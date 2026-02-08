@@ -1,30 +1,24 @@
 # darkness
 
-darkness, a fork of the openDarkEngine project, aims to be an extensible, cross platform implementation of the [Dark Engine](https://en.wikipedia.org/wiki/Dark_Engine). It aims to support all previously-generated official and fan content, and admit modular access to modernizing the graphics and AI stacks.
+`darkness`, an open Dark Engine(tm), is a substantial rewrite of the openDarkEngine project, and aims to be an extensible, cross platform implementation of the [Dark Engine](https://en.wikipedia.org/wiki/Dark_Engine). It aims to support all previously-generated official and fan content, and admit modular access to modernizing the graphics and AI stacks.
 
 ![don't be so sure](doc/orly.png)
 
-openDarkEngine (OPDE) was created as a heroic effort to build a multiplatform engine supporting the LookingGlass'es (TM) data files from the original DarkEngine(TM) games.
+### Usage
 
-Efforts were previously started to bring in simulation code and scripting support, but after a long hiatus this project is now undergoing a *refactoring/cleanup* phase, that will continue with removal of Ogre3d library and dependencies, to be replaced with a thin, rendering only library (f.ex. bgfx). This means resource/scene management will have to be written. Bulky python script bindings will probably get replaced with a more manageable Squirrel language bindings.
+TODO - Note, users must supply their own legally obtained game files to be able to use `darkness`.
 
-## License
-All the files, if not specified otherwise, are released under the GNU/GPL license.
+### Building
 
-## Building
-There is some partially obsolete info with build instructions in the doc/DEVELOPERS file. This will be updated after the project cleanup is finished, which includes a transition to another rendering library.
+TODO
 
-## Help needed
-This project would obviously benefit from more developers. Anyone willing to participate is welcome, please start by diving in the project, look at some issues that are in the tracker, maybe try fixing something or improving something.
-
-## Thanks
+### Thanks
 
 * TomNHarris (telliamed) - for the all the work he has done understanding the Dark Engine and its data formats. Also for the irreplaceable help in the past.
 * ShadowSpawn - For the BIN mesh format and Movement database format descriptions.
 * ataricom - For helping out with the (now defunct) sourceforge Wiki
 * TTLG community
 * ...and others not mentioned
-
 
 # Disclaimer
 `darkness` is an independent reimplementation of the Dark Engine and is not affiliated with, endorsed by, or derived from the original software or its rights holders.
