@@ -1,0 +1,27 @@
+build/
+**/*~
+
+# vcpkg (project-local)
+vcpkg/
+vcpkg_installed/
+
+# Python virtual environment
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# CMake
+CMakeUserPresets.json
+
+# Working notes (DO NOT DELETE — important local project docs, kept out of repo only)
+PROJECT_NOTES.md
+TASKS.md
+DARKENGINE_PORT_PLAN_v3.MD
+SOURCE_NOTES.md
