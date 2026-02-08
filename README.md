@@ -14,6 +14,7 @@ TODO
 
 ### Thanks
 
+* The openDarkEngine team.
 * TomNHarris (telliamed) - for the all the work he has done understanding the Dark Engine and its data formats. Also for the irreplaceable help in the past.
 * ShadowSpawn - For the BIN mesh format and Movement database format descriptions.
 * ataricom - For helping out with the (now defunct) sourceforge Wiki
