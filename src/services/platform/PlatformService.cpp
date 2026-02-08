@@ -27,16 +27,12 @@
 
 #ifdef WIN32
 #include "Win32Platform.h"
-#else
-#ifdef UNIX
+#elif defined(APPLE)
+#include "ApplePlatform.h"
+#elif defined(UNIX)
 #include "UnixPlatform.h"
 #else
-#ifdef APPLE
-#include "ApplePlatform.h"
-#else
 #error Unknown platform!
-#endif
-#endif
 #endif
 
 using namespace std;
@@ -54,16 +50,12 @@ PlatformService::PlatformService(ServiceManager *manager,
     : ServiceImpl<PlatformService>(manager, name) {
 #ifdef WIN32
     mPlatform = new Win32Platform(this);
-#else
-#ifdef UNIX
+#elif defined(APPLE)
+    mPlatform = new ApplePlatform(this);
+#elif defined(UNIX)
     mPlatform = new UnixPlatform(this);
 #else
-#ifdef APPLE
-    mPlatform = new ApplePlatform(this);
-#else
 #error Unknown platform!
-#endif
-#endif
 #endif
 }
 

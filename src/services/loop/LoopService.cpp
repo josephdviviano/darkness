@@ -21,9 +21,6 @@
  *
  *****************************************************************************/
 
-#include <OgreRoot.h>
-#include <OgreTimer.h>
-
 #include "LoopService.h"
 #include "OpdeException.h"
 #include "ServiceCommon.h"
@@ -134,11 +131,7 @@ LoopService::~LoopService() {}
 
 //------------------------------------------------------
 bool LoopService::init() {
-    // We use the Ogre::Root for timing, so it has to be defined.
-    // I could use render service for that, but it could create a circular
-    // reference (not likely, loop clients are weak pointers in fact, but
-    // anyway)
-    mRoot = Ogre::Root::getSingletonPtr();
+    mStartTime = std::chrono::steady_clock::now();
     return true;
 }
 
@@ -326,8 +319,11 @@ void LoopService::step() {
 
 //------------------------------------------------------
 unsigned long LoopService::getCurrentTime() {
-    return mRoot->getTimer()->getMilliseconds();
-};
+    auto now = std::chrono::steady_clock::now();
+    return static_cast<unsigned long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - mStartTime)
+            .count());
+}
 
 //------------------------------------------------------
 void LoopService::setLoopMode(const LoopModePtr &newMode) {

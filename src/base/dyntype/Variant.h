@@ -31,11 +31,9 @@
 #include "Quaternion.h"
 #include "Vector3.h"
 #include "integers.h"
+#include <map>
 #include <stdexcept>
-
-#include <OgreQuaternion.h>
-
-using Ogre::Quaternion;
+#include <string>
 
 namespace Opde {
 /** a variant class. This is a class that stores a value of a certain type. */
@@ -306,7 +304,7 @@ template <> int Variant::as<int>() const;
 template <> uint Variant::as<uint>() const;
 template <> std::string Variant::as<std::string>() const;
 template <> Vector3 Variant::as<Vector3>() const;
-template <> Ogre::Quaternion Variant::as<Ogre::Quaternion>() const;
+template <> Quaternion Variant::as<Quaternion>() const;
 
 /// Type traits for template to Variant conversions and various interactions
 /// (serialization, etc.)

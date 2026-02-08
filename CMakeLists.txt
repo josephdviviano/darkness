@@ -14,374 +14,222 @@
 #    You should have received a copy of the GNU General Public License
 #    along with this program; if not, write to the Free Software
 #    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-#
-#    $Id$
 
-cmake_minimum_required(VERSION 2.6)
+cmake_minimum_required(VERSION 3.21)
 
-project (OPDE)
+project(OPDE LANGUAGES C CXX)
 
-# TODO: set version and other properties directly in project statement
-SET(OPDE_VER_MAJOR "0")
-SET(OPDE_VER_MINOR "3")
-SET(OPDE_VER_PATCH "0")
-SET(REL_CODE_NAME  "El Motor Oscuro")
+set(OPDE_VER_MAJOR "0")
+set(OPDE_VER_MINOR "3")
+set(OPDE_VER_PATCH "0")
+set(REL_CODE_NAME  "El Motor Oscuro")
 
 # for installation - directories with version in them (/usr/share/... etc.)
-SET(OPDE_SHORTNAME_WITH_VERSION "${CMAKE_PROJECT_NAME}-${OPDE_VER_MAJOR}.${OPDE_VER_MINOR}")
-MARK_AS_ADVANCED(OPDE_SHORTNAME_WITH_VERSION)
+set(OPDE_SHORTNAME_WITH_VERSION "${CMAKE_PROJECT_NAME}-${OPDE_VER_MAJOR}.${OPDE_VER_MINOR}")
+mark_as_advanced(OPDE_SHORTNAME_WITH_VERSION)
 
-# Use C++11
-set (CMAKE_CXX_STANDARD 11)
+# C++17 standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Build type selection. Use ccmake for selection of this (or the commandline switches)
-# Default build type
-IF (NOT CMAKE_BUILD_TYPE)
-    # Release for now, as VC builds are incredibly slow on Debug
-    SET(CMAKE_BUILD_TYPE Release)
-ENDIF (NOT CMAKE_BUILD_TYPE)
+# Build type selection
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
 
-# Option to build in the debugging code
-OPTION(GLOBAL_DEBUG
-    "Build the debugging code"
-    OFF)
+# --- Options ---
 
-# Option to create Windows installer script
-OPTION(GENERATE_NSIS
-    "Creates Windows installer script"
-    ON)
+option(GLOBAL_DEBUG "Build the debugging code" OFF)
 
-# Option to generate documentation
-OPTION(GENERATE_DOC
-    "Generate documentation"
-    OFF)
+option(GENERATE_NSIS "Creates Windows installer script" ON)
 
-# Option to build in the debugging code
-OPTION(PROFILING
+option(GENERATE_DOC "Generate documentation" OFF)
+
+option(PROFILING
     "Build the sources with profiling support (Only Debug build type)"
     OFF)
 
-# Option to build in the debugging code
-OPTION(FRAME_PROFILER
+option(FRAME_PROFILER
     "Build in support for frame profiling (will log frame profiling events)"
     OFF)
 
-# Option to build all the libs as static (defunct - linking problems)
-# OPTION(STATIC_LIBS
-#    "Build the libs as static (defunct)"
-#    OFF)
-SET(STATIC_LIBS OFF)
-MARK_AS_ADVANCED(STATIC_LIBS)
-
-# Option to build the python module/extension
-OPTION(PYTHON_MODULE
-    "Build the python module version of the OpenDark library"
-    OFF)
+set(STATIC_LIBS OFF)
+mark_as_advanced(STATIC_LIBS)
 
 # Installation directories
-# SET(OPDE_BINARY_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/bin")
-SET(OPDE_BINARY_INSTALL_DIR "bin")
-MARK_AS_ADVANCED(OPDE_BINARY_INSTALL_DIR)
-# SET(OPDE_LIBRARY_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/lib")
-# TODO: lib64?
-SET(OPDE_LIBRARY_INSTALL_DIR "lib")
-MARK_AS_ADVANCED(OPDE_LIBRARY_INSTALL_DIR)
+set(OPDE_BINARY_INSTALL_DIR "bin")
+mark_as_advanced(OPDE_BINARY_INSTALL_DIR)
+set(OPDE_LIBRARY_INSTALL_DIR "lib")
+mark_as_advanced(OPDE_LIBRARY_INSTALL_DIR)
 
-SET(OPDE_DATA_INSTALL_DIR share/${OPDE_SHORTNAME_WITH_VERSION})
-SET(OPDE_FULL_DATA_INSTALL_DIR ${CMAKE_INSTALL_PREFIX}/${OPDE_DATA_INSTALL_DIR})
-MARK_AS_ADVANCED(OPDE_DATA_INSTALL_DIR)
-MARK_AS_ADVANCED(OPDE_FULL_DATA_INSTALL_DIR)
+set(OPDE_DATA_INSTALL_DIR share/${OPDE_SHORTNAME_WITH_VERSION})
+set(OPDE_FULL_DATA_INSTALL_DIR ${CMAKE_INSTALL_PREFIX}/${OPDE_DATA_INSTALL_DIR})
+mark_as_advanced(OPDE_DATA_INSTALL_DIR)
+mark_as_advanced(OPDE_FULL_DATA_INSTALL_DIR)
 
 # Compiler profiling flags
-IF (PROFILING)
-    IF(CMAKE_COMPILER_IS_GNUCXX)
-    SET(PROFILER "-pg") # GCC only profiler option
-    ENDIF(CMAKE_COMPILER_IS_GNUCXX)
-ELSE (PROFILING)
-    SET(PROFILER "")
-ENDIF (PROFILING)
-
-#Target the binary files into a separate directories
-# SET(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR/Build})
+if(PROFILING)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set(PROFILER "-pg")
+    endif()
+else()
+    set(PROFILER "")
+endif()
 
 # MinGW specific
-IF(CMAKE_COMPILER_IS_MINGW)
-    SET(CMAKE_EXE_LINKER_FLAGS "-Wl,--enable-auto-image-base -Wl,--add-stdcall-alias -Wl,--enable-runtime-pseudo-reloc -Wl,--enable-auto-import")
-    SET(CMAKE_SHARED_LINKER_FLAGS"-Wl,--enable-auto-image-base -Wl,--add-stdcall-alias -Wl,--enable-runtime-pseudo-reloc -Wl,--enable-auto-import")
-ENDIF(CMAKE_COMPILER_IS_MINGW)
+if(MINGW)
+    set(CMAKE_EXE_LINKER_FLAGS "-Wl,--enable-auto-image-base -Wl,--add-stdcall-alias -Wl,--enable-runtime-pseudo-reloc -Wl,--enable-auto-import")
+    set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--enable-auto-image-base -Wl,--add-stdcall-alias -Wl,--enable-runtime-pseudo-reloc -Wl,--enable-auto-import")
+endif()
 
-# Warning level high (Lowered by one to supress the payload of ogre related warnings in VC)
-SET(CMAKE_CXX_WARNING_LEVEL 3)
+set(CMAKE_CXX_WARNING_LEVEL 3)
 
-# GCC specific. Release/Debug flags (I add some debug/profiler switches there)
-IF(CMAKE_COMPILER_IS_GNUCXX)
-    SET(CMAKE_C_FLAGS_DEBUG "-g -O3 ${PROFILER}")
-    SET(CMAKE_CXX_FLAGS_DEBUG "-g -O3 ${PROFILER}")
-    SET(CMAKE_CXX_FLAGS_DISTRIBUTION "-O3 ${PROFILER}")
-    SET(CMAKE_C_FLAGS_DISTRIBUTION "-O3 ${PROFILER}")
+# GCC/Clang flags
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(CMAKE_C_FLAGS_DEBUG "-g -O3 ${PROFILER}")
+    set(CMAKE_CXX_FLAGS_DEBUG "-g -O3 ${PROFILER}")
+    set(CMAKE_CXX_FLAGS_DISTRIBUTION "-O3 ${PROFILER}")
+    set(CMAKE_C_FLAGS_DISTRIBUTION "-O3 ${PROFILER}")
 
-    SET(CMAKE_CXX_FLAGS "-O3 ${PROFILER}")
-    SET(CMAKE_C_FLAGS "-O3 ${PROFILER}")
-
-    # extra warnings, but no unused params (too common)
-    # no strict aliasing (see Py_True type punned pointer aliasing errors)
-    ADD_DEFINITIONS(-Wall -fno-strict-aliasing -fvisibility=default)
-    #  -Wextra -Wno-unused-parameter
-ENDIF(CMAKE_COMPILER_IS_GNUCXX)
-
-# -fPIC for 64bit IA (x86_64 that is)
-IF(UNIX AND NOT WIN32)
-  FIND_PROGRAM(CMAKE_UNAME uname /bin /usr/bin /usr/local/bin )
-  IF(CMAKE_UNAME)
-    EXEC_PROGRAM(uname ARGS -m OUTPUT_VARIABLE CMAKE_SYSTEM_PROCESSOR)
-    SET(CMAKE_SYSTEM_PROCESSOR ${CMAKE_SYSTEM_PROCESSOR} CACHE INTERNAL
-"processor type (i386 and x86_64)")
-    IF(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
-      ADD_DEFINITIONS(-fPIC)
-    ENDIF(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
-  ENDIF(CMAKE_UNAME)
-ENDIF(UNIX AND NOT WIN32)
-
-# MSVC specific stuff
-IF(CMAKE_COMPILER_IS_MSVC)
-    # STUB. Nothing now
-ENDIF(CMAKE_COMPILER_IS_MSVC)
+    set(CMAKE_CXX_FLAGS "-O3 ${PROFILER}")
+    set(CMAKE_C_FLAGS "-O3 ${PROFILER}")
+endif()
 
 # Various modules used for library path detections.
-LIST(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
-# Global debug option test. Sets the DEBUG flag in the config.h
-IF(GLOBAL_DEBUG)
-    MESSAGE(STATUS "Debugging is ON")
-    SET(OPDE_DEBUG 1)
-ELSE(GLOBAL_DEBUG)
-    MESSAGE(STATUS "Debugging is Off")
-ENDIF(GLOBAL_DEBUG)
+# Global debug option
+if(GLOBAL_DEBUG)
+    message(STATUS "Debugging is ON")
+    set(OPDE_DEBUG 1)
+else()
+    message(STATUS "Debugging is Off")
+endif()
 
+# --- Dependencies ---
+set(ODE_DIR ${CMAKE_MODULE_PATH})
 
-# Solve the dependencies
-SET(ODE_DIR ${CMAKE_MODULE_PATH})
-SET(OGRE_DIR ${CMAKE_MODULE_PATH})
-SET(FREEIMAGE_DIR ${CMAKE_MODULE_PATH})
+# Always-required dependencies
+find_package(SDL2 REQUIRED)
 
-FIND_PACKAGE(ODE REQUIRED)
-FIND_PACKAGE(OGRE REQUIRED)
-FIND_PACKAGE(FREEIMAGE REQUIRED)
-FIND_PACKAGE(SDL2 REQUIRED)
+if(SDL2_FOUND)
+    message(STATUS "SDL2 Found OK")
+    message(STATUS " - SDL2 includes ${SDL2_INCLUDE_DIR}")
+    message(STATUS " - SDL2 libs ${SDL2_LIBRARIES}")
+else()
+    message(FATAL_ERROR "SDL2 not found!")
+endif()
 
-# TODO: REMOVE, TEMPORARY TILL WE CHANGE TO OGRE's STRICT RESOURCE MANAGER
-PKG_CHECK_MODULES(ZZIPLIB REQUIRED zziplib)
+# ODE is used by physics service (headless-safe)
+find_package(ODE REQUIRED)
+if(ODE_FOUND)
+    message(STATUS "ODE Found OK")
+    message(STATUS " - ODE includes ${ODE_INCLUDE_DIR}")
+    message(STATUS " - ODE libs ${ODE_LIBRARIES}")
+else()
+    message(FATAL_ERROR "ODE not found!")
+endif()
+
 
 # Documentation
-# On Ubuntu, the following command does not search for Dot :(
-FIND_PACKAGE(Doxygen)
-FIND_PROGRAM(TEXI2HTML texi2html)
+if(GENERATE_DOC)
+    find_package(Doxygen)
+    find_program(TEXI2HTML texi2html)
+    if(NOT DOT)
+        find_program(DOT dot)
+    endif()
+    mark_as_advanced(TEXI2HTML DOT)
 
-IF(NOT DOT)
-	FIND_PROGRAM(DOT dot)
-ENDIF(NOT DOT)
+    include(FindPythonModule.cmake)
+    find_python_module("epydoc" "EPYDOC")
+endif()
 
-MARK_AS_ADVANCED(TEXI2HTML DOT)
-
-INCLUDE(FindPythonModule.cmake)
-FIND_PYTHON_MODULE("epydoc" "EPYDOC")
-
-IF(FREEIMAGE_FOUND)
-    MESSAGE(STATUS "FreeImage Found OK")
-    MESSAGE(STATUS " - FreeImage includes ${FREEIMAGE_INCLUDE_DIR}")
-    MESSAGE(STATUS " - FreeImage libs ${FREEIMAGE_LIBRARIES}")
-ELSE(FREEIMAGE_FOUND)
-    MESSAGE(FATAL_ERROR "FreeImage not found and selected in options!")
-ENDIF(FREEIMAGE_FOUND)
-
-IF(ODE_FOUND)
-    MESSAGE(STATUS "ODE Found OK")
-    MESSAGE(STATUS " - ODE includes ${ODE_INCLUDE_DIR}")
-    MESSAGE(STATUS " - ODE libs ${ODE_LIBRARIES}")
-ELSE(ODE_FOUND)
-    MESSAGE(FATAL_ERROR "ODE not found and selected in options!")
-ENDIF(ODE_FOUND)
-
-IF(SDL2_FOUND)
-    MESSAGE(STATUS "SDL2 Found OK")
-    MESSAGE(STATUS " - SDL2 includes ${SDL2_INCLUDE_DIR}")
-    MESSAGE(STATUS " - SDL2 libs ${SDL2_LIBRARIES}")
-ELSE(SDL2_FOUND)
-    MESSAGE(FATAL_ERROR "SDL2 not found!")
-ENDIF(SDL2_FOUND)
-
-FIND_PACKAGE(PythonLibs REQUIRED)
-SET(OPDE_PYTHON_LIBRARIES ${PYTHON_LIBRARIES})
-
-# Aditional libraries - deps of the python lib
-IF(UNIX)
-    INCLUDE(PythonDeps.cmake)
-    FIND_PYTHON_DEPS(OPDE_PYTHON_LIBRARIES)
-ENDIF(UNIX)
-
-IF(OPDE_PYTHON_LIBRARIES)
-    MESSAGE(STATUS "Python Found OK")
-    MESSAGE(STATUS " - Python includes ${PYTHON_INCLUDE_PATH}")
-    MESSAGE(STATUS " - Python libs ${OPDE_PYTHON_LIBRARIES}")
-ELSE(OPDE_PYTHON_LIBRARIES)
-    MESSAGE(FATAL_ERROR "Python not found")
-ENDIF(OPDE_PYTHON_LIBRARIES)
-
-# Only visual check enabling verbose output, and package found info
-IF(OGRE_FOUND)
-    MESSAGE(STATUS "OGRE Found OK")
-    MESSAGE(STATUS " - Ogre includes ${OGRE_INCLUDE_DIR}")
-    MESSAGE(STATUS " - Ogre libs ${OGRE_LIBRARIES}")
-ELSE(OGRE_FOUND)
-    MESSAGE(FATAL_ERROR "OGRE not found")
-ENDIF(OGRE_FOUND)
-
-SET(DOC_DEPS_SATISFIED OFF)
-MARK_AS_ADVANCED(DOC_DEPS_SATISFIED)
-
-# Preparation for the documentation generators - do we have all dependencies?
-IF (GENERATE_DOC)
-	IF(DOXYGEN_EXECUTABLE)
-		MESSAGE(STATUS "Doxygen Found OK")
-	ELSE(DOXYGEN_EXECUTABLE)
-		MESSAGE("Doxygen not found")
-	ENDIF(DOXYGEN_EXECUTABLE)
-
-	IF(TEXI2HTML)
-		MESSAGE(STATUS "Texi2html Found OK")
-	ELSE(TEXI2HTML)
-		MESSAGE("Texi2html not found")
-	ENDIF(TEXI2HTML)
-
-	IF(DOT)
-		MESSAGE(STATUS "Dot Found OK")
-	ELSE(DOT)
-		MESSAGE("Dot not found")
-	ENDIF(DOT)
-
-	IF(EPYDOC)
-		MESSAGE(STATUS "Epydoc Found OK")
-	ELSE(EPYDOC)
-		MESSAGE("Epydoc not found")
-	ENDIF(EPYDOC)
-
-	# See if we have all the dependencies for DOC_DEPS_SATISFIED
-	IF (DOXYGEN_EXECUTABLE AND TEXI2HTML AND DOT AND EPYDOC)
-		SET(DOC_DEPS_SATISFIED ON)
-	ELSE (DOXYGEN_EXECUTABLE AND TEXI2HTML AND DOT AND EPYDOC)
-		MESSAGE("Warning: Documentation dependencies not satisfied. Doc generation will be disabled.")
-		SET(GENERATE_DOC OFF)
-	ENDIF (DOXYGEN_EXECUTABLE AND TEXI2HTML AND DOT AND EPYDOC)
-ENDIF (GENERATE_DOC)
+set(DOC_DEPS_SATISFIED OFF)
+mark_as_advanced(DOC_DEPS_SATISFIED)
 
 # Some configuration checks to allow platform independence
-INCLUDE(ConfigureChecks.cmake)
-CONFIGURE_FILE(config.h.cmake ${CMAKE_BINARY_DIR}/config.h )
+include(ConfigureChecks.cmake)
+configure_file(config.h.cmake ${CMAKE_BINARY_DIR}/config.h)
 
-# Add the subdirectories which contain aditional CMakeLists.txt files
-add_subdirectory (src)
-add_subdirectory (proto)
-add_subdirectory (thirdparty)
-
-# TODO: We have to redo the doc generation as a custom target
+# Add the subdirectories which contain additional CMakeLists.txt files
+add_subdirectory(src)
+add_subdirectory(proto)
+add_subdirectory(thirdparty)
 
 # Additional fake_install dependencies
-SET(OPDE_DOC_INST_DEPS "")
-MARK_AS_ADVANCED(OPDE_DOC_INST_DEPS)
+set(OPDE_DOC_INST_DEPS "")
+mark_as_advanced(OPDE_DOC_INST_DEPS)
 
-# Generate the doxyfile if selected as an option
-# TODO: This will most certainly fail on windows due to the fact we use unix commands.
-IF (GENERATE_DOC AND DOC_DEPS_SATISFIED)
-    SET(OPDE_DOC_DIR share/${OPDE_SHORTNAME_WITH_VERSION})
+# Documentation generation
+if(GENERATE_DOC AND DOC_DEPS_SATISFIED)
+    set(OPDE_DOC_DIR share/${OPDE_SHORTNAME_WITH_VERSION})
 
-    # Generate the doxyfile from the template file
-    CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile.in
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile.in
                       ${CMAKE_BINARY_DIR}/Doxyfile)
 
-    # Now prepare the python doc. generator
-    CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/writedoc.py.in
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/writedoc.py.in
                       ${CMAKE_BINARY_DIR}/writedoc.py)
 
-    # doxygen make target
-    IF (DOXYGEN_EXECUTABLE)
-    	ADD_CUSTOM_TARGET(doc ALL
-        	COMMAND ${DOXYGEN_EXECUTABLE} ${CMAKE_BINARY_DIR}/Doxyfile
-		COMMENT "Building doxygen documentation" VERBATIM
-#		SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/doxyfile.in
-	)
-    ELSE (DOXYGEN_EXECUTABLE)
-    	MESSAGE("Warning: Doxygen not found, docs target disabled.")
-    ENDIF (DOXYGEN_EXECUTABLE)
+    if(DOXYGEN_EXECUTABLE)
+        add_custom_target(doc ALL
+            COMMAND ${DOXYGEN_EXECUTABLE} ${CMAKE_BINARY_DIR}/Doxyfile
+            COMMENT "Building doxygen documentation" VERBATIM
+        )
+    else()
+        message("Warning: Doxygen not found, docs target disabled.")
+    endif()
 
-    # Thanks Ogre guys for this trick...
-	# Create a dirctory for the python docs...
-    file(WRITE ${CMAKE_BINARY_DIR}/doc/python/html/temp.txt "This file should be deleted before installation. It is only here to force the creation of the python doc. folder")
+    file(WRITE ${CMAKE_BINARY_DIR}/doc/python/html/temp.txt "temp")
     file(REMOVE ${CMAKE_BINARY_DIR}/doc/python/html/temp.txt)
 
-
-    # generates the Python docs.
-    ADD_CUSTOM_TARGET(pydoc ALL
-    	DEPENDS opdeScript
+    add_custom_target(pydoc ALL
+        DEPENDS opdeScript
         COMMAND ${CMAKE_BINARY_DIR}/src/main/opdeScript ${CMAKE_BINARY_DIR}/writedoc.py
-	COMMENT "Building Python API documentation" VERBATIM
-#	SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/writedoc.py.in
+        COMMENT "Building Python API documentation" VERBATIM
     )
 
-    MARK_AS_ADVANCED(MANUAL_BUILDER)
-    # on win32 we use the buildmanual.bat, otherwise we use the buildmanual.sh
-    IF(WIN32)
-    	SET(MANUAL_BUILDER "${CMAKE_CURRENT_SOURCE_DIR}/doc/src/buildmanual.bat")
-    ELSE(WIN32)
-       	SET(MANUAL_BUILDER "/bin/sh" "${CMAKE_CURRENT_SOURCE_DIR}/doc/src/buildmanual.sh")
-    ENDIF(WIN32)
+    mark_as_advanced(MANUAL_BUILDER)
+    if(WIN32)
+        set(MANUAL_BUILDER "${CMAKE_CURRENT_SOURCE_DIR}/doc/src/buildmanual.bat")
+    else()
+        set(MANUAL_BUILDER "/bin/sh" "${CMAKE_CURRENT_SOURCE_DIR}/doc/src/buildmanual.sh")
+    endif()
 
-    # generates the Developers manual
-    ADD_CUSTOM_TARGET(manual ALL
+    add_custom_target(manual ALL
         COMMAND ${MANUAL_BUILDER} ${CMAKE_CURRENT_SOURCE_DIR}/doc/src/ ${CMAKE_BINARY_DIR}/doc/manual/
-	COMMENT "Building developer's manual" VERBATIM
-#	SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/doc/src/manual.texi
+        COMMENT "Building developer's manual" VERBATIM
     )
 
-    # Copy various common files (style.css so far)
-    CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/doc/style.css
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/doc/style.css
                       ${CMAKE_BINARY_DIR}/doc/style.css)
 
-    # TODO: property/link docs (maybe part of the writedoc.py?)
+    install(DIRECTORY ${OPDE_BINARY_DIR}/doc DESTINATION ${OPDE_DOC_DIR})
 
-    # Install directives for the documentation
-    # TODO: Skip .md5 and .map files as those are doxygen temporary
-    INSTALL(DIRECTORY ${OPDE_BINARY_DIR}/doc DESTINATION ${OPDE_DOC_DIR})
+    set(OPDE_DOC_INST_DEPS "doc" "pydoc" "manual")
+endif()
 
-    # additional fake_install deps
-    SET(OPDE_DOC_INST_DEPS "doc" "pydoc" "manual")
-ENDIF (GENERATE_DOC AND DOC_DEPS_SATISFIED)
-
-IF (GENERATE_NSIS)
-    CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/installer/opde-win.in
+if(GENERATE_NSIS)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/installer/opde-win.in
                       ${CMAKE_BINARY_DIR}/installer/opde-win.nsi @ONLY)
-        MESSAGE(STATUS "Installer script was generated in ${CMAKE_BINARY_DIR}/installer.")
-ENDIF (GENERATE_NSIS)
+    message(STATUS "Installer script was generated in ${CMAKE_BINARY_DIR}/installer.")
+endif()
 
 # Optional testing local install (not automatic, use "make fake_install")
-ADD_CUSTOM_TARGET(fake_install
+add_custom_target(fake_install
     "${CMAKE_COMMAND}"
     -D CMAKE_INSTALL_PREFIX:string=${CMAKE_CURRENT_BINARY_DIR}/fake_install/${CMAKE_INSTALL_PREFIX}
     -P "${CMAKE_CURRENT_BINARY_DIR}/cmake_install.cmake"
-#    DEPENDS opdeMain OpenDark ${OPDE_DOC_INST_DEPS}
 )
 
-MESSAGE(STATUS "Your configuration seems to be OK!")
-
-MESSAGE(STATUS "")
-
-# Print out some configuration status messages
-MESSAGE(STATUS "Your build parameters:")
-MESSAGE(STATUS " * Global debugging : ${GLOBAL_DEBUG}")
-MESSAGE(STATUS " * Build type       : ${CMAKE_BUILD_TYPE}")
-MESSAGE(STATUS " * Profilling       : ${PROFILING}")
-MESSAGE(STATUS " * Python module    : ${PYTHON_MODULE}")
-MESSAGE(STATUS " * Documentation    : ${GENERATE_DOC}")
-MESSAGE(STATUS " * C compiler       : ${CMAKE_C_COMPILER}")
-MESSAGE(STATUS " * C++ compiler     : ${CMAKE_CXX_COMPILER}")
-MESSAGE(STATUS " * Source directory : ${CMAKE_CURRENT_SOURCE_DIR}")
-MESSAGE(STATUS " * Binary directory : ${CMAKE_CURRENT_BINARY_DIR}")
+message(STATUS "Your configuration seems to be OK!")
+message(STATUS "")
+message(STATUS "Your build parameters:")
+message(STATUS " * Global debugging : ${GLOBAL_DEBUG}")
+message(STATUS " * Build type       : ${CMAKE_BUILD_TYPE}")
+message(STATUS " * Profilling       : ${PROFILING}")
+message(STATUS " * Documentation    : ${GENERATE_DOC}")
+message(STATUS " * C compiler       : ${CMAKE_C_COMPILER}")
+message(STATUS " * C++ compiler     : ${CMAKE_CXX_COMPILER}")
+message(STATUS " * Source directory : ${CMAKE_CURRENT_SOURCE_DIR}")
+message(STATUS " * Binary directory : ${CMAKE_CURRENT_BINARY_DIR}")

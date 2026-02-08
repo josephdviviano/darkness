@@ -26,6 +26,8 @@
 
 #include "config.h"
 
+#include <list>
+
 #include "FileGroup.h"
 #include "MessageSource.h"
 #include "OpdeService.h"

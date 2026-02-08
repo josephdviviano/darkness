@@ -28,8 +28,8 @@
 #include "bindings.h"
 #include "logger.h"
 
-#include <OgreDataStream.h>
-#include <OgreResourceGroupManager.h>
+#include <fstream>
+#include <sstream>
 
 using namespace std;
 
@@ -52,21 +52,15 @@ ScriptService::~ScriptService(){
 
 //------------------------------------
 void ScriptService::runScript(const std::string &filename) {
-    // Get the script as a memory pointer first, using the Ogre's resource
-    // system Then use python to run the script. If it communicates with opde
-    // any way, Py_INCREF will guarantee consistency on those interacting
-    // pieces.
-
-    // TODO: Compiled code v.s. code to compile (.py / .pyc)
-
-    // TODO: Group name for scripts! (Using default for now)
-    Ogre::DataStreamPtr fdata =
-        Ogre::ResourceGroupManager::getSingleton().openResource(
-            filename,
-            Ogre::ResourceGroupManager::AUTODETECT_RESOURCE_GROUP_NAME);
-    const Ogre::String &text = fdata->getAsString();
-
-    // Now run the script using python
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        LOG_ERROR("ScriptService: Could not open script file %s",
+                  filename.c_str());
+        return;
+    }
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    const std::string &text = ss.str();
     PythonLanguage::runScriptPtr(text.c_str());
 }
 

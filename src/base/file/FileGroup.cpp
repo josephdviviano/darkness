@@ -24,6 +24,10 @@
 #include "FileGroup.h"
 #include "format.h"
 
+#include <cassert>
+#include <cstring>
+#include <vector>
+
 namespace Opde {
 /*----------------------------------------------------*/
 /*-------------------- FileGroup ---------------------*/

@@ -23,16 +23,11 @@
 
 #include "DatabaseService.h"
 #include "FileGroup.h"
-#include "OgreTimer.h"
 #include "OpdeException.h"
 #include "OpdeServiceManager.h"
 #include "logger.h"
 
-#include <OgreResourceGroupManager.h>
-#include <OgreTimer.h>
-
 using namespace std;
-using namespace Ogre;
 
 namespace Opde {
 
@@ -45,18 +40,18 @@ const size_t ServiceImpl<DatabaseService>::SID = __SERVICE_ID_DATABASE;
 DatabaseService::DatabaseService(ServiceManager *manager,
                                  const std::string &name)
     : ServiceImpl<DatabaseService>(manager, name), mCurDB(NULL),
-      mProgressListener(NULL), mTimer(NULL) {}
+      mProgressListener(NULL), mStartTime(std::chrono::steady_clock::now()) {}
 
 //------------------------------------------------------
 bool DatabaseService::init() {
-    mTimer = new Ogre::Timer();
+    mStartTime = std::chrono::steady_clock::now();
     // Create all services listening to the database messages...
     ServiceManager::getSingleton().createByMask(SERVICE_DATABASE_LISTENER);
     return true;
 }
 
 //------------------------------------------------------
-DatabaseService::~DatabaseService() { delete mTimer; }
+DatabaseService::~DatabaseService() {}
 
 //------------------------------------------------------
 void DatabaseService::load(const std::string &filename, uint32_t loadMask) {
@@ -166,13 +161,7 @@ void DatabaseService::unload(uint32_t dropMask) {
 
 //------------------------------------------------------
 FileGroupPtr DatabaseService::getDBFileNamed(const std::string &filename) {
-    // TODO: Group of of the resource through the configuration service, once
-    // written
-    Ogre::DataStreamPtr stream =
-        Ogre::ResourceGroupManager::getSingleton().openResource(
-            filename, ResourceGroupManager::AUTODETECT_RESOURCE_GROUP_NAME);
-    FilePtr fp(new OgreFile(stream));
-
+    FilePtr fp(new StdFile(filename, File::FILE_R));
     return FileGroupPtr(new DarkFileGroup(fp));
 }
 
@@ -272,17 +261,25 @@ std::string DatabaseService::loadFileNameFromTag(const Opde::FileGroupPtr &db,
 }
 
 //------------------------------------------------------
+unsigned long DatabaseService::getMilliseconds() const {
+    auto now = std::chrono::steady_clock::now();
+    return static_cast<unsigned long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - mStartTime)
+            .count());
+}
+
+//------------------------------------------------------
 void DatabaseService::broadcastOnDBLoad(const FileGroupPtr &db,
                                         uint32_t curmask) {
     Listeners::iterator it = mListeners.begin();
 
     for (; it != mListeners.end(); ++it) {
-        unsigned long sttime = mTimer->getMilliseconds();
+        unsigned long sttime = getMilliseconds();
 
         // Inform about the load
         it->second->onDBLoad(db, curmask);
 
-        unsigned long now = mTimer->getMilliseconds();
+        unsigned long now = getMilliseconds();
 
         LOG_INFO("DatabaseService: Operation took %f seconds",
                  (float)(now - sttime) / 1000);
@@ -305,12 +302,12 @@ void DatabaseService::broadcastOnDBSave(const FileGroupPtr &db,
     Listeners::iterator it = mListeners.begin();
 
     for (; it != mListeners.end(); ++it) {
-        unsigned long sttime = mTimer->getMilliseconds();
+        unsigned long sttime = getMilliseconds();
 
         // Inform about the save
         it->second->onDBSave(db, tgtmask);
 
-        unsigned long now = mTimer->getMilliseconds();
+        unsigned long now = getMilliseconds();
 
         LOG_INFO("DatabaseService: Operation took %f seconds",
                  (float)(now - sttime) / 1000);
@@ -332,12 +329,12 @@ void DatabaseService::broadcastOnDBDrop(uint32_t dropmask) {
     Listeners::reverse_iterator it = mListeners.rbegin();
 
     for (; it != mListeners.rend(); ++it) {
-        unsigned long sttime = mTimer->getMilliseconds();
+        unsigned long sttime = getMilliseconds();
 
         // Inform about the drop
         it->second->onDBDrop(dropmask);
 
-        unsigned long now = mTimer->getMilliseconds();
+        unsigned long now = getMilliseconds();
 
         LOG_INFO("DatabaseService: Operation took %f seconds",
                  (float)(now - sttime) / 1000);

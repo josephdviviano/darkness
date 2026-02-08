@@ -27,8 +27,7 @@
 #include "compat.h"
 
 #include "Quaternion.h"
-#include <OgreMath.h>
-#include <OgreMatrix3.h>
+#include "Matrix3.h"
 
 #include "File.h"
 #include "NonCopyable.h"
@@ -133,15 +132,15 @@ template <> size_t TypeSerializer<Vector3>::getStoredSize(const void *valuePtr);
 // Quaternion spec. Stored as HPB on disk
 /// Quaternion specialization of the TypeSerializer::serialize
 template <>
-void TypeSerializer<Ogre::Quaternion>::serialize(FilePtr &dest,
+void TypeSerializer<Quaternion>::serialize(FilePtr &dest,
                                                  const void *valuePtr);
 /// Quaternion specialization of the TypeSerializer::deserialize
 template <>
-void TypeSerializer<Ogre::Quaternion>::deserialize(FilePtr &src,
+void TypeSerializer<Quaternion>::deserialize(FilePtr &src,
                                                    void *valuePtr);
 /// Quaternion stored size getter
 template <>
-size_t TypeSerializer<Ogre::Quaternion>::getStoredSize(const void *valuePtr);
+size_t TypeSerializer<Quaternion>::getStoredSize(const void *valuePtr);
 
 /// Variable length string specialization of the TypeSerializer::serialize
 template <>

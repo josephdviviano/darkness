@@ -1,5 +1,4 @@
 add_subdirectory(base)
 add_subdirectory(services)
-add_subdirectory(scenemanager)
 add_subdirectory(main)
-add_subdirectory(bindings)
+

@@ -22,6 +22,13 @@
  *****************************************************************************/
 
 #include "Serializer.h"
+#include "Matrix3.h"
+
+#include <cmath>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace Opde {
 
@@ -79,21 +86,21 @@ size_t TypeSerializer<Vector3>::getStoredSize(const void *valuePtr) {
 }
 
 template <>
-void TypeSerializer<Ogre::Quaternion>::serialize(FilePtr &dest,
-                                                 const void *valuePtr) {
+void TypeSerializer<Quaternion>::serialize(FilePtr &dest,
+                                           const void *valuePtr) {
     int16_t h, p, b;
 
-    Ogre::Matrix3 m;
+    Matrix3 m;
 
-    static_cast<const Ogre::Quaternion *>(valuePtr)->ToRotationMatrix(m);
+    static_cast<const Quaternion *>(valuePtr)->ToRotationMatrix(m);
 
-    Ogre::Radian x, y, z;
+    float x_rad, y_rad, z_rad;
 
-    m.ToEulerAnglesZYX(z, y, x);
+    m.ToEulerAnglesZYX(z_rad, y_rad, x_rad);
 
-    h = static_cast<int16_t>(x.valueRadians() * 32768 / Ogre::Math::PI);
-    p = static_cast<int16_t>(y.valueRadians() * 32768 / Ogre::Math::PI);
-    b = static_cast<int16_t>(z.valueRadians() * 32768 / Ogre::Math::PI);
+    h = static_cast<int16_t>(x_rad * 32768 / M_PI);
+    p = static_cast<int16_t>(y_rad * 32768 / M_PI);
+    b = static_cast<int16_t>(z_rad * 32768 / M_PI);
 
     dest->writeElem(&h, sizeof(int16_t));
     dest->writeElem(&p, sizeof(int16_t));
@@ -101,15 +108,15 @@ void TypeSerializer<Ogre::Quaternion>::serialize(FilePtr &dest,
 };
 
 template <>
-void TypeSerializer<Ogre::Quaternion>::deserialize(FilePtr &src,
-                                                   void *valuePtr) {
+void TypeSerializer<Quaternion>::deserialize(FilePtr &src,
+                                             void *valuePtr) {
     int16_t h, p, b;
 
     src->readElem(&h, sizeof(int16_t));
     src->readElem(&p, sizeof(int16_t));
     src->readElem(&b, sizeof(int16_t));
 
-    Ogre::Real x, y, z;
+    float x_rad, y_rad, z_rad;
 
     /* Order of HPB application is crucial. It was detected that Dark orders HPB
     in this order:
@@ -117,22 +124,21 @@ void TypeSerializer<Ogre::Quaternion>::deserialize(FilePtr &src,
     2. Pitch is applied
     3. Heading is applied
     */
-    x = ((float)(h) / 32768) * Ogre::Math::PI; // heading - y
-    y = ((float)(p) / 32768) * Ogre::Math::PI; // pitch - x
-    z = ((float)(b) / 32768) * Ogre::Math::PI; // bank - z
+    x_rad = ((float)(h) / 32768) * static_cast<float>(M_PI); // heading
+    y_rad = ((float)(p) / 32768) * static_cast<float>(M_PI); // pitch
+    z_rad = ((float)(b) / 32768) * static_cast<float>(M_PI); // bank
 
-    Ogre::Matrix3 m;
+    Matrix3 m;
 
-    // Still not there, but close
-    m.FromEulerAnglesZYX(Ogre::Radian(z), Ogre::Radian(y), Ogre::Radian(x));
+    m.FromEulerAnglesZYX(z_rad, y_rad, x_rad);
 
-    Ogre::Quaternion *q = static_cast<Ogre::Quaternion *>(valuePtr);
+    Quaternion *q = static_cast<Quaternion *>(valuePtr);
 
     q->FromRotationMatrix(m);
 };
 
 template <>
-size_t TypeSerializer<Ogre::Quaternion>::getStoredSize(const void *valuePtr) {
+size_t TypeSerializer<Quaternion>::getStoredSize(const void *valuePtr) {
     return sizeof(int16_t) * 3;
 }
 

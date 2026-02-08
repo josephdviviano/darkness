@@ -28,11 +28,10 @@
 #include "logger.h"
 #include "platform/PlatformService.h"
 
-#include <OgreConfigFile.h>
-#include <OgreException.h>
+#include <fstream>
+#include <string>
 
 using namespace std;
-using namespace Ogre;
 
 namespace Opde {
 
@@ -179,7 +178,15 @@ std::string
 ConfigService::getLocalisedResourcePath(const std::string &origPath) {
     std::string path, fname;
 
-    StringUtil::splitFilename(origPath, fname, path);
+    // Split filename from path
+    size_t pos = origPath.find_last_of("/\\");
+    if (pos != std::string::npos) {
+        path = origPath.substr(0, pos + 1);
+        fname = origPath.substr(pos + 1);
+    } else {
+        path = "";
+        fname = origPath;
+    }
 
     return path + getLanguage() + mPlatformService->getDirectorySeparator() +
            fname;
@@ -199,31 +206,52 @@ void ConfigService::logAllParameters() {
 
 //------------------------------------------------------
 bool ConfigService::loadFromFile(const std::string &cfgfile) {
-    try { // load a few options
-        LOG_INFO("ConfigService: Loading config file from '%s'",
-                 cfgfile.c_str());
+    LOG_INFO("ConfigService: Loading config file from '%s'",
+             cfgfile.c_str());
 
-        Ogre::ConfigFile cf;
-        cf.load(cfgfile);
-
-        // Get the iterator over values - no section
-        ConfigFile::SettingsIterator it = cf.getSettingsIterator();
-
-        while (it.hasMoreElements()) {
-            std::string key = it.peekNextKey();
-            std::string val = it.peekNextValue();
-
-            setParam(key, val);
-
-            it.moveNext();
-        }
-
-        return true;
-    } catch (const Ogre::Exception &e) {
+    std::ifstream file(cfgfile);
+    if (!file.is_open()) {
         LOG_ERROR("Config file '%s' was not found", cfgfile.c_str());
         return false;
-        // Guess the file didn't exist
     }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        // Skip empty lines and comments
+        if (line.empty() || line[0] == '#' || line[0] == ';')
+            continue;
+
+        // Skip section headers [section]
+        if (line[0] == '[')
+            continue;
+
+        // Find the = separator
+        size_t eqPos = line.find('=');
+        if (eqPos == std::string::npos)
+            continue;
+
+        std::string key = line.substr(0, eqPos);
+        std::string val = line.substr(eqPos + 1);
+
+        // Trim whitespace from key and value
+        auto trim = [](std::string &s) {
+            size_t start = s.find_first_not_of(" \t\r\n");
+            size_t end = s.find_last_not_of(" \t\r\n");
+            if (start == std::string::npos) {
+                s.clear();
+            } else {
+                s = s.substr(start, end - start + 1);
+            }
+        };
+
+        trim(key);
+        trim(val);
+
+        if (!key.empty())
+            setParam(key, val);
+    }
+
+    return true;
 }
 
 //-------------------------- Factory implementation

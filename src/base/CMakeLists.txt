@@ -1,24 +1,10 @@
-include_directories(
-    ${OPDE_BINARY_DIR}
-    ${ODE_INCLUDE_DIR}
-    ${OGRE_INCLUDE_DIR}
-    ${OPDE_BINARY_DIR}
-    ${OPDE_BASE_INCLUDES}
-    ${OPDE_SOURCE_DIR}/src/base
-    ${OPDE_SOURCE_DIR}/src/base/console
-    ${OPDE_SOURCE_DIR}/src/base/compat
-    ${OPDE_SOURCE_DIR}/src/base/dyntype
-    ${OPDE_SOURCE_DIR}/src/base/file
-    ${OPDE_SOURCE_DIR}/src/base/loaders
-    ${OPDE_SOURCE_DIR}/src/base/logger
-    ${OPDE_SOURCE_DIR}/src/base/servicemanager
-    ${OPDE_SOURCE_DIR}/src/compat
-)
-
-add_library (OpdeBase OBJECT
+set(OPDE_BASE_SOURCES
     Array.h
     BitArray.h
     Callback.h
+    MathTypes.cpp
+    Matrix3.h
+    Matrix4.h
     MessageSource.h
     NonCopyable.h
     OpdeException.cpp
@@ -60,19 +46,10 @@ add_library (OpdeBase OBJECT
     file/File.h
     FreeSpaceInfo.h
     Iterator.h
-    loaders/BinFormat.h
-    loaders/FonFormat.cpp
-    loaders/FonFormat.h
-    loaders/ManualBinFileLoader.cpp
-    loaders/ManualBinFileLoader.h
-    loaders/ManualFonFileLoader.cpp
-    loaders/ManualFonFileLoader.h
     logger/filelog.cpp
     logger/filelog.h
     logger/logger.cpp
     logger/logger.h
-    logger/OgreOpdeLogConnector.cpp
-    logger/OgreOpdeLogConnector.h
     logger/stdlog.cpp
     logger/stdlog.h
     servicemanager/OpdeService.cpp
@@ -80,4 +57,24 @@ add_library (OpdeBase OBJECT
     servicemanager/OpdeService.h
     servicemanager/OpdeServiceManager.cpp
     servicemanager/OpdeServiceManager.h
+)
+
+add_library(OpdeBase OBJECT ${OPDE_BASE_SOURCES})
+
+target_include_directories(OpdeBase PUBLIC
+    ${OPDE_BINARY_DIR}
+    ${OPDE_SOURCE_DIR}/src/base
+    ${OPDE_SOURCE_DIR}/src/base/console
+    ${OPDE_SOURCE_DIR}/src/base/compat
+    ${OPDE_SOURCE_DIR}/src/base/dyntype
+    ${OPDE_SOURCE_DIR}/src/base/file
+    ${OPDE_SOURCE_DIR}/src/base/loaders
+    ${OPDE_SOURCE_DIR}/src/base/logger
+    ${OPDE_SOURCE_DIR}/src/base/servicemanager
+    ${OPDE_SOURCE_DIR}/src/compat
+)
+
+target_compile_options(OpdeBase PRIVATE
+    $<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:
+        -Wall -fno-strict-aliasing -fvisibility=default>
 )

@@ -34,8 +34,8 @@
 
 namespace Opde {
 
-struct IsNewline : public std::unary_function<char, bool> {
-    bool operator()(char c) { return (c == '\n' || c == '\r'); }
+struct IsNewline {
+    bool operator()(char c) const { return (c == '\n' || c == '\r'); }
 };
 
 static IsNewline sIsNewLine;

@@ -25,8 +25,9 @@
 #ifndef __ITERATOR_H
 #define __ITERATOR_H
 
-#include <string>
+#include <cassert>
 #include <memory>
+#include <string>
 
 #include "config.h"
 
