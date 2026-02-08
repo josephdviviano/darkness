@@ -275,7 +275,7 @@ void Relation::load(const FileGroupPtr &db, const BitArray &objMask) {
         // Check if the flavor fits
         // The mID can't be negative, but just for sure:
         assert(mID >= 0);
-        assert(LINK_ID_FLAVOR(link->mID) ==
+        assert(LINK_ID_FLAVOR(link.mID) ==
                static_cast<unsigned int>(mID)); // keep compiler happy
 
         // Look if we fit into the mask
@@ -417,7 +417,7 @@ link_id_t Relation::create(int from, int to) {
 
     link_id_t id = getFreeLinkID(cidx);
 
-    Link newl{id, from, to, mID};
+    Link newl{id, from, to, static_cast<uint>(mID)};
     mStorage->create(id);
 
     // Last, insert the link to the database and notify
@@ -438,7 +438,7 @@ link_id_t Relation::createWithValues(int from, int to,
 
     link_id_t id = getFreeLinkID(cidx);
 
-    Link newl{id, from, to, mID};
+    Link newl{id, from, to, static_cast<uint>(mID)};
 
     mStorage->createWithValues(id, dataValues);
 
@@ -459,7 +459,7 @@ link_id_t Relation::createWithValue(int from, int to, const Variant &value) {
 
     link_id_t id = getFreeLinkID(cidx);
 
-    Link newl{id, from, to, mID};
+    Link newl{id, from, to, static_cast<uint>(mID)};
 
     mStorage->createWithValue(id, value);
 

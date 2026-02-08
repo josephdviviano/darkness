@@ -26,8 +26,6 @@
 
 #include "config.h"
 
-#include <OgreDataStream.h>
-
 #include "OpdeException.h"
 #include "SharedPtr.h"
 #include "integers.h"
@@ -286,38 +284,6 @@ public:
      * @return std::fstream instance for the opened file
      */
     std::fstream &getStream();
-};
-
-/** Read only File implementation using Ogre's DataStream.
- */
-class OgreFile : public File {
-private:
-    Ogre::DataStreamPtr mStream;
-
-public:
-    /** Constructor. Takes ogre's DataStream as source. Read only. */
-    OgreFile(const Ogre::DataStreamPtr &stream);
-
-    /** @copydoc File::size() */
-    virtual const file_size_t size();
-
-    /** @copydoc File::seek(file_offset_t,SeekMode) */
-    virtual void seek(file_offset_t pos, SeekMode mode);
-
-    /** @copydoc File::seek(file_pos_t) */
-    virtual void seek(file_pos_t pos);
-
-    /** @copydoc File::tell() */
-    virtual const file_pos_t tell();
-
-    /** @copydoc File::read() */
-    virtual File &read(void *buf, file_size_t size);
-
-    /** @copydoc File::write() */
-    virtual File &write(const void *buf, file_size_t size);
-
-    /** @copydoc File::eof() */
-    virtual bool eof() const;
 };
 
 /** Memory file. Virtual file existing in the memory. Speciality of this class

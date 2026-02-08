@@ -27,10 +27,10 @@
 
 #include "ConsoleBackend.h"
 
-#include <OgreStringVector.h>
+#include <cassert>
+#include <sstream>
 
 namespace Opde {
-using namespace Ogre;
 using namespace std;
 
 const char *logLevels[5] = {"FATAL", "ERROR", "INFO", "DEBUG", "VERBOSE"};
@@ -57,12 +57,25 @@ ConsoleBackend::~ConsoleBackend() {
 
 void ConsoleBackend::addText(std::string text, size_t level) {
     // split the text on newlines, to aid line counting
-    StringVector lines = StringUtil::split(text, "\r\n");
+    std::vector<std::string> lines;
+    std::string line;
+    for (char c : text) {
+        if (c == '\r' || c == '\n') {
+            if (!line.empty()) {
+                lines.push_back(line);
+                line.clear();
+            }
+        } else {
+            line += c;
+        }
+    }
+    if (!line.empty())
+        lines.push_back(line);
+    if (lines.empty())
+        lines.push_back(text);
 
-    StringVector::iterator it = lines.begin();
-
-    for (; it != lines.end(); it++) {
-        mMessages.push_back(std::make_pair(level, *it));
+    for (auto &l : lines) {
+        mMessages.push_back(std::make_pair(level, l));
     }
 
     // if the size is greater the mTextHistory, remove till sufficient
@@ -148,13 +161,6 @@ std::string ConsoleBackend::tabComplete(std::string Text) {
 
 void ConsoleBackend::putMessage(std::string text, size_t level) {
     addText(text, level);
-}
-
-void ConsoleBackend::messageLogged(const String &message, LogMessageLevel lml,
-                                   bool maskDebug, const String &logName,
-                                   bool &skipThisMessage) {
-    if (lml == LML_CRITICAL)
-        addText("OgreLog: (" + logName + ") : " + message);
 }
 
 void ConsoleBackend::logMessage(Logger::LogLevel level,

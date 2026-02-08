@@ -74,7 +74,7 @@ public:
     }
 
     LinkStruct toStruct() const {
-        return {mID, mSrc, mDst, mFlavor};
+        return {mID, mSrc, mDst, static_cast<uint16_t>(mFlavor)};
     }
 
     inline link_id_t id() const { return mID; };

@@ -1,84 +1,37 @@
 # A monolith object library for all services
-include_directories(
-    ${OPDE_BINARY_DIR}
-    ${ODE_INCLUDE_DIR}
-    ${OGRE_INCLUDE_DIR}
-    ${OPDE_BINARY_DIR}
-    ${OPDE_BASE_INCLUDES}
-    ${PYTHON_INCLUDE_PATH}
-    ${OPDE_SOURCE_DIR}/src/base
-    ${OPDE_SOURCE_DIR}/src/base/Dark
-    ${OPDE_SOURCE_DIR}/src/base/console
-    ${OPDE_SOURCE_DIR}/src/base/compat
-    ${OPDE_SOURCE_DIR}/src/base/dyntype
-    ${OPDE_SOURCE_DIR}/src/base/file
-    ${OPDE_SOURCE_DIR}/src/base/loaders
-    ${OPDE_SOURCE_DIR}/src/base/logger
-    ${OPDE_SOURCE_DIR}/src/base/servicemanager
-    ${OPDE_SOURCE_DIR}/src/bindings
-    ${OPDE_SOURCE_DIR}/src/compat
-    ${OPDE_SOURCE_DIR}/src/services
-    ${OPDE_SOURCE_DIR}/src/scenemanager
-)
 
-SET(PLATFORM_SOURCES
+set(PLATFORM_SOURCES
     platform/PlatformService.cpp
     platform/PlatformService.h
     platform/Platform.cpp
     platform/Platform.h
 )
 
-# OS Specific code follows. Example: OS X could have a specific condition here
-IF(UNIX)
-    IF(APPLE)
-        # Apple specific platform
-        # LIST(APPEND PLATFORM_SOURCES platform/ApplePlatform.cpp platform/ApplePlatform.h)
-        MESSAGE(FATAL_ERROR "Apple platform currently unsupported! Please consider helping us by providing the platform specific code!")
-    ELSE(APPLE)
+# OS Specific code follows
+if(UNIX)
+    if(APPLE)
+        # Apple uses the Unix platform base with macOS-specific paths
+        list(APPEND PLATFORM_SOURCES platform/ApplePlatform.cpp platform/ApplePlatform.h)
+    else()
         # Generic unix platform
-        LIST(APPEND PLATFORM_SOURCES platform/UnixPlatform.cpp platform/UnixPlatform.h)
-	ENDIF(APPLE)
-ELSE(UNIX)
-	IF(WIN32)
-        LIST(APPEND PLATFORM_SOURCES platform/Win32Platform.cpp platform/Win32Platform.h)
-	ELSE(WIN32)
-		MESSAGE(FATAL_ERROR "Unknown platform encountered! Please consider helping us by providing your platform specific code!")
-	ENDIF(WIN32)
-ENDIF(UNIX)
+        list(APPEND PLATFORM_SOURCES platform/UnixPlatform.cpp platform/UnixPlatform.h)
+    endif()
+else()
+    if(WIN32)
+        list(APPEND PLATFORM_SOURCES platform/Win32Platform.cpp platform/Win32Platform.h)
+    else()
+        message(FATAL_ERROR "Unknown platform encountered! Please consider helping us by providing your platform specific code!")
+    endif()
+endif()
 
-add_library (OpdeServices OBJECT
-    camera/CameraService.cpp
-    camera/CameraService.h
+# Core services that work without a renderer
+set(HEADLESS_SERVICES_SOURCES
     config/ConfigService.cpp
     config/ConfigService.h
     database/DatabaseService.cpp
     database/DatabaseService.h
-    draw/DrawBuffer.cpp
-    draw/DrawBuffer.h
-    draw/DrawCommon.cpp
-    draw/DrawCommon.h
-    draw/DrawOperation.cpp
-    draw/DrawOperation.h
-    draw/DrawService.cpp
-    draw/DrawService.h
-    draw/DrawSheet.cpp
-    draw/DrawSheet.h
-    draw/FontDrawSource.cpp
-    draw/FontDrawSource.h
-    draw/RenderedImage.cpp
-    draw/RenderedImage.h
-    draw/RenderedLabel.cpp
-    draw/RenderedLabel.h
-    draw/RenderedRect.cpp
-    draw/RenderedRect.h
-    draw/TextureAtlas.cpp
-    draw/TextureAtlas.h
     game/GameService.cpp
     game/GameService.h
-    gui/ConsoleGUI.cpp
-    gui/ConsoleGUI.h
-    gui/GUIService.cpp
-    gui/GUIService.h
     inherit/ArchetypeInheritor.cpp
     inherit/ArchetypeInheritor.h
     inherit/CachedInheritor.cpp
@@ -88,12 +41,6 @@ add_library (OpdeServices OBJECT
     inherit/InheritService.h
     inherit/NeverInheritor.cpp
     inherit/NeverInheritor.h
-    input/InputEventMapper.cpp
-    input/InputEventMapper.h
-    input/InputService.cpp
-    input/InputService.h
-    light/LightService.cpp
-    light/LightService.h
     link/LinkCommon.h
     link/LinkService.cpp
     link/LinkService.h
@@ -101,8 +48,6 @@ add_library (OpdeServices OBJECT
     link/Relation.h
     loop/LoopService.cpp
     loop/LoopService.h
-    material/MaterialService.cpp
-    material/MaterialService.h
     object/ObjectService.cpp
     object/ObjectService.h
     object/PositionPropertyStorage.cpp
@@ -125,13 +70,59 @@ add_library (OpdeServices OBJECT
     physics/PhysSphereModel.cpp
     physics/PhysSphereModel.h
     ${PLATFORM_SOURCES}
-    player/PlayerService.cpp
-    player/PlayerService.h
     property/PropertyCommon.h
     property/Property.cpp
     property/Property.h
     property/PropertyService.cpp
     property/PropertyService.h
+    room/RoomCommon.h
+    room/Room.cpp
+    room/Room.h
+    room/RoomPortal.cpp
+    room/RoomPortal.h
+    room/RoomService.cpp
+    room/RoomService.h
+    ServiceCommon.h
+    sim/SimService.cpp
+    sim/SimService.h
+)
+
+# Rendering services that require Ogre3D (or eventually bgfx)
+set(RENDER_SERVICES_SOURCES
+    camera/CameraService.cpp
+    camera/CameraService.h
+    draw/DrawBuffer.cpp
+    draw/DrawBuffer.h
+    draw/DrawCommon.cpp
+    draw/DrawCommon.h
+    draw/DrawOperation.cpp
+    draw/DrawOperation.h
+    draw/DrawService.cpp
+    draw/DrawService.h
+    draw/DrawSheet.cpp
+    draw/DrawSheet.h
+    draw/FontDrawSource.cpp
+    draw/FontDrawSource.h
+    draw/RenderedImage.cpp
+    draw/RenderedImage.h
+    draw/RenderedLabel.cpp
+    draw/RenderedLabel.h
+    draw/RenderedRect.cpp
+    draw/RenderedRect.h
+    draw/TextureAtlas.cpp
+    draw/TextureAtlas.h
+    gui/ConsoleGUI.cpp
+    gui/ConsoleGUI.h
+    gui/GUIService.cpp
+    gui/GUIService.h
+    input/InputEventMapper.cpp
+    input/InputEventMapper.h
+    input/InputService.cpp
+    input/InputService.h
+    light/LightService.cpp
+    light/LightService.h
+    material/MaterialService.cpp
+    material/MaterialService.h
     render/EntityMaterialInstance.cpp
     render/EntityMaterialInstance.h
     render/EntityInfo.cpp
@@ -157,18 +148,6 @@ add_library (OpdeServices OBJECT
     render/SubEntityMaterialInstance.h
     render/ZBiasProperty.cpp
     render/ZBiasProperty.h
-    room/RoomCommon.h
-    room/Room.cpp
-    room/Room.h
-    room/RoomPortal.cpp
-    room/RoomPortal.h
-    room/RoomService.cpp
-    room/RoomService.h
-    script/ScriptService.cpp
-    script/ScriptService.h
-    ServiceCommon.h
-    sim/SimService.cpp
-    sim/SimService.h
     worldrep/LightmapAtlas.cpp
     worldrep/LightmapAtlas.h
     worldrep/LightsForCell.cpp
@@ -179,4 +158,18 @@ add_library (OpdeServices OBJECT
     worldrep/WRCell.h
     worldrep/WRCommon.h
     worldrep/WRTypes.h
+)
+
+add_library(OpdeServices OBJECT ${HEADLESS_SERVICES_SOURCES})
+
+target_link_libraries(OpdeServices PUBLIC OpdeBase)
+
+target_include_directories(OpdeServices PUBLIC
+    ${ODE_INCLUDE_DIR}
+    ${OPDE_SOURCE_DIR}/src/services
+)
+
+target_compile_options(OpdeServices PRIVATE
+    $<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:
+        -Wall -fno-strict-aliasing -fvisibility=default>
 )

@@ -27,12 +27,9 @@
 
 #include "OpdeSingleton.h"
 
+#include <chrono>
 #include <cstddef>
 #include <vector>
-
-namespace Ogre {
-class Timer;
-};
 
 namespace Opde {
 
@@ -40,7 +37,7 @@ namespace Opde {
 class Tracer : public Singleton<Tracer> {
 public:
     /** Constructor */
-    Tracer(Ogre::Timer *timer);
+    Tracer();
 
     /** Destructor. Does not deallocate the listeners, as this is not a wanted
      * behavior. */
@@ -64,7 +61,12 @@ public:
     static Tracer *getSingletonPtr(void);
 
 private:
-    Ogre::Timer *mTimer;
+    unsigned long getMicroseconds() const;
+
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = std::chrono::time_point<Clock>;
+
+    TimePoint mStartTime;
 
     /** Frame number for perf tracer */
     size_t mTraceFrameNum;

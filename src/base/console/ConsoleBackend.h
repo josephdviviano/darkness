@@ -27,10 +27,11 @@
 
 #include "config.h"
 
+#include <deque>
 #include <map>
+#include <set>
 #include <string>
-
-#include "OgreLogManager.h"
+#include <vector>
 
 #include "ConsoleCommandListener.h"
 
@@ -43,11 +44,10 @@ namespace Opde {
  * A singleton class, used to insert texts to console and to call Command
  * Listeners */
 class ConsoleBackend : public Singleton<ConsoleBackend>,
-                       public Ogre::LogListener,
                        public Opde::LogListener {
 public:
     /** A pair - level, message */
-    typedef std::pair<size_t, Ogre::String> Message;
+    typedef std::pair<size_t, std::string> Message;
 
 private:
     /** Map of the string to the Listeners which handle them */
@@ -102,14 +102,6 @@ public:
 
     /* Writes a simple message to the console */
     void putMessage(std::string text, size_t level = 2);
-
-    /** Ogre's log listener implementation. Used as a to console logger for the
-     * ogre Logging system. This means that one can se the ogre logger to write
-     * messages to console too */
-    virtual void messageLogged(const Ogre::String &message,
-                               Ogre::LogMessageLevel lml, bool maskDebug,
-                               const Ogre::String &logName,
-                               bool &skipThisMessage);
 
     /** Opde logging method implementation */
     virtual void logMessage(Logger::LogLevel level, const std::string &msg);

@@ -23,10 +23,8 @@
 
 #include "File.h"
 #include "config.h"
-#include <OgreLogManager.h>
 
 using namespace std;
-using namespace Ogre;
 
 namespace Opde {
 
@@ -354,53 +352,6 @@ bool StdFile::eof() const { return mStream.eof(); }
 
 //------------------------------------
 std::fstream &StdFile::getStream() { return mStream; }
-
-/*------------------------------------------------------*/
-/*--------------------- OgreFile -----------------------*/
-/*------------------------------------------------------*/
-OgreFile::OgreFile(const Ogre::DataStreamPtr &stream)
-    : File(stream->getName(), File::FILE_R), mStream(stream) {
-    mAccessMode = FILE_R;
-}
-
-const file_size_t OgreFile::size() { return mStream->size(); }
-
-void OgreFile::seek(file_offset_t pos, SeekMode mode) {
-    file_pos_t npos = pos;
-
-    switch (mode) {
-    case FSEEK_BEG:
-        break;
-    case FSEEK_END:
-        npos = mStream->size() - pos;
-        break;
-    case FSEEK_CUR:
-        npos += mStream->tell();
-        break;
-    default: // should not happen
-        OPDE_FILEEXCEPT(FILE_OTHER_ERROR, "Unknown seek position modifier",
-                        "OgreFile.seek()");
-    }
-
-    mStream->seek(npos);
-};
-
-void OgreFile::seek(file_pos_t pos) { mStream->seek(pos); };
-
-const file_pos_t OgreFile::tell() { return mStream->tell(); };
-
-File &OgreFile::read(void *buf, file_size_t size) {
-    mStream->read(buf, size);
-
-    return *this;
-};
-
-File &OgreFile::write(const void *buf, file_size_t size) {
-    OPDE_FILEEXCEPT(FILE_WRITE_ERROR, "OgreFile write is not possible",
-                    "OgreFile::write");
-};
-
-bool OgreFile::eof() const { return mStream->eof(); }
 
 /*------------------------------------------------------*/
 /*--------------------- MemoryFile ---------------------*/

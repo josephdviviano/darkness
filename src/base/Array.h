@@ -27,7 +27,7 @@
 
 #include "OpdeException.h"
 
-#include <malloc.h>
+#include <cstdlib>
 #include <cassert>
 
 

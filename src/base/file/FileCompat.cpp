@@ -28,8 +28,13 @@
 #include "config.h"
 
 #include "FileCompat.h"
-#include <OgreMath.h>
-#include <OgreMatrix3.h>
+#include "Matrix3.h"
+
+#include <cmath>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace Opde {
 // Vector2
@@ -68,17 +73,17 @@ File &operator>>(File &st, Plane &val) {
 File &operator<<(File &st, const Quaternion &val) {
     int16_t xi, yi, zi;
 
-    Ogre::Matrix3 m;
+    Matrix3 m;
 
     val.ToRotationMatrix(m);
 
-    Ogre::Radian x, y, z;
+    float x_rad, y_rad, z_rad;
 
-    m.ToEulerAnglesZYX(z, y, x);
+    m.ToEulerAnglesZYX(z_rad, y_rad, x_rad);
 
-    xi = static_cast<int16_t>(x.valueRadians() * 32768 / Ogre::Math::PI);
-    yi = static_cast<int16_t>(y.valueRadians() * 32768 / Ogre::Math::PI);
-    zi = static_cast<int16_t>(z.valueRadians() * 32768 / Ogre::Math::PI);
+    xi = static_cast<int16_t>(x_rad * 32768 / M_PI);
+    yi = static_cast<int16_t>(y_rad * 32768 / M_PI);
+    zi = static_cast<int16_t>(z_rad * 32768 / M_PI);
 
     st << xi << yi << zi;
 
@@ -91,15 +96,13 @@ File &operator>>(File &st, Quaternion &val) {
 
     st >> xi >> yi >> zi;
 
-    x = ((float)(xi) / 32768) * Ogre::Math::PI;
-    y = ((float)(yi) / 32768) * Ogre::Math::PI;
-    z = ((float)(zi) / 32768) * Ogre::Math::PI;
+    x = ((float)(xi) / 32768) * static_cast<float>(M_PI);
+    y = ((float)(yi) / 32768) * static_cast<float>(M_PI);
+    z = ((float)(zi) / 32768) * static_cast<float>(M_PI);
 
-    Ogre::Matrix3 m;
+    Matrix3 m;
 
-    // Still not there, but close
-    m.FromEulerAnglesZYX(Ogre::Radian(z), Ogre::Radian(y), Ogre::Radian(x));
-    Quaternion q;
+    m.FromEulerAnglesZYX(z, y, x);
     val.FromRotationMatrix(m);
 
     return st;

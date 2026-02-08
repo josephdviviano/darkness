@@ -27,6 +27,9 @@
 #ifndef __ROOM_H
 #define __ROOM_H
 
+#include <set>
+#include <vector>
+
 #include "Array.h"
 #include "File.h"
 #include "Plane.h"

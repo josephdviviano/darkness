@@ -32,9 +32,7 @@
 #include "SharedPtr.h"
 #include "DatabaseCommon.h"
 
-namespace Ogre {
-class Timer;
-} // namespace Ogre
+#include <chrono>
 
 namespace Opde {
 
@@ -131,6 +129,9 @@ protected:
     /// Calls onDBLoad on all listeners obeying priorities
     void broadcastOnDBDrop(uint32_t dropmask);
 
+    /// Returns elapsed time in milliseconds since service start
+    unsigned long getMilliseconds() const;
+
     FileGroupPtr mCurDB;
 
     /// Used to report to the Progress Listener
@@ -143,7 +144,7 @@ protected:
 
     Listeners mListeners;
 
-    Ogre::Timer *mTimer;
+    std::chrono::steady_clock::time_point mStartTime;
 };
 
 /// Factory for the DatabaseService objects

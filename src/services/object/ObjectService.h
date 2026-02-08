@@ -41,8 +41,6 @@
 
 #include "BitArray.h"
 
-#include <OgreSceneManager.h>
-
 #include <stack>
 
 namespace Opde {
@@ -253,9 +251,6 @@ protected:
 
     /// Donor type property pointer
     Property *mPropDonorType;
-
-    /// Scene manager pointer
-    Ogre::SceneManager *mSceneMgr;
 
     /// Our specialized property storage for symbolic names
     SymNamePropertyStoragePtr mSymNameStorage;

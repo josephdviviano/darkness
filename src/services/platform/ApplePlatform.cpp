@@ -23,6 +23,8 @@
 
 #include "ApplePlatform.h"
 
+#include <cstdlib>
+
 using namespace std;
 
 namespace Opde {
@@ -37,14 +39,15 @@ ApplePlatform::~ApplePlatform() {}
 
 //------------------------------------------------------
 std::string ApplePlatform::getGlobalConfigPath() const {
-    // TODO: CODE
-    return "/Invalid/";
+    return "/usr/local/share/opde";
 }
 
 //------------------------------------------------------
 std::string ApplePlatform::getUserConfigPath() const {
-    // TODO: CODE
-    return "/Invalid/";
+    const char *home = std::getenv("HOME");
+    if (home)
+        return std::string(home) + "/Library/Application Support/opde";
+    return "/tmp/opde";
 }
 
 //------------------------------------------------------

@@ -30,9 +30,6 @@
 #include <sstream>
 #include <stdio.h>
 
-// measures the perf traces.
-#include <OgreTimer.h>
-
 #ifdef _MSC_VER
 #pragma warning(disable : 4996)
 #endif
@@ -41,11 +38,17 @@ namespace Opde {
 
 template <> Tracer *Singleton<Tracer>::ms_Singleton = 0;
 
-Tracer::Tracer(Ogre::Timer *timer)
-    : mTimer(timer), mTraceFrameNum(0),
-      mFrameStartTime(mTimer->getMicroseconds()) {}
+Tracer::Tracer()
+    : mStartTime(Clock::now()), mTraceFrameNum(0),
+      mFrameStartTime(getMicroseconds()) {}
 
 Tracer::~Tracer() {}
+
+unsigned long Tracer::getMicroseconds() const {
+    auto elapsed = Clock::now() - mStartTime;
+    return static_cast<unsigned long>(
+        std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
+}
 
 Tracer &Tracer::getSingleton(void) {
     assert(ms_Singleton);
@@ -56,7 +59,7 @@ Tracer *Tracer::getSingletonPtr(void) { return ms_Singleton; }
 
 void Tracer::traceStartFrame() {
     // spit out the traces?
-    unsigned long now = mTimer->getMicroseconds();
+    unsigned long now = getMicroseconds();
     unsigned long spentTime = now - mFrameStartTime;
 
     // For now, I'm spitting this into normal log. Later I'll
@@ -83,13 +86,13 @@ void Tracer::traceStartFrame() {
     ++mTraceFrameNum;
     mTraces.clear();
     mTraces.reserve(256);
-    mFrameStartTime = mTimer->getMicroseconds();
+    mFrameStartTime = getMicroseconds();
 }
 
 /** logs a tracer record used for performance tracing */
 unsigned long Tracer::trace(bool start, const char *func, const void *data) {
     TraceRecord trace;
-    trace.time = mTimer->getMicroseconds();
+    trace.time = getMicroseconds();
     trace.entry = start;
     trace.text = func;
     trace.function = true;
@@ -103,7 +106,7 @@ void Tracer::trace_endpoint(const char *func,
                             const void *data, unsigned long start)
 {
     TraceRecord trace;
-    trace.time = mTimer->getMicroseconds();
+    trace.time = getMicroseconds();
     trace.entry = false;
     trace.text = func;
     trace.function = true;
@@ -115,12 +118,11 @@ void Tracer::trace_endpoint(const char *func,
 /** logs a tracer record used for performance tracing */
 void Tracer::tracePoint(const char *text) {
     TraceRecord trace;
-    trace.time = mTimer->getMicroseconds();
+    trace.time = getMicroseconds();
     trace.entry = true;
     trace.text = text;
     trace.function = false;
     mTraces.push_back(trace);
 }
-
 
 } // namespace Opde

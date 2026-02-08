@@ -22,9 +22,6 @@
  *
  *****************************************************************************/
 
-#include <OgreMath.h>
-#include <OgreStringConverter.h>
-
 #include "ObjectService.h"
 #include "OpdeServiceManager.h"
 #include "PositionPropertyStorage.h"
@@ -49,7 +46,8 @@ ObjectService::ObjectService(ServiceManager *manager, const std::string &name)
     : ServiceImpl<Opde::ObjectService>(manager, name), mAllocatedObjects(),
       mDatabaseService(NULL),
       mObjVecVerMaj(0), // Seems to be the same for all versions
-      mObjVecVerMin(2), mSceneMgr(NULL), mSymNameStorage(NULL),
+      mObjVecVerMin(2),
+      mSymNameStorage(NULL),
       mPositionStorage(NULL) {}
 
 //------------------------------------------------------

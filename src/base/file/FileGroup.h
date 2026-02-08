@@ -27,6 +27,8 @@
 
 #include "config.h"
 
+#include <map>
+
 #include "File.h"
 #include "OpdeException.h"
 #include "SharedPtr.h"

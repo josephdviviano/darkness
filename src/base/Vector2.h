@@ -17,18 +17,52 @@
  *    along with this program; if not, write to the Free Software
  *    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
- *
- *	$Id:$
- *
  *****************************************************************************/
 
 #ifndef __VECTOR2_H
 #define __VECTOR2_H
 
-#include <OgreVector2.h>
+#include <cmath>
 
 namespace Opde {
-typedef Ogre::Vector2 Vector2;
-}
+
+struct Vector2 {
+    float x, y;
+
+    Vector2() : x(0), y(0) {}
+    Vector2(float x_, float y_) : x(x_), y(y_) {}
+
+    Vector2 operator+(const Vector2 &rhs) const {
+        return Vector2(x + rhs.x, y + rhs.y);
+    }
+
+    Vector2 operator-(const Vector2 &rhs) const {
+        return Vector2(x - rhs.x, y - rhs.y);
+    }
+
+    Vector2 operator*(float s) const {
+        return Vector2(x * s, y * s);
+    }
+
+    bool operator==(const Vector2 &rhs) const {
+        return x == rhs.x && y == rhs.y;
+    }
+
+    bool operator!=(const Vector2 &rhs) const {
+        return !(*this == rhs);
+    }
+
+    float dotProduct(const Vector2 &rhs) const {
+        return x * rhs.x + y * rhs.y;
+    }
+
+    float length() const {
+        return std::sqrt(x * x + y * y);
+    }
+
+    static const Vector2 ZERO;
+};
+
+} // namespace Opde
 
 #endif

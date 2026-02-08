@@ -17,18 +17,45 @@
  *    along with this program; if not, write to the Free Software
  *    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
- *
- *	$Id:$
- *
  *****************************************************************************/
 
 #ifndef __PLANE_H
 #define __PLANE_H
 
-#include <OgrePlane.h>
+#include "Vector3.h"
 
 namespace Opde {
-typedef Ogre::Plane Plane;
-}
+
+struct Plane {
+    enum Side {
+        NO_SIDE,
+        POSITIVE_SIDE,
+        NEGATIVE_SIDE,
+        BOTH_SIDE
+    };
+
+    Vector3 normal;
+    float d;
+
+    Plane() : normal(Vector3::ZERO), d(0.0f) {}
+    Plane(const Vector3 &normal_, float d_) : normal(normal_), d(d_) {}
+    Plane(float a, float b, float c, float d_)
+        : normal(a, b, c), d(d_) {}
+
+    float getDistance(const Vector3 &point) const {
+        return normal.dotProduct(point) + d;
+    }
+
+    Side getSide(const Vector3 &point) const {
+        float dist = getDistance(point);
+        if (dist < 0.0f)
+            return NEGATIVE_SIDE;
+        if (dist > 0.0f)
+            return POSITIVE_SIDE;
+        return NO_SIDE;
+    }
+};
+
+} // namespace Opde
 
 #endif

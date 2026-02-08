@@ -22,6 +22,8 @@
  *****************************************************************************/
 
 #include "Variant.h"
+#include <cassert>
+#include <sstream>
 #include <stdexcept>
 
 using namespace std;
@@ -813,7 +815,7 @@ template <> std::string Variant::as<std::string>() const { return toString(); }
 template <> Vector3 Variant::as<Vector3>() const { return toVector(); }
 
 //------------------------------------
-template <> Ogre::Quaternion Variant::as<Ogre::Quaternion>() const {
+template <> Quaternion Variant::as<Quaternion>() const {
     return toQuaternion();
 }
 

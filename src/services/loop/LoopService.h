@@ -40,9 +40,7 @@
 #include "SharedPtr.h"
 #include "compat.h"
 
-namespace Ogre {
-class Root;
-} // namespace Ogre
+#include <chrono>
 
 namespace Opde {
 
@@ -201,8 +199,8 @@ protected:
     /// List of registered loop clients
     LoopClientList mLoopClients;
 
-    /// Ogre::Root for timing purposes
-    Ogre::Root *mRoot;
+    /// Start time for timing purposes
+    std::chrono::steady_clock::time_point mStartTime;
 
     /// Time of the last frame (absolute)
     unsigned long mLastFrameTime;
