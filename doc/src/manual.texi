@@ -1,0 +1,854 @@
+\input texinfo @c -*-texinfo-*-
+@c %**start of header
+@setfilename manual.info
+@settitle OpenDarkEngine Developer's Manual
+@c %**end of header
+
+@copying
+This manual is for openDarkEngine (version @value{VERSION}, @value{UPDATED})
+
+Copyright @copyright{} 2005-2009 OpenDarkEngine team.
+
+@quotation
+Permission is granted to copy, distribute and/or modify this document
+under the terms of the GNU Free Documentation License, Version 1.2 or
+any later version published by the Free Software Foundation; with no
+Invariant Sections, with the Front-Cover Texts being ``A GNU Manual,''
+and with the Back-Cover Texts as in (a) below.  A copy of the
+license is included in the section entitled ``GNU Free Documentation
+License.''
+
+(a) The FSF's Back-Cover Text is: ``You have the freedom to
+copy and modify this GNU manual.  Buying copies from the FSF
+supports it in developing GNU and promoting software freedom.''
+@end quotation
+@end copying
+
+@titlepage
+@title Sample Title
+    
+@c The following two commands start the copyright page.
+@page
+@vskip 0pt plus 1filll
+@insertcopying
+@end titlepage
+     
+@c Output the table of contents at the beginning.
+@contents
+
+@ifnottex
+@node Top
+@top OpenDarkEngine Developer's Manual
+     
+This is the main developer's manual for OpenDarkEngine
+@end ifnottex
+     
+@menu
+* Introduction::      Introduction to the manual
+* Core architecture:: The core architecture of the engine
+* Directory structure:: The directory structure of the source code
+* Dark Engine's core concepts:: The key concepts found in Dark Engine, definition of terms
+* Services::          The available services
+* Input Service::
+* Binary Service::
+* Database Service::
+* Object Service::
+* Link Service::
+* Property Service::
+* Inherit Service::
+* MetaProperty::
+* WorldRep Service::
+* Light Service::
+* Material Service::
+* Render Service::
+* Draw Service::
+* Sim Service::
+* Config Service::
+* Loop Service::
+* Script Service::
+* DType::	Language explanation
+* PLDef::	Language explanation
+* Index::
+@c Not used right now - * Index::             Complete index.
+@end menu
+
+
+@c --------------------------------------------------------------------
+@node Introduction
+@chapter Introduction
+@cindex Introduction
+
+You have just started reading the developers manual for OpenDarkEngine project. The aim of this document is
+to give you some insight about the project's architecture, enable you to quickly orient in the project's source
+code.
+
+@cindex Used technologies
+@subheading Used technologies
+The core of OpenDarkEngine written in C++, various other parts are planned or already written in python. Build system
+used is CMake. Libraries currently used are OGRE, FreeImage and OIS.
+
+@cindex Build environment
+@subheading Build environment
+The project is being developed on windows and linux in parallel. It is verified that it is buildable using Visual C++ on
+windows and GCC4 on linux. Eclipse CDT is recommended IDE under linux, but others are also usable (for example Code::Blocks).
+CMake can generate workspace or project files for various IDEs there are - be sure to make yourself comfortable before starting
+to do any modifications.
+
+For up-to-date build guides, please consult the doc/DEVELOPERS document in the source distribution.
+
+@c --------------------------------------------------------------------
+@node Core architecture
+@chapter Core architecture
+@cindex Core architecture
+
+Whole engine exists in the Opde namespace. That means that every class definition, as well as typedef or enumeration,
+all these things are defined within the Opde namespace, and either prefixed with 'Opde::', or imported via using keyword
+when referenced from outside of this namespace. The only exceptions to this rule is code that links the openDarkEngine
+to Ogre library.
+
+@cindex shared_ptr
+Throughout the source code, some of the instances are held in memory - their lifetime is controled - by shared_ptr class.
+This class is very simmilar to the Boost's shared_ptr. The instances held by this smart pointer wrapper are easily identified
+thanks to the typedefs used to distribute them - all those types are postfixed with 'Ptr' string (e.g. 'ServicePtr').
+
+@cindex Callbacks
+Also worth mentioning is extensive use of the listener approach and factory approach. Classes can expose different message types, 
+which other register to, and then receive the message whenever the source class has something to tell. See the MessageSource.h and 
+Callback.h files in src/base directory.
+
+@cindex Architectural Overview
+@heading Architectural Overview
+
+@image{img/overview}
+
+This is the great overview of the planned structure of OpenDarkEngine. Some services might be missing in the diagram,
+and the diagram will probably develop as the project gets further. Still this gives a rough view of what the engine will be build
+of, and which categories of services exist. Each service in this picture is a standalone unit that targets a different task.
+
+@cindex Core classes
+@heading Core classes
+
+These are the core classes used:
+@table @asis
+@item Opde::Root
+	A central class for the engine. Manages the engines lifetime.
+@item Opde::ServiceManager
+	Manages the Service objects.
+@item Opde::Service
+	Subclasses of which fulfil various purposes (Graphics, AI, Sound, Physics, Object System, etc.)
+@end table
+
+@cindex Opde::Root
+@heading Root object
+Is a bed for the whole engine. Exposes various initialization methods, logging methods. Whole engine is constructed
+and initialized using this class.
+
+@cindex ServiceManager
+@heading ServiceManager
+
+@image{img/service}
+
+As the name of it suggests, this class is used to hold services and manage them. Each subclass of the Service class has a
+Factory class instance registered here (Opde::Root object does this). ServiceManager is a singleton class, meaning it only
+ever has one instance per application.
+
+Service manager also manages the bootstrap/main lifetime stages of the engine existence.
+
+For convenience, a @i{GET_SERVICE(ClassName)} macro exists, which gets the service instance and casts it to shared_ptr of the specified
+type. Example:
+
+@verbatim
+RenderServicePtr rs = GET_SERVICE(RenderService);
+@end verbatim
+
+Services, thanks to the shared_ptr, get destroyed once no reference points to them. One of the references is stored in the ServiceManager. 
+Normally, it is not needed to take special care about the Service reference count, but in some special cases, if the Service reference
+needs to be disposed to release the service (for example circular references between Services, or external usage of the Service), setting
+NULL to the service's shared_ptr is needed:
+
+@verbatim
+// prev. allocation
+RenderServicePtr rs = GET_SERVICE(RenderService);
+// some code
+rs->someMethod();
+// release the service 
+rs->setNull();
+// or rs = NULL;
+@end verbatim
+
+This operation is needed in the following situations:
+
+@itemize @bullet
+@item
+Circular reference between services - then the reference has to be released in the shutdown method of at least one of the services.
+@item
+External usage of the service - in this situation the service's reference has to be released before the ServiceManager (or Root object) is destroyed.
+@end itemize
+
+@cindex Service
+@heading Service
+The whole engine is built around a modular concept of Services. Services are autonomous classes (or sets of classes) that serve different 
+purposes. All service instances are managed using a ServiceManager object. Each of the service's instance exists only 
+once within ServiceManager's ownership. Services reference, use each other. For this to work well, shared pointers are
+used to reference services. 
+
+Each of the services has a name, type SID (e.g. Service ID) and service mask. SID is used to reference the service, Name is there to help debugging and logging,
+mask is used to automate some common tasks, and to mask the instantinated services, as requested via the parameter to the Opde::Root constructor. The service mask
+also enables one to construct, for example, only the core object system of the engine, meaning no graphical output, no simulation
+is done. This is especially usable for tool makers.
+
+All services are constructed using Service Factories, which are registered by either client code or Opde::Root object
+within the bootstrapping phase of the engine.
+
+There are three stages of service's life time:
+
+@cindex Service lifetime phases
+@table @asis
+@item Bootstrap phase
+	Which is used to setup resources for the services and initialize service's dependencies. 
+	This phase is active when the engine is bootstrapping.
+@item Main lifetime
+	Which represents the phase of the lifetime service is fully usable.
+@item Shutdown
+	Which is used to break circular references between services and release all the resources service holds.
+@end table
+
+All services are guaranteed to be bootstrapped and shut down under the condition of a normal application flow.
+
+@cindex Service masks
+@heading Service Masks
+Now you might wonder what the service masks are, and what are they used for? It's quite easy. Every registered Service Factory there
+is exposes a method to get the service mask for the given service. The service mask is freely used unsigned integer, which is compared
+with the specified mask that the service manager was constructed/initialized with. Nonzero bitwise and product will mean the service
+should be constructed and used.
+What's that good for? The engine can be told to be initialized and exist only with a subgroup of the available services. With SERVICE_CORE
+flags for example, the engine only initializes the services which are cruical to the engine - database and object services (together with some
+other core services - as for example the Config service).
+To learn more, look inside the src/services/serviceCommon.h file.
+
+@c --------------------------------------------------------------------
+@node Directory structure
+@chapter Directory structure
+@cindex Directory structure
+
+The source code of OpenDarkEngine is split across numerous directories to help with orientation. To understand the structure, these
+guidelines can be followed:
+
+@example
+proto/      - the prototype code directory - anything inside here is just for testing purposes, and does not belong to the source code of the engine
+scripts/    - this directory contains non-C++ code. @ref{DType} and @ref{PLDef} scripts are to be found here, as well as Ogre material and overlay scripts
+thirdparty/ - directory which contains various libraries that were not written by OpenDarkEngine team
+src/
+    compat/       - directory containing various compatibility related headers
+    main/         - this is the main, core code directory (all the executable's source code, as well as Root object and other glue and core code)
+    base/         - the base source code - contains a wide range of basic code - arrays, shared_pointers, ServiceManager code, etc.
+    bindings/     - Python OpenDarkEngine bindings
+    scenemanager/ - the Dark Scene Manager source code
+    services/     - the important part - all the services are here, each in it's own subdirectory
+    tools/        - various tools
+@end example
+
+@c --------------------------------------------------------------------
+@node Dark Engine's core concepts
+@chapter Dark Engine's core concepts
+@cindex Dark Engine's core concepts
+
+@cindex Object System
+@heading Object System
+The core of the engine is the object system. Object system in Dark Engine is quite different from what one would probably expect. There is no 
+object instance for objects one sees/uses, the game objects are just integer IDs that represent them. Everything the objects are consisted of 
+is stored as Property or link with the particular integer ID.
+
+@cindex Object types
+@cindex Archetype objects
+@cindex Concrete objects
+@subheading Object types
+There are two object types. Concrete objects and Archetype Objects. The Archetype objects (also called archetypes) are not live objects,
+but more template objects that serve as default value holders for properties and links. Archetypes typically have ID less than zero, and always bear DonorType property.
+The concrete objects are instances of the archetype objects, optionally. It is very common for concrete objects to inherit from an archetype. 
+
+There are a few archetype object types. Archetypes also inherit from each other, so there is what one could imagine as a set of trees with a root 
+object for every archetype type. Metaproperty archetype object tree needs a special attention. All the objects in that tree bear a different
+DonorType property value than the other archetypes, and when inherited, bear a different (non-zero) MetaProperty link priority value.
+The inheritance mechanisms are more explained later in the @ref{Inherit Service} section.
+
+Relations and Properies both utilise DataStorage class as a data storage backend (every object or link id can have data stored inside).
+
+@cindex property
+@cindex Properties
+@subheading Properties
+Properties are values or sets of values, that can be assigned to objects. Each object either holds a certain property type or doesn't.
+Properties come in different types, and serve different purposes. Each of those types has a different name which identifies it.
+
+Some properties are inherited (Others, like DonorType, are not). That means that if a given object does not own a value of the certain property, it still can have some inherited
+from an archetype object (see Object types). If object owns the property, any inherited values are typically masked, the priority of owned property is greater than the inherited one.
+
+Property service manages all object properties. Each of the property types has it's own PropertyGroup instance, or is constructed via code of the particular service which handles the
+property. Thus, we have SymbolicName and DonorType properties statically created in @ref{Object Service}, RenderType or RenderAlpha (and others) in @ref{Render Service}, etc.
+Properties can be implemented effectively, without the use of the DataStorage instance, or with it.
+
+
+@cindex Link
+@cindex Links
+@subheading Links
+
+Links are connections between objects. They have different types (called flavors). Each of the link flavors has different (if any - it's optional) data format attached and is managed
+with a different, separate Relation class. Relation instances come in pairs. This is meant to allow the usage of LinkFlavor, ~LinkFlavor pairs.
+
+Links have source object ID, destination object ID, flavor and link ID. Link ID is composed of three parts - Concreteness, Flavor and serial ID.
+
+@cindex Flavor
+@subheading Link Flavor
+Link flavor is a unique link type identifier. It comes as string (MetaProp, Contains, etc.) and ID (1/-1, 5/-5). The integer ID of the flavor is determined as the index of the flavor name in the 
+table stored in a chunk (see Tag File Database) named "Relations". This mapping happens dynamically upon gamesys or mission load. 
+
+@cindex Tag File Database
+@subheading Tag File Database
+Tag file database is a file format used in all 3 released dark engine games (as well as in the one unfinished). They can be viewed as uncompressed archives - 
+they contain what can be viewed as files (called tags or tag files, also sometimes referenced as chunks).
+
+@cindex GameSys
+@subheading Game System files
+Game system files. These store the abstract definitions of objects and other things. GameSys files have .GAM file extension (and use Tag File Database format). 
+They are used to define the game mechanics.
+
+@cindex Mission
+@subheading Mission files
+Mission files define the environment for particular mission. They have .MIS file extension (and are Tag File Database files). 
+They always build on top of a game system file, the (concrete) objects in missions inherit from the (abstract) objects in the gamesys,
+links in the mission files can point to gamesys objects, etc. - but not the other way round (that makes sense, since the gamesys files are used for N missions - see DARK.GAM).
+
+
+@c --------------------------------------------------------------------
+@node Services
+@chapter Services
+@cindex Services
+
+This is the current list of engine's services, divided by categories, and classified with a rough current completeness level (>90% means feature complete, bug-fix only):
+
+@subheading Input/Output
+@table @asis
+@item @ref{Input Service} - 70%
+	This service handles input devices and their translations to game commands. Also handles .BND files and console commands.
+@item @ref{Database Service} - 80%
+	Is a game database loading/saving service. Manages the loading/saving of .GAM/.MIS/.SAV files. All the services which store some
+	data inside these files listen to the events that this service generates and act accordingly.
+@end table
+
+@subheading Various
+@table @asis
+@item @ref{Binary Service} - 100 %
+	Is a helper service that holds dynamically defined types and enumerations, as specified by, for example the dtdef scripts.
+@item @ref{Config Service} - 20 %
+	Is a service that stores Name->Value type info. Reads opde.cfg at the moment. Will handle all the Dark Engine config file formats later, except bnd files.
+@item @ref{Loop Service} - 90 %
+	Responsible for the main game loop. A modular approach to game loop - different loop modes only handle different subsets of the great game loop.
+@item Platform Service - 0 %
+	Platform dependent service for configuration storage and savegame handling (settings, etc).
+@end table
+
+@subheading Object System
+@table @asis
+@item @ref{Object Service} - 70%
+	Is the main service for the engine's object system. Manages game object's lifetime.
+@item @ref{Link Service} - 70%
+	Is the link management service. Stores Relation objects. Each relation object stores all links of particular flavor.
+@item @ref{Property Service} - 70%
+	Is the property manager. Properties are named "types" that object can carry. Each of the property types has one PropertyGroup instance held by this service.
+@item @ref{Inherit Service} - 100%
+	This service manages object @i{trait} inheritance. Currently is used to cache and propagate inherited properties for objects.
+@end table
+
+@subheading Rendering
+@table @asis
+@item @ref{WorldRep Service} - 80%
+	This service is responsible for loading and preparing the World Rep, which is a different name for the level geometry. It loads and prepares it for display.
+@item @ref{Light Service} - 40%
+	This service manages lights in the world
+@item @ref{Material Service} - 20%
+	Helper service that helps with game object materials (textures, etc).
+@item @ref{Render Service} - 30%
+	This service manages the display of the engine.
+@item @ref{Draw Service} - 70%
+	Service responsible for 2D rendering (GUI, HUD).
+@end table
+
+@subheading Simulation
+@table @asis
+@item @ref{Sim Service} - 50%
+	Similar to the loop service, is it's client in fact. Will handle the simulation time management and time step distribution.
+@item Physics Service - 1%
+	Will handle all game object physics.
+@item Particle Service - 0%
+	This service is somewhere between simulation and rendering, but will use sim service so it's defined here. Currently not implemented, will handle particle effects.
+@item Player Service - 0%
+	Will handle player - all the player movement input commands, as well as life of the player, it's container, and other things.
+@item Container Service - 0%
+	Will handle in-game containers (chests for example), containment of objects in other objects and it's effect on those.
+@item AI Service - 0%
+	Will handle game AI's - behaviors, senses, etc. (Also, maybe, Act/React system)
+@item Sound Service - 0%
+	Will handle in-game sounds and their effect on in-game objects
+@item Stim/Receptron Service - 0%
+	Will handle stimulations and senses of objects
+@item Puppet Service - 0%
+	Will handle animations of AI's
+@item Tweq Service - 0%
+	Will handle tweqs - time-related changes of objects (Scaling, rotation, etc).
+@item @ref{Script Service} - 1%
+	Script interfacing service. Manages loading/unloading of script modules, script instantization and event translation.
+@item Camera Service - 10%
+	A camera handling service. Is responsible for camera to object attachments and player view handling.
+@end table
+
+@c --------------------------------------------------------------------
+@node Input Service
+@section Input Service
+@cindex Input Service
+
+@image{img/inputsvc}
+
+This service processes, translates and dispatches events sourcing from user's input. It supports two modes of function - mapped and unmapped. These two can be switched
+on the fly, and are there to support GUI/in-game modes (as well as MFD/normal mode in System Shock 2). One direct input listener can exist, and numerous mapped input modes can, via bind contexts. 
+The Bind Contexts are categories of user input, that can be switched. So, for example, there can be editor bind context and game bind context, MFD bind context etc.
+Different bind contexts are realised via different instances of InputEventMapper object.
+
+@heading Mapped mode
+Mapped mode is the mode likely to be used during gameplay. It uses the loaded bindings (loaded from bnd files) to convert the incomming inputs from input devices to function calls.
+For that to happen, two things need to be done, code wise:
+@table @asis
+@item Input Command registration
+	Input service exposes a mechanism to register named commands that are called when conditions are met (more later). These commands have to be registered with input service in order to work
+@item Key to command binding
+	The input service exposes a mechanism to execute commands. One of the commands is "bind". It has the same syntax as the one used in Dark's .BND files (for example 'bind 1 "inv_select sword"')
+@end table
+
+@heading Input service commands
+Input commands are one parameter callables (be them C++ or python code) implemented using the Callback class. They are registered using the InputService::registerCommandTrap method. 
+There are some built-in commands that are used to work with the key bindings and simmilar things - these are: bind (input command), echo (text and variables), set(sets a variable's value). 
+if a dollar sign is encountered (currently has to be the first character of following a whitespace) the consecutive characters right to the next whitespace are treated as a variable name, and
+substituted.
+
+@subheading Input service variables
+These are freely usable variants that can be read using echo command (example: "echo $bow_zoom") or InputService interface. Some will probably be set internally. 
+
+@heading Bind contexts
+Bind contexts are used to separate some or all bindings for different game modes (MFD for example).
+
+
+
+@c --------------------------------------------------------------------
+@node Binary Service
+@section Binary Service
+@cindex Binary Service
+
+@image{img/binarysvc}
+
+This service stores dynamically defined structures and enumerations. These are defined via .dtype scripts, which have a simple, C-like syntax (see @ref{DType})
+As a result, the binary service registers all the dynamically defined data types, which can then be used to load data that are not
+yet handled effectively using some other approaches.
+
+@c --------------------------------------------------------------------
+@node Database Service
+@section Database Service
+@cindex Database Service
+
+@image{img/databasesvc}
+
+This service is responsible for in-game state loads and saves. It can load and unload mission files, gamesys files, savegames, etc. and also save 
+them. It also exposes two types of messages, one is used to load or save data, the other is used to display loading/saving status.
+
+The service is currently a placeholder for a more propper implementation, but works well for the loading part.
+
+@cindex Tag File Database
+@subheading Tag File Database
+This service handles the Tag File Databases (also known as Dark Database). Those are files that contain tag files (also sometimes called chunks).
+Each of them has a name (much like a file name) and a version. The positions and lengths of those chunks is stored at the end of the file. 
+See FileGroup.h/.cpp for more info.
+The tag file databases have typically extensions .mis, .gam or .sav (among others).
+
+@c --------------------------------------------------------------------
+@node Object Service
+@section Object Service
+@cindex Object Service
+
+@image{img/objsvc}
+
+This is implementation of the Object System core. This service manages the objects themselves. It is able to create and destroy objects,
+manage concrete object's position/orientation values, map and unmap metaproperties by their name, etc.
+
+@heading MetaProperties
+@cindex MetaProperties
+
+What is a metaproperty? It is a special kind of object fragment, inherited via @ref{MetaProperty} link with a nonzero value.
+It attaches(via inheritance) new properties to an object or masks the properties previously inherited from archetypes of that objects. 
+As a result, the objects change their behavior.
+
+@heading Implemented properties
+
+@cindex DonorType
+@subheading DonorType Property
+DonorType is a property that is only owned by archetype objects. It indicates if the object is an archetype or metaproperty.
+
+@cindex SymbolicName
+@subheading SymbolicName Property
+SymbolicName is a property that is never inherited and contains object-system wide unique string name of the object.
+
+@cindex Position
+@subheading Position Property
+Position property contains position in space, orientation in space and some other useful position-related fields. Is only valid for concrete objects, has
+no meaning on archetypes.
+
+@c --------------------------------------------------------------------
+@node Link Service
+@section Link Service
+@cindex Link Service
+
+@image{img/linksvc}
+
+
+@cindex Relation
+@subheading Relation
+Relation class is the heart of the link service. It stores all links of a particular link type. It is capable of disk loading/saving, queries, etc. Relations are indexed by flavor name and 
+flavor ID. Relation names starting with '~' sign are inverse relations. Those have negative flavor id and contain links in the opposite direction (compared to normal relation of the same flavor).
+
+@c --------------------------------------------------------------------
+@node Property Service
+@section Property Service
+@cindex Property Service
+
+@image{img/propsvc}
+
+@cindex effective object ID
+PropertyGroup instances typically use a Inheritor instance - it is used to determine effective object ID. This id is the id of the bearer of the effective (active) property for the object ID.
+Example:
+
+@image{img/propinh}
+
+
+In this rather unrealistic and dull example, the SomeProperty has a value '2' on "A Chair" object, as it is inherited from the archetype object "Chair" (object ID -125). Property OtherProperty masks the value from
+object Furniture, and thus the "A Chair" has OtherProperty = 4.
+@c --------------------------------------------------------------------
+@node Inherit Service
+@section Inherit Service
+@cindex Inherit Service
+
+@image{img/inheritsvc}
+
+@cindex trait
+This service handles the MetaProp link. Contains named factories for different @i{trait} (some kind of object's quality - for example property ownership) inheritance schemes. Current list is (Inheritor factory names):
+@itemize @bullet
+@item
+	Always - Always inherits traits from archetypes
+@item
+	Archetype - Only inherits values on archetypes, so instances of objects need to gain a copy of the property value (used for properties that need a special care - physics, anim lights for example)
+@item
+	Never - This inheritor never inherits - it is used for things which are unique to both archetypes and concretes (Symbolic Name, donor type).
+@end itemize
+
+@node MetaProperty
+@cindex MetaProperty
+@subheading MetaProperty
+MetaProp link carries one unsigned integer as data (priority). If the value of it is zero, the link implements archetype inheritance. Nonzero links are MetaProperty links, and each of them has different priority. 
+The property, if not carried by the inheriting object itself, is inherited from the metaproperty source with the highest priority that offers it. Only one link of each priority value is allowed per object.
+Metaproperty object links have priority 1024 or higher. 
+
+Metaproperty objects bear different DonorType property value than other archetype objects.
+
+@c --------------------------------------------------------------------
+@node WorldRep Service
+@section WorldRep Service
+@cindex WorldRep Service
+
+@image{img/worldrepsvc}
+
+This service is responsible for loading WR/WRRGB tag files. These contain the static level geometry, which is traditionally called terrain. It does this in cooperation with 
+@ref{Light Service}, @ref{Material Service} and DarkSceneManager.
+
+@cindex WR
+@cindex WRRGB
+@heading WR/WRRGB - a short introduction
+
+@subheading Some facts
+In the times the Dark Engine was written, the pixels were expensive. WorldRep format is thus designed with that in mind. First, a few characteristic points about it:
+@itemize @bullet
+@item
+	Uses BSP tree - and it did so for two reasons: sorting rendered geometry and BSP traversal for point in cell searches
+@item
+	Contains Cells - these are convex, irregular polyhedra, with some faces textured. Others are just portals to other cells (can be either face, portal, or both in case of water)
+@item
+	Uses Portals - the old kind of those - these are polygons that connect two cells. Portals in WR are unidirectional
+@item
+	Uses Light Maps - the idea Quake 1 came with - pre-computed textures that modulate the intensity of textures applied on faces. The software version of Dark Engine renderer used surface cache
+@item
+	Does not contain precomputed PVS (Potential visibility sets). Visible cells are computed dynamically as needed.
+@end itemize
+
+@cindex PVS
+@subheading Visibility Determination (Dynamic PVS)
+Visibility determination is a process that determines the visible cell set from the given point and direction in space. As the portal counts in typical scenes go up to thousands,
+frustum culling is not usable for visibility determination. Instead, the portal (which is a polygon) is projected to screen space, vertex after vertex. The resulting screen coordinates
+define bounding box which is then clipped against previous bounding boxes. The result is see-through screen space rectangle that determines the maximal visible area the portal gives in 
+the defined circumstances. Thanks to the fact there can be more than one cell-portal path to see a given portal, the particular rectangles for the given polygon are unioned (well, in fact, 
+this is done per cell, not per polygon, but that is rather minor difference).
+The traversal is done in breadth-first manner, so the retraversals that are caused by visibility re-evaluations are minimised.
+
+@cindex Rendering
+@subheading Our current rendering approach
+As the technology advanced, the pixels become cheap, but the draw calls became expensive. Thus, we introduce a few optimizations, not necesarilly the best and most clever ones,
+that allow rendering the WR geometry on modern hardware using modern approaches.
+
+@itemize @bullet
+@item
+	VBO usage - we dynamically fill the index buffers of VBO object according to the cell lists. The mapping cell -> index set and rendering is done in the DarkGeometry class
+@item
+	Texture atlas usage - we use texture atlasses for lightmaps. They are built as the level is loaded, and use BSP tree to place the lightmap. This minimizes the batch counts
+@item
+	Conversion of dynamic lights to standard lights - we will need to do this. Original Dark Engine computes low-resolution lightmaps for all affected surfaces of dynamic lights. 
+	We will use standard lights instead for the purpose of dynamic lighting.
+@end itemize
+
+@c --------------------------------------------------------------------
+@node Light Service
+@section Light Service
+@cindex Light Service
+
+@image{img/lightsvc}
+
+Dark Engine introduces a pre-baked list of lights (built upon portalisation) in the WR tag file, right after the end of the BSP tree. This service handles the lights.
+The loading of the light list is invoked by WorldRep service when loading WorldRep. This service also handles lightmaps using atlases, and is capable of individual light
+modulation.
+Later, this service will also be capable of light related tweqs in cooperation with Tweq service and anim light handling, and dynamic light handling (dynamic lights
+are the only ones which influence the lighting of the static geometry in realtime).
+
+@c --------------------------------------------------------------------
+@node Material Service
+@section Material Service
+@cindex Material Service
+
+@image{img/materialsvc}
+
+Manages all the materials for static geometry, models and AI. Later it will also manage material properties and material overrides.
+Also currently manages flow textures (those are the textures applied to water surface).
+
+@c --------------------------------------------------------------------
+@node Render Service
+@section Render Service
+@cindex Render Service
+
+@image{img/rendersvc}
+
+This service is a connection point between Ogre and Opde. It manages display (resolution etc) and model rendering.
+It also manages render subgroup of Properties (RenderAlpha, RenderType, HasRefs, Scale). Listens to Object Service's position property and adjusts SceneNodes of
+objects accordingly.
+
+@c --------------------------------------------------------------------
+@node Draw Service
+@section Draw Service
+@cindex Draw Service
+
+@image{img/drawsvc}
+
+This service is used to draw 2D stuff on screen. It is capable of image atlassing (TextureAtlas class), bitmaps and bitmap based font rendering (it is capable of loading of .fon dark engine font format).
+
+@c --------------------------------------------------------------------
+@node Sim Service
+@section Sim Service
+@cindex Sim Service
+
+@image{img/simsvc}
+
+This service is a timer base for all simulated code. It issues per-frame time broadcasts to all listeners that should have it's time controlled in sim-time rather than via the @ref{Loop Service} timing.
+
+@cindex Sim Time
+@subheading Sim Time
+The simulation in the engine is controlled via it's own time base. This allows us to totally remove the simulation from the loop, effectively stopping the simulation, or control the simulation's time flow.
+Sim service has it's own time flow rate, controlled by flow coefficient. This coefficient determines how much simulation time passed on based on the real time gained from the Loop service.
+
+Sim service will also broadcast script messages ("Sim" with one boolean parameter starting).
+
+@c --------------------------------------------------------------------
+@node Config Service
+@section Config Service
+@cindex Config Service
+
+@image{img/configsvc}
+
+Config service loads configuration files and exposes them as name/value configuration pairs. It will later manage install.cfg, dark.cfg and others.
+
+
+@c --------------------------------------------------------------------
+@node Loop Service
+@section Loop Service
+@cindex Loop Service
+
+@image{img/loopsvc}
+
+Loop service implements a modular approach to game loop. All it does is the plain old game loop code with some extensions. 
+
+@cindex LoopMode
+@cindex LoopMask
+@cindex LoopClient
+@subheading LoopMode, LoopMask and LoopClient
+Meet loop mode and mask. These two come in pairs, and define game loop modes together with bit mask of categories they include. Each of the loop clients
+also includes a loop mask. The Mode and Client masks must have a nonzero and product in order for the loop client to be included in a loop mode.
+Example (self explaining, really):
+
+@itemize @bullet
+@item
+	LoopClient GUILoopClient - Loop Mask 0x0001
+@item
+	LoopClient VideoLoopClient - Loop Mask 0x0002
+@item
+	LoopClient SimLoopClient - Loop Mask 0x0004
+@item
+	LoopClient InputSystemLoopClient - Loop Mask 0x0FFFF
+@end itemize
+
+@itemize @bullet
+@item
+	LoopMode GUIOnly - LoopMask 0x0001
+@item
+	LoopMode VideoOnly - LoopMask 0x0002
+@item
+	LoopMode SimAndGui - LoopMask 0x0005
+@end itemize
+
+
+Loop service also features a primitive loop profiler - each loop client's time is logged for one loop run when activated.
+
+@c --------------------------------------------------------------------
+@node Script Service
+@section Script Service
+@cindex Script Service
+
+@image{img/scriptsvc}
+
+This service will handle scripting. Currently only a compilable empty skeleton exists, no code to inject engine events to scripts is written, as there is 
+no scripting module loader code yet.
+
+@cindex Script
+@subheading Script
+Script is an class/it's instance written in some scripting language that handles a certain aspect of object's behavior. Scripts listen to various game
+messages and handle the object's properties or other things accordingly. For example hypothetical Mine script would listen to physics messages,
+wait for PhysFellAsleep message and then activate a Receptron that would cause the mine to be sensitive to movement around it.
+
+@cindex Script Module
+@subheading Script Module
+Script module is a named package of Scripts. In the context of original Dark Engine, this is a .OSM file (which in reality is a DLL file).
+
+
+@c --------------------------------------------------------------------
+@node DType
+@section DType
+@cindex DType
+
+DType scripts define data types dynamically. They are defined using a C-like language, and parsed on demand. When the engine is initialized
+without anything other than core services, these scripts (in combination with @ref{PLDef} scripts) can be used to define properties and links
+dynamically, allowing the engine to understand data it normally would not. 
+
+@cindex dtype script
+@verbatim
+// a comment
+
+// Bitfield - maps bits of a unsigned, 32 bit integer to string names. A special case of enumeration
+bitfield bitf {
+	key "bit one" 0x01
+	key "bit two" 0x02
+}
+
+// Enumeration - much like the C enumerations. Maps different unique values of the specified type to string name
+enum enumeration : uint {
+	key "Option A" 0x00
+	key "Option B" 0x01
+}
+
+// A sample, nested struct 
+struct str {
+	uint32 use bitf uint_with_bitfield
+	int16 array [3]
+	
+	// an array of four structs
+	struct test [4] {
+		float x
+		char [4] name
+	}
+}
+
+// an alias - like C++ typedef
+alias str str2
+
+// a namespace. Can't be nested, default namespace is ""
+namespace Test {
+}
+@end verbatim
+
+These scripts are parsed using the DTypeScriptCompiler class and compiled into DType objects, then registered in the binary service.
+
+@c --------------------------------------------------------------------
+@node PLDef
+@section PLDef
+@cindex PLDef
+
+These scripts define properties and links. It is possible to define name, label, chunk versions, data types, inheritance approach and other things with them.
+
+Example:
+@verbatim
+property BloodType {
+        label "BloodType"
+        p_ver 2.17
+        type varstr
+}
+
+relation CulpableFor {
+    no_data
+}
+    
+relation Receptron {
+    hidden
+    l_ver 2.1
+    d_ver 2.1
+    fake_size 2
+}
+@end verbatim
+
+@cindex Property
+@subheading Property
+
+These are the allowed keywords for Property definition along with their meaning:
+@itemize @bullet
+@item
+    label "labeltext" - sets the property label
+@item
+    dtype "dtypename" - sets the dtype used for the property (if not specified, it is assumed that properties/property_name dtype is defined within binary service)
+@item
+    p_ver maj.min - sets the property chunk (P$) version (maj and min are numbers) 
+@item
+    inherit inh_name - sets the inheritance schema - (inheritor factory name is expected - always, never, archetype)
+@item
+    type datatype - sets the datatype the propery should use - currently only varstr is supported here (omiting means property will use dtype typed storage). Varstr means property uses variable sized string storage.    
+@end itemize
+
+@cindex Relation
+@subheading Relation
+
+@itemize @bullet
+@item
+    dtype "dtypename" - dtype datatype used
+@item
+    fake_size size - fake size of the relation data in bytes (used for some special cases where dark lies about the data size - for example receptron relation)
+@item
+    hidden - if specified, the hidden flag is set on relation - the relation won't show up in lists of relations, etc (used for system relations - for example MetaProp)
+@item
+    no_data - link does not use data (data less relations)
+@item
+    d_ver and l_ver fields - specify chunk versions of relations data chunk (LD$) and link chunk (L$)
+@end itemize
+
+@c --------------------------------------------------------------------
+@node Index
+@unnumbered Index
+   
+@printindex cp
+     
+@bye

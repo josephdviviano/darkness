@@ -1,0 +1,80 @@
+set(OPDE_BASE_SOURCES
+    Array.h
+    BitArray.h
+    Callback.h
+    MathTypes.cpp
+    Matrix3.h
+    Matrix4.h
+    MessageSource.h
+    NonCopyable.h
+    OpdeException.cpp
+    OpdeException.h
+    OpdeSingleton.h
+    LGPalette.h
+    LGPalette.cpp
+    Plane.h
+    PrioritizedMessageSource.h
+    Quaternion.h
+    SharedPtr.h
+    StringTokenizer.h
+    tracer.cpp
+    tracer.h
+    ValueChangeRequest.h
+    Vector2.h
+    Vector3.h
+    console/ConsoleBackend.cpp
+    console/ConsoleBackend.h
+    console/ConsoleCommandListener.cpp
+    console/ConsoleCommandListener.h
+    DarkCommon.h
+    dyntype/DataStorage.cpp
+    dyntype/DataStorage.h
+    dyntype/DTHelpers.h
+    dyntype/Variant.cpp
+    dyntype/Variant.h
+    dyntype/Serializer.cpp
+    dyntype/Serializer.h
+    dyntype/SingleFieldDataStorage.h
+    dyntype/StructDataStorage.h
+    file/darkdb.cpp
+    file/darkdb.h
+    file/FileCompat.cpp
+    file/FileCompat.h
+    file/File.cpp
+    file/FileGroup.cpp
+    file/FileGroup.h
+    file/File.h
+    FreeSpaceInfo.h
+    Iterator.h
+    logger/filelog.cpp
+    logger/filelog.h
+    logger/logger.cpp
+    logger/logger.h
+    logger/stdlog.cpp
+    logger/stdlog.h
+    servicemanager/OpdeService.cpp
+    servicemanager/OpdeServiceFactory.h
+    servicemanager/OpdeService.h
+    servicemanager/OpdeServiceManager.cpp
+    servicemanager/OpdeServiceManager.h
+)
+
+add_library(OpdeBase OBJECT ${OPDE_BASE_SOURCES})
+
+target_include_directories(OpdeBase PUBLIC
+    ${OPDE_BINARY_DIR}
+    ${OPDE_SOURCE_DIR}/src/base
+    ${OPDE_SOURCE_DIR}/src/base/console
+    ${OPDE_SOURCE_DIR}/src/base/compat
+    ${OPDE_SOURCE_DIR}/src/base/dyntype
+    ${OPDE_SOURCE_DIR}/src/base/file
+    ${OPDE_SOURCE_DIR}/src/base/loaders
+    ${OPDE_SOURCE_DIR}/src/base/logger
+    ${OPDE_SOURCE_DIR}/src/base/servicemanager
+    ${OPDE_SOURCE_DIR}/src/compat
+)
+
+target_compile_options(OpdeBase PRIVATE
+    $<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:
+        -Wall -fno-strict-aliasing -fvisibility=default>
+)

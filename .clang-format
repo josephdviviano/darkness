@@ -1,0 +1,21 @@
+BasedOnStyle: LLVM
+AlignAfterOpenBracket: Align
+IndentWidth: '4'
+Standard: Cpp11
+UseTab: Never
+AccessModifierOffset: -4
+BreakBeforeBraces: 'Custom'
+ConstructorInitializerAllOnOneLineOrOnePerLine: 'true'
+BreakConstructorInitializers: BeforeColon
+BraceWrapping: {
+    AfterClass: 'false'
+    AfterControlStatement: 'false'
+    AfterEnum : 'false'
+    AfterFunction : 'true'
+    AfterNamespace : 'false'
+    AfterStruct : 'false'
+    AfterUnion : 'false'
+    BeforeCatch : 'false'
+    BeforeElse : 'false'
+    IndentBraces : 'false'
+}

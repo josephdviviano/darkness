@@ -1,0 +1,228 @@
+                        Notes for Developers:            -*-text-*-
+                        ---------------------
+
+Last updated on 19-Oct-2008
+
+----------------
+- Requirements -
+----------------
+OPDE needs:
+* OGRE3D library, version 1.7
+* FreeImage library
+* SDL2
+* CMake
+* Python
+* For documentation builds: epydoc, texi2html, doxygen and graphviz
+
+Coding
+------
+There will be a whole coding style document later on, but for now, some simple rules:
+* Always document your code
+* Think about the way the code looks - will it be readable by others?
+* Test before commiting
+* Think twice, code once :)
+* Formatting, simply put - every curly brace indents, curly braces do not break (on the same line)
+	- if not sure, use astyle with scripts/astyle.conf as options file (astyle --options=SOME_PATH/scripts/astyle.conf file.cpp)
+
+Be sure to update ChangeLog file sometimes. On linux, it can be updated using svn2cl script.
+
+Opde uses Major.minor.patch versioning scheme.
+
+Releases
+--------
+This has to be decided. Some remarks:
+* NEWS file has to be updated before releasing
+* Release name has to be decided and put into the main CMakeLists.txt file
+
+
+Building
+--------
+
+Before building
+---------------
+Ogre3D environment has to be properly set up. To do that, please follow the steps mentioned on ogre3d wiki here: 
+http://www.ogre3d.org/wiki/index.php/Installing_An_SDK
+
+FreeImage is unpacked-only on windows. This means CMake can't find it automatically (unless it's placed in a 
+specially defined directory - see below), and the path has to be entered manually into the corresponding CMake 
+variable FREEIMAGE_PATH (use cmake gui for that, or cmake's command line parameters). If you'd like to avoid the 
+need of manual setting of freeimage dependency, place it into a directory "dependencies" next to the opde build
+directory, like this (example windows directory setup follows):
+
+C:\
+	Projects\
+		opde\
+			build\
+				...
+			dependencies\
+				freeimage\
+					Dist\
+					...
+				...
+			opde-svn\
+				trunk\
+					...
+
+In this setup, the "C:\Projects\opde\opde-svn\trunk\" is the source directory (OPDE_SOURCE_DIR in cmake scripts), 
+"C:\Projects\opde\build\" is the build target directory (OPDE_BINARY_DIR in cmake scripts), and the 
+"C:\Projects\opde\dependencies\" path is dedicated for all the dependencies that can't be installed/found by 
+CMake automatically.
+
+CMake tool is used to prepare makefiles/project files for openDarkEngine. The result of successful run of CMake is
+a project file or makefile, that can the be used to compile the project. Before compiling, ensure that you set all
+the cmake variables to the desired values. The current list of those is:
+
+GENERATE_DOC: Generates a DoxyFile that can be used to create API documentation.
+GLOBAL_DEBUG: Enables DEBUG level logging.
+PROFILING: (linux only) Enables GNU Profiler usage. Opde binary will generate profiling file if this is used. 
+	Can be examined with KProf for example. 
+
+
+Unix/Linux
+----------
+On *nix systems, building with the following commands (replace the OPDE_DIR with the directory in which the 
+source resides) should be sufficient:
+
+cd OPDE_DIR
+cmake .
+make
+
+For out-of-source builds (prefered method), create a separate directory that will hold the built files, 
+and run cmake with the path to the source directory (the one containing this readme) as a parameter (replace 
+the BUILD_DIR and OPDE_DIR with your paths).
+
+cd BUILD_DIR
+cmake OPDE_DIR
+make
+
+Note: You can also use ccmake instead of cmake, which is a GUI frontend to cmake that will let you change
+the variables. That means Doxygen building, build type, debug code building. This works on both windows 
+and *nix platforms. Also note a graphical frontend exists for CMake 2.6 and later, called cmake-gui.
+
+
+Windows
+-------
+
+On windows, please ensure that the OGRE_HOME environmental variables is set (should be if the installation was 
+done using the ogre sdk). Also ensure that MinGW/Visual C++ make systems are usable. (Cmake should test this 
+first time it is run).
+
+Then progress with (from commandline, being in the root directory of OPDE project):
+
+cmake .
+
+or, if you want to select the used generator (for example MinGW makefiles)
+
+cmake . -G "MinGW Makefiles"
+
+For list of the generators, use "cmake --help" from commandline - you'll get a list of available generators.
+
+Note: You can also use the out of source build approach as *nix building guide notes. This makes your source
+	directory clean. The windows version of ccmake is CMakeSetup.
+
+Please read the output of cmake carefuly. If the makefiles/VC solution is not present, it will give you hints 
+about what was wrong.
+
+The result should be compilable by your system (VC / mingw32-make for mingw)
+
+If you have a problem making for Mingw, please ensure that "sh" executable is NOT in path. If it is, and can't
+be relocated, select MSYS Makefiles rather than MinGW ones.
+
+Currently, Debug mode in VC is too slow for normal operation. For testing purposes, please use Release mode. 
+
+
+--------------
+- Setting up -
+--------------
+
+Note: For some additional info about setting up the resources for opde, please consult the online wiki as well:
+    http://opde.sourceforge.net/wiki/index.php/Main_Page
+    
+You will need to initialize resources.cfg, opde.cfg and plugins.cfg for the main executable to work (examples 
+use unix style paths, use windows style paths on windows):
+
+resources.cfg
+-------------
+This file should point to the .crf files used in Dark Engine's games, opde scripts (found in the source tree under scripts/) 
+and game specific scripts (scripts/thief1 etc.). It is used when no game type parameter is specified on command line. 
+The structure of the file is the same for any of the file names it can be stored as (thief1.cfg, thief2.cfg, shock2.cfg).
+
+Example content:
+
+# -- begin of resources.cfg --
+[General]
+# For temp files, overrides, etc. Not crucial
+FileSystem=./
+
+# Opde scripts path, common scripts:
+FileSystem=/some path/opde-svn/trunk/scripts
+
+# Crf files:
+Zip=/some path/fam.crf
+Zip=/some path/obj.crf
+Zip=/some path/books.crf
+Zip=/some path/intrface.crf
+Zip=/some path/editor.crf
+Zip=/some path/default.crf
+Zip=/some path/pal.crf
+
+# Scripts for Thief1 (replace the path's end with the game's name):
+FileSystem=/some path/opde-svn/trunk/scripts/thief1
+
+# Missions - should point to directory containing the .gam and .mis files
+FileSystem=/some path/t1/
+# -- end of resources.cfg --
+
+opde.cfg
+--------
+Couple of keys are supported for now, mainly for debugging purposes. One key is mandatory: "mission", 
+naming the mission OPDE should load upon start.
+
+# -- begin of opde.cfg --
+# if set to yes, the input's won't be exclusive to OPDE window. Great for debugging
+# nonexclusive=true
+
+# Mission file to use. If none is specified, the first mission file from the game is used
+mission=miss1.mis
+
+# Mouse and keyboard movement related
+move_speed=30
+mouse_speed=80
+mouse_invert=1
+
+# Debugging enabled - some FPS/Portal stats appear on screen if enabled
+debug=true
+# -- end of opde.cfg --
+
+
+plugins.cfg
+-----------
+This file should point to Ogre plugins. Please consult ogre's docs for more information.
+Example content (You'll also probably want to use RenderSystem_Direct3D7 or RenderSystem_Direct3D9 on windows):
+
+# -- begin of plugins.cfg --
+# set the path to the Ogre3D's path to plugins, or set ./ here and copy the ones that are needed next to executable
+PluginFolder=/usr/lib/OGRE
+
+Plugin=RenderSystem_GL.so
+Plugin=Plugin_ParticleFX.so
+# -- end of plugins.cfg --
+
+-----------
+- Running -
+-----------
+There is not much to do once the application is run succesfully now. The camera is controlled with mouse nad WASD keys.
+Opde binary has one/two optional parameters - t1/t2/ss2, optionaly followed by mission file name (without path).
+
+If the first parameter is specified, the opde binary loads resource declarations from a file named:
+t1 - thief1.cfg
+t2 - thief2.cfg
+ss2 - shock2.cfg
+Instead of the default resources.cfg file.
+
+------------
+- Problems -
+------------
+* pythonXX_d.lib missing. We know - use relWithDebInfo build target for now
+* FreeImage lib not found by CMake - we'll specify some standard path to put dependencies into, for now please fill in the 
+	path into the FREEIMAGE_PATH

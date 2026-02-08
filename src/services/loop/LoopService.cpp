@@ -1,0 +1,356 @@
+/******************************************************************************
+ *
+ *    This file is part of openDarkEngine project
+ *    Copyright (C) 2005-2009 openDarkEngine team
+ *
+ *    This program is free software; you can redistribute it and/or modify
+ *    it under the terms of the GNU General Public License as published by
+ *    the Free Software Foundation; either version 2 of the License, or
+ *    (at your option) any later version.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU General Public License for more details.
+ *
+ *    You should have received a copy of the GNU General Public License
+ *    along with this program; if not, write to the Free Software
+ *    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ *	  $Id$
+ *
+ *****************************************************************************/
+
+#include "LoopService.h"
+#include "OpdeException.h"
+#include "ServiceCommon.h"
+#include "OpdeServiceManager.h"
+#include "config/ConfigService.h"
+#include "logger.h"
+
+using namespace std;
+
+namespace Opde {
+/*-------------------------------------------------*/
+/*-------------------- LoopMode -------------------*/
+/*-------------------------------------------------*/
+LoopMode::LoopMode(const LoopModeDefinition &def, LoopService *owner)
+    : mLoopModeDef(def), mOwner(owner), mDebugNextFrame(false) {}
+
+//------------------------------------------------------
+void LoopMode::loopModeStarted() {
+    LoopClientMap::iterator it = mLoopClients.begin();
+
+    while (it != mLoopClients.end()) {
+        it->second->loopModeStarted(mLoopModeDef);
+
+        ++it;
+    }
+}
+
+//------------------------------------------------------
+void LoopMode::loopModeEnded() {
+    LoopClientMap::iterator it = mLoopClients.begin();
+
+    while (it != mLoopClients.end()) {
+        it->second->loopModeEnded(mLoopModeDef);
+
+        ++it;
+    }
+}
+
+//------------------------------------------------------
+void LoopMode::loopStep(float deltaTime) {
+    LoopClientMap::iterator it = mLoopClients.begin();
+
+    bool debugFrame = mDebugNextFrame;
+    mDebugNextFrame = false;
+
+    int corder = 0;
+
+    while (it != mLoopClients.end()) {
+        unsigned long stTime = mOwner->getCurrentTime();
+
+        LoopClient *client = it->second;
+
+        it++;
+
+        client->loopStep(deltaTime);
+
+        if (debugFrame) {
+            unsigned long stepTime = mOwner->getCurrentTime() - stTime;
+            LOG_INFO("LoopMode(%s) : Client %d (%s) : Used %ld ms",
+                     getLoopModeName().c_str(), corder,
+                     client->getLoopClientSpecification().name.c_str(),
+                     stepTime);
+        }
+
+        corder++;
+    }
+}
+
+//------------------------------------------------------
+void LoopMode::removeLoopClient(LoopClient *client) {
+    LoopClientMap::iterator it = mLoopClients.find(client->getPriority());
+
+    while (it != mLoopClients.end()) {
+        if (it->second == client) {
+            LoopClientMap::iterator rem = it++;
+
+            mLoopClients.erase(rem);
+        } else {
+            it++;
+        }
+    }
+}
+
+/*---------------------------------------------------*/
+/*-------------------- LoopClient -------------------*/
+/*---------------------------------------------------*/
+LoopClient::~LoopClient() {}
+
+void LoopClient::loopModeStarted(const LoopModeDefinition &loopMode) {}
+
+void LoopClient::loopModeEnded(const LoopModeDefinition &loopMode) {}
+
+/*----------------------------------------------------*/
+/*-------------------- LoopService -------------------*/
+/*----------------------------------------------------*/
+template <> const size_t ServiceImpl<LoopService>::SID = __SERVICE_ID_LOOP;
+
+LoopService::LoopService(ServiceManager *manager, const std::string &name)
+    : ServiceImpl<Opde::LoopService>(manager, name),
+      mTerminationRequested(false), mNewLoopMode(NULL),
+      mNewModeRequested(false), mLastFrameTime(0), mDebugOneFrame(false) {
+
+    mActiveMode.reset();
+}
+
+//------------------------------------------------------
+LoopService::~LoopService() {}
+
+//------------------------------------------------------
+bool LoopService::init() {
+    mStartTime = std::chrono::steady_clock::now();
+    return true;
+}
+
+//------------------------------------------------------
+void LoopService::createLoopMode(const LoopModeDefinition &modeDef) {
+    LOG_DEBUG("LoopService::createLoopMode: Creating new loop mode '%s'",
+              modeDef.name.c_str());
+
+    // First, look if the ID is not already reserved
+    LoopModeIDMap::const_iterator it = mLoopModes.find(modeDef.id);
+
+    if (it != mLoopModes.end()) {
+        LOG_ERROR("LoopService::createLoopMode: Loop mode ID %llX already "
+                  "reserved by '%s'",
+                  modeDef.id, it->second->getLoopModeName().c_str());
+        return;
+    }
+
+    LoopModeNameMap::const_iterator it1 = mLoopNamedModes.find(modeDef.name);
+
+    if (it1 != mLoopNamedModes.end()) {
+        LOG_ERROR("LoopService::createLoopMode: Loop mode name %s already "
+                  "reserved by '%s'",
+                  modeDef.name.c_str(), it->second->getLoopModeName().c_str());
+        return;
+    }
+
+    LoopModePtr mode(new LoopMode(modeDef, this));
+
+    mLoopModes[modeDef.id] = mode;
+    mLoopNamedModes[modeDef.name] = mode;
+
+    // Loop mode created. Loop over already inserted clients and register them
+    // as well.
+    LoopClientList::const_iterator cit = mLoopClients.begin();
+    for (; cit != mLoopClients.end(); ++cit) {
+        mode->addLoopClient(*cit);
+    }
+}
+
+//------------------------------------------------------
+void LoopService::addLoopClient(LoopClient *client) {
+    LOG_INFO("LoopService: Adding a new loop client %s",
+             client->getLoopClientSpecification().name.c_str());
+    // iterate through the loop modes. If the mask complies, add the client
+    LoopModeIDMap::const_iterator it = mLoopModes.begin();
+
+    while (it != mLoopModes.end()) {
+        if (it->second->getLoopMask() & client->getLoopMask()) {
+            it->second->addLoopClient(client);
+        }
+
+        it++;
+    }
+
+    mLoopClients.push_back(client);
+}
+
+//------------------------------------------------------
+void LoopService::removeLoopClient(LoopClient *client) {
+    // iterate through the loop modes. If the mask complies, add the client
+    LoopModeIDMap::const_iterator it = mLoopModes.begin();
+
+    while (it != mLoopModes.end()) {
+        // The worst thing that could happen is that there was no client in that
+        // loop So no removal was done.
+        it->second->removeLoopClient(client);
+
+        it++;
+    }
+}
+
+//------------------------------------------------------
+bool LoopService::requestLoopMode(LoopModeID newLoopMode) {
+    LoopModeIDMap::const_iterator it = mLoopModes.find(newLoopMode);
+    LOG_DEBUG("LoopService: Loop mode %zu requested", newLoopMode);
+
+    if (it != mLoopModes.end()) {
+        mNewLoopMode = it->second;
+        mNewModeRequested = true;
+        return true;
+    } else {
+        LOG_ERROR("LoopService: Invalid loop mode %zu requested", newLoopMode);
+        return false;
+    }
+}
+
+//------------------------------------------------------
+bool LoopService::requestLoopMode(const std::string &name) {
+    LoopModeNameMap::const_iterator it = mLoopNamedModes.find(name);
+    LOG_DEBUG("LoopService: Loop mode %s requested", name.c_str());
+
+    if (it != mLoopNamedModes.end()) {
+        mNewLoopMode = it->second;
+        mNewModeRequested = true;
+        return true;
+    } else {
+        LOG_ERROR("LoopService: Invalid loop mode %s requested", name.c_str());
+        return false;
+    }
+}
+
+//------------------------------------------------------
+void LoopService::requestTermination() {
+    LOG_DEBUG("LoopService: Termination was requested!");
+    mTerminationRequested = true;
+}
+
+//------------------------------------------------------
+void LoopService::run() {
+
+    if (mNewModeRequested) { // See if there is a loop mode pending...
+        mNewModeRequested = false;
+        setLoopMode(mNewLoopMode);
+        mActiveMode->loopModeStarted();
+    }
+
+    if (!mActiveMode) {
+        LOG_FATAL(
+            "LoopService::run: No loop mode set prior to run(). Terminating");
+        return;
+    }
+
+    while (!mTerminationRequested) {
+        bool debugFrame = mDebugOneFrame;
+        mDebugOneFrame = false;
+
+        if (debugFrame) {
+            LOG_FATAL("---- LoopService one frame timings ----");
+            mActiveMode->debugOneFrame();
+        }
+
+        unsigned long lFrameStart = getCurrentTime();
+        unsigned long deltaTime = lFrameStart - mLastFrameTime;
+
+        mActiveMode->loopStep(deltaTime);
+
+        if (mNewModeRequested) {
+            mNewModeRequested = false;
+            mActiveMode->loopModeEnded();
+
+            // Search for the new loop mode. If not found, log fatal, terminate
+            if (mNewLoopMode) {
+                setLoopMode(mNewLoopMode);
+            } else {
+                LOG_FATAL(
+                    "LoopService::run: The new requested loop mode is invalid "
+                    "(NULL mode pointer encountered). Terminating");
+                mTerminationRequested = true;
+            }
+
+            // Signalize the start of the loop
+            mActiveMode->loopModeStarted();
+        }
+
+        mLastFrameLength = getCurrentTime() - mLastFrameTime;
+
+        if (debugFrame) {
+            LOG_FATAL(
+                "---- One frame timings end. Total frame time: %d ms ----",
+                mLastFrameLength);
+        }
+        mLastFrameTime = lFrameStart;
+    }
+
+    if (mActiveMode) {
+        mActiveMode->loopModeEnded();
+    }
+
+    // The end of the loop.
+}
+
+//------------------------------------------------------
+void LoopService::step() {
+    unsigned long lFrameStart = getCurrentTime();
+    unsigned long deltaTime = lFrameStart - mLastFrameTime;
+
+    if (mActiveMode)
+        mActiveMode->loopStep(deltaTime);
+
+    mLastFrameLength = getCurrentTime() - mLastFrameTime;
+    mLastFrameTime = lFrameStart;
+}
+
+
+//------------------------------------------------------
+unsigned long LoopService::getCurrentTime() {
+    auto now = std::chrono::steady_clock::now();
+    return static_cast<unsigned long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - mStartTime)
+            .count());
+}
+
+//------------------------------------------------------
+void LoopService::setLoopMode(const LoopModePtr &newMode) {
+    LOG_INFO("LoopService: Setting loop mode %s",
+             mNewLoopMode->getLoopModeName().c_str());
+    mActiveMode = mNewLoopMode;
+}
+
+//------------------------------------------------------
+void LoopService::debugOneFrame() { mDebugOneFrame = true; }
+
+//------------------------------------------------------
+unsigned long LoopService::getLastFrameTime() { return mLastFrameLength; }
+
+//-------------------------- Factory implementation
+const std::string LoopServiceFactory::mName = "LoopService";
+
+LoopServiceFactory::LoopServiceFactory() : ServiceFactory(){};
+
+const std::string &LoopServiceFactory::getName() { return mName; }
+
+const uint LoopServiceFactory::getMask() { return SERVICE_ENGINE; }
+
+const size_t LoopServiceFactory::getSID() { return LoopService::SID; }
+
+Service *LoopServiceFactory::createInstance(ServiceManager *manager) {
+    return new LoopService(manager, mName);
+}
+
+} // namespace Opde
