@@ -20,6 +20,12 @@ struct RenderConfig {
     bool linearMips = false;  // gamma-correct mipmap generation
     bool sharpMips  = false;  // unsharp mask on mip levels
 
+    // -- water --
+    float waveAmplitude   = 0.3f;    // vertex Z displacement in world units (0 = flat)
+    float uvDistortion    = 0.015f;  // UV wobble strength (0 = no ripple)
+    float waterRotation   = 0.015f;  // UV rotation speed in rad/s (0 = no rotation)
+    float waterScrollSpeed = 0.05f;  // UV scroll speed in world units/s (0 = no drift)
+
     // -- developer --
     bool showObjects   = true;   // render object meshes
     bool portalCulling = true;   // portal/frustum culling
@@ -57,6 +63,30 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             if (gfx["filter_mode"])  cfg.filterMode = gfx["filter_mode"].as<int>();
             if (gfx["linear_mips"])  cfg.linearMips = gfx["linear_mips"].as<bool>();
             if (gfx["sharp_mips"])   cfg.sharpMips  = gfx["sharp_mips"].as<bool>();
+        }
+
+        // water section
+        if (YAML::Node water = root["water"]) {
+            if (water["wave_amplitude"]) {
+                cfg.waveAmplitude = water["wave_amplitude"].as<float>();
+                if (cfg.waveAmplitude < 0.0f) cfg.waveAmplitude = 0.0f;
+                if (cfg.waveAmplitude > 10.0f) cfg.waveAmplitude = 10.0f;
+            }
+            if (water["uv_distortion"]) {
+                cfg.uvDistortion = water["uv_distortion"].as<float>();
+                if (cfg.uvDistortion < 0.0f) cfg.uvDistortion = 0.0f;
+                if (cfg.uvDistortion > 0.1f) cfg.uvDistortion = 0.1f;
+            }
+            if (water["rotation_speed"]) {
+                cfg.waterRotation = water["rotation_speed"].as<float>();
+                if (cfg.waterRotation < 0.0f) cfg.waterRotation = 0.0f;
+                if (cfg.waterRotation > 1.0f) cfg.waterRotation = 1.0f;
+            }
+            if (water["scroll_speed"]) {
+                cfg.waterScrollSpeed = water["scroll_speed"].as<float>();
+                if (cfg.waterScrollSpeed < 0.0f) cfg.waterScrollSpeed = 0.0f;
+                if (cfg.waterScrollSpeed > 1.0f) cfg.waterScrollSpeed = 1.0f;
+            }
         }
 
         // developer section
@@ -103,6 +133,22 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cfg.linearMips = true;
         } else if (std::strcmp(argv[i], "--sharp-mips") == 0) {
             cfg.sharpMips = true;
+        } else if (std::strcmp(argv[i], "--wave-amp") == 0 && i + 1 < argc) {
+            cfg.waveAmplitude = static_cast<float>(std::atof(argv[++i]));
+            if (cfg.waveAmplitude < 0.0f) cfg.waveAmplitude = 0.0f;
+            if (cfg.waveAmplitude > 10.0f) cfg.waveAmplitude = 10.0f;
+        } else if (std::strcmp(argv[i], "--uv-distort") == 0 && i + 1 < argc) {
+            cfg.uvDistortion = static_cast<float>(std::atof(argv[++i]));
+            if (cfg.uvDistortion < 0.0f) cfg.uvDistortion = 0.0f;
+            if (cfg.uvDistortion > 0.1f) cfg.uvDistortion = 0.1f;
+        } else if (std::strcmp(argv[i], "--water-rot") == 0 && i + 1 < argc) {
+            cfg.waterRotation = static_cast<float>(std::atof(argv[++i]));
+            if (cfg.waterRotation < 0.0f) cfg.waterRotation = 0.0f;
+            if (cfg.waterRotation > 1.0f) cfg.waterRotation = 1.0f;
+        } else if (std::strcmp(argv[i], "--water-scroll") == 0 && i + 1 < argc) {
+            cfg.waterScrollSpeed = static_cast<float>(std::atof(argv[++i]));
+            if (cfg.waterScrollSpeed < 0.0f) cfg.waterScrollSpeed = 0.0f;
+            if (cfg.waterScrollSpeed > 1.0f) cfg.waterScrollSpeed = 1.0f;
         } else if (argv[i][0] != '-' && !cli.misPath) {
             // First non-flag argument is the mission file
             cli.misPath = argv[i];
