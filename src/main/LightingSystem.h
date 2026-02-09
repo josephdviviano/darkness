@@ -280,7 +280,20 @@ parseAnimLightProperties(const std::string &misPath)
         }
     }
 
-    std::fprintf(stderr, "LightingSystem: parsed %d AnimLight properties\n", parsed);
+    // Count animated (non-static) lights and report details
+    int animatedCount = 0;
+    int inactiveCount = 0;
+    for (const auto &[num, ls] : lights) {
+        if (ls.mode != ANIM_MAX_BRIGHT && ls.mode != ANIM_MIN_BRIGHT
+            && ls.mode != ANIM_ZERO)
+            animatedCount++;
+        if (ls.inactive)
+            inactiveCount++;
+    }
+
+    std::fprintf(stderr, "LightingSystem: parsed %d AnimLight properties (%d animated, %d static, %d inactive)\n",
+                 parsed, animatedCount, parsed - animatedCount, inactiveCount);
+
     return lights;
 }
 
