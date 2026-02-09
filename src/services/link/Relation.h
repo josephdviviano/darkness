@@ -33,7 +33,7 @@
 #include "MessageSource.h"
 #include "NonCopyable.h"
 
-namespace Opde {
+namespace Darkness {
 /** @brief Relation. A store of a group of links of the same flavor.
  */
 class Relation : public NonCopyable,
@@ -315,6 +315,6 @@ protected:
 
 /// Shared pointer on Relation
 typedef shared_ptr<Relation> RelationPtr;
-} // namespace Opde
+} // namespace Darkness
 
 #endif

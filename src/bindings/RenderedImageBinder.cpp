@@ -28,7 +28,7 @@
 #include "bindings.h"
 #include "draw/RenderedImage.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -38,7 +38,7 @@ const char *RenderedImageBinder::msName = "RenderedImage";
 // ------------------------------------------
 PyTypeObject RenderedImageBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.RenderedImage", // char *tp_name; */
+                          0) "darkness.services.RenderedImage", // char *tp_name; */
     sizeof(RenderedImageBinder::Base), // int tp_basicsize; */
     0,                            // int tp_itemsize;       /* not used much */
     RenderedImageBinder::dealloc, // destructor tp_dealloc; */
@@ -146,4 +146,4 @@ void RenderedImageBinder::init(PyObject *module) {
 }
 
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness

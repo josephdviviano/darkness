@@ -28,7 +28,7 @@
 #include <string>
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 
 struct PropertyDef {
     std::string name;
@@ -222,6 +222,6 @@ inline PLDefResult parsePLDef(const std::string &filename) {
     return result;
 }
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif // __PLDEFPARSER_H

@@ -22,7 +22,7 @@
 #include "LightsForCell.h"
 #include "File.h"
 
-namespace Opde {
+namespace Darkness {
 
 LightsForCell::LightsForCell(const FilePtr &file, size_t num_anim_lights,
                              size_t num_textured, size_t light_size,
@@ -181,4 +181,4 @@ Ogre::Vector2 LightsForCell::mapUV(size_t face_id,
     return mLightMaps[face_id]->toAtlasCoords(original);
 }
 
-} // namespace Opde
+} // namespace Darkness

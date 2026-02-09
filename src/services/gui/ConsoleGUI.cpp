@@ -31,7 +31,7 @@
 #include "draw/RenderedLabel.h"
 #include "draw/RenderedRect.h"
 
-#include "OpdeException.h"
+#include "DarknessException.h"
 
 #include <string.h>
 
@@ -42,7 +42,7 @@ using namespace std;
 #define CONSOLE_LINES 30
 #define SCROLL_LINES (CONSOLE_LINES - 2)
 
-namespace Opde {
+namespace Darkness {
 
 ConsoleGUI::ConsoleGUI(GUIService *owner) : mIsActive(false), mOwner(owner) {
     // get handle to the font
@@ -259,4 +259,4 @@ void ConsoleGUI::resolutionChanged(size_t width, size_t height) {
     mConsoleText->setClipRect(mTextClipRect);
     mCommandLine->setClipRect(mCmdLineClipRect);
 }
-} // namespace Opde
+} // namespace Darkness

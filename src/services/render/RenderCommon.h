@@ -23,7 +23,7 @@
 #ifndef __RENDERCOMMON_H
 #define __RENDERCOMMON_H
 
-namespace Opde {
+namespace Darkness {
 
 const unsigned int RENDER_TYPE_NORMAL = 0;
 const unsigned int RENDER_TYPE_NOT_RENDERED = 1;
@@ -61,6 +61,6 @@ struct RenderServiceMsg {
     RenderWindowSize size;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif /* __RENDERCOMMON_H */

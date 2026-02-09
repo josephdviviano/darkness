@@ -32,7 +32,7 @@
 #include "compat.h"
 #include "logger.h"
 
-namespace Opde {
+namespace Darkness {
 namespace Python {
 
 /** Templatized struct binder (no field writing supported). Exposes Type T as a
@@ -67,7 +67,7 @@ protected:
      * to be usable, and publishes it
      * @param tpDoc the doc string for the published type
      * @param tpName the name of the type (incl. the module - e.g.
-     * "Opde.SampleStruct")
+     * "Darkness.SampleStruct")
      * @param module the container to put the type into (has to agree with the
      * tpName's path)
      */
@@ -176,6 +176,6 @@ PyTypeObject PythonStruct<T>::msType = {
     repr,    // reprfunc  tp_repr;    /* __repr__ */
 };
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness
 
 #endif

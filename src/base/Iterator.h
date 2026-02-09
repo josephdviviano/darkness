@@ -31,7 +31,7 @@
 
 #include "config.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** A java-like iterator approach */
 template <typename T> class Iterator {
@@ -82,6 +82,6 @@ protected:
     const C &mMap;
     typename C::const_iterator mIter;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

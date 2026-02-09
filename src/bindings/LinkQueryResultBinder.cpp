@@ -26,7 +26,7 @@
 #include "LinkServiceBinder.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -36,7 +36,7 @@ const char *LinkQueryResultBinder::msName = "LinkQueryResult";
 // ------------------------------------------
 PyTypeObject LinkQueryResultBinder::msType = {
     PyVarObject_HEAD_INIT(
-        &PyType_Type, 0) "opde.services.LinkQueryResult", // char *tp_name; */
+        &PyType_Type, 0) "darkness.services.LinkQueryResult", // char *tp_name; */
     sizeof(LinkQueryResultBinder::Base), // int tp_basicsize; */
     0, // int tp_itemsize;       /* not used much */
     LinkQueryResultBinder::dealloc, // destructor tp_dealloc; */
@@ -123,4 +123,4 @@ void LinkQueryResultBinder::init(PyObject *module) {
 
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

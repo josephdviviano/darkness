@@ -27,12 +27,12 @@
 
 #include "config.h"
 
-#include "OpdeService.h"
+#include "DarknessService.h"
 #include "ServiceCommon.h"
 #include "SharedPtr.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessServiceFactory.h"
 
-namespace Opde {
+namespace Darkness {
 // Forward decl.
 class Platform;
 
@@ -82,6 +82,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

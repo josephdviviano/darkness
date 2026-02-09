@@ -22,7 +22,7 @@
  *****************************************************************************/
 
 #include "CameraService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "ServiceCommon.h"
 #include "SharedPtr.h"
 #include "input/InputService.h"
@@ -36,7 +36,7 @@
 using namespace std;
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- CameraService -----------------*/
@@ -308,4 +308,4 @@ Service *CameraServiceFactory::createInstance(ServiceManager *manager) {
     return new CameraService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

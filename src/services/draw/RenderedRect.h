@@ -29,7 +29,7 @@
 
 #include <OgreVector3.h>
 
-namespace Opde {
+namespace Darkness {
 /** Rendered rectangle. A single on-screen rectangle with a specified colour. */
 class RenderedRect : public DrawOperation {
 public:
@@ -72,6 +72,6 @@ private:
     PixelSize mPixelSize;
 };
 
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

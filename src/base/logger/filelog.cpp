@@ -23,7 +23,7 @@
  *****************************************************************************/
 
 #include "filelog.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 
 #include <stdio.h>
 #include <string>
@@ -32,12 +32,12 @@
 #pragma warning(disable : 4996)
 #endif
 
-namespace Opde {
+namespace Darkness {
 
 FileLog::FileLog(const std::string &fname)
     : ofile(fname.c_str(), std::ios::out) {
     if (!ofile.is_open())
-        OPDE_EXCEPT("Could not create output log file");
+        DARKNESS_EXCEPT("Could not create output log file");
 };
 
 FileLog::~FileLog() { ofile.close(); };
@@ -48,4 +48,4 @@ void FileLog::logMessage(Logger::LogLevel level, const std::string &msg) {
           << "] : " << msg << std::endl;
     ofile.flush();
 }
-} // namespace Opde
+} // namespace Darkness

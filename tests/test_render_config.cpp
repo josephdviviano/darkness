@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 struct TmpFile {
     fs::path path;
     explicit TmpFile(const std::string& content) {
-        path = fs::temp_directory_path() / ("opde_test_" + std::to_string(reinterpret_cast<uintptr_t>(this)) + ".yaml");
+        path = fs::temp_directory_path() / ("darkness_test_" + std::to_string(reinterpret_cast<uintptr_t>(this)) + ".yaml");
         std::ofstream out(path);
         out << content;
     }
@@ -36,7 +36,7 @@ static std::vector<char*> makeArgv(std::vector<std::string>& args) {
 // ---- Test cases ----
 
 TEST_CASE("RenderConfig defaults", "[config]") {
-    Opde::RenderConfig cfg;
+    Darkness::RenderConfig cfg;
 
     CHECK(cfg.lmScale    == 1);
     CHECK(cfg.filterMode == 0);
@@ -60,8 +60,8 @@ developer:
   force_flicker: true
 )");
 
-    Opde::RenderConfig cfg;
-    bool ok = Opde::loadConfigFromYAML(tmp.path.string(), cfg);
+    Darkness::RenderConfig cfg;
+    bool ok = Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
 
     REQUIRE(ok);
     CHECK(cfg.lmScale    == 4);
@@ -79,8 +79,8 @@ graphics:
   lm_scale: 3
 )");
 
-    Opde::RenderConfig cfg;
-    bool ok = Opde::loadConfigFromYAML(tmp.path.string(), cfg);
+    Darkness::RenderConfig cfg;
+    bool ok = Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
 
     REQUIRE(ok);
     CHECK(cfg.lmScale    == 3);
@@ -94,10 +94,10 @@ graphics:
 }
 
 TEST_CASE("YAML missing file returns false, config unchanged", "[config][yaml]") {
-    Opde::RenderConfig cfg;
-    Opde::RenderConfig orig = cfg;
+    Darkness::RenderConfig cfg;
+    Darkness::RenderConfig orig = cfg;
 
-    bool ok = Opde::loadConfigFromYAML("/tmp/nonexistent_opde_config_xyz.yaml", cfg);
+    bool ok = Darkness::loadConfigFromYAML("/tmp/nonexistent_darkness_config_xyz.yaml", cfg);
 
     CHECK_FALSE(ok);
     // Config must be unchanged
@@ -109,10 +109,10 @@ TEST_CASE("YAML missing file returns false, config unchanged", "[config][yaml]")
 TEST_CASE("YAML malformed file returns false, no crash", "[config][yaml]") {
     TmpFile tmp("{{{{not valid yaml at all : : :");
 
-    Opde::RenderConfig cfg;
-    Opde::RenderConfig orig = cfg;
+    Darkness::RenderConfig cfg;
+    Darkness::RenderConfig orig = cfg;
 
-    bool ok = Opde::loadConfigFromYAML(tmp.path.string(), cfg);
+    bool ok = Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
 
     CHECK_FALSE(ok);
     // Config must be unchanged — malformed YAML should not partially apply
@@ -122,9 +122,9 @@ TEST_CASE("YAML malformed file returns false, no crash", "[config][yaml]") {
 }
 
 TEST_CASE("CLI flags override defaults", "[config][cli]") {
-    Opde::RenderConfig cfg;
+    Darkness::RenderConfig cfg;
     std::vector<std::string> args = {
-        "opdeRender", "mission.mis",
+        "darknessRender", "mission.mis",
         "--no-objects", "--no-cull", "--filter",
         "--lm-scale", "4", "--force-flicker",
         "--linear-mips", "--sharp-mips"
@@ -132,7 +132,7 @@ TEST_CASE("CLI flags override defaults", "[config][cli]") {
     auto argv = makeArgv(args);
     int argc = static_cast<int>(argv.size());
 
-    Opde::CliResult cli = Opde::applyCliOverrides(argc, argv.data(), cfg);
+    Darkness::CliResult cli = Darkness::applyCliOverrides(argc, argv.data(), cfg);
 
     CHECK(cfg.showObjects   == false);
     CHECK(cfg.portalCulling == false);
@@ -146,9 +146,9 @@ TEST_CASE("CLI flags override defaults", "[config][cli]") {
 }
 
 TEST_CASE("CLI-only fields: --res, --config, --help, positional", "[config][cli]") {
-    Opde::RenderConfig cfg;
+    Darkness::RenderConfig cfg;
     std::vector<std::string> args = {
-        "opdeRender", "test.mis",
+        "darknessRender", "test.mis",
         "--res", "/path/to/res",
         "--config", "my.yaml",
         "--help"
@@ -156,7 +156,7 @@ TEST_CASE("CLI-only fields: --res, --config, --help, positional", "[config][cli]
     auto argv = makeArgv(args);
     int argc = static_cast<int>(argv.size());
 
-    Opde::CliResult cli = Opde::applyCliOverrides(argc, argv.data(), cfg);
+    Darkness::CliResult cli = Darkness::applyCliOverrides(argc, argv.data(), cfg);
 
     CHECK(cli.helpRequested == true);
     CHECK(cli.resPath    == "/path/to/res");
@@ -168,28 +168,28 @@ TEST_CASE("CLI-only fields: --res, --config, --help, positional", "[config][cli]
 TEST_CASE("lm_scale clamping in YAML and CLI", "[config][clamp]") {
     SECTION("YAML clamps below 1 to 1") {
         TmpFile tmp("graphics:\n  lm_scale: -5\n");
-        Opde::RenderConfig cfg;
-        Opde::loadConfigFromYAML(tmp.path.string(), cfg);
+        Darkness::RenderConfig cfg;
+        Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
         CHECK(cfg.lmScale == 1);
     }
     SECTION("YAML clamps above 8 to 8") {
         TmpFile tmp("graphics:\n  lm_scale: 99\n");
-        Opde::RenderConfig cfg;
-        Opde::loadConfigFromYAML(tmp.path.string(), cfg);
+        Darkness::RenderConfig cfg;
+        Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
         CHECK(cfg.lmScale == 8);
     }
     SECTION("CLI clamps below 1 to 1") {
-        Opde::RenderConfig cfg;
+        Darkness::RenderConfig cfg;
         std::vector<std::string> args = {"prog", "--lm-scale", "0"};
         auto argv = makeArgv(args);
-        Opde::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
+        Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
         CHECK(cfg.lmScale == 1);
     }
     SECTION("CLI clamps above 8 to 8") {
-        Opde::RenderConfig cfg;
+        Darkness::RenderConfig cfg;
         std::vector<std::string> args = {"prog", "--lm-scale", "100"};
         auto argv = makeArgv(args);
-        Opde::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
+        Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
         CHECK(cfg.lmScale == 8);
     }
 }
@@ -204,15 +204,15 @@ developer:
   show_objects: false
 )");
 
-    Opde::RenderConfig cfg;
-    bool ok = Opde::loadConfigFromYAML(tmp.path.string(), cfg);
+    Darkness::RenderConfig cfg;
+    bool ok = Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
     REQUIRE(ok);
     CHECK(cfg.lmScale == 6);
 
     // CLI overrides lm_scale but not filter_mode or show_objects
     std::vector<std::string> args = {"prog", "--lm-scale", "2"};
     auto argv = makeArgv(args);
-    Opde::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
+    Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
 
     CHECK(cfg.lmScale       == 2);  // CLI wins
     CHECK(cfg.filterMode    == 2);  // YAML preserved

@@ -28,7 +28,7 @@
 
 #include "ConsoleCommandListener.h"
 #include "GameState.h"
-#include "OpdeSingleton.h"
+#include "DarknessSingleton.h"
 #include "config/ConfigService.h"
 #include "draw/DrawService.h"
 #include "link/LinkCommon.h"
@@ -38,7 +38,7 @@
 #include <OgreRoot.h>
 #include <OgreSceneManager.h>
 
-namespace Opde {
+namespace Darkness {
 
 class GamePlayState : public Singleton<GamePlayState>,
                       public GameState,
@@ -126,6 +126,6 @@ private:
 
     DrawServicePtr mDrawService;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

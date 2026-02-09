@@ -1,4 +1,4 @@
-// TEMPORARILY ADDED TO OPDE AS A FIX TO OGRE 1.9 BUG
+// TEMPORARILY ADDED TO DARKNESS AS A FIX TO OGRE 1.9 BUG
 /*
 -----------------------------------------------------------------------------
 This source file is part of OGRE
@@ -33,7 +33,7 @@ THIS IS HERE BECAUSE OF THE BREAKING CHANGE IN OGRE THAT THEY DID FOR SOME
 OBSCURE REASON THAT REMOVED PATHS FROM FILENAMES WHICH SHOULD BE FULLY
 QUALIFIED!
 
-Changed minimally to be part of opde, but otherwise only fixed
+Changed minimally to be part of darkness, but otherwise only fixed
 */
 
 #include "OgreFixedZip.h"

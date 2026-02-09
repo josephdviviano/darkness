@@ -26,7 +26,7 @@
 
 #include "InheritService.h"
 
-namespace Opde {
+namespace Darkness {
 /** Never Inheritor. This inheritor never inherits. Always uses only the
  * existing self value for any object ID */
 class NeverInheritor : public Inheritor {
@@ -80,6 +80,6 @@ public:
 protected:
     static std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

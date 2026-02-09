@@ -30,7 +30,7 @@
 #include "OgreMesh.h"
 #include <OgreResourceManager.h>
 
-namespace Opde {
+namespace Darkness {
 
 /** ManualResourceLoader for BIN meshes. Used to load BIN meshes as Ogre::Mesh
  * instances */

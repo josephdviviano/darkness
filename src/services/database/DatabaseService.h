@@ -25,8 +25,8 @@
 #define __DATABASESERVICE_H
 
 #include "DarkCommon.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "PrioritizedMessageSource.h"
 #include "ServiceCommon.h"
 #include "SharedPtr.h"
@@ -34,7 +34,7 @@
 
 #include <chrono>
 
-namespace Opde {
+namespace Darkness {
 
 /** @brief Database service - service which handles dark database loading and
  * saving Typically, a service wanting to handle database events will register
@@ -165,6 +165,6 @@ public:
 private:
     static std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

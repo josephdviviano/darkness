@@ -526,7 +526,7 @@ static bgfx::TextureHandle createMipmappedTexture(
 
 // ── Build flat-shaded mesh (no textures) ──
 
-static FlatMesh buildFlatMesh(const Opde::WRParsedData &wr) {
+static FlatMesh buildFlatMesh(const Darkness::WRParsedData &wr) {
     FlatMesh mesh;
 
     // Sun direction for Lambertian shading
@@ -563,11 +563,11 @@ static FlatMesh buildFlatMesh(const Opde::WRParsedData &wr) {
                 continue;
 
             // Get plane normal for flat shading
-            Opde::Plane plane;
+            Darkness::Plane plane;
             if (poly.plane < cell.planes.size())
                 plane = cell.planes[poly.plane];
 
-            Opde::Vector3 n = plane.normal.normalisedCopy();
+            Darkness::Vector3 n = plane.normal.normalisedCopy();
             float dot = n.x * sunDir[0] + n.y * sunDir[1] + n.z * sunDir[2];
             float brightness = std::max(dot, 0.0f) * 0.85f + 0.15f;
 
@@ -591,7 +591,7 @@ static FlatMesh buildFlatMesh(const Opde::WRParsedData &wr) {
                 mesh.vertices.push_back({v.x, v.y, v.z, color});
             }
 
-            // Fan-triangulate: (0, t+1, t) — matches OPDE WRCell.cpp winding
+            // Fan-triangulate: (0, t+1, t) — matches original WRCell.cpp winding
             // Group by (cellID, 0) since flat mesh has no texture index
             uint64_t key = (static_cast<uint64_t>(ci) << 8);
             auto &triList = cellTexTriangles[key];
@@ -639,7 +639,7 @@ struct TexDimensions {
 // Only emit from air cells (mediaType==1) to avoid double-rendering — the
 // same portal polygon exists in both the air and water cell.
 
-static WorldMesh buildWaterMesh(const Opde::WRParsedData &wr,
+static WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
                                 const std::unordered_map<uint8_t, TexDimensions> &texDims) {
     WorldMesh mesh;
     // Semi-transparent dark blue-green — fallback for non-textured water portals
@@ -688,7 +688,7 @@ static WorldMesh buildWaterMesh(const Opde::WRParsedData &wr,
             if (isTextured) {
                 // UV computation — same algorithm as buildTexturedMesh
                 const auto &tex = cell.texturing[pi];
-                Opde::Vector3 origin(0, 0, 0);
+                Darkness::Vector3 origin(0, 0, 0);
                 if (tex.originVertex < indices.size()) {
                     uint8_t oi = indices[tex.originVertex];
                     if (oi < cell.vertices.size())
@@ -706,7 +706,7 @@ static WorldMesh buildWaterMesh(const Opde::WRParsedData &wr,
                     if (idx >= cell.vertices.size()) continue;
                     const auto &coord = cell.vertices[idx];
 
-                    Opde::Vector3 tmp = coord - origin;
+                    Darkness::Vector3 tmp = coord - origin;
                     float u, v;
 
                     if (std::abs(dotp) < 1e-6f) {
@@ -778,7 +778,7 @@ static WorldMesh buildWaterMesh(const Opde::WRParsedData &wr,
 
 // ── Build textured mesh with UV coordinates ──
 
-static WorldMesh buildTexturedMesh(const Opde::WRParsedData &wr,
+static WorldMesh buildTexturedMesh(const Darkness::WRParsedData &wr,
                                    const std::unordered_map<uint8_t, TexDimensions> &texDims) {
     WorldMesh mesh;
 
@@ -810,11 +810,11 @@ static WorldMesh buildTexturedMesh(const Opde::WRParsedData &wr,
 
             if (poly.count < 3) continue;
 
-            Opde::Plane plane;
+            Darkness::Plane plane;
             if (poly.plane < cell.planes.size())
                 plane = cell.planes[poly.plane];
 
-            Opde::Vector3 n = plane.normal.normalisedCopy();
+            Darkness::Vector3 n = plane.normal.normalisedCopy();
             float dot = n.x * sunDir[0] + n.y * sunDir[1] + n.z * sunDir[2];
             float brightness = std::max(dot, 0.0f) * 0.85f + 0.15f;
 
@@ -859,7 +859,7 @@ static WorldMesh buildTexturedMesh(const Opde::WRParsedData &wr,
             // UV computation (ref: WRCell.cpp:145-212)
             if (isTextured) {
                 const auto &tex = cell.texturing[pi];
-                Opde::Vector3 origin(0, 0, 0);
+                Darkness::Vector3 origin(0, 0, 0);
                 if (tex.originVertex < indices.size()) {
                     uint8_t oi = indices[tex.originVertex];
                     if (oi < cell.vertices.size())
@@ -877,7 +877,7 @@ static WorldMesh buildTexturedMesh(const Opde::WRParsedData &wr,
                     if (idx >= cell.vertices.size()) continue;
                     const auto &coord = cell.vertices[idx];
 
-                    Opde::Vector3 tmp = coord - origin;
+                    Darkness::Vector3 tmp = coord - origin;
                     float u, v;
 
                     if (std::abs(dotp) < 1e-6f) {
@@ -951,9 +951,9 @@ static WorldMesh buildTexturedMesh(const Opde::WRParsedData &wr,
 // ── Build lightmapped mesh with dual UV channels ──
 
 static LightmappedMesh buildLightmappedMesh(
-    const Opde::WRParsedData &wr,
+    const Darkness::WRParsedData &wr,
     const std::unordered_map<uint8_t, TexDimensions> &texDims,
-    const Opde::LightmapAtlasSet &lmAtlas)
+    const Darkness::LightmapAtlasSet &lmAtlas)
 {
     LightmappedMesh mesh;
 
@@ -1019,7 +1019,7 @@ static LightmappedMesh buildLightmappedMesh(
 
             if (isTextured) {
                 const auto &tex = cell.texturing[pi];
-                Opde::Vector3 origin(0, 0, 0);
+                Darkness::Vector3 origin(0, 0, 0);
                 if (tex.originVertex < indices.size()) {
                     uint8_t oi = indices[tex.originVertex];
                     if (oi < cell.vertices.size())
@@ -1033,8 +1033,8 @@ static LightmappedMesh buildLightmappedMesh(
                 float dotp = tex.axisU.dotProduct(tex.axisV);
 
                 // Lightmap shift and entry (if available)
-                const Opde::WRLightInfo *li = nullptr;
-                const Opde::LmapEntry *lmEntry = nullptr;
+                const Darkness::WRLightInfo *li = nullptr;
+                const Darkness::LmapEntry *lmEntry = nullptr;
                 float lsh_u = 0, lsh_v = 0;
 
                 if (hasLightmap) {
@@ -1060,7 +1060,7 @@ static LightmappedMesh buildLightmappedMesh(
                     verts[vi].y = coord.y;
                     verts[vi].z = coord.z;
 
-                    Opde::Vector3 tmp = coord - origin;
+                    Darkness::Vector3 tmp = coord - origin;
                     float pu = tex.axisU.dotProduct(tmp);
                     float pv = tex.axisV.dotProduct(tmp);
                     float projU, projV;
@@ -1118,8 +1118,8 @@ static LightmappedMesh buildLightmappedMesh(
                     }
                 } else {
                     // No lightmap — point at white fallback pixel in atlas
-                    const Opde::LmapEntry &fallback = (ci < lmAtlas.entries.size() && !lmAtlas.entries[ci].empty())
-                        ? lmAtlas.entries[ci][0] : Opde::LmapEntry{0, 0, 0, 0, 0, 0, 0, 0, 0};
+                    const Darkness::LmapEntry &fallback = (ci < lmAtlas.entries.size() && !lmAtlas.entries[ci].empty())
+                        ? lmAtlas.entries[ci][0] : Darkness::LmapEntry{0, 0, 0, 0, 0, 0, 0, 0, 0};
 
                     for (int vi = 0; vi < poly.count; ++vi) {
                         mesh.vertices.push_back({
@@ -1182,7 +1182,7 @@ struct ObjectSubMeshGPU {
     uint32_t firstIndex;
     uint32_t indexCount;
     std::string matName;   // lowercase material name, for texture lookup
-    bool textured;         // true = Opde::MD_MAT_TMAP, false = Opde::MD_MAT_COLOR
+    bool textured;         // true = Darkness::MD_MAT_TMAP, false = Darkness::MD_MAT_COLOR
 };
 
 // GPU buffers for a single unique model (shared by all instances)
@@ -1251,9 +1251,9 @@ static void buildFallbackCube(std::vector<PosColorVertex> &verts,
 // all cells. When the camera is near a water boundary, it may be inside
 // both an air and water cell — we prefer the smallest containing cell.
 
-static int32_t findCameraCell(const Opde::WRParsedData &wr,
+static int32_t findCameraCell(const Darkness::WRParsedData &wr,
                                float cx, float cy, float cz) {
-    Opde::Vector3 pt(cx, cy, cz);
+    Darkness::Vector3 pt(cx, cy, cz);
     float bestRadius = 1e30f;
     int32_t bestCell = -1;
 
@@ -1293,7 +1293,7 @@ static int32_t findCameraCell(const Opde::WRParsedData &wr,
 }
 
 // Convenience wrapper: returns mediaType (1=air, 2=water) for underwater detection
-static uint8_t getCameraMediaType(const Opde::WRParsedData &wr,
+static uint8_t getCameraMediaType(const Darkness::WRParsedData &wr,
                                    float cx, float cy, float cz) {
     int32_t cell = findCameraCell(wr, cx, cy, cz);
     if (cell >= 0 && cell < static_cast<int32_t>(wr.numCells))
@@ -1306,7 +1306,7 @@ static uint8_t getCameraMediaType(const Opde::WRParsedData &wr,
 // Portal connectivity info for BFS traversal
 struct PortalInfo {
     uint32_t tgtCell;           // destination cell index
-    Opde::Plane plane;          // portal plane (for backface cull)
+    Darkness::Plane plane;          // portal plane (for backface cull)
     // Portal polygon AABB (for frustum test)
     float minX, minY, minZ;
     float maxX, maxY, maxZ;
@@ -1315,7 +1315,7 @@ struct PortalInfo {
 // Build portal adjacency graph from WR data.
 // cellPortals[cellID] = list of portals leading to other cells.
 static std::vector<std::vector<PortalInfo>>
-buildPortalGraph(const Opde::WRParsedData &wr) {
+buildPortalGraph(const Darkness::WRParsedData &wr) {
     std::vector<std::vector<PortalInfo>> cellPortals(wr.numCells);
 
     for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
@@ -1441,7 +1441,7 @@ struct ViewFrustum {
 // BFS portal traversal: starting from the camera cell, follow portals
 // that are visible to the view frustum. Returns the set of visible cell IDs.
 static std::unordered_set<uint32_t>
-portalBFS(const Opde::WRParsedData &wr,
+portalBFS(const Darkness::WRParsedData &wr,
           const std::vector<std::vector<PortalInfo>> &cellPortals,
           int32_t startCell,
           const ViewFrustum &frustum,
@@ -1455,7 +1455,7 @@ portalBFS(const Opde::WRParsedData &wr,
     queue.push(static_cast<uint32_t>(startCell));
     visible.insert(static_cast<uint32_t>(startCell));
 
-    Opde::Vector3 camPos(camX, camY, camZ);
+    Darkness::Vector3 camPos(camX, camY, camZ);
 
     while (!queue.empty()) {
         uint32_t ci = queue.front();
@@ -1505,15 +1505,15 @@ static FogParams parseFogChunk(const char *misPath) {
     FogParams fog = { false, 0.0f, 0.0f, 0.0f, 1.0f };
 
     try {
-        Opde::FilePtr fp(new Opde::StdFile(misPath, Opde::File::FILE_R));
-        Opde::FileGroupPtr db(new Opde::DarkFileGroup(fp));
+        Darkness::FilePtr fp(new Darkness::StdFile(misPath, Darkness::File::FILE_R));
+        Darkness::FileGroupPtr db(new Darkness::DarkFileGroup(fp));
 
         if (!db->hasFile("FOG")) {
             std::fprintf(stderr, "No FOG chunk — fog disabled\n");
             return fog;
         }
 
-        Opde::FilePtr chunk = db->getFile("FOG");
+        Darkness::FilePtr chunk = db->getFile("FOG");
 
         int32_t red, green, blue;
         float distance;
@@ -1584,15 +1584,15 @@ static SkyParams parseSkyObjVar(const char *misPath) {
     SkyParams params = defaultSkyParams();
 
     try {
-        Opde::FilePtr fp(new Opde::StdFile(misPath, Opde::File::FILE_R));
-        Opde::FileGroupPtr db(new Opde::DarkFileGroup(fp));
+        Darkness::FilePtr fp(new Darkness::StdFile(misPath, Darkness::File::FILE_R));
+        Darkness::FileGroupPtr db(new Darkness::DarkFileGroup(fp));
 
         if (!db->hasFile("SKYOBJVAR")) {
             std::fprintf(stderr, "No SKYOBJVAR chunk — using default sky colours\n");
             return params;
         }
 
-        Opde::FilePtr chunk = db->getFile("SKYOBJVAR");
+        Darkness::FilePtr chunk = db->getFile("SKYOBJVAR");
 
         // Read the binary struct: matches DarkDBChunkSKYOBJVAR from DarkDBDefs.h
         // Fields: enable(4), fog(4), atmos_radius(4), earth_radius(4),
@@ -2005,10 +2005,10 @@ struct Camera {
 
 static void printHelp() {
     std::fprintf(stderr,
-        "opdeRender — Dark Engine world geometry viewer\n"
+        "darknessRender — Dark Engine world geometry viewer\n"
         "\n"
         "Usage:\n"
-        "  opdeRender <mission.mis> [--res <path>] [--config <path>] [--lm-scale <N>]\n"
+        "  darknessRender <mission.mis> [--res <path>] [--config <path>] [--lm-scale <N>]\n"
         "\n"
         "Options:\n"
         "  --res <path>   Path to Thief 2 RES directory containing fam.crf.\n"
@@ -2024,7 +2024,7 @@ static void printHelp() {
         "  --force-flicker Force all animated lights to flicker mode (debug).\n"
         "  --linear-mips  Gamma-correct mipmap generation (sRGB linearization).\n"
         "  --sharp-mips   Sharpen mip levels to preserve detail at distance.\n"
-        "  --config <path> Path to YAML config file (default: ./opdeRender.yaml).\n"
+        "  --config <path> Path to YAML config file (default: ./darknessRender.yaml).\n"
         "  --help         Show this help message.\n"
         "\n"
         "Controls:\n"
@@ -2054,13 +2054,13 @@ static void printHelp() {
         "\n"
         "Examples:\n"
         "  # Flat-shaded (no external resources needed):\n"
-        "  opdeRender path/to/miss6.mis\n"
+        "  darknessRender path/to/miss6.mis\n"
         "\n"
         "  # Textured, using mounted Thief 2 disc:\n"
-        "  opdeRender path/to/miss6.mis --res /Volumes/THIEF2_INSTALL_C/THIEF2/RES\n"
+        "  darknessRender path/to/miss6.mis --res /Volumes/THIEF2_INSTALL_C/THIEF2/RES\n"
         "\n"
         "  # Textured, using GOG install:\n"
-        "  opdeRender path/to/miss6.mis --res ~/GOG/Thief2/RES\n"
+        "  darknessRender path/to/miss6.mis --res ~/GOG/Thief2/RES\n"
     );
 }
 
@@ -2071,10 +2071,10 @@ int main(int argc, char *argv[]) {
     }
 
     // Parse config: hardcoded defaults → YAML file → CLI overrides
-    Opde::RenderConfig cfg;
+    Darkness::RenderConfig cfg;
 
     // First CLI pass: extract --config path (and detect --help early)
-    Opde::CliResult cli = Opde::applyCliOverrides(argc, argv, cfg);
+    Darkness::CliResult cli = Darkness::applyCliOverrides(argc, argv, cfg);
 
     if (cli.helpRequested) {
         printHelp();
@@ -2087,12 +2087,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Load YAML config (defaults to ./opdeRender.yaml if no --config flag)
-    std::string configPath = cli.configPath.empty() ? "opdeRender.yaml" : cli.configPath;
-    Opde::loadConfigFromYAML(configPath, cfg);
+    // Load YAML config (defaults to ./darknessRender.yaml if no --config flag)
+    std::string configPath = cli.configPath.empty() ? "darknessRender.yaml" : cli.configPath;
+    Darkness::loadConfigFromYAML(configPath, cfg);
 
     // Re-apply CLI so flags always win over YAML values
-    cli = Opde::applyCliOverrides(argc, argv, cfg);
+    cli = Darkness::applyCliOverrides(argc, argv, cfg);
 
     // Unpack into local variables — rest of file uses these unchanged
     const char *misPath    = cli.misPath;
@@ -2124,9 +2124,9 @@ int main(int argc, char *argv[]) {
     // Parse WR geometry
     std::fprintf(stderr, "Loading WR geometry from %s...\n", misPath);
 
-    Opde::WRParsedData wrData;
+    Darkness::WRParsedData wrData;
     try {
-        wrData = Opde::parseWRChunk(misPath);
+        wrData = Darkness::parseWRChunk(misPath);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "Failed to parse WR chunk: %s\n", e.what());
         return 1;
@@ -2144,21 +2144,21 @@ int main(int argc, char *argv[]) {
     }
 
     // Find player spawn point from L$PlayerFactory + P$Position chunks
-    Opde::SpawnInfo spawnInfo = Opde::findSpawnPoint(misPath);
+    Darkness::SpawnInfo spawnInfo = Darkness::findSpawnPoint(misPath);
 
     // Parse animated light properties from mission database
-    auto lightSources = Opde::parseAnimLightProperties(misPath);
+    auto lightSources = Darkness::parseAnimLightProperties(misPath);
 
     // Build reverse index: lightnum → list of (cellIdx, polyIdx) affected
-    auto animLightIndex = Opde::buildAnimLightIndex(wrData);
+    auto animLightIndex = Darkness::buildAnimLightIndex(wrData);
 
     // Ensure all lightnums referenced in WR data have a LightSource entry.
     // Lights without P$AnimLight properties default to mode 4 (max brightness).
     for (const auto &kv : animLightIndex) {
         if (lightSources.find(kv.first) == lightSources.end()) {
-            Opde::LightSource ls = {};
+            Darkness::LightSource ls = {};
             ls.lightNum = kv.first;
-            ls.mode = Opde::ANIM_MAX_BRIGHT;
+            ls.mode = Darkness::ANIM_MAX_BRIGHT;
             ls.maxBright = 1.0f;
             ls.minBright = 0.0f;
             ls.brightness = 1.0f;
@@ -2170,7 +2170,7 @@ int main(int argc, char *argv[]) {
     // Apply --force-flicker: override all lights to flicker mode for debugging
     if (forceFlicker) {
         for (auto &[num, ls] : lightSources) {
-            ls.mode = Opde::ANIM_FLICKER;
+            ls.mode = Darkness::ANIM_FLICKER;
             ls.inactive = false;
             ls.minBright = 0.0f;
             ls.maxBright = 1.0f;
@@ -2218,10 +2218,10 @@ int main(int argc, char *argv[]) {
     FogParams fogParams = parseFogChunk(misPath);
 
     // Parse TXLIST if in textured mode
-    Opde::TXList txList;
+    Darkness::TXList txList;
     if (texturedMode) {
         try {
-            txList = Opde::parseTXList(misPath);
+            txList = Darkness::parseTXList(misPath);
             std::fprintf(stderr, "TXLIST: %zu textures, %zu families\n",
                          txList.textures.size(), txList.families.size());
         } catch (const std::exception &e) {
@@ -2245,11 +2245,11 @@ int main(int argc, char *argv[]) {
     }
 
     // Load textures from CRF
-    std::unordered_map<uint8_t, Opde::DecodedImage> loadedTextures;
+    std::unordered_map<uint8_t, Darkness::DecodedImage> loadedTextures;
     std::unordered_map<uint8_t, TexDimensions> texDims;
 
     if (texturedMode) {
-        Opde::CRFTextureLoader loader(resPath);
+        Darkness::CRFTextureLoader loader(resPath);
         if (!loader.isOpen()) {
             std::fprintf(stderr, "CRF not available, falling back to flat shading\n");
             texturedMode = false;
@@ -2271,11 +2271,11 @@ int main(int argc, char *argv[]) {
     // ── Load skybox face textures (old sky system) ──
     // Missions without SKYOBJVAR use a textured skybox with per-mission PCX
     // textures in fam.crf under skyhw/ (e.g. skyhw/miss6n.PCX for north face).
-    std::unordered_map<std::string, Opde::DecodedImage> skyboxImages;
+    std::unordered_map<std::string, Darkness::DecodedImage> skyboxImages;
     bool hasSkybox = false;
 
     if (texturedMode) {
-        Opde::CRFTextureLoader skyLoader(resPath);
+        Darkness::CRFTextureLoader skyLoader(resPath);
         if (skyLoader.isOpen()) {
             // 5 faces: n=north(+Y), s=south(-Y), e=east(+X), w=west(-X), t=top(+Z)
             const char *suffixes[] = { "n", "s", "e", "w", "t" };
@@ -2307,10 +2307,10 @@ int main(int argc, char *argv[]) {
 
     // ── Parse object placements from .mis ──
 
-    Opde::ObjectPropData objData;
+    Darkness::ObjectPropData objData;
     if (showObjects) {
         try {
-            objData = Opde::parseObjectProps(misPath);
+            objData = Darkness::parseObjectProps(misPath);
         } catch (const std::exception &e) {
             std::fprintf(stderr, "Failed to parse object props: %s\n", e.what());
             showObjects = false;
@@ -2338,10 +2338,10 @@ int main(int argc, char *argv[]) {
     }
 
     // Load .bin models from obj.crf (if --res provided and objects enabled)
-    std::unordered_map<std::string, Opde::ParsedBinMesh> parsedModels;
+    std::unordered_map<std::string, Darkness::ParsedBinMesh> parsedModels;
 
     if (showObjects && !resPath.empty()) {
-        Opde::CRFModelLoader modelLoader(resPath);
+        Darkness::CRFModelLoader modelLoader(resPath);
         if (modelLoader.isOpen()) {
             int loaded = 0, failed = 0;
             for (const auto &name : objData.uniqueModels) {
@@ -2351,7 +2351,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 try {
-                    auto mesh = Opde::parseBinModel(binData.data(), binData.size());
+                    auto mesh = Darkness::parseBinModel(binData.data(), binData.size());
                     if (mesh.valid) {
                         parsedModels[name] = std::move(mesh);
                         ++loaded;
@@ -2390,7 +2390,7 @@ int main(int argc, char *argv[]) {
     std::unordered_set<std::string> objMatNames;
     for (const auto &kv : parsedModels) {
         for (const auto &mat : kv.second.materials) {
-            if (mat.type == Opde::MD_MAT_TMAP) {
+            if (mat.type == Darkness::MD_MAT_TMAP) {
                 // Lowercase the name for case-insensitive matching
                 std::string lname(mat.name);
                 std::transform(lname.begin(), lname.end(), lname.begin(),
@@ -2403,11 +2403,11 @@ int main(int argc, char *argv[]) {
     // Load object textures from obj.crf (txt16/ and txt/ subdirectories inside it).
     // Dark Engine stores object textures as GIF/PCX files within obj.crf, not in
     // separate txt16.crf/txt.crf archives.
-    std::unordered_map<std::string, Opde::DecodedImage> objTexImages;
+    std::unordered_map<std::string, Darkness::DecodedImage> objTexImages;
 
     if (!objMatNames.empty() && !resPath.empty()) {
         // Reuse obj.crf for texture lookup (same archive that holds .bin models)
-        Opde::CRFTextureLoader objTexLoader(resPath, "obj.crf");
+        Darkness::CRFTextureLoader objTexLoader(resPath, "obj.crf");
 
         int loaded = 0;
         for (const auto &name : objMatNames) {
@@ -2538,11 +2538,11 @@ int main(int argc, char *argv[]) {
     // ── Build lightmap atlas (if textured mode) ──
 
     bool lightmappedMode = false;
-    Opde::LightmapAtlasSet lmAtlasSet;
+    Darkness::LightmapAtlasSet lmAtlasSet;
     std::vector<bgfx::TextureHandle> lightmapAtlasHandles;
 
     if (texturedMode) {
-        lmAtlasSet = Opde::buildLightmapAtlases(wrData, lmScale);
+        lmAtlasSet = Darkness::buildLightmapAtlases(wrData, lmScale);
         if (!lmAtlasSet.atlases.empty()) {
             lightmappedMode = true;
 
@@ -2569,7 +2569,7 @@ int main(int argc, char *argv[]) {
                                       | static_cast<uint32_t>(pi);
                         if (!blendedSet.insert(key).second) continue;
 
-                        Opde::blendAnimatedLightmap(
+                        Darkness::blendAnimatedLightmap(
                             lmAtlasSet.atlases[0], wrData, ci, pi,
                             lmAtlasSet.entries[ci][pi],
                             initIntensities, lmScale);
@@ -2789,7 +2789,7 @@ int main(int argc, char *argv[]) {
         // Create GPU buffers for each parsed .bin model
         for (auto &kv : parsedModels) {
             const std::string &name = kv.first;
-            const Opde::ParsedBinMesh &mesh = kv.second;
+            const Darkness::ParsedBinMesh &mesh = kv.second;
 
             if (mesh.vertices.empty() || mesh.indices.empty()) continue;
 
@@ -2808,14 +2808,14 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            // Fallback colour for non-textured models or Opde::MD_MAT_COLOR materials
+            // Fallback colour for non-textured models or Darkness::MD_MAT_COLOR materials
             uint32_t fallbackColor = colorFromName(name);
 
             // Build set of material indices that have actually-loaded textures,
             // so we only assign white to vertices that will be textured at draw time.
             std::unordered_set<int> loadedMatIndices;
             for (int mi = 0; mi < static_cast<int>(mesh.materials.size()); ++mi) {
-                if (mesh.materials[mi].type == Opde::MD_MAT_TMAP) {
+                if (mesh.materials[mi].type == Darkness::MD_MAT_TMAP) {
                     std::string lname(mesh.materials[mi].name);
                     std::transform(lname.begin(), lname.end(), lname.begin(),
                                    [](unsigned char c) { return std::tolower(c); });
@@ -2842,7 +2842,7 @@ int main(int argc, char *argv[]) {
                     // (texture will modulate the final colour at draw time)
                     vertColor = packABGR(brightness, brightness, brightness);
                 } else if (mi >= 0 && mi < static_cast<int>(mesh.materials.size()) &&
-                           mesh.materials[mi].type == Opde::MD_MAT_COLOR) {
+                           mesh.materials[mi].type == Darkness::MD_MAT_COLOR) {
                     // Solid-colour material: BGRA from material data * brightness
                     const uint8_t *c = mesh.materials[mi].colour;
                     vertColor = packABGR(c[2] / 255.0f * brightness,   // R (colour is BGRA)
@@ -2883,7 +2883,7 @@ int main(int argc, char *argv[]) {
                 gsm.textured = false;
                 if (sm.matIndex >= 0 && sm.matIndex < static_cast<int>(mesh.materials.size())) {
                     const auto &mat = mesh.materials[sm.matIndex];
-                    gsm.textured = (mat.type == Opde::MD_MAT_TMAP);
+                    gsm.textured = (mat.type == Darkness::MD_MAT_TMAP);
                     // Lowercase material name for texture lookup
                     gsm.matName = mat.name;
                     std::transform(gsm.matName.begin(), gsm.matName.end(),
@@ -3088,7 +3088,7 @@ int main(int argc, char *argv[]) {
             std::unordered_map<int16_t, float> currentIntensities;
 
             for (auto &[lightNum, light] : lightSources) {
-                bool changed = Opde::updateLightAnimation(light, dt);
+                bool changed = Darkness::updateLightAnimation(light, dt);
                 float intensity = (light.maxBright > 0.0f)
                     ? light.brightness / light.maxBright : 0.0f;
                 currentIntensities[lightNum] = intensity;
@@ -3106,7 +3106,7 @@ int main(int argc, char *argv[]) {
                     if (it == animLightIndex.end()) continue;
 
                     for (auto &[ci, pi] : it->second) {
-                        Opde::blendAnimatedLightmap(
+                        Darkness::blendAnimatedLightmap(
                             lmAtlasSet.atlases[0], wrData, ci, pi,
                             lmAtlasSet.entries[ci][pi],
                             currentIntensities, lmScale);

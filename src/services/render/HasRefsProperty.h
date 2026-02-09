@@ -27,7 +27,7 @@
 
 #include "RenderedProperty.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** a HasRefs implementation using rendered property handler.
  * Uses simple bool data storage. Defaults to true. Inherits always.
@@ -59,6 +59,6 @@ protected:
 
     Ogre::SceneManager *mSceneMgr;
 };
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

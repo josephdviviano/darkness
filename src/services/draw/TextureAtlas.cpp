@@ -37,7 +37,7 @@
 #include <OgreTechnique.h>
 #include <OgreTextureManager.h>
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- TextureAtlas ------------------*/
@@ -366,4 +366,4 @@ void TextureAtlas::dropResources() {
     }
 }
 
-}; // namespace Opde
+}; // namespace Darkness

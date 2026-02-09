@@ -24,7 +24,7 @@
 #include <functional>
 
 #include "PlayerService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "input/InputService.h"
 #include "link/LinkService.h"
 #include "logger.h"
@@ -35,7 +35,7 @@
 // TODO: The right value
 #define PLAYER_HEAD_SUBMODEL 0
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- PlayerService -----------------*/
@@ -221,4 +221,4 @@ Service *PlayerServiceFactory::createInstance(ServiceManager *manager) {
     return new PlayerService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

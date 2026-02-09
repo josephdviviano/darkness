@@ -30,7 +30,7 @@ This file contains various dynamic datatype helpers, such as those for byte
 swapping
 */
 
-namespace Opde {
+namespace Darkness {
 void swap_any(void *src, void *tgt, size_t size) {
     char *csrc = reinterpret_cast<char *>(src);
     char *cdest = reinterpret_cast<char *>(tgt);
@@ -43,7 +43,7 @@ void swap_any(void *src, void *tgt, size_t size) {
 }
 
 // Following are the actual data manipulation routines to be used:
-#ifdef __OPDE_BIG_ENDIAN
+#ifdef __DARKNESS_BIG_ENDIAN
 template <typename T> void writeLE(void *tgt, T src) {
     swap_any(&src, tgt, sizeof(T));
 }
@@ -66,6 +66,6 @@ template <typename T> T readLE(void *src) {
     return *(reinterpret_cast<T *>(src));
 }
 #endif
-} // namespace Opde
+} // namespace Darkness
 
 #endif // __DTHELPERS_H

@@ -22,14 +22,14 @@
  *
  *****************************************************************************/
 
-#ifndef __OPDENONCOPYABLE_H
-#define __OPDENONCOPYABLE_H
+#ifndef __DARKNESSNONCOPYABLE_H
+#define __DARKNESSNONCOPYABLE_H
 
 #include "config.h"
 
 #include <cassert>
 
-namespace Opde {
+namespace Darkness {
 
 /// Non copyable class. Inherit to make class not copyable
 class NonCopyable {
@@ -41,6 +41,6 @@ private:
     void operator=(const NonCopyable &b) = delete;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

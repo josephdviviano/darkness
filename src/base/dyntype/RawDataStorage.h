@@ -32,7 +32,7 @@
 #include <map>
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 
 /** @brief Raw byte-blob DataStorage implementation.
  *
@@ -150,6 +150,6 @@ private:
     typedef MapKeyIterator<DataMap, int> DataMapKeyIterator;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif // __RAWDATASTORAGE_H

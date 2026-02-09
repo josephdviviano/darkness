@@ -160,16 +160,16 @@ set(RENDER_SERVICES_SOURCES
     worldrep/WRTypes.h
 )
 
-add_library(OpdeServices OBJECT ${HEADLESS_SERVICES_SOURCES})
+add_library(DarknessServices OBJECT ${HEADLESS_SERVICES_SOURCES})
 
-target_link_libraries(OpdeServices PUBLIC OpdeBase)
+target_link_libraries(DarknessServices PUBLIC DarknessBase)
 
-target_include_directories(OpdeServices PUBLIC
+target_include_directories(DarknessServices PUBLIC
     ${ODE_INCLUDE_DIR}
-    ${OPDE_SOURCE_DIR}/src/services
+    ${DARKNESS_SOURCE_DIR}/src/services
 )
 
-target_compile_options(OpdeServices PRIVATE
+target_compile_options(DarknessServices PRIVATE
     $<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:
         -Wall -fno-strict-aliasing -fvisibility=default>
 )

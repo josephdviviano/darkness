@@ -23,7 +23,7 @@
 
 #include "GUIService.h"
 #include "DarkCommon.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "ServiceCommon.h"
 #include "StringTokenizer.h"
 #include "config/ConfigService.h"
@@ -35,7 +35,7 @@
 using namespace std;
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 
 /*-----------------------------------------------------*/
 /*-------------------- GUIService ---------------------*/
@@ -43,7 +43,7 @@ namespace Opde {
 template <> const size_t ServiceImpl<GUIService>::SID = __SERVICE_ID_GUI;
 
 GUIService::GUIService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::GUIService>(manager, name),
+    : ServiceImpl<Darkness::GUIService>(manager, name),
       mActive(false),
       mVisible(false),
       mActiveSheet(),
@@ -284,4 +284,4 @@ Service *GUIServiceFactory::createInstance(ServiceManager *manager) {
     return new GUIService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

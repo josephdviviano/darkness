@@ -28,7 +28,7 @@
 #include "property/PropertyService.h"
 #include "EntityInfo.h"
 
-namespace Opde {
+namespace Darkness {
 /*--------------------------------------------------------*/
 /*-------------------- ModelScaleProperty ----------------*/
 /*--------------------------------------------------------*/
@@ -52,7 +52,7 @@ void ModelScaleProperty::addProperty(int oid) {
     Variant val;
 
     if (!get(oid, "", val))
-        OPDE_EXCEPT("Property not defined for object.");
+        DARKNESS_EXCEPT("Property not defined for object.");
 
     setScale(oid, val.toVector());
 };
@@ -87,4 +87,4 @@ void ModelScaleProperty::setScale(int oid, const Vector3 &scale) {
 
     ei->setScale(scale);
 };
-}; // namespace Opde
+}; // namespace Darkness

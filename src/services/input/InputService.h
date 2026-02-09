@@ -32,15 +32,15 @@
 
 #include "Variant.h"
 #include "InputEventMapper.h"
-#include "OpdeService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessService.h"
+#include "DarknessServiceManager.h"
 #include "SharedPtr.h"
 #include "loop/LoopCommon.h"
 #include "InputCommon.h"
 
 #include <deque>
 
-namespace Opde {
+namespace Darkness {
 
 /** @brief Input service - service which handles user input, and user input
  * mapping
@@ -290,6 +290,6 @@ public:
 private:
     static std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -26,7 +26,7 @@
 
 #include "PhysModel.h"
 
-namespace Opde {
+namespace Darkness {
 /** @brief BSP based physics model - models that were handled via BSP in
  * original implementation.
  * @note There are two approaches to do collision detection with this - either
@@ -37,6 +37,6 @@ public:
     PhysBSPModel(int objid);
     ~PhysBSPModel();
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

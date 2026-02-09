@@ -35,21 +35,21 @@
 #include "ObjectServiceBinder.h"
 #include "PropertyServiceBinder.h"
 
-namespace Opde {
+namespace Darkness {
 namespace Python {
 
 // ---------------------- class Services --------------------
-const char *ServiceBinder::msName = "opde.services";
+const char *ServiceBinder::msName = "darkness.services";
 
 PyMethodDef ServiceBinder::msMethods[] = {
     {const_cast<char *>("getConfigService"), getConfigService, METH_NOARGS,
-     "getConfigService() -> opde.services.ConfigService\n\tReturns a reference "
+     "getConfigService() -> darkness.services.ConfigService\n\tReturns a reference "
      "object to the ConfigService instance"},
     {const_cast<char *>("getLinkService"), getLinkService, METH_NOARGS,
-     "getLinkService() -> opde.services.LinkService\n\tReturns a reference "
+     "getLinkService() -> darkness.services.LinkService\n\tReturns a reference "
      "object to the LinkService instance"},
     {const_cast<char *>("getPropertyService"), getPropertyService, METH_NOARGS,
-     "getPropertyService() -> opde.services.PropertyService\n\tReturns a "
+     "getPropertyService() -> darkness.services.PropertyService\n\tReturns a "
      "reference object to the PropertyService instance"},
     {const_cast<char *>("getLoopService"), getLoopService, METH_NOARGS},
     {const_cast<char *>("getInputService"), getInputService, METH_NOARGS},
@@ -62,20 +62,20 @@ PyMethodDef ServiceBinder::msMethods[] = {
 };
 
 #ifdef IS_PY3K
-static int opdeServices_traverse(PyObject *m, visitproc visit, void *arg) {
+static int darknessServices_traverse(PyObject *m, visitproc visit, void *arg) {
     Py_VISIT(GETSTATE(m)->error);
     return 0;
 }
 
-static int opdeServices_clear(PyObject *m) {
+static int darknessServices_clear(PyObject *m) {
     Py_CLEAR(GETSTATE(m)->error);
     return 0;
 }
 
-static struct PyModuleDef sOpdeServicesModuleDef = {
-    PyModuleDef_HEAD_INIT,       "opde.services",          NULL,
+static struct PyModuleDef sDarknessServicesModuleDef = {
+    PyModuleDef_HEAD_INIT,       "darkness.services",          NULL,
     sizeof(struct module_state), ServiceBinder::msMethods, NULL,
-    opdeServices_traverse,       opdeServices_clear,       NULL};
+    darknessServices_traverse,       darknessServices_clear,       NULL};
 #else
 static struct module_state _state;
 #endif
@@ -192,20 +192,20 @@ PyObject *ServiceBinder::getInheritService(PyObject *self, PyObject *args) {
 
 PyObject *ServiceBinder::init(PyObject *container) {
 #ifdef IS_PY3K
-    PyObject *module = PyModule_Create(&sOpdeServicesModuleDef);
+    PyObject *module = PyModule_Create(&sDarknessServicesModuleDef);
 #else
     PyObject *module = Py_InitModule(msName, msMethods);
 #endif
     // Error?
     if (!module)
-        OPDE_EXCEPT("Could not initialize the python Module!");
+        DARKNESS_EXCEPT("Could not initialize the python Module!");
 
     // Error handling
     struct module_state *st = GETSTATE(module);
-    st->error = PyErr_NewException("opde.Error", NULL, NULL);
+    st->error = PyErr_NewException("darkness.Error", NULL, NULL);
     if (st->error == NULL) {
         Py_DECREF(module);
-        OPDE_EXCEPT("Could not initialize the opde.Error!");
+        DARKNESS_EXCEPT("Could not initialize the darkness.Error!");
     }
 
     // Register itself as a member of the container we got
@@ -245,4 +245,4 @@ PyObject *ServiceBinder::init(PyObject *container) {
 }
 
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness

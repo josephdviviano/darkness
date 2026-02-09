@@ -30,7 +30,7 @@
 #include <vector>
 #include <zzip/zzip.h>
 
-namespace Opde {
+namespace Darkness {
 
 class CRFModelLoader {
 public:
@@ -91,4 +91,4 @@ private:
     ZZIP_DIR *mDir;
 };
 
-} // namespace Opde
+} // namespace Darkness

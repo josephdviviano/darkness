@@ -24,7 +24,7 @@
 
 #include <cmath>
 
-namespace Opde {
+namespace Darkness {
 
 struct Matrix3;
 
@@ -75,6 +75,6 @@ struct Quaternion {
     static const Quaternion IDENTITY;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

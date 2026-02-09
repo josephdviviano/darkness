@@ -23,12 +23,12 @@
 
 #include "DrawCommon.h"
 #include "DrawService.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include <OgreVector2.h>
 
 using Ogre::Vector2;
 
-namespace Opde {
+namespace Darkness {
 //------------------------------------------------------
 DrawSourceBase::DrawSourceBase(ID srcID, const Ogre::MaterialPtr &mat,
                                const Ogre::TexturePtr &tex)
@@ -144,7 +144,7 @@ void DrawSource::loadImage(const Ogre::String &name,
                            const Ogre::String &group) {
     // If the image is loaded already, we have an error
     if (mImageLoaded)
-        OPDE_EXCEPT("Image already loaded in this DrawSource");
+        DARKNESS_EXCEPT("Image already loaded in this DrawSource");
 
     mImage->load(name, group);
     updatePixelSizeFromImage();
@@ -156,4 +156,4 @@ void DrawSource::loadImage(const Ogre::String &name,
 bool operator<(const DrawSheetPtr &a, const DrawSheetPtr &b) {
     return a.get() < b.get();
 }
-}; // namespace Opde
+}; // namespace Darkness

@@ -27,7 +27,7 @@
 #include "DrawSourceBinder.h"
 #include "FontDrawSourceBinder.h"
 #include "ManualFonFileLoader.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "RenderedImageBinder.h"
 #include "RenderedLabelBinder.h"
 #include "TextureAtlasBinder.h"
@@ -36,7 +36,7 @@
 
 using Ogre::ManualFonFileLoader;
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -46,7 +46,7 @@ const char *DrawServiceBinder::msName = "DrawService";
 // ------------------------------------------
 PyTypeObject DrawServiceBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.DrawService", // char *tp_name; */
+                          0) "darkness.services.DrawService", // char *tp_name; */
     sizeof(DrawServiceBinder::Base), // int tp_basicsize; */
     0,                          // int tp_itemsize;       /* not used much */
     DrawServiceBinder::dealloc, // destructor tp_dealloc; */
@@ -391,7 +391,7 @@ PyObject *DrawServiceBinder::setFontPalette(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "iss", &ptype, &fname, &group))
         __PY_BADPARMS_RET;
 
-    Opde::PaletteType pt;
+    Darkness::PaletteType pt;
     // validate the ptype
     switch (ptype) {
     case (int)ePT_Default:
@@ -457,7 +457,7 @@ const char *DrawOperationBinder::msName = "DrawOperation";
 // ------------------------------------------
 PyTypeObject DrawOperationBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.DrawOperation", // char *tp_name; */
+                          0) "darkness.services.DrawOperation", // char *tp_name; */
     sizeof(DrawOperationBinder::Base), // int tp_basicsize; */
     0,                            // int tp_itemsize;       /* not used much */
     DrawOperationBinder::dealloc, // destructor tp_dealloc; */
@@ -766,4 +766,4 @@ void DrawOperationBinder::init(PyObject *module) {
 }
 
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness

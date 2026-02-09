@@ -23,24 +23,24 @@
  *****************************************************************************/
 
 #include "ConfigServiceBinder.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "bindings.h"
 #include "config/ConfigService.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
 // -------------------- Config Service --------------------
 const char *ConfigServiceBinder::msName = "ConfigService";
 
-const char *opde_ConfigService__doc__ =
+const char *darkness_ConfigService__doc__ =
     "ConfigService proxy. Service that manages engine configuration";
 
 // ------------------------------------------
 PyTypeObject ConfigServiceBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type, 0) const_cast<char *>(
-        "opde.services.ConfigService"),  // char *tp_name; */
+        "darkness.services.ConfigService"),  // char *tp_name; */
     sizeof(ConfigServiceBinder::Base), // int tp_basicsize; */
     0,                            // int tp_itemsize;       /* not used much */
     ConfigServiceBinder::dealloc, // destructor tp_dealloc; */
@@ -59,7 +59,7 @@ PyTypeObject ConfigServiceBinder::msType = {
     0,                            // setattrofunc tp_setattro; */
     0,                            // PyBufferProcs *tp_as_buffer; */
     0,                            // long tp_flags; */
-    const_cast<char *>(opde_ConfigService__doc__), // char *tp_doc;  */
+    const_cast<char *>(darkness_ConfigService__doc__), // char *tp_doc;  */
     0,         // traverseproc tp_traverse; */
     0,         // inquiry tp_clear; */
     0,         // richcmpfunc tp_richcompare; */
@@ -72,7 +72,7 @@ PyTypeObject ConfigServiceBinder::msType = {
 };
 
 // ------------------------------------------
-const char *opde_ConfigService_setParam__doc__ =
+const char *darkness_ConfigService_setParam__doc__ =
     "setParam(key, value)\n"
     "Sets a new configuration parameter value\n"
     "@type key: string\n"
@@ -80,7 +80,7 @@ const char *opde_ConfigService_setParam__doc__ =
     "@type value: object\n"
     "@param value: the new value for the configuration key\n";
 
-const char *opde_ConfigService_getParam__doc__ =
+const char *darkness_ConfigService_getParam__doc__ =
     "getParam(key)\n"
     "Gets the value associated with the given configuration key\n"
     "@type key: string\n"
@@ -88,7 +88,7 @@ const char *opde_ConfigService_getParam__doc__ =
     "@rtype: object\n"
     "@return: the value associated with the key\n";
 
-const char *opde_ConfigService_hasParam__doc__ =
+const char *darkness_ConfigService_hasParam__doc__ =
     "hasParam(key)\n"
     "Detects if the given configuration key is defined\n"
     "@type key: string\n"
@@ -96,13 +96,13 @@ const char *opde_ConfigService_hasParam__doc__ =
     "@rtype: boolean\n"
     "@return: true if key defined, false otherwise\n";
 
-const char *opde_ConfigService_loadParams__doc__ =
+const char *darkness_ConfigService_loadParams__doc__ =
     "loadParams(path)\n"
     "Detects if the given configuration key is defined\n"
     "@type path: string\n"
     "@param path: The configuration file name\n";
 
-const char *opde_ConfigService_setConfigPathOverride__doc__ =
+const char *darkness_ConfigService_setConfigPathOverride__doc__ =
     "setConfigPathOverride(path)\n"
     "Sets a path that overrides the normal process of config loading - that "
     "means the path given will be the only one config files are loaded from.\n"
@@ -112,15 +112,15 @@ const char *opde_ConfigService_setConfigPathOverride__doc__ =
 // ------------------------------------------
 PyMethodDef ConfigServiceBinder::msMethods[] = {
     {"setParam", setParam, METH_VARARGS,
-     const_cast<char *>(opde_ConfigService_setParam__doc__)},
+     const_cast<char *>(darkness_ConfigService_setParam__doc__)},
     {"getParam", getParam, METH_VARARGS,
-     const_cast<char *>(opde_ConfigService_getParam__doc__)},
+     const_cast<char *>(darkness_ConfigService_getParam__doc__)},
     {"hasParam", hasParam, METH_VARARGS,
-     const_cast<char *>(opde_ConfigService_hasParam__doc__)},
+     const_cast<char *>(darkness_ConfigService_hasParam__doc__)},
     {"loadParams", loadParams, METH_VARARGS,
-     const_cast<char *>(opde_ConfigService_loadParams__doc__)},
+     const_cast<char *>(darkness_ConfigService_loadParams__doc__)},
     {"setConfigPathOverride", setConfigPathOverride, METH_VARARGS,
-     const_cast<char *>(opde_ConfigService_setConfigPathOverride__doc__)},
+     const_cast<char *>(darkness_ConfigService_setConfigPathOverride__doc__)},
     {NULL, NULL},
 };
 
@@ -263,4 +263,4 @@ PyObject *ConfigServiceBinder::repr(PyObject *self) {
 }
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

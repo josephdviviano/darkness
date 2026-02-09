@@ -30,7 +30,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-namespace Opde {
+namespace Darkness {
 
 template <>
 void TypeSerializer<bool>::serialize(FilePtr &dest, const void *valuePtr) {
@@ -177,4 +177,4 @@ template <>
 size_t TypeSerializer<std::string>::getStoredSize(const void *valuePtr) {
     return static_cast<const std::string *>(valuePtr)->size();
 }
-} // namespace Opde
+} // namespace Darkness

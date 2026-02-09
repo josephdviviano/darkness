@@ -25,7 +25,7 @@
 #include "DrawSourceBinder.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -35,7 +35,7 @@ const char *DrawSourceBinder::msName = "DrawSource";
 // ------------------------------------------
 PyTypeObject DrawSourceBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.DrawSource", // char *tp_name; */
+                          0) "darkness.services.DrawSource", // char *tp_name; */
     sizeof(DrawSourceBinder::Base),                    // int tp_basicsize; */
     0,                         // int tp_itemsize;       /* not used much */
     DrawSourceBinder::dealloc, // destructor tp_dealloc; */
@@ -100,4 +100,4 @@ void DrawSourceBinder::init(PyObject *module) {
 }
 
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness

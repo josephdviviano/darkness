@@ -32,8 +32,8 @@
 #include <OgreTextureManager.h>
 
 #include "LightsForCell.h"
-#include "OpdeException.h"
-#include "OpdeServiceManager.h"
+#include "DarknessException.h"
+#include "DarknessServiceManager.h"
 #include "WRCommon.h"
 #include "WorldRepService.h"
 #include "light/LightService.h"
@@ -45,7 +45,7 @@
 #include "DarkPortal.h"
 #include "DarkSceneManager.h"
 
-namespace Opde {
+namespace Darkness {
 
 //------------------------------------------------------------------------------------
 WRCell::WRCell()
@@ -136,7 +136,7 @@ const Ogre::Plane &WRCell::getPlane(int index) {
     assert(mLoaded);
 
     if (index > mHeader.numPlanes)
-        OPDE_EXCEPT("Plane index is out of bounds");
+        DARKNESS_EXCEPT("Plane index is out of bounds");
 
     return mPlanes[index];
 }
@@ -474,7 +474,7 @@ void WRCell::createCellGeometry(const MaterialServicePtr &matSvc,
                 polyToDim.find(polyNum);
 
             if (dimi == polyToDim.end())
-                OPDE_EXCEPT("Missing polygon texture dimensions!");
+                DARKNESS_EXCEPT("Missing polygon texture dimensions!");
 
             dimensions = dimi->second;
 
@@ -656,4 +656,4 @@ Ogre::Vector3 WRCell::getCenter() {
     return center;
 }
 
-} // namespace Opde
+} // namespace Darkness

@@ -34,7 +34,7 @@
 #include <OgreResourceManager.h>
 #include <Overlay/OgreFont.h>
 
-using namespace Opde; // For the Opde::File
+using namespace Darkness; // For the Darkness::File
 
 namespace Ogre {
 

@@ -32,7 +32,7 @@
 #include <string>
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 
 #pragma pack(push, 1)
 
@@ -112,4 +112,4 @@ inline TXList parseTXList(const std::string &misPath) {
     return result;
 }
 
-} // namespace Opde
+} // namespace Darkness

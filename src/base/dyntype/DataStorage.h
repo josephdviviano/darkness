@@ -30,7 +30,7 @@
 #include "File.h"
 #include "Iterator.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** Type aware variant based enumeration definition. Used for enumeration and
    bitfields.
@@ -259,6 +259,6 @@ public:
 /// Shared pointer to data storage
 typedef shared_ptr<DataStorage> DataStoragePtr;
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif // __PROPERTYSTORAGE_H

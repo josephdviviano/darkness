@@ -29,8 +29,8 @@
 #include "Callback.h"
 #include "Ogre.h"
 #include "ServiceCommon.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "WRTypes.h"
 #include "integers.h"
 #include "database/DatabaseCommon.h"
@@ -48,7 +48,7 @@ class DarkSceneManager;
 class DarkGeometry;
 } // namespace Ogre
 
-namespace Opde {
+namespace Darkness {
 
 class WRCell;
 
@@ -148,6 +148,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

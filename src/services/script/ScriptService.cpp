@@ -23,7 +23,7 @@
  *****************************************************************************/
 
 #include "ScriptService.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "ServiceCommon.h"
 #include "bindings.h"
 #include "logger.h"
@@ -33,7 +33,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 /*------------------------------------------------------*/
 /*-------------------- ScriptService -------------------*/
@@ -41,7 +41,7 @@ namespace Opde {
 template <> const size_t ServiceImpl<ScriptService>::SID = __SERVICE_ID_SCRIPT;
 
 ScriptService::ScriptService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::ScriptService>(manager, name){
+    : ServiceImpl<Darkness::ScriptService>(manager, name){
 
       };
 
@@ -134,4 +134,4 @@ Service *ScriptServiceFactory::createInstance(ServiceManager *manager) {
 const uint ScriptServiceFactory::getMask() { return SERVICE_ENGINE; }
 
 const size_t ScriptServiceFactory::getSID() { return ScriptService::SID; }
-} // namespace Opde
+} // namespace Darkness

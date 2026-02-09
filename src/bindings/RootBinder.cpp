@@ -25,19 +25,19 @@
 #include "RootBinder.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
 // -------------------- Link Service --------------------
 const char *RootBinder::msName = "Root";
 
-const char *opde_Root__doc__ = "The root object of the openDarkEngine API. "
+const char *darkness_Root__doc__ = "The root object of the openDarkEngine API. "
                                "Exposes some common objects/methods.\n";
 
 // ------------------------------------------
 PyTypeObject RootBinder::msType = {
-    PyVarObject_HEAD_INIT(&PyType_Type, 0) "opde.Root", /* char *tp_name; */
+    PyVarObject_HEAD_INIT(&PyType_Type, 0) "darkness.Root", /* char *tp_name; */
     sizeof(RootBinder::Base),                         /* int tp_basicsize; */
     0,                       // int tp_itemsize;       /* not used much */
     RootBinder::dealloc,     /* destructor tp_dealloc; */
@@ -56,7 +56,7 @@ PyTypeObject RootBinder::msType = {
     0,                       // setattrofunc tp_setattro; */
     0,                       // PyBufferProcs *tp_as_buffer; */
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, // long tp_flags; */
-    opde_Root__doc__,                         // char *tp_doc;  */
+    darkness_Root__doc__,                         // char *tp_doc;  */
     0,                                        // traverseproc tp_traverse; */
     0,                                        // inquiry tp_clear; */
     0,                                        // richcmpfunc tp_richcompare; */
@@ -76,20 +76,20 @@ PyTypeObject RootBinder::msType = {
 };
 
 // ------ Doc Strings -----------------------
-const char *opde_Root_loadResourceConfig__doc__ =
+const char *darkness_Root_loadResourceConfig__doc__ =
     "loadResourceConfig(path)\n"
     "Loads a Ogre's resource config file (resources.cfg type) from the "
     "specified path\n"
     "@type path: string\n"
     "@param path: Path to the resource config file to be loaded\n";
 
-const char *opde_Root_loadConfigFile__doc__ =
+const char *darkness_Root_loadConfigFile__doc__ =
     "loadConfigFile(path)\n"
-    "Loads a Opde's config file (opde.cfg type) from the specified path\n"
+    "Loads a Darkness config file (darkness.cfg type) from the specified path\n"
     "@type path: string\n"
-    "@param path: Path to the Opde's config file to be loaded\n";
+    "@param path: Path to the Darkness config file to be loaded\n";
 
-const char *opde_Root_addResourceLocation__doc__ =
+const char *darkness_Root_addResourceLocation__doc__ =
     "addResourceLocation(name,type,section[,recursive])\n"
     "Adds a resource location to the specified section (group)\n"
     "@type name: string\n"
@@ -102,7 +102,7 @@ const char *opde_Root_addResourceLocation__doc__ =
     "@param recursive: Optional parameter specifying if subdirectories should "
     "be searched\n;";
 
-const char *opde_Root_removeResourceLocation__doc__ =
+const char *darkness_Root_removeResourceLocation__doc__ =
     "removeResourceLocation(name,section)\n"
     "Removes resource location from the specified section (group)\n"
     "@type name: string\n"
@@ -110,23 +110,23 @@ const char *opde_Root_removeResourceLocation__doc__ =
     "@type section: string\n"
     "@param section: The section (resource group) to remove from\n";
 
-const char *opde_Root_bootstrapFinished__doc__ =
+const char *darkness_Root_bootstrapFinished__doc__ =
     "bootstrapFinished()\n"
-    "Informs Opde that the resource setup has been done and opde can start.";
+    "Informs Darkness that the resource setup has been done and darkness can start.";
 
-const char *opde_Root_logToFile__doc__ =
+const char *darkness_Root_logToFile__doc__ =
     "logToFile(filename)\n"
     "Removes resource location from the specified section (group)\n"
     "@type filename: string\n"
     "@param filename: Resource location name\n";
 
-const char *opde_Root_setLogLevel__doc__ =
+const char *darkness_Root_setLogLevel__doc__ =
     "setLogLevel(level)\n"
     "Removes resource location from the specified section (group)\n"
     "@type level: integer\n"
     "@param level: The desired log level\n";
 
-const char *opde_Root_registerCustomScriptLoaders__doc__ =
+const char *darkness_Root_registerCustomScriptLoaders__doc__ =
     "registerCustomScriptLoaders()\n"
     "Registers .dtype and .pldef script loaders to ogre for automatic loading "
     "(this means from this point in time further all encountered scripts of "
@@ -135,19 +135,19 @@ const char *opde_Root_registerCustomScriptLoaders__doc__ =
 // ------------------------------------------
 PyMethodDef RootBinder::msMethods[] = {
     {"loadResourceConfig", RootBinder::loadResourceConfig, METH_VARARGS,
-     opde_Root_loadResourceConfig__doc__},
+     darkness_Root_loadResourceConfig__doc__},
     {"loadConfigFile", RootBinder::loadConfigFile, METH_VARARGS,
-     opde_Root_loadConfigFile__doc__},
+     darkness_Root_loadConfigFile__doc__},
     {"addResourceLocation", RootBinder::addResourceLocation, METH_VARARGS,
-     opde_Root_addResourceLocation__doc__},
+     darkness_Root_addResourceLocation__doc__},
     {"removeResourceLocation", RootBinder::removeResourceLocation, METH_VARARGS,
-     opde_Root_removeResourceLocation__doc__},
+     darkness_Root_removeResourceLocation__doc__},
     {"bootstrapFinished", RootBinder::bootstrapFinished, METH_NOARGS,
-     opde_Root_bootstrapFinished__doc__},
+     darkness_Root_bootstrapFinished__doc__},
     {"logToFile", RootBinder::logToFile, METH_VARARGS,
-     opde_Root_logToFile__doc__},
+     darkness_Root_logToFile__doc__},
     {"setLogLevel", RootBinder::setLogLevel, METH_VARARGS,
-     opde_Root_setLogLevel__doc__},
+     darkness_Root_setLogLevel__doc__},
     {NULL, NULL},
 };
 
@@ -318,9 +318,9 @@ PyObject *RootBinder::setLogLevel(PyObject *self, PyObject *args) {
 // ------------------------------------------
 PyObject *RootBinder::repr(PyObject *self) {
 #ifdef IS_PY3K
-    return PyBytes_FromFormat("<Opde::Root at %p>", self);
+    return PyBytes_FromFormat("<Darkness::Root at %p>", self);
 #else
-    return PyString_FromFormat("<Opde::Root at %p>", self);
+    return PyString_FromFormat("<Darkness::Root at %p>", self);
 #endif
 }
 
@@ -337,9 +337,9 @@ PyObject *RootBinder::create(Root *root) {
 
 // ------------------------------------------
 void RootBinder::init(PyObject *module) {
-    // Register root in the Opde module
+    // Register root in the Darkness module
     publishType(module, &msType, msName);
 }
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

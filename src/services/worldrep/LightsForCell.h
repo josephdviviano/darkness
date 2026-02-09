@@ -28,7 +28,7 @@
 #include "integers.h"
 #include "worldrep/WRTypes.h"
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*------------------ LightsForCell -------------------*/
@@ -99,6 +99,6 @@ protected:
     bool mAtlased;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif /* __LIGHTSFORCELL_H */

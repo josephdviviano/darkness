@@ -31,14 +31,14 @@
 #define __MATERIALSERVICE_H
 
 #include "DarkCommon.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "ServiceCommon.h"
 #include "database/DatabaseCommon.h"
 
 #include <OgreStringVector.h>
 
-namespace Opde {
+namespace Darkness {
 
 // --- Following are family and txlist chunk structures shamelessly ripped from
 // Telliamed's code. To be replaced by a competent reader/writer - we should
@@ -285,6 +285,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

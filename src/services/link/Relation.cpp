@@ -26,13 +26,13 @@
 
 #include "Relation.h"
 #include "LinkCommon.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "format.h"
 #include "inherit/InheritService.h"
 #include "integers.h"
 #include "logger.h"
 
-namespace Opde {
+namespace Darkness {
 // size of the link header (id, src, dest, flav)
 static size_t LinkStructSize = 14;
 
@@ -567,7 +567,7 @@ const Link *Relation::getOneLink(int src, int dst) const {
     // I also could just return the first even if there would be more than one,
     // but that could lead to programmers headaches
     if (!res->end())
-        OPDE_EXCEPT("More than one link fulfilled the requirement");
+        DARKNESS_EXCEPT("More than one link fulfilled the requirement");
 
     return &l;
 }
@@ -611,7 +611,7 @@ void Relation::_addLink(const Link &link) {
     } else {
         // Verify link data exist
         if (mStorage && !mStorage->has(link.id()))
-            OPDE_EXCEPT(format("Relation (", mName,
+            DARKNESS_EXCEPT(format("Relation (", mName,
                                "): Link Data not defined prior to link "
                                "insertion")); // for link id " + link->mID
 
@@ -742,4 +742,4 @@ void Relation::_objectDestroyed(int id) {
         }
     }
 }
-} // namespace Opde
+} // namespace Darkness

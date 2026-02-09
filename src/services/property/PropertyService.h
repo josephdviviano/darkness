@@ -30,13 +30,13 @@
 
 #include "FileGroup.h"
 #include "MessageSource.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "Property.h"
 #include "PropertyCommon.h"
 #include "SharedPtr.h"
 
-namespace Opde {
+namespace Darkness {
 /** @brief Property service - service managing in-game object properties
  */
 class PropertyService : public ServiceImpl<PropertyService> {
@@ -191,6 +191,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

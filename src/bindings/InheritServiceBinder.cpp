@@ -23,11 +23,11 @@
  *****************************************************************************/
 
 #include "InheritServiceBinder.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "InheritQueryResultBinder.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -37,7 +37,7 @@ const char *InheritServiceBinder::msName = "InheritService";
 // ------------------------------------------
 PyTypeObject InheritServiceBinder::msType = {
     PyVarObject_HEAD_INIT(
-        &PyType_Type, 0) "opde.services.InheritService", /* char *tp_name; */
+        &PyType_Type, 0) "darkness.services.InheritService", /* char *tp_name; */
     sizeof(InheritServiceBinder::Base),                /* int tp_basicsize; */
     0,                             /* int tp_itemsize;       // not used much */
     InheritServiceBinder::dealloc, /* destructor tp_dealloc; */
@@ -292,4 +292,4 @@ void InheritLinkBinder::init(PyObject *module) {
     publishType(module, &msType, msName);
 }
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness

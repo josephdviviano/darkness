@@ -29,7 +29,7 @@
 
 #include "input/InputService.h"
 
-namespace Opde {
+namespace Darkness {
 namespace Python {
 
 /// Input service python binder
@@ -60,6 +60,6 @@ protected:
     static PyMethodDef msMethods[];
 };
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness
 
 #endif // __INPUTSERVICEBINDER_H

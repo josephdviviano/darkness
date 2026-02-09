@@ -26,15 +26,15 @@
 
 #include "Array.h"
 #include "DrawOperation.h"
-#include "OpdeService.h"
+#include "DarknessService.h"
 #include "RGBAQuad.h"
 #include "ServiceCommon.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessServiceFactory.h"
 
 #include <OgreRenderQueueListener.h>
 #include <stack>
 
-namespace Opde {
+namespace Darkness {
 
 // Forward decl.
 class TextureAtlas;
@@ -312,6 +312,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

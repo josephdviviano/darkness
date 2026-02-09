@@ -27,7 +27,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*--------------------- ApplePlatform ----------------*/
@@ -39,17 +39,17 @@ ApplePlatform::~ApplePlatform() {}
 
 //------------------------------------------------------
 std::string ApplePlatform::getGlobalConfigPath() const {
-    return "/usr/local/share/opde";
+    return "/usr/local/share/darkness";
 }
 
 //------------------------------------------------------
 std::string ApplePlatform::getUserConfigPath() const {
     const char *home = std::getenv("HOME");
     if (home)
-        return std::string(home) + "/Library/Application Support/opde";
-    return "/tmp/opde";
+        return std::string(home) + "/Library/Application Support/darkness";
+    return "/tmp/darkness";
 }
 
 //------------------------------------------------------
 std::string ApplePlatform::getDirectorySeparator() const { return "/"; }
-} // namespace Opde
+} // namespace Darkness

@@ -26,7 +26,7 @@
 #include "config.h"
 
 #include "GameStateManager.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "filelog.h"
 #include "logger.h"
 #include "stdlog.h"
@@ -59,7 +59,7 @@
 
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 
 // The instance owner
 template <> GameStateManager *Singleton<GameStateManager>::ms_Singleton = 0;
@@ -69,7 +69,7 @@ GameStateManager::GameStateManager(const std::string &GameType)
       mConfigService(NULL), mInputService(NULL), mServiceMgr(NULL) {
     mGameType = GameType;
 
-    mRoot = new Opde::Root(SERVICE_ALL & ~SERVICE_GUI, "opde.log");
+    mRoot = new Darkness::Root(SERVICE_ALL & ~SERVICE_GUI, "darkness.log");
 }
 
 GameStateManager::~GameStateManager() {
@@ -126,12 +126,12 @@ void GameStateManager::popState() {
             // the last?
         }
     } else {
-        OPDE_EXCEPT("State stack was empty, nothing could be done.");
+        DARKNESS_EXCEPT("State stack was empty, nothing could be done.");
     }
 }
 
 bool GameStateManager::run() {
-    // Initialize opde logger and console backend
+    // Initialize darkness logger and console backend
     // Create an ogre's root
     mOgreRoot = Ogre::Root::getSingletonPtr();
 
@@ -145,7 +145,7 @@ bool GameStateManager::run() {
     // TODO: Temporary till we come up with a commandline parsing ability
     mConfigService->setConfigPathOverride(".");
 
-    mConfigService->loadParams("opde.cfg");
+    mConfigService->loadParams("darkness.cfg");
 
     // override the config setting
     mConfigService->setParam("game_type", mGameType);
@@ -243,7 +243,7 @@ bool GameStateManager::run() {
 
     Timer *timer = mOgreRoot->getTimer();
 
-    std::unique_ptr<Opde::Tracer> tracer(new Opde::Tracer(timer));
+    std::unique_ptr<Darkness::Tracer> tracer(new Darkness::Tracer(timer));
 
 #warning TODO: Replace this code with propper loop manager code.
 
@@ -381,4 +381,4 @@ bool GameStateManager::mouseReleased(const SDL_MouseButtonEvent &e) {
     }
     return false;
 }
-} // namespace Opde
+} // namespace Darkness

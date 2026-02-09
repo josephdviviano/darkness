@@ -27,7 +27,7 @@
 
 #include "config.h"
 
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "Quaternion.h"
 #include "Vector3.h"
 #include "integers.h"
@@ -35,7 +35,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace Opde {
+namespace Darkness {
 /** a variant class. This is a class that stores a value of a certain type. */
 class Variant {
 public:
@@ -212,7 +212,7 @@ public:
     /// convertion operation with target type specified as template parameter
     /// (e.g.: dv.as<int>());
     template <typename T> T as() const {
-        OPDE_EXCEPT("Invalid Variant as<>() cast");
+        DARKNESS_EXCEPT("Invalid Variant as<>() cast");
     }
 
     /** Templated shared type for Variant. Holds values for the shared types
@@ -349,6 +349,6 @@ struct VariantTypeTraits<Quaternion> {
 
 /// Map of string -> Variant values
 typedef std::map<std::string, Variant> VariantStringMap;
-} // namespace Opde
+} // namespace Darkness
 
 #endif

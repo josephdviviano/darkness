@@ -52,7 +52,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 namespace {
 
@@ -154,7 +154,7 @@ void CalSkeletonLoader::load() {
     readHeader();
 
     if (mHeader.version != 1)
-        OPDE_EXCEPT(format("Cal file has version other than 1 : ", mFileName));
+        DARKNESS_EXCEPT(format("Cal file has version other than 1 : ", mFileName));
 
     // read the torsos
     readTorsos();
@@ -172,7 +172,7 @@ void CalSkeletonLoader::load() {
     // Torsos first
     // the root torso we expect as first
     if (mTorsos[0].parent != -1)
-        OPDE_EXCEPT(
+        DARKNESS_EXCEPT(
             format("Cal file expected to have torsos in order of creation : ",
                    mFileName));
 
@@ -217,11 +217,11 @@ void CalSkeletonLoader::readHeader(void) {
 void CalSkeletonLoader::readTorsos(void) {
     // sanity checks
     if (mHeader.num_torsos < 1)
-        OPDE_EXCEPT(format("Cal file has zero torsos : ", mFileName));
+        DARKNESS_EXCEPT(format("Cal file has zero torsos : ", mFileName));
 
     // hard to imagine a body with 512 torsos... a cartepillar? :)
     if (mHeader.num_torsos > 512)
-        OPDE_EXCEPT(format("Cal file has more than 512 torsos : ", mFileName));
+        DARKNESS_EXCEPT(format("Cal file has more than 512 torsos : ", mFileName));
 
     mTorsos.resize(mHeader.num_torsos);
     *mFile >> mTorsos;
@@ -229,7 +229,7 @@ void CalSkeletonLoader::readTorsos(void) {
 
 void CalSkeletonLoader::readLimbs(void) {
     if (mHeader.num_limbs > 512)
-        OPDE_EXCEPT(format("Cal file has more than 512 limbs : ", mFileName));
+        DARKNESS_EXCEPT(format("Cal file has more than 512 limbs : ", mFileName));
 
     mLimbs.resize(mHeader.num_limbs);
     *mFile >> mLimbs;
@@ -382,14 +382,14 @@ uint16_t SubMeshFiller::getIndex(int bone, uint16_t vert, uint16_t norm,
     // As I'm a bit lazy, I do this by iterating the whole vector
     // Check the limits!
     if (vert >= mVertices.size())
-        OPDE_EXCEPT("Vertex Index out of range!");
+        DARKNESS_EXCEPT("Vertex Index out of range!");
 
     // TODO: What takes precedence? Light's or normal's index?
     if (norm >= mNormals.size())
-            OPDE_EXCEPT("Normal Index out of range!");
+            DARKNESS_EXCEPT("Normal Index out of range!");
 
     if (uv >= mUVs.size() && mUseUV)
-        OPDE_EXCEPT("UV Index out of range!");
+        DARKNESS_EXCEPT("UV Index out of range!");
 
     VertexDefinition vdef;
     vdef.vertex = vert;
@@ -421,7 +421,7 @@ void SubMeshFiller::build() {
             .getAsRGBA();
 
     if (!mSkeleton)
-        OPDE_EXCEPT("No skeleton given prior to build!");
+        DARKNESS_EXCEPT("No skeleton given prior to build!");
 
     mSubMesh->operationType = Ogre::RenderOperation::OT_TRIANGLE_LIST;
 
@@ -478,7 +478,7 @@ void SubMeshFiller::build() {
         Ogre::Bone *b = mSkeleton->getBone(it->bone);
 
         if (b == NULL)
-            OPDE_EXCEPT(format("Invalid bone index encountered : ", it->bone));
+            DARKNESS_EXCEPT(format("Invalid bone index encountered : ", it->bone));
 
         Ogre::Matrix4 tf = b->_getFullTransform();
 
@@ -605,14 +605,14 @@ void SubMeshFiller::build() {
 /// loading
 class DarkBINFileLoader {
 public:
-    DarkBINFileLoader(Ogre::Mesh *mesh, const Opde::FilePtr &file,
+    DarkBINFileLoader(Ogre::Mesh *mesh, const Darkness::FilePtr &file,
                       unsigned int version)
         : mVersion(version), mMesh(mesh), mFile(file){};
 
 protected:
     unsigned int mVersion;
     Ogre::Mesh *mMesh;
-    Opde::FilePtr mFile;
+    Darkness::FilePtr mFile;
 
     typedef std::map<int, Ogre::MaterialPtr> OgreMaterials;
     typedef std::map<int, std::unique_ptr<SubMeshFiller>> FillerMap;
@@ -623,7 +623,7 @@ protected:
  * version of the Mesh. */
 class ObjectMeshLoader : public DarkBINFileLoader {
 public:
-    ObjectMeshLoader(Ogre::Mesh *mesh, const Opde::FilePtr &file,
+    ObjectMeshLoader(Ogre::Mesh *mesh, const Darkness::FilePtr &file,
                      unsigned int version)
         : DarkBINFileLoader(mesh, file, version), mMaterials(),
           mMaterialsExtra(), mVHots(), mVertices(), mNormals(),
@@ -631,7 +631,7 @@ public:
           mNumNorms(0), mNumLights(0), mMaxSlot(0) {
 
         if ((mVersion != 3) && (mVersion != 4))
-            OPDE_EXCEPT(format("Unsupported object mesh version : ", mVersion));
+            DARKNESS_EXCEPT(format("Unsupported object mesh version : ", mVersion));
     };
 
     ~ObjectMeshLoader() {
@@ -708,7 +708,7 @@ private:
 
 class AIMeshLoader : public DarkBINFileLoader {
 public:
-    AIMeshLoader(Ogre::Mesh *mesh, const Opde::FilePtr &file,
+    AIMeshLoader(Ogre::Mesh *mesh, const Darkness::FilePtr &file,
                  unsigned int version);
     ~AIMeshLoader();
 
@@ -968,7 +968,7 @@ void ObjectMeshLoader::loadSubNode(int obj, size_t offset) {
 
         loadPolygons(obj, nr.pgon_count);
     } else {
-        OPDE_EXCEPT(format("Unknown node type ", type,
+        DARKNESS_EXCEPT(format("Unknown node type ", type,
                            " at offset ", offset));
     };
 }
@@ -1044,7 +1044,7 @@ void ObjectMeshLoader::readMaterials() {
         } else if (mat.type == MD_MAT_TMAP) {
             *mFile >> mat.handle >> mat.uvscale;
         } else
-            OPDE_EXCEPT(format("Unknown Material type : ", mat.type));
+            DARKNESS_EXCEPT(format("Unknown Material type : ", mat.type));
     }
 
     // construct anyway
@@ -1124,7 +1124,7 @@ void ObjectMeshLoader::readVertices() {
         mFile->seek(mHdr.offset_verts);
         *mFile >> mVertices;
     } else
-        OPDE_EXCEPT("Number of vertices is zero!");
+        DARKNESS_EXCEPT("Number of vertices is zero!");
 }
 
 //-------------------------------------------------------------------
@@ -1134,13 +1134,13 @@ void ObjectMeshLoader::readNormals() {
         mFile->seek(mHdr.offset_norms);
         *mFile >> mExtraNormals;
     } else
-        OPDE_EXCEPT("Number of normals is zero!");
+        DARKNESS_EXCEPT("Number of normals is zero!");
 }
 
 //-------------------------------------------------------------------
 void ObjectMeshLoader::readLights() {
     if (mNumLights == 0)
-        OPDE_EXCEPT("Number of normals is zero!");
+        DARKNESS_EXCEPT("Number of normals is zero!");
 
     mLights.resize(mNumLights);
     mFile->seek(mHdr.offset_light);
@@ -1219,9 +1219,9 @@ SubMeshFiller *ObjectMeshLoader::getFillerForPolygon(ObjPolygon &ply) {
             fillerIdx = matidx;
             matName = mMesh->getName() + "/" + mMaterials[matidx].name;
         } else
-            OPDE_EXCEPT("Unrecognized color_mode for polygon");
+            DARKNESS_EXCEPT("Unrecognized color_mode for polygon");
     } else
-        OPDE_EXCEPT(format("Unknown or invalid polygon type: ", ply.type, " (",
+        DARKNESS_EXCEPT(format("Unknown or invalid polygon type: ", ply.type, " (",
                            type, " - ", color_mode, ")"));
 
     // Not found yet. Create one now
@@ -1264,7 +1264,7 @@ int ObjectMeshLoader::getMaterialIndex(int slotidx) {
     if (it != mSlotToMatNum.end()) {
         return it->second;
     } else
-        OPDE_EXCEPT(format("Unknown material slot index : ", slotidx));
+        DARKNESS_EXCEPT(format("Unknown material slot index : ", slotidx));
 }
 
 //-------------------------------------------------------------------
@@ -1320,7 +1320,7 @@ Ogre::MaterialPtr ObjectMeshLoader::prepareMaterial(const std::string &matname,
             if (!Ogre::ResourceGroupManager::getSingleton().resourceExists(
                     Ogre::ResourceGroupManager::DEFAULT_RESOURCE_GROUP_NAME,
                     txtname)) {
-                OPDE_EXCEPT(format(
+                DARKNESS_EXCEPT(format(
                     "Can't find texture in txt16 or txt folder: ", mat.name));
             }
         }
@@ -1357,7 +1357,7 @@ Ogre::MaterialPtr ObjectMeshLoader::prepareMaterial(const std::string &matname,
             tus->setAlphaOperation(Ogre::LBX_SOURCE1, Ogre::LBS_DIFFUSE);
         }
     } else {
-        OPDE_EXCEPT(format("Invalid material type : ", mat.type));
+        DARKNESS_EXCEPT(format("Invalid material type : ", mat.type));
     }
 
     // Illumination of the material. Converted to ambient lightning here
@@ -1411,7 +1411,7 @@ ObjectMeshLoader::createPalMaterial(const std::string &matname, int palindex)
 /*-----------------------------------------------------------------*/
 /*--------------------- AIMeshLoader        -----------------------*/
 /*-----------------------------------------------------------------*/
-AIMeshLoader::AIMeshLoader(Ogre::Mesh *mesh, const Opde::FilePtr &file,
+AIMeshLoader::AIMeshLoader(Ogre::Mesh *mesh, const Darkness::FilePtr &file,
                            unsigned int version)
     : DarkBINFileLoader(mesh, file, version),
       mJointsIn(),
@@ -1427,7 +1427,7 @@ AIMeshLoader::AIMeshLoader(Ogre::Mesh *mesh, const Opde::FilePtr &file,
       mVertexJointMap()
 {
     if (mVersion > 2 || mVersion < 1)
-        OPDE_EXCEPT(format("File has version outside (0,1) range, and thus "
+        DARKNESS_EXCEPT(format("File has version outside (0,1) range, and thus "
                            "cannot be handled ", mMesh->getName()));
 };
 
@@ -1545,7 +1545,7 @@ void AIMeshLoader::load() {
                 getFillerForSlot(tri.mat); // maybe slots are not used after all
 
             if (!f)
-                OPDE_EXCEPT("Filler not found for slot!");
+                DARKNESS_EXCEPT("Filler not found for slot!");
 
             f->addTriangle(tri.vert[0], mVertexJointMap[tri.vert[0]],
                            tri.vert[1], mVertexJointMap[tri.vert[1]],
@@ -1574,7 +1574,7 @@ void AIMeshLoader::readHeader() {
 void AIMeshLoader::readMaterials() {
     // repeat for all materials
     if (mHeader.num_mats < 1) // TODO: This could be fatal
-        OPDE_EXCEPT(format("File contains no materials ", mMesh->getName()));
+        DARKNESS_EXCEPT(format("File contains no materials ", mMesh->getName()));
 
     mFile->seek(mHeader.offset_mats, File::FSEEK_BEG);
     mMaterials.resize(mHeader.num_mats);
@@ -1595,7 +1595,7 @@ void AIMeshLoader::readMaterials() {
 
 void AIMeshLoader::readMappers() {
     if (mHeader.num_mappers < 1)
-        OPDE_EXCEPT(format("File contains no mappers " + mMesh->getName()));
+        DARKNESS_EXCEPT(format("File contains no mappers " + mMesh->getName()));
 
     mFile->seek(mHeader.offset_mappers, File::FSEEK_BEG);
     mMappers.resize(mHeader.num_mappers);
@@ -1604,7 +1604,7 @@ void AIMeshLoader::readMappers() {
 
 void AIMeshLoader::readJoints() {
     if (mHeader.num_joints < 1)
-        OPDE_EXCEPT(format("File contains no joints ", mMesh->getName()));
+        DARKNESS_EXCEPT(format("File contains no joints ", mMesh->getName()));
 
     mFile->seek(mHeader.offset_joints, File::FSEEK_BEG);
     mJoints.resize(mHeader.num_joints);
@@ -1615,7 +1615,7 @@ void AIMeshLoader::readTriangles() {
     mFile->seek(mHeader.offset_poly, File::FSEEK_BEG);
 
     if (mHeader.num_polys < 1)
-        OPDE_EXCEPT(format("File contains no polygons ", mMesh->getName()));
+        DARKNESS_EXCEPT(format("File contains no polygons ", mMesh->getName()));
 
     mTriangles.resize(mHeader.num_polys);
     *mFile >> mTriangles;
@@ -1625,7 +1625,7 @@ void AIMeshLoader::readVertices() {
     mFile->seek(mHeader.offset_vert, File::FSEEK_BEG);
 
     if (mHeader.num_vertices < 1)
-        OPDE_EXCEPT(format("File contains no vertices ", mMesh->getName()));
+        DARKNESS_EXCEPT(format("File contains no vertices ", mMesh->getName()));
 
     mVertices.resize(mHeader.num_vertices);
     *mFile >> mVertices;
@@ -1635,7 +1635,7 @@ void AIMeshLoader::readNormals() {
     mFile->seek(mHeader.offset_norm, File::FSEEK_BEG);
 
     if (mHeader.num_vertices < 1) // TODO: This could be fatal
-        OPDE_EXCEPT(format("File contains no normals ", mMesh->getName()));
+        DARKNESS_EXCEPT(format("File contains no normals ", mMesh->getName()));
 
     size_t num_normals = (mHeader.offset_vert - mHeader.offset_norm) / 12;
 
@@ -1647,7 +1647,7 @@ void AIMeshLoader::readUVs() {
     mFile->seek(mHeader.offset_uvmap, File::FSEEK_BEG);
 
     if (mHeader.num_vertices < 1) // TODO: This could be fatal
-        OPDE_EXCEPT(format("File contains no uv's ", mMesh->getName()));
+        DARKNESS_EXCEPT(format("File contains no uv's ", mMesh->getName()));
 
     // this packs both UV and a packed normal that we preffer
 
@@ -1767,7 +1767,7 @@ Ogre::MaterialPtr AIMeshLoader::prepareMaterial(const std::string &matname,
         }
 
     } else
-        OPDE_EXCEPT(format("Invalid material type : ", mat.type));
+        DARKNESS_EXCEPT(format("Invalid material type : ", mat.type));
 
     omat->setShadingMode(Ogre::SO_GOURAUD);
     omat->load();
@@ -1799,7 +1799,7 @@ SubMeshFiller *AIMeshLoader::getFillerForSlot(int slot) {
 
             return f;
         } else {
-            OPDE_EXCEPT(format("Slot is not occupied by material ", slot,
+            DARKNESS_EXCEPT(format("Slot is not occupied by material ", slot,
                                " file ", mMesh->getName()));
         }
     }
@@ -1863,7 +1863,7 @@ void ManualBinFileLoader::loadResource(Ogre::Resource *resource) {
 
         try {
             ldr.load();
-        } catch (const Opde::BasicException &e) {
+        } catch (const Darkness::BasicException &e) {
             LOG_ERROR("An exception happened while loading the mesh %s : %s ",
                       basename.c_str(), e.getDetails().c_str());
         }
@@ -1872,12 +1872,12 @@ void ManualBinFileLoader::loadResource(Ogre::Resource *resource) {
         ObjectMeshLoader ldr(m, f, version);
         try {
             ldr.load(); // that's all. Will do what's needed
-        } catch (const Opde::BasicException &e) {
+        } catch (const Darkness::BasicException &e) {
             LOG_ERROR("An exception happened while loading the mesh %s : %s ",
                       basename.c_str(), e.getDetails().c_str());
         }
     } else
-        OPDE_EXCEPT(format("Unknown BIN model format : '", header, "'"));
+        DARKNESS_EXCEPT(format("Unknown BIN model format : '", header, "'"));
 }
 
-} // namespace Opde
+} // namespace Darkness

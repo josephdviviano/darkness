@@ -31,7 +31,7 @@
 
 #include <fstream>
 
-namespace Opde {
+namespace Darkness {
 
 /** Log listener, writing the logging messsages to a file */
 class FileLog : public LogListener {
@@ -43,6 +43,6 @@ public:
     virtual ~FileLog();
     virtual void logMessage(Logger::LogLevel level, const std::string &msg);
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

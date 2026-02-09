@@ -29,8 +29,8 @@
 
 #include "EntityMaterialInstance.h"
 #include "MessageSource.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "ServiceCommon.h"
 #include "SharedPtr.h"
 #include "RenderCommon.h"
@@ -43,7 +43,7 @@ class DarkSceneManager;
 class DarkSceneManagerFactory;
 } // namespace Ogre
 
-namespace Opde {
+namespace Darkness {
 
 // forward decls.
 class HasRefsProperty;
@@ -230,7 +230,7 @@ protected:
     Ogre::Camera *mDefaultCamera;
 
     /// Manual loader for bin meshes
-    std::unique_ptr<Opde::ManualBinFileLoader> mManualBinFileLoader;
+    std::unique_ptr<Darkness::ManualBinFileLoader> mManualBinFileLoader;
 
     /// Pointer for loop service
     LoopServicePtr mLoopService;
@@ -295,6 +295,6 @@ public:
 private:
     static std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -26,7 +26,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 /*------------------------------------------------------*/
 /*------------------------- File -----------------------*/
@@ -65,7 +65,7 @@ void File::writeToFile(File &dest) {
 File &File::readElem(void *buf, file_size_t size, uint count) {
     read(buf, size * count);
 
-#ifdef __OPDE_BIG_ENDIAN
+#ifdef __DARKNESS_BIG_ENDIAN
     swapEndian(buf, size, count);
 #endif
     return *this;
@@ -73,7 +73,7 @@ File &File::readElem(void *buf, file_size_t size, uint count) {
 
 //------------------------------------
 File &File::writeElem(const void *buf, file_size_t size, uint count) {
-#ifdef __OPDE_BIG_ENDIAN
+#ifdef __DARKNESS_BIG_ENDIAN
     file_size_t bsize = size * count;
     std::unique_ptr<char[]> copyb(new char[bsize]);
 
@@ -255,12 +255,12 @@ StdFile::StdFile(const std::string &name, AccessMode mode)
         break;
 
     default:
-        OPDE_FILEEXCEPT(FILE_OTHER_ERROR, "Unknown open mode",
+        DARKNESS_FILEEXCEPT(FILE_OTHER_ERROR, "Unknown open mode",
                         "StdFile::StdFile()");
     }
 
     if (!mStream.is_open()) // open failed
-        OPDE_FILEEXCEPT(FILE_OPEN_ERROR,
+        DARKNESS_FILEEXCEPT(FILE_OPEN_ERROR,
                         string("File open failed for '") + mFileName + "'",
                         "StdFile::StdFile()");
 }
@@ -270,7 +270,7 @@ StdFile::~StdFile() { mStream.close(); }
 
 //------------------------------------
 const file_size_t StdFile::size() {
-    OPDE_FILEEXCEPT(FILE_UNIMPL, "size method not implemented for StdFile",
+    DARKNESS_FILEEXCEPT(FILE_UNIMPL, "size method not implemented for StdFile",
                     "StdFile.size()");
 }
 
@@ -290,7 +290,7 @@ void StdFile::seek(file_offset_t pos, SeekMode mode) {
         break;
 
     default: // should not happen
-        OPDE_FILEEXCEPT(FILE_OTHER_ERROR, "Unknown seek position modifier",
+        DARKNESS_FILEEXCEPT(FILE_OTHER_ERROR, "Unknown seek position modifier",
                         "StdFile.seek()");
     }
 
@@ -298,7 +298,7 @@ void StdFile::seek(file_offset_t pos, SeekMode mode) {
 
     // detect the seek status
     if (mStream.fail())
-        OPDE_FILEEXCEPT(FILE_OP_FAILED, "Seek failed", "StdFile.seek()");
+        DARKNESS_FILEEXCEPT(FILE_OP_FAILED, "Seek failed", "StdFile.seek()");
 }
 
 //------------------------------------
@@ -307,7 +307,7 @@ void StdFile::seek(file_pos_t pos) {
 
     // detect the seek status
     if (mStream.fail())
-        OPDE_FILEEXCEPT(FILE_OP_FAILED, "Seek failed", "StdFile.seek()");
+        DARKNESS_FILEEXCEPT(FILE_OP_FAILED, "Seek failed", "StdFile.seek()");
 }
 
 //------------------------------------
@@ -316,14 +316,14 @@ const file_pos_t StdFile::tell() { return mStream.tellg(); }
 //------------------------------------
 File &StdFile::read(void *buf, file_size_t size) {
     if (!isReadable())
-        OPDE_FILEEXCEPT(FILE_OP_FAILED, "Read on write-only file",
+        DARKNESS_FILEEXCEPT(FILE_OP_FAILED, "Read on write-only file",
                         "StdFile.read()");
 
     mStream.read(static_cast<char *>(buf), size);
 
     if (mStream.fail()) {
         mStream.clear(); // Clear the status flags
-        OPDE_FILEEXCEPT(FILE_READ_ERROR, "Read operation failed",
+        DARKNESS_FILEEXCEPT(FILE_READ_ERROR, "Read operation failed",
                         "StdFile.read()");
     }
 
@@ -333,14 +333,14 @@ File &StdFile::read(void *buf, file_size_t size) {
 //------------------------------------
 File &StdFile::write(const void *buf, file_size_t size) {
     if (!isWriteable())
-        OPDE_FILEEXCEPT(FILE_OP_FAILED, "Write on read-only file",
+        DARKNESS_FILEEXCEPT(FILE_OP_FAILED, "Write on read-only file",
                         "StdFile.write()");
 
     mStream.write(static_cast<const char *>(buf), size);
 
     if (mStream.fail()) {
         mStream.clear(); // Clear the status flags
-        OPDE_FILEEXCEPT(FILE_READ_ERROR, "Write operation failed",
+        DARKNESS_FILEEXCEPT(FILE_READ_ERROR, "Write operation failed",
                         "StdFile.write()");
     }
 
@@ -394,12 +394,12 @@ void MemoryFile::seek(file_offset_t pos, SeekMode mode) {
         break;
 
     default: // should not happen
-        OPDE_FILEEXCEPT(FILE_OTHER_ERROR, "Unknown seek position modifier",
+        DARKNESS_FILEEXCEPT(FILE_OTHER_ERROR, "Unknown seek position modifier",
                         "MemoryFile.seek()");
     }
 
     if ((npos < 0) || (static_cast<file_size_t>(npos) > mSize))
-        OPDE_FILEEXCEPT(FILE_OP_FAILED,
+        DARKNESS_FILEEXCEPT(FILE_OP_FAILED,
                         "Resulting position not within the file size",
                         "MemoryFile::seek()");
 
@@ -417,7 +417,7 @@ const file_pos_t MemoryFile::tell() { return mFilePos; }
 //------------------------------------
 File &MemoryFile::read(void *buf, file_size_t size) {
     if (!isReadable())
-        OPDE_FILEEXCEPT(FILE_OP_FAILED, "Read on write-only file",
+        DARKNESS_FILEEXCEPT(FILE_OP_FAILED, "Read on write-only file",
                         "MemoryFile.read()");
 
     return _read(buf, size);
@@ -451,7 +451,7 @@ File &MemoryFile::_read(void *buf, file_size_t size) {
                 mEof = true;
                 mFilePos = mSize;
 
-                OPDE_FILEEXCEPT(FILE_READ_ERROR, "Read past end of file",
+                DARKNESS_FILEEXCEPT(FILE_READ_ERROR, "Read past end of file",
                                 "MemoryFile.read()");
             }
         } else {
@@ -482,7 +482,7 @@ File &MemoryFile::_read(void *buf, file_size_t size) {
 //------------------------------------
 File &MemoryFile::write(const void *buf, file_size_t size) {
     if (!isWriteable())
-        OPDE_FILEEXCEPT(FILE_OP_FAILED, "Write on read-only file",
+        DARKNESS_FILEEXCEPT(FILE_OP_FAILED, "Write on read-only file",
                         "MemoryFile.write()");
 
     return _write(buf, size);
@@ -505,7 +505,7 @@ File &MemoryFile::_write(const void *buf, file_size_t size) {
             std::unique_ptr<char[]> nbuf(new char[MEMORY_FILE_BUF_LEN]);
 
             if (!nbuf) // this is quite fatal. something like out of disk space
-                OPDE_FILEEXCEPT(FILE_WRITE_ERROR,
+                DARKNESS_FILEEXCEPT(FILE_WRITE_ERROR,
                                 "Out of memory when allocating a new page",
                                 "MemoryFile.write()");
 
@@ -548,7 +548,7 @@ bool MemoryFile::eof() const { return mEof; }
 //------------------------------------
 void MemoryFile::initFromFile(File &src, file_size_t size) {
     if (mSize != 0)
-        OPDE_FILEEXCEPT(FILE_WRITE_ERROR, "Can't do init on already used file",
+        DARKNESS_FILEEXCEPT(FILE_WRITE_ERROR, "Can't do init on already used file",
                         "MemoryFile.initFromFile()");
 
     while (size > 0) {
@@ -578,7 +578,7 @@ FilePart::FilePart(const std::string &name, AccessMode accm, FilePtr &src,
 
     // only allow write if the underlying supports
     if ((accm & FILE_W) && !src->isWriteable())
-        OPDE_FILEEXCEPT(FILE_OPEN_ERROR,
+        DARKNESS_FILEEXCEPT(FILE_OPEN_ERROR,
                         string("AccessMode mismatch opening") + name,
                         "FilePart::FilePart()");
 
@@ -612,12 +612,12 @@ void FilePart::seek(file_offset_t pos, SeekMode mode) {
         break;
 
     default: // should not happen
-        OPDE_FILEEXCEPT(FILE_OTHER_ERROR, "Unknown seek position modifier",
+        DARKNESS_FILEEXCEPT(FILE_OTHER_ERROR, "Unknown seek position modifier",
                         "MemoryFile.seek()");
     }
 
     if ((npos < 0) || (static_cast<file_size_t>(npos) > mSize))
-        OPDE_FILEEXCEPT(FILE_OP_FAILED,
+        DARKNESS_FILEEXCEPT(FILE_OP_FAILED,
                         "Resulting position not within the file size",
                         "MemoryFile::seek()");
 
@@ -639,7 +639,7 @@ File &FilePart::read(void *buf, file_size_t size) {
     // only allow reads that do not overlap file's end. Otherwise, throw an
     // exception
     if (mFilePos + size > mSize)
-        OPDE_FILEEXCEPT(FILE_READ_ERROR, "Read past end of file",
+        DARKNESS_FILEEXCEPT(FILE_READ_ERROR, "Read past end of file",
                         "FilePart.read()");
 
     mSrcFile->seek(mOffPos + mFilePos);
@@ -658,11 +658,11 @@ File &FilePart::write(const void *buf, file_size_t size) {
     backupPos();
 
     if (!isWriteable())
-        OPDE_FILEEXCEPT(FILE_WRITE_ERROR, "Write not enabled on this FilePart",
+        DARKNESS_FILEEXCEPT(FILE_WRITE_ERROR, "Write not enabled on this FilePart",
                         "FilePart::write");
 
     if (mFilePos + size > mSize)
-        OPDE_FILEEXCEPT(FILE_WRITE_ERROR,
+        DARKNESS_FILEEXCEPT(FILE_WRITE_ERROR,
                         "Write would reach past FilePart's end",
                         "FilePart::write");
 
@@ -685,4 +685,4 @@ void FilePart::backupPos() { mPrevPos = mSrcFile->tell(); }
 
 //------------------------------------
 void FilePart::restorePos() { mSrcFile->seek(mPrevPos); }
-} // namespace Opde
+} // namespace Darkness

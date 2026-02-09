@@ -23,13 +23,13 @@
 
 #include "DatabaseService.h"
 #include "FileGroup.h"
-#include "OpdeException.h"
-#include "OpdeServiceManager.h"
+#include "DarknessException.h"
+#include "DarknessServiceManager.h"
 #include "logger.h"
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 /*--------------------------------------------------------*/
 /*-------------------- DatabaseService -------------------*/
@@ -237,7 +237,7 @@ const char *DatabaseService::getParentDBTagName(uint32_t fileType) {
 }
 
 //------------------------------------------------------
-std::string DatabaseService::loadFileNameFromTag(const Opde::FileGroupPtr &db,
+std::string DatabaseService::loadFileNameFromTag(const Darkness::FileGroupPtr &db,
                                                  const char *tagname) {
     FilePtr fdm = db->getFile(tagname);
 
@@ -366,4 +366,4 @@ Service *DatabaseServiceFactory::createInstance(ServiceManager *manager) {
     return new DatabaseService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

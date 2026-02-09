@@ -51,7 +51,7 @@ Changes in alpha release 0.1.6 (17-Sep-2006)
 Changes in alpha release 0.1.7 (2-Oct-2006)
 * Water portals rendering works even with the lightmaps. The materials are bad though - not looking as they should.
 * Added/restructuralised the materials
-* Added OpdeService, OpdeServiceFactory and some more. These will hopefully be a base classes for the services.
+* Added DarknessService, DarknessServiceFactory and some more. These will hopefully be a base classes for the services.
 * Lightmaps are partially fixed. Swiched on by default now.
 * Pre-add of the StructInfo sources (Thanks telliamed!). These should form the binary service later on (for universal binary file access using binary templates)
 * Some sky box work
@@ -76,7 +76,7 @@ Changes in alpha release 0.2.0 (28-Jan-2007)
 * Console now understands 'show_portals X' command (X==1 shows visible portal geometry)
 * RaySceneQuery and CollisionSceneQuery were implemented (the latter was not tested yet, may be malfunctioning or incomplete)
 * fixed the loading of the world geometry (mission geometry can now be loaded online several times)
-* added an cmake option to compile the OPDE_DEBUG code in (including LOG_DEBUG statements)
+* added an cmake option to compile the DARKNESS_DEBUG code in (including LOG_DEBUG statements)
 * Light map atlassing rewritten a bit. Now atlassing is done after all lightmaps are inserted, using a binary tree approach.
 
 Changes in alpha release 0.2.1 (23-May-2007)

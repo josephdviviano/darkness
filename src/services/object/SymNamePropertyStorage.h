@@ -26,7 +26,7 @@
 
 #include "SingleFieldDataStorage.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** A Bi-Directional unique string Symbolic name storage for symbolic names.
  * Overrides the StringPropertyStorage. */
@@ -57,6 +57,6 @@ public:
 };
 
 typedef shared_ptr<SymNamePropertyStorage> SymNamePropertyStoragePtr;
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

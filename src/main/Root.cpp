@@ -34,7 +34,7 @@
 
 #include "filelog.h"
 
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 
 // Services
 #include "database/DatabaseService.h"
@@ -59,13 +59,13 @@
 #include "ManualBinFileLoader.h"
 #include "ManualFonFileLoader.h"
 #include "OgreFixedZip.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "ProxyArchive.h"
 #include "logger.h"
 #include "stdlog.h"
 #include "tracer.h"
 
-namespace Opde {
+namespace Darkness {
 // -------------------------------------------------------
 // singleton related
 template <> Root *Singleton<Root>::ms_Singleton = 0;
@@ -89,7 +89,7 @@ Root::Root(uint serviceMask, const char *logFileName)
     }
 
     LOG_INFO("Root: Starting openDarkEngine %d.%d.%d (%s), build %s, %s",
-             OPDE_VER_MAJOR, OPDE_VER_MINOR, OPDE_VER_PATCH, OPDE_CODE_NAME,
+             DARKNESS_VER_MAJOR, DARKNESS_VER_MINOR, DARKNESS_VER_PATCH, DARKNESS_CODE_NAME,
              __DATE__, __TIME__);
 
     mServiceMgr.reset(new ServiceManager(mServiceMask));
@@ -103,10 +103,10 @@ Root::Root(uint serviceMask, const char *logFileName)
     mOgreLogManager.reset(new Ogre::LogManager());
     mOgreLogManager->createLog("Ogre.log", true, false, true);
 
-    mOgreOpdeLogConnector.reset(new OgreOpdeLogConnector(mLogger.get()));
+    mDarknessLogConnector.reset(new DarknessLogConnector(mLogger.get()));
 
     // create our logger's ogre log listener interface. Connect together
-    mOgreLogManager->getDefaultLog()->addListener(mOgreOpdeLogConnector.get());
+    mOgreLogManager->getDefaultLog()->addListener(mDarknessLogConnector.get());
 
     // Only initialize ogre if rendering is in serviceMask
     if (serviceMask & SERVICE_RENDERER) {
@@ -176,7 +176,7 @@ Root::~Root() {
     mZipArchiveFactory.reset();
 
     // As the last thing - release the logger
-    mOgreOpdeLogConnector.reset();
+    mDarknessLogConnector.reset();
     mOgreLogManager.reset();
     mLogger.reset();
 }
@@ -252,7 +252,7 @@ void Root::registerServiceFactories() {
     mServiceMgr->registerFactory<DrawServiceFactory>();
     mServiceMgr->registerFactory<RoomServiceFactory>();
     mServiceMgr->registerFactory<PlatformServiceFactory>();
-    // HACK: This thing is here so that we can test opdeScript, but still
+    // HACK: This thing is here so that we can test darknessScript, but still
     // have direct input in GameStateManager...
     // Reason is that GUIService steals direct input
     if (mServiceMask & SERVICE_GUI)
@@ -297,4 +297,4 @@ void Root::setLogLevel(int level) {
     // Call mLogger to setup the log level
     mLogger->setLogLevel(level);
 }
-} // namespace Opde
+} // namespace Darkness

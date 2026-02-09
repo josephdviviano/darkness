@@ -22,7 +22,7 @@
  *****************************************************************************/
 
 #include "InputService.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "ServiceCommon.h"
 #include "StringTokenizer.h"
 #include "logger.h"
@@ -30,7 +30,7 @@
 #include <OgreResourceGroupManager.h>
 #include <cctype>
 
-namespace Opde {
+namespace Darkness {
 
 /*---------------------------------------------------*/
 /*-------------------- InputEventMapper -------------*/
@@ -59,4 +59,4 @@ bool InputEventMapper::unmapEvent(unsigned int code,
 void InputEventMapper::bind(unsigned int code, const std::string &command) {
     mCodeToCommand[code] = command;
 }
-} // namespace Opde
+} // namespace Darkness

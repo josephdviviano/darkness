@@ -26,12 +26,12 @@
 #include "config.h"
 
 #include "GameStateManager.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "StringTokenizer.h"
 
 #include <OgreException.h>
 
-using namespace Opde;
+using namespace Darkness;
 
 #if OGRE_PLATFORM == OGRE_PLATFORM_WIN32
 #define WIN32_LEAN_AND_MEAN

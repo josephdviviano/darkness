@@ -28,7 +28,7 @@
 #include "DrawOperation.h"
 #include <OgreRenderQueue.h>
 
-namespace Opde {
+namespace Darkness {
 // forward decl.
 class DrawService;
 
@@ -156,6 +156,6 @@ protected:
     /// Resolution of the screen (either updated or overriden)
     size_t mWidth, mHeight;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

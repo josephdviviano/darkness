@@ -21,8 +21,8 @@
  *
  *****************************************************************************/
 
-#ifndef __OPDESERVICEMANAGER_H
-#define __OPDESERVICEMANAGER_H
+#ifndef __DARKNESSSERVICEMANAGER_H
+#define __DARKNESSSERVICEMANAGER_H
 
 #include <memory>
 #include <vector>
@@ -30,12 +30,12 @@
 #include "config.h"
 
 #include "Array.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
-#include "OpdeSingleton.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
+#include "DarknessSingleton.h"
 #include <map>
 
-namespace Opde {
+namespace Darkness {
 
 /** Central manager for the Services. Each service must have the ServiceFactory
  * implemented, and must implement Service class.
@@ -111,6 +111,6 @@ public:
     std::static_pointer_cast<__sname__>(                                       \
         ServiceManager::getSingleton().getService(__sname__::SID));
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

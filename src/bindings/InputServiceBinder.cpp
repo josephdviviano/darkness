@@ -27,7 +27,7 @@
 #include "PythonStruct.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -75,7 +75,7 @@ const char *InputServiceBinder::msName = "InputService";
 // ------------------------------------------
 PyTypeObject InputServiceBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.InputService", // char *tp_name; */
+                          0) "darkness.services.InputService", // char *tp_name; */
     sizeof(InputServiceBinder::Base), // int tp_basicsize; */
     0,                           // int tp_itemsize;       /* not used much */
     InputServiceBinder::dealloc, // destructor tp_dealloc; */
@@ -296,4 +296,4 @@ void InputServiceBinder::init(PyObject *module) {
 }
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

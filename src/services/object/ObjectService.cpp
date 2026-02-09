@@ -23,7 +23,7 @@
  *****************************************************************************/
 
 #include "ObjectService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "PositionPropertyStorage.h"
 #include "ServiceCommon.h"
 #include "SymNamePropertyStorage.h"
@@ -36,14 +36,14 @@
 
 #include "logger.h"
 
-namespace Opde {
+namespace Darkness {
 /*------------------------------------------------------*/
 /*-------------------- ObjectService -------------------*/
 /*------------------------------------------------------*/
 template <> const size_t ServiceImpl<ObjectService>::SID = __SERVICE_ID_OBJECT;
 
 ObjectService::ObjectService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::ObjectService>(manager, name), mAllocatedObjects(),
+    : ServiceImpl<Darkness::ObjectService>(manager, name), mAllocatedObjects(),
       mDatabaseService(NULL),
       mObjVecVerMaj(0), // Seems to be the same for all versions
       mObjVecVerMin(2),
@@ -558,7 +558,7 @@ void ObjectService::_beginCreateObject(int objID, int archetypeID) {
     _prepareForObject(objID);
 
     if (!exists(archetypeID)) {
-        OPDE_EXCEPT("Given archetype ID does not exist!");
+        DARKNESS_EXCEPT("Given archetype ID does not exist!");
     }
 
     // Use inherit service to set archetype for the new object
@@ -711,4 +711,4 @@ const uint ObjectServiceFactory::getMask() {
 
 const size_t ObjectServiceFactory::getSID() { return ObjectService::SID; }
 
-} // namespace Opde
+} // namespace Darkness

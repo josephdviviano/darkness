@@ -1,28 +1,28 @@
 include_directories(
     ${ODE_INCLUDE_DIR}
     ${OGRE_INCLUDE_DIR}
-    ${OPDE_BINARY_DIR}
-    ${OPDE_BASE_INCLUDES}
-    ${OPDE_SERVICE_INCLUDES}
+    ${DARKNESS_BINARY_DIR}
+    ${DARKNESS_BASE_INCLUDES}
+    ${DARKNESS_SERVICE_INCLUDES}
     ${PYTHON_INCLUDE_PATH}
-    ${OPDE_SOURCE_DIR}/src/scenemanager
-    ${OPDE_SOURCE_DIR}/src/main
-    ${OPDE_SOURCE_DIR}/src/base
-    ${OPDE_SOURCE_DIR}/src/base/console
-    ${OPDE_SOURCE_DIR}/src/base/compat
-    ${OPDE_SOURCE_DIR}/src/base/dyntype
-    ${OPDE_SOURCE_DIR}/src/base/file
-    ${OPDE_SOURCE_DIR}/src/base/loaders
-    ${OPDE_SOURCE_DIR}/src/base/logger
-    ${OPDE_SOURCE_DIR}/src/base/servicemanager
-    ${OPDE_SOURCE_DIR}/src/scenemanager
-    ${OPDE_SOURCE_DIR}/src/main
-    ${OPDE_SOURCE_DIR}/src/compat
-    ${OPDE_SOURCE_DIR}/src/bindings
-    ${OPDE_SOURCE_DIR}/src/services
+    ${DARKNESS_SOURCE_DIR}/src/scenemanager
+    ${DARKNESS_SOURCE_DIR}/src/main
+    ${DARKNESS_SOURCE_DIR}/src/base
+    ${DARKNESS_SOURCE_DIR}/src/base/console
+    ${DARKNESS_SOURCE_DIR}/src/base/compat
+    ${DARKNESS_SOURCE_DIR}/src/base/dyntype
+    ${DARKNESS_SOURCE_DIR}/src/base/file
+    ${DARKNESS_SOURCE_DIR}/src/base/loaders
+    ${DARKNESS_SOURCE_DIR}/src/base/logger
+    ${DARKNESS_SOURCE_DIR}/src/base/servicemanager
+    ${DARKNESS_SOURCE_DIR}/src/scenemanager
+    ${DARKNESS_SOURCE_DIR}/src/main
+    ${DARKNESS_SOURCE_DIR}/src/compat
+    ${DARKNESS_SOURCE_DIR}/src/bindings
+    ${DARKNESS_SOURCE_DIR}/src/services
 )
 
-add_library(OpdePython OBJECT
+add_library(DarknessPython OBJECT
     bindings.cpp
     bindings.h
     ConfigServiceBinder.cpp

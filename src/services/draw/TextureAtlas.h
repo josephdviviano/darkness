@@ -26,7 +26,7 @@
 
 #include "DrawCommon.h"
 
-namespace Opde {
+namespace Darkness {
 // Forward decl.
 class DrawService;
 class FontDrawSource;
@@ -107,6 +107,6 @@ protected:
     /// Used with vertex colour (texture less) rendering
     DrawSourcePtr mVertexColour;
 };
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

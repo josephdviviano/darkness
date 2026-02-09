@@ -27,7 +27,7 @@
 
 #include "RenderedProperty.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** a RenderAlpha property implementation using rendered property handler.
  * Controls the transparency of the object
@@ -61,6 +61,6 @@ protected:
 
     Ogre::SceneManager *mSceneMgr;
 };
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

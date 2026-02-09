@@ -1,4 +1,4 @@
-// RenderConfig.h — YAML + CLI configuration for opdeRender
+// RenderConfig.h — YAML + CLI configuration for darknessRender
 // Config precedence: CLI flags > YAML config file > hardcoded defaults
 #pragma once
 
@@ -9,7 +9,7 @@
 
 #include <yaml-cpp/yaml.h>
 
-namespace Opde {
+namespace Darkness {
 
 // All configurable settings for the renderer.
 // Defaults match the original hardcoded values.
@@ -112,4 +112,4 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
     return cli;
 }
 
-} // namespace Opde
+} // namespace Darkness

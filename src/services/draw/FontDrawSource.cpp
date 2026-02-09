@@ -23,10 +23,10 @@
 
 #include "FontDrawSource.h"
 #include "DrawCommon.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "TextureAtlas.h"
 
-namespace Opde {
+namespace Darkness {
 /*----------------------------------------------------*/
 /*------------------- FontDrawSource -----------------*/
 /*----------------------------------------------------*/
@@ -79,7 +79,7 @@ void FontDrawSource::addGlyph(FontCharType chr, const PixelSize &dimensions,
                                  palette);
         break;
     default:
-        OPDE_EXCEPT("Invalid pixel format supplied");
+        DARKNESS_EXCEPT("Invalid pixel format supplied");
     }
 
     // copy the dimensions
@@ -243,4 +243,4 @@ void FontDrawSource::populateImageFrom8BitPal(const DrawSourcePtr &dsp,
     dsp->setSourcePixmapPointer(pixels);
 }
 
-}; // namespace Opde
+}; // namespace Darkness

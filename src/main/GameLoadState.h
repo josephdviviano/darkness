@@ -29,15 +29,15 @@
 #include "FileGroup.h"
 #include "GameState.h"
 #include "ManualFonFileLoader.h"
-#include "OpdeServiceManager.h"
-#include "OpdeSingleton.h"
+#include "DarknessServiceManager.h"
+#include "DarknessSingleton.h"
 #include "worldrep/WorldRepService.h"
 
 #include <OgreRoot.h>
 #include <OgreSceneManager.h>
 #include <Overlay/OgreOverlayManager.h>
 
-namespace Opde {
+namespace Darkness {
 
 class GameLoadState : public Singleton<GameLoadState>, public GameState {
 public:
@@ -80,6 +80,6 @@ protected:
     // config service
     ConfigServicePtr mConfigService;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

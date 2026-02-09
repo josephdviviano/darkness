@@ -24,7 +24,7 @@
 #include <iostream>
 #include <OgreException.h>
 
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "Root.h"
 #include "StringTokenizer.h"
 #include "Variant.h"
@@ -36,7 +36,7 @@
 // Simple and very dirty doc generator.
 // outputs to latex so it can be converted to html using latex2html or rendered
 // to pdf, etc.
-namespace Opde {
+namespace Darkness {
 /// Documentation generator for properties and links
 class DocGenerator {
 protected:
@@ -45,7 +45,7 @@ protected:
     int mArgc;
     char **mArgv;
     std::string mConfigFile;
-    Opde::Root *mRoot;
+    Darkness::Root *mRoot;
     ConfigServicePtr mConfigSvc;
 
     typedef std::map<std::string, std::string> DocStrings;
@@ -78,7 +78,7 @@ protected:
         // parse the config file. Load the dtype scripts
         // this is done automatically by adding the resource locations
         // then bootstrapping
-        // initialize Opde::Root. No service types besides the base
+        // initialize Darkness::Root. No service types besides the base
         mRoot->loadConfigFile(mConfigFile);
 
         Variant p;
@@ -180,7 +180,7 @@ protected:
                 } else if (type == "page") {
                     ntype = DT_SPECIAL;
                 } else {
-                    OPDE_EXCEPT(format("Unknown section type :", type));
+                    DARKNESS_EXCEPT(format("Unknown section type :", type));
                 }
 
                 // dispatch the old text
@@ -383,7 +383,7 @@ protected:
 
 public:
     DocGenerator(int argc, char **argv) : mArgc(argc), mArgv(argv) {
-        mRoot = new Opde::Root(SERVICE_CORE, "opde-dg.log");
+        mRoot = new Darkness::Root(SERVICE_CORE, "darkness-dg.log");
         // we want script autoload
         // mRoot->registerCustomScriptLoaders();
         // TODO: debug config param.
@@ -399,7 +399,7 @@ public:
     }
 
     void help(void) {
-        std::cout << "Usage: opdeDocGen config_file" << std::endl;
+        std::cout << "Usage: darknessDocGen config_file" << std::endl;
     }
 
     bool generateDoc(void) {
@@ -423,13 +423,13 @@ public:
         return true;
     }
 };
-}; // namespace Opde
+}; // namespace Darkness
 
 int main(int argc, char **argv) {
     int rv = 0;
 
     try {
-        Opde::DocGenerator dg(argc, argv);
+        Darkness::DocGenerator dg(argc, argv);
 
         if (!dg.generateDoc())
             rv = 3; // exit code 3 - parsing failed
@@ -437,10 +437,10 @@ int main(int argc, char **argv) {
         std::cerr << "An exception has occured: "
                   << e.getFullDescription().c_str() << std::endl;
         rv = 1; // exit code 2 - ogre error
-    } catch (Opde::BasicException &e) {
+    } catch (Darkness::BasicException &e) {
         std::cerr << "An exception has occured: " << e.getDetails().c_str()
                   << std::endl;
-        rv = 2; // exit code 1 - opde error
+        rv = 2; // exit code 1 - darkness error
     }
 
     return rv;

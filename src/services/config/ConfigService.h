@@ -26,12 +26,12 @@
 #define __CONFIGSERVICE_H
 
 #include "Variant.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "SharedPtr.h"
 #include "ServiceCommon.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** @brief config service
  */
@@ -94,7 +94,7 @@ public:
     GameType getGameType();
 
     /** Language, as parsed from the install.cfg file
-     * @todo Parse the install.cfg - now we read it from opde.cfg
+     * @todo Parse the install.cfg - now we read it from darkness.cfg
      * @return Language name string (to be used with localized resource version
      * reader code)
      * */
@@ -113,7 +113,7 @@ public:
     void logAllParameters();
 
 protected:
-    /** initializes the service. Tries to load opde.cfg */
+    /** initializes the service. Tries to load darkness.cfg */
     bool init();
     void shutdown();
 
@@ -151,6 +151,6 @@ public:
 private:
     static std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

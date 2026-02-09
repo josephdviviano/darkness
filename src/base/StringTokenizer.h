@@ -31,7 +31,7 @@
 #include <functional>
 #include <string>
 
-namespace Opde {
+namespace Darkness {
 /// char classifier (is Space)
 struct IsChar : public std::unary_function<char, bool> {
     IsChar(char c) : mChar(c){};
@@ -201,6 +201,6 @@ protected:
 
     std::string::const_iterator mCurPos;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

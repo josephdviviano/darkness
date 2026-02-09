@@ -26,7 +26,7 @@
 
 #include "compat.h"
 
-namespace Opde {
+namespace Darkness {
 
 /// Property change types
 enum PropertyChangeType {
@@ -48,6 +48,6 @@ struct PropertyChangeMsg {
     /// An ID of the object that changed
     int objectID;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -30,7 +30,7 @@
 #include "link/LinkService.h"
 #include "link/Relation.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -70,6 +70,6 @@ protected:
     static PyMethodDef msMethods[];
 };
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness
 
 #endif

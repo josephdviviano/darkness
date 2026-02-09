@@ -28,7 +28,7 @@
 
 #include "integers.h"
 
-namespace Opde {
+namespace Darkness {
 
 /// A single RGBA color
 struct RGBAQuad {
@@ -38,6 +38,6 @@ struct RGBAQuad {
     uint8_t alpha;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

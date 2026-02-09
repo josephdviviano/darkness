@@ -1,4 +1,4 @@
-// TEMPORARILY ADDED TO OPDE AS A FIX TO OGRE 1.9 BUG
+// TEMPORARILY ADDED TO DARKNESS AS A FIX TO OGRE 1.9 BUG
 /*
 -----------------------------------------------------------------------------
 This source file is part of OGRE
