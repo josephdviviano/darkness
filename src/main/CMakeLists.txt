@@ -20,6 +20,7 @@ install(TARGETS opdeHeadless
 find_package(bgfx CONFIG REQUIRED)
 find_package(SDL2 CONFIG REQUIRED)
 find_package(zziplib CONFIG REQUIRED)
+find_package(yaml-cpp CONFIG REQUIRED)
 
 add_executable(opdeRender OpdeRender.cpp)
 
@@ -35,6 +36,7 @@ target_link_libraries(opdeRender PRIVATE
     SDL2::SDL2main
     SDL2::SDL2-static
     zziplib::libzzip
+    yaml-cpp::yaml-cpp
 )
 
 install(TARGETS opdeRender

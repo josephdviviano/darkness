@@ -22,9 +22,9 @@ TODO
 * ...and others not mentioned
 
 # Disclaimer
-`darkness` is an independent reimplementation of the Dark Engine and is not affiliated with, endorsed by, or derived from the original software or its rights holders.
+`darkness` is a reimplementation of the Dark Engine and is not affiliated with or endorsed by the original software's rights holders.
 
-This project does not contain, distribute, or incorporate any proprietary source code, binaries, assets, or data files from the original software. All code in this repository has been written by the project's contributors through independent development efforts. Users must supply their own legally obtained copies of any original data files required to operate this software. This project does not facilitate, encourage, or provide access to pirated or unauthorized copies of any proprietary material.
+This project does not contain, distribute, or incorporate proprietary source code, binaries, assets, or data files from the original software. All code in this repository has been written by the project's contributors through independent development efforts. Users must supply their own legally obtained copies of any original game data files required to operate this software. This project does not facilitate, encourage, or provide access to pirated or unauthorized copies of any proprietary material.
 
 ### Intellectual Property
 All original code in this repository is released under the GPLv3 license. See LICENSE for full terms.

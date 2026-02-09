@@ -54,6 +54,7 @@
 #include "LightingSystem.h"
 #include "ObjectPropParser.h"
 #include "BinMeshParser.h"
+#include "RenderConfig.h"
 
 static const int WINDOW_WIDTH  = 1280;
 static const int WINDOW_HEIGHT = 720;
@@ -163,6 +164,364 @@ static uint32_t packABGR(float r, float g, float b, float a) {
     uint8_t bi = static_cast<uint8_t>(std::min(std::max(b, 0.0f), 1.0f) * 255.0f);
     uint8_t ai = static_cast<uint8_t>(std::min(std::max(a, 0.0f), 1.0f) * 255.0f);
     return (uint32_t(ai) << 24) | (uint32_t(bi) << 16) | (uint32_t(gi) << 8) | ri;
+}
+
+// ── Mipmap generation and texture creation with full mip chain ──
+
+// Alpha handling mode for mipmap generation:
+// ALPHA_TEST  — preserves alpha coverage so cutout geometry (grates, foliage)
+//               doesn't shrink or disappear at distance
+// ALPHA_BLEND — no coverage adjustment (for fully opaque textures like skybox faces)
+enum class MipAlphaMode { ALPHA_TEST, ALPHA_BLEND };
+
+// sRGB linearization helpers for gamma-correct mipmap filtering.
+// Simplified pow(2.2) approximation — accurate enough for texture downsampling.
+static float srgbToLinear(uint8_t v) {
+    float f = v / 255.0f;
+    return std::pow(f, 2.2f);
+}
+
+static uint8_t linearToSrgb(float v) {
+    float f = std::pow(std::max(0.0f, std::min(1.0f, v)), 1.0f / 2.2f);
+    return static_cast<uint8_t>(f * 255.0f + 0.5f);
+}
+
+// ── Kaiser-windowed sinc filter for high-quality mipmap downsampling ──
+// Replaces the naive 2x2 box filter with a wider kernel that reduces aliasing
+// on high-frequency textures. Uses premultiplied alpha to prevent dark halos
+// at transparent edges.
+
+// Modified Bessel function I0 — polynomial approximation (Abramowitz & Stegun 9.8.1)
+static double besselI0(double x) {
+    double ax = std::abs(x);
+    if (ax < 3.75) {
+        double t = x / 3.75;
+        t *= t;
+        return 1.0 + t * (3.5156229 + t * (3.0899424 + t * (1.2067492
+             + t * (0.2659732 + t * (0.0360768 + t * 0.0045813)))));
+    }
+    double t = 3.75 / ax;
+    return (std::exp(ax) / std::sqrt(ax))
+         * (0.39894228 + t * (0.01328592 + t * (0.00225319
+         + t * (-0.00157565 + t * (0.00916281 + t * (-0.02057706
+         + t * (0.02635537 + t * (-0.01647633 + t * 0.00392377))))))));
+}
+
+// Kaiser window function: windowed sinc for anti-aliased downsampling
+// radius=3.0 gives a 6-tap diameter kernel; beta=4.0 gives a sharp cutoff
+// with minimal ringing — good balance for game textures
+static double kaiserWindow(double x, double radius, double beta) {
+    if (std::abs(x) > radius) return 0.0;
+    double r = x / radius;
+    return besselI0(beta * std::sqrt(std::max(0.0, 1.0 - r * r))) / besselI0(beta);
+}
+
+// Normalized sinc function: sin(pi*x) / (pi*x)
+static double sincFilter(double x) {
+    if (std::abs(x) < 1e-6) return 1.0;
+    double px = M_PI * x;
+    return std::sin(px) / px;
+}
+
+// Downsample RGBA image by 2x using Kaiser-windowed sinc filter.
+// Non-separable 2D kernel — up to ~37 taps per output pixel, fast enough
+// for the 64-256px textures typical in Dark Engine assets at load time.
+//
+// premultiply: multiply RGB by alpha before filtering, divide after
+//              (prevents dark halos at transparent edges)
+// linearize:   convert sRGB to linear before filtering, back to sRGB after
+//              (gamma-correct downsampling for more accurate color blending)
+static std::vector<uint8_t> downsampleKaiser(const uint8_t *src,
+                                              uint32_t srcW, uint32_t srcH,
+                                              bool premultiply, bool linearize) {
+    uint32_t dstW = std::max(1u, srcW / 2);
+    uint32_t dstH = std::max(1u, srcH / 2);
+    std::vector<uint8_t> dst(dstW * dstH * 4);
+
+    // Kaiser kernel parameters
+    const double radius = 3.0;
+    const double beta = 4.0;
+
+    // Precompute Kaiser kernel window radius in source pixels
+    // Scale factor is 2.0 (halving dimensions), filter radius in source space = radius * scale
+    const int filterRadius = static_cast<int>(std::ceil(radius));
+
+    for (uint32_t dy = 0; dy < dstH; ++dy) {
+        for (uint32_t dx = 0; dx < dstW; ++dx) {
+            // Center of the output pixel in source coordinates
+            double cx = (dx + 0.5) * 2.0 - 0.5;
+            double cy = (dy + 0.5) * 2.0 - 0.5;
+
+            // Accumulate weighted samples
+            double sumR = 0, sumG = 0, sumB = 0, sumA = 0;
+            double sumWeight = 0;
+
+            int sx0 = std::max(0, static_cast<int>(std::floor(cx)) - filterRadius);
+            int sy0 = std::max(0, static_cast<int>(std::floor(cy)) - filterRadius);
+            int sx1 = std::min(static_cast<int>(srcW) - 1,
+                               static_cast<int>(std::ceil(cx)) + filterRadius);
+            int sy1 = std::min(static_cast<int>(srcH) - 1,
+                               static_cast<int>(std::ceil(cy)) + filterRadius);
+
+            for (int sy = sy0; sy <= sy1; ++sy) {
+                double fy = (sy - cy) / 2.0;  // normalized to filter space
+                double wy = sincFilter(fy) * kaiserWindow(fy, radius, beta);
+
+                for (int sx = sx0; sx <= sx1; ++sx) {
+                    double fx = (sx - cx) / 2.0;
+                    double wx = sincFilter(fx) * kaiserWindow(fx, radius, beta);
+                    double w = wx * wy;
+
+                    const uint8_t *p = src + (sy * srcW + sx) * 4;
+                    float r, g, b, a;
+
+                    // Decode alpha
+                    a = p[3] / 255.0f;
+
+                    // Decode RGB with optional sRGB linearization
+                    if (linearize) {
+                        r = srgbToLinear(p[0]);
+                        g = srgbToLinear(p[1]);
+                        b = srgbToLinear(p[2]);
+                    } else {
+                        r = p[0] / 255.0f;
+                        g = p[1] / 255.0f;
+                        b = p[2] / 255.0f;
+                    }
+
+                    // Premultiplied alpha filtering: weight RGB by alpha
+                    // to prevent transparent pixels from bleeding dark into edges
+                    if (premultiply) {
+                        r *= a;
+                        g *= a;
+                        b *= a;
+                    }
+
+                    sumR += w * r;
+                    sumG += w * g;
+                    sumB += w * b;
+                    sumA += w * a;
+                    sumWeight += w;
+                }
+            }
+
+            // Normalize by total weight
+            if (sumWeight > 1e-10) {
+                sumR /= sumWeight;
+                sumG /= sumWeight;
+                sumB /= sumWeight;
+                sumA /= sumWeight;
+            }
+
+            // Un-premultiply: recover RGB from premultiplied values
+            if (premultiply && sumA > 1e-6) {
+                sumR /= sumA;
+                sumG /= sumA;
+                sumB /= sumA;
+            }
+
+            // Convert back to sRGB if we linearized
+            uint8_t *out = dst.data() + (dy * dstW + dx) * 4;
+            if (linearize) {
+                out[0] = linearToSrgb(static_cast<float>(sumR));
+                out[1] = linearToSrgb(static_cast<float>(sumG));
+                out[2] = linearToSrgb(static_cast<float>(sumB));
+            } else {
+                out[0] = static_cast<uint8_t>(std::min(std::max(sumR, 0.0), 1.0) * 255.0 + 0.5);
+                out[1] = static_cast<uint8_t>(std::min(std::max(sumG, 0.0), 1.0) * 255.0 + 0.5);
+                out[2] = static_cast<uint8_t>(std::min(std::max(sumB, 0.0), 1.0) * 255.0 + 0.5);
+            }
+            out[3] = static_cast<uint8_t>(std::min(std::max(sumA, 0.0), 1.0) * 255.0 + 0.5);
+        }
+    }
+    return dst;
+}
+
+// ── Alpha-coverage preservation for alpha-tested textures ──
+// Prevents cutout geometry (grates, fences, foliage) from shrinking/disappearing
+// at distance by adjusting mip alpha values to maintain the same coverage ratio
+// as the base level.
+
+// Compute the fraction of pixels with alpha >= threshold (matching shader discard)
+static float computeAlphaCoverage(const uint8_t *rgba, uint32_t w, uint32_t h,
+                                   uint8_t threshold = 128) {
+    if (w == 0 || h == 0) return 0.0f;
+    uint32_t count = 0;
+    uint32_t total = w * h;
+    for (uint32_t i = 0; i < total; ++i) {
+        if (rgba[i * 4 + 3] >= threshold) ++count;
+    }
+    return static_cast<float>(count) / static_cast<float>(total);
+}
+
+// Rescale alpha values in the mip so that the coverage (fraction of pixels
+// passing the alpha test) matches targetCoverage. Uses a histogram-based
+// approach: build alpha histogram, find the alpha value that yields the
+// target coverage, then remap so that value maps to the discard threshold (128).
+static void preserveAlphaCoverage(uint8_t *rgba, uint32_t w, uint32_t h,
+                                   float targetCoverage) {
+    if (w == 0 || h == 0) return;
+    if (targetCoverage <= 0.0f || targetCoverage >= 1.0f) return;
+
+    uint32_t total = w * h;
+
+    // Build cumulative histogram of alpha values
+    uint32_t hist[256] = {};
+    for (uint32_t i = 0; i < total; ++i) {
+        hist[rgba[i * 4 + 3]]++;
+    }
+
+    // Find the alpha threshold that yields targetCoverage
+    // Count pixels >= each threshold level
+    uint32_t targetCount = static_cast<uint32_t>(targetCoverage * total + 0.5f);
+    uint32_t cumAbove = 0;
+    int currentThreshold = 255;
+    for (int a = 255; a >= 0; --a) {
+        cumAbove += hist[a];
+        if (cumAbove >= targetCount) {
+            currentThreshold = a;
+            break;
+        }
+    }
+
+    // Remap alphas so that currentThreshold maps to 128 (the shader discard threshold)
+    // Scale = 128.0 / currentThreshold (if currentThreshold > 0)
+    if (currentThreshold <= 0) return;
+
+    float scale = 128.0f / static_cast<float>(currentThreshold);
+    for (uint32_t i = 0; i < total; ++i) {
+        float a = rgba[i * 4 + 3] * scale;
+        rgba[i * 4 + 3] = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, a + 0.5f)));
+    }
+}
+
+// ── Optional unsharp-mask sharpening for mip levels ──
+// Counteracts the inherent softening from downsampling by applying a subtle
+// sharpen: out = original + strength * (original - gaussian_blur).
+// Uses a 3x3 Gaussian blur kernel with sigma ~0.85.
+
+static void sharpenMipLevel(uint8_t *rgba, uint32_t w, uint32_t h, float strength) {
+    if (w < 3 || h < 3 || strength <= 0.0f) return;
+
+    // 3x3 Gaussian kernel (sigma ~0.85), normalized to sum=1
+    // Center=4/16, edges=2/16, corners=1/16
+    static const float kernel[3][3] = {
+        {1.0f/16, 2.0f/16, 1.0f/16},
+        {2.0f/16, 4.0f/16, 2.0f/16},
+        {1.0f/16, 2.0f/16, 1.0f/16}
+    };
+
+    // Work on a copy so we read unmodified original values
+    std::vector<uint8_t> blurred(w * h * 4);
+
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            float sum[4] = {};
+            for (int ky = -1; ky <= 1; ++ky) {
+                // Clamp with signed arithmetic to avoid unsigned underflow
+                int iy = static_cast<int>(y) + ky;
+                uint32_t sy = static_cast<uint32_t>(std::min(std::max(iy, 0), static_cast<int>(h) - 1));
+                for (int kx = -1; kx <= 1; ++kx) {
+                    int ix = static_cast<int>(x) + kx;
+                    uint32_t sx = static_cast<uint32_t>(std::min(std::max(ix, 0), static_cast<int>(w) - 1));
+                    float kw = kernel[ky + 1][kx + 1];
+                    const uint8_t *p = rgba + (sy * w + sx) * 4;
+                    for (int c = 0; c < 4; ++c) sum[c] += kw * p[c];
+                }
+            }
+            uint8_t *out = blurred.data() + (y * w + x) * 4;
+            for (int c = 0; c < 4; ++c) {
+                out[c] = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, sum[c] + 0.5f)));
+            }
+        }
+    }
+
+    // Apply unsharp mask: out = original + strength * (original - blurred)
+    // Only sharpen RGB, leave alpha untouched
+    uint32_t total = w * h;
+    for (uint32_t i = 0; i < total; ++i) {
+        uint8_t *p = rgba + i * 4;
+        const uint8_t *b = blurred.data() + i * 4;
+        for (int c = 0; c < 3; ++c) {
+            float val = p[c] + strength * (static_cast<float>(p[c]) - b[c]);
+            p[c] = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, val + 0.5f)));
+        }
+    }
+}
+
+// Create a bgfx texture with a full mip chain using Kaiser-windowed sinc downsampling.
+// Returns the texture handle. Uses the provided sampler flags for the base level.
+//
+// alphaMode: ALPHA_TEST preserves coverage (cutout geometry), ALPHA_BLEND skips it
+// linearize: sRGB→linear before filtering, linear→sRGB after (gamma-correct mips)
+// sharpen:   apply subtle unsharp mask to each mip level to preserve detail
+static bgfx::TextureHandle createMipmappedTexture(
+    const uint8_t *rgba, uint32_t w, uint32_t h, uint64_t samplerFlags,
+    MipAlphaMode alphaMode = MipAlphaMode::ALPHA_TEST,
+    bool linearize = false,
+    bool sharpen = false)
+{
+    // Count mip levels: floor(log2(max(w,h))) + 1
+    uint32_t mipCount = 1;
+    {
+        uint32_t maxDim = std::max(w, h);
+        while (maxDim > 1) { maxDim >>= 1; ++mipCount; }
+    }
+
+    // Measure base-level alpha coverage for preservation in smaller mips
+    float baseCoverage = 0.0f;
+    if (alphaMode == MipAlphaMode::ALPHA_TEST) {
+        baseCoverage = computeAlphaCoverage(rgba, w, h, 128);
+    }
+
+    // Generate all mip levels on CPU
+    struct MipLevel { std::vector<uint8_t> data; uint32_t w, h; };
+    std::vector<MipLevel> mips(mipCount);
+    mips[0].data.assign(rgba, rgba + w * h * 4);
+    mips[0].w = w;
+    mips[0].h = h;
+
+    for (uint32_t i = 1; i < mipCount; ++i) {
+        mips[i].w = std::max(1u, mips[i-1].w / 2);
+        mips[i].h = std::max(1u, mips[i-1].h / 2);
+
+        // Kaiser-windowed sinc downsample with premultiplied alpha (always)
+        // and optional sRGB linearization
+        mips[i].data = downsampleKaiser(mips[i-1].data.data(),
+                                         mips[i-1].w, mips[i-1].h,
+                                         true, linearize);
+
+        // Optional: sharpen to counteract filter softening (strength 0.4)
+        if (sharpen) {
+            sharpenMipLevel(mips[i].data.data(), mips[i].w, mips[i].h, 0.4f);
+        }
+
+        // Preserve alpha coverage so cutout geometry doesn't shrink at distance
+        // Only for ALPHA_TEST textures with partial coverage (not fully opaque/transparent)
+        if (alphaMode == MipAlphaMode::ALPHA_TEST
+            && baseCoverage > 0.0f && baseCoverage < 1.0f) {
+            preserveAlphaCoverage(mips[i].data.data(), mips[i].w, mips[i].h,
+                                   baseCoverage);
+        }
+    }
+
+    // Concatenate all mip levels into one contiguous buffer for bgfx
+    uint32_t totalSize = 0;
+    for (const auto &m : mips) totalSize += static_cast<uint32_t>(m.data.size());
+
+    const bgfx::Memory *mem = bgfx::alloc(totalSize);
+    uint32_t offset = 0;
+    for (const auto &m : mips) {
+        std::memcpy(mem->data + offset, m.data.data(), m.data.size());
+        offset += static_cast<uint32_t>(m.data.size());
+    }
+
+    return bgfx::createTexture2D(
+        static_cast<uint16_t>(w),
+        static_cast<uint16_t>(h),
+        true, // hasMips — bgfx expects all levels in the memory buffer
+        1, bgfx::TextureFormat::RGBA8,
+        samplerFlags, mem);
 }
 
 // ── Build flat-shaded mesh (no textures) ──
@@ -1649,7 +2008,7 @@ static void printHelp() {
         "opdeRender — Dark Engine world geometry viewer\n"
         "\n"
         "Usage:\n"
-        "  opdeRender <mission.mis> [--res <path>] [--lm-scale <N>]\n"
+        "  opdeRender <mission.mis> [--res <path>] [--config <path>] [--lm-scale <N>]\n"
         "\n"
         "Options:\n"
         "  --res <path>   Path to Thief 2 RES directory containing fam.crf.\n"
@@ -1661,7 +2020,11 @@ static void printHelp() {
         "                 interpolation. Higher values use more atlas memory.\n"
         "  --no-objects   Disable object mesh rendering (world geometry only).\n"
         "  --no-cull      Start with portal culling disabled (see all geometry).\n"
+        "  --filter       Start with bilinear texture filtering (default: point/crispy).\n"
         "  --force-flicker Force all animated lights to flicker mode (debug).\n"
+        "  --linear-mips  Gamma-correct mipmap generation (sRGB linearization).\n"
+        "  --sharp-mips   Sharpen mip levels to preserve detail at distance.\n"
+        "  --config <path> Path to YAML config file (default: ./opdeRender.yaml).\n"
         "  --help         Show this help message.\n"
         "\n"
         "Controls:\n"
@@ -1672,6 +2035,7 @@ static void printHelp() {
         "  Ctrl           Sprint (3x speed)\n"
         "  Scroll wheel   Adjust movement speed (shown in title bar)\n"
         "  C              Toggle portal culling on/off\n"
+        "  F              Cycle texture filtering (point/bilinear/trilinear/aniso)\n"
         "  Home           Teleport to player spawn point\n"
         "  Esc            Quit\n"
         "\n"
@@ -1706,36 +2070,40 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    const char *misPath = argv[1];
-    std::string resPath;
-    int lmScale = 1;
-    bool showObjects = true;
-    bool forceFlicker = false;
-    bool portalCulling = true; // enabled by default, toggled by C key
+    // Parse config: hardcoded defaults → YAML file → CLI overrides
+    Opde::RenderConfig cfg;
 
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            printHelp();
-            return 0;
-        }
-        if (std::strcmp(argv[i], "--res") == 0 && i + 1 < argc) {
-            resPath = argv[++i];
-        }
-        if (std::strcmp(argv[i], "--lm-scale") == 0 && i + 1 < argc) {
-            lmScale = std::atoi(argv[++i]);
-            if (lmScale < 1) lmScale = 1;
-            if (lmScale > 8) lmScale = 8;
-        }
-        if (std::strcmp(argv[i], "--no-objects") == 0) {
-            showObjects = false;
-        }
-        if (std::strcmp(argv[i], "--no-cull") == 0) {
-            portalCulling = false;
-        }
-        if (std::strcmp(argv[i], "--force-flicker") == 0) {
-            forceFlicker = true;
-        }
+    // First CLI pass: extract --config path (and detect --help early)
+    Opde::CliResult cli = Opde::applyCliOverrides(argc, argv, cfg);
+
+    if (cli.helpRequested) {
+        printHelp();
+        return 0;
     }
+
+    if (!cli.misPath) {
+        std::fprintf(stderr, "Error: no mission file specified.\n\n");
+        printHelp();
+        return 1;
+    }
+
+    // Load YAML config (defaults to ./opdeRender.yaml if no --config flag)
+    std::string configPath = cli.configPath.empty() ? "opdeRender.yaml" : cli.configPath;
+    Opde::loadConfigFromYAML(configPath, cfg);
+
+    // Re-apply CLI so flags always win over YAML values
+    cli = Opde::applyCliOverrides(argc, argv, cfg);
+
+    // Unpack into local variables — rest of file uses these unchanged
+    const char *misPath    = cli.misPath;
+    std::string resPath    = cli.resPath;
+    int  lmScale           = cfg.lmScale;
+    bool showObjects       = cfg.showObjects;
+    bool forceFlicker      = cfg.forceFlicker;
+    bool portalCulling     = cfg.portalCulling;
+    int  filterMode        = cfg.filterMode;
+    bool linearMips        = cfg.linearMips;
+    bool sharpMips         = cfg.sharpMips;
 
     bool texturedMode = !resPath.empty();
 
@@ -2279,22 +2647,17 @@ int main(int argc, char *argv[]) {
         );
         ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
 
-        // Create bgfx textures from loaded images
+        // Create bgfx textures with full mip chains from loaded images
         for (auto &kv : loadedTextures) {
             uint8_t idx = kv.first;
             const auto &img = kv.second;
-            const bgfx::Memory *mem = bgfx::copy(img.rgba.data(),
-                static_cast<uint32_t>(img.rgba.size()));
-            textureHandles[idx] = bgfx::createTexture2D(
-                static_cast<uint16_t>(img.width),
-                static_cast<uint16_t>(img.height),
-                false, 1, bgfx::TextureFormat::RGBA8,
+            textureHandles[idx] = createMipmappedTexture(
+                img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
                 | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
-                mem
-            );
+                MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
-        std::fprintf(stderr, "Created %zu GPU textures\n", textureHandles.size());
+        std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", textureHandles.size());
     } else if (texturedMode) {
         worldMesh = buildTexturedMesh(wrData, texDims);
         camX = worldMesh.cx; camY = worldMesh.cy; camZ = worldMesh.cz;
@@ -2326,18 +2689,13 @@ int main(int argc, char *argv[]) {
         for (auto &kv : loadedTextures) {
             uint8_t idx = kv.first;
             const auto &img = kv.second;
-            const bgfx::Memory *mem = bgfx::copy(img.rgba.data(),
-                static_cast<uint32_t>(img.rgba.size()));
-            textureHandles[idx] = bgfx::createTexture2D(
-                static_cast<uint16_t>(img.width),
-                static_cast<uint16_t>(img.height),
-                false, 1, bgfx::TextureFormat::RGBA8,
+            textureHandles[idx] = createMipmappedTexture(
+                img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
                 | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
-                mem
-            );
+                MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
-        std::fprintf(stderr, "Created %zu GPU textures\n", textureHandles.size());
+        std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", textureHandles.size());
     } else {
         flatMesh = buildFlatMesh(wrData);
         camX = flatMesh.cx; camY = flatMesh.cy; camZ = flatMesh.cz;
@@ -2414,18 +2772,14 @@ int main(int argc, char *argv[]) {
                 BGFX_BUFFER_INDEX32);
         }
 
-        // Create bgfx texture handles from loaded object texture images
+        // Create bgfx texture handles with mip chains from loaded object texture images
         for (auto &kv : objTexImages) {
             const auto &img = kv.second;
-            const bgfx::Memory *mem = bgfx::copy(img.rgba.data(),
-                static_cast<uint32_t>(img.rgba.size()));
-            objTextureHandles[kv.first] = bgfx::createTexture2D(
-                static_cast<uint16_t>(img.width),
-                static_cast<uint16_t>(img.height),
-                false, 1, bgfx::TextureFormat::RGBA8,
+            objTextureHandles[kv.first] = createMipmappedTexture(
+                img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
                 | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
-                mem);
+                MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
         if (!objTextureHandles.empty()) {
             std::fprintf(stderr, "Created %zu object texture GPU handles\n",
@@ -2579,17 +2933,14 @@ int main(int argc, char *argv[]) {
             bgfx::copy(skyboxCube.indices.data(),
                 static_cast<uint32_t>(skyboxCube.indices.size() * sizeof(uint16_t))));
 
-        // Create GPU textures for each loaded skybox face
+        // Create GPU textures with mip chains for each loaded skybox face
+        // Skybox faces are fully opaque so use ALPHA_BLEND (no coverage preservation)
         for (auto &kv : skyboxImages) {
             const auto &img = kv.second;
-            const bgfx::Memory *mem = bgfx::copy(img.rgba.data(),
-                static_cast<uint32_t>(img.rgba.size()));
-            skyboxTexHandles[kv.first] = bgfx::createTexture2D(
-                static_cast<uint16_t>(img.width),
-                static_cast<uint16_t>(img.height),
-                false, 1, bgfx::TextureFormat::RGBA8,
+            skyboxTexHandles[kv.first] = createMipmappedTexture(
+                img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-                mem);
+                MipAlphaMode::ALPHA_BLEND, linearMips, sharpMips);
         }
         std::fprintf(stderr, "Skybox GPU: %zu face textures created\n",
                      skyboxTexHandles.size());
@@ -2634,17 +2985,19 @@ int main(int argc, char *argv[]) {
     uint32_t cullVisibleCells = 0;  // updated each frame when culling is on
     uint32_t cullTotalCells = wrData.numCells;
 
-    // Helper to update window title with current speed and culling stats
+    // Helper to update window title with current speed, culling, and filter stats
     auto updateTitle = [&]() {
         char title[256];
+        const char *filterNames[] = { "point", "bilinear", "trilinear", "aniso" };
+        const char *filterStr = filterNames[filterMode % 4];
         if (portalCulling) {
             std::snprintf(title, sizeof(title),
-                "darkness — %s [speed: %.1f] [cull: %u/%u cells]",
-                modeStr, moveSpeed, cullVisibleCells, cullTotalCells);
+                "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s]",
+                modeStr, moveSpeed, cullVisibleCells, cullTotalCells, filterStr);
         } else {
             std::snprintf(title, sizeof(title),
-                "darkness — %s [speed: %.1f] [cull: OFF]",
-                modeStr, moveSpeed);
+                "darkness — %s [speed: %.1f] [cull: OFF] [%s]",
+                modeStr, moveSpeed, filterStr);
         }
         SDL_SetWindowTitle(window, title);
     };
@@ -2700,6 +3053,13 @@ int main(int argc, char *argv[]) {
                 portalCulling = !portalCulling;
                 std::fprintf(stderr, "Portal culling: %s\n",
                              portalCulling ? "ON" : "OFF");
+            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_f) {
+                // Cycle texture filtering: point → bilinear → trilinear → anisotropic
+                filterMode = (filterMode + 1) % 4;
+                const char *filterNames[] = {
+                    "point (crispy)", "bilinear", "trilinear", "anisotropic"
+                };
+                std::fprintf(stderr, "Texture filtering: %s\n", filterNames[filterMode]);
             }
         }
 
@@ -2770,6 +3130,38 @@ int main(int argc, char *argv[]) {
                      0.1f, 5000.0f,
                      bgfx::getCaps()->homogeneousDepth,
                      bx::Handedness::Right);
+
+        // Texture sampler flags for the current filtering mode (shared by both views).
+        // UINT32_MAX = use texture's baked POINT flags (default).
+        // Other modes override with explicit sampler flags per draw call.
+        // Two variants: MIRROR wrap (world/object textures), CLAMP wrap (skybox).
+        uint32_t texSampler, skySampler;
+        switch (filterMode) {
+        case 0: // Point: use texture's baked POINT flags
+            texSampler = UINT32_MAX;
+            skySampler = UINT32_MAX;
+            break;
+        case 1: // Bilinear: linear min/mag, point mip
+            texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR
+                       | BGFX_SAMPLER_MIP_POINT;
+            skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+                       | BGFX_SAMPLER_MIP_POINT;
+            break;
+        case 2: // Trilinear: linear min/mag/mip
+            texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR;
+            skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
+            break;
+        case 3: // Anisotropic: aniso min/mag, linear mip
+            texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR
+                       | BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
+            skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+                       | BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
+            break;
+        default:
+            texSampler = UINT32_MAX;
+            skySampler = UINT32_MAX;
+            break;
+        }
 
         // ── Underwater detection ──
         // Check if the camera is inside a water cell (mediaType==2).
@@ -2854,7 +3246,7 @@ int main(int argc, char *argv[]) {
                     bgfx::setVertexBuffer(0, skyboxVBH);
                     bgfx::setIndexBuffer(skyboxIBH, face.firstIndex, face.indexCount);
                     bgfx::setState(skyState);
-                    bgfx::setTexture(0, s_texColor, texIt->second);
+                    bgfx::setTexture(0, s_texColor, texIt->second, skySampler);
                     bgfx::submit(0, texturedProgram);
                 }
             } else if (bgfx::isValid(skyVBH)) {
@@ -2916,7 +3308,7 @@ int main(int argc, char *argv[]) {
                 } else {
                     auto it = textureHandles.find(grp.txtIndex);
                     if (it != textureHandles.end()) {
-                        bgfx::setTexture(0, s_texColor, it->second);
+                        bgfx::setTexture(0, s_texColor, it->second, texSampler);
                         if (!lightmapAtlasHandles.empty())
                             bgfx::setTexture(1, s_texLightmap, lightmapAtlasHandles[0]);
                         bgfx::submit(1, lightmappedProgram);
@@ -2940,7 +3332,7 @@ int main(int argc, char *argv[]) {
                 } else {
                     auto it = textureHandles.find(grp.txtIndex);
                     if (it != textureHandles.end()) {
-                        bgfx::setTexture(0, s_texColor, it->second);
+                        bgfx::setTexture(0, s_texColor, it->second, texSampler);
                         bgfx::submit(1, texturedProgram);
                     } else {
                         bgfx::submit(1, flatProgram);
@@ -3001,7 +3393,7 @@ int main(int argc, char *argv[]) {
                             // Look up object texture by material name
                             auto texIt = objTextureHandles.find(sm.matName);
                             if (texIt != objTextureHandles.end()) {
-                                bgfx::setTexture(0, s_texColor, texIt->second);
+                                bgfx::setTexture(0, s_texColor, texIt->second, texSampler);
                                 bgfx::submit(1, texturedProgram);
                             } else {
                                 // Texture not loaded — fall back to flat shading
@@ -3053,7 +3445,7 @@ int main(int argc, char *argv[]) {
                     bgfx::setUniform(u_waterParams, waterParams);
                     auto it = textureHandles.find(grp.txtIndex);
                     if (it != textureHandles.end()) {
-                        bgfx::setTexture(0, s_texColor, it->second);
+                        bgfx::setTexture(0, s_texColor, it->second, texSampler);
                         bgfx::submit(1, waterProgram);
                     } else {
                         bgfx::submit(1, flatProgram);

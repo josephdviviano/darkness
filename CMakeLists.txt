@@ -157,6 +157,10 @@ add_subdirectory(src)
 add_subdirectory(proto)
 add_subdirectory(thirdparty)
 
+# Unit tests (Catch2 v3)
+enable_testing()
+add_subdirectory(tests)
+
 # Additional fake_install dependencies
 set(OPDE_DOC_INST_DEPS "")
 mark_as_advanced(OPDE_DOC_INST_DEPS)

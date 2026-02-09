@@ -1,0 +1,36 @@
+# opdeRender configuration
+# Copy this file to opdeRender.yaml in your working directory.
+# CLI flags override any values set here.
+
+graphics:
+  # Lightmap upscale factor (1-8, default: 1)
+  # 1 = original blocky lightmaps
+  # 2/4/8 = progressively smoother via bicubic interpolation
+  lm_scale: 1
+
+  # Texture filtering mode (default: 0)
+  # 0 = point (crispy, authentic)
+  # 1 = bilinear
+  # 2 = trilinear
+  # 3 = anisotropic
+  filter_mode: 0
+
+  # Gamma-correct mipmap generation (default: false)
+  # Linearizes sRGB textures before downsampling for correct blending
+  linear_mips: false
+
+  # Sharpen mip levels to preserve detail at distance (default: false)
+  sharp_mips: false
+
+developer:
+  # Render object meshes (default: true)
+  # Set to false for world-geometry-only view
+  show_objects: true
+
+  # Portal/frustum culling (default: true)
+  # Toggle at runtime with C key
+  portal_culling: true
+
+  # Force all animated lights to flicker mode (default: false)
+  # Useful for debugging light animation
+  force_flicker: false
