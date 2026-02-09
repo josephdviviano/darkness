@@ -590,6 +590,7 @@ inline void blendAnimatedLightmap(
             }
         }
     }
+
 }
 
 } // namespace Opde
