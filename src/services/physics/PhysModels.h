@@ -29,7 +29,7 @@
 
 #include "DarkCommon.h"
 
-namespace Opde {
+namespace Darkness {
 class PhysicsService;
 class PhysModel;
 
@@ -70,6 +70,6 @@ private:
     /// Owning service of this object
     PhysicsService *mOwner;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

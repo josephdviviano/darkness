@@ -32,15 +32,15 @@
 
 #include "config.h"
 
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "ServiceCommon.h"
 #include "SharedPtr.h"
 #include "link/LinkCommon.h"
 #include "input/InputCommon.h"
 #include "sim/SimCommon.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** @brief Player service. Service that handles the player object (and input)
  */
@@ -104,6 +104,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

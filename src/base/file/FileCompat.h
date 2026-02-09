@@ -35,7 +35,7 @@
 #include "Vector3.h"
 #include "config.h"
 
-namespace Opde {
+namespace Darkness {
 // Vector2
 File &operator<<(File &st, const Vector2 &val);
 File &operator>>(File &st, Vector2 &val);
@@ -51,6 +51,6 @@ File &operator>>(File &st, Plane &val);
 // Quaternion
 File &operator<<(File &st, const Quaternion &val);
 File &operator>>(File &st, Quaternion &val);
-} // namespace Opde
+} // namespace Darkness
 
 #endif

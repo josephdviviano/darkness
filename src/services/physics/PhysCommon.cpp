@@ -26,7 +26,7 @@
 #include "FileCompat.h"
 #include "integers.h"
 
-namespace Opde {
+namespace Darkness {
 	/*----------------------------------------------------*/
 	/*----------------- PhysCompat helpers ---------------*/
 	/*----------------------------------------------------*/

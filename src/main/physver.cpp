@@ -27,7 +27,7 @@
 #include "FileGroup.h"
 #include "integers.h"
 
-using namespace Opde;
+using namespace Darkness;
 
 void usage(const char *message = NULL) {
     if (message)

@@ -34,7 +34,7 @@
 #pragma warning(disable : 4996)
 #endif
 
-namespace Opde {
+namespace Darkness {
 
 template <> Tracer *Singleton<Tracer>::ms_Singleton = 0;
 
@@ -125,4 +125,4 @@ void Tracer::tracePoint(const char *text) {
     mTraces.push_back(trace);
 }
 
-} // namespace Opde
+} // namespace Darkness

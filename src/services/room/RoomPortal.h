@@ -34,7 +34,7 @@
 #include "Plane.h"
 #include "Vector3.h"
 
-namespace Opde {
+namespace Darkness {
 /** @brief A room portal. Room portals connect two Room instances (doorways)
  */
 class RoomPortal {
@@ -84,6 +84,6 @@ private:
 
 /// Shared pointer to a room portal instance
 typedef shared_ptr<RoomPortal> RoomPortalPtr;
-} // namespace Opde
+} // namespace Darkness
 
 #endif

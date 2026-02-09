@@ -27,11 +27,11 @@
 
 #include "config.h"
 
-#include "OpdeService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessService.h"
+#include "DarknessServiceManager.h"
 #include "PlatformService.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** @brief A platform. OS specific piece of code used to handle configuration
  * and data paths.
@@ -55,6 +55,6 @@ protected:
     PlatformService *mOwner;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

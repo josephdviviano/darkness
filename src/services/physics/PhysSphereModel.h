@@ -26,7 +26,7 @@
 
 #include "PhysModel.h"
 
-namespace Opde {
+namespace Darkness {
 /** @brief Spherical physics model.
  * Model that is consisted of a sphere.
  */
@@ -35,6 +35,6 @@ public:
     PhysSphereModel(int objid);
     ~PhysSphereModel();
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

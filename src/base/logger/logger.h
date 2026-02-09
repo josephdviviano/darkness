@@ -27,11 +27,11 @@
 
 #include "config.h"
 
-#include "OpdeSingleton.h"
+#include "DarknessSingleton.h"
 #include <set>
 #include <string>
 
-namespace Opde {
+namespace Darkness {
 // Forward declaration
 class LogListener;
 
@@ -113,23 +113,23 @@ public:
 
 // Printf-like logging helping defines
 #define LOG_FATAL(...)                                                         \
-    ::Opde::Logger::getSingleton().log(::Opde::Logger::LOG_LEVEL_FATAL,        \
+    ::Darkness::Logger::getSingleton().log(::Darkness::Logger::LOG_LEVEL_FATAL,        \
                                        __VA_ARGS__)
 #define LOG_ERROR(...)                                                         \
-    ::Opde::Logger::getSingleton().log(::Opde::Logger::LOG_LEVEL_ERROR,        \
+    ::Darkness::Logger::getSingleton().log(::Darkness::Logger::LOG_LEVEL_ERROR,        \
                                        __VA_ARGS__)
 #define LOG_INFO(...)                                                          \
-    ::Opde::Logger::getSingleton().log(::Opde::Logger::LOG_LEVEL_INFO,         \
+    ::Darkness::Logger::getSingleton().log(::Darkness::Logger::LOG_LEVEL_INFO,         \
                                        __VA_ARGS__)
 
 // the debug+verbose loggers are conditionaly built in when the DEBUG flag is
 // defined
-#ifdef OPDE_DEBUG
+#ifdef DARKNESS_DEBUG
 #define LOG_DEBUG(...)                                                         \
-    ::Opde::Logger::getSingleton().log(::Opde::Logger::LOG_LEVEL_DEBUG,        \
+    ::Darkness::Logger::getSingleton().log(::Darkness::Logger::LOG_LEVEL_DEBUG,        \
                                        __VA_ARGS__)
 #define LOG_VERBOSE(...)                                                       \
-    ::Opde::Logger::getSingleton().log(::Opde::Logger::LOG_LEVEL_VERBOSE,      \
+    ::Darkness::Logger::getSingleton().log(::Darkness::Logger::LOG_LEVEL_VERBOSE,      \
                                        __VA_ARGS__)
 #else
 #define LOG_DEBUG(...)
@@ -142,37 +142,37 @@ public:
 // based on the compiler type...
 #if defined(GCC)
 #define STUB_WARN()                                                            \
-    ::Opde::Logger::getSingleton().log(                                        \
-        ::Opde::Logger::LOG_LEVEL_ERROR,                                       \
+    ::Darkness::Logger::getSingleton().log(                                        \
+        ::Darkness::Logger::LOG_LEVEL_ERROR,                                       \
         "STUB Warning: %s[%d]: '%s' is a stub.", __FILE__, __LINE__,           \
         __PRETTY_FUNCTION__)
 #define STUB_WARN_TXT(reason)                                                  \
-    ::Opde::Logger::getSingleton().log(                                        \
-        ::Opde::Logger::LOG_LEVEL_ERROR,                                       \
+    ::Darkness::Logger::getSingleton().log(                                        \
+        ::Darkness::Logger::LOG_LEVEL_ERROR,                                       \
         "STUB Warning: %s[%d]: '%s' is a stub. Reason: %s", __FILE__,          \
         __LINE__, __PRETTY_FUNCTION__, reason)
 #elif defined(_MSC_VER)
 #define STUB_WARN()                                                            \
-    ::Opde::Logger::getSingleton().log(                                        \
-        ::Opde::Logger::LOG_LEVEL_ERROR,                                       \
+    ::Darkness::Logger::getSingleton().log(                                        \
+        ::Darkness::Logger::LOG_LEVEL_ERROR,                                       \
         "STUB Warning: %s[%d]: '%s' is a stub.", __FILE__, __LINE__,           \
         __FUNCSIG__)
 #define STUB_WARN_TXT(reason)                                                  \
-    ::Opde::Logger::getSingleton().log(                                        \
-        ::Opde::Logger::LOG_LEVEL_ERROR,                                       \
+    ::Darkness::Logger::getSingleton().log(                                        \
+        ::Darkness::Logger::LOG_LEVEL_ERROR,                                       \
         "STUB Warning: %s[%d]: '%s' is a stub. Reason: %s", __FILE__,          \
         __LINE__, __FUNCSIG__, reason)
 #else
 #define STUB_WARN()                                                            \
-    ::Opde::Logger::getSingleton().log(::Opde::Logger::LOG_LEVEL_ERROR,        \
+    ::Darkness::Logger::getSingleton().log(::Darkness::Logger::LOG_LEVEL_ERROR,        \
                                        "STUB Warning: %s[%d]", __FILE__,       \
                                        __LINE__)
 #define STUB_WARN_TXT(reason)                                                  \
-    ::Opde::Logger::getSingleton().log(::Opde::Logger::LOG_LEVEL_ERROR,        \
+    ::Darkness::Logger::getSingleton().log(::Darkness::Logger::LOG_LEVEL_ERROR,        \
                                        "STUB Warning: %s[%d].  Reason: %s",    \
                                        __FILE__, __LINE__, reason)
 #endif
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

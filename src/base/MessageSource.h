@@ -32,7 +32,7 @@
 #include "DarkCommon.h"
 #include "SharedPtr.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** Message Source - a message sending class template.
  * M stands for the message type sended
@@ -87,6 +87,6 @@ public:
     }
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -29,11 +29,11 @@
 #include "integers.h"
 #include "RGBAQuad.h"
 
-namespace Opde {
+namespace Darkness {
 
 extern RGBAQuad sLGPalette[256];
 extern RGBAQuad sAAPalette[256];
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

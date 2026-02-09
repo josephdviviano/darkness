@@ -1,5 +1,5 @@
-# opdeRender configuration
-# Copy this file to opdeRender.yaml in your working directory.
+# darknessRender configuration
+# Copy this file to darknessRender.yaml in your working directory.
 # CLI flags override any values set here.
 
 graphics:

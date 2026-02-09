@@ -26,7 +26,7 @@
 #include "InheritServiceBinder.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -37,7 +37,7 @@ const char *InheritQueryResultBinder::msName = "InheritQueryResult";
 PyTypeObject InheritQueryResultBinder::msType = {
     PyVarObject_HEAD_INIT(
         &PyType_Type,
-        0) "opde.services.InheritQueryResult", /* char *tp_name; */
+        0) "darkness.services.InheritQueryResult", /* char *tp_name; */
     sizeof(InheritQueryResultBinder::Base),  /* int tp_basicsize; */
     0, // int tp_itemsize;       /* not used much */
     InheritQueryResultBinder::dealloc, /* destructor tp_dealloc; */
@@ -125,4 +125,4 @@ void InheritQueryResultBinder::init(PyObject *module) {
 
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

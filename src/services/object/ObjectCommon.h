@@ -23,7 +23,7 @@
 #ifndef __OBJECTCOMMON_H
 #define __OBJECTCOMMON_H
 
-namespace Opde {
+namespace Darkness {
 
 /// Object system broadcasted message types
 typedef enum {
@@ -53,6 +53,6 @@ struct ObjectServiceMsg {
     int maxObjID;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif /* __OBJECTCOMMON_H */

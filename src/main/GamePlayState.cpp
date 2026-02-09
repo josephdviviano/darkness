@@ -47,19 +47,19 @@
 
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 
 template <> GamePlayState *Singleton<GamePlayState>::ms_Singleton = 0;
 
 GamePlayState::GamePlayState() : mSceneMgr(NULL), mToLoadScreen(true) {
     /// Register as a command listener, so we can load different levels
-    Opde::ConsoleBackend::getSingleton().registerCommandListener(
+    Darkness::ConsoleBackend::getSingleton().registerCommandListener(
         "load", dynamic_cast<ConsoleCommandListener *>(this));
-    Opde::ConsoleBackend::getSingleton().setCommandHint(
+    Darkness::ConsoleBackend::getSingleton().setCommandHint(
         "load", "Loads a specified mission file");
-    Opde::ConsoleBackend::getSingleton().registerCommandListener(
+    Darkness::ConsoleBackend::getSingleton().registerCommandListener(
         "fps", dynamic_cast<ConsoleCommandListener *>(this));
-    Opde::ConsoleBackend::getSingleton().setCommandHint("fps",
+    Darkness::ConsoleBackend::getSingleton().setCommandHint("fps",
                                                         "Dump FPS stats");
 
     mRotateSpeed = 500;
@@ -117,7 +117,7 @@ void GamePlayState::start() {
     inputSrv->processCommand("bind ` show_console");
 
     if (posPG == NULL)
-        OPDE_EXCEPT("Could not get Position property. Not defined. Fatal");
+        DARKNESS_EXCEPT("Could not get Position property. Not defined. Fatal");
 
     LOG_DEBUG("Starting Point object id : %d", StartingPointObjID);
 
@@ -169,8 +169,8 @@ void GamePlayState::start() {
     if (mConfigService->hasParam("debug")) {
         if (mConfigService->getParam("debug") == true) {
             // enable verbose logging
-            ::Opde::Logger::getSingleton().setLogLevel(
-                ::Opde::Logger::LOG_LEVEL_VERBOSE);
+            ::Darkness::Logger::getSingleton().setLogLevel(
+                ::Darkness::Logger::LOG_LEVEL_VERBOSE);
         }
     }
 
@@ -365,7 +365,7 @@ void GamePlayState::bootstrapFinished() {
     mPlayerFactoryRelation = mLinkService->getRelation("PlayerFactory");
 
     if (!mPlayerFactoryRelation)
-        OPDE_EXCEPT("PlayerFactory relation not found. Fatal.");
+        DARKNESS_EXCEPT("PlayerFactory relation not found. Fatal.");
 
     mPlayerFactoryListenerID =
         mPlayerFactoryRelation->registerListener(metaPropCallback);
@@ -379,4 +379,4 @@ GamePlayState &GamePlayState::getSingleton() {
 
 GamePlayState *GamePlayState::getSingletonPtr() { return ms_Singleton; }
 
-} // namespace Opde
+} // namespace Darkness

@@ -24,7 +24,7 @@
 #ifndef __PHYSCONTROLS_H
 #define __PHYSCONTROLS_H
 
-namespace Opde {
+namespace Darkness {
 /** @brief Physics controls. Represents the controls placed on an object
  * physics. Three different controls are possible:
  * * Axis Velocity (In local space of the object)
@@ -40,6 +40,6 @@ public:
     void read(const FilePtr &sf);
     void write(const FilePtr &sf);
 };
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

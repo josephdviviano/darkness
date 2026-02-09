@@ -1,7 +1,7 @@
 /******************************************************************************
  *
  *    This file is part of openDarkEngine project
- *    Copyright (C) 2009 openDarkEngine team
+ *    Copyright (C) 2005-2006 openDarkEngine team
  *
  *    This program is free software; you can redistribute it and/or modify
  *    it under the terms of the GNU General Public License as published by
@@ -18,32 +18,36 @@
  *    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
  *
- *	  $Id$
+ *		$Id$
  *
  *****************************************************************************/
 
-// This source code is a fixed and maintained version of the Null render system written by xyzzy@ogre3d.org forum
+#ifndef __DARKNESS_LOGCONNECTOR_H
+#define __DARKNESS_LOGCONNECTOR_H
 
-#ifndef __NULLGPUPROGRAM_H
-#define __NULLGPUPROGRAM_H
+#include "config.h"
 
-#include "stdafx.h"
+#include "logger.h"
 
-namespace Ogre {
+#include <OgreLog.h>
 
-	class NULLHardwareBufferManager: public HardwareBufferManager {
-		HardwareVertexBufferSharedPtr createVertexBuffer(size_t vertexSize,
-				size_t numVerts, HardwareBuffer::Usage usage, bool useShadowBuffer =
-						false);
-		HardwareIndexBufferSharedPtr createIndexBuffer(
-				HardwareIndexBuffer::IndexType itype, size_t numIndexes,
-				HardwareBuffer::Usage usage, bool useShadowBuffer = false);
-	
-		RenderToVertexBufferSharedPtr createRenderToVertexBuffer();
-	};
-	
-	
-	
-}
+namespace Darkness {
+
+/** Darkness log connector
+ * log messages */
+class DarknessLogConnector : public Ogre::LogListener {
+protected:
+    Logger *mDarknessLogger;
+
+public:
+    DarknessLogConnector(Logger *darknessLogger);
+    virtual ~DarknessLogConnector();
+
+    virtual void messageLogged(const Ogre::String &message,
+                               Ogre::LogMessageLevel lml, bool maskDebug,
+                               const Ogre::String &logName,
+                               bool &skipThisMessage);
+};
+} // namespace Darkness
 
 #endif

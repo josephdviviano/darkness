@@ -24,7 +24,7 @@
 
 #include "Vector3.h"
 
-namespace Opde {
+namespace Darkness {
 
 struct Plane {
     enum Side {
@@ -56,6 +56,6 @@ struct Plane {
     }
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -29,21 +29,21 @@
 
 #include "Root.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
-/// Opde::Root python binder
-class RootBinder : public class_ptr_binder<Opde::Root> {
+/// Darkness::Root python binder
+class RootBinder : public class_ptr_binder<Darkness::Root> {
 public:
     // --- Python type related methods ---
     /// to string - reprfunc conversion
     static PyObject *repr(PyObject *self);
 
-    /// creates a python object representation of the Opde::Root object
+    /// creates a python object representation of the Darkness::Root object
     static PyObject *create(Root *root);
 
-    /// Initializes the opde.Root object (type)
+    /// Initializes the darkness.Root object (type)
     static void init(PyObject *module);
 
     // methods:
@@ -73,6 +73,6 @@ protected:
     static PyMethodDef msMethods[];
 };
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -40,7 +40,7 @@
 #include "config.h"
 #include "integers.h"
 
-namespace Opde {
+namespace Darkness {
 /** @brief A single Room. Rooms are space bounded elements that are used
  * for sound propagation, path finding and as a script message sources.
  */
@@ -107,6 +107,6 @@ private:
 
 /// Shared pointer to a room instance
 typedef shared_ptr<Room> RoomPtr;
-} // namespace Opde
+} // namespace Darkness
 
 #endif

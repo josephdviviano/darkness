@@ -29,7 +29,7 @@
 #include <string>
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 
 /** Minimal .dtype parser that computes struct sizes.
  *
@@ -334,6 +334,6 @@ inline std::map<std::string, int> parseDTypeSizes(const std::string &filename) {
     return sizes;
 }
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif // __DTYPESIZEPARSER_H

@@ -11,7 +11,7 @@ $Id$
 
 #include <OgreSubEntity.h>
 
-using namespace Opde;
+using namespace Darkness;
 using namespace Ogre;
 
 SubEntityMaterialInstance::SubEntityMaterialInstance(SubEntity *se)

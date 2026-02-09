@@ -34,7 +34,7 @@
 #include <OgreVector2.h>
 #include <OgreVector3.h>
 
-namespace Opde {
+namespace Darkness {
 /// Forward decl. (ownership)
 class DrawService;
 class TextureAtlas;
@@ -390,6 +390,6 @@ typedef enum { DPF_MONO, DPF_8BIT, DPF_RGBA } DarkPixelFormat;
 // them into sets for example
 bool operator<(const DrawSheetPtr &a, const DrawSheetPtr &b);
 
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

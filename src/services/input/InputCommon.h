@@ -30,7 +30,7 @@ struct SDL_KeyboardEvent;
 struct SDL_MouseMotionEvent;
 struct SDL_MouseButtonEvent;
 
-namespace Opde {
+namespace Darkness {
 
 /// Input event types
 enum InputEventType {
@@ -131,6 +131,6 @@ public:
     virtual bool mouseReleased(const SDL_MouseButtonEvent &e) = 0;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif /* __INPUTCOMMON_H */

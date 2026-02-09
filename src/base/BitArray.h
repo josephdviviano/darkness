@@ -28,9 +28,9 @@
 #include <cassert>
 #include <string.h>
 
-#include "OpdeException.h"
+#include "DarknessException.h"
 
-namespace Opde {
+namespace Darkness {
 /** Bit array supporting negative and positive indices. Maps a single boolean
  * value */
 class BitArray {
@@ -114,10 +114,10 @@ public:
     bool getBit(int index) const {
         // look if we are in bounds
         if (index < mMinIndex)
-            OPDE_ARRAY_EXCEPT("Index out of bounds");
+            DARKNESS_ARRAY_EXCEPT("Index out of bounds");
 
         if (index > mMaxIndex)
-            OPDE_ARRAY_EXCEPT("Index out of bounds");
+            DARKNESS_ARRAY_EXCEPT("Index out of bounds");
 
         // depending on the index sign, we either access negative
         // or positive array
@@ -145,10 +145,10 @@ public:
     bool setBit(int index, bool value) {
         // look if we are in bounds
         if (index < mMinIndex)
-            OPDE_ARRAY_EXCEPT("BitArray: Index out of bounds");
+            DARKNESS_ARRAY_EXCEPT("BitArray: Index out of bounds");
 
         if (index > mMaxIndex)
-            OPDE_ARRAY_EXCEPT("BitArray: Index out of bounds");
+            DARKNESS_ARRAY_EXCEPT("BitArray: Index out of bounds");
 
         // remap the id
         unsigned char *arrayRef;
@@ -231,7 +231,7 @@ public:
     /// grows the min index part only
     void growMinIndex(int min) {
         if (min > 0)
-            OPDE_ARRAY_EXCEPT(
+            DARKNESS_ARRAY_EXCEPT(
                 "BitArray: Min index has to be equal to zero or less");
 
         growBuf(&mNegativeArray, -mMinIndex, -min);
@@ -241,7 +241,7 @@ public:
     /// grows the max index part only
     void growMaxIndex(int max) {
         if (max < 0)
-            OPDE_ARRAY_EXCEPT(
+            DARKNESS_ARRAY_EXCEPT(
                 "BitArray: Max index has to be greater or equal to zero");
 
         growBuf(&mPositiveArray, mMaxIndex, max);
@@ -279,7 +279,7 @@ protected:
     /// grows the specified buffer to accompany the new size
     void growBuf(unsigned char **ptr, int oldIndex, int newIndex) {
         if (newIndex < oldIndex)
-            OPDE_ARRAY_EXCEPT("BitArray: Shrinking not allowed");
+            DARKNESS_ARRAY_EXCEPT("BitArray: Shrinking not allowed");
 
         size_t oldByteSize;
         if (oldIndex < 0)
@@ -300,7 +300,7 @@ protected:
         unsigned char *newptr = (unsigned char *)(realloc(*ptr, newByteSize));
 
         if (newptr == NULL) // realloc failed
-            OPDE_ARRAY_EXCEPT("BitArray: Growth failed");
+            DARKNESS_ARRAY_EXCEPT("BitArray: Growth failed");
 
         *ptr = newptr;
 
@@ -327,6 +327,6 @@ protected:
     int mMinIndex, mMaxIndex;
 };
 
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif // __BITARRAY_H

@@ -24,7 +24,7 @@
 
 #include <cmath>
 
-namespace Opde {
+namespace Darkness {
 
 struct Matrix3 {
     float m[3][3];
@@ -75,6 +75,6 @@ struct Matrix3 {
     }
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

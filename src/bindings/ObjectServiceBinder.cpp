@@ -22,12 +22,12 @@
  *
  *****************************************************************************/
 
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "ObjectServiceBinder.h"
 #include "object/ObjectService.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -37,7 +37,7 @@ const char *ObjectServiceBinder::msName = "ObjectService";
 // ------------------------------------------
 PyTypeObject ObjectServiceBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.ObjectService", // char *tp_name; */
+                          0) "darkness.services.ObjectService", // char *tp_name; */
     sizeof(ObjectServiceBinder::Base), // int tp_basicsize; */
     0,                            // int tp_itemsize;       /* not used much */
     ObjectServiceBinder::dealloc, // destructor tp_dealloc; */
@@ -441,4 +441,4 @@ void ObjectServiceBinder::init(PyObject *module) {
 }
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

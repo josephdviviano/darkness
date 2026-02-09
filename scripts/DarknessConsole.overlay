@@ -1,8 +1,8 @@
-Opde/Console
+Darkness/Console
 {
 	zorder 600
 
-	container BorderPanel(Opde/ConsolePanel)
+	container BorderPanel(Darkness/ConsolePanel)
 	{
 		metrics_mode relative
 		vert_align top
@@ -10,9 +10,9 @@ Opde/Console
 		top 0
 		width 1
 		height 0.5
-		material Opde/Console
+		material Darkness/Console
 
-		element TextArea(Opde/ConsoleText)
+		element TextArea(Darkness/ConsoleText)
 		{
 			metrics_mode pixels
 			left 0
@@ -24,7 +24,7 @@ Opde/Console
 			colour_bottom 1 1 1
 		}
 		
-		element TextArea(Opde/CommandLine)
+		element TextArea(Darkness/CommandLine)
 		{
 			metrics_mode pixels
 			vert_align bottom

@@ -32,7 +32,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 
 // Minimal GIF LZW decompressor for single-frame paletted images
 inline DecodedImage decodeGIF(const uint8_t *data, size_t size) {
@@ -343,4 +343,4 @@ done:
     return img;
 }
 
-} // namespace Opde
+} // namespace Darkness

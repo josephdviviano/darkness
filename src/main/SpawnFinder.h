@@ -34,7 +34,7 @@
 #include <cstdio>
 #include <string>
 
-namespace Opde {
+namespace Darkness {
 
 // Result of spawn point search
 struct SpawnInfo {
@@ -158,4 +158,4 @@ inline SpawnInfo findSpawnPoint(const std::string &misPath) {
     return info;
 }
 
-} // namespace Opde
+} // namespace Darkness

@@ -28,7 +28,7 @@
 #include "property/PropertyService.h"
 #include "EntityInfo.h"
 
-namespace Opde {
+namespace Darkness {
 
 /*--------------------------------------------------------*/
 /*-------------------- RenderTypeProperty ----------------*/
@@ -59,7 +59,7 @@ void RenderTypeProperty::addProperty(int oid) {
     Variant val;
 
     if (!get(oid, "", val))
-        OPDE_EXCEPT("Property not defined for object.");
+        DARKNESS_EXCEPT("Property not defined for object.");
 
     setRenderType(oid, val.toUInt());
 };
@@ -88,4 +88,4 @@ void RenderTypeProperty::setRenderType(int oid, uint32_t renderType) {
     EntityInfo *ei = getEntityInfo(oid);
     ei->setRenderType(renderType);
 };
-}; // namespace Opde
+}; // namespace Darkness

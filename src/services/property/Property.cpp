@@ -23,12 +23,12 @@
  *****************************************************************************/
 
 #include "Property.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "inherit/InheritService.h"
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 // --------------------------------------------------------------------------
 Property::Property(PropertyService *owner, const std::string &name,
@@ -335,4 +335,4 @@ void ActiveProperty::onPropertyModification(const InheritValueChangeMsg &msg) {
         return;
     }
 }
-} // namespace Opde
+} // namespace Darkness

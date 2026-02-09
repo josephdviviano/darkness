@@ -27,7 +27,7 @@
 
 #include "config.h"
 
-#include "OpdeService.h"
+#include "DarknessService.h"
 #include "ServiceCommon.h"
 #include "sim/SimService.h"
 
@@ -35,7 +35,7 @@ namespace Ogre {
 class Camera;
 } // namespace Ogre
 
-namespace Opde {
+namespace Darkness {
 
 class Variant;
 struct InputEventMsg;
@@ -172,6 +172,6 @@ public:
 private:
     static std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

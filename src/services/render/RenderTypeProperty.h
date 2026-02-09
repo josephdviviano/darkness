@@ -28,7 +28,7 @@
 #include "RenderedProperty.h"
 #include "RenderCommon.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** a RenderType property implementation using rendered property handler.
  * Uses simple unsigned integer data storage with an enumeration. Defaults to 0
@@ -62,6 +62,6 @@ protected:
     Ogre::SceneManager *mSceneMgr;
     std::unique_ptr<Enumeration> mEnum;
 };
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

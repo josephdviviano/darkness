@@ -1,9 +1,9 @@
 // Ogre overlay scripts
-Opde/OpdeDebugOverlay
+Darkness/DarknessDebugOverlay
 {
 	zorder 500
 	// Stats block
-	container BorderPanel(Opde/OpdeStatPanel)
+	container BorderPanel(Darkness/DarknessStatPanel)
 	{
 		metrics_mode pixels
 		vert_align top
@@ -13,7 +13,7 @@ Opde/OpdeDebugOverlay
 		height 160
 
 		    
-		element TextArea(Opde/Title)
+		element TextArea(Darkness/Title)
 		{
 			metrics_mode pixels
 			left 5
@@ -27,7 +27,7 @@ Opde/OpdeDebugOverlay
 			colour_bottom 1 1 0.7
 		}
 		
-		element TextArea(Opde/BackCulls)
+		element TextArea(Darkness/BackCulls)
 		{
 			metrics_mode pixels
 			left 5
@@ -40,7 +40,7 @@ Opde/OpdeDebugOverlay
 			colour_top 0.5 0.7 0.5
 			colour_bottom 0.3 0.5 0.3
 		}
-		element TextArea(Opde/EvalPorts)
+		element TextArea(Darkness/EvalPorts)
 		{
 			metrics_mode pixels
 			left 5
@@ -53,7 +53,7 @@ Opde/OpdeDebugOverlay
 			colour_top 0.5 0.7 0.5
 			colour_bottom 0.3 0.5 0.3
 		}
-		element TextArea(Opde/RendCells)
+		element TextArea(Darkness/RendCells)
 		{
 			metrics_mode pixels
 			left 5
@@ -67,7 +67,7 @@ Opde/OpdeDebugOverlay
 			colour_bottom 0.3 0.5 0.3
 		}
 				
-		element TextArea(Opde/TravTime)
+		element TextArea(Darkness/TravTime)
 		{
 			metrics_mode pixels
 			left 5
@@ -81,7 +81,7 @@ Opde/OpdeDebugOverlay
 			colour_bottom 0.3 0.5 0.3
 		}
 		
-		element TextArea(Opde/StaticRenderTime)
+		element TextArea(Darkness/StaticRenderTime)
 		{
 			metrics_mode pixels
 			left 5
@@ -95,7 +95,7 @@ Opde/OpdeDebugOverlay
 			colour_bottom 0.3 0.5 0.3
 		}
 
-		element TextArea(Opde/VisibleObjectsTime)
+		element TextArea(Darkness/VisibleObjectsTime)
 		{
 			metrics_mode pixels
 			left 5
@@ -109,7 +109,7 @@ Opde/OpdeDebugOverlay
 			colour_bottom 0.3 0.5 0.3
 		}
 		
-		element TextArea(Opde/LightListTime)
+		element TextArea(Darkness/LightListTime)
 		{
 			metrics_mode pixels
 			left 5
@@ -123,7 +123,7 @@ Opde/OpdeDebugOverlay
 			colour_bottom 0.3 0.5 0.3
 		}
 
-		element TextArea(Opde/LightCount)
+		element TextArea(Darkness/LightCount)
 		{
 			metrics_mode pixels
 			left 5
@@ -137,7 +137,7 @@ Opde/OpdeDebugOverlay
 			colour_bottom 0.3 0.5 0.3
 		}
 
-		element TextArea(Opde/SceneGraphTime)
+		element TextArea(Darkness/SceneGraphTime)
 		{
 			metrics_mode pixels
 			left 5

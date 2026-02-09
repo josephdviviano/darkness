@@ -36,19 +36,19 @@
 
 #include "File.h"
 #include "FileCompat.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "WRCommon.h"
 #include "integers.h"
 #include "logger.h"
 #include "database/DatabaseService.h"
 #include "light/LightService.h"
 #include "render/RenderService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "WRCell.h"
 
 // #define __SG
 
-namespace Opde {
+namespace Darkness {
 /*----------------------------------------------------*/
 /*----------------- WorldRep Service -----------------*/
 /*----------------------------------------------------*/
@@ -57,7 +57,7 @@ const size_t ServiceImpl<WorldRepService>::SID = __SERVICE_ID_WORLDREP;
 
 WorldRepService::WorldRepService(ServiceManager *manager,
                                  const std::string &name)
-    : ServiceImpl<Opde::WorldRepService>(manager, name), mNumCells(0) {
+    : ServiceImpl<Darkness::WorldRepService>(manager, name), mNumCells(0) {
     // ResourceGroupManager::getSingleton().setWorldResourceGroupName(TEMPTEXTURE_RESOURCE_GROUP);
 }
 
@@ -128,7 +128,7 @@ void WorldRepService::onDBLoad(const FileGroupPtr &db, uint32_t curmask) {
         wrChunk = db->getFile("WRRGB");
     } else {
         // Still no data?
-        OPDE_EXCEPT("Could not find WR nor WRRGB chunk...");
+        DARKNESS_EXCEPT("Could not find WR nor WRRGB chunk...");
     }
 
     loadFromChunk(wrChunk, lightSize);
@@ -388,4 +388,4 @@ const uint WorldRepServiceFactory::getMask() {
 }
 
 const size_t WorldRepServiceFactory::getSID() { return WorldRepService::SID; }
-} // namespace Opde
+} // namespace Darkness

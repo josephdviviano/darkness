@@ -28,8 +28,8 @@
 #include <memory>
 
 #include "DarkCommon.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "RoomCommon.h"
 #include "ServiceCommon.h"
 #include "SharedPtr.h"
@@ -37,7 +37,7 @@
 #include "config.h"
 #include "database/DatabaseCommon.h"
 
-namespace Opde {
+namespace Darkness {
 /** @brief Room service - service providing a Room database.
  * Room database is a high level system that classifies object positions into
  * 'rooms'.
@@ -156,6 +156,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -26,7 +26,7 @@
 
 #include "config.h"
 
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "SharedPtr.h"
 #include "integers.h"
 #include <fstream>
@@ -35,7 +35,7 @@
 // will split those to fit into the buffers
 #define MEMORY_FILE_BUF_LEN 64000
 
-namespace Opde {
+namespace Darkness {
 
 /** File error reasons. Will probably grow as needed */
 enum FileError {
@@ -57,7 +57,7 @@ typedef std::streamoff file_offset_t;
 typedef std::streampos file_pos_t;
 
 /** File access exception. */
-class FileException : public Opde::BasicException {
+class FileException : public Darkness::BasicException {
 protected:
     FileError error;
 
@@ -75,8 +75,8 @@ public:
 };
 
 /** A usage - simplifying macro for FileException */
-#define OPDE_FILEEXCEPT(err, desc, src)                                        \
-    throw(Opde::FileException(err, desc, src, __FILE__, __LINE__))
+#define DARKNESS_FILEEXCEPT(err, desc, src)                                        \
+    throw(Darkness::FileException(err, desc, src, __FILE__, __LINE__))
 
 /** Abstract file access class. Provides data manipulation methods.
  * The class is exception based, that means, any error happening while
@@ -251,7 +251,7 @@ protected:
 
 public:
     /** Constructor. Initializes the write access to the specified file
-     * @throw Opde::FileException if the mode is not FILE_WRITE, or file cannot
+     * @throw Darkness::FileException if the mode is not FILE_WRITE, or file cannot
      * be opened for writing
      */
     StdFile(const std::string &name, AccessMode mode);
@@ -423,6 +423,6 @@ private:
     /** eof indicator */
     bool mEof;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

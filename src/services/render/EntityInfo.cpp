@@ -29,7 +29,7 @@
 
 #include <OgreEntity.h>
 
-namespace Opde {
+namespace Darkness {
 
 /*--------------------------------------------------------*/
 /*--------------------- EntityInfo -----------------------*/
@@ -127,4 +127,4 @@ void EntityInfo::refreshVisibility() {
 };
 
 
-} // namespace Opde
+} // namespace Darkness

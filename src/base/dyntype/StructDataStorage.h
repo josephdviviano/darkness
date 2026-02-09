@@ -35,7 +35,7 @@
 #include "Iterator.h"
 #include "Serializer.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** Common ancestor template for all the struct based data storages. Template
  * parameter is the struct name. To use this, one must expose all the fields of
@@ -364,6 +364,6 @@ protected:
 
     size_t mStoredSize;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

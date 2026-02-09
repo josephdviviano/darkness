@@ -32,7 +32,7 @@
 #include "draw/TextureAtlas.h"
 #include "input/InputService.h"
 
-namespace Opde {
+namespace Darkness {
 /// forward decl.
 class GUIService;
 
@@ -81,6 +81,6 @@ private:
     std::vector<Ogre::ColourValue> mConsoleColors;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

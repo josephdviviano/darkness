@@ -26,7 +26,7 @@
 #include "Room.h"
 #include "RoomService.h"
 
-namespace Opde {
+namespace Darkness {
 /*----------------------------------------------------*/
 /*--------------------- RoomPortal -------------------*/
 /*----------------------------------------------------*/
@@ -96,4 +96,4 @@ void RoomPortal::clear() {
     mCenter = Vector3::ZERO;
     mDestPortal = 0;
 }
-} // namespace Opde
+} // namespace Darkness

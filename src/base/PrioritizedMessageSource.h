@@ -30,7 +30,7 @@
 #include "SharedPtr.h"
 #include <map>
 
-namespace Opde {
+namespace Darkness {
 
 /** Prioritized Message Source - a message source doing callbacks in a
  * deterministic order M stands for the message type sent
@@ -95,6 +95,6 @@ public:
     }
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

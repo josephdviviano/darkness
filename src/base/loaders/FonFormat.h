@@ -32,7 +32,7 @@
 #include "integers.h"
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 class File;
 
 struct DarkFontHeader {
@@ -208,6 +208,6 @@ static const uint32_t AntiAliasedColorTable[] = {
     0xAAAAAA, 0x999999, 0x888888, 0x777777, 0x666666, 0x555555, 0x444444,
     0x333333, 0x222222, 0x111111, 0x000000};
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif //__FONFORMAT_H

@@ -25,7 +25,7 @@
 #include "FontDrawSourceBinder.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -35,7 +35,7 @@ const char *FontDrawSourceBinder::msName = "FontDrawSource";
 // ------------------------------------------
 PyTypeObject FontDrawSourceBinder::msType = {
     PyVarObject_HEAD_INIT(
-        &PyType_Type, 0) "opde.services.FontDrawSource", // char *tp_name; */
+        &PyType_Type, 0) "darkness.services.FontDrawSource", // char *tp_name; */
     sizeof(FontDrawSourceBinder::Base),                // int tp_basicsize; */
     0,                             // int tp_itemsize;       /* not used much */
     FontDrawSourceBinder::dealloc, // destructor tp_dealloc; */
@@ -100,4 +100,4 @@ void FontDrawSourceBinder::init(PyObject *module) {
 }
 
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness

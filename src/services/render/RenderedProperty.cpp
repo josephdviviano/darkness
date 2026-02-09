@@ -25,7 +25,7 @@
 #include "RenderedProperty.h"
 #include "RenderService.h"
 
-namespace Opde {
+namespace Darkness {
 RenderedProperty::RenderedProperty(RenderService *rs, PropertyService *owner,
                                    const std::string &name,
                                    const std::string &chunk_name,
@@ -37,7 +37,7 @@ EntityInfo *RenderedProperty::getEntityInfo(int oid) {
     assert(ei);
 
     if (ei == NULL)
-        OPDE_EXCEPT("EntityInfo not found for object");
+        DARKNESS_EXCEPT("EntityInfo not found for object");
 
     return ei;
 };
@@ -47,8 +47,8 @@ Ogre::SceneNode *RenderedProperty::getSceneNode(int oid) {
     assert(sn);
 
     if (sn == NULL)
-        OPDE_EXCEPT("SceneNode not found for object");
+        DARKNESS_EXCEPT("SceneNode not found for object");
 
     return sn;
 };
-}; // namespace Opde
+}; // namespace Darkness

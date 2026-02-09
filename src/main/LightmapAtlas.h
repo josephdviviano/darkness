@@ -20,7 +20,7 @@
  *****************************************************************************/
 
 // Lightmap atlas packer — collects per-polygon lightmaps into GPU-friendly
-// atlas textures. Uses BSP-based rectangle packing (FreeSpaceInfo from OPDE).
+// atlas textures. Uses BSP-based rectangle packing (FreeSpaceInfo from original codebase).
 
 #pragma once
 
@@ -35,9 +35,9 @@
 #include <unordered_map>
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 
-// ── BSP-based 2D rectangle allocator (from OPDE FreeSpaceInfo.h) ──
+// ── BSP-based 2D rectangle allocator (from original codebase FreeSpaceInfo.h) ──
 
 class FreeSpaceInfo {
     std::unique_ptr<FreeSpaceInfo> mChild[2];
@@ -593,4 +593,4 @@ inline void blendAnimatedLightmap(
 
 }
 
-} // namespace Opde
+} // namespace Darkness

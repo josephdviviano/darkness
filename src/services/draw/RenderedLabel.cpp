@@ -29,7 +29,7 @@
 
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- RenderedLabel -----------------*/
@@ -176,4 +176,4 @@ void RenderedLabel::fillQuad(int x, int y, const unsigned char chr,
     ds->fillTexCoords(dq.texCoords);
 }
 
-} // namespace Opde
+} // namespace Darkness

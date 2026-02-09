@@ -43,7 +43,7 @@ class DarkGeometry;
 class DarkSceneManager;
 } // namespace Ogre
 
-namespace Opde {
+namespace Darkness {
 
 class WorldRepService;
 class LightsForCell;
@@ -204,6 +204,6 @@ public:
 
     LightsForCell *getLights() { return mLights.get(); }
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

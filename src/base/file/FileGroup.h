@@ -30,11 +30,11 @@
 #include <map>
 
 #include "File.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "SharedPtr.h"
 #include "darkdb.h"
 
-namespace Opde {
+namespace Darkness {
 //------------------------ group of files
 /** File group stored inside a single file. This is an abstract class for file
 group manipulation. For implementation see DarkFileGroup.
@@ -159,7 +159,7 @@ public:
 protected:
     /** Initialize the mFiles from the given file, throw an error if something
     goes wrong
-    @throw Opde::FileException if the source file contains errors
+    @throw Darkness::FileException if the source file contains errors
     */
     void _initSource();
 
@@ -169,6 +169,6 @@ protected:
     /** Source File header */
     DarkDBHeader mHeader;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

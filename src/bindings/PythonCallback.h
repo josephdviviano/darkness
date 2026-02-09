@@ -28,7 +28,7 @@
 #include "bindings.h"
 #include "Callback.h"
 
-namespace Opde {
+namespace Darkness {
 
 template<typename MSG, typename CVT>
 void call_python_callback(Python::Object &callable, const MSG &msg) {
@@ -61,7 +61,7 @@ public:
         if (!PyCallable_Check(mCallable))
             // WOULD BE: PyErr_SetString(PyExc_TypeError, "Python callback can't
             // be constructed on non-callable!");
-            OPDE_EXCEPT(
+            DARKNESS_EXCEPT(
                 "Python callback can't be constructed on non-callable!");
     };
 
@@ -75,6 +75,6 @@ protected:
     Python::Object mCallable;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

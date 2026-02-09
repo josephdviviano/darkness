@@ -23,8 +23,8 @@
 
 #include "ConfigService.h"
 #include "FileGroup.h"
-#include "OpdeException.h"
-#include "OpdeServiceManager.h"
+#include "DarknessException.h"
+#include "DarknessServiceManager.h"
 #include "logger.h"
 #include "platform/PlatformService.h"
 
@@ -33,7 +33,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- ConfigService -----------------*/
@@ -269,4 +269,4 @@ Service *ConfigServiceFactory::createInstance(ServiceManager *manager) {
     return new ConfigService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

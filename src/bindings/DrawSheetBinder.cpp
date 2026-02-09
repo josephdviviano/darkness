@@ -29,7 +29,7 @@
 
 #include "draw/DrawSheet.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -39,7 +39,7 @@ const char *DrawSheetBinder::msName = "DrawSheet";
 // ------------------------------------------
 PyTypeObject DrawSheetBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.DrawSheet", // char *tp_name; */
+                          0) "darkness.services.DrawSheet", // char *tp_name; */
     sizeof(DrawSheetBinder::Base),                    // int tp_basicsize; */
     0,                        // int tp_itemsize;       /* not used much */
     DrawSheetBinder::dealloc, // destructor tp_dealloc; */
@@ -261,4 +261,4 @@ void DrawSheetBinder::init(PyObject *module) {
 }
 
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness

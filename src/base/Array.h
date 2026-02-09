@@ -25,13 +25,13 @@
 #ifndef __ARRAY_H
 #define __ARRAY_H
 
-#include "OpdeException.h"
+#include "DarknessException.h"
 
 #include <cstdlib>
 #include <cassert>
 
 
-namespace Opde {
+namespace Darkness {
 /** A negative index capable, fixed size, growable array. Targetted at
  * per-object ID values.
  * @note Does not support holes - the whole array of stored values is
@@ -105,12 +105,12 @@ public:
     const T &operator[](int index) const {
         if (index < 0) {
             if (index + 1 < mMinIndex)
-                OPDE_ARRAY_EXCEPT("Array: Index out of bounds");
+                DARKNESS_ARRAY_EXCEPT("Array: Index out of bounds");
 
             return (mNegativeArray[-index - 1]);
         } else {
             if (index > mMaxIndex)
-                OPDE_ARRAY_EXCEPT("Array: Index out of bounds");
+                DARKNESS_ARRAY_EXCEPT("Array: Index out of bounds");
 
             return (mPositiveArray[index]);
         }
@@ -120,12 +120,12 @@ public:
     T &operator[](int index) {
         if (index < 0) {
             if (index + 1 < mMinIndex)
-                OPDE_ARRAY_EXCEPT("Array: Index out of bounds");
+                DARKNESS_ARRAY_EXCEPT("Array: Index out of bounds");
 
             return (mNegativeArray[-index - 1]);
         } else {
             if (index > mMaxIndex)
-                OPDE_ARRAY_EXCEPT("Array: Index out of bounds");
+                DARKNESS_ARRAY_EXCEPT("Array: Index out of bounds");
 
             return (mPositiveArray[index]);
         }
@@ -135,11 +135,11 @@ public:
     /// are removed
     void grow(int minIdx, int maxIdx) {
         if (minIdx > 0)
-            OPDE_ARRAY_EXCEPT(
+            DARKNESS_ARRAY_EXCEPT(
                 "Array: Min index has to be equal to zero or less");
 
         if (maxIdx < 0)
-            OPDE_ARRAY_EXCEPT(
+            DARKNESS_ARRAY_EXCEPT(
                 "Array: Max index has to be greater or equal to zero");
 
         // the only single place we have to increment - negative array does NOT
@@ -160,7 +160,7 @@ protected:
     void growBuf(T **ptr, int oldSize, int newSize) {
         if (newSize < oldSize) // if it would, we'd call placement destructor
                                // before realloc
-            OPDE_ARRAY_EXCEPT("Array: Shrinking not allowed");
+            DARKNESS_ARRAY_EXCEPT("Array: Shrinking not allowed");
 
         // just to be sure
         if (oldSize < 0)
@@ -172,7 +172,7 @@ protected:
         T *newptr = (T *)(realloc(*ptr, sizeof(T) * newSize));
 
         if (newptr == NULL) // realloc failed
-            OPDE_ARRAY_EXCEPT("Array: Growth failed");
+            DARKNESS_ARRAY_EXCEPT("Array: Growth failed");
 
         *ptr = newptr;
 
@@ -241,7 +241,7 @@ public:
     /// member const reference array operator
     const T &operator[](size_t index) const {
         if (index >= mSize)
-            OPDE_ARRAY_EXCEPT("SimpleArray: Index out of bounds");
+            DARKNESS_ARRAY_EXCEPT("SimpleArray: Index out of bounds");
 
         return (mArray[index]);
     }
@@ -249,7 +249,7 @@ public:
     /// member reference array operator
     T &operator[](size_t index) {
         if (index >= mSize)
-            OPDE_ARRAY_EXCEPT("SimpleArray: Index out of bounds");
+            DARKNESS_ARRAY_EXCEPT("SimpleArray: Index out of bounds");
 
         return (mArray[index]);
     }
@@ -267,7 +267,7 @@ public:
 protected:
     void growBuf(size_t newSize) {
         if (newSize < mSize)
-            OPDE_ARRAY_EXCEPT("SimpleArray: Shrinking not allowed");
+            DARKNESS_ARRAY_EXCEPT("SimpleArray: Shrinking not allowed");
 
         if (newSize == mSize)
             return;
@@ -275,7 +275,7 @@ protected:
         T *newptr = (T *)(realloc(mArray, sizeof(T) * newSize));
 
         if (newptr == NULL) // realloc failed
-            OPDE_ARRAY_EXCEPT("SimpleArray: Growth failed");
+            DARKNESS_ARRAY_EXCEPT("SimpleArray: Growth failed");
 
         mArray = newptr;
 
@@ -293,6 +293,6 @@ protected:
     T *mArray;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -22,7 +22,7 @@
  *****************************************************************************/
 
 #include "PlatformService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "logger.h"
 
 #ifdef WIN32
@@ -37,7 +37,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- PlatformService ---------------*/
@@ -107,4 +107,4 @@ Service *PlatformServiceFactory::createInstance(ServiceManager *manager) {
     return new PlatformService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

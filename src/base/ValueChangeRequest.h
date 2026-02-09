@@ -24,7 +24,7 @@
 #ifndef __VALUECHANGEREQUEST_H
 #define __VALUECHANGEREQUEST_H
 
-namespace Opde {
+namespace Darkness {
 
 /** A value + bool pair used to store requests of particular value (request for
  * setting change). A typical usage is a within value change method that
@@ -63,6 +63,6 @@ protected:
     bool mRequested;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

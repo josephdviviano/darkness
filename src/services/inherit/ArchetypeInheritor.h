@@ -28,7 +28,7 @@
 #include "CachedInheritor.h"
 #include "InheritService.h"
 
-namespace Opde {
+namespace Darkness {
 /** Archetype Inheritor. This inheritor only inherits to destination objects
  * having ID < 0 */
 class ArchetypeInheritor : public CachedInheritor {
@@ -56,6 +56,6 @@ public:
 protected:
     static std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

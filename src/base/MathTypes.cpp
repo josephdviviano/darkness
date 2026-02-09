@@ -24,7 +24,7 @@
 #include "Quaternion.h"
 #include "Matrix3.h"
 
-namespace Opde {
+namespace Darkness {
 
 // Vector3 constants
 const Vector3 Vector3::ZERO(0.0f, 0.0f, 0.0f);
@@ -94,4 +94,4 @@ void Quaternion::FromRotationMatrix(const Matrix3 &rot) {
     }
 }
 
-} // namespace Opde
+} // namespace Darkness

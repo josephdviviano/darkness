@@ -25,7 +25,7 @@
 #include "DrawService.h"
 #include "DrawSheet.h"
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- 	DrawOperation ----------------*/
@@ -147,4 +147,4 @@ void DrawOperation::setClipRect(const ClipRect &cr) {
     _markDirty();
 }
 
-} // namespace Opde
+} // namespace Darkness

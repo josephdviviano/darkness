@@ -1,5 +1,5 @@
 import wx
-import sys, getopt, opde
+import sys, getopt, darkness
 
 def usage():
 	sys.stderr.write( __doc__)
@@ -52,47 +52,47 @@ for o, a in opts:
 		sys.exit()
 
 
-# Tell Opde.Root to only create CORE services (those which are sufficient for tools, no renderer, etc)
+# Tell Darkness.Root to only create CORE services (those which are sufficient for tools, no renderer, etc)
 if (debug != 0):
-	opderoot = opde.createRoot(opde.services.SERVICE_CORE, "opde.log")
-	opderoot.setLogLevel(4)
+	darknessroot = darkness.createRoot(darkness.services.SERVICE_CORE, "darkness.log")
+	darknessroot.setLogLevel(4)
 else:
-	opderoot = opde.createRoot(opde.services.SERVICE_CORE)
-	opderoot.setLogLevel(0)
+	darknessroot = darkness.createRoot(darkness.services.SERVICE_CORE)
+	darknessroot.setLogLevel(0)
 
-# Opde logging can be done from python with Opde.log_debug, Opde.log_error and such functions (see bindings.h)
+# Darkness logging can be done from python with Darkness.log_debug, Darkness.log_error and such functions (see bindings.h)
 
 # Setup resources
 # Should have some better way of providing the resource config...
 # Loading resources autotmatically will result in an assert over here (No texture manager singleton)
 # This file should better exist, otherwise an exception will jump up from the call...
-opderoot.loadConfigFile(config)
+darknessroot.loadConfigFile(config)
 
 # Just some resource path initializations
 # These configurations should be based on some platform service
-cfgsrv = opde.services.getConfigService()
+cfgsrv = darkness.services.getConfigService()
 spath = cfgsrv.getParam("script_path")
 
 if (spath):
-	opderoot.addResourceLocation(spath, "Dir", "General", False)
+	darknessroot.addResourceLocation(spath, "Dir", "General", False)
 
 if (cfgsrv.hasParam("script_path_extra") == True):
-	opderoot.addResourceLocation(cfgsrv.getParam("script_path_extra"), "Dir", "General", False)
+	darknessroot.addResourceLocation(cfgsrv.getParam("script_path_extra"), "Dir", "General", False)
 
 # Load the dtype scripts (this varies depending on the game type)
-opderoot.loadDTypeScript(gametype + "-types.dtype", "General")
-opderoot.loadPLDefScript(gametype + "-links.pldef", "General")
-opderoot.loadPLDefScript(gametype + "-props.pldef", "General")
+darknessroot.loadDTypeScript(gametype + "-types.dtype", "General")
+darknessroot.loadPLDefScript(gametype + "-links.pldef", "General")
+darknessroot.loadPLDefScript(gametype + "-props.pldef", "General")
 
 # Bootstrapping finished. No more initialization needed, inform the services
-opderoot.bootstrapFinished();
+darknessroot.bootstrapFinished();
 
 # Service globals
-dbsrv = opde.services.getDatabaseService()
-linksrv = opde.services.getLinkService()
-inhsrv = opde.services.getInheritService()
-objsrv = opde.services.getObjectService()
-psrv = opde.services.getPropertyService()
+dbsrv = darkness.services.getDatabaseService()
+linksrv = darkness.services.getLinkService()
+inhsrv = darkness.services.getInheritService()
+objsrv = darkness.services.getObjectService()
+psrv = darkness.services.getPropertyService()
 
 # Load the gamesys (note: dbsrv.load("miss1.mis") would load both mission-2 and gamesys-1)
 # Ogre is case sensitive on linux. Will have to resolve this
@@ -151,7 +151,7 @@ class LazyTree(wx.TreeCtrl):
         self.Bind(wx.EVT_TREE_ITEM_COLLAPSING, self.OnCollapseItem)
         self.__collapsing = False
 
-	dbsrv.load(gamesys, opde.services.DBM_FILETYPE_GAM)
+	dbsrv.load(gamesys, darkness.services.DBM_FILETYPE_GAM)
 	
 	rootname = "Object"
         id = objsrv.named(rootname)

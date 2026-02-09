@@ -33,7 +33,7 @@
 
 #include <memory>
 
-namespace Opde {
+namespace Darkness {
 
 typedef size_t MessageListenerID;
 
@@ -51,6 +51,6 @@ class FileGroup;
 using FilePtr = std::shared_ptr<File>;
 using FileGroupPtr = std::shared_ptr<FileGroup>;
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

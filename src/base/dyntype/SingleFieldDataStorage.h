@@ -33,7 +33,7 @@
 #include "Iterator.h"
 #include "Serializer.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** Common ancestor template for all the single value data storages (with fixed
  * length data) */
@@ -252,7 +252,7 @@ public:
 
     /** @see DataStorage::getDataSize */
     virtual size_t getDataSize(void) {
-        OPDE_EXCEPT("Invalid call - string length is variable");
+        DARKNESS_EXCEPT("Invalid call - string length is variable");
     }
 };
 
@@ -269,6 +269,6 @@ public:
                                VariantTypeTraits<std::string>::type}) {}
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif // __PROPERTYSTORAGE_H

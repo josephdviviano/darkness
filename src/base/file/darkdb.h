@@ -29,7 +29,7 @@
 
 #include "integers.h"
 
-namespace Opde {
+namespace Darkness {
 // Forward decl.
 class File;
 
@@ -71,6 +71,6 @@ struct DarkDBChunkHeader {
 
 File &operator<<(File &st, const DarkDBChunkHeader &h);
 File &operator>>(File &st, DarkDBChunkHeader &h);
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

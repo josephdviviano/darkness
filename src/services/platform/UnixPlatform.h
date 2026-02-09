@@ -27,11 +27,11 @@
 
 #include "config.h"
 
-#include "OpdeService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessService.h"
+#include "DarknessServiceManager.h"
 #include "Platform.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** @brief Unix platform. Unix/Linux (Posix OS) specific platform handling code.
  */
@@ -47,9 +47,9 @@ public:
     virtual std::string getDirectorySeparator() const;
 
 private:
-    static const std::string msOpdeHomeDirName;
+    static const std::string msDarknessHomeDirName;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

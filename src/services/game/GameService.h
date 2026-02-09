@@ -26,12 +26,12 @@
 
 #include "config.h"
 
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "ServiceCommon.h"
 #include "SharedPtr.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** @brief Game service - service defining game states (Temporary code. Will be
  * filled with a high level state management - screens)
@@ -72,6 +72,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

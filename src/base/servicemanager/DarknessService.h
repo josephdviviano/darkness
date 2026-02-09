@@ -22,8 +22,8 @@
  *
  *****************************************************************************/
 
-#ifndef __OPDESERVICE_H
-#define __OPDESERVICE_H
+#ifndef __DARKNESSSERVICE_H
+#define __DARKNESSSERVICE_H
 
 #include "config.h"
 
@@ -33,7 +33,7 @@
 
 #include <string>
 
-namespace Opde {
+namespace Darkness {
 
 // Forward declaration
 class ServiceManager;
@@ -119,6 +119,6 @@ protected:
 
 /// A shared pointer to service
 typedef shared_ptr<Service> ServicePtr;
-} // namespace Opde
+} // namespace Darkness
 
 #endif

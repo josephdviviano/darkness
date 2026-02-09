@@ -30,11 +30,11 @@
 
 #include "BitArray.h"
 #include "LinkCommon.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "SharedPtr.h"
 
-namespace Opde {
+namespace Darkness {
 
 class Relation;
 class DataStorage;
@@ -203,6 +203,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

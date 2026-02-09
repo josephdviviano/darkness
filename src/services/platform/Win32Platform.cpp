@@ -25,7 +25,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*--------------------- Win32Platform ----------------*/
@@ -49,4 +49,4 @@ std::string Win32Platform::getUserConfigPath() const {
 
 //------------------------------------------------------
 std::string Win32Patform::getDirectorySeparator() const { return "\\"; }
-} // namespace Opde
+} // namespace Darkness

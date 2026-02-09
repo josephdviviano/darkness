@@ -23,15 +23,15 @@
 
 #include "RoomService.h"
 #include "FileGroup.h"
-#include "OpdeException.h"
-#include "OpdeServiceManager.h"
+#include "DarknessException.h"
+#include "DarknessServiceManager.h"
 #include "Room.h"
 #include "RoomPortal.h"
 #include "ServiceCommon.h"
 #include "database/DatabaseService.h"
 #include "logger.h"
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- RoomService -------------------*/
@@ -39,7 +39,7 @@ namespace Opde {
 template <> const size_t ServiceImpl<RoomService>::SID = __SERVICE_ID_ROOM;
 
 RoomService::RoomService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::RoomService>(manager, name), mRoomsOk(false) {}
+    : ServiceImpl<Darkness::RoomService>(manager, name), mRoomsOk(false) {}
 
 //------------------------------------------------------
 RoomService::~RoomService() { clear(); }
@@ -288,4 +288,4 @@ Service *RoomServiceFactory::createInstance(ServiceManager *manager) {
     return new RoomService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

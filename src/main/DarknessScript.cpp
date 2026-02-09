@@ -1,7 +1,7 @@
 /******************************************************************************
  *
  *    This file is part of openDarkEngine project
- *    Copyright (C) 2009 openDarkEngine team
+ *    Copyright (C) 2005-2006 openDarkEngine team
  *
  *    This program is free software; you can redistribute it and/or modify
  *    it under the terms of the GNU General Public License as published by
@@ -17,29 +17,37 @@
  *    along with this program; if not, write to the Free Software
  *    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
- *
- *	  $Id$
+ *    $Id$
  *
  *****************************************************************************/
 
-// This source code is a fixed and maintained version of the Null render system written by xyzzy@ogre3d.org forum
+#include <iostream>
 
-#ifndef __NULLRENDERTOVERTEXBUFFER_H
-#define __NULLRENDERTOVERTEXBUFFER_H
+#include "bindings.h"
+#include "config.h"
 
-#include "stdafx.h"
+#include "GameStateManager.h"
+#include "DarknessException.h"
 
-namespace Ogre {
+#include <OgreException.h>
 
-	class NULLRenderToVertexBuffer : public RenderToVertexBuffer {
-		public:
-			NULLRenderToVertexBuffer() {};
-			
-		
-			virtual void getRenderOperation(Ogre::RenderOperation& op) {};
-			virtual void update(Ogre::SceneManager*) {};
-	};
+using namespace Darkness;
 
+int main(int argc, char **argv) {
+    std::string scriptName = "";
+
+    if (argc >= 2)
+        scriptName = argv[1];
+
+    if (scriptName != "") {
+        PythonLanguage::init(argc - 1, &argv[1]);
+        PythonLanguage::runScript(scriptName.c_str());
+        PythonLanguage::term();
+    } else {
+        std::cerr << "darknessScript: Script name epected as a parameter!"
+                  << std::endl;
+        return 1;
+    }
+
+    return 0;
 }
-
-#endif

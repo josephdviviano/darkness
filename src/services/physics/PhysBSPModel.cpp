@@ -25,7 +25,7 @@
 #include "File.h"
 #include "logger.h"
 
-namespace Opde {
+namespace Darkness {
 /*----------------------------------------------------*/
 /*---------------------- PhysBSPModel ----------------*/
 /*----------------------------------------------------*/
@@ -34,4 +34,4 @@ PhysBSPModel::PhysBSPModel(int objid) : PhysModel(objid) {}
 //------------------------------------------------------
 PhysBSPModel::~PhysBSPModel() {}
 
-} // namespace Opde
+} // namespace Darkness

@@ -33,7 +33,7 @@
 #include "NonCopyable.h"
 #include "Vector3.h"
 
-namespace Opde {
+namespace Darkness {
 
 /// Data serializer - used to fill the values of data based on File contents,
 /// and the other way round
@@ -153,6 +153,6 @@ void TypeSerializer<std::string>::deserialize(FilePtr &src, void *valuePtr);
 template <>
 size_t TypeSerializer<std::string>::getStoredSize(const void *valuePtr);
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

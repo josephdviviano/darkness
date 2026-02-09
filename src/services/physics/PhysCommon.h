@@ -29,7 +29,7 @@
 #include "Vector3.h"
 #include "Quaternion.h"
 
-namespace Opde {
+namespace Darkness {
 	// Forward decls.
 	class PhysModel;
 	class File;

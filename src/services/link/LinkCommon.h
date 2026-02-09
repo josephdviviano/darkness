@@ -29,7 +29,7 @@
 #include "compat.h"
 #include "integers.h"
 
-namespace Opde {
+namespace Darkness {
 
 class Relation;
 
@@ -150,6 +150,6 @@ struct LinkChangeMsg {
 /// All link concreteness types
 #define LINKC_ALL (0x0F)
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

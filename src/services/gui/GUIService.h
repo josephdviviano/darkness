@@ -26,15 +26,15 @@
 #define __GUISERVICE_H
 
 #include "DarkCommon.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "ServiceCommon.h"
 
 // TODO: We only need the callback classes, no need to pull main service headers
 #include "input/InputCommon.h"
 #include "loop/LoopCommon.h"
 
-namespace Opde {
+namespace Darkness {
 
 class DrawSheet;
 class TextureAtlas;
@@ -186,6 +186,6 @@ public:
 private:
     static std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

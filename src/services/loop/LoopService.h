@@ -35,14 +35,14 @@
 
 #include "Callback.h"
 #include "LoopCommon.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "SharedPtr.h"
 #include "compat.h"
 
 #include <chrono>
 
-namespace Opde {
+namespace Darkness {
 
 class LoopService;
 
@@ -227,6 +227,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

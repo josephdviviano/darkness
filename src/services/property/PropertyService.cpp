@@ -23,12 +23,12 @@
  *****************************************************************************/
 
 #include "PropertyService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "ServiceCommon.h"
 #include "format.h"
 #include "logger.h"
 
-namespace Opde {
+namespace Darkness {
 /// helper string iterator over map keys
 class PropertyMapKeyIterator : public StringIterator {
 public:
@@ -63,7 +63,7 @@ const size_t ServiceImpl<PropertyService>::SID = __SERVICE_ID_PROPERTY;
 
 PropertyService::PropertyService(ServiceManager *manager,
                                  const std::string &name)
-    : ServiceImpl<Opde::PropertyService>(manager, name) {
+    : ServiceImpl<Darkness::PropertyService>(manager, name) {
     // Ensure listeners are created
     // Create the standard property storage factories...
 }
@@ -107,7 +107,7 @@ Property *PropertyService::createProperty(const std::string &name,
     try {
         nr = new Property(this, name, chunkName, storage, inheritorName);
     } catch (...) {
-        OPDE_EXCEPT(format("Failed to create property for ", name));
+        DARKNESS_EXCEPT(format("Failed to create property for ", name));
     }
 
     std::pair<PropertyMap::iterator, bool> res =
@@ -116,7 +116,7 @@ Property *PropertyService::createProperty(const std::string &name,
     if (!res.second) {
         delete nr;
 
-        OPDE_EXCEPT(format("Failed to insert new instance of Property, name already "
+        DARKNESS_EXCEPT(format("Failed to insert new instance of Property, name already "
                     "allocated : ", name));
     }
 
@@ -300,4 +300,4 @@ const uint PropertyServiceFactory::getMask() {
 }
 
 const size_t PropertyServiceFactory::getSID() { return PropertyService::SID; }
-} // namespace Opde
+} // namespace Darkness

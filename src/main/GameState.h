@@ -28,7 +28,7 @@
 
 #include <SDL2/SDL.h>
 
-namespace Opde {
+namespace Darkness {
 
 /** A game state. Abstract class which is filled with code doing stuff while
  * state is on top of the queue. It is guranteed, that the state will receive
@@ -85,6 +85,6 @@ public:
     void requestTermination();
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -26,7 +26,7 @@
 #include "DrawSourceBinder.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -36,7 +36,7 @@ const char *TextureAtlasBinder::msName = "TextureAtlas";
 // ------------------------------------------
 PyTypeObject TextureAtlasBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.TextureAtlas", // char *tp_name; */
+                          0) "darkness.services.TextureAtlas", // char *tp_name; */
     sizeof(TextureAtlasBinder::Base), // int tp_basicsize; */
     0,                           // int tp_itemsize;       /* not used much */
     TextureAtlasBinder::dealloc, // destructor tp_dealloc; */
@@ -145,4 +145,4 @@ void TextureAtlasBinder::init(PyObject *module) {
 }
 
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness

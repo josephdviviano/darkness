@@ -26,8 +26,8 @@
 
 #include <string>
 
-namespace Opde {
+namespace Darkness {
 
 ConsoleCommandListener::~ConsoleCommandListener(void) {}
 
-}; // namespace Opde
+}; // namespace Darkness

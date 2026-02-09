@@ -24,14 +24,14 @@
 
 // A copy of Ogre::Singleton. LGPL
 
-#ifndef __OPDESINGLETON_H
-#define __OPDESINGLETON_H
+#ifndef __DARKNESSSINGLETON_H
+#define __DARKNESSSINGLETON_H
 
 #include "config.h"
 
 #include <cassert>
 
-namespace Opde {
+namespace Darkness {
 
 // Just a copy of Ogre's singleton impl, before writing something on our own.
 // Thanks OGRE people!
@@ -66,6 +66,6 @@ public:
     */
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

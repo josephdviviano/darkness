@@ -26,8 +26,8 @@
 
 using namespace std;
 
-namespace Opde {
-const std::string UnixPlatform::msOpdeHomeDirName = ".opde";
+namespace Darkness {
+const std::string UnixPlatform::msDarknessHomeDirName = ".darkness";
 
 /*----------------------------------------------------*/
 /*--------------------- UnixPlatform ----------------*/
@@ -40,20 +40,20 @@ UnixPlatform::~UnixPlatform() {}
 //------------------------------------------------------
 std::string UnixPlatform::getGlobalConfigPath() const {
     // global config path is hardcoded at compile time
-    // it is the location of share/opde directory...
+    // it is the location of share/darkness directory...
     // for the share directory location, we have a config time define
-    return OPDE_SHARE_DIR;
+    return DARKNESS_SHARE_DIR;
 }
 
 //------------------------------------------------------
 std::string UnixPlatform::getUserConfigPath() const {
     // local config path is based on the user's home directory
-    // respectively the .opde directory inside it
+    // respectively the .darkness directory inside it
     std::string home = getenv("HOME");
 
-    return home + getDirectorySeparator() + msOpdeHomeDirName;
+    return home + getDirectorySeparator() + msDarknessHomeDirName;
 }
 
 //------------------------------------------------------
 std::string UnixPlatform::getDirectorySeparator() const { return "/"; }
-} // namespace Opde
+} // namespace Darkness

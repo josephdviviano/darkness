@@ -28,7 +28,7 @@
 #include "config.h"
 #include "logger.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** Log listener, writing the logging messages to std::cerr */
 class StdLog : public LogListener {
@@ -37,6 +37,6 @@ public:
     virtual ~StdLog();
     virtual void logMessage(Logger::LogLevel level, const std::string &msg);
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

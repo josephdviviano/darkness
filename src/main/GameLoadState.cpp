@@ -40,7 +40,7 @@
 
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 
 template <> GameLoadState *Singleton<GameLoadState>::ms_Singleton = 0;
 
@@ -149,4 +149,4 @@ GameLoadState &GameLoadState::getSingleton() {
 }
 
 GameLoadState *GameLoadState::getSingletonPtr() { return ms_Singleton; }
-} // namespace Opde
+} // namespace Darkness

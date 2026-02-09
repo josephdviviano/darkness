@@ -23,11 +23,11 @@
  *****************************************************************************/
 
 #include "GUIServiceBinder.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "RelationBinder.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -181,4 +181,4 @@ void GUIServiceBinder::init(PyObject *module) {
 }
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

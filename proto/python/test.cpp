@@ -3,7 +3,7 @@
  
 #include "bindings.h"
 
-using Opde::PythonLanguage;
+using Darkness::PythonLanguage;
 
 int main(void) {
 	// Only call the python script. that's all we need now

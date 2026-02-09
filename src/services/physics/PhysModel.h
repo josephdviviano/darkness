@@ -29,7 +29,7 @@
 #include "PhysCommon.h"
 #include "integers.h"
 
-namespace Opde {
+namespace Darkness {
 /** @brief Physics model. Contains all data on physics for particular object
  * (Both static and dynamic). This class presents the encapsulation of the whole
  * physical definition of the given object. Internally, this class is a
@@ -136,6 +136,6 @@ protected:
     /// mRopeAttSubModel && mRopeAttSubModel-1)
     float mRopeSegPos;
 };
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

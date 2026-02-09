@@ -36,7 +36,7 @@ class SceneNode;
 
 class EntityMaterialInstance;
 
-namespace Opde {
+namespace Darkness {
 
 /** Entity property realization object. A package of an entity and a
  * EntityMaterialInstance. Realizes all the per-object rendering related
@@ -89,6 +89,6 @@ protected:
     std::unique_ptr<EntityMaterialInstance> mEmi;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif /* __ENTITYINFO_H */

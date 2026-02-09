@@ -27,7 +27,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 /*------------------------------------------------------*/
 /*------------------- Enumeration ----------------------*/
@@ -40,7 +40,7 @@ Enumeration::Enumeration(const std::string &name, Variant::Type enumType,
     mBitField = bitfield;
 
     if (mBitField && mEnumType != Variant::DV_UINT)
-        OPDE_EXCEPT("Only uint is supported for bitfields");
+        DARKNESS_EXCEPT("Only uint is supported for bitfields");
 }
 
 //------------------------------------
@@ -142,4 +142,4 @@ bool DataStorage::createWithValue(int objID, const Variant &value)
     return setField(objID, "", value);
 }
 
-} // namespace Opde
+} // namespace Darkness

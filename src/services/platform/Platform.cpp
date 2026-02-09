@@ -25,7 +25,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*------------------------ Platform ------------------*/
@@ -34,4 +34,4 @@ Platform::Platform(PlatformService *owner) : mOwner(owner) {}
 
 //------------------------------------------------------
 Platform::~Platform() {}
-} // namespace Opde
+} // namespace Darkness

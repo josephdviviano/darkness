@@ -23,7 +23,7 @@
 
 #include "PositionPropertyStorage.h"
 
-namespace Opde {
+namespace Darkness {
 
 PositionPropertyStorage::PositionPropertyStorage() {
     field("position", &sPositionProp::position);
@@ -33,4 +33,4 @@ PositionPropertyStorage::PositionPropertyStorage() {
 
 PositionPropertyStorage::~PositionPropertyStorage(){};
 
-}; // namespace Opde
+}; // namespace Darkness

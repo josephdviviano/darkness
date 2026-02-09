@@ -27,7 +27,7 @@
 
 #include "RenderedProperty.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** a ModelName property implementation.
  * Controls the object's model (Mesh).
@@ -60,6 +60,6 @@ protected:
 
     Ogre::SceneManager *mSceneMgr;
 };
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

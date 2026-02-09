@@ -33,7 +33,7 @@
 #include <OgreMaterial.h>
 #include <OgreTexture.h>
 
-namespace Opde {
+namespace Darkness {
 class TextureAtlas;
 
 /// A structure that holds a Font definition ready for usage (as numerous
@@ -128,6 +128,6 @@ protected:
     /// Built flag (finalization indicator)
     bool mBuilt;
 };
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

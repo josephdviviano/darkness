@@ -27,11 +27,11 @@
 
 #include "config.h"
 
-#include "OpdeService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessService.h"
+#include "DarknessServiceManager.h"
 #include "Platform.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** @brief Apple platform. Apple OS specific platform handling code.
  */
@@ -47,6 +47,6 @@ public:
     virtual std::string getDirectorySeparator() const;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -161,7 +161,7 @@ service listeners
 // ---------------------------------------------
 // --- Forward declarations, including Ptrs ----
 // ---------------------------------------------
-namespace Opde {
+namespace Darkness {
 
 class ServiceManager;
 
@@ -212,6 +212,6 @@ using ScriptServicePtr = std::shared_ptr<ScriptService>;
 using SimServicePtr = std::shared_ptr<SimService>;
 using WorldRepServicePtr = std::shared_ptr<WorldRepService>;
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

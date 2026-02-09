@@ -31,7 +31,7 @@
 #include <OgreViewport.h>
 
 #include "DarkCommon.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "DrawService.h"
 #include "DrawSheet.h"
 #include "DrawOperation.h"
@@ -39,7 +39,7 @@
 #include "RenderedLabel.h"
 #include "RenderedRect.h"
 #include "FonFormat.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "StringTokenizer.h"
 #include "TextureAtlas.h"
 #include "config.h"
@@ -53,7 +53,7 @@
 using namespace std;
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 
 const int DrawService::MAX_Z_VALUE = 1024;
 const RGBAQuad DrawService::msMonoPalette[2] = {{0, 0, 0, 0},
@@ -799,4 +799,4 @@ Service *DrawServiceFactory::createInstance(ServiceManager *manager) {
     return new DrawService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

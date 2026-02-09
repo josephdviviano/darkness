@@ -27,7 +27,7 @@
 #include "SingleFieldDataStorage.h"
 #include "property/PropertyService.h"
 
-namespace Opde {
+namespace Darkness {
 /*--------------------------------------------------------*/
 /*--------------------- HasRefsProperty ------------------*/
 /*--------------------------------------------------------*/
@@ -50,7 +50,7 @@ void HasRefsProperty::addProperty(int oid) {
     Variant val(false);
 
     if (!get(oid, "", val))
-        OPDE_EXCEPT("Property not defined for object.");
+        DARKNESS_EXCEPT("Property not defined for object.");
 
     setHasRefs(oid, val.toBool());
 };
@@ -88,4 +88,4 @@ void HasRefsProperty::setHasRefs(int oid, bool hasRefs) {
             mSceneMgr->getRootSceneNode()->removeChild(sn);
     }
 };
-}; // namespace Opde
+}; // namespace Darkness

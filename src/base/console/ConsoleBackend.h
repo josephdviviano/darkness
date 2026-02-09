@@ -35,16 +35,16 @@
 
 #include "ConsoleCommandListener.h"
 
-#include "OpdeSingleton.h"
+#include "DarknessSingleton.h"
 #include "logger/logger.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** Backend class, used for commands processing, and console text memmory
  * A singleton class, used to insert texts to console and to call Command
  * Listeners */
 class ConsoleBackend : public Singleton<ConsoleBackend>,
-                       public Opde::LogListener {
+                       public Darkness::LogListener {
 public:
     /** A pair - level, message */
     typedef std::pair<size_t, std::string> Message;
@@ -103,7 +103,7 @@ public:
     /* Writes a simple message to the console */
     void putMessage(std::string text, size_t level = 2);
 
-    /** Opde logging method implementation */
+    /** Darkness logging method implementation */
     virtual void logMessage(Logger::LogLevel level, const std::string &msg);
 
     /** Returns true, if the console text was changed from last time, and resets
@@ -133,6 +133,6 @@ public:
     static ConsoleBackend *getSingletonPtr(void);
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

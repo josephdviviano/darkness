@@ -32,7 +32,7 @@
 #pragma warning(disable : 4996)
 #endif
 
-namespace Opde {
+namespace Darkness {
 
 struct IsNewline {
     bool operator()(char c) const { return (c == '\n' || c == '\r'); }
@@ -164,4 +164,4 @@ void Logger::setLogLevel(int level) {
 LogListener::LogListener() {}
 
 LogListener::~LogListener() {}
-} // namespace Opde
+} // namespace Darkness

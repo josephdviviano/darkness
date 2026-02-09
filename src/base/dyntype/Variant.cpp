@@ -28,7 +28,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 /*------------------------------------------------------*/
 /*-------------------- Variant ------------------------*/
 /*------------------------------------------------------*/
@@ -819,4 +819,4 @@ template <> Quaternion Variant::as<Quaternion>() const {
     return toQuaternion();
 }
 
-} // namespace Opde
+} // namespace Darkness

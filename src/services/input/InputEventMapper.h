@@ -29,7 +29,7 @@
 #include <map>
 #include <string>
 
-namespace Opde {
+namespace Darkness {
 class InputService;
 
 /** @brief Input Event Mapper - Manages bindings in a specific context
@@ -64,6 +64,6 @@ protected:
     /// Name of this mapper
     std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

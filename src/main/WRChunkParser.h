@@ -20,7 +20,7 @@
  *****************************************************************************/
 
 // Standalone WR/WRRGB chunk parser — reads cell geometry from .mis files
-// using only OpdeBase primitives (File, FileGroup). No Ogre, no service stack.
+// using only DarknessBase primitives (File, FileGroup). No Ogre, no service stack.
 
 #pragma once
 
@@ -35,7 +35,7 @@
 #include <string>
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 
 // ── Packed structs (copied from WRTypes.h, avoiding LightmapAtlas dependency) ──
 
@@ -267,4 +267,4 @@ inline WRParsedData parseWRChunk(const std::string &misPath) {
     return result;
 }
 
-} // namespace Opde
+} // namespace Darkness

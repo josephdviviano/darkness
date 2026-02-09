@@ -36,7 +36,7 @@
 #include "ConsoleCommandListener.h"
 #include "integers.h"
 
-namespace Opde {
+namespace Darkness {
 
 class FreeSpaceInfo;
 
@@ -76,7 +76,7 @@ class LightAtlas;
  * which can't be switched, and a set of lightmaps indexed by light number,
  * which can have their'e intensity modulated. The resulting lightmap is
  * recalculated every time an actual chage happens. Please use
- * Opde::LightAtlasList::setLightIntensity if you want to set an intensity to a
+ * Darkness::LightAtlasList::setLightIntensity if you want to set an intensity to a
  * certain light. Calling the method here would not refresh the lightmap
  * texture.
  * @see LightAtlasList */
@@ -383,5 +383,5 @@ public:
     virtual void commandExecuted(std::string command, std::string parameters);
 };
 
-} // namespace Opde
+} // namespace Darkness
 #endif

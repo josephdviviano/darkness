@@ -3,16 +3,16 @@
 	
 #cmakedefine HAVE_INTTYPES_H 1
 
-#cmakedefine OPDE_DEBUG
+#cmakedefine DARKNESS_DEBUG
 
 #cmakedefine FRAME_PROFILER
 
-#define OPDE_VER_MAJOR ${OPDE_VER_MAJOR}
-#define OPDE_VER_MINOR ${OPDE_VER_MINOR}
-#define OPDE_VER_PATCH ${OPDE_VER_PATCH}
-#define OPDE_CODE_NAME "${REL_CODE_NAME}"
+#define DARKNESS_VER_MAJOR ${DARKNESS_VER_MAJOR}
+#define DARKNESS_VER_MINOR ${DARKNESS_VER_MINOR}
+#define DARKNESS_VER_PATCH ${DARKNESS_VER_PATCH}
+#define DARKNESS_CODE_NAME "${REL_CODE_NAME}"
 
-#cmakedefine __OPDE_BIG_ENDIAN ${BIG_ENDIAN}
+#cmakedefine __DARKNESS_BIG_ENDIAN ${BIG_ENDIAN}
 
 #if defined (_MSC_VER)
 // disable the class needs to have a dll-interface...
@@ -27,6 +27,6 @@
 #cmakedefine APPLE
 
 // data installation path
-#define OPDE_SHARE_DIR "${OPDE_FULL_DATA_INSTALL_DIR}"
+#define DARKNESS_SHARE_DIR "${DARKNESS_FULL_DATA_INSTALL_DIR}"
 
 #endif

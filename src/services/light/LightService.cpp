@@ -26,7 +26,7 @@
 #include "File.h"
 
 #include "LightService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "render/RenderService.h"
 #include "worldrep/WRCell.h"
 #include "worldrep/WRTypes.h"
@@ -39,7 +39,7 @@
 using namespace std;
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*------------------- LightTableEntry ----------------*/
@@ -65,7 +65,7 @@ LightTableEntry::LightTableEntry(const FilePtr &tag, bool rgb) {
 template <> const size_t ServiceImpl<LightService>::SID = __SERVICE_ID_LIGHT;
 
 LightService::LightService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::LightService>(manager, name), mLightPixelSize(0) {
+    : ServiceImpl<Darkness::LightService>(manager, name), mLightPixelSize(0) {
 
     mAtlasList = new LightAtlasList();
 }
@@ -248,4 +248,4 @@ Service *LightServiceFactory::createInstance(ServiceManager *manager) {
     return new LightService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

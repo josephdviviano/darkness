@@ -30,7 +30,7 @@
 #include "PhysOBBModel.h"
 #include "PhysSphereModel.h"
 
-namespace Opde {
+namespace Darkness {
 
 // helpers
 File &operator>>(File &f, PhysModel::Spring &s)
@@ -186,4 +186,4 @@ void PhysModel::clear(void)
     mSubModels.clear();
 }
 
-} // namespace Opde
+} // namespace Darkness

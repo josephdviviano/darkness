@@ -30,7 +30,7 @@
 
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- RenderedRect ------------------*/
@@ -116,4 +116,4 @@ void RenderedRect::_rebuild() {
     mInClip = mClipOnScreen.clip(mDrawQuad);
 }
 
-} // namespace Opde
+} // namespace Darkness

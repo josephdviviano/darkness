@@ -36,7 +36,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-namespace Opde {
+namespace Darkness {
 // Vector2
 File &operator<<(File &st, const Vector2 &val) {
     st << val.x << val.y;
@@ -108,4 +108,4 @@ File &operator>>(File &st, Quaternion &val) {
     return st;
 }
 
-} // namespace Opde
+} // namespace Darkness

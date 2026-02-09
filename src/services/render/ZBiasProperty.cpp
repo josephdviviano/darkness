@@ -28,7 +28,7 @@
 #include "property/PropertyService.h"
 #include "EntityInfo.h"
 
-namespace Opde {
+namespace Darkness {
 /*--------------------------------------------------------*/
 /*-------------------- RenderAlphaProperty ----------------*/
 /*--------------------------------------------------------*/
@@ -51,7 +51,7 @@ void ZBiasProperty::addProperty(int oid) {
     Variant val;
 
     if (!get(oid, "", val))
-        OPDE_EXCEPT("Property not defined for object.");
+        DARKNESS_EXCEPT("Property not defined for object.");
 
     setZBias(oid, val.toUInt());
 };
@@ -80,4 +80,4 @@ void ZBiasProperty::setZBias(int oid, uint32_t bias) {
     EntityInfo *ei = getEntityInfo(oid);
     ei->setZBias(bias);
 };
-}; // namespace Opde
+}; // namespace Darkness

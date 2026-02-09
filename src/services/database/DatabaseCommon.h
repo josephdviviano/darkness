@@ -4,7 +4,7 @@
 #include "DarkCommon.h"
 #include "integers.h"
 
-namespace Opde {
+namespace Darkness {
 
 /// Database event types
 typedef enum {
@@ -157,6 +157,6 @@ protected:
     virtual void onDBDrop(uint32_t dropmask) = 0;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif /* __DATABASECOMMON_H */

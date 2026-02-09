@@ -26,7 +26,7 @@
 #include "ArchetypeInheritor.h"
 #include "CachedInheritor.h"
 #include "NeverInheritor.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "ServiceCommon.h"
 #include "SingleFieldDataStorage.h"
 #include "format.h"
@@ -36,7 +36,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 /*--------------------------------------------------------*/
 /*--------------------- InheritQueries -------------------*/
 /*--------------------------------------------------------*/
@@ -84,7 +84,7 @@ template <>
 const size_t ServiceImpl<InheritService>::SID = __SERVICE_ID_INHERIT;
 
 InheritService::InheritService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::InheritService>(manager, name), mMetaPropListenerID(0),
+    : ServiceImpl<Darkness::InheritService>(manager, name), mMetaPropListenerID(0),
       mMetaPropRelation() {
     // Register some common factories.
     // If a special factory would be needed, it has to be registered prior to
@@ -128,7 +128,7 @@ Inheritor *InheritService::createInheritor(const std::string &name) {
         mInheritors.push_back(inh); // no need map by name
         return inh;
     } else
-        OPDE_EXCEPT(format("No inheritor factory found for name : ", name));
+        DARKNESS_EXCEPT(format("No inheritor factory found for name : ", name));
 }
 
 //------------------------------------------------------
@@ -164,7 +164,7 @@ bool InheritService::init() {
 
     // Could not be created?
     if (!mMetaPropRelation)
-        OPDE_EXCEPT("MetaProp relation could not be created. Fatal.");
+        DARKNESS_EXCEPT("MetaProp relation could not be created. Fatal.");
 
     LOG_DEBUG("InheritService::init() - done!");
     return true;
@@ -295,7 +295,7 @@ bool InheritService::hasTargets(int objID) const {
 //------------------------------------------------------
 void InheritService::setArchetype(int objID, int archetypeID) {
     if (getArchetype(objID) != 0) {
-        OPDE_EXCEPT("Given object already has an archetype set");
+        DARKNESS_EXCEPT("Given object already has an archetype set");
     }
 
     _createMPLink(objID, archetypeID, 0);
@@ -417,7 +417,7 @@ void InheritService::_addLink(const Link &link, unsigned int priority) {
         r.first->second.insert(make_pair(ilp.srcID, ilp));
 
     if (!ri.second)
-        OPDE_EXCEPT(
+        DARKNESS_EXCEPT(
             "Multiple inheritance for the same src/dst pair is not allowed!");
 
     // Repeat for the mInheritTarget's
@@ -427,7 +427,7 @@ void InheritService::_addLink(const Link &link, unsigned int priority) {
     ri = r.first->second.insert(make_pair(ilp.dstID, ilp));
 
     if (!ri.second)
-        OPDE_EXCEPT(
+        DARKNESS_EXCEPT(
             "Multiple inheritance for the same src/dst pair is not allowed!");
 }
 
@@ -442,7 +442,7 @@ void InheritService::_changeLink(const Link &link, unsigned int priority) {
 
         it2->second.priority = priority;
     } else
-        OPDE_EXCEPT("Could not find the link to change the priority for");
+        DARKNESS_EXCEPT("Could not find the link to change the priority for");
 }
 
 //------------------------------------------------------
@@ -456,9 +456,9 @@ void InheritService::_removeLink(const Link &link) {
         if (it2 != it->second.end())
             it->second.erase(it2);
         else
-            OPDE_EXCEPT("Could not find the link to change the priority for");
+            DARKNESS_EXCEPT("Could not find the link to change the priority for");
     } else
-        OPDE_EXCEPT("Could not find the link to change the priority for");
+        DARKNESS_EXCEPT("Could not find the link to change the priority for");
 
     // Same again, for the targets
     it = mInheritTargets.find(link.src());
@@ -469,9 +469,9 @@ void InheritService::_removeLink(const Link &link) {
         if (it2 != it->second.end())
             it->second.erase(it2);
         else
-            OPDE_EXCEPT("Could not find the link to change the priority for");
+            DARKNESS_EXCEPT("Could not find the link to change the priority for");
     } else
-        OPDE_EXCEPT("Could not find the link to change the priority for");
+        DARKNESS_EXCEPT("Could not find the link to change the priority for");
 }
 
 //------------------------------------------------------
@@ -496,4 +496,4 @@ Service *InheritServiceFactory::createInstance(ServiceManager *manager) {
     return new InheritService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness
