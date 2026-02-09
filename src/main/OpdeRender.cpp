@@ -29,8 +29,10 @@
 #include <string>
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
+#include <queue>
 
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -110,9 +112,13 @@ struct PosUV2Vertex {
 
 bgfx::VertexLayout PosUV2Vertex::layout;
 
-// ── Texture group for batched draw calls ──
+// ── Cell+texture group for batched draw calls with portal culling ──
+// Groups are sorted by (cellID, txtIndex) so per-cell index ranges are contiguous.
+// When portal culling is active, only groups whose cellID is in the visible set
+// are submitted. When culling is off, all groups are submitted (same as before).
 
-struct TextureGroup {
+struct CellTextureGroup {
+    uint32_t cellID;
     uint8_t txtIndex;
     uint32_t firstIndex;
     uint32_t numIndices;
@@ -123,7 +129,7 @@ struct TextureGroup {
 struct WorldMesh {
     std::vector<PosColorUVVertex> vertices;
     std::vector<uint32_t> indices;
-    std::vector<TextureGroup> groups; // sorted by texture index
+    std::vector<CellTextureGroup> groups; // sorted by (cellID, txtIndex)
     float cx, cy, cz;
 };
 
@@ -132,13 +138,14 @@ struct WorldMesh {
 struct FlatMesh {
     std::vector<PosColorVertex> vertices;
     std::vector<uint32_t> indices;
+    std::vector<CellTextureGroup> groups; // sorted by (cellID, txtIndex)
     float cx, cy, cz;
 };
 
 struct LightmappedMesh {
     std::vector<PosUV2Vertex> vertices;
     std::vector<uint32_t> indices;
-    std::vector<TextureGroup> groups;
+    std::vector<CellTextureGroup> groups;
     float cx, cy, cz;
 };
 
@@ -170,6 +177,10 @@ static FlatMesh buildFlatMesh(const Opde::WRParsedData &wr) {
 
     float sumX = 0, sumY = 0, sumZ = 0;
     int cellCount = 0;
+
+    // Temporary per-(cell, texture) triangle lists for portal culling support
+    // Key: (cellID << 8) | txtIndex — cell in high bits for sort order
+    std::map<uint64_t, std::vector<uint32_t>> cellTexTriangles;
 
     for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
         const auto &cell = wr.cells[ci];
@@ -222,12 +233,29 @@ static FlatMesh buildFlatMesh(const Opde::WRParsedData &wr) {
             }
 
             // Fan-triangulate: (0, t+1, t) — matches OPDE WRCell.cpp winding
+            // Group by (cellID, 0) since flat mesh has no texture index
+            uint64_t key = (static_cast<uint64_t>(ci) << 8);
+            auto &triList = cellTexTriangles[key];
             for (int t = 1; t < poly.count - 1; ++t) {
-                mesh.indices.push_back(baseVertex);
-                mesh.indices.push_back(baseVertex + t + 1);
-                mesh.indices.push_back(baseVertex + t);
+                triList.push_back(baseVertex);
+                triList.push_back(baseVertex + t + 1);
+                triList.push_back(baseVertex + t);
             }
         }
+    }
+
+    // Build sorted index buffer: groups sorted by (cellID, txtIndex)
+    // std::map is already sorted by key
+    for (auto &kv : cellTexTriangles) {
+        uint32_t cellID = static_cast<uint32_t>(kv.first >> 8);
+        uint8_t txtIdx = static_cast<uint8_t>(kv.first & 0xFF);
+        CellTextureGroup grp;
+        grp.cellID = cellID;
+        grp.txtIndex = txtIdx;
+        grp.firstIndex = static_cast<uint32_t>(mesh.indices.size());
+        grp.numIndices = static_cast<uint32_t>(kv.second.size());
+        mesh.groups.push_back(grp);
+        mesh.indices.insert(mesh.indices.end(), kv.second.begin(), kv.second.end());
     }
 
     if (cellCount > 0) {
@@ -374,7 +402,8 @@ static WorldMesh buildWaterMesh(const Opde::WRParsedData &wr,
 
     for (uint8_t key : sortedKeys) {
         auto &triList = texTriangles[key];
-        TextureGroup grp;
+        CellTextureGroup grp;
+        grp.cellID = 0; // water mesh is not portal-culled
         grp.txtIndex = key;
         grp.firstIndex = static_cast<uint32_t>(mesh.indices.size());
         grp.numIndices = static_cast<uint32_t>(triList.size());
@@ -402,8 +431,9 @@ static WorldMesh buildTexturedMesh(const Opde::WRParsedData &wr,
     float sumX = 0, sumY = 0, sumZ = 0;
     int cellCount = 0;
 
-    // Temporary per-texture triangle lists; key = texture index
-    std::unordered_map<uint8_t, std::vector<uint32_t>> texTriangles;
+    // Temporary per-(cell, texture) triangle lists for portal culling support
+    // Key: (cellID << 8) | txtIndex — cell in high bits for sort order
+    std::map<uint64_t, std::vector<uint32_t>> cellTexTriangles;
 
     for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
         const auto &cell = wr.cells[ci];
@@ -522,9 +552,10 @@ static WorldMesh buildTexturedMesh(const Opde::WRParsedData &wr,
                 }
             }
 
-            // Fan-triangulate
+            // Fan-triangulate, grouped by (cellID, txtIndex) for portal culling
             uint8_t key = isTextured ? txtIdx : 0; // 0 = flat group
-            auto &triList = texTriangles[key];
+            uint64_t cellTexKey = (static_cast<uint64_t>(ci) << 8) | key;
+            auto &triList = cellTexTriangles[cellTexKey];
             for (int t = 1; t < poly.count - 1; ++t) {
                 triList.push_back(baseVertex);
                 triList.push_back(baseVertex + t + 1);
@@ -533,21 +564,18 @@ static WorldMesh buildTexturedMesh(const Opde::WRParsedData &wr,
         }
     }
 
-    // Build sorted index buffer: all groups sorted by texture index
-    // Put flat group (key=0) first
-    std::vector<uint8_t> sortedKeys;
-    for (auto &kv : texTriangles)
-        sortedKeys.push_back(kv.first);
-    std::sort(sortedKeys.begin(), sortedKeys.end());
-
-    for (uint8_t key : sortedKeys) {
-        auto &triList = texTriangles[key];
-        TextureGroup grp;
-        grp.txtIndex = key;
+    // Build sorted index buffer: groups sorted by (cellID, txtIndex)
+    // std::map is already sorted by key
+    for (auto &kv : cellTexTriangles) {
+        uint32_t cellID = static_cast<uint32_t>(kv.first >> 8);
+        uint8_t txtIdx = static_cast<uint8_t>(kv.first & 0xFF);
+        CellTextureGroup grp;
+        grp.cellID = cellID;
+        grp.txtIndex = txtIdx;
         grp.firstIndex = static_cast<uint32_t>(mesh.indices.size());
-        grp.numIndices = static_cast<uint32_t>(triList.size());
+        grp.numIndices = static_cast<uint32_t>(kv.second.size());
         mesh.groups.push_back(grp);
-        mesh.indices.insert(mesh.indices.end(), triList.begin(), triList.end());
+        mesh.indices.insert(mesh.indices.end(), kv.second.begin(), kv.second.end());
     }
 
     if (cellCount > 0) {
@@ -573,7 +601,8 @@ static LightmappedMesh buildLightmappedMesh(
     float sumX = 0, sumY = 0, sumZ = 0;
     int cellCount = 0;
 
-    std::unordered_map<uint8_t, std::vector<uint32_t>> texTriangles;
+    // Temporary per-(cell, texture) triangle lists for portal culling support
+    std::map<uint64_t, std::vector<uint32_t>> cellTexTriangles;
 
     auto findWrap = [](float x) -> float {
         if (x >= 0) return -64.0f * static_cast<int>(x / 64.0f);
@@ -751,8 +780,10 @@ static LightmappedMesh buildLightmappedMesh(
                 }
             }
 
+            // Fan-triangulate, grouped by (cellID, txtIndex) for portal culling
             uint8_t key = isTextured ? txtIdx : 0;
-            auto &triList = texTriangles[key];
+            uint64_t cellTexKey = (static_cast<uint64_t>(ci) << 8) | key;
+            auto &triList = cellTexTriangles[cellTexKey];
             for (int t = 1; t < poly.count - 1; ++t) {
                 triList.push_back(baseVertex);
                 triList.push_back(baseVertex + t + 1);
@@ -761,20 +792,17 @@ static LightmappedMesh buildLightmappedMesh(
         }
     }
 
-    // Build sorted index buffer
-    std::vector<uint8_t> sortedKeys;
-    for (auto &kv : texTriangles)
-        sortedKeys.push_back(kv.first);
-    std::sort(sortedKeys.begin(), sortedKeys.end());
-
-    for (uint8_t key : sortedKeys) {
-        auto &triList = texTriangles[key];
-        TextureGroup grp;
-        grp.txtIndex = key;
+    // Build sorted index buffer: groups sorted by (cellID, txtIndex)
+    for (auto &kv : cellTexTriangles) {
+        uint32_t cellID = static_cast<uint32_t>(kv.first >> 8);
+        uint8_t txtIdx = static_cast<uint8_t>(kv.first & 0xFF);
+        CellTextureGroup grp;
+        grp.cellID = cellID;
+        grp.txtIndex = txtIdx;
         grp.firstIndex = static_cast<uint32_t>(mesh.indices.size());
-        grp.numIndices = static_cast<uint32_t>(triList.size());
+        grp.numIndices = static_cast<uint32_t>(kv.second.size());
         mesh.groups.push_back(grp);
-        mesh.indices.insert(mesh.indices.end(), triList.begin(), triList.end());
+        mesh.indices.insert(mesh.indices.end(), kv.second.begin(), kv.second.end());
     }
 
     if (cellCount > 0) {
@@ -859,17 +887,16 @@ static void buildFallbackCube(std::vector<PosColorVertex> &verts,
 // ── Camera-to-cell lookup ──
 // Find which WR cell the camera is currently inside using a proper
 // point-in-convex-cell test against each cell's bounding planes.
-// Returns the mediaType of the containing cell (1=air, 2=water)
-// or 1 (air) if no cell contains the camera.
-// When the camera is near a water boundary, it may be geometrically inside
-// both an air cell and a water cell (they share the portal plane).
-// We prefer the smallest containing cell to get the most specific answer.
-static uint8_t getCameraMediaType(const Opde::WRParsedData &wr,
-                                   float cx, float cy, float cz) {
+// ── Camera cell detection ──
+// Find which cell the camera is in. Returns cell index, or -1 if outside
+// all cells. When the camera is near a water boundary, it may be inside
+// both an air and water cell — we prefer the smallest containing cell.
+
+static int32_t findCameraCell(const Opde::WRParsedData &wr,
+                               float cx, float cy, float cz) {
     Opde::Vector3 pt(cx, cy, cz);
     float bestRadius = 1e30f;
-    uint8_t bestMedia = 1;  // default: air
-    bool found = false;
+    int32_t bestCell = -1;
 
     for (uint32_t i = 0; i < wr.numCells; ++i) {
         const auto &cell = wr.cells[i];
@@ -898,13 +925,209 @@ static uint8_t getCameraMediaType(const Opde::WRParsedData &wr,
             // smaller than the adjacent air cells they border.
             if (cell.radius < bestRadius) {
                 bestRadius = cell.radius;
-                bestMedia = cell.mediaType;
-                found = true;
+                bestCell = static_cast<int32_t>(i);
             }
         }
     }
 
-    return bestMedia;
+    return bestCell;
+}
+
+// Convenience wrapper: returns mediaType (1=air, 2=water) for underwater detection
+static uint8_t getCameraMediaType(const Opde::WRParsedData &wr,
+                                   float cx, float cy, float cz) {
+    int32_t cell = findCameraCell(wr, cx, cy, cz);
+    if (cell >= 0 && cell < static_cast<int32_t>(wr.numCells))
+        return wr.cells[cell].mediaType;
+    return 1; // default: air
+}
+
+// ── Portal culling infrastructure ──
+
+// Portal connectivity info for BFS traversal
+struct PortalInfo {
+    uint32_t tgtCell;           // destination cell index
+    Opde::Plane plane;          // portal plane (for backface cull)
+    // Portal polygon AABB (for frustum test)
+    float minX, minY, minZ;
+    float maxX, maxY, maxZ;
+};
+
+// Build portal adjacency graph from WR data.
+// cellPortals[cellID] = list of portals leading to other cells.
+static std::vector<std::vector<PortalInfo>>
+buildPortalGraph(const Opde::WRParsedData &wr) {
+    std::vector<std::vector<PortalInfo>> cellPortals(wr.numCells);
+
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        const auto &cell = wr.cells[ci];
+        int numSolid = cell.numPolygons - cell.numPortals;
+
+        for (int pi = numSolid; pi < cell.numPolygons; ++pi) {
+            const auto &poly = cell.polygons[pi];
+            const auto &indices = cell.polyIndices[pi];
+
+            if (poly.count < 3) continue;
+            if (poly.tgtCell >= wr.numCells) continue;
+
+            PortalInfo portal;
+            portal.tgtCell = poly.tgtCell;
+
+            // Get portal plane from the polygon's plane reference
+            if (poly.plane < cell.planes.size()) {
+                portal.plane = cell.planes[poly.plane];
+            }
+
+            // Compute AABB of portal polygon vertices
+            portal.minX = portal.minY = portal.minZ =  1e30f;
+            portal.maxX = portal.maxY = portal.maxZ = -1e30f;
+
+            for (int vi = 0; vi < poly.count; ++vi) {
+                uint8_t idx = indices[vi];
+                if (idx >= cell.vertices.size()) continue;
+                const auto &v = cell.vertices[idx];
+                portal.minX = std::min(portal.minX, v.x);
+                portal.minY = std::min(portal.minY, v.y);
+                portal.minZ = std::min(portal.minZ, v.z);
+                portal.maxX = std::max(portal.maxX, v.x);
+                portal.maxY = std::max(portal.maxY, v.y);
+                portal.maxZ = std::max(portal.maxZ, v.z);
+            }
+
+            cellPortals[ci].push_back(portal);
+        }
+    }
+
+    return cellPortals;
+}
+
+// ── View frustum for portal culling ──
+// 6 planes extracted from the view-projection matrix (VP = view * proj).
+// Each plane stored as (a, b, c, d) where ax + by + cz + d >= 0 means inside.
+
+struct ViewFrustum {
+    float planes[6][4]; // left, right, bottom, top, near, far
+
+    // Extract frustum planes from a combined view-projection matrix.
+    // Standard technique: each plane is a sum/difference of VP matrix rows.
+    // Matrix is in row-major order (bx convention).
+    void extractFromVP(const float *vp) {
+        // Left: row3 + row0
+        planes[0][0] = vp[ 3] + vp[ 0];
+        planes[0][1] = vp[ 7] + vp[ 4];
+        planes[0][2] = vp[11] + vp[ 8];
+        planes[0][3] = vp[15] + vp[12];
+        // Right: row3 - row0
+        planes[1][0] = vp[ 3] - vp[ 0];
+        planes[1][1] = vp[ 7] - vp[ 4];
+        planes[1][2] = vp[11] - vp[ 8];
+        planes[1][3] = vp[15] - vp[12];
+        // Bottom: row3 + row1
+        planes[2][0] = vp[ 3] + vp[ 1];
+        planes[2][1] = vp[ 7] + vp[ 5];
+        planes[2][2] = vp[11] + vp[ 9];
+        planes[2][3] = vp[15] + vp[13];
+        // Top: row3 - row1
+        planes[3][0] = vp[ 3] - vp[ 1];
+        planes[3][1] = vp[ 7] - vp[ 5];
+        planes[3][2] = vp[11] - vp[ 9];
+        planes[3][3] = vp[15] - vp[13];
+        // Near: row3 + row2
+        planes[4][0] = vp[ 3] + vp[ 2];
+        planes[4][1] = vp[ 7] + vp[ 6];
+        planes[4][2] = vp[11] + vp[10];
+        planes[4][3] = vp[15] + vp[14];
+        // Far: row3 - row2
+        planes[5][0] = vp[ 3] - vp[ 2];
+        planes[5][1] = vp[ 7] - vp[ 6];
+        planes[5][2] = vp[11] - vp[10];
+        planes[5][3] = vp[15] - vp[14];
+
+        // Normalize each plane
+        for (int i = 0; i < 6; ++i) {
+            float len = std::sqrt(planes[i][0]*planes[i][0] +
+                                  planes[i][1]*planes[i][1] +
+                                  planes[i][2]*planes[i][2]);
+            if (len > 1e-8f) {
+                float inv = 1.0f / len;
+                planes[i][0] *= inv;
+                planes[i][1] *= inv;
+                planes[i][2] *= inv;
+                planes[i][3] *= inv;
+            }
+        }
+    }
+
+    // Test if an AABB is completely outside any frustum plane.
+    // Returns true if the AABB is at least partially inside the frustum.
+    // Conservative: may return true for some AABBs that are outside
+    // (the "positive vertex" test), but never false for visible AABBs.
+    bool testAABB(float minX, float minY, float minZ,
+                  float maxX, float maxY, float maxZ) const {
+        for (int i = 0; i < 6; ++i) {
+            // Find the "positive vertex" — the AABB corner most in the
+            // direction of the plane normal
+            float px = (planes[i][0] >= 0) ? maxX : minX;
+            float py = (planes[i][1] >= 0) ? maxY : minY;
+            float pz = (planes[i][2] >= 0) ? maxZ : minZ;
+            float dist = planes[i][0]*px + planes[i][1]*py +
+                         planes[i][2]*pz + planes[i][3];
+            if (dist < 0.0f)
+                return false; // entirely outside this plane
+        }
+        return true;
+    }
+};
+
+// BFS portal traversal: starting from the camera cell, follow portals
+// that are visible to the view frustum. Returns the set of visible cell IDs.
+static std::unordered_set<uint32_t>
+portalBFS(const Opde::WRParsedData &wr,
+          const std::vector<std::vector<PortalInfo>> &cellPortals,
+          int32_t startCell,
+          const ViewFrustum &frustum,
+          float camX, float camY, float camZ) {
+    std::unordered_set<uint32_t> visible;
+
+    if (startCell < 0 || startCell >= static_cast<int32_t>(wr.numCells))
+        return visible;
+
+    std::queue<uint32_t> queue;
+    queue.push(static_cast<uint32_t>(startCell));
+    visible.insert(static_cast<uint32_t>(startCell));
+
+    Opde::Vector3 camPos(camX, camY, camZ);
+
+    while (!queue.empty()) {
+        uint32_t ci = queue.front();
+        queue.pop();
+
+        if (ci >= cellPortals.size()) continue;
+
+        for (const auto &portal : cellPortals[ci]) {
+            // Already visited?
+            if (visible.count(portal.tgtCell))
+                continue;
+
+            // Backface test: skip portals facing away from the camera.
+            // Camera must be on the positive side of the portal plane
+            // (Dark Engine cell planes face inward).
+            float camDist = portal.plane.getDistance(camPos);
+            if (camDist < -0.1f)
+                continue;
+
+            // Frustum test: check if portal AABB intersects view frustum
+            if (!frustum.testAABB(portal.minX, portal.minY, portal.minZ,
+                                  portal.maxX, portal.maxY, portal.maxZ))
+                continue;
+
+            // Portal is visible — add target cell and continue traversal
+            visible.insert(portal.tgtCell);
+            queue.push(portal.tgtCell);
+        }
+    }
+
+    return visible;
 }
 
 // ── Fog parameters ──
@@ -1437,6 +1660,7 @@ static void printHelp() {
         "                 2/4/8 = progressively smoother shadows via bicubic\n"
         "                 interpolation. Higher values use more atlas memory.\n"
         "  --no-objects   Disable object mesh rendering (world geometry only).\n"
+        "  --no-cull      Start with portal culling disabled (see all geometry).\n"
         "  --force-flicker Force all animated lights to flicker mode (debug).\n"
         "  --help         Show this help message.\n"
         "\n"
@@ -1447,6 +1671,7 @@ static void printHelp() {
         "  Q/E            Move up/down (alternate)\n"
         "  Ctrl           Sprint (3x speed)\n"
         "  Scroll wheel   Adjust movement speed (shown in title bar)\n"
+        "  C              Toggle portal culling on/off\n"
         "  Home           Teleport to player spawn point\n"
         "  Esc            Quit\n"
         "\n"
@@ -1486,6 +1711,7 @@ int main(int argc, char *argv[]) {
     int lmScale = 1;
     bool showObjects = true;
     bool forceFlicker = false;
+    bool portalCulling = true; // enabled by default, toggled by C key
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
@@ -1502,6 +1728,9 @@ int main(int argc, char *argv[]) {
         }
         if (std::strcmp(argv[i], "--no-objects") == 0) {
             showObjects = false;
+        }
+        if (std::strcmp(argv[i], "--no-cull") == 0) {
+            portalCulling = false;
         }
         if (std::strcmp(argv[i], "--force-flicker") == 0) {
             forceFlicker = true;
@@ -1536,6 +1765,15 @@ int main(int argc, char *argv[]) {
     }
 
     std::fprintf(stderr, "Loaded %u cells\n", wrData.numCells);
+
+    // Build portal adjacency graph for portal culling
+    auto cellPortals = buildPortalGraph(wrData);
+    {
+        int totalPortals = 0;
+        for (const auto &pl : cellPortals) totalPortals += static_cast<int>(pl.size());
+        std::fprintf(stderr, "Portal graph: %d portals across %u cells\n",
+                     totalPortals, wrData.numCells);
+    }
 
     // Find player spawn point from L$PlayerFactory + P$Position chunks
     Opde::SpawnInfo spawnInfo = Opde::findSpawnPoint(misPath);
@@ -1712,6 +1950,22 @@ int main(int argc, char *argv[]) {
         if (objData.objects.empty()) {
             std::fprintf(stderr, "No objects to render\n");
             showObjects = false;
+        }
+    }
+
+    // Precompute which cell each object is in for portal culling.
+    // Objects don't move (yet), so this is a one-time lookup at load time.
+    // -1 = outside all cells (always rendered to avoid popping).
+    std::vector<int32_t> objCellIDs;
+    if (showObjects) {
+        objCellIDs.resize(objData.objects.size());
+        for (size_t i = 0; i < objData.objects.size(); ++i) {
+            const auto &obj = objData.objects[i];
+            if (obj.hasPosition) {
+                objCellIDs[i] = findCameraCell(wrData, obj.x, obj.y, obj.z);
+            } else {
+                objCellIDs[i] = -1;
+            }
         }
     }
 
@@ -2345,6 +2599,8 @@ int main(int argc, char *argv[]) {
                           texturedMode ? "textured" : "flat-shaded";
     std::fprintf(stderr, "Render window opened (%dx%d, Metal, %s)\n",
                  WINDOW_WIDTH, WINDOW_HEIGHT, modeStr);
+    std::fprintf(stderr, "Portal culling: %s (toggle with C key)\n",
+                 portalCulling ? "ON" : "OFF");
 
     // Use spawn point if found, otherwise fall back to centroid
     float spawnX = camX, spawnY = camY, spawnZ = camZ;
@@ -2362,7 +2618,7 @@ int main(int argc, char *argv[]) {
     }
 
     std::fprintf(stderr, "Controls: WASD=move, mouse=look, Space/LShift=up/down, "
-                 "scroll=speed, Home=spawn, Esc=quit\n");
+                 "scroll=speed, C=toggle culling, Home=spawn, Esc=quit\n");
 
     Camera cam;
     cam.init(spawnX, spawnY, spawnZ);
@@ -2374,11 +2630,22 @@ int main(int argc, char *argv[]) {
     const float MOUSE_SENS = 0.002f;
     const float PI = 3.14159265f;
 
-    // Helper to update window title with current speed
+    // Portal culling stats for title bar display
+    uint32_t cullVisibleCells = 0;  // updated each frame when culling is on
+    uint32_t cullTotalCells = wrData.numCells;
+
+    // Helper to update window title with current speed and culling stats
     auto updateTitle = [&]() {
-        char title[128];
-        std::snprintf(title, sizeof(title), "darkness — %s [speed: %.1f]",
-                      modeStr, moveSpeed);
+        char title[256];
+        if (portalCulling) {
+            std::snprintf(title, sizeof(title),
+                "darkness — %s [speed: %.1f] [cull: %u/%u cells]",
+                modeStr, moveSpeed, cullVisibleCells, cullTotalCells);
+        } else {
+            std::snprintf(title, sizeof(title),
+                "darkness — %s [speed: %.1f] [cull: OFF]",
+                modeStr, moveSpeed);
+        }
         SDL_SetWindowTitle(window, title);
     };
     updateTitle();
@@ -2428,6 +2695,11 @@ int main(int argc, char *argv[]) {
                 cam.pitch = 0;
                 std::fprintf(stderr, "Teleported to spawn (%.1f, %.1f, %.1f)\n",
                              spawnX, spawnY, spawnZ);
+            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c) {
+                // Toggle portal culling
+                portalCulling = !portalCulling;
+                std::fprintf(stderr, "Portal culling: %s\n",
+                             portalCulling ? "ON" : "OFF");
             }
         }
 
@@ -2601,12 +2873,38 @@ int main(int argc, char *argv[]) {
         cam.getViewMatrix(view);
         bgfx::setViewTransform(1, view, proj);
 
+        // ── Portal culling: determine visible cells ──
+        // Build view-projection matrix and extract frustum planes for portal tests.
+        // When culling is disabled, visibleCells remains empty (skip filtering).
+        std::unordered_set<uint32_t> visibleCells;
+        if (portalCulling) {
+            float vp[16];
+            bx::mtxMul(vp, view, proj);
+            ViewFrustum frustum;
+            frustum.extractFromVP(vp);
+
+            int32_t camCell = findCameraCell(wrData, cam.pos[0], cam.pos[1], cam.pos[2]);
+            visibleCells = portalBFS(wrData, cellPortals, camCell, frustum,
+                                     cam.pos[0], cam.pos[1], cam.pos[2]);
+            cullVisibleCells = static_cast<uint32_t>(visibleCells.size());
+        }
+        // Update title bar with culling stats every frame
+        updateTitle();
+
         // Identity model transform for world geometry
         float model[16];
         bx::mtxIdentity(model);
 
+        // Lambda: check if a cell should be rendered (culling filter)
+        auto isCellVisible = [&](uint32_t cellID) -> bool {
+            if (!portalCulling) return true; // culling off: render everything
+            return visibleCells.count(cellID) > 0;
+        };
+
         if (lightmappedMode) {
             for (const auto &grp : lmMesh.groups) {
+                if (!isCellVisible(grp.cellID)) continue;
+
                 setFogOn();
                 bgfx::setTransform(model);
                 bgfx::setVertexBuffer(0, vbh);
@@ -2629,6 +2927,8 @@ int main(int argc, char *argv[]) {
             }
         } else if (texturedMode) {
             for (const auto &grp : worldMesh.groups) {
+                if (!isCellVisible(grp.cellID)) continue;
+
                 setFogOn();
                 bgfx::setTransform(model);
                 bgfx::setVertexBuffer(0, vbh);
@@ -2648,18 +2948,31 @@ int main(int argc, char *argv[]) {
                 }
             }
         } else {
-            setFogOn();
-            bgfx::setTransform(model);
-            bgfx::setVertexBuffer(0, vbh);
-            bgfx::setIndexBuffer(ibh);
-            bgfx::setState(renderState);
-            bgfx::submit(1, flatProgram);
+            for (const auto &grp : flatMesh.groups) {
+                if (!isCellVisible(grp.cellID)) continue;
+
+                setFogOn();
+                bgfx::setTransform(model);
+                bgfx::setVertexBuffer(0, vbh);
+                bgfx::setIndexBuffer(ibh, grp.firstIndex, grp.numIndices);
+                bgfx::setState(renderState);
+                bgfx::submit(1, flatProgram);
+            }
         }
 
         // ── Draw object meshes (per-submesh for textured/solid materials) ──
         if (showObjects) {
-            for (const auto &obj : objData.objects) {
+            for (size_t oi = 0; oi < objData.objects.size(); ++oi) {
+                const auto &obj = objData.objects[oi];
                 if (!obj.hasPosition) continue;
+
+                // Portal culling: skip objects in non-visible cells.
+                // Objects outside all cells (cellID == -1) are always rendered.
+                if (portalCulling && oi < objCellIDs.size()) {
+                    int32_t objCell = objCellIDs[oi];
+                    if (objCell >= 0 && visibleCells.count(static_cast<uint32_t>(objCell)) == 0)
+                        continue;
+                }
 
                 // Compute per-object model matrix from position + angles
                 float objMtx[16];
