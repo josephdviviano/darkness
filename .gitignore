@@ -21,6 +21,7 @@ vcpkg_installed/
 CMakeUserPresets.json
 
 # Working notes (DO NOT DELETE — important local project docs, kept out of repo only)
+.claude/*
 PROJECT_NOTES.md
 TASKS.md
 DARKENGINE_PORT_PLAN_v3.MD
