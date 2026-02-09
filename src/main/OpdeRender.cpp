@@ -856,6 +856,57 @@ static void buildFallbackCube(std::vector<PosColorVertex> &verts,
     }
 }
 
+// ── Camera-to-cell lookup ──
+// Find which WR cell the camera is currently inside using a proper
+// point-in-convex-cell test against each cell's bounding planes.
+// Returns the mediaType of the containing cell (1=air, 2=water)
+// or 1 (air) if no cell contains the camera.
+// When the camera is near a water boundary, it may be geometrically inside
+// both an air cell and a water cell (they share the portal plane).
+// We prefer the smallest containing cell to get the most specific answer.
+static uint8_t getCameraMediaType(const Opde::WRParsedData &wr,
+                                   float cx, float cy, float cz) {
+    Opde::Vector3 pt(cx, cy, cz);
+    float bestRadius = 1e30f;
+    uint8_t bestMedia = 1;  // default: air
+    bool found = false;
+
+    for (uint32_t i = 0; i < wr.numCells; ++i) {
+        const auto &cell = wr.cells[i];
+
+        // Quick reject: skip cells whose bounding sphere doesn't contain the point
+        float dx = cx - cell.center.x;
+        float dy = cy - cell.center.y;
+        float dz = cz - cell.center.z;
+        float dist2 = dx*dx + dy*dy + dz*dz;
+        if (dist2 > cell.radius * cell.radius)
+            continue;
+
+        // Precise test: point must be on the positive side of all cell planes.
+        // Dark Engine convention: cell planes face inward, so inside = positive
+        // distance (normal · point + d > 0). Small negative epsilon for boundary.
+        bool inside = true;
+        for (const auto &plane : cell.planes) {
+            if (plane.getDistance(pt) < -0.1f) {
+                inside = false;
+                break;
+            }
+        }
+
+        if (inside) {
+            // Prefer the smallest containing cell — water cells are typically
+            // smaller than the adjacent air cells they border.
+            if (cell.radius < bestRadius) {
+                bestRadius = cell.radius;
+                bestMedia = cell.mediaType;
+                found = true;
+            }
+        }
+    }
+
+    return bestMedia;
+}
+
 // ── Fog parameters ──
 
 // Global mission fog — parsed from the FOG chunk in .mis files.
@@ -2448,14 +2499,50 @@ int main(int argc, char *argv[]) {
                      bgfx::getCaps()->homogeneousDepth,
                      bx::Handedness::Right);
 
+        // ── Underwater detection ──
+        // Check if the camera is inside a water cell (mediaType==2).
+        // When submerged, override fog with short-range blue-green water fog.
+        bool underwater = (getCameraMediaType(wrData, cam.pos[0], cam.pos[1], cam.pos[2]) == 2);
+
+        // Water fog defaults: dark blue-green tint, short visibility range
+        static constexpr float waterFogR = 0.10f, waterFogG = 0.18f, waterFogB = 0.25f;
+        static constexpr float waterFogDist = 80.0f;
+
         // ── Fog uniform values (reused before every bgfx::submit) ──
         // bgfx uniforms are per-submit: cleared after each draw call.
         // We set them before every submit so all shaders receive fog data.
-        float fogColorArr[4] = { fogParams.r, fogParams.g, fogParams.b, 1.0f };
-        float fogOnArr[4]  = { fogParams.enabled ? 1.0f : 0.0f, fogParams.distance, 0.0f, 0.0f };
+        // When underwater, override with water fog regardless of FOG chunk.
+        float fogColorArr[4], fogOnArr[4];
+        if (underwater) {
+            fogColorArr[0] = waterFogR; fogColorArr[1] = waterFogG;
+            fogColorArr[2] = waterFogB; fogColorArr[3] = 1.0f;
+            fogOnArr[0] = 1.0f; fogOnArr[1] = waterFogDist;
+            fogOnArr[2] = 0.0f; fogOnArr[3] = 0.0f;
+        } else {
+            fogColorArr[0] = fogParams.r; fogColorArr[1] = fogParams.g;
+            fogColorArr[2] = fogParams.b; fogColorArr[3] = 1.0f;
+            fogOnArr[0] = fogParams.enabled ? 1.0f : 0.0f;
+            fogOnArr[1] = fogParams.distance;
+            fogOnArr[2] = 0.0f; fogOnArr[3] = 0.0f;
+        }
         float fogOffArr[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
-        // Which fog params to use for sky: on if SKYOBJVAR.fog is set, off otherwise
-        float *skyFogArr = (fogParams.enabled && skyParams.fog) ? fogOnArr : fogOffArr;
+        // Sky fog: underwater always fogs sky; otherwise respect SKYOBJVAR.fog
+        bool skyFogged = underwater || (fogParams.enabled && skyParams.fog);
+        float *skyFogArr = skyFogged ? fogOnArr : fogOffArr;
+
+        // Update clear color per-frame for underwater tinting
+        if (underwater) {
+            uint8_t cr = static_cast<uint8_t>(waterFogR * 255.0f);
+            uint8_t cg = static_cast<uint8_t>(waterFogG * 255.0f);
+            uint8_t cb = static_cast<uint8_t>(waterFogB * 255.0f);
+            uint32_t waterClear = (uint32_t(cr) << 24) | (uint32_t(cg) << 16)
+                                | (uint32_t(cb) << 8) | 0xFF;
+            bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+                                waterClear, 1.0f, 0);
+        } else {
+            bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+                                skyClearColor, 1.0f, 0);
+        }
 
         // Helper: set fog uniforms before each submit call
         // (bgfx clears all uniform state after each submit)
