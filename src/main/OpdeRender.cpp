@@ -148,6 +148,15 @@ static uint32_t packABGR(float r, float g, float b) {
     return 0xff000000u | (bi << 16) | (gi << 8) | ri;
 }
 
+// Overload with explicit alpha for translucent geometry (e.g. water surfaces)
+static uint32_t packABGR(float r, float g, float b, float a) {
+    uint8_t ri = static_cast<uint8_t>(std::min(std::max(r, 0.0f), 1.0f) * 255.0f);
+    uint8_t gi = static_cast<uint8_t>(std::min(std::max(g, 0.0f), 1.0f) * 255.0f);
+    uint8_t bi = static_cast<uint8_t>(std::min(std::max(b, 0.0f), 1.0f) * 255.0f);
+    uint8_t ai = static_cast<uint8_t>(std::min(std::max(a, 0.0f), 1.0f) * 255.0f);
+    return (uint32_t(ai) << 24) | (uint32_t(bi) << 16) | (uint32_t(gi) << 8) | ri;
+}
+
 // ── Build flat-shaded mesh (no textures) ──
 
 static FlatMesh buildFlatMesh(const Opde::WRParsedData &wr) {
@@ -228,6 +237,53 @@ static FlatMesh buildFlatMesh(const Opde::WRParsedData &wr) {
         mesh.cx = mesh.cy = mesh.cz = 0;
     }
 
+    return mesh;
+}
+
+// ── Build water surface mesh from portal polygons ──
+// Water portals live at indices [numSolid..numPolygons) with flags != 0.
+// Only emit from air cells (mediaType==1) to avoid double-rendering — the
+// same portal polygon exists in both the air and water cell.
+
+static FlatMesh buildWaterMesh(const Opde::WRParsedData &wr) {
+    FlatMesh mesh;
+    // Semi-transparent dark blue-green — Dark Engine default water color
+    uint32_t waterColor = packABGR(0.2f, 0.32f, 0.4f, 0.35f);
+    int waterPolyCount = 0;
+
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        const auto &cell = wr.cells[ci];
+        // Only emit from air cells to avoid double-rendering at portal boundaries
+        if (cell.mediaType != 1) continue;
+        int numSolid = cell.numPolygons - cell.numPortals;
+
+        for (int pi = numSolid; pi < cell.numPolygons; ++pi) {
+            const auto &poly = cell.polygons[pi];
+            const auto &indices = cell.polyIndices[pi];
+            if (poly.count < 3) continue;
+            // Water portal: flags != 0 (non-water portals have flags == 0)
+            if (poly.flags == 0) continue;
+
+            uint32_t baseVertex = static_cast<uint32_t>(mesh.vertices.size());
+            for (int vi = 0; vi < poly.count; ++vi) {
+                uint8_t idx = indices[vi];
+                if (idx >= cell.vertices.size()) continue;
+                const auto &v = cell.vertices[idx];
+                mesh.vertices.push_back({v.x, v.y, v.z, waterColor});
+            }
+            // Fan triangulation: same winding as buildFlatMesh
+            for (int t = 1; t < poly.count - 1; ++t) {
+                mesh.indices.push_back(baseVertex);
+                mesh.indices.push_back(baseVertex + t + 1);
+                mesh.indices.push_back(baseVertex + t);
+            }
+            ++waterPolyCount;
+        }
+    }
+
+    mesh.cx = mesh.cy = mesh.cz = 0;
+    std::fprintf(stderr, "Water mesh: %d polygons, %zu vertices, %zu indices\n",
+                 waterPolyCount, mesh.vertices.size(), mesh.indices.size());
     return mesh;
 }
 
@@ -1835,6 +1891,23 @@ int main(int argc, char *argv[]) {
         ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
     }
 
+    // ── Build water surface mesh from portal polygons ──
+    FlatMesh waterMesh = buildWaterMesh(wrData);
+    bgfx::VertexBufferHandle waterVBH = BGFX_INVALID_HANDLE;
+    bgfx::IndexBufferHandle waterIBH = BGFX_INVALID_HANDLE;
+    bool hasWater = !waterMesh.vertices.empty();
+
+    if (hasWater) {
+        waterVBH = bgfx::createVertexBuffer(
+            bgfx::copy(waterMesh.vertices.data(),
+                        static_cast<uint32_t>(waterMesh.vertices.size() * sizeof(PosColorVertex))),
+            PosColorVertex::layout);
+        waterIBH = bgfx::createIndexBuffer(
+            bgfx::copy(waterMesh.indices.data(),
+                        static_cast<uint32_t>(waterMesh.indices.size() * sizeof(uint32_t))),
+            BGFX_BUFFER_INDEX32);
+    }
+
     // ── Create GPU buffers for object meshes ──
 
     // Per-unique-model GPU buffers (PosColorUVVertex for textured rendering)
@@ -2352,8 +2425,30 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        // ── Water surfaces: alpha-blended, no depth write, double-sided ──
+        // Rendered last so all opaque geometry is already in the depth buffer.
+        if (hasWater) {
+            float identity[16];
+            bx::mtxIdentity(identity);
+            bgfx::setTransform(identity);
+            bgfx::setVertexBuffer(0, waterVBH);
+            bgfx::setIndexBuffer(waterIBH);
+            // Alpha blend, depth test (read) but no depth write, no face culling
+            uint64_t waterState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                | BGFX_STATE_DEPTH_TEST_LESS
+                | BGFX_STATE_BLEND_ALPHA;
+            // No BGFX_STATE_WRITE_Z — water doesn't occlude geometry behind it
+            // No BGFX_STATE_CULL_* — water is visible from both sides
+            bgfx::setState(waterState);
+            bgfx::submit(1, flatProgram);
+        }
+
         bgfx::frame();
     }
+
+    // Cleanup — water surface buffers
+    if (bgfx::isValid(waterVBH)) bgfx::destroy(waterVBH);
+    if (bgfx::isValid(waterIBH)) bgfx::destroy(waterIBH);
 
     // Cleanup — textured skybox buffers
     if (bgfx::isValid(skyboxVBH)) bgfx::destroy(skyboxVBH);

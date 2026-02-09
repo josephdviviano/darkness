@@ -133,6 +133,7 @@ struct WRLightInfo {
 struct WRParsedCell {
     uint8_t numPolygons, numPortals, numPlanes, mediaType;
     uint8_t numTextured;
+    uint8_t flowGroup;  // 0=no flow, else flow group number for water animation
     Vector3 center;
     float radius;
     std::vector<Vector3> vertices;
@@ -201,6 +202,7 @@ inline WRParsedData parseWRChunk(const std::string &misPath) {
         cell.numPortals = ch.numPortals;
         cell.numPlanes = ch.numPlanes;
         cell.mediaType = ch.mediaType;
+        cell.flowGroup = ch.flowGroup;
         cell.center = ch.center;
         cell.radius = ch.radius;
 
