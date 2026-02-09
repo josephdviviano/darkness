@@ -856,11 +856,63 @@ static void buildFallbackCube(std::vector<PosColorVertex> &verts,
     }
 }
 
+// ── Fog parameters ──
+
+// Global mission fog — parsed from the FOG chunk in .mis files.
+// Linear distance fog: fully transparent at camera, fully opaque at 'distance'.
+struct FogParams {
+    bool enabled;           // true if FOG chunk present and distance > 0
+    float r, g, b;          // fog color in 0..1 range
+    float distance;         // distance at which fog is fully opaque
+};
+
+// Parse the FOG chunk from a .mis file if present.
+// Format: DarkDBChunkFOG = { int32 red, int32 green, int32 blue, float distance }
+static FogParams parseFogChunk(const char *misPath) {
+    FogParams fog = { false, 0.0f, 0.0f, 0.0f, 1.0f };
+
+    try {
+        Opde::FilePtr fp(new Opde::StdFile(misPath, Opde::File::FILE_R));
+        Opde::FileGroupPtr db(new Opde::DarkFileGroup(fp));
+
+        if (!db->hasFile("FOG")) {
+            std::fprintf(stderr, "No FOG chunk — fog disabled\n");
+            return fog;
+        }
+
+        Opde::FilePtr chunk = db->getFile("FOG");
+
+        int32_t red, green, blue;
+        float distance;
+        chunk->readElem(&red, sizeof(red));
+        chunk->readElem(&green, sizeof(green));
+        chunk->readElem(&blue, sizeof(blue));
+        chunk->readElem(&distance, sizeof(distance));
+
+        if (distance > 0.0f) {
+            fog.enabled = true;
+            fog.r = static_cast<float>(red) / 255.0f;
+            fog.g = static_cast<float>(green) / 255.0f;
+            fog.b = static_cast<float>(blue) / 255.0f;
+            fog.distance = distance;
+            std::fprintf(stderr, "FOG: color=(%d,%d,%d) distance=%.1f\n",
+                         red, green, blue, distance);
+        } else {
+            std::fprintf(stderr, "FOG: chunk present but distance=0 — fog disabled\n");
+        }
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "Failed to read FOG: %s (fog disabled)\n", e.what());
+    }
+
+    return fog;
+}
+
 // ── Sky dome ──
 
 // Sky rendering parameters — either from SKYOBJVAR chunk or defaults
 struct SkyParams {
     bool enabled;           // useNewSky from SKYOBJVAR (true if chunk present)
+    bool fog;               // whether the sky should be affected by fog
     int numLatPoints;       // latitude rings (default 8)
     int numLonPoints;       // longitude segments (default 24)
     float dipAngle;         // how far below horizon to extend (degrees, default 10)
@@ -878,6 +930,7 @@ struct SkyParams {
 static SkyParams defaultSkyParams() {
     SkyParams p;
     p.enabled = true;
+    p.fog = true;  // default: sky affected by fog (overridden by SKYOBJVAR if present)
     p.numLatPoints = 8;
     p.numLonPoints = 24;
     p.dipAngle = 10.0f;
@@ -952,6 +1005,7 @@ static SkyParams parseSkyObjVar(const char *misPath) {
 
         if (enable) {
             params.enabled = true;
+            params.fog = (fog != 0);
             params.numLatPoints = (latCount > 2 && latCount < 32) ? latCount : 8;
             params.numLonPoints = (lonCount > 4 && lonCount < 64) ? lonCount : 24;
             params.dipAngle = dipAngle;
@@ -1503,6 +1557,9 @@ int main(int argc, char *argv[]) {
     SkyParams skyParams = parseSkyObjVar(misPath);
     SkyDome skyDome = buildSkyDome(skyParams);
 
+    // Parse global fog parameters from FOG chunk (if present)
+    FogParams fogParams = parseFogChunk(misPath);
+
     // Parse TXLIST if in textured mode
     Opde::TXList txList;
     if (texturedMode) {
@@ -1747,8 +1804,16 @@ int main(int argc, char *argv[]) {
     }
 
     // View 0: Sky pass — clears colour + depth, renders sky dome with no depth writes
+    // When fog is enabled, use fog colour as clear colour so uncovered sky matches
+    uint32_t skyClearColor = 0x1a1a2eFF;
+    if (fogParams.enabled) {
+        uint8_t fr = static_cast<uint8_t>(fogParams.r * 255.0f);
+        uint8_t fg = static_cast<uint8_t>(fogParams.g * 255.0f);
+        uint8_t fb = static_cast<uint8_t>(fogParams.b * 255.0f);
+        skyClearColor = (uint32_t(fr) << 24) | (uint32_t(fg) << 16) | (uint32_t(fb) << 8) | 0xFF;
+    }
     bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
-                        0x1a1a2eFF, 1.0f, 0);
+                        skyClearColor, 1.0f, 0);
     bgfx::setViewRect(0, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
 
     // View 1: World + objects pass — clears depth only, preserves sky colour
@@ -1794,6 +1859,8 @@ int main(int argc, char *argv[]) {
     bgfx::UniformHandle s_texColor = bgfx::createUniform("s_texColor", bgfx::UniformType::Sampler);
     bgfx::UniformHandle s_texLightmap = bgfx::createUniform("s_texLightmap", bgfx::UniformType::Sampler);
     bgfx::UniformHandle u_waterParams = bgfx::createUniform("u_waterParams", bgfx::UniformType::Vec4);
+    bgfx::UniformHandle u_fogColor = bgfx::createUniform("u_fogColor", bgfx::UniformType::Vec4);
+    bgfx::UniformHandle u_fogParams = bgfx::createUniform("u_fogParams", bgfx::UniformType::Vec4);
 
     // ── Build lightmap atlas (if textured mode) ──
 
@@ -2381,6 +2448,26 @@ int main(int argc, char *argv[]) {
                      bgfx::getCaps()->homogeneousDepth,
                      bx::Handedness::Right);
 
+        // ── Fog uniform values (reused before every bgfx::submit) ──
+        // bgfx uniforms are per-submit: cleared after each draw call.
+        // We set them before every submit so all shaders receive fog data.
+        float fogColorArr[4] = { fogParams.r, fogParams.g, fogParams.b, 1.0f };
+        float fogOnArr[4]  = { fogParams.enabled ? 1.0f : 0.0f, fogParams.distance, 0.0f, 0.0f };
+        float fogOffArr[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
+        // Which fog params to use for sky: on if SKYOBJVAR.fog is set, off otherwise
+        float *skyFogArr = (fogParams.enabled && skyParams.fog) ? fogOnArr : fogOffArr;
+
+        // Helper: set fog uniforms before each submit call
+        // (bgfx clears all uniform state after each submit)
+        auto setFogOn = [&]() {
+            bgfx::setUniform(u_fogColor, fogColorArr);
+            bgfx::setUniform(u_fogParams, fogOnArr);
+        };
+        auto setFogSky = [&]() {
+            bgfx::setUniform(u_fogColor, fogColorArr);
+            bgfx::setUniform(u_fogParams, skyFogArr);
+        };
+
         // ── View 0: Sky pass ──
         // Sky rendered with rotation-only view (no translation),
         // no depth write/test — appears infinitely far behind everything.
@@ -2403,6 +2490,7 @@ int main(int argc, char *argv[]) {
                     auto texIt = skyboxTexHandles.find(face.key);
                     if (texIt == skyboxTexHandles.end()) continue;
 
+                    setFogSky();
                     bgfx::setTransform(skyModel);
                     bgfx::setVertexBuffer(0, skyboxVBH);
                     bgfx::setIndexBuffer(skyboxIBH, face.firstIndex, face.indexCount);
@@ -2412,6 +2500,7 @@ int main(int argc, char *argv[]) {
                 }
             } else if (bgfx::isValid(skyVBH)) {
                 // Procedural dome (new sky system) — vertex-coloured hemisphere
+                setFogSky();
                 bgfx::setTransform(skyModel);
                 bgfx::setVertexBuffer(0, skyVBH);
                 bgfx::setIndexBuffer(skyIBH);
@@ -2431,6 +2520,7 @@ int main(int argc, char *argv[]) {
 
         if (lightmappedMode) {
             for (const auto &grp : lmMesh.groups) {
+                setFogOn();
                 bgfx::setTransform(model);
                 bgfx::setVertexBuffer(0, vbh);
                 bgfx::setIndexBuffer(ibh, grp.firstIndex, grp.numIndices);
@@ -2452,6 +2542,7 @@ int main(int argc, char *argv[]) {
             }
         } else if (texturedMode) {
             for (const auto &grp : worldMesh.groups) {
+                setFogOn();
                 bgfx::setTransform(model);
                 bgfx::setVertexBuffer(0, vbh);
                 bgfx::setIndexBuffer(ibh, grp.firstIndex, grp.numIndices);
@@ -2470,6 +2561,7 @@ int main(int argc, char *argv[]) {
                 }
             }
         } else {
+            setFogOn();
             bgfx::setTransform(model);
             bgfx::setVertexBuffer(0, vbh);
             bgfx::setIndexBuffer(ibh);
@@ -2499,6 +2591,7 @@ int main(int argc, char *argv[]) {
                     for (const auto &sm : gpuModel.subMeshes) {
                         if (sm.indexCount == 0) continue;
 
+                        setFogOn();
                         bgfx::setTransform(objMtx);
                         bgfx::setVertexBuffer(0, gpuModel.vbh);
                         bgfx::setIndexBuffer(gpuModel.ibh, sm.firstIndex, sm.indexCount);
@@ -2522,6 +2615,7 @@ int main(int argc, char *argv[]) {
                     }
                 } else {
                     // Fallback: small coloured cube for missing models
+                    setFogOn();
                     bgfx::setTransform(objMtx);
                     bgfx::setVertexBuffer(0, fallbackCubeVBH);
                     bgfx::setIndexBuffer(fallbackCubeIBH);
@@ -2546,6 +2640,7 @@ int main(int argc, char *argv[]) {
             // No BGFX_STATE_CULL_* — water is visible from both sides
 
             for (const auto &grp : waterMesh.groups) {
+                setFogOn();
                 bgfx::setTransform(identity);
                 bgfx::setVertexBuffer(0, waterVBH);
                 bgfx::setIndexBuffer(waterIBH, grp.firstIndex, grp.numIndices);
@@ -2606,6 +2701,8 @@ int main(int argc, char *argv[]) {
     bgfx::destroy(s_texLightmap);
     bgfx::destroy(s_texColor);
     bgfx::destroy(u_waterParams);
+    bgfx::destroy(u_fogColor);
+    bgfx::destroy(u_fogParams);
 
     bgfx::destroy(ibh);
     bgfx::destroy(vbh);
