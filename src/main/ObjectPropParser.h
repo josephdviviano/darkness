@@ -47,7 +47,7 @@
 #include <vector>
 #include <algorithm>
 
-namespace Opde {
+namespace Darkness {
 
 // Per-object placement data merged from P$ModelName + P$Position chunks
 struct ObjectPlacement {
@@ -475,4 +475,4 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
     return result;
 }
 
-} // namespace Opde
+} // namespace Darkness

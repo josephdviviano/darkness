@@ -26,7 +26,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 /*--------------------------------------------------------*/
 /*--------------------- NeverInheritor -------------------*/
 /*--------------------------------------------------------*/
@@ -139,4 +139,4 @@ string NeverInheritorFactory::getName() const { return mName; }
 Inheritor *NeverInheritorFactory::createInstance(InheritService *is) const {
     return new NeverInheritor(this, is);
 }
-} // namespace Opde
+} // namespace Darkness

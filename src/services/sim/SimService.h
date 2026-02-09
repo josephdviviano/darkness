@@ -26,15 +26,15 @@
 
 #include <map>
 
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "ServiceCommon.h"
 #include "SharedPtr.h"
 #include "SimCommon.h"
 #include "ValueChangeRequest.h"
 #include "loop/LoopCommon.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** @brief Sim Service - a simulation timer base. Implements Sim time
  * (simulation time). This time can have different flow rate than normal time.
@@ -155,6 +155,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

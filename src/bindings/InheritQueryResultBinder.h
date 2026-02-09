@@ -29,12 +29,12 @@
 
 #include "inherit/InheritService.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
 /// Inherit query result python binder. Iterable
-/// @todo Candidate for a template - Opde::Iterator binder
+/// @todo Candidate for a template - Darkness::Iterator binder
 class InheritQueryResultBinder
     : public shared_ptr_binder<InheritQueryResultPtr> {
 public:
@@ -64,6 +64,6 @@ protected:
     static PyMethodDef msMethods[];
 };
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness
 
 #endif

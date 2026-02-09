@@ -1,19 +1,19 @@
 # CLI tool for loading/inspecting Dark Engine databases
-add_executable(opdeHeadless OpdeHeadless.cpp)
+add_executable(darknessHeadless DarknessHeadless.cpp)
 
-target_include_directories(opdeHeadless PRIVATE
+target_include_directories(darknessHeadless PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(opdeHeadless PRIVATE
-    OpdeBase
-    OpdeServices
+target_link_libraries(darknessHeadless PRIVATE
+    DarknessBase
+    DarknessServices
     ${ODE_LIBRARIES}
     ${SDL2_LIBRARIES}
 )
 
-install(TARGETS opdeHeadless
-    RUNTIME DESTINATION ${OPDE_BINARY_INSTALL_DIR}
+install(TARGETS darknessHeadless
+    RUNTIME DESTINATION ${DARKNESS_BINARY_INSTALL_DIR}
 )
 
 # SDL2 + bgfx render window (task 6a)
@@ -22,14 +22,14 @@ find_package(SDL2 CONFIG REQUIRED)
 find_package(zziplib CONFIG REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
 
-add_executable(opdeRender OpdeRender.cpp)
+add_executable(darknessRender DarknessRender.cpp)
 
-target_include_directories(opdeRender PRIVATE
+target_include_directories(darknessRender PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(opdeRender PRIVATE
-    OpdeBase
+target_link_libraries(darknessRender PRIVATE
+    DarknessBase
     bgfx::bgfx
     bgfx::bx
     bgfx::bimg
@@ -39,6 +39,6 @@ target_link_libraries(opdeRender PRIVATE
     yaml-cpp::yaml-cpp
 )
 
-install(TARGETS opdeRender
-    RUNTIME DESTINATION ${OPDE_BINARY_INSTALL_DIR}
+install(TARGETS darknessRender
+    RUNTIME DESTINATION ${DARKNESS_BINARY_INSTALL_DIR}
 )

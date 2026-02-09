@@ -26,7 +26,7 @@
 
 #include "config.h"
 
-#include "OpdeCommon.h"
+#include "DarknessCommon.h"
 
 #include <OgreRenderWindow.h>
 
@@ -35,15 +35,15 @@
 #include "ConsoleBackend.h"
 #include "Variant.h"
 #include "GameState.h"
-#include "OpdeServiceManager.h"
-#include "OpdeSingleton.h"
+#include "DarknessServiceManager.h"
+#include "DarknessSingleton.h"
 #include "Root.h"
 #include "config/ConfigService.h"
 #include "input/InputService.h"
 
-namespace Opde {
+namespace Darkness {
 
-/** The game state manager. A temporary piece of code that enables opde testing.
+/** The game state manager. A temporary piece of code that enables darkness testing.
  * @warning This code is here only for testing purposes, and will go away later
  * on
  */
@@ -104,8 +104,8 @@ protected:
     /// last frame's time
     unsigned long mTimeLastFrame;
 
-    /// Opde::root
-    Opde::Root *mRoot;
+    /// Darkness::root
+    Darkness::Root *mRoot;
     Ogre::Root *mOgreRoot;
 
     /// config service reference
@@ -124,6 +124,6 @@ protected:
     ServiceManager *mServiceMgr;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

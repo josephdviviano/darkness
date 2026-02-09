@@ -26,7 +26,7 @@
 
 #include "StructDataStorage.h"
 
-namespace Opde {
+namespace Darkness {
 
 struct sPositionProp {
     Vector3 position;
@@ -42,6 +42,6 @@ public:
 };
 
 typedef shared_ptr<PositionPropertyStorage> PositionPropertyStoragePtr;
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

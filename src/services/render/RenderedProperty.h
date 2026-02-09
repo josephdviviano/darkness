@@ -27,7 +27,7 @@
 
 #include "property/Property.h"
 
-namespace Opde {
+namespace Darkness {
 // forward decl
 class RenderService;
 class EntityInfo;
@@ -50,6 +50,6 @@ protected:
     // shortcut to the scenenode of the object
     Ogre::SceneNode *getSceneNode(int oid);
 };
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

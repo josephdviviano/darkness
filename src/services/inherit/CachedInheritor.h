@@ -28,7 +28,7 @@
 #include "BitArray.h"
 #include "InheritService.h"
 
-namespace Opde {
+namespace Darkness {
 /** Base class for cached inheritor implementations. Works self as "always"
  * inheritor, inheriting in every situation. This class implements all methods
  * common to usual cached Inheritor implementations (refreshed every change,
@@ -131,6 +131,6 @@ public:
 protected:
     static std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

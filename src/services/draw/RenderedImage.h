@@ -29,7 +29,7 @@
 
 #include <OgreVector3.h>
 
-namespace Opde {
+namespace Darkness {
 /** Rendered image. A single image on-screen rectangle utilising a single bitmap
  * image source (be it atlassed or not). */
 class RenderedImage : public DrawOperation {
@@ -58,6 +58,6 @@ protected:
     DrawSourcePtr mDrawSource;
 };
 
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

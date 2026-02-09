@@ -29,7 +29,7 @@
 
 #include <OgreVector3.h>
 
-namespace Opde {
+namespace Darkness {
 
 /** Rendered label. This class represents single font text area, possibly
  * wrapped and coloured. */
@@ -80,6 +80,6 @@ protected:
     SegmentList mText;
 };
 
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

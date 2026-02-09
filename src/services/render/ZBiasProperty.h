@@ -27,7 +27,7 @@
 
 #include "RenderedProperty.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** a Z-Bias property implementation using rendered property handler.
  * Controls the rendering bias of the object (for Z-Fightning avoidance). SS2/T2
@@ -60,6 +60,6 @@ protected:
 
     Ogre::SceneManager *mSceneMgr;
 };
-}; // namespace Opde
+}; // namespace Darkness
 
 #endif

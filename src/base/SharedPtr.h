@@ -29,10 +29,10 @@
 
 #include <memory>
 
-namespace Opde {
+namespace Darkness {
 
 template <typename T> using shared_ptr = std::shared_ptr<T>;
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

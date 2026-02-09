@@ -28,7 +28,7 @@
 #include <cstring>
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 /*----------------------------------------------------*/
 /*-------------------- FileGroup ---------------------*/
 /*----------------------------------------------------*/
@@ -82,7 +82,7 @@ void DarkFileGroup::_initSource() {
     // Sanity check
     if (mHeader.dead_beef != 0x0EFBEADDE) // Little endian encoded. would be
                                           // 0xDEADBEEF on big-endian, etc.
-        OPDE_FILEEXCEPT(
+        DARKNESS_FILEEXCEPT(
             FILE_OTHER_ERROR,
             "Supplied file is not a Dark database file. Dead beef mismatch",
             "DarkFileGroup::_initSource()");
@@ -108,7 +108,7 @@ void DarkFileGroup::_initSource() {
         *mSrcFile >> ch.header;
 
         if (strncmp(ch.header.name, item.name, 12) != 0)
-            OPDE_EXCEPT(format("Inventory chunk name mismatch: ",
+            DARKNESS_EXCEPT(format("Inventory chunk name mismatch: ",
                                ch.header.name, "-", item.name));
 
         ch.file = FilePtr(new FilePart(
@@ -133,7 +133,7 @@ const DarkDBChunkHeader &DarkFileGroup::getFileHeader(const std::string &name) {
     if (it != mFiles.end())
         return it->second.header;
     else
-        OPDE_FILEEXCEPT(
+        DARKNESS_FILEEXCEPT(
             FILE_OP_FAILED,
             format("File named ", name, " was not found in this FileGroup"),
             "DarkFileGroup::getFile");
@@ -150,7 +150,7 @@ FilePtr DarkFileGroup::getFile(const std::string &name) {
         it->second.file->seek(0);
         return it->second.file;
     } else
-        OPDE_FILEEXCEPT(
+        DARKNESS_FILEEXCEPT(
             FILE_OP_FAILED,
             format("File named ", sname, " was not found in this FileGroup"),
             "DarkFileGroup::getFile");
@@ -163,7 +163,7 @@ FilePtr DarkFileGroup::createFile(const std::string &name, uint32_t ver_maj,
     ChunkMap::iterator it = mFiles.find(name);
 
     if (it != mFiles.end()) {
-        OPDE_FILEEXCEPT(FILE_OTHER_ERROR,
+        DARKNESS_FILEEXCEPT(FILE_OTHER_ERROR,
                         format("Chunk already exists : " + name),
                         "DarkFileGroup::createFile");
     }
@@ -194,7 +194,7 @@ void DarkFileGroup::deleteFile(const std::string &name) {
     if (it != mFiles.end()) {
         mFiles.erase(it);
     } else {
-        OPDE_EXCEPT(format("File requested for deletion was not found : ", name));
+        DARKNESS_EXCEPT(format("File requested for deletion was not found : ", name));
     }
 }
 
@@ -266,4 +266,4 @@ FileGroup::const_iterator DarkFileGroup::begin() const {
 //------------------------------------
 FileGroup::const_iterator DarkFileGroup::end() const { return mFiles.end(); }
 
-} // namespace Opde
+} // namespace Darkness

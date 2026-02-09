@@ -35,7 +35,7 @@
 #include <OgreTextureManager.h>
 
 using namespace std;
-using namespace Opde; // For the Opde::File
+using namespace Darkness; // For the Darkness::File
 
 // Both horizontal and vertical spacing for characters
 #define _SPACING 3

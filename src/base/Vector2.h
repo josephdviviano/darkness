@@ -24,7 +24,7 @@
 
 #include <cmath>
 
-namespace Opde {
+namespace Darkness {
 
 struct Vector2 {
     float x, y;
@@ -63,6 +63,6 @@ struct Vector2 {
     static const Vector2 ZERO;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -29,7 +29,7 @@
 
 #include <string>
 
-namespace Opde {
+namespace Darkness {
 
 /** Abstract class ConsoleCommandListener. Defines an interface for classes,
  * which want to register as a command executors */
@@ -48,6 +48,6 @@ public:
     //	void helpWanted(std::string command) = 0;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

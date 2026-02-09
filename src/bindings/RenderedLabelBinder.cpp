@@ -28,7 +28,7 @@
 #include "bindings.h"
 #include "draw/RenderedLabel.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -38,7 +38,7 @@ const char *RenderedLabelBinder::msName = "RenderedLabel";
 // ------------------------------------------
 PyTypeObject RenderedLabelBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.RenderedLabel", // char *tp_name; */
+                          0) "darkness.services.RenderedLabel", // char *tp_name; */
     sizeof(RenderedLabelBinder::Base), // int tp_basicsize; */
     0,                            // int tp_itemsize;       /* not used much */
     RenderedLabelBinder::dealloc, // destructor tp_dealloc; */
@@ -172,4 +172,4 @@ void RenderedLabelBinder::init(PyObject *module) {
 }
 
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness

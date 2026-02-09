@@ -1,4 +1,4 @@
-set(OPDE_BASE_SOURCES
+set(DARKNESS_BASE_SOURCES
     Array.h
     BitArray.h
     Callback.h
@@ -7,9 +7,9 @@ set(OPDE_BASE_SOURCES
     Matrix4.h
     MessageSource.h
     NonCopyable.h
-    OpdeException.cpp
-    OpdeException.h
-    OpdeSingleton.h
+    DarknessException.cpp
+    DarknessException.h
+    DarknessSingleton.h
     LGPalette.h
     LGPalette.cpp
     Plane.h
@@ -52,29 +52,29 @@ set(OPDE_BASE_SOURCES
     logger/logger.h
     logger/stdlog.cpp
     logger/stdlog.h
-    servicemanager/OpdeService.cpp
-    servicemanager/OpdeServiceFactory.h
-    servicemanager/OpdeService.h
-    servicemanager/OpdeServiceManager.cpp
-    servicemanager/OpdeServiceManager.h
+    servicemanager/DarknessService.cpp
+    servicemanager/DarknessServiceFactory.h
+    servicemanager/DarknessService.h
+    servicemanager/DarknessServiceManager.cpp
+    servicemanager/DarknessServiceManager.h
 )
 
-add_library(OpdeBase OBJECT ${OPDE_BASE_SOURCES})
+add_library(DarknessBase OBJECT ${DARKNESS_BASE_SOURCES})
 
-target_include_directories(OpdeBase PUBLIC
-    ${OPDE_BINARY_DIR}
-    ${OPDE_SOURCE_DIR}/src/base
-    ${OPDE_SOURCE_DIR}/src/base/console
-    ${OPDE_SOURCE_DIR}/src/base/compat
-    ${OPDE_SOURCE_DIR}/src/base/dyntype
-    ${OPDE_SOURCE_DIR}/src/base/file
-    ${OPDE_SOURCE_DIR}/src/base/loaders
-    ${OPDE_SOURCE_DIR}/src/base/logger
-    ${OPDE_SOURCE_DIR}/src/base/servicemanager
-    ${OPDE_SOURCE_DIR}/src/compat
+target_include_directories(DarknessBase PUBLIC
+    ${DARKNESS_BINARY_DIR}
+    ${DARKNESS_SOURCE_DIR}/src/base
+    ${DARKNESS_SOURCE_DIR}/src/base/console
+    ${DARKNESS_SOURCE_DIR}/src/base/compat
+    ${DARKNESS_SOURCE_DIR}/src/base/dyntype
+    ${DARKNESS_SOURCE_DIR}/src/base/file
+    ${DARKNESS_SOURCE_DIR}/src/base/loaders
+    ${DARKNESS_SOURCE_DIR}/src/base/logger
+    ${DARKNESS_SOURCE_DIR}/src/base/servicemanager
+    ${DARKNESS_SOURCE_DIR}/src/compat
 )
 
-target_compile_options(OpdeBase PRIVATE
+target_compile_options(DarknessBase PRIVATE
     $<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:
         -Wall -fno-strict-aliasing -fvisibility=default>
 )

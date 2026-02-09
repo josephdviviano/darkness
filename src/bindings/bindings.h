@@ -31,7 +31,7 @@
 #include <Python.h>
 
 #include "Variant.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 
 #include <OgreColourValue.h>
 #include <OgreException.h>
@@ -39,9 +39,9 @@
 #include <frameobject.h>
 #include <traceback.h>
 
-namespace Opde {
+namespace Darkness {
 class Root;
-} // namespace Opde
+} // namespace Darkness
 
 // This implements error handling independently on python2/3
 struct module_state {
@@ -82,10 +82,10 @@ struct module_state {
 /// Checks if the specified PyObject is int or long
 #define __PYINTLONG_CHECK(a) (PyLong_Check(a) || PyLong_Check(a))
 
-namespace Opde {
+namespace Darkness {
 namespace Python {
 
-class PythonException : public Opde::BasicException {
+class PythonException : public Darkness::BasicException {
 protected:
     std::string mType;
 
@@ -169,7 +169,7 @@ public:
     }
 };
 
-#define __PY_HANDLE_PYTHON_ERROR Opde::Python::PythonException::checkAndThrow()
+#define __PY_HANDLE_PYTHON_ERROR Darkness::Python::PythonException::checkAndThrow()
 
 // Type converters
 enum VariableType {
@@ -716,13 +716,13 @@ private:
  * python environment */
 class PythonLanguage {
 protected:
-    static Opde::Root *msRoot;
+    static Darkness::Root *msRoot;
 
 public:
     /** Initializes python lang and all the bindings */
     static void init(int argc, char **argv);
 
-    /** Initializes the Opde module itself, without the interpretter */
+    /** Initializes the Darkness module itself, without the interpretter */
     static PyObject *initModule();
 
     /** Finalizes python lang */
@@ -741,6 +741,6 @@ public:
     static PyObject *getRoot(PyObject *self, PyObject *args);
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

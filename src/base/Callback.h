@@ -27,7 +27,7 @@
 
 #include "config.h"
 
-namespace Opde {
+namespace Darkness {
 
 /** An abstract callback functor definition. */
 template <class M> class Callback {
@@ -54,6 +54,6 @@ protected:
     I *mInstance;
     Method mMethod;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -24,7 +24,7 @@
 
 #include <cmath>
 
-namespace Opde {
+namespace Darkness {
 
 struct Vector3 {
     float x, y, z;
@@ -101,6 +101,6 @@ inline Vector3 operator*(float s, const Vector3 &v) {
     return Vector3(s * v.x, s * v.y, s * v.z);
 }
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

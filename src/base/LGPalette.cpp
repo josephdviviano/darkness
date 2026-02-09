@@ -23,7 +23,7 @@
 
 #include "LGPalette.h"
 
-namespace Opde {
+namespace Darkness {
 
 RGBAQuad sLGPalette[256] = {
     {0, 0, 0, 0},         {221, 221, 221, 255}, {182, 182, 182, 255},
@@ -200,5 +200,5 @@ RGBAQuad sAAPalette[256] = {
     {255, 255, 255, 255}, {255, 255, 255, 255}, {255, 255, 255, 255},
     {255, 255, 255, 255}, {255, 255, 255, 255}, {255, 0, 255, 0},
     {255, 255, 255, 255}};
-} // namespace Opde
+} // namespace Darkness
 

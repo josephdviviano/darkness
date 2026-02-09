@@ -26,7 +26,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 File &operator<<(File &st, const DarkDBHeader &h) {
     st << h.inv_offset << h.zero << h.one;
     st.write(&h.zeros, sizeof(h.zeros));
@@ -71,4 +71,4 @@ File &operator>>(File &st, DarkDBChunkHeader &h) {
     return st;
 }
 
-} // namespace Opde
+} // namespace Darkness

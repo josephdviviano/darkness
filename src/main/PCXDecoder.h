@@ -28,7 +28,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 
 struct DecodedImage {
     uint32_t width, height;
@@ -122,4 +122,4 @@ inline DecodedImage decodePCX(const uint8_t *data, size_t size) {
     return img;
 }
 
-} // namespace Opde
+} // namespace Darkness

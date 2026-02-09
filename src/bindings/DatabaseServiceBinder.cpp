@@ -24,16 +24,16 @@
 
 #include "DatabaseServiceBinder.h"
 #include "database/DatabaseService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "PythonCallback.h"
 #include "PythonStruct.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
-const char *opde_PythonDatabaseProgressMessage__doc__ =
+const char *darkness_PythonDatabaseProgressMessage__doc__ =
     "Database Progress Message structure. Structure informing about "
     "loading/saving progress.\n"
     "@ivar completed: Overall 0.0-1.0 progress\n"
@@ -49,8 +49,8 @@ public:
         field("currentCoarse", &DatabaseProgressMsg::currentCoarse);
         field("overallFine", &DatabaseProgressMsg::overallFine);
 
-        publish(opde_PythonDatabaseProgressMessage__doc__,
-                "opde.services.DatabaseProgressMsg", container);
+        publish(darkness_PythonDatabaseProgressMessage__doc__,
+                "darkness.services.DatabaseProgressMsg", container);
     }
 };
 
@@ -75,13 +75,13 @@ typedef shared_ptr<PythonDatabaseProgressCallback>
 // -------------------- Database Service --------------------
 const char *DatabaseServiceBinder::msName = "DatabaseService";
 
-const char *opde_DatabaseService__doc__ =
+const char *darkness_DatabaseService__doc__ =
     "Database service. Used to load/save game state";
 
 // ------------------------------------------
 PyTypeObject DatabaseServiceBinder::msType = {
     PyVarObject_HEAD_INIT(
-        &PyType_Type, 0) "opde.services.DatabaseService", // char *tp_name; */
+        &PyType_Type, 0) "darkness.services.DatabaseService", // char *tp_name; */
     sizeof(DatabaseServiceBinder::Base), // int tp_basicsize; */
     0, // int tp_itemsize;       /* not used much */
     DatabaseServiceBinder::dealloc, // destructor tp_dealloc; */
@@ -100,7 +100,7 @@ PyTypeObject DatabaseServiceBinder::msType = {
     0,                           // setattrofunc tp_setattro; */
     0,                           // PyBufferProcs *tp_as_buffer; */
     0,                           // long tp_flags; */
-    opde_DatabaseService__doc__, // char *tp_doc;  */
+    darkness_DatabaseService__doc__, // char *tp_doc;  */
     0,                           // traverseproc tp_traverse; */
     0,                           // inquiry tp_clear; */
     0,                           // richcmpfunc tp_richcompare; */
@@ -113,7 +113,7 @@ PyTypeObject DatabaseServiceBinder::msType = {
 };
 
 // ------------------------------------------
-const char *opde_DatabaseService_load__doc__ =
+const char *darkness_DatabaseService_load__doc__ =
     "load(filename, mask)\n"
     "Loads a database file and the parent databases it refers to from the "
     "specified location. Clears all the previous loaded data\n"
@@ -124,7 +124,7 @@ const char *opde_DatabaseService_load__doc__ =
     "more info)\n"
     "@raise IOError: if something bad happened while loading";
 
-const char *opde_DatabaseService_mergeLoad__doc__ =
+const char *darkness_DatabaseService_mergeLoad__doc__ =
     "mergeLoad(filename, mask)\n"
     "Loads a database file from the specified location, not destroying any "
     "previously loaded data (can be dangerous)\n"
@@ -135,7 +135,7 @@ const char *opde_DatabaseService_mergeLoad__doc__ =
     "more info)\n"
     "@raise IOError: if something bad happened while loading";
 
-const char *opde_DatabaseService_recursiveMergeLoad__doc__ =
+const char *darkness_DatabaseService_recursiveMergeLoad__doc__ =
     "recursiveMergeLoad(filename, mask)\n"
     "Loads a database file and the parent databases it refers to from the "
     "specified location, not destroying any previously loaded data (can be "
@@ -147,7 +147,7 @@ const char *opde_DatabaseService_recursiveMergeLoad__doc__ =
     "more info)\n"
     "@raise IOError: if something bad happened while loading";
 
-const char *opde_DatabaseService_save__doc__ =
+const char *darkness_DatabaseService_save__doc__ =
     "save(filename, mask)\n"
     "Saves a tag database file of the especified type to a specified "
     "location.\n"
@@ -158,38 +158,38 @@ const char *opde_DatabaseService_save__doc__ =
     "more info)\n"
     "@raise IOError: if something bad happened while loading";
 
-const char *opde_DatabaseService_unload__doc__ =
+const char *darkness_DatabaseService_unload__doc__ =
     "unload(mask)\n"
     "unloads all data. Clears specified subset of the engine data\n"
     "@type mask: integer\n"
     "@param mask: The mask to use while clearing (see the DBM_ constants for "
     "more info)";
 
-const char *opde_DatabaseService_setProgressListener__doc__ =
+const char *darkness_DatabaseService_setProgressListener__doc__ =
     "setProgressListener(listener)\n"
     "Registers a new database listener to be called every loading step. The "
     "callable has to have one parameter, which will receive "
-    "L{DatabaseProgressMsg<opde.services.DatabaseProgressMsg>}\n"
+    "L{DatabaseProgressMsg<darkness.services.DatabaseProgressMsg>}\n"
     "@type listener: callable\n"
     "@param listener: The function to call on every DB change\n";
 
-const char *opde_DatabaseService_unsetProgressListener__doc__ =
+const char *darkness_DatabaseService_unsetProgressListener__doc__ =
     "unsetProgressListener()\n"
     "Unsets the previously specified DB loading listner.";
 
 // ------------------------------------------
 PyMethodDef DatabaseServiceBinder::msMethods[] = {
-    {"load", load, METH_VARARGS, opde_DatabaseService_load__doc__},
+    {"load", load, METH_VARARGS, darkness_DatabaseService_load__doc__},
     {"mergeLoad", mergeLoad, METH_VARARGS,
-     opde_DatabaseService_mergeLoad__doc__},
+     darkness_DatabaseService_mergeLoad__doc__},
     {"recursiveMergeLoad", recursiveMergeLoad, METH_VARARGS,
-     opde_DatabaseService_recursiveMergeLoad__doc__},
-    {"save", save, METH_VARARGS, opde_DatabaseService_save__doc__},
-    {"unload", unload, METH_NOARGS, opde_DatabaseService_unload__doc__},
+     darkness_DatabaseService_recursiveMergeLoad__doc__},
+    {"save", save, METH_VARARGS, darkness_DatabaseService_save__doc__},
+    {"unload", unload, METH_NOARGS, darkness_DatabaseService_unload__doc__},
     {"setProgressListener", setProgressListener, METH_VARARGS,
-     opde_DatabaseService_setProgressListener__doc__},
+     darkness_DatabaseService_setProgressListener__doc__},
     {"unsetProgressListener", unsetProgressListener, METH_NOARGS,
-     opde_DatabaseService_unsetProgressListener__doc__},
+     darkness_DatabaseService_unsetProgressListener__doc__},
     {NULL, NULL},
 };
 
@@ -405,4 +405,4 @@ void DatabaseServiceBinder::init(PyObject *module) {
 
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

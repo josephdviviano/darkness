@@ -22,14 +22,14 @@
  *
  *****************************************************************************/
 
-#include "OpdeException.h"
+#include "DarknessException.h"
 
 #include <sstream>
 #include <string>
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 BasicException::BasicException(const std::string &desc, const std::string &src,
                                const char *file, long line) {
@@ -43,16 +43,16 @@ BasicException::BasicException(const std::string &desc, const std::string &src,
         stringstream out;
         out << lineNum;
 
-        details = string("Opde Exception (" + fileName + " line " + out.str() +
+        details = string("Darkness Exception (" + fileName + " line " + out.str() +
                          ") - " + source + " : " + description);
     } else {
         fileName = string("-Unsupplied-");
 
-        details = string("Opde Exception  - " + source + " : " + description);
+        details = string("Darkness Exception  - " + source + " : " + description);
     }
 }
 
 const std::string &BasicException::getDetails() const { return details; }
 
 BasicException::~BasicException() throw() {}
-} // namespace Opde
+} // namespace Darkness

@@ -30,8 +30,8 @@
 #include "StringIteratorBinder.h"
 #include "logger.h"
 
-namespace Opde {
-Opde::Root *Opde::PythonLanguage::msRoot = NULL;
+namespace Darkness {
+Darkness::Root *Darkness::PythonLanguage::msRoot = NULL;
 
 namespace Python {
 
@@ -147,85 +147,85 @@ void PythonPublishedType::publishType(PyObject *containter, PyTypeObject *type,
 } // namespace Python
 
 // ---- Doc Strings ----
-const char *opde_log_fatal__doc__ = "log_fatal(msg)\n"
+const char *darkness_log_fatal__doc__ = "log_fatal(msg)\n"
                                     "\tLogs a message with FATAL log level.\n"
                                     "@type msg: string\n"
                                     "@param msg: The logged string\n";
 
-const char *opde_log_error__doc__ = "log_error(msg)\n"
+const char *darkness_log_error__doc__ = "log_error(msg)\n"
                                     "\tLogs a message with ERROR log level.\n"
                                     "@type msg: string\n"
                                     "@param msg: The logged string\n";
 ;
 
-const char *opde_log_info__doc__ = "log_info(msg)\n"
+const char *darkness_log_info__doc__ = "log_info(msg)\n"
                                    "\tLogs a message with INFO log level.\n"
                                    "@type msg: string\n"
                                    "@param msg: The logged string\n";
 
-const char *opde_log_debug__doc__ = "log_debug(msg)\n"
+const char *darkness_log_debug__doc__ = "log_debug(msg)\n"
                                     "\tLogs a message with DEBUG log level.\n"
                                     "@type msg: string\n"
                                     "@param msg: The logged string\n";
 
-const char *opde_log_verbose__doc__ =
+const char *darkness_log_verbose__doc__ =
     "log_verbose(msg)\n"
     "\tLogs a message with VERBOSE (=ALL) log level.\n"
     "@type msg: string\n"
     "@param msg: The logged string\n";
 
-const char *opde_createRoot__doc__ =
+const char *darkness_createRoot__doc__ =
     "createRoot(mask;logfile)\n"
-    "Creates the Opde.Root object with the specified service mask (See "
-    "L{opde.services<Opde.Services>}).\n"
+    "Creates the Darkness.Root object with the specified service mask (See "
+    "L{darkness.services<Darkness.Services>}).\n"
     "@type mask: number\n"
     "@param mask: Service creation mask\n"
     "@type logfile: string\n"
     "@param logfile: The log file (optional)\n"
     "@rtype: Root\n"
-    "@return: A new opde.Root object reference";
+    "@return: A new darkness.Root object reference";
 
-const char *opde_getRoot__doc__ =
+const char *darkness_getRoot__doc__ =
     "getRoot()\n"
-    "Retrieves the previously created opde.Root object.\n"
+    "Retrieves the previously created darkness.Root object.\n"
     "@rtype: Root\n"
-    "@return: An opde.Root object reference";
+    "@return: An darkness.Root object reference";
 
-PyMethodDef sOpdeMethods[] = {
+PyMethodDef sDarknessMethods[] = {
     {const_cast<char *>("log_fatal"), Python::Py_Log_Fatal, METH_VARARGS,
-     opde_log_fatal__doc__},
+     darkness_log_fatal__doc__},
     {const_cast<char *>("log_error"), Python::Py_Log_Error, METH_VARARGS,
-     opde_log_error__doc__},
+     darkness_log_error__doc__},
     {const_cast<char *>("log_info"), Python::Py_Log_Info, METH_VARARGS,
-     opde_log_info__doc__},
+     darkness_log_info__doc__},
     {const_cast<char *>("log_debug"), Python::Py_Log_Debug, METH_VARARGS,
-     opde_log_debug__doc__},
+     darkness_log_debug__doc__},
     {const_cast<char *>("log_verbose"), Python::Py_Log_Verbose, METH_VARARGS,
-     opde_log_verbose__doc__},
+     darkness_log_verbose__doc__},
     {const_cast<char *>("createRoot"), PythonLanguage::createRoot, METH_VARARGS,
-     opde_createRoot__doc__},
+     darkness_createRoot__doc__},
     {const_cast<char *>("getRoot"), PythonLanguage::getRoot, METH_NOARGS,
-     opde_getRoot__doc__},
+     darkness_getRoot__doc__},
     {NULL, NULL},
 };
 
 #ifdef IS_PY3K
 // this is tricky. For python 3 we need some more boilerplate
 
-static int opdemodule_traverse(PyObject *m, visitproc visit, void *arg) {
+static int darknessmodule_traverse(PyObject *m, visitproc visit, void *arg) {
     Py_VISIT(GETSTATE(m)->error);
     return 0;
 }
 
-static int opdemodule_clear(PyObject *m) {
+static int darknessmodule_clear(PyObject *m) {
     Py_CLEAR(GETSTATE(m)->error);
     return 0;
 }
 
-static struct PyModuleDef sOpdeModuleDef = {
-    PyModuleDef_HEAD_INIT,       "opde",           NULL,
-    sizeof(struct module_state), sOpdeMethods,     NULL,
-    opdemodule_traverse,         opdemodule_clear, NULL};
+static struct PyModuleDef sDarknessModuleDef = {
+    PyModuleDef_HEAD_INIT,       "darkness",           NULL,
+    sizeof(struct module_state), sDarknessMethods,     NULL,
+    darknessmodule_traverse,         darknessmodule_clear, NULL};
 #else
 static struct module_state _state;
 #endif
@@ -233,7 +233,7 @@ static struct module_state _state;
 void PythonLanguage::init(int argc, char **argv) {
 #ifdef IS_PY3K
     // insert our module into the init tab
-    PyImport_AppendInittab("opde", &initModule);
+    PyImport_AppendInittab("darkness", &initModule);
 #endif
     Py_Initialize();
 
@@ -256,22 +256,22 @@ void PythonLanguage::init(int argc, char **argv) {
 PyObject *PythonLanguage::initModule() {
     msRoot = NULL;
 
-    // Create an Opde module
+    // Create an Darkness module
 #ifdef IS_PY3K
-    PyObject *module = PyModule_Create(&sOpdeModuleDef);
+    PyObject *module = PyModule_Create(&sDarknessModuleDef);
 #else
-    PyObject *module = Py_InitModule("opde", sOpdeMethods);
+    PyObject *module = Py_InitModule("darkness", sDarknessMethods);
 #endif
     // Error?
     if (!module)
-        OPDE_EXCEPT("Could not initialize the python Module!");
+        DARKNESS_EXCEPT("Could not initialize the python Module!");
 
     // Error handling
     struct module_state *st = GETSTATE(module);
-    st->error = PyErr_NewException("opde.Error", NULL, NULL);
+    st->error = PyErr_NewException("darkness.Error", NULL, NULL);
     if (st->error == NULL) {
         Py_DECREF(module);
-        OPDE_EXCEPT("Could not initialize the opde.Error!");
+        DARKNESS_EXCEPT("Could not initialize the darkness.Error!");
     }
 
     // Call all the binders here. The result is initialized Python VM
@@ -346,10 +346,10 @@ PyObject *PythonLanguage::createRoot(PyObject *self, PyObject *args) {
     if (PyArg_ParseTuple(args, "l|s", &mask, &logfile)) {
         if (logfile) {
             // Create new root, wrap, return
-            msRoot = new Opde::Root(mask, logfile);
+            msRoot = new Darkness::Root(mask, logfile);
         } else {
             // new root without logfile specifier
-            msRoot = new Opde::Root(mask);
+            msRoot = new Darkness::Root(mask);
         }
 
         // Todo: We could also share a single object instance here PyObject -
@@ -378,4 +378,4 @@ PyObject *PythonLanguage::getRoot(PyObject *self, PyObject *args) {
     return result;
 }
 
-} // namespace Opde
+} // namespace Darkness

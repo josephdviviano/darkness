@@ -30,11 +30,11 @@
 #include "ServiceCommon.h"
 #include "InheritCommon.h"
 #include "Iterator.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "SharedPtr.h"
 
-namespace Opde {
+namespace Darkness {
 
 class Relation;
 class Link;
@@ -224,6 +224,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

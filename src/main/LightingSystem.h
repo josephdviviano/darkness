@@ -49,7 +49,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 
 // ── Animation modes (from animlightmode enum in t2-types.dtype) ──
 
@@ -509,4 +509,4 @@ buildAnimLightIndex(const WRParsedData &wr)
     return index;
 }
 
-} // namespace Opde
+} // namespace Darkness

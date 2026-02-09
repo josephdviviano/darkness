@@ -24,7 +24,7 @@
 #include "MaterialService.h"
 #include "File.h"
 #include "FileGroup.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "ServiceCommon.h"
 #include "config/ConfigService.h"
 #include "database/DatabaseService.h"
@@ -45,7 +45,7 @@
 using namespace std;
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 const unsigned short int MaterialService::SKY_TEXTURE_ID = 249;
 const unsigned short int MaterialService::JORGE_TEXTURE_ID = 0;
 
@@ -59,7 +59,7 @@ const size_t ServiceImpl<MaterialService>::SID = __SERVICE_ID_MATERIAL;
 
 MaterialService::MaterialService(ServiceManager *manager,
                                  const std::string &name)
-    : ServiceImpl<Opde::MaterialService>(manager, name) {}
+    : ServiceImpl<Darkness::MaterialService>(manager, name) {}
 
 //------------------------------------------------------
 MaterialService::~MaterialService() { clear(); }
@@ -103,7 +103,7 @@ void MaterialService::loadMaterials(const FileGroupPtr &db) {
             "MaterialService::loadMaterials");
 
     // Load the TXLIST chunk from the resource mission file.
-    Opde::FilePtr txtList = db->getFile("TXLIST");
+    Darkness::FilePtr txtList = db->getFile("TXLIST");
 
     // TODO: Exception handling on the chunk readout!
     // Okay, we are ready to map the arrays
@@ -328,7 +328,7 @@ Ogre::MaterialPtr MaterialService::getWorldMaterialInstance(unsigned int idx,
 void MaterialService::prepareMaterialInstance(MaterialPtr &mat,
                                               unsigned int idx, int tag) {
     if (tag < 0) // Should not be here if the polygon is sky textured
-        OPDE_EXCEPT("Non-instanced material instance requested");
+        DARKNESS_EXCEPT("Non-instanced material instance requested");
 
     mat->setReceiveShadows(true);
 
@@ -432,7 +432,7 @@ void MaterialService::shutdown() {
 //-----------------------------------------------------------------------
 void MaterialService::loadFlowTextures(const FileGroupPtr &db) {
     // Load the TXLIST chunk from the resource mission file.
-    Opde::FilePtr flow_tex;
+    Darkness::FilePtr flow_tex;
     try {
         flow_tex = db->getFile("FLOW_TEX");
     } catch (FileException) {
@@ -848,4 +848,4 @@ Service *MaterialServiceFactory::createInstance(ServiceManager *manager) {
     return new MaterialService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

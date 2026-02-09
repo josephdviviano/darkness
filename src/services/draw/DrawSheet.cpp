@@ -26,7 +26,7 @@
 
 #include <OgreRenderQueue.h>
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- DrawSheet ---------------------*/
@@ -332,4 +332,4 @@ void DrawSheet::markBuffersDirty() {
         db->markDirty();
     }
 }
-}; // namespace Opde
+}; // namespace Darkness

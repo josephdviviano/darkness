@@ -38,10 +38,10 @@ typedef __int8 int8_t;
 #include <inttypes.h>
 #endif
 
-namespace Opde {
+namespace Darkness {
 #ifndef uint
 typedef unsigned int uint;
 #endif
-} // namespace Opde
+} // namespace Darkness
 
 #endif

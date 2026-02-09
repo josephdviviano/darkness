@@ -23,14 +23,14 @@
  *****************************************************************************/
 
 #include "LinkServiceBinder.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "DataFieldDescIteratorBinder.h"
 #include "LinkQueryResultBinder.h"
 #include "RelationBinder.h"
 #include "StringIteratorBinder.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -40,7 +40,7 @@ const char *LinkServiceBinder::msName = "LinkService";
 // ------------------------------------------
 PyTypeObject LinkServiceBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.LinkService", // char *tp_name; */
+                          0) "darkness.services.LinkService", // char *tp_name; */
     sizeof(LinkServiceBinder::Base), // int tp_basicsize; */
     0,                          // int tp_itemsize;       /* not used much */
     LinkServiceBinder::dealloc, // destructor tp_dealloc; */
@@ -464,4 +464,4 @@ void LinkBinder::init(PyObject *module) {
     publishType(module, &msType, msName);
 }
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness

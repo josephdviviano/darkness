@@ -29,7 +29,7 @@
 
 #include "draw/DrawService.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -218,6 +218,6 @@ protected:
 };
 
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness
 
 #endif

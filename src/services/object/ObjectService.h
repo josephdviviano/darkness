@@ -34,8 +34,8 @@
 #include "ObjectCommon.h"
 
 #include "MessageSource.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 
 #include "database/DatabaseCommon.h"
 
@@ -43,7 +43,7 @@
 
 #include <stack>
 
-namespace Opde {
+namespace Darkness {
 
 class Property;
 class SymNamePropertyStorage;
@@ -275,6 +275,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

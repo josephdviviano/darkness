@@ -26,7 +26,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 /*--------------------------------------------------------*/
 /*--------------------- NeverInheritor -------------------*/
 /*--------------------------------------------------------*/
@@ -58,4 +58,4 @@ string ArchetypeInheritorFactory::getName() const { return mName; }
 Inheritor *ArchetypeInheritorFactory::createInstance(InheritService *is) const {
     return new ArchetypeInheritor(this, is);
 }
-} // namespace Opde
+} // namespace Darkness

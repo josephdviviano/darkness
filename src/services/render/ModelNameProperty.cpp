@@ -27,7 +27,7 @@
 #include "SingleFieldDataStorage.h"
 #include "property/PropertyService.h"
 
-namespace Opde {
+namespace Darkness {
 /*--------------------------------------------------------*/
 /*-------------------- ModelNameProperty -----------------*/
 /*--------------------------------------------------------*/
@@ -49,7 +49,7 @@ void ModelNameProperty::addProperty(int oid) {
     Variant val;
 
     if (!get(oid, "", val))
-        OPDE_EXCEPT("Property not defined for object.");
+        DARKNESS_EXCEPT("Property not defined for object.");
 
     setModel(oid, val.toString());
 };
@@ -74,4 +74,4 @@ void ModelNameProperty::valueChanged(int oid, const std::string &field,
 void ModelNameProperty::setModel(int oid, const std::string &name) {
     mOwner->setObjectModel(oid, name);
 };
-}; // namespace Opde
+}; // namespace Darkness

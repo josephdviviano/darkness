@@ -31,7 +31,7 @@
 #include <vector>
 #include <zzip/zzip.h>
 
-namespace Opde {
+namespace Darkness {
 
 class CRFTextureLoader {
 public:
@@ -184,4 +184,4 @@ private:
     }
 };
 
-} // namespace Opde
+} // namespace Darkness

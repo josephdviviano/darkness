@@ -1,9 +1,9 @@
 // Ogre overlay scripts
-Opde/LoadOverlay
+Darkness/LoadOverlay
 {
 	zorder 510
 	// Main panel block
-	container BorderPanel(Opde/LoadPanel)
+	container BorderPanel(Darkness/LoadPanel)
 	{
 		metrics_mode pixels
 		vert_align center
@@ -13,7 +13,7 @@ Opde/LoadOverlay
 		width 320
 		height 50
 
-		element TextArea(Opde/LoadPanel/Description)
+		element TextArea(Darkness/LoadPanel/Description)
 		{
 			metrics_mode pixels
 			left 10

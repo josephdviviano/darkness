@@ -22,14 +22,14 @@
  *****************************************************************************/
 
 #include "SimService.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "ServiceCommon.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "loop/LoopService.h"
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 /*----------------------------------------------------*/
 /*-------------------- Sim Listener ------------------*/
 /*----------------------------------------------------*/
@@ -207,4 +207,4 @@ Service *SimServiceFactory::createInstance(ServiceManager *manager) {
     return new SimService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

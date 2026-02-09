@@ -28,7 +28,7 @@
 #include "SingleFieldDataStorage.h"
 #include "property/PropertyService.h"
 
-namespace Opde {
+namespace Darkness {
 /*--------------------------------------------------------*/
 /*-------------------- RenderAlphaProperty ----------------*/
 /*--------------------------------------------------------*/
@@ -52,7 +52,7 @@ void RenderAlphaProperty::addProperty(int oid) {
     Variant val;
 
     if (!get(oid, "", val))
-        OPDE_EXCEPT("Property not defined for object.");
+        DARKNESS_EXCEPT("Property not defined for object.");
 
     setAlpha(oid, val.toFloat());
 };
@@ -89,4 +89,4 @@ void RenderAlphaProperty::setAlpha(int oid, float alpha) {
     // and set the alpha on the entity
     ei->setAlpha(alpha);
 };
-}; // namespace Opde
+}; // namespace Darkness

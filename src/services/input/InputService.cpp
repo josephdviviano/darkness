@@ -23,7 +23,7 @@
  *****************************************************************************/
 
 #include "InputService.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "StringTokenizer.h"
 #include "config/ConfigService.h"
 #include "format.h"
@@ -34,7 +34,7 @@
 using namespace std;
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 
 /*-----------------------------------------------------*/
 /*-------------------- InputService -------------------*/
@@ -42,7 +42,7 @@ namespace Opde {
 template <> const size_t ServiceImpl<InputService>::SID = __SERVICE_ID_INPUT;
 
 InputService::InputService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::InputService>(manager, name),
+    : ServiceImpl<Darkness::InputService>(manager, name),
       mInputMode(IM_MAPPED),
       mDirectListener(NULL),
       mInitialDelay(0.4f), // TODO: Read these from the config service
@@ -585,7 +585,7 @@ Variant &InputService::createVariable(const std::string &var,
     ValueMap::iterator it = mVariables.find(var);
 
     if (it != mVariables.end())
-        OPDE_EXCEPT(format("InputService: duplicit creation of variable ", var));
+        DARKNESS_EXCEPT(format("InputService: duplicit creation of variable ", var));
 
     return mVariables.emplace(var, d_val).first->second;
 
@@ -598,7 +598,7 @@ Variant &InputService::getVariable(const std::string &var) {
     if (it != mVariables.end())
         return it->second;
     else
-        OPDE_EXCEPT(format("InputService: Undefined variable requested ", var));
+        DARKNESS_EXCEPT(format("InputService: Undefined variable requested ", var));
 }
 
 //------------------------------------------------------
@@ -608,7 +608,7 @@ const Variant &InputService::getVariable(const std::string &var) const {
     if (it != mVariables.end())
         return it->second;
     else
-        OPDE_EXCEPT(format("InputService: Undefined variable requested ", var));
+        DARKNESS_EXCEPT(format("InputService: Undefined variable requested ", var));
 }
 
 //------------------------------------------------------
@@ -767,7 +767,7 @@ void InputService::registerCommandAlias(const std::string &alias,
 //------------------------------------------------------
 void InputService::setDirectListener(DirectInputListener *listener) {
     if (mDirectListener)
-        OPDE_EXCEPT("InputService: Direct input listener already registered");
+        DARKNESS_EXCEPT("InputService: Direct input listener already registered");
 
     mDirectListener = listener;
 };
@@ -975,4 +975,4 @@ const size_t InputServiceFactory::getSID() { return InputService::SID; }
 Service *InputServiceFactory::createInstance(ServiceManager *manager) {
     return new InputService(manager, mName);
 }
-} // namespace Opde
+} // namespace Darkness

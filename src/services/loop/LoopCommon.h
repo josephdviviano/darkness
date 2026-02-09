@@ -27,7 +27,7 @@
 
 #include "integers.h"
 
-namespace Opde {
+namespace Darkness {
 
 // Forward decl.
 class LoopService;
@@ -122,7 +122,7 @@ protected:
     LoopClientDefinition mLoopClientDef;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 
 #endif /* __LOOPCOMMON_H */

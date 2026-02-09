@@ -28,14 +28,14 @@
 #include "LightmapAtlas.h"
 #include "ConsoleBackend.h"
 #include "FreeSpaceInfo.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "WRCommon.h"
 #include "compat.h"
 #include "integers.h"
 #include "material/MaterialService.h"
 #include "Vector3.h"
 
-namespace Opde {
+namespace Darkness {
 
 int LightAtlas::mMaxSize;
 
@@ -104,7 +104,7 @@ void LightAtlas::growAtlas(int newSize) {
         // place the lmap
         // should not fail, since the lmaps fitted to prev atlas.
         if (!placeLightMap(lm))
-            OPDE_EXCEPT("Could not fit after growth!");
+            DARKNESS_EXCEPT("Could not fit after growth!");
     }
 }
 
@@ -276,14 +276,14 @@ int LightAtlas::getPixelCount() { return mSize * mSize; }
 
 // ---------------- LightAtlasList Methods ----------------------
 LightAtlasList::LightAtlasList() {
-    Opde::ConsoleBackend::getSingleton().registerCommandListener(
+    Darkness::ConsoleBackend::getSingleton().registerCommandListener(
         std::string("light"), dynamic_cast<ConsoleCommandListener *>(this));
-    Opde::ConsoleBackend::getSingleton().setCommandHint(
+    Darkness::ConsoleBackend::getSingleton().setCommandHint(
         std::string("light"),
         "Switch a light intensity: light LIGHT_NUMBER INTENSITY(0-1)");
-    Opde::ConsoleBackend::getSingleton().registerCommandListener(
+    Darkness::ConsoleBackend::getSingleton().registerCommandListener(
         std::string("lmeff"), dynamic_cast<ConsoleCommandListener *>(this));
-    Opde::ConsoleBackend::getSingleton().setCommandHint(
+    Darkness::ConsoleBackend::getSingleton().setCommandHint(
         std::string("lmeff"), "lightmap atlas efficiency calculator");
 }
 
@@ -350,7 +350,7 @@ bool LightAtlasList::render() {
     // Step2. Render
     for (auto &atlas : mAtlases) {
         if (!atlas->render())
-            OPDE_EXCEPT("Could not render the lightmaps!");
+            DARKNESS_EXCEPT("Could not render the lightmaps!");
     }
 
     // iterate through existing Atlases, and see if any of them accepts our
@@ -398,7 +398,7 @@ void LightAtlasList::commandExecuted(std::string command,
                 space_pos + 1, parameters.length() - (space_pos + 1));
 
             // TODO: Use logger for this.
-            Opde::ConsoleBackend::getSingleton().putMessage(
+            Darkness::ConsoleBackend::getSingleton().putMessage(
                 std::string("Doing light change"));
 
             int light = Ogre::StringConverter::parseInt(s_light);
@@ -561,4 +561,4 @@ void LightMap::setPlacement(LightAtlas *_owner, FreeSpaceInfo *tgt) {
 std::pair<int, int> LightMap::getDimensions() const {
     return std::pair<int, int>(mSizeX, mSizeY);
 }
-} // namespace Opde
+} // namespace Darkness

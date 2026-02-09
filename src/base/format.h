@@ -26,7 +26,7 @@
 #include <string>
 #include <sstream>
 
-namespace Opde {
+namespace Darkness {
 
 inline void _format(std::ostringstream &oss) {}
 
@@ -43,7 +43,7 @@ inline std::string format(ArgsT&&...args) {
     return oss.str();
 }
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif /* __FORMAT_H */
 

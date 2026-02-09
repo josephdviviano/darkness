@@ -26,7 +26,7 @@
 
 #include "PhysModel.h"
 
-namespace Opde {
+namespace Darkness {
 /** @brief Box physics model. Unmovable.
  * Model that is consisted of a OBB.
  */
@@ -36,6 +36,6 @@ public:
     ~PhysOBBModel();
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

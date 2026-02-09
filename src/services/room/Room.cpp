@@ -26,7 +26,7 @@
 #include "RoomPortal.h"
 #include "RoomService.h"
 
-namespace Opde {
+namespace Darkness {
 /*----------------------------------------------------*/
 /*------------------------ Room ----------------------*/
 /*----------------------------------------------------*/
@@ -184,4 +184,4 @@ void Room::clear() {
 
     mIDLists.clear();
 }
-} // namespace Opde
+} // namespace Darkness

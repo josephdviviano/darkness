@@ -27,8 +27,8 @@
 #include "config.h"
 
 #include "FileGroup.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "ServiceCommon.h"
 #include "PhysModels.h"
 #include "Quaternion.h"
@@ -38,7 +38,7 @@
 
 #include <ode/ode.h>
 
-namespace Opde {
+namespace Darkness {
 
 /** @brief Physics service - service handling physics (STUB)
  */
@@ -118,6 +118,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

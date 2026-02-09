@@ -23,7 +23,7 @@
 
 #include "SymNamePropertyStorage.h"
 
-namespace Opde {
+namespace Darkness {
 /*-----------------------------------------------------------------------*/
 /*-------------------- Symbolic name property storage -------------------*/
 /*-----------------------------------------------------------------------*/
@@ -136,4 +136,4 @@ void SymNamePropertyStorage::clear() {
     StringDataStorage::clear();
     mReverseMap.clear();
 }
-}; // namespace Opde
+}; // namespace Darkness

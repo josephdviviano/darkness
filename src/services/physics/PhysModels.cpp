@@ -30,7 +30,7 @@
 #include "PhysOBBModel.h"
 #include "PhysSphereModel.h"
 
-namespace Opde {
+namespace Darkness {
 /*----------------------------------------------------*/
 /*---------------------- PhysModels ------------------*/
 /*----------------------------------------------------*/
@@ -95,7 +95,7 @@ void PhysModels::read(const FilePtr &tag, unsigned int physVersion) {
 
         default:
             LOG_ERROR("PhysModels::read: Unknown volume type %d", voltype);
-            OPDE_EXCEPT("Unknown volume type encountered");
+            DARKNESS_EXCEPT("Unknown volume type encountered");
         }
 
         mdl->read(tag, physVersion);
@@ -128,7 +128,7 @@ void PhysModels::read(const FilePtr &tag, unsigned int physVersion) {
 
         default:
             LOG_ERROR("PhysModels::read: Unknown volume type %d", voltype);
-            OPDE_EXCEPT("Unknown volume type encountered");
+            DARKNESS_EXCEPT("Unknown volume type encountered");
         }
 
         mdl->read(tag, physVersion);
@@ -147,4 +147,4 @@ void PhysModels::write(const FilePtr &tag, unsigned int physVersion) {
 //------------------------------------------------------
 void PhysModels::clear(void) { STUB_WARN(); }
 
-} // namespace Opde
+} // namespace Darkness

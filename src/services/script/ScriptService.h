@@ -26,14 +26,14 @@
 
 #include "config.h"
 
-#include "OpdeService.h"
-#include "OpdeServiceManager.h"
+#include "DarknessService.h"
+#include "DarknessServiceManager.h"
 #include "SharedPtr.h"
 #include <list>
 #include <map>
 #include <set>
 
-namespace Opde {
+namespace Darkness {
 
 /// A single instance of object script (instanced on object ID)
 class ObjectScript {
@@ -162,6 +162,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

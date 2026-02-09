@@ -27,7 +27,7 @@
 
 #include <memory>
 
-namespace Opde {
+namespace Darkness {
 
 /** Free space information storage - rectangular area in the lightmap (either
  * used or free to use) Organized in a binary tree. - A sort of a 2D texture
@@ -145,5 +145,5 @@ public:
     }
 };
 
-} // namespace Opde
+} // namespace Darkness
 #endif

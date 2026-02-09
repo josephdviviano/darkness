@@ -28,7 +28,7 @@
 #include "bindings.h"
 #include "ServiceCommon.h"
 
-namespace Opde {
+namespace Darkness {
 namespace Python {
 
 /// Property service python binder
@@ -59,6 +59,6 @@ protected:
     static PyMethodDef msMethods[];
 };
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness
 
 #endif // __PROPERTYSERVICEBINDER_H

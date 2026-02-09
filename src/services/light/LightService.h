@@ -34,8 +34,8 @@
 #include "Vector3.h"
 
 #include "ServiceCommon.h"
-#include "OpdeService.h"
-#include "OpdeServiceFactory.h"
+#include "DarknessService.h"
+#include "DarknessServiceFactory.h"
 #include "config.h"
 
 #include <OgreVector2.h>
@@ -46,7 +46,7 @@ class DarkLight;
 
 using Ogre::DarkLight;
 
-namespace Opde {
+namespace Darkness {
 
 class LightAtlasList;
 class LightService;
@@ -192,6 +192,6 @@ public:
 private:
     static const std::string mName;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

@@ -26,7 +26,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 /*---------------------------------------------------------*/
 /*--------------------- CachedInheritor -------------------*/
 /*---------------------------------------------------------*/
@@ -224,4 +224,4 @@ string CachedInheritorFactory::getName() const { return mName; }
 Inheritor *CachedInheritorFactory::createInstance(InheritService *is) const {
     return new CachedInheritor(this, is);
 }
-} // namespace Opde
+} // namespace Darkness

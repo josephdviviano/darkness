@@ -23,11 +23,11 @@
 
 #include "GameService.h"
 #include "FileGroup.h"
-#include "OpdeException.h"
-#include "OpdeServiceManager.h"
+#include "DarknessException.h"
+#include "DarknessServiceManager.h"
 #include "database/DatabaseService.h"
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- GameService -------------------*/
@@ -35,7 +35,7 @@ namespace Opde {
 template <> const size_t ServiceImpl<GameService>::SID = __SERVICE_ID_GAME;
 
 GameService::GameService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::GameService>(manager, name) {}
+    : ServiceImpl<Darkness::GameService>(manager, name) {}
 
 //------------------------------------------------------
 bool GameService::init() {
@@ -67,4 +67,4 @@ Service *GameServiceFactory::createInstance(ServiceManager *manager) {
     return new GameService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

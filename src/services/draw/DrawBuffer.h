@@ -31,7 +31,7 @@
 #include <OgreMovableObject.h>
 #include <OgreRenderable.h>
 
-namespace Opde {
+namespace Darkness {
 
 /** A single renderable representing all drawn quads for particular rendered
  * settings combination (DrawSheet stores N of these for N materials) */
@@ -130,6 +130,6 @@ protected:
 /// Draw buffer map for all render op. combinations (indexed with texture source
 /// ID)
 typedef std::map<DrawSource::ID, DrawBuffer *> DrawBufferMap;
-} // namespace Opde
+} // namespace Darkness
 
 #endif

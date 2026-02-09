@@ -1,7 +1,7 @@
 /******************************************************************************
  *
  *    This file is part of openDarkEngine project
- *    Copyright (C) 2009 openDarkEngine team
+ *    Copyright (C) 2005-2006 openDarkEngine team
  *
  *    This program is free software; you can redistribute it and/or modify
  *    it under the terms of the GNU General Public License as published by
@@ -18,29 +18,28 @@
  *    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
  *
- *	  $Id$
+ *		$Id$
  *
  *****************************************************************************/
 
-// This source code is a fixed and maintained version of the Null render system written by xyzzy@ogre3d.org forum
+#include "config.h"
 
-#ifndef __NULLHLSLPROGRAMFACTORY_H
-#define __NULLHLSLPROGRAMFACTORY_H
+#include "DarknessLogConnector.h"
+#include "logger.h"
 
-#include "stdafx.h"
+namespace Darkness {
 
-namespace Ogre {
-	class NULLHLSLProgramFactory : public Ogre::HighLevelGpuProgramFactory
-	{
-		public:
-			const String& getLanguage() const;
-			HighLevelGpuProgram* create(ResourceManager* creator, const Ogre::String& name, ResourceHandle handle,
-					const Ogre::String& group, bool isManual, Ogre::ManualResourceLoader* loader);
-			void destroy(Ogre::HighLevelGpuProgram*);
-			
-		protected:
-			static const String msLanguage;
-	};
+DarknessLogConnector::DarknessLogConnector(Logger *darknessLogger)
+    : mDarknessLogger(darknessLogger) {}
+
+DarknessLogConnector::~DarknessLogConnector() {}
+
+void DarknessLogConnector::messageLogged(const Ogre::String &message,
+                                         Ogre::LogMessageLevel lml,
+                                         bool maskDebug,
+                                         const Ogre::String &logName,
+                                         bool &skipThisMessage) {
+    mDarknessLogger->log(Logger::LOG_LEVEL_DEBUG, "OGRE_LOG: %s", message.c_str());
 }
 
-#endif
+} // namespace Darkness

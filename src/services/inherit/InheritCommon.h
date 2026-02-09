@@ -34,7 +34,7 @@
 #include "SharedPtr.h"
 #include "Variant.h"
 
-namespace Opde {
+namespace Darkness {
 // Forward declaration
 class InheritService;
 
@@ -200,6 +200,6 @@ public:
 
 typedef shared_ptr<InheritorFactory> InheritorFactoryPtr;
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

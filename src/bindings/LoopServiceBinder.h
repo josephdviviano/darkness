@@ -28,7 +28,7 @@
 #include "bindings.h"
 #include "ServiceCommon.h"
 
-namespace Opde {
+namespace Darkness {
 namespace Python {
 
 /// Loop service python binder
@@ -61,6 +61,6 @@ protected:
     static PyMethodDef msMethods[];
 };
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness
 
 #endif // __LOOPSERVICEBINDER_H

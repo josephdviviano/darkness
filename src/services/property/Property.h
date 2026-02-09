@@ -30,12 +30,12 @@
 #include "DataStorage.h"
 #include "FileGroup.h"
 #include "NonCopyable.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "PropertyCommon.h"
 #include "inherit/InheritService.h"
 #include "logger.h"
 
-namespace Opde {
+namespace Darkness {
 // forward decl.
 class PropertyService;
 
@@ -298,6 +298,6 @@ protected:
     virtual void valueChanged(int oid, const std::string &field,
                               const Variant &value) = 0;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

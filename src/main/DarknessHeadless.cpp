@@ -27,7 +27,7 @@
 #include "logger.h"
 #include "stdlog.h"
 #include "ConsoleBackend.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "File.h"
 #include "FileGroup.h"
 #include "darkdb.h"
@@ -59,7 +59,7 @@
 #include <iostream>
 #include <string>
 
-using namespace Opde;
+using namespace Darkness;
 
 // ---------- Level 1: Raw chunk inspection (no service stack) ----------
 
@@ -514,7 +514,7 @@ int main(int argc, char *argv[]) {
             printUsage(argv[0]);
             return 1;
         }
-    } catch (const Opde::BasicException &e) {
+    } catch (const Darkness::BasicException &e) {
         std::cerr << "Error: " << e.getDetails() << std::endl;
         return 1;
     } catch (const std::exception &e) {

@@ -24,25 +24,25 @@
 
 #include "PropertyServiceBinder.h"
 #include "DataFieldDescIteratorBinder.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "StringIteratorBinder.h"
 #include "bindings.h"
 #include "property/PropertyService.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
 // -------------------- Property Service --------------------
 const char *PropertyServiceBinder::msName = "PropertyService";
 
-const char *opde_PropertyService__doc__ =
+const char *darkness_PropertyService__doc__ =
     "PropertyService proxy. Service that manages properties of game objects";
 
 // ------------------------------------------
 PyTypeObject PropertyServiceBinder::msType = {
     PyVarObject_HEAD_INIT(
-        &PyType_Type, 0) "opde.services.PropertyService", // char *tp_name; */
+        &PyType_Type, 0) "darkness.services.PropertyService", // char *tp_name; */
     sizeof(PropertyServiceBinder::Base), /* int tp_basicsize; */
     0, // int tp_itemsize;       /* not used much */
     PropertyServiceBinder::dealloc, // destructor tp_dealloc; */
@@ -61,7 +61,7 @@ PyTypeObject PropertyServiceBinder::msType = {
     0,                           // setattrofunc tp_setattro; */
     0,                           // PyBufferProcs *tp_as_buffer; */
     0,                           // long tp_flags; */
-    opde_PropertyService__doc__, // char *tp_doc;  */
+    darkness_PropertyService__doc__, // char *tp_doc;  */
     0,                           // traverseproc tp_traverse; */
     0,                           // inquiry tp_clear; */
     0,                           // richcmpfunc tp_richcompare; */
@@ -74,7 +74,7 @@ PyTypeObject PropertyServiceBinder::msType = {
 };
 
 // ------------------------------------------
-const char *opde_PropertyService_has__doc__ =
+const char *darkness_PropertyService_has__doc__ =
     "has(id, name)\n"
     "Detects if the given object has certain property\n"
     "@type id: integer\n"
@@ -84,7 +84,7 @@ const char *opde_PropertyService_has__doc__ =
     "@rtype: bool\n"
     "@return: True if the object has the specified property";
 
-const char *opde_PropertyService_owns__doc__ =
+const char *darkness_PropertyService_owns__doc__ =
     "owns(id, name)\n"
     "Detects if the given object owns certain property (not through "
     "inheritance but directly)\n"
@@ -95,7 +95,7 @@ const char *opde_PropertyService_owns__doc__ =
     "@rtype: bool\n"
     "@return: True if the object has the specified property";
 
-const char *opde_PropertyService_set__doc__ =
+const char *darkness_PropertyService_set__doc__ =
     "set(id, name, field, value)\n"
     "Sets a new value of the given objects property field\n"
     "@type id: integer\n"
@@ -107,7 +107,7 @@ const char *opde_PropertyService_set__doc__ =
     "@type value: object\n"
     "@param value: New value object\n";
 
-const char *opde_PropertyService_get__doc__ =
+const char *darkness_PropertyService_get__doc__ =
     "set(id, name, field, value)\n"
     "Gets property field value for the specified object\n"
     "@type id: integer\n"
@@ -119,13 +119,13 @@ const char *opde_PropertyService_get__doc__ =
     "@rtype: object\n"
     "@return: Property field value, or None on error\n";
 
-const char *opde_PropertyService_getAllPropertyNames__doc__ =
+const char *darkness_PropertyService_getAllPropertyNames__doc__ =
     "getAllPropertyNames()\n"
     "@rtype: iterable object\n"
     "@return: Returns iterable object containing all property names as "
     "strings\n";
 
-const char *opde_PropertyService_getPropertyFieldsDesc__doc__ =
+const char *darkness_PropertyService_getPropertyFieldsDesc__doc__ =
     "getPropertyFieldsDesc()\n"
     "@type name: string\n"
     "@param name: Property name\n"
@@ -135,14 +135,14 @@ const char *opde_PropertyService_getPropertyFieldsDesc__doc__ =
 
 // ------------------------------------------
 PyMethodDef PropertyServiceBinder::msMethods[] = {
-    {"has", has, METH_VARARGS, opde_PropertyService_has__doc__},
-    {"owns", owns, METH_VARARGS, opde_PropertyService_owns__doc__},
-    {"set", set, METH_VARARGS, opde_PropertyService_set__doc__},
-    {"get", get, METH_VARARGS, opde_PropertyService_get__doc__},
+    {"has", has, METH_VARARGS, darkness_PropertyService_has__doc__},
+    {"owns", owns, METH_VARARGS, darkness_PropertyService_owns__doc__},
+    {"set", set, METH_VARARGS, darkness_PropertyService_set__doc__},
+    {"get", get, METH_VARARGS, darkness_PropertyService_get__doc__},
     {"getAllPropertyNames", getAllPropertyNames, METH_NOARGS,
-     opde_PropertyService_getAllPropertyNames__doc__},
+     darkness_PropertyService_getAllPropertyNames__doc__},
     {"getPropertyFieldsDesc", getPropertyFieldsDesc, METH_VARARGS,
-     opde_PropertyService_getPropertyFieldsDesc__doc__},
+     darkness_PropertyService_getPropertyFieldsDesc__doc__},
     {NULL, NULL},
 };
 
@@ -307,4 +307,4 @@ PyObject *PropertyServiceBinder::create() {
 }
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

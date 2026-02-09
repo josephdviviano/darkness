@@ -27,10 +27,10 @@
 
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 namespace Python {
 
-/** A Service interface for python. Manages a module "opde.services".
+/** A Service interface for python. Manages a module "darkness.services".
  * Exposes getters for services. Each getter is named exactly the same as the
  * service itself.
  * @note When creating a new service, remember to expose it here
@@ -56,6 +56,6 @@ protected:
     static const char *msName;
 };
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness
 
 #endif

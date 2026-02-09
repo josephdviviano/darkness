@@ -41,7 +41,7 @@ namespace Ogre {
  * 3. Other
  *
  *
- * In Opde, this class is used to mask the fact about the resource's source (crf
+ * In Darkness, this class is used to mask the fact about the resource's source (crf
  *file or not), and make ogre's file system archive case insensitive on *nix
  *systems.
  *

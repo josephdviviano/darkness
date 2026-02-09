@@ -26,13 +26,13 @@
 #include "format.h"
 #include "LinkService.h"
 #include "FileGroup.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "ServiceCommon.h"
 #include "database/DatabaseService.h"
 #include "logger.h"
 #include "Relation.h"
 
-namespace Opde {
+namespace Darkness {
 /// helper string iterator over map keys
 class RelationNameMapKeyIterator : public StringIterator {
 public:
@@ -65,7 +65,7 @@ protected:
 template <> const size_t ServiceImpl<LinkService>::SID = __SERVICE_ID_LINK;
 
 LinkService::LinkService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::LinkService>(manager, name), mDatabaseService(NULL) {}
+    : ServiceImpl<Darkness::LinkService>(manager, name), mDatabaseService(NULL) {}
 
 //------------------------------------------------------
 LinkService::~LinkService() {
@@ -115,7 +115,7 @@ void LinkService::load(const FileGroupPtr &db, const BitArray &objMask) {
         std::string stxt = text;
 
         if (stxt.substr(0, 1) == "~")
-            OPDE_EXCEPT(
+            DARKNESS_EXCEPT(
                 format("Conflicting name. Character ~ is reserved for inverse "
                        "relations. Conflicting name : ",
                        stxt));
@@ -136,7 +136,7 @@ void LinkService::load(const FileGroupPtr &db, const BitArray &objMask) {
 
         // Request the mapping to ID
         if (!requestRelationFlavorMap(i, text, rel))
-            OPDE_EXCEPT(format("Could not map relation '", text,
+            DARKNESS_EXCEPT(format("Could not map relation '", text,
                                "' to flavor. Name/ID conflict"));
 
         LOG_DEBUG("Mapped relation %s to flavor %d", text, i);
@@ -147,14 +147,14 @@ void LinkService::load(const FileGroupPtr &db, const BitArray &objMask) {
         rnit = mRelationNameMap.find(inverse);
 
         if (rnit == mRelationNameMap.end())
-            OPDE_EXCEPT(format("Could not find inverse relation ", inverse,
+            DARKNESS_EXCEPT(format("Could not find inverse relation ", inverse,
                                " predefined. Could not continue"));
 
         RelationPtr irel = rnit->second;
 
         // Request the mapping to ID
         if (!requestRelationFlavorMap(-i, inverse, irel))
-            OPDE_EXCEPT(format("Could not map inverse relation ", inverse,
+            DARKNESS_EXCEPT(format("Could not map inverse relation ", inverse,
                                " to flavor. Name/ID conflict"));
 
         LOG_DEBUG("Mapped relation pair %s, %s to flavor %d, %d", text,
@@ -192,7 +192,7 @@ void LinkService::save(const FileGroupPtr &db, uint saveMask) {
 
     for (; it != mRelationIDMap.end(); ++it, ++order) {
         if (order != it->first)
-            OPDE_EXCEPT("Index order mismatch, could not continue...");
+            DARKNESS_EXCEPT("Index order mismatch, could not continue...");
 
         // Write the relation's name
         char title[32];
@@ -239,7 +239,7 @@ RelationPtr LinkService::createRelation(const std::string &name,
                                         const DataStoragePtr &stor,
                                         bool hidden) {
     if (name.substr(0, 1) == "~")
-        OPDE_EXCEPT(
+        DARKNESS_EXCEPT(
             format(
                 "Name conflict: Relation can't use ~ character as the first "
                 "one, it's reserved for inverse relations. Conflicting name: ",
@@ -259,13 +259,13 @@ RelationPtr LinkService::createRelation(const std::string &name,
         mRelationNameMap.insert(make_pair(name, nr));
 
     if (!res.second)
-        OPDE_EXCEPT("Failed to insert new instance of Relation named " + name);
+        DARKNESS_EXCEPT("Failed to insert new instance of Relation named " + name);
 
     // Inverse relation now
     res = mRelationNameMap.insert(make_pair(inverse, nrinv));
 
     if (!res.second)
-        OPDE_EXCEPT("Failed to insert new instance of Relation");
+        DARKNESS_EXCEPT("Failed to insert new instance of Relation");
 
     LOG_VERBOSE(
         "LinkService::createRelation: Succesfully created Relation pair '%s'",
@@ -449,4 +449,4 @@ const uint LinkServiceFactory::getMask() {
 
 const size_t LinkServiceFactory::getSID() { return LinkService::SID; }
 
-} // namespace Opde
+} // namespace Darkness

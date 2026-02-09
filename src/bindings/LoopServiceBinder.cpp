@@ -22,12 +22,12 @@
  *
  *****************************************************************************/
 
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "LoopServiceBinder.h"
 #include "bindings.h"
 #include "loop/LoopService.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -37,7 +37,7 @@ const char *LoopServiceBinder::msName = "LoopService";
 // ------------------------------------------
 PyTypeObject LoopServiceBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.LoopService", // char *tp_name; */
+                          0) "darkness.services.LoopService", // char *tp_name; */
     sizeof(LoopServiceBinder::Base), // int tp_basicsize; */
     0,                          // int tp_itemsize;       /* not used much */
     LoopServiceBinder::dealloc, // destructor tp_dealloc; */
@@ -199,4 +199,4 @@ void LoopServiceBinder::init(PyObject *module) {
 }
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

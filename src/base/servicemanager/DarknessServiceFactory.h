@@ -22,13 +22,13 @@
  *
  *****************************************************************************/
 
-#ifndef __OPDESERVICEFACTORY_H
-#define __OPDESERVICEFACTORY_H
+#ifndef __DARKNESSSERVICEFACTORY_H
+#define __DARKNESSSERVICEFACTORY_H
 
 #include "compat.h"
 #include <string>
 
-namespace Opde {
+namespace Darkness {
 
 // Volca: I like the Ogre's approach to factories. This is quite simmilar
 
@@ -61,6 +61,6 @@ public:
      * @returns The bitmask of the service */
     virtual const uint getMask() = 0;
 };
-} // namespace Opde
+} // namespace Darkness
 
 #endif

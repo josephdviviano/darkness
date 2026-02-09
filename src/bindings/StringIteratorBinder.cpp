@@ -25,7 +25,7 @@
 #include "StringIteratorBinder.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -35,7 +35,7 @@ const char *StringIteratorBinder::msName = "StringIterator";
 // ------------------------------------------
 PyTypeObject StringIteratorBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.StringIterator", /* char *tp_name; */
+                          0) "darkness.StringIterator", /* char *tp_name; */
     sizeof(StringIteratorBinder::Base),           /* int tp_basicsize; */
     0,                             // int tp_itemsize;       /* not used much */
     StringIteratorBinder::dealloc, /* destructor tp_dealloc; */
@@ -127,4 +127,4 @@ void StringIteratorBinder::init(PyObject *module) {
 
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

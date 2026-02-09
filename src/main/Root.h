@@ -29,12 +29,12 @@
 #include "compat.h"
 #include "integers.h"
 
-#include "OpdeCommon.h"
+#include "DarknessCommon.h"
 
 #include "ConsoleBackend.h"
-#include "OgreOpdeLogConnector.h"
-#include "OpdeServiceManager.h"
-#include "OpdeSingleton.h"
+#include "DarknessLogConnector.h"
+#include "DarknessServiceManager.h"
+#include "DarknessSingleton.h"
 #include "ServiceCommon.h"
 #include "logger.h"
 
@@ -43,12 +43,12 @@
 #include <Overlay/OgreOverlaySystem.h>
 
 /** OpenDarkEngine namespace. Holds the whole openDarkEngine project. */
-namespace Opde {
+namespace Darkness {
 
-/** OPDE core class. Used to initialize the whole engine. Singleton */
+/** Darkness core class. Used to initialize the whole engine. Singleton */
 class Root : public Singleton<Root> {
 public:
-    /** Initializes the opde core
+    /** Initializes the darkness core
      * @param serviceMask the mask of the services which should be used (others
      * will be ignored and unreachable)
      * @param logFileName - optional log file name - when specified, logging to
@@ -56,7 +56,7 @@ public:
      */
     Root(uint serviceMask = SERVICE_ALL, const char *logFileName = NULL);
 
-    /** stops the opde core, does cleanup */
+    /** stops the darkness core, does cleanup */
     ~Root();
 
     // ----------------- Methods used for boostrapping --------------------
@@ -64,7 +64,7 @@ public:
     /// locations configuration
     void loadResourceConfig(const std::string &fileName);
 
-    /// Loads a config file with opde settings
+    /// Loads a config file with darkness settings
     void loadConfigFile(const std::string &fileName);
 
     /// Only a wrapper around the
@@ -106,7 +106,7 @@ protected:
     std::unique_ptr<ServiceManager> mServiceMgr;
     std::unique_ptr<Ogre::Root> mOgreRoot;
     std::unique_ptr<Ogre::LogManager> mOgreLogManager;
-    std::unique_ptr<OgreOpdeLogConnector> mOgreOpdeLogConnector;
+    std::unique_ptr<DarknessLogConnector> mDarknessLogConnector;
 
     /// @deprecated
     std::unique_ptr<ConsoleBackend> mConsoleBackend;
@@ -131,6 +131,6 @@ protected:
     std::unique_ptr<Ogre::ArchiveManager> mArchiveManager;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

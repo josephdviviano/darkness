@@ -26,7 +26,7 @@
 #include "GameState.h"
 #include "GameStateManager.h"
 
-namespace Opde {
+namespace Darkness {
 
 GameState::GameState() {}
 
@@ -42,4 +42,4 @@ void GameState::requestTermination() {
     GameStateManager::getSingleton().terminate();
 }
 
-} // namespace Opde
+} // namespace Darkness

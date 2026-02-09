@@ -48,7 +48,7 @@
 #include "DarkSceneManager.h"
 #include "EntityInfo.h"
 #include "ManualBinFileLoader.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "RenderService.h"
 #include "ServiceCommon.h"
 #include "config/ConfigService.h"
@@ -65,7 +65,7 @@
 #include "RenderTypeProperty.h"
 #include "ZBiasProperty.h"
 
-namespace Opde {
+namespace Darkness {
 const char *DEFAULT_RAMP_OBJECT_NAME = "DefaultRamp";
 const char *FX_PARTICLE_OBJECT_NAME = "FX_PARTICLE";
 
@@ -75,7 +75,7 @@ const char *FX_PARTICLE_OBJECT_NAME = "FX_PARTICLE";
 template <> const size_t ServiceImpl<RenderService>::SID = __SERVICE_ID_RENDER;
 
 RenderService::RenderService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::RenderService>(manager, name),
+    : ServiceImpl<Darkness::RenderService>(manager, name),
       mPropModelName(),
       mPropPosition(NULL),
       mPropScale(),
@@ -99,7 +99,7 @@ RenderService::RenderService(ServiceManager *manager, const std::string &name)
     // initialiser of graphics as the whole. This will be the modification that
     // should be done soon in order to let the code look and be nice FIX!
     mRoot = Ogre::Root::getSingletonPtr();
-    mManualBinFileLoader.reset(new Opde::ManualBinFileLoader());
+    mManualBinFileLoader.reset(new Darkness::ManualBinFileLoader());
 
     mLoopClientDef.id = LOOPCLIENT_ID_RENDERER;
     mLoopClientDef.mask = LOOPMODE_RENDER;
@@ -184,7 +184,7 @@ bool RenderService::init() {
     mConfigService->setParamDescription(
         "display", "Display id (for multi-screen systems)");
 
-    // get screen resolution from opde.cfg
+    // get screen resolution from darkness.cfg
     mCurrentSize.fullscreen =
         mConfigService->getParam("fullscreen", false).toBool();
     mCurrentSize.width = mConfigService->getParam("window_width", 0).toUInt();
@@ -253,7 +253,7 @@ bool RenderService::init() {
 void RenderService::initSDLWindow() {
     int res = SDL_Init(SDL_INIT_EVERYTHING);
     if (res != 0) {
-        OPDE_EXCEPT(format("SDL Initialization error: ", SDL_GetError()));
+        DARKNESS_EXCEPT(format("SDL Initialization error: ", SDL_GetError()));
     }
 
     // try to reach propper display and resolution
@@ -263,7 +263,7 @@ void RenderService::initSDLWindow() {
         int dispCount = SDL_GetNumVideoDisplays();
 
         if (dispCount < 0)
-            OPDE_EXCEPT(format("SDL can't get display count. Error: ", SDL_GetError()));
+            DARKNESS_EXCEPT(format("SDL can't get display count. Error: ", SDL_GetError()));
 
         if (mCurrentSize.display < 0)
             mCurrentSize.display = 0;
@@ -279,7 +279,7 @@ void RenderService::initSDLWindow() {
         res = SDL_GetDesktopDisplayMode(mCurrentSize.display, &mode);
 
         if (res)
-            OPDE_EXCEPT(format("SDL can't get current video mode. Error: ",
+            DARKNESS_EXCEPT(format("SDL can't get current video mode. Error: ",
                                SDL_GetError()));
 
         mCurrentSize.width = mode.w;
@@ -302,14 +302,14 @@ void RenderService::initSDLWindow() {
                                   mCurrentSize.height, flags);
 
     if (mSDLWindow == NULL)
-        OPDE_EXCEPT("Can't create SDL window");
+        DARKNESS_EXCEPT("Can't create SDL window");
 }
 
 // --------------------------------------------------------------------------
 void RenderService::initOgreWindow() {
     // where do I find this?
     if (mRoot->getAvailableRenderers().size() < 1)
-        OPDE_EXCEPT("Failed to initialize RenderSystem");
+        DARKNESS_EXCEPT("Failed to initialize RenderSystem");
     mRoot->setRenderSystem(mRoot->getAvailableRenderers()[0]);
     mRoot->initialise(false);
 
@@ -320,7 +320,7 @@ void RenderService::initOgreWindow() {
     SDL_SysWMinfo sysInfo;
     SDL_VERSION(&sysInfo.version);
     if (SDL_GetWindowWMInfo(mSDLWindow, &sysInfo) <= 0) {
-        OPDE_EXCEPT("Can't create SDL GL context");
+        DARKNESS_EXCEPT("Can't create SDL GL context");
     }
 
 #ifdef __WINDOWS__
@@ -413,7 +413,7 @@ void RenderService::bootstrapFinished() {
     mPropPosition = mPropertyService->getProperty("Position");
 
     if (mPropPosition == NULL)
-        OPDE_EXCEPT("Could not get Position property. Not defined. Fatal");
+        DARKNESS_EXCEPT("Could not get Position property. Not defined. Fatal");
 
     // listener to the position property to control the scenenode
     Property::ListenerPtr cposc(
@@ -463,7 +463,7 @@ void RenderService::prepareMesh(const Ogre::String &name) {
             LOG_ERROR("RenderService::prepareMesh: Could not find the "
                       "requested model %s",
                       name.c_str());
-        } catch (const Opde::FileException &) {
+        } catch (const Darkness::FileException &) {
             LOG_ERROR("RenderService::prepareMesh: Could not load the "
                       "requested model %s",
                       name.c_str());
@@ -644,7 +644,7 @@ Ogre::SceneNode *RenderService::getSceneNode(int objID) {
 
     // Throwing exceptions is not a good idea
     return NULL;
-    // OPDE_EXCEPT("Could not find scenenode for object. Does object exist?",
+    // DARKNESS_EXCEPT("Could not find scenenode for object. Does object exist?",
     // "ObjectService::getSceneNodeForObject");
 }
 
@@ -904,4 +904,4 @@ Service *RenderServiceFactory::createInstance(ServiceManager *manager) {
 }
 
 const size_t RenderServiceFactory::getSID() { return RenderService::SID; }
-} // namespace Opde
+} // namespace Darkness

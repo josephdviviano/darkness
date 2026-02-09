@@ -23,10 +23,10 @@
 
 
 #include "PhysicsService.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "ServiceCommon.h"
 #include "logger.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "database/DatabaseService.h"
 
 #include "PhysModel.h"
@@ -34,7 +34,7 @@
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- Physics Service ---------------*/
@@ -43,7 +43,7 @@ template <>
 const size_t ServiceImpl<PhysicsService>::SID = __SERVICE_ID_PHYSICS;
 
 PhysicsService::PhysicsService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::PhysicsService>(manager, name), mPhysModels(this)
+    : ServiceImpl<Darkness::PhysicsService>(manager, name), mPhysModels(this)
 {
 }
 
@@ -202,4 +202,4 @@ Service *PhysicsServiceFactory::createInstance(ServiceManager *manager)
     return new PhysicsService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

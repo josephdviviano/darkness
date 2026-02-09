@@ -34,7 +34,7 @@ this file are exact copies or free-style rewrites of the contributed code
 #include "integers.h"
 #include "File.h"
 
-namespace Opde {
+namespace Darkness {
 
 
 // Material flags (known)
@@ -852,6 +852,6 @@ File &operator <<(File &f, AITriangle &t) {
     return f;
 }
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

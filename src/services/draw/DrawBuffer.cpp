@@ -34,7 +34,7 @@
 
 using namespace Ogre;
 
-namespace Opde {
+namespace Darkness {
 
 /*----------------------------------------------------*/
 /*-------------------- DrawBuffer --------------------*/
@@ -339,4 +339,4 @@ void DrawBuffer::destroyBuffers() {
     mBuffer.reset();
 };
 
-} // namespace Opde
+} // namespace Darkness

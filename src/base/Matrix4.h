@@ -26,7 +26,7 @@
 #include <cstring>
 #include "Vector3.h"
 
-namespace Opde {
+namespace Darkness {
 
 struct Matrix4 {
     float m[4][4];
@@ -99,6 +99,6 @@ struct Matrix4 {
     const float *data() const { return &m[0][0]; }
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

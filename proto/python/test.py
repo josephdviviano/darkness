@@ -1,40 +1,40 @@
-import opde
+import darkness
 
 # TODO: We need to export service mask constants!
-opderoot = opde.createRoot(opde.services.SERVICE_ALL)
+darknessroot = darkness.createRoot(darkness.services.SERVICE_ALL)
 
-opderoot.logToFile("opde.log")
-opderoot.setLogLevel(4)
+darknessroot.logToFile("darkness.log")
+darknessroot.setLogLevel(4)
 
 # Setup resources
-opderoot.loadResourceConfig("thief1.cfg")
-opderoot.loadConfigFile("opde.cfg")
+darknessroot.loadResourceConfig("thief1.cfg")
+darknessroot.loadConfigFile("darkness.cfg")
 
 # Load the dype scripts (this should vary depending on the game type)
-# opderoot.loadDTypeScript("common.dtype", "General")
-#opderoot.loadDTypeScript("t1-types.dtype", "General")
-#opderoot.loadPLDefScript("t1-links.pldef", "General")
-#opderoot.loadPLDefScript("t1-props.pldef", "General")
+# darknessroot.loadDTypeScript("common.dtype", "General")
+#darknessroot.loadDTypeScript("t1-types.dtype", "General")
+#darknessroot.loadPLDefScript("t1-links.pldef", "General")
+#darknessroot.loadPLDefScript("t1-props.pldef", "General")
 
 
 # Bootstrapping finished. We can progress wit the actual engine run
-opderoot.bootstrapFinished();
+darknessroot.bootstrapFinished();
 
 # Service globals
-lsrv = opde.services.getLoopService()
-isrv = opde.services.getInputService()
+lsrv = darkness.services.getLoopService()
+isrv = darkness.services.getInputService()
 # osrv = Services.ObjectService()
 
 # ------------- State management -------------
 # To sim menu switcher
 # To be called from a key input handler
 def switchToSimMenu():
-    opde.log_debug("Switching to sim menu")
+    darkness.log_debug("Switching to sim menu")
     lsrv.requestLoopMode("GUIOnlyLoopMode")
     
 # The reverse (to game switch from gui)
 def switchToGameMode():
-    opde.log_debug("Switching to game mode")
+    darkness.log_debug("Switching to game mode")
     # TODO: Render service -> set world visible
     lsrv.requestLoopMode("AllClientsLoopMode")
     # guisrv.setActiveSheet(GameModeSheet)
@@ -51,18 +51,18 @@ def simMenuRequest(msg):
 
 def exitRequest(msg):
 #    log_info("Received a message for exitRequest " + str(msg.event))
-    opde.log_info("Termination requested!")
+    darkness.log_info("Termination requested!")
     lsrv.requestTermination()
 
 def debugFrameRequest(msg):
-    opde.log_info("Received a message for frame debugger. Will debug one frame")
-    opde.log_info("Comand field: " + msg.command)
-    opde.log_info("Comand params: " + str(msg.params))
+    darkness.log_info("Received a message for frame debugger. Will debug one frame")
+    darkness.log_info("Comand field: " + msg.command)
+    darkness.log_info("Comand params: " + str(msg.params))
     lsrv.debugOneFrame()
 
 # ------------ Main code -------------
 def databaseProgressUpdate(msg):
-    opde.log_info("Loading progress : " + str(msg.completed  * 100))
+    darkness.log_info("Loading progress : " + str(msg.completed  * 100))
 #    loadScreen.setLeftGauge(msg['progress_master'])
 #    loadScreen.setRightGauge(msg['progress_slave'])
 #    rendersrv.renderOneFrame()
@@ -86,19 +86,19 @@ isrv.command("bind 1 debug_frame")
 isrv.setInputMapped(True)
 
 # A sample mission load
-dbsrv = opde.services.getDatabaseService()
+dbsrv = darkness.services.getDatabaseService()
 dbsrv.setProgressListener(databaseProgressUpdate)
-# dbsrv.load("miss1.mis", opde.services.DBM_COMPLETE)
+# dbsrv.load("miss1.mis", darkness.services.DBM_COMPLETE)
 
 # some on-screen text
-drawsrv = opde.services.getDrawService()
+drawsrv = darkness.services.getDrawService()
 
 dsht = drawsrv.createSheet("default")
 drawsrv.setActiveSheet(dsht)
 atl = drawsrv.createAtlas()
 # load a font
-drawsrv.setFontPalette(opde.services.PT_PCX, "darkpal.pcx", "General")
-#drawsrv.setFontPalette(opde.services.PT_PCX, "amappal.pcx", "General")
+drawsrv.setFontPalette(darkness.services.PT_PCX, "darkpal.pcx", "General")
+#drawsrv.setFontPalette(darkness.services.PT_PCX, "amappal.pcx", "General")
 fnt = drawsrv.loadFont(atl, "TEXTFONT.FON" , "General")
 lab = drawsrv.createRenderedLabel(fnt)
 lab.setLabel("A small text on screen")
@@ -113,7 +113,7 @@ else:
     lsrv.run() # Run the main loop
     
 # Termination
-opde.log_info("Terminating Opde");
+darkness.log_info("Terminating Darkness");
 
 isrv.unregisterCommandTrap("debug_frame")
 isrv.unregisterCommandTrap("exit_request")

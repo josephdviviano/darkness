@@ -24,7 +24,7 @@
 #ifndef __ROOMCOMMON_H
 #define __ROOMCOMMON_H
 
-namespace Opde {
+namespace Darkness {
 // Forward declaration
 class RoomService;
 class Room;
@@ -160,6 +160,6 @@ class RoomPortal;
                 }
         };
         */
-} // namespace Opde
+} // namespace Darkness
 
 #endif

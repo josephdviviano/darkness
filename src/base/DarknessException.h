@@ -23,24 +23,24 @@
  *
  *****************************************************************************/
 
-#ifndef __OPDEEXCEPTION_H
-#define __OPDEEXCEPTION_H
+#ifndef __DARKNESSEXCEPTION_H
+#define __DARKNESSEXCEPTION_H
 
 #include "config.h"
 
 #include <stdexcept>
 #include <string>
 
-namespace Opde {
+namespace Darkness {
 
 /** A usage - simplifying macro */
-#define OPDE_EXCEPT(desc)                                                      \
-    throw(Opde::BasicException(desc, __FUNCTION__, __FILE__, __LINE__))
+#define DARKNESS_EXCEPT(desc)                                                      \
+    throw(Darkness::BasicException(desc, __FUNCTION__, __FILE__, __LINE__))
 
-/** @brief A standard OPDE exception
+/** @brief A standard Darkness exception
  *
- * This is a basic OPDE exception. Based largely on the Ogre's exception code
- * For simple usage, use the OPDE_EXCEPT macro */
+ * This is a basic Darkness exception. Based largely on the Ogre's exception code
+ * For simple usage, use the DARKNESS_EXCEPT macro */
 class BasicException : public std::exception {
 protected:
     std::string description;
@@ -68,9 +68,9 @@ public:
         : BasicException(txt, "", file, line){};
 };
 
-#define OPDE_ARRAY_EXCEPT(txt)                                                 \
-    throw(Opde::IndexOutOfBoundsException(txt, __FILE__, __LINE__))
+#define DARKNESS_ARRAY_EXCEPT(txt)                                                 \
+    throw(Darkness::IndexOutOfBoundsException(txt, __FILE__, __LINE__))
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

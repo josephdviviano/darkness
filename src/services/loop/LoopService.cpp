@@ -22,15 +22,15 @@
  *****************************************************************************/
 
 #include "LoopService.h"
-#include "OpdeException.h"
+#include "DarknessException.h"
 #include "ServiceCommon.h"
-#include "OpdeServiceManager.h"
+#include "DarknessServiceManager.h"
 #include "config/ConfigService.h"
 #include "logger.h"
 
 using namespace std;
 
-namespace Opde {
+namespace Darkness {
 /*-------------------------------------------------*/
 /*-------------------- LoopMode -------------------*/
 /*-------------------------------------------------*/
@@ -119,7 +119,7 @@ void LoopClient::loopModeEnded(const LoopModeDefinition &loopMode) {}
 template <> const size_t ServiceImpl<LoopService>::SID = __SERVICE_ID_LOOP;
 
 LoopService::LoopService(ServiceManager *manager, const std::string &name)
-    : ServiceImpl<Opde::LoopService>(manager, name),
+    : ServiceImpl<Darkness::LoopService>(manager, name),
       mTerminationRequested(false), mNewLoopMode(NULL),
       mNewModeRequested(false), mLastFrameTime(0), mDebugOneFrame(false) {
 
@@ -353,4 +353,4 @@ Service *LoopServiceFactory::createInstance(ServiceManager *manager) {
     return new LoopService(manager, mName);
 }
 
-} // namespace Opde
+} // namespace Darkness

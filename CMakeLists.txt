@@ -17,16 +17,21 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-project(OPDE LANGUAGES C CXX)
+project(Darkness LANGUAGES C CXX)
 
-set(OPDE_VER_MAJOR "0")
-set(OPDE_VER_MINOR "3")
-set(OPDE_VER_PATCH "0")
+# CMake auto-creates ${Darkness_SOURCE_DIR} and ${Darkness_BINARY_DIR} from
+# the project name. Alias them to DARKNESS_* for consistent use throughout.
+set(DARKNESS_SOURCE_DIR "${Darkness_SOURCE_DIR}")
+set(DARKNESS_BINARY_DIR "${Darkness_BINARY_DIR}")
+
+set(DARKNESS_VER_MAJOR "0")
+set(DARKNESS_VER_MINOR "3")
+set(DARKNESS_VER_PATCH "0")
 set(REL_CODE_NAME  "El Motor Oscuro")
 
 # for installation - directories with version in them (/usr/share/... etc.)
-set(OPDE_SHORTNAME_WITH_VERSION "${CMAKE_PROJECT_NAME}-${OPDE_VER_MAJOR}.${OPDE_VER_MINOR}")
-mark_as_advanced(OPDE_SHORTNAME_WITH_VERSION)
+set(DARKNESS_SHORTNAME_WITH_VERSION "${CMAKE_PROJECT_NAME}-${DARKNESS_VER_MAJOR}.${DARKNESS_VER_MINOR}")
+mark_as_advanced(DARKNESS_SHORTNAME_WITH_VERSION)
 
 # C++17 standard
 set(CMAKE_CXX_STANDARD 17)
@@ -58,15 +63,15 @@ set(STATIC_LIBS OFF)
 mark_as_advanced(STATIC_LIBS)
 
 # Installation directories
-set(OPDE_BINARY_INSTALL_DIR "bin")
-mark_as_advanced(OPDE_BINARY_INSTALL_DIR)
-set(OPDE_LIBRARY_INSTALL_DIR "lib")
-mark_as_advanced(OPDE_LIBRARY_INSTALL_DIR)
+set(DARKNESS_BINARY_INSTALL_DIR "bin")
+mark_as_advanced(DARKNESS_BINARY_INSTALL_DIR)
+set(DARKNESS_LIBRARY_INSTALL_DIR "lib")
+mark_as_advanced(DARKNESS_LIBRARY_INSTALL_DIR)
 
-set(OPDE_DATA_INSTALL_DIR share/${OPDE_SHORTNAME_WITH_VERSION})
-set(OPDE_FULL_DATA_INSTALL_DIR ${CMAKE_INSTALL_PREFIX}/${OPDE_DATA_INSTALL_DIR})
-mark_as_advanced(OPDE_DATA_INSTALL_DIR)
-mark_as_advanced(OPDE_FULL_DATA_INSTALL_DIR)
+set(DARKNESS_DATA_INSTALL_DIR share/${DARKNESS_SHORTNAME_WITH_VERSION})
+set(DARKNESS_FULL_DATA_INSTALL_DIR ${CMAKE_INSTALL_PREFIX}/${DARKNESS_DATA_INSTALL_DIR})
+mark_as_advanced(DARKNESS_DATA_INSTALL_DIR)
+mark_as_advanced(DARKNESS_FULL_DATA_INSTALL_DIR)
 
 # Compiler profiling flags
 if(PROFILING)
@@ -102,7 +107,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 # Global debug option
 if(GLOBAL_DEBUG)
     message(STATUS "Debugging is ON")
-    set(OPDE_DEBUG 1)
+    set(DARKNESS_DEBUG 1)
 else()
     message(STATUS "Debugging is Off")
 endif()
@@ -162,12 +167,12 @@ enable_testing()
 add_subdirectory(tests)
 
 # Additional fake_install dependencies
-set(OPDE_DOC_INST_DEPS "")
-mark_as_advanced(OPDE_DOC_INST_DEPS)
+set(DARKNESS_DOC_INST_DEPS "")
+mark_as_advanced(DARKNESS_DOC_INST_DEPS)
 
 # Documentation generation
 if(GENERATE_DOC AND DOC_DEPS_SATISFIED)
-    set(OPDE_DOC_DIR share/${OPDE_SHORTNAME_WITH_VERSION})
+    set(DARKNESS_DOC_DIR share/${DARKNESS_SHORTNAME_WITH_VERSION})
 
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile.in
                       ${CMAKE_BINARY_DIR}/Doxyfile)
@@ -188,8 +193,8 @@ if(GENERATE_DOC AND DOC_DEPS_SATISFIED)
     file(REMOVE ${CMAKE_BINARY_DIR}/doc/python/html/temp.txt)
 
     add_custom_target(pydoc ALL
-        DEPENDS opdeScript
-        COMMAND ${CMAKE_BINARY_DIR}/src/main/opdeScript ${CMAKE_BINARY_DIR}/writedoc.py
+        DEPENDS darknessScript
+        COMMAND ${CMAKE_BINARY_DIR}/src/main/darknessScript ${CMAKE_BINARY_DIR}/writedoc.py
         COMMENT "Building Python API documentation" VERBATIM
     )
 
@@ -208,14 +213,14 @@ if(GENERATE_DOC AND DOC_DEPS_SATISFIED)
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/doc/style.css
                       ${CMAKE_BINARY_DIR}/doc/style.css)
 
-    install(DIRECTORY ${OPDE_BINARY_DIR}/doc DESTINATION ${OPDE_DOC_DIR})
+    install(DIRECTORY ${DARKNESS_BINARY_DIR}/doc DESTINATION ${DARKNESS_DOC_DIR})
 
-    set(OPDE_DOC_INST_DEPS "doc" "pydoc" "manual")
+    set(DARKNESS_DOC_INST_DEPS "doc" "pydoc" "manual")
 endif()
 
 if(GENERATE_NSIS)
-    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/installer/opde-win.in
-                      ${CMAKE_BINARY_DIR}/installer/opde-win.nsi @ONLY)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/installer/darkness-win.in
+                      ${CMAKE_BINARY_DIR}/installer/darkness-win.nsi @ONLY)
     message(STATUS "Installer script was generated in ${CMAKE_BINARY_DIR}/installer.")
 endif()
 

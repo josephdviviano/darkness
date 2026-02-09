@@ -28,7 +28,7 @@
 #include "LinkServiceBinder.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 
@@ -38,7 +38,7 @@ const char *RelationBinder::msName = "Relation";
 // ------------------------------------------
 PyTypeObject RelationBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.services.Relation", /* char *tp_name; */
+                          0) "darkness.services.Relation", /* char *tp_name; */
     sizeof(RelationBinder::Base),                    /* int tp_basicsize; */
     0,                       // int tp_itemsize;       /* not used much */
     RelationBinder::dealloc, /* destructor tp_dealloc; */
@@ -308,4 +308,4 @@ void RelationBinder::init(PyObject *module) {
 }
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

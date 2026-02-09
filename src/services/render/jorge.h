@@ -25,7 +25,7 @@
 #ifndef JORGE_H
 #define JORGE_H
 
-namespace Opde {
+namespace Darkness {
 
 #define JORGE_TEXTURE_PNG_SIZE 302
 
@@ -58,6 +58,6 @@ unsigned char JORGE_TEXTURE_PNG[JORGE_TEXTURE_PNG_SIZE] = {
     0xf5, 0x85, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
     0x60, 0x82};
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

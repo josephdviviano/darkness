@@ -1,9 +1,9 @@
 // Ogre overlay scripts
-Opde/DebugOverlay
+Darkness/DebugOverlay
 {
 	zorder 500
 	// Stats block
-	container BorderPanel(Opde/StatPanel)
+	container BorderPanel(Darkness/StatPanel)
 	{
 		metrics_mode pixels
 		vert_align bottom
@@ -13,7 +13,7 @@ Opde/DebugOverlay
 		height 102
 
 	    
-		element TextArea(Opde/CurrFps)
+		element TextArea(Darkness/CurrFps)
 		{
 			metrics_mode pixels
 			left 5
@@ -26,7 +26,7 @@ Opde/DebugOverlay
 			colour_top 1 1 0.7
 			colour_bottom 1 1 0.7
 		}
-		element TextArea(Opde/AverageFps)
+		element TextArea(Darkness/AverageFps)
 		{
 			metrics_mode pixels
 			left 5
@@ -39,7 +39,7 @@ Opde/DebugOverlay
 			colour_top 0.5 0.7 0.5
 			colour_bottom 0.3 0.5 0.3
 		}
-		element TextArea(Opde/WorstFps)
+		element TextArea(Darkness/WorstFps)
 		{
 			metrics_mode pixels
 			left 5
@@ -52,7 +52,7 @@ Opde/DebugOverlay
 			colour_top 0.5 0.7 0.5
 			colour_bottom 0.3 0.5 0.3
 		}
-		element TextArea(Opde/BestFps)
+		element TextArea(Darkness/BestFps)
 		{
 			metrics_mode pixels
 			left 5
@@ -65,7 +65,7 @@ Opde/DebugOverlay
 			colour_top 0.5 0.7 0.5
 			colour_bottom 0.3 0.5 0.3
 		}
-		element TextArea(Opde/NumTris)
+		element TextArea(Darkness/NumTris)
 		{
 			metrics_mode pixels
 			left 5
@@ -78,7 +78,7 @@ Opde/DebugOverlay
 			colour_top 0.5 0.7 0.5
 			colour_bottom 0.3 0.5 0.3
 		}
-		element TextArea(Opde/NumBatches)
+		element TextArea(Darkness/NumBatches)
 		{
 			metrics_mode pixels
 			left 5
@@ -91,7 +91,7 @@ Opde/DebugOverlay
 			colour_top 0.5 0.7 0.5
 			colour_bottom 0.3 0.5 0.3
 		}
-		element TextArea(Opde/DebugText)
+		element TextArea(Darkness/DebugText)
 		{
 			metrics_mode pixels
 			left 230

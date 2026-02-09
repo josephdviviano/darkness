@@ -26,7 +26,7 @@
 #include "FonFormat.h"
 #include "File.h"
 
-namespace Opde {
+namespace Darkness {
 File &operator<<(File &st, const DarkFontHeader &h) {
     st << h.Format << h.Unknown << h.Palette;
     st.write(&h.Zeros1, sizeof(h.Zeros1));
@@ -123,4 +123,4 @@ File &operator>>(File &st, RGBTriple &h) {
     return st;
 }
 
-} // namespace Opde
+} // namespace Darkness

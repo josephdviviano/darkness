@@ -25,7 +25,7 @@
 #ifndef __SIMCOMMON_H
 #define __SIMCOMMON_H
 
-namespace Opde {
+namespace Darkness {
 
 /** Abstract Simulation listener - a class that does something related to
  * simulation extends this
@@ -66,6 +66,6 @@ protected:
     bool mSimRunning;
 };
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif /* __SIMCOMMON_H */

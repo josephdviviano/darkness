@@ -27,7 +27,7 @@
 #include "DrawCommon.h"
 #include <OgreString.h>
 
-namespace Opde {
+namespace Darkness {
 // Forward decls.
 class DrawService;
 class DrawBuffer;
@@ -136,6 +136,6 @@ protected:
 
 /// Map of all draw operations by it's ID
 typedef std::map<DrawOperation::ID, DrawOperation *> DrawOperationMap;
-} // namespace Opde
+} // namespace Darkness
 
 #endif

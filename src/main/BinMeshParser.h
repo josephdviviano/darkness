@@ -43,7 +43,7 @@
 #include <map>
 #include <algorithm>
 
-namespace Opde {
+namespace Darkness {
 
 // Output vertex with position, normal, and UV
 struct BinVert {
@@ -489,4 +489,4 @@ inline ParsedBinMesh parseBinModel(const uint8_t *data, size_t size) {
     return parser.parse();
 }
 
-} // namespace Opde
+} // namespace Darkness

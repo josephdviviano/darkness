@@ -27,7 +27,7 @@
 #include "PythonStruct.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 
 namespace Python {
 class DataFieldDescBinder : public PythonStruct<DataFieldDesc> {
@@ -52,7 +52,7 @@ const char *DataFieldsBinder::msName = "DataFieldDescIterator";
 // ------------------------------------------
 PyTypeObject DataFieldsBinder::msType = {
     PyVarObject_HEAD_INIT(&PyType_Type,
-                          0) "opde.DataFieldsIterator", // char *tp_name; */
+                          0) "darkness.DataFieldsIterator", // char *tp_name; */
     sizeof(DataFieldsBinder::Base), /* int tp_basicsize; */
     0, // int tp_itemsize;       /* not used much */
     DataFieldsBinder::dealloc, // destructor tp_dealloc; */
@@ -137,4 +137,4 @@ void DataFieldsBinder::init(PyObject *module) {
 
 } // namespace Python
 
-} // namespace Opde
+} // namespace Darkness

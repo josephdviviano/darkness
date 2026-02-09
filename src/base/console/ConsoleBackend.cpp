@@ -30,7 +30,7 @@
 #include <cassert>
 #include <sstream>
 
-namespace Opde {
+namespace Darkness {
 using namespace std;
 
 const char *logLevels[5] = {"FATAL", "ERROR", "INFO", "DEBUG", "VERBOSE"};
@@ -44,7 +44,7 @@ ConsoleBackend::ConsoleBackend(unsigned int text_history)
     mMessages.clear();
     mChanged = true;
 
-    // Register as Opde log listener
+    // Register as Darkness log listener
     Logger::getSingleton().registerLogListener(this);
 }
 
@@ -211,4 +211,4 @@ ConsoleBackend &ConsoleBackend::getSingleton(void) {
 }
 
 ConsoleBackend *ConsoleBackend::getSingletonPtr(void) { return ms_Singleton; }
-} // namespace Opde
+} // namespace Darkness

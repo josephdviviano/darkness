@@ -21,8 +21,8 @@
  *
  *****************************************************************************/
 
-#ifndef __OGREOPDETYPES_H
-#define __OGREOPDETYPES_H
+#ifndef __DARKNESS_WRTYPES_H
+#define __DARKNESS_WRTYPES_H
 
 #include "DarkCommon.h"
 #include "File.h"
@@ -35,7 +35,7 @@
 // the only one which collided is wr_cell_hdr, but to be sure...
 #pragma pack(push, 1)
 
-namespace Opde {
+namespace Darkness {
 
 struct WRHeader { // SIZE: 8
     uint32_t unk;
@@ -224,6 +224,6 @@ struct WRBSPNode { // 20b - BSP node
 #define _BSP_FLAGS(a) (a.ndn_fl >> 24)
 #pragma pack(pop)
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif

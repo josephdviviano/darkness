@@ -28,7 +28,7 @@
 #include "DataStorage.h"
 #include "bindings.h"
 
-namespace Opde {
+namespace Darkness {
 namespace Python {
 
 struct DataFieldsWithPosition {
@@ -69,6 +69,6 @@ protected:
     static PyMethodDef msMethods[];
 };
 } // namespace Python
-} // namespace Opde
+} // namespace Darkness
 
 #endif

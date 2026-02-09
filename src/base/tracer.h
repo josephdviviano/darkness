@@ -25,13 +25,13 @@
 
 #include "config.h"
 
-#include "OpdeSingleton.h"
+#include "DarknessSingleton.h"
 
 #include <chrono>
 #include <cstddef>
 #include <vector>
 
-namespace Opde {
+namespace Darkness {
 
 /** Performance tracer. Writes performance probes with function names. */
 class Tracer : public Singleton<Tracer> {
@@ -107,12 +107,12 @@ private:
 
 // Use this to place performance probes into code
 #ifdef FRAME_PROFILER
-#define TRACE_FRAME_BEGIN ::Opde::Tracer::getSingleton().traceStartFrame();
-#define TRACE_FUNCTION ::Opde::PerfTracer _perfTracerInstance(__PRETTY_FUNCTION__);
-#define TRACE_METHOD ::Opde::PerfTracer _perfTracerInstance(__PRETTY_FUNCTION__, this);
-#define TRACE_SCOPE(text) ::Opde::PerfTracer _perfTracerInstance##text(#text);
-#define TRACE_POINT(text) ::Opde::Tracer::getSingleton().tracePoint(#text);
-#define TRACE_SCOPE_OBJ(text, obj) ::Opde::PerfTracer _perfTracerInstance##text(#text, obj);
+#define TRACE_FRAME_BEGIN ::Darkness::Tracer::getSingleton().traceStartFrame();
+#define TRACE_FUNCTION ::Darkness::PerfTracer _perfTracerInstance(__PRETTY_FUNCTION__);
+#define TRACE_METHOD ::Darkness::PerfTracer _perfTracerInstance(__PRETTY_FUNCTION__, this);
+#define TRACE_SCOPE(text) ::Darkness::PerfTracer _perfTracerInstance##text(#text);
+#define TRACE_POINT(text) ::Darkness::Tracer::getSingleton().tracePoint(#text);
+#define TRACE_SCOPE_OBJ(text, obj) ::Darkness::PerfTracer _perfTracerInstance##text(#text, obj);
 #else
 #define TRACE_FRAME_BEGIN
 #define TRACE_FUNCTION
@@ -122,6 +122,6 @@ private:
 #define TRACE_SCOPE_OBJ(text, obj)
 #endif
 
-} // namespace Opde
+} // namespace Darkness
 
 #endif
