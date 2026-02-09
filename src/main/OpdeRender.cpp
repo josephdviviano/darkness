@@ -42,6 +42,7 @@
 #include "../shaders/basic_shader.h"
 #include "../shaders/textured_shader.h"
 #include "../shaders/lightmapped_shader.h"
+#include "../shaders/water_shader.h"
 #include "WRChunkParser.h"
 #include "TXListParser.h"
 #include "CRFTextureLoader.h"
@@ -240,16 +241,28 @@ static FlatMesh buildFlatMesh(const Opde::WRParsedData &wr) {
     return mesh;
 }
 
+// ── Texture dimensions for UV normalization ──
+
+struct TexDimensions {
+    uint32_t w, h;
+};
+
 // ── Build water surface mesh from portal polygons ──
 // Water portals live at indices [numSolid..numPolygons) with flags != 0.
 // Only emit from air cells (mediaType==1) to avoid double-rendering — the
 // same portal polygon exists in both the air and water cell.
 
-static FlatMesh buildWaterMesh(const Opde::WRParsedData &wr) {
-    FlatMesh mesh;
-    // Semi-transparent dark blue-green — Dark Engine default water color
+static WorldMesh buildWaterMesh(const Opde::WRParsedData &wr,
+                                const std::unordered_map<uint8_t, TexDimensions> &texDims) {
+    WorldMesh mesh;
+    // Semi-transparent dark blue-green — fallback for non-textured water portals
     uint32_t waterColor = packABGR(0.2f, 0.32f, 0.4f, 0.35f);
+    // Semi-transparent white — lets texture colors show through for textured water
+    uint32_t texWaterColor = packABGR(1.0f, 1.0f, 1.0f, 0.35f);
     int waterPolyCount = 0;
+
+    // Temporary per-texture triangle lists; key = texture index (0 = flat/untextured)
+    std::unordered_map<uint8_t, std::vector<uint32_t>> texTriangles;
 
     for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
         const auto &cell = wr.cells[ci];
@@ -264,34 +277,118 @@ static FlatMesh buildWaterMesh(const Opde::WRParsedData &wr) {
             // Water portal: flags != 0 (non-water portals have flags == 0)
             if (poly.flags == 0) continue;
 
-            uint32_t baseVertex = static_cast<uint32_t>(mesh.vertices.size());
-            for (int vi = 0; vi < poly.count; ++vi) {
-                uint8_t idx = indices[vi];
-                if (idx >= cell.vertices.size()) continue;
-                const auto &v = cell.vertices[idx];
-                mesh.vertices.push_back({v.x, v.y, v.z, waterColor});
+            // Determine if this water portal has texturing data
+            bool isTextured = (pi < cell.numTextured);
+            uint8_t txtIdx = 0;
+            float texW = 64.0f, texH = 64.0f;
+
+            if (isTextured) {
+                txtIdx = cell.texturing[pi].txt;
+                if (txtIdx == 0 || txtIdx == 249)
+                    isTextured = false;
             }
+
+            if (isTextured) {
+                auto it = texDims.find(txtIdx);
+                if (it != texDims.end()) {
+                    texW = static_cast<float>(it->second.w);
+                    texH = static_cast<float>(it->second.h);
+                }
+            }
+
+            uint32_t baseVertex = static_cast<uint32_t>(mesh.vertices.size());
+
+            if (isTextured) {
+                // UV computation — same algorithm as buildTexturedMesh
+                const auto &tex = cell.texturing[pi];
+                Opde::Vector3 origin(0, 0, 0);
+                if (tex.originVertex < indices.size()) {
+                    uint8_t oi = indices[tex.originVertex];
+                    if (oi < cell.vertices.size())
+                        origin = cell.vertices[oi];
+                }
+
+                float mag2_u = tex.axisU.squaredLength();
+                float mag2_v = tex.axisV.squaredLength();
+                float sh_u = tex.u / 4096.0f;
+                float sh_v = tex.v / 4096.0f;
+                float dotp = tex.axisU.dotProduct(tex.axisV);
+
+                for (int vi = 0; vi < poly.count; ++vi) {
+                    uint8_t idx = indices[vi];
+                    if (idx >= cell.vertices.size()) continue;
+                    const auto &coord = cell.vertices[idx];
+
+                    Opde::Vector3 tmp = coord - origin;
+                    float u, v;
+
+                    if (std::abs(dotp) < 1e-6f) {
+                        // Orthogonal axes — direct projection
+                        u = tex.axisU.dotProduct(tmp) / mag2_u + sh_u;
+                        v = tex.axisV.dotProduct(tmp) / mag2_v + sh_v;
+                    } else {
+                        // Non-orthogonal correction
+                        float corr = 1.0f / (mag2_u * mag2_v - dotp * dotp);
+                        float cu = corr * mag2_v;
+                        float cv = corr * mag2_u;
+                        float cross = corr * dotp;
+                        float pu = tex.axisU.dotProduct(tmp);
+                        float pv = tex.axisV.dotProduct(tmp);
+                        u = pu * cu - pv * cross + sh_u;
+                        v = pv * cv - pu * cross + sh_v;
+                    }
+
+                    // Normalize: projection is in 64-texel units, scale to 0..1 UV
+                    u /= (texW / 64.0f);
+                    v /= (texH / 64.0f);
+
+                    mesh.vertices.push_back({coord.x, coord.y, coord.z, texWaterColor, u, v});
+                }
+            } else {
+                // Non-textured water portal: flat color, no UVs
+                for (int vi = 0; vi < poly.count; ++vi) {
+                    uint8_t idx = indices[vi];
+                    if (idx >= cell.vertices.size()) continue;
+                    const auto &v = cell.vertices[idx];
+                    mesh.vertices.push_back({v.x, v.y, v.z, waterColor, 0.0f, 0.0f});
+                }
+            }
+
             // Fan triangulation: same winding as buildFlatMesh
+            uint8_t key = isTextured ? txtIdx : 0;
+            auto &triList = texTriangles[key];
             for (int t = 1; t < poly.count - 1; ++t) {
-                mesh.indices.push_back(baseVertex);
-                mesh.indices.push_back(baseVertex + t + 1);
-                mesh.indices.push_back(baseVertex + t);
+                triList.push_back(baseVertex);
+                triList.push_back(baseVertex + t + 1);
+                triList.push_back(baseVertex + t);
             }
             ++waterPolyCount;
         }
     }
 
+    // Build sorted index buffer with texture groups
+    std::vector<uint8_t> sortedKeys;
+    for (auto &kv : texTriangles)
+        sortedKeys.push_back(kv.first);
+    std::sort(sortedKeys.begin(), sortedKeys.end());
+
+    for (uint8_t key : sortedKeys) {
+        auto &triList = texTriangles[key];
+        TextureGroup grp;
+        grp.txtIndex = key;
+        grp.firstIndex = static_cast<uint32_t>(mesh.indices.size());
+        grp.numIndices = static_cast<uint32_t>(triList.size());
+        mesh.groups.push_back(grp);
+        mesh.indices.insert(mesh.indices.end(), triList.begin(), triList.end());
+    }
+
     mesh.cx = mesh.cy = mesh.cz = 0;
-    std::fprintf(stderr, "Water mesh: %d polygons, %zu vertices, %zu indices\n",
-                 waterPolyCount, mesh.vertices.size(), mesh.indices.size());
+    std::fprintf(stderr, "Water mesh: %d polygons, %zu vertices, %zu indices, %zu texture groups\n",
+                 waterPolyCount, mesh.vertices.size(), mesh.indices.size(), mesh.groups.size());
     return mesh;
 }
 
 // ── Build textured mesh with UV coordinates ──
-
-struct TexDimensions {
-    uint32_t w, h;
-};
 
 static WorldMesh buildTexturedMesh(const Opde::WRParsedData &wr,
                                    const std::unordered_map<uint8_t, TexDimensions> &texDims) {
@@ -1688,8 +1785,15 @@ int main(int argc, char *argv[]) {
         bgfx::createShader(bgfx::makeRef(fs_lightmapped_metal, sizeof(fs_lightmapped_metal))),
         true);
 
+    // Water program: textured fragment without alpha discard (for semi-transparent water surfaces)
+    bgfx::ProgramHandle waterProgram = bgfx::createProgram(
+        bgfx::createShader(bgfx::makeRef(vs_textured_metal, sizeof(vs_textured_metal))),
+        bgfx::createShader(bgfx::makeRef(fs_water_metal, sizeof(fs_water_metal))),
+        true);
+
     bgfx::UniformHandle s_texColor = bgfx::createUniform("s_texColor", bgfx::UniformType::Sampler);
     bgfx::UniformHandle s_texLightmap = bgfx::createUniform("s_texLightmap", bgfx::UniformType::Sampler);
+    bgfx::UniformHandle u_waterParams = bgfx::createUniform("u_waterParams", bgfx::UniformType::Vec4);
 
     // ── Build lightmap atlas (if textured mode) ──
 
@@ -1892,7 +1996,7 @@ int main(int argc, char *argv[]) {
     }
 
     // ── Build water surface mesh from portal polygons ──
-    FlatMesh waterMesh = buildWaterMesh(wrData);
+    WorldMesh waterMesh = buildWaterMesh(wrData, texDims);
     bgfx::VertexBufferHandle waterVBH = BGFX_INVALID_HANDLE;
     bgfx::IndexBufferHandle waterIBH = BGFX_INVALID_HANDLE;
     bool hasWater = !waterMesh.vertices.empty();
@@ -1900,8 +2004,8 @@ int main(int argc, char *argv[]) {
     if (hasWater) {
         waterVBH = bgfx::createVertexBuffer(
             bgfx::copy(waterMesh.vertices.data(),
-                        static_cast<uint32_t>(waterMesh.vertices.size() * sizeof(PosColorVertex))),
-            PosColorVertex::layout);
+                        static_cast<uint32_t>(waterMesh.vertices.size() * sizeof(PosColorUVVertex))),
+            PosColorUVVertex::layout);
         waterIBH = bgfx::createIndexBuffer(
             bgfx::copy(waterMesh.indices.data(),
                         static_cast<uint32_t>(waterMesh.indices.size() * sizeof(uint32_t))),
@@ -2166,6 +2270,7 @@ int main(int argc, char *argv[]) {
                          | BGFX_STATE_CULL_CW;
 
     auto lastTime = std::chrono::high_resolution_clock::now();
+    float waterElapsed = 0.0f;
 
     bool running = true;
     while (running) {
@@ -2173,6 +2278,7 @@ int main(int argc, char *argv[]) {
         float dt = std::chrono::duration<float>(now - lastTime).count();
         lastTime = now;
         dt = std::min(dt, 0.1f);
+        waterElapsed += dt;
 
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -2427,20 +2533,41 @@ int main(int argc, char *argv[]) {
 
         // ── Water surfaces: alpha-blended, no depth write, double-sided ──
         // Rendered last so all opaque geometry is already in the depth buffer.
+        // Per-texture-group rendering: textured water uses waterProgram (no discard),
+        // non-textured water falls back to flatProgram with blue-green vertex color.
         if (hasWater) {
             float identity[16];
             bx::mtxIdentity(identity);
-            bgfx::setTransform(identity);
-            bgfx::setVertexBuffer(0, waterVBH);
-            bgfx::setIndexBuffer(waterIBH);
             // Alpha blend, depth test (read) but no depth write, no face culling
             uint64_t waterState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                 | BGFX_STATE_DEPTH_TEST_LESS
                 | BGFX_STATE_BLEND_ALPHA;
             // No BGFX_STATE_WRITE_Z — water doesn't occlude geometry behind it
             // No BGFX_STATE_CULL_* — water is visible from both sides
-            bgfx::setState(waterState);
-            bgfx::submit(1, flatProgram);
+
+            for (const auto &grp : waterMesh.groups) {
+                bgfx::setTransform(identity);
+                bgfx::setVertexBuffer(0, waterVBH);
+                bgfx::setIndexBuffer(waterIBH, grp.firstIndex, grp.numIndices);
+                bgfx::setState(waterState);
+
+                if (grp.txtIndex != 0) {
+                    // Textured water: use water shader (texture * vertex color, no discard)
+                    // Set UV scroll params: x=elapsed time, y=scroll speed, z/w=reserved
+                    float waterParams[4] = { waterElapsed, 0.15f, 0.0f, 0.0f };
+                    bgfx::setUniform(u_waterParams, waterParams);
+                    auto it = textureHandles.find(grp.txtIndex);
+                    if (it != textureHandles.end()) {
+                        bgfx::setTexture(0, s_texColor, it->second);
+                        bgfx::submit(1, waterProgram);
+                    } else {
+                        bgfx::submit(1, flatProgram);
+                    }
+                } else {
+                    // Non-textured water: flat blue-green from vertex color
+                    bgfx::submit(1, flatProgram);
+                }
+            }
         }
 
         bgfx::frame();
@@ -2478,12 +2605,14 @@ int main(int argc, char *argv[]) {
         bgfx::destroy(kv.second);
     bgfx::destroy(s_texLightmap);
     bgfx::destroy(s_texColor);
+    bgfx::destroy(u_waterParams);
 
     bgfx::destroy(ibh);
     bgfx::destroy(vbh);
     bgfx::destroy(flatProgram);
     bgfx::destroy(texturedProgram);
     bgfx::destroy(lightmappedProgram);
+    bgfx::destroy(waterProgram);
 
     bgfx::shutdown();
     SDL_DestroyWindow(window);
