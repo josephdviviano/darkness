@@ -1,8 +1,16 @@
-$input v_color0
+$input v_color0, v_fogDist
 
 #include <bgfx_shader.sh>
 
+// u_fogColor.rgb = fog color, u_fogParams.x = enabled (0/1), u_fogParams.y = fog distance
+uniform vec4 u_fogColor;
+uniform vec4 u_fogParams;
+
 void main()
 {
-    gl_FragColor = v_color0;
+    vec4 color = v_color0;
+    // Linear distance fog: blend toward fog color from 0 at camera to full at fogDistance
+    float fogFactor = clamp(v_fogDist / u_fogParams.y, 0.0, 1.0) * u_fogParams.x;
+    color.rgb = mix(color.rgb, u_fogColor.rgb, fogFactor);
+    gl_FragColor = color;
 }
