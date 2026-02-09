@@ -1,9 +1,9 @@
 $input v_color0, v_texcoord0, v_fogDist
 
-// Water fragment shader: texture * vertex color with UV scrolling.
-// u_waterParams.x = elapsed time (seconds)
-// u_waterParams.y = scroll speed multiplier
-// UV offset creates flowing water appearance.
+// Water fragment shader: texture * vertex color with UV distortion.
+// UV rotation and scrolling are handled in the vertex shader (world-space).
+// u_waterParams: x=time, y=scroll speed, z=wave amplitude, w=UV distortion strength
+// No alpha discard — vertex alpha (35% for water) is preserved for blending.
 
 #include <bgfx_shader.sh>
 
@@ -17,9 +17,18 @@ uniform vec4 u_fogParams;
 
 void main()
 {
-    // Scroll UVs diagonally over time for a flowing appearance
-    float t = u_waterParams.x * u_waterParams.y;
-    vec2 uv = v_texcoord0 + vec2(t * 0.3, t * 0.7);
+    float t = u_waterParams.x;
+    float distStr = u_waterParams.w;
+
+    // Start with UVs from vertex shader (already rotated + scrolled for flow water)
+    vec2 uv = v_texcoord0;
+
+    // UV distortion — two sine ripples for wobble/shimmer effect
+    float ripple1 = sin(uv.x * 25.0 + uv.y * 15.0 + t * 2.0);
+    float ripple2 = sin(uv.x * 18.0 - uv.y * 22.0 + t * 2.7);
+    uv.x += ripple1 * distStr;
+    uv.y += ripple2 * distStr;
+
     vec4 texColor = texture2D(s_texColor, uv);
     vec4 finalColor = texColor * v_color0;
     // Linear distance fog (applied before alpha blending with background)

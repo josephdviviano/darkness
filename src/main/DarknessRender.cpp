@@ -119,10 +119,11 @@ bgfx::VertexLayout PosUV2Vertex::layout;
 // are submitted. When culling is off, all groups are submitted (same as before).
 
 struct CellTextureGroup {
-    uint32_t cellID;
-    uint8_t txtIndex;
-    uint32_t firstIndex;
-    uint32_t numIndices;
+    uint32_t cellID    = 0;
+    uint8_t  txtIndex  = 0;
+    uint8_t  flowGroup = 0;  // flow group index (water only, 0 = no flow)
+    uint32_t firstIndex = 0;
+    uint32_t numIndices = 0;
 };
 
 // ── World mesh (textured) ──
@@ -634,13 +635,66 @@ struct TexDimensions {
     uint32_t w, h;
 };
 
+// ── Water flow data ──
+// Forward declarations needed by buildWaterMesh and parseFlowData.
+
+// FLOW_TEX chunk: 256 entries mapping flow group index to water textures.
+// in_texture/out_texture are runtime-allocated palette indices — NOT usable as
+// TXLIST indices. Instead, the name field holds the texture base name which maps
+// to fam.crf paths: "water/<name>in.PCX" (air side) / "water/<name>out.PCX".
+static constexpr int MAX_FLOW_GROUPS = 256;
+
+struct FlowTexEntry {
+    int16_t inTexture;     // runtime palette index (NOT a TXLIST index)
+    int16_t outTexture;    // runtime palette index (NOT a TXLIST index)
+    char    name[28];      // texture base name (e.g. "gr" → water/grin.PCX)
+};
+static_assert(sizeof(FlowTexEntry) == 32, "FLOW_TEX entry must be 32 bytes");
+
+// CELL_MOTION chunk contains two sequential arrays:
+// 1. PortalCellMotion[256] — current state (center, angle, flags, axis)
+// 2. sMedMoCellMotion[256] — velocities (center_change, angle_change)
+// The state stores the current animation position; the velocities are per-second deltas.
+#pragma pack(push, 1)
+struct PortalCellMotion {
+    float    centerX, centerY, centerZ; // rotation pivot / UV origin in world space
+    uint16_t angle;                     // current rotation angle (binary radians, 65536 = 360°)
+    int32_t  inMotion;                  // 0=disabled, 1=enabled
+    uint8_t  majorAxis;                 // water plane: 0=X, 1=Y, 2=Z (default Z for horizontal)
+    uint8_t  pad1;
+    uint8_t  pad2;
+};
+static_assert(sizeof(PortalCellMotion) == 21, "PortalCellMotion must be 21 bytes");
+
+struct MedMoCellMotion {
+    float    centerChangeX, centerChangeY, centerChangeZ; // UV scroll velocity (world units/sec)
+    uint16_t angleChange;  // rotation velocity (binary radians/sec, cast to int16_t for sign)
+};
+static_assert(sizeof(MedMoCellMotion) == 14, "MedMoCellMotion must be 14 bytes");
+#pragma pack(pop)
+
+// Parsed flow data for the mission — texture mapping and animation velocities.
+struct FlowData {
+    FlowTexEntry      textures[MAX_FLOW_GROUPS];
+    PortalCellMotion  state[MAX_FLOW_GROUPS];     // current animation state
+    MedMoCellMotion   velocity[MAX_FLOW_GROUPS];  // animation velocities (per second)
+    bool hasFlowTex    = false;  // true if FLOW_TEX chunk was found
+    bool hasCellMotion = false;  // true if CELL_MOTION chunk was found
+};
+
 // ── Build water surface mesh from portal polygons ──
 // Water portals live at indices [numSolid..numPolygons) with flags != 0.
 // Only emit from air cells (mediaType==1) to avoid double-rendering — the
 // same portal polygon exists in both the air and water cell.
+// Texture source priority:
+//   1. FLOW_TEX chunk (via cell.flowGroup) — canonical water texture source
+//   2. Polygon texturing data (fallback if no FLOW_TEX or flowGroup==0)
+//   3. Flat blue-green vertex color (if no texture available)
 
 static WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
-                                const std::unordered_map<uint8_t, TexDimensions> &texDims) {
+                                const std::unordered_map<uint8_t, TexDimensions> &texDims,
+                                const FlowData &flowData,
+                                const std::unordered_map<uint8_t, TexDimensions> &flowTexDims) {
     WorldMesh mesh;
     // Semi-transparent dark blue-green — fallback for non-textured water portals
     uint32_t waterColor = packABGR(0.2f, 0.32f, 0.4f, 0.35f);
@@ -648,8 +702,14 @@ static WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
     uint32_t texWaterColor = packABGR(1.0f, 1.0f, 1.0f, 0.35f);
     int waterPolyCount = 0;
 
-    // Temporary per-texture triangle lists; key = texture index (0 = flat/untextured)
-    std::unordered_map<uint8_t, std::vector<uint32_t>> texTriangles;
+    // Composite key for grouping triangles by texture source.
+    // Flow-textured water uses 0x8000 | flowGroup (high bit set).
+    // TXLIST-textured water uses (txtIndex << 8) | flowGroup.
+    // This ensures each texture source gets its own draw group.
+    std::unordered_map<uint16_t, std::vector<uint32_t>> texTriangles;
+    // Track flow group and texture index per composite key
+    std::unordered_map<uint16_t, uint8_t> keyFlowGroup;
+    std::unordered_map<uint16_t, uint8_t> keyTxtIndex;
 
     for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
         const auto &cell = wr.cells[ci];
@@ -664,18 +724,40 @@ static WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
             // Water portal: flags != 0 (non-water portals have flags == 0)
             if (poly.flags == 0) continue;
 
-            // Determine if this water portal has texturing data
-            bool isTextured = (pi < cell.numTextured);
-            uint8_t txtIdx = 0;
-            float texW = 64.0f, texH = 64.0f;
-
-            if (isTextured) {
-                txtIdx = cell.texturing[pi].txt;
-                if (txtIdx == 0 || txtIdx == 249)
-                    isTextured = false;
+            // Resolve flow group: water portals connect an air cell to a water cell.
+            // The flowGroup is on the water cell (target), not the air cell (source).
+            uint8_t cellFlowGroup = 0;
+            bool hasFlowTex = false;
+            if (poly.tgtCell < wr.numCells) {
+                cellFlowGroup = wr.cells[poly.tgtCell].flowGroup;
+                if (cellFlowGroup > 0) {
+                    hasFlowTex = flowTexDims.count(cellFlowGroup) > 0;
+                }
             }
 
-            if (isTextured) {
+            // Determine texture: prefer flow texture (loaded by name from fam.crf),
+            // then polygon texturing from TXLIST, then flat color.
+            bool hasPolyTex = (pi < cell.numTextured);
+            uint8_t polyTxtIdx = 0;
+            if (hasPolyTex) {
+                polyTxtIdx = cell.texturing[pi].txt;
+                if (polyTxtIdx == 0 || polyTxtIdx == 249)
+                    hasPolyTex = false;
+            }
+
+            // Flow texture takes priority — polygon texture is fallback
+            uint8_t txtIdx = hasFlowTex ? 0 : polyTxtIdx;
+            bool isTextured = hasFlowTex || (txtIdx > 0);
+
+            float texW = 64.0f, texH = 64.0f;
+            if (hasFlowTex) {
+                // Dimensions from flow texture loaded by name from fam.crf
+                auto fit = flowTexDims.find(cellFlowGroup);
+                if (fit != flowTexDims.end()) {
+                    texW = static_cast<float>(fit->second.w);
+                    texH = static_cast<float>(fit->second.h);
+                }
+            } else if (isTextured) {
                 auto it = texDims.find(txtIdx);
                 if (it != texDims.end()) {
                     texW = static_cast<float>(it->second.w);
@@ -685,8 +767,8 @@ static WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
 
             uint32_t baseVertex = static_cast<uint32_t>(mesh.vertices.size());
 
-            if (isTextured) {
-                // UV computation — same algorithm as buildTexturedMesh
+            if (isTextured && hasPolyTex) {
+                // Textured water with polygon UV data — use projected UVs
                 const auto &tex = cell.texturing[pi];
                 Darkness::Vector3 origin(0, 0, 0);
                 if (tex.originVertex < indices.size()) {
@@ -710,11 +792,9 @@ static WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
                     float u, v;
 
                     if (std::abs(dotp) < 1e-6f) {
-                        // Orthogonal axes — direct projection
                         u = tex.axisU.dotProduct(tmp) / mag2_u + sh_u;
                         v = tex.axisV.dotProduct(tmp) / mag2_v + sh_v;
                     } else {
-                        // Non-orthogonal correction
                         float corr = 1.0f / (mag2_u * mag2_v - dotp * dotp);
                         float cu = corr * mag2_v;
                         float cv = corr * mag2_u;
@@ -731,6 +811,23 @@ static WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
 
                     mesh.vertices.push_back({coord.x, coord.y, coord.z, texWaterColor, u, v});
                 }
+            } else if (isTextured) {
+                // Textured water from FLOW_TEX but no polygon UV data —
+                // compute planar UVs by projecting onto the water plane.
+                // Dark Engine uses 4 world units per texture repeat (TEXTURE_UNIT_LENGTH).
+                constexpr float TEX_SCALE = 4.0f;
+                for (int vi = 0; vi < poly.count; ++vi) {
+                    uint8_t idx = indices[vi];
+                    if (idx >= cell.vertices.size()) continue;
+                    const auto &coord = cell.vertices[idx];
+
+                    // Project position onto the two axes perpendicular to the
+                    // water plane. Most water is Z-up (horizontal), so use X,Y.
+                    float u = coord.x / (texW * TEX_SCALE / 64.0f);
+                    float v = coord.y / (texH * TEX_SCALE / 64.0f);
+
+                    mesh.vertices.push_back({coord.x, coord.y, coord.z, texWaterColor, u, v});
+                }
             } else {
                 // Non-textured water portal: flat color, no UVs
                 for (int vi = 0; vi < poly.count; ++vi) {
@@ -742,7 +839,16 @@ static WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
             }
 
             // Fan triangulation: same winding as buildFlatMesh
-            uint8_t key = isTextured ? txtIdx : 0;
+            // Composite key: flow-textured uses 0x8000|flowGroup, TXLIST-textured
+            // uses (txtIdx<<8)|flowGroup to avoid key collisions.
+            uint16_t key;
+            if (hasFlowTex) {
+                key = 0x8000 | static_cast<uint16_t>(cellFlowGroup);
+            } else {
+                key = (static_cast<uint16_t>(txtIdx) << 8) | cellFlowGroup;
+            }
+            keyFlowGroup[key] = cellFlowGroup;
+            keyTxtIndex[key] = txtIdx;
             auto &triList = texTriangles[key];
             for (int t = 1; t < poly.count - 1; ++t) {
                 triList.push_back(baseVertex);
@@ -754,16 +860,17 @@ static WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
     }
 
     // Build sorted index buffer with texture groups
-    std::vector<uint8_t> sortedKeys;
+    std::vector<uint16_t> sortedKeys;
     for (auto &kv : texTriangles)
         sortedKeys.push_back(kv.first);
     std::sort(sortedKeys.begin(), sortedKeys.end());
 
-    for (uint8_t key : sortedKeys) {
+    for (uint16_t key : sortedKeys) {
         auto &triList = texTriangles[key];
         CellTextureGroup grp;
         grp.cellID = 0; // water mesh is not portal-culled
-        grp.txtIndex = key;
+        grp.txtIndex = keyTxtIndex[key];
+        grp.flowGroup = keyFlowGroup[key];
         grp.firstIndex = static_cast<uint32_t>(mesh.indices.size());
         grp.numIndices = static_cast<uint32_t>(triList.size());
         mesh.groups.push_back(grp);
@@ -771,8 +878,17 @@ static WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
     }
 
     mesh.cx = mesh.cy = mesh.cz = 0;
-    std::fprintf(stderr, "Water mesh: %d polygons, %zu vertices, %zu indices, %zu texture groups\n",
-                 waterPolyCount, mesh.vertices.size(), mesh.indices.size(), mesh.groups.size());
+    // Count flow-textured vs TXLIST-textured vs flat water groups
+    int flowTexGroups = 0, txlistTexGroups = 0, flatGroups = 0;
+    for (const auto &g : mesh.groups) {
+        if (g.flowGroup > 0) ++flowTexGroups;
+        else if (g.txtIndex > 0) ++txlistTexGroups;
+        else ++flatGroups;
+    }
+    std::fprintf(stderr, "Water mesh: %d polygons, %zu vertices, %zu indices, %zu groups"
+                 " (%d flow-textured, %d txlist, %d flat)\n",
+                 waterPolyCount, mesh.vertices.size(), mesh.indices.size(), mesh.groups.size(),
+                 flowTexGroups, txlistTexGroups, flatGroups);
     return mesh;
 }
 
@@ -1540,6 +1656,87 @@ static FogParams parseFogChunk(const char *misPath) {
     return fog;
 }
 
+// Parse FLOW_TEX and CELL_MOTION chunks from a .mis file.
+// FLOW_TEX: 256 × 32-byte entries mapping flow group to water texture names.
+// CELL_MOTION: two sequential arrays — PortalCellMotion[256] (state) then
+// MedMoCellMotion[256] (velocities). The velocities give the per-second scroll
+// and rotation rates for each flow group, as set by the level designer.
+static FlowData parseFlowData(const char *misPath) {
+    FlowData data = {};
+
+    try {
+        Darkness::FilePtr fp(new Darkness::StdFile(misPath, Darkness::File::FILE_R));
+        Darkness::FileGroupPtr db(new Darkness::DarkFileGroup(fp));
+
+        // Parse FLOW_TEX: 256 × 32 bytes = 8192 bytes
+        if (db->hasFile("FLOW_TEX")) {
+            Darkness::FilePtr chunk = db->getFile("FLOW_TEX");
+            for (int i = 0; i < MAX_FLOW_GROUPS; ++i) {
+                chunk->readElem(&data.textures[i], sizeof(FlowTexEntry));
+            }
+            data.hasFlowTex = true;
+
+            // Log flow groups with non-empty texture names
+            int namedCount = 0;
+            for (int i = 1; i < MAX_FLOW_GROUPS; ++i) {
+                if (data.textures[i].name[0] != '\0') {
+                    char safeName[29] = {};
+                    std::memcpy(safeName, data.textures[i].name, 28);
+                    std::fprintf(stderr, "  flow group %d: name='%s' (palette idx in=%d out=%d)\n",
+                                 i, safeName, data.textures[i].inTexture, data.textures[i].outTexture);
+                    ++namedCount;
+                }
+            }
+            std::fprintf(stderr, "FLOW_TEX: %d named flow groups\n", namedCount);
+        } else {
+            std::fprintf(stderr, "No FLOW_TEX chunk — water textures from polygon data only\n");
+        }
+
+        // Parse CELL_MOTION: PortalCellMotion[256] (21 bytes each) then
+        // MedMoCellMotion[256] (14 bytes each) = 256*(21+14) = 8960 bytes
+        if (db->hasFile("CELL_MOTION")) {
+            Darkness::FilePtr chunk = db->getFile("CELL_MOTION");
+            // First array: current state
+            for (int i = 0; i < MAX_FLOW_GROUPS; ++i) {
+                chunk->readElem(&data.state[i], sizeof(PortalCellMotion));
+            }
+            // Second array: velocities (scroll + rotation speeds)
+            for (int i = 0; i < MAX_FLOW_GROUPS; ++i) {
+                chunk->readElem(&data.velocity[i], sizeof(MedMoCellMotion));
+            }
+            data.hasCellMotion = true;
+
+            // Log flow groups with non-zero state (center or angle set by the level)
+            int motionCount = 0;
+            for (int i = 1; i < MAX_FLOW_GROUPS; ++i) {
+                const auto &st = data.state[i];
+                const auto &vel = data.velocity[i];
+                bool hasState = (st.centerX != 0 || st.centerY != 0 || st.centerZ != 0 || st.angle != 0);
+                bool hasVelocity = (vel.centerChangeX != 0 || vel.centerChangeY != 0 ||
+                                    vel.centerChangeZ != 0 || vel.angleChange != 0);
+                if (hasState || hasVelocity) {
+                    float angDeg = st.angle * 360.0f / 65536.0f;
+                    float angVelDeg = static_cast<float>(static_cast<int16_t>(vel.angleChange))
+                                      * 360.0f / 65536.0f;
+                    std::fprintf(stderr, "  motion %d: center=(%.1f,%.1f,%.1f) angle=%.1f° "
+                                 "vel=(%.2f,%.2f,%.2f)/s rot=%.1f°/s axis=%d\n",
+                                 i, st.centerX, st.centerY, st.centerZ, angDeg,
+                                 vel.centerChangeX, vel.centerChangeY, vel.centerChangeZ,
+                                 angVelDeg, st.majorAxis);
+                    ++motionCount;
+                }
+            }
+            std::fprintf(stderr, "CELL_MOTION: %d groups with non-zero state/velocity\n", motionCount);
+        } else {
+            std::fprintf(stderr, "No CELL_MOTION chunk — using default water animation\n");
+        }
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "Failed to read flow data: %s\n", e.what());
+    }
+
+    return data;
+}
+
 // ── Sky dome ──
 
 // Sky rendering parameters — either from SKYOBJVAR chunk or defaults
@@ -2104,6 +2301,10 @@ int main(int argc, char *argv[]) {
     int  filterMode        = cfg.filterMode;
     bool linearMips        = cfg.linearMips;
     bool sharpMips         = cfg.sharpMips;
+    float waveAmplitude    = cfg.waveAmplitude;
+    float uvDistortion     = cfg.uvDistortion;
+    float waterRotation    = cfg.waterRotation;
+    float waterScrollSpeed = cfg.waterScrollSpeed;
 
     bool texturedMode = !resPath.empty();
 
@@ -2217,6 +2418,9 @@ int main(int argc, char *argv[]) {
     // Parse global fog parameters from FOG chunk (if present)
     FogParams fogParams = parseFogChunk(misPath);
 
+    // Parse water flow data — FLOW_TEX (texture mapping) and CELL_MOTION (animation state)
+    FlowData flowData = parseFlowData(misPath);
+
     // Parse TXLIST if in textured mode
     Darkness::TXList txList;
     if (texturedMode) {
@@ -2231,9 +2435,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Collect unique texture indices used by world geometry
+    // Collect unique texture indices used by world geometry and water flow groups
     std::unordered_set<uint8_t> usedTextures;
     if (texturedMode) {
+        // World geometry textures from polygon texturing data
         for (const auto &cell : wrData.cells) {
             for (int pi = 0; pi < cell.numTextured; ++pi) {
                 uint8_t txt = cell.texturing[pi].txt;
@@ -2241,10 +2446,12 @@ int main(int argc, char *argv[]) {
                     usedTextures.insert(txt);
             }
         }
+        // Note: FLOW_TEX texture indices are runtime palette positions, NOT TXLIST
+        // indices. Water textures are loaded separately by name from fam.crf below.
         std::fprintf(stderr, "Unique texture indices used: %zu\n", usedTextures.size());
     }
 
-    // Load textures from CRF
+    // Load world textures from fam.crf (indexed by TXLIST)
     std::unordered_map<uint8_t, Darkness::DecodedImage> loadedTextures;
     std::unordered_map<uint8_t, TexDimensions> texDims;
 
@@ -2265,6 +2472,68 @@ int main(int argc, char *argv[]) {
             }
             std::fprintf(stderr, "Loaded %d/%zu textures from CRF\n",
                          loaded, usedTextures.size());
+        }
+    }
+
+    // Load water flow textures from fam.crf by name.
+    // FLOW_TEX name field (e.g. "gr") maps to "water/<name>in.PCX" for the
+    // air-side texture and "water/<name>out.PCX" for the underwater side.
+    // Keyed by flow group index (1-255).
+    std::unordered_map<uint8_t, Darkness::DecodedImage> flowLoadedTextures;
+    std::unordered_map<uint8_t, TexDimensions> flowTexDims;
+
+    if (texturedMode && flowData.hasFlowTex) {
+        Darkness::CRFTextureLoader loader(resPath);
+        if (loader.isOpen()) {
+            // Collect unique flow groups used by cells
+            std::unordered_set<uint8_t> usedFlowGroups;
+            for (const auto &cell : wrData.cells) {
+                if (cell.flowGroup > 0)
+                    usedFlowGroups.insert(cell.flowGroup);
+            }
+
+            int loaded = 0;
+            for (uint8_t fg : usedFlowGroups) {
+                const auto &fe = flowData.textures[fg];
+                if (fe.name[0] == '\0') continue;
+
+                // Extract base name, trimming trailing nulls/spaces
+                std::string baseName(fe.name, strnlen(fe.name, 28));
+                while (!baseName.empty() && (baseName.back() == ' ' || baseName.back() == '\0'))
+                    baseName.pop_back();
+                if (baseName.empty()) continue;
+
+                // Air-side texture: "water/<name>in" (e.g. "gr" → "water/grin")
+                std::string inName = baseName + "in";
+                auto img = loader.loadTexture("water", inName);
+
+                // Check if we got a real texture (not the 8x8 fallback)
+                if (img.width > 8 || img.height > 8) {
+                    std::fprintf(stderr, "Flow group %d: loaded water/%s.PCX (%ux%u)\n",
+                                 fg, inName.c_str(), img.width, img.height);
+                    flowTexDims[fg] = { img.width, img.height };
+                    flowLoadedTextures[fg] = std::move(img);
+                    ++loaded;
+                } else {
+                    std::fprintf(stderr, "Flow group %d: water/%s.PCX not found, trying waterhw/\n",
+                                 fg, inName.c_str());
+                    // Some missions may use WATERHW family instead
+                    auto img2 = loader.loadTexture("waterhw", inName);
+                    if (img2.width > 8 || img2.height > 8) {
+                        std::fprintf(stderr, "Flow group %d: loaded waterhw/%s.PCX (%ux%u)\n",
+                                     fg, inName.c_str(), img2.width, img2.height);
+                        flowTexDims[fg] = { img2.width, img2.height };
+                        flowLoadedTextures[fg] = std::move(img2);
+                        ++loaded;
+                    } else {
+                        std::fprintf(stderr, "Flow group %d: no water texture found for '%s'\n",
+                                     fg, baseName.c_str());
+                    }
+                }
+            }
+            if (loaded > 0) {
+                std::fprintf(stderr, "Loaded %d flow group water textures from CRF\n", loaded);
+            }
         }
     }
 
@@ -2523,15 +2792,16 @@ int main(int argc, char *argv[]) {
         bgfx::createShader(bgfx::makeRef(fs_lightmapped_metal, sizeof(fs_lightmapped_metal))),
         true);
 
-    // Water program: textured fragment without alpha discard (for semi-transparent water surfaces)
+    // Water program: vertex displacement + textured fragment with UV distortion
     bgfx::ProgramHandle waterProgram = bgfx::createProgram(
-        bgfx::createShader(bgfx::makeRef(vs_textured_metal, sizeof(vs_textured_metal))),
+        bgfx::createShader(bgfx::makeRef(vs_water_metal, sizeof(vs_water_metal))),
         bgfx::createShader(bgfx::makeRef(fs_water_metal, sizeof(fs_water_metal))),
         true);
 
     bgfx::UniformHandle s_texColor = bgfx::createUniform("s_texColor", bgfx::UniformType::Sampler);
     bgfx::UniformHandle s_texLightmap = bgfx::createUniform("s_texLightmap", bgfx::UniformType::Sampler);
     bgfx::UniformHandle u_waterParams = bgfx::createUniform("u_waterParams", bgfx::UniformType::Vec4);
+    bgfx::UniformHandle u_waterFlow = bgfx::createUniform("u_waterFlow", bgfx::UniformType::Vec4);
     bgfx::UniformHandle u_fogColor = bgfx::createUniform("u_fogColor", bgfx::UniformType::Vec4);
     bgfx::UniformHandle u_fogParams = bgfx::createUniform("u_fogParams", bgfx::UniformType::Vec4);
 
@@ -2618,6 +2888,8 @@ int main(int argc, char *argv[]) {
 
     // Create bgfx texture handles
     std::unordered_map<uint8_t, bgfx::TextureHandle> textureHandles;
+    // Flow water textures keyed by flow group index (loaded from fam.crf by name)
+    std::unordered_map<uint8_t, bgfx::TextureHandle> flowTextureHandles;
 
     if (lightmappedMode) {
         lmMesh = buildLightmappedMesh(wrData, texDims, lmAtlasSet);
@@ -2658,6 +2930,21 @@ int main(int argc, char *argv[]) {
                 MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
         std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", textureHandles.size());
+
+        // Create GPU textures for flow group water textures (loaded by name)
+        // Water textures are fully opaque (alpha blending via vertex color),
+        // so use ALPHA_BLEND (no coverage preservation needed).
+        for (auto &kv : flowLoadedTextures) {
+            uint8_t fg = kv.first;
+            const auto &img = kv.second;
+            flowTextureHandles[fg] = createMipmappedTexture(
+                img.rgba.data(), img.width, img.height,
+                BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
+                MipAlphaMode::ALPHA_BLEND, linearMips, sharpMips);
+        }
+        if (!flowTextureHandles.empty()) {
+            std::fprintf(stderr, "Created %zu flow water GPU textures\n", flowTextureHandles.size());
+        }
     } else if (texturedMode) {
         worldMesh = buildTexturedMesh(wrData, texDims);
         camX = worldMesh.cx; camY = worldMesh.cy; camZ = worldMesh.cz;
@@ -2726,7 +3013,7 @@ int main(int argc, char *argv[]) {
     }
 
     // ── Build water surface mesh from portal polygons ──
-    WorldMesh waterMesh = buildWaterMesh(wrData, texDims);
+    WorldMesh waterMesh = buildWaterMesh(wrData, texDims, flowData, flowTexDims);
     bgfx::VertexBufferHandle waterVBH = BGFX_INVALID_HANDLE;
     bgfx::IndexBufferHandle waterIBH = BGFX_INVALID_HANDLE;
     bool hasWater = !waterMesh.vertices.empty();
@@ -3438,14 +3725,37 @@ int main(int argc, char *argv[]) {
                 bgfx::setIndexBuffer(waterIBH, grp.firstIndex, grp.numIndices);
                 bgfx::setState(waterState);
 
-                if (grp.txtIndex != 0) {
-                    // Textured water: use water shader (texture * vertex color, no discard)
-                    // Set UV scroll params: x=elapsed time, y=scroll speed, z/w=reserved
-                    float waterParams[4] = { waterElapsed, 0.15f, 0.0f, 0.0f };
+                if (grp.txtIndex != 0 || grp.flowGroup > 0) {
+                    // Textured water: water shader with vertex displacement + UV distortion
+                    // u_waterParams: x=elapsed time, y=scroll speed, z=wave amplitude, w=UV distortion
+                    float waterParams[4] = { waterElapsed, waterScrollSpeed, waveAmplitude, uvDistortion };
                     bgfx::setUniform(u_waterParams, waterParams);
-                    auto it = textureHandles.find(grp.txtIndex);
-                    if (it != textureHandles.end()) {
-                        bgfx::setTexture(0, s_texColor, it->second, texSampler);
+
+                    // u_waterFlow: x=rotation speed, y=use_world_uv flag, z=tex_unit_len
+                    // Flow-textured water: vertex shader computes UVs from world position
+                    // with rotation (matching Dark Engine's flow animation system).
+                    // TXLIST-textured water: uses pre-computed UVs from mesh.
+                    bool isFlowTextured = (grp.flowGroup > 0);
+                    float useWorldUV = isFlowTextured ? 1.0f : 0.0f;
+                    constexpr float TEX_UNIT_LEN = 4.0f; // 4 world units per texture repeat
+                    float waterFlow[4] = { waterRotation, useWorldUV, TEX_UNIT_LEN, 0.0f };
+                    bgfx::setUniform(u_waterFlow, waterFlow);
+
+                    // Resolve texture: flow texture by group first, then TXLIST by index
+                    bgfx::TextureHandle tex = BGFX_INVALID_HANDLE;
+                    if (grp.flowGroup > 0) {
+                        auto fit = flowTextureHandles.find(grp.flowGroup);
+                        if (fit != flowTextureHandles.end())
+                            tex = fit->second;
+                    }
+                    if (!bgfx::isValid(tex) && grp.txtIndex != 0) {
+                        auto it = textureHandles.find(grp.txtIndex);
+                        if (it != textureHandles.end())
+                            tex = it->second;
+                    }
+
+                    if (bgfx::isValid(tex)) {
+                        bgfx::setTexture(0, s_texColor, tex, texSampler);
                         bgfx::submit(1, waterProgram);
                     } else {
                         bgfx::submit(1, flatProgram);
@@ -3460,9 +3770,11 @@ int main(int argc, char *argv[]) {
         bgfx::frame();
     }
 
-    // Cleanup — water surface buffers
+    // Cleanup — water surface buffers and flow textures
     if (bgfx::isValid(waterVBH)) bgfx::destroy(waterVBH);
     if (bgfx::isValid(waterIBH)) bgfx::destroy(waterIBH);
+    for (auto &kv : flowTextureHandles)
+        bgfx::destroy(kv.second);
 
     // Cleanup — textured skybox buffers
     if (bgfx::isValid(skyboxVBH)) bgfx::destroy(skyboxVBH);
@@ -3493,6 +3805,7 @@ int main(int argc, char *argv[]) {
     bgfx::destroy(s_texLightmap);
     bgfx::destroy(s_texColor);
     bgfx::destroy(u_waterParams);
+    bgfx::destroy(u_waterFlow);
     bgfx::destroy(u_fogColor);
     bgfx::destroy(u_fogParams);
 
