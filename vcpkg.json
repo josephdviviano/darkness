@@ -13,7 +13,9 @@
     "bgfx",
     "sdl2",
     "zziplib",
-    "ode"
+    "ode",
+    "yaml-cpp",
+    "catch2"
   ],
   "overrides": [],
   "builtin-baseline": "afcc8a3cdfb9bec4e62dc32b23f976e2c56b046f"
