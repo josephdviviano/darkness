@@ -1179,6 +1179,7 @@ static void printHelp() {
         "                 2/4/8 = progressively smoother shadows via bicubic\n"
         "                 interpolation. Higher values use more atlas memory.\n"
         "  --no-objects   Disable object mesh rendering (world geometry only).\n"
+        "  --force-flicker Force all animated lights to flicker mode (debug).\n"
         "  --help         Show this help message.\n"
         "\n"
         "Controls:\n"
@@ -1226,6 +1227,7 @@ int main(int argc, char *argv[]) {
     std::string resPath;
     int lmScale = 1;
     bool showObjects = true;
+    bool forceFlicker = false;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
@@ -1242,6 +1244,9 @@ int main(int argc, char *argv[]) {
         }
         if (std::strcmp(argv[i], "--no-objects") == 0) {
             showObjects = false;
+        }
+        if (std::strcmp(argv[i], "--force-flicker") == 0) {
+            forceFlicker = true;
         }
     }
 
@@ -1298,8 +1303,48 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    std::fprintf(stderr, "Animated lights: %zu sources, %zu indexed lightnums\n",
-                 lightSources.size(), animLightIndex.size());
+    // Apply --force-flicker: override all lights to flicker mode for debugging
+    if (forceFlicker) {
+        for (auto &[num, ls] : lightSources) {
+            ls.mode = Opde::ANIM_FLICKER;
+            ls.inactive = false;
+            ls.minBright = 0.0f;
+            ls.maxBright = 1.0f;
+            ls.brightenTime = 0.15f;
+            ls.dimTime = 0.15f;
+            ls.brightness = ls.maxBright;
+            ls.countdown = 0.1f;
+            ls.isRising = false;
+        }
+        std::fprintf(stderr, "Force-flicker: all %zu lights set to flicker mode\n",
+                     lightSources.size());
+    }
+
+    // Animated light diagnostics
+    {
+        int modeCounts[10] = {};
+        int inactiveCount = 0;
+        int fromMIS = 0, fromDefault = 0;
+        for (const auto &[num, ls] : lightSources) {
+            if (ls.mode < 10) modeCounts[ls.mode]++;
+            if (ls.inactive) inactiveCount++;
+            if (ls.objectId != 0) fromMIS++; else fromDefault++;
+        }
+        std::fprintf(stderr, "Animated lights: %zu sources (%d from MIS, %d defaulted), "
+                     "%zu indexed lightnums\n",
+                     lightSources.size(), fromMIS, fromDefault, animLightIndex.size());
+        const char *modeNames[] = {
+            "flip", "smooth", "random", "min_bright", "max_bright",
+            "zero", "brighten", "dim", "semi_random", "flicker"
+        };
+        for (int m = 0; m < 10; ++m) {
+            if (modeCounts[m] > 0)
+                std::fprintf(stderr, "  mode %d (%s): %d lights\n",
+                             m, modeNames[m], modeCounts[m]);
+        }
+        if (inactiveCount > 0)
+            std::fprintf(stderr, "  inactive: %d lights\n", inactiveCount);
+    }
 
     // Parse sky dome parameters from SKYOBJVAR chunk (if present)
     SkyParams skyParams = parseSkyObjVar(misPath);
@@ -1636,18 +1681,25 @@ int main(int argc, char *argv[]) {
             }
 
             for (const auto &atlas : lmAtlasSet.atlases) {
-                const bgfx::Memory *mem = bgfx::copy(atlas.rgba.data(),
-                    static_cast<uint32_t>(atlas.rgba.size()));
+                // Create texture WITHOUT initial data so it stays mutable —
+                // bgfx treats textures with initial mem as immutable.
+                // We upload via updateTexture2D immediately after creation.
                 // Point filtering so --lm-scale 1 gives the original blocky/vintage
                 // look. Higher lm-scale values bake bicubic smoothing into the
                 // atlas texels, providing progressively smoother lighting.
-                lightmapAtlasHandles.push_back(bgfx::createTexture2D(
+                bgfx::TextureHandle th = bgfx::createTexture2D(
                     static_cast<uint16_t>(atlas.size),
                     static_cast<uint16_t>(atlas.size),
                     false, 1, bgfx::TextureFormat::RGBA8,
                     BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
-                    | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-                    mem));
+                    | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+                // Upload initial atlas data
+                const bgfx::Memory *mem = bgfx::copy(atlas.rgba.data(),
+                    static_cast<uint32_t>(atlas.rgba.size()));
+                bgfx::updateTexture2D(th, 0, 0, 0, 0,
+                    static_cast<uint16_t>(atlas.size),
+                    static_cast<uint16_t>(atlas.size), mem);
+                lightmapAtlasHandles.push_back(th);
             }
             std::fprintf(stderr, "Created %zu lightmap atlas GPU texture(s)\n",
                          lightmapAtlasHandles.size());
