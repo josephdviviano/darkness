@@ -42,6 +42,10 @@ TEST_CASE("RenderConfig defaults", "[config]") {
     CHECK(cfg.filterMode == 0);
     CHECK(cfg.linearMips == false);
     CHECK(cfg.sharpMips  == false);
+    CHECK(cfg.waveAmplitude == 0.3f);
+    CHECK(cfg.uvDistortion  == 0.015f);
+    CHECK(cfg.waterRotation == 0.015f);
+    CHECK(cfg.waterScrollSpeed == 0.05f);
     CHECK(cfg.showObjects   == true);
     CHECK(cfg.portalCulling == true);
     CHECK(cfg.forceFlicker  == false);
@@ -191,6 +195,107 @@ TEST_CASE("lm_scale clamping in YAML and CLI", "[config][clamp]") {
         auto argv = makeArgv(args);
         Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
         CHECK(cfg.lmScale == 8);
+    }
+}
+
+TEST_CASE("YAML water section", "[config][yaml]") {
+    TmpFile tmp(R"(
+water:
+  wave_amplitude: 3.5
+  uv_distortion: 0.05
+  rotation_speed: 0.2
+  scroll_speed: 0.08
+)");
+
+    Darkness::RenderConfig cfg;
+    bool ok = Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
+
+    REQUIRE(ok);
+    CHECK(cfg.waveAmplitude == 3.5f);
+    CHECK(cfg.uvDistortion  == 0.05f);
+    CHECK(cfg.waterRotation == 0.2f);
+    CHECK(cfg.waterScrollSpeed == 0.08f);
+}
+
+TEST_CASE("CLI --wave-amp, --uv-distort, --water-rot, --water-scroll", "[config][cli]") {
+    Darkness::RenderConfig cfg;
+    std::vector<std::string> args = {
+        "prog", "--wave-amp", "4.0", "--uv-distort", "0.08",
+        "--water-rot", "0.3", "--water-scroll", "0.1"
+    };
+    auto argv = makeArgv(args);
+    Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
+
+    CHECK(cfg.waveAmplitude == 4.0f);
+    CHECK(cfg.uvDistortion  == 0.08f);
+    CHECK(cfg.waterRotation == 0.3f);
+    CHECK(cfg.waterScrollSpeed == 0.1f);
+}
+
+TEST_CASE("water config clamping", "[config][clamp]") {
+    SECTION("YAML clamps wave_amplitude below 0 to 0") {
+        TmpFile tmp("water:\n  wave_amplitude: -2.0\n");
+        Darkness::RenderConfig cfg;
+        Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
+        CHECK(cfg.waveAmplitude == 0.0f);
+    }
+    SECTION("YAML clamps wave_amplitude above 10 to 10") {
+        TmpFile tmp("water:\n  wave_amplitude: 50.0\n");
+        Darkness::RenderConfig cfg;
+        Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
+        CHECK(cfg.waveAmplitude == 10.0f);
+    }
+    SECTION("YAML clamps uv_distortion below 0 to 0") {
+        TmpFile tmp("water:\n  uv_distortion: -1.0\n");
+        Darkness::RenderConfig cfg;
+        Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
+        CHECK(cfg.uvDistortion == 0.0f);
+    }
+    SECTION("YAML clamps uv_distortion above 0.1 to 0.1") {
+        TmpFile tmp("water:\n  uv_distortion: 5.0\n");
+        Darkness::RenderConfig cfg;
+        Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
+        CHECK(cfg.uvDistortion == 0.1f);
+    }
+    SECTION("CLI clamps wave_amplitude") {
+        Darkness::RenderConfig cfg;
+        std::vector<std::string> args = {"prog", "--wave-amp", "-5"};
+        auto argv = makeArgv(args);
+        Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
+        CHECK(cfg.waveAmplitude == 0.0f);
+    }
+    SECTION("CLI clamps uv_distortion") {
+        Darkness::RenderConfig cfg;
+        std::vector<std::string> args = {"prog", "--uv-distort", "1.0"};
+        auto argv = makeArgv(args);
+        Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
+        CHECK(cfg.uvDistortion == 0.1f);
+    }
+    SECTION("YAML clamps rotation_speed above 1.0 to 1.0") {
+        TmpFile tmp("water:\n  rotation_speed: 5.0\n");
+        Darkness::RenderConfig cfg;
+        Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
+        CHECK(cfg.waterRotation == 1.0f);
+    }
+    SECTION("CLI clamps water_rotation") {
+        Darkness::RenderConfig cfg;
+        std::vector<std::string> args = {"prog", "--water-rot", "-1.0"};
+        auto argv = makeArgv(args);
+        Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
+        CHECK(cfg.waterRotation == 0.0f);
+    }
+    SECTION("YAML clamps scroll_speed above 1.0 to 1.0") {
+        TmpFile tmp("water:\n  scroll_speed: 5.0\n");
+        Darkness::RenderConfig cfg;
+        Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
+        CHECK(cfg.waterScrollSpeed == 1.0f);
+    }
+    SECTION("CLI clamps water_scroll") {
+        Darkness::RenderConfig cfg;
+        std::vector<std::string> args = {"prog", "--water-scroll", "-1.0"};
+        auto argv = makeArgv(args);
+        Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
+        CHECK(cfg.waterScrollSpeed == 0.0f);
     }
 }
 
