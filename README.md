@@ -4,13 +4,89 @@
 
 ![don't be so sure](doc/orly.png)
 
-### Usage
+### Prerequisites
 
-TODO - Note, users must supply their own legally obtained game files to be able to use `darkness`.
+- CMake 3.21+
+- C++17 compiler (Clang, GCC, or MSVC)
+- Git (for vcpkg submodule)
+
+Dependencies are managed automatically via [vcpkg](https://vcpkg.io/) manifest mode:
+bgfx, SDL2, zziplib, ODE, yaml-cpp, Catch2.
 
 ### Building
 
-TODO
+```bash
+# Clone with vcpkg submodule
+git clone --recursive https://github.com/example/darkness.git
+cd darkness
+
+# Configure and build (Debug)
+cmake --preset default
+cmake --build build/default
+
+# Or Release
+cmake --preset release
+cmake --build build/release
+```
+
+This produces two binaries:
+
+| Binary | Path | Description |
+|--------|------|-------------|
+| `darknessHeadless` | `build/default/src/main/darknessHeadless` | Mission inspector (dumps chunks, objects, properties) |
+| `darknessRender` | `build/default/src/main/darknessRender` | World geometry viewer (SDL2 + bgfx) |
+
+#### Platform presets
+
+| Preset | Platform | Notes |
+|--------|----------|-------|
+| `default` | macOS / auto-detect | Debug build |
+| `release` | macOS / auto-detect | Release build |
+| `linux-x64` | Linux | Debug build |
+| `windows-x64` | Windows | Debug build |
+
+### Usage
+
+Users must supply their own legally obtained game files. `darkness` does not include any game assets.
+
+#### World viewer
+
+```bash
+# Flat-shaded (no external resources needed)
+darknessRender path/to/miss6.mis
+
+# Textured + lightmapped (requires Thief 2 RES directory with fam.crf)
+darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES
+
+# With upscaled lightmaps
+darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES --lm-scale 4
+```
+
+**Controls:**
+
+| Key | Action |
+|-----|--------|
+| WASD | Move |
+| Mouse | Look |
+| Space / LShift | Up / Down |
+| Ctrl | Sprint (3x) |
+| Scroll wheel | Adjust speed |
+| C | Toggle portal culling |
+| F | Cycle texture filtering |
+| V | Toggle collision |
+| M / N | Cycle model isolation |
+| Home | Teleport to spawn |
+| Esc | Quit |
+
+Run `darknessRender --help` for all options.
+
+#### Mission inspector
+
+```bash
+darknessHeadless path/to/miss6.mis
+```
+
+Loads a `.mis` + `.gam` database and dumps chunk inventory, object hierarchy, properties, and links to stderr.
 
 ### Thanks
 
