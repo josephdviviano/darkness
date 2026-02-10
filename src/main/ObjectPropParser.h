@@ -27,7 +27,8 @@
 // raw int16 angles needed by the renderer's rotation matrix builder).
 //
 // BRLIST is also read directly — it's a non-property chunk identifying
-// editor brush objects that should not be rendered.
+// editor brush objects. BRLIST membership is logged for diagnostics but
+// does NOT filter objects from rendering; RenderType handles that.
 
 #pragma once
 
@@ -75,10 +76,10 @@ namespace detail {
 // The 'primal' field (int32 at offset 4) is the brush's associated object ID.
 // The 'type' field (int8 at offset 10) identifies the brush kind:
 //   0=SOLID(terrain), 1=AIR, 2=WATER, -1(0xFF)=LIGHT, -4(0xFC)=FLOW, -5(0xFB)=ROOM
-// All brush objects are editor constructs — not rendered as standalone objects.
+// Returns a map of object ID → brush type for use in filtering decisions.
 // (Terrain brushes are already baked into the worldmesh WR chunk.)
 inline void readBrushObjectIDs(FileGroupPtr &db,
-                                std::unordered_set<int32_t> &brushObjIDs) {
+                                std::unordered_map<int32_t, int8_t> &brushObjTypes) {
     const char *brChunk = "BRLIST";
     if (!db->hasFile(brChunk)) return;
 
@@ -128,16 +129,30 @@ inline void readBrushObjectIDs(FileGroupPtr &db,
                        File::FSEEK_CUR);
         }
 
-        // The primal field is the object ID associated with this brush
+        // The primal field is the object ID associated with this brush.
+        // Store with brush type for filtering decisions.
         if (primal > 0) {
-            brushObjIDs.insert(primal);
+            brushObjTypes[primal] = type;
         }
         ++count;
     }
 
     if (count > 0) {
         std::fprintf(stderr, "BRLIST: %d brushes, %zu unique object IDs\n",
-                     count, brushObjIDs.size());
+                     count, brushObjTypes.size());
+    }
+}
+
+// Brush type name for debug output
+inline const char *brushTypeName(int8_t type) {
+    switch (type) {
+        case  0: return "SOLID";
+        case  1: return "AIR";
+        case  2: return "WATER";
+        case -1: return "LIGHT";    // 0xFF as int8_t
+        case -4: return "FLOW";     // 0xFC as int8_t
+        case -5: return "ROOM";     // 0xFB as int8_t
+        default: return "UNKNOWN";
     }
 }
 
@@ -157,18 +172,25 @@ inline void readBrushObjectIDs(FileGroupPtr &db,
 // raw int16 angles for its rotation matrix builder.
 //
 // BRLIST is also read directly — it's a non-property chunk.
+//
+// Filtering: RenderType=NotRendered(1) and EditorOnly(3) are skipped.
+// BRLIST membership is NOT used for filtering — brush objects like doors
+// need their .bin models rendered. RenderType already handles invisible
+// brushes (room, flow, light brushes all have NotRendered set).
+// Pass debugObjects=true to log per-object filtering decisions to stderr.
 inline ObjectPropData parseObjectProps(PropertyService *propSvc,
-                                        const std::string &misPath) {
+                                        const std::string &misPath,
+                                        bool debugObjects = false) {
     ObjectPropData result;
 
     // Open .mis file for P$Position and BRLIST (still needed for direct reads)
     FilePtr misFp(new StdFile(misPath, File::FILE_R));
     FileGroupPtr misDb(new DarkFileGroup(misFp));
 
-    // Read BRLIST to identify editor brush objects (room/terrain/flow brushes)
-    // that should not be rendered as standalone objects
-    std::unordered_set<int32_t> brushObjIDs;
-    detail::readBrushObjectIDs(misDb, brushObjIDs);
+    // Read BRLIST to identify editor brush objects (room/terrain/flow brushes).
+    // Stores object ID → brush type for filtering decisions.
+    std::unordered_map<int32_t, int8_t> brushObjTypes;
+    detail::readBrushObjectIDs(misDb, brushObjTypes);
 
     // ── Read positions from P$Position ──
     // Read directly from file because PositionPropertyStorage uses a different
@@ -228,8 +250,18 @@ inline ObjectPropData parseObjectProps(PropertyService *propSvc,
                  posMap.size());
 
     // ── Merge: resolve properties via PropertyService for each positioned object ──
+    //
+    // Filter strategy:
+    //   - RenderType=EditorOnly(3) → always skip
+    //   - RenderType=NotRendered(1) → skip (these are lights, markers, waypoints, etc.)
+    //   - BRLIST membership → NOT filtered. Brush-associated objects like doors
+    //     may have .bin models that need to render. The BRLIST creates worldmesh
+    //     geometry (door frame hole, etc.) but the object's .bin model (door slab)
+    //     renders separately. RenderType already handles truly invisible brushes.
+    //   - No model name → skip as unresolved
     std::unordered_set<std::string> uniqueSet;
     int resolved = 0, unresolved = 0, filtered = 0;
+    int filteredEditorOnly = 0, filteredNotRendered = 0;
 
     for (auto &kv : posMap) {
         int32_t id = kv.first;
@@ -238,20 +270,36 @@ inline ObjectPropData parseObjectProps(PropertyService *propSvc,
         // Check render type — skip non-renderable objects (lights, markers, etc.)
         // Inheritance is resolved by PropertyService's Inheritor system.
         // 0=Normal, 1=NotRendered, 2=NoLightmap, 3=EditorOnly
-        PropRenderType rt;
-        if (getTypedProperty<PropRenderType>(propSvc, "RenderType", id, rt)) {
-            if (rt.mode == 1 || rt.mode == 3) {
-                ++filtered;
-                continue;
+        PropRenderType rt = {};
+        bool hasRenderType = getTypedProperty<PropRenderType>(
+            propSvc, "RenderType", id, rt);
+
+        if (hasRenderType && rt.mode == 3) {
+            if (debugObjects) {
+                std::fprintf(stderr, "  [SKIP] obj %d: EditorOnly (RenderType=3)\n", id);
             }
+            ++filtered;
+            ++filteredEditorOnly;
+            continue;
         }
 
-        // Skip editor brush objects (from BRLIST) — room brushes, terrain brushes,
-        // flow brushes, etc. are architectural geometry already baked into the
-        // worldmesh or used for room/sound definitions, not standalone objects
-        if (brushObjIDs.count(id)) {
+        if (hasRenderType && rt.mode == 1) {
+            if (debugObjects) {
+                std::fprintf(stderr, "  [SKIP] obj %d: NotRendered (RenderType=1)\n", id);
+            }
             ++filtered;
+            ++filteredNotRendered;
             continue;
+        }
+
+        // BRLIST membership is logged but NOT filtered — brush objects like doors
+        // need their .bin models rendered even though their brush creates worldmesh
+        // geometry. RenderType handles truly invisible brush objects.
+        bool inBrlist = brushObjTypes.count(id) > 0;
+        if (debugObjects && inBrlist) {
+            int8_t brushType = brushObjTypes.at(id);
+            std::fprintf(stderr, "  [INFO] obj %d: in BRLIST(%s), not filtered\n",
+                         id, detail::brushTypeName(brushType));
         }
 
         // Resolve model name through PropertyService inheritance chain.
@@ -311,8 +359,11 @@ inline ObjectPropData parseObjectProps(PropertyService *propSvc,
     std::sort(result.uniqueModels.begin(), result.uniqueModels.end());
 
     std::fprintf(stderr, "ObjectPropParser: %d resolved, %d unresolved, "
-                 "%d filtered (non-renderable) (%zu unique models)\n",
-                 resolved, unresolved, filtered, result.uniqueModels.size());
+                 "%d filtered (%d EditorOnly, %d NotRendered) "
+                 "(%zu unique models)\n",
+                 resolved, unresolved, filtered,
+                 filteredEditorOnly, filteredNotRendered,
+                 result.uniqueModels.size());
 
     return result;
 }

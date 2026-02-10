@@ -32,6 +32,7 @@ struct RenderConfig {
     bool portalCulling    = true;   // portal/frustum culling
     bool forceFlicker     = false;  // force all animated lights to flicker mode
     bool cameraCollision  = false;  // sphere collision against world geometry
+    bool debugObjects     = false;  // dump per-object filtering diagnostics to stderr
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -141,6 +142,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cfg.sharpMips = true;
         } else if (std::strcmp(argv[i], "--collision") == 0) {
             cfg.cameraCollision = true;
+        } else if (std::strcmp(argv[i], "--debug-objects") == 0) {
+            cfg.debugObjects = true;
         } else if (std::strcmp(argv[i], "--wave-amp") == 0 && i + 1 < argc) {
             cfg.waveAmplitude = static_cast<float>(std::atof(argv[++i]));
             if (cfg.waveAmplitude < 0.0f) cfg.waveAmplitude = 0.0f;
