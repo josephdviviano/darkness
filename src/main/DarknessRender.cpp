@@ -56,6 +56,7 @@
 #include "BinMeshParser.h"
 #include "RenderConfig.h"
 
+// TODO: Make these configurable via command-line or config file
 static const int WINDOW_WIDTH  = 1280;
 static const int WINDOW_HEIGHT = 720;
 
@@ -1305,6 +1306,7 @@ struct ObjectSubMeshGPU {
     uint32_t indexCount;
     std::string matName;   // lowercase material name, for texture lookup
     bool textured;         // true = Darkness::MD_MAT_TMAP, false = Darkness::MD_MAT_COLOR
+    float matTrans;        // per-material translucency from .bin mat_extra (0=opaque)
 };
 
 // GPU buffers for a single unique model (shared by all instances)
@@ -2929,6 +2931,8 @@ int main(int argc, char *argv[]) {
     bgfx::UniformHandle u_waterFlow = bgfx::createUniform("u_waterFlow", bgfx::UniformType::Vec4);
     bgfx::UniformHandle u_fogColor = bgfx::createUniform("u_fogColor", bgfx::UniformType::Vec4);
     bgfx::UniformHandle u_fogParams = bgfx::createUniform("u_fogParams", bgfx::UniformType::Vec4);
+    // Per-object params: x = alpha (1.0 = opaque, < 1.0 = translucent via RenderAlpha property)
+    bgfx::UniformHandle u_objectParams = bgfx::createUniform("u_objectParams", bgfx::UniformType::Vec4);
 
     // ── Build lightmap atlas (if textured mode) ──
 
@@ -3293,9 +3297,11 @@ int main(int argc, char *argv[]) {
                 gsm.firstIndex = sm.firstIndex;
                 gsm.indexCount = sm.indexCount;
                 gsm.textured = false;
+                gsm.matTrans = 0.0f;
                 if (sm.matIndex >= 0 && sm.matIndex < static_cast<int>(mesh.materials.size())) {
                     const auto &mat = mesh.materials[sm.matIndex];
                     gsm.textured = (mat.type == Darkness::MD_MAT_TMAP);
+                    gsm.matTrans = mat.trans;  // per-material translucency
                     // Lowercase material name for texture lookup
                     gsm.matName = mat.name;
                     std::transform(gsm.matName.begin(), gsm.matName.end(),
@@ -3310,6 +3316,24 @@ int main(int argc, char *argv[]) {
         }
         std::fprintf(stderr, "Object GPU buffers: %zu models + fallback cube\n",
                      objModelGPU.size());
+
+        // Count translucent objects/materials for diagnostics
+        int translucentObjCount = 0;
+        int translucentMatCount = 0;
+        for (const auto &obj : objData.objects) {
+            if (obj.renderAlpha < 1.0f) ++translucentObjCount;
+        }
+        for (const auto &kv : objModelGPU) {
+            if (!kv.second.valid) continue;
+            for (const auto &sm : kv.second.subMeshes) {
+                if (sm.matTrans > 0.0f) ++translucentMatCount;
+            }
+        }
+        if (translucentObjCount > 0 || translucentMatCount > 0) {
+            std::fprintf(stderr, "Translucent: %d objects (RenderAlpha), "
+                         "%d material submeshes (mat_extra)\n",
+                         translucentObjCount, translucentMatCount);
+        }
 
     }
 
@@ -3436,7 +3460,7 @@ int main(int argc, char *argv[]) {
         char title[512];
         const char *filterNames[] = { "point", "bilinear", "trilinear", "aniso" };
         const char *filterStr = filterNames[filterMode % 4];
-        
+
         // Build model isolation suffix if active
         char isoSuffix[128] = "";
         if (isolateModelIdx >= 0 && isolateModelIdx < (int)sortedModelNames.size()) {
@@ -3448,7 +3472,7 @@ int main(int argc, char *argv[]) {
                 isolateModelIdx + 1, sortedModelNames.size(),
                 isoName.c_str(), cnt);
         }
-        
+
         const char *clipStr = cameraCollision ? "clip" : "noclip";
 
         if (portalCulling) {
@@ -3714,13 +3738,18 @@ int main(int argc, char *argv[]) {
 
         // Helper: set fog uniforms before each submit call
         // (bgfx clears all uniform state after each submit)
+        // Default per-object params: fully opaque (x=1.0)
+        float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+
         auto setFogOn = [&]() {
             bgfx::setUniform(u_fogColor, fogColorArr);
             bgfx::setUniform(u_fogParams, fogOnArr);
+            bgfx::setUniform(u_objectParams, opaqueParams);
         };
         auto setFogSky = [&]() {
             bgfx::setUniform(u_fogColor, fogColorArr);
             bgfx::setUniform(u_fogParams, skyFogArr);
+            bgfx::setUniform(u_objectParams, opaqueParams);
         };
 
         // ── View 0: Sky pass ──
@@ -3857,75 +3886,109 @@ int main(int argc, char *argv[]) {
         }
 
         // ── Draw object meshes (per-submesh for textured/solid materials) ──
-        if (showObjects) {
-            for (size_t oi = 0; oi < objData.objects.size(); ++oi) {
-                const auto &obj = objData.objects[oi];
-                if (!obj.hasPosition) continue;
+        // Two-pass rendering for correct transparency compositing:
+        //   Pass 1: all opaque submeshes (matTrans == 0 AND renderAlpha == 1.0)
+        //   Pass 2: all translucent submeshes (matTrans > 0 OR renderAlpha < 1.0)
+        // A single object (e.g. a window) can have both opaque submeshes (frame)
+        // and translucent submeshes (glass pane), so transparency is per-submesh.
+        //
+        // Final alpha = (1.0 - material.trans) * object.renderAlpha
+        // where material.trans is from .bin mat_extra (0=opaque, 0.3=glass)
+        // and object.renderAlpha is from P$RenderAlp property (1.0=opaque)
 
-                // Portal culling: skip objects in non-visible cells.
-                // Objects outside all cells (cellID == -1) are always rendered.
-                if (portalCulling && oi < objCellIDs.size()) {
-                    int32_t objCell = objCellIDs[oi];
-                    if (objCell >= 0 && visibleCells.count(static_cast<uint32_t>(objCell)) == 0)
-                        continue;
-                }
+        // Alpha-blend state for translucent submeshes
+        uint64_t translucentState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                                  | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                                  | BGFX_STATE_CULL_CW
+                                  | BGFX_STATE_BLEND_ALPHA;
 
-                // Compute per-object model matrix from position + angles
-                float objMtx[16];
-                buildModelMatrix(objMtx, obj.x, obj.y, obj.z,
-                                 obj.heading, obj.pitch, obj.bank,
-                                 obj.scaleX, obj.scaleY, obj.scaleZ);
+        // Helper: draw one object's submeshes, filtering by opacity.
+        // When opaquePass=true, draws only opaque submeshes with renderState.
+        // When opaquePass=false, draws only translucent submeshes with translucentState.
+        auto drawObjectSubmeshes = [&](size_t oi, bool opaquePass) {
+            const auto &obj = objData.objects[oi];
+            if (!obj.hasPosition) return;
 
-                // Find the GPU model for this object's model name
-                std::string modelName(obj.modelName);
+            // Portal culling: skip objects in non-visible cells.
+            if (portalCulling && oi < objCellIDs.size()) {
+                int32_t objCell = objCellIDs[oi];
+                if (objCell >= 0 && visibleCells.count(static_cast<uint32_t>(objCell)) == 0)
+                    return;
+            }
 
-                // Model isolation mode: skip objects that don't match the isolated model
-                if (isolateModelIdx >= 0 && isolateModelIdx < (int)sortedModelNames.size()) {
-                    if (modelName != sortedModelNames[isolateModelIdx])
-                        continue;
-                }
+            // Compute per-object model matrix from position + angles
+            float objMtx[16];
+            buildModelMatrix(objMtx, obj.x, obj.y, obj.z,
+                             obj.heading, obj.pitch, obj.bank,
+                             obj.scaleX, obj.scaleY, obj.scaleZ);
 
-                auto it = objModelGPU.find(modelName);
+            std::string modelName(obj.modelName);
 
-                if (it != objModelGPU.end() && it->second.valid) {
-                    const auto &gpuModel = it->second;
+            // Model isolation mode: skip objects that don't match the isolated model
+            if (isolateModelIdx >= 0 && isolateModelIdx < (int)sortedModelNames.size()) {
+                if (modelName != sortedModelNames[isolateModelIdx])
+                    return;
+            }
 
-                    // Draw each submesh with appropriate shader/texture
-                    for (const auto &sm : gpuModel.subMeshes) {
-                        if (sm.indexCount == 0) continue;
+            auto it = objModelGPU.find(modelName);
 
-                        setFogOn();
-                        bgfx::setTransform(objMtx);
-                        bgfx::setVertexBuffer(0, gpuModel.vbh);
-                        bgfx::setIndexBuffer(gpuModel.ibh, sm.firstIndex, sm.indexCount);
-                        bgfx::setState(renderState);
+            if (it != objModelGPU.end() && it->second.valid) {
+                const auto &gpuModel = it->second;
 
-                        if (sm.textured) {
-                            // Look up object texture by material name
-                            auto texIt = objTextureHandles.find(sm.matName);
-                            if (texIt != objTextureHandles.end()) {
-                                bgfx::setTexture(0, s_texColor, texIt->second, texSampler);
-                                bgfx::submit(1, texturedProgram);
-                            } else {
-                                // Texture not loaded — fall back to flat shading
-                                // (vertex colour is white*brightness, so it will appear grey)
-                                bgfx::submit(1, flatProgram);
-                            }
+                for (const auto &sm : gpuModel.subMeshes) {
+                    if (sm.indexCount == 0) continue;
+
+                    // Determine if this submesh is translucent:
+                    // either the material has translucency or the object has RenderAlpha
+                    bool isTranslucent = (sm.matTrans > 0.0f) || (obj.renderAlpha < 1.0f);
+                    if (opaquePass == isTranslucent) continue;  // wrong pass
+
+                    // Compute final alpha: (1 - matTrans) * renderAlpha
+                    // matTrans convention: 0=opaque, 0.3=30% transparent glass
+                    float finalAlpha = (1.0f - sm.matTrans) * obj.renderAlpha;
+                    float objAlpha[4] = { finalAlpha, 0.0f, 0.0f, 0.0f };
+
+                    uint64_t state = opaquePass ? renderState : translucentState;
+
+                    bgfx::setUniform(u_fogColor, fogColorArr);
+                    bgfx::setUniform(u_fogParams, fogOnArr);
+                    bgfx::setUniform(u_objectParams, objAlpha);
+                    bgfx::setTransform(objMtx);
+                    bgfx::setVertexBuffer(0, gpuModel.vbh);
+                    bgfx::setIndexBuffer(gpuModel.ibh, sm.firstIndex, sm.indexCount);
+                    bgfx::setState(state);
+
+                    if (sm.textured) {
+                        auto texIt = objTextureHandles.find(sm.matName);
+                        if (texIt != objTextureHandles.end()) {
+                            bgfx::setTexture(0, s_texColor, texIt->second, texSampler);
+                            bgfx::submit(1, texturedProgram);
                         } else {
-                            // Solid-colour submesh — vertex colour carries material colour
                             bgfx::submit(1, flatProgram);
                         }
+                    } else {
+                        bgfx::submit(1, flatProgram);
                     }
-                } else if (showFallbackCubes) {
-                    // Fallback: small coloured cube for missing models
-                    // (disabled by default — enable with --show-fallback)
-                    setFogOn();
-                    bgfx::setTransform(objMtx);
-                    bgfx::setVertexBuffer(0, fallbackCubeVBH);
-                    bgfx::setIndexBuffer(fallbackCubeIBH);
-                    bgfx::setState(renderState);
-                    bgfx::submit(1, flatProgram);
                 }
+            } else if (showFallbackCubes && opaquePass) {
+                // Fallback cubes are always opaque
+                setFogOn();
+                bgfx::setTransform(objMtx);
+                bgfx::setVertexBuffer(0, fallbackCubeVBH);
+                bgfx::setIndexBuffer(fallbackCubeIBH);
+                bgfx::setState(renderState);
+                bgfx::submit(1, flatProgram);
+            }
+        };
+
+        if (showObjects) {
+            // Pass 1: opaque submeshes of all objects
+            for (size_t oi = 0; oi < objData.objects.size(); ++oi) {
+                drawObjectSubmeshes(oi, true);
+            }
+            // Pass 2: translucent submeshes — rendered after all opaque geometry
+            for (size_t oi = 0; oi < objData.objects.size(); ++oi) {
+                drawObjectSubmeshes(oi, false);
             }
         }
 
@@ -4033,6 +4096,7 @@ int main(int argc, char *argv[]) {
     bgfx::destroy(u_waterFlow);
     bgfx::destroy(u_fogColor);
     bgfx::destroy(u_fogParams);
+    bgfx::destroy(u_objectParams);
 
     bgfx::destroy(ibh);
     bgfx::destroy(vbh);
