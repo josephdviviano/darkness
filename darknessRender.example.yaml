@@ -44,6 +44,10 @@ developer:
   # Set to false for world-geometry-only view
   show_objects: true
 
+  # Show colored fallback cubes for objects with missing models (default: false)
+  # Enable for debugging which objects lack .bin models in obj.crf
+  show_fallback_cubes: false
+
   # Portal/frustum culling (default: true)
   # Toggle at runtime with C key
   portal_culling: true
