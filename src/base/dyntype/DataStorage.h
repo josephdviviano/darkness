@@ -254,6 +254,17 @@ public:
     /** Data size getter
      * @return Data size, if available. 0 otherwise */
     virtual size_t getDataSize(void) { return 0; };
+
+    /** Raw byte data access for an object.
+     * @param objID The object ID to get data for
+     * @param outSize Filled with the byte count of the returned data
+     * @return Pointer to the raw bytes, or nullptr if not found/not supported.
+     *         The pointer is valid as long as the storage is not modified. */
+    virtual const uint8_t *getRawData(int objID, size_t &outSize) const {
+        (void)objID;
+        outSize = 0;
+        return nullptr;
+    }
 };
 
 /// Shared pointer to data storage

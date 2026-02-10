@@ -132,6 +132,16 @@ public:
 
     bool isEmpty() override { return mDataMap.empty(); }
 
+    const uint8_t *getRawData(int objID, size_t &outSize) const override {
+        auto it = mDataMap.find(objID);
+        if (it == mDataMap.end()) {
+            outSize = 0;
+            return nullptr;
+        }
+        outSize = it->second.size();
+        return it->second.data();
+    }
+
     IntIteratorPtr getAllStoredObjects() override {
         return IntIteratorPtr(new DataMapKeyIterator(mDataMap));
     }

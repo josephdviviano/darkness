@@ -270,6 +270,17 @@ public:
     /** @see DataStorage::getDataSize */
     virtual size_t getDataSize(void) { return sizeof(T); }
 
+    /** @see DataStorage::getRawData */
+    const uint8_t *getRawData(int objID, size_t &outSize) const override {
+        auto it = mDataMap.find(objID);
+        if (it == mDataMap.end()) {
+            outSize = 0;
+            return nullptr;
+        }
+        outSize = sizeof(T);
+        return reinterpret_cast<const uint8_t *>(&it->second);
+    }
+
 protected:
     template <typename FT> class TypeHelper : public TypeHelperBase {
     public:
