@@ -84,6 +84,19 @@ public:
     /// Name getter. Returns the name of this property
     const std::string &getName() { return mName; };
 
+    /** Returns the effective object ID for this property after inheritance
+     * resolution (archetype + MetaProp chain walk).
+     * @param objID The object id to query
+     * @return The object ID that actually holds the property data, or 0 if
+     *         no object in the inheritance chain has this property */
+    int getEffectiveID(int objID) const {
+        return _getEffectiveObject(objID);
+    }
+
+    /** Returns the underlying data storage for this property.
+     * Can be used with getRawData() for typed byte access. */
+    DataStorage *getStorage() const { return mPropertyStorage.get(); }
+
     /** Determines whether an object with id obj_id stores or inherits property
      * of this type
      * @param obj_id The object id of the object

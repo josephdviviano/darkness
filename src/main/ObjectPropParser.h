@@ -19,31 +19,31 @@
  *
  *****************************************************************************/
 
-// ObjectPropParser — reads P$ModelName and P$Position chunks from Dark Engine
-// .mis and .gam files, resolving archetype inheritance via MetaProp links to
-// build a list of concrete objects and their world placements.
+// ObjectPropParser — builds a list of concrete objects with world placements
+// for rendering. Uses PropertyService for property resolution (ModelName,
+// RenderType, Scale, RenderAlpha) with proper inheritance via the Inheritor
+// system. P$Position is read directly from the .mis file because the built-in
+// PositionPropertyStorage uses a different in-memory format (Quaternion vs
+// raw int16 angles needed by the renderer's rotation matrix builder).
 //
-// Most objects in a mission file inherit their model name from their archetype
-// defined in the .gam file. The inheritance chain is resolved via L$MetaProp
-// links: each concrete object (positive ID) links to an archetype (negative
-// ID), which may chain further to parent archetypes.
-//
-// Same standalone/header-only pattern as SpawnFinder.h.
+// BRLIST is also read directly — it's a non-property chunk identifying
+// editor brush objects that should not be rendered.
 
 #pragma once
 
 #include "File.h"
 #include "FileGroup.h"
 #include "FileCompat.h"
+#include "property/PropertyService.h"
+#include "property/TypedProperty.h"
+#include "property/DarkPropertyDefs.h"
 
-#include <array>
 #include <cstdint>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 #include <algorithm>
 
@@ -69,134 +69,6 @@ struct ObjectPropData {
 };
 
 namespace detail {
-
-// Read all P$ModelName records from a file group into a map.
-// Records: {uint32_t objID, uint32_t dataSize=16, char name[16]}
-// Accepts both positive (concrete) and negative (archetype) IDs.
-inline void readModelNames(FileGroupPtr &db,
-                            std::unordered_map<int32_t, std::string> &modelMap) {
-    // "P$ModelName" is exactly 11 chars — fits in the 12-byte chunk name field
-    const char *modelChunk = "P$ModelName";
-
-    if (!db->hasFile(modelChunk)) return;
-
-    FilePtr modelFile = db->getFile(modelChunk);
-
-    while (static_cast<size_t>(modelFile->tell()) + 8 <= modelFile->size()) {
-        uint32_t objID, dataSize;
-        *modelFile >> objID >> dataSize;
-
-        if (dataSize == 0) continue;
-
-        // Read model name (fixed 16 bytes, null-terminated)
-        char name[16] = {};
-        size_t toRead = std::min(static_cast<size_t>(dataSize), sizeof(name));
-        modelFile->read(name, toRead);
-        name[15] = '\0';
-
-        // Skip any remaining bytes if dataSize > 16
-        if (dataSize > toRead) {
-            modelFile->seek(static_cast<file_offset_t>(dataSize - toRead),
-                            File::FSEEK_CUR);
-        }
-
-        if (name[0] != '\0') {
-            // Lowercase for consistent CRF lookups
-            std::string nameStr(name);
-            std::transform(nameStr.begin(), nameStr.end(),
-                           nameStr.begin(), ::tolower);
-            int32_t signedID = static_cast<int32_t>(objID);
-            modelMap[signedID] = nameStr;
-        }
-    }
-}
-
-// Read MetaProp links from a file group. Each link says "src inherits from dest".
-// Link records: {uint32_t id, int32_t src, int32_t dest, uint16_t flavor} = 14 bytes
-inline void readMetaPropLinks(FileGroupPtr &db,
-                               std::unordered_map<int32_t, int32_t> &parentMap) {
-    const char *linkChunk = "L$MetaProp";
-
-    if (!db->hasFile(linkChunk)) return;
-
-    FilePtr linkFile = db->getFile(linkChunk);
-    const int LINK_SIZE = 14;
-
-    while (static_cast<size_t>(linkFile->tell()) + LINK_SIZE <=
-           linkFile->size()) {
-        uint32_t id;
-        int32_t src, dest;
-        uint16_t flavor;
-        *linkFile >> id >> src >> dest >> flavor;
-
-        // Store the first (primary) parent link for each object.
-        // If an object has multiple MetaProp links, the first one is the
-        // primary archetype parent.
-        if (parentMap.find(src) == parentMap.end()) {
-            parentMap[src] = dest;
-        }
-    }
-}
-
-// Read all P$RenderTyp records from a file group into a map.
-// Records: {uint32_t objID, uint32_t dataSize=4, uint32_t renderType}
-// RenderType values: 0=Normal, 1=NotRendered, 2=NoLightmap, 3=EditorOnly
-inline void readRenderTypes(FileGroupPtr &db,
-                             std::unordered_map<int32_t, uint32_t> &renderMap) {
-    const char *rtChunk = "P$RenderTyp";
-
-    if (!db->hasFile(rtChunk)) return;
-
-    FilePtr rtFile = db->getFile(rtChunk);
-
-    while (static_cast<size_t>(rtFile->tell()) + 8 <= rtFile->size()) {
-        uint32_t objID, dataSize;
-        *rtFile >> objID >> dataSize;
-
-        if (dataSize >= 4) {
-            uint32_t renderType;
-            *rtFile >> renderType;
-
-            // Skip remaining bytes if dataSize > 4
-            if (dataSize > 4) {
-                rtFile->seek(static_cast<file_offset_t>(dataSize - 4),
-                             File::FSEEK_CUR);
-            }
-
-            int32_t signedID = static_cast<int32_t>(objID);
-            renderMap[signedID] = renderType;
-        } else if (dataSize > 0) {
-            rtFile->seek(static_cast<file_offset_t>(dataSize),
-                         File::FSEEK_CUR);
-        }
-    }
-}
-
-// Walk the MetaProp inheritance chain to resolve an object's render type.
-// Returns 0 (Normal) if no explicit RenderType is found in the chain.
-inline uint32_t resolveRenderType(
-    int32_t objID,
-    const std::unordered_map<int32_t, uint32_t> &renderMap,
-    const std::unordered_map<int32_t, int32_t> &parentMap)
-{
-    // Check direct assignment first
-    auto it = renderMap.find(objID);
-    if (it != renderMap.end()) return it->second;
-
-    // Walk the inheritance chain (max depth to prevent infinite loops)
-    int32_t current = objID;
-    for (int depth = 0; depth < 32; ++depth) {
-        auto pit = parentMap.find(current);
-        if (pit == parentMap.end()) break;
-
-        current = pit->second;
-        auto rit = renderMap.find(current);
-        if (rit != renderMap.end()) return rit->second;
-    }
-
-    // Default: Normal (renderable)
-    return 0;
-}
 
 // Read the BRLIST chunk to find object IDs associated with editor brushes.
 // BRLIST records are 76 bytes base (pack(2)), with variable face data for terrain.
@@ -269,257 +141,39 @@ inline void readBrushObjectIDs(FileGroupPtr &db,
     }
 }
 
-// Read all P$Scale records from a file group into a map.
-// Records: {uint32_t objID, uint32_t dataSize=12, float sx, float sy, float sz}
-// P$Scale stores the ModelScale as a Vector3.
-inline void readScales(FileGroupPtr &db,
-                        std::unordered_map<int32_t, std::array<float,3>> &scaleMap) {
-    const char *scaleChunk = "P$Scale";
-
-    if (!db->hasFile(scaleChunk)) return;
-
-    FilePtr sf = db->getFile(scaleChunk);
-
-    while (static_cast<size_t>(sf->tell()) + 8 <= sf->size()) {
-        uint32_t objID, dataSize;
-        *sf >> objID >> dataSize;
-
-        if (dataSize >= 12) {
-            float sx, sy, sz;
-            *sf >> sx >> sy >> sz;
-
-            // Skip remaining bytes if dataSize > 12
-            if (dataSize > 12) {
-                sf->seek(static_cast<file_offset_t>(dataSize - 12),
-                         File::FSEEK_CUR);
-            }
-
-            int32_t signedID = static_cast<int32_t>(objID);
-            scaleMap[signedID] = {sx, sy, sz};
-        } else if (dataSize > 0) {
-            sf->seek(static_cast<file_offset_t>(dataSize),
-                     File::FSEEK_CUR);
-        }
-    }
-}
-
-// Read all P$RenderAlp records from a file group into a map.
-// Records: {uint32_t objID, uint32_t dataSize=4, float alpha}
-// RenderAlpha is the per-object transparency multiplier (0.0 = invisible, 1.0 = opaque).
-// This property DOES inherit through the MetaProp chain ("always" inheritance).
-inline void readRenderAlpha(FileGroupPtr &db,
-                             std::unordered_map<int32_t, float> &alphaMap) {
-    const char *alphaChunk = "P$RenderAlp";
-
-    if (!db->hasFile(alphaChunk)) return;
-
-    FilePtr af = db->getFile(alphaChunk);
-
-    while (static_cast<size_t>(af->tell()) + 8 <= af->size()) {
-        uint32_t objID, dataSize;
-        *af >> objID >> dataSize;
-
-        if (dataSize >= 4) {
-            float alpha;
-            *af >> alpha;
-
-            // Skip remaining bytes if dataSize > 4
-            if (dataSize > 4) {
-                af->seek(static_cast<file_offset_t>(dataSize - 4),
-                         File::FSEEK_CUR);
-            }
-
-            // Clamp to valid range
-            if (alpha < 0.0f) alpha = 0.0f;
-            if (alpha > 1.0f) alpha = 1.0f;
-
-            int32_t signedID = static_cast<int32_t>(objID);
-            alphaMap[signedID] = alpha;
-        } else if (dataSize > 0) {
-            af->seek(static_cast<file_offset_t>(dataSize),
-                     File::FSEEK_CUR);
-        }
-    }
-}
-
-// Walk the MetaProp inheritance chain to resolve an object's render alpha.
-// Returns 1.0 (fully opaque) if no RenderAlpha property found in the chain.
-// Unlike P$Scale, RenderAlpha DOES inherit ("always" inheritance mode).
-inline float resolveRenderAlpha(
-    int32_t objID,
-    const std::unordered_map<int32_t, float> &alphaMap,
-    const std::unordered_map<int32_t, int32_t> &parentMap)
-{
-    // Check direct assignment first
-    auto it = alphaMap.find(objID);
-    if (it != alphaMap.end()) return it->second;
-
-    // Walk the inheritance chain (max depth to prevent infinite loops)
-    int32_t current = objID;
-    for (int depth = 0; depth < 32; ++depth) {
-        auto pit = parentMap.find(current);
-        if (pit == parentMap.end()) break;
-
-        current = pit->second;
-        auto ait = alphaMap.find(current);
-        if (ait != alphaMap.end()) return ait->second;
-    }
-
-    // Default: fully opaque
-    return 1.0f;
-}
-
-// Look up an object's scale directly (no inheritance).
-// Dark Engine's P$Scale property is created with kPropertyNoInherit
-// (see SCALPROP.CPP), so archetype scales are NOT inherited by concrete
-// objects. Archetype P$Scale values are often physics bounding box dimensions,
-// not visual model scales — inheriting them causes massive distortion.
-// Returns {1,1,1} if the object has no direct P$Scale record.
-inline std::array<float,3> resolveScale(
-    int32_t objID,
-    const std::unordered_map<int32_t, std::array<float,3>> &scaleMap)
-{
-    auto it = scaleMap.find(objID);
-    if (it != scaleMap.end()) return it->second;
-
-    return {1.0f, 1.0f, 1.0f};
-}
-
-// Walk the MetaProp inheritance chain to find the model name for an object.
-// Returns empty string if no model found in the chain.
-inline std::string resolveModelName(
-    int32_t objID,
-    const std::unordered_map<int32_t, std::string> &modelMap,
-    const std::unordered_map<int32_t, int32_t> &parentMap)
-{
-    // Check direct assignment first
-    auto it = modelMap.find(objID);
-    if (it != modelMap.end()) return it->second;
-
-    // Walk the inheritance chain (max depth to prevent infinite loops)
-    int32_t current = objID;
-    for (int depth = 0; depth < 32; ++depth) {
-        auto pit = parentMap.find(current);
-        if (pit == parentMap.end()) break;
-
-        current = pit->second;
-        auto mit = modelMap.find(current);
-        if (mit != modelMap.end()) return mit->second;
-    }
-
-    return {};
-}
-
-// Read the GAM_FILE path from a .mis file group
-inline std::string readGamFilePath(FileGroupPtr &db) {
-    if (!db->hasFile("GAM_FILE")) return {};
-
-    FilePtr gf = db->getFile("GAM_FILE");
-    size_t sz = gf->size();
-    std::string path(sz, '\0');
-    gf->read(&path[0], sz);
-    // Trim trailing nulls
-    while (!path.empty() && path.back() == '\0')
-        path.pop_back();
-    return path;
-}
-
 } // namespace detail
 
-// Parse object placement data from a .mis file.
+// Parse object placement data from a .mis file using PropertyService for
+// property resolution (ModelName, RenderType, Scale, RenderAlpha) with
+// proper inheritance via the Inheritor system.
 //
-// Algorithm:
-// 1. Open the .mis file, read GAM_FILE path, open the .gam file
-// 2. Read P$ModelName from both .gam (archetypes) and .mis (overrides)
-// 3. Read L$MetaProp links from both files (inheritance chain)
-// 4. Read P$Position from .mis (concrete object positions)
-// 5. For each concrete object with a position, resolve its model name
-//    by walking the MetaProp inheritance chain
-// 6. Collect unique model names for batch loading
+// PropertyService must have all properties loaded (GameService::load()
+// handles the recursive .gam + .mis database loading).
 //
-// gamPath: explicit path to .gam file, or empty to auto-detect from GAM_FILE chunk
-inline ObjectPropData parseObjectProps(const std::string &misPath,
-                                        const std::string &gamPath = {}) {
+// P$Position is still read directly from the .mis file because the built-in
+// PositionPropertyStorage stores a different in-memory format (32-byte
+// sPositionProp with Quaternion) than the on-disk format (22-byte
+// PropPosition with int16 binary-radian angles). The renderer needs the
+// raw int16 angles for its rotation matrix builder.
+//
+// BRLIST is also read directly — it's a non-property chunk.
+inline ObjectPropData parseObjectProps(PropertyService *propSvc,
+                                        const std::string &misPath) {
     ObjectPropData result;
 
-    // Combined maps from both .gam and .mis
-    std::unordered_map<int32_t, std::string> modelMap;
-    std::unordered_map<int32_t, int32_t> parentMap;
-    std::unordered_map<int32_t, uint32_t> renderTypeMap;
-    std::unordered_map<int32_t, std::array<float,3>> scaleMap;
-    std::unordered_map<int32_t, float> alphaMap;  // P$RenderAlp: per-object transparency
-    std::unordered_set<int32_t> brushObjIDs;  // object IDs from BRLIST (editor brushes)
-
-    // ── Load .gam file (archetype definitions) ──
+    // Open .mis file for P$Position and BRLIST (still needed for direct reads)
     FilePtr misFp(new StdFile(misPath, File::FILE_R));
     FileGroupPtr misDb(new DarkFileGroup(misFp));
 
-    // Determine .gam path: use explicit path, or read from GAM_FILE chunk
-    std::string resolvedGamPath = gamPath;
-    if (resolvedGamPath.empty()) {
-        std::string gamRef = detail::readGamFilePath(misDb);
-        if (!gamRef.empty()) {
-            // GAM_FILE path is relative to the .mis file's directory
-            // (or sometimes just a filename like "dark.gam")
-            std::string misDir;
-            size_t lastSlash = misPath.find_last_of("/\\");
-            if (lastSlash != std::string::npos) {
-                misDir = misPath.substr(0, lastSlash + 1);
-            }
-            resolvedGamPath = misDir + gamRef;
-            std::fprintf(stderr, "ObjectPropParser: GAM_FILE -> %s\n",
-                         resolvedGamPath.c_str());
-        }
-    }
-
-    if (!resolvedGamPath.empty()) {
-        try {
-            FilePtr gamFp(new StdFile(resolvedGamPath, File::FILE_R));
-            FileGroupPtr gamDb(new DarkFileGroup(gamFp));
-
-            detail::readModelNames(gamDb, modelMap);
-            detail::readMetaPropLinks(gamDb, parentMap);
-            detail::readRenderTypes(gamDb, renderTypeMap);
-            detail::readScales(gamDb, scaleMap);
-            detail::readRenderAlpha(gamDb, alphaMap);
-
-            std::fprintf(stderr, "ObjectPropParser: loaded %zu archetype models, "
-                         "%zu parent links, %zu render types, %zu scales, "
-                         "%zu alphas from .gam\n",
-                         modelMap.size(), parentMap.size(), renderTypeMap.size(),
-                         scaleMap.size(), alphaMap.size());
-        } catch (const std::exception &e) {
-            std::fprintf(stderr, "ObjectPropParser: failed to load .gam (%s): %s\n",
-                         resolvedGamPath.c_str(), e.what());
-        }
-    }
-
-    // ── Load .mis file (concrete objects + overrides) ──
-    size_t prevModels = modelMap.size();
-    size_t prevLinks = parentMap.size();
-
-    detail::readModelNames(misDb, modelMap);
-    detail::readMetaPropLinks(misDb, parentMap);
-    size_t prevRT = renderTypeMap.size();
-    detail::readRenderTypes(misDb, renderTypeMap);
-    size_t prevScales = scaleMap.size();
-    detail::readScales(misDb, scaleMap);
-    size_t prevAlphas = alphaMap.size();
-    detail::readRenderAlpha(misDb, alphaMap);
-
     // Read BRLIST to identify editor brush objects (room/terrain/flow brushes)
     // that should not be rendered as standalone objects
+    std::unordered_set<int32_t> brushObjIDs;
     detail::readBrushObjectIDs(misDb, brushObjIDs);
 
-    std::fprintf(stderr, "ObjectPropParser: +%zu models, +%zu links, +%zu render types, "
-                 "+%zu scales, +%zu alphas from .mis\n",
-                 modelMap.size() - prevModels, parentMap.size() - prevLinks,
-                 renderTypeMap.size() - prevRT, scaleMap.size() - prevScales,
-                 alphaMap.size() - prevAlphas);
-
     // ── Read positions from P$Position ──
+    // Read directly from file because PositionPropertyStorage uses a different
+    // in-memory format (Quaternion) than the on-disk format (int16 angles).
     const char *posChunk = "P$Position";
-
     std::unordered_map<int32_t, ObjectPlacement> posMap;
 
     if (misDb->hasFile(posChunk)) {
@@ -541,7 +195,6 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
                 *posFile >> cell;
 
                 // On-disk order: bank, pitch, heading (= angvec tx, ty, tz)
-                // DarkDBPropPosition.facing is SCoord {x,y,z} = {tx,ty,tz}
                 // where tx=bank(X-rot), ty=pitch(Y-rot), tz=heading(Z-rot)
                 int16_t bank, pitch, heading;
                 *posFile >> bank >> pitch >> heading;
@@ -574,7 +227,7 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
     std::fprintf(stderr, "ObjectPropParser: %zu concrete objects with positions\n",
                  posMap.size());
 
-    // ── Merge: resolve model names via inheritance for each positioned object ──
+    // ── Merge: resolve properties via PropertyService for each positioned object ──
     std::unordered_set<std::string> uniqueSet;
     int resolved = 0, unresolved = 0, filtered = 0;
 
@@ -583,11 +236,14 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
         const ObjectPlacement &pos = kv.second;
 
         // Check render type — skip non-renderable objects (lights, markers, etc.)
+        // Inheritance is resolved by PropertyService's Inheritor system.
         // 0=Normal, 1=NotRendered, 2=NoLightmap, 3=EditorOnly
-        uint32_t rt = detail::resolveRenderType(id, renderTypeMap, parentMap);
-        if (rt == 1 || rt == 3) {
-            ++filtered;
-            continue;
+        PropRenderType rt;
+        if (getTypedProperty<PropRenderType>(propSvc, "RenderType", id, rt)) {
+            if (rt.mode == 1 || rt.mode == 3) {
+                ++filtered;
+                continue;
+            }
         }
 
         // Skip editor brush objects (from BRLIST) — room brushes, terrain brushes,
@@ -598,27 +254,52 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
             continue;
         }
 
-        // Resolve model name through inheritance chain
-        std::string name = detail::resolveModelName(id, modelMap, parentMap);
-
-        if (name.empty()) {
+        // Resolve model name through PropertyService inheritance chain.
+        // The Inheritor walks archetype + MetaProp links automatically.
+        PropModelName mn;
+        if (!getTypedProperty<PropModelName>(propSvc, "ModelName", id, mn)) {
             ++unresolved;
             continue;
         }
+
+        // Lowercase for consistent CRF lookups
+        std::string name(mn.name);
+        if (name.empty() || name[0] == '\0') {
+            ++unresolved;
+            continue;
+        }
+        // Ensure null-termination for names that fill all 16 bytes
+        name.resize(std::strlen(mn.name));
+        std::transform(name.begin(), name.end(), name.begin(), ::tolower);
 
         ObjectPlacement placement = pos;
         std::strncpy(placement.modelName, name.c_str(),
                      sizeof(placement.modelName) - 1);
         placement.modelName[15] = '\0';
 
-        // Look up scale directly on this object (P$Scale does not inherit)
-        auto scale = detail::resolveScale(id, scaleMap);
-        placement.scaleX = scale[0];
-        placement.scaleY = scale[1];
-        placement.scaleZ = scale[2];
+        // Look up scale directly on this object (P$Scale does not inherit).
+        // Dark Engine's P$Scale property uses kPropertyNoInherit — archetype
+        // scales are physics bounding box dimensions, not visual model scales.
+        // We use ownsProperty() to check direct ownership only.
+        placement.scaleX = 1.0f;
+        placement.scaleY = 1.0f;
+        placement.scaleZ = 1.0f;
+        if (ownsProperty(propSvc, "ModelScale", id)) {
+            PropScale scale;
+            if (getTypedProperty<PropScale>(propSvc, "ModelScale", id, scale)) {
+                placement.scaleX = scale.x;
+                placement.scaleY = scale.y;
+                placement.scaleZ = scale.z;
+            }
+        }
 
-        // Resolve render alpha through inheritance (RenderAlpha inherits)
-        placement.renderAlpha = detail::resolveRenderAlpha(id, alphaMap, parentMap);
+        // Resolve render alpha through PropertyService inheritance.
+        // RenderAlpha DOES inherit ("always" inheritance mode).
+        PropRenderAlpha alpha;
+        if (getTypedProperty<PropRenderAlpha>(propSvc, "RenderAlpha", id, alpha)) {
+            // Clamp to valid range
+            placement.renderAlpha = std::max(0.0f, std::min(1.0f, alpha.alpha));
+        }
 
         result.objects.push_back(placement);
         uniqueSet.insert(name);

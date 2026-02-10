@@ -94,7 +94,8 @@ Loads a `.mis` + `.gam` database and dumps chunk inventory, object hierarchy, pr
 * TomNHarris (telliamed) - for the all the work he has done understanding the Dark Engine and its data formats. Also for the irreplaceable help in the past.
 * ShadowSpawn - For the BIN mesh format and Movement database format descriptions.
 * ataricom - For helping out with the (now defunct) sourceforge Wiki
-* TTLG community
+* The wonderfully obsessive TTLG community
+* Conor Armstrong (SilentSleep) for Equilibrium, our test fixture (and great FM!)
 * ...and others not mentioned
 
 # Disclaimer

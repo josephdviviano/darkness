@@ -53,6 +53,31 @@
 #include "BinMeshParser.h"
 #include "RenderConfig.h"
 
+// Logging (must be initialized before ServiceManager)
+#include "logger.h"
+#include "stdlog.h"
+#include "ConsoleBackend.h"
+
+// Service stack for typed property access
+#include "DarknessServiceManager.h"
+#include "config/ConfigService.h"
+#include "database/DatabaseService.h"
+#include "game/GameService.h"
+#include "inherit/InheritService.h"
+#include "link/LinkService.h"
+#include "link/Relation.h"
+#include "loop/LoopService.h"
+#include "object/ObjectService.h"
+#include "platform/PlatformService.h"
+#include "property/PropertyService.h"
+#include "room/RoomService.h"
+#include "sim/SimService.h"
+#include "physics/PhysicsService.h"
+#include "RawDataStorage.h"
+#include "PLDefParser.h"
+#include "DTypeSizeParser.h"
+#include "SingleFieldDataStorage.h"
+
 // TODO: Make these configurable via command-line or config file
 static const int WINDOW_WIDTH  = 1280;
 static const int WINDOW_HEIGHT = 720;
@@ -177,6 +202,113 @@ int main(int argc, char *argv[]) {
     float waterScrollSpeed = cfg.waterScrollSpeed;
 
     bool texturedMode = !resPath.empty();
+
+    // ── Initialize logging (required before ServiceManager) ──
+    Darkness::Logger logger;
+    Darkness::StdLog stdlog;
+    logger.setLogLevel(Darkness::Logger::LOG_LEVEL_FATAL);
+    Darkness::ConsoleBackend console;
+
+    // ── Initialize service stack for typed property access ──
+    // PropertyService provides property inheritance resolution (ModelName,
+    // RenderType, Scale, RenderAlpha) via the Inheritor system, replacing
+    // the ad-hoc MetaProp chain walking in the old ObjectPropParser.
+    {
+        auto *svcMgr = new Darkness::ServiceManager(SERVICE_ALL);
+
+        svcMgr->registerFactory<Darkness::PlatformServiceFactory>();
+        svcMgr->registerFactory<Darkness::ConfigServiceFactory>();
+        svcMgr->registerFactory<Darkness::DatabaseServiceFactory>();
+        svcMgr->registerFactory<Darkness::GameServiceFactory>();
+        svcMgr->registerFactory<Darkness::InheritServiceFactory>();
+        svcMgr->registerFactory<Darkness::LinkServiceFactory>();
+        svcMgr->registerFactory<Darkness::LoopServiceFactory>();
+        svcMgr->registerFactory<Darkness::ObjectServiceFactory>();
+        svcMgr->registerFactory<Darkness::PropertyServiceFactory>();
+        svcMgr->registerFactory<Darkness::RoomServiceFactory>();
+        svcMgr->registerFactory<Darkness::SimServiceFactory>();
+        svcMgr->registerFactory<Darkness::PhysicsServiceFactory>();
+
+        svcMgr->bootstrapFinished();
+    }
+
+    // Load schema definitions (property types, link relations)
+    std::string scriptsDir = "scripts/thief2";
+    {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        Darkness::LinkServicePtr linkSvc = GET_SERVICE(Darkness::LinkService);
+
+        Darkness::PLDefResult propDefs = Darkness::parsePLDef(scriptsDir + "/t2-props.pldef");
+        Darkness::PLDefResult linkDefs = Darkness::parsePLDef(scriptsDir + "/t2-links.pldef");
+        auto dtypeSizes = Darkness::parseDTypeSizes(scriptsDir + "/t2-types.dtype");
+
+        int propCount = 0;
+        for (const auto &pd : propDefs.properties) {
+            if (propSvc->getProperty(pd.name))
+                continue;
+            Darkness::DataStoragePtr storage;
+            if (pd.isVarStr) {
+                storage = Darkness::DataStoragePtr(new Darkness::StringDataStorage());
+            } else {
+                storage = Darkness::DataStoragePtr(new Darkness::RawDataStorage());
+            }
+            Darkness::Property *prop = propSvc->createProperty(
+                pd.name, pd.name, pd.inheritor, storage);
+            if (prop) {
+                prop->setChunkVersions(pd.verMaj, pd.verMin);
+                ++propCount;
+            }
+        }
+
+        int relCount = 0;
+        for (const auto &rd : linkDefs.relations) {
+            if (linkSvc->getRelation(rd.name))
+                continue;
+            Darkness::DataStoragePtr storage;
+            if (!rd.noData) {
+                auto it = dtypeSizes.find(rd.name);
+                size_t dataSize = (it != dtypeSizes.end()) ? it->second : 0;
+                storage = Darkness::DataStoragePtr(new Darkness::RawDataStorage(dataSize));
+            }
+            Darkness::RelationPtr rel = linkSvc->createRelation(rd.name, storage, rd.hidden);
+            if (rel) {
+                rel->setChunkVersions(rd.lVerMaj, rd.lVerMin,
+                                      rd.dVerMaj, rd.dVerMin);
+                if (rd.fakeSize >= 0)
+                    rel->setFakeSize(rd.fakeSize);
+                ++relCount;
+            }
+        }
+
+        // Register rendering properties that are commented out in t2-props.pldef
+        // (normally created by RenderService, which the standalone viewer doesn't use).
+        // These must exist before database loading so their P$ chunks get read.
+        auto registerRawProp = [&](const char *name, const char *chunk,
+                                   const char *inheritor) {
+            if (!propSvc->getProperty(name)) {
+                propSvc->createProperty(name, chunk, inheritor,
+                    Darkness::DataStoragePtr(new Darkness::RawDataStorage()));
+                ++propCount;
+            }
+        };
+        registerRawProp("ModelName",   "ModelName", "always");
+        registerRawProp("RenderType",  "RenderTyp", "always");
+        registerRawProp("RenderAlpha", "RenderAlp", "always");
+        // Scale uses "never" inheritor — kPropertyNoInherit in the original engine.
+        // Archetype scales are physics bounding boxes, not visual model scales.
+        registerRawProp("ModelScale",  "Scale",     "never");
+
+        std::fprintf(stderr, "Schema: registered %d properties, %d relations\n",
+                     propCount, relCount);
+    }
+
+    // Load the mission database (.gam + .mis) via service stack.
+    // GameService::load() recursively loads the parent .gam first, then the .mis.
+    // This populates PropertyService with all P$ data and LinkService with all L$ data.
+    {
+        Darkness::GameServicePtr gameSvc = GET_SERVICE(Darkness::GameService);
+        gameSvc->load(misPath);
+    }
 
     // Extract mission base name (e.g. "miss6" from "path/to/miss6.mis")
     // for constructing skybox texture filenames like "skyhw/miss6n.PCX"
@@ -452,7 +584,8 @@ int main(int argc, char *argv[]) {
     Darkness::ObjectPropData objData;
     if (showObjects) {
         try {
-            objData = Darkness::parseObjectProps(misPath);
+            Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+            objData = Darkness::parseObjectProps(propSvc.get(), misPath);
         } catch (const std::exception &e) {
             std::fprintf(stderr, "Failed to parse object props: %s\n", e.what());
             showObjects = false;
