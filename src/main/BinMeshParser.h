@@ -57,6 +57,8 @@ struct BinMatInfo {
     char name[16];
     uint8_t type;      // MD_MAT_TMAP (0) or MD_MAT_COLOR (1)
     uint8_t colour[4]; // BGRA colour for MD_MAT_COLOR materials
+    float trans;       // per-material translucency (0.0=opaque, >0=translucent)
+    float illum;       // self-illumination (0.0=none, 1.0=full)
 };
 
 // Per-material submesh range within the index buffer
@@ -165,13 +167,19 @@ private:
 
         // Read materials
         readMaterials();
-        for (const auto &mat : mMaterials) {
+        for (size_t i = 0; i < mMaterials.size(); ++i) {
+            const auto &mat = mMaterials[i];
             BinMatInfo info = {};
             std::memcpy(info.name, mat.name, 16);
             info.name[15] = '\0';
             info.type = mat.type;
             if (mat.type == MD_MAT_COLOR) {
                 std::memcpy(info.colour, mat.colour, 4);
+            }
+            // Copy auxiliary material data (transparency, illumination)
+            if (i < mMaterialsExtra.size()) {
+                info.trans = mMaterialsExtra[i].trans;
+                info.illum = mMaterialsExtra[i].illum;
             }
             result.materials.push_back(info);
         }
@@ -235,6 +243,40 @@ private:
         // Build slot -> material index mapping
         for (int i = 0; i < mHdr.num_mats; ++i) {
             mSlotToMat[mMaterials[i].slot_num] = i;
+        }
+
+        // Read auxiliary material data (transparency + illumination) for v4+ models
+        readMaterialsExtra();
+    }
+
+    // Read per-material transparency and illumination from mat_extra section.
+    // Only present in version 4+ models with mat_flags & MD_MAT_TRANS.
+    // Each record is {float trans, float illum} (8 bytes minimum).
+    void readMaterialsExtra() {
+        mMaterialsExtra.resize(mHdr.num_mats);
+        for (auto &mext : mMaterialsExtra) {
+            mext.trans = 0.0f;
+            mext.illum = 0.0f;
+        }
+
+        if (mVersion < 4) return;
+        if (!(mHdr.mat_flags & MD_MAT_TRANS)) return;
+        if (mHdr.offset_mat_extra <= 0 || mHdr.size_mat_extra < 8) return;
+
+        uint32_t extraOffset = static_cast<uint32_t>(mHdr.offset_mat_extra);
+        if (extraOffset >= mFileSize) return;
+
+        mFile->seek(extraOffset);
+
+        // Bytes to skip per record beyond the 8-byte {trans, illum} we read
+        int skipBytes = mHdr.size_mat_extra - 8;
+        if (skipBytes < 0) skipBytes = 0;
+
+        for (auto &mext : mMaterialsExtra) {
+            *mFile >> mext.trans >> mext.illum;
+            if (skipBytes > 0) {
+                mFile->seek(static_cast<file_offset_t>(skipBytes), File::FSEEK_CUR);
+            }
         }
     }
 
@@ -464,6 +506,7 @@ private:
     int mCurrentSubObj = 0;
 
     std::vector<MeshMaterial> mMaterials;
+    std::vector<MeshMaterialExtra> mMaterialsExtra;  // per-material trans + illum
     std::map<int, int> mSlotToMat; // slot_num -> material index
     std::vector<UVMap> mUVs;
     std::vector<Vertex> mVertices;
