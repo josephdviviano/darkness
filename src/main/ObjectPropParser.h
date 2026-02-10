@@ -197,6 +197,77 @@ inline uint32_t resolveRenderType(
     return 0;
 }
 
+// Read the BRLIST chunk to find object IDs associated with editor brushes.
+// BRLIST records are 76 bytes base (pack(2)), with variable face data for terrain.
+// The 'primal' field (int32 at offset 4) is the brush's associated object ID.
+// The 'type' field (int8 at offset 10) identifies the brush kind:
+//   0=SOLID(terrain), 1=AIR, 2=WATER, -1(0xFF)=LIGHT, -4(0xFC)=FLOW, -5(0xFB)=ROOM
+// All brush objects are editor constructs — not rendered as standalone objects.
+// (Terrain brushes are already baked into the worldmesh WR chunk.)
+inline void readBrushObjectIDs(FileGroupPtr &db,
+                                std::unordered_set<int32_t> &brushObjIDs) {
+    const char *brChunk = "BRLIST";
+    if (!db->hasFile(brChunk)) return;
+
+    FilePtr file = db->getFile(brChunk);
+    const size_t baseSize = 76;  // fixed part of each brush record (pack(2))
+
+    int count = 0;
+    while (static_cast<size_t>(file->tell()) + baseSize <= file->size()) {
+        // Read the fixed 76-byte brush header
+        uint16_t id, time;
+        int32_t primal;
+        int16_t base;
+        int8_t type;
+
+        *file >> id >> time;
+        *file >> primal;
+        *file >> base >> type;
+
+        // Skip remaining fixed fields (bytes 11..75 = 65 bytes)
+        // offset 11: 1 byte padding + 12 float pos + 12 float size + 6 int16 rot
+        //            + 2 int16 cur_face + 4 float snap + 18 unknown + 1 snap_grid
+        //            + 1 num_faces + 1 edge + 1 vertex + 1 flags + 1 group + 4 unknown
+        uint8_t padding;
+        *file >> padding;  // alignment byte at offset 11
+
+        float posX, posY, posZ, sizeX, sizeY, sizeZ;
+        *file >> posX >> posY >> posZ >> sizeX >> sizeY >> sizeZ;
+
+        int16_t rotX, rotY, rotZ, curFace;
+        *file >> rotX >> rotY >> rotZ >> curFace;
+
+        float snapSize;
+        *file >> snapSize;
+
+        // Skip 18 unknown bytes
+        file->seek(static_cast<file_offset_t>(18), File::FSEEK_CUR);
+
+        uint8_t snapGrid, numFaces, edge, vertex, flags, group;
+        *file >> snapGrid >> numFaces >> edge >> vertex >> flags >> group;
+
+        uint32_t unknown5;
+        *file >> unknown5;
+
+        // For terrain brushes (type 0), skip the per-face texture data
+        if (type == 0 && numFaces > 0) {
+            file->seek(static_cast<file_offset_t>(numFaces * 10),
+                       File::FSEEK_CUR);
+        }
+
+        // The primal field is the object ID associated with this brush
+        if (primal > 0) {
+            brushObjIDs.insert(primal);
+        }
+        ++count;
+    }
+
+    if (count > 0) {
+        std::fprintf(stderr, "BRLIST: %d brushes, %zu unique object IDs\n",
+                     count, brushObjIDs.size());
+    }
+}
+
 // Read all P$Scale records from a file group into a map.
 // Records: {uint32_t objID, uint32_t dataSize=12, float sx, float sy, float sz}
 // P$Scale stores the ModelScale as a Vector3.
@@ -309,6 +380,7 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
     std::unordered_map<int32_t, int32_t> parentMap;
     std::unordered_map<int32_t, uint32_t> renderTypeMap;
     std::unordered_map<int32_t, std::array<float,3>> scaleMap;
+    std::unordered_set<int32_t> brushObjIDs;  // object IDs from BRLIST (editor brushes)
 
     // ── Load .gam file (archetype definitions) ──
     FilePtr misFp(new StdFile(misPath, File::FILE_R));
@@ -362,6 +434,10 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
     detail::readRenderTypes(misDb, renderTypeMap);
     size_t prevScales = scaleMap.size();
     detail::readScales(misDb, scaleMap);
+
+    // Read BRLIST to identify editor brush objects (room/terrain/flow brushes)
+    // that should not be rendered as standalone objects
+    detail::readBrushObjectIDs(misDb, brushObjIDs);
 
     std::fprintf(stderr, "ObjectPropParser: +%zu models, +%zu links, +%zu render types, "
                  "+%zu scales from .mis\n",
@@ -436,6 +512,14 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
         // 0=Normal, 1=NotRendered, 2=NoLightmap, 3=EditorOnly
         uint32_t rt = detail::resolveRenderType(id, renderTypeMap, parentMap);
         if (rt == 1 || rt == 3) {
+            ++filtered;
+            continue;
+        }
+
+        // Skip editor brush objects (from BRLIST) — room brushes, terrain brushes,
+        // flow brushes, etc. are architectural geometry already baked into the
+        // worldmesh or used for room/sound definitions, not standalone objects
+        if (brushObjIDs.count(id)) {
             ++filtered;
             continue;
         }

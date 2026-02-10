@@ -682,8 +682,9 @@ struct FlowData {
     bool hasCellMotion = false;  // true if CELL_MOTION chunk was found
 };
 
-// ── Build water surface mesh from portal polygons ──
-// Water portals live at indices [numSolid..numPolygons) with flags != 0.
+// Water portals are portal polygons with the 0x10 flag that connect air cells
+// (mediaType 1) to water cells (mediaType 2). Portals with 0x10 between air
+// cells are room brush zone boundaries and should not be rendered as water.
 // Only emit from air cells (mediaType==1) to avoid double-rendering — the
 // same portal polygon exists in both the air and water cell.
 // Texture source priority:
@@ -721,8 +722,13 @@ static WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
             const auto &poly = cell.polygons[pi];
             const auto &indices = cell.polyIndices[pi];
             if (poly.count < 3) continue;
-            // Water portal: flags != 0 (non-water portals have flags == 0)
-            if (poly.flags == 0) continue;
+            // Water surface detection: portal polygon must have the water flag
+            // (bit 0x10) AND the target cell must be a water cell (mediaType 2).
+            // Portal polygons with 0x10 between air cells are room brush zone
+            // boundaries — invisible in the original engine, not water surfaces.
+            if (!(poly.flags & 0x10)) continue;
+            if (poly.tgtCell < wr.numCells &&
+                wr.cells[poly.tgtCell].mediaType != 2) continue;
 
             // Resolve flow group: water portals connect an air cell to a water cell.
             // The flowGroup is on the water cell (target), not the air cell (source).
@@ -2296,6 +2302,7 @@ int main(int argc, char *argv[]) {
     std::string resPath    = cli.resPath;
     int  lmScale           = cfg.lmScale;
     bool showObjects       = cfg.showObjects;
+    bool showFallbackCubes = cfg.showFallbackCubes;
     bool forceFlicker      = cfg.forceFlicker;
     bool portalCulling     = cfg.portalCulling;
     int  filterMode        = cfg.filterMode;
@@ -3185,7 +3192,41 @@ int main(int argc, char *argv[]) {
         }
         std::fprintf(stderr, "Object GPU buffers: %zu models + fallback cube\n",
                      objModelGPU.size());
+
     }
+
+    // ── Model isolation state for debugging ──
+    // Sorted list of model names that have loaded GPU data, with instance counts.
+    // Press N to cycle through, isolating one model at a time for identification.
+    std::vector<std::string> sortedModelNames;
+    std::unordered_map<std::string, int> modelInstanceCounts;
+    int isolateModelIdx = -1;  // -1 = show all, 0..N-1 = isolate that model
+
+    if (showObjects) {
+        // Count instances per model name
+        for (const auto &obj : objData.objects) {
+            if (!obj.hasPosition) continue;
+            std::string mn(obj.modelName);
+            modelInstanceCounts[mn]++;
+        }
+
+        // Build sorted list of models that have GPU data (loaded successfully)
+        for (const auto &kv : objModelGPU) {
+            if (kv.second.valid)
+                sortedModelNames.push_back(kv.first);
+        }
+        std::sort(sortedModelNames.begin(), sortedModelNames.end());
+
+        // Count unloaded models (fallback cube candidates)
+        int unloadedCount = 0;
+        for (const auto &kv : modelInstanceCounts) {
+            if (objModelGPU.find(kv.first) == objModelGPU.end() || !objModelGPU[kv.first].valid)
+                ++unloadedCount;
+        }
+        std::fprintf(stderr, "Model isolation: %zu loaded, %d unloaded (M=next, N=prev)\n",
+                     sortedModelNames.size(), unloadedCount);
+    }
+
 
     // ── Create sky dome GPU buffers ──
     bgfx::VertexBufferHandle skyVBH = BGFX_INVALID_HANDLE;
@@ -3256,7 +3297,7 @@ int main(int argc, char *argv[]) {
     }
 
     std::fprintf(stderr, "Controls: WASD=move, mouse=look, Space/LShift=up/down, "
-                 "scroll=speed, C=toggle culling, Home=spawn, Esc=quit\n");
+                 "scroll=speed, C=culling, F=filter, N=isolate model, Home=spawn, Esc=quit\n");
 
     Camera cam;
     cam.init(spawnX, spawnY, spawnZ);
@@ -3274,17 +3315,30 @@ int main(int argc, char *argv[]) {
 
     // Helper to update window title with current speed, culling, and filter stats
     auto updateTitle = [&]() {
-        char title[256];
+        char title[512];
         const char *filterNames[] = { "point", "bilinear", "trilinear", "aniso" };
         const char *filterStr = filterNames[filterMode % 4];
+        
+        // Build model isolation suffix if active
+        char isoSuffix[128] = "";
+        if (isolateModelIdx >= 0 && isolateModelIdx < (int)sortedModelNames.size()) {
+            const auto &isoName = sortedModelNames[isolateModelIdx];
+            auto cit = modelInstanceCounts.find(isoName);
+            int cnt = (cit != modelInstanceCounts.end()) ? cit->second : 0;
+            std::snprintf(isoSuffix, sizeof(isoSuffix),
+                " [MODEL %d/%zu: %s x%d]",
+                isolateModelIdx + 1, sortedModelNames.size(),
+                isoName.c_str(), cnt);
+        }
+        
         if (portalCulling) {
             std::snprintf(title, sizeof(title),
-                "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s]",
-                modeStr, moveSpeed, cullVisibleCells, cullTotalCells, filterStr);
+                "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s]%s",
+                modeStr, moveSpeed, cullVisibleCells, cullTotalCells, filterStr, isoSuffix);
         } else {
             std::snprintf(title, sizeof(title),
-                "darkness — %s [speed: %.1f] [cull: OFF] [%s]",
-                modeStr, moveSpeed, filterStr);
+                "darkness — %s [speed: %.1f] [cull: OFF] [%s]%s",
+                modeStr, moveSpeed, filterStr, isoSuffix);
         }
         SDL_SetWindowTitle(window, title);
     };
@@ -3341,14 +3395,43 @@ int main(int argc, char *argv[]) {
                 std::fprintf(stderr, "Portal culling: %s\n",
                              portalCulling ? "ON" : "OFF");
             } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_f) {
-                // Cycle texture filtering: point → bilinear → trilinear → anisotropic
+                // Cycle texture filtering: point -> bilinear -> trilinear -> anisotropic
                 filterMode = (filterMode + 1) % 4;
                 const char *filterNames[] = {
                     "point (crispy)", "bilinear", "trilinear", "anisotropic"
                 };
                 std::fprintf(stderr, "Texture filtering: %s\n", filterNames[filterMode]);
+            } else if (ev.type == SDL_KEYDOWN &&
+                       (ev.key.keysym.sym == SDLK_m || ev.key.keysym.sym == SDLK_n)) {
+                // Model isolation: M = next model, N = previous model.
+                // Cycles through sorted model names, isolating one at a time.
+                // Past the last/first model returns to "show all" mode.
+                bool forward = (ev.key.keysym.sym == SDLK_m);
+                if (sortedModelNames.empty()) {
+                    std::fprintf(stderr, "No models loaded for isolation\n");
+                } else {
+                    if (forward) {
+                        isolateModelIdx++;
+                        if (isolateModelIdx >= static_cast<int>(sortedModelNames.size()))
+                            isolateModelIdx = -1;
+                    } else {
+                        isolateModelIdx--;
+                        if (isolateModelIdx < -1)
+                            isolateModelIdx = static_cast<int>(sortedModelNames.size()) - 1;
+                    }
+                    if (isolateModelIdx < 0) {
+                        std::fprintf(stderr, "Model isolation: OFF (showing all)\n");
+                    } else {
+                        const auto &isoName = sortedModelNames[isolateModelIdx];
+                        std::fprintf(stderr, "Isolating model [%d/%zu]: '%s' (%d instances)\n",
+                                     isolateModelIdx + 1, sortedModelNames.size(),
+                                     isoName.c_str(), modelInstanceCounts[isoName]);
+                    }
+                    updateTitle();
+                }
             }
         }
+
 
         // Keyboard movement
         const Uint8 *keys = SDL_GetKeyboardState(nullptr);
@@ -3661,6 +3744,13 @@ int main(int argc, char *argv[]) {
 
                 // Find the GPU model for this object's model name
                 std::string modelName(obj.modelName);
+
+                // Model isolation mode: skip objects that don't match the isolated model
+                if (isolateModelIdx >= 0 && isolateModelIdx < (int)sortedModelNames.size()) {
+                    if (modelName != sortedModelNames[isolateModelIdx])
+                        continue;
+                }
+
                 auto it = objModelGPU.find(modelName);
 
                 if (it != objModelGPU.end() && it->second.valid) {
@@ -3692,8 +3782,9 @@ int main(int argc, char *argv[]) {
                             bgfx::submit(1, flatProgram);
                         }
                     }
-                } else {
+                } else if (showFallbackCubes) {
                     // Fallback: small coloured cube for missing models
+                    // (disabled by default — enable with --show-fallback)
                     setFogOn();
                     bgfx::setTransform(objMtx);
                     bgfx::setVertexBuffer(0, fallbackCubeVBH);

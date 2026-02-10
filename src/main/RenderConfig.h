@@ -27,9 +27,10 @@ struct RenderConfig {
     float waterScrollSpeed = 0.05f;  // UV scroll speed in world units/s (0 = no drift)
 
     // -- developer --
-    bool showObjects   = true;   // render object meshes
-    bool portalCulling = true;   // portal/frustum culling
-    bool forceFlicker  = false;  // force all animated lights to flicker mode
+    bool showObjects      = true;   // render object meshes
+    bool showFallbackCubes = false; // show colored cubes for objects with missing models
+    bool portalCulling    = true;   // portal/frustum culling
+    bool forceFlicker     = false;  // force all animated lights to flicker mode
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -91,9 +92,10 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
 
         // developer section
         if (YAML::Node dev = root["developer"]) {
-            if (dev["show_objects"])   cfg.showObjects   = dev["show_objects"].as<bool>();
-            if (dev["portal_culling"]) cfg.portalCulling  = dev["portal_culling"].as<bool>();
-            if (dev["force_flicker"])  cfg.forceFlicker   = dev["force_flicker"].as<bool>();
+            if (dev["show_objects"])        cfg.showObjects      = dev["show_objects"].as<bool>();
+            if (dev["show_fallback_cubes"]) cfg.showFallbackCubes = dev["show_fallback_cubes"].as<bool>();
+            if (dev["portal_culling"])      cfg.portalCulling     = dev["portal_culling"].as<bool>();
+            if (dev["force_flicker"])       cfg.forceFlicker      = dev["force_flicker"].as<bool>();
         }
 
         std::fprintf(stderr, "Loaded config from %s\n", path.c_str());
@@ -123,6 +125,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             if (cfg.lmScale > 8) cfg.lmScale = 8;
         } else if (std::strcmp(argv[i], "--no-objects") == 0) {
             cfg.showObjects = false;
+        } else if (std::strcmp(argv[i], "--show-fallback") == 0) {
+            cfg.showFallbackCubes = true;
         } else if (std::strcmp(argv[i], "--no-cull") == 0) {
             cfg.portalCulling = false;
         } else if (std::strcmp(argv[i], "--filter") == 0) {

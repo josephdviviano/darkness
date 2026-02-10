@@ -46,9 +46,10 @@ TEST_CASE("RenderConfig defaults", "[config]") {
     CHECK(cfg.uvDistortion  == 0.015f);
     CHECK(cfg.waterRotation == 0.015f);
     CHECK(cfg.waterScrollSpeed == 0.05f);
-    CHECK(cfg.showObjects   == true);
-    CHECK(cfg.portalCulling == true);
-    CHECK(cfg.forceFlicker  == false);
+    CHECK(cfg.showObjects      == true);
+    CHECK(cfg.showFallbackCubes == false);
+    CHECK(cfg.portalCulling    == true);
+    CHECK(cfg.forceFlicker     == false);
 }
 
 TEST_CASE("YAML full load", "[config][yaml]") {
@@ -60,6 +61,7 @@ graphics:
   sharp_mips: true
 developer:
   show_objects: false
+  show_fallback_cubes: true
   portal_culling: false
   force_flicker: true
 )");
@@ -72,9 +74,10 @@ developer:
     CHECK(cfg.filterMode == 2);
     CHECK(cfg.linearMips == true);
     CHECK(cfg.sharpMips  == true);
-    CHECK(cfg.showObjects   == false);
-    CHECK(cfg.portalCulling == false);
-    CHECK(cfg.forceFlicker  == true);
+    CHECK(cfg.showObjects      == false);
+    CHECK(cfg.showFallbackCubes == true);
+    CHECK(cfg.portalCulling    == false);
+    CHECK(cfg.forceFlicker     == true);
 }
 
 TEST_CASE("YAML partial load — unset fields keep defaults", "[config][yaml]") {
@@ -131,20 +134,21 @@ TEST_CASE("CLI flags override defaults", "[config][cli]") {
         "darknessRender", "mission.mis",
         "--no-objects", "--no-cull", "--filter",
         "--lm-scale", "4", "--force-flicker",
-        "--linear-mips", "--sharp-mips"
+        "--linear-mips", "--sharp-mips", "--show-fallback"
     };
     auto argv = makeArgv(args);
     int argc = static_cast<int>(argv.size());
 
     Darkness::CliResult cli = Darkness::applyCliOverrides(argc, argv.data(), cfg);
 
-    CHECK(cfg.showObjects   == false);
-    CHECK(cfg.portalCulling == false);
-    CHECK(cfg.filterMode    == 1);
-    CHECK(cfg.lmScale       == 4);
-    CHECK(cfg.forceFlicker  == true);
-    CHECK(cfg.linearMips    == true);
-    CHECK(cfg.sharpMips     == true);
+    CHECK(cfg.showObjects      == false);
+    CHECK(cfg.showFallbackCubes == true);
+    CHECK(cfg.portalCulling    == false);
+    CHECK(cfg.filterMode       == 1);
+    CHECK(cfg.lmScale          == 4);
+    CHECK(cfg.forceFlicker     == true);
+    CHECK(cfg.linearMips       == true);
+    CHECK(cfg.sharpMips        == true);
     CHECK(cli.misPath != nullptr);
     CHECK(std::string(cli.misPath) == "mission.mis");
 }
