@@ -58,6 +58,7 @@ struct ObjectPlacement {
     int16_t pitch;
     int16_t bank;
     float scaleX, scaleY, scaleZ;  // from P$Scale (default 1,1,1)
+    float renderAlpha;   // from P$RenderAlp (0.0=invisible, 1.0=opaque, default 1.0)
     bool hasPosition;    // false if object had model name but no position
 };
 
@@ -302,6 +303,72 @@ inline void readScales(FileGroupPtr &db,
     }
 }
 
+// Read all P$RenderAlp records from a file group into a map.
+// Records: {uint32_t objID, uint32_t dataSize=4, float alpha}
+// RenderAlpha is the per-object transparency multiplier (0.0 = invisible, 1.0 = opaque).
+// This property DOES inherit through the MetaProp chain ("always" inheritance).
+inline void readRenderAlpha(FileGroupPtr &db,
+                             std::unordered_map<int32_t, float> &alphaMap) {
+    const char *alphaChunk = "P$RenderAlp";
+
+    if (!db->hasFile(alphaChunk)) return;
+
+    FilePtr af = db->getFile(alphaChunk);
+
+    while (static_cast<size_t>(af->tell()) + 8 <= af->size()) {
+        uint32_t objID, dataSize;
+        *af >> objID >> dataSize;
+
+        if (dataSize >= 4) {
+            float alpha;
+            *af >> alpha;
+
+            // Skip remaining bytes if dataSize > 4
+            if (dataSize > 4) {
+                af->seek(static_cast<file_offset_t>(dataSize - 4),
+                         File::FSEEK_CUR);
+            }
+
+            // Clamp to valid range
+            if (alpha < 0.0f) alpha = 0.0f;
+            if (alpha > 1.0f) alpha = 1.0f;
+
+            int32_t signedID = static_cast<int32_t>(objID);
+            alphaMap[signedID] = alpha;
+        } else if (dataSize > 0) {
+            af->seek(static_cast<file_offset_t>(dataSize),
+                     File::FSEEK_CUR);
+        }
+    }
+}
+
+// Walk the MetaProp inheritance chain to resolve an object's render alpha.
+// Returns 1.0 (fully opaque) if no RenderAlpha property found in the chain.
+// Unlike P$Scale, RenderAlpha DOES inherit ("always" inheritance mode).
+inline float resolveRenderAlpha(
+    int32_t objID,
+    const std::unordered_map<int32_t, float> &alphaMap,
+    const std::unordered_map<int32_t, int32_t> &parentMap)
+{
+    // Check direct assignment first
+    auto it = alphaMap.find(objID);
+    if (it != alphaMap.end()) return it->second;
+
+    // Walk the inheritance chain (max depth to prevent infinite loops)
+    int32_t current = objID;
+    for (int depth = 0; depth < 32; ++depth) {
+        auto pit = parentMap.find(current);
+        if (pit == parentMap.end()) break;
+
+        current = pit->second;
+        auto ait = alphaMap.find(current);
+        if (ait != alphaMap.end()) return ait->second;
+    }
+
+    // Default: fully opaque
+    return 1.0f;
+}
+
 // Look up an object's scale directly (no inheritance).
 // Dark Engine's P$Scale property is created with kPropertyNoInherit
 // (see SCALPROP.CPP), so archetype scales are NOT inherited by concrete
@@ -380,6 +447,7 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
     std::unordered_map<int32_t, int32_t> parentMap;
     std::unordered_map<int32_t, uint32_t> renderTypeMap;
     std::unordered_map<int32_t, std::array<float,3>> scaleMap;
+    std::unordered_map<int32_t, float> alphaMap;  // P$RenderAlp: per-object transparency
     std::unordered_set<int32_t> brushObjIDs;  // object IDs from BRLIST (editor brushes)
 
     // ── Load .gam file (archetype definitions) ──
@@ -413,11 +481,13 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
             detail::readMetaPropLinks(gamDb, parentMap);
             detail::readRenderTypes(gamDb, renderTypeMap);
             detail::readScales(gamDb, scaleMap);
+            detail::readRenderAlpha(gamDb, alphaMap);
 
             std::fprintf(stderr, "ObjectPropParser: loaded %zu archetype models, "
-                         "%zu parent links, %zu render types, %zu scales from .gam\n",
+                         "%zu parent links, %zu render types, %zu scales, "
+                         "%zu alphas from .gam\n",
                          modelMap.size(), parentMap.size(), renderTypeMap.size(),
-                         scaleMap.size());
+                         scaleMap.size(), alphaMap.size());
         } catch (const std::exception &e) {
             std::fprintf(stderr, "ObjectPropParser: failed to load .gam (%s): %s\n",
                          resolvedGamPath.c_str(), e.what());
@@ -434,15 +504,18 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
     detail::readRenderTypes(misDb, renderTypeMap);
     size_t prevScales = scaleMap.size();
     detail::readScales(misDb, scaleMap);
+    size_t prevAlphas = alphaMap.size();
+    detail::readRenderAlpha(misDb, alphaMap);
 
     // Read BRLIST to identify editor brush objects (room/terrain/flow brushes)
     // that should not be rendered as standalone objects
     detail::readBrushObjectIDs(misDb, brushObjIDs);
 
     std::fprintf(stderr, "ObjectPropParser: +%zu models, +%zu links, +%zu render types, "
-                 "+%zu scales from .mis\n",
+                 "+%zu scales, +%zu alphas from .mis\n",
                  modelMap.size() - prevModels, parentMap.size() - prevLinks,
-                 renderTypeMap.size() - prevRT, scaleMap.size() - prevScales);
+                 renderTypeMap.size() - prevRT, scaleMap.size() - prevScales,
+                 alphaMap.size() - prevAlphas);
 
     // ── Read positions from P$Position ──
     const char *posChunk = "P$Position";
@@ -484,6 +557,7 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
                 p.heading = heading;
                 p.pitch = pitch;
                 p.bank = bank;
+                p.renderAlpha = 1.0f;  // default opaque, resolved later
                 p.hasPosition = true;
                 posMap[signedID] = p;
             } else {
@@ -542,6 +616,9 @@ inline ObjectPropData parseObjectProps(const std::string &misPath,
         placement.scaleX = scale[0];
         placement.scaleY = scale[1];
         placement.scaleZ = scale[2];
+
+        // Resolve render alpha through inheritance (RenderAlpha inherits)
+        placement.renderAlpha = detail::resolveRenderAlpha(id, alphaMap, parentMap);
 
         result.objects.push_back(placement);
         uniqueSet.insert(name);
