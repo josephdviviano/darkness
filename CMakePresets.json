@@ -32,6 +32,36 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_CXX_STANDARD": "17"
       }
+    },
+    {
+      "name": "linux-x64",
+      "displayName": "Linux x64 (Debug)",
+      "inherits": "vcpkg",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_STANDARD": "17"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "windows-x64",
+      "displayName": "Windows x64 (Debug)",
+      "inherits": "vcpkg",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_STANDARD": "17"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     }
   ],
   "buildPresets": [
@@ -42,6 +72,14 @@
     {
       "name": "release",
       "configurePreset": "release"
+    },
+    {
+      "name": "linux-x64",
+      "configurePreset": "linux-x64"
+    },
+    {
+      "name": "windows-x64",
+      "configurePreset": "windows-x64"
     }
   ]
 }
