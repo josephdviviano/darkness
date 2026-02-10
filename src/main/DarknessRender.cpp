@@ -585,7 +585,8 @@ int main(int argc, char *argv[]) {
     if (showObjects) {
         try {
             Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
-            objData = Darkness::parseObjectProps(propSvc.get(), misPath);
+            objData = Darkness::parseObjectProps(propSvc.get(), misPath,
+                                                    cfg.debugObjects);
         } catch (const std::exception &e) {
             std::fprintf(stderr, "Failed to parse object props: %s\n", e.what());
             showObjects = false;
