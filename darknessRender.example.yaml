@@ -55,3 +55,7 @@ developer:
   # Force all animated lights to flicker mode (default: false)
   # Useful for debugging light animation
   force_flicker: false
+
+  # Camera collision with world geometry (default: false)
+  # Toggle at runtime with V key
+  camera_collision: false
