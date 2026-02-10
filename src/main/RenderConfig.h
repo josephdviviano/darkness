@@ -31,6 +31,7 @@ struct RenderConfig {
     bool showFallbackCubes = false; // show colored cubes for objects with missing models
     bool portalCulling    = true;   // portal/frustum culling
     bool forceFlicker     = false;  // force all animated lights to flicker mode
+    bool cameraCollision  = false;  // sphere collision against world geometry
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -96,6 +97,7 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             if (dev["show_fallback_cubes"]) cfg.showFallbackCubes = dev["show_fallback_cubes"].as<bool>();
             if (dev["portal_culling"])      cfg.portalCulling     = dev["portal_culling"].as<bool>();
             if (dev["force_flicker"])       cfg.forceFlicker      = dev["force_flicker"].as<bool>();
+            if (dev["camera_collision"])    cfg.cameraCollision   = dev["camera_collision"].as<bool>();
         }
 
         std::fprintf(stderr, "Loaded config from %s\n", path.c_str());
@@ -137,6 +139,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cfg.linearMips = true;
         } else if (std::strcmp(argv[i], "--sharp-mips") == 0) {
             cfg.sharpMips = true;
+        } else if (std::strcmp(argv[i], "--collision") == 0) {
+            cfg.cameraCollision = true;
         } else if (std::strcmp(argv[i], "--wave-amp") == 0 && i + 1 < argc) {
             cfg.waveAmplitude = static_cast<float>(std::atof(argv[++i]));
             if (cfg.waveAmplitude < 0.0f) cfg.waveAmplitude = 0.0f;

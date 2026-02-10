@@ -1423,6 +1423,117 @@ static uint8_t getCameraMediaType(const Darkness::WRParsedData &wr,
     return 1; // default: air
 }
 
+// ── Camera collision infrastructure ──
+
+// Camera sphere radius — matches Dark Engine PLAYER_RADIUS
+static constexpr float CAMERA_SPHERE_RADIUS = 1.2f;
+// Number of constraint-projection iterations for corner handling
+static constexpr int   COLLISION_ITERATIONS = 3;
+
+// Test if a point (assumed to lie on the polygon's plane) is inside a convex polygon.
+// Uses the winding/cross-product method: the point must be on the interior side of
+// every edge when traversed in order, relative to the polygon's plane normal.
+static bool pointInConvexPolygon(const Darkness::Vector3 &p,
+                                 const std::vector<Darkness::Vector3> &verts,
+                                 const std::vector<uint8_t> &indices,
+                                 const Darkness::Vector3 &normal) {
+    int n = static_cast<int>(indices.size());
+    if (n < 3) return false;
+
+    for (int i = 0; i < n; ++i) {
+        const auto &a = verts[indices[i]];
+        const auto &b = verts[indices[(i + 1) % n]];
+        Darkness::Vector3 edge = b - a;
+        Darkness::Vector3 toP  = p - a;
+        Darkness::Vector3 cross = edge.crossProduct(toP);
+        if (cross.dotProduct(normal) < 0.0f)
+            return false;
+    }
+    return true;
+}
+
+// Apply sphere collision against solid polygons in the camera's current cell.
+// Only checks the cell containing the camera center — within one convex cell,
+// all plane normals face inward so pushes always go the correct direction.
+// Uses polygon-level checks (not plane-level) to correctly handle planes that
+// are partially portal and partially solid wall.
+static void applyCameraCollision(
+    const Darkness::WRParsedData &wr,
+    float oldPos[3], float newPos[3])
+{
+    // Find the cell containing the camera center
+    int32_t cellIdx = findCameraCell(wr, newPos[0], newPos[1], newPos[2]);
+    if (cellIdx < 0) {
+        cellIdx = findCameraCell(wr, oldPos[0], oldPos[1], oldPos[2]);
+        if (cellIdx < 0)
+            return;  // Completely outside world
+    }
+
+    for (int iter = 0; iter < COLLISION_ITERATIONS; ++iter) {
+        const auto &cell = wr.cells[cellIdx];
+        int numSolid = cell.numPolygons - cell.numPortals;
+        bool corrected = false;
+
+        for (int pi = 0; pi < numSolid; ++pi) {
+            const auto &poly = cell.polygons[pi];
+            if (poly.count < 3) continue;
+
+            const auto &plane = cell.planes[poly.plane];
+            Darkness::Vector3 pos(newPos[0], newPos[1], newPos[2]);
+            float dist = plane.getDistance(pos);
+
+            // Cell planes face inward: positive = inside, negative = past the wall.
+            // Push whenever dist < radius (sphere penetrates the plane).
+            // Negative dist is fine — single-cell normals always push inward.
+            if (dist >= CAMERA_SPHERE_RADIUS)
+                continue;
+
+            // Project camera onto the polygon's plane to check if the
+            // penetration is through this specific polygon's surface area.
+            // Use negated normal for the winding test: WR polygon vertices
+            // are CCW when viewed from outside the cell (outward-facing for
+            // rendering), but cell plane normals face inward. Negate so the
+            // winding test matches the vertex order.
+            Darkness::Vector3 projected = pos - plane.normal * dist;
+            Darkness::Vector3 outNormal(
+                -plane.normal.x, -plane.normal.y, -plane.normal.z);
+
+            if (!pointInConvexPolygon(projected, cell.vertices,
+                                      cell.polyIndices[pi], outNormal))
+                continue;
+
+            // Push sphere along inward normal until it clears the wall
+            float push = CAMERA_SPHERE_RADIUS - dist;
+            newPos[0] += plane.normal.x * push;
+            newPos[1] += plane.normal.y * push;
+            newPos[2] += plane.normal.z * push;
+            corrected = true;
+        }
+
+        if (!corrected)
+            break;
+
+        // Push may have moved camera through a portal into an adjacent cell
+        int32_t newCell = findCameraCell(wr, newPos[0], newPos[1], newPos[2]);
+        if (newCell >= 0) {
+            cellIdx = newCell;
+        } else {
+            // Pushed outside all cells — revert
+            newPos[0] = oldPos[0];
+            newPos[1] = oldPos[1];
+            newPos[2] = oldPos[2];
+            return;
+        }
+    }
+
+    // Final validation
+    if (findCameraCell(wr, newPos[0], newPos[1], newPos[2]) < 0) {
+        newPos[0] = oldPos[0];
+        newPos[1] = oldPos[1];
+        newPos[2] = oldPos[2];
+    }
+}
+
 // ── Portal culling infrastructure ──
 
 // Portal connectivity info for BFS traversal
@@ -2223,6 +2334,7 @@ static void printHelp() {
         "                 interpolation. Higher values use more atlas memory.\n"
         "  --no-objects   Disable object mesh rendering (world geometry only).\n"
         "  --no-cull      Start with portal culling disabled (see all geometry).\n"
+        "  --collision    Start with camera collision enabled (clip to world).\n"
         "  --filter       Start with bilinear texture filtering (default: point/crispy).\n"
         "  --force-flicker Force all animated lights to flicker mode (debug).\n"
         "  --linear-mips  Gamma-correct mipmap generation (sRGB linearization).\n"
@@ -2239,6 +2351,8 @@ static void printHelp() {
         "  Scroll wheel   Adjust movement speed (shown in title bar)\n"
         "  C              Toggle portal culling on/off\n"
         "  F              Cycle texture filtering (point/bilinear/trilinear/aniso)\n"
+        "  V              Toggle camera collision (clip/noclip)\n"
+        "  M/N            Cycle model isolation (next/prev)\n"
         "  Home           Teleport to player spawn point\n"
         "  Esc            Quit\n"
         "\n"
@@ -2305,6 +2419,7 @@ int main(int argc, char *argv[]) {
     bool showFallbackCubes = cfg.showFallbackCubes;
     bool forceFlicker      = cfg.forceFlicker;
     bool portalCulling     = cfg.portalCulling;
+    bool cameraCollision   = cfg.cameraCollision;
     int  filterMode        = cfg.filterMode;
     bool linearMips        = cfg.linearMips;
     bool sharpMips         = cfg.sharpMips;
@@ -2350,6 +2465,9 @@ int main(int argc, char *argv[]) {
         std::fprintf(stderr, "Portal graph: %d portals across %u cells\n",
                      totalPortals, wrData.numCells);
     }
+
+    // Camera collision uses polygon-level checks against the camera's current cell
+    // (no precomputation needed — solid polygon detection is done per-frame)
 
     // Find player spawn point from L$PlayerFactory + P$Position chunks
     Darkness::SpawnInfo spawnInfo = Darkness::findSpawnPoint(misPath);
@@ -3297,7 +3415,7 @@ int main(int argc, char *argv[]) {
     }
 
     std::fprintf(stderr, "Controls: WASD=move, mouse=look, Space/LShift=up/down, "
-                 "scroll=speed, C=culling, F=filter, N=isolate model, Home=spawn, Esc=quit\n");
+                 "scroll=speed, C=culling, F=filter, V=collision, M/N=isolate model, Home=spawn, Esc=quit\n");
 
     Camera cam;
     cam.init(spawnX, spawnY, spawnZ);
@@ -3331,14 +3449,16 @@ int main(int argc, char *argv[]) {
                 isoName.c_str(), cnt);
         }
         
+        const char *clipStr = cameraCollision ? "clip" : "noclip";
+
         if (portalCulling) {
             std::snprintf(title, sizeof(title),
-                "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s]%s",
-                modeStr, moveSpeed, cullVisibleCells, cullTotalCells, filterStr, isoSuffix);
+                "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s] [%s]%s",
+                modeStr, moveSpeed, cullVisibleCells, cullTotalCells, filterStr, clipStr, isoSuffix);
         } else {
             std::snprintf(title, sizeof(title),
-                "darkness — %s [speed: %.1f] [cull: OFF] [%s]%s",
-                modeStr, moveSpeed, filterStr, isoSuffix);
+                "darkness — %s [speed: %.1f] [cull: OFF] [%s] [%s]%s",
+                modeStr, moveSpeed, filterStr, clipStr, isoSuffix);
         }
         SDL_SetWindowTitle(window, title);
     };
@@ -3429,6 +3549,12 @@ int main(int argc, char *argv[]) {
                     }
                     updateTitle();
                 }
+            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_v) {
+                // Toggle camera collision with world geometry
+                cameraCollision = !cameraCollision;
+                std::fprintf(stderr, "Camera collision: %s\n",
+                             cameraCollision ? "ON (clip)" : "OFF (noclip)");
+                updateTitle();
             }
         }
 
@@ -3449,7 +3575,15 @@ int main(int argc, char *argv[]) {
         if (keys[SDL_SCANCODE_Q]) up += speed * dt;
         if (keys[SDL_SCANCODE_E]) up -= speed * dt;
 
+        // Save position before movement for collision revert
+        float oldPos[3] = { cam.pos[0], cam.pos[1], cam.pos[2] };
+
         cam.move(forward, right, up);
+
+        // Camera collision: constrain sphere within world cell planes
+        if (cameraCollision) {
+            applyCameraCollision(wrData, oldPos, cam.pos);
+        }
 
         // ── Animated lightmap update ──
         // Advance all light animation timers and re-blend changed lightmaps

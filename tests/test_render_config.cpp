@@ -50,6 +50,7 @@ TEST_CASE("RenderConfig defaults", "[config]") {
     CHECK(cfg.showFallbackCubes == false);
     CHECK(cfg.portalCulling    == true);
     CHECK(cfg.forceFlicker     == false);
+    CHECK(cfg.cameraCollision  == false);
 }
 
 TEST_CASE("YAML full load", "[config][yaml]") {
@@ -64,6 +65,7 @@ developer:
   show_fallback_cubes: true
   portal_culling: false
   force_flicker: true
+  camera_collision: true
 )");
 
     Darkness::RenderConfig cfg;
@@ -78,6 +80,7 @@ developer:
     CHECK(cfg.showFallbackCubes == true);
     CHECK(cfg.portalCulling    == false);
     CHECK(cfg.forceFlicker     == true);
+    CHECK(cfg.cameraCollision  == true);
 }
 
 TEST_CASE("YAML partial load — unset fields keep defaults", "[config][yaml]") {
@@ -134,7 +137,8 @@ TEST_CASE("CLI flags override defaults", "[config][cli]") {
         "darknessRender", "mission.mis",
         "--no-objects", "--no-cull", "--filter",
         "--lm-scale", "4", "--force-flicker",
-        "--linear-mips", "--sharp-mips", "--show-fallback"
+        "--linear-mips", "--sharp-mips", "--show-fallback",
+        "--collision"
     };
     auto argv = makeArgv(args);
     int argc = static_cast<int>(argv.size());
@@ -149,6 +153,7 @@ TEST_CASE("CLI flags override defaults", "[config][cli]") {
     CHECK(cfg.forceFlicker     == true);
     CHECK(cfg.linearMips       == true);
     CHECK(cfg.sharpMips        == true);
+    CHECK(cfg.cameraCollision  == true);
     CHECK(cli.misPath != nullptr);
     CHECK(std::string(cli.misPath) == "mission.mis");
 }
