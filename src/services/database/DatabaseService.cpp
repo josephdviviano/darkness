@@ -94,6 +94,16 @@ void DatabaseService::recursiveMergeLoad(const std::string &filename,
 
         std::string parentFile = loadFileNameFromTag(db, parentDbTag);
 
+        // Resolve relative paths against the parent file's directory.
+        // GAM_FILE typically contains just "dark.gam" which lives alongside
+        // the .mis file, not in the current working directory.
+        if (!parentFile.empty() && parentFile[0] != '/' && parentFile[0] != '\\') {
+            size_t lastSlash = filename.find_last_of("/\\");
+            if (lastSlash != std::string::npos) {
+                parentFile = filename.substr(0, lastSlash + 1) + parentFile;
+            }
+        }
+
         LOG_INFO("DatabaseService::recursiveMergeLoad - Recursing to file %s",
                  parentFile.c_str());
         recursiveMergeLoad(parentFile, loadMask & ~ft);

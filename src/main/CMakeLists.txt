@@ -128,6 +128,7 @@ target_include_directories(darknessRender PRIVATE
 
 target_link_libraries(darknessRender PRIVATE
     DarknessBase
+    DarknessServices
     bgfx::bgfx
     bgfx::bx
     bgfx::bimg
@@ -135,6 +136,7 @@ target_link_libraries(darknessRender PRIVATE
     SDL2::SDL2-static
     zziplib::libzzip
     yaml-cpp::yaml-cpp
+    ${ODE_LIBRARIES}
 )
 
 install(TARGETS darknessRender
