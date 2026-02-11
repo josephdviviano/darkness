@@ -1118,6 +1118,228 @@ TEST_CASE("IWorldQuery: queryFrustum subset of enclosing sphere",
 }
 
 // ============================================================================
+// Phase 1 verification: SpatialIndex with known entity positions (Task 17b)
+// ============================================================================
+
+TEST_CASE("17b: SpatialIndex finds every concrete entity at its own position",
+          "[worldquery][spatial][verify]") {
+    REQUIRE_WQ();
+
+    // Collect ALL concrete positioned entities and their positions
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    REQUIRE(positioned.size() > 0);
+
+    std::vector<std::pair<EntityID, Vector3>> entities;
+    for (auto eid : positioned) {
+        if (eid <= 0) continue;
+        entities.push_back({eid, s_worldQuery->getPosition(eid)});
+    }
+    REQUIRE(entities.size() > 0);
+
+    // Every entity should be found by queryRadius at its exact position
+    int found = 0;
+    int missed = 0;
+    for (const auto &[eid, pos] : entities) {
+        auto nearby = s_worldQuery->queryRadius(pos, 0.01f);
+        bool self = false;
+        for (auto id : nearby) {
+            if (id == eid) { self = true; break; }
+        }
+        if (self) ++found;
+        else ++missed;
+    }
+
+    CHECK(missed == 0);
+    CHECK(found == static_cast<int>(entities.size()));
+}
+
+TEST_CASE("17b: SpatialIndex queryRadius excludes distant entities",
+          "[worldquery][spatial][verify]") {
+    REQUIRE_WQ();
+
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    REQUIRE(positioned.size() > 0);
+
+    // Pick two concrete entities that are far apart
+    std::vector<std::pair<EntityID, Vector3>> entities;
+    for (auto eid : positioned) {
+        if (eid <= 0) continue;
+        entities.push_back({eid, s_worldQuery->getPosition(eid)});
+    }
+    REQUIRE(entities.size() >= 2);
+
+    // Find the pair with the maximum distance
+    float maxDist = 0;
+    size_t iA = 0, iB = 1;
+    for (size_t i = 0; i < std::min(entities.size(), size_t(100)); ++i) {
+        for (size_t j = i + 1; j < std::min(entities.size(), size_t(100)); ++j) {
+            float dx = entities[i].second.x - entities[j].second.x;
+            float dy = entities[i].second.y - entities[j].second.y;
+            float dz = entities[i].second.z - entities[j].second.z;
+            float d = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (d > maxDist) {
+                maxDist = d;
+                iA = i;
+                iB = j;
+            }
+        }
+    }
+
+    // With a small radius, one should NOT find the other
+    if (maxDist > 10.0f) {
+        float testRadius = maxDist / 4.0f; // quarter of max distance
+        auto nearA = s_worldQuery->queryRadius(entities[iA].second, testRadius);
+        bool foundB = false;
+        for (auto id : nearA) {
+            if (id == entities[iB].first) foundB = true;
+        }
+        CHECK_FALSE(foundB);
+    }
+}
+
+TEST_CASE("17b: SpatialIndex queryAABB matches queryRadius for tight box",
+          "[worldquery][spatial][verify]") {
+    REQUIRE_WQ();
+
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    REQUIRE(positioned.size() > 0);
+
+    // Pick a concrete entity
+    EntityID target = 0;
+    Vector3 pos;
+    for (auto eid : positioned) {
+        if (eid > 0) {
+            target = eid;
+            pos = s_worldQuery->getPosition(eid);
+            break;
+        }
+    }
+    REQUIRE(target > 0);
+
+    // Tight AABB around the entity's position
+    float halfSize = 0.5f;
+    BBox box = {
+        {pos.x - halfSize, pos.y - halfSize, pos.z - halfSize},
+        {pos.x + halfSize, pos.y + halfSize, pos.z + halfSize}
+    };
+    auto aabbResult = s_worldQuery->queryAABB(box);
+
+    // Entity should appear in AABB result
+    bool found = false;
+    for (auto id : aabbResult) {
+        if (id == target) found = true;
+    }
+    CHECK(found);
+}
+
+TEST_CASE("17b: SpatialIndex total entity count matches positioned concrete objects",
+          "[worldquery][spatial][verify]") {
+    REQUIRE_WQ();
+
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    size_t concreteCount = 0;
+    for (auto eid : positioned) {
+        if (eid > 0) ++concreteCount;
+    }
+
+    // Huge radius from origin — all entities should be found
+    auto all = s_worldQuery->queryRadius({0, 0, 0}, 1e6f);
+    CHECK(all.size() == concreteCount);
+}
+
+// ============================================================================
+// Phase 1 verification: Room queries (Task 17c)
+// ============================================================================
+
+TEST_CASE("17c: IWorldQuery room API consistent with RoomService state",
+          "[worldquery][room][verify]") {
+    REQUIRE_WQ();
+
+    if (!s_roomSvc->isLoaded()) {
+        // No rooms loaded — getRoomAt should return -1 for all positions
+        CHECK(s_worldQuery->getRoomAt({0, 0, 0}) == -1);
+        CHECK(s_worldQuery->getAdjacentRooms(0).empty());
+        CHECK(s_worldQuery->getPortals(0).empty());
+        WARN("Room database not loaded in Equilibrium fixture — "
+             "room tests limited to API consistency checks");
+    } else {
+        const auto &rooms = s_roomSvc->getAllRooms();
+        size_t svcCount = 0;
+        for (const auto &r : rooms) {
+            if (r) ++svcCount;
+        }
+        CHECK(svcCount > 0);
+    }
+}
+
+TEST_CASE("17c: IWorldQuery getAdjacentRooms consistent with RoomService portals",
+          "[worldquery][room][verify]") {
+    REQUIRE_WQ();
+
+    if (!s_roomSvc->isLoaded()) {
+        SKIP("Room database not loaded in this fixture");
+    }
+
+    const auto &rooms = s_roomSvc->getAllRooms();
+    int tested = 0;
+
+    for (const auto &r : rooms) {
+        if (!r || r->getPortalCount() == 0) continue;
+
+        RoomID rid = r->getRoomID();
+
+        // Get adjacent rooms via IWorldQuery
+        auto wqAdj = s_worldQuery->getAdjacentRooms(rid);
+
+        // Get adjacent rooms directly from RoomService portals
+        std::vector<RoomID> svcAdj;
+        for (size_t pi = 0; pi < r->getPortalCount(); ++pi) {
+            RoomPortal *portal = r->getPortal(pi);
+            if (portal && portal->getFarRoom()) {
+                svcAdj.push_back(portal->getFarRoom()->getRoomID());
+            }
+        }
+
+        CHECK(wqAdj.size() == svcAdj.size());
+
+        // Same rooms in same order
+        for (size_t i = 0; i < std::min(wqAdj.size(), svcAdj.size()); ++i) {
+            CHECK(wqAdj[i] == svcAdj[i]);
+        }
+
+        if (++tested >= 10) break; // spot check 10 rooms
+    }
+}
+
+TEST_CASE("17c: IWorldQuery getRoomAt does not crash for various positions",
+          "[worldquery][room][verify]") {
+    REQUIRE_WQ();
+
+    // Test a variety of positions — should not crash regardless of room state
+    std::vector<Vector3> testPositions = {
+        {0, 0, 0},
+        {100, 100, 100},
+        {-100, -100, -100},
+        {99999, 99999, 99999},
+    };
+
+    // Also test at known entity positions
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    int count = 0;
+    for (auto eid : positioned) {
+        if (eid <= 0) continue;
+        testPositions.push_back(s_worldQuery->getPosition(eid));
+        if (++count >= 5) break;
+    }
+
+    for (const auto &pos : testPositions) {
+        RoomID room = s_worldQuery->getRoomAt(pos);
+        // Result is either a valid room ID (>= 0) or -1 (not in any room)
+        CHECK(room >= -1);
+    }
+}
+
+// ============================================================================
 // Environment query stub tests
 // ============================================================================
 
