@@ -98,6 +98,16 @@ public:
      * */
     Room *getCurrentObjRoom(size_t idset, int objID) const;
 
+    // --- Read-only accessors for IWorldQuery ---
+
+    /// Get all rooms (read-only). Returns empty vector if rooms not loaded.
+    const std::vector<std::unique_ptr<Room>> &getAllRooms() const {
+        return mRooms;
+    }
+
+    /// Check if the room database is loaded and valid
+    bool isLoaded() const { return mRoomsOk; }
+
 protected:
     void setCurrentObjRoom(size_t idset, int objID, Room *room);
 

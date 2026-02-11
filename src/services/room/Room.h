@@ -74,6 +74,35 @@ public:
      */
     void detachObj(size_t idset, int id);
 
+    // --- Read-only accessors for IWorldQuery ---
+
+    /// Center point of the room (should not be in solid space)
+    const Vector3 &getCenter() const { return mCenter; }
+
+    /// Number of portals connecting this room to neighbors
+    uint32_t getPortalCount() const { return mPortalCount; }
+
+    /// Get portal by index, or nullptr if out of range
+    RoomPortal *getPortal(uint32_t index) const {
+        if (index >= mPortalCount)
+            return nullptr;
+        return mPortals[index];
+    }
+
+    /// Get the 6 bounding planes that define this room's volume
+    const Plane *getBoundingPlanes() const { return mPlanes; }
+
+    /// Get a copy of the object IDs in the specified id set
+    /// @param idset 0=objects, 1=creatures typically
+    std::vector<int> getObjectIDs(size_t idset) const {
+        std::vector<int> result;
+        if (idset < mIDLists.size()) {
+            const auto &s = mIDLists[idset];
+            result.assign(s.begin(), s.end());
+        }
+        return result;
+    }
+
 private:
     /// clears the room into an empty state, drops all allocations
     void clear();
