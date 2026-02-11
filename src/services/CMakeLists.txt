@@ -85,6 +85,9 @@ set(HEADLESS_SERVICES_SOURCES
     ServiceCommon.h
     sim/SimService.cpp
     sim/SimService.h
+    worldquery/WorldQueryTypes.h
+    worldquery/IWorldQuery.h
+    worldquery/ObjSysWorldState.h
 )
 
 # Rendering services that require Ogre3D (or eventually bgfx)

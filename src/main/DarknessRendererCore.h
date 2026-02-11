@@ -723,7 +723,7 @@ inline void applyCameraCollision(
 // ── Portal culling infrastructure ──
 
 // Portal connectivity info for BFS traversal
-struct PortalInfo {
+struct CellPortalInfo {
     uint32_t tgtCell;           // destination cell index
     Darkness::Plane plane;          // portal plane (for backface cull)
     // Portal polygon AABB (for frustum test)
@@ -733,9 +733,9 @@ struct PortalInfo {
 
 // Build portal adjacency graph from WR data.
 // cellPortals[cellID] = list of portals leading to other cells.
-inline std::vector<std::vector<PortalInfo>>
+inline std::vector<std::vector<CellPortalInfo>>
 buildPortalGraph(const Darkness::WRParsedData &wr) {
-    std::vector<std::vector<PortalInfo>> cellPortals(wr.numCells);
+    std::vector<std::vector<CellPortalInfo>> cellPortals(wr.numCells);
 
     for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
         const auto &cell = wr.cells[ci];
@@ -748,7 +748,7 @@ buildPortalGraph(const Darkness::WRParsedData &wr) {
             if (poly.count < 3) continue;
             if (poly.tgtCell >= wr.numCells) continue;
 
-            PortalInfo portal;
+            CellPortalInfo portal;
             portal.tgtCell = poly.tgtCell;
 
             // Get portal plane from the polygon's plane reference
@@ -861,7 +861,7 @@ struct ViewFrustum {
 // that are visible to the view frustum. Returns the set of visible cell IDs.
 inline std::unordered_set<uint32_t>
 portalBFS(const Darkness::WRParsedData &wr,
-          const std::vector<std::vector<PortalInfo>> &cellPortals,
+          const std::vector<std::vector<CellPortalInfo>> &cellPortals,
           int32_t startCell,
           const ViewFrustum &frustum,
           float camX, float camY, float camZ) {
