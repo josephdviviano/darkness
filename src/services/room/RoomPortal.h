@@ -56,6 +56,23 @@ public:
     /// getter for the room that is the source for this portal
     inline Room *getNearRoom() const { return mSrcRoom; };
 
+    // --- Read-only accessors for IWorldQuery ---
+
+    /// Portal ID
+    int32_t getPortalID() const { return mID; }
+
+    /// Center point of the portal (should not be in solid space)
+    const Vector3 &getCenter() const { return mCenter; }
+
+    /// Plane this portal lies on
+    const Plane &getPlane() const { return mPlane; }
+
+    /// Index of this portal in the room's portal list
+    uint32_t getIndex() const { return mIndex; }
+
+    /// Portal ID on the other side of this portal
+    int32_t getDestPortalID() const { return mDestPortal; }
+
 private:
     void clear();
 

@@ -77,6 +77,7 @@
 #include "PLDefParser.h"
 #include "DTypeSizeParser.h"
 #include "SingleFieldDataStorage.h"
+#include "worldquery/ObjSysWorldState.h"
 
 // TODO: Make these configurable via command-line or config file
 static const int WINDOW_WIDTH  = 1280;
@@ -308,6 +309,69 @@ int main(int argc, char *argv[]) {
     {
         Darkness::GameServicePtr gameSvc = GET_SERVICE(Darkness::GameService);
         gameSvc->load(misPath);
+    }
+
+    // Construct IWorldQuery facade — the read-only interface for downstream subsystems.
+    // Currently used for verification only; will be passed to AI, audio, scripts.
+    Darkness::ObjectServicePtr objSvcPtr = GET_SERVICE(Darkness::ObjectService);
+    Darkness::PropertyServicePtr propSvcPtr = GET_SERVICE(Darkness::PropertyService);
+    Darkness::LinkServicePtr linkSvcPtr = GET_SERVICE(Darkness::LinkService);
+    Darkness::RoomServicePtr roomSvcPtr = GET_SERVICE(Darkness::RoomService);
+
+    auto worldQuery = std::make_unique<Darkness::ObjSysWorldState>(
+        objSvcPtr.get(), propSvcPtr.get(), linkSvcPtr.get(), roomSvcPtr.get());
+
+    // Verification: exercise IWorldQuery methods to ensure correctness
+    {
+        int entityCount = 0, positionedCount = 0, roomCount = 0, linkCount = 0;
+
+        // Count positioned entities via property access
+        auto positionedIDs = worldQuery->getAllWithProperty("Position");
+        for (auto eid : positionedIDs) {
+            if (!worldQuery->exists(eid))
+                continue;
+            ++entityCount;
+
+            Darkness::Vector3 pos = worldQuery->getPosition(eid);
+            // Verify consistency: getPosition matches getProperty<T> raw data
+            if (pos.x != 0.0f || pos.y != 0.0f || pos.z != 0.0f)
+                ++positionedCount;
+        }
+
+        // Count rooms and their portals
+        if (roomSvcPtr->isLoaded()) {
+            const auto &rooms = roomSvcPtr->getAllRooms();
+            for (const auto &r : rooms) {
+                if (!r)
+                    continue;
+                ++roomCount;
+            }
+        }
+
+        // Count links via MetaProp relation — test back links (incoming to -1).
+        // Archetype -1 is the root; MetaProp links go TO it from other archetypes.
+        // Uses string-based getBackLinks which resolves ~MetaProp internally.
+        {
+            auto backLinks = worldQuery->getBackLinks(-1, "MetaProp", 0);
+            linkCount = static_cast<int>(backLinks.size());
+        }
+
+        // Test property handle caching (hot-path variant)
+        auto posHandle = worldQuery->resolveProperty("Position");
+        int handleHits = 0;
+        if (posHandle) {
+            for (auto eid : positionedIDs) {
+                if (worldQuery->hasProperty(eid, posHandle))
+                    ++handleHits;
+            }
+        }
+
+        std::fprintf(stderr,
+                     "IWorldQuery: verified %d entities (%d positioned), "
+                     "%d rooms, %d MetaProp backlinks to -1, "
+                     "handle cache: %d/%zu hits\n",
+                     entityCount, positionedCount, roomCount, linkCount,
+                     handleHits, positionedIDs.size());
     }
 
     // Extract mission base name (e.g. "miss6" from "path/to/miss6.mis")

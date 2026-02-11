@@ -168,35 +168,46 @@ static void ensureMissionLoaded() {
         }
     }
 
-    // Initialize logging (required before ServiceManager)
-    s_logger = new Darkness::Logger();
-    s_stdlog = new Darkness::StdLog();
-    s_logger->setLogLevel(Darkness::Logger::LOG_LEVEL_FATAL);
-    s_console = new Darkness::ConsoleBackend();
+    // Initialize logging — reuse existing singletons if another test file
+    // (e.g. test_world_query) already created them in this process
+    if (!Darkness::Logger::getSingletonPtr()) {
+        s_logger = new Darkness::Logger();
+        s_stdlog = new Darkness::StdLog();
+        s_logger->setLogLevel(Darkness::Logger::LOG_LEVEL_FATAL);
+    }
+    if (!Darkness::ConsoleBackend::getSingletonPtr()) {
+        s_console = new Darkness::ConsoleBackend();
+    }
 
-    // Initialize service stack
-    auto *svcMgr = new Darkness::ServiceManager(SERVICE_ALL);
+    // Reuse existing ServiceManager if already initialized
+    Darkness::ServiceManager *svcMgr = Darkness::ServiceManager::getSingletonPtr();
+    if (!svcMgr) {
+        svcMgr = new Darkness::ServiceManager(SERVICE_ALL);
 
-    svcMgr->registerFactory<Darkness::PlatformServiceFactory>();
-    svcMgr->registerFactory<Darkness::ConfigServiceFactory>();
-    svcMgr->registerFactory<Darkness::DatabaseServiceFactory>();
-    svcMgr->registerFactory<Darkness::GameServiceFactory>();
-    svcMgr->registerFactory<Darkness::InheritServiceFactory>();
-    svcMgr->registerFactory<Darkness::LinkServiceFactory>();
-    svcMgr->registerFactory<Darkness::LoopServiceFactory>();
-    svcMgr->registerFactory<Darkness::ObjectServiceFactory>();
-    svcMgr->registerFactory<Darkness::PropertyServiceFactory>();
-    svcMgr->registerFactory<Darkness::RoomServiceFactory>();
-    svcMgr->registerFactory<Darkness::SimServiceFactory>();
-    svcMgr->registerFactory<Darkness::PhysicsServiceFactory>();
+        svcMgr->registerFactory<Darkness::PlatformServiceFactory>();
+        svcMgr->registerFactory<Darkness::ConfigServiceFactory>();
+        svcMgr->registerFactory<Darkness::DatabaseServiceFactory>();
+        svcMgr->registerFactory<Darkness::GameServiceFactory>();
+        svcMgr->registerFactory<Darkness::InheritServiceFactory>();
+        svcMgr->registerFactory<Darkness::LinkServiceFactory>();
+        svcMgr->registerFactory<Darkness::LoopServiceFactory>();
+        svcMgr->registerFactory<Darkness::ObjectServiceFactory>();
+        svcMgr->registerFactory<Darkness::PropertyServiceFactory>();
+        svcMgr->registerFactory<Darkness::RoomServiceFactory>();
+        svcMgr->registerFactory<Darkness::SimServiceFactory>();
+        svcMgr->registerFactory<Darkness::PhysicsServiceFactory>();
 
-    svcMgr->bootstrapFinished();
+        svcMgr->bootstrapFinished();
+    }
 
-    // Load schema definitions (property types, link relations)
-    std::string scriptsDir = std::string(SCRIPTS_DIR);
-    {
-        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+    // Load schema and mission — skip if another test file already did this
+    Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+    s_propSvc = propSvc.get();
+
+    if (!propSvc->getProperty("ModelName")) {
+        // Schema not yet loaded — register all property/link types
         Darkness::LinkServicePtr linkSvc = GET_SERVICE(Darkness::LinkService);
+        std::string scriptsDir = std::string(SCRIPTS_DIR);
 
         Darkness::PLDefResult propDefs = Darkness::parsePLDef(scriptsDir + "/t2-props.pldef");
         Darkness::PLDefResult linkDefs = Darkness::parsePLDef(scriptsDir + "/t2-links.pldef");
@@ -255,14 +266,10 @@ static void ensureMissionLoaded() {
         registerRawProp("RenderAlpha", "RenderAlp", "always");
         registerRawProp("ModelScale",  "Scale",     "never");
 
-        s_propSvc = propSvc.get();
-
         std::fprintf(stderr, "Test: registered %d properties, %d relations\n",
                      propCount, relCount);
-    }
 
-    // Load the mission database (.gam + .mis)
-    {
+        // Load the mission database (.gam + .mis)
         Darkness::GameServicePtr gameSvc = GET_SERVICE(Darkness::GameService);
         gameSvc->load(s_misPath);
     }

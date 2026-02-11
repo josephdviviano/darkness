@@ -369,7 +369,8 @@ void Relation::save(const FileGroupPtr &db, uint saveMask) {
 // --------------------------------------------------------------------------
 Relation *Relation::inverse() {
     assert(mInverse != NULL);
-    assert(mInverse->isInverse() == isInverse());
+    // Normal relation's inverse should be marked as inverse (and vice versa)
+    assert(mInverse->isInverse() != isInverse());
 
     return mInverse;
 };
