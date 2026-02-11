@@ -78,12 +78,13 @@ struct LinkInfo {
     int flavor;
 };
 
-/// Result of a raycast query (stub until Task 16).
+/// Result of a raycast query.
 struct RayHit {
     Vector3 point;
     Vector3 normal;
     float distance;
     EntityID hitEntity; // 0 if world geometry hit
+    int32_t textureIndex = -1; // WR polygon texture index (-1 = unknown/no texture)
 };
 
 /// Axis-aligned bounding box.

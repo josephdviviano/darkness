@@ -7,8 +7,9 @@
  *    RoomService). This is the primary world-state facade for downstream
  *    subsystems.
  *
- *    Methods requiring future systems (SpatialIndex, raycast, light level)
- *    return documented defaults and will be filled in by later tasks.
+ *    Spatial queries (queryRadius, queryAABB, queryFrustum) are backed by a
+ *    lazily-populated SpatialIndex hash grid. Raycast and light level queries
+ *    return documented defaults until filled in by later tasks.
  *
  *    See .claude/IWorldQuery_PLAN.md for design rationale.
  *
@@ -17,7 +18,10 @@
 #ifndef __OBJSYSWORLDSTATE_H
 #define __OBJSYSWORLDSTATE_H
 
+#include <functional>
+
 #include "IWorldQuery.h"
+#include "SpatialIndex.h"
 #include "ServiceCommon.h"
 #include "link/LinkCommon.h"
 #include "link/LinkService.h"
@@ -287,19 +291,29 @@ public:
     }
 
     // ========================================================================
-    // Spatial queries (stubs until Task 15 SpatialIndex)
+    // Spatial queries — backed by lazily-populated SpatialIndex hash grid
     // ========================================================================
 
-    std::vector<EntityID> queryRadius(const Vector3 & /*center*/,
-                                      float /*radius*/) const override {
-        return {}; // Stub — will delegate to SpatialIndex in Task 15
+    std::vector<EntityID> queryRadius(const Vector3 &center,
+                                      float radius) const override {
+        ensureSpatialIndex();
+        return mSpatialIndex.queryRadius(center, radius);
+    }
+
+    std::vector<EntityID> queryAABB(const BBox &box) const override {
+        ensureSpatialIndex();
+        return mSpatialIndex.queryAABB(box);
     }
 
     std::vector<EntityID>
-    queryFrustum(const Vector3 & /*origin*/, const Vector3 & /*forward*/,
-                 float /*fovRadians*/, float /*aspect*/, float /*nearDist*/,
-                 float /*farDist*/) const override {
-        return {}; // Stub — will delegate to SpatialIndex in Task 15
+    queryFrustum(const Vector3 &origin, const Vector3 &forward,
+                 float fovRadians, float aspect, float nearDist,
+                 float farDist) const override {
+        ensureSpatialIndex();
+        BBox frustumBox =
+            computeFrustumAABB(origin, forward, fovRadians, aspect,
+                               nearDist, farDist);
+        return mSpatialIndex.queryAABB(frustumBox);
     }
 
     // ========================================================================
@@ -310,10 +324,22 @@ public:
         return 1.0f; // Stub — will query lightmap/dynamic light in Phase 6
     }
 
-    bool raycast(const Vector3 & /*from*/, const Vector3 & /*to*/,
-                 RayHit & /*hit*/) const override {
-        return false; // Stub — will delegate to ray-cell traversal in Task 16
+    bool raycast(const Vector3 &from, const Vector3 &to,
+                 RayHit &hit) const override {
+        if (mRaycaster)
+            return mRaycaster(from, to, hit);
+        return false; // No raycaster injected — fallback
     }
+
+    // ========================================================================
+    // Raycaster injection — renderer injects a lambda capturing WR geometry
+    // so the services layer has no dependency on WRParsedData / bgfx.
+    // ========================================================================
+
+    using RaycastFn = std::function<bool(const Vector3 &, const Vector3 &, RayHit &)>;
+
+    /// Inject the raycaster implementation. Call once after WR data is parsed.
+    void setRaycaster(RaycastFn fn) { mRaycaster = std::move(fn); }
 
 protected:
     const uint8_t *getRawPropertyData(EntityID id,
@@ -350,10 +376,125 @@ private:
         return mRoomSvc->getRoomByID(roomID);
     }
 
+    /// Populate the spatial index on first use. Iterates all entities with
+    /// P$Position and inserts concrete objects (ID > 0) into the grid.
+    void ensureSpatialIndex() const {
+        if (mSpatialPopulated)
+            return;
+        mSpatialPopulated = true;
+
+        auto ids = getAllObjectsWithProperty(mPropSvc, "Position");
+        for (int id : ids) {
+            if (id <= 0)
+                continue; // skip archetypes
+            Vector3 pos = mObjSvc->position(id);
+            mSpatialIndex.insert(static_cast<EntityID>(id), pos);
+        }
+    }
+
+    /// Compute a conservative AABB enclosing a view frustum.
+    /// Used by queryFrustum() to reduce the query to an AABB test.
+    static BBox computeFrustumAABB(const Vector3 &origin,
+                                   const Vector3 &forward,
+                                   float fovRadians, float aspect,
+                                   float nearDist, float farDist) {
+        // Build orthonormal basis from forward direction
+        // Dark Engine is Z-up — use Z-up as default, fall back to Y if
+        // forward is nearly vertical
+        Vector3 up = {0.0f, 0.0f, 1.0f};
+        float dot = forward.x * up.x + forward.y * up.y + forward.z * up.z;
+        if (std::fabs(dot) > 0.99f)
+            up = {0.0f, 1.0f, 0.0f}; // fallback for looking straight up/down
+
+        // right = forward × up (normalized)
+        Vector3 right = {
+            forward.y * up.z - forward.z * up.y,
+            forward.z * up.x - forward.x * up.z,
+            forward.x * up.y - forward.y * up.x
+        };
+        float rightLen = std::sqrt(right.x * right.x + right.y * right.y +
+                                   right.z * right.z);
+        if (rightLen > 1e-6f) {
+            right.x /= rightLen;
+            right.y /= rightLen;
+            right.z /= rightLen;
+        }
+
+        // adjusted up = right × forward
+        Vector3 adjUp = {
+            right.y * forward.z - right.z * forward.y,
+            right.z * forward.x - right.x * forward.z,
+            right.x * forward.y - right.y * forward.x
+        };
+
+        // Half-extents at near and far planes
+        float halfTan = std::tan(fovRadians * 0.5f);
+        float nearHW = nearDist * halfTan;
+        float nearHH = nearHW / aspect;
+        float farHW = farDist * halfTan;
+        float farHH = farHW / aspect;
+
+        // Compute 8 frustum corners
+        Vector3 nearCenter = {
+            origin.x + forward.x * nearDist,
+            origin.y + forward.y * nearDist,
+            origin.z + forward.z * nearDist
+        };
+        Vector3 farCenter = {
+            origin.x + forward.x * farDist,
+            origin.y + forward.y * farDist,
+            origin.z + forward.z * farDist
+        };
+
+        Vector3 corners[8];
+        // Near plane corners
+        for (int i = 0; i < 4; ++i) {
+            float sx = (i & 1) ? nearHW : -nearHW;
+            float sy = (i & 2) ? nearHH : -nearHH;
+            corners[i] = {
+                nearCenter.x + right.x * sx + adjUp.x * sy,
+                nearCenter.y + right.y * sx + adjUp.y * sy,
+                nearCenter.z + right.z * sx + adjUp.z * sy
+            };
+        }
+        // Far plane corners
+        for (int i = 0; i < 4; ++i) {
+            float sx = (i & 1) ? farHW : -farHW;
+            float sy = (i & 2) ? farHH : -farHH;
+            corners[4 + i] = {
+                farCenter.x + right.x * sx + adjUp.x * sy,
+                farCenter.y + right.y * sx + adjUp.y * sy,
+                farCenter.z + right.z * sx + adjUp.z * sy
+            };
+        }
+
+        // AABB = min/max across all 8 corners
+        BBox box;
+        box.min = corners[0];
+        box.max = corners[0];
+        for (int i = 1; i < 8; ++i) {
+            if (corners[i].x < box.min.x) box.min.x = corners[i].x;
+            if (corners[i].y < box.min.y) box.min.y = corners[i].y;
+            if (corners[i].z < box.min.z) box.min.z = corners[i].z;
+            if (corners[i].x > box.max.x) box.max.x = corners[i].x;
+            if (corners[i].y > box.max.y) box.max.y = corners[i].y;
+            if (corners[i].z > box.max.z) box.max.z = corners[i].z;
+        }
+
+        return box;
+    }
+
     ObjectService *mObjSvc;
     PropertyService *mPropSvc;
     LinkService *mLinkSvc;
     RoomService *mRoomSvc;
+
+    // Raycaster — injected by renderer, not set at construction time
+    RaycastFn mRaycaster;
+
+    // Spatial index — mutable for lazy init from const query methods
+    mutable SpatialIndex mSpatialIndex{32.0f};
+    mutable bool mSpatialPopulated = false;
 };
 
 } // namespace Darkness
