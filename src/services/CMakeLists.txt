@@ -88,6 +88,7 @@ set(HEADLESS_SERVICES_SOURCES
     worldquery/WorldQueryTypes.h
     worldquery/IWorldQuery.h
     worldquery/ObjSysWorldState.h
+    worldquery/SpatialIndex.h
 )
 
 # Rendering services that require Ogre3D (or eventually bgfx)

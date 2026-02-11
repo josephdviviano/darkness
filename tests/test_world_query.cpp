@@ -6,6 +6,7 @@
 // Same fixture as test_typed_properties.cpp.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 
 #include <cstdio>
 #include <cstdint>
@@ -46,8 +47,12 @@
 #include "property/TypedProperty.h"
 #include "property/DarkPropertyDefs.h"
 
-// IWorldQuery
+// IWorldQuery + SpatialIndex
 #include "worldquery/ObjSysWorldState.h"
+#include "worldquery/SpatialIndex.h"
+
+// Raycaster + cell geometry (bgfx-free)
+#include "RayCaster.h"
 
 namespace fs = std::filesystem;
 using namespace Darkness;
@@ -98,6 +103,10 @@ static RoomService *s_roomSvc = nullptr;
 
 // The IWorldQuery facade under test
 static std::unique_ptr<ObjSysWorldState> s_worldQuery;
+
+// WR geometry for raycaster integration tests (parsed from .mis alongside mission load)
+static WRParsedData s_wrData;
+static bool s_wrParsed = false;
 
 // Logger singletons
 static Logger *s_logger = nullptr;
@@ -230,6 +239,23 @@ static void ensureLoaded() {
     // Construct the IWorldQuery facade under test
     s_worldQuery = std::make_unique<ObjSysWorldState>(
         s_objSvc, s_propSvc, s_linkSvc, s_roomSvc);
+
+    // Parse WR geometry for raycaster integration tests
+    if (!s_wrParsed) {
+        try {
+            s_wrData = parseWRChunk(misPath);
+            s_wrParsed = true;
+            std::fprintf(stderr, "Test: parsed WR geometry (%u cells)\n", s_wrData.numCells);
+
+            // Inject raycaster into the world query facade
+            s_worldQuery->setRaycaster(
+                [](const Vector3 &from, const Vector3 &to, RayHit &hit) {
+                    return raycastWorld(s_wrData, from, to, hit);
+                });
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "Test: failed to parse WR chunk: %s\n", e.what());
+        }
+    }
 
     s_available = true;
     std::fprintf(stderr, "Test: mission loaded for IWorldQuery tests\n");
@@ -800,25 +826,295 @@ TEST_CASE("IWorldQuery: getAdjacentRooms and forEachAdjacentRoom are consistent"
 }
 
 // ============================================================================
-// Spatial query stub tests
+// SpatialIndex unit tests (synthetic data, no fixture needed)
 // ============================================================================
 
-TEST_CASE("IWorldQuery: queryRadius stub returns empty",
-          "[worldquery][spatial]") {
-    REQUIRE_WQ();
-
-    auto result = s_worldQuery->queryRadius({0.0f, 0.0f, 0.0f}, 100.0f);
-    CHECK(result.empty());
+TEST_CASE("SpatialIndex: empty index returns empty queries",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    CHECK(idx.size() == 0);
+    CHECK(idx.cellCount() == 0);
+    CHECK(idx.queryRadius({0, 0, 0}, 100.0f).empty());
+    CHECK(idx.queryAABB({{-100, -100, -100}, {100, 100, 100}}).empty());
 }
 
-TEST_CASE("IWorldQuery: queryFrustum stub returns empty",
+TEST_CASE("SpatialIndex: insert and queryRadius finds entity",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    idx.insert(1, {0, 0, 0});
+    idx.insert(2, {5, 0, 0});
+    idx.insert(3, {15, 0, 0});
+    idx.insert(4, {100, 0, 0});
+
+    auto result = idx.queryRadius({0, 0, 0}, 10.0f);
+    std::set<EntityID> found(result.begin(), result.end());
+
+    // Entity 1 (dist=0) and 2 (dist=5) within radius 10
+    CHECK(found.count(1) == 1);
+    CHECK(found.count(2) == 1);
+    // Entity 3 (dist=15) and 4 (dist=100) outside
+    CHECK(found.count(3) == 0);
+    CHECK(found.count(4) == 0);
+}
+
+TEST_CASE("SpatialIndex: queryRadius boundary — entity at exact radius",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    idx.insert(1, {10, 0, 0}); // exactly at radius 10
+
+    auto result = idx.queryRadius({0, 0, 0}, 10.0f);
+    // Should be included (distance <= radius)
+    CHECK(result.size() == 1);
+    CHECK(result[0] == 1);
+}
+
+TEST_CASE("SpatialIndex: queryAABB includes and excludes correctly",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    idx.insert(1, {5, 5, 5});    // inside box (0,0,0)-(10,10,10)
+    idx.insert(2, {0, 0, 0});    // on edge — included
+    idx.insert(3, {10, 10, 10}); // on edge — included
+    idx.insert(4, {20, 20, 20}); // outside
+
+    auto result = idx.queryAABB({{0, 0, 0}, {10, 10, 10}});
+    std::set<EntityID> found(result.begin(), result.end());
+
+    CHECK(found.count(1) == 1);
+    CHECK(found.count(2) == 1);
+    CHECK(found.count(3) == 1);
+    CHECK(found.count(4) == 0);
+}
+
+TEST_CASE("SpatialIndex: remove prevents entity from being found",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    idx.insert(1, {0, 0, 0});
+    idx.insert(2, {5, 0, 0});
+
+    CHECK(idx.size() == 2);
+
+    // Remove entity 1
+    idx.remove(1);
+    CHECK(idx.size() == 1);
+
+    auto result = idx.queryRadius({0, 0, 0}, 100.0f);
+    std::set<EntityID> found(result.begin(), result.end());
+    CHECK(found.count(1) == 0);
+    CHECK(found.count(2) == 1);
+}
+
+TEST_CASE("SpatialIndex: update moves entity between cells",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    idx.insert(1, {0, 0, 0});
+
+    // Found at origin
+    CHECK(idx.queryRadius({0, 0, 0}, 1.0f).size() == 1);
+    // Not found far away
+    CHECK(idx.queryRadius({200, 0, 0}, 1.0f).empty());
+
+    // Move entity to (200,0,0)
+    idx.update(1, {200, 0, 0});
+
+    // No longer at origin
+    CHECK(idx.queryRadius({0, 0, 0}, 1.0f).empty());
+    // Now found at new position
+    CHECK(idx.queryRadius({200, 0, 0}, 1.0f).size() == 1);
+}
+
+TEST_CASE("SpatialIndex: clear empties the index",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    idx.insert(1, {0, 0, 0});
+    idx.insert(2, {50, 50, 50});
+    idx.insert(3, {-100, -100, -100});
+
+    CHECK(idx.size() == 3);
+    idx.clear();
+    CHECK(idx.size() == 0);
+    CHECK(idx.cellCount() == 0);
+    CHECK(idx.queryRadius({0, 0, 0}, 10000.0f).empty());
+}
+
+TEST_CASE("SpatialIndex: negative coordinates work correctly",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    idx.insert(1, {-50, -50, -50});
+    idx.insert(2, {-45, -50, -50});
+
+    auto result = idx.queryRadius({-50, -50, -50}, 10.0f);
+    std::set<EntityID> found(result.begin(), result.end());
+    CHECK(found.count(1) == 1);
+    CHECK(found.count(2) == 1);
+}
+
+TEST_CASE("SpatialIndex: cell boundary — entities in different cells both found",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    // Cell boundary at x=10: entity at 9.5 (cell 0) and 10.5 (cell 1)
+    idx.insert(1, {9.5f, 0, 0});
+    idx.insert(2, {10.5f, 0, 0});
+
+    // Radius from x=10 should find both (dist < 1)
+    auto result = idx.queryRadius({10.0f, 0, 0}, 2.0f);
+    std::set<EntityID> found(result.begin(), result.end());
+    CHECK(found.count(1) == 1);
+    CHECK(found.count(2) == 1);
+}
+
+TEST_CASE("SpatialIndex: multiple entities in same cell all returned",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    // All in cell (0,0,0)
+    idx.insert(1, {1, 1, 1});
+    idx.insert(2, {2, 2, 2});
+    idx.insert(3, {3, 3, 3});
+    idx.insert(4, {4, 4, 4});
+
+    auto result = idx.queryRadius({0, 0, 0}, 10.0f);
+    CHECK(result.size() == 4);
+}
+
+TEST_CASE("SpatialIndex: large radius captures all inserted entities",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    idx.insert(1, {0, 0, 0});
+    idx.insert(2, {500, 0, 0});
+    idx.insert(3, {-500, 0, 0});
+    idx.insert(4, {0, 500, 0});
+    idx.insert(5, {0, 0, 500});
+
+    auto result = idx.queryRadius({0, 0, 0}, 1000.0f);
+    CHECK(result.size() == 5);
+}
+
+TEST_CASE("SpatialIndex: 3D diagonal distance is correct",
+          "[spatial][unit]") {
+    SpatialIndex idx(10.0f);
+    // sqrt(3^2 + 4^2 + 0^2) = 5
+    idx.insert(1, {3, 4, 0});
+    // sqrt(6^2 + 8^2 + 0^2) = 10
+    idx.insert(2, {6, 8, 0});
+
+    auto result = idx.queryRadius({0, 0, 0}, 5.0f);
+    std::set<EntityID> found(result.begin(), result.end());
+    CHECK(found.count(1) == 1);  // dist=5, inside
+    CHECK(found.count(2) == 0);  // dist=10, outside radius 5
+}
+
+// ============================================================================
+// Spatial query integration tests (Equilibrium fixture)
+// ============================================================================
+
+TEST_CASE("IWorldQuery: queryRadius finds entity at its own position",
           "[worldquery][spatial]") {
     REQUIRE_WQ();
 
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    REQUIRE(positioned.size() > 0);
+
+    // Find a concrete positioned entity
+    EntityID target = 0;
+    Vector3 targetPos;
+    for (auto eid : positioned) {
+        if (eid > 0) {
+            target = eid;
+            targetPos = s_worldQuery->getPosition(eid);
+            break;
+        }
+    }
+    REQUIRE(target > 0);
+
+    // Small radius at entity's exact position should find it
+    auto nearby = s_worldQuery->queryRadius(targetPos, 0.01f);
+    bool foundTarget = false;
+    for (auto id : nearby) {
+        if (id == target) foundTarget = true;
+    }
+    CHECK(foundTarget);
+}
+
+TEST_CASE("IWorldQuery: queryRadius large radius finds all concrete positioned entities",
+          "[worldquery][spatial]") {
+    REQUIRE_WQ();
+
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    REQUIRE(positioned.size() > 0);
+
+    // Count concrete positioned entities (ID > 0)
+    size_t concreteCount = 0;
+    for (auto eid : positioned) {
+        if (eid > 0) ++concreteCount;
+    }
+
+    // Very large radius should find all concrete positioned entities
+    auto all = s_worldQuery->queryRadius({0, 0, 0}, 100000.0f);
+    CHECK(all.size() >= concreteCount);
+}
+
+TEST_CASE("IWorldQuery: queryAABB with huge box returns all positioned entities",
+          "[worldquery][spatial]") {
+    REQUIRE_WQ();
+
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    size_t concreteCount = 0;
+    for (auto eid : positioned) {
+        if (eid > 0) ++concreteCount;
+    }
+
+    BBox hugeBox = {{-100000, -100000, -100000}, {100000, 100000, 100000}};
+    auto all = s_worldQuery->queryAABB(hugeBox);
+    CHECK(all.size() >= concreteCount);
+}
+
+TEST_CASE("IWorldQuery: queryFrustum returns entities with wide FOV",
+          "[worldquery][spatial]") {
+    REQUIRE_WQ();
+
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    REQUIRE(positioned.size() > 0);
+
+    // Find the centroid of all concrete positioned entities
+    float cx = 0, cy = 0, cz = 0;
+    int count = 0;
+    for (auto eid : positioned) {
+        if (eid <= 0) continue;
+        Vector3 pos = s_worldQuery->getPosition(eid);
+        cx += pos.x; cy += pos.y; cz += pos.z;
+        ++count;
+    }
+    REQUIRE(count > 0);
+    cx /= count; cy /= count; cz /= count;
+
+    // Wide FOV from centroid looking forward should find some entities
     auto result = s_worldQuery->queryFrustum(
-        {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f},
-        1.0f, 1.33f, 0.1f, 1000.0f);
-    CHECK(result.empty());
+        {cx, cy, cz}, {1.0f, 0.0f, 0.0f},
+        2.0f, 1.33f, 0.1f, 10000.0f); // ~115 degree FOV, huge far plane
+    CHECK(result.size() > 0);
+}
+
+TEST_CASE("IWorldQuery: queryFrustum subset of enclosing sphere",
+          "[worldquery][spatial]") {
+    REQUIRE_WQ();
+
+    // queryFrustum uses a conservative AABB, so its results should be a
+    // subset of a queryRadius with large enough radius to contain the AABB
+    Vector3 origin = {0, 0, 0};
+    Vector3 forward = {1, 0, 0};
+    float fov = 1.0f;     // ~57 degrees
+    float farDist = 500.0f;
+
+    auto frustumResult = s_worldQuery->queryFrustum(
+        origin, forward, fov, 1.33f, 0.1f, farDist);
+
+    // The frustum AABB is at most farDist in each direction
+    auto sphereResult = s_worldQuery->queryRadius(origin, farDist * 2.0f);
+    std::set<EntityID> sphereSet(sphereResult.begin(), sphereResult.end());
+
+    // Every frustum entity should be in the sphere result
+    for (auto eid : frustumResult) {
+        CHECK(sphereSet.count(eid) == 1);
+    }
 }
 
 // ============================================================================
@@ -833,14 +1129,447 @@ TEST_CASE("IWorldQuery: getLightLevel stub returns 1.0",
     CHECK(s_worldQuery->getLightLevel({100.0f, -50.0f, 25.0f}) == 1.0f);
 }
 
-TEST_CASE("IWorldQuery: raycast stub returns false",
-          "[worldquery][environment]") {
+TEST_CASE("IWorldQuery: raycast without injected raycaster returns false",
+          "[worldquery][raycast]") {
+    // Fresh ObjSysWorldState without setRaycaster → always returns false
     REQUIRE_WQ();
+    auto freshQuery = std::make_unique<ObjSysWorldState>(
+        s_objSvc, s_propSvc, s_linkSvc, s_roomSvc);
+
+    RayHit hit;
+    bool didHit = freshQuery->raycast(
+        {0.0f, 0.0f, 0.0f}, {100.0f, 0.0f, 0.0f}, hit);
+    CHECK_FALSE(didHit);
+}
+
+// ============================================================================
+// Raycast unit tests — synthetic WR geometry, no fixture needed
+// ============================================================================
+
+// Helper: build a simple box cell for testing.
+// Axis-aligned box from (-size, -size, -size) to (size, size, size).
+// 8 vertices, 6 planes (facing inward), 6 solid quad polygons.
+static WRParsedData makeBoxWorld(float size, int numCells = 1) {
+    WRParsedData wr;
+    wr.numCells = numCells;
+    wr.lightSize = 1;
+    wr.cells.resize(numCells);
+
+    auto &cell = wr.cells[0];
+    cell.numPolygons = 6;
+    cell.numPortals = 0;
+    cell.numPlanes = 6;
+    cell.mediaType = 1; // air
+    cell.numTextured = 0;
+    cell.flowGroup = 0;
+
+    // Cell center and bounding sphere
+    cell.center = {0.0f, 0.0f, 0.0f};
+    cell.radius = size * 1.74f; // sqrt(3) * size, covers corners
+
+    // 8 vertices of the box
+    cell.vertices = {
+        {-size, -size, -size}, // 0: ---
+        { size, -size, -size}, // 1: +--
+        { size,  size, -size}, // 2: ++-
+        {-size,  size, -size}, // 3: -+-
+        {-size, -size,  size}, // 4: --+
+        { size, -size,  size}, // 5: +-+
+        { size,  size,  size}, // 6: +++
+        {-size,  size,  size}, // 7: -++
+    };
+
+    // 6 inward-facing planes (Dark Engine convention: planes face into the cell)
+    cell.planes = {
+        {{-1, 0, 0}, size},  // 0: +X wall, inward normal = (-1,0,0), d = size
+        {{ 1, 0, 0}, size},  // 1: -X wall, inward normal = (+1,0,0), d = size
+        {{ 0,-1, 0}, size},  // 2: +Y wall, inward normal = (0,-1,0), d = size
+        {{ 0, 1, 0}, size},  // 3: -Y wall, inward normal = (0,+1,0), d = size
+        {{ 0, 0,-1}, size},  // 4: +Z wall (ceiling), inward normal = (0,0,-1), d = size
+        {{ 0, 0, 1}, size},  // 5: -Z wall (floor), inward normal = (0,0,+1), d = size
+    };
+
+    // 6 polygon structs (one per face)
+    cell.polygons.resize(6);
+    for (int i = 0; i < 6; ++i) {
+        cell.polygons[i].flags = 0;
+        cell.polygons[i].count = 4;
+        cell.polygons[i].plane = static_cast<uint8_t>(i);
+        cell.polygons[i].unk = 0;
+        cell.polygons[i].tgtCell = 0;
+        cell.polygons[i].unk1 = 0;
+        cell.polygons[i].unk2 = 0;
+    }
+
+    // Polygon vertex indices — wound CCW when viewed from outside the cell.
+    // pointInConvexPolygon uses outward normal (-plane.normal) for the winding test.
+    cell.polyIndices = {
+        {1, 2, 6, 5}, // plane 0: +X wall (x=+size), CCW from outside (+X)
+        {3, 0, 4, 7}, // plane 1: -X wall (x=-size), CCW from outside (-X)
+        {3, 7, 6, 2}, // plane 2: +Y wall (y=+size), CCW from outside (+Y)
+        {0, 1, 5, 4}, // plane 3: -Y wall (y=-size), CCW from outside (-Y)
+        {4, 5, 6, 7}, // plane 4: +Z ceiling (z=+size), CCW from outside (+Z)
+        {1, 0, 3, 2}, // plane 5: -Z floor (z=-size), CCW from outside (-Z)
+    };
+
+    return wr;
+}
+
+TEST_CASE("Raycast: ray hits wall in box cell",
+          "[raycast][unit]") {
+    auto wr = makeBoxWorld(10.0f);
+    RayHit hit;
+
+    // Ray from center toward +X wall
+    bool didHit = raycastWorld(wr, {0, 0, 0}, {20, 0, 0}, hit);
+    CHECK(didHit);
+    CHECK(hit.point.x == Catch::Approx(10.0f).margin(0.01f));
+    CHECK(hit.point.y == Catch::Approx(0.0f).margin(0.01f));
+    CHECK(hit.point.z == Catch::Approx(0.0f).margin(0.01f));
+    // Normal = inward cell plane normal = facing the ray origin (toward cell interior)
+    // +X wall's inward normal is (-1,0,0)
+    CHECK(hit.normal.x == Catch::Approx(-1.0f).margin(0.01f));
+    CHECK(hit.distance == Catch::Approx(10.0f).margin(0.01f));
+    CHECK(hit.hitEntity == 0); // world geometry
+}
+
+TEST_CASE("Raycast: ray hits each face of box",
+          "[raycast][unit]") {
+    auto wr = makeBoxWorld(10.0f);
+    RayHit hit;
+
+    // Inward cell plane normal = facing the ray origin (standard ray-trace convention)
+    // +X wall → inward normal (-1,0,0)
+    CHECK(raycastWorld(wr, {0,0,0}, {20,0,0}, hit));
+    CHECK(hit.normal.x == Catch::Approx(-1.0f).margin(0.01f));
+
+    // -X wall → inward normal (+1,0,0)
+    CHECK(raycastWorld(wr, {0,0,0}, {-20,0,0}, hit));
+    CHECK(hit.normal.x == Catch::Approx(1.0f).margin(0.01f));
+
+    // +Y wall → inward normal (0,-1,0)
+    CHECK(raycastWorld(wr, {0,0,0}, {0,20,0}, hit));
+    CHECK(hit.normal.y == Catch::Approx(-1.0f).margin(0.01f));
+
+    // -Y wall → inward normal (0,+1,0)
+    CHECK(raycastWorld(wr, {0,0,0}, {0,-20,0}, hit));
+    CHECK(hit.normal.y == Catch::Approx(1.0f).margin(0.01f));
+
+    // +Z ceiling → inward normal (0,0,-1)
+    CHECK(raycastWorld(wr, {0,0,0}, {0,0,20}, hit));
+    CHECK(hit.normal.z == Catch::Approx(-1.0f).margin(0.01f));
+
+    // -Z floor → inward normal (0,0,+1)
+    CHECK(raycastWorld(wr, {0,0,0}, {0,0,-20}, hit));
+    CHECK(hit.normal.z == Catch::Approx(1.0f).margin(0.01f));
+}
+
+TEST_CASE("Raycast: ray misses when parallel to all walls",
+          "[raycast][unit]") {
+    auto wr = makeBoxWorld(10.0f);
+    RayHit hit;
+
+    // Ray along +X axis but too short to reach the wall
+    CHECK_FALSE(raycastWorld(wr, {0, 0, 0}, {5, 0, 0}, hit));
+}
+
+TEST_CASE("Raycast: ray from outside world returns false",
+          "[raycast][unit]") {
+    auto wr = makeBoxWorld(10.0f);
+    RayHit hit;
+
+    // Origin outside all cells — findCameraCell returns -1
+    CHECK_FALSE(raycastWorld(wr, {100, 100, 100}, {200, 100, 100}, hit));
+}
+
+TEST_CASE("Raycast: closest hit wins when ray intersects multiple planes",
+          "[raycast][unit]") {
+    auto wr = makeBoxWorld(10.0f);
+    RayHit hit;
+
+    // Ray from near +X wall toward -X wall — should hit +X wall first
+    bool didHit = raycastWorld(wr, {5, 0, 0}, {-20, 0, 0}, hit);
+    CHECK(didHit);
+    // Closest hit should be the -X wall (distance 15 from origin {5,0,0})
+    // Wait — from {5,0,0} toward {-20,0,0}: direction is (-1,0,0)
+    // +X wall is at x=10, -X wall at x=-10
+    // From x=5 in direction (-1,0,0): hits -X wall at t=15, +X wall would be behind (t=-5)
+    // Actually the ray goes from (5,0,0) in direction (-1,0,0)
+    // It hits x=-10 at t=15
+    CHECK(hit.point.x == Catch::Approx(-10.0f).margin(0.01f));
+    CHECK(hit.distance == Catch::Approx(15.0f).margin(0.01f));
+}
+
+TEST_CASE("Raycast: degenerate zero-length ray returns false",
+          "[raycast][unit]") {
+    auto wr = makeBoxWorld(10.0f);
+    RayHit hit;
+
+    // from == to → zero-length ray
+    CHECK_FALSE(raycastWorld(wr, {0, 0, 0}, {0, 0, 0}, hit));
+}
+
+TEST_CASE("Raycast: ray through portal hits far wall",
+          "[raycast][unit]") {
+    // Build two connected box cells sharing a portal on the +X/-X boundary.
+    // Portals must be the LAST polygons in the list (indices [numSolid, numPolygons)).
+
+    WRParsedData wr;
+    wr.numCells = 2;
+    wr.lightSize = 1;
+    wr.cells.resize(2);
+
+    // ── Cell 0: box from (-10,-10,-10) to (10,10,10) ──
+    // +X face is a portal to cell 1, placed last in the polygon list
+    auto &c0 = wr.cells[0];
+    c0.numPolygons = 6;
+    c0.numPortals = 1;  // last polygon is a portal
+    c0.numPlanes = 6;
+    c0.mediaType = 1;
+    c0.numTextured = 0;
+    c0.flowGroup = 0;
+    c0.center = {0, 0, 0};
+    c0.radius = 10.0f * 1.74f;
+
+    c0.vertices = {
+        {-10, -10, -10}, {10, -10, -10}, {10, 10, -10}, {-10, 10, -10},
+        {-10, -10,  10}, {10, -10,  10}, {10, 10,  10}, {-10, 10,  10},
+    };
+
+    // Planes: put +X plane last (index 5) so its polygon is the portal
+    c0.planes = {
+        {{ 1, 0, 0}, 10},   // 0: -X wall
+        {{ 0,-1, 0}, 10},   // 1: +Y wall
+        {{ 0, 1, 0}, 10},   // 2: -Y wall
+        {{ 0, 0,-1}, 10},   // 3: +Z ceiling
+        {{ 0, 0, 1}, 10},   // 4: -Z floor
+        {{-1, 0, 0}, 10},   // 5: +X wall (portal plane)
+    };
+
+    c0.polygons.resize(6);
+    for (int i = 0; i < 6; ++i) {
+        c0.polygons[i].flags = 0;
+        c0.polygons[i].count = 4;
+        c0.polygons[i].plane = static_cast<uint8_t>(i);
+        c0.polygons[i].unk = 0;
+        c0.polygons[i].tgtCell = 0;
+        c0.polygons[i].unk1 = 0;
+        c0.polygons[i].unk2 = 0;
+    }
+    // Polygon 5 is the portal → cell 1
+    c0.polygons[5].tgtCell = 1;
+
+    c0.polyIndices = {
+        {3, 0, 4, 7}, // plane 0: -X wall
+        {3, 2, 6, 7}, // plane 1: +Y wall
+        {0, 4, 5, 1}, // plane 2: -Y wall
+        {4, 5, 6, 7}, // plane 3: +Z ceiling
+        {1, 0, 3, 2}, // plane 4: -Z floor
+        {1, 2, 6, 5}, // plane 5: +X wall (portal)
+    };
+
+    // ── Cell 1: box from (10,-10,-10) to (30,10,10) ──
+    // -X face is a portal back to cell 0, placed last in the polygon list
+    auto &c1 = wr.cells[1];
+    c1.numPolygons = 6;
+    c1.numPortals = 1;  // last polygon is a portal
+    c1.numPlanes = 6;
+    c1.mediaType = 1;
+    c1.numTextured = 0;
+    c1.flowGroup = 0;
+    c1.center = {20, 0, 0};
+    c1.radius = 10.0f * 1.74f;
+
+    c1.vertices = {
+        {10, -10, -10}, {30, -10, -10}, {30, 10, -10}, {10, 10, -10},
+        {10, -10,  10}, {30, -10,  10}, {30, 10,  10}, {10, 10,  10},
+    };
+
+    // Planes: put -X plane last (index 5) so its polygon is the portal
+    c1.planes = {
+        {{-1, 0, 0}, 30},   // 0: +X wall
+        {{ 0,-1, 0}, 10},   // 1: +Y wall
+        {{ 0, 1, 0}, 10},   // 2: -Y wall
+        {{ 0, 0,-1}, 10},   // 3: +Z ceiling
+        {{ 0, 0, 1}, 10},   // 4: -Z floor
+        {{ 1, 0, 0}, -10},  // 5: -X wall (portal plane)
+    };
+
+    c1.polygons.resize(6);
+    for (int i = 0; i < 6; ++i) {
+        c1.polygons[i].flags = 0;
+        c1.polygons[i].count = 4;
+        c1.polygons[i].plane = static_cast<uint8_t>(i);
+        c1.polygons[i].unk = 0;
+        c1.polygons[i].tgtCell = 0;
+        c1.polygons[i].unk1 = 0;
+        c1.polygons[i].unk2 = 0;
+    }
+    // Polygon 5 is the portal → cell 0
+    c1.polygons[5].tgtCell = 0;
+
+    c1.polyIndices = {
+        {1, 2, 6, 5}, // plane 0: +X wall
+        {3, 2, 6, 7}, // plane 1: +Y wall
+        {0, 4, 5, 1}, // plane 2: -Y wall
+        {4, 5, 6, 7}, // plane 3: +Z ceiling
+        {1, 0, 3, 2}, // plane 4: -Z floor
+        {3, 0, 4, 7}, // plane 5: -X wall (portal)
+    };
+
+    RayHit hit;
+
+    // Ray from center of cell 0 toward +X (through portal into cell 1, hitting +X wall)
+    bool didHit = raycastWorld(wr, {0, 0, 0}, {40, 0, 0}, hit);
+    CHECK(didHit);
+    // Should hit cell 1's +X wall at x=30, inward normal = (-1,0,0)
+    CHECK(hit.point.x == Catch::Approx(30.0f).margin(0.01f));
+    CHECK(hit.distance == Catch::Approx(30.0f).margin(0.01f));
+    CHECK(hit.normal.x == Catch::Approx(-1.0f).margin(0.01f));
+}
+
+TEST_CASE("Raycast: textureIndex populated for textured polygon",
+          "[raycast][unit]") {
+    auto wr = makeBoxWorld(10.0f);
+    auto &cell = wr.cells[0];
+
+    // Add texturing data for the first polygon (+X face)
+    cell.numTextured = 1;
+    WRPolygonTexturing tex{};
+    tex.txt = 42; // texture index 42
+    cell.texturing.push_back(tex);
+
+    RayHit hit;
+    bool didHit = raycastWorld(wr, {0, 0, 0}, {20, 0, 0}, hit);
+    CHECK(didHit);
+    CHECK(hit.textureIndex == 42);
+}
+
+TEST_CASE("Raycast: textureIndex is -1 for untextured polygon",
+          "[raycast][unit]") {
+    auto wr = makeBoxWorld(10.0f);
+    // No texturing data (numTextured = 0)
+
+    RayHit hit;
+    bool didHit = raycastWorld(wr, {0, 0, 0}, {20, 0, 0}, hit);
+    CHECK(didHit);
+    CHECK(hit.textureIndex == -1);
+}
+
+// ============================================================================
+// Raycast integration tests (Equilibrium fixture with WR geometry)
+// ============================================================================
+
+TEST_CASE("IWorldQuery: raycast downward hits floor from positioned entity",
+          "[worldquery][raycast]") {
+    REQUIRE_WQ();
+    REQUIRE(s_wrParsed);
+
+    // Find a concrete positioned entity that is inside a WR cell
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    REQUIRE(positioned.size() > 0);
+
+    EntityID target = 0;
+    Vector3 targetPos;
+    for (auto eid : positioned) {
+        if (eid <= 0) continue;
+        Vector3 pos = s_worldQuery->getPosition(eid);
+        // Verify entity is inside a WR cell before casting
+        if (findCameraCell(s_wrData, pos.x, pos.y, pos.z) >= 0) {
+            target = eid;
+            targetPos = pos;
+            break;
+        }
+    }
+    REQUIRE(target > 0);
+
+    // Cast ray downward from entity position
+    RayHit hit;
+    Vector3 below(targetPos.x, targetPos.y, targetPos.z - 200.0f);
+    bool didHit = s_worldQuery->raycast(targetPos, below, hit);
+    CHECK(didHit);
+    if (didHit) {
+        // Floor normal should point upward (Z > 0)
+        CHECK(hit.normal.z > 0.0f);
+        CHECK(hit.distance > 0.0f);
+        CHECK(hit.hitEntity == 0); // world geometry
+    }
+}
+
+TEST_CASE("IWorldQuery: raycast upward hits ceiling from positioned entity",
+          "[worldquery][raycast]") {
+    REQUIRE_WQ();
+    REQUIRE(s_wrParsed);
+
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    REQUIRE(positioned.size() > 0);
+
+    EntityID target = 0;
+    Vector3 targetPos;
+    for (auto eid : positioned) {
+        if (eid <= 0) continue;
+        Vector3 pos = s_worldQuery->getPosition(eid);
+        if (findCameraCell(s_wrData, pos.x, pos.y, pos.z) >= 0) {
+            target = eid;
+            targetPos = pos;
+            break;
+        }
+    }
+    REQUIRE(target > 0);
+
+    // Cast ray upward
+    RayHit hit;
+    Vector3 above(targetPos.x, targetPos.y, targetPos.z + 200.0f);
+    bool didHit = s_worldQuery->raycast(targetPos, above, hit);
+    CHECK(didHit);
+    if (didHit) {
+        // Ceiling normal should point downward (Z < 0)
+        CHECK(hit.normal.z < 0.0f);
+        CHECK(hit.distance > 0.0f);
+    }
+}
+
+TEST_CASE("IWorldQuery: raycast from outside world returns false",
+          "[worldquery][raycast]") {
+    REQUIRE_WQ();
+    REQUIRE(s_wrParsed);
 
     RayHit hit;
     bool didHit = s_worldQuery->raycast(
-        {0.0f, 0.0f, 0.0f}, {100.0f, 0.0f, 0.0f}, hit);
+        {99999.0f, 99999.0f, 99999.0f},
+        {99999.0f, 99999.0f, 99899.0f}, hit);
     CHECK_FALSE(didHit);
+}
+
+TEST_CASE("IWorldQuery: raycast hit has valid textureIndex",
+          "[worldquery][raycast]") {
+    REQUIRE_WQ();
+    REQUIRE(s_wrParsed);
+
+    // Find a positioned entity inside a WR cell
+    auto positioned = s_worldQuery->getAllWithProperty("Position");
+    REQUIRE(positioned.size() > 0);
+
+    EntityID target = 0;
+    Vector3 targetPos;
+    for (auto eid : positioned) {
+        if (eid <= 0) continue;
+        Vector3 pos = s_worldQuery->getPosition(eid);
+        if (findCameraCell(s_wrData, pos.x, pos.y, pos.z) >= 0) {
+            target = eid;
+            targetPos = pos;
+            break;
+        }
+    }
+    REQUIRE(target > 0);
+
+    RayHit hit;
+    Vector3 below(targetPos.x, targetPos.y, targetPos.z - 200.0f);
+    bool didHit = s_worldQuery->raycast(targetPos, below, hit);
+    if (didHit) {
+        // textureIndex should be either -1 (untextured) or a valid index (>= 0)
+        CHECK(hit.textureIndex >= -1);
+    }
 }
 
 // ============================================================================

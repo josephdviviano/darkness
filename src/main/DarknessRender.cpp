@@ -52,6 +52,8 @@
 #include "ObjectPropParser.h"
 #include "BinMeshParser.h"
 #include "RenderConfig.h"
+#include "RayCaster.h"
+#include "DebugConsole.h"
 
 // Logging (must be initialized before ServiceManager)
 #include "logger.h"
@@ -123,12 +125,15 @@ static void printHelp() {
         "  Q/E            Move up/down (alternate)\n"
         "  Ctrl           Sprint (3x speed)\n"
         "  Scroll wheel   Adjust movement speed (shown in title bar)\n"
-        "  C              Toggle portal culling on/off\n"
-        "  F              Cycle texture filtering (point/bilinear/trilinear/aniso)\n"
-        "  V              Toggle camera collision (clip/noclip)\n"
-        "  M/N            Cycle model isolation (next/prev)\n"
+        "  ` (backtick)   Open settings console\n"
         "  Home           Teleport to player spawn point\n"
         "  Esc            Quit\n"
+        "\n"
+        "Debug shortcuts (hold Backspace + key):\n"
+        "  BS+C           Toggle portal culling on/off\n"
+        "  BS+F           Cycle texture filtering (point/bilinear/trilinear/aniso)\n"
+        "  BS+V           Toggle camera collision (clip/noclip)\n"
+        "  BS+M/N         Cycle model isolation (next/prev)\n"
         "\n"
         "Resource setup:\n"
         "  The --res path should point to a directory containing fam.crf, which\n"
@@ -201,6 +206,8 @@ int main(int argc, char *argv[]) {
     float uvDistortion     = cfg.uvDistortion;
     float waterRotation    = cfg.waterRotation;
     float waterScrollSpeed = cfg.waterScrollSpeed;
+
+    bool showRaycast = false;   // Backspace+R: debug raycast visualization
 
     bool texturedMode = !resPath.empty();
 
@@ -400,6 +407,14 @@ int main(int argc, char *argv[]) {
     }
 
     std::fprintf(stderr, "Loaded %u cells\n", wrData.numCells);
+
+    // Inject raycaster into the world query facade — enables ray-vs-world
+    // queries (AI line-of-sight, physics, sound occlusion) via portal traversal
+    worldQuery->setRaycaster(
+        [&wrData](const Darkness::Vector3 &from, const Darkness::Vector3 &to,
+                  Darkness::RayHit &hit) {
+            return Darkness::raycastWorld(wrData, from, to, hit);
+        });
 
     // Build portal adjacency graph for portal culling
     auto cellPortals = buildPortalGraph(wrData);
@@ -832,6 +847,12 @@ int main(int argc, char *argv[]) {
     // View 1: World + objects pass — clears depth only, preserves sky colour
     bgfx::setViewClear(1, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
     bgfx::setViewRect(1, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+
+    // View 2: Debug overlay — no clear, renders on top of view 1.
+    // Separate view ensures debug lines are drawn AFTER all world geometry,
+    // regardless of bgfx's internal draw call sorting within a view.
+    bgfx::setViewClear(2, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+    bgfx::setViewRect(2, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
 
     PosColorVertex::init();
     PosColorUVVertex::init();
@@ -1380,7 +1401,7 @@ int main(int argc, char *argv[]) {
     }
 
     std::fprintf(stderr, "Controls: WASD=move, mouse=look, Space/LShift=up/down, "
-                 "scroll=speed, C=culling, F=filter, V=collision, M/N=isolate model, Home=spawn, Esc=quit\n");
+                 "scroll=speed, `=console, Home=spawn, BS+C/F/V/M/N/R=debug, Esc=quit\n");
 
     Camera cam;
     cam.init(spawnX, spawnY, spawnZ);
@@ -1429,6 +1450,55 @@ int main(int argc, char *argv[]) {
     };
     updateTitle();
 
+    // ── Debug console for runtime settings management ──
+    // Opened with backtick (`), provides tab-completion and value editing.
+    Darkness::DebugConsole dbgConsole;
+
+    dbgConsole.addCategorical("filter_mode",
+        {"point", "bilinear", "trilinear", "anisotropic"},
+        [&]() { return filterMode; },
+        [&](int v) { filterMode = v; updateTitle(); });
+
+    dbgConsole.addBool("portal_culling",
+        [&]() { return portalCulling; },
+        [&](bool v) { portalCulling = v; updateTitle(); });
+
+    dbgConsole.addBool("camera_collision",
+        [&]() { return cameraCollision; },
+        [&](bool v) { cameraCollision = v; updateTitle(); });
+
+    dbgConsole.addBool("show_objects",
+        [&]() { return showObjects; },
+        [&](bool v) { showObjects = v; });
+
+    dbgConsole.addBool("show_fallback_cubes",
+        [&]() { return showFallbackCubes; },
+        [&](bool v) { showFallbackCubes = v; });
+
+    dbgConsole.addBool("show_raycast",
+        [&]() { return showRaycast; },
+        [&](bool v) { showRaycast = v; });
+
+    dbgConsole.addFloat("move_speed", 1.0f, 500.0f,
+        [&]() { return moveSpeed; },
+        [&](float v) { moveSpeed = v; updateTitle(); });
+
+    dbgConsole.addFloat("wave_amplitude", 0.0f, 5.0f,
+        [&]() { return waveAmplitude; },
+        [&](float v) { waveAmplitude = v; });
+
+    dbgConsole.addFloat("uv_distortion", 0.0f, 0.5f,
+        [&]() { return uvDistortion; },
+        [&](float v) { uvDistortion = v; });
+
+    dbgConsole.addFloat("water_rotation", 0.0f, 0.5f,
+        [&]() { return waterRotation; },
+        [&](float v) { waterRotation = v; });
+
+    dbgConsole.addFloat("water_scroll", 0.0f, 1.0f,
+        [&]() { return waterScrollSpeed; },
+        [&](float v) { waterScrollSpeed = v; });
+
     uint64_t renderState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                          | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
                          | BGFX_STATE_CULL_CW;
@@ -1446,6 +1516,9 @@ int main(int argc, char *argv[]) {
 
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            // Debug console gets first crack at all events
+            if (dbgConsole.handleEvent(ev)) continue;
+
             if (ev.type == SDL_QUIT) {
                 running = false;
             } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
@@ -1474,20 +1547,23 @@ int main(int argc, char *argv[]) {
                 cam.pitch = 0;
                 std::fprintf(stderr, "Teleported to spawn (%.1f, %.1f, %.1f)\n",
                              spawnX, spawnY, spawnZ);
-            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c) {
-                // Toggle portal culling
+            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c
+                       && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
+                // Backspace+C: Toggle portal culling
                 portalCulling = !portalCulling;
                 std::fprintf(stderr, "Portal culling: %s\n",
                              portalCulling ? "ON" : "OFF");
-            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_f) {
-                // Cycle texture filtering: point -> bilinear -> trilinear -> anisotropic
+            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_f
+                       && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
+                // Backspace+F: Cycle texture filtering
                 filterMode = (filterMode + 1) % 4;
                 const char *filterNames[] = {
                     "point (crispy)", "bilinear", "trilinear", "anisotropic"
                 };
                 std::fprintf(stderr, "Texture filtering: %s\n", filterNames[filterMode]);
-            } else if (ev.type == SDL_KEYDOWN &&
-                       (ev.key.keysym.sym == SDLK_m || ev.key.keysym.sym == SDLK_n)) {
+            } else if (ev.type == SDL_KEYDOWN
+                       && (ev.key.keysym.sym == SDLK_m || ev.key.keysym.sym == SDLK_n)
+                       && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
                 // Model isolation: M = next model, N = previous model.
                 // Cycles through sorted model names, isolating one at a time.
                 // Past the last/first model returns to "show all" mode.
@@ -1514,40 +1590,49 @@ int main(int argc, char *argv[]) {
                     }
                     updateTitle();
                 }
-            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_v) {
-                // Toggle camera collision with world geometry
+            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_v
+                       && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
+                // Backspace+V: Toggle camera collision with world geometry
                 cameraCollision = !cameraCollision;
                 std::fprintf(stderr, "Camera collision: %s\n",
                              cameraCollision ? "ON (clip)" : "OFF (noclip)");
                 updateTitle();
+            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_r
+                       && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
+                // Backspace+R: Toggle debug raycast visualization
+                showRaycast = !showRaycast;
+                std::fprintf(stderr, "Raycast debug: %s\n",
+                             showRaycast ? "ON" : "OFF");
             }
         }
 
 
-        // Keyboard movement
-        const Uint8 *keys = SDL_GetKeyboardState(nullptr);
-        float forward = 0, right = 0, up = 0;
-        float speed = moveSpeed;
-        if (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL])
-            speed *= 3.0f;
+        // Keyboard movement — suppressed while debug console is open
+        if (!dbgConsole.isOpen()) {
+            const Uint8 *keys = SDL_GetKeyboardState(nullptr);
+            float forward = 0, right = 0, up = 0;
+            float speed = moveSpeed;
+            if (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL])
+                speed *= 3.0f;
 
-        if (keys[SDL_SCANCODE_W]) forward += speed * dt;
-        if (keys[SDL_SCANCODE_S]) forward -= speed * dt;
-        if (keys[SDL_SCANCODE_D]) right   += speed * dt;
-        if (keys[SDL_SCANCODE_A]) right   -= speed * dt;
-        if (keys[SDL_SCANCODE_SPACE])  up += speed * dt;
-        if (keys[SDL_SCANCODE_LSHIFT]) up -= speed * dt;
-        if (keys[SDL_SCANCODE_Q]) up += speed * dt;
-        if (keys[SDL_SCANCODE_E]) up -= speed * dt;
+            if (keys[SDL_SCANCODE_W]) forward += speed * dt;
+            if (keys[SDL_SCANCODE_S]) forward -= speed * dt;
+            if (keys[SDL_SCANCODE_D]) right   += speed * dt;
+            if (keys[SDL_SCANCODE_A]) right   -= speed * dt;
+            if (keys[SDL_SCANCODE_SPACE])  up += speed * dt;
+            if (keys[SDL_SCANCODE_LSHIFT]) up -= speed * dt;
+            if (keys[SDL_SCANCODE_Q]) up += speed * dt;
+            if (keys[SDL_SCANCODE_E]) up -= speed * dt;
 
-        // Save position before movement for collision revert
-        float oldPos[3] = { cam.pos[0], cam.pos[1], cam.pos[2] };
+            // Save position before movement for collision revert
+            float oldPos[3] = { cam.pos[0], cam.pos[1], cam.pos[2] };
 
-        cam.move(forward, right, up);
+            cam.move(forward, right, up);
 
-        // Camera collision: constrain sphere within world cell planes
-        if (cameraCollision) {
-            applyCameraCollision(wrData, oldPos, cam.pos);
+            // Camera collision: constrain sphere within world cell planes
+            if (cameraCollision) {
+                applyCameraCollision(wrData, oldPos, cam.pos);
+            }
         }
 
         // ── Animated lightmap update ──
@@ -1995,6 +2080,148 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+
+        // ── Debug raycast visualization (view 2 — on top of world) ──
+        // Casts a ray from the camera forward and draws the result as debug lines.
+        // Rendered in view 2 (separate from world geometry) so lines always appear
+        // on top regardless of bgfx's internal draw call sorting.
+        //
+        // Note: a line from camera to hit along the view direction is invisible
+        // (projects to a single pixel). Instead we draw a large cross at the hit
+        // point, a surface normal line, and a HUD text overlay.
+        if (showRaycast) {
+            // Set up view 2 with same transform as view 1
+            bgfx::setViewTransform(2, view, proj);
+
+            // Compute camera forward direction (same as Camera::getViewMatrix)
+            float cosPitch = std::cos(cam.pitch);
+            float fwdX = std::cos(cam.yaw) * cosPitch;
+            float fwdY = std::sin(cam.yaw) * cosPitch;
+            float fwdZ = std::sin(cam.pitch);
+
+            // Ray from camera position, extending forward up to 500 world units
+            constexpr float RAY_VIS_DIST = 500.0f;
+            Vector3 rayFrom(cam.pos[0], cam.pos[1], cam.pos[2]);
+            Vector3 rayTo(cam.pos[0] + fwdX * RAY_VIS_DIST,
+                          cam.pos[1] + fwdY * RAY_VIS_DIST,
+                          cam.pos[2] + fwdZ * RAY_VIS_DIST);
+
+            RayHit rayHit;
+            bool rayDidHit = Darkness::raycastWorld(wrData, rayFrom, rayTo, rayHit);
+
+            // Draw debug lines using bgfx transient vertex buffers.
+            // Hit: normal (2) + cross (6) + offset ray (2) = 10.  Miss: ray (2).
+            constexpr uint32_t MAX_DEBUG_VERTS = 10;
+            bgfx::TransientVertexBuffer tvb;
+            if (bgfx::getAvailTransientVertexBuffer(MAX_DEBUG_VERTS, PosColorVertex::layout) >= MAX_DEBUG_VERTS) {
+                bgfx::allocTransientVertexBuffer(&tvb, MAX_DEBUG_VERTS, PosColorVertex::layout);
+                auto *verts = reinterpret_cast<PosColorVertex *>(tvb.data);
+                uint32_t numVerts = 0;
+
+                // Helper: emit one debug vertex
+                auto addVert = [&](float vx, float vy, float vz, uint32_t color) {
+                    verts[numVerts].x = vx;
+                    verts[numVerts].y = vy;
+                    verts[numVerts].z = vz;
+                    verts[numVerts].abgr = color;
+                    ++numVerts;
+                };
+
+                // Colors (ABGR format for bgfx)
+                uint32_t green  = 0xFF00FF00;  // hit ray segment
+                uint32_t yellow = 0xFF00FFFF;  // miss ray segment
+                uint32_t cyan   = 0xFFFFFF00;  // surface normal
+                uint32_t red    = 0xFF0000FF;  // hit marker cross
+
+                if (rayDidHit) {
+                    // Cyan line: surface normal at hit point (4 unit length)
+                    constexpr float NORM_LEN = 4.0f;
+                    addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z, cyan);
+                    addVert(rayHit.point.x + rayHit.normal.x * NORM_LEN,
+                            rayHit.point.y + rayHit.normal.y * NORM_LEN,
+                            rayHit.point.z + rayHit.normal.z * NORM_LEN, cyan);
+
+                    // Red cross at hit point (3 axes, 2 unit half-size — visible at distance)
+                    constexpr float CROSS = 2.0f;
+                    addVert(rayHit.point.x - CROSS, rayHit.point.y, rayHit.point.z, red);
+                    addVert(rayHit.point.x + CROSS, rayHit.point.y, rayHit.point.z, red);
+                    addVert(rayHit.point.x, rayHit.point.y - CROSS, rayHit.point.z, red);
+                    addVert(rayHit.point.x, rayHit.point.y + CROSS, rayHit.point.z, red);
+                    addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z - CROSS, red);
+                    addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z + CROSS, red);
+
+                    // Green line: from hit point pulled back slightly toward camera,
+                    // offset perpendicular so it's not collinear with the view ray.
+                    // This gives a visible green "approach" line near the hit.
+                    constexpr float PULLBACK = 5.0f;
+                    constexpr float OFFSET = 0.3f;
+                    // Camera right vector for perpendicular offset
+                    float rtX = std::sin(cam.yaw);
+                    float rtY = -std::cos(cam.yaw);
+                    addVert(rayHit.point.x - fwdX * PULLBACK + rtX * OFFSET,
+                            rayHit.point.y - fwdY * PULLBACK + rtY * OFFSET,
+                            rayHit.point.z - fwdZ * PULLBACK, green);
+                    addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z, green);
+                } else {
+                    // Yellow line: camera → ray end (visible against sky/void)
+                    addVert(cam.pos[0], cam.pos[1], cam.pos[2], yellow);
+                    addVert(rayTo.x, rayTo.y, rayTo.z, yellow);
+                }
+
+                // Submit to view 2 (debug overlay) — no depth test so lines
+                // render on top of world geometry
+                float identity[16];
+                bx::mtxIdentity(identity);
+                bgfx::setTransform(identity);
+                bgfx::setVertexBuffer(0, &tvb, 0, numVerts);
+                uint64_t lineState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                                   | BGFX_STATE_PT_LINES;
+                bgfx::setState(lineState);
+                setFogOn();
+                bgfx::submit(2, flatProgram);
+            }
+
+            // HUD text overlay showing raycast results
+            bgfx::setDebug(BGFX_DEBUG_TEXT);
+            bgfx::dbgTextClear();
+
+            // Screen-center crosshair (160 cols x 45 rows at 1280x720)
+            uint8_t cross_attr = 0x0E; // yellow on black
+            bgfx::dbgTextPrintf(79, 22, cross_attr, "+");
+
+            uint8_t hud_attr = 0x0F; // white on black
+            uint8_t val_attr = 0x0A; // green on black
+
+            bgfx::dbgTextPrintf(2, 1, hud_attr, "RAYCAST DEBUG (Backspace+R to toggle)");
+
+            if (rayDidHit) {
+                bgfx::dbgTextPrintf(2, 3, val_attr, "Hit:     YES");
+                bgfx::dbgTextPrintf(2, 4, val_attr, "Dist:    %.2f", rayHit.distance);
+                bgfx::dbgTextPrintf(2, 5, val_attr, "Point:   (%.2f, %.2f, %.2f)",
+                    rayHit.point.x, rayHit.point.y, rayHit.point.z);
+                bgfx::dbgTextPrintf(2, 6, val_attr, "Normal:  (%.3f, %.3f, %.3f)",
+                    rayHit.normal.x, rayHit.normal.y, rayHit.normal.z);
+                bgfx::dbgTextPrintf(2, 7, val_attr, "TexIdx:  %d",
+                    rayHit.textureIndex);
+                // Show texture name if available from TXLIST
+                if (rayHit.textureIndex >= 0 &&
+                    static_cast<size_t>(rayHit.textureIndex) < txList.textures.size()) {
+                    const auto &tex = txList.textures[rayHit.textureIndex];
+                    bgfx::dbgTextPrintf(2, 8, val_attr, "Texture: %s/%s",
+                        tex.family.c_str(), tex.name.c_str());
+                }
+            } else {
+                bgfx::dbgTextPrintf(2, 3, 0x0C, "Hit:     NO (miss)");
+            }
+
+            // Camera info line
+            int32_t camCellIdx = findCameraCell(wrData, cam.pos[0], cam.pos[1], cam.pos[2]);
+            bgfx::dbgTextPrintf(2, 10, hud_attr, "Camera:  (%.2f, %.2f, %.2f)  cell=%d",
+                cam.pos[0], cam.pos[1], cam.pos[2], camCellIdx);
+        }
+
+        // Debug console overlay (no-op when closed)
+        dbgConsole.render();
 
         bgfx::frame();
     }

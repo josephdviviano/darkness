@@ -195,7 +195,10 @@ public:
     virtual std::vector<EntityID> queryRadius(const Vector3 &center,
                                               float radius) const = 0;
 
-    /// Find all entities within a view frustum
+    /// Find all entities within an axis-aligned bounding box
+    virtual std::vector<EntityID> queryAABB(const BBox &box) const = 0;
+
+    /// Find all entities within a view frustum (conservative AABB approximation)
     virtual std::vector<EntityID> queryFrustum(
         const Vector3 &origin, const Vector3 &forward, float fovRadians,
         float aspect, float nearDist, float farDist) const = 0;
