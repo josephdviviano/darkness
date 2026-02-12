@@ -36,6 +36,8 @@
 
 #include "logger.h"
 
+#include <vector>
+
 namespace Darkness {
 /*------------------------------------------------------*/
 /*-------------------- ObjectService -------------------*/
@@ -370,22 +372,16 @@ void ObjectService::_load(const FileGroupPtr &db, uint loadMask) {
     // Calculate the objvec bitmap size
     size_t bsize = f->size() - 2 * sizeof(int32_t);
 
-    unsigned char *bitmap = new unsigned char[bsize + 1];
-
-    for (size_t idx = 0; idx <= bsize;
-         idx++) // fill the whole buf with zeros, even the padding at the end
-        bitmap[idx] = 0;
-
-    f->read(bitmap, bsize);
+    // Load and unpack bitmap into a temporary vector
+    std::vector<unsigned char> bitmap(bsize + 1, 0);
+    f->read(bitmap.data(), bsize);
 
     // bit array going to be used to merge the objects (from file, and those in
     // mem)
-    BitArray fileObjs(bitmap, bsize, minID, maxID);
+    BitArray fileObjs(bitmap.data(), bsize, minID, maxID);
 
     // grow the system to allow the stored objects to flow in
     grow(minID, maxID);
-
-    delete[] bitmap; // not needed anymore, was copied into the fileObjs
 
     // current position in the bitmap
     int id;
@@ -533,15 +529,12 @@ void ObjectService::_save(const FileGroupPtr &db, uint saveMask) {
 
     size_t siz = objmask.getByteSize();
 
-    char *buf = new char[siz];
-
-    objmask.fillBuffer(buf);
+    std::vector<char> buf(siz);
+    objmask.fillBuffer(buf.data());
 
     ovf->writeElem(&minid, 4);
     ovf->writeElem(&maxid, 4);
-    ovf->write(buf, siz);
-
-    delete[] buf;
+    ovf->write(buf.data(), siz);
 
     // serialize the properties and links
     mLinkService->save(db, saveMask);

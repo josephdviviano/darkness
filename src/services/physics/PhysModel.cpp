@@ -105,7 +105,7 @@ void PhysModel::read(const FilePtr &sf, unsigned int physVersion)
     *sf >> unk >> unk;
 
     // SubModels...
-    mSubModels.grow(mSubModelCount);
+    mSubModels.resize(mSubModelCount);
 
     for (unsigned int i = 0; i < mSubModelCount; ++i) {
         SubModel &sm = mSubModels[i];
@@ -118,6 +118,7 @@ void PhysModel::read(const FilePtr &sf, unsigned int physVersion)
     *sf >> mMainSubModel;
 
     // Following are what seems to be relative submodel positions
+    mRelPos.resize(mSubModelCount);  // was missing — latent bug in original code
     for (unsigned int i = 0; i < mSubModelCount; ++i) {
         *sf >> mRelPos[i];
     }
@@ -184,6 +185,7 @@ void PhysModel::clear(void)
     mSubModelTypes.clear();
     mSprings.clear();
     mSubModels.clear();
+    mRelPos.clear();
 }
 
 } // namespace Darkness

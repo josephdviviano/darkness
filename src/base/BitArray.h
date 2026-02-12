@@ -25,8 +25,10 @@
 #ifndef __BITARRAY_H
 #define __BITARRAY_H
 
+#include <algorithm>
 #include <cassert>
-#include <string.h>
+#include <cstring>
+#include <vector>
 
 #include "DarknessException.h"
 
@@ -36,47 +38,23 @@ namespace Darkness {
 class BitArray {
 public:
     /// constructs a new empty bitarray
-    BitArray()
-        : mNegativeArray(NULL), mPositiveArray(NULL), mMinIndex(1),
-          mMaxIndex(-1){};
+    BitArray() : mMinIndex(1), mMaxIndex(-1) {};
 
     /// constructs a new bitarray with a specified min and max boundaries (all
     /// values false)
-    explicit BitArray(int min, int max)
-        : mNegativeArray(NULL), mPositiveArray(NULL), mMinIndex(1),
-          mMaxIndex(-1) {
+    explicit BitArray(int min, int max) : mMinIndex(1), mMaxIndex(-1) {
         grow(min, max);
     }
 
-    /// copy constructor
-    BitArray(const BitArray &b) {
-        // copy the bounds
-        mMinIndex = b.mMinIndex;
-        mMaxIndex = b.mMaxIndex;
+    /// copy constructor — vector members handle deep copy automatically
+    BitArray(const BitArray &b) = default;
 
-        mPositiveArray = NULL;
-        mNegativeArray = NULL;
-
-        // allocate space
-        if (b.mNegativeArray != NULL) {
-            size_t bsize = getSizeFromIndex(-mMinIndex);
-            mNegativeArray = (unsigned char *)(malloc(bsize));
-            // copy the values
-            memcpy(mNegativeArray, b.mNegativeArray, bsize);
-        }
-
-        if (b.mPositiveArray != NULL) {
-            size_t bsize = getSizeFromIndex(mMaxIndex);
-            mPositiveArray = (unsigned char *)(malloc(bsize));
-            // copy the values
-            memcpy(mPositiveArray, b.mPositiveArray, bsize);
-        }
-    }
+    /// copy assignment
+    BitArray &operator=(const BitArray &b) = default;
 
     /// constructs a bitarray as a copy of a source buffer of a given size
     BitArray(unsigned char *source, int size, int min, int max)
-        : mNegativeArray(NULL), mPositiveArray(NULL), mMinIndex(1),
-          mMaxIndex(-1) {
+        : mMinIndex(1), mMaxIndex(-1) {
 
         assert(max > min);
 
@@ -96,16 +74,12 @@ public:
         }
     };
 
-    ~BitArray() { clear(); }
+    ~BitArray() = default;
 
     /// clear method - clears the array - reinitializes it to zero element sized
     void clear() {
-        // now get rid of the arrays
-        free(mNegativeArray);
-        free(mPositiveArray);
-
-        mNegativeArray = NULL;
-        mPositiveArray = NULL;
+        mNegativeArray.clear();
+        mPositiveArray.clear();
 
         mMinIndex = 1;
         mMaxIndex = -1;
@@ -121,18 +95,18 @@ public:
 
         // depending on the index sign, we either access negative
         // or positive array
-        unsigned char *arrayRef;
+        const uint8_t *arrayRef;
 
         // character and bit positions
         size_t cpos;
         size_t bpos;
 
         if (index < 0) {
-            arrayRef = mNegativeArray;
+            arrayRef = mNegativeArray.data();
             cpos = getIndex(-index - 1);
             bpos = getOffset(-index - 1);
         } else {
-            arrayRef = mPositiveArray;
+            arrayRef = mPositiveArray.data();
             cpos = getIndex(index);
             bpos = getOffset(index);
         }
@@ -151,18 +125,18 @@ public:
             DARKNESS_ARRAY_EXCEPT("BitArray: Index out of bounds");
 
         // remap the id
-        unsigned char *arrayRef;
+        uint8_t *arrayRef;
 
         // character and bit positions
         size_t cpos;
         size_t bpos;
 
         if (index < 0) {
-            arrayRef = mNegativeArray;
+            arrayRef = mNegativeArray.data();
             cpos = getIndex(-index - 1);
             bpos = getOffset(-index - 1);
         } else {
-            arrayRef = mPositiveArray;
+            arrayRef = mPositiveArray.data();
             cpos = getIndex(index);
             bpos = getOffset(index);
         }
@@ -211,8 +185,8 @@ public:
 
     /// clears the array values, setting all bits to false
     void clearBits() {
-        memset(mNegativeArray, 0, getSizeFromIndex(-mMinIndex));
-        memset(mPositiveArray, 0, getSizeFromIndex(mMaxIndex));
+        std::fill(mNegativeArray.begin(), mNegativeArray.end(), uint8_t(0));
+        std::fill(mPositiveArray.begin(), mPositiveArray.end(), uint8_t(0));
     };
 
     /// clears the array and sets new min and max boundary values
@@ -234,7 +208,7 @@ public:
             DARKNESS_ARRAY_EXCEPT(
                 "BitArray: Min index has to be equal to zero or less");
 
-        growBuf(&mNegativeArray, -mMinIndex, -min);
+        growBuf(mNegativeArray, -mMinIndex, -min);
         mMinIndex = min;
     }
 
@@ -244,7 +218,7 @@ public:
             DARKNESS_ARRAY_EXCEPT(
                 "BitArray: Max index has to be greater or equal to zero");
 
-        growBuf(&mPositiveArray, mMaxIndex, max);
+        growBuf(mPositiveArray, mMaxIndex, max);
         mMaxIndex = max;
     }
 
@@ -276,35 +250,22 @@ public:
     bool operator[](int index) const { return getBit(index); };
 
 protected:
-    /// grows the specified buffer to accompany the new size
-    void growBuf(unsigned char **ptr, int oldIndex, int newIndex) {
+    /// grows the specified buffer to accommodate the new index range
+    void growBuf(std::vector<uint8_t> &buf, int oldIndex, int newIndex) {
         if (newIndex < oldIndex)
             DARKNESS_ARRAY_EXCEPT("BitArray: Shrinking not allowed");
 
-        size_t oldByteSize;
-        if (oldIndex < 0)
-            oldByteSize = 0;
-        else
-            oldByteSize = getSizeFromIndex(oldIndex);
-
         size_t newByteSize;
-
         if (newIndex < 0)
             newByteSize = 0;
         else
             newByteSize = getSizeFromIndex(newIndex);
 
-        if (newByteSize == oldByteSize)
+        if (newByteSize == buf.size())
             return;
 
-        unsigned char *newptr = (unsigned char *)(realloc(*ptr, newByteSize));
-
-        if (newptr == NULL) // realloc failed
-            DARKNESS_ARRAY_EXCEPT("BitArray: Growth failed");
-
-        *ptr = newptr;
-
-        memset((*ptr) + oldByteSize, 0, newByteSize - oldByteSize);
+        // resize with zero-fill for new bytes (preserves existing values)
+        buf.resize(newByteSize, 0);
     }
 
     /// byte offset of an address getter
@@ -321,8 +282,8 @@ protected:
         return size_t(getIndex(index)) + 1;
     }
 
-    unsigned char *mNegativeArray;
-    unsigned char *mPositiveArray;
+    std::vector<uint8_t> mNegativeArray;
+    std::vector<uint8_t> mPositiveArray;
 
     int mMinIndex, mMaxIndex;
 };

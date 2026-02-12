@@ -71,7 +71,12 @@ Property::Property(PropertyService *owner, const std::string &name,
 }
 
 // --------------------------------------------------------------------------
-Property::~Property() {}
+Property::~Property() {
+    // Defensive: ensure shutdown was called to release inheritor resources
+    if (mInheritor) {
+        shutdown();
+    }
+}
 
 // --------------------------------------------------------------------------
 void Property::shutdown() {

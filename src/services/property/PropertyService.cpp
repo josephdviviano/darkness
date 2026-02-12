@@ -70,12 +70,7 @@ PropertyService::PropertyService(ServiceManager *manager,
 
 // --------------------------------------------------------------------------
 PropertyService::~PropertyService() {
-    PropertyList::iterator it = mOwnedProperties.begin();
-
-    for (; it != mOwnedProperties.end(); ++it) {
-        delete *it;
-    }
-
+    // unique_ptr handles property deletion automatically
     mOwnedProperties.clear();
     mPropertyMap.clear();
 }
@@ -103,31 +98,31 @@ Property *PropertyService::createProperty(const std::string &name,
                                           const std::string &chunkName,
                                           std::string inheritorName,
                                           const DataStoragePtr &storage) {
-    Property *nr;
+    std::unique_ptr<Property> nr;
     try {
-        nr = new Property(this, name, chunkName, storage, inheritorName);
+        nr = std::make_unique<Property>(this, name, chunkName, storage, inheritorName);
     } catch (...) {
         DARKNESS_EXCEPT(format("Failed to create property for ", name));
     }
 
+    Property *raw = nr.get();
+
     std::pair<PropertyMap::iterator, bool> res =
-        mPropertyMap.insert(make_pair(name, nr));
+        mPropertyMap.insert(make_pair(name, raw));
 
     if (!res.second) {
-        delete nr;
-
         DARKNESS_EXCEPT(format("Failed to insert new instance of Property, name already "
                     "allocated : ", name));
     }
 
-    // insert the pointer into the to be freed list
-    mOwnedProperties.push_back(nr);
+    // transfer ownership to the owned list
+    mOwnedProperties.push_back(std::move(nr));
 
     LOG_INFO("PropertyService::createProperty: Created a property %s (With "
              "chunk name %s)",
              name.c_str(), chunkName.c_str());
 
-    return nr;
+    return raw;
 }
 
 // --------------------------------------------------------------------------

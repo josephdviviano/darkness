@@ -26,7 +26,8 @@
 
 #include "config.h"
 
-#include <list>
+#include <memory>
+#include <vector>
 
 #include "FileGroup.h"
 #include "MessageSource.h"
@@ -153,7 +154,7 @@ public:
     /// maps properties to their names
     typedef std::map<std::string, Property *> PropertyMap;
 
-    typedef std::list<Property *> PropertyList;
+    typedef std::vector<std::unique_ptr<Property>> PropertyList;
 
 protected:
     /// service initialization
