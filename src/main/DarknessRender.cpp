@@ -1211,20 +1211,18 @@ int main(int argc, char *argv[]) {
     const char *misPath    = cli.misPath;
     std::string resPath    = cli.resPath;
     int  lmScale           = cfg.lmScale;
-    bool showObjects       = cfg.showObjects;
-    bool showFallbackCubes = cfg.showFallbackCubes;
+    state.showObjects       = cfg.showObjects;
+    state.showFallbackCubes = cfg.showFallbackCubes;
     bool forceFlicker      = cfg.forceFlicker;
-    bool portalCulling     = cfg.portalCulling;
-    bool cameraCollision   = cfg.cameraCollision;
-    int  filterMode        = cfg.filterMode;
+    state.portalCulling     = cfg.portalCulling;
+    state.cameraCollision   = cfg.cameraCollision;
+    state.filterMode        = cfg.filterMode;
     bool linearMips        = cfg.linearMips;
     bool sharpMips         = cfg.sharpMips;
-    float waveAmplitude    = cfg.waveAmplitude;
-    float uvDistortion     = cfg.uvDistortion;
-    float waterRotation    = cfg.waterRotation;
-    float waterScrollSpeed = cfg.waterScrollSpeed;
-
-    bool showRaycast = false;   // Backspace+R: debug raycast visualization
+    state.waveAmplitude    = cfg.waveAmplitude;
+    state.uvDistortion     = cfg.uvDistortion;
+    state.waterRotation    = cfg.waterRotation;
+    state.waterScrollSpeed = cfg.waterScrollSpeed;
 
     mission.texturedMode = !resPath.empty();
 
@@ -1674,18 +1672,18 @@ int main(int argc, char *argv[]) {
     // ── Parse object placements from .mis ──
 
     // mission.objData populated below
-    if (showObjects) {
+    if (state.showObjects) {
         try {
             Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
             mission.objData = Darkness::parseObjectProps(propSvc.get(), misPath,
                                                     cfg.debugObjects);
         } catch (const std::exception &e) {
             std::fprintf(stderr, "Failed to parse object props: %s\n", e.what());
-            showObjects = false;
+            state.showObjects = false;
         }
         if (mission.objData.objects.empty()) {
             std::fprintf(stderr, "No objects to render\n");
-            showObjects = false;
+            state.showObjects = false;
         }
     }
 
@@ -1693,7 +1691,7 @@ int main(int argc, char *argv[]) {
     // Objects don't move (yet), so this is a one-time lookup at load time.
     // -1 = outside all cells (always rendered to avoid popping).
     // mission.objCellIDs populated below
-    if (showObjects) {
+    if (state.showObjects) {
         mission.objCellIDs.resize(mission.objData.objects.size());
         for (size_t i = 0; i < mission.objData.objects.size(); ++i) {
             const auto &obj = mission.objData.objects[i];
@@ -1708,7 +1706,7 @@ int main(int argc, char *argv[]) {
     // Load .bin models from obj.crf (if --res provided and objects enabled)
     // mission.parsedModels populated below
 
-    if (showObjects && !resPath.empty()) {
+    if (state.showObjects && !resPath.empty()) {
         Darkness::CRFModelLoader modelLoader(resPath);
         if (modelLoader.isOpen()) {
             int loaded = 0, failed = 0;
@@ -1796,8 +1794,8 @@ int main(int argc, char *argv[]) {
     Darkness::GPUResources gpu;
     Darkness::BuiltMeshes meshes;
 
-    uint32_t skyClearColor;
-    SDL_Window *window = initWindow(mission.fogParams, skyClearColor);
+    // state.skyClearColor set by initWindow
+    SDL_Window *window = initWindow(mission.fogParams, state.skyClearColor);
     if (!window) return 1;
 
     // ── Shaders ──
@@ -1839,12 +1837,12 @@ int main(int argc, char *argv[]) {
 
     // ── Build lightmap atlas (if textured mode) ──
 
-    bool lightmappedMode = false;
+    // meshes.lightmappedMode set below if lightmap atlas builds successfully
 
     if (mission.texturedMode) {
         gpu.lmAtlasSet = Darkness::buildLightmapAtlases(mission.wrData, lmScale);
         if (!gpu.lmAtlasSet.atlases.empty()) {
-            lightmappedMode = true;
+            meshes.lightmappedMode = true;
 
             // Initial blend pass: apply animated overlays at initial intensities.
             // buildLightmapAtlases() only wrote static lightmaps into the atlas.
@@ -1910,7 +1908,7 @@ int main(int argc, char *argv[]) {
 
     float camX, camY, camZ;
 
-    if (lightmappedMode) {
+    if (meshes.lightmappedMode) {
         meshes.lmMesh = buildLightmappedMesh(mission.wrData, mission.texDims, gpu.lmAtlasSet);
         camX = meshes.lmMesh.cx; camY = meshes.lmMesh.cy; camZ = meshes.lmMesh.cz;
 
@@ -2033,9 +2031,9 @@ int main(int argc, char *argv[]) {
 
     // ── Build water surface mesh from portal polygons ──
     meshes.waterMesh = buildWaterMesh(mission.wrData, mission.texDims, mission.flowData, mission.flowTexDims);
-    bool hasWater = !meshes.waterMesh.vertices.empty();
+    meshes.hasWater = !meshes.waterMesh.vertices.empty();
 
-    if (hasWater) {
+    if (meshes.hasWater) {
         gpu.waterVBH = bgfx::createVertexBuffer(
             bgfx::copy(meshes.waterMesh.vertices.data(),
                         static_cast<uint32_t>(meshes.waterMesh.vertices.size() * sizeof(PosColorUVVertex))),
@@ -2050,7 +2048,7 @@ int main(int argc, char *argv[]) {
 
     // gpu.objModelGPU, gpu.objTextureHandles, gpu.fallbackCube* populated below
 
-    if (showObjects) {
+    if (state.showObjects) {
         // Build fallback cube
         {
             std::vector<PosColorVertex> cubeVerts;
@@ -2219,33 +2217,31 @@ int main(int argc, char *argv[]) {
     // ── Model isolation state for debugging ──
     // Sorted list of model names that have loaded GPU data, with instance counts.
     // Press N to cycle through, isolating one model at a time for identification.
-    std::vector<std::string> sortedModelNames;
-    std::unordered_map<std::string, int> modelInstanceCounts;
-    int isolateModelIdx = -1;  // -1 = show all, 0..N-1 = isolate that model
+    // state.sortedModelNames, state.modelInstanceCounts, state.isolateModelIdx populated below
 
-    if (showObjects) {
+    if (state.showObjects) {
         // Count instances per model name
         for (const auto &obj : mission.objData.objects) {
             if (!obj.hasPosition) continue;
             std::string mn(obj.modelName);
-            modelInstanceCounts[mn]++;
+            state.modelInstanceCounts[mn]++;
         }
 
         // Build sorted list of models that have GPU data (loaded successfully)
         for (const auto &kv : gpu.objModelGPU) {
             if (kv.second.valid)
-                sortedModelNames.push_back(kv.first);
+                state.sortedModelNames.push_back(kv.first);
         }
-        std::sort(sortedModelNames.begin(), sortedModelNames.end());
+        std::sort(state.sortedModelNames.begin(), state.sortedModelNames.end());
 
         // Count unloaded models (fallback cube candidates)
         int unloadedCount = 0;
-        for (const auto &kv : modelInstanceCounts) {
+        for (const auto &kv : state.modelInstanceCounts) {
             if (gpu.objModelGPU.find(kv.first) == gpu.objModelGPU.end() || !gpu.objModelGPU[kv.first].valid)
                 ++unloadedCount;
         }
         std::fprintf(stderr, "Model isolation: %zu loaded, %d unloaded (M=next, N=prev)\n",
-                     sortedModelNames.size(), unloadedCount);
+                     state.sortedModelNames.size(), unloadedCount);
     }
 
 
@@ -2290,24 +2286,24 @@ int main(int argc, char *argv[]) {
                      gpu.skyboxTexHandles.size());
     }
 
-    const char *modeStr = lightmappedMode ? "lightmapped" :
+    const char *modeStr = meshes.lightmappedMode ? "lightmapped" :
                           mission.texturedMode ? "textured" : "flat-shaded";
     std::fprintf(stderr, "Render window opened (%dx%d, %s, %s)\n",
                  WINDOW_WIDTH, WINDOW_HEIGHT,
                  bgfx::getRendererName(rendererType), modeStr);
     std::fprintf(stderr, "Portal culling: %s (toggle with C key)\n",
-                 portalCulling ? "ON" : "OFF");
+                 state.portalCulling ? "ON" : "OFF");
 
     // Use spawn point if found, otherwise fall back to centroid
-    float spawnX = camX, spawnY = camY, spawnZ = camZ;
-    float spawnYaw = 0.0f;
+    state.spawnX = camX; state.spawnY = camY; state.spawnZ = camZ;
+    state.spawnYaw = 0.0f;
     if (mission.spawnInfo.found) {
-        spawnX = mission.spawnInfo.x;
-        spawnY = mission.spawnInfo.y;
-        spawnZ = mission.spawnInfo.z;
-        spawnYaw = mission.spawnInfo.yaw;
+        state.spawnX = mission.spawnInfo.x;
+        state.spawnY = mission.spawnInfo.y;
+        state.spawnZ = mission.spawnInfo.z;
+        state.spawnYaw = mission.spawnInfo.yaw;
         std::fprintf(stderr, "Camera at spawn (%.1f, %.1f, %.1f)\n",
-                     spawnX, spawnY, spawnZ);
+                     state.spawnX, state.spawnY, state.spawnZ);
     } else {
         std::fprintf(stderr, "Camera at centroid (%.1f, %.1f, %.1f)\n",
                      camX, camY, camZ);
@@ -2316,46 +2312,45 @@ int main(int argc, char *argv[]) {
     std::fprintf(stderr, "Controls: WASD=move, mouse=look, Space/LShift=up/down, "
                  "scroll=speed, `=console, Home=spawn, BS+C/F/V/M/N/R=debug, Esc=quit\n");
 
-    Camera cam;
-    cam.init(spawnX, spawnY, spawnZ);
-    cam.yaw = spawnYaw;
+    // state.cam initialized below
+    state.cam.init(state.spawnX, state.spawnY, state.spawnZ);
+    state.cam.yaw = state.spawnYaw;
 
     SDL_SetRelativeMouseMode(SDL_TRUE);
 
-    float moveSpeed = 20.0f; // adjustable via scroll wheel
+    // state.moveSpeed has default 20.0f from struct initializer
 
     // Portal culling stats for title bar display
-    uint32_t cullVisibleCells = 0;  // updated each frame when culling is on
-    uint32_t cullTotalCells = mission.wrData.numCells;
+    state.cullTotalCells = mission.wrData.numCells;
 
     // Helper to update window title with current speed, culling, and filter stats
     auto updateTitle = [&]() {
         char title[512];
         const char *filterNames[] = { "point", "bilinear", "trilinear", "aniso" };
-        const char *filterStr = filterNames[filterMode % 4];
+        const char *filterStr = filterNames[state.filterMode % 4];
 
         // Build model isolation suffix if active
         char isoSuffix[128] = "";
-        if (isolateModelIdx >= 0 && isolateModelIdx < (int)sortedModelNames.size()) {
-            const auto &isoName = sortedModelNames[isolateModelIdx];
-            auto cit = modelInstanceCounts.find(isoName);
-            int cnt = (cit != modelInstanceCounts.end()) ? cit->second : 0;
+        if (state.isolateModelIdx >= 0 && state.isolateModelIdx < (int)state.sortedModelNames.size()) {
+            const auto &isoName = state.sortedModelNames[state.isolateModelIdx];
+            auto cit = state.modelInstanceCounts.find(isoName);
+            int cnt = (cit != state.modelInstanceCounts.end()) ? cit->second : 0;
             std::snprintf(isoSuffix, sizeof(isoSuffix),
                 " [MODEL %d/%zu: %s x%d]",
-                isolateModelIdx + 1, sortedModelNames.size(),
+                state.isolateModelIdx + 1, state.sortedModelNames.size(),
                 isoName.c_str(), cnt);
         }
 
-        const char *clipStr = cameraCollision ? "clip" : "noclip";
+        const char *clipStr = state.cameraCollision ? "clip" : "noclip";
 
-        if (portalCulling) {
+        if (state.portalCulling) {
             std::snprintf(title, sizeof(title),
                 "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s] [%s]%s",
-                modeStr, moveSpeed, cullVisibleCells, cullTotalCells, filterStr, clipStr, isoSuffix);
+                modeStr, state.moveSpeed, state.cullVisibleCells, state.cullTotalCells, filterStr, clipStr, isoSuffix);
         } else {
             std::snprintf(title, sizeof(title),
                 "darkness — %s [speed: %.1f] [cull: OFF] [%s] [%s]%s",
-                modeStr, moveSpeed, filterStr, clipStr, isoSuffix);
+                modeStr, state.moveSpeed, filterStr, clipStr, isoSuffix);
         }
         SDL_SetWindowTitle(window, title);
     };
@@ -2367,92 +2362,90 @@ int main(int argc, char *argv[]) {
 
     dbgConsole.addCategorical("filter_mode",
         {"point", "bilinear", "trilinear", "anisotropic"},
-        [&]() { return filterMode; },
-        [&](int v) { filterMode = v; updateTitle(); });
+        [&]() { return state.filterMode; },
+        [&](int v) { state.filterMode = v; updateTitle(); });
 
     dbgConsole.addBool("portal_culling",
-        [&]() { return portalCulling; },
-        [&](bool v) { portalCulling = v; updateTitle(); });
+        [&]() { return state.portalCulling; },
+        [&](bool v) { state.portalCulling = v; updateTitle(); });
 
     dbgConsole.addBool("camera_collision",
-        [&]() { return cameraCollision; },
-        [&](bool v) { cameraCollision = v; updateTitle(); });
+        [&]() { return state.cameraCollision; },
+        [&](bool v) { state.cameraCollision = v; updateTitle(); });
 
     dbgConsole.addBool("show_objects",
-        [&]() { return showObjects; },
-        [&](bool v) { showObjects = v; });
+        [&]() { return state.showObjects; },
+        [&](bool v) { state.showObjects = v; });
 
     dbgConsole.addBool("show_fallback_cubes",
-        [&]() { return showFallbackCubes; },
-        [&](bool v) { showFallbackCubes = v; });
+        [&]() { return state.showFallbackCubes; },
+        [&](bool v) { state.showFallbackCubes = v; });
 
     dbgConsole.addBool("show_raycast",
-        [&]() { return showRaycast; },
-        [&](bool v) { showRaycast = v; });
+        [&]() { return state.showRaycast; },
+        [&](bool v) { state.showRaycast = v; });
 
     dbgConsole.addFloat("move_speed", 1.0f, 500.0f,
-        [&]() { return moveSpeed; },
-        [&](float v) { moveSpeed = v; updateTitle(); });
+        [&]() { return state.moveSpeed; },
+        [&](float v) { state.moveSpeed = v; updateTitle(); });
 
     dbgConsole.addFloat("wave_amplitude", 0.0f, 5.0f,
-        [&]() { return waveAmplitude; },
-        [&](float v) { waveAmplitude = v; });
+        [&]() { return state.waveAmplitude; },
+        [&](float v) { state.waveAmplitude = v; });
 
     dbgConsole.addFloat("uv_distortion", 0.0f, 0.5f,
-        [&]() { return uvDistortion; },
-        [&](float v) { uvDistortion = v; });
+        [&]() { return state.uvDistortion; },
+        [&](float v) { state.uvDistortion = v; });
 
     dbgConsole.addFloat("water_rotation", 0.0f, 0.5f,
-        [&]() { return waterRotation; },
-        [&](float v) { waterRotation = v; });
+        [&]() { return state.waterRotation; },
+        [&](float v) { state.waterRotation = v; });
 
     dbgConsole.addFloat("water_scroll", 0.0f, 1.0f,
-        [&]() { return waterScrollSpeed; },
-        [&](float v) { waterScrollSpeed = v; });
+        [&]() { return state.waterScrollSpeed; },
+        [&](float v) { state.waterScrollSpeed = v; });
 
     auto lastTime = std::chrono::high_resolution_clock::now();
-    float waterElapsed = 0.0f;
-
-    bool running = true;
-    while (running) {
+    // state.waterElapsed, state.running have defaults from struct initializer
+    while (state.running) {
         auto now = std::chrono::high_resolution_clock::now();
         float dt = std::chrono::duration<float>(now - lastTime).count();
         lastTime = now;
         dt = std::min(dt, 0.1f);
-        waterElapsed += dt;
+        state.waterElapsed += dt;
 
-        handleEvents(running, cam, moveSpeed,
-                     portalCulling, filterMode,
-                     isolateModelIdx, cameraCollision, showRaycast,
-                     spawnX, spawnY, spawnZ, spawnYaw,
-                     sortedModelNames, modelInstanceCounts,
+        handleEvents(state.running, state.cam, state.moveSpeed,
+                     state.portalCulling, state.filterMode,
+                     state.isolateModelIdx, state.cameraCollision, state.showRaycast,
+                     state.spawnX, state.spawnY, state.spawnZ, state.spawnYaw,
+                     state.sortedModelNames, state.modelInstanceCounts,
                      dbgConsole, updateTitle);
 
-        updateMovement(dt, cam, moveSpeed, cameraCollision, mission.wrData, dbgConsole);
+        updateMovement(dt, state.cam, state.moveSpeed, state.cameraCollision, mission.wrData, dbgConsole);
 
-        updateLightmaps(dt, lightmappedMode,
+        updateLightmaps(dt, meshes.lightmappedMode,
                         mission.lightSources, mission.animLightIndex,
                         gpu.lmAtlasSet, gpu.lightmapAtlasHandles,
                         mission.wrData, lmScale);
 
         // ── Prepare frame: matrices, fog, samplers, culling ──
-        auto fc = prepareFrame(cam, filterMode,
-                               portalCulling, skyClearColor,
+        auto fc = prepareFrame(state.cam, state.filterMode,
+                               state.portalCulling, state.skyClearColor,
                                mission.wrData, mission.cellPortals,
                                mission.fogParams, mission.skyParams,
-                               cullVisibleCells);
+                               state.cullVisibleCells);
         updateTitle();
 
         // ── View 0: Sky pass ──
-        renderSky(cam, fc.proj, mission.hasSkybox,
+        renderSky(state.cam, fc.proj, mission.hasSkybox,
                   gpu.skyboxVBH, gpu.skyboxIBH, meshes.skyboxCube, gpu.skyboxTexHandles,
                   gpu.skyVBH, gpu.skyIBH, gpu.flatProgram, gpu.texturedProgram,
                   gpu.s_texColor, gpu.u_fogColor, gpu.u_fogParams, gpu.u_objectParams,
                   fc.fogColorArr, fc.skyFogArr, fc.skySampler);
 
         // ── View 1: World geometry ──
-        renderWorld(lightmappedMode, mission.texturedMode,
-                    portalCulling, fc.visibleCells,
+        renderWorld(meshes.lightmappedMode, mission.texturedMode,
+                    state.portalCulling, fc.visibleCells,
                     meshes.lmMesh, meshes.worldMesh, meshes.flatMesh,
                     gpu.vbh, gpu.ibh, gpu.flatProgram, gpu.texturedProgram, gpu.lightmappedProgram,
                     gpu.s_texColor, gpu.s_texLightmap,
@@ -2462,9 +2455,9 @@ int main(int argc, char *argv[]) {
                     fc.texSampler, fc.renderState);
 
         // ── Object meshes ──
-        renderObjects(showObjects, showFallbackCubes,
-                      portalCulling, fc.visibleCells,
-                      isolateModelIdx, sortedModelNames,
+        renderObjects(state.showObjects, state.showFallbackCubes,
+                      state.portalCulling, fc.visibleCells,
+                      state.isolateModelIdx, state.sortedModelNames,
                       mission.objData, mission.objCellIDs,
                       gpu.objModelGPU, gpu.objTextureHandles,
                       gpu.fallbackCubeVBH, gpu.fallbackCubeIBH,
@@ -2474,17 +2467,17 @@ int main(int argc, char *argv[]) {
                       fc.texSampler, fc.renderState);
 
         // ── Water surfaces ──
-        renderWater(hasWater, meshes.waterMesh, gpu.waterVBH, gpu.waterIBH,
+        renderWater(meshes.hasWater, meshes.waterMesh, gpu.waterVBH, gpu.waterIBH,
                     gpu.flatProgram, gpu.waterProgram,
                     gpu.s_texColor, gpu.u_fogColor, gpu.u_fogParams, gpu.u_objectParams,
                     gpu.u_waterParams, gpu.u_waterFlow,
                     fc.fogColorArr, fc.fogOnArr,
                     gpu.textureHandles, gpu.flowTextureHandles, fc.texSampler,
-                    waterElapsed, waterScrollSpeed,
-                    waveAmplitude, uvDistortion, waterRotation);
+                    state.waterElapsed, state.waterScrollSpeed,
+                    state.waveAmplitude, state.uvDistortion, state.waterRotation);
 
         // ── Debug raycast visualization (view 2) ──
-        renderDebugOverlay(showRaycast, cam, fc.view, fc.proj, mission.wrData, mission.txList,
+        renderDebugOverlay(state.showRaycast, state.cam, fc.view, fc.proj, mission.wrData, mission.txList,
                            gpu.flatProgram, gpu.u_fogColor, gpu.u_fogParams, gpu.u_objectParams,
                            fc.fogColorArr, fc.fogOnArr);
 
