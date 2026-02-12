@@ -1,6 +1,6 @@
 # darkness
 
-`darkness`, an open Dark Engine(tm), is built on the headless core of the openDarkEngine project, and aims to be an extensible, cross platform implementation of the [Dark Engine](https://en.wikipedia.org/wiki/Dark_Engine). It aims to support all previously-generated official and fan content, and admit modular access to modernizing the graphics and AI stacks.
+`darkness`, an open [Dark Engine](https://en.wikipedia.org/wiki/Dark_Engine)(tm), is built on the headless core of the [openDarkEngine](https://github.com/volca02/openDarkEngine) project, and is optimized for a modular design permitting extensibility and full cross-platform compatibility on modern hardware. It aims to support all previously-generated official and fan content, and admit modular access to modernizing the graphics, audio, physics, and AI stacks.
 
 ![don't be so sure](doc/orly.png)
 
@@ -99,7 +99,7 @@ Loads a `.mis` + `.gam` database and dumps chunk inventory, object hierarchy, pr
 * ...and others not mentioned
 
 # Disclaimer
-`darkness` is a reimplementation of the Dark Engine and is not affiliated with or endorsed by the original software's rights holders.
+`darkness` is a reimplementation of the Dark Engine, drawing heavily from `opde`, and is not affiliated with or endorsed by the original software's rights holders or the `opde` team.
 
 This project does not contain, distribute, or incorporate proprietary source code, binaries, assets, or data files from the original software. All code in this repository has been written by the project's contributors through independent development efforts. Users must supply their own legally obtained copies of any original game data files required to operate this software. This project does not facilitate, encourage, or provide access to pirated or unauthorized copies of any proprietary material.
 
