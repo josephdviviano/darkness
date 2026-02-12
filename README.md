@@ -1,6 +1,6 @@
 # darkness
 
-`darkness`, an open Dark Engine(tm), is a substantial rewrite of the openDarkEngine project, and aims to be an extensible, cross platform implementation of the [Dark Engine](https://en.wikipedia.org/wiki/Dark_Engine). It aims to support all previously-generated official and fan content, and admit modular access to modernizing the graphics and AI stacks.
+`darkness`, an open Dark Engine(tm), is built on the headless core of the openDarkEngine project, and aims to be an extensible, cross platform implementation of the [Dark Engine](https://en.wikipedia.org/wiki/Dark_Engine). It aims to support all previously-generated official and fan content, and admit modular access to modernizing the graphics and AI stacks.
 
 ![don't be so sure](doc/orly.png)
 
