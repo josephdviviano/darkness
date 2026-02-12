@@ -40,7 +40,7 @@ void RoomPortal::read(const FilePtr &sf) {
     *sf >> mID >> mIndex >> mPlane >> mEdgeCount;
     // planes that define edges
 
-    mEdges.grow(mEdgeCount);
+    mEdges.resize(mEdgeCount);
 
     for (size_t i = 0; i < mEdgeCount; ++i) {
         *sf >> mEdges[i];

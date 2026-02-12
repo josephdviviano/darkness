@@ -27,10 +27,9 @@
 #ifndef __ROOM_H
 #define __ROOM_H
 
+#include <memory>
 #include <set>
 #include <vector>
-
-#include "Array.h"
 #include "File.h"
 #include "Plane.h"
 #include "Quaternion.h"
@@ -86,7 +85,7 @@ public:
     RoomPortal *getPortal(uint32_t index) const {
         if (index >= mPortalCount)
             return nullptr;
-        return mPortals[index];
+        return mPortals[index].get();
     }
 
     /// Get the 6 bounding planes that define this room's volume
@@ -121,11 +120,11 @@ private:
     Plane mPlanes[6];
     /// Portal count
     uint32_t mPortalCount;
-    /// Portal list
-    SimpleArray<RoomPortal *> mPortals;
+    /// Portal list (owning)
+    std::vector<std::unique_ptr<RoomPortal>> mPortals;
     /// Portal to portal distances (a 2d array, single index here for simplicity
     /// of allocations)
-    float *mPortalDistances;
+    std::vector<float> mPortalDistances;
 
     typedef std::set<int> IDSet;
     typedef std::vector<IDSet> IDLists;

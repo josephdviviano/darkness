@@ -25,6 +25,7 @@
 #define __PHYSMODELS_H
 
 #include <map>
+#include <memory>
 #include <set>
 
 #include "DarkCommon.h"
@@ -61,7 +62,7 @@ public:
     bool isStationary(int objid);
 
 private:
-    typedef std::map<int, PhysModel *> IDModelMap;
+    typedef std::map<int, std::unique_ptr<PhysModel>> IDModelMap;
     typedef std::set<int> IDSet;
 
     IDModelMap mModels;

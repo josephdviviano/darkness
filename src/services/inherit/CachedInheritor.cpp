@@ -62,12 +62,14 @@ bool CachedInheritor::getImplements(int objID) const {
 
 //------------------------------------------------------
 int CachedInheritor::getEffectiveID(int srcID) const {
-    return mEffObjMap[srcID];
+    auto it = mEffObjMap.find(srcID);
+    return (it != mEffObjMap.end()) ? it->second : 0;
 }
 
 //------------------------------------------------------
 bool CachedInheritor::setEffectiveID(int srcID, int effID) {
-    int prev = mEffObjMap[srcID];
+    auto it = mEffObjMap.find(srcID);
+    int prev = (it != mEffObjMap.end()) ? it->second : 0;
     mEffObjMap[srcID] = effID;
 
     return prev != effID;
@@ -187,7 +189,8 @@ void CachedInheritor::onInheritMsg(const InheritChangeMsg &msg) {
 
 //------------------------------------------------------
 void CachedInheritor::grow(int minID, int maxID) {
-    mEffObjMap.grow(minID, maxID);
+    // Reserve capacity hint for the expected ID range
+    mEffObjMap.reserve(maxID - minID + 1);
     mImplements.grow(minID, maxID);
 }
 

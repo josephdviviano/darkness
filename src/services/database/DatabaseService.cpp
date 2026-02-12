@@ -27,6 +27,8 @@
 #include "DarknessServiceManager.h"
 #include "logger.h"
 
+#include <vector>
+
 using namespace std;
 
 namespace Darkness {
@@ -255,17 +257,10 @@ std::string DatabaseService::loadFileNameFromTag(const Darkness::FileGroupPtr &d
 
     std::string res;
 
-    char *data = NULL;
+    std::vector<char> data(gft_size + 1, 0);
+    fdm->read(data.data(), fdm->size()); // TODO: Catch exception
 
-    data = new char[gft_size + 1];
-    data[0] = 0x0;
-    data[gft_size] = 0x0;
-
-    fdm->read(data, fdm->size()); // TODO: Catch exception
-
-    res = std::string(data);
-
-    delete[] data;
+    res = std::string(data.data());
 
     return res;
 }

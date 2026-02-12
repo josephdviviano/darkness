@@ -24,7 +24,8 @@
 #ifndef __PHYSMODEL_H
 #define __PHYSMODEL_H
 
-#include "Array.h"
+#include <vector>
+
 #include "File.h"
 #include "PhysCommon.h"
 #include "integers.h"
@@ -120,11 +121,11 @@ protected:
     Vector3 mMantlingVec;
 
     /// This contains the positions and orientations of SubModels
-    SimpleArray<SubModel> mSubModels;
+    std::vector<SubModel> mSubModels;
     SubModel mMainSubModel;
 
     /// relative submodel positions
-    SimpleArray<Vector3> mRelPos;
+    std::vector<Vector3> mRelPos;
 
     /// Object to which this one is attached (rope climbing)
     int32_t mRopeAttObjID;

@@ -29,7 +29,6 @@
 
 #include "config.h"
 
-#include "Array.h"
 #include "DarknessService.h"
 #include "DarknessServiceFactory.h"
 #include "DarknessSingleton.h"

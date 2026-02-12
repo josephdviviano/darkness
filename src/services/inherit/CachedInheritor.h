@@ -24,7 +24,8 @@
 #ifndef __CACHEDINHERITOR_H
 #define __CACHEDINHERITOR_H
 
-#include "Array.h"
+#include <unordered_map>
+
 #include "BitArray.h"
 #include "InheritService.h"
 
@@ -105,8 +106,8 @@ protected:
     /// Inheritance change listener ID
     InheritService::ListenerID mListenerID;
 
-    /// Map of effective object ID's
-    typedef Array<int> EffectiveObjectMap;
+    /// Map of effective object ID's (object ID → effective source ID, 0 = none)
+    typedef std::unordered_map<int, int> EffectiveObjectMap;
 
     /// Map of effective object ID's - instance
     EffectiveObjectMap mEffObjMap;
