@@ -1344,6 +1344,398 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
     return worldQuery;
 }
 
+// ── Load mission data from .mis file ──
+// Parses WR geometry, portal graph, spawn point, animated lights, sky/fog/flow
+// parameters, and extracts mission base name. Returns false if WR parse fails.
+static bool loadMissionData(const char *misPath, bool forceFlicker,
+                            Darkness::MissionData &mission)
+{
+    // Extract mission base name (e.g. "miss6" from "path/to/miss6.mis")
+    // for constructing skybox texture filenames like "skyhw/miss6n.PCX"
+    {
+        std::string p(misPath);
+        size_t slash = p.find_last_of("/\\");
+        std::string base = (slash != std::string::npos) ? p.substr(slash + 1) : p;
+        size_t dot = base.find('.');
+        mission.missionName = (dot != std::string::npos) ? base.substr(0, dot) : base;
+        // Lowercase for case-insensitive CRF matching
+        std::transform(mission.missionName.begin(), mission.missionName.end(),
+                       mission.missionName.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+    }
+
+    // Parse WR geometry
+    std::fprintf(stderr, "Loading WR geometry from %s...\n", misPath);
+    try {
+        mission.wrData = Darkness::parseWRChunk(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "Failed to parse WR chunk: %s\n", e.what());
+        return false;
+    }
+    std::fprintf(stderr, "Loaded %u cells\n", mission.wrData.numCells);
+
+    // Build portal adjacency graph for portal culling
+    mission.cellPortals = buildPortalGraph(mission.wrData);
+    {
+        int totalPortals = 0;
+        for (const auto &pl : mission.cellPortals)
+            totalPortals += static_cast<int>(pl.size());
+        std::fprintf(stderr, "Portal graph: %d portals across %u cells\n",
+                     totalPortals, mission.wrData.numCells);
+    }
+
+    // Find player spawn point from L$PlayerFactory + P$Position chunks
+    mission.spawnInfo = Darkness::findSpawnPoint(misPath);
+
+    // Parse animated light properties from mission database
+    mission.lightSources = Darkness::parseAnimLightProperties(misPath);
+
+    // Build reverse index: lightnum → list of (cellIdx, polyIdx) affected
+    mission.animLightIndex = Darkness::buildAnimLightIndex(mission.wrData);
+
+    // Ensure all lightnums referenced in WR data have a LightSource entry.
+    // Lights without P$AnimLight properties default to mode 4 (max brightness).
+    for (const auto &kv : mission.animLightIndex) {
+        if (mission.lightSources.find(kv.first) == mission.lightSources.end()) {
+            Darkness::LightSource ls = {};
+            ls.lightNum = kv.first;
+            ls.mode = Darkness::ANIM_MAX_BRIGHT;
+            ls.maxBright = 1.0f;
+            ls.minBright = 0.0f;
+            ls.brightness = 1.0f;
+            ls.prevIntensity = 1.0f;
+            mission.lightSources[kv.first] = ls;
+        }
+    }
+
+    // Apply --force-flicker: override all lights to flicker mode for debugging
+    if (forceFlicker) {
+        for (auto &[num, ls] : mission.lightSources) {
+            ls.mode = Darkness::ANIM_FLICKER;
+            ls.inactive = false;
+            ls.minBright = 0.0f;
+            ls.maxBright = 1.0f;
+            ls.brightenTime = 0.15f;
+            ls.dimTime = 0.15f;
+            ls.brightness = ls.maxBright;
+            ls.countdown = 0.1f;
+            ls.isRising = false;
+        }
+        std::fprintf(stderr, "Force-flicker: all %zu lights set to flicker mode\n",
+                     mission.lightSources.size());
+    }
+
+    // Animated light diagnostics
+    {
+        int modeCounts[10] = {};
+        int inactiveCount = 0;
+        int fromMIS = 0, fromDefault = 0;
+        for (const auto &[num, ls] : mission.lightSources) {
+            if (ls.mode < 10) modeCounts[ls.mode]++;
+            if (ls.inactive) inactiveCount++;
+            if (ls.objectId != 0) fromMIS++; else fromDefault++;
+        }
+        std::fprintf(stderr, "Animated lights: %zu sources (%d from MIS, %d defaulted), "
+                     "%zu indexed lightnums\n",
+                     mission.lightSources.size(), fromMIS, fromDefault,
+                     mission.animLightIndex.size());
+        const char *modeNames[] = {
+            "flip", "smooth", "random", "min_bright", "max_bright",
+            "zero", "brighten", "dim", "semi_random", "flicker"
+        };
+        for (int m = 0; m < 10; ++m) {
+            if (modeCounts[m] > 0)
+                std::fprintf(stderr, "  mode %d (%s): %d lights\n",
+                             m, modeNames[m], modeCounts[m]);
+        }
+        if (inactiveCount > 0)
+            std::fprintf(stderr, "  inactive: %d lights\n", inactiveCount);
+    }
+
+    // Parse sky dome parameters from SKYOBJVAR chunk (if present)
+    mission.skyParams = parseSkyObjVar(misPath);
+    mission.skyDome = buildSkyDome(mission.skyParams);
+
+    // Parse global fog parameters from FOG chunk (if present)
+    mission.fogParams = parseFogChunk(misPath);
+
+    // Parse water flow data — FLOW_TEX (texture mapping) and CELL_MOTION (animation state)
+    mission.flowData = parseFlowData(misPath);
+
+    return true;
+}
+
+// ── Load world textures from CRF archives ──
+// Parses TXLIST, loads world textures from fam.crf, water flow textures,
+// and skybox face textures. All images stored in mission for later GPU upload.
+static void loadWorldTextures(const char *misPath, const std::string &resPath,
+                              Darkness::MissionData &mission)
+{
+    // Parse TXLIST if in textured mode
+    if (mission.texturedMode) {
+        try {
+            mission.txList = Darkness::parseTXList(misPath);
+            std::fprintf(stderr, "TXLIST: %zu textures, %zu families\n",
+                         mission.txList.textures.size(), mission.txList.families.size());
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "Failed to parse TXLIST: %s (falling back to flat)\n",
+                         e.what());
+            mission.texturedMode = false;
+        }
+    }
+
+    // Collect unique texture indices used by world geometry
+    std::unordered_set<uint8_t> usedTextures;
+    if (mission.texturedMode) {
+        for (const auto &cell : mission.wrData.cells) {
+            for (int pi = 0; pi < cell.numTextured; ++pi) {
+                uint8_t txt = cell.texturing[pi].txt;
+                if (txt != 0 && txt != 249)
+                    usedTextures.insert(txt);
+            }
+        }
+        // Note: FLOW_TEX texture indices are runtime palette positions, NOT TXLIST
+        // indices. Water textures are loaded separately by name from fam.crf below.
+        std::fprintf(stderr, "Unique texture indices used: %zu\n", usedTextures.size());
+    }
+
+    // Load world textures from fam.crf (indexed by TXLIST)
+    if (mission.texturedMode) {
+        Darkness::CRFTextureLoader loader(resPath);
+        if (!loader.isOpen()) {
+            std::fprintf(stderr, "CRF not available, falling back to flat shading\n");
+            mission.texturedMode = false;
+        } else {
+            int loaded = 0;
+            for (uint8_t idx : usedTextures) {
+                if (idx >= mission.txList.textures.size()) continue;
+                const auto &entry = mission.txList.textures[idx];
+                auto img = loader.loadTexture(entry.family, entry.name);
+                mission.texDims[idx] = { img.width, img.height };
+                mission.loadedTextures[idx] = std::move(img);
+                ++loaded;
+            }
+            std::fprintf(stderr, "Loaded %d/%zu textures from CRF\n",
+                         loaded, usedTextures.size());
+        }
+    }
+
+    // Load water flow textures from fam.crf by name.
+    // FLOW_TEX name field (e.g. "gr") maps to "water/<name>in.PCX" for the
+    // air-side texture and "water/<name>out.PCX" for the underwater side.
+    // Keyed by flow group index (1-255).
+    if (mission.texturedMode && mission.flowData.hasFlowTex) {
+        Darkness::CRFTextureLoader loader(resPath);
+        if (loader.isOpen()) {
+            // Collect unique flow groups used by cells
+            std::unordered_set<uint8_t> usedFlowGroups;
+            for (const auto &cell : mission.wrData.cells) {
+                if (cell.flowGroup > 0)
+                    usedFlowGroups.insert(cell.flowGroup);
+            }
+
+            int loaded = 0;
+            for (uint8_t fg : usedFlowGroups) {
+                const auto &fe = mission.flowData.textures[fg];
+                if (fe.name[0] == '\0') continue;
+
+                // Extract base name, trimming trailing nulls/spaces
+                std::string baseName(fe.name, strnlen(fe.name, 28));
+                while (!baseName.empty() && (baseName.back() == ' ' || baseName.back() == '\0'))
+                    baseName.pop_back();
+                if (baseName.empty()) continue;
+
+                // Air-side texture: "water/<name>in" (e.g. "gr" → "water/grin")
+                std::string inName = baseName + "in";
+                auto img = loader.loadTexture("water", inName);
+
+                // Check if we got a real texture (not the 8x8 fallback)
+                if (img.width > 8 || img.height > 8) {
+                    std::fprintf(stderr, "Flow group %d: loaded water/%s.PCX (%ux%u)\n",
+                                 fg, inName.c_str(), img.width, img.height);
+                    mission.flowTexDims[fg] = { img.width, img.height };
+                    mission.flowLoadedTextures[fg] = std::move(img);
+                    ++loaded;
+                } else {
+                    std::fprintf(stderr, "Flow group %d: water/%s.PCX not found, trying waterhw/\n",
+                                 fg, inName.c_str());
+                    // Some missions may use WATERHW family instead
+                    auto img2 = loader.loadTexture("waterhw", inName);
+                    if (img2.width > 8 || img2.height > 8) {
+                        std::fprintf(stderr, "Flow group %d: loaded waterhw/%s.PCX (%ux%u)\n",
+                                     fg, inName.c_str(), img2.width, img2.height);
+                        mission.flowTexDims[fg] = { img2.width, img2.height };
+                        mission.flowLoadedTextures[fg] = std::move(img2);
+                        ++loaded;
+                    } else {
+                        std::fprintf(stderr, "Flow group %d: no water texture found for '%s'\n",
+                                     fg, baseName.c_str());
+                    }
+                }
+            }
+            if (loaded > 0) {
+                std::fprintf(stderr, "Loaded %d flow group water textures from CRF\n", loaded);
+            }
+        }
+    }
+
+    // Load skybox face textures (old sky system).
+    // Missions without SKYOBJVAR use a textured skybox with per-mission PCX
+    // textures in fam.crf under skyhw/ (e.g. skyhw/miss6n.PCX for north face).
+    if (mission.texturedMode) {
+        Darkness::CRFTextureLoader skyLoader(resPath);
+        if (skyLoader.isOpen()) {
+            // 5 faces: n=north(+Y), s=south(-Y), e=east(+X), w=west(-X), t=top(+Z)
+            const char *suffixes[] = { "n", "s", "e", "w", "t" };
+            int loaded = 0;
+            for (const char *suf : suffixes) {
+                std::string texName = mission.missionName + suf;
+                auto img = skyLoader.loadTexture("skyhw", texName);
+                // Real texture is larger than the 8x8 fallback checkerboard
+                if (img.width > 8 || img.height > 8) {
+                    mission.skyboxImages[suf] = std::move(img);
+                    ++loaded;
+                }
+            }
+            // Skybox available if at least the 4 side faces loaded (top optional)
+            mission.hasSkybox = mission.skyboxImages.count("n") && mission.skyboxImages.count("s")
+                     && mission.skyboxImages.count("e") && mission.skyboxImages.count("w");
+            if (mission.hasSkybox) {
+                std::fprintf(stderr, "Skybox: loaded %d/5 faces for %s (textured skybox active)\n",
+                             loaded, mission.missionName.c_str());
+                for (auto &kv : mission.skyboxImages) {
+                    std::fprintf(stderr, "  face '%s': %ux%u\n",
+                                 kv.first.c_str(), kv.second.width, kv.second.height);
+                }
+            } else if (loaded > 0) {
+                std::fprintf(stderr, "Skybox: partial load (%d faces), falling back to dome\n", loaded);
+            }
+        }
+    }
+}
+
+// ── Load object assets: properties, .bin models, textures from obj.crf ──
+// Parses object placements via PropertyService, precomputes per-object cell IDs
+// for portal culling, loads .bin meshes and object textures from obj.crf.
+static void loadObjectAssets(const char *misPath, const std::string &resPath,
+                             const Darkness::RenderConfig &cfg,
+                             const Darkness::WRParsedData &wrData,
+                             Darkness::MissionData &mission,
+                             Darkness::RuntimeState &state)
+{
+    // Parse object placements from .mis via PropertyService
+    if (state.showObjects) {
+        try {
+            Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+            mission.objData = Darkness::parseObjectProps(propSvc.get(), misPath,
+                                                    cfg.debugObjects);
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "Failed to parse object props: %s\n", e.what());
+            state.showObjects = false;
+        }
+        if (mission.objData.objects.empty()) {
+            std::fprintf(stderr, "No objects to render\n");
+            state.showObjects = false;
+        }
+    }
+
+    // Precompute which cell each object is in for portal culling.
+    // Objects don't move (yet), so this is a one-time lookup at load time.
+    // -1 = outside all cells (always rendered to avoid popping).
+    if (state.showObjects) {
+        mission.objCellIDs.resize(mission.objData.objects.size());
+        for (size_t i = 0; i < mission.objData.objects.size(); ++i) {
+            const auto &obj = mission.objData.objects[i];
+            if (obj.hasPosition) {
+                mission.objCellIDs[i] = findCameraCell(wrData, obj.x, obj.y, obj.z);
+            } else {
+                mission.objCellIDs[i] = -1;
+            }
+        }
+    }
+
+    // Load .bin models from obj.crf (if --res provided and objects enabled)
+    if (state.showObjects && !resPath.empty()) {
+        Darkness::CRFModelLoader modelLoader(resPath);
+        if (modelLoader.isOpen()) {
+            int loaded = 0, failed = 0;
+            for (const auto &name : mission.objData.uniqueModels) {
+                auto binData = modelLoader.loadModel(name);
+                if (binData.empty()) {
+                    ++failed;
+                    continue;
+                }
+                try {
+                    auto mesh = Darkness::parseBinModel(binData.data(), binData.size());
+                    if (mesh.valid) {
+                        mission.parsedModels[name] = std::move(mesh);
+                        ++loaded;
+                    } else {
+                        // Log first few failures for debugging
+                        if (failed < 5) {
+                            // Show magic header of failed file
+                            char hdr[5] = {};
+                            if (binData.size() >= 4)
+                                std::memcpy(hdr, binData.data(), 4);
+                            std::fprintf(stderr, "  model '%s': parse failed "
+                                         "(size=%zu, magic='%s')\n",
+                                         name.c_str(), binData.size(), hdr);
+                        }
+                        ++failed;
+                    }
+                } catch (const std::exception &e) {
+                    // Some .bin files may be AI meshes (LGMM) or corrupt
+                    if (failed < 5) {
+                        std::fprintf(stderr, "  model '%s': exception: %s\n",
+                                     name.c_str(), e.what());
+                    }
+                    ++failed;
+                }
+            }
+            std::fprintf(stderr, "Loaded %d/%zu models from obj.crf (%d failed)\n",
+                         loaded, mission.objData.uniqueModels.size(), failed);
+        } else {
+            std::fprintf(stderr, "obj.crf not available, using fallback cubes\n");
+        }
+    }
+
+    // Load object textures from obj.crf (txt16/ and txt/ subdirectories inside it).
+    // Dark Engine stores object textures as GIF/PCX files within obj.crf, not in
+    // separate txt16.crf/txt.crf archives.
+
+    // Collect unique MD_MAT_TMAP material names from all parsed models
+    std::unordered_set<std::string> objMatNames;
+    for (const auto &kv : mission.parsedModels) {
+        for (const auto &mat : kv.second.materials) {
+            if (mat.type == Darkness::MD_MAT_TMAP) {
+                // Lowercase the name for case-insensitive matching
+                std::string lname(mat.name);
+                std::transform(lname.begin(), lname.end(), lname.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                objMatNames.insert(lname);
+            }
+        }
+    }
+
+    if (!objMatNames.empty() && !resPath.empty()) {
+        // Reuse obj.crf for texture lookup (same archive that holds .bin models)
+        Darkness::CRFTextureLoader objTexLoader(resPath, "obj.crf");
+
+        int loaded = 0;
+        for (const auto &name : objMatNames) {
+            if (!objTexLoader.isOpen()) break;
+            auto img = objTexLoader.loadObjectTexture(name);
+            // Check if we got a real texture (not the 8x8 fallback checkerboard)
+            if (img.width > 8 || img.height > 8) {
+                mission.objTexImages[name] = std::move(img);
+                ++loaded;
+            }
+        }
+        std::fprintf(stderr, "Loaded %d/%zu object textures from obj.crf\n",
+                     loaded, objMatNames.size());
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         printHelp();
@@ -1407,32 +1799,9 @@ int main(int argc, char *argv[]) {
     std::string scriptsDir = "scripts/thief2";
     auto worldQuery = initServiceStack(misPath, scriptsDir);
 
-    // Extract mission base name (e.g. "miss6" from "path/to/miss6.mis")
-    // for constructing skybox texture filenames like "skyhw/miss6n.PCX"
-    // mission.missionName populated below
-    {
-        std::string p(misPath);
-        size_t slash = p.find_last_of("/\\");
-        std::string base = (slash != std::string::npos) ? p.substr(slash + 1) : p;
-        size_t dot = base.find('.');
-        mission.missionName = (dot != std::string::npos) ? base.substr(0, dot) : base;
-        // Lowercase for case-insensitive CRF matching
-        std::transform(mission.missionName.begin(), mission.missionName.end(), mission.missionName.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-    }
-
-    // Parse WR geometry
-    std::fprintf(stderr, "Loading WR geometry from %s...\n", misPath);
-
-    // mission.wrData populated below
-    try {
-        mission.wrData = Darkness::parseWRChunk(misPath);
-    } catch (const std::exception &e) {
-        std::fprintf(stderr, "Failed to parse WR chunk: %s\n", e.what());
+    // ── Load mission data: WR geometry, portals, spawn, lights, sky, fog, flow ──
+    if (!loadMissionData(misPath, forceFlicker, mission))
         return 1;
-    }
-
-    std::fprintf(stderr, "Loaded %u cells\n", mission.wrData.numCells);
 
     // Inject raycaster into the world query facade — enables ray-vs-world
     // queries (AI line-of-sight, physics, sound occlusion) via portal traversal
@@ -1442,363 +1811,11 @@ int main(int argc, char *argv[]) {
             return Darkness::raycastWorld(mission.wrData, from, to, hit);
         });
 
-    // Build portal adjacency graph for portal culling
-    mission.cellPortals = buildPortalGraph(mission.wrData);
-    {
-        int totalPortals = 0;
-        for (const auto &pl : mission.cellPortals) totalPortals += static_cast<int>(pl.size());
-        std::fprintf(stderr, "Portal graph: %d portals across %u cells\n",
-                     totalPortals, mission.wrData.numCells);
-    }
+    // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
+    loadWorldTextures(misPath, resPath, mission);
 
-    // Camera collision uses polygon-level checks against the camera's current cell
-    // (no precomputation needed — solid polygon detection is done per-frame)
-
-    // Find player spawn point from L$PlayerFactory + P$Position chunks
-    mission.spawnInfo = Darkness::findSpawnPoint(misPath);
-
-    // Parse animated light properties from mission database
-    mission.lightSources = Darkness::parseAnimLightProperties(misPath);
-
-    // Build reverse index: lightnum → list of (cellIdx, polyIdx) affected
-    mission.animLightIndex = Darkness::buildAnimLightIndex(mission.wrData);
-
-    // Ensure all lightnums referenced in WR data have a LightSource entry.
-    // Lights without P$AnimLight properties default to mode 4 (max brightness).
-    for (const auto &kv : mission.animLightIndex) {
-        if (mission.lightSources.find(kv.first) == mission.lightSources.end()) {
-            Darkness::LightSource ls = {};
-            ls.lightNum = kv.first;
-            ls.mode = Darkness::ANIM_MAX_BRIGHT;
-            ls.maxBright = 1.0f;
-            ls.minBright = 0.0f;
-            ls.brightness = 1.0f;
-            ls.prevIntensity = 1.0f;
-            mission.lightSources[kv.first] = ls;
-        }
-    }
-
-    // Apply --force-flicker: override all lights to flicker mode for debugging
-    if (forceFlicker) {
-        for (auto &[num, ls] : mission.lightSources) {
-            ls.mode = Darkness::ANIM_FLICKER;
-            ls.inactive = false;
-            ls.minBright = 0.0f;
-            ls.maxBright = 1.0f;
-            ls.brightenTime = 0.15f;
-            ls.dimTime = 0.15f;
-            ls.brightness = ls.maxBright;
-            ls.countdown = 0.1f;
-            ls.isRising = false;
-        }
-        std::fprintf(stderr, "Force-flicker: all %zu lights set to flicker mode\n",
-                     mission.lightSources.size());
-    }
-
-    // Animated light diagnostics
-    {
-        int modeCounts[10] = {};
-        int inactiveCount = 0;
-        int fromMIS = 0, fromDefault = 0;
-        for (const auto &[num, ls] : mission.lightSources) {
-            if (ls.mode < 10) modeCounts[ls.mode]++;
-            if (ls.inactive) inactiveCount++;
-            if (ls.objectId != 0) fromMIS++; else fromDefault++;
-        }
-        std::fprintf(stderr, "Animated lights: %zu sources (%d from MIS, %d defaulted), "
-                     "%zu indexed lightnums\n",
-                     mission.lightSources.size(), fromMIS, fromDefault, mission.animLightIndex.size());
-        const char *modeNames[] = {
-            "flip", "smooth", "random", "min_bright", "max_bright",
-            "zero", "brighten", "dim", "semi_random", "flicker"
-        };
-        for (int m = 0; m < 10; ++m) {
-            if (modeCounts[m] > 0)
-                std::fprintf(stderr, "  mode %d (%s): %d lights\n",
-                             m, modeNames[m], modeCounts[m]);
-        }
-        if (inactiveCount > 0)
-            std::fprintf(stderr, "  inactive: %d lights\n", inactiveCount);
-    }
-
-    // Parse sky dome parameters from SKYOBJVAR chunk (if present)
-    mission.skyParams = parseSkyObjVar(misPath);
-    mission.skyDome = buildSkyDome(mission.skyParams);
-
-    // Parse global fog parameters from FOG chunk (if present)
-    mission.fogParams = parseFogChunk(misPath);
-
-    // Parse water flow data — FLOW_TEX (texture mapping) and CELL_MOTION (animation state)
-    mission.flowData = parseFlowData(misPath);
-
-    // Parse TXLIST if in textured mode
-    // mission.txList populated below if textured mode
-    if (mission.texturedMode) {
-        try {
-            mission.txList = Darkness::parseTXList(misPath);
-            std::fprintf(stderr, "TXLIST: %zu textures, %zu families\n",
-                         mission.txList.textures.size(), mission.txList.families.size());
-        } catch (const std::exception &e) {
-            std::fprintf(stderr, "Failed to parse TXLIST: %s (falling back to flat)\n",
-                         e.what());
-            mission.texturedMode = false;
-        }
-    }
-
-    // Collect unique texture indices used by world geometry and water flow groups
-    std::unordered_set<uint8_t> usedTextures;
-    if (mission.texturedMode) {
-        // World geometry textures from polygon texturing data
-        for (const auto &cell : mission.wrData.cells) {
-            for (int pi = 0; pi < cell.numTextured; ++pi) {
-                uint8_t txt = cell.texturing[pi].txt;
-                if (txt != 0 && txt != 249)
-                    usedTextures.insert(txt);
-            }
-        }
-        // Note: FLOW_TEX texture indices are runtime palette positions, NOT TXLIST
-        // indices. Water textures are loaded separately by name from fam.crf below.
-        std::fprintf(stderr, "Unique texture indices used: %zu\n", usedTextures.size());
-    }
-
-    // Load world textures from fam.crf (indexed by TXLIST)
-
-    if (mission.texturedMode) {
-        Darkness::CRFTextureLoader loader(resPath);
-        if (!loader.isOpen()) {
-            std::fprintf(stderr, "CRF not available, falling back to flat shading\n");
-            mission.texturedMode = false;
-        } else {
-            int loaded = 0;
-            for (uint8_t idx : usedTextures) {
-                if (idx >= mission.txList.textures.size()) continue;
-                const auto &entry = mission.txList.textures[idx];
-                auto img = loader.loadTexture(entry.family, entry.name);
-                mission.texDims[idx] = { img.width, img.height };
-                mission.loadedTextures[idx] = std::move(img);
-                ++loaded;
-            }
-            std::fprintf(stderr, "Loaded %d/%zu textures from CRF\n",
-                         loaded, usedTextures.size());
-        }
-    }
-
-    // Load water flow textures from fam.crf by name.
-    // FLOW_TEX name field (e.g. "gr") maps to "water/<name>in.PCX" for the
-    // air-side texture and "water/<name>out.PCX" for the underwater side.
-    // Keyed by flow group index (1-255).
-    // mission.flowLoadedTextures, mission.flowTexDims populated below
-
-    if (mission.texturedMode && mission.flowData.hasFlowTex) {
-        Darkness::CRFTextureLoader loader(resPath);
-        if (loader.isOpen()) {
-            // Collect unique flow groups used by cells
-            std::unordered_set<uint8_t> usedFlowGroups;
-            for (const auto &cell : mission.wrData.cells) {
-                if (cell.flowGroup > 0)
-                    usedFlowGroups.insert(cell.flowGroup);
-            }
-
-            int loaded = 0;
-            for (uint8_t fg : usedFlowGroups) {
-                const auto &fe = mission.flowData.textures[fg];
-                if (fe.name[0] == '\0') continue;
-
-                // Extract base name, trimming trailing nulls/spaces
-                std::string baseName(fe.name, strnlen(fe.name, 28));
-                while (!baseName.empty() && (baseName.back() == ' ' || baseName.back() == '\0'))
-                    baseName.pop_back();
-                if (baseName.empty()) continue;
-
-                // Air-side texture: "water/<name>in" (e.g. "gr" → "water/grin")
-                std::string inName = baseName + "in";
-                auto img = loader.loadTexture("water", inName);
-
-                // Check if we got a real texture (not the 8x8 fallback)
-                if (img.width > 8 || img.height > 8) {
-                    std::fprintf(stderr, "Flow group %d: loaded water/%s.PCX (%ux%u)\n",
-                                 fg, inName.c_str(), img.width, img.height);
-                    mission.flowTexDims[fg] = { img.width, img.height };
-                    mission.flowLoadedTextures[fg] = std::move(img);
-                    ++loaded;
-                } else {
-                    std::fprintf(stderr, "Flow group %d: water/%s.PCX not found, trying waterhw/\n",
-                                 fg, inName.c_str());
-                    // Some missions may use WATERHW family instead
-                    auto img2 = loader.loadTexture("waterhw", inName);
-                    if (img2.width > 8 || img2.height > 8) {
-                        std::fprintf(stderr, "Flow group %d: loaded waterhw/%s.PCX (%ux%u)\n",
-                                     fg, inName.c_str(), img2.width, img2.height);
-                        mission.flowTexDims[fg] = { img2.width, img2.height };
-                        mission.flowLoadedTextures[fg] = std::move(img2);
-                        ++loaded;
-                    } else {
-                        std::fprintf(stderr, "Flow group %d: no water texture found for '%s'\n",
-                                     fg, baseName.c_str());
-                    }
-                }
-            }
-            if (loaded > 0) {
-                std::fprintf(stderr, "Loaded %d flow group water textures from CRF\n", loaded);
-            }
-        }
-    }
-
-    // ── Load skybox face textures (old sky system) ──
-    // Missions without SKYOBJVAR use a textured skybox with per-mission PCX
-    // textures in fam.crf under skyhw/ (e.g. skyhw/miss6n.PCX for north face).
-    // mission.skyboxImages, mission.hasSkybox populated below
-
-    if (mission.texturedMode) {
-        Darkness::CRFTextureLoader skyLoader(resPath);
-        if (skyLoader.isOpen()) {
-            // 5 faces: n=north(+Y), s=south(-Y), e=east(+X), w=west(-X), t=top(+Z)
-            const char *suffixes[] = { "n", "s", "e", "w", "t" };
-            int loaded = 0;
-            for (const char *suf : suffixes) {
-                std::string texName = mission.missionName + suf;
-                auto img = skyLoader.loadTexture("skyhw", texName);
-                // Real texture is larger than the 8x8 fallback checkerboard
-                if (img.width > 8 || img.height > 8) {
-                    mission.skyboxImages[suf] = std::move(img);
-                    ++loaded;
-                }
-            }
-            // Skybox available if at least the 4 side faces loaded (top optional)
-            mission.hasSkybox = mission.skyboxImages.count("n") && mission.skyboxImages.count("s")
-                     && mission.skyboxImages.count("e") && mission.skyboxImages.count("w");
-            if (mission.hasSkybox) {
-                std::fprintf(stderr, "Skybox: loaded %d/5 faces for %s (textured skybox active)\n",
-                             loaded, mission.missionName.c_str());
-                for (auto &kv : mission.skyboxImages) {
-                    std::fprintf(stderr, "  face '%s': %ux%u\n",
-                                 kv.first.c_str(), kv.second.width, kv.second.height);
-                }
-            } else if (loaded > 0) {
-                std::fprintf(stderr, "Skybox: partial load (%d faces), falling back to dome\n", loaded);
-            }
-        }
-    }
-
-    // ── Parse object placements from .mis ──
-
-    // mission.objData populated below
-    if (state.showObjects) {
-        try {
-            Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
-            mission.objData = Darkness::parseObjectProps(propSvc.get(), misPath,
-                                                    cfg.debugObjects);
-        } catch (const std::exception &e) {
-            std::fprintf(stderr, "Failed to parse object props: %s\n", e.what());
-            state.showObjects = false;
-        }
-        if (mission.objData.objects.empty()) {
-            std::fprintf(stderr, "No objects to render\n");
-            state.showObjects = false;
-        }
-    }
-
-    // Precompute which cell each object is in for portal culling.
-    // Objects don't move (yet), so this is a one-time lookup at load time.
-    // -1 = outside all cells (always rendered to avoid popping).
-    // mission.objCellIDs populated below
-    if (state.showObjects) {
-        mission.objCellIDs.resize(mission.objData.objects.size());
-        for (size_t i = 0; i < mission.objData.objects.size(); ++i) {
-            const auto &obj = mission.objData.objects[i];
-            if (obj.hasPosition) {
-                mission.objCellIDs[i] = findCameraCell(mission.wrData, obj.x, obj.y, obj.z);
-            } else {
-                mission.objCellIDs[i] = -1;
-            }
-        }
-    }
-
-    // Load .bin models from obj.crf (if --res provided and objects enabled)
-    // mission.parsedModels populated below
-
-    if (state.showObjects && !resPath.empty()) {
-        Darkness::CRFModelLoader modelLoader(resPath);
-        if (modelLoader.isOpen()) {
-            int loaded = 0, failed = 0;
-            for (const auto &name : mission.objData.uniqueModels) {
-                auto binData = modelLoader.loadModel(name);
-                if (binData.empty()) {
-                    ++failed;
-                    continue;
-                }
-                try {
-                    auto mesh = Darkness::parseBinModel(binData.data(), binData.size());
-                    if (mesh.valid) {
-                        mission.parsedModels[name] = std::move(mesh);
-                        ++loaded;
-                    } else {
-                        // Log first few failures for debugging
-                        if (failed < 5) {
-                            // Show magic header of failed file
-                            char hdr[5] = {};
-                            if (binData.size() >= 4)
-                                std::memcpy(hdr, binData.data(), 4);
-                            std::fprintf(stderr, "  model '%s': parse failed "
-                                         "(size=%zu, magic='%s')\n",
-                                         name.c_str(), binData.size(), hdr);
-                        }
-                        ++failed;
-                    }
-                } catch (const std::exception &e) {
-                    // Some .bin files may be AI meshes (LGMM) or corrupt
-                    if (failed < 5) {
-                        std::fprintf(stderr, "  model '%s': exception: %s\n",
-                                     name.c_str(), e.what());
-                    }
-                    ++failed;
-                }
-            }
-            std::fprintf(stderr, "Loaded %d/%zu models from obj.crf (%d failed)\n",
-                         loaded, mission.objData.uniqueModels.size(), failed);
-        } else {
-            std::fprintf(stderr, "obj.crf not available, using fallback cubes\n");
-        }
-    }
-
-    // ── Load object textures from txt16.crf (16-bit) with txt.crf fallback ──
-
-    // Collect unique MD_MAT_TMAP material names from all parsed models
-    std::unordered_set<std::string> objMatNames;
-    for (const auto &kv : mission.parsedModels) {
-        for (const auto &mat : kv.second.materials) {
-            if (mat.type == Darkness::MD_MAT_TMAP) {
-                // Lowercase the name for case-insensitive matching
-                std::string lname(mat.name);
-                std::transform(lname.begin(), lname.end(), lname.begin(),
-                               [](unsigned char c) { return std::tolower(c); });
-                objMatNames.insert(lname);
-            }
-        }
-    }
-
-    // Load object textures from obj.crf (txt16/ and txt/ subdirectories inside it).
-    // Dark Engine stores object textures as GIF/PCX files within obj.crf, not in
-    // separate txt16.crf/txt.crf archives.
-    // mission.objTexImages populated below
-
-    if (!objMatNames.empty() && !resPath.empty()) {
-        // Reuse obj.crf for texture lookup (same archive that holds .bin models)
-        Darkness::CRFTextureLoader objTexLoader(resPath, "obj.crf");
-
-        int loaded = 0;
-        for (const auto &name : objMatNames) {
-            if (!objTexLoader.isOpen()) break;
-            auto img = objTexLoader.loadObjectTexture(name);
-            // Check if we got a real texture (not the 8x8 fallback checkerboard)
-            if (img.width > 8 || img.height > 8) {
-                mission.objTexImages[name] = std::move(img);
-                ++loaded;
-            }
-        }
-        std::fprintf(stderr, "Loaded %d/%zu object textures from obj.crf\n",
-                     loaded, objMatNames.size());
-    }
+    // ── Load object assets: properties, .bin models, textures from obj.crf ──
+    loadObjectAssets(misPath, resPath, cfg, mission.wrData, mission, state);
 
     // ── SDL2 + bgfx init ──
 
