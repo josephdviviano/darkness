@@ -29,6 +29,7 @@
 #include <string>
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
@@ -88,8 +89,10 @@ static const int WINDOW_HEIGHT = 720;
 // ── Renderer modules ──
 // Core: vertex formats, texture pipeline, camera, collision, culling, fog data
 // Extended: mesh builders, water system, sky, fog parsing, fallback cube
+// State: data-holding structs for renderer decomposition
 #include "DarknessRendererCore.h"
 #include "DarknessRendererExtended.h"
+#include "DarknessRenderState.h"
 
 using namespace Darkness;
 
@@ -158,6 +161,1016 @@ static void printHelp() {
         "  # Textured, using GOG install:\n"
         "  darknessRender path/to/miss6.mis --res ~/GOG/Thief2/RES\n"
     );
+}
+
+// ── Render-loop functions ──
+// Each function handles one pass of the per-frame render loop.
+// Parameters are explicit locals from main() — will be consolidated into
+// structs in Steps 11-13.
+
+// Render sky dome or textured skybox into View 0 (no depth write/test).
+static void renderSky(
+    const Darkness::Camera &cam, const float proj[16],
+    bool hasSkybox,
+    bgfx::VertexBufferHandle skyboxVBH, bgfx::IndexBufferHandle skyboxIBH,
+    const Darkness::SkyboxCube &skyboxCube,
+    const std::unordered_map<std::string, bgfx::TextureHandle> &skyboxTexHandles,
+    bgfx::VertexBufferHandle skyVBH, bgfx::IndexBufferHandle skyIBH,
+    bgfx::ProgramHandle flatProgram, bgfx::ProgramHandle texturedProgram,
+    bgfx::UniformHandle s_texColor,
+    bgfx::UniformHandle u_fogColor, bgfx::UniformHandle u_fogParams,
+    bgfx::UniformHandle u_objectParams,
+    const float fogColorArr[4], const float *skyFogArr,
+    uint32_t skySampler)
+{
+    float skyView[16];
+    cam.getSkyViewMatrix(skyView);
+    bgfx::setViewTransform(0, skyView, proj);
+
+    float skyModel[16];
+    bx::mtxIdentity(skyModel);
+
+    // Cull CCW (not CW) because the camera is inside the cube/sphere —
+    // we see the back faces, so cull the outward-facing front faces.
+    uint64_t skyState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                      | BGFX_STATE_CULL_CCW;
+
+    // Inline sky fog uniform helper
+    float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    auto setFogSky = [&]() {
+        bgfx::setUniform(u_fogColor, fogColorArr);
+        bgfx::setUniform(u_fogParams, skyFogArr);
+        bgfx::setUniform(u_objectParams, opaqueParams);
+    };
+
+    if (hasSkybox && bgfx::isValid(skyboxVBH)) {
+        // Textured skybox (old sky system) — render each face with its texture
+        for (const auto &face : skyboxCube.faces) {
+            auto texIt = skyboxTexHandles.find(face.key);
+            if (texIt == skyboxTexHandles.end()) continue;
+
+            setFogSky();
+            bgfx::setTransform(skyModel);
+            bgfx::setVertexBuffer(0, skyboxVBH);
+            bgfx::setIndexBuffer(skyboxIBH, face.firstIndex, face.indexCount);
+            bgfx::setState(skyState);
+            bgfx::setTexture(0, s_texColor, texIt->second, skySampler);
+            bgfx::submit(0, texturedProgram);
+        }
+    } else if (bgfx::isValid(skyVBH)) {
+        // Procedural dome (new sky system) — vertex-coloured hemisphere
+        setFogSky();
+        bgfx::setTransform(skyModel);
+        bgfx::setVertexBuffer(0, skyVBH);
+        bgfx::setIndexBuffer(skyIBH);
+        bgfx::setState(skyState);
+        bgfx::submit(0, flatProgram);
+    }
+}
+
+// Render world geometry into View 1 — lightmapped, textured, or flat-shaded.
+// Iterates per-cell draw groups, skipping cells not in the visible set.
+static void renderWorld(
+    bool lightmappedMode, bool texturedMode,
+    bool portalCulling, const std::unordered_set<uint32_t> &visibleCells,
+    const Darkness::LightmappedMesh &lmMesh,
+    const Darkness::WorldMesh &worldMesh,
+    const Darkness::FlatMesh &flatMesh,
+    bgfx::VertexBufferHandle vbh, bgfx::IndexBufferHandle ibh,
+    bgfx::ProgramHandle flatProgram, bgfx::ProgramHandle texturedProgram,
+    bgfx::ProgramHandle lightmappedProgram,
+    bgfx::UniformHandle s_texColor, bgfx::UniformHandle s_texLightmap,
+    bgfx::UniformHandle u_fogColor, bgfx::UniformHandle u_fogParams,
+    bgfx::UniformHandle u_objectParams,
+    const float fogColorArr[4], const float fogOnArr[4],
+    const std::unordered_map<uint8_t, bgfx::TextureHandle> &textureHandles,
+    const std::vector<bgfx::TextureHandle> &lightmapAtlasHandles,
+    uint32_t texSampler, uint64_t renderState)
+{
+    float model[16];
+    bx::mtxIdentity(model);
+
+    float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    auto setFogOn = [&]() {
+        bgfx::setUniform(u_fogColor, fogColorArr);
+        bgfx::setUniform(u_fogParams, fogOnArr);
+        bgfx::setUniform(u_objectParams, opaqueParams);
+    };
+
+    auto isCellVisible = [&](uint32_t cellID) -> bool {
+        if (!portalCulling) return true;
+        return visibleCells.count(cellID) > 0;
+    };
+
+    if (lightmappedMode) {
+        for (const auto &grp : lmMesh.groups) {
+            if (!isCellVisible(grp.cellID)) continue;
+
+            setFogOn();
+            bgfx::setTransform(model);
+            bgfx::setVertexBuffer(0, vbh);
+            bgfx::setIndexBuffer(ibh, grp.firstIndex, grp.numIndices);
+            bgfx::setState(renderState);
+
+            if (grp.txtIndex == 0) {
+                bgfx::submit(1, flatProgram);
+            } else {
+                auto it = textureHandles.find(grp.txtIndex);
+                if (it != textureHandles.end()) {
+                    bgfx::setTexture(0, s_texColor, it->second, texSampler);
+                    if (!lightmapAtlasHandles.empty())
+                        bgfx::setTexture(1, s_texLightmap, lightmapAtlasHandles[0]);
+                    bgfx::submit(1, lightmappedProgram);
+                } else {
+                    bgfx::submit(1, flatProgram);
+                }
+            }
+        }
+    } else if (texturedMode) {
+        for (const auto &grp : worldMesh.groups) {
+            if (!isCellVisible(grp.cellID)) continue;
+
+            setFogOn();
+            bgfx::setTransform(model);
+            bgfx::setVertexBuffer(0, vbh);
+            bgfx::setIndexBuffer(ibh, grp.firstIndex, grp.numIndices);
+            bgfx::setState(renderState);
+
+            if (grp.txtIndex == 0) {
+                bgfx::submit(1, flatProgram);
+            } else {
+                auto it = textureHandles.find(grp.txtIndex);
+                if (it != textureHandles.end()) {
+                    bgfx::setTexture(0, s_texColor, it->second, texSampler);
+                    bgfx::submit(1, texturedProgram);
+                } else {
+                    bgfx::submit(1, flatProgram);
+                }
+            }
+        }
+    } else {
+        for (const auto &grp : flatMesh.groups) {
+            if (!isCellVisible(grp.cellID)) continue;
+
+            setFogOn();
+            bgfx::setTransform(model);
+            bgfx::setVertexBuffer(0, vbh);
+            bgfx::setIndexBuffer(ibh, grp.firstIndex, grp.numIndices);
+            bgfx::setState(renderState);
+            bgfx::submit(1, flatProgram);
+        }
+    }
+}
+
+// Render water surfaces into View 1 — alpha-blended, no depth write, double-sided.
+// Rendered last so all opaque geometry is already in the depth buffer.
+static void renderWater(
+    bool hasWater,
+    const Darkness::WorldMesh &waterMesh,
+    bgfx::VertexBufferHandle waterVBH, bgfx::IndexBufferHandle waterIBH,
+    bgfx::ProgramHandle flatProgram, bgfx::ProgramHandle waterProgram,
+    bgfx::UniformHandle s_texColor,
+    bgfx::UniformHandle u_fogColor, bgfx::UniformHandle u_fogParams,
+    bgfx::UniformHandle u_objectParams,
+    bgfx::UniformHandle u_waterParams, bgfx::UniformHandle u_waterFlow,
+    const float fogColorArr[4], const float fogOnArr[4],
+    const std::unordered_map<uint8_t, bgfx::TextureHandle> &textureHandles,
+    const std::unordered_map<uint8_t, bgfx::TextureHandle> &flowTextureHandles,
+    uint32_t texSampler,
+    float waterElapsed, float waterScrollSpeed,
+    float waveAmplitude, float uvDistortion, float waterRotation)
+{
+    if (!hasWater) return;
+
+    float identity[16];
+    bx::mtxIdentity(identity);
+
+    // Alpha blend, depth test (read) but no depth write, no face culling
+    uint64_t waterState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+        | BGFX_STATE_DEPTH_TEST_LESS
+        | BGFX_STATE_BLEND_ALPHA;
+    // No BGFX_STATE_WRITE_Z — water doesn't occlude geometry behind it
+    // No BGFX_STATE_CULL_* — water is visible from both sides
+
+    float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    auto setFogOn = [&]() {
+        bgfx::setUniform(u_fogColor, fogColorArr);
+        bgfx::setUniform(u_fogParams, fogOnArr);
+        bgfx::setUniform(u_objectParams, opaqueParams);
+    };
+
+    for (const auto &grp : waterMesh.groups) {
+        setFogOn();
+        bgfx::setTransform(identity);
+        bgfx::setVertexBuffer(0, waterVBH);
+        bgfx::setIndexBuffer(waterIBH, grp.firstIndex, grp.numIndices);
+        bgfx::setState(waterState);
+
+        if (grp.txtIndex != 0 || grp.flowGroup > 0) {
+            // Textured water: water shader with vertex displacement + UV distortion
+            // u_waterParams: x=elapsed time, y=scroll speed, z=wave amplitude, w=UV distortion
+            float wp[4] = { waterElapsed, waterScrollSpeed, waveAmplitude, uvDistortion };
+            bgfx::setUniform(u_waterParams, wp);
+
+            // u_waterFlow: x=rotation speed, y=use_world_uv flag, z=tex_unit_len
+            // Flow-textured water: vertex shader computes UVs from world position
+            // with rotation (matching Dark Engine's flow animation system).
+            // TXLIST-textured water: uses pre-computed UVs from mesh.
+            bool isFlowTextured = (grp.flowGroup > 0);
+            float useWorldUV = isFlowTextured ? 1.0f : 0.0f;
+            constexpr float TEX_UNIT_LEN = 4.0f; // 4 world units per texture repeat
+            float wf[4] = { waterRotation, useWorldUV, TEX_UNIT_LEN, 0.0f };
+            bgfx::setUniform(u_waterFlow, wf);
+
+            // Resolve texture: flow texture by group first, then TXLIST by index
+            bgfx::TextureHandle tex = BGFX_INVALID_HANDLE;
+            if (grp.flowGroup > 0) {
+                auto fit = flowTextureHandles.find(grp.flowGroup);
+                if (fit != flowTextureHandles.end())
+                    tex = fit->second;
+            }
+            if (!bgfx::isValid(tex) && grp.txtIndex != 0) {
+                auto it = textureHandles.find(grp.txtIndex);
+                if (it != textureHandles.end())
+                    tex = it->second;
+            }
+
+            if (bgfx::isValid(tex)) {
+                bgfx::setTexture(0, s_texColor, tex, texSampler);
+                bgfx::submit(1, waterProgram);
+            } else {
+                bgfx::submit(1, flatProgram);
+            }
+        } else {
+            // Non-textured water: flat blue-green from vertex color
+            bgfx::submit(1, flatProgram);
+        }
+    }
+}
+
+// Render debug raycast visualization + HUD text into View 2.
+// Casts a ray from camera forward, draws cross at hit point, normal line,
+// and HUD text overlay with hit details.
+static void renderDebugOverlay(
+    bool showRaycast,
+    const Darkness::Camera &cam, const float view[16], const float proj[16],
+    const Darkness::WRParsedData &wrData, const Darkness::TXList &txList,
+    bgfx::ProgramHandle flatProgram,
+    bgfx::UniformHandle u_fogColor, bgfx::UniformHandle u_fogParams,
+    bgfx::UniformHandle u_objectParams,
+    const float fogColorArr[4], const float fogOnArr[4])
+{
+    if (!showRaycast) return;
+
+    // Set up view 2 with same transform as view 1
+    bgfx::setViewTransform(2, view, proj);
+
+    // Compute camera forward direction (same as Camera::getViewMatrix)
+    float cosPitch = std::cos(cam.pitch);
+    float fwdX = std::cos(cam.yaw) * cosPitch;
+    float fwdY = std::sin(cam.yaw) * cosPitch;
+    float fwdZ = std::sin(cam.pitch);
+
+    // Ray from camera position, extending forward up to 500 world units
+    constexpr float RAY_VIS_DIST = 500.0f;
+    Darkness::Vector3 rayFrom(cam.pos[0], cam.pos[1], cam.pos[2]);
+    Darkness::Vector3 rayTo(cam.pos[0] + fwdX * RAY_VIS_DIST,
+                            cam.pos[1] + fwdY * RAY_VIS_DIST,
+                            cam.pos[2] + fwdZ * RAY_VIS_DIST);
+
+    Darkness::RayHit rayHit;
+    bool rayDidHit = Darkness::raycastWorld(wrData, rayFrom, rayTo, rayHit);
+
+    // Draw debug lines using bgfx transient vertex buffers.
+    // Hit: normal (2) + cross (6) + offset ray (2) = 10.  Miss: ray (2).
+    constexpr uint32_t MAX_DEBUG_VERTS = 10;
+    bgfx::TransientVertexBuffer tvb;
+    if (bgfx::getAvailTransientVertexBuffer(MAX_DEBUG_VERTS, Darkness::PosColorVertex::layout) >= MAX_DEBUG_VERTS) {
+        bgfx::allocTransientVertexBuffer(&tvb, MAX_DEBUG_VERTS, Darkness::PosColorVertex::layout);
+        auto *verts = reinterpret_cast<Darkness::PosColorVertex *>(tvb.data);
+        uint32_t numVerts = 0;
+
+        // Helper: emit one debug vertex
+        auto addVert = [&](float vx, float vy, float vz, uint32_t color) {
+            verts[numVerts].x = vx;
+            verts[numVerts].y = vy;
+            verts[numVerts].z = vz;
+            verts[numVerts].abgr = color;
+            ++numVerts;
+        };
+
+        // Colors (ABGR format for bgfx)
+        uint32_t green  = 0xFF00FF00;  // hit ray segment
+        uint32_t yellow = 0xFF00FFFF;  // miss ray segment
+        uint32_t cyan   = 0xFFFFFF00;  // surface normal
+        uint32_t red    = 0xFF0000FF;  // hit marker cross
+
+        if (rayDidHit) {
+            // Cyan line: surface normal at hit point (4 unit length)
+            constexpr float NORM_LEN = 4.0f;
+            addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z, cyan);
+            addVert(rayHit.point.x + rayHit.normal.x * NORM_LEN,
+                    rayHit.point.y + rayHit.normal.y * NORM_LEN,
+                    rayHit.point.z + rayHit.normal.z * NORM_LEN, cyan);
+
+            // Red cross at hit point (3 axes, 2 unit half-size — visible at distance)
+            constexpr float CROSS = 2.0f;
+            addVert(rayHit.point.x - CROSS, rayHit.point.y, rayHit.point.z, red);
+            addVert(rayHit.point.x + CROSS, rayHit.point.y, rayHit.point.z, red);
+            addVert(rayHit.point.x, rayHit.point.y - CROSS, rayHit.point.z, red);
+            addVert(rayHit.point.x, rayHit.point.y + CROSS, rayHit.point.z, red);
+            addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z - CROSS, red);
+            addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z + CROSS, red);
+
+            // Green line: from hit point pulled back slightly toward camera,
+            // offset perpendicular so it's not collinear with the view ray.
+            // This gives a visible green "approach" line near the hit.
+            constexpr float PULLBACK = 5.0f;
+            constexpr float OFFSET = 0.3f;
+            // Camera right vector for perpendicular offset
+            float rtX = std::sin(cam.yaw);
+            float rtY = -std::cos(cam.yaw);
+            addVert(rayHit.point.x - fwdX * PULLBACK + rtX * OFFSET,
+                    rayHit.point.y - fwdY * PULLBACK + rtY * OFFSET,
+                    rayHit.point.z - fwdZ * PULLBACK, green);
+            addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z, green);
+        } else {
+            // Yellow line: camera → ray end (visible against sky/void)
+            addVert(cam.pos[0], cam.pos[1], cam.pos[2], yellow);
+            addVert(rayTo.x, rayTo.y, rayTo.z, yellow);
+        }
+
+        // Submit to view 2 (debug overlay) — no depth test so lines
+        // render on top of world geometry
+        float identity[16];
+        bx::mtxIdentity(identity);
+        bgfx::setTransform(identity);
+        bgfx::setVertexBuffer(0, &tvb, 0, numVerts);
+        uint64_t lineState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                           | BGFX_STATE_PT_LINES;
+        bgfx::setState(lineState);
+        float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+        bgfx::setUniform(u_fogColor, fogColorArr);
+        bgfx::setUniform(u_fogParams, fogOnArr);
+        bgfx::setUniform(u_objectParams, opaqueParams);
+        bgfx::submit(2, flatProgram);
+    }
+
+    // HUD text overlay showing raycast results
+    bgfx::setDebug(BGFX_DEBUG_TEXT);
+    bgfx::dbgTextClear();
+
+    // Screen-center crosshair (160 cols x 45 rows at 1280x720)
+    uint8_t cross_attr = 0x0E; // yellow on black
+    bgfx::dbgTextPrintf(79, 22, cross_attr, "+");
+
+    uint8_t hud_attr = 0x0F; // white on black
+    uint8_t val_attr = 0x0A; // green on black
+
+    bgfx::dbgTextPrintf(2, 1, hud_attr, "RAYCAST DEBUG (Backspace+R to toggle)");
+
+    if (rayDidHit) {
+        bgfx::dbgTextPrintf(2, 3, val_attr, "Hit:     YES");
+        bgfx::dbgTextPrintf(2, 4, val_attr, "Dist:    %.2f", rayHit.distance);
+        bgfx::dbgTextPrintf(2, 5, val_attr, "Point:   (%.2f, %.2f, %.2f)",
+            rayHit.point.x, rayHit.point.y, rayHit.point.z);
+        bgfx::dbgTextPrintf(2, 6, val_attr, "Normal:  (%.3f, %.3f, %.3f)",
+            rayHit.normal.x, rayHit.normal.y, rayHit.normal.z);
+        bgfx::dbgTextPrintf(2, 7, val_attr, "TexIdx:  %d",
+            rayHit.textureIndex);
+        // Show texture name if available from TXLIST
+        if (rayHit.textureIndex >= 0 &&
+            static_cast<size_t>(rayHit.textureIndex) < txList.textures.size()) {
+            const auto &tex = txList.textures[rayHit.textureIndex];
+            bgfx::dbgTextPrintf(2, 8, val_attr, "Texture: %s/%s",
+                tex.family.c_str(), tex.name.c_str());
+        }
+    } else {
+        bgfx::dbgTextPrintf(2, 3, 0x0C, "Hit:     NO (miss)");
+    }
+
+    // Camera info line
+    int32_t camCellIdx = findCameraCell(wrData, cam.pos[0], cam.pos[1], cam.pos[2]);
+    bgfx::dbgTextPrintf(2, 10, hud_attr, "Camera:  (%.2f, %.2f, %.2f)  cell=%d",
+        cam.pos[0], cam.pos[1], cam.pos[2], camCellIdx);
+}
+
+// ── Object rendering ──
+// Two-pass rendering for correct transparency compositing:
+//   Pass 1: all opaque submeshes (matTrans == 0 AND renderAlpha == 1.0)
+//   Pass 2: all translucent submeshes (matTrans > 0 OR renderAlpha < 1.0)
+// A single object (e.g. a window) can have both opaque submeshes (frame)
+// and translucent submeshes (glass pane), so transparency is per-submesh.
+//
+// Final alpha = (1.0 - material.trans) * object.renderAlpha
+// where material.trans is from .bin mat_extra (0=opaque, 0.3=glass)
+// and object.renderAlpha is from P$RenderAlp property (1.0=opaque)
+static void renderObjects(
+    bool showObjects, bool showFallbackCubes,
+    bool portalCulling, const std::unordered_set<uint32_t> &visibleCells,
+    int isolateModelIdx, const std::vector<std::string> &sortedModelNames,
+    const ObjectPropData &objData,
+    const std::vector<int32_t> &objCellIDs,
+    const std::unordered_map<std::string, ObjectModelGPU> &objModelGPU,
+    const std::unordered_map<std::string, bgfx::TextureHandle> &objTextureHandles,
+    bgfx::VertexBufferHandle fallbackCubeVBH, bgfx::IndexBufferHandle fallbackCubeIBH,
+    bgfx::ProgramHandle flatProgram, bgfx::ProgramHandle texturedProgram,
+    bgfx::UniformHandle s_texColor,
+    bgfx::UniformHandle u_fogColor, bgfx::UniformHandle u_fogParams,
+    bgfx::UniformHandle u_objectParams,
+    const float fogColorArr[4], const float fogOnArr[4],
+    uint32_t texSampler, uint64_t renderState)
+{
+    if (!showObjects) return;
+
+    // Alpha-blend state for translucent submeshes
+    uint64_t translucentState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                              | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                              | BGFX_STATE_CULL_CW
+                              | BGFX_STATE_BLEND_ALPHA;
+
+    // Helper: set fog uniforms (bgfx clears uniforms after each submit)
+    float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    auto setFogOn = [&]() {
+        bgfx::setUniform(u_fogColor, fogColorArr);
+        bgfx::setUniform(u_fogParams, fogOnArr);
+        bgfx::setUniform(u_objectParams, opaqueParams);
+    };
+
+    // Helper: draw one object's submeshes, filtering by opacity.
+    // When opaquePass=true, draws only opaque submeshes with renderState.
+    // When opaquePass=false, draws only translucent submeshes with translucentState.
+    auto drawObjectSubmeshes = [&](size_t oi, bool opaquePass) {
+        const auto &obj = objData.objects[oi];
+        if (!obj.hasPosition) return;
+
+        // Portal culling: skip objects in non-visible cells.
+        if (portalCulling && oi < objCellIDs.size()) {
+            int32_t objCell = objCellIDs[oi];
+            if (objCell >= 0 && visibleCells.count(static_cast<uint32_t>(objCell)) == 0)
+                return;
+        }
+
+        // Compute per-object model matrix from position + angles
+        float objMtx[16];
+        buildModelMatrix(objMtx, obj.x, obj.y, obj.z,
+                         obj.heading, obj.pitch, obj.bank,
+                         obj.scaleX, obj.scaleY, obj.scaleZ);
+
+        std::string modelName(obj.modelName);
+
+        // Model isolation mode: skip objects that don't match the isolated model
+        if (isolateModelIdx >= 0 && isolateModelIdx < (int)sortedModelNames.size()) {
+            if (modelName != sortedModelNames[isolateModelIdx])
+                return;
+        }
+
+        auto it = objModelGPU.find(modelName);
+
+        if (it != objModelGPU.end() && it->second.valid) {
+            const auto &gpuModel = it->second;
+
+            for (const auto &sm : gpuModel.subMeshes) {
+                if (sm.indexCount == 0) continue;
+
+                // Determine if this submesh is translucent:
+                // either the material has translucency or the object has RenderAlpha
+                bool isTranslucent = (sm.matTrans > 0.0f) || (obj.renderAlpha < 1.0f);
+                if (opaquePass == isTranslucent) continue;  // wrong pass
+
+                // Compute final alpha: (1 - matTrans) * renderAlpha
+                // matTrans convention: 0=opaque, 0.3=30% transparent glass
+                float finalAlpha = (1.0f - sm.matTrans) * obj.renderAlpha;
+                float objAlpha[4] = { finalAlpha, 0.0f, 0.0f, 0.0f };
+
+                uint64_t state = opaquePass ? renderState : translucentState;
+
+                bgfx::setUniform(u_fogColor, fogColorArr);
+                bgfx::setUniform(u_fogParams, fogOnArr);
+                bgfx::setUniform(u_objectParams, objAlpha);
+                bgfx::setTransform(objMtx);
+                bgfx::setVertexBuffer(0, gpuModel.vbh);
+                bgfx::setIndexBuffer(gpuModel.ibh, sm.firstIndex, sm.indexCount);
+                bgfx::setState(state);
+
+                if (sm.textured) {
+                    auto texIt = objTextureHandles.find(sm.matName);
+                    if (texIt != objTextureHandles.end()) {
+                        bgfx::setTexture(0, s_texColor, texIt->second, texSampler);
+                        bgfx::submit(1, texturedProgram);
+                    } else {
+                        bgfx::submit(1, flatProgram);
+                    }
+                } else {
+                    bgfx::submit(1, flatProgram);
+                }
+            }
+        } else if (showFallbackCubes && opaquePass) {
+            // Fallback cubes are always opaque
+            setFogOn();
+            bgfx::setTransform(objMtx);
+            bgfx::setVertexBuffer(0, fallbackCubeVBH);
+            bgfx::setIndexBuffer(fallbackCubeIBH);
+            bgfx::setState(renderState);
+            bgfx::submit(1, flatProgram);
+        }
+    };
+
+    // Pass 1: opaque submeshes of all objects
+    for (size_t oi = 0; oi < objData.objects.size(); ++oi) {
+        drawObjectSubmeshes(oi, true);
+    }
+    // Pass 2: translucent submeshes — rendered after all opaque geometry
+    for (size_t oi = 0; oi < objData.objects.size(); ++oi) {
+        drawObjectSubmeshes(oi, false);
+    }
+}
+
+// ── Event handling ──
+// Process SDL events: quit, mouse look, scroll-wheel speed, keyboard shortcuts.
+// Mutates camera, runtime flags, and model isolation state.
+static void handleEvents(
+    bool &running, Camera &cam, float &moveSpeed,
+    bool &portalCulling, int &filterMode,
+    int &isolateModelIdx, bool &cameraCollision, bool &showRaycast,
+    float spawnX, float spawnY, float spawnZ, float spawnYaw,
+    const std::vector<std::string> &sortedModelNames,
+    const std::unordered_map<std::string, int> &modelInstanceCounts,
+    Darkness::DebugConsole &dbgConsole,
+    std::function<void()> updateTitle)
+{
+    static constexpr float MOUSE_SENS = 0.002f;
+    static constexpr float PI = 3.14159265f;
+
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+        // Debug console gets first crack at all events
+        if (dbgConsole.handleEvent(ev)) continue;
+
+        if (ev.type == SDL_QUIT) {
+            running = false;
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
+            running = false;
+        } else if (ev.type == SDL_MOUSEMOTION) {
+            cam.yaw   -= ev.motion.xrel * MOUSE_SENS;
+            cam.pitch -= ev.motion.yrel * MOUSE_SENS;
+            cam.pitch = std::max(-PI * 0.49f, std::min(PI * 0.49f, cam.pitch));
+        } else if (ev.type == SDL_MOUSEWHEEL) {
+            // Scroll wheel adjusts movement speed: 1.5x per tick
+            if (ev.wheel.y > 0) {
+                for (int i = 0; i < ev.wheel.y; ++i)
+                    moveSpeed *= 1.5f;
+            } else if (ev.wheel.y < 0) {
+                for (int i = 0; i < -ev.wheel.y; ++i)
+                    moveSpeed /= 1.5f;
+            }
+            moveSpeed = std::max(1.0f, std::min(500.0f, moveSpeed));
+            updateTitle();
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_HOME) {
+            // Teleport back to spawn point
+            cam.pos[0] = spawnX;
+            cam.pos[1] = spawnY;
+            cam.pos[2] = spawnZ;
+            cam.yaw = spawnYaw;
+            cam.pitch = 0;
+            std::fprintf(stderr, "Teleported to spawn (%.1f, %.1f, %.1f)\n",
+                         spawnX, spawnY, spawnZ);
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c
+                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
+            // Backspace+C: Toggle portal culling
+            portalCulling = !portalCulling;
+            std::fprintf(stderr, "Portal culling: %s\n",
+                         portalCulling ? "ON" : "OFF");
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_f
+                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
+            // Backspace+F: Cycle texture filtering
+            filterMode = (filterMode + 1) % 4;
+            const char *filterNames[] = {
+                "point (crispy)", "bilinear", "trilinear", "anisotropic"
+            };
+            std::fprintf(stderr, "Texture filtering: %s\n", filterNames[filterMode]);
+        } else if (ev.type == SDL_KEYDOWN
+                   && (ev.key.keysym.sym == SDLK_m || ev.key.keysym.sym == SDLK_n)
+                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
+            // Model isolation: M = next model, N = previous model.
+            // Cycles through sorted model names, isolating one at a time.
+            // Past the last/first model returns to "show all" mode.
+            bool forward = (ev.key.keysym.sym == SDLK_m);
+            if (sortedModelNames.empty()) {
+                std::fprintf(stderr, "No models loaded for isolation\n");
+            } else {
+                if (forward) {
+                    isolateModelIdx++;
+                    if (isolateModelIdx >= static_cast<int>(sortedModelNames.size()))
+                        isolateModelIdx = -1;
+                } else {
+                    isolateModelIdx--;
+                    if (isolateModelIdx < -1)
+                        isolateModelIdx = static_cast<int>(sortedModelNames.size()) - 1;
+                }
+                if (isolateModelIdx < 0) {
+                    std::fprintf(stderr, "Model isolation: OFF (showing all)\n");
+                } else {
+                    const auto &isoName = sortedModelNames[isolateModelIdx];
+                    auto cit = modelInstanceCounts.find(isoName);
+                    int cnt = (cit != modelInstanceCounts.end()) ? cit->second : 0;
+                    std::fprintf(stderr, "Isolating model [%d/%zu]: '%s' (%d instances)\n",
+                                 isolateModelIdx + 1, sortedModelNames.size(),
+                                 isoName.c_str(), cnt);
+                }
+                updateTitle();
+            }
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_v
+                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
+            // Backspace+V: Toggle camera collision with world geometry
+            cameraCollision = !cameraCollision;
+            std::fprintf(stderr, "Camera collision: %s\n",
+                         cameraCollision ? "ON (clip)" : "OFF (noclip)");
+            updateTitle();
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_r
+                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
+            // Backspace+R: Toggle debug raycast visualization
+            showRaycast = !showRaycast;
+            std::fprintf(stderr, "Raycast debug: %s\n",
+                         showRaycast ? "ON" : "OFF");
+        }
+    }
+}
+
+// ── Movement update ──
+// WASD + vertical movement, suppressed while debug console is open.
+// Applies camera collision against world geometry when enabled.
+static void updateMovement(
+    float dt, Camera &cam, float moveSpeed,
+    bool cameraCollision, const WRParsedData &wrData,
+    const Darkness::DebugConsole &dbgConsole)
+{
+    if (dbgConsole.isOpen()) return;
+
+    const Uint8 *keys = SDL_GetKeyboardState(nullptr);
+    float forward = 0, right = 0, up = 0;
+    float speed = moveSpeed;
+    if (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL])
+        speed *= 3.0f;
+
+    if (keys[SDL_SCANCODE_W]) forward += speed * dt;
+    if (keys[SDL_SCANCODE_S]) forward -= speed * dt;
+    if (keys[SDL_SCANCODE_D]) right   += speed * dt;
+    if (keys[SDL_SCANCODE_A]) right   -= speed * dt;
+    if (keys[SDL_SCANCODE_SPACE])  up += speed * dt;
+    if (keys[SDL_SCANCODE_LSHIFT]) up -= speed * dt;
+    if (keys[SDL_SCANCODE_Q]) up += speed * dt;
+    if (keys[SDL_SCANCODE_E]) up -= speed * dt;
+
+    // Save position before movement for collision revert
+    float oldPos[3] = { cam.pos[0], cam.pos[1], cam.pos[2] };
+
+    cam.move(forward, right, up);
+
+    // Camera collision: constrain sphere within world cell planes
+    if (cameraCollision) {
+        applyCameraCollision(wrData, oldPos, cam.pos);
+    }
+}
+
+// ── Animated lightmap update ──
+// Advance all light animation timers and re-blend changed lightmaps into
+// the atlas CPU buffer, then upload the updated atlas to the GPU.
+static void updateLightmaps(
+    float dt, bool lightmappedMode,
+    std::unordered_map<int16_t, LightSource> &lightSources,
+    const std::unordered_map<int16_t, std::vector<std::pair<uint32_t, int>>> &animLightIndex,
+    LightmapAtlasSet &lmAtlasSet,
+    const std::vector<bgfx::TextureHandle> &lightmapAtlasHandles,
+    const WRParsedData &wrData, int lmScale)
+{
+    if (!lightmappedMode || lmAtlasSet.atlases.empty()) return;
+
+    bool anyLightChanged = false;
+    std::unordered_map<int16_t, float> currentIntensities;
+
+    for (auto &[lightNum, light] : lightSources) {
+        bool changed = Darkness::updateLightAnimation(light, dt);
+        float intensity = (light.maxBright > 0.0f)
+            ? light.brightness / light.maxBright : 0.0f;
+        currentIntensities[lightNum] = intensity;
+        if (changed) anyLightChanged = true;
+    }
+
+    // Re-blend changed lightmaps into atlas CPU buffer
+    if (anyLightChanged) {
+        for (auto &[lightNum, light] : lightSources) {
+            float intensity = currentIntensities[lightNum];
+            if (std::abs(intensity - light.prevIntensity) < 0.002f) continue;
+            light.prevIntensity = intensity;
+
+            auto it = animLightIndex.find(lightNum);
+            if (it == animLightIndex.end()) continue;
+
+            for (auto &[ci, pi] : it->second) {
+                Darkness::blendAnimatedLightmap(
+                    lmAtlasSet.atlases[0], wrData, ci, pi,
+                    lmAtlasSet.entries[ci][pi],
+                    currentIntensities, lmScale);
+            }
+        }
+
+        // Upload full atlas to GPU
+        const auto &atlas = lmAtlasSet.atlases[0];
+        const bgfx::Memory *mem = bgfx::copy(
+            atlas.rgba.data(), static_cast<uint32_t>(atlas.rgba.size()));
+        bgfx::updateTexture2D(lightmapAtlasHandles[0], 0, 0, 0, 0,
+            static_cast<uint16_t>(atlas.size),
+            static_cast<uint16_t>(atlas.size), mem);
+    }
+}
+
+// ── Frame preparation ──
+// Compute per-frame matrices, fog uniforms, sampler flags, underwater state,
+// portal culling, and bgfx view transforms. Returns a FrameContext consumed
+// by each render pass within a single frame.
+static Darkness::FrameContext prepareFrame(
+    const Camera &cam, int filterMode,
+    bool portalCulling, uint32_t skyClearColor,
+    const WRParsedData &wrData,
+    const std::vector<std::vector<CellPortalInfo>> &cellPortals,
+    const FogParams &fogParams, const SkyParams &skyParams,
+    uint32_t &outCullVisibleCells)
+{
+    using namespace Darkness;
+    FrameContext fc{};
+
+    // Projection matrix (shared by sky and world views)
+    bx::mtxProj(fc.proj, 60.0f,
+                 float(WINDOW_WIDTH) / float(WINDOW_HEIGHT),
+                 0.1f, 5000.0f,
+                 bgfx::getCaps()->homogeneousDepth,
+                 bx::Handedness::Right);
+
+    // Texture sampler flags for the current filtering mode (shared by both views).
+    // UINT32_MAX = use texture's baked POINT flags (default).
+    // Other modes override with explicit sampler flags per draw call.
+    // Two variants: MIRROR wrap (world/object textures), CLAMP wrap (skybox).
+    switch (filterMode) {
+    case 0: // Point: use texture's baked POINT flags
+        fc.texSampler = UINT32_MAX;
+        fc.skySampler = UINT32_MAX;
+        break;
+    case 1: // Bilinear: linear min/mag, point mip
+        fc.texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR
+                      | BGFX_SAMPLER_MIP_POINT;
+        fc.skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+                      | BGFX_SAMPLER_MIP_POINT;
+        break;
+    case 2: // Trilinear: linear min/mag/mip
+        fc.texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR;
+        fc.skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
+        break;
+    case 3: // Anisotropic: aniso min/mag, linear mip
+        fc.texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR
+                      | BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
+        fc.skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+                      | BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
+        break;
+    default:
+        fc.texSampler = UINT32_MAX;
+        fc.skySampler = UINT32_MAX;
+        break;
+    }
+
+    // ── Underwater detection ──
+    // Check if the camera is inside a water cell (mediaType==2).
+    // When submerged, override fog with short-range blue-green water fog.
+    fc.underwater = (getCameraMediaType(wrData, cam.pos[0], cam.pos[1], cam.pos[2]) == 2);
+
+    // Water fog defaults: dark blue-green tint, short visibility range
+    static constexpr float waterFogR = 0.10f, waterFogG = 0.18f, waterFogB = 0.25f;
+    static constexpr float waterFogDist = 80.0f;
+
+    // ── Fog uniform values (reused before every bgfx::submit) ──
+    // bgfx uniforms are per-submit: cleared after each draw call.
+    // We set them before every submit so all shaders receive fog data.
+    // When underwater, override with water fog regardless of FOG chunk.
+    if (fc.underwater) {
+        fc.fogColorArr[0] = waterFogR; fc.fogColorArr[1] = waterFogG;
+        fc.fogColorArr[2] = waterFogB; fc.fogColorArr[3] = 1.0f;
+        fc.fogOnArr[0] = 1.0f; fc.fogOnArr[1] = waterFogDist;
+        fc.fogOnArr[2] = 0.0f; fc.fogOnArr[3] = 0.0f;
+    } else {
+        fc.fogColorArr[0] = fogParams.r; fc.fogColorArr[1] = fogParams.g;
+        fc.fogColorArr[2] = fogParams.b; fc.fogColorArr[3] = 1.0f;
+        fc.fogOnArr[0] = fogParams.enabled ? 1.0f : 0.0f;
+        fc.fogOnArr[1] = fogParams.distance;
+        fc.fogOnArr[2] = 0.0f; fc.fogOnArr[3] = 0.0f;
+    }
+    fc.fogOffArr[0] = 0.0f; fc.fogOffArr[1] = 1.0f;
+    fc.fogOffArr[2] = 0.0f; fc.fogOffArr[3] = 0.0f;
+
+    // Sky fog: underwater always fogs sky; otherwise respect SKYOBJVAR.fog
+    fc.skyFogged = fc.underwater || (fogParams.enabled && skyParams.fog);
+    fc.skyFogArr = fc.skyFogged ? fc.fogOnArr : fc.fogOffArr;
+
+    // Update clear color per-frame for underwater tinting
+    if (fc.underwater) {
+        uint8_t cr = static_cast<uint8_t>(waterFogR * 255.0f);
+        uint8_t cg = static_cast<uint8_t>(waterFogG * 255.0f);
+        uint8_t cb = static_cast<uint8_t>(waterFogB * 255.0f);
+        uint32_t waterClear = (uint32_t(cr) << 24) | (uint32_t(cg) << 16)
+                            | (uint32_t(cb) << 8) | 0xFF;
+        bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+                            waterClear, 1.0f, 0);
+    } else {
+        bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+                            skyClearColor, 1.0f, 0);
+    }
+
+    // View 1 transform (world + objects)
+    cam.getViewMatrix(fc.view);
+    bgfx::setViewTransform(1, fc.view, fc.proj);
+
+    // ── Portal culling: determine visible cells ──
+    // Build view-projection matrix and extract frustum planes for portal tests.
+    // When culling is disabled, visibleCells remains empty (skip filtering).
+    if (portalCulling) {
+        float vp[16];
+        bx::mtxMul(vp, fc.view, fc.proj);
+        ViewFrustum frustum;
+        frustum.extractFromVP(vp);
+
+        int32_t camCell = findCameraCell(wrData, cam.pos[0], cam.pos[1], cam.pos[2]);
+        fc.visibleCells = portalBFS(wrData, cellPortals, camCell, frustum,
+                                     cam.pos[0], cam.pos[1], cam.pos[2]);
+        outCullVisibleCells = static_cast<uint32_t>(fc.visibleCells.size());
+    }
+
+    // Opaque geometry render state (constant each frame)
+    fc.renderState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                   | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                   | BGFX_STATE_CULL_CW;
+
+    return fc;
+}
+
+// ── Cleanup functions ──
+// Destroy all bgfx GPU resources created during initialization.
+static void destroyGPUResources(
+    bgfx::VertexBufferHandle vbh, bgfx::IndexBufferHandle ibh,
+    bgfx::ProgramHandle flatProgram, bgfx::ProgramHandle texturedProgram,
+    bgfx::ProgramHandle lightmappedProgram, bgfx::ProgramHandle waterProgram,
+    bgfx::UniformHandle s_texColor, bgfx::UniformHandle s_texLightmap,
+    bgfx::UniformHandle u_waterParams, bgfx::UniformHandle u_waterFlow,
+    bgfx::UniformHandle u_fogColor, bgfx::UniformHandle u_fogParams,
+    bgfx::UniformHandle u_objectParams,
+    std::unordered_map<uint8_t, bgfx::TextureHandle> &textureHandles,
+    std::unordered_map<uint8_t, bgfx::TextureHandle> &flowTextureHandles,
+    std::vector<bgfx::TextureHandle> &lightmapAtlasHandles,
+    bgfx::VertexBufferHandle waterVBH, bgfx::IndexBufferHandle waterIBH,
+    bgfx::VertexBufferHandle skyboxVBH, bgfx::IndexBufferHandle skyboxIBH,
+    std::unordered_map<std::string, bgfx::TextureHandle> &skyboxTexHandles,
+    bgfx::VertexBufferHandle skyVBH, bgfx::IndexBufferHandle skyIBH,
+    std::unordered_map<std::string, Darkness::ObjectModelGPU> &objModelGPU,
+    std::unordered_map<std::string, bgfx::TextureHandle> &objTextureHandles,
+    bgfx::VertexBufferHandle fallbackCubeVBH, bgfx::IndexBufferHandle fallbackCubeIBH)
+{
+    // Water surface buffers and flow textures
+    if (bgfx::isValid(waterVBH)) bgfx::destroy(waterVBH);
+    if (bgfx::isValid(waterIBH)) bgfx::destroy(waterIBH);
+    for (auto &kv : flowTextureHandles)
+        bgfx::destroy(kv.second);
+
+    // Textured skybox buffers
+    if (bgfx::isValid(skyboxVBH)) bgfx::destroy(skyboxVBH);
+    if (bgfx::isValid(skyboxIBH)) bgfx::destroy(skyboxIBH);
+    for (auto &kv : skyboxTexHandles)
+        bgfx::destroy(kv.second);
+
+    // Sky dome buffers
+    if (bgfx::isValid(skyVBH)) bgfx::destroy(skyVBH);
+    if (bgfx::isValid(skyIBH)) bgfx::destroy(skyIBH);
+
+    // Object GPU buffers and textures
+    for (auto &kv : objModelGPU) {
+        if (bgfx::isValid(kv.second.vbh)) bgfx::destroy(kv.second.vbh);
+        if (bgfx::isValid(kv.second.ibh)) bgfx::destroy(kv.second.ibh);
+    }
+    for (auto &kv : objTextureHandles) {
+        bgfx::destroy(kv.second);
+    }
+    if (bgfx::isValid(fallbackCubeVBH)) bgfx::destroy(fallbackCubeVBH);
+    if (bgfx::isValid(fallbackCubeIBH)) bgfx::destroy(fallbackCubeIBH);
+
+    // World geometry and textures
+    for (auto &h : lightmapAtlasHandles)
+        bgfx::destroy(h);
+    for (auto &kv : textureHandles)
+        bgfx::destroy(kv.second);
+    bgfx::destroy(s_texLightmap);
+    bgfx::destroy(s_texColor);
+    bgfx::destroy(u_waterParams);
+    bgfx::destroy(u_waterFlow);
+    bgfx::destroy(u_fogColor);
+    bgfx::destroy(u_fogParams);
+    bgfx::destroy(u_objectParams);
+
+    bgfx::destroy(ibh);
+    bgfx::destroy(vbh);
+    bgfx::destroy(flatProgram);
+    bgfx::destroy(texturedProgram);
+    bgfx::destroy(lightmappedProgram);
+    bgfx::destroy(waterProgram);
+}
+
+// Initialize SDL2 window and bgfx rendering context.
+// Sets up 3 views: sky (0), world+objects (1), debug overlay (2).
+// Returns the SDL window, or nullptr on failure.
+static SDL_Window *initWindow(const Darkness::FogParams &fogParams,
+                               uint32_t &outSkyClearColor) {
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        return nullptr;
+    }
+
+    SDL_Window *window = SDL_CreateWindow(
+        "darkness — lightmapped renderer",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        WINDOW_WIDTH, WINDOW_HEIGHT,
+        SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI
+    );
+
+    if (!window) {
+        std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        return nullptr;
+    }
+
+    SDL_SysWMinfo wmi;
+    SDL_VERSION(&wmi.version);
+    if (!SDL_GetWindowWMInfo(window, &wmi)) {
+        std::fprintf(stderr, "SDL_GetWindowWMInfo failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return nullptr;
+    }
+
+    bgfx::renderFrame(); // single-threaded mode
+
+    bgfx::Init bInit;
+    bInit.type = bgfx::RendererType::Count; // auto-detect: Metal/D3D11/OpenGL/Vulkan
+    bInit.resolution.width  = WINDOW_WIDTH;
+    bInit.resolution.height = WINDOW_HEIGHT;
+    bInit.resolution.reset  = BGFX_RESET_VSYNC;
+
+#if BX_PLATFORM_OSX
+    bInit.platformData.nwh = wmi.info.cocoa.window;
+#elif BX_PLATFORM_LINUX
+    bInit.platformData.ndt = wmi.info.x11.display;
+    bInit.platformData.nwh = (void *)(uintptr_t)wmi.info.x11.window;
+#elif BX_PLATFORM_WINDOWS
+    bInit.platformData.nwh = wmi.info.win.window;
+#endif
+
+    if (!bgfx::init(bInit)) {
+        std::fprintf(stderr, "bgfx::init failed\n");
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return nullptr;
+    }
+
+    // View 0: Sky pass — clears colour + depth, renders sky dome with no depth writes
+    // When fog is enabled, use fog colour as clear colour so uncovered sky matches
+    outSkyClearColor = 0x1a1a2eFF;
+    if (fogParams.enabled) {
+        uint8_t fr = static_cast<uint8_t>(fogParams.r * 255.0f);
+        uint8_t fg = static_cast<uint8_t>(fogParams.g * 255.0f);
+        uint8_t fb = static_cast<uint8_t>(fogParams.b * 255.0f);
+        outSkyClearColor = (uint32_t(fr) << 24) | (uint32_t(fg) << 16) | (uint32_t(fb) << 8) | 0xFF;
+    }
+    bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+                        outSkyClearColor, 1.0f, 0);
+    bgfx::setViewRect(0, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+
+    // View 1: World + objects pass — clears depth only, preserves sky colour
+    bgfx::setViewClear(1, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+    bgfx::setViewRect(1, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+
+    // View 2: Debug overlay — no clear, renders on top of view 1.
+    // Separate view ensures debug lines are drawn AFTER all world geometry,
+    // regardless of bgfx's internal draw call sorting within a view.
+    bgfx::setViewClear(2, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+    bgfx::setViewRect(2, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+
+    Darkness::PosColorVertex::init();
+    Darkness::PosColorUVVertex::init();
+    Darkness::PosUV2Vertex::init();
+
+    return window;
+}
+
+// Shut down bgfx and SDL2 window.
+static void shutdownWindow(SDL_Window *window) {
+    bgfx::shutdown();
+    SDL_DestroyWindow(window);
+    SDL_Quit();
 }
 
 int main(int argc, char *argv[]) {
@@ -780,83 +1793,9 @@ int main(int argc, char *argv[]) {
 
     // ── SDL2 + bgfx init ──
 
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-        return 1;
-    }
-
-    SDL_Window *window = SDL_CreateWindow(
-        "darkness — lightmapped renderer",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WINDOW_WIDTH, WINDOW_HEIGHT,
-        SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI
-    );
-
-    if (!window) {
-        std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
-        SDL_Quit();
-        return 1;
-    }
-
-    SDL_SysWMinfo wmi;
-    SDL_VERSION(&wmi.version);
-    if (!SDL_GetWindowWMInfo(window, &wmi)) {
-        std::fprintf(stderr, "SDL_GetWindowWMInfo failed: %s\n", SDL_GetError());
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
-    }
-
-    bgfx::renderFrame(); // single-threaded mode
-
-    bgfx::Init bInit;
-    bInit.type = bgfx::RendererType::Count; // auto-detect: Metal/D3D11/OpenGL/Vulkan
-    bInit.resolution.width  = WINDOW_WIDTH;
-    bInit.resolution.height = WINDOW_HEIGHT;
-    bInit.resolution.reset  = BGFX_RESET_VSYNC;
-
-#if BX_PLATFORM_OSX
-    bInit.platformData.nwh = wmi.info.cocoa.window;
-#elif BX_PLATFORM_LINUX
-    bInit.platformData.ndt = wmi.info.x11.display;
-    bInit.platformData.nwh = (void *)(uintptr_t)wmi.info.x11.window;
-#elif BX_PLATFORM_WINDOWS
-    bInit.platformData.nwh = wmi.info.win.window;
-#endif
-
-    if (!bgfx::init(bInit)) {
-        std::fprintf(stderr, "bgfx::init failed\n");
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
-    }
-
-    // View 0: Sky pass — clears colour + depth, renders sky dome with no depth writes
-    // When fog is enabled, use fog colour as clear colour so uncovered sky matches
-    uint32_t skyClearColor = 0x1a1a2eFF;
-    if (fogParams.enabled) {
-        uint8_t fr = static_cast<uint8_t>(fogParams.r * 255.0f);
-        uint8_t fg = static_cast<uint8_t>(fogParams.g * 255.0f);
-        uint8_t fb = static_cast<uint8_t>(fogParams.b * 255.0f);
-        skyClearColor = (uint32_t(fr) << 24) | (uint32_t(fg) << 16) | (uint32_t(fb) << 8) | 0xFF;
-    }
-    bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
-                        skyClearColor, 1.0f, 0);
-    bgfx::setViewRect(0, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
-
-    // View 1: World + objects pass — clears depth only, preserves sky colour
-    bgfx::setViewClear(1, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
-    bgfx::setViewRect(1, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
-
-    // View 2: Debug overlay — no clear, renders on top of view 1.
-    // Separate view ensures debug lines are drawn AFTER all world geometry,
-    // regardless of bgfx's internal draw call sorting within a view.
-    bgfx::setViewClear(2, BGFX_CLEAR_NONE, 0, 1.0f, 0);
-    bgfx::setViewRect(2, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
-
-    PosColorVertex::init();
-    PosColorUVVertex::init();
-    PosUV2Vertex::init();
+    uint32_t skyClearColor;
+    SDL_Window *window = initWindow(fogParams, skyClearColor);
+    if (!window) return 1;
 
     // ── Shaders ──
     // Load from cross-platform embedded shader table (auto-selects Metal/D3D/GL/Vulkan)
@@ -1410,8 +2349,6 @@ int main(int argc, char *argv[]) {
     SDL_SetRelativeMouseMode(SDL_TRUE);
 
     float moveSpeed = 20.0f; // adjustable via scroll wheel
-    const float MOUSE_SENS = 0.002f;
-    const float PI = 3.14159265f;
 
     // Portal culling stats for title bar display
     uint32_t cullVisibleCells = 0;  // updated each frame when culling is on
@@ -1499,10 +2436,6 @@ int main(int argc, char *argv[]) {
         [&]() { return waterScrollSpeed; },
         [&](float v) { waterScrollSpeed = v; });
 
-    uint64_t renderState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                         | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
-                         | BGFX_STATE_CULL_CW;
-
     auto lastTime = std::chrono::high_resolution_clock::now();
     float waterElapsed = 0.0f;
 
@@ -1514,711 +2447,72 @@ int main(int argc, char *argv[]) {
         dt = std::min(dt, 0.1f);
         waterElapsed += dt;
 
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            // Debug console gets first crack at all events
-            if (dbgConsole.handleEvent(ev)) continue;
+        handleEvents(running, cam, moveSpeed,
+                     portalCulling, filterMode,
+                     isolateModelIdx, cameraCollision, showRaycast,
+                     spawnX, spawnY, spawnZ, spawnYaw,
+                     sortedModelNames, modelInstanceCounts,
+                     dbgConsole, updateTitle);
 
-            if (ev.type == SDL_QUIT) {
-                running = false;
-            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
-                running = false;
-            } else if (ev.type == SDL_MOUSEMOTION) {
-                cam.yaw   -= ev.motion.xrel * MOUSE_SENS;
-                cam.pitch -= ev.motion.yrel * MOUSE_SENS;
-                cam.pitch = std::max(-PI * 0.49f, std::min(PI * 0.49f, cam.pitch));
-            } else if (ev.type == SDL_MOUSEWHEEL) {
-                // Scroll wheel adjusts movement speed: 1.5x per tick
-                if (ev.wheel.y > 0) {
-                    for (int i = 0; i < ev.wheel.y; ++i)
-                        moveSpeed *= 1.5f;
-                } else if (ev.wheel.y < 0) {
-                    for (int i = 0; i < -ev.wheel.y; ++i)
-                        moveSpeed /= 1.5f;
-                }
-                moveSpeed = std::max(1.0f, std::min(500.0f, moveSpeed));
-                updateTitle();
-            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_HOME) {
-                // Teleport back to spawn point
-                cam.pos[0] = spawnX;
-                cam.pos[1] = spawnY;
-                cam.pos[2] = spawnZ;
-                cam.yaw = spawnYaw;
-                cam.pitch = 0;
-                std::fprintf(stderr, "Teleported to spawn (%.1f, %.1f, %.1f)\n",
-                             spawnX, spawnY, spawnZ);
-            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c
-                       && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-                // Backspace+C: Toggle portal culling
-                portalCulling = !portalCulling;
-                std::fprintf(stderr, "Portal culling: %s\n",
-                             portalCulling ? "ON" : "OFF");
-            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_f
-                       && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-                // Backspace+F: Cycle texture filtering
-                filterMode = (filterMode + 1) % 4;
-                const char *filterNames[] = {
-                    "point (crispy)", "bilinear", "trilinear", "anisotropic"
-                };
-                std::fprintf(stderr, "Texture filtering: %s\n", filterNames[filterMode]);
-            } else if (ev.type == SDL_KEYDOWN
-                       && (ev.key.keysym.sym == SDLK_m || ev.key.keysym.sym == SDLK_n)
-                       && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-                // Model isolation: M = next model, N = previous model.
-                // Cycles through sorted model names, isolating one at a time.
-                // Past the last/first model returns to "show all" mode.
-                bool forward = (ev.key.keysym.sym == SDLK_m);
-                if (sortedModelNames.empty()) {
-                    std::fprintf(stderr, "No models loaded for isolation\n");
-                } else {
-                    if (forward) {
-                        isolateModelIdx++;
-                        if (isolateModelIdx >= static_cast<int>(sortedModelNames.size()))
-                            isolateModelIdx = -1;
-                    } else {
-                        isolateModelIdx--;
-                        if (isolateModelIdx < -1)
-                            isolateModelIdx = static_cast<int>(sortedModelNames.size()) - 1;
-                    }
-                    if (isolateModelIdx < 0) {
-                        std::fprintf(stderr, "Model isolation: OFF (showing all)\n");
-                    } else {
-                        const auto &isoName = sortedModelNames[isolateModelIdx];
-                        std::fprintf(stderr, "Isolating model [%d/%zu]: '%s' (%d instances)\n",
-                                     isolateModelIdx + 1, sortedModelNames.size(),
-                                     isoName.c_str(), modelInstanceCounts[isoName]);
-                    }
-                    updateTitle();
-                }
-            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_v
-                       && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-                // Backspace+V: Toggle camera collision with world geometry
-                cameraCollision = !cameraCollision;
-                std::fprintf(stderr, "Camera collision: %s\n",
-                             cameraCollision ? "ON (clip)" : "OFF (noclip)");
-                updateTitle();
-            } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_r
-                       && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-                // Backspace+R: Toggle debug raycast visualization
-                showRaycast = !showRaycast;
-                std::fprintf(stderr, "Raycast debug: %s\n",
-                             showRaycast ? "ON" : "OFF");
-            }
-        }
+        updateMovement(dt, cam, moveSpeed, cameraCollision, wrData, dbgConsole);
 
+        updateLightmaps(dt, lightmappedMode,
+                        lightSources, animLightIndex,
+                        lmAtlasSet, lightmapAtlasHandles,
+                        wrData, lmScale);
 
-        // Keyboard movement — suppressed while debug console is open
-        if (!dbgConsole.isOpen()) {
-            const Uint8 *keys = SDL_GetKeyboardState(nullptr);
-            float forward = 0, right = 0, up = 0;
-            float speed = moveSpeed;
-            if (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL])
-                speed *= 3.0f;
-
-            if (keys[SDL_SCANCODE_W]) forward += speed * dt;
-            if (keys[SDL_SCANCODE_S]) forward -= speed * dt;
-            if (keys[SDL_SCANCODE_D]) right   += speed * dt;
-            if (keys[SDL_SCANCODE_A]) right   -= speed * dt;
-            if (keys[SDL_SCANCODE_SPACE])  up += speed * dt;
-            if (keys[SDL_SCANCODE_LSHIFT]) up -= speed * dt;
-            if (keys[SDL_SCANCODE_Q]) up += speed * dt;
-            if (keys[SDL_SCANCODE_E]) up -= speed * dt;
-
-            // Save position before movement for collision revert
-            float oldPos[3] = { cam.pos[0], cam.pos[1], cam.pos[2] };
-
-            cam.move(forward, right, up);
-
-            // Camera collision: constrain sphere within world cell planes
-            if (cameraCollision) {
-                applyCameraCollision(wrData, oldPos, cam.pos);
-            }
-        }
-
-        // ── Animated lightmap update ──
-        // Advance all light animation timers and re-blend changed lightmaps
-        if (lightmappedMode && !lmAtlasSet.atlases.empty()) {
-            bool anyLightChanged = false;
-            std::unordered_map<int16_t, float> currentIntensities;
-
-            for (auto &[lightNum, light] : lightSources) {
-                bool changed = Darkness::updateLightAnimation(light, dt);
-                float intensity = (light.maxBright > 0.0f)
-                    ? light.brightness / light.maxBright : 0.0f;
-                currentIntensities[lightNum] = intensity;
-                if (changed) anyLightChanged = true;
-            }
-
-            // Re-blend changed lightmaps into atlas CPU buffer
-            if (anyLightChanged) {
-                for (auto &[lightNum, light] : lightSources) {
-                    float intensity = currentIntensities[lightNum];
-                    if (std::abs(intensity - light.prevIntensity) < 0.002f) continue;
-                    light.prevIntensity = intensity;
-
-                    auto it = animLightIndex.find(lightNum);
-                    if (it == animLightIndex.end()) continue;
-
-                    for (auto &[ci, pi] : it->second) {
-                        Darkness::blendAnimatedLightmap(
-                            lmAtlasSet.atlases[0], wrData, ci, pi,
-                            lmAtlasSet.entries[ci][pi],
-                            currentIntensities, lmScale);
-                    }
-                }
-
-                // Upload full atlas to GPU
-                const auto &atlas = lmAtlasSet.atlases[0];
-                const bgfx::Memory *mem = bgfx::copy(
-                    atlas.rgba.data(), static_cast<uint32_t>(atlas.rgba.size()));
-                bgfx::updateTexture2D(lightmapAtlasHandles[0], 0, 0, 0, 0,
-                    static_cast<uint16_t>(atlas.size),
-                    static_cast<uint16_t>(atlas.size), mem);
-            }
-        }
-
-        // Set up projection matrix (shared by both views)
-        float proj[16];
-        bx::mtxProj(proj, 60.0f,
-                     float(WINDOW_WIDTH) / float(WINDOW_HEIGHT),
-                     0.1f, 5000.0f,
-                     bgfx::getCaps()->homogeneousDepth,
-                     bx::Handedness::Right);
-
-        // Texture sampler flags for the current filtering mode (shared by both views).
-        // UINT32_MAX = use texture's baked POINT flags (default).
-        // Other modes override with explicit sampler flags per draw call.
-        // Two variants: MIRROR wrap (world/object textures), CLAMP wrap (skybox).
-        uint32_t texSampler, skySampler;
-        switch (filterMode) {
-        case 0: // Point: use texture's baked POINT flags
-            texSampler = UINT32_MAX;
-            skySampler = UINT32_MAX;
-            break;
-        case 1: // Bilinear: linear min/mag, point mip
-            texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR
-                       | BGFX_SAMPLER_MIP_POINT;
-            skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
-                       | BGFX_SAMPLER_MIP_POINT;
-            break;
-        case 2: // Trilinear: linear min/mag/mip
-            texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR;
-            skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
-            break;
-        case 3: // Anisotropic: aniso min/mag, linear mip
-            texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR
-                       | BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
-            skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
-                       | BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
-            break;
-        default:
-            texSampler = UINT32_MAX;
-            skySampler = UINT32_MAX;
-            break;
-        }
-
-        // ── Underwater detection ──
-        // Check if the camera is inside a water cell (mediaType==2).
-        // When submerged, override fog with short-range blue-green water fog.
-        bool underwater = (getCameraMediaType(wrData, cam.pos[0], cam.pos[1], cam.pos[2]) == 2);
-
-        // Water fog defaults: dark blue-green tint, short visibility range
-        static constexpr float waterFogR = 0.10f, waterFogG = 0.18f, waterFogB = 0.25f;
-        static constexpr float waterFogDist = 80.0f;
-
-        // ── Fog uniform values (reused before every bgfx::submit) ──
-        // bgfx uniforms are per-submit: cleared after each draw call.
-        // We set them before every submit so all shaders receive fog data.
-        // When underwater, override with water fog regardless of FOG chunk.
-        float fogColorArr[4], fogOnArr[4];
-        if (underwater) {
-            fogColorArr[0] = waterFogR; fogColorArr[1] = waterFogG;
-            fogColorArr[2] = waterFogB; fogColorArr[3] = 1.0f;
-            fogOnArr[0] = 1.0f; fogOnArr[1] = waterFogDist;
-            fogOnArr[2] = 0.0f; fogOnArr[3] = 0.0f;
-        } else {
-            fogColorArr[0] = fogParams.r; fogColorArr[1] = fogParams.g;
-            fogColorArr[2] = fogParams.b; fogColorArr[3] = 1.0f;
-            fogOnArr[0] = fogParams.enabled ? 1.0f : 0.0f;
-            fogOnArr[1] = fogParams.distance;
-            fogOnArr[2] = 0.0f; fogOnArr[3] = 0.0f;
-        }
-        float fogOffArr[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
-        // Sky fog: underwater always fogs sky; otherwise respect SKYOBJVAR.fog
-        bool skyFogged = underwater || (fogParams.enabled && skyParams.fog);
-        float *skyFogArr = skyFogged ? fogOnArr : fogOffArr;
-
-        // Update clear color per-frame for underwater tinting
-        if (underwater) {
-            uint8_t cr = static_cast<uint8_t>(waterFogR * 255.0f);
-            uint8_t cg = static_cast<uint8_t>(waterFogG * 255.0f);
-            uint8_t cb = static_cast<uint8_t>(waterFogB * 255.0f);
-            uint32_t waterClear = (uint32_t(cr) << 24) | (uint32_t(cg) << 16)
-                                | (uint32_t(cb) << 8) | 0xFF;
-            bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
-                                waterClear, 1.0f, 0);
-        } else {
-            bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
-                                skyClearColor, 1.0f, 0);
-        }
-
-        // Helper: set fog uniforms before each submit call
-        // (bgfx clears all uniform state after each submit)
-        // Default per-object params: fully opaque (x=1.0)
-        float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
-
-        auto setFogOn = [&]() {
-            bgfx::setUniform(u_fogColor, fogColorArr);
-            bgfx::setUniform(u_fogParams, fogOnArr);
-            bgfx::setUniform(u_objectParams, opaqueParams);
-        };
-        auto setFogSky = [&]() {
-            bgfx::setUniform(u_fogColor, fogColorArr);
-            bgfx::setUniform(u_fogParams, skyFogArr);
-            bgfx::setUniform(u_objectParams, opaqueParams);
-        };
-
-        // ── View 0: Sky pass ──
-        // Sky rendered with rotation-only view (no translation),
-        // no depth write/test — appears infinitely far behind everything.
-        {
-            float skyView[16];
-            cam.getSkyViewMatrix(skyView);
-            bgfx::setViewTransform(0, skyView, proj);
-
-            float skyModel[16];
-            bx::mtxIdentity(skyModel);
-
-            // Cull CCW (not CW) because the camera is inside the cube/sphere —
-            // we see the back faces, so cull the outward-facing front faces.
-            uint64_t skyState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                              | BGFX_STATE_CULL_CCW;
-
-            if (hasSkybox && bgfx::isValid(skyboxVBH)) {
-                // Textured skybox (old sky system) — render each face with its texture
-                for (const auto &face : skyboxCube.faces) {
-                    auto texIt = skyboxTexHandles.find(face.key);
-                    if (texIt == skyboxTexHandles.end()) continue;
-
-                    setFogSky();
-                    bgfx::setTransform(skyModel);
-                    bgfx::setVertexBuffer(0, skyboxVBH);
-                    bgfx::setIndexBuffer(skyboxIBH, face.firstIndex, face.indexCount);
-                    bgfx::setState(skyState);
-                    bgfx::setTexture(0, s_texColor, texIt->second, skySampler);
-                    bgfx::submit(0, texturedProgram);
-                }
-            } else if (bgfx::isValid(skyVBH)) {
-                // Procedural dome (new sky system) — vertex-coloured hemisphere
-                setFogSky();
-                bgfx::setTransform(skyModel);
-                bgfx::setVertexBuffer(0, skyVBH);
-                bgfx::setIndexBuffer(skyIBH);
-                bgfx::setState(skyState);
-                bgfx::submit(0, flatProgram);
-            }
-        }
-
-        // ── View 1: World + objects pass ──
-        float view[16];
-        cam.getViewMatrix(view);
-        bgfx::setViewTransform(1, view, proj);
-
-        // ── Portal culling: determine visible cells ──
-        // Build view-projection matrix and extract frustum planes for portal tests.
-        // When culling is disabled, visibleCells remains empty (skip filtering).
-        std::unordered_set<uint32_t> visibleCells;
-        if (portalCulling) {
-            float vp[16];
-            bx::mtxMul(vp, view, proj);
-            ViewFrustum frustum;
-            frustum.extractFromVP(vp);
-
-            int32_t camCell = findCameraCell(wrData, cam.pos[0], cam.pos[1], cam.pos[2]);
-            visibleCells = portalBFS(wrData, cellPortals, camCell, frustum,
-                                     cam.pos[0], cam.pos[1], cam.pos[2]);
-            cullVisibleCells = static_cast<uint32_t>(visibleCells.size());
-        }
-        // Update title bar with culling stats every frame
+        // ── Prepare frame: matrices, fog, samplers, culling ──
+        auto fc = prepareFrame(cam, filterMode,
+                               portalCulling, skyClearColor,
+                               wrData, cellPortals,
+                               fogParams, skyParams,
+                               cullVisibleCells);
         updateTitle();
 
-        // Identity model transform for world geometry
-        float model[16];
-        bx::mtxIdentity(model);
+        // ── View 0: Sky pass ──
+        renderSky(cam, fc.proj, hasSkybox,
+                  skyboxVBH, skyboxIBH, skyboxCube, skyboxTexHandles,
+                  skyVBH, skyIBH, flatProgram, texturedProgram,
+                  s_texColor, u_fogColor, u_fogParams, u_objectParams,
+                  fc.fogColorArr, fc.skyFogArr, fc.skySampler);
 
-        // Lambda: check if a cell should be rendered (culling filter)
-        auto isCellVisible = [&](uint32_t cellID) -> bool {
-            if (!portalCulling) return true; // culling off: render everything
-            return visibleCells.count(cellID) > 0;
-        };
+        // ── View 1: World geometry ──
+        renderWorld(lightmappedMode, texturedMode,
+                    portalCulling, fc.visibleCells,
+                    lmMesh, worldMesh, flatMesh,
+                    vbh, ibh, flatProgram, texturedProgram, lightmappedProgram,
+                    s_texColor, s_texLightmap,
+                    u_fogColor, u_fogParams, u_objectParams,
+                    fc.fogColorArr, fc.fogOnArr,
+                    textureHandles, lightmapAtlasHandles,
+                    fc.texSampler, fc.renderState);
 
-        if (lightmappedMode) {
-            for (const auto &grp : lmMesh.groups) {
-                if (!isCellVisible(grp.cellID)) continue;
+        // ── Object meshes ──
+        renderObjects(showObjects, showFallbackCubes,
+                      portalCulling, fc.visibleCells,
+                      isolateModelIdx, sortedModelNames,
+                      objData, objCellIDs,
+                      objModelGPU, objTextureHandles,
+                      fallbackCubeVBH, fallbackCubeIBH,
+                      flatProgram, texturedProgram,
+                      s_texColor, u_fogColor, u_fogParams, u_objectParams,
+                      fc.fogColorArr, fc.fogOnArr,
+                      fc.texSampler, fc.renderState);
 
-                setFogOn();
-                bgfx::setTransform(model);
-                bgfx::setVertexBuffer(0, vbh);
-                bgfx::setIndexBuffer(ibh, grp.firstIndex, grp.numIndices);
-                bgfx::setState(renderState);
+        // ── Water surfaces ──
+        renderWater(hasWater, waterMesh, waterVBH, waterIBH,
+                    flatProgram, waterProgram,
+                    s_texColor, u_fogColor, u_fogParams, u_objectParams,
+                    u_waterParams, u_waterFlow,
+                    fc.fogColorArr, fc.fogOnArr,
+                    textureHandles, flowTextureHandles, fc.texSampler,
+                    waterElapsed, waterScrollSpeed,
+                    waveAmplitude, uvDistortion, waterRotation);
 
-                if (grp.txtIndex == 0) {
-                    bgfx::submit(1, flatProgram);
-                } else {
-                    auto it = textureHandles.find(grp.txtIndex);
-                    if (it != textureHandles.end()) {
-                        bgfx::setTexture(0, s_texColor, it->second, texSampler);
-                        if (!lightmapAtlasHandles.empty())
-                            bgfx::setTexture(1, s_texLightmap, lightmapAtlasHandles[0]);
-                        bgfx::submit(1, lightmappedProgram);
-                    } else {
-                        bgfx::submit(1, flatProgram);
-                    }
-                }
-            }
-        } else if (texturedMode) {
-            for (const auto &grp : worldMesh.groups) {
-                if (!isCellVisible(grp.cellID)) continue;
-
-                setFogOn();
-                bgfx::setTransform(model);
-                bgfx::setVertexBuffer(0, vbh);
-                bgfx::setIndexBuffer(ibh, grp.firstIndex, grp.numIndices);
-                bgfx::setState(renderState);
-
-                if (grp.txtIndex == 0) {
-                    bgfx::submit(1, flatProgram);
-                } else {
-                    auto it = textureHandles.find(grp.txtIndex);
-                    if (it != textureHandles.end()) {
-                        bgfx::setTexture(0, s_texColor, it->second, texSampler);
-                        bgfx::submit(1, texturedProgram);
-                    } else {
-                        bgfx::submit(1, flatProgram);
-                    }
-                }
-            }
-        } else {
-            for (const auto &grp : flatMesh.groups) {
-                if (!isCellVisible(grp.cellID)) continue;
-
-                setFogOn();
-                bgfx::setTransform(model);
-                bgfx::setVertexBuffer(0, vbh);
-                bgfx::setIndexBuffer(ibh, grp.firstIndex, grp.numIndices);
-                bgfx::setState(renderState);
-                bgfx::submit(1, flatProgram);
-            }
-        }
-
-        // ── Draw object meshes (per-submesh for textured/solid materials) ──
-        // Two-pass rendering for correct transparency compositing:
-        //   Pass 1: all opaque submeshes (matTrans == 0 AND renderAlpha == 1.0)
-        //   Pass 2: all translucent submeshes (matTrans > 0 OR renderAlpha < 1.0)
-        // A single object (e.g. a window) can have both opaque submeshes (frame)
-        // and translucent submeshes (glass pane), so transparency is per-submesh.
-        //
-        // Final alpha = (1.0 - material.trans) * object.renderAlpha
-        // where material.trans is from .bin mat_extra (0=opaque, 0.3=glass)
-        // and object.renderAlpha is from P$RenderAlp property (1.0=opaque)
-
-        // Alpha-blend state for translucent submeshes
-        uint64_t translucentState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                                  | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
-                                  | BGFX_STATE_CULL_CW
-                                  | BGFX_STATE_BLEND_ALPHA;
-
-        // Helper: draw one object's submeshes, filtering by opacity.
-        // When opaquePass=true, draws only opaque submeshes with renderState.
-        // When opaquePass=false, draws only translucent submeshes with translucentState.
-        auto drawObjectSubmeshes = [&](size_t oi, bool opaquePass) {
-            const auto &obj = objData.objects[oi];
-            if (!obj.hasPosition) return;
-
-            // Portal culling: skip objects in non-visible cells.
-            if (portalCulling && oi < objCellIDs.size()) {
-                int32_t objCell = objCellIDs[oi];
-                if (objCell >= 0 && visibleCells.count(static_cast<uint32_t>(objCell)) == 0)
-                    return;
-            }
-
-            // Compute per-object model matrix from position + angles
-            float objMtx[16];
-            buildModelMatrix(objMtx, obj.x, obj.y, obj.z,
-                             obj.heading, obj.pitch, obj.bank,
-                             obj.scaleX, obj.scaleY, obj.scaleZ);
-
-            std::string modelName(obj.modelName);
-
-            // Model isolation mode: skip objects that don't match the isolated model
-            if (isolateModelIdx >= 0 && isolateModelIdx < (int)sortedModelNames.size()) {
-                if (modelName != sortedModelNames[isolateModelIdx])
-                    return;
-            }
-
-            auto it = objModelGPU.find(modelName);
-
-            if (it != objModelGPU.end() && it->second.valid) {
-                const auto &gpuModel = it->second;
-
-                for (const auto &sm : gpuModel.subMeshes) {
-                    if (sm.indexCount == 0) continue;
-
-                    // Determine if this submesh is translucent:
-                    // either the material has translucency or the object has RenderAlpha
-                    bool isTranslucent = (sm.matTrans > 0.0f) || (obj.renderAlpha < 1.0f);
-                    if (opaquePass == isTranslucent) continue;  // wrong pass
-
-                    // Compute final alpha: (1 - matTrans) * renderAlpha
-                    // matTrans convention: 0=opaque, 0.3=30% transparent glass
-                    float finalAlpha = (1.0f - sm.matTrans) * obj.renderAlpha;
-                    float objAlpha[4] = { finalAlpha, 0.0f, 0.0f, 0.0f };
-
-                    uint64_t state = opaquePass ? renderState : translucentState;
-
-                    bgfx::setUniform(u_fogColor, fogColorArr);
-                    bgfx::setUniform(u_fogParams, fogOnArr);
-                    bgfx::setUniform(u_objectParams, objAlpha);
-                    bgfx::setTransform(objMtx);
-                    bgfx::setVertexBuffer(0, gpuModel.vbh);
-                    bgfx::setIndexBuffer(gpuModel.ibh, sm.firstIndex, sm.indexCount);
-                    bgfx::setState(state);
-
-                    if (sm.textured) {
-                        auto texIt = objTextureHandles.find(sm.matName);
-                        if (texIt != objTextureHandles.end()) {
-                            bgfx::setTexture(0, s_texColor, texIt->second, texSampler);
-                            bgfx::submit(1, texturedProgram);
-                        } else {
-                            bgfx::submit(1, flatProgram);
-                        }
-                    } else {
-                        bgfx::submit(1, flatProgram);
-                    }
-                }
-            } else if (showFallbackCubes && opaquePass) {
-                // Fallback cubes are always opaque
-                setFogOn();
-                bgfx::setTransform(objMtx);
-                bgfx::setVertexBuffer(0, fallbackCubeVBH);
-                bgfx::setIndexBuffer(fallbackCubeIBH);
-                bgfx::setState(renderState);
-                bgfx::submit(1, flatProgram);
-            }
-        };
-
-        if (showObjects) {
-            // Pass 1: opaque submeshes of all objects
-            for (size_t oi = 0; oi < objData.objects.size(); ++oi) {
-                drawObjectSubmeshes(oi, true);
-            }
-            // Pass 2: translucent submeshes — rendered after all opaque geometry
-            for (size_t oi = 0; oi < objData.objects.size(); ++oi) {
-                drawObjectSubmeshes(oi, false);
-            }
-        }
-
-        // ── Water surfaces: alpha-blended, no depth write, double-sided ──
-        // Rendered last so all opaque geometry is already in the depth buffer.
-        // Per-texture-group rendering: textured water uses waterProgram (no discard),
-        // non-textured water falls back to flatProgram with blue-green vertex color.
-        if (hasWater) {
-            float identity[16];
-            bx::mtxIdentity(identity);
-            // Alpha blend, depth test (read) but no depth write, no face culling
-            uint64_t waterState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                | BGFX_STATE_DEPTH_TEST_LESS
-                | BGFX_STATE_BLEND_ALPHA;
-            // No BGFX_STATE_WRITE_Z — water doesn't occlude geometry behind it
-            // No BGFX_STATE_CULL_* — water is visible from both sides
-
-            for (const auto &grp : waterMesh.groups) {
-                setFogOn();
-                bgfx::setTransform(identity);
-                bgfx::setVertexBuffer(0, waterVBH);
-                bgfx::setIndexBuffer(waterIBH, grp.firstIndex, grp.numIndices);
-                bgfx::setState(waterState);
-
-                if (grp.txtIndex != 0 || grp.flowGroup > 0) {
-                    // Textured water: water shader with vertex displacement + UV distortion
-                    // u_waterParams: x=elapsed time, y=scroll speed, z=wave amplitude, w=UV distortion
-                    float waterParams[4] = { waterElapsed, waterScrollSpeed, waveAmplitude, uvDistortion };
-                    bgfx::setUniform(u_waterParams, waterParams);
-
-                    // u_waterFlow: x=rotation speed, y=use_world_uv flag, z=tex_unit_len
-                    // Flow-textured water: vertex shader computes UVs from world position
-                    // with rotation (matching Dark Engine's flow animation system).
-                    // TXLIST-textured water: uses pre-computed UVs from mesh.
-                    bool isFlowTextured = (grp.flowGroup > 0);
-                    float useWorldUV = isFlowTextured ? 1.0f : 0.0f;
-                    constexpr float TEX_UNIT_LEN = 4.0f; // 4 world units per texture repeat
-                    float waterFlow[4] = { waterRotation, useWorldUV, TEX_UNIT_LEN, 0.0f };
-                    bgfx::setUniform(u_waterFlow, waterFlow);
-
-                    // Resolve texture: flow texture by group first, then TXLIST by index
-                    bgfx::TextureHandle tex = BGFX_INVALID_HANDLE;
-                    if (grp.flowGroup > 0) {
-                        auto fit = flowTextureHandles.find(grp.flowGroup);
-                        if (fit != flowTextureHandles.end())
-                            tex = fit->second;
-                    }
-                    if (!bgfx::isValid(tex) && grp.txtIndex != 0) {
-                        auto it = textureHandles.find(grp.txtIndex);
-                        if (it != textureHandles.end())
-                            tex = it->second;
-                    }
-
-                    if (bgfx::isValid(tex)) {
-                        bgfx::setTexture(0, s_texColor, tex, texSampler);
-                        bgfx::submit(1, waterProgram);
-                    } else {
-                        bgfx::submit(1, flatProgram);
-                    }
-                } else {
-                    // Non-textured water: flat blue-green from vertex color
-                    bgfx::submit(1, flatProgram);
-                }
-            }
-        }
-
-        // ── Debug raycast visualization (view 2 — on top of world) ──
-        // Casts a ray from the camera forward and draws the result as debug lines.
-        // Rendered in view 2 (separate from world geometry) so lines always appear
-        // on top regardless of bgfx's internal draw call sorting.
-        //
-        // Note: a line from camera to hit along the view direction is invisible
-        // (projects to a single pixel). Instead we draw a large cross at the hit
-        // point, a surface normal line, and a HUD text overlay.
-        if (showRaycast) {
-            // Set up view 2 with same transform as view 1
-            bgfx::setViewTransform(2, view, proj);
-
-            // Compute camera forward direction (same as Camera::getViewMatrix)
-            float cosPitch = std::cos(cam.pitch);
-            float fwdX = std::cos(cam.yaw) * cosPitch;
-            float fwdY = std::sin(cam.yaw) * cosPitch;
-            float fwdZ = std::sin(cam.pitch);
-
-            // Ray from camera position, extending forward up to 500 world units
-            constexpr float RAY_VIS_DIST = 500.0f;
-            Vector3 rayFrom(cam.pos[0], cam.pos[1], cam.pos[2]);
-            Vector3 rayTo(cam.pos[0] + fwdX * RAY_VIS_DIST,
-                          cam.pos[1] + fwdY * RAY_VIS_DIST,
-                          cam.pos[2] + fwdZ * RAY_VIS_DIST);
-
-            RayHit rayHit;
-            bool rayDidHit = Darkness::raycastWorld(wrData, rayFrom, rayTo, rayHit);
-
-            // Draw debug lines using bgfx transient vertex buffers.
-            // Hit: normal (2) + cross (6) + offset ray (2) = 10.  Miss: ray (2).
-            constexpr uint32_t MAX_DEBUG_VERTS = 10;
-            bgfx::TransientVertexBuffer tvb;
-            if (bgfx::getAvailTransientVertexBuffer(MAX_DEBUG_VERTS, PosColorVertex::layout) >= MAX_DEBUG_VERTS) {
-                bgfx::allocTransientVertexBuffer(&tvb, MAX_DEBUG_VERTS, PosColorVertex::layout);
-                auto *verts = reinterpret_cast<PosColorVertex *>(tvb.data);
-                uint32_t numVerts = 0;
-
-                // Helper: emit one debug vertex
-                auto addVert = [&](float vx, float vy, float vz, uint32_t color) {
-                    verts[numVerts].x = vx;
-                    verts[numVerts].y = vy;
-                    verts[numVerts].z = vz;
-                    verts[numVerts].abgr = color;
-                    ++numVerts;
-                };
-
-                // Colors (ABGR format for bgfx)
-                uint32_t green  = 0xFF00FF00;  // hit ray segment
-                uint32_t yellow = 0xFF00FFFF;  // miss ray segment
-                uint32_t cyan   = 0xFFFFFF00;  // surface normal
-                uint32_t red    = 0xFF0000FF;  // hit marker cross
-
-                if (rayDidHit) {
-                    // Cyan line: surface normal at hit point (4 unit length)
-                    constexpr float NORM_LEN = 4.0f;
-                    addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z, cyan);
-                    addVert(rayHit.point.x + rayHit.normal.x * NORM_LEN,
-                            rayHit.point.y + rayHit.normal.y * NORM_LEN,
-                            rayHit.point.z + rayHit.normal.z * NORM_LEN, cyan);
-
-                    // Red cross at hit point (3 axes, 2 unit half-size — visible at distance)
-                    constexpr float CROSS = 2.0f;
-                    addVert(rayHit.point.x - CROSS, rayHit.point.y, rayHit.point.z, red);
-                    addVert(rayHit.point.x + CROSS, rayHit.point.y, rayHit.point.z, red);
-                    addVert(rayHit.point.x, rayHit.point.y - CROSS, rayHit.point.z, red);
-                    addVert(rayHit.point.x, rayHit.point.y + CROSS, rayHit.point.z, red);
-                    addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z - CROSS, red);
-                    addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z + CROSS, red);
-
-                    // Green line: from hit point pulled back slightly toward camera,
-                    // offset perpendicular so it's not collinear with the view ray.
-                    // This gives a visible green "approach" line near the hit.
-                    constexpr float PULLBACK = 5.0f;
-                    constexpr float OFFSET = 0.3f;
-                    // Camera right vector for perpendicular offset
-                    float rtX = std::sin(cam.yaw);
-                    float rtY = -std::cos(cam.yaw);
-                    addVert(rayHit.point.x - fwdX * PULLBACK + rtX * OFFSET,
-                            rayHit.point.y - fwdY * PULLBACK + rtY * OFFSET,
-                            rayHit.point.z - fwdZ * PULLBACK, green);
-                    addVert(rayHit.point.x, rayHit.point.y, rayHit.point.z, green);
-                } else {
-                    // Yellow line: camera → ray end (visible against sky/void)
-                    addVert(cam.pos[0], cam.pos[1], cam.pos[2], yellow);
-                    addVert(rayTo.x, rayTo.y, rayTo.z, yellow);
-                }
-
-                // Submit to view 2 (debug overlay) — no depth test so lines
-                // render on top of world geometry
-                float identity[16];
-                bx::mtxIdentity(identity);
-                bgfx::setTransform(identity);
-                bgfx::setVertexBuffer(0, &tvb, 0, numVerts);
-                uint64_t lineState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                                   | BGFX_STATE_PT_LINES;
-                bgfx::setState(lineState);
-                setFogOn();
-                bgfx::submit(2, flatProgram);
-            }
-
-            // HUD text overlay showing raycast results
-            bgfx::setDebug(BGFX_DEBUG_TEXT);
-            bgfx::dbgTextClear();
-
-            // Screen-center crosshair (160 cols x 45 rows at 1280x720)
-            uint8_t cross_attr = 0x0E; // yellow on black
-            bgfx::dbgTextPrintf(79, 22, cross_attr, "+");
-
-            uint8_t hud_attr = 0x0F; // white on black
-            uint8_t val_attr = 0x0A; // green on black
-
-            bgfx::dbgTextPrintf(2, 1, hud_attr, "RAYCAST DEBUG (Backspace+R to toggle)");
-
-            if (rayDidHit) {
-                bgfx::dbgTextPrintf(2, 3, val_attr, "Hit:     YES");
-                bgfx::dbgTextPrintf(2, 4, val_attr, "Dist:    %.2f", rayHit.distance);
-                bgfx::dbgTextPrintf(2, 5, val_attr, "Point:   (%.2f, %.2f, %.2f)",
-                    rayHit.point.x, rayHit.point.y, rayHit.point.z);
-                bgfx::dbgTextPrintf(2, 6, val_attr, "Normal:  (%.3f, %.3f, %.3f)",
-                    rayHit.normal.x, rayHit.normal.y, rayHit.normal.z);
-                bgfx::dbgTextPrintf(2, 7, val_attr, "TexIdx:  %d",
-                    rayHit.textureIndex);
-                // Show texture name if available from TXLIST
-                if (rayHit.textureIndex >= 0 &&
-                    static_cast<size_t>(rayHit.textureIndex) < txList.textures.size()) {
-                    const auto &tex = txList.textures[rayHit.textureIndex];
-                    bgfx::dbgTextPrintf(2, 8, val_attr, "Texture: %s/%s",
-                        tex.family.c_str(), tex.name.c_str());
-                }
-            } else {
-                bgfx::dbgTextPrintf(2, 3, 0x0C, "Hit:     NO (miss)");
-            }
-
-            // Camera info line
-            int32_t camCellIdx = findCameraCell(wrData, cam.pos[0], cam.pos[1], cam.pos[2]);
-            bgfx::dbgTextPrintf(2, 10, hud_attr, "Camera:  (%.2f, %.2f, %.2f)  cell=%d",
-                cam.pos[0], cam.pos[1], cam.pos[2], camCellIdx);
-        }
+        // ── Debug raycast visualization (view 2) ──
+        renderDebugOverlay(showRaycast, cam, fc.view, fc.proj, wrData, txList,
+                           flatProgram, u_fogColor, u_fogParams, u_objectParams,
+                           fc.fogColorArr, fc.fogOnArr);
 
         // Debug console overlay (no-op when closed)
         dbgConsole.render();
@@ -2226,56 +2520,15 @@ int main(int argc, char *argv[]) {
         bgfx::frame();
     }
 
-    // Cleanup — water surface buffers and flow textures
-    if (bgfx::isValid(waterVBH)) bgfx::destroy(waterVBH);
-    if (bgfx::isValid(waterIBH)) bgfx::destroy(waterIBH);
-    for (auto &kv : flowTextureHandles)
-        bgfx::destroy(kv.second);
-
-    // Cleanup — textured skybox buffers
-    if (bgfx::isValid(skyboxVBH)) bgfx::destroy(skyboxVBH);
-    if (bgfx::isValid(skyboxIBH)) bgfx::destroy(skyboxIBH);
-    for (auto &kv : skyboxTexHandles)
-        bgfx::destroy(kv.second);
-
-    // Cleanup — sky dome buffers
-    if (bgfx::isValid(skyVBH)) bgfx::destroy(skyVBH);
-    if (bgfx::isValid(skyIBH)) bgfx::destroy(skyIBH);
-
-    // Cleanup — object GPU buffers and textures
-    for (auto &kv : objModelGPU) {
-        if (bgfx::isValid(kv.second.vbh)) bgfx::destroy(kv.second.vbh);
-        if (bgfx::isValid(kv.second.ibh)) bgfx::destroy(kv.second.ibh);
-    }
-    for (auto &kv : objTextureHandles) {
-        bgfx::destroy(kv.second);
-    }
-    if (bgfx::isValid(fallbackCubeVBH)) bgfx::destroy(fallbackCubeVBH);
-    if (bgfx::isValid(fallbackCubeIBH)) bgfx::destroy(fallbackCubeIBH);
-
-    // Cleanup — world geometry and textures
-    for (auto &h : lightmapAtlasHandles)
-        bgfx::destroy(h);
-    for (auto &kv : textureHandles)
-        bgfx::destroy(kv.second);
-    bgfx::destroy(s_texLightmap);
-    bgfx::destroy(s_texColor);
-    bgfx::destroy(u_waterParams);
-    bgfx::destroy(u_waterFlow);
-    bgfx::destroy(u_fogColor);
-    bgfx::destroy(u_fogParams);
-    bgfx::destroy(u_objectParams);
-
-    bgfx::destroy(ibh);
-    bgfx::destroy(vbh);
-    bgfx::destroy(flatProgram);
-    bgfx::destroy(texturedProgram);
-    bgfx::destroy(lightmappedProgram);
-    bgfx::destroy(waterProgram);
-
-    bgfx::shutdown();
-    SDL_DestroyWindow(window);
-    SDL_Quit();
+    destroyGPUResources(
+        vbh, ibh, flatProgram, texturedProgram, lightmappedProgram, waterProgram,
+        s_texColor, s_texLightmap, u_waterParams, u_waterFlow,
+        u_fogColor, u_fogParams, u_objectParams,
+        textureHandles, flowTextureHandles, lightmapAtlasHandles,
+        waterVBH, waterIBH, skyboxVBH, skyboxIBH, skyboxTexHandles,
+        skyVBH, skyIBH, objModelGPU, objTextureHandles,
+        fallbackCubeVBH, fallbackCubeIBH);
+    shutdownWindow(window);
 
     std::fprintf(stderr, "Clean shutdown.\n");
     return 0;
