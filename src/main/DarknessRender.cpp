@@ -686,6 +686,171 @@ static void renderObjects(
     }
 }
 
+// ── Initialize runtime state ──
+// Sets render mode string, model isolation data, spawn/camera position,
+// SDL mouse capture, and portal culling stats.
+static void initRuntimeState(
+    const Darkness::MissionData &mission,
+    const Darkness::BuiltMeshes &meshes,
+    const Darkness::GPUResources &gpu,
+    float centroidX, float centroidY, float centroidZ,
+    Darkness::RuntimeState &state)
+{
+    // Render mode description for title bar
+    state.modeStr = meshes.lightmappedMode ? "lightmapped" :
+                    mission.texturedMode ? "textured" : "flat-shaded";
+    std::fprintf(stderr, "Render window opened (%dx%d, %s, %s)\n",
+                 WINDOW_WIDTH, WINDOW_HEIGHT,
+                 bgfx::getRendererName(bgfx::getRendererType()), state.modeStr);
+    std::fprintf(stderr, "Portal culling: %s (toggle with C key)\n",
+                 state.portalCulling ? "ON" : "OFF");
+
+    // ── Model isolation state for debugging ──
+    // Sorted list of model names that have loaded GPU data, with instance counts.
+    // Press N to cycle through, isolating one model at a time for identification.
+    if (state.showObjects) {
+        // Count instances per model name
+        for (const auto &obj : mission.objData.objects) {
+            if (!obj.hasPosition) continue;
+            std::string mn(obj.modelName);
+            state.modelInstanceCounts[mn]++;
+        }
+
+        // Build sorted list of models that have GPU data (loaded successfully)
+        for (const auto &kv : gpu.objModelGPU) {
+            if (kv.second.valid)
+                state.sortedModelNames.push_back(kv.first);
+        }
+        std::sort(state.sortedModelNames.begin(), state.sortedModelNames.end());
+
+        // Count unloaded models (fallback cube candidates)
+        int unloadedCount = 0;
+        for (const auto &kv : state.modelInstanceCounts) {
+            if (gpu.objModelGPU.find(kv.first) == gpu.objModelGPU.end() || !gpu.objModelGPU.at(kv.first).valid)
+                ++unloadedCount;
+        }
+        std::fprintf(stderr, "Model isolation: %zu loaded, %d unloaded (M=next, N=prev)\n",
+                     state.sortedModelNames.size(), unloadedCount);
+    }
+
+    // Use spawn point if found, otherwise fall back to centroid
+    state.spawnX = centroidX; state.spawnY = centroidY; state.spawnZ = centroidZ;
+    state.spawnYaw = 0.0f;
+    if (mission.spawnInfo.found) {
+        state.spawnX = mission.spawnInfo.x;
+        state.spawnY = mission.spawnInfo.y;
+        state.spawnZ = mission.spawnInfo.z;
+        state.spawnYaw = mission.spawnInfo.yaw;
+        std::fprintf(stderr, "Camera at spawn (%.1f, %.1f, %.1f)\n",
+                     state.spawnX, state.spawnY, state.spawnZ);
+    } else {
+        std::fprintf(stderr, "Camera at centroid (%.1f, %.1f, %.1f)\n",
+                     centroidX, centroidY, centroidZ);
+    }
+
+    std::fprintf(stderr, "Controls: WASD=move, mouse=look, Space/LShift=up/down, "
+                 "scroll=speed, `=console, Home=spawn, BS+C/F/V/M/N/R=debug, Esc=quit\n");
+
+    // Initialize camera at spawn position
+    state.cam.init(state.spawnX, state.spawnY, state.spawnZ);
+    state.cam.yaw = state.spawnYaw;
+
+    SDL_SetRelativeMouseMode(SDL_TRUE);
+
+    // Portal culling stats for title bar display
+    state.cullTotalCells = mission.wrData.numCells;
+}
+
+// ── Update window title bar ──
+// Displays current render mode, speed, culling stats, filter mode, and model isolation info.
+static void updateTitleBar(SDL_Window *window, const Darkness::RuntimeState &state) {
+    char title[512];
+    const char *filterNames[] = { "point", "bilinear", "trilinear", "aniso" };
+    const char *filterStr = filterNames[state.filterMode % 4];
+
+    // Build model isolation suffix if active
+    char isoSuffix[128] = "";
+    if (state.isolateModelIdx >= 0 && state.isolateModelIdx < (int)state.sortedModelNames.size()) {
+        const auto &isoName = state.sortedModelNames[state.isolateModelIdx];
+        auto cit = state.modelInstanceCounts.find(isoName);
+        int cnt = (cit != state.modelInstanceCounts.end()) ? cit->second : 0;
+        std::snprintf(isoSuffix, sizeof(isoSuffix),
+            " [MODEL %d/%zu: %s x%d]",
+            state.isolateModelIdx + 1, state.sortedModelNames.size(),
+            isoName.c_str(), cnt);
+    }
+
+    const char *clipStr = state.cameraCollision ? "clip" : "noclip";
+
+    if (state.portalCulling) {
+        std::snprintf(title, sizeof(title),
+            "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s] [%s]%s",
+            state.modeStr, state.moveSpeed, state.cullVisibleCells, state.cullTotalCells, filterStr, clipStr, isoSuffix);
+    } else {
+        std::snprintf(title, sizeof(title),
+            "darkness — %s [speed: %.1f] [cull: OFF] [%s] [%s]%s",
+            state.modeStr, state.moveSpeed, filterStr, clipStr, isoSuffix);
+    }
+    SDL_SetWindowTitle(window, title);
+}
+
+// ── Register debug console settings ──
+// Binds 11 runtime-changeable settings to the debug console (opened with backtick).
+// Lambdas capture state by reference and update the title bar when relevant settings change.
+static void registerConsoleSettings(
+    Darkness::DebugConsole &dbgConsole,
+    Darkness::RuntimeState &state,
+    SDL_Window *window)
+{
+    // Helper lambda that captures window+state for title bar refresh
+    auto refreshTitle = [window, &state]() { updateTitleBar(window, state); };
+
+    dbgConsole.addCategorical("filter_mode",
+        {"point", "bilinear", "trilinear", "anisotropic"},
+        [&state]() { return state.filterMode; },
+        [&state, refreshTitle](int v) { state.filterMode = v; refreshTitle(); });
+
+    dbgConsole.addBool("portal_culling",
+        [&state]() { return state.portalCulling; },
+        [&state, refreshTitle](bool v) { state.portalCulling = v; refreshTitle(); });
+
+    dbgConsole.addBool("camera_collision",
+        [&state]() { return state.cameraCollision; },
+        [&state, refreshTitle](bool v) { state.cameraCollision = v; refreshTitle(); });
+
+    dbgConsole.addBool("show_objects",
+        [&state]() { return state.showObjects; },
+        [&state](bool v) { state.showObjects = v; });
+
+    dbgConsole.addBool("show_fallback_cubes",
+        [&state]() { return state.showFallbackCubes; },
+        [&state](bool v) { state.showFallbackCubes = v; });
+
+    dbgConsole.addBool("show_raycast",
+        [&state]() { return state.showRaycast; },
+        [&state](bool v) { state.showRaycast = v; });
+
+    dbgConsole.addFloat("move_speed", 1.0f, 500.0f,
+        [&state]() { return state.moveSpeed; },
+        [&state, refreshTitle](float v) { state.moveSpeed = v; refreshTitle(); });
+
+    dbgConsole.addFloat("wave_amplitude", 0.0f, 5.0f,
+        [&state]() { return state.waveAmplitude; },
+        [&state](float v) { state.waveAmplitude = v; });
+
+    dbgConsole.addFloat("uv_distortion", 0.0f, 0.5f,
+        [&state]() { return state.uvDistortion; },
+        [&state](float v) { state.uvDistortion = v; });
+
+    dbgConsole.addFloat("water_rotation", 0.0f, 0.5f,
+        [&state]() { return state.waterRotation; },
+        [&state](float v) { state.waterRotation = v; });
+
+    dbgConsole.addFloat("water_scroll", 0.0f, 1.0f,
+        [&state]() { return state.waterScrollSpeed; },
+        [&state](float v) { state.waterScrollSpeed = v; });
+}
+
 // ── Event handling ──
 // Process SDL events: quit, mouse look, scroll-wheel speed, keyboard shortcuts.
 // Mutates camera, runtime flags, and model isolation state.
@@ -2291,152 +2456,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    const char *modeStr = meshes.lightmappedMode ? "lightmapped" :
-                          mission.texturedMode ? "textured" : "flat-shaded";
-    std::fprintf(stderr, "Render window opened (%dx%d, %s, %s)\n",
-                 WINDOW_WIDTH, WINDOW_HEIGHT,
-                 bgfx::getRendererName(bgfx::getRendererType()), modeStr);
-    std::fprintf(stderr, "Portal culling: %s (toggle with C key)\n",
-                 state.portalCulling ? "ON" : "OFF");
-
-    // ── Model isolation state for debugging ──
-    // Sorted list of model names that have loaded GPU data, with instance counts.
-    // Press N to cycle through, isolating one model at a time for identification.
-    if (state.showObjects) {
-        // Count instances per model name
-        for (const auto &obj : mission.objData.objects) {
-            if (!obj.hasPosition) continue;
-            std::string mn(obj.modelName);
-            state.modelInstanceCounts[mn]++;
-        }
-
-        // Build sorted list of models that have GPU data (loaded successfully)
-        for (const auto &kv : gpu.objModelGPU) {
-            if (kv.second.valid)
-                state.sortedModelNames.push_back(kv.first);
-        }
-        std::sort(state.sortedModelNames.begin(), state.sortedModelNames.end());
-
-        // Count unloaded models (fallback cube candidates)
-        int unloadedCount = 0;
-        for (const auto &kv : state.modelInstanceCounts) {
-            if (gpu.objModelGPU.find(kv.first) == gpu.objModelGPU.end() || !gpu.objModelGPU[kv.first].valid)
-                ++unloadedCount;
-        }
-        std::fprintf(stderr, "Model isolation: %zu loaded, %d unloaded (M=next, N=prev)\n",
-                     state.sortedModelNames.size(), unloadedCount);
-    }
-
-    // Use spawn point if found, otherwise fall back to centroid
-    state.spawnX = camX; state.spawnY = camY; state.spawnZ = camZ;
-    state.spawnYaw = 0.0f;
-    if (mission.spawnInfo.found) {
-        state.spawnX = mission.spawnInfo.x;
-        state.spawnY = mission.spawnInfo.y;
-        state.spawnZ = mission.spawnInfo.z;
-        state.spawnYaw = mission.spawnInfo.yaw;
-        std::fprintf(stderr, "Camera at spawn (%.1f, %.1f, %.1f)\n",
-                     state.spawnX, state.spawnY, state.spawnZ);
-    } else {
-        std::fprintf(stderr, "Camera at centroid (%.1f, %.1f, %.1f)\n",
-                     camX, camY, camZ);
-    }
-
-    std::fprintf(stderr, "Controls: WASD=move, mouse=look, Space/LShift=up/down, "
-                 "scroll=speed, `=console, Home=spawn, BS+C/F/V/M/N/R=debug, Esc=quit\n");
-
-    // state.cam initialized below
-    state.cam.init(state.spawnX, state.spawnY, state.spawnZ);
-    state.cam.yaw = state.spawnYaw;
-
-    SDL_SetRelativeMouseMode(SDL_TRUE);
-
-    // state.moveSpeed has default 20.0f from struct initializer
-
-    // Portal culling stats for title bar display
-    state.cullTotalCells = mission.wrData.numCells;
-
-    // Helper to update window title with current speed, culling, and filter stats
-    auto updateTitle = [&]() {
-        char title[512];
-        const char *filterNames[] = { "point", "bilinear", "trilinear", "aniso" };
-        const char *filterStr = filterNames[state.filterMode % 4];
-
-        // Build model isolation suffix if active
-        char isoSuffix[128] = "";
-        if (state.isolateModelIdx >= 0 && state.isolateModelIdx < (int)state.sortedModelNames.size()) {
-            const auto &isoName = state.sortedModelNames[state.isolateModelIdx];
-            auto cit = state.modelInstanceCounts.find(isoName);
-            int cnt = (cit != state.modelInstanceCounts.end()) ? cit->second : 0;
-            std::snprintf(isoSuffix, sizeof(isoSuffix),
-                " [MODEL %d/%zu: %s x%d]",
-                state.isolateModelIdx + 1, state.sortedModelNames.size(),
-                isoName.c_str(), cnt);
-        }
-
-        const char *clipStr = state.cameraCollision ? "clip" : "noclip";
-
-        if (state.portalCulling) {
-            std::snprintf(title, sizeof(title),
-                "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s] [%s]%s",
-                modeStr, state.moveSpeed, state.cullVisibleCells, state.cullTotalCells, filterStr, clipStr, isoSuffix);
-        } else {
-            std::snprintf(title, sizeof(title),
-                "darkness — %s [speed: %.1f] [cull: OFF] [%s] [%s]%s",
-                modeStr, state.moveSpeed, filterStr, clipStr, isoSuffix);
-        }
-        SDL_SetWindowTitle(window, title);
-    };
-    updateTitle();
+    // ── Initialize runtime state: mode string, model isolation, spawn/camera ──
+    initRuntimeState(mission, meshes, gpu, camX, camY, camZ, state);
 
     // ── Debug console for runtime settings management ──
     // Opened with backtick (`), provides tab-completion and value editing.
     Darkness::DebugConsole dbgConsole;
+    registerConsoleSettings(dbgConsole, state, window);
 
-    dbgConsole.addCategorical("filter_mode",
-        {"point", "bilinear", "trilinear", "anisotropic"},
-        [&]() { return state.filterMode; },
-        [&](int v) { state.filterMode = v; updateTitle(); });
-
-    dbgConsole.addBool("portal_culling",
-        [&]() { return state.portalCulling; },
-        [&](bool v) { state.portalCulling = v; updateTitle(); });
-
-    dbgConsole.addBool("camera_collision",
-        [&]() { return state.cameraCollision; },
-        [&](bool v) { state.cameraCollision = v; updateTitle(); });
-
-    dbgConsole.addBool("show_objects",
-        [&]() { return state.showObjects; },
-        [&](bool v) { state.showObjects = v; });
-
-    dbgConsole.addBool("show_fallback_cubes",
-        [&]() { return state.showFallbackCubes; },
-        [&](bool v) { state.showFallbackCubes = v; });
-
-    dbgConsole.addBool("show_raycast",
-        [&]() { return state.showRaycast; },
-        [&](bool v) { state.showRaycast = v; });
-
-    dbgConsole.addFloat("move_speed", 1.0f, 500.0f,
-        [&]() { return state.moveSpeed; },
-        [&](float v) { state.moveSpeed = v; updateTitle(); });
-
-    dbgConsole.addFloat("wave_amplitude", 0.0f, 5.0f,
-        [&]() { return state.waveAmplitude; },
-        [&](float v) { state.waveAmplitude = v; });
-
-    dbgConsole.addFloat("uv_distortion", 0.0f, 0.5f,
-        [&]() { return state.uvDistortion; },
-        [&](float v) { state.uvDistortion = v; });
-
-    dbgConsole.addFloat("water_rotation", 0.0f, 0.5f,
-        [&]() { return state.waterRotation; },
-        [&](float v) { state.waterRotation = v; });
-
-    dbgConsole.addFloat("water_scroll", 0.0f, 1.0f,
-        [&]() { return state.waterScrollSpeed; },
-        [&](float v) { state.waterScrollSpeed = v; });
+    // Thin wrapper for title bar updates — used by handleEvents and render loop
+    auto updateTitle = [&]() { updateTitleBar(window, state); };
+    updateTitle();
 
     auto lastTime = std::chrono::high_resolution_clock::now();
     // state.waterElapsed, state.running have defaults from struct initializer
