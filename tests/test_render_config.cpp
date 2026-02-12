@@ -38,7 +38,7 @@ static std::vector<char*> makeArgv(std::vector<std::string>& args) {
 TEST_CASE("RenderConfig defaults", "[config]") {
     Darkness::RenderConfig cfg;
 
-    CHECK(cfg.lmScale    == 1);
+    CHECK(cfg.lightmapFiltering == 0);
     CHECK(cfg.filterMode == 0);
     CHECK(cfg.linearMips == false);
     CHECK(cfg.sharpMips  == false);
@@ -56,7 +56,7 @@ TEST_CASE("RenderConfig defaults", "[config]") {
 TEST_CASE("YAML full load", "[config][yaml]") {
     TmpFile tmp(R"(
 graphics:
-  lm_scale: 4
+  lightmap_filtering: bicubic
   filter_mode: 2
   linear_mips: true
   sharp_mips: true
@@ -72,7 +72,7 @@ developer:
     bool ok = Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
 
     REQUIRE(ok);
-    CHECK(cfg.lmScale    == 4);
+    CHECK(cfg.lightmapFiltering == 1);
     CHECK(cfg.filterMode == 2);
     CHECK(cfg.linearMips == true);
     CHECK(cfg.sharpMips  == true);
@@ -86,14 +86,14 @@ developer:
 TEST_CASE("YAML partial load — unset fields keep defaults", "[config][yaml]") {
     TmpFile tmp(R"(
 graphics:
-  lm_scale: 3
+  lightmap_filtering: bicubic
 )");
 
     Darkness::RenderConfig cfg;
     bool ok = Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
 
     REQUIRE(ok);
-    CHECK(cfg.lmScale    == 3);
+    CHECK(cfg.lightmapFiltering == 1);
     // Everything else should be default
     CHECK(cfg.filterMode == 0);
     CHECK(cfg.linearMips == false);
@@ -111,9 +111,9 @@ TEST_CASE("YAML missing file returns false, config unchanged", "[config][yaml]")
 
     CHECK_FALSE(ok);
     // Config must be unchanged
-    CHECK(cfg.lmScale      == orig.lmScale);
-    CHECK(cfg.filterMode   == orig.filterMode);
-    CHECK(cfg.showObjects  == orig.showObjects);
+    CHECK(cfg.lightmapFiltering == orig.lightmapFiltering);
+    CHECK(cfg.filterMode        == orig.filterMode);
+    CHECK(cfg.showObjects       == orig.showObjects);
 }
 
 TEST_CASE("YAML malformed file returns false, no crash", "[config][yaml]") {
@@ -126,9 +126,9 @@ TEST_CASE("YAML malformed file returns false, no crash", "[config][yaml]") {
 
     CHECK_FALSE(ok);
     // Config must be unchanged — malformed YAML should not partially apply
-    CHECK(cfg.lmScale      == orig.lmScale);
-    CHECK(cfg.filterMode   == orig.filterMode);
-    CHECK(cfg.showObjects  == orig.showObjects);
+    CHECK(cfg.lightmapFiltering == orig.lightmapFiltering);
+    CHECK(cfg.filterMode        == orig.filterMode);
+    CHECK(cfg.showObjects       == orig.showObjects);
 }
 
 TEST_CASE("CLI flags override defaults", "[config][cli]") {
@@ -136,7 +136,7 @@ TEST_CASE("CLI flags override defaults", "[config][cli]") {
     std::vector<std::string> args = {
         "darknessRender", "mission.mis",
         "--no-objects", "--no-cull", "--filter",
-        "--lm-scale", "4", "--force-flicker",
+        "--lightmap-filtering", "bicubic", "--force-flicker",
         "--linear-mips", "--sharp-mips", "--show-fallback",
         "--collision"
     };
@@ -149,7 +149,7 @@ TEST_CASE("CLI flags override defaults", "[config][cli]") {
     CHECK(cfg.showFallbackCubes == true);
     CHECK(cfg.portalCulling    == false);
     CHECK(cfg.filterMode       == 1);
-    CHECK(cfg.lmScale          == 4);
+    CHECK(cfg.lightmapFiltering == 1);
     CHECK(cfg.forceFlicker     == true);
     CHECK(cfg.linearMips       == true);
     CHECK(cfg.sharpMips        == true);
@@ -178,32 +178,45 @@ TEST_CASE("CLI-only fields: --res, --config, --help, positional", "[config][cli]
     CHECK(std::string(cli.misPath) == "test.mis");
 }
 
-TEST_CASE("lm_scale clamping in YAML and CLI", "[config][clamp]") {
-    SECTION("YAML clamps below 1 to 1") {
-        TmpFile tmp("graphics:\n  lm_scale: -5\n");
+TEST_CASE("lightmap_filtering string parsing in YAML and CLI", "[config][clamp]") {
+    SECTION("YAML bilinear maps to 0") {
+        TmpFile tmp("graphics:\n  lightmap_filtering: bilinear\n");
         Darkness::RenderConfig cfg;
         Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
-        CHECK(cfg.lmScale == 1);
+        CHECK(cfg.lightmapFiltering == 0);
     }
-    SECTION("YAML clamps above 8 to 8") {
-        TmpFile tmp("graphics:\n  lm_scale: 99\n");
+    SECTION("YAML bicubic maps to 1") {
+        TmpFile tmp("graphics:\n  lightmap_filtering: bicubic\n");
         Darkness::RenderConfig cfg;
         Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
-        CHECK(cfg.lmScale == 8);
+        CHECK(cfg.lightmapFiltering == 1);
     }
-    SECTION("CLI clamps below 1 to 1") {
+    SECTION("YAML unknown string defaults to 0 (bilinear)") {
+        TmpFile tmp("graphics:\n  lightmap_filtering: foobar\n");
         Darkness::RenderConfig cfg;
-        std::vector<std::string> args = {"prog", "--lm-scale", "0"};
+        Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
+        CHECK(cfg.lightmapFiltering == 0);
+    }
+    SECTION("CLI bilinear maps to 0") {
+        Darkness::RenderConfig cfg;
+        std::vector<std::string> args = {"prog", "--lightmap-filtering", "bilinear"};
         auto argv = makeArgv(args);
         Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
-        CHECK(cfg.lmScale == 1);
+        CHECK(cfg.lightmapFiltering == 0);
     }
-    SECTION("CLI clamps above 8 to 8") {
+    SECTION("CLI bicubic maps to 1") {
         Darkness::RenderConfig cfg;
-        std::vector<std::string> args = {"prog", "--lm-scale", "100"};
+        std::vector<std::string> args = {"prog", "--lightmap-filtering", "bicubic"};
         auto argv = makeArgv(args);
         Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
-        CHECK(cfg.lmScale == 8);
+        CHECK(cfg.lightmapFiltering == 1);
+    }
+    SECTION("CLI unknown string defaults to 0 (bilinear)") {
+        Darkness::RenderConfig cfg;
+        std::vector<std::string> args = {"prog", "--lightmap-filtering", "garbage"};
+        auto argv = makeArgv(args);
+        Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
+        CHECK(cfg.lightmapFiltering == 0);
     }
 }
 
@@ -312,7 +325,7 @@ TEST_CASE("CLI overrides YAML — last-write wins", "[config][precedence]") {
     // Simulate the real config loading order: YAML first, then CLI
     TmpFile tmp(R"(
 graphics:
-  lm_scale: 6
+  lightmap_filtering: bicubic
   filter_mode: 2
 developer:
   show_objects: false
@@ -321,14 +334,14 @@ developer:
     Darkness::RenderConfig cfg;
     bool ok = Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
     REQUIRE(ok);
-    CHECK(cfg.lmScale == 6);
+    CHECK(cfg.lightmapFiltering == 1);
 
-    // CLI overrides lm_scale but not filter_mode or show_objects
-    std::vector<std::string> args = {"prog", "--lm-scale", "2"};
+    // CLI overrides lightmap_filtering but not filter_mode or show_objects
+    std::vector<std::string> args = {"prog", "--lightmap-filtering", "bilinear"};
     auto argv = makeArgv(args);
     Darkness::applyCliOverrides(static_cast<int>(argv.size()), argv.data(), cfg);
 
-    CHECK(cfg.lmScale       == 2);  // CLI wins
-    CHECK(cfg.filterMode    == 2);  // YAML preserved
-    CHECK(cfg.showObjects   == false);  // YAML preserved
+    CHECK(cfg.lightmapFiltering == 0);  // CLI wins
+    CHECK(cfg.filterMode        == 2);  // YAML preserved
+    CHECK(cfg.showObjects       == false);  // YAML preserved
 }

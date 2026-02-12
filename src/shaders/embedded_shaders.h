@@ -29,6 +29,8 @@
 #include "glsl/fs_textured.sc.bin.h"
 #include "glsl/vs_lightmapped.sc.bin.h"
 #include "glsl/fs_lightmapped.sc.bin.h"
+#include "glsl/vs_lightmapped_bicubic.sc.bin.h"
+#include "glsl/fs_lightmapped_bicubic.sc.bin.h"
 #include "glsl/vs_water.sc.bin.h"
 #include "glsl/fs_water.sc.bin.h"
 
@@ -39,6 +41,8 @@
 #include "essl/fs_textured.sc.bin.h"
 #include "essl/vs_lightmapped.sc.bin.h"
 #include "essl/fs_lightmapped.sc.bin.h"
+#include "essl/vs_lightmapped_bicubic.sc.bin.h"
+#include "essl/fs_lightmapped_bicubic.sc.bin.h"
 #include "essl/vs_water.sc.bin.h"
 #include "essl/fs_water.sc.bin.h"
 
@@ -49,6 +53,8 @@
 #include "spirv/fs_textured.sc.bin.h"
 #include "spirv/vs_lightmapped.sc.bin.h"
 #include "spirv/fs_lightmapped.sc.bin.h"
+#include "spirv/vs_lightmapped_bicubic.sc.bin.h"
+#include "spirv/fs_lightmapped_bicubic.sc.bin.h"
 #include "spirv/vs_water.sc.bin.h"
 #include "spirv/fs_water.sc.bin.h"
 
@@ -60,6 +66,8 @@
 #include "metal/fs_textured.sc.bin.h"
 #include "metal/vs_lightmapped.sc.bin.h"
 #include "metal/fs_lightmapped.sc.bin.h"
+#include "metal/vs_lightmapped_bicubic.sc.bin.h"
+#include "metal/fs_lightmapped_bicubic.sc.bin.h"
 #include "metal/vs_water.sc.bin.h"
 #include "metal/fs_water.sc.bin.h"
 #endif
@@ -72,6 +80,8 @@
 #include "dx11/fs_textured.sc.bin.h"
 #include "dx11/vs_lightmapped.sc.bin.h"
 #include "dx11/fs_lightmapped.sc.bin.h"
+#include "dx11/vs_lightmapped_bicubic.sc.bin.h"
+#include "dx11/fs_lightmapped_bicubic.sc.bin.h"
 #include "dx11/vs_water.sc.bin.h"
 #include "dx11/fs_water.sc.bin.h"
 #endif
@@ -86,6 +96,8 @@ static const bgfx::EmbeddedShader s_embeddedShaders[] = {
     BGFX_EMBEDDED_SHADER(fs_textured),
     BGFX_EMBEDDED_SHADER(vs_lightmapped),
     BGFX_EMBEDDED_SHADER(fs_lightmapped),
+    BGFX_EMBEDDED_SHADER(vs_lightmapped_bicubic),
+    BGFX_EMBEDDED_SHADER(fs_lightmapped_bicubic),
     BGFX_EMBEDDED_SHADER(vs_water),
     BGFX_EMBEDDED_SHADER(fs_water),
     BGFX_EMBEDDED_SHADER_END()

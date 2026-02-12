@@ -682,7 +682,6 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                                Darkness::GPUResources &gpu,
                                float &centroidX, float &centroidY, float &centroidZ)
 {
-    int lmScale = cfg.lmScale;
     bool linearMips = cfg.linearMips;
     bool sharpMips = cfg.sharpMips;
 
@@ -702,11 +701,20 @@ static bool createGPUResources(const Darkness::MissionData &mission,
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_textured"),
         true);
 
-    // Lightmapped program
+    // Lightmapped program (bilinear — hardware LINEAR filtering, the default)
     gpu.lightmappedProgram = bgfx::createProgram(
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_lightmapped"),
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_lightmapped"),
         true);
+
+    // Lightmapped bicubic program (cubic B-spline filtering via 4 bilinear taps)
+    gpu.lightmappedBicubicProgram = bgfx::createProgram(
+        bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_lightmapped_bicubic"),
+        bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_lightmapped_bicubic"),
+        true);
+    if (!bgfx::isValid(gpu.lightmappedBicubicProgram)) {
+        std::fprintf(stderr, "Warning: bicubic lightmap shader failed to compile, falling back to bilinear\n");
+    }
 
     // Water program: vertex displacement + textured fragment with UV distortion
     gpu.waterProgram = bgfx::createProgram(
@@ -722,11 +730,13 @@ static bool createGPUResources(const Darkness::MissionData &mission,
     gpu.u_fogParams = bgfx::createUniform("u_fogParams", bgfx::UniformType::Vec4);
     // Per-object params: x = alpha (1.0 = opaque, < 1.0 = translucent via RenderAlpha property)
     gpu.u_objectParams = bgfx::createUniform("u_objectParams", bgfx::UniformType::Vec4);
+    // Atlas dimensions for bicubic shader texel-space calculations
+    gpu.u_lmAtlasSize = bgfx::createUniform("u_lmAtlasSize", bgfx::UniformType::Vec4);
 
     // ── Build lightmap atlas (if textured mode) ──
 
     if (mission.texturedMode) {
-        gpu.lmAtlasSet = Darkness::buildLightmapAtlases(mission.wrData, lmScale);
+        gpu.lmAtlasSet = Darkness::buildLightmapAtlases(mission.wrData);
         if (!gpu.lmAtlasSet.atlases.empty()) {
             meshes.lightmappedMode = true;
 
@@ -756,7 +766,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                         Darkness::blendAnimatedLightmap(
                             gpu.lmAtlasSet.atlases[0], mission.wrData, ci, pi,
                             gpu.lmAtlasSet.entries[ci][pi],
-                            initIntensities, lmScale);
+                            initIntensities);
                         ++blendedPolys;
                     }
                 }
@@ -768,15 +778,13 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 // Create texture WITHOUT initial data so it stays mutable —
                 // bgfx treats textures with initial mem as immutable.
                 // We upload via updateTexture2D immediately after creation.
-                // Point filtering so --lm-scale 1 gives the original blocky/vintage
-                // look. Higher lm-scale values bake bicubic smoothing into the
-                // atlas texels, providing progressively smoother lighting.
+                // LINEAR filtering matches the original Dark Engine's hardware path.
+                // Atlas has 2px edge-clamped padding to prevent seam bleeding.
                 bgfx::TextureHandle th = bgfx::createTexture2D(
                     static_cast<uint16_t>(atlas.size),
                     static_cast<uint16_t>(atlas.size),
                     false, 1, bgfx::TextureFormat::RGBA8,
-                    BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
-                    | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+                    BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
                 // Upload initial atlas data
                 const bgfx::Memory *mem = bgfx::copy(atlas.rgba.data(),
                     static_cast<uint32_t>(atlas.rgba.size()));
@@ -1246,12 +1254,15 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
     bgfx::destroy(gpu.u_fogColor);
     bgfx::destroy(gpu.u_fogParams);
     bgfx::destroy(gpu.u_objectParams);
+    bgfx::destroy(gpu.u_lmAtlasSize);
 
     bgfx::destroy(gpu.ibh);
     bgfx::destroy(gpu.vbh);
     bgfx::destroy(gpu.flatProgram);
     bgfx::destroy(gpu.texturedProgram);
     bgfx::destroy(gpu.lightmappedProgram);
+    if (bgfx::isValid(gpu.lightmappedBicubicProgram))
+        bgfx::destroy(gpu.lightmappedBicubicProgram);
     bgfx::destroy(gpu.waterProgram);
 }
 
