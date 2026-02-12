@@ -1736,95 +1736,20 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
     }
 }
 
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        printHelp();
-        return 1;
-    }
-
-    // Parse config: hardcoded defaults → YAML file → CLI overrides
-    Darkness::RenderConfig cfg;
-
-    // First CLI pass: extract --config path (and detect --help early)
-    Darkness::CliResult cli = Darkness::applyCliOverrides(argc, argv, cfg);
-
-    if (cli.helpRequested) {
-        printHelp();
-        return 0;
-    }
-
-    if (!cli.misPath) {
-        std::fprintf(stderr, "Error: no mission file specified.\n\n");
-        printHelp();
-        return 1;
-    }
-
-    // Load YAML config (defaults to ./darknessRender.yaml if no --config flag)
-    std::string configPath = cli.configPath.empty() ? "darknessRender.yaml" : cli.configPath;
-    Darkness::loadConfigFromYAML(configPath, cfg);
-
-    // Re-apply CLI so flags always win over YAML values
-    cli = Darkness::applyCliOverrides(argc, argv, cfg);
-
-    // All CPU-side parsed mission content and mutable runtime state.
-    Darkness::MissionData mission;
-    Darkness::RuntimeState state;
-
-    // Unpack into local variables — rest of file uses these unchanged
-    const char *misPath    = cli.misPath;
-    std::string resPath    = cli.resPath;
-    int  lmScale           = cfg.lmScale;
-    state.showObjects       = cfg.showObjects;
-    state.showFallbackCubes = cfg.showFallbackCubes;
-    bool forceFlicker      = cfg.forceFlicker;
-    state.portalCulling     = cfg.portalCulling;
-    state.cameraCollision   = cfg.cameraCollision;
-    state.filterMode        = cfg.filterMode;
-    bool linearMips        = cfg.linearMips;
-    bool sharpMips         = cfg.sharpMips;
-    state.waveAmplitude    = cfg.waveAmplitude;
-    state.uvDistortion     = cfg.uvDistortion;
-    state.waterRotation    = cfg.waterRotation;
-    state.waterScrollSpeed = cfg.waterScrollSpeed;
-
-    mission.texturedMode = !resPath.empty();
-
-    // ── Initialize logging (required before ServiceManager) ──
-    Darkness::Logger logger;
-    Darkness::StdLog stdlog;
-    logger.setLogLevel(Darkness::Logger::LOG_LEVEL_FATAL);
-    Darkness::ConsoleBackend console;
-
-    // ── Initialize service stack, load database, construct IWorldQuery ──
-    std::string scriptsDir = "scripts/thief2";
-    auto worldQuery = initServiceStack(misPath, scriptsDir);
-
-    // ── Load mission data: WR geometry, portals, spawn, lights, sky, fog, flow ──
-    if (!loadMissionData(misPath, forceFlicker, mission))
-        return 1;
-
-    // Inject raycaster into the world query facade — enables ray-vs-world
-    // queries (AI line-of-sight, physics, sound occlusion) via portal traversal
-    worldQuery->setRaycaster(
-        [&mission](const Darkness::Vector3 &from, const Darkness::Vector3 &to,
-                  Darkness::RayHit &hit) {
-            return Darkness::raycastWorld(mission.wrData, from, to, hit);
-        });
-
-    // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
-    loadWorldTextures(misPath, resPath, mission);
-
-    // ── Load object assets: properties, .bin models, textures from obj.crf ──
-    loadObjectAssets(misPath, resPath, cfg, mission.wrData, mission, state);
-
-    // ── SDL2 + bgfx init ──
-
-    Darkness::GPUResources gpu;
-    Darkness::BuiltMeshes meshes;
-
-    // state.skyClearColor set by initWindow
-    SDL_Window *window = initWindow(mission.fogParams, state.skyClearColor);
-    if (!window) return 1;
+// ── Create all GPU resources: shaders, lightmap atlas, world/object/sky buffers ──
+// Builds mesh data from MissionData, uploads to bgfx, creates shader programs
+// and uniform handles. Returns false if world geometry is empty (fatal).
+// centroidX/Y/Z receive the world geometry centroid for camera init.
+static bool createGPUResources(const Darkness::MissionData &mission,
+                               const Darkness::RenderConfig &cfg,
+                               bool showObjects,
+                               Darkness::BuiltMeshes &meshes,
+                               Darkness::GPUResources &gpu,
+                               float &centroidX, float &centroidY, float &centroidZ)
+{
+    int lmScale = cfg.lmScale;
+    bool linearMips = cfg.linearMips;
+    bool sharpMips = cfg.sharpMips;
 
     // ── Shaders ──
     // Load from cross-platform embedded shader table (auto-selects Metal/D3D/GL/Vulkan)
@@ -1864,8 +1789,6 @@ int main(int argc, char *argv[]) {
     gpu.u_objectParams = bgfx::createUniform("u_objectParams", bgfx::UniformType::Vec4);
 
     // ── Build lightmap atlas (if textured mode) ──
-
-    // meshes.lightmappedMode set below if lightmap atlas builds successfully
 
     if (mission.texturedMode) {
         gpu.lmAtlasSet = Darkness::buildLightmapAtlases(mission.wrData, lmScale);
@@ -1934,11 +1857,9 @@ int main(int argc, char *argv[]) {
 
     // ── Build geometry and create GPU buffers ──
 
-    float camX, camY, camZ;
-
     if (meshes.lightmappedMode) {
         meshes.lmMesh = buildLightmappedMesh(mission.wrData, mission.texDims, gpu.lmAtlasSet);
-        camX = meshes.lmMesh.cx; camY = meshes.lmMesh.cy; camZ = meshes.lmMesh.cz;
+        centroidX = meshes.lmMesh.cx; centroidY = meshes.lmMesh.cy; centroidZ = meshes.lmMesh.cz;
 
         std::fprintf(stderr, "Geometry (lightmapped): %zu vertices, %zu indices (%zu triangles), %zu texture groups\n",
                      meshes.lmMesh.vertices.size(), meshes.lmMesh.indices.size(),
@@ -1946,10 +1867,7 @@ int main(int argc, char *argv[]) {
 
         if (meshes.lmMesh.vertices.empty()) {
             std::fprintf(stderr, "No geometry to render\n");
-            bgfx::shutdown();
-            SDL_DestroyWindow(window);
-            SDL_Quit();
-            return 1;
+            return false;
         }
 
         const bgfx::Memory *vbMem = bgfx::copy(
@@ -1965,7 +1883,7 @@ int main(int argc, char *argv[]) {
         gpu.ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
 
         // Create bgfx textures with full mip chains from loaded images
-        for (auto &kv : mission.loadedTextures) {
+        for (const auto &kv : mission.loadedTextures) {
             uint8_t idx = kv.first;
             const auto &img = kv.second;
             gpu.textureHandles[idx] = createMipmappedTexture(
@@ -1979,7 +1897,7 @@ int main(int argc, char *argv[]) {
         // Create GPU textures for flow group water textures (loaded by name)
         // Water textures are fully opaque (alpha blending via vertex color),
         // so use ALPHA_BLEND (no coverage preservation needed).
-        for (auto &kv : mission.flowLoadedTextures) {
+        for (const auto &kv : mission.flowLoadedTextures) {
             uint8_t fg = kv.first;
             const auto &img = kv.second;
             gpu.flowTextureHandles[fg] = createMipmappedTexture(
@@ -1992,7 +1910,7 @@ int main(int argc, char *argv[]) {
         }
     } else if (mission.texturedMode) {
         meshes.worldMesh = buildTexturedMesh(mission.wrData, mission.texDims);
-        camX = meshes.worldMesh.cx; camY = meshes.worldMesh.cy; camZ = meshes.worldMesh.cz;
+        centroidX = meshes.worldMesh.cx; centroidY = meshes.worldMesh.cy; centroidZ = meshes.worldMesh.cz;
 
         std::fprintf(stderr, "Geometry (textured): %zu vertices, %zu indices (%zu triangles), %zu texture groups\n",
                      meshes.worldMesh.vertices.size(), meshes.worldMesh.indices.size(),
@@ -2000,10 +1918,7 @@ int main(int argc, char *argv[]) {
 
         if (meshes.worldMesh.vertices.empty()) {
             std::fprintf(stderr, "No geometry to render\n");
-            bgfx::shutdown();
-            SDL_DestroyWindow(window);
-            SDL_Quit();
-            return 1;
+            return false;
         }
 
         const bgfx::Memory *vbMem = bgfx::copy(
@@ -2018,7 +1933,7 @@ int main(int argc, char *argv[]) {
         );
         gpu.ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
 
-        for (auto &kv : mission.loadedTextures) {
+        for (const auto &kv : mission.loadedTextures) {
             uint8_t idx = kv.first;
             const auto &img = kv.second;
             gpu.textureHandles[idx] = createMipmappedTexture(
@@ -2030,7 +1945,7 @@ int main(int argc, char *argv[]) {
         std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", gpu.textureHandles.size());
     } else {
         meshes.flatMesh = buildFlatMesh(mission.wrData);
-        camX = meshes.flatMesh.cx; camY = meshes.flatMesh.cy; camZ = meshes.flatMesh.cz;
+        centroidX = meshes.flatMesh.cx; centroidY = meshes.flatMesh.cy; centroidZ = meshes.flatMesh.cz;
 
         std::fprintf(stderr, "Geometry (flat): %zu vertices, %zu indices (%zu triangles)\n",
                      meshes.flatMesh.vertices.size(), meshes.flatMesh.indices.size(),
@@ -2038,10 +1953,7 @@ int main(int argc, char *argv[]) {
 
         if (meshes.flatMesh.vertices.empty()) {
             std::fprintf(stderr, "No geometry to render\n");
-            bgfx::shutdown();
-            SDL_DestroyWindow(window);
-            SDL_Quit();
-            return 1;
+            return false;
         }
 
         const bgfx::Memory *vbMem = bgfx::copy(
@@ -2074,9 +1986,7 @@ int main(int argc, char *argv[]) {
 
     // ── Create GPU buffers for object meshes ──
 
-    // gpu.objModelGPU, gpu.objTextureHandles, gpu.fallbackCube* populated below
-
-    if (state.showObjects) {
+    if (showObjects) {
         // Build fallback cube
         {
             std::vector<PosColorVertex> cubeVerts;
@@ -2094,7 +2004,7 @@ int main(int argc, char *argv[]) {
         }
 
         // Create bgfx texture handles with mip chains from loaded object texture images
-        for (auto &kv : mission.objTexImages) {
+        for (const auto &kv : mission.objTexImages) {
             const auto &img = kv.second;
             gpu.objTextureHandles[kv.first] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
@@ -2108,7 +2018,7 @@ int main(int argc, char *argv[]) {
         }
 
         // Create GPU buffers for each parsed .bin model
-        for (auto &kv : mission.parsedModels) {
+        for (const auto &kv : mission.parsedModels) {
             const std::string &name = kv.first;
             const Darkness::ParsedBinMesh &mesh = kv.second;
 
@@ -2239,14 +2149,159 @@ int main(int argc, char *argv[]) {
                          "%d material submeshes (mat_extra)\n",
                          translucentObjCount, translucentMatCount);
         }
-
     }
+
+    // ── Create sky dome GPU buffers ──
+
+    if (!mission.skyDome.vertices.empty()) {
+        gpu.skyVBH = bgfx::createVertexBuffer(
+            bgfx::copy(mission.skyDome.vertices.data(),
+                static_cast<uint32_t>(mission.skyDome.vertices.size() * sizeof(PosColorVertex))),
+            PosColorVertex::layout);
+        gpu.skyIBH = bgfx::createIndexBuffer(
+            bgfx::copy(mission.skyDome.indices.data(),
+                static_cast<uint32_t>(mission.skyDome.indices.size() * sizeof(uint16_t))));
+        gpu.skyIndexCount = static_cast<uint32_t>(mission.skyDome.indices.size());
+    }
+
+    // ── Create textured skybox GPU buffers (old sky system) ──
+
+    if (mission.hasSkybox) {
+        meshes.skyboxCube = buildSkyboxCube();
+
+        gpu.skyboxVBH = bgfx::createVertexBuffer(
+            bgfx::copy(meshes.skyboxCube.vertices.data(),
+                static_cast<uint32_t>(meshes.skyboxCube.vertices.size() * sizeof(PosColorUVVertex))),
+            PosColorUVVertex::layout);
+        gpu.skyboxIBH = bgfx::createIndexBuffer(
+            bgfx::copy(meshes.skyboxCube.indices.data(),
+                static_cast<uint32_t>(meshes.skyboxCube.indices.size() * sizeof(uint16_t))));
+
+        // Create GPU textures with mip chains for each loaded skybox face
+        // Skybox faces are fully opaque so use ALPHA_BLEND (no coverage preservation)
+        for (const auto &kv : mission.skyboxImages) {
+            const auto &img = kv.second;
+            gpu.skyboxTexHandles[kv.first] = createMipmappedTexture(
+                img.rgba.data(), img.width, img.height,
+                BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+                MipAlphaMode::ALPHA_BLEND, linearMips, sharpMips);
+        }
+        std::fprintf(stderr, "Skybox GPU: %zu face textures created\n",
+                     gpu.skyboxTexHandles.size());
+    }
+
+    return true;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        printHelp();
+        return 1;
+    }
+
+    // Parse config: hardcoded defaults → YAML file → CLI overrides
+    Darkness::RenderConfig cfg;
+
+    // First CLI pass: extract --config path (and detect --help early)
+    Darkness::CliResult cli = Darkness::applyCliOverrides(argc, argv, cfg);
+
+    if (cli.helpRequested) {
+        printHelp();
+        return 0;
+    }
+
+    if (!cli.misPath) {
+        std::fprintf(stderr, "Error: no mission file specified.\n\n");
+        printHelp();
+        return 1;
+    }
+
+    // Load YAML config (defaults to ./darknessRender.yaml if no --config flag)
+    std::string configPath = cli.configPath.empty() ? "darknessRender.yaml" : cli.configPath;
+    Darkness::loadConfigFromYAML(configPath, cfg);
+
+    // Re-apply CLI so flags always win over YAML values
+    cli = Darkness::applyCliOverrides(argc, argv, cfg);
+
+    // All CPU-side parsed mission content and mutable runtime state.
+    Darkness::MissionData mission;
+    Darkness::RuntimeState state;
+
+    // Unpack into local variables — rest of file uses these unchanged
+    const char *misPath    = cli.misPath;
+    std::string resPath    = cli.resPath;
+    int  lmScale           = cfg.lmScale;
+    state.showObjects       = cfg.showObjects;
+    state.showFallbackCubes = cfg.showFallbackCubes;
+    bool forceFlicker      = cfg.forceFlicker;
+    state.portalCulling     = cfg.portalCulling;
+    state.cameraCollision   = cfg.cameraCollision;
+    state.filterMode        = cfg.filterMode;
+    bool linearMips        = cfg.linearMips;
+    bool sharpMips         = cfg.sharpMips;
+    state.waveAmplitude    = cfg.waveAmplitude;
+    state.uvDistortion     = cfg.uvDistortion;
+    state.waterRotation    = cfg.waterRotation;
+    state.waterScrollSpeed = cfg.waterScrollSpeed;
+
+    mission.texturedMode = !resPath.empty();
+
+    // ── Initialize logging (required before ServiceManager) ──
+    Darkness::Logger logger;
+    Darkness::StdLog stdlog;
+    logger.setLogLevel(Darkness::Logger::LOG_LEVEL_FATAL);
+    Darkness::ConsoleBackend console;
+
+    // ── Initialize service stack, load database, construct IWorldQuery ──
+    std::string scriptsDir = "scripts/thief2";
+    auto worldQuery = initServiceStack(misPath, scriptsDir);
+
+    // ── Load mission data: WR geometry, portals, spawn, lights, sky, fog, flow ──
+    if (!loadMissionData(misPath, forceFlicker, mission))
+        return 1;
+
+    // Inject raycaster into the world query facade — enables ray-vs-world
+    // queries (AI line-of-sight, physics, sound occlusion) via portal traversal
+    worldQuery->setRaycaster(
+        [&mission](const Darkness::Vector3 &from, const Darkness::Vector3 &to,
+                  Darkness::RayHit &hit) {
+            return Darkness::raycastWorld(mission.wrData, from, to, hit);
+        });
+
+    // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
+    loadWorldTextures(misPath, resPath, mission);
+
+    // ── Load object assets: properties, .bin models, textures from obj.crf ──
+    loadObjectAssets(misPath, resPath, cfg, mission.wrData, mission, state);
+
+    // ── SDL2 + bgfx init ──
+
+    Darkness::GPUResources gpu;
+    Darkness::BuiltMeshes meshes;
+
+    // state.skyClearColor set by initWindow
+    SDL_Window *window = initWindow(mission.fogParams, state.skyClearColor);
+    if (!window) return 1;
+
+    // ── Create all GPU resources: shaders, lightmap atlas, world/object/sky buffers ──
+    float camX, camY, camZ;
+    if (!createGPUResources(mission, cfg, state.showObjects, meshes, gpu,
+                            camX, camY, camZ)) {
+        shutdownWindow(window);
+        return 1;
+    }
+
+    const char *modeStr = meshes.lightmappedMode ? "lightmapped" :
+                          mission.texturedMode ? "textured" : "flat-shaded";
+    std::fprintf(stderr, "Render window opened (%dx%d, %s, %s)\n",
+                 WINDOW_WIDTH, WINDOW_HEIGHT,
+                 bgfx::getRendererName(bgfx::getRendererType()), modeStr);
+    std::fprintf(stderr, "Portal culling: %s (toggle with C key)\n",
+                 state.portalCulling ? "ON" : "OFF");
 
     // ── Model isolation state for debugging ──
     // Sorted list of model names that have loaded GPU data, with instance counts.
     // Press N to cycle through, isolating one model at a time for identification.
-    // state.sortedModelNames, state.modelInstanceCounts, state.isolateModelIdx populated below
-
     if (state.showObjects) {
         // Count instances per model name
         for (const auto &obj : mission.objData.objects) {
@@ -2271,56 +2326,6 @@ int main(int argc, char *argv[]) {
         std::fprintf(stderr, "Model isolation: %zu loaded, %d unloaded (M=next, N=prev)\n",
                      state.sortedModelNames.size(), unloadedCount);
     }
-
-
-    // ── Create sky dome GPU buffers ──
-    // gpu.skyVBH, gpu.skyIBH, gpu.skyIndexCount populated below
-
-    if (!mission.skyDome.vertices.empty()) {
-        gpu.skyVBH = bgfx::createVertexBuffer(
-            bgfx::copy(mission.skyDome.vertices.data(),
-                static_cast<uint32_t>(mission.skyDome.vertices.size() * sizeof(PosColorVertex))),
-            PosColorVertex::layout);
-        gpu.skyIBH = bgfx::createIndexBuffer(
-            bgfx::copy(mission.skyDome.indices.data(),
-                static_cast<uint32_t>(mission.skyDome.indices.size() * sizeof(uint16_t))));
-        gpu.skyIndexCount = static_cast<uint32_t>(mission.skyDome.indices.size());
-    }
-
-    // ── Create textured skybox GPU buffers (old sky system) ──
-    // gpu.skybox*, meshes.skyboxCube populated below
-
-    if (mission.hasSkybox) {
-        meshes.skyboxCube = buildSkyboxCube();
-
-        gpu.skyboxVBH = bgfx::createVertexBuffer(
-            bgfx::copy(meshes.skyboxCube.vertices.data(),
-                static_cast<uint32_t>(meshes.skyboxCube.vertices.size() * sizeof(PosColorUVVertex))),
-            PosColorUVVertex::layout);
-        gpu.skyboxIBH = bgfx::createIndexBuffer(
-            bgfx::copy(meshes.skyboxCube.indices.data(),
-                static_cast<uint32_t>(meshes.skyboxCube.indices.size() * sizeof(uint16_t))));
-
-        // Create GPU textures with mip chains for each loaded skybox face
-        // Skybox faces are fully opaque so use ALPHA_BLEND (no coverage preservation)
-        for (auto &kv : mission.skyboxImages) {
-            const auto &img = kv.second;
-            gpu.skyboxTexHandles[kv.first] = createMipmappedTexture(
-                img.rgba.data(), img.width, img.height,
-                BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-                MipAlphaMode::ALPHA_BLEND, linearMips, sharpMips);
-        }
-        std::fprintf(stderr, "Skybox GPU: %zu face textures created\n",
-                     gpu.skyboxTexHandles.size());
-    }
-
-    const char *modeStr = meshes.lightmappedMode ? "lightmapped" :
-                          mission.texturedMode ? "textured" : "flat-shaded";
-    std::fprintf(stderr, "Render window opened (%dx%d, %s, %s)\n",
-                 WINDOW_WIDTH, WINDOW_HEIGHT,
-                 bgfx::getRendererName(rendererType), modeStr);
-    std::fprintf(stderr, "Portal culling: %s (toggle with C key)\n",
-                 state.portalCulling ? "ON" : "OFF");
 
     // Use spawn point if found, otherwise fall back to centroid
     state.spawnX = camX; state.spawnY = camY; state.spawnZ = camZ;
