@@ -1203,6 +1203,10 @@ int main(int argc, char *argv[]) {
     // Re-apply CLI so flags always win over YAML values
     cli = Darkness::applyCliOverrides(argc, argv, cfg);
 
+    // All CPU-side parsed mission content and mutable runtime state.
+    Darkness::MissionData mission;
+    Darkness::RuntimeState state;
+
     // Unpack into local variables — rest of file uses these unchanged
     const char *misPath    = cli.misPath;
     std::string resPath    = cli.resPath;
@@ -1222,7 +1226,7 @@ int main(int argc, char *argv[]) {
 
     bool showRaycast = false;   // Backspace+R: debug raycast visualization
 
-    bool texturedMode = !resPath.empty();
+    mission.texturedMode = !resPath.empty();
 
     // ── Initialize logging (required before ServiceManager) ──
     Darkness::Logger logger;
@@ -1396,64 +1400,64 @@ int main(int argc, char *argv[]) {
 
     // Extract mission base name (e.g. "miss6" from "path/to/miss6.mis")
     // for constructing skybox texture filenames like "skyhw/miss6n.PCX"
-    std::string missionName;
+    // mission.missionName populated below
     {
         std::string p(misPath);
         size_t slash = p.find_last_of("/\\");
         std::string base = (slash != std::string::npos) ? p.substr(slash + 1) : p;
         size_t dot = base.find('.');
-        missionName = (dot != std::string::npos) ? base.substr(0, dot) : base;
+        mission.missionName = (dot != std::string::npos) ? base.substr(0, dot) : base;
         // Lowercase for case-insensitive CRF matching
-        std::transform(missionName.begin(), missionName.end(), missionName.begin(),
+        std::transform(mission.missionName.begin(), mission.missionName.end(), mission.missionName.begin(),
                        [](unsigned char c) { return std::tolower(c); });
     }
 
     // Parse WR geometry
     std::fprintf(stderr, "Loading WR geometry from %s...\n", misPath);
 
-    Darkness::WRParsedData wrData;
+    // mission.wrData populated below
     try {
-        wrData = Darkness::parseWRChunk(misPath);
+        mission.wrData = Darkness::parseWRChunk(misPath);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "Failed to parse WR chunk: %s\n", e.what());
         return 1;
     }
 
-    std::fprintf(stderr, "Loaded %u cells\n", wrData.numCells);
+    std::fprintf(stderr, "Loaded %u cells\n", mission.wrData.numCells);
 
     // Inject raycaster into the world query facade — enables ray-vs-world
     // queries (AI line-of-sight, physics, sound occlusion) via portal traversal
     worldQuery->setRaycaster(
-        [&wrData](const Darkness::Vector3 &from, const Darkness::Vector3 &to,
+        [&mission](const Darkness::Vector3 &from, const Darkness::Vector3 &to,
                   Darkness::RayHit &hit) {
-            return Darkness::raycastWorld(wrData, from, to, hit);
+            return Darkness::raycastWorld(mission.wrData, from, to, hit);
         });
 
     // Build portal adjacency graph for portal culling
-    auto cellPortals = buildPortalGraph(wrData);
+    mission.cellPortals = buildPortalGraph(mission.wrData);
     {
         int totalPortals = 0;
-        for (const auto &pl : cellPortals) totalPortals += static_cast<int>(pl.size());
+        for (const auto &pl : mission.cellPortals) totalPortals += static_cast<int>(pl.size());
         std::fprintf(stderr, "Portal graph: %d portals across %u cells\n",
-                     totalPortals, wrData.numCells);
+                     totalPortals, mission.wrData.numCells);
     }
 
     // Camera collision uses polygon-level checks against the camera's current cell
     // (no precomputation needed — solid polygon detection is done per-frame)
 
     // Find player spawn point from L$PlayerFactory + P$Position chunks
-    Darkness::SpawnInfo spawnInfo = Darkness::findSpawnPoint(misPath);
+    mission.spawnInfo = Darkness::findSpawnPoint(misPath);
 
     // Parse animated light properties from mission database
-    auto lightSources = Darkness::parseAnimLightProperties(misPath);
+    mission.lightSources = Darkness::parseAnimLightProperties(misPath);
 
     // Build reverse index: lightnum → list of (cellIdx, polyIdx) affected
-    auto animLightIndex = Darkness::buildAnimLightIndex(wrData);
+    mission.animLightIndex = Darkness::buildAnimLightIndex(mission.wrData);
 
     // Ensure all lightnums referenced in WR data have a LightSource entry.
     // Lights without P$AnimLight properties default to mode 4 (max brightness).
-    for (const auto &kv : animLightIndex) {
-        if (lightSources.find(kv.first) == lightSources.end()) {
+    for (const auto &kv : mission.animLightIndex) {
+        if (mission.lightSources.find(kv.first) == mission.lightSources.end()) {
             Darkness::LightSource ls = {};
             ls.lightNum = kv.first;
             ls.mode = Darkness::ANIM_MAX_BRIGHT;
@@ -1461,13 +1465,13 @@ int main(int argc, char *argv[]) {
             ls.minBright = 0.0f;
             ls.brightness = 1.0f;
             ls.prevIntensity = 1.0f;
-            lightSources[kv.first] = ls;
+            mission.lightSources[kv.first] = ls;
         }
     }
 
     // Apply --force-flicker: override all lights to flicker mode for debugging
     if (forceFlicker) {
-        for (auto &[num, ls] : lightSources) {
+        for (auto &[num, ls] : mission.lightSources) {
             ls.mode = Darkness::ANIM_FLICKER;
             ls.inactive = false;
             ls.minBright = 0.0f;
@@ -1479,7 +1483,7 @@ int main(int argc, char *argv[]) {
             ls.isRising = false;
         }
         std::fprintf(stderr, "Force-flicker: all %zu lights set to flicker mode\n",
-                     lightSources.size());
+                     mission.lightSources.size());
     }
 
     // Animated light diagnostics
@@ -1487,14 +1491,14 @@ int main(int argc, char *argv[]) {
         int modeCounts[10] = {};
         int inactiveCount = 0;
         int fromMIS = 0, fromDefault = 0;
-        for (const auto &[num, ls] : lightSources) {
+        for (const auto &[num, ls] : mission.lightSources) {
             if (ls.mode < 10) modeCounts[ls.mode]++;
             if (ls.inactive) inactiveCount++;
             if (ls.objectId != 0) fromMIS++; else fromDefault++;
         }
         std::fprintf(stderr, "Animated lights: %zu sources (%d from MIS, %d defaulted), "
                      "%zu indexed lightnums\n",
-                     lightSources.size(), fromMIS, fromDefault, animLightIndex.size());
+                     mission.lightSources.size(), fromMIS, fromDefault, mission.animLightIndex.size());
         const char *modeNames[] = {
             "flip", "smooth", "random", "min_bright", "max_bright",
             "zero", "brighten", "dim", "semi_random", "flicker"
@@ -1509,34 +1513,34 @@ int main(int argc, char *argv[]) {
     }
 
     // Parse sky dome parameters from SKYOBJVAR chunk (if present)
-    SkyParams skyParams = parseSkyObjVar(misPath);
-    SkyDome skyDome = buildSkyDome(skyParams);
+    mission.skyParams = parseSkyObjVar(misPath);
+    mission.skyDome = buildSkyDome(mission.skyParams);
 
     // Parse global fog parameters from FOG chunk (if present)
-    FogParams fogParams = parseFogChunk(misPath);
+    mission.fogParams = parseFogChunk(misPath);
 
     // Parse water flow data — FLOW_TEX (texture mapping) and CELL_MOTION (animation state)
-    FlowData flowData = parseFlowData(misPath);
+    mission.flowData = parseFlowData(misPath);
 
     // Parse TXLIST if in textured mode
-    Darkness::TXList txList;
-    if (texturedMode) {
+    // mission.txList populated below if textured mode
+    if (mission.texturedMode) {
         try {
-            txList = Darkness::parseTXList(misPath);
+            mission.txList = Darkness::parseTXList(misPath);
             std::fprintf(stderr, "TXLIST: %zu textures, %zu families\n",
-                         txList.textures.size(), txList.families.size());
+                         mission.txList.textures.size(), mission.txList.families.size());
         } catch (const std::exception &e) {
             std::fprintf(stderr, "Failed to parse TXLIST: %s (falling back to flat)\n",
                          e.what());
-            texturedMode = false;
+            mission.texturedMode = false;
         }
     }
 
     // Collect unique texture indices used by world geometry and water flow groups
     std::unordered_set<uint8_t> usedTextures;
-    if (texturedMode) {
+    if (mission.texturedMode) {
         // World geometry textures from polygon texturing data
-        for (const auto &cell : wrData.cells) {
+        for (const auto &cell : mission.wrData.cells) {
             for (int pi = 0; pi < cell.numTextured; ++pi) {
                 uint8_t txt = cell.texturing[pi].txt;
                 if (txt != 0 && txt != 249)
@@ -1549,22 +1553,20 @@ int main(int argc, char *argv[]) {
     }
 
     // Load world textures from fam.crf (indexed by TXLIST)
-    std::unordered_map<uint8_t, Darkness::DecodedImage> loadedTextures;
-    std::unordered_map<uint8_t, TexDimensions> texDims;
 
-    if (texturedMode) {
+    if (mission.texturedMode) {
         Darkness::CRFTextureLoader loader(resPath);
         if (!loader.isOpen()) {
             std::fprintf(stderr, "CRF not available, falling back to flat shading\n");
-            texturedMode = false;
+            mission.texturedMode = false;
         } else {
             int loaded = 0;
             for (uint8_t idx : usedTextures) {
-                if (idx >= txList.textures.size()) continue;
-                const auto &entry = txList.textures[idx];
+                if (idx >= mission.txList.textures.size()) continue;
+                const auto &entry = mission.txList.textures[idx];
                 auto img = loader.loadTexture(entry.family, entry.name);
-                texDims[idx] = { img.width, img.height };
-                loadedTextures[idx] = std::move(img);
+                mission.texDims[idx] = { img.width, img.height };
+                mission.loadedTextures[idx] = std::move(img);
                 ++loaded;
             }
             std::fprintf(stderr, "Loaded %d/%zu textures from CRF\n",
@@ -1576,22 +1578,21 @@ int main(int argc, char *argv[]) {
     // FLOW_TEX name field (e.g. "gr") maps to "water/<name>in.PCX" for the
     // air-side texture and "water/<name>out.PCX" for the underwater side.
     // Keyed by flow group index (1-255).
-    std::unordered_map<uint8_t, Darkness::DecodedImage> flowLoadedTextures;
-    std::unordered_map<uint8_t, TexDimensions> flowTexDims;
+    // mission.flowLoadedTextures, mission.flowTexDims populated below
 
-    if (texturedMode && flowData.hasFlowTex) {
+    if (mission.texturedMode && mission.flowData.hasFlowTex) {
         Darkness::CRFTextureLoader loader(resPath);
         if (loader.isOpen()) {
             // Collect unique flow groups used by cells
             std::unordered_set<uint8_t> usedFlowGroups;
-            for (const auto &cell : wrData.cells) {
+            for (const auto &cell : mission.wrData.cells) {
                 if (cell.flowGroup > 0)
                     usedFlowGroups.insert(cell.flowGroup);
             }
 
             int loaded = 0;
             for (uint8_t fg : usedFlowGroups) {
-                const auto &fe = flowData.textures[fg];
+                const auto &fe = mission.flowData.textures[fg];
                 if (fe.name[0] == '\0') continue;
 
                 // Extract base name, trimming trailing nulls/spaces
@@ -1608,8 +1609,8 @@ int main(int argc, char *argv[]) {
                 if (img.width > 8 || img.height > 8) {
                     std::fprintf(stderr, "Flow group %d: loaded water/%s.PCX (%ux%u)\n",
                                  fg, inName.c_str(), img.width, img.height);
-                    flowTexDims[fg] = { img.width, img.height };
-                    flowLoadedTextures[fg] = std::move(img);
+                    mission.flowTexDims[fg] = { img.width, img.height };
+                    mission.flowLoadedTextures[fg] = std::move(img);
                     ++loaded;
                 } else {
                     std::fprintf(stderr, "Flow group %d: water/%s.PCX not found, trying waterhw/\n",
@@ -1619,8 +1620,8 @@ int main(int argc, char *argv[]) {
                     if (img2.width > 8 || img2.height > 8) {
                         std::fprintf(stderr, "Flow group %d: loaded waterhw/%s.PCX (%ux%u)\n",
                                      fg, inName.c_str(), img2.width, img2.height);
-                        flowTexDims[fg] = { img2.width, img2.height };
-                        flowLoadedTextures[fg] = std::move(img2);
+                        mission.flowTexDims[fg] = { img2.width, img2.height };
+                        mission.flowLoadedTextures[fg] = std::move(img2);
                         ++loaded;
                     } else {
                         std::fprintf(stderr, "Flow group %d: no water texture found for '%s'\n",
@@ -1637,31 +1638,30 @@ int main(int argc, char *argv[]) {
     // ── Load skybox face textures (old sky system) ──
     // Missions without SKYOBJVAR use a textured skybox with per-mission PCX
     // textures in fam.crf under skyhw/ (e.g. skyhw/miss6n.PCX for north face).
-    std::unordered_map<std::string, Darkness::DecodedImage> skyboxImages;
-    bool hasSkybox = false;
+    // mission.skyboxImages, mission.hasSkybox populated below
 
-    if (texturedMode) {
+    if (mission.texturedMode) {
         Darkness::CRFTextureLoader skyLoader(resPath);
         if (skyLoader.isOpen()) {
             // 5 faces: n=north(+Y), s=south(-Y), e=east(+X), w=west(-X), t=top(+Z)
             const char *suffixes[] = { "n", "s", "e", "w", "t" };
             int loaded = 0;
             for (const char *suf : suffixes) {
-                std::string texName = missionName + suf;
+                std::string texName = mission.missionName + suf;
                 auto img = skyLoader.loadTexture("skyhw", texName);
                 // Real texture is larger than the 8x8 fallback checkerboard
                 if (img.width > 8 || img.height > 8) {
-                    skyboxImages[suf] = std::move(img);
+                    mission.skyboxImages[suf] = std::move(img);
                     ++loaded;
                 }
             }
             // Skybox available if at least the 4 side faces loaded (top optional)
-            hasSkybox = skyboxImages.count("n") && skyboxImages.count("s")
-                     && skyboxImages.count("e") && skyboxImages.count("w");
-            if (hasSkybox) {
+            mission.hasSkybox = mission.skyboxImages.count("n") && mission.skyboxImages.count("s")
+                     && mission.skyboxImages.count("e") && mission.skyboxImages.count("w");
+            if (mission.hasSkybox) {
                 std::fprintf(stderr, "Skybox: loaded %d/5 faces for %s (textured skybox active)\n",
-                             loaded, missionName.c_str());
-                for (auto &kv : skyboxImages) {
+                             loaded, mission.missionName.c_str());
+                for (auto &kv : mission.skyboxImages) {
                     std::fprintf(stderr, "  face '%s': %ux%u\n",
                                  kv.first.c_str(), kv.second.width, kv.second.height);
                 }
@@ -1673,17 +1673,17 @@ int main(int argc, char *argv[]) {
 
     // ── Parse object placements from .mis ──
 
-    Darkness::ObjectPropData objData;
+    // mission.objData populated below
     if (showObjects) {
         try {
             Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
-            objData = Darkness::parseObjectProps(propSvc.get(), misPath,
+            mission.objData = Darkness::parseObjectProps(propSvc.get(), misPath,
                                                     cfg.debugObjects);
         } catch (const std::exception &e) {
             std::fprintf(stderr, "Failed to parse object props: %s\n", e.what());
             showObjects = false;
         }
-        if (objData.objects.empty()) {
+        if (mission.objData.objects.empty()) {
             std::fprintf(stderr, "No objects to render\n");
             showObjects = false;
         }
@@ -1692,27 +1692,27 @@ int main(int argc, char *argv[]) {
     // Precompute which cell each object is in for portal culling.
     // Objects don't move (yet), so this is a one-time lookup at load time.
     // -1 = outside all cells (always rendered to avoid popping).
-    std::vector<int32_t> objCellIDs;
+    // mission.objCellIDs populated below
     if (showObjects) {
-        objCellIDs.resize(objData.objects.size());
-        for (size_t i = 0; i < objData.objects.size(); ++i) {
-            const auto &obj = objData.objects[i];
+        mission.objCellIDs.resize(mission.objData.objects.size());
+        for (size_t i = 0; i < mission.objData.objects.size(); ++i) {
+            const auto &obj = mission.objData.objects[i];
             if (obj.hasPosition) {
-                objCellIDs[i] = findCameraCell(wrData, obj.x, obj.y, obj.z);
+                mission.objCellIDs[i] = findCameraCell(mission.wrData, obj.x, obj.y, obj.z);
             } else {
-                objCellIDs[i] = -1;
+                mission.objCellIDs[i] = -1;
             }
         }
     }
 
     // Load .bin models from obj.crf (if --res provided and objects enabled)
-    std::unordered_map<std::string, Darkness::ParsedBinMesh> parsedModels;
+    // mission.parsedModels populated below
 
     if (showObjects && !resPath.empty()) {
         Darkness::CRFModelLoader modelLoader(resPath);
         if (modelLoader.isOpen()) {
             int loaded = 0, failed = 0;
-            for (const auto &name : objData.uniqueModels) {
+            for (const auto &name : mission.objData.uniqueModels) {
                 auto binData = modelLoader.loadModel(name);
                 if (binData.empty()) {
                     ++failed;
@@ -1721,7 +1721,7 @@ int main(int argc, char *argv[]) {
                 try {
                     auto mesh = Darkness::parseBinModel(binData.data(), binData.size());
                     if (mesh.valid) {
-                        parsedModels[name] = std::move(mesh);
+                        mission.parsedModels[name] = std::move(mesh);
                         ++loaded;
                     } else {
                         // Log first few failures for debugging
@@ -1746,7 +1746,7 @@ int main(int argc, char *argv[]) {
                 }
             }
             std::fprintf(stderr, "Loaded %d/%zu models from obj.crf (%d failed)\n",
-                         loaded, objData.uniqueModels.size(), failed);
+                         loaded, mission.objData.uniqueModels.size(), failed);
         } else {
             std::fprintf(stderr, "obj.crf not available, using fallback cubes\n");
         }
@@ -1756,7 +1756,7 @@ int main(int argc, char *argv[]) {
 
     // Collect unique MD_MAT_TMAP material names from all parsed models
     std::unordered_set<std::string> objMatNames;
-    for (const auto &kv : parsedModels) {
+    for (const auto &kv : mission.parsedModels) {
         for (const auto &mat : kv.second.materials) {
             if (mat.type == Darkness::MD_MAT_TMAP) {
                 // Lowercase the name for case-insensitive matching
@@ -1771,7 +1771,7 @@ int main(int argc, char *argv[]) {
     // Load object textures from obj.crf (txt16/ and txt/ subdirectories inside it).
     // Dark Engine stores object textures as GIF/PCX files within obj.crf, not in
     // separate txt16.crf/txt.crf archives.
-    std::unordered_map<std::string, Darkness::DecodedImage> objTexImages;
+    // mission.objTexImages populated below
 
     if (!objMatNames.empty() && !resPath.empty()) {
         // Reuse obj.crf for texture lookup (same archive that holds .bin models)
@@ -1783,7 +1783,7 @@ int main(int argc, char *argv[]) {
             auto img = objTexLoader.loadObjectTexture(name);
             // Check if we got a real texture (not the 8x8 fallback checkerboard)
             if (img.width > 8 || img.height > 8) {
-                objTexImages[name] = std::move(img);
+                mission.objTexImages[name] = std::move(img);
                 ++loaded;
             }
         }
@@ -1793,8 +1793,11 @@ int main(int argc, char *argv[]) {
 
     // ── SDL2 + bgfx init ──
 
+    Darkness::GPUResources gpu;
+    Darkness::BuiltMeshes meshes;
+
     uint32_t skyClearColor;
-    SDL_Window *window = initWindow(fogParams, skyClearColor);
+    SDL_Window *window = initWindow(mission.fogParams, skyClearColor);
     if (!window) return 1;
 
     // ── Shaders ──
@@ -1802,57 +1805,55 @@ int main(int argc, char *argv[]) {
     bgfx::RendererType::Enum rendererType = bgfx::getRendererType();
 
     // Flat-color program
-    bgfx::ProgramHandle flatProgram = bgfx::createProgram(
+    gpu.flatProgram = bgfx::createProgram(
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_basic"),
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_basic"),
         true);
 
     // Textured program
-    bgfx::ProgramHandle texturedProgram = bgfx::createProgram(
+    gpu.texturedProgram = bgfx::createProgram(
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_textured"),
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_textured"),
         true);
 
     // Lightmapped program
-    bgfx::ProgramHandle lightmappedProgram = bgfx::createProgram(
+    gpu.lightmappedProgram = bgfx::createProgram(
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_lightmapped"),
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_lightmapped"),
         true);
 
     // Water program: vertex displacement + textured fragment with UV distortion
-    bgfx::ProgramHandle waterProgram = bgfx::createProgram(
+    gpu.waterProgram = bgfx::createProgram(
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_water"),
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_water"),
         true);
 
-    bgfx::UniformHandle s_texColor = bgfx::createUniform("s_texColor", bgfx::UniformType::Sampler);
-    bgfx::UniformHandle s_texLightmap = bgfx::createUniform("s_texLightmap", bgfx::UniformType::Sampler);
-    bgfx::UniformHandle u_waterParams = bgfx::createUniform("u_waterParams", bgfx::UniformType::Vec4);
-    bgfx::UniformHandle u_waterFlow = bgfx::createUniform("u_waterFlow", bgfx::UniformType::Vec4);
-    bgfx::UniformHandle u_fogColor = bgfx::createUniform("u_fogColor", bgfx::UniformType::Vec4);
-    bgfx::UniformHandle u_fogParams = bgfx::createUniform("u_fogParams", bgfx::UniformType::Vec4);
+    gpu.s_texColor = bgfx::createUniform("s_texColor", bgfx::UniformType::Sampler);
+    gpu.s_texLightmap = bgfx::createUniform("s_texLightmap", bgfx::UniformType::Sampler);
+    gpu.u_waterParams = bgfx::createUniform("u_waterParams", bgfx::UniformType::Vec4);
+    gpu.u_waterFlow = bgfx::createUniform("u_waterFlow", bgfx::UniformType::Vec4);
+    gpu.u_fogColor = bgfx::createUniform("u_fogColor", bgfx::UniformType::Vec4);
+    gpu.u_fogParams = bgfx::createUniform("u_fogParams", bgfx::UniformType::Vec4);
     // Per-object params: x = alpha (1.0 = opaque, < 1.0 = translucent via RenderAlpha property)
-    bgfx::UniformHandle u_objectParams = bgfx::createUniform("u_objectParams", bgfx::UniformType::Vec4);
+    gpu.u_objectParams = bgfx::createUniform("u_objectParams", bgfx::UniformType::Vec4);
 
     // ── Build lightmap atlas (if textured mode) ──
 
     bool lightmappedMode = false;
-    Darkness::LightmapAtlasSet lmAtlasSet;
-    std::vector<bgfx::TextureHandle> lightmapAtlasHandles;
 
-    if (texturedMode) {
-        lmAtlasSet = Darkness::buildLightmapAtlases(wrData, lmScale);
-        if (!lmAtlasSet.atlases.empty()) {
+    if (mission.texturedMode) {
+        gpu.lmAtlasSet = Darkness::buildLightmapAtlases(mission.wrData, lmScale);
+        if (!gpu.lmAtlasSet.atlases.empty()) {
             lightmappedMode = true;
 
             // Initial blend pass: apply animated overlays at initial intensities.
             // buildLightmapAtlases() only wrote static lightmaps into the atlas.
             // We must blend in overlay contributions so lights at max brightness
             // (mode 4, the default) have correct initial appearance.
-            if (!animLightIndex.empty()) {
+            if (!mission.animLightIndex.empty()) {
                 // Compute initial intensities for all lights
                 std::unordered_map<int16_t, float> initIntensities;
-                for (const auto &[lightNum, light] : lightSources) {
+                for (const auto &[lightNum, light] : mission.lightSources) {
                     initIntensities[lightNum] = (light.maxBright > 0.0f)
                         ? light.brightness / light.maxBright : 0.0f;
                 }
@@ -1862,15 +1863,15 @@ int main(int argc, char *argv[]) {
                 // overlays at once, so we only need to call it once per polygon.
                 std::unordered_set<uint64_t> blendedSet;
                 int blendedPolys = 0;
-                for (const auto &[lightNum, polys] : animLightIndex) {
+                for (const auto &[lightNum, polys] : mission.animLightIndex) {
                     for (const auto &[ci, pi] : polys) {
                         uint64_t key = (static_cast<uint64_t>(ci) << 32)
                                       | static_cast<uint32_t>(pi);
                         if (!blendedSet.insert(key).second) continue;
 
                         Darkness::blendAnimatedLightmap(
-                            lmAtlasSet.atlases[0], wrData, ci, pi,
-                            lmAtlasSet.entries[ci][pi],
+                            gpu.lmAtlasSet.atlases[0], mission.wrData, ci, pi,
+                            gpu.lmAtlasSet.entries[ci][pi],
                             initIntensities, lmScale);
                         ++blendedPolys;
                     }
@@ -1879,7 +1880,7 @@ int main(int argc, char *argv[]) {
                              blendedPolys);
             }
 
-            for (const auto &atlas : lmAtlasSet.atlases) {
+            for (const auto &atlas : gpu.lmAtlasSet.atlases) {
                 // Create texture WITHOUT initial data so it stays mutable —
                 // bgfx treats textures with initial mem as immutable.
                 // We upload via updateTexture2D immediately after creation.
@@ -1898,37 +1899,26 @@ int main(int argc, char *argv[]) {
                 bgfx::updateTexture2D(th, 0, 0, 0, 0,
                     static_cast<uint16_t>(atlas.size),
                     static_cast<uint16_t>(atlas.size), mem);
-                lightmapAtlasHandles.push_back(th);
+                gpu.lightmapAtlasHandles.push_back(th);
             }
             std::fprintf(stderr, "Created %zu lightmap atlas GPU texture(s)\n",
-                         lightmapAtlasHandles.size());
+                         gpu.lightmapAtlasHandles.size());
         }
     }
 
     // ── Build geometry and create GPU buffers ──
 
     float camX, camY, camZ;
-    bgfx::VertexBufferHandle vbh;
-    bgfx::IndexBufferHandle ibh;
-
-    LightmappedMesh lmMesh;
-    WorldMesh worldMesh;
-    FlatMesh flatMesh;
-
-    // Create bgfx texture handles
-    std::unordered_map<uint8_t, bgfx::TextureHandle> textureHandles;
-    // Flow water textures keyed by flow group index (loaded from fam.crf by name)
-    std::unordered_map<uint8_t, bgfx::TextureHandle> flowTextureHandles;
 
     if (lightmappedMode) {
-        lmMesh = buildLightmappedMesh(wrData, texDims, lmAtlasSet);
-        camX = lmMesh.cx; camY = lmMesh.cy; camZ = lmMesh.cz;
+        meshes.lmMesh = buildLightmappedMesh(mission.wrData, mission.texDims, gpu.lmAtlasSet);
+        camX = meshes.lmMesh.cx; camY = meshes.lmMesh.cy; camZ = meshes.lmMesh.cz;
 
         std::fprintf(stderr, "Geometry (lightmapped): %zu vertices, %zu indices (%zu triangles), %zu texture groups\n",
-                     lmMesh.vertices.size(), lmMesh.indices.size(),
-                     lmMesh.indices.size() / 3, lmMesh.groups.size());
+                     meshes.lmMesh.vertices.size(), meshes.lmMesh.indices.size(),
+                     meshes.lmMesh.indices.size() / 3, meshes.lmMesh.groups.size());
 
-        if (lmMesh.vertices.empty()) {
+        if (meshes.lmMesh.vertices.empty()) {
             std::fprintf(stderr, "No geometry to render\n");
             bgfx::shutdown();
             SDL_DestroyWindow(window);
@@ -1937,52 +1927,52 @@ int main(int argc, char *argv[]) {
         }
 
         const bgfx::Memory *vbMem = bgfx::copy(
-            lmMesh.vertices.data(),
-            static_cast<uint32_t>(lmMesh.vertices.size() * sizeof(PosUV2Vertex))
+            meshes.lmMesh.vertices.data(),
+            static_cast<uint32_t>(meshes.lmMesh.vertices.size() * sizeof(PosUV2Vertex))
         );
-        vbh = bgfx::createVertexBuffer(vbMem, PosUV2Vertex::layout);
+        gpu.vbh = bgfx::createVertexBuffer(vbMem, PosUV2Vertex::layout);
 
         const bgfx::Memory *ibMem = bgfx::copy(
-            lmMesh.indices.data(),
-            static_cast<uint32_t>(lmMesh.indices.size() * sizeof(uint32_t))
+            meshes.lmMesh.indices.data(),
+            static_cast<uint32_t>(meshes.lmMesh.indices.size() * sizeof(uint32_t))
         );
-        ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
+        gpu.ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
 
         // Create bgfx textures with full mip chains from loaded images
-        for (auto &kv : loadedTextures) {
+        for (auto &kv : mission.loadedTextures) {
             uint8_t idx = kv.first;
             const auto &img = kv.second;
-            textureHandles[idx] = createMipmappedTexture(
+            gpu.textureHandles[idx] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
                 | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
                 MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
-        std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", textureHandles.size());
+        std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", gpu.textureHandles.size());
 
         // Create GPU textures for flow group water textures (loaded by name)
         // Water textures are fully opaque (alpha blending via vertex color),
         // so use ALPHA_BLEND (no coverage preservation needed).
-        for (auto &kv : flowLoadedTextures) {
+        for (auto &kv : mission.flowLoadedTextures) {
             uint8_t fg = kv.first;
             const auto &img = kv.second;
-            flowTextureHandles[fg] = createMipmappedTexture(
+            gpu.flowTextureHandles[fg] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
                 MipAlphaMode::ALPHA_BLEND, linearMips, sharpMips);
         }
-        if (!flowTextureHandles.empty()) {
-            std::fprintf(stderr, "Created %zu flow water GPU textures\n", flowTextureHandles.size());
+        if (!gpu.flowTextureHandles.empty()) {
+            std::fprintf(stderr, "Created %zu flow water GPU textures\n", gpu.flowTextureHandles.size());
         }
-    } else if (texturedMode) {
-        worldMesh = buildTexturedMesh(wrData, texDims);
-        camX = worldMesh.cx; camY = worldMesh.cy; camZ = worldMesh.cz;
+    } else if (mission.texturedMode) {
+        meshes.worldMesh = buildTexturedMesh(mission.wrData, mission.texDims);
+        camX = meshes.worldMesh.cx; camY = meshes.worldMesh.cy; camZ = meshes.worldMesh.cz;
 
         std::fprintf(stderr, "Geometry (textured): %zu vertices, %zu indices (%zu triangles), %zu texture groups\n",
-                     worldMesh.vertices.size(), worldMesh.indices.size(),
-                     worldMesh.indices.size() / 3, worldMesh.groups.size());
+                     meshes.worldMesh.vertices.size(), meshes.worldMesh.indices.size(),
+                     meshes.worldMesh.indices.size() / 3, meshes.worldMesh.groups.size());
 
-        if (worldMesh.vertices.empty()) {
+        if (meshes.worldMesh.vertices.empty()) {
             std::fprintf(stderr, "No geometry to render\n");
             bgfx::shutdown();
             SDL_DestroyWindow(window);
@@ -1991,36 +1981,36 @@ int main(int argc, char *argv[]) {
         }
 
         const bgfx::Memory *vbMem = bgfx::copy(
-            worldMesh.vertices.data(),
-            static_cast<uint32_t>(worldMesh.vertices.size() * sizeof(PosColorUVVertex))
+            meshes.worldMesh.vertices.data(),
+            static_cast<uint32_t>(meshes.worldMesh.vertices.size() * sizeof(PosColorUVVertex))
         );
-        vbh = bgfx::createVertexBuffer(vbMem, PosColorUVVertex::layout);
+        gpu.vbh = bgfx::createVertexBuffer(vbMem, PosColorUVVertex::layout);
 
         const bgfx::Memory *ibMem = bgfx::copy(
-            worldMesh.indices.data(),
-            static_cast<uint32_t>(worldMesh.indices.size() * sizeof(uint32_t))
+            meshes.worldMesh.indices.data(),
+            static_cast<uint32_t>(meshes.worldMesh.indices.size() * sizeof(uint32_t))
         );
-        ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
+        gpu.ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
 
-        for (auto &kv : loadedTextures) {
+        for (auto &kv : mission.loadedTextures) {
             uint8_t idx = kv.first;
             const auto &img = kv.second;
-            textureHandles[idx] = createMipmappedTexture(
+            gpu.textureHandles[idx] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
                 | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
                 MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
-        std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", textureHandles.size());
+        std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", gpu.textureHandles.size());
     } else {
-        flatMesh = buildFlatMesh(wrData);
-        camX = flatMesh.cx; camY = flatMesh.cy; camZ = flatMesh.cz;
+        meshes.flatMesh = buildFlatMesh(mission.wrData);
+        camX = meshes.flatMesh.cx; camY = meshes.flatMesh.cy; camZ = meshes.flatMesh.cz;
 
         std::fprintf(stderr, "Geometry (flat): %zu vertices, %zu indices (%zu triangles)\n",
-                     flatMesh.vertices.size(), flatMesh.indices.size(),
-                     flatMesh.indices.size() / 3);
+                     meshes.flatMesh.vertices.size(), meshes.flatMesh.indices.size(),
+                     meshes.flatMesh.indices.size() / 3);
 
-        if (flatMesh.vertices.empty()) {
+        if (meshes.flatMesh.vertices.empty()) {
             std::fprintf(stderr, "No geometry to render\n");
             bgfx::shutdown();
             SDL_DestroyWindow(window);
@@ -2029,47 +2019,36 @@ int main(int argc, char *argv[]) {
         }
 
         const bgfx::Memory *vbMem = bgfx::copy(
-            flatMesh.vertices.data(),
-            static_cast<uint32_t>(flatMesh.vertices.size() * sizeof(PosColorVertex))
+            meshes.flatMesh.vertices.data(),
+            static_cast<uint32_t>(meshes.flatMesh.vertices.size() * sizeof(PosColorVertex))
         );
-        vbh = bgfx::createVertexBuffer(vbMem, PosColorVertex::layout);
+        gpu.vbh = bgfx::createVertexBuffer(vbMem, PosColorVertex::layout);
 
         const bgfx::Memory *ibMem = bgfx::copy(
-            flatMesh.indices.data(),
-            static_cast<uint32_t>(flatMesh.indices.size() * sizeof(uint32_t))
+            meshes.flatMesh.indices.data(),
+            static_cast<uint32_t>(meshes.flatMesh.indices.size() * sizeof(uint32_t))
         );
-        ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
+        gpu.ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
     }
 
     // ── Build water surface mesh from portal polygons ──
-    WorldMesh waterMesh = buildWaterMesh(wrData, texDims, flowData, flowTexDims);
-    bgfx::VertexBufferHandle waterVBH = BGFX_INVALID_HANDLE;
-    bgfx::IndexBufferHandle waterIBH = BGFX_INVALID_HANDLE;
-    bool hasWater = !waterMesh.vertices.empty();
+    meshes.waterMesh = buildWaterMesh(mission.wrData, mission.texDims, mission.flowData, mission.flowTexDims);
+    bool hasWater = !meshes.waterMesh.vertices.empty();
 
     if (hasWater) {
-        waterVBH = bgfx::createVertexBuffer(
-            bgfx::copy(waterMesh.vertices.data(),
-                        static_cast<uint32_t>(waterMesh.vertices.size() * sizeof(PosColorUVVertex))),
+        gpu.waterVBH = bgfx::createVertexBuffer(
+            bgfx::copy(meshes.waterMesh.vertices.data(),
+                        static_cast<uint32_t>(meshes.waterMesh.vertices.size() * sizeof(PosColorUVVertex))),
             PosColorUVVertex::layout);
-        waterIBH = bgfx::createIndexBuffer(
-            bgfx::copy(waterMesh.indices.data(),
-                        static_cast<uint32_t>(waterMesh.indices.size() * sizeof(uint32_t))),
+        gpu.waterIBH = bgfx::createIndexBuffer(
+            bgfx::copy(meshes.waterMesh.indices.data(),
+                        static_cast<uint32_t>(meshes.waterMesh.indices.size() * sizeof(uint32_t))),
             BGFX_BUFFER_INDEX32);
     }
 
     // ── Create GPU buffers for object meshes ──
 
-    // Per-unique-model GPU buffers (PosColorUVVertex for textured rendering)
-    std::unordered_map<std::string, ObjectModelGPU> objModelGPU;
-
-    // Object texture GPU handles (keyed by lowercase material name)
-    std::unordered_map<std::string, bgfx::TextureHandle> objTextureHandles;
-
-    // Fallback cube: a single shared VBH/IBH for models not found in obj.crf
-    bgfx::VertexBufferHandle fallbackCubeVBH = BGFX_INVALID_HANDLE;
-    bgfx::IndexBufferHandle fallbackCubeIBH = BGFX_INVALID_HANDLE;
-    uint32_t fallbackCubeIndexCount = 0;
+    // gpu.objModelGPU, gpu.objTextureHandles, gpu.fallbackCube* populated below
 
     if (showObjects) {
         // Build fallback cube
@@ -2077,33 +2056,33 @@ int main(int argc, char *argv[]) {
             std::vector<PosColorVertex> cubeVerts;
             std::vector<uint32_t> cubeIndices;
             buildFallbackCube(cubeVerts, cubeIndices, 0xff808080u);
-            fallbackCubeIndexCount = static_cast<uint32_t>(cubeIndices.size());
-            fallbackCubeVBH = bgfx::createVertexBuffer(
+            gpu.fallbackCubeIndexCount = static_cast<uint32_t>(cubeIndices.size());
+            gpu.fallbackCubeVBH = bgfx::createVertexBuffer(
                 bgfx::copy(cubeVerts.data(),
                     static_cast<uint32_t>(cubeVerts.size() * sizeof(PosColorVertex))),
                 PosColorVertex::layout);
-            fallbackCubeIBH = bgfx::createIndexBuffer(
+            gpu.fallbackCubeIBH = bgfx::createIndexBuffer(
                 bgfx::copy(cubeIndices.data(),
                     static_cast<uint32_t>(cubeIndices.size() * sizeof(uint32_t))),
                 BGFX_BUFFER_INDEX32);
         }
 
         // Create bgfx texture handles with mip chains from loaded object texture images
-        for (auto &kv : objTexImages) {
+        for (auto &kv : mission.objTexImages) {
             const auto &img = kv.second;
-            objTextureHandles[kv.first] = createMipmappedTexture(
+            gpu.objTextureHandles[kv.first] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
                 | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
                 MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
-        if (!objTextureHandles.empty()) {
+        if (!gpu.objTextureHandles.empty()) {
             std::fprintf(stderr, "Created %zu object texture GPU handles\n",
-                         objTextureHandles.size());
+                         gpu.objTextureHandles.size());
         }
 
         // Create GPU buffers for each parsed .bin model
-        for (auto &kv : parsedModels) {
+        for (auto &kv : mission.parsedModels) {
             const std::string &name = kv.first;
             const Darkness::ParsedBinMesh &mesh = kv.second;
 
@@ -2135,7 +2114,7 @@ int main(int argc, char *argv[]) {
                     std::string lname(mesh.materials[mi].name);
                     std::transform(lname.begin(), lname.end(), lname.begin(),
                                    [](unsigned char c) { return std::tolower(c); });
-                    if (objTexImages.count(lname)) {
+                    if (mission.objTexImages.count(lname)) {
                         loadedMatIndices.insert(mi);
                     }
                 }
@@ -2181,12 +2160,12 @@ int main(int argc, char *argv[]) {
                 };
             }
 
-            ObjectModelGPU gpu;
-            gpu.vbh = bgfx::createVertexBuffer(
+            ObjectModelGPU objGPUEntry;
+            objGPUEntry.vbh = bgfx::createVertexBuffer(
                 bgfx::copy(gpuVerts.data(),
                     static_cast<uint32_t>(gpuVerts.size() * sizeof(PosColorUVVertex))),
                 PosColorUVVertex::layout);
-            gpu.ibh = bgfx::createIndexBuffer(
+            objGPUEntry.ibh = bgfx::createIndexBuffer(
                 bgfx::copy(mesh.indices.data(),
                     static_cast<uint32_t>(mesh.indices.size() * sizeof(uint32_t))),
                 BGFX_BUFFER_INDEX32);
@@ -2208,22 +2187,22 @@ int main(int argc, char *argv[]) {
                                    gsm.matName.begin(),
                                    [](unsigned char c) { return std::tolower(c); });
                 }
-                gpu.subMeshes.push_back(gsm);
+                objGPUEntry.subMeshes.push_back(gsm);
             }
 
-            gpu.valid = true;
-            objModelGPU[name] = std::move(gpu);
+            objGPUEntry.valid = true;
+            gpu.objModelGPU[name] = std::move(objGPUEntry);
         }
         std::fprintf(stderr, "Object GPU buffers: %zu models + fallback cube\n",
-                     objModelGPU.size());
+                     gpu.objModelGPU.size());
 
         // Count translucent objects/materials for diagnostics
         int translucentObjCount = 0;
         int translucentMatCount = 0;
-        for (const auto &obj : objData.objects) {
+        for (const auto &obj : mission.objData.objects) {
             if (obj.renderAlpha < 1.0f) ++translucentObjCount;
         }
-        for (const auto &kv : objModelGPU) {
+        for (const auto &kv : gpu.objModelGPU) {
             if (!kv.second.valid) continue;
             for (const auto &sm : kv.second.subMeshes) {
                 if (sm.matTrans > 0.0f) ++translucentMatCount;
@@ -2246,14 +2225,14 @@ int main(int argc, char *argv[]) {
 
     if (showObjects) {
         // Count instances per model name
-        for (const auto &obj : objData.objects) {
+        for (const auto &obj : mission.objData.objects) {
             if (!obj.hasPosition) continue;
             std::string mn(obj.modelName);
             modelInstanceCounts[mn]++;
         }
 
         // Build sorted list of models that have GPU data (loaded successfully)
-        for (const auto &kv : objModelGPU) {
+        for (const auto &kv : gpu.objModelGPU) {
             if (kv.second.valid)
                 sortedModelNames.push_back(kv.first);
         }
@@ -2262,7 +2241,7 @@ int main(int argc, char *argv[]) {
         // Count unloaded models (fallback cube candidates)
         int unloadedCount = 0;
         for (const auto &kv : modelInstanceCounts) {
-            if (objModelGPU.find(kv.first) == objModelGPU.end() || !objModelGPU[kv.first].valid)
+            if (gpu.objModelGPU.find(kv.first) == gpu.objModelGPU.end() || !gpu.objModelGPU[kv.first].valid)
                 ++unloadedCount;
         }
         std::fprintf(stderr, "Model isolation: %zu loaded, %d unloaded (M=next, N=prev)\n",
@@ -2271,53 +2250,48 @@ int main(int argc, char *argv[]) {
 
 
     // ── Create sky dome GPU buffers ──
-    bgfx::VertexBufferHandle skyVBH = BGFX_INVALID_HANDLE;
-    bgfx::IndexBufferHandle skyIBH = BGFX_INVALID_HANDLE;
-    uint32_t skyIndexCount = 0;
+    // gpu.skyVBH, gpu.skyIBH, gpu.skyIndexCount populated below
 
-    if (!skyDome.vertices.empty()) {
-        skyVBH = bgfx::createVertexBuffer(
-            bgfx::copy(skyDome.vertices.data(),
-                static_cast<uint32_t>(skyDome.vertices.size() * sizeof(PosColorVertex))),
+    if (!mission.skyDome.vertices.empty()) {
+        gpu.skyVBH = bgfx::createVertexBuffer(
+            bgfx::copy(mission.skyDome.vertices.data(),
+                static_cast<uint32_t>(mission.skyDome.vertices.size() * sizeof(PosColorVertex))),
             PosColorVertex::layout);
-        skyIBH = bgfx::createIndexBuffer(
-            bgfx::copy(skyDome.indices.data(),
-                static_cast<uint32_t>(skyDome.indices.size() * sizeof(uint16_t))));
-        skyIndexCount = static_cast<uint32_t>(skyDome.indices.size());
+        gpu.skyIBH = bgfx::createIndexBuffer(
+            bgfx::copy(mission.skyDome.indices.data(),
+                static_cast<uint32_t>(mission.skyDome.indices.size() * sizeof(uint16_t))));
+        gpu.skyIndexCount = static_cast<uint32_t>(mission.skyDome.indices.size());
     }
 
     // ── Create textured skybox GPU buffers (old sky system) ──
-    bgfx::VertexBufferHandle skyboxVBH = BGFX_INVALID_HANDLE;
-    bgfx::IndexBufferHandle skyboxIBH = BGFX_INVALID_HANDLE;
-    SkyboxCube skyboxCube;
-    std::unordered_map<std::string, bgfx::TextureHandle> skyboxTexHandles;
+    // gpu.skybox*, meshes.skyboxCube populated below
 
-    if (hasSkybox) {
-        skyboxCube = buildSkyboxCube();
+    if (mission.hasSkybox) {
+        meshes.skyboxCube = buildSkyboxCube();
 
-        skyboxVBH = bgfx::createVertexBuffer(
-            bgfx::copy(skyboxCube.vertices.data(),
-                static_cast<uint32_t>(skyboxCube.vertices.size() * sizeof(PosColorUVVertex))),
+        gpu.skyboxVBH = bgfx::createVertexBuffer(
+            bgfx::copy(meshes.skyboxCube.vertices.data(),
+                static_cast<uint32_t>(meshes.skyboxCube.vertices.size() * sizeof(PosColorUVVertex))),
             PosColorUVVertex::layout);
-        skyboxIBH = bgfx::createIndexBuffer(
-            bgfx::copy(skyboxCube.indices.data(),
-                static_cast<uint32_t>(skyboxCube.indices.size() * sizeof(uint16_t))));
+        gpu.skyboxIBH = bgfx::createIndexBuffer(
+            bgfx::copy(meshes.skyboxCube.indices.data(),
+                static_cast<uint32_t>(meshes.skyboxCube.indices.size() * sizeof(uint16_t))));
 
         // Create GPU textures with mip chains for each loaded skybox face
         // Skybox faces are fully opaque so use ALPHA_BLEND (no coverage preservation)
-        for (auto &kv : skyboxImages) {
+        for (auto &kv : mission.skyboxImages) {
             const auto &img = kv.second;
-            skyboxTexHandles[kv.first] = createMipmappedTexture(
+            gpu.skyboxTexHandles[kv.first] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
                 MipAlphaMode::ALPHA_BLEND, linearMips, sharpMips);
         }
         std::fprintf(stderr, "Skybox GPU: %zu face textures created\n",
-                     skyboxTexHandles.size());
+                     gpu.skyboxTexHandles.size());
     }
 
     const char *modeStr = lightmappedMode ? "lightmapped" :
-                          texturedMode ? "textured" : "flat-shaded";
+                          mission.texturedMode ? "textured" : "flat-shaded";
     std::fprintf(stderr, "Render window opened (%dx%d, %s, %s)\n",
                  WINDOW_WIDTH, WINDOW_HEIGHT,
                  bgfx::getRendererName(rendererType), modeStr);
@@ -2327,11 +2301,11 @@ int main(int argc, char *argv[]) {
     // Use spawn point if found, otherwise fall back to centroid
     float spawnX = camX, spawnY = camY, spawnZ = camZ;
     float spawnYaw = 0.0f;
-    if (spawnInfo.found) {
-        spawnX = spawnInfo.x;
-        spawnY = spawnInfo.y;
-        spawnZ = spawnInfo.z;
-        spawnYaw = spawnInfo.yaw;
+    if (mission.spawnInfo.found) {
+        spawnX = mission.spawnInfo.x;
+        spawnY = mission.spawnInfo.y;
+        spawnZ = mission.spawnInfo.z;
+        spawnYaw = mission.spawnInfo.yaw;
         std::fprintf(stderr, "Camera at spawn (%.1f, %.1f, %.1f)\n",
                      spawnX, spawnY, spawnZ);
     } else {
@@ -2352,7 +2326,7 @@ int main(int argc, char *argv[]) {
 
     // Portal culling stats for title bar display
     uint32_t cullVisibleCells = 0;  // updated each frame when culling is on
-    uint32_t cullTotalCells = wrData.numCells;
+    uint32_t cullTotalCells = mission.wrData.numCells;
 
     // Helper to update window title with current speed, culling, and filter stats
     auto updateTitle = [&]() {
@@ -2454,64 +2428,64 @@ int main(int argc, char *argv[]) {
                      sortedModelNames, modelInstanceCounts,
                      dbgConsole, updateTitle);
 
-        updateMovement(dt, cam, moveSpeed, cameraCollision, wrData, dbgConsole);
+        updateMovement(dt, cam, moveSpeed, cameraCollision, mission.wrData, dbgConsole);
 
         updateLightmaps(dt, lightmappedMode,
-                        lightSources, animLightIndex,
-                        lmAtlasSet, lightmapAtlasHandles,
-                        wrData, lmScale);
+                        mission.lightSources, mission.animLightIndex,
+                        gpu.lmAtlasSet, gpu.lightmapAtlasHandles,
+                        mission.wrData, lmScale);
 
         // ── Prepare frame: matrices, fog, samplers, culling ──
         auto fc = prepareFrame(cam, filterMode,
                                portalCulling, skyClearColor,
-                               wrData, cellPortals,
-                               fogParams, skyParams,
+                               mission.wrData, mission.cellPortals,
+                               mission.fogParams, mission.skyParams,
                                cullVisibleCells);
         updateTitle();
 
         // ── View 0: Sky pass ──
-        renderSky(cam, fc.proj, hasSkybox,
-                  skyboxVBH, skyboxIBH, skyboxCube, skyboxTexHandles,
-                  skyVBH, skyIBH, flatProgram, texturedProgram,
-                  s_texColor, u_fogColor, u_fogParams, u_objectParams,
+        renderSky(cam, fc.proj, mission.hasSkybox,
+                  gpu.skyboxVBH, gpu.skyboxIBH, meshes.skyboxCube, gpu.skyboxTexHandles,
+                  gpu.skyVBH, gpu.skyIBH, gpu.flatProgram, gpu.texturedProgram,
+                  gpu.s_texColor, gpu.u_fogColor, gpu.u_fogParams, gpu.u_objectParams,
                   fc.fogColorArr, fc.skyFogArr, fc.skySampler);
 
         // ── View 1: World geometry ──
-        renderWorld(lightmappedMode, texturedMode,
+        renderWorld(lightmappedMode, mission.texturedMode,
                     portalCulling, fc.visibleCells,
-                    lmMesh, worldMesh, flatMesh,
-                    vbh, ibh, flatProgram, texturedProgram, lightmappedProgram,
-                    s_texColor, s_texLightmap,
-                    u_fogColor, u_fogParams, u_objectParams,
+                    meshes.lmMesh, meshes.worldMesh, meshes.flatMesh,
+                    gpu.vbh, gpu.ibh, gpu.flatProgram, gpu.texturedProgram, gpu.lightmappedProgram,
+                    gpu.s_texColor, gpu.s_texLightmap,
+                    gpu.u_fogColor, gpu.u_fogParams, gpu.u_objectParams,
                     fc.fogColorArr, fc.fogOnArr,
-                    textureHandles, lightmapAtlasHandles,
+                    gpu.textureHandles, gpu.lightmapAtlasHandles,
                     fc.texSampler, fc.renderState);
 
         // ── Object meshes ──
         renderObjects(showObjects, showFallbackCubes,
                       portalCulling, fc.visibleCells,
                       isolateModelIdx, sortedModelNames,
-                      objData, objCellIDs,
-                      objModelGPU, objTextureHandles,
-                      fallbackCubeVBH, fallbackCubeIBH,
-                      flatProgram, texturedProgram,
-                      s_texColor, u_fogColor, u_fogParams, u_objectParams,
+                      mission.objData, mission.objCellIDs,
+                      gpu.objModelGPU, gpu.objTextureHandles,
+                      gpu.fallbackCubeVBH, gpu.fallbackCubeIBH,
+                      gpu.flatProgram, gpu.texturedProgram,
+                      gpu.s_texColor, gpu.u_fogColor, gpu.u_fogParams, gpu.u_objectParams,
                       fc.fogColorArr, fc.fogOnArr,
                       fc.texSampler, fc.renderState);
 
         // ── Water surfaces ──
-        renderWater(hasWater, waterMesh, waterVBH, waterIBH,
-                    flatProgram, waterProgram,
-                    s_texColor, u_fogColor, u_fogParams, u_objectParams,
-                    u_waterParams, u_waterFlow,
+        renderWater(hasWater, meshes.waterMesh, gpu.waterVBH, gpu.waterIBH,
+                    gpu.flatProgram, gpu.waterProgram,
+                    gpu.s_texColor, gpu.u_fogColor, gpu.u_fogParams, gpu.u_objectParams,
+                    gpu.u_waterParams, gpu.u_waterFlow,
                     fc.fogColorArr, fc.fogOnArr,
-                    textureHandles, flowTextureHandles, fc.texSampler,
+                    gpu.textureHandles, gpu.flowTextureHandles, fc.texSampler,
                     waterElapsed, waterScrollSpeed,
                     waveAmplitude, uvDistortion, waterRotation);
 
         // ── Debug raycast visualization (view 2) ──
-        renderDebugOverlay(showRaycast, cam, fc.view, fc.proj, wrData, txList,
-                           flatProgram, u_fogColor, u_fogParams, u_objectParams,
+        renderDebugOverlay(showRaycast, cam, fc.view, fc.proj, mission.wrData, mission.txList,
+                           gpu.flatProgram, gpu.u_fogColor, gpu.u_fogParams, gpu.u_objectParams,
                            fc.fogColorArr, fc.fogOnArr);
 
         // Debug console overlay (no-op when closed)
@@ -2521,13 +2495,13 @@ int main(int argc, char *argv[]) {
     }
 
     destroyGPUResources(
-        vbh, ibh, flatProgram, texturedProgram, lightmappedProgram, waterProgram,
-        s_texColor, s_texLightmap, u_waterParams, u_waterFlow,
-        u_fogColor, u_fogParams, u_objectParams,
-        textureHandles, flowTextureHandles, lightmapAtlasHandles,
-        waterVBH, waterIBH, skyboxVBH, skyboxIBH, skyboxTexHandles,
-        skyVBH, skyIBH, objModelGPU, objTextureHandles,
-        fallbackCubeVBH, fallbackCubeIBH);
+        gpu.vbh, gpu.ibh, gpu.flatProgram, gpu.texturedProgram, gpu.lightmappedProgram, gpu.waterProgram,
+        gpu.s_texColor, gpu.s_texLightmap, gpu.u_waterParams, gpu.u_waterFlow,
+        gpu.u_fogColor, gpu.u_fogParams, gpu.u_objectParams,
+        gpu.textureHandles, gpu.flowTextureHandles, gpu.lightmapAtlasHandles,
+        gpu.waterVBH, gpu.waterIBH, gpu.skyboxVBH, gpu.skyboxIBH, gpu.skyboxTexHandles,
+        gpu.skyVBH, gpu.skyIBH, gpu.objModelGPU, gpu.objTextureHandles,
+        gpu.fallbackCubeVBH, gpu.fallbackCubeIBH);
     shutdownWindow(window);
 
     std::fprintf(stderr, "Clean shutdown.\n");
