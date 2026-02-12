@@ -117,13 +117,14 @@ struct BuiltMeshes {
 // cleanup can destroy everything in one pass.
 
 struct GPUResources {
-    // Shader programs (4)
-    bgfx::ProgramHandle flatProgram        = BGFX_INVALID_HANDLE;
-    bgfx::ProgramHandle texturedProgram    = BGFX_INVALID_HANDLE;
-    bgfx::ProgramHandle lightmappedProgram = BGFX_INVALID_HANDLE;
-    bgfx::ProgramHandle waterProgram       = BGFX_INVALID_HANDLE;
+    // Shader programs (5)
+    bgfx::ProgramHandle flatProgram                = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle texturedProgram            = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle lightmappedProgram         = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle lightmappedBicubicProgram  = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle waterProgram               = BGFX_INVALID_HANDLE;
 
-    // Uniforms (7)
+    // Uniforms (8)
     bgfx::UniformHandle s_texColor     = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle s_texLightmap  = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_waterParams  = BGFX_INVALID_HANDLE;
@@ -131,6 +132,7 @@ struct GPUResources {
     bgfx::UniformHandle u_fogColor     = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_fogParams    = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_objectParams = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_lmAtlasSize  = BGFX_INVALID_HANDLE;
 
     // World geometry
     bgfx::VertexBufferHandle  vbh = BGFX_INVALID_HANDLE;
@@ -188,6 +190,7 @@ struct RuntimeState {
     bool  portalCulling = true;
     bool  cameraCollision = false;
     int   filterMode = 0;
+    int   lightmapFiltering = 0;  // 0=bilinear (default), 1=bicubic
     float waveAmplitude = 1.0f;
     float uvDistortion = 1.0f;
     float waterRotation = 1.0f;

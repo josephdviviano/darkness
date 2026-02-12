@@ -92,163 +92,6 @@ inline void convertLmPixel(const uint8_t *src, int lightSize,
     }
 }
 
-// ── Bicubic (Catmull-Rom) lightmap upscaling ──
-
-// Catmull-Rom spline weight for sample offset i (-1, 0, 1, 2) at fractional t
-inline float catmullRomWeight(float t, int i) {
-    // Standard Catmull-Rom with tau = 0.5
-    switch (i) {
-        case -1: return 0.5f * (-t + 2.0f * t * t - t * t * t);
-        case  0: return 0.5f * (2.0f - 5.0f * t * t + 3.0f * t * t * t);
-        case  1: return 0.5f * (t + 4.0f * t * t - 3.0f * t * t * t);
-        case  2: return 0.5f * (-t * t + t * t * t);
-        default: return 0.0f;
-    }
-}
-
-// Sample a float RGB image at fractional (fx, fy) with bicubic interpolation.
-// Clamps at edges (no wrapping — individual lightmaps, not tiled textures).
-inline void sampleBicubic(const std::vector<float> &img, int w, int h,
-                          float fx, float fy, float &r, float &g, float &b) {
-    int ix = static_cast<int>(std::floor(fx));
-    int iy = static_cast<int>(std::floor(fy));
-    float fracX = fx - static_cast<float>(ix);
-    float fracY = fy - static_cast<float>(iy);
-
-    r = g = b = 0.0f;
-
-    for (int jj = -1; jj <= 2; ++jj) {
-        float wy = catmullRomWeight(fracY, jj);
-        int sy = std::max(0, std::min(h - 1, iy + jj));
-
-        for (int ii = -1; ii <= 2; ++ii) {
-            float wx = catmullRomWeight(fracX, ii);
-            int sx = std::max(0, std::min(w - 1, ix + ii));
-
-            int off = (sy * w + sx) * 3;
-            float weight = wx * wy;
-            r += img[off + 0] * weight;
-            g += img[off + 1] * weight;
-            b += img[off + 2] * weight;
-        }
-    }
-}
-
-// In-place separable Gaussian blur on a float RGB image.
-// Radius is the half-width of the kernel; sigma = radius / 2.
-// Clamps at edges.
-inline void gaussianBlur(std::vector<float> &img, int w, int h, int radius) {
-    if (radius < 1) return;
-
-    float sigma = static_cast<float>(radius) / 2.0f;
-    float invSigma2 = 1.0f / (2.0f * sigma * sigma);
-
-    // Build 1D kernel
-    int kernelSize = radius * 2 + 1;
-    std::vector<float> kernel(kernelSize);
-    float sum = 0.0f;
-    for (int i = 0; i < kernelSize; ++i) {
-        float d = static_cast<float>(i - radius);
-        kernel[i] = std::exp(-d * d * invSigma2);
-        sum += kernel[i];
-    }
-    for (int i = 0; i < kernelSize; ++i)
-        kernel[i] /= sum;
-
-    // Horizontal pass
-    std::vector<float> tmp(w * h * 3);
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            float r = 0, g = 0, b = 0;
-            for (int k = -radius; k <= radius; ++k) {
-                int sx = std::max(0, std::min(w - 1, x + k));
-                int off = (y * w + sx) * 3;
-                float wt = kernel[k + radius];
-                r += img[off + 0] * wt;
-                g += img[off + 1] * wt;
-                b += img[off + 2] * wt;
-            }
-            int off = (y * w + x) * 3;
-            tmp[off + 0] = r;
-            tmp[off + 1] = g;
-            tmp[off + 2] = b;
-        }
-    }
-
-    // Vertical pass
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            float r = 0, g = 0, b = 0;
-            for (int k = -radius; k <= radius; ++k) {
-                int sy = std::max(0, std::min(h - 1, y + k));
-                int off = (sy * w + x) * 3;
-                float wt = kernel[k + radius];
-                r += tmp[off + 0] * wt;
-                g += tmp[off + 1] * wt;
-                b += tmp[off + 2] * wt;
-            }
-            int off = (y * w + x) * 3;
-            img[off + 0] = r;
-            img[off + 1] = g;
-            img[off + 2] = b;
-        }
-    }
-}
-
-// Upscale a raw lightmap by the given integer factor using bicubic interpolation
-// followed by a Gaussian blur pass for aggressive smoothing.
-// src: raw lightmap bytes (lx * ly pixels, lightSize bytes/pixel)
-// Returns RGBA8 image of size (lx*scale) x (ly*scale).
-inline std::vector<uint8_t> upscaleLightmap(
-    const uint8_t *src, int lx, int ly, int lightSize, int scale)
-{
-    // Convert source to float RGB (0.0 - 1.0)
-    std::vector<float> fimg(lx * ly * 3);
-    for (int i = 0; i < lx * ly; ++i) {
-        uint8_t r, g, b;
-        convertLmPixel(&src[i * lightSize], lightSize, r, g, b);
-        fimg[i * 3 + 0] = r / 255.0f;
-        fimg[i * 3 + 1] = g / 255.0f;
-        fimg[i * 3 + 2] = b / 255.0f;
-    }
-
-    int outW = lx * scale;
-    int outH = ly * scale;
-
-    // Bicubic upscale into float buffer
-    std::vector<float> upscaled(outW * outH * 3);
-    for (int oy = 0; oy < outH; ++oy) {
-        for (int ox = 0; ox < outW; ++ox) {
-            float srcX = (static_cast<float>(ox) + 0.5f) / static_cast<float>(scale) - 0.5f;
-            float srcY = (static_cast<float>(oy) + 0.5f) / static_cast<float>(scale) - 0.5f;
-
-            float r, g, b;
-            sampleBicubic(fimg, lx, ly, srcX, srcY, r, g, b);
-
-            int off = (oy * outW + ox) * 3;
-            upscaled[off + 0] = r;
-            upscaled[off + 1] = g;
-            upscaled[off + 2] = b;
-        }
-    }
-
-    // Gaussian blur — radius proportional to scale for aggressive smoothing.
-    // This spreads lighting beyond the original sample points.
-    int blurRadius = scale * 2;
-    gaussianBlur(upscaled, outW, outH, blurRadius);
-
-    // Convert to RGBA8
-    std::vector<uint8_t> out(outW * outH * 4);
-    for (int i = 0; i < outW * outH; ++i) {
-        out[i * 4 + 0] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, upscaled[i * 3 + 0] * 255.0f)));
-        out[i * 4 + 1] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, upscaled[i * 3 + 1] * 255.0f)));
-        out[i * 4 + 2] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, upscaled[i * 3 + 2] * 255.0f)));
-        out[i * 4 + 3] = 255;
-    }
-
-    return out;
-}
-
 // ── Atlas data structures ──
 
 struct LmapEntry {
@@ -256,8 +99,8 @@ struct LmapEntry {
     float atlasSU, atlasSV;  // size in atlas (0-1)
     int atlasIndex;          // which atlas (usually 0)
     // Pixel coordinates for runtime atlas updates (blending animated lightmaps)
-    int pixelX, pixelY;      // position in atlas
-    int pixelW, pixelH;      // dimensions in atlas (= lx*scale, ly*scale)
+    int pixelX, pixelY;      // position in atlas (data origin, inside padding border)
+    int pixelW, pixelH;      // dimensions in atlas (= lx, ly)
 };
 
 struct AtlasTexture {
@@ -271,9 +114,49 @@ struct LightmapAtlasSet {
     std::vector<std::vector<LmapEntry>> entries;
 };
 
-// ── Atlas builder ──
+// ── Edge padding helper ──
+// Fills a 2px border around a lightmap region in the atlas by edge-clamping.
+// This prevents bilinear/bicubic filtering from sampling neighboring lightmaps.
+// dataX/dataY = top-left of the actual data; lx/ly = data dimensions.
+// The padding area is dataX-2..dataX+lx+1, dataY-2..dataY+ly+1.
+inline void fillEdgePadding(std::vector<uint8_t> &rgba, int atlasSize,
+                            int dataX, int dataY, int lx, int ly) {
+    // Helper: get a pointer to the RGBA pixel at (px, py) in the atlas
+    auto pixel = [&](int px, int py) -> uint8_t * {
+        return &rgba[(py * atlasSize + px) * 4];
+    };
 
-inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr, int lmScale = 1) {
+    // Fill left/right padding columns (including corners)
+    for (int dy = -2; dy < ly + 2; ++dy) {
+        int srcRow = std::max(0, std::min(ly - 1, dy));
+        // Left 2 columns: repeat leftmost data pixel in this row
+        const uint8_t *srcLeft = pixel(dataX, dataY + srcRow);
+        for (int dx = -2; dx < 0; ++dx)
+            std::memcpy(pixel(dataX + dx, dataY + dy), srcLeft, 4);
+        // Right 2 columns: repeat rightmost data pixel in this row
+        const uint8_t *srcRight = pixel(dataX + lx - 1, dataY + srcRow);
+        for (int dx = lx; dx < lx + 2; ++dx)
+            std::memcpy(pixel(dataX + dx, dataY + dy), srcRight, 4);
+    }
+
+    // Fill top/bottom padding rows (between the left/right columns already filled)
+    for (int dx = 0; dx < lx; ++dx) {
+        // Top 2 rows: repeat topmost data pixel in this column
+        const uint8_t *srcTop = pixel(dataX + dx, dataY);
+        for (int dy = -2; dy < 0; ++dy)
+            std::memcpy(pixel(dataX + dx, dataY + dy), srcTop, 4);
+        // Bottom 2 rows: repeat bottommost data pixel in this column
+        const uint8_t *srcBot = pixel(dataX + dx, dataY + ly - 1);
+        for (int dy = ly; dy < ly + 2; ++dy)
+            std::memcpy(pixel(dataX + dx, dataY + dy), srcBot, 4);
+    }
+}
+
+// ── Atlas builder ──
+// Packs all per-polygon lightmaps into a single atlas texture at 1:1 resolution
+// with 2px edge-clamped padding for GPU bilinear/bicubic filtering.
+
+inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr) {
     LightmapAtlasSet result;
     result.entries.resize(wr.numCells);
 
@@ -281,13 +164,11 @@ inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr, int lmScale
         result.entries[ci].resize(wr.cells[ci].numTextured);
 
     // Collect all lightmaps with valid dimensions
-    // Scaled dimensions are used for atlas allocation; original dimensions for source data
     struct LmRef {
         uint32_t cellIdx;
         int polyIdx;
-        int lx, ly;         // original source dimensions
-        int slx, sly;       // scaled dimensions (lx*lmScale, ly*lmScale)
-        int area;            // scaled area for sorting
+        int lx, ly;         // source dimensions
+        int area;            // for sorting
     };
 
     std::vector<LmRef> refs;
@@ -298,11 +179,7 @@ inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr, int lmScale
             if (li.lx > 0 && li.ly > 0) {
                 int origLx = static_cast<int>(li.lx);
                 int origLy = static_cast<int>(li.ly);
-                int scaledLx = origLx * lmScale;
-                int scaledLy = origLy * lmScale;
-                refs.push_back({ci, pi, origLx, origLy,
-                                scaledLx, scaledLy,
-                                scaledLx * scaledLy});
+                refs.push_back({ci, pi, origLx, origLy, origLx * origLy});
             }
         }
     }
@@ -311,17 +188,17 @@ inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr, int lmScale
     std::sort(refs.begin(), refs.end(),
               [](const LmRef &a, const LmRef &b) { return a.area > b.area; });
 
-    // Start with a small atlas and grow as needed.
-    // Allow larger atlases when upscaling lightmaps.
+    // Start with a small atlas and grow as needed
     int atlasSize = 64;
-    const int maxAtlasSize = (lmScale > 1) ? 8192 : 2048;
+    const int maxAtlasSize = 4096;
 
-    // Try packing — grow atlas if it fails
+    // Try packing — grow atlas if it fails.
+    // Each lightmap allocates (lx+4, ly+4) to include 2px padding border.
     while (atlasSize <= maxAtlasSize) {
         auto packer = std::make_unique<FreeSpaceInfo>(0, 0, atlasSize, atlasSize);
 
-        // Reserve pixel (0,0) as pure white for non-lightmapped polygon fallback
-        // Use a 2x2 block so bilinear filtering doesn't bleed
+        // Reserve pixel (0,0) as pure white for non-lightmapped polygon fallback.
+        // Use a 2x2 block so bilinear filtering doesn't bleed into neighbours.
         FreeSpaceInfo *whiteBlock = packer->allocate(2, 2);
         if (!whiteBlock) {
             atlasSize *= 2;
@@ -333,7 +210,8 @@ inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr, int lmScale
         std::vector<FreeSpaceInfo *> allocations(refs.size(), nullptr);
 
         for (size_t i = 0; i < refs.size(); ++i) {
-            allocations[i] = packer->allocate(refs[i].slx, refs[i].sly);
+            // Allocate data + 4px (2px padding on each side)
+            allocations[i] = packer->allocate(refs[i].lx + 4, refs[i].ly + 4);
             if (!allocations[i]) {
                 allFit = false;
                 break;
@@ -382,64 +260,56 @@ inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr, int lmScale
             }
         }
 
-        // Blit lightmap pixels and record entries
+        // Blit lightmap pixels and record entries.
+        // Data is placed at (alloc + 2, alloc + 2) — the 2px border is filled
+        // by edge-clamping after the blit.
         for (size_t i = 0; i < refs.size(); ++i) {
             const auto &ref = refs[i];
             const auto &alloc = allocations[i];
             const auto &cell = wr.cells[ref.cellIdx];
             const auto &lmData = cell.staticLightmaps[ref.polyIdx];
 
-            if (lmScale == 1) {
-                // Direct blit — no upscaling overhead
-                for (int ly = 0; ly < ref.ly; ++ly) {
-                    for (int lx = 0; lx < ref.lx; ++lx) {
-                        int srcOff = (ly * ref.lx + lx) * wr.lightSize;
-                        int dstPx = (alloc->y + ly) * atlasSize + (alloc->x + lx);
+            // Data origin inside the padded allocation
+            int dataX = alloc->x + 2;
+            int dataY = alloc->y + 2;
 
-                        uint8_t r, g, b;
-                        convertLmPixel(&lmData[srcOff], wr.lightSize, r, g, b);
+            // Direct 1:1 blit
+            for (int ly = 0; ly < ref.ly; ++ly) {
+                for (int lx = 0; lx < ref.lx; ++lx) {
+                    int srcOff = (ly * ref.lx + lx) * wr.lightSize;
+                    int dstPx = (dataY + ly) * atlasSize + (dataX + lx);
 
-                        atlas.rgba[dstPx * 4 + 0] = r;
-                        atlas.rgba[dstPx * 4 + 1] = g;
-                        atlas.rgba[dstPx * 4 + 2] = b;
-                        atlas.rgba[dstPx * 4 + 3] = 255;
-                    }
-                }
-            } else {
-                // Bicubic upscale, then blit the result
-                auto upscaled = upscaleLightmap(lmData.data(), ref.lx, ref.ly,
-                                                wr.lightSize, lmScale);
-                for (int oy = 0; oy < ref.sly; ++oy) {
-                    for (int ox = 0; ox < ref.slx; ++ox) {
-                        int srcIdx = (oy * ref.slx + ox) * 4;
-                        int dstPx = (alloc->y + oy) * atlasSize + (alloc->x + ox);
+                    uint8_t r, g, b;
+                    convertLmPixel(&lmData[srcOff], wr.lightSize, r, g, b);
 
-                        atlas.rgba[dstPx * 4 + 0] = upscaled[srcIdx + 0];
-                        atlas.rgba[dstPx * 4 + 1] = upscaled[srcIdx + 1];
-                        atlas.rgba[dstPx * 4 + 2] = upscaled[srcIdx + 2];
-                        atlas.rgba[dstPx * 4 + 3] = 255;
-                    }
+                    atlas.rgba[dstPx * 4 + 0] = r;
+                    atlas.rgba[dstPx * 4 + 1] = g;
+                    atlas.rgba[dstPx * 4 + 2] = b;
+                    atlas.rgba[dstPx * 4 + 3] = 255;
                 }
             }
 
-            // Record atlas UV entry (using scaled dimensions in atlas space)
+            // Fill 2px edge-clamped padding around the data
+            fillEdgePadding(atlas.rgba, atlasSize, dataX, dataY, ref.lx, ref.ly);
+
+            // Record atlas UV entry — UVs point to inner data region (inside padding)
             LmapEntry &entry = result.entries[ref.cellIdx][ref.polyIdx];
-            entry.atlasU = static_cast<float>(alloc->x) * invSize;
-            entry.atlasV = static_cast<float>(alloc->y) * invSize;
-            entry.atlasSU = static_cast<float>(ref.slx) * invSize;
-            entry.atlasSV = static_cast<float>(ref.sly) * invSize;
+            entry.atlasU = static_cast<float>(dataX) * invSize;
+            entry.atlasV = static_cast<float>(dataY) * invSize;
+            entry.atlasSU = static_cast<float>(ref.lx) * invSize;
+            entry.atlasSV = static_cast<float>(ref.ly) * invSize;
             entry.atlasIndex = 0;
             // Pixel coordinates for runtime atlas updates (animated lightmaps)
-            entry.pixelX = alloc->x;
-            entry.pixelY = alloc->y;
-            entry.pixelW = ref.slx;
-            entry.pixelH = ref.sly;
+            entry.pixelX = dataX;
+            entry.pixelY = dataY;
+            entry.pixelW = ref.lx;
+            entry.pixelH = ref.ly;
         }
 
         result.atlases.push_back(std::move(atlas));
 
-        std::fprintf(stderr, "Lightmap atlas: %dx%d, %zu lightmaps packed (scale %dx)\n",
-                     atlasSize, atlasSize, refs.size(), lmScale);
+        std::fprintf(stderr, "Lightmap atlas: %dx%d, %zu lightmaps packed (1:1 + 2px padding)\n",
+                     atlasSize, atlasSize, refs.size());
         break;
     }
 
@@ -453,10 +323,10 @@ inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr, int lmScale
 
 // ── Animated lightmap blending ──
 //
-// Re-blends a single polygon's lightmap into the atlas CPU buffer:
+// Re-blends a single polygon's lightmap into the atlas CPU buffer at 1:1:
 //   result = static + sum(intensity[i] * overlay[i])
 // Overlays are in bit order of animflags, mapped to lightnum via cell.animMap.
-// If lmScale > 1, upscales the blended result before writing to atlas.
+// After blending, re-fills the 2px edge padding for correct GPU filtering.
 //
 // Parameters:
 //   atlas       — atlas CPU buffer to write into
@@ -465,14 +335,12 @@ inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr, int lmScale
 //   polyIdx     — textured polygon index within cell
 //   entry       — atlas entry with pixel position/size
 //   intensities — lightnum → current intensity (0.0-1.0) for each animated light
-//   lmScale     — lightmap upscale factor (1 = no upscale)
 inline void blendAnimatedLightmap(
     AtlasTexture &atlas,
     const WRParsedData &wr,
     uint32_t cellIdx, int polyIdx,
     const LmapEntry &entry,
-    const std::unordered_map<int16_t, float> &intensities,
-    int lmScale)
+    const std::unordered_map<int16_t, float> &intensities)
 {
     const auto &cell = wr.cells[cellIdx];
     const auto &li = cell.lightInfos[polyIdx];
@@ -531,66 +399,21 @@ inline void blendAnimatedLightmap(
     for (auto &v : blended)
         v = std::max(0.0f, std::min(1.0f, v));
 
-    // Write blended result into atlas (with optional upscaling)
-    if (lmScale > 1) {
-        // Upscale using existing bicubic + blur pipeline
-        // First convert blended float → raw bytes for upscaleLightmap()
-        // We use lightSize=1 (grayscale) format but store as 3 separate channels
-        // Actually, build RGBA8 directly from float buffer, then upscale that
-        // Simpler: convert to a temp raw buffer, upscale, blit
+    // Direct blit at 1:1 scale into atlas
+    for (int py = 0; py < ly && (entry.pixelY + py) < atlas.size; ++py) {
+        for (int px = 0; px < lx && (entry.pixelX + px) < atlas.size; ++px) {
+            int srcOff = (py * lx + px) * 3;
+            int dstPx = (entry.pixelY + py) * atlas.size + (entry.pixelX + px);
 
-        // Build temporary RGBA8 at original resolution
-        int outW = lx * lmScale;
-        int outH = ly * lmScale;
-
-        // Bicubic upscale from float buffer
-        std::vector<float> upscaled(outW * outH * 3);
-        for (int oy = 0; oy < outH; ++oy) {
-            for (int ox = 0; ox < outW; ++ox) {
-                float srcX = (static_cast<float>(ox) + 0.5f) / static_cast<float>(lmScale) - 0.5f;
-                float srcY = (static_cast<float>(oy) + 0.5f) / static_cast<float>(lmScale) - 0.5f;
-
-                float r, g, b;
-                sampleBicubic(blended, lx, ly, srcX, srcY, r, g, b);
-
-                int off = (oy * outW + ox) * 3;
-                upscaled[off + 0] = r;
-                upscaled[off + 1] = g;
-                upscaled[off + 2] = b;
-            }
-        }
-
-        // Gaussian blur for smooth lighting
-        int blurRadius = lmScale * 2;
-        gaussianBlur(upscaled, outW, outH, blurRadius);
-
-        // Blit upscaled result into atlas
-        for (int oy = 0; oy < outH && (entry.pixelY + oy) < atlas.size; ++oy) {
-            for (int ox = 0; ox < outW && (entry.pixelX + ox) < atlas.size; ++ox) {
-                int srcOff = (oy * outW + ox) * 3;
-                int dstPx = (entry.pixelY + oy) * atlas.size + (entry.pixelX + ox);
-
-                atlas.rgba[dstPx * 4 + 0] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, upscaled[srcOff + 0] * 255.0f)));
-                atlas.rgba[dstPx * 4 + 1] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, upscaled[srcOff + 1] * 255.0f)));
-                atlas.rgba[dstPx * 4 + 2] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, upscaled[srcOff + 2] * 255.0f)));
-                atlas.rgba[dstPx * 4 + 3] = 255;
-            }
-        }
-    } else {
-        // Direct blit at 1:1 scale
-        for (int py = 0; py < ly && (entry.pixelY + py) < atlas.size; ++py) {
-            for (int px = 0; px < lx && (entry.pixelX + px) < atlas.size; ++px) {
-                int srcOff = (py * lx + px) * 3;
-                int dstPx = (entry.pixelY + py) * atlas.size + (entry.pixelX + px);
-
-                atlas.rgba[dstPx * 4 + 0] = static_cast<uint8_t>(blended[srcOff + 0] * 255.0f);
-                atlas.rgba[dstPx * 4 + 1] = static_cast<uint8_t>(blended[srcOff + 1] * 255.0f);
-                atlas.rgba[dstPx * 4 + 2] = static_cast<uint8_t>(blended[srcOff + 2] * 255.0f);
-                atlas.rgba[dstPx * 4 + 3] = 255;
-            }
+            atlas.rgba[dstPx * 4 + 0] = static_cast<uint8_t>(blended[srcOff + 0] * 255.0f);
+            atlas.rgba[dstPx * 4 + 1] = static_cast<uint8_t>(blended[srcOff + 1] * 255.0f);
+            atlas.rgba[dstPx * 4 + 2] = static_cast<uint8_t>(blended[srcOff + 2] * 255.0f);
+            atlas.rgba[dstPx * 4 + 3] = 255;
         }
     }
 
+    // Re-fill 2px edge padding so GPU filtering stays correct after blend
+    fillEdgePadding(atlas.rgba, atlas.size, entry.pixelX, entry.pixelY, lx, ly);
 }
 
 } // namespace Darkness

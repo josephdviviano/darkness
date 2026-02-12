@@ -3,10 +3,10 @@
 # CLI flags override any values set here.
 
 graphics:
-  # Lightmap upscale factor (1-8, default: 1)
-  # 1 = original blocky lightmaps
-  # 2/4/8 = progressively smoother via bicubic interpolation
-  lm_scale: 1
+  # Lightmap filtering mode (default: bilinear)
+  # bilinear = GPU hardware filtering (fast, matches original engine)
+  # bicubic  = cubic B-spline shader (smoother, minimal GPU cost)
+  lightmap_filtering: bilinear
 
   # Texture filtering mode (default: 0)
   # 0 = point (crispy, authentic)
