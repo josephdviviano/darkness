@@ -15,8 +15,8 @@ namespace Darkness {
 // Defaults match the original hardcoded values.
 struct RenderConfig {
     // -- graphics --
-    int  lmScale    = 1;      // lightmap upscale factor (1-8)
-    int  filterMode = 0;      // texture filtering: 0=point, 1=bilinear, 2=trilinear, 3=aniso
+    int  lightmapFiltering = 0; // lightmap filtering: 0=bilinear (default), 1=bicubic
+    int  filterMode = 0;        // texture filtering: 0=point, 1=bilinear, 2=trilinear, 3=aniso
     bool linearMips = false;  // gamma-correct mipmap generation
     bool sharpMips  = false;  // unsharp mask on mip levels
 
@@ -58,10 +58,10 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
 
         // graphics section
         if (YAML::Node gfx = root["graphics"]) {
-            if (gfx["lm_scale"]) {
-                cfg.lmScale = gfx["lm_scale"].as<int>();
-                if (cfg.lmScale < 1) cfg.lmScale = 1;
-                if (cfg.lmScale > 8) cfg.lmScale = 8;
+            if (gfx["lightmap_filtering"]) {
+                std::string val = gfx["lightmap_filtering"].as<std::string>();
+                if (val == "bicubic") cfg.lightmapFiltering = 1;
+                else cfg.lightmapFiltering = 0;  // "bilinear" or unknown → default
             }
             if (gfx["filter_mode"])  cfg.filterMode = gfx["filter_mode"].as<int>();
             if (gfx["linear_mips"])  cfg.linearMips = gfx["linear_mips"].as<bool>();
@@ -122,10 +122,10 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cli.resPath = argv[++i];
         } else if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             cli.configPath = argv[++i];
-        } else if (std::strcmp(argv[i], "--lm-scale") == 0 && i + 1 < argc) {
-            cfg.lmScale = std::atoi(argv[++i]);
-            if (cfg.lmScale < 1) cfg.lmScale = 1;
-            if (cfg.lmScale > 8) cfg.lmScale = 8;
+        } else if (std::strcmp(argv[i], "--lightmap-filtering") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (std::strcmp(val, "bicubic") == 0) cfg.lightmapFiltering = 1;
+            else cfg.lightmapFiltering = 0;  // "bilinear" or unknown → default
         } else if (std::strcmp(argv[i], "--no-objects") == 0) {
             cfg.showObjects = false;
         } else if (std::strcmp(argv[i], "--show-fallback") == 0) {

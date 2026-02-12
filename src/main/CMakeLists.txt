@@ -90,6 +90,26 @@ bgfx_compile_shaders(
     AS_HEADERS
 )
 
+# Lightmapped bicubic shader — cubic B-spline lightmap filtering
+bgfx_compile_shaders(
+    TYPE VERTEX
+    SHADERS ${SHADER_DIR}/vs_lightmapped_bicubic.sc
+    VARYING_DEF ${SHADER_DIR}/varying_lightmapped.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR LIGHTMAPPED_BICUBIC_VS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_lightmapped_bicubic.sc
+    VARYING_DEF ${SHADER_DIR}/varying_lightmapped.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR LIGHTMAPPED_BICUBIC_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+
 # Water shader — uses varying_water.def.sc
 bgfx_compile_shaders(
     TYPE VERTEX
@@ -115,6 +135,7 @@ add_custom_target(compile_shaders DEPENDS
     ${BASIC_VS_OUTPUTS} ${BASIC_FS_OUTPUTS}
     ${TEXTURED_VS_OUTPUTS} ${TEXTURED_FS_OUTPUTS}
     ${LIGHTMAPPED_VS_OUTPUTS} ${LIGHTMAPPED_FS_OUTPUTS}
+    ${LIGHTMAPPED_BICUBIC_VS_OUTPUTS} ${LIGHTMAPPED_BICUBIC_FS_OUTPUTS}
     ${WATER_VS_OUTPUTS} ${WATER_FS_OUTPUTS}
 )
 

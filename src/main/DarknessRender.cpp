@@ -102,16 +102,16 @@ static void printHelp() {
         "darknessRender — Dark Engine world geometry viewer\n"
         "\n"
         "Usage:\n"
-        "  darknessRender <mission.mis> [--res <path>] [--config <path>] [--lm-scale <N>]\n"
+        "  darknessRender <mission.mis> [--res <path>] [--config <path>] [--lightmap-filtering <mode>]\n"
         "\n"
         "Options:\n"
         "  --res <path>   Path to Thief 2 RES directory containing fam.crf.\n"
         "                 Enables lightmapped+textured rendering. Without this\n"
         "                 flag, geometry is rendered with flat Lambertian shading.\n"
-        "  --lm-scale <N> Lightmap upscale factor (1-8, default 1).\n"
-        "                 1 = vintage (original blocky lightmaps).\n"
-        "                 2/4/8 = progressively smoother shadows via bicubic\n"
-        "                 interpolation. Higher values use more atlas memory.\n"
+        "  --lightmap-filtering <mode>\n"
+        "                 Lightmap filtering mode: bilinear (default) or bicubic.\n"
+        "                 bilinear = GPU hardware filtering (fast, matches original engine).\n"
+        "                 bicubic  = cubic B-spline shader (smoother, minimal GPU cost).\n"
         "  --no-objects   Disable object mesh rendering (world geometry only).\n"
         "  --no-cull      Start with portal culling disabled (see all geometry).\n"
         "  --collision    Start with camera collision enabled (clip to world).\n"
@@ -136,6 +136,7 @@ static void printHelp() {
         "Debug shortcuts (hold Backspace + key):\n"
         "  BS+C           Toggle portal culling on/off\n"
         "  BS+F           Cycle texture filtering (point/bilinear/trilinear/aniso)\n"
+        "  BS+L           Toggle lightmap filtering (bilinear/bicubic)\n"
         "  BS+V           Toggle camera collision (clip/noclip)\n"
         "  BS+M/N         Cycle model isolation (next/prev)\n"
         "\n"
@@ -264,7 +265,17 @@ static void renderWorld(
                     bgfx::setTexture(0, gpu.s_texColor, it->second, fc.texSampler);
                     if (!gpu.lightmapAtlasHandles.empty())
                         bgfx::setTexture(1, gpu.s_texLightmap, gpu.lightmapAtlasHandles[0]);
-                    bgfx::submit(1, gpu.lightmappedProgram);
+
+                    // Select lightmap program: bilinear (hardware) or bicubic (shader)
+                    bgfx::ProgramHandle lmProg = gpu.lightmappedProgram;
+                    if (state.lightmapFiltering == 1 && bgfx::isValid(gpu.lightmappedBicubicProgram)) {
+                        lmProg = gpu.lightmappedBicubicProgram;
+                        // Pass atlas dimensions for texel-space calculations in bicubic shader
+                        float sz[4] = { float(gpu.lmAtlasSet.atlases[0].size),
+                                        float(gpu.lmAtlasSet.atlases[0].size), 0, 0 };
+                        bgfx::setUniform(gpu.u_lmAtlasSize, sz);
+                    }
+                    bgfx::submit(1, lmProg);
                 } else {
                     bgfx::submit(1, gpu.flatProgram);
                 }
@@ -654,6 +665,8 @@ static void updateTitleBar(SDL_Window *window, const Darkness::RuntimeState &sta
     char title[512];
     const char *filterNames[] = { "point", "bilinear", "trilinear", "aniso" };
     const char *filterStr = filterNames[state.filterMode % 4];
+    const char *lmNames[] = { "bilinear", "bicubic" };
+    const char *lmStr = lmNames[state.lightmapFiltering % 2];
 
     // Build model isolation suffix if active
     char isoSuffix[128] = "";
@@ -671,12 +684,12 @@ static void updateTitleBar(SDL_Window *window, const Darkness::RuntimeState &sta
 
     if (state.portalCulling) {
         std::snprintf(title, sizeof(title),
-            "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s] [%s]%s",
-            state.modeStr, state.moveSpeed, state.cullVisibleCells, state.cullTotalCells, filterStr, clipStr, isoSuffix);
+            "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s] [lm:%s] [%s]%s",
+            state.modeStr, state.moveSpeed, state.cullVisibleCells, state.cullTotalCells, filterStr, lmStr, clipStr, isoSuffix);
     } else {
         std::snprintf(title, sizeof(title),
-            "darkness — %s [speed: %.1f] [cull: OFF] [%s] [%s]%s",
-            state.modeStr, state.moveSpeed, filterStr, clipStr, isoSuffix);
+            "darkness — %s [speed: %.1f] [cull: OFF] [%s] [lm:%s] [%s]%s",
+            state.modeStr, state.moveSpeed, filterStr, lmStr, clipStr, isoSuffix);
     }
     SDL_SetWindowTitle(window, title);
 }
@@ -696,6 +709,11 @@ static void registerConsoleSettings(
         {"point", "bilinear", "trilinear", "anisotropic"},
         [&state]() { return state.filterMode; },
         [&state, refreshTitle](int v) { state.filterMode = v; refreshTitle(); });
+
+    dbgConsole.addCategorical("lightmap_filtering",
+        {"bilinear", "bicubic"},
+        [&state]() { return state.lightmapFiltering; },
+        [&state, refreshTitle](int v) { state.lightmapFiltering = v; refreshTitle(); });
 
     dbgConsole.addBool("portal_culling",
         [&state]() { return state.portalCulling; },
@@ -834,6 +852,13 @@ static void handleEvents(
             std::fprintf(stderr, "Camera collision: %s\n",
                          state.cameraCollision ? "ON (clip)" : "OFF (noclip)");
             updateTitleBar(window, state);
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_l
+                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
+            // Backspace+L: Toggle lightmap filtering (bilinear ↔ bicubic)
+            state.lightmapFiltering = (state.lightmapFiltering + 1) % 2;
+            const char *lmNames[] = { "bilinear", "bicubic" };
+            std::fprintf(stderr, "Lightmap filtering: %s\n", lmNames[state.lightmapFiltering]);
+            updateTitleBar(window, state);
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_r
                    && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
             // Backspace+R: Toggle debug raycast visualization
@@ -885,7 +910,7 @@ static void updateMovement(
 // the atlas CPU buffer, then upload the updated atlas to the GPU.
 static void updateLightmaps(
     float dt, const Darkness::BuiltMeshes &meshes,
-    Darkness::MissionData &mission, Darkness::GPUResources &gpu, int lmScale)
+    Darkness::MissionData &mission, Darkness::GPUResources &gpu)
 {
     if (!meshes.lightmappedMode || gpu.lmAtlasSet.atlases.empty()) return;
 
@@ -900,8 +925,12 @@ static void updateLightmaps(
         if (changed) anyLightChanged = true;
     }
 
-    // Re-blend changed lightmaps into atlas CPU buffer
+    // Re-blend changed lightmaps into atlas CPU buffer, tracking dirty region
     if (anyLightChanged) {
+        const auto &atlas = gpu.lmAtlasSet.atlases[0];
+        int dirtyX0 = atlas.size, dirtyY0 = atlas.size;
+        int dirtyX1 = 0, dirtyY1 = 0;
+
         for (auto &[lightNum, light] : mission.lightSources) {
             float intensity = currentIntensities[lightNum];
             if (std::abs(intensity - light.prevIntensity) < 0.002f) continue;
@@ -911,20 +940,38 @@ static void updateLightmaps(
             if (it == mission.animLightIndex.end()) continue;
 
             for (auto &[ci, pi] : it->second) {
+                const auto &entry = gpu.lmAtlasSet.entries[ci][pi];
                 Darkness::blendAnimatedLightmap(
                     gpu.lmAtlasSet.atlases[0], mission.wrData, ci, pi,
-                    gpu.lmAtlasSet.entries[ci][pi],
-                    currentIntensities, lmScale);
+                    entry, currentIntensities);
+
+                // Expand dirty region to include this lightmap + its 2px padding
+                int x0 = std::max(0, entry.pixelX - 2);
+                int y0 = std::max(0, entry.pixelY - 2);
+                int x1 = std::min(atlas.size, entry.pixelX + entry.pixelW + 2);
+                int y1 = std::min(atlas.size, entry.pixelY + entry.pixelH + 2);
+                dirtyX0 = std::min(dirtyX0, x0);
+                dirtyY0 = std::min(dirtyY0, y0);
+                dirtyX1 = std::max(dirtyX1, x1);
+                dirtyY1 = std::max(dirtyY1, y1);
             }
         }
 
-        // Upload full atlas to GPU
-        const auto &atlas = gpu.lmAtlasSet.atlases[0];
-        const bgfx::Memory *mem = bgfx::copy(
-            atlas.rgba.data(), static_cast<uint32_t>(atlas.rgba.size()));
-        bgfx::updateTexture2D(gpu.lightmapAtlasHandles[0], 0, 0, 0, 0,
-            static_cast<uint16_t>(atlas.size),
-            static_cast<uint16_t>(atlas.size), mem);
+        // Upload only the dirty sub-rectangle to GPU
+        if (dirtyX1 > dirtyX0 && dirtyY1 > dirtyY0) {
+            int dw = dirtyX1 - dirtyX0;
+            int dh = dirtyY1 - dirtyY0;
+            std::vector<uint8_t> sub(dw * dh * 4);
+            for (int y = 0; y < dh; ++y) {
+                std::memcpy(&sub[y * dw * 4],
+                            &atlas.rgba[((dirtyY0 + y) * atlas.size + dirtyX0) * 4],
+                            dw * 4);
+            }
+            const bgfx::Memory *mem = bgfx::copy(sub.data(), static_cast<uint32_t>(sub.size()));
+            bgfx::updateTexture2D(gpu.lightmapAtlasHandles[0], 0, 0,
+                static_cast<uint16_t>(dirtyX0), static_cast<uint16_t>(dirtyY0),
+                static_cast<uint16_t>(dw), static_cast<uint16_t>(dh), mem);
+        }
     }
 }
 
@@ -1096,6 +1143,7 @@ int main(int argc, char *argv[]) {
     state.portalCulling     = cfg.portalCulling;
     state.cameraCollision   = cfg.cameraCollision;
     state.filterMode        = cfg.filterMode;
+    state.lightmapFiltering = cfg.lightmapFiltering;
     state.waveAmplitude    = cfg.waveAmplitude;
     state.uvDistortion     = cfg.uvDistortion;
     state.waterRotation    = cfg.waterRotation;
@@ -1170,7 +1218,7 @@ int main(int argc, char *argv[]) {
 
         updateMovement(dt, state, mission, dbgConsole);
 
-        updateLightmaps(dt, meshes, mission, gpu, cfg.lmScale);
+        updateLightmaps(dt, meshes, mission, gpu);
 
         // ── Prepare frame: matrices, fog, samplers, culling ──
         auto fc = prepareFrame(state, mission);

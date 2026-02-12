@@ -58,8 +58,8 @@ darknessRender path/to/miss6.mis
 # Textured + lightmapped (requires Thief 2 RES directory with fam.crf)
 darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES
 
-# With upscaled lightmaps
-darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES --lm-scale 4
+# With bicubic lightmap filtering (smoother shadows)
+darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES --lightmap-filtering bicubic
 ```
 
 **Controls:**
