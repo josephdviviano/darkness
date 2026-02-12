@@ -23,7 +23,7 @@
 //
 // Uses the existing BinFormat.h structs (BinHeader, SubObjectHeader, ObjPolygon,
 // ObjLight, NodeSplit/Call/Raw, etc.) with File I/O operators. Follows the same
-// BSP tree walk algorithm as ManualBinFileLoader.cpp (ObjectMeshLoader).
+// BSP tree walk algorithm from LGMD model format specification.
 //
 // Input: raw .bin file bytes (from CRFModelLoader or file read).
 // Output: ParsedBinMesh with vertex/index arrays ready for bgfx VBH/IBH.
