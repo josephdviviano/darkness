@@ -199,6 +199,9 @@ struct RuntimeState {
     bool hasWater = false;
     bool hasSkybox = false;
 
+    // Mode description string for title bar (points to string literal)
+    const char *modeStr = "flat-shaded";
+
     // Portal culling stats (for title bar)
     uint32_t cullVisibleCells = 0;
     uint32_t cullTotalCells = 0;
