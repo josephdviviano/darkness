@@ -1173,69 +1173,15 @@ static void shutdownWindow(SDL_Window *window) {
     SDL_Quit();
 }
 
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        printHelp();
-        return 1;
-    }
-
-    // Parse config: hardcoded defaults → YAML file → CLI overrides
-    Darkness::RenderConfig cfg;
-
-    // First CLI pass: extract --config path (and detect --help early)
-    Darkness::CliResult cli = Darkness::applyCliOverrides(argc, argv, cfg);
-
-    if (cli.helpRequested) {
-        printHelp();
-        return 0;
-    }
-
-    if (!cli.misPath) {
-        std::fprintf(stderr, "Error: no mission file specified.\n\n");
-        printHelp();
-        return 1;
-    }
-
-    // Load YAML config (defaults to ./darknessRender.yaml if no --config flag)
-    std::string configPath = cli.configPath.empty() ? "darknessRender.yaml" : cli.configPath;
-    Darkness::loadConfigFromYAML(configPath, cfg);
-
-    // Re-apply CLI so flags always win over YAML values
-    cli = Darkness::applyCliOverrides(argc, argv, cfg);
-
-    // All CPU-side parsed mission content and mutable runtime state.
-    Darkness::MissionData mission;
-    Darkness::RuntimeState state;
-
-    // Unpack into local variables — rest of file uses these unchanged
-    const char *misPath    = cli.misPath;
-    std::string resPath    = cli.resPath;
-    int  lmScale           = cfg.lmScale;
-    state.showObjects       = cfg.showObjects;
-    state.showFallbackCubes = cfg.showFallbackCubes;
-    bool forceFlicker      = cfg.forceFlicker;
-    state.portalCulling     = cfg.portalCulling;
-    state.cameraCollision   = cfg.cameraCollision;
-    state.filterMode        = cfg.filterMode;
-    bool linearMips        = cfg.linearMips;
-    bool sharpMips         = cfg.sharpMips;
-    state.waveAmplitude    = cfg.waveAmplitude;
-    state.uvDistortion     = cfg.uvDistortion;
-    state.waterRotation    = cfg.waterRotation;
-    state.waterScrollSpeed = cfg.waterScrollSpeed;
-
-    mission.texturedMode = !resPath.empty();
-
-    // ── Initialize logging (required before ServiceManager) ──
-    Darkness::Logger logger;
-    Darkness::StdLog stdlog;
-    logger.setLogLevel(Darkness::Logger::LOG_LEVEL_FATAL);
-    Darkness::ConsoleBackend console;
-
-    // ── Initialize service stack for typed property access ──
-    // PropertyService provides property inheritance resolution (ModelName,
-    // RenderType, Scale, RenderAlpha) via the Inheritor system, replacing
-    // the ad-hoc MetaProp chain walking in the old ObjectPropParser.
+// ── Initialize service stack and load mission database ──
+// Creates the ServiceManager with all 12 services, registers property/relation
+// schemas from PLDef/DType files, loads the mission database (.gam + .mis),
+// constructs the IWorldQuery facade, and runs verification diagnostics.
+// Logger objects must be constructed before calling this (they live in main).
+static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
+    const char *misPath, const std::string &scriptsDir)
+{
+    // Create service manager with all 12 services
     {
         auto *svcMgr = new Darkness::ServiceManager(SERVICE_ALL);
 
@@ -1256,7 +1202,6 @@ int main(int argc, char *argv[]) {
     }
 
     // Load schema definitions (property types, link relations)
-    std::string scriptsDir = "scripts/thief2";
     {
         Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
         Darkness::LinkServicePtr linkSvc = GET_SERVICE(Darkness::LinkService);
@@ -1395,6 +1340,72 @@ int main(int argc, char *argv[]) {
                      entityCount, positionedCount, roomCount, linkCount,
                      handleHits, positionedIDs.size());
     }
+
+    return worldQuery;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        printHelp();
+        return 1;
+    }
+
+    // Parse config: hardcoded defaults → YAML file → CLI overrides
+    Darkness::RenderConfig cfg;
+
+    // First CLI pass: extract --config path (and detect --help early)
+    Darkness::CliResult cli = Darkness::applyCliOverrides(argc, argv, cfg);
+
+    if (cli.helpRequested) {
+        printHelp();
+        return 0;
+    }
+
+    if (!cli.misPath) {
+        std::fprintf(stderr, "Error: no mission file specified.\n\n");
+        printHelp();
+        return 1;
+    }
+
+    // Load YAML config (defaults to ./darknessRender.yaml if no --config flag)
+    std::string configPath = cli.configPath.empty() ? "darknessRender.yaml" : cli.configPath;
+    Darkness::loadConfigFromYAML(configPath, cfg);
+
+    // Re-apply CLI so flags always win over YAML values
+    cli = Darkness::applyCliOverrides(argc, argv, cfg);
+
+    // All CPU-side parsed mission content and mutable runtime state.
+    Darkness::MissionData mission;
+    Darkness::RuntimeState state;
+
+    // Unpack into local variables — rest of file uses these unchanged
+    const char *misPath    = cli.misPath;
+    std::string resPath    = cli.resPath;
+    int  lmScale           = cfg.lmScale;
+    state.showObjects       = cfg.showObjects;
+    state.showFallbackCubes = cfg.showFallbackCubes;
+    bool forceFlicker      = cfg.forceFlicker;
+    state.portalCulling     = cfg.portalCulling;
+    state.cameraCollision   = cfg.cameraCollision;
+    state.filterMode        = cfg.filterMode;
+    bool linearMips        = cfg.linearMips;
+    bool sharpMips         = cfg.sharpMips;
+    state.waveAmplitude    = cfg.waveAmplitude;
+    state.uvDistortion     = cfg.uvDistortion;
+    state.waterRotation    = cfg.waterRotation;
+    state.waterScrollSpeed = cfg.waterScrollSpeed;
+
+    mission.texturedMode = !resPath.empty();
+
+    // ── Initialize logging (required before ServiceManager) ──
+    Darkness::Logger logger;
+    Darkness::StdLog stdlog;
+    logger.setLogLevel(Darkness::Logger::LOG_LEVEL_FATAL);
+    Darkness::ConsoleBackend console;
+
+    // ── Initialize service stack, load database, construct IWorldQuery ──
+    std::string scriptsDir = "scripts/thief2";
+    auto worldQuery = initServiceStack(misPath, scriptsDir);
 
     // Extract mission base name (e.g. "miss6" from "path/to/miss6.mis")
     // for constructing skybox texture filenames like "skyhw/miss6n.PCX"
