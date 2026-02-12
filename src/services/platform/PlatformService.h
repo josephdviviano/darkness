@@ -27,6 +27,8 @@
 
 #include "config.h"
 
+#include <memory>
+
 #include "DarknessService.h"
 #include "ServiceCommon.h"
 #include "SharedPtr.h"
@@ -60,7 +62,7 @@ protected:
     void shutdown();
 
 private:
-    Platform *mPlatform;
+    std::unique_ptr<Platform> mPlatform;
 };
 
 /// Shared pointer to Platform service

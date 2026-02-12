@@ -49,18 +49,21 @@ PlatformService::PlatformService(ServiceManager *manager,
                                  const std::string &name)
     : ServiceImpl<PlatformService>(manager, name) {
 #ifdef WIN32
-    mPlatform = new Win32Platform(this);
+    mPlatform = std::make_unique<Win32Platform>(this);
 #elif defined(APPLE)
-    mPlatform = new ApplePlatform(this);
+    mPlatform = std::make_unique<ApplePlatform>(this);
 #elif defined(UNIX)
-    mPlatform = new UnixPlatform(this);
+    mPlatform = std::make_unique<UnixPlatform>(this);
 #else
 #error Unknown platform!
 #endif
 }
 
 //------------------------------------------------------
-PlatformService::~PlatformService() { delete mPlatform; }
+PlatformService::~PlatformService() {
+    // unique_ptr handles deletion; destructor body in .cpp ensures
+    // Platform's complete type is visible for proper destruction
+}
 
 //------------------------------------------------------
 std::string PlatformService::getGlobalConfigPath() const {

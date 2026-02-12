@@ -32,7 +32,7 @@ namespace Darkness {
 /*----------------------------------------------------*/
 Room::Room(RoomService *owner)
     : mOwner(owner), mObjectID(0), mRoomID(0), mCenter(), mPortalCount(0),
-      mPortals(), mPortalDistances(NULL) {
+      mPortals(), mPortalDistances() {
     // nothing
 }
 
@@ -52,16 +52,15 @@ void Room::read(const FilePtr &sf) {
     *sf >> mPortalCount;
 
     // read the room portals
-    mPortals.grow(mPortalCount);
+    mPortals.resize(mPortalCount);
     for (size_t i = 0; i < mPortalCount; ++i) {
-        mPortals[i] = new RoomPortal(mOwner);
+        mPortals[i] = std::make_unique<RoomPortal>(mOwner);
         mPortals[i]->read(sf);
     }
 
     // the portal-to-portal distances
-    delete[] mPortalDistances;
-    mPortalDistances = new float[mPortalCount * mPortalCount];
-    sf->readElem(mPortalDistances, sizeof(float), mPortalCount * mPortalCount);
+    mPortalDistances.resize(mPortalCount * mPortalCount);
+    sf->readElem(mPortalDistances.data(), sizeof(float), mPortalCount * mPortalCount);
 
     // the object ID lists
     // there are usually two lists of ID's in the room database
@@ -104,7 +103,7 @@ void Room::write(const FilePtr &sf) {
     }
 
     // the portal-to-portal distances
-    sf->writeElem(mPortalDistances, sizeof(float), mPortalCount * mPortalCount);
+    sf->writeElem(mPortalDistances.data(), sizeof(float), mPortalCount * mPortalCount);
 
     // the object ID lists
     uint32_t num_lists = mIDLists.size();
@@ -140,7 +139,7 @@ bool Room::isInside(const Vector3 &point) {
 //------------------------------------------------------
 RoomPortal *Room::getPortalForPoint(const Vector3 &pos) {
     for (size_t i = 0; i < mPortalCount; ++i) {
-        RoomPortal *rp = mPortals[i];
+        RoomPortal *rp = mPortals[i].get();
         if (rp->isInside(pos))
             return rp;
     }
@@ -174,13 +173,10 @@ void Room::clear() {
     mRoomID = 0;
     mCenter = Vector3::ZERO;
 
-    for (size_t i = 0; i < mPortalCount; ++i)
-        delete mPortals[i];
-
+    // unique_ptr handles portal deletion automatically
     mPortals.clear();
     mPortalCount = 0;
-    delete[] mPortalDistances;
-    mPortalDistances = NULL;
+    mPortalDistances.clear();
 
     mIDLists.clear();
 }

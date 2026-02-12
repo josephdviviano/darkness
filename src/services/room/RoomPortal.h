@@ -24,7 +24,8 @@
 #ifndef __ROOMPORTAL_H
 #define __ROOMPORTAL_H
 
-#include "Array.h"
+#include <vector>
+
 #include "File.h"
 #include "RoomCommon.h"
 #include "SharedPtr.h"
@@ -87,7 +88,7 @@ private:
     /// Number of portal edges
     uint32_t mEdgeCount;
     /// Plane list - planes that make up the portal
-    SimpleArray<Plane> mEdges;
+    std::vector<Plane> mEdges;
     // Source and destination rooms
     /// room number this portal goes to
     Room *mDestRoom;

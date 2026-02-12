@@ -44,7 +44,7 @@ PhysModel *PhysModels::get(int objid) const {
     IDModelMap::const_iterator it = mModels.find(objid);
 
     if (it != mModels.end())
-        return it->second;
+        return it->second.get();
 
     return NULL;
 };
@@ -78,19 +78,19 @@ void PhysModels::read(const FilePtr &tag, unsigned int physVersion) {
 
         *tag >> voltype >> id;
 
-        PhysModel *mdl;
+        std::unique_ptr<PhysModel> mdl;
 
         switch (voltype) {
         case 0x00: // Sphere model
         case 0x02: // point model
         case 0x04: // Sphere Hat model
-            mdl = new PhysSphereModel(id);
+            mdl = std::make_unique<PhysSphereModel>(id);
             break;
         case 0x01: // BSP model
-            mdl = new PhysBSPModel(id);
+            mdl = std::make_unique<PhysBSPModel>(id);
             break;
         case 0x03: // OBB model
-            mdl = new PhysOBBModel(id);
+            mdl = std::make_unique<PhysOBBModel>(id);
             break;
 
         default:
@@ -99,7 +99,7 @@ void PhysModels::read(const FilePtr &tag, unsigned int physVersion) {
         }
 
         mdl->read(tag, physVersion);
-        mModels.insert(std::make_pair(id, mdl));
+        mModels.insert(std::make_pair(id, std::move(mdl)));
     }
 
     // The same code for Stationary...
@@ -111,19 +111,19 @@ void PhysModels::read(const FilePtr &tag, unsigned int physVersion) {
 
         *tag >> voltype >> id;
 
-        PhysModel *mdl;
+        std::unique_ptr<PhysModel> mdl;
 
         switch (voltype) {
         case 0x00: // Sphere model
         case 0x02: // point model
         case 0x04: // Sphere Hat model
-            mdl = new PhysSphereModel(id);
+            mdl = std::make_unique<PhysSphereModel>(id);
             break;
         case 0x01: // BSP model
-            mdl = new PhysBSPModel(id);
+            mdl = std::make_unique<PhysBSPModel>(id);
             break;
         case 0x03: // OBB model
-            mdl = new PhysOBBModel(id);
+            mdl = std::make_unique<PhysOBBModel>(id);
             break;
 
         default:
@@ -132,8 +132,9 @@ void PhysModels::read(const FilePtr &tag, unsigned int physVersion) {
         }
 
         mdl->read(tag, physVersion);
-        mModels.insert(std::make_pair(id, mdl));
-        addToStationary(mdl);
+        PhysModel *raw = mdl.get();  // non-owning ptr for addToStationary
+        mModels.insert(std::make_pair(id, std::move(mdl)));
+        addToStationary(raw);
     }
 };
 
@@ -145,6 +146,9 @@ void PhysModels::write(const FilePtr &tag, unsigned int physVersion) {
 };
 
 //------------------------------------------------------
-void PhysModels::clear(void) { STUB_WARN(); }
+void PhysModels::clear(void) {
+    mModels.clear();
+    mStationaryObjects.clear();
+}
 
 } // namespace Darkness
