@@ -69,6 +69,10 @@ set(HEADLESS_SERVICES_SOURCES
     physics/PhysOBBModel.h
     physics/PhysSphereModel.cpp
     physics/PhysSphereModel.h
+    physics/IPhysicsWorld.h
+    physics/PlayerPhysics.h
+    physics/CollisionGeometry.h
+    physics/DarkPhysics.h
     ${PLATFORM_SOURCES}
     property/PropertyCommon.h
     property/Property.cpp
