@@ -28,7 +28,7 @@
 #include "config.h"
 
 #include "FileCompat.h"
-#include "Matrix3.h"
+#include "DarknessMath.h"
 
 #include <cmath>
 
@@ -73,13 +73,13 @@ File &operator>>(File &st, Plane &val) {
 File &operator<<(File &st, const Quaternion &val) {
     int16_t xi, yi, zi;
 
-    Matrix3 m;
-
-    val.ToRotationMatrix(m);
+    // Convert quaternion → rotation matrix → Euler angles (ZYX order)
+    // GLM's eulerAngle functions work with mat4, so we go quat → mat3 → mat4
+    Matrix3 m3 = glm::mat3_cast(val);
+    Matrix4 m4(m3);
 
     float x_rad, y_rad, z_rad;
-
-    m.ToEulerAnglesZYX(z_rad, y_rad, x_rad);
+    glm::extractEulerAngleZYX(m4, z_rad, y_rad, x_rad);
 
     xi = static_cast<int16_t>(x_rad * 32768 / M_PI);
     yi = static_cast<int16_t>(y_rad * 32768 / M_PI);
@@ -100,10 +100,11 @@ File &operator>>(File &st, Quaternion &val) {
     y = ((float)(yi) / 32768) * static_cast<float>(M_PI);
     z = ((float)(zi) / 32768) * static_cast<float>(M_PI);
 
-    Matrix3 m;
-
-    m.FromEulerAnglesZYX(z, y, x);
-    val.FromRotationMatrix(m);
+    // Convert Euler angles (ZYX order) → rotation matrix → quaternion
+    // GLM's eulerAngleZYX returns mat4, cast to mat3 for quat_cast
+    Matrix4 m4 = glm::eulerAngleZYX(z, y, x);
+    Matrix3 m3(m4);
+    val = glm::quat_cast(m3);
 
     return st;
 }

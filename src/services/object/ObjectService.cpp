@@ -87,7 +87,7 @@ Vector3 ObjectService::position(int objID) {
     if (mPropPosition->get(objID, "position", res)) {
         return res.toVector();
     } else
-        return Vector3::ZERO;
+        return Vector3(0.0f);
 }
 
 //------------------------------------------------------
@@ -97,7 +97,7 @@ Quaternion ObjectService::orientation(int objID) {
     if (mPropPosition->get(objID, "orientation", res)) {
         return res.toQuaternion();
     } else
-        return Quaternion::IDENTITY;
+        return Quaternion(1.0f, 0.0f, 0.0f, 0.0f);
 }
 
 //------------------------------------------------------
