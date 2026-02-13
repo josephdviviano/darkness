@@ -39,6 +39,20 @@ water:
   # 0 = no drift, creates directional water flow
   scroll_speed: 0.05
 
+physics:
+  # Physics timestep rate (default: 60)
+  # Controls the fixed timestep for player physics simulation.
+  # Accepts string names or integer Hz values:
+  #   "vintage" or 12 = 12.5Hz (original Dark Engine rate, 3 collision iterations)
+  #   "modern" or 60  = 60Hz (default, smooth modern physics, 1 collision iteration)
+  #   "ultra" or 120  = 120Hz (high fidelity, 1 collision iteration)
+  # Higher rates give smoother collision but cost more CPU.
+  # All rates produce equivalent physics behavior (same walk speed, jump height,
+  # head bob timing) thanks to rate-independent exponential decay formulation.
+  # Toggle at runtime via debug console (backtick key).
+  # CLI: --physics-rate <12|60|120>
+  rate: 60
+
 developer:
   # Render object meshes (default: true)
   # Set to false for world-geometry-only view

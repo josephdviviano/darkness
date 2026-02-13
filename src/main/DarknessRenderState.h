@@ -179,6 +179,7 @@ struct RuntimeState {
     float  waterElapsed = 0.0f;
     uint32_t skyClearColor = 0x1a1a2eFF;
     bool   running = true;
+    bool   windowFocused = true;  // false when Command+Tab or otherwise backgrounded
 
     // Debug/isolation
     int  isolateModelIdx = -1;

@@ -708,8 +708,8 @@ static void updateTitleBar(SDL_Window *window, const Darkness::RuntimeState &sta
         const char *speedMode = pp.isSneaking() ? "sneak" :
                                 pp.isRunning()  ? "run" : modeName;
         std::snprintf(physSuffix, sizeof(physSuffix),
-            " [%s %s %.1f u/s cell:%d]", groundStr, speedMode, speed,
-            state.physics->getPlayerCell());
+            " [%s %s %.1f u/s cell:%d %.0fHz]", groundStr, speedMode, speed,
+            state.physics->getPlayerCell(), state.physics->getPhysicsHz());
     }
 
     if (state.portalCulling) {
@@ -766,6 +766,24 @@ static void registerConsoleSettings(
             refreshTitle();
         });
 
+    dbgConsole.addCategorical("physics_rate",
+        {"12.5Hz (vintage)", "60Hz (modern)", "120Hz (ultra)"},
+        [&state]() {
+            if (!state.physics) return 1;
+            float hz = state.physics->getPhysicsHz();
+            if (hz < 20.0f) return 0;       // vintage
+            if (hz > 100.0f) return 2;       // ultra
+            return 1;                         // modern
+        },
+        [&state, refreshTitle](int v) {
+            if (!state.physics) return;
+            auto &pp = state.physics->getPlayerPhysics();
+            if (v == 0) pp.setTimestep(Darkness::PlayerPhysics::VINTAGE);
+            else if (v == 2) pp.setTimestep(Darkness::PlayerPhysics::ULTRA);
+            else pp.setTimestep(Darkness::PlayerPhysics::MODERN);
+            refreshTitle();
+        });
+
     dbgConsole.addBool("show_objects",
         [&state]() { return state.showObjects; },
         [&state](bool v) { state.showObjects = v; });
@@ -817,6 +835,14 @@ static void handleEvents(
 
         if (ev.type == SDL_QUIT) {
             state.running = false;
+        } else if (ev.type == SDL_WINDOWEVENT) {
+            // Track window focus to avoid rendering to an invalid Metal drawable
+            // when the user Command+Tabs away (macOS) or Alt+Tabs (Windows/Linux).
+            if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                state.windowFocused = false;
+            } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+                state.windowFocused = true;
+            }
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) {
             state.running = false;
         } else if (ev.type == SDL_MOUSEMOTION) {
@@ -1319,7 +1345,14 @@ int main(int argc, char *argv[]) {
     // Must be created after loadMissionData() so mission.wrData is valid.
     // The physics instance lives for the duration of the program; wrData
     // must outlive it (both are in main's scope).
-    state.physics = std::make_unique<Darkness::DarkPhysics>(mission.wrData);
+    // Map config physicsRate to PhysicsTimestep preset:
+    //   <= 12 → VINTAGE (12.5Hz, 3 collision iters, authentic Dark Engine feel)
+    //   >= 120 → ULTRA (120Hz, 1 iter, high-fidelity)
+    //   else → MODERN (60Hz, 1 iter, default)
+    auto physTimestep = (cfg.physicsRate <= 12)  ? Darkness::PlayerPhysics::VINTAGE
+                      : (cfg.physicsRate >= 120) ? Darkness::PlayerPhysics::ULTRA
+                      : Darkness::PlayerPhysics::MODERN;
+    state.physics = std::make_unique<Darkness::DarkPhysics>(mission.wrData, physTimestep);
 
     // Inject raycaster into the world query facade — enables ray-vs-world
     // queries (AI line-of-sight, physics, sound occlusion) via portal traversal
@@ -1385,6 +1418,18 @@ int main(int argc, char *argv[]) {
         state.waterElapsed += dt;
 
         handleEvents(state, dbgConsole, window);
+
+        // When the window loses focus (Command+Tab on macOS, Alt+Tab elsewhere),
+        // skip rendering entirely. The Metal drawable is invalid while backgrounded
+        // and submitting draw calls would segfault. We still call bgfx::frame() with
+        // no submissions to keep the internal state ticking, and sleep briefly to
+        // avoid burning CPU in a tight poll loop.
+        if (!state.windowFocused) {
+            bgfx::frame();
+            SDL_Delay(16);  // ~60Hz idle polling rate
+            lastTime = std::chrono::high_resolution_clock::now();  // reset clock to avoid dt spike on refocus
+            continue;
+        }
 
         updateMovement(dt, state, mission, dbgConsole);
 

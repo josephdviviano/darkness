@@ -42,7 +42,7 @@
  *    - All sphere radius: 1.2 units
  *    - 5 sphere offsets from body center (Z-up): +1.8, -0.6, -2.2, -2.6, -3.0
  *    - Gravity: ~32 units/sec² (runtime-configurable)
- *    - Fixed timestep: 60 Hz (1/60 sec per physics step)
+ *    - Configurable timestep: 12.5/60/120 Hz via PhysicsTimestep presets
  *
  *    See NOTES.SOURCE.md for full physics constants documentation.
  *
@@ -146,7 +146,6 @@ public:
 
     // Physics parameters
     static constexpr float GRAVITY        = 32.0f;   // units/sec² (runtime-adjustable)
-    static constexpr float FIXED_DT       = 1.0f / 60.0f;  // 60 Hz physics timestep
     // Slope handling — friction-based.
     // GROUND_NORMAL_MIN: any surface with normal.z above this counts as "ground" for
     // state/landing purposes. The 5-sphere model and movement control handle the rest.
@@ -155,8 +154,9 @@ public:
     static constexpr float GROUND_NORMAL_MIN = 0.1f;   // cos(~84°) — any upward surface
     static constexpr float SLIDE_THRESHOLD   = 0.64f;  // cos(~50°) — below this, sliding
 
-    // Collision iteration count — matching the renderer's camera collision
-    static constexpr int COLLISION_ITERS  = 3;
+    // Collision iteration count — now set per-preset via PhysicsTimestep.collisionIters.
+    // Vintage (12.5Hz): 3 iterations.
+    // Modern/Ultra: 1 iteration (higher Hz compensates with more steps/sec).
 
     // Landing detection thresholds.
     static constexpr float LANDING_MIN_VEL  = 2.0f;    // minimum downward speed for landing pose
@@ -180,15 +180,30 @@ public:
     // ground acceleration - impulse formula with friction=0 and Z removed from input.
     static constexpr float AIR_ACCEL_FRAC = 0.3f;
 
-    // Spring-connected head (smooths vertical motion, creates natural head bob).
-    // Formula: vel = displacement * tension + vel * damping
-    // Damping=0.02 means only 2% of previous velocity is retained per frame
-    // (98% decay — very heavy damping, no oscillation).
-    // The Z-axis (vertical) gets an additional 0.5 multiplier for less springy vertical motion.
-    static constexpr float HEAD_SPRING_TENSION = 0.6f;
-    static constexpr float HEAD_SPRING_DAMPING = 0.02f;
-    static constexpr float HEAD_SPRING_Z_SCALE = 0.5f;  // vertical axis half-strength
-    static constexpr float HEAD_SPRING_CAP     = 25.0f;  // max spring velocity
+    /// Physics timestep configuration — bundles all rate-dependent parameters.
+    /// Spring constants are in per-second units (rate-independent). The exponential
+    /// decay formula `blend = 1 - exp(-rate * dt)` handles different timesteps to
+    /// produce equivalent convergence per second.
+    ///
+    /// Inspired by Godot's frame-rate-independent smoothing approach.
+    struct PhysicsTimestep {
+        float fixedDt;          // seconds per physics step
+        int   collisionIters;   // constraint projection iterations per step
+        float springStiffness;  // head spring convergence rate (per second, XY axes)
+        float springDamping;    // head spring convergence rate (per second, Z axis)
+    };
+
+    // Spring rates derived from the the reference point: 12.5Hz physics simulation.
+    // At 12.5Hz, had 60% convergence per step for XY and 30% for Z.
+    //
+    //   XY: 60% convergence per step at 12.5Hz => rate = -12.5*ln(0.4) = 11.45/sec
+    //   Z:  30% convergence per step at 12.5Hz => rate = -12.5*ln(0.7) = 4.46/sec
+    //
+    // Verification across rates (remaining displacement after 1 second):
+    //   12.5Hz: (1-0.600)^12.5 = 0.0001 | 60Hz: (1-0.174)^60 = 0.0001 | 120Hz: (1-0.091)^120 = 0.0001
+    static constexpr PhysicsTimestep VINTAGE = { 1.0f / 12.5f, 3, 11.45f, 4.46f };
+    static constexpr PhysicsTimestep MODERN  = { 1.0f / 60.0f, 1, 11.45f, 4.46f };
+    static constexpr PhysicsTimestep ULTRA   = { 1.0f / 120.0f, 1, 11.45f, 4.46f };
 
     // Eye position above head submodel center.
     // Camera is 0.8 units above the head sphere center for natural eye height.
@@ -322,23 +337,63 @@ public:
 
     /// Create player physics with reference to collision geometry.
     /// The collision geometry must outlive this object.
-    explicit PlayerPhysics(const CollisionGeometry &collision)
-        : mCollision(collision) {}
+    /// Optionally accepts a PhysicsTimestep preset (default: MODERN = 60Hz).
+    explicit PlayerPhysics(const CollisionGeometry &collision,
+                           const PhysicsTimestep &ts = MODERN)
+        : mCollision(collision), mTimestep(ts) {}
+
+    /// Change the active physics timestep preset at runtime.
+    void setTimestep(const PhysicsTimestep &ts) { mTimestep = ts; }
+
+    /// Get the active physics timestep configuration.
+    const PhysicsTimestep& getTimestep() const { return mTimestep; }
+
+    /// Get the physics update rate in Hz (= 1 / fixedDt).
+    float getPhysicsHz() const { return 1.0f / mTimestep.fixedDt; }
 
     // ── Main simulation ──
 
     /// Advance the player simulation by dt seconds.
-    /// Internally steps in FIXED_DT increments. Performs gravity, movement
+    /// Internally steps in fixedDt increments. Performs gravity, movement
     /// integration, collision response, and ground detection.
     /// contactCb may be empty if no contact notifications are needed.
     inline void step(float dt, const ContactCallback &contactCb) {
         mTimeAccum += dt;
 
-        // Fixed timestep accumulation — step at 60 Hz
-        while (mTimeAccum >= FIXED_DT) {
-            mTimeAccum -= FIXED_DT;
-            fixedStep(contactCb);
+        // DEBUG: validate timestep config on every step
+        if (mTimestep.fixedDt <= 0.0f || mTimestep.fixedDt > 1.0f) {
+            fprintf(stderr, "[PHYSICS-BUG] invalid fixedDt=%.6f, forcing MODERN\n", mTimestep.fixedDt);
+            mTimestep = MODERN;
         }
+
+        // Fixed timestep accumulation — step at configured Hz.
+        // Before stepping, snapshot eye position for render interpolation.
+        // After the loop, compute interpolation alpha from accumulator remainder.
+        int stepCount = 0;
+        while (mTimeAccum >= mTimestep.fixedDt) {
+            // Snapshot previous eye state BEFORE each physics step so we always
+            // have the state from one step behind the current state.
+            mPrevEyePos   = computeRawEyePos();
+            mPrevLeanTilt = computeRawLeanTilt();
+
+            mTimeAccum -= mTimestep.fixedDt;
+            fixedStep(contactCb);
+            ++stepCount;
+            // Safety: cap at 10 steps per frame to prevent spiral of death
+            if (stepCount >= 10) {
+                mTimeAccum = 0.0f;
+                break;
+            }
+        }
+
+        // Compute render interpolation alpha from accumulator remainder.
+        // alpha=0 means "show previous state", alpha=1 means "show current state".
+        // This MUST run every frame, not just when a physics step occurred — on
+        // frames between physics steps the accumulator still grows, and alpha must
+        // reflect progress through the interval so the camera moves smoothly.
+        // At 12.5Hz with 60fps, ~4 of 5 frames have no physics step; without
+        // unconditional alpha update the camera would freeze between steps.
+        mInterpAlpha = mTimeAccum / mTimestep.fixedDt;
     }
 
     // ── Input ──
@@ -408,49 +463,26 @@ public:
     /// (higher than the old 2-sphere model's ground + 1.2).
     const Vector3 &getPosition() const { return mPosition; }
 
-    /// Eye position — computed from body center + 3D head spring output.
-    /// The 3D spring tracks motion pose targets (stride bob, landing dip),
-    /// producing natural forward/lateral/vertical displacement smoothed by
-    /// spring dynamics. Lean offset is applied on top with collision limiting.
+    /// Eye position — interpolated between previous and current physics states.
+    /// Uses the accumulator remainder from step() to smoothly blend between the
+    /// last two computed physics positions. This is essential for low-Hz presets
+    /// (12.5Hz vintage) where the physics timestep is much coarser than the
+    /// display refresh rate. Without interpolation, the camera visibly jumps
+    /// between physics positions.
     ///
-    /// Spring displacement is in player-local coordinates:
-    ///   X = forward (cos(yaw), sin(yaw), 0)
-    ///   Y = lateral/right (sin(yaw), -cos(yaw), 0)
-    ///   Z = vertical (0, 0, 1)
+    /// Uses "Fix Your Timestep" interpolation with frame fraction.
     inline Vector3 getEyePosition() const {
-        // Base eye Z = body center + head offset + gEyeLoc + spring vertical displacement
-        float headZ = isCrouching() ? HEAD_OFFSET_Z * CROUCH_SCALE : HEAD_OFFSET_Z;
-        Vector3 eye = mPosition + Vector3(0.0f, 0.0f, headZ + EYE_ABOVE_HEAD + mSpringPos.z);
-
-        float sinYaw = std::sin(mYaw);
-        float cosYaw = std::cos(mYaw);
-
-        // Apply spring forward displacement (player-local → world)
-        if (std::fabs(mSpringPos.x) > 0.001f) {
-            eye.x += cosYaw * mSpringPos.x;
-            eye.y += sinYaw * mSpringPos.x;
-        }
-
-        // Apply lateral displacement (player-local → world).
-        // Uses collision-limited mLeanAmount instead of raw mSpringPos.y.
-        // When not leaning, mLeanAmount == mSpringPos.y (stride bob only, no collision).
-        // When leaning, mLeanAmount may be reduced by wall collision in updateLean().
-        // Right vector in Z-up: (sin(yaw), -cos(yaw), 0)
-        if (std::fabs(mLeanAmount) > 0.001f) {
-            eye.x += sinYaw * mLeanAmount;
-            eye.y -= cosYaw * mLeanAmount;
-        }
-        return eye;
+        Vector3 current = computeRawEyePos();
+        return glm::mix(mPrevEyePos, current, mInterpAlpha);
     }
 
-    /// Camera roll/bank angle from leaning (radians).
+    /// Camera roll/bank angle from leaning (radians), interpolated.
     /// Positive = tilting right, negative = tilting left.
     /// Proportional to the collision-limited lean extent (mLeanAmount),
     /// which is derived from the spring's lateral displacement each frame.
     inline float getLeanTilt() const {
-        float maxDist = isCrouching() ? CROUCH_LEAN_DISTANCE : LEAN_DISTANCE;
-        if (maxDist < 0.01f) return 0.0f;
-        return (mLeanAmount / maxDist) * LEAN_TILT;
+        float current = computeRawLeanTilt();
+        return mPrevLeanTilt + (current - mPrevLeanTilt) * mInterpAlpha;
     }
 
     /// Linear velocity
@@ -508,6 +540,12 @@ public:
             mCellIdx = mCollision.findCell(pos + Vector3(0.0f, 0.0f, SPHERE_RADIUS));
         }
         mCurrentMode = PlayerMode::Jump; // will detect ground on next step
+
+        // Initialize interpolation state to current position so there's no
+        // lerp glitch on the first frame after a teleport/spawn.
+        mPrevEyePos   = computeRawEyePos();
+        mPrevLeanTilt = computeRawLeanTilt();
+        mInterpAlpha  = 1.0f;
     }
 
     /// Set gravity magnitude (units/sec²). Default is GRAVITY.
@@ -522,13 +560,30 @@ private:
         Vector3 dbgStepStart = mPosition;
         int32_t dbgCellStart = mCellIdx;
 
+        // DEBUG: phase tracking — prints which phase we're entering so a crash
+        // shows the last completed phase in stderr before the segfault.
+        static int dbgStepNum = 0;
+        ++dbgStepNum;
+        // Only log first 20 steps and then every 600th (~10 sec at 60Hz) to avoid spam
+        bool dbgVerbose = (dbgStepNum <= 20) || (dbgStepNum % 600 == 0);
+        if (dbgVerbose) {
+            fprintf(stderr, "[PHYS-STEP] #%d  dt=%.4f  Hz=%.0f  iters=%d  pos=(%.1f,%.1f,%.1f)  "
+                "cell=%d  mode=%d  spring=(%.2f,%.2f,%.2f)\n",
+                dbgStepNum, mTimestep.fixedDt, 1.0f/mTimestep.fixedDt,
+                mTimestep.collisionIters,
+                mPosition.x, mPosition.y, mPosition.z,
+                mCellIdx, static_cast<int>(mCurrentMode),
+                mSpringPos.x, mSpringPos.y, mSpringPos.z);
+        }
+
         // Advance simulation time (for landing throttle, animation timing, etc.)
-        mSimTime += FIXED_DT;
+        mSimTime += mTimestep.fixedDt;
 
         // ── Mantle takes over the full step when active ──
         // During mantling, normal movement/gravity/collision are suppressed.
         // The mantle state machine drives position directly.
         if (mMantling) {
+            if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: mantle\n", dbgStepNum);
             updateMantle();
             updateCell();
             updateMotionPose();
@@ -552,48 +607,60 @@ private:
         mJumpRequested = false;
 
         // 2. Handle mode transitions (crouch, swim, etc.)
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 2-modes\n", dbgStepNum);
         if (!mMotionDisabled)
             updateModeTransitions();
 
         // 3. Apply gravity (if airborne — always, even when disabled)
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 3-gravity\n", dbgStepNum);
         applyGravity();
 
         // 4. Apply horizontal movement from input (skip when disabled)
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 4-movement\n", dbgStepNum);
         if (!mMotionDisabled)
             applyMovement();
 
         // 5. Integrate position
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 5-integrate\n", dbgStepNum);
         integrate();
 
         // 6. Update cell index BEFORE collision — if integration moved
         //    the player through a portal, collision must test against
         //    the new cell's walls, not the old cell's.
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 6-updateCell\n", dbgStepNum);
         updateCell();
 
         // 7. Resolve collisions via 5-sphere constraint projection
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 7-collision (iters=%d)\n", dbgStepNum, mTimestep.collisionIters);
         resolveCollisions(contactCb);
 
         // 8. Detect ground and update movement state
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 8-detectGround\n", dbgStepNum);
         detectGround();
 
         // 9. Update cell index again (collision may have shifted position)
         // Relies purely on gravity + collision + constraint response to keep
         // the player grounded. An explicit snap was causing jitter (collision
         // pushes up, snap pulls down) and fighting with uphill movement.
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 9-updateCell2\n", dbgStepNum);
         updateCell();
 
         // 10. Check for mantle opportunity when airborne and pressing forward
         if (mCurrentMode == PlayerMode::Jump && mInputForward > 0.1f && !mMotionDisabled) {
+            if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 10-mantle\n", dbgStepNum);
             checkMantle();
         }
 
         // 11. Update motion pose system (discrete stride-driven pose targets)
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 11-motionPose\n", dbgStepNum);
         updateMotionPose();
 
         // 12. Update 3D head spring (tracks pose targets with spring dynamics)
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 12-headSpring\n", dbgStepNum);
         updateHeadSpring();
 
         // 13. Update lean (visual-only lateral camera offset with collision)
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 13-lean\n", dbgStepNum);
         updateLean();
 
         // DEBUG: detect teleportation — large per-step position jump
@@ -611,13 +678,16 @@ private:
                     static_cast<int>(mCurrentMode));
             }
         }
+
+        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  DONE  pos=(%.1f,%.1f,%.1f)  cell=%d\n",
+            dbgStepNum, mPosition.x, mPosition.y, mPosition.z, mCellIdx);
     }
 
     /// Apply gravity to velocity (if not on ground)
     inline void applyGravity() {
         if (!isOnGround()) {
             // Z-up: gravity pulls downward
-            mVelocity.z -= mGravityMag * FIXED_DT;
+            mVelocity.z -= mGravityMag * mTimestep.fixedDt;
         }
     }
 
@@ -706,7 +776,7 @@ private:
                 float hSpeed = std::sqrt(mVelocity.x * mVelocity.x +
                                          mVelocity.y * mVelocity.y);
                 if (hSpeed > 0.01f) {
-                    float decel = MOVEMENT_DECEL * FIXED_DT;
+                    float decel = MOVEMENT_DECEL * mTimestep.fixedDt;
                     float newSpeed = std::max(0.0f, hSpeed - decel);
                     float ratio = newSpeed / hSpeed;
                     mVelocity.x *= ratio;
@@ -722,7 +792,7 @@ private:
 
                 if (deltaLen > 0.01f) {
                     // Accelerate toward desired velocity
-                    float accelMag = MOVEMENT_ACCEL * FIXED_DT;
+                    float accelMag = MOVEMENT_ACCEL * mTimestep.fixedDt;
                     if (accelMag > deltaLen) {
                         // Would overshoot — snap to desired
                         mVelocity.x = desired.x;
@@ -751,7 +821,7 @@ private:
                 float deltaLen = glm::length(delta);
 
                 if (deltaLen > 0.01f) {
-                    float airAccel = MOVEMENT_ACCEL * AIR_ACCEL_FRAC * FIXED_DT;
+                    float airAccel = MOVEMENT_ACCEL * AIR_ACCEL_FRAC * mTimestep.fixedDt;
                     if (airAccel > deltaLen) {
                         mVelocity.x = airDesired.x;
                         mVelocity.y = airDesired.y;
@@ -767,7 +837,7 @@ private:
 
     /// Integrate position from velocity
     inline void integrate() {
-        mPosition += mVelocity * FIXED_DT;
+        mPosition += mVelocity * mTimestep.fixedDt;
     }
 
     /// Resolve collisions using the 5-sphere model.
@@ -785,7 +855,7 @@ private:
 
         mLastContacts.clear();
 
-        for (int iter = 0; iter < COLLISION_ITERS; ++iter) {
+        for (int iter = 0; iter < mTimestep.collisionIters; ++iter) {
             if (mCellIdx < 0)
                 break;
 
@@ -1232,7 +1302,7 @@ private:
     inline void updateMantle() {
         if (!mMantling) return;
 
-        mMantleTimer += FIXED_DT;
+        mMantleTimer += mTimestep.fixedDt;
 
         switch (mMantleState) {
         case MantleState::Hold:
@@ -1256,10 +1326,13 @@ private:
                     mMantleState = MantleState::Forward;
                     mMantleTimer = 0.0f;
                 } else {
-                    // Move toward target at spring-controlled rate
-                    float riseSpeed = dz * HEAD_SPRING_TENSION / FIXED_DT * 0.5f;
-                    riseSpeed = std::max(-20.0f, std::min(20.0f, riseSpeed));
-                    mPosition.z += riseSpeed * FIXED_DT;
+                    // Move toward target via exponential convergence (rate-independent).
+                    // Uses the Z spring damping rate — same 30% convergence/step at 12.5Hz.
+                    float blend = 1.0f - std::exp(-mTimestep.springDamping * mTimestep.fixedDt);
+                    float step = dz * blend;
+                    float maxStep = 20.0f * mTimestep.fixedDt;  // velocity cap equivalent
+                    step = std::max(-maxStep, std::min(maxStep, step));
+                    mPosition.z += step;
                 }
             }
             break;
@@ -1277,7 +1350,7 @@ private:
                     mMantleState = MantleState::StandUp;
                     mMantleTimer = 0.0f;
                 } else {
-                    float frac = FIXED_DT / std::max(0.01f, MANTLE_FWD_TIME - mMantleTimer + FIXED_DT);
+                    float frac = mTimestep.fixedDt / std::max(0.01f, MANTLE_FWD_TIME - mMantleTimer + mTimestep.fixedDt);
                     mPosition.x += dx * frac;
                     mPosition.y += dy * frac;
                 }
@@ -1294,7 +1367,7 @@ private:
         case MantleState::Complete:
             // Phase 5: wait for ground contact, then end mantle
             // Apply gravity so the player settles onto the ledge
-            mVelocity.z -= mGravityMag * FIXED_DT;
+            mVelocity.z -= mGravityMag * mTimestep.fixedDt;
             if (isOnGround() || mMantleTimer > 1.0f) {
                 // Done mantling — return to normal mode
                 mMantling = false;
@@ -1537,7 +1610,7 @@ private:
         bool isWalking = (isOnGround() && hSpeed > 1.5f && !isLeaning);
 
         // Advance pose timer
-        mPoseTimer += FIXED_DT;
+        mPoseTimer += mTimestep.fixedDt;
 
         // Compute current interpolated pose offset
         bool poseReady = false;  // true when current pose blend+hold is complete
@@ -1578,7 +1651,7 @@ private:
         // not time-based, foot submodel tracking.
         bool strideTriggered = false;
         if (isOnGround() && hSpeed > 1.0f) {
-            mStrideDist += hSpeed * FIXED_DT;
+            mStrideDist += hSpeed * mTimestep.fixedDt;
             float footstepDist = computeFootstepDist(hSpeed);
             if (isWalking && mStrideDist >= footstepDist) {
                 strideTriggered = true;
@@ -1659,70 +1732,76 @@ private:
         mWasWalking = isWalking;
     }
 
-    /// Update 3D head spring.
-    ///
-    /// The spring tracks the motion pose's interpolated offset in player-local
-    /// coordinates {forward, lateral, vertical}. The formula:
-    ///
-    ///   tension_eff = tension / dt     (= 0.6 / (1/60) = 36.0 at 60fps)
-    ///   damping_eff = damping + (1 - damping) * dt   (= 0.02 + 0.98/60 ≈ 0.0363)
-    ///
-    ///   vel = displacement * tension_eff
-    ///   vel.z *= 0.5        // vertical axis half-strength
-    ///   vel += prev_vel * damping_eff
-    ///
-    ///   if (|vel| > cap) vel *= cap / |vel|
-    ///   pos += vel * dt
-    ///
-    /// At 60fps this converges ~60% per frame horizontally, ~30% vertically.
-    /// Very overdamped — no oscillation, smooth and natural.
-    inline void updateHeadSpring() {
-        // Target = current interpolated motion pose offset
-        Vector3 target = mPoseCurrent;
+    /// Compute the raw (un-interpolated) eye position from current physics state.
+    /// This is the body center + head offset + eye-above-head + spring displacement
+    /// (in player-local coords rotated by yaw) + collision-limited lean.
+    /// Called by getEyePosition() for interpolation and by step() to snapshot state.
+    inline Vector3 computeRawEyePos() const {
+        // Head Z offset — drops when crouching (body center shifts down to keep feet planted)
+        float headZ = isCrouching() ? HEAD_OFFSET_Z * CROUCH_SCALE : HEAD_OFFSET_Z;
+        Vector3 eye = mPosition + Vector3(0.0f, 0.0f, headZ + EYE_ABOVE_HEAD + mSpringPos.z);
 
-        // Displacement from current spring position to target
-        Vector3 disp = target - mSpringPos;
+        float sinYaw = std::sin(mYaw);
+        float cosYaw = std::cos(mYaw);
 
-        // Spring dt clamping — protection against lag spikes and near-zero
-        // timesteps that could destabilize the spring.
-        float springDt = FIXED_DT;
-        if (springDt > 0.05f) springDt = 0.05f * 0.6f;  // lag spike protection
-        if (springDt < 0.001f) springDt = 0.001f;        // division-by-zero protection
-
-        // Effective tension: tension / dt — scales displacement into velocity
-        // At 60fps: 0.6 / (1/60) = 36.0
-        float tensionEff = HEAD_SPRING_TENSION / springDt;
-
-        // Effective damping: retains a tiny fraction of previous velocity
-        // At 60fps: 0.02 + 0.98 * (1/60) ≈ 0.0363
-        float dampingEff = HEAD_SPRING_DAMPING + (1.0f - HEAD_SPRING_DAMPING) * springDt;
-
-        // New velocity = displacement-proportional term + damped previous velocity
-        Vector3 newVel = disp * tensionEff;
-        newVel.z *= HEAD_SPRING_Z_SCALE;  // vertical axis half-strength
-        newVel += mSpringVel * dampingEff;
-
-        // Velocity cap — prevents extreme values during large displacements
-        // (e.g. crouch transition, landing bump)
-        float velMag = glm::length(newVel);
-        if (velMag > HEAD_SPRING_CAP) {
-            newVel *= HEAD_SPRING_CAP / velMag;
+        // Spring forward displacement (mSpringPos.x = forward axis in player-local coords)
+        if (std::fabs(mSpringPos.x) > 0.001f) {
+            eye.x += cosYaw * mSpringPos.x;
+            eye.y += sinYaw * mSpringPos.x;
         }
 
-        mSpringVel = newVel;
-        mSpringPos += mSpringVel * springDt;
+        // Collision-limited lean offset (lateral displacement)
+        if (std::fabs(mLeanAmount) > 0.001f) {
+            eye.x += sinYaw * mLeanAmount;
+            eye.y -= cosYaw * mLeanAmount;
+        }
+
+        return eye;
+    }
+
+    /// Compute the raw (un-interpolated) lean tilt from current physics state.
+    /// Returns camera roll angle proportional to collision-limited lean extent.
+    inline float computeRawLeanTilt() const {
+        float maxDist = isCrouching() ? CROUCH_LEAN_DISTANCE : LEAN_DISTANCE;
+        if (maxDist < 0.01f) return 0.0f;
+        return (mLeanAmount / maxDist) * LEAN_TILT;
+    }
+
+    /// Update 3D head spring — exponential decay model (rate-independent).
+    ///
+    /// Replaces the per-frame tension/damping formulation with exponential
+    /// convergence (inspired by Godot's frame-rate-independent smoothing):
+    ///   blend = 1 - exp(-rate * dt)
+    ///
+    /// Rates derived from the original Dark Engine at 12.5Hz (the reference):
+    ///   XY: 60% convergence per step at 12.5Hz => 11.45/sec
+    ///   Z:  30% convergence per step at 12.5Hz => 4.46/sec
+    ///
+    /// At any Hz, convergence per second is preserved:
+    ///   12.5Hz: blend=0.600/step, 60Hz: blend=0.174/step, 120Hz: blend=0.091/step
+    ///   All produce ~0.01% remaining after 1 second.
+    inline void updateHeadSpring() {
+        Vector3 target = mPoseCurrent;
+        Vector3 disp = target - mSpringPos;
+
+        float dt = mTimestep.fixedDt;
+        float blendXY = 1.0f - std::exp(-mTimestep.springStiffness * dt);
+        float blendZ  = 1.0f - std::exp(-mTimestep.springDamping * dt);
+
+        mSpringPos.x += disp.x * blendXY;
+        mSpringPos.y += disp.y * blendXY;
+        mSpringPos.z += disp.z * blendZ;
 
         // Clamp to sane range — ±3.0 accommodates crouch transition where
         // body center shifts ±1.5 and the spring must track the large
         // displacement back to zero.
-        mSpringPos.x = std::max(-3.0f, std::min(3.0f, mSpringPos.x));
-        mSpringPos.y = std::max(-3.0f, std::min(3.0f, mSpringPos.y));
-        mSpringPos.z = std::max(-3.0f, std::min(3.0f, mSpringPos.z));
+        mSpringPos = glm::clamp(mSpringPos, Vector3(-3.0f), Vector3(3.0f));
     }
 
     // ── State ──
 
     const CollisionGeometry &mCollision;  // world collision geometry (not owned)
+    PhysicsTimestep mTimestep = MODERN;  // active timestep configuration
 
     Vector3 mPosition{0.0f};       // body center position (ground + 4.2 on flat ground)
     Vector3 mVelocity{0.0f};       // linear velocity
@@ -1754,7 +1833,6 @@ private:
     // Position is displacement from the stance rest offset; the spring naturally
     // converges toward the current pose target.
     Vector3 mSpringPos{0.0f};     // current spring displacement {fwd, lat, vert}
-    Vector3 mSpringVel{0.0f};     // spring velocity
 
     // ── Motion pose state ──
     // Discrete stride-driven pose system. Each stride triggers a new target
@@ -1787,6 +1865,16 @@ private:
 
     // Ground contact normal from last collision pass
     Vector3 mGroundNormal{0.0f, 0.0f, 1.0f};
+
+    // ── Render interpolation state ──
+    // "Fix Your Timestep" interpolation — smooth rendering between fixed physics steps.
+    // The original Dark Engine uses interpolates with frame fraction to blend
+    // between previous and current physics states. At low Hz (12.5Hz vintage), without
+    // interpolation the camera visibly snaps between physics positions.
+    // mInterpAlpha = accumulator remainder / fixedDt, in [0, 1).
+    Vector3 mPrevEyePos{0.0f};    // eye position from before the last physics step
+    float   mPrevLeanTilt = 0.0f; // lean tilt from before the last physics step
+    float   mInterpAlpha  = 1.0f; // interpolation fraction (1.0 = show current state)
 
     // Lean state — driven through motion poses (spring provides easing)
     int   mLeanDir        = 0;    // lean direction: -1=left, 0=center, +1=right
