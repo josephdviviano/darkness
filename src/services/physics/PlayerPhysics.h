@@ -25,14 +25,22 @@
  *    collision and constraint-based response. Header-only (inline),
  *    matching CellGeometry.h / RayCaster.h / CollisionGeometry.h pattern.
  *
- *    Phase 2 uses a simplified 2-sphere model (body + head) with the
- *    full 5-sphere model planned for later. Collision response uses
- *    normal removal (constraint projection), not impulse-based resolution.
+ *    Uses a 5-sphere player model:
+ *    HEAD (+1.8), BODY (-0.6), SHIN (-2.2), KNEE (-2.6), FOOT (-3.0)
+ *    All spheres have radius 1.2, rigidly attached to a single body center.
+ *    Stairs are handled naturally by lower sphere contacts generating
+ *    upward-component normals — no explicit stair-step logic needed.
+ *
+ *    Head bob is driven by discrete motion poses — target offsets that the
+ *    head spring tracks. Each stride activates a new pose target, and the
+ *    3D spring naturally smooths the transitions, creating realistic bob
+ *    with organic acceleration/deceleration. This matches the original
+ *    Dark Engine's player head physics system.
  *
  *    Constants:
  *    - Walk speed: 11.0 units/sec, Run: 22.0, Creep: 5.5
- *    - Player body sphere radius: 1.2 units
- *    - Head sphere offset: +4.8 units above body center
+ *    - All sphere radius: 1.2 units
+ *    - 5 sphere offsets from body center (Z-up): +1.8, -0.6, -2.2, -2.6, -3.0
  *    - Gravity: ~40 units/sec² (runtime-configurable)
  *    - Fixed timestep: 60 Hz (1/60 sec per physics step)
  *
@@ -43,43 +51,85 @@
 #ifndef __PLAYERPHYSICS_H
 #define __PLAYERPHYSICS_H
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <vector>
 
 #include "DarknessMath.h"
 #include "CollisionGeometry.h"
 #include "IPhysicsWorld.h"
+#include "RayCaster.h"
 
 namespace Darkness {
 
-/// Player movement state
-enum class PlayerMoveState {
-    OnGround,       // walking / standing on a solid surface
-    Falling,        // airborne, gravity pulling down
-    Swimming,       // in water volume (mediaType == 2)
-    Climbing        // on a climbable surface (rope, ladder)
+/// Player mode — high-level state machine.
+/// Determines speed multipliers, motion pose configuration, and physics behavior.
+/// Replaces the separate PlayerMoveState enum and mCrouching boolean.
+enum class PlayerMode {
+    Stand,      // 0: Normal walking/running (on ground)
+    Crouch,     // 1: Crouched movement (0.6× speed)
+    Swim,       // 2: In water (0.7× speed, 0.7× rotation)
+    Climb,      // 3: On climbable surface (0.5× trans, 0.7× rot)
+    BodyCarry,  // 4: Carrying a body (1.0× speed, heavy bob)
+    Slide,      // 5: Sliding on smooth surface
+    Jump,       // 6: Airborne (jumping/falling)
+    Dead,       // 7: No movement
+    NumModes
 };
 
-/// Player physics simulation — custom sphere-polygon collision.
+/// Mantle animation state — 5 phases from ledge detection to standing up.
+enum class MantleState {
+    None,       // not mantling
+    Hold,       // Phase 1: hold position, suppress physics (MANTLE_HOLD_TIME)
+    Rise,       // Phase 2: move vertically toward ledge via spring
+    Forward,    // Phase 3: move horizontally onto ledge (MANTLE_FWD_TIME)
+    StandUp,    // Phase 4: restore normal standing offsets
+    Complete    // Phase 5: wait for ground contact, then return to normal mode
+};
+
+/// Player physics simulation — custom 5-sphere-polygon collision.
 /// Owns the player's position, velocity, and movement state.
 /// Updated each frame by DarkPhysics::step().
 class PlayerPhysics {
 public:
     // ── Player physics constants ──
-    // Values from previous analysis (Task 20)
+    // 5-sphere player model (HEAD, BODY, SHIN, KNEE, FOOT) with fixed radius and vertical offsets.
 
-    // Sphere radii — all spheres use the same radius
+    // Sphere radii — all 5 spheres use the same radius
     static constexpr float SPHERE_RADIUS = 1.2f;
 
-    // Sphere center offsets relative to body center (Z-up)
-    // Full 5-sphere model: HEAD +1.8, BODY -0.6, KNEE -2.6, SHIN -2.2, FOOT -3.0
-    // Phase 2 simplified: body sphere at center, head sphere above
-    static constexpr float HEAD_OFFSET    = 4.8f;    // head center above body center
+    // Player height parameters
     static constexpr float STAND_HEIGHT   = 6.0f;    // total standing height
     static constexpr float CROUCH_HEIGHT  = 3.0f;    // total crouching height
-    static constexpr float CROUCH_HEAD_OFFSET = 2.4f; // head offset when crouching
+
+    // 5-sphere center offsets relative to body center (Z-up).
+    // Standing on flat ground: FOOT bottom at ground → FOOT center at ground + 1.2
+    // → body center at ground + 4.2 → eye (HEAD center) at ground + 6.0.
+    static constexpr float HEAD_OFFSET_Z  =  1.8f;   // (STAND_HEIGHT/2) - SPHERE_RADIUS
+    static constexpr float BODY_OFFSET_Z  = -0.6f;   // (STAND_HEIGHT/2) - 3*SPHERE_RADIUS
+    static constexpr float SHIN_OFFSET_Z  = -2.2f;   // -(STAND_HEIGHT * 11/30)
+    static constexpr float KNEE_OFFSET_Z  = -2.6f;   // -(STAND_HEIGHT * 13/30)
+    static constexpr float FOOT_OFFSET_Z  = -3.0f;   // -(STAND_HEIGHT/2)
+
+    // Number of collision spheres and offset array for iteration
+    static constexpr int NUM_SPHERES = 5;
+    static constexpr float SPHERE_OFFSETS[NUM_SPHERES] = {
+        HEAD_OFFSET_Z,   // 0: HEAD   +1.8
+        BODY_OFFSET_Z,   // 1: BODY   -0.6
+        SHIN_OFFSET_Z,   // 2: SHIN   -2.2
+        KNEE_OFFSET_Z,   // 3: KNEE   -2.6
+        FOOT_OFFSET_Z    // 4: FOOT   -3.0
+    };
+
+    // Crouch scale — all sphere offsets scale by CROUCH_HEIGHT/STAND_HEIGHT when crouching.
+    // Body center drops to keep feet on ground.
+    static constexpr float CROUCH_SCALE = CROUCH_HEIGHT / STAND_HEIGHT; // 0.5
+    // Body center shift when crouching: (1 - CROUCH_SCALE) * FOOT_OFFSET_Z
+    // = 0.5 * (-3.0) = -1.5 (body center drops 1.5 units to keep feet planted)
+    static constexpr float CROUCH_CENTER_DROP = (1.0f - CROUCH_SCALE) * FOOT_OFFSET_Z;
 
     // Movement speeds (world units/sec)
     static constexpr float WALK_SPEED     = 11.0f;
@@ -97,36 +147,176 @@ public:
     // Physics parameters
     static constexpr float GRAVITY        = 40.0f;   // units/sec² (runtime-adjustable)
     static constexpr float FIXED_DT       = 1.0f / 60.0f;  // 60 Hz physics timestep
-    static constexpr float MAX_SLOPE_COS  = 0.766f;  // cos(~40°), max walkable slope
-    static constexpr float STAIR_HEIGHT   = 4.0f;    // max auto-step height
+    // Slope handling — friction-based.
+    // GROUND_NORMAL_MIN: any surface with normal.z above this counts as "ground" for
+    // state/landing purposes. The 5-sphere model and movement control handle the rest.
+    // SLIDE_THRESHOLD: below this normal.z, movement control is progressively reduced,
+    // causing the player to slide down steep slopes under gravity.
+    static constexpr float GROUND_NORMAL_MIN = 0.1f;   // cos(~84°) — any upward surface
+    static constexpr float SLIDE_THRESHOLD   = 0.64f;  // cos(~50°) — below this, sliding
     static constexpr float GROUND_SNAP    = 0.5f;    // snap-to-ground tolerance
 
     // Collision iteration count — matching the renderer's camera collision
     static constexpr int COLLISION_ITERS  = 3;
 
-    // Air control factor — reduced horizontal control while airborne
-    static constexpr float AIR_CONTROL    = 0.3f;
+    // Landing detection thresholds.
+    static constexpr float LANDING_MIN_VEL  = 2.0f;    // minimum downward speed for landing pose
+    static constexpr float LANDING_MIN_TIME = 0.2f;    // minimum 200ms between landing events
 
-    // Spring-connected head
+    // Mantle system — 3-ray detection + 5-state animation
+    static constexpr float MANTLE_UP_DIST   = 3.5f;    // upward headroom check distance
+    static constexpr float MANTLE_FWD_DIST  = 2.4f;    // forward ledge reach (radius × 2)
+    static constexpr float MANTLE_DOWN_DIST = 7.0f;    // downward surface scan distance
+    static constexpr float MANTLE_HOLD_TIME = 0.3f;    // Phase 1: hold & compress duration
+    static constexpr float MANTLE_FWD_TIME  = 0.4f;    // Phase 3: forward movement duration
+
+    // Acceleration-based movement — replaces direct velocity setting.
+    // Impulse-based control (PHCTRL); these values create similar ramp-up/ramp-down curves.
+    // At 120 units/sec² accel, walk speed (11) reached in ~0.09 seconds.
+    // At 80 units/sec² decel, full stop from walk in ~0.14 seconds.
+    static constexpr float MOVEMENT_ACCEL = 120.0f;  // ground acceleration (units/sec²)
+    static constexpr float MOVEMENT_DECEL = 80.0f;   // ground deceleration (units/sec²)
+
+    // Air acceleration fraction — airborne steering uses this fraction of
+    // ground acceleration. The original engine uses the same impulse formula
+    // with friction=0 and Z removed from input.
+    static constexpr float AIR_ACCEL_FRAC = 0.3f;
+
+    // Spring-connected head (smooths vertical motion, creates natural head bob).
+    // Formula: vel = displacement * tension + vel * damping
+    // Damping=0.02 means only 2% of previous velocity is retained per frame
+    // (98% decay — very heavy damping, no oscillation).
+    // The Z-axis (vertical) gets an additional 0.5 multiplier for less springy vertical motion.
     static constexpr float HEAD_SPRING_TENSION = 0.6f;
     static constexpr float HEAD_SPRING_DAMPING = 0.02f;
+    static constexpr float HEAD_SPRING_Z_SCALE = 0.5f;  // vertical axis half-strength
+    static constexpr float HEAD_SPRING_CAP     = 25.0f;  // max spring velocity
 
-    // Friction deceleration rate (units/sec² when no input on ground)
-    static constexpr float GROUND_FRICTION = 60.0f;
+    // Eye position above head submodel center.
+    // Camera is 0.8 units above the head sphere center for natural eye height.
+    static constexpr float EYE_ABOVE_HEAD     = 0.8f;
+
+    // Note: GROUND_FRICTION removed — replaced by MOVEMENT_DECEL (acceleration model)
+
+    // ── Per-mode speed multipliers ──
+    // trans = translation speed scale, rot = rotation speed scale.
+    struct ModeSpeedScale { float trans; float rot; };
+    static constexpr ModeSpeedScale MODE_SPEEDS[static_cast<int>(PlayerMode::NumModes)] = {
+        {1.0f, 1.0f},  // Stand:     100% trans, 100% rot
+        {0.6f, 0.6f},  // Crouch:    60% trans,  60% rot
+        {0.7f, 0.7f},  // Swim:      70% trans,  70% rot
+        {0.5f, 0.7f},  // Climb:     50% trans,  70% rot
+        {1.0f, 1.0f},  // BodyCarry: 100% (set from script)
+        {1.0f, 1.0f},  // Slide:     100%
+        {1.0f, 1.0f},  // Jump:      100% (air control handles actual speed)
+        {0.0f, 0.0f},  // Dead:      disabled
+    };
+
+    // ── Motion pose system ──
+    // The drives head bob through discrete motion poses —
+    // target head positions that the 3D spring tracks. Each stride activates a
+    // new pose, and the spring naturally smooths the transitions.
+    //
+    // Pose offsets are in player-local coordinates:
+    //   fwd = forward displacement, lat = lateral (right positive), vert = vertical (down negative)
+    //
+    // Stride triggering uses velocity-dependent footstep distance:
+    //   < 5 u/s: 2.5 units/step, 5–15 u/s: lerp to 4.0, > 15 u/s: 4.0.
+
+    /// Motion pose data — target head displacement from stance rest position.
+    struct MotionPoseData {
+        float duration;    // blend time from current pose to this target (seconds)
+        float holdTime;    // hold at target before allowing next pose (seconds)
+        float fwd;         // forward displacement
+        float lat;         // lateral displacement (positive = right)
+        float vert;        // vertical displacement (negative = dip)
+    };
+
+    // ── Pose table — complete set of player motion poses ──
+    //
+    // Normal walking/idle (submodel 0 head offset):
+    static constexpr MotionPoseData POSE_NORMAL       = {0.8f,  0.0f,  0.0f,   0.0f,    0.0f};
+
+    // Walking strides — each stride is chained as {footfall, recovery} via the motion
+    // queue, creating a natural up-down bounce. The footfall dips the camera down with
+    // subtle lateral sway; the recovery returns it toward neutral height.
+    // Durations are short (~0.15s) so the dip-recover cycle fits within a single stride
+    // interval (~0.3s at walk speed, ~0.18s at run speed).
+    static constexpr MotionPoseData POSE_STRIDE_LEFT  = {0.15f, 0.0f,  0.0f,  -0.06f,  -0.25f};
+    static constexpr MotionPoseData POSE_STRIDE_RIGHT = {0.15f, 0.0f,  0.0f,   0.06f,  -0.25f};
+
+    // Crouching strides — slightly deeper dip and wider sway.
+    // Vert is relative to POSE_CROUCH (-2.02), so -2.50 = 0.48 below crouch rest.
+    static constexpr MotionPoseData POSE_CRAWL_LEFT   = {0.15f, 0.0f,  0.0f,  -0.10f,  -2.50f};
+    static constexpr MotionPoseData POSE_CRAWL_RIGHT  = {0.15f, 0.0f,  0.0f,   0.10f,  -2.50f};
+
+    // Crouching idle — dip from crouch height change:
+    static constexpr MotionPoseData POSE_CROUCH       = {0.8f,  0.0f,  0.0f,   0.0f,   -2.02f};
+
+    // Landing impact — instantaneous dip on landing (dur=0 = snap), held briefly:
+    static constexpr MotionPoseData POSE_JUMP_LAND    = {0.0f,  0.1f,  0.0f,   0.0f,   -0.5f};
+
+    // Body carry mode (carrying a body or heavy object):
+    // Heavier bob — deeper dip and more lateral sway while carrying.
+    static constexpr MotionPoseData POSE_CARRY_IDLE   = {0.8f,  0.0f,  0.0f,   0.0f,   -0.8f};
+    static constexpr MotionPoseData POSE_CARRY_LEFT   = {0.15f, 0.0f,  0.0f,  -0.5f,   -1.5f};
+    static constexpr MotionPoseData POSE_CARRY_RIGHT  = {0.15f, 0.0f,  0.0f,   0.15f,  -1.1f};
+
+    // Weapon swing (head bob during sword/blackjack attacks):
+    static constexpr MotionPoseData POSE_WEAPON_SWING       = {0.6f,  0.01f, 0.8f,  0.0f,   0.0f};
+    static constexpr MotionPoseData POSE_WEAPON_SWING_CROUCH = {0.6f, 0.01f, 0.8f,  0.0f,  -2.02f};
+
+    // Standing lean — 1.5s blend, no hold (lean via motion pose system):
+    // lat is in player-local coords: positive = right. So lean LEFT = negative lat.
+    static constexpr MotionPoseData POSE_LEAN_LEFT    = {1.5f,  0.0f,  0.0f,  -2.2f,    0.0f};
+    static constexpr MotionPoseData POSE_LEAN_RIGHT   = {1.5f,  0.0f,  0.0f,   2.2f,    0.0f};
+    static constexpr MotionPoseData POSE_LEAN_FWD     = {1.5f,  0.0f,  2.2f,   0.0f,    0.0f};
+
+    // Crouching lean — reduced distance + vertical drop:
+    static constexpr MotionPoseData POSE_CLNLEAN_LEFT  = {1.5f, 0.0f, 0.0f,  -1.7f,   -2.0f};
+    static constexpr MotionPoseData POSE_CLNLEAN_RIGHT = {1.5f, 0.0f, 0.0f,   1.7f,   -2.0f};
+    static constexpr MotionPoseData POSE_CLNLEAN_FWD   = {1.5f, 0.0f, 1.7f,   0.0f,   -2.0f};
+
+    // ── Per-mode motion configuration ──
+    // Maps each PlayerMode to its rest, left stride, and right stride poses.
+    // Modes without walking bob use the rest pose for all three slots.
+    struct ModeMotionConfig {
+        const MotionPoseData *restPose;     // idle pose for this mode
+        const MotionPoseData *strideLeft;   // left foot stride
+        const MotionPoseData *strideRight;  // right foot stride
+    };
+
+    // Inline helper — constexpr array not viable with pointer-to-static-constexpr
+    // in C++17, so use a lookup function instead.
+    static inline ModeMotionConfig getModeMotion(PlayerMode mode) {
+        switch (mode) {
+        case PlayerMode::Stand:     return {&POSE_NORMAL,     &POSE_STRIDE_LEFT,  &POSE_STRIDE_RIGHT};
+        case PlayerMode::Crouch:    return {&POSE_CROUCH,     &POSE_CRAWL_LEFT,   &POSE_CRAWL_RIGHT};
+        case PlayerMode::Swim:      return {&POSE_NORMAL,     &POSE_NORMAL,        &POSE_NORMAL};
+        case PlayerMode::Climb:     return {&POSE_NORMAL,     &POSE_NORMAL,        &POSE_NORMAL};
+        case PlayerMode::BodyCarry: return {&POSE_CARRY_IDLE, &POSE_CARRY_LEFT,    &POSE_CARRY_RIGHT};
+        case PlayerMode::Slide:     return {&POSE_NORMAL,     &POSE_NORMAL,        &POSE_NORMAL};
+        case PlayerMode::Jump:      return {&POSE_NORMAL,     &POSE_NORMAL,        &POSE_NORMAL};
+        case PlayerMode::Dead:      return {&POSE_NORMAL,     &POSE_NORMAL,        &POSE_NORMAL};
+        default:                    return {&POSE_NORMAL,     &POSE_NORMAL,        &POSE_NORMAL};
+        }
+    }
+
+    // Stride distance thresholds (velocity-dependent footstep formula)
+    static constexpr float STRIDE_DIST_MIN   = 2.5f;   // footstep distance at creep speed
+    static constexpr float STRIDE_DIST_MAX   = 4.0f;   // footstep distance at run speed
+    static constexpr float STRIDE_SPEED_LOW  = 5.0f;   // speed where stride distance starts growing
+    static constexpr float STRIDE_SPEED_HIGH = 15.0f;  // speed where stride distance reaches max
 
     // Leaning — visual-only camera offset, physics body stays in place.
     // Lean is purely cosmetic, no physics body movement.
-    // Distances for lean motion data:
-    //   Standing lean: 2.2 units lateral
-    //   Crouching lean: 1.7 units lateral + 2.0 units vertical drop
-    // Blending uses cosine easing (smooth start/end):
-    //   weight = (1 - cos(pi * t)) / 2 — smooth acceleration/deceleration
-    //   Default blend duration: 500ms (kMotDefaultBlendLength). Snappy 400ms
-    //   for a slightly snappier feel while keeping the easing shape.
+    // Lean parameters — lean is driven through motion poses (POSE_LEAN_*/POSE_CLNLEAN_*).
+    // The head spring provides natural easing (no separate blend timer needed).
+    // Distances match the motion pose lateral offsets:
+    //   Standing lean: 2.2 units lateral (POSE_LEAN_LEFT/RIGHT)
+    //   Crouching lean: 1.7 units lateral + 2.0 units vertical drop (POSE_CLNLEAN_*)
     static constexpr float LEAN_DISTANCE        = 2.2f;   // standing lean lateral offset (world units)
     static constexpr float CROUCH_LEAN_DISTANCE = 1.7f;   // crouching lean lateral offset (world units)
-    static constexpr float CROUCH_LEAN_DROP     = 2.0f;   // vertical drop during crouching lean
-    static constexpr float LEAN_BLEND_DURATION  = 0.5f;   // blend time (seconds, default: 0.5, snappier 0.4)
     static constexpr float LEAN_TILT            = 0.2618f; // max camera roll (~15 degrees, radians)
 
     // ── Construction ──
@@ -171,57 +361,95 @@ public:
     /// Set crouching state. Cannot un-crouch if ceiling blocks.
     inline void setCrouching(bool crouching) { mWantsCrouch = crouching; }
 
+    /// Set sneaking (creep) state. Reduces movement speed by 0.5x.
+    /// Cannot stack with running — sneaking takes priority.
+    inline void setSneaking(bool sneaking) { mSneaking = sneaking; }
+
+    /// Set running state. Doubles movement speed (22 units/sec).
+    /// If sneaking is also active, sneaking takes priority (no running).
+    inline void setRunning(bool running) { mRunning = running; }
+
+    /// Disable all motion (for cutscenes, death, etc.)
+    /// When disabled, movement input is ignored, poses stop updating,
+    /// and gravity still applies but player cannot control velocity.
+    inline void disableMotion() { mMotionDisabled = true; }
+
+    /// Re-enable motion after being disabled.
+    inline void enableMotion()  { mMotionDisabled = false; }
+
+    /// Check if motion is currently disabled.
+    bool isMotionDisabled() const { return mMotionDisabled; }
+
     /// Set lean direction: -1 = left, 0 = center, +1 = right.
     /// Lean is visual-only — the physics body stays in place while the
     /// camera offsets laterally, with collision limiting the lean distance.
-    /// Crouching uses a shorter lean distance.
-    /// When the target changes, restarts the cosine blend from current position.
+    /// Lean is driven through the motion pose system (POSE_LEAN_* or POSE_CLNLEAN_*),
+    /// and the head spring provides natural easing. While leaning, stride bob is
+    /// suppressed — lean poses take priority in the chaining state machine.
     inline void setLeanDirection(int dir) {
-        float maxDist = mCrouching ? CROUCH_LEAN_DISTANCE : LEAN_DISTANCE;
-        float newTarget = (dir < 0) ? -maxDist :
-                          (dir > 0) ?  maxDist : 0.0f;
-        // Restart blend when lean direction changes
-        if (std::fabs(newTarget - mLeanTarget) > 0.01f) {
-            mLeanBlendStart = mLeanAmount;
-            mLeanBlendT = 0.0f;
+        if (dir == mLeanDir) return;  // no change
+        mLeanDir = dir;
+
+        if (dir < 0) {
+            // Lean left — select standing or crouching variant
+            activatePose(isCrouching() ? POSE_CLNLEAN_LEFT : POSE_LEAN_LEFT);
+        } else if (dir > 0) {
+            // Lean right
+            activatePose(isCrouching() ? POSE_CLNLEAN_RIGHT : POSE_LEAN_RIGHT);
+        } else {
+            // Centering — return to mode's rest pose
+            activatePose(*getModeMotion(mCurrentMode).restPose);
         }
-        mLeanTarget = newTarget;
     }
 
     // ── State queries ──
 
-    /// Body center position (not eye position)
+    /// Body center position (not eye position).
+    /// In the 5-sphere model, body center is at ground + 4.2 on flat ground
+    /// (higher than the old 2-sphere model's ground + 1.2).
     const Vector3 &getPosition() const { return mPosition; }
 
-    /// Eye position (head sphere center — above body center, plus lean offset).
-    /// The lean offset is applied laterally (perpendicular to look direction)
-    /// with collision limiting to prevent the camera from entering walls.
-    /// Crouching lean also lowers the camera.
+    /// Eye position — computed from body center + 3D head spring output.
+    /// The 3D spring tracks motion pose targets (stride bob, landing dip),
+    /// producing natural forward/lateral/vertical displacement smoothed by
+    /// spring dynamics. Lean offset is applied on top with collision limiting.
+    ///
+    /// Spring displacement is in player-local coordinates:
+    ///   X = forward (cos(yaw), sin(yaw), 0)
+    ///   Y = lateral/right (sin(yaw), -cos(yaw), 0)
+    ///   Z = vertical (0, 0, 1)
     inline Vector3 getEyePosition() const {
-        Vector3 eye = mPosition + Vector3(0.0f, 0.0f, mHeadOffset);
-        if (std::fabs(mLeanAmount) > 0.01f) {
-            // Right vector in Z-up: (sin(yaw), -cos(yaw), 0)
-            float sinYaw = std::sin(mYaw);
-            float cosYaw = std::cos(mYaw);
+        // Base eye Z = body center + head offset + gEyeLoc + spring vertical displacement
+        float headZ = isCrouching() ? HEAD_OFFSET_Z * CROUCH_SCALE : HEAD_OFFSET_Z;
+        Vector3 eye = mPosition + Vector3(0.0f, 0.0f, headZ + EYE_ABOVE_HEAD + mSpringPos.z);
+
+        float sinYaw = std::sin(mYaw);
+        float cosYaw = std::cos(mYaw);
+
+        // Apply spring forward displacement (player-local → world)
+        if (std::fabs(mSpringPos.x) > 0.001f) {
+            eye.x += cosYaw * mSpringPos.x;
+            eye.y += sinYaw * mSpringPos.x;
+        }
+
+        // Apply lateral displacement (player-local → world).
+        // Uses collision-limited mLeanAmount instead of raw mSpringPos.y.
+        // When not leaning, mLeanAmount == mSpringPos.y (stride bob only, no collision).
+        // When leaning, mLeanAmount may be reduced by wall collision in updateLean().
+        // Right vector in Z-up: (sin(yaw), -cos(yaw), 0)
+        if (std::fabs(mLeanAmount) > 0.001f) {
             eye.x += sinYaw * mLeanAmount;
             eye.y -= cosYaw * mLeanAmount;
-
-            // Crouching lean lowers the camera proportionally to lean extent -2.0 vertical drop.
-            if (mCrouching) {
-                float maxDist = CROUCH_LEAN_DISTANCE;
-                float frac = (maxDist > 0.01f) ? std::fabs(mLeanAmount) / maxDist : 0.0f;
-                eye.z -= CROUCH_LEAN_DROP * frac;
-            }
         }
         return eye;
     }
 
     /// Camera roll/bank angle from leaning (radians).
     /// Positive = tilting right, negative = tilting left.
-    /// Proportional to lean extent — matches original engine's head
-    /// submodel rotation during lean motion animation.
+    /// Proportional to the collision-limited lean extent (mLeanAmount),
+    /// which is derived from the spring's lateral displacement each frame.
     inline float getLeanTilt() const {
-        float maxDist = mCrouching ? CROUCH_LEAN_DISTANCE : LEAN_DISTANCE;
+        float maxDist = isCrouching() ? CROUCH_LEAN_DISTANCE : LEAN_DISTANCE;
         if (maxDist < 0.01f) return 0.0f;
         return (mLeanAmount / maxDist) * LEAN_TILT;
     }
@@ -233,35 +461,54 @@ public:
     int32_t getCell() const { return mCellIdx; }
 
     /// Is the player standing on a walkable surface?
-    bool isOnGround() const { return mMoveState == PlayerMoveState::OnGround; }
+    /// Ground modes: Stand, Crouch, BodyCarry, Slide (not Jump, Swim, Climb, Dead)
+    bool isOnGround() const {
+        return mCurrentMode == PlayerMode::Stand ||
+               mCurrentMode == PlayerMode::Crouch ||
+               mCurrentMode == PlayerMode::BodyCarry ||
+               mCurrentMode == PlayerMode::Slide;
+    }
 
-    /// Current movement state
-    PlayerMoveState getMoveState() const { return mMoveState; }
+    /// Current player mode
+    PlayerMode getMode() const { return mCurrentMode; }
 
     /// Is the player crouching?
-    bool isCrouching() const { return mCrouching; }
+    bool isCrouching() const { return mCurrentMode == PlayerMode::Crouch; }
+
+    /// Is the player sneaking (creeping)?
+    bool isSneaking() const { return mSneaking; }
+
+    /// Is the player running?
+    bool isRunning() const { return mRunning; }
+
+    /// Is the player currently mantling? (Stub — implemented in Phase 5)
+    bool isMantling() const { return mMantling; }
 
     // ── Teleport ──
 
     /// Set player position directly (for spawn, teleport).
     /// Also resets velocity and updates cell index.
-    /// If findCell fails at the given position, tries eye level as fallback
-    /// (the caller often passes the camera/eye position as body center,
+    /// If findCell fails at the given position, tries head and foot level
+    /// as fallbacks (the caller often passes the camera/eye position,
     /// and the cell geometry may not extend below the floor).
     inline void setPosition(const Vector3 &pos) {
         mPosition = pos;
         mVelocity = Vector3(0.0f);
         mCellIdx = mCollision.findCell(pos);
         if (mCellIdx < 0) {
-            // Try at eye level — the camera position is usually inside a cell
-            // even when the body center (below eye) would be outside
-            mCellIdx = mCollision.findCell(pos + Vector3(0.0f, 0.0f, HEAD_OFFSET));
+            // Try at head sphere level (body center might be placed at eye height)
+            mCellIdx = mCollision.findCell(pos + Vector3(0.0f, 0.0f, HEAD_OFFSET_Z));
+        }
+        if (mCellIdx < 0) {
+            // Try at foot sphere level (body center is higher in 5-sphere model,
+            // so the foot sphere position might be inside the cell)
+            mCellIdx = mCollision.findCell(pos + Vector3(0.0f, 0.0f, FOOT_OFFSET_Z));
         }
         if (mCellIdx < 0) {
             // Last resort: try slightly above the given position
             mCellIdx = mCollision.findCell(pos + Vector3(0.0f, 0.0f, SPHERE_RADIUS));
         }
-        mMoveState = PlayerMoveState::Falling; // will detect ground on next step
+        mCurrentMode = PlayerMode::Jump; // will detect ground on next step
     }
 
     /// Set gravity magnitude (units/sec²). Default is GRAVITY.
@@ -272,23 +519,40 @@ private:
 
     /// Single fixed-timestep physics step
     inline void fixedStep(const ContactCallback &contactCb) {
-        // 1. Handle jump request
-        if (mJumpRequested) {
-            if (mMoveState == PlayerMoveState::OnGround) {
-                mVelocity.z = JUMP_IMPULSE;
-                mMoveState = PlayerMoveState::Falling;
-            }
-            mJumpRequested = false;
+        // Advance simulation time (for landing throttle, animation timing, etc.)
+        mSimTime += FIXED_DT;
+
+        // ── Mantle takes over the full step when active ──
+        // During mantling, normal movement/gravity/collision are suppressed.
+        // The mantle state machine drives position directly.
+        if (mMantling) {
+            updateMantle();
+            updateCell();
+            updateMotionPose();
+            updateHeadSpring();
+            updateLean();
+            return;
         }
 
-        // 2. Handle crouch state
-        updateCrouch();
+        // 1. Handle jump request (can jump from any ground mode)
+        if (mJumpRequested && !mMotionDisabled) {
+            if (isOnGround()) {
+                mVelocity.z = JUMP_IMPULSE;
+                mCurrentMode = PlayerMode::Jump;
+            }
+        }
+        mJumpRequested = false;
 
-        // 3. Apply gravity (if airborne)
+        // 2. Handle mode transitions (crouch, swim, etc.)
+        if (!mMotionDisabled)
+            updateModeTransitions();
+
+        // 3. Apply gravity (if airborne — always, even when disabled)
         applyGravity();
 
-        // 4. Apply horizontal movement from input
-        applyMovement();
+        // 4. Apply horizontal movement from input (skip when disabled)
+        if (!mMotionDisabled)
+            applyMovement();
 
         // 5. Integrate position
         integrate();
@@ -298,37 +562,38 @@ private:
         //    the new cell's walls, not the old cell's.
         updateCell();
 
-        // 7. Resolve collisions via constraint projection
+        // 7. Resolve collisions via 5-sphere constraint projection
         resolveCollisions(contactCb);
-
-        // 7.5. Stair stepping — when walking into a wall, try to step over
-        //      small ledges automatically. Must happen after collision so we
-        //      know which contacts are walls, and before ground detection.
-        if (mMoveState == PlayerMoveState::OnGround) {
-            tryStairStep();
-        }
 
         // 8. Detect ground and update movement state
         detectGround();
 
         // 9. Snap to ground when walking on slopes (prevents hopping)
-        if (mMoveState == PlayerMoveState::OnGround) {
+        if (isOnGround()) {
             snapToGround();
         }
 
         // 10. Update cell index again (collision may have shifted position)
         updateCell();
 
-        // 11. Update head spring (natural head bob)
+        // 11. Check for mantle opportunity when airborne and pressing forward
+        if (mCurrentMode == PlayerMode::Jump && mInputForward > 0.1f && !mMotionDisabled) {
+            checkMantle();
+        }
+
+        // 12. Update motion pose system (discrete stride-driven pose targets)
+        updateMotionPose();
+
+        // 13. Update 3D head spring (tracks pose targets with spring dynamics)
         updateHeadSpring();
 
-        // 12. Update lean (visual-only lateral camera offset with collision)
+        // 14. Update lean (visual-only lateral camera offset with collision)
         updateLean();
     }
 
     /// Apply gravity to velocity (if not on ground)
     inline void applyGravity() {
-        if (mMoveState != PlayerMoveState::OnGround) {
+        if (!isOnGround()) {
             // Z-up: gravity pulls downward
             mVelocity.z -= mGravityMag * FIXED_DT;
         }
@@ -349,7 +614,9 @@ private:
         Vector3 forward(cosYaw, sinYaw, 0.0f);
         Vector3 right(sinYaw, -cosYaw, 0.0f);
 
-        // Determine speed based on movement direction
+        // Determine speed based on movement direction and speed modifiers.
+        // Speed toggle hierarchy: sneak (0.5x) takes priority over run (2x).
+        // Crouch multiplier (0.6x) stacks with either speed mode.
         float forwardSpeed = WALK_SPEED;
         float strafeSpeed  = SIDESTEP_SPEED;
 
@@ -357,11 +624,20 @@ private:
         if (mInputForward < 0.0f)
             forwardSpeed = BACKWARD_SPEED;
 
-        // Crouching reduces speed
-        if (mCrouching) {
-            forwardSpeed *= CROUCH_MULT;
-            strafeSpeed  *= CROUCH_MULT;
+        // Speed mode: sneak (creep 0.5x) or run (sprint 2x)
+        if (mSneaking) {
+            forwardSpeed *= 0.5f;
+            strafeSpeed  *= 0.5f;
+        } else if (mRunning) {
+            forwardSpeed *= 2.0f;
+            strafeSpeed  *= 2.0f;
         }
+
+        // Apply mode speed multiplier (crouch=0.6, swim=0.7, climb=0.5, etc.)
+        // Stacks with sneak/run for effective speed calculation.
+        float modeScale = MODE_SPEEDS[static_cast<int>(mCurrentMode)].trans;
+        forwardSpeed *= modeScale;
+        strafeSpeed  *= modeScale;
 
         Vector3 desired = forward * (mInputForward * forwardSpeed)
                         + right   * (mInputRight   * strafeSpeed);
@@ -369,50 +645,100 @@ private:
         return desired;
     }
 
-    /// Apply movement input to velocity (ground vs air control)
+    /// Apply movement input to velocity — acceleration-based control.
+    /// Instead of setting velocity directly, accelerates toward the desired
+    /// velocity. This creates natural ramp-up/ramp-down curves impulse-based control system.
+    ///
+    /// Ground: accelerate toward desired at MOVEMENT_ACCEL, decelerate
+    /// at MOVEMENT_DECEL when no input. Slope projection prevents
+    /// fighting gravity on inclines.
+    ///
+    /// Air: same acceleration model at reduced rate (AIR_ACCEL_FRAC),
+    /// with Z removed from input (can't add vertical speed while airborne).
     inline void applyMovement() {
         Vector3 desired = computeDesiredVelocity();
 
-        if (mMoveState == PlayerMoveState::OnGround) {
-            // On ground: directly set horizontal velocity to desired.
+        if (isOnGround()) {
             // Project desired velocity onto ground plane so walking on slopes
-            // doesn't fight gravity.
-            if (mGroundNormal.z > MAX_SLOPE_COS) {
-                // Walkable slope — project movement onto ground plane
-                // Remove the component along the ground normal from desired
+            // doesn't fight gravity. Always project when on any ground surface.
+            if (mGroundNormal.z > GROUND_NORMAL_MIN) {
                 float dot = glm::dot(desired, mGroundNormal);
                 desired -= mGroundNormal * dot;
             }
 
-            // Apply friction when no input: decelerate toward zero
+            // Friction-based slope handling:
+            // On steep slopes (normal.z < SLIDE_THRESHOLD), progressively reduce
+            // movement control. This lets the 5-sphere model and gravity naturally
+            // determine what's walkable vs what causes sliding — no hard angle cutoff.
+            if (mGroundNormal.z < SLIDE_THRESHOLD) {
+                // Linear ramp: full control at SLIDE_THRESHOLD, zero at GROUND_NORMAL_MIN
+                float slopeFactor = (mGroundNormal.z - GROUND_NORMAL_MIN)
+                                  / (SLIDE_THRESHOLD - GROUND_NORMAL_MIN);
+                slopeFactor = std::max(0.0f, std::min(1.0f, slopeFactor));
+                desired *= slopeFactor;
+            }
+
             float desiredLen = glm::length(desired);
             if (desiredLen < 0.01f) {
-                // No input — apply friction to slow down
-                float speed = std::sqrt(mVelocity.x * mVelocity.x +
-                                        mVelocity.y * mVelocity.y);
-                if (speed > 0.01f) {
-                    float decel = GROUND_FRICTION * FIXED_DT;
-                    float newSpeed = std::max(0.0f, speed - decel);
-                    float ratio = newSpeed / speed;
+                // No input — decelerate toward zero
+                float hSpeed = std::sqrt(mVelocity.x * mVelocity.x +
+                                         mVelocity.y * mVelocity.y);
+                if (hSpeed > 0.01f) {
+                    float decel = MOVEMENT_DECEL * FIXED_DT;
+                    float newSpeed = std::max(0.0f, hSpeed - decel);
+                    float ratio = newSpeed / hSpeed;
                     mVelocity.x *= ratio;
                     mVelocity.y *= ratio;
                 }
             } else {
-                // Has input — set velocity directly from slope-projected desired.
-                // Z must be SET (not +=) to prevent accumulation on slopes —
-                // adding desired.z each frame would launch the player off ramps.
-                mVelocity.x = desired.x;
-                mVelocity.y = desired.y;
+                // Has input — accelerate toward desired velocity.
+                // Compute acceleration direction from current horizontal velocity
+                // toward desired. This creates a natural ramp-up curve.
+                Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
+                Vector3 delta = desired - hVel;
+                float deltaLen = glm::length(delta);
+
+                if (deltaLen > 0.01f) {
+                    // Accelerate toward desired velocity
+                    float accelMag = MOVEMENT_ACCEL * FIXED_DT;
+                    if (accelMag > deltaLen) {
+                        // Would overshoot — snap to desired
+                        mVelocity.x = desired.x;
+                        mVelocity.y = desired.y;
+                    } else {
+                        Vector3 accelDir = delta / deltaLen;
+                        mVelocity.x += accelDir.x * accelMag;
+                        mVelocity.y += accelDir.y * accelMag;
+                    }
+                }
+
+                // Apply slope Z component — SET (not +=) to prevent accumulation
+                // on slopes that would launch the player off ramps.
                 mVelocity.z = desired.z;
             }
         } else {
-            // Airborne: reduced horizontal control (air strafe)
-            float desiredLen = glm::length(desired);
-            if (desiredLen > 0.01f) {
-                // Apply air control as acceleration toward desired velocity
-                Vector3 accel = desired * AIR_CONTROL;
-                mVelocity.x += accel.x * FIXED_DT;
-                mVelocity.y += accel.y * FIXED_DT;
+            // Airborne: acceleration-based steering with Z removed from input.
+            // Uses the same impulse formula with friction=0
+            // but removes vertical input — can't gain altitude while airborne.
+            Vector3 airDesired(desired.x, desired.y, 0.0f);
+            float airDesiredLen = glm::length(airDesired);
+
+            if (airDesiredLen > 0.01f) {
+                Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
+                Vector3 delta = airDesired - hVel;
+                float deltaLen = glm::length(delta);
+
+                if (deltaLen > 0.01f) {
+                    float airAccel = MOVEMENT_ACCEL * AIR_ACCEL_FRAC * FIXED_DT;
+                    if (airAccel > deltaLen) {
+                        mVelocity.x = airDesired.x;
+                        mVelocity.y = airDesired.y;
+                    } else {
+                        Vector3 accelDir = delta / deltaLen;
+                        mVelocity.x += accelDir.x * airAccel;
+                        mVelocity.y += accelDir.y * airAccel;
+                    }
+                }
             }
         }
     }
@@ -422,17 +748,117 @@ private:
         mPosition += mVelocity * FIXED_DT;
     }
 
-    /// Run sphere-vs-cell collision and constraint projection.
-    /// Uses CollisionGeometry::resolveCollisions() which matches
-    /// the camera collision algorithm (iterative push along contact normals).
+    /// Resolve collisions using the 5-sphere model.
+    /// For each iteration, tests all 5 sphere centers against cell polygons,
+    /// accumulates contacts, and pushes the body center out of penetrations.
+    /// The 5-sphere model naturally handles stairs: lower spheres (FOOT, KNEE,
+    /// SHIN) contact step edges with normals that have upward components,
+    /// lifting the player up and over without explicit stair-step logic.
     inline void resolveCollisions(const ContactCallback &contactCb) {
-        std::vector<SphereContact> contacts;
-        mCollision.resolveCollisions(mPosition, SPHERE_RADIUS, mCellIdx,
-                                     contacts, COLLISION_ITERS);
+        Vector3 origPos = mPosition;
+        int32_t origCell = mCellIdx;
+
+        // Compute current sphere offsets (standing or crouching)
+        float scale = isCrouching() ? CROUCH_SCALE : 1.0f;
+
+        mLastContacts.clear();
+
+        for (int iter = 0; iter < COLLISION_ITERS; ++iter) {
+            if (mCellIdx < 0)
+                break;
+
+            std::vector<SphereContact> iterContacts;
+
+            for (int s = 0; s < NUM_SPHERES; ++s) {
+                Vector3 sphereCenter = mPosition + Vector3(0.0f, 0.0f, SPHERE_OFFSETS[s] * scale);
+
+                // Test against the body center's cell
+                auto contacts = mCollision.sphereVsCellPolygons(
+                    sphereCenter, SPHERE_RADIUS, mCellIdx);
+
+                // Test the sphere's own cell if it differs from body center's cell
+                // (handles straddling portal boundaries, e.g. feet in one cell, head in another)
+                int32_t sphereCell = mCollision.findCell(sphereCenter);
+                if (sphereCell >= 0 && sphereCell != mCellIdx) {
+                    auto adj = mCollision.sphereVsCellPolygons(
+                        sphereCenter, SPHERE_RADIUS, sphereCell);
+                    contacts.insert(contacts.end(), adj.begin(), adj.end());
+                }
+
+                // Test adjacent cells via portals from the body center's cell
+                const auto &cell = mCollision.getWR().cells[mCellIdx];
+                int numSolid = cell.numPolygons - cell.numPortals;
+                for (int pi = numSolid; pi < cell.numPolygons; ++pi) {
+                    const auto &poly = cell.polygons[pi];
+                    if (poly.count < 3) continue;
+                    const auto &plane = cell.planes[poly.plane];
+                    float dist = plane.getDistance(sphereCenter);
+                    if (dist < SPHERE_RADIUS) {
+                        int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
+                        if (tgtCell >= 0 && tgtCell != mCellIdx && tgtCell != sphereCell
+                            && tgtCell < static_cast<int32_t>(mCollision.getWR().numCells)) {
+                            auto adj = mCollision.sphereVsCellPolygons(
+                                sphereCenter, SPHERE_RADIUS, tgtCell);
+                            contacts.insert(contacts.end(), adj.begin(), adj.end());
+                        }
+                    }
+                }
+
+                iterContacts.insert(iterContacts.end(), contacts.begin(), contacts.end());
+            }
+
+            if (iterContacts.empty())
+                break; // No contacts — done
+
+            // Push body center out of penetrating polygons.
+            // De-duplicate by normal direction: when multiple spheres hit the same
+            // wall (dot > 0.99), use only the maximum penetration depth. Without
+            // this, 3 spheres hitting one wall would triple the push, causing
+            // jittery over-correction on the next frame.
+            std::vector<std::pair<Vector3, float>> pushes; // {normal, maxPenetration}
+            for (const auto &c : iterContacts) {
+                bool merged = false;
+                for (auto &p : pushes) {
+                    if (glm::dot(c.normal, p.first) > 0.99f) {
+                        // Same wall — keep the deeper penetration
+                        p.second = std::max(p.second, c.penetration);
+                        merged = true;
+                        break;
+                    }
+                }
+                if (!merged) {
+                    pushes.push_back({c.normal, c.penetration});
+                }
+            }
+            for (const auto &p : pushes) {
+                mPosition += p.first * p.second;
+            }
+
+            // Accumulate contacts for ground detection and velocity removal
+            mLastContacts.insert(mLastContacts.end(),
+                                 iterContacts.begin(), iterContacts.end());
+
+            // Push may have moved through a portal — update cell
+            int32_t newCell = mCollision.findCell(mPosition);
+            if (newCell >= 0) {
+                mCellIdx = newCell;
+            } else {
+                // Pushed outside all cells — revert to original position
+                mPosition = origPos;
+                mCellIdx = origCell;
+                return;
+            }
+        }
+
+        // Final validation — body center must still be in a valid cell
+        if (mCollision.findCell(mPosition) < 0) {
+            mPosition = origPos;
+            mCellIdx = origCell;
+        }
 
         // Fire contact callbacks for downstream consumers (audio, AI, scripts)
         if (contactCb) {
-            for (const auto &c : contacts) {
+            for (const auto &c : mLastContacts) {
                 ContactEvent event;
                 event.bodyA = -1; // player entity (archetype ID, placeholder)
                 event.bodyB = 0;  // world geometry
@@ -445,61 +871,133 @@ private:
             }
         }
 
-        // Remove velocity components that go into contact surfaces.
-        // This is the constraint-based response: for each contact normal,
-        // remove the velocity component pointing into the surface.
-        for (const auto &c : contacts) {
+        // Constraint-based velocity response.
+        //
+        // 1 surface  — remove the normal velocity component (slide along plane)
+        // 2 surfaces — project velocity onto the edge between them (slide along crease)
+        // 3+ surfaces — project onto edge, validate direction; if reversed, fully stop
+        //
+        // This prevents the over-removal bug where independent per-normal subtraction
+        // could push velocity *through* an adjacent surface.
+
+        // Collect unique constraint normals (dot > 0.99 = same plane)
+        std::vector<Vector3> constraints;
+        constraints.reserve(mLastContacts.size());
+        for (const auto &c : mLastContacts) {
+            // Only constrain if velocity is moving into the surface
             float vn = glm::dot(mVelocity, c.normal);
-            if (vn < 0.0f) {
-                // Velocity points into the surface — remove that component
-                mVelocity -= c.normal * vn;
+            if (vn >= 0.0f) continue;
+
+            bool duplicate = false;
+            for (const auto &cn : constraints) {
+                if (glm::dot(c.normal, cn) > 0.99f) { duplicate = true; break; }
             }
+            if (!duplicate)
+                constraints.push_back(c.normal);
         }
 
-        // Check for ground contacts in this iteration's results.
-        // A ground contact has an upward-facing normal (normal.z > MAX_SLOPE_COS)
-        mLastContacts = std::move(contacts);
+        if (constraints.size() == 1) {
+            // Single surface — remove velocity component along the normal
+            float vn = glm::dot(mVelocity, constraints[0]);
+            if (vn < 0.0f)
+                mVelocity -= constraints[0] * vn;
+
+        } else if (constraints.size() == 2) {
+            // Two surfaces (crease/wedge) — slide along the edge between them
+            Vector3 edge = glm::cross(constraints[0], constraints[1]);
+            float edgeLen = glm::length(edge);
+            if (edgeLen > 1e-6f) {
+                edge /= edgeLen;
+                mVelocity = edge * glm::dot(mVelocity, edge);
+            } else {
+                // Nearly parallel normals — degenerate, treat as single surface
+                float vn = glm::dot(mVelocity, constraints[0]);
+                if (vn < 0.0f)
+                    mVelocity -= constraints[0] * vn;
+            }
+
+        } else if (constraints.size() >= 3) {
+            // Corner (3+ surfaces) — project onto edge, validate direction
+            Vector3 origVel = mVelocity;
+            Vector3 edge = glm::cross(constraints[0], constraints[1]);
+            float edgeLen = glm::length(edge);
+            if (edgeLen > 1e-6f) {
+                edge /= edgeLen;
+                Vector3 projected = edge * glm::dot(mVelocity, edge);
+                // If projected velocity reverses original direction, player is fully blocked
+                if (glm::dot(projected, origVel) < 0.0f)
+                    mVelocity = Vector3(0.0f);
+                else
+                    mVelocity = projected;
+            } else {
+                mVelocity = Vector3(0.0f);
+            }
+        }
     }
 
     /// Detect ground contact and update movement state.
-    /// Uses contact normals from the last collision pass — if any contact
-    /// has an upward-facing normal (z > MAX_SLOPE_COS), player is on ground.
+    /// Any contact with an upward-facing normal (z > GROUND_NORMAL_MIN) counts
+    /// as ground. Movement control on steep slopes is handled separately by
+    /// applyMovement() via SLIDE_THRESHOLD — this only determines ground/air state.
+    /// Ground probe uses FOOT sphere position for accurate floor detection.
     inline void detectGround() {
         bool onGround = false;
 
-        // Check contacts from collision resolution
+        // Check contacts from collision resolution (any sphere's ground contact counts)
         for (const auto &c : mLastContacts) {
-            if (c.normal.z > MAX_SLOPE_COS) {
+            if (c.normal.z > GROUND_NORMAL_MIN) {
                 onGround = true;
                 mGroundNormal = c.normal;
                 break;
             }
         }
 
-        // If no contacts found, do a ground probe
-        if (!onGround && mCellIdx >= 0) {
+        // If no contacts found AND the player is not ascending (jumping),
+        // probe for ground below the FOOT sphere. Skip when velocity.z > 0.5
+        // to prevent the ground probe from cancelling a jump — the probe drops
+        // the FOOT sphere by GROUND_SNAP and would find the floor the player
+        // just left, snapping them back down. The 0.5 threshold allows minor
+        // slope-walk vertical velocities through.
+        if (!onGround && mCellIdx >= 0 && mVelocity.z <= 0.5f) {
+            float footOffset = isCrouching() ? (FOOT_OFFSET_Z * CROUCH_SCALE) : FOOT_OFFSET_Z;
+            Vector3 footCenter = mPosition + Vector3(0.0f, 0.0f, footOffset);
             Vector3 probeNormal;
-            if (mCollision.groundTest(mPosition, SPHERE_RADIUS, mCellIdx,
+            if (mCollision.groundTest(footCenter, SPHERE_RADIUS, mCellIdx,
                                       GROUND_SNAP, probeNormal)) {
-                if (probeNormal.z > MAX_SLOPE_COS) {
+                if (probeNormal.z > GROUND_NORMAL_MIN) {
                     onGround = true;
                     mGroundNormal = probeNormal;
                 }
             }
         }
 
-        // Update movement state
+        // Update movement state — mode transitions for ground/air
         if (onGround) {
-            if (mMoveState == PlayerMoveState::Falling) {
-                // Landing — zero vertical velocity
+            if (mCurrentMode == PlayerMode::Jump) {
+                // Landing — zero vertical velocity and optionally activate
+                // landing bump pose. The bump only triggers if the player was
+                // falling fast enough (LANDING_MIN_VEL) and enough time has
+                // elapsed since the last landing (LANDING_MIN_TIME).
+                float fallSpeed = -mVelocity.z;  // positive when falling
                 if (mVelocity.z < 0.0f)
                     mVelocity.z = 0.0f;
+
+                if (fallSpeed > LANDING_MIN_VEL &&
+                    (mSimTime - mLastLandingTime) > LANDING_MIN_TIME) {
+                    activatePose(POSE_JUMP_LAND);
+                    mLandingActive = true;
+                    mLastLandingTime = mSimTime;
+                }
+
+                // Return to crouch or stand based on input
+                mCurrentMode = mWantsCrouch ? PlayerMode::Crouch : PlayerMode::Stand;
             }
-            mMoveState = PlayerMoveState::OnGround;
+            // If already in a ground mode, stay in it (crouch transitions
+            // are handled by updateModeTransitions)
         } else {
-            if (mMoveState == PlayerMoveState::OnGround) {
+            if (isOnGround()) {
                 // Just walked off an edge — start falling
-                mMoveState = PlayerMoveState::Falling;
+                mCurrentMode = PlayerMode::Jump;
             }
         }
     }
@@ -507,22 +1005,27 @@ private:
     /// Snap player to ground when walking on slopes.
     /// Prevents "hopping" when walking downhill and keeps the player
     /// glued to the surface when walking uphill.
-    /// This is only called when mMoveState == OnGround, so jump velocity
+    /// Uses FOOT sphere position for ground detection.
+    /// This is only called when mCurrentMode == OnGround, so jump velocity
     /// (which immediately sets state to Falling) never reaches here.
     inline void snapToGround() {
         if (mCellIdx < 0)
             return;
 
+        float footOffset = isCrouching() ? (FOOT_OFFSET_Z * CROUCH_SCALE) : FOOT_OFFSET_Z;
+        Vector3 footCenter = mPosition + Vector3(0.0f, 0.0f, footOffset);
+
         Vector3 probeNormal;
-        if (mCollision.groundTest(mPosition, SPHERE_RADIUS, mCellIdx,
+        if (mCollision.groundTest(footCenter, SPHERE_RADIUS, mCellIdx,
                                   GROUND_SNAP * 2.0f, probeNormal)) {
-            // Ground is close below — push down to contact
-            Vector3 testPos = mPosition;
+            // Ground is close below — push FOOT sphere down to contact.
+            // The body center shifts by the same amount (rigid body).
+            Vector3 testPos = footCenter;
             testPos.z -= GROUND_SNAP;
             auto contacts = mCollision.sphereVsCellPolygons(testPos, SPHERE_RADIUS, mCellIdx);
             for (const auto &c : contacts) {
-                if (c.normal.z > MAX_SLOPE_COS) {
-                    // Snap to this surface
+                if (c.normal.z > GROUND_NORMAL_MIN) {
+                    // Snap body center down (same delta applies to all spheres)
                     mPosition.z -= (GROUND_SNAP - c.penetration);
                     if (mVelocity.z < 0.0f)
                         mVelocity.z = 0.0f;
@@ -532,138 +1035,20 @@ private:
         }
     }
 
-    /// Stair stepping — when the player walks into a wall while on ground,
-    /// try to automatically step over small ledges (up to STAIR_HEIGHT).
+    /// Update lean — collision-limited lean amount derived from spring position.
     ///
-    /// Algorithm: lift → forward → drop
-    ///   1. Lift the sphere upward by STAIR_HEIGHT
-    ///   2. Move forward in the desired horizontal direction
-    ///   3. Drop down to find walkable ground
-    ///   4. If ground found without wall collisions at the lifted height,
-    ///      accept the stepped position.
+    /// Lean is now driven through the motion pose system: setLeanDirection()
+    /// activates POSE_LEAN_* poses, and the head spring naturally converges
+    /// toward the lean target with organic easing. This replaces the separate
+    /// cosine-eased interpolation that was previously used.
     ///
-    /// This matches the standard FPS stair-step approach and compensates
-    /// for our simplified 2-sphere model (the 5-sphere
-    /// model handles stairs naturally via lower sphere contacts, which will be
-    /// implemented.).
-    inline void tryStairStep() {
-        // Only attempt when moving and hitting a wall
-        bool hitWall = false;
-        for (const auto &c : mLastContacts) {
-            // Wall contact: mostly horizontal normal (not floor, not ceiling)
-            if (c.normal.z < MAX_SLOPE_COS && c.normal.z > -0.5f) {
-                hitWall = true;
-                break;
-            }
-        }
-        if (!hitWall)
-            return;
-
-        // Need horizontal movement direction to know which way to step
-        Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
-        float hSpeed = glm::length(hVel);
-        if (hSpeed < 0.01f)
-            return;
-        Vector3 moveDir = hVel / hSpeed;
-
-        // Distance to probe forward — enough to clear the step edge
-        float stepFwd = SPHERE_RADIUS * 2.0f;
-
-        // Step 1: Lift — check if there's headroom above
-        Vector3 liftPos = mPosition;
-        liftPos.z += STAIR_HEIGHT;
-
-        int32_t liftCell = mCollision.findCell(liftPos);
-        if (liftCell < 0)
-            liftCell = mCellIdx;
-
-        auto liftContacts = mCollision.sphereVsCellPolygons(
-            liftPos, SPHERE_RADIUS, liftCell);
-        for (const auto &c : liftContacts) {
-            if (c.normal.z < -0.5f)
-                return; // ceiling blocks the lift
-        }
-
-        // Step 2: Move forward at lifted height
-        Vector3 fwdPos = liftPos + moveDir * stepFwd;
-
-        int32_t fwdCell = mCollision.findCell(fwdPos);
-        if (fwdCell < 0)
-            return; // outside world at lifted+forward position
-
-        // Check for wall collisions at the lifted+forward position
-        auto fwdContacts = mCollision.sphereVsCellPolygons(
-            fwdPos, SPHERE_RADIUS, fwdCell);
-        for (const auto &c : fwdContacts) {
-            if (c.normal.z < MAX_SLOPE_COS && c.normal.z > -0.5f)
-                return; // still blocked at stepped height — step too tall
-        }
-
-        // Step 3: Drop — find ground below the lifted+forward position
-        Vector3 probeNormal;
-        if (!mCollision.groundTest(fwdPos, SPHERE_RADIUS, fwdCell,
-                                   STAIR_HEIGHT + GROUND_SNAP, probeNormal))
-            return; // no ground below
-
-        if (probeNormal.z < MAX_SLOPE_COS)
-            return; // ground is too steep
-
-        // Find exact contact point by testing a lowered sphere
-        Vector3 dropPos = fwdPos;
-        dropPos.z -= STAIR_HEIGHT;
-
-        int32_t dropCell = mCollision.findCell(dropPos);
-        if (dropCell < 0)
-            dropCell = fwdCell;
-
-        auto dropContacts = mCollision.sphereVsCellPolygons(
-            dropPos, SPHERE_RADIUS, dropCell);
-        for (const auto &c : dropContacts) {
-            if (c.normal.z > MAX_SLOPE_COS) {
-                // Found walkable ground — compute final stepped position.
-                // Push up from the dropped position by the penetration amount
-                // so the sphere sits exactly on the surface.
-                Vector3 steppedPos = dropPos;
-                steppedPos.z += c.penetration;
-
-                // Validate the stepped position is in a valid cell
-                int32_t steppedCell = mCollision.findCell(steppedPos);
-                if (steppedCell < 0)
-                    return;
-
-                // Accept the step — update position and cell
-                mPosition = steppedPos;
-                mCellIdx = steppedCell;
-                mGroundNormal = probeNormal;
-
-                // Zero vertical velocity (we just stepped, not jumped)
-                if (mVelocity.z < 0.0f)
-                    mVelocity.z = 0.0f;
-                return;
-            }
-        }
-    }
-
-    /// Update lean — cosine-eased blend toward target lean distance.
-    /// Uses the original engine's motion blending curve: (1 - cos(pi*t)) / 2
-    /// which gives smooth acceleration at the start and deceleration at the end.
-    /// When the lean target changes (via setLeanDirection), a new blend starts
-    /// from the current lean position, allowing smooth direction reversals.
-    /// Collision against walls limits the final lean distance.
+    /// This function reads the spring's lateral displacement (mSpringPos.y),
+    /// checks for wall collisions at the leaned head position, and stores
+    /// the collision-limited result in mLeanAmount for use by getEyePosition()
+    /// and getLeanTilt().
     inline void updateLean() {
-        // Advance blend timer toward completion
-        if (mLeanBlendT < 1.0f) {
-            mLeanBlendT += FIXED_DT / LEAN_BLEND_DURATION;
-            if (mLeanBlendT > 1.0f) mLeanBlendT = 1.0f;
-        }
-
-        // Cosine easing: (1 - cos(pi * t)) / 2
-        // t=0 → 0 (start), t=0.5 → 0.5 (midpoint), t=1 → 1 (end)
-        // Accelerates from rest, decelerates to rest — matches the original
-        // engine's mp_ramp_table used for all motion blending.
-        static constexpr float PI = 3.14159265f;
-        float eased = (1.0f - std::cos(PI * mLeanBlendT)) * 0.5f;
-        mLeanAmount = mLeanBlendStart + (mLeanTarget - mLeanBlendStart) * eased;
+        // Read lean from spring lateral displacement
+        mLeanAmount = mSpringPos.y;
 
         // Collision check at leaned head position — prevent leaning into walls.
         // Test the head sphere at the leaned position; if it collides, reduce
@@ -671,7 +1056,8 @@ private:
         if (std::fabs(mLeanAmount) > 0.01f && mCellIdx >= 0) {
             float sinYaw = std::sin(mYaw);
             float cosYaw = std::cos(mYaw);
-            Vector3 leanedHead = mPosition + Vector3(0.0f, 0.0f, mHeadOffset);
+            float leanBaseZ = (isCrouching() ? HEAD_OFFSET_Z * CROUCH_SCALE : HEAD_OFFSET_Z) + mSpringPos.z;
+            Vector3 leanedHead = mPosition + Vector3(0.0f, 0.0f, leanBaseZ);
             leanedHead.x += sinYaw * mLeanAmount;
             leanedHead.y -= cosYaw * mLeanAmount;
 
@@ -682,7 +1068,7 @@ private:
                 // Simple approach: halve the lean until no collision.
                 for (int i = 0; i < 4; ++i) {
                     mLeanAmount *= 0.5f;
-                    leanedHead = mPosition + Vector3(0.0f, 0.0f, mHeadOffset);
+                    leanedHead = mPosition + Vector3(0.0f, 0.0f, leanBaseZ);
                     leanedHead.x += sinYaw * mLeanAmount;
                     leanedHead.y -= cosYaw * mLeanAmount;
                     contacts = mCollision.sphereVsCellPolygons(
@@ -698,6 +1084,143 @@ private:
         }
     }
 
+    /// Check for mantleable ledge using 3-ray detection.
+    /// Called each fixedStep when the player is airborne and pressing forward.
+    ///
+    /// Detection phases:
+    /// 1. Cast UP from head — must NOT hit (headroom check)
+    /// 2. Cast FORWARD from top — must NOT hit (clear path to ledge)
+    /// 3. Cast DOWN from forward position — MUST hit (ledge surface)
+    inline bool checkMantle() {
+        if (mCurrentMode != PlayerMode::Jump || mInputForward < 0.1f || mMantling)
+            return false;
+
+        float heightScale = isCrouching() ? CROUCH_SCALE : 1.0f;
+        Vector3 headPos = mPosition + Vector3(0.0f, 0.0f, HEAD_OFFSET_Z * heightScale);
+
+        // Phase 1: upward — check headroom
+        Vector3 upTarget = headPos + Vector3(0.0f, 0.0f, MANTLE_UP_DIST);
+        RayHit hit;
+        if (raycastWorld(mCollision.getWR(), headPos, upTarget, hit))
+            return false;  // ceiling too low
+
+        // Phase 2: forward — check clear path
+        float cosY = std::cos(mYaw);
+        float sinY = std::sin(mYaw);
+        Vector3 fwd(cosY, sinY, 0.0f);
+        Vector3 fwdTarget = upTarget + fwd * MANTLE_FWD_DIST;
+        if (raycastWorld(mCollision.getWR(), upTarget, fwdTarget, hit))
+            return false;  // wall in the way
+
+        // Phase 3: downward — find ledge surface
+        Vector3 downTarget = fwdTarget + Vector3(0.0f, 0.0f, -MANTLE_DOWN_DIST);
+        if (!raycastWorld(mCollision.getWR(), fwdTarget, downTarget, hit))
+            return false;  // no ledge found
+
+        // Found a mantleable surface — compute target position
+        // Place body center above the ledge surface with FOOT sphere on the ledge
+        float footZ = isCrouching() ? FOOT_OFFSET_Z * CROUCH_SCALE : FOOT_OFFSET_Z;
+        mMantleTarget = hit.point;
+        mMantleTarget.z -= footZ;  // body center above ledge (FOOT_OFFSET_Z is negative)
+        mMantleTarget.z += SPHERE_RADIUS;  // surface + sphere radius clearance
+
+        startMantle();
+        return true;
+    }
+
+    /// Begin the mantle animation — 5-state machine.
+    inline void startMantle() {
+        mMantling = true;
+        mMantleState = MantleState::Hold;
+        mMantleTimer = 0.0f;
+        mMantleStartPos = mPosition;
+    }
+
+    /// Update the mantle state machine each fixedStep.
+    /// During mantling, normal movement and gravity are suppressed.
+    /// The position is driven directly by the state machine.
+    inline void updateMantle() {
+        if (!mMantling) return;
+
+        mMantleTimer += FIXED_DT;
+
+        switch (mMantleState) {
+        case MantleState::Hold:
+            // Phase 1: hold position, suppress physics
+            mVelocity = Vector3(0.0f);
+            if (mMantleTimer >= MANTLE_HOLD_TIME) {
+                mMantleState = MantleState::Rise;
+                mMantleTimer = 0.0f;
+            }
+            break;
+
+        case MantleState::Rise:
+            // Phase 2: rise vertically toward target Z via spring-like motion
+            mVelocity = Vector3(0.0f);
+            {
+                float targetZ = mMantleTarget.z;
+                float dz = targetZ - mPosition.z;
+                if (std::fabs(dz) < 0.1f) {
+                    // Close enough — snap and advance
+                    mPosition.z = targetZ;
+                    mMantleState = MantleState::Forward;
+                    mMantleTimer = 0.0f;
+                } else {
+                    // Move toward target at spring-controlled rate
+                    float riseSpeed = dz * HEAD_SPRING_TENSION / FIXED_DT * 0.5f;
+                    riseSpeed = std::max(-20.0f, std::min(20.0f, riseSpeed));
+                    mPosition.z += riseSpeed * FIXED_DT;
+                }
+            }
+            break;
+
+        case MantleState::Forward:
+            // Phase 3: move horizontally onto ledge
+            mVelocity = Vector3(0.0f);
+            {
+                float dx = mMantleTarget.x - mPosition.x;
+                float dy = mMantleTarget.y - mPosition.y;
+                float hDist = std::sqrt(dx * dx + dy * dy);
+                if (hDist < 0.1f || mMantleTimer >= MANTLE_FWD_TIME) {
+                    mPosition.x = mMantleTarget.x;
+                    mPosition.y = mMantleTarget.y;
+                    mMantleState = MantleState::StandUp;
+                    mMantleTimer = 0.0f;
+                } else {
+                    float frac = FIXED_DT / std::max(0.01f, MANTLE_FWD_TIME - mMantleTimer + FIXED_DT);
+                    mPosition.x += dx * frac;
+                    mPosition.y += dy * frac;
+                }
+            }
+            break;
+
+        case MantleState::StandUp:
+            // Phase 4: restore normal standing — spring handles the visual transition
+            mVelocity = Vector3(0.0f);
+            mMantleState = MantleState::Complete;
+            mMantleTimer = 0.0f;
+            break;
+
+        case MantleState::Complete:
+            // Phase 5: wait for ground contact, then end mantle
+            // Apply gravity so the player settles onto the ledge
+            mVelocity.z -= mGravityMag * FIXED_DT;
+            if (isOnGround() || mMantleTimer > 1.0f) {
+                // Done mantling — return to normal mode
+                mMantling = false;
+                mMantleState = MantleState::None;
+                mCurrentMode = mWantsCrouch ? PlayerMode::Crouch : PlayerMode::Stand;
+                mVelocity = Vector3(0.0f);
+            }
+            break;
+
+        default:
+            mMantling = false;
+            mMantleState = MantleState::None;
+            break;
+        }
+    }
+
     /// Update cell index from current position
     inline void updateCell() {
         int32_t newCell = mCollision.findCell(mPosition);
@@ -706,85 +1229,396 @@ private:
         // If newCell < 0, keep the old cell (player might be at a boundary)
     }
 
-    /// Update crouch state — transition between standing and crouching
-    inline void updateCrouch() {
-        if (mWantsCrouch && !mCrouching) {
-            // Start crouching
-            mCrouching = true;
-            mHeadOffset = CROUCH_HEAD_OFFSET;
-        } else if (!mWantsCrouch && mCrouching) {
-            // Try to uncrouch — check if there's room above
-            // Test head sphere at standing height for collision
-            Vector3 standingHeadPos = mPosition + Vector3(0.0f, 0.0f, HEAD_OFFSET);
-            auto headContacts = mCollision.sphereVsCellPolygons(
-                standingHeadPos, SPHERE_RADIUS, mCellIdx);
+    /// Update mode transitions — handles crouch, jump→ground, ground→jump, swim.
+    /// Replaces the old updateModeTransitions(). Body center shifts and spring compensation
+    /// for crouch/uncrouch are preserved — just driven by mode transitions now.
+    inline void updateModeTransitions() {
+        // Crouch spring compensation: when the body center shifts and the base
+        // offset changes (standing→crouching), the spring Z must absorb the full
+        // eye height difference so the eye stays at the same world position.
+        // The spring then naturally converges back to zero, creating a smooth
+        // crouch/uncrouch transition.
+        //
+        // Total eye shift = body center shift + base offset change
+        //   = CROUCH_CENTER_DROP + (HEAD_OFFSET_Z * CROUCH_SCALE - HEAD_OFFSET_Z)
+        //   = -1.5 + (0.9 - 1.8) = -2.4
+        // Spring must compensate by +2.4 (crouching) or -2.4 (un-crouching).
+        static constexpr float CROUCH_EYE_SHIFT =
+            HEAD_OFFSET_Z - CROUCH_CENTER_DROP - HEAD_OFFSET_Z * CROUCH_SCALE;
+            // = 1.8 - (-1.5) - 0.9 = 2.4
 
-            // Only uncrouch if head has no collisions at standing height
-            if (headContacts.empty()) {
-                mCrouching = false;
-                mHeadOffset = HEAD_OFFSET;
+        // ── Crouch transitions (only on ground modes) ──
+        if (isOnGround()) {
+            if (mWantsCrouch && !isCrouching()) {
+                // Start crouching — body center drops to keep feet on ground
+                mCurrentMode = PlayerMode::Crouch;
+                mPosition.z += CROUCH_CENTER_DROP; // drops by 1.5 (negative value)
+                // Compensate spring Z to keep eye at same world position.
+                // Spring will converge back to zero → smooth crouch transition.
+                mSpringPos.z += CROUCH_EYE_SHIFT;
+            } else if (!mWantsCrouch && isCrouching()) {
+                // Try to un-crouch — check if there's room above.
+                // Test HEAD sphere at standing height (body center raised back up)
+                Vector3 futureCenter = mPosition;
+                futureCenter.z -= CROUCH_CENTER_DROP; // raise center by 1.5
+                Vector3 standingHeadPos = futureCenter + Vector3(0.0f, 0.0f, HEAD_OFFSET_Z);
+                auto headContacts = mCollision.sphereVsCellPolygons(
+                    standingHeadPos, SPHERE_RADIUS, mCellIdx);
+
+                // Only un-crouch if head has no collisions at standing height
+                if (headContacts.empty()) {
+                    mCurrentMode = PlayerMode::Stand;
+                    mPosition.z -= CROUCH_CENTER_DROP; // raise center by 1.5
+                    // Compensate spring Z for reverse transition
+                    mSpringPos.z -= CROUCH_EYE_SHIFT;
+                }
+                // else: ceiling too low, stay crouched
             }
-            // else: ceiling too low, stay crouched
+        }
+
+        // ── Swim detection — enter/exit water based on cell media type ──
+        if (mCellIdx >= 0) {
+            uint8_t media = mCollision.getMediaType(mPosition);
+            if (media == 2 && mCurrentMode != PlayerMode::Swim) {
+                mCurrentMode = PlayerMode::Swim;
+            } else if (media != 2 && mCurrentMode == PlayerMode::Swim) {
+                mCurrentMode = mWantsCrouch ? PlayerMode::Crouch : PlayerMode::Stand;
+            }
         }
     }
 
-    /// Update head spring — provides natural head bob.
-    /// The head is connected to the body by a spring; when the body
-    /// moves vertically (stairs, landing), the head lags behind slightly.
+    /// Activate a new motion pose — sets new target, preserves current offset.
+    /// Current offset is NOT reset — it stays wherever it is, and the cumulative blend in
+    /// updateMotionPose() converges it toward the new target.
+    inline void activatePose(const MotionPoseData &pose) {
+        // mPoseCurrent stays where it is — cumulative blend handles convergence
+        mPoseEnd = Vector3(pose.fwd, pose.lat, pose.vert);
+        mPoseDuration = pose.duration;
+        mPoseHoldTime = pose.holdTime;
+        mPoseTimer = 0.0f;
+        mPoseHolding = false;
+    }
+
+    /// Activate the next stride pose (alternates left/right).
+    /// Each stride is chained as {footfall, recovery} via the motion queue.
+    /// The footfall dips the camera down; the recovery returns it toward the
+    /// mode's rest height. This creates the natural up-down bounce of walking.
+    /// Uses the per-mode motion config table — each mode has its own stride poses.
+    inline void activateStride() {
+        auto motionCfg = getModeMotion(mCurrentMode);
+
+        // Build a recovery pose targeting the mode's rest position with short duration.
+        // Stored as member so the pointer remains valid for the motion queue.
+        mStrideRecovery = {0.12f, 0.0f,
+                           motionCfg.restPose->fwd,
+                           motionCfg.restPose->lat,
+                           motionCfg.restPose->vert};
+
+        if (mStrideIsLeft) {
+            activatePoseList({motionCfg.strideLeft, &mStrideRecovery});
+        } else {
+            activatePoseList({motionCfg.strideRight, &mStrideRecovery});
+        }
+        mStrideIsLeft = !mStrideIsLeft;
+    }
+
+    /// Activate a sequence of poses as a LIFO queue.
+    /// The first pose activates immediately; the rest are pushed onto the queue
+    /// in reverse order (last pushed = first popped). When each pose completes,
+    /// the next is popped from the queue. Allow for compound motions (weapon swing + recovery,
+    /// mantle phases, etc.).
+    inline void activatePoseList(std::initializer_list<const MotionPoseData*> poses) {
+        mMotionQueue.clear();
+        auto it = poses.begin();
+        if (it == poses.end()) return;
+
+        // Force-activate the first pose immediately
+        activatePose(**it);
+        ++it;
+
+        // Push remaining in reverse order (LIFO: last pushed = first popped)
+        for (auto end = poses.end(); it != end; ++it)
+            mMotionQueue.push_back(*it);
+        std::reverse(mMotionQueue.begin(), mMotionQueue.end());
+    }
+
+    /// Compute velocity-dependent footstep distance.
+    inline float computeFootstepDist(float hSpeed) const {
+        if (hSpeed < STRIDE_SPEED_LOW)
+            return STRIDE_DIST_MIN;
+        if (hSpeed > STRIDE_SPEED_HIGH)
+            return STRIDE_DIST_MAX;
+        return STRIDE_DIST_MIN
+             + (STRIDE_DIST_MAX - STRIDE_DIST_MIN)
+             * ((hSpeed - STRIDE_SPEED_LOW) / (STRIDE_SPEED_HIGH - STRIDE_SPEED_LOW));
+    }
+
+    /// Update motion pose system — distance-based stride triggering.
+    ///
+    /// Strides trigger when the foot's accumulated travel distance exceeds
+    /// the velocity-dependent footstep distance (computeFootstepDist).
+    /// The pose blend animation plays over its duration independently.
+    /// Foot submodel distance trigger.
+    ///
+    /// Velocity thresholds:
+    ///   > 1.0 units/sec — start tracking foot distance
+    ///   > 1.5 units/sec — trigger head bob motion (stride activation)
+    ///
+    /// When the player stops, the current pose blend completes and
+    /// transitions to the mode's rest pose.
+    inline void updateMotionPose() {
+        float hSpeed = std::sqrt(mVelocity.x * mVelocity.x +
+                                  mVelocity.y * mVelocity.y);
+        // Lean suppresses stride bob — lean poses take priority over stride.
+        // When leaning, the spring's lateral axis is driven by the lean offset,
+        // so stride lateral bob would conflict.
+        bool isLeaning = (mLeanDir != 0);
+        bool isWalking = (isOnGround() && hSpeed > 1.5f && !isLeaning);
+
+        // Advance pose timer
+        mPoseTimer += FIXED_DT;
+
+        // Compute current interpolated pose offset
+        bool poseReady = false;  // true when current pose blend+hold is complete
+        if (mPoseHolding) {
+            // At target, holding — mPoseCurrent stays at mPoseEnd
+            mPoseCurrent = mPoseEnd;
+            // Check if hold time expired → pose is ready for next transition
+            if (mPoseTimer >= mPoseHoldTime) {
+                poseReady = true;
+            }
+        } else if (mPoseDuration <= 0.0f) {
+            // Instant pose (dur=0, e.g. landing bump) — snap to target, start hold
+            mPoseCurrent = mPoseEnd;
+            mPoseHolding = true;
+            mPoseTimer = 0.0f;
+        } else {
+            // Cumulative progressive blend.
+            // Each frame applies (timeActive / duration) fraction of remaining
+            // distance. This converges ~99% in the first half of the duration,
+            // creating a rapid "snap" followed by a hold at target — feels like
+            // a footstep impact rather than a smooth slide.
+            if (mPoseTimer >= mPoseDuration) {
+                // Blend complete — snap to target, enter hold phase
+                mPoseCurrent = mPoseEnd;
+                mPoseHolding = true;
+                mPoseTimer = 0.0f;
+            } else {
+                float frac = mPoseTimer / mPoseDuration;
+                Vector3 delta = mPoseEnd - mPoseCurrent;
+                mPoseCurrent += delta * frac;
+            }
+        }
+
+        // ── Distance-based stride accumulation ──
+        // Accumulate foot travel distance when moving above tracking threshold.
+        // This drives stride triggering — footstep animation is distance-based,
+        // not time-based, foot submodel tracking.
+        bool strideTriggered = false;
+        if (isOnGround() && hSpeed > 1.0f) {
+            mStrideDist += hSpeed * FIXED_DT;
+            float footstepDist = computeFootstepDist(hSpeed);
+            if (isWalking && mStrideDist >= footstepDist) {
+                strideTriggered = true;
+                mStrideDist -= footstepDist;  // carry over excess distance
+            }
+        } else {
+            mStrideDist = 0.0f;
+        }
+
+        // Per-mode rest pose (idle position for current mode)
+        const MotionPoseData &restPose = *getModeMotion(mCurrentMode).restPose;
+
+        // ── Pose chaining state machine ──
+        //
+        // Priority order:
+        // 1. Motion queue — if a queued sequence is active, pop next on completion
+        // 2. Landing bump — must complete before stride resumes
+        // 3. Walking strides — distance-triggered
+        // 4. Idle — return to mode's rest pose
+
+        // Motion queue takes priority — compound motions (weapon swing, mantle)
+        // play through their full sequence regardless of walking state.
+        if (!mMotionQueue.empty() && poseReady) {
+            activatePose(*mMotionQueue.back());
+            mMotionQueue.pop_back();
+        }
+        // Landing bump takes priority over normal strides
+        else if (mLandingActive) {
+            if (poseReady) {
+                mLandingActive = false;
+                // After landing, resume walking or return to idle
+                if (isWalking) {
+                    activateStride();
+                    mStrideDist = 0.0f;
+                } else {
+                    activatePose(restPose);
+                }
+            }
+        }
+        // Walking: trigger strides based on foot travel distance
+        else if (isWalking) {
+            if (!mWasWalking) {
+                // Just started walking — activate first stride immediately
+                activateStride();
+                mStrideDist = 0.0f;
+            } else if (strideTriggered) {
+                // Foot traveled enough distance — activate next stride
+                activateStride();
+            }
+        }
+        // Not walking: return to mode's rest pose when current pose completes
+        else {
+            if (mWasWalking && !mLandingActive) {
+                // Just stopped walking — let current blend finish, then go to rest.
+                // If already holding (blend done), transition immediately.
+                if (poseReady) {
+                    activatePose(restPose);
+                }
+                // If still blending, the pose will complete naturally,
+                // then poseReady fires next frame and we'll catch it below.
+            } else if (poseReady && glm::length(mPoseEnd) > 0.01f) {
+                // Idle, current non-zero pose completed — return to rest
+                activatePose(restPose);
+            }
+        }
+
+        mWasWalking = isWalking;
+    }
+
+    /// Update 3D head spring.
+    ///
+    /// The spring tracks the motion pose's interpolated offset in player-local
+    /// coordinates {forward, lateral, vertical}. The formula:
+    ///
+    ///   tension_eff = tension / dt     (= 0.6 / (1/60) = 36.0 at 60fps)
+    ///   damping_eff = damping + (1 - damping) * dt   (= 0.02 + 0.98/60 ≈ 0.0363)
+    ///
+    ///   vel = displacement * tension_eff
+    ///   vel.z *= 0.5        // vertical axis half-strength
+    ///   vel += prev_vel * damping_eff
+    ///
+    ///   if (|vel| > cap) vel *= cap / |vel|
+    ///   pos += vel * dt
+    ///
+    /// At 60fps this converges ~60% per frame horizontally, ~30% vertically.
+    /// Very overdamped — no oscillation, smooth and natural.
     inline void updateHeadSpring() {
-        float targetOffset = mCrouching ? CROUCH_HEAD_OFFSET : HEAD_OFFSET;
+        // Target = current interpolated motion pose offset
+        Vector3 target = mPoseCurrent;
 
-        // Spring force toward target offset
-        float displacement = targetOffset - mHeadOffset;
-        float springForce = displacement * HEAD_SPRING_TENSION;
+        // Displacement from current spring position to target
+        Vector3 disp = target - mSpringPos;
 
-        // Damping force to prevent oscillation
-        float dampingForce = -mHeadVelocity * HEAD_SPRING_DAMPING;
+        // Spring dt clamping — protection against lag spikes and near-zero
+        // timesteps that could destabilize the spring.
+        float springDt = FIXED_DT;
+        if (springDt > 0.05f) springDt = 0.05f * 0.6f;  // lag spike protection
+        if (springDt < 0.001f) springDt = 0.001f;        // division-by-zero protection
 
-        // Integrate spring
-        mHeadVelocity += (springForce + dampingForce);
-        mHeadOffset += mHeadVelocity;
+        // Effective tension: tension / dt — scales displacement into velocity
+        // At 60fps: 0.6 / (1/60) = 36.0
+        float tensionEff = HEAD_SPRING_TENSION / springDt;
 
-        // Clamp to prevent wild oscillation
-        float minOffset = targetOffset - 1.0f;
-        float maxOffset = targetOffset + 1.0f;
-        mHeadOffset = std::max(minOffset, std::min(maxOffset, mHeadOffset));
+        // Effective damping: retains a tiny fraction of previous velocity
+        // At 60fps: 0.02 + 0.98 * (1/60) ≈ 0.0363
+        float dampingEff = HEAD_SPRING_DAMPING + (1.0f - HEAD_SPRING_DAMPING) * springDt;
+
+        // New velocity = displacement-proportional term + damped previous velocity
+        Vector3 newVel = disp * tensionEff;
+        newVel.z *= HEAD_SPRING_Z_SCALE;  // vertical axis half-strength
+        newVel += mSpringVel * dampingEff;
+
+        // Velocity cap — prevents extreme values during large displacements
+        // (e.g. crouch transition, landing bump)
+        float velMag = glm::length(newVel);
+        if (velMag > HEAD_SPRING_CAP) {
+            newVel *= HEAD_SPRING_CAP / velMag;
+        }
+
+        mSpringVel = newVel;
+        mSpringPos += mSpringVel * springDt;
+
+        // Clamp to sane range — ±3.0 accommodates crouch transition where
+        // body center shifts ±1.5 and the spring must track the large
+        // displacement back to zero.
+        mSpringPos.x = std::max(-3.0f, std::min(3.0f, mSpringPos.x));
+        mSpringPos.y = std::max(-3.0f, std::min(3.0f, mSpringPos.y));
+        mSpringPos.z = std::max(-3.0f, std::min(3.0f, mSpringPos.z));
     }
 
     // ── State ──
 
     const CollisionGeometry &mCollision;  // world collision geometry (not owned)
 
-    Vector3 mPosition{0.0f};       // body center position
+    Vector3 mPosition{0.0f};       // body center position (ground + 4.2 on flat ground)
     Vector3 mVelocity{0.0f};       // linear velocity
     float mYaw = 0.0f;            // look direction (radians)
     float mInputForward = 0.0f;   // movement input [-1, 1]
     float mInputRight   = 0.0f;   // strafe input [-1, 1]
 
     int32_t mCellIdx = -1;        // current WR cell index
-    PlayerMoveState mMoveState = PlayerMoveState::Falling;
+    PlayerMode mCurrentMode = PlayerMode::Jump;
 
-    bool mCrouching    = false;   // currently crouching
-    bool mWantsCrouch  = false;   // crouch input pressed
-    bool mJumpRequested = false;  // jump pending next step
+    bool mWantsCrouch    = false;   // crouch input pressed (drives Stand↔Crouch transition)
+    bool mJumpRequested  = false;  // jump pending next step
+    bool mSneaking       = false;   // sneaking (creep mode, 0.5x speed)
+    bool mRunning        = false;   // running (2x speed)
+    bool mMotionDisabled = false;   // motion disabled (cutscenes, death)
+    bool mMantling       = false;   // mantle animation in progress
+    MantleState mMantleState = MantleState::None;  // current mantle phase
+    float mMantleTimer   = 0.0f;   // time in current mantle phase
+    Vector3 mMantleTarget{0.0f};   // target position for mantle completion
+    Vector3 mMantleStartPos{0.0f}; // position at mantle start
 
     float mGravityMag = GRAVITY;  // current gravity magnitude
     float mTimeAccum  = 0.0f;     // fixed-timestep accumulator
+    float mSimTime    = 0.0f;     // total simulation time (for landing throttle, etc.)
+    float mLastLandingTime = -1.0f; // time of last landing event (for throttling)
 
-    // Head spring state (for natural head bob)
-    float mHeadOffset     = HEAD_OFFSET;  // current head offset
-    float mHeadVelocity   = 0.0f;         // head spring velocity
+    // ── 3D head spring state ──
+    // Spring tracks motion pose targets in player-local coords {fwd, lat, vert}.
+    // Position is displacement from the stance rest offset; the spring naturally
+    // converges toward the current pose target.
+    Vector3 mSpringPos{0.0f};     // current spring displacement {fwd, lat, vert}
+    Vector3 mSpringVel{0.0f};     // spring velocity
+
+    // ── Motion pose state ──
+    // Discrete stride-driven pose system. Each stride triggers a new target
+    // that the spring tracks. Cumulative progressive blend converges current
+    // offset toward target (no explicit start position — preserves current).
+    Vector3 mPoseEnd{0.0f};       // blend target offset {fwd, lat, vert}
+    Vector3 mPoseCurrent{0.0f};   // current interpolated pose offset
+    float mPoseTimer    = 0.0f;   // elapsed time in current blend/hold
+    float mPoseDuration = 0.8f;   // current blend duration (from pose data)
+    float mPoseHoldTime = 0.0f;   // current hold time at target
+    bool  mPoseHolding  = true;   // true = holding at target, false = blending
+
+    // Stride tracking — distance-based triggering.
+    // Strides activate when foot travel distance exceeds computeFootstepDist().
+    bool  mStrideIsLeft  = true;  // which foot is next (alternates each stride)
+    bool  mWasWalking    = false; // was the player walking last frame (edge detection)
+    bool  mLandingActive = false; // true while landing bump pose is active
+    float mStrideDist    = 0.0f;  // accumulated horizontal foot travel distance
+
+    // Stride recovery pose — built dynamically in activateStride() targeting the
+    // mode's rest position with short duration. Stored as member so the pointer
+    // remains valid for the motion queue.
+    MotionPoseData mStrideRecovery = {0.12f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Motion queue — LIFO stack for chaining multi-pose sequences.
+    // When a pose completes, the next is popped from the back.
+    // Used for compound motions (weapon swing → recovery, mantle phases, etc.)
+    std::vector<const MotionPoseData*> mMotionQueue;
 
     // Ground contact normal from last collision pass
     Vector3 mGroundNormal{0.0f, 0.0f, 1.0f};
 
-    // Lean state (visual-only camera offset with cosine-eased blending)
-    float mLeanTarget     = 0.0f; // target lean distance (-LEAN_DISTANCE..+LEAN_DISTANCE)
-    float mLeanAmount     = 0.0f; // current lean distance (eased)
-    float mLeanBlendStart = 0.0f; // lean amount at start of current blend
-    float mLeanBlendT     = 1.0f; // blend progress (0→1, starts at 1 = complete)
+    // Lean state — driven through motion poses (spring provides easing)
+    int   mLeanDir        = 0;    // lean direction: -1=left, 0=center, +1=right
+    float mLeanAmount     = 0.0f; // collision-limited lateral offset (derived from spring each frame)
 
-    // Contacts from last collision resolution (used by detectGround)
+    // Contacts from last collision resolution (used by detectGround and velocity removal)
     std::vector<SphereContact> mLastContacts;
 };
 
