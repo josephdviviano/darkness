@@ -26,6 +26,9 @@ struct RenderConfig {
     float waterRotation   = 0.015f;  // UV rotation speed in rad/s (0 = no rotation)
     float waterScrollSpeed = 0.05f;  // UV scroll speed in world units/s (0 = no drift)
 
+    // -- physics --
+    int physicsRate = 60;  // physics timestep Hz: 12 = vintage (12.5Hz), 60 = modern, 120 = ultra
+
     // -- developer --
     bool showObjects      = true;   // render object meshes
     bool showFallbackCubes = false; // show colored cubes for objects with missing models
@@ -92,6 +95,27 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             }
         }
 
+        // physics section
+        if (YAML::Node phys = root["physics"]) {
+            if (phys["rate"]) {
+                // Accept string names or integer Hz values
+                try {
+                    std::string val = phys["rate"].as<std::string>();
+                    if (val == "vintage" || val == "12.5" || val == "12")
+                        cfg.physicsRate = 12;
+                    else if (val == "ultra" || val == "120")
+                        cfg.physicsRate = 120;
+                    else
+                        cfg.physicsRate = 60;  // "modern" or unknown → default
+                } catch (...) {
+                    int val = phys["rate"].as<int>(60);
+                    if (val <= 12) cfg.physicsRate = 12;
+                    else if (val >= 120) cfg.physicsRate = 120;
+                    else cfg.physicsRate = 60;
+                }
+            }
+        }
+
         // developer section
         if (YAML::Node dev = root["developer"]) {
             if (dev["show_objects"])        cfg.showObjects      = dev["show_objects"].as<bool>();
@@ -144,6 +168,11 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cfg.cameraCollision = true;
         } else if (std::strcmp(argv[i], "--debug-objects") == 0) {
             cfg.debugObjects = true;
+        } else if (std::strcmp(argv[i], "--physics-rate") == 0 && i + 1 < argc) {
+            int val = std::atoi(argv[++i]);
+            if (val <= 12) cfg.physicsRate = 12;
+            else if (val >= 120) cfg.physicsRate = 120;
+            else cfg.physicsRate = 60;
         } else if (std::strcmp(argv[i], "--wave-amp") == 0 && i + 1 < argc) {
             cfg.waveAmplitude = static_cast<float>(std::atof(argv[++i]));
             if (cfg.waveAmplitude < 0.0f) cfg.waveAmplitude = 0.0f;

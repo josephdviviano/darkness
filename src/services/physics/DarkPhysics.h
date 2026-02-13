@@ -58,10 +58,12 @@ class DarkPhysics : public IPhysicsWorld {
 public:
     /// Construct the physics world from parsed WR cell data.
     /// Takes ownership of the collision geometry built from wr.
+    /// Optionally accepts a PhysicsTimestep preset (default: MODERN = 60Hz).
     /// The WRParsedData must outlive this object.
-    explicit DarkPhysics(const WRParsedData &wr)
+    explicit DarkPhysics(const WRParsedData &wr,
+                         const PlayerPhysics::PhysicsTimestep &ts = PlayerPhysics::MODERN)
         : mCollision(wr)
-        , mPlayer(mCollision)
+        , mPlayer(mCollision, ts)
         , mGravity(0.0f, 0.0f, -PlayerPhysics::GRAVITY)
     {
     }
@@ -75,7 +77,7 @@ public:
         mPlayer.step(dt, mContactCb);
 
         // TODO (Task 26): Step ODE world for non-player bodies
-        // dWorldQuickStep(mODEWorld, PlayerPhysics::FIXED_DT);
+        // dWorldQuickStep(mODEWorld, mPlayer.getTimestep().fixedDt);
     }
 
     void addBody(EntityID id, const PhysicsBodyDesc &desc) override {
@@ -264,6 +266,9 @@ public:
     }
 
     // ── Direct access for renderer integration ──
+
+    /// Get the physics update rate in Hz (convenience delegate to PlayerPhysics).
+    float getPhysicsHz() const { return mPlayer.getPhysicsHz(); }
 
     /// Access the collision geometry (for renderer camera collision fallback)
     const CollisionGeometry &getCollisionGeometry() const { return mCollision; }
