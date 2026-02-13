@@ -998,6 +998,26 @@ static void updateMovement(
 
         // Read back eye position and lean tilt from physics into camera
         Darkness::Vector3 eye = state.physics->getPlayerEyePosition();
+
+        // DEBUG: detect large per-frame eye position jumps (visible teleportation)
+        {
+            float dx = eye.x - state.cam.pos[0];
+            float dy = eye.y - state.cam.pos[1];
+            float dz = eye.z - state.cam.pos[2];
+            float eyeJump = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (eyeJump > 2.0f && state.cam.pos[0] != 0.0f) { // skip first frame
+                fprintf(stderr, "[EYE-JUMP] dt=%.4f  dist=%.2f  eye=(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)  "
+                    "cell=%d  body=(%.1f,%.1f,%.1f)\n",
+                    dt, eyeJump,
+                    state.cam.pos[0], state.cam.pos[1], state.cam.pos[2],
+                    eye.x, eye.y, eye.z,
+                    state.physics->getPlayerCell(),
+                    state.physics->getPlayerPosition().x,
+                    state.physics->getPlayerPosition().y,
+                    state.physics->getPlayerPosition().z);
+            }
+        }
+
         state.cam.pos[0] = eye.x;
         state.cam.pos[1] = eye.y;
         state.cam.pos[2] = eye.z;

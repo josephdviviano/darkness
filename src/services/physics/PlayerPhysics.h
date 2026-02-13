@@ -177,8 +177,7 @@ public:
     static constexpr float MOVEMENT_DECEL = 80.0f;   // ground deceleration (units/sec²)
 
     // Air acceleration fraction — airborne steering uses this fraction of
-    // ground acceleration. The original engine uses the same impulse formula
-    // with friction=0 and Z removed from input.
+    // ground acceleration - impulse formula with friction=0 and Z removed from input.
     static constexpr float AIR_ACCEL_FRAC = 0.3f;
 
     // Spring-connected head (smooths vertical motion, creates natural head bob).
@@ -241,7 +240,7 @@ public:
     // stride interval (~0.31s at walk speed), so each new stride interrupts the previous
     // mid-blend. The head spring smooths these interrupted transitions into organic
     // walking motion — rapid convergence toward footfall target, then interrupted by the
-    // next stride before fully reaching it. This matches the Dark Engine's stride system.
+    // next stride before fully reaching it.
     static constexpr MotionPoseData POSE_STRIDE_LEFT  = {0.6f,  0.01f, 0.0f,  -0.1f,   -0.4f};
     static constexpr MotionPoseData POSE_STRIDE_RIGHT = {0.6f,  0.01f, 0.0f,   0.1f,   -0.4f};
 
@@ -519,6 +518,10 @@ private:
 
     /// Single fixed-timestep physics step
     inline void fixedStep(const ContactCallback &contactCb) {
+        // DEBUG: snapshot position at step start to detect teleportation
+        Vector3 dbgStepStart = mPosition;
+        int32_t dbgCellStart = mCellIdx;
+
         // Advance simulation time (for landing throttle, animation timing, etc.)
         mSimTime += FIXED_DT;
 
@@ -539,10 +542,10 @@ private:
             if (isOnGround()) {
                 mVelocity.z = JUMP_IMPULSE;
                 mCurrentMode = PlayerMode::Jump;
-                // Reset motion to rest pose — the original locks motion to
-                // kMoNormal during jump mode (no stride bob while airborne).
-                // Also reset stride distance so landing doesn't carry stale state.
-                activatePose(POSE_NORMAL);
+                // Reset stride bob — locks motion to POSE_NORMAL during jump mode.
+                // DON'T override an active lean.
+                if (mLeanDir == 0)
+                    activatePose(POSE_NORMAL);
                 mStrideDist = 0.0f;
             }
         }
@@ -574,10 +577,9 @@ private:
         detectGround();
 
         // 9. Update cell index again (collision may have shifted position)
-        // Note: no snap-to-ground here. The original Dark Engine relies purely on
-        // gravity + collision + constraint response to keep the player grounded.
-        // An explicit snap was causing jitter (collision pushes up, snap pulls down)
-        // and fighting with uphill movement.
+        // Relies purely on gravity + collision + constraint response to keep
+        // the player grounded. An explicit snap was causing jitter (collision
+        // pushes up, snap pulls down) and fighting with uphill movement.
         updateCell();
 
         // 10. Check for mantle opportunity when airborne and pressing forward
@@ -593,6 +595,22 @@ private:
 
         // 13. Update lean (visual-only lateral camera offset with collision)
         updateLean();
+
+        // DEBUG: detect teleportation — large per-step position jump
+        {
+            Vector3 delta = mPosition - dbgStepStart;
+            float jumpDist = glm::length(delta);
+            if (jumpDist > 2.0f) {
+                fprintf(stderr, "[TELEPORT] t=%.3f  dist=%.2f  pos=(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)  "
+                    "cell=%d->%d  vel=(%.1f,%.1f,%.1f)  mode=%d\n",
+                    mSimTime, jumpDist,
+                    dbgStepStart.x, dbgStepStart.y, dbgStepStart.z,
+                    mPosition.x, mPosition.y, mPosition.z,
+                    dbgCellStart, mCellIdx,
+                    mVelocity.x, mVelocity.y, mVelocity.z,
+                    static_cast<int>(mCurrentMode));
+            }
+        }
     }
 
     /// Apply gravity to velocity (if not on ground)
@@ -784,6 +802,10 @@ private:
                 // (handles straddling portal boundaries, e.g. feet in one cell, head in another)
                 int32_t sphereCell = mCollision.findCell(sphereCenter);
                 if (sphereCell >= 0 && sphereCell != mCellIdx) {
+                    fprintf(stderr, "[SPHERE-CELL] t=%.3f  sphere[%d] cell=%d (body cell=%d)  "
+                        "sphereZ=%.1f  pos=(%.1f,%.1f,%.1f)\n",
+                        mSimTime, s, sphereCell, mCellIdx,
+                        sphereCenter.z, mPosition.x, mPosition.y, mPosition.z);
                     auto adj = mCollision.sphereVsCellPolygons(
                         sphereCenter, SPHERE_RADIUS, sphereCell);
                     contacts.insert(contacts.end(), adj.begin(), adj.end());
@@ -834,6 +856,31 @@ private:
                     pushes.push_back({c.normal, c.penetration});
                 }
             }
+            // DEBUG: detect large collision pushes
+            {
+                float totalPush = 0.0f;
+                for (const auto &p : pushes)
+                    totalPush += p.second;
+                if (totalPush > 2.0f) {
+                    fprintf(stderr, "[BIG-PUSH] t=%.3f  iter=%d  totalPush=%.2f  pos=(%.1f,%.1f,%.1f)  "
+                        "cell=%d  #contacts=%zu  #pushes=%zu\n",
+                        mSimTime, iter, totalPush,
+                        mPosition.x, mPosition.y, mPosition.z,
+                        mCellIdx,
+                        iterContacts.size(), pushes.size());
+                    for (size_t pi = 0; pi < pushes.size(); ++pi) {
+                        fprintf(stderr, "  push[%zu]: n=(%.3f,%.3f,%.3f) pen=%.2f\n",
+                            pi, pushes[pi].first.x, pushes[pi].first.y, pushes[pi].first.z,
+                            pushes[pi].second);
+                    }
+                    // Show which spheres and cells generated the contacts
+                    for (const auto &c : iterContacts) {
+                        fprintf(stderr, "  contact: n=(%.3f,%.3f,%.3f) pen=%.2f cell=%d poly=%d\n",
+                            c.normal.x, c.normal.y, c.normal.z,
+                            c.penetration, c.cellIdx, c.polyIdx);
+                    }
+                }
+            }
             for (const auto &p : pushes) {
                 mPosition += p.first * p.second;
             }
@@ -842,20 +889,71 @@ private:
             mLastContacts.insert(mLastContacts.end(),
                                  iterContacts.begin(), iterContacts.end());
 
-            // Push may have moved through a portal — update cell
-            int32_t newCell = mCollision.findCell(mPosition);
-            if (newCell >= 0) {
-                mCellIdx = newCell;
-            } else {
-                // Pushed outside all cells — revert to original position
-                mPosition = origPos;
-                mCellIdx = origCell;
-                return;
+            // Push may have moved through a portal — update cell.
+            // Use portal-based tracking (not brute-force) to avoid jumping to
+            // an overlapping but topologically-unconnected cell mid-resolution.
+            {
+                bool cellUpdated = false;
+                // Check if still in current cell
+                const auto &curC = mCollision.getWR().cells[mCellIdx];
+                bool inCur = true;
+                for (const auto &pl : curC.planes) {
+                    if (pl.getDistance(mPosition) < -0.1f) { inCur = false; break; }
+                }
+                if (inCur) {
+                    cellUpdated = true;
+                } else {
+                    // Check portal-connected cells
+                    int nSolid = curC.numPolygons - curC.numPortals;
+                    for (int ppi = nSolid; ppi < curC.numPolygons; ++ppi) {
+                        int32_t tc = static_cast<int32_t>(curC.polygons[ppi].tgtCell);
+                        if (tc < 0 || tc >= static_cast<int32_t>(mCollision.getWR().numCells))
+                            continue;
+                        const auto &tgtC = mCollision.getWR().cells[tc];
+                        bool inTgt = true;
+                        for (const auto &pl : tgtC.planes) {
+                            if (pl.getDistance(mPosition) < -0.1f) { inTgt = false; break; }
+                        }
+                        if (inTgt) {
+                            mCellIdx = tc;
+                            cellUpdated = true;
+                            break;
+                        }
+                    }
+                }
+                if (!cellUpdated) {
+                    // Brute-force fallback
+                    int32_t newCell = mCollision.findCell(mPosition);
+                    if (newCell >= 0) {
+                        fprintf(stderr, "[COLLISION-CELL] t=%.3f  brute-force cell change in resolveCollisions: "
+                            "%d->%d  pos=(%.1f,%.1f,%.1f)  iter=%d\n",
+                            mSimTime, mCellIdx, newCell,
+                            mPosition.x, mPosition.y, mPosition.z, iter);
+                        mCellIdx = newCell;
+                    } else {
+                        // Pushed outside all cells — revert to original position
+                        fprintf(stderr, "[COLLISION-REVERT] t=%.3f  pushed outside all cells, reverting: "
+                            "pos=(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)  cell=%d->%d\n",
+                            mSimTime,
+                            mPosition.x, mPosition.y, mPosition.z,
+                            origPos.x, origPos.y, origPos.z,
+                            mCellIdx, origCell);
+                        mPosition = origPos;
+                        mCellIdx = origCell;
+                        return;
+                    }
+                }
             }
         }
 
         // Final validation — body center must still be in a valid cell
         if (mCollision.findCell(mPosition) < 0) {
+            fprintf(stderr, "[FINAL-REVERT] t=%.3f  final validation failed, reverting: "
+                "pos=(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)  cell=%d->%d\n",
+                mSimTime,
+                mPosition.x, mPosition.y, mPosition.z,
+                origPos.x, origPos.y, origPos.z,
+                mCellIdx, origCell);
             mPosition = origPos;
             mCellIdx = origCell;
         }
@@ -1007,9 +1105,11 @@ private:
         } else {
             if (isOnGround()) {
                 // Just walked off an edge — start falling.
-                // Reset motion to rest pose (no stride bob while airborne).
+                // Reset stride bob (no stride while airborne), but preserve
+                // lean.
                 mCurrentMode = PlayerMode::Jump;
-                activatePose(POSE_NORMAL);
+                if (mLeanDir == 0)
+                    activatePose(POSE_NORMAL);
                 mStrideDist = 0.0f;
             }
         }
@@ -1031,8 +1131,10 @@ private:
         mLeanAmount = mSpringPos.y;
 
         // Collision check at leaned head position — prevent leaning into walls.
-        // Test the head sphere at the leaned position; if it collides, reduce
-        // lean to the maximum collision-free distance.
+        // Instead of binary-search halving (which can snap to zero when near a
+        // wall), use the contact penetration depth to compute the exact maximum
+        // safe lean distance. The lean holds at the wall surface rather than
+        // snapping back to standing.
         if (std::fabs(mLeanAmount) > 0.01f && mCellIdx >= 0) {
             float sinYaw = std::sin(mYaw);
             float cosYaw = std::cos(mYaw);
@@ -1044,22 +1146,30 @@ private:
             auto contacts = mCollision.sphereVsCellPolygons(
                 leanedHead, SPHERE_RADIUS, mCellIdx);
             if (!contacts.empty()) {
-                // Find the maximum safe lean by binary search / step back.
-                // Simple approach: halve the lean until no collision.
-                for (int i = 0; i < 4; ++i) {
-                    mLeanAmount *= 0.5f;
-                    leanedHead = mPosition + Vector3(0.0f, 0.0f, leanBaseZ);
-                    leanedHead.x += sinYaw * mLeanAmount;
-                    leanedHead.y -= cosYaw * mLeanAmount;
-                    contacts = mCollision.sphereVsCellPolygons(
-                        leanedHead, SPHERE_RADIUS, mCellIdx);
-                    if (contacts.empty())
-                        break;
+                // Compute the lean direction in world space (unit vector pointing
+                // from the player's center toward the leaned head position).
+                float leanSign = (mLeanAmount > 0.0f) ? 1.0f : -1.0f;
+                Vector3 leanDir(sinYaw * leanSign, -cosYaw * leanSign, 0.0f);
+
+                // Find the largest pushback required along the lean direction
+                // across all contacts. This tells us exactly how far to pull
+                // the head back to clear all walls.
+                float maxPushback = 0.0f;
+                for (const auto &c : contacts) {
+                    // Project the contact push (normal * penetration) onto the
+                    // negative lean direction — how much of the wall push opposes
+                    // the lean.
+                    float pushInLeanDir = glm::dot(c.normal * c.penetration, -leanDir);
+                    if (pushInLeanDir > maxPushback)
+                        maxPushback = pushInLeanDir;
                 }
-                // If still colliding after 4 halves (lean < 6% of original),
-                // zero the lean completely.
-                if (!contacts.empty())
-                    mLeanAmount = 0.0f;
+
+                // Reduce lean by the pushback + small margin to prevent jitter.
+                // The lean holds at exactly the wall distance rather than zeroing.
+                constexpr float LEAN_WALL_MARGIN = 0.05f;
+                float absLean = std::fabs(mLeanAmount);
+                absLean = std::max(0.0f, absLean - maxPushback - LEAN_WALL_MARGIN);
+                mLeanAmount = absLean * leanSign;
             }
         }
     }
@@ -1201,12 +1311,76 @@ private:
         }
     }
 
-    /// Update cell index from current position
+    /// Update cell index from current position.
+    ///
+    /// Uses portal-graph-based cell tracking rather than brute-force search.
+    /// Tracks cell transitions through portal plane crossings, which avoids
+    /// teleporting to geometrically-overlapping but topologically-unconnected
+    /// cells (e.g., water cells that overlap air cells).
+    ///
+    /// Algorithm:
+    ///   1. If still inside current cell, stay (most common case)
+    ///   2. Check portal-connected cells (one hop from current cell)
+    ///   3. Fallback: brute-force search (for spawn, teleport, etc.)
     inline void updateCell() {
+        const auto &wr = mCollision.getWR();
+
+        // No current cell — brute-force search (initial placement, teleport)
+        if (mCellIdx < 0 || mCellIdx >= static_cast<int32_t>(wr.numCells)) {
+            int32_t newCell = mCollision.findCell(mPosition);
+            if (newCell >= 0)
+                mCellIdx = newCell;
+            return;
+        }
+
+        // 1. Check if still inside current cell (fast path — usual case)
+        const auto &curCell = wr.cells[mCellIdx];
+        bool stillInside = true;
+        for (const auto &plane : curCell.planes) {
+            if (plane.getDistance(mPosition) < -0.1f) {
+                stillInside = false;
+                break;
+            }
+        }
+        if (stillInside)
+            return;
+
+        // 2. Check portal-connected cells — prefer topological neighbors.
+        // Only transition to cells reachable via a portal from the current cell.
+        // This prevents jumping to overlapping water/air cells or distant cells
+        // whose bounding spheres happen to contain the player's position.
+        int numSolid = curCell.numPolygons - curCell.numPortals;
+        for (int pi = numSolid; pi < curCell.numPolygons; ++pi) {
+            int32_t tgtCell = static_cast<int32_t>(curCell.polygons[pi].tgtCell);
+            if (tgtCell < 0 || tgtCell >= static_cast<int32_t>(wr.numCells))
+                continue;
+
+            const auto &tgt = wr.cells[tgtCell];
+            bool inside = true;
+            for (const auto &plane : tgt.planes) {
+                if (plane.getDistance(mPosition) < -0.1f) {
+                    inside = false;
+                    break;
+                }
+            }
+            if (inside) {
+                mCellIdx = tgtCell;
+                return;
+            }
+        }
+
+        // 3. Fallback: brute-force search (handles cases where portal graph
+        // doesn't reach — shouldn't happen in normal gameplay but covers
+        // edge cases like respawn or level geometry quirks).
         int32_t newCell = mCollision.findCell(mPosition);
-        if (newCell >= 0)
+        if (newCell >= 0) {
+            fprintf(stderr, "[UPDATECELL-BRUTE] t=%.3f  brute-force fallback: %d->%d  "
+                "pos=(%.1f,%.1f,%.1f)\n",
+                mSimTime, mCellIdx, newCell,
+                mPosition.x, mPosition.y, mPosition.z);
             mCellIdx = newCell;
-        // If newCell < 0, keep the old cell (player might be at a boundary)
+        }
+        // If still -1, keep old cell (player at boundary, will resolve next frame)
     }
 
     /// Update mode transitions — handles crouch, jump→ground, ground→jump, swim.
@@ -1278,6 +1452,12 @@ private:
         mPoseHoldTime = pose.holdTime;
         mPoseTimer = 0.0f;
         mPoseHolding = false;
+
+        // Clear any pending motion queue entries. A direct pose activation
+        // supersedes queued poses (e.g. a stale stride recovery left over
+        // from walking). activatePoseList() repopulates the queue AFTER
+        // calling activatePose(), so this clear doesn't affect new sequences.
+        mMotionQueue.clear();
     }
 
     /// Activate the next stride pose (alternates left/right).
@@ -1429,10 +1609,17 @@ private:
         else if (mLandingActive) {
             if (poseReady) {
                 mLandingActive = false;
-                // After landing, resume walking or return to idle
+                // After landing, resume walking or return to idle.
+                // If leaning, re-activate the lean pose — the original gates
+                // rest pose activation on !IsLeaning(), so lean survives landing.
                 if (isWalking) {
                     activateStride();
                     mStrideDist = 0.0f;
+                } else if (isLeaning) {
+                    // Re-activate lean pose so spring target stays at lean offset
+                    activatePose(isCrouching()
+                        ? (mLeanDir < 0 ? POSE_CLNLEAN_LEFT : POSE_CLNLEAN_RIGHT)
+                        : (mLeanDir < 0 ? POSE_LEAN_LEFT : POSE_LEAN_RIGHT));
                 } else {
                     activatePose(restPose);
                 }
@@ -1449,18 +1636,22 @@ private:
                 activateStride();
             }
         }
-        // Not walking: return to mode's rest pose when current pose completes
+        // Not walking: return to mode's rest pose when current pose completes.
+        // Exception: while leaning (mLeanDir != 0), hold at the lean target
+        // indefinitely — the lean pose should persist until the key is released.
+        // setLeanDirection(0) explicitly activates the rest pose on key release.
         else {
-            if (mWasWalking && !mLandingActive) {
-                // Just stopped walking — let current blend finish, then go to rest.
+            if (mWasWalking && !mLandingActive && !isLeaning) {
+                // Just stopped walking (not due to lean) — return to rest.
                 // If already holding (blend done), transition immediately.
                 if (poseReady) {
                     activatePose(restPose);
                 }
                 // If still blending, the pose will complete naturally,
                 // then poseReady fires next frame and we'll catch it below.
-            } else if (poseReady && glm::length(mPoseEnd) > 0.01f) {
-                // Idle, current non-zero pose completed — return to rest
+            } else if (poseReady && glm::length(mPoseEnd) > 0.01f && !isLeaning) {
+                // Idle, current non-zero pose completed — return to rest.
+                // Skip when leaning — lean holds at target until key released.
                 activatePose(restPose);
             }
         }
