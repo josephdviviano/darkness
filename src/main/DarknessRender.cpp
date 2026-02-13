@@ -134,11 +134,18 @@ static void printHelp() {
         "  Esc            Quit\n"
         "\n"
         "Debug shortcuts (hold Backspace + key):\n"
+        "  BS+P           Toggle physics mode (walk with gravity/fly noclip)\n"
         "  BS+C           Toggle portal culling on/off\n"
         "  BS+F           Cycle texture filtering (point/bilinear/trilinear/aniso)\n"
         "  BS+L           Toggle lightmap filtering (bilinear/bicubic)\n"
-        "  BS+V           Toggle camera collision (clip/noclip)\n"
+        "  BS+V           Toggle camera collision (clip/noclip) [fly mode only]\n"
         "  BS+M/N         Cycle model isolation (next/prev)\n"
+        "\n"
+        "Physics mode controls (when BS+P is active):\n"
+        "  WASD           Walk forward/strafe\n"
+        "  Space           Jump (when on ground)\n"
+        "  LShift          Crouch (hold)\n"
+        "  Ctrl            Sprint (2x speed)\n"
         "\n"
         "Resource setup:\n"
         "  The --res path should point to a directory containing fam.crf, which\n"
@@ -680,16 +687,29 @@ static void updateTitleBar(SDL_Window *window, const Darkness::RuntimeState &sta
             isoName.c_str(), cnt);
     }
 
-    const char *clipStr = state.cameraCollision ? "clip" : "noclip";
+    // Physics mode shows "walk" / camera collision shows "clip" / default "noclip"
+    const char *moveStr = state.physicsMode ? "walk" :
+                          state.cameraCollision ? "clip" : "noclip";
+
+    // In physics mode, show velocity and ground state for debugging
+    char physSuffix[128] = "";
+    if (state.physicsMode && state.physics) {
+        Darkness::Vector3 vel = state.physics->getPlayerVelocity();
+        float speed = std::sqrt(vel.x * vel.x + vel.y * vel.y);
+        const char *groundStr = state.physics->isPlayerOnGround() ? "ground" : "air";
+        std::snprintf(physSuffix, sizeof(physSuffix),
+            " [%s %.1f u/s cell:%d]", groundStr, speed,
+            state.physics->getPlayerCell());
+    }
 
     if (state.portalCulling) {
         std::snprintf(title, sizeof(title),
-            "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s] [lm:%s] [%s]%s",
-            state.modeStr, state.moveSpeed, state.cullVisibleCells, state.cullTotalCells, filterStr, lmStr, clipStr, isoSuffix);
+            "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s] [lm:%s] [%s]%s%s",
+            state.modeStr, state.moveSpeed, state.cullVisibleCells, state.cullTotalCells, filterStr, lmStr, moveStr, isoSuffix, physSuffix);
     } else {
         std::snprintf(title, sizeof(title),
-            "darkness — %s [speed: %.1f] [cull: OFF] [%s] [lm:%s] [%s]%s",
-            state.modeStr, state.moveSpeed, filterStr, lmStr, clipStr, isoSuffix);
+            "darkness — %s [speed: %.1f] [cull: OFF] [%s] [lm:%s] [%s]%s%s",
+            state.modeStr, state.moveSpeed, filterStr, lmStr, moveStr, isoSuffix, physSuffix);
     }
     SDL_SetWindowTitle(window, title);
 }
@@ -722,6 +742,19 @@ static void registerConsoleSettings(
     dbgConsole.addBool("camera_collision",
         [&state]() { return state.cameraCollision; },
         [&state, refreshTitle](bool v) { state.cameraCollision = v; refreshTitle(); });
+
+    dbgConsole.addBool("physics_mode",
+        [&state]() { return state.physicsMode; },
+        [&state, refreshTitle](bool v) {
+            state.physicsMode = v;
+            // When entering physics mode, teleport player to current camera position
+            if (v && state.physics) {
+                Darkness::Vector3 bodyPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+                state.physics->setPlayerPosition(bodyPos);
+                state.physics->setPlayerYaw(state.cam.yaw);
+            }
+            refreshTitle();
+        });
 
     dbgConsole.addBool("show_objects",
         [&state]() { return state.showObjects; },
@@ -798,6 +831,12 @@ static void handleEvents(
             state.cam.pos[2] = state.spawnZ;
             state.cam.yaw = state.spawnYaw;
             state.cam.pitch = 0;
+            // Also teleport physics player if physics mode is active
+            if (state.physics) {
+                Darkness::Vector3 spawnPos(state.spawnX, state.spawnY, state.spawnZ);
+                state.physics->setPlayerPosition(spawnPos);
+                state.physics->setPlayerYaw(state.spawnYaw);
+            }
             std::fprintf(stderr, "Teleported to spawn (%.1f, %.1f, %.1f)\n",
                          state.spawnX, state.spawnY, state.spawnZ);
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c
@@ -865,13 +904,30 @@ static void handleEvents(
             state.showRaycast = !state.showRaycast;
             std::fprintf(stderr, "Raycast debug: %s\n",
                          state.showRaycast ? "ON" : "OFF");
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_p
+                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
+            // Backspace+P: Toggle physics mode (walk vs fly)
+            state.physicsMode = !state.physicsMode;
+            if (state.physicsMode && state.physics) {
+                // Enter physics mode: teleport player to current camera position.
+                // Use camera position directly as body center — gravity will
+                // settle the player to the correct standing height.
+                Darkness::Vector3 bodyPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+                state.physics->setPlayerPosition(bodyPos);
+                state.physics->setPlayerYaw(state.cam.yaw);
+            }
+            std::fprintf(stderr, "Physics mode: %s\n",
+                         state.physicsMode ? "ON (walk)" : "OFF (fly)");
+            updateTitleBar(window, state);
         }
     }
 }
 
 // ── Movement update ──
 // WASD + vertical movement, suppressed while debug console is open.
-// Applies camera collision against world geometry when enabled.
+// Two modes:
+//   Fly mode (default): free camera with optional sphere collision (Backspace+V)
+//   Physics mode (Backspace+P): gravity, ground detection, constraint collision
 static void updateMovement(
     float dt, Darkness::RuntimeState &state,
     const Darkness::MissionData &mission,
@@ -880,6 +936,45 @@ static void updateMovement(
     if (dbgConsole.isOpen()) return;
 
     const Uint8 *keys = SDL_GetKeyboardState(nullptr);
+
+    // ── Physics mode: player walks with gravity and collision ──
+    if (state.physicsMode && state.physics) {
+        // Normalized movement input [-1, 1] for forward/strafe
+        float forward = 0.0f, right = 0.0f;
+        if (keys[SDL_SCANCODE_W]) forward += 1.0f;
+        if (keys[SDL_SCANCODE_S]) forward -= 1.0f;
+        if (keys[SDL_SCANCODE_D]) right   += 1.0f;
+        if (keys[SDL_SCANCODE_A]) right   -= 1.0f;
+
+        // Sprint with Ctrl: doubles input magnitude so PlayerPhysics
+        // produces RUN_SPEED (22 units/sec) instead of WALK_SPEED (11)
+        if (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]) {
+            forward *= 2.0f;
+            right   *= 2.0f;
+        }
+
+        state.physics->setPlayerMovement(forward, right);
+        state.physics->setPlayerYaw(state.cam.yaw);
+
+        // Jump with Space (only takes effect when on ground)
+        if (keys[SDL_SCANCODE_SPACE])
+            state.physics->playerJump();
+
+        // Crouch with LShift (hold to crouch)
+        state.physics->setPlayerCrouching(keys[SDL_SCANCODE_LSHIFT] != 0);
+
+        // Step the physics simulation
+        state.physics->step(dt);
+
+        // Read back eye position from physics into camera
+        Darkness::Vector3 eye = state.physics->getPlayerEyePosition();
+        state.cam.pos[0] = eye.x;
+        state.cam.pos[1] = eye.y;
+        state.cam.pos[2] = eye.z;
+        return;
+    }
+
+    // ── Fly mode: free camera with optional collision ──
     float forward = 0, right = 0, up = 0;
     float speed = state.moveSpeed;
     if (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL])
@@ -1168,6 +1263,12 @@ int main(int argc, char *argv[]) {
     if (!loadMissionData(misPath, cfg.forceFlicker, mission))
         return 1;
 
+    // Create physics world from parsed WR cell geometry.
+    // Must be created after loadMissionData() so mission.wrData is valid.
+    // The physics instance lives for the duration of the program; wrData
+    // must outlive it (both are in main's scope).
+    state.physics = std::make_unique<Darkness::DarkPhysics>(mission.wrData);
+
     // Inject raycaster into the world query facade — enables ray-vs-world
     // queries (AI line-of-sight, physics, sound occlusion) via portal traversal
     worldQuery->setRaycaster(
@@ -1200,6 +1301,20 @@ int main(int argc, char *argv[]) {
 
     // ── Initialize runtime state: mode string, model isolation, spawn/camera ──
     initRuntimeState(mission, meshes, gpu, camX, camY, camZ, state);
+
+    // Initialize physics player at spawn position.
+    // Use the camera position (eye level) directly as initial body center.
+    // Gravity will pull the player down to the floor within a fraction of a
+    // second, settling them at the correct standing height.  Subtracting
+    // HEAD_OFFSET here would risk placing the body center below the floor
+    // (outside all WR cells), which disables collision entirely.
+    if (state.physics) {
+        Darkness::Vector3 bodyPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+        state.physics->setPlayerPosition(bodyPos);
+        state.physics->setPlayerYaw(state.cam.yaw);
+        std::fprintf(stderr, "Physics: player spawned at body (%.1f, %.1f, %.1f)\n",
+                     bodyPos.x, bodyPos.y, bodyPos.z);
+    }
 
     // ── Debug console for runtime settings management ──
     // Opened with backtick (`), provides tab-completion and value editing.
