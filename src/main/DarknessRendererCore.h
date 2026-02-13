@@ -717,7 +717,11 @@ struct ViewFrustum {
     // Extract frustum planes from a combined view-projection matrix.
     // Standard technique: each plane is a sum/difference of VP matrix rows.
     // Matrix is in row-major order (bx convention).
-    void extractFromVP(const float *vp) {
+    // guardBand: world-space margin added to left/right/top/bottom planes.
+    // Prevents objects from popping at screen edges due to cell-based culling,
+    // especially noticeable at widescreen aspect ratios where large objects
+    // may extend past their cell boundary into the visible area.
+    void extractFromVP(const float *vp, float guardBand = 0.0f) {
         // Left: row3 + row0
         planes[0][0] = vp[ 3] + vp[ 0];
         planes[0][1] = vp[ 7] + vp[ 4];
@@ -760,6 +764,15 @@ struct ViewFrustum {
                 planes[i][1] *= inv;
                 planes[i][2] *= inv;
                 planes[i][3] *= inv;
+            }
+        }
+
+        // Push left/right/top/bottom planes outward by the guard band.
+        // After normalization, planes[i][3] is the signed distance from origin,
+        // so adding guardBand moves the plane outward (away from frustum center).
+        if (guardBand > 0.0f) {
+            for (int i = 0; i < 4; ++i) {  // left, right, bottom, top only
+                planes[i][3] += guardBand;
             }
         }
     }
