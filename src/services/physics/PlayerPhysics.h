@@ -539,6 +539,11 @@ private:
             if (isOnGround()) {
                 mVelocity.z = JUMP_IMPULSE;
                 mCurrentMode = PlayerMode::Jump;
+                // Reset motion to rest pose — the original locks motion to
+                // kMoNormal during jump mode (no stride bob while airborne).
+                // Also reset stride distance so landing doesn't carry stale state.
+                activatePose(POSE_NORMAL);
+                mStrideDist = 0.0f;
             }
         }
         mJumpRequested = false;
@@ -1001,8 +1006,11 @@ private:
             // are handled by updateModeTransitions)
         } else {
             if (isOnGround()) {
-                // Just walked off an edge — start falling
+                // Just walked off an edge — start falling.
+                // Reset motion to rest pose (no stride bob while airborne).
                 mCurrentMode = PlayerMode::Jump;
+                activatePose(POSE_NORMAL);
+                mStrideDist = 0.0f;
             }
         }
     }
