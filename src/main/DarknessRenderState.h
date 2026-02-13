@@ -209,6 +209,7 @@ struct RuntimeState {
     // In fly mode, old noclip/clip behavior is preserved.
     std::unique_ptr<DarkPhysics> physics;
     bool physicsMode = true;  // physics (walk) mode on by default; BS+P toggles to fly
+    bool crouchToggled = false;  // crouch toggle state (LShift toggles on/off)
 
     // Mode description string for title bar (points to string literal)
     const char *modeStr = "flat-shaded";
