@@ -15,7 +15,8 @@
     "zziplib",
     "ode",
     "yaml-cpp",
-    "catch2"
+    "catch2",
+    "glm"
   ],
   "overrides": [],
   "builtin-baseline": "afcc8a3cdfb9bec4e62dc32b23f976e2c56b046f"

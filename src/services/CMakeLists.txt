@@ -93,7 +93,7 @@ set(HEADLESS_SERVICES_SOURCES
 
 add_library(DarknessServices OBJECT ${HEADLESS_SERVICES_SOURCES})
 
-target_link_libraries(DarknessServices PUBLIC DarknessBase)
+target_link_libraries(DarknessServices PUBLIC DarknessBase glm::glm)
 
 target_include_directories(DarknessServices PUBLIC
     ${ODE_INCLUDE_DIR}

@@ -22,7 +22,7 @@
  *****************************************************************************/
 
 #include "Serializer.h"
-#include "Matrix3.h"
+#include "DarknessMath.h"
 
 #include <cmath>
 
@@ -90,13 +90,14 @@ void TypeSerializer<Quaternion>::serialize(FilePtr &dest,
                                            const void *valuePtr) {
     int16_t h, p, b;
 
-    Matrix3 m;
-
-    static_cast<const Quaternion *>(valuePtr)->ToRotationMatrix(m);
+    // Convert quaternion → rotation matrix → Euler angles (ZYX order)
+    // GLM's extractEulerAngleZYX works with mat4
+    const Quaternion &q = *static_cast<const Quaternion *>(valuePtr);
+    Matrix3 m3 = glm::mat3_cast(q);
+    Matrix4 m4(m3);
 
     float x_rad, y_rad, z_rad;
-
-    m.ToEulerAnglesZYX(z_rad, y_rad, x_rad);
+    glm::extractEulerAngleZYX(m4, z_rad, y_rad, x_rad);
 
     h = static_cast<int16_t>(x_rad * 32768 / M_PI);
     p = static_cast<int16_t>(y_rad * 32768 / M_PI);
@@ -118,23 +119,18 @@ void TypeSerializer<Quaternion>::deserialize(FilePtr &src,
 
     float x_rad, y_rad, z_rad;
 
-    /* Order of HPB application is crucial. It was detected that Dark orders HPB
-    in this order:
-    1. Bank is applied
-    2. Pitch is applied
-    3. Heading is applied
-    */
+    /* Dark Engine rotation order (ZYX): Bank applied first, then Pitch, then Heading.
+       Disk order of the int16 values is bank, pitch, heading (angvec tx, ty, tz). */
     x_rad = ((float)(h) / 32768) * static_cast<float>(M_PI); // heading
     y_rad = ((float)(p) / 32768) * static_cast<float>(M_PI); // pitch
     z_rad = ((float)(b) / 32768) * static_cast<float>(M_PI); // bank
 
-    Matrix3 m;
-
-    m.FromEulerAnglesZYX(z_rad, y_rad, x_rad);
+    // Convert Euler angles (ZYX order) → rotation matrix → quaternion
+    Matrix4 m4 = glm::eulerAngleZYX(z_rad, y_rad, x_rad);
+    Matrix3 m3(m4);
 
     Quaternion *q = static_cast<Quaternion *>(valuePtr);
-
-    q->FromRotationMatrix(m);
+    *q = glm::quat_cast(m3);
 };
 
 template <>

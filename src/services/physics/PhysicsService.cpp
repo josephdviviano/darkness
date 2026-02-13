@@ -166,7 +166,8 @@ const Vector3 &PhysicsService::getSubModelPosition(int objId, size_t submdl)
 {
     // TODO: Stub. Code
     STUB_WARN();
-    return Vector3::ZERO;
+    static const Vector3 zero(0.0f);
+    return zero;
 }
 
 //------------------------------------------------------
@@ -175,7 +176,8 @@ const Quaternion &PhysicsService::getSubModelOrientation(int objId,
 {
     // TODO: Stub. Code
     STUB_WARN();
-    return Quaternion::IDENTITY;
+    static const Quaternion identity(1.0f, 0.0f, 0.0f, 0.0f);
+    return identity;
 }
 
 //------------------------------------------------------

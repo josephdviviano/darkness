@@ -93,7 +93,7 @@ void RoomPortal::clear() {
     mEdges.clear();
     mSrcRoom = NULL;
     mDestRoom = NULL;
-    mCenter = Vector3::ZERO;
+    mCenter = Vector3(0.0f);
     mDestPortal = 0;
 }
 } // namespace Darkness

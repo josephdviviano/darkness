@@ -1,8 +1,7 @@
 set(DARKNESS_BASE_SOURCES
-    Array.h
     BitArray.h
     Callback.h
-    MathTypes.cpp
+    DarknessMath.h
     Matrix3.h
     Matrix4.h
     MessageSource.h
@@ -73,6 +72,8 @@ target_include_directories(DarknessBase PUBLIC
     ${DARKNESS_SOURCE_DIR}/src/base/servicemanager
     ${DARKNESS_SOURCE_DIR}/src/compat
 )
+
+target_link_libraries(DarknessBase PUBLIC glm::glm)
 
 target_compile_options(DarknessBase PRIVATE
     $<$<OR:$<CXX_COMPILER_ID:GNU>,$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>>:

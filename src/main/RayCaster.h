@@ -48,7 +48,7 @@ inline bool rayIntersectPolygon(const Vector3 &origin,
     const auto &plane = cell.planes[poly.plane];
 
     // Ray-plane intersection: t = -(plane.normal · origin + plane.d) / (plane.normal · dir)
-    float denom = plane.normal.dotProduct(dir);
+    float denom = glm::dot(plane.normal, dir);
 
     // If ray is nearly parallel to the plane, no intersection
     if (std::fabs(denom) < RAY_EPSILON)
