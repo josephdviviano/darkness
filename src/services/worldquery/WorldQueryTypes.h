@@ -14,9 +14,7 @@
 
 #include <cstdint>
 
-#include "Plane.h"
-#include "Quaternion.h"
-#include "Vector3.h"
+#include "DarknessMath.h"
 
 namespace Darkness {
 

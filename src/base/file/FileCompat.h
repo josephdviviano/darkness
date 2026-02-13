@@ -29,10 +29,7 @@
 #define __FILECOMPAT_H
 
 #include "File.h"
-#include "Plane.h"
-#include "Quaternion.h"
-#include "Vector2.h"
-#include "Vector3.h"
+#include "DarknessMath.h"
 #include "config.h"
 
 namespace Darkness {

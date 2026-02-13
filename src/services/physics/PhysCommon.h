@@ -26,8 +26,7 @@
 
 #include "compat.h"
 #include "integers.h"
-#include "Vector3.h"
-#include "Quaternion.h"
+#include "DarknessMath.h"
 
 namespace Darkness {
 	// Forward decls.

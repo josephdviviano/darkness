@@ -27,8 +27,7 @@
 #include "File.h"
 #include "FileGroup.h"
 #include "FileCompat.h"
-#include "Vector3.h"
-#include "Plane.h"
+#include "DarknessMath.h"
 
 #include <cstdint>
 #include <cstring>

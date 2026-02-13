@@ -33,7 +33,7 @@
 #include "RoomCommon.h"
 #include "ServiceCommon.h"
 #include "SharedPtr.h"
-#include "Vector3.h"
+#include "DarknessMath.h"
 #include "config.h"
 #include "database/DatabaseCommon.h"
 
