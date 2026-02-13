@@ -314,14 +314,14 @@ inline WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
 
                     if (std::abs(dotp) < 1e-6f) {
                         u = glm::dot(tex.axisU, tmp) / mag2_u + sh_u;
-                        v = glm::dot(tex.axisV, tmp) / mag2_v + sh_v;   // why is this one a member function?
+                        v = glm::dot(tex.axisV, tmp) / mag2_v + sh_v;
                     } else {
                         float corr = 1.0f / (mag2_u * mag2_v - dotp * dotp);
                         float cu = corr * mag2_v;
                         float cv = corr * mag2_u;
                         float cross = corr * dotp;
                         float pu = glm::dot(tex.axisU, tmp);
-                        float pv = glm::dot(tex.axisV, tmp);  // why is this one a member function?
+                        float pv = glm::dot(tex.axisV, tmp);
                         u = pu * cu - pv * cross + sh_u;
                         v = pv * cv - pu * cross + sh_v;
                     }

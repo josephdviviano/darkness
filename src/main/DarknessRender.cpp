@@ -176,8 +176,7 @@ static void printHelp() {
 
 // ── Render-loop functions ──
 // Each function handles one pass of the per-frame render loop.
-// Parameters are explicit locals from main() — will be consolidated into
-// structs in Steps 11-13.
+// Parameters are struct references defined in DarknessRenderState.h.
 
 // Render sky dome or textured skybox into View 0 (no depth write/test).
 static void renderSky(
@@ -726,7 +725,7 @@ static void updateTitleBar(SDL_Window *window, const Darkness::RuntimeState &sta
 }
 
 // ── Register debug console settings ──
-// Binds 11 runtime-changeable settings to the debug console (opened with backtick).
+// Binds 13 runtime-changeable settings to the debug console (opened with backtick).
 // Lambdas capture state by reference and update the title bar when relevant settings change.
 static void registerConsoleSettings(
     Darkness::DebugConsole &dbgConsole,
@@ -976,7 +975,7 @@ static void updateMovement(
         if (keys[SDL_SCANCODE_SPACE])
             state.physics->playerJump();
 
-        // Crouch with LShift (toggle on/off, handled in event loop)
+        // Crouch with C key (toggle on/off, handled in event loop)
         state.physics->setPlayerCrouching(state.crouchToggled);
 
         // Lean with Q/E — lateral camera offset, physics body stays in place.
