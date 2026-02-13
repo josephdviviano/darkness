@@ -2,8 +2,6 @@ set(DARKNESS_BASE_SOURCES
     BitArray.h
     Callback.h
     DarknessMath.h
-    Matrix3.h
-    Matrix4.h
     MessageSource.h
     NonCopyable.h
     DarknessException.cpp
@@ -11,16 +9,12 @@ set(DARKNESS_BASE_SOURCES
     DarknessSingleton.h
     LGPalette.h
     LGPalette.cpp
-    Plane.h
     PrioritizedMessageSource.h
-    Quaternion.h
     SharedPtr.h
     StringTokenizer.h
     tracer.cpp
     tracer.h
     ValueChangeRequest.h
-    Vector2.h
-    Vector3.h
     console/ConsoleBackend.cpp
     console/ConsoleBackend.h
     console/ConsoleCommandListener.cpp

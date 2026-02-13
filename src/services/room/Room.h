@@ -31,11 +31,9 @@
 #include <set>
 #include <vector>
 #include "File.h"
-#include "Plane.h"
-#include "Quaternion.h"
+#include "DarknessMath.h"
 #include "RoomCommon.h"
 #include "SharedPtr.h"
-#include "Vector3.h"
 #include "config.h"
 #include "integers.h"
 

@@ -26,12 +26,10 @@
 
 #include "compat.h"
 
-#include "Quaternion.h"
-#include "Matrix3.h"
+#include "DarknessMath.h"
 
 #include "File.h"
 #include "NonCopyable.h"
-#include "Vector3.h"
 
 namespace Darkness {
 

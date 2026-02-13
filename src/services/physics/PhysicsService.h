@@ -31,9 +31,8 @@
 #include "DarknessServiceFactory.h"
 #include "ServiceCommon.h"
 #include "PhysModels.h"
-#include "Quaternion.h"
+#include "DarknessMath.h"
 #include "SharedPtr.h"
-#include "Vector3.h"
 #include "database/DatabaseCommon.h"
 
 #include <ode/ode.h>

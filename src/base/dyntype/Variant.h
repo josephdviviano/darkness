@@ -28,8 +28,7 @@
 #include "config.h"
 
 #include "DarknessException.h"
-#include "Quaternion.h"
-#include "Vector3.h"
+#include "DarknessMath.h"
 #include "integers.h"
 #include <map>
 #include <stdexcept>

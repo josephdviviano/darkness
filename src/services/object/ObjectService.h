@@ -27,8 +27,7 @@
 
 #include "config.h"
 
-#include "Vector3.h"
-#include "Quaternion.h"
+#include "DarknessMath.h"
 #include "DarkCommon.h"
 #include "ServiceCommon.h"
 #include "ObjectCommon.h"
