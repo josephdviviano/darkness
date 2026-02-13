@@ -1077,11 +1077,14 @@ static Darkness::FrameContext prepareFrame(
     // ── Portal culling: determine visible cells ──
     // Build view-projection matrix and extract frustum planes for portal tests.
     // When culling is disabled, visibleCells remains empty (skip filtering).
+    // Guard band (world units) expands the frustum slightly to prevent large
+    // objects from popping at screen edges due to cell-based culling.
     if (state.portalCulling) {
+        constexpr float CULL_GUARD_BAND = 10.0f;
         float vp[16];
         bx::mtxMul(vp, fc.view, fc.proj);
         ViewFrustum frustum;
-        frustum.extractFromVP(vp);
+        frustum.extractFromVP(vp, CULL_GUARD_BAND);
 
         int32_t camCell = findCameraCell(mission.wrData, state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
         fc.visibleCells = portalBFS(mission.wrData, mission.cellPortals, camCell, frustum,
