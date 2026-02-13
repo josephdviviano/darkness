@@ -34,6 +34,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -50,6 +51,7 @@
 #include "SpawnFinder.h"
 #include "TXListParser.h"
 #include "PCXDecoder.h"
+#include "physics/DarkPhysics.h"
 
 namespace Darkness {
 
@@ -201,6 +203,12 @@ struct RuntimeState {
     bool texturedMode = false;
     bool hasWater = false;
     bool hasSkybox = false;
+
+    // Physics simulation (created after WR data is parsed, nullptr until then)
+    // In physics mode the camera position is driven by PlayerPhysics::getEyePosition().
+    // In fly mode, old noclip/clip behavior is preserved.
+    std::unique_ptr<DarkPhysics> physics;
+    bool physicsMode = true;  // physics (walk) mode on by default; BS+P toggles to fly
 
     // Mode description string for title bar (points to string literal)
     const char *modeStr = "flat-shaded";
