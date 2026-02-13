@@ -126,6 +126,11 @@ struct ContactEvent {
 /// Callback type for contact notifications
 using ContactCallback = std::function<void(const ContactEvent &)>;
 
+/// Callback type for footstep sound events.
+/// Fired when the player's foot travel distance exceeds the stride threshold.
+/// pos = player foot position, speed = horizontal speed, materialIdx = ground texture
+using FootstepCallback = std::function<void(const Vector3 &pos, float speed, int materialIdx)>;
+
 // ============================================================================
 // IPhysicsWorld — the physics interface
 // ============================================================================
@@ -226,6 +231,14 @@ public:
     /// Cannot uncrouch if ceiling is too low.
     virtual void setPlayerCrouching(bool crouching) = 0;
 
+    /// Toggle sneaking (creep mode). Reduces movement speed by 0.5x.
+    /// Cannot stack with running — sneaking takes priority.
+    virtual void setPlayerSneaking(bool sneaking) = 0;
+
+    /// Toggle running (sprint). Doubles movement speed.
+    /// If sneaking is also active, sneaking takes priority.
+    virtual void setPlayerRunning(bool running) = 0;
+
     /// True if the player is standing on a walkable surface.
     virtual bool isPlayerOnGround() const = 0;
 
@@ -234,6 +247,22 @@ public:
 
     /// Player linear velocity (for footstep timing, sound, etc.)
     virtual Vector3 getPlayerVelocity() const = 0;
+
+    /// Register a callback for footstep sound events. Called when the player's
+    /// foot travel distance exceeds the stride threshold (distance-based).
+    virtual void setFootstepCallback(FootstepCallback cb) = 0;
+
+    /// Query the player's current mode (Stand, Crouch, Swim, Jump, etc.)
+    virtual int getPlayerMode() const = 0;
+
+    /// True if the player is in the middle of a mantle animation.
+    virtual bool isPlayerMantling() const = 0;
+
+    /// Disable all player motion (for cutscenes, death sequences).
+    virtual void disablePlayerMotion() = 0;
+
+    /// Re-enable player motion after being disabled.
+    virtual void enablePlayerMotion() = 0;
 };
 
 } // namespace Darkness

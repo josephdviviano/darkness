@@ -222,6 +222,14 @@ public:
         mPlayer.setCrouching(crouching);
     }
 
+    void setPlayerSneaking(bool sneaking) override {
+        mPlayer.setSneaking(sneaking);
+    }
+
+    void setPlayerRunning(bool running) override {
+        mPlayer.setRunning(running);
+    }
+
     bool isPlayerOnGround() const override {
         return mPlayer.isOnGround();
     }
@@ -232,6 +240,27 @@ public:
 
     Vector3 getPlayerVelocity() const override {
         return mPlayer.getVelocity();
+    }
+
+    void setFootstepCallback(FootstepCallback cb) override {
+        mFootstepCb = std::move(cb);
+        // TODO: Fire from PlayerPhysics stride triggering
+    }
+
+    int getPlayerMode() const override {
+        return static_cast<int>(mPlayer.getMode());
+    }
+
+    bool isPlayerMantling() const override {
+        return mPlayer.isMantling();
+    }
+
+    void disablePlayerMotion() override {
+        mPlayer.disableMotion();
+    }
+
+    void enablePlayerMotion() override {
+        mPlayer.enableMotion();
     }
 
     // ── Direct access for renderer integration ──
@@ -249,6 +278,7 @@ private:
 
     Vector3 mGravity;                // world gravity vector
     ContactCallback mContactCb;      // optional contact notification callback
+    FootstepCallback mFootstepCb;    // optional footstep sound callback
 
     // Stored body descriptors for deferred ODE integration (Task 26)
     std::unordered_map<EntityID, PhysicsBodyDesc> mBodyDescs;

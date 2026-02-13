@@ -144,9 +144,10 @@ static void printHelp() {
         "Physics mode controls (when BS+P is active):\n"
         "  WASD           Walk forward/strafe\n"
         "  Space           Jump (when on ground)\n"
-        "  LShift          Crouch (hold)\n"
+        "  C               Crouch (toggle)\n"
+        "  LShift          Sneak/creep (hold, 0.5x speed)\n"
         "  Q/E             Lean left/right\n"
-        "  Ctrl            Sprint (2x speed)\n"
+        "  Ctrl            Sprint/run (2x speed)\n"
         "\n"
         "Resource setup:\n"
         "  The --res path should point to a directory containing fam.crf, which\n"
@@ -367,7 +368,7 @@ static void renderWater(
 
             // u_waterFlow: x=rotation speed, y=use_world_uv flag, z=tex_unit_len
             // Flow-textured water: vertex shader computes UVs from world position
-            // with rotation (matching Dark Engine's flow animation system).
+            // with rotation.
             // TXLIST-textured water: uses pre-computed UVs from mesh.
             bool isFlowTextured = (grp.flowGroup > 0);
             float useWorldUV = isFlowTextured ? 1.0f : 0.0f;
@@ -698,8 +699,17 @@ static void updateTitleBar(SDL_Window *window, const Darkness::RuntimeState &sta
         Darkness::Vector3 vel = state.physics->getPlayerVelocity();
         float speed = std::sqrt(vel.x * vel.x + vel.y * vel.y);
         const char *groundStr = state.physics->isPlayerOnGround() ? "ground" : "air";
+        // Show player mode + speed modifier
+        const auto &pp = state.physics->getPlayerPhysics();
+        static const char *modeNames[] = {
+            "stand", "crouch", "swim", "climb", "carry", "slide", "jump", "dead"
+        };
+        int modeIdx = static_cast<int>(pp.getMode());
+        const char *modeName = (modeIdx >= 0 && modeIdx < 8) ? modeNames[modeIdx] : "?";
+        const char *speedMode = pp.isSneaking() ? "sneak" :
+                                pp.isRunning()  ? "run" : modeName;
         std::snprintf(physSuffix, sizeof(physSuffix),
-            " [%s %.1f u/s cell:%d]", groundStr, speed,
+            " [%s %s %.1f u/s cell:%d]", groundStr, speedMode, speed,
             state.physics->getPlayerCell());
     }
 
@@ -909,6 +919,7 @@ static void handleEvents(
                    && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
             // Backspace+P: Toggle physics mode (walk vs fly)
             state.physicsMode = !state.physicsMode;
+            state.crouchToggled = false;  // reset crouch when toggling physics mode
             if (state.physicsMode && state.physics) {
                 // Enter physics mode: teleport player to current camera position.
                 // Use camera position directly as body center — gravity will
@@ -920,6 +931,11 @@ static void handleEvents(
             std::fprintf(stderr, "Physics mode: %s\n",
                          state.physicsMode ? "ON (walk)" : "OFF (fly)");
             updateTitleBar(window, state);
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c
+                   && !SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]
+                   && state.physicsMode) {
+            // C in physics mode: toggle crouch on/off
+            state.crouchToggled = !state.crouchToggled;
         }
     }
 }
@@ -947,22 +963,21 @@ static void updateMovement(
         if (keys[SDL_SCANCODE_D]) right   += 1.0f;
         if (keys[SDL_SCANCODE_A]) right   -= 1.0f;
 
-        // Sprint with Ctrl: doubles input magnitude so PlayerPhysics
-        // produces RUN_SPEED (22 units/sec) instead of WALK_SPEED (11)
-        if (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]) {
-            forward *= 2.0f;
-            right   *= 2.0f;
-        }
-
         state.physics->setPlayerMovement(forward, right);
         state.physics->setPlayerYaw(state.cam.yaw);
+
+        // Speed modes: run (Ctrl, 2x) and sneak (LShift, 0.5x).
+        // Sneak takes priority — can't run and sneak simultaneously.
+        state.physics->setPlayerRunning(
+            keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]);
+        state.physics->setPlayerSneaking(keys[SDL_SCANCODE_LSHIFT] != 0);
 
         // Jump with Space (only takes effect when on ground)
         if (keys[SDL_SCANCODE_SPACE])
             state.physics->playerJump();
 
-        // Crouch with LShift (hold to crouch)
-        state.physics->setPlayerCrouching(keys[SDL_SCANCODE_LSHIFT] != 0);
+        // Crouch with LShift (toggle on/off, handled in event loop)
+        state.physics->setPlayerCrouching(state.crouchToggled);
 
         // Lean with Q/E — lateral camera offset, physics body stays in place.
         // In physics mode Q/E lean instead of moving vertically.
