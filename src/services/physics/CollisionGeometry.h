@@ -137,6 +137,15 @@ public:
             if (dist >= radius)
                 continue;
 
+            // Sphere center is completely past this wall — spurious contact.
+            // This happens when testing adjacent cells via portal adjacency:
+            // the sphere is inside its own cell but the adjacent cell's wall
+            // plane is far behind it. penetration would be radius + |dist|,
+            // causing explosive pushes. A sphere can only legitimately contact
+            // a wall when its center is within one radius of the plane.
+            if (dist < -radius)
+                continue;
+
             // Project sphere center onto the polygon's plane to check if
             // the penetration is through this polygon's surface area.
             // Use negated normal for the winding test: WR polygon vertices
