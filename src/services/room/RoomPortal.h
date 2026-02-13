@@ -32,8 +32,7 @@
 #include "config.h"
 #include "integers.h"
 
-#include "Plane.h"
-#include "Vector3.h"
+#include "DarknessMath.h"
 
 namespace Darkness {
 /** @brief A room portal. Room portals connect two Room instances (doorways)
