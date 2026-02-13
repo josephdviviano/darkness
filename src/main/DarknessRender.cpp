@@ -145,6 +145,7 @@ static void printHelp() {
         "  WASD           Walk forward/strafe\n"
         "  Space           Jump (when on ground)\n"
         "  LShift          Crouch (hold)\n"
+        "  Q/E             Lean left/right\n"
         "  Ctrl            Sprint (2x speed)\n"
         "\n"
         "Resource setup:\n"
@@ -963,18 +964,27 @@ static void updateMovement(
         // Crouch with LShift (hold to crouch)
         state.physics->setPlayerCrouching(keys[SDL_SCANCODE_LSHIFT] != 0);
 
+        // Lean with Q/E — lateral camera offset, physics body stays in place.
+        // In physics mode Q/E lean instead of moving vertically.
+        int leanDir = 0;
+        if (keys[SDL_SCANCODE_Q]) leanDir -= 1;
+        if (keys[SDL_SCANCODE_E]) leanDir += 1;
+        state.physics->getPlayerPhysics().setLeanDirection(leanDir);
+
         // Step the physics simulation
         state.physics->step(dt);
 
-        // Read back eye position from physics into camera
+        // Read back eye position and lean tilt from physics into camera
         Darkness::Vector3 eye = state.physics->getPlayerEyePosition();
         state.cam.pos[0] = eye.x;
         state.cam.pos[1] = eye.y;
         state.cam.pos[2] = eye.z;
+        state.cam.roll = state.physics->getPlayerPhysics().getLeanTilt();
         return;
     }
 
     // ── Fly mode: free camera with optional collision ──
+    state.cam.roll = 0.0f;  // no lean tilt in fly mode
     float forward = 0, right = 0, up = 0;
     float speed = state.moveSpeed;
     if (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL])

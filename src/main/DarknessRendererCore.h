@@ -906,10 +906,11 @@ struct Camera {
     float pos[3];
     float yaw;
     float pitch;
+    float roll = 0.0f;  // camera bank for lean tilt (radians, + = right, - = left)
 
     void init(float x, float y, float z) {
         pos[0] = x; pos[1] = y; pos[2] = z;
-        yaw = 0; pitch = 0;
+        yaw = 0; pitch = 0; roll = 0;
     }
 
     void getViewMatrix(float *mtx) const {
@@ -927,13 +928,30 @@ struct Camera {
 
         bx::Vec3 eye = { pos[0], pos[1], pos[2] };
         bx::Vec3 target = { at[0], at[1], at[2] };
+
+        // Camera roll (lean tilt): rotate the world-up hint vector around
+        // the forward axis. This tilts the camera view, matching the original
+        // engine's head submodel bank during lean animation.
+        // Formula: up' = cos(roll) * worldUp + sin(roll) * rightDir
+        // where rightDir = (sin(yaw), -cos(yaw), 0) in Z-up coordinates.
+        // Positive roll = lean right: up vector tilts toward right (head tilts right).
         bx::Vec3 upV = { 0.0f, 0.0f, 1.0f };  // Z is up in Dark Engine
+        if (std::fabs(roll) > 0.001f) {
+            float cosR = std::cos(roll);
+            float sinR = std::sin(roll);
+            upV = {
+                 sinR * std::sin(yaw),   // sin(roll) * right.x
+                -sinR * std::cos(yaw),   // sin(roll) * right.y  (right.y = -cos(yaw))
+                 cosR                     // cos(roll) * worldUp.z
+            };
+        }
 
         bx::mtxLookAt(mtx, eye, target, upV, bx::Handedness::Right);
     }
 
     // Sky view matrix: rotation only, no translation.
     // Sky dome follows camera rotation but appears infinitely far away.
+    // Roll is applied here too — the whole view tilts when leaning.
     void getSkyViewMatrix(float *mtx) const {
         float cosPitch = std::cos(pitch);
         float fwd[3] = {
@@ -942,10 +960,20 @@ struct Camera {
             std::sin(pitch)
         };
 
-        // Look from origin — sky dome is centered at (0,0,0)
         bx::Vec3 eye = { 0.0f, 0.0f, 0.0f };
         bx::Vec3 target = { fwd[0], fwd[1], fwd[2] };
+
+        // Apply same roll as world view (lean tilts sky too)
         bx::Vec3 upV = { 0.0f, 0.0f, 1.0f };
+        if (std::fabs(roll) > 0.001f) {
+            float cosR = std::cos(roll);
+            float sinR = std::sin(roll);
+            upV = {
+                 sinR * std::sin(yaw),
+                -sinR * std::cos(yaw),
+                 cosR
+            };
+        }
 
         bx::mtxLookAt(mtx, eye, target, upV, bx::Handedness::Right);
     }
