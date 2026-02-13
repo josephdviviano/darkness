@@ -90,8 +90,8 @@ inline bool pointInConvexPolygon(const Vector3 &p,
         const auto &b = verts[indices[(i + 1) % n]];
         Vector3 edge = b - a;
         Vector3 toP  = p - a;
-        Vector3 cross = edge.crossProduct(toP);
-        if (cross.dotProduct(normal) < 0.0f)
+        Vector3 cross = glm::cross(edge, toP);
+        if (glm::dot(cross, normal) < 0.0f)
             return false;
     }
     return true;

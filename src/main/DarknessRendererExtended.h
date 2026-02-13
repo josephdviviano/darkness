@@ -135,7 +135,7 @@ inline FlatMesh buildFlatMesh(const Darkness::WRParsedData &wr) {
             if (poly.plane < cell.planes.size())
                 plane = cell.planes[poly.plane];
 
-            Darkness::Vector3 n = plane.normal.normalisedCopy();
+            Darkness::Vector3 n = glm::normalize(plane.normal);
             float dot = n.x * sunDir[0] + n.y * sunDir[1] + n.z * sunDir[2];
             float brightness = std::max(dot, 0.0f) * 0.85f + 0.15f;
 
@@ -298,11 +298,11 @@ inline WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
                         origin = cell.vertices[oi];
                 }
 
-                float mag2_u = tex.axisU.squaredLength();
-                float mag2_v = tex.axisV.squaredLength();
+                float mag2_u = glm::length2(tex.axisU);
+                float mag2_v = glm::length2(tex.axisV);
                 float sh_u = tex.u / 4096.0f;
                 float sh_v = tex.v / 4096.0f;
-                float dotp = tex.axisU.dotProduct(tex.axisV);
+                float dotp = glm::dot(tex.axisU, tex.axisV);
 
                 for (int vi = 0; vi < poly.count; ++vi) {
                     uint8_t idx = indices[vi];
@@ -313,15 +313,15 @@ inline WorldMesh buildWaterMesh(const Darkness::WRParsedData &wr,
                     float u, v;
 
                     if (std::abs(dotp) < 1e-6f) {
-                        u = tex.axisU.dotProduct(tmp) / mag2_u + sh_u;
-                        v = tex.axisV.dotProduct(tmp) / mag2_v + sh_v;
+                        u = glm::dot(tex.axisU, tmp) / mag2_u + sh_u;
+                        v = glm::dot(tex.axisV, tmp) / mag2_v + sh_v;   // why is this one a member function?
                     } else {
                         float corr = 1.0f / (mag2_u * mag2_v - dotp * dotp);
                         float cu = corr * mag2_v;
                         float cv = corr * mag2_u;
                         float cross = corr * dotp;
-                        float pu = tex.axisU.dotProduct(tmp);
-                        float pv = tex.axisV.dotProduct(tmp);
+                        float pu = glm::dot(tex.axisU, tmp);
+                        float pv = glm::dot(tex.axisV, tmp);  // why is this one a member function?
                         u = pu * cu - pv * cross + sh_u;
                         v = pv * cv - pu * cross + sh_v;
                     }
@@ -451,7 +451,7 @@ inline WorldMesh buildTexturedMesh(const Darkness::WRParsedData &wr,
             if (poly.plane < cell.planes.size())
                 plane = cell.planes[poly.plane];
 
-            Darkness::Vector3 n = plane.normal.normalisedCopy();
+            Darkness::Vector3 n = glm::normalize(plane.normal);
             float dot = n.x * sunDir[0] + n.y * sunDir[1] + n.z * sunDir[2];
             float brightness = std::max(dot, 0.0f) * 0.85f + 0.15f;
 
@@ -503,11 +503,11 @@ inline WorldMesh buildTexturedMesh(const Darkness::WRParsedData &wr,
                         origin = cell.vertices[oi];
                 }
 
-                float mag2_u = tex.axisU.squaredLength();
-                float mag2_v = tex.axisV.squaredLength();
+                float mag2_u = glm::length2(tex.axisU);
+                float mag2_v = glm::length2(tex.axisV);
                 float sh_u = tex.u / 4096.0f;
                 float sh_v = tex.v / 4096.0f;
-                float dotp = tex.axisU.dotProduct(tex.axisV);
+                float dotp = glm::dot(tex.axisU, tex.axisV);
 
                 for (int vi = 0; vi < poly.count; ++vi) {
                     uint8_t idx = indices[vi];
@@ -519,16 +519,16 @@ inline WorldMesh buildTexturedMesh(const Darkness::WRParsedData &wr,
 
                     if (std::abs(dotp) < 1e-6f) {
                         // Orthogonal axes — direct projection
-                        u = tex.axisU.dotProduct(tmp) / mag2_u + sh_u;
-                        v = tex.axisV.dotProduct(tmp) / mag2_v + sh_v;
+                        u = glm::dot(tex.axisU, tmp) / mag2_u + sh_u;
+                        v = glm::dot(tex.axisV, tmp) / mag2_v + sh_v;
                     } else {
                         // Non-orthogonal correction (WRCell.cpp:196-203)
                         float corr = 1.0f / (mag2_u * mag2_v - dotp * dotp);
                         float cu = corr * mag2_v;
                         float cv = corr * mag2_u;
                         float cross = corr * dotp;
-                        float pu = tex.axisU.dotProduct(tmp);
-                        float pv = tex.axisV.dotProduct(tmp);
+                        float pu = glm::dot(tex.axisU, tmp);
+                        float pv = glm::dot(tex.axisV, tmp);
                         u = pu * cu - pv * cross + sh_u;
                         v = pv * cv - pu * cross + sh_v;
                     }
@@ -663,11 +663,11 @@ inline LightmappedMesh buildLightmappedMesh(
                         origin = cell.vertices[oi];
                 }
 
-                float mag2_u = tex.axisU.squaredLength();
-                float mag2_v = tex.axisV.squaredLength();
+                float mag2_u = glm::length2(tex.axisU);
+                float mag2_v = glm::length2(tex.axisV);
                 float sh_u = tex.u / 4096.0f;
                 float sh_v = tex.v / 4096.0f;
-                float dotp = tex.axisU.dotProduct(tex.axisV);
+                float dotp = glm::dot(tex.axisU, tex.axisV);
 
                 // Lightmap shift and entry (if available)
                 const Darkness::WRLightInfo *li = nullptr;
@@ -698,8 +698,8 @@ inline LightmappedMesh buildLightmappedMesh(
                     verts[vi].z = coord.z;
 
                     Darkness::Vector3 tmp = coord - origin;
-                    float pu = tex.axisU.dotProduct(tmp);
-                    float pv = tex.axisV.dotProduct(tmp);
+                    float pu = glm::dot(tex.axisU, tmp);
+                    float pv = glm::dot(tex.axisV, tmp);
                     float projU, projV;
 
                     if (std::abs(dotp) < 1e-6f) {

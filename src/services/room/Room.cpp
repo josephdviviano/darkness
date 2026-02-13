@@ -171,7 +171,7 @@ void Room::detachObj(size_t idset, int id) {
 void Room::clear() {
     mObjectID = 0;
     mRoomID = 0;
-    mCenter = Vector3::ZERO;
+    mCenter = Vector3(0.0f);
 
     // unique_ptr handles portal deletion automatically
     mPortals.clear();
