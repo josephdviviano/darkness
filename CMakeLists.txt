@@ -47,10 +47,6 @@ endif()
 
 option(GLOBAL_DEBUG "Build the debugging code" OFF)
 
-option(GENERATE_NSIS "Creates Windows installer script" ON)
-
-option(GENERATE_DOC "Generate documentation" OFF)
-
 option(PROFILING
     "Build the sources with profiling support (Only Debug build type)"
     OFF)
@@ -145,22 +141,6 @@ else()
 endif()
 
 
-# Documentation
-if(GENERATE_DOC)
-    find_package(Doxygen)
-    find_program(TEXI2HTML texi2html)
-    if(NOT DOT)
-        find_program(DOT dot)
-    endif()
-    mark_as_advanced(TEXI2HTML DOT)
-
-    include(FindPythonModule.cmake)
-    find_python_module("epydoc" "EPYDOC")
-endif()
-
-set(DOC_DEPS_SATISFIED OFF)
-mark_as_advanced(DOC_DEPS_SATISFIED)
-
 # Some configuration checks to allow platform independence
 include(ConfigureChecks.cmake)
 configure_file(config.h.cmake ${CMAKE_BINARY_DIR}/config.h)
@@ -174,64 +154,6 @@ add_subdirectory(thirdparty)
 enable_testing()
 add_subdirectory(tests)
 
-# Additional fake_install dependencies
-set(DARKNESS_DOC_INST_DEPS "")
-mark_as_advanced(DARKNESS_DOC_INST_DEPS)
-
-# Documentation generation
-if(GENERATE_DOC AND DOC_DEPS_SATISFIED)
-    set(DARKNESS_DOC_DIR share/${DARKNESS_SHORTNAME_WITH_VERSION})
-
-    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile.in
-                      ${CMAKE_BINARY_DIR}/Doxyfile)
-
-    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/writedoc.py.in
-                      ${CMAKE_BINARY_DIR}/writedoc.py)
-
-    if(DOXYGEN_EXECUTABLE)
-        add_custom_target(doc ALL
-            COMMAND ${DOXYGEN_EXECUTABLE} ${CMAKE_BINARY_DIR}/Doxyfile
-            COMMENT "Building doxygen documentation" VERBATIM
-        )
-    else()
-        message("Warning: Doxygen not found, docs target disabled.")
-    endif()
-
-    file(WRITE ${CMAKE_BINARY_DIR}/doc/python/html/temp.txt "temp")
-    file(REMOVE ${CMAKE_BINARY_DIR}/doc/python/html/temp.txt)
-
-    add_custom_target(pydoc ALL
-        DEPENDS darknessScript
-        COMMAND ${CMAKE_BINARY_DIR}/src/main/darknessScript ${CMAKE_BINARY_DIR}/writedoc.py
-        COMMENT "Building Python API documentation" VERBATIM
-    )
-
-    mark_as_advanced(MANUAL_BUILDER)
-    if(WIN32)
-        set(MANUAL_BUILDER "${CMAKE_CURRENT_SOURCE_DIR}/doc/src/buildmanual.bat")
-    else()
-        set(MANUAL_BUILDER "/bin/sh" "${CMAKE_CURRENT_SOURCE_DIR}/doc/src/buildmanual.sh")
-    endif()
-
-    add_custom_target(manual ALL
-        COMMAND ${MANUAL_BUILDER} ${CMAKE_CURRENT_SOURCE_DIR}/doc/src/ ${CMAKE_BINARY_DIR}/doc/manual/
-        COMMENT "Building developer's manual" VERBATIM
-    )
-
-    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/doc/style.css
-                      ${CMAKE_BINARY_DIR}/doc/style.css)
-
-    install(DIRECTORY ${DARKNESS_BINARY_DIR}/doc DESTINATION ${DARKNESS_DOC_DIR})
-
-    set(DARKNESS_DOC_INST_DEPS "doc" "pydoc" "manual")
-endif()
-
-if(GENERATE_NSIS)
-    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/installer/darkness-win.in
-                      ${CMAKE_BINARY_DIR}/installer/darkness-win.nsi @ONLY)
-    message(STATUS "Installer script was generated in ${CMAKE_BINARY_DIR}/installer.")
-endif()
-
 # Optional testing local install (not automatic, use "make fake_install")
 add_custom_target(fake_install
     "${CMAKE_COMMAND}"
@@ -244,8 +166,7 @@ message(STATUS "")
 message(STATUS "Your build parameters:")
 message(STATUS " * Global debugging : ${GLOBAL_DEBUG}")
 message(STATUS " * Build type       : ${CMAKE_BUILD_TYPE}")
-message(STATUS " * Profilling       : ${PROFILING}")
-message(STATUS " * Documentation    : ${GENERATE_DOC}")
+message(STATUS " * Profiling        : ${PROFILING}")
 message(STATUS " * C compiler       : ${CMAKE_C_COMPILER}")
 message(STATUS " * C++ compiler     : ${CMAKE_CXX_COMPILER}")
 message(STATUS " * Source directory : ${CMAKE_CURRENT_SOURCE_DIR}")

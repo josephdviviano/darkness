@@ -1,3 +1,0 @@
-# -*-perl-*-
-
-$EXTRA_HEAD = '<LINK TYPE="text/css" rel="stylesheet" href="../style.css"> ';
