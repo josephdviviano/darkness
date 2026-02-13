@@ -22,16 +22,14 @@
 /******************************************************************************
  *
  *    PlayerPhysics — custom player movement simulation with sphere-polygon
- *    collision with constraint-based response.
+ *    collision and constraint-based response. Header-only (inline),
+ *    matching CellGeometry.h / RayCaster.h / CollisionGeometry.h pattern.
  *
- *    Aims to use a multi-sphere player model (head, body, knee,
- *    shin, foot — 5 spheres total, all r=1.2) with a spring-connected
- *    head for natural head bob. Our Phase 2 implementation starts with a
- *    simplified 2-sphere model (body + head) and adds complexity
- *    progressively. The collision response uses normal removal
- *    (constraint projection), not impulse-based resolution.
+ *    Phase 2 uses a simplified 2-sphere model (body + head) with the
+ *    full 5-sphere model planned for later. Collision response uses
+ *    normal removal (constraint projection), not impulse-based resolution.
  *
- *    Constants derived:
+ *    Constants:
  *    - Walk speed: 11.0 units/sec, Run: 22.0, Creep: 5.5
  *    - Player body sphere radius: 1.2 units
  *    - Head sphere offset: +4.8 units above body center
@@ -47,17 +45,16 @@
 
 #include <cmath>
 #include <cstdint>
+#include <functional>
+#include <vector>
 
 #include "DarknessMath.h"
+#include "CollisionGeometry.h"
+#include "IPhysicsWorld.h"
 
 namespace Darkness {
 
-// Forward declarations
-class CollisionGeometry;
-struct ContactEvent;
-using ContactCallback = std::function<void(const ContactEvent &)>;
-
-/// Player movement state flags
+/// Player movement state
 enum class PlayerMoveState {
     OnGround,       // walking / standing on a solid surface
     Falling,        // airborne, gravity pulling down
@@ -73,7 +70,7 @@ public:
     // ── Player physics constants ──
     // Values from previous analysis (Task 20)
 
-    // Sphere radii — all spheres share the same radius in the original engine
+    // Sphere radii — all spheres use the same radius
     static constexpr float SPHERE_RADIUS = 1.2f;
 
     // Sphere center offsets relative to body center (Z-up)
@@ -114,35 +111,50 @@ public:
     static constexpr float HEAD_SPRING_TENSION = 0.6f;
     static constexpr float HEAD_SPRING_DAMPING = 0.02f;
 
+    // Friction deceleration rate (units/sec² when no input on ground)
+    static constexpr float GROUND_FRICTION = 60.0f;
+
     // ── Construction ──
 
     /// Create player physics with reference to collision geometry.
     /// The collision geometry must outlive this object.
-    explicit PlayerPhysics(const CollisionGeometry &collision);
+    explicit PlayerPhysics(const CollisionGeometry &collision)
+        : mCollision(collision) {}
 
     // ── Main simulation ──
 
     /// Advance the player simulation by dt seconds.
     /// Internally steps in FIXED_DT increments. Performs gravity, movement
     /// integration, collision response, and ground detection.
-    /// contactCb may be nullptr if no contact notifications are needed.
-    void step(float dt, const ContactCallback &contactCb);
+    /// contactCb may be empty if no contact notifications are needed.
+    inline void step(float dt, const ContactCallback &contactCb) {
+        mTimeAccum += dt;
+
+        // Fixed timestep accumulation — step at 60 Hz
+        while (mTimeAccum >= FIXED_DT) {
+            mTimeAccum -= FIXED_DT;
+            fixedStep(contactCb);
+        }
+    }
 
     // ── Input ──
 
     /// Set movement input (normalized to [-1, 1]).
     /// forward > 0 = forward, right > 0 = strafe right.
-    void setMovement(float forward, float right);
+    inline void setMovement(float forward, float right) {
+        mInputForward = forward;
+        mInputRight = right;
+    }
 
     /// Set the player's look direction yaw (radians).
     /// Movement is oriented relative to this yaw.
-    void setYaw(float yaw);
+    inline void setYaw(float yaw) { mYaw = yaw; }
 
     /// Initiate a jump (only if on ground).
-    void jump();
+    inline void jump() { mJumpRequested = true; }
 
-    /// Set crouching state. Cannot uncrouch if ceiling blocks.
-    void setCrouching(bool crouching);
+    /// Set crouching state. Cannot un-crouch if ceiling blocks.
+    inline void setCrouching(bool crouching) { mWantsCrouch = crouching; }
 
     // ── State queries ──
 
@@ -150,7 +162,9 @@ public:
     const Vector3 &getPosition() const { return mPosition; }
 
     /// Eye position (head sphere center — above body center)
-    Vector3 getEyePosition() const;
+    inline Vector3 getEyePosition() const {
+        return mPosition + Vector3(0.0f, 0.0f, mHeadOffset);
+    }
 
     /// Linear velocity
     const Vector3 &getVelocity() const { return mVelocity; }
@@ -171,7 +185,24 @@ public:
 
     /// Set player position directly (for spawn, teleport).
     /// Also resets velocity and updates cell index.
-    void setPosition(const Vector3 &pos);
+    /// If findCell fails at the given position, tries eye level as fallback
+    /// (the caller often passes the camera/eye position as body center,
+    /// and the cell geometry may not extend below the floor).
+    inline void setPosition(const Vector3 &pos) {
+        mPosition = pos;
+        mVelocity = Vector3(0.0f);
+        mCellIdx = mCollision.findCell(pos);
+        if (mCellIdx < 0) {
+            // Try at eye level — the camera position is usually inside a cell
+            // even when the body center (below eye) would be outside
+            mCellIdx = mCollision.findCell(pos + Vector3(0.0f, 0.0f, HEAD_OFFSET));
+        }
+        if (mCellIdx < 0) {
+            // Last resort: try slightly above the given position
+            mCellIdx = mCollision.findCell(pos + Vector3(0.0f, 0.0f, SPHERE_RADIUS));
+        }
+        mMoveState = PlayerMoveState::Falling; // will detect ground on next step
+    }
 
     /// Set gravity magnitude (units/sec²). Default is GRAVITY.
     void setGravityMagnitude(float g) { mGravityMag = g; }
@@ -180,31 +211,309 @@ private:
     // ── Internal simulation steps ──
 
     /// Single fixed-timestep physics step
-    void fixedStep(const ContactCallback &contactCb);
+    inline void fixedStep(const ContactCallback &contactCb) {
+        // 1. Handle jump request
+        if (mJumpRequested) {
+            if (mMoveState == PlayerMoveState::OnGround) {
+                mVelocity.z = JUMP_IMPULSE;
+                mMoveState = PlayerMoveState::Falling;
+            }
+            mJumpRequested = false;
+        }
+
+        // 2. Handle crouch state
+        updateCrouch();
+
+        // 3. Apply gravity (if airborne)
+        applyGravity();
+
+        // 4. Apply horizontal movement from input
+        applyMovement();
+
+        // 5. Integrate position
+        integrate();
+
+        // 6. Update cell index BEFORE collision — if integration moved
+        //    the player through a portal, collision must test against
+        //    the new cell's walls, not the old cell's.
+        updateCell();
+
+        // 7. Resolve collisions via constraint projection
+        resolveCollisions(contactCb);
+
+        // 8. Detect ground and update movement state
+        detectGround();
+
+        // 9. Snap to ground when walking on slopes (prevents hopping)
+        if (mMoveState == PlayerMoveState::OnGround) {
+            snapToGround();
+        }
+
+        // 10. Update cell index again (collision may have shifted position)
+        updateCell();
+
+        // 11. Update head spring (natural head bob)
+        updateHeadSpring();
+    }
 
     /// Apply gravity to velocity (if not on ground)
-    void applyGravity();
+    inline void applyGravity() {
+        if (mMoveState != PlayerMoveState::OnGround) {
+            // Z-up: gravity pulls downward
+            mVelocity.z -= mGravityMag * FIXED_DT;
+        }
+    }
 
-    /// Compute desired horizontal velocity from input + yaw
-    Vector3 computeDesiredVelocity() const;
+    /// Compute desired horizontal velocity from input + yaw.
+    /// Forward direction is determined by the player's yaw angle.
+    /// Z-up coordinate system: forward = (cos(yaw), sin(yaw), 0)
+    inline Vector3 computeDesiredVelocity() const {
+        if (std::fabs(mInputForward) < 0.001f && std::fabs(mInputRight) < 0.001f)
+            return Vector3(0.0f);
+
+        // Forward and right vectors in Z-up coordinate system
+        // Forward = (cos(yaw), sin(yaw), 0)
+        // Right = (sin(yaw), -cos(yaw), 0)
+        float cosYaw = std::cos(mYaw);
+        float sinYaw = std::sin(mYaw);
+        Vector3 forward(cosYaw, sinYaw, 0.0f);
+        Vector3 right(sinYaw, -cosYaw, 0.0f);
+
+        // Determine speed based on movement direction
+        float forwardSpeed = WALK_SPEED;
+        float strafeSpeed  = SIDESTEP_SPEED;
+
+        // Backward movement is slower
+        if (mInputForward < 0.0f)
+            forwardSpeed = BACKWARD_SPEED;
+
+        // Crouching reduces speed
+        if (mCrouching) {
+            forwardSpeed *= CROUCH_MULT;
+            strafeSpeed  *= CROUCH_MULT;
+        }
+
+        Vector3 desired = forward * (mInputForward * forwardSpeed)
+                        + right   * (mInputRight   * strafeSpeed);
+
+        return desired;
+    }
 
     /// Apply movement input to velocity (ground vs air control)
-    void applyMovement();
+    inline void applyMovement() {
+        Vector3 desired = computeDesiredVelocity();
+
+        if (mMoveState == PlayerMoveState::OnGround) {
+            // On ground: directly set horizontal velocity to desired.
+            // Project desired velocity onto ground plane so walking on slopes
+            // doesn't fight gravity.
+            if (mGroundNormal.z > MAX_SLOPE_COS) {
+                // Walkable slope — project movement onto ground plane
+                // Remove the component along the ground normal from desired
+                float dot = glm::dot(desired, mGroundNormal);
+                desired -= mGroundNormal * dot;
+            }
+
+            // Apply friction when no input: decelerate toward zero
+            float desiredLen = glm::length(desired);
+            if (desiredLen < 0.01f) {
+                // No input — apply friction to slow down
+                float speed = std::sqrt(mVelocity.x * mVelocity.x +
+                                        mVelocity.y * mVelocity.y);
+                if (speed > 0.01f) {
+                    float decel = GROUND_FRICTION * FIXED_DT;
+                    float newSpeed = std::max(0.0f, speed - decel);
+                    float ratio = newSpeed / speed;
+                    mVelocity.x *= ratio;
+                    mVelocity.y *= ratio;
+                }
+            } else {
+                // Has input — set velocity directly from slope-projected desired.
+                // Z must be SET (not +=) to prevent accumulation on slopes —
+                // adding desired.z each frame would launch the player off ramps.
+                mVelocity.x = desired.x;
+                mVelocity.y = desired.y;
+                mVelocity.z = desired.z;
+            }
+        } else {
+            // Airborne: reduced horizontal control (air strafe)
+            float desiredLen = glm::length(desired);
+            if (desiredLen > 0.01f) {
+                // Apply air control as acceleration toward desired velocity
+                Vector3 accel = desired * AIR_CONTROL;
+                mVelocity.x += accel.x * FIXED_DT;
+                mVelocity.y += accel.y * FIXED_DT;
+            }
+        }
+    }
 
     /// Integrate position from velocity
-    void integrate();
+    inline void integrate() {
+        mPosition += mVelocity * FIXED_DT;
+    }
 
-    /// Run sphere-vs-cell collision and constraint projection
-    void resolveCollisions(const ContactCallback &contactCb);
+    /// Run sphere-vs-cell collision and constraint projection.
+    /// Uses CollisionGeometry::resolveCollisions() which matches
+    /// the camera collision algorithm (iterative push along contact normals).
+    inline void resolveCollisions(const ContactCallback &contactCb) {
+        std::vector<SphereContact> contacts;
+        mCollision.resolveCollisions(mPosition, SPHERE_RADIUS, mCellIdx,
+                                     contacts, COLLISION_ITERS);
 
-    /// Detect ground contact and update movement state
-    void detectGround();
+        // Fire contact callbacks for downstream consumers (audio, AI, scripts)
+        if (contactCb) {
+            for (const auto &c : contacts) {
+                ContactEvent event;
+                event.bodyA = -1; // player entity (archetype ID, placeholder)
+                event.bodyB = 0;  // world geometry
+                event.point = mPosition - c.normal * (SPHERE_RADIUS - c.penetration);
+                event.normal = c.normal;
+                event.depth = c.penetration;
+                event.materialA = -1;
+                event.materialB = c.textureIdx;
+                contactCb(event);
+            }
+        }
 
-    /// Snap player to ground when walking downhill
-    void snapToGround();
+        // Remove velocity components that go into contact surfaces.
+        // This is the constraint-based response: for each contact normal,
+        // remove the velocity component pointing into the surface.
+        for (const auto &c : contacts) {
+            float vn = glm::dot(mVelocity, c.normal);
+            if (vn < 0.0f) {
+                // Velocity points into the surface — remove that component
+                mVelocity -= c.normal * vn;
+            }
+        }
+
+        // Check for ground contacts in this iteration's results.
+        // A ground contact has an upward-facing normal (normal.z > MAX_SLOPE_COS)
+        mLastContacts = std::move(contacts);
+    }
+
+    /// Detect ground contact and update movement state.
+    /// Uses contact normals from the last collision pass — if any contact
+    /// has an upward-facing normal (z > MAX_SLOPE_COS), player is on ground.
+    inline void detectGround() {
+        bool onGround = false;
+
+        // Check contacts from collision resolution
+        for (const auto &c : mLastContacts) {
+            if (c.normal.z > MAX_SLOPE_COS) {
+                onGround = true;
+                mGroundNormal = c.normal;
+                break;
+            }
+        }
+
+        // If no contacts found, do a ground probe
+        if (!onGround && mCellIdx >= 0) {
+            Vector3 probeNormal;
+            if (mCollision.groundTest(mPosition, SPHERE_RADIUS, mCellIdx,
+                                      GROUND_SNAP, probeNormal)) {
+                if (probeNormal.z > MAX_SLOPE_COS) {
+                    onGround = true;
+                    mGroundNormal = probeNormal;
+                }
+            }
+        }
+
+        // Update movement state
+        if (onGround) {
+            if (mMoveState == PlayerMoveState::Falling) {
+                // Landing — zero vertical velocity
+                if (mVelocity.z < 0.0f)
+                    mVelocity.z = 0.0f;
+            }
+            mMoveState = PlayerMoveState::OnGround;
+        } else {
+            if (mMoveState == PlayerMoveState::OnGround) {
+                // Just walked off an edge — start falling
+                mMoveState = PlayerMoveState::Falling;
+            }
+        }
+    }
+
+    /// Snap player to ground when walking on slopes.
+    /// Prevents "hopping" when walking downhill and keeps the player
+    /// glued to the surface when walking uphill.
+    /// This is only called when mMoveState == OnGround, so jump velocity
+    /// (which immediately sets state to Falling) never reaches here.
+    inline void snapToGround() {
+        if (mCellIdx < 0)
+            return;
+
+        Vector3 probeNormal;
+        if (mCollision.groundTest(mPosition, SPHERE_RADIUS, mCellIdx,
+                                  GROUND_SNAP * 2.0f, probeNormal)) {
+            // Ground is close below — push down to contact
+            Vector3 testPos = mPosition;
+            testPos.z -= GROUND_SNAP;
+            auto contacts = mCollision.sphereVsCellPolygons(testPos, SPHERE_RADIUS, mCellIdx);
+            for (const auto &c : contacts) {
+                if (c.normal.z > MAX_SLOPE_COS) {
+                    // Snap to this surface
+                    mPosition.z -= (GROUND_SNAP - c.penetration);
+                    if (mVelocity.z < 0.0f)
+                        mVelocity.z = 0.0f;
+                    break;
+                }
+            }
+        }
+    }
 
     /// Update cell index from current position
-    void updateCell();
+    inline void updateCell() {
+        int32_t newCell = mCollision.findCell(mPosition);
+        if (newCell >= 0)
+            mCellIdx = newCell;
+        // If newCell < 0, keep the old cell (player might be at a boundary)
+    }
+
+    /// Update crouch state — transition between standing and crouching
+    inline void updateCrouch() {
+        if (mWantsCrouch && !mCrouching) {
+            // Start crouching
+            mCrouching = true;
+            mHeadOffset = CROUCH_HEAD_OFFSET;
+        } else if (!mWantsCrouch && mCrouching) {
+            // Try to uncrouch — check if there's room above
+            // Test head sphere at standing height for collision
+            Vector3 standingHeadPos = mPosition + Vector3(0.0f, 0.0f, HEAD_OFFSET);
+            auto headContacts = mCollision.sphereVsCellPolygons(
+                standingHeadPos, SPHERE_RADIUS, mCellIdx);
+
+            // Only uncrouch if head has no collisions at standing height
+            if (headContacts.empty()) {
+                mCrouching = false;
+                mHeadOffset = HEAD_OFFSET;
+            }
+            // else: ceiling too low, stay crouched
+        }
+    }
+
+    /// Update head spring — provides natural head bob.
+    /// The head is connected to the body by a spring; when the body
+    /// moves vertically (stairs, landing), the head lags behind slightly.
+    inline void updateHeadSpring() {
+        float targetOffset = mCrouching ? CROUCH_HEAD_OFFSET : HEAD_OFFSET;
+
+        // Spring force toward target offset
+        float displacement = targetOffset - mHeadOffset;
+        float springForce = displacement * HEAD_SPRING_TENSION;
+
+        // Damping force to prevent oscillation
+        float dampingForce = -mHeadVelocity * HEAD_SPRING_DAMPING;
+
+        // Integrate spring
+        mHeadVelocity += (springForce + dampingForce);
+        mHeadOffset += mHeadVelocity;
+
+        // Clamp to prevent wild oscillation
+        float minOffset = targetOffset - 1.0f;
+        float maxOffset = targetOffset + 1.0f;
+        mHeadOffset = std::max(minOffset, std::min(maxOffset, mHeadOffset));
+    }
 
     // ── State ──
 
@@ -232,6 +541,9 @@ private:
 
     // Ground contact normal from last collision pass
     Vector3 mGroundNormal{0.0f, 0.0f, 1.0f};
+
+    // Contacts from last collision resolution (used by detectGround)
+    std::vector<SphereContact> mLastContacts;
 };
 
 } // namespace Darkness

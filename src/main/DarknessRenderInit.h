@@ -1199,7 +1199,7 @@ static void initRuntimeState(
     }
 
     std::fprintf(stderr, "Controls: WASD=move, mouse=look, Space/LShift=up/down, "
-                 "scroll=speed, `=console, Home=spawn, BS+C/F/V/M/N/R=debug, Esc=quit\n");
+                 "scroll=speed, `=console, Home=spawn, BS+P=walk, BS+C/F/V/M/N/R=debug, Esc=quit\n");
 
     // Initialize camera at spawn position
     state.cam.init(state.spawnX, state.spawnY, state.spawnZ);

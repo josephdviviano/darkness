@@ -22,7 +22,8 @@
 /******************************************************************************
  *
  *    CollisionGeometry — sphere-vs-cell-polygon collision queries over WR
- *    world geometry data.
+ *    world geometry data. Header-only (inline), matching the pattern of
+ *    CellGeometry.h and RayCaster.h.
  *
  *    This generalizes the renderer's applyCameraCollision() into a reusable
  *    physics utility. The key differences from the camera-only version:
@@ -33,8 +34,10 @@
  *
  *    The Darkness collision model:
  *    1. For each solid polygon in the cell, test sphere-vs-plane distance
- *    2. If dist < radius, project sphere center onto plane and test point-in-polygon
- *    3. Accumulate contact normals, then remove velocity components along contacts
+ *    2. If dist < radius, project sphere center onto plane and test
+ *       point-in-polygon
+ *    3. Accumulate contact normals, then remove velocity components
+ *       along contacts
  *    4. Iterate 3 times to handle corner/edge convergence
  *
  *    WR cell conventions:
@@ -99,52 +102,258 @@ public:
 
     /// Test a sphere against all solid polygons in a specific cell.
     /// Returns contacts where the sphere penetrates a wall polygon.
-    /// The sphere is tested against each solid polygon's plane and polygon area.
     ///
-    /// @param center   Sphere center position
-    /// @param radius   Sphere radius
-    /// @param cellIdx  Cell to test against
-    /// @return Vector of contacts (may be empty if no penetration)
-    std::vector<SphereContact> sphereVsCellPolygons(
-        const Vector3 &center, float radius, int32_t cellIdx) const;
+    /// Algorithm (per polygon):
+    ///   1. Compute signed distance from sphere center to polygon plane
+    ///   2. If dist >= radius, sphere doesn't reach this plane — skip
+    ///   3. Project sphere center onto the plane
+    ///   4. Test if projected point is inside the polygon (winding test)
+    ///   5. If inside, record contact with penetration = radius - dist
+    ///
+    /// Cell planes face inward, so the plane normal points INTO the cell
+    /// (toward the interior). A positive distance means the sphere center
+    /// is inside the cell; negative means past the wall. We push whenever
+    /// dist < radius.
+    inline std::vector<SphereContact> sphereVsCellPolygons(
+        const Vector3 &center, float radius, int32_t cellIdx) const
+    {
+        std::vector<SphereContact> contacts;
+
+        if (cellIdx < 0 || cellIdx >= static_cast<int32_t>(mWR.numCells))
+            return contacts;
+
+        const auto &cell = mWR.cells[cellIdx];
+        int numSolid = cell.numPolygons - cell.numPortals;
+
+        for (int pi = 0; pi < numSolid; ++pi) {
+            const auto &poly = cell.polygons[pi];
+            if (poly.count < 3)
+                continue;
+
+            const auto &plane = cell.planes[poly.plane];
+            float dist = plane.getDistance(center);
+
+            // Sphere doesn't reach this plane — no contact
+            if (dist >= radius)
+                continue;
+
+            // Project sphere center onto the polygon's plane to check if
+            // the penetration is through this polygon's surface area.
+            // Use negated normal for the winding test: WR polygon vertices
+            // are CCW when viewed from outside the cell (outward-facing for
+            // rendering), but cell plane normals face inward. Negate so
+            // the winding test matches the vertex order.
+            Vector3 projected = center - plane.normal * dist;
+            Vector3 outNormal(-plane.normal.x, -plane.normal.y, -plane.normal.z);
+
+            if (!pointInConvexPolygon(projected, cell.vertices,
+                                      cell.polyIndices[pi], outNormal))
+                continue;
+
+            // Record contact: normal points inward (push direction),
+            // penetration is how far the sphere has penetrated
+            SphereContact contact;
+            contact.normal = plane.normal;
+            contact.penetration = radius - dist;
+            contact.cellIdx = cellIdx;
+            contact.polyIdx = pi;
+
+            // Texture index if this polygon has texturing data
+            if (pi < static_cast<int>(cell.numTextured)) {
+                contact.textureIdx = static_cast<int32_t>(cell.texturing[pi].txt);
+            } else {
+                contact.textureIdx = -1;
+            }
+
+            contacts.push_back(contact);
+        }
+
+        return contacts;
+    }
 
     /// Test a sphere against solid polygons in the containing cell AND
     /// adjacent cells reachable via portals. This handles the case where
     /// the sphere is near a portal boundary and should collide with walls
     /// in the adjacent cell too.
     ///
-    /// @param center   Sphere center position
-    /// @param radius   Sphere radius
-    /// @return Vector of all contacts from the containing cell and neighbors
-    std::vector<SphereContact> sphereVsWorld(
-        const Vector3 &center, float radius) const;
+    /// Portal adjacency check: for each portal polygon in the containing
+    /// cell, if the sphere center is within radius of the portal plane,
+    /// also test the target cell's solid polygons.
+    inline std::vector<SphereContact> sphereVsWorld(
+        const Vector3 &center, float radius) const
+    {
+        int32_t cellIdx = findCell(center);
+        if (cellIdx < 0)
+            return {};
+
+        // Test the containing cell first
+        auto contacts = sphereVsCellPolygons(center, radius, cellIdx);
+
+        // Check portal polygons to find adjacent cells where the sphere
+        // might also be colliding. The sphere reaches into an adjacent
+        // cell when its distance to the portal plane is less than its radius.
+        const auto &cell = mWR.cells[cellIdx];
+        int numSolid = cell.numPolygons - cell.numPortals;
+
+        for (int pi = numSolid; pi < cell.numPolygons; ++pi) {
+            const auto &poly = cell.polygons[pi];
+            if (poly.count < 3)
+                continue;
+
+            const auto &plane = cell.planes[poly.plane];
+            float dist = plane.getDistance(center);
+
+            // Sphere extends past this portal plane — check adjacent cell
+            if (dist < radius) {
+                int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
+                if (tgtCell >= 0 && tgtCell < static_cast<int32_t>(mWR.numCells)) {
+                    auto adjContacts = sphereVsCellPolygons(center, radius, tgtCell);
+                    contacts.insert(contacts.end(),
+                                    adjContacts.begin(), adjContacts.end());
+                }
+            }
+        }
+
+        return contacts;
+    }
 
     /// Apply constraint-based collision resolution to a sphere.
     /// Iteratively projects the sphere position out of all penetrating
     /// polygons (3-iteration constraint projection).
     ///
-    /// @param center    IN/OUT: sphere center, modified to resolved position
-    /// @param radius    Sphere radius
-    /// @param cellIdx   IN/OUT: cell index, updated if sphere crosses a portal
-    /// @param contacts  OUT: filled with contacts from all iterations
-    /// @param maxIters  Number of constraint projection iterations (default 3)
-    void resolveCollisions(
+    /// Each iteration:
+    ///   1. Find all sphere-polygon contacts at current position
+    ///   2. For each contact, push sphere along contact normal by penetration
+    ///   3. Re-find cell (may have crossed portal during push)
+    ///   4. Repeat until no contacts or max iterations reached
+    ///
+    /// This handles corners (2 intersecting walls) and edges (3+ walls)
+    /// by converging through multiple push iterations — the same approach
+    /// as the renderer's camera collision.
+    inline void resolveCollisions(
         Vector3 &center, float radius,
         int32_t &cellIdx,
         std::vector<SphereContact> &contacts,
-        int maxIters = 3) const;
+        int maxIters = 3) const
+    {
+        // Save original position for revert on failure
+        Vector3 origCenter = center;
+        int32_t origCell = cellIdx;
 
-    /// Quick ground test — cast a sphere downward by a small amount to
-    /// check if there's a walkable surface below.
+        for (int iter = 0; iter < maxIters; ++iter) {
+            if (cellIdx < 0)
+                break;
+
+            auto iterContacts = sphereVsCellPolygons(center, radius, cellIdx);
+
+            // Also check adjacent cells via portals
+            const auto &cell = mWR.cells[cellIdx];
+            int numSolid = cell.numPolygons - cell.numPortals;
+            for (int pi = numSolid; pi < cell.numPolygons; ++pi) {
+                const auto &poly = cell.polygons[pi];
+                if (poly.count < 3)
+                    continue;
+                const auto &plane = cell.planes[poly.plane];
+                float dist = plane.getDistance(center);
+                if (dist < radius) {
+                    int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
+                    if (tgtCell >= 0 && tgtCell < static_cast<int32_t>(mWR.numCells)) {
+                        auto adj = sphereVsCellPolygons(center, radius, tgtCell);
+                        iterContacts.insert(iterContacts.end(),
+                                            adj.begin(), adj.end());
+                    }
+                }
+            }
+
+            if (iterContacts.empty())
+                break; // No contacts — done
+
+            // Push sphere out of each penetrating polygon
+            for (const auto &c : iterContacts) {
+                center += c.normal * c.penetration;
+            }
+
+            // Record contacts for caller (ground detection, contact events)
+            contacts.insert(contacts.end(),
+                            iterContacts.begin(), iterContacts.end());
+
+            // Push may have moved sphere through a portal — update cell
+            int32_t newCell = findCell(center);
+            if (newCell >= 0) {
+                cellIdx = newCell;
+            } else {
+                // Pushed outside all cells — revert to original position
+                center = origCenter;
+                cellIdx = origCell;
+                return;
+            }
+        }
+
+        // Final validation — sphere must still be in a valid cell
+        if (findCell(center) < 0) {
+            center = origCenter;
+            cellIdx = origCell;
+        }
+    }
+
+    /// Quick ground test — test a slightly lowered sphere to check if
+    /// there's a walkable surface below.
     ///
-    /// @param center    Sphere center position
-    /// @param radius    Sphere radius
-    /// @param cellIdx   Cell to start from
-    /// @param maxDrop   Maximum distance to check below (default 0.5 units)
-    /// @param outNormal OUT: ground surface normal if hit
-    /// @return true if ground was found within maxDrop distance
-    bool groundTest(const Vector3 &center, float radius, int32_t cellIdx,
-                    float maxDrop, Vector3 &outNormal) const;
+    /// Drops the sphere center by maxDrop and checks for contacts
+    /// with floor-like normals (normal.z > 0, pointing upward).
+    /// Returns the upward-most normal found.
+    inline bool groundTest(const Vector3 &center, float radius, int32_t cellIdx,
+                           float maxDrop, Vector3 &outNormal) const
+    {
+        if (cellIdx < 0 || cellIdx >= static_cast<int32_t>(mWR.numCells))
+            return false;
+
+        // Test at slightly lowered position
+        Vector3 testPos = center;
+        testPos.z -= maxDrop;
+
+        // Find the cell at the test position (may differ from current cell
+        // if we're near a ledge or stairway)
+        int32_t testCell = findCell(testPos);
+        if (testCell < 0)
+            testCell = cellIdx; // fallback to current cell
+
+        auto contacts = sphereVsCellPolygons(testPos, radius, testCell);
+
+        // Also check adjacent cells at the lowered position
+        if (testCell >= 0 && testCell < static_cast<int32_t>(mWR.numCells)) {
+            const auto &cell = mWR.cells[testCell];
+            int numSolid = cell.numPolygons - cell.numPortals;
+            for (int pi = numSolid; pi < cell.numPolygons; ++pi) {
+                const auto &poly = cell.polygons[pi];
+                if (poly.count < 3)
+                    continue;
+                const auto &plane = cell.planes[poly.plane];
+                float dist = plane.getDistance(testPos);
+                if (dist < radius) {
+                    int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
+                    if (tgtCell >= 0 && tgtCell < static_cast<int32_t>(mWR.numCells)) {
+                        auto adj = sphereVsCellPolygons(testPos, radius, tgtCell);
+                        contacts.insert(contacts.end(), adj.begin(), adj.end());
+                    }
+                }
+            }
+        }
+
+        // Find the most upward-facing contact normal (ground = normal.z > 0)
+        bool found = false;
+        float bestZ = -1.0f;
+        for (const auto &c : contacts) {
+            // Ground normals point upward (positive Z in Z-up coordinate system)
+            if (c.normal.z > 0.0f && c.normal.z > bestZ) {
+                bestZ = c.normal.z;
+                outNormal = c.normal;
+                found = true;
+            }
+        }
+
+        return found;
+    }
 
     /// Access the underlying WR data (for raycast delegation, etc.)
     const WRParsedData &getWR() const { return mWR; }
