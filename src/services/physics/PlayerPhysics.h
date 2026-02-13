@@ -41,7 +41,7 @@
  *    - Walk speed: 11.0 units/sec, Run: 22.0, Creep: 5.5
  *    - All sphere radius: 1.2 units
  *    - 5 sphere offsets from body center (Z-up): +1.8, -0.6, -2.2, -2.6, -3.0
- *    - Gravity: ~40 units/sec² (runtime-configurable)
+ *    - Gravity: ~32 units/sec² (runtime-configurable)
  *    - Fixed timestep: 60 Hz (1/60 sec per physics step)
  *
  *    See NOTES.SOURCE.md for full physics constants documentation.
@@ -145,7 +145,7 @@ public:
     static constexpr float CLIMB_MULT     = 0.5f;
 
     // Physics parameters
-    static constexpr float GRAVITY        = 40.0f;   // units/sec² (runtime-adjustable)
+    static constexpr float GRAVITY        = 32.0f;   // units/sec² (runtime-adjustable)
     static constexpr float FIXED_DT       = 1.0f / 60.0f;  // 60 Hz physics timestep
     // Slope handling — friction-based.
     // GROUND_NORMAL_MIN: any surface with normal.z above this counts as "ground" for
@@ -154,7 +154,6 @@ public:
     // causing the player to slide down steep slopes under gravity.
     static constexpr float GROUND_NORMAL_MIN = 0.1f;   // cos(~84°) — any upward surface
     static constexpr float SLIDE_THRESHOLD   = 0.64f;  // cos(~50°) — below this, sliding
-    static constexpr float GROUND_SNAP    = 0.5f;    // snap-to-ground tolerance
 
     // Collision iteration count — matching the renderer's camera collision
     static constexpr int COLLISION_ITERS  = 3;
@@ -238,17 +237,18 @@ public:
     static constexpr MotionPoseData POSE_NORMAL       = {0.8f,  0.0f,  0.0f,   0.0f,    0.0f};
 
     // Walking strides — each stride is chained as {footfall, recovery} via the motion
-    // queue, creating a natural up-down bounce. The footfall dips the camera down with
-    // subtle lateral sway; the recovery returns it toward neutral height.
-    // Durations are short (~0.15s) so the dip-recover cycle fits within a single stride
-    // interval (~0.3s at walk speed, ~0.18s at run speed).
-    static constexpr MotionPoseData POSE_STRIDE_LEFT  = {0.15f, 0.0f,  0.0f,  -0.06f,  -0.25f};
-    static constexpr MotionPoseData POSE_STRIDE_RIGHT = {0.15f, 0.0f,  0.0f,   0.06f,  -0.25f};
+    // queue, creating a natural up-down bounce. Duration (0.6s) is longer than the
+    // stride interval (~0.31s at walk speed), so each new stride interrupts the previous
+    // mid-blend. The head spring smooths these interrupted transitions into organic
+    // walking motion — rapid convergence toward footfall target, then interrupted by the
+    // next stride before fully reaching it. This matches the Dark Engine's stride system.
+    static constexpr MotionPoseData POSE_STRIDE_LEFT  = {0.6f,  0.01f, 0.0f,  -0.1f,   -0.4f};
+    static constexpr MotionPoseData POSE_STRIDE_RIGHT = {0.6f,  0.01f, 0.0f,   0.1f,   -0.4f};
 
-    // Crouching strides — slightly deeper dip and wider sway.
+    // Crouching strides — slightly wider sway, deeper vertical offset from crouch height.
     // Vert is relative to POSE_CROUCH (-2.02), so -2.50 = 0.48 below crouch rest.
-    static constexpr MotionPoseData POSE_CRAWL_LEFT   = {0.15f, 0.0f,  0.0f,  -0.10f,  -2.50f};
-    static constexpr MotionPoseData POSE_CRAWL_RIGHT  = {0.15f, 0.0f,  0.0f,   0.10f,  -2.50f};
+    static constexpr MotionPoseData POSE_CRAWL_LEFT   = {0.6f,  0.01f, 0.0f,  -0.15f,  -2.50f};
+    static constexpr MotionPoseData POSE_CRAWL_RIGHT  = {0.6f,  0.01f, 0.0f,   0.15f,  -2.50f};
 
     // Crouching idle — dip from crouch height change:
     static constexpr MotionPoseData POSE_CROUCH       = {0.8f,  0.0f,  0.0f,   0.0f,   -2.02f};
@@ -259,8 +259,8 @@ public:
     // Body carry mode (carrying a body or heavy object):
     // Heavier bob — deeper dip and more lateral sway while carrying.
     static constexpr MotionPoseData POSE_CARRY_IDLE   = {0.8f,  0.0f,  0.0f,   0.0f,   -0.8f};
-    static constexpr MotionPoseData POSE_CARRY_LEFT   = {0.15f, 0.0f,  0.0f,  -0.5f,   -1.5f};
-    static constexpr MotionPoseData POSE_CARRY_RIGHT  = {0.15f, 0.0f,  0.0f,   0.15f,  -1.1f};
+    static constexpr MotionPoseData POSE_CARRY_LEFT   = {0.6f,  0.01f, 0.0f,  -0.5f,   -1.5f};
+    static constexpr MotionPoseData POSE_CARRY_RIGHT  = {0.6f,  0.01f, 0.0f,   0.15f,  -1.1f};
 
     // Weapon swing (head bob during sword/blackjack attacks):
     static constexpr MotionPoseData POSE_WEAPON_SWING       = {0.6f,  0.01f, 0.8f,  0.0f,   0.0f};
@@ -568,26 +568,25 @@ private:
         // 8. Detect ground and update movement state
         detectGround();
 
-        // 9. Snap to ground when walking on slopes (prevents hopping)
-        if (isOnGround()) {
-            snapToGround();
-        }
-
-        // 10. Update cell index again (collision may have shifted position)
+        // 9. Update cell index again (collision may have shifted position)
+        // Note: no snap-to-ground here. The original Dark Engine relies purely on
+        // gravity + collision + constraint response to keep the player grounded.
+        // An explicit snap was causing jitter (collision pushes up, snap pulls down)
+        // and fighting with uphill movement.
         updateCell();
 
-        // 11. Check for mantle opportunity when airborne and pressing forward
+        // 10. Check for mantle opportunity when airborne and pressing forward
         if (mCurrentMode == PlayerMode::Jump && mInputForward > 0.1f && !mMotionDisabled) {
             checkMantle();
         }
 
-        // 12. Update motion pose system (discrete stride-driven pose targets)
+        // 11. Update motion pose system (discrete stride-driven pose targets)
         updateMotionPose();
 
-        // 13. Update 3D head spring (tracks pose targets with spring dynamics)
+        // 12. Update 3D head spring (tracks pose targets with spring dynamics)
         updateHeadSpring();
 
-        // 14. Update lean (visual-only lateral camera offset with collision)
+        // 13. Update lean (visual-only lateral camera offset with collision)
         updateLean();
     }
 
@@ -952,18 +951,24 @@ private:
             }
         }
 
-        // If no contacts found AND the player is not ascending (jumping),
-        // probe for ground below the FOOT sphere. Skip when velocity.z > 0.5
-        // to prevent the ground probe from cancelling a jump — the probe drops
-        // the FOOT sphere by GROUND_SNAP and would find the floor the player
-        // just left, snapping them back down. The 0.5 threshold allows minor
-        // slope-walk vertical velocities through.
+        // If no contacts found from collision AND the player is not ascending,
+        // probe slightly below the FOOT sphere to detect ground. This prevents
+        // briefly entering Jump mode when walking over small bumps or down slopes
+        // where the collision pass didn't generate contacts. The probe only
+        // DETECTS ground (updates state), it doesn't move the player — gravity
+        // and collision handle the actual positioning.
+        // Skip when velocity.z > 0.5 to avoid cancelling a jump (the probe
+        // would find the floor just left).
         if (!onGround && mCellIdx >= 0 && mVelocity.z <= 0.5f) {
             float footOffset = isCrouching() ? (FOOT_OFFSET_Z * CROUCH_SCALE) : FOOT_OFFSET_Z;
             Vector3 footCenter = mPosition + Vector3(0.0f, 0.0f, footOffset);
             Vector3 probeNormal;
+            // Small probe distance — just enough to catch one frame of gravity drop
+            // at 60Hz: 0.5 * g * dt² = 0.5 * 32 * (1/60)² ≈ 0.004 units.
+            // Use 0.1 units for a comfortable margin.
+            constexpr float GROUND_PROBE_DIST = 0.1f;
             if (mCollision.groundTest(footCenter, SPHERE_RADIUS, mCellIdx,
-                                      GROUND_SNAP, probeNormal)) {
+                                      GROUND_PROBE_DIST, probeNormal)) {
                 if (probeNormal.z > GROUND_NORMAL_MIN) {
                     onGround = true;
                     mGroundNormal = probeNormal;
@@ -998,39 +1003,6 @@ private:
             if (isOnGround()) {
                 // Just walked off an edge — start falling
                 mCurrentMode = PlayerMode::Jump;
-            }
-        }
-    }
-
-    /// Snap player to ground when walking on slopes.
-    /// Prevents "hopping" when walking downhill and keeps the player
-    /// glued to the surface when walking uphill.
-    /// Uses FOOT sphere position for ground detection.
-    /// This is only called when mCurrentMode == OnGround, so jump velocity
-    /// (which immediately sets state to Falling) never reaches here.
-    inline void snapToGround() {
-        if (mCellIdx < 0)
-            return;
-
-        float footOffset = isCrouching() ? (FOOT_OFFSET_Z * CROUCH_SCALE) : FOOT_OFFSET_Z;
-        Vector3 footCenter = mPosition + Vector3(0.0f, 0.0f, footOffset);
-
-        Vector3 probeNormal;
-        if (mCollision.groundTest(footCenter, SPHERE_RADIUS, mCellIdx,
-                                  GROUND_SNAP * 2.0f, probeNormal)) {
-            // Ground is close below — push FOOT sphere down to contact.
-            // The body center shifts by the same amount (rigid body).
-            Vector3 testPos = footCenter;
-            testPos.z -= GROUND_SNAP;
-            auto contacts = mCollision.sphereVsCellPolygons(testPos, SPHERE_RADIUS, mCellIdx);
-            for (const auto &c : contacts) {
-                if (c.normal.z > GROUND_NORMAL_MIN) {
-                    // Snap body center down (same delta applies to all spheres)
-                    mPosition.z -= (GROUND_SNAP - c.penetration);
-                    if (mVelocity.z < 0.0f)
-                        mVelocity.z = 0.0f;
-                    break;
-                }
             }
         }
     }
@@ -1287,11 +1259,12 @@ private:
         }
     }
 
-    /// Activate a new motion pose — sets new target, preserves current offset.
-    /// Current offset is NOT reset — it stays wherever it is, and the cumulative blend in
-    /// updateMotionPose() converges it toward the new target.
+    /// Activate a new motion pose — captures current offset as blend start,
+    /// sets new target, and begins linear interpolation toward it.
+    /// The head spring provides organic ease-in/ease-out on top of the
+    /// constant-velocity linear blend.
     inline void activatePose(const MotionPoseData &pose) {
-        // mPoseCurrent stays where it is — cumulative blend handles convergence
+        mPoseStart = mPoseCurrent;  // capture current position as blend origin
         mPoseEnd = Vector3(pose.fwd, pose.lat, pose.vert);
         mPoseDuration = pose.duration;
         mPoseHoldTime = pose.holdTime;
@@ -1393,20 +1366,21 @@ private:
             mPoseHolding = true;
             mPoseTimer = 0.0f;
         } else {
-            // Cumulative progressive blend.
-            // Each frame applies (timeActive / duration) fraction of remaining
-            // distance. This converges ~99% in the first half of the duration,
-            // creating a rapid "snap" followed by a hold at target — feels like
-            // a footstep impact rather than a smooth slide.
+            // Linear interpolation from start to target over the full duration.
+            // A cumulative progressive blend  (current += (target - current) * (t/T) )converges
+            // faster at higher framerates. At 20-30fps, common in the early 2000s, this produced
+            // smooth motion, but at our fixed 60Hz physics rate it converges ~99% in 1/3 of the
+            // duration, creating a "snap then hold" pattern.
+            // Linear interpolation (current = start + (target - start) * t/T) is framerate-independent
+            // and uses the full duration — the head spring provides organic acceleration/deceleration.
             if (mPoseTimer >= mPoseDuration) {
                 // Blend complete — snap to target, enter hold phase
                 mPoseCurrent = mPoseEnd;
                 mPoseHolding = true;
                 mPoseTimer = 0.0f;
             } else {
-                float frac = mPoseTimer / mPoseDuration;
-                Vector3 delta = mPoseEnd - mPoseCurrent;
-                mPoseCurrent += delta * frac;
+                float t = mPoseTimer / mPoseDuration;
+                mPoseCurrent = mPoseStart + (mPoseEnd - mPoseStart) * t;
             }
         }
 
@@ -1585,8 +1559,9 @@ private:
 
     // ── Motion pose state ──
     // Discrete stride-driven pose system. Each stride triggers a new target
-    // that the spring tracks. Cumulative progressive blend converges current
-    // offset toward target (no explicit start position — preserves current).
+    // that the spring tracks. Linear interpolation from start to end over
+    // the pose duration; the head spring adds organic ease-in/ease-out.
+    Vector3 mPoseStart{0.0f};     // blend start offset (captured in activatePose)
     Vector3 mPoseEnd{0.0f};       // blend target offset {fwd, lat, vert}
     Vector3 mPoseCurrent{0.0f};   // current interpolated pose offset
     float mPoseTimer    = 0.0f;   // elapsed time in current blend/hold

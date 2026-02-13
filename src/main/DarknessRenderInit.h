@@ -1152,7 +1152,7 @@ static void initRuntimeState(
     std::fprintf(stderr, "Render window opened (%dx%d, %s, %s)\n",
                  WINDOW_WIDTH, WINDOW_HEIGHT,
                  bgfx::getRendererName(bgfx::getRendererType()), state.modeStr);
-    std::fprintf(stderr, "Portal culling: %s (toggle with C key)\n",
+    std::fprintf(stderr, "Portal culling: %s (toggle with BS+C)\n",
                  state.portalCulling ? "ON" : "OFF");
 
     // ── Model isolation state for debugging ──

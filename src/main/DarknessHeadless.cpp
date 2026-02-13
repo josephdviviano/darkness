@@ -19,7 +19,7 @@
  *
  *****************************************************************************/
 
-// Headless entry point for openDarkEngine
+// Headless entry point for Darkness
 // Loads and inspects Dark Engine databases (.mis, .gam, .sav) without a renderer
 
 #include "config.h"
@@ -419,7 +419,7 @@ static void printAllLinks() {
 // ---------- Usage ----------
 
 static void printUsage(const char *prog) {
-    std::cerr << "openDarkEngine Headless Inspector" << std::endl;
+    std::cerr << "Darkness Headless Inspector" << std::endl;
     std::cerr << std::endl;
     std::cerr << "Usage: " << prog << " <database> [command] [args] [--scripts <path>]" << std::endl;
     std::cerr << std::endl;
