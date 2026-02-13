@@ -935,6 +935,13 @@ static void handleEvents(
                    && state.physicsMode) {
             // C in physics mode: toggle crouch on/off
             state.crouchToggled = !state.crouchToggled;
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_SPACE
+                   && !ev.key.repeat && state.physicsMode && state.physics) {
+            // Space in physics mode: jump (edge-triggered, not continuous).
+            // The original Dark Engine fires jump once per key-press event.
+            // SDL_KEYDOWN with key.repeat filtered out ensures we only jump
+            // on the initial press, not on OS key-repeat while held.
+            state.physics->playerJump();
         }
     }
 }
@@ -971,9 +978,10 @@ static void updateMovement(
             keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]);
         state.physics->setPlayerSneaking(keys[SDL_SCANCODE_LSHIFT] != 0);
 
-        // Jump with Space (only takes effect when on ground)
-        if (keys[SDL_SCANCODE_SPACE])
-            state.physics->playerJump();
+        // Jump: handled by SDL_KEYDOWN event (edge-triggered, not held).
+        // The original Dark Engine fires jump on key-press events, not per-frame
+        // polling. This prevents jump chaining when spacebar is held — the player
+        // must release and re-press space to jump again after landing.
 
         // Crouch with C key (toggle on/off, handled in event loop)
         state.physics->setPlayerCrouching(state.crouchToggled);
