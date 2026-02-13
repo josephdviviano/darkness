@@ -11,7 +11,7 @@
 - Git (for vcpkg submodule)
 
 Dependencies are managed automatically via [vcpkg](https://vcpkg.io/) manifest mode:
-bgfx, SDL2, zziplib, ODE, yaml-cpp, Catch2.
+bgfx, GLM, SDL2, zziplib, ODE, yaml-cpp, Catch2.
 
 ### Building
 
