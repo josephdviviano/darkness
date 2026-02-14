@@ -75,6 +75,7 @@
 #include "room/RoomService.h"
 #include "sim/SimService.h"
 #include "physics/PhysicsService.h"
+#include "motion/MotionService.h"
 #include "RawDataStorage.h"
 #include "PLDefParser.h"
 #include "DTypeSizeParser.h"
@@ -140,6 +141,7 @@ static void printHelp() {
         "  BS+L           Toggle lightmap filtering (bilinear/bicubic)\n"
         "  BS+V           Toggle camera collision (clip/noclip) [fly mode only]\n"
         "  BS+M/N         Cycle model isolation (next/prev)\n"
+        "  BS+G           Toggle physics diagnostic log (physics_log.csv)\n"
         "\n"
         "Physics mode controls (when BS+P is active):\n"
         "  WASD           Walk forward/strafe\n"
@@ -940,6 +942,16 @@ static void handleEvents(
             state.showRaycast = !state.showRaycast;
             std::fprintf(stderr, "Raycast debug: %s\n",
                          state.showRaycast ? "ON" : "OFF");
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_g
+                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]
+                   && state.physics) {
+            // Backspace+G: Toggle per-timestep physics diagnostic logging
+            auto &player = state.physics->getPlayerPhysics();
+            if (player.isLogging()) {
+                player.stopLog();
+            } else {
+                player.startLog("physics_log.csv");
+            }
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_p
                    && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
             // Backspace+P: Toggle physics mode (walk vs fly)
@@ -1018,6 +1030,9 @@ static void updateMovement(
         if (keys[SDL_SCANCODE_Q]) leanDir -= 1;
         if (keys[SDL_SCANCODE_E]) leanDir += 1;
         state.physics->getPlayerPhysics().setLeanDirection(leanDir);
+
+        // Feed camera pitch to physics for diagnostic logging
+        state.physics->getPlayerPhysics().setCameraPitch(state.cam.pitch);
 
         // Step the physics simulation
         state.physics->step(dt);
@@ -1253,11 +1268,20 @@ static Darkness::FrameContext prepareFrame(
     // Guard band (world units) expands the frustum slightly to prevent large
     // objects from popping at screen edges due to cell-based culling.
     if (state.portalCulling) {
-        constexpr float CULL_GUARD_BAND = 10.0f;
+        // Build a wider projection for culling than for rendering.
+        // Adding 20 degrees to the rendering FOV prevents large objects
+        // from popping out at screen edges due to cell-based culling.
+        constexpr float CULL_FOV_EXTRA = 20.0f;
+        float cullProj[16];
+        bx::mtxProj(cullProj, 60.0f + CULL_FOV_EXTRA,
+                     float(WINDOW_WIDTH) / float(WINDOW_HEIGHT),
+                     0.1f, 5000.0f,
+                     bgfx::getCaps()->homogeneousDepth,
+                     bx::Handedness::Right);
         float vp[16];
-        bx::mtxMul(vp, fc.view, fc.proj);
+        bx::mtxMul(vp, fc.view, cullProj);
         ViewFrustum frustum;
-        frustum.extractFromVP(vp, CULL_GUARD_BAND);
+        frustum.extractFromVP(vp);
 
         int32_t camCell = findCameraCell(mission.wrData, state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
         fc.visibleCells = portalBFS(mission.wrData, mission.cellPortals, camCell, frustum,
@@ -1353,6 +1377,24 @@ int main(int argc, char *argv[]) {
                       : (cfg.physicsRate >= 120) ? Darkness::PlayerPhysics::ULTRA
                       : Darkness::PlayerPhysics::MODERN;
     state.physics = std::make_unique<Darkness::DarkPhysics>(mission.wrData, physTimestep);
+
+    // ── Load motion capture data from motions.crf ──
+    // motions.crf is present in ALL Dark Engine games (Thief 1/2, System Shock 2).
+    // Currently loaded for future NPC animation (Phase 4 AI). The player camera uses
+    // pre-scripted offset poses (matching the original engine's PlayerMotionTable),
+    // NOT raw motion capture data — mocap is only for third-person creature animation.
+    std::unique_ptr<Darkness::MotionService> motionSvc;
+    if (!resPath.empty()) {
+        motionSvc = std::make_unique<Darkness::MotionService>();
+        if (motionSvc->loadFromCRF(resPath)) {
+            std::fprintf(stderr, "Motion: loaded %d clips from motions.crf (for future NPC use)\n",
+                         motionSvc->clipCount());
+        } else {
+            std::fprintf(stderr, "WARNING: failed to load motions.crf from %s\n"
+                                 "         NPC animation will not be available.\n",
+                         resPath.c_str());
+        }
+    }
 
     // Inject raycaster into the world query facade — enables ray-vs-world
     // queries (AI line-of-sight, physics, sound occlusion) via portal traversal
