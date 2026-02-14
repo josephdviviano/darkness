@@ -237,6 +237,7 @@ struct FrameContext {
     bool underwater = false;
     bool skyFogged = false;
     std::unordered_set<uint32_t> visibleCells;
+    ViewFrustum objFrustum;       // Rendering-FOV frustum for per-object AABB tests
     uint64_t renderState = 0;     // BGFX_STATE flags for opaque geometry
 };
 
