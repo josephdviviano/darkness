@@ -133,17 +133,21 @@ public:
             const auto &plane = cell.planes[poly.plane];
             float dist = plane.getDistance(center);
 
-            // Sphere doesn't reach this plane — no contact
+            // Sphere doesn't reach this plane — no contact.
+            // For point detectors (radius=0), contact requires dist < 0
+            // (the point has crossed the plane surface).
             if (dist >= radius)
                 continue;
 
-            // Sphere center is completely past this wall — spurious contact.
-            // This happens when testing adjacent cells via portal adjacency:
-            // the sphere is inside its own cell but the adjacent cell's wall
-            // plane is far behind it. penetration would be radius + |dist|,
-            // causing explosive pushes. A sphere can only legitimately contact
-            // a wall when its center is within one radius of the plane.
-            if (dist < -radius)
+            // Spurious contact rejection — the center is too far past the wall.
+            // For real spheres (radius > 0), the sphere can only legitimately
+            // contact a wall when its center is within one radius of the plane.
+            // For point detectors (radius ~= 0), use a fixed max penetration
+            // threshold to reject contacts from adjacent cell walls that are
+            // far behind the point.
+            constexpr float POINT_MAX_PENETRATION = 0.5f;
+            float maxBehind = (radius > 0.001f) ? radius : POINT_MAX_PENETRATION;
+            if (dist < -maxBehind)
                 continue;
 
             // Project sphere center onto the polygon's plane to check if
