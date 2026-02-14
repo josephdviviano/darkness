@@ -89,6 +89,8 @@ set(HEADLESS_SERVICES_SOURCES
     ServiceCommon.h
     sim/SimService.cpp
     sim/SimService.h
+    motion/MotionService.h
+    motion/MotionPlayback.h
     worldquery/WorldQueryTypes.h
     worldquery/IWorldQuery.h
     worldquery/ObjSysWorldState.h

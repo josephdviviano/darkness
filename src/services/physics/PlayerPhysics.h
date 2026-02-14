@@ -25,22 +25,22 @@
  *    collision and constraint-based response. Header-only (inline),
  *    matching CellGeometry.h / RayCaster.h / CollisionGeometry.h pattern.
  *
- *    Uses a 5-sphere player model:
- *    HEAD (+1.8), BODY (-0.6), SHIN (-2.2), KNEE (-2.6), FOOT (-3.0)
- *    All spheres have radius 1.2, rigidly attached to a single body center.
- *    Stairs are handled naturally by lower sphere contacts generating
- *    upward-component normals — no explicit stair-step logic needed.
+ *    Uses a 5-submodel player model:
+ *    HEAD (+1.8, r=1.2), BODY (-0.6, r=1.2) — real collision spheres
+ *    SHIN (-2.2, r=0), KNEE (-2.6, r=0), FOOT (-3.0, r=0) — point detectors
+ *    HEAD and BODY handle wall/ceiling collision; the lower three are zero-radius
+ *    point detectors that sense floor contact and ground slope. All five are
+ *    rigidly attached to a single body center.
  *
  *    Head bob is driven by discrete motion poses — target offsets that the
  *    head spring tracks. Each stride activates a new pose target, and the
  *    3D spring naturally smooths the transitions, creating realistic bob
- *    with organic acceleration/deceleration. This matches the original
- *    Dark Engine's player head physics system.
+ *    with organic acceleration/deceleration.
  *
  *    Constants:
  *    - Walk speed: 11.0 units/sec, Run: 22.0, Creep: 5.5
- *    - All sphere radius: 1.2 units
- *    - 5 sphere offsets from body center (Z-up): +1.8, -0.6, -2.2, -2.6, -3.0
+ *    - HEAD/BODY sphere radius: 1.2, KNEE/SHIN/FOOT: 0.0 (point detectors)
+ *    - 5 submodel offsets from body center (Z-up): +1.8, -0.6, -2.2, -2.6, -3.0
  *    - Gravity: ~32 units/sec² (runtime-configurable)
  *    - Configurable timestep: 12.5/60/120 Hz via PhysicsTimestep presets
  *
@@ -54,6 +54,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <initializer_list>
 #include <vector>
@@ -96,25 +97,27 @@ enum class MantleState {
 class PlayerPhysics {
 public:
     // ── Player physics constants ──
-    // 5-sphere player model (HEAD, BODY, SHIN, KNEE, FOOT) with fixed radius and vertical offsets.
+    // 5-submodel player model (HEAD, BODY, SHIN, KNEE, FOOT) with vertical offsets.
+    // HEAD and BODY are real collision spheres (radius 1.2).
+    // SHIN, KNEE, FOOT are zero-radius point detectors — they sense floor/ground
+    // contacts but have no physical volume. Only 2 of 5 submodels are true spheres.
 
-    // Sphere radii — all 5 spheres use the same radius
+    // Collision sphere radius for HEAD and BODY submodels
     static constexpr float SPHERE_RADIUS = 1.2f;
 
     // Player height parameters
     static constexpr float STAND_HEIGHT   = 6.0f;    // total standing height
-    static constexpr float CROUCH_HEIGHT  = 3.0f;    // total crouching height
 
     // 5-sphere center offsets relative to body center (Z-up).
-    // Standing on flat ground: FOOT bottom at ground → FOOT center at ground + 1.2
-    // → body center at ground + 4.2 → eye (HEAD center) at ground + 6.0.
+    // Standing on flat ground: FOOT point at ground (r=0) → body center at ground + 3.0
+    // → HEAD center at ground + 4.8 → eye at ground + 5.6.
     static constexpr float HEAD_OFFSET_Z  =  1.8f;   // (STAND_HEIGHT/2) - SPHERE_RADIUS
     static constexpr float BODY_OFFSET_Z  = -0.6f;   // (STAND_HEIGHT/2) - 3*SPHERE_RADIUS
     static constexpr float SHIN_OFFSET_Z  = -2.2f;   // -(STAND_HEIGHT * 11/30)
     static constexpr float KNEE_OFFSET_Z  = -2.6f;   // -(STAND_HEIGHT * 13/30)
     static constexpr float FOOT_OFFSET_Z  = -3.0f;   // -(STAND_HEIGHT/2)
 
-    // Number of collision spheres and offset array for iteration
+    // Number of submodels and offset array for iteration
     static constexpr int NUM_SPHERES = 5;
     static constexpr float SPHERE_OFFSETS[NUM_SPHERES] = {
         HEAD_OFFSET_Z,   // 0: HEAD   +1.8
@@ -124,12 +127,40 @@ public:
         FOOT_OFFSET_Z    // 4: FOOT   -3.0
     };
 
-    // Crouch scale — all sphere offsets scale by CROUCH_HEIGHT/STAND_HEIGHT when crouching.
-    // Body center drops to keep feet on ground.
-    static constexpr float CROUCH_SCALE = CROUCH_HEIGHT / STAND_HEIGHT; // 0.5
-    // Body center shift when crouching: (1 - CROUCH_SCALE) * FOOT_OFFSET_Z
-    // = 0.5 * (-3.0) = -1.5 (body center drops 1.5 units to keep feet planted)
-    static constexpr float CROUCH_CENTER_DROP = (1.0f - CROUCH_SCALE) * FOOT_OFFSET_Z;
+    // Per-submodel collision radii.
+    // HEAD and BODY are real collision spheres that push the body away from walls.
+    // SHIN, KNEE, FOOT are point detectors (radius 0.0) — they sense floor/terrain
+    // contacts but have no physical volume. The point detectors participate in
+    // collision response (pushing the body up when they penetrate the floor) but
+    // don't inflate the player's width at leg level.
+    static constexpr float SPHERE_RADII[NUM_SPHERES] = {
+        SPHERE_RADIUS,   // 0: HEAD   — real collision sphere
+        SPHERE_RADIUS,   // 1: BODY   — real collision sphere
+        0.0f,            // 2: SHIN   — point detector
+        0.0f,            // 3: KNEE   — point detector
+        0.0f,            // 4: FOOT   — point detector
+    };
+
+    // Per-submodel crouch offsets.
+    // During crouch, HEAD and BODY physically drop by these amounts. SHIN/KNEE/FOOT
+    // stay at their standing offsets (feet don't move during crouch). The body center
+    // position stays the same — only submodel positions change.
+    //
+    //   Crouch:     HEAD {0, 0, -2.02},  BODY {0, 0, -1.0}
+    //   CrawlLeft:  HEAD {0, -0.15, -2.5}, BODY {0, 0, -1.0}
+    //   CrawlRIght: HEAD {0, 0.15, -2.5},  BODY {0, 0, -1.0}
+    static constexpr float CROUCH_HEAD_DROP = -2.02f;  // HEAD sphere drops 2.02 units
+    static constexpr float CROUCH_BODY_DROP = -1.0f;   // BODY sphere drops 1.0 unit
+
+    // Per-submodel crouch collision offsets (added to SPHERE_OFFSETS during crouch).
+    // HEAD and BODY drop for ceiling clearance, lower submodels stay put.
+    static constexpr float CROUCH_OFFSETS[NUM_SPHERES] = {
+        CROUCH_HEAD_DROP,  // 0: HEAD   drops by -2.02
+        CROUCH_BODY_DROP,  // 1: BODY   drops by -1.0
+        0.0f,              // 2: SHIN   stays at -2.2
+        0.0f,              // 3: KNEE   stays at -2.6
+        0.0f,              // 4: FOOT   stays at -3.0
+    };
 
     // Movement speeds (world units/sec)
     static constexpr float WALK_SPEED     = 11.0f;
@@ -169,47 +200,64 @@ public:
     static constexpr float MANTLE_HOLD_TIME = 0.3f;    // Phase 1: hold & compress duration
     static constexpr float MANTLE_FWD_TIME  = 0.4f;    // Phase 3: forward movement duration
 
-    // Acceleration-based movement — replaces direct velocity setting.
-    // Impulse-based control (PHCTRL); these values create similar ramp-up/ramp-down curves.
-    // At 120 units/sec² accel, walk speed (11) reached in ~0.09 seconds.
-    // At 80 units/sec² decel, full stop from walk in ~0.14 seconds.
-    static constexpr float MOVEMENT_ACCEL = 120.0f;  // ground acceleration (units/sec²)
-    static constexpr float MOVEMENT_DECEL = 80.0f;   // ground deceleration (units/sec²)
+    // Movement control — exponential convergence impulse system.
+    // Instead of constant acceleration/deceleration,
+    // velocity converges toward the desired value exponentially each step.
+    //
+    // The convergence rate alpha = CONTROL_MULTIPLIER * contactFriction * dt / VELOCITY_RATE
+    // where contactFriction = FRICTION_FACTOR * groundNormal.z * gravityMag.
+    // On flat ground: contactFriction = 0.03 * 1.0 * 32.0 = 0.96
+    //   alpha at 60Hz = 11.0 * 0.96 * 0.0167 = 0.176 per step
+    //   alpha at 12.5Hz = 11.0 * 0.96 * 0.08 = 0.845 per step
+    //
+    // This gives exponential approach with time constant tau = 1/(11*0.96) = 0.095s.
+    // Deceleration uses the same formula with desired=0 (no separate decel constant).
+    // Mass cancels in the derivation: rate = 11 * mass * friction / velocity_rate,
+    // then alpha = rate * dt / mass = 11 * friction * dt / velocity_rate.
+    static constexpr float CONTROL_MULTIPLIER = 11.0f;
+    static constexpr float FRICTION_FACTOR    = 0.03f;
+    static constexpr float VELOCITY_RATE      = 1.0f;
 
-    // Air acceleration fraction — airborne steering uses this fraction of
-    // ground acceleration - impulse formula with friction=0 and Z removed from input.
-    static constexpr float AIR_ACCEL_FRAC = 0.3f;
+    // Air control fraction.
+    static constexpr float AIR_CONTROL_FRAC = 0.3f;
 
-    /// Physics timestep configuration — bundles all rate-dependent parameters.
-    /// Spring constants are in per-second units (rate-independent). The exponential
-    /// decay formula `blend = 1 - exp(-rate * dt)` handles different timesteps to
-    /// produce equivalent convergence per second.
-    ///
-    /// Inspired by Godot's frame-rate-independent smoothing approach.
+    /// Physics timestep configuration — bundles rate-dependent parameters.
+    /// Spring constants are NOT here (they're identical across all presets).
     struct PhysicsTimestep {
         float fixedDt;          // seconds per physics step
         int   collisionIters;   // constraint projection iterations per step
-        float springStiffness;  // head spring convergence rate (per second, XY axes)
-        float springDamping;    // head spring convergence rate (per second, Z axis)
     };
 
-    // Spring rates derived from the the reference point: 12.5Hz physics simulation.
-    // At 12.5Hz, had 60% convergence per step for XY and 30% for Z.
+    static constexpr PhysicsTimestep VINTAGE = { 1.0f / 12.5f, 3 };
+    static constexpr PhysicsTimestep MODERN  = { 1.0f / 60.0f, 1 };
+    static constexpr PhysicsTimestep ULTRA   = { 1.0f / 120.0f, 1 };
+
+    // ── Head spring constants
     //
-    //   XY: 60% convergence per step at 12.5Hz => rate = -12.5*ln(0.4) = 11.45/sec
-    //   Z:  30% convergence per step at 12.5Hz => rate = -12.5*ln(0.7) = 4.46/sec
+    // The spring uses dt-dependent scaling with a clamped spring dt:
+    //   springDt = min(dt, 0.05)               (clamps to 50ms)
+    //   tension_eff = BASE_TENSION / springDt   (at 12.5Hz: 0.6/0.05 = 12.0)
+    //   damping_eff = BASE_DAMPING + (1-BASE_DAMPING) * springDt  (at 12.5Hz: 0.069)
+    //   vel = displacement * tension_eff + old_vel * damping_eff
+    //   vel.z *= Z_SCALE                       (Z-axis half-strength)
+    //   pos += vel * dt                        (position uses FULL dt, not clamped)
     //
-    // Verification across rates (remaining displacement after 1 second):
-    //   12.5Hz: (1-0.600)^12.5 = 0.0001 | 60Hz: (1-0.174)^60 = 0.0001 | 120Hz: (1-0.091)^120 = 0.0001
-    static constexpr PhysicsTimestep VINTAGE = { 1.0f / 12.5f, 3, 11.45f, 4.46f };
-    static constexpr PhysicsTimestep MODERN  = { 1.0f / 60.0f, 1, 11.45f, 4.46f };
-    static constexpr PhysicsTimestep ULTRA   = { 1.0f / 120.0f, 1, 11.45f, 4.46f };
+    // The dt clamping at 50ms makes the spring stiffer at 12.5Hz (80ms steps)
+    // than a naive implementation: tension_eff=12.0 instead of 7.5 (+60%),
+    // damping_eff=0.069 instead of 0.098 (-30%).
+    //
+    // Note: this formula is NOT rate-independent (behavior differs at 60Hz).
+    // Once the 12.5Hz behavior is confirmed correct, a rate-independent
+    // analytical solution can be derived to match at all timesteps.
+    static constexpr float HEAD_SPRING_BASE_TENSION = 0.6f;   // spring tension constant
+    static constexpr float HEAD_SPRING_BASE_DAMPING = 0.02f;  // velocity retention base
+    static constexpr float HEAD_SPRING_Z_SCALE      = 0.5f;   // Z-axis half-strength
+    static constexpr float HEAD_SPRING_VEL_CAP      = 25.0f;  // max spring velocity magnitude
+    static constexpr float HEAD_SPRING_MAX_DT       = 0.05f;  // spring dt cap (50ms) — clamps dt for spring calc
 
     // Eye position above head submodel center.
     // Camera is 0.8 units above the head sphere center for natural eye height.
     static constexpr float EYE_ABOVE_HEAD     = 0.8f;
-
-    // Note: GROUND_FRICTION removed — replaced by MOVEMENT_DECEL (acceleration model)
 
     // ── Per-mode speed multipliers ──
     // trans = translation speed scale, rot = rotation speed scale.
@@ -247,24 +295,42 @@ public:
 
     // ── Pose table — complete set of player motion poses ──
     //
+    // Motion coordinator blends offsets
+    // progressively toward targets over a duration. The head spring then tracks
+    // the blended offset, adding overshoot and organic smoothing. Both systems
+    // work together: the blend shapes the target trajectory, the spring adds
+    // dynamic response.
+    //
+    // Durations: 0.6s for strides, 0.8s for
+    // mode transitions (stand/crouch), 1.5s for lean (slow easing). Landing
+    // and weapon impacts are instant (0.0s) for sharp feel.
+    //
     // Normal walking/idle (submodel 0 head offset):
     static constexpr MotionPoseData POSE_NORMAL       = {0.8f,  0.0f,  0.0f,   0.0f,    0.0f};
 
-    // Walking strides — each stride is chained as {footfall, recovery} via the motion
-    // queue, creating a natural up-down bounce. Duration (0.6s) is longer than the
-    // stride interval (~0.31s at walk speed), so each new stride interrupts the previous
-    // mid-blend. The head spring smooths these interrupted transitions into organic
-    // walking motion — rapid convergence toward footfall target, then interrupted by the
-    // next stride before fully reaching it.
-    static constexpr MotionPoseData POSE_STRIDE_LEFT  = {0.6f,  0.01f, 0.0f,  -0.1f,   -0.4f};
-    static constexpr MotionPoseData POSE_STRIDE_RIGHT = {0.6f,  0.01f, 0.0f,   0.1f,   -0.4f};
+    // Walking strides — progressive blend over 0.6s.
+    // The motion coordinator blends mPoseCurrent toward the stride target over the
+    // duration, then the head spring tracks mPoseCurrent with spring dynamics.
+    // Both the blend curve and the spring's overshoot/lag contribute to natural bob.
+    //
+    // Vertical offsets derived from motion capture data (humwlklt/humwlkrt in
+    // motions.crf). Each stride has a different ending Z in the mocap:
+    //   Left stride (humwlklt): ends at Z = +0.038 relative to baseline
+    //   Right stride (humwlkrt): ends at Z = -0.049 relative to baseline
+    // With baseline buttZOffset = -0.4, this gives -0.362 / -0.449.
+    // The alternating Z targets create vertical bob as the spring tracks them.
+    static constexpr MotionPoseData POSE_STRIDE_LEFT  = {0.6f,  0.01f, 0.0f,  -0.1f,   -0.362f};
+    static constexpr MotionPoseData POSE_STRIDE_RIGHT = {0.6f,  0.01f, 0.0f,   0.1f,   -0.449f};
 
     // Crouching strides — slightly wider sway, deeper vertical offset from crouch height.
-    // Vert is relative to POSE_CROUCH (-2.02), so -2.50 = 0.48 below crouch rest.
-    static constexpr MotionPoseData POSE_CRAWL_LEFT   = {0.6f,  0.01f, 0.0f,  -0.15f,  -2.50f};
-    static constexpr MotionPoseData POSE_CRAWL_RIGHT  = {0.6f,  0.01f, 0.0f,   0.15f,  -2.50f};
+    // Vert is relative to POSE_CROUCH (-2.02). Crouch stride mocap (humdwlkl/humdwlkr)
+    // shows similar asymmetry: left ends lower, right ends higher.
+    //   humdwlkl ends at Z = -0.093, humdwlkr ends at Z = +0.127 relative to baseline
+    // With baseline = -2.50: -2.593 / -2.373.
+    static constexpr MotionPoseData POSE_CRAWL_LEFT   = {0.6f,  0.01f, 0.0f,  -0.15f,  -2.593f};
+    static constexpr MotionPoseData POSE_CRAWL_RIGHT  = {0.6f,  0.01f, 0.0f,   0.15f,  -2.373f};
 
-    // Crouching idle — dip from crouch height change:
+    // Crouching idle — blend over 0.8s for smooth crouch transition:
     static constexpr MotionPoseData POSE_CROUCH       = {0.8f,  0.0f,  0.0f,   0.0f,   -2.02f};
 
     // Landing impact — instantaneous dip on landing (dur=0 = snap), held briefly:
@@ -273,14 +339,16 @@ public:
     // Body carry mode (carrying a body or heavy object):
     // Heavier bob — deeper dip and more lateral sway while carrying.
     static constexpr MotionPoseData POSE_CARRY_IDLE   = {0.8f,  0.0f,  0.0f,   0.0f,   -0.8f};
-    static constexpr MotionPoseData POSE_CARRY_LEFT   = {0.6f,  0.01f, 0.0f,  -0.5f,   -1.5f};
-    static constexpr MotionPoseData POSE_CARRY_RIGHT  = {0.6f,  0.01f, 0.0f,   0.15f,  -1.1f};
+    static constexpr MotionPoseData POSE_CARRY_LEFT   = {0.6f,  0.0f,  0.0f,  -0.5f,   -1.5f};
+    static constexpr MotionPoseData POSE_CARRY_RIGHT  = {0.6f,  0.0f,  0.0f,   0.15f,  -1.1f};
 
     // Weapon swing (head bob during sword/blackjack attacks):
-    static constexpr MotionPoseData POSE_WEAPON_SWING       = {0.6f,  0.01f, 0.8f,  0.0f,   0.0f};
-    static constexpr MotionPoseData POSE_WEAPON_SWING_CROUCH = {0.6f, 0.01f, 0.8f,  0.0f,  -2.02f};
+    // Instant target — spring overshoot creates natural recoil feel.
+    static constexpr MotionPoseData POSE_WEAPON_SWING       = {0.0f,  0.0f, 0.8f,  0.0f,   0.0f};
+    static constexpr MotionPoseData POSE_WEAPON_SWING_CROUCH = {0.0f, 0.0f, 0.8f,  0.0f,  -2.02f};
 
-    // Standing lean — 1.5s blend, no hold (lean via motion pose system):
+    // Standing lean — 1.5s progressive blend for smooth easing into lean position.
+    // Collision-limited via updateLean().
     // lat is in player-local coords: positive = right. So lean LEFT = negative lat.
     static constexpr MotionPoseData POSE_LEAN_LEFT    = {1.5f,  0.0f,  0.0f,  -2.2f,    0.0f};
     static constexpr MotionPoseData POSE_LEAN_RIGHT   = {1.5f,  0.0f,  0.0f,   2.2f,    0.0f};
@@ -316,11 +384,13 @@ public:
         }
     }
 
-    // Stride distance thresholds (velocity-dependent footstep formula)
-    static constexpr float STRIDE_DIST_MIN   = 2.5f;   // footstep distance at creep speed
-    static constexpr float STRIDE_DIST_MAX   = 4.0f;   // footstep distance at run speed
+    // Stride distance
+    //   footstep_dist = 2.5 + 3.0 * ((velocity_mag - 5.0) / 10.0)
+    // Clamped to [2.5, 5.5] by the velocity range [5.0, 15.0].
+    static constexpr float STRIDE_DIST_BASE  = 2.5f;   // base footstep distance
+    static constexpr float STRIDE_DIST_RANGE = 3.0f;   // additional distance at max speed
     static constexpr float STRIDE_SPEED_LOW  = 5.0f;   // speed where stride distance starts growing
-    static constexpr float STRIDE_SPEED_HIGH = 15.0f;  // speed where stride distance reaches max
+    static constexpr float STRIDE_SPEED_RANGE = 10.0f;  // velocity range (15.0 - 5.0)
 
     // Leaning — visual-only camera offset, physics body stays in place.
     // Lean is purely cosmetic, no physics body movement.
@@ -342,6 +412,8 @@ public:
                            const PhysicsTimestep &ts = MODERN)
         : mCollision(collision), mTimestep(ts) {}
 
+    ~PlayerPhysics() { stopLog(); }
+
     /// Change the active physics timestep preset at runtime.
     void setTimestep(const PhysicsTimestep &ts) { mTimestep = ts; }
 
@@ -350,6 +422,66 @@ public:
 
     /// Get the physics update rate in Hz (= 1 / fixedDt).
     float getPhysicsHz() const { return 1.0f / mTimestep.fixedDt; }
+
+    // ── Diagnostic logging ──
+    // Per-timestep CSV logging for debugging head bob, stride triggering, and
+    // spring dynamics. Writes one row per fixedStep() call with full physics state.
+    // Enabled by startLog()/stopLog(). The renderer calls setCameraPitch() each
+    // frame so the log includes the full camera orientation.
+
+    /// Start writing per-timestep diagnostic log to the given file path.
+    /// Creates (or truncates) the file and writes a CSV header.
+    inline void startLog(const char *path) {
+        stopLog();  // close any previous log
+        mLogFile = std::fopen(path, "w");
+        if (!mLogFile) {
+            std::fprintf(stderr, "[PlayerPhysics] Failed to open log: %s\n", path);
+            return;
+        }
+        std::fprintf(mLogFile,
+            "simTime,dt,mode,sneaking,running,"
+            "posX,posY,posZ,velX,velY,velZ,hSpeed,"
+            "eyeX,eyeY,eyeZ,yaw,camPitch,"
+            "springPosX,springPosY,springPosZ,"
+            "springVelX,springVelY,springVelZ,"
+            "poseTargetX,poseTargetY,poseTargetZ,"
+            "poseStartX,poseStartY,poseStartZ,"
+            "poseTimer,poseDur,poseHolding,"
+            "strideDist,strideIsLeft,leanDir,leanAmount,"
+            "cell,inputFwd,inputRight\n");
+        std::fflush(mLogFile);
+        std::fprintf(stderr, "[PlayerPhysics] Logging to: %s\n", path);
+    }
+
+    /// Stop diagnostic logging and close the file.
+    inline void stopLog() {
+        if (mLogFile) {
+            std::fclose(mLogFile);
+            mLogFile = nullptr;
+            std::fprintf(stderr, "[PlayerPhysics] Log stopped\n");
+        }
+    }
+
+    /// Is logging currently active?
+    bool isLogging() const { return mLogFile != nullptr; }
+
+    /// Set the camera pitch from the renderer (for logging — physics doesn't own pitch).
+    void setCameraPitch(float pitch) { mCamPitch = pitch; }
+
+    /// Get string name for the current player mode (for logging/display).
+    static const char* modeName(PlayerMode mode) {
+        switch (mode) {
+            case PlayerMode::Stand:     return "Stand";
+            case PlayerMode::Crouch:    return "Crouch";
+            case PlayerMode::Swim:      return "Swim";
+            case PlayerMode::Climb:     return "Climb";
+            case PlayerMode::BodyCarry: return "BodyCarry";
+            case PlayerMode::Slide:     return "Slide";
+            case PlayerMode::Jump:      return "Jump";
+            case PlayerMode::Dead:      return "Dead";
+            default:                    return "Unknown";
+        }
+    }
 
     // ── Main simulation ──
 
@@ -360,9 +492,8 @@ public:
     inline void step(float dt, const ContactCallback &contactCb) {
         mTimeAccum += dt;
 
-        // DEBUG: validate timestep config on every step
+        // Validate timestep config — recover from invalid values
         if (mTimestep.fixedDt <= 0.0f || mTimestep.fixedDt > 1.0f) {
-            fprintf(stderr, "[PHYSICS-BUG] invalid fixedDt=%.6f, forcing MODERN\n", mTimestep.fixedDt);
             mTimestep = MODERN;
         }
 
@@ -541,6 +672,12 @@ public:
         }
         mCurrentMode = PlayerMode::Jump; // will detect ground on next step
 
+        // Reset spring state — teleporting should not carry old spring velocity
+        // into the new position, which would cause oscillation on arrival.
+        mSpringPos = Vector3(0.0f);
+        mSpringVel = Vector3(0.0f);
+        mPoseCurrent = Vector3(0.0f);
+
         // Initialize interpolation state to current position so there's no
         // lerp glitch on the first frame after a teleport/spawn.
         mPrevEyePos   = computeRawEyePos();
@@ -556,26 +693,6 @@ private:
 
     /// Single fixed-timestep physics step
     inline void fixedStep(const ContactCallback &contactCb) {
-        // DEBUG: snapshot position at step start to detect teleportation
-        Vector3 dbgStepStart = mPosition;
-        int32_t dbgCellStart = mCellIdx;
-
-        // DEBUG: phase tracking — prints which phase we're entering so a crash
-        // shows the last completed phase in stderr before the segfault.
-        static int dbgStepNum = 0;
-        ++dbgStepNum;
-        // Only log first 20 steps and then every 600th (~10 sec at 60Hz) to avoid spam
-        bool dbgVerbose = (dbgStepNum <= 20) || (dbgStepNum % 600 == 0);
-        if (dbgVerbose) {
-            fprintf(stderr, "[PHYS-STEP] #%d  dt=%.4f  Hz=%.0f  iters=%d  pos=(%.1f,%.1f,%.1f)  "
-                "cell=%d  mode=%d  spring=(%.2f,%.2f,%.2f)\n",
-                dbgStepNum, mTimestep.fixedDt, 1.0f/mTimestep.fixedDt,
-                mTimestep.collisionIters,
-                mPosition.x, mPosition.y, mPosition.z,
-                mCellIdx, static_cast<int>(mCurrentMode),
-                mSpringPos.x, mSpringPos.y, mSpringPos.z);
-        }
-
         // Advance simulation time (for landing throttle, animation timing, etc.)
         mSimTime += mTimestep.fixedDt;
 
@@ -583,7 +700,6 @@ private:
         // During mantling, normal movement/gravity/collision are suppressed.
         // The mantle state machine drives position directly.
         if (mMantling) {
-            if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: mantle\n", dbgStepNum);
             updateMantle();
             updateCell();
             updateMotionPose();
@@ -607,80 +723,61 @@ private:
         mJumpRequested = false;
 
         // 2. Handle mode transitions (crouch, swim, etc.)
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 2-modes\n", dbgStepNum);
         if (!mMotionDisabled)
             updateModeTransitions();
 
-        // 3. Apply gravity (if airborne — always, even when disabled)
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 3-gravity\n", dbgStepNum);
+        // 3. Update motion pose system (stride targets, progressive blend).
+        updateMotionPose();
+
+        // 4. Apply gravity (if airborne — always, even when disabled)
         applyGravity();
 
-        // 4. Apply horizontal movement from input (skip when disabled)
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 4-movement\n", dbgStepNum);
+        // 5. Apply horizontal movement from input (skip when disabled)
         if (!mMotionDisabled)
             applyMovement();
 
-        // 5. Integrate position
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 5-integrate\n", dbgStepNum);
+        // 6. Update head spring — runs BEFORE collision
+        updateHeadSpring();
+
+        // 7. Pre-constrain velocity against known contact surfaces from the
+        //    previous frame. This removes velocity going into walls BEFORE
+        //    position integration, so the player slides along surfaces instead
+        //    of moving into them and being pushed back out.
+        constrainVelocity();
+
+        // 8. Integrate position
         integrate();
 
-        // 6. Update cell index BEFORE collision — if integration moved
+        // 9. Update cell index BEFORE collision — if integration moved
         //    the player through a portal, collision must test against
         //    the new cell's walls, not the old cell's.
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 6-updateCell\n", dbgStepNum);
         updateCell();
 
-        // 7. Resolve collisions via 5-sphere constraint projection
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 7-collision (iters=%d)\n", dbgStepNum, mTimestep.collisionIters);
+        // 10. Resolve collisions via 5-sphere constraint projection.
+        //     Position correction for any remaining penetrations (new contacts,
+        //     cell transitions). Also refreshes mLastContacts for the next
+        //     frame's constrainVelocity() call.
         resolveCollisions(contactCb);
 
-        // 8. Detect ground and update movement state
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 8-detectGround\n", dbgStepNum);
+        // 11. Detect ground and update movement state
         detectGround();
 
-        // 9. Update cell index again (collision may have shifted position)
+        // 12. Update cell index again (collision may have shifted position)
         // Relies purely on gravity + collision + constraint response to keep
         // the player grounded. An explicit snap was causing jitter (collision
         // pushes up, snap pulls down) and fighting with uphill movement.
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 9-updateCell2\n", dbgStepNum);
         updateCell();
 
-        // 10. Check for mantle opportunity when airborne and pressing forward
+        // 13. Check for mantle opportunity when airborne and pressing forward
         if (mCurrentMode == PlayerMode::Jump && mInputForward > 0.1f && !mMotionDisabled) {
-            if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 10-mantle\n", dbgStepNum);
             checkMantle();
         }
 
-        // 11. Update motion pose system (discrete stride-driven pose targets)
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 11-motionPose\n", dbgStepNum);
-        updateMotionPose();
-
-        // 12. Update 3D head spring (tracks pose targets with spring dynamics)
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 12-headSpring\n", dbgStepNum);
-        updateHeadSpring();
-
-        // 13. Update lean (visual-only lateral camera offset with collision)
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  phase: 13-lean\n", dbgStepNum);
+        // 14. Update lean (visual-only lateral camera offset with collision)
         updateLean();
 
-        // DEBUG: detect teleportation — large per-step position jump
-        {
-            Vector3 delta = mPosition - dbgStepStart;
-            float jumpDist = glm::length(delta);
-            if (jumpDist > 2.0f) {
-                fprintf(stderr, "[TELEPORT] t=%.3f  dist=%.2f  pos=(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)  "
-                    "cell=%d->%d  vel=(%.1f,%.1f,%.1f)  mode=%d\n",
-                    mSimTime, jumpDist,
-                    dbgStepStart.x, dbgStepStart.y, dbgStepStart.z,
-                    mPosition.x, mPosition.y, mPosition.z,
-                    dbgCellStart, mCellIdx,
-                    mVelocity.x, mVelocity.y, mVelocity.z,
-                    static_cast<int>(mCurrentMode));
-            }
-        }
-
-        if (dbgVerbose) fprintf(stderr, "[PHYS-STEP] #%d  DONE  pos=(%.1f,%.1f,%.1f)  cell=%d\n",
-            dbgStepNum, mPosition.x, mPosition.y, mPosition.z, mCellIdx);
+        // 15. Write diagnostic log row (if logging enabled)
+        writeLogRow();
     }
 
     /// Apply gravity to velocity (if not on ground)
@@ -737,18 +834,19 @@ private:
         return desired;
     }
 
-    /// Apply movement input to velocity — acceleration-based control.
-    /// Instead of setting velocity directly, accelerates toward the desired
-    /// velocity. This creates natural ramp-up/ramp-down curves impulse-based control system.
+    /// Apply movement control — exponential velocity convergence impulse system:
     ///
-    /// Ground: accelerate toward desired at MOVEMENT_ACCEL, decelerate
-    /// at MOVEMENT_DECEL when no input. Slope projection prevents
-    /// fighting gravity on inclines.
+    ///   contactFriction = FRICTION_FACTOR * groundNormal.z * gravityMag
+    ///   alpha = CONTROL_MULTIPLIER * contactFriction * dt / VELOCITY_RATE
+    ///   vel += (desired - vel) * alpha
     ///
-    /// Air: same acceleration model at reduced rate (AIR_ACCEL_FRAC),
-    /// with Z removed from input (can't add vertical speed while airborne).
+    /// This creates exponential approach to desired velocity with tau ~0.095s on
+    /// flat ground. When desired=0 (no input), velocity decays exponentially
+    /// toward zero — no separate deceleration constant needed.
+    ///
     inline void applyMovement() {
         Vector3 desired = computeDesiredVelocity();
+        const float dt = mTimestep.fixedDt;
 
         if (isOnGround()) {
             // Project desired velocity onto ground plane so walking on slopes
@@ -763,75 +861,47 @@ private:
             // movement control. This lets the 5-sphere model and gravity naturally
             // determine what's walkable vs what causes sliding — no hard angle cutoff.
             if (mGroundNormal.z < SLIDE_THRESHOLD) {
-                // Linear ramp: full control at SLIDE_THRESHOLD, zero at GROUND_NORMAL_MIN
                 float slopeFactor = (mGroundNormal.z - GROUND_NORMAL_MIN)
                                   / (SLIDE_THRESHOLD - GROUND_NORMAL_MIN);
                 slopeFactor = std::max(0.0f, std::min(1.0f, slopeFactor));
                 desired *= slopeFactor;
             }
 
-            float desiredLen = glm::length(desired);
-            if (desiredLen < 0.01f) {
-                // No input — decelerate toward zero
-                float hSpeed = std::sqrt(mVelocity.x * mVelocity.x +
-                                         mVelocity.y * mVelocity.y);
-                if (hSpeed > 0.01f) {
-                    float decel = MOVEMENT_DECEL * mTimestep.fixedDt;
-                    float newSpeed = std::max(0.0f, hSpeed - decel);
-                    float ratio = newSpeed / hSpeed;
-                    mVelocity.x *= ratio;
-                    mVelocity.y *= ratio;
-                }
-            } else {
-                // Has input — accelerate toward desired velocity.
-                // Compute acceleration direction from current horizontal velocity
-                // toward desired. This creates a natural ramp-up curve.
-                Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
-                Vector3 delta = desired - hVel;
-                float deltaLen = glm::length(delta);
+            // Compute convergence rate from ground friction.
+            // contactFriction = FRICTION_FACTOR * groundNormal.z * gravityMag
+            // On flat ground: 0.03 * 1.0 * 32.0 = 0.96
+            float contactFriction = FRICTION_FACTOR * mGroundNormal.z * mGravityMag;
+            float alpha = CONTROL_MULTIPLIER * contactFriction * dt / VELOCITY_RATE;
+            alpha = std::min(alpha, 1.0f);  // cap at 1.0 (instant convergence)
 
-                if (deltaLen > 0.01f) {
-                    // Accelerate toward desired velocity
-                    float accelMag = MOVEMENT_ACCEL * mTimestep.fixedDt;
-                    if (accelMag > deltaLen) {
-                        // Would overshoot — snap to desired
-                        mVelocity.x = desired.x;
-                        mVelocity.y = desired.y;
-                    } else {
-                        Vector3 accelDir = delta / deltaLen;
-                        mVelocity.x += accelDir.x * accelMag;
-                        mVelocity.y += accelDir.y * accelMag;
-                    }
-                }
+            // Apply convergence to horizontal velocity.
+            // Preserves desired.z for slope projection (SET, not converge, to avoid
+            // accumulation on slopes that launches player off ramps).
+            float prevZ = mVelocity.z;
+            Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
+            Vector3 hDesired(desired.x, desired.y, 0.0f);
 
-                // Apply slope Z component — SET (not +=) to prevent accumulation
-                // on slopes that would launch the player off ramps.
-                mVelocity.z = desired.z;
-            }
+            // Exponential convergence: vel += (desired - vel) * alpha
+            Vector3 hNew = hVel + (hDesired - hVel) * alpha;
+            mVelocity.x = hNew.x;
+            mVelocity.y = hNew.y;
+
+            // Z component: set from slope projection (not converged)
+            mVelocity.z = desired.z != 0.0f ? desired.z : prevZ;
         } else {
-            // Airborne: acceleration-based steering with Z removed from input.
-            // Uses the same impulse formula with friction=0
-            // but removes vertical input — can't gain altitude while airborne.
+            // Airborne: should have zero air control (friction=0).
             Vector3 airDesired(desired.x, desired.y, 0.0f);
-            float airDesiredLen = glm::length(airDesired);
+            Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
 
-            if (airDesiredLen > 0.01f) {
-                Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
-                Vector3 delta = airDesired - hVel;
-                float deltaLen = glm::length(delta);
+            // Use flat-ground friction for air control base rate
+            float airAlpha = CONTROL_MULTIPLIER * (FRICTION_FACTOR * 1.0f * mGravityMag)
+                           * AIR_CONTROL_FRAC * dt / VELOCITY_RATE;
+            airAlpha = std::min(airAlpha, 1.0f);
 
-                if (deltaLen > 0.01f) {
-                    float airAccel = MOVEMENT_ACCEL * AIR_ACCEL_FRAC * mTimestep.fixedDt;
-                    if (airAccel > deltaLen) {
-                        mVelocity.x = airDesired.x;
-                        mVelocity.y = airDesired.y;
-                    } else {
-                        Vector3 accelDir = delta / deltaLen;
-                        mVelocity.x += accelDir.x * airAccel;
-                        mVelocity.y += accelDir.y * airAccel;
-                    }
-                }
-            }
+            Vector3 hNew = hVel + (airDesired - hVel) * airAlpha;
+            mVelocity.x = hNew.x;
+            mVelocity.y = hNew.y;
+            // Z unchanged — gravity handles it
         }
     }
 
@@ -841,17 +911,88 @@ private:
     }
 
     /// Resolve collisions using the 5-sphere model.
-    /// For each iteration, tests all 5 sphere centers against cell polygons,
+    /// For each iteration, tests all 5 submodel positions against cell polygons,
     /// accumulates contacts, and pushes the body center out of penetrations.
-    /// The 5-sphere model naturally handles stairs: lower spheres (FOOT, KNEE,
-    /// SHIN) contact step edges with normals that have upward components,
-    /// lifting the player up and over without explicit stair-step logic.
+    /// HEAD and BODY are real spheres (r=1.2) for wall/ceiling collision.
+    /// Pre-constrain velocity against known contact surfaces.
+    ///
+    /// Uses contacts from the PREVIOUS frame's collision resolution to remove
+    /// velocity components going into known walls/floor. This prevents the body
+    /// from moving into surfaces and needing to be pushed back out, reducing
+    /// jitter.
+    ///
+    /// The position-correction pass in resolveCollisions() still runs after
+    /// integration to handle new contacts and penetrations.
+    inline void constrainVelocity() {
+        if (mLastContacts.empty()) return;
+
+        // Collect unique constraint normals from previous frame's contacts
+        std::vector<Vector3> constraints;
+        constraints.reserve(mLastContacts.size());
+        for (const auto &c : mLastContacts) {
+            // Only constrain if velocity is moving into the surface
+            float vn = glm::dot(mVelocity, c.normal);
+            if (vn >= 0.0f) continue;
+
+            bool duplicate = false;
+            for (const auto &cn : constraints) {
+                if (glm::dot(c.normal, cn) > 0.99f) { duplicate = true; break; }
+            }
+            if (!duplicate)
+                constraints.push_back(c.normal);
+        }
+
+        // Apply constraint-based velocity removal
+        if (constraints.size() == 1) {
+            // Single surface — remove velocity component along the normal
+            float vn = glm::dot(mVelocity, constraints[0]);
+            if (vn < 0.0f)
+                mVelocity -= constraints[0] * vn;
+
+        } else if (constraints.size() == 2) {
+            // Two surfaces (crease/wedge) — slide along the edge between them
+            Vector3 edge = glm::cross(constraints[0], constraints[1]);
+            float edgeLen = glm::length(edge);
+            if (edgeLen > 1e-6f) {
+                edge /= edgeLen;
+                mVelocity = edge * glm::dot(mVelocity, edge);
+            } else {
+                float vn = glm::dot(mVelocity, constraints[0]);
+                if (vn < 0.0f)
+                    mVelocity -= constraints[0] * vn;
+            }
+
+        } else if (constraints.size() >= 3) {
+            // Corner (3+ surfaces) — project onto edge, validate direction
+            Vector3 origVel = mVelocity;
+            Vector3 edge = glm::cross(constraints[0], constraints[1]);
+            float edgeLen = glm::length(edge);
+            if (edgeLen > 1e-6f) {
+                edge /= edgeLen;
+                Vector3 projected = edge * glm::dot(mVelocity, edge);
+                if (glm::dot(projected, origVel) < 0.0f)
+                    mVelocity = Vector3(0.0f);
+                else
+                    mVelocity = projected;
+            } else {
+                mVelocity = Vector3(0.0f);
+            }
+        }
+    }
+
+    /// Resolve collisions using the 5-sphere model.
+    /// For each iteration, tests all 5 submodel positions against cell polygons,
+    /// accumulates contacts, and pushes the body center out of penetrations.
+    /// HEAD and BODY are real spheres (r=1.2) for wall/ceiling collision.
+    /// SHIN, KNEE, FOOT are point detectors (r=0) — they sense floor contacts
+    /// and generate upward normals that keep the player above the ground.
     inline void resolveCollisions(const ContactCallback &contactCb) {
         Vector3 origPos = mPosition;
         int32_t origCell = mCellIdx;
 
-        // Compute current sphere offsets (standing or crouching)
-        float scale = isCrouching() ? CROUCH_SCALE : 1.0f;
+        // Compute current sphere offsets — during crouch, HEAD and BODY get
+        // additional downward offsets.
+        bool crouching = isCrouching();
 
         mLastContacts.clear();
 
@@ -862,26 +1003,29 @@ private:
             std::vector<SphereContact> iterContacts;
 
             for (int s = 0; s < NUM_SPHERES; ++s) {
-                Vector3 sphereCenter = mPosition + Vector3(0.0f, 0.0f, SPHERE_OFFSETS[s] * scale);
+                float sphereR = SPHERE_RADII[s];
+                float offsetZ = SPHERE_OFFSETS[s] + (crouching ? CROUCH_OFFSETS[s] : 0.0f);
+                Vector3 sphereCenter = mPosition + Vector3(0.0f, 0.0f, offsetZ);
 
                 // Test against the body center's cell
                 auto contacts = mCollision.sphereVsCellPolygons(
-                    sphereCenter, SPHERE_RADIUS, mCellIdx);
+                    sphereCenter, sphereR, mCellIdx);
 
-                // Test the sphere's own cell if it differs from body center's cell
+                // Test the submodel's own cell if it differs from body center's cell
                 // (handles straddling portal boundaries, e.g. feet in one cell, head in another)
                 int32_t sphereCell = mCollision.findCell(sphereCenter);
                 if (sphereCell >= 0 && sphereCell != mCellIdx) {
-                    fprintf(stderr, "[SPHERE-CELL] t=%.3f  sphere[%d] cell=%d (body cell=%d)  "
-                        "sphereZ=%.1f  pos=(%.1f,%.1f,%.1f)\n",
-                        mSimTime, s, sphereCell, mCellIdx,
-                        sphereCenter.z, mPosition.x, mPosition.y, mPosition.z);
                     auto adj = mCollision.sphereVsCellPolygons(
-                        sphereCenter, SPHERE_RADIUS, sphereCell);
+                        sphereCenter, sphereR, sphereCell);
                     contacts.insert(contacts.end(), adj.begin(), adj.end());
                 }
 
-                // Test adjacent cells via portals from the body center's cell
+                // Test adjacent cells via portals from the body center's cell.
+                // For point detectors (radius=0), the portal distance check uses
+                // the POINT_MAX_PENETRATION threshold to avoid missing floor contacts
+                // in adjacent cells near portal boundaries.
+                constexpr float POINT_PORTAL_REACH = 0.5f;
+                float portalReach = (sphereR > 0.001f) ? sphereR : POINT_PORTAL_REACH;
                 const auto &cell = mCollision.getWR().cells[mCellIdx];
                 int numSolid = cell.numPolygons - cell.numPortals;
                 for (int pi = numSolid; pi < cell.numPolygons; ++pi) {
@@ -889,12 +1033,12 @@ private:
                     if (poly.count < 3) continue;
                     const auto &plane = cell.planes[poly.plane];
                     float dist = plane.getDistance(sphereCenter);
-                    if (dist < SPHERE_RADIUS) {
+                    if (dist < portalReach) {
                         int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
                         if (tgtCell >= 0 && tgtCell != mCellIdx && tgtCell != sphereCell
                             && tgtCell < static_cast<int32_t>(mCollision.getWR().numCells)) {
                             auto adj = mCollision.sphereVsCellPolygons(
-                                sphereCenter, SPHERE_RADIUS, tgtCell);
+                                sphereCenter, sphereR, tgtCell);
                             contacts.insert(contacts.end(), adj.begin(), adj.end());
                         }
                     }
@@ -924,31 +1068,6 @@ private:
                 }
                 if (!merged) {
                     pushes.push_back({c.normal, c.penetration});
-                }
-            }
-            // DEBUG: detect large collision pushes
-            {
-                float totalPush = 0.0f;
-                for (const auto &p : pushes)
-                    totalPush += p.second;
-                if (totalPush > 2.0f) {
-                    fprintf(stderr, "[BIG-PUSH] t=%.3f  iter=%d  totalPush=%.2f  pos=(%.1f,%.1f,%.1f)  "
-                        "cell=%d  #contacts=%zu  #pushes=%zu\n",
-                        mSimTime, iter, totalPush,
-                        mPosition.x, mPosition.y, mPosition.z,
-                        mCellIdx,
-                        iterContacts.size(), pushes.size());
-                    for (size_t pi = 0; pi < pushes.size(); ++pi) {
-                        fprintf(stderr, "  push[%zu]: n=(%.3f,%.3f,%.3f) pen=%.2f\n",
-                            pi, pushes[pi].first.x, pushes[pi].first.y, pushes[pi].first.z,
-                            pushes[pi].second);
-                    }
-                    // Show which spheres and cells generated the contacts
-                    for (const auto &c : iterContacts) {
-                        fprintf(stderr, "  contact: n=(%.3f,%.3f,%.3f) pen=%.2f cell=%d poly=%d\n",
-                            c.normal.x, c.normal.y, c.normal.z,
-                            c.penetration, c.cellIdx, c.polyIdx);
-                    }
                 }
             }
             for (const auto &p : pushes) {
@@ -995,19 +1114,9 @@ private:
                     // Brute-force fallback
                     int32_t newCell = mCollision.findCell(mPosition);
                     if (newCell >= 0) {
-                        fprintf(stderr, "[COLLISION-CELL] t=%.3f  brute-force cell change in resolveCollisions: "
-                            "%d->%d  pos=(%.1f,%.1f,%.1f)  iter=%d\n",
-                            mSimTime, mCellIdx, newCell,
-                            mPosition.x, mPosition.y, mPosition.z, iter);
                         mCellIdx = newCell;
                     } else {
-                        // Pushed outside all cells — revert to original position
-                        fprintf(stderr, "[COLLISION-REVERT] t=%.3f  pushed outside all cells, reverting: "
-                            "pos=(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)  cell=%d->%d\n",
-                            mSimTime,
-                            mPosition.x, mPosition.y, mPosition.z,
-                            origPos.x, origPos.y, origPos.z,
-                            mCellIdx, origCell);
+                        // Pushed outside all cells.
                         mPosition = origPos;
                         mCellIdx = origCell;
                         return;
@@ -1018,17 +1127,15 @@ private:
 
         // Final validation — body center must still be in a valid cell
         if (mCollision.findCell(mPosition) < 0) {
-            fprintf(stderr, "[FINAL-REVERT] t=%.3f  final validation failed, reverting: "
-                "pos=(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)  cell=%d->%d\n",
-                mSimTime,
-                mPosition.x, mPosition.y, mPosition.z,
-                origPos.x, origPos.y, origPos.z,
-                mCellIdx, origCell);
             mPosition = origPos;
             mCellIdx = origCell;
         }
 
-        // Fire contact callbacks for downstream consumers (audio, AI, scripts)
+        // Fire contact callbacks for downstream consumers (audio, AI, scripts).
+        // Contact point is approximate — we don't track which submodel generated
+        // each contact, so we use SPHERE_RADIUS (HEAD/BODY radius) as the offset.
+        // For point detector contacts, this places the event slightly above the
+        // actual contact, which is acceptable for audio footstep triggers.
         if (contactCb) {
             for (const auto &c : mLastContacts) {
                 ContactEvent event;
@@ -1043,68 +1150,6 @@ private:
             }
         }
 
-        // Constraint-based velocity response.
-        //
-        // 1 surface  — remove the normal velocity component (slide along plane)
-        // 2 surfaces — project velocity onto the edge between them (slide along crease)
-        // 3+ surfaces — project onto edge, validate direction; if reversed, fully stop
-        //
-        // This prevents the over-removal bug where independent per-normal subtraction
-        // could push velocity *through* an adjacent surface.
-
-        // Collect unique constraint normals (dot > 0.99 = same plane)
-        std::vector<Vector3> constraints;
-        constraints.reserve(mLastContacts.size());
-        for (const auto &c : mLastContacts) {
-            // Only constrain if velocity is moving into the surface
-            float vn = glm::dot(mVelocity, c.normal);
-            if (vn >= 0.0f) continue;
-
-            bool duplicate = false;
-            for (const auto &cn : constraints) {
-                if (glm::dot(c.normal, cn) > 0.99f) { duplicate = true; break; }
-            }
-            if (!duplicate)
-                constraints.push_back(c.normal);
-        }
-
-        if (constraints.size() == 1) {
-            // Single surface — remove velocity component along the normal
-            float vn = glm::dot(mVelocity, constraints[0]);
-            if (vn < 0.0f)
-                mVelocity -= constraints[0] * vn;
-
-        } else if (constraints.size() == 2) {
-            // Two surfaces (crease/wedge) — slide along the edge between them
-            Vector3 edge = glm::cross(constraints[0], constraints[1]);
-            float edgeLen = glm::length(edge);
-            if (edgeLen > 1e-6f) {
-                edge /= edgeLen;
-                mVelocity = edge * glm::dot(mVelocity, edge);
-            } else {
-                // Nearly parallel normals — degenerate, treat as single surface
-                float vn = glm::dot(mVelocity, constraints[0]);
-                if (vn < 0.0f)
-                    mVelocity -= constraints[0] * vn;
-            }
-
-        } else if (constraints.size() >= 3) {
-            // Corner (3+ surfaces) — project onto edge, validate direction
-            Vector3 origVel = mVelocity;
-            Vector3 edge = glm::cross(constraints[0], constraints[1]);
-            float edgeLen = glm::length(edge);
-            if (edgeLen > 1e-6f) {
-                edge /= edgeLen;
-                Vector3 projected = edge * glm::dot(mVelocity, edge);
-                // If projected velocity reverses original direction, player is fully blocked
-                if (glm::dot(projected, origVel) < 0.0f)
-                    mVelocity = Vector3(0.0f);
-                else
-                    mVelocity = projected;
-            } else {
-                mVelocity = Vector3(0.0f);
-            }
-        }
     }
 
     /// Detect ground contact and update movement state.
@@ -1125,22 +1170,25 @@ private:
         }
 
         // If no contacts found from collision AND the player is not ascending,
-        // probe slightly below the FOOT sphere to detect ground. This prevents
-        // briefly entering Jump mode when walking over small bumps or down slopes
-        // where the collision pass didn't generate contacts. The probe only
-        // DETECTS ground (updates state), it doesn't move the player — gravity
-        // and collision handle the actual positioning.
+        // probe slightly below the FOOT point detector to detect ground. This
+        // prevents briefly entering Jump mode when walking over small bumps or
+        // down slopes where the collision pass didn't generate contacts. The
+        // probe only DETECTS ground (updates state), it doesn't move the player
+        // — gravity and collision handle the actual positioning.
         // Skip when velocity.z > 0.5 to avoid cancelling a jump (the probe
         // would find the floor just left).
         if (!onGround && mCellIdx >= 0 && mVelocity.z <= 0.5f) {
-            float footOffset = isCrouching() ? (FOOT_OFFSET_Z * CROUCH_SCALE) : FOOT_OFFSET_Z;
+            // FOOT stays at its standing offset during crouch (no crouch drop for legs)
+            float footOffset = FOOT_OFFSET_Z;
             Vector3 footCenter = mPosition + Vector3(0.0f, 0.0f, footOffset);
             Vector3 probeNormal;
             // Small probe distance — just enough to catch one frame of gravity drop
             // at 60Hz: 0.5 * g * dt² = 0.5 * 32 * (1/60)² ≈ 0.004 units.
             // Use 0.1 units for a comfortable margin.
+            // FOOT is a point detector (radius=0), so groundTest uses point-test mode.
             constexpr float GROUND_PROBE_DIST = 0.1f;
-            if (mCollision.groundTest(footCenter, SPHERE_RADIUS, mCellIdx,
+            constexpr float FOOT_RADIUS = SPHERE_RADII[4]; // 0.0 (point detector)
+            if (mCollision.groundTest(footCenter, FOOT_RADIUS, mCellIdx,
                                       GROUND_PROBE_DIST, probeNormal)) {
                 if (probeNormal.z > GROUND_NORMAL_MIN) {
                     onGround = true;
@@ -1167,8 +1215,13 @@ private:
                     mLastLandingTime = mSimTime;
                 }
 
-                // Return to crouch or stand based on input
+                // Return to crouch or stand based on input.
+                // Activate the appropriate rest pose so the head spring drives
+                // toward the correct height (POSE_CROUCH = -2.02 or POSE_NORMAL = 0).
                 mCurrentMode = mWantsCrouch ? PlayerMode::Crouch : PlayerMode::Stand;
+                if (!mLandingActive && mLeanDir == 0) {
+                    activatePose(*getModeMotion(mCurrentMode).restPose);
+                }
             }
             // If already in a ground mode, stay in it (crouch transitions
             // are handled by updateModeTransitions)
@@ -1208,11 +1261,14 @@ private:
         if (std::fabs(mLeanAmount) > 0.01f && mCellIdx >= 0) {
             float sinYaw = std::sin(mYaw);
             float cosYaw = std::cos(mYaw);
-            float leanBaseZ = (isCrouching() ? HEAD_OFFSET_Z * CROUCH_SCALE : HEAD_OFFSET_Z) + mSpringPos.z;
+            // HEAD collision position for lean: standing offset + crouch drop (if any)
+            float headOffset = HEAD_OFFSET_Z + (isCrouching() ? CROUCH_HEAD_DROP : 0.0f);
+            float leanBaseZ = headOffset + mSpringPos.z;
             Vector3 leanedHead = mPosition + Vector3(0.0f, 0.0f, leanBaseZ);
             leanedHead.x += sinYaw * mLeanAmount;
             leanedHead.y -= cosYaw * mLeanAmount;
 
+            // Test HEAD sphere (r=1.2) at the leaned position
             auto contacts = mCollision.sphereVsCellPolygons(
                 leanedHead, SPHERE_RADIUS, mCellIdx);
             if (!contacts.empty()) {
@@ -1255,8 +1311,9 @@ private:
         if (mCurrentMode != PlayerMode::Jump || mInputForward < 0.1f || mMantling)
             return false;
 
-        float heightScale = isCrouching() ? CROUCH_SCALE : 1.0f;
-        Vector3 headPos = mPosition + Vector3(0.0f, 0.0f, HEAD_OFFSET_Z * heightScale);
+        // HEAD position for mantle check — apply crouch drop if crouching
+        float headZ = HEAD_OFFSET_Z + (isCrouching() ? CROUCH_HEAD_DROP : 0.0f);
+        Vector3 headPos = mPosition + Vector3(0.0f, 0.0f, headZ);
 
         // Phase 1: upward — check headroom
         Vector3 upTarget = headPos + Vector3(0.0f, 0.0f, MANTLE_UP_DIST);
@@ -1277,12 +1334,12 @@ private:
         if (!raycastWorld(mCollision.getWR(), fwdTarget, downTarget, hit))
             return false;  // no ledge found
 
-        // Found a mantleable surface — compute target position
-        // Place body center above the ledge surface with FOOT sphere on the ledge
-        float footZ = isCrouching() ? FOOT_OFFSET_Z * CROUCH_SCALE : FOOT_OFFSET_Z;
+        // Found a mantleable surface — compute target position.
+        // Place body center above the ledge so the FOOT point detector sits on
+        // the surface. FOOT stays at its standing offset during crouch (no crouch
+        // drop for legs), so use FOOT_OFFSET_Z directly.
         mMantleTarget = hit.point;
-        mMantleTarget.z -= footZ;  // body center above ledge (FOOT_OFFSET_Z is negative)
-        mMantleTarget.z += SPHERE_RADIUS;  // surface + sphere radius clearance
+        mMantleTarget.z -= FOOT_OFFSET_Z;  // body center above ledge (FOOT_OFFSET_Z is negative)
 
         startMantle();
         return true;
@@ -1327,8 +1384,9 @@ private:
                     mMantleTimer = 0.0f;
                 } else {
                     // Move toward target via exponential convergence (rate-independent).
-                    // Uses the Z spring damping rate — same 30% convergence/step at 12.5Hz.
-                    float blend = 1.0f - std::exp(-mTimestep.springDamping * mTimestep.fixedDt);
+                    // 4.46/sec converges ~90% in 0.5s — quick enough for the mantle animation.
+                    static constexpr float MANTLE_RISE_RATE = 4.46f;
+                    float blend = 1.0f - std::exp(-MANTLE_RISE_RATE * mTimestep.fixedDt);
                     float step = dz * blend;
                     float maxStep = 20.0f * mTimestep.fixedDt;  // velocity cap equivalent
                     step = std::max(-maxStep, std::min(maxStep, step));
@@ -1447,10 +1505,6 @@ private:
         // edge cases like respawn or level geometry quirks).
         int32_t newCell = mCollision.findCell(mPosition);
         if (newCell >= 0) {
-            fprintf(stderr, "[UPDATECELL-BRUTE] t=%.3f  brute-force fallback: %d->%d  "
-                "pos=(%.1f,%.1f,%.1f)\n",
-                mSimTime, mCellIdx, newCell,
-                mPosition.x, mPosition.y, mPosition.z);
             mCellIdx = newCell;
         }
         // If still -1, keep old cell (player at boundary, will resolve next frame)
@@ -1460,44 +1514,38 @@ private:
     /// Replaces the old updateModeTransitions(). Body center shifts and spring compensation
     /// for crouch/uncrouch are preserved — just driven by mode transitions now.
     inline void updateModeTransitions() {
-        // Crouch spring compensation: when the body center shifts and the base
-        // offset changes (standing→crouching), the spring Z must absorb the full
-        // eye height difference so the eye stays at the same world position.
-        // The spring then naturally converges back to zero, creating a smooth
-        // crouch/uncrouch transition.
-        //
-        // Total eye shift = body center shift + base offset change
-        //   = CROUCH_CENTER_DROP + (HEAD_OFFSET_Z * CROUCH_SCALE - HEAD_OFFSET_Z)
-        //   = -1.5 + (0.9 - 1.8) = -2.4
-        // Spring must compensate by +2.4 (crouching) or -2.4 (un-crouching).
-        static constexpr float CROUCH_EYE_SHIFT =
-            HEAD_OFFSET_Z - CROUCH_CENTER_DROP - HEAD_OFFSET_Z * CROUCH_SCALE;
-            // = 1.8 - (-1.5) - 0.9 = 2.4
+        // Crouch uses per-submodel offsets (HEAD -2.02, BODY -1.0)
+        // The body center stays in place — no
+        // body center drop needed. The motion pose system (POSE_CROUCH) drives
+        // mSpringPos.z toward -2.02, creating a smooth visual eye drop.
+        // The collision system applies CROUCH_OFFSETS[] to physically lower HEAD
+        // and BODY spheres for ceiling clearance.
 
         // ── Crouch transitions (only on ground modes) ──
         if (isOnGround()) {
             if (mWantsCrouch && !isCrouching()) {
-                // Start crouching — body center drops to keep feet on ground
+                // Start crouching — body center stays in place.
+                // Explicitly activate POSE_CROUCH so the head spring drives the
+                // eye downward smoothly. Without this, the pose system's idle
+                // check (glm::length(mPoseEnd) > 0.01f) would fail when
+                // transitioning from POSE_NORMAL (all zeros) and the camera
+                // would never actually lower.
                 mCurrentMode = PlayerMode::Crouch;
-                mPosition.z += CROUCH_CENTER_DROP; // drops by 1.5 (negative value)
-                // Compensate spring Z to keep eye at same world position.
-                // Spring will converge back to zero → smooth crouch transition.
-                mSpringPos.z += CROUCH_EYE_SHIFT;
+                if (mLeanDir == 0)
+                    activatePose(POSE_CROUCH);
             } else if (!mWantsCrouch && isCrouching()) {
                 // Try to un-crouch — check if there's room above.
-                // Test HEAD sphere at standing height (body center raised back up)
-                Vector3 futureCenter = mPosition;
-                futureCenter.z -= CROUCH_CENTER_DROP; // raise center by 1.5
-                Vector3 standingHeadPos = futureCenter + Vector3(0.0f, 0.0f, HEAD_OFFSET_Z);
+                // Test HEAD sphere at standing height (no crouch offset applied)
+                Vector3 standingHeadPos = mPosition + Vector3(0.0f, 0.0f, HEAD_OFFSET_Z);
                 auto headContacts = mCollision.sphereVsCellPolygons(
                     standingHeadPos, SPHERE_RADIUS, mCellIdx);
 
                 // Only un-crouch if head has no collisions at standing height
                 if (headContacts.empty()) {
                     mCurrentMode = PlayerMode::Stand;
-                    mPosition.z -= CROUCH_CENTER_DROP; // raise center by 1.5
-                    // Compensate spring Z for reverse transition
-                    mSpringPos.z -= CROUCH_EYE_SHIFT;
+                    // Activate standing rest pose so the spring drives eye back up
+                    if (mLeanDir == 0)
+                        activatePose(POSE_NORMAL);
                 }
                 // else: ceiling too low, stay crouched
             }
@@ -1515,45 +1563,52 @@ private:
     }
 
     /// Activate a new motion pose — captures current offset as blend start,
-    /// sets new target, and begins linear interpolation toward it.
-    /// The head spring provides organic ease-in/ease-out on top of the
-    /// constant-velocity linear blend.
+    /// sets new target, and begins progressive blend toward it.
+    /// The head spring provides organic smoothing on top of the blend curve.
+    ///
+    /// Same-motion guard: if the new target matches the current target and the
+    /// pose is already blending/holding, skip re-activation.
     inline void activatePose(const MotionPoseData &pose) {
+        Vector3 newTarget(pose.fwd, pose.lat, pose.vert);
+
+        // Skip if already targeting the same offset (same-motion guard).
+        // Exception: if the pose just finished holding (poseReady), allow
+        // re-activation so stride→rest→stride cycling works correctly.
+        if (glm::length(mPoseEnd - newTarget) < 0.001f && !mPoseHolding) {
+            return;  // already blending toward this target
+        }
+
         mPoseStart = mPoseCurrent;  // capture current position as blend origin
-        mPoseEnd = Vector3(pose.fwd, pose.lat, pose.vert);
+        mPoseEnd = newTarget;
         mPoseDuration = pose.duration;
         mPoseHoldTime = pose.holdTime;
         mPoseTimer = 0.0f;
         mPoseHolding = false;
 
         // Clear any pending motion queue entries. A direct pose activation
-        // supersedes queued poses (e.g. a stale stride recovery left over
-        // from walking). activatePoseList() repopulates the queue AFTER
-        // calling activatePose(), so this clear doesn't affect new sequences.
+        // supersedes queued poses (e.g. compound motions from weapon swings
+        // or mantle sequences). Strides no longer use the queue — each stride
+        // directly activates a new pose, interrupting the previous blend.
         mMotionQueue.clear();
     }
 
     /// Activate the next stride pose (alternates left/right).
-    /// Each stride is chained as {footfall, recovery} via the motion queue.
-    /// The footfall dips the camera down; the recovery returns it toward the
-    /// mode's rest height. This creates the natural up-down bounce of walking.
-    /// Uses the per-mode motion config table — each mode has its own stride poses.
+    ///
+    /// Blends toward stride target over 0.6s using progressive interpolation. The head
+    /// spring provides organic dynamics (overshoot, lag) on top of the blend.
+    ///
     inline void activateStride() {
         auto motionCfg = getModeMotion(mCurrentMode);
+        const MotionPoseData *stride = mStrideIsLeft
+            ? motionCfg.strideLeft : motionCfg.strideRight;
 
-        // Build a recovery pose targeting the mode's rest position with short duration.
-        // Stored as member so the pointer remains valid for the motion queue.
-        mStrideRecovery = {0.12f, 0.0f,
-                           motionCfg.restPose->fwd,
-                           motionCfg.restPose->lat,
-                           motionCfg.restPose->vert};
+        // Activate stride directly — captures current pose as blend start,
+        // begins progressive blend toward stride target. Each new stride
+        // interrupts the previous blend naturally via activatePose().
+        activatePose(*stride);
 
-        if (mStrideIsLeft) {
-            activatePoseList({motionCfg.strideLeft, &mStrideRecovery});
-        } else {
-            activatePoseList({motionCfg.strideRight, &mStrideRecovery});
-        }
         mStrideIsLeft = !mStrideIsLeft;
+        mLastStrideSimTime = mSimTime;
     }
 
     /// Activate a sequence of poses as a LIFO queue.
@@ -1577,14 +1632,12 @@ private:
     }
 
     /// Compute velocity-dependent footstep distance.
+    ///   footstep_dist = 2.5 + 3.0 * ((velocity_mag - 5.0) / 10.0)
+    /// Clamped to [2.5, 5.5] by the velocity bounds.
     inline float computeFootstepDist(float hSpeed) const {
-        if (hSpeed < STRIDE_SPEED_LOW)
-            return STRIDE_DIST_MIN;
-        if (hSpeed > STRIDE_SPEED_HIGH)
-            return STRIDE_DIST_MAX;
-        return STRIDE_DIST_MIN
-             + (STRIDE_DIST_MAX - STRIDE_DIST_MIN)
-             * ((hSpeed - STRIDE_SPEED_LOW) / (STRIDE_SPEED_HIGH - STRIDE_SPEED_LOW));
+        float t = (hSpeed - STRIDE_SPEED_LOW) / STRIDE_SPEED_RANGE;
+        t = std::max(0.0f, std::min(1.0f, t));
+        return STRIDE_DIST_BASE + STRIDE_DIST_RANGE * t;
     }
 
     /// Update motion pose system — distance-based stride triggering.
@@ -1622,26 +1675,28 @@ private:
                 poseReady = true;
             }
         } else if (mPoseDuration <= 0.0f) {
-            // Instant pose (dur=0, e.g. landing bump) — snap to target, start hold
+            // Instant pose (dur=0) — snap to target, start hold.
+            // Used for landing impacts and weapon swings where the spring should
+            // handle all smoothing from an instant displacement.
             mPoseCurrent = mPoseEnd;
             mPoseHolding = true;
             mPoseTimer = 0.0f;
         } else {
-            // Linear interpolation from start to target over the full duration.
-            // A cumulative progressive blend  (current += (target - current) * (t/T) )converges
-            // faster at higher framerates. At 20-30fps, common in the early 2000s, this produced
-            // smooth motion, but at our fixed 60Hz physics rate it converges ~99% in 1/3 of the
-            // duration, creating a "snap then hold" pattern.
-            // Linear interpolation (current = start + (target - start) * t/T) is framerate-independent
-            // and uses the full duration — the head spring provides organic acceleration/deceleration.
+            // Progressive blend
+            // Formula: curOffset += (targOffset - curOffset) * (timeActive / timeDuration)
+            // This is NOT linear interpolation — it's a cumulative blend where each
+            // step applies a fraction of the remaining distance. The fraction grows
+            // with time (timeActive/timeDuration increases each step), creating an
+            // accelerating approach curve that reaches the target at t=duration.
+            // At the original 12.5Hz rate with 0.6s duration, this produces ~7 blend
+            // steps with progressively larger increments.
             if (mPoseTimer >= mPoseDuration) {
-                // Blend complete — snap to target, enter hold phase
                 mPoseCurrent = mPoseEnd;
                 mPoseHolding = true;
                 mPoseTimer = 0.0f;
             } else {
-                float t = mPoseTimer / mPoseDuration;
-                mPoseCurrent = mPoseStart + (mPoseEnd - mPoseStart) * t;
+                float blendFrac = mPoseTimer / mPoseDuration;
+                mPoseCurrent += (mPoseEnd - mPoseCurrent) * blendFrac;
             }
         }
 
@@ -1674,9 +1729,12 @@ private:
 
         // Motion queue takes priority — compound motions (weapon swing, mantle)
         // play through their full sequence regardless of walking state.
+        // Pop BEFORE activatePose — activatePose() clears the entire queue
+        // internally, so pop_back after clear would be UB on an empty vector.
         if (!mMotionQueue.empty() && poseReady) {
-            activatePose(*mMotionQueue.back());
+            const MotionPoseData *nextQueued = mMotionQueue.back();
             mMotionQueue.pop_back();
+            activatePose(*nextQueued);
         }
         // Landing bump takes priority over normal strides
         else if (mLandingActive) {
@@ -1705,7 +1763,9 @@ private:
                 activateStride();
                 mStrideDist = 0.0f;
             } else if (strideTriggered) {
-                // Foot traveled enough distance — activate next stride
+                // Foot traveled enough distance — activate next stride.
+                // Strides chain directly left→right→left without returning
+                // to rest in between.
                 activateStride();
             }
         }
@@ -1722,10 +1782,16 @@ private:
                 }
                 // If still blending, the pose will complete naturally,
                 // then poseReady fires next frame and we'll catch it below.
-            } else if (poseReady && glm::length(mPoseEnd) > 0.01f && !isLeaning) {
-                // Idle, current non-zero pose completed — return to rest.
-                // Skip when leaning — lean holds at target until key released.
-                activatePose(restPose);
+            } else if (poseReady && !isLeaning) {
+                // Idle — check if current pose differs from mode's rest pose.
+                // Activates restPose when: (a) a non-zero pose completed (e.g.
+                // landing bump returning to idle), or (b) the mode changed and
+                // the rest pose is different from the current target (e.g.
+                // switching from Stand (vert=0) to Crouch (vert=-2.02)).
+                Vector3 restTarget(restPose.fwd, restPose.lat, restPose.vert);
+                if (glm::length(mPoseEnd - restTarget) > 0.01f) {
+                    activatePose(restPose);
+                }
             }
         }
 
@@ -1737,9 +1803,10 @@ private:
     /// (in player-local coords rotated by yaw) + collision-limited lean.
     /// Called by getEyePosition() for interpolation and by step() to snapshot state.
     inline Vector3 computeRawEyePos() const {
-        // Head Z offset — drops when crouching (body center shifts down to keep feet planted)
-        float headZ = isCrouching() ? HEAD_OFFSET_Z * CROUCH_SCALE : HEAD_OFFSET_Z;
-        Vector3 eye = mPosition + Vector3(0.0f, 0.0f, headZ + EYE_ABOVE_HEAD + mSpringPos.z);
+        // Head Z offset — always HEAD_OFFSET_Z. During crouch, the motion pose system
+        // (POSE_CROUCH vert=-2.02) drives mSpringPos.z down, lowering the eye naturally.
+        // No body center shift or offset scaling needed.
+        Vector3 eye = mPosition + Vector3(0.0f, 0.0f, HEAD_OFFSET_Z + EYE_ABOVE_HEAD + mSpringPos.z);
 
         float sinYaw = std::sin(mYaw);
         float cosYaw = std::cos(mYaw);
@@ -1761,41 +1828,117 @@ private:
 
     /// Compute the raw (un-interpolated) lean tilt from current physics state.
     /// Returns camera roll angle proportional to collision-limited lean extent.
+    /// Only produces roll when actively leaning (Q/E keys) — stride lateral sway
+    /// is translational only (no roll).
     inline float computeRawLeanTilt() const {
+        if (mLeanDir == 0) return 0.0f;  // no roll from stride sway
         float maxDist = isCrouching() ? CROUCH_LEAN_DISTANCE : LEAN_DISTANCE;
         if (maxDist < 0.01f) return 0.0f;
         return (mLeanAmount / maxDist) * LEAN_TILT;
     }
 
-    /// Update 3D head spring — exponential decay model (rate-independent).
+    /// Exact analytical step for one axis of a damped harmonic oscillator.
+    /// State: pos (position), vel (velocity). Target: equilibrium point.
+    /// Uses the matrix exponential of the continuous-time ODE:
+    ///   x'' + 2ζω₀x' + ω₀²x = 0
+    /// This is exact — no Euler integration error. At any dt the trajectory
+    /// is identical to the continuous ODE solution. Rate-independent by construction.
     ///
-    /// Replaces the per-frame tension/damping formulation with exponential
-    /// convergence (inspired by Godot's frame-rate-independent smoothing):
-    ///   blend = 1 - exp(-rate * dt)
+    /// Handles both underdamped (ζ<1, sin/cos) and overdamped (ζ>1, sinh/cosh).
+    /// CURRENTLY UNUSED — kept for future rate-independent spring implementation.
+    /// Once the direct discrete formula is verified at 12.5Hz, this can replace
+    /// it with properly derived ω₀/ζ values for rate-independent behavior.
+    static inline void stepSpringAxis(float &pos, float &vel, float target,
+                                      float omega0, float zeta, float dt) {
+        float d = pos - target;     // displacement from equilibrium
+        float v = vel;              // current velocity
+
+        float sigma = zeta * omega0;  // decay rate
+        float e = std::exp(-sigma * dt);
+
+        if (zeta < 1.0f) {
+            // Underdamped: oscillatory solution with sin/cos
+            float wd = omega0 * std::sqrt(1.0f - zeta * zeta);
+            float cosWd = std::cos(wd * dt);
+            float sinWd = std::sin(wd * dt);
+            float sigmaOverWd = sigma / wd;
+            float omega0SqOverWd = (omega0 * omega0) / wd;
+
+            pos = target + e * (d * (cosWd + sigmaOverWd * sinWd)
+                              + v * (sinWd / wd));
+            vel = e * (d * (-omega0SqOverWd * sinWd)
+                     + v * (cosWd - sigmaOverWd * sinWd));
+        } else {
+            // Overdamped: non-oscillatory solution with sinh/cosh
+            float wd = omega0 * std::sqrt(zeta * zeta - 1.0f);
+            float chWd = std::cosh(wd * dt);
+            float shWd = std::sinh(wd * dt);
+            float sigmaOverWd = sigma / wd;
+            float omega0SqOverWd = (omega0 * omega0) / wd;
+
+            pos = target + e * (d * (chWd + sigmaOverWd * shWd)
+                              + v * (shWd / wd));
+            vel = e * (d * (-omega0SqOverWd * shWd)
+                     + v * (chWd - sigmaOverWd * shWd));
+        }
+    }
+
+    /// Update 3D head spring — direct discrete implementation - spring formula (dt-dependent):
+    ///   springDt = min(dt, 0.05)               (clamps spring dt to 50ms)
+    ///   tension_eff = BASE_TENSION / springDt   (higher rate → lower tension)
+    ///   damping_eff = BASE_DAMPING + (1.0 - BASE_DAMPING) * springDt
+    ///   vel = displacement * tension_eff        (target-tracking velocity)
+    ///   vel.z *= Z_SCALE                        (Z-axis half-strength, hardcoded)
+    ///   vel = vel + old_vel * damping_eff        (blend new with retained old)
+    ///   pos += vel * dt                          (integrate with FULL dt, not clamped)
     ///
-    /// Rates derived from the original Dark Engine at 12.5Hz (the reference):
-    ///   XY: 60% convergence per step at 12.5Hz => 11.45/sec
-    ///   Z:  30% convergence per step at 12.5Hz => 4.46/sec
+    /// The dt clamping means at 12.5Hz (dt=0.08), the spring uses springDt=0.05:
+    ///   tension_eff = 0.6/0.05 = 12.0  (not 7.5)
+    ///   damping_eff = 0.02 + 0.98*0.05 = 0.069  (not 0.098)
+    /// This makes the spring 60% stiffer and 30% less damped than without clamping.
+    /// Position integration still uses the full physics dt for correct displacement.
     ///
-    /// At any Hz, convergence per second is preserved:
-    ///   12.5Hz: blend=0.600/step, 60Hz: blend=0.174/step, 120Hz: blend=0.091/step
-    ///   All produce ~0.01% remaining after 1 second.
+    /// Note: This formula is NOT rate-independent — behavior differs at 60Hz vs 12.5Hz.
+    /// For now we use it at all rates; rate-independent analytical stepping can be
+    /// added later once the behavior is confirmed correct at the original 12.5Hz rate.
     inline void updateHeadSpring() {
+        const float dt = mTimestep.fixedDt;
         Vector3 target = mPoseCurrent;
+
+        // Original engine clamps the spring dt to 50ms max. This affects tension/damping
+        // calculation but NOT position integration (which uses full dt).
+        const float springDt = std::min(dt, HEAD_SPRING_MAX_DT);
+
+        // Compute dt-dependent spring parameters with clamped dt
+        float tensionEff = HEAD_SPRING_BASE_TENSION / springDt;
+        float dampingEff = HEAD_SPRING_BASE_DAMPING
+                         + (1.0f - HEAD_SPRING_BASE_DAMPING) * springDt;
+
+        // Displacement from target → spring velocity (target-seeking term)
         Vector3 disp = target - mSpringPos;
+        Vector3 newVel = disp * tensionEff;
 
-        float dt = mTimestep.fixedDt;
-        float blendXY = 1.0f - std::exp(-mTimestep.springStiffness * dt);
-        float blendZ  = 1.0f - std::exp(-mTimestep.springDamping * dt);
+        // Z-axis half-strength — makes vertical spring slower/overdamped.
+        // This is what creates the dominant vertical head bob: the Z spring
+        // is always in transit during walking because it approaches so slowly.
+        newVel.z *= HEAD_SPRING_Z_SCALE;
 
-        mSpringPos.x += disp.x * blendXY;
-        mSpringPos.y += disp.y * blendXY;
-        mSpringPos.z += disp.z * blendZ;
+        // Blend with previous velocity (damping_eff < 1 = mostly new, little old)
+        // At 12.5Hz with clamping: dampingEff=0.069, so 93% new + 7% old
+        mSpringVel = newVel + mSpringVel * dampingEff;
 
-        // Clamp to sane range — ±3.0 accommodates crouch transition where
-        // body center shifts ±1.5 and the spring must track the large
-        // displacement back to zero.
-        mSpringPos = glm::clamp(mSpringPos, Vector3(-3.0f), Vector3(3.0f));
+        // Velocity cap — 25.0
+        float velMag = glm::length(mSpringVel);
+        if (velMag > HEAD_SPRING_VEL_CAP) {
+            mSpringVel *= HEAD_SPRING_VEL_CAP / velMag;
+        }
+
+        // Integrate position
+        mSpringPos += mSpringVel * dt;
+
+        // Clamp to sane range — prevents spring runaway on large target jumps.
+        // ±4.0 accommodates crouch transition (2.02 units) plus overshoot.
+        mSpringPos = glm::clamp(mSpringPos, Vector3(-4.0f), Vector3(4.0f));
     }
 
     // ── State ──
@@ -1829,15 +1972,18 @@ private:
     float mLastLandingTime = -1.0f; // time of last landing event (for throttling)
 
     // ── 3D head spring state ──
-    // Spring tracks motion pose targets in player-local coords {fwd, lat, vert}.
-    // Position is displacement from the stance rest offset; the spring naturally
-    // converges toward the current pose target.
-    Vector3 mSpringPos{0.0f};     // current spring displacement {fwd, lat, vert}
+    // Direct discrete spring using a dt-dependent formula.
+    // Tracks motion pose targets in player-local coords {fwd, lat, vert}.
+    // XY axes are near-critical; Z (with 0.5× tension) is overdamped.
+    // The slow Z approach creates dominant vertical head bob during walking.
+    Vector3 mSpringPos{0.0f};     // current spring position {fwd, lat, vert}
+    Vector3 mSpringVel{0.0f};     // spring velocity (used by direct discrete formula)
 
     // ── Motion pose state ──
-    // Discrete stride-driven pose system. Each stride triggers a new target
-    // that the spring tracks. Linear interpolation from start to end over
-    // the pose duration; the head spring adds organic ease-in/ease-out.
+    // Stride-driven pose system using progressive blend + head spring.
+    // Strides chain directly left→right→left (no rest between strides).
+    // The progressive blend shapes the target trajectory, and the head spring
+    // adds dynamic response on top (overshoot, lag).
     Vector3 mPoseStart{0.0f};     // blend start offset (captured in activatePose)
     Vector3 mPoseEnd{0.0f};       // blend target offset {fwd, lat, vert}
     Vector3 mPoseCurrent{0.0f};   // current interpolated pose offset
@@ -1853,10 +1999,8 @@ private:
     bool  mLandingActive = false; // true while landing bump pose is active
     float mStrideDist    = 0.0f;  // accumulated horizontal foot travel distance
 
-    // Stride recovery pose — built dynamically in activateStride() targeting the
-    // mode's rest position with short duration. Stored as member so the pointer
-    // remains valid for the motion queue.
-    MotionPoseData mStrideRecovery = {0.12f, 0.0f, 0.0f, 0.0f, 0.0f};
+    // Stride timing — last stride activation time for diagnostics/logging
+    float mLastStrideSimTime   = 0.0f;  // simTime when last stride was activated
 
     // Motion queue — LIFO stack for chaining multi-pose sequences.
     // When a pose completes, the next is popped from the back.
@@ -1868,7 +2012,7 @@ private:
 
     // ── Render interpolation state ──
     // "Fix Your Timestep" interpolation — smooth rendering between fixed physics steps.
-    // The original Dark Engine uses interpolates with frame fraction to blend
+    // Interpolates with frame fraction to blend
     // between previous and current physics states. At low Hz (12.5Hz vintage), without
     // interpolation the camera visibly snaps between physics positions.
     // mInterpAlpha = accumulator remainder / fixedDt, in [0, 1).
@@ -1882,6 +2026,53 @@ private:
 
     // Contacts from last collision resolution (used by detectGround and velocity removal)
     std::vector<SphereContact> mLastContacts;
+
+    // ── Diagnostic logging state ──
+    FILE *mLogFile = nullptr;   // per-timestep CSV log file (null = disabled)
+    float mCamPitch = 0.0f;    // camera pitch from renderer (for logging only)
+
+    /// Write one CSV row with full physics state. Called at end of fixedStep().
+    inline void writeLogRow() {
+        if (!mLogFile) return;
+
+        float hSpeed = std::sqrt(mVelocity.x * mVelocity.x +
+                                  mVelocity.y * mVelocity.y);
+        Vector3 eye = computeRawEyePos();
+
+        std::fprintf(mLogFile,
+            "%.4f,%.5f,%s,%d,%d,"           // simTime,dt,mode,sneaking,running
+            "%.3f,%.3f,%.3f,"               // posX,posY,posZ
+            "%.3f,%.3f,%.3f,%.3f,"          // velX,velY,velZ,hSpeed
+            "%.4f,%.4f,%.4f,"               // eyeX,eyeY,eyeZ
+            "%.4f,%.4f,"                    // yaw,camPitch
+            "%.5f,%.5f,%.5f,"              // springPosX,springPosY,springPosZ
+            "%.5f,%.5f,%.5f,"              // springVelX,springVelY,springVelZ
+            "%.5f,%.5f,%.5f,"              // poseTargetX,poseTargetY,poseTargetZ
+            "%.5f,%.5f,%.5f,"              // poseStartX,poseStartY,poseStartZ
+            "%.4f,%.4f,%d,"                // poseTimer,poseDur,poseHolding
+            "%.3f,%d,%d,%.4f,"              // strideDist,strideIsLeft,leanDir,leanAmount
+            "%d,%.2f,%.2f\n",               // cell,inputFwd,inputRight
+            mSimTime, mTimestep.fixedDt, modeName(mCurrentMode),
+            (int)mSneaking, (int)mRunning,
+            mPosition.x, mPosition.y, mPosition.z,
+            mVelocity.x, mVelocity.y, mVelocity.z, hSpeed,
+            eye.x, eye.y, eye.z,
+            mYaw, mCamPitch,
+            mSpringPos.x, mSpringPos.y, mSpringPos.z,
+            mSpringVel.x, mSpringVel.y, mSpringVel.z,
+            mPoseCurrent.x, mPoseCurrent.y, mPoseCurrent.z,
+            mPoseStart.x, mPoseStart.y, mPoseStart.z,
+            mPoseTimer, mPoseDuration, (int)mPoseHolding,
+            mStrideDist, (int)mStrideIsLeft, mLeanDir, mLeanAmount,
+            mCellIdx, mInputForward, mInputRight);
+
+        // Flush periodically so data isn't lost on crash
+        static int flushCounter = 0;
+        if (++flushCounter >= 10) {
+            std::fflush(mLogFile);
+            flushCounter = 0;
+        }
+    }
 };
 
 } // namespace Darkness
