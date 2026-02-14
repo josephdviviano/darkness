@@ -313,22 +313,19 @@ public:
     // duration, then the head spring tracks mPoseCurrent with spring dynamics.
     // Both the blend curve and the spring's overshoot/lag contribute to natural bob.
     //
-    // Vertical offsets derived from motion capture data (humwlklt/humwlkrt in
-    // motions.crf). Each stride has a different ending Z in the mocap:
-    //   Left stride (humwlklt): ends at Z = +0.038 relative to baseline
-    //   Right stride (humwlkrt): ends at Z = -0.049 relative to baseline
-    // With baseline buttZOffset = -0.4, this gives -0.362 / -0.449.
-    // The alternating Z targets create vertical bob as the spring tracks them.
-    static constexpr MotionPoseData POSE_STRIDE_LEFT  = {0.6f,  0.01f, 0.0f,  -0.1f,   -0.362f};
-    static constexpr MotionPoseData POSE_STRIDE_RIGHT = {0.6f,  0.01f, 0.0f,   0.1f,   -0.449f};
+    // Both strides use identical vertical dip (-0.4) and symmetric lateral sway (±0.1).
+    // Lateral sign convention: original Y=LEFT-positive → our lat=RIGHT-positive,
+    // so left stride sways right (+0.1) and right stride sways left (-0.1),
+    // pushing the body AWAY from the stepping foot.
+    static constexpr MotionPoseData POSE_STRIDE_LEFT  = {0.6f,  0.01f, 0.0f,   0.1f,   -0.4f};
+    static constexpr MotionPoseData POSE_STRIDE_RIGHT = {0.6f,  0.01f, 0.0f,  -0.1f,   -0.4f};
 
     // Crouching strides — slightly wider sway, deeper vertical offset from crouch height.
-    // Vert is relative to POSE_CROUCH (-2.02). Crouch stride mocap (humdwlkl/humdwlkr)
-    // shows similar asymmetry: left ends lower, right ends higher.
-    //   humdwlkl ends at Z = -0.093, humdwlkr ends at Z = +0.127 relative to baseline
-    // With baseline = -2.50: -2.593 / -2.373.
-    static constexpr MotionPoseData POSE_CRAWL_LEFT   = {0.6f,  0.01f, 0.0f,  -0.15f,  -2.593f};
-    static constexpr MotionPoseData POSE_CRAWL_RIGHT  = {0.6f,  0.01f, 0.0f,   0.15f,  -2.373f};
+    // Vert is relative to POSE_CROUCH (-2.02). Both crawl strides use identical vertical
+    // dip (-2.5) and symmetric
+    // lateral sway (±0.15), with same sign convention as standing strides.
+    static constexpr MotionPoseData POSE_CRAWL_LEFT   = {0.6f,  0.01f, 0.0f,   0.15f,  -2.5f};
+    static constexpr MotionPoseData POSE_CRAWL_RIGHT  = {0.6f,  0.01f, 0.0f,  -0.15f,  -2.5f};
 
     // Crouching idle — blend over 0.8s for smooth crouch transition:
     static constexpr MotionPoseData POSE_CROUCH       = {0.8f,  0.0f,  0.0f,   0.0f,   -2.02f};
@@ -339,8 +336,8 @@ public:
     // Body carry mode (carrying a body or heavy object):
     // Heavier bob — deeper dip and more lateral sway while carrying.
     static constexpr MotionPoseData POSE_CARRY_IDLE   = {0.8f,  0.0f,  0.0f,   0.0f,   -0.8f};
-    static constexpr MotionPoseData POSE_CARRY_LEFT   = {0.6f,  0.0f,  0.0f,  -0.5f,   -1.5f};
-    static constexpr MotionPoseData POSE_CARRY_RIGHT  = {0.6f,  0.0f,  0.0f,   0.15f,  -1.1f};
+    static constexpr MotionPoseData POSE_CARRY_LEFT   = {0.6f,  0.0f,  0.0f,   0.5f,   -1.5f};
+    static constexpr MotionPoseData POSE_CARRY_RIGHT  = {0.6f,  0.0f,  0.0f,  -0.15f,  -1.1f};
 
     // Weapon swing (head bob during sword/blackjack attacks):
     // Instant target — spring overshoot creates natural recoil feel.
@@ -401,7 +398,7 @@ public:
     //   Crouching lean: 1.7 units lateral + 2.0 units vertical drop (POSE_CLNLEAN_*)
     static constexpr float LEAN_DISTANCE        = 2.2f;   // standing lean lateral offset (world units)
     static constexpr float CROUCH_LEAN_DISTANCE = 1.7f;   // crouching lean lateral offset (world units)
-    static constexpr float LEAN_TILT            = 0.2618f; // max camera roll (~15 degrees, radians)
+    static constexpr float LEAN_TILT            = 0.087f;  // max camera roll (~5 degrees, radians)
 
     // ── Construction ──
 
@@ -1585,11 +1582,10 @@ private:
         mPoseTimer = 0.0f;
         mPoseHolding = false;
 
-        // Clear any pending motion queue entries. A direct pose activation
-        // supersedes queued poses (e.g. compound motions from weapon swings
-        // or mantle sequences). Strides no longer use the queue — each stride
-        // directly activates a new pose, interrupting the previous blend.
-        mMotionQueue.clear();
+        // NOTE: Do NOT clear mMotionQueue here. The original engine's Activate()
+        // does not touch the motion list — only ActivateList() manages the queue.
+        // Clearing here would break compound motions (weapon swing → recovery)
+        // if a stride or rest interrupt fires mid-sequence.
     }
 
     /// Activate the next stride pose (alternates left/right).
@@ -1756,7 +1752,12 @@ private:
                 }
             }
         }
-        // Walking: trigger strides based on foot travel distance
+        // Walking: trigger strides based on foot travel distance.
+        // Between strides, a rest-condition interrupt fires ~100ms after
+        // each stride activation. This interrupts the stride's progressive
+        // blend at ~30% completion, producing the characteristic subtle
+        // walking bob. Without this, strides chain directly and the full
+        // stride offset is reached, creating ~3× too much head bob.
         else if (isWalking) {
             if (!mWasWalking) {
                 // Just started walking — activate first stride immediately
@@ -1764,9 +1765,17 @@ private:
                 mStrideDist = 0.0f;
             } else if (strideTriggered) {
                 // Foot traveled enough distance — activate next stride.
-                // Strides chain directly left→right→left without returning
-                // to rest in between.
                 activateStride();
+            } else if ((mSimTime - mLastStrideSimTime) > 0.1f &&
+                       mStrideDist > computeFootstepDist(hSpeed) * 0.5f) {
+                // Rest-condition interrupt: the original engine fires
+                // ActivateRestMotion() when >100ms has elapsed since the last
+                // stride event AND the foot has traveled past the half-footstep
+                // distance. This creates a stride→rest→stride→rest oscillation
+                // pattern where each stride is interrupted at ~30% blend, keeping
+                // effective head bob amplitude to roughly 1/3 of the full stride
+                // target offset.
+                activatePose(restPose);
             }
         }
         // Not walking: return to mode's rest pose when current pose completes.
@@ -1775,13 +1784,14 @@ private:
         // setLeanDirection(0) explicitly activates the rest pose on key release.
         else {
             if (mWasWalking && !mLandingActive && !isLeaning) {
-                // Just stopped walking (not due to lean) — return to rest.
-                // If already holding (blend done), transition immediately.
-                if (poseReady) {
-                    activatePose(restPose);
-                }
-                // If still blending, the pose will complete naturally,
-                // then poseReady fires next frame and we'll catch it below.
+                // Just stopped walking — immediately interrupt any in-progress
+                // stride blend with the rest pose. The original engine fires
+                // ActivateRestMotion() immediately when velocity drops below
+                // the stride threshold (the velocity_mag < 1.5 OR-clause in
+                // the rest-condition check bypasses the distance requirement).
+                // Same-motion guard in activatePose() prevents re-triggering
+                // on subsequent idle frames.
+                activatePose(restPose);
             } else if (poseReady && !isLeaning) {
                 // Idle — check if current pose differs from mode's rest pose.
                 // Activates restPose when: (a) a non-zero pose completed (e.g.
@@ -1817,7 +1827,11 @@ private:
             eye.y += sinYaw * mSpringPos.x;
         }
 
-        // Collision-limited lean offset (lateral displacement)
+        // Collision-limited lateral offset (combines stride sway + lean).
+        // Both stride lateral sway and deliberate lean flow through mLeanAmount,
+        // which is set from mSpringPos.y in updateLean() and collision-limited
+        // for wall clipping. Camera tilt is only applied during deliberate lean
+        // (mLeanDir != 0) in computeRawLeanTilt().
         if (std::fabs(mLeanAmount) > 0.001f) {
             eye.x += sinYaw * mLeanAmount;
             eye.y -= cosYaw * mLeanAmount;
@@ -1981,9 +1995,10 @@ private:
 
     // ── Motion pose state ──
     // Stride-driven pose system using progressive blend + head spring.
-    // Strides chain directly left→right→left (no rest between strides).
-    // The progressive blend shapes the target trajectory, and the head spring
-    // adds dynamic response on top (overshoot, lag).
+    // A rest-condition interrupt fires ~100ms after each stride activation,
+    // creating stride→rest→stride oscillation. Each stride is interrupted at
+    // ~30% blend, limiting effective bob amplitude. The head spring adds
+    // dynamic response on top (overshoot, lag).
     Vector3 mPoseStart{0.0f};     // blend start offset (captured in activatePose)
     Vector3 mPoseEnd{0.0f};       // blend target offset {fwd, lat, vert}
     Vector3 mPoseCurrent{0.0f};   // current interpolated pose offset

@@ -586,11 +586,31 @@ static void renderObjects(
         const auto &obj = mission.objData.objects[oi];
         if (!obj.hasPosition) return;
 
-        // Portal culling: skip objects in non-visible cells.
+        // Portal culling: skip objects in non-visible cells, unless the
+        // object's world-space AABB still intersects the rendering frustum.
+        // This prevents large objects from popping when their center-of-mass
+        // cell passes behind the camera but part of the mesh is still visible.
         if (state.portalCulling && oi < mission.objCellIDs.size()) {
             int32_t objCell = mission.objCellIDs[oi];
-            if (objCell >= 0 && fc.visibleCells.count(static_cast<uint32_t>(objCell)) == 0)
-                return;
+            if (objCell >= 0 && fc.visibleCells.count(static_cast<uint32_t>(objCell)) == 0) {
+                // Cell not visible — check if model AABB intersects frustum
+                std::string mname(obj.modelName);
+                auto mit = mission.parsedModels.find(mname);
+                if (mit == mission.parsedModels.end()) return;
+                const auto &mesh = mit->second;
+
+                // Compute conservative world-space AABB from model bbox + position.
+                // Ignores rotation for speed — the resulting box is larger than
+                // the true oriented bbox, so we never cull something visible.
+                float halfX = (mesh.bboxMax[0] - mesh.bboxMin[0]) * 0.5f * obj.scaleX;
+                float halfY = (mesh.bboxMax[1] - mesh.bboxMin[1]) * 0.5f * obj.scaleY;
+                float halfZ = (mesh.bboxMax[2] - mesh.bboxMin[2]) * 0.5f * obj.scaleZ;
+                float extent = std::max({halfX, halfY, halfZ});  // sphere-ish bound
+                if (!fc.objFrustum.testAABB(
+                        obj.x - extent, obj.y - extent, obj.z - extent,
+                        obj.x + extent, obj.y + extent, obj.z + extent))
+                    return;
+            }
         }
 
         // Compute per-object model matrix from position + angles
@@ -1269,11 +1289,11 @@ static Darkness::FrameContext prepareFrame(
     // objects from popping at screen edges due to cell-based culling.
     if (state.portalCulling) {
         // Build a wider projection for culling than for rendering.
-        // Adding 20 degrees to the rendering FOV prevents large objects
-        // from popping out at screen edges due to cell-based culling.
-        constexpr float CULL_FOV_EXTRA = 20.0f;
+        // 120-degree vertical FOV (~160° horizontal at 16:9) gives generous
+        // margin so large objects aren't culled while still partially visible.
+        constexpr float CULL_FOV = 120.0f;
         float cullProj[16];
-        bx::mtxProj(cullProj, 60.0f + CULL_FOV_EXTRA,
+        bx::mtxProj(cullProj, CULL_FOV,
                      float(WINDOW_WIDTH) / float(WINDOW_HEIGHT),
                      0.1f, 5000.0f,
                      bgfx::getCaps()->homogeneousDepth,
@@ -1287,6 +1307,14 @@ static Darkness::FrameContext prepareFrame(
         fc.visibleCells = portalBFS(mission.wrData, mission.cellPortals, camCell, frustum,
                                      state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
         state.cullVisibleCells = static_cast<uint32_t>(fc.visibleCells.size());
+
+        // Build a tighter frustum from the actual rendering projection for
+        // per-object AABB tests. Objects whose cells are culled by the wide
+        // portal frustum still get rendered if their world-space AABB
+        // intersects this rendering frustum.
+        float renderVP[16];
+        bx::mtxMul(renderVP, fc.view, fc.proj);
+        fc.objFrustum.extractFromVP(renderVP);
     }
 
     // Opaque geometry render state (constant each frame)
