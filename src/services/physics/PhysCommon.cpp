@@ -65,7 +65,7 @@ namespace Darkness {
 			>> val.unknown;
 		
 		// value of the owner is not read, ignored
-		val.owner = NULL;
+		val.owner = nullptr;
 			
 		// this is just to skip the owner pointer
 		uint32_t vl = 0;

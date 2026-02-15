@@ -420,6 +420,12 @@ public:
 
     ~PlayerPhysics() { stopLog(); }
 
+    // Non-copyable, non-movable: holds raw FILE* and reference member
+    PlayerPhysics(const PlayerPhysics &) = delete;
+    PlayerPhysics &operator=(const PlayerPhysics &) = delete;
+    PlayerPhysics(PlayerPhysics &&) = delete;
+    PlayerPhysics &operator=(PlayerPhysics &&) = delete;
+
     /// Change the active physics timestep preset at runtime.
     void setTimestep(const PhysicsTimestep &ts) { mTimestep = ts; }
 
@@ -544,7 +550,11 @@ public:
 
     /// Set the player's look direction yaw (radians).
     /// Movement is oriented relative to this yaw.
-    inline void setYaw(float yaw) { mYaw = yaw; }
+    inline void setYaw(float yaw) {
+        mYaw = yaw;
+        mCosYaw = std::cos(yaw);
+        mSinYaw = std::sin(yaw);
+    }
 
     /// Initiate a jump (only if on ground).
     inline void jump() { mJumpRequested = true; }
@@ -804,8 +814,8 @@ private:
         // Forward and right vectors in Z-up coordinate system
         // Forward = (cos(yaw), sin(yaw), 0)
         // Right = (sin(yaw), -cos(yaw), 0)
-        float cosYaw = std::cos(mYaw);
-        float sinYaw = std::sin(mYaw);
+        float cosYaw = mCosYaw;
+        float sinYaw = mSinYaw;
         Vector3 forward(cosYaw, sinYaw, 0.0f);
         Vector3 right(sinYaw, -cosYaw, 0.0f);
 
@@ -932,46 +942,49 @@ private:
     inline void constrainVelocity() {
         if (mLastContacts.empty()) return;
 
-        // Collect unique constraint normals from previous frame's contacts
-        std::vector<Vector3> constraints;
-        constraints.reserve(mLastContacts.size());
+        // Collect unique constraint normals from previous frame's contacts.
+        // Bounded by de-duplication — at most ~5 unique wall directions.
+        static constexpr int MAX_CONSTRAINTS = 8;
+        Vector3 constraintBuf[MAX_CONSTRAINTS];
+        int constraintCount = 0;
+
         for (const auto &c : mLastContacts) {
             // Only constrain if velocity is moving into the surface
             float vn = glm::dot(mVelocity, c.normal);
             if (vn >= 0.0f) continue;
 
             bool duplicate = false;
-            for (const auto &cn : constraints) {
-                if (glm::dot(c.normal, cn) > 0.99f) { duplicate = true; break; }
+            for (int i = 0; i < constraintCount; ++i) {
+                if (glm::dot(c.normal, constraintBuf[i]) > 0.99f) { duplicate = true; break; }
             }
-            if (!duplicate)
-                constraints.push_back(c.normal);
+            if (!duplicate && constraintCount < MAX_CONSTRAINTS)
+                constraintBuf[constraintCount++] = c.normal;
         }
 
         // Apply constraint-based velocity removal
-        if (constraints.size() == 1) {
+        if (constraintCount == 1) {
             // Single surface — remove velocity component along the normal
-            float vn = glm::dot(mVelocity, constraints[0]);
+            float vn = glm::dot(mVelocity, constraintBuf[0]);
             if (vn < 0.0f)
-                mVelocity -= constraints[0] * vn;
+                mVelocity -= constraintBuf[0] * vn;
 
-        } else if (constraints.size() == 2) {
+        } else if (constraintCount == 2) {
             // Two surfaces (crease/wedge) — slide along the edge between them
-            Vector3 edge = glm::cross(constraints[0], constraints[1]);
+            Vector3 edge = glm::cross(constraintBuf[0], constraintBuf[1]);
             float edgeLen = glm::length(edge);
             if (edgeLen > 1e-6f) {
                 edge /= edgeLen;
                 mVelocity = edge * glm::dot(mVelocity, edge);
             } else {
-                float vn = glm::dot(mVelocity, constraints[0]);
+                float vn = glm::dot(mVelocity, constraintBuf[0]);
                 if (vn < 0.0f)
-                    mVelocity -= constraints[0] * vn;
+                    mVelocity -= constraintBuf[0] * vn;
             }
 
-        } else if (constraints.size() >= 3) {
+        } else if (constraintCount >= 3) {
             // Corner (3+ surfaces) — project onto edge, validate direction
             Vector3 origVel = mVelocity;
-            Vector3 edge = glm::cross(constraints[0], constraints[1]);
+            Vector3 edge = glm::cross(constraintBuf[0], constraintBuf[1]);
             float edgeLen = glm::length(edge);
             if (edgeLen > 1e-6f) {
                 edge /= edgeLen;
@@ -1001,12 +1014,13 @@ private:
         bool crouching = isCrouching();
 
         mLastContacts.clear();
+        mLastContacts.reserve(16);
 
         for (int iter = 0; iter < mTimestep.collisionIters; ++iter) {
             if (mCellIdx < 0)
                 break;
 
-            std::vector<SphereContact> iterContacts;
+            mIterContacts.clear();
 
             for (int s = 0; s < NUM_SPHERES; ++s) {
                 float sphereR = SPHERE_RADII[s];
@@ -1014,16 +1028,15 @@ private:
                 Vector3 sphereCenter = mPosition + Vector3(0.0f, 0.0f, offsetZ);
 
                 // Test against the body center's cell
-                auto contacts = mCollision.sphereVsCellPolygons(
-                    sphereCenter, sphereR, mCellIdx);
+                mCollision.sphereVsCellPolygons(
+                    sphereCenter, sphereR, mCellIdx, mIterContacts);
 
                 // Test the submodel's own cell if it differs from body center's cell
                 // (handles straddling portal boundaries, e.g. feet in one cell, head in another)
                 int32_t sphereCell = mCollision.findCell(sphereCenter);
                 if (sphereCell >= 0 && sphereCell != mCellIdx) {
-                    auto adj = mCollision.sphereVsCellPolygons(
-                        sphereCenter, sphereR, sphereCell);
-                    contacts.insert(contacts.end(), adj.begin(), adj.end());
+                    mCollision.sphereVsCellPolygons(
+                        sphereCenter, sphereR, sphereCell, mIterContacts);
                 }
 
                 // Test adjacent cells via portals from the body center's cell.
@@ -1043,17 +1056,14 @@ private:
                         int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
                         if (tgtCell >= 0 && tgtCell != mCellIdx && tgtCell != sphereCell
                             && tgtCell < static_cast<int32_t>(mCollision.getWR().numCells)) {
-                            auto adj = mCollision.sphereVsCellPolygons(
-                                sphereCenter, sphereR, tgtCell);
-                            contacts.insert(contacts.end(), adj.begin(), adj.end());
+                            mCollision.sphereVsCellPolygons(
+                                sphereCenter, sphereR, tgtCell, mIterContacts);
                         }
                     }
                 }
-
-                iterContacts.insert(iterContacts.end(), contacts.begin(), contacts.end());
             }
 
-            if (iterContacts.empty())
+            if (mIterContacts.empty())
                 break; // No contacts — done
 
             // Push body center out of penetrating polygons.
@@ -1061,10 +1071,10 @@ private:
             // wall (dot > 0.99), use only the maximum penetration depth. Without
             // this, 3 spheres hitting one wall would triple the push, causing
             // jittery over-correction on the next frame.
-            std::vector<std::pair<Vector3, float>> pushes; // {normal, maxPenetration}
-            for (const auto &c : iterContacts) {
+            mPushes.clear();
+            for (const auto &c : mIterContacts) {
                 bool merged = false;
-                for (auto &p : pushes) {
+                for (auto &p : mPushes) {
                     if (glm::dot(c.normal, p.first) > 0.99f) {
                         // Same wall — keep the deeper penetration
                         p.second = std::max(p.second, c.penetration);
@@ -1073,16 +1083,16 @@ private:
                     }
                 }
                 if (!merged) {
-                    pushes.push_back({c.normal, c.penetration});
+                    mPushes.push_back({c.normal, c.penetration});
                 }
             }
-            for (const auto &p : pushes) {
+            for (const auto &p : mPushes) {
                 mPosition += p.first * p.second;
             }
 
             // Accumulate contacts for ground detection and velocity removal
             mLastContacts.insert(mLastContacts.end(),
-                                 iterContacts.begin(), iterContacts.end());
+                                 mIterContacts.begin(), mIterContacts.end());
 
             // Push may have moved through a portal — update cell.
             // Use portal-based tracking (not brute-force) to avoid jumping to
@@ -1265,8 +1275,8 @@ private:
         // safe lean distance. The lean holds at the wall surface rather than
         // snapping back to standing.
         if (std::fabs(mLeanAmount) > 0.01f && mCellIdx >= 0) {
-            float sinYaw = std::sin(mYaw);
-            float cosYaw = std::cos(mYaw);
+            float sinYaw = mSinYaw;
+            float cosYaw = mCosYaw;
             // HEAD collision position for lean: standing offset + crouch drop (if any)
             float headOffset = HEAD_OFFSET_Z + (isCrouching() ? CROUCH_HEAD_DROP : 0.0f);
             float leanBaseZ = headOffset + mSpringPos.z;
@@ -1275,8 +1285,9 @@ private:
             leanedHead.y -= cosYaw * mLeanAmount;
 
             // Test HEAD sphere (r=1.2) at the leaned position
-            auto contacts = mCollision.sphereVsCellPolygons(
-                leanedHead, SPHERE_RADIUS, mCellIdx);
+            std::vector<SphereContact> contacts;
+            mCollision.sphereVsCellPolygons(
+                leanedHead, SPHERE_RADIUS, mCellIdx, contacts);
             if (!contacts.empty()) {
                 // Compute the lean direction in world space (unit vector pointing
                 // from the player's center toward the leaned head position).
@@ -1328,8 +1339,8 @@ private:
             return false;  // ceiling too low
 
         // Phase 2: forward — check clear path
-        float cosY = std::cos(mYaw);
-        float sinY = std::sin(mYaw);
+        float cosY = mCosYaw;
+        float sinY = mSinYaw;
         Vector3 fwd(cosY, sinY, 0.0f);
         Vector3 fwdTarget = upTarget + fwd * MANTLE_FWD_DIST;
         if (raycastWorld(mCollision.getWR(), upTarget, fwdTarget, hit))
@@ -1543,8 +1554,9 @@ private:
                 // Try to un-crouch — check if there's room above.
                 // Test HEAD sphere at standing height (no crouch offset applied)
                 Vector3 standingHeadPos = mPosition + Vector3(0.0f, 0.0f, HEAD_OFFSET_Z);
-                auto headContacts = mCollision.sphereVsCellPolygons(
-                    standingHeadPos, SPHERE_RADIUS, mCellIdx);
+                std::vector<SphereContact> headContacts;
+                mCollision.sphereVsCellPolygons(
+                    standingHeadPos, SPHERE_RADIUS, mCellIdx, headContacts);
 
                 // Only un-crouch if head has no collisions at standing height
                 if (headContacts.empty()) {
@@ -1830,8 +1842,9 @@ private:
         // No body center shift or offset scaling needed.
         Vector3 eye = mPosition + Vector3(0.0f, 0.0f, HEAD_OFFSET_Z + EYE_ABOVE_HEAD + mSpringPos.z);
 
-        float sinYaw = std::sin(mYaw);
-        float cosYaw = std::cos(mYaw);
+        // Use cached sin/cos (updated in setYaw() and fixedStep())
+        float sinYaw = mSinYaw;
+        float cosYaw = mCosYaw;
 
         // Spring forward displacement (mSpringPos.x = forward axis in player-local coords)
         if (std::fabs(mSpringPos.x) > 0.001f) {
@@ -1978,6 +1991,8 @@ private:
     Vector3 mPosition{0.0f};       // body center position (ground + 4.2 on flat ground)
     Vector3 mVelocity{0.0f};       // linear velocity
     float mYaw = 0.0f;            // look direction (radians)
+    float mCosYaw = 1.0f;         // cached cos(mYaw), updated per step and setYaw()
+    float mSinYaw = 0.0f;         // cached sin(mYaw), updated per step and setYaw()
     float mInputForward = 0.0f;   // movement input [-1, 1]
     float mInputRight   = 0.0f;   // strafe input [-1, 1]
 
@@ -2056,6 +2071,10 @@ private:
 
     // Contacts from last collision resolution (used by detectGround and velocity removal)
     std::vector<SphereContact> mLastContacts;
+
+    // Pre-allocated scratch buffers for resolveCollisions() — avoids per-step heap allocs
+    std::vector<SphereContact> mIterContacts;                // per-iteration contact accumulator
+    std::vector<std::pair<Vector3, float>> mPushes;          // de-duplicated push normals
 
     // ── Diagnostic logging state ──
     FILE *mLogFile = nullptr;   // per-timestep CSV log file (null = disabled)
