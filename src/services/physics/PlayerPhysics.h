@@ -386,13 +386,17 @@ public:
         }
     }
 
-    // Stride distance
-    //   footstep_dist = 2.5 + 3.0 * ((velocity_mag - 5.0) / 10.0)
-    // Clamped to [2.5, 5.5] by the velocity range [5.0, 15.0].
-    static constexpr float STRIDE_DIST_BASE  = 2.5f;   // base footstep distance
-    static constexpr float STRIDE_DIST_RANGE = 3.0f;   // additional distance at max speed
-    static constexpr float STRIDE_SPEED_LOW  = 5.0f;   // speed where stride distance starts growing
+    // Stride distance:
+    //   vel < 5.0:  footstep_dist = 2.5
+    //   vel > 15.0: footstep_dist = 4.0  (hard cap, NOT the formula's 5.5)
+    //   else:       footstep_dist = 2.5 + 3.0 * ((vel - 5.0) / 10.0)
+    // Note: the formula reaches 5.5 at vel=15, but the cap overrides to 4.0
+    // for vel > 15.0.
+    static constexpr float STRIDE_DIST_BASE   = 2.5f;   // base footstep distance
+    static constexpr float STRIDE_DIST_RANGE  = 3.0f;   // additional distance at max speed
+    static constexpr float STRIDE_SPEED_LOW   = 5.0f;   // speed where stride distance starts growing
     static constexpr float STRIDE_SPEED_RANGE = 10.0f;  // velocity range (15.0 - 5.0)
+    static constexpr float STRIDE_DIST_CAP    = 4.0f;   // hard cap at vel > 15.0
 
     // Leaning — visual-only camera offset, physics body stays in place.
     // Lean is purely cosmetic, no physics body movement.
@@ -1632,12 +1636,16 @@ private:
     }
 
     /// Compute velocity-dependent footstep distance.
-    ///   footstep_dist = 2.5 + 3.0 * ((velocity_mag - 5.0) / 10.0)
-    /// Clamped to [2.5, 5.5] by the velocity bounds.
     inline float computeFootstepDist(float hSpeed) const {
-        float t = (hSpeed - STRIDE_SPEED_LOW) / STRIDE_SPEED_RANGE;
-        t = std::max(0.0f, std::min(1.0f, t));
-        return STRIDE_DIST_BASE + STRIDE_DIST_RANGE * t;
+        // low speed
+        if (hSpeed < STRIDE_SPEED_LOW)
+            return STRIDE_DIST_BASE;
+        // max speed
+        if (hSpeed > STRIDE_SPEED_LOW + STRIDE_SPEED_RANGE)
+            return STRIDE_DIST_CAP;
+        // middle range of speeds
+        return STRIDE_DIST_BASE + STRIDE_DIST_RANGE
+             * ((hSpeed - STRIDE_SPEED_LOW) / STRIDE_SPEED_RANGE);
     }
 
     /// Update motion pose system — distance-based stride triggering.
@@ -1834,8 +1842,8 @@ private:
         // Collision-limited lateral offset (combines stride sway + lean).
         // Both stride lateral sway and deliberate lean flow through mLeanAmount,
         // which is set from mSpringPos.y in updateLean() and collision-limited
-        // for wall clipping. Camera tilt is only applied during deliberate lean
-        // (mLeanDir != 0) in computeRawLeanTilt().
+        // for wall clipping. Camera roll tracks mLeanAmount proportionally via
+        // computeRawLeanTilt() — stride sway produces ~0.2° roll (imperceptible).
         if (std::fabs(mLeanAmount) > 0.001f) {
             eye.x += sinYaw * mLeanAmount;
             eye.y -= cosYaw * mLeanAmount;
