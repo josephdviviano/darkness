@@ -2,6 +2,7 @@
  *
  *    This file is part of the darkness project
  *    Copyright (C) 2005-2009 openDarkEngine team
+ *    Copyright (C) 2026 darkness team
  *
  *    This program is free software; you can redistribute it and/or modify
  *    it under the terms of the GNU General Public License as published by
@@ -29,11 +30,9 @@
 //   MotionService (this file)  — global database, stateless after load
 //   MotionPlayback.h           — per-entity playback state (owned by consumer)
 //
-// The original Dark Engine's motion system is a cross-cutting service touching
-// sound (footfall flags), AI (locomotion planning), physics (position constraints),
-// rendering (joint transforms), scripts (PlayMotion), and camera (butt offset).
-// This v1 implementation covers root translation + motion flags. Full skeleton
-// playback and motion coordination are reserved for future phases.
+// The motion system touches sound (footfall flags), AI (locomotion planning),
+// physics (position constraints), rendering (joint transforms), scripts (PlayMotion),
+// and camera (butt offset). Many of these are still TODO.
 //
 // Binary format references documented in .claude/NOTES.SOURCE.md (gitignored).
 
@@ -58,10 +57,8 @@ namespace Darkness {
 // engine's flag definitions for cross-system compatibility.
 // Sound, physics, and scripts will consume these flags.
 //
-// TODO(sound): These flags are defined but NOT currently loading from
-// motions.crf — the .mi flag arrays appear truncated on disk. See the
-// TODO in parseMI() for details. Must be fixed before footstep sounds
-// can be driven by MF_LEFT_FOOTFALL / MF_RIGHT_FOOTFALL events.
+// Sound, physics, and scripts consume these flags via MotionPlayback callbacks.
+// Flags are loaded from .mi files in motions.crf during MotionService::loadFromCRF().
 enum MotionFlags : uint32_t {
     MF_STANDING        = 0x00000001,  // character at rest
     MF_LEFT_FOOTFALL   = 0x00000002,  // left foot touches ground
@@ -381,31 +378,25 @@ private:
         clip.freq = freq > 0 ? freq : 30;
         clip.duration = static_cast<float>(clip.numFrames) / static_cast<float>(clip.freq);
 
-        // The remaining bytes after the 96-byte header contain:
-        //   N × MIComponent (12 bytes each)
-        //   M × MIFlag (8 bytes each)
+        // On-disk layout of mps_motion (after the 96-byte mps_motion_info):
         //
-        // We need to figure out N and M. The MI file doesn't store these counts
-        // directly in a simple way. However, from the mps_motion struct layout:
-        //   After the 96-byte mps_motion_info come:
-        //     int32 num_components
-        //     [components array — but stored as pointers in memory, data inline on disk]
-        //     int32 num_flags
-        //     [flags array]
+        //   int32 num_components     (4 bytes)
+        //   int32 components_ptr     (4 bytes, always NULL on disk — serialized pointer)
+        //   int32 num_flags          (4 bytes)
+        //   int32 flags_ptr          (4 bytes, always NULL on disk — serialized pointer)
+        //   MIComponent[num_components]  (12 bytes each)
+        //   MIFlag[num_flags]            (8 bytes each)
         //
-        // Actually, looking at the file format more carefully:
-        // The mps_motion struct on disk is:
-        //   mps_motion_info (96 bytes)
-        //   int32 num_components (4 bytes)
-        //   MIComponent[num_components] (12 bytes each)
-        //   int32 num_flags (4 bytes)
-        //   MIFlag[num_flags] (8 bytes each)
+        // The two pointer fields are part of the in-memory mps_motion struct
+        // (32-bit pointers). On disk they're serialized as NULL and the actual
+        // data arrays follow after all four fields. The original engine writes
+        // the entire struct with ITagFile_Write, then the data arrays inline.
 
         size_t offset = MI_HEADER_SIZE;
 
-        // Read num_components
-        if (offset + 4 > data.size()) {
-            // No components — might be a virtual motion
+        // Read the four mps_motion fields after mps_motion_info (16 bytes total)
+        if (offset + 16 > data.size()) {
+            // No motion data — might be a virtual motion
             return clip.numFrames > 0;
         }
 
@@ -413,13 +404,25 @@ private:
         std::memcpy(&numComponents, p + offset, 4);
         offset += 4;
 
+        // Skip components pointer (NULL on disk, was a 32-bit in-memory pointer)
+        offset += 4;
+
+        int32_t numFlags;
+        std::memcpy(&numFlags, p + offset, 4);
+        offset += 4;
+
+        // Skip flags pointer (NULL on disk, was a 32-bit in-memory pointer)
+        offset += 4;
+
+        // Validate counts
         if (numComponents < 0 || numComponents > 64) {
             std::fprintf(stderr, "MotionService: MI bad num_components=%d\n", numComponents);
             return false;
         }
 
-        // Read components
-        if (offset + numComponents * sizeof(MIComponent) > data.size()) {
+        // Read component array
+        size_t compDataSize = static_cast<size_t>(numComponents) * sizeof(MIComponent);
+        if (offset + compDataSize > data.size()) {
             std::fprintf(stderr, "MotionService: MI truncated (components)\n");
             return false;
         }
@@ -437,33 +440,15 @@ private:
             }
         }
 
-        // Read num_flags
-        //
-        // TODO(sound): Motion flags (footfall events, triggers) are currently
-        // NOT loading — the .mi files in motions.crf appear to have truncated
-        // flag arrays. The num_flags field is present and valid, but the file
-        // ends before all flag records can be read (boundary check fails).
-        // Possible causes:
-        //   1. Flags are stripped from shipped .mi files and regenerated at runtime
-        //   2. Flags are stored in a separate file or chunk (not in the .mi)
-        //   3. The on-disk struct packing differs from our assumed layout
-        // This MUST be investigated before Phase 3 Audio (Task 36) — footfall
-        // flags (MF_LEFT_FOOTFALL, MF_RIGHT_FOOTFALL) drive footstep sounds.
-        // See also: .claude/TASKS.TODO.md Task 25.5 and Phase 3 Task 36.
-        if (offset + 4 <= data.size()) {
-            int32_t numFlags;
-            std::memcpy(&numFlags, p + offset, 4);
-            offset += 4;
-
-            if (numFlags > 0 && numFlags < 256 &&
-                offset + numFlags * sizeof(MIFlag) <= data.size()) {
-                clip.flags.reserve(numFlags);
-                for (int i = 0; i < numFlags; ++i) {
-                    MIFlag flag;
-                    std::memcpy(&flag, p + offset, sizeof(MIFlag));
-                    offset += sizeof(MIFlag);
-                    clip.flags.emplace_back(flag.frame, flag.flags);
-                }
+        // Read flag array — motion event markers (footfalls, triggers, etc.)
+        if (numFlags > 0 && numFlags < 256 &&
+            offset + static_cast<size_t>(numFlags) * sizeof(MIFlag) <= data.size()) {
+            clip.flags.reserve(numFlags);
+            for (int i = 0; i < numFlags; ++i) {
+                MIFlag flag;
+                std::memcpy(&flag, p + offset, sizeof(MIFlag));
+                offset += sizeof(MIFlag);
+                clip.flags.emplace_back(flag.frame, flag.flags);
             }
         }
 
