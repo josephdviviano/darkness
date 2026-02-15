@@ -22,3 +22,6 @@ CMakeUserPresets.json
 
 # Working notes (DO NOT DELETE — important local project docs, kept out of repo only)
 .claude/
+
+# e.g., physics_log
+*.csv
