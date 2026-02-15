@@ -54,11 +54,7 @@ namespace Darkness {
 // Consumers (sound, physics, scripts) register a listener to receive
 // motion flag events as they fire during playback. The callback receives
 // the combined flag bits and the frame number that triggered them.
-//
-// TODO(sound): This callback mechanism is ready but currently never fires
-// because MI flag arrays are not loading from motions.crf (truncated on
-// disk). Fix the flag parsing in MotionService::parseMI() before wiring
-// up footstep sounds. See TODO(sound) in MotionService.h.
+// Flag data is loaded from .mi files via MotionService::parseMI().
 using MotionFlagCallback = std::function<void(uint32_t flags, int frame)>;
 
 // ════════════════════════════════════════════════════════════════════
