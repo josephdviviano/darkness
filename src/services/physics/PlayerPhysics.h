@@ -25,6 +25,11 @@
  *    collision and constraint-based response. Header-only (inline),
  *    matching CellGeometry.h / RayCaster.h / CollisionGeometry.h pattern.
  *
+ *    TODO: Player physics (headbob, lean, anything that depends on dt) is ONLY
+ *          vintage correct at 12.5hz, at higher rendering rates, these actions
+ *          can seem exaggerated. We will leave them as is for now and revisit
+ *          later.
+ *
  *    Uses a 5-submodel player model:
  *    HEAD (+1.8, r=1.2), BODY (-0.6, r=1.2) — real collision spheres
  *    SHIN (-2.2, r=0), KNEE (-2.6, r=0), FOOT (-3.0, r=0) — point detectors
@@ -1582,8 +1587,7 @@ private:
         mPoseTimer = 0.0f;
         mPoseHolding = false;
 
-        // NOTE: Do NOT clear mMotionQueue here. The original engine's Activate()
-        // does not touch the motion list — only ActivateList() manages the queue.
+        // NOTE: Do NOT clear mMotionQueue here.
         // Clearing here would break compound motions (weapon swing → recovery)
         // if a stride or rest interrupt fires mid-sequence.
     }
@@ -1768,8 +1772,8 @@ private:
                 activateStride();
             } else if ((mSimTime - mLastStrideSimTime) > 0.1f &&
                        mStrideDist > computeFootstepDist(hSpeed) * 0.5f) {
-                // Rest-condition interrupt: the original engine fires
-                // ActivateRestMotion() when >100ms has elapsed since the last
+                // Rest-condition interrupt: fires activatePose(restPose) when >100ms
+                // has elapsed since the last
                 // stride event AND the foot has traveled past the half-footstep
                 // distance. This creates a stride→rest→stride→rest oscillation
                 // pattern where each stride is interrupted at ~30% blend, keeping
@@ -1785,8 +1789,8 @@ private:
         else {
             if (mWasWalking && !mLandingActive && !isLeaning) {
                 // Just stopped walking — immediately interrupt any in-progress
-                // stride blend with the rest pose. The original engine fires
-                // ActivateRestMotion() immediately when velocity drops below
+                // stride blend with the rest pose. Fires
+                // activatePose(restPose) immediately when velocity drops below
                 // the stride threshold (the velocity_mag < 1.5 OR-clause in
                 // the rest-condition check bypasses the distance requirement).
                 // Same-motion guard in activatePose() prevents re-triggering
@@ -1842,10 +1846,13 @@ private:
 
     /// Compute the raw (un-interpolated) lean tilt from current physics state.
     /// Returns camera roll angle proportional to collision-limited lean extent.
-    /// Only produces roll when actively leaning (Q/E keys) — stride lateral sway
-    /// is translational only (no roll).
+    /// Camera roll is derived
+    /// from the HEAD submodel's lateral displacement (mLeanAmount), not gated
+    /// on a lean-active flag. This means stride sway (±0.1 units) produces
+    /// ~0.2° of roll — imperceptible.
+    /// Lean (±2.2 units) produces the full ~5° roll, and on key release the
+    /// spring smoothly decays mLeanAmount back to zero, giving smooth roll return.
     inline float computeRawLeanTilt() const {
-        if (mLeanDir == 0) return 0.0f;  // no roll from stride sway
         float maxDist = isCrouching() ? CROUCH_LEAN_DISTANCE : LEAN_DISTANCE;
         if (maxDist < 0.01f) return 0.0f;
         return (mLeanAmount / maxDist) * LEAN_TILT;
@@ -1919,7 +1926,7 @@ private:
         const float dt = mTimestep.fixedDt;
         Vector3 target = mPoseCurrent;
 
-        // Original engine clamps the spring dt to 50ms max. This affects tension/damping
+        // Clamps the spring dt to 50ms max. This affects tension/damping
         // calculation but NOT position integration (which uses full dt).
         const float springDt = std::min(dt, HEAD_SPRING_MAX_DT);
 
