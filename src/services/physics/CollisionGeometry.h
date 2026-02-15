@@ -114,13 +114,13 @@ public:
     /// (toward the interior). A positive distance means the sphere center
     /// is inside the cell; negative means past the wall. We push whenever
     /// dist < radius.
-    inline std::vector<SphereContact> sphereVsCellPolygons(
-        const Vector3 &center, float radius, int32_t cellIdx) const
+    /// Append contacts to outContacts (caller manages clear).
+    inline void sphereVsCellPolygons(
+        const Vector3 &center, float radius, int32_t cellIdx,
+        std::vector<SphereContact> &outContacts) const
     {
-        std::vector<SphereContact> contacts;
-
         if (cellIdx < 0 || cellIdx >= static_cast<int32_t>(mWR.numCells))
-            return contacts;
+            return;
 
         const auto &cell = mWR.cells[cellIdx];
         int numSolid = cell.numPolygons - cell.numPortals;
@@ -178,10 +178,8 @@ public:
                 contact.textureIdx = -1;
             }
 
-            contacts.push_back(contact);
+            outContacts.push_back(contact);
         }
-
-        return contacts;
     }
 
     /// Test a sphere against solid polygons in the containing cell AND
@@ -200,7 +198,8 @@ public:
             return {};
 
         // Test the containing cell first
-        auto contacts = sphereVsCellPolygons(center, radius, cellIdx);
+        std::vector<SphereContact> contacts;
+        sphereVsCellPolygons(center, radius, cellIdx, contacts);
 
         // Check portal polygons to find adjacent cells where the sphere
         // might also be colliding. The sphere reaches into an adjacent
@@ -220,9 +219,7 @@ public:
             if (dist < radius) {
                 int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
                 if (tgtCell >= 0 && tgtCell < static_cast<int32_t>(mWR.numCells)) {
-                    auto adjContacts = sphereVsCellPolygons(center, radius, tgtCell);
-                    contacts.insert(contacts.end(),
-                                    adjContacts.begin(), adjContacts.end());
+                    sphereVsCellPolygons(center, radius, tgtCell, contacts);
                 }
             }
         }
@@ -257,7 +254,8 @@ public:
             if (cellIdx < 0)
                 break;
 
-            auto iterContacts = sphereVsCellPolygons(center, radius, cellIdx);
+            std::vector<SphereContact> iterContacts;
+            sphereVsCellPolygons(center, radius, cellIdx, iterContacts);
 
             // Also check adjacent cells via portals
             const auto &cell = mWR.cells[cellIdx];
@@ -271,9 +269,7 @@ public:
                 if (dist < radius) {
                     int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
                     if (tgtCell >= 0 && tgtCell < static_cast<int32_t>(mWR.numCells)) {
-                        auto adj = sphereVsCellPolygons(center, radius, tgtCell);
-                        iterContacts.insert(iterContacts.end(),
-                                            adj.begin(), adj.end());
+                        sphereVsCellPolygons(center, radius, tgtCell, iterContacts);
                     }
                 }
             }
@@ -331,7 +327,8 @@ public:
         if (testCell < 0)
             testCell = cellIdx; // fallback to current cell
 
-        auto contacts = sphereVsCellPolygons(testPos, radius, testCell);
+        std::vector<SphereContact> contacts;
+        sphereVsCellPolygons(testPos, radius, testCell, contacts);
 
         // Also check adjacent cells at the lowered position
         if (testCell >= 0 && testCell < static_cast<int32_t>(mWR.numCells)) {
@@ -346,8 +343,7 @@ public:
                 if (dist < radius) {
                     int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
                     if (tgtCell >= 0 && tgtCell < static_cast<int32_t>(mWR.numCells)) {
-                        auto adj = sphereVsCellPolygons(testPos, radius, tgtCell);
-                        contacts.insert(contacts.end(), adj.begin(), adj.end());
+                        sphereVsCellPolygons(testPos, radius, tgtCell, contacts);
                     }
                 }
             }

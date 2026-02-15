@@ -46,7 +46,7 @@ PhysModel *PhysModels::get(int objid) const {
     if (it != mModels.end())
         return it->second.get();
 
-    return NULL;
+    return nullptr;
 };
 
 //------------------------------------------------------

@@ -96,7 +96,7 @@ protected:
     unsigned int mPhysVersion;
 
     // Dark World
-    dWorldID dDarkWorldID;
+    dWorldID dDarkWorldID = nullptr;
 
     /// Collection of all the physical models
     PhysModels mPhysModels;
