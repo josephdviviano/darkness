@@ -246,7 +246,8 @@ public:
 
     void setFootstepCallback(FootstepCallback cb) override {
         mFootstepCb = std::move(cb);
-        // TODO: Fire from PlayerPhysics stride triggering
+        // Forward to PlayerPhysics where stride events fire
+        mPlayer.setFootstepCallback(mFootstepCb);
     }
 
     int getPlayerMode() const override {

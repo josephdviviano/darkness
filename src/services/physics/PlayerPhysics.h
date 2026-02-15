@@ -86,17 +86,27 @@ enum class PlayerMode {
     NumModes
 };
 
-/// Mantle animation state — 5 phases from ledge detection to standing up.
+/// Mantle animation state machine — mirrors Dark Engine 5-state machine.
+///
+/// State sequence:
+///   Hold → Rise → Forward → FinalRise → Complete
+///
+/// The original engine uses a spring-connected multi-sphere model where the
+/// head sphere is driven by a target location with adjustable spring tension.
+/// During the "compressed ball" phases (Forward, FinalRise), all 5 sub-model
+/// offsets are zeroed so the player fits through tight gaps. We approximate
+/// this with direct position manipulation and exponential convergence.
 enum class MantleState {
     None,       // not mantling
-    Hold,       // Phase 1: hold position, suppress physics (MANTLE_HOLD_TIME)
-    Rise,       // Phase 2: move vertically toward ledge via spring
-    Forward,    // Phase 3: move horizontally onto ledge (MANTLE_FWD_TIME)
-    StandUp,    // Phase 4: restore normal standing offsets
-    Complete    // Phase 5: wait for ground contact, then return to normal mode
+    Hold,       // State 1: freeze position, suppress physics (0.3s)
+    Rise,       // State 2: rise body to intermediate height (head peeks above ledge)
+    Forward,    // State 3: "compressed ball" moves horizontally onto ledge (0.4s)
+    FinalRise,  // State 4: "compressed ball" rises to final standing height
+    Complete    // State 5: expand, find floor, restore normal mode (immediate)
 };
 
-/// Player physics simulation — custom 5-sphere-polygon collision.
+/// Player physics simulation — custom 5-submodel polygon collision
+/// (2 real spheres + 3 point detectors).
 /// Owns the player's position, velocity, and movement state.
 /// Updated each frame by DarkPhysics::step().
 class PlayerPhysics {
@@ -198,12 +208,16 @@ public:
     static constexpr float LANDING_MIN_VEL  = 2.0f;    // minimum downward speed for landing pose
     static constexpr float LANDING_MIN_TIME = 0.2f;    // minimum 200ms between landing events
 
-    // Mantle system — 3-ray detection + 5-state animation
+    // Mantle system — 3-ray detection + 5-state animation.
+    // Detection: UP → FWD → DOWN raycasts, then forward surface finding from HEAD/BODY/FOOT.
+    // Animation: Hold(0.3s) → Rise(to intermediate) → Forward(0.4s) → FinalRise → Complete.
     static constexpr float MANTLE_UP_DIST   = 3.5f;    // upward headroom check distance
     static constexpr float MANTLE_FWD_DIST  = 2.4f;    // forward ledge reach (radius × 2)
     static constexpr float MANTLE_DOWN_DIST = 7.0f;    // downward surface scan distance
-    static constexpr float MANTLE_HOLD_TIME = 0.3f;    // Phase 1: hold & compress duration
-    static constexpr float MANTLE_FWD_TIME  = 0.4f;    // Phase 3: forward movement duration
+    static constexpr float MANTLE_HOLD_TIME = 0.3f;    // State 1: hold duration
+    static constexpr float MANTLE_FWD_TIME  = 0.4f;    // State 3: forward movement duration
+    static constexpr float MANTLE_PULLBACK  = 0.55f;   // pull back from wall (approx half radius)
+    static constexpr float MANTLE_CONVERGE  = 0.0001f; // distance² convergence threshold (= 0.01 units)
 
     // Movement control — exponential convergence impulse system.
     // Instead of constant acceleration/deceleration,
@@ -341,8 +355,8 @@ public:
     // Body carry mode (carrying a body or heavy object):
     // Heavier bob — deeper dip and more lateral sway while carrying.
     static constexpr MotionPoseData POSE_CARRY_IDLE   = {0.8f,  0.0f,  0.0f,   0.0f,   -0.8f};
-    static constexpr MotionPoseData POSE_CARRY_LEFT   = {0.6f,  0.0f,  0.0f,   0.5f,   -1.5f};
-    static constexpr MotionPoseData POSE_CARRY_RIGHT  = {0.6f,  0.0f,  0.0f,  -0.15f,  -1.1f};
+    static constexpr MotionPoseData POSE_CARRY_LEFT   = {0.6f,  0.01f, 0.0f,   0.5f,   -1.5f};
+    static constexpr MotionPoseData POSE_CARRY_RIGHT  = {0.6f,  0.01f, 0.0f,  -0.15f,  -1.1f};
 
     // Weapon swing (head bob during sword/blackjack attacks):
     // Instant target — spring overshoot creates natural recoil feel.
@@ -703,6 +717,12 @@ public:
 
     /// Set gravity magnitude (units/sec²). Default is GRAVITY.
     void setGravityMagnitude(float g) { mGravityMag = g; }
+
+    /// Register a callback for footstep sound events. Fired each time a stride
+    /// triggers (distance-based). The callback receives the player's foot position,
+    /// horizontal speed, and ground texture index for material-based sound selection.
+    /// Phase 3 Audio will use this to play surface-appropriate footstep sounds.
+    void setFootstepCallback(FootstepCallback cb) { mFootstepCb = std::move(cb); }
 
 private:
     // ── Internal simulation steps ──
@@ -1176,12 +1196,18 @@ private:
     inline void detectGround() {
         bool onGround = false;
 
-        // Check contacts from collision resolution (any sphere's ground contact counts)
+        // Check contacts from collision resolution (any sphere's ground contact counts).
+        // Track the most upward-facing ground normal and its texture index for
+        // footstep material lookup (Phase 3 Audio).
+        float bestGroundZ = -1.0f;
         for (const auto &c : mLastContacts) {
             if (c.normal.z > GROUND_NORMAL_MIN) {
                 onGround = true;
-                mGroundNormal = c.normal;
-                break;
+                if (c.normal.z > bestGroundZ) {
+                    bestGroundZ = c.normal.z;
+                    mGroundNormal = c.normal;
+                    mGroundTextureIdx = c.textureIdx;
+                }
             }
         }
 
@@ -1317,13 +1343,53 @@ private:
         }
     }
 
+    /// Test whether the player model can fit at a given position without
+    /// penetrating world geometry. Tests all 5 submodels (2 real spheres +
+    /// 3 point detectors) at their standing offsets against cell polygons.
+    ///
+    /// Returns true if no submodel has a penetrating contact at testPos.
+    inline bool canPlayerFitAt(const Vector3 &testPos) const {
+        int32_t testCell = mCollision.findCell(testPos);
+        if (testCell < 0)
+            return false;  // outside all cells — not valid
+
+        std::vector<SphereContact> contacts;
+        for (int s = 0; s < NUM_SPHERES; ++s) {
+            float sphereR = SPHERE_RADII[s];
+            float offsetZ = SPHERE_OFFSETS[s];  // standing offsets (not crouched)
+            Vector3 sphereCenter = testPos + Vector3(0.0f, 0.0f, offsetZ);
+
+            contacts.clear();
+            mCollision.sphereVsCellPolygons(sphereCenter, sphereR, testCell, contacts);
+
+            // Also check the submodel's own cell if different
+            int32_t sphereCell = mCollision.findCell(sphereCenter);
+            if (sphereCell >= 0 && sphereCell != testCell) {
+                mCollision.sphereVsCellPolygons(sphereCenter, sphereR, sphereCell, contacts);
+            }
+
+            if (!contacts.empty())
+                return false;  // penetration detected — player doesn't fit
+        }
+
+        return true;
+    }
+
     /// Check for mantleable ledge using 3-ray detection.
     /// Called each fixedStep when the player is airborne and pressing forward.
     ///
-    /// Detection phases:
-    /// 1. Cast UP from head — must NOT hit (headroom check)
-    /// 2. Cast FORWARD from top — must NOT hit (clear path to ledge)
-    /// 3. Cast DOWN from forward position — MUST hit (ledge surface)
+    /// Detection algorithm:
+    /// 1. Cast UP from head — must NOT hit (headroom check, 3.5 units)
+    /// 2. Cast FORWARD from top — must NOT hit (clear path, radius×2 = 2.4)
+    /// 3. Cast DOWN from forward position — MUST hit (ledge surface, 7.0 units)
+    /// 4. Find forward surface by casting forward from HEAD/BODY/FOOT
+    ///    (determines XY target, pulled back 0.55 from wall)
+    ///
+    /// Rise target Z places body center at an INTERMEDIATE height — just enough
+    /// for the head sphere to peek above the ledge lip. The full standing height
+    /// is reached later via the FinalRise phase after forward compression.
+    ///
+    /// riseZ = ledge.z + radius*1.02 - HEAD_OFFSET + 1.0
     inline bool checkMantle() {
         if (mCurrentMode != PlayerMode::Jump || mInputForward < 0.1f || mMantling)
             return false;
@@ -1332,31 +1398,81 @@ private:
         float headZ = HEAD_OFFSET_Z + (isCrouching() ? CROUCH_HEAD_DROP : 0.0f);
         Vector3 headPos = mPosition + Vector3(0.0f, 0.0f, headZ);
 
-        // Phase 1: upward — check headroom
+        // Phase 1: upward — check headroom (3.5 units above head)
         Vector3 upTarget = headPos + Vector3(0.0f, 0.0f, MANTLE_UP_DIST);
         RayHit hit;
         if (raycastWorld(mCollision.getWR(), headPos, upTarget, hit))
             return false;  // ceiling too low
 
-        // Phase 2: forward — check clear path
-        float cosY = mCosYaw;
-        float sinY = mSinYaw;
-        Vector3 fwd(cosY, sinY, 0.0f);
-        Vector3 fwdTarget = upTarget + fwd * MANTLE_FWD_DIST;
+        // Forward direction (horizontal, unit length, from cached yaw)
+        Vector3 fwd(mCosYaw, mSinYaw, 0.0f);
+        Vector3 moveDir = fwd * MANTLE_FWD_DIST;  // radius × 2 = 2.4 units
+
+        // Phase 2: forward — check clear path above the ledge
+        Vector3 fwdTarget = upTarget + moveDir;
         if (raycastWorld(mCollision.getWR(), upTarget, fwdTarget, hit))
             return false;  // wall in the way
 
-        // Phase 3: downward — find ledge surface
+        // Phase 3: downward — find ledge surface (7.0 units down)
         Vector3 downTarget = fwdTarget + Vector3(0.0f, 0.0f, -MANTLE_DOWN_DIST);
         if (!raycastWorld(mCollision.getWR(), fwdTarget, downTarget, hit))
             return false;  // no ledge found
 
-        // Found a mantleable surface — compute target position.
-        // Place body center above the ledge so the FOOT point detector sits on
-        // the surface. FOOT stays at its standing offset during crouch (no crouch
-        // drop for legs), so use FOOT_OFFSET_Z directly.
-        mMantleTarget = hit.point;
-        mMantleTarget.z -= FOOT_OFFSET_Z;  // body center above ledge (FOOT_OFFSET_Z is negative)
+        float ledgeZ = hit.point.z;
+
+        // Phase 4: Find forward surface to determine XY target.
+        // Casts forward from HEAD, then BODY, then FOOT (with fallbacks)
+        // to find the wall face. The target XY is pulled back from the wall by 0.55.
+        // This ensures the player ends up close to (but not inside) the wall.
+        Vector3 fwdHitPoint;
+        bool foundFwdSurface = false;
+
+        // Try HEAD → BODY → FOOT forward ray to find wall surface
+        static constexpr float FWD_SURFACE_OFFSETS[3] = {
+            HEAD_OFFSET_Z, BODY_OFFSET_Z, FOOT_OFFSET_Z
+        };
+        for (int i = 0; i < 3 && !foundFwdSurface; ++i) {
+            Vector3 spherePos = mPosition + Vector3(0.0f, 0.0f, FWD_SURFACE_OFFSETS[i]);
+            Vector3 sphereFwd = spherePos + moveDir;
+            if (raycastWorld(mCollision.getWR(), spherePos, sphereFwd, hit)) {
+                fwdHitPoint = hit.point;
+                foundFwdSurface = true;
+            }
+        }
+
+        // Compute rise target — INTERMEDIATE height for head peek.
+        // Z = ledge.z + (radius * 1.02) - HEAD_POS + 1.0
+        // This places the body center so the head sphere peeks just above the ledge.
+        // Head will be at riseZ + HEAD_OFFSET_Z = ledge.z + 0.424 + 1.8 = ledge.z + 2.224
+        float riseZ = ledgeZ + (SPHERE_RADIUS * 1.02f) - HEAD_OFFSET_Z + 1.0f;
+
+        if (foundFwdSurface) {
+            // Pull back from wall by MANTLE_PULLBACK (0.55) in movement direction
+            mMantleTarget = fwdHitPoint - fwd * MANTLE_PULLBACK;
+            mMantleTarget.z = riseZ;
+        } else {
+            // Fallback: use body XY position as last resort.
+            mMantleTarget = Vector3(mPosition.x, mPosition.y, riseZ);
+        }
+
+        // Validate: can the player fit at the target position?
+        // Checks is_valid at the target, and also at
+        // target + forward + down (standing on the ledge beyond the lip).
+        // We test all 5 submodels (2 spheres + 3 point detectors) against
+        // the cell geometry at the proposed position.
+        Vector3 standingTarget = mMantleTarget;
+        standingTarget.z = ledgeZ - FOOT_OFFSET_Z;  // final standing body center
+        if (!canPlayerFitAt(standingTarget)) {
+            return false;  // can't fit at target — abort mantle
+        }
+
+        // Also check one step forward and below (standing on the ledge surface).
+        // delta = target + movement_dir, delta.z += -PLAYER_FOOT_POS
+        Vector3 beyondTarget = standingTarget + moveDir;
+        beyondTarget.z = ledgeZ - FOOT_OFFSET_Z;
+        if (!canPlayerFitAt(beyondTarget)) {
+            return false;  // can't fit standing on the ledge — abort mantle
+        }
 
         startMantle();
         return true;
@@ -1371,16 +1487,30 @@ private:
     }
 
     /// Update the mantle state machine each fixedStep.
-    /// During mantling, normal movement and gravity are suppressed.
-    /// The position is driven directly by the state machine.
+    /// During mantling, normal movement/gravity/collision are suppressed.
+    /// Position is driven directly by the state machine via exponential
+    /// convergence (similar to a spring system).
+    ///
+    /// Inspired by a spring-connected multi-sphere model where the
+    /// head sphere is driven toward a target location. During states 3-4,
+    /// all submodel offsets are zeroed ("compressed ball") so the player
+    /// fits through tight geometry. We simulate this by:
+    ///   - Rising body center to an intermediate height (state 2)
+    ///   - Jumping body center up by HEAD_OFFSET_Z at the Rise→Forward
+    ///     transition (simulates collapsing all spheres to the head position)
+    ///   - Moving forward at the elevated position (state 3)
+    ///   - Rising the remaining distance to final standing height (state 4)
     inline void updateMantle() {
         if (!mMantling) return;
 
         mMantleTimer += mTimestep.fixedDt;
 
         switch (mMantleState) {
+
         case MantleState::Hold:
-            // Phase 1: hold position, suppress physics
+            // State 1: Freeze position for MANTLE_HOLD_TIME (0.3s).
+            // We zero velocity, intended to be similar to setting target to
+            // (head.xy, body.z) — spring holds position.
             mVelocity = Vector3(0.0f);
             if (mMantleTimer >= MANTLE_HOLD_TIME) {
                 mMantleState = MantleState::Rise;
@@ -1389,23 +1519,47 @@ private:
             break;
 
         case MantleState::Rise:
-            // Phase 2: rise vertically toward target Z via spring-like motion
+            // State 2: Rise body center to intermediate height.
+            // The target Z places the head sphere just above the ledge lip.
+            // We approximate dynamic spring tension: inverted distance-squared
+            // scaling (faster far away, slower near target for smooth deceleration)
+            // with exponential convergence at a matching rate.
             mVelocity = Vector3(0.0f);
             {
-                float targetZ = mMantleTarget.z;
-                float dz = targetZ - mPosition.z;
-                if (std::fabs(dz) < 0.1f) {
-                    // Close enough — snap and advance
-                    mPosition.z = targetZ;
+                float dz = mMantleTarget.z - mPosition.z;
+                float d2 = dz * dz;
+
+                if (d2 < MANTLE_CONVERGE) {
+                    // Converged — snap position and transition to Forward.
+                    mPosition.z = mMantleTarget.z;
+
+                    // "Compress" — simulate collapsing all 5 spheres to the head
+                    // position. Instead of moving the the body center to where the head was,
+                    // zeroing all submodel offsets, we bump the body center up by
+                    // HEAD_OFFSET_Z.
+                    mPosition.z += HEAD_OFFSET_Z;
+
+                    // Compute forward target: current (compressed) position + facing × radius×2.
+                    // The forward direction is recomputed fresh (matching original behavior).
+                    Vector3 fwd(mCosYaw, mSinYaw, 0.0f);
+                    mMantleTarget = mPosition + fwd * MANTLE_FWD_DIST;
+
                     mMantleState = MantleState::Forward;
                     mMantleTimer = 0.0f;
                 } else {
-                    // Move toward target via exponential convergence (rate-independent).
-                    // 4.46/sec converges ~90% in 0.5s — quick enough for the mantle animation.
-                    static constexpr float MANTLE_RISE_RATE = 4.46f;
-                    float blend = 1.0f - std::exp(-MANTLE_RISE_RATE * mTimestep.fixedDt);
+                    // Dynamic convergence rate — approximates the original's
+                    // inverse-distance-squared spring tension scaling.
+                    // Far away (d² > 1): rate decreases → velocity builds naturally.
+                    // Close (d² < 1): rate = base rate → smooth deceleration.
+                    static constexpr float RISE_BASE_RATE = 4.46f;
+                    float rate = (d2 > 1.0f) ? (RISE_BASE_RATE / d2) : RISE_BASE_RATE;
+                    rate = std::max(rate, 2.0f);  // floor to prevent stalling
+
+                    float blend = 1.0f - std::exp(-rate * mTimestep.fixedDt);
                     float step = dz * blend;
-                    float maxStep = 20.0f * mTimestep.fixedDt;  // velocity cap equivalent
+
+                    // Velocity cap (~20 units/sec equivalent)
+                    float maxStep = 20.0f * mTimestep.fixedDt;
                     step = std::max(-maxStep, std::min(maxStep, step));
                     mPosition.z += step;
                 }
@@ -1413,43 +1567,98 @@ private:
             break;
 
         case MantleState::Forward:
-            // Phase 3: move horizontally onto ledge
+            // State 3: "Compressed ball" moves forward onto the ledge (0.4s).
+            // We drive with a fast exponential convergence rate approximating a
+            // target set to body+forward*radius*2, head velocity multiplied by 10×
+            //  each frame, spring tension reduced to 0.012.
             mVelocity = Vector3(0.0f);
             {
                 float dx = mMantleTarget.x - mPosition.x;
                 float dy = mMantleTarget.y - mPosition.y;
-                float hDist = std::sqrt(dx * dx + dy * dy);
-                if (hDist < 0.1f || mMantleTimer >= MANTLE_FWD_TIME) {
+                float hDist2 = dx * dx + dy * dy;
+
+                if (mMantleTimer >= MANTLE_FWD_TIME || hDist2 < MANTLE_CONVERGE) {
+                    // Snap to target XY and transition to FinalRise.
                     mPosition.x = mMantleTarget.x;
                     mPosition.y = mMantleTarget.y;
-                    mMantleState = MantleState::StandUp;
+
+                    // Compute FinalRise target: body + (0, 0, rise2Height).
+                    // target = body + (0, 0, -FOOT_POS - RADIUS - 1.0)
+                    // = body + (0, 0, 3.0 - 1.2 - 1.0) = body + (0, 0, 0.8)
+                    // This brings the compressed ball up so that when the full model
+                    // is restored, the foot sphere sits on the ledge surface.
+                    static constexpr float RISE2_HEIGHT =
+                        -FOOT_OFFSET_Z - SPHERE_RADIUS - 1.0f;  // = 0.8
+                    mMantleTarget = mPosition + Vector3(0.0f, 0.0f, RISE2_HEIGHT);
+
+                    mMantleState = MantleState::FinalRise;
                     mMantleTimer = 0.0f;
                 } else {
-                    float frac = mTimestep.fixedDt / std::max(0.01f, MANTLE_FWD_TIME - mMantleTimer + mTimestep.fixedDt);
-                    mPosition.x += dx * frac;
-                    mPosition.y += dy * frac;
+                    // Fast convergence (emulates 10× velocity multiplier).
+                    // The high rate drives the compressed ball forward quickly.
+                    static constexpr float FWD_RATE = 8.0f;
+                    float blend = 1.0f - std::exp(-FWD_RATE * mTimestep.fixedDt);
+                    mPosition.x += dx * blend;
+                    mPosition.y += dy * blend;
                 }
             }
             break;
 
-        case MantleState::StandUp:
-            // Phase 4: restore normal standing — spring handles the visual transition
+        case MantleState::FinalRise:
+            // State 4: "Compressed ball" rises to final standing height.
+            // velocity scaled by min(50, max(30, 30/d²)) — adaptive
+            // speed that's faster far away and slower near target.
+            // We approximate with exponential convergence at an adaptive rate.
             mVelocity = Vector3(0.0f);
-            mMantleState = MantleState::Complete;
-            mMantleTimer = 0.0f;
+            {
+                float dz = mMantleTarget.z - mPosition.z;
+                float d2 = dz * dz;
+
+                if (d2 < MANTLE_CONVERGE) {
+                    // Converged — snap and find actual floor beneath us.
+                    mPosition.z = mMantleTarget.z;
+
+                    // Raycast down to find floor surface - casts down by FOOT_POS - 1.0
+                    // to locate floor.
+                    Vector3 rayFrom = mPosition;
+                    Vector3 rayTo = mPosition;
+                    rayTo.z += FOOT_OFFSET_Z - 1.0f;  // FOOT_POS - 1.0 below body center
+                    RayHit floorHit;
+                    if (raycastWorld(mCollision.getWR(), rayFrom, rayTo, floorHit)) {
+                        // Place body center so foot is on floor + 0.1 margin
+                        // target.z = floor_hit.z - FOOT_POS + 0.1
+                        mPosition.z = floorHit.point.z - FOOT_OFFSET_Z + 0.1f;
+                    }
+
+                    mMantleState = MantleState::Complete;
+                    mMantleTimer = 0.0f;
+                } else {
+                    // Adaptive convergence rate matching velocity scaling.
+                    // Original: vel *= min(50, max(30, 30/d²))
+                    // We map this to convergence rate: higher rate = faster convergence.
+                    float rate = std::min(12.0f,
+                                 std::max(6.0f, 6.0f / std::max(d2, 0.01f)));
+                    float blend = 1.0f - std::exp(-rate * mTimestep.fixedDt);
+                    float step = dz * blend;
+
+                    // Velocity cap (~30 units/sec equivalent)
+                    float maxStep = 30.0f * mTimestep.fixedDt;
+                    step = std::max(-maxStep, std::min(maxStep, step));
+                    mPosition.z += step;
+                }
+            }
             break;
 
         case MantleState::Complete:
-            // Phase 5: wait for ground contact, then end mantle
-            // Apply gravity so the player settles onto the ledge
-            mVelocity.z -= mGravityMag * mTimestep.fixedDt;
-            if (isOnGround() || mMantleTimer > 1.0f) {
-                // Done mantling — return to normal mode
-                mMantling = false;
-                mMantleState = MantleState::None;
-                mCurrentMode = mWantsCrouch ? PlayerMode::Crouch : PlayerMode::Stand;
-                mVelocity = Vector3(0.0f);
-            }
+            // State 5: Restore normal mode.
+            // The original engine restores all submodel offsets, re-enables
+            // player motion, then tries pushing backward/upward if stuck in terrain.
+            // We end the mantle and let normal collision handle it, so it isn't as instant.
+            // TODO: might need to fix this if it breaks gameplay on complex terrain.
+            mMantling = false;
+            mMantleState = MantleState::None;
+            mCurrentMode = mWantsCrouch ? PlayerMode::Crouch : PlayerMode::Stand;
+            mVelocity = Vector3(0.0f);
             break;
 
         default:
@@ -1622,6 +1831,17 @@ private:
         // begins progressive blend toward stride target. Each new stride
         // interrupts the previous blend naturally via activatePose().
         activatePose(*stride);
+
+        // Fire footstep callback — Phase 3 Audio uses this for surface-appropriate
+        // footstep sounds. Position is at the FOOT point detector (ground contact),
+        // speed is horizontal velocity magnitude, material is the ground texture
+        // index from the last collision pass.
+        if (mFootstepCb) {
+            Vector3 footPos = mPosition + Vector3(0.0f, 0.0f, FOOT_OFFSET_Z);
+            float hSpeed = std::sqrt(mVelocity.x * mVelocity.x +
+                                     mVelocity.y * mVelocity.y);
+            mFootstepCb(footPos, hSpeed, mGroundTextureIdx);
+        }
 
         mStrideIsLeft = !mStrideIsLeft;
         mLastStrideSimTime = mSimTime;
@@ -2052,8 +2272,9 @@ private:
     // Used for compound motions (weapon swing → recovery, mantle phases, etc.)
     std::vector<const MotionPoseData*> mMotionQueue;
 
-    // Ground contact normal from last collision pass
+    // Ground contact normal and texture from last collision pass
     Vector3 mGroundNormal{0.0f, 0.0f, 1.0f};
+    int32_t mGroundTextureIdx = -1;  // texture index of ground surface (for footstep material)
 
     // ── Render interpolation state ──
     // "Fix Your Timestep" interpolation — smooth rendering between fixed physics steps.
@@ -2075,6 +2296,9 @@ private:
     // Pre-allocated scratch buffers for resolveCollisions() — avoids per-step heap allocs
     std::vector<SphereContact> mIterContacts;                // per-iteration contact accumulator
     std::vector<std::pair<Vector3, float>> mPushes;          // de-duplicated push normals
+
+    // ── Callbacks ──
+    FootstepCallback mFootstepCb;  // footstep sound event (Phase 3 Audio stub)
 
     // ── Diagnostic logging state ──
     FILE *mLogFile = nullptr;   // per-timestep CSV log file (null = disabled)
