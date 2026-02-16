@@ -91,11 +91,13 @@ enum class PlayerMode {
 /// State sequence:
 ///   Hold → Rise → Forward → FinalRise → Complete
 ///
-/// The original engine uses a spring-connected multi-sphere model where the
-/// head sphere is driven by a target location with adjustable spring tension.
-/// During the "compressed ball" phases (Forward, FinalRise), all 5 sub-model
-/// offsets are zeroed so the player fits through tight gaps. We approximate
-/// this with direct position manipulation and exponential convergence.
+///
+/// Virtual head position (mMantleHeadPos) driven by the same spring formula used
+/// for head bob (computeSpringVelocity). The camera tracks this virtual head during
+/// mantling, making body position changes invisible. During the "compressed ball"
+/// phases (Forward, FinalRise), all 5 sub-model offsets are zeroed so the player
+/// fits through tight gaps.
+
 enum class MantleState {
     None,       // not mantling
     Hold,       // State 1: freeze position, suppress physics (0.3s)
@@ -192,13 +194,22 @@ public:
 
     // Physics parameters
     static constexpr float GRAVITY        = 32.0f;   // units/sec² (runtime-adjustable)
-    // Slope handling — friction-based.
+    // Slope handling — purely friction-based, matching original Dark Engine.
     // GROUND_NORMAL_MIN: any surface with normal.z above this counts as "ground" for
     // state/landing purposes. The 5-sphere model and movement control handle the rest.
-    // SLIDE_THRESHOLD: below this normal.z, movement control is progressively reduced,
-    // causing the player to slide down steep slopes under gravity.
-    static constexpr float GROUND_NORMAL_MIN = 0.1f;   // cos(~84°) — any upward surface
-    static constexpr float SLIDE_THRESHOLD   = 0.64f;  // cos(~50°) — below this, sliding
+    // There is NO hard walkable slope angle. Friction = 0.03 * normal.z * gravity
+    // naturally decreases on steeper slopes, reducing movement control and allowing
+    // gravity's slope-parallel component to dominate. Sliding is emergent.
+    static constexpr float GROUND_NORMAL_MIN = 0.01f;  // near-zero epsilon, matches original engine's normal.z > 0
+
+    // Jump requires friction > JUMP_MIN_FRICTION. On flat ground friction = 0.96;
+    // the threshold 0.5 corresponds to slopes steeper than ~58° (normal.z < 0.52).
+    static constexpr float JUMP_MIN_FRICTION = 0.5f;
+
+    // Grace period before entering Jump after losing ground contact.
+    // Derived from freefall time to travel 0.1 units (contact break distance):
+    // t = sqrt(2 * 0.1 / 32) ≈ 0.079s.
+    static constexpr float GROUND_GRACE_DURATION = 0.08f;
 
     // Collision iteration count — now set per-preset via PhysicsTimestep.collisionIters.
     // Vintage (12.5Hz): 3 iterations.
@@ -219,25 +230,50 @@ public:
     static constexpr float MANTLE_PULLBACK  = 0.55f;   // pull back from wall (approx half radius)
     static constexpr float MANTLE_CONVERGE  = 0.0001f; // distance² convergence threshold (= 0.01 units)
 
-    // Movement control — exponential convergence impulse system.
-    // Instead of constant acceleration/deceleration,
-    // velocity converges toward the desired value exponentially each step.
+    // Movement control — force/mass-based system with separate ground friction.
     //
-    // The convergence rate alpha = CONTROL_MULTIPLIER * contactFriction * dt / VELOCITY_RATE
-    // where contactFriction = FRICTION_FACTOR * groundNormal.z * gravityMag.
-    // On flat ground: contactFriction = 0.03 * 1.0 * 32.0 = 0.96
-    //   alpha at 60Hz = 11.0 * 0.96 * 0.0167 = 0.176 per step
-    //   alpha at 12.5Hz = 11.0 * 0.96 * 0.08 = 0.845 per step
+    // Accumulates forces and integrates:
+    //   rate = min(CONTROL_MULTIPLIER * PLAYER_MASS * friction / VELOCITY_RATE, MAX_CONTROL_RATE)
+    //   ctrl_accel = (target_vel - current_vel) * rate
+    //   new_vel = vel + ctrl_accel * dt / PLAYER_MASS
     //
-    // This gives exponential approach with time constant tau = 1/(11*0.96) = 0.095s.
+    // For the velocity-controlled player, mass cancels in the derivation:
+    //  alpha = rate * dt / mass = min(11 * friction / vrate, 2000/mass) * dt
+    // This gives exponential convergence with time constant tau = 1/(11*0.96) = 0.095s.
     // Deceleration uses the same formula with desired=0 (no separate decel constant).
-    // Mass cancels in the derivation: rate = 11 * mass * friction / velocity_rate,
-    // then alpha = rate * dt / mass = 11 * friction * dt / velocity_rate.
+    //
+    // Ground friction is computed separately by computeGroundFriction(), which sums
+    // contributions from all ground contacts with per-terrain scaling. This replaces
+    // the inline single-normal calculation used previously.
+    //
+    // On flat ground: friction = 0.03 * 1.0 * 32.0 = 0.96
+    //   rate = 11 * 180 * 0.96 / 1.0 = 1900.8 (below 2000 cap)
+    //   alpha at 60Hz = 1900.8 * 0.0167 / 180 = 0.176 per step
+    //   alpha at 12.5Hz = 1900.8 * 0.08 / 180 = 0.845 per step
     static constexpr float CONTROL_MULTIPLIER = 11.0f;
     static constexpr float FRICTION_FACTOR    = 0.03f;
     static constexpr float VELOCITY_RATE      = 1.0f;
 
-    // Air control fraction.
+    // Player mass — used in force/mass calculations. Mass cancels in the
+    // velocity-control path (rate = 11*mass*friction/vrate, accel = ctrl/mass),
+    // so this only matters for the rate cap and future non-controlled states.
+    static constexpr float PLAYER_MASS = 180.0f;
+
+    // Maximum control rate (units/sec²). Limits control acceleration on
+    // high-friction surfaces.
+    // Flat ground: rate = 11 * 180 * 0.96 / 1.0 = 1900.8 (below cap).
+    static constexpr float MAX_CONTROL_RATE = 2000.0f;  // Caps just above ground rate.
+
+    // Z-axis friction multiplier for separate friction forces.
+    // Extra vertical friction (40%) aids landing deceleration. Applied
+    // in the non-velocity-controlled friction path (future: mantling, ragdoll).
+    static constexpr float Z_FRICTION_MULT = 1.4f;
+
+    // Base friction in water — provides drag even without ground contacts.
+    // Air has base_friction = 0 (no drag), water = 0.3.
+    static constexpr float WATER_BASE_FRICTION = 0.3f;
+
+    // Air control fraction — scales ground-equivalent friction for airborne steering.
     static constexpr float AIR_CONTROL_FRAC = 0.3f;
 
     /// Physics timestep configuration — bundles rate-dependent parameters.
@@ -273,6 +309,28 @@ public:
     static constexpr float HEAD_SPRING_Z_SCALE      = 0.5f;   // Z-axis half-strength
     static constexpr float HEAD_SPRING_VEL_CAP      = 25.0f;  // max spring velocity magnitude
     static constexpr float HEAD_SPRING_MAX_DT       = 0.05f;  // spring dt cap (50ms) — clamps dt for spring calc
+
+    /// Compute spring velocity from the dt-dependent formula.
+    /// Returns new velocity; caller integrates position (pos += vel * dt).
+    /// This separation allows callers to modify velocity before integration
+    /// (e.g., mantle velocity multipliers in states 3/4).
+    static inline Vector3 computeSpringVelocity(
+        const Vector3& pos, const Vector3& oldVel, const Vector3& target,
+        float tension, float damping, float zScale, float velCap, float dt)
+    {
+        float springDt = std::clamp(dt, 0.001f, HEAD_SPRING_MAX_DT);
+        float tensionEff = tension / springDt;
+        float dampingEff = damping + (1.0f - damping) * springDt;
+
+        Vector3 disp = target - pos;
+        Vector3 newVel = disp * tensionEff;
+        newVel.z *= zScale;
+        newVel = newVel + oldVel * dampingEff;
+
+        float mag = glm::length(newVel);
+        if (mag > velCap) newVel *= velCap / mag;
+        return newVel;
+    }
 
     // Eye position above head submodel center.
     // Camera is 0.8 units above the head sphere center for natural eye height.
@@ -701,6 +759,8 @@ public:
             mCellIdx = mCollision.findCell(pos + Vector3(0.0f, 0.0f, SPHERE_RADIUS));
         }
         mCurrentMode = PlayerMode::Jump; // will detect ground on next step
+        mGroundGraceTimer = 0.0f;
+        mGroundGraceActive = false;
 
         // Reset spring state — teleporting should not carry old spring velocity
         // into the new position, which would cause oscillation on arrival.
@@ -745,15 +805,37 @@ private:
         }
 
         // 1. Handle jump request (can jump from any ground mode)
+        // Requires friction > 0.5 to jump — prevents jumping on steep slopes where
+        // the player has no traction (above ~58°).
+        // When friction is between 0.5 and 1.0, jump velocity is scaled down
+        // proportionally, making slope-edge jumps weaker.
         if (mJumpRequested && !mMotionDisabled) {
             if (isOnGround()) {
-                mVelocity.z = JUMP_IMPULSE;
-                mCurrentMode = PlayerMode::Jump;
-                // Reset stride bob — locks motion to POSE_NORMAL during jump mode.
-                // DON'T override an active lean.
-                if (mLeanDir == 0)
-                    activatePose(POSE_NORMAL);
-                mStrideDist = 0.0f;
+                float jumpFriction = computeGroundFriction();
+                if (jumpFriction > JUMP_MIN_FRICTION) {
+                    // Remove vertical velocity component, boost horizontal by 5%,
+                    // add jump impulse upward, then scale the ENTIRE velocity by
+                    // friction when friction <= 1.0. On slopes, both the
+                    // jump height AND horizontal momentum are reduced.
+                    mVelocity.z = 0.0f;
+                    mVelocity.x *= 1.05f;
+                    mVelocity.y *= 1.05f;
+                    mVelocity.z = JUMP_IMPULSE;
+
+                    // Scale entire velocity by friction on slopes
+                    if (jumpFriction <= 1.0f) {
+                        mVelocity *= jumpFriction;
+                    }
+                    mCurrentMode = PlayerMode::Jump;
+                    // Cancel any active ground grace — we're definitely airborne now
+                    mGroundGraceTimer = 0.0f;
+                    mGroundGraceActive = false;
+                    // Reset stride bob — locks motion to POSE_NORMAL during jump mode.
+                    // DON'T override an active lean.
+                    if (mLeanDir == 0)
+                        activatePose(POSE_NORMAL);
+                    mStrideDist = 0.0f;
+                }
             }
         }
         mJumpRequested = false;
@@ -816,9 +898,13 @@ private:
         writeLogRow();
     }
 
-    /// Apply gravity to velocity (if not on ground)
+    /// Apply gravity to velocity (if not on ground, or during grace period).
+    /// During the ground grace period, the player stays in a ground mode for
+    /// movement control (friction, stride bob) but gravity still applies so
+    /// walking off a ledge transitions naturally into a fall. Without this,
+    /// the player would hover for the grace duration before starting to drop.
     inline void applyGravity() {
-        if (!isOnGround()) {
+        if (!isOnGround() || mGroundGraceActive) {
             // Z-up: gravity pulls downward
             mVelocity.z -= mGravityMag * mTimestep.fixedDt;
         }
@@ -870,10 +956,70 @@ private:
         return desired;
     }
 
-    /// Apply movement control — exponential velocity convergence impulse system:
+    /// Compute ground friction from the best ground contact.
     ///
-    ///   contactFriction = FRICTION_FACTOR * groundNormal.z * gravityMag
-    ///   alpha = CONTROL_MULTIPLIER * contactFriction * dt / VELOCITY_RATE
+    /// Uses the most upward-facing contact normal from mLastContacts to compute:
+    ///   friction = FRICTION_FACTOR * terrainScale * bestNormal.z * gravity
+    ///
+    /// Re-detects contacts each frame, so mLastContacts may be empty
+    /// when the player stands stably without penetration. In that case, we fall
+    /// back to mGroundNormal (set by detectGround()'s probe), which persists
+    /// from the previous frame's ground detection.
+    ///
+    /// Sums friction from all upward-facing contacts, matching the original
+    /// engine's PhysGetFriction which iterates all submodel contacts. Multiple
+    /// floor contacts (e.g., BODY + FOOT on the same surface) contribute
+    /// additive friction, which typically pushes the control rate to the 2000
+    /// cap on walkable slopes. This ensures the player has full control
+    /// authority up to about 69° (matching original behavior).
+    ///
+    /// Falls back to WATER_BASE_FRICTION when swimming with no ground contacts.
+    /// Returns 0 in air (no contacts, not swimming).
+    inline float computeGroundFriction() const {
+        // Sum friction from all upward-facing contacts — matches the original
+        // engine's PhysGetFriction which sums across all submodel face/edge/vertex
+        // contacts. Multiple submodels touching the same floor surface contribute
+        // additive friction. This is critical: on a 60° slope, single-contact
+        // friction = 0.48 (below the 0.5 jump gate), but summed friction = ~1.44
+        // (well above), matching the original's behavior where the player can
+        // still jump on 60° slopes.
+        float totalFriction = 0.0f;
+        for (const auto &c : mLastContacts) {
+            if (c.normal.z > 0.0f) {
+                float terrainScale = getTerrainFriction(c.textureIdx);
+                totalFriction += FRICTION_FACTOR * terrainScale * c.normal.z * mGravityMag;
+            }
+        }
+
+        // Fallback: if no upward contacts in mLastContacts but we ARE on ground,
+        // use mGroundNormal from detectGround()'s probe. This handles the common
+        // case where the player stands stably without generating collision contacts
+        // (probe detects ground but doesn't populate mLastContacts).
+        if (totalFriction == 0.0f && isOnGround() && mGroundNormal.z > GROUND_NORMAL_MIN) {
+            totalFriction = FRICTION_FACTOR * mGroundNormal.z * mGravityMag;
+        }
+
+        // Water base friction provides drag when submerged with no ground contacts
+        if (totalFriction == 0.0f && mCurrentMode == PlayerMode::Swim) {
+            totalFriction = WATER_BASE_FRICTION;
+        }
+        return totalFriction;
+    }
+
+    /// Per-terrain friction multiplier (default 1.0).
+    /// Infrastructure for future terrain property lookup from texture index.
+    /// When terrain properties are loaded, this can map textureIdx to the
+    /// per-texture friction scale from the level's property data.
+    inline float getTerrainFriction(int32_t /*textureIdx*/) const {
+        return 1.0f;
+    }
+
+    /// Apply movement — force/mass-based control with separate ground friction.
+    ///
+    /// For velocity-controlled movement (walking/running/crouching):
+    ///   friction = sum of contact friction contributions (computeGroundFriction)
+    ///   rate = min(11 * mass * friction / velocity_rate, 2000)
+    ///   alpha = rate * dt / mass   (mass cancels, giving exponential convergence)
     ///   vel += (desired - vel) * alpha
     ///
     /// This creates exponential approach to desired velocity with tau ~0.095s on
@@ -884,7 +1030,10 @@ private:
         Vector3 desired = computeDesiredVelocity();
         const float dt = mTimestep.fixedDt;
 
-        if (isOnGround()) {
+        // Compute friction from all ground contacts (replaces inline single-normal calc)
+        float friction = computeGroundFriction();
+
+        if (isOnGround() && !mGroundGraceActive) {
             // Project desired velocity onto ground plane so walking on slopes
             // doesn't fight gravity. Always project when on any ground surface.
             if (mGroundNormal.z > GROUND_NORMAL_MIN) {
@@ -892,23 +1041,20 @@ private:
                 desired -= mGroundNormal * dot;
             }
 
-            // Friction-based slope handling:
-            // On steep slopes (normal.z < SLIDE_THRESHOLD), progressively reduce
-            // movement control. This lets the 5-sphere model and gravity naturally
-            // determine what's walkable vs what causes sliding — no hard angle cutoff.
-            if (mGroundNormal.z < SLIDE_THRESHOLD) {
-                float slopeFactor = (mGroundNormal.z - GROUND_NORMAL_MIN)
-                                  / (SLIDE_THRESHOLD - GROUND_NORMAL_MIN);
-                slopeFactor = std::max(0.0f, std::min(1.0f, slopeFactor));
-                desired *= slopeFactor;
-            }
+            // No additional slope friction penalty — the base friction formula
+            // (friction = 0.03 * normal.z * gravity) already provides slope-dependent friction. Steeper
+            // slopes naturally have lower friction_pct (= normal.z), reducing
+            // control authority and allowing gravity to dominate. Sliding is
+            // emergent from this single formula, not from an explicit threshold.
 
-            // Compute convergence rate from ground friction.
-            // contactFriction = FRICTION_FACTOR * groundNormal.z * gravityMag
-            // On flat ground: 0.03 * 1.0 * 32.0 = 0.96
-            float contactFriction = FRICTION_FACTOR * mGroundNormal.z * mGravityMag;
-            float alpha = CONTROL_MULTIPLIER * contactFriction * dt / VELOCITY_RATE;
-            alpha = std::min(alpha, 1.0f);  // cap at 1.0 (instant convergence)
+            // Control rate: rate = min(11 * mass * friction / velocity_rate, 2000)
+            // Alpha = rate * dt / mass — mass cancels, giving exponential convergence.
+            // Friction is SUMMED across all submodel contacts (matching original).
+            // On flat ground with ~3 contacts: friction ≈ 2.88, rate = capped at 2000.
+            float rate = CONTROL_MULTIPLIER * PLAYER_MASS * friction / VELOCITY_RATE;
+            rate = std::min(rate, MAX_CONTROL_RATE);
+            float alpha = rate * dt / PLAYER_MASS;
+            alpha = std::min(alpha, 1.0f);  // safety cap: prevent overshoot at low framerates
 
             // Apply convergence to horizontal velocity.
             // Preserves desired.z for slope projection (SET, not converge, to avoid
@@ -917,22 +1063,58 @@ private:
             Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
             Vector3 hDesired(desired.x, desired.y, 0.0f);
 
-            // Exponential convergence: vel += (desired - vel) * alpha
+            // Force-based convergence: vel += (desired - vel) * alpha
             Vector3 hNew = hVel + (hDesired - hVel) * alpha;
+
+            // Velocity reversal check — if convergence would reverse horizontal
+            // velocity direction when decelerating (desired ~= 0), stop instead.
+            // Prevents oscillation around zero from overshooting.
+            if (glm::length2(hDesired) < 0.001f && glm::dot(hNew, hVel) < 0.0f) {
+                hNew = Vector3(0.0f);
+            }
+
             mVelocity.x = hNew.x;
             mVelocity.y = hNew.y;
 
             // Z component: set from slope projection (not converged)
             mVelocity.z = desired.z != 0.0f ? desired.z : prevZ;
+        } else if (isOnGround()) {
+            // Grace period: ground mode for friction/stride but no slope
+            // projection. The player is slightly above the ground and falling
+            // under gravity (applyGravity applies during grace). Slope
+            // projection would remove horizontal velocity based on a stale
+            // mGroundNormal, causing the player to plummet straight down at
+            // ledge edges instead of arcing naturally.
+            //
+            // Use full ground friction for movement control so the player
+            // doesn't suddenly lose traction during grace.
+            float rate = CONTROL_MULTIPLIER * PLAYER_MASS * friction / VELOCITY_RATE;
+            rate = std::min(rate, MAX_CONTROL_RATE);
+            float alpha = rate * dt / PLAYER_MASS;
+            alpha = std::min(alpha, 1.0f);
+
+            Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
+            Vector3 hDesired(desired.x, desired.y, 0.0f);
+            Vector3 hNew = hVel + (hDesired - hVel) * alpha;
+
+            if (glm::length2(hDesired) < 0.001f && glm::dot(hNew, hVel) < 0.0f) {
+                hNew = Vector3(0.0f);
+            }
+
+            mVelocity.x = hNew.x;
+            mVelocity.y = hNew.y;
+            // Z unchanged — gravity handles it during grace
         } else {
-            // Airborne: should have zero air control (friction=0).
+            // Airborne: limited air control.
+            // In air, contact friction = 0 and base_friction = 0, so we use
+            // flat-ground equivalent friction scaled by AIR_CONTROL_FRAC.
             Vector3 airDesired(desired.x, desired.y, 0.0f);
             Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
 
-            // Use flat-ground friction for air control base rate
-            float airAlpha = CONTROL_MULTIPLIER * (FRICTION_FACTOR * 1.0f * mGravityMag)
-                           * AIR_CONTROL_FRAC * dt / VELOCITY_RATE;
-            airAlpha = std::min(airAlpha, 1.0f);
+            float airFriction = FRICTION_FACTOR * 1.0f * mGravityMag;  // flat-ground equivalent
+            float airRate = CONTROL_MULTIPLIER * PLAYER_MASS * airFriction / VELOCITY_RATE;
+            airRate = std::min(airRate, MAX_CONTROL_RATE);
+            float airAlpha = airRate * AIR_CONTROL_FRAC * dt / PLAYER_MASS;
 
             Vector3 hNew = hVel + (airDesired - hVel) * airAlpha;
             mVelocity.x = hNew.x;
@@ -1190,8 +1372,9 @@ private:
 
     /// Detect ground contact and update movement state.
     /// Any contact with an upward-facing normal (z > GROUND_NORMAL_MIN) counts
-    /// as ground. Movement control on steep slopes is handled separately by
-    /// applyMovement() via SLIDE_THRESHOLD — this only determines ground/air state.
+    /// as ground. Movement control on steep slopes is handled by the friction
+    /// formula (friction = 0.03 * normal.z * gravity) — this only determines
+    /// ground/air state.
     /// Ground probe uses FOOT sphere position for accurate floor detection.
     inline void detectGround() {
         bool onGround = false;
@@ -1212,11 +1395,19 @@ private:
         }
 
         // If no contacts found from collision AND the player is not ascending,
-        // probe slightly below the FOOT point detector to detect ground. This
+        // probe along the last known ground normal to detect ground. This
         // prevents briefly entering Jump mode when walking over small bumps or
         // down slopes where the collision pass didn't generate contacts. The
         // probe only DETECTS ground (updates state), it doesn't move the player
         // — gravity and collision handle the actual positioning.
+        //
+        // The probe direction follows the inverse of the last known ground
+        // normal rather than always probing straight down. On slopes, this
+        // follows the surface, giving the full 0.1-unit probe reach along the
+        // surface normal. A straight-down probe on a 45° slope only reaches
+        // 0.07 effective units along the normal. Falls back to -Z when no
+        // valid ground normal exists (e.g. first frame after level load).
+        //
         // Skip when velocity.z > 0.5 to avoid cancelling a jump (the probe
         // would find the floor just left).
         if (!onGround && mCellIdx >= 0 && mVelocity.z <= 0.5f) {
@@ -1224,23 +1415,37 @@ private:
             float footOffset = FOOT_OFFSET_Z;
             Vector3 footCenter = mPosition + Vector3(0.0f, 0.0f, footOffset);
             Vector3 probeNormal;
-            // Small probe distance — just enough to catch one frame of gravity drop
-            // at 60Hz: 0.5 * g * dt² = 0.5 * 32 * (1/60)² ≈ 0.004 units.
-            // Use 0.1 units for a comfortable margin.
-            // FOOT is a point detector (radius=0), so groundTest uses point-test mode.
+            int32_t probeTextureIdx = -1;
             constexpr float GROUND_PROBE_DIST = 0.1f;
             constexpr float FOOT_RADIUS = SPHERE_RADII[4]; // 0.0 (point detector)
+
+            // Probe along the inverse of the last known ground normal.
+            // On flat ground this is (0,0,-1), identical to the old behavior.
+            Vector3 probeDir = -mGroundNormal;
+            // Safety: if mGroundNormal has been corrupted or is near-horizontal,
+            // fall back to straight down
+            if (mGroundNormal.z < GROUND_NORMAL_MIN) {
+                probeDir = Vector3(0.0f, 0.0f, -1.0f);
+            }
+
             if (mCollision.groundTest(footCenter, FOOT_RADIUS, mCellIdx,
-                                      GROUND_PROBE_DIST, probeNormal)) {
+                                      GROUND_PROBE_DIST, probeDir,
+                                      probeNormal, probeTextureIdx,
+                                      mGroundProbeContacts)) {
                 if (probeNormal.z > GROUND_NORMAL_MIN) {
                     onGround = true;
                     mGroundNormal = probeNormal;
+                    mGroundTextureIdx = probeTextureIdx;
                 }
             }
         }
 
         // Update movement state — mode transitions for ground/air
         if (onGround) {
+            // Reset grace state whenever ground is positively detected
+            mGroundGraceTimer = 0.0f;
+            mGroundGraceActive = false;
+
             if (mCurrentMode == PlayerMode::Jump) {
                 // Landing — zero vertical velocity and optionally activate
                 // landing bump pose. The bump only triggers if the player was
@@ -1269,14 +1474,34 @@ private:
             // are handled by updateModeTransitions)
         } else {
             if (isOnGround()) {
-                // Just walked off an edge — start falling.
-                // Reset stride bob (no stride while airborne), but preserve
-                // lean.
-                mCurrentMode = PlayerMode::Jump;
-                if (mLeanDir == 0)
-                    activatePose(POSE_NORMAL);
-                mStrideDist = 0.0f;
+                // Ground lost while in a ground mode — apply grace period.
+                // This prevents single-frame air transitions on bumps and slopes
+                // where the collision pass and probe both fail momentarily.
+                //
+                // During grace, gravity still applies (see applyGravity) so
+                // walking off a ledge produces natural fall behavior. The grace
+                // only affects mode state — the player stays in Stand/Crouch
+                // for movement friction and stride bob continuity.
+                if (mGroundGraceTimer <= 0.0f) {
+                    // First frame without ground — start the grace timer
+                    mGroundGraceTimer = GROUND_GRACE_DURATION;
+                    mGroundGraceActive = true;
+                } else {
+                    // Grace counting down
+                    mGroundGraceTimer -= mTimestep.fixedDt;
+                    if (mGroundGraceTimer <= 0.0f) {
+                        // Grace expired — transition to Jump
+                        mGroundGraceTimer = 0.0f;
+                        mGroundGraceActive = false;
+                        mCurrentMode = PlayerMode::Jump;
+                        if (mLeanDir == 0)
+                            activatePose(POSE_NORMAL);
+                        mStrideDist = 0.0f;
+                    }
+                    // else: still in grace period, stay in ground mode
+                }
             }
+            // If already in Jump mode, stay in Jump mode
         }
     }
 
@@ -1479,39 +1704,49 @@ private:
     }
 
     /// Begin the mantle animation — 5-state machine.
+    /// Initializes the virtual head at the current HEAD position so the
+    /// camera sees no discontinuity when mantling begins.
     inline void startMantle() {
         mMantling = true;
         mMantleState = MantleState::Hold;
         mMantleTimer = 0.0f;
-        mMantleStartPos = mPosition;
+        mMantleCompressed = false;
+        // Virtual head starts at current head position
+        mMantleHeadPos = mPosition + Vector3(0.0f, 0.0f, HEAD_OFFSET_Z);
+        mMantleHeadVel = Vector3(0.0f);
     }
 
     /// Update the mantle state machine each fixedStep.
     /// During mantling, normal movement/gravity/collision are suppressed.
-    /// Position is driven directly by the state machine via exponential
-    /// convergence (similar to a spring system).
+    /// A virtual head position (mMantleHeadPos) is driven by the spring
+    /// formula. The camera tracks this head, so body teleports at state
+    /// transitions are invisible to the player.
     ///
-    /// Inspired by a spring-connected multi-sphere model where the
-    /// head sphere is driven toward a target location. During states 3-4,
-    /// all submodel offsets are zeroed ("compressed ball") so the player
-    /// fits through tight geometry. We simulate this by:
-    ///   - Rising body center to an intermediate height (state 2)
-    ///   - Jumping body center up by HEAD_OFFSET_Z at the Rise→Forward
-    ///     transition (simulates collapsing all spheres to the head position)
-    ///   - Moving forward at the elevated position (state 3)
-    ///   - Rising the remaining distance to final standing height (state 4)
+    /// Uses computeSpringVelocity() with per-state tension and velocity
+    /// multipliers to replicate the original engine's spring-driven HEAD
+    /// submodel behavior during mantling.
     inline void updateMantle() {
         if (!mMantling) return;
 
-        mMantleTimer += mTimestep.fixedDt;
+        const float dt = mTimestep.fixedDt;
+        mMantleTimer += dt;
 
         switch (mMantleState) {
 
         case MantleState::Hold:
             // State 1: Freeze position for MANTLE_HOLD_TIME (0.3s).
-            // We zero velocity, intended to be similar to setting target to
-            // (head.xy, body.z) — spring holds position.
+            // Spring holds head in place — target = current head position.
+            // Body velocity zeroed.
             mVelocity = Vector3(0.0f);
+            {
+                // Spring holds head at current position (target = self)
+                Vector3 holdTarget = mMantleHeadPos;
+                mMantleHeadVel = computeSpringVelocity(
+                    mMantleHeadPos, mMantleHeadVel, holdTarget,
+                    HEAD_SPRING_BASE_TENSION, HEAD_SPRING_BASE_DAMPING,
+                    HEAD_SPRING_Z_SCALE, HEAD_SPRING_VEL_CAP, dt);
+                mMantleHeadPos += mMantleHeadVel * dt;
+            }
             if (mMantleTimer >= MANTLE_HOLD_TIME) {
                 mMantleState = MantleState::Rise;
                 mMantleTimer = 0.0f;
@@ -1519,143 +1754,180 @@ private:
             break;
 
         case MantleState::Rise:
-            // State 2: Rise body center to intermediate height.
-            // The target Z places the head sphere just above the ledge lip.
-            // We approximate dynamic spring tension: inverted distance-squared
-            // scaling (faster far away, slower near target for smooth deceleration)
-            // with exponential convergence at a matching rate.
+            // State 2: Spring drives head toward rise target with adaptive tension.
+            // Head target = (mantleTarget.xy, riseZ + HEAD_OFFSET_Z) — head is
+            // HEAD_OFFSET_Z above the body center target.
+            // Tension modulated by inverse-distance-squared (faster far, slower near).
             mVelocity = Vector3(0.0f);
             {
-                float dz = mMantleTarget.z - mPosition.z;
-                float d2 = dz * dz;
+                // Head target: body center target + head offset
+                Vector3 headTarget(mMantleTarget.x, mMantleTarget.y,
+                                   mMantleTarget.z + HEAD_OFFSET_Z);
 
-                if (d2 < MANTLE_CONVERGE) {
-                    // Converged — snap position and transition to Forward.
-                    mPosition.z = mMantleTarget.z;
+                // Adaptive tension: inverse-distance-squared modulation
+                // Far away (d² > 1): tension decreases → natural acceleration
+                // Close (d² < 1): tension = full base → smooth approach
+                Vector3 diff = headTarget - mMantleHeadPos;
+                float d2 = glm::dot(diff, diff);
+                float tensionScale = (d2 > 1.0f) ? std::min(1.0f, 1.0f / d2) : 1.0f;
+                float tension = tensionScale * HEAD_SPRING_BASE_TENSION;
 
-                    // "Compress" — simulate collapsing all 5 spheres to the head
-                    // position. Instead of moving the the body center to where the head was,
-                    // zeroing all submodel offsets, we bump the body center up by
-                    // HEAD_OFFSET_Z.
-                    mPosition.z += HEAD_OFFSET_Z;
+                mMantleHeadVel = computeSpringVelocity(
+                    mMantleHeadPos, mMantleHeadVel, headTarget,
+                    tension, HEAD_SPRING_BASE_DAMPING,
+                    HEAD_SPRING_Z_SCALE, HEAD_SPRING_VEL_CAP, dt);
+                mMantleHeadPos += mMantleHeadVel * dt;
 
-                    // Compute forward target: current (compressed) position + facing × radius×2.
-                    // The forward direction is recomputed fresh (matching original behavior).
+                // Check convergence — head reached rise target
+                Vector3 remain = headTarget - mMantleHeadPos;
+                if (glm::dot(remain, remain) < MANTLE_CONVERGE) {
+                    // Rise→Forward transition: "compress" the player model.
+                    // Body teleports to head position (invisible to camera since
+                    // camera tracks mMantleHeadPos, not mPosition).
+                    mMantleHeadPos = headTarget;  // snap head exactly
+                    mPosition = mMantleHeadPos;   // body catches up to head
+                    mMantleCompressed = true;
+
+                    // Compute forward target: current position + facing × fwd distance.
+                    // In compressed state, head = body (no offset).
                     Vector3 fwd(mCosYaw, mSinYaw, 0.0f);
                     mMantleTarget = mPosition + fwd * MANTLE_FWD_DIST;
 
+                    // Reset spring velocity for fresh forward movement
+                    mMantleHeadVel = Vector3(0.0f);
+
                     mMantleState = MantleState::Forward;
                     mMantleTimer = 0.0f;
-                } else {
-                    // Dynamic convergence rate — approximates the original's
-                    // inverse-distance-squared spring tension scaling.
-                    // Far away (d² > 1): rate decreases → velocity builds naturally.
-                    // Close (d² < 1): rate = base rate → smooth deceleration.
-                    static constexpr float RISE_BASE_RATE = 4.46f;
-                    float rate = (d2 > 1.0f) ? (RISE_BASE_RATE / d2) : RISE_BASE_RATE;
-                    rate = std::max(rate, 2.0f);  // floor to prevent stalling
-
-                    float blend = 1.0f - std::exp(-rate * mTimestep.fixedDt);
-                    float step = dz * blend;
-
-                    // Velocity cap (~20 units/sec equivalent)
-                    float maxStep = 20.0f * mTimestep.fixedDt;
-                    step = std::max(-maxStep, std::min(maxStep, step));
-                    mPosition.z += step;
                 }
             }
             break;
 
         case MantleState::Forward:
             // State 3: "Compressed ball" moves forward onto the ledge (0.4s).
-            // We drive with a fast exponential convergence rate approximating a
-            // target set to body+forward*radius*2, head velocity multiplied by 10×
-            //  each frame, spring tension reduced to 0.012.
+            // Spring with reduced tension (0.012) + 10× velocity multiplier.
+            // Head = body during compressed state (no offset).
             mVelocity = Vector3(0.0f);
             {
-                float dx = mMantleTarget.x - mPosition.x;
-                float dy = mMantleTarget.y - mPosition.y;
+                // Forward target — only XY matters, Z stays at current
+                Vector3 fwdTarget = mMantleTarget;
+                fwdTarget.z = mMantleHeadPos.z;  // hold Z constant
+
+                // Reduced tension for forward phase (0.02 × base = 0.012)
+                static constexpr float FWD_TENSION_SCALE = 0.02f;
+                float tension = FWD_TENSION_SCALE * HEAD_SPRING_BASE_TENSION;
+
+                mMantleHeadVel = computeSpringVelocity(
+                    mMantleHeadPos, mMantleHeadVel, fwdTarget,
+                    tension, HEAD_SPRING_BASE_DAMPING,
+                    HEAD_SPRING_Z_SCALE, HEAD_SPRING_VEL_CAP, dt);
+
+                // 10× velocity multiplier applied AFTER spring cap
+                mMantleHeadVel *= 10.0f;
+                mMantleHeadPos += mMantleHeadVel * dt;
+
+                // Track body with head during compressed state
+                mPosition = mMantleHeadPos;
+
+                // Check convergence or timeout
+                float dx = mMantleTarget.x - mMantleHeadPos.x;
+                float dy = mMantleTarget.y - mMantleHeadPos.y;
                 float hDist2 = dx * dx + dy * dy;
 
                 if (mMantleTimer >= MANTLE_FWD_TIME || hDist2 < MANTLE_CONVERGE) {
-                    // Snap to target XY and transition to FinalRise.
+                    // Forward→FinalRise transition.
+                    // Snap body to forward target XY
                     mPosition.x = mMantleTarget.x;
                     mPosition.y = mMantleTarget.y;
+                    mMantleHeadPos.x = mPosition.x;
+                    mMantleHeadPos.y = mPosition.y;
 
-                    // Compute FinalRise target: body + (0, 0, rise2Height).
-                    // target = body + (0, 0, -FOOT_POS - RADIUS - 1.0)
-                    // = body + (0, 0, 3.0 - 1.2 - 1.0) = body + (0, 0, 0.8)
-                    // This brings the compressed ball up so that when the full model
-                    // is restored, the foot sphere sits on the ledge surface.
+                    // Restore head offset — camera jumps +1.8 (same as original
+                    // engine's 3→4 transition where HEAD offset is restored).
+                    mMantleHeadPos.z += HEAD_OFFSET_Z;
+
+                    // FinalRise body target: body rises 0.8 units
+                    // (-FOOT_OFFSET_Z - SPHERE_RADIUS - 1.0 = 3.0 - 1.2 - 1.0 = 0.8)
                     static constexpr float RISE2_HEIGHT =
                         -FOOT_OFFSET_Z - SPHERE_RADIUS - 1.0f;  // = 0.8
                     mMantleTarget = mPosition + Vector3(0.0f, 0.0f, RISE2_HEIGHT);
 
+                    // Reset spring velocity for fresh rise
+                    mMantleHeadVel = Vector3(0.0f);
+
                     mMantleState = MantleState::FinalRise;
                     mMantleTimer = 0.0f;
-                } else {
-                    // Fast convergence (emulates 10× velocity multiplier).
-                    // The high rate drives the compressed ball forward quickly.
-                    static constexpr float FWD_RATE = 8.0f;
-                    float blend = 1.0f - std::exp(-FWD_RATE * mTimestep.fixedDt);
-                    mPosition.x += dx * blend;
-                    mPosition.y += dy * blend;
                 }
             }
             break;
 
         case MantleState::FinalRise:
-            // State 4: "Compressed ball" rises to final standing height.
-            // velocity scaled by min(50, max(30, 30/d²)) — adaptive
-            // speed that's faster far away and slower near target.
-            // We approximate with exponential convergence at an adaptive rate.
+            // State 4: Spring drives head up to final standing height.
+            // Same reduced tension as Forward + adaptive velocity multiplier
+            // min(50, max(30, 30/d²)) applied AFTER spring cap.
             mVelocity = Vector3(0.0f);
             {
-                float dz = mMantleTarget.z - mPosition.z;
-                float d2 = dz * dz;
+                // Head target = body target + HEAD_OFFSET_Z
+                Vector3 headTarget = mMantleTarget + Vector3(0.0f, 0.0f, HEAD_OFFSET_Z);
 
-                if (d2 < MANTLE_CONVERGE) {
-                    // Converged — snap and find actual floor beneath us.
-                    mPosition.z = mMantleTarget.z;
+                // Same reduced tension as Forward phase
+                static constexpr float RISE2_TENSION_SCALE = 0.02f;
+                float tension = RISE2_TENSION_SCALE * HEAD_SPRING_BASE_TENSION;
 
-                    // Raycast down to find floor surface - casts down by FOOT_POS - 1.0
-                    // to locate floor.
+                mMantleHeadVel = computeSpringVelocity(
+                    mMantleHeadPos, mMantleHeadVel, headTarget,
+                    tension, HEAD_SPRING_BASE_DAMPING,
+                    HEAD_SPRING_Z_SCALE, HEAD_SPRING_VEL_CAP, dt);
+
+                // Adaptive velocity multiplier: min(50, max(30, 30/d²))
+                // Applied AFTER spring cap (matching original order)
+                Vector3 remain = headTarget - mMantleHeadPos;
+                float d2 = glm::dot(remain, remain);
+                float velMult = std::min(50.0f, std::max(30.0f, 30.0f / std::max(d2, 0.01f)));
+                mMantleHeadVel *= velMult;
+
+                mMantleHeadPos += mMantleHeadVel * dt;
+
+                // Body tracks head minus offset during FinalRise
+                mPosition.x = mMantleHeadPos.x;
+                mPosition.y = mMantleHeadPos.y;
+                mPosition.z = mMantleHeadPos.z - HEAD_OFFSET_Z;
+
+                // Check convergence
+                remain = headTarget - mMantleHeadPos;
+                if (glm::dot(remain, remain) < MANTLE_CONVERGE) {
+                    // Snap to target
+                    mPosition = mMantleTarget;
+                    mMantleHeadPos = headTarget;
+
+                    // Raycast down to find actual floor surface
                     Vector3 rayFrom = mPosition;
                     Vector3 rayTo = mPosition;
-                    rayTo.z += FOOT_OFFSET_Z - 1.0f;  // FOOT_POS - 1.0 below body center
+                    rayTo.z += FOOT_OFFSET_Z - 1.0f;  // scan below feet
                     RayHit floorHit;
                     if (raycastWorld(mCollision.getWR(), rayFrom, rayTo, floorHit)) {
                         // Place body center so foot is on floor + 0.1 margin
-                        // target.z = floor_hit.z - FOOT_POS + 0.1
                         mPosition.z = floorHit.point.z - FOOT_OFFSET_Z + 0.1f;
                     }
 
+                    // Seed the normal head spring to bridge the camera transition.
+                    // mSpringPos.z compensates so the normal eye formula produces the
+                    // same eye height that the mantle head was at. The spring then
+                    // naturally decays to 0, creating a smooth transition back to
+                    // normal camera behavior.
+                    mSpringPos.z = mMantleHeadPos.z - (mPosition.z + HEAD_OFFSET_Z);
+
                     mMantleState = MantleState::Complete;
                     mMantleTimer = 0.0f;
-                } else {
-                    // Adaptive convergence rate matching velocity scaling.
-                    // Original: vel *= min(50, max(30, 30/d²))
-                    // We map this to convergence rate: higher rate = faster convergence.
-                    float rate = std::min(12.0f,
-                                 std::max(6.0f, 6.0f / std::max(d2, 0.01f)));
-                    float blend = 1.0f - std::exp(-rate * mTimestep.fixedDt);
-                    float step = dz * blend;
-
-                    // Velocity cap (~30 units/sec equivalent)
-                    float maxStep = 30.0f * mTimestep.fixedDt;
-                    step = std::max(-maxStep, std::min(maxStep, step));
-                    mPosition.z += step;
                 }
             }
             break;
 
         case MantleState::Complete:
             // State 5: Restore normal mode.
-            // The original engine restores all submodel offsets, re-enables
-            // player motion, then tries pushing backward/upward if stuck in terrain.
-            // We end the mantle and let normal collision handle it, so it isn't as instant.
-            // TODO: might need to fix this if it breaks gameplay on complex terrain.
+            // We end the mantle and let normal collision handle any remaining
+            // penetration on the next physics step.
             mMantling = false;
+            mMantleCompressed = false;
             mMantleState = MantleState::None;
             mCurrentMode = mWantsCrouch ? PlayerMode::Crouch : PlayerMode::Stand;
             mVelocity = Vector3(0.0f);
@@ -1663,6 +1935,7 @@ private:
 
         default:
             mMantling = false;
+            mMantleCompressed = false;
             mMantleState = MantleState::None;
             break;
         }
@@ -2057,6 +2330,13 @@ private:
     /// (in player-local coords rotated by yaw) + collision-limited lean.
     /// Called by getEyePosition() for interpolation and by step() to snapshot state.
     inline Vector3 computeRawEyePos() const {
+        // During mantling, camera tracks the spring-driven virtual head.
+        // mMantleHeadPos is driven by the mantle spring each step — the camera
+        // sees smooth motion while the body may teleport at state transitions.
+        if (mMantling) {
+            return mMantleHeadPos + Vector3(0.0f, 0.0f, EYE_ABOVE_HEAD);
+        }
+
         // Head Z offset — always HEAD_OFFSET_Z. During crouch, the motion pose system
         // (POSE_CROUCH vert=-2.02) drives mSpringPos.z down, lowering the eye naturally.
         // No body center shift or offset scaling needed.
@@ -2167,35 +2447,15 @@ private:
         const float dt = mTimestep.fixedDt;
         Vector3 target = mPoseCurrent;
 
-        // Clamps the spring dt to 50ms max. This affects tension/damping
-        // calculation but NOT position integration (which uses full dt).
-        const float springDt = std::min(dt, HEAD_SPRING_MAX_DT);
+        // Compute spring velocity using the shared helper.
+        // Uses the standard head spring parameters (tension=0.6, damping=0.02,
+        // Z-scale=0.5, cap=25.0). The helper handles dt clamping internally.
+        mSpringVel = computeSpringVelocity(
+            mSpringPos, mSpringVel, target,
+            HEAD_SPRING_BASE_TENSION, HEAD_SPRING_BASE_DAMPING,
+            HEAD_SPRING_Z_SCALE, HEAD_SPRING_VEL_CAP, dt);
 
-        // Compute dt-dependent spring parameters with clamped dt
-        float tensionEff = HEAD_SPRING_BASE_TENSION / springDt;
-        float dampingEff = HEAD_SPRING_BASE_DAMPING
-                         + (1.0f - HEAD_SPRING_BASE_DAMPING) * springDt;
-
-        // Displacement from target → spring velocity (target-seeking term)
-        Vector3 disp = target - mSpringPos;
-        Vector3 newVel = disp * tensionEff;
-
-        // Z-axis half-strength — makes vertical spring slower/overdamped.
-        // This is what creates the dominant vertical head bob: the Z spring
-        // is always in transit during walking because it approaches so slowly.
-        newVel.z *= HEAD_SPRING_Z_SCALE;
-
-        // Blend with previous velocity (damping_eff < 1 = mostly new, little old)
-        // At 12.5Hz with clamping: dampingEff=0.069, so 93% new + 7% old
-        mSpringVel = newVel + mSpringVel * dampingEff;
-
-        // Velocity cap — 25.0
-        float velMag = glm::length(mSpringVel);
-        if (velMag > HEAD_SPRING_VEL_CAP) {
-            mSpringVel *= HEAD_SPRING_VEL_CAP / velMag;
-        }
-
-        // Integrate position
+        // Integrate position (uses full dt, not clamped spring dt)
         mSpringPos += mSpringVel * dt;
 
         // Clamp to sane range — prevents spring runaway on large target jumps.
@@ -2228,7 +2488,13 @@ private:
     MantleState mMantleState = MantleState::None;  // current mantle phase
     float mMantleTimer   = 0.0f;   // time in current mantle phase
     Vector3 mMantleTarget{0.0f};   // target position for mantle completion
-    Vector3 mMantleStartPos{0.0f}; // position at mantle start
+
+    // ── Mantle spring state ──
+    // Virtual head position driven by the spring during mantling.
+    // Camera tracks this instead of mPosition + HEAD_OFFSET_Z.
+    Vector3 mMantleHeadPos{0.0f};      // spring-driven virtual head position
+    Vector3 mMantleHeadVel{0.0f};      // virtual head velocity (spring state)
+    bool    mMantleCompressed = false;  // true during Forward/FinalRise (offsets zeroed)
 
     float mGravityMag = GRAVITY;  // current gravity magnitude
     float mTimeAccum  = 0.0f;     // fixed-timestep accumulator
@@ -2275,6 +2541,14 @@ private:
     // Ground contact normal and texture from last collision pass
     Vector3 mGroundNormal{0.0f, 0.0f, 1.0f};
     int32_t mGroundTextureIdx = -1;  // texture index of ground surface (for footstep material)
+
+    // Ground grace period state — prevents instant Jump transitions on bumps
+    // and slopes where collision + probe both fail momentarily.
+    float mGroundGraceTimer = 0.0f;     // countdown timer (seconds)
+    bool  mGroundGraceActive = false;   // true during the grace window
+
+    // Scratch buffer for groundTest() probe — avoids per-step heap allocation
+    std::vector<SphereContact> mGroundProbeContacts;
 
     // ── Render interpolation state ──
     // "Fix Your Timestep" interpolation — smooth rendering between fixed physics steps.
