@@ -1488,6 +1488,16 @@ int main(int argc, char *argv[]) {
     // ── Load object assets: properties, .bin models, textures from obj.crf ──
     loadObjectAssets(misPath, resPath, cfg, mission, state);
 
+    // ── Build object collision bodies from .bin bounding boxes ──
+    // Creates OBB/sphere collision bodies for placed objects (crates, furniture,
+    // doors) so the player can't walk through them. Uses P$PhysType properties
+    // to determine shape type and P$PhysDims for optional dimension overrides.
+    if (state.physics && !mission.objData.objects.empty()) {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        state.physics->buildObjectCollision(
+            mission.objData.objects, mission.parsedModels, propSvc.get());
+    }
+
     // ── SDL2 + bgfx init ──
     Darkness::GPUResources gpu;
     Darkness::BuiltMeshes meshes;
