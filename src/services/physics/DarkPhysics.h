@@ -47,6 +47,7 @@
 
 #include "IPhysicsWorld.h"
 #include "CollisionGeometry.h"
+#include "ObjectCollisionGeometry.h"
 #include "PlayerPhysics.h"
 #include "RayCaster.h"
 
@@ -275,6 +276,58 @@ public:
         mGravity = Vector3(0.0f, 0.0f, -mPlayer.getGravityMagnitude());
     }
 
+    // ── Object collision (Task 26) ──
+
+    /// Build collision bodies for placed world objects (crates, furniture, doors).
+    /// Called once during level load after object assets are parsed.
+    /// Creates an ObjectCollisionWorld from .bin bounding boxes and P$PhysType
+    /// properties, then wires the collision callback into PlayerPhysics.
+    ///
+    /// ODE UPGRADE: When ODE rigid bodies are added, this method would also
+    /// create dGeomIDs for each static object (dCreateBox/dCreateSphere) in
+    /// the dSpaceID, and dynamic objects would additionally get dBodyIDs with
+    /// dMassSetBox/dMassSetSphere. The custom player collision callback would
+    /// remain (proven correct), while ODE dNearCallback handles object-vs-object.
+    void buildObjectCollision(
+        const std::vector<ObjectPlacement> &objects,
+        const std::unordered_map<std::string, ParsedBinMesh> &models,
+        PropertyService *propSvc)
+    {
+        mObjectCollision = std::make_unique<ObjectCollisionWorld>();
+        mObjectCollision->build(objects, models, propSvc, mCollision.getWR());
+
+        size_t bodyCount = mObjectCollision->bodyCount();
+        if (bodyCount == 0) {
+            std::fprintf(stderr, "Physics: no object collision bodies created\n");
+            return;
+        }
+
+        std::fprintf(stderr, "Physics: %zu object collision bodies created (%zu cells)\n",
+                     bodyCount, mObjectCollision->cellCount());
+
+        // Wire the object collision callback into PlayerPhysics.
+        // The callback captures mObjectCollision by raw pointer (safe because
+        // DarkPhysics owns both the ObjectCollisionWorld and the PlayerPhysics,
+        // and their lifetimes are identical).
+        //
+        // ODE UPGRADE: This callback wiring would remain for player-vs-static-object
+        // collision. For dynamic objects, ODE dNearCallback would handle them
+        // separately, with the player registered as a kinematic dGeomID.
+        ObjectCollisionWorld *ocw = mObjectCollision.get();
+        mPlayer.setObjectCollisionCallback(
+            [ocw](const Vector3 *centers, const float *radii,
+                  int numSpheres, int32_t playerCell,
+                  std::vector<SphereContact> &outContacts) {
+                ocw->testPlayerSpheres(centers, radii, numSpheres,
+                                       playerCell, outContacts);
+            });
+    }
+
+    /// Number of active object collision bodies (for diagnostics).
+    size_t objectCollisionBodyCount() const {
+        return mObjectCollision ? mObjectCollision->bodyCount() : 0;
+    }
+
     // ── Direct access for renderer integration ──
 
     /// Get the physics update rate in Hz (convenience delegate to PlayerPhysics).
@@ -289,6 +342,14 @@ public:
 
 private:
     CollisionGeometry mCollision;    // world collision geometry from WR cells
+
+    // Object collision world — built from .bin bounding boxes and P$PhysType.
+    // Owns all ObjectCollisionBody data and the cell→object broadphase map.
+    // Declared before mPlayer so it outlives the player's callback capture.
+    // ODE UPGRADE: Would coexist with dSpaceID — static objects remain as
+    // ObjectCollisionBodies for player collision, dynamic objects get dGeomIDs.
+    std::unique_ptr<ObjectCollisionWorld> mObjectCollision;
+
     PlayerPhysics mPlayer;           // custom player movement simulation
 
     Vector3 mGravity;                // world gravity vector

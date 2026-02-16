@@ -836,6 +836,30 @@ public:
     /// Phase 3 Audio will use this to play surface-appropriate footstep sounds.
     void setFootstepCallback(FootstepCallback cb) { mFootstepCb = std::move(cb); }
 
+    /// Callback for object collision testing. Called per physics step during
+    /// resolveCollisions(), after WR polygon tests but before push de-duplication.
+    /// Receives the 5 submodel sphere centers and radii, the player's current
+    /// portal cell, and an output vector to append SphereContact results into.
+    ///
+    /// Object contacts use cellIdx = -1 as sentinel (distinguishing them from WR
+    /// contacts), and polyIdx encodes (bodyIndex << 4) | (faceIdx & 0xF).
+    ///
+    /// ODE UPGRADE: When ODE rigid bodies are added, this callback pattern would
+    /// be replaced by registering the player as a kinematic dGeomID and using
+    /// dNearCallback to generate contacts between player and object geoms.
+    using ObjectCollisionCallback = std::function<void(
+        const Vector3 *sphereCenters,
+        const float *sphereRadii,
+        int numSpheres,
+        int32_t playerCell,
+        std::vector<SphereContact> &outContacts)>;
+
+    /// Register a callback for player-vs-object collision. Set by DarkPhysics
+    /// to bridge PlayerPhysics with ObjectCollisionWorld.
+    void setObjectCollisionCallback(ObjectCollisionCallback cb) {
+        mObjectCollisionCb = std::move(cb);
+    }
+
 private:
     // ── Internal simulation steps ──
 
@@ -1400,6 +1424,27 @@ private:
                 }
             }
 
+            // ── Object collision pass ──
+            // After testing WR cell polygons for all 5 submodels, test against
+            // placed object collision bodies (crates, furniture, doors, etc.).
+            // The callback is set by DarkPhysics to invoke ObjectCollisionWorld's
+            // testPlayerSpheres(), which appends SphereContact results (with
+            // cellIdx=-1 sentinel) into mIterContacts alongside the WR contacts.
+            if (mObjectCollisionCb) {
+                // Build sphere center array from current body position + offsets
+                // (same computation as the per-sphere loop above)
+                Vector3 sphereCenters[NUM_SPHERES];
+                for (int s = 0; s < NUM_SPHERES; ++s) {
+                    float poseOffsetZ = 0.0f;
+                    if (s == 0) poseOffsetZ = mPoseCurrent.z;
+                    else if (s == 1) poseOffsetZ = mBodyPoseCurrent.z;
+                    float offsetZ = mSphereOffsetsBase[s] + poseOffsetZ;
+                    sphereCenters[s] = mPosition + Vector3(0.0f, 0.0f, offsetZ);
+                }
+                mObjectCollisionCb(sphereCenters, mSphereRadii,
+                                   NUM_SPHERES, mCellIdx, mIterContacts);
+            }
+
             if (mIterContacts.empty())
                 break; // No contacts — done
 
@@ -1506,6 +1551,27 @@ private:
                 SphereContact pc = nc;
                 pc.age = 0;
                 mPersistentContacts.push_back(pc);
+
+                // ── Damped bounce impulse on first contact with object OBBs ──
+                // The original engine applies a small elastic bounce (0.02 scale)
+                // when the player first collides with an object. This makes the
+                // response feel slightly elastic rather than perfectly rigid, but
+                // the 0.02 factor is nearly imperceptible — the player barely
+                // bounces off crates/furniture. WR polygon contacts (cellIdx >= 0)
+                // are constraint-only with no bounce (walls feel perfectly rigid).
+                //
+                // ODE UPGRADE: This impulse would be replaced by ODE contact joint
+                // surface parameters (dContact.surface.bounce = 0.02,
+                // dContact.surface.bounce_vel = kBreakObjectContactVel).
+                if (nc.cellIdx == -1) {
+                    float dp = glm::dot(mVelocity, nc.normal);
+                    if (dp < 0.0f) {
+                        // Remove normal component (dp < 0 = into surface) and
+                        // reflect 2% back out. Factor = 1.0 (zero) + 0.02 (bounce).
+                        constexpr float kBounceScale = 0.02f;  // matches kOBBBounceScale
+                        mVelocity -= nc.normal * dp * (1.0f + kBounceScale);
+                    }
+                }
             }
         }
 
@@ -2790,7 +2856,8 @@ private:
     std::vector<std::pair<Vector3, float>> mPushes;          // de-duplicated push normals
 
     // ── Callbacks ──
-    FootstepCallback mFootstepCb;  // footstep sound event (Phase 3 Audio stub)
+    FootstepCallback mFootstepCb;            // footstep sound event (Phase 3 Audio stub)
+    ObjectCollisionCallback mObjectCollisionCb;  // player-vs-object collision (Task 26)
 
     // ── Diagnostic logging state ──
     FILE *mLogFile = nullptr;   // per-timestep CSV log file (null = disabled)
