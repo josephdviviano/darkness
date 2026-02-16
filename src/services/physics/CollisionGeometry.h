@@ -305,21 +305,28 @@ public:
         }
     }
 
-    /// Quick ground test — test a slightly lowered sphere to check if
-    /// there's a walkable surface below.
+    /// Quick ground test — probe along a given direction to check for
+    /// a walkable surface nearby.
     ///
-    /// Drops the sphere center by maxDrop and checks for contacts
-    /// with floor-like normals (normal.z > 0, pointing upward).
-    /// Returns the upward-most normal found.
+    /// The probe direction should be a unit vector pointing "into" the
+    /// expected ground surface. For flat ground this is (0,0,-1); for
+    /// slopes it follows the last known ground normal's inverse.
+    /// Ground probes follow the contact normal direction rather than
+    /// always going straight down, improving reliability on steep slopes.
+    ///
+    /// Returns the most upward-facing contact normal and its texture
+    /// index. scratchContacts is a caller-provided buffer (cleared
+    /// internally) to avoid per-call heap allocation on the hot path.
     inline bool groundTest(const Vector3 &center, float radius, int32_t cellIdx,
-                           float maxDrop, Vector3 &outNormal) const
+                           float maxDrop, const Vector3 &probeDir,
+                           Vector3 &outNormal, int32_t &outTextureIdx,
+                           std::vector<SphereContact> &scratchContacts) const
     {
         if (cellIdx < 0 || cellIdx >= static_cast<int32_t>(mWR.numCells))
             return false;
 
-        // Test at slightly lowered position
-        Vector3 testPos = center;
-        testPos.z -= maxDrop;
+        // Probe position: move center along probeDir by maxDrop
+        Vector3 testPos = center + probeDir * maxDrop;
 
         // Find the cell at the test position (may differ from current cell
         // if we're near a ledge or stairway)
@@ -327,10 +334,10 @@ public:
         if (testCell < 0)
             testCell = cellIdx; // fallback to current cell
 
-        std::vector<SphereContact> contacts;
-        sphereVsCellPolygons(testPos, radius, testCell, contacts);
+        scratchContacts.clear();
+        sphereVsCellPolygons(testPos, radius, testCell, scratchContacts);
 
-        // Also check adjacent cells at the lowered position
+        // Also check adjacent cells at the probed position
         if (testCell >= 0 && testCell < static_cast<int32_t>(mWR.numCells)) {
             const auto &cell = mWR.cells[testCell];
             int numSolid = cell.numPolygons - cell.numPortals;
@@ -343,7 +350,7 @@ public:
                 if (dist < radius) {
                     int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
                     if (tgtCell >= 0 && tgtCell < static_cast<int32_t>(mWR.numCells)) {
-                        sphereVsCellPolygons(testPos, radius, tgtCell, contacts);
+                        sphereVsCellPolygons(testPos, radius, tgtCell, scratchContacts);
                     }
                 }
             }
@@ -352,11 +359,13 @@ public:
         // Find the most upward-facing contact normal (ground = normal.z > 0)
         bool found = false;
         float bestZ = -1.0f;
-        for (const auto &c : contacts) {
+        outTextureIdx = -1;
+        for (const auto &c : scratchContacts) {
             // Ground normals point upward (positive Z in Z-up coordinate system)
             if (c.normal.z > 0.0f && c.normal.z > bestZ) {
                 bestZ = c.normal.z;
                 outNormal = c.normal;
+                outTextureIdx = c.textureIdx;
                 found = true;
             }
         }
