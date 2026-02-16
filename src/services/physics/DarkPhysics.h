@@ -266,6 +266,15 @@ public:
         mPlayer.enableMotion();
     }
 
+    /// Apply player physics configuration from P$PhysAttr and P$PhysDims properties.
+    /// This overrides the default hardcoded constants with per-object values from
+    /// the archetype inheritance chain. Called once during level load.
+    void applyPlayerConfig(const PlayerPhysics::PlayerPhysicsConfig &cfg) {
+        mPlayer.applyConfig(cfg);
+        // Keep mGravity vector consistent with the new gravity magnitude
+        mGravity = Vector3(0.0f, 0.0f, -mPlayer.getGravityMagnitude());
+    }
+
     // ── Direct access for renderer integration ──
 
     /// Get the physics update rate in Hz (convenience delegate to PlayerPhysics).
