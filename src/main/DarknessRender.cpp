@@ -1406,6 +1406,56 @@ int main(int argc, char *argv[]) {
                       : Darkness::PlayerPhysics::MODERN;
     state.physics = std::make_unique<Darkness::DarkPhysics>(mission.wrData, physTimestep);
 
+    // ── Query player physics properties from archetype inheritance chain ──
+    // The starting point object inherits P$PhysAttr/P$PhysDims from the
+    // Avatar archetype in dark.gam. Values override PlayerPhysics defaults.
+    if (mission.spawnInfo.found && mission.spawnInfo.objectID != 0) {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        Darkness::PlayerPhysics::PlayerPhysicsConfig cfg;
+
+        // Read P$PhysAttr — may be 48 bytes (without poreSize) or 52 bytes
+        Darkness::PropPhysAttr attr = {};
+        size_t rawSize = 0;
+        const uint8_t *rawData = Darkness::getPropertyRawData(
+            propSvc.get(), "PhysAttr", mission.spawnInfo.objectID, rawSize);
+        if (rawData && rawSize >= 20) {
+            // Copy what's available (handles both 48 and 52-byte variants)
+            std::memcpy(&attr, rawData, std::min(rawSize, sizeof(attr)));
+            cfg.gravityScale = attr.gravity / 100.0f;
+            cfg.mass = attr.mass;
+            cfg.density = attr.density;
+            cfg.elasticity = attr.elasticity;
+            std::fprintf(stderr, "P$PhysAttr (obj %d): gravity=%.1f%% mass=%.1f "
+                         "density=%.1f elasticity=%.2f friction=%.3f\n",
+                         mission.spawnInfo.objectID, attr.gravity, attr.mass,
+                         attr.density, attr.elasticity, attr.friction);
+        } else {
+            std::fprintf(stderr, "P$PhysAttr: not found for obj %d (using defaults)\n",
+                         mission.spawnInfo.objectID);
+        }
+
+        // Read P$PhysDims (52 bytes) — sphere radii and submodel offsets
+        Darkness::PropPhysDims dims = {};
+        if (Darkness::getTypedProperty<Darkness::PropPhysDims>(
+                propSvc.get(), "PhysDims", mission.spawnInfo.objectID, dims)) {
+            if (dims.radius[0] > 0.0f) cfg.headRadius = dims.radius[0];
+            if (dims.radius[1] > 0.0f) cfg.bodyRadius = dims.radius[1];
+            cfg.headOffsetZ = dims.offset1Z;
+            cfg.bodyOffsetZ = dims.offset2Z;
+            std::fprintf(stderr, "P$PhysDims (obj %d): r0=%.2f r1=%.2f "
+                         "off1=(%.2f,%.2f,%.2f) off2=(%.2f,%.2f,%.2f)\n",
+                         mission.spawnInfo.objectID,
+                         dims.radius[0], dims.radius[1],
+                         dims.offset1X, dims.offset1Y, dims.offset1Z,
+                         dims.offset2X, dims.offset2Y, dims.offset2Z);
+        } else {
+            std::fprintf(stderr, "P$PhysDims: not found for obj %d (using defaults)\n",
+                         mission.spawnInfo.objectID);
+        }
+
+        state.physics->applyPlayerConfig(cfg);
+    }
+
     // ── Load motion capture data from motions.crf ──
     // motions.crf is present in ALL Dark Engine games (Thief 1/2, System Shock 2).
     // Currently loaded for future NPC animation (Phase 4 AI). The player camera uses

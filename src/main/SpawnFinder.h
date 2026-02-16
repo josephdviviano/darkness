@@ -40,6 +40,7 @@ namespace Darkness {
 struct SpawnInfo {
     float x, y, z;    // position
     float yaw;         // facing angle in radians (from heading in binary radians)
+    int32_t objectID;  // StartingPoint object ID (for property inheritance queries)
     bool found;        // false = no spawn found, caller should use centroid
 };
 
@@ -56,7 +57,7 @@ struct SpawnInfo {
 //    Angles are binary radians (65536 = 360 degrees).
 // 3. Extract yaw from the heading angle.
 inline SpawnInfo findSpawnPoint(const std::string &misPath) {
-    SpawnInfo info = {0, 0, 0, 0, false};
+    SpawnInfo info = {0, 0, 0, 0, 0, false};
 
     FilePtr fp(new StdFile(misPath, File::FILE_R));
     FileGroupPtr db(new DarkFileGroup(fp));
@@ -88,6 +89,7 @@ inline SpawnInfo findSpawnPoint(const std::string &misPath) {
 
         // Take the first link — its src is the StartingPoint object
         startingPointID = src;
+        info.objectID = startingPointID;
         foundLink = true;
         break;
     }

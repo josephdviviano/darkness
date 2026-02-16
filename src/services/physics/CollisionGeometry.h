@@ -52,6 +52,7 @@
 #ifndef __COLLISIONGEOMETRY_H
 #define __COLLISIONGEOMETRY_H
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -69,6 +70,7 @@ struct SphereContact {
     int32_t cellIdx;       // which cell the contact polygon belongs to
     int32_t polyIdx;       // polygon index within that cell
     int32_t textureIdx;    // texture index (-1 if untextured)
+    uint8_t age = 0;       // frames since last detection (0 = just detected this frame)
 };
 
 /// Collision geometry wrapper over WR parsed data.
@@ -125,6 +127,9 @@ public:
         const auto &cell = mWR.cells[cellIdx];
         int numSolid = cell.numPolygons - cell.numPortals;
 
+        // Clear edge dedup buffer for this cell test pass
+        mVisitedEdges.clear();
+
         for (int pi = 0; pi < numSolid; ++pi) {
             const auto &poly = cell.polygons[pi];
             if (poly.count < 3)
@@ -157,28 +162,31 @@ public:
             // rendering), but cell plane normals face inward. Negate so
             // the winding test matches the vertex order.
             Vector3 projected = center - plane.normal * dist;
-            Vector3 outNormal(-plane.normal.x, -plane.normal.y, -plane.normal.z);
+            Vector3 windNormal(-plane.normal.x, -plane.normal.y, -plane.normal.z);
 
-            if (!pointInConvexPolygon(projected, cell.vertices,
-                                      cell.polyIndices[pi], outNormal))
-                continue;
+            if (pointInConvexPolygon(projected, cell.vertices,
+                                      cell.polyIndices[pi], windNormal)) {
+                // Face contact: sphere center projects inside the polygon face.
+                // Normal is the inward-facing plane normal (push direction).
+                SphereContact contact;
+                contact.normal = plane.normal;
+                contact.penetration = radius - dist;
+                contact.cellIdx = cellIdx;
+                contact.polyIdx = pi;
 
-            // Record contact: normal points inward (push direction),
-            // penetration is how far the sphere has penetrated
-            SphereContact contact;
-            contact.normal = plane.normal;
-            contact.penetration = radius - dist;
-            contact.cellIdx = cellIdx;
-            contact.polyIdx = pi;
+                if (pi < static_cast<int>(cell.numTextured)) {
+                    contact.textureIdx = static_cast<int32_t>(cell.texturing[pi].txt);
+                } else {
+                    contact.textureIdx = -1;
+                }
 
-            // Texture index if this polygon has texturing data
-            if (pi < static_cast<int>(cell.numTextured)) {
-                contact.textureIdx = static_cast<int32_t>(cell.texturing[pi].txt);
-            } else {
-                contact.textureIdx = -1;
+                outContacts.push_back(contact);
+            } else if (radius > 0.001f) {
+                // Edge fallback: sphere center projects outside the polygon face,
+                // but may still intersect a polygon edge. Only test for real spheres
+                // (HEAD/BODY), not point detectors (SHIN/KNEE/FOOT).
+                sphereVsPolygonEdges(center, radius, cell, pi, cellIdx, outContacts);
             }
-
-            outContacts.push_back(contact);
         }
     }
 
@@ -378,6 +386,79 @@ public:
 
 private:
     const WRParsedData &mWR;
+
+    // Scratch buffer for edge contact de-duplication within a single cell test.
+    // Keyed on ordered vertex index pairs packed into uint16_t.
+    // Mutable because sphereVsCellPolygons() is const but needs scratch space.
+    mutable std::vector<uint16_t> mVisitedEdges;
+
+    /// Fallback edge contact test — called when sphere is within radius of a polygon's
+    /// plane but its center projects outside the polygon face. Tests each edge of the
+    /// polygon for sphere-edge intersection using closest-point-on-segment.
+    ///
+    /// Contact normal points from the closest edge point toward the sphere center
+    /// (radial push direction). This produces correct sliding behavior along wall
+    /// edges and around convex corners.
+    ///
+    /// Shared edges between adjacent polygons are de-duplicated via mVisitedEdges
+    /// (keyed on ordered vertex index pair) to prevent double-push.
+    inline void sphereVsPolygonEdges(
+        const Vector3 &center, float radius,
+        const WRParsedCell &cell, int pi, int32_t cellIdx,
+        std::vector<SphereContact> &outContacts) const
+    {
+        const auto &indices = cell.polyIndices[pi];
+        int n = static_cast<int>(indices.size());
+        if (n < 3) return;
+
+        int32_t textureIdx = -1;
+        if (pi < static_cast<int>(cell.numTextured))
+            textureIdx = static_cast<int32_t>(cell.texturing[pi].txt);
+
+        for (int i = 0; i < n; ++i) {
+            uint8_t idxA = indices[i];
+            uint8_t idxB = indices[(i + 1) % n];
+
+            // De-duplicate shared edges — adjacent polygons in the same cell
+            // share edges. Ordered pair key: min in high byte, max in low byte.
+            uint16_t edgeKey = (static_cast<uint16_t>(std::min(idxA, idxB)) << 8)
+                             | static_cast<uint16_t>(std::max(idxA, idxB));
+            bool seen = false;
+            for (auto k : mVisitedEdges) {
+                if (k == edgeKey) { seen = true; break; }
+            }
+            if (seen) continue;
+            mVisitedEdges.push_back(edgeKey);
+
+            const Vector3 &a = cell.vertices[idxA];
+            const Vector3 &b = cell.vertices[idxB];
+
+            // Closest point on segment a→b to sphere center
+            // Standard parametric clamping: t = dot(P-A, B-A) / |B-A|², clamped [0,1]
+            // (same algorithm as Godot's geometry_3d.h::get_closest_point_to_segment)
+            Vector3 edge = b - a;
+            float edgeLenSq = glm::dot(edge, edge);
+            if (edgeLenSq < 1e-12f) continue; // degenerate edge
+
+            float t = glm::dot(center - a, edge) / edgeLenSq;
+            t = std::clamp(t, 0.0f, 1.0f);
+            Vector3 closest = a + edge * t;
+
+            Vector3 diff = center - closest;
+            float distSq = glm::dot(diff, diff);
+
+            if (distSq < radius * radius && distSq > 1e-12f) {
+                float dist = std::sqrt(distSq);
+                SphereContact contact;
+                contact.normal = diff / dist;
+                contact.penetration = radius - dist;
+                contact.cellIdx = cellIdx;
+                contact.polyIdx = pi;
+                contact.textureIdx = textureIdx;
+                outContacts.push_back(contact);
+            }
+        }
+    }
 };
 
 } // namespace Darkness
