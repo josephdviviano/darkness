@@ -171,6 +171,17 @@ struct ObjectCollisionBody {
     // Special objects interact differently with sphere models (the sphere radius is NOT zeroed vs special).
     bool isSpecial = false;
 
+    // ── Object stepping fields (from P$PhysAttr) ──
+    // climbableSides: 6-bit bitmask of climbable OBB faces (bits 0-5 = +X,+Y,+Z,-X,-Y,-Z).
+    // When != 0, stair stepping is suppressed and collision result is set to "nothing" —
+    // the climbing system handles these objects instead. Default 0 = no climbable sides.
+    int32_t climbableSides = 0;
+
+    // isEdgeTrigger: if true, this OBB is a volume trigger (pressure plates, trip wires)
+    // that generates entry/exit events instead of physical collision. Stair stepping
+    // returns immediately when encountering an edge trigger OBB. Default false.
+    bool isEdgeTrigger = false;
+
     // Precomputed world-space AABB for quick rejection tests
     Vector3 aabbMin;
     Vector3 aabbMax;
@@ -363,6 +374,133 @@ inline OBBCollisionResult checkSphereVsSphere(
 }
 
 // ============================================================================
+// Ray-vs-OBB intersection — slab method for object stair stepping
+// ============================================================================
+
+/// Result of a ray-vs-OBB intersection test.
+struct RayOBBResult {
+    bool hit;           // true if ray intersects the OBB
+    int faceIdx;        // which OBB face was hit (0-5), -1 if no hit
+    float t;            // parametric hit time along ray (0.0 = start, 1.0 = end)
+    Vector3 point;      // world-space hit point on the OBB surface
+};
+
+/// Slab-based ray-vs-OBB intersection test.
+///
+/// Tests a ray segment (start → end) against the 6 face planes of an OBB.
+/// Uses the standard slab method: for each axis, compute parametric entry/exit
+/// times. If the maximum entry time is less than the minimum exit time and
+/// occurs before the ray end, the ray intersects the OBB.
+///
+/// Used by the object stair stepping system to cast UP/FWD/DOWN rays against
+/// OBBs instead of terrain. All three step-check rays use this test.
+///
+/// @param rayStart   World-space ray start point
+/// @param rayEnd     World-space ray end point
+/// @param body       The OBB collision body to test against
+/// @return           Intersection result with face index, parametric t, hit point
+inline RayOBBResult rayVsOBB(
+    const Vector3 &rayStart,
+    const Vector3 &rayEnd,
+    const ObjectCollisionBody &body)
+{
+    RayOBBResult result;
+    result.hit = false;
+    result.faceIdx = -1;
+    result.t = 0.0f;
+    result.point = Vector3(0.0f);
+
+    // Half-extents from full edge lengths
+    Vector3 halfExtents = body.edgeLengths * 0.5f;
+
+    // 6 face normals: rotation matrix columns (sides 0-2) and negated (sides 3-5)
+    Vector3 normals[6];
+    normals[0] = body.rotation[0];   // +X
+    normals[1] = body.rotation[1];   // +Y
+    normals[2] = body.rotation[2];   // +Z
+    normals[3] = -body.rotation[0];  // -X
+    normals[4] = -body.rotation[1];  // -Y
+    normals[5] = -body.rotation[2];  // -Z
+
+    // Plane constants: d[i] = dot(normal[i], center + normal[i] * halfExtent)
+    // = dot(normal[i], center) + halfExtent[i%3]
+    float d[6];
+    for (int i = 0; i < 6; ++i) {
+        d[i] = glm::dot(normals[i], body.worldPos) + halfExtents[i % 3];
+    }
+
+    // Slab intersection: track maximum entry time and minimum exit time.
+    // Epsilon matching the original engine's tolerance for inside/outside test.
+    constexpr float kSlabEpsilon = 0.0001f;
+    float maxEntryTime = -1000000.0f;
+    float minExitTime  =  1000000.0f;
+    int bestSide = -1;
+
+    for (int i = 0; i < 6; ++i) {
+        float startDist = glm::dot(normals[i], rayStart) - d[i];
+        float endDist   = glm::dot(normals[i], rayEnd)   - d[i];
+
+        // Both inside this slab — no constraint
+        if (startDist <= kSlabEpsilon && endDist <= kSlabEpsilon)
+            continue;
+
+        // Both outside this slab — ray cannot intersect OBB
+        if (startDist >= -kSlabEpsilon && endDist >= -kSlabEpsilon) {
+            bestSide = -1;
+            break;
+        }
+
+        // Crossing — compute parametric intersection time
+        float t = startDist / (startDist - endDist);
+
+        if (startDist < 0.0f) {
+            // Ray exiting this slab — track minimum exit time
+            if (t < minExitTime)
+                minExitTime = t;
+        } else {
+            // Ray entering this slab — track maximum entry time and face
+            if (t > maxEntryTime) {
+                maxEntryTime = t;
+                bestSide = i;
+            }
+        }
+    }
+
+    if (bestSide < 0)
+        return result; // missed — ray outside one slab entirely or inside all
+
+    // Valid hit requires: entry before ray end AND entry before exit
+    if (maxEntryTime < 1.0f && minExitTime > maxEntryTime) {
+        result.hit = true;
+        result.faceIdx = bestSide;
+        result.t = maxEntryTime;
+        result.point = rayStart + (rayEnd - rayStart) * maxEntryTime;
+    }
+
+    return result;
+}
+
+/// Compute the world-space outward normal for a given OBB face index (0-5).
+///
+/// Face index mapping matches the Dark Engine convention:
+///   0 = +X axis (rotation column 0)
+///   1 = +Y axis (rotation column 1)
+///   2 = +Z axis (rotation column 2)
+///   3 = -X axis (negated column 0)
+///   4 = -Y axis (negated column 1)
+///   5 = -Z axis (negated column 2)
+///
+/// @param body      The OBB collision body
+/// @param faceIdx   Face index (0-5)
+/// @return          Unit normal vector in world space
+inline Vector3 getOBBFaceNormal(const ObjectCollisionBody &body, int faceIdx) {
+    Vector3 normal = body.rotation[faceIdx % 3];
+    if (faceIdx > 2)
+        normal = -normal;
+    return normal;
+}
+
+// ============================================================================
 // ObjectCollisionWorld — manages all object collision bodies and queries
 // ============================================================================
 
@@ -404,6 +542,7 @@ public:
         const WRParsedData &wr)
     {
         mBodies.clear();
+        mObjIDToBody.clear();
         mCellToObjects.clear();
         mWR = &wr;
 
@@ -521,6 +660,27 @@ public:
             body.shapeType = shapeType;
             body.isSpecial = isSpecial;
 
+            // Read P$PhysAttr for object stepping fields (OBB-only).
+            // P$PhysAttr layout (52 bytes): gravity(0), mass(4), density(8),
+            // elasticity(12), base_friction(16), cog_offset(20), rot_axes(32),
+            // rest_axes(36), climbable_sides(40), edge_trigger(44), pore_size(48).
+            // climbable_sides: 6-bit bitmask of climbable OBB faces.
+            // edge_trigger: BOOL (int32) — volume trigger, not physical.
+            if (propSvc && shapeType == CollisionShapeType::OBB) {
+                size_t attrSize = 0;
+                const uint8_t *attrData = getPropertyRawData(
+                    propSvc, "PhysAttr", obj.objID, attrSize);
+                if (attrData && attrSize >= 48) {
+                    int32_t climbSides;
+                    std::memcpy(&climbSides, attrData + 40, sizeof(int32_t));
+                    body.climbableSides = climbSides;
+
+                    int32_t edgeTrig;
+                    std::memcpy(&edgeTrig, attrData + 44, sizeof(int32_t));
+                    body.isEdgeTrigger = (edgeTrig != 0);
+                }
+            }
+
             // Compute rotation matrix from object facing angles.
             // Original rotation order: M = Rz(heading) * Ry(pitch) * Rx(bank)
             // NON-NEGATED angles (negation is only for bgfx GPU transpose compensation).
@@ -612,6 +772,7 @@ public:
             registerInCells(body, wr);
 
             mBodies.push_back(std::move(body));
+            mObjIDToBody[mBodies.back().objID] = mBodies.size() - 1;
         }
 
         // Build reverse lookup: cell index → body indices
@@ -710,6 +871,10 @@ public:
                     contact.polyIdx = static_cast<int32_t>((bi << 4) | (cr.faceIdx & 0xF));
                     contact.textureIdx = -1;
                     contact.age = 0;
+                    // Tag with object ID and player submodel index for
+                    // object stepping decisions in tryStairStep().
+                    contact.objectId = body.objID;
+                    contact.submodelIdx = static_cast<int8_t>(s);
 
                     outContacts.push_back(contact);
                 }
@@ -731,8 +896,21 @@ public:
     /// Access all bodies.
     const std::vector<ObjectCollisionBody> &getBodies() const { return mBodies; }
 
+    /// Find a collision body by game object ID.
+    /// Returns nullptr if no body exists for the given object ID.
+    /// Used by object stair stepping to look up OBB properties
+    /// (climbable sides, edge trigger, rotation, edge lengths).
+    const ObjectCollisionBody *findBodyByObjID(int32_t objID) const {
+        auto it = mObjIDToBody.find(objID);
+        return (it != mObjIDToBody.end()) ? &mBodies[it->second] : nullptr;
+    }
+
 private:
     std::vector<ObjectCollisionBody> mBodies;
+
+    // Object ID → index into mBodies. Built at load time for O(1) body lookup.
+    // Used by object stair stepping to find OBB properties from contact objectId.
+    std::unordered_map<int32_t, size_t> mObjIDToBody;
 
     // Portal cell → indices into mBodies. Built at load time, static.
     // ODE UPGRADE: Would be replaced by dHashSpace containing all dGeomIDs.

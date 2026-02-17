@@ -72,6 +72,10 @@ struct SphereContact {
     int32_t textureIdx;    // texture index (-1 if untextured)
     uint8_t age = 0;       // frames since last detection (0 = just detected this frame)
     int8_t submodelIdx = -1; // which player submodel generated this contact (0-4, -1=unknown)
+    int32_t objectId = -1; // object ID for object contacts (-1 = terrain contact).
+                           // Set during testPlayerSpheres() for player-vs-object collisions.
+                           // Used by tryStairStep() to look up OBB properties (climbable
+                           // sides, edge trigger) for object stepping decisions.
     bool isEdge = false;   // true = edge/vertex contact, false = face contact.
                            // The original engine classifies contacts as TerrainFace,
                            // TerrainEdge, or TerrainVertex. Only TerrainFace triggers
