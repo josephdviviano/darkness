@@ -66,6 +66,7 @@
 
 #include "DarknessMath.h"
 #include "CollisionGeometry.h"
+#include "ObjectCollisionGeometry.h"
 #include "IPhysicsWorld.h"
 #include "RayCaster.h"
 
@@ -883,6 +884,13 @@ public:
         mObjectCollisionCb = std::move(cb);
     }
 
+    /// Set the object collision world pointer for object stair stepping.
+    /// Allows tryStairStep() to look up OBB bodies for ray-vs-OBB tests
+    /// and read climbable/edge-trigger properties.
+    void setObjectCollisionWorld(const ObjectCollisionWorld *ocw) {
+        mObjectWorld = ocw;
+    }
+
 private:
     // ── Internal simulation steps ──
 
@@ -1698,11 +1706,11 @@ private:
             // and only triggers stair stepping on face contacts. Edge contacts
             // at polygon boundaries (e.g. wall-slope intersections) have ambiguous
             // normals and can cause spurious stepping on slopes.
-            // Object contacts (submodelIdx=-1) are excluded — stepping over
-            // world objects requires additional validation (object type, climbable
-            // surface checks) that is not yet implemented.
+            // Object contacts (objectId >= 0) are excluded — object stepping uses
+            // a separate code path with OBB-specific ray tests and validation.
             if (std::fabs(c.normal.z) < STEP_WALL_THRESHOLD
                 && c.submodelIdx >= 2
+                && c.objectId < 0
                 && !c.isEdge) {
                 hasWallContact = true;
                 bestWallNormal = c.normal;
@@ -1723,8 +1731,12 @@ private:
                 bestWallNormal = fwdProbe.normal;
             }
         }
-        if (!hasWallContact)
-            return false;
+        if (!hasWallContact) {
+            // No terrain wall contact — try object stepping path instead.
+            // Object stepping uses ray-vs-OBB tests (not terrain raycasts) and
+            // has different post-step actions (no terrain contact destruction).
+            return tryObjectStairStep(moveDir, hSpeed, footPos);
+        }
 
         if (mStepLog) {
             std::fprintf(stderr, "[STEP] ── attempt ── pos=(%.2f,%.2f,%.2f) footZ=%.2f "
@@ -1992,6 +2004,267 @@ private:
 
         // Break climb state — always calls BreakClimb
         // after a successful step to cancel any active climbing.
+        if (mCurrentMode == PlayerMode::Climb) {
+            mCurrentMode = PlayerMode::Stand;
+        }
+
+        return true;
+    }
+
+    /// Object stair stepping — step onto OBB world objects (crates, tables, etc).
+    ///
+    /// Called by tryStairStep() when no terrain wall contact was found. Scans
+    /// mLastContacts for OBB object contacts from leg-level submodels, then
+    /// runs the 3-phase ray-vs-OBB intersection (UP/FWD/DOWN) against the
+    /// triggering OBB. All three rays test against the specific OBB only (not
+    /// terrain). Validation at the stepped position is terrain-only (same as
+    /// terrain stepping).
+    ///
+    /// Key differences from terrain stepping:
+    /// - All 3 rays use rayVsOBB() against the triggering OBB, not terrain raycasts
+    /// - Face normal check uses nZ < 0.4 (no fabs — differs from terrain's fabs check)
+    /// - Climbable OBBs (climbableSides != 0): suppress stepping, set collision to nothing
+    /// - Edge trigger OBBs: immediately skip (not physical objects)
+    /// - Post-step: do NOT destroy leg terrain contacts (only create a new object contact)
+    /// - The OBB face index from the DOWN ray becomes the standing surface contact
+    ///
+    /// @param moveDir   Horizontal movement direction (unit vector)
+    /// @param hSpeed    Horizontal speed (for forward probe distance)
+    /// @param footPos   World-space position of the FOOT submodel
+    /// @return          True if a step was accepted (position updated)
+    inline bool tryObjectStairStep(const Vector3 &moveDir, float hSpeed,
+                                    const Vector3 &footPos) {
+        if (!mObjectWorld)
+            return false;
+
+        // ── Scan for OBB wall contacts from leg-level submodels ──
+        // Match contacts where:
+        // 1. It's an object contact (objectId >= 0)
+        // 2. Submodel is SHIN/KNEE/FOOT (indices 2-4)
+        // 3. The OBB is not climbable (climbableSides == 0)
+        // 4. The OBB is not an edge trigger
+        // 5. The OBB face normal Z < 0.4 (wall-like, not floor-like)
+        //    NOTE: no fabs() — differs from terrain which uses fabs(nZ)
+        const ObjectCollisionBody *stepOBB = nullptr;
+        int triggerFaceIdx = -1;
+
+        for (const auto &c : mLastContacts) {
+            if (c.objectId < 0 || c.submodelIdx < 2)
+                continue;
+
+            const ObjectCollisionBody *body = mObjectWorld->findBodyByObjID(c.objectId);
+            if (!body || body->shapeType != CollisionShapeType::OBB)
+                continue;
+
+            // Climbable OBBs — suppress stepping entirely.
+            // The climbing system handles these objects (future task).
+            if (body->climbableSides != 0)
+                continue;
+
+            // Edge triggers — not physical objects, skip.
+            if (body->isEdgeTrigger)
+                continue;
+
+            // Get the OBB face index from the encoded polyIdx.
+            // polyIdx = (bodyIndex << 4) | (faceIdx & 0xF)
+            int faceIdx = c.polyIdx & 0xF;
+            if (faceIdx > 5)
+                continue; // sphere contact (0xF), not a valid face
+
+            Vector3 faceNormal = getOBBFaceNormal(*body, faceIdx);
+
+            // Wall-like face check: nZ < 0.4 (no fabs — object stepping
+            // only triggers on faces whose normal points more sideways than up).
+            if (faceNormal.z < 0.4f) {
+                stepOBB = body;
+                triggerFaceIdx = faceIdx;
+                break;
+            }
+        }
+
+        if (!stepOBB)
+            return false;
+
+        if (mStepLog) {
+            std::fprintf(stderr, "[STEP-OBJ] ── attempt ── objID=%d pos=(%.2f,%.2f,%.2f) "
+                "footZ=%.2f hSpeed=%.2f dir=(%.2f,%.2f) face=%d\n",
+                stepOBB->objID, mPosition.x, mPosition.y, mPosition.z,
+                footPos.z, hSpeed, moveDir.x, moveDir.y, triggerFaceIdx);
+        }
+
+        // ── Phase 1: Ray UP against OBB ──
+        // Cast from foot upward by STEP_UP_DIST (2.0). If the ray hits the
+        // OBB, the step is too tall (obstacle above).
+        Vector3 upStart = footPos + Vector3(0.0f, 0.0f, STEP_UP_EPSILON);
+        Vector3 upEnd = footPos + Vector3(0.0f, 0.0f, STEP_UP_DIST);
+
+        RayOBBResult upResult = rayVsOBB(upStart, upEnd, *stepOBB);
+        if (upResult.hit) {
+            if (mStepLog) std::fprintf(stderr, "[STEP-OBJ]   P1 UP FAIL: OBB hit at Z=%.2f\n",
+                upResult.point.z);
+            return false;
+        }
+
+        // ── Phase 2: Ray FORWARD against OBB ──
+        // Probe forward from the lifted position. Distance = speed * 0.01.
+        float fwdDist = hSpeed * STEP_FWD_SCALE;
+        Vector3 fwdEnd = upEnd + moveDir * fwdDist;
+
+        RayOBBResult fwdResult = rayVsOBB(upEnd, fwdEnd, *stepOBB);
+        if (fwdResult.hit) {
+            if (mStepLog) std::fprintf(stderr, "[STEP-OBJ]   P2 FWD FAIL: OBB hit at (%.2f,%.2f,%.2f)\n",
+                fwdResult.point.x, fwdResult.point.y, fwdResult.point.z);
+            return false;
+        }
+
+        if (mStepLog) {
+            std::fprintf(stderr, "[STEP-OBJ]   P1+P2 OK: fwdDist=%.4f fwdEnd=(%.2f,%.2f,%.2f)\n",
+                fwdDist, fwdEnd.x, fwdEnd.y, fwdEnd.z);
+        }
+
+        // ── Phase 3: Ray DOWN against OBB ──
+        // Cast downward from lifted+forward position by 4.0 units (2× STEP_UP_DIST).
+        // Must hit the OBB to find the landing surface (the top face).
+        static constexpr float OBJ_STEP_DOWN_DIST = 4.0f;
+        Vector3 downEnd = fwdEnd - Vector3(0.0f, 0.0f, OBJ_STEP_DOWN_DIST);
+
+        RayOBBResult downResult = rayVsOBB(fwdEnd, downEnd, *stepOBB);
+        if (!downResult.hit) {
+            if (mStepLog) std::fprintf(stderr, "[STEP-OBJ]   P3 DOWN FAIL: no OBB surface found\n");
+            return false;
+        }
+
+        int topFaceIdx = downResult.faceIdx;
+        float hitZ = downResult.point.z;
+        Vector3 topNormal = getOBBFaceNormal(*stepOBB, topFaceIdx);
+
+        if (mStepLog) {
+            std::fprintf(stderr, "[STEP-OBJ]   P3 DOWN: hitZ=%.3f face=%d n=(%.2f,%.2f,%.2f)\n",
+                hitZ, topFaceIdx, topNormal.x, topNormal.y, topNormal.z);
+        }
+
+        // Compute lift: z_delta = max(0.3, hit_z - foot_z) + 0.02
+        float zDelta = hitZ - footPos.z;
+        if (zDelta < STEP_MIN_ZDELTA)
+            zDelta = STEP_MIN_ZDELTA;
+        zDelta += STEP_CLEARANCE;
+
+        if (zDelta > STEP_UP_DIST + STEP_CLEARANCE) {
+            if (mStepLog) std::fprintf(stderr, "[STEP-OBJ]   REJECT: zDelta=%.3f > max=%.3f\n",
+                zDelta, STEP_UP_DIST + STEP_CLEARANCE);
+            return false;
+        }
+
+        if (mStepLog) {
+            std::fprintf(stderr, "[STEP-OBJ]   P3 OK: hitZ=%.2f zDelta=%.3f\n", hitZ, zDelta);
+        }
+
+        // ── Validate: terrain-only sphere tests at stepped position ──
+        // Same as terrain stepping: check BODY and HEAD spheres for terrain
+        // collisions at the new height. No OBB re-check needed.
+        Vector3 steppedPos = mPosition;
+        steppedPos.z += zDelta;
+
+        int32_t steppedCell = mCollision.findCell(steppedPos);
+        if (steppedCell < 0) {
+            if (mStepLog) std::fprintf(stderr, "[STEP-OBJ]   VALIDATE FAIL: no cell at steppedPos\n");
+            return false;
+        }
+
+        // BODY validation
+        {
+            float bodyOffsetZ = mSphereOffsetsBase[1] + mBodyPoseCurrent.z;
+            Vector3 bodyCenter = steppedPos + Vector3(0.0f, 0.0f, bodyOffsetZ);
+
+            mStepScratchContacts.clear();
+            mCollision.sphereVsCellPolygons(bodyCenter, SPHERE_RADIUS,
+                                             steppedCell, mStepScratchContacts);
+            int32_t bodyCell = mCollision.findCell(bodyCenter);
+            if (bodyCell >= 0 && bodyCell != steppedCell) {
+                mCollision.sphereVsCellPolygons(bodyCenter, SPHERE_RADIUS,
+                                                 bodyCell, mStepScratchContacts);
+            }
+
+            for (const auto &c : mStepScratchContacts) {
+                if (c.normal.z < STEP_WALL_THRESHOLD && c.penetration > 0.01f) {
+                    if (mStepLog) {
+                        std::fprintf(stderr, "[STEP-OBJ]   VALIDATE FAIL: BODY terrain collision "
+                            "n=(%.2f,%.2f,%.2f) pen=%.3f\n",
+                            c.normal.x, c.normal.y, c.normal.z, c.penetration);
+                    }
+                    return false;
+                }
+            }
+        }
+
+        // HEAD validation at current position (spring-connected, won't move)
+        {
+            float headOffsetZ = mSphereOffsetsBase[0] + mPoseCurrent.z;
+            Vector3 headCenter = mPosition + Vector3(0.0f, 0.0f, headOffsetZ);
+
+            mStepScratchContacts.clear();
+            mCollision.sphereVsCellPolygons(headCenter, SPHERE_RADIUS,
+                                             steppedCell, mStepScratchContacts);
+            int32_t headCell = mCollision.findCell(headCenter);
+            if (headCell >= 0 && headCell != steppedCell) {
+                mCollision.sphereVsCellPolygons(headCenter, SPHERE_RADIUS,
+                                                 headCell, mStepScratchContacts);
+            }
+
+            for (const auto &c : mStepScratchContacts) {
+                if (c.normal.z < STEP_WALL_THRESHOLD && c.penetration > 0.01f) {
+                    if (mStepLog) {
+                        std::fprintf(stderr, "[STEP-OBJ]   VALIDATE FAIL: HEAD terrain collision "
+                            "n=(%.2f,%.2f,%.2f) pen=%.3f\n",
+                            c.normal.x, c.normal.y, c.normal.z, c.penetration);
+                    }
+                    return false;
+                }
+            }
+        }
+
+        // ── Accept the object step ──
+        if (mStepLog) {
+            std::fprintf(stderr, "[STEP-OBJ]   ACCEPTED: objID=%d pos (%.2f,%.2f,%.2f) -> "
+                "(%.2f,%.2f,%.2f) zDelta=%.3f face=%d\n",
+                stepOBB->objID,
+                mPosition.x, mPosition.y, mPosition.z,
+                steppedPos.x, steppedPos.y, steppedPos.z,
+                zDelta, topFaceIdx);
+        }
+
+        mPosition = steppedPos;
+        mCellIdx = steppedCell;
+        mVelocity.z = 0.0f;
+        mGroundNormal = topNormal;
+
+        // HEAD spring compensation (same as terrain stepping)
+        mSpringPos.z -= zDelta;
+
+        // Object stepping does NOT destroy leg terrain contacts.
+        // Only create a new object contact for FOOT standing on the OBB top face.
+        {
+            SphereContact objContact;
+            objContact.normal = topNormal;
+            objContact.penetration = 0.01f;
+            objContact.cellIdx = -1; // object contact sentinel
+            objContact.polyIdx = -1; // synthetic
+            objContact.textureIdx = -1;
+            objContact.age = 0;
+            objContact.submodelIdx = 4; // FOOT
+            objContact.objectId = stepOBB->objID;
+            mLastContacts.push_back(objContact);
+        }
+
+        // Mode transition — same as terrain stepping
+        if (mCurrentMode != PlayerMode::Stand &&
+            mCurrentMode != PlayerMode::Crouch &&
+            mCurrentMode != PlayerMode::Swim &&
+            mCurrentMode != PlayerMode::Dead) {
+            mCurrentMode = PlayerMode::Stand;
+        }
+
+        // Break climb state
         if (mCurrentMode == PlayerMode::Climb) {
             mCurrentMode = PlayerMode::Stand;
         }
@@ -3282,6 +3555,7 @@ private:
     // ── Callbacks ──
     FootstepCallback mFootstepCb;            // footstep sound event (Phase 3 Audio stub)
     ObjectCollisionCallback mObjectCollisionCb;  // player-vs-object collision (Task 26)
+    const ObjectCollisionWorld *mObjectWorld = nullptr;  // for OBB lookup in object stepping
 
     // ── Diagnostic logging state ──
     FILE *mLogFile = nullptr;   // per-timestep CSV log file (null = disabled)

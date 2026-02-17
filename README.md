@@ -3,6 +3,7 @@
 `darkness`, an open [Dark Engine](https://en.wikipedia.org/wiki/Dark_Engine)(tm), is built on the headless core of the [openDarkEngine](https://github.com/volca02/openDarkEngine) project, and is optimized for a modular design permitting extensibility and full cross-platform compatibility on modern hardware. It aims to support all previously-generated official and fan content, and admit modular access to modernizing the graphics, audio, physics, and AI stacks.
 
 ![don't be so sure](doc/orly.png)
+![but actually tho](doc/physics.png)
 
 ### Prerequisites
 
