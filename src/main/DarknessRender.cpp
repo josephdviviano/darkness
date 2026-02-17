@@ -801,9 +801,9 @@ static void registerConsoleSettings(
         [&state, refreshTitle](int v) {
             if (!state.physics) return;
             auto &pp = state.physics->getPlayerPhysics();
-            if (v == 0) pp.setTimestep(Darkness::PlayerPhysics::VINTAGE);
-            else if (v == 2) pp.setTimestep(Darkness::PlayerPhysics::ULTRA);
-            else pp.setTimestep(Darkness::PlayerPhysics::MODERN);
+            if (v == 0) pp.setTimestep(Darkness::VINTAGE);
+            else if (v == 2) pp.setTimestep(Darkness::ULTRA);
+            else pp.setTimestep(Darkness::MODERN);
             refreshTitle();
         });
 
@@ -1406,9 +1406,9 @@ int main(int argc, char *argv[]) {
     //   <= 12 → VINTAGE (12.5Hz, 3 collision iters, authentic Dark Engine feel)
     //   >= 120 → ULTRA (120Hz, 1 iter, high-fidelity)
     //   else → MODERN (60Hz, 1 iter, default)
-    auto physTimestep = (cfg.physicsRate <= 12)  ? Darkness::PlayerPhysics::VINTAGE
-                      : (cfg.physicsRate >= 120) ? Darkness::PlayerPhysics::ULTRA
-                      : Darkness::PlayerPhysics::MODERN;
+    auto physTimestep = (cfg.physicsRate <= 12)  ? Darkness::VINTAGE
+                      : (cfg.physicsRate >= 120) ? Darkness::ULTRA
+                      : Darkness::MODERN;
     state.physics = std::make_unique<Darkness::DarkPhysics>(mission.wrData, physTimestep);
 
     // ── Query player physics properties from archetype inheritance chain ──
@@ -1416,7 +1416,7 @@ int main(int argc, char *argv[]) {
     // Avatar archetype in dark.gam. Values override PlayerPhysics defaults.
     if (mission.spawnInfo.found && mission.spawnInfo.objectID != 0) {
         Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
-        Darkness::PlayerPhysics::PlayerPhysicsConfig cfg;
+        Darkness::PlayerPhysicsConfig cfg;
 
         // Read P$PhysAttr — may be 48 bytes (without poreSize) or 52 bytes
         Darkness::PropPhysAttr attr = {};
