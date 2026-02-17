@@ -321,6 +321,8 @@ public:
                 ocw->testPlayerSpheres(centers, radii, numSpheres,
                                        playerCell, outContacts);
             });
+        // Set direct pointer for object stair stepping (ray-vs-OBB lookups).
+        mPlayer.setObjectCollisionWorld(ocw);
     }
 
     /// Number of active object collision bodies (for diagnostics).
