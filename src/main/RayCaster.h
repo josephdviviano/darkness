@@ -96,10 +96,32 @@ inline bool rayIntersectPolygon(const Vector3 &origin,
 // hit.hitEntity = 0 for world geometry hits.
 // hit.textureIndex = WR texture list index of the hit polygon (-1 if untextured).
 
+/// Overload that also outputs the terminal cell — the cell where the hit
+/// occurred, or the last cell traversed if no hit. This enables cell hint
+/// propagation between chained raycasts (e.g. the 3-phase stair step check
+/// where each phase should start in the cell the previous phase ended in).
+/// Pass outTerminalCell = nullptr to ignore.
+inline bool raycastWorld(const WRParsedData &wr,
+                          const Vector3 &from,
+                          const Vector3 &to,
+                          RayHit &hit,
+                          int32_t *outTerminalCell,
+                          int32_t startCellHint = -1);
+
+/// Standard overload — no cell output, no cell hint.
 inline bool raycastWorld(const WRParsedData &wr,
                           const Vector3 &from,
                           const Vector3 &to,
                           RayHit &hit) {
+    return raycastWorld(wr, from, to, hit, nullptr, -1);
+}
+
+inline bool raycastWorld(const WRParsedData &wr,
+                          const Vector3 &from,
+                          const Vector3 &to,
+                          RayHit &hit,
+                          int32_t *outTerminalCell,
+                          int32_t startCellHint) {
     // Compute ray direction and length
     Vector3 delta(to.x - from.x, to.y - from.y, to.z - from.z);
     float maxDist = std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
@@ -112,10 +134,14 @@ inline bool raycastWorld(const WRParsedData &wr,
     float invDist = 1.0f / maxDist;
     Vector3 dir(delta.x * invDist, delta.y * invDist, delta.z * invDist);
 
-    // Find the starting cell
-    int32_t startCell = findCameraCell(wr, from.x, from.y, from.z);
-    if (startCell < 0)
+    // Find the starting cell — use the hint if provided, otherwise search
+    int32_t startCell = (startCellHint >= 0 && startCellHint < static_cast<int32_t>(wr.numCells))
+                      ? startCellHint
+                      : findCameraCell(wr, from.x, from.y, from.z);
+    if (startCell < 0) {
+        if (outTerminalCell) *outTerminalCell = -1;
         return false;
+    }
 
     // BFS traversal state
     // Using a simple array-based queue and visited bitset for efficiency
@@ -128,6 +154,7 @@ inline bool raycastWorld(const WRParsedData &wr,
 
     bool foundHit = false;
     float bestT = maxDist; // Only accept hits within the ray segment [from, to]
+    int32_t hitCell = startCell;  // cell where the best hit was found
 
     size_t queueHead = 0;
     int cellsProcessed = 0;
@@ -160,6 +187,7 @@ inline bool raycastWorld(const WRParsedData &wr,
                     }
 
                     foundHit = true;
+                    hitCell = cellIdx;
                 }
             }
         }
@@ -181,6 +209,20 @@ inline bool raycastWorld(const WRParsedData &wr,
                     }
                 }
             }
+        }
+    }
+
+    // Output the terminal cell: the cell containing the hit (if found),
+    // or the last cell the BFS traversed (closest to the ray endpoint).
+    // This enables the caller to chain raycasts with cell hint propagation,
+    // matching the original engine's Location hint system.
+    if (outTerminalCell) {
+        if (foundHit) {
+            *outTerminalCell = hitCell;
+        } else {
+            // No hit — use the last cell traversed by BFS (the deepest cell
+            // the ray reached). This is the best cell context for the next phase.
+            *outTerminalCell = queue.empty() ? startCell : queue.back();
         }
     }
 

@@ -120,6 +120,7 @@ static void printHelp() {
         "  --force-flicker Force all animated lights to flicker mode (debug).\n"
         "  --linear-mips  Gamma-correct mipmap generation (sRGB linearization).\n"
         "  --sharp-mips   Sharpen mip levels to preserve detail at distance.\n"
+        "  --step-log     Log stair step diagnostics to stderr ([STEP] prefix).\n"
         "  --config <path> Path to YAML config file (default: ./darknessRender.yaml).\n"
         "  --help         Show this help message.\n"
         "\n"
@@ -818,6 +819,10 @@ static void registerConsoleSettings(
         [&state]() { return state.showRaycast; },
         [&state](bool v) { state.showRaycast = v; });
 
+    dbgConsole.addBool("step_log",
+        [&state]() { return state.physics ? state.physics->getPlayerPhysics().stepLogEnabled() : false; },
+        [&state](bool v) { if (state.physics) state.physics->getPlayerPhysics().setStepLog(v); });
+
     dbgConsole.addFloat("move_speed", 1.0f, 500.0f,
         [&state]() { return state.moveSpeed; },
         [&state, refreshTitle](float v) { state.moveSpeed = v; refreshTitle(); });
@@ -1454,6 +1459,12 @@ int main(int argc, char *argv[]) {
         }
 
         state.physics->applyPlayerConfig(cfg);
+    }
+
+    // Enable stair step diagnostics if --step-log was passed
+    if (cfg.stepLog && state.physics) {
+        state.physics->getPlayerPhysics().setStepLog(true);
+        std::fprintf(stderr, "Stair step logging enabled (--step-log)\n");
     }
 
     // ── Load motion capture data from motions.crf ──

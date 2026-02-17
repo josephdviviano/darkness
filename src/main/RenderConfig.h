@@ -36,6 +36,7 @@ struct RenderConfig {
     bool forceFlicker     = false;  // force all animated lights to flicker mode
     bool cameraCollision  = false;  // sphere collision against world geometry
     bool debugObjects     = false;  // dump per-object filtering diagnostics to stderr
+    bool stepLog          = false;  // stair step diagnostics to stderr ([STEP] prefix)
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -168,6 +169,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cfg.cameraCollision = true;
         } else if (std::strcmp(argv[i], "--debug-objects") == 0) {
             cfg.debugObjects = true;
+        } else if (std::strcmp(argv[i], "--step-log") == 0) {
+            cfg.stepLog = true;
         } else if (std::strcmp(argv[i], "--physics-rate") == 0 && i + 1 < argc) {
             int val = std::atoi(argv[++i]);
             if (val <= 12) cfg.physicsRate = 12;

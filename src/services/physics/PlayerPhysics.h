@@ -211,6 +211,25 @@ public:
     // Vintage (12.5Hz): 3 iterations.
     // Modern/Ultra: 1 iteration (higher Hz compensates with more steps/sec).
 
+    // Stair stepping — 3-phase raycast algorithm for automatically stepping up
+    // small ledges during ground movement. Triggered when FOOT/SHIN/KNEE contacts
+    // have a steep/vertical normal (z < STEP_WALL_THRESHOLD), meaning the player
+    // hit a wall-like surface at foot level.
+    //
+    // Phase 1: Probe UP to check clearance above the ledge
+    // Phase 2: Probe FORWARD (along velocity) to check space on the ledge
+    // Phase 3: Probe DOWN to find the surface to stand on
+    //
+    // The lift height is computed from the downward probe hit, clamped to a
+    // minimum of STEP_MIN_ZDELTA to handle very small ledges that would
+    // otherwise be missed. An additional STEP_CLEARANCE is added for safety.
+    static constexpr float STEP_WALL_THRESHOLD = 0.4f;   // normal.z below this = "wall" (steep surface)
+    static constexpr float STEP_UP_DIST        = 2.0f;   // upward probe distance (units)
+    static constexpr float STEP_FWD_SCALE      = 0.01f;  // forward probe = velocity * this
+    static constexpr float STEP_UP_EPSILON     = 0.01f;  // UP ray start offset above foot (collision skin)
+    static constexpr float STEP_MIN_ZDELTA     = 0.3f;   // minimum lift height (units)
+    static constexpr float STEP_CLEARANCE      = 0.02f;  // additional clearance above step surface
+
     // Landing detection thresholds.
     static constexpr float LANDING_MIN_VEL  = 2.0f;    // minimum downward speed for landing pose
     static constexpr float LANDING_MIN_TIME = 0.2f;    // minimum 200ms between landing events
@@ -590,6 +609,10 @@ public:
 
     /// Is logging currently active?
     bool isLogging() const { return mLogFile != nullptr; }
+
+    /// Enable/disable stair step diagnostics to stderr ([STEP] prefix).
+    void setStepLog(bool enable) { mStepLog = enable; }
+    bool stepLogEnabled() const { return mStepLog; }
 
     /// Set the camera pitch from the renderer (for logging — physics doesn't own pitch).
     void setCameraPitch(float pitch) { mCamPitch = pitch; }
@@ -972,6 +995,12 @@ private:
         //     frame's constrainVelocity() call.
         resolveCollisions(contactCb);
 
+        // 10b. Stair stepping — after collision resolution finds wall contacts
+        //      at leg level, try to step up small ledges. Must run before
+        //      detectGround() so the stepped position is used for ground state.
+        //      Only when grounded and moving horizontally.
+        tryStairStep();
+
         // 11. Detect ground and update movement state
         detectGround();
 
@@ -1073,20 +1102,18 @@ private:
     /// back to mGroundNormal (set by detectGround()'s probe), which persists
     /// from the previous frame's ground detection.
     ///
-    /// Sums friction from all upward-facing contacts, matching the original
-    /// engine's PhysGetFriction which iterates all submodel contacts. Multiple
+    /// Sums friction from all upward-facing contacts. Multiple
     /// floor contacts (e.g., BODY + FOOT on the same surface) contribute
     /// additive friction, which typically pushes the control rate to the 2000
     /// cap on walkable slopes. This ensures the player has full control
-    /// authority up to about 69° (matching original behavior).
+    /// authority up to about 69°.
     ///
     /// Falls back to WATER_BASE_FRICTION when swimming with no ground contacts.
     /// Returns 0 in air (no contacts, not swimming).
     inline float computeGroundFriction() const {
-        // Sum friction from all upward-facing contacts — matches the original
-        // engine's PhysGetFriction which sums across all submodel face/edge/vertex
-        // contacts. Multiple submodels touching the same floor surface contribute
-        // additive friction. This is critical: on a 60° slope, single-contact
+        // Sum friction from all upward-facing contacts — Multiple submodels touching
+        // the same floor surface contribute additive friction. This is critical: on
+        // a 60° slope, single-contact
         // friction = 0.48 (below the 0.5 jump gate), but summed friction = ~1.44
         // (well above), matching the original's behavior where the player can
         // still jump on 60° slopes.
@@ -1156,7 +1183,7 @@ private:
 
             // Control rate: rate = min(11 * mass * friction / velocity_rate, 2000)
             // Alpha = rate * dt / mass — mass cancels, giving exponential convergence.
-            // Friction is SUMMED across all submodel contacts (matching original).
+            // Friction is SUMMED across all submodel contacts.
             // On flat ground with ~3 contacts: friction ≈ 2.88, rate = capped at 2000.
             float rate = CONTROL_MULTIPLIER * mMass * friction / VELOCITY_RATE;
             rate = std::min(rate, MAX_CONTROL_RATE);
@@ -1216,10 +1243,8 @@ private:
             //
             // Unlike air/ground paths which strip Z, swimming uses the camera pitch
             // to project forward movement into 3D. Looking up and pressing forward
-            // swims upward; looking down swims downward. This matches the original
-            // engine where water movement preserves the gravity-axis component of
-            // control velocity when base_friction > 0.
-
+            // swims upward; looking down swims downward.
+            //
             // Build 3D desired velocity using camera pitch for Z component.
             // forward3D = (cos(yaw)*cos(pitch), sin(yaw)*cos(pitch), sin(pitch))
             // right stays horizontal = (sin(yaw), -cos(yaw), 0)
@@ -1388,6 +1413,10 @@ private:
                 float offsetZ = mSphereOffsetsBase[s] + poseOffsetZ;
                 Vector3 sphereCenter = mPosition + Vector3(0.0f, 0.0f, offsetZ);
 
+                // Track contact count before this submodel's tests so we can
+                // tag all new contacts with the submodel index afterwards.
+                size_t contactsBefore = mIterContacts.size();
+
                 // Test against the body center's cell
                 mCollision.sphereVsCellPolygons(
                     sphereCenter, sphereR, mCellIdx, mIterContacts);
@@ -1421,6 +1450,13 @@ private:
                                 sphereCenter, sphereR, tgtCell, mIterContacts);
                         }
                     }
+                }
+
+                // Tag all new contacts from this submodel with its index.
+                // Enables per-submodel filtering in tryStairStep() (leg-level
+                // contacts only) and detectGround() (FOOT recovery).
+                for (size_t ci = contactsBefore; ci < mIterContacts.size(); ++ci) {
+                    mIterContacts[ci].submodelIdx = static_cast<int8_t>(s);
                 }
             }
 
@@ -1611,6 +1647,358 @@ private:
 
     }
 
+    /// Try to step up a small ledge — 3-phase raycast algorithm.
+    ///
+    /// Called after resolveCollisions() when the player is on the ground and
+    /// has contacts from FOOT/SHIN/KNEE submodels with steep/vertical normals
+    /// (normal.z < STEP_WALL_THRESHOLD). These contacts indicate the player
+    /// hit a wall-like surface at leg level — potentially a steppable ledge.
+    ///
+    ///   Phase 1 — UP: Probe upward from foot to check headroom above the ledge.
+    ///             If blocked by ceiling/geometry, step is too tall.
+    ///   Phase 2 — FWD: Probe forward (along horizontal velocity) at the lifted
+    ///             height. If blocked, ledge is too narrow or wall continues.
+    ///   Phase 3 — DOWN: Probe downward from the lifted+forward position to find
+    ///             the ledge surface. If no surface found, it's a gap.
+    ///
+    /// On success, lifts the player by max(STEP_MIN_ZDELTA, hit_z - foot_z) +
+    /// STEP_CLEARANCE, then validates the BODY sphere at the new height.
+    /// If BODY collides at the stepped position, the step is aborted.
+    ///
+    /// Returns true if the step was applied (position updated).
+    inline bool tryStairStep() {
+        // Only attempt while grounded and moving horizontally
+        if (!isOnGround())
+            return false;
+
+        // Use the player's INTENDED movement direction/speed, not mVelocity.
+        // constrainVelocity() (step 7) removes velocity into the riser wall
+        // before we get here, so mVelocity's horizontal component is often ~0.
+        // The desired velocity from input is unaffected by wall constraints.
+        Vector3 desired = computeDesiredVelocity();
+        Vector3 hDesired(desired.x, desired.y, 0.0f);
+        float hSpeed = glm::length(hDesired);
+        if (hSpeed < 0.1f)
+            return false;
+
+        Vector3 moveDir = hDesired / hSpeed;
+
+        // Check if any leg-level contact has a steep/vertical normal (wall-like
+        // surface). Head & Body wall contacts (from walls above step height) should NOT
+        // trigger stepping. No directional filter — the forward probe handles that.
+        // Foot position — the lowest point of the player model
+        float footOffsetZ = mSphereOffsetsBase[4]; // FOOT = -3.0
+        Vector3 footPos = mPosition + Vector3(0.0f, 0.0f, footOffsetZ);
+
+        bool hasWallContact = false;
+        Vector3 bestWallNormal(0.0f);
+        for (const auto &c : mLastContacts) {
+            // Only trigger on FACE contacts from leg-level terrain submodels.
+            // The Dark Engine distinguishes face, edge, and vertex contact types
+            // and only triggers stair stepping on face contacts. Edge contacts
+            // at polygon boundaries (e.g. wall-slope intersections) have ambiguous
+            // normals and can cause spurious stepping on slopes.
+            // Object contacts (submodelIdx=-1) are excluded — stepping over
+            // world objects requires additional validation (object type, climbable
+            // surface checks) that is not yet implemented.
+            if (std::fabs(c.normal.z) < STEP_WALL_THRESHOLD
+                && c.submodelIdx >= 2
+                && !c.isEdge) {
+                hasWallContact = true;
+                bestWallNormal = c.normal;
+                break;
+            }
+        }
+
+        // Fallback: if no wall contact in mLastContacts, cast a short forward
+        // ray from the FOOT position to detect step risers that the collision
+        // system missed (e.g. point detector at polygon edge gap). This is a
+        // safety net for Fix #2's edge detection which still has coverage gaps.
+        if (!hasWallContact) {
+            RayHit fwdProbe;
+            Vector3 fwdProbeEnd = footPos + moveDir * SPHERE_RADIUS; // 1.2 units ahead
+            if (raycastWorld(mCollision.getWR(), footPos, fwdProbeEnd, fwdProbe)
+                && std::fabs(fwdProbe.normal.z) < STEP_WALL_THRESHOLD) {
+                hasWallContact = true;
+                bestWallNormal = fwdProbe.normal;
+            }
+        }
+        if (!hasWallContact)
+            return false;
+
+        if (mStepLog) {
+            std::fprintf(stderr, "[STEP] ── attempt ── pos=(%.2f,%.2f,%.2f) footZ=%.2f "
+                "hSpeed=%.2f dir=(%.2f,%.2f) wallN=(%.2f,%.2f,%.2f) contacts=%zu\n",
+                mPosition.x, mPosition.y, mPosition.z, footPos.z,
+                hSpeed, moveDir.x, moveDir.y,
+                bestWallNormal.x, bestWallNormal.y, bestWallNormal.z,
+                mLastContacts.size());
+            // Dump per-contact details with submodel index for diagnostics
+            for (size_t ci = 0; ci < mLastContacts.size(); ++ci) {
+                const auto &c = mLastContacts[ci];
+                std::fprintf(stderr, "[STEP]   contact[%zu]: sub=%d n=(%.2f,%.2f,%.2f) pen=%.3f cell=%d poly=%d\n",
+                    ci, (int)c.submodelIdx,
+                    c.normal.x, c.normal.y, c.normal.z,
+                    c.penetration, c.cellIdx, c.polyIdx);
+            }
+        }
+
+        // ── Phase 1: Raycast UP ──
+        // Cast from foot upward by STEP_UP_DIST (2.0). The ray traverses
+        // portal boundaries, potentially entering the stair cell above.
+        // We capture the terminal cell — the cell the ray ended up in after
+        // portal traversal — and pass it as a hint to subsequent phases.
+        //
+        // Start the ray slightly above the foot (STEP_UP_EPSILON = 0.01).
+        // The point detectors maintain a small separation
+        // from surfaces; our collision resolves to exactly dist=0, so
+        // the UP ray self-intersects at t=0 with the floor polygon.
+        // This minimal offset (0.01 units) reproduces the original
+        // engine's natural skin behavior without reducing headroom.
+        Vector3 upStart = footPos + Vector3(0.0f, 0.0f, STEP_UP_EPSILON);
+        Vector3 upPos = footPos + Vector3(0.0f, 0.0f, STEP_UP_DIST);
+        RayHit stepHit;
+        int32_t cellHint = -1;
+
+        if (raycastWorld(mCollision.getWR(), upStart, upPos, stepHit, &cellHint)) {
+            if (mStepLog) std::fprintf(stderr, "[STEP]   P1 UP FAIL: hit at Z=%.2f (ceil)\n",
+                stepHit.point.z);
+            return false; // ceiling too low
+        }
+
+        // ── Phase 2: Raycast FORWARD ──
+        // Probe forward at the lifted height to check clearance above the
+        // step ledge. The forward distance is velocity * 0.01. This works because
+        // the cell hint from Phase 1 already places us in the stair cell.
+        float fwdDist = hSpeed * STEP_FWD_SCALE;
+        Vector3 fwdPos = upPos + moveDir * fwdDist;
+
+        int32_t fwdCellHint = cellHint;
+        if (raycastWorld(mCollision.getWR(), upPos, fwdPos, stepHit, &fwdCellHint, cellHint)) {
+            if (mStepLog) std::fprintf(stderr, "[STEP]   P2 FWD FAIL: hit at (%.2f,%.2f,%.2f) fwdDist=%.4f\n",
+                stepHit.point.x, stepHit.point.y, stepHit.point.z, fwdDist);
+            return false; // wall in the way at the lifted height
+        }
+
+        if (mStepLog) {
+            std::fprintf(stderr, "[STEP]   P1+P2 OK: fwdDist=%.4f fwdPos=(%.2f,%.2f,%.2f) "
+                "cellHint=%d->%d\n",
+                fwdDist, fwdPos.x, fwdPos.y, fwdPos.z, cellHint, fwdCellHint);
+        }
+
+        // ── Phase 3: Raycast DOWN ──
+        // Cast straight down from the lifted+forward position to find the
+        // step tread surface - propagates
+        // cell context through all 3 phases via Location hints. Our BFS
+        // raycast can't traverse vertical portals with a vertical ray
+        // (denom ≈ 0 for parallel normal/direction), so when the hint
+        // points to a tiny riser cell, the DOWN ray gets stuck there.
+        //
+        // To match the original behavior: try with the propagated hint
+        // first (fast path), then fall back to findCameraCell(fwdPos)
+        // which determines the correct containing cell geometrically.
+        // The cast distance (4.0 = 2 × STEP_UP_DIST) handles downward steps as well.
+        static constexpr float STEP_DOWN_DIST = 4.0f;
+        Vector3 downTarget = fwdPos - Vector3(0.0f, 0.0f, STEP_DOWN_DIST);
+
+        if (!raycastWorld(mCollision.getWR(), fwdPos, downTarget, stepHit, nullptr, fwdCellHint)) {
+            // Hint-based raycast failed — the hint likely points to a
+            // riser cell with only vertical portals. Retry using
+            // findCameraCell to locate the correct cell for fwdPos.
+            if (!raycastWorld(mCollision.getWR(), fwdPos, downTarget, stepHit)) {
+                if (mStepLog) std::fprintf(stderr, "[STEP]   P3 DOWN FAIL: no surface found (hint=%d, cell-find also failed)\n",
+                    fwdCellHint);
+                return false;
+            }
+            if (mStepLog) std::fprintf(stderr, "[STEP]   P3 DOWN: cell-find fallback succeeded\n");
+        }
+
+        float hitZ = stepHit.point.z;
+        Vector3 stepGroundNormal = stepHit.normal;
+        bool foundGround = (stepGroundNormal.z > GROUND_NORMAL_MIN);
+
+        if (mStepLog) {
+            std::fprintf(stderr, "[STEP]   P3 DOWN: hitZ=%.3f n=(%.2f,%.2f,%.2f) dist=%.3f "
+                "ground=%d hint=%d\n",
+                hitZ, stepGroundNormal.x, stepGroundNormal.y, stepGroundNormal.z,
+                stepHit.distance, (int)foundGround, fwdCellHint);
+        }
+
+        if (!foundGround) {
+            if (mStepLog) std::fprintf(stderr, "[STEP]   P3 REJECT: hit surface is not ground (nZ=%.2f)\n",
+                stepGroundNormal.z);
+            return false;
+        }
+
+        // Compute lift: z_delta = max(0.3, hit_z - foot_z) + 0.02
+        float zDelta = hitZ - footPos.z;
+        if (zDelta < STEP_MIN_ZDELTA)
+            zDelta = STEP_MIN_ZDELTA;
+        zDelta += STEP_CLEARANCE;
+
+        // Don't step if the lift would exceed the probe range
+        if (zDelta > STEP_UP_DIST + STEP_CLEARANCE) {
+            if (mStepLog) std::fprintf(stderr, "[STEP]   REJECT: zDelta=%.3f > max=%.3f (too high)\n",
+                zDelta, STEP_UP_DIST + STEP_CLEARANCE);
+            return false;
+        }
+
+        if (mStepLog) {
+            std::fprintf(stderr, "[STEP]   P3 OK: hitZ=%.2f zDelta=%.3f (raw=%.3f clamped to min=%.1f +clearance=%.2f)\n",
+                hitZ, zDelta, hitZ - footPos.z, STEP_MIN_ZDELTA, STEP_CLEARANCE);
+        }
+
+        // ── Validate: test BODY sphere at the stepped position ──
+        // Effectively only BODY is validated at the stepped height.
+        // We validate BODY (index 1) to ensure it fits at the new height.
+        Vector3 steppedPos = mPosition;
+        steppedPos.z += zDelta;
+
+        int32_t steppedCell = mCollision.findCell(steppedPos);
+        if (steppedCell < 0) {
+            if (mStepLog) std::fprintf(stderr, "[STEP]   VALIDATE FAIL: steppedPos=(%.2f,%.2f,%.2f) no cell\n",
+                steppedPos.x, steppedPos.y, steppedPos.z);
+            return false;
+        }
+
+        {
+            float bodyOffsetZ = mSphereOffsetsBase[1] + mBodyPoseCurrent.z;
+            Vector3 bodyCenter = steppedPos + Vector3(0.0f, 0.0f, bodyOffsetZ);
+
+            mStepScratchContacts.clear();
+            mCollision.sphereVsCellPolygons(bodyCenter, SPHERE_RADIUS,
+                                             steppedCell, mStepScratchContacts);
+            int32_t bodyCell = mCollision.findCell(bodyCenter);
+            if (bodyCell >= 0 && bodyCell != steppedCell) {
+                mCollision.sphereVsCellPolygons(bodyCenter, SPHERE_RADIUS,
+                                                 bodyCell, mStepScratchContacts);
+            }
+
+            for (const auto &c : mStepScratchContacts) {
+                // Wall or ceiling collision at the stepped position — abort.
+                // Allow floor contacts since we expect to rest on the step.
+                if (c.normal.z < STEP_WALL_THRESHOLD && c.penetration > 0.01f) {
+                    if (mStepLog) {
+                        std::fprintf(stderr, "[STEP]   VALIDATE FAIL: BODY collision n=(%.2f,%.2f,%.2f) pen=%.3f "
+                            "bodyCenter=(%.2f,%.2f,%.2f)\n",
+                            c.normal.x, c.normal.y, c.normal.z, c.penetration,
+                            bodyCenter.x, bodyCenter.y, bodyCenter.z);
+                    }
+                    return false;
+                }
+            }
+
+            if (mStepLog) {
+                std::fprintf(stderr, "[STEP]   VALIDATE OK: bodyCenter=(%.2f,%.2f,%.2f) bodyCell=%d contacts=%zu\n",
+                    bodyCenter.x, bodyCenter.y, bodyCenter.z, bodyCell >= 0 ? bodyCell : steppedCell,
+                    mStepScratchContacts.size());
+            }
+        }
+
+        // ── Validate HEAD sphere at its CURRENT position ──
+        // HEAD validation tests at the current world position, not the stepped position.
+        // This is correct because HEAD won't actually move during the step; the
+        // spring will gradually pull it up over subsequent frames.
+        {
+            float headOffsetZ = mSphereOffsetsBase[0] + mPoseCurrent.z;
+            Vector3 headCenter = mPosition + Vector3(0.0f, 0.0f, headOffsetZ);
+
+            mStepScratchContacts.clear();
+            mCollision.sphereVsCellPolygons(headCenter, SPHERE_RADIUS,
+                                             steppedCell, mStepScratchContacts);
+            int32_t headCell = mCollision.findCell(headCenter);
+            if (headCell >= 0 && headCell != steppedCell) {
+                mCollision.sphereVsCellPolygons(headCenter, SPHERE_RADIUS,
+                                                 headCell, mStepScratchContacts);
+            }
+
+            for (const auto &c : mStepScratchContacts) {
+                // Wall or ceiling collision at the stepped position — abort.
+                // Same rejection criteria as BODY: floor contacts are OK.
+                if (c.normal.z < STEP_WALL_THRESHOLD && c.penetration > 0.01f) {
+                    if (mStepLog) {
+                        std::fprintf(stderr, "[STEP]   VALIDATE FAIL: HEAD collision n=(%.2f,%.2f,%.2f) pen=%.3f "
+                            "headCenter=(%.2f,%.2f,%.2f)\n",
+                            c.normal.x, c.normal.y, c.normal.z, c.penetration,
+                            headCenter.x, headCenter.y, headCenter.z);
+                    }
+                    return false;
+                }
+            }
+
+            if (mStepLog) {
+                std::fprintf(stderr, "[STEP]   VALIDATE OK: headCenter=(%.2f,%.2f,%.2f) headCell=%d contacts=%zu\n",
+                    headCenter.x, headCenter.y, headCenter.z, headCell >= 0 ? headCell : steppedCell,
+                    mStepScratchContacts.size());
+            }
+        }
+
+        // ── Accept the step ──
+        if (mStepLog) {
+            std::fprintf(stderr, "[STEP]   ACCEPTED: pos (%.2f,%.2f,%.2f) -> (%.2f,%.2f,%.2f) "
+                "zDelta=%.3f cell %d->%d\n",
+                mPosition.x, mPosition.y, mPosition.z,
+                steppedPos.x, steppedPos.y, steppedPos.z,
+                zDelta, mCellIdx, steppedCell);
+        }
+
+        mPosition = steppedPos;
+        mCellIdx = steppedCell;
+        mVelocity.z = 0.0f;
+        mGroundNormal = stepGroundNormal;
+
+        // HEAD spring compensation — keep camera at its current world position
+        // and let the spring smoothly pull it up to the new equilibrium.
+        // Since eye_z = mPosition.z + HEAD_OFFSET_Z + EYE_ABOVE_HEAD + mSpringPos.z,
+        // offsetting mSpringPos.z by -zDelta cancels the position change for
+        // the camera. The spring then naturally blends back toward mPoseCurrent.
+        mSpringPos.z -= zDelta;
+
+        // Destroy all terrain contacts on KNEE/SHIN/FOOT (submodels 2-4) and
+        // create a new FOOT contact at the step surface. This matches the
+        // DestroyAllTerrainContacts for the three leg sub-models, then
+        // CreateTerrainContact on FOOT with the discovered surface polygon.
+        mLastContacts.erase(
+            std::remove_if(mLastContacts.begin(), mLastContacts.end(),
+                           [](const SphereContact &c) {
+                               return c.submodelIdx >= 2 || c.submodelIdx < 0;
+                           }),
+            mLastContacts.end());
+
+        // Synthesize a new FOOT ground contact at the step surface.
+        // This gives the next frame correct ground
+        // state without requiring a new collision pass.
+        {
+            SphereContact footContact;
+            footContact.normal = stepGroundNormal;
+            footContact.penetration = 0.01f; // nominal contact
+            footContact.cellIdx = steppedCell;
+            footContact.polyIdx = -1; // synthetic (no exact poly from raycast)
+            footContact.textureIdx = stepHit.textureIndex;
+            footContact.age = 0;
+            footContact.submodelIdx = 4; // FOOT
+            mLastContacts.push_back(footContact);
+        }
+
+        // Mode transition — forces Stand mode after a
+        // successful step unless the player is already in Stand, Crouch, Swim,
+        // or Dead. This prevents stepping while in Climb, Slide, etc.
+        if (mCurrentMode != PlayerMode::Stand &&
+            mCurrentMode != PlayerMode::Crouch &&
+            mCurrentMode != PlayerMode::Swim &&
+            mCurrentMode != PlayerMode::Dead) {
+            mCurrentMode = PlayerMode::Stand;
+        }
+
+        // Break climb state — always calls BreakClimb
+        // after a successful step to cancel any active climbing.
+        if (mCurrentMode == PlayerMode::Climb) {
+            mCurrentMode = PlayerMode::Stand;
+        }
+
+        return true;
+    }
+
     /// Detect ground contact and update movement state.
     /// Any contact with an upward-facing normal (z > GROUND_NORMAL_MIN) counts
     /// as ground. Movement control on steep slopes is handled by the friction
@@ -1677,6 +2065,39 @@ private:
                     onGround = true;
                     mGroundNormal = probeNormal;
                     mGroundTextureIdx = probeTextureIdx;
+                }
+            }
+        }
+
+        // FOOT contact recovery — when the player is on ground but FOOT
+        // (submodel 4) has no ground contact in mLastContacts, probe downward
+        // from the FOOT position to re-acquire the tread below. This handles
+        // the transition between stair treads where FOOT briefly loses contact
+        // as it moves between adjacent polygons. The synthesized contact enables
+        // tryStairStep() to detect the next riser contact properly.
+        if (onGround) {
+            bool footHasGround = false;
+            for (const auto &c : mLastContacts) {
+                if (c.submodelIdx == 4 && c.normal.z > GROUND_NORMAL_MIN) {
+                    footHasGround = true;
+                    break;
+                }
+            }
+            if (!footHasGround) {
+                float footOffset = mSphereOffsetsBase[4]; // -3.0
+                Vector3 footCenter = mPosition + Vector3(0.0f, 0.0f, footOffset);
+                Vector3 probeEnd = footCenter - Vector3(0.0f, 0.0f, 0.5f); // 0.5 units down
+                RayHit footProbe;
+                if (raycastWorld(mCollision.getWR(), footCenter, probeEnd, footProbe)
+                    && footProbe.normal.z > GROUND_NORMAL_MIN) {
+                    SphereContact fc;
+                    fc.normal = footProbe.normal;
+                    fc.penetration = 0.01f;
+                    fc.cellIdx = mCellIdx;
+                    fc.polyIdx = -1; // synthetic contact
+                    fc.textureIdx = footProbe.textureIndex;
+                    fc.submodelIdx = 4; // FOOT
+                    mLastContacts.push_back(fc);
                 }
             }
         }
@@ -2124,8 +2545,7 @@ private:
                     tension, HEAD_SPRING_BASE_DAMPING,
                     HEAD_SPRING_Z_SCALE, HEAD_SPRING_VEL_CAP, dt);
 
-                // Adaptive velocity multiplier: min(50, max(30, 30/d²))
-                // Applied AFTER spring cap (matching original order)
+                // Adaptive velocity multiplier: min(50, max(30, 30/d² (matching original order)
                 Vector3 remain = headTarget - mMantleHeadPos;
                 float d2 = glm::dot(remain, remain);
                 float velMult = std::min(50.0f, std::max(30.0f, 30.0f / std::max(d2, 0.01f)));
@@ -2518,8 +2938,8 @@ private:
             if (poseReady) {
                 mLandingActive = false;
                 // After landing, resume walking or return to idle.
-                // If leaning, re-activate the lean pose — the original gates
-                // rest pose activation on !IsLeaning(), so lean survives landing.
+                // If leaning, re-activate the lean pose — gates
+                // rest pose activation on is_leaning, so lean survives landing.
                 if (isWalking) {
                     activateStride();
                     mStrideDist = 0.0f;
@@ -2762,7 +3182,7 @@ private:
 
     // ── Overridable physics parameters (from P$PhysAttr/P$PhysDims or defaults) ──
     float mMass = PLAYER_MASS;
-    float mDensity = 0.9f;          // buoyancy density — 0.9 = positively buoyant (original default)
+    float mDensity = 0.9f;          // buoyancy density — 0.9 (positive)
     float mElasticity = 0.0f;
     float mSphereRadii[NUM_SPHERES] = {
         SPHERE_RADIUS, SPHERE_RADIUS, 0.0f, 0.0f, 0.0f
@@ -2826,6 +3246,10 @@ private:
 
     // Scratch buffer for groundTest() probe — avoids per-step heap allocation
     std::vector<SphereContact> mGroundProbeContacts;
+    // Scratch buffers for tryStairStep() probes — avoids per-step heap allocation
+    std::vector<SphereContact> mStepScratchContacts;
+    std::vector<int32_t>       mStepBFSQueue;    // BFS cell queue for multi-hop portal traversal
+    std::vector<bool>          mStepBFSVisited;  // visited flags for BFS (sized to numCells)
 
     // ── Render interpolation state ──
     // "Fix Your Timestep" interpolation — smooth rendering between fixed physics steps.
@@ -2861,6 +3285,7 @@ private:
 
     // ── Diagnostic logging state ──
     FILE *mLogFile = nullptr;   // per-timestep CSV log file (null = disabled)
+    bool  mStepLog = false;     // stair step diagnostics to stderr ([STEP] prefix)
     float mCamPitch = 0.0f;    // camera pitch from renderer (for logging only)
 
     /// Write one CSV row with full physics state. Called at end of fixedStep().
