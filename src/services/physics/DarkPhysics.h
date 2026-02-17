@@ -62,10 +62,10 @@ public:
     /// Optionally accepts a PhysicsTimestep preset (default: MODERN = 60Hz).
     /// The WRParsedData must outlive this object.
     explicit DarkPhysics(const WRParsedData &wr,
-                         const PlayerPhysics::PhysicsTimestep &ts = PlayerPhysics::MODERN)
+                         const PhysicsTimestep &ts = MODERN)
         : mCollision(wr)
         , mPlayer(mCollision, ts)
-        , mGravity(0.0f, 0.0f, -PlayerPhysics::GRAVITY)
+        , mGravity(0.0f, 0.0f, -GRAVITY)
     {
     }
 
@@ -270,7 +270,7 @@ public:
     /// Apply player physics configuration from P$PhysAttr and P$PhysDims properties.
     /// This overrides the default hardcoded constants with per-object values from
     /// the archetype inheritance chain. Called once during level load.
-    void applyPlayerConfig(const PlayerPhysics::PlayerPhysicsConfig &cfg) {
+    void applyPlayerConfig(const PlayerPhysicsConfig &cfg) {
         mPlayer.applyConfig(cfg);
         // Keep mGravity vector consistent with the new gravity magnitude
         mGravity = Vector3(0.0f, 0.0f, -mPlayer.getGravityMagnitude());
