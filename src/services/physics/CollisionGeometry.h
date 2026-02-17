@@ -71,6 +71,11 @@ struct SphereContact {
     int32_t polyIdx;       // polygon index within that cell
     int32_t textureIdx;    // texture index (-1 if untextured)
     uint8_t age = 0;       // frames since last detection (0 = just detected this frame)
+    int8_t submodelIdx = -1; // which player submodel generated this contact (0-4, -1=unknown)
+    bool isEdge = false;   // true = edge/vertex contact, false = face contact.
+                           // The original engine classifies contacts as TerrainFace,
+                           // TerrainEdge, or TerrainVertex. Only TerrainFace triggers
+                           // stair stepping (CheckStep uses == kPC_TerrainFace).
 };
 
 /// Collision geometry wrapper over WR parsed data.
@@ -186,6 +191,13 @@ public:
                 // but may still intersect a polygon edge. Only test for real spheres
                 // (HEAD/BODY), not point detectors (SHIN/KNEE/FOOT).
                 sphereVsPolygonEdges(center, radius, cell, pi, cellIdx, outContacts);
+            } else {
+                // Point detector edge fallback — test if the point is very close
+                // to a polygon edge. Without this, FOOT/SHIN/KNEE miss stair risers
+                // at polygon boundaries where the point doesn't project inside
+                // either the riser face or the tread face. Uses a small fixed
+                // threshold since there's no sphere radius to define intersection.
+                pointVsPolygonEdges(center, cell, pi, cellIdx, outContacts);
             }
         }
     }
@@ -455,6 +467,75 @@ private:
                 contact.cellIdx = cellIdx;
                 contact.polyIdx = pi;
                 contact.textureIdx = textureIdx;
+                contact.isEdge = true;  // edge contact (kPC_TerrainEdge equivalent)
+                outContacts.push_back(contact);
+            }
+        }
+    }
+
+    /// Point-vs-polygon-edge fallback for zero-radius submodels (FOOT/SHIN/KNEE).
+    /// Similar to sphereVsPolygonEdges() but uses a fixed distance threshold
+    /// instead of sphere radius. Generates contacts when a point detector is
+    /// within POINT_EDGE_THRESHOLD of a polygon edge — catches stair riser
+    /// contacts that the face projection test misses at polygon boundaries.
+    ///
+    /// Contact normal points from the closest edge point toward the detector
+    /// (same as sphere version). Penetration = threshold - distance.
+    inline void pointVsPolygonEdges(
+        const Vector3 &center,
+        const WRParsedCell &cell, int pi, int32_t cellIdx,
+        std::vector<SphereContact> &outContacts) const
+    {
+        static constexpr float POINT_EDGE_THRESHOLD = 0.1f;
+
+        const auto &indices = cell.polyIndices[pi];
+        int n = static_cast<int>(indices.size());
+        if (n < 3) return;
+
+        int32_t textureIdx = -1;
+        if (pi < static_cast<int>(cell.numTextured))
+            textureIdx = static_cast<int32_t>(cell.texturing[pi].txt);
+
+        for (int i = 0; i < n; ++i) {
+            uint8_t idxA = indices[i];
+            uint8_t idxB = indices[(i + 1) % n];
+
+            // De-duplicate shared edges (same as sphere version)
+            uint16_t edgeKey = (static_cast<uint16_t>(std::min(idxA, idxB)) << 8)
+                             | static_cast<uint16_t>(std::max(idxA, idxB));
+            bool seen = false;
+            for (auto k : mVisitedEdges) {
+                if (k == edgeKey) { seen = true; break; }
+            }
+            if (seen) continue;
+            mVisitedEdges.push_back(edgeKey);
+
+            const Vector3 &a = cell.vertices[idxA];
+            const Vector3 &b = cell.vertices[idxB];
+
+            // Closest point on segment a→b to detector center
+            // (same algorithm as Godot's geometry_3d.h::get_closest_point_to_segment)
+            Vector3 edge = b - a;
+            float edgeLenSq = glm::dot(edge, edge);
+            if (edgeLenSq < 1e-12f) continue; // degenerate edge
+
+            float t = glm::dot(center - a, edge) / edgeLenSq;
+            t = std::clamp(t, 0.0f, 1.0f);
+            Vector3 closest = a + edge * t;
+
+            Vector3 diff = center - closest;
+            float distSq = glm::dot(diff, diff);
+
+            if (distSq < POINT_EDGE_THRESHOLD * POINT_EDGE_THRESHOLD
+                && distSq > 1e-12f) {
+                float dist = std::sqrt(distSq);
+                SphereContact contact;
+                contact.normal = diff / dist;
+                contact.penetration = POINT_EDGE_THRESHOLD - dist;
+                contact.cellIdx = cellIdx;
+                contact.polyIdx = pi;
+                contact.textureIdx = textureIdx;
+                contact.isEdge = true;  // edge contact (kPC_TerrainEdge equivalent)
                 outContacts.push_back(contact);
             }
         }
