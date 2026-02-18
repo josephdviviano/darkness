@@ -153,6 +153,12 @@ public:
     void setStepLog(bool enable) { mStepLog = enable; }
     bool stepLogEnabled() const { return mStepLog; }
 
+    /// Enable/disable climbing diagnostics to stderr ([CLIMB] prefix).
+    void setClimbLog(bool enable) { mClimbLog = enable; }
+
+    /// True if the player is actively climbing an OBB (ladder, climbable surface).
+    bool isClimbing() const { return mClimbingObjId >= 0; }
+
     /// Set the camera pitch from the renderer (for logging — physics doesn't own pitch).
     void setCameraPitch(float pitch) { mCamPitch = pitch; }
 
@@ -414,6 +420,19 @@ public:
         mObjectWorld = ocw;
     }
 
+    /// Set per-texture friction lookup table (indexed by TXLIST texture index).
+    /// Built at mission load from P$Friction on texture archetypes in dark.gam.
+    void setFrictionTable(const std::vector<float> &table) {
+        mFrictionTable = table;
+    }
+
+    /// Set per-texture climbability lookup table (indexed by TXLIST texture index).
+    /// Built at mission load from P$Climbabil on texture archetypes in dark.gam.
+    /// Climbability boosts friction on steep surfaces (not a climb-mode trigger).
+    void setClimbabilityTable(const std::vector<float> &table) {
+        mClimbabilityTable = table;
+    }
+
 private:
     // ── Internal simulation steps ──
 
@@ -440,7 +459,11 @@ private:
         // When friction is between 0.5 and 1.0, jump velocity is scaled down
         // proportionally, making slope-edge jumps weaker.
         if (mJumpRequested && !mMotionDisabled) {
-            if (isOnGround()) {
+            if (mCurrentMode == PlayerMode::Climb) {
+                // Jump off climbing surface — reflected/projected impulse away from wall
+                breakClimb(true);
+                // Don't clear mJumpRequested yet — mantle check at step 13 may use it
+            } else if (isOnGround()) {
                 float jumpFriction = computeGroundFriction();
                 if (jumpFriction > JUMP_MIN_FRICTION) {
                     // Remove vertical velocity component, boost horizontal by 5%,
@@ -532,8 +555,25 @@ private:
         //      Only when grounded and moving horizontally.
         tryStairStep();
 
+        // 10c. Climbing — detect/maintain/break climb on climbable OBB objects.
+        //      Must run after collision resolution (needs fresh contacts) and after
+        //      stair step (stair step breaks climb). Before detectGround so climbing
+        //      prevents ground transition.
+        if (!mMantling && !mMotionDisabled) {
+            if (mCurrentMode == PlayerMode::Climb)
+                checkClimbContinuation();
+            else if (mCurrentMode != PlayerMode::Swim)
+                checkClimb();
+        }
+
         // 11. Detect ground and update movement state
         detectGround();
+
+        // 11b. Ground breaks climb — if we've reached ground while climbing,
+        // transition to standing. This handles climbing down to the bottom
+        // of a ladder or losing the surface while near the floor.
+        if (mCurrentMode == PlayerMode::Climb && isOnGround())
+            breakClimb(false);
 
         // 12. Update cell index again (collision may have shifted position)
         // Relies purely on gravity + collision + constraint response to keep
@@ -565,6 +605,7 @@ private:
     #include "PlayerPhysics_Collision.inl"
     #include "PlayerPhysics_StairStep.inl"
     #include "PlayerPhysics_Mantle.inl"
+    #include "PlayerPhysics_Climb.inl"
     #include "PlayerPhysics_MotionPose.inl"
     #include "PlayerPhysics_Diagnostics.inl"
 
@@ -593,6 +634,14 @@ private:
     MantleState mMantleState = MantleState::None;  // current mantle phase
     float mMantleTimer   = 0.0f;   // time in current mantle phase
     Vector3 mMantleTarget{0.0f};   // target position for mantle completion
+
+    // ── Climbing state ──
+    // Active when player is attached to a climbable OBB (ladder, climbable surface).
+    // Gravity is suppressed; forward/backward input remapped to up/down along the wall.
+    int32_t mClimbingObjId = -1;       // Object ID being climbed (-1 = not climbing)
+    Vector3 mClimbFaceNormal{0.0f};    // world-space normal of the climbable face
+    int     mClimbFaceIdx = -1;        // which OBB face (0-5)
+    bool    mClimbLog = false;         // diagnostics to stderr
 
     // ── Mantle spring state ──
     // Virtual head position driven by the spring during mantling.
@@ -688,6 +737,13 @@ private:
     // Pre-allocated scratch buffers for resolveCollisions() — avoids per-step heap allocs
     std::vector<SphereContact> mIterContacts;                // per-iteration contact accumulator
     std::vector<std::pair<Vector3, float>> mPushes;          // de-duplicated push normals
+
+    // ── Per-texture friction table (indexed by TXLIST texture index, default 1.0) ──
+    std::vector<float> mFrictionTable;
+
+    // ── Per-texture climbability table (indexed by TXLIST texture index, default 0.0) ──
+    // Climbability boosts friction on steep surfaces — NOT a climb-mode trigger.
+    std::vector<float> mClimbabilityTable;
 
     // ── Callbacks ──
     FootstepCallback mFootstepCb;            // footstep sound event (Phase 3 Audio stub)

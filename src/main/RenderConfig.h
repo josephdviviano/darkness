@@ -124,6 +124,7 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             if (dev["portal_culling"])      cfg.portalCulling     = dev["portal_culling"].as<bool>();
             if (dev["force_flicker"])       cfg.forceFlicker      = dev["force_flicker"].as<bool>();
             if (dev["camera_collision"])    cfg.cameraCollision   = dev["camera_collision"].as<bool>();
+            if (dev["step_log"])            cfg.stepLog           = dev["step_log"].as<bool>();
         }
 
         std::fprintf(stderr, "Loaded config from %s\n", path.c_str());
