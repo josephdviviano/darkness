@@ -472,7 +472,9 @@ int main(int argc, char *argv[]) {
 
     if (needsServices) {
         logger.registerLogListener(&stdlog);
-        logger.setLogLevel(Logger::LOG_LEVEL_INFO);
+        // Only show errors — INFO floods stderr and drowns the stdout data output.
+        // Service initialization is verbose; the user wants clean data on stdout.
+        logger.setLogLevel(Logger::LOG_LEVEL_ERROR);
     } else {
         logger.setLogLevel(Logger::LOG_LEVEL_FATAL);
     }

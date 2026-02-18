@@ -182,6 +182,15 @@ static constexpr float MANTLE_FWD_TIME  = 0.4f;    // State 3: forward movement 
 static constexpr float MANTLE_PULLBACK  = 0.55f;   // pull back from wall (approx half radius)
 static constexpr float MANTLE_CONVERGE  = 0.0001f; // distance² convergence threshold (= 0.01 units)
 
+// ── Climbing parameters ──
+// OBB climbing — player attaches to objects with climbable_sides bitmask (ladders, etc.).
+// Forward input = climb up, backward = climb down, strafe = lateral along wall.
+// Gravity is suppressed during climbing; downward velocity is zeroed when no downward
+// input is given. The original Dark Engine disabled terrain wall climbing ("don't climb
+// on walls, spidey") — only OBB objects with climbable_sides support climbing.
+static constexpr float CLIMB_JUMP_SCALE    = 5.0f;   // velocity impulse on jump-off
+static constexpr float CLIMB_JUMP_REFLECT  = 0.5f;   // damping for reflected jump direction
+
 // Movement control — force/mass-based system. See applyMovement() for full derivation.
 static constexpr float CONTROL_MULTIPLIER = 11.0f;
 static constexpr float FRICTION_FACTOR    = 0.03f;
@@ -205,9 +214,6 @@ static constexpr float WATER_CONTROL_SCALE = 0.5f;
 
 // Jump impulse scaling in water (half-strength jumps from pool floor/treading water).
 static constexpr float WATER_JUMP_SCALE = 0.5f;
-
-// Air control fraction — scales ground-equivalent friction for airborne steering.
-static constexpr float AIR_CONTROL_FRAC = 0.3f;
 
 /// Physics timestep configuration — bundles rate-dependent parameters.
 /// Spring constants are NOT here (they're identical across all presets).

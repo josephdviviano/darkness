@@ -259,12 +259,29 @@ public:
         return mPlayer.isMantling();
     }
 
+    bool isPlayerClimbing() const override {
+        return mPlayer.isClimbing();
+    }
+
     void disablePlayerMotion() override {
         mPlayer.disableMotion();
     }
 
     void enablePlayerMotion() override {
         mPlayer.enableMotion();
+    }
+
+    /// Set per-texture friction lookup table (indexed by TXLIST texture index).
+    /// Built at mission load from P$Friction on texture archetypes in dark.gam.
+    void setFrictionTable(const std::vector<float> &table) {
+        mPlayer.setFrictionTable(table);
+    }
+
+    /// Set per-texture climbability lookup table (indexed by TXLIST texture index).
+    /// Built at mission load from P$Climbabil on texture archetypes in dark.gam.
+    /// Non-zero values boost friction on steep surfaces (not a climb-mode trigger).
+    void setClimbabilityTable(const std::vector<float> &table) {
+        mPlayer.setClimbabilityTable(table);
     }
 
     /// Apply player physics configuration from P$PhysAttr and P$PhysDims properties.

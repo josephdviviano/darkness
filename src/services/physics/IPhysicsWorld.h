@@ -258,6 +258,9 @@ public:
     /// True if the player is in the middle of a mantle animation.
     virtual bool isPlayerMantling() const = 0;
 
+    /// True if the player is attached to a climbable surface (ladder, etc.)
+    virtual bool isPlayerClimbing() const = 0;
+
     /// Disable all player motion (for cutscenes, death sequences).
     virtual void disablePlayerMotion() = 0;
 
