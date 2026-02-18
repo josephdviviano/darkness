@@ -188,6 +188,13 @@ static constexpr float MANTLE_CONVERGE  = 0.0001f; // distance² convergence thr
 // Gravity is suppressed during climbing; downward velocity is zeroed when no downward
 // input is given. The original Dark Engine disabled terrain wall climbing ("don't climb
 // on walls, spidey") — only OBB objects with climbable_sides support climbing.
+//
+// Climbing base speeds: the original engine uses "slow" input speeds (half of normal)
+// as the base, then applies the 0.5× mode scale on top. Effective speeds:
+//   forward: 5.5 × 0.5 = 2.75,  backward: 2.75 × 0.5 = 1.375,  strafe: 3.85 × 0.5 = 1.925
+static constexpr float CLIMB_FWD_SPEED     = 5.5f;   // half of WALK_SPEED
+static constexpr float CLIMB_BACK_SPEED    = 2.75f;   // half of BACKWARD_SPEED
+static constexpr float CLIMB_STR_SPEED     = 3.85f;   // half of SIDESTEP_SPEED
 static constexpr float CLIMB_JUMP_SCALE    = 5.0f;   // velocity impulse on jump-off
 static constexpr float CLIMB_JUMP_REFLECT  = 0.5f;   // damping for reflected jump direction
 
