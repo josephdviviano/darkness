@@ -48,7 +48,7 @@ physics:
   #   "ultra" or 120  = 120Hz (high fidelity, 1 collision iteration)
   # Higher rates give smoother collision but cost more CPU.
   # All rates produce equivalent physics behavior (same walk speed, jump height,
-  # head bob timing) thanks to rate-independent exponential decay formulation.
+  # head bob timing).
   # Toggle at runtime via debug console (backtick key).
   # CLI: --physics-rate <12|60|120>
   rate: 60
@@ -73,3 +73,8 @@ developer:
   # Camera collision with world geometry (default: false)
   # Toggle at runtime with V key
   camera_collision: false
+
+  # Log stair step diagnostics to stderr (default: false)
+  # Prints [STEP] messages for debugging stair-step logic
+  # CLI: --step-log
+  step_log: false
