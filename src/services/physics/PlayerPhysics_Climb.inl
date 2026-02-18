@@ -48,8 +48,12 @@
             mClimbFaceIdx = faceIdx;
             mCurrentMode = PlayerMode::Climb;
 
-            // Zero velocity on climb entry — start fresh from wall
-            mVelocity = Vector3(0.0f);
+            // Remove velocity component going into the wall (preserve tangential).
+            // The original engine applies face constraints on entry rather than
+            // zeroing all velocity, avoiding a "hitch" when grabbing a ladder at speed.
+            float normalVel = glm::dot(mVelocity, faceNormal);
+            if (normalVel < 0.0f)
+                mVelocity -= faceNormal * normalVel;
 
             // Cancel any active lean
             if (mLeanDir != 0) {
@@ -114,10 +118,19 @@
             }
         }
 
-        // Update face normal from contacts if player moved to a different face
+        // Update face normal from contacts — supports multi-face blending for smooth
+        // corner transitions. The original engine uses weighted edge constraints when
+        // the player is in front of 2 faces, producing a blended edge normal.
+        bool hasCurrentContact = false;
+        Vector3 blendedNormal(0.0f);
+        int lastFace = -1;
+        int faceCount = 0;
+
         for (const auto &c : mLastContacts) {
             if (c.objectId != mClimbingObjId || c.cellIdx != -1)
                 continue;
+
+            hasCurrentContact = true;
 
             int faceIdx = c.polyIdx & 0xF;
             if (faceIdx < 0 || faceIdx > 5)
@@ -126,17 +139,51 @@
             if ((body->climbableSides & (1 << faceIdx)) == 0)
                 continue;
 
-            if (faceIdx != mClimbFaceIdx) {
-                mClimbFaceNormal = getOBBFaceNormal(*body, faceIdx);
-                mClimbFaceIdx = faceIdx;
-                if (mClimbLog) {
-                    std::fprintf(stderr, "[CLIMB] Face change: face=%d "
-                        "normal=(%.2f,%.2f,%.2f)\n",
-                        faceIdx, mClimbFaceNormal.x, mClimbFaceNormal.y,
-                        mClimbFaceNormal.z);
-                }
+            // Accumulate normals for blending (handles edge/corner cases)
+            Vector3 faceN = getOBBFaceNormal(*body, faceIdx);
+            if (faceCount == 0 || faceIdx != lastFace) {
+                blendedNormal += faceN;
+                lastFace = faceIdx;
+                ++faceCount;
             }
-            break;
+        }
+
+        if (faceCount > 0) {
+            float len = glm::length(blendedNormal);
+            if (len > 0.001f)
+                mClimbFaceNormal = blendedNormal / len;
+            mClimbFaceIdx = lastFace;
+        }
+
+        // Adjacent OBB transfer: if we have no contacts on the current climbing
+        // object but ARE touching a different climbable OBB, transfer directly.
+        if (!hasCurrentContact) {
+            for (const auto &c : mLastContacts) {
+                if (c.objectId <= 0 || c.objectId == mClimbingObjId || c.cellIdx != -1)
+                    continue;
+
+                const auto *newBody = mObjectWorld->findBodyByObjID(c.objectId);
+                if (!newBody || newBody->climbableSides == 0)
+                    continue;
+
+                int newFace = c.polyIdx & 0xF;
+                if (newFace < 0 || newFace > 5)
+                    continue;
+                if ((newBody->climbableSides & (1 << newFace)) == 0)
+                    continue;
+
+                // Transfer to new climbing object
+                mClimbingObjId = c.objectId;
+                mClimbFaceIdx = newFace;
+                mClimbFaceNormal = getOBBFaceNormal(*newBody, newFace);
+                if (mClimbLog) {
+                    std::fprintf(stderr, "[CLIMB] Transfer to objID=%d face=%d "
+                        "normal=(%.2f,%.2f,%.2f)\n",
+                        c.objectId, newFace,
+                        mClimbFaceNormal.x, mClimbFaceNormal.y, mClimbFaceNormal.z);
+                }
+                return;
+            }
         }
     }
 
@@ -153,20 +200,41 @@
         if (jumping) {
             // Applies the NORMAL jump velocity first
             // (strip vertical, boost horizontal 5%, add 14 up), then adds
-            // the climb jump-off impulse on top. This gives strong horizontal
-            // momentum when jumping off ladders.
+            // the climb jump-off impulse on top.
 
             // Step 1: Normal jump — strip vertical, boost horizontal, add upward
             mVelocity.z = 0.0f;                    // remove vertical component
             mVelocity *= 1.05f;                     // 5% horizontal boost
             mVelocity.z += JUMP_IMPULSE;            // 14.0 upward
 
-            // Step 2: Compute climb jump-off direction from facing vs surface
+            // Step 2: Determine jump direction — check for near-top vault first
             Vector3 forward(mCosYaw, mSinYaw, 0.0f);
             float facingDot = glm::dot(forward, mClimbFaceNormal);
 
+            // Near-top-of-OBB vault detection: if the player's projection along
+            // the OBB's Z axis is within 1.0 distance-squared of the top point,
+            // apply a strong forward push ("jump_thru") to vault over the top.
+            // This is the key mechanism for dismounting ladders at the top.
+            bool jumpThru = false;
+            const auto *body = mObjectWorld
+                ? mObjectWorld->findBodyByObjID(mClimbingObjId) : nullptr;
+            if (body) {
+                Vector3 offset = mPosition - body->worldPos;
+                Vector3 topPt = body->rotation[2] * (body->edgeLengths.z * 0.5f);
+                Vector3 projPt = body->rotation[2] * glm::dot(offset, body->rotation[2]);
+                if (glm::length2(topPt - projPt) < 1.0f)
+                    jumpThru = true;
+            }
+
             Vector3 jumpDir;
-            if (facingDot > 0.0f) {
+            if (jumpThru) {
+                // Near top of OBB: vault forward with strong push + slight upward.
+                // Magnitude ~2.0, scaled by CLIMB_JUMP_SCALE(5.0) = ~10 forward.
+                jumpDir = forward * 2.0f + Vector3(0.0f, 0.0f, 0.1f);
+                if (mClimbLog) {
+                    std::fprintf(stderr, "[CLIMB] jump_thru vault: forward push\n");
+                }
+            } else if (facingDot > 0.0f) {
                 // Facing away from surface — jump in facing direction
                 // forward is already unit length, no normalize needed
                 jumpDir = forward;
