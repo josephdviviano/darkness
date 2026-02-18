@@ -33,6 +33,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <queue>
+#include <unistd.h> // dup2, fileno
 
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -120,7 +121,15 @@ static void printHelp() {
         "  --force-flicker Force all animated lights to flicker mode (debug).\n"
         "  --linear-mips  Gamma-correct mipmap generation (sRGB linearization).\n"
         "  --sharp-mips   Sharpen mip levels to preserve detail at distance.\n"
+        "  --physics-rate <hz>\n"
+        "                 Physics timestep: 12 (vintage), 60 (modern/default), 120 (ultra).\n"
+        "  --show-fallback Show colored cubes for objects with missing models.\n"
+        "  --wave-amp <f> Water wave amplitude, 0.0-10.0 (default: 0.3).\n"
+        "  --uv-distort <f> Water UV distortion, 0.0-0.1 (default: 0.015).\n"
+        "  --water-rot <f> Water UV rotation speed in rad/s, 0.0-1.0 (default: 0.015).\n"
+        "  --water-scroll <f> Water UV scroll speed, 0.0-1.0 (default: 0.05).\n"
         "  --step-log     Log stair step diagnostics to stderr ([STEP] prefix).\n"
+        "  --debug-objects Dump per-object filtering diagnostics to stderr.\n"
         "  --config <path> Path to YAML config file (default: ./darknessRender.yaml).\n"
         "  --help         Show this help message.\n"
         "\n"
@@ -143,6 +152,7 @@ static void printHelp() {
         "  BS+V           Toggle camera collision (clip/noclip) [fly mode only]\n"
         "  BS+M/N         Cycle model isolation (next/prev)\n"
         "  BS+G           Toggle physics diagnostic log (physics_log.csv)\n"
+        "  BS+R           Toggle raycast debug visualization\n"
         "\n"
         "Physics mode controls (when BS+P is active):\n"
         "  WASD           Walk forward/strafe\n"
@@ -748,7 +758,7 @@ static void updateTitleBar(SDL_Window *window, const Darkness::RuntimeState &sta
 }
 
 // ── Register debug console settings ──
-// Binds 13 runtime-changeable settings to the debug console (opened with backtick).
+// Binds 15 runtime-changeable settings to the debug console (opened with backtick).
 // Lambdas capture state by reference and update the title bar when relevant settings change.
 static void registerConsoleSettings(
     Darkness::DebugConsole &dbgConsole,
@@ -1357,6 +1367,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Route all engine diagnostics to stdout so standard pipes and redirects work:
+    //   ./darknessRender ... | grep FRICTION
+    //   ./darknessRender ... > log.txt
+    // The render binary is interactive (SDL window), so stdout carries no structured
+    // data. Merging stderr into stdout makes all fprintf(stderr, ...) output
+    // easily filterable. Line-buffering ensures output appears immediately.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    dup2(fileno(stdout), fileno(stderr));
+
     // Load YAML config (defaults to ./darknessRender.yaml if no --config flag)
     std::string configPath = cli.configPath.empty() ? "darknessRender.yaml" : cli.configPath;
     Darkness::loadConfigFromYAML(configPath, cfg);
@@ -1495,6 +1514,97 @@ int main(int argc, char *argv[]) {
 
     // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
     loadWorldTextures(misPath, resPath, mission);
+
+    // ── Build per-texture friction table from P$Friction on texture archetypes ──
+    // The original engine maps each TXLIST texture index to a "t_fam/<family>/<name>"
+    // archetype in dark.gam, then reads P$Friction (float, default 1.0) from that
+    // archetype (with MetaProp inheritance). We build a flat lookup table at load time
+    // to avoid string lookups per physics step.
+    //
+    // TODO: The shipping Thief 2 gamesys only has 3 P$Friction records (city/roof,
+    // city/rooftile at 0.15, and object 2 at 0.0). Ice/snow textures (vmawwin/iceclif1
+    // etc.) have no friction override — verify whether the original engine has additional
+    // friction sources beyond P$Friction (e.g. texture-name heuristics, per-mission
+    // overrides, or Climbability affecting friction). May need a name-based fallback
+    // or manual friction table for ice/snow surfaces if gameplay testing reveals issues.
+    {
+        Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        size_t numTex = mission.txList.textures.size();
+        mission.frictionTable.assign(numTex, 1.0f);
+
+        int nonDefault = 0;
+        for (size_t i = 0; i < numTex; ++i) {
+            const auto &entry = mission.txList.textures[i];
+            if (entry.family.empty() && entry.name.empty())
+                continue;
+
+            // Texture archetypes in dark.gam are named "t_fam/<family>/<name>"
+            // with original case preserved (objectNamed is case-sensitive).
+            std::string archName = "t_fam/" + entry.fullPath;
+
+            int archID = objSvc->named(archName);
+            if (archID == 0) continue;  // no archetype found for this texture
+
+            float friction = 1.0f;
+            if (Darkness::getTypedProperty<float>(propSvc.get(), "Friction", archID, friction)) {
+                if (std::fabs(friction - 1.0f) > 0.001f) {
+                    mission.frictionTable[i] = friction;
+                    ++nonDefault;
+                    std::fprintf(stderr, "[FRICTION] %s: %.2f (idx %zu)\n",
+                                 archName.c_str(), friction, i);
+                }
+            }
+        }
+        std::fprintf(stderr, "[FRICTION] %d textures with non-default friction out of %zu loaded\n",
+                     nonDefault, numTex);
+
+        // Pass friction table to player physics
+        if (state.physics) {
+            state.physics->setFrictionTable(mission.frictionTable);
+        }
+    }
+
+    // ── Build per-texture climbability table from P$Climbabil ──
+    // Same pattern as friction table above. P$Climbabil is a single float
+    // "factor" on texture archetypes. Non-zero values boost friction on steep
+    // surfaces (helping the player walk up ramps) — this is NOT a climb-mode
+    // trigger. The original engine disabled terrain wall climbing in shipping
+    // Thief 2; only OBB objects with climbable_sides support actual climbing.
+    {
+        Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        size_t numTex = mission.txList.textures.size();
+        mission.climbabilityTable.assign(numTex, 0.0f);
+
+        int nonDefault = 0;
+        for (size_t i = 0; i < numTex; ++i) {
+            const auto &entry = mission.txList.textures[i];
+            if (entry.family.empty() && entry.name.empty())
+                continue;
+
+            std::string archName = "t_fam/" + entry.fullPath;
+            int archID = objSvc->named(archName);
+            if (archID == 0) continue;
+
+            float climbability = 0.0f;
+            if (Darkness::getTypedProperty<float>(propSvc.get(), "Climbabil", archID, climbability)) {
+                if (climbability > 0.001f) {
+                    mission.climbabilityTable[i] = climbability;
+                    ++nonDefault;
+                    std::fprintf(stderr, "[CLIMBABILITY] %s: %.2f (idx %zu)\n",
+                                 archName.c_str(), climbability, i);
+                }
+            }
+        }
+        std::fprintf(stderr, "[CLIMBABILITY] %d textures with non-zero climbability out of %zu loaded\n",
+                     nonDefault, numTex);
+
+        // Pass climbability table to player physics
+        if (state.physics) {
+            state.physics->setClimbabilityTable(mission.climbabilityTable);
+        }
+    }
 
     // ── Load object assets: properties, .bin models, textures from obj.crf ──
     loadObjectAssets(misPath, resPath, cfg, mission, state);

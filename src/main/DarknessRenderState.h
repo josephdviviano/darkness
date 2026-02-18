@@ -93,6 +93,15 @@ struct MissionData {
     std::unordered_map<std::string, ParsedBinMesh>    parsedModels;
     std::unordered_map<std::string, DecodedImage>     objTexImages;
 
+    // Per-texture terrain friction (indexed by TXLIST texture index, default 1.0).
+    // Built from P$Friction on texture archetype objects in dark.gam.
+    std::vector<float>                                frictionTable;
+
+    // Per-texture climbability factor (indexed by TXLIST texture index, default 0.0).
+    // Built from P$Climbabil on texture archetype objects in dark.gam.
+    // Non-zero values boost friction on steep surfaces (NOT a climb-mode trigger).
+    std::vector<float>                                climbabilityTable;
+
     // Mission metadata
     SpawnInfo                                         spawnInfo;
     std::string                                       missionName;

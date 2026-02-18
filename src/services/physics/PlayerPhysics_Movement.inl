@@ -4,6 +4,10 @@
     /// friction/stride but gravity still applies — walking off a ledge transitions naturally
     /// into a fall instead of hovering for the grace duration.
     inline void applyGravity() {
+        // No gravity while climbing or mantling. Climbing friction handles wall traction instead.
+        if (mCurrentMode == PlayerMode::Climb || mMantling)
+            return;
+
         if (!isOnGround() || mGroundGraceActive) {
             // Z-up: gravity pulls downward (uses scaled gravity for per-room variation)
             mVelocity.z -= mGravityMag * mTimestep.fixedDt;
@@ -88,6 +92,21 @@
             totalFriction = FRICTION_FACTOR * mGroundNormal.z * mGravityMag;
         }
 
+        // Climbability boosts friction on steep surfaces (Dark Engine convention).
+        // With climbability >= 1.0, friction is raised to full ground-level friction,
+        // allowing the player to walk on otherwise un-walkable steep slopes.
+        // This is NOT a climb-mode trigger — just a friction multiplier.
+        float maxFriction = FRICTION_FACTOR * mGravityMag;
+        if (totalFriction < maxFriction) {
+            float climbFactor = 0.0f;
+            for (const auto &c : mLastContacts) {
+                if (c.normal.z > 0.0f)
+                    climbFactor = std::max(climbFactor, getTerrainClimbability(c.textureIdx));
+            }
+            if (climbFactor > 0.0f)
+                totalFriction += (maxFriction - totalFriction) * std::min(climbFactor, 1.0f);
+        }
+
         // Water base friction provides drag when submerged with no ground contacts
         if (totalFriction == 0.0f && mCurrentMode == PlayerMode::Swim) {
             totalFriction = WATER_BASE_FRICTION;
@@ -95,12 +114,22 @@
         return totalFriction;
     }
 
-    /// Per-terrain friction multiplier (default 1.0).
-    /// Infrastructure for future terrain property lookup from texture index.
-    /// When terrain properties are loaded, this can map textureIdx to the
-    /// per-texture friction scale from the level's property data.
-    inline float getTerrainFriction(int32_t /*textureIdx*/) const {
+    /// Per-terrain friction multiplier from P$Friction on texture archetypes in dark.gam.
+    /// Lookup table built at mission load (setFrictionTable). Default 1.0 for textures
+    /// without explicit friction or if table not loaded.
+    inline float getTerrainFriction(int32_t textureIdx) const {
+        if (textureIdx >= 0 && textureIdx < static_cast<int32_t>(mFrictionTable.size()))
+            return mFrictionTable[textureIdx];
         return 1.0f;
+    }
+
+    /// Per-terrain climbability multiplier from P$Climbabil on texture archetypes.
+    /// Climbability boosts friction on steep surfaces — NOT a climb-mode trigger.
+    /// Default 0.0 for textures without explicit climbability or if table not loaded.
+    inline float getTerrainClimbability(int32_t textureIdx) const {
+        if (textureIdx >= 0 && textureIdx < static_cast<int32_t>(mClimbabilityTable.size()))
+            return mClimbabilityTable[textureIdx];
+        return 0.0f;
     }
 
     /// Apply movement — force/mass-based velocity control:
@@ -205,22 +234,51 @@
             // 3D velocity convergence (no Z stripping — full 3D control)
             mVelocity += (swimDesired - mVelocity) * alpha;
 
+        } else if (mCurrentMode == PlayerMode::Climb) {
+            // ── Climbing: movement follows player's look direction ──
+            // When the player looks upward
+            // while pressing forward, the control velocity has both an upward Z
+            // component and a forward-into-wall component. This is what allows
+            // the player to naturally climb over the top of a ladder — the
+            // forward momentum carries them over the edge.
+            // Gravity is suppressed (handled in applyGravity).
+
+            // Player's 3D look direction from yaw + pitch (gravity-stripping
+            // is bypassed for climbers — the vertical component is preserved)
+            float cosPitch = std::cos(mCamPitch);
+            float sinPitch = std::sin(mCamPitch);
+            Vector3 lookDir(mCosYaw * cosPitch, mSinYaw * cosPitch, sinPitch);
+
+            // Right vector (horizontal only, perpendicular to yaw)
+            Vector3 rightDir(mSinYaw, -mCosYaw, 0.0f);
+
+            // Speed: 0.5× base (CLIMB_MULT via MODE_SPEEDS), stacks with sneak/run
+            float modeScale = MODE_SPEEDS[static_cast<int>(mCurrentMode)].trans;
+            float fwdSpeed = WALK_SPEED * modeScale;
+            float strSpeed = SIDESTEP_SPEED * modeScale;
+            if (mInputForward < 0.0f) fwdSpeed = BACKWARD_SPEED * modeScale;
+            if (mSneaking)      { fwdSpeed *= 0.5f; strSpeed *= 0.5f; }
+            else if (mRunning)  { fwdSpeed *= 2.0f; strSpeed *= 2.0f; }
+
+            Vector3 climbDesired = lookDir  * (mInputForward * fwdSpeed)
+                                 + rightDir * (mInputRight   * strSpeed);
+
+            // Full ground-level friction for wall traction
+            float friction = FRICTION_FACTOR * mGravityMag;
+            float rate = CONTROL_MULTIPLIER * mMass * friction / VELOCITY_RATE;
+            rate = std::min(rate, MAX_CONTROL_RATE);
+            float alpha = rate * dt / mMass;
+            alpha = std::min(alpha, 1.0f);
+
+            mVelocity += (climbDesired - mVelocity) * alpha;
+
+            // Zero downward velocity when not pressing backward (original engine behavior:
+            // if velocity.z < 0 and control_velocity.z >= 0, velocity.z = 0)
+            if (mVelocity.z < 0.0f && mInputForward >= 0.0f)
+                mVelocity.z = 0.0f;
+
         } else {
-            // Airborne: limited air control.
-            // In air, contact friction = 0 and base_friction = 0, so we use
-            // flat-ground equivalent friction scaled by AIR_CONTROL_FRAC.
-            Vector3 airDesired(desired.x, desired.y, 0.0f);
-            Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
-
-            float airFriction = FRICTION_FACTOR * 1.0f * mGravityMag;  // flat-ground equivalent
-            float airRate = CONTROL_MULTIPLIER * mMass * airFriction / VELOCITY_RATE;
-            airRate = std::min(airRate, MAX_CONTROL_RATE);
-            float airAlpha = airRate * AIR_CONTROL_FRAC * dt / mMass;
-
-            Vector3 hNew = hVel + (airDesired - hVel) * airAlpha;
-            mVelocity.x = hNew.x;
-            mVelocity.y = hNew.y;
-            // Z unchanged — gravity handles it
+            // Airborne: no air control.
         }
     }
 
