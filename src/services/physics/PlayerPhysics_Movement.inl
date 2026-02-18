@@ -92,7 +92,7 @@
             totalFriction = FRICTION_FACTOR * mGroundNormal.z * mGravityMag;
         }
 
-        // Climbability boosts friction on steep surfaces (Dark Engine convention).
+        // Climbability boosts friction on steep surfaces.
         // With climbability >= 1.0, friction is raised to full ground-level friction,
         // allowing the player to walk on otherwise un-walkable steep slopes.
         // This is NOT a climb-mode trigger — just a friction multiplier.
@@ -236,12 +236,14 @@
 
         } else if (mCurrentMode == PlayerMode::Climb) {
             // ── Climbing: movement follows player's look direction ──
-            // When the player looks upward
-            // while pressing forward, the control velocity has both an upward Z
-            // component and a forward-into-wall component. This is what allows
-            // the player to naturally climb over the top of a ladder — the
-            // forward momentum carries them over the edge.
-            // Gravity is suppressed (handled in applyGravity).
+            // The original engine uses the player's combined head+body facing
+            // direction. When looking upward while pressing forward, the control
+            // velocity has both an upward Z component and a forward-into-wall
+            // component. Gravity is suppressed (handled in applyGravity).
+
+            // Look up the climbing OBB (needed for non-climbable face pushback)
+            const ObjectCollisionBody *body = mObjectWorld
+                ? mObjectWorld->findBodyByObjID(mClimbingObjId) : nullptr;
 
             // Player's 3D look direction from yaw + pitch (gravity-stripping
             // is bypassed for climbers — the vertical component is preserved)
@@ -252,11 +254,13 @@
             // Right vector (horizontal only, perpendicular to yaw)
             Vector3 rightDir(mSinYaw, -mCosYaw, 0.0f);
 
-            // Speed: 0.5× base (CLIMB_MULT via MODE_SPEEDS), stacks with sneak/run
+            // Speed: uses "slow" base speeds (half of normal)
+            // for climbing input, then the 0.5× mode scale halves again.
+            // Effective: forward=2.75, backward=1.375, strafe=1.925 u/s.
             float modeScale = MODE_SPEEDS[static_cast<int>(mCurrentMode)].trans;
-            float fwdSpeed = WALK_SPEED * modeScale;
-            float strSpeed = SIDESTEP_SPEED * modeScale;
-            if (mInputForward < 0.0f) fwdSpeed = BACKWARD_SPEED * modeScale;
+            float fwdSpeed = CLIMB_FWD_SPEED * modeScale;
+            float strSpeed = CLIMB_STR_SPEED * modeScale;
+            if (mInputForward < 0.0f) fwdSpeed = CLIMB_BACK_SPEED * modeScale;
             if (mSneaking)      { fwdSpeed *= 0.5f; strSpeed *= 0.5f; }
             else if (mRunning)  { fwdSpeed *= 2.0f; strSpeed *= 2.0f; }
 
@@ -272,9 +276,36 @@
 
             mVelocity += (climbDesired - mVelocity) * alpha;
 
-            // Zero downward velocity when not pressing backward (original engine behavior:
-            // if velocity.z < 0 and control_velocity.z >= 0, velocity.z = 0)
-            if (mVelocity.z < 0.0f && mInputForward >= 0.0f)
+            // Wall-plane constraint: remove velocity component going into or away
+            // from the climbing surface.
+            float normalVel = glm::dot(mVelocity, mClimbFaceNormal);
+            mVelocity -= mClimbFaceNormal * normalVel;
+
+            // Non-climbable face pushback: if the player has moved past a non-climbable
+            // face (e.g. the top of a ladder), remove velocity going further past it.
+            // This prevents climbing over the top — the player must jump to dismount.
+            if (body) {
+                Vector3 offset = mPosition - body->worldPos;
+                Vector3 halfExt = body->edgeLengths * 0.5f;
+                for (int face = 0; face < 6; ++face) {
+                    if (body->climbableSides & (1 << face))
+                        continue;  // climbable faces don't push back
+                    Vector3 faceN = getOBBFaceNormal(*body, face);
+                    int ax = face % 3;
+                    float proj = glm::dot(offset, body->rotation[ax]);
+                    float dist = (face < 3) ? (proj - halfExt[ax]) : (-proj - halfExt[ax]);
+                    if (dist > 0.0f) {
+                        float vn = glm::dot(mVelocity, faceN);
+                        if (vn > 0.0f)
+                            mVelocity -= faceN * vn;
+                    }
+                }
+            }
+
+            // Zero downward velocity when desired velocity is non-negative Z.
+            // The original checks control_velocity.z >= 0: if looking down while
+            // pressing forward (negative climbDesired.z), descent is allowed.
+            if (mVelocity.z < 0.0f && climbDesired.z >= 0.0f)
                 mVelocity.z = 0.0f;
 
         } else {
