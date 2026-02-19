@@ -128,12 +128,12 @@ public:
             "springPosX,springPosY,springPosZ,"
             "springVelX,springVelY,springVelZ,"
             "poseTargetX,poseTargetY,poseTargetZ,"
-            "poseStartX,poseStartY,poseStartZ,"
             "bodyPoseX,bodyPoseY,bodyPoseZ,"
             "poseTimer,poseDur,poseHolding,"
             "strideDist,strideIsLeft,leanDir,leanAmount,"
             "cell,inputFwd,inputRight\n");
         std::fflush(mLogFile);
+        mLogFlushCounter = 0;
         std::fprintf(stderr, "[PlayerPhysics] Logging to: %s\n", path);
     }
 
@@ -675,7 +675,6 @@ private:
     // Stride-driven pose system: progressive blend + head spring. Rest-condition interrupt fires
     // ~100ms after each stride, creating stride→rest→stride oscillation at ~30% blend depth.
     // The head spring adds dynamic response on top (overshoot, lag).
-    Vector3 mPoseStart{0.0f};     // HEAD blend start offset (captured in activatePose)
     Vector3 mPoseEnd{0.0f};       // HEAD blend target offset {fwd, lat, vert}
     Vector3 mPoseCurrent{0.0f};   // HEAD current interpolated pose offset
     Vector3 mBodyPoseEnd{0.0f};       // BODY blend target offset {fwd, lat, vert}
@@ -694,11 +693,6 @@ private:
 
     // Stride timing — last stride activation time for diagnostics/logging
     float mLastStrideSimTime   = 0.0f;  // simTime when last stride was activated
-
-    // Motion queue — LIFO stack for chaining multi-pose sequences.
-    // When a pose completes, the next is popped from the back.
-    // Used for compound motions (weapon swing → recovery, mantle phases, etc.)
-    std::vector<const MotionPoseData*> mMotionQueue;
 
     // Ground contact normal and texture from last collision pass
     Vector3 mGroundNormal{0.0f, 0.0f, 1.0f};
@@ -752,6 +746,7 @@ private:
 
     // ── Diagnostic logging state ──
     FILE *mLogFile = nullptr;   // per-timestep CSV log file (null = disabled)
+    int   mLogFlushCounter = 0; // flush every N rows (avoids data loss on crash)
     bool  mStepLog = false;     // stair step diagnostics to stderr ([STEP] prefix)
     float mCamPitch = 0.0f;    // camera pitch from renderer (for logging only)
 };

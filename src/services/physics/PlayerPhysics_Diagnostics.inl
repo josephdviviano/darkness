@@ -16,7 +16,6 @@
             "%.5f,%.5f,%.5f,"              // springPosX,springPosY,springPosZ
             "%.5f,%.5f,%.5f,"              // springVelX,springVelY,springVelZ
             "%.5f,%.5f,%.5f,"              // poseTargetX,poseTargetY,poseTargetZ
-            "%.5f,%.5f,%.5f,"              // poseStartX,poseStartY,poseStartZ
             "%.5f,%.5f,%.5f,"              // bodyPoseX,bodyPoseY,bodyPoseZ
             "%.4f,%.4f,%d,"                // poseTimer,poseDur,poseHolding
             "%.3f,%d,%d,%.4f,"              // strideDist,strideIsLeft,leanDir,leanAmount
@@ -30,16 +29,14 @@
             mSpringPos.x, mSpringPos.y, mSpringPos.z,
             mSpringVel.x, mSpringVel.y, mSpringVel.z,
             mPoseCurrent.x, mPoseCurrent.y, mPoseCurrent.z,
-            mPoseStart.x, mPoseStart.y, mPoseStart.z,
             mBodyPoseCurrent.x, mBodyPoseCurrent.y, mBodyPoseCurrent.z,
             mPoseTimer, mPoseDuration, (int)mPoseHolding,
             mStrideDist, (int)mStrideIsLeft, mLeanDir, mLeanAmount,
             mCellIdx, mInputForward, mInputRight);
 
         // Flush periodically so data isn't lost on crash
-        static int flushCounter = 0;
-        if (++flushCounter >= 10) {
+        if (++mLogFlushCounter >= 10) {
             std::fflush(mLogFile);
-            flushCounter = 0;
+            mLogFlushCounter = 0;
         }
     }

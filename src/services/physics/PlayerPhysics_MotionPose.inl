@@ -17,7 +17,6 @@
             return;  // already blending toward this target
         }
 
-        mPoseStart = mPoseCurrent;  // capture current HEAD position as blend origin
         mPoseEnd = newTarget;
         mBodyPoseEnd = newBodyTarget;
         mPoseDuration = pose.duration;
@@ -25,9 +24,6 @@
         mPoseTimer = 0.0f;
         mPoseHolding = false;
 
-        // NOTE: Do NOT clear mMotionQueue here.
-        // Clearing here would break compound motions (weapon swing → recovery)
-        // if a stride or rest interrupt fires mid-sequence.
     }
 
     /// Activate the next stride pose (alternates left/right). Progressive blend over 0.6s
@@ -119,22 +115,12 @@
         // ── Pose chaining state machine ──
         //
         // Priority order:
-        // 1. Motion queue — if a queued sequence is active, pop next on completion
-        // 2. Landing bump — must complete before stride resumes
-        // 3. Walking strides — distance-triggered
-        // 4. Idle — return to mode's rest pose
+        // 1. Landing bump — must complete before stride resumes
+        // 2. Walking strides — distance-triggered
+        // 3. Idle — return to mode's rest pose
 
-        // Motion queue takes priority — compound motions (weapon swing, mantle)
-        // play through their full sequence regardless of walking state.
-        // Pop BEFORE activatePose — activatePose() clears the entire queue
-        // internally, so pop_back after clear would be UB on an empty vector.
-        if (!mMotionQueue.empty() && poseReady) {
-            const MotionPoseData *nextQueued = mMotionQueue.back();
-            mMotionQueue.pop_back();
-            activatePose(*nextQueued);
-        }
         // Landing bump takes priority over normal strides
-        else if (mLandingActive) {
+        if (mLandingActive) {
             if (poseReady) {
                 mLandingActive = false;
                 // After landing, resume walking or return to idle.
@@ -289,6 +275,9 @@
     /// CURRENTLY UNUSED — kept for future rate-independent spring implementation.
     /// Once the direct discrete formula is verified at 12.5Hz, this can replace
     /// it with properly derived ω₀/ζ values for rate-independent behavior.
+    /// TODO: Use to implement a rate-independent spring for the head — would require retuning spring
+    /// parameters (currently tuned for direct discrete) but would eliminate dt-dependent behavior.
+    /// This is currently unused.
     static inline void stepSpringAxis(float &pos, float &vel, float target,
                                       float omega0, float zeta, float dt) {
         float d = pos - target;     // displacement from equilibrium
