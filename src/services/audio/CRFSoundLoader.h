@@ -37,7 +37,6 @@
 #include <vector>
 #include <unordered_map>
 #include <list>
-#include <mutex>
 #include <zzip/zzip.h>
 
 namespace Darkness {
@@ -52,7 +51,7 @@ struct SoundData {
 };
 
 /// Loads WAV sound files from Thief 2's snd.crf archive.
-/// Thread-safe for concurrent lookups (zziplib calls are mutex-protected).
+/// NOT thread-safe — callers must synchronize access externally if needed.
 class CRFSoundLoader {
 public:
     explicit CRFSoundLoader(const std::string &resPath) : mDir(nullptr) {
@@ -134,10 +133,15 @@ private:
         }
         zzip_file_close(fp);
 
-        // Minimal WAV validation: RIFF header + minimum size
+        // WAV validation: RIFF header + WAVE subtype + minimum size
         if (buf.size() < 44) return {};
         if (buf[0] != 'R' || buf[1] != 'I' || buf[2] != 'F' || buf[3] != 'F') {
-            std::fprintf(stderr, "CRFSoundLoader: %s is not a valid WAV file\n",
+            std::fprintf(stderr, "CRFSoundLoader: %s is not a RIFF file\n",
+                         path.c_str());
+            return {};
+        }
+        if (buf[8] != 'W' || buf[9] != 'A' || buf[10] != 'V' || buf[11] != 'E') {
+            std::fprintf(stderr, "CRFSoundLoader: %s is RIFF but not WAV\n",
                          path.c_str());
             return {};
         }
