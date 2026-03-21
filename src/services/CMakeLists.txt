@@ -26,6 +26,8 @@ endif()
 
 # Core services that work without a renderer
 set(HEADLESS_SERVICES_SOURCES
+    audio/AudioService.cpp
+    audio/AudioService.h
     config/ConfigService.cpp
     config/ConfigService.h
     database/DatabaseService.cpp

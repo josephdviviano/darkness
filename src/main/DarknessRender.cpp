@@ -76,6 +76,7 @@
 #include "room/RoomService.h"
 #include "sim/SimService.h"
 #include "physics/PhysicsService.h"
+#include "audio/AudioService.h"
 #include "motion/MotionService.h"
 #include "RawDataStorage.h"
 #include "PLDefParser.h"

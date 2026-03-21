@@ -47,6 +47,7 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
         svcMgr->registerFactory<Darkness::RoomServiceFactory>();
         svcMgr->registerFactory<Darkness::SimServiceFactory>();
         svcMgr->registerFactory<Darkness::PhysicsServiceFactory>();
+        svcMgr->registerFactory<Darkness::AudioServiceFactory>();
 
         svcMgr->bootstrapFinished();
     }
