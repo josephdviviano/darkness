@@ -29,6 +29,13 @@
 #include "property/PropertyService.h"
 #include "logger.h"
 
+// miniaudio — single-header C library, implementation compiled here
+#define MINIAUDIO_IMPLEMENTATION
+#include <miniaudio.h>
+
+// Steam Audio C API
+#include <phonon.h>
+
 namespace Darkness {
 
 /*----------------------------------------------------*/
@@ -50,7 +57,96 @@ AudioService::AudioService(ServiceManager *manager, const std::string &name)
 //------------------------------------------------------
 AudioService::~AudioService()
 {
+    // Ensure backends are shut down even if shutdown() wasn't called
+    shutdownSteamAudio();
+    shutdownMiniaudio();
 }
+
+// ── miniaudio backend ──
+
+//------------------------------------------------------
+bool AudioService::initMiniaudio()
+{
+    mMaEngine = new ma_engine();
+
+    ma_engine_config config = ma_engine_config_init();
+    config.channels = 2;           // stereo output
+    config.sampleRate = 44100;     // standard sample rate
+    config.noDevice = MA_FALSE;    // create output device
+
+    ma_result result = ma_engine_init(&config, mMaEngine);
+    if (result != MA_SUCCESS) {
+        LOG_ERROR("AudioService: miniaudio init failed (error %d)", result);
+        delete mMaEngine;
+        mMaEngine = nullptr;
+        return false;
+    }
+
+    LOG_INFO("AudioService: miniaudio initialized (44100 Hz stereo)");
+    return true;
+}
+
+//------------------------------------------------------
+void AudioService::shutdownMiniaudio()
+{
+    if (mMaEngine) {
+        ma_engine_uninit(mMaEngine);
+        delete mMaEngine;
+        mMaEngine = nullptr;
+        LOG_INFO("AudioService: miniaudio shut down");
+    }
+}
+
+// ── Steam Audio backend ──
+
+//------------------------------------------------------
+bool AudioService::initSteamAudio()
+{
+    // Create Steam Audio context
+    IPLContextSettings contextSettings{};
+    contextSettings.version = STEAMAUDIO_VERSION;
+
+    IPLerror err = iplContextCreate(&contextSettings, &mIplContext);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: Steam Audio context creation failed (error %d)", err);
+        return false;
+    }
+
+    // Create HRTF for binaural rendering
+    IPLAudioSettings audioSettings{};
+    audioSettings.samplingRate = 44100;
+    audioSettings.frameSize = 1024;  // ~23ms at 44100Hz
+
+    IPLHRTFSettings hrtfSettings{};
+    hrtfSettings.type = IPL_HRTFTYPE_DEFAULT;
+
+    err = iplHRTFCreate(mIplContext, &audioSettings, &hrtfSettings, &mIplHrtf);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: Steam Audio HRTF creation failed (error %d)", err);
+        iplContextRelease(&mIplContext);
+        mIplContext = nullptr;
+        return false;
+    }
+
+    LOG_INFO("AudioService: Steam Audio initialized (HRTF ready)");
+    return true;
+}
+
+//------------------------------------------------------
+void AudioService::shutdownSteamAudio()
+{
+    if (mIplHrtf) {
+        iplHRTFRelease(&mIplHrtf);
+        mIplHrtf = nullptr;
+    }
+    if (mIplContext) {
+        iplContextRelease(&mIplContext);
+        mIplContext = nullptr;
+        LOG_INFO("AudioService: Steam Audio shut down");
+    }
+}
+
+// ── Service lifecycle ──
 
 //------------------------------------------------------
 bool AudioService::init()
@@ -73,13 +169,28 @@ void AudioService::bootstrapFinished()
     auto loopSvc = GET_SERVICE(LoopService);
     loopSvc->addLoopClient(this);
 
-    LOG_INFO("AudioService: initialized");
+    // Initialize audio backends
+    bool maOk = initMiniaudio();
+    bool saOk = initSteamAudio();
+    mAudioReady = maOk && saOk;
+
+    if (mAudioReady) {
+        LOG_INFO("AudioService: fully initialized");
+    } else {
+        LOG_ERROR("AudioService: initialized with errors (miniaudio=%s, steam_audio=%s)",
+                  maOk ? "ok" : "FAILED", saOk ? "ok" : "FAILED");
+    }
 }
 
 //------------------------------------------------------
 void AudioService::shutdown()
 {
     haltAll();
+
+    // Shut down audio backends
+    shutdownSteamAudio();
+    shutdownMiniaudio();
+    mAudioReady = false;
 
     // Unregister loop client
     auto loopSvc = GET_SERVICE(LoopService);
@@ -135,6 +246,9 @@ void AudioService::onDBDrop(uint32_t dropmask)
 //------------------------------------------------------
 void AudioService::loopStep(float deltaTime)
 {
+    if (!mAudioReady)
+        return;
+
     // TODO (Task 36): Update active voices — check for finished sounds,
     //   update Steam Audio source positions for moving objects
     // TODO (Task 35): Run Steam Audio simulation step
@@ -146,6 +260,9 @@ void AudioService::loopStep(float deltaTime)
 SoundHandle AudioService::playSchema(const std::string &schemaName,
                                      const Vector3 &position)
 {
+    if (!mAudioReady)
+        return SOUND_HANDLE_INVALID;
+
     // TODO (Task 36): Resolve schema, pick sample, start playback
     LOG_DEBUG("AudioService::playSchema('%s') — not yet implemented",
               schemaName.c_str());
@@ -156,6 +273,9 @@ SoundHandle AudioService::playSchema(const std::string &schemaName,
 SoundHandle AudioService::playSchemaOnObj(const std::string &schemaName,
                                           int objID)
 {
+    if (!mAudioReady)
+        return SOUND_HANDLE_INVALID;
+
     // TODO (Task 36): Resolve schema, attach to object, start playback
     LOG_DEBUG("AudioService::playSchemaOnObj('%s', %d) — not yet implemented",
               schemaName.c_str(), objID);

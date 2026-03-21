@@ -36,6 +36,14 @@
 #include <string>
 #include <unordered_map>
 
+// Forward declarations for audio backend types (defined in .cpp via C headers)
+struct ma_engine;
+// Steam Audio uses DECLARE_OPAQUE_HANDLE: typedef struct _IPLFoo_t* IPLFoo
+struct _IPLContext_t;
+typedef _IPLContext_t* IPLContext;
+struct _IPLHRTF_t;
+typedef _IPLHRTF_t* IPLHRTF;
+
 namespace Darkness {
 
 /// Handle to an active sound (returned by play functions, used to halt/query)
@@ -125,6 +133,26 @@ private:
 
     /// Next sound handle to assign
     SoundHandle mNextHandle = 0;
+
+    // ── Audio backends ──
+
+    /// miniaudio engine (heap-allocated to keep ma_engine out of header)
+    ma_engine *mMaEngine = nullptr;
+
+    /// Steam Audio context
+    IPLContext mIplContext = nullptr;
+
+    /// Steam Audio HRTF for binaural rendering
+    IPLHRTF mIplHrtf = nullptr;
+
+    /// Whether audio backends initialized successfully
+    bool mAudioReady = false;
+
+    // Private helpers
+    bool initMiniaudio();
+    void shutdownMiniaudio();
+    bool initSteamAudio();
+    void shutdownSteamAudio();
 };
 
 /// Factory for AudioService
