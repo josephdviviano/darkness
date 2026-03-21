@@ -29,6 +29,9 @@ set(HEADLESS_SERVICES_SOURCES
     audio/AudioService.cpp
     audio/AudioService.h
     audio/CRFSoundLoader.h
+    audio/SchemaTypes.h
+    audio/SchemaParser.h
+    audio/SchemaParser.cpp
     config/ConfigService.cpp
     config/ConfigService.h
     database/DatabaseService.cpp

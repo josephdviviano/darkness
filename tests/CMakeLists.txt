@@ -7,6 +7,7 @@ add_executable(darkness_tests
     test_render_config.cpp
     test_typed_properties.cpp
     test_world_query.cpp
+    test_schema_parser.cpp
 )
 
 target_link_libraries(darkness_tests PRIVATE
