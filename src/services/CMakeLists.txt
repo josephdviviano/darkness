@@ -28,6 +28,7 @@ endif()
 set(HEADLESS_SERVICES_SOURCES
     audio/AudioService.cpp
     audio/AudioService.h
+    audio/CRFSoundLoader.h
     config/ConfigService.cpp
     config/ConfigService.h
     database/DatabaseService.cpp
@@ -101,14 +102,16 @@ set(HEADLESS_SERVICES_SOURCES
 
 add_library(DarknessServices OBJECT ${HEADLESS_SERVICES_SOURCES})
 
-# Audio backend dependencies (Steam Audio + miniaudio)
+# Audio backend dependencies (Steam Audio + miniaudio + zziplib for snd.crf)
 find_package(flatbuffers CONFIG REQUIRED)
 find_package(pffft CONFIG REQUIRED)
 find_package(mysofa CONFIG REQUIRED)
 find_package(steam-audio CONFIG REQUIRED)
+find_package(zziplib CONFIG REQUIRED)
 
 target_link_libraries(DarknessServices PUBLIC DarknessBase glm::glm
-    unofficial::steam-audio::phonon)
+    unofficial::steam-audio::phonon
+    zziplib::libzzip)
 
 target_include_directories(DarknessServices PUBLIC
     ${ODE_INCLUDE_DIR}

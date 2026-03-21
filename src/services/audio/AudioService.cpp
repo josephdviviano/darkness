@@ -21,6 +21,7 @@
  *****************************************************************************/
 
 #include "AudioService.h"
+#include "CRFSoundLoader.h"
 #include "ServiceCommon.h"
 #include "DarknessServiceManager.h"
 #include "database/DatabaseService.h"
@@ -146,6 +147,26 @@ void AudioService::shutdownSteamAudio()
     }
 }
 
+// ── Sound resource loading ──
+
+//------------------------------------------------------
+bool AudioService::loadSoundResources(const std::string &resPath)
+{
+    // Create sound loader (opens snd.crf)
+    mSoundLoader = std::make_unique<CRFSoundLoader>(resPath);
+    if (!mSoundLoader->isOpen()) {
+        LOG_ERROR("AudioService: Failed to open snd.crf from %s", resPath.c_str());
+        mSoundLoader.reset();
+        return false;
+    }
+
+    // Create LRU sound cache (64MB budget)
+    mSoundCache = std::make_unique<SoundCache>();
+
+    LOG_INFO("AudioService: Sound resources loaded from %s", resPath.c_str());
+    return true;
+}
+
 // ── Service lifecycle ──
 
 //------------------------------------------------------
@@ -186,6 +207,10 @@ void AudioService::bootstrapFinished()
 void AudioService::shutdown()
 {
     haltAll();
+
+    // Release sound resources
+    mSoundCache.reset();
+    mSoundLoader.reset();
 
     // Shut down audio backends
     shutdownSteamAudio();
@@ -236,6 +261,11 @@ void AudioService::onDBDrop(uint32_t dropmask)
     haltAll();
     mBlockingFactors.clear();
     mNextHandle = 0;
+
+    // Flush the sound cache on mission unload (sounds may differ between missions)
+    if (mSoundCache) {
+        mSoundCache->clear();
+    }
 
     // TODO (Task 35): Destroy Steam Audio scene
     // TODO (Task 34): Clear schema database
