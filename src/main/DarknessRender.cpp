@@ -1505,6 +1505,16 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // ── Load sound resources from snd.crf ──
+    if (!resPath.empty()) {
+        Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+        if (!audioSvc->loadSoundResources(resPath)) {
+            std::fprintf(stderr, "WARNING: failed to load snd.crf from %s\n"
+                                 "         Sound playback will not be available.\n",
+                         resPath.c_str());
+        }
+    }
+
     // Inject raycaster into the world query facade — enables ray-vs-world
     // queries (AI line-of-sight, physics, sound occlusion) via portal traversal
     worldQuery->setRaycaster(

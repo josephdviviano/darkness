@@ -33,6 +33,7 @@
 #include "database/DatabaseCommon.h"
 #include "loop/LoopCommon.h"
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -45,6 +46,11 @@ struct _IPLHRTF_t;
 typedef _IPLHRTF_t* IPLHRTF;
 
 namespace Darkness {
+
+// Forward declarations for sound resource types (defined in CRFSoundLoader.h)
+class CRFSoundLoader;
+class SoundCache;
+struct SoundData;
 
 /// Handle to an active sound (returned by play functions, used to halt/query)
 using SoundHandle = int32_t;
@@ -103,6 +109,13 @@ public:
      *  @return Blocking factor (0.0–1.0), or 0.0 if not set */
     float getBlockingFactor(int room1, int room2) const;
 
+    /** Load sound resources from a Thief 2 RES directory.
+     *  Opens snd.crf and prepares the sound cache.
+     *  Called from DarknessRender.cpp after services are bootstrapped.
+     *  @param resPath  Path to Thief 2 RES directory (containing snd.crf)
+     *  @return true if snd.crf opened successfully */
+    bool loadSoundResources(const std::string &resPath);
+
 protected:
     // ── Service lifecycle ──
 
@@ -147,6 +160,14 @@ private:
 
     /// Whether audio backends initialized successfully
     bool mAudioReady = false;
+
+    // ── Sound resource loading ──
+
+    /// CRF sound loader (opens snd.crf via zziplib)
+    std::unique_ptr<CRFSoundLoader> mSoundLoader;
+
+    /// LRU cache for recently-used decoded sounds (default 64MB budget)
+    std::unique_ptr<SoundCache> mSoundCache;
 
     // Private helpers
     bool initMiniaudio();
