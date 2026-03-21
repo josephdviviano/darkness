@@ -52,6 +52,9 @@ class CRFSoundLoader;
 class SoundCache;
 struct SoundData;
 
+/// Active voice — owns WAV data, miniaudio decoder + sound (defined in AudioService.cpp)
+struct ActiveVoice;
+
 /// Handle to an active sound (returned by play functions, used to halt/query)
 using SoundHandle = int32_t;
 
@@ -168,6 +171,15 @@ private:
 
     /// LRU cache for recently-used decoded sounds (default 64MB budget)
     std::unique_ptr<SoundCache> mSoundCache;
+
+    // ── Active voice management ──
+
+    /// Map of active voices (handle → voice). Voices own their WAV data,
+    /// miniaudio decoder, and sound object. Cleaned up in loopStep().
+    std::unordered_map<SoundHandle, std::unique_ptr<ActiveVoice>> mVoices;
+
+    /// Remove finished voices from the active map
+    void cleanupFinishedVoices();
 
     // Private helpers
     bool initMiniaudio();

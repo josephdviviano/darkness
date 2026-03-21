@@ -40,6 +40,39 @@
 namespace Darkness {
 
 /*----------------------------------------------------*/
+/*-------------- Active Voice Management -------------*/
+/*----------------------------------------------------*/
+
+/// An active voice playing through miniaudio. Owns the WAV data, decoder,
+/// and sound object. Non-copyable/non-movable because ma_decoder and ma_sound
+/// contain internal pointers that would dangle after a move.
+struct ActiveVoice {
+    SoundData data;        // WAV bytes — must outlive decoder (pointer dependency)
+    ma_decoder decoder;    // Decodes WAV → PCM (data source for ma_sound)
+    ma_sound sound;        // Playback control (volume, position, state)
+    SoundHandle handle = SOUND_HANDLE_INVALID;
+    bool initialized = false;
+
+    ActiveVoice() {
+        std::memset(&decoder, 0, sizeof(decoder));
+        std::memset(&sound, 0, sizeof(sound));
+    }
+
+    ~ActiveVoice() {
+        if (initialized) {
+            ma_sound_uninit(&sound);
+            ma_decoder_uninit(&decoder);
+        }
+    }
+
+    // Non-copyable, non-movable (ma_decoder/ma_sound have internal pointers)
+    ActiveVoice(const ActiveVoice &) = delete;
+    ActiveVoice &operator=(const ActiveVoice &) = delete;
+    ActiveVoice(ActiveVoice &&) = delete;
+    ActiveVoice &operator=(ActiveVoice &&) = delete;
+};
+
+/*----------------------------------------------------*/
 /*------------------ Audio Service -------------------*/
 /*----------------------------------------------------*/
 template <>
@@ -58,6 +91,8 @@ AudioService::AudioService(ServiceManager *manager, const std::string &name)
 //------------------------------------------------------
 AudioService::~AudioService()
 {
+    // Voices must be destroyed before the engine (they reference it internally)
+    mVoices.clear();
     // Ensure backends are shut down even if shutdown() wasn't called
     shutdownSteamAudio();
     shutdownMiniaudio();
@@ -243,7 +278,49 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
     // TODO (Task 35): Build Steam Audio IPLScene from world geometry
     // TODO (Task 39): Load ambient sound properties (P$AmbientHack)
 
-    LOG_INFO("AudioService: mission loaded (audio setup pending)");
+    // Test sound playback — load and play a sound effect from snd.crf
+    // to verify the full pipeline (CRF → WAV → miniaudio → speakers)
+    if (mSoundLoader && mAudioReady) {
+        static const char *testNames[] = {"swoosh1", "bowpull", "gate1",
+                                          "doormtl1", "swordhi1"};
+        for (const char *name : testNames) {
+            SoundData snd = mSoundLoader->loadSound(name);
+            if (!snd.valid())
+                continue;
+
+            auto voice = std::make_unique<ActiveVoice>();
+            voice->data = std::move(snd);
+            voice->handle = mNextHandle++;
+
+            // Decode WAV from memory → PCM
+            ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 0, 0);
+            if (ma_decoder_init_memory(voice->data.wavData.data(),
+                                       voice->data.wavData.size(),
+                                       &cfg, &voice->decoder) != MA_SUCCESS) {
+                LOG_ERROR("AudioService: failed to decode test sound '%s'", name);
+                continue;
+            }
+
+            // Create sound from decoder (no spatialization for this test)
+            if (ma_sound_init_from_data_source(
+                    mMaEngine, &voice->decoder,
+                    MA_SOUND_FLAG_NO_SPATIALIZATION, nullptr,
+                    &voice->sound) != MA_SUCCESS) {
+                ma_decoder_uninit(&voice->decoder);
+                LOG_ERROR("AudioService: failed to init test sound '%s'", name);
+                continue;
+            }
+
+            voice->initialized = true;
+            ma_sound_start(&voice->sound);
+            LOG_INFO("AudioService: playing test sound '%s' (%zu bytes)",
+                     name, voice->data.sizeBytes());
+            mVoices[voice->handle] = std::move(voice);
+            break; // Only play one test sound
+        }
+    }
+
+    LOG_INFO("AudioService: mission loaded");
 }
 
 //------------------------------------------------------
@@ -279,9 +356,24 @@ void AudioService::loopStep(float deltaTime)
     if (!mAudioReady)
         return;
 
-    // TODO (Task 36): Update active voices — check for finished sounds,
-    //   update Steam Audio source positions for moving objects
+    // Remove voices that have finished playback
+    cleanupFinishedVoices();
+
+    // TODO (Task 36): Update active voices — update Steam Audio source
+    //   positions for moving objects
     // TODO (Task 35): Run Steam Audio simulation step
+}
+
+//------------------------------------------------------
+void AudioService::cleanupFinishedVoices()
+{
+    for (auto it = mVoices.begin(); it != mVoices.end();) {
+        if (it->second->initialized && ma_sound_at_end(&it->second->sound)) {
+            it = mVoices.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // ── Public API stubs ──
@@ -318,14 +410,25 @@ void AudioService::haltSound(SoundHandle handle)
     if (handle == SOUND_HANDLE_INVALID)
         return;
 
-    // TODO (Task 36): Stop the specific active voice
-    LOG_DEBUG("AudioService::haltSound(%d) — not yet implemented", handle);
+    auto it = mVoices.find(handle);
+    if (it != mVoices.end()) {
+        if (it->second->initialized) {
+            ma_sound_stop(&it->second->sound);
+        }
+        mVoices.erase(it);
+    }
 }
 
 //------------------------------------------------------
 void AudioService::haltAll()
 {
-    // TODO (Task 36): Stop all active voices
+    // Stop all active sounds before destroying voices
+    for (auto &[handle, voice] : mVoices) {
+        if (voice->initialized) {
+            ma_sound_stop(&voice->sound);
+        }
+    }
+    mVoices.clear();
     mNextHandle = 0;
 }
 
