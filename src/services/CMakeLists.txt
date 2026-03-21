@@ -101,11 +101,19 @@ set(HEADLESS_SERVICES_SOURCES
 
 add_library(DarknessServices OBJECT ${HEADLESS_SERVICES_SOURCES})
 
-target_link_libraries(DarknessServices PUBLIC DarknessBase glm::glm)
+# Audio backend dependencies (Steam Audio + miniaudio)
+find_package(flatbuffers CONFIG REQUIRED)
+find_package(pffft CONFIG REQUIRED)
+find_package(mysofa CONFIG REQUIRED)
+find_package(steam-audio CONFIG REQUIRED)
+
+target_link_libraries(DarknessServices PUBLIC DarknessBase glm::glm
+    unofficial::steam-audio::phonon)
 
 target_include_directories(DarknessServices PUBLIC
     ${ODE_INCLUDE_DIR}
     ${DARKNESS_SOURCE_DIR}/src/services
+    ${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/include
 )
 
 target_compile_options(DarknessServices PRIVATE

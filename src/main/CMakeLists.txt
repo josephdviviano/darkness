@@ -21,6 +21,7 @@ find_package(bgfx CONFIG REQUIRED)
 find_package(SDL2 CONFIG REQUIRED)
 find_package(zziplib CONFIG REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
+# Steam Audio is found in services/CMakeLists.txt (linked via DarknessServices)
 
 # ── Cross-platform shader compilation ──
 # Compiles .sc shaders to all backends supported on the build platform
