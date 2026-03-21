@@ -60,6 +60,7 @@ This file contains some global definitions common to all services
 #define __SERVICE_ID_CAMERA 21
 #define __SERVICE_ID_PLATFORM 22
 #define __SERVICE_ID_PLAYER 23
+#define __SERVICE_ID_AUDIO 24
 
 // --------------------------------------
 // ---  Bitmasks for service masking  ---
@@ -130,6 +131,8 @@ service listeners
 #define DBP_OBJECT 20
 // And script modules are initialized
 #define DBP_SCRIPT 25
+// Audio loads after objects (needs schema properties and room data)
+#define DBP_AUDIO 22
 
 // ---------------------------------------------
 // --- Loop modes id's and client priorities ---
@@ -143,11 +146,14 @@ service listeners
 #define LOOPCLIENT_ID_RENDERER 2
 #define LOOPCLIENT_ID_GUI 4
 #define LOOPCLIENT_ID_PLAYER 8
+#define LOOPCLIENT_ID_AUDIO 16
 
 // Input first
 #define LOOPCLIENT_PRIORITY_INPUT 1
 // Post - input handling
 #define LOOPCLIENT_PRIORITY_POSTINPUT 20
+// Audio after post-input, before GUI/renderer
+#define LOOPCLIENT_PRIORITY_AUDIO 100
 // GUI some time before render
 #define LOOPCLIENT_PRIORITY_GUI 900
 // Renderer last
@@ -166,6 +172,7 @@ namespace Darkness {
 class ServiceManager;
 
 // Services
+class AudioService;
 class CameraService;
 class ConfigService;
 class DatabaseService;
@@ -189,6 +196,7 @@ class ScriptService;
 class SimService;
 class WorldRepService;
 
+using AudioServicePtr = std::shared_ptr<AudioService>;
 using CameraServicePtr = std::shared_ptr<CameraService>;
 using ConfigServicePtr = std::shared_ptr<ConfigService>;
 using DatabaseServicePtr = std::shared_ptr<DatabaseService>;
