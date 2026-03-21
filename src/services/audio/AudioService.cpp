@@ -23,6 +23,7 @@
 #include "AudioService.h"
 #include "CRFSoundLoader.h"
 #include "ServiceCommon.h"
+#include <atomic>
 #include "DarknessServiceManager.h"
 #include "database/DatabaseService.h"
 #include "loop/LoopService.h"
@@ -46,12 +47,17 @@ namespace Darkness {
 /// An active voice playing through miniaudio. Owns the WAV data, decoder,
 /// and sound object. Non-copyable/non-movable because ma_decoder and ma_sound
 /// contain internal pointers that would dangle after a move.
+///
+/// Thread safety: the `finished` flag is set atomically by miniaudio's end
+/// callback (audio thread) and read by cleanupFinishedVoices (main thread).
+/// This avoids polling ma_sound_at_end() across threads.
 struct ActiveVoice {
     SoundData data;        // WAV bytes — must outlive decoder (pointer dependency)
     ma_decoder decoder;    // Decodes WAV → PCM (data source for ma_sound)
     ma_sound sound;        // Playback control (volume, position, state)
     SoundHandle handle = SOUND_HANDLE_INVALID;
     bool initialized = false;
+    std::atomic<bool> finished{false};  // Set by end callback on audio thread
 
     ActiveVoice() {
         std::memset(&decoder, 0, sizeof(decoder));
@@ -71,6 +77,16 @@ struct ActiveVoice {
     ActiveVoice(ActiveVoice &&) = delete;
     ActiveVoice &operator=(ActiveVoice &&) = delete;
 };
+
+/// miniaudio end callback — called on the audio thread when a sound finishes.
+/// Sets the atomic finished flag so the main thread can safely clean up.
+static void onSoundEnd(void *pUserData, ma_sound * /*pSound*/)
+{
+    auto *voice = static_cast<ActiveVoice *>(pUserData);
+    if (voice) {
+        voice->finished.store(true, std::memory_order_release);
+    }
+}
 
 /*----------------------------------------------------*/
 /*------------------ Audio Service -------------------*/
@@ -312,7 +328,18 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
             }
 
             voice->initialized = true;
-            ma_sound_start(&voice->sound);
+
+            // Register end callback so the audio thread signals completion
+            // via the atomic flag (avoids cross-thread ma_sound_at_end polling)
+            ma_sound_set_end_callback(&voice->sound, onSoundEnd, voice.get());
+
+            ma_result startResult = ma_sound_start(&voice->sound);
+            if (startResult != MA_SUCCESS) {
+                LOG_ERROR("AudioService: failed to start test sound '%s' (error %d)",
+                          name, startResult);
+                continue;
+            }
+
             LOG_INFO("AudioService: playing test sound '%s' (%zu bytes)",
                      name, voice->data.sizeBytes());
             mVoices[voice->handle] = std::move(voice);
@@ -367,8 +394,10 @@ void AudioService::loopStep(float deltaTime)
 //------------------------------------------------------
 void AudioService::cleanupFinishedVoices()
 {
+    // Only check the atomic flag (set by the audio thread's end callback).
+    // This avoids cross-thread calls to ma_sound_at_end().
     for (auto it = mVoices.begin(); it != mVoices.end();) {
-        if (it->second->initialized && ma_sound_at_end(&it->second->sound)) {
+        if (it->second->finished.load(std::memory_order_acquire)) {
             it = mVoices.erase(it);
         } else {
             ++it;
