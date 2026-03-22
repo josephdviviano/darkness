@@ -113,7 +113,8 @@ private:
     class Tokenizer {
     public:
         Tokenizer(const std::string &source, const std::string &filename,
-                  const std::unordered_map<std::string, int> &defines);
+                  const std::unordered_map<std::string, int> &defines,
+                  std::vector<std::string> *errors = nullptr);
         Token next();
         Token peek();
         const std::string &filename() const { return mFilename; }
@@ -127,6 +128,7 @@ private:
         const std::string &mSource;
         const std::string mFilename;
         const std::unordered_map<std::string, int> &mDefines;
+        std::vector<std::string> *mParserErrors;  // borrowed from SchemaParser
         size_t mPos = 0;
         int mLine = 1;
         Token mPeeked;

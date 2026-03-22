@@ -615,3 +615,108 @@ TEST_CASE("Parse Thief 2 SPEECH.SPC", "[schema][thief2][!mayfail]") {
     CHECK(parser.voiceCount() > 0);
     CHECK(parser.conceptCount() > 0);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Fix verification: unterminated string, multi-level inheritance, fieldsSet
+// ════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Unterminated string reports error", "[schema][parser]") {
+    SchemaParser parser;
+    // Missing closing quote — should produce an error
+    bool ok = parser.parseString(R"(schema bad volume -100 "unterminated)");
+    CHECK_FALSE(ok);
+    REQUIRE(parser.errors().size() >= 1);
+
+    // Check that the error message mentions unterminated string
+    bool found = false;
+    for (const auto &e : parser.errors()) {
+        if (e.find("unterminated") != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("Multi-level archetype inheritance (A -> B -> C)", "[schema][inheritance]") {
+    SchemaParser parser;
+    REQUIRE(parser.parseString(R"(
+        schema GRANDPARENT
+        volume -100
+        priority 32
+        audio_class ambient
+        no_repeat
+
+        schema PARENT
+        archetype GRANDPARENT
+        fade 500
+
+        schema CHILD
+        archetype PARENT
+        delay 200
+        child_sample1
+    )"));
+
+    auto *s = parser.findSchema("CHILD");
+    REQUIRE(s != nullptr);
+    // Inherited from GRANDPARENT through PARENT
+    CHECK(s->playParams.volume == -100);
+    CHECK(s->playParams.priority == 32);
+    CHECK(s->playParams.audioClass == SchemaAudioClass::Ambient);
+    CHECK((s->playParams.flags & SCH_NO_REPEAT) != 0);
+    // Inherited from PARENT
+    CHECK(s->playParams.fade == 500);
+    // Set directly on CHILD
+    CHECK(s->playParams.initialDelay == 200);
+    CHECK(s->samples.size() == 1);
+}
+
+TEST_CASE("Circular archetype reference does not infinite loop", "[schema][inheritance]") {
+    SchemaParser parser;
+    // A references B, B references A — parser must not hang
+    REQUIRE(parser.parseString(R"(
+        schema ALPHA
+        archetype BETA
+        volume -100
+
+        schema BETA
+        archetype ALPHA
+        priority 64
+    )"));
+
+    // Both should exist and have their own explicit values
+    auto *a = parser.findSchema("ALPHA");
+    auto *b = parser.findSchema("BETA");
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK(a->playParams.volume == -100);
+    CHECK(b->playParams.priority == 64);
+}
+
+TEST_CASE("Inheritance respects explicitly-set default values", "[schema][inheritance]") {
+    SchemaParser parser;
+    REQUIRE(parser.parseString(R"(
+        schema PARENT
+        volume -500
+        priority 200
+        pan -3000
+        fade 100
+
+        schema CHILD_DEFAULTS
+        archetype PARENT
+        pan 0
+        priority 128
+    )"));
+
+    auto *s = parser.findSchema("CHILD_DEFAULTS");
+    REQUIRE(s != nullptr);
+
+    // Child explicitly set pan=0 and priority=128 (both happen to be defaults).
+    // These must NOT be overwritten by the parent's values.
+    CHECK(s->playParams.pan == 0);
+    CHECK(s->playParams.priority == 128);
+
+    // These were not set by child, so they should be inherited from parent.
+    CHECK(s->playParams.volume == -500);
+    CHECK(s->playParams.fade == 100);
+}
