@@ -28,10 +28,13 @@
 #include "ServiceCommon.h"
 #include <algorithm>
 #include <atomic>
+#include <queue>
 #include "DarknessServiceManager.h"
 #include "database/DatabaseService.h"
 #include "loop/LoopService.h"
 #include "object/ObjectService.h"
+#include "room/Room.h"
+#include "room/RoomPortal.h"
 #include "room/RoomService.h"
 #include "property/PropertyService.h"
 #include "logger.h"
@@ -1385,6 +1388,144 @@ void AudioService::haltAll()
     }
     mVoices.clear();
     mNextHandle = 0;
+}
+
+// ── Sound propagation through portal graph (AI hearing) ──
+
+//------------------------------------------------------
+SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
+                                            const Vector3 &listenerPos,
+                                            float maxDist) const
+{
+    SoundPropInfo result;
+
+    if (!mRoomService || !mRoomService->isLoaded())
+        return result;
+
+    // Find the rooms containing source and listener
+    Room *sourceRoom = mRoomService->roomFromPoint(sourcePos);
+    Room *listenerRoom = mRoomService->roomFromPoint(listenerPos);
+
+    if (!sourceRoom || !listenerRoom)
+        return result;
+
+    // Same room — direct line of sight, no portal traversal needed
+    if (sourceRoom == listenerRoom) {
+        float dist = glm::length(listenerPos - sourcePos);
+        if (dist <= maxDist) {
+            result.reached = true;
+            result.realDistance = dist;
+            result.effectiveDistance = dist;
+            result.totalBlocking = 0.0f;
+            result.virtualPosition = sourcePos;
+        }
+        return result;
+    }
+
+    // Dijkstra-style BFS through portal graph, ordered by effective distance.
+    // Each entry tracks cumulative real distance, effective distance (with blocking
+    // penalties), and the last portal crossed (for virtual position).
+    struct BFSEntry {
+        Room *room;
+        float realDist;         // Cumulative real distance to room entry point
+        float effectiveDist;    // Cumulative effective distance (with blocking penalties)
+        float maxBlocking;      // Highest blocking factor encountered so far
+        Vector3 entryPoint;     // Where we entered this room (portal center or source)
+        Vector3 lastPortalPos;  // Center of the last portal crossed (for virtual position)
+
+        // Priority queue: smallest effective distance first
+        bool operator>(const BFSEntry &o) const {
+            return effectiveDist > o.effectiveDist;
+        }
+    };
+
+    std::priority_queue<BFSEntry, std::vector<BFSEntry>, std::greater<BFSEntry>> pq;
+    std::unordered_map<int32_t, float> bestDist;  // roomID → best effective distance seen
+
+    // Seed with the source room
+    BFSEntry start;
+    start.room = sourceRoom;
+    start.realDist = 0.0f;
+    start.effectiveDist = 0.0f;
+    start.maxBlocking = 0.0f;
+    start.entryPoint = sourcePos;
+    start.lastPortalPos = sourcePos;
+    pq.push(start);
+    bestDist[sourceRoom->getRoomID()] = 0.0f;
+
+    while (!pq.empty()) {
+        BFSEntry cur = pq.top();
+        pq.pop();
+
+        // Skip if we already found a better path to this room
+        auto it = bestDist.find(cur.room->getRoomID());
+        if (it != bestDist.end() && cur.effectiveDist > it->second)
+            continue;
+
+        // Check if we've reached the listener's room
+        if (cur.room == listenerRoom) {
+            // Add final segment from room entry point to listener
+            float finalSeg = glm::length(listenerPos - cur.entryPoint);
+            result.reached = true;
+            result.realDistance = cur.realDist + finalSeg;
+            result.effectiveDistance = cur.effectiveDist + finalSeg;
+            result.totalBlocking = cur.maxBlocking;
+            // Virtual position: the last portal center, or source if same-room
+            result.virtualPosition = (cur.lastPortalPos == sourcePos)
+                                     ? sourcePos : cur.lastPortalPos;
+            return result;
+        }
+
+        // Explore portals from the current room
+        uint32_t portalCount = cur.room->getPortalCount();
+        for (uint32_t i = 0; i < portalCount; ++i) {
+            RoomPortal *portal = cur.room->getPortal(i);
+            if (!portal) continue;
+
+            Room *nextRoom = portal->getFarRoom();
+            if (!nextRoom) continue;
+
+            // Distance from current entry point to this portal center
+            float segDist = glm::length(portal->getCenter() - cur.entryPoint);
+            float newRealDist = cur.realDist + segDist;
+
+            // Get blocking factor for this portal (keyed by room pair)
+            float blocking = getBlockingFactor(cur.room->getRoomID(),
+                                                nextRoom->getRoomID());
+
+            // Dark Engine munged distance formula:
+            // effectiveDist = realDist + (maxDist - realDist) * blockingFactor
+            // Applied per-portal: the penalty increases the effective distance
+            float penalty = (maxDist - newRealDist) * blocking;
+            if (penalty < 0.0f) penalty = 0.0f;
+            float newEffDist = cur.effectiveDist + segDist + penalty;
+
+            // Prune if beyond max propagation distance
+            if (newEffDist > maxDist)
+                continue;
+
+            float newMaxBlocking = std::max(cur.maxBlocking, blocking);
+
+            // Only explore if this is a better path to the next room
+            int32_t nextID = nextRoom->getRoomID();
+            auto bestIt = bestDist.find(nextID);
+            if (bestIt != bestDist.end() && newEffDist >= bestIt->second)
+                continue;
+            bestDist[nextID] = newEffDist;
+
+            BFSEntry next;
+            next.room = nextRoom;
+            next.realDist = newRealDist;
+            next.effectiveDist = newEffDist;
+            next.maxBlocking = newMaxBlocking;
+            next.entryPoint = portal->getCenter();
+            next.lastPortalPos = portal->getCenter();
+            pq.push(next);
+        }
+    }
+
+    // Sound could not reach the listener within maxDist
+    return result;
 }
 
 //------------------------------------------------------

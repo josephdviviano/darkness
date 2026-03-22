@@ -85,6 +85,19 @@ constexpr SoundHandle SOUND_HANDLE_INVALID = -1;
 /// Maximum simultaneous active voices (matches Dark Engine's limit)
 constexpr int MAX_ACTIVE_VOICES = 32;
 
+/// Default maximum sound propagation distance (world units)
+constexpr float SOUND_MAX_DIST = 200.0f;
+
+/// Result of sound propagation through the portal graph.
+/// Describes how a sound reaches a listener after traversing portals and doors.
+struct SoundPropInfo {
+    float effectiveDistance = 0.0f;   ///< Distance with blocking penalties applied
+    float realDistance = 0.0f;        ///< Actual physical distance through portal chain
+    float totalBlocking = 0.0f;      ///< Cumulative blocking factor [0,1] (max of all portals)
+    Vector3 virtualPosition{0, 0, 0}; ///< Where the sound appears to come from (last portal center)
+    bool reached = false;            ///< Whether the sound can reach the listener
+};
+
 /** @brief Audio service — manages all sound playback, schema resolution,
  *  Steam Audio spatialization, and AI sound propagation.
  *
@@ -156,6 +169,17 @@ public:
      *  @param yaw    Heading rotation (radians, counterclockwise from +X in Z-up)
      *  @param pitch  Tilt rotation (radians, positive = looking up) */
     void setListenerTransform(const Vector3 &pos, float yaw, float pitch);
+
+    /** Propagate sound from source to listener through the portal graph.
+     *  Uses Dijkstra-style BFS through room portals, applying per-portal
+     *  blocking factors (from doors) to compute effective distance.
+     *  @param sourcePos    World-space sound source position
+     *  @param listenerPos  World-space listener/AI position
+     *  @param maxDist      Maximum propagation distance (default 200 world units)
+     *  @return Propagation info (reached=false if sound can't reach listener) */
+    SoundPropInfo propagateSound(const Vector3 &sourcePos,
+                                 const Vector3 &listenerPos,
+                                 float maxDist = SOUND_MAX_DIST) const;
 
     /** Per-frame audio update — voice cleanup, Steam Audio simulation step.
      *  Called from the render binary's main loop (LoopService is not used
