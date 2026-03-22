@@ -61,6 +61,18 @@ enum SchemaFlags : uint32_t {
     SCH_LOC_SPATIAL    = 1 << 9,   // Local-only spatial sound
 };
 
+/// Tracks which SchemaPlayParams fields were explicitly set by the parser,
+/// so that archetype inheritance can distinguish "not set" from "set to default".
+enum SchemaFieldSet : uint32_t {
+    SCH_SET_NONE        = 0,
+    SCH_SET_VOLUME      = 1 << 0,
+    SCH_SET_DELAY       = 1 << 1,
+    SCH_SET_PAN         = 1 << 2,
+    SCH_SET_PRIORITY    = 1 << 3,
+    SCH_SET_FADE        = 1 << 4,
+    SCH_SET_AUDIO_CLASS = 1 << 5,
+};
+
 /// Playback parameters (maps to sSchemaPlayParams, 20 bytes on disk)
 struct SchemaPlayParams {
     uint32_t flags = 0;           // SchemaFlags bitfield
@@ -70,6 +82,7 @@ struct SchemaPlayParams {
     int fade = 0;                 // Fade in/out duration (ms)
     SchemaAudioClass audioClass = SchemaAudioClass::Noise;
     int priority = 128;           // 0-255, default 128
+    uint32_t fieldsSet = 0;       // SchemaFieldSet bitmask — tracks explicit parser assignments
 };
 
 /// Loop parameters (maps to sSchemaLoopParams, 8 bytes on disk)
