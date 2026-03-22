@@ -38,8 +38,10 @@ namespace Darkness {
 
 SchemaParser::Tokenizer::Tokenizer(
     const std::string &source, const std::string &filename,
-    const std::unordered_map<std::string, int> &defines)
-    : mSource(source), mFilename(filename), mDefines(defines) {}
+    const std::unordered_map<std::string, int> &defines,
+    std::vector<std::string> *errors)
+    : mSource(source), mFilename(filename), mDefines(defines),
+      mParserErrors(errors) {}
 
 SchemaParser::Token SchemaParser::Tokenizer::next()
 {
@@ -131,7 +133,14 @@ SchemaParser::Token SchemaParser::Tokenizer::readToken()
             if (mSource[mPos] == '\n') mLine++;
             text += mSource[mPos++];
         }
-        if (mPos < mSource.size()) mPos++; // skip closing quote
+        if (mPos < mSource.size()) {
+            mPos++; // skip closing quote
+        } else if (mParserErrors) {
+            // Unterminated string — reached EOF without closing quote
+            std::ostringstream ss;
+            ss << mFilename << ":" << tokenLine << ": error: unterminated string literal";
+            mParserErrors->push_back(ss.str());
+        }
         return {TokenType::String, text, 0, tokenLine};
     }
 
@@ -220,7 +229,7 @@ SchemaParser::Tokenizer::lookupKeyword(const std::string &lower)
 bool SchemaParser::parseString(const std::string &text,
                                const std::string &filename)
 {
-    Tokenizer tok(text, filename, mDefines);
+    Tokenizer tok(text, filename, mDefines, &mErrors);
     parseTopLevel(tok, ".");
     return mErrors.empty();
 }
@@ -246,7 +255,7 @@ bool SchemaParser::loadFile(const std::string &filePath)
     std::string baseDir = fs::path(filePath).parent_path().string();
     if (baseDir.empty()) baseDir = ".";
 
-    Tokenizer tok(contents, filePath, mDefines);
+    Tokenizer tok(contents, filePath, mDefines, &mErrors);
     parseTopLevel(tok, baseDir);
     return mErrors.empty();
 }
@@ -394,33 +403,39 @@ bool SchemaParser::parseSchemaParams(Tokenizer &tok, SchemaEntry &entry)
     case TokenType::Volume: {
         Token val = tok.next();
         entry.playParams.volume = val.intValue;
+        entry.playParams.fieldsSet |= SCH_SET_VOLUME;
         break;
     }
     case TokenType::Delay: {
         Token val = tok.next();
         entry.playParams.initialDelay = val.intValue;
+        entry.playParams.fieldsSet |= SCH_SET_DELAY;
         break;
     }
     case TokenType::Pan: {
         Token val = tok.next();
         entry.playParams.pan = val.intValue;
         entry.playParams.flags |= SCH_PAN_POS;
+        entry.playParams.fieldsSet |= SCH_SET_PAN;
         break;
     }
     case TokenType::PanRange: {
         Token val = tok.next();
         entry.playParams.pan = val.intValue;
         entry.playParams.flags |= SCH_PAN_RANGE;
+        entry.playParams.fieldsSet |= SCH_SET_PAN;
         break;
     }
     case TokenType::Priority: {
         Token val = tok.next();
         entry.playParams.priority = val.intValue;
+        entry.playParams.fieldsSet |= SCH_SET_PRIORITY;
         break;
     }
     case TokenType::Fade: {
         Token val = tok.next();
         entry.playParams.fade = val.intValue;
+        entry.playParams.fieldsSet |= SCH_SET_FADE;
         break;
     }
     case TokenType::Flags: {
@@ -431,6 +446,7 @@ bool SchemaParser::parseSchemaParams(Tokenizer &tok, SchemaEntry &entry)
     case TokenType::AudioClass: {
         Token name = tok.next();
         entry.playParams.audioClass = parseAudioClassName(name.text);
+        entry.playParams.fieldsSet |= SCH_SET_AUDIO_CLASS;
         break;
     }
     case TokenType::MonoLoop: {
@@ -711,39 +727,58 @@ std::vector<SchemaTagValue> SchemaParser::parseTagList(Tokenizer &tok)
 
 void SchemaParser::resolveArchetype(SchemaEntry &entry) const
 {
+    // Walk the archetype chain (supports multi-level: A → B → C).
+    // Uses a visited set to detect and break circular references.
+    std::unordered_set<std::string> visited;
     std::string parentKey = toLower(entry.archetypeName);
-    auto it = mSchemas.find(parentKey);
-    if (it == mSchemas.end())
-        return;
 
-    const SchemaEntry &parent = it->second;
+    while (!parentKey.empty() && visited.find(parentKey) == visited.end()) {
+        visited.insert(parentKey);
 
-    // Inherit play params where the child hasn't set them
-    // (default volume is -1, default delay/pan/fade are 0)
-    if (entry.playParams.volume == -1 && parent.playParams.volume != -1)
-        entry.playParams.volume = parent.playParams.volume;
-    if (entry.playParams.initialDelay == 0 && parent.playParams.initialDelay != 0)
-        entry.playParams.initialDelay = parent.playParams.initialDelay;
-    if (entry.playParams.fade == 0 && parent.playParams.fade != 0)
-        entry.playParams.fade = parent.playParams.fade;
-    if (entry.playParams.priority == 128 && parent.playParams.priority != 128)
-        entry.playParams.priority = parent.playParams.priority;
+        auto it = mSchemas.find(parentKey);
+        if (it == mSchemas.end())
+            break;
 
-    // Inherit flags (OR with parent, preserving child's explicit flags)
-    entry.playParams.flags |= parent.playParams.flags;
+        const SchemaEntry &parent = it->second;
 
-    // Inherit audio class if child is default (Noise)
-    if (entry.playParams.audioClass == SchemaAudioClass::Noise &&
-        parent.playParams.audioClass != SchemaAudioClass::Noise)
-        entry.playParams.audioClass = parent.playParams.audioClass;
+        // Inherit play params only where the child hasn't explicitly set them.
+        // Uses fieldsSet bitmask so "set to default" is distinguishable from "not set".
+        if (!(entry.playParams.fieldsSet & SCH_SET_VOLUME) &&
+            (parent.playParams.fieldsSet & SCH_SET_VOLUME))
+            entry.playParams.volume = parent.playParams.volume;
+        if (!(entry.playParams.fieldsSet & SCH_SET_DELAY) &&
+            (parent.playParams.fieldsSet & SCH_SET_DELAY))
+            entry.playParams.initialDelay = parent.playParams.initialDelay;
+        if (!(entry.playParams.fieldsSet & SCH_SET_PAN) &&
+            (parent.playParams.fieldsSet & SCH_SET_PAN))
+            entry.playParams.pan = parent.playParams.pan;
+        if (!(entry.playParams.fieldsSet & SCH_SET_PRIORITY) &&
+            (parent.playParams.fieldsSet & SCH_SET_PRIORITY))
+            entry.playParams.priority = parent.playParams.priority;
+        if (!(entry.playParams.fieldsSet & SCH_SET_FADE) &&
+            (parent.playParams.fieldsSet & SCH_SET_FADE))
+            entry.playParams.fade = parent.playParams.fade;
+        if (!(entry.playParams.fieldsSet & SCH_SET_AUDIO_CLASS) &&
+            (parent.playParams.fieldsSet & SCH_SET_AUDIO_CLASS))
+            entry.playParams.audioClass = parent.playParams.audioClass;
 
-    // Inherit loop params if child has no loop
-    if (!entry.loopParams.isLooping && parent.loopParams.isLooping)
-        entry.loopParams = parent.loopParams;
+        // Propagate inherited fieldsSet so grandchild sees what was inherited
+        entry.playParams.fieldsSet |= parent.playParams.fieldsSet;
 
-    // Inherit message if child has none
-    if (entry.message.empty() && !parent.message.empty())
-        entry.message = parent.message;
+        // Inherit flags (OR with parent, preserving child's explicit flags)
+        entry.playParams.flags |= parent.playParams.flags;
+
+        // Inherit loop params if child has no loop
+        if (!entry.loopParams.isLooping && parent.loopParams.isLooping)
+            entry.loopParams = parent.loopParams;
+
+        // Inherit message if child has none
+        if (entry.message.empty() && !parent.message.empty())
+            entry.message = parent.message;
+
+        // Continue up the chain
+        parentKey = toLower(parent.archetypeName);
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
