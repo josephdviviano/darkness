@@ -37,6 +37,7 @@
 #include "room/RoomPortal.h"
 #include "room/RoomService.h"
 #include "property/PropertyService.h"
+#include "property/TypedProperty.h"
 #include "logger.h"
 
 #include <unordered_set>
@@ -688,6 +689,7 @@ void AudioService::bootstrapFinished()
 void AudioService::shutdown()
 {
     haltAll();
+    mAmbients.clear();
 
     // Release sound resources
     mSoundCache.reset();
@@ -726,27 +728,9 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
         return;
 
     // NOTE: Steam Audio scene is built via buildAcousticScene() called from DarknessRender.cpp
-    // TODO (Task 39): Load ambient sound properties (P$AmbientHack)
 
-    // Test: play a schema-based sound if schemas are loaded
-    if (mSchemaParser && mAudioReady) {
-        // Try a few common test schemas (gate opening, sword swipe)
-        static const char *testSchemas[] = {"gate_open", "sw_swipe", "bow_pull"};
-        for (const char *name : testSchemas) {
-            SoundHandle h = playSchema(name, Vector3(0.0f, 0.0f, 0.0f));
-            if (h != SOUND_HANDLE_INVALID) {
-                LOG_INFO("AudioService: test schema '%s' playing (handle %d)", name, h);
-                break;
-            }
-        }
-    } else if (mSoundLoader && mAudioReady) {
-        // Fallback: play a raw sound effect if no schemas available
-        SoundHandle h = startVoice("test", "swoosh1", Vector3(0.0f, 0.0f, 0.0f),
-                                    128, false, 0);
-        if (h != SOUND_HANDLE_INVALID) {
-            LOG_INFO("AudioService: test sound playing (handle %d)", h);
-        }
-    }
+    // Load ambient sound objects from P$AmbientHack properties
+    loadAmbientSounds();
 
     LOG_INFO("AudioService: mission loaded");
 }
@@ -774,6 +758,9 @@ void AudioService::onDBDrop(uint32_t dropmask)
 
     // Release Steam Audio acoustic scene
     destroyAcousticScene();
+
+    // Clear ambient sounds (voices already halted above)
+    mAmbients.clear();
 
     // Clear per-schema state (NO_REPEAT tracking) and texture materials
     mLastSampleIdx.clear();
@@ -935,6 +922,9 @@ void AudioService::loopStep(float deltaTime)
             }
         }
     }
+
+    // Update ambient sound volumes based on listener distance
+    updateAmbientVolumes();
 }
 
 //------------------------------------------------------
@@ -1389,6 +1379,122 @@ void AudioService::haltAll()
     }
     mVoices.clear();
     mNextHandle = 0;
+}
+
+// ── Ambient sound system ──
+
+//------------------------------------------------------
+void AudioService::loadAmbientSounds()
+{
+    if (!mPropertyService || !mObjectService || !mAudioReady)
+        return;
+
+    // Find all objects with P$AmbientHack (property name "AmbientHa" in the gamesys)
+    auto objIDs = getAllObjectsWithProperty(mPropertyService.get(), "AmbientHa");
+
+    int loaded = 0;
+    for (int objID : objIDs) {
+        // Only process concrete objects (positive IDs), not archetypes
+        if (objID <= 0)
+            continue;
+
+        size_t rawSize = 0;
+        const uint8_t *raw = getPropertyRawData(
+            mPropertyService.get(), "AmbientHa", objID, rawSize);
+        if (!raw || rawSize < sizeof(PropAmbientHack))
+            continue;
+
+        const auto *prop = reinterpret_cast<const PropAmbientHack *>(raw);
+
+        // Skip turned-off ambients
+        if (prop->flags & AMB_TURNED_OFF)
+            continue;
+
+        AmbientSound amb;
+        amb.objID = objID;
+        amb.schemaName = std::string(prop->schema,
+            strnlen(prop->schema, sizeof(prop->schema)));
+        amb.radius = static_cast<float>(prop->radius);
+        amb.volume = prop->volume;
+        amb.flags = prop->flags;
+        amb.position = mObjectService->position(objID);
+
+        if (amb.schemaName.empty())
+            continue;
+
+        // AMB_ONCE_ONLY: play once then stop; otherwise loop continuously
+        bool isLooping = !(amb.flags & AMB_ONCE_ONLY);
+
+        // Start a voice for this ambient sound.
+        // Use the schema system if available, otherwise raw voice.
+        if (mSchemaParser) {
+            const SchemaEntry *schema = mSchemaParser->findSchema(amb.schemaName);
+            if (schema && !schema->samples.empty()) {
+                // Select a sample (ambient schemas typically have one sample)
+                const SchemaSample &sample = schema->samples[0];
+                amb.handle = startVoice(amb.schemaName, sample.name, amb.position,
+                                         schema->playParams.priority, isLooping, objID);
+            }
+        }
+
+        // Fallback: try loading schema name as a raw sound
+        if (amb.handle == SOUND_HANDLE_INVALID) {
+            amb.handle = startVoice(amb.schemaName, amb.schemaName, amb.position,
+                                     64, isLooping, objID);
+        }
+
+        if (amb.handle != SOUND_HANDLE_INVALID) {
+            // Apply ambient volume (0 = silence initially — updated by distance)
+            if (mVoices.count(amb.handle)) {
+                ma_sound_set_volume(&mVoices[amb.handle]->sound, 0.0f);
+            }
+            mAmbients.push_back(std::move(amb));
+            ++loaded;
+        }
+    }
+
+    if (loaded > 0) {
+        LOG_INFO("AudioService: loaded %d ambient sounds from P$AmbientHack", loaded);
+    }
+}
+
+//------------------------------------------------------
+void AudioService::updateAmbientVolumes()
+{
+    if (mAmbients.empty())
+        return;
+
+    for (auto &amb : mAmbients) {
+        if (amb.handle == SOUND_HANDLE_INVALID)
+            continue;
+
+        auto it = mVoices.find(amb.handle);
+        if (it == mVoices.end()) {
+            amb.handle = SOUND_HANDLE_INVALID;
+            continue;
+        }
+
+        // Distance-based volume falloff within the ambient's radius.
+        // Volume is 0 at the radius boundary, full at the source position.
+        float dist = glm::length(mListenerPos - amb.position);
+        float vol = 0.0f;
+
+        if (amb.radius > 0.0f && dist < amb.radius) {
+            // Linear falloff: 1.0 at center, 0.0 at radius
+            float falloff = 1.0f - (dist / amb.radius);
+
+            // Smooth the falloff curve (quadratic) for more natural fade
+            if (!(amb.flags & AMB_NO_FADE)) {
+                falloff *= falloff;
+            }
+
+            // Apply the ambient's volume parameter
+            float baseVol = schemaVolumeToLinear(amb.volume);
+            vol = baseVol * falloff;
+        }
+
+        ma_sound_set_volume(&it->second->sound, vol);
+    }
 }
 
 // ── Footstep material system ──
