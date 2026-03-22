@@ -33,9 +33,11 @@
 #include "database/DatabaseCommon.h"
 #include "loop/LoopCommon.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 // Forward declarations for audio backend types (defined in .cpp via C headers)
 struct ma_engine;
@@ -44,6 +46,12 @@ struct _IPLContext_t;
 typedef _IPLContext_t* IPLContext;
 struct _IPLHRTF_t;
 typedef _IPLHRTF_t* IPLHRTF;
+struct _IPLScene_t;
+typedef _IPLScene_t* IPLScene;
+struct _IPLStaticMesh_t;
+typedef _IPLStaticMesh_t* IPLStaticMesh;
+struct _IPLSimulator_t;
+typedef _IPLSimulator_t* IPLSimulator;
 
 namespace Darkness {
 
@@ -51,6 +59,17 @@ namespace Darkness {
 class CRFSoundLoader;
 class SoundCache;
 struct SoundData;
+
+/// Data transfer struct for world geometry → Steam Audio acoustic scene.
+/// Filled by the render binary from WR chunk data, passed to AudioService.
+struct AcousticSceneData {
+    /// World-space vertex positions (3 floats per vertex: x, y, z)
+    std::vector<float> vertices;
+    /// Triangle indices (3 per triangle, indexing into vertices)
+    std::vector<int32_t> indices;
+    /// Per-triangle texture name from TXLIST (family/name path, for material lookup)
+    std::vector<std::string> texNames;
+};
 
 /// Active voice — owns WAV data, miniaudio decoder + sound (defined in AudioService.cpp)
 struct ActiveVoice;
@@ -119,6 +138,13 @@ public:
      *  @return true if snd.crf opened successfully */
     bool loadSoundResources(const std::string &resPath);
 
+    /** Build Steam Audio acoustic scene from world geometry.
+     *  Called from the render binary after WR chunks are parsed.
+     *  Creates IPLScene + IPLStaticMesh + IPLSimulator for ray-traced acoustics.
+     *  @param data  World geometry — vertices, triangle indices, per-triangle texture names
+     *  @return true if scene built successfully */
+    bool buildAcousticScene(const AcousticSceneData &data);
+
 protected:
     // ── Service lifecycle ──
 
@@ -181,11 +207,26 @@ private:
     /// Remove finished voices from the active map
     void cleanupFinishedVoices();
 
+    // ── Steam Audio acoustic scene ──
+
+    /// Acoustic scene built from WR world geometry
+    IPLScene mIplScene = nullptr;
+
+    /// Static mesh within the scene (world geometry + material assignments)
+    IPLStaticMesh mIplStaticMesh = nullptr;
+
+    /// Simulator for direct/reflection/reverb computation
+    IPLSimulator mIplSimulator = nullptr;
+
+    /// Whether an acoustic scene is currently active (built and committed)
+    bool mSceneReady = false;
+
     // Private helpers
     bool initMiniaudio();
     void shutdownMiniaudio();
     bool initSteamAudio();
     void shutdownSteamAudio();
+    void destroyAcousticScene();
 };
 
 /// Factory for AudioService

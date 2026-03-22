@@ -1515,6 +1515,71 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // ── Build Steam Audio acoustic scene from WR world geometry ──
+    // Extract simplified mesh (solid polygons only, no portals/sky) and
+    // per-triangle texture names for acoustic material assignment.
+    {
+        Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+        Darkness::AcousticSceneData sceneData;
+
+        const auto &wr = mission.wrData;
+        for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+            const auto &cell = wr.cells[ci];
+            int numSolid = cell.numPolygons - cell.numPortals;
+
+            for (int pi = 0; pi < numSolid; ++pi) {
+                const auto &poly = cell.polygons[pi];
+
+                // Skip sky polygons (BACKHACK_IDX = 249)
+                if (pi < cell.numTextured && cell.texturing[pi].txt == 249)
+                    continue;
+
+                // Determine texture name for material lookup
+                std::string texName = "generic";
+                if (pi < cell.numTextured) {
+                    uint8_t txtIdx = cell.texturing[pi].txt;
+                    if (txtIdx < mission.txList.textures.size()) {
+                        const auto &entry = mission.txList.textures[txtIdx];
+                        if (!entry.fullPath.empty())
+                            texName = entry.fullPath;
+                    }
+                }
+
+                // Fan-triangulate the polygon (same winding as render mesh)
+                uint32_t baseVertex = static_cast<uint32_t>(
+                    sceneData.vertices.size() / 3);
+
+                for (int vi = 0; vi < poly.count; ++vi) {
+                    uint8_t idx = cell.polyIndices[pi][vi];
+                    const auto &v = cell.vertices[idx];
+                    sceneData.vertices.push_back(v.x);
+                    sceneData.vertices.push_back(v.y);
+                    sceneData.vertices.push_back(v.z);
+                }
+
+                for (int t = 1; t < poly.count - 1; ++t) {
+                    sceneData.indices.push_back(
+                        static_cast<int32_t>(baseVertex));
+                    sceneData.indices.push_back(
+                        static_cast<int32_t>(baseVertex + t + 1));
+                    sceneData.indices.push_back(
+                        static_cast<int32_t>(baseVertex + t));
+                    sceneData.texNames.push_back(texName);
+                }
+            }
+        }
+
+        size_t numTris = sceneData.indices.size() / 3;
+        size_t numVerts = sceneData.vertices.size() / 3;
+        std::fprintf(stderr, "Acoustic mesh: %zu vertices, %zu triangles\n",
+                     numVerts, numTris);
+
+        if (!audioSvc->buildAcousticScene(sceneData)) {
+            std::fprintf(stderr, "WARNING: failed to build acoustic scene\n"
+                                 "         Steam Audio spatialization disabled.\n");
+        }
+    }
+
     // Inject raycaster into the world query facade — enables ray-vs-world
     // queries (AI line-of-sight, physics, sound occlusion) via portal traversal
     worldQuery->setRaycaster(
