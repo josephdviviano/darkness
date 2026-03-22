@@ -158,16 +158,28 @@ struct SteamAudioDSPNode {
     int frameSize = 1024;
     bool effectsReady = false;       // true when effects + node are initialized
     bool nodeInitialized = false;    // true when ma_node_init succeeded
+
+    // Diagnostics (written by audio thread, read by main thread)
+    std::atomic<uint64_t> callCount{0};     // how many times process() was called
+    std::atomic<float> peakInput{0.0f};     // peak input level seen
+    std::atomic<float> peakOutput{0.0f};    // peak output level seen
+    std::atomic<uint32_t> lastFrameCount{0}; // last frame count delivered by miniaudio
+    std::atomic<float> lastAtten{1.0f};     // last attenuation factor applied
 };
 
 /// vtable for the Steam Audio DSP custom node
 static ma_node_vtable sSteamAudioNodeVtable = {
     steamAudioNodeProcess,   // onProcess
     nullptr,                 // onGetRequiredInputFrameCount (1:1 input/output ratio)
-    1,                       // inputBusCount  (mono from ma_sound)
+    1,                       // inputBusCount  (stereo from ma_sound)
     1,                       // outputBusCount (stereo to engine endpoint)
     0                        // flags
 };
+
+/// Temporary debug flag: when true, bypass Steam Audio effects and just pass
+/// mono input through as dual-mono stereo. Helps isolate node graph issues.
+/// DSP bypass level (0=full pipeline, 3=mono passthrough, 4=stereo passthrough)
+static std::atomic<int> sDSPBypassLevel{0};
 
 /// Audio-thread callback: applies Steam Audio direct + binaural effects.
 /// Reads mono from ma_sound, outputs stereo binaural to engine endpoint.
@@ -184,6 +196,10 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
     if (frameCount > static_cast<ma_uint32>(node->frameSize))
         frameCount = static_cast<ma_uint32>(node->frameSize);
 
+    // Track diagnostics
+    node->callCount.fetch_add(1, std::memory_order_relaxed);
+    node->lastFrameCount.store(frameCount, std::memory_order_relaxed);
+
     float* stereoOut = ppFramesOut[0];  // interleaved stereo output
 
     if (!node->effectsReady || frameCount == 0 || !ppFramesIn[0]) {
@@ -194,27 +210,61 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         return;
     }
 
-    const float* monoIn = ppFramesIn[0];
+    // Input is interleaved stereo from ma_sound (engine outputs stereo).
+    // Downmix to mono for Steam Audio processing.
+    const float* stereoIn = ppFramesIn[0];
     float* mono = node->monoScratch.data();
 
-    // Step 1: Copy mono input to scratch buffer (direct effect processes in-place)
-    std::memcpy(mono, monoIn, frameCount * sizeof(float));
+    float peakIn = 0.0f;
+    for (ma_uint32 i = 0; i < frameCount; ++i) {
+        mono[i] = (stereoIn[i * 2] + stereoIn[i * 2 + 1]) * 0.5f;
+        float a = std::fabs(mono[i]);
+        if (a > peakIn) peakIn = a;
+    }
+    node->peakInput.store(peakIn, std::memory_order_relaxed);
 
-    // Step 2: Wrap in Steam Audio deinterleaved buffer (mono = single pointer)
-    float* monoPtr = mono;
-    IPLAudioBuffer inBuf{};
-    inBuf.numChannels = 1;
-    inBuf.numSamples = static_cast<IPLint32>(frameCount);
-    inBuf.data = &monoPtr;
+    int bypassLevel = sDSPBypassLevel.load(std::memory_order_relaxed);
 
-    // Step 3: Apply direct effect in-place (distance attenuation, air absorption,
-    //         occlusion, transmission — frequency-dependent 3-band EQ)
-    if (node->directEffect) {
-        iplDirectEffectApply(node->directEffect, &node->directParams, &inBuf, &inBuf);
+    // Level 4: stereo passthrough (no processing at all)
+    if (bypassLevel >= 4) {
+        std::memcpy(stereoOut, stereoIn, frameCount * 2 * sizeof(float));
+        node->peakOutput.store(peakIn, std::memory_order_relaxed);
+        pFrameCountIn[0] = frameCount;
+        *pFrameCountOut = frameCount;
+        return;
     }
 
-    // Step 4: Apply binaural effect (mono → stereo HRTF spatialization)
-    if (node->binauralEffect) {
+    // Level 3: mono passthrough (downmix, then output as dual-mono)
+    if (bypassLevel >= 3) {
+        for (ma_uint32 i = 0; i < frameCount; ++i) {
+            stereoOut[i * 2]     = mono[i];
+            stereoOut[i * 2 + 1] = mono[i];
+        }
+        node->peakOutput.store(peakIn, std::memory_order_relaxed);
+        pFrameCountIn[0] = frameCount;
+        *pFrameCountOut = frameCount;
+        return;
+    }
+
+    // Levels 0-2: Steam Audio processing
+    //
+    // Architecture: run binaural HRTF on the raw mono input, then apply direct
+    // effect attenuation as a simple post-multiply on the stereo output.
+    //
+    // Level 0: binaural + direct attenuation (full pipeline)
+    // Level 1: direct attenuation only (no binaural — mono passthrough)
+    // Level 2: binaural only (no direct attenuation)
+    bool runBinaural = (bypassLevel == 0 || bypassLevel == 2) && node->binauralEffect;
+    bool runAtten = (bypassLevel == 0 || bypassLevel == 1);
+
+    // Apply binaural effect (mono → stereo HRTF spatialization).
+    if (runBinaural) {
+        float* binauralMonoPtr = mono;
+        IPLAudioBuffer binauralIn{};
+        binauralIn.numChannels = 1;
+        binauralIn.numSamples = static_cast<IPLint32>(frameCount);
+        binauralIn.data = &binauralMonoPtr;
+
         float* chL = node->stereoL.data();
         float* chR = node->stereoR.data();
         float* stereoChannels[2] = {chL, chR};
@@ -231,19 +281,58 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         binParams.hrtf = node->hrtf;
         binParams.peakDelays = nullptr;
 
-        iplBinauralEffectApply(node->binauralEffect, &binParams, &inBuf, &outBuf);
+        iplBinauralEffectApply(node->binauralEffect, &binParams, &binauralIn, &outBuf);
+
+        // Apply direct effect attenuation as post-multiply on stereo output.
+        // This gives us distance falloff, occlusion, and air absorption
+        // without chaining the IPLDirectEffect into the binaural input.
+        if (runAtten) {
+            float atten = node->directParams.distanceAttenuation
+                        * node->directParams.occlusion;
+            float airAvg = (node->directParams.airAbsorption[0]
+                          + node->directParams.airAbsorption[1]
+                          + node->directParams.airAbsorption[2]) / 3.0f;
+            atten *= airAvg;
+            if (atten < 0.001f) atten = 0.001f;
+            node->lastAtten.store(atten, std::memory_order_relaxed);
+            for (ma_uint32 i = 0; i < frameCount; ++i) {
+                chL[i] *= atten;
+                chR[i] *= atten;
+            }
+        }
 
         // Interleave deinterleaved stereo → miniaudio interleaved output
+        float peakOut = 0.0f;
         for (ma_uint32 i = 0; i < frameCount; ++i) {
             stereoOut[i * 2]     = chL[i];
             stereoOut[i * 2 + 1] = chR[i];
+            float a = std::fabs(chL[i]);
+            if (a > peakOut) peakOut = a;
+            a = std::fabs(chR[i]);
+            if (a > peakOut) peakOut = a;
         }
+        node->peakOutput.store(peakOut, std::memory_order_relaxed);
     } else {
-        // No binaural — duplicate mono to both channels
-        for (ma_uint32 i = 0; i < frameCount; ++i) {
-            stereoOut[i * 2]     = mono[i];
-            stereoOut[i * 2 + 1] = mono[i];
+        // No binaural — duplicate mono to both channels, apply direct attenuation
+        float atten = 1.0f;
+        if (runAtten) {
+            atten = node->directParams.distanceAttenuation
+                  * node->directParams.occlusion;
+            float airAvg = (node->directParams.airAbsorption[0]
+                          + node->directParams.airAbsorption[1]
+                          + node->directParams.airAbsorption[2]) / 3.0f;
+            atten *= airAvg;
+            if (atten < 0.001f) atten = 0.001f;
         }
+        float peakOut = 0.0f;
+        for (ma_uint32 i = 0; i < frameCount; ++i) {
+            float s = mono[i] * atten;
+            stereoOut[i * 2]     = s;
+            stereoOut[i * 2 + 1] = s;
+            float a = std::fabs(s);
+            if (a > peakOut) peakOut = a;
+        }
+        node->peakOutput.store(peakOut, std::memory_order_relaxed);
     }
 
     pFrameCountIn[0] = frameCount;
@@ -374,20 +463,45 @@ bool AudioService::initMiniaudio()
 {
     mMaEngine = new ma_engine();
 
+    // Use 48kHz — the standard rate that Steam Audio's HRTF supports.
+    // miniaudio handles resampling to the device's native rate (e.g. 96kHz).
     ma_engine_config config = ma_engine_config_init();
     config.channels = 2;           // stereo output
-    config.sampleRate = 44100;     // standard sample rate
+    config.sampleRate = 48000;     // 48kHz for Steam Audio HRTF compatibility
     config.noDevice = MA_FALSE;    // create output device
+    config.listenerCount = 1;      // one listener for 3D spatialization
+    config.periodSizeInFrames = 1024; // power-of-2 period for Steam Audio HRTF compatibility
 
     ma_result result = ma_engine_init(&config, mMaEngine);
     if (result != MA_SUCCESS) {
         LOG_ERROR("AudioService: miniaudio init failed (error %d)", result);
+        std::fprintf(stderr, "AudioService: miniaudio init FAILED (error %d)\n", result);
         delete mMaEngine;
         mMaEngine = nullptr;
         return false;
     }
 
-    LOG_INFO("AudioService: miniaudio initialized (44100 Hz stereo)");
+    // Store the engine sample rate (48kHz) for Steam Audio to match.
+    // The device may run at a different native rate (e.g. 96kHz);
+    // miniaudio resamples internally.
+    mDeviceSampleRate = ma_engine_get_sample_rate(mMaEngine);
+
+    // Detect the actual audio processing frame size from the device.
+    // Must match Steam Audio's frameSize for correct buffer processing.
+    ma_device *device = ma_engine_get_device(mMaEngine);
+    if (device) {
+        ma_uint32 periodSize = device->playback.internalPeriodSizeInFrames;
+        if (periodSize > 0) {
+            mFrameSize = periodSize;
+        }
+        std::fprintf(stderr, "AudioService: miniaudio engine %u Hz → device '%s' @ %u Hz, %u ch, "
+                     "period=%u frames\n",
+                     mDeviceSampleRate, device->playback.name,
+                     device->sampleRate, device->playback.channels,
+                     mFrameSize);
+    }
+
+    LOG_INFO("AudioService: miniaudio initialized");
     return true;
 }
 
@@ -417,13 +531,14 @@ bool AudioService::initSteamAudio()
         return false;
     }
 
-    // Create HRTF for binaural rendering
+    // Create HRTF for binaural rendering (must match device sample rate)
     IPLAudioSettings audioSettings{};
-    audioSettings.samplingRate = 44100;
-    audioSettings.frameSize = 1024;  // ~23ms at 44100Hz
+    audioSettings.samplingRate = static_cast<IPLint32>(mDeviceSampleRate);
+    audioSettings.frameSize = static_cast<IPLint32>(mFrameSize);
 
     IPLHRTFSettings hrtfSettings{};
     hrtfSettings.type = IPL_HRTFTYPE_DEFAULT;
+    hrtfSettings.volume = 1.0f;  // 1.0 = use HRTF data as-is (0.0 = silence!)
 
     err = iplHRTFCreate(mIplContext, &audioSettings, &hrtfSettings, &mIplHrtf);
     if (err != IPL_STATUS_SUCCESS) {
@@ -698,7 +813,6 @@ bool AudioService::init()
 //------------------------------------------------------
 void AudioService::bootstrapFinished()
 {
-    std::fprintf(stderr, "AudioService::bootstrapFinished() called\n");
     // Acquire service dependencies
     mDbService = GET_SERVICE(DatabaseService);
     mRoomService = GET_SERVICE(RoomService);
@@ -1029,7 +1143,7 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
 
     auto &dsp = voice.dspNode;
     dsp.hrtf = mIplHrtf;
-    dsp.frameSize = 1024;
+    dsp.frameSize = static_cast<int>(mFrameSize);
 
     // Allocate processing buffers (once, never reallocated — audio thread safe)
     dsp.monoScratch.resize(dsp.frameSize);
@@ -1037,8 +1151,9 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     dsp.stereoR.resize(dsp.frameSize);
 
     // Create IPLDirectEffect (per-voice, frequency-dependent 3-band EQ)
+    // Must match device sample rate so effects process audio correctly.
     IPLAudioSettings audioSettings{};
-    audioSettings.samplingRate = 44100;
+    audioSettings.samplingRate = static_cast<IPLint32>(mDeviceSampleRate);
     audioSettings.frameSize = dsp.frameSize;
 
     IPLDirectEffectSettings directSettings{};
@@ -1064,9 +1179,11 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
         return;
     }
 
-    // Initialize custom miniaudio node (mono input → stereo output)
-    ma_uint32 inputChannels[1] = {1};   // 1 input bus, 1 channel (mono)
-    ma_uint32 outputChannels[1] = {2};  // 1 output bus, 2 channels (stereo)
+    // Initialize custom miniaudio node (stereo input → stereo output).
+    // Input is stereo because ma_sound always outputs in the engine's channel format.
+    // The process callback downmixes to mono for Steam Audio, then re-spatializes to stereo.
+    ma_uint32 inputChannels[1] = {2};   // 1 input bus, 2 channels (stereo from ma_sound)
+    ma_uint32 outputChannels[1] = {2};  // 1 output bus, 2 channels (stereo to endpoint)
 
     ma_node_config nodeConfig = ma_node_config_init();
     nodeConfig.vtable = &sSteamAudioNodeVtable;
@@ -1106,8 +1223,13 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     dsp.effectsReady = true;
 
     // Connect the node graph: ma_sound → DSP node → engine endpoint
-    ma_node_attach_output_bus(&voice.sound, 0, &dsp.base, 0);
-    ma_node_attach_output_bus(&dsp.base, 0, ma_engine_get_endpoint(mMaEngine), 0);
+    ma_result r1 = ma_node_attach_output_bus(&voice.sound, 0, &dsp.base, 0);
+    ma_result r2 = ma_node_attach_output_bus(&dsp.base, 0, ma_engine_get_endpoint(mMaEngine), 0);
+
+    if (r1 != MA_SUCCESS || r2 != MA_SUCCESS) {
+        LOG_ERROR("AudioService: DSP node attach failed: sound→dsp=%d, dsp→endpoint=%d",
+                  r1, r2);
+    }
 
     LOG_DEBUG("AudioService: Steam Audio DSP pipeline initialized for voice %d",
               voice.handle);
@@ -1505,6 +1627,22 @@ void AudioService::updateAmbientVolumes()
 {
     if (mAmbients.empty())
         return;
+
+    // Debug: periodic status dump (once per ~5 seconds)
+    static float debugTimer = 0.0f;
+    debugTimer += 1.0f / 60.0f;  // approximate
+    if (debugTimer >= 5.0f) {
+        debugTimer = 0.0f;
+        int playing = 0;
+        for (const auto &amb : mAmbients) {
+            if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle))
+                ++playing;
+        }
+        std::fprintf(stderr, "[Audio] %zu voices, %d/%zu ambients playing, "
+                     "listener=(%.0f,%.0f,%.0f)\n",
+                     mVoices.size(), playing, mAmbients.size(),
+                     mListenerPos.x, mListenerPos.y, mListenerPos.z);
+    }
 
     for (auto &amb : mAmbients) {
         if (amb.handle == SOUND_HANDLE_INVALID)

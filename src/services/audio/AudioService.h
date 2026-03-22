@@ -294,6 +294,12 @@ private:
     /// Whether audio backends initialized successfully
     bool mAudioReady = false;
 
+    /// Actual device sample rate (detected at init, used by Steam Audio)
+    uint32_t mDeviceSampleRate = 48000;
+
+    /// Audio processing frame size (aligned with Steam Audio)
+    uint32_t mFrameSize = 1024;
+
     // ── Sound resource loading ──
 
     /// CRF sound loader (opens snd.crf via zziplib)
