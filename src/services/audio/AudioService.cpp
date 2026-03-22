@@ -23,12 +23,15 @@
 #include "AudioService.h"
 #include "AcousticMaterials.h"
 #include "CRFSoundLoader.h"
+#include "SchemaParser.h"
+#include "SchemaTypes.h"
 #include "ServiceCommon.h"
 #include <algorithm>
 #include <atomic>
 #include "DarknessServiceManager.h"
 #include "database/DatabaseService.h"
 #include "loop/LoopService.h"
+#include "object/ObjectService.h"
 #include "room/RoomService.h"
 #include "property/PropertyService.h"
 #include "logger.h"
@@ -262,6 +265,11 @@ struct ActiveVoice {
     bool initialized = false;
     std::atomic<bool> finished{false};  // Set by end callback on audio thread
 
+    // Voice management metadata
+    std::string schemaName;            // Schema that spawned this voice
+    int priority = 128;                // 0-255, higher = more important
+    int objID = 0;                     // Object ID if attached (0 = positional)
+
     // Steam Audio simulation source (nullptr if scene not ready or non-spatial)
     IPLSource iplSource = nullptr;
 
@@ -455,6 +463,22 @@ bool AudioService::loadSoundResources(const std::string &resPath)
     // Create LRU sound cache (64MB budget)
     mSoundCache = std::make_unique<SoundCache>();
 
+    // Load schema files (.spc, .arc, .sch) from RES/SND/SCHEMA/
+    std::string schemaDir = resPath + "/SND/SCHEMA";
+    mSchemaParser = std::make_unique<SchemaParser>();
+    if (mSchemaParser->loadDirectory(schemaDir)) {
+        LOG_INFO("AudioService: loaded %zu schemas from %s",
+                 mSchemaParser->schemaCount(), schemaDir.c_str());
+        // Log any parse warnings
+        for (const auto &w : mSchemaParser->warnings()) {
+            LOG_DEBUG("AudioService: schema warning: %s", w.c_str());
+        }
+    } else {
+        LOG_INFO("AudioService: no schema files found in %s (schemas unavailable)",
+                 schemaDir.c_str());
+        mSchemaParser.reset();
+    }
+
     LOG_INFO("AudioService: Sound resources loaded from %s", resPath.c_str());
     return true;
 }
@@ -635,6 +659,7 @@ void AudioService::bootstrapFinished()
     mDbService = GET_SERVICE(DatabaseService);
     mRoomService = GET_SERVICE(RoomService);
     mPropertyService = GET_SERVICE(PropertyService);
+    mObjectService = GET_SERVICE(ObjectService);
 
     // Register as a database listener — load after rooms are ready
     mDbService->registerListener(this, DBP_AUDIO);
@@ -685,6 +710,8 @@ void AudioService::shutdown()
 
     mRoomService.reset();
     mPropertyService.reset();
+    mObjectService.reset();
+    mSchemaParser.reset();
 
     LOG_INFO("AudioService: shut down");
 }
@@ -695,75 +722,26 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
     if (!(curmask & DBM_MIS_DATA))
         return;
 
-    // TODO (Task 34): Load and parse .sch schema files
     // NOTE: Steam Audio scene is built via buildAcousticScene() called from DarknessRender.cpp
     // TODO (Task 39): Load ambient sound properties (P$AmbientHack)
 
-    // Test sound playback — load and play a sound effect from snd.crf
-    // to verify the full pipeline (CRF → WAV → miniaudio → speakers)
-    if (mSoundLoader && mAudioReady) {
-        static const char *testNames[] = {"swoosh1", "bowpull", "gate1",
-                                          "doormtl1", "swordhi1"};
-        for (const char *name : testNames) {
-            SoundData snd = mSoundLoader->loadSound(name);
-            if (!snd.valid())
-                continue;
-
-            auto voice = std::make_unique<ActiveVoice>();
-            voice->data = std::move(snd);
-            voice->handle = mNextHandle++;
-
-            // Decode WAV from memory → PCM
-            ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 0, 0);
-            if (ma_decoder_init_memory(voice->data.wavData.data(),
-                                       voice->data.wavData.size(),
-                                       &cfg, &voice->decoder) != MA_SUCCESS) {
-                LOG_ERROR("AudioService: failed to decode test sound '%s'", name);
-                continue;
+    // Test: play a schema-based sound if schemas are loaded
+    if (mSchemaParser && mAudioReady) {
+        // Try a few common test schemas (gate opening, sword swipe)
+        static const char *testSchemas[] = {"gate_open", "sw_swipe", "bow_pull"};
+        for (const char *name : testSchemas) {
+            SoundHandle h = playSchema(name, Vector3(0.0f, 0.0f, 0.0f));
+            if (h != SOUND_HANDLE_INVALID) {
+                LOG_INFO("AudioService: test schema '%s' playing (handle %d)", name, h);
+                break;
             }
-
-            // Create sound without default attachment so we can route through
-            // the Steam Audio DSP node. Spatialization is handled by Steam Audio's
-            // binaural effect, not miniaudio's built-in panner.
-            if (ma_sound_init_from_data_source(
-                    mMaEngine, &voice->decoder,
-                    MA_SOUND_FLAG_NO_SPATIALIZATION |
-                    MA_SOUND_FLAG_NO_DEFAULT_ATTACHMENT, nullptr,
-                    &voice->sound) != MA_SUCCESS) {
-                ma_decoder_uninit(&voice->decoder);
-                LOG_ERROR("AudioService: failed to init test sound '%s'", name);
-                continue;
-            }
-
-            voice->initialized = true;
-
-            // Set up Steam Audio DSP pipeline (direct + binaural effects)
-            initVoiceDSP(*voice);
-
-            // If DSP setup failed or not available, connect directly to endpoint
-            if (!voice->dspNode.effectsReady) {
-                ma_node_attach_output_bus(&voice->sound, 0,
-                                          ma_engine_get_endpoint(mMaEngine), 0);
-            }
-
-            // Create Steam Audio source for spatial simulation
-            createVoiceSource(*voice);
-
-            // Register end callback so the audio thread signals completion
-            // via the atomic flag (avoids cross-thread ma_sound_at_end polling)
-            ma_sound_set_end_callback(&voice->sound, onSoundEnd, voice.get());
-
-            ma_result startResult = ma_sound_start(&voice->sound);
-            if (startResult != MA_SUCCESS) {
-                LOG_ERROR("AudioService: failed to start test sound '%s' (error %d)",
-                          name, startResult);
-                continue;
-            }
-
-            LOG_INFO("AudioService: playing test sound '%s' (%zu bytes)",
-                     name, voice->data.sizeBytes());
-            mVoices[voice->handle] = std::move(voice);
-            break; // Only play one test sound
+        }
+    } else if (mSoundLoader && mAudioReady) {
+        // Fallback: play a raw sound effect if no schemas available
+        SoundHandle h = startVoice("test", "swoosh1", Vector3(0.0f, 0.0f, 0.0f),
+                                    128, false, 0);
+        if (h != SOUND_HANDLE_INVALID) {
+            LOG_INFO("AudioService: test sound playing (handle %d)", h);
         }
     }
 
@@ -794,7 +772,8 @@ void AudioService::onDBDrop(uint32_t dropmask)
     // Release Steam Audio acoustic scene
     destroyAcousticScene();
 
-    // TODO (Task 34): Clear schema database
+    // Clear per-schema state (NO_REPEAT tracking)
+    mLastSampleIdx.clear();
 
     LOG_INFO("AudioService: mission audio state cleared");
 }
@@ -1098,32 +1077,284 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
               voice.handle);
 }
 
-// ── Public API stubs ──
+// ── Voice creation helpers ──
+
+/// Convert Dark Engine volume (millibels, -10000 to -1) to linear 0.0–1.0.
+/// -1 = full volume (~1.0), -10000 = -100 dB (silence).
+static float schemaVolumeToLinear(int volume)
+{
+    if (volume >= 0) return 1.0f;
+    if (volume <= -10000) return 0.0f;
+    // millibels → dB → linear: 10^(volume/2000)
+    return std::pow(10.0f, volume / 2000.0f);
+}
+
+//------------------------------------------------------
+int AudioService::selectSample(const std::string &schemaName, int sampleCount,
+                                int totalFreq, const int *frequencies)
+{
+    if (sampleCount <= 0)
+        return -1;
+    if (sampleCount == 1)
+        return 0;
+
+    // Weighted random selection based on frequency values
+    std::uniform_int_distribution<int> dist(0, totalFreq - 1);
+    int roll = dist(mRng);
+
+    int cumulative = 0;
+    for (int i = 0; i < sampleCount; ++i) {
+        cumulative += frequencies[i];
+        if (roll < cumulative)
+            return i;
+    }
+    return sampleCount - 1;  // fallback (shouldn't happen)
+}
+
+//------------------------------------------------------
+bool AudioService::evictLowestPriority(int newPriority)
+{
+    // Find the voice with the lowest priority
+    SoundHandle lowestHandle = SOUND_HANDLE_INVALID;
+    int lowestPriority = newPriority;  // Only evict if we find something LOWER
+
+    for (const auto &[handle, voice] : mVoices) {
+        if (voice->priority < lowestPriority) {
+            lowestPriority = voice->priority;
+            lowestHandle = handle;
+        }
+    }
+
+    if (lowestHandle == SOUND_HANDLE_INVALID)
+        return false;  // All existing voices have equal or higher priority
+
+    LOG_DEBUG("AudioService: evicting voice %d (priority %d) for new voice (priority %d)",
+              lowestHandle, lowestPriority, newPriority);
+    haltSound(lowestHandle);
+    return true;
+}
+
+//------------------------------------------------------
+SoundHandle AudioService::startVoice(const std::string &schemaName,
+                                      const std::string &sampleName,
+                                      const Vector3 &position,
+                                      int priority, bool looping, int objID)
+{
+    if (!mMaEngine || !mSoundLoader)
+        return SOUND_HANDLE_INVALID;
+
+    // Enforce voice limit — evict lowest priority if full
+    if (static_cast<int>(mVoices.size()) >= MAX_ACTIVE_VOICES) {
+        if (!evictLowestPriority(priority)) {
+            LOG_DEBUG("AudioService: voice pool full, cannot play '%s' (priority %d)",
+                      schemaName.c_str(), priority);
+            return SOUND_HANDLE_INVALID;
+        }
+    }
+
+    // Load WAV data (check cache first, then CRF)
+    SoundData snd;
+    if (mSoundCache) {
+        const SoundData *cached = mSoundCache->get(sampleName);
+        if (cached) {
+            snd = *cached;
+        }
+    }
+    if (!snd.valid()) {
+        snd = mSoundLoader->loadSound(sampleName);
+        if (!snd.valid()) {
+            LOG_ERROR("AudioService: failed to load sample '%s' for schema '%s'",
+                      sampleName.c_str(), schemaName.c_str());
+            return SOUND_HANDLE_INVALID;
+        }
+        if (mSoundCache) {
+            mSoundCache->put(sampleName, snd);
+        }
+    }
+
+    auto voice = std::make_unique<ActiveVoice>();
+    voice->data = std::move(snd);
+    voice->handle = mNextHandle++;
+    voice->schemaName = schemaName;
+    voice->priority = priority;
+    voice->objID = objID;
+    voice->worldPos = position;
+
+    // Decode WAV from memory → PCM
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 0, 0);
+    if (ma_decoder_init_memory(voice->data.wavData.data(),
+                               voice->data.wavData.size(),
+                               &cfg, &voice->decoder) != MA_SUCCESS) {
+        LOG_ERROR("AudioService: failed to decode sample '%s'", sampleName.c_str());
+        return SOUND_HANDLE_INVALID;
+    }
+
+    // Create sound without default attachment (routed through DSP node)
+    if (ma_sound_init_from_data_source(
+            mMaEngine, &voice->decoder,
+            MA_SOUND_FLAG_NO_SPATIALIZATION |
+            MA_SOUND_FLAG_NO_DEFAULT_ATTACHMENT, nullptr,
+            &voice->sound) != MA_SUCCESS) {
+        ma_decoder_uninit(&voice->decoder);
+        LOG_ERROR("AudioService: failed to init sound for '%s'", sampleName.c_str());
+        return SOUND_HANDLE_INVALID;
+    }
+
+    voice->initialized = true;
+
+    // Set looping if schema says so
+    if (looping) {
+        ma_sound_set_looping(&voice->sound, MA_TRUE);
+    }
+
+    // Set up Steam Audio DSP pipeline (direct + binaural effects)
+    initVoiceDSP(*voice);
+
+    // If DSP setup failed or not available, connect directly to endpoint
+    if (!voice->dspNode.effectsReady) {
+        ma_node_attach_output_bus(&voice->sound, 0,
+                                  ma_engine_get_endpoint(mMaEngine), 0);
+    }
+
+    // Create Steam Audio source for spatial simulation
+    createVoiceSource(*voice);
+
+    ma_result startResult = ma_sound_start(&voice->sound);
+    if (startResult != MA_SUCCESS) {
+        LOG_ERROR("AudioService: failed to start sound '%s' (error %d)",
+                  sampleName.c_str(), startResult);
+        return SOUND_HANDLE_INVALID;
+    }
+
+    // Register end callback AFTER successful start (avoids dangling pointer if start fails)
+    ma_sound_set_end_callback(&voice->sound, onSoundEnd, voice.get());
+
+    SoundHandle h = voice->handle;
+    LOG_DEBUG("AudioService: playing '%s' sample '%s' at (%.1f, %.1f, %.1f) priority=%d",
+              schemaName.c_str(), sampleName.c_str(),
+              position.x, position.y, position.z, priority);
+    mVoices[h] = std::move(voice);
+    return h;
+}
+
+// ── Public API ──
 
 //------------------------------------------------------
 SoundHandle AudioService::playSchema(const std::string &schemaName,
                                      const Vector3 &position)
 {
-    if (!mAudioReady)
+    if (!mAudioReady || !mSchemaParser)
         return SOUND_HANDLE_INVALID;
 
-    // TODO (Task 36): Resolve schema, pick sample, start playback
-    LOG_DEBUG("AudioService::playSchema('%s') — not yet implemented",
-              schemaName.c_str());
-    return SOUND_HANDLE_INVALID;
+    const SchemaEntry *schema = mSchemaParser->findSchema(schemaName);
+    if (!schema) {
+        LOG_DEBUG("AudioService::playSchema: schema '%s' not found", schemaName.c_str());
+        return SOUND_HANDLE_INVALID;
+    }
+
+    if (schema->samples.empty()) {
+        LOG_DEBUG("AudioService::playSchema: schema '%s' has no samples", schemaName.c_str());
+        return SOUND_HANDLE_INVALID;
+    }
+
+    // Select a sample using frequency-weighted random selection
+    std::vector<int> freqs;
+    freqs.reserve(schema->samples.size());
+    for (const auto &s : schema->samples)
+        freqs.push_back(s.frequency);
+
+    int totalFreq = schema->totalFrequency();
+    if (totalFreq <= 0)
+        return SOUND_HANDLE_INVALID;
+
+    int idx = selectSample(schemaName, static_cast<int>(schema->samples.size()),
+                           totalFreq, freqs.data());
+    if (idx < 0 || idx >= static_cast<int>(schema->samples.size()))
+        return SOUND_HANDLE_INVALID;
+
+    // NO_REPEAT: avoid repeating the last sample
+    if ((schema->playParams.flags & SCH_NO_REPEAT) && schema->samples.size() > 1) {
+        auto it = mLastSampleIdx.find(schemaName);
+        if (it != mLastSampleIdx.end() && it->second == idx) {
+            // Re-roll once to avoid repeat
+            idx = selectSample(schemaName, static_cast<int>(schema->samples.size()),
+                               totalFreq, freqs.data());
+            if (idx < 0 || idx >= static_cast<int>(schema->samples.size()))
+                return SOUND_HANDLE_INVALID;
+        }
+    }
+    mLastSampleIdx[schemaName] = idx;
+
+    const SchemaSample &sample = schema->samples[idx];
+    bool looping = schema->loopParams.isLooping;
+
+    SoundHandle h = startVoice(schemaName, sample.name, position,
+                               schema->playParams.priority, looping, 0);
+
+    // Apply schema volume to the voice
+    if (h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
+        float vol = schemaVolumeToLinear(schema->playParams.volume);
+        ma_sound_set_volume(&mVoices[h]->sound, vol);
+    }
+
+    return h;
 }
 
 //------------------------------------------------------
 SoundHandle AudioService::playSchemaOnObj(const std::string &schemaName,
                                           int objID)
 {
-    if (!mAudioReady)
+    if (!mAudioReady || !mObjectService)
         return SOUND_HANDLE_INVALID;
 
-    // TODO (Task 36): Resolve schema, attach to object, start playback
-    LOG_DEBUG("AudioService::playSchemaOnObj('%s', %d) — not yet implemented",
-              schemaName.c_str(), objID);
-    return SOUND_HANDLE_INVALID;
+    // Look up object position via ObjectService
+    Vector3 pos = mObjectService->position(objID);
+
+    // Play the schema at the object's position, attached to the object
+    if (!mSchemaParser)
+        return SOUND_HANDLE_INVALID;
+
+    const SchemaEntry *schema = mSchemaParser->findSchema(schemaName);
+    if (!schema || schema->samples.empty())
+        return SOUND_HANDLE_INVALID;
+
+    std::vector<int> freqs;
+    freqs.reserve(schema->samples.size());
+    for (const auto &s : schema->samples)
+        freqs.push_back(s.frequency);
+
+    int totalFreq = schema->totalFrequency();
+    if (totalFreq <= 0)
+        return SOUND_HANDLE_INVALID;
+
+    int idx = selectSample(schemaName, static_cast<int>(schema->samples.size()),
+                           totalFreq, freqs.data());
+    if (idx < 0 || idx >= static_cast<int>(schema->samples.size()))
+        return SOUND_HANDLE_INVALID;
+
+    if ((schema->playParams.flags & SCH_NO_REPEAT) && schema->samples.size() > 1) {
+        auto it = mLastSampleIdx.find(schemaName);
+        if (it != mLastSampleIdx.end() && it->second == idx) {
+            idx = selectSample(schemaName, static_cast<int>(schema->samples.size()),
+                               totalFreq, freqs.data());
+            if (idx < 0 || idx >= static_cast<int>(schema->samples.size()))
+                return SOUND_HANDLE_INVALID;
+        }
+    }
+    mLastSampleIdx[schemaName] = idx;
+
+    const SchemaSample &sample = schema->samples[idx];
+    bool looping = schema->loopParams.isLooping;
+
+    SoundHandle h = startVoice(schemaName, sample.name, pos,
+                               schema->playParams.priority, looping, objID);
+
+    if (h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
+        float vol = schemaVolumeToLinear(schema->playParams.volume);
+        ma_sound_set_volume(&mVoices[h]->sound, vol);
+    }
+
+    return h;
 }
 
 //------------------------------------------------------
