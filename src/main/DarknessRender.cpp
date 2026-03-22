@@ -77,6 +77,7 @@
 #include "sim/SimService.h"
 #include "physics/PhysicsService.h"
 #include "audio/AudioService.h"
+#include "audio/AcousticMaterials.h"
 #include "motion/MotionService.h"
 #include "RawDataStorage.h"
 #include "PLDefParser.h"
@@ -1682,6 +1683,33 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // ── Build per-texture material keyword table for footstep sounds ──
+    // Maps each TXLIST texture index → material keyword ("stone", "metal", etc.)
+    // using substring matching on texture family/name paths.
+    {
+        Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+        size_t numTex = mission.txList.textures.size();
+        std::vector<std::string> materials(numTex);
+        for (size_t i = 0; i < numTex; ++i) {
+            const auto &entry = mission.txList.textures[i];
+            if (!entry.fullPath.empty()) {
+                materials[i] = Darkness::lookupAcousticMaterialKeyword(entry.fullPath);
+            } else {
+                materials[i] = "generic";
+            }
+        }
+        audioSvc->setTextureMaterials(std::move(materials));
+
+        // Register footstep callback with physics — plays material-appropriate
+        // footstep sounds when the player's stride triggers a footfall event.
+        if (state.physics) {
+            state.physics->setFootstepCallback(
+                [audioSvc](const Darkness::Vector3 &pos, float speed, int matIdx) {
+                    audioSvc->playFootstep(pos, speed, matIdx);
+                });
+        }
+    }
+
     // ── Load object assets: properties, .bin models, textures from obj.crf ──
     loadObjectAssets(misPath, resPath, cfg, mission, state);
 
@@ -1766,6 +1794,13 @@ int main(int argc, char *argv[]) {
             audioSvc->setListenerTransform(
                 Darkness::Vector3(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]),
                 state.cam.yaw, state.cam.pitch);
+
+            // Update player water state for footstep material override
+            if (state.physics) {
+                audioSvc->setPlayerInWater(
+                    state.physics->getPlayerPhysics().isInWater());
+            }
+
             audioSvc->updateAudio(dt);
         }
 
