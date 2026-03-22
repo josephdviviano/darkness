@@ -21,6 +21,7 @@
  *****************************************************************************/
 
 #include "AudioService.h"
+#include "AcousticMaterials.h"
 #include "CRFSoundLoader.h"
 #include "ServiceCommon.h"
 #include <algorithm>
@@ -31,6 +32,8 @@
 #include "room/RoomService.h"
 #include "property/PropertyService.h"
 #include "logger.h"
+
+#include <unordered_set>
 
 // miniaudio — single-header C library, implementation compiled here
 #define MINIAUDIO_IMPLEMENTATION
@@ -45,18 +48,13 @@ namespace Darkness {
 /*---------- Acoustic Material Preset Table ----------*/
 /*----------------------------------------------------*/
 
-/// Steam Audio material properties for common surface types.
-/// Values are per-frequency-band: {400 Hz, 2.5 kHz, 15 kHz}.
-/// Based on published acoustic absorption/transmission coefficients
+/// Steam Audio material properties indexed by keyword.
+/// Uses the keyword table from AcousticMaterials.h for substring matching,
+/// then maps matched keywords to IPLMaterial values here.
+/// Values from published acoustic absorption/transmission coefficients
 /// (see NOTES.AUDIO_ENGINE.md for sources and reasoning).
-struct AcousticMaterialEntry {
-    const char *keyword;   // substring to match in texture names
-    IPLMaterial material;
-};
-
-// Sorted by keyword length descending to prevent false matches
-// (e.g. "car" matching before "carpet"). See NOTES.AUDIO_ENGINE.md.
-static const AcousticMaterialEntry kAcousticMaterials[] = {
+static const std::unordered_map<std::string, IPLMaterial> kKeywordToIPLMaterial = {
+    //                             absorption{lo, mid, hi}     scat   transmission{lo, mid, hi}
     {"concrete", {{ 0.05f, 0.07f, 0.08f }, 0.05f, { 0.015f, 0.015f, 0.015f }}},
     {"ceramic",  {{ 0.01f, 0.02f, 0.02f }, 0.05f, { 0.060f, 0.044f, 0.011f }}},
     {"plaster",  {{ 0.12f, 0.06f, 0.04f }, 0.05f, { 0.056f, 0.056f, 0.004f }}},
@@ -71,28 +69,47 @@ static const AcousticMaterialEntry kAcousticMaterials[] = {
     {"tile",     {{ 0.01f, 0.02f, 0.02f }, 0.05f, { 0.060f, 0.044f, 0.011f }}},
     {"dirt",     {{ 0.60f, 0.70f, 0.80f }, 0.60f, { 0.031f, 0.012f, 0.008f }}},
     {"ice",      {{ 0.01f, 0.02f, 0.02f }, 0.05f, { 0.060f, 0.044f, 0.011f }}},
+    // Aliases — keywords from AcousticMaterials.h that map to the same materials
+    {"floor",    {{ 0.13f, 0.20f, 0.24f }, 0.20f, { 0.015f, 0.002f, 0.001f }}}, // → stone
+    {"earth",    {{ 0.60f, 0.70f, 0.80f }, 0.60f, { 0.031f, 0.012f, 0.008f }}}, // → dirt
+    {"metl",     {{ 0.20f, 0.07f, 0.06f }, 0.05f, { 0.250f, 0.190f, 0.080f }}}, // → metal (Thief 2 abbreviation)
+    {"rust",     {{ 0.20f, 0.07f, 0.06f }, 0.05f, { 0.250f, 0.190f, 0.080f }}}, // → metal
+    {"iron",     {{ 0.20f, 0.07f, 0.06f }, 0.05f, { 0.250f, 0.190f, 0.080f }}}, // → metal
+    {"door",     {{ 0.11f, 0.07f, 0.06f }, 0.05f, { 0.070f, 0.014f, 0.005f }}}, // → wood
+    {"gate",     {{ 0.20f, 0.07f, 0.06f }, 0.05f, { 0.250f, 0.190f, 0.080f }}}, // → metal
+    {"roof",     {{ 0.01f, 0.02f, 0.02f }, 0.05f, { 0.060f, 0.044f, 0.011f }}}, // → tile
+    {"vine",     {{ 0.11f, 0.07f, 0.06f }, 0.05f, { 0.070f, 0.014f, 0.005f }}}, // → wood
+    {"leaf",     {{ 0.11f, 0.07f, 0.06f }, 0.05f, { 0.070f, 0.014f, 0.005f }}}, // → wood
+    {"bark",     {{ 0.11f, 0.07f, 0.06f }, 0.05f, { 0.070f, 0.014f, 0.005f }}}, // → wood
+    {"rug",      {{ 0.24f, 0.69f, 0.73f }, 0.05f, { 0.020f, 0.005f, 0.003f }}}, // → carpet
+    {"hay",      {{ 0.24f, 0.69f, 0.73f }, 0.05f, { 0.020f, 0.005f, 0.003f }}}, // → carpet
+    {"mud",      {{ 0.60f, 0.70f, 0.80f }, 0.60f, { 0.031f, 0.012f, 0.008f }}}, // → dirt
 };
-static const size_t kAcousticMaterialCount =
-    sizeof(kAcousticMaterials) / sizeof(kAcousticMaterials[0]);
 
 // Default material for unmatched textures
 static const IPLMaterial kGenericMaterial =
     {{ 0.10f, 0.20f, 0.30f }, 0.05f, { 0.100f, 0.050f, 0.030f }};
 
-/// Look up an acoustic material by texture name via substring matching.
-/// Longer keywords are checked first to avoid false partial matches.
+/// Look up an IPLMaterial by texture name via keyword substring matching.
+/// Uses the shared keyword table from AcousticMaterials.h for matching,
+/// then maps the keyword to IPLMaterial properties.
+/// Logs unmatched textures once per name for development diagnostics.
 static IPLMaterial lookupAcousticMaterial(const std::string &texName)
 {
-    // Convert to lowercase for matching
-    std::string lower = texName;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::string keyword = lookupAcousticMaterialKeyword(texName);
 
-    for (size_t i = 0; i < kAcousticMaterialCount; ++i) {
-        if (lower.find(kAcousticMaterials[i].keyword) != std::string::npos) {
-            return kAcousticMaterials[i].material;
+    if (keyword == "generic") {
+        // Log each unmatched texture name once to help identify keyword gaps
+        static std::unordered_set<std::string> sLoggedUnmatched;
+        if (sLoggedUnmatched.insert(texName).second) {
+            LOG_INFO("AudioService: no acoustic keyword match for texture '%s' "
+                     "— using generic material", texName.c_str());
         }
+        return kGenericMaterial;
     }
-    return kGenericMaterial;
+
+    auto it = kKeywordToIPLMaterial.find(keyword);
+    return (it != kKeywordToIPLMaterial.end()) ? it->second : kGenericMaterial;
 }
 
 /*----------------------------------------------------*/
@@ -296,112 +313,125 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         return false;
     }
 
-    // Step 1: Create IPLScene (Steam Audio's built-in CPU raytracer)
-    IPLSceneSettings sceneSettings{};
-    sceneSettings.type = IPL_SCENETYPE_DEFAULT;
+    // Wrap scene construction in try-catch so that any C++ exception
+    // (e.g. from std::vector allocation) cleans up partially-created
+    // Steam Audio objects instead of leaking them.
+    try {
+        // Step 1: Create IPLScene (Steam Audio's built-in CPU raytracer)
+        IPLSceneSettings sceneSettings{};
+        sceneSettings.type = IPL_SCENETYPE_DEFAULT;
 
-    IPLerror err = iplSceneCreate(mIplContext, &sceneSettings, &mIplScene);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: iplSceneCreate failed (error %d)", err);
-        return false;
-    }
-
-    // Step 2: Build material palette from unique texture names
-    // Map each unique texture name to a material index
-    std::unordered_map<std::string, int32_t> texToMaterialIdx;
-    std::vector<IPLMaterial> materials;
-
-    for (const auto &texName : data.texNames) {
-        if (texToMaterialIdx.find(texName) == texToMaterialIdx.end()) {
-            texToMaterialIdx[texName] = static_cast<int32_t>(materials.size());
-            materials.push_back(lookupAcousticMaterial(texName));
+        IPLerror err = iplSceneCreate(mIplContext, &sceneSettings, &mIplScene);
+        if (err != IPL_STATUS_SUCCESS) {
+            LOG_ERROR("AudioService: iplSceneCreate failed (error %d)", err);
+            return false;
         }
-    }
 
-    // Ensure at least one material (generic fallback)
-    if (materials.empty()) {
-        materials.push_back(kGenericMaterial);
-    }
+        // Step 2: Build material palette from unique texture names
+        // Map each unique texture name to a material index
+        std::unordered_map<std::string, int32_t> texToMaterialIdx;
+        std::vector<IPLMaterial> materials;
 
-    // Build per-triangle material index array
-    std::vector<IPLint32> materialIndices;
-    materialIndices.reserve(numTriangles);
-    for (const auto &texName : data.texNames) {
-        auto it = texToMaterialIdx.find(texName);
-        materialIndices.push_back(it != texToMaterialIdx.end() ? it->second : 0);
-    }
+        for (const auto &texName : data.texNames) {
+            if (texToMaterialIdx.find(texName) == texToMaterialIdx.end()) {
+                texToMaterialIdx[texName] = static_cast<int32_t>(materials.size());
+                materials.push_back(lookupAcousticMaterial(texName));
+            }
+        }
 
-    // Step 3: Convert vertex data to IPLVector3 array
-    // (IPLVector3 is {float x, y, z} — same layout as our flat array)
-    std::vector<IPLVector3> iplVertices(numVertices);
-    for (size_t i = 0; i < numVertices; ++i) {
-        iplVertices[i] = {data.vertices[i * 3],
-                          data.vertices[i * 3 + 1],
-                          data.vertices[i * 3 + 2]};
-    }
+        // Ensure at least one material (generic fallback)
+        if (materials.empty()) {
+            materials.push_back(kGenericMaterial);
+        }
 
-    // Convert index data to IPLTriangle array
-    std::vector<IPLTriangle> iplTriangles(numTriangles);
-    for (size_t i = 0; i < numTriangles; ++i) {
-        iplTriangles[i].indices[0] = data.indices[i * 3];
-        iplTriangles[i].indices[1] = data.indices[i * 3 + 1];
-        iplTriangles[i].indices[2] = data.indices[i * 3 + 2];
-    }
+        // Build per-triangle material index array
+        std::vector<IPLint32> materialIndices;
+        materialIndices.reserve(numTriangles);
+        for (const auto &texName : data.texNames) {
+            auto it = texToMaterialIdx.find(texName);
+            materialIndices.push_back(it != texToMaterialIdx.end() ? it->second : 0);
+        }
 
-    // Step 4: Create static mesh with geometry and material assignments
-    IPLStaticMeshSettings meshSettings{};
-    meshSettings.numVertices = static_cast<IPLint32>(numVertices);
-    meshSettings.numTriangles = static_cast<IPLint32>(numTriangles);
-    meshSettings.numMaterials = static_cast<IPLint32>(materials.size());
-    meshSettings.vertices = iplVertices.data();
-    meshSettings.triangles = iplTriangles.data();
-    meshSettings.materialIndices = materialIndices.data();
-    meshSettings.materials = materials.data();
+        // Step 3: Convert vertex data to IPLVector3 array
+        // (IPLVector3 is {float x, y, z} — same layout as our flat array)
+        std::vector<IPLVector3> iplVertices(numVertices);
+        for (size_t i = 0; i < numVertices; ++i) {
+            iplVertices[i] = {data.vertices[i * 3],
+                              data.vertices[i * 3 + 1],
+                              data.vertices[i * 3 + 2]};
+        }
 
-    err = iplStaticMeshCreate(mIplScene, &meshSettings, &mIplStaticMesh);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: iplStaticMeshCreate failed (error %d)", err);
-        iplSceneRelease(&mIplScene);
-        mIplScene = nullptr;
+        // Convert index data to IPLTriangle array
+        std::vector<IPLTriangle> iplTriangles(numTriangles);
+        for (size_t i = 0; i < numTriangles; ++i) {
+            iplTriangles[i].indices[0] = data.indices[i * 3];
+            iplTriangles[i].indices[1] = data.indices[i * 3 + 1];
+            iplTriangles[i].indices[2] = data.indices[i * 3 + 2];
+        }
+
+        // Step 4: Create static mesh with geometry and material assignments
+        IPLStaticMeshSettings meshSettings{};
+        meshSettings.numVertices = static_cast<IPLint32>(numVertices);
+        meshSettings.numTriangles = static_cast<IPLint32>(numTriangles);
+        meshSettings.numMaterials = static_cast<IPLint32>(materials.size());
+        meshSettings.vertices = iplVertices.data();
+        meshSettings.triangles = iplTriangles.data();
+        meshSettings.materialIndices = materialIndices.data();
+        meshSettings.materials = materials.data();
+
+        err = iplStaticMeshCreate(mIplScene, &meshSettings, &mIplStaticMesh);
+        if (err != IPL_STATUS_SUCCESS) {
+            LOG_ERROR("AudioService: iplStaticMeshCreate failed (error %d)", err);
+            destroyAcousticScene();
+            return false;
+        }
+
+        // Step 5: Add the mesh to the scene and commit (builds BVH acceleration)
+        iplStaticMeshAdd(mIplStaticMesh, mIplScene);
+        iplSceneCommit(mIplScene);
+
+        // Step 6: Create the simulator for direct occlusion + reflections + reverb
+        IPLSimulationSettings simSettings{};
+        simSettings.flags = static_cast<IPLSimulationFlags>(
+            IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+        simSettings.sceneType = IPL_SCENETYPE_DEFAULT;
+        simSettings.reflectionType = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+        simSettings.maxNumOcclusionSamples = 32;
+        simSettings.maxNumRays = 4096;       // rays per simulation step
+        simSettings.numDiffuseSamples = 32;
+        simSettings.maxDuration = 2.0f;      // max reverb tail (seconds)
+        simSettings.maxOrder = 1;            // ambisonics order
+        simSettings.maxNumSources = 32;      // voice pool size
+        simSettings.numThreads = 2;          // parallel ray tracing
+        simSettings.samplingRate = 44100;
+        simSettings.frameSize = 1024;
+
+        err = iplSimulatorCreate(mIplContext, &simSettings, &mIplSimulator);
+        if (err != IPL_STATUS_SUCCESS) {
+            LOG_ERROR("AudioService: iplSimulatorCreate failed (error %d)", err);
+            destroyAcousticScene();
+            return false;
+        }
+
+        // Bind the scene to the simulator
+        iplSimulatorSetScene(mIplSimulator, mIplScene);
+        iplSimulatorCommit(mIplSimulator);
+
+        mSceneReady = true;
+
+        LOG_INFO("AudioService: acoustic scene built — %zu vertices, %zu triangles, "
+                 "%zu materials", numVertices, numTriangles, materials.size());
+        return true;
+
+    } catch (const std::exception &e) {
+        LOG_ERROR("AudioService: exception building acoustic scene: %s", e.what());
+        destroyAcousticScene();
         return false;
-    }
-
-    // Step 5: Add the mesh to the scene and commit (builds BVH acceleration)
-    iplStaticMeshAdd(mIplStaticMesh, mIplScene);
-    iplSceneCommit(mIplScene);
-
-    // Step 6: Create the simulator for direct occlusion + reflections + reverb
-    IPLSimulationSettings simSettings{};
-    simSettings.flags = static_cast<IPLSimulationFlags>(
-        IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
-    simSettings.sceneType = IPL_SCENETYPE_DEFAULT;
-    simSettings.reflectionType = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-    simSettings.maxNumOcclusionSamples = 32;
-    simSettings.maxNumRays = 4096;       // rays per simulation step
-    simSettings.numDiffuseSamples = 32;
-    simSettings.maxDuration = 2.0f;      // max reverb tail (seconds)
-    simSettings.maxOrder = 1;            // ambisonics order
-    simSettings.maxNumSources = 32;      // voice pool size
-    simSettings.numThreads = 2;          // parallel ray tracing
-    simSettings.samplingRate = 44100;
-    simSettings.frameSize = 1024;
-
-    err = iplSimulatorCreate(mIplContext, &simSettings, &mIplSimulator);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: iplSimulatorCreate failed (error %d)", err);
+    } catch (...) {
+        LOG_ERROR("AudioService: unknown exception building acoustic scene");
         destroyAcousticScene();
         return false;
     }
-
-    // Bind the scene to the simulator
-    iplSimulatorSetScene(mIplSimulator, mIplScene);
-    iplSimulatorCommit(mIplSimulator);
-
-    mSceneReady = true;
-
-    LOG_INFO("AudioService: acoustic scene built — %zu vertices, %zu triangles, "
-             "%zu materials", numVertices, numTriangles, materials.size());
-    return true;
 }
 
 //------------------------------------------------------
@@ -467,6 +497,9 @@ void AudioService::shutdown()
     // Release sound resources
     mSoundCache.reset();
     mSoundLoader.reset();
+
+    // Release acoustic scene before the Steam Audio context it depends on
+    destroyAcousticScene();
 
     // Shut down audio backends
     shutdownSteamAudio();
@@ -593,8 +626,13 @@ void AudioService::loopStep(float deltaTime)
     // Remove voices that have finished playback
     cleanupFinishedVoices();
 
-    // TODO (Task 36): Update active voices — update Steam Audio source
-    //   positions for moving objects, run simulation step
+    // Guard against use-after-free if the acoustic scene is destroyed
+    // between frames (e.g. mission unload). Future Task 36 simulator
+    // calls (iplSimulatorRunDirect, etc.) must only run when scene is live.
+    if (mSceneReady) {
+        // TODO (Task 36): Update active voices — update Steam Audio source
+        //   positions for moving objects, run simulation step
+    }
 }
 
 //------------------------------------------------------
