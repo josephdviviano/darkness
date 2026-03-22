@@ -1509,7 +1509,7 @@ int main(int argc, char *argv[]) {
     // ── Load sound resources from snd.crf ──
     if (!resPath.empty()) {
         Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
-        if (!audioSvc->loadSoundResources(resPath)) {
+        if (!audioSvc->loadSoundResources(resPath, cli.schemasPath)) {
             std::fprintf(stderr, "WARNING: failed to load snd.crf from %s\n"
                                  "         Sound playback will not be available.\n",
                          resPath.c_str());

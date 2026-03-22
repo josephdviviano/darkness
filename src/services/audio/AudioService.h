@@ -189,9 +189,13 @@ public:
     /** Load sound resources from a Thief 2 RES directory.
      *  Opens snd.crf and prepares the sound cache.
      *  Called from DarknessRender.cpp after services are bootstrapped.
-     *  @param resPath  Path to Thief 2 RES directory (containing snd.crf)
+     *  @param resPath     Path to Thief 2 RES directory (containing snd.crf)
+     *  @param schemasPath Optional explicit path to schema files directory.
+     *                     If empty, searches EDITOR/SCHEMA and EDITOR/schemas
+     *                     relative to the RES directory's parent.
      *  @return true if snd.crf opened successfully */
-    bool loadSoundResources(const std::string &resPath);
+    bool loadSoundResources(const std::string &resPath,
+                            const std::string &schemasPath = "");
 
     /** Build Steam Audio acoustic scene from world geometry.
      *  Called from the render binary after WR chunks are parsed.

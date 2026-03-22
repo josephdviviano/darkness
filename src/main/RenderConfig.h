@@ -43,6 +43,7 @@ struct RenderConfig {
 struct CliResult {
     const char* misPath    = nullptr;  // positional arg: mission file
     std::string resPath;               // --res <path>
+    std::string schemasPath;           // --schemas <path>
     std::string configPath;            // --config <path>
     bool        helpRequested = false; // --help / -h
 };
@@ -146,6 +147,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cli.helpRequested = true;
         } else if (std::strcmp(argv[i], "--res") == 0 && i + 1 < argc) {
             cli.resPath = argv[++i];
+        } else if (std::strcmp(argv[i], "--schemas") == 0 && i + 1 < argc) {
+            cli.schemasPath = argv[++i];
         } else if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             cli.configPath = argv[++i];
         } else if (std::strcmp(argv[i], "--lightmap-filtering") == 0 && i + 1 < argc) {
