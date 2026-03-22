@@ -73,14 +73,51 @@ struct AcousticSceneData {
     std::vector<std::string> texNames;
 };
 
-/// Active voice — owns WAV data, miniaudio decoder + sound (defined in AudioService.cpp)
-struct ActiveVoice;
-
 /// Handle to an active sound (returned by play functions, used to halt/query)
 using SoundHandle = int32_t;
 
 /// Invalid sound handle sentinel
 constexpr SoundHandle SOUND_HANDLE_INVALID = -1;
+
+/// Active voice — owns WAV data, miniaudio decoder + sound (defined in AudioService.cpp)
+struct ActiveVoice;
+
+/// On-disk layout of P$AmbientHack property (60 bytes).
+/// Ambient sound objects in the mission use this to define looping environmental sounds.
+#pragma pack(push, 1)
+struct PropAmbientHack {
+    int32_t radius;           ///< Propagation radius in world units
+    int32_t volume;           ///< Volume (millibels, same as schema volume)
+    uint32_t flags;           ///< AmbientHackFlags bitfield
+    char schema[16];          ///< Schema name (null-terminated)
+    char aux1[16];            ///< Auxiliary data (unused)
+    char aux2[16];            ///< Auxiliary data (unused)
+};
+#pragma pack(pop)
+
+/// AmbientHackedFlags bitfield values
+enum AmbientHackFlags : uint32_t {
+    AMB_ENVIRONMENTAL = 0x01, ///< Room-based environmental ambient
+    AMB_NO_SHARP_CURVE = 0x02,///< Smooth volume falloff
+    AMB_TURNED_OFF = 0x04,    ///< Initially disabled
+    AMB_ONCE_ONLY = 0x08,     ///< Play once then stop
+    AMB_MUSIC = 0x10,         ///< Music track (separate volume control)
+    AMB_SYNCH = 0x20,         ///< Synchronize with other ambients
+    AMB_NO_FADE = 0x40,       ///< No fade in/out
+    AMB_DESTROY_OBJ = 0x80,   ///< Destroy object after playing
+    AMB_AUTO_OFF = 0x100,     ///< Auto-disable when out of range
+};
+
+/// Tracked ambient sound instance (attached to a mission object)
+struct AmbientSound {
+    int objID = 0;                    ///< Mission object ID
+    std::string schemaName;           ///< Schema to play
+    Vector3 position{0, 0, 0};       ///< World-space position
+    float radius = 0.0f;             ///< Propagation radius
+    int32_t volume = -1;              ///< Volume in millibels
+    uint32_t flags = 0;               ///< AmbientHackFlags
+    SoundHandle handle = SOUND_HANDLE_INVALID; ///< Active voice handle (if playing)
+};
 
 /// Maximum simultaneous active voices (matches Dark Engine's limit)
 constexpr int MAX_ACTIVE_VOICES = 32;
@@ -278,6 +315,17 @@ private:
 
     /// Per-schema last sample index for NO_REPEAT behavior
     std::unordered_map<std::string, int> mLastSampleIdx;
+
+    // ── Ambient sound management ──
+
+    /// Active ambient sounds parsed from P$AmbientHack properties
+    std::vector<AmbientSound> mAmbients;
+
+    /// Load ambient sound objects from mission data
+    void loadAmbientSounds();
+
+    /// Update ambient volumes based on listener distance (per-frame)
+    void updateAmbientVolumes();
 
     // ── Texture material mapping (for footstep schema selection) ──
 
