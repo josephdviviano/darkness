@@ -145,6 +145,19 @@ public:
      *  @return true if scene built successfully */
     bool buildAcousticScene(const AcousticSceneData &data);
 
+    /** Update the listener (player camera) position and orientation.
+     *  Called each frame from the render binary after camera/physics update.
+     *  @param pos    World-space listener position
+     *  @param yaw    Heading rotation (radians, counterclockwise from +X in Z-up)
+     *  @param pitch  Tilt rotation (radians, positive = looking up) */
+    void setListenerTransform(const Vector3 &pos, float yaw, float pitch);
+
+    /** Per-frame audio update — voice cleanup, Steam Audio simulation step.
+     *  Called from the render binary's main loop (LoopService is not used
+     *  in the render binary; this provides a direct entry point).
+     *  @param deltaTime  Frame delta in seconds */
+    void updateAudio(float deltaTime);
+
 protected:
     // ── Service lifecycle ──
 
@@ -221,12 +234,20 @@ private:
     /// Whether an acoustic scene is currently active (built and committed)
     bool mSceneReady = false;
 
+    // ── Listener state (updated each frame from render binary) ──
+
+    Vector3 mListenerPos{0.0f, 0.0f, 0.0f};
+    float mListenerYaw = 0.0f;
+    float mListenerPitch = 0.0f;
+
     // Private helpers
     bool initMiniaudio();
     void shutdownMiniaudio();
     bool initSteamAudio();
     void shutdownSteamAudio();
     void destroyAcousticScene();
+    void createVoiceSource(ActiveVoice &voice);
+    void removeVoiceSource(ActiveVoice &voice);
 };
 
 /// Factory for AudioService

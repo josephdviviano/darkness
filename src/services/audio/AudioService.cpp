@@ -131,12 +131,24 @@ struct ActiveVoice {
     bool initialized = false;
     std::atomic<bool> finished{false};  // Set by end callback on audio thread
 
+    // Steam Audio simulation source (nullptr if scene not ready or non-spatial)
+    IPLSource iplSource = nullptr;
+
+    // World-space position for spatial audio (updated for moving objects)
+    Vector3 worldPos{0.0f, 0.0f, 0.0f};
+
     ActiveVoice() {
         std::memset(&decoder, 0, sizeof(decoder));
         std::memset(&sound, 0, sizeof(sound));
     }
 
     ~ActiveVoice() {
+        // NOTE: IPLSource must be removed from the simulator BEFORE destruction.
+        // This is handled by removeVoiceSource() called from cleanup/halt paths,
+        // not in this destructor (we don't have the simulator reference here).
+        if (iplSource) {
+            iplSourceRelease(&iplSource);
+        }
         if (initialized) {
             ma_sound_uninit(&sound);
             ma_decoder_uninit(&decoder);
@@ -567,6 +579,9 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
 
             voice->initialized = true;
 
+            // Create Steam Audio source for spatial simulation
+            createVoiceSource(*voice);
+
             // Register end callback so the audio thread signals completion
             // via the atomic flag (avoids cross-thread ma_sound_at_end polling)
             ma_sound_set_end_callback(&voice->sound, onSoundEnd, voice.get());
@@ -618,6 +633,33 @@ void AudioService::onDBDrop(uint32_t dropmask)
 }
 
 //------------------------------------------------------
+void AudioService::updateAudio(float deltaTime)
+{
+    loopStep(deltaTime);
+}
+
+//------------------------------------------------------
+void AudioService::setListenerTransform(const Vector3 &pos, float yaw, float pitch)
+{
+    mListenerPos = pos;
+    mListenerYaw = yaw;
+    mListenerPitch = pitch;
+
+    // Also update miniaudio's 3D listener position
+    if (mMaEngine) {
+        ma_engine_listener_set_position(mMaEngine, 0, pos.x, pos.y, pos.z);
+
+        // Compute forward and up vectors for miniaudio listener
+        // Dark Engine Z-up: forward = (cosY*cosP, sinY*cosP, sinP)
+        float cosY = std::cos(yaw), sinY = std::sin(yaw);
+        float cosP = std::cos(pitch), sinP = std::sin(pitch);
+        ma_engine_listener_set_direction(mMaEngine, 0,
+                                         cosY * cosP, sinY * cosP, sinP);
+        ma_engine_listener_set_world_up(mMaEngine, 0, 0.0f, 0.0f, 1.0f);
+    }
+}
+
+//------------------------------------------------------
 void AudioService::loopStep(float deltaTime)
 {
     if (!mAudioReady)
@@ -626,12 +668,85 @@ void AudioService::loopStep(float deltaTime)
     // Remove voices that have finished playback
     cleanupFinishedVoices();
 
-    // Guard against use-after-free if the acoustic scene is destroyed
-    // between frames (e.g. mission unload). Future Task 36 simulator
-    // calls (iplSimulatorRunDirect, etc.) must only run when scene is live.
-    if (mSceneReady) {
-        // TODO (Task 36): Update active voices — update Steam Audio source
-        //   positions for moving objects, run simulation step
+    // Run Steam Audio simulation for all active sources
+    if (mSceneReady && mIplSimulator && !mVoices.empty()) {
+        // Step 1: Set listener position/orientation for the simulator
+        float cosY = std::cos(mListenerYaw), sinY = std::sin(mListenerYaw);
+        float cosP = std::cos(mListenerPitch), sinP = std::sin(mListenerPitch);
+
+        IPLCoordinateSpace3 listenerCoord{};
+        listenerCoord.origin = {mListenerPos.x, mListenerPos.y, mListenerPos.z};
+        listenerCoord.ahead  = {cosY * cosP, sinY * cosP, sinP};
+        listenerCoord.right  = {sinY, -cosY, 0.0f};
+        // up = cross(right, ahead) for right-handed Z-up
+        listenerCoord.up     = {-cosY * sinP, -sinY * sinP, cosP};
+
+        IPLSimulationSharedInputs sharedInputs{};
+        sharedInputs.listener = listenerCoord;
+        sharedInputs.numRays = 4096;
+        sharedInputs.numBounces = 4;
+        sharedInputs.duration = 2.0f;
+        sharedInputs.order = 1;
+        sharedInputs.irradianceMinDistance = 1.0f;
+        iplSimulatorSetSharedInputs(mIplSimulator,
+            static_cast<IPLSimulationFlags>(
+                IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS),
+            &sharedInputs);
+
+        // Step 2: Update per-source positions
+        for (auto &[handle, voice] : mVoices) {
+            if (!voice->iplSource)
+                continue;
+
+            IPLCoordinateSpace3 sourceCoord{};
+            sourceCoord.origin = {voice->worldPos.x, voice->worldPos.y, voice->worldPos.z};
+            // Sources are omnidirectional — orientation doesn't matter for direct sim,
+            // but Steam Audio requires a valid coordinate frame
+            sourceCoord.ahead = {1.0f, 0.0f, 0.0f};
+            sourceCoord.right = {0.0f, 1.0f, 0.0f};
+            sourceCoord.up    = {0.0f, 0.0f, 1.0f};
+
+            IPLSimulationInputs inputs{};
+            inputs.flags = static_cast<IPLSimulationFlags>(
+                IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+            inputs.directFlags = static_cast<IPLDirectSimulationFlags>(
+                IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
+                IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION |
+                IPL_DIRECTSIMULATIONFLAGS_OCCLUSION |
+                IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
+            inputs.source = sourceCoord;
+            inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
+            inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+            inputs.occlusionType = IPL_OCCLUSIONTYPE_RAYCAST;
+            inputs.numOcclusionSamples = 16;
+            inputs.numTransmissionRays = 8;
+
+            iplSourceSetInputs(voice->iplSource,
+                static_cast<IPLSimulationFlags>(
+                    IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS),
+                &inputs);
+        }
+
+        // Step 3: Run the simulation
+        iplSimulatorRunDirect(mIplSimulator);
+        // TODO (Task 35e): Also run reflections when DSP effect pipeline is ready
+        // iplSimulatorRunReflections(mIplSimulator);
+
+        // Step 4: Read back results and apply to miniaudio voices
+        for (auto &[handle, voice] : mVoices) {
+            if (!voice->iplSource)
+                continue;
+
+            IPLSimulationOutputs outputs{};
+            iplSourceGetOutputs(voice->iplSource,
+                static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT),
+                &outputs);
+
+            // Apply distance attenuation + occlusion as volume scaling
+            // (Full DSP pipeline with frequency-dependent effects in Task 35e)
+            float volume = outputs.direct.distanceAttenuation * outputs.direct.occlusion;
+            ma_sound_set_volume(&voice->sound, volume);
+        }
     }
 }
 
@@ -642,11 +757,49 @@ void AudioService::cleanupFinishedVoices()
     // This avoids cross-thread calls to ma_sound_at_end().
     for (auto it = mVoices.begin(); it != mVoices.end();) {
         if (it->second->finished.load(std::memory_order_acquire)) {
+            removeVoiceSource(*it->second);
             it = mVoices.erase(it);
         } else {
             ++it;
         }
     }
+}
+
+//------------------------------------------------------
+void AudioService::createVoiceSource(ActiveVoice &voice)
+{
+    if (!mIplSimulator || !mSceneReady)
+        return;
+
+    IPLSourceSettings srcSettings{};
+    srcSettings.flags = static_cast<IPLSimulationFlags>(
+        IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+
+    IPLerror err = iplSourceCreate(mIplSimulator, &srcSettings, &voice.iplSource);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplSourceCreate failed (error %d)", err);
+        voice.iplSource = nullptr;
+        return;
+    }
+
+    iplSourceAdd(voice.iplSource, mIplSimulator);
+    iplSimulatorCommit(mIplSimulator);
+}
+
+//------------------------------------------------------
+void AudioService::removeVoiceSource(ActiveVoice &voice)
+{
+    if (!voice.iplSource)
+        return;
+
+    if (mIplSimulator) {
+        iplSourceRemove(voice.iplSource, mIplSimulator);
+        iplSimulatorCommit(mIplSimulator);
+    }
+    // Release the source handle here (not in ~ActiveVoice) so lifecycle is
+    // self-contained and ordering relative to simulator destruction doesn't matter.
+    iplSourceRelease(&voice.iplSource);
+    // voice.iplSource is now nullptr (iplSourceRelease nulls the pointer)
 }
 
 // ── Public API stubs ──
@@ -688,6 +841,7 @@ void AudioService::haltSound(SoundHandle handle)
         if (it->second->initialized) {
             ma_sound_stop(&it->second->sound);
         }
+        removeVoiceSource(*it->second);
         mVoices.erase(it);
     }
 }
@@ -695,11 +849,12 @@ void AudioService::haltSound(SoundHandle handle)
 //------------------------------------------------------
 void AudioService::haltAll()
 {
-    // Stop all active sounds before destroying voices
+    // Remove all Steam Audio sources before destroying voices
     for (auto &[handle, voice] : mVoices) {
         if (voice->initialized) {
             ma_sound_stop(&voice->sound);
         }
+        removeVoiceSource(*voice);
     }
     mVoices.clear();
     mNextHandle = 0;
