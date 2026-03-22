@@ -775,8 +775,9 @@ void AudioService::onDBDrop(uint32_t dropmask)
     // Release Steam Audio acoustic scene
     destroyAcousticScene();
 
-    // Clear per-schema state (NO_REPEAT tracking)
+    // Clear per-schema state (NO_REPEAT tracking) and texture materials
     mLastSampleIdx.clear();
+    mTextureMaterials.clear();
 
     LOG_INFO("AudioService: mission audio state cleared");
 }
@@ -1388,6 +1389,122 @@ void AudioService::haltAll()
     }
     mVoices.clear();
     mNextHandle = 0;
+}
+
+// ── Footstep material system ──
+
+//------------------------------------------------------
+void AudioService::setTextureMaterials(std::vector<std::string> materials)
+{
+    mTextureMaterials = std::move(materials);
+    LOG_INFO("AudioService: %zu texture materials set", mTextureMaterials.size());
+}
+
+//------------------------------------------------------
+void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
+{
+    if (!mAudioReady || !mSchemaParser)
+        return;
+
+    // Determine material for footstep sound selection.
+    // Water overrides ground material when the player's feet are submerged.
+    std::string material;
+    bool isWater = mPlayerInWater;
+
+    if (isWater) {
+        material = "water";
+    } else {
+        // Look up material keyword from texture index
+        material = "stone";  // default fallback
+        if (textureIdx >= 0 && textureIdx < static_cast<int>(mTextureMaterials.size())) {
+            const std::string &m = mTextureMaterials[textureIdx];
+            if (!m.empty() && m != "generic") {
+                material = m;
+            }
+        }
+    }
+
+    // Build env_tag query: (Event Footstep) + (Material <keyword>)
+    // This matches schemas with env_tag like:
+    //   env_tag (Event Footstep) (Material Stone)
+    // For water footsteps, also adds (MediaLevel Foot) tag.
+    std::vector<SchemaTagValue> query;
+    {
+        SchemaTagValue eventTag;
+        eventTag.tagName = "Event";
+        eventTag.enumValues.push_back("Footstep");
+        query.push_back(std::move(eventTag));
+
+        SchemaTagValue matTag;
+        matTag.tagName = "Material";
+        matTag.enumValues.push_back(material);
+        query.push_back(std::move(matTag));
+
+        // Water footsteps add MediaLevel tag for splash/wading distinction
+        if (isWater) {
+            SchemaTagValue mediaTag;
+            mediaTag.tagName = "MediaLevel";
+            mediaTag.enumValues.push_back("Foot");
+            query.push_back(std::move(mediaTag));
+        }
+    }
+
+    // Find matching schemas via env_tag matching
+    auto matches = mSchemaParser->findByEnvTags(query);
+    if (matches.empty()) {
+        LOG_DEBUG("AudioService: no footstep schema for material '%s'", material.c_str());
+        return;
+    }
+
+    // Pick the first matching schema (highest priority if multiple match)
+    const SchemaEntry *schema = matches[0];
+
+    // Scale volume by movement speed:
+    //   creep (~5.5 u/s)  → quiet (0.3)
+    //   walk  (~11 u/s)   → normal (0.6)
+    //   run   (~22 u/s)   → loud (1.0)
+    float speedFactor = std::clamp(speed / 22.0f, 0.1f, 1.0f);
+    float baseVol = schemaVolumeToLinear(schema->playParams.volume);
+    float finalVol = baseVol * speedFactor;
+
+    // Select sample and play
+    if (schema->samples.empty())
+        return;
+
+    std::vector<int> freqs;
+    freqs.reserve(schema->samples.size());
+    for (const auto &s : schema->samples)
+        freqs.push_back(s.frequency);
+
+    int totalFreq = schema->totalFrequency();
+    if (totalFreq <= 0)
+        return;
+
+    int idx = selectSample(schema->name, static_cast<int>(schema->samples.size()),
+                           totalFreq, freqs.data());
+    if (idx < 0 || idx >= static_cast<int>(schema->samples.size()))
+        return;
+
+    // NO_REPEAT for footsteps
+    if ((schema->playParams.flags & SCH_NO_REPEAT) && schema->samples.size() > 1) {
+        auto it = mLastSampleIdx.find(schema->name);
+        if (it != mLastSampleIdx.end() && it->second == idx) {
+            idx = selectSample(schema->name, static_cast<int>(schema->samples.size()),
+                               totalFreq, freqs.data());
+            if (idx < 0 || idx >= static_cast<int>(schema->samples.size()))
+                return;
+        }
+    }
+    mLastSampleIdx[schema->name] = idx;
+
+    const SchemaSample &sample = schema->samples[idx];
+
+    SoundHandle h = startVoice(schema->name, sample.name, pos,
+                               schema->playParams.priority, false, 0);
+
+    if (h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
+        ma_sound_set_volume(&mVoices[h]->sound, finalVol);
+    }
 }
 
 // ── Sound propagation through portal graph (AI hearing) ──
