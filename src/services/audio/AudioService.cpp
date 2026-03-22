@@ -508,6 +508,12 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         return false;
     }
 
+    if (data.texNames.size() != numTriangles) {
+        LOG_ERROR("AudioService: texNames count (%zu) != triangle count (%zu)",
+                  data.texNames.size(), numTriangles);
+        return false;
+    }
+
     // Wrap scene construction in try-catch so that any C++ exception
     // (e.g. from std::vector allocation) cleans up partially-created
     // Steam Audio objects instead of leaking them.
