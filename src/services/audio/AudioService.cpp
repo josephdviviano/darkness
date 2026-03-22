@@ -23,6 +23,7 @@
 #include "AudioService.h"
 #include "CRFSoundLoader.h"
 #include "ServiceCommon.h"
+#include <algorithm>
 #include <atomic>
 #include "DarknessServiceManager.h"
 #include "database/DatabaseService.h"
@@ -39,6 +40,60 @@
 #include <phonon.h>
 
 namespace Darkness {
+
+/*----------------------------------------------------*/
+/*---------- Acoustic Material Preset Table ----------*/
+/*----------------------------------------------------*/
+
+/// Steam Audio material properties for common surface types.
+/// Values are per-frequency-band: {400 Hz, 2.5 kHz, 15 kHz}.
+/// Based on published acoustic absorption/transmission coefficients
+/// (see NOTES.AUDIO_ENGINE.md for sources and reasoning).
+struct AcousticMaterialEntry {
+    const char *keyword;   // substring to match in texture names
+    IPLMaterial material;
+};
+
+// Sorted by keyword length descending to prevent false matches
+// (e.g. "car" matching before "carpet"). See NOTES.AUDIO_ENGINE.md.
+static const AcousticMaterialEntry kAcousticMaterials[] = {
+    {"concrete", {{ 0.05f, 0.07f, 0.08f }, 0.05f, { 0.015f, 0.015f, 0.015f }}},
+    {"ceramic",  {{ 0.01f, 0.02f, 0.02f }, 0.05f, { 0.060f, 0.044f, 0.011f }}},
+    {"plaster",  {{ 0.12f, 0.06f, 0.04f }, 0.05f, { 0.056f, 0.056f, 0.004f }}},
+    {"carpet",   {{ 0.24f, 0.69f, 0.73f }, 0.05f, { 0.020f, 0.005f, 0.003f }}},
+    {"gravel",   {{ 0.60f, 0.70f, 0.80f }, 0.60f, { 0.031f, 0.012f, 0.008f }}},
+    {"brick",    {{ 0.03f, 0.04f, 0.07f }, 0.05f, { 0.015f, 0.015f, 0.015f }}},
+    {"glass",    {{ 0.06f, 0.03f, 0.02f }, 0.05f, { 0.060f, 0.044f, 0.011f }}},
+    {"stone",    {{ 0.13f, 0.20f, 0.24f }, 0.20f, { 0.015f, 0.002f, 0.001f }}},
+    {"metal",    {{ 0.20f, 0.07f, 0.06f }, 0.05f, { 0.250f, 0.190f, 0.080f }}},
+    {"wood",     {{ 0.11f, 0.07f, 0.06f }, 0.05f, { 0.070f, 0.014f, 0.005f }}},
+    {"rock",     {{ 0.13f, 0.20f, 0.24f }, 0.20f, { 0.015f, 0.002f, 0.001f }}},
+    {"tile",     {{ 0.01f, 0.02f, 0.02f }, 0.05f, { 0.060f, 0.044f, 0.011f }}},
+    {"dirt",     {{ 0.60f, 0.70f, 0.80f }, 0.60f, { 0.031f, 0.012f, 0.008f }}},
+    {"ice",      {{ 0.01f, 0.02f, 0.02f }, 0.05f, { 0.060f, 0.044f, 0.011f }}},
+};
+static const size_t kAcousticMaterialCount =
+    sizeof(kAcousticMaterials) / sizeof(kAcousticMaterials[0]);
+
+// Default material for unmatched textures
+static const IPLMaterial kGenericMaterial =
+    {{ 0.10f, 0.20f, 0.30f }, 0.05f, { 0.100f, 0.050f, 0.030f }};
+
+/// Look up an acoustic material by texture name via substring matching.
+/// Longer keywords are checked first to avoid false partial matches.
+static IPLMaterial lookupAcousticMaterial(const std::string &texName)
+{
+    // Convert to lowercase for matching
+    std::string lower = texName;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    for (size_t i = 0; i < kAcousticMaterialCount; ++i) {
+        if (lower.find(kAcousticMaterials[i].keyword) != std::string::npos) {
+            return kAcousticMaterials[i].material;
+        }
+    }
+    return kGenericMaterial;
+}
 
 /*----------------------------------------------------*/
 /*-------------- Active Voice Management -------------*/
@@ -109,6 +164,8 @@ AudioService::~AudioService()
 {
     // Voices must be destroyed before the engine (they reference it internally)
     mVoices.clear();
+    // Release acoustic scene before the Steam Audio context
+    destroyAcousticScene();
     // Ensure backends are shut down even if shutdown() wasn't called
     shutdownSteamAudio();
     shutdownMiniaudio();
@@ -218,6 +275,154 @@ bool AudioService::loadSoundResources(const std::string &resPath)
     return true;
 }
 
+// ── Steam Audio acoustic scene ──
+
+//------------------------------------------------------
+bool AudioService::buildAcousticScene(const AcousticSceneData &data)
+{
+    if (!mIplContext) {
+        LOG_ERROR("AudioService: cannot build acoustic scene — Steam Audio not initialized");
+        return false;
+    }
+
+    // Destroy any existing scene from a previous mission
+    destroyAcousticScene();
+
+    size_t numVertices = data.vertices.size() / 3;
+    size_t numTriangles = data.indices.size() / 3;
+
+    if (numVertices == 0 || numTriangles == 0) {
+        LOG_INFO("AudioService: empty geometry — skipping acoustic scene");
+        return false;
+    }
+
+    // Step 1: Create IPLScene (Steam Audio's built-in CPU raytracer)
+    IPLSceneSettings sceneSettings{};
+    sceneSettings.type = IPL_SCENETYPE_DEFAULT;
+
+    IPLerror err = iplSceneCreate(mIplContext, &sceneSettings, &mIplScene);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplSceneCreate failed (error %d)", err);
+        return false;
+    }
+
+    // Step 2: Build material palette from unique texture names
+    // Map each unique texture name to a material index
+    std::unordered_map<std::string, int32_t> texToMaterialIdx;
+    std::vector<IPLMaterial> materials;
+
+    for (const auto &texName : data.texNames) {
+        if (texToMaterialIdx.find(texName) == texToMaterialIdx.end()) {
+            texToMaterialIdx[texName] = static_cast<int32_t>(materials.size());
+            materials.push_back(lookupAcousticMaterial(texName));
+        }
+    }
+
+    // Ensure at least one material (generic fallback)
+    if (materials.empty()) {
+        materials.push_back(kGenericMaterial);
+    }
+
+    // Build per-triangle material index array
+    std::vector<IPLint32> materialIndices;
+    materialIndices.reserve(numTriangles);
+    for (const auto &texName : data.texNames) {
+        auto it = texToMaterialIdx.find(texName);
+        materialIndices.push_back(it != texToMaterialIdx.end() ? it->second : 0);
+    }
+
+    // Step 3: Convert vertex data to IPLVector3 array
+    // (IPLVector3 is {float x, y, z} — same layout as our flat array)
+    std::vector<IPLVector3> iplVertices(numVertices);
+    for (size_t i = 0; i < numVertices; ++i) {
+        iplVertices[i] = {data.vertices[i * 3],
+                          data.vertices[i * 3 + 1],
+                          data.vertices[i * 3 + 2]};
+    }
+
+    // Convert index data to IPLTriangle array
+    std::vector<IPLTriangle> iplTriangles(numTriangles);
+    for (size_t i = 0; i < numTriangles; ++i) {
+        iplTriangles[i].indices[0] = data.indices[i * 3];
+        iplTriangles[i].indices[1] = data.indices[i * 3 + 1];
+        iplTriangles[i].indices[2] = data.indices[i * 3 + 2];
+    }
+
+    // Step 4: Create static mesh with geometry and material assignments
+    IPLStaticMeshSettings meshSettings{};
+    meshSettings.numVertices = static_cast<IPLint32>(numVertices);
+    meshSettings.numTriangles = static_cast<IPLint32>(numTriangles);
+    meshSettings.numMaterials = static_cast<IPLint32>(materials.size());
+    meshSettings.vertices = iplVertices.data();
+    meshSettings.triangles = iplTriangles.data();
+    meshSettings.materialIndices = materialIndices.data();
+    meshSettings.materials = materials.data();
+
+    err = iplStaticMeshCreate(mIplScene, &meshSettings, &mIplStaticMesh);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplStaticMeshCreate failed (error %d)", err);
+        iplSceneRelease(&mIplScene);
+        mIplScene = nullptr;
+        return false;
+    }
+
+    // Step 5: Add the mesh to the scene and commit (builds BVH acceleration)
+    iplStaticMeshAdd(mIplStaticMesh, mIplScene);
+    iplSceneCommit(mIplScene);
+
+    // Step 6: Create the simulator for direct occlusion + reflections + reverb
+    IPLSimulationSettings simSettings{};
+    simSettings.flags = static_cast<IPLSimulationFlags>(
+        IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+    simSettings.sceneType = IPL_SCENETYPE_DEFAULT;
+    simSettings.reflectionType = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+    simSettings.maxNumOcclusionSamples = 32;
+    simSettings.maxNumRays = 4096;       // rays per simulation step
+    simSettings.numDiffuseSamples = 32;
+    simSettings.maxDuration = 2.0f;      // max reverb tail (seconds)
+    simSettings.maxOrder = 1;            // ambisonics order
+    simSettings.maxNumSources = 32;      // voice pool size
+    simSettings.numThreads = 2;          // parallel ray tracing
+    simSettings.samplingRate = 44100;
+    simSettings.frameSize = 1024;
+
+    err = iplSimulatorCreate(mIplContext, &simSettings, &mIplSimulator);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplSimulatorCreate failed (error %d)", err);
+        destroyAcousticScene();
+        return false;
+    }
+
+    // Bind the scene to the simulator
+    iplSimulatorSetScene(mIplSimulator, mIplScene);
+    iplSimulatorCommit(mIplSimulator);
+
+    mSceneReady = true;
+
+    LOG_INFO("AudioService: acoustic scene built — %zu vertices, %zu triangles, "
+             "%zu materials", numVertices, numTriangles, materials.size());
+    return true;
+}
+
+//------------------------------------------------------
+void AudioService::destroyAcousticScene()
+{
+    mSceneReady = false;
+
+    if (mIplSimulator) {
+        iplSimulatorRelease(&mIplSimulator);
+        mIplSimulator = nullptr;
+    }
+    if (mIplStaticMesh) {
+        iplStaticMeshRelease(&mIplStaticMesh);
+        mIplStaticMesh = nullptr;
+    }
+    if (mIplScene) {
+        iplSceneRelease(&mIplScene);
+        mIplScene = nullptr;
+    }
+}
+
 // ── Service lifecycle ──
 
 //------------------------------------------------------
@@ -291,7 +496,7 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
         return;
 
     // TODO (Task 34): Load and parse .sch schema files
-    // TODO (Task 35): Build Steam Audio IPLScene from world geometry
+    // NOTE: Steam Audio scene is built via buildAcousticScene() called from DarknessRender.cpp
     // TODO (Task 39): Load ambient sound properties (P$AmbientHack)
 
     // Test sound playback — load and play a sound effect from snd.crf
@@ -371,7 +576,9 @@ void AudioService::onDBDrop(uint32_t dropmask)
         mSoundCache->clear();
     }
 
-    // TODO (Task 35): Destroy Steam Audio scene
+    // Release Steam Audio acoustic scene
+    destroyAcousticScene();
+
     // TODO (Task 34): Clear schema database
 
     LOG_INFO("AudioService: mission audio state cleared");
@@ -387,8 +594,7 @@ void AudioService::loopStep(float deltaTime)
     cleanupFinishedVoices();
 
     // TODO (Task 36): Update active voices — update Steam Audio source
-    //   positions for moving objects
-    // TODO (Task 35): Run Steam Audio simulation step
+    //   positions for moving objects, run simulation step
 }
 
 //------------------------------------------------------
