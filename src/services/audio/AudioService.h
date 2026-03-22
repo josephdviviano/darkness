@@ -248,6 +248,7 @@ private:
     void destroyAcousticScene();
     void createVoiceSource(ActiveVoice &voice);
     void removeVoiceSource(ActiveVoice &voice);
+    void initVoiceDSP(ActiveVoice &voice);
 };
 
 /// Factory for AudioService

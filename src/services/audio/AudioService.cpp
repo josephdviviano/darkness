@@ -113,6 +113,137 @@ static IPLMaterial lookupAcousticMaterial(const std::string &texName)
 }
 
 /*----------------------------------------------------*/
+/*----------- Steam Audio DSP Processing Node --------*/
+/*----------------------------------------------------*/
+
+/// Forward declare the process callback for the custom miniaudio node vtable.
+static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
+                                   ma_uint32* pFrameCountIn,
+                                   float** ppFramesOut, ma_uint32* pFrameCountOut);
+
+/// Custom miniaudio node for Steam Audio DSP processing.
+/// Sits between a voice's ma_sound (mono) and the engine endpoint (stereo).
+/// Applies IPLDirectEffect (frequency-dependent attenuation) followed by
+/// IPLBinauralEffect (HRTF spatialization) on the audio thread.
+struct SteamAudioDSPNode {
+    ma_node_base base;  // Must be first member (miniaudio node graph requirement)
+
+    // Steam Audio effects (per-voice, processed on audio thread)
+    IPLDirectEffect directEffect = nullptr;
+    IPLBinauralEffect binauralEffect = nullptr;
+
+    // Shared reference (NOT owned — AudioService manages HRTF lifetime)
+    IPLHRTF hrtf = nullptr;
+
+    // Processing parameters — written by main thread in loopStep(),
+    // read by audio thread in process callback. Potential tearing on
+    // partial writes is acceptable: worst case is slightly wrong audio
+    // for a single frame (~23ms), which is imperceptible.
+    IPLDirectEffectParams directParams{};
+    IPLVector3 direction{1.0f, 0.0f, 0.0f};  // listener-to-source (listener-local frame)
+
+    // Scratch buffers for deinterleaved Steam Audio processing
+    // (allocated once at init, never reallocated — safe for audio thread)
+    std::vector<float> monoScratch;   // mono channel for direct effect in/out
+    std::vector<float> stereoL;       // left channel (binaural output)
+    std::vector<float> stereoR;       // right channel (binaural output)
+
+    int frameSize = 1024;
+    bool effectsReady = false;       // true when effects + node are initialized
+    bool nodeInitialized = false;    // true when ma_node_init succeeded
+};
+
+/// vtable for the Steam Audio DSP custom node
+static ma_node_vtable sSteamAudioNodeVtable = {
+    steamAudioNodeProcess,   // onProcess
+    nullptr,                 // onGetRequiredInputFrameCount (1:1 input/output ratio)
+    1,                       // inputBusCount  (mono from ma_sound)
+    1,                       // outputBusCount (stereo to engine endpoint)
+    0                        // flags
+};
+
+/// Audio-thread callback: applies Steam Audio direct + binaural effects.
+/// Reads mono from ma_sound, outputs stereo binaural to engine endpoint.
+static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
+                                   ma_uint32* pFrameCountIn,
+                                   float** ppFramesOut, ma_uint32* pFrameCountOut)
+{
+    auto* node = reinterpret_cast<SteamAudioDSPNode*>(pNode);
+    ma_uint32 frameCount = *pFrameCountOut;
+
+    // Limit to available input frames and our buffer size
+    if (pFrameCountIn[0] < frameCount)
+        frameCount = pFrameCountIn[0];
+    if (frameCount > static_cast<ma_uint32>(node->frameSize))
+        frameCount = static_cast<ma_uint32>(node->frameSize);
+
+    float* stereoOut = ppFramesOut[0];  // interleaved stereo output
+
+    if (!node->effectsReady || frameCount == 0 || !ppFramesIn[0]) {
+        // Output silence
+        std::memset(stereoOut, 0, frameCount * 2 * sizeof(float));
+        pFrameCountIn[0] = frameCount;
+        *pFrameCountOut = frameCount;
+        return;
+    }
+
+    const float* monoIn = ppFramesIn[0];
+    float* mono = node->monoScratch.data();
+
+    // Step 1: Copy mono input to scratch buffer (direct effect processes in-place)
+    std::memcpy(mono, monoIn, frameCount * sizeof(float));
+
+    // Step 2: Wrap in Steam Audio deinterleaved buffer (mono = single pointer)
+    float* monoPtr = mono;
+    IPLAudioBuffer inBuf{};
+    inBuf.numChannels = 1;
+    inBuf.numSamples = static_cast<IPLint32>(frameCount);
+    inBuf.data = &monoPtr;
+
+    // Step 3: Apply direct effect in-place (distance attenuation, air absorption,
+    //         occlusion, transmission — frequency-dependent 3-band EQ)
+    if (node->directEffect) {
+        iplDirectEffectApply(node->directEffect, &node->directParams, &inBuf, &inBuf);
+    }
+
+    // Step 4: Apply binaural effect (mono → stereo HRTF spatialization)
+    if (node->binauralEffect) {
+        float* chL = node->stereoL.data();
+        float* chR = node->stereoR.data();
+        float* stereoChannels[2] = {chL, chR};
+
+        IPLAudioBuffer outBuf{};
+        outBuf.numChannels = 2;
+        outBuf.numSamples = static_cast<IPLint32>(frameCount);
+        outBuf.data = stereoChannels;
+
+        IPLBinauralEffectParams binParams{};
+        binParams.direction = node->direction;
+        binParams.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;
+        binParams.spatialBlend = 1.0f;
+        binParams.hrtf = node->hrtf;
+        binParams.peakDelays = nullptr;
+
+        iplBinauralEffectApply(node->binauralEffect, &binParams, &inBuf, &outBuf);
+
+        // Interleave deinterleaved stereo → miniaudio interleaved output
+        for (ma_uint32 i = 0; i < frameCount; ++i) {
+            stereoOut[i * 2]     = chL[i];
+            stereoOut[i * 2 + 1] = chR[i];
+        }
+    } else {
+        // No binaural — duplicate mono to both channels
+        for (ma_uint32 i = 0; i < frameCount; ++i) {
+            stereoOut[i * 2]     = mono[i];
+            stereoOut[i * 2 + 1] = mono[i];
+        }
+    }
+
+    pFrameCountIn[0] = frameCount;
+    *pFrameCountOut = frameCount;
+}
+
+/*----------------------------------------------------*/
 /*-------------- Active Voice Management -------------*/
 /*----------------------------------------------------*/
 
@@ -137,25 +268,49 @@ struct ActiveVoice {
     // World-space position for spatial audio (updated for moving objects)
     Vector3 worldPos{0.0f, 0.0f, 0.0f};
 
+    // Steam Audio DSP node — applies direct + binaural effects in audio thread.
+    // Connected between ma_sound output and engine endpoint in the node graph.
+    SteamAudioDSPNode dspNode;
+
     ActiveVoice() {
         std::memset(&decoder, 0, sizeof(decoder));
         std::memset(&sound, 0, sizeof(sound));
     }
 
     ~ActiveVoice() {
-        // NOTE: IPLSource must be removed from the simulator BEFORE destruction.
-        // This is handled by removeVoiceSource() called from cleanup/halt paths,
-        // not in this destructor (we don't have the simulator reference here).
-        if (iplSource) {
-            iplSourceRelease(&iplSource);
+        // Stop playback first to prevent audio thread from accessing resources
+        if (initialized) {
+            ma_sound_stop(&sound);
         }
+
+        // Disconnect and destroy DSP node (detaches from graph, waits for audio thread)
+        if (dspNode.nodeInitialized) {
+            ma_node_uninit(&dspNode.base, nullptr);
+            dspNode.nodeInitialized = false;
+        }
+        if (dspNode.directEffect) {
+            iplDirectEffectRelease(&dspNode.directEffect);
+            dspNode.directEffect = nullptr;
+        }
+        if (dspNode.binauralEffect) {
+            iplBinauralEffectRelease(&dspNode.binauralEffect);
+            dspNode.binauralEffect = nullptr;
+        }
+        dspNode.effectsReady = false;
+
+        // Destroy sound and decoder
         if (initialized) {
             ma_sound_uninit(&sound);
             ma_decoder_uninit(&decoder);
         }
+
+        // Release IPLSource (removeVoiceSource should have been called, but be safe)
+        if (iplSource) {
+            iplSourceRelease(&iplSource);
+        }
     }
 
-    // Non-copyable, non-movable (ma_decoder/ma_sound have internal pointers)
+    // Non-copyable, non-movable (ma_decoder/ma_sound/ma_node have internal pointers)
     ActiveVoice(const ActiveVoice &) = delete;
     ActiveVoice &operator=(const ActiveVoice &) = delete;
     ActiveVoice(ActiveVoice &&) = delete;
@@ -567,10 +722,13 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
                 continue;
             }
 
-            // Create sound from decoder (no spatialization for this test)
+            // Create sound without default attachment so we can route through
+            // the Steam Audio DSP node. Spatialization is handled by Steam Audio's
+            // binaural effect, not miniaudio's built-in panner.
             if (ma_sound_init_from_data_source(
                     mMaEngine, &voice->decoder,
-                    MA_SOUND_FLAG_NO_SPATIALIZATION, nullptr,
+                    MA_SOUND_FLAG_NO_SPATIALIZATION |
+                    MA_SOUND_FLAG_NO_DEFAULT_ATTACHMENT, nullptr,
                     &voice->sound) != MA_SUCCESS) {
                 ma_decoder_uninit(&voice->decoder);
                 LOG_ERROR("AudioService: failed to init test sound '%s'", name);
@@ -578,6 +736,15 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
             }
 
             voice->initialized = true;
+
+            // Set up Steam Audio DSP pipeline (direct + binaural effects)
+            initVoiceDSP(*voice);
+
+            // If DSP setup failed or not available, connect directly to endpoint
+            if (!voice->dspNode.effectsReady) {
+                ma_node_attach_output_bus(&voice->sound, 0,
+                                          ma_engine_get_endpoint(mMaEngine), 0);
+            }
 
             // Create Steam Audio source for spatial simulation
             createVoiceSource(*voice);
@@ -729,10 +896,12 @@ void AudioService::loopStep(float deltaTime)
 
         // Step 3: Run the simulation
         iplSimulatorRunDirect(mIplSimulator);
-        // TODO (Task 35e): Also run reflections when DSP effect pipeline is ready
+        // TODO: Also run reflections when reflection DSP pipeline is ready
         // iplSimulatorRunReflections(mIplSimulator);
 
-        // Step 4: Read back results and apply to miniaudio voices
+        // Step 4: Read back simulation results and feed to DSP nodes.
+        // The DSP node's process callback (audio thread) uses these params
+        // for frequency-dependent direct effects + HRTF binaural rendering.
         for (auto &[handle, voice] : mVoices) {
             if (!voice->iplSource)
                 continue;
@@ -742,10 +911,45 @@ void AudioService::loopStep(float deltaTime)
                 static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT),
                 &outputs);
 
-            // Apply distance attenuation + occlusion as volume scaling
-            // (Full DSP pipeline with frequency-dependent effects in Task 35e)
-            float volume = outputs.direct.distanceAttenuation * outputs.direct.occlusion;
-            ma_sound_set_volume(&voice->sound, volume);
+            if (voice->dspNode.effectsReady) {
+                // Copy simulation outputs directly to DSP node params.
+                // outputs.direct IS an IPLDirectEffectParams — just set the flags
+                // to tell the effect which components to apply.
+                voice->dspNode.directParams = outputs.direct;
+                voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
+                    IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
+                    IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
+                    IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
+                    IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+                voice->dspNode.directParams.transmissionType =
+                    IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+
+                // Compute listener-to-source direction in listener's local frame
+                // for HRTF binaural rendering
+                Vector3 toSource = voice->worldPos - mListenerPos;
+                float dist = glm::length(toSource);
+                if (dist > 0.001f) {
+                    toSource /= dist;
+                    // Listener basis vectors (Z-up right-handed)
+                    Vector3 right(sinY, -cosY, 0.0f);
+                    Vector3 ahead(cosY * cosP, sinY * cosP, sinP);
+                    Vector3 up(-cosY * sinP, -sinY * sinP, cosP);
+
+                    // Project world direction onto listener-local axes.
+                    // Steam Audio convention: +X=right, +Y=up, -Z=ahead,
+                    // so negate the ahead component for correct front/back.
+                    voice->dspNode.direction = {
+                        glm::dot(toSource, right),    // x = right
+                        glm::dot(toSource, up),       // y = up
+                        -glm::dot(toSource, ahead)    // z = -ahead (Steam Audio: -Z = forward)
+                    };
+                }
+            } else {
+                // Fallback: simple volume scaling (no DSP pipeline available)
+                float volume = outputs.direct.distanceAttenuation *
+                               outputs.direct.occlusion;
+                ma_sound_set_volume(&voice->sound, volume);
+            }
         }
     }
 }
@@ -800,6 +1004,98 @@ void AudioService::removeVoiceSource(ActiveVoice &voice)
     // self-contained and ordering relative to simulator destruction doesn't matter.
     iplSourceRelease(&voice.iplSource);
     // voice.iplSource is now nullptr (iplSourceRelease nulls the pointer)
+}
+
+//------------------------------------------------------
+void AudioService::initVoiceDSP(ActiveVoice &voice)
+{
+    if (!mIplContext || !mIplHrtf || !mMaEngine)
+        return;
+
+    auto &dsp = voice.dspNode;
+    dsp.hrtf = mIplHrtf;
+    dsp.frameSize = 1024;
+
+    // Allocate processing buffers (once, never reallocated — audio thread safe)
+    dsp.monoScratch.resize(dsp.frameSize);
+    dsp.stereoL.resize(dsp.frameSize);
+    dsp.stereoR.resize(dsp.frameSize);
+
+    // Create IPLDirectEffect (per-voice, frequency-dependent 3-band EQ)
+    IPLAudioSettings audioSettings{};
+    audioSettings.samplingRate = 44100;
+    audioSettings.frameSize = dsp.frameSize;
+
+    IPLDirectEffectSettings directSettings{};
+    directSettings.numChannels = 1;  // mono processing
+
+    IPLerror err = iplDirectEffectCreate(mIplContext, &audioSettings,
+                                          &directSettings, &dsp.directEffect);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplDirectEffectCreate failed (error %d)", err);
+        return;
+    }
+
+    // Create IPLBinauralEffect (mono → stereo HRTF spatialization)
+    IPLBinauralEffectSettings binauralSettings{};
+    binauralSettings.hrtf = mIplHrtf;
+
+    err = iplBinauralEffectCreate(mIplContext, &audioSettings,
+                                   &binauralSettings, &dsp.binauralEffect);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplBinauralEffectCreate failed (error %d)", err);
+        iplDirectEffectRelease(&dsp.directEffect);
+        dsp.directEffect = nullptr;
+        return;
+    }
+
+    // Initialize custom miniaudio node (mono input → stereo output)
+    ma_uint32 inputChannels[1] = {1};   // 1 input bus, 1 channel (mono)
+    ma_uint32 outputChannels[1] = {2};  // 1 output bus, 2 channels (stereo)
+
+    ma_node_config nodeConfig = ma_node_config_init();
+    nodeConfig.vtable = &sSteamAudioNodeVtable;
+    nodeConfig.inputBusCount = 1;
+    nodeConfig.outputBusCount = 1;
+    nodeConfig.pInputChannels = inputChannels;
+    nodeConfig.pOutputChannels = outputChannels;
+
+    ma_result result = ma_node_init(ma_engine_get_node_graph(mMaEngine),
+                                     &nodeConfig, nullptr, &dsp.base);
+    if (result != MA_SUCCESS) {
+        LOG_ERROR("AudioService: ma_node_init failed for DSP node (error %d)", result);
+        iplBinauralEffectRelease(&dsp.binauralEffect);
+        dsp.binauralEffect = nullptr;
+        iplDirectEffectRelease(&dsp.directEffect);
+        dsp.directEffect = nullptr;
+        return;
+    }
+    dsp.nodeInitialized = true;
+
+    // Set default direct params (unity — no attenuation until simulation updates)
+    dsp.directParams.flags = static_cast<IPLDirectEffectFlags>(
+        IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
+        IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
+        IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
+        IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+    dsp.directParams.transmissionType = IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+    dsp.directParams.distanceAttenuation = 1.0f;
+    dsp.directParams.airAbsorption[0] = 1.0f;
+    dsp.directParams.airAbsorption[1] = 1.0f;
+    dsp.directParams.airAbsorption[2] = 1.0f;
+    dsp.directParams.occlusion = 1.0f;
+    dsp.directParams.transmission[0] = 1.0f;
+    dsp.directParams.transmission[1] = 1.0f;
+    dsp.directParams.transmission[2] = 1.0f;
+
+    dsp.effectsReady = true;
+
+    // Connect the node graph: ma_sound → DSP node → engine endpoint
+    ma_node_attach_output_bus(&voice.sound, 0, &dsp.base, 0);
+    ma_node_attach_output_bus(&dsp.base, 0, ma_engine_get_endpoint(mMaEngine), 0);
+
+    LOG_DEBUG("AudioService: Steam Audio DSP pipeline initialized for voice %d",
+              voice.handle);
 }
 
 // ── Public API stubs ──
