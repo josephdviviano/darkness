@@ -1760,6 +1760,15 @@ int main(int argc, char *argv[]) {
 
         updateMovement(dt, state, mission, dbgConsole);
 
+        // Update audio listener position and run Steam Audio simulation
+        {
+            Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+            audioSvc->setListenerTransform(
+                Darkness::Vector3(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]),
+                state.cam.yaw, state.cam.pitch);
+            audioSvc->updateAudio(dt);
+        }
+
         updateLightmaps(dt, meshes, mission, gpu);
 
         // ── Prepare frame: matrices, fog, samplers, culling ──
