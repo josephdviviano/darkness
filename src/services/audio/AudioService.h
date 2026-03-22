@@ -35,6 +35,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -59,6 +60,7 @@ namespace Darkness {
 class CRFSoundLoader;
 class SoundCache;
 struct SoundData;
+class SchemaParser;
 
 /// Data transfer struct for world geometry → Steam Audio acoustic scene.
 /// Filled by the render binary from WR chunk data, passed to AudioService.
@@ -79,6 +81,9 @@ using SoundHandle = int32_t;
 
 /// Invalid sound handle sentinel
 constexpr SoundHandle SOUND_HANDLE_INVALID = -1;
+
+/// Maximum simultaneous active voices (matches Dark Engine's limit)
+constexpr int MAX_ACTIVE_VOICES = 32;
 
 /** @brief Audio service — manages all sound playback, schema resolution,
  *  Steam Audio spatialization, and AI sound propagation.
@@ -181,6 +186,7 @@ private:
     DatabaseServicePtr mDbService;
     RoomServicePtr mRoomService;
     PropertyServicePtr mPropertyService;
+    ObjectServicePtr mObjectService;
 
     // ── Portal blocking factors for AI hearing propagation ──
     // Key: (room1 << 16) | room2 (bidirectional — stored both ways)
@@ -211,6 +217,9 @@ private:
     /// LRU cache for recently-used decoded sounds (default 64MB budget)
     std::unique_ptr<SoundCache> mSoundCache;
 
+    /// Schema parser (.sch/.spc/.arc files — sound selection rules)
+    std::unique_ptr<SchemaParser> mSchemaParser;
+
     // ── Active voice management ──
 
     /// Map of active voices (handle → voice). Voices own their WAV data,
@@ -219,6 +228,12 @@ private:
 
     /// Remove finished voices from the active map
     void cleanupFinishedVoices();
+
+    /// Random number generator for sample selection
+    std::mt19937 mRng{std::random_device{}()};
+
+    /// Per-schema last sample index for NO_REPEAT behavior
+    std::unordered_map<std::string, int> mLastSampleIdx;
 
     // ── Steam Audio acoustic scene ──
 
@@ -249,6 +264,11 @@ private:
     void createVoiceSource(ActiveVoice &voice);
     void removeVoiceSource(ActiveVoice &voice);
     void initVoiceDSP(ActiveVoice &voice);
+    int selectSample(const std::string &schemaName, int sampleCount, int totalFreq,
+                     const int *frequencies);
+    SoundHandle startVoice(const std::string &schemaName, const std::string &sampleName,
+                           const Vector3 &position, int priority, bool looping, int objID);
+    bool evictLowestPriority(int newPriority);
 };
 
 /// Factory for AudioService
