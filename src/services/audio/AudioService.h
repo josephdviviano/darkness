@@ -181,6 +181,26 @@ public:
                                  const Vector3 &listenerPos,
                                  float maxDist = SOUND_MAX_DIST) const;
 
+    /** Set the per-texture material keyword table (indexed by TXLIST texture index).
+     *  Built from world texture names via AcousticMaterials keyword matching.
+     *  Called from the render binary after TXLIST is parsed.
+     *  @param materials  Per-texture material keywords (e.g., "stone", "metal", "wood") */
+    void setTextureMaterials(std::vector<std::string> materials);
+
+    /** Play a footstep sound for a specific material and speed.
+     *  Selects a schema via env_tag matching: (Event Footstep) + (Material <keyword>).
+     *  When in water, overrides material with water-specific schema tags.
+     *  Called from the physics footstep callback.
+     *  @param pos         World-space foot position
+     *  @param speed       Horizontal movement speed (world units/sec)
+     *  @param textureIdx  Ground texture index (TXLIST) for material lookup */
+    void playFootstep(const Vector3 &pos, float speed, int textureIdx);
+
+    /** Set the player's water state for footstep material override.
+     *  When in water, footsteps use water splash schemas instead of ground material.
+     *  @param inWater  true if the player's feet are submerged */
+    void setPlayerInWater(bool inWater) { mPlayerInWater = inWater; }
+
     /** Per-frame audio update — voice cleanup, Steam Audio simulation step.
      *  Called from the render binary's main loop (LoopService is not used
      *  in the render binary; this provides a direct entry point).
@@ -259,6 +279,12 @@ private:
     /// Per-schema last sample index for NO_REPEAT behavior
     std::unordered_map<std::string, int> mLastSampleIdx;
 
+    // ── Texture material mapping (for footstep schema selection) ──
+
+    /// Per-texture material keyword (indexed by TXLIST texture index).
+    /// E.g., "stone", "metal", "wood", "carpet", "generic" (default).
+    std::vector<std::string> mTextureMaterials;
+
     // ── Steam Audio acoustic scene ──
 
     /// Acoustic scene built from WR world geometry
@@ -278,6 +304,9 @@ private:
     Vector3 mListenerPos{0.0f, 0.0f, 0.0f};
     float mListenerYaw = 0.0f;
     float mListenerPitch = 0.0f;
+
+    /// Whether the player's feet are currently in water (for footstep override)
+    bool mPlayerInWater = false;
 
     // Private helpers
     bool initMiniaudio();
