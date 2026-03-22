@@ -454,7 +454,8 @@ void AudioService::shutdownSteamAudio()
 // ── Sound resource loading ──
 
 //------------------------------------------------------
-bool AudioService::loadSoundResources(const std::string &resPath)
+bool AudioService::loadSoundResources(const std::string &resPath,
+                                      const std::string &schemasPath)
 {
     // Create sound loader (opens snd.crf)
     mSoundLoader = std::make_unique<CRFSoundLoader>(resPath);
@@ -467,23 +468,53 @@ bool AudioService::loadSoundResources(const std::string &resPath)
     // Create LRU sound cache (64MB budget)
     mSoundCache = std::make_unique<SoundCache>();
 
-    // Load schema files (.spc, .arc, .sch) from RES/SND/SCHEMA/
-    std::string schemaDir = resPath + "/SND/SCHEMA";
+    // Load schema files (.spc, .arc, .sch).
+    // Thief 2 stores schemas on disc 2 at EDITOR/SCHEMA/ or disc 1 at EDITOR/schemas/.
+    // If --schemas path is provided, use it directly. Otherwise search known locations.
     mSchemaParser = std::make_unique<SchemaParser>();
-    if (mSchemaParser->loadDirectory(schemaDir)) {
-        LOG_INFO("AudioService: loaded %zu schemas from %s",
-                 mSchemaParser->schemaCount(), schemaDir.c_str());
-        // Log any parse warnings
-        for (const auto &w : mSchemaParser->warnings()) {
-            LOG_DEBUG("AudioService: schema warning: %s", w.c_str());
+    bool schemasLoaded = false;
+
+    // Explicit path from --schemas CLI flag
+    if (!schemasPath.empty()) {
+        if (mSchemaParser->loadDirectory(schemasPath)) {
+            std::fprintf(stderr, "AudioService: loaded %zu schemas from %s\n",
+                         mSchemaParser->schemaCount(), schemasPath.c_str());
+            schemasLoaded = true;
         }
-    } else {
-        LOG_INFO("AudioService: no schema files found in %s (schemas unavailable)",
-                 schemaDir.c_str());
+    }
+
+    // Search known Thief 2 schema locations relative to RES parent directory
+    if (!schemasLoaded) {
+        const char *searchPaths[] = {
+            "/../EDITOR/SCHEMA",   // Disc 2 layout (uppercase)
+            "/../EDITOR/schemas",  // Disc 1 layout (lowercase)
+        };
+        for (const char *suffix : searchPaths) {
+            std::string dir = resPath + suffix;
+            if (mSchemaParser->loadDirectory(dir)) {
+                std::fprintf(stderr, "AudioService: loaded %zu schemas from %s\n",
+                             mSchemaParser->schemaCount(), dir.c_str());
+                schemasLoaded = true;
+                break;
+            }
+        }
+    }
+
+    if (!schemasLoaded) {
+        std::fprintf(stderr, "AudioService: no schema files found — use --schemas <path>\n");
         mSchemaParser.reset();
     }
 
     LOG_INFO("AudioService: Sound resources loaded from %s", resPath.c_str());
+    std::fprintf(stderr, "AudioService: loaded %zu schemas, sound resources ready\n",
+                 mSchemaParser ? mSchemaParser->schemaCount() : 0);
+
+    // Now that schemas and sound loader are ready, load ambient sounds
+    // from mission data (P$AmbientHack properties parsed during onDBLoad).
+    loadAmbientSounds();
+    std::fprintf(stderr, "AudioService: %zu ambient sounds, %zu active voices\n",
+                 mAmbients.size(), mVoices.size());
+
     return true;
 }
 
@@ -622,6 +653,8 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
 
         LOG_INFO("AudioService: acoustic scene built — %zu vertices, %zu triangles, "
                  "%zu materials", numVertices, numTriangles, materials.size());
+        std::fprintf(stderr, "AudioService: acoustic scene built (%zu tris, %zu mats)\n",
+                     numTriangles, materials.size());
         return true;
 
     } catch (const std::exception &e) {
@@ -665,6 +698,7 @@ bool AudioService::init()
 //------------------------------------------------------
 void AudioService::bootstrapFinished()
 {
+    std::fprintf(stderr, "AudioService::bootstrapFinished() called\n");
     // Acquire service dependencies
     mDbService = GET_SERVICE(DatabaseService);
     mRoomService = GET_SERVICE(RoomService);
@@ -685,9 +719,12 @@ void AudioService::bootstrapFinished()
 
     if (mAudioReady) {
         LOG_INFO("AudioService: fully initialized");
+        std::fprintf(stderr, "AudioService: fully initialized (miniaudio + Steam Audio)\n");
     } else {
         LOG_ERROR("AudioService: initialized with errors (miniaudio=%s, steam_audio=%s)",
                   maOk ? "ok" : "FAILED", saOk ? "ok" : "FAILED");
+        std::fprintf(stderr, "AudioService: INIT FAILED (miniaudio=%s, steam_audio=%s)\n",
+                     maOk ? "ok" : "FAILED", saOk ? "ok" : "FAILED");
     }
 }
 
@@ -733,12 +770,11 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
     if (!(curmask & DBM_MIS_DATA))
         return;
 
-    // NOTE: Steam Audio scene is built via buildAcousticScene() called from DarknessRender.cpp
+    // NOTE: Sound resources, acoustic scene, and ambient sounds are loaded from
+    // DarknessRender.cpp after this point (loadSoundResources → loadAmbientSounds).
+    // onDBLoad just records that mission data is available.
 
-    // Load ambient sound objects from P$AmbientHack properties
-    loadAmbientSounds();
-
-    LOG_INFO("AudioService: mission loaded");
+    LOG_INFO("AudioService: mission data loaded");
 }
 
 //------------------------------------------------------
