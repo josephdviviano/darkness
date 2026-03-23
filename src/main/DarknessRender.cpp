@@ -1299,6 +1299,12 @@ static Darkness::FrameContext prepareFrame(
     state.cam.getViewMatrix(fc.view);
     bgfx::setViewTransform(1, fc.view, fc.proj);
 
+    // Ensure view 1's depth clear always executes, even if portal culling
+    // produces zero visible cells (e.g., camera between cells). Without this,
+    // bgfx skips the clear for views with no submissions, leaving stale depth
+    // values that cause far geometry to flash through near geometry.
+    bgfx::touch(1);
+
     // ── Portal culling: determine visible cells ──
     // Build view-projection matrix and extract frustum planes for portal tests.
     // When culling is disabled, visibleCells remains empty (skip filtering).

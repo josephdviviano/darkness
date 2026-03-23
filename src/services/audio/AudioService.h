@@ -366,6 +366,10 @@ private:
     /// Whether an acoustic scene is currently active (built and committed)
     bool mSceneReady = false;
 
+    /// Deferred simulator commit flag — set when sources are added/removed,
+    /// committed once per frame in loopStep() before simulation runs.
+    bool mSimulatorDirty = false;
+
     // ── Listener state (updated each frame from render binary) ──
 
     Vector3 mListenerPos{0.0f, 0.0f, 0.0f};

@@ -961,6 +961,14 @@ void AudioService::loopStep(float deltaTime)
     // Remove voices that have finished playback
     cleanupFinishedVoices();
 
+    // Batch-commit any pending source additions/removals before simulation.
+    // This replaces per-voice iplSimulatorCommit() calls, avoiding the expensive
+    // commit operation firing multiple times per frame during ambient start/stop.
+    if (mSimulatorDirty && mIplSimulator) {
+        iplSimulatorCommit(mIplSimulator);
+        mSimulatorDirty = false;
+    }
+
     // Run Steam Audio simulation for all active sources
     if (mSceneReady && mIplSimulator && !mVoices.empty()) {
         // Step 1: Set listener position/orientation for the simulator
@@ -1116,7 +1124,7 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
     }
 
     iplSourceAdd(voice.iplSource, mIplSimulator);
-    iplSimulatorCommit(mIplSimulator);
+    mSimulatorDirty = true;
 }
 
 //------------------------------------------------------
@@ -1127,7 +1135,7 @@ void AudioService::removeVoiceSource(ActiveVoice &voice)
 
     if (mIplSimulator) {
         iplSourceRemove(voice.iplSource, mIplSimulator);
-        iplSimulatorCommit(mIplSimulator);
+        mSimulatorDirty = true;
     }
     // Release the source handle here (not in ~ActiveVoice) so lifecycle is
     // self-contained and ordering relative to simulator destruction doesn't matter.
