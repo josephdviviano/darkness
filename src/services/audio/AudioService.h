@@ -237,6 +237,15 @@ public:
      *  @param textureIdx  Ground texture index (TXLIST) for material lookup */
     void playFootstep(const Vector3 &pos, float speed, int textureIdx);
 
+    /** Play a landing impact sound for the given material and fall speed.
+     *  Selects a schema via env_tag matching: (Event Footstep) (Landing True)
+     *  (CreatureType Player) (Material <keyword>).
+     *  Volume scales with fall velocity — harder falls are louder.
+     *  @param pos         World-space foot position
+     *  @param fallSpeed   Downward velocity at impact (positive, world units/sec)
+     *  @param textureIdx  Ground texture index (TXLIST) for material lookup */
+    void playLanding(const Vector3 &pos, float fallSpeed, int textureIdx);
+
     /** Set the player's water state for footstep material override.
      *  When in water, footsteps use water splash schemas instead of ground material.
      *  @param inWater  true if the player's feet are submerged */
