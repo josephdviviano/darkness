@@ -421,6 +421,12 @@
                     activatePose(POSE_JUMP_LAND);
                     mLandingActive = true;
                     mLastLandingTime = mSimTime;
+
+                    // Fire landing callback for impact sound
+                    if (mLandingCb) {
+                        Vector3 footPos = mPosition + Vector3(0.0f, 0.0f, mSphereOffsetsBase[4]);
+                        mLandingCb(footPos, fallSpeed, mGroundTextureIdx);
+                    }
                 }
 
                 // If landing in water, go directly to Swim mode to prevent

@@ -1272,9 +1272,9 @@ int AudioService::selectSample(const std::string &schemaName, int sampleCount,
 //------------------------------------------------------
 bool AudioService::evictLowestPriority(int newPriority)
 {
-    // Find the voice with the lowest priority
+    // Find the voice with the lowest priority (strictly lower than new)
     SoundHandle lowestHandle = SOUND_HANDLE_INVALID;
-    int lowestPriority = newPriority;  // Only evict if we find something LOWER
+    int lowestPriority = newPriority;
 
     for (const auto &[handle, voice] : mVoices) {
         if (voice->priority < lowestPriority) {
@@ -1586,39 +1586,14 @@ void AudioService::loadAmbientSounds()
         if (amb.schemaName.empty())
             continue;
 
-        // AMB_ONCE_ONLY: play once then stop; otherwise loop continuously
-        bool isLooping = !(amb.flags & AMB_ONCE_ONLY);
-
-        // Start a voice for this ambient sound.
-        // Use the schema system if available, otherwise raw voice.
-        if (mSchemaParser) {
-            const SchemaEntry *schema = mSchemaParser->findSchema(amb.schemaName);
-            if (schema && !schema->samples.empty()) {
-                // Select a sample (ambient schemas typically have one sample)
-                const SchemaSample &sample = schema->samples[0];
-                amb.handle = startVoice(amb.schemaName, sample.name, amb.position,
-                                         schema->playParams.priority, isLooping, objID);
-            }
-        }
-
-        // Fallback: try loading schema name as a raw sound
-        if (amb.handle == SOUND_HANDLE_INVALID) {
-            amb.handle = startVoice(amb.schemaName, amb.schemaName, amb.position,
-                                     64, isLooping, objID);
-        }
-
-        if (amb.handle != SOUND_HANDLE_INVALID) {
-            // Apply ambient volume (0 = silence initially — updated by distance)
-            if (mVoices.count(amb.handle)) {
-                ma_sound_set_volume(&mVoices[amb.handle]->sound, 0.0f);
-            }
-            mAmbients.push_back(std::move(amb));
-            ++loaded;
-        }
+        // Register ambient data only — voices are started/stopped dynamically
+        // in updateAmbientVolumes() based on listener distance.
+        mAmbients.push_back(std::move(amb));
+        ++loaded;
     }
 
     if (loaded > 0) {
-        LOG_INFO("AudioService: loaded %d ambient sounds from P$AmbientHack", loaded);
+        LOG_INFO("AudioService: registered %d ambient sounds from P$AmbientHack", loaded);
     }
 }
 
@@ -1645,35 +1620,50 @@ void AudioService::updateAmbientVolumes()
     }
 
     for (auto &amb : mAmbients) {
-        if (amb.handle == SOUND_HANDLE_INVALID)
-            continue;
-
-        auto it = mVoices.find(amb.handle);
-        if (it == mVoices.end()) {
-            amb.handle = SOUND_HANDLE_INVALID;
-            continue;
-        }
-
-        // Distance-based volume falloff within the ambient's radius.
-        // Volume is 0 at the radius boundary, full at the source position.
         float dist = glm::length(mListenerPos - amb.position);
-        float vol = 0.0f;
+        bool inRange = (amb.radius > 0.0f && dist < amb.radius);
 
-        if (amb.radius > 0.0f && dist < amb.radius) {
-            // Linear falloff: 1.0 at center, 0.0 at radius
-            float falloff = 1.0f - (dist / amb.radius);
-
-            // Smooth the falloff curve (quadratic) for more natural fade
-            if (!(amb.flags & AMB_NO_FADE)) {
-                falloff *= falloff;
+        if (inRange) {
+            // Start voice if not already playing
+            if (amb.handle == SOUND_HANDLE_INVALID) {
+                bool isLooping = !(amb.flags & AMB_ONCE_ONLY);
+                if (mSchemaParser) {
+                    const SchemaEntry *schema = mSchemaParser->findSchema(amb.schemaName);
+                    if (schema && !schema->samples.empty()) {
+                        const SchemaSample &sample = schema->samples[0];
+                        amb.handle = startVoice(amb.schemaName, sample.name, amb.position,
+                                                schema->playParams.priority, isLooping, amb.objID);
+                    }
+                }
+                // Fallback: try loading schema name as a raw sound
+                if (amb.handle == SOUND_HANDLE_INVALID) {
+                    amb.handle = startVoice(amb.schemaName, amb.schemaName, amb.position,
+                                            64, isLooping, amb.objID);
+                }
             }
 
-            // Apply the ambient's volume parameter
-            float baseVol = schemaVolumeToLinear(amb.volume);
-            vol = baseVol * falloff;
-        }
+            // Update volume based on distance
+            if (amb.handle != SOUND_HANDLE_INVALID) {
+                auto it = mVoices.find(amb.handle);
+                if (it == mVoices.end()) {
+                    amb.handle = SOUND_HANDLE_INVALID;
+                    continue;
+                }
 
-        ma_sound_set_volume(&it->second->sound, vol);
+                float falloff = 1.0f - (dist / amb.radius);
+                if (!(amb.flags & AMB_NO_FADE)) {
+                    falloff *= falloff;  // quadratic curve for natural fade
+                }
+                float baseVol = schemaVolumeToLinear(amb.volume);
+                ma_sound_set_volume(&it->second->sound, baseVol * falloff);
+            }
+        } else {
+            // Out of range — stop voice to free the slot and DSP resources
+            if (amb.handle != SOUND_HANDLE_INVALID) {
+                haltSound(amb.handle);
+                amb.handle = SOUND_HANDLE_INVALID;
+            }
+        }
     }
 }
 
@@ -1698,21 +1688,53 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
     bool isWater = mPlayerInWater;
 
     if (isWater) {
-        material = "water";
+        material = "Liquid";  // Schema material name for water surfaces
     } else {
-        // Look up material keyword from texture index
-        material = "stone";  // default fallback
+        // Look up acoustic keyword from texture index, then map to schema Material name.
+        // AcousticMaterials returns internal keywords (e.g., "concrete", "brick", "dirt")
+        // but schemas use Dark Engine material names (e.g., "Stone", "Earth", "Metal").
+        std::string keyword = "generic";
         if (textureIdx >= 0 && textureIdx < static_cast<int>(mTextureMaterials.size())) {
             const std::string &m = mTextureMaterials[textureIdx];
-            if (!m.empty() && m != "generic") {
-                material = m;
-            }
+            if (!m.empty()) keyword = m;
+        }
+
+        // Map acoustic keywords → schema Material enum values
+        if (keyword == "stone" || keyword == "concrete" || keyword == "brick" ||
+            keyword == "plaster" || keyword == "rock" || keyword == "floor" ||
+            keyword == "roof") {
+            material = "Stone";
+        } else if (keyword == "metal" || keyword == "metl" || keyword == "rust" ||
+                   keyword == "iron" || keyword == "gate" || keyword == "grate" ||
+                   keyword == "plate" || keyword == "pipe" || keyword == "steel" ||
+                   keyword == "bronze") {
+            material = "Metal";
+        } else if (keyword == "wood" || keyword == "door" || keyword == "bark") {
+            material = "Wood";
+        } else if (keyword == "tile") {
+            material = "Tile";
+        } else if (keyword == "ceramic") {
+            material = "Ceramic";
+        } else if (keyword == "glass") {
+            material = "Glass";
+        } else if (keyword == "carpet" || keyword == "rug") {
+            material = "Carpet";
+        } else if (keyword == "gravel") {
+            material = "Gravel";
+        } else if (keyword == "earth" || keyword == "dirt" || keyword == "mud") {
+            material = "Earth";
+        } else if (keyword == "ice") {
+            material = "Ice";
+        } else if (keyword == "hay" || keyword == "vine" || keyword == "leaf") {
+            material = "Vegetation";
+        } else {
+            material = "Stone";  // safe default — most common surface in Thief
         }
     }
 
-    // Build env_tag query: (Event Footstep) + (Material <keyword>)
-    // This matches schemas with env_tag like:
-    //   env_tag (Event Footstep) (Material Stone)
+    // Build env_tag query to match schemas like:
+    //   env_tag (Event Footstep) (CreatureType Player) (Material Stone)
+    // CreatureType Player is required — all player footstep schemas include it.
     // For water footsteps, also adds (MediaLevel Foot) tag.
     std::vector<SchemaTagValue> query;
     {
@@ -1720,6 +1742,12 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
         eventTag.tagName = "Event";
         eventTag.enumValues.push_back("Footstep");
         query.push_back(std::move(eventTag));
+
+        // CreatureType Player — required by all player footstep schemas
+        SchemaTagValue creatureTag;
+        creatureTag.tagName = "CreatureType";
+        creatureTag.enumValues.push_back("Player");
+        query.push_back(std::move(creatureTag));
 
         SchemaTagValue matTag;
         matTag.tagName = "Material";
@@ -1738,7 +1766,8 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
     // Find matching schemas via env_tag matching
     auto matches = mSchemaParser->findByEnvTags(query);
     if (matches.empty()) {
-        LOG_DEBUG("AudioService: no footstep schema for material '%s'", material.c_str());
+        LOG_DEBUG("AudioService: no footstep schema for material '%s' (texIdx=%d)",
+                  material.c_str(), textureIdx);
         return;
     }
 
@@ -1784,6 +1813,127 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
     mLastSampleIdx[schema->name] = idx;
 
     const SchemaSample &sample = schema->samples[idx];
+
+    SoundHandle h = startVoice(schema->name, sample.name, pos,
+                               schema->playParams.priority, false, 0);
+
+    if (h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
+        ma_sound_set_volume(&mVoices[h]->sound, finalVol);
+    }
+}
+
+//------------------------------------------------------
+void AudioService::playLanding(const Vector3 &pos, float fallSpeed, int textureIdx)
+{
+    if (!mAudioReady || !mSchemaParser)
+        return;
+
+    // Determine material (same mapping as playFootstep)
+    std::string material;
+    bool isWater = mPlayerInWater;
+
+    if (isWater) {
+        material = "Liquid";
+    } else {
+        std::string keyword = "generic";
+        if (textureIdx >= 0 && textureIdx < static_cast<int>(mTextureMaterials.size())) {
+            const std::string &m = mTextureMaterials[textureIdx];
+            if (!m.empty()) keyword = m;
+        }
+
+        if (keyword == "stone" || keyword == "concrete" || keyword == "brick" ||
+            keyword == "plaster" || keyword == "rock" || keyword == "floor" ||
+            keyword == "roof") {
+            material = "Stone";
+        } else if (keyword == "metal" || keyword == "metl" || keyword == "rust" ||
+                   keyword == "iron" || keyword == "gate" || keyword == "grate" ||
+                   keyword == "plate" || keyword == "pipe" || keyword == "steel" ||
+                   keyword == "bronze") {
+            material = "Metal";
+        } else if (keyword == "wood" || keyword == "door" || keyword == "bark") {
+            material = "Wood";
+        } else if (keyword == "tile") {
+            material = "Tile";
+        } else if (keyword == "ceramic") {
+            material = "Ceramic";
+        } else if (keyword == "glass") {
+            material = "Glass";
+        } else if (keyword == "carpet" || keyword == "rug") {
+            material = "Carpet";
+        } else if (keyword == "gravel") {
+            material = "Gravel";
+        } else if (keyword == "earth" || keyword == "dirt" || keyword == "mud") {
+            material = "Earth";
+        } else if (keyword == "ice") {
+            material = "Ice";
+        } else if (keyword == "hay" || keyword == "vine" || keyword == "leaf") {
+            material = "Vegetation";
+        } else {
+            material = "Stone";
+        }
+    }
+
+    // Build env_tag query: (Event Footstep) (Landing True) (CreatureType Player) (Material ...)
+    std::vector<SchemaTagValue> query;
+    {
+        SchemaTagValue eventTag;
+        eventTag.tagName = "Event";
+        eventTag.enumValues.push_back("Footstep");
+        query.push_back(std::move(eventTag));
+
+        SchemaTagValue landingTag;
+        landingTag.tagName = "Landing";
+        landingTag.enumValues.push_back("True");
+        query.push_back(std::move(landingTag));
+
+        SchemaTagValue creatureTag;
+        creatureTag.tagName = "CreatureType";
+        creatureTag.enumValues.push_back("Player");
+        query.push_back(std::move(creatureTag));
+
+        SchemaTagValue matTag;
+        matTag.tagName = "Material";
+        matTag.enumValues.push_back(material);
+        query.push_back(std::move(matTag));
+
+        if (isWater) {
+            SchemaTagValue mediaTag;
+            mediaTag.tagName = "MediaLevel";
+            mediaTag.enumValues.push_back("Foot");
+            query.push_back(std::move(mediaTag));
+        }
+    }
+
+    auto matches = mSchemaParser->findByEnvTags(query);
+    if (matches.empty()) {
+        LOG_DEBUG("AudioService: no landing schema for material '%s'", material.c_str());
+        return;
+    }
+
+    const SchemaEntry *schema = matches[0];
+
+    // Volume scales with fall velocity — harder falls are louder.
+    // Dark Engine uses SCH_ADD_VOLUME: the computed volume is added to the
+    // schema's base volume. Formula: playVol = baseVol + volMul * (fallSpeed - cutoff)
+    // Higher fallSpeed → less negative playVol → louder overall.
+    constexpr int LANDING_BASE_VOL = -1000;  // millibels
+    constexpr int LANDING_VOL_MUL = 250;     // millibels per unit/sec
+    constexpr float LANDING_CUTOFF_VEL = 2.0f;
+    int playVol = LANDING_BASE_VOL +
+        LANDING_VOL_MUL * static_cast<int>(fallSpeed - LANDING_CUTOFF_VEL);
+    if (playVol > -1) playVol = -1;
+
+    // Additive: schema volume + velocity-scaled volume (both in millibels)
+    int totalMillibels = schema->playParams.volume + playVol;
+    if (totalMillibels > -1) totalMillibels = -1;
+
+    float finalVol = schemaVolumeToLinear(totalMillibels);
+
+    if (schema->samples.empty())
+        return;
+
+    // Landing schemas typically have a single sample (e.g., ftroc_j)
+    const SchemaSample &sample = schema->samples[0];
 
     SoundHandle h = startVoice(schema->name, sample.name, pos,
                                schema->playParams.priority, false, 0);

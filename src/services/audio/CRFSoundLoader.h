@@ -22,15 +22,20 @@
 // CRF sound loader — loads WAV sounds from snd.crf (ZIP) archives via zziplib.
 // Follows the same zziplib pattern as CRFTextureLoader (originally from OPDE).
 //
-// Sound samples in snd.crf are organized as:
-//   SFX/<name>.WAV        — sound effects (footsteps, doors, ambient, etc.)
-//   <character>/english/<name>.WAV  — character voice lines
+// Sound samples in snd.crf are organized under many subdirectories:
+//   SFX/     — sound effects (ambient, impacts, machinery, etc.)
+//   Feet/    — footstep sounds (player + AI, all surface types)
+//   Doors/   — door open/close sounds
+//   <character>/english/  — character voice lines (Garrett, Guard, etc.)
+//   ...and more (see snd.crf listing for full set)
 //
 // Schema files reference sounds by bare name (no path, no extension).
-// Lookup is case-insensitive via ZZIP_CASELESS.
+// At load time, we build an index of all WAV files in the archive so
+// any bare name resolves instantly to its full CRF path.
 
 #pragma once
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <string>
@@ -62,7 +67,9 @@ public:
             std::fprintf(stderr, "CRFSoundLoader: Failed to open %s (error %d)\n",
                          crfPath.c_str(), err);
         } else {
-            std::fprintf(stderr, "CRFSoundLoader: Opened %s\n", crfPath.c_str());
+            buildIndex();
+            std::fprintf(stderr, "CRFSoundLoader: Opened %s (%zu files indexed)\n",
+                         crfPath.c_str(), mNameIndex.size());
         }
     }
 
@@ -78,19 +85,25 @@ public:
     bool isOpen() const { return mDir != nullptr; }
 
     /// Load a sound by bare name (as referenced in .sch schema files).
-    /// Tries multiple path patterns to find the file:
-    ///   1. SFX/<name>.WAV  (sound effects)
-    ///   2. <name>.WAV      (root level)
-    /// For voice lines, use loadVoiceLine() instead.
+    /// Uses the pre-built filename index to resolve the bare name to its
+    /// full path within the CRF archive, regardless of subdirectory.
     SoundData loadSound(const std::string &name) {
         if (!mDir) return {};
 
-        // Search paths for sound effects (most common case)
+        // Look up bare name (case-insensitive) in the index
+        std::string key = name;
+        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+
+        auto it = mNameIndex.find(key);
+        if (it != mNameIndex.end()) {
+            return readFile(it->second, name);
+        }
+
+        // Fallback: try explicit paths (legacy behavior)
         std::string paths[] = {
             "SFX/" + name + ".WAV",
             name + ".WAV",
         };
-
         for (const auto &path : paths) {
             SoundData result = readFile(path, name);
             if (result.valid()) return result;
@@ -118,6 +131,33 @@ public:
     }
 
 private:
+    /// Build a case-insensitive index of bare filename → full CRF path
+    /// for all WAV files in the archive. Called once at load time.
+    void buildIndex() {
+        ZZIP_DIRENT entry;
+        while (zzip_dir_read(mDir, &entry)) {
+            std::string fullPath(entry.d_name);
+            // Only index .WAV files
+            if (fullPath.size() < 4) continue;
+            std::string ext = fullPath.substr(fullPath.size() - 4);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext != ".wav") continue;
+
+            // Extract bare filename (strip directory and extension)
+            size_t lastSlash = fullPath.rfind('/');
+            std::string bareName = (lastSlash != std::string::npos)
+                ? fullPath.substr(lastSlash + 1) : fullPath;
+            // Strip .WAV extension
+            bareName = bareName.substr(0, bareName.size() - 4);
+            std::transform(bareName.begin(), bareName.end(), bareName.begin(), ::tolower);
+
+            // First entry wins (if duplicates exist across subdirectories)
+            if (mNameIndex.find(bareName) == mNameIndex.end()) {
+                mNameIndex[bareName] = fullPath;
+            }
+        }
+    }
+
     /// Read a file from the CRF archive by path (case-insensitive).
     SoundData readFile(const std::string &path, const std::string &name) {
         ZZIP_FILE *fp = zzip_file_open(mDir, path.c_str(), ZZIP_CASELESS);
@@ -153,6 +193,9 @@ private:
     }
 
     ZZIP_DIR *mDir;
+
+    /// Bare filename (lowercase, no extension) → full CRF path (e.g., "ftroc_p1" → "Feet/FTROC_P1.WAV")
+    std::unordered_map<std::string, std::string> mNameIndex;
 };
 
 /// LRU cache for decoded sound data.

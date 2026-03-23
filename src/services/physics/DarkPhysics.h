@@ -251,6 +251,11 @@ public:
         mPlayer.setFootstepCallback(mFootstepCb);
     }
 
+    void setLandingCallback(LandingCallback cb) override {
+        mLandingCb = std::move(cb);
+        mPlayer.setLandingCallback(mLandingCb);
+    }
+
     int getPlayerMode() const override {
         return static_cast<int>(mPlayer.getMode());
     }
@@ -373,7 +378,8 @@ private:
 
     Vector3 mGravity;                // world gravity vector
     ContactCallback mContactCb;      // optional contact notification callback
-    FootstepCallback mFootstepCb;    // optional footstep sound callback
+    FootstepCallback mFootstepCb;    // footstep sound callback
+    LandingCallback mLandingCb;      // landing impact sound callback
 
     // Stored body descriptors for deferred ODE integration (Task 26)
     std::unordered_map<EntityID, PhysicsBodyDesc> mBodyDescs;

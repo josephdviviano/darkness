@@ -1700,12 +1700,15 @@ int main(int argc, char *argv[]) {
         }
         audioSvc->setTextureMaterials(std::move(materials));
 
-        // Register footstep callback with physics — plays material-appropriate
-        // footstep sounds when the player's stride triggers a footfall event.
+        // Register footstep and landing callbacks with physics
         if (state.physics) {
             state.physics->setFootstepCallback(
                 [audioSvc](const Darkness::Vector3 &pos, float speed, int matIdx) {
                     audioSvc->playFootstep(pos, speed, matIdx);
+                });
+            state.physics->setLandingCallback(
+                [audioSvc](const Darkness::Vector3 &pos, float fallSpeed, int matIdx) {
+                    audioSvc->playLanding(pos, fallSpeed, matIdx);
                 });
         }
     }
