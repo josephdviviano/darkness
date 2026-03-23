@@ -31,8 +31,6 @@
 #include <chrono>
 #include <map>
 #include <unordered_map>
-#include <unordered_set>
-#include <queue>
 #include <unistd.h> // dup2, fileno
 
 #include <SDL.h>
@@ -146,17 +144,18 @@ static void printHelp() {
         "  Home           Teleport to player spawn point\n"
         "  Esc            Quit\n"
         "\n"
-        "Debug shortcuts (hold Backspace + key):\n"
-        "  BS+P           Toggle physics mode (walk with gravity/fly noclip)\n"
-        "  BS+C           Toggle portal culling on/off\n"
-        "  BS+F           Cycle texture filtering (point/bilinear/trilinear/aniso)\n"
-        "  BS+L           Toggle lightmap filtering (bilinear/bicubic)\n"
-        "  BS+V           Toggle camera collision (clip/noclip) [fly mode only]\n"
-        "  BS+M/N         Cycle model isolation (next/prev)\n"
-        "  BS+G           Toggle physics diagnostic log (physics_log.csv)\n"
-        "  BS+R           Toggle raycast debug visualization\n"
+        "Debug console (` backtick to open):\n"
+        "  portal_culling     Toggle portal culling on/off\n"
+        "  filter_mode        Cycle texture filtering (point/bilinear/trilinear/aniso)\n"
+        "  lightmap_filtering Toggle lightmap filtering (bilinear/bicubic)\n"
+        "  camera_collision   Toggle camera collision (clip/noclip) [fly mode only]\n"
+        "  physics_mode       Toggle physics mode (walk with gravity/fly noclip)\n"
+        "  isolate_model      Cycle model isolation\n"
+        "  physics_log        Toggle physics diagnostic log (physics_log.csv)\n"
+        "  show_raycast       Toggle raycast debug visualization\n"
+        "  refl_enabled       Toggle audio reflections (convolution reverb)\n"
         "\n"
-        "Physics mode controls (when BS+P is active):\n"
+        "Physics mode controls (when physics_mode is on):\n"
         "  WASD           Walk forward/strafe\n"
         "  Space           Jump (when on ground)\n"
         "  C               Crouch (toggle)\n"
@@ -425,11 +424,13 @@ static void renderDebugOverlay(
     const Darkness::MissionData &mission,
     const Darkness::RuntimeState &state)
 {
-    if (!state.showRaycast) return;
+    if (!state.showRaycast && !state.showAcousticMesh) return;
 
     // Set up view 2 with same transform as view 1
     bgfx::setViewTransform(2, fc.view, fc.proj);
 
+    // ── Raycast debug lines ──
+    if (state.showRaycast) {
     // Compute camera forward direction (same as Camera::getViewMatrix)
     float cosPitch = std::cos(state.cam.pitch);
     float fwdX = std::cos(state.cam.yaw) * cosPitch;
@@ -520,6 +521,24 @@ static void renderDebugOverlay(
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
         bgfx::submit(2, gpu.flatProgram);
     }
+    // Acoustic mesh wireframe overlay
+    if (state.showAcousticMesh && bgfx::isValid(state.acousticVBH)) {
+        float identity[16];
+        bx::mtxIdentity(identity);
+        bgfx::setTransform(identity);
+        bgfx::setVertexBuffer(0, state.acousticVBH, 0, state.acousticLineCount);
+        uint64_t wireState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                           | BGFX_STATE_PT_LINES
+                           | BGFX_STATE_BLEND_ALPHA
+                           | BGFX_STATE_DEPTH_TEST_LESS;
+        bgfx::setState(wireState);
+        float noFog[4] = {0, 0, 0, 0};
+        bgfx::setUniform(gpu.u_fogColor, noFog);
+        bgfx::setUniform(gpu.u_fogParams, noFog);
+        float opaqueParams[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+        bgfx::submit(2, gpu.flatProgram);
+    }
 
     // HUD text overlay showing raycast results
     bgfx::setDebug(BGFX_DEBUG_TEXT);
@@ -532,7 +551,7 @@ static void renderDebugOverlay(
     uint8_t hud_attr = 0x0F; // white on black
     uint8_t val_attr = 0x0A; // green on black
 
-    bgfx::dbgTextPrintf(2, 1, hud_attr, "RAYCAST DEBUG (Backspace+R to toggle)");
+    bgfx::dbgTextPrintf(2, 1, hud_attr, "RAYCAST DEBUG (` > show_raycast to toggle)");
 
     if (rayDidHit) {
         bgfx::dbgTextPrintf(2, 3, val_attr, "Hit:     YES");
@@ -558,6 +577,7 @@ static void renderDebugOverlay(
     int32_t camCellIdx = findCameraCell(mission.wrData, state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
     bgfx::dbgTextPrintf(2, 10, hud_attr, "Camera:  (%.2f, %.2f, %.2f)  cell=%d",
         state.cam.pos[0], state.cam.pos[1], state.cam.pos[2], camCellIdx);
+    } // end showRaycast
 }
 
 // ── Object rendering ──
@@ -782,24 +802,27 @@ static void registerConsoleSettings(
 
     dbgConsole.addBool("portal_culling",
         [&state]() { return state.portalCulling; },
-        [&state, refreshTitle](bool v) { state.portalCulling = v; refreshTitle(); });
+        [&state, refreshTitle](bool v) { state.portalCulling = v; refreshTitle(); },
+        "BFS portal traversal culling (reduces draw calls)");
 
     dbgConsole.addBool("camera_collision",
         [&state]() { return state.cameraCollision; },
-        [&state, refreshTitle](bool v) { state.cameraCollision = v; refreshTitle(); });
+        [&state, refreshTitle](bool v) { state.cameraCollision = v; refreshTitle(); },
+        "Sphere collision against world geometry (noclip when off)");
 
     dbgConsole.addBool("physics_mode",
         [&state]() { return state.physicsMode; },
         [&state, refreshTitle](bool v) {
             state.physicsMode = v;
-            // When entering physics mode, teleport player to current camera position
+            state.crouchToggled = false;
             if (v && state.physics) {
                 Darkness::Vector3 bodyPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
                 state.physics->setPlayerPosition(bodyPos);
                 state.physics->setPlayerYaw(state.cam.yaw);
             }
             refreshTitle();
-        });
+        },
+        "Walk mode (on) vs fly/noclip mode (off)");
 
     dbgConsole.addCategorical("physics_rate",
         {"12.5Hz (vintage)", "60Hz (modern)", "120Hz (ultra)"},
@@ -821,39 +844,189 @@ static void registerConsoleSettings(
 
     dbgConsole.addBool("show_objects",
         [&state]() { return state.showObjects; },
-        [&state](bool v) { state.showObjects = v; });
+        [&state](bool v) { state.showObjects = v; },
+        "Render object meshes (.bin models from obj.crf)");
 
     dbgConsole.addBool("show_fallback_cubes",
         [&state]() { return state.showFallbackCubes; },
-        [&state](bool v) { state.showFallbackCubes = v; });
+        [&state](bool v) { state.showFallbackCubes = v; },
+        "Show colored cubes for objects with missing models");
 
     dbgConsole.addBool("show_raycast",
         [&state]() { return state.showRaycast; },
-        [&state](bool v) { state.showRaycast = v; });
+        [&state](bool v) { state.showRaycast = v; },
+        "Debug ray visualization from camera center");
 
     dbgConsole.addBool("step_log",
         [&state]() { return state.physics ? state.physics->getPlayerPhysics().stepLogEnabled() : false; },
-        [&state](bool v) { if (state.physics) state.physics->getPlayerPhysics().setStepLog(v); });
+        [&state](bool v) { if (state.physics) state.physics->getPlayerPhysics().setStepLog(v); },
+        "Log stair-step diagnostics to stderr ([STEP] prefix)");
+
+    dbgConsole.addBool("physics_log",
+        [&state]() { return state.physics ? state.physics->getPlayerPhysics().isLogging() : false; },
+        [&state](bool v) {
+            if (!state.physics) return;
+            auto &player = state.physics->getPlayerPhysics();
+            if (v) player.startLog("physics_log.csv");
+            else   player.stopLog();
+        },
+        "Write per-timestep physics data to physics_log.csv");
+
+    // Model isolation: "all" = show everything, then one entry per loaded model name.
+    // sortedModelNames is populated during init before this registration runs.
+    {
+        std::vector<std::string> modelOpts = {"all"};
+        modelOpts.insert(modelOpts.end(),
+                         state.sortedModelNames.begin(),
+                         state.sortedModelNames.end());
+        dbgConsole.addCategorical("isolate_model", modelOpts,
+            [&state]() { return state.isolateModelIdx + 1; },  // -1 → 0 ("all")
+            [&state, window](int v) {
+                state.isolateModelIdx = v - 1;  // 0 → -1 ("all")
+                if (state.isolateModelIdx >= 0 &&
+                    state.isolateModelIdx < static_cast<int>(state.sortedModelNames.size())) {
+                    const auto &isoName = state.sortedModelNames[state.isolateModelIdx];
+                    auto cit = state.modelInstanceCounts.find(isoName);
+                    int cnt = (cit != state.modelInstanceCounts.end()) ? cit->second : 0;
+                    std::fprintf(stderr, "Isolating model [%d/%zu]: '%s' (%d instances)\n",
+                                 state.isolateModelIdx + 1, state.sortedModelNames.size(),
+                                 isoName.c_str(), cnt);
+                } else {
+                    std::fprintf(stderr, "Model isolation: OFF (showing all)\n");
+                }
+                updateTitleBar(window, state);
+            });
+    }
 
     dbgConsole.addFloat("move_speed", 1.0f, 500.0f,
         [&state]() { return state.moveSpeed; },
-        [&state, refreshTitle](float v) { state.moveSpeed = v; refreshTitle(); });
+        [&state, refreshTitle](float v) { state.moveSpeed = v; refreshTitle(); },
+        "Camera/fly movement speed (world units/sec)");
 
     dbgConsole.addFloat("wave_amplitude", 0.0f, 5.0f,
         [&state]() { return state.waveAmplitude; },
-        [&state](float v) { state.waveAmplitude = v; });
+        [&state](float v) { state.waveAmplitude = v; },
+        "Water vertex wave displacement (0=flat)");
 
     dbgConsole.addFloat("uv_distortion", 0.0f, 0.5f,
         [&state]() { return state.uvDistortion; },
-        [&state](float v) { state.uvDistortion = v; });
+        [&state](float v) { state.uvDistortion = v; },
+        "Water UV texture wobble strength");
 
     dbgConsole.addFloat("water_rotation", 0.0f, 0.5f,
         [&state]() { return state.waterRotation; },
-        [&state](float v) { state.waterRotation = v; });
+        [&state](float v) { state.waterRotation = v; },
+        "Water UV rotation speed (rad/s)");
 
     dbgConsole.addFloat("water_scroll", 0.0f, 1.0f,
         [&state]() { return state.waterScrollSpeed; },
-        [&state](float v) { state.waterScrollSpeed = v; });
+        [&state](float v) { state.waterScrollSpeed = v; },
+        "Water UV scroll speed (world units/s)");
+
+    // ── Audio reflection settings ──
+
+    dbgConsole.addBool("refl_enabled",
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getReflectionsEnabled() : false;
+        },
+        [](bool v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setReflectionsEnabled(v);
+        },
+        "Steam Audio convolution reverb (per-source reflections)");
+
+    dbgConsole.addFloat("refl_rays", 128.0f, 8192.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? static_cast<float>(svc->getReflectionNumRays()) : 4096.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setReflectionNumRays(static_cast<int>(v));
+        },
+        "Rays per reflection sim step (background thread)");
+
+    dbgConsole.addFloat("refl_bounces", 1.0f, 8.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? static_cast<float>(svc->getReflectionNumBounces()) : 4.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setReflectionNumBounces(static_cast<int>(v));
+        },
+        "Bounces per ray (more = multi-room reverb propagation)");
+
+    dbgConsole.addFloat("refl_duration", 0.5f, 4.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getReflectionDuration() : 2.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setReflectionDuration(v);
+        },
+        "Max reverb tail length in seconds");
+
+    dbgConsole.addFloat("refl_throttle", 1.0f, 32.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? static_cast<float>(svc->getReflectionThrottle()) : 4.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setReflectionThrottle(static_cast<int>(v));
+        },
+        "Run reflection sim every Nth frame (higher = less CPU)");
+
+    dbgConsole.addFloat("refl_tri_count", 0.0f, 999999.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? static_cast<float>(svc->getAcousticSceneTriCount()) : 0.0f;
+        },
+        [](float) { /* read-only */ },
+        "Triangles in acoustic scene (read-only)");
+
+    dbgConsole.addFloat("refl_max_voices", 1.0f, 32.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? static_cast<float>(svc->getMaxReflectionVoices()) : 4.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setMaxReflectionVoices(static_cast<int>(v));
+        },
+        "Max active voices with convolution reverb (~3ms each at half-rate)");
+
+    dbgConsole.addFloat("refl_sample_rate", 0.0f, 48000.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? static_cast<float>(svc->getReflectionSampleRate()) : 48000.0f;
+        },
+        [](float) { /* read-only */ },
+        "Reflection pipeline sample rate (read-only, set via YAML)");
+
+    dbgConsole.addFloat("refl_ambi_order", 0.0f, 1.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? static_cast<float>(svc->getAmbisonicsOrder()) : 0.0f;
+        },
+        [](float) { /* read-only */ },
+        "Ambisonics order: 0=omnidirectional 1=directional (read-only, set via YAML)");
+
+    dbgConsole.addFloat("transmission_scale", 0.1f, 100.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getTransmissionScale() : 10.0f;
+        },
+        [](float) { /* read-only — set via YAML, requires scene rebuild */ },
+        "Material transmission multiplier (1=physical, 10=audible through walls, set via YAML)");
+
+    dbgConsole.addBool("show_acoustic_mesh",
+        [&state]() { return state.showAcousticMesh; },
+        [&state](bool v) { state.showAcousticMesh = v; },
+        "Cyan wireframe overlay of the acoustic scene geometry");
 }
 
 // ── Event handling ──
@@ -915,98 +1088,6 @@ static void handleEvents(
             std::fprintf(stderr, "Teleported to spawn (%.1f, %.1f, %.1f)\n",
                          state.spawnX, state.spawnY, state.spawnZ);
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c
-                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-            // Backspace+C: Toggle portal culling
-            state.portalCulling = !state.portalCulling;
-            std::fprintf(stderr, "Portal culling: %s\n",
-                         state.portalCulling ? "ON" : "OFF");
-        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_f
-                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-            // Backspace+F: Cycle texture filtering
-            state.filterMode = (state.filterMode + 1) % 4;
-            const char *filterNames[] = {
-                "point (crispy)", "bilinear", "trilinear", "anisotropic"
-            };
-            std::fprintf(stderr, "Texture filtering: %s\n", filterNames[state.filterMode]);
-        } else if (ev.type == SDL_KEYDOWN
-                   && (ev.key.keysym.sym == SDLK_m || ev.key.keysym.sym == SDLK_n)
-                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-            // Model isolation: M = next model, N = previous model.
-            // Cycles through sorted model names, isolating one at a time.
-            // Past the last/first model returns to "show all" mode.
-            bool forward = (ev.key.keysym.sym == SDLK_m);
-            if (state.sortedModelNames.empty()) {
-                std::fprintf(stderr, "No models loaded for isolation\n");
-            } else {
-                if (forward) {
-                    state.isolateModelIdx++;
-                    if (state.isolateModelIdx >= static_cast<int>(state.sortedModelNames.size()))
-                        state.isolateModelIdx = -1;
-                } else {
-                    state.isolateModelIdx--;
-                    if (state.isolateModelIdx < -1)
-                        state.isolateModelIdx = static_cast<int>(state.sortedModelNames.size()) - 1;
-                }
-                if (state.isolateModelIdx < 0) {
-                    std::fprintf(stderr, "Model isolation: OFF (showing all)\n");
-                } else {
-                    const auto &isoName = state.sortedModelNames[state.isolateModelIdx];
-                    auto cit = state.modelInstanceCounts.find(isoName);
-                    int cnt = (cit != state.modelInstanceCounts.end()) ? cit->second : 0;
-                    std::fprintf(stderr, "Isolating model [%d/%zu]: '%s' (%d instances)\n",
-                                 state.isolateModelIdx + 1, state.sortedModelNames.size(),
-                                 isoName.c_str(), cnt);
-                }
-                updateTitleBar(window, state);
-            }
-        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_v
-                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-            // Backspace+V: Toggle camera collision with world geometry
-            state.cameraCollision = !state.cameraCollision;
-            std::fprintf(stderr, "Camera collision: %s\n",
-                         state.cameraCollision ? "ON (clip)" : "OFF (noclip)");
-            updateTitleBar(window, state);
-        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_l
-                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-            // Backspace+L: Toggle lightmap filtering (bilinear ↔ bicubic)
-            state.lightmapFiltering = (state.lightmapFiltering + 1) % 2;
-            const char *lmNames[] = { "bilinear", "bicubic" };
-            std::fprintf(stderr, "Lightmap filtering: %s\n", lmNames[state.lightmapFiltering]);
-            updateTitleBar(window, state);
-        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_r
-                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-            // Backspace+R: Toggle debug raycast visualization
-            state.showRaycast = !state.showRaycast;
-            std::fprintf(stderr, "Raycast debug: %s\n",
-                         state.showRaycast ? "ON" : "OFF");
-        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_g
-                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]
-                   && state.physics) {
-            // Backspace+G: Toggle per-timestep physics diagnostic logging
-            auto &player = state.physics->getPlayerPhysics();
-            if (player.isLogging()) {
-                player.stopLog();
-            } else {
-                player.startLog("physics_log.csv");
-            }
-        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_p
-                   && SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]) {
-            // Backspace+P: Toggle physics mode (walk vs fly)
-            state.physicsMode = !state.physicsMode;
-            state.crouchToggled = false;  // reset crouch when toggling physics mode
-            if (state.physicsMode && state.physics) {
-                // Enter physics mode: teleport player to current camera position.
-                // Use camera position directly as body center — gravity will
-                // settle the player to the correct standing height.
-                Darkness::Vector3 bodyPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
-                state.physics->setPlayerPosition(bodyPos);
-                state.physics->setPlayerYaw(state.cam.yaw);
-            }
-            std::fprintf(stderr, "Physics mode: %s\n",
-                         state.physicsMode ? "ON (walk)" : "OFF (fly)");
-            updateTitleBar(window, state);
-        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c
-                   && !SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_BACKSPACE]
                    && state.physicsMode) {
             // C in physics mode: toggle crouch on/off
             state.crouchToggled = !state.crouchToggled;
@@ -1024,8 +1105,8 @@ static void handleEvents(
 // ── Movement update ──
 // WASD + vertical movement, suppressed while debug console is open.
 // Two modes:
-//   Fly mode (default): free camera with optional sphere collision (Backspace+V)
-//   Physics mode (Backspace+P): gravity, ground detection, constraint collision
+//   Fly mode (default): free camera with optional sphere collision (camera_collision)
+//   Physics mode: gravity, ground detection, constraint collision (physics_mode)
 static void updateMovement(
     float dt, Darkness::RuntimeState &state,
     const Darkness::MissionData &mission,
@@ -1523,13 +1604,14 @@ int main(int argc, char *argv[]) {
     }
 
     // ── Build Steam Audio acoustic scene from WR world geometry ──
-    // Extract simplified mesh (solid polygons only, no portals/sky) and
-    // per-triangle texture names for acoustic material assignment.
+    // The full world mesh is only ~10K triangles — trivial for Steam Audio's
+    // BVH ray tracer. Build once at load time, no per-frame rebuilds needed.
     {
         Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
-        Darkness::AcousticSceneData sceneData;
 
         const auto &wr = mission.wrData;
+        Darkness::AcousticSceneData fullScene;
+
         for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
             const auto &cell = wr.cells[ci];
             int numSolid = cell.numPolygons - cell.numPortals;
@@ -1552,39 +1634,54 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                // Fan-triangulate the polygon (same winding as render mesh)
-                uint32_t baseVertex = static_cast<uint32_t>(
-                    sceneData.vertices.size() / 3);
+                // Fan-triangulate the polygon
+                uint32_t baseVertex =
+                    static_cast<uint32_t>(fullScene.vertices.size() / 3);
 
                 for (int vi = 0; vi < poly.count; ++vi) {
                     uint8_t idx = cell.polyIndices[pi][vi];
                     const auto &v = cell.vertices[idx];
-                    sceneData.vertices.push_back(v.x);
-                    sceneData.vertices.push_back(v.y);
-                    sceneData.vertices.push_back(v.z);
+                    fullScene.vertices.push_back(v.x);
+                    fullScene.vertices.push_back(v.y);
+                    fullScene.vertices.push_back(v.z);
                 }
 
                 for (int t = 1; t < poly.count - 1; ++t) {
-                    sceneData.indices.push_back(
+                    fullScene.indices.push_back(
                         static_cast<int32_t>(baseVertex));
-                    sceneData.indices.push_back(
+                    fullScene.indices.push_back(
                         static_cast<int32_t>(baseVertex + t + 1));
-                    sceneData.indices.push_back(
+                    fullScene.indices.push_back(
                         static_cast<int32_t>(baseVertex + t));
-                    sceneData.texNames.push_back(texName);
+                    fullScene.texNames.push_back(texName);
                 }
             }
         }
 
-        size_t numTris = sceneData.indices.size() / 3;
-        size_t numVerts = sceneData.vertices.size() / 3;
-        std::fprintf(stderr, "Acoustic mesh: %zu vertices, %zu triangles\n",
-                     numVerts, numTris);
+        size_t numTris = fullScene.indices.size() / 3;
+        size_t numVerts = fullScene.vertices.size() / 3;
+        std::fprintf(stderr, "Acoustic mesh: %zu vertices, %zu triangles (%u cells)\n",
+                     numVerts, numTris, wr.numCells);
 
-        if (!audioSvc->buildAcousticScene(sceneData)) {
+        // Apply audio config before building the acoustic scene
+        audioSvc->setHalfRateReflections(cfg.halfRateReflections);
+        audioSvc->setAmbisonicsOrder(cfg.ambisonicsOrder);
+        audioSvc->setMaxReflectionVoices(cfg.maxReflectionVoices);
+        audioSvc->setReflectionNumRays(cfg.reflectionNumRays);
+        audioSvc->setReflectionNumBounces(cfg.reflectionNumBounces);
+        audioSvc->setReflectionDuration(cfg.reflectionDuration);
+        audioSvc->setReflectionThrottle(cfg.reflectionThrottle);
+        audioSvc->setTransmissionScale(cfg.transmissionScale);
+
+        if (!audioSvc->buildAcousticScene(fullScene)) {
             std::fprintf(stderr, "WARNING: failed to build acoustic scene\n"
                                  "         Steam Audio spatialization disabled.\n");
         }
+
+        // Store acoustic mesh data for debug wireframe overlay.
+        // GPU buffer is created later after bgfx::init.
+        state.acousticVerts = fullScene.vertices;
+        state.acousticIndices = fullScene.indices;
     }
 
     // Inject raycaster into the world query facade — enables ray-vs-world
@@ -1746,6 +1843,36 @@ int main(int argc, char *argv[]) {
                             camX, camY, camZ)) {
         shutdownWindow(window);
         return 1;
+    }
+
+    // ── Create acoustic mesh debug wireframe buffer (after bgfx init) ──
+    if (!state.acousticIndices.empty()) {
+        size_t numTris = state.acousticIndices.size() / 3;
+        std::vector<Darkness::PosColorVertex> lineVerts;
+        lineVerts.reserve(numTris * 6);
+        uint32_t wireColor = 0x80FFFF00;  // ABGR: semi-transparent cyan
+        for (size_t t = 0; t < numTris; ++t) {
+            int32_t i0 = state.acousticIndices[t * 3 + 0];
+            int32_t i1 = state.acousticIndices[t * 3 + 1];
+            int32_t i2 = state.acousticIndices[t * 3 + 2];
+            float x0 = state.acousticVerts[i0*3], y0 = state.acousticVerts[i0*3+1], z0 = state.acousticVerts[i0*3+2];
+            float x1 = state.acousticVerts[i1*3], y1 = state.acousticVerts[i1*3+1], z1 = state.acousticVerts[i1*3+2];
+            float x2 = state.acousticVerts[i2*3], y2 = state.acousticVerts[i2*3+1], z2 = state.acousticVerts[i2*3+2];
+            lineVerts.push_back({x0,y0,z0,wireColor}); lineVerts.push_back({x1,y1,z1,wireColor});
+            lineVerts.push_back({x1,y1,z1,wireColor}); lineVerts.push_back({x2,y2,z2,wireColor});
+            lineVerts.push_back({x2,y2,z2,wireColor}); lineVerts.push_back({x0,y0,z0,wireColor});
+        }
+        state.acousticLineCount = static_cast<uint32_t>(lineVerts.size());
+        const bgfx::Memory *mem = bgfx::copy(lineVerts.data(),
+            static_cast<uint32_t>(lineVerts.size() * sizeof(Darkness::PosColorVertex)));
+        state.acousticVBH = bgfx::createVertexBuffer(mem, Darkness::PosColorVertex::layout);
+        std::fprintf(stderr, "Acoustic debug mesh: %zu tris, %u line verts\n",
+                     numTris, state.acousticLineCount);
+        // Free CPU-side data now that GPU buffer is created
+        state.acousticVerts.clear();
+        state.acousticVerts.shrink_to_fit();
+        state.acousticIndices.clear();
+        state.acousticIndices.shrink_to_fit();
     }
 
     // ── Initialize runtime state: mode string, model isolation, spawn/camera ──

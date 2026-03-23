@@ -50,6 +50,7 @@ enum class SettingType { Bool, Categorical, Float };
 // RenderConfig or any other concrete type.
 struct SettingDesc {
     std::string name;
+    std::string description;          // One-line help text shown when highlighted
     SettingType type;
     std::vector<std::string> options; // Bool: {"off","on"}, Categorical: named list
     float minVal = 0, maxVal = 0;     // Float range (ignored for other types)
@@ -72,9 +73,11 @@ public:
 
     void addBool(const std::string &name,
                  std::function<bool()> getter,
-                 std::function<void(bool)> setter) {
+                 std::function<void(bool)> setter,
+                 const std::string &desc = "") {
         SettingDesc sd;
         sd.name = name;
+        sd.description = desc;
         sd.type = SettingType::Bool;
         sd.options = {"off", "on"};
         sd.get = [getter]() { return getter() ? "on" : "off"; };
@@ -89,9 +92,11 @@ public:
     void addCategorical(const std::string &name,
                         const std::vector<std::string> &options,
                         std::function<int()> getter,
-                        std::function<void(int)> setter) {
+                        std::function<void(int)> setter,
+                        const std::string &desc = "") {
         SettingDesc sd;
         sd.name = name;
+        sd.description = desc;
         sd.type = SettingType::Categorical;
         sd.options = options;
         sd.get = [getter, options]() -> std::string {
@@ -111,9 +116,11 @@ public:
 
     void addFloat(const std::string &name, float minVal, float maxVal,
                   std::function<float()> getter,
-                  std::function<void(float)> setter) {
+                  std::function<void(float)> setter,
+                  const std::string &desc = "") {
         SettingDesc sd;
         sd.name = name;
+        sd.description = desc;
         sd.type = SettingType::Float;
         sd.minVal = minVal;
         sd.maxVal = maxVal;
@@ -340,6 +347,17 @@ public:
 
             // Bottom separator
             drawSeparator(COL0, sepBottomY, 50);
+
+            // Description of highlighted setting (if available)
+            if (selectedIdx_ >= 0 &&
+                selectedIdx_ < static_cast<int>(filteredIndices_.size())) {
+                auto &sel = settings_[filteredIndices_[selectedIdx_]];
+                if (!sel.description.empty()) {
+                    bgfx::dbgTextPrintf(COL0 + 1, helpY, ATTR_HINT,
+                        "%s", sel.description.c_str());
+                    helpY++;  // push help bar down
+                }
+            }
 
             // Help bar
             bgfx::dbgTextPrintf(COL0, helpY, ATTR_HELP,

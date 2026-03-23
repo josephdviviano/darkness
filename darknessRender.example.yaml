@@ -1,5 +1,5 @@
 # darknessRender configuration
-# Copy this file to darknessRender.yaml in your working directory.
+# Copy this file to  in your working directory.
 # CLI flags override any values set here.
 
 graphics:
@@ -78,3 +78,8 @@ developer:
   # Prints [STEP] messages for debugging stair-step logic
   # CLI: --step-log
   step_log: false
+
+
+audio:
+  half_rate_reflections: false
+  max_reflection_voices: 4

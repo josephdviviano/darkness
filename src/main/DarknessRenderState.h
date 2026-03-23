@@ -227,6 +227,14 @@ struct RuntimeState {
     // Portal culling stats (for title bar)
     uint32_t cullVisibleCells = 0;
     uint32_t cullTotalCells = 0;
+
+    // Debug: acoustic mesh wireframe overlay (toggle with 9 key)
+    bool showAcousticMesh = false;
+    std::vector<float> acousticVerts;     // x,y,z flat array
+    std::vector<int32_t> acousticIndices; // triangle indices
+    bgfx::VertexBufferHandle acousticVBH = BGFX_INVALID_HANDLE;
+    bgfx::IndexBufferHandle  acousticIBH = BGFX_INVALID_HANDLE;
+    uint32_t acousticLineCount = 0;
 };
 
 // ── FrameContext — Per-frame computed values ──

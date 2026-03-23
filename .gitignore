@@ -25,3 +25,7 @@ CMakeUserPresets.json
 
 # e.g., physics_log
 *.csv
+
+# config file
+
+darknessRender.yaml

@@ -26,6 +26,16 @@ struct RenderConfig {
     float waterRotation   = 0.015f;  // UV rotation speed in rad/s (0 = no rotation)
     float waterScrollSpeed = 0.05f;  // UV scroll speed in world units/s (0 = no drift)
 
+    // -- audio --
+    bool halfRateReflections = true;   // run reflection convolution at 24kHz (half rate)
+    int  maxReflectionVoices = 8;      // max ACTIVE voices with reflection convolution (tail voices are free)
+    int  ambisonicsOrder = 0;          // 0 = omnidirectional reverb (1ch, 4x cheaper), 1 = directional (4ch)
+    int  reflectionNumRays   = 1024;   // rays per reflection sim step (128–8192)
+    int  reflectionNumBounces = 4;     // bounces per ray (1–8)
+    float reflectionDuration = 2.0f;   // max reverb tail in seconds (0.5–4.0)
+    int  reflectionThrottle  = 4;      // run reflection sim every Nth frame (1–32)
+    float transmissionScale  = 10.0f;  // multiply all material transmission coefficients (1=physical, 10=audible through walls)
+
     // -- physics --
     int physicsRate = 60;  // physics timestep Hz: 12 = vintage (12.5Hz), 60 = modern, 120 = ultra
 
@@ -94,6 +104,47 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 cfg.waterScrollSpeed = water["scroll_speed"].as<float>();
                 if (cfg.waterScrollSpeed < 0.0f) cfg.waterScrollSpeed = 0.0f;
                 if (cfg.waterScrollSpeed > 1.0f) cfg.waterScrollSpeed = 1.0f;
+            }
+        }
+
+        // audio section
+        if (YAML::Node audio = root["audio"]) {
+            if (audio["half_rate_reflections"])
+                cfg.halfRateReflections = audio["half_rate_reflections"].as<bool>();
+            if (audio["ambisonics_order"]) {
+                cfg.ambisonicsOrder = audio["ambisonics_order"].as<int>();
+                if (cfg.ambisonicsOrder < 0) cfg.ambisonicsOrder = 0;
+                if (cfg.ambisonicsOrder > 1) cfg.ambisonicsOrder = 1;
+            }
+            if (audio["max_reflection_voices"]) {
+                cfg.maxReflectionVoices = audio["max_reflection_voices"].as<int>();
+                if (cfg.maxReflectionVoices < 1) cfg.maxReflectionVoices = 1;
+                if (cfg.maxReflectionVoices > 32) cfg.maxReflectionVoices = 32;
+            }
+            if (audio["reflection_rays"]) {
+                cfg.reflectionNumRays = audio["reflection_rays"].as<int>();
+                if (cfg.reflectionNumRays < 128) cfg.reflectionNumRays = 128;
+                if (cfg.reflectionNumRays > 8192) cfg.reflectionNumRays = 8192;
+            }
+            if (audio["reflection_bounces"]) {
+                cfg.reflectionNumBounces = audio["reflection_bounces"].as<int>();
+                if (cfg.reflectionNumBounces < 1) cfg.reflectionNumBounces = 1;
+                if (cfg.reflectionNumBounces > 8) cfg.reflectionNumBounces = 8;
+            }
+            if (audio["reflection_duration"]) {
+                cfg.reflectionDuration = audio["reflection_duration"].as<float>();
+                if (cfg.reflectionDuration < 0.5f) cfg.reflectionDuration = 0.5f;
+                if (cfg.reflectionDuration > 4.0f) cfg.reflectionDuration = 4.0f;
+            }
+            if (audio["reflection_throttle"]) {
+                cfg.reflectionThrottle = audio["reflection_throttle"].as<int>();
+                if (cfg.reflectionThrottle < 1) cfg.reflectionThrottle = 1;
+                if (cfg.reflectionThrottle > 32) cfg.reflectionThrottle = 32;
+            }
+            if (audio["transmission_scale"]) {
+                cfg.transmissionScale = audio["transmission_scale"].as<float>();
+                if (cfg.transmissionScale < 0.1f) cfg.transmissionScale = 0.1f;
+                if (cfg.transmissionScale > 100.0f) cfg.transmissionScale = 100.0f;
             }
         }
 
