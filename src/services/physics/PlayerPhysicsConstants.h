@@ -121,12 +121,15 @@ static constexpr float SPHERE_RADII[NUM_SPHERES] = {
 // Reference crouch offsets (in pose table): Crouch HEAD=-2.02/BODY=-1.0,
 // CrawlLeft HEAD=-2.5/BODY=-1.0, CrawlRight HEAD=-2.5/BODY=-1.0.
 
-// Movement speeds (world units/sec)
-static constexpr float WALK_SPEED     = 11.0f;
-static constexpr float RUN_SPEED      = 22.0f;
-static constexpr float CREEP_SPEED    = 5.5f;
-static constexpr float SIDESTEP_SPEED = 7.7f;
-static constexpr float BACKWARD_SPEED = 5.5f;
+// Movement speeds (world units/sec).
+// The Dark Engine game module uses a base slew speed of 15.0 u/s, with the
+// default (no modifier) walking at half that. These are the walk-mode base
+// speeds; run multiplies by 2× and creep by 0.5×.
+static constexpr float WALK_SPEED     = 7.5f;    // default forward walk
+static constexpr float RUN_SPEED      = 15.0f;   // sprint (2× walk)
+static constexpr float CREEP_SPEED    = 3.75f;   // sneak (0.5× walk)
+static constexpr float SIDESTEP_SPEED = 5.25f;   // lateral strafe (0.7× walk)
+static constexpr float BACKWARD_SPEED = 3.75f;   // reverse movement (0.5× walk)
 static constexpr float JUMP_IMPULSE   = 14.0f;   // upward velocity on jump
 
 // Speed multipliers for movement modes
@@ -191,10 +194,10 @@ static constexpr float MANTLE_CONVERGE  = 0.0001f; // distance² convergence thr
 //
 // Climbing base speeds: the original engine uses "slow" input speeds (half of normal)
 // as the base, then applies the 0.5× mode scale on top. Effective speeds:
-//   forward: 5.5 × 0.5 = 2.75,  backward: 2.75 × 0.5 = 1.375,  strafe: 3.85 × 0.5 = 1.925
-static constexpr float CLIMB_FWD_SPEED     = 5.5f;   // half of WALK_SPEED
-static constexpr float CLIMB_BACK_SPEED    = 2.75f;   // half of BACKWARD_SPEED
-static constexpr float CLIMB_STR_SPEED     = 3.85f;   // half of SIDESTEP_SPEED
+//   forward: 3.75 × 0.5 = 1.875,  backward: 1.875 × 0.5 = 0.9375,  strafe: 2.625 × 0.5 = 1.3125
+static constexpr float CLIMB_FWD_SPEED     = 3.75f;   // half of WALK_SPEED
+static constexpr float CLIMB_BACK_SPEED    = 1.875f;  // half of BACKWARD_SPEED
+static constexpr float CLIMB_STR_SPEED     = 2.625f;  // half of SIDESTEP_SPEED
 static constexpr float CLIMB_JUMP_SCALE    = 5.0f;   // velocity impulse on jump-off
 static constexpr float CLIMB_JUMP_REFLECT  = 0.5f;   // damping for reflected jump direction
 
