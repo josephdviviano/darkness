@@ -33,10 +33,13 @@
 #include "database/DatabaseCommon.h"
 #include "loop/LoopCommon.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -53,6 +56,12 @@ struct _IPLStaticMesh_t;
 typedef _IPLStaticMesh_t* IPLStaticMesh;
 struct _IPLSimulator_t;
 typedef _IPLSimulator_t* IPLSimulator;
+struct _IPLReflectionMixer_t;
+typedef _IPLReflectionMixer_t* IPLReflectionMixer;
+struct _IPLAmbisonicsDecodeEffect_t;
+typedef _IPLAmbisonicsDecodeEffect_t* IPLAmbisonicsDecodeEffect;
+struct _IPLSource_t;
+typedef _IPLSource_t* IPLSource;
 
 namespace Darkness {
 
@@ -120,7 +129,13 @@ struct AmbientSound {
 };
 
 /// Maximum simultaneous active voices (matches Dark Engine's limit)
-constexpr int MAX_ACTIVE_VOICES = 32;
+constexpr int MAX_ACTIVE_VOICES = 64;
+
+/// Default maximum voices with reflection convolution enabled simultaneously.
+/// Per-voice convolution is expensive. Remaining voices use direct path only
+/// (HRTF + distance attenuation + occlusion), which is cheap.
+/// Tunable at runtime via setMaxReflectionVoices().
+constexpr int DEFAULT_MAX_REFLECTION_VOICES = 2;
 
 /// Default maximum sound propagation distance (world units)
 constexpr float SOUND_MAX_DIST = 200.0f;
@@ -150,6 +165,10 @@ class AudioService : public ServiceImpl<AudioService>,
                      public DatabaseListener,
                      public LoopClient {
 public:
+    /// Forward declaration — defined in AudioService.cpp (needs public access
+    /// for the free-function audio-thread callback reflectionMixNodeProcess)
+    struct ReflectionMixNode;
+
     AudioService(ServiceManager *manager, const std::string &name);
     ~AudioService() override;
 
@@ -250,6 +269,52 @@ public:
      *  When in water, footsteps use water splash schemas instead of ground material.
      *  @param inWater  true if the player's feet are submerged */
     void setPlayerInWater(bool inWater) { mPlayerInWater = inWater; }
+
+    /** Toggle convolution reflections on/off (for A/B comparison). */
+    void setReflectionsEnabled(bool enabled) { mReflectionsEnabled = enabled; }
+    bool getReflectionsEnabled() const { return mReflectionsEnabled; }
+
+    // ── Tunable reflection parameters (exposed for console binding) ──
+
+    void setReflectionNumRays(int n) { mReflectionNumRays = std::max(128, std::min(n, 8192)); }
+    int  getReflectionNumRays() const { return mReflectionNumRays; }
+
+    void setReflectionNumBounces(int n) { mReflectionNumBounces = std::max(1, std::min(n, 8)); }
+    int  getReflectionNumBounces() const { return mReflectionNumBounces; }
+
+    void setReflectionDuration(float d) { mReflectionDuration = std::max(0.5f, std::min(d, 4.0f)); }
+    float getReflectionDuration() const { return mReflectionDuration; }
+
+    void setReflectionThrottle(int n) { mReflectionThrottle = std::max(1, std::min(n, 32)); }
+    int  getReflectionThrottle() const { return mReflectionThrottle; }
+
+    void setMaxReflectionVoices(int n) { mMaxReflectionVoices = std::max(1, std::min(n, MAX_ACTIVE_VOICES)); }
+    int  getMaxReflectionVoices() const { return mMaxReflectionVoices; }
+
+    void setTransmissionScale(float s) { mTransmissionScale = std::max(0.1f, std::min(s, 100.0f)); }
+    float getTransmissionScale() const { return mTransmissionScale; }
+
+    /** Whether reflection convolution runs at half sample rate (24kHz).
+     *  Must be set BEFORE buildAcousticScene() — cannot change at runtime.
+     *  Half-rate halves convolution cost per voice, allowing more reflection
+     *  voices for the same CPU budget. Reverb quality is perceptually
+     *  transparent at 24kHz (12kHz bandwidth captures all reverb character). */
+    void setHalfRateReflections(bool enabled) { mHalfRateReflections = enabled; }
+    bool getHalfRateReflections() const { return mHalfRateReflections; }
+
+    /** Ambisonics order for reflection convolution (0 or 1).
+     *  Must be set BEFORE buildAcousticScene() — cannot change at runtime.
+     *  Order 0 = 1 channel (omnidirectional reverb), 4x cheaper per voice.
+     *  Order 1 = 4 channels (directional reverb), more spatial detail in tails.
+     *  Direct path HRTF is unaffected — spatial positioning stays full quality. */
+    void setAmbisonicsOrder(int order) { mAmbisonicsOrder = std::max(0, std::min(order, 1)); }
+    int  getAmbisonicsOrder() const { return mAmbisonicsOrder; }
+
+    /** @return the actual reflection pipeline sample rate (24000 or 48000) */
+    uint32_t getReflectionSampleRate() const { return mReflectionSampleRate; }
+
+    /** @return number of triangles in the current acoustic scene */
+    int  getAcousticSceneTriCount() const { return mAcousticTriCount; }
 
     /** Per-frame audio update — voice cleanup, Steam Audio simulation step.
      *  Called from the render binary's main loop (LoopService is not used
@@ -370,6 +435,75 @@ private:
     /// committed once per frame in loopStep() before simulation runs.
     bool mSimulatorDirty = false;
 
+    // ── Reflection pipeline (convolution reverb → ambisonics → binaural) ──
+
+    /// Shared reflection mixer — accumulates convolution output from all
+    /// per-voice reflection effects into a single ambisonics buffer.
+    IPLReflectionMixer mIplReflectionMixer = nullptr;
+
+    /// Ambisonics decode effect — converts accumulated reflection ambisonics
+    /// (from the mixer) to binaural stereo via HRTF.
+    IPLAmbisonicsDecodeEffect mIplAmbiDecodeEffect = nullptr;
+
+    /// Whether reflections are enabled (toggled at runtime with R key)
+    bool mReflectionsEnabled = true;
+
+    /// Global reflection mix node — sits between per-voice DSP nodes and the
+    /// engine endpoint. Retrieves mixed reflection ambisonics, decodes to
+    /// binaural stereo, and adds to the direct audio stream.
+    std::unique_ptr<ReflectionMixNode> mReflectionMixNode;
+
+    /// Frame counter for throttling reflection simulation (every Nth frame)
+    int mReflectionFrameCounter = 0;
+
+    // ── Tunable reflection parameters ──
+
+    int mReflectionNumRays = 1024;     ///< Rays per simulation step (128–8192)
+    int mReflectionNumBounces = 4;     ///< Bounces per ray (1–8)
+    float mReflectionDuration = 2.0f;  ///< Max reverb tail in seconds (0.5–4.0)
+    int mReflectionThrottle = 4;       ///< Run every Nth frame (1–32)
+    int mMaxReflectionVoices = DEFAULT_MAX_REFLECTION_VOICES;
+    int mAcousticTriCount = 0;         ///< Triangles in current acoustic scene
+
+    /// Global multiplier for material transmission coefficients.
+    /// 1.0 = physically accurate, 10.0 = audible through walls (game-friendly).
+    float mTransmissionScale = 10.0f;
+
+    /// Half-rate reflection mode: convolution at 24kHz instead of 48kHz.
+    /// Set before buildAcousticScene(). Halves convolution cost per voice.
+    bool mHalfRateReflections = false;
+
+    /// Ambisonics order for reflections (0 = 1 channel, 1 = 4 channels).
+    /// Order 0 is 4x cheaper per voice. Set before buildAcousticScene().
+    int mAmbisonicsOrder = 0;
+    int mAmbisonicsChannels = 1;  ///< (mAmbisonicsOrder+1)^2, computed at init
+
+    /// Reflection pipeline sample rate and frame size (derived from mHalfRateReflections)
+    uint32_t mReflectionSampleRate = 48000;
+    uint32_t mReflectionFrameSize = 1024;
+
+    // ── Background thread for reflection simulation ──
+
+    /// Background thread running iplSimulatorRunReflections() asynchronously.
+    /// Reflection results are consumed next frame (1-frame latency, imperceptible).
+    std::thread mReflectionThread;
+
+    /// Set when background reflection sim is running — prevents overlapping runs
+    std::atomic<bool> mReflectionSimRunning{false};
+
+    /// Signals the reflection thread to shut down
+    std::atomic<bool> mReflectionShutdown{false};
+
+    /// IPL sources awaiting deferred removal (accumulated while sim thread is busy).
+    /// Freed in bulk when the sim thread is idle, since iplSourceRemove must not
+    /// race with iplSimulatorRunDirect/Reflections.
+    std::vector<IPLSource> mPendingSourceRemovals;
+
+    /// Join the background reflection thread if it's running.
+    /// Must be called before any source mutation (add/remove/commit)
+    /// to prevent Steam Audio from accessing freed source data.
+    void waitForReflectionThread();
+
     // ── Listener state (updated each frame from render binary) ──
 
     Vector3 mListenerPos{0.0f, 0.0f, 0.0f};
@@ -385,13 +519,16 @@ private:
     bool initSteamAudio();
     void shutdownSteamAudio();
     void destroyAcousticScene();
+    bool initReflectionPipeline();
+    void destroyReflectionPipeline();
     void createVoiceSource(ActiveVoice &voice);
     void removeVoiceSource(ActiveVoice &voice);
     void initVoiceDSP(ActiveVoice &voice);
     int selectSample(const std::string &schemaName, int sampleCount, int totalFreq,
                      const int *frequencies);
     SoundHandle startVoice(const std::string &schemaName, const std::string &sampleName,
-                           const Vector3 &position, int priority, bool looping, int objID);
+                           const Vector3 &position, int priority, bool looping,
+                           int objID, float volume = 1.0f);
     bool evictLowestPriority(int newPriority);
 };
 
