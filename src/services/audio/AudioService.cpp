@@ -1775,10 +1775,10 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
     const SchemaEntry *schema = matches[0];
 
     // Scale volume by movement speed:
-    //   creep (~5.5 u/s)  → quiet (0.3)
-    //   walk  (~11 u/s)   → normal (0.6)
-    //   run   (~22 u/s)   → loud (1.0)
-    float speedFactor = std::clamp(speed / 22.0f, 0.1f, 1.0f);
+    //   creep (~3.75 u/s) → quiet (0.3)
+    //   walk  (~7.5 u/s)  → normal (0.6)
+    //   run   (~15 u/s)   → loud (1.0)
+    float speedFactor = std::clamp(speed / 15.0f, 0.1f, 1.0f);
     float baseVol = schemaVolumeToLinear(schema->playParams.volume);
     float finalVol = baseVol * speedFactor;
 
