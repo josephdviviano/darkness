@@ -149,13 +149,35 @@ struct SteamAudioDSPNode {
     IPLDirectEffectParams directParams{};
     IPLVector3 direction{1.0f, 0.0f, 0.0f};  // listener-to-source (listener-local frame)
 
+    // Reflection convolution effect (per-voice, feeds into shared mixer)
+    IPLReflectionEffect reflectionEffect = nullptr;
+
+    // Shared reference to the reflection mixer (NOT owned — AudioService manages)
+    IPLReflectionMixer reflectionMixer = nullptr;
+
+    // Reflection simulation output params (written by main thread from simulator)
+    IPLReflectionEffectParams reflectionParams{};
+    bool reflectionsActive = false;
+
     // Scratch buffers for deinterleaved Steam Audio processing
     // (allocated once at init, never reallocated — safe for audio thread)
     std::vector<float> monoScratch;   // mono channel for direct effect in/out
     std::vector<float> stereoL;       // left channel (binaural output)
     std::vector<float> stereoR;       // right channel (binaural output)
 
+    // Per-voice ambisonics scratch for reflection convolution output
+    // (required by iplReflectionEffectApply even when using mixer accumulation)
+    std::vector<float> ambiScratch0;  // W channel
+    std::vector<float> ambiScratch1;  // Y channel
+    std::vector<float> ambiScratch2;  // Z channel
+    std::vector<float> ambiScratch3;  // X channel
+
+    // Half-rate decimation scratch (used when reflection pipeline runs at 24kHz)
+    std::vector<float> decimatedMono;
+
     int frameSize = 1024;
+    int reflectionFrameSize = 1024;  // half of frameSize in half-rate mode
+    bool halfRate = false;
     bool effectsReady = false;       // true when effects + node are initialized
     bool nodeInitialized = false;    // true when ma_node_init succeeded
 
@@ -173,7 +195,61 @@ static ma_node_vtable sSteamAudioNodeVtable = {
     nullptr,                 // onGetRequiredInputFrameCount (1:1 input/output ratio)
     1,                       // inputBusCount  (stereo from ma_sound)
     1,                       // outputBusCount (stereo to engine endpoint)
-    0                        // flags
+    MA_NODE_FLAG_CONTINUOUS_PROCESSING  // Keep processing after input exhausted (reverb tails)
+};
+
+// Forward-declare the reflection mix node process callback
+static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
+                                      ma_uint32* pFrameCountIn,
+                                      float** ppFramesOut, ma_uint32* pFrameCountOut);
+
+/// Global reflection mix node — one per AudioService.
+/// Sits between all per-voice DSP nodes and the engine endpoint.
+/// Retrieves accumulated reflection convolution output from the shared mixer,
+/// decodes ambisonics to binaural stereo via HRTF, and adds to the direct signal.
+struct AudioService::ReflectionMixNode {
+    ma_node_base base{};  // Must be first member (miniaudio node graph requirement)
+
+    // Shared handles (NOT owned — AudioService manages lifetimes)
+    IPLReflectionMixer mixer = nullptr;
+    IPLAmbisonicsDecodeEffect ambiDecodeEffect = nullptr;
+    IPLHRTF hrtf = nullptr;
+
+    // Listener orientation for ambisonics decode (written by main thread each frame).
+    // Must be initialized to a valid coordinate space — zero vectors cause crashes
+    // in iplAmbisonicsDecodeEffectApply before the first loopStep sets the real values.
+    IPLCoordinateSpace3 listenerOrientation = {
+        {1.0f, 0.0f, 0.0f},  // right  = +X
+        {0.0f, 0.0f, 1.0f},  // up     = +Z (Dark Engine Z-up)
+        {0.0f, 1.0f, 0.0f},  // ahead  = +Y
+        {0.0f, 0.0f, 0.0f}   // origin = world origin
+    };
+
+    // Scratch buffers for ambisonics processing (order 1 = 4 channels)
+    std::vector<float> ambiCh0;  // W channel
+    std::vector<float> ambiCh1;  // Y channel
+    std::vector<float> ambiCh2;  // Z channel
+    std::vector<float> ambiCh3;  // X channel
+    std::vector<float> decodedL; // binaural left
+    std::vector<float> decodedR; // binaural right
+
+    int frameSize = 1024;             // engine frame size (48kHz)
+    int reflectionFrameSize = 1024;   // reflection frame size (24kHz or 48kHz)
+    int ambiChannels = 1;             // ambisonics channel count (1 for order 0, 4 for order 1)
+    int ambiOrder = 0;                // ambisonics order (0 or 1)
+    bool halfRate = false;            // true when running reflections at half sample rate
+    bool ready = false;               // true once pipeline is initialized
+    bool simulationRan = false;       // true after first iplSimulatorRunReflections completes
+    bool nodeInitialized = false;
+};
+
+/// vtable for the global reflection mix node
+static ma_node_vtable sReflectionMixNodeVtable = {
+    reflectionMixNodeProcess,
+    nullptr,    // onGetRequiredInputFrameCount
+    1,          // inputBusCount  (stereo sum from all per-voice DSP nodes)
+    1,          // outputBusCount (stereo to engine endpoint)
+    0           // flags
 };
 
 /// Temporary debug flag: when true, bypass Steam Audio effects and just pass
@@ -181,16 +257,31 @@ static ma_node_vtable sSteamAudioNodeVtable = {
 /// DSP bypass level (0=full pipeline, 3=mono passthrough, 4=stereo passthrough)
 static std::atomic<int> sDSPBypassLevel{0};
 
+// ── Audio thread profiling (written by audio thread, read by main thread) ──
+// Tracks peak time spent in audio callbacks to detect buffer underruns.
+static std::atomic<float> sPerVoicePeakUs{0.0f};    // peak per-voice DSP time (µs)
+static std::atomic<float> sMixNodePeakUs{0.0f};      // peak global mix node time (µs)
+static std::atomic<float> sTotalCallbackPeakUs{0.0f}; // peak total audio callback time (µs)
+static std::atomic<int>   sPerVoiceCallCount{0};      // voices processed in last period
+static std::atomic<float> sWaitThreadPeakMs{0.0f};    // peak waitForReflectionThread time (ms)
+static std::atomic<float> sCommitPeakMs{0.0f};         // peak iplSimulatorCommit time (ms)
+
+// Accumulates per-voice time within a single audio callback cycle.
+// Reset by the mix node after reading. Not truly thread-safe between
+// multiple voice callbacks in the same cycle, but gives a good estimate.
+static std::atomic<float> sCallbackAccumUs{0.0f};
+
 /// Audio-thread callback: applies Steam Audio direct + binaural effects.
 /// Reads mono from ma_sound, outputs stereo binaural to engine endpoint.
 static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                                    ma_uint32* pFrameCountIn,
                                    float** ppFramesOut, ma_uint32* pFrameCountOut)
 {
+    auto t0 = std::chrono::steady_clock::now();
     auto* node = reinterpret_cast<SteamAudioDSPNode*>(pNode);
     ma_uint32 frameCount = *pFrameCountOut;
 
-    // Limit to available input frames and our buffer size
+    // Clamp to available input and our buffer size (1:1 input/output ratio)
     if (pFrameCountIn[0] < frameCount)
         frameCount = pFrameCountIn[0];
     if (frameCount > static_cast<ma_uint32>(node->frameSize))
@@ -202,7 +293,7 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
 
     float* stereoOut = ppFramesOut[0];  // interleaved stereo output
 
-    if (!node->effectsReady || frameCount == 0 || !ppFramesIn[0]) {
+    if (!node->effectsReady || frameCount == 0) {
         // Output silence
         std::memset(stereoOut, 0, frameCount * 2 * sizeof(float));
         pFrameCountIn[0] = frameCount;
@@ -216,10 +307,14 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
     float* mono = node->monoScratch.data();
 
     float peakIn = 0.0f;
-    for (ma_uint32 i = 0; i < frameCount; ++i) {
-        mono[i] = (stereoIn[i * 2] + stereoIn[i * 2 + 1]) * 0.5f;
-        float a = std::fabs(mono[i]);
-        if (a > peakIn) peakIn = a;
+    if (stereoIn && frameCount > 0) {
+        for (ma_uint32 i = 0; i < frameCount; ++i) {
+            mono[i] = (stereoIn[i * 2] + stereoIn[i * 2 + 1]) * 0.5f;
+            float a = std::fabs(mono[i]);
+            if (a > peakIn) peakIn = a;
+        }
+    } else {
+        std::memset(mono, 0, frameCount * sizeof(float));
     }
     node->peakInput.store(peakIn, std::memory_order_relaxed);
 
@@ -301,6 +396,64 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             }
         }
 
+        // Apply reflection convolution — feeds attenuated mono input through
+        // per-voice convolution IR and accumulates the ambisonics result into
+        // the shared mixer. We use the attenuated mono (matching the direct
+        // output volume) so that reverb level is proportional to the source's
+        // perceived loudness. The IR encodes reflection paths but not source
+        // distance — without this, nearby sounds would have disproportionately
+        // quiet reverb relative to their direct signal.
+        if (node->reflectionsActive && node->reflectionEffect && node->reflectionMixer
+            && node->reflectionParams.irSize > 0) {
+            // Apply attenuation to mono before convolution (same factor as direct path)
+            float reflAtten = node->lastAtten.load(std::memory_order_relaxed);
+            if (runAtten && reflAtten < 1.0f) {
+                for (ma_uint32 i = 0; i < frameCount; ++i)
+                    mono[i] *= reflAtten;
+            }
+
+            // Steam Audio requires EXACTLY reflectionFrameSize samples per call.
+            // In half-rate mode, decimate mono input from 48kHz to 24kHz.
+            ma_uint32 reflFrames = static_cast<ma_uint32>(node->reflectionFrameSize);
+            float* reflMonoPtr = mono;
+            if (node->halfRate && !node->decimatedMono.empty()) {
+                float* dec = node->decimatedMono.data();
+                ma_uint32 pairs = std::min(frameCount / 2, reflFrames);
+                for (ma_uint32 i = 0; i < pairs; ++i)
+                    dec[i] = (mono[i * 2] + mono[i * 2 + 1]) * 0.5f;
+                // Zero-pad if frameCount was short
+                for (ma_uint32 i = pairs; i < reflFrames; ++i)
+                    dec[i] = 0.0f;
+                reflMonoPtr = dec;
+            } else if (frameCount < reflFrames) {
+                // Non-half-rate but short frame — pad mono with zeros
+                for (ma_uint32 i = frameCount; i < reflFrames; ++i)
+                    mono[i] = 0.0f;
+            }
+
+            IPLAudioBuffer reflIn{};
+            reflIn.numChannels = 1;
+            reflIn.numSamples = static_cast<IPLint32>(reflFrames);
+            reflIn.data = &reflMonoPtr;
+
+            // Output buffer required by Steam Audio even when mixer accumulates.
+            // Channel count depends on ambisonics order (1 for order 0, 4 for order 1).
+            float* ambiChPtrs[4] = {
+                node->ambiScratch0.data(),
+                !node->ambiScratch1.empty() ? node->ambiScratch1.data() : nullptr,
+                !node->ambiScratch2.empty() ? node->ambiScratch2.data() : nullptr,
+                !node->ambiScratch3.empty() ? node->ambiScratch3.data() : nullptr
+            };
+            IPLAudioBuffer reflOut{};
+            reflOut.numChannels = node->reflectionParams.numChannels;
+            reflOut.numSamples = static_cast<IPLint32>(reflFrames);
+            reflOut.data = ambiChPtrs;
+
+            iplReflectionEffectApply(node->reflectionEffect,
+                                      &node->reflectionParams,
+                                      &reflIn, &reflOut, node->reflectionMixer);
+        }
+
         // Interleave deinterleaved stereo → miniaudio interleaved output
         float peakOut = 0.0f;
         for (ma_uint32 i = 0; i < frameCount; ++i) {
@@ -337,6 +490,134 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
 
     pFrameCountIn[0] = frameCount;
     *pFrameCountOut = frameCount;
+
+    // Profile: track peak per-voice DSP time and accumulate for total callback
+    auto t1 = std::chrono::steady_clock::now();
+    float us = std::chrono::duration<float, std::micro>(t1 - t0).count();
+    float prev = sPerVoicePeakUs.load(std::memory_order_relaxed);
+    if (us > prev) sPerVoicePeakUs.store(us, std::memory_order_relaxed);
+    // Accumulate per-voice time for total callback measurement (C++17 CAS loop)
+    float oldAccum = sCallbackAccumUs.load(std::memory_order_relaxed);
+    while (!sCallbackAccumUs.compare_exchange_weak(oldAccum, oldAccum + us,
+                                                     std::memory_order_relaxed)) {}
+    sPerVoiceCallCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+/// Audio-thread callback for the global reflection mix node.
+/// Receives summed direct stereo from all per-voice DSP nodes (via miniaudio bus),
+/// retrieves accumulated reflection convolution output from the shared mixer,
+/// decodes from ambisonics to binaural stereo, and adds to the direct signal.
+static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
+                                      ma_uint32* pFrameCountIn,
+                                      float** ppFramesOut, ma_uint32* pFrameCountOut)
+{
+    auto mixT0 = std::chrono::steady_clock::now();
+    auto* node = reinterpret_cast<AudioService::ReflectionMixNode*>(pNode);
+    ma_uint32 frameCount = *pFrameCountOut;
+
+    if (pFrameCountIn[0] < frameCount)
+        frameCount = pFrameCountIn[0];
+    if (frameCount > static_cast<ma_uint32>(node->frameSize))
+        frameCount = static_cast<ma_uint32>(node->frameSize);
+
+    float* stereoOut = ppFramesOut[0];
+    const float* stereoIn = ppFramesIn[0];
+
+    // Always pass through the direct audio (from per-voice DSP nodes)
+    if (stereoIn && stereoOut && frameCount > 0)
+        std::memcpy(stereoOut, stereoIn, frameCount * 2 * sizeof(float));
+
+    // If reflection pipeline not ready or no simulation has run yet, just pass through.
+    // Calling iplReflectionMixerApply before any simulation data exists can crash.
+    if (!node->ready || !node->simulationRan || !node->mixer || !node->ambiDecodeEffect) {
+        pFrameCountIn[0] = frameCount;
+        *pFrameCountOut = frameCount;
+        return;
+    }
+
+    // Steam Audio requires EXACTLY reflectionFrameSize samples per call.
+    // Always use the configured size, not frameCount/2 (which may not match
+    // if miniaudio delivers a non-standard frame count).
+    ma_uint32 reflFrameCount = static_cast<ma_uint32>(node->reflectionFrameSize);
+
+    // Step 1: Retrieve accumulated reflection ambisonics from the mixer.
+    // Channel count depends on ambisonics order (1 for order 0, 4 for order 1).
+    int nch = node->ambiChannels;
+    float* ambiChannels[4] = {
+        node->ambiCh0.data(),
+        nch > 1 ? node->ambiCh1.data() : nullptr,
+        nch > 2 ? node->ambiCh2.data() : nullptr,
+        nch > 3 ? node->ambiCh3.data() : nullptr
+    };
+
+    IPLAudioBuffer ambiOut{};
+    ambiOut.numChannels = nch;
+    ambiOut.numSamples = static_cast<IPLint32>(reflFrameCount);
+    ambiOut.data = ambiChannels;
+
+    IPLReflectionEffectParams mixerParams{};
+    mixerParams.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+    mixerParams.numChannels = nch;
+
+    iplReflectionMixerApply(node->mixer, &mixerParams, &ambiOut);
+
+    // Step 2: Decode ambisonics to binaural stereo via HRTF
+    float* decodedChannels[2] = {node->decodedL.data(), node->decodedR.data()};
+
+    IPLAudioBuffer decodedBuf{};
+    decodedBuf.numChannels = 2;
+    decodedBuf.numSamples = static_cast<IPLint32>(reflFrameCount);
+    decodedBuf.data = decodedChannels;
+
+    IPLAmbisonicsDecodeEffectParams decodeParams{};
+    decodeParams.order = node->ambiOrder;
+    decodeParams.hrtf = node->hrtf;
+    decodeParams.orientation = node->listenerOrientation;
+    decodeParams.binaural = IPL_TRUE;
+
+    iplAmbisonicsDecodeEffectApply(node->ambiDecodeEffect, &decodeParams,
+                                   &ambiOut, &decodedBuf);
+
+    // Step 3: Additive mix — reflection reverb on top of direct audio.
+    // In half-rate mode, upsample the decoded stereo from reflFrameCount
+    // to frameCount using linear interpolation (fine for diffuse reverb).
+    // Clamp output to frameCount to avoid writing past the output buffer.
+    if (node->halfRate) {
+        ma_uint32 outSamples = std::min(reflFrameCount * 2, frameCount);
+        ma_uint32 pairs = outSamples / 2;
+        for (ma_uint32 i = 0; i < pairs; ++i) {
+            float l0 = decodedChannels[0][i];
+            float r0 = decodedChannels[1][i];
+            float l1 = (i + 1 < reflFrameCount) ? decodedChannels[0][i + 1] : l0;
+            float r1 = (i + 1 < reflFrameCount) ? decodedChannels[1][i + 1] : r0;
+            // Each half-rate sample maps to 2 full-rate samples
+            stereoOut[i * 4]     += l0;
+            stereoOut[i * 4 + 1] += r0;
+            if (i * 2 + 1 < outSamples) {
+                stereoOut[i * 4 + 2] += (l0 + l1) * 0.5f;
+                stereoOut[i * 4 + 3] += (r0 + r1) * 0.5f;
+            }
+        }
+    } else {
+        ma_uint32 outSamples = std::min(reflFrameCount, frameCount);
+        for (ma_uint32 i = 0; i < outSamples; ++i) {
+            stereoOut[i * 2]     += decodedChannels[0][i];
+            stereoOut[i * 2 + 1] += decodedChannels[1][i];
+        }
+    }
+
+    pFrameCountIn[0] = frameCount;
+    *pFrameCountOut = frameCount;
+
+    // Profile: track peak mix node time and total callback time
+    auto mixT1 = std::chrono::steady_clock::now();
+    float mixUs = std::chrono::duration<float, std::micro>(mixT1 - mixT0).count();
+    float prevMix = sMixNodePeakUs.load(std::memory_order_relaxed);
+    if (mixUs > prevMix) sMixNodePeakUs.store(mixUs, std::memory_order_relaxed);
+    // Total = all per-voice DSP time + this mix node time
+    float totalUs = sCallbackAccumUs.exchange(0.0f, std::memory_order_relaxed) + mixUs;
+    float prevTotal = sTotalCallbackPeakUs.load(std::memory_order_relaxed);
+    if (totalUs > prevTotal) sTotalCallbackPeakUs.store(totalUs, std::memory_order_relaxed);
 }
 
 /*----------------------------------------------------*/
@@ -357,6 +638,13 @@ struct ActiveVoice {
     SoundHandle handle = SOUND_HANDLE_INVALID;
     bool initialized = false;
     std::atomic<bool> finished{false};  // Set by end callback on audio thread
+
+    // Reverb tail timer: when the source audio finishes, the voice stays alive
+    // to let the per-voice convolution tail ring out. The DSP callback feeds
+    // silence into the convolution during this period. When the timer expires,
+    // the voice is truly finished and can be cleaned up.
+    bool sourceEnded = false;    // true after ma_sound reaches end
+    float tailTimer = 0.0f;     // seconds remaining for reverb tail
 
     // Voice management metadata
     std::string schemaName;            // Schema that spawned this voice
@@ -379,7 +667,13 @@ struct ActiveVoice {
     }
 
     ~ActiveVoice() {
-        // Stop playback first to prevent audio thread from accessing resources
+        // Mark DSP as inactive FIRST — tells the audio thread to stop using
+        // this node's effects immediately (before we uninit/release them).
+        dspNode.effectsReady = false;
+        dspNode.reflectionsActive = false;
+
+        // Stop playback — use immediate stop here since ma_node_uninit below
+        // will block until the audio thread finishes, providing a clean boundary.
         if (initialized) {
             ma_sound_stop(&sound);
         }
@@ -397,7 +691,11 @@ struct ActiveVoice {
             iplBinauralEffectRelease(&dspNode.binauralEffect);
             dspNode.binauralEffect = nullptr;
         }
-        dspNode.effectsReady = false;
+        if (dspNode.reflectionEffect) {
+            iplReflectionEffectRelease(&dspNode.reflectionEffect);
+            dspNode.reflectionEffect = nullptr;
+        }
+        dspNode.reflectionMixer = nullptr;  // shared ref, not owned
 
         // Destroy sound and decoder
         if (initialized) {
@@ -419,12 +717,18 @@ struct ActiveVoice {
 };
 
 /// miniaudio end callback — called on the audio thread when a sound finishes.
-/// Sets the atomic finished flag so the main thread can safely clean up.
+/// Marks sourceEnded so the main thread can start the reverb tail timer.
+/// The voice stays alive during the tail period so the per-voice convolution
+/// continues feeding its IR tail into the reflection mixer.
 static void onSoundEnd(void *pUserData, ma_sound * /*pSound*/)
 {
     auto *voice = static_cast<ActiveVoice *>(pUserData);
     if (voice) {
-        voice->finished.store(true, std::memory_order_release);
+        // Always defer to main thread via sourceEnded — the main thread
+        // decides whether to start a tail timer or mark finished based on
+        // whether the voice has a reflection effect (not just reflectionsActive,
+        // which changes per-frame based on distance ranking).
+        voice->sourceEnded = true;
     }
 }
 
@@ -682,7 +986,15 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         for (const auto &texName : data.texNames) {
             if (texToMaterialIdx.find(texName) == texToMaterialIdx.end()) {
                 texToMaterialIdx[texName] = static_cast<int32_t>(materials.size());
-                materials.push_back(lookupAcousticMaterial(texName));
+                IPLMaterial mat = lookupAcousticMaterial(texName);
+                // Apply transmission scale — higher values make sounds more
+                // audible through walls (game-friendly vs physically accurate)
+                if (mTransmissionScale != 1.0f) {
+                    for (int b = 0; b < 3; ++b)
+                        mat.transmission[b] = std::min(1.0f,
+                            mat.transmission[b] * mTransmissionScale);
+                }
+                materials.push_back(mat);
             }
         }
 
@@ -737,21 +1049,33 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         iplStaticMeshAdd(mIplStaticMesh, mIplScene);
         iplSceneCommit(mIplScene);
 
-        // Step 6: Create the simulator for direct occlusion + reflections + reverb
+        // Compute reflection pipeline rate — half-rate uses 24kHz (half of 48kHz)
+        // for convolution, halving per-voice FFT cost while keeping HRTF at 48kHz.
+        if (mHalfRateReflections) {
+            mReflectionSampleRate = mDeviceSampleRate / 2;
+            mReflectionFrameSize = mFrameSize / 2;
+        } else {
+            mReflectionSampleRate = mDeviceSampleRate;
+            mReflectionFrameSize = mFrameSize;
+        }
+
+        // Step 6: Create the simulator for direct occlusion + reflections + reverb.
+        // The simulator uses the reflection sample rate — IRs are generated at this
+        // rate, which must match the reflection effects and mixer.
         IPLSimulationSettings simSettings{};
         simSettings.flags = static_cast<IPLSimulationFlags>(
             IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
         simSettings.sceneType = IPL_SCENETYPE_DEFAULT;
         simSettings.reflectionType = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
         simSettings.maxNumOcclusionSamples = 32;
-        simSettings.maxNumRays = 4096;       // rays per simulation step
+        simSettings.maxNumRays = 4096;       // max rays (runtime uses mReflectionNumRays)
         simSettings.numDiffuseSamples = 32;
-        simSettings.maxDuration = 2.0f;      // max reverb tail (seconds)
-        simSettings.maxOrder = 1;            // ambisonics order
+        simSettings.maxDuration = mReflectionDuration;
+        simSettings.maxOrder = mAmbisonicsOrder;
         simSettings.maxNumSources = 32;      // voice pool size
         simSettings.numThreads = 2;          // parallel ray tracing
-        simSettings.samplingRate = 44100;
-        simSettings.frameSize = 1024;
+        simSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
+        simSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
 
         err = iplSimulatorCreate(mIplContext, &simSettings, &mIplSimulator);
         if (err != IPL_STATUS_SUCCESS) {
@@ -765,6 +1089,16 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         iplSimulatorCommit(mIplSimulator);
 
         mSceneReady = true;
+        mAcousticTriCount = static_cast<int>(numTriangles);
+
+        // Create the reflection pipeline (mixer + ambisonics decode + mix node)
+        // This is optional — if it fails, direct effects still work
+        std::fprintf(stderr, "REFL: about to call initReflectionPipeline()\n");
+        if (!initReflectionPipeline()) {
+            LOG_ERROR("AudioService: reflection pipeline init failed — "
+                      "direct effects only");
+        }
+        std::fprintf(stderr, "REFL: initReflectionPipeline returned\n");
 
         LOG_INFO("AudioService: acoustic scene built — %zu vertices, %zu triangles, "
                  "%zu materials", numVertices, numTriangles, materials.size());
@@ -784,9 +1118,175 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
 }
 
 //------------------------------------------------------
+bool AudioService::initReflectionPipeline()
+{
+    std::fprintf(stderr, "REFL: initReflectionPipeline enter\n");
+    if (!mIplContext || !mIplHrtf || !mMaEngine || !mIplSimulator)
+        return false;
+
+    // Reflection pipeline uses the reflection sample rate (24kHz or 48kHz).
+    // This rate was computed in buildAcousticScene and must match the simulator.
+    IPLAudioSettings audioSettings{};
+    audioSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
+    audioSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
+
+    // irSize = maxDuration * samplingRate (matches simulator settings)
+    IPLint32 irSize = static_cast<IPLint32>(mReflectionDuration * mReflectionSampleRate);
+    // Compute ambisonics channel count: (order+1)^2. Order 0=1ch, order 1=4ch.
+    mAmbisonicsChannels = (mAmbisonicsOrder + 1) * (mAmbisonicsOrder + 1);
+    IPLint32 numAmbiChannels = static_cast<IPLint32>(mAmbisonicsChannels);
+
+    std::fprintf(stderr, "REFL: creating mixer (irSize=%d, channels=%d, rate=%d, frame=%d%s)\n",
+                 irSize, numAmbiChannels,
+                 audioSettings.samplingRate, audioSettings.frameSize,
+                 mHalfRateReflections ? ", half-rate" : "");
+
+    // Create shared reflection mixer — accumulates all per-voice convolution outputs
+    IPLReflectionEffectSettings reflSettings{};
+    reflSettings.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+    reflSettings.irSize = irSize;
+    reflSettings.numChannels = numAmbiChannels;
+
+    IPLerror err = iplReflectionMixerCreate(mIplContext, &audioSettings,
+                                             &reflSettings, &mIplReflectionMixer);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplReflectionMixerCreate failed (error %d)", err);
+        return false;
+    }
+    std::fprintf(stderr, "REFL: mixer created OK\n");
+
+    // Create ambisonics decode effect (ambisonics → binaural stereo via HRTF).
+    // This also runs at the reflection rate — output is upsampled in the mix node.
+    IPLAmbisonicsDecodeEffectSettings decodeSettings{};
+    decodeSettings.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_STEREO;
+    decodeSettings.hrtf = mIplHrtf;
+    decodeSettings.maxOrder = mAmbisonicsOrder;
+
+    err = iplAmbisonicsDecodeEffectCreate(mIplContext, &audioSettings,
+                                           &decodeSettings, &mIplAmbiDecodeEffect);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplAmbisonicsDecodeEffectCreate failed (error %d)", err);
+        iplReflectionMixerRelease(&mIplReflectionMixer);
+        mIplReflectionMixer = nullptr;
+        return false;
+    }
+
+    // Create global reflection mix node in the miniaudio node graph.
+    // The node operates at the engine's 48kHz rate; it internally handles
+    // resampling when the reflection pipeline runs at half rate.
+    mReflectionMixNode = std::make_unique<ReflectionMixNode>();
+    auto& rmn = *mReflectionMixNode;
+    rmn.mixer = mIplReflectionMixer;
+    rmn.ambiDecodeEffect = mIplAmbiDecodeEffect;
+    rmn.hrtf = mIplHrtf;
+    rmn.frameSize = static_cast<int>(mFrameSize);
+    rmn.reflectionFrameSize = static_cast<int>(mReflectionFrameSize);
+    rmn.halfRate = mHalfRateReflections;
+    rmn.ambiChannels = mAmbisonicsChannels;
+    rmn.ambiOrder = mAmbisonicsOrder;
+
+    // Allocate scratch buffers at the reflection frame size.
+    // Only allocate channels needed for the configured ambisonics order.
+    rmn.ambiCh0.resize(mReflectionFrameSize, 0.0f);
+    if (mAmbisonicsChannels > 1) rmn.ambiCh1.resize(mReflectionFrameSize, 0.0f);
+    if (mAmbisonicsChannels > 2) rmn.ambiCh2.resize(mReflectionFrameSize, 0.0f);
+    if (mAmbisonicsChannels > 3) rmn.ambiCh3.resize(mReflectionFrameSize, 0.0f);
+    rmn.decodedL.resize(mReflectionFrameSize, 0.0f);
+    rmn.decodedR.resize(mReflectionFrameSize, 0.0f);
+
+    // Initialize the miniaudio node
+    ma_uint32 inputChannels[1] = {2};
+    ma_uint32 outputChannels[1] = {2};
+
+    ma_node_config nodeConfig = ma_node_config_init();
+    nodeConfig.vtable = &sReflectionMixNodeVtable;
+    nodeConfig.inputBusCount = 1;
+    nodeConfig.outputBusCount = 1;
+    nodeConfig.pInputChannels = inputChannels;
+    nodeConfig.pOutputChannels = outputChannels;
+
+    ma_result result = ma_node_init(ma_engine_get_node_graph(mMaEngine),
+                                     &nodeConfig, nullptr, &rmn.base);
+    if (result != MA_SUCCESS) {
+        LOG_ERROR("AudioService: ReflectionMixNode init failed (error %d)", result);
+        mReflectionMixNode.reset();
+        iplAmbisonicsDecodeEffectRelease(&mIplAmbiDecodeEffect);
+        mIplAmbiDecodeEffect = nullptr;
+        iplReflectionMixerRelease(&mIplReflectionMixer);
+        mIplReflectionMixer = nullptr;
+        return false;
+    }
+    rmn.nodeInitialized = true;
+    std::fprintf(stderr, "REFL: node initialized, attaching to endpoint\n");
+
+    // Connect: reflection mix node → engine endpoint
+    ma_result r = ma_node_attach_output_bus(&rmn.base, 0,
+                                             ma_engine_get_endpoint(mMaEngine), 0);
+    if (r != MA_SUCCESS) {
+        LOG_ERROR("AudioService: ReflectionMixNode attach failed (error %d)", r);
+        ma_node_uninit(&rmn.base, nullptr);
+        mReflectionMixNode.reset();
+        iplAmbisonicsDecodeEffectRelease(&mIplAmbiDecodeEffect);
+        mIplAmbiDecodeEffect = nullptr;
+        iplReflectionMixerRelease(&mIplReflectionMixer);
+        mIplReflectionMixer = nullptr;
+        return false;
+    }
+
+    rmn.ready = true;
+
+    std::fprintf(stderr, "AudioService: reflection pipeline initialized "
+                 "(convolution, order %d (%dch), IR %d samples, %uHz%s, max %d voices)\n",
+                 mAmbisonicsOrder, mAmbisonicsChannels,
+                 irSize, mReflectionSampleRate,
+                 mHalfRateReflections ? " half-rate" : "",
+                 mMaxReflectionVoices);
+    return true;
+}
+
+//------------------------------------------------------
+void AudioService::destroyReflectionPipeline()
+{
+    // Wait for any in-flight background reflection simulation to finish
+    mReflectionShutdown.store(true, std::memory_order_release);
+    if (mReflectionThread.joinable())
+        mReflectionThread.join();
+
+    // Flush deferred IPL source removals before destroying the simulator
+    if (!mPendingSourceRemovals.empty() && mIplSimulator) {
+        for (auto &src : mPendingSourceRemovals) {
+            iplSourceRemove(src, mIplSimulator);
+            iplSourceRelease(&src);
+        }
+        mPendingSourceRemovals.clear();
+    }
+
+    // Order matters: mix node references mixer/decode, so destroy it first
+    if (mReflectionMixNode) {
+        mReflectionMixNode->ready = false;
+        if (mReflectionMixNode->nodeInitialized) {
+            ma_node_uninit(&mReflectionMixNode->base, nullptr);
+        }
+        mReflectionMixNode.reset();
+    }
+
+    if (mIplAmbiDecodeEffect) {
+        iplAmbisonicsDecodeEffectRelease(&mIplAmbiDecodeEffect);
+        mIplAmbiDecodeEffect = nullptr;
+    }
+    if (mIplReflectionMixer) {
+        iplReflectionMixerRelease(&mIplReflectionMixer);
+        mIplReflectionMixer = nullptr;
+    }
+}
+
+//------------------------------------------------------
 void AudioService::destroyAcousticScene()
 {
     mSceneReady = false;
+
+    // Destroy reflection pipeline before simulator (it references simulator sources)
+    destroyReflectionPipeline();
 
     if (mIplSimulator) {
         iplSimulatorRelease(&mIplSimulator);
@@ -958,20 +1458,48 @@ void AudioService::loopStep(float deltaTime)
     if (!mAudioReady)
         return;
 
-    // Remove voices that have finished playback
-    cleanupFinishedVoices();
+    // Source mutations (add/remove/commit) must not happen while the background
+    // simulation thread is running — iplSimulatorRunDirect/Reflections holds
+    // internal pointers to committed sources. Instead of BLOCKING the main thread
+    // (which caused 200+ms stalls), we DEFER mutations until the sim finishes.
+    bool simBusy = mReflectionSimRunning.load(std::memory_order_acquire);
 
-    // Batch-commit any pending source additions/removals before simulation.
-    // This replaces per-voice iplSimulatorCommit() calls, avoiding the expensive
-    // commit operation firing multiple times per frame during ambient start/stop.
-    if (mSimulatorDirty && mIplSimulator) {
-        iplSimulatorCommit(mIplSimulator);
-        mSimulatorDirty = false;
+    if (!simBusy) {
+        // Background sim is idle — safe to mutate sources
+        if (mReflectionThread.joinable())
+            mReflectionThread.join();
+
+        // Flush deferred IPL source removals (accumulated while sim was busy)
+        if (!mPendingSourceRemovals.empty() && mIplSimulator) {
+            for (auto &src : mPendingSourceRemovals) {
+                iplSourceRemove(src, mIplSimulator);
+                iplSourceRelease(&src);
+            }
+            mPendingSourceRemovals.clear();
+        }
+
+        // Remove voices that have finished playback
+        cleanupFinishedVoices();
+
+        // Batch-commit any pending source additions/removals before simulation.
+        if (mSimulatorDirty && mIplSimulator) {
+            auto ct0 = std::chrono::steady_clock::now();
+            iplSimulatorCommit(mIplSimulator);
+            auto ct1 = std::chrono::steady_clock::now();
+            float cMs = std::chrono::duration<float, std::milli>(ct1 - ct0).count();
+            float prevC = sCommitPeakMs.load(std::memory_order_relaxed);
+            if (cMs > prevC) sCommitPeakMs.store(cMs, std::memory_order_relaxed);
+            mSimulatorDirty = false;
+        }
+    } else {
+        // Sim is running — still clean up finished voices to free slots for
+        // new sounds (e.g., footsteps). IPL source removal is deferred
+        // automatically by removeVoiceSource when sim is busy.
+        cleanupFinishedVoices();
     }
 
     // Run Steam Audio simulation for all active sources
     if (mSceneReady && mIplSimulator && !mVoices.empty()) {
-        // Step 1: Set listener position/orientation for the simulator
         float cosY = std::cos(mListenerYaw), sinY = std::sin(mListenerYaw);
         float cosP = std::cos(mListenerPitch), sinP = std::sin(mListenerPitch);
 
@@ -979,84 +1507,162 @@ void AudioService::loopStep(float deltaTime)
         listenerCoord.origin = {mListenerPos.x, mListenerPos.y, mListenerPos.z};
         listenerCoord.ahead  = {cosY * cosP, sinY * cosP, sinP};
         listenerCoord.right  = {sinY, -cosY, 0.0f};
-        // up = cross(right, ahead) for right-handed Z-up
         listenerCoord.up     = {-cosY * sinP, -sinY * sinP, cosP};
 
-        IPLSimulationSharedInputs sharedInputs{};
-        sharedInputs.listener = listenerCoord;
-        sharedInputs.numRays = 4096;
-        sharedInputs.numBounces = 4;
-        sharedInputs.duration = 2.0f;
-        sharedInputs.order = 1;
-        sharedInputs.irradianceMinDistance = 1.0f;
-        iplSimulatorSetSharedInputs(mIplSimulator,
-            static_cast<IPLSimulationFlags>(
-                IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS),
-            &sharedInputs);
-
-        // Step 2: Update per-source positions
-        for (auto &[handle, voice] : mVoices) {
-            if (!voice->iplSource)
-                continue;
-
-            IPLCoordinateSpace3 sourceCoord{};
-            sourceCoord.origin = {voice->worldPos.x, voice->worldPos.y, voice->worldPos.z};
-            // Sources are omnidirectional — orientation doesn't matter for direct sim,
-            // but Steam Audio requires a valid coordinate frame
-            sourceCoord.ahead = {1.0f, 0.0f, 0.0f};
-            sourceCoord.right = {0.0f, 1.0f, 0.0f};
-            sourceCoord.up    = {0.0f, 0.0f, 1.0f};
-
-            IPLSimulationInputs inputs{};
-            inputs.flags = static_cast<IPLSimulationFlags>(
-                IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
-            inputs.directFlags = static_cast<IPLDirectSimulationFlags>(
-                IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
-                IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION |
-                IPL_DIRECTSIMULATIONFLAGS_OCCLUSION |
-                IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
-            inputs.source = sourceCoord;
-            inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
-            inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
-            inputs.occlusionType = IPL_OCCLUSIONTYPE_RAYCAST;
-            inputs.numOcclusionSamples = 16;
-            inputs.numTransmissionRays = 8;
-
-            iplSourceSetInputs(voice->iplSource,
-                static_cast<IPLSimulationFlags>(
-                    IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS),
-                &inputs);
+        // Update listener orientation for ambisonics decode (audio thread reads this)
+        if (mReflectionMixNode && mReflectionMixNode->ready) {
+            mReflectionMixNode->listenerOrientation = listenerCoord;
         }
 
-        // Step 3: Run the simulation
-        iplSimulatorRunDirect(mIplSimulator);
-        // TODO: Also run reflections when reflection DSP pipeline is ready
-        // iplSimulatorRunReflections(mIplSimulator);
+        // Steps 1-3: Set simulation inputs and launch background sim.
+        // All iplSimulator/iplSource calls must happen when the sim thread is
+        // idle to prevent data races with iplSimulatorRunDirect/Reflections.
+        if (!simBusy) {
+            // Step 1: Set listener position for the simulator
+            IPLSimulationSharedInputs sharedInputs{};
+            sharedInputs.listener = listenerCoord;
+            sharedInputs.numRays = mReflectionNumRays;
+            sharedInputs.numBounces = mReflectionNumBounces;
+            sharedInputs.duration = mReflectionDuration;
+            sharedInputs.order = mAmbisonicsOrder;
+            sharedInputs.irradianceMinDistance = 1.0f;
+            iplSimulatorSetSharedInputs(mIplSimulator,
+                static_cast<IPLSimulationFlags>(
+                    IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS),
+                &sharedInputs);
+
+            // Step 2: Update per-source positions
+            for (auto &[handle, voice] : mVoices) {
+                if (!voice->iplSource)
+                    continue;
+
+                IPLCoordinateSpace3 sourceCoord{};
+                sourceCoord.origin = {voice->worldPos.x, voice->worldPos.y, voice->worldPos.z};
+                sourceCoord.ahead = {1.0f, 0.0f, 0.0f};
+                sourceCoord.right = {0.0f, 1.0f, 0.0f};
+                sourceCoord.up    = {0.0f, 0.0f, 1.0f};
+
+                IPLSimulationInputs inputs{};
+                inputs.flags = static_cast<IPLSimulationFlags>(
+                    IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+                inputs.directFlags = static_cast<IPLDirectSimulationFlags>(
+                    IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
+                    IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION |
+                    IPL_DIRECTSIMULATIONFLAGS_OCCLUSION |
+                    IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
+                inputs.source = sourceCoord;
+                inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
+                inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+                inputs.occlusionType = IPL_OCCLUSIONTYPE_RAYCAST;
+                inputs.numOcclusionSamples = 16;
+                inputs.numTransmissionRays = 8;
+
+                iplSourceSetInputs(voice->iplSource,
+                    static_cast<IPLSimulationFlags>(
+                        IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS),
+                    &inputs);
+            }
+
+            // Step 3: Launch simulation on background thread
+            bool runReflections = mReflectionsEnabled && mIplReflectionMixer
+                && (++mReflectionFrameCounter >= mReflectionThrottle);
+            if (runReflections)
+                mReflectionFrameCounter = 0;
+
+            mReflectionSimRunning.store(true, std::memory_order_release);
+            mReflectionThread = std::thread([this, runReflections]() {
+                iplSimulatorRunDirect(mIplSimulator);
+                if (runReflections) {
+                    iplSimulatorRunReflections(mIplSimulator);
+                    if (mReflectionMixNode)
+                        mReflectionMixNode->simulationRan = true;
+                }
+                mReflectionSimRunning.store(false, std::memory_order_release);
+            });
+        }
 
         // Step 4: Read back simulation results and feed to DSP nodes.
-        // The DSP node's process callback (audio thread) uses these params
-        // for frequency-dependent direct effects + HRTF binaural rendering.
+        // Results are from the previous frame's simulation (1-frame latency) since
+        // we moved both direct and reflection sim to the background thread.
+        // This is imperceptible for both attenuation and reverb changes.
+        // Steam Audio's triple buffer ensures iplSourceGetOutputs returns the
+        // latest completed results without blocking.
+
+        // Select the N closest voices for reflection convolution.
+        // Per-voice convolution is expensive (~98M FLOPs per voice per audio
+        // frame with a 96K IR), so we limit to mMaxReflectionVoices sources.
+        // Remaining voices get direct path only (HRTF + occlusion), which is
+        // cheap and still sounds great.
+        struct VoiceDist {
+            SoundHandle handle;
+            float distSq;
+        };
+        std::vector<VoiceDist> reflCandidates;
+        if (mReflectionsEnabled) {
+            reflCandidates.reserve(mVoices.size());
+            for (auto &[h, v] : mVoices) {
+                // Skip tail voices — they've finished playing and are just
+                // ringing out their convolution tail. Don't let them steal
+                // reflection slots from voices that are actively producing audio.
+                if (v->sourceEnded)
+                    continue;
+                if (v->iplSource && v->dspNode.effectsReady && v->dspNode.reflectionEffect) {
+                    Vector3 delta = v->worldPos - mListenerPos;
+                    reflCandidates.push_back({h, glm::dot(delta, delta)});
+                }
+            }
+            // Partial sort: only need the N closest
+            if (static_cast<int>(reflCandidates.size()) > mMaxReflectionVoices) {
+                std::partial_sort(reflCandidates.begin(),
+                                  reflCandidates.begin() + mMaxReflectionVoices,
+                                  reflCandidates.end(),
+                                  [](const VoiceDist &a, const VoiceDist &b) {
+                                      return a.distSq < b.distSq;
+                                  });
+                reflCandidates.resize(mMaxReflectionVoices);
+            }
+        }
+
         for (auto &[handle, voice] : mVoices) {
             if (!voice->iplSource)
                 continue;
 
             IPLSimulationOutputs outputs{};
-            iplSourceGetOutputs(voice->iplSource,
-                static_cast<IPLSimulationFlags>(IPL_SIMULATIONFLAGS_DIRECT),
-                &outputs);
+            IPLSimulationFlags getFlags = static_cast<IPLSimulationFlags>(
+                IPL_SIMULATIONFLAGS_DIRECT |
+                (mReflectionsEnabled ? IPL_SIMULATIONFLAGS_REFLECTIONS : 0));
+            iplSourceGetOutputs(voice->iplSource, getFlags, &outputs);
 
             if (voice->dspNode.effectsReady) {
-                // Copy simulation outputs directly to DSP node params.
-                // outputs.direct IS an IPLDirectEffectParams — just set the flags
-                // to tell the effect which components to apply.
-                voice->dspNode.directParams = outputs.direct;
-                voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
-                    IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
-                    IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
-                    IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
-                    IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
-                voice->dspNode.directParams.transmissionType =
-                    IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+                // Copy simulation outputs to DSP node params. Guard against
+                // invalid/zero outputs from the simulation — before the first
+                // background sim run, outputs may contain zeros which would
+                // silence the voice. Keep defaults (unity) until sim catches up.
+                if (outputs.direct.distanceAttenuation > 0.0f) {
+                    voice->dspNode.directParams = outputs.direct;
+                    voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
+                        IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
+                        IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
+                        IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
+                        IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+                    voice->dspNode.directParams.transmissionType =
+                        IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+                }
+
+                // Only enable reflection convolution for the N closest voices
+                bool isReflVoice = false;
+                for (const auto &rc : reflCandidates) {
+                    if (rc.handle == handle) { isReflVoice = true; break; }
+                }
+                if (isReflVoice) {
+                    voice->dspNode.reflectionParams = outputs.reflections;
+                    voice->dspNode.reflectionParams.type =
+                        IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+                    voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
+                    voice->dspNode.reflectionsActive = true;
+                } else {
+                    voice->dspNode.reflectionsActive = false;
+                }
 
                 // Compute listener-to-source direction in listener's local frame
                 // for HRTF binaural rendering
@@ -1087,6 +1693,41 @@ void AudioService::loopStep(float deltaTime)
         }
     }
 
+    // Tick reverb tail timers for voices whose source audio has ended.
+    // The voice stays alive during the tail so the per-voice convolution
+    // continues feeding its IR tail into the reflection mixer.
+    for (auto &[handle, voice] : mVoices) {
+        if (voice->sourceEnded && !voice->finished.load(std::memory_order_relaxed)) {
+            if (voice->tailTimer <= 0.0f) {
+                // Start the tail timer if this voice has a reflection effect.
+                // Check reflectionEffect (was it created with one?) not
+                // reflectionsActive (is it in the top N right now?) — a voice
+                // may have been active earlier and accumulated convolution state.
+                if (voice->dspNode.reflectionEffect) {
+                    // Use half the IR duration — the tail decays exponentially,
+                    // so most energy is in the first half. Keeps voice slots free.
+                    voice->tailTimer = mReflectionDuration * 0.5f;
+                    // Ensure convolution stays active during the tail so the
+                    // IR rings out naturally (feed silence → convolution outputs tail)
+                    voice->dspNode.reflectionsActive = true;
+                    std::fprintf(stderr, "[VOICE] TAIL_START h=%d '%s' tail=%.1fs\n",
+                                 handle, voice->schemaName.c_str(), voice->tailTimer);
+                } else {
+                    voice->finished.store(true, std::memory_order_release);
+                    std::fprintf(stderr, "[VOICE] END_NOTAIL h=%d '%s'\n",
+                                 handle, voice->schemaName.c_str());
+                }
+            } else {
+                voice->tailTimer -= deltaTime;
+                if (voice->tailTimer <= 0.0f) {
+                    voice->finished.store(true, std::memory_order_release);
+                    std::fprintf(stderr, "[VOICE] TAIL_DONE h=%d '%s'\n",
+                                 handle, voice->schemaName.c_str());
+                }
+            }
+        }
+    }
+
     // Update ambient sound volumes based on listener distance
     updateAmbientVolumes();
 }
@@ -1098,6 +1739,9 @@ void AudioService::cleanupFinishedVoices()
     // This avoids cross-thread calls to ma_sound_at_end().
     for (auto it = mVoices.begin(); it != mVoices.end();) {
         if (it->second->finished.load(std::memory_order_acquire)) {
+            std::fprintf(stderr, "[VOICE] CLEANUP h=%d '%s' srcEnded=%d tail=%.1f\n",
+                         it->second->handle, it->second->schemaName.c_str(),
+                         it->second->sourceEnded ? 1 : 0, it->second->tailTimer);
             removeVoiceSource(*it->second);
             it = mVoices.erase(it);
         } else {
@@ -1128,17 +1772,37 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
 }
 
 //------------------------------------------------------
+void AudioService::waitForReflectionThread()
+{
+    // If the background reflection thread is running, wait for it to finish.
+    // This prevents Steam Audio's internal data structures from being accessed
+    // while we modify the source list (add/remove/commit).
+    if (mReflectionThread.joinable()) {
+        mReflectionThread.join();
+    }
+    mReflectionSimRunning.store(false, std::memory_order_release);
+}
+
+//------------------------------------------------------
 void AudioService::removeVoiceSource(ActiveVoice &voice)
 {
     if (!voice.iplSource)
         return;
 
+    // If the background sim thread is running, we can't safely call
+    // iplSourceRemove (it races with iplSimulatorRunDirect/Reflections).
+    // Defer the removal — queue the IPL source handle for later cleanup.
+    if (mReflectionSimRunning.load(std::memory_order_acquire)) {
+        mPendingSourceRemovals.push_back(voice.iplSource);
+        voice.iplSource = nullptr;  // detach from voice (we own it now)
+        mSimulatorDirty = true;
+        return;
+    }
+
     if (mIplSimulator) {
         iplSourceRemove(voice.iplSource, mIplSimulator);
         mSimulatorDirty = true;
     }
-    // Release the source handle here (not in ~ActiveVoice) so lifecycle is
-    // self-contained and ordering relative to simulator destruction doesn't matter.
     iplSourceRelease(&voice.iplSource);
     // voice.iplSource is now nullptr (iplSourceRelease nulls the pointer)
 }
@@ -1152,11 +1816,19 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     auto &dsp = voice.dspNode;
     dsp.hrtf = mIplHrtf;
     dsp.frameSize = static_cast<int>(mFrameSize);
+    dsp.reflectionFrameSize = static_cast<int>(mReflectionFrameSize);
+    dsp.halfRate = mHalfRateReflections;
 
     // Allocate processing buffers (once, never reallocated — audio thread safe)
     dsp.monoScratch.resize(dsp.frameSize);
     dsp.stereoL.resize(dsp.frameSize);
     dsp.stereoR.resize(dsp.frameSize);
+    dsp.ambiScratch0.resize(mReflectionFrameSize, 0.0f);
+    if (mAmbisonicsChannels > 1) dsp.ambiScratch1.resize(mReflectionFrameSize, 0.0f);
+    if (mAmbisonicsChannels > 2) dsp.ambiScratch2.resize(mReflectionFrameSize, 0.0f);
+    if (mAmbisonicsChannels > 3) dsp.ambiScratch3.resize(mReflectionFrameSize, 0.0f);
+    if (mHalfRateReflections)
+        dsp.decimatedMono.resize(mReflectionFrameSize, 0.0f);
 
     // Create IPLDirectEffect (per-voice, frequency-dependent 3-band EQ)
     // Must match device sample rate so effects process audio correctly.
@@ -1187,6 +1859,31 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
         return;
     }
 
+    // Create per-voice reflection convolution effect (optional — only if mixer exists).
+    // Uses the reflection sample rate (24kHz or 48kHz) to match the mixer and simulator.
+    if (mIplReflectionMixer) {
+        IPLint32 irSize = static_cast<IPLint32>(mReflectionDuration * mReflectionSampleRate);
+
+        IPLAudioSettings reflAudioSettings{};
+        reflAudioSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
+        reflAudioSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
+
+        IPLReflectionEffectSettings reflSettings{};
+        reflSettings.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+        reflSettings.irSize = irSize;
+        reflSettings.numChannels = static_cast<IPLint32>(mAmbisonicsChannels);
+
+        err = iplReflectionEffectCreate(mIplContext, &reflAudioSettings,
+                                         &reflSettings, &dsp.reflectionEffect);
+        if (err == IPL_STATUS_SUCCESS) {
+            dsp.reflectionMixer = mIplReflectionMixer;
+        } else {
+            LOG_ERROR("AudioService: iplReflectionEffectCreate failed (error %d) "
+                      "— direct effects only for this voice", err);
+            // Continue without reflections for this voice
+        }
+    }
+
     // Initialize custom miniaudio node (stereo input → stereo output).
     // Input is stereo because ma_sound always outputs in the engine's channel format.
     // The process callback downmixes to mono for Steam Audio, then re-spatializes to stereo.
@@ -1204,6 +1901,10 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
                                      &nodeConfig, nullptr, &dsp.base);
     if (result != MA_SUCCESS) {
         LOG_ERROR("AudioService: ma_node_init failed for DSP node (error %d)", result);
+        if (dsp.reflectionEffect) {
+            iplReflectionEffectRelease(&dsp.reflectionEffect);
+            dsp.reflectionEffect = nullptr;
+        }
         iplBinauralEffectRelease(&dsp.binauralEffect);
         dsp.binauralEffect = nullptr;
         iplDirectEffectRelease(&dsp.directEffect);
@@ -1228,19 +1929,28 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     dsp.directParams.transmission[1] = 1.0f;
     dsp.directParams.transmission[2] = 1.0f;
 
-    dsp.effectsReady = true;
+    // Connect the node graph BEFORE setting effectsReady — prevents the audio
+    // thread from trying to process through an unconnected node.
+    //   ma_sound → DSP node → ReflectionMixNode → engine endpoint
+    // If no reflection mix node, fall back to DSP node → engine endpoint
+    ma_node* outputTarget = (mReflectionMixNode && mReflectionMixNode->nodeInitialized)
+        ? reinterpret_cast<ma_node*>(&mReflectionMixNode->base)
+        : static_cast<ma_node*>(ma_engine_get_endpoint(mMaEngine));
 
-    // Connect the node graph: ma_sound → DSP node → engine endpoint
     ma_result r1 = ma_node_attach_output_bus(&voice.sound, 0, &dsp.base, 0);
-    ma_result r2 = ma_node_attach_output_bus(&dsp.base, 0, ma_engine_get_endpoint(mMaEngine), 0);
+    ma_result r2 = ma_node_attach_output_bus(&dsp.base, 0, outputTarget, 0);
 
     if (r1 != MA_SUCCESS || r2 != MA_SUCCESS) {
-        LOG_ERROR("AudioService: DSP node attach failed: sound→dsp=%d, dsp→endpoint=%d",
+        LOG_ERROR("AudioService: DSP node attach failed: sound→dsp=%d, dsp→target=%d",
                   r1, r2);
+        // Don't set effectsReady — the fallback in startVoice will
+        // connect the sound directly to the endpoint
+        return;
     }
 
-    LOG_DEBUG("AudioService: Steam Audio DSP pipeline initialized for voice %d",
-              voice.handle);
+    // Only mark ready AFTER the graph is fully wired — the audio thread
+    // checks this flag before using any Steam Audio effects.
+    dsp.effectsReady = true;
 }
 
 // ── Voice creation helpers ──
@@ -1294,8 +2004,8 @@ bool AudioService::evictLowestPriority(int newPriority)
     if (lowestHandle == SOUND_HANDLE_INVALID)
         return false;  // All existing voices have equal or higher priority
 
-    LOG_DEBUG("AudioService: evicting voice %d (priority %d) for new voice (priority %d)",
-              lowestHandle, lowestPriority, newPriority);
+    std::fprintf(stderr, "[VOICE] EVICT h=%d pri=%d for new pri=%d\n",
+                 lowestHandle, lowestPriority, newPriority);
     haltSound(lowestHandle);
     return true;
 }
@@ -1304,7 +2014,8 @@ bool AudioService::evictLowestPriority(int newPriority)
 SoundHandle AudioService::startVoice(const std::string &schemaName,
                                       const std::string &sampleName,
                                       const Vector3 &position,
-                                      int priority, bool looping, int objID)
+                                      int priority, bool looping,
+                                      int objID, float volume)
 {
     if (!mMaEngine || !mSoundLoader)
         return SOUND_HANDLE_INVALID;
@@ -1312,8 +2023,8 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
     // Enforce voice limit — evict lowest priority if full
     if (static_cast<int>(mVoices.size()) >= MAX_ACTIVE_VOICES) {
         if (!evictLowestPriority(priority)) {
-            LOG_DEBUG("AudioService: voice pool full, cannot play '%s' (priority %d)",
-                      schemaName.c_str(), priority);
+            std::fprintf(stderr, "[VOICE] POOL_FULL cannot play '%s' pri=%d voices=%zu\n",
+                         schemaName.c_str(), priority, mVoices.size());
             return SOUND_HANDLE_INVALID;
         }
     }
@@ -1373,17 +2084,36 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
         ma_sound_set_looping(&voice->sound, MA_TRUE);
     }
 
-    // Set up Steam Audio DSP pipeline (direct + binaural effects)
-    initVoiceDSP(*voice);
+    // DIAGNOSTIC: set to true to bypass Steam Audio entirely and test
+    // raw miniaudio playback. If sounds are still cut off without Steam Audio,
+    // the bug is in miniaudio/decoder/data, not in our DSP pipeline.
+    static const bool sBypassSteamAudio = (std::getenv("DARKNESS_NO_STEAMAUDIO") != nullptr);
 
-    // If DSP setup failed or not available, connect directly to endpoint
+    if (!sBypassSteamAudio) {
+        // Set up Steam Audio DSP pipeline (direct + binaural effects)
+        initVoiceDSP(*voice);
+    }
+
+    // If DSP setup failed, not available, or bypassed — connect directly to endpoint
     if (!voice->dspNode.effectsReady) {
+        if (sBypassSteamAudio) {
+            std::fprintf(stderr, "[VOICE] BYPASS '%s' — Steam Audio disabled via env\n",
+                         schemaName.c_str());
+        } else {
+            std::fprintf(stderr, "[VOICE] DSP_FAIL '%s' sample='%s' — raw bypass to endpoint\n",
+                         schemaName.c_str(), sampleName.c_str());
+        }
         ma_node_attach_output_bus(&voice->sound, 0,
                                   ma_engine_get_endpoint(mMaEngine), 0);
     }
 
     // Create Steam Audio source for spatial simulation
-    createVoiceSource(*voice);
+    if (!sBypassSteamAudio)
+        createVoiceSource(*voice);
+
+    // Set volume BEFORE starting playback — prevents the audio thread from
+    // pulling the first frames at a wrong volume level.
+    ma_sound_set_volume(&voice->sound, volume);
 
     ma_result startResult = ma_sound_start(&voice->sound);
     if (startResult != MA_SUCCESS) {
@@ -1396,9 +2126,20 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
     ma_sound_set_end_callback(&voice->sound, onSoundEnd, voice.get());
 
     SoundHandle h = voice->handle;
-    LOG_DEBUG("AudioService: playing '%s' sample '%s' at (%.1f, %.1f, %.1f) priority=%d",
-              schemaName.c_str(), sampleName.c_str(),
-              position.x, position.y, position.z, priority);
+
+    // Diagnostic: check decoded audio properties
+    ma_uint64 totalFrames = 0;
+    ma_decoder_get_length_in_pcm_frames(&voice->decoder, &totalFrames);
+    ma_uint32 decRate = voice->decoder.outputSampleRate;
+    ma_uint32 decCh = voice->decoder.outputChannels;
+    float durMs = (decRate > 0) ? (totalFrames * 1000.0f / decRate) : 0.0f;
+
+    std::fprintf(stderr, "[VOICE] START h=%d '%s' sample='%s' pri=%d voices=%zu "
+                 "wavBytes=%zu decoded=%lluframes %uHz %uch %.0fms\n",
+                 h, schemaName.c_str(), sampleName.c_str(),
+                 priority, mVoices.size() + 1,
+                 voice->data.wavData.size(), (unsigned long long)totalFrames,
+                 decRate, decCh, durMs);
     mVoices[h] = std::move(voice);
     return h;
 }
@@ -1454,15 +2195,9 @@ SoundHandle AudioService::playSchema(const std::string &schemaName,
     const SchemaSample &sample = schema->samples[idx];
     bool looping = schema->loopParams.isLooping;
 
+    float vol = schemaVolumeToLinear(schema->playParams.volume);
     SoundHandle h = startVoice(schemaName, sample.name, position,
-                               schema->playParams.priority, looping, 0);
-
-    // Apply schema volume to the voice
-    if (h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
-        float vol = schemaVolumeToLinear(schema->playParams.volume);
-        ma_sound_set_volume(&mVoices[h]->sound, vol);
-    }
-
+                               schema->playParams.priority, looping, 0, vol);
     return h;
 }
 
@@ -1512,14 +2247,9 @@ SoundHandle AudioService::playSchemaOnObj(const std::string &schemaName,
     const SchemaSample &sample = schema->samples[idx];
     bool looping = schema->loopParams.isLooping;
 
+    float vol = schemaVolumeToLinear(schema->playParams.volume);
     SoundHandle h = startVoice(schemaName, sample.name, pos,
-                               schema->playParams.priority, looping, objID);
-
-    if (h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
-        float vol = schemaVolumeToLinear(schema->playParams.volume);
-        ma_sound_set_volume(&mVoices[h]->sound, vol);
-    }
-
+                               schema->playParams.priority, looping, objID, vol);
     return h;
 }
 
@@ -1531,11 +2261,19 @@ void AudioService::haltSound(SoundHandle handle)
 
     auto it = mVoices.find(handle);
     if (it != mVoices.end()) {
-        if (it->second->initialized) {
-            ma_sound_stop(&it->second->sound);
+        auto &voice = *it->second;
+        std::fprintf(stderr, "[VOICE] HALT h=%d '%s' hasRefl=%d\n",
+                     handle, voice.schemaName.c_str(),
+                     voice.dspNode.reflectionEffect ? 1 : 0);
+        if (voice.initialized) {
+            // Fade out over 15ms to prevent click/pop from abrupt stop.
+            // miniaudio schedules the stop after the fade completes.
+            ma_sound_stop_with_fade_in_milliseconds(&voice.sound, 15);
         }
-        removeVoiceSource(*it->second);
-        mVoices.erase(it);
+        // Don't destroy immediately — mark sourceEnded so the tail timer
+        // can let any reverb ring out naturally. For voices without a
+        // reflection effect, the tail timer will mark finished immediately.
+        voice.sourceEnded = true;
     }
 }
 
@@ -1621,15 +2359,45 @@ void AudioService::updateAmbientVolumes()
             if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle))
                 ++playing;
         }
-        std::fprintf(stderr, "[Audio] %zu voices, %d/%zu ambients playing, "
-                     "listener=(%.0f,%.0f,%.0f)\n",
-                     mVoices.size(), playing, mAmbients.size(),
-                     mListenerPos.x, mListenerPos.y, mListenerPos.z);
+        // Read and reset audio thread profiling counters
+        float voiceUs = sPerVoicePeakUs.exchange(0.0f, std::memory_order_relaxed);
+        float mixUs   = sMixNodePeakUs.exchange(0.0f, std::memory_order_relaxed);
+        float totalUs = sTotalCallbackPeakUs.exchange(0.0f, std::memory_order_relaxed);
+        int   voiceCalls = sPerVoiceCallCount.exchange(0, std::memory_order_relaxed);
+        float waitMs  = sWaitThreadPeakMs.exchange(0.0f, std::memory_order_relaxed);
+        float commitMs = sCommitPeakMs.exchange(0.0f, std::memory_order_relaxed);
+        (void)voiceCalls;
+
+        // Audio budget: 1024 samples @ 48kHz = 21333µs per callback.
+        float budgetUs = (static_cast<float>(mFrameSize) / mDeviceSampleRate) * 1e6f;
+        float loadPct = (totalUs / budgetUs) * 100.0f;
+
+        int reflVoices = 0;
+        int tailVoices = 0;
+        for (auto &[h, v] : mVoices) {
+            if (v->dspNode.reflectionsActive) ++reflVoices;
+            if (v->sourceEnded && !v->finished.load(std::memory_order_relaxed)) ++tailVoices;
+        }
+
+        std::fprintf(stderr, "[Audio] %zu voices (%d refl, %d tail), %d/%zu ambients | "
+                     "total=%.0f/%.0fµs (%.0f%%) peak_voice=%.0fµs mix=%.0fµs | "
+                     "main: wait=%.1fms commit=%.1fms\n",
+                     mVoices.size(), reflVoices, tailVoices, playing, mAmbients.size(),
+                     totalUs, budgetUs, loadPct,
+                     voiceUs, mixUs,
+                     waitMs, commitMs);
     }
 
     for (auto &amb : mAmbients) {
         float dist = glm::length(mListenerPos - amb.position);
-        bool inRange = (amb.radius > 0.0f && dist < amb.radius);
+        // Hysteresis: start at radius, stop at radius * 1.1.
+        // Prevents voice churn when listener hovers near the boundary —
+        // each start/stop creates/destroys IPL effects and triggers
+        // iplSimulatorCommit, which is expensive with many ambients.
+        bool alreadyPlaying = (amb.handle != SOUND_HANDLE_INVALID);
+        float stopRadius = amb.radius * 1.5f;
+        bool inRange = (amb.radius > 0.0f &&
+                        (alreadyPlaying ? dist < stopRadius : dist < amb.radius));
 
         if (inRange) {
             // Start voice if not already playing
@@ -1639,14 +2407,17 @@ void AudioService::updateAmbientVolumes()
                     const SchemaEntry *schema = mSchemaParser->findSchema(amb.schemaName);
                     if (schema && !schema->samples.empty()) {
                         const SchemaSample &sample = schema->samples[0];
+                        float ambVol = schemaVolumeToLinear(schema->playParams.volume);
                         amb.handle = startVoice(amb.schemaName, sample.name, amb.position,
-                                                schema->playParams.priority, isLooping, amb.objID);
+                                                schema->playParams.priority, isLooping,
+                                                amb.objID, ambVol);
                     }
                 }
                 // Fallback: try loading schema name as a raw sound
                 if (amb.handle == SOUND_HANDLE_INVALID) {
                     amb.handle = startVoice(amb.schemaName, amb.schemaName, amb.position,
-                                            64, isLooping, amb.objID);
+                                            64, isLooping, amb.objID,
+                                            schemaVolumeToLinear(amb.volume));
                 }
             }
 
@@ -1658,12 +2429,20 @@ void AudioService::updateAmbientVolumes()
                     continue;
                 }
 
-                float falloff = 1.0f - (dist / amb.radius);
+                float falloff = std::max(0.0f, 1.0f - (dist / amb.radius));
                 if (!(amb.flags & AMB_NO_FADE)) {
                     falloff *= falloff;  // quadratic curve for natural fade
                 }
+                // Only apply schema base volume here — Steam Audio's DSP handles
+                // distance attenuation via simulation. Don't double-attenuate.
                 float baseVol = schemaVolumeToLinear(amb.volume);
-                ma_sound_set_volume(&it->second->sound, baseVol * falloff);
+                if (it->second->dspNode.effectsReady) {
+                    // DSP active: set base volume only, let Steam Audio handle distance
+                    ma_sound_set_volume(&it->second->sound, baseVol);
+                } else {
+                    // No DSP: apply manual distance falloff
+                    ma_sound_set_volume(&it->second->sound, baseVol * falloff);
+                }
             }
         } else {
             // Out of range — stop voice to free the slot and DSP resources
@@ -1823,10 +2602,19 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
     const SchemaSample &sample = schema->samples[idx];
 
     SoundHandle h = startVoice(schema->name, sample.name, pos,
-                               schema->playParams.priority, false, 0);
+                               schema->playParams.priority, false, 0, finalVol);
 
     if (h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
-        ma_sound_set_volume(&mVoices[h]->sound, finalVol);
+        // Diagnostic: count concurrent footstep voices (including tails)
+        int footActive = 0, footTail = 0;
+        for (auto &[fh, fv] : mVoices) {
+            if (fv->schemaName.find("foot_") == 0 || fv->schemaName.find("land_") == 0) {
+                if (fv->sourceEnded) ++footTail;
+                else ++footActive;
+            }
+        }
+        std::fprintf(stderr, "[FOOT] h=%d '%s' vol=%.2f spd=%.1f active=%d tail=%d\n",
+                     h, sample.name.c_str(), finalVol, speed, footActive, footTail);
     }
 }
 
@@ -1944,11 +2732,7 @@ void AudioService::playLanding(const Vector3 &pos, float fallSpeed, int textureI
     const SchemaSample &sample = schema->samples[0];
 
     SoundHandle h = startVoice(schema->name, sample.name, pos,
-                               schema->playParams.priority, false, 0);
-
-    if (h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
-        ma_sound_set_volume(&mVoices[h]->sound, finalVol);
-    }
+                               schema->playParams.priority, false, 0, finalVol);
 }
 
 // ── Sound propagation through portal graph (AI hearing) ──
