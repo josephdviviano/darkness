@@ -62,6 +62,14 @@
         Vector3 desired = forward * (mInputForward * forwardSpeed)
                         + right   * (mInputRight   * strafeSpeed);
 
+        // Clamp diagonal movement: when forward + strafe are combined,
+        // the vector magnitude exceeds the forward speed (sqrt(fwd²+str²)).
+        // Cap to forward speed so diagonal is never faster than straight.
+        // Inspired by Godot's Input::get_vector() unit-circle clamping.
+        float mag = glm::length(desired);
+        if (mag > forwardSpeed)
+            desired *= (forwardSpeed / mag);
+
         return desired;
     }
 
@@ -224,6 +232,11 @@
             Vector3 swimDesired = forward3D * (mInputForward * fwdSpeed)
                                 + right     * (mInputRight   * strSpeed);
 
+            // Clamp diagonal swim speed to forward speed
+            float swimMag = glm::length(swimDesired);
+            if (swimMag > fwdSpeed)
+                swimDesired *= (fwdSpeed / swimMag);
+
             // Flat friction (no velocity-dependent drag — that's in the friction-force path, bypassed
             // for velocity-controlled objects). Swim control rate: 11 * 180 * 0.3 / 1.0 = 594.
             float rate = CONTROL_MULTIPLIER * mMass * WATER_BASE_FRICTION / VELOCITY_RATE;
@@ -266,6 +279,11 @@
 
             Vector3 climbDesired = lookDir  * (mInputForward * fwdSpeed)
                                  + rightDir * (mInputRight   * strSpeed);
+
+            // Clamp diagonal climb speed to forward speed
+            float climbMag = glm::length(climbDesired);
+            if (climbMag > fwdSpeed)
+                climbDesired *= (fwdSpeed / climbMag);
 
             // Full ground-level friction for wall traction
             float friction = FRICTION_FACTOR * mGravityMag;
