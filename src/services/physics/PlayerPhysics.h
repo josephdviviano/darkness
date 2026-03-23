@@ -393,6 +393,11 @@ public:
     /// sound selection. Phase 3 Audio will use this to play surface-appropriate sounds.
     void setFootstepCallback(FootstepCallback cb) { mFootstepCb = std::move(cb); }
 
+    /// Register a callback for landing impact sound events. Fired when the player
+    /// transitions from airborne (Jump mode) to ground contact with sufficient velocity.
+    /// Receives foot position, downward fall speed, and ground texture index.
+    void setLandingCallback(LandingCallback cb) { mLandingCb = std::move(cb); }
+
     /// Callback for object collision testing. Called per physics step during resolveCollisions(),
     /// after WR polygon tests but before push de-duplication. Receives 5 submodel sphere centers
     /// and radii, player's current portal cell, and output vector to append SphereContact results.
@@ -740,7 +745,8 @@ private:
     std::vector<float> mClimbabilityTable;
 
     // ── Callbacks ──
-    FootstepCallback mFootstepCb;            // footstep sound event (Phase 3 Audio stub)
+    FootstepCallback mFootstepCb;            // footstep sound event (stride-based)
+    LandingCallback mLandingCb;              // landing impact sound event
     ObjectCollisionCallback mObjectCollisionCb;  // player-vs-object collision (Task 26)
     const ObjectCollisionWorld *mObjectWorld = nullptr;  // for OBB lookup in object stepping
 

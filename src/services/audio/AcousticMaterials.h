@@ -44,13 +44,17 @@ inline const char *kAcousticKeywords[] = {
     "plaster",
     "carpet",
     "gravel",
+    "bronze",    // bronze metal fixtures
     // 5 chars
     "brick",
     "glass",
     "stone",
     "metal",
+    "grate",     // metal grating (city/Gratesqr, iroGrate, etc.)
+    "plate",     // metal plates (city/Plate, etc.)
     "floor",     // many Thief 2 families like "wfloor", "sfloor" are wood/stone
     "earth",
+    "steel",     // steel surfaces
     // 4 chars
     "wood",
     "rock",
@@ -59,6 +63,7 @@ inline const char *kAcousticKeywords[] = {
     "dirt",
     "rust",      // rusty metal surfaces
     "iron",      // iron metal surfaces
+    "pipe",      // metal piping
     "door",      // wooden doors (wdoor, etc.)
     "gate",      // metal gates
     "roof",      // rooftop surfaces (tile/stone)

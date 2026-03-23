@@ -131,6 +131,11 @@ using ContactCallback = std::function<void(const ContactEvent &)>;
 /// pos = player foot position, speed = horizontal speed, materialIdx = ground texture
 using FootstepCallback = std::function<void(const Vector3 &pos, float speed, int materialIdx)>;
 
+/// Callback type for landing sound events.
+/// Fired when the player transitions from airborne to ground contact.
+/// pos = player foot position, fallSpeed = downward velocity at impact, materialIdx = ground texture
+using LandingCallback = std::function<void(const Vector3 &pos, float fallSpeed, int materialIdx)>;
+
 // ============================================================================
 // IPhysicsWorld — the physics interface
 // ============================================================================
@@ -251,6 +256,10 @@ public:
     /// Register a callback for footstep sound events. Called when the player's
     /// foot travel distance exceeds the stride threshold (distance-based).
     virtual void setFootstepCallback(FootstepCallback cb) = 0;
+
+    /// Register a callback for landing sound events. Called when the player
+    /// lands after a jump or fall, with the impact velocity for volume scaling.
+    virtual void setLandingCallback(LandingCallback cb) = 0;
 
     /// Query the player's current mode (Stand, Crouch, Swim, Jump, etc.)
     virtual int getPlayerMode() const = 0;
