@@ -149,6 +149,14 @@ struct SteamAudioDSPNode {
     IPLDirectEffectParams directParams{};
     IPLVector3 direction{1.0f, 0.0f, 0.0f};  // listener-to-source (listener-local frame)
 
+    // Portal-based sound propagation (alternative to direct line-of-sight).
+    // When a sound is occluded but reachable through connected rooms (doorways,
+    // corridors), the portal path provides attenuation and direction from the
+    // last portal the sound passed through.
+    bool usePortalRouting = false;
+    float portalAttenuation = 0.0f;      // inverse-square from effective distance
+    IPLVector3 portalDirection{1.0f, 0.0f, 0.0f}; // direction toward virtual source (portal center)
+
     // Reflection convolution effect (per-voice, feeds into shared mixer)
     IPLReflectionEffect reflectionEffect = nullptr;
 
@@ -378,16 +386,31 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
 
         iplBinauralEffectApply(node->binauralEffect, &binParams, &binauralIn, &outBuf);
 
-        // Apply direct effect attenuation as post-multiply on stereo output.
-        // This gives us distance falloff, occlusion, and air absorption
-        // without chaining the IPLDirectEffect into the binaural input.
+        // Apply attenuation from the best available propagation path.
+        // Three paths are considered (highest energy wins):
+        //   1. Direct line-of-sight (Steam Audio: distance × occlusion × air)
+        //   2. Portal routing (through doorways/corridors, effective distance)
+        //   3. Transmission through walls (part of direct sim, very quiet)
         if (runAtten) {
-            float atten = node->directParams.distanceAttenuation
-                        * node->directParams.occlusion;
+            float directAtten = node->directParams.distanceAttenuation
+                              * node->directParams.occlusion;
             float airAvg = (node->directParams.airAbsorption[0]
                           + node->directParams.airAbsorption[1]
                           + node->directParams.airAbsorption[2]) / 3.0f;
-            atten *= airAvg;
+            directAtten *= airAvg;
+
+            // Portal routing provides an alternative path through connected rooms.
+            // Use whichever path delivers more energy to the listener.
+            float atten = directAtten;
+            if (node->usePortalRouting && node->portalAttenuation > directAtten) {
+                atten = node->portalAttenuation;
+                // Override HRTF direction to point toward the portal (doorway)
+                // where the sound is arriving from, not the actual source behind
+                // the wall. This will take effect on the NEXT binaural apply
+                // (current frame already processed with direct direction).
+                // The 1-frame lag is imperceptible.
+            }
+
             if (atten < 0.001f) atten = 0.001f;
             node->lastAtten.store(atten, std::memory_order_relaxed);
             for (ma_uint32 i = 0; i < frameCount; ++i) {
@@ -1666,15 +1689,14 @@ void AudioService::loopStep(float deltaTime)
 
                 // Compute listener-to-source direction in listener's local frame
                 // for HRTF binaural rendering
+                Vector3 right(sinY, -cosY, 0.0f);
+                Vector3 ahead(cosY * cosP, sinY * cosP, sinP);
+                Vector3 up(-cosY * sinP, -sinY * sinP, cosP);
+
                 Vector3 toSource = voice->worldPos - mListenerPos;
                 float dist = glm::length(toSource);
                 if (dist > 0.001f) {
                     toSource /= dist;
-                    // Listener basis vectors (Z-up right-handed)
-                    Vector3 right(sinY, -cosY, 0.0f);
-                    Vector3 ahead(cosY * cosP, sinY * cosP, sinP);
-                    Vector3 up(-cosY * sinP, -sinY * sinP, cosP);
-
                     // Project world direction onto listener-local axes.
                     // Steam Audio convention: +X=right, +Y=up, -Z=ahead,
                     // so negate the ahead component for correct front/back.
@@ -1684,6 +1706,46 @@ void AudioService::loopStep(float deltaTime)
                         -glm::dot(toSource, ahead)    // z = -ahead (Steam Audio: -Z = forward)
                     };
                 }
+
+                // Portal-based sound propagation: find indirect paths through
+                // connected rooms (doorways, corridors). When a sound is occluded
+                // by geometry but reachable through the portal graph, the portal
+                // path provides an alternative with attenuation based on effective
+                // distance and direction from the last portal (virtual source).
+                // Skip for tail voices — they're just ringing out convolution.
+                if (!voice->sourceEnded) {
+                SoundPropInfo prop = propagateSound(voice->worldPos, mListenerPos);
+                if (prop.reached) {
+                    // Gentle inverse-distance attenuation scaled for Dark Engine
+                    // world units (~1 unit = 1 foot). At 30 units (one room), ~62%.
+                    // At 100 units (several rooms), ~33%. At 200 units (max), ~20%.
+                    float portalAtten = 1.0f / (1.0f + prop.effectiveDistance * 0.02f);
+                    voice->dspNode.portalAttenuation = portalAtten;
+                    voice->dspNode.usePortalRouting = true;
+
+                    // If the portal path delivers more energy than the direct path,
+                    // override the HRTF direction to point toward the virtual source
+                    // (the last portal center). The sound appears to come from the
+                    // doorway it traveled through, not from behind the wall.
+                    float directAtten = voice->dspNode.directParams.distanceAttenuation
+                                      * voice->dspNode.directParams.occlusion;
+                    if (portalAtten > directAtten) {
+                        Vector3 toPortal = prop.virtualPosition - mListenerPos;
+                        float portalDist = glm::length(toPortal);
+                        if (portalDist > 0.001f) {
+                            toPortal /= portalDist;
+                            voice->dspNode.direction = {
+                                glm::dot(toPortal, right),
+                                glm::dot(toPortal, up),
+                                -glm::dot(toPortal, ahead)
+                            };
+                        }
+                    }
+                } else {
+                    voice->dspNode.usePortalRouting = false;
+                    voice->dspNode.portalAttenuation = 0.0f;
+                }
+                } // end !sourceEnded portal routing
             } else {
                 // Fallback: simple volume scaling (no DSP pipeline available)
                 float volume = outputs.direct.distanceAttenuation *
