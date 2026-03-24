@@ -289,10 +289,22 @@ bool SchemaParser::loadDirectory(const std::string &dirPath)
     for (const auto &f : arcFiles) loadFile(f);
     for (const auto &f : schFiles) loadFile(f);
 
+    // Deferred archetype resolution pass: resolve any schemas whose archetype
+    // wasn't defined yet when they were parsed (forward references across files).
+    // Only re-resolve schemas that failed initial resolution.
+    int deferredResolved = 0;
+    for (auto &[key, schema] : mSchemas) {
+        if (!schema.archetypeName.empty() && !schema.archetypeResolved) {
+            resolveArchetype(schema);
+            schema.archetypeResolved = true;
+            ++deferredResolved;
+        }
+    }
+
     std::fprintf(stderr, "SchemaParser: loaded %zu schemas, %zu tags, "
-                 "%zu voices, %zu concepts from %s\n",
+                 "%zu voices, %zu concepts from %s (%d archetypes resolved)\n",
                  mSchemas.size(), mTags.size(), mVoices.size(),
-                 mConcepts.size(), dirPath.c_str());
+                 mConcepts.size(), dirPath.c_str(), deferredResolved);
 
     return mErrors.empty();
 }
@@ -349,9 +361,13 @@ void SchemaParser::parseSchemaEntry(Tokenizer &tok)
         parseSamples(tok, entry);
     }
 
-    // Resolve archetype inheritance
+    // Resolve archetype inheritance (may fail for forward references — deferred pass retries)
     if (!entry.archetypeName.empty()) {
-        resolveArchetype(entry);
+        std::string parentKey = toLower(entry.archetypeName);
+        if (mSchemas.find(parentKey) != mSchemas.end()) {
+            resolveArchetype(entry);
+            entry.archetypeResolved = true;
+        }
     }
 
     // Store (case-insensitive key)
@@ -818,10 +834,18 @@ SchemaParser::findByEnvTags(const std::vector<SchemaTagValue> &queryTags) const
                     // Wildcard match (no values specified)
                     tagFound = true;
                 } else if (reqTag.isIntRange) {
-                    // Integer range: query must be in range
+                    // Integer range: query value/range must fall within schema's range
                     if (qTag.isIntRange) {
                         tagFound = (qTag.rangeMin >= reqTag.rangeMin &&
                                     qTag.rangeMax <= reqTag.rangeMax);
+                    } else if (!qTag.enumValues.empty()) {
+                        // Single integer value passed as enum string — parse and check range
+                        try {
+                            int val = std::stoi(qTag.enumValues[0]);
+                            tagFound = (val >= reqTag.rangeMin && val <= reqTag.rangeMax);
+                        } catch (...) {
+                            tagFound = false;
+                        }
                     }
                 } else {
                     // Enum match: any query value must match any schema value
@@ -840,6 +864,29 @@ SchemaParser::findByEnvTags(const std::vector<SchemaTagValue> &queryTags) const
             if (!tagFound) {
                 allMatch = false;
                 break;
+            }
+        }
+
+        // Enforce env_tag_required: if the query includes a required tag,
+        // the schema MUST also include that tag. This prevents schemas without
+        // the tag from being selected when the query specifies a required context.
+        if (allMatch) {
+            for (const auto &qTag : queryTags) {
+                std::string qKey = toLower(qTag.tagName);
+                if (mRequiredEnvTags.count(qKey)) {
+                    // Query has a required tag — schema must also have it
+                    bool schemaHasTag = false;
+                    for (const auto &sTag : schema.envTags) {
+                        if (toLower(sTag.tagName) == qKey) {
+                            schemaHasTag = true;
+                            break;
+                        }
+                    }
+                    if (!schemaHasTag) {
+                        allMatch = false;
+                        break;
+                    }
+                }
             }
         }
 
