@@ -530,20 +530,17 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
 
             // Architecture B routing:
             // - Cross-room voices: portal attenuation × last-segment occlusion.
-            //   The IPLSource position was set to the virtual position (doorway),
+            //   The IPLSource was positioned at the virtual position (doorway),
             //   so directAtten reflects occlusion from doorway to listener.
-            // - Same-room voices: Steam Audio direct path, but use portal
-            //   attenuation as a minimum floor. This prevents ambient sources
-            //   partially embedded in geometry (or near corners) from being
-            //   silenced by transient occlusion spikes from Steam Audio.
+            // - Same-room / no-room voices: Steam Audio direct path only.
+            //   Wall occlusion is trusted — if Steam Audio says there's a wall,
+            //   the sound is muffled regardless of portal graph reachability.
+            //   (The portal floor was previously overriding legitimate wall
+            //   occlusion for sounds behind walls that happened to be portal-
+            //   reachable through a long doorway chain.)
             float atten = directAtten;
             if (node->usePortalRouting) {
                 atten = node->portalAttenuation * directAtten;
-            } else if (node->portalAttenuation > 0.0f) {
-                // Same-room: use the better of direct path and portal path.
-                // Portal attenuation provides a stable distance-based floor
-                // that prevents flickering from occlusion noise.
-                atten = std::max(directAtten, node->portalAttenuation);
             }
 
             if (atten < 0.001f) atten = 0.001f;
