@@ -1734,14 +1734,35 @@ int main(int argc, char *argv[]) {
 
                 bool isPortal = (pi >= numSolid);
 
+                // The WR polygon ordering within each cell is:
+                //   [0, numSolid)        — solid walls (textured, physical)
+                //   [numSolid, numTex)   — rendered portals (water/glass boundaries)
+                //   [numTex, numPolys)   — non-rendered portals (BSP splits)
+                //
+                // Non-rendered portals are BSP subdivision artifacts — invisible
+                // boundaries created when the BSP compiler splits large cells.
+                // In outdoor areas, these create a lattice of phantom surfaces
+                // floating in mid-air. They must be EXCLUDED from the acoustic
+                // mesh to prevent phantom reflections.
+                bool isNonRenderedPortal = isPortal && (pi >= cell.numTextured);
+                if (isNonRenderedPortal)
+                    continue;
+
                 // Skip sky polygons (BACKHACK_IDX = 249) — only solid polys have textures
                 if (!isPortal && pi < cell.numTextured && cell.texturing[pi].txt == 249)
                     continue;
 
+                // Also skip water boundary textures (WATERIN_IDX=247, WATEROUT_IDX=248)
+                // — these are medium transitions, not acoustically reflective surfaces
+                if (!isPortal && pi < cell.numTextured) {
+                    uint8_t txtIdx = cell.texturing[pi].txt;
+                    if (txtIdx >= 247)  // WATERIN, WATEROUT, BACKHACK — all non-physical
+                        continue;
+                }
+
                 // Determine texture name for material lookup.
-                // Portal polygons have no texture — use a special sentinel that maps
-                // to a high-transmission material so Steam Audio rays can pass through
-                // doorways while still closing the mesh (no holes at cell boundaries).
+                // Rendered portal polygons (water/glass boundaries) use the _portal
+                // material. Solid walls use their TXLIST texture for material matching.
                 std::string texName = "generic";
                 if (isPortal) {
                     texName = "_portal";
