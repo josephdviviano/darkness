@@ -132,7 +132,6 @@ struct AmbientSound {
     uint32_t flags = 0;               ///< AmbientHackFlags
     SoundHandle handle = SOUND_HANDLE_INVALID; ///< Active voice handle (if playing)
     float smoothedEffDist = 1e9f;     ///< Temporally smoothed effective distance (EMA)
-    float fadeInTimer = 0.0f;         ///< Seconds remaining for fade-in ramp (0 = done)
 };
 
 /// Maximum simultaneous active voices (matches Dark Engine's limit)
