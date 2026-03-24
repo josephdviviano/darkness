@@ -45,6 +45,10 @@ inline const char *kAcousticKeywords[] = {
     "carpet",
     "gravel",
     "bronze",    // bronze metal fixtures
+    // 6 chars — specific floor families (checked before generic "floor")
+    "wfloor",    // wood floor (e.g., wfloor/plank01)
+    "sfloor",    // stone floor (e.g., sfloor/grey01)
+    "mfloor",    // metal floor (e.g., mfloor/grate01)
     // 5 chars
     "brick",
     "glass",
@@ -52,7 +56,7 @@ inline const char *kAcousticKeywords[] = {
     "metal",
     "grate",     // metal grating (city/Gratesqr, iroGrate, etc.)
     "plate",     // metal plates (city/Plate, etc.)
-    "floor",     // many Thief 2 families like "wfloor", "sfloor" are wood/stone
+    "floor",     // generic floor fallback (→ stone)
     "earth",
     "steel",     // steel surfaces
     // 4 chars

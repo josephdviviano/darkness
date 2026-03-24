@@ -115,6 +115,7 @@ struct SchemaTagValue {
 struct SchemaEntry {
     std::string name;
     std::string archetypeName;    // Parent archetype name (for inheritance)
+    bool archetypeResolved = false; // true after successful archetype resolution
     SchemaPlayParams playParams;
     SchemaLoopParams loopParams;
     std::vector<SchemaSample> samples;

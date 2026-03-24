@@ -41,6 +41,7 @@ struct RenderConfig {
     bool probePathing        = true;   // baked probe diffraction/pathing (when available)
     bool realtimeReflections = true;   // Steam Audio real-time convolution reverb
 
+
     // -- physics --
     int physicsRate = 60;  // physics timestep Hz: 12 = vintage (12.5Hz), 60 = modern, 120 = ultra
 
