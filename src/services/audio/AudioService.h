@@ -459,6 +459,11 @@ private:
 
     // ── Texture material mapping (for footstep schema selection) ──
 
+    /// Per-room LoudRoom transmission factor (keyed by room ID, default 1.0).
+    /// Values < 1.0 dampen sound passing through the room, > 1.0 amplify.
+    /// Parsed from P$LoudRoom property on room objects.
+    std::unordered_map<int32_t, float> mRoomTransmission;
+
     /// Per-texture material keyword (indexed by TXLIST texture index).
     /// E.g., "stone", "metal", "wood", "carpet", "generic" (default).
     std::vector<std::string> mTextureMaterials;
