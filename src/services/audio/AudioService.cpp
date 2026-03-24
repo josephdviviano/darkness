@@ -174,6 +174,7 @@ struct SteamAudioDSPNode {
     // corridors), the portal path provides attenuation and direction from the
     // last portal the sound passed through.
     bool usePortalRouting = false;
+    bool skipAttenuation = false;        // true for player-emitted sounds (footsteps, within 5 units)
     float portalAttenuation = 0.0f;      // inverse-square from effective distance
     IPLVector3 portalDirection{1.0f, 0.0f, 0.0f}; // direction toward virtual source (portal center)
 
@@ -510,7 +511,7 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         //   1. Direct line-of-sight (Steam Audio: distance × occlusion × air)
         //   2. Portal routing (through doorways/corridors, effective distance)
         //   3. Transmission through walls (part of direct sim, very quiet)
-        if (runAtten) {
+        if (runAtten && !node->skipAttenuation) {
             float airAvg = (node->directParams.airAbsorption[0]
                           + node->directParams.airAbsorption[1]
                           + node->directParams.airAbsorption[2]) / 3.0f;
@@ -524,16 +525,8 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             float transAvg = (node->directParams.transmission[0]
                             + node->directParams.transmission[1]
                             + node->directParams.transmission[2]) / 3.0f;
-            // For very close sources (distanceAttenuation > 0.9, i.e., within ~3 units),
-            // bypass occlusion — Steam Audio's rays from feet-to-head can hit floor
-            // geometry, producing transient occlusion spikes that cut off footsteps.
-            // There is no meaningful wall occlusion at this range.
-            float occlusion = node->directParams.occlusion;
-            if (node->directParams.distanceAttenuation > 0.9f) {
-                occlusion = 1.0f;  // no occlusion for very close sources
-            }
             float directAtten = node->directParams.distanceAttenuation
-                              * (occlusion + transAvg * (1.0f - occlusion))
+                              * (node->directParams.occlusion + transAvg * (1.0f - node->directParams.occlusion))
                               * airAvg;
 
             // Architecture B routing:
@@ -834,6 +827,7 @@ struct ActiveVoice {
     std::string schemaName;            // Schema that spawned this voice
     int priority = 128;                // 0-255, higher = more important
     int objID = 0;                     // Object ID if attached (0 = positional)
+    bool playerEmitted = false;        // true for footsteps/landing — skip DSP attenuation
 
     // Steam Audio simulation source (nullptr if scene not ready or non-spatial)
     IPLSource iplSource = nullptr;
@@ -1833,10 +1827,14 @@ void AudioService::loopStep(float deltaTime)
                 if (!voice->iplSource)
                     continue;
 
+                // Player-emitted sounds (footsteps, landing) bypass DSP
+                // attenuation — the player's own sounds are never wall-occluded.
+                voice->dspNode.skipAttenuation = voice->playerEmitted;
+
                 // Run portal propagation to determine reachability and path
                 SoundPropInfo prop{};
                 bool isCrossRoom = false;
-                if (mPortalRoutingEnabled && !voice->sourceEnded) {
+                if (mPortalRoutingEnabled && !voice->sourceEnded && !voice->playerEmitted) {
                     auto prT0 = std::chrono::steady_clock::now();
                     prop = propagateSoundBlended(voice->worldPos);
                     auto prT1 = std::chrono::steady_clock::now();
@@ -3190,6 +3188,13 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
     SoundHandle h = startVoice(schema->name, sample.name, pos,
                                schema->playParams.priority, false, 0, finalVol);
 
+    // Mark as player-emitted so the DSP callback skips attenuation.
+    // The player's own footsteps should always be audible at the volume
+    // set by the footstep system — never occluded by floor geometry.
+    if (h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
+        mVoices[h]->playerEmitted = true;
+    }
+
     if (h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
         // Diagnostic: count concurrent footstep voices (including tails)
         int footActive = 0, footTail = 0;
@@ -3319,6 +3324,11 @@ void AudioService::playLanding(const Vector3 &pos, float fallSpeed, int textureI
 
     SoundHandle h = startVoice(schema->name, sample.name, pos,
                                schema->playParams.priority, false, 0, finalVol);
+
+    // Mark as player-emitted — landing impacts are never occluded
+    if (h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
+        mVoices[h]->playerEmitted = true;
+    }
 }
 
 // ── Portal blend: smooth room transitions ──
