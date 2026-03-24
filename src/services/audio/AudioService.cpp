@@ -528,19 +528,22 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                               * (node->directParams.occlusion + transAvg * (1.0f - node->directParams.occlusion))
                               * airAvg;
 
-            // Architecture B: cross-room voices use portal attenuation (from room
-            // BFS effective distance) multiplied by Steam Audio's last-segment
-            // occlusion. Same-room voices use Steam Audio's direct path only.
-            // The IPLSource position was already set to the virtual position for
-            // cross-room voices, so directAtten reflects the last-segment occlusion
-            // from the doorway to the listener.
+            // Architecture B routing:
+            // - Cross-room voices: portal attenuation × last-segment occlusion.
+            //   The IPLSource position was set to the virtual position (doorway),
+            //   so directAtten reflects occlusion from doorway to listener.
+            // - Same-room voices: Steam Audio direct path, but use portal
+            //   attenuation as a minimum floor. This prevents ambient sources
+            //   partially embedded in geometry (or near corners) from being
+            //   silenced by transient occlusion spikes from Steam Audio.
             float atten = directAtten;
             if (node->usePortalRouting) {
-                // Multiply portal-path attenuation by the last-segment occlusion
-                // from Steam Audio. This gives frequency-dependent filtering
-                // through the doorway opening while the overall volume comes from
-                // the room-graph path distance.
                 atten = node->portalAttenuation * directAtten;
+            } else if (node->portalAttenuation > 0.0f) {
+                // Same-room: use the better of direct path and portal path.
+                // Portal attenuation provides a stable distance-based floor
+                // that prevents flickering from occlusion noise.
+                atten = std::max(directAtten, node->portalAttenuation);
             }
 
             if (atten < 0.001f) atten = 0.001f;
