@@ -1828,9 +1828,14 @@ void AudioService::loopStep(float deltaTime)
                     sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
                     sPortalRoutingCount.fetch_add(1, std::memory_order_relaxed);
 
-                    // Determine if the voice is in a different room from the listener
+                    // Determine if the voice is in a different room from the listener.
+                    // Minimum distance threshold: sounds very close to the listener
+                    // (footsteps, player-emitted sounds) are always same-room even if
+                    // roomFromPoint returns different rooms at floor/ceiling boundaries.
                     Room *srcRoom = mRoomService ? mRoomService->roomFromPoint(voice->worldPos) : nullptr;
-                    isCrossRoom = (srcRoom && listenerRoom && srcRoom != listenerRoom);
+                    float srcListenerDist = glm::length(voice->worldPos - mListenerPos);
+                    isCrossRoom = (srcRoom && listenerRoom && srcRoom != listenerRoom
+                                   && srcListenerDist > 5.0f);
                 }
 
                 // Store propagation result on DSP node for the audio callback
@@ -2988,19 +2993,21 @@ void AudioService::updateAmbientVolumes()
                     continue;
                 }
 
-                // Use the stop radius for falloff so the hysteresis zone
-                // fades smoothly instead of producing silent voices.
-                // At dist=0: falloff=1.0. At dist=stopRadius: falloff=0.0.
-                float falloff = std::max(0.0f, 1.0f - (dist / stopRadius));
-                if (!(amb.flags & AMB_NO_FADE)) {
-                    falloff *= falloff;  // quadratic curve for natural fade
-                }
-                // Apply schema base volume with distance falloff.
-                // Use stopRadius for falloff to avoid silent hysteresis zone.
-                // Steam Audio's DSP will apply additional occlusion/air absorption
-                // on top via the directParams in the audio callback.
+                // Set the base schema volume only. Steam Audio's DSP callback
+                // handles all distance-dependent attenuation (inverse-square,
+                // occlusion, air absorption) via directParams. We don't apply
+                // our own distance falloff here to avoid double-dipping.
+                //
+                // Only apply a fade in the hysteresis zone (beyond the nominal
+                // radius) so the voice fades smoothly to silence at the stop
+                // boundary instead of cutting off abruptly.
                 float baseVol = schemaVolumeToLinear(amb.volume);
-                float targetVol = baseVol * falloff;
+                float targetVol = baseVol;
+                if (dist > amb.radius) {
+                    // In hysteresis zone: linear fade from baseVol to 0
+                    float fade = 1.0f - (dist - amb.radius) / (stopRadius - amb.radius);
+                    targetVol = baseVol * std::max(0.0f, fade);
+                }
                 ma_sound_set_volume(&it->second->sound, targetVol);
             }
         } else {
@@ -3126,7 +3133,11 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
     //   run   (~15 u/s)   → loud (1.0)
     float speedFactor = std::clamp(speed / 15.0f, 0.1f, 1.0f);
     float baseVol = schemaVolumeToLinear(schema->playParams.volume);
-    float finalVol = baseVol * speedFactor;
+    // Boost footstep volume to compensate for Steam Audio's distance
+    // attenuation at close range (source at feet ~3 units from listener).
+    // Without this, the DSP callback's directAtten multiplies the already
+    // speed-scaled volume, making footsteps sound too distant.
+    float finalVol = baseVol * speedFactor * 2.0f;
 
     // Select sample and play
     if (schema->samples.empty())
