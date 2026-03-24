@@ -561,9 +561,20 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         // quiet reverb relative to their direct signal.
         if (node->reflectionsActive && node->reflectionEffect && node->reflectionMixer
             && node->reflectionParams.irSize > 0) {
-            // Apply attenuation to mono before convolution (same factor as direct path)
-            float reflAtten = node->lastAtten.load(std::memory_order_relaxed);
-            if (runAtten && reflAtten < 1.0f) {
+            // Feed the UNATTENUATED mono signal into the convolution.
+            // The reflection IR encodes the energy from all reflected paths
+            // (wall bounces, ceiling reflections, around-corner diffraction).
+            // These paths are independent of the direct-path occlusion — a lamp
+            // behind a wall has its direct path blocked, but its reflected energy
+            // (bouncing off nearby walls and through doorways) should still be
+            // audible. Pre-attenuating the convolution input by the direct-path
+            // occlusion would silence the reflected paths too.
+            //
+            // Distance attenuation is still relevant (a distant source produces
+            // less reflected energy), so we apply distanceAttenuation only,
+            // without occlusion/transmission.
+            float reflAtten = node->directParams.distanceAttenuation;
+            if (reflAtten < 1.0f) {
                 for (ma_uint32 i = 0; i < frameCount; ++i)
                     mono[i] *= reflAtten;
             }
