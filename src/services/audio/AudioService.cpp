@@ -2956,31 +2956,41 @@ void AudioService::updateAmbientVolumes()
 
     for (auto &amb : mAmbients) {
         // Use room-graph effective distance for the range check, not euclidean.
-        // A sound 30 units away euclidean but 200 units through the room graph
-        // (behind many walls) should NOT start playing. The room graph distance
-        // correctly accounts for architectural separation.
+        // Euclidean pre-check: skip the expensive Dijkstra BFS for ambients that
+        // are obviously too far away (euclidean > max possible range).
         float euclidDist = glm::length(mListenerPos - amb.position);
-        float effectiveDist = euclidDist;  // fallback if propagation unavailable
+        float rawEffDist = euclidDist;  // fallback if propagation unavailable
+        float stopRadius = amb.radius * 1.5f;
 
-        if (mPortalRoutingEnabled && mRoomService && mRoomService->isLoaded()) {
+        // Skip BFS for ambients far beyond any possible range
+        if (euclidDist <= stopRadius + 10.0f &&
+            mPortalRoutingEnabled && mRoomService && mRoomService->isLoaded()) {
             SoundPropInfo prop = propagateSound(amb.position, mListenerPos);
             if (prop.reached) {
-                effectiveDist = prop.effectiveDistance;
+                rawEffDist = prop.effectiveDistance;
             } else {
                 // Unreachable through portal graph — treat as very far away.
-                // Only allow if euclidean distance is very close (< 5 units),
-                // which means the source is likely in the same room but outside
-                // the room OBBs (roomFromPoint failure).
-                effectiveDist = (euclidDist < 5.0f) ? euclidDist : amb.radius * 10.0f;
+                // Only allow if euclidean distance is very close (< 5 units).
+                rawEffDist = (euclidDist < 5.0f) ? euclidDist : amb.radius * 10.0f;
             }
+        } else if (euclidDist > stopRadius + 10.0f) {
+            rawEffDist = euclidDist;  // use euclidean, definitely out of range
         }
 
+        // Temporal smoothing: exponential moving average on effective distance.
+        // Prevents frame-to-frame jitter from roomFromPoint boundary flicker
+        // causing ambient voices to oscillate between playing and silent.
+        // Smoothing factor 0.15 = ~6 frame time constant at 60fps (~100ms).
+        constexpr float kSmoothFactor = 0.15f;
+        if (amb.smoothedEffDist > 1e8f) {
+            amb.smoothedEffDist = rawEffDist;  // first frame: initialize
+        } else {
+            amb.smoothedEffDist += (rawEffDist - amb.smoothedEffDist) * kSmoothFactor;
+        }
+        float effectiveDist = amb.smoothedEffDist;
+
         // Hysteresis: start at radius, stop at radius * 1.5.
-        // The 50% band prevents voice churn when listener hovers near the
-        // boundary — each start/stop creates/destroys IPL effects and
-        // triggers iplSimulatorCommit, which is expensive with many ambients.
         bool alreadyPlaying = (amb.handle != SOUND_HANDLE_INVALID);
-        float stopRadius = amb.radius * 1.5f;
         bool inRange = (amb.radius > 0.0f &&
                         (alreadyPlaying ? effectiveDist < stopRadius : effectiveDist < amb.radius));
 
@@ -3005,6 +3015,10 @@ void AudioService::updateAmbientVolumes()
                     amb.handle = startVoice(amb.schemaName, amb.schemaName, amb.position,
                                             64, isLooping, amb.objID, 0.0f);
                 }
+                // Start a fade-in ramp for newly created voices
+                if (amb.handle != SOUND_HANDLE_INVALID) {
+                    amb.fadeInTimer = 0.3f;  // 300ms fade-in
+                }
             }
 
             // Update volume based on distance
@@ -3015,20 +3029,26 @@ void AudioService::updateAmbientVolumes()
                     continue;
                 }
 
-                // Set the base schema volume only. Steam Audio's DSP callback
-                // handles all distance-dependent attenuation (inverse-square,
-                // occlusion, air absorption) via directParams. We don't apply
-                // our own distance falloff here to avoid double-dipping.
+                // Tick fade-in timer (300ms ramp from 0 to 1)
+                float fadeIn = 1.0f;
+                if (amb.fadeInTimer > 0.0f) {
+                    fadeIn = 1.0f - (amb.fadeInTimer / 0.3f);
+                    fadeIn = std::max(0.0f, std::min(1.0f, fadeIn));
+                    amb.fadeInTimer -= 1.0f / 60.0f;  // approximate frame time
+                }
+
+                // Set the base schema volume with fade-in ramp. Steam Audio's
+                // DSP callback handles all distance-dependent attenuation.
                 //
-                // Only apply a fade in the hysteresis zone (beyond the nominal
+                // Only apply a fade-out in the hysteresis zone (beyond the nominal
                 // radius) so the voice fades smoothly to silence at the stop
                 // boundary instead of cutting off abruptly.
                 float baseVol = schemaVolumeToLinear(amb.volume);
-                float targetVol = baseVol;
+                float targetVol = baseVol * fadeIn;
                 if (effectiveDist > amb.radius) {
                     // In hysteresis zone: linear fade from baseVol to 0
                     float fade = 1.0f - (effectiveDist - amb.radius) / (stopRadius - amb.radius);
-                    targetVol = baseVol * std::max(0.0f, fade);
+                    targetVol = baseVol * fadeIn * std::max(0.0f, fade);
                 }
                 ma_sound_set_volume(&it->second->sound, targetVol);
             }
