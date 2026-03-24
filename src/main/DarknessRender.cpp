@@ -1664,14 +1664,66 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // Parse TXLIST early — needed by the acoustic mesh builder for material
+    // keyword matching. The full texture loading (CRF I/O, GPU upload) happens
+    // later in loadWorldTextures(), but we need the texture name strings now.
+    if (mission.texturedMode && mission.txList.textures.empty()) {
+        try {
+            mission.txList = Darkness::parseTXList(misPath);
+            std::fprintf(stderr, "TXLIST (early parse for acoustics): %zu textures\n",
+                         mission.txList.textures.size());
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "Early TXLIST parse failed: %s\n", e.what());
+        }
+    }
+
     // ── Build Steam Audio acoustic scene from WR world geometry ──
-    // The full world mesh is only ~10K triangles — trivial for Steam Audio's
-    // BVH ray tracer. Build once at load time, no per-frame rebuilds needed.
+    // Build once at load time, no per-frame rebuilds needed.
     {
         Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
 
         const auto &wr = mission.wrData;
         Darkness::AcousticSceneData fullScene;
+
+        // Vertex deduplication: hash map from quantized position to vertex index.
+        // Adjacent cells share vertices at polygon edges — without dedup, each
+        // polygon pushes its own copy, inflating the vertex buffer ~3x.
+        // Quantize to 0.01 units to merge coincident vertices robustly.
+        struct VertKey {
+            int32_t x, y, z;
+            bool operator==(const VertKey &o) const {
+                return x == o.x && y == o.y && z == o.z;
+            }
+        };
+        struct VertKeyHash {
+            size_t operator()(const VertKey &k) const {
+                // FNV-1a inspired hash for 3 ints
+                size_t h = 0x811c9dc5u;
+                h ^= static_cast<size_t>(k.x); h *= 0x01000193u;
+                h ^= static_cast<size_t>(k.y); h *= 0x01000193u;
+                h ^= static_cast<size_t>(k.z); h *= 0x01000193u;
+                return h;
+            }
+        };
+        std::unordered_map<VertKey, uint32_t, VertKeyHash> vertexMap;
+        vertexMap.reserve(wr.numCells * 20);  // rough estimate
+
+        // Helper: get or insert a deduplicated vertex, returns index
+        auto getVertexIndex = [&](float x, float y, float z) -> uint32_t {
+            // Quantize to 0.01 units for robust merging
+            VertKey key{static_cast<int32_t>(std::round(x * 100.0f)),
+                        static_cast<int32_t>(std::round(y * 100.0f)),
+                        static_cast<int32_t>(std::round(z * 100.0f))};
+            auto it = vertexMap.find(key);
+            if (it != vertexMap.end())
+                return it->second;
+            uint32_t idx = static_cast<uint32_t>(fullScene.vertices.size() / 3);
+            fullScene.vertices.push_back(x);
+            fullScene.vertices.push_back(y);
+            fullScene.vertices.push_back(z);
+            vertexMap[key] = idx;
+            return idx;
+        };
 
         for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
             const auto &cell = wr.cells[ci];
@@ -1706,25 +1758,22 @@ int main(int argc, char *argv[]) {
                 if (poly.count < 3)
                     continue;
 
-                // Fan-triangulate the polygon
-                uint32_t baseVertex =
-                    static_cast<uint32_t>(fullScene.vertices.size() / 3);
-
+                // Collect deduplicated vertex indices for this polygon
+                std::vector<uint32_t> polyVerts(poly.count);
                 for (int vi = 0; vi < poly.count; ++vi) {
                     uint8_t idx = cell.polyIndices[pi][vi];
                     const auto &v = cell.vertices[idx];
-                    fullScene.vertices.push_back(v.x);
-                    fullScene.vertices.push_back(v.y);
-                    fullScene.vertices.push_back(v.z);
+                    polyVerts[vi] = getVertexIndex(v.x, v.y, v.z);
                 }
 
+                // Fan-triangulate the polygon
                 for (int t = 1; t < poly.count - 1; ++t) {
                     fullScene.indices.push_back(
-                        static_cast<int32_t>(baseVertex));
+                        static_cast<int32_t>(polyVerts[0]));
                     fullScene.indices.push_back(
-                        static_cast<int32_t>(baseVertex + t + 1));
+                        static_cast<int32_t>(polyVerts[t + 1]));
                     fullScene.indices.push_back(
-                        static_cast<int32_t>(baseVertex + t));
+                        static_cast<int32_t>(polyVerts[t]));
                     fullScene.texNames.push_back(texName);
                 }
             }
