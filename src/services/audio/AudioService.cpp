@@ -524,8 +524,16 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             float transAvg = (node->directParams.transmission[0]
                             + node->directParams.transmission[1]
                             + node->directParams.transmission[2]) / 3.0f;
+            // For very close sources (distanceAttenuation > 0.9, i.e., within ~3 units),
+            // bypass occlusion — Steam Audio's rays from feet-to-head can hit floor
+            // geometry, producing transient occlusion spikes that cut off footsteps.
+            // There is no meaningful wall occlusion at this range.
+            float occlusion = node->directParams.occlusion;
+            if (node->directParams.distanceAttenuation > 0.9f) {
+                occlusion = 1.0f;  // no occlusion for very close sources
+            }
             float directAtten = node->directParams.distanceAttenuation
-                              * (node->directParams.occlusion + transAvg * (1.0f - node->directParams.occlusion))
+                              * (occlusion + transAvg * (1.0f - occlusion))
                               * airAvg;
 
             // Architecture B routing:
