@@ -1871,6 +1871,11 @@ void AudioService::loopStep(float deltaTime)
         // reflCandidates and reflCandidateSet were already computed in Step 2a
         // (before iplSourceSetInputs) so non-top-N voices could be set to baked mode.
 
+        // Track total convolution voices (top-N + baked) against the budget cap.
+        // Top-N voices from reflCandidateSet are counted first (they always get slots),
+        // then baked voices fill remaining slots up to mMaxReflectionVoices.
+        int activeConvolutionCount = 0;
+
         for (auto &[handle, voice] : mVoices) {
             if (!voice->iplSource)
                 continue;
@@ -1907,12 +1912,19 @@ void AudioService::loopStep(float deltaTime)
                     voice->dspNode.directParams.airAbsorption[2] = 1.0f;
                 }
 
-                // Only enable reflection convolution for the N closest voices
+                // Enable reflection convolution up to the global budget.
+                // Top-N closest voices (real-time) get priority, then baked
+                // voices fill remaining slots. Total convolution voices are
+                // capped at mMaxReflectionVoices to stay within the audio
+                // callback budget (~1.5ms per convolution voice).
                 bool isReflVoice = reflCandidateSet.count(handle) > 0;
-                if (isReflVoice) {
-                    // Write params BEFORE the release-store on reflectionsActive.
-                    // The audio thread's implicit acquire on reflectionsActive
-                    // guarantees these fields are visible when it reads them.
+                bool canAffordConvolution = (activeConvolutionCount < mMaxReflectionVoices);
+                bool hasBakedData = mProbesHaveReflections
+                                    && outputs.reflections.irSize > 0
+                                    && voice->dspNode.reflectionEffect;
+                bool enableRefl = isReflVoice || (hasBakedData && canAffordConvolution);
+
+                if (enableRefl) {
                     voice->dspNode.reflectionParams = outputs.reflections;
                     voice->dspNode.reflectionParams.type =
                         IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
@@ -1927,7 +1939,6 @@ void AudioService::loopStep(float deltaTime)
                         // Linear ramp: full IR at 20 units, quarter IR at 140+ units
                         float lodScale = std::max(0.25f, 1.0f - (voiceDist - 20.0f) / 120.0f);
                         int lodIrSize = static_cast<int>(maxIrSize * lodScale);
-                        // Round down to nearest frame boundary for Steam Audio
                         lodIrSize = (lodIrSize / static_cast<int>(mReflectionFrameSize))
                                   * static_cast<int>(mReflectionFrameSize);
                         if (lodIrSize < static_cast<int>(mReflectionFrameSize))
@@ -1936,30 +1947,7 @@ void AudioService::loopStep(float deltaTime)
                     }
 
                     voice->dspNode.reflectionsActive.store(true, std::memory_order_release);
-                } else if (mProbesHaveReflections && outputs.reflections.irSize > 0
-                           && voice->dspNode.reflectionEffect) {
-                    // Non-top-N voice with baked probe reflection data available.
-                    // Apply the baked IR so distant voices get reverb from the
-                    // nearest probe instead of being dry.
-                    voice->dspNode.reflectionParams = outputs.reflections;
-                    voice->dspNode.reflectionParams.type =
-                        IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-                    voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
-
-                    // Apply distance-based IR LOD to baked voices too
-                    float voiceDist = glm::length(voice->worldPos - mListenerPos);
-                    int maxIrSize = voice->dspNode.reflectionParams.irSize;
-                    if (maxIrSize > 0 && voiceDist > 20.0f) {
-                        float lodScale = std::max(0.25f, 1.0f - (voiceDist - 20.0f) / 120.0f);
-                        int lodIrSize = static_cast<int>(maxIrSize * lodScale);
-                        lodIrSize = (lodIrSize / static_cast<int>(mReflectionFrameSize))
-                                  * static_cast<int>(mReflectionFrameSize);
-                        if (lodIrSize < static_cast<int>(mReflectionFrameSize))
-                            lodIrSize = static_cast<int>(mReflectionFrameSize);
-                        voice->dspNode.reflectionParams.irSize = lodIrSize;
-                    }
-
-                    voice->dspNode.reflectionsActive.store(true, std::memory_order_release);
+                    ++activeConvolutionCount;
                 } else {
                     voice->dspNode.reflectionsActive.store(false, std::memory_order_relaxed);
                 }
