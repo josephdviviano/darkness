@@ -70,6 +70,10 @@ typedef _IPLPathEffect_t* IPLPathEffect;
 
 namespace Darkness {
 
+// Forward declarations for room system types
+class Room;
+class RoomPortal;
+
 // Forward declarations for sound resource types (defined in CRFSoundLoader.h)
 class CRFSoundLoader;
 class SoundCache;
@@ -587,6 +591,35 @@ private:
     /// Must be called before any source mutation (add/remove/commit)
     /// to prevent Steam Audio from accessing freed source data.
     void waitForReflectionThread();
+
+    // ── Portal blending for smooth room transitions ──
+
+    /// Per-frame portal blend state. When the listener stands in a doorway
+    /// between two rooms, this provides a smooth positional blend between
+    /// the propagation results from both rooms, eliminating the flicker from
+    /// roomFromPoint alternating between rooms at the boundary.
+    struct PortalBlendState {
+        bool        active = false;     ///< True when listener is near a portal
+        Room       *roomA = nullptr;    ///< Primary room (from roomFromPoint)
+        Room       *roomB = nullptr;    ///< Secondary room (far side of portal)
+        float       blend = 0.0f;       ///< 0.0 = fully roomA, 1.0 = fully roomB
+    };
+    PortalBlendState mPortalBlend;
+
+    /// Compute portal blend state for the current listener position.
+    /// Called once per frame at the start of loopStep().
+    void computePortalBlend();
+
+    /// Propagate sound with portal blending. Uses mPortalBlend to interpolate
+    /// between both rooms when the listener straddles a portal boundary.
+    SoundPropInfo propagateSoundBlended(const Vector3 &sourcePos,
+                                         float maxDist = SOUND_MAX_DIST) const;
+
+    /// Room-explicit propagateSound overload (bypasses internal roomFromPoint).
+    SoundPropInfo propagateSound(const Vector3 &sourcePos,
+                                  const Vector3 &listenerPos,
+                                  Room *sourceRoom, Room *listenerRoom,
+                                  float maxDist = SOUND_MAX_DIST) const;
 
     // ── Listener state (updated each frame from render binary) ──
 
