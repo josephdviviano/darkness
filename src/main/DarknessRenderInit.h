@@ -322,8 +322,8 @@ static bool loadMissionData(const char *misPath, bool forceFlicker,
 static void loadWorldTextures(const char *misPath, const std::string &resPath,
                               Darkness::MissionData &mission)
 {
-    // Parse TXLIST if in textured mode
-    if (mission.texturedMode) {
+    // Parse TXLIST if in textured mode (skip if already parsed early for acoustics)
+    if (mission.texturedMode && mission.txList.textures.empty()) {
         try {
             mission.txList = Darkness::parseTXList(misPath);
             std::fprintf(stderr, "TXLIST: %zu textures, %zu families\n",

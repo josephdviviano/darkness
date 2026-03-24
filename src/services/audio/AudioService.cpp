@@ -381,8 +381,17 @@ static std::atomic<float> sPerVoicePeakUs{0.0f};    // peak per-voice DSP time (
 static std::atomic<float> sMixNodePeakUs{0.0f};      // peak global mix node time (µs)
 static std::atomic<float> sTotalCallbackPeakUs{0.0f}; // peak total audio callback time (µs)
 static std::atomic<int>   sPerVoiceCallCount{0};      // voices processed in last period
-static std::atomic<float> sWaitThreadPeakMs{0.0f};    // peak waitForReflectionThread time (ms)
 static std::atomic<float> sCommitPeakMs{0.0f};         // peak iplSimulatorCommit time (ms)
+
+// ── Main thread + sim worker profiling ──
+static std::atomic<float> sLoopStepPeakMs{0.0f};      // peak loopStep total time (ms)
+static std::atomic<float> sDirectSimPeakMs{0.0f};     // peak iplSimulatorRunDirect time (ms)
+static std::atomic<float> sReflSimPeakMs{0.0f};       // peak iplSimulatorRunReflections time (ms)
+static std::atomic<int>   sPortalRoutingTotalUs{0};     // accumulated portal routing time per dump (µs, int)
+static std::atomic<int>   sPortalRoutingCount{0};      // portal routing calls per dump
+static std::atomic<int>   sVoicesCreated{0};           // voices started since last dump
+static std::atomic<int>   sVoicesDestroyed{0};         // voices cleaned up since last dump
+static std::atomic<int>   sReflFramesRun{0};           // reflection sim steps since last dump
 
 // Accumulates per-voice time within a single audio callback cycle.
 // Reset by the mix node after reading. Not truly thread-safe between
@@ -1655,6 +1664,8 @@ void AudioService::loopStep(float deltaTime)
     if (!mAudioReady)
         return;
 
+    auto loopStepStart = std::chrono::steady_clock::now();
+
     // Source mutations (add/remove/commit) must not happen while the background
     // simulation thread is running — iplSimulatorRunDirect/Reflections holds
     // internal pointers to committed sources. Instead of BLOCKING the main thread
@@ -1956,7 +1967,12 @@ void AudioService::loopStep(float deltaTime)
                 // distance and direction from the last portal (virtual source).
                 // Skip for tail voices — they're just ringing out convolution.
                 if (mPortalRoutingEnabled && !voice->sourceEnded) {
+                auto prT0 = std::chrono::steady_clock::now();
                 SoundPropInfo prop = propagateSound(voice->worldPos, mListenerPos);
+                auto prT1 = std::chrono::steady_clock::now();
+                float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
+                sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
+                sPortalRoutingCount.fetch_add(1, std::memory_order_relaxed);
                 if (prop.reached) {
                     // Inverse-square attenuation scaled for Dark Engine world units.
                     // At 30 units (one room): 52%. At 100 units (corridor): 9%.
@@ -2039,6 +2055,14 @@ void AudioService::loopStep(float deltaTime)
     // Update ambient sound volumes based on listener distance
     updateAmbientVolumes();
 
+    // loopStep total time (main thread)
+    {
+        auto loopStepEnd = std::chrono::steady_clock::now();
+        float ms = std::chrono::duration<float, std::milli>(loopStepEnd - loopStepStart).count();
+        float prev = sLoopStepPeakMs.load(std::memory_order_relaxed);
+        if (ms > prev) sLoopStepPeakMs.store(ms, std::memory_order_relaxed);
+    }
+
     // Write position data to CSV if recording is active
     if (sRecording.load(std::memory_order_relaxed)) {
         static auto recordStart = std::chrono::steady_clock::now();
@@ -2086,11 +2110,22 @@ void AudioService::simWorkerMain()
         }
 
         if (doDirect) {
+            auto t0 = std::chrono::steady_clock::now();
             iplSimulatorRunDirect(mIplSimulator);
+            auto t1 = std::chrono::steady_clock::now();
+            float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+            float prev = sDirectSimPeakMs.load(std::memory_order_relaxed);
+            if (ms > prev) sDirectSimPeakMs.store(ms, std::memory_order_relaxed);
             mDirectSimRunning.store(false, std::memory_order_release);
         }
         if (doReflections) {
+            auto t0 = std::chrono::steady_clock::now();
             iplSimulatorRunReflections(mIplSimulator);
+            auto t1 = std::chrono::steady_clock::now();
+            float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+            float prev = sReflSimPeakMs.load(std::memory_order_relaxed);
+            if (ms > prev) sReflSimPeakMs.store(ms, std::memory_order_relaxed);
+            sReflFramesRun.fetch_add(1, std::memory_order_relaxed);
             if (mReflectionMixNode)
                 mReflectionMixNode->simulationRan = true;
             mReflectionSimRunning.store(false, std::memory_order_release);
@@ -2110,6 +2145,7 @@ void AudioService::cleanupFinishedVoices()
                          it->second->sourceEnded ? 1 : 0, it->second->tailTimer);
             removeVoiceSource(*it->second);
             it = mVoices.erase(it);
+            sVoicesDestroyed.fetch_add(1, std::memory_order_relaxed);
         } else {
             ++it;
         }
@@ -2531,6 +2567,7 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
                  voice->data.wavData.size(), (unsigned long long)totalFrames,
                  decRate, decCh, durMs);
     mVoices[h] = std::move(voice);
+    sVoicesCreated.fetch_add(1, std::memory_order_relaxed);
     return h;
 }
 
@@ -2777,10 +2814,17 @@ void AudioService::updateAmbientVolumes()
         float voiceUs = sPerVoicePeakUs.exchange(0.0f, std::memory_order_relaxed);
         float mixUs   = sMixNodePeakUs.exchange(0.0f, std::memory_order_relaxed);
         float totalUs = sTotalCallbackPeakUs.exchange(0.0f, std::memory_order_relaxed);
-        int   voiceCalls = sPerVoiceCallCount.exchange(0, std::memory_order_relaxed);
-        float waitMs  = sWaitThreadPeakMs.exchange(0.0f, std::memory_order_relaxed);
         float commitMs = sCommitPeakMs.exchange(0.0f, std::memory_order_relaxed);
-        (void)voiceCalls;
+
+        // Read and reset main thread + sim worker profiling counters
+        float loopMs  = sLoopStepPeakMs.exchange(0.0f, std::memory_order_relaxed);
+        float directMs = sDirectSimPeakMs.exchange(0.0f, std::memory_order_relaxed);
+        float reflMs  = sReflSimPeakMs.exchange(0.0f, std::memory_order_relaxed);
+        int   portalUs = sPortalRoutingTotalUs.exchange(0, std::memory_order_relaxed);
+        int   portalCalls = sPortalRoutingCount.exchange(0, std::memory_order_relaxed);
+        int   created = sVoicesCreated.exchange(0, std::memory_order_relaxed);
+        int   destroyed = sVoicesDestroyed.exchange(0, std::memory_order_relaxed);
+        int   reflFrames = sReflFramesRun.exchange(0, std::memory_order_relaxed);
 
         // Audio budget: 1024 samples @ 48kHz = 21333µs per callback.
         float budgetUs = (static_cast<float>(mFrameSize) / mDeviceSampleRate) * 1e6f;
@@ -2793,11 +2837,16 @@ void AudioService::updateAmbientVolumes()
             if (v->sourceEnded && !v->finished.load(std::memory_order_relaxed)) ++tailVoices;
         }
 
+        // Effective rays/sec (rays * reflection sim steps run in this dump period)
+        float raysPerSec = (reflFrames * mReflectionNumRays) / 5.0f;  // 5s dump interval
+
         // Log active ambient details to diagnose distant sound leaks
         for (const auto &amb : mAmbients) {
             if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle)) {
                 float d = glm::length(mListenerPos - amb.position);
-                auto &v = *mVoices[amb.handle];
+                auto it = mVoices.find(amb.handle);
+                if (it == mVoices.end()) continue;
+                auto &v = *it->second;
                 float atten = v.dspNode.lastAtten.load(std::memory_order_relaxed);
                 bool portal = v.dspNode.usePortalRouting;
                 float pAtten = v.dspNode.portalAttenuation;
@@ -2808,13 +2857,18 @@ void AudioService::updateAmbientVolumes()
             }
         }
 
+        float portalAvgUs = portalCalls > 0 ? static_cast<float>(portalUs) / portalCalls : 0.0f;
+
         std::fprintf(stderr, "[Audio] %zu voices (%d refl, %d tail), %d/%zu ambients | "
-                     "total=%.0f/%.0fµs (%.0f%%) peak_voice=%.0fµs mix=%.0fµs | "
-                     "main: wait=%.1fms commit=%.1fms\n",
+                     "cb: total=%.0f/%.0fµs (%.0f%%) voice=%.0fµs mix=%.0fµs | "
+                     "main: loop=%.1fms commit=%.1fms portal=%.0fµs(%dcalls,avg=%.0f) | "
+                     "sim: direct=%.1fms refl=%.1fms(%dsteps) rays/s=%.0f | "
+                     "churn: +%d/-%d\n",
                      mVoices.size(), reflVoices, tailVoices, playing, mAmbients.size(),
-                     totalUs, budgetUs, loadPct,
-                     voiceUs, mixUs,
-                     waitMs, commitMs);
+                     totalUs, budgetUs, loadPct, voiceUs, mixUs,
+                     loopMs, commitMs, static_cast<float>(portalUs), portalCalls, portalAvgUs,
+                     directMs, reflMs, reflFrames, raysPerSec,
+                     created, destroyed);
     }
 
     for (auto &amb : mAmbients) {
