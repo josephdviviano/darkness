@@ -1673,6 +1673,9 @@ void AudioService::loopStep(float deltaTime)
 
     auto loopStepStart = std::chrono::steady_clock::now();
 
+    // Compute portal blend state for this frame (once, reused by all propagation calls)
+    computePortalBlend();
+
     // Source mutations (add/remove/commit) must not happen while the background
     // simulation thread is running — iplSimulatorRunDirect/Reflections holds
     // internal pointers to committed sources. Instead of BLOCKING the main thread
@@ -1814,7 +1817,12 @@ void AudioService::loopStep(float deltaTime)
             // to the virtual position (last portal anchor) so Steam Audio traces
             // rays from the doorway, not from behind a wall. Same-room voices
             // use their real position. Unreachable voices skip simulation.
-            Room *listenerRoom = mRoomService ? mRoomService->roomFromPoint(mListenerPos) : nullptr;
+            // Use the portal blend's primary room for stable cross-room detection.
+            // When blending is active, roomFromPoint may flicker between rooms,
+            // but mPortalBlend.roomA is always the primary room for this frame.
+            Room *listenerRoom = mPortalBlend.active
+                ? mPortalBlend.roomA
+                : (mRoomService ? mRoomService->roomFromPoint(mListenerPos) : nullptr);
 
             for (auto &[handle, voice] : mVoices) {
                 if (!voice->iplSource)
@@ -1825,7 +1833,7 @@ void AudioService::loopStep(float deltaTime)
                 bool isCrossRoom = false;
                 if (mPortalRoutingEnabled && !voice->sourceEnded) {
                     auto prT0 = std::chrono::steady_clock::now();
-                    prop = propagateSound(voice->worldPos, mListenerPos);
+                    prop = propagateSoundBlended(voice->worldPos);
                     auto prT1 = std::chrono::steady_clock::now();
                     float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
                     sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
@@ -2966,7 +2974,7 @@ void AudioService::updateAmbientVolumes()
         // Skip BFS for ambients far beyond any possible range
         if (euclidDist <= stopRadius + 10.0f &&
             mPortalRoutingEnabled && mRoomService && mRoomService->isLoaded()) {
-            SoundPropInfo prop = propagateSound(amb.position, mListenerPos);
+            SoundPropInfo prop = propagateSoundBlended(amb.position);
             if (prop.reached) {
                 rawEffDist = prop.effectiveDistance;
             } else {
@@ -3336,21 +3344,125 @@ void AudioService::playLanding(const Vector3 &pos, float fallSpeed, int textureI
                                schema->playParams.priority, false, 0, finalVol);
 }
 
-// ── Sound propagation through portal graph (AI hearing) ──
+// ── Portal blend: smooth room transitions ──
+
+//------------------------------------------------------
+void AudioService::computePortalBlend()
+{
+    mPortalBlend = {};  // reset to inactive
+
+    if (!mRoomService || !mRoomService->isLoaded())
+        return;
+
+    Room *primaryRoom = mRoomService->roomFromPoint(mListenerPos);
+    if (!primaryRoom)
+        return;
+
+    constexpr float kBlendRadius = 3.0f;
+
+    // Find the closest portal the listener is near enough to trigger blending.
+    float bestAbsDist = kBlendRadius;
+    RoomPortal *bestPortal = nullptr;
+    float bestSignedDist = 0.0f;
+
+    uint32_t portalCount = primaryRoom->getPortalCount();
+    for (uint32_t i = 0; i < portalCount; ++i) {
+        RoomPortal *portal = primaryRoom->getPortal(i);
+        if (!portal || !portal->getFarRoom())
+            continue;
+
+        // Signed distance from listener to portal plane.
+        // After our d-negation on load: positive = inside (near-room side).
+        float signedDist = portal->getPlane().getDistance(mListenerPos);
+        float absDist = std::fabs(signedDist);
+
+        if (absDist >= bestAbsDist)
+            continue;
+
+        // Check edge containment: is the listener within the portal's
+        // 2D footprint? isInside() tests edge planes only.
+        if (!portal->isInside(mListenerPos))
+            continue;
+
+        bestAbsDist = absDist;
+        bestPortal = portal;
+        bestSignedDist = signedDist;
+    }
+
+    if (!bestPortal)
+        return;
+
+    // Blend weight from portal plane signed distance.
+    // signedDist > 0: listener on near-room side → blend toward roomA.
+    // signedDist < 0: listener crossed to far side → blend toward roomB.
+    // signedDist = 0: on the portal plane → 50/50 blend.
+    float blend = 0.5f - bestSignedDist / (2.0f * kBlendRadius);
+    blend = std::max(0.0f, std::min(1.0f, blend));
+
+    mPortalBlend.active = true;
+    mPortalBlend.roomA  = primaryRoom;
+    mPortalBlend.roomB  = bestPortal->getFarRoom();
+    mPortalBlend.blend  = blend;
+}
+
+//------------------------------------------------------
+SoundPropInfo AudioService::propagateSoundBlended(const Vector3 &sourcePos,
+                                                   float maxDist) const
+{
+    if (!mPortalBlend.active) {
+        return propagateSound(sourcePos, mListenerPos, maxDist);
+    }
+
+    // Resolve source room once (shared between both calls)
+    Room *sourceRoom = mRoomService ? mRoomService->roomFromPoint(sourcePos) : nullptr;
+
+    // Propagate assuming listener is in roomA
+    SoundPropInfo propA = propagateSound(sourcePos, mListenerPos,
+                                          sourceRoom, mPortalBlend.roomA, maxDist);
+    // Propagate assuming listener is in roomB
+    SoundPropInfo propB = propagateSound(sourcePos, mListenerPos,
+                                          sourceRoom, mPortalBlend.roomB, maxDist);
+
+    float t = mPortalBlend.blend;
+
+    // If only one path reached, use it
+    if (propA.reached && !propB.reached) return propA;
+    if (!propA.reached && propB.reached) return propB;
+    if (!propA.reached && !propB.reached) return propA;
+
+    // Blend the results
+    SoundPropInfo blended;
+    blended.reached = true;
+    blended.effectiveDistance = propA.effectiveDistance * (1.0f - t) + propB.effectiveDistance * t;
+    blended.realDistance = propA.realDistance * (1.0f - t) + propB.realDistance * t;
+    blended.totalBlocking = propA.totalBlocking * (1.0f - t) + propB.totalBlocking * t;
+    blended.virtualPosition = propA.virtualPosition * (1.0f - t) + propB.virtualPosition * t;
+    return blended;
+}
+
+// ── Sound propagation through portal graph ──
 
 //------------------------------------------------------
 SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
                                             const Vector3 &listenerPos,
                                             float maxDist) const
 {
-    SoundPropInfo result;
-
     if (!mRoomService || !mRoomService->isLoaded())
-        return result;
+        return {};
 
-    // Find the rooms containing source and listener
     Room *sourceRoom = mRoomService->roomFromPoint(sourcePos);
     Room *listenerRoom = mRoomService->roomFromPoint(listenerPos);
+
+    return propagateSound(sourcePos, listenerPos, sourceRoom, listenerRoom, maxDist);
+}
+
+//------------------------------------------------------
+SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
+                                            const Vector3 &listenerPos,
+                                            Room *sourceRoom, Room *listenerRoom,
+                                            float maxDist) const
+{
+    SoundPropInfo result;
 
     if (!sourceRoom || !listenerRoom) {
         // Fallback: when source or listener is outside all BSP rooms (e.g., ambient
