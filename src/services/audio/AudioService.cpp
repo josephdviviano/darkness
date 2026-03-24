@@ -2955,7 +2955,26 @@ void AudioService::updateAmbientVolumes()
     }
 
     for (auto &amb : mAmbients) {
-        float dist = glm::length(mListenerPos - amb.position);
+        // Use room-graph effective distance for the range check, not euclidean.
+        // A sound 30 units away euclidean but 200 units through the room graph
+        // (behind many walls) should NOT start playing. The room graph distance
+        // correctly accounts for architectural separation.
+        float euclidDist = glm::length(mListenerPos - amb.position);
+        float effectiveDist = euclidDist;  // fallback if propagation unavailable
+
+        if (mPortalRoutingEnabled && mRoomService && mRoomService->isLoaded()) {
+            SoundPropInfo prop = propagateSound(amb.position, mListenerPos);
+            if (prop.reached) {
+                effectiveDist = prop.effectiveDistance;
+            } else {
+                // Unreachable through portal graph — treat as very far away.
+                // Only allow if euclidean distance is very close (< 5 units),
+                // which means the source is likely in the same room but outside
+                // the room OBBs (roomFromPoint failure).
+                effectiveDist = (euclidDist < 5.0f) ? euclidDist : amb.radius * 10.0f;
+            }
+        }
+
         // Hysteresis: start at radius, stop at radius * 1.5.
         // The 50% band prevents voice churn when listener hovers near the
         // boundary — each start/stop creates/destroys IPL effects and
@@ -2963,7 +2982,7 @@ void AudioService::updateAmbientVolumes()
         bool alreadyPlaying = (amb.handle != SOUND_HANDLE_INVALID);
         float stopRadius = amb.radius * 1.5f;
         bool inRange = (amb.radius > 0.0f &&
-                        (alreadyPlaying ? dist < stopRadius : dist < amb.radius));
+                        (alreadyPlaying ? effectiveDist < stopRadius : effectiveDist < amb.radius));
 
         if (inRange) {
             // Start voice if not already playing
@@ -3006,9 +3025,9 @@ void AudioService::updateAmbientVolumes()
                 // boundary instead of cutting off abruptly.
                 float baseVol = schemaVolumeToLinear(amb.volume);
                 float targetVol = baseVol;
-                if (dist > amb.radius) {
+                if (effectiveDist > amb.radius) {
                     // In hysteresis zone: linear fade from baseVol to 0
-                    float fade = 1.0f - (dist - amb.radius) / (stopRadius - amb.radius);
+                    float fade = 1.0f - (effectiveDist - amb.radius) / (stopRadius - amb.radius);
                     targetVol = baseVol * std::max(0.0f, fade);
                 }
                 ma_sound_set_volume(&it->second->sound, targetVol);
