@@ -38,12 +38,15 @@ RoomPortal::~RoomPortal() { clear(); }
 //------------------------------------------------------
 void RoomPortal::read(const FilePtr &sf) {
     *sf >> mID >> mIndex >> mPlane >> mEdgeCount;
-    // planes that define edges
+    // Dark Engine plane convention: dot(n, p) >= d means inside.
+    // Our Plane::getDistance uses dot(n, p) + d, so negate d.
+    mPlane.d = -mPlane.d;
 
     mEdges.resize(mEdgeCount);
 
     for (size_t i = 0; i < mEdgeCount; ++i) {
         *sf >> mEdges[i];
+        mEdges[i].d = -mEdges[i].d;
     }
 
     // room ID's to be linked
@@ -61,9 +64,11 @@ void RoomPortal::read(const FilePtr &sf) {
 
 //------------------------------------------------------
 void RoomPortal::write(const FilePtr &sf) {
+    // NOTE: mPlane.d and mEdges[i].d were negated on load (see read()) to convert
+    // from Dark Engine convention to our Plane convention. If we ever re-save
+    // ROOM_DB, we must negate d again here to restore the on-disk convention.
     *sf << mID << mIndex << mPlane << mEdgeCount;
 
-    // planes that define edges
     for (size_t i = 0; i < mEdgeCount; ++i) {
         *sf << mEdges[i];
     }

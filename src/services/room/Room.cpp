@@ -47,6 +47,10 @@ void Room::read(const FilePtr &sf) {
 
     for (size_t i = 0; i < 6; ++i) {
         *sf >> mPlanes[i];
+        // Dark Engine stores plane distance as dot(normal, point) >= d (positive),
+        // but our Plane::getDistance computes dot(normal, point) + d.
+        // Negate d to convert: dot(n, p) + (-d) >= 0 ↔ dot(n, p) >= d
+        mPlanes[i].d = -mPlanes[i].d;
     }
 
     *sf >> mPortalCount;
@@ -92,6 +96,10 @@ void Room::write(const FilePtr &sf) {
     *sf << mObjectID << mRoomID << mCenter;
 
     for (size_t i = 0; i < 6; ++i) {
+        // NOTE: mPlanes[i].d was negated on load (see read()) to convert from
+        // Dark Engine convention (dot(n,p) >= d = inside, outward-facing normals)
+        // to our convention (dot(n,p) + d >= 0 = inside). If we ever re-save
+        // ROOM_DB, we must negate d again here to restore the on-disk convention.
         *sf << mPlanes[i];
     }
 

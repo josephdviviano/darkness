@@ -1677,16 +1677,23 @@ int main(int argc, char *argv[]) {
             const auto &cell = wr.cells[ci];
             int numSolid = cell.numPolygons - cell.numPortals;
 
-            for (int pi = 0; pi < numSolid; ++pi) {
+            for (int pi = 0; pi < cell.numPolygons; ++pi) {
                 const auto &poly = cell.polygons[pi];
 
-                // Skip sky polygons (BACKHACK_IDX = 249)
-                if (pi < cell.numTextured && cell.texturing[pi].txt == 249)
+                bool isPortal = (pi >= numSolid);
+
+                // Skip sky polygons (BACKHACK_IDX = 249) — only solid polys have textures
+                if (!isPortal && pi < cell.numTextured && cell.texturing[pi].txt == 249)
                     continue;
 
-                // Determine texture name for material lookup
+                // Determine texture name for material lookup.
+                // Portal polygons have no texture — use a special sentinel that maps
+                // to a high-transmission material so Steam Audio rays can pass through
+                // doorways while still closing the mesh (no holes at cell boundaries).
                 std::string texName = "generic";
-                if (pi < cell.numTextured) {
+                if (isPortal) {
+                    texName = "_portal";
+                } else if (pi < cell.numTextured) {
                     uint8_t txtIdx = cell.texturing[pi].txt;
                     if (txtIdx < mission.txList.textures.size()) {
                         const auto &entry = mission.txList.textures[txtIdx];
@@ -1694,6 +1701,10 @@ int main(int argc, char *argv[]) {
                             texName = entry.fullPath;
                     }
                 }
+
+                // Skip degenerate polygons
+                if (poly.count < 3)
+                    continue;
 
                 // Fan-triangulate the polygon
                 uint32_t baseVertex =
@@ -1991,9 +2002,14 @@ int main(int argc, char *argv[]) {
                 bakeDone.store(true, std::memory_order_release);
             });
 
-            // Render progress bar until baking completes
+            // Render progress bar until baking completes.
+            // Steam Audio's iplPathBakerBake reports progress in two phases
+            // (visibility graph + shortest paths), each going 0→1. We track
+            // phase transitions to show overall progress as 0→100%.
+            int bakePhase = 0;
+            float lastProg = 0.0f;
+
             while (!bakeDone.load(std::memory_order_acquire)) {
-                // Poll SDL events to keep the window responsive
                 SDL_Event ev;
                 while (SDL_PollEvent(&ev)) {
                     if (ev.type == SDL_QUIT) {
@@ -2003,7 +2019,12 @@ int main(int argc, char *argv[]) {
                 }
                 if (!state.running) break;
 
-                float prog = bakeProgress.load(std::memory_order_relaxed);
+                float rawProg = bakeProgress.load(std::memory_order_relaxed);
+                // Detect phase transition: progress drops back toward 0
+                if (rawProg < lastProg - 0.1f) bakePhase++;
+                lastProg = rawProg;
+                // Map to overall: phase 0 = 0-50%, phase 1 = 50-100%
+                float prog = (bakePhase == 0) ? rawProg * 0.5f : 0.5f + rawProg * 0.5f;
                 int pct = static_cast<int>(prog * 100.0f);
 
                 // Render progress bar using bgfx debug text

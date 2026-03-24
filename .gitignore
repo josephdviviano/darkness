@@ -27,5 +27,8 @@ CMakeUserPresets.json
 *.csv
 *.log
 
+# audio logs
+*.wav
+
 # config file
 darknessRender.yaml

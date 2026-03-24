@@ -34,6 +34,7 @@
 #include "loop/LoopCommon.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -520,8 +521,9 @@ private:
 
     // ── Baked probe pathing ──
 
-    IPLProbeBatch mIplProbeBatch = nullptr;  ///< Loaded probe data (positions + baked paths)
+    IPLProbeBatch mIplProbeBatch = nullptr;  ///< Loaded probe data (positions + baked paths + reflections)
     int mProbeCount = 0;                     ///< Number of probes in the batch
+    bool mProbesHaveReflections = false;     ///< True if loaded probes contain baked reflection IRs
 
     /// Scene bounding box (computed during buildAcousticScene)
     Vector3 mSceneMin{0, 0, 0};
@@ -548,19 +550,32 @@ private:
     //
     // Source mutations (add/remove/commit) must wait for BOTH threads to be idle.
 
-    /// Direct simulation thread — runs iplSimulatorRunDirect every frame
-    std::thread mDirectSimThread;
-    std::atomic<bool> mDirectSimRunning{false};
+    /// Persistent simulation worker thread — handles both direct and reflection
+    /// simulation requests via condition variable signaling. Eliminates per-frame
+    /// std::thread creation overhead (60 pthread_create/join cycles per second).
+    std::thread mSimWorkerThread;
+    std::mutex mSimWorkerMutex;
+    std::condition_variable mSimWorkerCV;
 
-    /// Reflection simulation thread — runs iplSimulatorRunReflections (throttled)
-    std::thread mReflectionThread;
+    /// Work requests for the sim worker (protected by mSimWorkerMutex)
+    bool mSimWorkerWantDirect = false;
+    bool mSimWorkerWantReflections = false;
+
+    /// Completion flags (atomic, read by main thread without lock)
+    std::atomic<bool> mDirectSimRunning{false};
     std::atomic<bool> mReflectionSimRunning{false};
 
-    /// Signals threads to shut down
-    std::atomic<bool> mReflectionShutdown{false};
+    /// Signals worker thread to shut down
+    std::atomic<bool> mSimWorkerShutdown{false};
+
+    /// Worker thread entry point
+    void simWorkerMain();
 
     /// IPL sources awaiting deferred removal (accumulated while any sim thread is busy).
     std::vector<IPLSource> mPendingSourceRemovals;
+
+    /// IPL sources awaiting deferred add (accumulated while any sim thread is busy).
+    std::vector<IPLSource> mPendingSourceAdds;
 
     /// Join the background reflection thread if it's running.
     /// Must be called before any source mutation (add/remove/commit)
