@@ -3397,8 +3397,17 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
 
             // Dark Engine munged distance formula:
             // effectiveDist = realDist + (maxDist - realDist) * blockingFactor
-            // Applied per-portal: the penalty increases the effective distance
-            float penalty = (maxDist - newRealDist) * blocking;
+            // Applied per-portal: the penalty increases the effective distance.
+            //
+            // Additionally, add a fixed per-portal distance penalty. Dark Engine
+            // BSP cells are small convex leaves (not architectural rooms), so
+            // traversing many cells adds little geometric distance. Without the
+            // penalty, a sound 6 cells away through walls sounds nearly as loud
+            // as one at the same euclidean distance in open air. The penalty
+            // ensures each portal traversal has a meaningful acoustic cost,
+            // simulating the energy loss from sound diffracting around corners.
+            constexpr float kPerPortalPenalty = 10.0f; // world units per portal hop
+            float penalty = (maxDist - newRealDist) * blocking + kPerPortalPenalty;
             if (penalty < 0.0f) penalty = 0.0f;
             float newEffDist = cur.effectiveDist + segDist + penalty;
 
