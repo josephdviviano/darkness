@@ -2963,49 +2963,21 @@ void AudioService::updateAmbientVolumes()
     }
 
     for (auto &amb : mAmbients) {
-        // Use room-graph effective distance for the range check, not euclidean.
-        // Euclidean pre-check: skip the expensive Dijkstra BFS for ambients that
-        // are obviously too far away (euclidean > max possible range).
-        float euclidDist = glm::length(mListenerPos - amb.position);
-        float rawEffDist = euclidDist;  // fallback if propagation unavailable
-        float startRadius = amb.radius * 2.0f;  // voice created here (inaudible)
-        float stopRadius = amb.radius * 2.5f;  // voice destroyed here (hysteresis)
+        // Ambient sound activation uses EUCLIDEAN distance, matching the
+        // original Dark Engine's ambient system (AMBIENT.C). The room portal
+        // system was never used for ambient activation — ambients work purely
+        // on radius. Room routing handles cross-room propagation for voices
+        // in the voice update loop (Step 2b), not here.
+        //
+        // Start voices at 1.5x radius (before audible) so the distance-based
+        // volume curve fades in smoothly. Stop at 2x radius (hysteresis).
+        float dist = glm::length(mListenerPos - amb.position);
+        float startRadius = amb.radius * 1.5f;
+        float stopRadius = amb.radius * 2.0f;
 
-        // Skip BFS for ambients far beyond any possible range
-        if (euclidDist <= stopRadius + 10.0f &&
-            mPortalRoutingEnabled && mRoomService && mRoomService->isLoaded()) {
-            SoundPropInfo prop = propagateSoundBlended(amb.position);
-            if (prop.reached) {
-                rawEffDist = prop.effectiveDistance;
-            } else {
-                // Unreachable through portal graph — treat as very far away.
-                // Only allow if euclidean distance is very close (< 5 units).
-                rawEffDist = (euclidDist < 5.0f) ? euclidDist : amb.radius * 10.0f;
-            }
-        } else if (euclidDist > stopRadius + 10.0f) {
-            rawEffDist = euclidDist;  // use euclidean, definitely out of range
-        }
-
-        // Temporal smoothing: exponential moving average on effective distance.
-        // Prevents frame-to-frame jitter from roomFromPoint boundary flicker
-        // causing ambient voices to oscillate between playing and silent.
-        // Smoothing factor 0.15 = ~6 frame time constant at 60fps (~100ms).
-        constexpr float kSmoothFactor = 0.15f;
-        if (amb.smoothedEffDist > 1e8f) {
-            amb.smoothedEffDist = rawEffDist;  // first frame: initialize
-        } else {
-            amb.smoothedEffDist += (rawEffDist - amb.smoothedEffDist) * kSmoothFactor;
-        }
-        float effectiveDist = amb.smoothedEffDist;
-
-        // Start voices BEFORE they become audible (at 2x radius) so the
-        // distance-based volume curve produces a smooth fade-in as the player
-        // approaches. Stop at 2.5x radius (hysteresis). The voice plays at
-        // volume 0 in the pre-audible zone and fades in purely based on
-        // position as the player gets closer.
         bool alreadyPlaying = (amb.handle != SOUND_HANDLE_INVALID);
         bool inRange = (amb.radius > 0.0f &&
-                        (alreadyPlaying ? effectiveDist < stopRadius : effectiveDist < startRadius));
+                        (alreadyPlaying ? dist < stopRadius : dist < startRadius));
 
         if (inRange) {
             // Start voice if not already playing
@@ -3043,7 +3015,7 @@ void AudioService::updateAmbientVolumes()
                 }
 
                 float baseVol = schemaVolumeToLinear(amb.volume);
-                float distFactor = std::max(0.0f, 1.0f - (effectiveDist / amb.radius));
+                float distFactor = std::max(0.0f, 1.0f - (dist / amb.radius));
                 if (!(amb.flags & AMB_NO_FADE)) {
                     distFactor *= distFactor;  // quadratic for natural rolloff
                 }
@@ -3453,51 +3425,12 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
     Room *sourceRoom = mRoomService->roomFromPoint(sourcePos);
     Room *listenerRoom = mRoomService->roomFromPoint(listenerPos);
 
-    // Nearest-room fallback: when a source is outside all room OBBs
-    // (common for ambient objects placed by level designers at map edges),
-    // assign it to the nearest room by center distance. This enables portal
-    // routing instead of raw euclidean fallback, so walls actually block
-    // the sound.
-    //
-    // However, if the source and listener are close together (euclidean),
-    // the nearest-room assignment might put them in different rooms due to
-    // the room coverage gap — producing an artificially long portal path.
-    // In this case, assign the source to the LISTENER'S room so they're
-    // treated as same-room (which they effectively are, being nearby).
-    if (!sourceRoom && mRoomService) {
-        float euclidDist = glm::length(sourcePos - listenerPos);
-        if (listenerRoom && euclidDist < 20.0f) {
-            // Source is close to listener but outside room OBBs — assign to
-            // listener's room. This prevents nearby streetlights, torches etc.
-            // from being routed through long portal paths.
-            sourceRoom = listenerRoom;
-        } else {
-            // Source is far from listener — find nearest room by center distance
-            float bestDist = 1e9f;
-            const auto &rooms = mRoomService->getAllRooms();
-            for (const auto &r : rooms) {
-                if (!r) continue;
-                float d = glm::length(r->getCenter() - sourcePos);
-                if (d < bestDist) {
-                    bestDist = d;
-                    sourceRoom = r.get();
-                }
-            }
-        }
-    }
-    if (!listenerRoom && mRoomService) {
-        float bestDist = 1e9f;
-        const auto &rooms = mRoomService->getAllRooms();
-        for (const auto &r : rooms) {
-            if (!r) continue;
-            float d = glm::length(r->getCenter() - listenerPos);
-            if (d < bestDist) {
-                bestDist = d;
-                listenerRoom = r.get();
-            }
-        }
-    }
-
+    // If source or listener is outside all room OBBs, the 5-arg overload
+    // handles it with a euclidean distance fallback. This matches the original
+    // Dark Engine behavior: objects outside the room database cannot propagate
+    // sound through the room portal graph. The ambient system uses euclidean
+    // distance directly (matching AMBIENT.C), so this fallback only affects
+    // non-ambient voices (footsteps, one-shots) that happen to be outside rooms.
     return propagateSound(sourcePos, listenerPos, sourceRoom, listenerRoom, maxDist);
 }
 
