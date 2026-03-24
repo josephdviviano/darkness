@@ -1611,6 +1611,7 @@ void AudioService::onDBDrop(uint32_t dropmask)
 
     haltAll();
     mBlockingFactors.clear();
+    mRoomTransmission.clear();
     mNextHandle = 0;
 
     // Flush the sound cache on mission unload (sounds may differ between missions)
@@ -2768,6 +2769,35 @@ void AudioService::loadAmbientSounds()
     if (!mPropertyService || !mObjectService || !mAudioReady)
         return;
 
+    // Load per-room LoudRoom transmission factors from room object properties.
+    // LoudRoom is a single float (default 1.0) that multiplicatively scales
+    // sound energy passing through a room during portal propagation.
+    // Values < 1.0 dampen (closets, padded rooms), > 1.0 amplify (marble halls).
+    mRoomTransmission.clear();
+    if (mRoomService) {
+        const auto &rooms = mRoomService->getAllRooms();
+        int loudRoomCount = 0;
+        for (const auto &room : rooms) {
+            if (!room) continue;
+            int32_t objID = room->getObjectID();
+            size_t rawSize = 0;
+            const uint8_t *raw = getPropertyRawData(
+                mPropertyService.get(), "LoudRoom", objID, rawSize);
+            if (raw && rawSize >= sizeof(float)) {
+                float transmission;
+                std::memcpy(&transmission, raw, sizeof(float));
+                if (transmission != 1.0f) {  // only store non-default values
+                    mRoomTransmission[room->getRoomID()] = transmission;
+                    ++loudRoomCount;
+                }
+            }
+        }
+        if (loudRoomCount > 0) {
+            std::fprintf(stderr, "AudioService: loaded %d LoudRoom transmission factors\n",
+                         loudRoomCount);
+        }
+    }
+
     // Find all objects with P$AmbientHack (property name "AmbientHa" in the gamesys)
     auto objIDs = getAllObjectsWithProperty(mPropertyService.get(), "AmbientHa");
 
@@ -3421,6 +3451,13 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
             // give total transmission 0.5 * 0.5 = 0.25 (not max(0.5, 0.5) = 0.5).
             // This matches the Dark Engine's FindSoundPath blocking formula.
             float newTransmission = cur.cumulativeTransmission * (1.0f - blocking);
+
+            // LoudRoom: per-room transmission multiplier from P$LoudRoom property.
+            // Applied when entering the next room. Default 1.0 (no effect).
+            auto loudIt = mRoomTransmission.find(nextRoom->getRoomID());
+            if (loudIt != mRoomTransmission.end()) {
+                newTransmission *= loudIt->second;
+            }
 
             int32_t nextID = nextRoom->getRoomID();
             auto bestIt = bestDist.find(nextID);
