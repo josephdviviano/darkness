@@ -89,6 +89,15 @@ public:
     /// Get the 6 bounding planes that define this room's volume
     const Plane *getBoundingPlanes() const { return mPlanes; }
 
+    /// Get the precomputed distance between two portals within this room.
+    /// The distance matrix is stored as a flat array indexed by
+    /// [portalA * portalCount + portalB]. Returns 0 if indices are out of range.
+    float getPortalDist(uint32_t portalA, uint32_t portalB) const {
+        if (portalA >= mPortalCount || portalB >= mPortalCount)
+            return 0.0f;
+        return mPortalDistances[portalA * mPortalCount + portalB];
+    }
+
     /// Get a copy of the object IDs in the specified id set
     /// @param idset 0=objects, 1=creatures typically
     std::vector<int> getObjectIDs(size_t idset) const {

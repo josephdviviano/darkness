@@ -26,6 +26,8 @@
 #include "Room.h"
 #include "RoomService.h"
 
+#include <cmath>
+
 namespace Darkness {
 /*----------------------------------------------------*/
 /*--------------------- RoomPortal -------------------*/
@@ -84,6 +86,65 @@ bool RoomPortal::isInside(const Vector3 &point) {
     for (size_t i = 0; i < mEdgeCount; ++i) {
         if (mEdges[i].getSide(point) == Plane::NEGATIVE_SIDE)
             return false;
+    }
+
+    return true;
+}
+
+//------------------------------------------------------
+bool RoomPortal::raycast(const Vector3 &origin, const Vector3 &dir) const
+{
+    // Ray-portal plane intersection.
+    // Our planes have d negated on load, so getDistance() = -original_dist.
+    // The portal plane normal points from near-room to far-room.
+    float denom = glm::dot(mPlane.normal, dir);
+    if (std::fabs(denom) < 1e-7f)
+        return false;  // ray parallel to portal plane
+
+    // Parametric intersection: t where origin + t*dir hits the plane
+    float t = -mPlane.getDistance(origin) / denom;
+
+    // Compute intersection point (allow the full ray segment, not just [0,1])
+    Vector3 hitPt = origin + dir * t;
+
+    // Point-in-polygon test: check all edge half-planes.
+    // After our d-negation, "inside the portal" means getDistance >= -epsilon
+    // for all edge planes (positive side in our convention = inside).
+    constexpr float kEpsilon = 0.0001f;
+    for (uint32_t i = 0; i < mEdgeCount; ++i) {
+        if (mEdges[i].getDistance(hitPt) < -kEpsilon)
+            return false;  // outside this edge
+    }
+
+    return true;
+}
+
+//------------------------------------------------------
+bool RoomPortal::getRaycastProjection(const Vector3 &origin, const Vector3 &dir,
+                                       Vector3 &projPt) const
+{
+    // Intersect ray with portal plane to get the base point.
+    float denom = glm::dot(mPlane.normal, dir);
+    if (std::fabs(denom) < 1e-7f)
+        return false;  // parallel
+
+    float t = -mPlane.getDistance(origin) / denom;
+    projPt = origin + dir * t;
+
+    // Iterative edge clamping: for each violated edge, project the point
+    // onto the edge plane. This is the Dark Engine's approximate nearest-point
+    // algorithm (inspired by OPDE's portal projection approach).
+    // After our d-negation: "outside" = getDistance < -epsilon.
+    // Projection: move the point onto the edge plane by subtracting the
+    // violation distance along the edge normal.
+    constexpr float kEpsilon = 0.0001f;
+    for (uint32_t i = 0; i < mEdgeCount; ++i) {
+        float dist = mEdges[i].getDistance(projPt);
+        if (dist < -kEpsilon) {
+            // Point is outside this edge. Project onto the edge plane.
+            // dist is negative (outside), so subtracting normal*dist moves inward.
+            projPt -= mEdges[i].normal * dist;
+        }
     }
 
     return true;

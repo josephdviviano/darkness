@@ -3320,122 +3320,254 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
         return result;
     }
 
-    // Dijkstra-style BFS through portal graph, ordered by effective distance.
-    // Each entry tracks cumulative real distance, effective distance (with blocking
-    // penalties), and the last portal crossed (for virtual position).
+    // ── Dijkstra BFS through room portal graph ──
+    // Uses the precomputed portal-to-portal distance matrix within each room
+    // (from ROOM_DB) instead of euclidean entry-point-to-portal distances.
+    // Tracks enter-portal indices for matrix lookup and path reconstruction.
+    // Based on the Dark Engine's cRoomPropAgent::PropagateBF algorithm.
     struct BFSEntry {
-        Room *room;
-        float realDist;         // Cumulative real distance to room entry point
-        float effectiveDist;    // Cumulative effective distance (with blocking penalties)
-        float maxBlocking;      // Highest blocking factor encountered so far
-        Vector3 entryPoint;     // Where we entered this room (portal center or source)
-        Vector3 lastPortalPos;  // Center of the last portal crossed (for virtual position)
+        Room    *room;
+        float    realDist;        // Cumulative geometric distance
+        float    effectiveDist;   // With blocking penalties applied
+        float    cumulativeTransmission; // Product of (1 - blocking) per portal
+        int32_t  enterPortalIdx;  // Portal index we entered this room through (-1 = source room)
+        Room    *prevRoom;        // Previous room (for path reconstruction)
 
-        // Priority queue: smallest effective distance first
         bool operator>(const BFSEntry &o) const {
             return effectiveDist > o.effectiveDist;
         }
     };
 
     std::priority_queue<BFSEntry, std::vector<BFSEntry>, std::greater<BFSEntry>> pq;
-    // Reuse the visited map across calls to avoid per-call hash table allocation.
-    // clear() retains bucket memory. thread_local is safe since propagateSound
-    // is only called from the main thread.
+
+    // Reuse visited map across calls (thread_local retains bucket memory)
     thread_local std::unordered_map<int32_t, float> bestDist;
     bestDist.clear();
 
-    // Seed with the source room
-    BFSEntry start;
+    // For path reconstruction: store the BFS entry that reached each room
+    thread_local std::unordered_map<int32_t, BFSEntry> reachedFrom;
+    reachedFrom.clear();
+
+    // Seed with source room
+    BFSEntry start{};
     start.room = sourceRoom;
     start.realDist = 0.0f;
     start.effectiveDist = 0.0f;
-    start.maxBlocking = 0.0f;
-    start.entryPoint = sourcePos;
-    start.lastPortalPos = sourcePos;
+    start.cumulativeTransmission = 1.0f;  // full transmission (no blocking)
+    start.enterPortalIdx = -1;
+    start.prevRoom = nullptr;
     pq.push(start);
     bestDist[sourceRoom->getRoomID()] = 0.0f;
+
+    BFSEntry listenerEntry{};
+    bool foundListener = false;
 
     while (!pq.empty()) {
         BFSEntry cur = pq.top();
         pq.pop();
 
-        // Skip if we already found a better path to this room
         auto it = bestDist.find(cur.room->getRoomID());
         if (it != bestDist.end() && cur.effectiveDist > it->second)
             continue;
 
-        // Check if we've reached the listener's room
+        reachedFrom[cur.room->getRoomID()] = cur;
+
+        // Reached listener's room
         if (cur.room == listenerRoom) {
-            // Add final segment from room entry point to listener
-            float finalSeg = glm::length(listenerPos - cur.entryPoint);
-            result.reached = true;
-            result.realDistance = cur.realDist + finalSeg;
-            result.effectiveDistance = cur.effectiveDist + finalSeg;
-            result.totalBlocking = cur.maxBlocking;
-            // Virtual position: the last portal center, or source if same-room
-            result.virtualPosition = (cur.lastPortalPos == sourcePos)
-                                     ? sourcePos : cur.lastPortalPos;
-            return result;
+            listenerEntry = cur;
+            foundListener = true;
+            break;
         }
 
-        // Explore portals from the current room
+        // Explore portals
         uint32_t portalCount = cur.room->getPortalCount();
         for (uint32_t i = 0; i < portalCount; ++i) {
+            // Don't go back through the portal we entered from
+            if (static_cast<int32_t>(i) == cur.enterPortalIdx)
+                continue;
+
             RoomPortal *portal = cur.room->getPortal(i);
             if (!portal) continue;
 
             Room *nextRoom = portal->getFarRoom();
             if (!nextRoom) continue;
 
-            // Distance from current entry point to this portal center
-            float segDist = glm::length(portal->getCenter() - cur.entryPoint);
+            // Distance: use precomputed portal-to-portal matrix for intra-room
+            // distance. For the source room (enterPortalIdx == -1), use euclidean
+            // from source position to exit portal center.
+            float segDist;
+            if (cur.enterPortalIdx >= 0) {
+                segDist = cur.room->getPortalDist(i, static_cast<uint32_t>(cur.enterPortalIdx));
+            } else {
+                segDist = glm::length(portal->getCenter() - sourcePos);
+            }
             float newRealDist = cur.realDist + segDist;
 
-            // Get blocking factor for this portal (keyed by room pair)
+            // Blocking: Dark Engine formula — dist += (maxDist - dist) * blocking.
+            // No artificial per-portal penalty: room portals are real architectural
+            // doorways, so open portals have zero blocking (unlike BSP cell boundaries).
             float blocking = getBlockingFactor(cur.room->getRoomID(),
                                                 nextRoom->getRoomID());
+            float newEffDist = cur.effectiveDist + segDist;
+            if (blocking > 0.0f && newEffDist < maxDist) {
+                newEffDist += (maxDist - newEffDist) * blocking;
+            }
 
-            // Dark Engine munged distance formula:
-            // effectiveDist = realDist + (maxDist - realDist) * blockingFactor
-            // Applied per-portal: the penalty increases the effective distance.
-            //
-            // Additionally, add a fixed per-portal distance penalty. Dark Engine
-            // BSP cells are small convex leaves (not architectural rooms), so
-            // traversing many cells adds little geometric distance. Without the
-            // penalty, a sound 6 cells away through walls sounds nearly as loud
-            // as one at the same euclidean distance in open air. The penalty
-            // ensures each portal traversal has a meaningful acoustic cost,
-            // simulating the energy loss from sound diffracting around corners.
-            constexpr float kPerPortalPenalty = 10.0f; // world units per portal hop
-            float penalty = (maxDist - newRealDist) * blocking + kPerPortalPenalty;
-            if (penalty < 0.0f) penalty = 0.0f;
-            float newEffDist = cur.effectiveDist + segDist + penalty;
-
-            // Prune if beyond max propagation distance
             if (newEffDist > maxDist)
                 continue;
 
-            float newMaxBlocking = std::max(cur.maxBlocking, blocking);
+            // Multiplicative transmission: each portal reduces the cumulative
+            // transmission by its blocking factor. Two doors each blocking 50%
+            // give total transmission 0.5 * 0.5 = 0.25 (not max(0.5, 0.5) = 0.5).
+            // This matches the Dark Engine's FindSoundPath blocking formula.
+            float newTransmission = cur.cumulativeTransmission * (1.0f - blocking);
 
-            // Only explore if this is a better path to the next room
             int32_t nextID = nextRoom->getRoomID();
             auto bestIt = bestDist.find(nextID);
             if (bestIt != bestDist.end() && newEffDist >= bestIt->second)
                 continue;
             bestDist[nextID] = newEffDist;
 
-            BFSEntry next;
+            // Find the entry portal index in the next room. Use the stored
+            // destination portal ID (from ROOM_DB) for O(1) lookup instead of
+            // linear search. This correctly handles rooms with multiple portals
+            // to the same neighbor.
+            int32_t farPortalIdx = -1;
+            int32_t destPortalID = portal->getDestPortalID();
+            for (uint32_t j = 0; j < nextRoom->getPortalCount(); ++j) {
+                RoomPortal *p = nextRoom->getPortal(j);
+                if (p && p->getPortalID() == destPortalID) {
+                    farPortalIdx = static_cast<int32_t>(j);
+                    break;
+                }
+            }
+
+            BFSEntry next{};
             next.room = nextRoom;
             next.realDist = newRealDist;
             next.effectiveDist = newEffDist;
-            next.maxBlocking = newMaxBlocking;
-            next.entryPoint = portal->getCenter();
-            next.lastPortalPos = portal->getCenter();
+            next.cumulativeTransmission = newTransmission;
+            next.enterPortalIdx = farPortalIdx;
+            next.prevRoom = cur.room;
             pq.push(next);
         }
     }
 
-    // Sound could not reach the listener within maxDist
+    if (!foundListener)
+        return result;  // unreachable within maxDist
+
+    // ── Path reconstruction + portal edge projection ──
+    // Walk backward from listener room to source room, collecting the portal
+    // sequence. Then run a forward pass with anchor projection to find the
+    // shortest geometric path that threads through all portal openings.
+    // Based on the Dark Engine's FindSoundPath algorithm.
+
+    // Reconstruct portal sequence (reversed: listener→source, then flip)
+    struct PortalInfo {
+        RoomPortal *portal;
+        Room       *fromRoom;
+    };
+    std::vector<PortalInfo> portalChain;
+    {
+        Room *walkRoom = listenerRoom;
+        while (walkRoom != sourceRoom) {
+            auto it = reachedFrom.find(walkRoom->getRoomID());
+            if (it == reachedFrom.end())
+                break;  // shouldn't happen if foundListener is true
+
+            const BFSEntry &entry = it->second;
+            if (!entry.prevRoom)
+                break;
+
+            // Find the portal from prevRoom to walkRoom
+            for (uint32_t i = 0; i < entry.prevRoom->getPortalCount(); ++i) {
+                RoomPortal *p = entry.prevRoom->getPortal(i);
+                if (p && p->getFarRoom() == walkRoom) {
+                    portalChain.push_back({p, entry.prevRoom});
+                    break;
+                }
+            }
+            walkRoom = entry.prevRoom;
+        }
+        // Reverse so portalChain[0] is nearest to source
+        std::reverse(portalChain.begin(), portalChain.end());
+    }
+
+    // Forward-pass anchor projection: cast rays from source through each
+    // portal toward the next portal (or listener). When a ray misses a portal,
+    // project onto the nearest edge to create an anchor point where sound
+    // bends around the doorframe.
+    struct Anchor {
+        Vector3 pos;
+        bool valid = false;
+    };
+    std::vector<Anchor> anchors(portalChain.size());
+
+    Vector3 leadPt = sourcePos;  // current "leading" point
+    for (size_t i = 0; i < portalChain.size(); ++i) {
+        // Target: next portal center, or listener if this is the last portal
+        Vector3 target = (i + 1 < portalChain.size())
+                         ? portalChain[i + 1].portal->getCenter()
+                         : listenerPos;
+
+        Vector3 dir = target - leadPt;
+
+        if (!portalChain[i].portal->raycast(leadPt, dir)) {
+            // Ray missed — project onto nearest portal edge
+            Vector3 projPt;
+            if (portalChain[i].portal->getRaycastProjection(leadPt, dir, projPt)) {
+                anchors[i].pos = projPt;
+                anchors[i].valid = true;
+                leadPt = projPt;
+            }
+        }
+        // If raycast succeeds, no anchor needed — path goes straight through
+    }
+
+    // Compute path distance through anchor points
+    float pathDist = 0.0f;
+    int lastAnchor = -1;
+    Vector3 virtualPos = sourcePos;
+
+    for (size_t i = 0; i < anchors.size(); ++i) {
+        if (anchors[i].valid) {
+            if (lastAnchor < 0) {
+                pathDist += glm::length(anchors[i].pos - sourcePos);
+            } else {
+                pathDist += glm::length(anchors[i].pos - anchors[lastAnchor].pos);
+            }
+            lastAnchor = static_cast<int>(i);
+            virtualPos = anchors[i].pos;
+        }
+    }
+
+    // Final segment: last anchor (or source) to listener
+    if (lastAnchor < 0) {
+        // Direct LOS through all portals (rare but possible for aligned rooms)
+        pathDist += glm::length(listenerPos - sourcePos);
+        virtualPos = sourcePos;
+    } else {
+        pathDist += glm::length(listenerPos - anchors[lastAnchor].pos);
+        virtualPos = anchors[lastAnchor].pos;
+    }
+
+    // Apply blocking to the path distance (Dark Engine munged distance formula).
+    // totalBlocking = 1 - cumulativeTransmission (0 = no blocking, 1 = fully blocked).
+    // The original formula: dist += (maxDist - dist) * totalBlocking.
+    float totalBlocking = 1.0f - listenerEntry.cumulativeTransmission;
+    float effDist = pathDist;
+    if (totalBlocking > 0.0f && effDist < maxDist) {
+        effDist += (maxDist - effDist) * totalBlocking;
+    }
+
+    if (effDist <= maxDist) {
+        result.reached = true;
+        result.realDistance = pathDist;
+        result.effectiveDistance = effDist;
+        result.totalBlocking = totalBlocking;
+        result.virtualPosition = virtualPos;
+    }
+
     return result;
 }
 
@@ -3466,11 +3598,11 @@ float AudioService::getBlockingFactor(int room1, int room2) const
     auto it = mBlockingFactors.find(key);
     if (it != mBlockingFactors.end())
         return it->second;
-    // Default portal blocking: even an open doorway narrows the sound field
-    // and introduces a small acoustic penalty. This prevents sounds from
-    // propagating freely through the entire portal graph as if in open air.
-    // The value represents minimal narrowing through an open passage.
-    return 0.15f;
+    // Open portals have zero blocking. Room portals are real architectural
+    // doorways (not BSP cell boundaries), so traversing an open doorway has
+    // no artificial penalty. Door blocking is set explicitly via
+    // setBlockingFactor() when doors close.
+    return 0.0f;
 }
 
 /*---------------------- Factory ----------------------*/
