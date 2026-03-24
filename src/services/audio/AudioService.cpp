@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <queue>
+#include <sys/stat.h>
 #include "DarknessServiceManager.h"
 #include "database/DatabaseService.h"
 #include "loop/LoopService.h"
@@ -264,6 +265,88 @@ static ma_node_vtable sReflectionMixNodeVtable = {
 /// mono input through as dual-mono stereo. Helps isolate node graph issues.
 /// DSP bypass level (0=full pipeline, 3=mono passthrough, 4=stereo passthrough)
 static std::atomic<int> sDSPBypassLevel{0};
+
+// ── Debug audio recording ──
+// Captures the final stereo output to a WAV file for offline analysis.
+// Toggled via the debug console (record_audio setting).
+static std::atomic<bool> sRecording{false};
+static FILE *sRecordFile = nullptr;
+static uint32_t sRecordSamples = 0;  // total stereo samples written
+static std::mutex sRecordMutex;
+
+static void startRecording(uint32_t sampleRate) {
+    std::lock_guard<std::mutex> lock(sRecordMutex);
+    if (sRecordFile) return;
+
+    std::string path = "darkness_audio_capture.wav";
+    sRecordFile = std::fopen(path.c_str(), "wb");
+    if (!sRecordFile) {
+        std::fprintf(stderr, "[RECORD] Failed to open %s\n", path.c_str());
+        return;
+    }
+
+    // Write a placeholder WAV header (44 bytes) — updated on close
+    uint8_t header[44] = {};
+    std::memcpy(header, "RIFF", 4);
+    std::memcpy(header + 8, "WAVE", 4);
+    std::memcpy(header + 12, "fmt ", 4);
+    uint32_t fmtSize = 16;
+    std::memcpy(header + 16, &fmtSize, 4);
+    uint16_t audioFmt = 3;  // IEEE float
+    std::memcpy(header + 20, &audioFmt, 2);
+    uint16_t channels = 2;
+    std::memcpy(header + 22, &channels, 2);
+    std::memcpy(header + 24, &sampleRate, 4);
+    uint32_t byteRate = sampleRate * 2 * 4;  // stereo float32
+    std::memcpy(header + 28, &byteRate, 4);
+    uint16_t blockAlign = 8;  // 2 channels × 4 bytes
+    std::memcpy(header + 32, &blockAlign, 2);
+    uint16_t bitsPerSample = 32;
+    std::memcpy(header + 34, &bitsPerSample, 2);
+    std::memcpy(header + 36, "data", 4);
+    // data size placeholder (updated on close)
+    std::fwrite(header, 1, 44, sRecordFile);
+    sRecordSamples = 0;
+
+    // Also start a position log
+    FILE *posFile = std::fopen("darkness_audio_positions.csv", "w");
+    if (posFile) {
+        std::fprintf(posFile, "timestamp_ms,x,y,z,yaw,pitch,voices,refl_voices\n");
+        std::fclose(posFile);
+    }
+
+    std::fprintf(stderr, "[RECORD] Started: %s (48kHz stereo float32)\n", path.c_str());
+    sRecording.store(true, std::memory_order_release);
+}
+
+static void stopRecording() {
+    std::lock_guard<std::mutex> lock(sRecordMutex);
+    sRecording.store(false, std::memory_order_release);
+    if (!sRecordFile) return;
+
+    // Fix up WAV header with actual sizes
+    uint32_t dataSize = sRecordSamples * 2 * 4;  // stereo float32
+    uint32_t riffSize = 36 + dataSize;
+    std::fseek(sRecordFile, 4, SEEK_SET);
+    std::fwrite(&riffSize, 4, 1, sRecordFile);
+    std::fseek(sRecordFile, 40, SEEK_SET);
+    std::fwrite(&dataSize, 4, 1, sRecordFile);
+    std::fclose(sRecordFile);
+    sRecordFile = nullptr;
+
+    float durSec = sRecordSamples / 48000.0f;
+    std::fprintf(stderr, "[RECORD] Stopped: %u samples (%.1f seconds)\n",
+                 sRecordSamples, durSec);
+}
+
+// Called from the audio thread (reflectionMixNodeProcess) to capture output
+static void recordAudioFrame(const float *stereoInterleaved, uint32_t frameCount) {
+    if (!sRecording.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lock(sRecordMutex);
+    if (!sRecordFile) return;
+    std::fwrite(stereoInterleaved, sizeof(float), frameCount * 2, sRecordFile);
+    sRecordSamples += frameCount;
+}
 
 // ── Audio thread profiling (written by audio thread, read by main thread) ──
 // Tracks peak time spent in audio callbacks to detect buffer underruns.
@@ -629,8 +712,20 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         }
     }
 
+    // Clamp output to [-1, 1] — HRTF convolution can produce samples > 1.0
+    // (confirmed by Steam Audio issue #350). Without clamping, the DAC clips
+    // harshly, producing audible click artifacts.
+    for (ma_uint32 i = 0; i < frameCount * 2; ++i) {
+        if (stereoOut[i] > 1.0f) stereoOut[i] = 1.0f;
+        else if (stereoOut[i] < -1.0f) stereoOut[i] = -1.0f;
+    }
+
     pFrameCountIn[0] = frameCount;
     *pFrameCountOut = frameCount;
+
+    // Capture final output for debug recording (if active)
+    if (stereoOut && frameCount > 0)
+        recordAudioFrame(stereoOut, frameCount);
 
     // Profile: track peak mix node time and total callback time
     auto mixT1 = std::chrono::steady_clock::now();
@@ -1034,13 +1129,18 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             materialIndices.push_back(it != texToMaterialIdx.end() ? it->second : 0);
         }
 
-        // Step 3: Convert vertex data to IPLVector3 array
+        // Step 3: Convert vertex data to IPLVector3 array and compute scene bounds
         // (IPLVector3 is {float x, y, z} — same layout as our flat array)
+        mSceneMin = Vector3( 1e9f,  1e9f,  1e9f);
+        mSceneMax = Vector3(-1e9f, -1e9f, -1e9f);
         std::vector<IPLVector3> iplVertices(numVertices);
         for (size_t i = 0; i < numVertices; ++i) {
-            iplVertices[i] = {data.vertices[i * 3],
-                              data.vertices[i * 3 + 1],
-                              data.vertices[i * 3 + 2]};
+            float x = data.vertices[i * 3];
+            float y = data.vertices[i * 3 + 1];
+            float z = data.vertices[i * 3 + 2];
+            iplVertices[i] = {x, y, z};
+            mSceneMin = glm::min(mSceneMin, Vector3(x, y, z));
+            mSceneMax = glm::max(mSceneMax, Vector3(x, y, z));
         }
 
         // Convert index data to IPLTriangle array
@@ -1096,7 +1196,10 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         simSettings.maxDuration = mReflectionDuration;
         simSettings.maxOrder = mAmbisonicsOrder;
         simSettings.maxNumSources = 32;      // voice pool size
-        simSettings.numThreads = 2;          // parallel ray tracing
+        // Use most available cores for parallel ray tracing.
+        // Reserve 2 cores for main + audio threads.
+        unsigned int hwThreads = std::thread::hardware_concurrency();
+        simSettings.numThreads = std::max(2u, hwThreads > 2 ? hwThreads - 2 : 2u);
         simSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
         simSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
 
@@ -1270,8 +1373,10 @@ bool AudioService::initReflectionPipeline()
 //------------------------------------------------------
 void AudioService::destroyReflectionPipeline()
 {
-    // Wait for any in-flight background reflection simulation to finish
+    // Wait for any in-flight simulation threads to finish
     mReflectionShutdown.store(true, std::memory_order_release);
+    if (mDirectSimThread.joinable())
+        mDirectSimThread.join();
     if (mReflectionThread.joinable())
         mReflectionThread.join();
 
@@ -1310,6 +1415,15 @@ void AudioService::destroyAcousticScene()
 
     // Destroy reflection pipeline before simulator (it references simulator sources)
     destroyReflectionPipeline();
+
+    // Release probe batch before simulator (it's registered with the simulator)
+    if (mIplProbeBatch) {
+        if (mIplSimulator)
+            iplSimulatorRemoveProbeBatch(mIplSimulator, mIplProbeBatch);
+        iplProbeBatchRelease(&mIplProbeBatch);
+        mIplProbeBatch = nullptr;
+        mProbeCount = 0;
+    }
 
     if (mIplSimulator) {
         iplSimulatorRelease(&mIplSimulator);
@@ -1485,14 +1599,21 @@ void AudioService::loopStep(float deltaTime)
     // simulation thread is running — iplSimulatorRunDirect/Reflections holds
     // internal pointers to committed sources. Instead of BLOCKING the main thread
     // (which caused 200+ms stalls), we DEFER mutations until the sim finishes.
-    bool simBusy = mReflectionSimRunning.load(std::memory_order_acquire);
+    // Source mutations (add/remove/commit) must not race with simulation threads.
+    // We check both threads. Direct sim is fast (~2-5ms) and runs every frame,
+    // so it's usually done by the next frame. Reflection sim can take 50-200ms.
+    bool directBusy = mDirectSimRunning.load(std::memory_order_acquire);
+    bool reflBusy = mReflectionSimRunning.load(std::memory_order_acquire);
+    bool anySimBusy = directBusy || reflBusy;
 
-    if (!simBusy) {
-        // Background sim is idle — safe to mutate sources
+    if (!anySimBusy) {
+        // Both sim threads idle — safe to mutate sources
+        if (mDirectSimThread.joinable())
+            mDirectSimThread.join();
         if (mReflectionThread.joinable())
             mReflectionThread.join();
 
-        // Flush deferred IPL source removals (accumulated while sim was busy)
+        // Flush deferred IPL source removals
         if (!mPendingSourceRemovals.empty() && mIplSimulator) {
             for (auto &src : mPendingSourceRemovals) {
                 iplSourceRemove(src, mIplSimulator);
@@ -1504,7 +1625,7 @@ void AudioService::loopStep(float deltaTime)
         // Remove voices that have finished playback
         cleanupFinishedVoices();
 
-        // Batch-commit any pending source additions/removals before simulation.
+        // Batch-commit any pending source additions/removals
         if (mSimulatorDirty && mIplSimulator) {
             auto ct0 = std::chrono::steady_clock::now();
             iplSimulatorCommit(mIplSimulator);
@@ -1515,9 +1636,8 @@ void AudioService::loopStep(float deltaTime)
             mSimulatorDirty = false;
         }
     } else {
-        // Sim is running — still clean up finished voices to free slots for
-        // new sounds (e.g., footsteps). IPL source removal is deferred
-        // automatically by removeVoiceSource when sim is busy.
+        // At least one sim thread busy — still clean up finished voices
+        // (IPL source removal is deferred automatically)
         cleanupFinishedVoices();
     }
 
@@ -1537,10 +1657,10 @@ void AudioService::loopStep(float deltaTime)
             mReflectionMixNode->listenerOrientation = listenerCoord;
         }
 
-        // Steps 1-3: Set simulation inputs and launch background sim.
-        // All iplSimulator/iplSource calls must happen when the sim thread is
-        // idle to prevent data races with iplSimulatorRunDirect/Reflections.
-        if (!simBusy) {
+        // Set simulation inputs and launch background threads.
+        // Source inputs (setInputs/setSharedInputs) must not race with simulation,
+        // so we only update them when BOTH sim threads are idle.
+        if (!anySimBusy) {
             // Step 1: Set listener position for the simulator
             IPLSimulationSharedInputs sharedInputs{};
             sharedInputs.listener = listenerCoord;
@@ -1586,22 +1706,28 @@ void AudioService::loopStep(float deltaTime)
                     &inputs);
             }
 
-            // Step 3: Launch simulation on background thread
+            // Step 3a: Launch direct simulation on its own thread (every frame).
+            // Direct sim is cheap (~2-5ms) and controls audibility — must be fresh.
+            mDirectSimRunning.store(true, std::memory_order_release);
+            mDirectSimThread = std::thread([this]() {
+                iplSimulatorRunDirect(mIplSimulator);
+                mDirectSimRunning.store(false, std::memory_order_release);
+            });
+
+            // Step 3b: Launch reflection simulation on a separate thread (throttled).
+            // Reflection sim is expensive (~50-200ms) but latency-tolerant.
             bool runReflections = mReflectionsEnabled && mIplReflectionMixer
                 && (++mReflectionFrameCounter >= mReflectionThrottle);
-            if (runReflections)
+            if (runReflections) {
                 mReflectionFrameCounter = 0;
-
-            mReflectionSimRunning.store(true, std::memory_order_release);
-            mReflectionThread = std::thread([this, runReflections]() {
-                iplSimulatorRunDirect(mIplSimulator);
-                if (runReflections) {
+                mReflectionSimRunning.store(true, std::memory_order_release);
+                mReflectionThread = std::thread([this]() {
                     iplSimulatorRunReflections(mIplSimulator);
                     if (mReflectionMixNode)
                         mReflectionMixNode->simulationRan = true;
-                }
-                mReflectionSimRunning.store(false, std::memory_order_release);
-            });
+                    mReflectionSimRunning.store(false, std::memory_order_release);
+                });
+            }
         }
 
         // Step 4: Read back simulation results and feed to DSP nodes.
@@ -1713,7 +1839,7 @@ void AudioService::loopStep(float deltaTime)
                 // path provides an alternative with attenuation based on effective
                 // distance and direction from the last portal (virtual source).
                 // Skip for tail voices — they're just ringing out convolution.
-                if (!voice->sourceEnded) {
+                if (mPortalRoutingEnabled && !voice->sourceEnded) {
                 SoundPropInfo prop = propagateSound(voice->worldPos, mListenerPos);
                 if (prop.reached) {
                     // Gentle inverse-distance attenuation scaled for Dark Engine
@@ -1766,9 +1892,10 @@ void AudioService::loopStep(float deltaTime)
                 // reflectionsActive (is it in the top N right now?) — a voice
                 // may have been active earlier and accumulated convolution state.
                 if (voice->dspNode.reflectionEffect) {
-                    // Use half the IR duration — the tail decays exponentially,
-                    // so most energy is in the first half. Keeps voice slots free.
-                    voice->tailTimer = mReflectionDuration * 0.5f;
+                    // Tail timer: let the convolution ring out, but cap at 1.0s
+                    // to prevent tail voices from accumulating and consuming
+                    // too much audio thread budget.
+                    voice->tailTimer = std::min(mReflectionDuration * 0.5f, 1.0f);
                     // Ensure convolution stays active during the tail so the
                     // IR rings out naturally (feed silence → convolution outputs tail)
                     voice->dspNode.reflectionsActive = true;
@@ -1792,6 +1919,24 @@ void AudioService::loopStep(float deltaTime)
 
     // Update ambient sound volumes based on listener distance
     updateAmbientVolumes();
+
+    // Write position data to CSV if recording is active
+    if (sRecording.load(std::memory_order_relaxed)) {
+        static auto recordStart = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        float ms = std::chrono::duration<float, std::milli>(now - recordStart).count();
+        int reflCount = 0;
+        for (auto &[h, v] : mVoices)
+            if (v->dspNode.reflectionsActive) ++reflCount;
+        FILE *posFile = std::fopen("darkness_audio_positions.csv", "a");
+        if (posFile) {
+            std::fprintf(posFile, "%.1f,%.2f,%.2f,%.2f,%.4f,%.4f,%zu,%d\n",
+                         ms, mListenerPos.x, mListenerPos.y, mListenerPos.z,
+                         mListenerYaw, mListenerPitch,
+                         mVoices.size(), reflCount);
+            std::fclose(posFile);
+        }
+    }
 }
 
 //------------------------------------------------------
@@ -1836,12 +1981,14 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
 //------------------------------------------------------
 void AudioService::waitForReflectionThread()
 {
-    // If the background reflection thread is running, wait for it to finish.
-    // This prevents Steam Audio's internal data structures from being accessed
-    // while we modify the source list (add/remove/commit).
-    if (mReflectionThread.joinable()) {
+    // Wait for BOTH simulation threads to finish before mutating sources.
+    // iplSourceAdd/Remove must not race with iplSimulatorRunDirect or RunReflections.
+    if (mDirectSimThread.joinable())
+        mDirectSimThread.join();
+    mDirectSimRunning.store(false, std::memory_order_release);
+
+    if (mReflectionThread.joinable())
         mReflectionThread.join();
-    }
     mReflectionSimRunning.store(false, std::memory_order_release);
 }
 
@@ -2980,6 +3127,281 @@ const size_t AudioServiceFactory::getSID() { return AudioService::SID; }
 Service *AudioServiceFactory::createInstance(ServiceManager *manager)
 {
     return new AudioService(manager, mName);
+}
+
+// ── Probe baking and loading ──
+
+//------------------------------------------------------
+int AudioService::getProbeCount() const
+{
+    return mProbeCount;
+}
+
+void AudioService::startAudioRecording()
+{
+    startRecording(mDeviceSampleRate);
+}
+
+void AudioService::stopAudioRecording()
+{
+    stopRecording();
+}
+
+bool AudioService::isRecordingAudio() const
+{
+    return sRecording.load(std::memory_order_relaxed);
+}
+
+//------------------------------------------------------
+std::string AudioService::getProbeFilePath(const std::string &misPath,
+                                            const std::string &gameName)
+{
+    // Extract mission filename without extension
+    std::string missionName;
+    auto lastSlash = misPath.find_last_of("/\\");
+    std::string filename = (lastSlash != std::string::npos)
+        ? misPath.substr(lastSlash + 1) : misPath;
+    auto dotPos = filename.rfind('.');
+    missionName = (dotPos != std::string::npos)
+        ? filename.substr(0, dotPos) : filename;
+
+    // Convert to lowercase for consistency
+    for (auto &c : missionName) c = static_cast<char>(std::tolower(c));
+
+    // Build path: ~/darkness/{gameName}/baked_probes/{missionName}.probes
+    const char *home = std::getenv("HOME");
+    if (!home) home = ".";
+    std::string dir = std::string(home) + "/darkness/" + gameName + "/baked_probes";
+
+    // Create directories (mkdir -p equivalent)
+    std::string pathSoFar;
+    for (size_t i = 0; i < dir.size(); ++i) {
+        if (dir[i] == '/' || i == dir.size() - 1) {
+            pathSoFar = dir.substr(0, i + 1);
+#ifdef _WIN32
+            _mkdir(pathSoFar.c_str());
+#else
+            mkdir(pathSoFar.c_str(), 0755);
+#endif
+        }
+    }
+
+    return dir + "/" + missionName + ".probes";
+}
+
+bool AudioService::bakeProbes(const std::string &outputPath,
+                               std::atomic<float> *progress,
+                               float spacing, float height)
+{
+    if (!mIplContext || !mIplScene) {
+        LOG_ERROR("AudioService: cannot bake probes — no acoustic scene");
+        return false;
+    }
+
+    std::fprintf(stderr, "Baking probes: spacing=%.1f height=%.1f ...\n", spacing, height);
+
+    // Step 1: Generate probes on a uniform floor grid
+    IPLProbeArray probeArray = nullptr;
+    IPLerror err = iplProbeArrayCreate(mIplContext, &probeArray);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplProbeArrayCreate failed (%d)", err);
+        return false;
+    }
+
+    // Use the actual acoustic scene bounding box for probe generation.
+    // The OBB transform maps a unit cube [-0.5, 0.5]³ to world space.
+    Vector3 center = (mSceneMin + mSceneMax) * 0.5f;
+    Vector3 extent = mSceneMax - mSceneMin;
+    // Add a small margin to ensure probes cover the edges
+    extent += Vector3(spacing * 2.0f);
+
+    IPLMatrix4x4 transform{};
+    transform.elements[0][0] = extent.x;   // X scale
+    transform.elements[1][1] = extent.y;   // Y scale
+    transform.elements[2][2] = extent.z;   // Z scale
+    transform.elements[3][0] = center.x;   // X translation
+    transform.elements[3][1] = center.y;   // Y translation
+    transform.elements[3][2] = center.z;   // Z translation
+    transform.elements[3][3] = 1.0f;
+
+    std::fprintf(stderr, "Scene bounds: (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) extent=(%.0f,%.0f,%.0f)\n",
+                 mSceneMin.x, mSceneMin.y, mSceneMin.z,
+                 mSceneMax.x, mSceneMax.y, mSceneMax.z,
+                 extent.x, extent.y, extent.z);
+
+    IPLProbeGenerationParams genParams{};
+    genParams.type = IPL_PROBEGENERATIONTYPE_UNIFORMFLOOR;
+    genParams.spacing = spacing;
+    genParams.height = height;
+    genParams.transform = transform;
+
+    iplProbeArrayGenerateProbes(probeArray, mIplScene, &genParams);
+
+    int numProbes = iplProbeArrayGetNumProbes(probeArray);
+    std::fprintf(stderr, "Generated %d probes (spacing=%.1f, height=%.1f)\n",
+                 numProbes, spacing, height);
+
+    if (numProbes == 0) {
+        LOG_ERROR("AudioService: no probes generated — check scene geometry");
+        iplProbeArrayRelease(&probeArray);
+        return false;
+    }
+
+    // Step 2: Create probe batch and add the generated probes
+    IPLProbeBatch probeBatch = nullptr;
+    err = iplProbeBatchCreate(mIplContext, &probeBatch);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplProbeBatchCreate failed (%d)", err);
+        iplProbeArrayRelease(&probeArray);
+        return false;
+    }
+
+    iplProbeBatchAddProbeArray(probeBatch, probeArray);
+    iplProbeBatchCommit(probeBatch);
+    iplProbeArrayRelease(&probeArray);  // batch now owns the probe data
+
+    // Step 3: Bake pathing data (visibility graph + shortest paths)
+    std::fprintf(stderr, "Baking pathing data for %d probes...\n", numProbes);
+
+    IPLBakedDataIdentifier pathId{};
+    pathId.type = IPL_BAKEDDATATYPE_PATHING;
+    pathId.variation = IPL_BAKEDDATAVARIATION_DYNAMIC;
+
+    IPLPathBakeParams bakeParams{};
+    bakeParams.scene = mIplScene;
+    bakeParams.probeBatch = probeBatch;
+    bakeParams.identifier = pathId;
+    bakeParams.numSamples = 4;       // visibility test samples (rays = numSamples²)
+    bakeParams.radius = spacing;     // probe influence radius
+    bakeParams.threshold = 0.1f;     // visibility threshold
+    bakeParams.visRange = 200.0f;    // max visibility distance (SOUND_MAX_DIST)
+    bakeParams.pathRange = 200.0f;   // max path length
+    bakeParams.numThreads = 4;       // parallel baking
+
+    auto bakeStart = std::chrono::steady_clock::now();
+
+    iplPathBakerBake(mIplContext, &bakeParams,
+        [](IPLfloat32 p, void *userData) {
+            auto *prog = static_cast<std::atomic<float> *>(userData);
+            if (prog) prog->store(p, std::memory_order_relaxed);
+            static int lastPct = -1;
+            int pct = static_cast<int>(p * 100.0f);
+            if (pct != lastPct && pct % 10 == 0) {
+                std::fprintf(stderr, "  baking: %d%%\n", pct);
+                lastPct = pct;
+            }
+        },
+        progress);
+
+    auto bakeEnd = std::chrono::steady_clock::now();
+    float bakeSec = std::chrono::duration<float>(bakeEnd - bakeStart).count();
+    std::fprintf(stderr, "Pathing bake complete: %d probes in %.1f seconds\n",
+                 numProbes, bakeSec);
+
+    // Step 4: Serialize to disk
+    IPLSerializedObjectSettings soSettings{};
+    soSettings.data = nullptr;
+    soSettings.size = 0;
+
+    IPLSerializedObject serializedObject = nullptr;
+    err = iplSerializedObjectCreate(mIplContext, &soSettings, &serializedObject);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplSerializedObjectCreate failed (%d)", err);
+        iplProbeBatchRelease(&probeBatch);
+        return false;
+    }
+
+    iplProbeBatchSave(probeBatch, serializedObject);
+
+    IPLsize dataSize = iplSerializedObjectGetSize(serializedObject);
+    IPLbyte *data = iplSerializedObjectGetData(serializedObject);
+
+    FILE *f = std::fopen(outputPath.c_str(), "wb");
+    if (!f) {
+        LOG_ERROR("AudioService: failed to open '%s' for writing", outputPath.c_str());
+        iplSerializedObjectRelease(&serializedObject);
+        iplProbeBatchRelease(&probeBatch);
+        return false;
+    }
+
+    std::fwrite(data, 1, dataSize, f);
+    std::fclose(f);
+
+    std::fprintf(stderr, "Saved %d probes to '%s' (%zu bytes)\n",
+                 numProbes, outputPath.c_str(), static_cast<size_t>(dataSize));
+
+    iplSerializedObjectRelease(&serializedObject);
+    iplProbeBatchRelease(&probeBatch);
+    return true;
+}
+
+//------------------------------------------------------
+bool AudioService::loadProbes(const std::string &probePath)
+{
+    if (!mIplContext || !mIplSimulator) {
+        LOG_ERROR("AudioService: cannot load probes — no context/simulator");
+        return false;
+    }
+
+    // Release any previously loaded probes
+    if (mIplProbeBatch) {
+        waitForReflectionThread();
+        iplSimulatorRemoveProbeBatch(mIplSimulator, mIplProbeBatch);
+        iplSimulatorCommit(mIplSimulator);
+        iplProbeBatchRelease(&mIplProbeBatch);
+        mIplProbeBatch = nullptr;
+        mProbeCount = 0;
+    }
+
+    // Read file into memory
+    FILE *f = std::fopen(probePath.c_str(), "rb");
+    if (!f) {
+        LOG_INFO("AudioService: no probe file at '%s' — pathing disabled",
+                 probePath.c_str());
+        return false;
+    }
+
+    std::fseek(f, 0, SEEK_END);
+    size_t fileSize = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+
+    std::vector<uint8_t> fileData(fileSize);
+    std::fread(fileData.data(), 1, fileSize, f);
+    std::fclose(f);
+
+    // Deserialize
+    IPLSerializedObjectSettings soSettings{};
+    soSettings.data = reinterpret_cast<IPLbyte *>(fileData.data());
+    soSettings.size = static_cast<IPLsize>(fileSize);
+
+    IPLSerializedObject serializedObject = nullptr;
+    IPLerror err = iplSerializedObjectCreate(mIplContext, &soSettings, &serializedObject);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplSerializedObjectCreate failed (%d) loading '%s'",
+                  err, probePath.c_str());
+        return false;
+    }
+
+    err = iplProbeBatchLoad(mIplContext, serializedObject, &mIplProbeBatch);
+    iplSerializedObjectRelease(&serializedObject);
+
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("AudioService: iplProbeBatchLoad failed (%d) for '%s'",
+                  err, probePath.c_str());
+        return false;
+    }
+
+    iplProbeBatchCommit(mIplProbeBatch);
+    mProbeCount = iplProbeBatchGetNumProbes(mIplProbeBatch);
+
+    // Register with simulator
+    waitForReflectionThread();
+    iplSimulatorAddProbeBatch(mIplSimulator, mIplProbeBatch);
+    iplSimulatorCommit(mIplSimulator);
+
+    std::fprintf(stderr, "AudioService: loaded %d probes from '%s'\n",
+                 mProbeCount, probePath.c_str());
+    return true;
 }
 
 } // namespace Darkness
