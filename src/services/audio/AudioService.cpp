@@ -528,16 +528,19 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                               * (node->directParams.occlusion + transAvg * (1.0f - node->directParams.occlusion))
                               * airAvg;
 
-            // Portal routing provides an alternative path through connected rooms.
-            // Use whichever path delivers more energy to the listener.
+            // Architecture B: cross-room voices use portal attenuation (from room
+            // BFS effective distance) multiplied by Steam Audio's last-segment
+            // occlusion. Same-room voices use Steam Audio's direct path only.
+            // The IPLSource position was already set to the virtual position for
+            // cross-room voices, so directAtten reflects the last-segment occlusion
+            // from the doorway to the listener.
             float atten = directAtten;
-            if (node->usePortalRouting && node->portalAttenuation > directAtten) {
-                atten = node->portalAttenuation;
-                // Override HRTF direction to point toward the portal (doorway)
-                // where the sound is arriving from, not the actual source behind
-                // the wall. This will take effect on the NEXT binaural apply
-                // (current frame already processed with direct direction).
-                // The 1-frame lag is imperceptible.
+            if (node->usePortalRouting) {
+                // Multiply portal-path attenuation by the last-segment occlusion
+                // from Steam Audio. This gives frequency-dependent filtering
+                // through the doorway opening while the overall volume comes from
+                // the room-graph path distance.
+                atten = node->portalAttenuation * directAtten;
             }
 
             if (atten < 0.001f) atten = 0.001f;
@@ -1728,11 +1731,16 @@ void AudioService::loopStep(float deltaTime)
         float cosY = std::cos(mListenerYaw), sinY = std::sin(mListenerYaw);
         float cosP = std::cos(mListenerPitch), sinP = std::sin(mListenerPitch);
 
+        // Listener coordinate frame (used for both IPL and HRTF direction)
+        Vector3 right(sinY, -cosY, 0.0f);
+        Vector3 ahead(cosY * cosP, sinY * cosP, sinP);
+        Vector3 up(-cosY * sinP, -sinY * sinP, cosP);
+
         IPLCoordinateSpace3 listenerCoord{};
         listenerCoord.origin = {mListenerPos.x, mListenerPos.y, mListenerPos.z};
-        listenerCoord.ahead  = {cosY * cosP, sinY * cosP, sinP};
-        listenerCoord.right  = {sinY, -cosY, 0.0f};
-        listenerCoord.up     = {-cosY * sinP, -sinY * sinP, cosP};
+        listenerCoord.ahead  = {ahead.x, ahead.y, ahead.z};
+        listenerCoord.right  = {right.x, right.y, right.z};
+        listenerCoord.up     = {up.x, up.y, up.z};
 
         // Update listener orientation for ambisonics decode (audio thread reads this)
         if (mReflectionMixNode && mReflectionMixNode->ready) {
@@ -1798,13 +1806,75 @@ void AudioService::loopStep(float deltaTime)
             bakedReflId.type = IPL_BAKEDDATATYPE_REFLECTIONS;
             bakedReflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
 
-            // Step 2b: Update per-source positions and baked/real-time mode
+            // Step 2b: Run portal propagation and set source positions.
+            // Architecture B: for cross-room voices, set the IPLSource position
+            // to the virtual position (last portal anchor) so Steam Audio traces
+            // rays from the doorway, not from behind a wall. Same-room voices
+            // use their real position. Unreachable voices skip simulation.
+            Room *listenerRoom = mRoomService ? mRoomService->roomFromPoint(mListenerPos) : nullptr;
+
             for (auto &[handle, voice] : mVoices) {
                 if (!voice->iplSource)
                     continue;
 
+                // Run portal propagation to determine reachability and path
+                SoundPropInfo prop{};
+                bool isCrossRoom = false;
+                if (mPortalRoutingEnabled && !voice->sourceEnded) {
+                    auto prT0 = std::chrono::steady_clock::now();
+                    prop = propagateSound(voice->worldPos, mListenerPos);
+                    auto prT1 = std::chrono::steady_clock::now();
+                    float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
+                    sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
+                    sPortalRoutingCount.fetch_add(1, std::memory_order_relaxed);
+
+                    // Determine if the voice is in a different room from the listener
+                    Room *srcRoom = mRoomService ? mRoomService->roomFromPoint(voice->worldPos) : nullptr;
+                    isCrossRoom = (srcRoom && listenerRoom && srcRoom != listenerRoom);
+                }
+
+                // Store propagation result on DSP node for the audio callback
+                if (prop.reached) {
+                    float portalAtten = 1.0f / (1.0f + prop.effectiveDistance *
+                                                        prop.effectiveDistance * 0.001f);
+                    voice->dspNode.portalAttenuation = portalAtten;
+                    voice->dspNode.usePortalRouting = isCrossRoom;
+
+                    // For cross-room voices, compute HRTF direction toward the
+                    // virtual position (last portal anchor / doorway edge)
+                    if (isCrossRoom) {
+                        Vector3 toPortal = prop.virtualPosition - mListenerPos;
+                        float portalDist = glm::length(toPortal);
+                        if (portalDist > 0.001f) {
+                            toPortal /= portalDist;
+                            voice->dspNode.direction = {
+                                glm::dot(toPortal, right),
+                                glm::dot(toPortal, up),
+                                -glm::dot(toPortal, ahead)
+                            };
+                        }
+                    }
+                } else {
+                    voice->dspNode.usePortalRouting = false;
+                    voice->dspNode.portalAttenuation = 0.0f;
+                }
+
+                // Architecture B: for cross-room voices, set the IPLSource
+                // position to the virtual position (last portal anchor).
+                // Steam Audio traces direct-path rays from the doorway, giving
+                // correct frequency-dependent occlusion for the final visible
+                // segment. Same-room voices use their real position for full
+                // same-room occlusion (pillars, furniture, etc.).
                 IPLCoordinateSpace3 sourceCoord{};
-                sourceCoord.origin = {voice->worldPos.x, voice->worldPos.y, voice->worldPos.z};
+                if (isCrossRoom && prop.reached) {
+                    sourceCoord.origin = {prop.virtualPosition.x,
+                                          prop.virtualPosition.y,
+                                          prop.virtualPosition.z};
+                } else {
+                    sourceCoord.origin = {voice->worldPos.x,
+                                          voice->worldPos.y,
+                                          voice->worldPos.z};
+                }
                 sourceCoord.ahead = {1.0f, 0.0f, 0.0f};
                 sourceCoord.right = {0.0f, 1.0f, 0.0f};
                 sourceCoord.up    = {0.0f, 0.0f, 1.0f};
@@ -1825,8 +1895,7 @@ void AudioService::loopStep(float deltaTime)
                 inputs.numTransmissionRays = 8;
 
                 // Non-top-N voices use baked probe reflections instead of
-                // real-time ray tracing. This gives them reverb from the
-                // nearest probe at near-zero simulation cost.
+                // real-time ray tracing.
                 bool isTopN = reflCandidateSet.count(handle) > 0;
                 if (!isTopN && mProbesHaveReflections) {
                     inputs.baked = IPL_TRUE;
@@ -1963,11 +2032,9 @@ void AudioService::loopStep(float deltaTime)
                 }
 
                 // Compute listener-to-source direction in listener's local frame
-                // for HRTF binaural rendering
-                Vector3 right(sinY, -cosY, 0.0f);
-                Vector3 ahead(cosY * cosP, sinY * cosP, sinP);
-                Vector3 up(-cosY * sinP, -sinY * sinP, cosP);
-
+                // for HRTF binaural rendering. Cross-room voices already had
+                // their direction set toward the portal in Step 2b — skip them.
+                if (!voice->dspNode.usePortalRouting) {
                 Vector3 toSource = voice->worldPos - mListenerPos;
                 float dist = glm::length(toSource);
                 if (dist > 0.001f) {
@@ -1981,52 +2048,12 @@ void AudioService::loopStep(float deltaTime)
                         -glm::dot(toSource, ahead)    // z = -ahead (Steam Audio: -Z = forward)
                     };
                 }
+                } // end !usePortalRouting direction update
 
-                // Portal-based sound propagation: find indirect paths through
-                // connected rooms (doorways, corridors). When a sound is occluded
-                // by geometry but reachable through the portal graph, the portal
-                // path provides an alternative with attenuation based on effective
-                // distance and direction from the last portal (virtual source).
-                // Skip for tail voices — they're just ringing out convolution.
-                if (mPortalRoutingEnabled && !voice->sourceEnded) {
-                auto prT0 = std::chrono::steady_clock::now();
-                SoundPropInfo prop = propagateSound(voice->worldPos, mListenerPos);
-                auto prT1 = std::chrono::steady_clock::now();
-                float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
-                sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
-                sPortalRoutingCount.fetch_add(1, std::memory_order_relaxed);
-                if (prop.reached) {
-                    // Inverse-square attenuation scaled for Dark Engine world units.
-                    // At 30 units (one room): 52%. At 100 units (corridor): 9%.
-                    // At 200 units (max): 2.4%. Matches real-world sound falloff.
-                    float portalAtten = 1.0f / (1.0f + prop.effectiveDistance *
-                                                        prop.effectiveDistance * 0.001f);
-                    voice->dspNode.portalAttenuation = portalAtten;
-                    voice->dspNode.usePortalRouting = true;
-
-                    // If the portal path delivers more energy than the direct path,
-                    // override the HRTF direction to point toward the virtual source
-                    // (the last portal center). The sound appears to come from the
-                    // doorway it traveled through, not from behind the wall.
-                    float directAtten = voice->dspNode.directParams.distanceAttenuation
-                                      * voice->dspNode.directParams.occlusion;
-                    if (portalAtten > directAtten) {
-                        Vector3 toPortal = prop.virtualPosition - mListenerPos;
-                        float portalDist = glm::length(toPortal);
-                        if (portalDist > 0.001f) {
-                            toPortal /= portalDist;
-                            voice->dspNode.direction = {
-                                glm::dot(toPortal, right),
-                                glm::dot(toPortal, up),
-                                -glm::dot(toPortal, ahead)
-                            };
-                        }
-                    }
-                } else {
-                    voice->dspNode.usePortalRouting = false;
-                    voice->dspNode.portalAttenuation = 0.0f;
-                }
-                } // end !sourceEnded portal routing
+                // Portal routing is now done in Step 2b (before iplSourceSetInputs).
+                // The HRTF direction and portalAttenuation are already set on
+                // the DSP node. Cross-room voices also have their IPLSource
+                // position overridden to the virtual position.
             } else {
                 // Fallback: simple volume scaling (no DSP pipeline available)
                 float volume = outputs.direct.distanceAttenuation *
