@@ -1871,10 +1871,19 @@ void AudioService::loopStep(float deltaTime)
         // reflCandidates and reflCandidateSet were already computed in Step 2a
         // (before iplSourceSetInputs) so non-top-N voices could be set to baked mode.
 
-        // Track total convolution voices (top-N + baked) against the budget cap.
-        // Top-N voices from reflCandidateSet are counted first (they always get slots),
-        // then baked voices fill remaining slots up to mMaxReflectionVoices.
-        int activeConvolutionCount = 0;
+        // Track total convolution voices against the audio callback budget.
+        // Tail voices (sourceEnded, still ringing out reverb) are counted first
+        // since they already have reflectionsActive=true and can't be cheaply
+        // disabled mid-convolution. Remaining slots go to active voices: top-N
+        // closest first, then baked voices fill remaining up to mMaxReflectionVoices.
+        int tailConvolutionCount = 0;
+        for (auto &[h, v] : mVoices) {
+            if (v->sourceEnded && !v->finished.load(std::memory_order_relaxed)
+                && v->dspNode.reflectionsActive.load(std::memory_order_relaxed)) {
+                ++tailConvolutionCount;
+            }
+        }
+        int activeConvolutionCount = tailConvolutionCount;
 
         for (auto &[handle, voice] : mVoices) {
             if (!voice->iplSource)
@@ -2036,16 +2045,13 @@ void AudioService::loopStep(float deltaTime)
                 // Check reflectionEffect (was it created with one?) not
                 // reflectionsActive (is it in the top N right now?) — a voice
                 // may have been active earlier and accumulated convolution state.
-                if (voice->dspNode.reflectionEffect) {
-                    // Tail timer: let the convolution IR ring out naturally.
-                    // Use the full reflection duration so cavernous spaces get
-                    // realistic long reverb tails. The reflection voice ranker
-                    // in loopStep excludes tail voices from the active top-N,
-                    // so tail pile-up doesn't starve new sounds of reflection slots.
+                if (voice->dspNode.reflectionEffect &&
+                    voice->dspNode.reflectionsActive.load(std::memory_order_relaxed)) {
+                    // Only start a reverb tail if this voice was actually running
+                    // convolution (was in the top-N or had a baked slot). Voices
+                    // that were dry don't need a tail — there's no convolution
+                    // state to ring out.
                     voice->tailTimer = mReflectionDuration;
-                    // Ensure convolution stays active during the tail so the
-                    // IR rings out naturally (feed silence → convolution outputs tail)
-                    voice->dspNode.reflectionsActive.store(true, std::memory_order_release);
                     std::fprintf(stderr, "[VOICE] TAIL_START h=%d '%s' tail=%.1fs\n",
                                  handle, voice->schemaName.c_str(), voice->tailTimer);
                 } else {
