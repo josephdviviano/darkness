@@ -73,6 +73,34 @@ public:
     /// Portal ID on the other side of this portal
     int32_t getDestPortalID() const { return mDestPortal; }
 
+    /// Number of edge planes defining the portal boundary
+    uint32_t getEdgeCount() const { return mEdgeCount; }
+
+    /// Get edge plane by index (bounds checked, returns identity plane if OOB)
+    const Plane &getEdgePlane(uint32_t i) const {
+        static const Plane identity{};
+        return (i < mEdgeCount) ? mEdges[i] : identity;
+    }
+
+    /// Test whether a ray from origin in direction dir passes through the portal.
+    /// Uses ray-plane intersection followed by point-in-edge-planes test.
+    /// @param origin  Ray origin
+    /// @param dir     Ray direction (NOT necessarily unit length — treated as a segment endpoint offset)
+    /// @return true if the ray passes through the portal polygon
+    bool raycast(const Vector3 &origin, const Vector3 &dir) const;
+
+    /// Find the closest point on the portal boundary to a ray that missed.
+    /// Intersects the ray with the portal plane, then projects onto any violated
+    /// edge planes. The result is an "anchor point" where sound bends around the
+    /// portal frame. Based on the Dark Engine's portal edge projection algorithm
+    /// (inspired by OPDE's RoomPortal).
+    /// @param origin  Ray origin
+    /// @param dir     Ray direction
+    /// @param[out] projPt  The projected point on (or near) the portal boundary
+    /// @return true if a projection was found (false only if ray is parallel to portal plane)
+    bool getRaycastProjection(const Vector3 &origin, const Vector3 &dir,
+                              Vector3 &projPt) const;
+
 private:
     void clear();
 
