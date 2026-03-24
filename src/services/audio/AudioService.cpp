@@ -1936,6 +1936,30 @@ void AudioService::loopStep(float deltaTime)
                     }
 
                     voice->dspNode.reflectionsActive.store(true, std::memory_order_release);
+                } else if (mProbesHaveReflections && outputs.reflections.irSize > 0
+                           && voice->dspNode.reflectionEffect) {
+                    // Non-top-N voice with baked probe reflection data available.
+                    // Apply the baked IR so distant voices get reverb from the
+                    // nearest probe instead of being dry.
+                    voice->dspNode.reflectionParams = outputs.reflections;
+                    voice->dspNode.reflectionParams.type =
+                        IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+                    voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
+
+                    // Apply distance-based IR LOD to baked voices too
+                    float voiceDist = glm::length(voice->worldPos - mListenerPos);
+                    int maxIrSize = voice->dspNode.reflectionParams.irSize;
+                    if (maxIrSize > 0 && voiceDist > 20.0f) {
+                        float lodScale = std::max(0.25f, 1.0f - (voiceDist - 20.0f) / 120.0f);
+                        int lodIrSize = static_cast<int>(maxIrSize * lodScale);
+                        lodIrSize = (lodIrSize / static_cast<int>(mReflectionFrameSize))
+                                  * static_cast<int>(mReflectionFrameSize);
+                        if (lodIrSize < static_cast<int>(mReflectionFrameSize))
+                            lodIrSize = static_cast<int>(mReflectionFrameSize);
+                        voice->dspNode.reflectionParams.irSize = lodIrSize;
+                    }
+
+                    voice->dspNode.reflectionsActive.store(true, std::memory_order_release);
                 } else {
                     voice->dspNode.reflectionsActive.store(false, std::memory_order_relaxed);
                 }
