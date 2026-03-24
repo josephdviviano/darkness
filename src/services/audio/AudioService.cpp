@@ -3457,17 +3457,31 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
     // (common for ambient objects placed by level designers at map edges),
     // assign it to the nearest room by center distance. This enables portal
     // routing instead of raw euclidean fallback, so walls actually block
-    // the sound. Without this, all 119 ambients in MISS6 use euclidean
-    // distance because their positions fall outside room boundaries.
+    // the sound.
+    //
+    // However, if the source and listener are close together (euclidean),
+    // the nearest-room assignment might put them in different rooms due to
+    // the room coverage gap — producing an artificially long portal path.
+    // In this case, assign the source to the LISTENER'S room so they're
+    // treated as same-room (which they effectively are, being nearby).
     if (!sourceRoom && mRoomService) {
-        float bestDist = 1e9f;
-        const auto &rooms = mRoomService->getAllRooms();
-        for (const auto &r : rooms) {
-            if (!r) continue;
-            float d = glm::length(r->getCenter() - sourcePos);
-            if (d < bestDist) {
-                bestDist = d;
-                sourceRoom = r.get();
+        float euclidDist = glm::length(sourcePos - listenerPos);
+        if (listenerRoom && euclidDist < 20.0f) {
+            // Source is close to listener but outside room OBBs — assign to
+            // listener's room. This prevents nearby streetlights, torches etc.
+            // from being routed through long portal paths.
+            sourceRoom = listenerRoom;
+        } else {
+            // Source is far from listener — find nearest room by center distance
+            float bestDist = 1e9f;
+            const auto &rooms = mRoomService->getAllRooms();
+            for (const auto &r : rooms) {
+                if (!r) continue;
+                float d = glm::length(r->getCenter() - sourcePos);
+                if (d < bestDist) {
+                    bestDist = d;
+                    sourceRoom = r.get();
+                }
             }
         }
     }
