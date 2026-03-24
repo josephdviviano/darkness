@@ -3029,11 +3029,17 @@ void AudioService::updateAmbientVolumes()
                 }
 
                 float baseVol = schemaVolumeToLinear(amb.volume);
-                float distFactor = std::max(0.0f, 1.0f - (dist / amb.radius));
-                if (!(amb.flags & AMB_NO_FADE)) {
-                    distFactor *= distFactor;  // quadratic for natural rolloff
-                }
-                ma_sound_set_volume(&it->second->sound, baseVol * distFactor);
+                // Set base schema volume only — NO distance-based rolloff here.
+                // Steam Audio's distanceAttenuation (1/r) provides distance rolloff
+                // for both the direct path and the reflection convolution input.
+                // Applying our own distance curve here would double-dip on distance,
+                // making reflected sounds from occluded sources inaudible because
+                // the convolution input is pre-attenuated before Steam Audio's
+                // distance model is applied.
+                //
+                // The activation radius (startRadius/stopRadius) still controls
+                // when the voice starts and stops — it just doesn't affect volume.
+                ma_sound_set_volume(&it->second->sound, baseVol);
             }
         } else {
             // Out of range — stop voice to free the slot and DSP resources
