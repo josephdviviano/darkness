@@ -2052,11 +2052,22 @@ int main(int argc, char *argv[]) {
             });
 
             // Render progress bar until baking completes.
-            // Steam Audio's iplPathBakerBake reports progress in two phases
-            // (visibility graph + shortest paths), each going 0→1. We track
-            // phase transitions to show overall progress as 0→100%.
-            int bakePhase = 0;
+            // The bake runs 3 sequential stages, each reporting 0→1 progress:
+            //   Stage 0: Probe placement + pathing visibility (fast, ~10s)
+            //   Stage 1: Pathing shortest paths (fast, ~10s)
+            //   Stage 2: Reflection IR baking (slow, minutes)
+            // We detect stage transitions when progress drops and map to
+            // overall 0→100% with weighted allocation (stages 0+1 = 20%, stage 2 = 80%).
+            int bakeStage = 0;
             float lastProg = 0.0f;
+            const char *stageNames[] = {
+                "Baking pathing visibility...",
+                "Computing shortest paths...",
+                "Baking reflection IRs (this takes a while)..."
+            };
+            // Weight allocation: pathing stages are fast, reflection is slow
+            const float stageStart[] = {0.0f, 0.10f, 0.20f};
+            const float stageWeight[] = {0.10f, 0.10f, 0.80f};
 
             while (!bakeDone.load(std::memory_order_acquire)) {
                 SDL_Event ev;
@@ -2069,11 +2080,13 @@ int main(int argc, char *argv[]) {
                 if (!state.running) break;
 
                 float rawProg = bakeProgress.load(std::memory_order_relaxed);
-                // Detect phase transition: progress drops back toward 0
-                if (rawProg < lastProg - 0.1f) bakePhase++;
+                // Detect stage transition: progress drops back toward 0
+                if (rawProg < lastProg - 0.1f && bakeStage < 2) bakeStage++;
                 lastProg = rawProg;
-                // Map to overall: phase 0 = 0-50%, phase 1 = 50-100%
-                float prog = (bakePhase == 0) ? rawProg * 0.5f : 0.5f + rawProg * 0.5f;
+
+                // Map to overall progress with weighted stages
+                float prog = stageStart[bakeStage] + rawProg * stageWeight[bakeStage];
+                prog = std::min(prog, 1.0f);
                 int pct = static_cast<int>(prog * 100.0f);
 
                 // Render progress bar using bgfx debug text
@@ -2085,9 +2098,11 @@ int main(int argc, char *argv[]) {
                 bgfx::setDebug(BGFX_DEBUG_TEXT);
                 bgfx::dbgTextClear();
 
-                // Title
+                // Title + stage name
                 bgfx::dbgTextPrintf(2, 10, 0x0f, "DARKNESS ENGINE");
-                bgfx::dbgTextPrintf(2, 12, 0x07, "Baking acoustic probes...");
+                bgfx::dbgTextPrintf(2, 12, 0x07, "Baking acoustic probes (stage %d/3):",
+                                    bakeStage + 1);
+                bgfx::dbgTextPrintf(2, 13, 0x07, "  %s", stageNames[bakeStage]);
 
                 // Progress bar (40 chars wide)
                 int barWidth = 40;
@@ -2097,10 +2112,10 @@ int main(int argc, char *argv[]) {
                     bar[i] = (i < filled) ? '#' : '-';
                 bar[barWidth] = '\0';
 
-                bgfx::dbgTextPrintf(2, 14, 0x0a, "[%s] %d%%", bar, pct);
-                bgfx::dbgTextPrintf(2, 16, 0x08, "This only happens once per mission.");
-                bgfx::dbgTextPrintf(2, 17, 0x08, "Probe data will be cached in:");
-                bgfx::dbgTextPrintf(2, 18, 0x08, "  %s", state.probeBakePath.c_str());
+                bgfx::dbgTextPrintf(2, 15, 0x0a, "[%s] %d%%", bar, pct);
+                bgfx::dbgTextPrintf(2, 17, 0x08, "This only happens once per mission.");
+                bgfx::dbgTextPrintf(2, 18, 0x08, "Probe data will be cached in:");
+                bgfx::dbgTextPrintf(2, 19, 0x08, "  %s", state.probeBakePath.c_str());
 
                 bgfx::frame();
                 SDL_Delay(50);  // ~20fps for the progress display
