@@ -228,7 +228,11 @@ struct RuntimeState {
     uint32_t cullVisibleCells = 0;
     uint32_t cullTotalCells = 0;
 
-    // Debug: acoustic mesh wireframe overlay (toggle with 9 key)
+    // Probe baking state (auto-bake on first run)
+    bool probeBakeNeeded = false;
+    std::string probeBakePath;
+
+    // Debug: acoustic mesh wireframe overlay
     bool showAcousticMesh = false;
     std::vector<float> acousticVerts;     // x,y,z flat array
     std::vector<int32_t> acousticIndices; // triangle indices

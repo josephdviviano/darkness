@@ -785,7 +785,8 @@ static void updateTitleBar(SDL_Window *window, const Darkness::RuntimeState &sta
 static void registerConsoleSettings(
     Darkness::DebugConsole &dbgConsole,
     Darkness::RuntimeState &state,
-    SDL_Window *window)
+    SDL_Window *window,
+    const std::string &misPath = "")
 {
     // Helper lambda that captures window+state for title bar refresh
     auto refreshTitle = [window, &state]() { updateTitleBar(window, state); };
@@ -925,6 +926,30 @@ static void registerConsoleSettings(
 
     // ── Audio reflection settings ──
 
+    // ── Propagation layer toggles ──
+
+    dbgConsole.addBool("portal_routing",
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getPortalRoutingEnabled() : true;
+        },
+        [](bool v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setPortalRoutingEnabled(v);
+        },
+        "Route sound through doorways via portal graph (indirect paths)");
+
+    dbgConsole.addBool("probe_pathing",
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getProbePathingEnabled() : true;
+        },
+        [](bool v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setProbePathingEnabled(v);
+        },
+        "Baked probe diffraction/pathing (when probe data available)");
+
     dbgConsole.addBool("refl_enabled",
         []() {
             auto svc = GET_SERVICE(Darkness::AudioService);
@@ -934,7 +959,7 @@ static void registerConsoleSettings(
             auto svc = GET_SERVICE(Darkness::AudioService);
             if (svc) svc->setReflectionsEnabled(v);
         },
-        "Steam Audio convolution reverb (per-source reflections)");
+        "Real-time convolution reverb (per-source room reflections)");
 
     dbgConsole.addFloat("refl_rays", 128.0f, 8192.0f,
         []() {
@@ -1022,6 +1047,42 @@ static void registerConsoleSettings(
         },
         [](float) { /* read-only — set via YAML, requires scene rebuild */ },
         "Material transmission multiplier (1=physical, 10=audible through walls, set via YAML)");
+
+    // Bake probes: set to "on" to trigger re-baking
+    dbgConsole.addBool("bake_probes",
+        []() { return false; },  // always shows "off" (it's an action, not a state)
+        [misPath](bool v) {
+            if (!v) return;
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (!svc) return;
+            std::string probePath = Darkness::AudioService::getProbeFilePath(misPath);
+            std::fprintf(stderr, "Re-baking probes → %s\n", probePath.c_str());
+            if (svc->bakeProbes(probePath)) {
+                svc->loadProbes(probePath);
+            }
+        },
+        "Re-bake acoustic probes (blocking, ~10-60s). Auto-baked on first run.");
+
+    dbgConsole.addFloat("probe_count", 0.0f, 99999.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? static_cast<float>(svc->getProbeCount()) : 0.0f;
+        },
+        [](float) { /* read-only */ },
+        "Number of loaded acoustic probes (read-only)");
+
+    dbgConsole.addBool("record_audio",
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->isRecordingAudio() : false;
+        },
+        [](bool v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (!svc) return;
+            if (v) svc->startAudioRecording();
+            else   svc->stopAudioRecording();
+        },
+        "Record final audio output to WAV + position CSV for debugging");
 
     dbgConsole.addBool("show_acoustic_mesh",
         [&state]() { return state.showAcousticMesh; },
@@ -1672,10 +1733,26 @@ int main(int argc, char *argv[]) {
         audioSvc->setReflectionDuration(cfg.reflectionDuration);
         audioSvc->setReflectionThrottle(cfg.reflectionThrottle);
         audioSvc->setTransmissionScale(cfg.transmissionScale);
+        audioSvc->setPortalRoutingEnabled(cfg.portalRouting);
+        audioSvc->setProbePathingEnabled(cfg.probePathing);
+        audioSvc->setReflectionsEnabled(cfg.realtimeReflections);
 
         if (!audioSvc->buildAcousticScene(fullScene)) {
             std::fprintf(stderr, "WARNING: failed to build acoustic scene\n"
                                  "         Steam Audio spatialization disabled.\n");
+        }
+
+        // Try to load baked probe data from the darkness install folder.
+        // If no probes exist, auto-bake them (with a progress bar).
+        {
+            std::string probePath = Darkness::AudioService::getProbeFilePath(misPath);
+            if (!audioSvc->loadProbes(probePath)) {
+                // No baked probes — need to bake.
+                // This is done BEFORE the render loop starts, so we can use
+                // a simple bgfx debug text progress bar during baking.
+                state.probeBakePath = probePath;
+                state.probeBakeNeeded = true;
+            }
         }
 
         // Store acoustic mesh data for debug wireframe overlay.
@@ -1895,9 +1972,82 @@ int main(int argc, char *argv[]) {
     // ── Debug console for runtime settings management ──
     // Opened with backtick (`), provides tab-completion and value editing.
     Darkness::DebugConsole dbgConsole;
-    registerConsoleSettings(dbgConsole, state, window);
+    registerConsoleSettings(dbgConsole, state, window, misPath);
 
     updateTitleBar(window, state);
+
+    // ── Auto-bake probes if needed (with progress bar) ──
+    if (state.probeBakeNeeded) {
+        Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+        if (audioSvc) {
+            std::atomic<float> bakeProgress{0.0f};
+            std::atomic<bool> bakeDone{false};
+            bool bakeSuccess = false;
+
+            // Run baking on a background thread so we can render progress
+            std::thread bakeThread([&]() {
+                bakeSuccess = audioSvc->bakeProbes(state.probeBakePath,
+                                                    &bakeProgress);
+                bakeDone.store(true, std::memory_order_release);
+            });
+
+            // Render progress bar until baking completes
+            while (!bakeDone.load(std::memory_order_acquire)) {
+                // Poll SDL events to keep the window responsive
+                SDL_Event ev;
+                while (SDL_PollEvent(&ev)) {
+                    if (ev.type == SDL_QUIT) {
+                        state.running = false;
+                        break;
+                    }
+                }
+                if (!state.running) break;
+
+                float prog = bakeProgress.load(std::memory_order_relaxed);
+                int pct = static_cast<int>(prog * 100.0f);
+
+                // Render progress bar using bgfx debug text
+                bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+                                   0x1a1a2eFF, 1.0f, 0);
+                bgfx::setViewRect(0, 0, 0, 1280, 720);
+                bgfx::touch(0);
+
+                bgfx::setDebug(BGFX_DEBUG_TEXT);
+                bgfx::dbgTextClear();
+
+                // Title
+                bgfx::dbgTextPrintf(2, 10, 0x0f, "DARKNESS ENGINE");
+                bgfx::dbgTextPrintf(2, 12, 0x07, "Baking acoustic probes...");
+
+                // Progress bar (40 chars wide)
+                int barWidth = 40;
+                int filled = static_cast<int>(prog * barWidth);
+                char bar[64] = {};
+                for (int i = 0; i < barWidth; ++i)
+                    bar[i] = (i < filled) ? '#' : '-';
+                bar[barWidth] = '\0';
+
+                bgfx::dbgTextPrintf(2, 14, 0x0a, "[%s] %d%%", bar, pct);
+                bgfx::dbgTextPrintf(2, 16, 0x08, "This only happens once per mission.");
+                bgfx::dbgTextPrintf(2, 17, 0x08, "Probe data will be cached in:");
+                bgfx::dbgTextPrintf(2, 18, 0x08, "  %s", state.probeBakePath.c_str());
+
+                bgfx::frame();
+                SDL_Delay(50);  // ~20fps for the progress display
+            }
+
+            bakeThread.join();
+
+            if (bakeSuccess && state.running) {
+                audioSvc->loadProbes(state.probeBakePath);
+                std::fprintf(stderr, "Probe baking complete — %d probes loaded\n",
+                             audioSvc->getProbeCount());
+            }
+
+            bgfx::setDebug(0);  // disable debug text
+        }
+        state.probeBakeNeeded = false;
+    }
 
     auto lastTime = std::chrono::high_resolution_clock::now();
     // state.waterElapsed, state.running have defaults from struct initializer

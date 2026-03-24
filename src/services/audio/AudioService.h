@@ -62,6 +62,10 @@ struct _IPLAmbisonicsDecodeEffect_t;
 typedef _IPLAmbisonicsDecodeEffect_t* IPLAmbisonicsDecodeEffect;
 struct _IPLSource_t;
 typedef _IPLSource_t* IPLSource;
+struct _IPLProbeBatch_t;
+typedef _IPLProbeBatch_t* IPLProbeBatch;
+struct _IPLPathEffect_t;
+typedef _IPLPathEffect_t* IPLPathEffect;
 
 namespace Darkness {
 
@@ -294,6 +298,47 @@ public:
     void setTransmissionScale(float s) { mTransmissionScale = std::max(0.1f, std::min(s, 100.0f)); }
     float getTransmissionScale() const { return mTransmissionScale; }
 
+    // Propagation layer toggles (all on by default)
+    void setPortalRoutingEnabled(bool v) { mPortalRoutingEnabled = v; }
+    bool getPortalRoutingEnabled() const { return mPortalRoutingEnabled; }
+    void setProbePathingEnabled(bool v) { mProbePathingEnabled = v; }
+    bool getProbePathingEnabled() const { return mProbePathingEnabled; }
+
+    /** Bake acoustic probes for the current scene.
+     *  Generates probes on a uniform floor grid, bakes pathing visibility,
+     *  and saves to the specified file. Blocking call (~10-60 seconds).
+     *  Progress is reported via the atomic float (0.0-1.0).
+     *  @param outputPath  File path for the .probes output
+     *  @param progress    Atomic float updated with bake progress (optional)
+     *  @param spacing     Grid spacing in world units (default 5.0)
+     *  @param height      Probe height above floor (default 5 world units)
+     *  @return true if baking succeeded */
+    bool bakeProbes(const std::string &outputPath,
+                    std::atomic<float> *progress = nullptr,
+                    float spacing = 5.0f, float height = 5.0f);
+
+    /** Load baked probe data from disk and register with simulator.
+     *  @param probePath  Path to .probes file
+     *  @return true if loaded successfully */
+    bool loadProbes(const std::string &probePath);
+
+    /** @return number of loaded probes (0 if none) */
+    int getProbeCount() const;
+
+    /** Start/stop recording the final audio output to WAV + position CSV.
+     *  Files are written to the current working directory:
+     *  - darkness_audio_capture.wav (48kHz stereo float32)
+     *  - darkness_audio_positions.csv (timestamp, x, y, z, yaw, pitch, voices) */
+    void startAudioRecording();
+    void stopAudioRecording();
+    bool isRecordingAudio() const;
+
+    /** Get the standard probe file path for a mission.
+     *  Stored in ~/darkness/{gameName}/baked_probes/{missionName}.probes
+     *  Creates directories if they don't exist. */
+    static std::string getProbeFilePath(const std::string &misPath,
+                                         const std::string &gameName = "thief2");
+
     /** Whether reflection convolution runs at half sample rate (24kHz).
      *  Must be set BEFORE buildAcousticScene() — cannot change at runtime.
      *  Half-rate halves convolution cost per voice, allowing more reflection
@@ -469,6 +514,19 @@ private:
     /// 1.0 = physically accurate, 10.0 = audible through walls (game-friendly).
     float mTransmissionScale = 10.0f;
 
+    /// Propagation layer toggles (debug — all on by default)
+    bool mPortalRoutingEnabled = true;   ///< Portal-graph routing through doorways
+    bool mProbePathingEnabled = true;    ///< Baked probe diffraction (when available)
+
+    // ── Baked probe pathing ──
+
+    IPLProbeBatch mIplProbeBatch = nullptr;  ///< Loaded probe data (positions + baked paths)
+    int mProbeCount = 0;                     ///< Number of probes in the batch
+
+    /// Scene bounding box (computed during buildAcousticScene)
+    Vector3 mSceneMin{0, 0, 0};
+    Vector3 mSceneMax{0, 0, 0};
+
     /// Half-rate reflection mode: convolution at 24kHz instead of 48kHz.
     /// Set before buildAcousticScene(). Halves convolution cost per voice.
     bool mHalfRateReflections = false;
@@ -482,21 +540,26 @@ private:
     uint32_t mReflectionSampleRate = 48000;
     uint32_t mReflectionFrameSize = 1024;
 
-    // ── Background thread for reflection simulation ──
+    // ── Background simulation threads ──
+    //
+    // Two separate threads for direct and reflection simulation:
+    // - Direct sim (occlusion/attenuation): runs every frame, cheap, latency-critical
+    // - Reflection sim (ray-traced reverb): runs throttled, expensive, latency-tolerant
+    //
+    // Source mutations (add/remove/commit) must wait for BOTH threads to be idle.
 
-    /// Background thread running iplSimulatorRunReflections() asynchronously.
-    /// Reflection results are consumed next frame (1-frame latency, imperceptible).
+    /// Direct simulation thread — runs iplSimulatorRunDirect every frame
+    std::thread mDirectSimThread;
+    std::atomic<bool> mDirectSimRunning{false};
+
+    /// Reflection simulation thread — runs iplSimulatorRunReflections (throttled)
     std::thread mReflectionThread;
-
-    /// Set when background reflection sim is running — prevents overlapping runs
     std::atomic<bool> mReflectionSimRunning{false};
 
-    /// Signals the reflection thread to shut down
+    /// Signals threads to shut down
     std::atomic<bool> mReflectionShutdown{false};
 
-    /// IPL sources awaiting deferred removal (accumulated while sim thread is busy).
-    /// Freed in bulk when the sim thread is idle, since iplSourceRemove must not
-    /// race with iplSimulatorRunDirect/Reflections.
+    /// IPL sources awaiting deferred removal (accumulated while any sim thread is busy).
     std::vector<IPLSource> mPendingSourceRemovals;
 
     /// Join the background reflection thread if it's running.
