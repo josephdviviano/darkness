@@ -3453,6 +3453,37 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
     Room *sourceRoom = mRoomService->roomFromPoint(sourcePos);
     Room *listenerRoom = mRoomService->roomFromPoint(listenerPos);
 
+    // Nearest-room fallback: when a source is outside all room OBBs
+    // (common for ambient objects placed by level designers at map edges),
+    // assign it to the nearest room by center distance. This enables portal
+    // routing instead of raw euclidean fallback, so walls actually block
+    // the sound. Without this, all 119 ambients in MISS6 use euclidean
+    // distance because their positions fall outside room boundaries.
+    if (!sourceRoom && mRoomService) {
+        float bestDist = 1e9f;
+        const auto &rooms = mRoomService->getAllRooms();
+        for (const auto &r : rooms) {
+            if (!r) continue;
+            float d = glm::length(r->getCenter() - sourcePos);
+            if (d < bestDist) {
+                bestDist = d;
+                sourceRoom = r.get();
+            }
+        }
+    }
+    if (!listenerRoom && mRoomService) {
+        float bestDist = 1e9f;
+        const auto &rooms = mRoomService->getAllRooms();
+        for (const auto &r : rooms) {
+            if (!r) continue;
+            float d = glm::length(r->getCenter() - listenerPos);
+            if (d < bestDist) {
+                bestDist = d;
+                listenerRoom = r.get();
+            }
+        }
+    }
+
     return propagateSound(sourcePos, listenerPos, sourceRoom, listenerRoom, maxDist);
 }
 
@@ -3465,10 +3496,9 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
     SoundPropInfo result;
 
     if (!sourceRoom || !listenerRoom) {
-        // Fallback: when source or listener is outside all BSP rooms (e.g., ambient
-        // objects placed outside the room structure), use direct distance instead.
-        // Without this fallback, sounds outside rooms would be permanently silent
-        // because portal routing can't find a path.
+        // Both rooms should be resolved by the 3-arg wrapper's nearest-room
+        // fallback. If we still have NULL here (no rooms loaded at all), use
+        // euclidean distance as a last resort.
         float dist = glm::length(listenerPos - sourcePos);
         if (dist <= maxDist) {
             result.reached = true;
@@ -3478,10 +3508,9 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
             result.virtualPosition = sourcePos;
         }
 
-        // Log the first few failures for diagnostics
         static int sFailCount = 0;
         if (sFailCount < 5) {
-            std::fprintf(stderr, "[PORTAL] roomFromPoint FAILED (using distance fallback): "
+            std::fprintf(stderr, "[PORTAL] propagateSound: NULL room after fallback "
                          "src=(%.1f,%.1f,%.1f)→%s lst=(%.1f,%.1f,%.1f)→%s dist=%.1f\n",
                          sourcePos.x, sourcePos.y, sourcePos.z,
                          sourceRoom ? "OK" : "NULL",
