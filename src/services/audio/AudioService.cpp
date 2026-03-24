@@ -1831,7 +1831,6 @@ void AudioService::loopStep(float deltaTime)
                 // Run portal propagation to determine reachability and path
                 SoundPropInfo prop{};
                 bool isCrossRoom = false;
-                Room *srcRoom = nullptr;
                 if (mPortalRoutingEnabled && !voice->sourceEnded) {
                     auto prT0 = std::chrono::steady_clock::now();
                     prop = propagateSoundBlended(voice->worldPos);
@@ -1844,29 +1843,18 @@ void AudioService::loopStep(float deltaTime)
                     // Minimum distance threshold: sounds very close to the listener
                     // (footsteps, player-emitted sounds) are always same-room even if
                     // roomFromPoint returns different rooms at floor/ceiling boundaries.
-                    srcRoom = mRoomService ? mRoomService->roomFromPoint(voice->worldPos) : nullptr;
+                    Room *srcRoom = mRoomService ? mRoomService->roomFromPoint(voice->worldPos) : nullptr;
                     float srcListenerDist = glm::length(voice->worldPos - mListenerPos);
                     isCrossRoom = (srcRoom && listenerRoom && srcRoom != listenerRoom
                                    && srcListenerDist > 5.0f);
                 }
 
-                // Store propagation result on DSP node for the audio callback.
-                // Only set portalAttenuation when the source is in a valid room.
-                // Sources outside room OBBs (common for ambient objects) rely on
-                // Steam Audio's direct occlusion — no portal attenuation floor.
-                // This prevents the euclidean fallback distance from overriding
-                // wall occlusion and letting sounds leak through walls.
-
-                if (prop.reached && srcRoom) {
+                // Store propagation result on DSP node for the audio callback
+                if (prop.reached) {
                     float portalAtten = 1.0f / (1.0f + prop.effectiveDistance *
                                                         prop.effectiveDistance * 0.001f);
                     voice->dspNode.portalAttenuation = portalAtten;
                     voice->dspNode.usePortalRouting = isCrossRoom;
-                } else if (prop.reached) {
-                    // Source outside rooms: no portal routing, no floor.
-                    // Steam Audio's directAtten handles everything.
-                    voice->dspNode.portalAttenuation = 0.0f;
-                    voice->dspNode.usePortalRouting = false;
 
                     // For cross-room voices, compute HRTF direction toward the
                     // virtual position (last portal anchor / doorway edge)
