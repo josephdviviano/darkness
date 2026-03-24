@@ -2960,7 +2960,8 @@ void AudioService::updateAmbientVolumes()
         // are obviously too far away (euclidean > max possible range).
         float euclidDist = glm::length(mListenerPos - amb.position);
         float rawEffDist = euclidDist;  // fallback if propagation unavailable
-        float stopRadius = amb.radius * 1.5f;
+        float startRadius = amb.radius * 2.0f;  // voice created here (inaudible)
+        float stopRadius = amb.radius * 2.5f;  // voice destroyed here (hysteresis)
 
         // Skip BFS for ambients far beyond any possible range
         if (euclidDist <= stopRadius + 10.0f &&
@@ -2989,10 +2990,14 @@ void AudioService::updateAmbientVolumes()
         }
         float effectiveDist = amb.smoothedEffDist;
 
-        // Hysteresis: start at radius, stop at radius * 1.5.
+        // Start voices BEFORE they become audible (at 2x radius) so the
+        // distance-based volume curve produces a smooth fade-in as the player
+        // approaches. Stop at 2.5x radius (hysteresis). The voice plays at
+        // volume 0 in the pre-audible zone and fades in purely based on
+        // position as the player gets closer.
         bool alreadyPlaying = (amb.handle != SOUND_HANDLE_INVALID);
         bool inRange = (amb.radius > 0.0f &&
-                        (alreadyPlaying ? effectiveDist < stopRadius : effectiveDist < amb.radius));
+                        (alreadyPlaying ? effectiveDist < stopRadius : effectiveDist < startRadius));
 
         if (inRange) {
             // Start voice if not already playing
@@ -3015,13 +3020,13 @@ void AudioService::updateAmbientVolumes()
                     amb.handle = startVoice(amb.schemaName, amb.schemaName, amb.position,
                                             64, isLooping, amb.objID, 0.0f);
                 }
-                // Start a fade-in ramp for newly created voices
-                if (amb.handle != SOUND_HANDLE_INVALID) {
-                    amb.fadeInTimer = 0.3f;  // 300ms fade-in
-                }
             }
 
-            // Update volume based on distance
+            // Update volume — purely position-based, no time-based fades.
+            // Volume curve: full volume at dist=0, fades to 0 at dist=radius.
+            // Beyond radius (in the start/stop management zone), volume is 0
+            // but the voice stays alive so it can fade back in smoothly when
+            // the player approaches again.
             if (amb.handle != SOUND_HANDLE_INVALID) {
                 auto it = mVoices.find(amb.handle);
                 if (it == mVoices.end()) {
@@ -3029,28 +3034,12 @@ void AudioService::updateAmbientVolumes()
                     continue;
                 }
 
-                // Tick fade-in timer (300ms ramp from 0 to 1)
-                float fadeIn = 1.0f;
-                if (amb.fadeInTimer > 0.0f) {
-                    fadeIn = 1.0f - (amb.fadeInTimer / 0.3f);
-                    fadeIn = std::max(0.0f, std::min(1.0f, fadeIn));
-                    amb.fadeInTimer -= 1.0f / 60.0f;  // approximate frame time
-                }
-
-                // Set the base schema volume with fade-in ramp. Steam Audio's
-                // DSP callback handles all distance-dependent attenuation.
-                //
-                // Only apply a fade-out in the hysteresis zone (beyond the nominal
-                // radius) so the voice fades smoothly to silence at the stop
-                // boundary instead of cutting off abruptly.
                 float baseVol = schemaVolumeToLinear(amb.volume);
-                float targetVol = baseVol * fadeIn;
-                if (effectiveDist > amb.radius) {
-                    // In hysteresis zone: linear fade from baseVol to 0
-                    float fade = 1.0f - (effectiveDist - amb.radius) / (stopRadius - amb.radius);
-                    targetVol = baseVol * fadeIn * std::max(0.0f, fade);
+                float distFactor = std::max(0.0f, 1.0f - (effectiveDist / amb.radius));
+                if (!(amb.flags & AMB_NO_FADE)) {
+                    distFactor *= distFactor;  // quadratic for natural rolloff
                 }
-                ma_sound_set_volume(&it->second->sound, targetVol);
+                ma_sound_set_volume(&it->second->sound, baseVol * distFactor);
             }
         } else {
             // Out of range — stop voice to free the slot and DSP resources
