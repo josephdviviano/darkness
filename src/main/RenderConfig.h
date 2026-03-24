@@ -36,6 +36,11 @@ struct RenderConfig {
     int  reflectionThrottle  = 4;      // run reflection sim every Nth frame (1–32)
     float transmissionScale  = 10.0f;  // multiply all material transmission coefficients (1=physical, 10=audible through walls)
 
+    // Propagation layer toggles (all on by default — debug use only)
+    bool portalRouting       = true;   // portal-graph sound routing through doorways
+    bool probePathing        = true;   // baked probe diffraction/pathing (when available)
+    bool realtimeReflections = true;   // Steam Audio real-time convolution reverb
+
     // -- physics --
     int physicsRate = 60;  // physics timestep Hz: 12 = vintage (12.5Hz), 60 = modern, 120 = ultra
 
@@ -146,6 +151,12 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 if (cfg.transmissionScale < 0.1f) cfg.transmissionScale = 0.1f;
                 if (cfg.transmissionScale > 100.0f) cfg.transmissionScale = 100.0f;
             }
+            if (audio["portal_routing"])
+                cfg.portalRouting = audio["portal_routing"].as<bool>();
+            if (audio["probe_pathing"])
+                cfg.probePathing = audio["probe_pathing"].as<bool>();
+            if (audio["realtime_reflections"])
+                cfg.realtimeReflections = audio["realtime_reflections"].as<bool>();
         }
 
         // physics section
