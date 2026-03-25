@@ -2516,24 +2516,15 @@ void AudioService::waitForConvolutionWorker()
 {
     if (!mConvolutionWorker) return;
 
-    // Wait for the worker to finish its current frame. Then invalidate
-    // any staging slots that might reference effects about to be freed.
-    // The worker reads from staging[1-writeIdx]. We need to ensure those
-    // slots don't contain dangling effect pointers.
+    // Wait for the worker to finish its current frame. After this returns,
+    // the worker is idle and won't access any effect pointers until the
+    // next frameSeq signal. Since voice destruction calls ma_node_uninit
+    // BEFORE this function (blocking until the audio callback finishes),
+    // the audio callback won't snapshot the destroyed voice into staging
+    // again. So the worker's next iteration will have fresh staging data
+    // that doesn't include the destroyed voice.
     while (mConvolutionWorker->processing.load(std::memory_order_acquire))
         std::this_thread::yield();
-
-    // Clear all effect pointers in BOTH staging buffers to prevent the
-    // worker from using a freed effect on the next cycle.
-    for (int b = 0; b < 2; ++b) {
-        for (int i = 0; i < ConvolutionWorker::kMaxSlots; ++i) {
-            mConvolutionWorker->staging[b][i].active = false;
-            mConvolutionWorker->staging[b][i].effect = nullptr;
-        }
-    }
-    mConvolutionWorker->stagingCount[0] = 0;
-    mConvolutionWorker->stagingCount[1] = 0;
-    mConvolutionWorker->readyCount.store(0, std::memory_order_release);
 }
 
 //------------------------------------------------------
