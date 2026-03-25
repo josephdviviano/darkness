@@ -314,6 +314,11 @@ public:
     void setDiffuseSamples(int n) { mDiffuseSamples = std::max(16, std::min(n, 256)); }
     void setBakeDiffuseSamples(int n) { mBakeDiffuseSamples = std::max(32, std::min(n, 512)); }
 
+    void setOcclusionRadius(float r) { mOcclusionRadius = std::max(0.1f, std::min(r, 10.0f)); }
+    float getOcclusionRadius() const { return mOcclusionRadius; }
+    void setOcclusionSamples(int n) { mOcclusionSamples = std::max(4, std::min(n, 64)); }
+    int  getOcclusionSamples() const { return mOcclusionSamples; }
+
     // Propagation layer toggles (all on by default)
     void setPortalRoutingEnabled(bool v) { mPortalRoutingEnabled = v; }
     bool getPortalRoutingEnabled() const { return mPortalRoutingEnabled; }
@@ -375,13 +380,23 @@ public:
     static std::string getProbeFilePath(const std::string &misPath,
                                          const std::string &gameName = "thief2");
 
-    /** Whether reflection convolution runs at half sample rate (24kHz).
+    /** Reflection convolution rate divisor (1=full 48kHz, 2=half 24kHz, 4=quarter 12kHz).
      *  Must be set BEFORE buildAcousticScene() — cannot change at runtime.
-     *  Half-rate halves convolution cost per voice, allowing more reflection
-     *  voices for the same CPU budget. Reverb quality is perceptually
-     *  transparent at 24kHz (12kHz bandwidth captures all reverb character). */
-    void setHalfRateReflections(bool enabled) { mHalfRateReflections = enabled; }
-    bool getHalfRateReflections() const { return mHalfRateReflections; }
+     *  Higher divisors reduce per-voice convolution cost proportionally.
+     *  Reverb is perceptually transparent at 24kHz; 12kHz cuts above 6kHz
+     *  but reverb tails are dominated by frequencies below 4kHz anyway. */
+    void setReflectionRateDivisor(int div) { mReflectionRateDivisor = (div >= 4) ? 4 : (div >= 2) ? 2 : 1; }
+    int  getReflectionRateDivisor() const { return mReflectionRateDivisor; }
+
+    /// Backward-compatible wrapper for the old bool API
+    void setHalfRateReflections(bool enabled) { mReflectionRateDivisor = enabled ? 2 : 1; }
+    bool getHalfRateReflections() const { return mReflectionRateDivisor >= 2; }
+
+    /** Number of parallel convolution worker threads (0=auto, based on hardware).
+     *  Must be set BEFORE buildAcousticScene() — cannot change at runtime.
+     *  More workers enable more simultaneous convolution voices. */
+    void setConvolutionWorkerCount(int n) { mConvolutionWorkerCount = std::max(0, std::min(n, 16)); }
+    int  getConvolutionWorkerCount() const { return mConvolutionWorkerCount; }
 
     /** Ambisonics order for reflection convolution (0 or 1).
      *  Must be set BEFORE buildAcousticScene() — cannot change at runtime.
@@ -564,8 +579,8 @@ private:
     /// Must be called before releasing any IPLReflectionEffect.
     void waitForConvolutionWorker();
 
-    /// Convolution worker thread entry point.
-    void convolutionWorkerMain();
+    /// Convolution sub-worker thread entry point (one per parallel worker).
+    void convolutionSubWorkerMain(int workerIdx);
 
     /// Frame counter for throttling reflection simulation (every Nth frame)
     int mReflectionFrameCounter = 0;
@@ -594,6 +609,13 @@ private:
     /// Diffuse scattering samples for probe baking (32-512, higher=smoother)
     int mBakeDiffuseSamples = 128;
 
+    /// Volumetric occlusion source sphere radius (world units).
+    /// Larger = smoother transitions around corners, smaller = tighter response.
+    float mOcclusionRadius = 1.5f;
+    /// Number of ray samples for volumetric occlusion (4-64).
+    /// More samples = smoother gradient, higher CPU cost per source.
+    int mOcclusionSamples = 16;
+
     /// Propagation layer toggles (debug — all on by default)
     bool mPortalRoutingEnabled = true;   ///< Portal-graph routing through doorways
     bool mProbePathingEnabled = true;    ///< Baked probe diffraction (when available)
@@ -621,47 +643,50 @@ private:
     Vector3 mSceneMin{0, 0, 0};
     Vector3 mSceneMax{0, 0, 0};
 
-    /// Half-rate reflection mode: convolution at 24kHz instead of 48kHz.
-    /// Set before buildAcousticScene(). Halves convolution cost per voice.
-    bool mHalfRateReflections = false;
+    /// Reflection rate divisor: 1=full (48kHz), 2=half (24kHz), 4=quarter (12kHz).
+    /// Set before buildAcousticScene(). Higher divisors reduce per-voice cost.
+    int mReflectionRateDivisor = 2;
+
+    /// Number of parallel convolution worker threads (0=auto).
+    int mConvolutionWorkerCount = 0;
 
     /// Ambisonics order for reflections (0 = 1 channel, 1 = 4 channels).
     /// Order 0 is 4x cheaper per voice. Set before buildAcousticScene().
     int mAmbisonicsOrder = 0;
     int mAmbisonicsChannels = 1;  ///< (mAmbisonicsOrder+1)^2, computed at init
 
-    /// Reflection pipeline sample rate and frame size (derived from mHalfRateReflections)
+    /// Reflection pipeline sample rate and frame size (derived from mReflectionRateDivisor)
     uint32_t mReflectionSampleRate = 48000;
     uint32_t mReflectionFrameSize = 1024;
 
     // ── Background simulation threads ──
     //
-    // Two separate threads for direct and reflection simulation:
-    // - Direct sim (occlusion/attenuation): runs every frame, cheap, latency-critical
-    // - Reflection sim (ray-traced reverb): runs throttled, expensive, latency-tolerant
+    // Two SEPARATE threads for direct and reflection simulation so that the
+    // expensive reflection ray trace never blocks the latency-critical direct sim:
+    // - Direct sim (occlusion/attenuation): runs every frame, cheap, <2ms
+    // - Reflection sim (ray-traced reverb): runs throttled, expensive, 50-200ms
     //
     // Source mutations (add/remove/commit) must wait for BOTH threads to be idle.
 
-    /// Persistent simulation worker thread — handles both direct and reflection
-    /// simulation requests via condition variable signaling. Eliminates per-frame
-    /// std::thread creation overhead (60 pthread_create/join cycles per second).
-    std::thread mSimWorkerThread;
-    std::mutex mSimWorkerMutex;
-    std::condition_variable mSimWorkerCV;
-
-    /// Work requests for the sim worker (protected by mSimWorkerMutex)
-    bool mSimWorkerWantDirect = false;
-    bool mSimWorkerWantReflections = false;
-
-    /// Completion flags (atomic, read by main thread without lock)
+    /// Direct simulation worker — runs occlusion/attenuation every frame.
+    /// Latency-critical: determines whether sounds are audible or blocked.
+    std::thread mDirectSimThread;
+    std::mutex mDirectSimMutex;
+    std::condition_variable mDirectSimCV;
+    bool mDirectSimWant = false;  ///< protected by mDirectSimMutex
     std::atomic<bool> mDirectSimRunning{false};
+    std::atomic<bool> mDirectSimShutdown{false};
+    void directSimWorkerMain();
+
+    /// Reflection simulation worker — runs ray-traced reverb on a throttled schedule.
+    /// Latency-tolerant: reverb tails change slowly with listener movement.
+    std::thread mReflectionSimThread;
+    std::mutex mReflectionSimMutex;
+    std::condition_variable mReflectionSimCV;
+    bool mReflectionSimWant = false;  ///< protected by mReflectionSimMutex
     std::atomic<bool> mReflectionSimRunning{false};
-
-    /// Signals worker thread to shut down
-    std::atomic<bool> mSimWorkerShutdown{false};
-
-    /// Worker thread entry point
-    void simWorkerMain();
+    std::atomic<bool> mReflectionSimShutdown{false};
+    void reflectionSimWorkerMain();
 
     /// IPL sources awaiting deferred removal (accumulated while any sim thread is busy).
     std::vector<IPLSource> mPendingSourceRemovals;
