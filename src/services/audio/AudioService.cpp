@@ -3776,18 +3776,53 @@ void AudioService::playLanding(const Vector3 &pos, float fallSpeed, int textureI
 //------------------------------------------------------
 void AudioService::computePortalBlend()
 {
-    mPortalBlend = {};  // reset to inactive
-
-    if (!mRoomService || !mRoomService->isLoaded())
+    if (!mRoomService || !mRoomService->isLoaded()) {
+        mPortalBlend = {};
         return;
-
-    Room *primaryRoom = mRoomService->roomFromPoint(mListenerPos);
-    if (!primaryRoom)
-        return;
+    }
 
     constexpr float kBlendRadius = 3.0f;
 
-    // Find the closest portal the listener is near enough to trigger blending.
+    // If blend is already active, KEEP the existing roomA/roomB assignment
+    // and only update the blend weight. This prevents the room assignment from
+    // flickering frame-to-frame in narrow hallways where roomFromPoint returns
+    // different rooms on each frame.
+    if (mPortalBlend.active && mPortalBlend.roomA && mPortalBlend.roomB) {
+        // Check if we're still near the same portal by searching both rooms
+        RoomPortal *activePortal = nullptr;
+        float activeDist = 0.0f;
+
+        // Search roomA's portals for one connecting to roomB
+        for (uint32_t i = 0; i < mPortalBlend.roomA->getPortalCount(); ++i) {
+            RoomPortal *p = mPortalBlend.roomA->getPortal(i);
+            if (p && p->getFarRoom() == mPortalBlend.roomB) {
+                float d = std::fabs(p->getPlane().getDistance(mListenerPos));
+                if (d < kBlendRadius && p->isInside(mListenerPos)) {
+                    activePortal = p;
+                    activeDist = p->getPlane().getDistance(mListenerPos);
+                    break;
+                }
+            }
+        }
+
+        if (activePortal) {
+            // Still in the blend zone — update weight only, keep rooms pinned
+            float blend = 0.5f - activeDist / (2.0f * kBlendRadius);
+            mPortalBlend.blend = std::max(0.0f, std::min(1.0f, blend));
+            return;
+        }
+
+        // Left the blend zone — deactivate and fall through to fresh detection
+        mPortalBlend = {};
+    }
+
+    // Fresh portal detection: find the closest portal to the listener
+    Room *primaryRoom = mRoomService->roomFromPoint(mListenerPos);
+    if (!primaryRoom) {
+        mPortalBlend = {};
+        return;
+    }
+
     float bestAbsDist = kBlendRadius;
     RoomPortal *bestPortal = nullptr;
     float bestSignedDist = 0.0f;
@@ -3798,16 +3833,12 @@ void AudioService::computePortalBlend()
         if (!portal || !portal->getFarRoom())
             continue;
 
-        // Signed distance from listener to portal plane.
-        // After our d-negation on load: positive = inside (near-room side).
         float signedDist = portal->getPlane().getDistance(mListenerPos);
         float absDist = std::fabs(signedDist);
 
         if (absDist >= bestAbsDist)
             continue;
 
-        // Check edge containment: is the listener within the portal's
-        // 2D footprint? isInside() tests edge planes only.
         if (!portal->isInside(mListenerPos))
             continue;
 
@@ -3816,13 +3847,11 @@ void AudioService::computePortalBlend()
         bestSignedDist = signedDist;
     }
 
-    if (!bestPortal)
+    if (!bestPortal) {
+        mPortalBlend = {};
         return;
+    }
 
-    // Blend weight from portal plane signed distance.
-    // signedDist > 0: listener on near-room side → blend toward roomA.
-    // signedDist < 0: listener crossed to far side → blend toward roomB.
-    // signedDist = 0: on the portal plane → 50/50 blend.
     float blend = 0.5f - bestSignedDist / (2.0f * kBlendRadius);
     blend = std::max(0.0f, std::min(1.0f, blend));
 
