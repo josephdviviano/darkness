@@ -306,6 +306,9 @@ public:
     void setAbsorptionScale(float s) { mAbsorptionScale = std::max(0.01f, std::min(s, 10.0f)); }
     float getAbsorptionScale() const { return mAbsorptionScale; }
 
+    void setDiffuseSamples(int n) { mDiffuseSamples = std::max(16, std::min(n, 256)); }
+    void setBakeDiffuseSamples(int n) { mBakeDiffuseSamples = std::max(32, std::min(n, 512)); }
+
     // Propagation layer toggles (all on by default)
     void setPortalRoutingEnabled(bool v) { mPortalRoutingEnabled = v; }
     bool getPortalRoutingEnabled() const { return mPortalRoutingEnabled; }
@@ -532,6 +535,11 @@ private:
     /// Values > 1.0 make surfaces more absorptive (deader rooms).
     /// 1.0 = physically accurate. 0.5 = half absorption (twice as reflective).
     float mAbsorptionScale = 1.0f;
+
+    /// Diffuse scattering samples for real-time reflection simulation (16-256)
+    int mDiffuseSamples = 64;
+    /// Diffuse scattering samples for probe baking (32-512, higher=smoother)
+    int mBakeDiffuseSamples = 128;
 
     /// Propagation layer toggles (debug — all on by default)
     bool mPortalRoutingEnabled = true;   ///< Portal-graph routing through doorways

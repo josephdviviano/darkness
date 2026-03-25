@@ -36,6 +36,8 @@ struct RenderConfig {
     int  reflectionThrottle  = 4;      // run reflection sim every Nth frame (1–32)
     float transmissionScale  = 10.0f;  // multiply all material transmission coefficients (1=physical, 10=audible through walls)
     float absorptionScale    = 1.0f;   // multiply all material absorption coefficients (1=physical, 0.5=more reflective)
+    int   diffuseSamples     = 64;     // diffuse scattering samples for real-time reflection sim (16-256)
+    int   bakeDiffuseSamples = 128;    // diffuse scattering samples for probe baking (32-512, higher=smoother)
 
     // Propagation layer toggles (all on by default — debug use only)
     bool portalRouting       = true;   // portal-graph sound routing through doorways
@@ -157,6 +159,16 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 cfg.absorptionScale = audio["absorption_scale"].as<float>();
                 if (cfg.absorptionScale < 0.01f) cfg.absorptionScale = 0.01f;
                 if (cfg.absorptionScale > 10.0f) cfg.absorptionScale = 10.0f;
+            }
+            if (audio["diffuse_samples"]) {
+                cfg.diffuseSamples = audio["diffuse_samples"].as<int>();
+                if (cfg.diffuseSamples < 16) cfg.diffuseSamples = 16;
+                if (cfg.diffuseSamples > 256) cfg.diffuseSamples = 256;
+            }
+            if (audio["bake_diffuse_samples"]) {
+                cfg.bakeDiffuseSamples = audio["bake_diffuse_samples"].as<int>();
+                if (cfg.bakeDiffuseSamples < 32) cfg.bakeDiffuseSamples = 32;
+                if (cfg.bakeDiffuseSamples > 512) cfg.bakeDiffuseSamples = 512;
             }
             if (audio["portal_routing"])
                 cfg.portalRouting = audio["portal_routing"].as<bool>();
