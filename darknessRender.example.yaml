@@ -81,13 +81,19 @@ developer:
 
 
 audio:
-  # Run reflection convolution at 24kHz instead of 48kHz.
-  # Halves per-voice convolution cost. Perceptually transparent.
-  half_rate_reflections: true
+  # Reflection convolution rate divisor (1, 2, or 4).
+  # 1 = full rate (48kHz), 2 = half rate (24kHz), 4 = quarter rate (12kHz).
+  # Higher divisors reduce per-voice cost. Reverb is perceptually transparent
+  # at quarter rate (6kHz bandwidth captures all reverb character).
+  reflection_rate_divisor: 2
+
+  # Number of parallel convolution worker threads (0 = auto).
+  # Auto selects hardware_concurrency - 3. More workers = more voices.
+  convolution_workers: 0
 
   # Maximum voices with per-source reflection convolution (1-64).
-  # Each costs ~1.5ms (half-rate) or ~3ms (full-rate). Tail voices count.
-  max_reflection_voices: 8
+  # With multiple workers, higher values are feasible.
+  max_reflection_voices: 16
 
   # Ambisonics order for reflection reverb (0 or 1).
   # 0 = omnidirectional (cheap), 1 = directional (4x cost, more spatial)
@@ -104,6 +110,14 @@ audio:
 
   # Run reflection simulation every Nth frame (1-32)
   reflection_throttle: 4
+
+  # Volumetric occlusion source sphere radius in world units (0.1-10).
+  # Larger = smoother transitions around corners (1.5 = lamp, 3.0 = machinery).
+  occlusion_radius: 1.5
+
+  # Volumetric occlusion ray samples per source (4-64).
+  # More = smoother gradient but higher CPU cost per source.
+  occlusion_samples: 16
 
   # Material transmission multiplier (0.1-100).
   # 1.0 = physically accurate, 10.0 = game-friendly (audible through walls)

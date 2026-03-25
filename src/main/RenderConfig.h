@@ -27,7 +27,8 @@ struct RenderConfig {
     float waterScrollSpeed = 0.05f;  // UV scroll speed in world units/s (0 = no drift)
 
     // -- audio --
-    bool halfRateReflections = true;   // run reflection convolution at 24kHz (half rate)
+    int  reflectionRateDivisor = 2;    // 1=full (48kHz), 2=half (24kHz), 4=quarter (12kHz)
+    int  convolutionWorkers = 0;       // parallel convolution worker threads (0=auto)
     int  maxReflectionVoices = 8;      // max ACTIVE voices with reflection convolution (tail voices are free)
     int  ambisonicsOrder = 0;          // 0 = omnidirectional reverb (1ch, 4x cheaper), 1 = directional (4ch)
     int  reflectionNumRays   = 1024;   // rays per reflection sim step (128–8192)
@@ -38,6 +39,8 @@ struct RenderConfig {
     float absorptionScale    = 1.0f;   // multiply all material absorption coefficients (1=physical, 0.5=more reflective)
     int   diffuseSamples     = 64;     // diffuse scattering samples for real-time reflection sim (16-256)
     int   bakeDiffuseSamples = 128;    // diffuse scattering samples for probe baking (32-512, higher=smoother)
+    float occlusionRadius    = 1.5f;   // volumetric occlusion source sphere radius (world units, 0.1-10)
+    int   occlusionSamples   = 16;     // volumetric occlusion ray samples per source (4-64)
 
     // Propagation layer toggles (all on by default — debug use only)
     bool portalRouting       = true;   // portal-graph sound routing through doorways
@@ -130,8 +133,19 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
 
         // audio section
         if (YAML::Node audio = root["audio"]) {
-            if (audio["half_rate_reflections"])
-                cfg.halfRateReflections = audio["half_rate_reflections"].as<bool>();
+            if (audio["half_rate_reflections"]) {
+                // Backward-compatible: bool → divisor 2 or 1
+                cfg.reflectionRateDivisor = audio["half_rate_reflections"].as<bool>() ? 2 : 1;
+            }
+            if (audio["reflection_rate_divisor"]) {
+                int div = audio["reflection_rate_divisor"].as<int>();
+                cfg.reflectionRateDivisor = (div >= 4) ? 4 : (div >= 2) ? 2 : 1;
+            }
+            if (audio["convolution_workers"]) {
+                cfg.convolutionWorkers = audio["convolution_workers"].as<int>();
+                if (cfg.convolutionWorkers < 0) cfg.convolutionWorkers = 0;
+                if (cfg.convolutionWorkers > 16) cfg.convolutionWorkers = 16;
+            }
             if (audio["ambisonics_order"]) {
                 cfg.ambisonicsOrder = audio["ambisonics_order"].as<int>();
                 if (cfg.ambisonicsOrder < 0) cfg.ambisonicsOrder = 0;
@@ -140,7 +154,7 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             if (audio["max_reflection_voices"]) {
                 cfg.maxReflectionVoices = audio["max_reflection_voices"].as<int>();
                 if (cfg.maxReflectionVoices < 1) cfg.maxReflectionVoices = 1;
-                if (cfg.maxReflectionVoices > 32) cfg.maxReflectionVoices = 32;
+                if (cfg.maxReflectionVoices > 64) cfg.maxReflectionVoices = 64;
             }
             if (audio["reflection_rays"]) {
                 cfg.reflectionNumRays = audio["reflection_rays"].as<int>();
@@ -181,6 +195,16 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 cfg.bakeDiffuseSamples = audio["bake_diffuse_samples"].as<int>();
                 if (cfg.bakeDiffuseSamples < 32) cfg.bakeDiffuseSamples = 32;
                 if (cfg.bakeDiffuseSamples > 512) cfg.bakeDiffuseSamples = 512;
+            }
+            if (audio["occlusion_radius"]) {
+                cfg.occlusionRadius = audio["occlusion_radius"].as<float>();
+                if (cfg.occlusionRadius < 0.1f) cfg.occlusionRadius = 0.1f;
+                if (cfg.occlusionRadius > 10.0f) cfg.occlusionRadius = 10.0f;
+            }
+            if (audio["occlusion_samples"]) {
+                cfg.occlusionSamples = audio["occlusion_samples"].as<int>();
+                if (cfg.occlusionSamples < 4) cfg.occlusionSamples = 4;
+                if (cfg.occlusionSamples > 64) cfg.occlusionSamples = 64;
             }
             if (audio["portal_routing"])
                 cfg.portalRouting = audio["portal_routing"].as<bool>();

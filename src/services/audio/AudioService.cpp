@@ -263,12 +263,12 @@ struct SteamAudioDSPNode {
     std::vector<float> ambiScratch2;  // Z channel
     std::vector<float> ambiScratch3;  // X channel
 
-    // Half-rate decimation scratch (used when reflection pipeline runs at 24kHz)
+    // Decimation scratch (used when reflection pipeline runs at reduced rate)
     std::vector<float> decimatedMono;
 
     int frameSize = 1024;
-    int reflectionFrameSize = 1024;  // half of frameSize in half-rate mode
-    bool halfRate = false;
+    int reflectionFrameSize = 1024;  // frameSize / rateDivisor
+    int rateDivisor = 1;  // 1=full, 2=half, 4=quarter
     std::atomic<bool> effectsReady{false};   // true when effects + node are initialized
     bool nodeInitialized = false;            // true when ma_node_init succeeded (main thread only)
 
@@ -336,7 +336,6 @@ struct AudioService::ReflectionMixNode {
     int reflectionFrameSize = 1024;   // reflection frame size (24kHz or 48kHz)
     int ambiChannels = 1;             // ambisonics channel count (1 for order 0, 4 for order 1)
     int ambiOrder = 0;                // ambisonics order (0 or 1)
-    bool halfRate = false;            // true when running reflections at half sample rate
     std::atomic<bool> ready{false};   // true once pipeline is initialized
     std::atomic<bool> simulationRan{false};  // true after first iplSimulatorRunReflections completes
     bool nodeInitialized = false;
@@ -440,24 +439,53 @@ struct AudioService::ReflectionMixNode {
     }
 };
 
-/// Off-thread convolution worker. Processes all per-voice reflection convolution
-/// on a dedicated thread, writing decoded binaural stereo to a double buffer.
-/// The audio callback reads the front buffer (previous frame's result) while the
-/// worker writes to the back buffer (current frame). Atomic index swap, no locks.
-struct ConvolutionWorker {
-    // Double-buffered decoded stereo output (deinterleaved)
-    std::vector<float> stereoL[2];
-    std::vector<float> stereoR[2];
-    std::atomic<int> frontIdx{0};  // audio reads buf[front], worker writes buf[1-front]
+/// Per-thread convolution sub-worker. Each sub-worker owns its own Steam Audio
+/// mixer/decoder pipeline and processes a subset of voice slots assigned by
+/// the mix node callback. Completely independent — no shared mutable state
+/// between sub-workers during processing.
+struct ConvolutionSubWorker {
+    // Own Steam Audio pipeline (not thread-safe — one per worker)
+    IPLReflectionMixer mixer = nullptr;
+    IPLAmbisonicsDecodeEffect ambiDecodeEffect = nullptr;
 
-    // Per-voice mono input snapshots (filled by audio thread, read by worker)
+    // Own scratch buffers for ambisonics processing
+    std::vector<float> ambiCh0, ambiCh1, ambiCh2, ambiCh3;
+    std::vector<float> voiceAmbi0, voiceAmbi1, voiceAmbi2, voiceAmbi3;
+    std::vector<float> decodedL, decodedR;
+
+    // Own double-buffered stereo output (deinterleaved)
+    std::vector<float> stereoL[2], stereoR[2];
+    std::atomic<int> frontIdx{0};
+    std::atomic<bool> hasProducedOutput{false};
+
+    // Assignment: indices into shared staging[readBuf].
+    // Written by mix node BEFORE signal, read by worker AFTER signal.
+    // The atomic frameSeq provides the acquire-release barrier.
+    int assignedSlots[MAX_ACTIVE_VOICES];
+    int assignedCount = 0;
+
+    // Thread control
+    std::thread thread;
+    std::atomic<uint64_t> frameSeq{0};       // incremented by mix node to signal new data
+    std::atomic<uint64_t> processedSeq{0};   // last frameSeq the worker finished
+    std::atomic<bool> shutdown{false};
+    std::atomic<float> peakMs{0.0f};
+};
+
+/// Off-thread convolution worker with K parallel sub-workers.
+/// The audio callback writes voice mono snapshots to shared staging buffers.
+/// The mix node callback distributes voice slots across sub-workers (round-robin)
+/// and signals them. Each sub-worker processes its subset independently and
+/// writes to its own double-buffered stereo output. The mix node reads and
+/// sums all sub-worker outputs on the next callback. No barrier sync needed.
+struct ConvolutionWorker {
+    // Per-voice mono input snapshots (filled by audio thread, read by sub-workers)
     struct VoiceSlot {
         std::vector<float> mono;          // processed mono data (post-distance-atten, post-decimate)
         IPLReflectionEffect effect = nullptr;
         IPLReflectionEffectParams params{};
-        // Shared validity token — reference-counted so the worker can safely
+        // Shared validity token — reference-counted so workers can safely
         // dereference it even after the owning ActiveVoice has been destroyed.
-        // Replaces the old raw effectsReadyPtr which was a use-after-free bug.
         std::shared_ptr<std::atomic<bool>> validityToken;
         int reflFrameSize = 0;
         bool active = false;
@@ -465,46 +493,38 @@ struct ConvolutionWorker {
     static constexpr int kMaxSlots = MAX_ACTIVE_VOICES;
 
     // Double-buffered voice slots: audio thread writes to staging[writeIdx],
-    // worker reads from staging[1-writeIdx]. Swapped atomically via writeIdx.
+    // sub-workers read from staging[readBuf]. Swapped atomically via writeIdx.
     VoiceSlot staging[2][kMaxSlots];
     int stagingCount[2] = {0, 0};        // count per buffer
     std::atomic<int> writeIdx{0};        // audio thread writes to this index
-    std::atomic<int> readyCount{0};      // count of the buffer just completed (for worker)
-    std::atomic<int> workerReadBuf{-1};  // which staging buffer the worker is reading (-1 = idle)
+    std::atomic<int> readyCount{0};      // count of the buffer just completed
 
-    // Worker-owned Steam Audio objects (never touched by audio thread)
-    IPLReflectionMixer mixer = nullptr;
-    IPLAmbisonicsDecodeEffect ambiDecodeEffect = nullptr;
+    // Track how many sub-workers are still reading the staging buffer.
+    // Mix node checks this before swapping — if > 0, drops the frame.
+    std::atomic<int> workersReading{0};
+
+    // Which staging buffer sub-workers should read (plain int — visibility
+    // guaranteed by the acquire-release on sub-worker frameSeq signals).
+    int currentReadBuf = -1;
+
+    // Sub-workers (K parallel threads, each with own mixer/decoder/output).
+    // unique_ptr because ConvolutionSubWorker contains std::atomic (non-movable).
+    std::vector<std::unique_ptr<ConvolutionSubWorker>> workers;
+    int numWorkers = 1;
+
+    // Shared read-only state (set at init, never modified during processing)
     IPLHRTF hrtf = nullptr;
     IPLContext context = nullptr;
-
-    // Worker-owned scratch buffers
-    std::vector<float> ambiCh0, ambiCh1, ambiCh2, ambiCh3;
-    std::vector<float> decodedL, decodedR;
-    // Per-voice ambisonics scratch (reused across voices)
-    std::vector<float> voiceAmbi0, voiceAmbi1, voiceAmbi2, voiceAmbi3;
-
-    // Listener orientation snapshot (written by audio thread in mix node callback)
-    IPLCoordinateSpace3 listenerOrientation = {
-        {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f}
-    };
-
-    // Config
     int frameSize = 1024;
     int reflectionFrameSize = 1024;
     int ambiChannels = 1;
     int ambiOrder = 0;
-    bool halfRate = false;
+    int rateDivisor = 2;  // 1=full, 2=half, 4=quarter
 
-    // Thread control
-    std::thread thread;
-    std::atomic<uint64_t> frameSeq{0};       // incremented by audio thread to signal new data
-    std::atomic<uint64_t> processedSeq{0};   // last frameSeq the worker finished processing
-    std::atomic<bool> shutdown{false};
-    std::atomic<bool> hasProducedOutput{false}; // false until first frame completes
-
-    // Profiling
-    std::atomic<float> peakMs{0.0f};
+    // Listener orientation snapshot (written by mix node, read by all workers)
+    IPLCoordinateSpace3 listenerOrientation = {
+        {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f}
+    };
 };
 
 /// vtable for the global reflection mix node
@@ -802,13 +822,19 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 float reflAtten = node->directParams.distanceAttenuation;
                 ma_uint32 reflFrames = static_cast<ma_uint32>(node->reflectionFrameSize);
 
-                if (node->halfRate && !node->decimatedMono.empty()) {
-                    // Decimate 48kHz mono to 24kHz
+                if (node->rateDivisor > 1 && !node->decimatedMono.empty()) {
+                    // Decimate from device rate to reflection rate (averaging groups)
                     float *dec = node->decimatedMono.data();
-                    ma_uint32 pairs = std::min(frameCount / 2, reflFrames);
-                    for (ma_uint32 i = 0; i < pairs; ++i)
-                        dec[i] = (mono[i * 2] + mono[i * 2 + 1]) * 0.5f * reflAtten;
-                    for (ma_uint32 i = pairs; i < reflFrames; ++i)
+                    int div = node->rateDivisor;
+                    float invDiv = 1.0f / static_cast<float>(div);
+                    ma_uint32 outFrames = std::min(frameCount / static_cast<ma_uint32>(div), reflFrames);
+                    for (ma_uint32 i = 0; i < outFrames; ++i) {
+                        float sum = 0.0f;
+                        for (int d = 0; d < div; ++d)
+                            sum += mono[i * div + d];
+                        dec[i] = sum * invDiv * reflAtten;
+                    }
+                    for (ma_uint32 i = outFrames; i < reflFrames; ++i)
                         dec[i] = 0.0f;
                     std::memcpy(slot.mono.data(), dec, reflFrames * sizeof(float));
                 } else {
@@ -907,44 +933,70 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         return;
     }
 
-    // Read the convolution worker's front buffer (previous frame's decoded
-    // reverb) and add it to the direct audio. The worker writes to the back
-    // buffer concurrently — double-buffered with atomic swap, no contention.
+    // Read all sub-workers' front buffers (previous frame's decoded reverb)
+    // and sum into the output. Each sub-worker double-buffers independently.
     ConvolutionWorker *cw = node->convWorker;
-    if (cw && cw->hasProducedOutput.load(std::memory_order_acquire)) {
-        int front = cw->frontIdx.load(std::memory_order_acquire);
-
-        // Additive mix with gain ramp
+    if (cw) {
         ma_uint32 outSamples = std::min(static_cast<ma_uint32>(cw->frameSize), frameCount);
-        for (ma_uint32 i = 0; i < outSamples; ++i) {
-            if (node->reflGain < node->reflGainTarget)
-                node->reflGain = std::min(node->reflGain + node->kReflRampRate, node->reflGainTarget);
-            float g = node->reflGain;
-            stereoOut[i * 2]     += cw->stereoL[front][i] * g;
-            stereoOut[i * 2 + 1] += cw->stereoR[front][i] * g;
+        for (auto &subPtr : cw->workers) {
+            auto &sub = *subPtr;
+            if (!sub.hasProducedOutput.load(std::memory_order_acquire)) continue;
+            int front = sub.frontIdx.load(std::memory_order_acquire);
+
+            // Additive mix with gain ramp
+            for (ma_uint32 i = 0; i < outSamples; ++i) {
+                if (node->reflGain < node->reflGainTarget)
+                    node->reflGain = std::min(node->reflGain + node->kReflRampRate, node->reflGainTarget);
+                float g = node->reflGain;
+                stereoOut[i * 2]     += sub.stereoL[front][i] * g;
+                stereoOut[i * 2 + 1] += sub.stereoR[front][i] * g;
+            }
         }
     }
 
-    // Signal the convolution worker that new voice inputs are ready.
+    // Distribute voice slots to sub-workers and signal them.
     // Snapshot the listener orientation for ambisonics decode.
     if (cw) {
         cw->listenerOrientation = node->listenerOrientation;
 
         // Swap staging buffers: the write buffer (just filled by voice callbacks)
-        // becomes the read buffer for the worker. Start a fresh write buffer.
-        // Guard: if the worker is still reading the target buffer, skip the
-        // swap and drop this frame's staging data to prevent corruption.
+        // becomes the read buffer for sub-workers. Start a fresh write buffer.
+        // Guard: if ANY sub-worker is still reading, skip the swap and drop
+        // this frame's staging data to prevent corruption.
         int w = cw->writeIdx.load(std::memory_order_relaxed);
         int newW = 1 - w;
-        if (cw->workerReadBuf.load(std::memory_order_acquire) == newW) {
-            // Worker still reading the buffer we'd swap to — drop this frame
+        if (cw->workersReading.load(std::memory_order_acquire) > 0) {
+            // Sub-workers still reading — drop this frame
             cw->stagingCount[w] = 0;
         } else {
-            cw->readyCount.store(cw->stagingCount[w], std::memory_order_relaxed);
+            int count = cw->stagingCount[w];
+            cw->readyCount.store(count, std::memory_order_relaxed);
             cw->stagingCount[newW] = 0;
             cw->writeIdx.store(newW, std::memory_order_release);
-            // Signal worker that new data is available
-            cw->frameSeq.fetch_add(1, std::memory_order_release);
+
+            // Distribute voice slots to sub-workers (round-robin)
+            int numW = cw->numWorkers;
+            for (int wk = 0; wk < numW; ++wk)
+                cw->workers[wk]->assignedCount = 0;
+            for (int i = 0; i < count && i < ConvolutionWorker::kMaxSlots; ++i) {
+                int wk = i % numW;
+                auto &sub = *cw->workers[wk];
+                sub.assignedSlots[sub.assignedCount++] = i;
+            }
+
+            // Set which staging buffer sub-workers should read.
+            // This write is visible to workers via the frameSeq acquire barrier.
+            cw->currentReadBuf = w;  // the buffer we just swapped away from
+
+            // Pre-set workersReading BEFORE signaling to close the TOCTOU gap.
+            // Without this, a sub-worker could wake from the signal but not yet
+            // increment workersReading, letting the next mix node callback see 0
+            // and swap the buffer out from under it.
+            cw->workersReading.store(numW, std::memory_order_release);
+
+            // Signal all sub-workers that new data is available
+            for (auto &subPtr : cw->workers)
+                subPtr->frameSeq.fetch_add(1, std::memory_order_release);
         }
     }
 
@@ -1136,22 +1188,24 @@ struct ActiveVoice {
             dspNode.nodeInitialized = false;
         }
 
-        // Wait for the convolution worker to finish its current frame BEFORE
-        // Wait for the convolution worker to finish all pending frames before
+        // Wait for ALL convolution sub-workers to finish pending frames before
         // releasing the reflection effect. Uses processedSeq counter for
         // correctness (no TOCTOU gap).
         if (dspNode.convWorker && dspNode.reflectionEffect) {
             auto &cw = *dspNode.convWorker;
-            uint64_t target = cw.frameSeq.load(std::memory_order_acquire);
             auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-            while (cw.processedSeq.load(std::memory_order_acquire) < target) {
-                if (cw.shutdown.load(std::memory_order_relaxed)) break;
-                if (std::chrono::steady_clock::now() >= deadline) {
-                    std::fprintf(stderr, "[AUDIO] WARNING: ~ActiveVoice worker drain "
-                                 "timed out — releasing effect anyway\n");
-                    break;
+            for (auto &subPtr : cw.workers) {
+                auto &sub = *subPtr;
+                uint64_t target = sub.frameSeq.load(std::memory_order_acquire);
+                while (sub.processedSeq.load(std::memory_order_acquire) < target) {
+                    if (sub.shutdown.load(std::memory_order_relaxed)) break;
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        std::fprintf(stderr, "[AUDIO] WARNING: ~ActiveVoice worker drain "
+                                     "timed out — releasing effect anyway\n");
+                        break;
+                    }
+                    std::this_thread::yield();
                 }
-                std::this_thread::yield();
             }
         }
 
@@ -1533,15 +1587,11 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         iplStaticMeshAdd(mIplStaticMesh, mIplScene);
         iplSceneCommit(mIplScene);
 
-        // Compute reflection pipeline rate — half-rate uses 24kHz (half of 48kHz)
-        // for convolution, halving per-voice FFT cost while keeping HRTF at 48kHz.
-        if (mHalfRateReflections) {
-            mReflectionSampleRate = mDeviceSampleRate / 2;
-            mReflectionFrameSize = mFrameSize / 2;
-        } else {
-            mReflectionSampleRate = mDeviceSampleRate;
-            mReflectionFrameSize = mFrameSize;
-        }
+        // Compute reflection pipeline rate — reduced rate lowers per-voice FFT
+        // cost while keeping HRTF at full device rate (48kHz).
+        // Divisor 1=full rate, 2=half (24kHz), 4=quarter (12kHz).
+        mReflectionSampleRate = mDeviceSampleRate / static_cast<uint32_t>(mReflectionRateDivisor);
+        mReflectionFrameSize = mFrameSize / static_cast<uint32_t>(mReflectionRateDivisor);
 
         // Step 6: Create the simulator for direct occlusion + reflections + reverb.
         // The simulator uses the reflection sample rate — IRs are generated at this
@@ -1623,10 +1673,10 @@ bool AudioService::initReflectionPipeline()
     mAmbisonicsChannels = (mAmbisonicsOrder + 1) * (mAmbisonicsOrder + 1);
     IPLint32 numAmbiChannels = static_cast<IPLint32>(mAmbisonicsChannels);
 
-    std::fprintf(stderr, "REFL: creating mixer (irSize=%d, channels=%d, rate=%d, frame=%d%s)\n",
+    std::fprintf(stderr, "REFL: creating mixer (irSize=%d, channels=%d, rate=%d, frame=%d, 1/%d rate)\n",
                  irSize, numAmbiChannels,
                  audioSettings.samplingRate, audioSettings.frameSize,
-                 mHalfRateReflections ? ", half-rate" : "");
+                 mReflectionRateDivisor);
 
     // Create shared reflection mixer — accumulates all per-voice convolution outputs
     IPLReflectionEffectSettings reflSettings{};
@@ -1668,7 +1718,6 @@ bool AudioService::initReflectionPipeline()
     rmn.hrtf = mIplHrtf;
     rmn.frameSize = static_cast<int>(mFrameSize);
     rmn.reflectionFrameSize = static_cast<int>(mReflectionFrameSize);
-    rmn.halfRate = mHalfRateReflections;
     rmn.ambiChannels = mAmbisonicsChannels;
     rmn.ambiOrder = mAmbisonicsOrder;
 
@@ -1748,81 +1797,109 @@ bool AudioService::initReflectionPipeline()
 
     // NOTE: rmn.convWorker is set AFTER the worker is created (below).
 
-    // Create the off-thread convolution worker.
-    // It owns its own IPLReflectionMixer and IPLAmbisonicsDecodeEffect,
-    // completely independent from the audio thread.
+    // Create the off-thread convolution worker with K parallel sub-workers.
+    // Each sub-worker owns its own IPLReflectionMixer and IPLAmbisonicsDecodeEffect.
     mConvolutionWorker = std::make_unique<ConvolutionWorker>();
     auto &cw = *mConvolutionWorker;
     cw.context = mIplContext;
     cw.hrtf = mIplHrtf;
     cw.frameSize = static_cast<int>(mFrameSize);
     cw.reflectionFrameSize = static_cast<int>(mReflectionFrameSize);
-    cw.halfRate = mHalfRateReflections;
+    cw.rateDivisor = mReflectionRateDivisor;
     cw.ambiChannels = mAmbisonicsChannels;
     cw.ambiOrder = mAmbisonicsOrder;
 
-    // Create worker-owned mixer
-    err = iplReflectionMixerCreate(mIplContext, &audioSettings,
-                                    &reflSettings, &cw.mixer);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: convolution worker mixer create failed (%d)", err);
-        // Non-fatal — fall back to on-thread convolution
+    // Determine number of sub-workers
+    if (mConvolutionWorkerCount > 0) {
+        cw.numWorkers = mConvolutionWorkerCount;
+    } else {
+        // Auto: use available cores minus 3 (main + audio + sim), minimum 1
+        unsigned int hwThreads = std::thread::hardware_concurrency();
+        cw.numWorkers = std::max(1, static_cast<int>(hwThreads) - 3);
+    }
+
+    // Allocate shared per-voice mono staging buffers (both double-buffer sides)
+    for (int b = 0; b < 2; ++b) {
+        for (int i = 0; i < ConvolutionWorker::kMaxSlots; ++i) {
+            cw.staging[b][i].mono.resize(mReflectionFrameSize, 0.0f);
+        }
+    }
+
+    // Create K sub-workers, each with own mixer + decoder + scratch + output
+    for (int i = 0; i < cw.numWorkers; ++i)
+        cw.workers.push_back(std::make_unique<ConvolutionSubWorker>());
+    bool allWorkersOk = true;
+    for (int wk = 0; wk < cw.numWorkers; ++wk) {
+        auto &sub = *cw.workers[wk];
+
+        // Create sub-worker's own reflection mixer
+        err = iplReflectionMixerCreate(mIplContext, &audioSettings,
+                                        &reflSettings, &sub.mixer);
+        if (err != IPL_STATUS_SUCCESS) {
+            LOG_ERROR("AudioService: sub-worker %d mixer create failed (%d)", wk, err);
+            allWorkersOk = false;
+            break;
+        }
+
+        // Create sub-worker's own ambisonics decode effect
+        err = iplAmbisonicsDecodeEffectCreate(mIplContext, &audioSettings,
+                                               &decodeSettings, &sub.ambiDecodeEffect);
+        if (err != IPL_STATUS_SUCCESS) {
+            LOG_ERROR("AudioService: sub-worker %d decode create failed (%d)", wk, err);
+            iplReflectionMixerRelease(&sub.mixer);
+            sub.mixer = nullptr;
+            allWorkersOk = false;
+            break;
+        }
+
+        // Allocate double-buffered stereo output
+        for (int b = 0; b < 2; ++b) {
+            sub.stereoL[b].resize(mFrameSize, 0.0f);
+            sub.stereoR[b].resize(mFrameSize, 0.0f);
+        }
+
+        // Allocate scratch buffers
+        sub.ambiCh0.resize(mReflectionFrameSize, 0.0f);
+        if (mAmbisonicsChannels > 1) sub.ambiCh1.resize(mReflectionFrameSize, 0.0f);
+        if (mAmbisonicsChannels > 2) sub.ambiCh2.resize(mReflectionFrameSize, 0.0f);
+        if (mAmbisonicsChannels > 3) sub.ambiCh3.resize(mReflectionFrameSize, 0.0f);
+        sub.decodedL.resize(mReflectionFrameSize, 0.0f);
+        sub.decodedR.resize(mReflectionFrameSize, 0.0f);
+        sub.voiceAmbi0.resize(mReflectionFrameSize, 0.0f);
+        if (mAmbisonicsChannels > 1) sub.voiceAmbi1.resize(mReflectionFrameSize, 0.0f);
+        if (mAmbisonicsChannels > 2) sub.voiceAmbi2.resize(mReflectionFrameSize, 0.0f);
+        if (mAmbisonicsChannels > 3) sub.voiceAmbi3.resize(mReflectionFrameSize, 0.0f);
+    }
+
+    if (!allWorkersOk) {
+        // Clean up partially created sub-workers
+        for (auto &subPtr : cw.workers) {
+            if (subPtr->ambiDecodeEffect)
+                iplAmbisonicsDecodeEffectRelease(&subPtr->ambiDecodeEffect);
+            if (subPtr->mixer)
+                iplReflectionMixerRelease(&subPtr->mixer);
+        }
         mConvolutionWorker.reset();
     }
 
     if (mConvolutionWorker) {
-        // Create worker-owned ambisonics decode effect
-        err = iplAmbisonicsDecodeEffectCreate(mIplContext, &audioSettings,
-                                               &decodeSettings, &cw.ambiDecodeEffect);
-        if (err != IPL_STATUS_SUCCESS) {
-            LOG_ERROR("AudioService: convolution worker decode create failed (%d)", err);
-            iplReflectionMixerRelease(&cw.mixer);
-            cw.mixer = nullptr;
-            mConvolutionWorker.reset();
+        // Spawn sub-worker threads
+        for (int wk = 0; wk < cw.numWorkers; ++wk) {
+            cw.workers[wk]->shutdown.store(false, std::memory_order_relaxed);
+            cw.workers[wk]->thread = std::thread([this, wk]() { convolutionSubWorkerMain(wk); });
         }
-    }
-
-    if (mConvolutionWorker) {
-        // Allocate double-buffered stereo output
-        for (int b = 0; b < 2; ++b) {
-            cw.stereoL[b].resize(mFrameSize, 0.0f);
-            cw.stereoR[b].resize(mFrameSize, 0.0f);
-        }
-
-        // Allocate worker scratch buffers
-        cw.ambiCh0.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 1) cw.ambiCh1.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 2) cw.ambiCh2.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 3) cw.ambiCh3.resize(mReflectionFrameSize, 0.0f);
-        cw.decodedL.resize(mReflectionFrameSize, 0.0f);
-        cw.decodedR.resize(mReflectionFrameSize, 0.0f);
-        cw.voiceAmbi0.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 1) cw.voiceAmbi1.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 2) cw.voiceAmbi2.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 3) cw.voiceAmbi3.resize(mReflectionFrameSize, 0.0f);
-
-        // Allocate per-voice mono staging buffers (both double-buffer sides)
-        for (int b = 0; b < 2; ++b) {
-            for (int i = 0; i < ConvolutionWorker::kMaxSlots; ++i) {
-                cw.staging[b][i].mono.resize(mReflectionFrameSize, 0.0f);
-            }
-        }
-
-        // Spawn the worker thread
-        cw.shutdown.store(false, std::memory_order_relaxed);
-        cw.thread = std::thread([this]() { convolutionWorkerMain(); });
 
         // Wire the mix node to the worker
         rmn.convWorker = mConvolutionWorker.get();
 
-        std::fprintf(stderr, "REFL: convolution worker started (off-thread)\n");
+        std::fprintf(stderr, "REFL: convolution started (%d sub-workers, off-thread)\n",
+                     cw.numWorkers);
     }
 
     std::fprintf(stderr, "AudioService: reflection pipeline initialized "
-                 "(convolution, order %d (%dch), IR %d samples, %uHz%s, max %d voices%s)\n",
+                 "(convolution, order %d (%dch), IR %d samples, %uHz, 1/%d rate, max %d voices%s)\n",
                  mAmbisonicsOrder, mAmbisonicsChannels,
-                 irSize, mReflectionSampleRate,
-                 mHalfRateReflections ? " half-rate" : "",
+                 irSize, mReflectionSampleRate, mReflectionRateDivisor,
                  mMaxReflectionVoices,
                  mConvolutionWorker ? ", off-thread" : ", on-thread fallback");
     return true;
@@ -1831,17 +1908,21 @@ bool AudioService::initReflectionPipeline()
 //------------------------------------------------------
 void AudioService::destroyReflectionPipeline()
 {
-    // Shut down the convolution worker before destroying any Steam Audio objects
+    // Shut down all convolution sub-workers before destroying any Steam Audio objects
     if (mConvolutionWorker) {
-        mConvolutionWorker->shutdown.store(true, std::memory_order_release);
-        mConvolutionWorker->frameSeq.fetch_add(1, std::memory_order_release);  // wake it
-        if (mConvolutionWorker->thread.joinable())
-            mConvolutionWorker->thread.join();
-        // Release worker-owned Steam Audio objects
-        if (mConvolutionWorker->ambiDecodeEffect)
-            iplAmbisonicsDecodeEffectRelease(&mConvolutionWorker->ambiDecodeEffect);
-        if (mConvolutionWorker->mixer)
-            iplReflectionMixerRelease(&mConvolutionWorker->mixer);
+        for (auto &subPtr : mConvolutionWorker->workers) {
+            subPtr->shutdown.store(true, std::memory_order_release);
+            subPtr->frameSeq.fetch_add(1, std::memory_order_release);  // wake it
+        }
+        for (auto &subPtr : mConvolutionWorker->workers) {
+            if (subPtr->thread.joinable())
+                subPtr->thread.join();
+            // Release sub-worker-owned Steam Audio objects
+            if (subPtr->ambiDecodeEffect)
+                iplAmbisonicsDecodeEffectRelease(&subPtr->ambiDecodeEffect);
+            if (subPtr->mixer)
+                iplReflectionMixerRelease(&subPtr->mixer);
+        }
         mConvolutionWorker.reset();
     }
 
@@ -1942,10 +2023,12 @@ void AudioService::bootstrapFinished()
     bool saOk = initSteamAudio();
     mAudioReady = maOk && saOk;
 
-    // Start the persistent simulation worker thread
+    // Start the persistent simulation worker threads (separate for direct + reflections)
     if (mAudioReady) {
-        mSimWorkerShutdown.store(false, std::memory_order_relaxed);
-        mSimWorkerThread = std::thread(&AudioService::simWorkerMain, this);
+        mDirectSimShutdown.store(false, std::memory_order_relaxed);
+        mDirectSimThread = std::thread(&AudioService::directSimWorkerMain, this);
+        mReflectionSimShutdown.store(false, std::memory_order_relaxed);
+        mReflectionSimThread = std::thread(&AudioService::reflectionSimWorkerMain, this);
     }
 
     if (mAudioReady) {
@@ -1969,11 +2052,15 @@ void AudioService::shutdown()
     mSoundCache.reset();
     mSoundLoader.reset();
 
-    // Shut down the simulation worker thread before destroying the scene
-    mSimWorkerShutdown.store(true, std::memory_order_release);
-    mSimWorkerCV.notify_one();
-    if (mSimWorkerThread.joinable())
-        mSimWorkerThread.join();
+    // Shut down both simulation worker threads before destroying the scene
+    mDirectSimShutdown.store(true, std::memory_order_release);
+    mDirectSimCV.notify_one();
+    mReflectionSimShutdown.store(true, std::memory_order_release);
+    mReflectionSimCV.notify_one();
+    if (mDirectSimThread.joinable())
+        mDirectSimThread.join();
+    if (mReflectionSimThread.joinable())
+        mReflectionSimThread.join();
 
     // Release acoustic scene before the Steam Audio context it depends on
     destroyAcousticScene();
@@ -2390,8 +2477,13 @@ void AudioService::loopStep(float deltaTime)
                 inputs.source = sourceCoord;
                 inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
                 inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
-                inputs.occlusionType = IPL_OCCLUSIONTYPE_RAYCAST;
-                inputs.numOcclusionSamples = 16;
+                // Volumetric occlusion models the source as a sphere — as the
+                // sphere partially disappears behind a corner, occlusion ramps
+                // smoothly from 0 to 1 instead of snapping instantly (RAYCAST).
+                // The 16 samples are points within the sphere used for ray tests.
+                inputs.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;
+                inputs.occlusionRadius = mOcclusionRadius;
+                inputs.numOcclusionSamples = mOcclusionSamples;
                 inputs.numTransmissionRays = 8;
 
                 // Non-top-N voices use baked probe reflections instead of
@@ -2417,18 +2509,23 @@ void AudioService::loopStep(float deltaTime)
             if (wantReflections)
                 mReflectionFrameCounter = 0;
 
-            // Set running flags BEFORE signaling (worker clears them on completion)
+            // Signal direct sim (runs every frame, latency-critical)
             mDirectSimRunning.store(true, std::memory_order_release);
-            if (wantReflections)
-                mReflectionSimRunning.store(true, std::memory_order_release);
-
             {
-                std::lock_guard<std::mutex> lock(mSimWorkerMutex);
-                mSimWorkerWantDirect = wantDirect;
-                if (wantReflections)
-                    mSimWorkerWantReflections = true;
+                std::lock_guard<std::mutex> lock(mDirectSimMutex);
+                mDirectSimWant = true;
             }
-            mSimWorkerCV.notify_one();
+            mDirectSimCV.notify_one();
+
+            // Signal reflection sim (throttled, latency-tolerant, separate thread)
+            if (wantReflections) {
+                mReflectionSimRunning.store(true, std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lock(mReflectionSimMutex);
+                    mReflectionSimWant = true;
+                }
+                mReflectionSimCV.notify_one();
+            }
         }
 
         // Step 4: Read back simulation results and feed to DSP nodes.
@@ -2646,66 +2743,76 @@ void AudioService::loopStep(float deltaTime)
 }
 
 //------------------------------------------------------
-void AudioService::simWorkerMain()
+void AudioService::directSimWorkerMain()
 {
-    // Persistent worker thread for Steam Audio simulation.
-    // Waits on a condition variable for work requests, avoiding the overhead
-    // of creating/destroying a std::thread every frame (60 pthread_create/join
-    // cycles per second).
+    // Dedicated thread for direct simulation (occlusion/attenuation).
+    // Runs every frame, completes in <2ms — latency-critical for responsive
+    // sound blocking when the player moves around corners or through doorways.
     while (true) {
-        bool doDirect = false;
-        bool doReflections = false;
-
         {
-            std::unique_lock<std::mutex> lock(mSimWorkerMutex);
-            mSimWorkerCV.wait(lock, [this] {
-                return mSimWorkerWantDirect || mSimWorkerWantReflections
-                       || mSimWorkerShutdown.load(std::memory_order_relaxed);
+            std::unique_lock<std::mutex> lock(mDirectSimMutex);
+            mDirectSimCV.wait(lock, [this] {
+                return mDirectSimWant
+                       || mDirectSimShutdown.load(std::memory_order_relaxed);
             });
-
-            if (mSimWorkerShutdown.load(std::memory_order_relaxed))
+            if (mDirectSimShutdown.load(std::memory_order_relaxed))
                 break;
-
-            doDirect = mSimWorkerWantDirect;
-            doReflections = mSimWorkerWantReflections;
-            mSimWorkerWantDirect = false;
-            mSimWorkerWantReflections = false;
+            mDirectSimWant = false;
         }
 
-        if (doDirect) {
-            auto t0 = std::chrono::steady_clock::now();
-            iplSimulatorRunDirect(mIplSimulator);
-            auto t1 = std::chrono::steady_clock::now();
-            float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
-            float prev = sDirectSimPeakMs.load(std::memory_order_relaxed);
-            if (ms > prev) sDirectSimPeakMs.store(ms, std::memory_order_relaxed);
-            mDirectSimRunning.store(false, std::memory_order_release);
+        auto t0 = std::chrono::steady_clock::now();
+        iplSimulatorRunDirect(mIplSimulator);
+        auto t1 = std::chrono::steady_clock::now();
+        float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+        float prev = sDirectSimPeakMs.load(std::memory_order_relaxed);
+        if (ms > prev) sDirectSimPeakMs.store(ms, std::memory_order_relaxed);
+        mDirectSimRunning.store(false, std::memory_order_release);
+    }
+}
+
+void AudioService::reflectionSimWorkerMain()
+{
+    // Dedicated thread for reflection simulation (ray-traced reverb).
+    // Runs every Nth frame, can take 50-200ms — latency-tolerant because
+    // reverb tails change slowly with listener movement.
+    // Separated from direct sim so it never blocks occlusion updates.
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lock(mReflectionSimMutex);
+            mReflectionSimCV.wait(lock, [this] {
+                return mReflectionSimWant
+                       || mReflectionSimShutdown.load(std::memory_order_relaxed);
+            });
+            if (mReflectionSimShutdown.load(std::memory_order_relaxed))
+                break;
+            mReflectionSimWant = false;
         }
-        if (doReflections) {
-            auto t0 = std::chrono::steady_clock::now();
-            iplSimulatorRunReflections(mIplSimulator);
-            auto t1 = std::chrono::steady_clock::now();
-            float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
-            float prev = sReflSimPeakMs.load(std::memory_order_relaxed);
-            if (ms > prev) sReflSimPeakMs.store(ms, std::memory_order_relaxed);
-            sReflFramesRun.fetch_add(1, std::memory_order_relaxed);
-            if (mReflectionMixNode)
-                mReflectionMixNode->simulationRan = true;
-            mReflectionSimRunning.store(false, std::memory_order_release);
-        }
+
+        auto t0 = std::chrono::steady_clock::now();
+        iplSimulatorRunReflections(mIplSimulator);
+        auto t1 = std::chrono::steady_clock::now();
+        float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+        float prev = sReflSimPeakMs.load(std::memory_order_relaxed);
+        if (ms > prev) sReflSimPeakMs.store(ms, std::memory_order_relaxed);
+        sReflFramesRun.fetch_add(1, std::memory_order_relaxed);
+        if (mReflectionMixNode)
+            mReflectionMixNode->simulationRan = true;
+        mReflectionSimRunning.store(false, std::memory_order_release);
     }
 }
 
 //------------------------------------------------------
-void AudioService::convolutionWorkerMain()
+void AudioService::convolutionSubWorkerMain(int workerIdx)
 {
     if (!mConvolutionWorker) return;
     auto &cw = *mConvolutionWorker;
+    if (workerIdx < 0 || workerIdx >= static_cast<int>(cw.workers.size())) return;
+    auto &sub = *cw.workers[workerIdx];
     uint64_t lastSeq = 0;
 
-    while (!cw.shutdown.load(std::memory_order_relaxed)) {
-        // Wait for the audio thread to signal new data
-        uint64_t seq = cw.frameSeq.load(std::memory_order_acquire);
+    while (!sub.shutdown.load(std::memory_order_relaxed)) {
+        // Wait for the mix node to signal new data
+        uint64_t seq = sub.frameSeq.load(std::memory_order_acquire);
         if (seq == lastSeq) {
             std::this_thread::yield();
             continue;
@@ -2714,26 +2821,25 @@ void AudioService::convolutionWorkerMain()
 
         auto t0 = std::chrono::steady_clock::now();
 
-        // Read from the staging buffer that was just completed by the audio thread.
-        int readBuf = 1 - cw.writeIdx.load(std::memory_order_acquire);
-        cw.workerReadBuf.store(readBuf, std::memory_order_release);
-        int count = cw.readyCount.load(std::memory_order_acquire);
-        int back = 1 - cw.frontIdx.load(std::memory_order_relaxed);
+        // workersReading was pre-set by the mix node before signaling us.
+        // We only decrement when done — no increment needed here.
 
-        // Clear back stereo buffers
-        std::memset(cw.stereoL[back].data(), 0, cw.frameSize * sizeof(float));
-        std::memset(cw.stereoR[back].data(), 0, cw.frameSize * sizeof(float));
+        int readBuf = cw.currentReadBuf;  // visible via frameSeq acquire barrier
+        int assignCount = sub.assignedCount;  // likewise
+        int back = 1 - sub.frontIdx.load(std::memory_order_relaxed);
 
-        // Process each active voice's convolution through the worker's mixer
+        // Clear this sub-worker's back stereo buffers
+        std::memset(sub.stereoL[back].data(), 0, cw.frameSize * sizeof(float));
+        std::memset(sub.stereoR[back].data(), 0, cw.frameSize * sizeof(float));
+
+        // Process assigned voice slots through this sub-worker's mixer
         int nch = cw.ambiChannels;
-        for (int i = 0; i < count && i < ConvolutionWorker::kMaxSlots; ++i) {
+        for (int j = 0; j < assignCount; ++j) {
+            int i = sub.assignedSlots[j];
+            if (i < 0 || i >= ConvolutionWorker::kMaxSlots) continue;
             auto &slot = cw.staging[readBuf][i];
             if (!slot.active || !slot.effect || slot.params.irSize <= 0)
                 continue;
-            // Check if the voice's effects are still valid via the shared
-            // validity token. The token is a reference-counted heap bool —
-            // safe to dereference even after the owning ActiveVoice is destroyed.
-            // ~ActiveVoice sets the token to false before releasing the effect.
             if (slot.validityToken && !slot.validityToken->load(std::memory_order_acquire))
                 continue;
 
@@ -2744,41 +2850,44 @@ void AudioService::convolutionWorkerMain()
             reflIn.numSamples = static_cast<IPLint32>(slot.reflFrameSize);
             reflIn.data = &monoPtr;
 
-            // Build output buffer (worker-owned per-voice ambisonics scratch)
+            // Build output buffer (sub-worker-owned per-voice ambisonics scratch)
             float *ambiPtrs[4] = {
-                cw.voiceAmbi0.data(),
-                !cw.voiceAmbi1.empty() ? cw.voiceAmbi1.data() : nullptr,
-                !cw.voiceAmbi2.empty() ? cw.voiceAmbi2.data() : nullptr,
-                !cw.voiceAmbi3.empty() ? cw.voiceAmbi3.data() : nullptr
+                sub.voiceAmbi0.data(),
+                !sub.voiceAmbi1.empty() ? sub.voiceAmbi1.data() : nullptr,
+                !sub.voiceAmbi2.empty() ? sub.voiceAmbi2.data() : nullptr,
+                !sub.voiceAmbi3.empty() ? sub.voiceAmbi3.data() : nullptr
             };
             IPLAudioBuffer reflOut{};
             reflOut.numChannels = slot.params.numChannels;
             reflOut.numSamples = static_cast<IPLint32>(slot.reflFrameSize);
             reflOut.data = ambiPtrs;
 
-            // Apply convolution, accumulating into worker's mixer
+            // Apply convolution, accumulating into this sub-worker's mixer
             iplReflectionEffectApply(slot.effect, &slot.params,
-                                      &reflIn, &reflOut, cw.mixer);
+                                      &reflIn, &reflOut, sub.mixer);
         }
 
-        // Release staging slot references after processing. This drops the
-        // shared_ptr refcounts so destroyed voices' validity tokens (and their
-        // effect pointers) are not held longer than necessary. The audio thread
-        // owns the OTHER staging buffer, so this is safe — no concurrent access.
-        for (int i = 0; i < count && i < ConvolutionWorker::kMaxSlots; ++i) {
+        // Release staging slot references for this sub-worker's assigned slots.
+        // Each sub-worker operates on disjoint slots (round-robin) — no contention.
+        for (int j = 0; j < assignCount; ++j) {
+            int i = sub.assignedSlots[j];
+            if (i < 0 || i >= ConvolutionWorker::kMaxSlots) continue;
             auto &slot = cw.staging[readBuf][i];
             slot.effect = nullptr;
             slot.validityToken.reset();
             slot.active = false;
         }
 
-        // Extract accumulated ambisonics from worker's mixer
+        // Done reading shared staging
+        cw.workersReading.fetch_sub(1, std::memory_order_acq_rel);
+
+        // Extract accumulated ambisonics from this sub-worker's mixer
         ma_uint32 reflFrameCount = static_cast<ma_uint32>(cw.reflectionFrameSize);
         float *ambiChannels[4] = {
-            cw.ambiCh0.data(),
-            nch > 1 ? cw.ambiCh1.data() : nullptr,
-            nch > 2 ? cw.ambiCh2.data() : nullptr,
-            nch > 3 ? cw.ambiCh3.data() : nullptr
+            sub.ambiCh0.data(),
+            nch > 1 ? sub.ambiCh1.data() : nullptr,
+            nch > 2 ? sub.ambiCh2.data() : nullptr,
+            nch > 3 ? sub.ambiCh3.data() : nullptr
         };
         IPLAudioBuffer ambiOut{};
         ambiOut.numChannels = nch;
@@ -2788,10 +2897,10 @@ void AudioService::convolutionWorkerMain()
         IPLReflectionEffectParams mixerParams{};
         mixerParams.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
         mixerParams.numChannels = nch;
-        iplReflectionMixerApply(cw.mixer, &mixerParams, &ambiOut);
+        iplReflectionMixerApply(sub.mixer, &mixerParams, &ambiOut);
 
         // Decode ambisonics to binaural stereo
-        float *decodedPtrs[2] = {cw.decodedL.data(), cw.decodedR.data()};
+        float *decodedPtrs[2] = {sub.decodedL.data(), sub.decodedR.data()};
         IPLAudioBuffer decodedBuf{};
         decodedBuf.numChannels = 2;
         decodedBuf.numSamples = static_cast<IPLint32>(reflFrameCount);
@@ -2802,44 +2911,44 @@ void AudioService::convolutionWorkerMain()
         decodeParams.hrtf = cw.hrtf;
         decodeParams.orientation = cw.listenerOrientation;
         decodeParams.binaural = IPL_TRUE;
-        iplAmbisonicsDecodeEffectApply(cw.ambiDecodeEffect, &decodeParams,
+        iplAmbisonicsDecodeEffectApply(sub.ambiDecodeEffect, &decodeParams,
                                         &ambiOut, &decodedBuf);
 
-        // Write decoded stereo to back buffer.
-        // Handle half-rate upsampling here (worker side) so the audio thread
-        // just does a simple additive copy.
-        if (cw.halfRate) {
-            ma_uint32 pairs = std::min(reflFrameCount, static_cast<ma_uint32>(cw.frameSize / 2));
-            for (ma_uint32 j = 0; j < pairs; ++j) {
-                float l0 = cw.decodedL[j];
-                float r0 = cw.decodedR[j];
-                float l1 = (j + 1 < reflFrameCount) ? cw.decodedL[j + 1] : l0;
-                float r1 = (j + 1 < reflFrameCount) ? cw.decodedR[j + 1] : r0;
-                cw.stereoL[back][j * 2]     = l0;
-                cw.stereoL[back][j * 2 + 1] = (l0 + l1) * 0.5f;
-                cw.stereoR[back][j * 2]     = r0;
-                cw.stereoR[back][j * 2 + 1] = (r0 + r1) * 0.5f;
+        // Write decoded stereo to this sub-worker's back buffer.
+        // Handle upsampling from reflection rate to device rate.
+        int div = cw.rateDivisor;
+        if (div > 1) {
+            // Linear interpolation upsample by rateDivisor
+            ma_uint32 inFrames = std::min(reflFrameCount,
+                static_cast<ma_uint32>(cw.frameSize / div));
+            for (ma_uint32 j = 0; j < inFrames; ++j) {
+                float l0 = sub.decodedL[j];
+                float r0 = sub.decodedR[j];
+                float l1 = (j + 1 < reflFrameCount) ? sub.decodedL[j + 1] : l0;
+                float r1 = (j + 1 < reflFrameCount) ? sub.decodedR[j + 1] : r0;
+                for (int d = 0; d < div; ++d) {
+                    float t = static_cast<float>(d) / static_cast<float>(div);
+                    sub.stereoL[back][j * div + d] = l0 + (l1 - l0) * t;
+                    sub.stereoR[back][j * div + d] = r0 + (r1 - r0) * t;
+                }
             }
         } else {
             ma_uint32 outSamples = std::min(reflFrameCount, static_cast<ma_uint32>(cw.frameSize));
-            std::memcpy(cw.stereoL[back].data(), cw.decodedL.data(), outSamples * sizeof(float));
-            std::memcpy(cw.stereoR[back].data(), cw.decodedR.data(), outSamples * sizeof(float));
+            std::memcpy(sub.stereoL[back].data(), sub.decodedL.data(), outSamples * sizeof(float));
+            std::memcpy(sub.stereoR[back].data(), sub.decodedR.data(), outSamples * sizeof(float));
         }
 
-        // Done reading staging — release the read buffer
-        cw.workerReadBuf.store(-1, std::memory_order_release);
-
         // Swap: make back buffer the new front
-        cw.frontIdx.store(back, std::memory_order_release);
-        cw.hasProducedOutput.store(true, std::memory_order_release);
+        sub.frontIdx.store(back, std::memory_order_release);
+        sub.hasProducedOutput.store(true, std::memory_order_release);
 
         auto t1 = std::chrono::steady_clock::now();
         float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
-        float prev = cw.peakMs.load(std::memory_order_relaxed);
-        if (ms > prev) cw.peakMs.store(ms, std::memory_order_relaxed);
+        float prev = sub.peakMs.load(std::memory_order_relaxed);
+        if (ms > prev) sub.peakMs.store(ms, std::memory_order_relaxed);
 
         // Signal that this frame's data has been fully processed
-        cw.processedSeq.store(lastSeq, std::memory_order_release);
+        sub.processedSeq.store(lastSeq, std::memory_order_release);
     }
 }
 
@@ -2849,23 +2958,22 @@ void AudioService::waitForConvolutionWorker()
     if (!mConvolutionWorker) return;
     auto &cw = *mConvolutionWorker;
 
-    // Wait until the worker has finished processing ALL frames signaled so far.
-    // Uses processedSeq counter instead of a "processing" flag to eliminate the
-    // TOCTOU gap where the worker has woken from frameSeq but hasn't started
-    // processing yet (the old approach would see processing=false and return
-    // prematurely, then the worker would start processing freed data).
-    uint64_t target = cw.frameSeq.load(std::memory_order_acquire);
+    // Wait until ALL sub-workers have finished processing ALL frames signaled so far.
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-    while (cw.processedSeq.load(std::memory_order_acquire) < target) {
-        if (cw.shutdown.load(std::memory_order_relaxed)) break;
-        if (std::chrono::steady_clock::now() >= deadline) {
-            std::fprintf(stderr, "[AUDIO] WARNING: convolution worker wait timed out "
-                         "(target=%llu, processed=%llu)\n",
-                         (unsigned long long)target,
-                         (unsigned long long)cw.processedSeq.load(std::memory_order_relaxed));
-            break;
+    for (auto &subPtr : cw.workers) {
+        auto &sub = *subPtr;
+        uint64_t target = sub.frameSeq.load(std::memory_order_acquire);
+        while (sub.processedSeq.load(std::memory_order_acquire) < target) {
+            if (sub.shutdown.load(std::memory_order_relaxed)) break;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                std::fprintf(stderr, "[AUDIO] WARNING: convolution sub-worker wait timed out "
+                             "(target=%llu, processed=%llu)\n",
+                             (unsigned long long)target,
+                             (unsigned long long)sub.processedSeq.load(std::memory_order_relaxed));
+                break;
+            }
+            std::this_thread::yield();
         }
-        std::this_thread::yield();
     }
 }
 
@@ -2989,7 +3097,7 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     dsp.hrtf = mIplHrtf;
     dsp.frameSize = static_cast<int>(mFrameSize);
     dsp.reflectionFrameSize = static_cast<int>(mReflectionFrameSize);
-    dsp.halfRate = mHalfRateReflections;
+    dsp.rateDivisor = mReflectionRateDivisor;
 
     // Allocate processing buffers (once, never reallocated — audio thread safe)
     dsp.monoScratch.resize(dsp.frameSize);
@@ -2999,7 +3107,7 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     if (mAmbisonicsChannels > 1) dsp.ambiScratch1.resize(mReflectionFrameSize, 0.0f);
     if (mAmbisonicsChannels > 2) dsp.ambiScratch2.resize(mReflectionFrameSize, 0.0f);
     if (mAmbisonicsChannels > 3) dsp.ambiScratch3.resize(mReflectionFrameSize, 0.0f);
-    if (mHalfRateReflections)
+    if (mReflectionRateDivisor > 1)
         dsp.decimatedMono.resize(mReflectionFrameSize, 0.0f);
 
     // Create IPLDirectEffect (per-voice, frequency-dependent 3-band EQ)
@@ -3709,10 +3817,14 @@ void AudioService::updateAmbientVolumes()
                      loopMs, commitMs, static_cast<float>(portalUs), portalCalls, portalAvgUs,
                      directMs, reflMs, reflFrames, raysPerSec,
                      created, destroyed);
-        // Append convolution worker stats if active
+        // Append convolution sub-worker stats if active
         if (mConvolutionWorker) {
-            float cwMs = mConvolutionWorker->peakMs.exchange(0.0f, std::memory_order_relaxed);
-            std::fprintf(stderr, " | conv: %.1fms", cwMs);
+            float maxMs = 0.0f;
+            for (auto &subPtr : mConvolutionWorker->workers) {
+                float ms = subPtr->peakMs.exchange(0.0f, std::memory_order_relaxed);
+                if (ms > maxMs) maxMs = ms;
+            }
+            std::fprintf(stderr, " | conv: %.1fms (%dw)", maxMs, mConvolutionWorker->numWorkers);
         }
         std::fprintf(stderr, "\n");
     }

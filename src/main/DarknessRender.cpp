@@ -1022,7 +1022,7 @@ static void registerConsoleSettings(
             auto svc = GET_SERVICE(Darkness::AudioService);
             if (svc) svc->setMaxReflectionVoices(static_cast<int>(v));
         },
-        "Max active voices with convolution reverb (~3ms each at half-rate)");
+        "Max active voices with convolution reverb");
 
     dbgConsole.addFloat("refl_sample_rate", 0.0f, 48000.0f,
         []() {
@@ -1806,7 +1806,8 @@ int main(int argc, char *argv[]) {
                      numVerts, numTris, wr.numCells);
 
         // Apply audio config before building the acoustic scene
-        audioSvc->setHalfRateReflections(cfg.halfRateReflections);
+        audioSvc->setReflectionRateDivisor(cfg.reflectionRateDivisor);
+        audioSvc->setConvolutionWorkerCount(cfg.convolutionWorkers);
         audioSvc->setAmbisonicsOrder(cfg.ambisonicsOrder);
         audioSvc->setMaxReflectionVoices(cfg.maxReflectionVoices);
         audioSvc->setReflectionNumRays(cfg.reflectionNumRays);
@@ -1817,6 +1818,8 @@ int main(int argc, char *argv[]) {
         audioSvc->setAbsorptionScale(cfg.absorptionScale);
         audioSvc->setDiffuseSamples(cfg.diffuseSamples);
         audioSvc->setBakeDiffuseSamples(cfg.bakeDiffuseSamples);
+        audioSvc->setOcclusionRadius(cfg.occlusionRadius);
+        audioSvc->setOcclusionSamples(cfg.occlusionSamples);
         audioSvc->setPortalRoutingEnabled(cfg.portalRouting);
         audioSvc->setProbePathingEnabled(cfg.probePathing);
         audioSvc->setReflectionsEnabled(cfg.realtimeReflections);
