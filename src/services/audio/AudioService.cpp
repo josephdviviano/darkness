@@ -226,6 +226,14 @@ struct SteamAudioDSPNode {
     std::atomic<bool> effectsReady{false};   // true when effects + node are initialized
     bool nodeInitialized = false;            // true when ma_node_init succeeded (main thread only)
 
+    // Shared validity token for the convolution worker. Heap-allocated and
+    // reference-counted so the worker can safely check it even after the
+    // ActiveVoice that created it has been destroyed. The audio callback
+    // copies the shared_ptr into the staging slot; ~ActiveVoice sets the
+    // bool to false but does NOT need to wait for the worker to see it —
+    // the shared_ptr prevents use-after-free of the token itself.
+    std::shared_ptr<std::atomic<bool>> validityToken;
+
     // Diagnostics (written by audio thread, read by main thread)
     std::atomic<uint64_t> callCount{0};     // how many times process() was called
     std::atomic<float> peakInput{0.0f};     // peak input level seen
@@ -312,7 +320,10 @@ struct ConvolutionWorker {
         std::vector<float> mono;          // processed mono data (post-distance-atten, post-decimate)
         IPLReflectionEffect effect = nullptr;
         IPLReflectionEffectParams params{};
-        std::atomic<bool> *effectsReadyPtr = nullptr;  // validity check — points to voice's effectsReady
+        // Shared validity token — reference-counted so the worker can safely
+        // dereference it even after the owning ActiveVoice has been destroyed.
+        // Replaces the old raw effectsReadyPtr which was a use-after-free bug.
+        std::shared_ptr<std::atomic<bool>> validityToken;
         int reflFrameSize = 0;
         bool active = false;
     };
@@ -324,6 +335,7 @@ struct ConvolutionWorker {
     int stagingCount[2] = {0, 0};        // count per buffer
     std::atomic<int> writeIdx{0};        // audio thread writes to this index
     std::atomic<int> readyCount{0};      // count of the buffer just completed (for worker)
+    std::atomic<int> workerReadBuf{-1};  // which staging buffer the worker is reading (-1 = idle)
 
     // Worker-owned Steam Audio objects (never touched by audio thread)
     IPLReflectionMixer mixer = nullptr;
@@ -351,8 +363,8 @@ struct ConvolutionWorker {
 
     // Thread control
     std::thread thread;
-    std::atomic<uint64_t> frameSeq{0};   // incremented by audio thread to signal new data
-    std::atomic<bool> processing{false}; // true while worker is processing a frame
+    std::atomic<uint64_t> frameSeq{0};       // incremented by audio thread to signal new data
+    std::atomic<uint64_t> processedSeq{0};   // last frameSeq the worker finished processing
     std::atomic<bool> shutdown{false};
     std::atomic<bool> hasProducedOutput{false}; // false until first frame completes
 
@@ -673,7 +685,7 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 }
 
                 slot.effect = node->reflectionEffect;
-                slot.effectsReadyPtr = &node->effectsReady;
+                slot.validityToken = node->validityToken;  // shared_ptr copy — prevents use-after-free
                 slot.params = node->reflectionParams;
                 slot.reflFrameSize = node->reflectionFrameSize;
                 slot.active = true;
@@ -785,14 +797,20 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
 
         // Swap staging buffers: the write buffer (just filled by voice callbacks)
         // becomes the read buffer for the worker. Start a fresh write buffer.
+        // Guard: if the worker is still reading the target buffer, skip the
+        // swap and drop this frame's staging data to prevent corruption.
         int w = cw->writeIdx.load(std::memory_order_relaxed);
-        cw->readyCount.store(cw->stagingCount[w], std::memory_order_relaxed);
         int newW = 1 - w;
-        cw->stagingCount[newW] = 0;  // clear next write buffer's count
-        cw->writeIdx.store(newW, std::memory_order_release);
-
-        // Signal worker that new data is available
-        cw->frameSeq.fetch_add(1, std::memory_order_release);
+        if (cw->workerReadBuf.load(std::memory_order_acquire) == newW) {
+            // Worker still reading the buffer we'd swap to — drop this frame
+            cw->stagingCount[w] = 0;
+        } else {
+            cw->readyCount.store(cw->stagingCount[w], std::memory_order_relaxed);
+            cw->stagingCount[newW] = 0;
+            cw->writeIdx.store(newW, std::memory_order_release);
+            // Signal worker that new data is available
+            cw->frameSeq.fetch_add(1, std::memory_order_release);
+        }
     }
 
     // Clamp output to [-1, 1] — HRTF convolution can produce samples > 1.0
@@ -881,17 +899,47 @@ struct ActiveVoice {
         dspNode.effectsReady.store(false, std::memory_order_release);
         dspNode.reflectionsActive.store(false, std::memory_order_release);
 
+        // Invalidate the shared validity token. The convolution worker holds
+        // a shared_ptr copy, so the token stays alive — but reads as false,
+        // causing the worker to skip this voice's staged data. This is safe
+        // even if the worker checks it after this ActiveVoice is freed.
+        if (dspNode.validityToken) {
+            dspNode.validityToken->store(false, std::memory_order_release);
+        }
+
         // Stop playback — use immediate stop here since ma_node_uninit below
         // will block until the audio thread finishes, providing a clean boundary.
         if (initialized) {
             ma_sound_stop(&sound);
         }
 
-        // Disconnect and destroy DSP node (detaches from graph, waits for audio thread)
+        // Disconnect and destroy DSP node (detaches from graph, waits for audio thread).
+        // After this returns, the audio callback will NOT be called again for this
+        // node, so no new staging snapshots will reference this voice's effect.
         if (dspNode.nodeInitialized) {
             ma_node_uninit(&dspNode.base, nullptr);
             dspNode.nodeInitialized = false;
         }
+
+        // Wait for the convolution worker to finish its current frame BEFORE
+        // Wait for the convolution worker to finish all pending frames before
+        // releasing the reflection effect. Uses processedSeq counter for
+        // correctness (no TOCTOU gap).
+        if (dspNode.convWorker && dspNode.reflectionEffect) {
+            auto &cw = *dspNode.convWorker;
+            uint64_t target = cw.frameSeq.load(std::memory_order_acquire);
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (cw.processedSeq.load(std::memory_order_acquire) < target) {
+                if (cw.shutdown.load(std::memory_order_relaxed)) break;
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    std::fprintf(stderr, "[AUDIO] WARNING: ~ActiveVoice worker drain "
+                                 "timed out — releasing effect anyway\n");
+                    break;
+                }
+                std::this_thread::yield();
+            }
+        }
+
         if (dspNode.directEffect) {
             iplDirectEffectRelease(&dspNode.directEffect);
             dspNode.directEffect = nullptr;
@@ -2401,13 +2449,12 @@ void AudioService::convolutionWorkerMain()
             continue;
         }
         lastSeq = seq;
-        cw.processing.store(true, std::memory_order_release);
 
         auto t0 = std::chrono::steady_clock::now();
 
         // Read from the staging buffer that was just completed by the audio thread.
-        // The audio thread swapped writeIdx, so the read buffer is 1 - current writeIdx.
         int readBuf = 1 - cw.writeIdx.load(std::memory_order_acquire);
+        cw.workerReadBuf.store(readBuf, std::memory_order_release);
         int count = cw.readyCount.load(std::memory_order_acquire);
         int back = 1 - cw.frontIdx.load(std::memory_order_relaxed);
 
@@ -2421,11 +2468,11 @@ void AudioService::convolutionWorkerMain()
             auto &slot = cw.staging[readBuf][i];
             if (!slot.active || !slot.effect || slot.params.irSize <= 0)
                 continue;
-            // Check if the voice's effects are still valid — the destructor
-            // sets effectsReady=false before releasing the effect, so this
-            // prevents use-after-free for voices cleaned up between the audio
-            // callback snapshot and the worker's processing.
-            if (slot.effectsReadyPtr && !slot.effectsReadyPtr->load(std::memory_order_acquire))
+            // Check if the voice's effects are still valid via the shared
+            // validity token. The token is a reference-counted heap bool —
+            // safe to dereference even after the owning ActiveVoice is destroyed.
+            // ~ActiveVoice sets the token to false before releasing the effect.
+            if (slot.validityToken && !slot.validityToken->load(std::memory_order_acquire))
                 continue;
 
             // Build input buffer from the mono snapshot
@@ -2450,6 +2497,17 @@ void AudioService::convolutionWorkerMain()
             // Apply convolution, accumulating into worker's mixer
             iplReflectionEffectApply(slot.effect, &slot.params,
                                       &reflIn, &reflOut, cw.mixer);
+        }
+
+        // Release staging slot references after processing. This drops the
+        // shared_ptr refcounts so destroyed voices' validity tokens (and their
+        // effect pointers) are not held longer than necessary. The audio thread
+        // owns the OTHER staging buffer, so this is safe — no concurrent access.
+        for (int i = 0; i < count && i < ConvolutionWorker::kMaxSlots; ++i) {
+            auto &slot = cw.staging[readBuf][i];
+            slot.effect = nullptr;
+            slot.validityToken.reset();
+            slot.active = false;
         }
 
         // Extract accumulated ambisonics from worker's mixer
@@ -2506,6 +2564,9 @@ void AudioService::convolutionWorkerMain()
             std::memcpy(cw.stereoR[back].data(), cw.decodedR.data(), outSamples * sizeof(float));
         }
 
+        // Done reading staging — release the read buffer
+        cw.workerReadBuf.store(-1, std::memory_order_release);
+
         // Swap: make back buffer the new front
         cw.frontIdx.store(back, std::memory_order_release);
         cw.hasProducedOutput.store(true, std::memory_order_release);
@@ -2515,7 +2576,8 @@ void AudioService::convolutionWorkerMain()
         float prev = cw.peakMs.load(std::memory_order_relaxed);
         if (ms > prev) cw.peakMs.store(ms, std::memory_order_relaxed);
 
-        cw.processing.store(false, std::memory_order_release);
+        // Signal that this frame's data has been fully processed
+        cw.processedSeq.store(lastSeq, std::memory_order_release);
     }
 }
 
@@ -2523,8 +2585,26 @@ void AudioService::convolutionWorkerMain()
 void AudioService::waitForConvolutionWorker()
 {
     if (!mConvolutionWorker) return;
-    while (mConvolutionWorker->processing.load(std::memory_order_acquire))
+    auto &cw = *mConvolutionWorker;
+
+    // Wait until the worker has finished processing ALL frames signaled so far.
+    // Uses processedSeq counter instead of a "processing" flag to eliminate the
+    // TOCTOU gap where the worker has woken from frameSeq but hasn't started
+    // processing yet (the old approach would see processing=false and return
+    // prematurely, then the worker would start processing freed data).
+    uint64_t target = cw.frameSeq.load(std::memory_order_acquire);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (cw.processedSeq.load(std::memory_order_acquire) < target) {
+        if (cw.shutdown.load(std::memory_order_relaxed)) break;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::fprintf(stderr, "[AUDIO] WARNING: convolution worker wait timed out "
+                         "(target=%llu, processed=%llu)\n",
+                         (unsigned long long)target,
+                         (unsigned long long)cw.processedSeq.load(std::memory_order_relaxed));
+            break;
+        }
         std::this_thread::yield();
+    }
 }
 
 //------------------------------------------------------
@@ -2594,9 +2674,15 @@ void AudioService::removeVoiceSource(ActiveVoice &voice)
     if (!voice.iplSource)
         return;
 
-    // Ensure the convolution worker isn't processing this voice's reflection
-    // effect before we release it. The worker may be using the effect pointer
-    // from a snapshot taken during the previous audio callback.
+    // Invalidate this voice's effects BEFORE waiting for the worker.
+    // The worker checks effectsReady before using the effect pointer, so
+    // setting it false here ensures any in-flight processing skips this voice.
+    // This closes the race where the worker hasn't started yet but has a
+    // staging snapshot containing this voice's effect pointer.
+    voice.dspNode.effectsReady.store(false, std::memory_order_release);
+    voice.dspNode.reflectionsActive.store(false, std::memory_order_release);
+
+    // Wait for the worker to finish processing all current frames.
     waitForConvolutionWorker();
 
     // If either background sim thread is running, we can't safely call
@@ -2768,6 +2854,13 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
         // connect the sound directly to the endpoint
         return;
     }
+
+    // Create the shared validity token for the convolution worker.
+    // This is a heap-allocated atomic<bool> shared between the voice and any
+    // staging slots that reference its reflectionEffect. When the voice is
+    // destroyed, ~ActiveVoice sets the token to false; the worker's shared_ptr
+    // copy keeps the token alive so it can be safely checked without UB.
+    dsp.validityToken = std::make_shared<std::atomic<bool>>(true);
 
     // Only mark ready AFTER the graph is fully wired — the audio thread
     // checks this flag before using any Steam Audio effects.
