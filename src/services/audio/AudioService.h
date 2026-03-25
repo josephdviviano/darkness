@@ -68,11 +68,16 @@ typedef _IPLProbeBatch_t* IPLProbeBatch;
 struct _IPLPathEffect_t;
 typedef _IPLPathEffect_t* IPLPathEffect;
 
+// Forward declaration for off-thread convolution worker (defined in AudioService.cpp)
+
 namespace Darkness {
 
 // Forward declarations for room system types
 class Room;
 class RoomPortal;
+
+// Forward declaration for off-thread convolution worker (defined in AudioService.cpp)
+struct ConvolutionWorker;
 
 // Forward declarations for sound resource types (defined in CRFSoundLoader.h)
 class CRFSoundLoader;
@@ -144,7 +149,7 @@ constexpr int MAX_ACTIVE_VOICES = 64;
 /// Per-voice convolution is expensive. Remaining voices use direct path only
 /// (HRTF + distance attenuation + occlusion), which is cheap.
 /// Tunable at runtime via setMaxReflectionVoices().
-constexpr int DEFAULT_MAX_REFLECTION_VOICES = 2;
+constexpr int DEFAULT_MAX_REFLECTION_VOICES = 16;
 
 /// Default maximum sound propagation distance (world units)
 constexpr float SOUND_MAX_DIST = 200.0f;
@@ -510,9 +515,19 @@ private:
     bool mReflectionsEnabled = true;
 
     /// Global reflection mix node — sits between per-voice DSP nodes and the
-    /// engine endpoint. Retrieves mixed reflection ambisonics, decodes to
-    /// binaural stereo, and adds to the direct audio stream.
+    /// engine endpoint. Reads the convolution worker's output and adds to direct.
     std::unique_ptr<ReflectionMixNode> mReflectionMixNode;
+
+    /// Off-thread convolution worker — processes all per-voice reflection
+    /// convolution on a dedicated thread with double-buffered stereo output.
+    std::unique_ptr<ConvolutionWorker> mConvolutionWorker;
+
+    /// Wait for the convolution worker to finish its current frame.
+    /// Must be called before releasing any IPLReflectionEffect.
+    void waitForConvolutionWorker();
+
+    /// Convolution worker thread entry point.
+    void convolutionWorkerMain();
 
     /// Frame counter for throttling reflection simulation (every Nth frame)
     int mReflectionFrameCounter = 0;
