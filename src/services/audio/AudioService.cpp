@@ -276,8 +276,8 @@ struct AudioService::ReflectionMixNode {
     int ambiChannels = 1;             // ambisonics channel count (1 for order 0, 4 for order 1)
     int ambiOrder = 0;                // ambisonics order (0 or 1)
     bool halfRate = false;            // true when running reflections at half sample rate
-    bool ready = false;               // true once pipeline is initialized
-    bool simulationRan = false;       // true after first iplSimulatorRunReflections completes
+    std::atomic<bool> ready{false};   // true once pipeline is initialized
+    std::atomic<bool> simulationRan{false};  // true after first iplSimulatorRunReflections completes
     bool nodeInitialized = false;
 
     // Reflection gain ramp — smoothly fades in reflection output to prevent
