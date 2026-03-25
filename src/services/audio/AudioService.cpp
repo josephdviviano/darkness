@@ -849,6 +849,12 @@ struct ActiveVoice {
     int objID = 0;                     // Object ID if attached (0 = positional)
     bool playerEmitted = false;        // true for footsteps/landing — skip DSP attenuation
 
+    // Re-propagation throttle: nearby sounds update every frame, distant
+    // sounds every 8-16 frames. Matching the original engine's adaptive
+    // update frequency (FramesUntilUpdate = dist/10, clamped to [1,16]).
+    int propagationCountdown = 0;      // frames until next propagateSound call
+    SoundPropInfo cachedProp{};        // last propagation result (reused between updates)
+
     // Steam Audio simulation source (nullptr if scene not ready or non-spatial)
     IPLSource iplSource = nullptr;
 
@@ -1858,16 +1864,34 @@ void AudioService::loopStep(float deltaTime)
                 // attenuation — the player's own sounds are never wall-occluded.
                 voice->dspNode.skipAttenuation = voice->playerEmitted;
 
-                // Run portal propagation to determine reachability and path
+                // Run portal propagation to determine reachability and path.
+                // Throttled: nearby voices update every frame, distant voices
+                // every 8-16 frames. Matching the original engine's adaptive
+                // update frequency. Uses cached result between updates.
                 SoundPropInfo prop{};
                 bool isCrossRoom = false;
                 if (mPortalRoutingEnabled && !voice->sourceEnded && !voice->playerEmitted) {
-                    auto prT0 = std::chrono::steady_clock::now();
-                    prop = propagateSoundBlended(voice->worldPos);
-                    auto prT1 = std::chrono::steady_clock::now();
-                    float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
-                    sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
-                    sPortalRoutingCount.fetch_add(1, std::memory_order_relaxed);
+                    if (voice->propagationCountdown <= 0) {
+                        auto prT0 = std::chrono::steady_clock::now();
+                        prop = propagateSoundBlended(voice->worldPos);
+                        auto prT1 = std::chrono::steady_clock::now();
+                        float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
+                        sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
+                        sPortalRoutingCount.fetch_add(1, std::memory_order_relaxed);
+
+                        voice->cachedProp = prop;
+
+                        // Set next update interval based on distance.
+                        // 0 = update every frame (very close). 16 = every 16th frame (~267ms).
+                        // Matches original engine: FramesUntilUpdate = dist/10, clamped [0,16].
+                        float dist = prop.reached ? prop.effectiveDistance : 200.0f;
+                        voice->propagationCountdown = std::max(0, std::min(16,
+                            static_cast<int>(dist / 10.0f)));
+                    } else {
+                        // Use cached result from previous propagation
+                        prop = voice->cachedProp;
+                        voice->propagationCountdown--;
+                    }
 
                     // Determine if the voice is in a different room from the listener.
                     // Minimum distance threshold: sounds very close to the listener
