@@ -35,6 +35,7 @@ struct RenderConfig {
     float reflectionDuration = 2.0f;   // max reverb tail in seconds (0.5–4.0)
     int  reflectionThrottle  = 4;      // run reflection sim every Nth frame (1–32)
     float transmissionScale  = 10.0f;  // multiply all material transmission coefficients (1=physical, 10=audible through walls)
+    float absorptionScale    = 1.0f;   // multiply all material absorption coefficients (1=physical, 0.5=more reflective)
 
     // Propagation layer toggles (all on by default — debug use only)
     bool portalRouting       = true;   // portal-graph sound routing through doorways
@@ -151,6 +152,11 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 cfg.transmissionScale = audio["transmission_scale"].as<float>();
                 if (cfg.transmissionScale < 0.1f) cfg.transmissionScale = 0.1f;
                 if (cfg.transmissionScale > 100.0f) cfg.transmissionScale = 100.0f;
+            }
+            if (audio["absorption_scale"]) {
+                cfg.absorptionScale = audio["absorption_scale"].as<float>();
+                if (cfg.absorptionScale < 0.01f) cfg.absorptionScale = 0.01f;
+                if (cfg.absorptionScale > 10.0f) cfg.absorptionScale = 10.0f;
             }
             if (audio["portal_routing"])
                 cfg.portalRouting = audio["portal_routing"].as<bool>();

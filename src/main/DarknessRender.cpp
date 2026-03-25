@@ -1814,6 +1814,7 @@ int main(int argc, char *argv[]) {
         audioSvc->setReflectionDuration(cfg.reflectionDuration);
         audioSvc->setReflectionThrottle(cfg.reflectionThrottle);
         audioSvc->setTransmissionScale(cfg.transmissionScale);
+        audioSvc->setAbsorptionScale(cfg.absorptionScale);
         audioSvc->setPortalRoutingEnabled(cfg.portalRouting);
         audioSvc->setProbePathingEnabled(cfg.probePathing);
         audioSvc->setReflectionsEnabled(cfg.realtimeReflections);
