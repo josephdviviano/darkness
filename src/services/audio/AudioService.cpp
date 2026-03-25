@@ -1649,6 +1649,7 @@ void AudioService::onDBDrop(uint32_t dropmask)
 
     haltAll();
     mBlockingFactors.clear();
+    mListenerRoom = nullptr;
     mRoomTransmission.clear();
     mNextHandle = 0;
 
@@ -1852,9 +1853,36 @@ void AudioService::loopStep(float deltaTime)
             // Use the portal blend's primary room for stable cross-room detection.
             // When blending is active, roomFromPoint may flicker between rooms,
             // but mPortalBlend.roomA is always the primary room for this frame.
-            Room *listenerRoom = mPortalBlend.active
-                ? mPortalBlend.roomA
-                : (mRoomService ? mRoomService->roomFromPoint(mListenerPos) : nullptr);
+            // Update cached listener room incrementally:
+            // 1. If portal blend is active, use the blend's primary room (stable)
+            // 2. Otherwise, check if still inside the cached room (fast, 6 plane tests)
+            // 3. If not, check adjacent rooms via portal adjacency (fast, ~4 rooms)
+            // 4. Only fall back to full brute-force scan if adjacency fails
+            if (mPortalBlend.active) {
+                mListenerRoom = mPortalBlend.roomA;
+            } else if (mListenerRoom && mListenerRoom->isInside(mListenerPos)) {
+                // Still in the same room — no change needed
+            } else if (mListenerRoom) {
+                // Moved out of cached room — check adjacent rooms first
+                bool found = false;
+                for (uint32_t i = 0; i < mListenerRoom->getPortalCount(); ++i) {
+                    RoomPortal *portal = mListenerRoom->getPortal(i);
+                    if (portal && portal->getFarRoom() &&
+                        portal->getFarRoom()->isInside(mListenerPos)) {
+                        mListenerRoom = portal->getFarRoom();
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    // Adjacent rooms didn't match — full scan
+                    mListenerRoom = mRoomService ? mRoomService->roomFromPoint(mListenerPos) : nullptr;
+                }
+            } else {
+                // No cached room — full scan
+                mListenerRoom = mRoomService ? mRoomService->roomFromPoint(mListenerPos) : nullptr;
+            }
+            Room *listenerRoom = mListenerRoom;
 
             for (auto &[handle, voice] : mVoices) {
                 if (!voice->iplSource)

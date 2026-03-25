@@ -643,6 +643,10 @@ private:
     float mListenerYaw = 0.0f;
     float mListenerPitch = 0.0f;
 
+    /// Cached listener room — updated incrementally each frame via portal
+    /// adjacency instead of brute-force roomFromPoint every frame.
+    Room *mListenerRoom = nullptr;
+
     /// Whether the player's feet are currently in water (for footstep override)
     bool mPlayerInWater = false;
 

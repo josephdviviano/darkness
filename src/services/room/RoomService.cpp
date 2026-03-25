@@ -62,12 +62,63 @@ Room *RoomService::findObjRoom(size_t idset, int objID, const Vector3 &pos) {
 
 //------------------------------------------------------
 Room *RoomService::roomFromPoint(const Vector3 &pos) {
+    // Collect all rooms containing this point (OBBs can overlap at portals).
+    // The original Dark Engine handles up to 8 overlapping rooms and uses
+    // portal-plane disambiguation to find the correct one.
+    Room *candidates[8];
+    int numCandidates = 0;
+
     for (const std::unique_ptr<Room> &r : mRooms) {
-        if (r->isInside(pos))
-            return r.get();
+        if (r->isInside(pos)) {
+            if (numCandidates < 8)
+                candidates[numCandidates++] = r.get();
+        }
     }
 
-    return NULL;
+    if (numCandidates == 0)
+        return nullptr;
+    if (numCandidates == 1)
+        return candidates[0];
+
+    // Disambiguate overlapping rooms by portal planes.
+    // For each pair of candidate rooms, find the portal between them and
+    // check which side of the portal plane the point falls on. The room
+    // on the point's side wins; the other is eliminated.
+    // Pairwise elimination: for each pair, find the shared portal and use
+    // its plane to determine which room the point belongs to.
+    for (int i = 0; i < numCandidates; ++i) {
+        if (!candidates[i]) continue;
+        for (int j = i + 1; j < numCandidates; ++j) {
+            if (!candidates[j]) continue;
+
+            Room *roomA = candidates[i];
+            Room *roomB = candidates[j];
+            for (uint32_t p = 0; p < roomA->getPortalCount(); ++p) {
+                RoomPortal *portal = roomA->getPortal(p);
+                if (!portal) continue;
+                if (portal->getFarRoom() == roomB) {
+                    // Portal plane separates the two rooms.
+                    // Positive getDistance = near-room side (roomA's side).
+                    float dist = portal->getPlane().getDistance(pos);
+                    if (dist >= 0.0f) {
+                        candidates[j] = nullptr;  // eliminate roomB
+                    } else {
+                        candidates[i] = nullptr;  // eliminate roomA
+                    }
+                    break;
+                }
+            }
+            // If roomA was eliminated, stop testing it against further rooms
+            if (!candidates[i]) break;
+        }
+    }
+
+    // Return the first surviving candidate
+    for (int i = 0; i < numCandidates; ++i) {
+        if (candidates[i])
+            return candidates[i];
+    }
+    return nullptr;
 }
 
 //------------------------------------------------------
