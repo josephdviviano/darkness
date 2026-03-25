@@ -2938,23 +2938,27 @@ void AudioService::removeVoiceSource(ActiveVoice &voice)
     // Wait for the worker to finish processing all current frames.
     waitForConvolutionWorker();
 
+    // If this source was deferred for add but never actually added to the
+    // simulator, just release it directly. This check must run BEFORE the
+    // sim-busy check — otherwise when sim threads are idle we'd call
+    // iplSourceRemove on a source that was never iplSourceAdd'ed, crashing
+    // inside Steam Audio (pointer authentication failure / SIGSEGV).
+    auto addIt = std::find(mPendingSourceAdds.begin(),
+                           mPendingSourceAdds.end(), voice.iplSource);
+    if (addIt != mPendingSourceAdds.end()) {
+        mPendingSourceAdds.erase(addIt);
+        iplSourceRelease(&voice.iplSource);
+        return;
+    }
+
     // If either background sim thread is running, we can't safely call
     // iplSourceRemove (it races with iplSimulatorRunDirect/Reflections).
     // Defer the removal — queue the IPL source handle for later cleanup.
     if (mDirectSimRunning.load(std::memory_order_acquire) ||
         mReflectionSimRunning.load(std::memory_order_acquire)) {
-        // If this source was deferred for add but never actually added,
-        // just release it directly — no need to defer a removal.
-        auto addIt = std::find(mPendingSourceAdds.begin(),
-                               mPendingSourceAdds.end(), voice.iplSource);
-        if (addIt != mPendingSourceAdds.end()) {
-            mPendingSourceAdds.erase(addIt);
-            iplSourceRelease(&voice.iplSource);
-        } else {
-            mPendingSourceRemovals.push_back(voice.iplSource);
-            voice.iplSource = nullptr;  // detach from voice (we own it now)
-            mSimulatorDirty = true;
-        }
+        mPendingSourceRemovals.push_back(voice.iplSource);
+        voice.iplSource = nullptr;  // detach from voice (we own it now)
+        mSimulatorDirty = true;
         return;
     }
 
