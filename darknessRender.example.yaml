@@ -81,5 +81,47 @@ developer:
 
 
 audio:
-  half_rate_reflections: false
-  max_reflection_voices: 4
+  # Run reflection convolution at 24kHz instead of 48kHz.
+  # Halves per-voice convolution cost. Perceptually transparent.
+  half_rate_reflections: true
+
+  # Maximum voices with per-source reflection convolution (1-64).
+  # Each costs ~1.5ms (half-rate) or ~3ms (full-rate). Tail voices count.
+  max_reflection_voices: 8
+
+  # Ambisonics order for reflection reverb (0 or 1).
+  # 0 = omnidirectional (cheap), 1 = directional (4x cost, more spatial)
+  ambisonics_order: 0
+
+  # Rays per reflection simulation step (background thread, 128-8192)
+  reflection_rays: 4096
+
+  # Bounces per ray (1-8). More bounces = sound reaches further around corners.
+  reflection_bounces: 4
+
+  # Max reverb tail in seconds (0.5-4.0)
+  reflection_duration: 2.0
+
+  # Run reflection simulation every Nth frame (1-32)
+  reflection_throttle: 4
+
+  # Material transmission multiplier (0.1-100).
+  # 1.0 = physically accurate, 10.0 = game-friendly (audible through walls)
+  transmission_scale: 1.0
+
+  # Material absorption multiplier (0.01-10).
+  # 1.0 = physically accurate, 0.5 = more reflective surfaces, richer reverb.
+  # Requires probe re-bake (delete .probes file).
+  absorption_scale: 1.0
+
+  # Diffuse scattering samples per bounce for real-time simulation (16-256)
+  diffuse_samples: 64
+
+  # Diffuse scattering samples per bounce for probe baking (32-512)
+  # Requires probe re-bake.
+  bake_diffuse_samples: 128
+
+  # Propagation layer toggles (all on by default — debug use only)
+  # portal_routing: true
+  # probe_pathing: true
+  # realtime_reflections: true
