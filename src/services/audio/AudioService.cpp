@@ -1279,7 +1279,7 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         simSettings.reflectionType = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
         simSettings.maxNumOcclusionSamples = 32;
         simSettings.maxNumRays = 4096;       // max rays (runtime uses mReflectionNumRays)
-        simSettings.numDiffuseSamples = 32;
+        simSettings.numDiffuseSamples = mDiffuseSamples;
         simSettings.maxDuration = mReflectionDuration;
         simSettings.maxOrder = mAmbisonicsOrder;
         simSettings.maxNumSources = 32;      // voice pool size
@@ -4045,7 +4045,7 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     reflBakeParams.bakeFlags = static_cast<IPLReflectionsBakeFlags>(
         IPL_REFLECTIONSBAKEFLAGS_BAKECONVOLUTION);
     reflBakeParams.numRays = mReflectionNumRays;
-    reflBakeParams.numDiffuseSamples = 32;
+    reflBakeParams.numDiffuseSamples = mBakeDiffuseSamples;
     reflBakeParams.numBounces = mReflectionNumBounces;
     reflBakeParams.simulatedDuration = mReflectionDuration;
     reflBakeParams.savedDuration = mReflectionDuration;  // save full IR
