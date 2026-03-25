@@ -44,6 +44,18 @@ struct RenderConfig {
     bool probePathing        = true;   // baked probe diffraction/pathing (when available)
     bool realtimeReflections = true;   // Steam Audio real-time convolution reverb
 
+    // -- audio DSP chain --
+    bool  dspLimiter    = true;    // soft tanh limiter (prevents digital clipping)
+    float dspLimiterKnee = 0.8f;   // knee threshold (0.5–0.95, higher = later onset)
+    bool  dspCompressor = true;    // master bus compressor (tames transients)
+    float dspCompThreshold = -15.0f; // compressor threshold in dBFS (-30 to 0)
+    float dspCompRatio = 3.0f;     // compression ratio (1.5 to 10)
+    bool  dspEQ         = true;    // low-shelf EQ (adds bass weight)
+    float dspEQFreq     = 120.0f;  // EQ center frequency in Hz (60–500)
+    float dspEQGain     = 3.0f;    // EQ gain in dB (-6 to +6)
+    bool  dspDucking    = false;   // ambient ducking when SFX plays (disabled by default)
+    float dspDuckAmount = 0.5f;    // ambient volume during ducking (0.1–1.0)
+
 
     // -- physics --
     int physicsRate = 60;  // physics timestep Hz: 12 = vintage (12.5Hz), 60 = modern, 120 = ultra
@@ -176,6 +188,46 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 cfg.probePathing = audio["probe_pathing"].as<bool>();
             if (audio["realtime_reflections"])
                 cfg.realtimeReflections = audio["realtime_reflections"].as<bool>();
+
+            // DSP chain settings
+            if (audio["dsp_limiter"])
+                cfg.dspLimiter = audio["dsp_limiter"].as<bool>();
+            if (audio["dsp_limiter_knee"]) {
+                cfg.dspLimiterKnee = audio["dsp_limiter_knee"].as<float>();
+                if (cfg.dspLimiterKnee < 0.5f) cfg.dspLimiterKnee = 0.5f;
+                if (cfg.dspLimiterKnee > 0.95f) cfg.dspLimiterKnee = 0.95f;
+            }
+            if (audio["dsp_compressor"])
+                cfg.dspCompressor = audio["dsp_compressor"].as<bool>();
+            if (audio["dsp_comp_threshold"]) {
+                cfg.dspCompThreshold = audio["dsp_comp_threshold"].as<float>();
+                if (cfg.dspCompThreshold < -30.0f) cfg.dspCompThreshold = -30.0f;
+                if (cfg.dspCompThreshold > 0.0f) cfg.dspCompThreshold = 0.0f;
+            }
+            if (audio["dsp_comp_ratio"]) {
+                cfg.dspCompRatio = audio["dsp_comp_ratio"].as<float>();
+                if (cfg.dspCompRatio < 1.5f) cfg.dspCompRatio = 1.5f;
+                if (cfg.dspCompRatio > 10.0f) cfg.dspCompRatio = 10.0f;
+            }
+            if (audio["dsp_eq"])
+                cfg.dspEQ = audio["dsp_eq"].as<bool>();
+            if (audio["dsp_eq_freq"]) {
+                cfg.dspEQFreq = audio["dsp_eq_freq"].as<float>();
+                if (cfg.dspEQFreq < 60.0f) cfg.dspEQFreq = 60.0f;
+                if (cfg.dspEQFreq > 500.0f) cfg.dspEQFreq = 500.0f;
+            }
+            if (audio["dsp_eq_gain"]) {
+                cfg.dspEQGain = audio["dsp_eq_gain"].as<float>();
+                if (cfg.dspEQGain < -6.0f) cfg.dspEQGain = -6.0f;
+                if (cfg.dspEQGain > 6.0f) cfg.dspEQGain = 6.0f;
+            }
+            if (audio["dsp_ducking"])
+                cfg.dspDucking = audio["dsp_ducking"].as<bool>();
+            if (audio["dsp_duck_amount"]) {
+                cfg.dspDuckAmount = audio["dsp_duck_amount"].as<float>();
+                if (cfg.dspDuckAmount < 0.1f) cfg.dspDuckAmount = 0.1f;
+                if (cfg.dspDuckAmount > 1.0f) cfg.dspDuckAmount = 1.0f;
+            }
         }
 
         // physics section
