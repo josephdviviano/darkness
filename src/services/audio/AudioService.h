@@ -303,6 +303,9 @@ public:
     void setTransmissionScale(float s) { mTransmissionScale = std::max(0.1f, std::min(s, 100.0f)); }
     float getTransmissionScale() const { return mTransmissionScale; }
 
+    void setAbsorptionScale(float s) { mAbsorptionScale = std::max(0.01f, std::min(s, 10.0f)); }
+    float getAbsorptionScale() const { return mAbsorptionScale; }
+
     // Propagation layer toggles (all on by default)
     void setPortalRoutingEnabled(bool v) { mPortalRoutingEnabled = v; }
     bool getPortalRoutingEnabled() const { return mPortalRoutingEnabled; }
@@ -523,6 +526,12 @@ private:
     /// Global multiplier for material transmission coefficients.
     /// 1.0 = physically accurate, 10.0 = audible through walls (game-friendly).
     float mTransmissionScale = 10.0f;
+
+    /// Global multiplier for material absorption coefficients.
+    /// Values < 1.0 make surfaces more reflective (less absorption per bounce).
+    /// Values > 1.0 make surfaces more absorptive (deader rooms).
+    /// 1.0 = physically accurate. 0.5 = half absorption (twice as reflective).
+    float mAbsorptionScale = 1.0f;
 
     /// Propagation layer toggles (debug — all on by default)
     bool mPortalRoutingEnabled = true;   ///< Portal-graph routing through doorways
