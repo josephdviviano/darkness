@@ -363,6 +363,7 @@ struct AudioService::ReflectionMixNode {
     // Uses linked stereo peak envelope follower with configurable attack/release.
     bool compressorEnabled = true;
     float compThresholdDb = -15.0f;  // dBFS threshold
+    float compThresholdLin = 0.178f; // linear threshold (computed from dB in initDSP)
     float compRatio = 3.0f;         // compression ratio (3:1)
     float compAttackCoeff = 0.0f;   // per-sample attack smoothing coefficient
     float compReleaseCoeff = 0.0f;  // per-sample release smoothing coefficient
@@ -406,6 +407,7 @@ struct AudioService::ReflectionMixNode {
         // At threshold, gain reduction = (threshold - threshold) * (1 - 1/ratio) = 0.
         // At 0 dBFS, gain reduction = (0 - threshold) * (1 - 1/ratio).
         // We add half that reduction back as makeup to keep perceived loudness.
+        compThresholdLin = std::pow(10.0f, compThresholdDb / 20.0f);
         compMakeupDb = -compThresholdDb * (1.0f - 1.0f / compRatio) * 0.5f;
         compMakeupLin = std::pow(10.0f, compMakeupDb / 20.0f);
 
@@ -975,7 +977,17 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
     // Stage 2: Compressor — linked stereo peak envelope follower.
     // Tames transients to keep loud sounds (explosions, machinery) from drowning
     // out subtle ambient detail. Attack ~10ms, release ~250ms.
+    //
+    // Gain computation uses the linear domain to avoid per-sample log10/pow
+    // (which caused 4ms mix node spikes). The compressor transfer function
+    // in linear: gain = (threshold / envelope)^(1 - 1/ratio) when envelope
+    // exceeds threshold. This is mathematically equivalent to the dB formulation
+    // but uses a single powf call with a precomputed exponent.
     if (node->compressorEnabled) {
+        float threshLin = node->compThresholdLin;
+        float exponent = 1.0f - 1.0f / node->compRatio;  // e.g., 2/3 for 3:1
+        float makeup = node->compMakeupLin;
+
         for (ma_uint32 i = 0; i < frameCount; ++i) {
             float sL = stereoOut[i * 2];
             float sR = stereoOut[i * 2 + 1];
@@ -989,16 +1001,13 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             else
                 node->compEnvelope += node->compReleaseCoeff * (peak - node->compEnvelope);
 
-            // Compute gain reduction in dB domain
-            float envDb = 20.0f * std::log10(node->compEnvelope + 1e-10f);
-            float gain = 1.0f;
-            if (envDb > node->compThresholdDb) {
-                float reductionDb = (envDb - node->compThresholdDb) * (1.0f - 1.0f / node->compRatio);
-                gain = std::pow(10.0f, -reductionDb / 20.0f);
+            // Gain reduction in linear domain: no log10/pow10 needed.
+            // gain = (threshold / envelope)^exponent when envelope > threshold.
+            float totalGain = makeup;
+            if (node->compEnvelope > threshLin) {
+                totalGain *= std::pow(threshLin / node->compEnvelope, exponent);
             }
 
-            // Apply compression + makeup gain
-            float totalGain = gain * node->compMakeupLin;
             stereoOut[i * 2]     = sL * totalGain;
             stereoOut[i * 2 + 1] = sR * totalGain;
         }
@@ -4122,8 +4131,16 @@ void AudioService::computePortalBlend()
     // and only update the blend weight. This prevents the room assignment from
     // flickering frame-to-frame in narrow hallways where roomFromPoint returns
     // different rooms on each frame.
+    //
+    // Sustain path: only check plane distance, NOT polygon containment.
+    // The initial detection validates isInside() to pick the right portal,
+    // but the sustain path must be lenient — the listener can slide along
+    // a wall near a portal and temporarily leave the polygon projection
+    // while still being in the blend zone. Checking isInside here caused
+    // blend to drop and re-engage every frame, oscillating all attenuation.
+    // Use a wider exit threshold (2x blend radius) for hysteresis.
+    constexpr float kExitRadius = kBlendRadius * 2.0f;
     if (mPortalBlend.active && mPortalBlend.roomA && mPortalBlend.roomB) {
-        // Check if we're still near the same portal by searching both rooms
         RoomPortal *activePortal = nullptr;
         float activeDist = 0.0f;
 
@@ -4132,7 +4149,8 @@ void AudioService::computePortalBlend()
             RoomPortal *p = mPortalBlend.roomA->getPortal(i);
             if (p && p->getFarRoom() == mPortalBlend.roomB) {
                 float d = std::fabs(p->getPlane().getDistance(mListenerPos));
-                if (d < kBlendRadius && p->isInside(mListenerPos)) {
+                // Sustain: only plane distance, no isInside — wider exit zone
+                if (d < kExitRadius) {
                     activePortal = p;
                     activeDist = p->getPlane().getDistance(mListenerPos);
                     break;
@@ -4141,13 +4159,16 @@ void AudioService::computePortalBlend()
         }
 
         if (activePortal) {
-            // Still in the blend zone — update weight only, keep rooms pinned
+            // Still in the blend zone — update weight only, keep rooms pinned.
+            // Use the original blend radius for the weight calculation so the
+            // blend reaches 0/1 at the boundary. Beyond kBlendRadius the weight
+            // clamps to 0 or 1, but the blend stays active until kExitRadius.
             float blend = 0.5f - activeDist / (2.0f * kBlendRadius);
             mPortalBlend.blend = std::max(0.0f, std::min(1.0f, blend));
             return;
         }
 
-        // Left the blend zone — deactivate and fall through to fresh detection
+        // Left the exit zone — deactivate and fall through to fresh detection
         mPortalBlend = {};
     }
 
