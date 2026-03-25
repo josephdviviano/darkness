@@ -312,6 +312,7 @@ struct ConvolutionWorker {
         std::vector<float> mono;          // processed mono data (post-distance-atten, post-decimate)
         IPLReflectionEffect effect = nullptr;
         IPLReflectionEffectParams params{};
+        std::atomic<bool> *effectsReadyPtr = nullptr;  // validity check — points to voice's effectsReady
         int reflFrameSize = 0;
         bool active = false;
     };
@@ -672,6 +673,7 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 }
 
                 slot.effect = node->reflectionEffect;
+                slot.effectsReadyPtr = &node->effectsReady;
                 slot.params = node->reflectionParams;
                 slot.reflFrameSize = node->reflectionFrameSize;
                 slot.active = true;
@@ -2419,6 +2421,12 @@ void AudioService::convolutionWorkerMain()
             auto &slot = cw.staging[readBuf][i];
             if (!slot.active || !slot.effect || slot.params.irSize <= 0)
                 continue;
+            // Check if the voice's effects are still valid — the destructor
+            // sets effectsReady=false before releasing the effect, so this
+            // prevents use-after-free for voices cleaned up between the audio
+            // callback snapshot and the worker's processing.
+            if (slot.effectsReadyPtr && !slot.effectsReadyPtr->load(std::memory_order_acquire))
+                continue;
 
             // Build input buffer from the mono snapshot
             float *monoPtr = slot.mono.data();
@@ -2515,14 +2523,6 @@ void AudioService::convolutionWorkerMain()
 void AudioService::waitForConvolutionWorker()
 {
     if (!mConvolutionWorker) return;
-
-    // Wait for the worker to finish its current frame. After this returns,
-    // the worker is idle and won't access any effect pointers until the
-    // next frameSeq signal. Since voice destruction calls ma_node_uninit
-    // BEFORE this function (blocking until the audio callback finishes),
-    // the audio callback won't snapshot the destroyed voice into staging
-    // again. So the worker's next iteration will have fresh staging data
-    // that doesn't include the destroyed voice.
     while (mConvolutionWorker->processing.load(std::memory_order_acquire))
         std::this_thread::yield();
 }
