@@ -320,6 +320,26 @@ public:
     void setProbePathingEnabled(bool v) { mProbePathingEnabled = v; }
     bool getProbePathingEnabled() const { return mProbePathingEnabled; }
 
+    // ── Master bus DSP chain config (applied when reflection pipeline initializes) ──
+
+    /// Configure the soft limiter (prevents digital clipping)
+    void setDSPLimiterEnabled(bool v) { mDSPLimiterEnabled = v; }
+    void setDSPLimiterKnee(float k) { mDSPLimiterKnee = std::max(0.5f, std::min(k, 0.95f)); }
+
+    /// Configure the master bus compressor (tames transients)
+    void setDSPCompressorEnabled(bool v) { mDSPCompressorEnabled = v; }
+    void setDSPCompThreshold(float t) { mDSPCompThreshold = std::max(-30.0f, std::min(t, 0.0f)); }
+    void setDSPCompRatio(float r) { mDSPCompRatio = std::max(1.5f, std::min(r, 10.0f)); }
+
+    /// Configure the low-shelf EQ (bass boost/cut)
+    void setDSPEQEnabled(bool v) { mDSPEQEnabled = v; }
+    void setDSPEQFreq(float f) { mDSPEQFreq = std::max(60.0f, std::min(f, 500.0f)); }
+    void setDSPEQGain(float g) { mDSPEQGain = std::max(-6.0f, std::min(g, 6.0f)); }
+
+    /// Configure the ambient ducking system (disabled by default)
+    void setDSPDuckingEnabled(bool v) { mDSPDuckingEnabled = v; }
+    void setDSPDuckAmount(float a) { mDSPDuckAmount = std::max(0.1f, std::min(a, 1.0f)); }
+
     /** Bake acoustic probes for the current scene.
      *  Generates probes on a uniform floor grid, bakes pathing visibility,
      *  and saves to the specified file. Blocking call (~10-60 seconds).
@@ -483,6 +503,24 @@ private:
     /// E.g., "stone", "metal", "wood", "carpet", "generic" (default).
     std::vector<std::string> mTextureMaterials;
 
+    // ── Dark Engine room acoustic data (for verification/comparison) ──
+
+    /// Per-room EAX reverb preset index from ROOM_EAX chunk (0-25).
+    /// Maps room ID → EAX preset index. Parsed for verification logging
+    /// against Steam Audio's physics-based reverb. Not used for rendering.
+    std::unordered_map<int32_t, uint32_t> mRoomEAXPresets;
+
+    /// On-disk layout of P$Acoustics property (12 bytes).
+    /// Stores the EAX reverb type, dampening, and height parameters that the
+    /// original Dark Engine passed to Creative's EAX hardware reverb API.
+    #pragma pack(push, 1)
+    struct PropAcoustics {
+        uint32_t eax;        ///< EAX preset index (0-25, see kEAXPresetNames)
+        int32_t dampening;   ///< Room dampening factor
+        int32_t height;      ///< Room height override
+    };
+    #pragma pack(pop)
+
     // ── Steam Audio acoustic scene ──
 
     /// Acoustic scene built from WR world geometry
@@ -559,6 +597,19 @@ private:
     /// Propagation layer toggles (debug — all on by default)
     bool mPortalRoutingEnabled = true;   ///< Portal-graph routing through doorways
     bool mProbePathingEnabled = true;    ///< Baked probe diffraction (when available)
+
+    // ── Master bus DSP chain config (stored until reflection pipeline init) ──
+
+    bool  mDSPLimiterEnabled = true;
+    float mDSPLimiterKnee = 0.8f;
+    bool  mDSPCompressorEnabled = true;
+    float mDSPCompThreshold = -15.0f;
+    float mDSPCompRatio = 3.0f;
+    bool  mDSPEQEnabled = true;
+    float mDSPEQFreq = 120.0f;
+    float mDSPEQGain = 3.0f;
+    bool  mDSPDuckingEnabled = false;
+    float mDSPDuckAmount = 0.5f;
 
     // ── Baked probe pathing ──
 

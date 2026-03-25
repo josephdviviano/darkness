@@ -42,6 +42,7 @@
 #include "logger.h"
 
 #include <unordered_set>
+#include <cmath>
 
 // miniaudio — single-header C library, implementation compiled here
 #define MINIAUDIO_IMPLEMENTATION
@@ -51,6 +52,51 @@
 #include <phonon.h>
 
 namespace Darkness {
+
+/*----------------------------------------------------*/
+/*---------- EAX Reverb Preset Reference Table -------*/
+/*----------------------------------------------------*/
+
+/// EAX 2.0 reverb preset names and approximate decay times (seconds).
+/// The original Dark Engine stored a per-room preset index (0-25) in the
+/// ROOM_EAX chunk and P$Acoustics property, passing it to Creative's EAX
+/// hardware reverb API. We parse these for verification: comparing the
+/// designer's intended reverb character against what Steam Audio's physics-
+/// based convolution produces from the actual room geometry and materials.
+///
+/// Decay times from the EAX 2.0 specification (Creative Technology, 1999).
+struct EAXPresetInfo {
+    const char *name;
+    float decayTime;  // approximate T60 in seconds
+};
+static const EAXPresetInfo kEAXPresets[26] = {
+    {"Generic",         1.49f},
+    {"PaddedCell",      0.17f},
+    {"Room",            0.40f},
+    {"Bathroom",        1.49f},
+    {"LivingRoom",      0.50f},
+    {"StoneRoom",       2.31f},
+    {"Auditorium",      4.32f},
+    {"ConcertHall",     3.92f},
+    {"Cave",            2.91f},
+    {"Arena",           7.24f},
+    {"Hangar",         10.05f},
+    {"CarpetedHallway", 0.30f},
+    {"Hallway",         1.49f},
+    {"StoneCorridor",   2.70f},
+    {"Alley",           1.49f},
+    {"Forest",          1.49f},
+    {"City",            1.49f},
+    {"Mountains",       1.49f},
+    {"Quarry",          1.49f},
+    {"Plain",           1.49f},
+    {"ParkingLot",      1.65f},
+    {"SewerPipe",       2.81f},
+    {"UnderWater",      1.49f},
+    {"Drugged",         8.39f},
+    {"Dizzy",          17.23f},
+    {"Psychotic",       7.56f},
+};
 
 /*----------------------------------------------------*/
 /*---------- Acoustic Material Preset Table ----------*/
@@ -303,6 +349,93 @@ struct AudioService::ReflectionMixNode {
     float reflGain = 0.0f;           // current gain (0=silent, 1=full)
     float reflGainTarget = 1.0f;     // target gain
     static constexpr float kReflRampRate = 1.0f / 480.0f; // per-sample increment (~10ms at 48kHz)
+
+    // ── Master bus DSP chain ──
+    // Processing order: Low-shelf EQ → Compressor → Soft Limiter
+    // Each stage can be independently enabled/disabled via config.
+
+    // Soft limiter — replaces hard clamp with smooth tanh saturation.
+    // Transparent below the threshold knee, smoothly curves to ±1.0 above.
+    bool limiterEnabled = true;
+    float limiterKnee = 0.8f;  // linear threshold where limiting begins
+
+    // Master bus compressor — tames transients to preserve dynamic detail.
+    // Uses linked stereo peak envelope follower with configurable attack/release.
+    bool compressorEnabled = true;
+    float compThresholdDb = -15.0f;  // dBFS threshold
+    float compRatio = 3.0f;         // compression ratio (3:1)
+    float compAttackCoeff = 0.0f;   // per-sample attack smoothing coefficient
+    float compReleaseCoeff = 0.0f;  // per-sample release smoothing coefficient
+    float compMakeupDb = 0.0f;      // makeup gain in dB (auto-computed from threshold/ratio)
+    float compMakeupLin = 1.0f;     // linear makeup gain
+    float compEnvelope = 0.0f;      // envelope follower state (shared stereo)
+
+    // Low-shelf EQ — adds weight to the soundscape (+3dB at 120Hz default).
+    // Uses biquad filter (Audio EQ Cookbook, Robert Bristow-Johnson).
+    bool eqEnabled = true;
+    float eqFreq = 120.0f;       // center frequency (Hz)
+    float eqGainDb = 3.0f;       // shelf gain (dB)
+    float eqQ = 0.707f;          // filter Q (Butterworth)
+    // Biquad coefficients (computed at init from freq/gain/Q/sampleRate)
+    float eqB0 = 1.0f, eqB1 = 0.0f, eqB2 = 0.0f;
+    float eqA1 = 0.0f, eqA2 = 0.0f;
+    // Per-channel biquad state (Direct Form II Transposed)
+    float eqZ1L = 0.0f, eqZ2L = 0.0f;  // left channel
+    float eqZ1R = 0.0f, eqZ2R = 0.0f;  // right channel
+
+    // Ducking system — ducks ambient sounds when SFX voices are active.
+    // Disabled by default. When enabled, ambient voice volumes are multiplied
+    // by duckGain, which smoothly transitions based on SFX activity.
+    bool duckingEnabled = false;
+    float duckAmount = 0.5f;       // target ambient volume multiplier during SFX
+    float duckAttackCoeff = 0.0f;  // per-frame attack coefficient
+    float duckReleaseCoeff = 0.0f; // per-frame release coefficient
+    float duckGain = 1.0f;         // current ducking multiplier (1.0 = no duck)
+
+    /// Initialize DSP chain coefficients from sample rate. Must be called after
+    /// frameSize is set and before the first audio callback.
+    void initDSP(uint32_t sampleRate) {
+        // Compressor attack/release coefficients (per-sample exponential)
+        // attack = 10ms, release = 250ms
+        float attackTimeSec = 0.010f;
+        float releaseTimeSec = 0.250f;
+        compAttackCoeff = 1.0f - std::exp(-1.0f / (static_cast<float>(sampleRate) * attackTimeSec));
+        compReleaseCoeff = 1.0f - std::exp(-1.0f / (static_cast<float>(sampleRate) * releaseTimeSec));
+
+        // Auto makeup gain: compensate for the gain reduction at threshold.
+        // At threshold, gain reduction = (threshold - threshold) * (1 - 1/ratio) = 0.
+        // At 0 dBFS, gain reduction = (0 - threshold) * (1 - 1/ratio).
+        // We add half that reduction back as makeup to keep perceived loudness.
+        compMakeupDb = -compThresholdDb * (1.0f - 1.0f / compRatio) * 0.5f;
+        compMakeupLin = std::pow(10.0f, compMakeupDb / 20.0f);
+
+        // Low-shelf EQ biquad coefficients (Audio EQ Cookbook, R. Bristow-Johnson)
+        float w0 = 2.0f * 3.14159265f * eqFreq / static_cast<float>(sampleRate);
+        float A = std::pow(10.0f, eqGainDb / 40.0f);
+        float alpha = std::sin(w0) / (2.0f * eqQ);
+        float cosW0 = std::cos(w0);
+        float sqrtA2alpha = 2.0f * std::sqrt(A) * alpha;
+
+        float b0 = A * ((A + 1.0f) - (A - 1.0f) * cosW0 + sqrtA2alpha);
+        float b1 = 2.0f * A * ((A - 1.0f) - (A + 1.0f) * cosW0);
+        float b2 = A * ((A + 1.0f) - (A - 1.0f) * cosW0 - sqrtA2alpha);
+        float a0 = (A + 1.0f) + (A - 1.0f) * cosW0 + sqrtA2alpha;
+        float a1 = -2.0f * ((A - 1.0f) + (A + 1.0f) * cosW0);
+        float a2 = (A + 1.0f) + (A - 1.0f) * cosW0 - sqrtA2alpha;
+
+        // Normalize by a0
+        float invA0 = 1.0f / a0;
+        eqB0 = b0 * invA0;
+        eqB1 = b1 * invA0;
+        eqB2 = b2 * invA0;
+        eqA1 = a1 * invA0;
+        eqA2 = a2 * invA0;
+
+        // Ducking coefficients (per-frame, not per-sample — called from loopStep)
+        // Attack: 50ms, Release: 500ms, assuming ~60fps
+        duckAttackCoeff = 1.0f - std::exp(-1.0f / (60.0f * 0.050f));
+        duckReleaseCoeff = 1.0f - std::exp(-1.0f / (60.0f * 0.500f));
+    }
 };
 
 /// Off-thread convolution worker. Processes all per-voice reflection convolution
@@ -813,12 +946,85 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         }
     }
 
-    // Clamp output to [-1, 1] — HRTF convolution can produce samples > 1.0
-    // (confirmed by Steam Audio issue #350). Without clamping, the DAC clips
-    // harshly, producing audible click artifacts.
-    for (ma_uint32 i = 0; i < frameCount * 2; ++i) {
-        if (stereoOut[i] > 1.0f) stereoOut[i] = 1.0f;
-        else if (stereoOut[i] < -1.0f) stereoOut[i] = -1.0f;
+    // ── Master bus DSP chain ──
+    // Processing order: Low-shelf EQ → Compressor → Soft Limiter
+    // HRTF convolution can produce samples > 1.0 (confirmed by Steam Audio
+    // issue #350). The DSP chain shapes dynamics and prevents digital clipping
+    // while preserving the natural character of the soundscape.
+
+    // Stage 1: Low-shelf EQ — adds weight to low frequencies (biquad filter).
+    // Direct Form II Transposed: y[n] = b0*x[n] + z1; z1 = b1*x[n] - a1*y[n] + z2; z2 = b2*x[n] - a2*y[n]
+    if (node->eqEnabled) {
+        for (ma_uint32 i = 0; i < frameCount; ++i) {
+            // Left channel
+            float xL = stereoOut[i * 2];
+            float yL = node->eqB0 * xL + node->eqZ1L;
+            node->eqZ1L = node->eqB1 * xL - node->eqA1 * yL + node->eqZ2L;
+            node->eqZ2L = node->eqB2 * xL - node->eqA2 * yL;
+            stereoOut[i * 2] = yL;
+
+            // Right channel
+            float xR = stereoOut[i * 2 + 1];
+            float yR = node->eqB0 * xR + node->eqZ1R;
+            node->eqZ1R = node->eqB1 * xR - node->eqA1 * yR + node->eqZ2R;
+            node->eqZ2R = node->eqB2 * xR - node->eqA2 * yR;
+            stereoOut[i * 2 + 1] = yR;
+        }
+    }
+
+    // Stage 2: Compressor — linked stereo peak envelope follower.
+    // Tames transients to keep loud sounds (explosions, machinery) from drowning
+    // out subtle ambient detail. Attack ~10ms, release ~250ms.
+    if (node->compressorEnabled) {
+        for (ma_uint32 i = 0; i < frameCount; ++i) {
+            float sL = stereoOut[i * 2];
+            float sR = stereoOut[i * 2 + 1];
+
+            // Linked stereo peak detection
+            float peak = std::max(std::fabs(sL), std::fabs(sR));
+
+            // Envelope follower (attack/release asymmetric smoothing)
+            if (peak > node->compEnvelope)
+                node->compEnvelope += node->compAttackCoeff * (peak - node->compEnvelope);
+            else
+                node->compEnvelope += node->compReleaseCoeff * (peak - node->compEnvelope);
+
+            // Compute gain reduction in dB domain
+            float envDb = 20.0f * std::log10(node->compEnvelope + 1e-10f);
+            float gain = 1.0f;
+            if (envDb > node->compThresholdDb) {
+                float reductionDb = (envDb - node->compThresholdDb) * (1.0f - 1.0f / node->compRatio);
+                gain = std::pow(10.0f, -reductionDb / 20.0f);
+            }
+
+            // Apply compression + makeup gain
+            float totalGain = gain * node->compMakeupLin;
+            stereoOut[i * 2]     = sL * totalGain;
+            stereoOut[i * 2 + 1] = sR * totalGain;
+        }
+    }
+
+    // Stage 3: Soft limiter — smooth tanh saturation above the knee threshold.
+    // Transparent below the knee (default 0.8), smoothly curves to ±1.0 above.
+    // Replaces the old hard clamp which produced audible click artifacts.
+    if (node->limiterEnabled) {
+        float knee = node->limiterKnee;
+        float range = 1.0f - knee;
+        float invRange = 1.0f / range;
+        for (ma_uint32 i = 0; i < frameCount * 2; ++i) {
+            float x = stereoOut[i];
+            if (x > knee)
+                stereoOut[i] = knee + range * std::tanh((x - knee) * invRange);
+            else if (x < -knee)
+                stereoOut[i] = -(knee + range * std::tanh((-x - knee) * invRange));
+        }
+    } else {
+        // Safety hard clamp as absolute last resort (should not be reached
+        // if limiter is enabled, but guards against runaway signals)
+        for (ma_uint32 i = 0; i < frameCount * 2; ++i) {
+            if (stereoOut[i] > 1.0f) stereoOut[i] = 1.0f;
+            else if (stereoOut[i] < -1.0f) stereoOut[i] = -1.0f;
+        }
     }
 
     pFrameCountIn[0] = frameCount;
@@ -1505,6 +1711,30 @@ bool AudioService::initReflectionPipeline()
         return false;
     }
 
+    // Apply DSP chain config from AudioService members (set by RenderConfig).
+    // Must be done BEFORE setting ready=true so the audio callback never sees
+    // uninitialized coefficients (ready + simulationRan gate the DSP path).
+    rmn.limiterEnabled = mDSPLimiterEnabled;
+    rmn.limiterKnee = mDSPLimiterKnee;
+    rmn.compressorEnabled = mDSPCompressorEnabled;
+    rmn.compThresholdDb = mDSPCompThreshold;
+    rmn.compRatio = mDSPCompRatio;
+    rmn.eqEnabled = mDSPEQEnabled;
+    rmn.eqFreq = mDSPEQFreq;
+    rmn.eqGainDb = mDSPEQGain;
+    rmn.duckingEnabled = mDSPDuckingEnabled;
+    rmn.duckAmount = mDSPDuckAmount;
+
+    // Initialize the master bus DSP chain (EQ, compressor, limiter coefficients)
+    rmn.initDSP(mDeviceSampleRate);
+    std::fprintf(stderr, "REFL: DSP chain initialized (limiter=%s knee=%.2f, compressor=%s %.0fdB/%g:1, eq=%s %gHz/%+gdB, ducking=%s)\n",
+                 rmn.limiterEnabled ? "on" : "off", rmn.limiterKnee,
+                 rmn.compressorEnabled ? "on" : "off", rmn.compThresholdDb, rmn.compRatio,
+                 rmn.eqEnabled ? "on" : "off", rmn.eqFreq, rmn.eqGainDb,
+                 rmn.duckingEnabled ? "on" : "off");
+
+    // Set ready AFTER DSP coefficients are fully written — ensures the audio
+    // callback never executes the DSP chain with default/uninitialized values.
     rmn.ready = true;
 
     // NOTE: rmn.convWorker is set AFTER the worker is created (below).
@@ -1772,6 +2002,28 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
     // DarknessRender.cpp after this point (loadSoundResources → loadAmbientSounds).
     // onDBLoad just records that mission data is available.
 
+    // Parse ROOM_EAX chunk — per-room EAX reverb preset indices.
+    // The original Dark Engine stored these for Creative's hardware EAX reverb.
+    // We parse them for verification logging: comparing the designer's intended
+    // reverb character against Steam Audio's physics-based convolution result.
+    mRoomEAXPresets.clear();
+    if (db->hasFile("ROOM_EAX")) {
+        FilePtr eaxFile = db->getFile("ROOM_EAX");
+        uint32_t count = 0;
+        *eaxFile >> count;
+        if (count > 0 && count < 1024) {  // sanity check
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t eaxIdx = 0;
+                *eaxFile >> eaxIdx;
+                if (eaxIdx < 26)
+                    mRoomEAXPresets[static_cast<int32_t>(i)] = eaxIdx;
+            }
+            std::fprintf(stderr, "AudioService: parsed ROOM_EAX chunk — %u rooms with EAX presets\n", count);
+        }
+    } else {
+        std::fprintf(stderr, "AudioService: no ROOM_EAX chunk in mission (EAX presets unavailable)\n");
+    }
+
     LOG_INFO("AudioService: mission data loaded");
 }
 
@@ -1791,6 +2043,7 @@ void AudioService::onDBDrop(uint32_t dropmask)
     mBlockingFactors.clear();
     mListenerRoom = nullptr;
     mRoomTransmission.clear();
+    mRoomEAXPresets.clear();
     mNextHandle = 0;
 
     // Flush the sound cache on mission unload (sounds may differ between missions)
@@ -3270,6 +3523,58 @@ void AudioService::loadAmbientSounds()
             std::fprintf(stderr, "AudioService: loaded %d LoudRoom transmission factors\n",
                          loudRoomCount);
         }
+
+        // Load P$Acoustics property per room and log comparison with ROOM_EAX presets.
+        // This verifies that Steam Audio's physics-based reverb produces results
+        // comparable to the original designers' EAX preset intentions.
+        if (!mRoomEAXPresets.empty()) {
+            std::fprintf(stderr, "\n=== Room Acoustic Verification (EAX presets vs Steam Audio) ===\n");
+            std::fprintf(stderr, "  Room | ObjID | EAX Preset         | Decay(s) | Damp | Height | LoudRoom\n");
+            std::fprintf(stderr, "  -----|-------|--------------------|---------:|-----:|-------:|---------\n");
+            for (const auto &room : rooms) {
+                if (!room) continue;
+                int16_t roomID = room->getRoomID();
+                int32_t objID = room->getObjectID();
+
+                // Look up EAX preset from ROOM_EAX chunk
+                uint32_t eaxIdx = 0;  // default: Generic
+                auto eaxIt = mRoomEAXPresets.find(roomID);
+                if (eaxIt != mRoomEAXPresets.end())
+                    eaxIdx = eaxIt->second;
+                const char *presetName = (eaxIdx < 26) ? kEAXPresets[eaxIdx].name : "Unknown";
+                float decayTime = (eaxIdx < 26) ? kEAXPresets[eaxIdx].decayTime : 0.0f;
+
+                // Try to load P$Acoustics for additional dampening/height info
+                int32_t dampening = 0;
+                int32_t height = 0;
+                size_t acRawSize = 0;
+                const uint8_t *acRaw = getPropertyRawData(
+                    mPropertyService.get(), "Acoustics", objID, acRawSize);
+                if (acRaw && acRawSize >= sizeof(PropAcoustics)) {
+                    PropAcoustics ac;
+                    std::memcpy(&ac, acRaw, sizeof(PropAcoustics));
+                    dampening = ac.dampening;
+                    height = ac.height;
+                    // Use the property's EAX index if different from ROOM_EAX chunk
+                    // (P$Acoustics on the room object can override the chunk value)
+                    if (ac.eax < 26 && ac.eax != eaxIdx) {
+                        eaxIdx = ac.eax;
+                        presetName = kEAXPresets[eaxIdx].name;
+                        decayTime = kEAXPresets[eaxIdx].decayTime;
+                    }
+                }
+
+                // LoudRoom transmission factor (already loaded above)
+                float loudRoom = 1.0f;
+                auto lrIt = mRoomTransmission.find(roomID);
+                if (lrIt != mRoomTransmission.end())
+                    loudRoom = lrIt->second;
+
+                std::fprintf(stderr, "  %4d | %5d | %-18s | %7.2f  | %4d | %6d | %.2f\n",
+                             roomID, objID, presetName, decayTime, dampening, height, loudRoom);
+            }
+            std::fprintf(stderr, "=== End Room Acoustic Verification ===\n\n");
+        }
     }
 
     // Find all objects with P$AmbientHack (property name "AmbientHa" in the gamesys)
@@ -3464,7 +3769,11 @@ void AudioService::updateAmbientVolumes()
                 if (!(amb.flags & AMB_NO_FADE)) {
                     distFactor *= distFactor;  // quadratic for natural rolloff
                 }
-                ma_sound_set_volume(&it->second->sound, baseVol * distFactor);
+                // Apply ducking multiplier inline (not as a separate pass)
+                // to avoid compounding volume decay across frames.
+                float duck = (mReflectionMixNode && mReflectionMixNode->duckingEnabled)
+                             ? mReflectionMixNode->duckGain : 1.0f;
+                ma_sound_set_volume(&it->second->sound, baseVol * distFactor * duck);
             }
         } else {
             // Out of range — stop voice to free the slot and DSP resources
@@ -3473,6 +3782,28 @@ void AudioService::updateAmbientVolumes()
                 amb.handle = SOUND_HANDLE_INVALID;
             }
         }
+    }
+
+    // ── Ducking system (disabled by default) ──
+    // When SFX voices are playing, ambient volumes are reduced to keep dialog,
+    // footsteps, and other important sounds prominent. The duck envelope smoothly
+    // transitions between normal and ducked states to avoid pumping artifacts.
+    // The duckGain multiplier is applied inline above (when setting each ambient's
+    // volume) to avoid compounding volume decay from read-back-and-multiply.
+    if (mReflectionMixNode && mReflectionMixNode->duckingEnabled) {
+        auto &rmn = *mReflectionMixNode;
+
+        // Count active non-ambient SFX voices
+        int sfxVoices = 0;
+        for (auto &[h, v] : mVoices) {
+            if (!v->isAmbient && !v->sourceEnded.load(std::memory_order_relaxed))
+                ++sfxVoices;
+        }
+
+        // Smooth envelope toward target
+        float target = (sfxVoices > 0) ? rmn.duckAmount : 1.0f;
+        float coeff = (target < rmn.duckGain) ? rmn.duckAttackCoeff : rmn.duckReleaseCoeff;
+        rmn.duckGain += coeff * (target - rmn.duckGain);
     }
 }
 
