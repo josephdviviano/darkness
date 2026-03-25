@@ -125,3 +125,28 @@ audio:
   # portal_routing: true
   # probe_pathing: true
   # realtime_reflections: true
+
+  # -- Master bus DSP chain --
+  # Processing order: Low-shelf EQ → Compressor → Soft Limiter
+
+  # Soft limiter — replaces hard digital clipping with smooth tanh saturation.
+  # Transparent below the knee, smoothly curves to ±1.0 above.
+  dsp_limiter: true
+  dsp_limiter_knee: 0.8    # onset threshold (0.5–0.95, higher = later/subtler)
+
+  # Master bus compressor — tames transients to preserve dynamic detail.
+  # Keeps explosions and machinery from drowning out subtle ambients.
+  dsp_compressor: true
+  dsp_comp_threshold: -15   # dBFS threshold (-30 to 0)
+  dsp_comp_ratio: 3.0       # compression ratio (1.5 to 10)
+
+  # Low-shelf EQ — adds physical weight to the low end of the soundscape.
+  # Enhances footsteps, distant machinery, and stone resonance.
+  dsp_eq: true
+  dsp_eq_freq: 120          # center frequency in Hz (60–500)
+  dsp_eq_gain: 3.0          # shelf gain in dB (-6 to +6)
+
+  # Ambient ducking — reduces ambient volumes when SFX voices play.
+  # Keeps dialog, footsteps, and alerts prominent. Disabled by default.
+  dsp_ducking: false
+  dsp_duck_amount: 0.5      # ambient volume during ducking (0.1–1.0)

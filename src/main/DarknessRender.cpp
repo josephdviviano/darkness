@@ -1821,6 +1821,18 @@ int main(int argc, char *argv[]) {
         audioSvc->setProbePathingEnabled(cfg.probePathing);
         audioSvc->setReflectionsEnabled(cfg.realtimeReflections);
 
+        // DSP chain config (soft limiter, compressor, EQ, ducking)
+        audioSvc->setDSPLimiterEnabled(cfg.dspLimiter);
+        audioSvc->setDSPLimiterKnee(cfg.dspLimiterKnee);
+        audioSvc->setDSPCompressorEnabled(cfg.dspCompressor);
+        audioSvc->setDSPCompThreshold(cfg.dspCompThreshold);
+        audioSvc->setDSPCompRatio(cfg.dspCompRatio);
+        audioSvc->setDSPEQEnabled(cfg.dspEQ);
+        audioSvc->setDSPEQFreq(cfg.dspEQFreq);
+        audioSvc->setDSPEQGain(cfg.dspEQGain);
+        audioSvc->setDSPDuckingEnabled(cfg.dspDucking);
+        audioSvc->setDSPDuckAmount(cfg.dspDuckAmount);
+
         if (!audioSvc->buildAcousticScene(fullScene)) {
             std::fprintf(stderr, "WARNING: failed to build acoustic scene\n"
                                  "         Steam Audio spatialization disabled.\n");
