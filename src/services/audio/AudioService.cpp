@@ -848,6 +848,7 @@ struct ActiveVoice {
     int priority = 128;                // 0-255, higher = more important
     int objID = 0;                     // Object ID if attached (0 = positional)
     bool playerEmitted = false;        // true for footsteps/landing — skip DSP attenuation
+    bool isAmbient = false;            // true for ambient voices — distance handled by ambient system
 
     // Re-propagation throttle: nearby sounds update every frame, distant
     // sounds every 8-16 frames. Matching the original engine's adaptive
@@ -2070,11 +2071,28 @@ void AudioService::loopStep(float deltaTime)
                 // while waiting for the sim to catch up.
                 if (outputs.direct.distanceAttenuation > 0.0f) {
                     voice->dspNode.directParams = outputs.direct;
-                    voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
-                        IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
-                        IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
-                        IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
-                        IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+
+                    // For ambient voices, SKIP distance attenuation from Steam Audio.
+                    // The ambient system handles distance via ma_sound_set_volume
+                    // with a designer-controlled radius curve. Steam Audio still
+                    // provides occlusion, transmission, and air absorption —
+                    // so walls block the sound correctly without double-dipping
+                    // on distance.
+                    if (voice->isAmbient) {
+                        voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
+                            IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
+                            IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
+                            IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+                        // Override distanceAttenuation to 1.0 so the reflection
+                        // convolution input isn't distance-scaled either
+                        voice->dspNode.directParams.distanceAttenuation = 1.0f;
+                    } else {
+                        voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
+                            IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
+                            IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
+                            IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
+                            IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+                    }
                     voice->dspNode.directParams.transmissionType =
                         IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
                 } else {
@@ -3077,10 +3095,18 @@ void AudioService::updateAmbientVolumes()
                                                 amb.objID, 0.0f);
                     }
                 }
+                // Mark as ambient so the DSP skips distance attenuation
+                // (the ambient system handles distance via ma_sound_set_volume)
+                if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle)) {
+                    mVoices[amb.handle]->isAmbient = true;
+                }
                 // Fallback: try loading schema name as a raw sound
                 if (amb.handle == SOUND_HANDLE_INVALID) {
                     amb.handle = startVoice(amb.schemaName, amb.schemaName, amb.position,
                                             64, isLooping, amb.objID, 0.0f);
+                    if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle)) {
+                        mVoices[amb.handle]->isAmbient = true;
+                    }
                 }
             }
 
@@ -3226,11 +3252,9 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
     //   run   (~15 u/s)   → loud (1.0)
     float speedFactor = std::clamp(speed / 15.0f, 0.1f, 1.0f);
     float baseVol = schemaVolumeToLinear(schema->playParams.volume);
-    // Boost footstep volume to compensate for Steam Audio's distance
-    // attenuation at close range (source at feet ~3 units from listener).
-    // Without this, the DSP callback's directAtten multiplies the already
-    // speed-scaled volume, making footsteps sound too distant.
-    float finalVol = baseVol * speedFactor * 2.0f;
+    // Player-emitted sounds have skipAttenuation=true, so no Steam Audio
+    // distance/occlusion is applied. Volume is purely speed-dependent.
+    float finalVol = baseVol * speedFactor;
 
     // Select sample and play
     if (schema->samples.empty())
