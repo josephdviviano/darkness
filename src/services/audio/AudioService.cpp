@@ -2019,10 +2019,9 @@ void AudioService::bootstrapFinished()
     bool saOk = initSteamAudio();
     mAudioReady = maOk && saOk;
 
-    // Start the persistent simulation worker threads (separate for direct + reflections)
+    // Start the reflection simulation worker thread (background, latency-tolerant).
+    // Direct sim runs synchronously on the main thread for same-frame occlusion.
     if (mAudioReady) {
-        mDirectSimShutdown.store(false, std::memory_order_relaxed);
-        mDirectSimThread = std::thread(&AudioService::directSimWorkerMain, this);
         mReflectionSimShutdown.store(false, std::memory_order_relaxed);
         mReflectionSimThread = std::thread(&AudioService::reflectionSimWorkerMain, this);
     }
@@ -2048,13 +2047,9 @@ void AudioService::shutdown()
     mSoundCache.reset();
     mSoundLoader.reset();
 
-    // Shut down both simulation worker threads before destroying the scene
-    mDirectSimShutdown.store(true, std::memory_order_release);
-    mDirectSimCV.notify_one();
+    // Shut down the reflection simulation worker thread before destroying the scene
     mReflectionSimShutdown.store(true, std::memory_order_release);
     mReflectionSimCV.notify_one();
-    if (mDirectSimThread.joinable())
-        mDirectSimThread.join();
     if (mReflectionSimThread.joinable())
         mReflectionSimThread.join();
 
@@ -2194,22 +2189,19 @@ void AudioService::loopStep(float deltaTime)
     // Compute portal blend state for this frame (once, reused by all propagation calls)
     computePortalBlend();
 
-    // Source mutations (add/remove/commit) must not happen while the background
-    // simulation thread is running — iplSimulatorRunDirect/Reflections holds
-    // internal pointers to committed sources. Instead of BLOCKING the main thread
-    // (which caused 200+ms stalls), we DEFER mutations until the sim finishes.
-    // Source mutations (add/remove/commit) require the direct sim thread to be idle.
-    // The reflection sim can run concurrently with source input updates because
+    // Update ambient volumes early so newly created ambient voices exist before
+    // the simulation runs. This ensures same-frame occlusion for new ambients —
+    // voices created after the sim would miss occlusion for their first frame.
+    updateAmbientVolumes();
+
+    // Source mutations (add/remove/commit) can race with the background reflection
+    // sim thread, so we defer them until it's idle. Direct sim runs synchronously
+    // on the main thread, so it's never concurrent with mutations.
     // Steam Audio uses double-buffering: setInputs writes to the staging buffer,
     // while runReflections reads from the committed (active) buffer.
-    // Only commit() copies staging → active, so commit must wait for both threads.
-    bool directBusy = mDirectSimRunning.load(std::memory_order_acquire);
+    // Only commit() copies staging → active, so commit must wait for reflections.
     bool reflBusy = mReflectionSimRunning.load(std::memory_order_acquire);
-
-    // Source mutations (add/remove) need both sim tasks idle because they modify
-    // the source list that both sim tasks reference.
-    // Commit (staging→active copy) needs both idle because RunReflections reads active.
-    bool canMutate = !directBusy && !reflBusy;
+    bool canMutate = !reflBusy;
 
     if (canMutate) {
 
@@ -2232,11 +2224,9 @@ void AudioService::loopStep(float deltaTime)
         }
     }
 
-    // Commit can happen whenever BOTH threads are idle — the most common window
-    // is right after the direct sim finishes (every frame) and before the next
-    // reflection sim launches (every Nth frame). If the reflection sim takes
-    // longer than the throttle interval, commits are deferred, but the fallback
-    // attenuation above ensures voices are never silent while waiting.
+    // Commit copies staging → active buffer. Must wait for reflection sim to
+    // be idle since it reads from the active buffer. Direct sim runs inline
+    // (after commit), so no conflict there.
     if (canMutate && mSimulatorDirty && mIplSimulator) {
         auto ct0 = std::chrono::steady_clock::now();
         iplSimulatorCommit(mIplSimulator);
@@ -2284,7 +2274,7 @@ void AudioService::loopStep(float deltaTime)
         std::vector<VoiceDist> reflCandidates;
         std::unordered_set<SoundHandle> reflCandidateSet;
 
-        if (!directBusy) {
+        {
             // Step 1: Set listener position for the simulator
             IPLSimulationSharedInputs sharedInputs{};
             sharedInputs.listener = listenerCoord;
@@ -2496,24 +2486,29 @@ void AudioService::loopStep(float deltaTime)
                     &inputs);
             }
 
-            // Step 3: Signal the persistent sim worker thread.
-            // Direct sim runs every frame, reflection sim runs throttled.
-            bool wantDirect = true;
+            // Step 3: Run direct sim and signal reflection thread.
+            // Direct sim runs synchronously every frame.
+            // Reflection sim runs on background thread, throttled.
             bool wantReflections = mReflectionsEnabled && mIplReflectionMixer
                 && !reflBusy
                 && (++mReflectionFrameCounter >= mReflectionThrottle);
             if (wantReflections)
                 mReflectionFrameCounter = 0;
 
-            // Signal direct sim (runs every frame, latency-critical)
-            mDirectSimRunning.store(true, std::memory_order_release);
+            // Run direct sim synchronously on the main thread (2-5ms).
+            // Same-frame results: every voice (including newly created ones)
+            // gets real occlusion/distance/air absorption before the audio
+            // callback sees them. No fallback path needed.
             {
-                std::lock_guard<std::mutex> lock(mDirectSimMutex);
-                mDirectSimWant = true;
+                auto dt0 = std::chrono::steady_clock::now();
+                iplSimulatorRunDirect(mIplSimulator);
+                auto dt1 = std::chrono::steady_clock::now();
+                float dMs = std::chrono::duration<float, std::milli>(dt1 - dt0).count();
+                float prevD = sDirectSimPeakMs.load(std::memory_order_relaxed);
+                if (dMs > prevD) sDirectSimPeakMs.store(dMs, std::memory_order_relaxed);
             }
-            mDirectSimCV.notify_one();
 
-            // Signal reflection sim (throttled, latency-tolerant, separate thread)
+            // Signal reflection sim (throttled, latency-tolerant, background thread)
             if (wantReflections) {
                 mReflectionSimRunning.store(true, std::memory_order_release);
                 {
@@ -2525,11 +2520,9 @@ void AudioService::loopStep(float deltaTime)
         }
 
         // Step 4: Read back simulation results and feed to DSP nodes.
-        // Results are from the previous frame's simulation (1-frame latency) since
-        // we moved both direct and reflection sim to the background thread.
-        // This is imperceptible for both attenuation and reverb changes.
-        // Steam Audio's triple buffer ensures iplSourceGetOutputs returns the
-        // latest completed results without blocking.
+        // Direct sim results are same-frame (ran synchronously above).
+        // Reflection results are from the previous frame (background thread),
+        // which is imperceptible since reverb tails change slowly.
 
         // reflCandidates and reflCandidateSet were already computed in Step 2a
         // (before iplSourceSetInputs) so non-top-N voices could be set to baked mode.
@@ -2559,49 +2552,32 @@ void AudioService::loopStep(float deltaTime)
             iplSourceGetOutputs(voice->iplSource, getFlags, &outputs);
 
             if (voice->dspNode.effectsReady) {
-                // Copy simulation outputs to DSP node params. If the simulator
-                // hasn't processed this source yet (zero attenuation = uncommitted),
-                // compute a distance-based fallback so the voice is never silent
-                // while waiting for the sim to catch up.
-                if (outputs.direct.distanceAttenuation > 0.0f) {
-                    voice->dspNode.directParams = outputs.direct;
+                // Copy simulation outputs to DSP node params.
+                // Direct sim ran synchronously above, so results are same-frame
+                // for all voices including newly created ones.
+                voice->dspNode.directParams = outputs.direct;
 
-                    // For ambient voices, SKIP distance attenuation from Steam Audio.
-                    // The ambient system handles distance via ma_sound_set_volume
-                    // with a designer-controlled radius curve. Steam Audio still
-                    // provides occlusion, transmission, and air absorption —
-                    // so walls block the sound correctly without double-dipping
-                    // on distance.
-                    if (voice->isAmbient) {
-                        voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
-                            IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
-                            IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
-                            IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
-                        // Override distanceAttenuation to 1.0 so the reflection
-                        // convolution input isn't distance-scaled either
-                        voice->dspNode.directParams.distanceAttenuation = 1.0f;
-                    } else {
-                        voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
-                            IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
-                            IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
-                            IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
-                            IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
-                    }
-                    voice->dspNode.directParams.transmissionType =
-                        IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
-                } else {
-                    // Sim hasn't committed this source yet — use distance fallback
-                    // so the voice plays at a reasonable volume immediately.
-                    float dist = glm::length(voice->worldPos - mListenerPos);
-                    float fallbackAtten = 1.0f / (1.0f + dist * dist * 0.001f);
-                    voice->dspNode.directParams.distanceAttenuation = fallbackAtten;
-                    voice->dspNode.directParams.occlusion = 1.0f;
-                    voice->dspNode.directParams.airAbsorption[0] = 1.0f;
-                    voice->dspNode.directParams.airAbsorption[1] = 1.0f;
-                    voice->dspNode.directParams.airAbsorption[2] = 1.0f;
+                // For environmental ambient voices, SKIP distance attenuation —
+                // the ambient system handles distance via ma_sound_set_volume
+                // with a designer-controlled radius curve. Object ambients and
+                // normal voices get full Steam Audio distance attenuation.
+                if (voice->isAmbient) {
                     voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
-                        IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION);
+                        IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
+                        IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
+                        IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+                    // Override distanceAttenuation to 1.0 so the reflection
+                    // convolution input isn't distance-scaled either
+                    voice->dspNode.directParams.distanceAttenuation = 1.0f;
+                } else {
+                    voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
+                        IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
+                        IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
+                        IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
+                        IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
                 }
+                voice->dspNode.directParams.transmissionType =
+                    IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
 
                 // Enable reflection convolution up to the global budget.
                 // Top-N closest voices (real-time) get priority, then baked
@@ -2710,8 +2686,7 @@ void AudioService::loopStep(float deltaTime)
         }
     }
 
-    // Update ambient sound volumes based on listener distance
-    updateAmbientVolumes();
+    // (ambient volumes updated at top of loopStep, before simulation)
 
     // loopStep total time (main thread)
     {
@@ -2741,33 +2716,6 @@ void AudioService::loopStep(float deltaTime)
 }
 
 //------------------------------------------------------
-void AudioService::directSimWorkerMain()
-{
-    // Dedicated thread for direct simulation (occlusion/attenuation).
-    // Runs every frame, completes in <2ms — latency-critical for responsive
-    // sound blocking when the player moves around corners or through doorways.
-    while (true) {
-        {
-            std::unique_lock<std::mutex> lock(mDirectSimMutex);
-            mDirectSimCV.wait(lock, [this] {
-                return mDirectSimWant
-                       || mDirectSimShutdown.load(std::memory_order_relaxed);
-            });
-            if (mDirectSimShutdown.load(std::memory_order_relaxed))
-                break;
-            mDirectSimWant = false;
-        }
-
-        auto t0 = std::chrono::steady_clock::now();
-        iplSimulatorRunDirect(mIplSimulator);
-        auto t1 = std::chrono::steady_clock::now();
-        float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
-        float prev = sDirectSimPeakMs.load(std::memory_order_relaxed);
-        if (ms > prev) sDirectSimPeakMs.store(ms, std::memory_order_relaxed);
-        mDirectSimRunning.store(false, std::memory_order_release);
-    }
-}
-
 void AudioService::reflectionSimWorkerMain()
 {
     // Dedicated thread for reflection simulation (ray-traced reverb).
@@ -3011,10 +2959,10 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
         return;
     }
 
-    // iplSourceAdd modifies the simulator's source list, which both sim threads
-    // iterate. Defer the add if either thread is running to prevent races.
-    if (mDirectSimRunning.load(std::memory_order_acquire) ||
-        mReflectionSimRunning.load(std::memory_order_acquire)) {
+    // iplSourceAdd modifies the simulator's source list, which the reflection
+    // sim thread iterates. Defer the add if it's running to prevent races.
+    // Direct sim runs inline on the main thread, so no conflict.
+    if (mReflectionSimRunning.load(std::memory_order_acquire)) {
         mPendingSourceAdds.push_back(voice.iplSource);
     } else {
         iplSourceAdd(voice.iplSource, mIplSimulator);
@@ -3025,13 +2973,10 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
 //------------------------------------------------------
 void AudioService::waitForReflectionThread()
 {
-    // Spin-wait for both simulation tasks to complete on the worker thread.
-    // This is called infrequently (voice add/remove, shutdown) and the sim
-    // tasks are short (~2-5ms direct, ~10-50ms reflections), so spinning
-    // is acceptable. The worker thread stays alive — we just wait for its
-    // current work to finish.
-    while (mDirectSimRunning.load(std::memory_order_acquire) ||
-           mReflectionSimRunning.load(std::memory_order_acquire)) {
+    // Spin-wait for the reflection sim to complete on its background thread.
+    // Called infrequently (voice removal, shutdown). Direct sim runs inline
+    // on the main thread so it's never concurrent here.
+    while (mReflectionSimRunning.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
 }
@@ -3066,11 +3011,11 @@ void AudioService::removeVoiceSource(ActiveVoice &voice)
         return;
     }
 
-    // If either background sim thread is running, we can't safely call
-    // iplSourceRemove (it races with iplSimulatorRunDirect/Reflections).
+    // If the reflection sim thread is running, we can't safely call
+    // iplSourceRemove (it races with iplSimulatorRunReflections).
     // Defer the removal — queue the IPL source handle for later cleanup.
-    if (mDirectSimRunning.load(std::memory_order_acquire) ||
-        mReflectionSimRunning.load(std::memory_order_acquire)) {
+    // Direct sim runs inline on the main thread, so no conflict.
+    if (mReflectionSimRunning.load(std::memory_order_acquire)) {
         mPendingSourceRemovals.push_back(voice.iplSource);
         voice.iplSource = nullptr;  // detach from voice (we own it now)
         mSimulatorDirty = true;
@@ -3193,21 +3138,22 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     }
     dsp.nodeInitialized = true;
 
-    // Set default direct params (unity — no attenuation until simulation updates)
+    // Set default direct params to SILENT — new voices stay inaudible until
+    // the simulation provides real occlusion/distance values. This prevents
+    // a 1-frame pop at full volume for voices created after the sim runs.
+    // The simulation overwrites these in loopStep once it processes the source.
     dsp.directParams.flags = static_cast<IPLDirectEffectFlags>(
         IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
-        IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
-        IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
-        IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+        IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION);
     dsp.directParams.transmissionType = IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
-    dsp.directParams.distanceAttenuation = 1.0f;
+    dsp.directParams.distanceAttenuation = 0.0f;
     dsp.directParams.airAbsorption[0] = 1.0f;
     dsp.directParams.airAbsorption[1] = 1.0f;
     dsp.directParams.airAbsorption[2] = 1.0f;
-    dsp.directParams.occlusion = 1.0f;
-    dsp.directParams.transmission[0] = 1.0f;
-    dsp.directParams.transmission[1] = 1.0f;
-    dsp.directParams.transmission[2] = 1.0f;
+    dsp.directParams.occlusion = 0.0f;
+    dsp.directParams.transmission[0] = 0.0f;
+    dsp.directParams.transmission[1] = 0.0f;
+    dsp.directParams.transmission[2] = 0.0f;
 
     // Connect the node graph BEFORE setting effectsReady — prevents the audio
     // thread from trying to process through an unconnected node.
@@ -3847,15 +3793,16 @@ void AudioService::updateAmbientVolumes()
 
         if (inRange) {
             // Start voice if not already playing
+            bool justCreated = false;
             if (amb.handle == SOUND_HANDLE_INVALID) {
                 bool isLooping = !(amb.flags & AMB_ONCE_ONLY);
                 if (mSchemaParser) {
                     const SchemaEntry *schema = mSchemaParser->findSchema(amb.schemaName);
                     if (schema && !schema->samples.empty()) {
                         const SchemaSample &sample = schema->samples[0];
-                        // Start at volume 0 — the volume update below will set the
-                        // correct level this same frame. Prevents pop-in at full volume
-                        // before Steam Audio has simulated this source.
+                        // Start at volume 0 — stays silent until the sim has
+                        // processed this source (next frame) so occlusion is
+                        // applied before the voice is audible.
                         amb.handle = startVoice(amb.schemaName, sample.name, amb.position,
                                                 schema->playParams.priority, isLooping,
                                                 amb.objID, 0.0f);
@@ -3865,6 +3812,7 @@ void AudioService::updateAmbientVolumes()
                 // (the ambient system handles distance via ma_sound_set_volume)
                 if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle)) {
                     mVoices[amb.handle]->isAmbient = true;
+                    justCreated = true;
                 }
                 // Fallback: try loading schema name as a raw sound
                 if (amb.handle == SOUND_HANDLE_INVALID) {
@@ -3872,9 +3820,16 @@ void AudioService::updateAmbientVolumes()
                                             64, isLooping, amb.objID, 0.0f);
                     if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle)) {
                         mVoices[amb.handle]->isAmbient = true;
+                        justCreated = true;
                     }
                 }
             }
+
+            // Skip volume update for just-created voices — they start at 0
+            // and will get their correct volume next frame after the sim has
+            // processed them with real occlusion values.
+            if (justCreated)
+                continue;
 
             // Update volume — purely position-based, no time-based fades.
             // Volume curve: full volume at dist=0, fades to 0 at dist=radius.
