@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstdarg>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <stdio.h>
 
@@ -48,7 +49,7 @@ template <> Logger *Singleton<Logger>::ms_Singleton = 0;
 
 Logger::Logger() {
     mListeners.clear();
-    mLoggingLevel = LOG_LEVEL_VERBOSE;
+    mLoggingLevel.store(LOG_LEVEL_VERBOSE, std::memory_order_relaxed);
 }
 
 Logger::~Logger() {}
@@ -71,10 +72,13 @@ void Logger::dispatchLogMessage(LogLevel level, const std::string &msg) {
 }
 
 void Logger::log(LogLevel level, const char *fmt, ...) {
-    // Ignore the message if the level is too high
-    if (mLoggingLevel < level)
+    // Ignore the message if the level is too high.
+    // Atomic relaxed load: benign race (worst case: one extra/missed log line)
+    if (mLoggingLevel.load(std::memory_order_relaxed) < level)
         return;
 
+    // Format the message outside the lock (vsnprintf is thread-safe,
+    // and we don't want to hold the mutex during potentially slow formatting)
     va_list argptr;
     char result[2048];
 
@@ -82,12 +86,13 @@ void Logger::log(LogLevel level, const char *fmt, ...) {
     vsnprintf(result, 2047, fmt, argptr);
     va_end(argptr);
 
-    // This is how the log listener could work:
-    // printf("Log (%s) : %s\n", LOG_LEVEL_STRINGS[level], result);
-
     // Now that the string is complete, we'll split it on newlines
     // to avoid losing headers on some lines
     std::string msg(result);
+
+    // Hold the lock for the entire dispatch sequence so multi-line
+    // messages from one thread aren't interleaved with another thread's lines
+    std::lock_guard<std::mutex> lock(mLogMutex);
 
     std::string::iterator it = msg.begin();
 
@@ -108,10 +113,12 @@ void Logger::log(LogLevel level, const char *fmt, ...) {
 }
 
 void Logger::registerLogListener(LogListener *listener) {
+    std::lock_guard<std::mutex> lock(mLogMutex);
     mListeners.insert(listener);
 }
 
 void Logger::unregisterLogListener(LogListener *listener) {
+    std::lock_guard<std::mutex> lock(mLogMutex);
     mListeners.erase(listener);
 }
 
@@ -135,7 +142,9 @@ template <typename T> Logger &Logger::operator<<(const T &t) {
     return *this;
 }
 
-void Logger::setLogLevel(LogLevel level) { mLoggingLevel = level; }
+void Logger::setLogLevel(LogLevel level) {
+    mLoggingLevel.store(static_cast<int>(level), std::memory_order_relaxed);
+}
 
 void Logger::setLogLevel(int level) {
     switch (level) {

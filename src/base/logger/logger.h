@@ -28,6 +28,7 @@
 #include "config.h"
 
 #include "DarknessSingleton.h"
+#include <mutex>
 #include <set>
 #include <string>
 
@@ -56,11 +57,16 @@ private:
     LogListenerSet mListeners;
 
     /** A global log level. Set by setLogLevel. All messages having higher log
-     * level are ignored */
-    LogLevel mLoggingLevel;
+     * level are ignored. Atomic to allow safe reading from worker threads
+     * without holding mLogMutex (fast-path filter before formatting). */
+    std::atomic<int> mLoggingLevel;
+
+    /** Protects mListeners and serializes log dispatch for thread safety.
+     * Multiple threads (worker pool, audio) may log concurrently. */
+    mutable std::mutex mLogMutex;
 
     /** Message dispatching method. Sends the logging message to all log
-     * listeners */
+     * listeners. Caller must hold mLogMutex. */
     void dispatchLogMessage(LogLevel level, const std::string &msg);
 
 public:
