@@ -62,25 +62,25 @@ darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES
 # With bicubic lightmap filtering (smoother shadows)
 darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES --lightmap-filtering bicubic
 
-# Enable camera collision and vintage physics rate
-darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES --collision --physics-rate 12
+# With sound schemas (enables spatial audio)
+darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES --schemas /path/to/EDITOR/SCHEMA
 ```
 
-The `--res` path should point to a directory containing `fam.crf`, which holds the PCX textures used by Dark Engine levels. This can come from:
+The `--res` path should point to a directory containing `fam.crf` and `obj.crf`, which hold the textures and object models used by Dark Engine levels. The `--schemas` path enables spatial audio by loading sound schemas. These can come from:
 
-1. **Mounted ISO (macOS):** `hdiutil mount ../disk_images/thief_2_disk_1.iso` then `--res /Volumes/THIEF2_INSTALL_C/THIEF2/RES`
+1. **Mounted ISOs (macOS):** `hdiutil mount ../disk_images/thief_2_disk_1.iso` then `--res /Volumes/THIEF2_INSTALL_C/THIEF2/RES` and `--schemas /Volumes/THIEF2_CD2/EDITOR/SCHEMA`
 2. **GOG/Steam install directory:** `--res /path/to/Thief2/RES`
-3. **Any directory containing fam.crf**
+3. **Any directory containing fam.crf and obj.crf**
 
 #### Configuration
 
-Settings can be specified in a YAML config file, via CLI flags, or changed at runtime. Precedence is: **YAML defaults < CLI flags < runtime changes**.
+Settings can be specified in a YAML config file, via CLI flags, or changed at runtime via the debug console. Precedence is: **YAML defaults < CLI flags < runtime changes**.
 
-Copy `darknessRender.example.yaml` to `darknessRender.yaml` in your working directory, or use `--config <path>` to point to a custom config file.
+Copy `darknessRender.example.yaml` to `darknessRender.yaml` in your working directory, or use `--config <path>` to point to a custom config file. The YAML file has sections for `graphics`, `water`, `physics`, `audio`, and `developer` settings. See the example file for full documentation of all options, including spatial audio reflection parameters and the master bus DSP chain (limiter, compressor, EQ, ducking).
 
 #### Controls — Fly mode
 
-The default camera mode is physics model. Switch to fly/noclip using BS+P.
+The default camera mode is fly (noclip). Switch between fly and physics mode via the debug console (`physics_mode`).
 
 | Key | Action |
 |-----|--------|
@@ -91,11 +91,12 @@ The default camera mode is physics model. Switch to fly/noclip using BS+P.
 | LCtrl | Sprint (3x speed) |
 | Scroll wheel | Adjust movement speed (shown in title bar) |
 | Home | Teleport to player spawn point |
+| ` (backtick) | Open debug console |
 | Esc | Quit |
 
-#### Controls — Physics mode (BS+P to enter)
+#### Controls — Physics mode
 
-Walk-on-ground mode with gravity, collision, jumping, crouching, and leaning.
+Walk-on-ground mode with gravity, collision, jumping, crouching, and leaning. Enable via the debug console (`physics_mode` = on).
 
 | Key | Action |
 |-----|--------|
@@ -109,42 +110,69 @@ Walk-on-ground mode with gravity, collision, jumping, crouching, and leaning.
 | Home | Teleport to player spawn point |
 | Esc | Quit |
 
-#### Debug shortcuts (hold Backspace + key)
-
-| Keys | Action |
-|------|--------|
-| BS+P | Toggle physics / fly mode |
-| BS+C | Toggle portal culling on/off |
-| BS+F | Cycle texture filtering (point / bilinear / trilinear / anisotropic) |
-| BS+L | Toggle lightmap filtering (bilinear / bicubic) |
-| BS+V | Toggle camera collision (fly mode only) |
-| BS+M / BS+N | Cycle model isolation forward / backward |
-| BS+G | Toggle physics diagnostic log (`physics_log.csv`) |
-| BS+R | Toggle raycast debug visualization |
-
 #### Debug console
 
-Press **\` (backtick)** to open the in-game settings console. Type to filter settings by name, Tab to auto-complete, arrow keys to navigate, Enter to select and edit. Press backtick or Esc to cancel.
+Press **\` (backtick)** to open the in-game settings console. All runtime settings are managed here — there are no separate keyboard shortcuts for toggling features.
 
-Available console settings:
+**Interaction:** Type to filter settings by name, Tab to auto-complete, Up/Down arrows to navigate the list, Enter to select and edit. For bool/categorical settings, use Left/Right arrows to cycle values. For float settings, type a new value. Enter applies, backtick or Esc cancels.
+
+##### Rendering
 
 | Setting | Type | Description |
 |---------|------|-------------|
 | `filter_mode` | point / bilinear / trilinear / anisotropic | Texture filtering mode |
 | `lightmap_filtering` | bilinear / bicubic | Lightmap filter quality |
 | `portal_culling` | on / off | Portal/frustum culling |
-| `camera_collision` | on / off | Camera clips to world geometry |
-| `physics_mode` | on / off | Physics (walk) vs fly (noclip) |
-| `physics_rate` | vintage / modern / ultra | Physics timestep (12.5 / 60 / 120 Hz) |
 | `show_objects` | on / off | Render object meshes |
 | `show_fallback_cubes` | on / off | Show colored cubes for missing models |
 | `show_raycast` | on / off | Debug raycast visualization |
-| `step_log` | on / off | Stair step diagnostics to stderr |
+| `show_acoustic_mesh` | on / off | Cyan wireframe overlay of acoustic scene geometry |
+| `isolate_model` | all / (model names) | Isolate a single object model for inspection |
+
+##### Camera & Physics
+
+| Setting | Type | Description |
+|---------|------|-------------|
+| `physics_mode` | on / off | Physics (walk) vs fly (noclip) |
+| `physics_rate` | vintage / modern / ultra | Physics timestep (12.5 / 60 / 120 Hz) |
+| `physics_log` | on / off | Write per-timestep diagnostics to `physics_log.csv` |
+| `camera_collision` | on / off | Camera clips to world geometry (fly mode only) |
 | `move_speed` | 1.0 - 500.0 | Camera movement speed (fly mode) |
+| `step_log` | on / off | Stair step diagnostics to stderr |
+
+##### Water
+
+| Setting | Type | Description |
+|---------|------|-------------|
 | `wave_amplitude` | 0.0 - 5.0 | Water vertex wave height |
 | `uv_distortion` | 0.0 - 0.5 | Water UV wobble strength |
 | `water_rotation` | 0.0 - 0.5 | Water UV rotation speed (rad/s) |
 | `water_scroll` | 0.0 - 1.0 | Water UV scroll speed |
+
+##### Audio — Spatial Reflections
+
+| Setting | Type | Description |
+|---------|------|-------------|
+| `refl_enabled` | on / off | Real-time convolution reverb |
+| `portal_routing` | on / off | Sound routing through doorways via portal graph |
+| `probe_pathing` | on / off | Baked probe diffraction (when .probes file available) |
+| `refl_rays` | 128 - 8192 | Rays per reflection sim step |
+| `refl_bounces` | 1 - 8 | Bounces per ray |
+| `refl_duration` | 0.5 - 4.0 | Max reverb tail in seconds |
+| `refl_throttle` | 1 - 32 | Run reflection sim every Nth frame |
+| `refl_max_voices` | 1 - 32 | Max active convolution voices |
+| `transmission_scale` | 0.1 - 100.0 | Material transmission multiplier (read-only at runtime) |
+| `refl_tri_count` | *(read-only)* | Acoustic scene triangle count |
+| `refl_sample_rate` | *(read-only)* | Convolution sample rate |
+| `refl_ambi_order` | *(read-only)* | Ambisonics order (0=omni, 1=directional) |
+
+##### Audio — Probes & Recording
+
+| Setting | Type | Description |
+|---------|------|-------------|
+| `bake_probes` | *(action)* | Set to "on" to re-bake acoustic probes |
+| `probe_count` | *(read-only)* | Current probe count |
+| `record_audio` | on / off | Start/stop audio recording to file |
 
 #### CLI reference
 
@@ -152,6 +180,7 @@ Available console settings:
 |------|---------|-------------|
 | `<mission.mis>` | *(required)* | Path to mission file |
 | `--res <path>` | *(none)* | Thief 2 RES directory (enables textured+lightmapped rendering) |
+| `--schemas <path>` | *(none)* | Path to schemas directory (sound schemas, etc.) |
 | `--config <path>` | `./darknessRender.yaml` | Path to YAML config file |
 | `--lightmap-filtering <mode>` | `bilinear` | Lightmap filtering: `bilinear` or `bicubic` |
 | `--filter` | off | Start with bilinear texture filtering (default: point) |
