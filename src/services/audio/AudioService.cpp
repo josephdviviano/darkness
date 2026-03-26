@@ -287,6 +287,7 @@ struct SteamAudioDSPNode {
     std::atomic<float> peakOutput{0.0f};    // peak output level seen
     std::atomic<uint32_t> lastFrameCount{0}; // last frame count delivered by miniaudio
     std::atomic<float> lastAtten{1.0f};     // last attenuation factor applied
+
 };
 
 /// vtable for the Steam Audio DSP custom node
@@ -2552,9 +2553,18 @@ void AudioService::loopStep(float deltaTime)
             iplSourceGetOutputs(voice->iplSource, getFlags, &outputs);
 
             if (voice->dspNode.effectsReady) {
-                // Copy simulation outputs to DSP node params.
-                // Direct sim ran synchronously above, so results are same-frame
-                // for all voices including newly created ones.
+                // Skip sources that haven't been added to the simulator yet.
+                // When the reflection sim is busy at voice creation time,
+                // iplSourceAdd is deferred to mPendingSourceAdds. Until it's
+                // flushed and the sim processes the source, iplSourceGetOutputs
+                // returns uninitialized values. Keep silent initVoiceDSP defaults.
+                bool isPending = std::find(mPendingSourceAdds.begin(),
+                                           mPendingSourceAdds.end(),
+                                           voice->iplSource) != mPendingSourceAdds.end();
+
+                if (isPending)
+                    continue;
+
                 voice->dspNode.directParams = outputs.direct;
 
                 // For environmental ambient voices, SKIP distance attenuation —
@@ -3808,10 +3818,11 @@ void AudioService::updateAmbientVolumes()
                                                 amb.objID, 0.0f);
                     }
                 }
-                // Mark as ambient so the DSP skips distance attenuation
-                // (the ambient system handles distance via ma_sound_set_volume)
+                // Environmental ambients use the ambient system's radius curve
+                // for distance. Object ambients use Steam Audio distance.
+                bool isEnvironmental = (amb.flags & AMB_ENVIRONMENTAL) != 0;
                 if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle)) {
-                    mVoices[amb.handle]->isAmbient = true;
+                    mVoices[amb.handle]->isAmbient = isEnvironmental;
                     justCreated = true;
                 }
                 // Fallback: try loading schema name as a raw sound
@@ -3819,35 +3830,35 @@ void AudioService::updateAmbientVolumes()
                     amb.handle = startVoice(amb.schemaName, amb.schemaName, amb.position,
                                             64, isLooping, amb.objID, 0.0f);
                     if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle)) {
-                        mVoices[amb.handle]->isAmbient = true;
+                        mVoices[amb.handle]->isAmbient = isEnvironmental;
                         justCreated = true;
                     }
                 }
             }
 
-            // Skip volume update for just-created voices — they start at 0
-            // and will get their correct volume next frame after the sim has
-            // processed them with real occlusion values.
-            if (justCreated)
-                continue;
-
-            // Update volume — purely position-based, no time-based fades.
-            // Volume curve: full volume at dist=0, fades to 0 at dist=radius.
-            // Beyond radius (in the start/stop management zone), volume is 0
-            // but the voice stays alive so it can fade back in smoothly when
-            // the player approaches again.
-            if (amb.handle != SOUND_HANDLE_INVALID) {
+            // Update volume.
+            // Just-created voices stay at 0 — silent defaults in initVoiceDSP
+            // ensure iplDirectEffectApply outputs silence until the sim provides
+            // real occlusion/distance data (next frame).
+            if (!justCreated && amb.handle != SOUND_HANDLE_INVALID) {
                 auto it = mVoices.find(amb.handle);
                 if (it == mVoices.end()) {
                     amb.handle = SOUND_HANDLE_INVALID;
                     continue;
                 }
 
+                bool isEnvironmental = (amb.flags & AMB_ENVIRONMENTAL) != 0;
                 float baseVol = schemaVolumeToLinear(amb.volume);
-                float distFactor = std::max(0.0f, 1.0f - (dist / amb.radius));
-                if (!(amb.flags & AMB_NO_FADE)) {
-                    distFactor *= distFactor;  // quadratic for natural rolloff
+                float distFactor;
+                if (isEnvironmental) {
+                    distFactor = std::max(0.0f, 1.0f - (dist / amb.radius));
+                    if (!(amb.flags & AMB_NO_FADE))
+                        distFactor *= distFactor;
+                } else {
+                    // Object ambients — Steam Audio handles distance.
+                    distFactor = 1.0f;
                 }
+
                 // Apply ducking multiplier inline (not as a separate pass)
                 // to avoid compounding volume decay across frames.
                 float duck = (mReflectionMixNode && mReflectionMixNode->duckingEnabled)
