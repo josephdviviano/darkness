@@ -2562,6 +2562,23 @@ void AudioService::loopStep(float deltaTime)
                                            mPendingSourceAdds.end(),
                                            voice->iplSource) != mPendingSourceAdds.end();
 
+                // Always update HRTF direction — it doesn't depend on simulation
+                // outputs and pending voices still need correct spatialization.
+                if (!voice->dspNode.usePortalRouting) {
+                    Vector3 toSource = voice->worldPos - mListenerPos;
+                    float dist = glm::length(toSource);
+                    if (dist > 0.001f) {
+                        toSource /= dist;
+                        // Project world direction onto listener-local axes.
+                        // Steam Audio convention: +X=right, +Y=up, -Z=ahead,
+                        // so negate the ahead component for correct front/back.
+                        float dirX = glm::dot(toSource, right);
+                        float dirY = glm::dot(toSource, up);
+                        float dirZ = -glm::dot(toSource, ahead);
+                        voice->dspNode.direction = { dirX, dirY, dirZ };
+                    }
+                }
+
                 if (isPending)
                     continue;
 
@@ -2629,24 +2646,8 @@ void AudioService::loopStep(float deltaTime)
                     voice->dspNode.reflectionsActive.store(false, std::memory_order_relaxed);
                 }
 
-                // Compute listener-to-source direction in listener's local frame
-                // for HRTF binaural rendering. Cross-room voices already had
-                // their direction set toward the portal in Step 2b — skip them.
-                if (!voice->dspNode.usePortalRouting) {
-                Vector3 toSource = voice->worldPos - mListenerPos;
-                float dist = glm::length(toSource);
-                if (dist > 0.001f) {
-                    toSource /= dist;
-                    // Project world direction onto listener-local axes.
-                    // Steam Audio convention: +X=right, +Y=up, -Z=ahead,
-                    // so negate the ahead component for correct front/back.
-                    voice->dspNode.direction = {
-                        glm::dot(toSource, right),    // x = right
-                        glm::dot(toSource, up),       // y = up
-                        -glm::dot(toSource, ahead)    // z = -ahead (Steam Audio: -Z = forward)
-                    };
-                }
-                } // end !usePortalRouting direction update
+                // Direction update moved above isPending guard so all voices
+                // (including pending ones) get correct HRTF spatialization.
 
                 // Portal routing is now done in Step 2b (before iplSourceSetInputs).
                 // The HRTF direction and portalAttenuation are already set on
