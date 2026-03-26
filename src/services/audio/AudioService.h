@@ -547,8 +547,10 @@ private:
     /// Simulator for direct/reflection/reverb computation
     IPLSimulator mIplSimulator = nullptr;
 
-    /// Whether an acoustic scene is currently active (built and committed)
-    bool mSceneReady = false;
+    /// Whether an acoustic scene is currently active (built and committed).
+    /// Atomic as a defensive measure — currently only accessed from the main
+    /// thread, but the reflection sim thread could plausibly need it in future.
+    std::atomic<bool> mSceneReady{false};
 
     /// Deferred simulator commit flag — set when sources are added/removed,
     /// committed once per frame in loopStep() before simulation runs.
