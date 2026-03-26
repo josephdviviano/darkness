@@ -37,13 +37,25 @@
         activatePose(*stride);
 
         // Fire footstep callback (Phase 3 Audio) — FOOT position, horizontal speed, ground texture.
+        // Offset footstep laterally to alternate left/right foot for spatial audio immersion.
+        // The "right" vector in Z-up is (sin(yaw), -cos(yaw), 0); left foot gets negative offset.
+        // Crouched stance is slightly wider than standing for a subtle but noticeable effect.
         if (mFootstepCb) {
-            Vector3 footPos = mPosition + Vector3(0.0f, 0.0f, mSphereOffsetsBase[4]);
+            constexpr float FOOT_OFFSET_STAND  = 0.8f;  // lateral offset from center (standing)
+            constexpr float FOOT_OFFSET_CROUCH = 1.0f;  // wider stance when crouched
+
+            float lateralDist = isCrouching() ? FOOT_OFFSET_CROUCH : FOOT_OFFSET_STAND;
+            // mStrideIsLeft = head bobs left = RIGHT foot strikes ground (and vice versa)
+            float sign = mStrideIsLeft ? 1.0f : -1.0f;
+            Vector3 right(mSinYaw, -mCosYaw, 0.0f);
+
+            Vector3 footPos = mPosition + Vector3(0.0f, 0.0f, mSphereOffsetsBase[4])
+                            + right * (sign * lateralDist);
             float hSpeed = horizontalSpeed();
             mFootstepCb(footPos, hSpeed, mGroundTextureIdx);
         }
 
-        mStrideIsLeft = !mStrideIsLeft;
+        mStrideIsLeft = !mStrideIsLeft;  // Flips stride for next time.
         mLastStrideSimTime = mSimTime;
     }
 
