@@ -668,16 +668,6 @@ private:
     //
     // Source mutations (add/remove/commit) must wait for BOTH threads to be idle.
 
-    /// Direct simulation worker — runs occlusion/attenuation every frame.
-    /// Latency-critical: determines whether sounds are audible or blocked.
-    std::thread mDirectSimThread;
-    std::mutex mDirectSimMutex;
-    std::condition_variable mDirectSimCV;
-    bool mDirectSimWant = false;  ///< protected by mDirectSimMutex
-    std::atomic<bool> mDirectSimRunning{false};
-    std::atomic<bool> mDirectSimShutdown{false};
-    void directSimWorkerMain();
-
     /// Reflection simulation worker — runs ray-traced reverb on a throttled schedule.
     /// Latency-tolerant: reverb tails change slowly with listener movement.
     std::thread mReflectionSimThread;
