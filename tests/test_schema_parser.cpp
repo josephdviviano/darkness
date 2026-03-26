@@ -11,6 +11,10 @@
  *****************************************************************************/
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <algorithm>
+#include <string>
+
 #include "audio/SchemaParser.h"
 
 using namespace Darkness;
@@ -719,4 +723,555 @@ TEST_CASE("Inheritance respects explicitly-set default values", "[schema][inheri
     // These were not set by child, so they should be inherited from parent.
     CHECK(s->playParams.volume == -500);
     CHECK(s->playParams.fade == 100);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 34g: Parse NewBridge fan mission .sch files (7 .sch + 2 .spc + 1 .arc)
+// ════════════════════════════════════════════════════════════════════════════
+
+#ifndef FIXTURES_DIR
+#define FIXTURES_DIR "tests/fixtures"
+#endif
+
+static const std::string NEWBRIDGE_DIR =
+    std::string(FIXTURES_DIR) + "/newbridge_schema";
+
+TEST_CASE("NewBridge: loadDirectory succeeds with no errors", "[schema][newbridge]") {
+    SchemaParser parser;
+    bool ok = parser.loadDirectory(NEWBRIDGE_DIR);
+
+    // Dump errors for debugging
+    for (const auto &e : parser.errors())
+        UNSCOPED_INFO("ERROR: " << e);
+    for (const auto &w : parser.warnings())
+        UNSCOPED_INFO("WARNING: " << w);
+
+    REQUIRE(ok);
+    CHECK(parser.errors().empty());
+}
+
+TEST_CASE("NewBridge: schema count", "[schema][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+    // 7 .sch files + 3 archetypes in m20.arc = total schemas
+    // Count manually: m20.arc has 3 (AMB_M20, DEVICES_M20, M20_CONV)
+    // The .sch files define the rest
+    CHECK(parser.schemaCount() >= 200);
+    // Exact count may vary — at least all are parsed
+    INFO("Total schemas parsed: " << parser.schemaCount());
+}
+
+TEST_CASE("NewBridge: tags from ENVSOUND.SPC", "[schema][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+
+    // ENVSOUND.SPC defines key tags like Event, Material, etc.
+    auto *eventTag = parser.findTag("Event");
+    REQUIRE(eventTag != nullptr);
+    CHECK_FALSE(eventTag->isIntTag);
+    CHECK(eventTag->isRequired);
+    // Event has: Launch Collision Footstep Damage StateChange Activate
+    //            ActiveLoop Deactivate Death Select Reject MediaTrans Climbstep Motion Create
+    CHECK(eventTag->values.size() >= 10);
+
+    // Check a tag_int exists
+    auto *launchVel = parser.findTag("LaunchVel");
+    if (launchVel) {
+        CHECK(launchVel->isIntTag);
+    }
+}
+
+TEST_CASE("NewBridge: voices and concepts from SPEECH.SPC", "[schema][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+
+    CHECK(parser.voiceCount() > 0);
+    CHECK(parser.conceptCount() > 0);
+
+    INFO("Voices: " << parser.voiceCount() << ", Concepts: " << parser.conceptCount());
+}
+
+TEST_CASE("NewBridge: simple ambient schema (m20turb1)", "[schema][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+
+    auto *s = parser.findSchema("m20turb1");
+    REQUIRE(s != nullptr);
+    CHECK(s->archetypeName == "DEVICES_M20");
+    CHECK(s->playParams.volume == -1000);
+    CHECK(s->loopParams.isLooping == true);
+    CHECK(s->loopParams.isPoly == false);
+    CHECK(s->loopParams.intervalMin == 0);
+    CHECK(s->loopParams.intervalMax == 0);
+    REQUIRE(s->samples.size() == 1);
+    CHECK(s->samples[0].name == "turbinlp");
+}
+
+TEST_CASE("NewBridge: multi-sample with no_repeat and delay (m20manintten)",
+          "[schema][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+
+    auto *s = parser.findSchema("m20manintten");
+    REQUIRE(s != nullptr);
+    CHECK(s->archetypeName == "AMB_M20");
+    CHECK(s->playParams.volume == -2500);
+    CHECK(s->playParams.initialDelay == 8000);
+    CHECK(s->playParams.flags & SCH_NO_REPEAT);
+    CHECK(s->loopParams.isLooping == true);
+    CHECK(s->loopParams.intervalMin == 10000);
+    CHECK(s->loopParams.intervalMax == 20000);
+    REQUIRE(s->samples.size() == 5);
+    CHECK(s->samples[0].name == "gr3");
+    CHECK(s->samples[4].name == "gr9");
+}
+
+TEST_CASE("NewBridge: conversation schema with schema_voice (nb000)",
+          "[schema][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+
+    auto *s = parser.findSchema("nb000");
+    REQUIRE(s != nullptr);
+    CHECK(s->archetypeName == "M20_CONV");
+    CHECK(s->playParams.volume == -1);
+    CHECK(s->playParams.initialDelay == 500);
+    REQUIRE(s->samples.size() == 1);
+    CHECK(s->samples[0].name == "nb000");
+
+    // schema_voice vgarrett 1 nbconv0 (LineNo 1 1)
+    CHECK(s->voiceName == "vgarrett");
+    CHECK(s->voiceWeight == 1);
+    CHECK(s->conceptName == "nbconv0");
+    REQUIRE(s->voiceTags.size() == 1);
+    CHECK(s->voiceTags[0].tagName == "LineNo");
+    CHECK(s->voiceTags[0].isIntRange == true);
+    CHECK(s->voiceTags[0].rangeMin == 1);
+    CHECK(s->voiceTags[0].rangeMax == 1);
+}
+
+TEST_CASE("NewBridge: env_tag schema (blackjack_ceram)", "[schema][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+
+    auto *s = parser.findSchema("blackjack_ceram");
+    REQUIRE(s != nullptr);
+    CHECK(s->archetypeName == "HIT_MATERIAL");
+    CHECK(s->playParams.volume == -1);
+    REQUIRE(s->samples.size() == 2);
+    CHECK(s->samples[0].name == "ar_body1");
+    CHECK(s->samples[1].name == "ar_body2");
+
+    // env_tag (Event Collision) (WeaponType Blackjack) (Material Ceramic)
+    REQUIRE(s->envTags.size() == 3);
+
+    // Find each tag by name (order may vary)
+    bool foundEvent = false, foundWeapon = false, foundMaterial = false;
+    for (const auto &tag : s->envTags) {
+        if (tag.tagName == "Event") {
+            CHECK(tag.enumValues.size() == 1);
+            CHECK(tag.enumValues[0] == "Collision");
+            foundEvent = true;
+        } else if (tag.tagName == "WeaponType") {
+            CHECK(tag.enumValues.size() == 1);
+            CHECK(tag.enumValues[0] == "Blackjack");
+            foundWeapon = true;
+        } else if (tag.tagName == "Material") {
+            CHECK(tag.enumValues.size() == 1);
+            CHECK(tag.enumValues[0] == "Ceramic");
+            foundMaterial = true;
+        }
+    }
+    CHECK(foundEvent);
+    CHECK(foundWeapon);
+    CHECK(foundMaterial);
+}
+
+TEST_CASE("NewBridge: door state change env_tag with multi-value enum",
+          "[schema][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+
+    // Look for the door schema with multi-value OldOpenState
+    // env_tag (Event StateChange) (DoorType Wood1cem) (OpenState Open)
+    //         (OldOpenState Closed Opening Closing)
+    // We need to find this schema by scanning for env_tags with OldOpenState
+    const SchemaEntry *doorSchema = nullptr;
+    for (const auto &[key, schema] : parser.schemas()) {
+        for (const auto &tag : schema.envTags) {
+            if (tag.tagName == "OldOpenState" && tag.enumValues.size() >= 3) {
+                doorSchema = &schema;
+                break;
+            }
+        }
+        if (doorSchema) break;
+    }
+
+    REQUIRE(doorSchema != nullptr);
+    INFO("Door schema: " << doorSchema->name);
+
+    // Verify multi-value enum was parsed
+    for (const auto &tag : doorSchema->envTags) {
+        if (tag.tagName == "OldOpenState") {
+            CHECK(tag.enumValues.size() == 3);
+            // Should contain Closed, Opening, Closing
+            CHECK(std::find(tag.enumValues.begin(), tag.enumValues.end(), "Closed")
+                  != tag.enumValues.end());
+            CHECK(std::find(tag.enumValues.begin(), tag.enumValues.end(), "Opening")
+                  != tag.enumValues.end());
+            CHECK(std::find(tag.enumValues.begin(), tag.enumValues.end(), "Closing")
+                  != tag.enumValues.end());
+        }
+    }
+}
+
+TEST_CASE("NewBridge: archetype resolution (AMB_M20 -> AMB)", "[schema][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+
+    // m20.arc defines: AMB_M20 archetype AMB
+    auto *archSchema = parser.findSchema("AMB_M20");
+    REQUIRE(archSchema != nullptr);
+    CHECK(archSchema->archetypeName == "AMB");
+}
+
+TEST_CASE("NewBridge: creature celebration schema_voice (ab1rcel)",
+          "[schema][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+
+    auto *s = parser.findSchema("ab1rcel");
+    REQUIRE(s != nullptr);
+    CHECK(s->archetypeName == "AI_NONE");
+    CHECK(s->playParams.flags & SCH_NO_REPEAT);
+    CHECK(s->samples.size() == 5);
+    CHECK(s->voiceName == "vape1");
+    CHECK(s->voiceWeight == 1);
+    CHECK(s->conceptName == "nbritcel");
+}
+
+TEST_CASE("NewBridge: all 205 schemas have names and archetypes",
+          "[schema][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+
+    int namedCount = 0;
+    int withArchetype = 0;
+    for (const auto &[key, schema] : parser.schemas()) {
+        if (!schema.name.empty()) namedCount++;
+        if (!schema.archetypeName.empty()) withArchetype++;
+    }
+
+    CHECK(namedCount == parser.schemaCount());
+    // All NewBridge schemas use archetypes
+    CHECK(withArchetype == parser.schemaCount());
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 34h: Round-trip tests — parse → serialize → reparse
+// ════════════════════════════════════════════════════════════════════════════
+
+// Helper: compare two SchemaEntry structs field-by-field
+static void checkSchemaEqual(const SchemaEntry &a, const SchemaEntry &b,
+                              const std::string &name) {
+    INFO("Comparing schema: " << name);
+
+    // Names are compared case-insensitively since parser lowercases keys
+    // but stores original names
+    CHECK(a.archetypeName == b.archetypeName);
+
+    // Play params — compare only explicitly-set fields
+    CHECK(a.playParams.volume == b.playParams.volume);
+    CHECK(a.playParams.pan == b.playParams.pan);
+    CHECK(a.playParams.initialDelay == b.playParams.initialDelay);
+    CHECK(a.playParams.fade == b.playParams.fade);
+    CHECK(a.playParams.priority == b.playParams.priority);
+    CHECK(a.playParams.audioClass == b.playParams.audioClass);
+    CHECK(a.playParams.flags == b.playParams.flags);
+
+    // Loop params
+    CHECK(a.loopParams.isLooping == b.loopParams.isLooping);
+    if (a.loopParams.isLooping) {
+        CHECK(a.loopParams.isPoly == b.loopParams.isPoly);
+        CHECK(a.loopParams.maxSamples == b.loopParams.maxSamples);
+        CHECK(a.loopParams.intervalMin == b.loopParams.intervalMin);
+        CHECK(a.loopParams.intervalMax == b.loopParams.intervalMax);
+    }
+    CHECK(a.loopParams.count == b.loopParams.count);
+
+    // Samples
+    REQUIRE(a.samples.size() == b.samples.size());
+    for (size_t i = 0; i < a.samples.size(); ++i) {
+        CHECK(a.samples[i].name == b.samples[i].name);
+        CHECK(a.samples[i].frequency == b.samples[i].frequency);
+        CHECK(a.samples[i].text == b.samples[i].text);
+    }
+
+    // Voice binding
+    CHECK(a.voiceName == b.voiceName);
+    CHECK(a.voiceWeight == b.voiceWeight);
+    CHECK(a.conceptName == b.conceptName);
+    REQUIRE(a.voiceTags.size() == b.voiceTags.size());
+    for (size_t i = 0; i < a.voiceTags.size(); ++i) {
+        CHECK(a.voiceTags[i].tagName == b.voiceTags[i].tagName);
+        CHECK(a.voiceTags[i].isIntRange == b.voiceTags[i].isIntRange);
+        if (a.voiceTags[i].isIntRange) {
+            CHECK(a.voiceTags[i].rangeMin == b.voiceTags[i].rangeMin);
+            CHECK(a.voiceTags[i].rangeMax == b.voiceTags[i].rangeMax);
+        } else {
+            CHECK(a.voiceTags[i].enumValues == b.voiceTags[i].enumValues);
+        }
+    }
+
+    // Env tags
+    REQUIRE(a.envTags.size() == b.envTags.size());
+    for (size_t i = 0; i < a.envTags.size(); ++i) {
+        CHECK(a.envTags[i].tagName == b.envTags[i].tagName);
+        CHECK(a.envTags[i].isIntRange == b.envTags[i].isIntRange);
+        if (a.envTags[i].isIntRange) {
+            CHECK(a.envTags[i].rangeMin == b.envTags[i].rangeMin);
+            CHECK(a.envTags[i].rangeMax == b.envTags[i].rangeMax);
+        } else {
+            CHECK(a.envTags[i].enumValues == b.envTags[i].enumValues);
+        }
+    }
+
+    // Message
+    CHECK(a.message == b.message);
+}
+
+TEST_CASE("Round-trip: simple schema", "[schema][roundtrip]") {
+    SchemaParser parser;
+    REQUIRE(parser.parseString(R"(
+        schema test_basic
+        archetype SomeParent
+        volume -500
+        delay 100
+        mono_loop 1000 2000
+        no_repeat
+        sample1
+        sample2 freq 3
+    )"));
+
+    std::string serialized = parser.serialize();
+    INFO("Serialized:\n" << serialized);
+
+    SchemaParser parser2;
+    REQUIRE(parser2.parseString(serialized));
+
+    auto *a = parser.findSchema("test_basic");
+    auto *b = parser2.findSchema("test_basic");
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    checkSchemaEqual(*a, *b, "test_basic");
+}
+
+TEST_CASE("Round-trip: all fields set", "[schema][roundtrip]") {
+    SchemaParser parser;
+    REQUIRE(parser.parseString(R"(
+        tag TestTag val1 val2 val3
+        tag_int TestInt
+        env_tag_required TestTag
+
+        voice TestVoice archetype BaseVoice
+        concept testconcept 42
+
+        schema allfields
+        archetype SomeBase
+        volume -3000
+        delay 500
+        pan_range 2000
+        priority 200
+        fade 100
+        audio_class speech
+        no_repeat
+        no_cache
+        stream
+        play_once
+        no_combat
+        net_ambient
+        local_spatial
+        poly_loop 3 500 1500
+        loop_count 5
+        message test_msg
+        samp1 "subtitle text" freq 4
+        samp2
+        schema_voice TestVoice 10 testconcept (TestTag val1 val2) (TestInt 0 100)
+        env_tag (TestTag val3) (TestInt 50 75)
+    )"));
+
+    std::string serialized = parser.serialize();
+    INFO("Serialized:\n" << serialized);
+
+    SchemaParser parser2;
+    REQUIRE(parser2.parseString(serialized));
+
+    auto *a = parser.findSchema("allfields");
+    auto *b = parser2.findSchema("allfields");
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    checkSchemaEqual(*a, *b, "allfields");
+
+    // Also verify tags/voices/concepts survived
+    CHECK(parser2.tagCount() >= 2);
+    CHECK(parser2.voiceCount() >= 1);
+    CHECK(parser2.conceptCount() >= 1);
+
+    auto *tag = parser2.findTag("TestTag");
+    REQUIRE(tag != nullptr);
+    CHECK(tag->values.size() == 3);
+    CHECK(tag->isRequired);
+}
+
+TEST_CASE("Round-trip: archetype inheritance preserved", "[schema][roundtrip]") {
+    SchemaParser parser;
+    REQUIRE(parser.parseString(R"(
+        schema PARENT
+        volume -500
+        priority 200
+
+        schema CHILD
+        archetype PARENT
+        delay 100
+    )"));
+
+    std::string serialized = parser.serialize();
+    SchemaParser parser2;
+    REQUIRE(parser2.parseString(serialized));
+
+    auto *child = parser2.findSchema("CHILD");
+    REQUIRE(child != nullptr);
+    CHECK(child->archetypeName == "PARENT");
+    // After reparse + re-resolve, inherited values should match
+    CHECK(child->playParams.volume == -500);
+    CHECK(child->playParams.initialDelay == 100);
+}
+
+TEST_CASE("Round-trip: NewBridge full directory", "[schema][roundtrip][newbridge]") {
+    SchemaParser parser;
+    REQUIRE(parser.loadDirectory(NEWBRIDGE_DIR));
+
+    std::string serialized = parser.serialize();
+    INFO("Serialized length: " << serialized.size() << " bytes");
+
+    SchemaParser parser2;
+    REQUIRE(parser2.parseString(serialized));
+
+    // Same number of schemas
+    CHECK(parser2.schemaCount() == parser.schemaCount());
+
+    // Compare every schema field-by-field
+    int compared = 0;
+    for (const auto &[key, schema] : parser.schemas()) {
+        auto *reparsed = parser2.findSchema(schema.name);
+        if (reparsed) {
+            checkSchemaEqual(schema, *reparsed, schema.name);
+            compared++;
+        } else {
+            FAIL("Schema '" << schema.name << "' missing after round-trip");
+        }
+    }
+
+    INFO("Compared " << compared << " schemas successfully");
+    CHECK(compared == (int)parser.schemaCount());
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 34j: Error cases — malformed input, missing fields, unknown keywords
+// ════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Error: unterminated string", "[schema][errors]") {
+    SchemaParser parser;
+    parser.parseString("schema foo\nvolume -1\n\"never closed");
+    CHECK_FALSE(parser.errors().empty());
+}
+
+TEST_CASE("Error: missing schema name", "[schema][errors]") {
+    SchemaParser parser;
+    // 'schema' immediately followed by another keyword
+    parser.parseString("schema\nschema bar\nvolume -1\nbaz");
+    // The first 'schema' should fail (next token is 'schema', not identifier)
+    CHECK_FALSE(parser.errors().empty());
+}
+
+TEST_CASE("Error: empty input produces no schemas", "[schema][errors]") {
+    SchemaParser parser;
+    bool ok = parser.parseString("");
+    CHECK(ok);
+    CHECK(parser.schemaCount() == 0);
+    CHECK(parser.errors().empty());
+}
+
+TEST_CASE("Error: comments only produces no schemas", "[schema][errors]") {
+    SchemaParser parser;
+    bool ok = parser.parseString("// just comments\n// nothing here\n");
+    CHECK(ok);
+    CHECK(parser.schemaCount() == 0);
+    CHECK(parser.errors().empty());
+}
+
+TEST_CASE("Error: unknown top-level token produces warning", "[schema][errors]") {
+    SchemaParser parser;
+    parser.parseString("gobbledygook 42\nschema foo\nvolume -1\nbar");
+    // 'gobbledygook' is unknown at top level — should be a warning
+    CHECK_FALSE(parser.warnings().empty());
+    // But the valid schema should still parse
+    CHECK(parser.schemaCount() >= 1);
+}
+
+TEST_CASE("Error: duplicate schema name (last wins)", "[schema][errors]") {
+    SchemaParser parser;
+    parser.parseString(R"(
+        schema dupe
+        volume -100
+        samp1
+
+        schema dupe
+        volume -200
+        samp2
+    )");
+
+    auto *s = parser.findSchema("dupe");
+    REQUIRE(s != nullptr);
+    // Second definition overwrites first
+    CHECK(s->playParams.volume == -200);
+    REQUIRE(s->samples.size() == 1);
+    CHECK(s->samples[0].name == "samp2");
+}
+
+TEST_CASE("Error: tag with no values is valid", "[schema][errors]") {
+    SchemaParser parser;
+    // A tag with no enum values — this is technically valid (empty set)
+    bool ok = parser.parseString("tag EmptyTag\nschema foo\nbar");
+    CHECK(ok);
+    auto *tag = parser.findTag("EmptyTag");
+    REQUIRE(tag != nullptr);
+    CHECK(tag->values.empty());
+    CHECK_FALSE(tag->isIntTag);
+}
+
+TEST_CASE("Error: negative volume is valid", "[schema][errors]") {
+    SchemaParser parser;
+    bool ok = parser.parseString("schema neg\nvolume -10000\nsample1");
+    CHECK(ok);
+    auto *s = parser.findSchema("neg");
+    REQUIRE(s != nullptr);
+    CHECK(s->playParams.volume == -10000);
+}
+
+TEST_CASE("Error: sample with quoted text preserved", "[schema][errors]") {
+    SchemaParser parser;
+    bool ok = parser.parseString(R"(
+        schema dialog
+        samp1 "Hello world"
+        samp2 "Goodbye" freq 5
+    )");
+    CHECK(ok);
+
+    auto *s = parser.findSchema("dialog");
+    REQUIRE(s != nullptr);
+    REQUIRE(s->samples.size() == 2);
+    CHECK(s->samples[0].text == "Hello world");
+    CHECK(s->samples[1].text == "Goodbye");
+    CHECK(s->samples[1].frequency == 5);
 }

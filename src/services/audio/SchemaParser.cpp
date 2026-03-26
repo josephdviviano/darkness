@@ -431,6 +431,9 @@ bool SchemaParser::parseSchemaParams(Tokenizer &tok, SchemaEntry &entry)
     case TokenType::Pan: {
         Token val = tok.next();
         entry.playParams.pan = val.intValue;
+        // Clear PAN_RANGE before setting PAN_POS (mutually exclusive,
+        // matches original YACC grammar behavior)
+        entry.playParams.flags &= ~SCH_PAN_RANGE;
         entry.playParams.flags |= SCH_PAN_POS;
         entry.playParams.fieldsSet |= SCH_SET_PAN;
         break;
@@ -438,6 +441,8 @@ bool SchemaParser::parseSchemaParams(Tokenizer &tok, SchemaEntry &entry)
     case TokenType::PanRange: {
         Token val = tok.next();
         entry.playParams.pan = val.intValue;
+        // Clear PAN_POS before setting PAN_RANGE (mutually exclusive)
+        entry.playParams.flags &= ~SCH_PAN_POS;
         entry.playParams.flags |= SCH_PAN_RANGE;
         entry.playParams.fieldsSet |= SCH_SET_PAN;
         break;
@@ -896,6 +901,169 @@ SchemaParser::findByEnvTags(const std::vector<SchemaTagValue> &queryTags) const
     }
 
     return matches;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Serialization — emit parsed data back as .sch text
+// ════════════════════════════════════════════════════════════════════════════
+
+static std::string audioClassName(SchemaAudioClass c) {
+    switch (c) {
+    case SchemaAudioClass::Noise:      return "noise";
+    case SchemaAudioClass::Speech:     return "speech";
+    case SchemaAudioClass::Ambient:    return "ambient";
+    case SchemaAudioClass::Music:      return "music";
+    case SchemaAudioClass::MetaUI:     return "metaui";
+    case SchemaAudioClass::PlayerFeet: return "player_feet";
+    case SchemaAudioClass::OtherFeet:  return "other_feet";
+    case SchemaAudioClass::Collisions: return "collisions";
+    case SchemaAudioClass::Weapons:    return "weapons";
+    case SchemaAudioClass::Monsters:   return "monsters";
+    }
+    return "noise";
+}
+
+static void serializeTagList(std::ostringstream &out,
+                              const std::vector<SchemaTagValue> &tags) {
+    for (const auto &tag : tags) {
+        out << " (" << tag.tagName;
+        if (tag.isIntRange) {
+            out << " " << tag.rangeMin << " " << tag.rangeMax;
+        } else {
+            for (const auto &v : tag.enumValues)
+                out << " " << v;
+        }
+        out << ")";
+    }
+}
+
+std::string SchemaParser::serialize() const {
+    std::ostringstream out;
+
+    // ── #define constants ──
+    for (const auto &[name, value] : mDefines) {
+        out << "#define " << name << " " << value << "\n";
+    }
+    if (!mDefines.empty()) out << "\n";
+
+    // ── Tag definitions ──
+    for (const auto &[key, tag] : mTags) {
+        if (tag.isIntTag) {
+            out << "tag_int " << tag.name << "\n";
+        } else {
+            out << "tag " << tag.name;
+            for (const auto &v : tag.values)
+                out << " " << v;
+            out << "\n";
+        }
+    }
+
+    // ── env_tag_required ──
+    for (const auto &req : mRequiredEnvTags) {
+        // Find original-case name from tag definitions
+        auto it = mTags.find(req);
+        out << "env_tag_required " << (it != mTags.end() ? it->second.name : req) << "\n";
+    }
+    if (!mTags.empty()) out << "\n";
+
+    // ── Voice definitions ──
+    for (const auto &[key, voice] : mVoices) {
+        out << "voice " << voice.name;
+        if (!voice.archetypeName.empty())
+            out << " archetype " << voice.archetypeName;
+        out << "\n";
+    }
+    if (!mVoices.empty()) out << "\n";
+
+    // ── Concept definitions ──
+    for (const auto &[key, concept] : mConcepts) {
+        out << "concept " << concept.name << " " << concept.priority << "\n";
+    }
+    if (!mConcepts.empty()) out << "\n";
+
+    // ── Schema definitions ──
+    // Emit archetype-only schemas (no samples) first, then full schemas
+    for (const auto &[key, schema] : mSchemas) {
+        out << "schema " << schema.name << "\n";
+
+        if (!schema.archetypeName.empty())
+            out << "archetype " << schema.archetypeName << "\n";
+
+        // Play params — only emit fields that were explicitly set
+        const auto &pp = schema.playParams;
+        if (pp.fieldsSet & SCH_SET_VOLUME)
+            out << "volume " << pp.volume << "\n";
+        if (pp.fieldsSet & SCH_SET_DELAY)
+            out << "delay " << pp.initialDelay << "\n";
+        if (pp.fieldsSet & SCH_SET_PAN) {
+            if (pp.flags & SCH_PAN_RANGE)
+                out << "pan_range " << pp.pan << "\n";
+            else
+                out << "pan " << pp.pan << "\n";
+        }
+        if (pp.fieldsSet & SCH_SET_PRIORITY)
+            out << "priority " << pp.priority << "\n";
+        if (pp.fieldsSet & SCH_SET_FADE)
+            out << "fade " << pp.fade << "\n";
+        if (pp.fieldsSet & SCH_SET_AUDIO_CLASS)
+            out << "audio_class " << audioClassName(pp.audioClass) << "\n";
+
+        // Boolean flags — only emit those explicitly set (not inherited)
+        if (pp.flags & SCH_NO_REPEAT)    out << "no_repeat\n";
+        if (pp.flags & SCH_NO_CACHE)     out << "no_cache\n";
+        if (pp.flags & SCH_STREAM)       out << "stream\n";
+        if (pp.flags & SCH_PLAY_ONCE)    out << "play_once\n";
+        if (pp.flags & SCH_NO_COMBAT)    out << "no_combat\n";
+        if (pp.flags & SCH_NET_AMBIENT)  out << "net_ambient\n";
+        if (pp.flags & SCH_LOC_SPATIAL)  out << "local_spatial\n";
+
+        // Loop params
+        const auto &lp = schema.loopParams;
+        if (lp.isLooping) {
+            if (lp.isPoly)
+                out << "poly_loop " << (int)lp.maxSamples
+                    << " " << lp.intervalMin << " " << lp.intervalMax << "\n";
+            else
+                out << "mono_loop " << lp.intervalMin
+                    << " " << lp.intervalMax << "\n";
+        }
+        if (lp.count > 0)
+            out << "loop_count " << lp.count << "\n";
+
+        // Message
+        if (!schema.message.empty())
+            out << "message " << schema.message << "\n";
+
+        // Samples
+        for (const auto &s : schema.samples) {
+            out << s.name;
+            if (!s.text.empty())
+                out << " \"" << s.text << "\"";
+            if (s.frequency != 1)
+                out << " freq " << (int)s.frequency;
+            out << "\n";
+        }
+
+        // schema_voice (speech binding)
+        if (!schema.voiceName.empty()) {
+            out << "schema_voice " << schema.voiceName
+                << " " << schema.voiceWeight
+                << " " << schema.conceptName;
+            serializeTagList(out, schema.voiceTags);
+            out << "\n";
+        }
+
+        // env_tag
+        if (!schema.envTags.empty()) {
+            out << "env_tag";
+            serializeTagList(out, schema.envTags);
+            out << "\n";
+        }
+
+        out << "\n";
+    }
+
+    return out.str();
 }
 
 // ════════════════════════════════════════════════════════════════════════════

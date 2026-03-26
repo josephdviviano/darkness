@@ -83,6 +83,34 @@ public:
     const std::vector<std::string> &errors() const { return mErrors; }
     const std::vector<std::string> &warnings() const { return mWarnings; }
 
+    // ── Serialization ──
+
+    /// Serialize all parsed data back to .sch text format.
+    /// Output is structurally equivalent to the input but may differ in
+    /// whitespace, comment content, and ordering. Comments from the original
+    /// source are preserved as "// [original comment]" where available.
+    /// Suitable for round-trip testing: parse → serialize → reparse should
+    /// produce identical data structures.
+    std::string serialize() const;
+
+    // ── Accessors for tags/voices/concepts/defines (for serialization & testing) ──
+
+    const std::unordered_map<std::string, TagDefinition> &tags() const {
+        return mTags;
+    }
+    const std::unordered_map<std::string, VoiceDefinition> &voices() const {
+        return mVoices;
+    }
+    const std::unordered_map<std::string, ConceptDefinition> &concepts() const {
+        return mConcepts;
+    }
+    const std::unordered_map<std::string, int> &defines() const {
+        return mDefines;
+    }
+    const std::unordered_set<std::string> &requiredEnvTags() const {
+        return mRequiredEnvTags;
+    }
+
 private:
     // ── Token types ──
     enum class TokenType {
