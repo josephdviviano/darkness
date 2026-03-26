@@ -50,6 +50,8 @@ set(DARKNESS_BASE_SOURCES
     servicemanager/DarknessService.h
     servicemanager/DarknessServiceManager.cpp
     servicemanager/DarknessServiceManager.h
+    threading/WorkerThreadPool.cpp
+    threading/WorkerThreadPool.h
 )
 
 add_library(DarknessBase OBJECT ${DARKNESS_BASE_SOURCES})
@@ -64,6 +66,7 @@ target_include_directories(DarknessBase PUBLIC
     ${DARKNESS_SOURCE_DIR}/src/base/loaders
     ${DARKNESS_SOURCE_DIR}/src/base/logger
     ${DARKNESS_SOURCE_DIR}/src/base/servicemanager
+    ${DARKNESS_SOURCE_DIR}/src/base/threading
     ${DARKNESS_SOURCE_DIR}/src/compat
 )
 

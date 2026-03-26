@@ -9,6 +9,7 @@ add_executable(darkness_tests
     test_world_query.cpp
     test_schema_parser.cpp
     test_acoustic_materials.cpp
+    test_worker_thread_pool.cpp
 )
 
 target_link_libraries(darkness_tests PRIVATE
