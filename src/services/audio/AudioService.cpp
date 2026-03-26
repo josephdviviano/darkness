@@ -252,7 +252,8 @@ struct SteamAudioDSPNode {
 
     // Scratch buffers for deinterleaved Steam Audio processing
     // (allocated once at init, never reallocated — safe for audio thread)
-    std::vector<float> monoScratch;   // mono channel for direct effect in/out
+    std::vector<float> monoScratch;   // mono channel (raw downmix, preserved for convolution)
+    std::vector<float> directEffectOut; // mono output from iplDirectEffectApply (filtered)
     std::vector<float> stereoL;       // left channel (binaural output)
     std::vector<float> stereoR;       // right channel (binaural output)
 
@@ -718,18 +719,55 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
 
     // Levels 0-2: Steam Audio processing
     //
-    // Architecture: run binaural HRTF on the raw mono input, then apply direct
-    // effect attenuation as a simple post-multiply on the stereo output.
+    // Architecture: apply IPLDirectEffect (frequency-dependent 3-band attenuation
+    // for distance, air absorption, occlusion, transmission) to mono, then run
+    // binaural HRTF for spatialization. Portal routing is a separate post-HRTF
+    // scalar multiply (geometric, frequency-independent).
     //
-    // Level 0: binaural + direct attenuation (full pipeline)
+    // Level 0: direct effect + binaural (full pipeline)
     // Level 1: direct attenuation only (no binaural — mono passthrough)
     // Level 2: binaural only (no direct attenuation)
     bool runBinaural = (bypassLevel == 0 || bypassLevel == 2) && node->binauralEffect;
     bool runAtten = (bypassLevel == 0 || bypassLevel == 1);
 
+    // Apply Steam Audio direct effect — frequency-dependent 3-band EQ covering
+    // distance attenuation, air absorption, occlusion, and wall transmission.
+    // Processes mono input to a separate output buffer so the raw mono stays
+    // pristine for convolution staging (reverb uses unfiltered mono × distance).
+    float* binauralMono = mono;  // default: feed raw mono to HRTF
+    if (runAtten && !node->skipAttenuation && node->directEffect) {
+        float* directInPtr = mono;
+        IPLAudioBuffer directIn{};
+        directIn.numChannels = 1;
+        directIn.numSamples = static_cast<IPLint32>(frameCount);
+        directIn.data = &directInPtr;
+
+        float* directOutPtr = node->directEffectOut.data();
+        IPLAudioBuffer directOut{};
+        directOut.numChannels = 1;
+        directOut.numSamples = static_cast<IPLint32>(frameCount);
+        directOut.data = &directOutPtr;
+
+        iplDirectEffectApply(node->directEffect, &node->directParams,
+                             &directIn, &directOut);
+        binauralMono = directOutPtr;  // feed filtered mono to HRTF
+
+        // Store scalar attenuation estimate for debug logging and
+        // reflection voice distance ranking (broadband approximation)
+        float atten = node->directParams.distanceAttenuation
+                    * node->directParams.occlusion;
+        if (node->usePortalRouting) {
+            atten *= node->portalAttenuation;
+        }
+        if (atten < 0.001f) atten = 0.001f;
+        node->lastAtten.store(atten, std::memory_order_relaxed);
+    }
+
     // Apply binaural effect (mono → stereo HRTF spatialization).
+    // Uses filtered mono (post-direct-effect) so frequency-dependent
+    // attenuation is spatialized correctly to the listener's head.
     if (runBinaural) {
-        float* binauralMonoPtr = mono;
+        float* binauralMonoPtr = binauralMono;
         IPLAudioBuffer binauralIn{};
         binauralIn.numChannels = 1;
         binauralIn.numSamples = static_cast<IPLint32>(frameCount);
@@ -753,49 +791,15 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
 
         iplBinauralEffectApply(node->binauralEffect, &binParams, &binauralIn, &outBuf);
 
-        // Apply attenuation from the best available propagation path.
-        // Three paths are considered (highest energy wins):
-        //   1. Direct line-of-sight (Steam Audio: distance × occlusion × air)
-        //   2. Portal routing (through doorways/corridors, effective distance)
-        //   3. Transmission through walls (part of direct sim, very quiet)
-        if (runAtten && !node->skipAttenuation) {
-            float airAvg = (node->directParams.airAbsorption[0]
-                          + node->directParams.airAbsorption[1]
-                          + node->directParams.airAbsorption[2]) / 3.0f;
-
-            // Apply wall transmission — when a sound is behind geometry, Steam
-            // Audio computes how much energy passes through the intervening
-            // material (frequency-dependent). The listener hears the unoccluded
-            // portion (occlusion) plus what leaks through (transmission).
-            // When fully occluded (occlusion=0), only transmission remains.
-            // When not occluded (occlusion=1), transmission has no effect.
-            float transAvg = (node->directParams.transmission[0]
-                            + node->directParams.transmission[1]
-                            + node->directParams.transmission[2]) / 3.0f;
-            float directAtten = node->directParams.distanceAttenuation
-                              * (node->directParams.occlusion + transAvg * (1.0f - node->directParams.occlusion))
-                              * airAvg;
-
-            // Architecture B routing:
-            // - Cross-room voices: portal attenuation × last-segment occlusion.
-            //   The IPLSource was positioned at the virtual position (doorway),
-            //   so directAtten reflects occlusion from doorway to listener.
-            // - Same-room / no-room voices: Steam Audio direct path only.
-            //   Wall occlusion is trusted — if Steam Audio says there's a wall,
-            //   the sound is muffled regardless of portal graph reachability.
-            //   (The portal floor was previously overriding legitimate wall
-            //   occlusion for sounds behind walls that happened to be portal-
-            //   reachable through a long doorway chain.)
-            float atten = directAtten;
-            if (node->usePortalRouting) {
-                atten = node->portalAttenuation * directAtten;
-            }
-
-            if (atten < 0.001f) atten = 0.001f;
-            node->lastAtten.store(atten, std::memory_order_relaxed);
+        // Apply portal routing — geometric distance through doorway chain.
+        // This is frequency-independent (not acoustic material filtering)
+        // and separate from the direct effect applied above.
+        if (runAtten && !node->skipAttenuation && node->usePortalRouting) {
+            float portalScale = node->portalAttenuation;
+            if (portalScale < 0.001f) portalScale = 0.001f;
             for (ma_uint32 i = 0; i < frameCount; ++i) {
-                chL[i] *= atten;
-                chR[i] *= atten;
+                chL[i] *= portalScale;
+                chR[i] *= portalScale;
             }
         }
 
@@ -865,20 +869,12 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         }
         node->peakOutput.store(peakOut, std::memory_order_relaxed);
     } else {
-        // No binaural — duplicate mono to both channels, apply direct attenuation
-        float atten = 1.0f;
-        if (runAtten) {
-            atten = node->directParams.distanceAttenuation
-                  * node->directParams.occlusion;
-            float airAvg = (node->directParams.airAbsorption[0]
-                          + node->directParams.airAbsorption[1]
-                          + node->directParams.airAbsorption[2]) / 3.0f;
-            atten *= airAvg;
-            if (atten < 0.001f) atten = 0.001f;
-        }
+        // No binaural — duplicate filtered mono to both channels.
+        // Direct effect was already applied above (binauralMono points to
+        // filtered output if attenuation is active).
         float peakOut = 0.0f;
         for (ma_uint32 i = 0; i < frameCount; ++i) {
-            float s = mono[i] * atten;
+            float s = binauralMono[i];
             stereoOut[i * 2]     = s;
             stereoOut[i * 2 + 1] = s;
             float a = std::fabs(s);
@@ -2603,6 +2599,8 @@ void AudioService::loopStep(float deltaTime)
                     voice->dspNode.directParams.airAbsorption[0] = 1.0f;
                     voice->dspNode.directParams.airAbsorption[1] = 1.0f;
                     voice->dspNode.directParams.airAbsorption[2] = 1.0f;
+                    voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
+                        IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION);
                 }
 
                 // Enable reflection convolution up to the global budget.
@@ -3101,6 +3099,7 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
 
     // Allocate processing buffers (once, never reallocated — audio thread safe)
     dsp.monoScratch.resize(dsp.frameSize);
+    dsp.directEffectOut.resize(dsp.frameSize, 0.0f);
     dsp.stereoL.resize(dsp.frameSize);
     dsp.stereoR.resize(dsp.frameSize);
     dsp.ambiScratch0.resize(mReflectionFrameSize, 0.0f);
