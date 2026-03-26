@@ -348,11 +348,19 @@ TEST_CASE("WorkerThreadPool: destructor calls shutdown", "[threading]") {
 // ─── Thread-Safe Logging Stress Test ─────────────────────────────────────────
 
 TEST_CASE("WorkerThreadPool: concurrent logging does not crash", "[threading]") {
-    // Ensure Logger singleton exists
-    Logger logger;
-    StdLog stdlog;
-    logger.registerLogListener(&stdlog);
-    logger.setLogLevel(Logger::LOG_LEVEL_INFO);
+    // Create Logger/StdLog only if no other test file already owns the singletons
+    // (test_typed_properties and test_world_query leak heap-allocated ones).
+    Logger *logger = nullptr;
+    StdLog *stdlog = nullptr;
+    bool ownsSingletons = !Logger::getSingletonPtr();
+    if (ownsSingletons) {
+        logger = new Logger();
+        stdlog = new StdLog();
+        logger->registerLogListener(stdlog);
+        logger->setLogLevel(Logger::LOG_LEVEL_INFO);
+    } else {
+        logger = Logger::getSingletonPtr();
+    }
 
     WorkerThreadPool pool;
     pool.init(4, 0);
@@ -367,7 +375,11 @@ TEST_CASE("WorkerThreadPool: concurrent logging does not crash", "[threading]") 
     pool.waitForAll();
     pool.shutdown();
 
-    logger.unregisterLogListener(&stdlog);
+    if (ownsSingletons) {
+        logger->unregisterLogListener(stdlog);
+        delete stdlog;
+        delete logger;
+    }
     // If we got here without crashing or TSAN errors, the test passes
     REQUIRE(true);
 }

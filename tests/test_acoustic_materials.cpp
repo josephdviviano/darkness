@@ -98,7 +98,9 @@ TEST_CASE("Thief 2 wood textures match wood-like keywords", "[acoustic][thief2]"
     CHECK(lookupAcousticMaterialKeyword("wood/floor01") == "floor");
     CHECK(lookupAcousticMaterialKeyword("wood/panel03") == "wood");
     CHECK(lookupAcousticMaterialKeyword("wdoor/oak01") == "door");
-    CHECK(lookupAcousticMaterialKeyword("wfloor/parq01") == "floor");
+    // "wfloor" is a distinct 6-char keyword (wood floor) — matched before
+    // generic "floor" because it's longer. Maps to wood acoustics.
+    CHECK(lookupAcousticMaterialKeyword("wfloor/parq01") == "wfloor");
     CHECK(lookupAcousticMaterialKeyword("bark/tree01") == "bark");
 }
 

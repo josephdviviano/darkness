@@ -791,6 +791,10 @@ static void registerConsoleSettings(
     // Helper lambda that captures window+state for title bar refresh
     auto refreshTitle = [window, &state]() { updateTitleBar(window, state); };
 
+    // ── Rendering ──
+
+    dbgConsole.setGroup("Rendering");
+
     dbgConsole.addCategorical("filter_mode",
         {"point", "bilinear", "trilinear", "anisotropic"},
         [&state]() { return state.filterMode; },
@@ -806,10 +810,55 @@ static void registerConsoleSettings(
         [&state, refreshTitle](bool v) { state.portalCulling = v; refreshTitle(); },
         "BFS portal traversal culling (reduces draw calls)");
 
-    dbgConsole.addBool("camera_collision",
-        [&state]() { return state.cameraCollision; },
-        [&state, refreshTitle](bool v) { state.cameraCollision = v; refreshTitle(); },
-        "Sphere collision against world geometry (noclip when off)");
+    dbgConsole.addBool("show_objects",
+        [&state]() { return state.showObjects; },
+        [&state](bool v) { state.showObjects = v; },
+        "Render object meshes (.bin models from obj.crf)");
+
+    dbgConsole.addBool("show_fallback_cubes",
+        [&state]() { return state.showFallbackCubes; },
+        [&state](bool v) { state.showFallbackCubes = v; },
+        "Show colored cubes for objects with missing models");
+
+    dbgConsole.addBool("show_raycast",
+        [&state]() { return state.showRaycast; },
+        [&state](bool v) { state.showRaycast = v; },
+        "Debug ray visualization from camera center");
+
+    dbgConsole.addBool("show_acoustic_mesh",
+        [&state]() { return state.showAcousticMesh; },
+        [&state](bool v) { state.showAcousticMesh = v; },
+        "Cyan wireframe overlay of the acoustic scene geometry");
+
+    // Model isolation: "all" = show everything, then one entry per loaded model name.
+    // sortedModelNames is populated during init before this registration runs.
+    {
+        std::vector<std::string> modelOpts = {"all"};
+        modelOpts.insert(modelOpts.end(),
+                         state.sortedModelNames.begin(),
+                         state.sortedModelNames.end());
+        dbgConsole.addCategorical("isolate_model", modelOpts,
+            [&state]() { return state.isolateModelIdx + 1; },  // -1 → 0 ("all")
+            [&state, window](int v) {
+                state.isolateModelIdx = v - 1;  // 0 → -1 ("all")
+                if (state.isolateModelIdx >= 0 &&
+                    state.isolateModelIdx < static_cast<int>(state.sortedModelNames.size())) {
+                    const auto &isoName = state.sortedModelNames[state.isolateModelIdx];
+                    auto cit = state.modelInstanceCounts.find(isoName);
+                    int cnt = (cit != state.modelInstanceCounts.end()) ? cit->second : 0;
+                    std::fprintf(stderr, "Isolating model [%d/%zu]: '%s' (%d instances)\n",
+                                 state.isolateModelIdx + 1, state.sortedModelNames.size(),
+                                 isoName.c_str(), cnt);
+                } else {
+                    std::fprintf(stderr, "Model isolation: OFF (showing all)\n");
+                }
+                updateTitleBar(window, state);
+            });
+    }
+
+    // ── Movement ──
+
+    dbgConsole.setGroup("Movement");
 
     dbgConsole.addBool("physics_mode",
         [&state]() { return state.physicsMode; },
@@ -843,20 +892,15 @@ static void registerConsoleSettings(
             refreshTitle();
         });
 
-    dbgConsole.addBool("show_objects",
-        [&state]() { return state.showObjects; },
-        [&state](bool v) { state.showObjects = v; },
-        "Render object meshes (.bin models from obj.crf)");
+    dbgConsole.addBool("camera_collision",
+        [&state]() { return state.cameraCollision; },
+        [&state, refreshTitle](bool v) { state.cameraCollision = v; refreshTitle(); },
+        "Sphere collision against world geometry (noclip when off)");
 
-    dbgConsole.addBool("show_fallback_cubes",
-        [&state]() { return state.showFallbackCubes; },
-        [&state](bool v) { state.showFallbackCubes = v; },
-        "Show colored cubes for objects with missing models");
-
-    dbgConsole.addBool("show_raycast",
-        [&state]() { return state.showRaycast; },
-        [&state](bool v) { state.showRaycast = v; },
-        "Debug ray visualization from camera center");
+    dbgConsole.addFloat("move_speed", 1.0f, 500.0f,
+        [&state]() { return state.moveSpeed; },
+        [&state, refreshTitle](float v) { state.moveSpeed = v; refreshTitle(); },
+        "Camera/fly movement speed (world units/sec)");
 
     dbgConsole.addBool("step_log",
         [&state]() { return state.physics ? state.physics->getPlayerPhysics().stepLogEnabled() : false; },
@@ -873,36 +917,9 @@ static void registerConsoleSettings(
         },
         "Write per-timestep physics data to physics_log.csv");
 
-    // Model isolation: "all" = show everything, then one entry per loaded model name.
-    // sortedModelNames is populated during init before this registration runs.
-    {
-        std::vector<std::string> modelOpts = {"all"};
-        modelOpts.insert(modelOpts.end(),
-                         state.sortedModelNames.begin(),
-                         state.sortedModelNames.end());
-        dbgConsole.addCategorical("isolate_model", modelOpts,
-            [&state]() { return state.isolateModelIdx + 1; },  // -1 → 0 ("all")
-            [&state, window](int v) {
-                state.isolateModelIdx = v - 1;  // 0 → -1 ("all")
-                if (state.isolateModelIdx >= 0 &&
-                    state.isolateModelIdx < static_cast<int>(state.sortedModelNames.size())) {
-                    const auto &isoName = state.sortedModelNames[state.isolateModelIdx];
-                    auto cit = state.modelInstanceCounts.find(isoName);
-                    int cnt = (cit != state.modelInstanceCounts.end()) ? cit->second : 0;
-                    std::fprintf(stderr, "Isolating model [%d/%zu]: '%s' (%d instances)\n",
-                                 state.isolateModelIdx + 1, state.sortedModelNames.size(),
-                                 isoName.c_str(), cnt);
-                } else {
-                    std::fprintf(stderr, "Model isolation: OFF (showing all)\n");
-                }
-                updateTitleBar(window, state);
-            });
-    }
+    // ── Water ──
 
-    dbgConsole.addFloat("move_speed", 1.0f, 500.0f,
-        [&state]() { return state.moveSpeed; },
-        [&state, refreshTitle](float v) { state.moveSpeed = v; refreshTitle(); },
-        "Camera/fly movement speed (world units/sec)");
+    dbgConsole.setGroup("Water");
 
     dbgConsole.addFloat("wave_amplitude", 0.0f, 5.0f,
         [&state]() { return state.waveAmplitude; },
@@ -924,9 +941,9 @@ static void registerConsoleSettings(
         [&state](float v) { state.waterScrollSpeed = v; },
         "Water UV scroll speed (world units/s)");
 
-    // ── Audio reflection settings ──
+    // ── Audio ──
 
-    // ── Propagation layer toggles ──
+    dbgConsole.setGroup("Audio");
 
     dbgConsole.addBool("portal_routing",
         []() {
@@ -1083,11 +1100,6 @@ static void registerConsoleSettings(
             else   svc->stopAudioRecording();
         },
         "Record final audio output to WAV + position CSV for debugging");
-
-    dbgConsole.addBool("show_acoustic_mesh",
-        [&state]() { return state.showAcousticMesh; },
-        [&state](bool v) { state.showAcousticMesh = v; },
-        "Cyan wireframe overlay of the acoustic scene geometry");
 }
 
 // ── Event handling ──
