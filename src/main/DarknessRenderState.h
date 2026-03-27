@@ -58,6 +58,7 @@ namespace Darkness {
 // Forward declarations
 class ObjectStateMap;
 class DoorSystem;
+class FrobSystem;
 
 // ── MissionData — CPU-side parsed mission content ──
 // Everything loaded from the .mis/.gam files and CRF archives before
@@ -230,8 +231,11 @@ struct RuntimeState {
     // the renderer reads it to override static P$Position transforms.
     ObjectStateMap *objectStates = nullptr;
 
-    // Door system — non-owning pointer, for debug interaction (F key toggles nearest door)
+    // Door system — non-owning pointer, for debug interaction (G key toggles nearest door)
     DoorSystem *doorSystem = nullptr;
+
+    // Frob system — non-owning pointer, for player interaction with objects
+    FrobSystem *frobSystem = nullptr;
 
     // Mode description string for title bar (points to string literal)
     const char *modeStr = "flat-shaded";
