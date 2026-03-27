@@ -190,6 +190,29 @@ public:
         return std::clamp((door.currentValue - door.closedValue) / range, 0.0f, 1.0f);
     }
 
+    /// Get the open fraction for a portal between two rooms.
+    /// Returns 1.0 (fully open) if no door exists between those rooms.
+    float getOpenFractionForRooms(int32_t room1, int32_t room2) const {
+        uint64_t key = roomPairKey(room1, room2);
+        auto it = mRoomPairToDoor.find(key);
+        if (it == mRoomPairToDoor.end()) return 1.0f;
+        return getOpenFraction(it->second);
+    }
+
+    /// Get the sound blocking factor (0.0-1.0) for a portal between two rooms.
+    /// Returns 0.0 if no door or door is fully open.
+    float getSoundBlockingForRooms(int32_t room1, int32_t room2) const {
+        uint64_t key = roomPairKey(room1, room2);
+        auto it = mRoomPairToDoor.find(key);
+        if (it == mRoomPairToDoor.end()) return 0.0f;
+        auto doorIt = mDoors.find(it->second);
+        if (doorIt == mDoors.end()) return 0.0f;
+        const DoorState &door = doorIt->second;
+        // Blocking scales inversely with open fraction: closed=full blocking, open=none
+        float openFrac = getOpenFraction(door.objID);
+        return door.soundBlocking * (1.0f - openFrac);
+    }
+
     /// Check if an object is a door.
     bool isDoor(int32_t objID) const { return mDoors.find(objID) != mDoors.end(); }
 
@@ -201,6 +224,11 @@ public:
 
     /// Set callback for door open/close events (audio blocking, script messages).
     void setEventCallback(DoorEventCallback cb) { mEventCallback = std::move(cb); }
+
+    /// Set callback for continuous audio blocking updates during door animation.
+    /// Called per-frame with (room1, room2, blockingFactor) while a door is moving.
+    using AudioBlockingCallback = std::function<void(int32_t room1, int32_t room2, float factor)>;
+    void setAudioBlockingCallback(AudioBlockingCallback cb) { mAudioBlockingCallback = std::move(cb); }
 
     /// Get all door IDs (for debug enumeration).
     std::vector<int32_t> getAllDoorIDs() const {
@@ -217,6 +245,17 @@ public:
         for (auto &[id, door] : mDoors) {
             if (door.status == kDoorOpening || door.status == kDoorClosing) {
                 updateDoor(door, delta);
+
+                // Continuously update audio blocking during animation.
+                // This is called via the mAudioBlockingCallback which is
+                // set by the renderer to call AudioService::setBlockingFactor.
+                if (mAudioBlockingCallback &&
+                    door.room1 >= 0 && door.room2 >= 0 &&
+                    door.room1 != door.room2 && door.soundBlocking > 0.0f) {
+                    float openFrac = getOpenFraction(id);
+                    float blocking = door.soundBlocking * (1.0f - openFrac);
+                    mAudioBlockingCallback(door.room1, door.room2, blocking);
+                }
             }
         }
     }
@@ -258,6 +297,11 @@ private:
             }
 
             mDoors[id] = door;
+
+            // Build room pair → door mapping for portal queries
+            if (door.room1 >= 0 && door.room2 >= 0 && door.room1 != door.room2) {
+                mRoomPairToDoor[roomPairKey(door.room1, door.room2)] = id;
+            }
         }
     }
 
@@ -464,11 +508,22 @@ private:
             mEventCallback(door.objID, newStatus, door);
     }
 
+    // ── Helpers ──
+
+    /// Pack two room IDs into a single key (order-independent).
+    static uint64_t roomPairKey(int32_t r1, int32_t r2) {
+        if (r1 > r2) std::swap(r1, r2);
+        return (static_cast<uint64_t>(static_cast<uint32_t>(r1)) << 32) |
+                static_cast<uint64_t>(static_cast<uint32_t>(r2));
+    }
+
     // ── Data ──
     std::unordered_map<int32_t, DoorState> mDoors;
+    std::unordered_map<uint64_t, int32_t> mRoomPairToDoor;  // room pair → door objID
     ObjectStateMap *mObjectStates = nullptr;
     ObjectService *mObjSvc = nullptr;
     DoorEventCallback mEventCallback;
+    AudioBlockingCallback mAudioBlockingCallback;
 };
 
 } // namespace Darkness
