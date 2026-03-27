@@ -83,6 +83,7 @@
 #include "SingleFieldDataStorage.h"
 #include "worldquery/ObjSysWorldState.h"
 #include "sim/DoorSystem.h"
+#include "FrobSystem.h"
 #include "FunctionalLoopClient.h"
 
 // TODO: Make these configurable via command-line or config file
@@ -1131,6 +1132,20 @@ static void registerConsoleSettings(
             else   svc->stopAudioRecording();
         },
         "Record final audio output to WAV + position CSV for debugging");
+
+    // ── Interaction ──
+
+    dbgConsole.setGroup("Interaction");
+
+    dbgConsole.addFloat("frob_distance", 1.0f, 30.0f,
+        [&state]() {
+            return state.frobSystem ? state.frobSystem->getFrobDistance()
+                                    : Darkness::kDefaultFrobDistance;
+        },
+        [&state](float v) {
+            if (state.frobSystem) state.frobSystem->setFrobDistance(v);
+        },
+        "Maximum interaction distance (original engine default: 8.0)");
 }
 
 // ── Event handling ──
@@ -1215,6 +1230,13 @@ static void handleEvents(
                     simSvc->pauseSim();
                     std::fprintf(stderr, "Simulation PAUSED\n");
                 }
+            }
+        } else if (ev.type == SDL_MOUSEBUTTONDOWN
+                   && ev.button.button == SDL_BUTTON_RIGHT
+                   && state.frobSystem) {
+            // Right-click: frob the object under the crosshair
+            if (state.frobSystem->hasTarget()) {
+                state.frobSystem->executeFrob();
             }
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_g
                    && !ev.key.repeat && state.doorSystem) {
@@ -1976,6 +1998,19 @@ int main(int argc, char *argv[]) {
     }
     state.doorSystem = &doorSystem;
 
+    // ── Initialize frob system ──
+    // Casts a short ray from the camera each frame to find the nearest frobbable
+    // object (doors, switches, pickups). Right-click triggers the frob action.
+    Darkness::FrobSystem frobSystem;
+    {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
+        Darkness::ObjectCollisionWorld *ocw =
+            state.physics ? state.physics->getObjectCollisionWorld() : nullptr;
+        frobSystem.init(propSvc.get(), objSvc.get(), &doorSystem, ocw);
+    }
+    state.frobSystem = &frobSystem;
+
     // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
     loadWorldTextures(misPath, resPath, mission);
 
@@ -2382,6 +2417,11 @@ int main(int argc, char *argv[]) {
 
             updateMovement(dt, state, mission, dbgConsole);
 
+            // Update frob target — cast ray from camera to find nearest frobbable object
+            if (state.frobSystem) {
+                state.frobSystem->update(state.cam);
+            }
+
             // Set audio listener position before AudioService::loopStep runs
             Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
             audioSvc->setListenerTransform(
@@ -2431,6 +2471,14 @@ int main(int argc, char *argv[]) {
 
             // ── Debug raycast visualization (view 2) ──
             renderDebugOverlay(fc, gpu, mission, state);
+
+            // Frob target indicator — show object name at screen center
+            if (state.frobSystem && state.frobSystem->hasTarget()) {
+                const auto &target = state.frobSystem->getTarget();
+                // bgfx debug text: row 14 (near center), centered horizontally
+                bgfx::dbgTextPrintf(30, 14, 0x0f, "[%s]  (%.1f)",
+                                    target.name.c_str(), target.distance);
+            }
 
             // Debug console overlay (no-op when closed)
             dbgConsole.render();

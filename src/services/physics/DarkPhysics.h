@@ -360,6 +360,12 @@ public:
     /// Access the collision geometry (for renderer camera collision fallback)
     const CollisionGeometry &getCollisionGeometry() const { return mCollision; }
 
+    /// Access the object collision world (for frob ray-vs-OBB, debug display).
+    /// Returns nullptr if no object collision has been built.
+    ObjectCollisionWorld *getObjectCollisionWorld() {
+        return mObjectCollision.get();
+    }
+
     /// Access the player physics (for debug display, etc.)
     const PlayerPhysics &getPlayerPhysics() const { return mPlayer; }
     PlayerPhysics &getPlayerPhysics() { return mPlayer; }

@@ -1,0 +1,236 @@
+/******************************************************************************
+ *
+ *    This file is part of the Darkness engine
+ *    Copyright (C) 2024-2026 darkness contributors
+ *
+ *    This program is free software; you can redistribute it and/or modify
+ *    it under the terms of the GNU General Public License as published by
+ *    the Free Software Foundation; either version 2 of the License, or
+ *    (at your option) any later version.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU General Public License for more details.
+ *
+ *    You should have received a copy of the GNU General Public License
+ *    along with this program; if not, write to the Free Software
+ *    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ *****************************************************************************/
+
+// FrobSystem.h — Player interaction with world objects
+//
+// Casts a short ray from the camera each frame to find the nearest frobbable
+// object. When the player right-clicks, dispatches the appropriate action
+// (door toggle, script message, pickup, etc.).
+//
+// The frob ray tests both world geometry (via RayCaster portal BFS) and
+// object OBBs (via ObjectCollisionGeometry ray-vs-OBB). The nearest hit
+// that has a FrobInfo property or is a door becomes the frob target.
+//
+// Visual feedback: the frob target's object name is shown as debug text.
+// Full HUD integration (crosshair highlight, use prompt) deferred to later.
+
+#pragma once
+
+#include <cstdint>
+#include <cmath>
+#include <string>
+#include <functional>
+
+#include "DarknessMath.h"
+#include "DarknessRendererCore.h"
+#include "physics/ObjectCollisionGeometry.h"
+#include "property/DarkPropertyDefs.h"
+#include "property/TypedProperty.h"
+#include "property/PropertyService.h"
+#include "object/ObjectService.h"
+#include "sim/DoorSystem.h"
+
+namespace Darkness {
+
+// ── FrobInfo property (from Dark Engine) ──
+// P$FrobInfo: 16 bytes, 3 action fields + padding.
+// Each field is a bitfield of frob actions for that context.
+struct PropFrobInfo {
+    uint32_t worldAction;      // actions when frobbed in world
+    uint32_t invAction;        // actions when frobbed in inventory
+    uint32_t toolAction;       // actions when used as tool
+    uint32_t pad;              // zero padding
+};
+
+// Frob action flags (from Dark Engine)
+static constexpr uint32_t kFrobMove        = 0x001;  // pick up object
+static constexpr uint32_t kFrobScript      = 0x002;  // run script
+static constexpr uint32_t kFrobDelete      = 0x004;  // delete object
+static constexpr uint32_t kFrobIgnore      = 0x008;  // no-op
+static constexpr uint32_t kFrobFocusScript = 0x010;  // script on focus
+static constexpr uint32_t kFrobDefault     = 0x100;  // default action (use act/react)
+
+/// Default frob distance — matches the original Dark Engine
+/// (head_focus_dist2_tol = 64.0, so sqrt(64) = 8.0 world units).
+static constexpr float kDefaultFrobDistance = 8.0f;
+
+// ── Frob result ──
+struct FrobTarget {
+    int32_t objID = 0;            // 0 = no target
+    float distance = 0.0f;        // distance to hit point
+    Vector3 hitPoint = {0, 0, 0}; // world-space hit point on object
+    bool isDoor = false;           // true if target is a door
+    uint32_t frobActions = 0;      // worldAction flags from FrobInfo (0 if door)
+    std::string name;              // object/archetype name for display
+};
+
+// ── FrobSystem ──
+
+class FrobSystem {
+public:
+    FrobSystem() = default;
+
+    void init(PropertyService *propSvc, ObjectService *objSvc,
+              DoorSystem *doorSys, ObjectCollisionWorld *collisionWorld) {
+        mPropSvc = propSvc;
+        mObjSvc = objSvc;
+        mDoorSys = doorSys;
+        mCollisionWorld = collisionWorld;
+    }
+
+    /// Update frob target each frame. Cast ray from camera and find nearest
+    /// frobbable object. Call before render so highlight is current.
+    void update(const Camera &cam) {
+        mTarget = {};  // clear
+
+        if (!mCollisionWorld) return;
+
+        // Compute ray from camera position along look direction
+        float cosPitch = std::cos(cam.pitch);
+        Vector3 forward(
+            std::cos(cam.yaw) * cosPitch,
+            std::sin(cam.yaw) * cosPitch,
+            std::sin(cam.pitch));
+
+        Vector3 rayStart(cam.pos[0], cam.pos[1], cam.pos[2]);
+        Vector3 rayEnd = rayStart + forward * mFrobDistance;
+
+        // Test all collision bodies against the ray.
+        // We iterate all bodies rather than doing spatial lookup because
+        // the frob ray is very short (~5 units) and there are typically
+        // only a few hundred objects. If this becomes a bottleneck,
+        // we can add spatial pre-filtering.
+        float bestT = 2.0f;  // > 1.0 means no hit yet
+
+        const auto &bodies = mCollisionWorld->getBodies();
+        for (const auto &body : bodies) {
+            // Quick AABB pre-test: skip bodies whose AABB is far from ray
+            // (the ray is very short so most bodies will be skipped)
+            float midX = (body.aabbMin.x + body.aabbMax.x) * 0.5f;
+            float midY = (body.aabbMin.y + body.aabbMax.y) * 0.5f;
+            float midZ = (body.aabbMin.z + body.aabbMax.z) * 0.5f;
+            float dx = midX - rayStart.x;
+            float dy = midY - rayStart.y;
+            float dz = midZ - rayStart.z;
+            float distSq = dx*dx + dy*dy + dz*dz;
+            // Skip objects far beyond frob range (generous margin for large objects)
+            if (distSq > (mFrobDistance + 10.0f) * (mFrobDistance + 10.0f))
+                continue;
+
+            RayOBBResult result = rayVsOBB(rayStart, rayEnd, body);
+            if (!result.hit || result.t >= bestT)
+                continue;
+
+            // Check if this object is frobbable
+            bool isDoor = mDoorSys && mDoorSys->isDoor(body.objID);
+            bool hasFrob = false;
+            uint32_t frobActions = 0;
+
+            if (!isDoor && mPropSvc) {
+                PropFrobInfo frobInfo;
+                if (getTypedProperty<PropFrobInfo>(mPropSvc, "FrobInfo",
+                                                    body.objID, frobInfo)) {
+                    frobActions = frobInfo.worldAction;
+                    hasFrob = (frobActions != 0 &&
+                               !(frobActions & kFrobIgnore));
+                }
+            }
+
+            if (!isDoor && !hasFrob)
+                continue;  // not frobbable
+
+            // This is the new best frob target
+            bestT = result.t;
+            mTarget.objID = body.objID;
+            mTarget.distance = result.t * mFrobDistance;
+            mTarget.hitPoint = result.point;
+            mTarget.isDoor = isDoor;
+            mTarget.frobActions = frobActions;
+
+            // Get display name
+            if (mObjSvc) {
+                mTarget.name = mObjSvc->getName(body.objID);
+                if (mTarget.name.empty()) {
+                    // Fall back to archetype name
+                    mTarget.name = "obj " + std::to_string(body.objID);
+                }
+            }
+        }
+    }
+
+    /// Execute frob on the current target. Returns true if action was taken.
+    bool executeFrob() {
+        if (mTarget.objID == 0) return false;
+
+        if (mTarget.isDoor && mDoorSys) {
+            mDoorSys->activate(mTarget.objID, kDoorToggle);
+            return true;
+        }
+
+        if (mTarget.frobActions & kFrobScript) {
+            // TODO: send FrobWorldEnd script message (Task 55)
+            std::fprintf(stderr, "Frob: script action on obj %d (%s)\n",
+                         mTarget.objID, mTarget.name.c_str());
+            return true;
+        }
+
+        if (mTarget.frobActions & kFrobMove) {
+            // TODO: pick up object (inventory system, Phase 6)
+            std::fprintf(stderr, "Frob: pickup obj %d (%s)\n",
+                         mTarget.objID, mTarget.name.c_str());
+            return true;
+        }
+
+        if (mTarget.frobActions & kFrobDefault) {
+            // Default frob: if it's also a door archetype, toggle it
+            if (mDoorSys && mDoorSys->isDoor(mTarget.objID)) {
+                mDoorSys->activate(mTarget.objID, kDoorToggle);
+                return true;
+            }
+            // TODO: act/react default behavior (Task 55)
+            std::fprintf(stderr, "Frob: default action on obj %d (%s)\n",
+                         mTarget.objID, mTarget.name.c_str());
+            return true;
+        }
+
+        return false;
+    }
+
+    /// Get the current frob target (updated each frame by update()).
+    const FrobTarget &getTarget() const { return mTarget; }
+
+    /// Check if there's a valid frob target under the crosshair.
+    bool hasTarget() const { return mTarget.objID != 0; }
+
+    /// Set the maximum frob distance (configurable via debug console / YAML).
+    void setFrobDistance(float dist) { mFrobDistance = dist; }
+    float getFrobDistance() const { return mFrobDistance; }
+
+private:
+    PropertyService *mPropSvc = nullptr;
+    ObjectService *mObjSvc = nullptr;
+    DoorSystem *mDoorSys = nullptr;
+    ObjectCollisionWorld *mCollisionWorld = nullptr;
+    FrobTarget mTarget;
+    float mFrobDistance = kDefaultFrobDistance;
+};
+
+} // namespace Darkness
