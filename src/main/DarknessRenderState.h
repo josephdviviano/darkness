@@ -55,8 +55,9 @@
 
 namespace Darkness {
 
-// Forward declaration — ObjectStateMap is defined in worldquery/ObjectState.h
+// Forward declarations
 class ObjectStateMap;
+class DoorSystem;
 
 // ── MissionData — CPU-side parsed mission content ──
 // Everything loaded from the .mis/.gam files and CRF archives before
@@ -228,6 +229,9 @@ struct RuntimeState {
     // by ObjSysWorldState. Game systems (doors, tweqs, platforms) write here;
     // the renderer reads it to override static P$Position transforms.
     ObjectStateMap *objectStates = nullptr;
+
+    // Door system — non-owning pointer, for debug interaction (F key toggles nearest door)
+    DoorSystem *doorSystem = nullptr;
 
     // Mode description string for title bar (points to string literal)
     const char *modeStr = "flat-shaded";

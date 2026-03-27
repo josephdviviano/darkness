@@ -82,6 +82,7 @@
 #include "DTypeSizeParser.h"
 #include "SingleFieldDataStorage.h"
 #include "worldquery/ObjSysWorldState.h"
+#include "sim/DoorSystem.h"
 #include "FunctionalLoopClient.h"
 
 // TODO: Make these configurable via command-line or config file
@@ -1215,6 +1216,31 @@ static void handleEvents(
                     std::fprintf(stderr, "Simulation PAUSED\n");
                 }
             }
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_g
+                   && !ev.key.repeat && state.doorSystem) {
+            // G: toggle the nearest door (debug interaction).
+            // Finds the closest door to the camera and toggles it open/closed.
+            Darkness::Vector3 camPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+            auto doorIDs = state.doorSystem->getAllDoorIDs();
+            int32_t nearestID = 0;
+            float nearestDist = 1e9f;
+            for (int32_t id : doorIDs) {
+                const auto *door = state.doorSystem->getDoor(id);
+                if (!door) continue;
+                float dx = door->basePosition.x - camPos.x;
+                float dy = door->basePosition.y - camPos.y;
+                float dz = door->basePosition.z - camPos.z;
+                float dist = dx*dx + dy*dy + dz*dz;
+                if (dist < nearestDist) {
+                    nearestDist = dist;
+                    nearestID = id;
+                }
+            }
+            if (nearestID != 0) {
+                state.doorSystem->activate(nearestID, Darkness::kDoorToggle);
+                std::fprintf(stderr, "Toggled door %d (dist=%.1f)\n",
+                             nearestID, std::sqrt(nearestDist));
+            }
         }
     }
 }
@@ -1939,6 +1965,17 @@ int main(int argc, char *argv[]) {
     // Give the renderer access to the mutable object state map (owned by worldQuery)
     state.objectStates = &worldQuery->objectStates();
 
+    // ── Initialize door system ──
+    // Scans for P$RotDoor and P$TransDoor properties, creates DoorState entries,
+    // and initializes ObjectState transforms for each door.
+    Darkness::DoorSystem doorSystem;
+    {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
+        doorSystem.init(propSvc.get(), objSvc.get(), state.objectStates);
+    }
+    state.doorSystem = &doorSystem;
+
     // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
     loadWorldTextures(misPath, resPath, mission);
 
@@ -2270,6 +2307,19 @@ int main(int argc, char *argv[]) {
         loopSvc->step();
     }
 
+    // Register DoorSystem as a SimListener so it receives simStep() calls.
+    // Priority 10 = before physics (which would be 20+ when registered).
+    simSvc->registerListener(&doorSystem, 10);
+
+    // Set up door event callback for logging (audio blocking in Task 62)
+    doorSystem.setEventCallback([](int32_t objID, Darkness::DoorStatus status,
+                                    const Darkness::DoorState &door) {
+        const char *statusNames[] = {"CLOSED", "OPEN", "CLOSING", "OPENING", "HALT"};
+        const char *name = (status >= 0 && status <= 4) ? statusNames[status] : "?";
+        std::fprintf(stderr, "Door %d: %s (room %d↔%d, blocking=%.0f%%)\n",
+                     objID, name, door.room1, door.room2, door.soundBlocking * 100.0f);
+    });
+
     // Start simulation time — SimListeners will begin receiving simStep()
     simSvc->startSim();
 
@@ -2359,9 +2409,10 @@ int main(int argc, char *argv[]) {
         loopSvc->step();
     }
 
-    // Clean up LoopClients before state is destroyed
+    // Clean up LoopClients and SimListeners before state is destroyed
     loopSvc->removeLoopClient(&inputClient);
     loopSvc->removeLoopClient(&renderClient);
+    simSvc->unregisterListener(&doorSystem);
     simSvc->endSim();
 
     destroyGPUResources(gpu);
