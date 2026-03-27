@@ -234,9 +234,16 @@ public:
         return result;
     }
 
-    float getPortalOpenFraction(PortalID /*portal*/) const override {
-        // Stub: all portals fully open until door state in Phase 2
-        return 1.0f;
+    float getPortalOpenFraction(PortalID portal) const override {
+        if (!mPortalOpenFractionFn) return 1.0f;
+        return mPortalOpenFractionFn(portal);
+    }
+
+    /// Inject a function that queries door state for portal open fraction.
+    /// Called by the renderer after DoorSystem is initialized.
+    using PortalOpenFractionFn = std::function<float(PortalID)>;
+    void setPortalOpenFractionFn(PortalOpenFractionFn fn) {
+        mPortalOpenFractionFn = std::move(fn);
     }
 
     std::vector<EntityID> queryRoom(RoomID room,
@@ -514,6 +521,9 @@ private:
     // Mutable object state overrides (doors, platforms, tweqs, etc.)
     // Objects without entries use their static P$Position from the database.
     ObjectStateMap mObjectStates;
+
+    // Portal open fraction query — injected by renderer after DoorSystem init
+    PortalOpenFractionFn mPortalOpenFractionFn;
 
     // Raycaster — injected by renderer, not set at construction time
     RaycastFn mRaycaster;
