@@ -2307,17 +2307,59 @@ int main(int argc, char *argv[]) {
         loopSvc->step();
     }
 
+    // Wire continuous audio blocking updates during door animation
+    doorSystem.setAudioBlockingCallback(
+        [](int32_t room1, int32_t room2, float factor) {
+            Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+            if (audioSvc)
+                audioSvc->setBlockingFactor(room1, room2, factor);
+        });
+
+    // Apply initial blocking for all doors that start closed
+    {
+        Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+        for (int32_t id : doorSystem.getAllDoorIDs()) {
+            const auto *door = doorSystem.getDoor(id);
+            if (door && door->status == Darkness::kDoorClosed &&
+                door->soundBlocking > 0.0f &&
+                door->room1 >= 0 && door->room2 >= 0 &&
+                door->room1 != door->room2) {
+                audioSvc->setBlockingFactor(door->room1, door->room2,
+                                             door->soundBlocking);
+            }
+        }
+    }
+
     // Register DoorSystem as a SimListener so it receives simStep() calls.
     // Priority 10 = before physics (which would be 20+ when registered).
     simSvc->registerListener(&doorSystem, 10);
 
-    // Set up door event callback for logging (audio blocking in Task 62)
+    // Set up door event callback: update audio blocking and log status changes.
+    // When a door starts opening, remove sound blocking. When it finishes
+    // closing, apply full blocking. During animation, blocking scales with
+    // the open fraction (updated per-frame below).
     doorSystem.setEventCallback([](int32_t objID, Darkness::DoorStatus status,
                                     const Darkness::DoorState &door) {
         const char *statusNames[] = {"CLOSED", "OPEN", "CLOSING", "OPENING", "HALT"};
         const char *name = (status >= 0 && status <= 4) ? statusNames[status] : "?";
-        std::fprintf(stderr, "Door %d: %s (room %d↔%d, blocking=%.0f%%)\n",
+        std::fprintf(stderr, "Door %d: %s (room %d<->%d, blocking=%.0f%%)\n",
                      objID, name, door.room1, door.room2, door.soundBlocking * 100.0f);
+
+        // Update audio blocking on door state transitions
+        if (door.room1 >= 0 && door.room2 >= 0 && door.room1 != door.room2) {
+            Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+            if (audioSvc) {
+                if (status == Darkness::kDoorClosed) {
+                    // Door fully closed: apply maximum blocking
+                    audioSvc->setBlockingFactor(door.room1, door.room2,
+                                                 door.soundBlocking);
+                } else if (status == Darkness::kDoorOpen) {
+                    // Door fully open: remove blocking
+                    audioSvc->setBlockingFactor(door.room1, door.room2, 0.0f);
+                }
+                // Opening/closing transitions: blocking updated per-frame below
+            }
+        }
     });
 
     // Start simulation time — SimListeners will begin receiving simStep()
