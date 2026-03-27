@@ -287,6 +287,23 @@ void LoopService::run() {
 
 //------------------------------------------------------
 void LoopService::step() {
+    // Process pending mode request (must happen before dispatching to clients,
+    // otherwise mActiveMode stays null after requestLoopMode() and no clients
+    // ever receive loopStep calls)
+    if (mNewModeRequested) {
+        mNewModeRequested = false;
+        if (mActiveMode)
+            mActiveMode->loopModeEnded();
+        if (mNewLoopMode) {
+            setLoopMode(mNewLoopMode);
+            mActiveMode->loopModeStarted();
+        } else {
+            LOG_FATAL("LoopService::step: Invalid loop mode requested (NULL)");
+            mTerminationRequested = true;
+            return;
+        }
+    }
+
     auto now = std::chrono::steady_clock::now();
     float deltaSeconds = std::chrono::duration<float>(now - mLastFrameTimePoint).count();
     mLastFrameTimePoint = now;

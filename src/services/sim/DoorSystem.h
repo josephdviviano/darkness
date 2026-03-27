@@ -414,6 +414,25 @@ private:
     }
 
     void updateDoor(DoorState &door, float dt) {
+        // Guard against zero velocity (e.g. speed=0 in property data) —
+        // snap to target immediately instead of getting stuck forever.
+        if (std::abs(door.velocity) < 1e-6f) {
+            if (door.status == kDoorOpening) {
+                door.currentValue = door.openValue;
+                door.velocity = 0.0f;
+                door.status = kDoorOpen;
+                applyDoorTransform(door);
+                emitEvent(door, kDoorOpen);
+            } else if (door.status == kDoorClosing) {
+                door.currentValue = door.closedValue;
+                door.velocity = 0.0f;
+                door.status = kDoorClosed;
+                applyDoorTransform(door);
+                emitEvent(door, kDoorClosed);
+            }
+            return;
+        }
+
         door.currentValue += door.velocity * dt;
 
         // Check limits
