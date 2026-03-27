@@ -47,6 +47,7 @@
 #include "property/PropertyService.h"
 #include "object/ObjectService.h"
 #include "sim/DoorSystem.h"
+#include "sim/MessageDispatch.h"
 
 namespace Darkness {
 
@@ -89,11 +90,13 @@ public:
     FrobSystem() = default;
 
     void init(PropertyService *propSvc, ObjectService *objSvc,
-              DoorSystem *doorSys, ObjectCollisionWorld *collisionWorld) {
+              DoorSystem *doorSys, ObjectCollisionWorld *collisionWorld,
+              MessageDispatch *msgDispatch = nullptr) {
         mPropSvc = propSvc;
         mObjSvc = objSvc;
         mDoorSys = doorSys;
         mCollisionWorld = collisionWorld;
+        mMsgDispatch = msgDispatch;
     }
 
     /// Update frob target each frame. Cast ray from camera and find nearest
@@ -177,37 +180,26 @@ public:
     }
 
     /// Execute frob on the current target. Returns true if action was taken.
+    /// Routes through MessageDispatch which handles SwitchLink traversal —
+    /// frobbing a lever sends FrobWorldEnd to the lever, which follows
+    /// SwitchLink relations to send TurnOn to linked doors/objects.
     bool executeFrob() {
         if (mTarget.objID == 0) return false;
 
+        // Route through MessageDispatch if available — this handles
+        // SwitchLink traversal (lever→door) and built-in handlers
+        if (mMsgDispatch) {
+            mMsgDispatch->frobWorldEnd(mTarget.objID, 0 /* player */);
+            std::fprintf(stderr, "Frob: %s obj %d (%s) dist=%.1f\n",
+                         mTarget.isDoor ? "door" : "object",
+                         mTarget.objID, mTarget.name.c_str(),
+                         mTarget.distance);
+            return true;
+        }
+
+        // Fallback: direct door toggle if no message dispatch
         if (mTarget.isDoor && mDoorSys) {
             mDoorSys->activate(mTarget.objID, kDoorToggle);
-            return true;
-        }
-
-        if (mTarget.frobActions & kFrobScript) {
-            // TODO: send FrobWorldEnd script message (Task 55)
-            std::fprintf(stderr, "Frob: script action on obj %d (%s)\n",
-                         mTarget.objID, mTarget.name.c_str());
-            return true;
-        }
-
-        if (mTarget.frobActions & kFrobMove) {
-            // TODO: pick up object (inventory system, Phase 6)
-            std::fprintf(stderr, "Frob: pickup obj %d (%s)\n",
-                         mTarget.objID, mTarget.name.c_str());
-            return true;
-        }
-
-        if (mTarget.frobActions & kFrobDefault) {
-            // Default frob: if it's also a door archetype, toggle it
-            if (mDoorSys && mDoorSys->isDoor(mTarget.objID)) {
-                mDoorSys->activate(mTarget.objID, kDoorToggle);
-                return true;
-            }
-            // TODO: act/react default behavior (Task 55)
-            std::fprintf(stderr, "Frob: default action on obj %d (%s)\n",
-                         mTarget.objID, mTarget.name.c_str());
             return true;
         }
 
@@ -224,11 +216,15 @@ public:
     void setFrobDistance(float dist) { mFrobDistance = dist; }
     float getFrobDistance() const { return mFrobDistance; }
 
+    /// Set the message dispatch system (for SwitchLink traversal).
+    void setMessageDispatch(MessageDispatch *md) { mMsgDispatch = md; }
+
 private:
     PropertyService *mPropSvc = nullptr;
     ObjectService *mObjSvc = nullptr;
     DoorSystem *mDoorSys = nullptr;
     ObjectCollisionWorld *mCollisionWorld = nullptr;
+    MessageDispatch *mMsgDispatch = nullptr;
     FrobTarget mTarget;
     float mFrobDistance = kDefaultFrobDistance;
 };

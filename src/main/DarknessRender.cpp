@@ -83,6 +83,7 @@
 #include "SingleFieldDataStorage.h"
 #include "worldquery/ObjSysWorldState.h"
 #include "sim/DoorSystem.h"
+#include "sim/MessageDispatch.h"
 #include "FrobSystem.h"
 #include "FunctionalLoopClient.h"
 
@@ -2008,8 +2009,29 @@ int main(int argc, char *argv[]) {
         Darkness::ObjectCollisionWorld *ocw =
             state.physics ? state.physics->getObjectCollisionWorld() : nullptr;
         frobSystem.init(propSvc.get(), objSvc.get(), &doorSystem, ocw);
+        // MessageDispatch connected below after creation
     }
     state.frobSystem = &frobSystem;
+
+    // ── Initialize message dispatch ──
+    // Routes script messages (TurnOn, TurnOff, FrobWorldEnd) to handlers.
+    // SwitchLink traversal: frobbing a lever sends TurnOn to linked objects.
+    Darkness::MessageDispatch messageDispatch;
+    messageDispatch.init(worldQuery.get());
+
+    // Register built-in door handler: doors respond to TurnOn/TurnOff/FrobWorldEnd
+    messageDispatch.registerGlobalHandler("TurnOn", [&doorSystem](const Darkness::ScriptMessage &msg) {
+        return doorSystem.activate(msg.to, Darkness::kDoorDoOpen);
+    });
+    messageDispatch.registerGlobalHandler("TurnOff", [&doorSystem](const Darkness::ScriptMessage &msg) {
+        return doorSystem.activate(msg.to, Darkness::kDoorDoClose);
+    });
+    messageDispatch.registerGlobalHandler("FrobWorldEnd", [&doorSystem](const Darkness::ScriptMessage &msg) {
+        return doorSystem.activate(msg.to, Darkness::kDoorToggle);
+    });
+
+    // Connect FrobSystem to MessageDispatch for SwitchLink traversal
+    frobSystem.setMessageDispatch(&messageDispatch);
 
     // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
     loadWorldTextures(misPath, resPath, mission);
