@@ -55,6 +55,9 @@
 
 namespace Darkness {
 
+// Forward declaration — ObjectStateMap is defined in worldquery/ObjectState.h
+class ObjectStateMap;
+
 // ── MissionData — CPU-side parsed mission content ──
 // Everything loaded from the .mis/.gam files and CRF archives before
 // any GPU resources are created.
@@ -220,6 +223,11 @@ struct RuntimeState {
     std::unique_ptr<DarkPhysics> physics;
     bool physicsMode = true;  // physics (walk) mode on by default; BS+P toggles to fly
     bool crouchToggled = false;  // crouch toggle state (C key toggles on/off)
+
+    // Mutable object state — non-owning pointer to the ObjectStateMap owned
+    // by ObjSysWorldState. Game systems (doors, tweqs, platforms) write here;
+    // the renderer reads it to override static P$Position transforms.
+    ObjectStateMap *objectStates = nullptr;
 
     // Mode description string for title bar (points to string literal)
     const char *modeStr = "flat-shaded";

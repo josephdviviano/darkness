@@ -39,6 +39,31 @@ public:
         mCells[key].push_back(id);
     }
 
+    /// Update an entity's position. Moves it to a new cell if needed.
+    /// No-op if the entity was never inserted.
+    void update(EntityID id, const Vector3 &newPos) {
+        auto posIt = mPositions.find(id);
+        if (posIt == mPositions.end())
+            return;
+
+        uint64_t oldKey = cellKeyFromPos(posIt->second);
+        uint64_t newKey = cellKeyFromPos(newPos);
+        posIt->second = newPos;
+
+        if (oldKey != newKey) {
+            // Remove from old cell
+            auto cellIt = mCells.find(oldKey);
+            if (cellIt != mCells.end()) {
+                auto &vec = cellIt->second;
+                vec.erase(std::remove(vec.begin(), vec.end(), id), vec.end());
+                if (vec.empty())
+                    mCells.erase(cellIt);
+            }
+            // Insert into new cell
+            mCells[newKey].push_back(id);
+        }
+    }
+
     /// Remove an entity (uses its stored position to find the correct cell).
     void remove(EntityID id) {
         auto posIt = mPositions.find(id);
@@ -55,12 +80,6 @@ public:
         }
 
         mPositions.erase(posIt);
-    }
-
-    /// Update an entity's position (remove from old cell, insert into new).
-    void update(EntityID id, const Vector3 &newPos) {
-        remove(id);
-        insert(id, newPos);
     }
 
     /// Clear all entries.

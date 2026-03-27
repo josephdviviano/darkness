@@ -21,6 +21,7 @@
 #include <functional>
 
 #include "IWorldQuery.h"
+#include "ObjectState.h"
 #include "SpatialIndex.h"
 #include "ServiceCommon.h"
 #include "link/LinkCommon.h"
@@ -44,16 +45,37 @@ public:
           mRoomSvc(roomSvc) {}
 
     // ========================================================================
+    // Object state overrides (mutable transforms for doors, platforms, etc.)
+    // ========================================================================
+
+    /// Access the mutable object state map. Game systems use this to set
+    /// transform overrides for objects that move at runtime.
+    ObjectStateMap &objectStates() { return mObjectStates; }
+    const ObjectStateMap &objectStates() const { return mObjectStates; }
+
+    /// Update an object's runtime position and keep the SpatialIndex in sync.
+    /// Call this instead of directly modifying ObjectStateMap when position changes.
+    void setObjectPosition(int32_t objID, const Vector3 &pos) {
+        mObjectStates.get(objID).setPosition(pos);
+        if (mSpatialPopulated)
+            mSpatialIndex.update(static_cast<EntityID>(objID), pos);
+    }
+
+    // ========================================================================
     // Entity queries
     // ========================================================================
 
     bool exists(EntityID id) const override { return mObjSvc->exists(id); }
 
     Vector3 getPosition(EntityID id) const override {
+        const ObjectState *st = mObjectStates.tryGet(static_cast<int32_t>(id));
+        if (st) return st->position;
         return mObjSvc->position(id);
     }
 
     Quaternion getOrientation(EntityID id) const override {
+        const ObjectState *st = mObjectStates.tryGet(static_cast<int32_t>(id));
+        if (st) return st->orientation;
         return mObjSvc->orientation(id);
     }
 
@@ -488,6 +510,10 @@ private:
     PropertyService *mPropSvc;
     LinkService *mLinkSvc;
     RoomService *mRoomSvc;
+
+    // Mutable object state overrides (doors, platforms, tweqs, etc.)
+    // Objects without entries use their static P$Position from the database.
+    ObjectStateMap mObjectStates;
 
     // Raycaster — injected by renderer, not set at construction time
     RaycastFn mRaycaster;

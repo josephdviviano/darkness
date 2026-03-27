@@ -636,22 +636,51 @@ static void renderObjects(
                 // Compute conservative world-space AABB from model bbox + position.
                 // Ignores rotation for speed — the resulting box is larger than
                 // the true oriented bbox, so we never cull something visible.
-                float halfX = (mesh.bboxMax[0] - mesh.bboxMin[0]) * 0.5f * obj.scaleX;
-                float halfY = (mesh.bboxMax[1] - mesh.bboxMin[1]) * 0.5f * obj.scaleY;
-                float halfZ = (mesh.bboxMax[2] - mesh.bboxMin[2]) * 0.5f * obj.scaleZ;
+                // Use runtime position if available (moving doors/platforms).
+                float cx = obj.x, cy = obj.y, cz = obj.z;
+                float csx = obj.scaleX, csy = obj.scaleY, csz = obj.scaleZ;
+                const Darkness::ObjectState *cullState = state.objectStates
+                    ? state.objectStates->tryGet(obj.objID) : nullptr;
+                if (cullState) {
+                    cx = cullState->position.x; cy = cullState->position.y; cz = cullState->position.z;
+                    csx = cullState->scale.x; csy = cullState->scale.y; csz = cullState->scale.z;
+                }
+                float halfX = (mesh.bboxMax[0] - mesh.bboxMin[0]) * 0.5f * csx;
+                float halfY = (mesh.bboxMax[1] - mesh.bboxMin[1]) * 0.5f * csy;
+                float halfZ = (mesh.bboxMax[2] - mesh.bboxMin[2]) * 0.5f * csz;
                 float extent = std::max({halfX, halfY, halfZ});  // sphere-ish bound
                 if (!fc.objFrustum.testAABB(
-                        obj.x - extent, obj.y - extent, obj.z - extent,
-                        obj.x + extent, obj.y + extent, obj.z + extent))
+                        cx - extent, cy - extent, cz - extent,
+                        cx + extent, cy + extent, cz + extent))
                     return;
             }
         }
 
-        // Compute per-object model matrix from position + angles
+        // Compute per-object model matrix. If the object has a runtime state
+        // override (door opening, platform moving, tweq animating), use that
+        // transform instead of the static P$Position from the .mis file.
         float objMtx[16];
-        buildModelMatrix(objMtx, obj.x, obj.y, obj.z,
-                         obj.heading, obj.pitch, obj.bank,
-                         obj.scaleX, obj.scaleY, obj.scaleZ);
+        const Darkness::ObjectState *objState = state.objectStates
+            ? state.objectStates->tryGet(obj.objID) : nullptr;
+        if (objState && !(objState->flags & Darkness::kObjStateDestroyed)) {
+            if (objState->flags & Darkness::kObjStateHidden)
+                return;  // skip hidden objects (blink tweq, etc.)
+            // Build matrix from runtime state angles (already in radians)
+            const float negH = -objState->heading;
+            const float negP = -objState->pitch;
+            const float negB = -objState->bank;
+            bx::mtxRotateXYZ(objMtx, negB, negP, negH);
+            objMtx[ 0] *= objState->scale.x; objMtx[ 1] *= objState->scale.x; objMtx[ 2] *= objState->scale.x;
+            objMtx[ 4] *= objState->scale.y; objMtx[ 5] *= objState->scale.y; objMtx[ 6] *= objState->scale.y;
+            objMtx[ 8] *= objState->scale.z; objMtx[ 9] *= objState->scale.z; objMtx[10] *= objState->scale.z;
+            objMtx[12] = objState->position.x;
+            objMtx[13] = objState->position.y;
+            objMtx[14] = objState->position.z;
+        } else {
+            buildModelMatrix(objMtx, obj.x, obj.y, obj.z,
+                             obj.heading, obj.pitch, obj.bank,
+                             obj.scaleX, obj.scaleY, obj.scaleZ);
+        }
 
         std::string modelName(obj.modelName);
 
@@ -1906,6 +1935,9 @@ int main(int argc, char *argv[]) {
                   Darkness::RayHit &hit) {
             return Darkness::raycastWorld(mission.wrData, from, to, hit);
         });
+
+    // Give the renderer access to the mutable object state map (owned by worldQuery)
+    state.objectStates = &worldQuery->objectStates();
 
     // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
     loadWorldTextures(misPath, resPath, mission);
