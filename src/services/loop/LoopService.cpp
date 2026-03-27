@@ -132,6 +132,7 @@ LoopService::~LoopService() {}
 //------------------------------------------------------
 bool LoopService::init() {
     mStartTime = std::chrono::steady_clock::now();
+    mLastFrameTimePoint = mStartTime;
     return true;
 }
 
@@ -256,18 +257,7 @@ void LoopService::run() {
     }
 
     while (!mTerminationRequested) {
-        bool debugFrame = mDebugOneFrame;
-        mDebugOneFrame = false;
-
-        if (debugFrame) {
-            LOG_FATAL("---- LoopService one frame timings ----");
-            mActiveMode->debugOneFrame();
-        }
-
-        unsigned long lFrameStart = getCurrentTime();
-        unsigned long deltaTime = lFrameStart - mLastFrameTime;
-
-        mActiveMode->loopStep(deltaTime);
+        step();
 
         if (mNewModeRequested) {
             mNewModeRequested = false;
@@ -286,15 +276,6 @@ void LoopService::run() {
             // Signalize the start of the loop
             mActiveMode->loopModeStarted();
         }
-
-        mLastFrameLength = getCurrentTime() - mLastFrameTime;
-
-        if (debugFrame) {
-            LOG_FATAL(
-                "---- One frame timings end. Total frame time: %d ms ----",
-                mLastFrameLength);
-        }
-        mLastFrameTime = lFrameStart;
     }
 
     if (mActiveMode) {
@@ -306,14 +287,32 @@ void LoopService::run() {
 
 //------------------------------------------------------
 void LoopService::step() {
-    unsigned long lFrameStart = getCurrentTime();
-    unsigned long deltaTime = lFrameStart - mLastFrameTime;
+    auto now = std::chrono::steady_clock::now();
+    float deltaSeconds = std::chrono::duration<float>(now - mLastFrameTimePoint).count();
+    mLastFrameTimePoint = now;
+
+    // Cap delta to prevent physics/sim explosion after long stalls (e.g.
+    // window focus loss, debugger breakpoint). 100ms = 10fps minimum.
+    if (deltaSeconds > 0.1f)
+        deltaSeconds = 0.1f;
+
+    bool debugFrame = mDebugOneFrame;
+    mDebugOneFrame = false;
+
+    if (debugFrame && mActiveMode) {
+        LOG_FATAL("---- LoopService one frame timings ----");
+        mActiveMode->debugOneFrame();
+    }
 
     if (mActiveMode)
-        mActiveMode->loopStep(deltaTime);
+        mActiveMode->loopStep(deltaSeconds);
 
-    mLastFrameLength = getCurrentTime() - mLastFrameTime;
-    mLastFrameTime = lFrameStart;
+    mLastFrameLength = static_cast<unsigned long>(deltaSeconds * 1000.0f);
+
+    if (debugFrame) {
+        LOG_FATAL("---- One frame timings end. Total frame time: %lu ms ----",
+                  mLastFrameLength);
+    }
 }
 
 

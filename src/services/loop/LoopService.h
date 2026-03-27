@@ -202,7 +202,10 @@ protected:
     /// Start time for timing purposes
     std::chrono::steady_clock::time_point mStartTime;
 
-    /// Time of the last frame (absolute)
+    /// Time point of the last frame (for delta calculation)
+    std::chrono::steady_clock::time_point mLastFrameTimePoint;
+
+    /// Time of the last frame (absolute, milliseconds — legacy, for getCurrentTime())
     unsigned long mLastFrameTime;
 
     /// Length of the last frame (in miliseconds)
