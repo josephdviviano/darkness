@@ -147,12 +147,15 @@ service listeners
 #define LOOPCLIENT_ID_GUI 4
 #define LOOPCLIENT_ID_PLAYER 8
 #define LOOPCLIENT_ID_AUDIO 16
+#define LOOPCLIENT_ID_SIM 32
 
 // Input first
 #define LOOPCLIENT_PRIORITY_INPUT 1
 // Post - input handling
 #define LOOPCLIENT_PRIORITY_POSTINPUT 20
-// Audio after post-input, before GUI/renderer
+// Simulation time (pause, flow coefficient) — after input, before audio
+#define LOOPCLIENT_PRIORITY_SIM 50
+// Audio after sim, before GUI/renderer
 #define LOOPCLIENT_PRIORITY_AUDIO 100
 // GUI some time before render
 #define LOOPCLIENT_PRIORITY_GUI 900

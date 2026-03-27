@@ -67,10 +67,21 @@ template <> const size_t ServiceImpl<SimService>::SID = __SERVICE_ID_SIM;
 
 SimService::SimService(ServiceManager *manager, const std::string &name)
     : ServiceImpl<SimService>(manager, name), mTimeCoeff(1), mSimTime(0),
-      mPaused(false) {}
+      mPaused(false), mSimRunning(false) {
+    // LoopClient definition — runs after input, before audio
+    mLoopClientDef.id = LOOPCLIENT_ID_SIM;
+    mLoopClientDef.mask = LOOPMODE_INPUT | LOOPMODE_RENDER;
+    mLoopClientDef.name = "SimService";
+    mLoopClientDef.priority = LOOPCLIENT_PRIORITY_SIM;
+}
 
 //------------------------------------------------------
-bool SimService::init() { return true; }
+bool SimService::init() {
+    // Register as a LoopClient so we receive per-frame loopStep() calls
+    LoopServicePtr loopSvc = GET_SERVICE(LoopService);
+    loopSvc->addLoopClient(this);
+    return true;
+}
 
 //------------------------------------------------------
 SimService::~SimService() {}
@@ -142,7 +153,7 @@ void SimService::registerListener(SimListener *listener, size_t priority) {
 
 //------------------------------------------------------
 void SimService::unregisterListener(SimListener *listener) {
-    SimListeners::iterator it;
+    SimListeners::iterator it = mSimListeners.begin();
 
     while (it != mSimListeners.end()) {
         if (it->second == listener) {

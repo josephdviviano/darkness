@@ -82,6 +82,7 @@
 #include "DTypeSizeParser.h"
 #include "SingleFieldDataStorage.h"
 #include "worldquery/ObjSysWorldState.h"
+#include "FunctionalLoopClient.h"
 
 // TODO: Make these configurable via command-line or config file
 static const int WINDOW_WIDTH  = 1280;
@@ -1171,6 +1172,20 @@ static void handleEvents(
             // SDL_KEYDOWN with key.repeat filtered out ensures we only jump
             // on the initial press, not on OS key-repeat while held.
             state.physics->playerJump();
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_p
+                   && !ev.key.repeat) {
+            // P: toggle simulation pause. Physics, doors, tweqs, and platforms
+            // freeze while audio and rendering continue.
+            Darkness::SimServicePtr simSvc = GET_SERVICE(Darkness::SimService);
+            if (simSvc->isSimRunning()) {
+                if (simSvc->isSimPaused()) {
+                    simSvc->unPauseSim();
+                    std::fprintf(stderr, "Simulation UNPAUSED\n");
+                } else {
+                    simSvc->pauseSim();
+                    std::fprintf(stderr, "Simulation PAUSED\n");
+                }
+            }
         }
     }
 }
@@ -1225,8 +1240,20 @@ static void updateMovement(
         // Feed camera pitch to physics for diagnostic logging
         state.physics->getPlayerPhysics().setCameraPitch(state.cam.pitch);
 
-        // Step the physics simulation
-        state.physics->step(dt);
+        // Step the physics simulation (respects sim pause — when paused,
+        // player movement input is accepted but not simulated, so the player
+        // freezes in place). SimService applies flow coefficient for slow-mo.
+        {
+            Darkness::SimServicePtr simSvc = GET_SERVICE(Darkness::SimService);
+            float simDt = dt;
+            if (simSvc->isSimRunning()) {
+                if (simSvc->isSimPaused())
+                    simDt = 0.0f;
+                else
+                    simDt = dt * simSvc->getFlowCoeff();
+            }
+            state.physics->step(simDt);
+        }
 
         // Read back eye position and lean tilt from physics into camera
         Darkness::Vector3 eye = state.physics->getPlayerEyePosition();
@@ -2185,73 +2212,125 @@ int main(int argc, char *argv[]) {
         state.probeBakeNeeded = false;
     }
 
-    auto lastTime = std::chrono::high_resolution_clock::now();
-    // state.waterElapsed, state.running have defaults from struct initializer
-    while (state.running) {
-        auto now = std::chrono::high_resolution_clock::now();
-        float dt = std::chrono::duration<float>(now - lastTime).count();
-        lastTime = now;
-        dt = std::min(dt, 0.1f);
-        state.waterElapsed += dt;
+    // ── Set up LoopService for priority-ordered frame dispatch ──
+    //
+    // Execution order per frame (by LoopClient priority):
+    //   1. InputClient     (priority 1)    — SDL events, movement, listener xform
+    //   2. SimService      (priority 50)   — sim time, pause, dispatches to SimListeners
+    //   3. AudioService    (priority 100)  — voice management, Steam Audio sim kick
+    //   4. RenderClient    (priority 1024) — lightmaps, all render passes, bgfx::frame
+    //
+    // SimService and AudioService register themselves during bootstrapFinished().
+    // We create the LoopMode, register our two FunctionalLoopClients, then drive
+    // the loop with loopService->step().
+    Darkness::LoopServicePtr loopSvc = GET_SERVICE(Darkness::LoopService);
+    Darkness::SimServicePtr simSvc = GET_SERVICE(Darkness::SimService);
 
-        handleEvents(state, dbgConsole, window);
+    {
+        Darkness::LoopModeDefinition gameMode;
+        gameMode.id = 1;
+        gameMode.mask = LOOPMODE_INPUT | LOOPMODE_RENDER;
+        gameMode.name = "GameRunning";
+        loopSvc->createLoopMode(gameMode);
+        loopSvc->requestLoopMode(gameMode.id);
+        // Force the pending mode request to take effect immediately
+        // (normally happens at start of run(), but we use step())
+        loopSvc->step();
+    }
 
-        // When the window loses focus (Command+Tab on macOS, Alt+Tab elsewhere),
-        // skip rendering entirely. The Metal drawable is invalid while backgrounded
-        // and submitting draw calls would segfault. We still call bgfx::frame() with
-        // no submissions to keep the internal state ticking, and sleep briefly to
-        // avoid burning CPU in a tight poll loop.
-        if (!state.windowFocused) {
-            bgfx::frame();
-            SDL_Delay(16);  // ~60Hz idle polling rate
-            lastTime = std::chrono::high_resolution_clock::now();  // reset clock to avoid dt spike on refocus
-            continue;
-        }
+    // Start simulation time — SimListeners will begin receiving simStep()
+    simSvc->startSim();
 
-        updateMovement(dt, state, mission, dbgConsole);
+    // InputClient: SDL events, player movement, audio listener transform.
+    // Runs first (priority 1) so camera position is current before audio/render.
+    Darkness::FunctionalLoopClient inputClient(
+        LOOPCLIENT_ID_INPUT, "InputClient",
+        LOOPMODE_INPUT | LOOPMODE_RENDER, LOOPCLIENT_PRIORITY_INPUT,
+        [&](float dt) {
+            state.waterElapsed += dt;
 
-        // Update audio listener position and run Steam Audio simulation
-        {
+            handleEvents(state, dbgConsole, window);
+
+            // When unfocused, skip movement but still process events
+            // (so we detect refocus). Render client handles the idle case.
+            if (!state.windowFocused)
+                return;
+
+            updateMovement(dt, state, mission, dbgConsole);
+
+            // Set audio listener position before AudioService::loopStep runs
             Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
             audioSvc->setListenerTransform(
                 Darkness::Vector3(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]),
                 state.cam.yaw, state.cam.pitch);
 
-            // Update player water state for footstep material override
             if (state.physics) {
                 audioSvc->setPlayerInWater(
                     state.physics->getPlayerPhysics().isInWater());
             }
+        });
 
-            audioSvc->updateAudio(dt);
-        }
+    // RenderClient: lightmaps, all render passes, bgfx::frame().
+    // Runs last (priority 1024).
+    Darkness::FunctionalLoopClient renderClient(
+        LOOPCLIENT_ID_RENDERER, "RenderClient",
+        LOOPMODE_RENDER, LOOPCLIENT_PRIORITY_RENDERER,
+        [&](float dt) {
+            // When the window loses focus (Command+Tab on macOS, Alt+Tab elsewhere),
+            // skip rendering entirely. The Metal drawable is invalid while backgrounded
+            // and submitting draw calls would segfault. We still call bgfx::frame() with
+            // no submissions to keep the internal state ticking, and sleep briefly to
+            // avoid burning CPU in a tight poll loop.
+            if (!state.windowFocused) {
+                bgfx::frame();
+                SDL_Delay(16);  // ~60Hz idle polling rate
+                return;
+            }
 
-        updateLightmaps(dt, meshes, mission, gpu);
+            updateLightmaps(dt, meshes, mission, gpu);
 
-        // ── Prepare frame: matrices, fog, samplers, culling ──
-        auto fc = prepareFrame(state, mission);
-        updateTitleBar(window, state);
+            // ── Prepare frame: matrices, fog, samplers, culling ──
+            auto fc = prepareFrame(state, mission);
+            updateTitleBar(window, state);
 
-        // ── View 0: Sky pass ──
-        renderSky(fc, meshes, gpu, mission, state);
+            // ── View 0: Sky pass ──
+            renderSky(fc, meshes, gpu, mission, state);
 
-        // ── View 1: World geometry ──
-        renderWorld(fc, meshes, gpu, mission, state);
+            // ── View 1: World geometry ──
+            renderWorld(fc, meshes, gpu, mission, state);
 
-        // ── Object meshes ──
-        renderObjects(fc, gpu, mission, state);
+            // ── Object meshes ──
+            renderObjects(fc, gpu, mission, state);
 
-        // ── Water surfaces ──
-        renderWater(fc, meshes, gpu, state);
+            // ── Water surfaces ──
+            renderWater(fc, meshes, gpu, state);
 
-        // ── Debug raycast visualization (view 2) ──
-        renderDebugOverlay(fc, gpu, mission, state);
+            // ── Debug raycast visualization (view 2) ──
+            renderDebugOverlay(fc, gpu, mission, state);
 
-        // Debug console overlay (no-op when closed)
-        dbgConsole.render();
+            // Debug console overlay (no-op when closed)
+            dbgConsole.render();
 
-        bgfx::frame();
+            bgfx::frame();
+        });
+
+    loopSvc->addLoopClient(&inputClient);
+    loopSvc->addLoopClient(&renderClient);
+
+    // Note: AudioService already registered itself as a LoopClient during
+    // bootstrapFinished() (priority 100). It receives loopStep(dt) from
+    // LoopService — the manual audioSvc->updateAudio(dt) call is removed.
+    // SimService registered itself in init() (priority 50).
+
+    // ── Main loop — LoopService drives frame dispatch ──
+    while (state.running && !loopSvc->isTerminationRequested()) {
+        loopSvc->step();
     }
+
+    // Clean up LoopClients before state is destroyed
+    loopSvc->removeLoopClient(&inputClient);
+    loopSvc->removeLoopClient(&renderClient);
+    simSvc->endSim();
 
     destroyGPUResources(gpu);
     shutdownWindow(window);
