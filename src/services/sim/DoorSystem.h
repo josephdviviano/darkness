@@ -487,24 +487,24 @@ private:
             break;
         }
 
-        // Also compute bbox center — if non-zero, the model origin is NOT at
-        // the bbox center, meaning the model may already be edge-aligned.
-        Vector3 bboxCenter(0.0f);
+        // Log bbox center to check if model is centered or edge-aligned.
         if (mParsedModels) {
-            char modelName[16] = {};
-            if (getTypedProperty<char[16]>(propSvc, "ModelName", objID, modelName)) {
-                auto it = mParsedModels->find(std::string(modelName));
-                if (it != mParsedModels->end()) {
-                    const auto &mesh = it->second;
-                    bboxCenter = Vector3(
-                        (mesh.bboxMin[0] + mesh.bboxMax[0]) * 0.5f,
-                        (mesh.bboxMin[1] + mesh.bboxMax[1]) * 0.5f,
-                        (mesh.bboxMin[2] + mesh.bboxMax[2]) * 0.5f);
-                    std::fprintf(stderr, "  Door %d: model '%s' bbox=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f) center=(%.2f,%.2f,%.2f)\n",
-                                 door.objID, modelName,
+            PropModelName mn;
+            if (getTypedProperty<PropModelName>(propSvc, "ModelName", objID, mn)) {
+                std::string mname(mn.name, strnlen(mn.name, 16));
+                auto mit = mParsedModels->find(mname);
+                if (mit != mParsedModels->end()) {
+                    const auto &mesh = mit->second;
+                    Vector3 bc((mesh.bboxMin[0]+mesh.bboxMax[0])*0.5f,
+                               (mesh.bboxMin[1]+mesh.bboxMax[1])*0.5f,
+                               (mesh.bboxMin[2]+mesh.bboxMax[2])*0.5f);
+                    std::fprintf(stderr, "  Door %d: model '%s' "
+                                 "bbox=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f) "
+                                 "center=(%.2f,%.2f,%.2f)\n",
+                                 objID, mname.c_str(),
                                  mesh.bboxMin[0], mesh.bboxMin[1], mesh.bboxMin[2],
                                  mesh.bboxMax[0], mesh.bboxMax[1], mesh.bboxMax[2],
-                                 bboxCenter.x, bboxCenter.y, bboxCenter.z);
+                                 bc.x, bc.y, bc.z);
                 }
             }
         }
