@@ -335,6 +335,12 @@ private:
                 computePivotOffset(door, propSvc, id);
             }
 
+            // Check if this door is in the placement array (= rendered statically)
+            if (mPlacements && mPlacements->find(id) == mPlacements->end()) {
+                std::fprintf(stderr, "  Door %d: WARNING — not in render array! "
+                             "May be a terrain brush, not a .bin model object.\n", id);
+            }
+
             // Do NOT create ObjectState entries here. Doors render through the
             // static P$Position path until they start animating.
 
