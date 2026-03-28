@@ -428,12 +428,16 @@ private:
                 door.basePitch   = static_cast<float>(p.pitch)   * kAngScale;
                 door.baseBank    = static_cast<float>(p.bank)    * kAngScale;
                 door.baseScale   = Vector3(p.sx, p.sy, p.sz);
+                std::fprintf(stderr, "  Door %d: angles from PLACEMENT (raw binary radians)\n", objID);
                 return;
+            } else {
+                std::fprintf(stderr, "  Door %d: NOT IN PLACEMENT MAP — using quaternion fallback!\n", objID);
             }
         }
 
-        // Fallback: use ObjectService (quaternion round-trip)
+        // Fallback: use ObjectService (quaternion round-trip) — WARNING: may mirror
         if (mObjSvc) {
+            std::fprintf(stderr, "  Door %d: angles from QUATERNION ROUND-TRIP (may mirror!)\n", objID);
             door.basePosition = mObjSvc->position(objID);
             Quaternion q = mObjSvc->orientation(objID);
             Matrix3 rotMat = glm::mat3_cast(q);
