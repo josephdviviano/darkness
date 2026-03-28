@@ -206,15 +206,15 @@ public:
 
     /// Get the open fraction (0.0 = closed, 1.0 = open) for portal blocking.
     float getOpenFraction(int32_t objID) const {
+        static constexpr float kTwoPi = 2.0f * 3.14159265f;
         auto it = mDoors.find(objID);
-        if (it == mDoors.end()) return 1.0f;  // unknown = fully open
+        if (it == mDoors.end()) return 1.0f;
         const DoorState &door = it->second;
-        // Use signed targets for clockwise doors (currentValue goes negative)
         float signedOpen = door.openValue;
         float signedClosed = door.closedValue;
         if (door.type == kDoorRotating && door.clockwise) {
-            signedOpen = -door.openValue;
-            signedClosed = -door.closedValue;
+            signedOpen  = (door.openValue > 0.01f)   ? -(kTwoPi - door.openValue)   : 0.0f;
+            signedClosed = (door.closedValue > 0.01f) ? -(kTwoPi - door.closedValue) : 0.0f;
         }
         float range = signedOpen - signedClosed;
         if (std::abs(range) < 1e-6f) return 1.0f;
@@ -589,14 +589,16 @@ private:
 
         door.currentValue += door.velocity * dt;
 
-        // Check limits. For clockwise rotating doors, currentValue goes negative
-        // (e.g., 0 → -4.712 for a 270° clockwise door). The signed target values
-        // account for the direction of travel.
+        // Check limits. For clockwise rotating doors, currentValue goes negative.
+        // A clockwise door with open=270° (4.712 rad) reaches its open position
+        // by rotating 90° clockwise (the short way around), not 270°.
+        // The signed target is -(2π - openValue) when openValue > π.
+        static constexpr float kTwoPi = 2.0f * 3.14159265f;
         float signedOpen = door.openValue;
         float signedClosed = door.closedValue;
         if (door.type == kDoorRotating && door.clockwise) {
-            signedOpen = -door.openValue;
-            signedClosed = -door.closedValue;
+            signedOpen  = (door.openValue > 0.01f)   ? -(kTwoPi - door.openValue)   : 0.0f;
+            signedClosed = (door.closedValue > 0.01f) ? -(kTwoPi - door.closedValue) : 0.0f;
         }
 
         bool reachedOpen = false;
