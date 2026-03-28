@@ -47,6 +47,7 @@
 #include "property/DarkPropertyDefs.h"
 #include "property/PropertyService.h"
 #include "property/TypedProperty.h"
+#include "BinMeshParser.h"
 #include "worldquery/ObjectState.h"
 
 namespace Darkness {
@@ -103,11 +104,18 @@ struct DoorState {
     float pushMass = 0.0f;
 
     // Base transform (object's static position from P$Position)
+    // Note: P$Position stores the model center, NOT the hinge.
     Vector3 basePosition = {0.0f, 0.0f, 0.0f};
     float baseHeading = 0.0f;    // radians
     float basePitch   = 0.0f;    // radians
     float baseBank    = 0.0f;    // radians
     Vector3 baseScale = {1.0f, 1.0f, 1.0f};
+
+    // Pivot offset: vector from hinge to model center in the door's local frame.
+    // For rotating doors, the center traces an arc around the hinge. The pivot
+    // is computed from the .bin model bounding box — half the door width along
+    // the axis perpendicular to the rotation axis.
+    Vector3 pivotOffset = {0.0f, 0.0f, 0.0f};
 
     // Renderer index — index into mission.objData.objects[] for quick lookup.
     // -1 if not found (archetype-only door, shouldn't happen for concrete objects).
@@ -130,10 +138,13 @@ public:
 
     /// Scan for all objects with P$RotDoor or P$TransDoor properties and
     /// create DoorState entries. Call after level load, before sim starts.
+    /// parsedModels is used to compute hinge pivot offsets from bounding boxes.
     void init(PropertyService *propSvc, ObjectService *objSvc,
-              ObjectStateMap *objectStates) {
+              ObjectStateMap *objectStates,
+              const std::unordered_map<std::string, ParsedBinMesh> *parsedModels = nullptr) {
         mObjectStates = objectStates;
         mObjSvc = objSvc;
+        mParsedModels = parsedModels;
 
         // Scan for rotating doors
         initDoorsOfType<PropRotDoor>(propSvc, "RotDoor", kDoorRotating);
@@ -284,6 +295,14 @@ private:
             // via PositionPropertyStorage, which handles the disk→quaternion conversion)
             initDoorBaseTransform(door, propSvc, id);
 
+            // Compute hinge pivot offset from model bounding box.
+            // Matches the Dark Engine's COG computation in doorphys.cpp:
+            //   axis 0 or 1: cog.z = edgeLengths.z / 2
+            //   axis 2:      cog.x = edgeLengths.x / 2
+            if (doorType == kDoorRotating) {
+                computePivotOffset(door, propSvc, id);
+            }
+
             // Initialize ObjectState so the renderer can read the door's position
             if (mObjectStates) {
                 ObjectState &os = mObjectStates->get(id);
@@ -372,6 +391,60 @@ private:
         Vector3 scale(1.0f);
         if (getTypedProperty<Vector3>(propSvc, "Scale", objID, scale)) {
             door.baseScale = scale;
+        }
+    }
+
+    /// Compute the COG (pivot) offset for a rotating door.
+    /// Matches the Dark Engine algorithm in doorphys.cpp UpdateDoorPhysics:
+    ///   If COG is zero, compute from OBB edge lengths:
+    ///     axis 0 or 1 (X/Y rotation): cog.z = edgeLengths.z / 2
+    ///     axis 2      (Z rotation):   cog.x = edgeLengths.x / 2
+    /// This places the COG at the center of the door slab, so that rotation
+    /// around the model origin (hinge) correctly arcs the visual center.
+    void computePivotOffset(DoorState &door, PropertyService *propSvc,
+                             int32_t objID) {
+        // Try P$PhysDims for explicit OBB dimensions
+        PropPhysDims dims;
+        Vector3 edgeLengths(0.0f);
+        if (getTypedProperty<PropPhysDims>(propSvc, "PhysDims", objID, dims)) {
+            edgeLengths = Vector3(dims.sizeX, dims.sizeY, dims.sizeZ);
+        }
+
+        // Fall back to model bounding box if PhysDims has no size
+        if (glm::length(edgeLengths) < 0.01f && mParsedModels) {
+            // Look up model name
+            char modelName[16] = {};
+            if (getTypedProperty<char[16]>(propSvc, "ModelName", objID, modelName)) {
+                std::string mname(modelName);
+                auto it = mParsedModels->find(mname);
+                if (it != mParsedModels->end()) {
+                    const auto &mesh = it->second;
+                    edgeLengths = Vector3(
+                        mesh.bboxMax[0] - mesh.bboxMin[0],
+                        mesh.bboxMax[1] - mesh.bboxMin[1],
+                        mesh.bboxMax[2] - mesh.bboxMin[2]);
+                }
+            }
+        }
+
+        // Compute COG offset matching the Dark Engine convention
+        door.pivotOffset = Vector3(0.0f);
+        switch (door.axis) {
+        case 0:  // X rotation
+        case 1:  // Y rotation
+            door.pivotOffset.z = edgeLengths.z / 2.0f;
+            break;
+        case 2:  // Z rotation (most common for doors)
+            door.pivotOffset.x = edgeLengths.x / 2.0f;
+            break;
+        }
+
+        if (glm::length(door.pivotOffset) > 0.01f) {
+            std::fprintf(stderr, "  Door %d: pivot offset (%.2f, %.2f, %.2f) "
+                         "from edge lengths (%.1f, %.1f, %.1f)\n",
+                         door.objID, door.pivotOffset.x, door.pivotOffset.y,
+                         door.pivotOffset.z, edgeLengths.x, edgeLengths.y,
+                         edgeLengths.z);
         }
     }
 
@@ -480,37 +553,46 @@ private:
         ObjectState &os = mObjectStates->get(door.objID);
 
         if (door.type == kDoorRotating) {
-            // Compose the base orientation with the door's local rotation offset.
-            // The door's origin (P$Position) is at the hinge point as placed in
-            // DromEd, so the position stays fixed — only orientation changes.
+            // Rotating door transform — matches the Dark Engine's algorithm from
+            // GenerateBaseDoorLocations in doorphys.cpp.
             //
-            // We must compose rotations as matrices rather than adding Euler angles,
-            // because adding angles only works when the base orientation aligns with
-            // world axes. For arbitrarily-oriented doors (e.g. a door facing
-            // northeast), the local rotation axis must be transformed through the
-            // base orientation.
+            // The model's origin is at its center, not the hinge. The COG (center
+            // of gravity) offset is a vector from the model origin to the center of
+            // the door slab in local coordinates. When the door rotates, the center
+            // traces an arc around the hinge:
             //
-            // Combined = R_base * R_local_offset
-            // This applies the offset rotation in the door's local coordinate frame.
+            //   base_cog    = R_base * COG
+            //   current_cog = (R_base * R_local) * COG
+            //   position    = basePosition + (current_cog - base_cog)
+            //
+            // This keeps the hinge fixed while the center moves along the arc.
+
             Matrix4 baseMat = glm::eulerAngleZYX(door.baseHeading,
                                                    door.basePitch,
                                                    door.baseBank);
-            // Build axis vector for the local rotation
+
+            // Build the local rotation offset
             Vector3 axisVec(0.0f);
             switch (door.axis) {
-            case 0: axisVec.x = 1.0f; break;  // X axis = bank
-            case 1: axisVec.y = 1.0f; break;  // Y axis = pitch
-            case 2: axisVec.z = 1.0f; break;  // Z axis = heading
+            case 0: axisVec.x = 1.0f; break;
+            case 1: axisVec.y = 1.0f; break;
+            case 2: axisVec.z = 1.0f; break;
             }
             Matrix4 offsetMat = glm::rotate(Matrix4(1.0f), door.currentValue, axisVec);
             Matrix4 combined = baseMat * offsetMat;
+
+            // Compute position arc from COG offset
+            Matrix3 baseMat3 = Matrix3(baseMat);
+            Matrix3 combinedMat3 = Matrix3(combined);
+            Vector3 baseCog = baseMat3 * door.pivotOffset;
+            Vector3 curCog = combinedMat3 * door.pivotOffset;
+            Vector3 posDelta = curCog - baseCog;
 
             // Extract Euler angles from the combined rotation
             float h, p, b;
             glm::extractEulerAngleZYX(combined, h, p, b);
 
-            // Position stays at the hinge (base position) — only orientation changes
-            os.setTransform(door.basePosition, h, p, b);
+            os.setTransform(door.basePosition + posDelta, h, p, b);
             os.scale = door.baseScale;
 
         } else {
@@ -557,6 +639,7 @@ private:
     std::unordered_map<uint64_t, int32_t> mRoomPairToDoor;  // room pair → door objID
     ObjectStateMap *mObjectStates = nullptr;
     ObjectService *mObjSvc = nullptr;
+    const std::unordered_map<std::string, ParsedBinMesh> *mParsedModels = nullptr;
     DoorEventCallback mEventCallback;
     AudioBlockingCallback mAudioBlockingCallback;
 };
