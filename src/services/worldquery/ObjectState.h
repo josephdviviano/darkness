@@ -78,6 +78,14 @@ struct ObjectState {
     // ── State flags ──
     uint32_t flags = kObjStateActive;
 
+    // ── Pre-built model matrix (optional) ──
+    // When hasMatrix is true, the renderer uses this 4x4 matrix directly
+    // instead of building from heading/pitch/bank via bx::mtxRotateXYZ.
+    // This avoids lossy Euler extraction from composed rotation matrices
+    // (which can produce mirrored/flipped representations).
+    float modelMatrix[16] = {};
+    bool hasMatrix = false;
+
     // ── Convenience setters ──
 
     /// Set position + angles (in radians). Recomputes quaternion.

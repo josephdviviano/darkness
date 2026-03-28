@@ -590,22 +590,19 @@ private:
             // Rotating door transform — matches the Dark Engine's algorithm from
             // GenerateBaseDoorLocations in doorphys.cpp.
             //
-            // The model's origin is at its center, not the hinge. The COG (center
-            // of gravity) offset is a vector from the model origin to the center of
-            // the door slab in local coordinates. When the door rotates, the center
-            // traces an arc around the hinge:
+            // We build the final bx-format model matrix DIRECTLY, avoiding the
+            // lossy glm::extractEulerAngleZYX round-trip which can produce
+            // mirrored Euler representations for certain rotations.
             //
-            //   base_cog    = R_base * COG
-            //   current_cog = (R_base * R_local) * COG
-            //   position    = basePosition + (current_cog - base_cog)
-            //
-            // This keeps the hinge fixed while the center moves along the arc.
+            // The bx convention: row-major, v * M. Renderer negates angles to
+            // compensate for Metal's column-major transpose. We replicate the
+            // exact same matrix construction as buildModelMatrix but with the
+            // composed rotation.
 
+            // Build combined rotation: R_base * R_local_offset (in glm, column-major)
             Matrix4 baseMat = glm::eulerAngleZYX(door.baseHeading,
                                                    door.basePitch,
                                                    door.baseBank);
-
-            // Build the local rotation offset
             Vector3 axisVec(0.0f);
             switch (door.axis) {
             case 0: axisVec.x = 1.0f; break;
@@ -620,13 +617,30 @@ private:
             Matrix3 combinedMat3 = Matrix3(combined);
             Vector3 baseCog = baseMat3 * door.pivotOffset;
             Vector3 curCog = combinedMat3 * door.pivotOffset;
-            Vector3 posDelta = curCog - baseCog;
+            Vector3 worldPos = door.basePosition + (curCog - baseCog);
 
-            // Extract Euler angles from the combined rotation
-            float h, p, b;
-            glm::extractEulerAngleZYX(combined, h, p, b);
+            // Build bx-format model matrix directly from the combined rotation.
+            // bx is row-major; the renderer negates angles for the Metal transpose.
+            // Instead of extracting Euler angles (lossy), we negate the glm
+            // column-major rotation (= transpose it) and write directly as bx row-major.
+            // Transposing a rotation matrix = inverting it = negating angles, which
+            // is exactly the -b,-p,-h trick that buildModelMatrix uses.
+            Matrix3 rot3 = Matrix3(combined);
+            float *m = os.modelMatrix;
+            // Transpose the 3x3 rotation (glm column-major → bx row-major with
+            // the negation baked in via transpose)
+            m[ 0] = rot3[0][0]; m[ 1] = rot3[1][0]; m[ 2] = rot3[2][0]; m[ 3] = 0.0f;
+            m[ 4] = rot3[0][1]; m[ 5] = rot3[1][1]; m[ 6] = rot3[2][1]; m[ 7] = 0.0f;
+            m[ 8] = rot3[0][2]; m[ 9] = rot3[1][2]; m[10] = rot3[2][2]; m[11] = 0.0f;
+            // Apply scale (row-scaling, same as buildModelMatrix)
+            m[ 0] *= door.baseScale.x; m[ 1] *= door.baseScale.x; m[ 2] *= door.baseScale.x;
+            m[ 4] *= door.baseScale.y; m[ 5] *= door.baseScale.y; m[ 6] *= door.baseScale.y;
+            m[ 8] *= door.baseScale.z; m[ 9] *= door.baseScale.z; m[10] *= door.baseScale.z;
+            // Translation
+            m[12] = worldPos.x; m[13] = worldPos.y; m[14] = worldPos.z; m[15] = 1.0f;
 
-            os.setTransform(door.basePosition + posDelta, h, p, b);
+            os.hasMatrix = true;
+            os.position = worldPos;
             os.scale = door.baseScale;
 
         } else {
