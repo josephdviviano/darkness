@@ -266,9 +266,18 @@ public:
 
     void simStep(float simTime, float delta) override {
         if (delta <= 0.0f) return;
+        ++mFrameCount;
         for (auto &[id, door] : mDoors) {
             if (door.status == kDoorOpening || door.status == kDoorClosing) {
                 updateDoor(door, delta);
+
+                // Log animation every 15 frames (~4x/sec at 60fps)
+                if (mFrameCount % 15 == 0) {
+                    const ObjectState *os = mObjectStates ? mObjectStates->tryGet(id) : nullptr;
+                    std::fprintf(stderr, "  Door %d: val=%.4f vel=%.4f frac=%.3f pos=(%.2f,%.2f,%.2f)\n",
+                                 id, door.currentValue, door.velocity, getOpenFraction(id),
+                                 os ? os->position.x : 0, os ? os->position.y : 0, os ? os->position.z : 0);
+                }
 
                 // Continuously update audio blocking during animation.
                 // This is called via the mAudioBlockingCallback which is
@@ -315,10 +324,22 @@ private:
             }
 
             // Do NOT create ObjectState entries here. Doors render through the
-            // static P$Position path until they start animating. This ensures the
-            // closed position exactly matches the static renderer (same binary
-            // radian conversion, no quaternion round-trip ambiguity).
-            // ObjectState is created on-demand in startOpening/startClosing.
+            // static P$Position path until they start animating.
+
+            // Log door init details for debugging
+            std::fprintf(stderr, "  Door %d: type=%s axis=%d closed=%.3f open=%.3f speed=%.3f "
+                         "clockwise=%d status=%d\n",
+                         id, (doorType == kDoorRotating ? "rot" : "trans"),
+                         door.axis, door.closedValue, door.openValue,
+                         door.speed, door.clockwise ? 1 : 0, door.status);
+            std::fprintf(stderr, "    basePos=(%.2f,%.2f,%.2f) angles=(h=%.4f,p=%.4f,b=%.4f) "
+                         "scale=(%.2f,%.2f,%.2f)\n",
+                         door.basePosition.x, door.basePosition.y, door.basePosition.z,
+                         door.baseHeading, door.basePitch, door.baseBank,
+                         door.baseScale.x, door.baseScale.y, door.baseScale.z);
+            std::fprintf(stderr, "    pivot=(%.2f,%.2f,%.2f) rooms=(%d,%d) blocking=%.0f%%\n",
+                         door.pivotOffset.x, door.pivotOffset.y, door.pivotOffset.z,
+                         door.room1, door.room2, door.soundBlocking * 100.0f);
 
             mDoors[id] = door;
 
@@ -475,9 +496,26 @@ private:
     void ensureObjectState(DoorState &door) {
         if (door.hasObjectState || !mObjectStates) return;
         door.hasObjectState = true;
-        // Apply the current transform — for a door that was static until now,
-        // this matches applyDoorTransform with the current angle.
         applyDoorTransform(door);
+
+        // Log the ObjectState creation for debugging
+        const ObjectState *os = mObjectStates->tryGet(door.objID);
+        if (os) {
+            std::fprintf(stderr, "  Door %d: ObjectState CREATED at currentValue=%.4f\n"
+                         "    pos=(%.2f,%.2f,%.2f) angles=(h=%.4f,p=%.4f,b=%.4f) hasMatrix=%d\n",
+                         door.objID, door.currentValue,
+                         os->position.x, os->position.y, os->position.z,
+                         os->heading, os->pitch, os->bank, os->hasMatrix ? 1 : 0);
+            if (os->hasMatrix) {
+                const float *m = os->modelMatrix;
+                std::fprintf(stderr, "    matrix: [%.3f %.3f %.3f %.3f]\n"
+                             "            [%.3f %.3f %.3f %.3f]\n"
+                             "            [%.3f %.3f %.3f %.3f]\n"
+                             "            [%.3f %.3f %.3f %.3f]\n",
+                             m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7],
+                             m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
+            }
+        }
     }
 
     void startOpening(DoorState &door) {
@@ -691,6 +729,7 @@ private:
     const std::unordered_map<int32_t, ObjPlacementInfo> *mPlacements = nullptr;
     DoorEventCallback mEventCallback;
     AudioBlockingCallback mAudioBlockingCallback;
+    uint32_t mFrameCount = 0;
 };
 
 } // namespace Darkness
