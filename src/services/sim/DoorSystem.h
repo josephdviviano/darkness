@@ -700,11 +700,21 @@ private:
 
             Matrix4 fullGlm = worldTranslate * baseMat * fromHinge * offsetRot * toHinge * scaleMat;
 
-            // Transpose to bx row-major
+            // Convert glm column-major to bx row-major.
+            // Only transpose the 3x3 rotation block. Translation goes from
+            // glm column 3 to bx row 3 (m[12-14]). A full 4x4 transpose would
+            // put translation values into the rotation block, causing scaling.
             float *m = os.modelMatrix;
-            for (int col = 0; col < 4; ++col)
-                for (int row = 0; row < 4; ++row)
+            for (int col = 0; col < 3; ++col)
+                for (int row = 0; row < 3; ++row)
                     m[row * 4 + col] = fullGlm[col][row];
+            m[ 3] = 0.0f;
+            m[ 7] = 0.0f;
+            m[11] = 0.0f;
+            m[12] = fullGlm[3][0];  // tx
+            m[13] = fullGlm[3][1];  // ty
+            m[14] = fullGlm[3][2];  // tz
+            m[15] = 1.0f;
 
             os.hasMatrix = true;
             os.position = door.basePosition;  // approximate for queries
