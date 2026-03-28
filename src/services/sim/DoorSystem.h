@@ -209,9 +209,16 @@ public:
         auto it = mDoors.find(objID);
         if (it == mDoors.end()) return 1.0f;  // unknown = fully open
         const DoorState &door = it->second;
-        float range = door.openValue - door.closedValue;
+        // Use signed targets for clockwise doors (currentValue goes negative)
+        float signedOpen = door.openValue;
+        float signedClosed = door.closedValue;
+        if (door.type == kDoorRotating && door.clockwise) {
+            signedOpen = -door.openValue;
+            signedClosed = -door.closedValue;
+        }
+        float range = signedOpen - signedClosed;
         if (std::abs(range) < 1e-6f) return 1.0f;
-        return std::clamp((door.currentValue - door.closedValue) / range, 0.0f, 1.0f);
+        return std::clamp((door.currentValue - signedClosed) / range, 0.0f, 1.0f);
     }
 
     /// Get the open fraction for a portal between two rooms.
@@ -530,14 +537,14 @@ private:
 
         door.status = kDoorOpening;
 
-        // Set velocity direction based on door type
+        // Set velocity direction based on door type.
+        // For rotating doors, clockwise=true means negative rotation direction.
+        // The Dark Engine convention: clockwise doors rotate from closed toward
+        // -openValue (e.g., a 270° clockwise door goes from 0 to -4.712 rad).
         if (door.type == kDoorRotating) {
-            // Rotating door: direction depends on clockwise flag
             float dir = door.clockwise ? -1.0f : 1.0f;
-            if (door.openValue < door.closedValue) dir = -dir;
             door.velocity = door.speed * dir;
         } else {
-            // Translating door: direction from closed→open
             float dir = (door.openValue > door.closedValue) ? 1.0f : -1.0f;
             door.velocity = door.speed * dir;
         }
@@ -550,10 +557,9 @@ private:
 
         door.status = kDoorClosing;
 
-        // Reverse velocity direction
+        // Reverse direction
         if (door.type == kDoorRotating) {
             float dir = door.clockwise ? 1.0f : -1.0f;
-            if (door.openValue < door.closedValue) dir = -dir;
             door.velocity = door.speed * dir;
         } else {
             float dir = (door.openValue > door.closedValue) ? -1.0f : 1.0f;
@@ -583,25 +589,31 @@ private:
 
         door.currentValue += door.velocity * dt;
 
-        // Check limits
-        float minVal = std::min(door.closedValue, door.openValue);
-        float maxVal = std::max(door.closedValue, door.openValue);
+        // Check limits. For clockwise rotating doors, currentValue goes negative
+        // (e.g., 0 → -4.712 for a 270° clockwise door). The signed target values
+        // account for the direction of travel.
+        float signedOpen = door.openValue;
+        float signedClosed = door.closedValue;
+        if (door.type == kDoorRotating && door.clockwise) {
+            signedOpen = -door.openValue;
+            signedClosed = -door.closedValue;
+        }
 
         bool reachedOpen = false;
         bool reachedClosed = false;
 
         if (door.status == kDoorOpening) {
-            if ((door.velocity > 0 && door.currentValue >= door.openValue) ||
-                (door.velocity < 0 && door.currentValue <= door.openValue)) {
-                door.currentValue = door.openValue;
+            if ((door.velocity > 0 && door.currentValue >= signedOpen) ||
+                (door.velocity < 0 && door.currentValue <= signedOpen)) {
+                door.currentValue = signedOpen;
                 door.velocity = 0.0f;
                 door.status = kDoorOpen;
                 reachedOpen = true;
             }
         } else if (door.status == kDoorClosing) {
-            if ((door.velocity > 0 && door.currentValue >= door.closedValue) ||
-                (door.velocity < 0 && door.currentValue <= door.closedValue)) {
-                door.currentValue = door.closedValue;
+            if ((door.velocity > 0 && door.currentValue >= signedClosed) ||
+                (door.velocity < 0 && door.currentValue <= signedClosed)) {
+                door.currentValue = signedClosed;
                 door.velocity = 0.0f;
                 door.status = kDoorClosed;
                 reachedClosed = true;
@@ -609,6 +621,8 @@ private:
         }
 
         // Clamp to range (safety)
+        float minVal = std::min(signedClosed, signedOpen);
+        float maxVal = std::max(signedClosed, signedOpen);
         door.currentValue = std::clamp(door.currentValue, minVal, maxVal);
 
         // Update ObjectState transform
@@ -625,19 +639,9 @@ private:
         ObjectState &os = mObjectStates->get(door.objID);
 
         if (door.type == kDoorRotating) {
-            // Rotating door transform — matches the Dark Engine's algorithm from
-            // GenerateBaseDoorLocations in doorphys.cpp.
-            //
-            // We build the final bx-format model matrix DIRECTLY, avoiding the
-            // lossy glm::extractEulerAngleZYX round-trip which can produce
-            // mirrored Euler representations for certain rotations.
-            //
-            // The bx convention: row-major, v * M. Renderer negates angles to
-            // compensate for Metal's column-major transpose. We replicate the
-            // exact same matrix construction as buildModelMatrix but with the
-            // composed rotation.
-
-            // Build combined rotation: R_base * R_local_offset (in glm, column-major)
+            // Build the combined rotation: R_base * R_local_offset (in glm).
+            // Position stays at basePosition (P$Position = hinge point for
+            // properly placed doors in DromEd).
             Matrix4 baseMat = glm::eulerAngleZYX(door.baseHeading,
                                                    door.basePitch,
                                                    door.baseBank);
@@ -650,35 +654,24 @@ private:
             Matrix4 offsetMat = glm::rotate(Matrix4(1.0f), door.currentValue, axisVec);
             Matrix4 combined = baseMat * offsetMat;
 
-            // Compute position arc from COG offset
-            Matrix3 baseMat3 = Matrix3(baseMat);
-            Matrix3 combinedMat3 = Matrix3(combined);
-            Vector3 baseCog = baseMat3 * door.pivotOffset;
-            Vector3 curCog = combinedMat3 * door.pivotOffset;
-            Vector3 worldPos = door.basePosition + (curCog - baseCog);
-
             // Build bx-format model matrix directly from the combined rotation.
-            // bx is row-major; the renderer negates angles for the Metal transpose.
-            // Instead of extracting Euler angles (lossy), we negate the glm
-            // column-major rotation (= transpose it) and write directly as bx row-major.
-            // Transposing a rotation matrix = inverting it = negating angles, which
-            // is exactly the -b,-p,-h trick that buildModelMatrix uses.
+            // Transpose the glm column-major 3x3 into bx row-major — this is
+            // equivalent to bx::mtxRotateXYZ(-b,-p,-h) without the lossy Euler
+            // extraction round-trip.
             Matrix3 rot3 = Matrix3(combined);
             float *m = os.modelMatrix;
-            // Transpose the 3x3 rotation (glm column-major → bx row-major with
-            // the negation baked in via transpose)
             m[ 0] = rot3[0][0]; m[ 1] = rot3[1][0]; m[ 2] = rot3[2][0]; m[ 3] = 0.0f;
             m[ 4] = rot3[0][1]; m[ 5] = rot3[1][1]; m[ 6] = rot3[2][1]; m[ 7] = 0.0f;
             m[ 8] = rot3[0][2]; m[ 9] = rot3[1][2]; m[10] = rot3[2][2]; m[11] = 0.0f;
-            // Apply scale (row-scaling, same as buildModelMatrix)
+            // Scale (row-scaling)
             m[ 0] *= door.baseScale.x; m[ 1] *= door.baseScale.x; m[ 2] *= door.baseScale.x;
             m[ 4] *= door.baseScale.y; m[ 5] *= door.baseScale.y; m[ 6] *= door.baseScale.y;
             m[ 8] *= door.baseScale.z; m[ 9] *= door.baseScale.z; m[10] *= door.baseScale.z;
-            // Translation
-            m[12] = worldPos.x; m[13] = worldPos.y; m[14] = worldPos.z; m[15] = 1.0f;
+            // Translation — position stays at basePosition (hinge)
+            m[12] = door.basePosition.x; m[13] = door.basePosition.y; m[14] = door.basePosition.z; m[15] = 1.0f;
 
             os.hasMatrix = true;
-            os.position = worldPos;
+            os.position = door.basePosition;
             os.scale = door.baseScale;
 
         } else {
