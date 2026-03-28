@@ -487,27 +487,24 @@ private:
             break;
         }
 
-        // Log bbox center to check if model is centered or edge-aligned.
-        // Try every parsed model to find the one matching the door's PhysDims.
+        // Log bbox — search all models for one containing "door" in the name
         if (mParsedModels) {
             for (const auto &[mname, mesh] : *mParsedModels) {
-                float ex = mesh.bboxMax[0] - mesh.bboxMin[0];
-                float ey = mesh.bboxMax[1] - mesh.bboxMin[1];
-                float ez = mesh.bboxMax[2] - mesh.bboxMin[2];
-                if (std::abs(ex - edgeLengths.x) < 0.1f &&
-                    std::abs(ey - edgeLengths.y) < 0.1f &&
-                    std::abs(ez - edgeLengths.z) < 0.1f) {
-                    Vector3 bc((mesh.bboxMin[0]+mesh.bboxMax[0])*0.5f,
-                               (mesh.bboxMin[1]+mesh.bboxMax[1])*0.5f,
-                               (mesh.bboxMin[2]+mesh.bboxMax[2])*0.5f);
-                    std::fprintf(stderr, "  Door %d: model '%s' "
-                                 "bbox=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f) "
-                                 "center=(%.2f,%.2f,%.2f)\n",
-                                 objID, mname.c_str(),
+                // Case-insensitive check for "door" in model name
+                std::string lower = mname;
+                for (auto &c : lower) c = std::tolower(c);
+                if (lower.find("door") != std::string::npos) {
+                    std::fprintf(stderr, "  [DOOR MODEL] '%s' bbox=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f) "
+                                 "size=(%.2f,%.2f,%.2f) center=(%.2f,%.2f,%.2f)\n",
+                                 mname.c_str(),
                                  mesh.bboxMin[0], mesh.bboxMin[1], mesh.bboxMin[2],
                                  mesh.bboxMax[0], mesh.bboxMax[1], mesh.bboxMax[2],
-                                 bc.x, bc.y, bc.z);
-                    break;
+                                 mesh.bboxMax[0]-mesh.bboxMin[0],
+                                 mesh.bboxMax[1]-mesh.bboxMin[1],
+                                 mesh.bboxMax[2]-mesh.bboxMin[2],
+                                 (mesh.bboxMin[0]+mesh.bboxMax[0])*0.5f,
+                                 (mesh.bboxMin[1]+mesh.bboxMax[1])*0.5f,
+                                 (mesh.bboxMin[2]+mesh.bboxMax[2])*0.5f);
                 }
             }
         }
