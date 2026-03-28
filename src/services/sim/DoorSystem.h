@@ -103,13 +103,12 @@ struct DoorState {
     int32_t room1 = -1, room2 = -1;
     float pushMass = 0.0f;
 
-    // Base transform from P$Position. We store the angles as float radians
-    // converted directly from the binary radians in the ObjectPlacement data
-    // (NOT via quaternion round-trip, which can produce mirrored Euler angles).
+    // Base transform from P$Position. We store the rotation as a matrix
+    // (not Euler angles) to avoid the lossy extractEulerAngleZYX round-trip
+    // which can produce mirrored representations. The original engine works
+    // with rotation matrices directly (mx_ang2mat) — we do the same.
     Vector3 basePosition = {0.0f, 0.0f, 0.0f};
-    float baseHeading = 0.0f;    // radians (from int16 binary radians)
-    float basePitch   = 0.0f;    // radians
-    float baseBank    = 0.0f;    // radians
+    Matrix4 baseRotation = Matrix4(1.0f);  // glm column-major rotation matrix
     Vector3 baseScale = {1.0f, 1.0f, 1.0f};
     bool hasObjectState = false;  // true once ObjectState entry is created
 
@@ -345,10 +344,9 @@ private:
                          id, (doorType == kDoorRotating ? "rot" : "trans"),
                          door.axis, door.closedValue, door.openValue,
                          door.speed, door.clockwise ? 1 : 0, door.status);
-            std::fprintf(stderr, "    basePos=(%.2f,%.2f,%.2f) angles=(h=%.4f,p=%.4f,b=%.4f) "
+            std::fprintf(stderr, "    basePos=(%.2f,%.2f,%.2f) baseRot=matrix "
                          "scale=(%.2f,%.2f,%.2f)\n",
                          door.basePosition.x, door.basePosition.y, door.basePosition.z,
-                         door.baseHeading, door.basePitch, door.baseBank,
                          door.baseScale.x, door.baseScale.y, door.baseScale.z);
             std::fprintf(stderr, "    pivot=(%.2f,%.2f,%.2f) rooms=(%d,%d) blocking=%.0f%%\n",
                          door.pivotOffset.x, door.pivotOffset.y, door.pivotOffset.z,
@@ -416,63 +414,24 @@ private:
                                 int32_t objID) {
         static constexpr float kAngScale = 2.0f * 3.14159265f / 65536.0f;
 
-        // Read P$Position raw bytes directly: 22 bytes =
-        //   float[3] pos (12 bytes), int32 cell (4 bytes),
-        //   int16 bank, int16 pitch, int16 heading (6 bytes)
-        // This matches the static renderer's binary radian conversion exactly,
-        // avoiding the quaternion round-trip which can produce mirrored Euler angles.
-        // Doors may not be in the ObjectPlacement array (filtered by parseObjectProps
-        // due to RenderType or missing direct P$ModelName).
-        Property *posProp = propSvc->getProperty("Position");
-        if (posProp && posProp->has(objID)) {
-            // Get raw data from the property's storage
-            Variant posVar;
-            if (posProp->get(objID, "position", posVar)) {
-                door.basePosition = posVar.toVector();
-            }
-            // Read orientation as raw binary radians from storage
-            // PositionPropertyStorage stores the on-disk format with fields
-            // "position" (Vector3) and "facing" (Quaternion, converted from binary radians).
-            // We need to reverse-engineer the binary radians from the quaternion.
-            // BUT — for identity or near-identity rotations, just use the quaternion path.
-            Variant facVar;
-            if (posProp->get(objID, "orientation", facVar)) {
-                Quaternion q = facVar.toQuaternion();
-                // For identity quaternion (most doors), angles are exactly (0,0,0)
-                if (std::abs(q.w - 1.0f) < 1e-5f &&
-                    std::abs(q.x) < 1e-5f && std::abs(q.y) < 1e-5f &&
-                    std::abs(q.z) < 1e-5f) {
-                    door.baseHeading = 0.0f;
-                    door.basePitch = 0.0f;
-                    door.baseBank = 0.0f;
-                    std::fprintf(stderr, "  Door %d: identity orientation (no rotation)\n", objID);
-                } else {
-                    Matrix3 rotMat = glm::mat3_cast(q);
-                    glm::extractEulerAngleZYX(Matrix4(rotMat), door.baseHeading,
-                                               door.basePitch, door.baseBank);
-                    std::fprintf(stderr, "  Door %d: non-identity orientation q=(%.4f,%.4f,%.4f,%.4f) "
-                                 "→ euler=(%.4f,%.4f,%.4f)\n",
-                                 objID, q.w, q.x, q.y, q.z,
-                                 door.baseHeading, door.basePitch, door.baseBank);
-                }
-            }
-        } else if (mObjSvc) {
-            // Last resort fallback
+        // Get the base rotation as a MATRIX — never extract Euler angles.
+        // The original engine converts angvec → matrix via mx_ang2mat and
+        // works with matrices throughout. We do the same: quaternion → matrix.
+        // This avoids the lossy extractEulerAngleZYX which can mirror.
+
+        if (mObjSvc) {
             door.basePosition = mObjSvc->position(objID);
-            std::fprintf(stderr, "  Door %d: no Position property, using ObjectService\n", objID);
+            Quaternion q = mObjSvc->orientation(objID);
+            door.baseRotation = glm::mat4_cast(q);
         }
 
-        // Also try raw placement data if available (has the exact binary radians)
+        // Override position from placement data if available (exact float match)
         if (mPlacements) {
             auto it = mPlacements->find(objID);
             if (it != mPlacements->end()) {
                 const auto &p = it->second;
                 door.basePosition = Vector3(p.x, p.y, p.z);
-                door.baseHeading = static_cast<float>(p.heading) * kAngScale;
-                door.basePitch   = static_cast<float>(p.pitch)   * kAngScale;
-                door.baseBank    = static_cast<float>(p.bank)    * kAngScale;
-                door.baseScale   = Vector3(p.sx, p.sy, p.sz);
-                std::fprintf(stderr, "  Door %d: OVERRIDDEN from placement (raw binary radians)\n", objID);
+                door.baseScale = Vector3(p.sx, p.sy, p.sz);
             }
         }
 
@@ -712,12 +671,9 @@ private:
             //
             //   M = T(basePos) * R_base * T(+pivot) * R_offset * T(-pivot) * S
             //
-            // This translates model vertices to put the hinge at origin, applies
-            // the door rotation, translates back, applies base orientation, then
-            // places in world. In glm (column-major, column-vector):
-            Matrix4 baseMat = glm::eulerAngleZYX(door.baseHeading,
-                                                   door.basePitch,
-                                                   door.baseBank);
+            // R_base is stored as a matrix (from quaternion), never as Euler angles.
+            // This avoids the lossy extractEulerAngleZYX round-trip.
+            const Matrix4 &baseMat = door.baseRotation;
             Vector3 axisVec(0.0f);
             switch (door.axis) {
             case 0: axisVec.x = 1.0f; break;
@@ -769,13 +725,25 @@ private:
             }
 
             // Rotate offset by base orientation
-            Matrix3 rotMat = glm::mat3(glm::eulerAngleZYX(door.baseHeading,
-                                                            door.basePitch,
-                                                            door.baseBank));
+            Matrix3 rotMat = Matrix3(door.baseRotation);
             Vector3 worldOffset = rotMat * localOffset;
 
-            os.setTransform(door.basePosition + worldOffset,
-                           door.baseHeading, door.basePitch, door.baseBank);
+            // For translating doors, build the matrix directly too
+            Matrix4 transMat = glm::translate(Matrix4(1.0f), worldOffset);
+            Matrix4 worldTranslate = glm::translate(Matrix4(1.0f), door.basePosition);
+            Matrix4 scaleMat = glm::scale(Matrix4(1.0f), door.baseScale);
+            Matrix4 fullGlm = worldTranslate * transMat * door.baseRotation * scaleMat;
+
+            float *m = os.modelMatrix;
+            for (int col = 0; col < 3; ++col)
+                for (int row = 0; row < 3; ++row)
+                    m[row * 4 + col] = fullGlm[col][row];
+            m[ 3] = 0.0f; m[ 7] = 0.0f; m[11] = 0.0f;
+            m[12] = fullGlm[3][0]; m[13] = fullGlm[3][1];
+            m[14] = fullGlm[3][2]; m[15] = 1.0f;
+
+            os.hasMatrix = true;
+            os.position = door.basePosition + worldOffset;
             os.scale = door.baseScale;
         }
     }
