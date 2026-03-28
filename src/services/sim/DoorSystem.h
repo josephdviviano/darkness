@@ -680,16 +680,24 @@ private:
             case 1: axisVec.y = 1.0f; break;
             case 2: axisVec.z = 1.0f; break;
             }
-            Matrix4 offsetRot = glm::rotate(Matrix4(1.0f), door.currentValue, axisVec);
-
-            // Build the full transform in glm column-major:
-            // M_glm = T(basePos) * R_base * T(+pivot) * R_offset * T(-pivot) * S
-            Matrix4 toHinge = glm::translate(Matrix4(1.0f), -door.pivotOffset);
-            Matrix4 fromHinge = glm::translate(Matrix4(1.0f), door.pivotOffset);
-            Matrix4 scaleMat = glm::scale(Matrix4(1.0f), door.baseScale);
-            Matrix4 worldTranslate = glm::translate(Matrix4(1.0f), door.basePosition);
-
-            Matrix4 fullGlm = worldTranslate * baseMat * fromHinge * offsetRot * toHinge * scaleMat;
+            Matrix4 fullGlm;
+            if (std::abs(door.currentValue) < 1e-7f) {
+                // At rest (closed or exactly at base position): use exact
+                // T(basePos) * R_base * S — no pivot translations, no float drift.
+                // This guarantees the first frame matches the static renderer.
+                Matrix4 scaleMat = glm::scale(Matrix4(1.0f), door.baseScale);
+                Matrix4 worldTranslate = glm::translate(Matrix4(1.0f), door.basePosition);
+                fullGlm = worldTranslate * baseMat * scaleMat;
+            } else {
+                // Animating: full hinge transform
+                // M_glm = T(basePos) * R_base * T(+pivot) * R_offset * T(-pivot) * S
+                Matrix4 offsetRot = glm::rotate(Matrix4(1.0f), door.currentValue, axisVec);
+                Matrix4 toHinge = glm::translate(Matrix4(1.0f), -door.pivotOffset);
+                Matrix4 fromHinge = glm::translate(Matrix4(1.0f), door.pivotOffset);
+                Matrix4 scaleMat = glm::scale(Matrix4(1.0f), door.baseScale);
+                Matrix4 worldTranslate = glm::translate(Matrix4(1.0f), door.basePosition);
+                fullGlm = worldTranslate * baseMat * fromHinge * offsetRot * toHinge * scaleMat;
+            }
 
             // Convert glm column-major to bx row-major.
             // Only transpose the 3x3 rotation block. Translation goes from
