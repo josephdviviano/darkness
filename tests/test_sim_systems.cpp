@@ -20,31 +20,53 @@
 #include "ServiceCommon.h"
 #include "worldquery/ObjectState.h"
 #include "worldquery/IWorldQuery.h"
+#include "DarknessServiceManager.h"
+#include "config/ConfigService.h"
+#include "database/DatabaseService.h"
+#include "game/GameService.h"
+#include "inherit/InheritService.h"
+#include "link/LinkService.h"
+#include "object/ObjectService.h"
+#include "platform/PlatformService.h"
+#include "property/PropertyService.h"
+#include "room/RoomService.h"
+#include "physics/PhysicsService.h"
 #include "logger.h"
 #include "stdlog.h"
+#include "ConsoleBackend.h"
 
 using namespace Darkness;
 using Catch::Approx;
 
-// Ensure Logger singleton exists before any test runs.
-// LoopService/SimService use LOG_* macros that assert the singleton.
-// Check getSingletonPtr() first — another test file may have created it.
-static struct LoggerBootstrap {
-    Logger *logger = nullptr;
-    StdLog *stdlog = nullptr;
-    LoggerBootstrap() {
+// Bootstrap Logger + ServiceManager singletons before any test runs.
+// Reuses existing singletons if another test file already created them
+// (all test files link into one binary, singletons persist across tests).
+static struct ServiceBootstrap {
+    ServiceBootstrap() {
         if (!Logger::getSingletonPtr()) {
-            logger = new Logger();
-            stdlog = new StdLog();
+            auto *logger = new Logger();
+            auto *stdlog = new StdLog();
             logger->registerLogListener(stdlog);
             logger->setLogLevel(Logger::LOG_LEVEL_ERROR);
         }
+        if (!ServiceManager::getSingletonPtr()) {
+            auto *svcMgr = new ServiceManager(SERVICE_ALL);
+            svcMgr->registerFactory<PlatformServiceFactory>();
+            svcMgr->registerFactory<ConfigServiceFactory>();
+            svcMgr->registerFactory<DatabaseServiceFactory>();
+            svcMgr->registerFactory<GameServiceFactory>();
+            svcMgr->registerFactory<InheritServiceFactory>();
+            svcMgr->registerFactory<LinkServiceFactory>();
+            svcMgr->registerFactory<LoopServiceFactory>();
+            svcMgr->registerFactory<ObjectServiceFactory>();
+            svcMgr->registerFactory<PropertyServiceFactory>();
+            svcMgr->registerFactory<RoomServiceFactory>();
+            svcMgr->registerFactory<SimServiceFactory>();
+            svcMgr->registerFactory<PhysicsServiceFactory>();
+            svcMgr->bootstrapFinished();
+        }
     }
-    ~LoggerBootstrap() {
-        // Don't delete — other test files' statics may still reference it,
-        // and Singleton destructor handles cleanup.
-    }
-} sLoggerBootstrap;
+} sServiceBootstrap;
 
 static constexpr float kPi = 3.14159265f;
 
@@ -275,25 +297,120 @@ TEST_CASE("LoopMode: duplicate priority clients all dispatched", "[LoopService]"
 // LoopService::step() tests
 // ============================================================================
 
-// Note: LoopService::step() and LoopService construction require a
-// ServiceManager (Logger singleton + ServiceImpl base class). These are
-// tested via full integration (running darknessRender) and indirectly
-// through the LoopMode dispatch tests above. The critical step()
-// mode-request-processing fix is covered by the LoopMode tests which
-// exercise the same client dispatch code path.
+// ============================================================================
+// LoopService::step() tests — use GET_SERVICE via ServiceManager singleton
+// ============================================================================
+
+// Helper: get or create a LoopService with a test mode and client.
+// Returns the LoopService shared_ptr. Creates a "TestMode" if it doesn't
+// exist. Note: LoopService is a singleton — same instance across tests.
+static LoopServicePtr getTestLoopService() {
+    return GET_SERVICE(LoopService);
+}
+
+TEST_CASE("LoopService: step processes pending mode request", "[LoopService]") {
+    // This is the critical bug fix regression test.
+    // Before the fix, step() never processed mNewModeRequested, so
+    // mActiveMode stayed null and no clients received loopStep().
+    auto loopSvc = getTestLoopService();
+    REQUIRE(loopSvc);
+
+    // Create a unique mode for this test (idempotent if already exists)
+    LoopModeDefinition modeDef{100, 0xFF, "StepTest"};
+    loopSvc->createLoopMode(modeDef);
+
+    MockLoopClient client(100, "StepTestClient", 0xFF, 1);
+    loopSvc->addLoopClient(&client);
+
+    loopSvc->requestLoopMode(modeDef.id);
+    loopSvc->step();  // This must activate the mode AND dispatch
+
+    REQUIRE(client.startedCount >= 1);
+    REQUIRE(client.stepDeltas.size() >= 1);
+
+    // Cleanup
+    loopSvc->removeLoopClient(&client);
+}
+
+TEST_CASE("LoopService: step delta is capped at 0.1 seconds", "[LoopService]") {
+    auto loopSvc = getTestLoopService();
+    REQUIRE(loopSvc);
+
+    LoopModeDefinition modeDef{101, 0xFF, "CapTest"};
+    loopSvc->createLoopMode(modeDef);
+    MockLoopClient client(101, "CapTestClient", 0xFF, 1);
+    loopSvc->addLoopClient(&client);
+    loopSvc->requestLoopMode(modeDef.id);
+    loopSvc->step();  // activate mode + first step
+    client.stepDeltas.clear();
+
+    // Sleep longer than the 0.1s cap
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    loopSvc->step();
+
+    REQUIRE(client.stepDeltas.size() >= 1);
+    REQUIRE(client.stepDeltas.back() <= 0.101f);
+
+    loopSvc->removeLoopClient(&client);
+}
+
+TEST_CASE("LoopService: step delta is in seconds not milliseconds", "[LoopService]") {
+    auto loopSvc = getTestLoopService();
+    REQUIRE(loopSvc);
+
+    LoopModeDefinition modeDef{102, 0xFF, "UnitsTest"};
+    loopSvc->createLoopMode(modeDef);
+    MockLoopClient client(102, "UnitsClient", 0xFF, 1);
+    loopSvc->addLoopClient(&client);
+    loopSvc->requestLoopMode(modeDef.id);
+    loopSvc->step();  // activate + first step
+    client.stepDeltas.clear();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    loopSvc->step();
+
+    REQUIRE(client.stepDeltas.size() >= 1);
+    // Delta should be ~0.05 seconds, NOT ~50.0 (milliseconds)
+    REQUIRE(client.stepDeltas.back() < 1.0f);
+    REQUIRE(client.stepDeltas.back() > 0.01f);
+
+    loopSvc->removeLoopClient(&client);
+}
+
+TEST_CASE("LoopService: requestTermination sets flag", "[LoopService]") {
+    auto loopSvc = getTestLoopService();
+    REQUIRE(loopSvc);
+    // Note: we test the flag but don't actually terminate — other tests need the service
+    bool wasTerm = loopSvc->isTerminationRequested();
+    loopSvc->requestTermination();
+    REQUIRE(loopSvc->isTerminationRequested() == true);
+    // Reset for other tests (LoopService doesn't have an unset, but the flag
+    // only matters for run() loops which we don't use in tests)
+}
 
 // ============================================================================
 // SimService tests
 // ============================================================================
 
-// Helper: create a SimService on the heap (bypassing ServiceManager).
-// Don't call init() — it would try GET_SERVICE(LoopService).
-static std::unique_ptr<SimService> makeSimService() {
-    return std::make_unique<SimService>(nullptr, "test");
+// Get the SimService from the ServiceManager singleton.
+// SimService is a singleton — same instance across all tests.
+// We must be careful to reset state between tests.
+static SimServicePtr getTestSimService() {
+    return GET_SERVICE(SimService);
+}
+
+// Helper: ensure SimService is in a clean stopped state for a test.
+static SimServicePtr freshSimService() {
+    auto svc = getTestSimService();
+    if (svc->isSimRunning()) {
+        svc->endSim();
+        svc->loopStep(0.0f);  // process the end request
+    }
+    return svc;
 }
 
 TEST_CASE("SimService: loopStep with sim not running does nothing", "[SimService]") {
-    auto svc = makeSimService();
+    auto svc = freshSimService();
     MockSimListener listener;
     svc->registerListener(&listener, 1);
 
@@ -302,7 +419,7 @@ TEST_CASE("SimService: loopStep with sim not running does nothing", "[SimService
 }
 
 TEST_CASE("SimService: startSim then step dispatches", "[SimService]") {
-    auto svc = makeSimService();
+    auto svc = freshSimService();
     MockSimListener listener;
     svc->registerListener(&listener, 1);
 
@@ -316,7 +433,7 @@ TEST_CASE("SimService: startSim then step dispatches", "[SimService]") {
 }
 
 TEST_CASE("SimService: startSim resets simTime to zero", "[SimService]") {
-    auto svc = makeSimService();
+    auto svc = freshSimService();
     MockSimListener listener;
     svc->registerListener(&listener, 1);
 
@@ -338,7 +455,7 @@ TEST_CASE("SimService: startSim resets simTime to zero", "[SimService]") {
 }
 
 TEST_CASE("SimService: pauseSim stops step dispatch", "[SimService]") {
-    auto svc = makeSimService();
+    auto svc = freshSimService();
     MockSimListener listener;
     svc->registerListener(&listener, 1);
 
@@ -354,7 +471,7 @@ TEST_CASE("SimService: pauseSim stops step dispatch", "[SimService]") {
 }
 
 TEST_CASE("SimService: unPauseSim resumes step dispatch", "[SimService]") {
-    auto svc = makeSimService();
+    auto svc = freshSimService();
     MockSimListener listener;
     svc->registerListener(&listener, 1);
     // registerListener fires sync: simUnPaused (because sim starts unpaused)
@@ -372,7 +489,7 @@ TEST_CASE("SimService: unPauseSim resumes step dispatch", "[SimService]") {
 }
 
 TEST_CASE("SimService: flowCoeff scales delta", "[SimService]") {
-    auto svc = makeSimService();
+    auto svc = freshSimService();
     MockSimListener listener;
     svc->registerListener(&listener, 1);
 
@@ -387,7 +504,7 @@ TEST_CASE("SimService: flowCoeff scales delta", "[SimService]") {
 }
 
 TEST_CASE("SimService: simTime accumulates correctly", "[SimService]") {
-    auto svc = makeSimService();
+    auto svc = freshSimService();
     MockSimListener listener;
     svc->registerListener(&listener, 1);
 
@@ -404,7 +521,7 @@ TEST_CASE("SimService: simTime accumulates correctly", "[SimService]") {
 }
 
 TEST_CASE("SimService: setFlowCoeff rejects non-positive", "[SimService]") {
-    auto svc = makeSimService();
+    auto svc = freshSimService();
     MockSimListener listener;
     svc->registerListener(&listener, 1);
 
@@ -417,7 +534,7 @@ TEST_CASE("SimService: setFlowCoeff rejects non-positive", "[SimService]") {
 }
 
 TEST_CASE("SimService: registerListener receives sync callbacks", "[SimService]") {
-    auto svc = makeSimService();
+    auto svc = freshSimService();
 
     // Start sim, pause it, set flow
     svc->startSim();
@@ -438,7 +555,7 @@ TEST_CASE("SimService: registerListener receives sync callbacks", "[SimService]"
 }
 
 TEST_CASE("SimService: unregisterListener removes correctly", "[SimService]") {
-    auto svc = makeSimService();
+    auto svc = freshSimService();
     MockSimListener a, b;
     svc->registerListener(&a, 1);
     svc->registerListener(&b, 2);
@@ -456,7 +573,7 @@ TEST_CASE("SimService: unregisterListener removes correctly", "[SimService]") {
 }
 
 TEST_CASE("SimService: endSim notifies listeners", "[SimService]") {
-    auto svc = makeSimService();
+    auto svc = freshSimService();
     MockSimListener listener;
     svc->registerListener(&listener, 1);
     // registerListener fires sync callback: simEnded() because sim isn't running yet
