@@ -309,7 +309,10 @@ private:
         static constexpr float kDegToRad = 3.14159265f / 180.0f;
         door.closedValue = prop.closedAngle * kDegToRad;
         door.openValue = prop.openAngle * kDegToRad;
-        door.speed = prop.speed * kDegToRad;  // convert deg/sec to rad/sec
+        // Speed is already in radians/sec (physics velocity unit) — do NOT convert.
+        // The Dark Engine stores open/closed angles in degrees for DromEd editing
+        // convenience, but base_speed is a physics parameter in native units.
+        door.speed = prop.speed;
         door.axis = prop.axis;
         door.status = static_cast<DoorStatus>(prop.status);
         door.hardLimits = (prop.hardLimits != 0);
@@ -477,23 +480,36 @@ private:
         ObjectState &os = mObjectStates->get(door.objID);
 
         if (door.type == kDoorRotating) {
-            // Apply rotation offset around the door's axis.
-            // The rotation is relative to the door's base orientation.
-            float angleOffset = door.currentValue;
-            float h = door.baseHeading;
-            float p = door.basePitch;
-            float b = door.baseBank;
-
-            // Add angle offset on the appropriate axis
+            // Compose the base orientation with the door's local rotation offset.
+            // The door's origin (P$Position) is at the hinge point as placed in
+            // DromEd, so the position stays fixed — only orientation changes.
+            //
+            // We must compose rotations as matrices rather than adding Euler angles,
+            // because adding angles only works when the base orientation aligns with
+            // world axes. For arbitrarily-oriented doors (e.g. a door facing
+            // northeast), the local rotation axis must be transformed through the
+            // base orientation.
+            //
+            // Combined = R_base * R_local_offset
+            // This applies the offset rotation in the door's local coordinate frame.
+            Matrix4 baseMat = glm::eulerAngleZYX(door.baseHeading,
+                                                   door.basePitch,
+                                                   door.baseBank);
+            // Build axis vector for the local rotation
+            Vector3 axisVec(0.0f);
             switch (door.axis) {
-            case 0: b += angleOffset; break;  // X axis = bank
-            case 1: p += angleOffset; break;  // Y axis = pitch
-            case 2: h += angleOffset; break;  // Z axis = heading
+            case 0: axisVec.x = 1.0f; break;  // X axis = bank
+            case 1: axisVec.y = 1.0f; break;  // Y axis = pitch
+            case 2: axisVec.z = 1.0f; break;  // Z axis = heading
             }
+            Matrix4 offsetMat = glm::rotate(Matrix4(1.0f), door.currentValue, axisVec);
+            Matrix4 combined = baseMat * offsetMat;
 
-            // Compute position offset from rotation around pivot point.
-            // For rotating doors, the object rotates about its base position,
-            // which is typically the hinge point set in DromEd.
+            // Extract Euler angles from the combined rotation
+            float h, p, b;
+            glm::extractEulerAngleZYX(combined, h, p, b);
+
+            // Position stays at the hinge (base position) — only orientation changes
             os.setTransform(door.basePosition, h, p, b);
             os.scale = door.baseScale;
 
