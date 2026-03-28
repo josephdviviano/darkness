@@ -148,6 +148,7 @@ public:
         float x, y, z;
         int16_t heading, pitch, bank;
         float sx, sy, sz;
+        char modelName[16];
     };
 
     void init(PropertyService *propSvc, ObjectService *objSvc,
@@ -278,12 +279,17 @@ public:
             if (door.status == kDoorOpening || door.status == kDoorClosing) {
                 updateDoor(door, delta);
 
-                // Log animation every 15 frames (~4x/sec at 60fps)
-                if (mFrameCount % 15 == 0) {
+                // Log every animation frame
+                {
                     const ObjectState *os = mObjectStates ? mObjectStates->tryGet(id) : nullptr;
-                    std::fprintf(stderr, "  Door %d: val=%.4f vel=%.4f frac=%.3f pos=(%.2f,%.2f,%.2f)\n",
+                    std::fprintf(stderr, "  Door %d: val=%.4f vel=%.4f frac=%.3f pos=(%.2f,%.2f,%.2f)",
                                  id, door.currentValue, door.velocity, getOpenFraction(id),
                                  os ? os->position.x : 0, os ? os->position.y : 0, os ? os->position.z : 0);
+                    if (os && os->hasMatrix) {
+                        const float *m = os->modelMatrix;
+                        std::fprintf(stderr, " mtx12-14=(%.2f,%.2f,%.2f)", m[12], m[13], m[14]);
+                    }
+                    std::fprintf(stderr, "\n");
                 }
 
                 // Continuously update audio blocking during animation.
@@ -487,24 +493,27 @@ private:
             break;
         }
 
-        // Log bbox — search all models for one containing "door" in the name
-        if (mParsedModels) {
-            for (const auto &[mname, mesh] : *mParsedModels) {
-                // Case-insensitive check for "door" in model name
-                std::string lower = mname;
-                for (auto &c : lower) c = std::tolower(c);
-                if (lower.find("door") != std::string::npos) {
-                    std::fprintf(stderr, "  [DOOR MODEL] '%s' bbox=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f) "
-                                 "size=(%.2f,%.2f,%.2f) center=(%.2f,%.2f,%.2f)\n",
-                                 mname.c_str(),
+        // Log bbox using model name from ObjectPlacement data
+        if (mParsedModels && mPlacements) {
+            auto pit = mPlacements->find(objID);
+            if (pit != mPlacements->end()) {
+                std::string mname(pit->second.modelName,
+                                  strnlen(pit->second.modelName, 16));
+                auto mit = mParsedModels->find(mname);
+                if (mit != mParsedModels->end()) {
+                    const auto &mesh = mit->second;
+                    std::fprintf(stderr, "  Door %d: model '%s' "
+                                 "bbox=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f) "
+                                 "center=(%.2f,%.2f,%.2f)\n",
+                                 objID, mname.c_str(),
                                  mesh.bboxMin[0], mesh.bboxMin[1], mesh.bboxMin[2],
                                  mesh.bboxMax[0], mesh.bboxMax[1], mesh.bboxMax[2],
-                                 mesh.bboxMax[0]-mesh.bboxMin[0],
-                                 mesh.bboxMax[1]-mesh.bboxMin[1],
-                                 mesh.bboxMax[2]-mesh.bboxMin[2],
                                  (mesh.bboxMin[0]+mesh.bboxMax[0])*0.5f,
                                  (mesh.bboxMin[1]+mesh.bboxMax[1])*0.5f,
                                  (mesh.bboxMin[2]+mesh.bboxMax[2])*0.5f);
+                } else {
+                    std::fprintf(stderr, "  Door %d: model '%s' NOT FOUND in parsedModels\n",
+                                 objID, mname.c_str());
                 }
             }
         }
