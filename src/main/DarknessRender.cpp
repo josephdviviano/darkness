@@ -1232,10 +1232,9 @@ static void handleEvents(
                     std::fprintf(stderr, "Simulation PAUSED\n");
                 }
             }
-        } else if (ev.type == SDL_MOUSEBUTTONDOWN
-                   && ev.button.button == SDL_BUTTON_RIGHT
-                   && state.frobSystem) {
-            // Right-click: frob the object under the crosshair
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_f
+                   && !ev.key.repeat && state.frobSystem) {
+            // F: frob the object under the crosshair
             if (state.frobSystem->hasTarget()) {
                 state.frobSystem->executeFrob();
             }
@@ -2497,15 +2496,23 @@ int main(int argc, char *argv[]) {
             // ── Debug raycast visualization (view 2) ──
             renderDebugOverlay(fc, gpu, mission, state);
 
-            // Frob target indicator — show object name at screen center
+            // Frob target indicator + debug console overlay.
+            // Both use bgfx debug text, which requires BGFX_DEBUG_TEXT.
+            // Enable it, clear the text buffer, draw frob hint, then console
+            // (console draws on top if open, otherwise text buffer stays).
+            bgfx::setDebug(BGFX_DEBUG_TEXT);
+            bgfx::dbgTextClear();
+
             if (state.frobSystem && state.frobSystem->hasTarget()) {
                 const auto &target = state.frobSystem->getTarget();
-                // bgfx debug text: row 14 (near center), centered horizontally
-                bgfx::dbgTextPrintf(30, 14, 0x0f, "[%s]  (%.1f)",
-                                    target.name.c_str(), target.distance);
+                // Center of screen: 160 cols (1280/8), 45 rows (720/16)
+                // Place hint just below center
+                int col = 80 - static_cast<int>(target.name.size()) / 2 - 2;
+                if (col < 0) col = 0;
+                bgfx::dbgTextPrintf(col, 24, 0x0f, "[ %s ]", target.name.c_str());
             }
 
-            // Debug console overlay (no-op when closed)
+            // Debug console overlay (draws on top of frob hint when open)
             dbgConsole.render();
 
             bgfx::frame();
