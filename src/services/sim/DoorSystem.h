@@ -640,8 +640,12 @@ private:
 
         if (door.type == kDoorRotating) {
             // Build the combined rotation: R_base * R_local_offset (in glm).
-            // Position stays at basePosition (P$Position = hinge point for
-            // properly placed doors in DromEd).
+            // P$Position is the model center (not the hinge). The COG pivot offset
+            // gives the vector from hinge to center in local space. As the door
+            // rotates, the center traces an arc around the fixed hinge:
+            //   base_cog = R_base * pivotOffset
+            //   cur_cog  = R_combined * pivotOffset
+            //   worldPos = basePosition + (cur_cog - base_cog)
             Matrix4 baseMat = glm::eulerAngleZYX(door.baseHeading,
                                                    door.basePitch,
                                                    door.baseBank);
@@ -654,10 +658,16 @@ private:
             Matrix4 offsetMat = glm::rotate(Matrix4(1.0f), door.currentValue, axisVec);
             Matrix4 combined = baseMat * offsetMat;
 
+            // Position arc: center traces arc around hinge
+            Matrix3 baseMat3 = Matrix3(baseMat);
+            Matrix3 combinedMat3 = Matrix3(combined);
+            Vector3 baseCog = baseMat3 * door.pivotOffset;
+            Vector3 curCog = combinedMat3 * door.pivotOffset;
+            Vector3 worldPos = door.basePosition + (curCog - baseCog);
+
             // Build bx-format model matrix directly from the combined rotation.
-            // Transpose the glm column-major 3x3 into bx row-major — this is
-            // equivalent to bx::mtxRotateXYZ(-b,-p,-h) without the lossy Euler
-            // extraction round-trip.
+            // Transpose the glm column-major 3x3 into bx row-major — equivalent
+            // to bx::mtxRotateXYZ(-b,-p,-h) without lossy Euler extraction.
             Matrix3 rot3 = Matrix3(combined);
             float *m = os.modelMatrix;
             m[ 0] = rot3[0][0]; m[ 1] = rot3[1][0]; m[ 2] = rot3[2][0]; m[ 3] = 0.0f;
@@ -667,11 +677,11 @@ private:
             m[ 0] *= door.baseScale.x; m[ 1] *= door.baseScale.x; m[ 2] *= door.baseScale.x;
             m[ 4] *= door.baseScale.y; m[ 5] *= door.baseScale.y; m[ 6] *= door.baseScale.y;
             m[ 8] *= door.baseScale.z; m[ 9] *= door.baseScale.z; m[10] *= door.baseScale.z;
-            // Translation — position stays at basePosition (hinge)
-            m[12] = door.basePosition.x; m[13] = door.basePosition.y; m[14] = door.basePosition.z; m[15] = 1.0f;
+            // Translation — center position on the arc
+            m[12] = worldPos.x; m[13] = worldPos.y; m[14] = worldPos.z; m[15] = 1.0f;
 
             os.hasMatrix = true;
-            os.position = door.basePosition;
+            os.position = worldPos;
             os.scale = door.baseScale;
 
         } else {
