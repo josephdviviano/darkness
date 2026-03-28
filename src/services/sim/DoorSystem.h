@@ -670,13 +670,16 @@ private:
         ObjectState &os = mObjectStates->get(door.objID);
 
         if (door.type == kDoorRotating) {
-            // Build the combined rotation: R_base * R_local_offset (in glm).
-            // P$Position is the model center (not the hinge). The COG pivot offset
-            // gives the vector from hinge to center in local space. As the door
-            // rotates, the center traces an arc around the fixed hinge:
-            //   base_cog = R_base * pivotOffset
-            //   cur_cog  = R_combined * pivotOffset
-            //   worldPos = basePosition + (cur_cog - base_cog)
+            // Rotate around the hinge, not the model center.
+            //
+            // The model origin is at its center. The pivot offset is the vector
+            // from hinge to center in local space. To rotate around the hinge:
+            //
+            //   M = T(basePos) * R_base * T(+pivot) * R_offset * T(-pivot) * S
+            //
+            // This translates model vertices to put the hinge at origin, applies
+            // the door rotation, translates back, applies base orientation, then
+            // places in world. In glm (column-major, column-vector):
             Matrix4 baseMat = glm::eulerAngleZYX(door.baseHeading,
                                                    door.basePitch,
                                                    door.baseBank);
@@ -686,33 +689,25 @@ private:
             case 1: axisVec.y = 1.0f; break;
             case 2: axisVec.z = 1.0f; break;
             }
-            Matrix4 offsetMat = glm::rotate(Matrix4(1.0f), door.currentValue, axisVec);
-            Matrix4 combined = baseMat * offsetMat;
+            Matrix4 offsetRot = glm::rotate(Matrix4(1.0f), door.currentValue, axisVec);
 
-            // Position arc: center traces arc around hinge
-            Matrix3 baseMat3 = Matrix3(baseMat);
-            Matrix3 combinedMat3 = Matrix3(combined);
-            Vector3 baseCog = baseMat3 * door.pivotOffset;
-            Vector3 curCog = combinedMat3 * door.pivotOffset;
-            Vector3 worldPos = door.basePosition + (curCog - baseCog);
+            // Build the full transform in glm column-major:
+            // M_glm = T(basePos) * R_base * T(+pivot) * R_offset * T(-pivot) * S
+            Matrix4 toHinge = glm::translate(Matrix4(1.0f), -door.pivotOffset);
+            Matrix4 fromHinge = glm::translate(Matrix4(1.0f), door.pivotOffset);
+            Matrix4 scaleMat = glm::scale(Matrix4(1.0f), door.baseScale);
+            Matrix4 worldTranslate = glm::translate(Matrix4(1.0f), door.basePosition);
 
-            // Build bx-format model matrix directly from the combined rotation.
-            // Transpose the glm column-major 3x3 into bx row-major — equivalent
-            // to bx::mtxRotateXYZ(-b,-p,-h) without lossy Euler extraction.
-            Matrix3 rot3 = Matrix3(combined);
+            Matrix4 fullGlm = worldTranslate * baseMat * fromHinge * offsetRot * toHinge * scaleMat;
+
+            // Transpose to bx row-major
             float *m = os.modelMatrix;
-            m[ 0] = rot3[0][0]; m[ 1] = rot3[1][0]; m[ 2] = rot3[2][0]; m[ 3] = 0.0f;
-            m[ 4] = rot3[0][1]; m[ 5] = rot3[1][1]; m[ 6] = rot3[2][1]; m[ 7] = 0.0f;
-            m[ 8] = rot3[0][2]; m[ 9] = rot3[1][2]; m[10] = rot3[2][2]; m[11] = 0.0f;
-            // Scale (row-scaling)
-            m[ 0] *= door.baseScale.x; m[ 1] *= door.baseScale.x; m[ 2] *= door.baseScale.x;
-            m[ 4] *= door.baseScale.y; m[ 5] *= door.baseScale.y; m[ 6] *= door.baseScale.y;
-            m[ 8] *= door.baseScale.z; m[ 9] *= door.baseScale.z; m[10] *= door.baseScale.z;
-            // Translation — center position on the arc
-            m[12] = worldPos.x; m[13] = worldPos.y; m[14] = worldPos.z; m[15] = 1.0f;
+            for (int col = 0; col < 4; ++col)
+                for (int row = 0; row < 4; ++row)
+                    m[row * 4 + col] = fullGlm[col][row];
 
             os.hasMatrix = true;
-            os.position = worldPos;
+            os.position = door.basePosition;  // approximate for queries
             os.scale = door.baseScale;
 
         } else {
