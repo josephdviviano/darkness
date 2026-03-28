@@ -1999,11 +1999,14 @@ int main(int argc, char *argv[]) {
     // DoorSystem uses this to get exact angles matching the static renderer.
     std::unordered_map<int32_t, Darkness::DoorSystem::ObjPlacementInfo> doorPlacements;
     for (const auto &obj : mission.objData.objects) {
-        doorPlacements[obj.objID] = {
+        Darkness::DoorSystem::ObjPlacementInfo pi = {
             obj.x, obj.y, obj.z,
             obj.heading, obj.pitch, obj.bank,
-            obj.scaleX, obj.scaleY, obj.scaleZ
+            obj.scaleX, obj.scaleY, obj.scaleZ,
+            {}
         };
+        std::memcpy(pi.modelName, obj.modelName, 16);
+        doorPlacements[obj.objID] = pi;
     }
 
     Darkness::DoorSystem doorSystem;
