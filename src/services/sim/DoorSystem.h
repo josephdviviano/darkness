@@ -416,9 +416,53 @@ private:
                                 int32_t objID) {
         static constexpr float kAngScale = 2.0f * 3.14159265f / 65536.0f;
 
-        // Prefer raw ObjectPlacement data (binary radians → float radians directly).
-        // This matches the static renderer's conversion exactly, avoiding the
-        // quaternion round-trip which can produce mirrored Euler angles.
+        // Read P$Position raw bytes directly: 22 bytes =
+        //   float[3] pos (12 bytes), int32 cell (4 bytes),
+        //   int16 bank, int16 pitch, int16 heading (6 bytes)
+        // This matches the static renderer's binary radian conversion exactly,
+        // avoiding the quaternion round-trip which can produce mirrored Euler angles.
+        // Doors may not be in the ObjectPlacement array (filtered by parseObjectProps
+        // due to RenderType or missing direct P$ModelName).
+        Property *posProp = propSvc->getProperty("Position");
+        if (posProp && posProp->has(objID)) {
+            // Get raw data from the property's storage
+            Variant posVar;
+            if (posProp->get(objID, "position", posVar)) {
+                door.basePosition = posVar.toVector();
+            }
+            // Read orientation as raw binary radians from storage
+            // PositionPropertyStorage stores the on-disk format with fields
+            // "position" (Vector3) and "facing" (Quaternion, converted from binary radians).
+            // We need to reverse-engineer the binary radians from the quaternion.
+            // BUT — for identity or near-identity rotations, just use the quaternion path.
+            Variant facVar;
+            if (posProp->get(objID, "orientation", facVar)) {
+                Quaternion q = facVar.toQuaternion();
+                // For identity quaternion (most doors), angles are exactly (0,0,0)
+                if (std::abs(q.w - 1.0f) < 1e-5f &&
+                    std::abs(q.x) < 1e-5f && std::abs(q.y) < 1e-5f &&
+                    std::abs(q.z) < 1e-5f) {
+                    door.baseHeading = 0.0f;
+                    door.basePitch = 0.0f;
+                    door.baseBank = 0.0f;
+                    std::fprintf(stderr, "  Door %d: identity orientation (no rotation)\n", objID);
+                } else {
+                    Matrix3 rotMat = glm::mat3_cast(q);
+                    glm::extractEulerAngleZYX(Matrix4(rotMat), door.baseHeading,
+                                               door.basePitch, door.baseBank);
+                    std::fprintf(stderr, "  Door %d: non-identity orientation q=(%.4f,%.4f,%.4f,%.4f) "
+                                 "→ euler=(%.4f,%.4f,%.4f)\n",
+                                 objID, q.w, q.x, q.y, q.z,
+                                 door.baseHeading, door.basePitch, door.baseBank);
+                }
+            }
+        } else if (mObjSvc) {
+            // Last resort fallback
+            door.basePosition = mObjSvc->position(objID);
+            std::fprintf(stderr, "  Door %d: no Position property, using ObjectService\n", objID);
+        }
+
+        // Also try raw placement data if available (has the exact binary radians)
         if (mPlacements) {
             auto it = mPlacements->find(objID);
             if (it != mPlacements->end()) {
@@ -428,21 +472,8 @@ private:
                 door.basePitch   = static_cast<float>(p.pitch)   * kAngScale;
                 door.baseBank    = static_cast<float>(p.bank)    * kAngScale;
                 door.baseScale   = Vector3(p.sx, p.sy, p.sz);
-                std::fprintf(stderr, "  Door %d: angles from PLACEMENT (raw binary radians)\n", objID);
-                return;
-            } else {
-                std::fprintf(stderr, "  Door %d: NOT IN PLACEMENT MAP — using quaternion fallback!\n", objID);
+                std::fprintf(stderr, "  Door %d: OVERRIDDEN from placement (raw binary radians)\n", objID);
             }
-        }
-
-        // Fallback: use ObjectService (quaternion round-trip) — WARNING: may mirror
-        if (mObjSvc) {
-            std::fprintf(stderr, "  Door %d: angles from QUATERNION ROUND-TRIP (may mirror!)\n", objID);
-            door.basePosition = mObjSvc->position(objID);
-            Quaternion q = mObjSvc->orientation(objID);
-            Matrix3 rotMat = glm::mat3_cast(q);
-            glm::extractEulerAngleZYX(Matrix4(rotMat), door.baseHeading,
-                                       door.basePitch, door.baseBank);
         }
 
         // P$Scale: direct ownership only (kPropertyNoInherit)
