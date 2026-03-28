@@ -10,6 +10,8 @@ add_executable(darkness_tests
     test_schema_parser.cpp
     test_acoustic_materials.cpp
     test_worker_thread_pool.cpp
+    test_object_state.cpp
+    test_sim_systems.cpp
 )
 
 target_link_libraries(darkness_tests PRIVATE
