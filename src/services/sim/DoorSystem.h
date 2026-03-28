@@ -488,13 +488,15 @@ private:
         }
 
         // Log bbox center to check if model is centered or edge-aligned.
+        // Try every parsed model to find the one matching the door's PhysDims.
         if (mParsedModels) {
-            PropModelName mn;
-            if (getTypedProperty<PropModelName>(propSvc, "ModelName", objID, mn)) {
-                std::string mname(mn.name, strnlen(mn.name, 16));
-                auto mit = mParsedModels->find(mname);
-                if (mit != mParsedModels->end()) {
-                    const auto &mesh = mit->second;
+            for (const auto &[mname, mesh] : *mParsedModels) {
+                float ex = mesh.bboxMax[0] - mesh.bboxMin[0];
+                float ey = mesh.bboxMax[1] - mesh.bboxMin[1];
+                float ez = mesh.bboxMax[2] - mesh.bboxMin[2];
+                if (std::abs(ex - edgeLengths.x) < 0.1f &&
+                    std::abs(ey - edgeLengths.y) < 0.1f &&
+                    std::abs(ez - edgeLengths.z) < 0.1f) {
                     Vector3 bc((mesh.bboxMin[0]+mesh.bboxMax[0])*0.5f,
                                (mesh.bboxMin[1]+mesh.bboxMax[1])*0.5f,
                                (mesh.bboxMin[2]+mesh.bboxMax[2])*0.5f);
@@ -505,6 +507,7 @@ private:
                                  mesh.bboxMin[0], mesh.bboxMin[1], mesh.bboxMin[2],
                                  mesh.bboxMax[0], mesh.bboxMax[1], mesh.bboxMax[2],
                                  bc.x, bc.y, bc.z);
+                    break;
                 }
             }
         }
