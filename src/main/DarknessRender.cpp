@@ -668,17 +668,22 @@ static void renderObjects(
         if (objState && !(objState->flags & Darkness::kObjStateDestroyed)) {
             if (objState->flags & Darkness::kObjStateHidden)
                 return;  // skip hidden objects (blink tweq, etc.)
-            // Build matrix from runtime state angles (already in radians)
-            const float negH = -objState->heading;
-            const float negP = -objState->pitch;
-            const float negB = -objState->bank;
-            bx::mtxRotateXYZ(objMtx, negB, negP, negH);
-            objMtx[ 0] *= objState->scale.x; objMtx[ 1] *= objState->scale.x; objMtx[ 2] *= objState->scale.x;
-            objMtx[ 4] *= objState->scale.y; objMtx[ 5] *= objState->scale.y; objMtx[ 6] *= objState->scale.y;
-            objMtx[ 8] *= objState->scale.z; objMtx[ 9] *= objState->scale.z; objMtx[10] *= objState->scale.z;
-            objMtx[12] = objState->position.x;
-            objMtx[13] = objState->position.y;
-            objMtx[14] = objState->position.z;
+            if (objState->hasMatrix) {
+                // Use pre-built matrix directly — avoids lossy Euler extraction
+                std::memcpy(objMtx, objState->modelMatrix, sizeof(objMtx));
+            } else {
+                // Build matrix from runtime state angles (already in radians)
+                const float negH = -objState->heading;
+                const float negP = -objState->pitch;
+                const float negB = -objState->bank;
+                bx::mtxRotateXYZ(objMtx, negB, negP, negH);
+                objMtx[ 0] *= objState->scale.x; objMtx[ 1] *= objState->scale.x; objMtx[ 2] *= objState->scale.x;
+                objMtx[ 4] *= objState->scale.y; objMtx[ 5] *= objState->scale.y; objMtx[ 6] *= objState->scale.y;
+                objMtx[ 8] *= objState->scale.z; objMtx[ 9] *= objState->scale.z; objMtx[10] *= objState->scale.z;
+                objMtx[12] = objState->position.x;
+                objMtx[13] = objState->position.y;
+                objMtx[14] = objState->position.z;
+            }
         } else {
             buildModelMatrix(objMtx, obj.x, obj.y, obj.z,
                              obj.heading, obj.pitch, obj.bank,
