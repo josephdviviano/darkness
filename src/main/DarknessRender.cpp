@@ -1994,7 +1994,8 @@ int main(int argc, char *argv[]) {
     {
         Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
         Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
-        doorSystem.init(propSvc.get(), objSvc.get(), state.objectStates);
+        doorSystem.init(propSvc.get(), objSvc.get(), state.objectStates,
+                        &mission.parsedModels);
     }
     state.doorSystem = &doorSystem;
 
