@@ -103,13 +103,15 @@ struct DoorState {
     int32_t room1 = -1, room2 = -1;
     float pushMass = 0.0f;
 
-    // Base transform (object's static position from P$Position)
-    // Note: P$Position stores the model center, NOT the hinge.
+    // Base transform from P$Position. We store the angles as float radians
+    // converted directly from the binary radians in the ObjectPlacement data
+    // (NOT via quaternion round-trip, which can produce mirrored Euler angles).
     Vector3 basePosition = {0.0f, 0.0f, 0.0f};
-    float baseHeading = 0.0f;    // radians
+    float baseHeading = 0.0f;    // radians (from int16 binary radians)
     float basePitch   = 0.0f;    // radians
     float baseBank    = 0.0f;    // radians
     Vector3 baseScale = {1.0f, 1.0f, 1.0f};
+    bool hasObjectState = false;  // true once ObjectState entry is created
 
     // Pivot offset: vector from hinge to model center in the door's local frame.
     // For rotating doors, the center traces an arc around the hinge. The pivot
@@ -139,12 +141,23 @@ public:
     /// Scan for all objects with P$RotDoor or P$TransDoor properties and
     /// create DoorState entries. Call after level load, before sim starts.
     /// parsedModels is used to compute hinge pivot offsets from bounding boxes.
+    /// objectPlacements: objID → (index, heading, pitch, bank, x, y, z, sx, sy, sz)
+    /// from the mission's ObjectPlacement array — used for raw binary radian angles
+    /// that match the static renderer exactly (no quaternion round-trip).
+    struct ObjPlacementInfo {
+        float x, y, z;
+        int16_t heading, pitch, bank;
+        float sx, sy, sz;
+    };
+
     void init(PropertyService *propSvc, ObjectService *objSvc,
               ObjectStateMap *objectStates,
-              const std::unordered_map<std::string, ParsedBinMesh> *parsedModels = nullptr) {
+              const std::unordered_map<std::string, ParsedBinMesh> *parsedModels = nullptr,
+              const std::unordered_map<int32_t, ObjPlacementInfo> *placements = nullptr) {
         mObjectStates = objectStates;
         mObjSvc = objSvc;
         mParsedModels = parsedModels;
+        mPlacements = placements;
 
         // Scan for rotating doors
         initDoorsOfType<PropRotDoor>(propSvc, "RotDoor", kDoorRotating);
@@ -291,29 +304,21 @@ private:
             door.type = doorType;
             initDoorFromProperty(door, prop, doorType);
 
-            // Get object's base position from ObjectService (reads P$Position
-            // via PositionPropertyStorage, which handles the disk→quaternion conversion)
+            // Get the door's base transform. Use raw binary radians from the
+            // ObjectPlacement data (which the static renderer also uses) to avoid
+            // quaternion round-trip that can produce mirrored Euler angles.
             initDoorBaseTransform(door, propSvc, id);
 
             // Compute hinge pivot offset from model bounding box.
-            // Matches the Dark Engine's COG computation in doorphys.cpp:
-            //   axis 0 or 1: cog.z = edgeLengths.z / 2
-            //   axis 2:      cog.x = edgeLengths.x / 2
             if (doorType == kDoorRotating) {
                 computePivotOffset(door, propSvc, id);
             }
 
-            // Initialize ObjectState so the renderer can read the door's position
-            if (mObjectStates) {
-                ObjectState &os = mObjectStates->get(id);
-                os.position = door.basePosition;
-                os.heading = door.baseHeading;
-                os.pitch = door.basePitch;
-                os.bank = door.baseBank;
-                os.scale = door.baseScale;
-                os.setAngles(os.heading, os.pitch, os.bank);
-                os.flags = kObjStateActive;
-            }
+            // Do NOT create ObjectState entries here. Doors render through the
+            // static P$Position path until they start animating. This ensures the
+            // closed position exactly matches the static renderer (same binary
+            // radian conversion, no quaternion round-trip ambiguity).
+            // ObjectState is created on-demand in startOpening/startClosing.
 
             mDoors[id] = door;
 
@@ -375,17 +380,32 @@ private:
 
     void initDoorBaseTransform(DoorState &door, PropertyService *propSvc,
                                 int32_t objID) {
-        if (!mObjSvc) return;
+        static constexpr float kAngScale = 2.0f * 3.14159265f / 65536.0f;
 
-        // Get position from ObjectService (reads P$Position via PositionPropertyStorage)
-        door.basePosition = mObjSvc->position(objID);
+        // Prefer raw ObjectPlacement data (binary radians → float radians directly).
+        // This matches the static renderer's conversion exactly, avoiding the
+        // quaternion round-trip which can produce mirrored Euler angles.
+        if (mPlacements) {
+            auto it = mPlacements->find(objID);
+            if (it != mPlacements->end()) {
+                const auto &p = it->second;
+                door.basePosition = Vector3(p.x, p.y, p.z);
+                door.baseHeading = static_cast<float>(p.heading) * kAngScale;
+                door.basePitch   = static_cast<float>(p.pitch)   * kAngScale;
+                door.baseBank    = static_cast<float>(p.bank)    * kAngScale;
+                door.baseScale   = Vector3(p.sx, p.sy, p.sz);
+                return;
+            }
+        }
 
-        // Get orientation as quaternion, convert to Euler angles.
-        // Dark Engine rotation order: Rz(heading) * Ry(pitch) * Rx(bank)
-        Quaternion q = mObjSvc->orientation(objID);
-        Matrix3 rotMat = glm::mat3_cast(q);
-        glm::extractEulerAngleZYX(Matrix4(rotMat), door.baseHeading,
-                                   door.basePitch, door.baseBank);
+        // Fallback: use ObjectService (quaternion round-trip)
+        if (mObjSvc) {
+            door.basePosition = mObjSvc->position(objID);
+            Quaternion q = mObjSvc->orientation(objID);
+            Matrix3 rotMat = glm::mat3_cast(q);
+            glm::extractEulerAngleZYX(Matrix4(rotMat), door.baseHeading,
+                                       door.basePitch, door.baseBank);
+        }
 
         // P$Scale: direct ownership only (kPropertyNoInherit)
         Vector3 scale(1.0f);
@@ -450,8 +470,20 @@ private:
 
     // ── Door movement ──
 
+    /// Ensure the door has an ObjectState entry (created on-demand when
+    /// animation starts, so static doors render through the normal path).
+    void ensureObjectState(DoorState &door) {
+        if (door.hasObjectState || !mObjectStates) return;
+        door.hasObjectState = true;
+        // Apply the current transform — for a door that was static until now,
+        // this matches applyDoorTransform with the current angle.
+        applyDoorTransform(door);
+    }
+
     void startOpening(DoorState &door) {
         if (door.status == kDoorOpen) return;
+
+        ensureObjectState(door);
 
         // Remove blocking when door starts opening
         if (door.status == kDoorClosed) {
@@ -475,6 +507,8 @@ private:
 
     void startClosing(DoorState &door) {
         if (door.status == kDoorClosed) return;
+
+        ensureObjectState(door);
 
         door.status = kDoorClosing;
 
@@ -640,6 +674,7 @@ private:
     ObjectStateMap *mObjectStates = nullptr;
     ObjectService *mObjSvc = nullptr;
     const std::unordered_map<std::string, ParsedBinMesh> *mParsedModels = nullptr;
+    const std::unordered_map<int32_t, ObjPlacementInfo> *mPlacements = nullptr;
     DoorEventCallback mEventCallback;
     AudioBlockingCallback mAudioBlockingCallback;
 };

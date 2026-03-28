@@ -1990,12 +1990,23 @@ int main(int argc, char *argv[]) {
     // ── Initialize door system ──
     // Scans for P$RotDoor and P$TransDoor properties, creates DoorState entries,
     // and initializes ObjectState transforms for each door.
+    // Build objID → placement map for raw binary radian angles.
+    // DoorSystem uses this to get exact angles matching the static renderer.
+    std::unordered_map<int32_t, Darkness::DoorSystem::ObjPlacementInfo> doorPlacements;
+    for (const auto &obj : mission.objData.objects) {
+        doorPlacements[obj.objID] = {
+            obj.x, obj.y, obj.z,
+            obj.heading, obj.pitch, obj.bank,
+            obj.scaleX, obj.scaleY, obj.scaleZ
+        };
+    }
+
     Darkness::DoorSystem doorSystem;
     {
         Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
         Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
         doorSystem.init(propSvc.get(), objSvc.get(), state.objectStates,
-                        &mission.parsedModels);
+                        &mission.parsedModels, &doorPlacements);
     }
     state.doorSystem = &doorSystem;
 
