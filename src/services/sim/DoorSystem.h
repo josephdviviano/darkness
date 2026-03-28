@@ -487,13 +487,33 @@ private:
             break;
         }
 
-        if (glm::length(door.pivotOffset) > 0.01f) {
-            std::fprintf(stderr, "  Door %d: pivot offset (%.2f, %.2f, %.2f) "
-                         "from edge lengths (%.1f, %.1f, %.1f)\n",
-                         door.objID, door.pivotOffset.x, door.pivotOffset.y,
-                         door.pivotOffset.z, edgeLengths.x, edgeLengths.y,
-                         edgeLengths.z);
+        // Also compute bbox center — if non-zero, the model origin is NOT at
+        // the bbox center, meaning the model may already be edge-aligned.
+        Vector3 bboxCenter(0.0f);
+        if (mParsedModels) {
+            char modelName[16] = {};
+            if (getTypedProperty<char[16]>(propSvc, "ModelName", objID, modelName)) {
+                auto it = mParsedModels->find(std::string(modelName));
+                if (it != mParsedModels->end()) {
+                    const auto &mesh = it->second;
+                    bboxCenter = Vector3(
+                        (mesh.bboxMin[0] + mesh.bboxMax[0]) * 0.5f,
+                        (mesh.bboxMin[1] + mesh.bboxMax[1]) * 0.5f,
+                        (mesh.bboxMin[2] + mesh.bboxMax[2]) * 0.5f);
+                    std::fprintf(stderr, "  Door %d: model '%s' bbox=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f) center=(%.2f,%.2f,%.2f)\n",
+                                 door.objID, modelName,
+                                 mesh.bboxMin[0], mesh.bboxMin[1], mesh.bboxMin[2],
+                                 mesh.bboxMax[0], mesh.bboxMax[1], mesh.bboxMax[2],
+                                 bboxCenter.x, bboxCenter.y, bboxCenter.z);
+                }
+            }
         }
+
+        std::fprintf(stderr, "  Door %d: pivot offset (%.2f, %.2f, %.2f) "
+                     "from edge lengths (%.1f, %.1f, %.1f)\n",
+                     door.objID, door.pivotOffset.x, door.pivotOffset.y,
+                     door.pivotOffset.z, edgeLengths.x, edgeLengths.y,
+                     edgeLengths.z);
     }
 
     // ── Door movement ──
