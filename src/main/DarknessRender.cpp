@@ -1238,10 +1238,31 @@ static void handleEvents(
                 }
             }
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_f
-                   && !ev.key.repeat && state.frobSystem) {
-            // F: frob the object under the crosshair
-            if (state.frobSystem->hasTarget()) {
+                   && !ev.key.repeat) {
+            // F: frob the object under the crosshair, or nearest door if no target.
+            // Brush doors have no collision body so frob raycast can't hit them —
+            // fall back to nearest-door-by-distance for those.
+            if (state.frobSystem && state.frobSystem->hasTarget()) {
                 state.frobSystem->executeFrob();
+            } else if (state.doorSystem) {
+                Darkness::Vector3 camPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+                auto doorIDs = state.doorSystem->getAllDoorIDs();
+                int32_t nearestID = 0;
+                float nearestDist = Darkness::kDefaultFrobDistance * Darkness::kDefaultFrobDistance;
+                for (int32_t did : doorIDs) {
+                    const auto *d = state.doorSystem->getDoor(did);
+                    if (!d) continue;
+                    float dx = d->basePosition.x - camPos.x;
+                    float dy = d->basePosition.y - camPos.y;
+                    float dz = d->basePosition.z - camPos.z;
+                    float distSq = dx*dx + dy*dy + dz*dz;
+                    if (distSq < nearestDist) { nearestDist = distSq; nearestID = did; }
+                }
+                if (nearestID != 0) {
+                    state.doorSystem->activate(nearestID, Darkness::kDoorToggle);
+                    std::fprintf(stderr, "Frob fallback: toggled door %d (dist=%.1f)\n",
+                                 nearestID, std::sqrt(nearestDist));
+                }
             }
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_g
                    && !ev.key.repeat && state.doorSystem) {
