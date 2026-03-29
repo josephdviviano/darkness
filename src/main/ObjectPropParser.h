@@ -65,8 +65,13 @@ struct ObjectPlacement {
 
 // Aggregated result of parsing object properties
 struct ObjectPropData {
-    std::vector<ObjectPlacement> objects;       // concrete objects with models
+    std::vector<ObjectPlacement> objects;       // concrete objects with models (filtered by RenderType)
     std::vector<std::string> uniqueModels;      // deduplicated model names
+
+    // ALL concrete objects with P$Position, regardless of RenderType.
+    // Keyed by object ID. Use this for any system that needs placement
+    // data for non-rendered objects (doors, triggers, markers, etc.).
+    std::unordered_map<int32_t, ObjectPlacement> allPlacements;
 };
 
 namespace detail {
@@ -232,6 +237,7 @@ inline ObjectPropData parseObjectProps(PropertyService *propSvc,
                 p.heading = heading;
                 p.pitch = pitch;
                 p.bank = bank;
+                p.scaleX = 1.0f; p.scaleY = 1.0f; p.scaleZ = 1.0f;  // default scale
                 p.renderAlpha = 1.0f;  // default opaque, resolved later
                 p.hasPosition = true;
                 posMap[signedID] = p;
@@ -248,6 +254,12 @@ inline ObjectPropData parseObjectProps(PropertyService *propSvc,
 
     std::fprintf(stderr, "ObjectPropParser: %zu concrete objects with positions\n",
                  posMap.size());
+
+    // Store ALL placements before filtering — systems like DoorSystem need
+    // placement data for objects that are filtered from the render list.
+    result.allPlacements = posMap;
+    std::fprintf(stderr, "ObjectPropParser: stored %zu entries in allPlacements\n",
+                 result.allPlacements.size());
 
     // ── Merge: resolve properties via PropertyService for each positioned object ──
     //

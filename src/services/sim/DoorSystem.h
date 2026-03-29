@@ -38,6 +38,7 @@
 
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <unordered_map>
 #include <functional>
 
@@ -122,6 +123,9 @@ struct DoorState {
     // Renderer index — index into mission.objData.objects[] for quick lookup.
     // -1 if not found (archetype-only door, shouldn't happen for concrete objects).
     int renderIndex = -1;
+
+    // Debug: frame counter for per-activation logging (reset on each activate)
+    int logFrames = 0;
 };
 
 // ── Callback for door events (sound blocking, script messages, etc.) ──
@@ -182,6 +186,7 @@ public:
         if (it == mDoors.end()) return false;
 
         DoorState &door = it->second;
+        door.logFrames = 0;  // reset per-activation debug counter
         switch (action) {
         case kDoorDoOpen:
             startOpening(door);
@@ -279,6 +284,33 @@ public:
             if (door.status == kDoorOpening || door.status == kDoorClosing) {
                 updateDoor(door, delta);
 
+                // Log first 3 frames of each activation + final frame
+                if (door.logFrames < 3 ||
+                    door.status == kDoorOpen || door.status == kDoorClosed) {
+                    const ObjectState *os = mObjectStates ? mObjectStates->tryGet(id) : nullptr;
+                    if (os && os->hasMatrix) {
+                        const float *m = os->modelMatrix;
+                        // Compute where hinge and far-edge ended up in world space
+                        // by transforming local-space points through the bx row-major matrix.
+                        // bx row-major: result = v * M (row-vector convention)
+                        auto xformPt = [&](float lx, float ly, float lz) -> Vector3 {
+                            return Vector3(
+                                lx*m[0] + ly*m[4] + lz*m[8]  + m[12],
+                                lx*m[1] + ly*m[5] + lz*m[9]  + m[13],
+                                lx*m[2] + ly*m[6] + lz*m[10] + m[14]);
+                        };
+                        // Hinge = +pivotOffset from center, far edge = -pivotOffset
+                        Vector3 hinge = xformPt(door.pivotOffset.x, door.pivotOffset.y, door.pivotOffset.z);
+                        Vector3 far = xformPt(-door.pivotOffset.x, -door.pivotOffset.y, -door.pivotOffset.z);
+                        std::fprintf(stderr, "  Door %d frame %d: val=%.3f "
+                                     "hinge=(%.2f,%.2f,%.2f) far=(%.2f,%.2f,%.2f)\n",
+                                     id, door.logFrames, door.currentValue,
+                                     hinge.x, hinge.y, hinge.z,
+                                     far.x, far.y, far.z);
+                    }
+                    ++door.logFrames;
+                }
+
                 // Continuously update audio blocking during animation.
                 // This is called via the mAudioBlockingCallback which is
                 // set by the renderer to call AudioService::setBlockingFactor.
@@ -332,13 +364,46 @@ private:
                 mPlacements->find(id) != mPlacements->end();
             door.isBrushDoor = !isRenderedObject;
 
-            std::fprintf(stderr, "  Door %d: type=%s axis=%d closed=%.3f open=%.3f speed=%.3f "
-                         "clockwise=%d isBrush=%d pivot=(%.2f,%.2f,%.2f) rooms=(%d,%d)\n",
-                         id, (doorType == kDoorRotating ? "rot" : "trans"),
-                         door.axis, door.closedValue, door.openValue,
-                         door.speed, door.clockwise ? 1 : 0, door.isBrushDoor ? 1 : 0,
-                         door.pivotOffset.x, door.pivotOffset.y, door.pivotOffset.z,
-                         door.room1, door.room2);
+            // Detailed init logging for door geometry debugging
+            {
+                Quaternion q = mObjSvc ? mObjSvc->orientation(id) : Quaternion(1,0,0,0);
+                std::fprintf(stderr, "  Door %d: type=%s axis=%d closed=%.3f open=%.3f speed=%.3f "
+                             "clockwise=%d isBrush=%d rooms=(%d,%d)\n",
+                             id, (doorType == kDoorRotating ? "rot" : "trans"),
+                             door.axis, door.closedValue, door.openValue,
+                             door.speed, door.clockwise ? 1 : 0, door.isBrushDoor ? 1 : 0,
+                             door.room1, door.room2);
+                std::fprintf(stderr, "    basePos=(%.2f,%.2f,%.2f) pivot=(%.2f,%.2f,%.2f)\n",
+                             door.basePosition.x, door.basePosition.y, door.basePosition.z,
+                             door.pivotOffset.x, door.pivotOffset.y, door.pivotOffset.z);
+                std::fprintf(stderr, "    quat=(w=%.4f,x=%.4f,y=%.4f,z=%.4f)\n",
+                             q.w, q.x, q.y, q.z);
+                std::fprintf(stderr, "    baseMat row0=(%.4f,%.4f,%.4f) row1=(%.4f,%.4f,%.4f) row2=(%.4f,%.4f,%.4f)\n",
+                             door.baseRotation[0][0], door.baseRotation[1][0], door.baseRotation[2][0],
+                             door.baseRotation[0][1], door.baseRotation[1][1], door.baseRotation[2][1],
+                             door.baseRotation[0][2], door.baseRotation[1][2], door.baseRotation[2][2]);
+                // Log hinge and far-edge in world space (local→world via baseMat+basePos)
+                Vector3 hingeLocal = door.pivotOffset;  // hinge in local space
+                Vector3 farLocal = -door.pivotOffset;    // far edge in local space
+                Matrix3 rot3 = Matrix3(door.baseRotation);
+                Vector3 hingeWorld = door.basePosition + rot3 * hingeLocal;
+                Vector3 farWorld = door.basePosition + rot3 * farLocal;
+                std::fprintf(stderr, "    hingeWorld=(%.2f,%.2f,%.2f) farWorld=(%.2f,%.2f,%.2f)\n",
+                             hingeWorld.x, hingeWorld.y, hingeWorld.z,
+                             farWorld.x, farWorld.y, farWorld.z);
+                // Log placement angles if available
+                if (mPlacements) {
+                    auto pit = mPlacements->find(id);
+                    if (pit != mPlacements->end()) {
+                        const auto &pl = pit->second;
+                        float angScale = 2.0f * 3.14159265f / 65536.0f;
+                        std::fprintf(stderr, "    placement h=%d(%.1f°) p=%d(%.1f°) b=%d(%.1f°)\n",
+                                     pl.heading, pl.heading * angScale * 180.0f / 3.14159265f,
+                                     pl.pitch, pl.pitch * angScale * 180.0f / 3.14159265f,
+                                     pl.bank, pl.bank * angScale * 180.0f / 3.14159265f);
+                    }
+                }
+            }
 
             mDoors[id] = door;
 
@@ -402,24 +467,34 @@ private:
                                 int32_t objID) {
         static constexpr float kAngScale = 2.0f * 3.14159265f / 65536.0f;
 
-        // Get the base rotation as a MATRIX — never extract Euler angles.
-        // The original engine converts angvec → matrix via mx_ang2mat and
-        // works with matrices throughout. We do the same: quaternion → matrix.
-        // This avoids the lossy extractEulerAngleZYX which can mirror.
-
-        if (mObjSvc) {
-            door.basePosition = mObjSvc->position(objID);
-            Quaternion q = mObjSvc->orientation(objID);
-            door.baseRotation = glm::mat4_cast(q);
-        }
-
-        // Override position from placement data if available (exact float match)
+        // Get position and rotation from placement data (allPlacements map,
+        // which includes ALL concrete objects regardless of RenderType).
         if (mPlacements) {
             auto it = mPlacements->find(objID);
             if (it != mPlacements->end()) {
-                const auto &p = it->second;
-                door.basePosition = Vector3(p.x, p.y, p.z);
-                door.baseScale = Vector3(p.sx, p.sy, p.sz);
+                const auto &pl = it->second;
+                door.basePosition = Vector3(pl.x, pl.y, pl.z);
+                door.baseScale = Vector3(pl.sx, pl.sy, pl.sz);
+
+                // Build rotation as Rz(heading) * Ry(pitch) * Rx(bank) —
+                // same convention as buildModelMatrix in DarknessRendererCore.h
+                float h   = static_cast<float>(pl.heading) * kAngScale;
+                float pit = static_cast<float>(pl.pitch)   * kAngScale;
+                float b   = static_cast<float>(pl.bank)    * kAngScale;
+                door.baseRotation = Matrix4(glm::mat3(
+                    glm::eulerAngleZYX(h, pit, b)));
+            } else {
+                std::fprintf(stderr, "  WARNING: Door %d: not found in allPlacements — "
+                             "baseRotation will be identity. Door will snap on first activation.\n", objID);
+                if (mObjSvc) {
+                    door.basePosition = mObjSvc->position(objID);
+                }
+            }
+        } else {
+            std::fprintf(stderr, "  WARNING: Door %d: no placement data provided — "
+                         "baseRotation will be identity.\n", objID);
+            if (mObjSvc) {
+                door.basePosition = mObjSvc->position(objID);
             }
         }
 
@@ -636,15 +711,13 @@ private:
         ObjectState &os = mObjectStates->get(door.objID);
 
         if (door.type == kDoorRotating) {
-            // Rotate around the hinge, not the model center.
+            // Rotate around the hinge edge, not the model center.
             //
-            // The model origin is at its center. The pivot offset is the vector
-            // from hinge to center in local space. To rotate around the hinge:
+            // The .bin model origin is at the center of the door slab.
+            // pivotOffset = half the door width, pointing from center to
+            // the hinge edge. To rotate around that edge:
             //
             //   M = T(basePos) * R_base * T(+pivot) * R_offset * T(-pivot) * S
-            //
-            // R_base is stored as a matrix (from quaternion), never as Euler angles.
-            // This avoids the lossy extractEulerAngleZYX round-trip.
             const Matrix4 &baseMat = door.baseRotation;
             Vector3 axisVec(0.0f);
             switch (door.axis) {
@@ -654,21 +727,18 @@ private:
             }
             Matrix4 fullGlm;
             if (std::abs(door.currentValue) < 1e-7f) {
-                // At rest (closed or exactly at base position): use exact
-                // T(basePos) * R_base * S — no pivot translations, no float drift.
-                // This guarantees the first frame matches the static renderer.
+                // At rest: T(basePos) * R_base * S — matches static renderer.
                 Matrix4 scaleMat = glm::scale(Matrix4(1.0f), door.baseScale);
                 Matrix4 worldTranslate = glm::translate(Matrix4(1.0f), door.basePosition);
                 fullGlm = worldTranslate * baseMat * scaleMat;
             } else {
-                // Animating: full hinge transform
-                // M_glm = T(basePos) * R_base * T(+pivot) * R_offset * T(-pivot) * S
+                // Animating: rotate around hinge edge (at +pivotOffset from center)
                 Matrix4 offsetRot = glm::rotate(Matrix4(1.0f), door.currentValue, axisVec);
-                Matrix4 toHinge = glm::translate(Matrix4(1.0f), -door.pivotOffset);
-                Matrix4 fromHinge = glm::translate(Matrix4(1.0f), door.pivotOffset);
+                Matrix4 toPivot = glm::translate(Matrix4(1.0f), -door.pivotOffset);
+                Matrix4 fromPivot = glm::translate(Matrix4(1.0f), door.pivotOffset);
                 Matrix4 scaleMat = glm::scale(Matrix4(1.0f), door.baseScale);
                 Matrix4 worldTranslate = glm::translate(Matrix4(1.0f), door.basePosition);
-                fullGlm = worldTranslate * baseMat * fromHinge * offsetRot * toHinge * scaleMat;
+                fullGlm = worldTranslate * baseMat * fromPivot * offsetRot * toPivot * scaleMat;
             }
 
             // Convert glm column-major to bx row-major.
