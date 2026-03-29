@@ -319,14 +319,14 @@ TEST_CASE("Parse env_tag on schema", "[schema][tags]") {
     auto *s = parser.findSchema("footstep_stone_player");
     REQUIRE(s != nullptr);
     CHECK(s->hasEnvTags());
-    REQUIRE(s->envTags.size() == 3);
-    CHECK(s->envTags[0].tagName == "Event");
-    CHECK(s->envTags[0].enumValues.size() == 1);
-    CHECK(s->envTags[0].enumValues[0] == "Footstep");
-    CHECK(s->envTags[1].tagName == "Material");
-    CHECK(s->envTags[1].enumValues[0] == "Stone");
-    CHECK(s->envTags[2].tagName == "CreatureType");
-    CHECK(s->envTags[2].enumValues[0] == "Player");
+    REQUIRE(s->envTagGroups[0].size() == 3);
+    CHECK(s->envTagGroups[0][0].tagName == "Event");
+    CHECK(s->envTagGroups[0][0].enumValues.size() == 1);
+    CHECK(s->envTagGroups[0][0].enumValues[0] == "Footstep");
+    CHECK(s->envTagGroups[0][1].tagName == "Material");
+    CHECK(s->envTagGroups[0][1].enumValues[0] == "Stone");
+    CHECK(s->envTagGroups[0][2].tagName == "CreatureType");
+    CHECK(s->envTagGroups[0][2].enumValues[0] == "Player");
 }
 
 TEST_CASE("Parse env_tag with integer range", "[schema][tags]") {
@@ -340,11 +340,11 @@ TEST_CASE("Parse env_tag with integer range", "[schema][tags]") {
 
     auto *s = parser.findSchema("range_test");
     REQUIRE(s != nullptr);
-    REQUIRE(s->envTags.size() == 1);
-    CHECK(s->envTags[0].tagName == "Speed");
-    CHECK(s->envTags[0].isIntRange == true);
-    CHECK(s->envTags[0].rangeMin == 0);
-    CHECK(s->envTags[0].rangeMax == 100);
+    REQUIRE(s->envTagGroups[0].size() == 1);
+    CHECK(s->envTagGroups[0][0].tagName == "Speed");
+    CHECK(s->envTagGroups[0][0].isIntRange == true);
+    CHECK(s->envTagGroups[0][0].rangeMin == 0);
+    CHECK(s->envTagGroups[0][0].rangeMax == 100);
 }
 
 TEST_CASE("findByEnvTags matching", "[schema][tags]") {
@@ -863,11 +863,11 @@ TEST_CASE("NewBridge: env_tag schema (blackjack_ceram)", "[schema][newbridge]") 
     CHECK(s->samples[1].name == "ar_body2");
 
     // env_tag (Event Collision) (WeaponType Blackjack) (Material Ceramic)
-    REQUIRE(s->envTags.size() == 3);
+    REQUIRE(s->envTagGroups[0].size() == 3);
 
     // Find each tag by name (order may vary)
     bool foundEvent = false, foundWeapon = false, foundMaterial = false;
-    for (const auto &tag : s->envTags) {
+    for (const auto &tag : s->envTagGroups[0]) {
         if (tag.tagName == "Event") {
             CHECK(tag.enumValues.size() == 1);
             CHECK(tag.enumValues[0] == "Collision");
@@ -898,11 +898,14 @@ TEST_CASE("NewBridge: door state change env_tag with multi-value enum",
     // We need to find this schema by scanning for env_tags with OldOpenState
     const SchemaEntry *doorSchema = nullptr;
     for (const auto &[key, schema] : parser.schemas()) {
-        for (const auto &tag : schema.envTags) {
-            if (tag.tagName == "OldOpenState" && tag.enumValues.size() >= 3) {
-                doorSchema = &schema;
-                break;
+        for (const auto &group : schema.envTagGroups) {
+            for (const auto &tag : group) {
+                if (tag.tagName == "OldOpenState" && tag.enumValues.size() >= 3) {
+                    doorSchema = &schema;
+                    break;
+                }
             }
+            if (doorSchema) break;
         }
         if (doorSchema) break;
     }
@@ -910,17 +913,18 @@ TEST_CASE("NewBridge: door state change env_tag with multi-value enum",
     REQUIRE(doorSchema != nullptr);
     INFO("Door schema: " << doorSchema->name);
 
-    // Verify multi-value enum was parsed
-    for (const auto &tag : doorSchema->envTags) {
-        if (tag.tagName == "OldOpenState") {
-            CHECK(tag.enumValues.size() == 3);
-            // Should contain Closed, Opening, Closing
-            CHECK(std::find(tag.enumValues.begin(), tag.enumValues.end(), "Closed")
-                  != tag.enumValues.end());
-            CHECK(std::find(tag.enumValues.begin(), tag.enumValues.end(), "Opening")
-                  != tag.enumValues.end());
-            CHECK(std::find(tag.enumValues.begin(), tag.enumValues.end(), "Closing")
-                  != tag.enumValues.end());
+    // Verify multi-value enum was parsed — search across all env_tag groups
+    for (const auto &group : doorSchema->envTagGroups) {
+        for (const auto &tag : group) {
+            if (tag.tagName == "OldOpenState") {
+                CHECK(tag.enumValues.size() == 3);
+                CHECK(std::find(tag.enumValues.begin(), tag.enumValues.end(), "Closed")
+                      != tag.enumValues.end());
+                CHECK(std::find(tag.enumValues.begin(), tag.enumValues.end(), "Opening")
+                      != tag.enumValues.end());
+                CHECK(std::find(tag.enumValues.begin(), tag.enumValues.end(), "Closing")
+                      != tag.enumValues.end());
+            }
         }
     }
 }
@@ -1023,16 +1027,19 @@ static void checkSchemaEqual(const SchemaEntry &a, const SchemaEntry &b,
         }
     }
 
-    // Env tags
-    REQUIRE(a.envTags.size() == b.envTags.size());
-    for (size_t i = 0; i < a.envTags.size(); ++i) {
-        CHECK(a.envTags[i].tagName == b.envTags[i].tagName);
-        CHECK(a.envTags[i].isIntRange == b.envTags[i].isIntRange);
-        if (a.envTags[i].isIntRange) {
-            CHECK(a.envTags[i].rangeMin == b.envTags[i].rangeMin);
-            CHECK(a.envTags[i].rangeMax == b.envTags[i].rangeMax);
-        } else {
-            CHECK(a.envTags[i].enumValues == b.envTags[i].enumValues);
+    // Env tag groups
+    REQUIRE(a.envTagGroups.size() == b.envTagGroups.size());
+    for (size_t g = 0; g < a.envTagGroups.size(); ++g) {
+        REQUIRE(a.envTagGroups[g].size() == b.envTagGroups[g].size());
+        for (size_t i = 0; i < a.envTagGroups[g].size(); ++i) {
+            CHECK(a.envTagGroups[g][i].tagName == b.envTagGroups[g][i].tagName);
+            CHECK(a.envTagGroups[g][i].isIntRange == b.envTagGroups[g][i].isIntRange);
+            if (a.envTagGroups[g][i].isIntRange) {
+                CHECK(a.envTagGroups[g][i].rangeMin == b.envTagGroups[g][i].rangeMin);
+                CHECK(a.envTagGroups[g][i].rangeMax == b.envTagGroups[g][i].rangeMax);
+            } else {
+                CHECK(a.envTagGroups[g][i].enumValues == b.envTagGroups[g][i].enumValues);
+            }
         }
     }
 

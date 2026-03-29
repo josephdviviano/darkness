@@ -614,7 +614,7 @@ void SchemaParser::parseEnvTagDef(Tokenizer &tok)
     if (!mLastSchemaName.empty()) {
         auto it = mSchemas.find(mLastSchemaName);
         if (it != mSchemas.end()) {
-            it->second.envTags = std::move(tags);
+            it->second.envTagGroups.push_back(std::move(tags));
         }
     } else {
         warn(tok, "env_tag without preceding schema definition");
@@ -826,76 +826,84 @@ SchemaParser::findByEnvTags(const std::vector<SchemaTagValue> &queryTags) const
     for (const auto &[key, schema] : mSchemas) {
         if (!schema.hasEnvTags()) continue;
 
-        // Check if ALL of the schema's env_tags match the query
-        bool allMatch = true;
-        for (const auto &reqTag : schema.envTags) {
-            bool tagFound = false;
-            for (const auto &qTag : queryTags) {
-                if (toLower(reqTag.tagName) != toLower(qTag.tagName))
-                    continue;
+        // Multiple env_tag lines are alternatives (OR): ANY group can match.
+        // Within a single env_tag line, ALL tags must match (AND).
+        bool anyGroupMatched = false;
+        for (const auto &group : schema.envTagGroups) {
+            bool allMatch = true;
+            for (const auto &reqTag : group) {
+                bool tagFound = false;
+                for (const auto &qTag : queryTags) {
+                    if (toLower(reqTag.tagName) != toLower(qTag.tagName))
+                        continue;
 
-                // Tag name matches — check values
-                if (reqTag.enumValues.empty() && !reqTag.isIntRange) {
-                    // Wildcard match (no values specified)
-                    tagFound = true;
-                } else if (reqTag.isIntRange) {
-                    // Integer range: query value/range must fall within schema's range
-                    if (qTag.isIntRange) {
-                        tagFound = (qTag.rangeMin >= reqTag.rangeMin &&
-                                    qTag.rangeMax <= reqTag.rangeMax);
-                    } else if (!qTag.enumValues.empty()) {
-                        // Single integer value passed as enum string — parse and check range
-                        try {
-                            int val = std::stoi(qTag.enumValues[0]);
-                            tagFound = (val >= reqTag.rangeMin && val <= reqTag.rangeMax);
-                        } catch (...) {
-                            tagFound = false;
-                        }
-                    }
-                } else {
-                    // Enum match: any query value must match any schema value
-                    for (const auto &qVal : qTag.enumValues) {
-                        for (const auto &rVal : reqTag.enumValues) {
-                            if (toLower(qVal) == toLower(rVal)) {
-                                tagFound = true;
-                                break;
+                    // Tag name matches — check values
+                    if (reqTag.enumValues.empty() && !reqTag.isIntRange) {
+                        // Wildcard match (no values specified)
+                        tagFound = true;
+                    } else if (reqTag.isIntRange) {
+                        // Integer range: query value/range must fall within schema's range
+                        if (qTag.isIntRange) {
+                            tagFound = (qTag.rangeMin >= reqTag.rangeMin &&
+                                        qTag.rangeMax <= reqTag.rangeMax);
+                        } else if (!qTag.enumValues.empty()) {
+                            try {
+                                int val = std::stoi(qTag.enumValues[0]);
+                                tagFound = (val >= reqTag.rangeMin && val <= reqTag.rangeMax);
+                            } catch (...) {
+                                tagFound = false;
                             }
                         }
-                        if (tagFound) break;
+                    } else {
+                        // Enum match: any query value must match any schema value
+                        for (const auto &qVal : qTag.enumValues) {
+                            for (const auto &rVal : reqTag.enumValues) {
+                                if (toLower(qVal) == toLower(rVal)) {
+                                    tagFound = true;
+                                    break;
+                                }
+                            }
+                            if (tagFound) break;
+                        }
                     }
+                    if (tagFound) break;
                 }
-                if (tagFound) break;
+                if (!tagFound) {
+                    allMatch = false;
+                    break;
+                }
             }
-            if (!tagFound) {
-                allMatch = false;
+            if (allMatch) {
+                anyGroupMatched = true;
                 break;
             }
         }
 
         // Enforce env_tag_required: if the query includes a required tag,
-        // the schema MUST also include that tag. This prevents schemas without
-        // the tag from being selected when the query specifies a required context.
-        if (allMatch) {
+        // the schema MUST also include that tag in at least one group.
+        if (anyGroupMatched) {
             for (const auto &qTag : queryTags) {
                 std::string qKey = toLower(qTag.tagName);
                 if (mRequiredEnvTags.count(qKey)) {
-                    // Query has a required tag — schema must also have it
                     bool schemaHasTag = false;
-                    for (const auto &sTag : schema.envTags) {
-                        if (toLower(sTag.tagName) == qKey) {
-                            schemaHasTag = true;
-                            break;
+                    for (const auto &group : schema.envTagGroups) {
+                        for (const auto &sTag : group) {
+                            if (toLower(sTag.tagName) == qKey) {
+                                schemaHasTag = true;
+                                break;
+                            }
                         }
+                        if (schemaHasTag) break;
                     }
                     if (!schemaHasTag) {
-                        allMatch = false;
+                        anyGroupMatched = false;
                         break;
                     }
                 }
             }
         }
 
-        if (allMatch) {
+        if (anyGroupMatched) {
             matches.push_back(&schema);
         }
     }
@@ -1053,10 +1061,10 @@ std::string SchemaParser::serialize() const {
             out << "\n";
         }
 
-        // env_tag
-        if (!schema.envTags.empty()) {
+        // env_tag (one line per group)
+        for (const auto &group : schema.envTagGroups) {
             out << "env_tag";
-            serializeTagList(out, schema.envTags);
+            serializeTagList(out, group);
             out << "\n";
         }
 

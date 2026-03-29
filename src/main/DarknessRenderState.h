@@ -59,6 +59,7 @@ namespace Darkness {
 class ObjectStateMap;
 class DoorSystem;
 class FrobSystem;
+class MessageDispatch;
 
 // ── MissionData — CPU-side parsed mission content ──
 // Everything loaded from the .mis/.gam files and CRF archives before
@@ -236,6 +237,10 @@ struct RuntimeState {
 
     // Frob system — non-owning pointer, for player interaction with objects
     FrobSystem *frobSystem = nullptr;
+
+    // Message dispatch — non-owning pointer, for routing frob/TurnOn/TurnOff
+    // through global handlers (which enforce lock checks, etc.)
+    MessageDispatch *messageDispatch = nullptr;
 
     // Mode description string for title bar (points to string literal)
     const char *modeStr = "flat-shaded";

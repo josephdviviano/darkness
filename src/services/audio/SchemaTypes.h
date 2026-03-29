@@ -121,7 +121,9 @@ struct SchemaEntry {
     std::vector<SchemaSample> samples;
 
     // Environmental sound matching (env_tag)
-    std::vector<SchemaTagValue> envTags;
+    // Each inner vector is one env_tag line (all tags in a line must match = AND).
+    // Multiple env_tag lines are alternatives (any line can match = OR).
+    std::vector<std::vector<SchemaTagValue>> envTagGroups;
 
     // Speech matching (schema_voice)
     std::string voiceName;
@@ -132,7 +134,7 @@ struct SchemaEntry {
     // Message label for AI notification
     std::string message;
 
-    bool hasEnvTags() const { return !envTags.empty(); }
+    bool hasEnvTags() const { return !envTagGroups.empty(); }
     bool hasVoice() const { return !voiceName.empty(); }
 
     /// Total frequency weight across all samples
