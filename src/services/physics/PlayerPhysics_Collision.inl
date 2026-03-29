@@ -331,6 +331,13 @@
                 mCollision.sphereVsCellPolygons(sphereCenter, sphereR, sphereCell, contacts);
             }
 
+            // Also check objects (doors, crates, furniture) — prevents mantling
+            // through objects that only exist as collision bodies, not WR geometry.
+            if (mObjectWorld && sphereR > 0.0f) {
+                mObjectWorld->testPlayerSpheres(
+                    &sphereCenter, &sphereR, 1, testCell, contacts);
+            }
+
             if (!contacts.empty())
                 return false;  // penetration detected — player doesn't fit
         }
