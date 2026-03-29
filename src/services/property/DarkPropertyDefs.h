@@ -304,6 +304,12 @@ struct PropMovingTerrain {
     int32_t unknown;
 };
 
+// P$Locked — dtype: Locked, inheritor: always, 4 bytes
+// Simple boolean lock state. When true, doors reject frob attempts while closed.
+struct PropLocked {
+    uint32_t isLocked;       // bool32: 0 = unlocked, nonzero = locked
+};
+
 #pragma pack(pop)
 
 } // namespace Darkness
