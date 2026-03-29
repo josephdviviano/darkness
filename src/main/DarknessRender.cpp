@@ -31,6 +31,7 @@
 #include <chrono>
 #include <map>
 #include <unordered_map>
+#include <sstream>
 #include <unistd.h> // dup2, fileno
 
 #include <SDL.h>
@@ -1259,8 +1260,13 @@ static void handleEvents(
                     if (distSq < nearestDist) { nearestDist = distSq; nearestID = did; }
                 }
                 if (nearestID != 0) {
-                    state.doorSystem->activate(nearestID, Darkness::kDoorToggle);
-                    std::fprintf(stderr, "Frob fallback: toggled door %d (dist=%.1f)\n",
+                    // Route through MessageDispatch so lock checks apply
+                    if (state.messageDispatch) {
+                        state.messageDispatch->frobWorldEnd(nearestID, 0);
+                    } else {
+                        state.doorSystem->activate(nearestID, Darkness::kDoorToggle);
+                    }
+                    std::fprintf(stderr, "Frob fallback: door %d (dist=%.1f)\n",
                                  nearestID, std::sqrt(nearestDist));
                 }
             }
@@ -2068,6 +2074,7 @@ int main(int argc, char *argv[]) {
 
     // Connect FrobSystem to MessageDispatch for SwitchLink traversal
     frobSystem.setMessageDispatch(&messageDispatch);
+    state.messageDispatch = &messageDispatch;
 
     // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
     loadWorldTextures(misPath, resPath, mission);
@@ -2217,6 +2224,16 @@ int main(int argc, char *argv[]) {
         Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
         doorSystem.init(propSvc.get(), objSvc.get(), state.objectStates,
                         &mission.parsedModels, &doorPlacements);
+
+        // Log lock state for each door (P$Locked property)
+        for (int32_t did : doorSystem.getAllDoorIDs()) {
+            Darkness::PropLocked locked;
+            if (Darkness::getTypedProperty<Darkness::PropLocked>(
+                    propSvc.get(), "Locked", did, locked) &&
+                locked.isLocked != 0) {
+                std::fprintf(stderr, "  Door %d: LOCKED\n", did);
+            }
+        }
     }
 
     // ── Build object collision bodies from .bin bounding boxes ──
@@ -2458,7 +2475,8 @@ int main(int argc, char *argv[]) {
     // the open fraction (updated per-frame below).
     {
     Darkness::AudioServicePtr audioForEvents = GET_SERVICE(Darkness::AudioService);
-    doorSystem.setEventCallback([audioForEvents](int32_t objID, Darkness::DoorStatus status,
+    Darkness::PropertyServicePtr propSvcForDoors = GET_SERVICE(Darkness::PropertyService);
+    doorSystem.setEventCallback([audioForEvents, propSvcForDoors](int32_t objID, Darkness::DoorStatus status,
                                     Darkness::DoorStatus oldStatus,
                                     const Darkness::DoorState &door) {
         // State name strings matching Dark Engine schema env_tag convention
@@ -2488,14 +2506,47 @@ int main(int argc, char *argv[]) {
             creatureTag.tagName = "CreatureType";
             creatureTag.enumValues.push_back("Player");
 
-            // TODO: read DoorType from object property (P$DoorSoundType or
-            // archetype inheritance). Hardcoded to Wood1sm for initial testing.
-            Darkness::SchemaTagValue doorTypeTag;
-            doorTypeTag.tagName = "DoorType";
-            doorTypeTag.enumValues.push_back("Wood1sm");
-
+            // Read DoorType from the object's "ClassTags" property.
+            // On-disk format: uint32 + char[252] containing tag pairs
+            // like "DoorType Wood1sm". Resolved through archetype inheritance.
             std::vector<Darkness::SchemaTagValue> tags = {
-                eventTag, openTag, oldTag, creatureTag, doorTypeTag};
+                eventTag, openTag, oldTag, creatureTag};
+            {
+                struct { uint32_t value; char text[252]; } classTags = {};
+                // The property is "Class Tag" in the pldef (label "ClassTags",
+                // chunk "P$Class Tag"). Try all known names.
+                bool found = false;
+                for (const char *pname : {"ClassTags", "Class Tags", "Class Tag"}) {
+                    if (propSvcForDoors &&
+                        Darkness::getTypedProperty<decltype(classTags)>(
+                            propSvcForDoors.get(), pname, objID, classTags)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) {
+                    // Parse tag pairs from the string (e.g., "DoorType Wood1sm")
+                    std::string tagStr(classTags.text,
+                        strnlen(classTags.text, sizeof(classTags.text)));
+                    std::fprintf(stderr, "  Door %d ClassTags: \"%s\"\n",
+                                 objID, tagStr.c_str());
+                    // Split into key-value pairs
+                    std::istringstream iss(tagStr);
+                    std::string key, val;
+                    while (iss >> key >> val) {
+                        Darkness::SchemaTagValue t;
+                        t.tagName = key;
+                        t.enumValues.push_back(val);
+                        tags.push_back(std::move(t));
+                    }
+                } else {
+                    static int warnCount = 0;
+                    if (warnCount < 3) {
+                        std::fprintf(stderr, "  Door %d: ClassTags property not found\n", objID);
+                        ++warnCount;
+                    }
+                }
+            }
             auto h = audioForEvents->playEnvSchema(tags, door.basePosition);
             if (h == Darkness::SOUND_HANDLE_INVALID) {
                 std::fprintf(stderr, "  Door %d: no schema matched env_tags "
