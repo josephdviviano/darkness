@@ -673,7 +673,7 @@ private:
     }
 
     void applyDoorTransform(DoorState &door) {
-        if (!mObjectStates) return;
+        if (!mObjectStates || door.isBrushDoor) return;
 
         ObjectState &os = mObjectStates->get(door.objID);
 
