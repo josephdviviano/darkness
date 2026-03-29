@@ -299,14 +299,38 @@ public:
                                 lx*m[1] + ly*m[5] + lz*m[9]  + m[13],
                                 lx*m[2] + ly*m[6] + lz*m[10] + m[14]);
                         };
-                        // Hinge = +pivotOffset from center, far edge = -pivotOffset
-                        Vector3 hinge = xformPt(door.pivotOffset.x, door.pivotOffset.y, door.pivotOffset.z);
-                        Vector3 far = xformPt(-door.pivotOffset.x, -door.pivotOffset.y, -door.pivotOffset.z);
-                        std::fprintf(stderr, "  Door %d frame %d: val=%.3f "
-                                     "hinge=(%.2f,%.2f,%.2f) far=(%.2f,%.2f,%.2f)\n",
+                        // Log all 8 bbox corners transformed to world space.
+                        // Get model bbox from parsedModels via placement modelName.
+                        float bmin[3] = {-2, -0.1f, -4};  // fallback
+                        float bmax[3] = { 2,  0.1f,  4};
+                        if (mPlacements) {
+                            auto pit = mPlacements->find(id);
+                            if (pit != mPlacements->end()) {
+                                std::string mname(pit->second.modelName,
+                                    strnlen(pit->second.modelName, 16));
+                                if (mParsedModels) {
+                                    auto mit = mParsedModels->find(mname);
+                                    if (mit != mParsedModels->end()) {
+                                        for (int i = 0; i < 3; ++i) {
+                                            bmin[i] = mit->second.bboxMin[i];
+                                            bmax[i] = mit->second.bboxMax[i];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        std::fprintf(stderr, "  Door %d frame %d: val=%.3f bbox=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)\n",
                                      id, door.logFrames, door.currentValue,
-                                     hinge.x, hinge.y, hinge.z,
-                                     far.x, far.y, far.z);
+                                     bmin[0], bmin[1], bmin[2], bmax[0], bmax[1], bmax[2]);
+                        // Transform and log all 8 corners
+                        for (int ci = 0; ci < 8; ++ci) {
+                            float cx = (ci & 1) ? bmax[0] : bmin[0];
+                            float cy = (ci & 2) ? bmax[1] : bmin[1];
+                            float cz = (ci & 4) ? bmax[2] : bmin[2];
+                            Vector3 w = xformPt(cx, cy, cz);
+                            std::fprintf(stderr, "    v%d local=(%.1f,%.1f,%.1f) -> world=(%.2f,%.2f,%.2f)\n",
+                                         ci, cx, cy, cz, w.x, w.y, w.z);
+                        }
                     }
                     ++door.logFrames;
                 }
@@ -476,8 +500,10 @@ private:
                 door.basePosition = Vector3(pl.x, pl.y, pl.z);
                 door.baseScale = Vector3(pl.sx, pl.sy, pl.sz);
 
-                // Build rotation as Rz(heading) * Ry(pitch) * Rx(bank) —
-                // same convention as buildModelMatrix in DarknessRendererCore.h
+                // Build rotation matching Dark Engine convention:
+                // Rz(heading) * Ry(pitch) * Rx(bank).
+                // No angle negation — we use direct GLM memcpy (not 3x3 transpose)
+                // so the GPU sees the GLM matrix as-is.
                 float h   = static_cast<float>(pl.heading) * kAngScale;
                 float pit = static_cast<float>(pl.pitch)   * kAngScale;
                 float b   = static_cast<float>(pl.bank)    * kAngScale;
@@ -732,7 +758,7 @@ private:
                 Matrix4 worldTranslate = glm::translate(Matrix4(1.0f), door.basePosition);
                 fullGlm = worldTranslate * baseMat * scaleMat;
             } else {
-                // Animating: rotate around hinge edge (at +pivotOffset from center)
+                // Animating: rotate around hinge edge (at +pivotOffset from center).
                 Matrix4 offsetRot = glm::rotate(Matrix4(1.0f), door.currentValue, axisVec);
                 Matrix4 toPivot = glm::translate(Matrix4(1.0f), -door.pivotOffset);
                 Matrix4 fromPivot = glm::translate(Matrix4(1.0f), door.pivotOffset);
@@ -741,21 +767,12 @@ private:
                 fullGlm = worldTranslate * baseMat * fromPivot * offsetRot * toPivot * scaleMat;
             }
 
-            // Convert glm column-major to bx row-major.
-            // Only transpose the 3x3 rotation block. Translation goes from
-            // glm column 3 to bx row 3 (m[12-14]). A full 4x4 transpose would
-            // put translation values into the rotation block, causing scaling.
-            float *m = os.modelMatrix;
-            for (int col = 0; col < 3; ++col)
-                for (int row = 0; row < 3; ++row)
-                    m[row * 4 + col] = fullGlm[col][row];
-            m[ 3] = 0.0f;
-            m[ 7] = 0.0f;
-            m[11] = 0.0f;
-            m[12] = fullGlm[3][0];  // tx
-            m[13] = fullGlm[3][1];  // ty
-            m[14] = fullGlm[3][2];  // tz
-            m[15] = 1.0f;
+            // Copy GLM column-major matrix directly to the model matrix.
+            // bgfx passes the float[16] to the GPU without transposing, and
+            // the GPU reads it as column-major — which is GLM's native format.
+            // No 3x3 transpose needed (and doing one breaks pivot transforms
+            // by inverting the rotation while leaving translation unchanged).
+            std::memcpy(os.modelMatrix, glm::value_ptr(fullGlm), 16 * sizeof(float));
 
             os.hasMatrix = true;
             os.position = door.basePosition;  // approximate for queries
