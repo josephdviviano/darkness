@@ -1270,31 +1270,6 @@ static void handleEvents(
                                  nearestID, std::sqrt(nearestDist));
                 }
             }
-        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_g
-                   && !ev.key.repeat && state.doorSystem) {
-            // G: toggle the nearest door (debug interaction).
-            // Finds the closest door to the camera and toggles it open/closed.
-            Darkness::Vector3 camPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
-            auto doorIDs = state.doorSystem->getAllDoorIDs();
-            int32_t nearestID = 0;
-            float nearestDist = 1e9f;
-            for (int32_t id : doorIDs) {
-                const auto *door = state.doorSystem->getDoor(id);
-                if (!door) continue;
-                float dx = door->basePosition.x - camPos.x;
-                float dy = door->basePosition.y - camPos.y;
-                float dz = door->basePosition.z - camPos.z;
-                float dist = dx*dx + dy*dy + dz*dz;
-                if (dist < nearestDist) {
-                    nearestDist = dist;
-                    nearestID = id;
-                }
-            }
-            if (nearestID != 0) {
-                state.doorSystem->activate(nearestID, Darkness::kDoorToggle);
-                std::fprintf(stderr, "Toggled door %d (dist=%.1f)\n",
-                             nearestID, std::sqrt(nearestDist));
-            }
         }
     }
 }
@@ -2060,11 +2035,46 @@ int main(int argc, char *argv[]) {
             if (doorSystem.isDoor(msg.to) &&
                 doorSystem.getStatus(msg.to) == Darkness::kDoorClosed) {
                 auto propSvc = GET_SERVICE(Darkness::PropertyService);
-                Darkness::PropLocked locked;
+                Darkness::PropLocked locked{};
                 if (propSvc &&
                     Darkness::getTypedProperty<Darkness::PropLocked>(
                         propSvc.get(), "Locked", msg.to, locked) &&
                     locked.isLocked != 0) {
+                    // Play reject sound: env_tag (Event Reject)(Operation OpenDoor)
+                    // plus the door's ClassTags (e.g. DoorType Metal)
+                    auto audioSvc = GET_SERVICE(Darkness::AudioService);
+                    const auto *door = doorSystem.getDoor(msg.to);
+                    if (audioSvc && door) {
+                        std::vector<Darkness::SchemaTagValue> tags;
+                        Darkness::SchemaTagValue evtTag;
+                        evtTag.tagName = "Event";
+                        evtTag.enumValues.push_back("Reject");
+                        tags.push_back(evtTag);
+                        Darkness::SchemaTagValue opTag;
+                        opTag.tagName = "Operation";
+                        opTag.enumValues.push_back("OpenDoor");
+                        tags.push_back(opTag);
+                        // Add ClassTags from the door object (e.g. DoorType Metal)
+                        struct { uint32_t value; char text[252]; } classTags = {};
+                        for (const char *pname : {"ClassTags", "Class Tags", "Class Tag"}) {
+                            if (Darkness::getTypedProperty<decltype(classTags)>(
+                                    propSvc.get(), pname, msg.to, classTags))
+                                break;
+                        }
+                        std::string tagStr(classTags.text,
+                            strnlen(classTags.text, sizeof(classTags.text)));
+                        if (!tagStr.empty()) {
+                            std::istringstream iss(tagStr);
+                            std::string key, val;
+                            while (iss >> key >> val) {
+                                Darkness::SchemaTagValue t;
+                                t.tagName = key;
+                                t.enumValues.push_back(val);
+                                tags.push_back(std::move(t));
+                            }
+                        }
+                        audioSvc->playEnvSchema(tags, door->basePosition);
+                    }
                     std::fprintf(stderr, "Door %d: LOCKED, rejecting frob\n", msg.to);
                     return true;  // consumed — do not toggle
                 }
@@ -2225,14 +2235,18 @@ int main(int argc, char *argv[]) {
         doorSystem.init(propSvc.get(), objSvc.get(), state.objectStates,
                         &mission.parsedModels, &doorPlacements);
 
-        // Log lock state for each door (P$Locked property)
+        // Log locked doors
+        int lockedCount = 0;
         for (int32_t did : doorSystem.getAllDoorIDs()) {
-            Darkness::PropLocked locked;
+            Darkness::PropLocked locked{};
             if (Darkness::getTypedProperty<Darkness::PropLocked>(
                     propSvc.get(), "Locked", did, locked) &&
                 locked.isLocked != 0) {
-                std::fprintf(stderr, "  Door %d: LOCKED\n", did);
+                ++lockedCount;
             }
+        }
+        if (lockedCount > 0) {
+            std::fprintf(stderr, "  %d doors locked (P$Locked)\n", lockedCount);
         }
     }
 
