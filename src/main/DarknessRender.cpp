@@ -2013,30 +2013,10 @@ int main(int argc, char *argv[]) {
     // Give the renderer access to the mutable object state map (owned by worldQuery)
     state.objectStates = &worldQuery->objectStates();
 
-    // ── Initialize door system ──
-    // Scans for P$RotDoor and P$TransDoor properties, creates DoorState entries,
-    // and initializes ObjectState transforms for each door.
-    // Build objID → placement map for raw binary radian angles.
-    // DoorSystem uses this to get exact angles matching the static renderer.
-    std::unordered_map<int32_t, Darkness::DoorSystem::ObjPlacementInfo> doorPlacements;
-    for (const auto &obj : mission.objData.objects) {
-        Darkness::DoorSystem::ObjPlacementInfo pi = {
-            obj.x, obj.y, obj.z,
-            obj.heading, obj.pitch, obj.bank,
-            obj.scaleX, obj.scaleY, obj.scaleZ,
-            {}
-        };
-        std::memcpy(pi.modelName, obj.modelName, 16);
-        doorPlacements[obj.objID] = pi;
-    }
-
+    // Declare DoorSystem early so frob/message systems can reference it.
+    // Actual init is deferred until after loadObjectAssets (which populates
+    // allPlacements with position/angle data for ALL concrete objects).
     Darkness::DoorSystem doorSystem;
-    {
-        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
-        Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
-        doorSystem.init(propSvc.get(), objSvc.get(), state.objectStates,
-                        &mission.parsedModels, &doorPlacements);
-    }
     state.doorSystem = &doorSystem;
 
     // ── Initialize frob system ──
@@ -2199,6 +2179,29 @@ int main(int argc, char *argv[]) {
 
     // ── Load object assets: properties, .bin models, textures from obj.crf ──
     loadObjectAssets(misPath, resPath, cfg, mission, state);
+
+    // ── Initialize door system (after loadObjectAssets so allPlacements is populated) ──
+    // Build objID → placement map from ALL positioned objects (not just rendered
+    // ones). Doors have RenderType=NotRendered and are filtered from
+    // mission.objData.objects, but DoorSystem needs their raw angles.
+    // NOTE: doorPlacements must outlive doorSystem — it stores a raw pointer.
+    std::unordered_map<int32_t, Darkness::DoorSystem::ObjPlacementInfo> doorPlacements;
+    for (const auto &[id, obj] : mission.objData.allPlacements) {
+        Darkness::DoorSystem::ObjPlacementInfo pi = {
+            obj.x, obj.y, obj.z,
+            obj.heading, obj.pitch, obj.bank,
+            obj.scaleX, obj.scaleY, obj.scaleZ,
+            {}
+        };
+        std::memcpy(pi.modelName, obj.modelName, 16);
+        doorPlacements[id] = pi;
+    }
+    {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
+        doorSystem.init(propSvc.get(), objSvc.get(), state.objectStates,
+                        &mission.parsedModels, &doorPlacements);
+    }
 
     // ── Build object collision bodies from .bin bounding boxes ──
     // Creates OBB/sphere collision bodies for placed objects (crates, furniture,
