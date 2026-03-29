@@ -3504,6 +3504,56 @@ SoundHandle AudioService::playSchemaOnObj(const std::string &schemaName,
 }
 
 //------------------------------------------------------
+SoundHandle AudioService::playEnvSchema(const std::vector<SchemaTagValue> &tags,
+                                         const Vector3 &position)
+{
+    if (!mAudioReady || !mSchemaParser)
+        return SOUND_HANDLE_INVALID;
+
+    auto matches = mSchemaParser->findByEnvTags(tags);
+    if (matches.empty())
+        return SOUND_HANDLE_INVALID;
+
+    // Use the first matching schema (highest priority match)
+    const SchemaEntry *schema = matches[0];
+    if (schema->samples.empty())
+        return SOUND_HANDLE_INVALID;
+
+    // Weighted random sample selection (same as playSchema)
+    std::vector<int> freqs;
+    freqs.reserve(schema->samples.size());
+    for (const auto &s : schema->samples)
+        freqs.push_back(s.frequency);
+
+    int totalFreq = schema->totalFrequency();
+    if (totalFreq <= 0)
+        return SOUND_HANDLE_INVALID;
+
+    int idx = selectSample(schema->name, static_cast<int>(schema->samples.size()),
+                           totalFreq, freqs.data());
+    if (idx < 0 || idx >= static_cast<int>(schema->samples.size()))
+        return SOUND_HANDLE_INVALID;
+
+    if ((schema->playParams.flags & SCH_NO_REPEAT) && schema->samples.size() > 1) {
+        auto it = mLastSampleIdx.find(schema->name);
+        if (it != mLastSampleIdx.end() && it->second == idx) {
+            idx = selectSample(schema->name, static_cast<int>(schema->samples.size()),
+                               totalFreq, freqs.data());
+            if (idx < 0 || idx >= static_cast<int>(schema->samples.size()))
+                return SOUND_HANDLE_INVALID;
+        }
+    }
+    mLastSampleIdx[schema->name] = idx;
+
+    const SchemaSample &sample = schema->samples[idx];
+    bool looping = schema->loopParams.isLooping;
+    float vol = schemaVolumeToLinear(schema->playParams.volume);
+
+    return startVoice(schema->name, sample.name, position,
+                      schema->playParams.priority, looping, 0, vol);
+}
+
+//------------------------------------------------------
 void AudioService::haltSound(SoundHandle handle)
 {
     if (handle == SOUND_HANDLE_INVALID)

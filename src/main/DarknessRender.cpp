@@ -2046,9 +2046,25 @@ int main(int argc, char *argv[]) {
     messageDispatch.registerGlobalHandler("TurnOff", [&doorSystem](const Darkness::ScriptMessage &msg) {
         return doorSystem.activate(msg.to, Darkness::kDoorDoClose);
     });
-    messageDispatch.registerGlobalHandler("FrobWorldEnd", [&doorSystem](const Darkness::ScriptMessage &msg) {
-        return doorSystem.activate(msg.to, Darkness::kDoorToggle);
-    });
+    messageDispatch.registerGlobalHandler("FrobWorldEnd",
+        [&doorSystem](const Darkness::ScriptMessage &msg) {
+            // Dark Engine convention: locked doors reject frob when closed.
+            // Lock check only applies to frob — TurnOn/TurnOff from scripts/levers
+            // can still open locked doors, matching original engine behavior.
+            if (doorSystem.isDoor(msg.to) &&
+                doorSystem.getStatus(msg.to) == Darkness::kDoorClosed) {
+                auto propSvc = GET_SERVICE(Darkness::PropertyService);
+                Darkness::PropLocked locked;
+                if (propSvc &&
+                    Darkness::getTypedProperty<Darkness::PropLocked>(
+                        propSvc.get(), "Locked", msg.to, locked) &&
+                    locked.isLocked != 0) {
+                    std::fprintf(stderr, "Door %d: LOCKED, rejecting frob\n", msg.to);
+                    return true;  // consumed — do not toggle
+                }
+            }
+            return doorSystem.activate(msg.to, Darkness::kDoorToggle);
+        });
 
     // Connect FrobSystem to MessageDispatch for SwitchLink traversal
     frobSystem.setMessageDispatch(&messageDispatch);
@@ -2443,24 +2459,60 @@ int main(int argc, char *argv[]) {
     {
     Darkness::AudioServicePtr audioForEvents = GET_SERVICE(Darkness::AudioService);
     doorSystem.setEventCallback([audioForEvents](int32_t objID, Darkness::DoorStatus status,
+                                    Darkness::DoorStatus oldStatus,
                                     const Darkness::DoorState &door) {
-        const char *statusNames[] = {"CLOSED", "OPEN", "CLOSING", "OPENING", "HALT"};
-        const char *name = (status >= 0 && status <= 4) ? statusNames[status] : "?";
-        std::fprintf(stderr, "Door %d: %s (room %d<->%d, blocking=%.0f%%)\n",
-                     objID, name, door.room1, door.room2, door.soundBlocking * 100.0f);
+        // State name strings matching Dark Engine schema env_tag convention
+        const char *stateNames[] = {"Closed", "Open", "Closing", "Opening", "Halted"};
+        const char *statusName = (status >= 0 && status <= 4) ? stateNames[status] : "?";
+        const char *oldName = (oldStatus >= 0 && oldStatus <= 4) ? stateNames[oldStatus] : "?";
+        std::fprintf(stderr, "Door %d: %s (was %s, room %d<->%d)\n",
+                     objID, statusName, oldName, door.room1, door.room2);
+
+        // Play door sound via general-purpose env_tag schema matching.
+        // Tags follow the Dark Engine's StdDoor script convention:
+        //   (Event StateChange) (OpenState <new>) (OldOpenState <old>)
+        if (audioForEvents) {
+            Darkness::SchemaTagValue eventTag;
+            eventTag.tagName = "Event";
+            eventTag.enumValues.push_back("StateChange");
+
+            Darkness::SchemaTagValue openTag;
+            openTag.tagName = "OpenState";
+            openTag.enumValues.push_back(statusName);
+
+            Darkness::SchemaTagValue oldTag;
+            oldTag.tagName = "OldOpenState";
+            oldTag.enumValues.push_back(oldName);
+
+            Darkness::SchemaTagValue creatureTag;
+            creatureTag.tagName = "CreatureType";
+            creatureTag.enumValues.push_back("Player");
+
+            // TODO: read DoorType from object property (P$DoorSoundType or
+            // archetype inheritance). Hardcoded to Wood1sm for initial testing.
+            Darkness::SchemaTagValue doorTypeTag;
+            doorTypeTag.tagName = "DoorType";
+            doorTypeTag.enumValues.push_back("Wood1sm");
+
+            std::vector<Darkness::SchemaTagValue> tags = {
+                eventTag, openTag, oldTag, creatureTag, doorTypeTag};
+            auto h = audioForEvents->playEnvSchema(tags, door.basePosition);
+            if (h == Darkness::SOUND_HANDLE_INVALID) {
+                std::fprintf(stderr, "  Door %d: no schema matched env_tags "
+                             "(OpenState=%s OldOpenState=%s)\n",
+                             objID, statusName, oldName);
+            }
+        }
 
         // Update audio blocking on door state transitions
         if (door.room1 >= 0 && door.room2 >= 0 && door.room1 != door.room2 &&
             audioForEvents) {
                 if (status == Darkness::kDoorClosed) {
-                    // Door fully closed: apply maximum blocking
                     audioForEvents->setBlockingFactor(door.room1, door.room2,
                                                        door.soundBlocking);
                 } else if (status == Darkness::kDoorOpen) {
-                    // Door fully open: remove blocking
                     audioForEvents->setBlockingFactor(door.room1, door.room2, 0.0f);
                 }
-                // Opening/closing transitions: blocking updated per-frame via callback
         }
     });
     }
