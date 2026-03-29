@@ -32,6 +32,7 @@
 #include "DarknessMath.h"
 #include "database/DatabaseCommon.h"
 #include "loop/LoopCommon.h"
+#include "audio/SchemaTypes.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -200,6 +201,17 @@ public:
      *  @param objID       Object ID to attach to
      *  @return Sound handle, or SOUND_HANDLE_INVALID on failure */
     SoundHandle playSchemaOnObj(const std::string &schemaName, int objID);
+
+    /** Play a sound matching environment tags at a world position.
+     *  General-purpose schema query: finds schemas whose env_tags match the
+     *  provided tag set, selects a sample, and plays it at the given position.
+     *  Used by doors, NPCs, traps, and any system that triggers sounds via
+     *  the Dark Engine's env_tag matching system.
+     *  @param tags     Environment tags to match (e.g., Event=StateChange, OpenState=Opening)
+     *  @param position World-space position for 3D audio
+     *  @return Sound handle, or SOUND_HANDLE_INVALID if no matching schema found */
+    SoundHandle playEnvSchema(const std::vector<SchemaTagValue> &tags,
+                              const Vector3 &position);
 
     /** Halt a specific active sound.
      *  @param handle  Sound handle from playSchema/playSchemaOnObj */
