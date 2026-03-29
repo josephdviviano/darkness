@@ -569,10 +569,10 @@ private:
         switch (door.axis) {
         case 0:  // X rotation
         case 1:  // Y rotation
-            door.pivotOffset.z = edgeLengths.z / 2.0f;
+            door.pivotOffset.z = -edgeLengths.z / 2.0f;
             break;
         case 2:  // Z rotation (most common for doors)
-            door.pivotOffset.x = edgeLengths.x / 2.0f;
+            door.pivotOffset.x = -edgeLengths.x / 2.0f;
             break;
         }
 
