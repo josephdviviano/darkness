@@ -111,6 +111,7 @@ struct DoorState {
     Matrix4 baseRotation = Matrix4(1.0f);  // glm column-major rotation matrix
     Vector3 baseScale = {1.0f, 1.0f, 1.0f};
     bool hasObjectState = false;  // true once ObjectState entry is created
+    bool isBrushDoor = false;     // true if terrain brush (no .bin model to render)
 
     // Pivot offset: vector from hinge to model center in the door's local frame.
     // For rotating doors, the center traces an arc around the hinge. The pivot
@@ -335,14 +336,18 @@ private:
                 computePivotOffset(door, propSvc, id);
             }
 
-            // Check if this door is in the placement array (= rendered statically)
-            if (mPlacements && mPlacements->find(id) == mPlacements->end()) {
-                std::fprintf(stderr, "  Door %d: WARNING — not in render array! "
-                             "May be a terrain brush, not a .bin model object.\n", id);
-            }
+            // Check if this door is in the render array (= has a .bin model).
+            // Dark Engine doors are typically TERRAIN BRUSHES — part of the
+            // world geometry, not .bin model objects. The .bin model (if any)
+            // is inherited from the archetype for physics collision shape only.
+            // We must NOT render a .bin model for these — the visual is the brush.
+            bool isRenderedObject = mPlacements &&
+                mPlacements->find(id) != mPlacements->end();
+            door.isBrushDoor = !isRenderedObject;
 
-            // Do NOT create ObjectState entries here. Doors render through the
-            // static P$Position path until they start animating.
+            if (!isRenderedObject) {
+                std::fprintf(stderr, "  Door %d: terrain brush door (no .bin render)\n", id);
+            }
 
             // Log door init details for debugging
             std::fprintf(stderr, "  Door %d: type=%s axis=%d closed=%.3f open=%.3f speed=%.3f "
@@ -529,8 +534,11 @@ private:
 
     /// Ensure the door has an ObjectState entry (created on-demand when
     /// animation starts, so static doors render through the normal path).
+    /// Brush doors (terrain geometry) don't get ObjectState — their visual
+    /// is the WR cell polygons, not a .bin model. Moving brush geometry
+    /// requires a different approach (Phase 4 future work).
     void ensureObjectState(DoorState &door) {
-        if (door.hasObjectState || !mObjectStates) return;
+        if (door.hasObjectState || !mObjectStates || door.isBrushDoor) return;
         door.hasObjectState = true;
         applyDoorTransform(door);
 
