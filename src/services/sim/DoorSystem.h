@@ -279,19 +279,6 @@ public:
             if (door.status == kDoorOpening || door.status == kDoorClosing) {
                 updateDoor(door, delta);
 
-                // Log every animation frame
-                {
-                    const ObjectState *os = mObjectStates ? mObjectStates->tryGet(id) : nullptr;
-                    std::fprintf(stderr, "  Door %d: val=%.4f vel=%.4f frac=%.3f pos=(%.2f,%.2f,%.2f)",
-                                 id, door.currentValue, door.velocity, getOpenFraction(id),
-                                 os ? os->position.x : 0, os ? os->position.y : 0, os ? os->position.z : 0);
-                    if (os && os->hasMatrix) {
-                        const float *m = os->modelMatrix;
-                        std::fprintf(stderr, " mtx12-14=(%.2f,%.2f,%.2f)", m[12], m[13], m[14]);
-                    }
-                    std::fprintf(stderr, "\n");
-                }
-
                 // Continuously update audio blocking during animation.
                 // This is called via the mAudioBlockingCallback which is
                 // set by the renderer to call AudioService::setBlockingFactor.
@@ -345,34 +332,13 @@ private:
                 mPlacements->find(id) != mPlacements->end();
             door.isBrushDoor = !isRenderedObject;
 
-            if (!isRenderedObject) {
-                std::fprintf(stderr, "  Door %d: terrain brush door (no .bin render)\n", id);
-            }
-
-            // Log door init details for debugging — position from P$Position
-            // BEFORE any interaction, so we can compare with post-frob state.
-            {
-                // Also log the ObjectService quaternion for this object
-                Quaternion q = mObjSvc ? mObjSvc->orientation(id) : Quaternion(1,0,0,0);
-                std::fprintf(stderr, "  Door %d: type=%s axis=%d closed=%.3f open=%.3f speed=%.3f "
-                             "clockwise=%d status=%d isBrush=%d\n",
-                             id, (doorType == kDoorRotating ? "rot" : "trans"),
-                             door.axis, door.closedValue, door.openValue,
-                             door.speed, door.clockwise ? 1 : 0, door.status,
-                             door.isBrushDoor ? 1 : 0);
-                std::fprintf(stderr, "    INIT basePos=(%.4f,%.4f,%.4f) scale=(%.2f,%.2f,%.2f)\n",
-                             door.basePosition.x, door.basePosition.y, door.basePosition.z,
-                             door.baseScale.x, door.baseScale.y, door.baseScale.z);
-                std::fprintf(stderr, "    INIT quaternion=(%.6f,%.6f,%.6f,%.6f)\n",
-                             q.w, q.x, q.y, q.z);
-                // Log baseRotation matrix diagonal (quick identity check)
-                std::fprintf(stderr, "    INIT baseRot diag=(%.4f,%.4f,%.4f) off=(%.4f,%.4f,%.4f)\n",
-                             door.baseRotation[0][0], door.baseRotation[1][1], door.baseRotation[2][2],
-                             door.baseRotation[1][0], door.baseRotation[2][0], door.baseRotation[2][1]);
-            }
-            std::fprintf(stderr, "    pivot=(%.2f,%.2f,%.2f) rooms=(%d,%d) blocking=%.0f%%\n",
+            std::fprintf(stderr, "  Door %d: type=%s axis=%d closed=%.3f open=%.3f speed=%.3f "
+                         "clockwise=%d isBrush=%d pivot=(%.2f,%.2f,%.2f) rooms=(%d,%d)\n",
+                         id, (doorType == kDoorRotating ? "rot" : "trans"),
+                         door.axis, door.closedValue, door.openValue,
+                         door.speed, door.clockwise ? 1 : 0, door.isBrushDoor ? 1 : 0,
                          door.pivotOffset.x, door.pivotOffset.y, door.pivotOffset.z,
-                         door.room1, door.room2, door.soundBlocking * 100.0f);
+                         door.room1, door.room2);
 
             mDoors[id] = door;
 
@@ -545,32 +511,13 @@ private:
 
     /// Ensure the door has an ObjectState entry (created on-demand when
     /// animation starts, so static doors render through the normal path).
-    /// Brush doors (terrain geometry) don't get ObjectState — their visual
-    /// is the WR cell polygons, not a .bin model. Moving brush geometry
-    /// requires a different approach (Phase 4 future work).
+    /// All doors (including brush doors) get ObjectState — the door's .bin
+    /// model (inherited from archetype) is the visual that animates. The WR
+    /// cell geometry is just the door frame, not the door slab.
     void ensureObjectState(DoorState &door) {
-        if (door.hasObjectState || !mObjectStates || door.isBrushDoor) return;
+        if (door.hasObjectState || !mObjectStates) return;
         door.hasObjectState = true;
         applyDoorTransform(door);
-
-        // Log the ObjectState creation for debugging
-        const ObjectState *os = mObjectStates->tryGet(door.objID);
-        if (os) {
-            std::fprintf(stderr, "  Door %d: ObjectState CREATED at currentValue=%.4f\n"
-                         "    pos=(%.2f,%.2f,%.2f) angles=(h=%.4f,p=%.4f,b=%.4f) hasMatrix=%d\n",
-                         door.objID, door.currentValue,
-                         os->position.x, os->position.y, os->position.z,
-                         os->heading, os->pitch, os->bank, os->hasMatrix ? 1 : 0);
-            if (os->hasMatrix) {
-                const float *m = os->modelMatrix;
-                std::fprintf(stderr, "    matrix: [%.3f %.3f %.3f %.3f]\n"
-                             "            [%.3f %.3f %.3f %.3f]\n"
-                             "            [%.3f %.3f %.3f %.3f]\n"
-                             "            [%.3f %.3f %.3f %.3f]\n",
-                             m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7],
-                             m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
-            }
-        }
     }
 
     void startOpening(DoorState &door) {
@@ -684,7 +631,7 @@ private:
     }
 
     void applyDoorTransform(DoorState &door) {
-        if (!mObjectStates || door.isBrushDoor) return;
+        if (!mObjectStates) return;
 
         ObjectState &os = mObjectStates->get(door.objID);
 
