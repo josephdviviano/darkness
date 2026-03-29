@@ -96,9 +96,55 @@
         mMantleState = MantleState::Hold;
         mMantleTimer = 0.0f;
         mMantleCompressed = false;
+        mMantleStartPos = mPosition;  // save for abort fallback
         // Virtual head starts at current head position
         mMantleHeadPos = mPosition + Vector3(0.0f, 0.0f, mSphereOffsetsBase[0]);
         mMantleHeadVel = Vector3(0.0f);
+    }
+
+    /// Abort a mantle in progress — restore player to pre-mantle position and resume
+    /// normal physics. Called when the mantle path is blocked by a wall or object.
+    inline void abortMantle() {
+        mPosition = mMantleStartPos;
+        mVelocity = Vector3(0.0f);
+        mMantling = false;
+        mMantleCompressed = false;
+        mMantleState = MantleState::None;
+        mCurrentMode = mWantsCrouch ? PlayerMode::Crouch : PlayerMode::Stand;
+        updateCell();
+        resolveCollisions([](const ContactEvent&) {});
+        updateCell();
+    }
+
+    /// Check if mantle movement is blocked by world geometry or objects.
+    /// Tests HEAD sphere at the new position; returns true if any contact
+    /// significantly opposes the movement direction.
+    inline bool isMantlePathBlocked(const Vector3 &oldHead, const Vector3 &newHead) const {
+        int32_t cell = mCollision.findCell(newHead);
+        if (cell < 0) return true;  // outside world geometry
+
+        std::vector<SphereContact> contacts;
+        float headR = mSphereRadii[0];
+        mCollision.sphereVsCellPolygons(newHead, headR, cell, contacts);
+        if (mObjectWorld) {
+            mObjectWorld->testPlayerSpheres(&newHead, &headR, 1, cell, contacts);
+        }
+        if (contacts.empty()) return false;
+
+        // Check if any contact opposes the movement direction with significant
+        // penetration. This filters out floor/ceiling scrape contacts that are
+        // expected during mantle (e.g. rolling over a ledge lip).
+        Vector3 moveDir = newHead - oldHead;
+        float moveDist = glm::length(moveDir);
+        if (moveDist < 0.001f) return false;
+        moveDir /= moveDist;
+
+        for (const auto &c : contacts) {
+            if (glm::dot(c.normal, -moveDir) > 0.3f && c.penetration > 0.1f) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Update mantle state machine each fixedStep. Normal movement/gravity/collision suppressed.
@@ -149,11 +195,18 @@
                 float tensionScale = (d2 > 1.0f) ? std::min(1.0f, 1.0f / d2) : 1.0f;
                 float tension = tensionScale * HEAD_SPRING_BASE_TENSION;
 
+                Vector3 oldHead = mMantleHeadPos;
                 mMantleHeadVel = computeSpringVelocity(
                     mMantleHeadPos, mMantleHeadVel, headTarget,
                     tension, HEAD_SPRING_BASE_DAMPING,
                     HEAD_SPRING_Z_SCALE, HEAD_SPRING_VEL_CAP, dt);
                 mMantleHeadPos += mMantleHeadVel * dt;
+
+                // Abort if head hits wall or object during rise
+                if (isMantlePathBlocked(oldHead, mMantleHeadPos)) {
+                    abortMantle();
+                    return;
+                }
 
                 // Check convergence — head reached rise target
                 Vector3 remain = headTarget - mMantleHeadPos;
@@ -193,6 +246,7 @@
                 static constexpr float FWD_TENSION_SCALE = 0.02f;
                 float tension = FWD_TENSION_SCALE * HEAD_SPRING_BASE_TENSION;
 
+                Vector3 oldHead = mMantleHeadPos;
                 mMantleHeadVel = computeSpringVelocity(
                     mMantleHeadPos, mMantleHeadVel, fwdTarget,
                     tension, HEAD_SPRING_BASE_DAMPING,
@@ -204,6 +258,12 @@
 
                 // Track body with head during compressed state
                 mPosition = mMantleHeadPos;
+
+                // Abort if compressed ball hits wall or object
+                if (isMantlePathBlocked(oldHead, mMantleHeadPos)) {
+                    abortMantle();
+                    return;
+                }
 
                 // Check convergence or timeout
                 float dx = mMantleTarget.x - mMantleHeadPos.x;
@@ -250,6 +310,7 @@
                 static constexpr float RISE2_TENSION_SCALE = 0.02f;
                 float tension = RISE2_TENSION_SCALE * HEAD_SPRING_BASE_TENSION;
 
+                Vector3 oldHead = mMantleHeadPos;
                 mMantleHeadVel = computeSpringVelocity(
                     mMantleHeadPos, mMantleHeadVel, headTarget,
                     tension, HEAD_SPRING_BASE_DAMPING,
@@ -267,6 +328,12 @@
                 mPosition.x = mMantleHeadPos.x;
                 mPosition.y = mMantleHeadPos.y;
                 mPosition.z = mMantleHeadPos.z - mSphereOffsetsBase[0];
+
+                // Abort if player hits wall or object during final rise
+                if (isMantlePathBlocked(oldHead, mMantleHeadPos)) {
+                    abortMantle();
+                    return;
+                }
 
                 // Check convergence
                 remain = headTarget - mMantleHeadPos;

@@ -653,6 +653,7 @@ private:
     // Camera tracks this instead of mPosition + HEAD_OFFSET_Z.
     Vector3 mMantleHeadPos{0.0f};      // spring-driven virtual head position
     Vector3 mMantleHeadVel{0.0f};      // virtual head velocity (spring state)
+    Vector3 mMantleStartPos{0.0f};     // body center at mantle start (for abort fallback)
     bool    mMantleCompressed = false;  // true during Forward/FinalRise (offsets zeroed)
 
     // ── Overridable physics parameters (from P$PhysAttr/P$PhysDims or defaults) ──

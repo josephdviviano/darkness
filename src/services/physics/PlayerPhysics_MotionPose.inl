@@ -229,50 +229,89 @@
     }
 
     /// Update lean — collision-limited lean derived from spring lateral displacement (mSpringPos.y).
-    /// Lean driven through pose system (setLeanDirection→POSE_LEAN_*) with spring easing. Checks
-    /// wall collisions at leaned head position and stores result in mLeanAmount.
+    /// Lean driven through pose system (setLeanDirection→POSE_LEAN_*) with spring easing.
+    /// Sweeps HEAD sphere along the lean path testing both world geometry and objects
+    /// (doors, crates) for continuous collision coverage. Stores result in mLeanAmount.
     inline void updateLean() {
         // Read lean from spring lateral displacement
         mLeanAmount = mSpringPos.y;
 
-        // Collision check — use contact penetration depth for exact maximum safe lean distance.
-        // Lean holds at wall surface rather than snapping back to standing.
+        // Collision check — sweep HEAD sphere along the lean path testing both
+        // world geometry and objects. Samples in steps no larger than sphere radius
+        // for continuous coverage of thin obstacles (e.g. doors).
+        // Lean holds at wall/object surface rather than snapping back to standing.
         if (std::fabs(mLeanAmount) > 0.01f && mCellIdx >= 0) {
             float sinYaw = mSinYaw;
             float cosYaw = mCosYaw;
             // HEAD collision position for lean: standing offset + pose-driven drop
             float headOffset = mSphereOffsetsBase[0] + mPoseCurrent.z;
             float leanBaseZ = headOffset + mSpringPos.z;
-            Vector3 leanedHead = mPosition + Vector3(0.0f, 0.0f, leanBaseZ);
-            leanedHead.x += sinYaw * mLeanAmount;
-            leanedHead.y -= cosYaw * mLeanAmount;
+            // Base (unleaned) head position
+            Vector3 baseHead = mPosition + Vector3(0.0f, 0.0f, leanBaseZ);
 
-            // Test HEAD sphere at the leaned position
-            std::vector<SphereContact> contacts;
-            mCollision.sphereVsCellPolygons(
-                leanedHead, mSphereRadii[0], mCellIdx, contacts);
-            if (!contacts.empty()) {
-                // Lean direction in world space (center → leaned head).
-                float leanSign = (mLeanAmount > 0.0f) ? 1.0f : -1.0f;
-                Vector3 leanDir(sinYaw * leanSign, -cosYaw * leanSign, 0.0f);
+            float leanSign = (mLeanAmount > 0.0f) ? 1.0f : -1.0f;
+            Vector3 leanDir(sinYaw * leanSign, -cosYaw * leanSign, 0.0f);
 
-                // Find largest pushback along lean direction to clear all walls.
-                float maxPushback = 0.0f;
-                for (const auto &c : contacts) {
-                    // Project the contact push (normal * penetration) onto the
-                    // negative lean direction — how much of the wall push opposes
-                    // the lean.
-                    float pushInLeanDir = glm::dot(c.normal * c.penetration, -leanDir);
-                    if (pushInLeanDir > maxPushback)
-                        maxPushback = pushInLeanDir;
+            float absLean = std::fabs(mLeanAmount);
+            float sphereR = mSphereRadii[0];
+            constexpr float LEAN_WALL_MARGIN = 0.05f;
+
+            // Sample lean path in steps no larger than sphere radius. Each sample's
+            // sphere overlaps the previous, giving continuous coverage that catches
+            // thin objects (doors) an endpoint-only test would miss.
+            int numSteps = std::max(1, static_cast<int>(std::ceil(absLean / sphereR)));
+            float safeLean = absLean;
+
+            for (int i = 1; i <= numSteps; ++i) {
+                float sampleDist = absLean * float(i) / float(numSteps);
+                Vector3 sampleHead = baseHead + leanDir * sampleDist;
+
+                // Find cell at sample position for broadphase accuracy
+                int32_t sampleCell = mCollision.findCell(sampleHead);
+                if (sampleCell < 0) {
+                    // Outside world geometry — lean can't extend this far
+                    safeLean = std::min(safeLean, std::max(0.0f,
+                        sampleDist - sphereR));
+                    break;
                 }
 
-                // Reduce lean by pushback + margin — holds at wall distance rather than zeroing.
-                constexpr float LEAN_WALL_MARGIN = 0.05f;
-                float absLean = std::fabs(mLeanAmount);
-                absLean = std::max(0.0f, absLean - maxPushback - LEAN_WALL_MARGIN);
-                mLeanAmount = absLean * leanSign;
+                std::vector<SphereContact> contacts;
+
+                // Test against world geometry
+                mCollision.sphereVsCellPolygons(
+                    sampleHead, sphereR, sampleCell, contacts);
+                // Also check body center's cell if different (portal boundary)
+                if (sampleCell != mCellIdx) {
+                    mCollision.sphereVsCellPolygons(
+                        sampleHead, sphereR, mCellIdx, contacts);
+                }
+
+                // Test against objects (doors, crates, furniture)
+                if (mObjectWorld) {
+                    mObjectWorld->testPlayerSpheres(
+                        &sampleHead, &sphereR, 1, sampleCell, contacts);
+                }
+
+                if (!contacts.empty()) {
+                    // Find maximum pushback opposing the lean at this sample.
+                    // Project each contact's push (normal * penetration) onto the
+                    // negative lean direction — how much the wall opposes the lean.
+                    float maxPushback = 0.0f;
+                    for (const auto &c : contacts) {
+                        float pushInLeanDir =
+                            glm::dot(c.normal * c.penetration, -leanDir);
+                        if (pushInLeanDir > maxPushback)
+                            maxPushback = pushInLeanDir;
+                    }
+                    // Safe lean at this sample: distance minus pushback minus margin.
+                    // Minimum across all samples handles thin objects detected only
+                    // at one intermediate position.
+                    float safeLeanHere = sampleDist - maxPushback - LEAN_WALL_MARGIN;
+                    safeLean = std::min(safeLean, safeLeanHere);
+                }
             }
+
+            mLeanAmount = std::max(0.0f, safeLean) * leanSign;
         }
     }
 
