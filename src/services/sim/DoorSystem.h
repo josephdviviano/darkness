@@ -349,16 +349,27 @@ private:
                 std::fprintf(stderr, "  Door %d: terrain brush door (no .bin render)\n", id);
             }
 
-            // Log door init details for debugging
-            std::fprintf(stderr, "  Door %d: type=%s axis=%d closed=%.3f open=%.3f speed=%.3f "
-                         "clockwise=%d status=%d\n",
-                         id, (doorType == kDoorRotating ? "rot" : "trans"),
-                         door.axis, door.closedValue, door.openValue,
-                         door.speed, door.clockwise ? 1 : 0, door.status);
-            std::fprintf(stderr, "    basePos=(%.2f,%.2f,%.2f) baseRot=matrix "
-                         "scale=(%.2f,%.2f,%.2f)\n",
-                         door.basePosition.x, door.basePosition.y, door.basePosition.z,
-                         door.baseScale.x, door.baseScale.y, door.baseScale.z);
+            // Log door init details for debugging — position from P$Position
+            // BEFORE any interaction, so we can compare with post-frob state.
+            {
+                // Also log the ObjectService quaternion for this object
+                Quaternion q = mObjSvc ? mObjSvc->orientation(id) : Quaternion(1,0,0,0);
+                std::fprintf(stderr, "  Door %d: type=%s axis=%d closed=%.3f open=%.3f speed=%.3f "
+                             "clockwise=%d status=%d isBrush=%d\n",
+                             id, (doorType == kDoorRotating ? "rot" : "trans"),
+                             door.axis, door.closedValue, door.openValue,
+                             door.speed, door.clockwise ? 1 : 0, door.status,
+                             door.isBrushDoor ? 1 : 0);
+                std::fprintf(stderr, "    INIT basePos=(%.4f,%.4f,%.4f) scale=(%.2f,%.2f,%.2f)\n",
+                             door.basePosition.x, door.basePosition.y, door.basePosition.z,
+                             door.baseScale.x, door.baseScale.y, door.baseScale.z);
+                std::fprintf(stderr, "    INIT quaternion=(%.6f,%.6f,%.6f,%.6f)\n",
+                             q.w, q.x, q.y, q.z);
+                // Log baseRotation matrix diagonal (quick identity check)
+                std::fprintf(stderr, "    INIT baseRot diag=(%.4f,%.4f,%.4f) off=(%.4f,%.4f,%.4f)\n",
+                             door.baseRotation[0][0], door.baseRotation[1][1], door.baseRotation[2][2],
+                             door.baseRotation[1][0], door.baseRotation[2][0], door.baseRotation[2][1]);
+            }
             std::fprintf(stderr, "    pivot=(%.2f,%.2f,%.2f) rooms=(%d,%d) blocking=%.0f%%\n",
                          door.pivotOffset.x, door.pivotOffset.y, door.pivotOffset.z,
                          door.room1, door.room2, door.soundBlocking * 100.0f);
