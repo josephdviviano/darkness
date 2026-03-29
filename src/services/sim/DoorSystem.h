@@ -130,6 +130,7 @@ struct DoorState {
 
 // ── Callback for door events (sound blocking, script messages, etc.) ──
 using DoorEventCallback = std::function<void(int32_t objID, DoorStatus newStatus,
+                                              DoorStatus oldStatus,
                                               const DoorState &door)>;
 
 // ============================================================================
@@ -628,7 +629,7 @@ private:
 
         // Remove blocking when door starts opening
         if (door.status == kDoorClosed) {
-            emitEvent(door, kDoorOpening);
+            emitEvent(door, kDoorOpening, kDoorClosed);
         }
 
         door.status = kDoorOpening;
@@ -672,13 +673,13 @@ private:
                 door.velocity = 0.0f;
                 door.status = kDoorOpen;
                 applyDoorTransform(door);
-                emitEvent(door, kDoorOpen);
+                emitEvent(door, kDoorOpen, kDoorOpening);
             } else if (door.status == kDoorClosing) {
                 door.currentValue = door.closedValue;
                 door.velocity = 0.0f;
                 door.status = kDoorClosed;
                 applyDoorTransform(door);
-                emitEvent(door, kDoorClosed);
+                emitEvent(door, kDoorClosed, kDoorClosing);
             }
             return;
         }
@@ -727,8 +728,8 @@ private:
         applyDoorTransform(door);
 
         // Emit events on state change
-        if (reachedOpen) emitEvent(door, kDoorOpen);
-        if (reachedClosed) emitEvent(door, kDoorClosed);
+        if (reachedOpen) emitEvent(door, kDoorOpen, kDoorOpening);
+        if (reachedClosed) emitEvent(door, kDoorClosed, kDoorClosing);
     }
 
     void applyDoorTransform(DoorState &door) {
@@ -815,9 +816,9 @@ private:
         }
     }
 
-    void emitEvent(const DoorState &door, DoorStatus newStatus) {
+    void emitEvent(const DoorState &door, DoorStatus newStatus, DoorStatus oldStatus) {
         if (mEventCallback)
-            mEventCallback(door.objID, newStatus, door);
+            mEventCallback(door.objID, newStatus, oldStatus, door);
     }
 
     // ── Helpers ──
