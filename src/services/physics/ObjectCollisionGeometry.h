@@ -161,11 +161,16 @@ struct ObjectCollisionBody {
     float sphereRadius = 0.0f;          // bounding sphere radius (scaled)
 
     // ── Broadphase data ──
-    // Portal cells this object's AABB overlaps. Built at load time, never changes
-    // for static objects. Used for portal-cell-based broadphase queries.
+    // Portal cells this object's AABB overlaps. Built at load time, updated at
+    // runtime for moving objects (doors). Used for portal-cell-based broadphase.
     // ODE UPGRADE: Would be replaced by dHashSpace or dQuadTreeSpace membership.
     // ODE's dSpaceCollide2() handles broadphase internally.
     std::vector<int32_t> cellIDs;
+
+    // Model-space bounding box center (unscaled). Stored at build time so
+    // updateBodyTransform() can recompute worldPos from a new model matrix.
+    // worldPos = modelMatrix * vec4(bboxCenter, 1.0) (matrix includes scale).
+    Vector3 bboxCenter = Vector3(0.0f);
 
     // Special flag from P$PhysType — affects PointVsNotSpecial narrowphase filter.
     // Special objects interact differently with sphere models (the sphere radius is NOT zeroed vs special).
@@ -735,6 +740,7 @@ public:
                 // OBB center = object position + rotated model bbox center offset
                 Vector3 rotatedCenter = body.rotation * (bboxCenter * scale);
                 body.worldPos = Vector3(obj.x, obj.y, obj.z) + rotatedCenter;
+                body.bboxCenter = bboxCenter;
 
                 ++createdOBB;
             } else {
@@ -755,6 +761,7 @@ public:
                 }
 
                 body.worldPos = Vector3(obj.x, obj.y, obj.z);
+                body.bboxCenter = bboxCenter;
                 // Edge lengths unused for spheres but zero them out
                 body.edgeLengths = Vector3(0.0f);
 
@@ -905,6 +912,48 @@ public:
         return (it != mObjIDToBody.end()) ? &mBodies[it->second] : nullptr;
     }
 
+    /// Update a collision body's transform from a new world-space model matrix.
+    /// Called by DoorSystem when a door animates. The model matrix includes
+    /// position, rotation, and scale (same matrix written to ObjectState for GPU).
+    ///
+    /// Recomputes worldPos (from stored bboxCenter), rotation (normalized 3x3),
+    /// AABB, and portal cell registration.
+    ///
+    /// Returns true if a body was found and updated; false if no body exists
+    /// for this objID (e.g., brush doors without .bin collision).
+    bool updateBodyTransform(int32_t objID, const glm::mat4 &modelMatrix) {
+        auto it = mObjIDToBody.find(objID);
+        if (it == mObjIDToBody.end())
+            return false;
+
+        size_t bodyIdx = it->second;
+        ObjectCollisionBody &body = mBodies[bodyIdx];
+
+        // New world-space OBB center: transform stored model-space bboxCenter
+        // through the new model matrix (which includes scale).
+        glm::vec4 centerWorld = modelMatrix * glm::vec4(body.bboxCenter, 1.0f);
+        body.worldPos = Vector3(centerWorld.x, centerWorld.y, centerWorld.z);
+
+        // Extract rotation: normalize columns of the upper-left 3x3 to strip scale.
+        if (body.shapeType == CollisionShapeType::OBB) {
+            glm::mat3 upper3x3 = glm::mat3(modelMatrix);
+            body.rotation[0] = glm::normalize(upper3x3[0]);
+            body.rotation[1] = glm::normalize(upper3x3[1]);
+            body.rotation[2] = glm::normalize(upper3x3[2]);
+        }
+
+        // Recompute AABB from new position and rotation
+        computeAABB(body);
+
+        // Re-register in portal cells: unregister from old, find new via BFS,
+        // then register in new cells.
+        unregisterFromCells(bodyIdx, body);
+        registerInCells(body, *mWR);
+        registerBodyInCells(bodyIdx, body);
+
+        return true;
+    }
+
 private:
     std::vector<ObjectCollisionBody> mBodies;
 
@@ -912,7 +961,8 @@ private:
     // Used by object stair stepping to find OBB properties from contact objectId.
     std::unordered_map<int32_t, size_t> mObjIDToBody;
 
-    // Portal cell → indices into mBodies. Built at load time, static.
+    // Portal cell → indices into mBodies. Updated at runtime when moving
+    // objects (doors) change cells.
     // ODE UPGRADE: Would be replaced by dHashSpace containing all dGeomIDs.
     std::unordered_map<int32_t, std::vector<size_t>> mCellToObjects;
 
@@ -924,6 +974,29 @@ private:
     // This is fine for Phase 2 (single-threaded physics step).
     mutable std::unordered_set<size_t> mCandidateSet;
     mutable std::vector<size_t> mCandidates;
+
+    // ── Cell registration helpers ──
+
+    /// Remove a body from mCellToObjects for all cells it's currently in.
+    /// Must be called BEFORE registerInCells() (which clears body.cellIDs).
+    void unregisterFromCells(size_t bodyIdx, const ObjectCollisionBody &body) {
+        for (int32_t cellIdx : body.cellIDs) {
+            auto it = mCellToObjects.find(cellIdx);
+            if (it == mCellToObjects.end()) continue;
+            auto &vec = it->second;
+            vec.erase(std::remove(vec.begin(), vec.end(), bodyIdx), vec.end());
+            if (vec.empty())
+                mCellToObjects.erase(it);
+        }
+    }
+
+    /// Add a body to mCellToObjects for all cells in its cellIDs.
+    /// Called after registerInCells() has populated body.cellIDs.
+    void registerBodyInCells(size_t bodyIdx, const ObjectCollisionBody &body) {
+        for (int32_t cellIdx : body.cellIDs) {
+            mCellToObjects[cellIdx].push_back(bodyIdx);
+        }
+    }
 
     // ── AABB computation ──
 

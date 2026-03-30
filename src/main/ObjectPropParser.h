@@ -255,6 +255,20 @@ inline ObjectPropData parseObjectProps(PropertyService *propSvc,
     std::fprintf(stderr, "ObjectPropParser: %zu concrete objects with positions\n",
                  posMap.size());
 
+    // Read P$Scale (ModelScale) for ALL positioned objects before filtering.
+    // Scale uses "never" inheritor (kPropertyNoInherit) — only direct ownership.
+    // Systems like DoorSystem need correct scale for non-rendered objects.
+    for (auto &[id, p] : posMap) {
+        if (ownsProperty(propSvc, "ModelScale", id)) {
+            PropScale scale;
+            if (getTypedProperty<PropScale>(propSvc, "ModelScale", id, scale)) {
+                p.scaleX = scale.x;
+                p.scaleY = scale.y;
+                p.scaleZ = scale.z;
+            }
+        }
+    }
+
     // Store ALL placements before filtering — systems like DoorSystem need
     // placement data for objects that are filtered from the render list.
     result.allPlacements = posMap;
