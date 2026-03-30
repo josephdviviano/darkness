@@ -25,7 +25,45 @@
 #ifndef __SIMCOMMON_H
 #define __SIMCOMMON_H
 
+#include <cstring>
+#include "DarknessMath.h"
+#include "worldquery/ObjectState.h"
+
 namespace Darkness {
+
+// ============================================================================
+// SimTransform — base transform snapshot for simulated objects
+// ============================================================================
+//
+// Shared by DoorSystem, TweqSystem, and any future system that animates
+// objects at runtime. Stores the object's initial position, rotation, and
+// scale as captured from P$Position / ObjectPlacement at init time.
+// Systems compose animation offsets on top of this base transform.
+
+struct SimTransform {
+    Vector3 position = {0.0f, 0.0f, 0.0f};
+    Matrix4 rotation = Matrix4(1.0f);  // column-major GLM (avoids Euler round-trip)
+    Vector3 scale    = {1.0f, 1.0f, 1.0f};
+};
+
+// ============================================================================
+// applyModelMatrix — write a composed 4x4 transform to ObjectState
+// ============================================================================
+//
+// Centralizes the GLM→ObjectState matrix copy used by all sim systems.
+inline void applyModelMatrix(ObjectStateMap &states, int32_t objID,
+                             const Matrix4 &fullGlm, const Vector3 &pos,
+                             const Vector3 &scale) {
+    ObjectState &os = states.get(objID);
+    std::memcpy(os.modelMatrix, glm::value_ptr(fullGlm), 16 * sizeof(float));
+    os.hasMatrix = true;
+    os.position = pos;
+    os.scale = scale;
+}
+
+// ============================================================================
+// SimListener — abstract per-frame simulation callback
+// ============================================================================
 
 /** Abstract Simulation listener - a class that does something related to
  * simulation extends this
