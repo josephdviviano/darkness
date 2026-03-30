@@ -310,6 +310,161 @@ struct PropLocked {
     uint32_t isLocked;       // bool32: 0 = unlocked, nonzero = locked
 };
 
+// ============================================================================
+// Tweq properties (Phase 5 — procedural object animation)
+// ============================================================================
+//
+// Tweqs animate objects at runtime: rotating fans, flickering lights, scaling
+// objects, cycling models. Config (Cfg) properties hold static parameters set
+// by the level designer; state (St) properties hold per-instance runtime data.
+//
+// Flag values match the Dark Engine's tweqflgs.h definitions exactly.
+// Struct layouts verified against t2-types.dtype and p_ver size fields.
+
+// ── Tweq flag types ──
+
+// Animation config flags (uint8 bitfield — CfgTweq*.anim)
+enum TweqAnimFlags : uint8_t {
+    kTweqAnimNoLimit        = 0x01,  // Ignore axis bounds
+    kTweqAnimSim            = 0x02,  // Auto-start with simulation
+    kTweqAnimWrap           = 0x04,  // Wrap at bounds (vs bounce)
+    kTweqAnimOneBounce      = 0x08,  // Stop after one forward+reverse cycle
+    kTweqAnimSimSmallRadius = 0x10,  // Only update within 20 units of camera
+    kTweqAnimSimLargeRadius = 0x20,  // Only update within 80 units of camera
+    kTweqAnimOffscreen      = 0x40,  // Only update when off-screen
+};
+
+// Curve/interpolation flags (uint8 bitfield — CfgTweq*.curve)
+enum TweqCurveFlags : uint8_t {
+    kTweqCurveJitterLow  = 0x01,  // Low jitter (level 1)
+    kTweqCurveJitterHigh = 0x02,  // High jitter (level 2); low+high = level 3
+    kTweqCurveMul        = 0x04,  // Multiply rate instead of add
+};
+constexpr uint8_t kTweqCurveJitterMask = 0x03;  // Bits 0-1: jitter level 0-3
+
+// Halt action (uint8 enum — CfgTweq*.halt)
+enum TweqHaltAction : uint8_t {
+    kTweqHaltDestroy    = 0,  // Destroy the object
+    kTweqHaltRemoveProp = 1,  // Remove the tweq property, keep object
+    kTweqHaltStop       = 2,  // Stop the tweq, leave property attached
+    kTweqHaltContinue   = 3,  // Continue forever (wrapping/bouncing)
+    kTweqHaltSlay       = 4,  // Slay (damage-kill) the object
+};
+
+// Misc config flags (uint16 bitfield — CfgTweq*.misc)
+enum TweqMiscFlags : uint16_t {
+    kTweqMiscAnchor     = 0x001,  // Anchor at bottom of model
+    kTweqMiscScripts    = 0x002,  // Send TweqComplete messages to scripts
+    kTweqMiscRandom     = 0x004,  // Random variation
+    kTweqMiscGravity    = 0x008,  // Apply gravity (emitters)
+    kTweqMiscZeroVel    = 0x010,  // Zero velocity on emit
+    kTweqMiscTellAI     = 0x020,  // Notify AI system
+    kTweqMiscPushOut    = 0x040,  // Push emitted objects out of source
+    kTweqMiscNegLogic   = 0x080,  // Invert on/off logic
+    kTweqMiscRelVel     = 0x100,  // Emit velocity relative to object rotation
+    kTweqMiscNoPhysics  = 0x200,  // Skip physics on emitted objects
+    kTweqMiscVHot       = 0x400,  // Anchor at VHOT point
+    kTweqMiscHostOnly   = 0x800,  // Run only on network host
+};
+
+// Animation state flags (uint16 base / uint32 per-axis — StTweq*.anim)
+enum TweqStateFlags : uint16_t {
+    kTweqStateOn      = 0x01,  // Tweq is currently active
+    kTweqStateReverse = 0x02,  // Playing in reverse direction
+    kTweqStateReSynch = 0x04,  // Resynchronize on next update
+    kTweqStateGoEdge  = 0x08,  // Jump to edge when resynching
+    kTweqStateLapOne  = 0x10,  // First lap completed (internal)
+};
+
+// Tweq type enum (matches Dark Engine eTweqType)
+enum eTweqType : int32_t {
+    kTweqTypeScale   = 0,
+    kTweqTypeRotate  = 1,
+    kTweqTypeJoints  = 2,
+    kTweqTypeModels  = 3,
+    kTweqTypeDelete  = 4,
+    kTweqTypeEmitter = 5,
+    kTweqTypeFlicker = 6,
+    kTweqTypeLock    = 7,
+    kTweqTypeAll     = 8,  // Sentinel: operate on all tweqs
+};
+
+// ── Per-axis configuration (shared by Rotate and Scale) ──
+
+struct PropTweqAxisConfig {
+    float rate;   // degrees/sec (rotate) or scale-units/sec (scale)
+    float low;    // lower bound
+    float high;   // upper bound
+};
+static_assert(sizeof(PropTweqAxisConfig) == 12);
+
+// ── CfgTweqRo / CfgTweqSc — vector tweq config (Rotate, Scale) ──
+// p_ver 2.48 → 48 bytes
+
+struct PropCfgTweqVector {
+    uint8_t  unknown;   // padding/version (always 0)
+    uint8_t  curve;     // TweqCurveFlags
+    uint8_t  anim;      // TweqAnimFlags
+    uint8_t  halt;      // TweqHaltAction
+    uint16_t misc;      // TweqMiscFlags
+    uint16_t zero;      // unused for axis tweqs (per-axis rates instead)
+    PropTweqAxisConfig x;
+    PropTweqAxisConfig y;
+    PropTweqAxisConfig z;
+    int32_t  primary;   // physaxistype: 0=X, 1=Y, 2=Z (controls completion)
+};
+static_assert(sizeof(PropCfgTweqVector) == 48);
+
+// ── CfgTweqMo — models tweq config ──
+// p_ver 2.104 → 104 bytes
+
+struct PropCfgTweqModels {
+    uint8_t  unknown;
+    uint8_t  curve;
+    uint8_t  anim;
+    uint8_t  halt;
+    uint16_t misc;
+    uint16_t rate;      // milliseconds per model swap
+    char     modelName[6][16];  // up to 6 model names (null-terminated)
+};
+static_assert(sizeof(PropCfgTweqModels) == 104);
+
+// ── CfgTweqBl / CfgTweqDe — simple tweq config (Flicker, Delete) ──
+// p_ver 2.8 → 8 bytes
+
+struct PropCfgTweqSimple {
+    uint8_t  unknown;
+    uint8_t  curve;
+    uint8_t  anim;
+    uint8_t  halt;
+    uint16_t misc;
+    uint16_t rate;      // milliseconds per step
+};
+static_assert(sizeof(PropCfgTweqSimple) == 8);
+
+// ── StTweqRot / StTweqSca — vector tweq state ──
+// p_ver 2.16 → 16 bytes
+
+struct PropStTweqVector {
+    uint16_t anim;      // TweqStateFlags (base: global on/off/reverse)
+    uint16_t misc;      // unused (tweqnullflags)
+    uint32_t x;         // TweqStateFlags per-axis (x)
+    uint32_t y;         // TweqStateFlags per-axis (y)
+    uint32_t z;         // TweqStateFlags per-axis (z)
+};
+static_assert(sizeof(PropStTweqVector) == 16);
+
+// ── StTweqBli / StTweqDel / StTweqMod — simple tweq state ──
+// p_ver 2.8 → 8 bytes
+
+struct PropStTweqSimple {
+    uint16_t anim;      // TweqStateFlags
+    uint16_t misc;      // unused
+    uint16_t time;      // elapsed time in ms
+    uint16_t frame;     // current frame index
+};
+static_assert(sizeof(PropStTweqSimple) == 8);
+
 #pragma pack(pop)
 
 } // namespace Darkness
