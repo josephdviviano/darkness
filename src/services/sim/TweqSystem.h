@@ -230,17 +230,29 @@ public:
 
     // ── Accessors (for tests and diagnostics) ──
 
-    const std::unordered_map<uint64_t, TweqInstance> &getTweqs() const { return mTweqs; }
-    size_t count() const { return mTweqs.size(); }
-
-private:
-    // ── Initialization helpers ──
-
     /// Pack objID + tweqType into a unique map key
     static uint64_t tweqKey(int32_t objID, eTweqType type) {
         return (static_cast<uint64_t>(static_cast<uint32_t>(objID)) << 8) |
                static_cast<uint64_t>(type);
     }
+
+    const std::unordered_map<uint64_t, TweqInstance> &getTweqs() const { return mTweqs; }
+    size_t count() const { return mTweqs.size(); }
+
+    /// Inject a tweq instance and set the object state map (for unit tests).
+    void injectForTest(const TweqInstance &tw, ObjectStateMap *states) {
+        mTweqs[tweqKey(tw.objID, tw.type)] = tw;
+        mObjectStates = states;
+    }
+
+    /// Get a tweq instance by objID + type (for test assertions).
+    const TweqInstance *getInstanceForTest(int32_t objID, eTweqType type) const {
+        auto it = mTweqs.find(tweqKey(objID, type));
+        return (it != mTweqs.end()) ? &it->second : nullptr;
+    }
+
+private:
+    // ── Initialization helpers ──
 
     template <typename CfgT, typename StT>
     void initTweqsOfType(PropertyService *propSvc,

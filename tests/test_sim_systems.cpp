@@ -715,3 +715,306 @@ TEST_CASE("MessageDispatch: multiple handlers first to consume stops", "[Message
     REQUIRE(first == true);
     REQUIRE(second == false);
 }
+
+// ============================================================================
+// TweqSystem unit tests
+// ============================================================================
+
+#include "sim/TweqSystem.h"
+
+// Helper: create a TweqInstance with rotate config (no PropertyService needed)
+static Darkness::TweqInstance makeRotateTweq(int32_t objID,
+                                              float rateX, float lowX, float highX,
+                                              uint8_t animFlags = 0,
+                                              uint8_t haltAction = Darkness::kTweqHaltContinue) {
+    Darkness::TweqInstance tw;
+    tw.objID = objID;
+    tw.type = Darkness::kTweqTypeRotate;
+    tw.cfgAnim = animFlags;
+    tw.cfgHalt = haltAction;
+    tw.cfgCurve = 0;
+    tw.cfgMisc = 0;
+    tw.axes[0] = {rateX, lowX, highX};
+    tw.axes[1] = {0.0f, 0.0f, 0.0f};  // Y inactive
+    tw.axes[2] = {0.0f, 0.0f, 0.0f};  // Z inactive
+    tw.primaryAxis = 0;  // all axes
+    tw.active = true;
+    tw.values[0] = lowX;  // start at low bound
+    tw.values[1] = 0.0f;
+    tw.values[2] = 0.0f;
+    tw.base.position = {10.0f, 20.0f, 30.0f};
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.base.scale = {1.0f, 1.0f, 1.0f};
+    return tw;
+}
+
+static Darkness::TweqInstance makeScaleTweq(int32_t objID,
+                                             float rateX, float lowX, float highX) {
+    Darkness::TweqInstance tw;
+    tw.objID = objID;
+    tw.type = Darkness::kTweqTypeScale;
+    tw.cfgAnim = 0;
+    tw.cfgHalt = Darkness::kTweqHaltContinue;
+    tw.cfgCurve = 0;
+    tw.cfgMisc = 0;
+    tw.axes[0] = {rateX, lowX, highX};
+    tw.axes[1] = {0.0f, 0.0f, 0.0f};
+    tw.axes[2] = {0.0f, 0.0f, 0.0f};
+    tw.primaryAxis = 0;
+    tw.active = true;
+    tw.values[0] = 1.0f;
+    tw.values[1] = 1.0f;
+    tw.values[2] = 1.0f;
+    tw.base.position = {0.0f, 0.0f, 0.0f};
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.base.scale = {1.0f, 1.0f, 1.0f};
+    return tw;
+}
+
+// ── Axis Processing Tests ──
+
+TEST_CASE("TweqSystem: rotate forward accumulation", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(100, 90.0f, 0.0f, 360.0f, Darkness::kTweqAnimNoLimit);
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.1f);
+
+    auto *result = sys.getInstanceForTest(100, Darkness::kTweqTypeRotate);
+    REQUIRE(result != nullptr);
+    REQUIRE(result->values[0] == Approx(90.0f).margin(1.0f));
+}
+
+TEST_CASE("TweqSystem: wrap mode wraps to opposite edge", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(101, 90.0f, 0.0f, 100.0f, Darkness::kTweqAnimWrap);
+    tw.values[0] = 95.0f;
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.1f);
+
+    auto *result = sys.getInstanceForTest(101, Darkness::kTweqTypeRotate);
+    REQUIRE(result->values[0] >= 0.0f);
+    REQUIRE(result->values[0] <= 100.0f);
+}
+
+TEST_CASE("TweqSystem: bounce mode reverses at limit", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(102, 90.0f, 0.0f, 100.0f, 0, Darkness::kTweqHaltContinue);
+    tw.values[0] = 95.0f;
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.1f);
+
+    auto *result = sys.getInstanceForTest(102, Darkness::kTweqTypeRotate);
+    REQUIRE(result->values[0] == Approx(100.0f).margin(0.1f));
+    REQUIRE((result->axisState[0] & Darkness::kTweqStateReverse) != 0);
+}
+
+TEST_CASE("TweqSystem: OneBounce completes after full cycle", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(103, 200.0f, 0.0f, 50.0f,
+                              Darkness::kTweqAnimOneBounce, Darkness::kTweqHaltStop);
+    tw.values[0] = 45.0f;
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.1f);
+    auto *r1 = sys.getInstanceForTest(103, Darkness::kTweqTypeRotate);
+    REQUIRE(r1->active == true);
+    REQUIRE((r1->axisState[0] & Darkness::kTweqStateReverse) != 0);
+
+    for (int i = 0; i < 20; ++i)
+        sys.simStep(0.0f, 0.1f);
+
+    auto *r2 = sys.getInstanceForTest(103, Darkness::kTweqTypeRotate);
+    REQUIRE(r2->active == false);
+}
+
+TEST_CASE("TweqSystem: NoLimit ignores bounds", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(104, 90.0f, 0.0f, 100.0f, Darkness::kTweqAnimNoLimit);
+    tw.values[0] = 95.0f;
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.1f);
+
+    auto *result = sys.getInstanceForTest(104, Darkness::kTweqTypeRotate);
+    REQUIRE(result->values[0] > 100.0f);
+    REQUIRE(result->active == true);
+}
+
+TEST_CASE("TweqSystem: reverse flag negates rate", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(105, 90.0f, 0.0f, 360.0f, Darkness::kTweqAnimNoLimit);
+    tw.values[0] = 180.0f;
+    tw.axisState[0] = Darkness::kTweqStateReverse;
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.1f);
+
+    auto *result = sys.getInstanceForTest(105, Darkness::kTweqTypeRotate);
+    REQUIRE(result->values[0] < 180.0f);
+}
+
+TEST_CASE("TweqSystem: multiply mode scales value", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeScaleTweq(106, 1.1f, 0.5f, 2.0f);
+    tw.cfgCurve = Darkness::kTweqCurveMul;
+    tw.cfgAnim = Darkness::kTweqAnimNoLimit;
+    tw.values[0] = 1.0f;
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.1f);
+
+    auto *result = sys.getInstanceForTest(106, Darkness::kTweqTypeScale);
+    REQUIRE(result->values[0] != Approx(1.0f));
+}
+
+// ── State Machine Tests ──
+
+TEST_CASE("TweqSystem: activate starts tweq", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(200, 90.0f, 0.0f, 360.0f);
+    tw.active = false;
+    sys.injectForTest(tw, &states);
+
+    bool found = sys.activate(200, Darkness::kTweqDoActivate);
+    REQUIRE(found == true);
+    REQUIRE(sys.getInstanceForTest(200, Darkness::kTweqTypeRotate)->active == true);
+}
+
+TEST_CASE("TweqSystem: halt stops tweq", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(201, 90.0f, 0.0f, 360.0f);
+    tw.active = true;
+    sys.injectForTest(tw, &states);
+
+    sys.activate(201, Darkness::kTweqDoHalt);
+    REQUIRE(sys.getInstanceForTest(201, Darkness::kTweqTypeRotate)->active == false);
+}
+
+TEST_CASE("TweqSystem: default toggles active state", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(202, 90.0f, 0.0f, 360.0f);
+    tw.active = true;
+    sys.injectForTest(tw, &states);
+
+    sys.activate(202, Darkness::kTweqDoDefault);
+    REQUIRE(sys.getInstanceForTest(202, Darkness::kTweqTypeRotate)->active == false);
+
+    sys.activate(202, Darkness::kTweqDoDefault);
+    REQUIRE(sys.getInstanceForTest(202, Darkness::kTweqTypeRotate)->active == true);
+}
+
+// ── Transform Tests ──
+
+TEST_CASE("TweqSystem: rotate writes model matrix to ObjectState", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(300, 90.0f, 0.0f, 360.0f, Darkness::kTweqAnimNoLimit);
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.1f);
+
+    const auto *os = states.tryGet(300);
+    REQUIRE(os != nullptr);
+    REQUIRE(os->hasMatrix == true);
+    REQUIRE(os->modelMatrix[0] != Approx(0.0f));
+}
+
+TEST_CASE("TweqSystem: scale modifies ObjectState", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeScaleTweq(301, 1.0f, 1.0f, 2.0f);
+    tw.cfgAnim = Darkness::kTweqAnimNoLimit;
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.1f);
+
+    const auto *os = states.tryGet(301);
+    REQUIRE(os != nullptr);
+    REQUIRE(os->hasMatrix == true);
+}
+
+TEST_CASE("TweqSystem: flicker toggles visibility", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    Darkness::TweqInstance tw;
+    tw.objID = 302;
+    tw.type = Darkness::kTweqTypeFlicker;
+    tw.cfgRate = 100;
+    tw.cfgAnim = Darkness::kTweqAnimNoLimit;
+    tw.cfgHalt = Darkness::kTweqHaltContinue;
+    tw.active = true;
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.15f);
+    const auto *os = states.tryGet(302);
+    REQUIRE(os != nullptr);
+    bool firstState = (os->flags & Darkness::kObjStateHidden) != 0;
+
+    sys.simStep(0.15f, 0.15f);
+    bool secondState = (os->flags & Darkness::kObjStateHidden) != 0;
+    REQUIRE(firstState != secondState);
+}
+
+TEST_CASE("TweqSystem: inactive tweqs don't update", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(303, 90.0f, 0.0f, 360.0f, Darkness::kTweqAnimNoLimit);
+    tw.active = false;
+    tw.values[0] = 45.0f;
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 1.0f);
+
+    auto *result = sys.getInstanceForTest(303, Darkness::kTweqTypeRotate);
+    REQUIRE(result->values[0] == Approx(45.0f));
+}
+
+// ── Completion Tests ──
+
+TEST_CASE("TweqSystem: halt stop deactivates tweq", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(400, 200.0f, 0.0f, 50.0f, 0, Darkness::kTweqHaltStop);
+    tw.values[0] = 48.0f;
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.1f);
+
+    auto *result = sys.getInstanceForTest(400, Darkness::kTweqTypeRotate);
+    REQUIRE(result->active == false);
+}
+
+TEST_CASE("TweqSystem: scripts flag fires event callback", "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    auto tw = makeRotateTweq(401, 200.0f, 0.0f, 50.0f, 0, Darkness::kTweqHaltStop);
+    tw.cfgMisc = Darkness::kTweqMiscScripts;
+    tw.values[0] = 48.0f;
+    sys.injectForTest(tw, &states);
+
+    bool eventFired = false;
+    int eventObjID = 0;
+    sys.setEventCallback([&](int32_t objID, Darkness::eTweqType type, int action) {
+        eventFired = true;
+        eventObjID = objID;
+    });
+
+    sys.simStep(0.0f, 0.1f);
+
+    REQUIRE(eventFired == true);
+    REQUIRE(eventObjID == 401);
+}
+
