@@ -46,6 +46,7 @@
 
 #include <cstdint>
 #include <cmath>
+#include <string>
 #include <unordered_map>
 
 #include "DarknessMath.h"
@@ -77,6 +78,11 @@ struct ObjectState {
 
     // ── State flags ──
     uint32_t flags = kObjStateActive;
+
+    // ── Model override (tweq model cycling) ──
+    // When non-empty, the renderer uses this model name instead of the object's
+    // static model from ObjectPlacement. Set by TweqSystem for Models tweqs.
+    std::string modelNameOverride;
 
     // ── Pre-built model matrix (optional) ──
     // When hasMatrix is true, the renderer uses this 4x4 matrix directly

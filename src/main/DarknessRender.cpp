@@ -84,6 +84,7 @@
 #include "SingleFieldDataStorage.h"
 #include "worldquery/ObjSysWorldState.h"
 #include "sim/DoorSystem.h"
+#include "sim/TweqSystem.h"
 #include "sim/MessageDispatch.h"
 #include "FrobSystem.h"
 #include "FunctionalLoopClient.h"
@@ -692,6 +693,11 @@ static void renderObjects(
         }
 
         std::string modelName(obj.modelName);
+
+        // Check for tweq model override (model cycling animation)
+        if (objState && !objState->modelNameOverride.empty()) {
+            modelName = objState->modelNameOverride;
+        }
 
         // Model isolation mode: skip objects that don't match the isolated model
         if (state.isolateModelIdx >= 0 && state.isolateModelIdx < (int)state.sortedModelNames.size()) {
@@ -2000,6 +2006,8 @@ int main(int argc, char *argv[]) {
     Darkness::DoorSystem doorSystem;
     state.doorSystem = &doorSystem;
 
+    Darkness::TweqSystem tweqSystem;
+
     // ── Initialize frob system ──
     // Casts a short ray from the camera each frame to find the nearest frobbable
     // object (doors, switches, pickups). Right-click triggers the frob action.
@@ -2027,6 +2035,17 @@ int main(int argc, char *argv[]) {
     messageDispatch.registerGlobalHandler("TurnOff", [&doorSystem](const Darkness::ScriptMessage &msg) {
         return doorSystem.activate(msg.to, Darkness::kDoorDoClose);
     });
+    // Tweq handlers: TurnOn/TurnOff activate/halt tweqs. Return false to
+    // avoid consuming the message — other systems (doors, scripts) may also respond.
+    messageDispatch.registerGlobalHandler("TurnOn", [&tweqSystem](const Darkness::ScriptMessage &msg) {
+        tweqSystem.activate(msg.to, Darkness::kTweqDoActivate);
+        return false;  // never consume — multiple systems may respond
+    });
+    messageDispatch.registerGlobalHandler("TurnOff", [&tweqSystem](const Darkness::ScriptMessage &msg) {
+        tweqSystem.activate(msg.to, Darkness::kTweqDoHalt);
+        return false;
+    });
+
     messageDispatch.registerGlobalHandler("FrobWorldEnd",
         [&doorSystem](const Darkness::ScriptMessage &msg) {
             // Dark Engine convention: locked doors reject frob when closed.
@@ -2224,9 +2243,9 @@ int main(int argc, char *argv[]) {
     // ones). Doors have RenderType=NotRendered and are filtered from
     // mission.objData.objects, but DoorSystem needs their raw angles.
     // NOTE: doorPlacements must outlive doorSystem — it stores a raw pointer.
-    std::unordered_map<int32_t, Darkness::DoorSystem::ObjPlacementInfo> doorPlacements;
+    std::unordered_map<int32_t, Darkness::ObjPlacementInfo> doorPlacements;
     for (const auto &[id, obj] : mission.objData.allPlacements) {
-        Darkness::DoorSystem::ObjPlacementInfo pi = {
+        Darkness::ObjPlacementInfo pi = {
             obj.x, obj.y, obj.z,
             obj.heading, obj.pitch, obj.bank,
             obj.scaleX, obj.scaleY, obj.scaleZ,
@@ -2254,6 +2273,14 @@ int main(int argc, char *argv[]) {
         if (lockedCount > 0) {
             std::fprintf(stderr, "  %d doors locked (P$Locked)\n", lockedCount);
         }
+    }
+
+    // ── Initialize tweq system ──
+    // Scans for objects with tweq config properties (Rotate, Scale, Flicker, Models)
+    // and creates per-object animation instances. Auto-starts tweqs with Sim flag.
+    {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        tweqSystem.init(propSvc.get(), state.objectStates, &doorPlacements);
     }
 
     // ── Build object collision bodies from .bin bounding boxes ──
@@ -2501,6 +2528,7 @@ int main(int argc, char *argv[]) {
     // Register DoorSystem as a SimListener so it receives simStep() calls.
     // Priority 10 = before physics (which would be 20+ when registered).
     simSvc->registerListener(&doorSystem, 10);
+    simSvc->registerListener(&tweqSystem, 15);  // after doors (10), before physics (20+)
 
     // Set up door event callback: update audio blocking and log status changes.
     // When a door starts opening, remove sound blocking. When it finishes
@@ -2725,6 +2753,7 @@ int main(int argc, char *argv[]) {
     loopSvc->removeLoopClient(&inputClient);
     loopSvc->removeLoopClient(&renderClient);
     simSvc->unregisterListener(&doorSystem);
+    simSvc->unregisterListener(&tweqSystem);
     simSvc->endSim();
 
     destroyGPUResources(gpu);
