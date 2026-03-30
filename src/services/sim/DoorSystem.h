@@ -126,6 +126,7 @@ struct DoorState {
 
     // Debug: frame counter for per-activation logging (reset on each activate)
     int logFrames = 0;
+    int blockingLogCount = 0;  // one-shot counter for blocking factor logs
 };
 
 // ── Callback for door events (sound blocking, script messages, etc.) ──
@@ -268,6 +269,13 @@ public:
     using AudioBlockingCallback = std::function<void(int32_t room1, int32_t room2, float factor)>;
     void setAudioBlockingCallback(AudioBlockingCallback cb) { mAudioBlockingCallback = std::move(cb); }
 
+    /// Set callback for runtime collision body updates during door animation.
+    /// Called per-frame with (objID, worldMatrix) while a door is moving.
+    /// The callback should update the door's collision OBB to match its visual
+    /// position, allowing the player to walk through open doors.
+    using CollisionUpdateCallback = std::function<void(int32_t objID, const Matrix4 &worldMatrix)>;
+    void setCollisionUpdateCallback(CollisionUpdateCallback cb) { mCollisionUpdateCb = std::move(cb); }
+
     /// Get all door IDs (for debug enumeration).
     std::vector<int32_t> getAllDoorIDs() const {
         std::vector<int32_t> ids;
@@ -336,15 +344,26 @@ public:
                     ++door.logFrames;
                 }
 
-                // Continuously update audio blocking during animation.
-                // This is called via the mAudioBlockingCallback which is
-                // set by the renderer to call AudioService::setBlockingFactor.
+                // Update audio blocking continuously during animation.
+                // Blocking scales with closed fraction: fully closed = full blocking,
+                // fully open = zero blocking. Applies symmetrically for both opening
+                // and closing so the LPF transitions smoothly in both directions.
+                // Door's own sounds use skipPortalRouting and are unaffected.
                 if (mAudioBlockingCallback &&
                     door.room1 >= 0 && door.room2 >= 0 &&
                     door.room1 != door.room2 && door.soundBlocking > 0.0f) {
                     float openFrac = getOpenFraction(id);
                     float blocking = door.soundBlocking * (1.0f - openFrac);
                     mAudioBlockingCallback(door.room1, door.room2, blocking);
+                    // One-shot diagnostic: log first blocking change per door activation
+                    if (door.blockingLogCount < 2) {
+                        std::fprintf(stderr, "  Door %d: blocking rooms(%d,%d) "
+                                     "factor=%.3f (sndBlock=%.2f, %s)\n",
+                                     id, door.room1, door.room2,
+                                     blocking, door.soundBlocking,
+                                     door.status == kDoorOpening ? "opening" : "closing");
+                        ++door.blockingLogCount;
+                    }
                 }
             }
         }
@@ -393,11 +412,11 @@ private:
             {
                 Quaternion q = mObjSvc ? mObjSvc->orientation(id) : Quaternion(1,0,0,0);
                 std::fprintf(stderr, "  Door %d: type=%s axis=%d closed=%.3f open=%.3f speed=%.3f "
-                             "clockwise=%d isBrush=%d rooms=(%d,%d)\n",
+                             "clockwise=%d isBrush=%d rooms=(%d,%d) sndBlock=%.2f\n",
                              id, (doorType == kDoorRotating ? "rot" : "trans"),
                              door.axis, door.closedValue, door.openValue,
                              door.speed, door.clockwise ? 1 : 0, door.isBrushDoor ? 1 : 0,
-                             door.room1, door.room2);
+                             door.room1, door.room2, door.soundBlocking);
                 std::fprintf(stderr, "    basePos=(%.2f,%.2f,%.2f) pivot=(%.2f,%.2f,%.2f)\n",
                              door.basePosition.x, door.basePosition.y, door.basePosition.z,
                              door.pivotOffset.x, door.pivotOffset.y, door.pivotOffset.z);
@@ -450,7 +469,11 @@ private:
         door.axis = prop.axis;
         door.status = static_cast<DoorStatus>(prop.status);
         door.hardLimits = (prop.hardLimits != 0);
-        door.soundBlocking = prop.blockSound / 100.0f;
+        // blockSound is a 0-100 percentage (Dark Engine default: 60).
+        // Halved because Steam Audio's geometry-based occlusion provides
+        // additional attenuation through door frame walls — without the
+        // reduction, sounds behind closed doors are over-attenuated.
+        door.soundBlocking = prop.blockSound / 200.0f;
         door.visionBlocking = (prop.blockVision != 0);
         door.pushMass = prop.pushMass;
         door.room1 = prop.room1;
@@ -473,7 +496,8 @@ private:
         door.axis = prop.axis;
         door.status = static_cast<DoorStatus>(prop.status);
         door.hardLimits = (prop.hardLimits != 0);
-        door.soundBlocking = prop.blockSound / 100.0f;
+        // Halved — same reasoning as RotDoor (Steam Audio additive occlusion)
+        door.soundBlocking = prop.blockSound / 200.0f;
         door.visionBlocking = (prop.blockVision != 0);
         door.pushMass = prop.pushMass;
         door.room1 = prop.room1;
@@ -527,7 +551,7 @@ private:
 
         // P$Scale: direct ownership only (kPropertyNoInherit)
         Vector3 scale(1.0f);
-        if (getTypedProperty<Vector3>(propSvc, "Scale", objID, scale)) {
+        if (getTypedProperty<Vector3>(propSvc, "ModelScale", objID, scale)) {
             door.baseScale = scale;
         }
     }
@@ -548,7 +572,9 @@ private:
             edgeLengths = Vector3(dims.sizeX, dims.sizeY, dims.sizeZ);
         }
 
-        // Fall back to model bounding box if PhysDims has no size
+        // Fall back to model bounding box if PhysDims has no size.
+        // Apply door.baseScale since PhysDims.size already includes scale
+        // but raw model bbox dimensions do not.
         if (glm::length(edgeLengths) < 0.01f && mParsedModels) {
             // Look up model name
             char modelName[16] = {};
@@ -560,7 +586,7 @@ private:
                     edgeLengths = Vector3(
                         mesh.bboxMax[0] - mesh.bboxMin[0],
                         mesh.bboxMax[1] - mesh.bboxMin[1],
-                        mesh.bboxMax[2] - mesh.bboxMin[2]);
+                        mesh.bboxMax[2] - mesh.bboxMin[2]) * door.baseScale;
                 }
             }
         }
@@ -736,6 +762,7 @@ private:
         if (!mObjectStates) return;
 
         ObjectState &os = mObjectStates->get(door.objID);
+        Matrix4 fullGlm(1.0f);
 
         if (door.type == kDoorRotating) {
             // Rotate around the hinge edge, not the model center.
@@ -752,7 +779,6 @@ private:
             case 1: axisVec.y = 1.0f; break;
             case 2: axisVec.z = 1.0f; break;
             }
-            Matrix4 fullGlm;
             if (std::abs(door.currentValue) < 1e-7f) {
                 // At rest: T(basePos) * R_base * S — matches static renderer.
                 Matrix4 scaleMat = glm::scale(Matrix4(1.0f), door.baseScale);
@@ -800,7 +826,7 @@ private:
             Matrix4 transMat = glm::translate(Matrix4(1.0f), worldOffset);
             Matrix4 worldTranslate = glm::translate(Matrix4(1.0f), door.basePosition);
             Matrix4 scaleMat = glm::scale(Matrix4(1.0f), door.baseScale);
-            Matrix4 fullGlm = worldTranslate * transMat * door.baseRotation * scaleMat;
+            fullGlm = worldTranslate * transMat * door.baseRotation * scaleMat;
 
             float *m = os.modelMatrix;
             for (int col = 0; col < 3; ++col)
@@ -813,6 +839,15 @@ private:
             os.hasMatrix = true;
             os.position = door.basePosition + worldOffset;
             os.scale = door.baseScale;
+        }
+
+        // Update collision body to match the new visual transform.
+        // fullGlm includes position, rotation, pivot, and scale — everything
+        // needed to recompute the OBB center and orientation.
+        // Brush doors and doors without P$PhysType have no collision body;
+        // updateBodyTransform silently returns false for those.
+        if (mCollisionUpdateCb) {
+            mCollisionUpdateCb(door.objID, fullGlm);
         }
     }
 
@@ -839,6 +874,7 @@ private:
     const std::unordered_map<int32_t, ObjPlacementInfo> *mPlacements = nullptr;
     DoorEventCallback mEventCallback;
     AudioBlockingCallback mAudioBlockingCallback;
+    CollisionUpdateCallback mCollisionUpdateCb;
     uint32_t mFrameCount = 0;
 };
 

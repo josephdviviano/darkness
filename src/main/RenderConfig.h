@@ -39,7 +39,7 @@ struct RenderConfig {
     float absorptionScale    = 1.0f;   // multiply all material absorption coefficients (1=physical, 0.5=more reflective)
     int   diffuseSamples     = 64;     // diffuse scattering samples for real-time reflection sim (16-256)
     int   bakeDiffuseSamples = 128;    // diffuse scattering samples for probe baking (32-512, higher=smoother)
-    float occlusionRadius    = 1.5f;   // volumetric occlusion source sphere radius (world units, 0.1-10)
+    float occlusionRadius    = 3.0f;   // volumetric occlusion source sphere radius (world units, 0.1-10)
     int   occlusionSamples   = 16;     // volumetric occlusion ray samples per source (4-64)
 
     // Propagation layer toggles (all on by default — debug use only)

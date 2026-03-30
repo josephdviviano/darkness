@@ -2073,7 +2073,13 @@ int main(int argc, char *argv[]) {
                                 tags.push_back(std::move(t));
                             }
                         }
-                        audioSvc->playEnvSchema(tags, door->basePosition);
+                        // Play on both sides of the door (same as open/close sounds)
+                        Darkness::Matrix3 doorRot(door->baseRotation);
+                        Darkness::Vector3 doorNormal = doorRot[1];
+                        audioSvc->playEnvSchema(tags,
+                            door->basePosition + doorNormal * 0.5f, true);
+                        audioSvc->playEnvSchema(tags,
+                            door->basePosition - doorNormal * 0.5f, true);
                     }
                     std::fprintf(stderr, "Door %d: LOCKED, rejecting frob\n", msg.to);
                     return true;  // consumed — do not toggle
@@ -2258,6 +2264,19 @@ int main(int argc, char *argv[]) {
         Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
         state.physics->buildObjectCollision(
             mission.objData.objects, mission.parsedModels, propSvc.get());
+    }
+
+    // Wire door collision updates: when doors animate, update their collision
+    // OBB position so the player can walk through open doors.
+    {
+        Darkness::ObjectCollisionWorld *ocw =
+            state.physics ? state.physics->getObjectCollisionWorld() : nullptr;
+        if (ocw) {
+            doorSystem.setCollisionUpdateCallback(
+                [ocw](int32_t objID, const Darkness::Matrix4 &worldMatrix) {
+                    ocw->updateBodyTransform(objID, worldMatrix);
+                });
+        }
     }
 
     // ── SDL2 + bgfx init ──
@@ -2561,7 +2580,17 @@ int main(int argc, char *argv[]) {
                     }
                 }
             }
-            auto h = audioForEvents->playEnvSchema(tags, door.basePosition);
+            // The door's P$Position sits at the portal plane, embedded in frame
+            // geometry. Play on BOTH sides of the door (offset along the door's
+            // face normal) so the sound is always audible regardless of which
+            // side the player is on. Steam Audio naturally occludes the far-side
+            // source through the frame geometry.
+            Darkness::Matrix3 doorRot(door.baseRotation);
+            Darkness::Vector3 doorNormal = doorRot[1];  // local Y = thin axis (face normal)
+            Darkness::Vector3 posA = door.basePosition + doorNormal * 0.5f;
+            Darkness::Vector3 posB = door.basePosition - doorNormal * 0.5f;
+            auto h = audioForEvents->playEnvSchema(tags, posA, true);
+            audioForEvents->playEnvSchema(tags, posB, true);
             if (h == Darkness::SOUND_HANDLE_INVALID) {
                 std::fprintf(stderr, "  Door %d: no schema matched env_tags "
                              "(OpenState=%s OldOpenState=%s)\n",

@@ -211,7 +211,8 @@ public:
      *  @param position World-space position for 3D audio
      *  @return Sound handle, or SOUND_HANDLE_INVALID if no matching schema found */
     SoundHandle playEnvSchema(const std::vector<SchemaTagValue> &tags,
-                              const Vector3 &position);
+                              const Vector3 &position,
+                              bool bypassPortalBlocking = false);
 
     /** Halt a specific active sound.
      *  @param handle  Sound handle from playSchema/playSchemaOnObj */
@@ -330,6 +331,9 @@ public:
     float getOcclusionRadius() const { return mOcclusionRadius; }
     void setOcclusionSamples(int n) { mOcclusionSamples = std::max(4, std::min(n, 64)); }
     int  getOcclusionSamples() const { return mOcclusionSamples; }
+
+    /// Get the current listener position (for door sound placement, etc.)
+    Vector3 getListenerPos() const { return mListenerPos; }
 
     // Propagation layer toggles (all on by default)
     void setPortalRoutingEnabled(bool v) { mPortalRoutingEnabled = v; }
@@ -625,7 +629,7 @@ private:
 
     /// Volumetric occlusion source sphere radius (world units).
     /// Larger = smoother transitions around corners, smaller = tighter response.
-    float mOcclusionRadius = 1.5f;
+    float mOcclusionRadius = 3.0f;
     /// Number of ray samples for volumetric occlusion (4-64).
     /// More samples = smoother gradient, higher CPU cost per source.
     int mOcclusionSamples = 16;

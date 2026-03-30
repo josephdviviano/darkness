@@ -234,7 +234,13 @@ struct SteamAudioDSPNode {
     bool usePortalRouting = false;
     bool skipAttenuation = false;        // true for player-emitted sounds (footsteps, within 5 units)
     float portalAttenuation = 0.0f;      // inverse-square from effective distance
+    float portalBlocking = 0.0f;         // 0.0=open, 1.0=fully blocked (for LPF)
     IPLVector3 portalDirection{1.0f, 0.0f, 0.0f}; // direction toward virtual source (portal center)
+
+    // Per-voice low-pass filter state for door blocking (audio thread only).
+    // Simulates high-frequency absorption through closed doors.
+    float lpfStateL = 0.0f;
+    float lpfStateR = 0.0f;
 
     // Reflection convolution effect (per-voice, feeds into shared mixer)
     IPLReflectionEffect reflectionEffect = nullptr;
@@ -802,6 +808,28 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 chL[i] *= portalScale;
                 chR[i] *= portalScale;
             }
+
+            // Low-pass filter for door blocking — closed doors absorb high
+            // frequencies more than low frequencies, producing a muffled
+            // quality. Uses a 1-pole IIR LPF whose cutoff decreases with
+            // increasing blocking factor: 0 blocking = no filter (20kHz),
+            // full blocking = heavy filter (~800Hz).
+            float blocking = node->portalBlocking;
+            if (blocking > 0.01f) {
+                // Map blocking 0→1 to cutoff 20000→800 Hz (exponential)
+                float cutoff = 20000.0f * std::pow(0.04f, blocking);  // 0.04 = 800/20000
+                constexpr float sampleRate = 48000.0f;
+                float rc = 1.0f / (2.0f * 3.14159265f * cutoff);
+                float dt = 1.0f / sampleRate;
+                float alpha = dt / (rc + dt);
+
+                for (ma_uint32 i = 0; i < frameCount; ++i) {
+                    node->lpfStateL += alpha * (chL[i] - node->lpfStateL);
+                    chL[i] = node->lpfStateL;
+                    node->lpfStateR += alpha * (chR[i] - node->lpfStateR);
+                    chR[i] = node->lpfStateR;
+                }
+            }
         }
 
         // Apply reflection convolution — feeds attenuated mono input through
@@ -1134,6 +1162,7 @@ struct ActiveVoice {
     int priority = 128;                // 0-255, higher = more important
     int objID = 0;                     // Object ID if attached (0 = positional)
     bool playerEmitted = false;        // true for footsteps/landing — skip DSP attenuation
+    bool skipPortalRouting = false;    // true for door sounds — use Steam Audio but skip portal blocking
     bool isAmbient = false;            // true for ambient voices — distance handled by ambient system
 
     // Re-propagation throttle: nearby sounds update every frame, distant
@@ -2374,7 +2403,8 @@ void AudioService::loopStep(float deltaTime)
                 // update frequency. Uses cached result between updates.
                 SoundPropInfo prop{};
                 bool isCrossRoom = false;
-                if (mPortalRoutingEnabled && !voice->sourceEnded && !voice->playerEmitted) {
+                if (mPortalRoutingEnabled && !voice->sourceEnded && !voice->playerEmitted
+                    && !voice->skipPortalRouting) {
                     if (voice->propagationCountdown <= 0) {
                         auto prT0 = std::chrono::steady_clock::now();
                         prop = propagateSoundBlended(voice->worldPos);
@@ -2412,6 +2442,7 @@ void AudioService::loopStep(float deltaTime)
                     float portalAtten = 1.0f / (1.0f + prop.effectiveDistance *
                                                         prop.effectiveDistance * 0.001f);
                     voice->dspNode.portalAttenuation = portalAtten;
+                    voice->dspNode.portalBlocking = prop.totalBlocking;
                     voice->dspNode.usePortalRouting = isCrossRoom;
 
                     // For cross-room voices, compute HRTF direction toward the
@@ -2469,7 +2500,13 @@ void AudioService::loopStep(float deltaTime)
                 // smoothly from 0 to 1 instead of snapping instantly (RAYCAST).
                 // The 16 samples are points within the sphere used for ray tests.
                 inputs.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;
-                inputs.occlusionRadius = mOcclusionRadius;
+                // Door/local sounds use a larger occlusion sphere so they aren't
+                // over-occluded by narrow door frames. The larger sphere means more
+                // rays see around edges, producing gentle partial occlusion instead
+                // of heavy blocking. Works correctly for both player and NPC doors.
+                inputs.occlusionRadius = voice->skipPortalRouting
+                    ? std::max(mOcclusionRadius, 5.0f)
+                    : mOcclusionRadius;
                 inputs.numOcclusionSamples = mOcclusionSamples;
                 inputs.numTransmissionRays = 8;
 
@@ -2605,6 +2642,20 @@ void AudioService::loopStep(float deltaTime)
                 }
                 voice->dspNode.directParams.transmissionType =
                     IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+
+                // Diagnostic: log Steam Audio direct params for door sounds
+                if (voice->skipPortalRouting) {
+                    const auto &dp = voice->dspNode.directParams;
+                    std::fprintf(stderr, "[DOOR_SND] h=%u '%s' distAtten=%.3f "
+                                 "occl=%.3f trans=(%.2f,%.2f,%.2f) "
+                                 "portalRoute=%d portalAtten=%.3f blocking=%.3f\n",
+                                 handle, voice->schemaName.c_str(),
+                                 dp.distanceAttenuation, dp.occlusion,
+                                 dp.transmission[0], dp.transmission[1], dp.transmission[2],
+                                 (int)voice->dspNode.usePortalRouting,
+                                 voice->dspNode.portalAttenuation,
+                                 voice->dspNode.portalBlocking);
+                }
 
                 // Enable reflection convolution up to the global budget.
                 // Top-N closest voices (real-time) get priority, then baked
@@ -3505,7 +3556,8 @@ SoundHandle AudioService::playSchemaOnObj(const std::string &schemaName,
 
 //------------------------------------------------------
 SoundHandle AudioService::playEnvSchema(const std::vector<SchemaTagValue> &tags,
-                                         const Vector3 &position)
+                                         const Vector3 &position,
+                                         bool bypassPortalBlocking)
 {
     if (!mAudioReady || !mSchemaParser)
         return SOUND_HANDLE_INVALID;
@@ -3549,8 +3601,27 @@ SoundHandle AudioService::playEnvSchema(const std::vector<SchemaTagValue> &tags,
     bool looping = schema->loopParams.isLooping;
     float vol = schemaVolumeToLinear(schema->playParams.volume);
 
-    return startVoice(schema->name, sample.name, position,
-                      schema->playParams.priority, looping, 0, vol);
+    // Local sounds (door open/close) get a volume boost to compensate for
+    // Steam Audio's geometry-based distance attenuation which stacks on top
+    // of the schema's authored volume. The original engine had no such
+    // additional attenuation layer. 2x boost (~+6dB) restores audibility.
+    if (bypassPortalBlocking) {
+        vol = std::min(vol * 2.0f, 1.0f);
+    }
+
+    SoundHandle h = startVoice(schema->name, sample.name, position,
+                               schema->playParams.priority, looping, 0, vol);
+    // Local sounds skip portal-based blocking so they're audible from both
+    // sides of a door. Steam Audio HRTF and distance attenuation still apply.
+    if (bypassPortalBlocking && h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
+        mVoices[h]->skipPortalRouting = true;
+        std::fprintf(stderr, "[DOOR_SND] CREATE h=%u '%s' vol=%.3f "
+                     "schemaVol=%d pos=(%.1f,%.1f,%.1f)\n",
+                     h, schema->name.c_str(), vol,
+                     schema->playParams.volume,
+                     position.x, position.y, position.z);
+    }
+    return h;
 }
 
 //------------------------------------------------------
