@@ -147,15 +147,7 @@ public:
     /// Scan for all objects with P$RotDoor or P$TransDoor properties and
     /// create DoorState entries. Call after level load, before sim starts.
     /// parsedModels is used to compute hinge pivot offsets from bounding boxes.
-    /// objectPlacements: objID → (index, heading, pitch, bank, x, y, z, sx, sy, sz)
-    /// from the mission's ObjectPlacement array — used for raw binary radian angles
-    /// that match the static renderer exactly (no quaternion round-trip).
-    struct ObjPlacementInfo {
-        float x, y, z;
-        int16_t heading, pitch, bank;
-        float sx, sy, sz;
-        char modelName[16];
-    };
+    // ObjPlacementInfo is defined in SimCommon.h (shared with TweqSystem)
 
     void init(PropertyService *propSvc, ObjectService *objSvc,
               ObjectStateMap *objectStates,

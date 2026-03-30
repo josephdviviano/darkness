@@ -32,6 +32,20 @@
 namespace Darkness {
 
 // ============================================================================
+// ObjPlacementInfo — raw placement data from mission file
+// ============================================================================
+//
+// Shared by DoorSystem, TweqSystem, and other sim systems that need raw
+// binary-radian angles and model names from ObjectPlacement data.
+
+struct ObjPlacementInfo {
+    float x, y, z;
+    int16_t heading, pitch, bank;
+    float sx, sy, sz;
+    char modelName[16];
+};
+
+// ============================================================================
 // SimTransform — base transform snapshot for simulated objects
 // ============================================================================
 //
