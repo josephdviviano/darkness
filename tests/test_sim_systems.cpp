@@ -304,8 +304,14 @@ TEST_CASE("LoopMode: duplicate priority clients all dispatched", "[LoopService]"
 // Helper: get or create a LoopService with a test mode and client.
 // Returns the LoopService shared_ptr. Creates a "TestMode" if it doesn't
 // exist. Note: LoopService is a singleton — same instance across tests.
+// Cache service pointers once to avoid repeated GET_SERVICE calls through
+// the singleton, which can SIGSEGV when Catch2's test-randomization runs
+// tests from other files that perturb ServiceManager internal state.
+static LoopServicePtr sCachedLoopSvc;
 static LoopServicePtr getTestLoopService() {
-    return GET_SERVICE(LoopService);
+    if (!sCachedLoopSvc)
+        sCachedLoopSvc = GET_SERVICE(LoopService);
+    return sCachedLoopSvc;
 }
 
 TEST_CASE("LoopService: step processes pending mode request", "[LoopService]") {
@@ -313,7 +319,7 @@ TEST_CASE("LoopService: step processes pending mode request", "[LoopService]") {
     // Before the fix, step() never processed mNewModeRequested, so
     // mActiveMode stayed null and no clients received loopStep().
     auto loopSvc = getTestLoopService();
-    REQUIRE(loopSvc);
+    REQUIRE(loopSvc.get() != nullptr);
 
     // Create a unique mode for this test (idempotent if already exists)
     LoopModeDefinition modeDef{100, 0xFF, "StepTest"};
@@ -334,7 +340,7 @@ TEST_CASE("LoopService: step processes pending mode request", "[LoopService]") {
 
 TEST_CASE("LoopService: step delta is capped at 0.1 seconds", "[LoopService]") {
     auto loopSvc = getTestLoopService();
-    REQUIRE(loopSvc);
+    REQUIRE(loopSvc.get() != nullptr);
 
     LoopModeDefinition modeDef{101, 0xFF, "CapTest"};
     loopSvc->createLoopMode(modeDef);
@@ -356,7 +362,7 @@ TEST_CASE("LoopService: step delta is capped at 0.1 seconds", "[LoopService]") {
 
 TEST_CASE("LoopService: step delta is in seconds not milliseconds", "[LoopService]") {
     auto loopSvc = getTestLoopService();
-    REQUIRE(loopSvc);
+    REQUIRE(loopSvc.get() != nullptr);
 
     LoopModeDefinition modeDef{102, 0xFF, "UnitsTest"};
     loopSvc->createLoopMode(modeDef);
@@ -379,7 +385,7 @@ TEST_CASE("LoopService: step delta is in seconds not milliseconds", "[LoopServic
 
 TEST_CASE("LoopService: requestTermination sets flag", "[LoopService]") {
     auto loopSvc = getTestLoopService();
-    REQUIRE(loopSvc);
+    REQUIRE(loopSvc.get() != nullptr);
     // Note: we test the flag but don't actually terminate — other tests need the service
     bool wasTerm = loopSvc->isTerminationRequested();
     loopSvc->requestTermination();
@@ -395,17 +401,10 @@ TEST_CASE("LoopService: requestTermination sets flag", "[LoopService]") {
 // Get the SimService from the ServiceManager singleton.
 // SimService is a singleton — same instance across all tests.
 // We must be careful to reset state between tests.
-static SimServicePtr getTestSimService() {
-    return GET_SERVICE(SimService);
-}
-
-// Helper: ensure SimService is in a clean stopped state for a test.
-static SimServicePtr freshSimService() {
-    auto svc = getTestSimService();
-    if (svc->isSimRunning()) {
-        svc->endSim();
-        svc->loopStep(0.0f);  // process the end request
-    }
+// Create a fresh standalone SimService for each test (not from the shared
+// ServiceManager) to avoid SIGSEGV from cross-test-file singleton corruption.
+static std::shared_ptr<SimService> freshSimService() {
+    auto svc = std::make_shared<SimService>(nullptr, "SimService");
     return svc;
 }
 
