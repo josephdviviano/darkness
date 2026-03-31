@@ -146,9 +146,18 @@ public:
             try {
                 // Detect format by magic bytes
                 if (buf.size() >= 6 && std::memcmp(buf.data(), "GIF", 3) == 0) {
-                    return decodeGIF(buf.data(), buf.size());
+                    auto img = decodeGIF(buf.data(), buf.size());
+                    if (img.width > 0 && img.height > 0) return img;
+                    std::fprintf(stderr, "CRF: GIF decode returned 0x0 for %s (%zu bytes)\n",
+                                 path.c_str(), buf.size());
                 } else if (buf.size() >= 128 + 769 && buf[0] == 0x0A) {
                     return decodePCX(buf.data(), buf.size());
+                } else {
+                    std::fprintf(stderr, "CRF: unknown format for %s (%zu bytes, magic=%02x%02x%02x)\n",
+                                 path.c_str(), buf.size(),
+                                 buf.size() > 0 ? buf[0] : 0,
+                                 buf.size() > 1 ? buf[1] : 0,
+                                 buf.size() > 2 ? buf[2] : 0);
                 }
             } catch (const std::exception &e) {
                 std::fprintf(stderr, "CRF: Failed to decode %s: %s\n",
