@@ -15,8 +15,10 @@
  *          printf("Object %d at (%.1f, %.1f, %.1f)\n", objID, pos.x, pos.y, pos.z);
  *      }
  *
- *    Property names are the label names (e.g. "Position", "ModelName", "Scale"),
- *    NOT the chunk names (e.g. "P$Position"). PropertyService stores them by label.
+ *    Property names are the pldef property names (e.g. "Position", "RotDoor",
+ *    "CfgTweqRo"), NOT the labels (e.g. "RotatingDoor", "TweqRotateConfig")
+ *    and NOT the chunk names (e.g. "P$Position"). PropertyService registers
+ *    by the pldef property name.
  *
  *****************************************************************************/
 
