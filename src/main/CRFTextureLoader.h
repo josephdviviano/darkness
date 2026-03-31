@@ -127,6 +127,9 @@ public:
             "txt/" + matName
         };
 
+        // Try each path, keep the best (largest) result. txt16/ may have tiny
+        // 2x2 placeholders while txt/ has the real texture, or vice versa.
+        DecodedImage bestImg = {};
         for (const auto &path : paths) {
             ZZIP_FILE *fp = zzip_file_open(mDir, path.c_str(), ZZIP_CASELESS);
             if (!fp) continue;
@@ -144,20 +147,23 @@ public:
             if (buf.size() < 13) continue; // too small for any image
 
             try {
-                // Detect format by magic bytes
+                DecodedImage img = {};
                 if (buf.size() >= 6 && std::memcmp(buf.data(), "GIF", 3) == 0) {
-                    auto img = decodeGIF(buf.data(), buf.size());
-                    if (img.width > 0 && img.height > 0) return img;
-                    std::fprintf(stderr, "CRF: GIF decode returned 0x0 for %s (%zu bytes)\n",
-                                 path.c_str(), buf.size());
+                    img = decodeGIF(buf.data(), buf.size());
                 } else if (buf.size() >= 128 + 769 && buf[0] == 0x0A) {
-                    return decodePCX(buf.data(), buf.size());
+                    img = decodePCX(buf.data(), buf.size());
                 } else {
                     std::fprintf(stderr, "CRF: unknown format for %s (%zu bytes, magic=%02x%02x%02x)\n",
                                  path.c_str(), buf.size(),
                                  buf.size() > 0 ? buf[0] : 0,
                                  buf.size() > 1 ? buf[1] : 0,
                                  buf.size() > 2 ? buf[2] : 0);
+                    continue;
+                }
+                // Keep the larger version (txt/ may have real texture when
+                // txt16/ only has a 2x2 placeholder, or vice versa)
+                if (img.width * img.height > bestImg.width * bestImg.height) {
+                    bestImg = std::move(img);
                 }
             } catch (const std::exception &e) {
                 std::fprintf(stderr, "CRF: Failed to decode %s: %s\n",
@@ -165,6 +171,8 @@ public:
             }
         }
 
+        // Return the best decoded image, or fallback if nothing decoded
+        if (bestImg.width > 0 && bestImg.height > 0) return bestImg;
         return makeFallback();
     }
 
