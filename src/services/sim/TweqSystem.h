@@ -156,9 +156,11 @@ public:
 
     void init(PropertyService *propSvc,
               ObjectStateMap *objectStates,
-              const std::unordered_map<int32_t, ObjPlacementInfo> *placements) {
+              const std::unordered_map<int32_t, ObjPlacementInfo> *placements,
+              const std::unordered_map<std::string, ParsedBinMesh> *parsedModels = nullptr) {
         mObjectStates = objectStates;
         mPlacements = placements;
+        mParsedModels = parsedModels;
 
         // Scan for each tweq type. Property names are chunk names from the pldef
         // (e.g., "CfgTweqRo"), NOT labels (e.g., "TweqRotateConfig") — the
@@ -425,15 +427,20 @@ private:
 
             // Log Models tweq config at init for debugging
             if (tweqType == kTweqTypeModels) {
-                std::fprintf(stderr, "  TweqModels obj=%d: rate=%dms models=[",
-                             objID, tw.cfgRate);
+                std::fprintf(stderr, "  TweqModels obj=%d: staticModel='%.16s' rate=%dms models=[",
+                             objID, placement.modelName, tw.cfgRate);
                 for (int i = 0; i < 6; ++i) {
                     if (tw.modelNames[i][0] != '\0')
                         std::fprintf(stderr, "'%s'%s", tw.modelNames[i],
                                      i < 5 && tw.modelNames[i+1][0] != '\0' ? "," : "");
                 }
-                std::fprintf(stderr, "] count=%d anim=0x%02x halt=%d active=%d\n",
-                             tw.modelCount, tw.cfgAnim, tw.cfgHalt, tw.active ? 1 : 0);
+                std::fprintf(stderr, "] count=%d anim=0x%02x misc=0x%03x halt=%d active=%d",
+                             tw.modelCount, tw.cfgAnim, tw.cfgMisc, tw.cfgHalt, tw.active ? 1 : 0);
+                // Flag decode
+                if (tw.cfgMisc & kTweqMiscAnchor) std::fprintf(stderr, " ANCHOR");
+                if (tw.cfgMisc & kTweqMiscVHot) std::fprintf(stderr, " VHOT");
+                if (tw.cfgMisc & kTweqMiscScripts) std::fprintf(stderr, " SCRIPTS");
+                std::fprintf(stderr, "\n");
             }
 
             mTweqs[tweqKey(objID, tweqType)] = std::move(tw);
@@ -751,17 +758,27 @@ private:
             }
         }
 
-        // Always apply the model name override for the current frame, regardless
-        // of halt result. The halt action controls whether the tweq continues
-        // running — but the current frame's model should always be displayed.
-        // (kTweqHaltContinue from a bounce was skipping this, causing stale models.)
+        // Always apply the model name override for the current frame.
         {
             int frame = std::clamp(static_cast<int>(tw.curFrame), 0, tw.modelCount - 1);
-            if (mObjectStates && tw.modelNames[frame][0] != '\0') {
+            std::string newModelName(tw.modelNames[frame],
+                strnlen(tw.modelNames[frame], 16));
+            if (mObjectStates && !newModelName.empty()) {
                 ensureObjectState(tw);
                 ObjectState &os = mObjectStates->get(tw.objID);
-                os.modelNameOverride = std::string(tw.modelNames[frame],
-                    strnlen(tw.modelNames[frame], 16));
+
+                // Anchor compensation: when the ANCHOR flag is set, adjust the
+                // object's Z position to keep the bottom of the bounding box
+                // fixed. Different flame model variants have different bbox
+                // heights, so without this the flame bobs up and down.
+                // Matches Dark Engine get_anchor/finalize_anchor logic.
+                if ((tw.cfgMisc & kTweqMiscAnchor) && mParsedModels) {
+                    float oldAnchorZ = getModelBBoxBottomZ(os.modelNameOverride);
+                    float newAnchorZ = getModelBBoxBottomZ(newModelName);
+                    os.position.z += (oldAnchorZ - newAnchorZ);
+                }
+
+                os.modelNameOverride = std::move(newModelName);
             }
         }
 
@@ -883,6 +900,16 @@ private:
 
     // ── Utility ──
 
+    /// Get the bounding box bottom Z for a model (for anchor compensation).
+    /// Returns the Z coordinate of the bbox minimum (model-space bottom).
+    /// Returns 0 if the model isn't found.
+    float getModelBBoxBottomZ(const std::string &modelName) const {
+        if (!mParsedModels || modelName.empty()) return 0.0f;
+        auto it = mParsedModels->find(modelName);
+        if (it == mParsedModels->end() || !it->second.valid) return 0.0f;
+        return it->second.bboxMin[2];  // Z = vertical in Dark Engine
+    }
+
     /// Random float in [-1, 1] (matches Dark Engine frand_hack)
     float randFloat() {
         return std::uniform_real_distribution<float>(-1.0f, 1.0f)(mRng);
@@ -895,6 +922,7 @@ private:
     TweqEventCallback mEventCallback;
     std::mt19937 mRng;
     uint32_t mFrameCount = 0;
+    const std::unordered_map<std::string, ParsedBinMesh> *mParsedModels = nullptr;
 
     // Scratch set for per-frame dirty object tracking (avoids allocation per frame)
     std::unordered_set<int32_t> mDirtyObjects;

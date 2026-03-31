@@ -2385,7 +2385,8 @@ int main(int argc, char *argv[]) {
     // and creates per-object animation instances. Auto-starts tweqs with Sim flag.
     {
         Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
-        tweqSystem.init(propSvc.get(), state.objectStates, &doorPlacements);
+        tweqSystem.init(propSvc.get(), state.objectStates, &doorPlacements,
+                        &mission.parsedModels);
     }
 
     // ── Build object collision bodies from .bin bounding boxes ──
