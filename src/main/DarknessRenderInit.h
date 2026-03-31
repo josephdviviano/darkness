@@ -588,15 +588,20 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
         int loaded = 0, notFound = 0;
         for (const auto &name : objMatNames) {
             // Try obj.crf first (txt16/ and txt/ subdirs)
+            // The loader returns the best version (largest of txt16/ and txt/)
+            // and falls back to an 8x8 checkerboard if nothing is found.
+            // Accept any real image (even 2x2 solid fills like black.gif).
             Darkness::DecodedImage img;
             if (objTexLoader.isOpen()) {
                 img = objTexLoader.loadObjectTexture(name);
             }
-            // Fallback to fam.crf if not found in obj.crf
-            if ((img.width <= 8 && img.height <= 8) && famTexLoader.isOpen()) {
+            // Fallback to fam.crf if obj.crf returned the 8x8 checkerboard
+            bool isFallback = (img.width == 8 && img.height == 8);
+            if (isFallback && famTexLoader.isOpen()) {
                 img = famTexLoader.loadObjectTexture(name);
+                isFallback = (img.width == 8 && img.height == 8);
             }
-            if (img.width > 8 || img.height > 8) {
+            if (!isFallback) {
                 mission.objTexImages[name] = std::move(img);
                 ++loaded;
             } else {
