@@ -516,13 +516,13 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
     if (state.showObjects && !resPath.empty()) {
         Darkness::CRFModelLoader modelLoader(resPath);
         if (modelLoader.isOpen()) {
-            int loaded = 0, failed = 0;
+            int loaded = 0, notFound = 0, parseFailed = 0;
             for (const auto &name : mission.objData.uniqueModels) {
                 auto binData = modelLoader.loadModel(name);
                 if (binData.empty()) {
-                    ++failed;
-                    std::fprintf(stderr, "  model '%s': not found in obj.crf\n",
-                                 name.c_str());
+                    // Not in obj.crf — may be in mesh.crf (AI/creatures) which
+                    // we don't load yet. Expected, not fatal.
+                    ++notFound;
                     continue;
                 }
                 try {
@@ -531,25 +531,29 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
                         mission.parsedModels[name] = std::move(mesh);
                         ++loaded;
                     } else {
+                        // File IS in obj.crf but failed to parse — this is a bug.
                         char hdr[5] = {};
                         if (binData.size() >= 4)
                             std::memcpy(hdr, binData.data(), 4);
-                        std::fprintf(stderr, "  model '%s': parse failed "
-                                     "(size=%zu, magic='%s')\n",
+                        std::fprintf(stderr, "  FATAL: model '%s' found in obj.crf "
+                                     "but parse failed (size=%zu, magic='%s')\n",
                                      name.c_str(), binData.size(), hdr);
-                        ++failed;
+                        ++parseFailed;
                     }
                 } catch (const std::exception &e) {
-                    std::fprintf(stderr, "  model '%s': exception: %s\n",
+                    std::fprintf(stderr, "  FATAL: model '%s' parse exception: %s\n",
                                  name.c_str(), e.what());
-                    ++failed;
+                    ++parseFailed;
                 }
             }
-            std::fprintf(stderr, "Loaded %d/%zu models from obj.crf\n",
+            std::fprintf(stderr, "Loaded %d/%zu models from obj.crf",
                          loaded, mission.objData.uniqueModels.size());
-            if (failed > 0) {
-                std::fprintf(stderr, "FATAL: %d models failed to load from obj.crf. "
-                             "Cannot continue with missing assets.\n", failed);
+            if (notFound > 0)
+                std::fprintf(stderr, " (%d not in obj.crf — AI/creature meshes?)", notFound);
+            std::fprintf(stderr, "\n");
+            if (parseFailed > 0) {
+                std::fprintf(stderr, "FATAL: %d models found in obj.crf but failed to parse. "
+                             "Cannot continue.\n", parseFailed);
                 std::exit(1);
             }
         } else {
