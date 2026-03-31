@@ -425,6 +425,18 @@ private:
                 tw.values[2] = static_cast<float>(placement.heading) * kAngScale * kRadToDeg;
             }
 
+            // For active Models tweqs, apply the initial model immediately so
+            // objects with staticModel='' don't flash as invisible on the first frame.
+            if (tweqType == kTweqTypeModels && tw.active && tw.modelCount > 0) {
+                int frame = std::clamp(static_cast<int>(tw.curFrame), 0, tw.modelCount - 1);
+                if (tw.modelNames[frame][0] != '\0' && mObjectStates) {
+                    ensureObjectState(tw);
+                    ObjectState &os = mObjectStates->get(tw.objID);
+                    os.modelNameOverride = std::string(tw.modelNames[frame],
+                        strnlen(tw.modelNames[frame], 16));
+                }
+            }
+
             // Log Models tweq config at init for debugging
             if (tweqType == kTweqTypeModels) {
                 std::fprintf(stderr, "  TweqModels obj=%d: staticModel='%.16s' rate=%dms models=[",
