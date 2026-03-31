@@ -102,6 +102,7 @@ struct TweqInstance {
     float     elapsedMs = 0.0f;  // for timed tweqs
     int16_t   curFrame = 0;      // for Models tweq
     bool      flickerHidden = false;  // current flicker visibility state
+    bool      hasAnimLight = false;  // object has AnimLight — flicker controls light, not visibility
 
     // Base transform snapshot
     SimTransform base;
@@ -298,6 +299,16 @@ private:
             // Auto-activate if Sim flag is set (always-on tweqs like fans)
             if (tw.cfgAnim & kTweqAnimSim) {
                 tw.active = true;
+            }
+
+            // Check if this object has an AnimLight property. Flicker tweqs on
+            // objects with AnimLights should toggle the light, not hide the object.
+            // (Light toggling is deferred — for now, just skip visibility toggle.)
+            if (tweqType == kTweqTypeFlicker) {
+                size_t animSize = 0;
+                if (getPropertyRawData(propSvc, "AnimLight", objID, animSize)) {
+                    tw.hasAnimLight = true;
+                }
             }
 
             // Initialize current values for Scale tweqs (start at 1.0, not 0.0)
@@ -540,15 +551,27 @@ private:
     /// Called before flicker/model tweqs modify flags or modelNameOverride,
     /// because mObjectStates->get() creates a default entry at position (0,0,0)
     /// which would make the renderer place the object at the origin.
+    ///
+    /// Uses initFromBinaryRadians() with the raw int16 placement angles so the
+    /// renderer's bx::mtxRotateXYZ fallback path produces a bit-identical matrix
+    /// to the static render path. Do NOT set hasMatrix — let the renderer build
+    /// the bx matrix itself to avoid GLM/bx convention mismatches.
     void ensureObjectState(TweqInstance &tw) {
         if (!mObjectStates || tw.hasObjectState) return;
         tw.hasObjectState = true;
-        // Write base transform so the object stays in place
-        Matrix4 baseMat = glm::translate(Matrix4(1.0f), tw.base.position)
-                        * tw.base.rotation
-                        * glm::scale(Matrix4(1.0f), tw.base.scale);
-        applyModelMatrix(*mObjectStates, tw.objID, baseMat,
-                         tw.base.position, tw.base.scale);
+
+        auto it = mPlacements ? mPlacements->find(tw.objID) : decltype(mPlacements->end()){};
+        if (mPlacements && it != mPlacements->end()) {
+            const auto &pl = it->second;
+            mObjectStates->get(tw.objID).initFromBinaryRadians(
+                pl.x, pl.y, pl.z, pl.heading, pl.pitch, pl.bank,
+                pl.sx, pl.sy, pl.sz);
+        } else {
+            // Fallback: set position from SimTransform
+            ObjectState &os = mObjectStates->get(tw.objID);
+            os.position = tw.base.position;
+            os.scale = tw.base.scale;
+        }
     }
 
     int processFlickerTweq(TweqInstance &tw, float dt_ms) {
@@ -557,9 +580,13 @@ private:
         if (tw.elapsedMs >= static_cast<float>(tw.cfgRate)) {
             tw.elapsedMs -= static_cast<float>(tw.cfgRate);
 
-            // Toggle visibility
+            // Toggle visibility — but only for objects without AnimLights.
+            // Torches/candles have AnimLights; the flicker should control the
+            // light intensity, not hide the model. Light toggling is deferred
+            // (needs LightingSystem API). For now, AnimLight objects just get
+            // the frame event for script/callback use.
             tw.flickerHidden = !tw.flickerHidden;
-            if (mObjectStates) {
+            if (mObjectStates && !tw.hasAnimLight) {
                 ensureObjectState(tw);
                 ObjectState &os = mObjectStates->get(tw.objID);
                 if (tw.flickerHidden)
