@@ -503,11 +503,18 @@ private:
         tw.cfgHalt  = cfg.halt;
         tw.cfgMisc  = cfg.misc;
         tw.cfgRate  = cfg.rate;
+        // Copy model names. modelCount = index of first empty slot (not last
+        // non-empty). The Dark Engine stops cycling at the first empty name;
+        // slots after the gap (e.g., mecgas0 at [5] after empty [4]) are
+        // script-accessible state variants, not part of the animation cycle.
         tw.modelCount = 0;
         for (int i = 0; i < 6; ++i) {
             std::memcpy(tw.modelNames[i], cfg.modelName[i], 16);
-            tw.modelNames[i][15] = '\0';  // ensure null termination
-            if (tw.modelNames[i][0] != '\0') tw.modelCount = i + 1;
+            tw.modelNames[i][15] = '\0';
+        }
+        for (int i = 0; i < 6; ++i) {
+            if (tw.modelNames[i][0] == '\0') break;
+            tw.modelCount = i + 1;
         }
     }
 
