@@ -610,7 +610,7 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
         if (notFound > 0)
             std::fprintf(stderr, " (%d not found)", notFound);
         std::fprintf(stderr, "\n");
-        if (false) { // Texture not-found is non-fatal for now (some in other archives)
+        if (notFound > 0) {
         }
     }
 }
