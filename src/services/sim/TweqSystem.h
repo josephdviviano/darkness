@@ -94,6 +94,7 @@ struct TweqInstance {
     // Models tweq
     char      modelNames[6][16] = {};
     int       modelCount = 0;    // number of valid model names
+    float     baseAnchorZ = 0.0f; // bbox bottom Z of first model (anchor reference)
 
     // ── Runtime state ──
     bool      active = false;
@@ -423,6 +424,14 @@ private:
                 tw.values[0] = static_cast<float>(placement.bank)    * kAngScale * kRadToDeg;
                 tw.values[1] = static_cast<float>(placement.pitch)   * kAngScale * kRadToDeg;
                 tw.values[2] = static_cast<float>(placement.heading) * kAngScale * kRadToDeg;
+            }
+
+            // Compute base anchor Z from the first model (used as fixed reference
+            // for anchor compensation — avoids Z bobbing between model variants).
+            if (tweqType == kTweqTypeModels && tw.modelCount > 0 &&
+                (tw.cfgMisc & kTweqMiscAnchor) && mParsedModels) {
+                tw.baseAnchorZ = getModelBBoxBottomZ(
+                    std::string(tw.modelNames[0], strnlen(tw.modelNames[0], 16)));
             }
 
             // For active Models tweqs, apply the initial model immediately so
@@ -807,27 +816,25 @@ private:
                 // fixed. Different flame model variants have different bbox
                 // heights, so without this the flame bobs up and down.
                 // Matches Dark Engine get_anchor/finalize_anchor logic.
-                if ((tw.cfgMisc & kTweqMiscAnchor) && mParsedModels
-                    && !os.modelNameOverride.empty()) {
-                    // Only compensate when swapping between known models.
-                    // Skip on first swap (empty→model) to avoid bogus offset.
-                    float oldAnchorZ = getModelBBoxBottomZ(os.modelNameOverride);
+                // Anchor compensation: adjust Z so the bbox bottom stays at a
+                // fixed height. Uses baseAnchorZ (first model's bbox bottom)
+                // as a constant reference to avoid per-swap Z bobbing.
+                if ((tw.cfgMisc & kTweqMiscAnchor) && mParsedModels) {
                     float newAnchorZ = getModelBBoxBottomZ(newModelName);
-                    if (oldAnchorZ != 0.0f || newAnchorZ != 0.0f) {
-                        os.position.z += (oldAnchorZ - newAnchorZ);
-                    }
+                    // Reset to placement Z, then apply offset from base model
+                    os.position.z = tw.base.position.z + (tw.baseAnchorZ - newAnchorZ);
                 }
 
                 // Log model swap with GPU lookup check
                 if (tw.logFrames < 8 && mParsedModels) {
                     bool parsed = mParsedModels->count(newModelName) > 0;
                     std::fprintf(stderr, "[TWEQ_MODEL] obj=%d swap '%s' -> '%s' "
-                                 "parsed=%d pos.z=%.2f\n",
+                                 "parsed=%d pos=(%.2f,%.2f,%.2f)\n",
                                  tw.objID,
                                  os.modelNameOverride.c_str(),
                                  newModelName.c_str(),
                                  parsed ? 1 : 0,
-                                 os.position.z);
+                                 os.position.x, os.position.y, os.position.z);
                 }
                 os.modelNameOverride = std::move(newModelName);
             }
