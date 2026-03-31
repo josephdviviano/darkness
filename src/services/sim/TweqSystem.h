@@ -536,6 +536,21 @@ private:
         return result;
     }
 
+    /// Ensure an ObjectState entry exists with the correct base transform.
+    /// Called before flicker/model tweqs modify flags or modelNameOverride,
+    /// because mObjectStates->get() creates a default entry at position (0,0,0)
+    /// which would make the renderer place the object at the origin.
+    void ensureObjectState(TweqInstance &tw) {
+        if (!mObjectStates || tw.hasObjectState) return;
+        tw.hasObjectState = true;
+        // Write base transform so the object stays in place
+        Matrix4 baseMat = glm::translate(Matrix4(1.0f), tw.base.position)
+                        * tw.base.rotation
+                        * glm::scale(Matrix4(1.0f), tw.base.scale);
+        applyModelMatrix(*mObjectStates, tw.objID, baseMat,
+                         tw.base.position, tw.base.scale);
+    }
+
     int processFlickerTweq(TweqInstance &tw, float dt_ms) {
         tw.elapsedMs += dt_ms;
 
@@ -545,6 +560,7 @@ private:
             // Toggle visibility
             tw.flickerHidden = !tw.flickerHidden;
             if (mObjectStates) {
+                ensureObjectState(tw);
                 ObjectState &os = mObjectStates->get(tw.objID);
                 if (tw.flickerHidden)
                     os.flags |= kObjStateHidden;
@@ -601,6 +617,7 @@ private:
         if (result == kTweqStatusQuo || result == kTweqFrameEvent) {
             int frame = std::clamp(static_cast<int>(tw.curFrame), 0, tw.modelCount - 1);
             if (mObjectStates && tw.modelNames[frame][0] != '\0') {
+                ensureObjectState(tw);
                 ObjectState &os = mObjectStates->get(tw.objID);
                 os.modelNameOverride = std::string(tw.modelNames[frame],
                     strnlen(tw.modelNames[frame], 16));
