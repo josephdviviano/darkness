@@ -31,6 +31,7 @@
 #include <chrono>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <unistd.h> // dup2, fileno
 
@@ -124,7 +125,6 @@ static void printHelp() {
         "  --no-cull      Start with portal culling disabled (see all geometry).\n"
         "  --collision    Start with camera collision enabled (clip to world).\n"
         "  --filter       Start with bilinear texture filtering (default: point/crispy).\n"
-        "  --force-flicker Force all animated lights to flicker mode (debug).\n"
         "  --linear-mips  Gamma-correct mipmap generation (sRGB linearization).\n"
         "  --sharp-mips   Sharpen mip levels to preserve detail at distance.\n"
         "  --physics-rate <hz>\n"
@@ -875,6 +875,16 @@ static void registerConsoleSettings(
         [&state](bool v) { state.showAcousticMesh = v; },
         "Cyan wireframe overlay of the acoustic scene geometry");
 
+    dbgConsole.addBool("debug_anim_lightmaps",
+        [&state]() { return state.debugAnimLightmaps; },
+        [&state](bool v) { state.debugAnimLightmaps = v; },
+        "Tint animated lightmap polygons magenta for visibility");
+
+    dbgConsole.addBool("force_flicker",
+        [&state]() { return state.forceFlicker; },
+        [&state](bool v) { state.forceFlicker = v; },
+        "Override all animated lights to flicker mode");
+
     // Model isolation: "all" = show everything, then one entry per loaded model name.
     // sortedModelNames is populated during init before this registration runs.
     {
@@ -1404,11 +1414,54 @@ static void updateMovement(
 // ── Animated lightmap update ──
 // Advance all light animation timers and re-blend changed lightmaps into
 // the atlas CPU buffer, then upload the updated atlas to the GPU.
+// debugTint: tint animated lightmap polygons magenta for visibility.
+// forceFlicker: override all lights to flicker mode (saved/restored on toggle).
 static void updateLightmaps(
     float dt, const Darkness::BuiltMeshes &meshes,
-    Darkness::MissionData &mission, Darkness::GPUResources &gpu)
+    Darkness::MissionData &mission, Darkness::GPUResources &gpu,
+    bool debugTint = false, bool forceFlicker = false)
 {
     if (!meshes.lightmappedMode || gpu.lmAtlasSet.atlases.empty()) return;
+
+    // Track debug mode transitions so we can force a full re-blend
+    static bool prevDebugTint = false;
+    bool debugChanged = (debugTint != prevDebugTint);
+    prevDebugTint = debugTint;
+
+    // Handle force-flicker toggle: save/restore original light parameters
+    static bool prevForceFlicker = false;
+    static std::unordered_map<int16_t, Darkness::LightSource> savedLights;
+    if (forceFlicker && !prevForceFlicker) {
+        // Save original light state and override to flicker
+        savedLights.clear();
+        for (auto &[num, ls] : mission.lightSources) {
+            savedLights[num] = ls;
+            ls.mode = Darkness::ANIM_FLICKER;
+            ls.inactive = false;
+            ls.minBright = 0.0f;
+            ls.maxBright = std::max(ls.maxBright, 1.0f);
+            ls.brightenTime = 0.15f;
+            ls.dimTime = 0.15f;
+            ls.brightness = ls.maxBright;
+            ls.countdown = 0.1f;
+            ls.isRising = false;
+            ls.prevIntensity = -1.0f;
+        }
+        debugChanged = true; // force full re-blend
+        std::fprintf(stderr, "Force-flicker: ON (%zu lights)\n",
+                     mission.lightSources.size());
+    } else if (!forceFlicker && prevForceFlicker) {
+        // Restore original light state
+        for (auto &[num, ls] : mission.lightSources) {
+            auto it = savedLights.find(num);
+            if (it != savedLights.end()) ls = it->second;
+            ls.prevIntensity = -1.0f;
+        }
+        savedLights.clear();
+        debugChanged = true; // force full re-blend
+        std::fprintf(stderr, "Force-flicker: OFF (restored original modes)\n");
+    }
+    prevForceFlicker = forceFlicker;
 
     bool anyLightChanged = false;
     std::unordered_map<int16_t, float> currentIntensities;
@@ -1421,35 +1474,66 @@ static void updateLightmaps(
         if (changed) anyLightChanged = true;
     }
 
+    // Force full re-blend when debug mode toggles
+    bool forceAll = debugChanged;
+
     // Re-blend changed lightmaps into atlas CPU buffer, tracking dirty region
-    if (anyLightChanged) {
+    if (anyLightChanged || forceAll) {
         const auto &atlas = gpu.lmAtlasSet.atlases[0];
         int dirtyX0 = atlas.size, dirtyY0 = atlas.size;
         int dirtyX1 = 0, dirtyY1 = 0;
 
-        for (auto &[lightNum, light] : mission.lightSources) {
-            float intensity = currentIntensities[lightNum];
-            if (std::abs(intensity - light.prevIntensity) < 0.002f) continue;
-            light.prevIntensity = intensity;
+        if (forceAll) {
+            // Re-blend ALL animated polygons (debug toggle or first frame)
+            std::unordered_set<uint64_t> visited;
+            for (const auto &[lightNum, polys] : mission.animLightIndex) {
+                for (const auto &[ci, pi] : polys) {
+                    uint64_t key = (static_cast<uint64_t>(ci) << 32)
+                                 | static_cast<uint32_t>(pi);
+                    if (!visited.insert(key).second) continue;
 
-            auto it = mission.animLightIndex.find(lightNum);
-            if (it == mission.animLightIndex.end()) continue;
+                    const auto &entry = gpu.lmAtlasSet.entries[ci][pi];
+                    Darkness::blendAnimatedLightmap(
+                        gpu.lmAtlasSet.atlases[0], mission.wrData, ci, pi,
+                        entry, currentIntensities, debugTint);
 
-            for (auto &[ci, pi] : it->second) {
-                const auto &entry = gpu.lmAtlasSet.entries[ci][pi];
-                Darkness::blendAnimatedLightmap(
-                    gpu.lmAtlasSet.atlases[0], mission.wrData, ci, pi,
-                    entry, currentIntensities);
+                    int x0 = std::max(0, entry.pixelX - 2);
+                    int y0 = std::max(0, entry.pixelY - 2);
+                    int x1 = std::min(atlas.size, entry.pixelX + entry.pixelW + 2);
+                    int y1 = std::min(atlas.size, entry.pixelY + entry.pixelH + 2);
+                    dirtyX0 = std::min(dirtyX0, x0);
+                    dirtyY0 = std::min(dirtyY0, y0);
+                    dirtyX1 = std::max(dirtyX1, x1);
+                    dirtyY1 = std::max(dirtyY1, y1);
+                }
+            }
+            // Reset prevIntensity so subsequent frames don't skip updates
+            for (auto &[ln, light] : mission.lightSources)
+                light.prevIntensity = -1.0f;
+        } else {
+            for (auto &[lightNum, light] : mission.lightSources) {
+                float intensity = currentIntensities[lightNum];
+                if (std::abs(intensity - light.prevIntensity) < 0.002f) continue;
+                light.prevIntensity = intensity;
 
-                // Expand dirty region to include this lightmap + its 2px padding
-                int x0 = std::max(0, entry.pixelX - 2);
-                int y0 = std::max(0, entry.pixelY - 2);
-                int x1 = std::min(atlas.size, entry.pixelX + entry.pixelW + 2);
-                int y1 = std::min(atlas.size, entry.pixelY + entry.pixelH + 2);
-                dirtyX0 = std::min(dirtyX0, x0);
-                dirtyY0 = std::min(dirtyY0, y0);
-                dirtyX1 = std::max(dirtyX1, x1);
-                dirtyY1 = std::max(dirtyY1, y1);
+                auto it = mission.animLightIndex.find(lightNum);
+                if (it == mission.animLightIndex.end()) continue;
+
+                for (auto &[ci, pi] : it->second) {
+                    const auto &entry = gpu.lmAtlasSet.entries[ci][pi];
+                    Darkness::blendAnimatedLightmap(
+                        gpu.lmAtlasSet.atlases[0], mission.wrData, ci, pi,
+                        entry, currentIntensities, debugTint);
+
+                    int x0 = std::max(0, entry.pixelX - 2);
+                    int y0 = std::max(0, entry.pixelY - 2);
+                    int x1 = std::min(atlas.size, entry.pixelX + entry.pixelW + 2);
+                    int y1 = std::min(atlas.size, entry.pixelY + entry.pixelH + 2);
+                    dirtyX0 = std::min(dirtyX0, x0);
+                    dirtyY0 = std::min(dirtyY0, y0);
+                    dirtyX1 = std::max(dirtyX1, x1);
+                    dirtyY1 = std::max(dirtyY1, y1);
+                }
             }
         }
 
@@ -1693,7 +1777,7 @@ int main(int argc, char *argv[]) {
     auto worldQuery = initServiceStack(misPath, scriptsDir);
 
     // ── Load mission data: WR geometry, portals, spawn, lights, sky, fog, flow ──
-    if (!loadMissionData(misPath, cfg.forceFlicker, mission))
+    if (!loadMissionData(misPath, mission))
         return 1;
 
     // Create physics world from parsed WR cell geometry.
@@ -2714,7 +2798,8 @@ int main(int argc, char *argv[]) {
                 return;
             }
 
-            updateLightmaps(dt, meshes, mission, gpu);
+            updateLightmaps(dt, meshes, mission, gpu,
+                            state.debugAnimLightmaps, state.forceFlicker);
 
             // ── Prepare frame: matrices, fog, samplers, culling ──
             auto fc = prepareFrame(state, mission);
