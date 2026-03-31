@@ -784,10 +784,15 @@ private:
                 // fixed. Different flame model variants have different bbox
                 // heights, so without this the flame bobs up and down.
                 // Matches Dark Engine get_anchor/finalize_anchor logic.
-                if ((tw.cfgMisc & kTweqMiscAnchor) && mParsedModels) {
+                if ((tw.cfgMisc & kTweqMiscAnchor) && mParsedModels
+                    && !os.modelNameOverride.empty()) {
+                    // Only compensate when swapping between known models.
+                    // Skip on first swap (empty→model) to avoid bogus offset.
                     float oldAnchorZ = getModelBBoxBottomZ(os.modelNameOverride);
                     float newAnchorZ = getModelBBoxBottomZ(newModelName);
-                    os.position.z += (oldAnchorZ - newAnchorZ);
+                    if (oldAnchorZ != 0.0f || newAnchorZ != 0.0f) {
+                        os.position.z += (oldAnchorZ - newAnchorZ);
+                    }
                 }
 
                 os.modelNameOverride = std::move(newModelName);
