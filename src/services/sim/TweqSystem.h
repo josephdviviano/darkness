@@ -260,15 +260,16 @@ public:
                 break;
             }
 
-            // Log first 3 frames per tweq for debugging
-            if (tw.logFrames < 3) {
+            // Log first 5 frames per tweq for debugging
+            if (tw.logFrames < 5) {
                 const ObjectState *os = mObjectStates ? mObjectStates->tryGet(tw.objID) : nullptr;
                 std::fprintf(stderr, "[TWEQ] obj=%d type=%s frame=%d "
-                             "val=(%.1f,%.1f,%.1f) elapsed=%.0fms "
+                             "val=(%.1f,%.1f,%.1f) elapsed=%.0fms curFrame=%d "
                              "hidden=%d hasAnimLight=%d result=%d",
                              tw.objID, typeName, tw.logFrames,
                              tw.values[0], tw.values[1], tw.values[2],
-                             tw.elapsedMs, tw.flickerHidden ? 1 : 0,
+                             tw.elapsedMs, (int)tw.curFrame,
+                             tw.flickerHidden ? 1 : 0,
                              tw.hasAnimLight ? 1 : 0, result);
                 if (os) {
                     std::fprintf(stderr, " OS: pos=(%.1f,%.1f,%.1f) "
@@ -420,6 +421,19 @@ private:
                 tw.values[0] = static_cast<float>(placement.bank)    * kAngScale * kRadToDeg;
                 tw.values[1] = static_cast<float>(placement.pitch)   * kAngScale * kRadToDeg;
                 tw.values[2] = static_cast<float>(placement.heading) * kAngScale * kRadToDeg;
+            }
+
+            // Log Models tweq config at init for debugging
+            if (tweqType == kTweqTypeModels) {
+                std::fprintf(stderr, "  TweqModels obj=%d: rate=%dms models=[",
+                             objID, tw.cfgRate);
+                for (int i = 0; i < 6; ++i) {
+                    if (tw.modelNames[i][0] != '\0')
+                        std::fprintf(stderr, "'%s'%s", tw.modelNames[i],
+                                     i < 5 && tw.modelNames[i+1][0] != '\0' ? "," : "");
+                }
+                std::fprintf(stderr, "] count=%d anim=0x%02x halt=%d active=%d\n",
+                             tw.modelCount, tw.cfgAnim, tw.cfgHalt, tw.active ? 1 : 0);
             }
 
             mTweqs[tweqKey(objID, tweqType)] = std::move(tw);
@@ -709,7 +723,11 @@ private:
         // Duration per model frame (rate + 1 ms, matching Dark Engine)
         float duration = static_cast<float>(tw.cfgRate + 1);
 
-        while (result == kTweqStatusQuo && tw.elapsedMs >= duration) {
+        // Process elapsed time. Continue on kTweqHaltContinue (3) because
+        // bounce/wrap returns it but the tweq should keep running.
+        while ((result == kTweqStatusQuo || result == static_cast<int>(kTweqHaltContinue))
+               && tw.elapsedMs >= duration) {
+            result = kTweqStatusQuo;  // reset for next iteration
             tw.elapsedMs -= duration;
 
             bool isReverse = (tw.axisState[0] & kTweqStateReverse) != 0;
@@ -733,8 +751,11 @@ private:
             }
         }
 
-        // Apply model name override
-        if (result == kTweqStatusQuo || result == kTweqFrameEvent) {
+        // Always apply the model name override for the current frame, regardless
+        // of halt result. The halt action controls whether the tweq continues
+        // running — but the current frame's model should always be displayed.
+        // (kTweqHaltContinue from a bounce was skipping this, causing stale models.)
+        {
             int frame = std::clamp(static_cast<int>(tw.curFrame), 0, tw.modelCount - 1);
             if (mObjectStates && tw.modelNames[frame][0] != '\0') {
                 ensureObjectState(tw);
