@@ -103,6 +103,7 @@ struct TweqInstance {
     int16_t   curFrame = 0;      // for Models tweq
     bool      flickerHidden = false;  // current flicker visibility state
     bool      hasAnimLight = false;  // object has AnimLight — flicker controls light, not visibility
+    int       logFrames = 0;       // diagnostic: frame counter for per-tweq logging
 
     // Base transform snapshot
     SimTransform base;
@@ -120,6 +121,36 @@ using TweqEventCallback = std::function<void(int32_t objID, eTweqType type,
 class TweqSystem : public SimListener {
 public:
     TweqSystem() : mRng(std::random_device{}()) {}
+
+    // ── Pre-init: collect model names for asset loading ──
+
+    /// Scan all positioned objects for CfgTweqMo properties and collect the
+    /// model names they reference. Called BEFORE loadObjectAssets so variant
+    /// models (flame3c, etc.) are loaded and have GPU buffers.
+    /// Scan all objects with CfgTweqMo (Models tweq config) and collect the
+    /// model names they reference. Uses property inheritance so archetype
+    /// configs are found for all concrete objects.
+    static std::vector<std::string> collectModelNames(PropertyService *propSvc) {
+        std::vector<std::string> names;
+        if (!propSvc) return names;
+        // Get all objects (including archetypes) that have CfgTweqMo
+        auto ids = getAllObjectsWithProperty(propSvc, "CfgTweqMo");
+        for (int id : ids) {
+            PropCfgTweqModels cfg;
+            if (!getTypedProperty<PropCfgTweqModels>(propSvc, "CfgTweqMo", id, cfg))
+                continue;
+            for (int i = 0; i < 6; ++i) {
+                if (cfg.modelName[i][0] != '\0') {
+                    names.emplace_back(cfg.modelName[i],
+                        strnlen(cfg.modelName[i], 16));
+                }
+            }
+        }
+        // Deduplicate
+        std::sort(names.begin(), names.end());
+        names.erase(std::unique(names.begin(), names.end()), names.end());
+        return names;
+    }
 
     // ── Initialization ──
 
@@ -192,6 +223,7 @@ public:
     void simStep(float simTime, float delta) override {
         if (delta <= 0.0f) return;
         float dt_ms = delta * 1000.0f;
+        ++mFrameCount;
 
         // Collect objects that need transform updates (may have multiple tweqs)
         mDirtyObjects.clear();
@@ -200,24 +232,68 @@ public:
             if (!tw.active) continue;
 
             int result = kTweqStatusQuo;
+            const char *typeName = "?";
 
             switch (tw.type) {
             case kTweqTypeRotate:
+                typeName = "Rotate";
+                result = processVectorTweq(tw, dt_ms);
+                mDirtyObjects.insert(tw.objID);
+                break;
             case kTweqTypeScale:
+                typeName = "Scale";
                 result = processVectorTweq(tw, dt_ms);
                 mDirtyObjects.insert(tw.objID);
                 break;
 
             case kTweqTypeFlicker:
+                typeName = "Flicker";
                 result = processFlickerTweq(tw, dt_ms);
                 break;
 
             case kTweqTypeModels:
+                typeName = "Models";
                 result = processModelsTweq(tw, dt_ms);
                 break;
 
             default:
                 break;
+            }
+
+            // Log first 3 frames per tweq for debugging
+            if (tw.logFrames < 3) {
+                const ObjectState *os = mObjectStates ? mObjectStates->tryGet(tw.objID) : nullptr;
+                std::fprintf(stderr, "[TWEQ] obj=%d type=%s frame=%d "
+                             "val=(%.1f,%.1f,%.1f) elapsed=%.0fms "
+                             "hidden=%d hasAnimLight=%d result=%d",
+                             tw.objID, typeName, tw.logFrames,
+                             tw.values[0], tw.values[1], tw.values[2],
+                             tw.elapsedMs, tw.flickerHidden ? 1 : 0,
+                             tw.hasAnimLight ? 1 : 0, result);
+                if (os) {
+                    std::fprintf(stderr, " OS: pos=(%.1f,%.1f,%.1f) "
+                                 "h=%.3f p=%.3f b=%.3f "
+                                 "hasMtx=%d flags=0x%x model='%s'",
+                                 os->position.x, os->position.y, os->position.z,
+                                 os->heading, os->pitch, os->bank,
+                                 os->hasMatrix ? 1 : 0, os->flags,
+                                 os->modelNameOverride.c_str());
+                } else {
+                    std::fprintf(stderr, " OS: (none)");
+                }
+                // Also log the static placement for comparison
+                if (mPlacements) {
+                    auto pit = mPlacements->find(tw.objID);
+                    if (pit != mPlacements->end()) {
+                        const auto &pl = pit->second;
+                        std::fprintf(stderr, " PL: pos=(%.1f,%.1f,%.1f) "
+                                     "h=%d p=%d b=%d",
+                                     pl.x, pl.y, pl.z,
+                                     pl.heading, pl.pitch, pl.bank);
+                    }
+                }
+                std::fprintf(stderr, "\n");
+                ++tw.logFrames;
             }
 
             if (result != kTweqStatusQuo && result != kTweqFrameEvent) {
@@ -241,6 +317,23 @@ public:
 
     const std::unordered_map<uint64_t, TweqInstance> &getTweqs() const { return mTweqs; }
     size_t count() const { return mTweqs.size(); }
+
+    /// Collect all model names referenced by Models tweqs (for pre-loading).
+    /// Returns names that may not be in the static uniqueModels set.
+    std::vector<std::string> getReferencedModelNames() const {
+        std::vector<std::string> names;
+        for (const auto &[key, tw] : mTweqs) {
+            if (tw.type == kTweqTypeModels) {
+                for (int i = 0; i < 6; ++i) {
+                    if (tw.modelNames[i][0] != '\0') {
+                        names.emplace_back(tw.modelNames[i],
+                            strnlen(tw.modelNames[i], 16));
+                    }
+                }
+            }
+        }
+        return names;
+    }
 
     /// Inject a tweq instance and set the object state map (for unit tests).
     void injectForTest(const TweqInstance &tw, ObjectStateMap *states) {
@@ -780,6 +873,7 @@ private:
     const std::unordered_map<int32_t, ObjPlacementInfo> *mPlacements = nullptr;
     TweqEventCallback mEventCallback;
     std::mt19937 mRng;
+    uint32_t mFrameCount = 0;
 
     // Scratch set for per-frame dirty object tracking (avoids allocation per frame)
     std::unordered_set<int32_t> mDirtyObjects;
