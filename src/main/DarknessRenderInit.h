@@ -521,6 +521,8 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
                 auto binData = modelLoader.loadModel(name);
                 if (binData.empty()) {
                     ++failed;
+                    std::fprintf(stderr, "  model '%s': not found in obj.crf\n",
+                                 name.c_str());
                     continue;
                 }
                 try {
@@ -529,29 +531,27 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
                         mission.parsedModels[name] = std::move(mesh);
                         ++loaded;
                     } else {
-                        // Log first few failures for debugging
-                        if (failed < 5) {
-                            // Show magic header of failed file
-                            char hdr[5] = {};
-                            if (binData.size() >= 4)
-                                std::memcpy(hdr, binData.data(), 4);
-                            std::fprintf(stderr, "  model '%s': parse failed "
-                                         "(size=%zu, magic='%s')\n",
-                                         name.c_str(), binData.size(), hdr);
-                        }
+                        char hdr[5] = {};
+                        if (binData.size() >= 4)
+                            std::memcpy(hdr, binData.data(), 4);
+                        std::fprintf(stderr, "  model '%s': parse failed "
+                                     "(size=%zu, magic='%s')\n",
+                                     name.c_str(), binData.size(), hdr);
                         ++failed;
                     }
                 } catch (const std::exception &e) {
-                    // Some .bin files may be AI meshes (LGMM) or corrupt
-                    if (failed < 5) {
-                        std::fprintf(stderr, "  model '%s': exception: %s\n",
-                                     name.c_str(), e.what());
-                    }
+                    std::fprintf(stderr, "  model '%s': exception: %s\n",
+                                 name.c_str(), e.what());
                     ++failed;
                 }
             }
-            std::fprintf(stderr, "Loaded %d/%zu models from obj.crf (%d failed)\n",
-                         loaded, mission.objData.uniqueModels.size(), failed);
+            std::fprintf(stderr, "Loaded %d/%zu models from obj.crf\n",
+                         loaded, mission.objData.uniqueModels.size());
+            if (failed > 0) {
+                std::fprintf(stderr, "FATAL: %d models failed to load from obj.crf. "
+                             "Cannot continue with missing assets.\n", failed);
+                std::exit(1);
+            }
         } else {
             std::fprintf(stderr, "obj.crf not available, using fallback cubes\n");
         }
@@ -580,17 +580,28 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
         Darkness::CRFTextureLoader objTexLoader(resPath, "obj.crf");
 
         int loaded = 0;
+        std::vector<std::string> failedTextures;
         for (const auto &name : objMatNames) {
             if (!objTexLoader.isOpen()) break;
             auto img = objTexLoader.loadObjectTexture(name);
-            // Check if we got a real texture (not the 8x8 fallback checkerboard)
             if (img.width > 8 || img.height > 8) {
                 mission.objTexImages[name] = std::move(img);
                 ++loaded;
+            } else {
+                failedTextures.push_back(name);
+                std::fprintf(stderr, "  FATAL: obj texture '%s' not found in "
+                             "obj.crf (txt16/ and txt/ searched)\n",
+                             name.c_str());
             }
         }
         std::fprintf(stderr, "Loaded %d/%zu object textures from obj.crf\n",
                      loaded, objMatNames.size());
+        if (!failedTextures.empty()) {
+            std::fprintf(stderr, "FATAL: %zu object textures failed to load. "
+                         "Cannot continue with missing assets.\n",
+                         failedTextures.size());
+            std::exit(1);
+        }
     }
 }
 
