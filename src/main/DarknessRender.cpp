@@ -2319,27 +2319,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // ── Collect tweq model names before loading assets ──
-    // Models tweqs reference variant .bin models (flame3c, newt02, etc.) that
-    // aren't in the static object placement list. Add them to uniqueModels
-    // so loadObjectAssets loads and creates GPU buffers for them.
-    {
-        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
-        auto tweqModelNames = Darkness::TweqSystem::collectModelNames(propSvc.get());
-        if (!tweqModelNames.empty()) {
-            for (const auto &name : tweqModelNames) {
-                mission.objData.uniqueModels.push_back(name);
-            }
-            // Deduplicate
-            std::sort(mission.objData.uniqueModels.begin(), mission.objData.uniqueModels.end());
-            mission.objData.uniqueModels.erase(
-                std::unique(mission.objData.uniqueModels.begin(), mission.objData.uniqueModels.end()),
-                mission.objData.uniqueModels.end());
-            std::fprintf(stderr, "TweqSystem: added %zu model variants for pre-loading\n",
-                         tweqModelNames.size());
-        }
-    }
-
     // ── Load object assets: properties, .bin models, textures from obj.crf ──
     loadObjectAssets(misPath, resPath, cfg, mission, state);
 

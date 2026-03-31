@@ -439,6 +439,22 @@ private:
 
             // Log Models tweq config at init for debugging
             if (tweqType == kTweqTypeModels) {
+                // Dump raw property bytes to verify struct alignment
+                size_t rawSz = 0;
+                const uint8_t *raw = getPropertyRawData(propSvc, cfgPropName, objID, rawSz);
+                if (raw && rawSz >= 8) {
+                    std::fprintf(stderr, "  TweqModels obj=%d RAW[%zu]: hdr=%02x %02x %02x %02x %04x %04x names=",
+                                 objID, rawSz, raw[0], raw[1], raw[2], raw[3],
+                                 *reinterpret_cast<const uint16_t*>(raw+4),
+                                 *reinterpret_cast<const uint16_t*>(raw+6));
+                    // Print each 16-byte model name slot
+                    for (int s = 0; s < 6 && (8 + s*16) < (int)rawSz; ++s) {
+                        char name[17] = {};
+                        std::memcpy(name, raw + 8 + s*16, 16);
+                        std::fprintf(stderr, "[%d]='%s' ", s, name);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
                 std::fprintf(stderr, "  TweqModels obj=%d: staticModel='%.16s' rate=%dms models=[",
                              objID, placement.modelName, tw.cfgRate);
                 for (int i = 0; i < 6; ++i) {
@@ -795,6 +811,17 @@ private:
                     }
                 }
 
+                // Log model swap with GPU lookup check
+                if (tw.logFrames < 8 && mParsedModels) {
+                    bool parsed = mParsedModels->count(newModelName) > 0;
+                    std::fprintf(stderr, "[TWEQ_MODEL] obj=%d swap '%s' -> '%s' "
+                                 "parsed=%d pos.z=%.2f\n",
+                                 tw.objID,
+                                 os.modelNameOverride.c_str(),
+                                 newModelName.c_str(),
+                                 parsed ? 1 : 0,
+                                 os.position.z);
+                }
                 os.modelNameOverride = std::move(newModelName);
             }
         }

@@ -23,6 +23,9 @@
 
 #pragma once
 
+#include <unordered_set>
+#include "sim/TweqSystem.h"
+
 // ── Initialize service stack and load mission database ──
 // Creates the ServiceManager with all 12 services, registers property/relation
 // schemas from PLDef/DType files, loads the mission database (.gam + .mis),
@@ -198,7 +201,7 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
 // ── Load mission data from .mis file ──
 // Parses WR geometry, portal graph, spawn point, animated lights, sky/fog/flow
 // parameters, and extracts mission base name. Returns false if WR parse fails.
-static bool loadMissionData(const char *misPath, bool forceFlicker,
+static bool loadMissionData(const char *misPath,
                             Darkness::MissionData &mission)
 {
     // Extract mission base name (e.g. "miss6" from "path/to/miss6.mis")
@@ -257,23 +260,6 @@ static bool loadMissionData(const char *misPath, bool forceFlicker,
             ls.prevIntensity = 1.0f;
             mission.lightSources[kv.first] = ls;
         }
-    }
-
-    // Apply --force-flicker: override all lights to flicker mode for debugging
-    if (forceFlicker) {
-        for (auto &[num, ls] : mission.lightSources) {
-            ls.mode = Darkness::ANIM_FLICKER;
-            ls.inactive = false;
-            ls.minBright = 0.0f;
-            ls.maxBright = 1.0f;
-            ls.brightenTime = 0.15f;
-            ls.dimTime = 0.15f;
-            ls.brightness = ls.maxBright;
-            ls.countdown = 0.1f;
-            ls.isRising = false;
-        }
-        std::fprintf(stderr, "Force-flicker: all %zu lights set to flicker mode\n",
-                     mission.lightSources.size());
     }
 
     // Animated light diagnostics
@@ -500,6 +486,28 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
                 mission.objCellIDs[i] = findCameraCell(mission.wrData, obj.x, obj.y, obj.z);
             } else {
                 mission.objCellIDs[i] = -1;
+            }
+        }
+    }
+
+    // Collect additional model names from Models tweqs (flame variants, etc.)
+    // before loading .bin files, so they get parsed AND get GPU buffers.
+    {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        auto tweqModels = Darkness::TweqSystem::collectModelNames(propSvc.get());
+        if (!tweqModels.empty()) {
+            int added = 0;
+            std::unordered_set<std::string> existing(
+                mission.objData.uniqueModels.begin(),
+                mission.objData.uniqueModels.end());
+            for (const auto &name : tweqModels) {
+                if (!existing.count(name)) {
+                    mission.objData.uniqueModels.push_back(name);
+                    ++added;
+                }
+            }
+            if (added > 0) {
+                std::fprintf(stderr, "TweqSystem: added %d model variants for loading\n", added);
             }
         }
     }
