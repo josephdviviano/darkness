@@ -128,15 +128,17 @@ public:
         mObjectStates = objectStates;
         mPlacements = placements;
 
-        // Scan for each tweq type
+        // Scan for each tweq type. Property names are chunk names from the pldef
+        // (e.g., "CfgTweqRo"), NOT labels (e.g., "TweqRotateConfig") — the
+        // PropertyService registers by chunk name.
         initTweqsOfType<PropCfgTweqVector, PropStTweqVector>(
-            propSvc, "TweqRotateConfig", "TweqRotateState", kTweqTypeRotate);
+            propSvc, "CfgTweqRo", "StTweqRot", kTweqTypeRotate);
         initTweqsOfType<PropCfgTweqVector, PropStTweqVector>(
-            propSvc, "TweqScaleConfig", "TweqScaleState", kTweqTypeScale);
+            propSvc, "CfgTweqSc", "StTweqSca", kTweqTypeScale);
         initTweqsOfType<PropCfgTweqSimple, PropStTweqSimple>(
-            propSvc, "TweqFlickerConfig", "TweqFlickerState", kTweqTypeFlicker);
+            propSvc, "CfgTweqBl", "StTweqBli", kTweqTypeFlicker);
         initTweqsOfType<PropCfgTweqModels, PropStTweqSimple>(
-            propSvc, "TweqModelsConfig", "TweqModelsState", kTweqTypeModels);
+            propSvc, "CfgTweqMo", "StTweqMod", kTweqTypeModels);
 
         // Count by type for diagnostics
         int counts[8] = {};
