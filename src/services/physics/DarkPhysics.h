@@ -724,13 +724,12 @@ public:
                 // Attach geom to body
                 dGeomSetBody(geom, odeBody);
 
-                // Store scale for sync (scale doesn't change but we need it for matrix)
-                // Derive from ObjectCollisionBody's edgeLengths vs unit box... actually
-                // the collision body already has the scaled dimensions baked in. The
-                // model matrix for rendering needs the original object scale from placement.
-                // For now, use 1.0 — updateBodyTransform strips scale from the rotation.
-                mODEScales[body.objID] = Vector3(1.0f);
+                // Start all dynamic bodies as sleeping. Without WR floor
+                // geometry in ODE, awake bodies would fall through the world.
+                // Bodies wake when disturbed (player push, object collision).
+                dBodyDisable(odeBody);
 
+                mODEScales[body.objID] = Vector3(1.0f);
                 mODEBodies[body.objID] = odeBody;
                 ++dynamicCount;
             } else {
