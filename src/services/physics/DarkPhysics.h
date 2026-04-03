@@ -45,6 +45,8 @@
 #include <memory>
 #include <unordered_map>
 
+#include <ode/ode.h>
+
 #include "IPhysicsWorld.h"
 #include "CollisionGeometry.h"
 #include "ObjectCollisionGeometry.h"
@@ -67,18 +69,42 @@ public:
         , mPlayer(mCollision, ts)
         , mGravity(0.0f, 0.0f, -GRAVITY)
     {
+        initODE();
     }
 
-    ~DarkPhysics() override = default;
+    ~DarkPhysics() override {
+        shutdownODE();
+    }
 
     // ── World management ──
 
     void step(float dt) override {
-        // Step player physics
+        // Step player physics (custom 5-sphere constraint model)
         mPlayer.step(dt, mContactCb);
 
-        // TODO (Task 26): Step ODE world for non-player bodies
-        // dWorldQuickStep(mODEWorld, mPlayer.getTimestep().fixedDt);
+        // Sync player capsule position for ODE collision detection
+        if (mPlayerGeom) {
+            Vector3 pos = mPlayer.getPosition();
+            dGeomSetPosition(mPlayerGeom, pos.x, pos.y, pos.z);
+        }
+
+        // Step ODE world with fixed timestep accumulator (same rate as player physics)
+        if (mODEWorld) {
+            float fixedDt = mPlayer.getTimestep().fixedDt;
+            mODEAccum += dt;
+            int steps = 0;
+            while (mODEAccum >= fixedDt && steps < 10) {
+                dSpaceCollide(mODESpace, this, &odeNearCallback);
+                dWorldQuickStep(mODEWorld, fixedDt);
+                dJointGroupEmpty(mODEContacts);
+                mODEAccum -= fixedDt;
+                ++steps;
+            }
+            if (steps >= 10) mODEAccum = 0.0f;  // prevent spiral of death
+        }
+
+        // Update view punch spring
+        mPlayer.updateViewPunch(dt);
     }
 
     void addBody(EntityID id, const PhysicsBodyDesc &desc) override {
@@ -94,11 +120,9 @@ public:
 
     void setGravity(const Vector3 &g) override {
         mGravity = g;
-        // Update player gravity magnitude from Z component
-        // (Z-up: gravity is negative Z)
         mPlayer.setGravityMagnitude(std::fabs(g.z));
-
-        // TODO (Task 26): dWorldSetGravity(mODEWorld, g.x, g.y, g.z);
+        if (mODEWorld)
+            dWorldSetGravity(mODEWorld, g.x, g.y, g.z);
     }
 
     // ── Force / impulse ──
@@ -371,13 +395,219 @@ public:
     PlayerPhysics &getPlayerPhysics() { return mPlayer; }
 
 private:
+    // ── ODE initialization and shutdown ──
+
+    void initODE() {
+        static bool sODEInitialized = false;
+        if (!sODEInitialized) {
+            dInitODE2(0);
+            sODEInitialized = true;
+        }
+
+        mODEWorld = dWorldCreate();
+        mODESpace = dHashSpaceCreate(nullptr);
+        mODEContacts = dJointGroupCreate(0);
+
+        // World parameters — Z-up, matching Dark Engine gravity
+        dWorldSetGravity(mODEWorld, 0.0, 0.0, -GRAVITY);
+
+        // Solver parameters for stable stacking
+        dWorldSetERP(mODEWorld, 0.8);                     // stiff error correction
+        dWorldSetCFM(mODEWorld, 1e-4);                     // slight softness for stability
+        dWorldSetContactSurfaceLayer(mODEWorld, 0.001);    // 1mm penetration tolerance
+        dWorldSetQuickStepNumIterations(mODEWorld, 20);    // solver iterations
+
+        // Auto-sleep for stable resting contacts (critical for stacked crates)
+        dWorldSetAutoDisableFlag(mODEWorld, 1);
+        dWorldSetAutoDisableLinearThreshold(mODEWorld, 0.01);
+        dWorldSetAutoDisableAngularThreshold(mODEWorld, 0.01);
+        dWorldSetAutoDisableSteps(mODEWorld, 10);
+
+        // Damping — angular damping bleeds rotational energy so stacks
+        // settle quickly without locking rotation
+        dWorldSetLinearDamping(mODEWorld, 0.005);
+        dWorldSetAngularDamping(mODEWorld, 0.05);
+
+        std::fprintf(stderr, "ODE world created (gravity=%.1f, ERP=0.8, CFM=1e-4, "
+                     "angularDamping=0.05)\n", -GRAVITY);
+    }
+
+    void shutdownODE() {
+        // Destroy player geom
+        if (mPlayerGeom) { dGeomDestroy(mPlayerGeom); mPlayerGeom = nullptr; }
+
+        // Destroy all object geoms
+        for (auto &[id, geom] : mODEGeoms)
+            dGeomDestroy(geom);
+        mODEGeoms.clear();
+
+        // Destroy ODE world
+        if (mODEContacts) { dJointGroupDestroy(mODEContacts); mODEContacts = nullptr; }
+        if (mODESpace) { dSpaceDestroy(mODESpace); mODESpace = nullptr; }
+        if (mODEWorld) { dWorldDestroy(mODEWorld); mODEWorld = nullptr; }
+        dCloseODE();
+    }
+
+    // ── ODE collision callback ──
+
+    /// Maximum contact points per geom pair. 4 is sufficient for stable
+    /// box-on-box stacking; more contacts = more solver work.
+    static constexpr int MAX_ODE_CONTACTS = 4;
+
+    /// Sentinel value stored in player geom's dGeomSetData
+    static constexpr intptr_t PLAYER_GEOM_TAG = -999;
+
+    /// ODE near callback — called for each potentially colliding geom pair.
+    /// Creates temporary contact joints for overlapping bodies.
+    /// Detects player-vs-dynamic contacts and routes impulse to PlayerPhysics.
+    static void odeNearCallback(void *data, dGeomID o1, dGeomID o2) {
+        auto *self = static_cast<DarkPhysics *>(data);
+
+        // Skip space-space collisions (not used with flat hash space)
+        if (dGeomIsSpace(o1) || dGeomIsSpace(o2)) return;
+
+        // Check if either geom is the player
+        intptr_t tag1 = reinterpret_cast<intptr_t>(dGeomGetData(o1));
+        intptr_t tag2 = reinterpret_cast<intptr_t>(dGeomGetData(o2));
+        bool isPlayer1 = (tag1 == PLAYER_GEOM_TAG);
+        bool isPlayer2 = (tag2 == PLAYER_GEOM_TAG);
+
+        // Player-vs-static: skip (handled by custom PlayerPhysics collision)
+        if (isPlayer1 || isPlayer2) {
+            dGeomID otherGeom = isPlayer1 ? o2 : o1;
+            dBodyID dynBody = dGeomGetBody(otherGeom);
+            if (!dynBody) return;  // static geom — custom system handles it
+
+            // Player-vs-dynamic: extract hit reaction (Task 61 will add dynamic bodies)
+            self->handlePlayerDynamicContact(otherGeom, dynBody);
+            return;
+        }
+
+        // Normal object-vs-object collision
+        dBodyID b1 = dGeomGetBody(o1);
+        dBodyID b2 = dGeomGetBody(o2);
+
+        // Skip if both are static (no dynamics to solve)
+        if (!b1 && !b2) return;
+
+        // Generate contact points
+        dContact contacts[MAX_ODE_CONTACTS];
+        int numContacts = dCollide(o1, o2, MAX_ODE_CONTACTS,
+                                    &contacts[0].geom, sizeof(dContact));
+
+        for (int i = 0; i < numContacts; ++i) {
+            contacts[i].surface.mode = dContactBounce | dContactApprox1;
+            contacts[i].surface.mu = 0.8;             // friction coefficient
+            contacts[i].surface.bounce = 0.1;          // low bounce for heavy objects
+            contacts[i].surface.bounce_vel = 0.1;      // minimum velocity for bounce
+
+            dJointID joint = dJointCreateContact(
+                self->mODEWorld, self->mODEContacts, &contacts[i]);
+            dJointAttach(joint, b1, b2);
+        }
+    }
+
+    /// Handle player-vs-dynamic-object contact: apply knockback impulse
+    /// and direction-aware view punch to PlayerPhysics.
+    void handlePlayerDynamicContact(dGeomID otherGeom, dBodyID dynBody) {
+        const dReal *vel = dBodyGetLinearVel(dynBody);
+        Vector3 objVel(static_cast<float>(vel[0]),
+                       static_cast<float>(vel[1]),
+                       static_cast<float>(vel[2]));
+        float speed = glm::length(objVel);
+        if (speed < 1.0f) return;  // below threshold, no hit reaction
+
+        // Knockback impulse scaled by object mass and speed
+        dMass mass;
+        dBodyGetMass(dynBody, &mass);
+        float impulseScale = static_cast<float>(mass.mass) * speed * 0.01f;
+        Vector3 knockDir = glm::normalize(objVel);
+
+        // Apply velocity impulse to player
+        mPlayer.applyImpulse(knockDir * impulseScale);
+
+        // Direction-aware view punch (Source Engine style)
+        // Decompose hit direction into pitch (forward) and roll (side)
+        Vector3 forward = mPlayer.getForward();
+        Vector3 right = mPlayer.getRight();
+        float sideDot = glm::dot(knockDir, right);
+        float fwdDot = glm::dot(knockDir, forward);
+        float punchMag = impulseScale * 20.0f;
+        mPlayer.addViewPunch(Vector3(
+            fwdDot * punchMag,     // pitch
+            0.0f,                   // yaw (minimal)
+            sideDot * punchMag      // roll
+        ));
+    }
+
+    // ── ODE static geometry creation ──
+
+    /// Convert GLM column-major mat3 to ODE row-major dMatrix3 (3×4 array).
+    static void glmMat3ToODE(const glm::mat3 &m, dMatrix3 R) {
+        R[0] = m[0][0]; R[1] = m[1][0]; R[2]  = m[2][0]; R[3]  = 0;
+        R[4] = m[0][1]; R[5] = m[1][1]; R[6]  = m[2][1]; R[7]  = 0;
+        R[8] = m[0][2]; R[9] = m[1][2]; R[10] = m[2][2]; R[11] = 0;
+    }
+
+public:
+    /// Create ODE geoms for all static collision bodies. Called after
+    /// buildObjectCollision() has populated ObjectCollisionWorld.
+    void buildODEGeoms() {
+        if (!mObjectCollision || !mODESpace) return;
+
+        int staticCount = 0;
+        for (size_t i = 0; i < mObjectCollision->bodyCount(); ++i) {
+            const auto &body = mObjectCollision->getBody(i);
+            if (body.isEdgeTrigger) continue;  // sensor-only, no ODE geom
+            if (body.shapeType == CollisionShapeType::None) continue;
+
+            dGeomID geom = nullptr;
+            if (body.shapeType == CollisionShapeType::OBB) {
+                geom = dCreateBox(mODESpace,
+                    body.edgeLengths.x, body.edgeLengths.y, body.edgeLengths.z);
+            } else {
+                geom = dCreateSphere(mODESpace, body.sphereRadius);
+            }
+
+            dGeomSetPosition(geom, body.worldPos.x, body.worldPos.y, body.worldPos.z);
+            dMatrix3 R;
+            glmMat3ToODE(body.rotation, R);
+            dGeomSetRotation(geom, R);
+
+            // No dBody — static geom (infinite mass)
+            // Store objID for identification in nearCallback
+            dGeomSetData(geom, reinterpret_cast<void *>(
+                static_cast<intptr_t>(body.objID)));
+            mODEGeoms[body.objID] = geom;
+            ++staticCount;
+        }
+
+        // Create player kinematic capsule
+        // Height=6.0 (player height), radius=1.2 (HEAD/BODY sphere radius)
+        // ODE capsules are Z-aligned by default, matching Dark Engine Z-up
+        {
+            float radius = 1.2f;
+            float length = 6.0f - 2.0f * radius;  // capsule cylinder length
+            mPlayerGeom = dCreateCapsule(mODESpace, radius, length);
+            dGeomSetData(mPlayerGeom,
+                reinterpret_cast<void *>(static_cast<intptr_t>(PLAYER_GEOM_TAG)));
+
+            // Sync initial position
+            Vector3 pos = mPlayer.getPosition();
+            dGeomSetPosition(mPlayerGeom, pos.x, pos.y, pos.z);
+        }
+
+        std::fprintf(stderr, "ODE geoms: %d static + 1 player capsule\n", staticCount);
+    }
+
+private:
+    // ── Data members ──
+
     CollisionGeometry mCollision;    // world collision geometry from WR cells
 
     // Object collision world — built from .bin bounding boxes and P$PhysType.
-    // Owns all ObjectCollisionBody data and the cell→object broadphase map.
-    // Declared before mPlayer so it outlives the player's callback capture.
-    // ODE UPGRADE: Would coexist with dSpaceID — static objects remain as
-    // ObjectCollisionBodies for player collision, dynamic objects get dGeomIDs.
+    // Used for ALL player-vs-object collision (static and dynamic).
+    // Dynamic bodies sync ODE rotation back via updateBodyTransform() each frame.
     std::unique_ptr<ObjectCollisionWorld> mObjectCollision;
 
     PlayerPhysics mPlayer;           // custom player movement simulation
@@ -387,15 +617,16 @@ private:
     FootstepCallback mFootstepCb;    // footstep sound callback
     LandingCallback mLandingCb;      // landing impact sound callback
 
-    // Stored body descriptors for deferred ODE integration (Task 26)
+    // Stored body descriptors for deferred dynamic body creation (Task 61)
     std::unordered_map<EntityID, PhysicsBodyDesc> mBodyDescs;
 
-    // TODO (Task 26): ODE world state
-    // dWorldID mODEWorld = nullptr;
-    // dSpaceID mODESpace = nullptr;
-    // dJointGroupID mODEContacts = nullptr;
-    // std::unordered_map<EntityID, dBodyID> mODEBodies;
-    // std::unordered_map<EntityID, dGeomID> mODEGeoms;
+    // ── ODE world state ──
+    dWorldID       mODEWorld    = nullptr;
+    dSpaceID       mODESpace    = nullptr;
+    dJointGroupID  mODEContacts = nullptr;
+    std::unordered_map<int32_t, dGeomID> mODEGeoms;   // objID → static geom
+    dGeomID        mPlayerGeom  = nullptr;             // kinematic player capsule
+    float          mODEAccum    = 0.0f;               // fixed-timestep accumulator for ODE
 };
 
 } // namespace Darkness

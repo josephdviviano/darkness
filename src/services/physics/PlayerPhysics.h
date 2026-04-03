@@ -309,6 +309,45 @@ public:
     /// Linear velocity
     const Vector3 &getVelocity() const { return mVelocity; }
 
+    /// Forward direction (X-Y plane, from yaw). Z-up coordinate system.
+    Vector3 getForward() const {
+        return Vector3(mCosYaw, mSinYaw, 0.0f);
+    }
+
+    /// Right direction (X-Y plane, perpendicular to forward). Z-up.
+    Vector3 getRight() const {
+        return Vector3(mSinYaw, -mCosYaw, 0.0f);
+    }
+
+    /// Apply a velocity impulse to the player (knockback from object impacts).
+    void applyImpulse(const Vector3 &impulse) {
+        mVelocity += impulse;
+    }
+
+    // ── View punch — spring-driven camera kick from object impacts ──
+    //
+    // Source Engine style: angular velocity impulse decays via a critically
+    // damped spring. Produces a satisfying snap-then-settle when the player
+    // is hit by a fast-moving object.
+
+    /// Add angular velocity impulse to the view punch spring.
+    void addViewPunch(const Vector3 &angleVel) {
+        mPunchAngleVel += angleVel;
+    }
+
+    /// Update the view punch spring (called per frame, not per physics step).
+    void updateViewPunch(float dt) {
+        if (glm::length(mPunchAngle) < 1e-6f &&
+            glm::length(mPunchAngleVel) < 1e-6f) return;
+        float spring = std::min(PUNCH_SPRING * dt, 2.0f);
+        mPunchAngleVel -= mPunchAngle * spring;
+        mPunchAngleVel *= (1.0f - PUNCH_DAMPING * dt);
+        mPunchAngle += mPunchAngleVel * dt;
+    }
+
+    /// Get current view punch offset (pitch, yaw, roll in radians).
+    const Vector3 &getViewPunch() const { return mPunchAngle; }
+
     /// Current WR cell index (-1 if outside all cells)
     int32_t getCell() const { return mCellIdx; }
 
@@ -781,6 +820,14 @@ private:
     // ── Per-texture climbability table (indexed by TXLIST texture index, default 0.0) ──
     // Climbability boosts friction on steep surfaces — NOT a climb-mode trigger.
     std::vector<float> mClimbabilityTable;
+
+    // ── View punch spring (Source Engine style camera kick) ──
+    // Spring-driven angular offset from object impacts. Snaps away from
+    // the hit direction then settles back to zero.
+    static constexpr float PUNCH_DAMPING = 9.0f;
+    static constexpr float PUNCH_SPRING  = 65.0f;
+    Vector3 mPunchAngle{0.0f};      // current angular offset (pitch, yaw, roll)
+    Vector3 mPunchAngleVel{0.0f};   // angular velocity of the spring
 
     // ── Callbacks ──
     FootstepCallback mFootstepCb;            // footstep sound event (stride-based)
