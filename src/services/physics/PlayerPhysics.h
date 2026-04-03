@@ -321,6 +321,17 @@ public:
                mCurrentMode == PlayerMode::Slide;
     }
 
+    /// Check if the player is standing on a specific object (ground contact).
+    /// Used by PressurePlateSystem to detect player weight on plates.
+    bool isStandingOnObject(int32_t objID) const {
+        if (!isOnGround()) return false;
+        for (const auto &c : mLastContacts) {
+            if (c.objectId == objID && c.normal.z > GROUND_NORMAL_MIN)
+                return true;
+        }
+        return false;
+    }
+
     /// Check if the player's center of gravity is in a water cell.
     /// Used for buoyancy, jump scaling, and mode transitions.
     bool isInWater() const {
