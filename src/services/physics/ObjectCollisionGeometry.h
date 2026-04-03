@@ -160,6 +160,9 @@ struct ObjectCollisionBody {
     // ── Sphere data (shapeType == Sphere) ──
     float sphereRadius = 0.0f;          // bounding sphere radius (scaled)
 
+    // ── Object scale (for ODE dynamic body rendering sync) ──
+    Vector3 objectScale{1.0f, 1.0f, 1.0f};  // original P$Scale / placement scale
+
     // ── Broadphase data ──
     // Portal cells this object's AABB overlaps. Built at load time, updated at
     // runtime for moving objects (doors). Used for portal-cell-based broadphase.
@@ -705,6 +708,7 @@ public:
 
             // Apply P$Scale to dimensions
             Vector3 scale(obj.scaleX, obj.scaleY, obj.scaleZ);
+            body.objectScale = scale;
 
             if (shapeType == CollisionShapeType::OBB) {
                 // Default edge lengths = model bbox dimensions * scale * 0.999.
