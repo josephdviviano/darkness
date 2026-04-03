@@ -52,6 +52,8 @@
 #include "ObjectCollisionGeometry.h"
 #include "PlayerPhysics.h"
 #include "RayCaster.h"
+#include "sim/SimCommon.h"
+#include "property/TypedProperty.h"
 
 namespace Darkness {
 
@@ -102,6 +104,9 @@ public:
             }
             if (steps >= 10) mODEAccum = 0.0f;  // prevent spiral of death
         }
+
+        // Sync dynamic bodies back to collision geometry + renderer
+        syncDynamicBodies();
 
         // Update view punch spring
         mPlayer.updateViewPunch(dt);
@@ -360,12 +365,33 @@ public:
         // collision. For dynamic objects, ODE dNearCallback would handle them
         // separately, with the player registered as a kinematic dGeomID.
         ObjectCollisionWorld *ocw = mObjectCollision.get();
+        DarkPhysics *self = this;
         mPlayer.setObjectCollisionCallback(
-            [ocw](const Vector3 *centers, const float *radii,
+            [ocw, self](const Vector3 *centers, const float *radii,
                   int numSpheres, int32_t playerCell,
                   std::vector<SphereContact> &outContacts) {
+                size_t prevCount = outContacts.size();
                 ocw->testPlayerSpheres(centers, radii, numSpheres,
                                        playerCell, outContacts);
+                // Push dynamic objects that the player is colliding with
+                Vector3 playerVel = self->mPlayer.getVelocity();
+                float playerSpeed = glm::length(playerVel);
+                if (playerSpeed > 0.5f) {
+                    for (size_t ci = prevCount; ci < outContacts.size(); ++ci) {
+                        int32_t objID = outContacts[ci].objectId;
+                        if (objID > 0 && self->hasDynamicBody(objID)) {
+                            // Push force: player velocity projected along contact normal,
+                            // scaled by player mass (180 kg) for appropriate momentum transfer
+                            float pushAlongNormal = glm::dot(playerVel,
+                                -outContacts[ci].normal);
+                            if (pushAlongNormal > 0.1f) {
+                                Vector3 force = -outContacts[ci].normal *
+                                    pushAlongNormal * 180.0f;
+                                self->pushDynamicObject(objID, force);
+                            }
+                        }
+                    }
+                }
             });
         // Set direct pointer for object stair stepping (ray-vs-OBB lookups).
         mPlayer.setObjectCollisionWorld(ocw);
@@ -436,10 +462,21 @@ private:
         // Destroy player geom
         if (mPlayerGeom) { dGeomDestroy(mPlayerGeom); mPlayerGeom = nullptr; }
 
+        // Destroy all dynamic bodies (must happen before geom destruction)
+        for (auto &[id, body] : mODEBodies)
+            dBodyDestroy(body);
+        mODEBodies.clear();
+
         // Destroy all object geoms
         for (auto &[id, geom] : mODEGeoms)
             dGeomDestroy(geom);
         mODEGeoms.clear();
+
+        // Free per-geom data
+        for (auto *gd : mGeomDataPtrs)
+            delete gd;
+        mGeomDataPtrs.clear();
+        mODEScales.clear();
 
         // Destroy ODE world
         if (mODEContacts) { dJointGroupDestroy(mODEContacts); mODEContacts = nullptr; }
@@ -457,6 +494,13 @@ private:
     /// Sentinel value stored in player geom's dGeomSetData
     static constexpr intptr_t PLAYER_GEOM_TAG = -999;
 
+    /// Per-geom data stored via dGeomSetData for nearCallback material lookup.
+    struct ODEGeomData {
+        int32_t objID;
+        float friction;
+        float elasticity;
+    };
+
     /// ODE near callback — called for each potentially colliding geom pair.
     /// Creates temporary contact joints for overlapping bodies.
     /// Detects player-vs-dynamic contacts and routes impulse to PlayerPhysics.
@@ -466,11 +510,11 @@ private:
         // Skip space-space collisions (not used with flat hash space)
         if (dGeomIsSpace(o1) || dGeomIsSpace(o2)) return;
 
-        // Check if either geom is the player
-        intptr_t tag1 = reinterpret_cast<intptr_t>(dGeomGetData(o1));
-        intptr_t tag2 = reinterpret_cast<intptr_t>(dGeomGetData(o2));
-        bool isPlayer1 = (tag1 == PLAYER_GEOM_TAG);
-        bool isPlayer2 = (tag2 == PLAYER_GEOM_TAG);
+        // Check if either geom is the player via ODEGeomData
+        auto *gd1 = static_cast<ODEGeomData *>(dGeomGetData(o1));
+        auto *gd2 = static_cast<ODEGeomData *>(dGeomGetData(o2));
+        bool isPlayer1 = (gd1 && gd1->objID == static_cast<int32_t>(PLAYER_GEOM_TAG));
+        bool isPlayer2 = (gd2 && gd2->objID == static_cast<int32_t>(PLAYER_GEOM_TAG));
 
         // Player-vs-static: skip (handled by custom PlayerPhysics collision)
         if (isPlayer1 || isPlayer2) {
@@ -490,6 +534,16 @@ private:
         // Skip if both are static (no dynamics to solve)
         if (!b1 && !b2) return;
 
+        // Read per-object material properties from ODEGeomData
+        float mu = 0.8f, bounce = 0.1f;
+        auto *d1 = static_cast<ODEGeomData *>(dGeomGetData(o1));
+        auto *d2 = static_cast<ODEGeomData *>(dGeomGetData(o2));
+        if (d1 && d2 && d1->objID != PLAYER_GEOM_TAG && d2->objID != PLAYER_GEOM_TAG) {
+            // Average friction, max elasticity (bouncier surface wins)
+            mu = (d1->friction + d2->friction) * 0.5f;
+            bounce = std::max(d1->elasticity, d2->elasticity);
+        }
+
         // Generate contact points
         dContact contacts[MAX_ODE_CONTACTS];
         int numContacts = dCollide(o1, o2, MAX_ODE_CONTACTS,
@@ -497,9 +551,9 @@ private:
 
         for (int i = 0; i < numContacts; ++i) {
             contacts[i].surface.mode = dContactBounce | dContactApprox1;
-            contacts[i].surface.mu = 0.8;             // friction coefficient
-            contacts[i].surface.bounce = 0.1;          // low bounce for heavy objects
-            contacts[i].surface.bounce_vel = 0.1;      // minimum velocity for bounce
+            contacts[i].surface.mu = mu;
+            contacts[i].surface.bounce = bounce;
+            contacts[i].surface.bounce_vel = 0.1;
 
             dJointID joint = dJointCreateContact(
                 self->mODEWorld, self->mODEContacts, &contacts[i]);
@@ -549,18 +603,74 @@ private:
         R[8] = m[0][2]; R[9] = m[1][2]; R[10] = m[2][2]; R[11] = 0;
     }
 
+    /// Convert ODE position + rotation to GLM mat4 (with scale).
+    static Matrix4 odeToGlmMatrix(const dReal *pos, const dReal *R,
+                                   const Vector3 &scale) {
+        // ODE dMatrix3 is row-major 3x4: R[row*4+col]
+        // GLM mat4 is column-major: m[col][row]
+        Matrix4 m(1.0f);
+        m[0][0] = static_cast<float>(R[0])  * scale.x;
+        m[1][0] = static_cast<float>(R[1])  * scale.y;
+        m[2][0] = static_cast<float>(R[2])  * scale.z;
+        m[0][1] = static_cast<float>(R[4])  * scale.x;
+        m[1][1] = static_cast<float>(R[5])  * scale.y;
+        m[2][1] = static_cast<float>(R[6])  * scale.z;
+        m[0][2] = static_cast<float>(R[8])  * scale.x;
+        m[1][2] = static_cast<float>(R[9])  * scale.y;
+        m[2][2] = static_cast<float>(R[10]) * scale.z;
+        m[3][0] = static_cast<float>(pos[0]);
+        m[3][1] = static_cast<float>(pos[1]);
+        m[3][2] = static_cast<float>(pos[2]);
+        return m;
+    }
+
+    /// Sync awake dynamic ODE bodies back to collision geometry and renderer.
+    void syncDynamicBodies() {
+        if (!mObjectCollision || !mObjectStates) return;
+        for (auto &[objID, body] : mODEBodies) {
+            if (!dBodyIsEnabled(body)) continue;  // sleeping — no update needed
+
+            const dReal *pos = dBodyGetPosition(body);
+            const dReal *R = dBodyGetRotation(body);
+
+            // Look up scale from ObjectCollisionBody (scale doesn't change at runtime)
+            Vector3 scale(1.0f);
+            auto scaleIt = mODEScales.find(objID);
+            if (scaleIt != mODEScales.end()) scale = scaleIt->second;
+
+            Matrix4 modelMatrix = odeToGlmMatrix(pos, R, scale);
+            Vector3 position(static_cast<float>(pos[0]),
+                             static_cast<float>(pos[1]),
+                             static_cast<float>(pos[2]));
+
+            // Sync collision geometry (AABB, rotation, cell registration)
+            mObjectCollision->updateBodyTransform(objID, modelMatrix);
+
+            // Sync renderer (ObjectState)
+            applyModelMatrix(*mObjectStates, objID, modelMatrix, position, scale);
+        }
+    }
+
 public:
-    /// Create ODE geoms for all static collision bodies. Called after
-    /// buildObjectCollision() has populated ObjectCollisionWorld.
-    void buildODEGeoms() {
+    /// Set the ObjectStateMap for dynamic body renderer sync.
+    /// Called by darknessRender after world state is constructed.
+    void setObjectStates(ObjectStateMap *states) { mObjectStates = states; }
+
+    /// Create ODE geoms for all collision bodies. Static objects get geoms
+    /// only; dynamic objects (P$PhysAttr.mass > 0) get dBodyID + dGeomID.
+    /// isKinematic callback excludes objects managed by other systems
+    /// (DoorSystem, MovingTerrainSystem, PressurePlateSystem).
+    void buildODEGeoms(PropertyService *propSvc,
+                       std::function<bool(int32_t)> isKinematic = nullptr) {
         if (!mObjectCollision || !mODESpace) return;
 
-        int staticCount = 0;
+        int staticCount = 0, dynamicCount = 0;
         for (size_t i = 0; i < mObjectCollision->bodyCount(); ++i) {
             const auto &body = mObjectCollision->getBody(i);
-            if (body.isEdgeTrigger) continue;  // sensor-only, no ODE geom
+            if (body.isEdgeTrigger) continue;
             if (body.shapeType == CollisionShapeType::None) continue;
 
+            // Create geom for the shape
             dGeomID geom = nullptr;
             if (body.shapeType == CollisionShapeType::OBB) {
                 geom = dCreateBox(mODESpace,
@@ -574,30 +684,90 @@ public:
             glmMat3ToODE(body.rotation, R);
             dGeomSetRotation(geom, R);
 
-            // No dBody — static geom (infinite mass)
-            // Store objID for identification in nearCallback
-            dGeomSetData(geom, reinterpret_cast<void *>(
-                static_cast<intptr_t>(body.objID)));
+            // Check if this object should be dynamic
+            bool isDynamic = false;
+            PropPhysAttr attr{};
+            if (propSvc && !(isKinematic && isKinematic(body.objID))) {
+                if (getTypedProperty<PropPhysAttr>(propSvc, "PhysAttr", body.objID, attr)) {
+                    isDynamic = (attr.mass > 0.001f);
+                }
+            }
+
+            // Allocate per-geom data (lives for duration of ODE world)
+            auto *gd = new ODEGeomData{
+                body.objID,
+                isDynamic ? attr.friction : 0.8f,
+                isDynamic ? attr.elasticity : 0.1f
+            };
+            dGeomSetData(geom, gd);
+            mGeomDataPtrs.push_back(gd);  // track for cleanup
+
+            if (isDynamic) {
+                // Create rigid body
+                dBodyID odeBody = dBodyCreate(mODEWorld);
+
+                // Set mass from P$PhysAttr
+                dMass odeMass;
+                if (body.shapeType == CollisionShapeType::OBB) {
+                    dMassSetBox(&odeMass, 1.0,
+                        body.edgeLengths.x, body.edgeLengths.y, body.edgeLengths.z);
+                } else {
+                    dMassSetSphere(&odeMass, 1.0, body.sphereRadius);
+                }
+                dMassAdjust(&odeMass, attr.mass);
+                dBodySetMass(odeBody, &odeMass);
+
+                // Position and rotation
+                dBodySetPosition(odeBody, body.worldPos.x, body.worldPos.y, body.worldPos.z);
+                dBodySetRotation(odeBody, R);
+
+                // Attach geom to body
+                dGeomSetBody(geom, odeBody);
+
+                // Store scale for sync (scale doesn't change but we need it for matrix)
+                // Derive from ObjectCollisionBody's edgeLengths vs unit box... actually
+                // the collision body already has the scaled dimensions baked in. The
+                // model matrix for rendering needs the original object scale from placement.
+                // For now, use 1.0 — updateBodyTransform strips scale from the rotation.
+                mODEScales[body.objID] = Vector3(1.0f);
+
+                mODEBodies[body.objID] = odeBody;
+                ++dynamicCount;
+            } else {
+                ++staticCount;
+            }
+
             mODEGeoms[body.objID] = geom;
-            ++staticCount;
         }
 
         // Create player kinematic capsule
-        // Height=6.0 (player height), radius=1.2 (HEAD/BODY sphere radius)
-        // ODE capsules are Z-aligned by default, matching Dark Engine Z-up
         {
             float radius = 1.2f;
-            float length = 6.0f - 2.0f * radius;  // capsule cylinder length
+            float length = 6.0f - 2.0f * radius;
             mPlayerGeom = dCreateCapsule(mODESpace, radius, length);
-            dGeomSetData(mPlayerGeom,
-                reinterpret_cast<void *>(static_cast<intptr_t>(PLAYER_GEOM_TAG)));
+            auto *pgd = new ODEGeomData{static_cast<int32_t>(PLAYER_GEOM_TAG), 0.5f, 0.0f};
+            dGeomSetData(mPlayerGeom, pgd);
+            mGeomDataPtrs.push_back(pgd);
 
-            // Sync initial position
             Vector3 pos = mPlayer.getPosition();
             dGeomSetPosition(mPlayerGeom, pos.x, pos.y, pos.z);
         }
 
-        std::fprintf(stderr, "ODE geoms: %d static + 1 player capsule\n", staticCount);
+        std::fprintf(stderr, "ODE geoms: %d static, %d dynamic, 1 player capsule\n",
+                     staticCount, dynamicCount);
+    }
+
+    /// Check if an object has a dynamic ODE body (for player push logic).
+    bool hasDynamicBody(int32_t objID) const {
+        return mODEBodies.find(objID) != mODEBodies.end();
+    }
+
+    /// Wake and push a dynamic object (called when player collides with it).
+    void pushDynamicObject(int32_t objID, const Vector3 &force) {
+        auto it = mODEBodies.find(objID);
+        if (it == mODEBodies.end()) return;
+        dBodyEnable(it->second);
+        dBodyAddForce(it->second, force.x, force.y, force.z);
     }
 
 private:
@@ -624,9 +794,13 @@ private:
     dWorldID       mODEWorld    = nullptr;
     dSpaceID       mODESpace    = nullptr;
     dJointGroupID  mODEContacts = nullptr;
-    std::unordered_map<int32_t, dGeomID> mODEGeoms;   // objID → static geom
+    std::unordered_map<int32_t, dGeomID>  mODEGeoms;   // objID → geom (static or dynamic)
+    std::unordered_map<int32_t, dBodyID>  mODEBodies;  // objID → dynamic body
+    std::unordered_map<int32_t, Vector3>  mODEScales;  // objID → object scale for matrix
+    std::vector<ODEGeomData *>            mGeomDataPtrs; // owned per-geom data for cleanup
     dGeomID        mPlayerGeom  = nullptr;             // kinematic player capsule
     float          mODEAccum    = 0.0f;               // fixed-timestep accumulator for ODE
+    ObjectStateMap *mObjectStates = nullptr;           // renderer transform sync (not owned)
 };
 
 } // namespace Darkness
