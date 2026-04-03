@@ -402,6 +402,10 @@ public:
                                 forceScale = std::min(forceScale, 1.0f);
                                 Vector3 force = -normal * pushAlongNormal *
                                     objMass * forceScale;
+                                std::fprintf(stderr, "  [PUSH] obj=%d mass=%.1f "
+                                    "force=(%.1f,%.1f,%.1f) scale=%.2f\n",
+                                    objID, objMass,
+                                    force.x, force.y, force.z, forceScale);
                                 self->pushDynamicObject(objID, force);
                             }
                         }
@@ -580,15 +584,12 @@ private:
                                     &contacts[0].geom, sizeof(dContact));
 
         for (int i = 0; i < numContacts; ++i) {
-            // SoftERP + SoftCFM for gentle contact resolution (prevents jitter).
-            // Bounce only with sufficient velocity to avoid micro-bouncing at rest.
-            contacts[i].surface.mode = dContactBounce | dContactApprox1 |
-                                        dContactSoftERP | dContactSoftCFM;
+            // Stiff contacts with minimal bounce for stable resting.
+            // SoftERP/CFM avoided — they cause objects to sink into trimesh.
+            contacts[i].surface.mode = dContactBounce | dContactApprox1;
             contacts[i].surface.mu = mu;
-            contacts[i].surface.bounce = std::min(bounce, 0.3f);  // cap bounce
-            contacts[i].surface.bounce_vel = 0.5f;  // need decent speed to bounce
-            contacts[i].surface.soft_erp = 0.5f;    // softer error correction
-            contacts[i].surface.soft_cfm = 0.01f;   // more compliant contacts
+            contacts[i].surface.bounce = std::min(bounce, 0.2f);
+            contacts[i].surface.bounce_vel = 1.0f;  // need real speed to bounce
 
             dJointID joint = dJointCreateContact(
                 self->mODEWorld, self->mODEContacts, &contacts[i]);
@@ -662,11 +663,26 @@ private:
     /// Sync awake dynamic ODE bodies back to collision geometry and renderer.
     void syncDynamicBodies() {
         if (!mObjectCollision || !mObjectStates) return;
+        ++mODEFrameCount;
+        int awakeCount = 0;
         for (auto &[objID, body] : mODEBodies) {
             if (!dBodyIsEnabled(body)) continue;  // sleeping — no update needed
+            ++awakeCount;
 
             const dReal *pos = dBodyGetPosition(body);
+            const dReal *vel = dBodyGetLinearVel(body);
             const dReal *R = dBodyGetRotation(body);
+
+            // Log awake bodies every 30 frames (~0.5s at 60Hz)
+            if (mODEFrameCount % 30 == 0) {
+                dMass mass;
+                dBodyGetMass(body, &mass);
+                std::fprintf(stderr, "  [ODE] obj=%d mass=%.1f pos=(%.2f,%.2f,%.2f) "
+                             "vel=(%.2f,%.2f,%.2f)\n",
+                             objID, mass.mass,
+                             pos[0], pos[1], pos[2],
+                             vel[0], vel[1], vel[2]);
+            }
 
             // Look up scale from ObjectCollisionBody (scale doesn't change at runtime)
             Vector3 scale(1.0f);
@@ -683,6 +699,9 @@ private:
 
             // Sync renderer (ObjectState)
             applyModelMatrix(*mObjectStates, objID, modelMatrix, position, scale);
+        }
+        if (awakeCount > 0 && mODEFrameCount % 30 == 0) {
+            std::fprintf(stderr, "  [ODE] %d bodies awake\n", awakeCount);
         }
     }
 
@@ -722,11 +741,15 @@ public:
                     verts.push_back(v.z);
                 }
 
-                // Fan triangulation
+                // Fan triangulation — reversed winding for ODE.
+                // WR cell polygons face inward (into the cell). ODE trimeshes
+                // are single-sided and need outward-facing normals (objects
+                // collide from the normal side). Reversing the winding makes
+                // objects inside cells collide with floors/walls correctly.
                 for (int ti = 1; ti < poly.count - 1; ++ti) {
                     indices.push_back(static_cast<dTriIndex>(baseVertIdx));
-                    indices.push_back(static_cast<dTriIndex>(baseVertIdx + ti));
                     indices.push_back(static_cast<dTriIndex>(baseVertIdx + ti + 1));
+                    indices.push_back(static_cast<dTriIndex>(baseVertIdx + ti));
                 }
             }
         }
@@ -914,6 +937,7 @@ private:
     std::vector<ODEGeomData *>            mGeomDataPtrs; // owned per-geom data for cleanup
     dGeomID        mPlayerGeom  = nullptr;             // kinematic player capsule
     float          mODEAccum    = 0.0f;               // fixed-timestep accumulator for ODE
+    uint32_t       mODEFrameCount = 0;                // frame counter for throttled logging
     ObjectStateMap *mObjectStates = nullptr;           // renderer transform sync (not owned)
 
     // World geometry trimesh — solid WR cell polygons for object-vs-world collision
