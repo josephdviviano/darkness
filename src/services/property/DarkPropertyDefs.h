@@ -311,6 +311,27 @@ struct PropLocked {
 };
 
 // ============================================================================
+// Pressure plate property (Phase 4F)
+// ============================================================================
+//
+// P$PhysPPlat — dtype: PhysPPlat, 28 bytes.
+// Defines a pressure plate that depresses under weight and sends script
+// messages. The last two int32 fields are runtime state (state + cur_pause).
+
+#pragma pack(push, 1)
+struct PropPhysPPlate {
+    float    weight;        // Activation weight threshold
+    float    travel;        // Distance plate moves down (world units)
+    float    speed;         // Movement speed (units/sec)
+    float    pause;         // Hold time: -1=immediate, -2=latched, >0=seconds
+    uint32_t blockVision;   // bool32: blocks AI vision when active
+    int32_t  state;         // Runtime: ePPState (0=inactive, 1=active, 2=deactivating, 3=activating)
+    float    curPause;      // Runtime: current pause countdown
+};
+#pragma pack(pop)
+static_assert(sizeof(PropPhysPPlate) == 28, "PropPhysPPlate must match PhysPPlat dtype (28 bytes)");
+
+// ============================================================================
 // TPath link data (Moving Terrain / Elevators)
 // ============================================================================
 //
