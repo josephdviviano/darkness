@@ -385,6 +385,13 @@ public:
                     // Skip top contacts (player standing on object)
                     if (outContacts[ci].normal.z > 0.3f) continue;
 
+                    // Skip heavy objects — terrain fixtures, large furniture.
+                    // The player can only push objects lighter than ~50kg.
+                    // Heavier objects still participate in ODE object-object
+                    // collision but are immovable by the player.
+                    float objMass = self->getDynamicBodyMass(objID);
+                    if (objMass > 50.0f) continue;
+
                     Vector3 norm = -outContacts[ci].normal;  // toward object
                     // For horizontal push only (like original sphere special case)
                     norm.z = 0.0f;
@@ -411,7 +418,6 @@ public:
 
                     // Mass-weighted velocity average along normal
                     // (original engine algorithm from UpdateObjectContacts)
-                    float objMass = self->getDynamicBodyMass(objID);
                     float totalMass = playerMass + objMass;
                     float resvel = (playerDot * playerMass + objDot * objMass)
                                     * 0.5f / totalMass;
@@ -868,7 +874,7 @@ public:
                 // Bodies wake when disturbed (player push, object collision).
                 dBodyDisable(odeBody);
 
-                mODEScales[body.objID] = Vector3(1.0f);
+                mODEScales[body.objID] = body.objectScale;
                 mODEBodies[body.objID] = odeBody;
                 ++dynamicCount;
             } else {
