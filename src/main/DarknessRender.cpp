@@ -85,6 +85,7 @@
 #include "SingleFieldDataStorage.h"
 #include "worldquery/ObjSysWorldState.h"
 #include "sim/DoorSystem.h"
+#include "sim/MovingTerrainSystem.h"
 #include "sim/TweqSystem.h"
 #include "sim/MessageDispatch.h"
 #include "FrobSystem.h"
@@ -135,6 +136,7 @@ static void printHelp() {
         "  --water-rot <f> Water UV rotation speed in rad/s, 0.0-1.0 (default: 0.015).\n"
         "  --water-scroll <f> Water UV scroll speed, 0.0-1.0 (default: 0.05).\n"
         "  --step-log     Log stair step diagnostics to stderr ([STEP] prefix).\n"
+        "  --toggle-platforms  Auto-activate all moving terrain at startup.\n"
         "  --debug-objects Dump per-object filtering diagnostics to stderr.\n"
         "  --config <path> Path to YAML config file (default: ./darknessRender.yaml).\n"
         "  --help         Show this help message.\n"
@@ -1169,6 +1171,26 @@ static void registerConsoleSettings(
             if (state.frobSystem) state.frobSystem->setFrobDistance(v);
         },
         "Maximum interaction distance (original engine default: 8.0)");
+
+    dbgConsole.addBool("toggle_platforms",
+        []() { return false; },  // read as momentary (always shows "off")
+        [&state](bool v) {
+            if (v && state.movingTerrainSystem) {
+                // Toggle all platforms: activate stopped ones, deactivate moving ones
+                auto ids = state.movingTerrainSystem->getAllPlatformIDs();
+                int activated = 0, deactivated = 0;
+                for (int32_t id : ids) {
+                    if (state.movingTerrainSystem->toggle(id)) {
+                        const Darkness::Vector3 *vel =
+                            state.movingTerrainSystem->getVelocity(id);
+                        if (vel) ++activated; else ++deactivated;
+                    }
+                }
+                std::fprintf(stderr, "toggle_platforms: %d activated, %d deactivated\n",
+                             activated, deactivated);
+            }
+        },
+        "Toggle all moving terrain (elevators/platforms) on/off");
 }
 
 // ── Event handling ──
@@ -2091,6 +2113,8 @@ int main(int argc, char *argv[]) {
     state.doorSystem = &doorSystem;
 
     Darkness::TweqSystem tweqSystem;
+    Darkness::MovingTerrainSystem movingTerrainSystem;
+    state.movingTerrainSystem = &movingTerrainSystem;
 
     // ── Initialize frob system ──
     // Casts a short ray from the camera each frame to find the nearest frobbable
@@ -2127,6 +2151,16 @@ int main(int argc, char *argv[]) {
     });
     messageDispatch.registerGlobalHandler("TurnOff", [&tweqSystem](const Darkness::ScriptMessage &msg) {
         tweqSystem.activate(msg.to, Darkness::kTweqDoHalt);
+        return false;
+    });
+    // Moving terrain handlers: TurnOn/TurnOff activate/deactivate platforms.
+    // Return false to avoid consuming — other systems may also respond.
+    messageDispatch.registerGlobalHandler("TurnOn", [&movingTerrainSystem](const Darkness::ScriptMessage &msg) {
+        movingTerrainSystem.activate(msg.to);
+        return false;
+    });
+    messageDispatch.registerGlobalHandler("TurnOff", [&movingTerrainSystem](const Darkness::ScriptMessage &msg) {
+        movingTerrainSystem.deactivate(msg.to);
         return false;
     });
 
@@ -2368,6 +2402,19 @@ int main(int argc, char *argv[]) {
                         &mission.parsedModels);
     }
 
+    // ── Initialize moving terrain system ──
+    // Scans for objects with P$MovingTerrain property and builds waypoint graphs
+    // from TPathInit/TPath link chains. Platforms follow waypoint paths at
+    // configured speeds, pausing at each waypoint.
+    {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
+        Darkness::LinkServicePtr linkSvc = GET_SERVICE(Darkness::LinkService);
+        movingTerrainSystem.init(propSvc.get(), objSvc.get(), linkSvc.get(),
+                                 state.objectStates, &doorPlacements);
+        movingTerrainSystem.setMessageDispatch(&messageDispatch);
+    }
+
     // ── Build object collision bodies from .bin bounding boxes ──
     // Creates OBB/sphere collision bodies for placed objects (crates, furniture,
     // doors) so the player can't walk through them. Uses P$PhysType properties
@@ -2388,7 +2435,21 @@ int main(int argc, char *argv[]) {
                 [ocw](int32_t objID, const Darkness::Matrix4 &worldMatrix) {
                     ocw->updateBodyTransform(objID, worldMatrix);
                 });
+            // Moving terrain also needs collision body updates
+            movingTerrainSystem.setCollisionUpdateCallback(
+                [ocw](int32_t objID, const Darkness::Matrix4 &worldMatrix) {
+                    ocw->updateBodyTransform(objID, worldMatrix);
+                });
         }
+    }
+
+    // Wire platform riding: PlayerPhysics queries platform velocity to carry
+    // the player when standing on a moving elevator/platform.
+    if (state.physics) {
+        state.physics->getPlayerPhysics().setPlatformVelocityCallback(
+            [&movingTerrainSystem](int32_t objID) -> const Darkness::Vector3 * {
+                return movingTerrainSystem.getVelocity(objID);
+            });
     }
 
     // ── SDL2 + bgfx init ──
@@ -2614,6 +2675,7 @@ int main(int argc, char *argv[]) {
     // Priority 10 = before physics (which would be 20+ when registered).
     simSvc->registerListener(&doorSystem, 10);
     simSvc->registerListener(&tweqSystem, 15);  // after doors (10), before physics (20+)
+    simSvc->registerListener(&movingTerrainSystem, 12);  // after doors (10), before tweqs (15)
 
     // Set up door event callback: update audio blocking and log status changes.
     // When a door starts opening, remove sound blocking. When it finishes
@@ -2830,6 +2892,14 @@ int main(int argc, char *argv[]) {
     // LoopService — the manual audioSvc->updateAudio(dt) call is removed.
     // SimService registered itself in init() (priority 50).
 
+    // Auto-toggle all platforms if --toggle-platforms was passed
+    if (cfg.togglePlatforms) {
+        auto ids = movingTerrainSystem.getAllPlatformIDs();
+        for (int32_t id : ids)
+            movingTerrainSystem.activate(id);
+        std::fprintf(stderr, "--toggle-platforms: activated %zu platforms\n", ids.size());
+    }
+
     // ── Main loop — LoopService drives frame dispatch ──
     while (state.running && !loopSvc->isTerminationRequested()) {
         loopSvc->step();
@@ -2840,6 +2910,7 @@ int main(int argc, char *argv[]) {
     loopSvc->removeLoopClient(&renderClient);
     simSvc->unregisterListener(&doorSystem);
     simSvc->unregisterListener(&tweqSystem);
+    simSvc->unregisterListener(&movingTerrainSystem);
     simSvc->endSim();
 
     destroyGPUResources(gpu);
