@@ -384,6 +384,11 @@ public:
                     for (size_t ci = prevCount; ci < outContacts.size(); ++ci) {
                         int32_t objID = outContacts[ci].objectId;
                         if (objID > 0 && self->hasDynamicBody(objID)) {
+                            // Skip contacts where player is on TOP of the object.
+                            // These have upward normals (z > 0.3) — pushing here
+                            // would drive the object into the floor.
+                            if (outContacts[ci].normal.z > 0.3f) continue;
+
                             Vector3 normal = outContacts[ci].normal;
                             // Only push horizontally — zero out vertical component
                             normal.z = 0.0f;
@@ -459,7 +464,7 @@ private:
         // Solver parameters for stable stacking
         dWorldSetERP(mODEWorld, 0.8);                     // stiff error correction
         dWorldSetCFM(mODEWorld, 1e-4);                     // slight softness for stability
-        dWorldSetContactSurfaceLayer(mODEWorld, 0.001);    // 1mm penetration tolerance
+        dWorldSetContactSurfaceLayer(mODEWorld, 0.01);     // 1cm penetration tolerance
         dWorldSetQuickStepNumIterations(mODEWorld, 20);    // solver iterations
 
         // Auto-sleep for stable resting contacts (critical for stacked crates).
@@ -470,10 +475,13 @@ private:
         dWorldSetAutoDisableSteps(mODEWorld, 5);
         dWorldSetAutoDisableTime(mODEWorld, 0.5);  // sleep after 0.5s of low activity
 
-        // Damping — higher than typical defaults so objects settle quickly.
-        // Angular damping bleeds rotational energy for stable stacks.
-        dWorldSetLinearDamping(mODEWorld, 0.02);
-        dWorldSetAngularDamping(mODEWorld, 0.1);
+        // Aggressive damping so objects settle quickly on trimesh surfaces.
+        // Without this, objects micro-bounce on trimesh contact points
+        // and never reach the auto-disable velocity threshold.
+        dWorldSetLinearDamping(mODEWorld, 0.05);
+        dWorldSetAngularDamping(mODEWorld, 0.2);
+        dWorldSetLinearDampingThreshold(mODEWorld, 0.01);
+        dWorldSetAngularDampingThreshold(mODEWorld, 0.01);
 
         std::fprintf(stderr, "ODE world created (gravity=%.1f, ERP=0.8, CFM=1e-4, "
                      "angularDamping=0.05)\n", -GRAVITY);
