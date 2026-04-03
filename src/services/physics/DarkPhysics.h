@@ -373,48 +373,55 @@ public:
                 size_t prevCount = outContacts.size();
                 ocw->testPlayerSpheres(centers, radii, numSpheres,
                                        playerCell, outContacts);
-                // Push dynamic objects the player is walking into.
-                // Force proportional to player velocity, scaled down by object
-                // mass so heavy objects are harder to push. Only horizontal
-                // force is applied — prevents the player from launching objects
-                // upward by walking on top of them.
+                // Push dynamic objects using the original engine's velocity
+                // transfer algorithm: mass-weighted velocity averaging along
+                // the contact normal. No forces — direct velocity set.
                 Vector3 playerVel = self->mPlayer.getVelocity();
-                float playerSpeed = glm::length(Vector3(playerVel.x, playerVel.y, 0.0f));
-                if (playerSpeed > 0.5f) {
-                    for (size_t ci = prevCount; ci < outContacts.size(); ++ci) {
-                        int32_t objID = outContacts[ci].objectId;
-                        if (objID > 0 && self->hasDynamicBody(objID)) {
-                            // Skip contacts where player is on TOP of the object.
-                            // These have upward normals (z > 0.3) — pushing here
-                            // would drive the object into the floor.
-                            if (outContacts[ci].normal.z > 0.3f) continue;
+                float playerMass = 180.0f;  // Dark Engine default player mass
+                for (size_t ci = prevCount; ci < outContacts.size(); ++ci) {
+                    int32_t objID = outContacts[ci].objectId;
+                    if (objID <= 0 || !self->hasDynamicBody(objID)) continue;
 
-                            Vector3 normal = outContacts[ci].normal;
-                            // Only push horizontally — zero out vertical component
-                            normal.z = 0.0f;
-                            float normalLen = glm::length(normal);
-                            if (normalLen < 0.01f) continue;  // vertical contact only
-                            normal /= normalLen;
+                    // Skip top contacts (player standing on object)
+                    if (outContacts[ci].normal.z > 0.3f) continue;
 
-                            float pushAlongNormal = glm::dot(playerVel, -normal);
-                            if (pushAlongNormal > 0.1f) {
-                                float objMass = self->getDynamicBodyMass(objID);
-                                // Force = push * PLAYER_PUSH_FORCE, inversely scaled
-                                // by object mass. Heavy objects (100kg) get 15% of
-                                // push force, light objects (1kg) get 100%.
-                                float forceScale = PLAYER_PUSH_FORCE /
-                                    std::max(objMass, 1.0f);
-                                forceScale = std::min(forceScale, 1.0f);
-                                Vector3 force = -normal * pushAlongNormal *
-                                    objMass * forceScale;
-                                std::fprintf(stderr, "  [PUSH] obj=%d mass=%.1f "
-                                    "force=(%.1f,%.1f,%.1f) scale=%.2f\n",
-                                    objID, objMass,
-                                    force.x, force.y, force.z, forceScale);
-                                self->pushDynamicObject(objID, force);
-                            }
-                        }
-                    }
+                    Vector3 norm = -outContacts[ci].normal;  // toward object
+                    // For horizontal push only (like original sphere special case)
+                    norm.z = 0.0f;
+                    float normLen = glm::length(norm);
+                    if (normLen < 0.01f) continue;
+                    norm /= normLen;
+
+                    // Project player velocity onto contact normal
+                    float playerDot = glm::dot(playerVel, norm);
+                    if (playerDot < 0.1f) continue;  // not moving toward object
+
+                    // Get object velocity along normal
+                    auto bodyIt = self->mODEBodies.find(objID);
+                    if (bodyIt == self->mODEBodies.end()) continue;
+                    dBodyID odeBody = bodyIt->second;
+                    const dReal *objVelR = dBodyGetLinearVel(odeBody);
+                    Vector3 objVel(static_cast<float>(objVelR[0]),
+                                   static_cast<float>(objVelR[1]),
+                                   static_cast<float>(objVelR[2]));
+                    float objDot = glm::dot(objVel, norm);
+
+                    // Only push if moving toward each other
+                    if (playerDot - objDot < 0.001f) continue;
+
+                    // Mass-weighted velocity average along normal
+                    // (original engine algorithm from UpdateObjectContacts)
+                    float objMass = self->getDynamicBodyMass(objID);
+                    float totalMass = playerMass + objMass;
+                    float resvel = (playerDot * playerMass + objDot * objMass)
+                                    * 0.5f / totalMass;
+
+                    // Set new object velocity: remove old normal component,
+                    // add averaged result
+                    Vector3 newObjVel = objVel - norm * objDot + norm * resvel;
+                    dBodyEnable(odeBody);
+                    dBodySetLinearVel(odeBody,
+                        newObjVel.x, newObjVel.y, newObjVel.z);
                 }
             });
         // Set direct pointer for object stair stepping (ray-vs-OBB lookups).
@@ -524,14 +531,9 @@ private:
     /// box-on-box stacking; more contacts = more solver work.
     static constexpr int MAX_ODE_CONTACTS = 4;
 
-    /// Maximum push force the player can exert by walking into objects.
-    /// Tuned so the player can nudge light objects (bottles, small crates)
-    /// but can't bulldoze heavy furniture (benches, tables, large crates).
-    static constexpr float PLAYER_PUSH_FORCE = 15.0f;
-
-    /// Minimum velocity for an ODE dynamic body to stay awake. Below this,
-    /// ODE auto-disables the body (sleeping). Higher = settles faster.
-    static constexpr float SLEEP_LINEAR_THRESHOLD = 0.05f;
+    // Player push uses the original engine's velocity transfer algorithm:
+    // mass-weighted average along contact normal, directly setting the
+    // object's velocity. No ODE forces — much more stable than impulses.
 
     /// Sentinel value stored in player geom's dGeomSetData
     static constexpr intptr_t PLAYER_GEOM_TAG = -999;
