@@ -2458,6 +2458,8 @@ int main(int argc, char *argv[]) {
                        movingTerrainSystem.isPlatform(objID) ||
                        pressurePlateSystem.isPlate(objID);
             });
+        // Build world geometry trimesh so dynamic objects collide with floors/walls
+        state.physics->buildWorldTrimesh();
 
         // Initialize edge trigger system from collision bodies with isEdgeTrigger=true
         edgeTriggerSystem.init(state.physics->getObjectCollisionWorld());
