@@ -450,16 +450,18 @@ private:
         dWorldSetContactSurfaceLayer(mODEWorld, 0.001);    // 1mm penetration tolerance
         dWorldSetQuickStepNumIterations(mODEWorld, 20);    // solver iterations
 
-        // Auto-sleep for stable resting contacts (critical for stacked crates)
+        // Auto-sleep for stable resting contacts (critical for stacked crates).
+        // Higher thresholds than typical ODE defaults so objects settle quickly.
         dWorldSetAutoDisableFlag(mODEWorld, 1);
-        dWorldSetAutoDisableLinearThreshold(mODEWorld, 0.01);
-        dWorldSetAutoDisableAngularThreshold(mODEWorld, 0.01);
-        dWorldSetAutoDisableSteps(mODEWorld, 10);
+        dWorldSetAutoDisableLinearThreshold(mODEWorld, 0.05);
+        dWorldSetAutoDisableAngularThreshold(mODEWorld, 0.05);
+        dWorldSetAutoDisableSteps(mODEWorld, 5);
+        dWorldSetAutoDisableTime(mODEWorld, 0.5);  // sleep after 0.5s of low activity
 
-        // Damping — angular damping bleeds rotational energy so stacks
-        // settle quickly without locking rotation
-        dWorldSetLinearDamping(mODEWorld, 0.005);
-        dWorldSetAngularDamping(mODEWorld, 0.05);
+        // Damping — higher than typical defaults so objects settle quickly.
+        // Angular damping bleeds rotational energy for stable stacks.
+        dWorldSetLinearDamping(mODEWorld, 0.02);
+        dWorldSetAngularDamping(mODEWorld, 0.1);
 
         std::fprintf(stderr, "ODE world created (gravity=%.1f, ERP=0.8, CFM=1e-4, "
                      "angularDamping=0.05)\n", -GRAVITY);
@@ -505,8 +507,14 @@ private:
     /// Maximum push force the player can exert by walking into objects.
     /// Tuned so the player can nudge light objects (bottles, small crates)
     /// but can't bulldoze heavy furniture (benches, tables, large crates).
-    /// Units: kg — objects heavier than this are effectively immovable.
     static constexpr float PLAYER_PUSH_FORCE = 15.0f;
+
+    /// Maximum mass for a dynamic ODE body (kg). Objects heavier than this
+    /// are treated as static (immovable) world geometry. In the original
+    /// engine, most furniture is not pushable — only small pickup-able
+    /// objects like bottles, plates, goblets, bones, and small crates.
+    /// Tunable: increase if too few objects move, decrease if too many.
+    static constexpr float MAX_DYNAMIC_MASS = 5.0f;
 
     /// Sentinel value stored in player geom's dGeomSetData
     static constexpr intptr_t PLAYER_GEOM_TAG = -999;
@@ -567,10 +575,15 @@ private:
                                     &contacts[0].geom, sizeof(dContact));
 
         for (int i = 0; i < numContacts; ++i) {
-            contacts[i].surface.mode = dContactBounce | dContactApprox1;
+            // SoftERP + SoftCFM for gentle contact resolution (prevents jitter).
+            // Bounce only with sufficient velocity to avoid micro-bouncing at rest.
+            contacts[i].surface.mode = dContactBounce | dContactApprox1 |
+                                        dContactSoftERP | dContactSoftCFM;
             contacts[i].surface.mu = mu;
-            contacts[i].surface.bounce = bounce;
-            contacts[i].surface.bounce_vel = 0.1;
+            contacts[i].surface.bounce = std::min(bounce, 0.3f);  // cap bounce
+            contacts[i].surface.bounce_vel = 0.5f;  // need decent speed to bounce
+            contacts[i].surface.soft_erp = 0.5f;    // softer error correction
+            contacts[i].surface.soft_cfm = 0.01f;   // more compliant contacts
 
             dJointID joint = dJointCreateContact(
                 self->mODEWorld, self->mODEContacts, &contacts[i]);
@@ -767,12 +780,16 @@ public:
             glmMat3ToODE(body.rotation, R);
             dGeomSetRotation(geom, R);
 
-            // Check if this object should be dynamic
+            // Check if this object should be dynamic. Only lightweight objects
+            // become ODE rigid bodies — heavy furniture stays static (immovable).
+            // The original engine uses archetype hierarchy (Movable vs not) but we
+            // approximate with a mass threshold. Objects above MAX_DYNAMIC_MASS are
+            // treated as static world geometry.
             bool isDynamic = false;
             PropPhysAttr attr{};
             if (propSvc && !(isKinematic && isKinematic(body.objID))) {
                 if (getTypedProperty<PropPhysAttr>(propSvc, "PhysAttr", body.objID, attr)) {
-                    isDynamic = (attr.mass > 0.001f);
+                    isDynamic = (attr.mass > 0.001f && attr.mass <= MAX_DYNAMIC_MASS);
                 }
             }
 
