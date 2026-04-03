@@ -12,6 +12,7 @@ add_executable(darkness_tests
     test_worker_thread_pool.cpp
     test_object_state.cpp
     test_sim_systems.cpp
+    test_probe_file.cpp
 )
 
 target_link_libraries(darkness_tests PRIVATE
