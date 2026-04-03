@@ -373,27 +373,35 @@ public:
                 size_t prevCount = outContacts.size();
                 ocw->testPlayerSpheres(centers, radii, numSpheres,
                                        playerCell, outContacts);
-                // Gently push dynamic objects the player is walking into.
-                // Force is modest — the player nudges light objects but can't
-                // bulldoze heavy furniture. Objects heavier than the player
-                // (mass > 180) are effectively immovable by walking.
+                // Push dynamic objects the player is walking into.
+                // Force proportional to player velocity, scaled down by object
+                // mass so heavy objects are harder to push. Only horizontal
+                // force is applied — prevents the player from launching objects
+                // upward by walking on top of them.
                 Vector3 playerVel = self->mPlayer.getVelocity();
-                float playerSpeed = glm::length(playerVel);
+                float playerSpeed = glm::length(Vector3(playerVel.x, playerVel.y, 0.0f));
                 if (playerSpeed > 0.5f) {
                     for (size_t ci = prevCount; ci < outContacts.size(); ++ci) {
                         int32_t objID = outContacts[ci].objectId;
                         if (objID > 0 && self->hasDynamicBody(objID)) {
-                            float pushAlongNormal = glm::dot(playerVel,
-                                -outContacts[ci].normal);
+                            Vector3 normal = outContacts[ci].normal;
+                            // Only push horizontally — zero out vertical component
+                            normal.z = 0.0f;
+                            float normalLen = glm::length(normal);
+                            if (normalLen < 0.01f) continue;  // vertical contact only
+                            normal /= normalLen;
+
+                            float pushAlongNormal = glm::dot(playerVel, -normal);
                             if (pushAlongNormal > 0.1f) {
-                                // Scale force by mass ratio: heavy objects barely move,
-                                // light objects get a gentle nudge. Cap at 1.0 so the
-                                // player never pushes harder than the object's own weight.
                                 float objMass = self->getDynamicBodyMass(objID);
-                                float massRatio = std::min(1.0f,
-                                    PLAYER_PUSH_FORCE / std::max(objMass, 1.0f));
-                                Vector3 force = -outContacts[ci].normal *
-                                    pushAlongNormal * objMass * massRatio;
+                                // Force = push * PLAYER_PUSH_FORCE, inversely scaled
+                                // by object mass. Heavy objects (100kg) get 15% of
+                                // push force, light objects (1kg) get 100%.
+                                float forceScale = PLAYER_PUSH_FORCE /
+                                    std::max(objMass, 1.0f);
+                                forceScale = std::min(forceScale, 1.0f);
+                                Vector3 force = -normal * pushAlongNormal *
+                                    objMass * forceScale;
                                 self->pushDynamicObject(objID, force);
                             }
                         }
@@ -509,12 +517,9 @@ private:
     /// but can't bulldoze heavy furniture (benches, tables, large crates).
     static constexpr float PLAYER_PUSH_FORCE = 15.0f;
 
-    /// Maximum mass for a dynamic ODE body (kg). Objects heavier than this
-    /// are treated as static (immovable) world geometry. In the original
-    /// engine, most furniture is not pushable — only small pickup-able
-    /// objects like bottles, plates, goblets, bones, and small crates.
-    /// Tunable: increase if too few objects move, decrease if too many.
-    static constexpr float MAX_DYNAMIC_MASS = 5.0f;
+    /// Minimum velocity for an ODE dynamic body to stay awake. Below this,
+    /// ODE auto-disables the body (sleeping). Higher = settles faster.
+    static constexpr float SLEEP_LINEAR_THRESHOLD = 0.05f;
 
     /// Sentinel value stored in player geom's dGeomSetData
     static constexpr intptr_t PLAYER_GEOM_TAG = -999;
@@ -780,16 +785,17 @@ public:
             glmMat3ToODE(body.rotation, R);
             dGeomSetRotation(geom, R);
 
-            // Check if this object should be dynamic. Only lightweight objects
-            // become ODE rigid bodies — heavy furniture stays static (immovable).
-            // The original engine uses archetype hierarchy (Movable vs not) but we
-            // approximate with a mass threshold. Objects above MAX_DYNAMIC_MASS are
-            // treated as static world geometry.
+            // Check if this object should be dynamic. In the original engine,
+            // any object with a physics model that is NOT location-controlled
+            // is movable. We approximate: objects with P$PhysAttr.mass > 0 that
+            // are not managed by kinematic systems (doors, platforms, plates)
+            // become dynamic ODE bodies. Mass determines how hard they are to push,
+            // not whether they can be pushed.
             bool isDynamic = false;
             PropPhysAttr attr{};
             if (propSvc && !(isKinematic && isKinematic(body.objID))) {
                 if (getTypedProperty<PropPhysAttr>(propSvc, "PhysAttr", body.objID, attr)) {
-                    isDynamic = (attr.mass > 0.001f && attr.mass <= MAX_DYNAMIC_MASS);
+                    isDynamic = (attr.mass > 0.001f);
                 }
             }
 
