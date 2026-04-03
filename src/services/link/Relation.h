@@ -160,6 +160,19 @@ public:
      */
     Variant getLinkField(link_id_t id, const std::string &field);
 
+    /** Gets raw link data bytes for a given link ID.
+     * @param id The link id
+     * @param outSize Receives the data size in bytes
+     * @return Pointer to the raw data, or nullptr if not found.
+     *         Valid until the link is modified or destroyed. */
+    const uint8_t *getRawLinkData(link_id_t id, size_t &outSize) const {
+        if (!mStorage) {
+            outSize = 0;
+            return nullptr;
+        }
+        return mStorage->getRawData(static_cast<int>(id), outSize);
+    }
+
     // ----------------- Link query methods --------------------
     /** Gets all links that come from source to destination
      * @param src Source object ID

@@ -595,3 +595,58 @@
             }
         }
     }
+
+    // ── Platform riding ──
+    //
+    // Moving terrain (elevators, platforms) carry the player by adding the
+    // platform's velocity to the player position each physics step. The
+    // original Dark Engine tracks a "reference frame object" and adds a
+    // velocity constraint along the contact normal. Our simplified version
+    // directly displaces the player by the platform's velocity * dt.
+    //
+    // On platform departure (ground contact lost), the platform's velocity
+    // is inherited into the player's velocity for smooth detachment — the
+    // player keeps moving in the direction the platform was traveling.
+
+    inline void updatePlatformRiding() {
+        if (!mPlatformVelocityCb) return;
+
+        // Scan ground contacts for a moving terrain object
+        int32_t newPlatformID = 0;
+        for (const auto &c : mLastContacts) {
+            if (c.objectId > 0 && c.normal.z > GROUND_NORMAL_MIN) {
+                // Check if this object is a moving platform
+                const Vector3 *platVel = mPlatformVelocityCb(c.objectId);
+                if (platVel) {
+                    newPlatformID = c.objectId;
+                    mPlatformVelocity = *platVel;
+                    break;
+                }
+            }
+        }
+
+        if (newPlatformID != 0) {
+            // On a platform — apply platform displacement this step
+            mPosition += mPlatformVelocity * mTimestep.fixedDt;
+
+            // Suppress downward friction when platform is moving upward.
+            // Without this, friction fights the upward velocity and the
+            // player "sinks" through a rising platform.
+            if (mPlatformVelocity.z < 0.0f) {
+                // Platform descending — remove downward velocity component
+                // beyond what the platform provides, so the player descends
+                // with the platform instead of floating
+                if (mVelocity.z < mPlatformVelocity.z)
+                    mVelocity.z = mPlatformVelocity.z;
+            }
+
+            mPlatformObjID = newPlatformID;
+
+        } else if (mPlatformObjID != 0) {
+            // Just left the platform — inherit platform velocity into
+            // player velocity for smooth detachment
+            mVelocity += mPlatformVelocity;
+            mPlatformObjID = 0;
+            mPlatformVelocity = Vector3(0.0f);
+        }
+    }

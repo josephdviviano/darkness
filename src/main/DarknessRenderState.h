@@ -58,6 +58,7 @@ namespace Darkness {
 // Forward declarations
 class ObjectStateMap;
 class DoorSystem;
+class MovingTerrainSystem;
 class FrobSystem;
 class MessageDispatch;
 
@@ -209,6 +210,8 @@ struct RuntimeState {
     bool  cameraCollision = false;
     int   filterMode = 0;
     int   lightmapFiltering = 0;  // 0=bilinear (default), 1=bicubic
+    bool  debugAnimLightmaps = false; // tint animated lightmap polys magenta
+    bool  forceFlicker = false;       // override all animated lights to flicker mode
     float waveAmplitude = 1.0f;
     float uvDistortion = 1.0f;
     float waterRotation = 1.0f;
@@ -234,6 +237,9 @@ struct RuntimeState {
 
     // Door system — non-owning pointer, for debug interaction (G key toggles nearest door)
     DoorSystem *doorSystem = nullptr;
+
+    // Moving terrain system — non-owning pointer, for platform velocity queries
+    MovingTerrainSystem *movingTerrainSystem = nullptr;
 
     // Frob system — non-owning pointer, for player interaction with objects
     FrobSystem *frobSystem = nullptr;

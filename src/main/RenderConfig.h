@@ -67,10 +67,10 @@ struct RenderConfig {
     bool showObjects      = true;   // render object meshes
     bool showFallbackCubes = false; // show colored cubes for objects with missing models
     bool portalCulling    = true;   // portal/frustum culling
-    bool forceFlicker     = false;  // force all animated lights to flicker mode
     bool cameraCollision  = false;  // sphere collision against world geometry
     bool debugObjects     = false;  // dump per-object filtering diagnostics to stderr
     bool stepLog          = false;  // stair step diagnostics to stderr ([STEP] prefix)
+    bool togglePlatforms  = false;  // auto-activate all moving terrain at startup
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -280,7 +280,6 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             if (dev["show_objects"])        cfg.showObjects      = dev["show_objects"].as<bool>();
             if (dev["show_fallback_cubes"]) cfg.showFallbackCubes = dev["show_fallback_cubes"].as<bool>();
             if (dev["portal_culling"])      cfg.portalCulling     = dev["portal_culling"].as<bool>();
-            if (dev["force_flicker"])       cfg.forceFlicker      = dev["force_flicker"].as<bool>();
             if (dev["camera_collision"])    cfg.cameraCollision   = dev["camera_collision"].as<bool>();
             if (dev["step_log"])            cfg.stepLog           = dev["step_log"].as<bool>();
         }
@@ -320,8 +319,6 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cfg.portalCulling = false;
         } else if (std::strcmp(argv[i], "--filter") == 0) {
             cfg.filterMode = 1;  // bilinear
-        } else if (std::strcmp(argv[i], "--force-flicker") == 0) {
-            cfg.forceFlicker = true;
         } else if (std::strcmp(argv[i], "--linear-mips") == 0) {
             cfg.linearMips = true;
         } else if (std::strcmp(argv[i], "--sharp-mips") == 0) {
@@ -332,6 +329,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cfg.debugObjects = true;
         } else if (std::strcmp(argv[i], "--step-log") == 0) {
             cfg.stepLog = true;
+        } else if (std::strcmp(argv[i], "--toggle-platforms") == 0) {
+            cfg.togglePlatforms = true;
         } else if (std::strcmp(argv[i], "--physics-rate") == 0 && i + 1 < argc) {
             int val = std::atoi(argv[++i]);
             if (val <= 12) cfg.physicsRate = 12;

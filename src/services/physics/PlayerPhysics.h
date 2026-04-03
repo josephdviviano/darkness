@@ -438,6 +438,18 @@ public:
         mClimbabilityTable = table;
     }
 
+    /// Callback to query platform velocity for moving terrain / elevator riding.
+    /// Returns nullptr if the object is not a moving platform, or a pointer to
+    /// its current velocity vector if it is. The pointer is valid for the current
+    /// frame only.
+    using PlatformVelocityCallback = std::function<const Vector3 *(int32_t objID)>;
+
+    /// Register a callback to query platform velocities. Set by the main loop
+    /// to bridge PlayerPhysics with MovingTerrainSystem.
+    void setPlatformVelocityCallback(PlatformVelocityCallback cb) {
+        mPlatformVelocityCb = std::move(cb);
+    }
+
 private:
     // ── Internal simulation steps ──
 
@@ -580,6 +592,13 @@ private:
         if (mCurrentMode == PlayerMode::Climb && isOnGround())
             breakClimb(false);
 
+        // 11c. Platform riding — if standing on a moving terrain object,
+        // add platform velocity to player position (reference frame tracking).
+        // The original Dark Engine adds a velocity constraint for the contact
+        // normal component and tracks the reference frame object. Our simplified
+        // version directly applies the platform displacement each step.
+        updatePlatformRiding();
+
         // 12. Update cell index again (collision may have shifted position)
         // Relies purely on gravity + collision + constraint response to keep
         // the player grounded. An explicit snap was causing jitter (collision
@@ -704,6 +723,13 @@ private:
     Vector3 mGroundNormal{0.0f, 0.0f, 1.0f};
     int32_t mGroundTextureIdx = -1;  // texture index of ground surface (for footstep material)
 
+    // Platform riding state — tracks which moving platform the player is standing on.
+    // When grounded on a moving terrain object, its velocity is added to the player's
+    // position each frame (reference frame tracking). On platform departure, the
+    // platform velocity is inherited into the player's velocity for smooth detachment.
+    int32_t mPlatformObjID = 0;          // object ID of platform (0 = not on a platform)
+    Vector3 mPlatformVelocity{0.0f};     // platform's velocity last frame
+
     // Ground grace period state — prevents instant Jump transitions on bumps
     // and slopes where collision + probe both fail momentarily.
     float mGroundGraceTimer = 0.0f;     // countdown timer (seconds)
@@ -749,6 +775,7 @@ private:
     FootstepCallback mFootstepCb;            // footstep sound event (stride-based)
     LandingCallback mLandingCb;              // landing impact sound event
     ObjectCollisionCallback mObjectCollisionCb;  // player-vs-object collision (Task 26)
+    PlatformVelocityCallback mPlatformVelocityCb;  // moving terrain velocity query (Task 57)
     const ObjectCollisionWorld *mObjectWorld = nullptr;  // for OBB lookup in object stepping
 
     // ── Diagnostic logging state ──
