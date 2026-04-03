@@ -365,70 +365,15 @@ public:
         // collision. For dynamic objects, ODE dNearCallback would handle them
         // separately, with the player registered as a kinematic dGeomID.
         ObjectCollisionWorld *ocw = mObjectCollision.get();
-        DarkPhysics *self = this;
         mPlayer.setObjectCollisionCallback(
-            [ocw, self](const Vector3 *centers, const float *radii,
+            [ocw](const Vector3 *centers, const float *radii,
                   int numSpheres, int32_t playerCell,
                   std::vector<SphereContact> &outContacts) {
-                size_t prevCount = outContacts.size();
                 ocw->testPlayerSpheres(centers, radii, numSpheres,
                                        playerCell, outContacts);
-                // Push dynamic objects using the original engine's velocity
-                // transfer algorithm: mass-weighted velocity averaging along
-                // the contact normal. No forces — direct velocity set.
-                Vector3 playerVel = self->mPlayer.getVelocity();
-                float playerMass = 180.0f;  // Dark Engine default player mass
-                for (size_t ci = prevCount; ci < outContacts.size(); ++ci) {
-                    int32_t objID = outContacts[ci].objectId;
-                    if (objID <= 0 || !self->hasDynamicBody(objID)) continue;
-
-                    // Skip top contacts (player standing on object)
-                    if (outContacts[ci].normal.z > 0.3f) continue;
-
-                    // Skip heavy objects — terrain fixtures, large furniture.
-                    // The player can only push objects lighter than ~50kg.
-                    // Heavier objects still participate in ODE object-object
-                    // collision but are immovable by the player.
-                    float objMass = self->getDynamicBodyMass(objID);
-                    if (objMass > 50.0f) continue;
-
-                    Vector3 norm = -outContacts[ci].normal;  // toward object
-                    // For horizontal push only (like original sphere special case)
-                    norm.z = 0.0f;
-                    float normLen = glm::length(norm);
-                    if (normLen < 0.01f) continue;
-                    norm /= normLen;
-
-                    // Project player velocity onto contact normal
-                    float playerDot = glm::dot(playerVel, norm);
-                    if (playerDot < 0.1f) continue;  // not moving toward object
-
-                    // Get object velocity along normal
-                    auto bodyIt = self->mODEBodies.find(objID);
-                    if (bodyIt == self->mODEBodies.end()) continue;
-                    dBodyID odeBody = bodyIt->second;
-                    const dReal *objVelR = dBodyGetLinearVel(odeBody);
-                    Vector3 objVel(static_cast<float>(objVelR[0]),
-                                   static_cast<float>(objVelR[1]),
-                                   static_cast<float>(objVelR[2]));
-                    float objDot = glm::dot(objVel, norm);
-
-                    // Only push if moving toward each other
-                    if (playerDot - objDot < 0.001f) continue;
-
-                    // Mass-weighted velocity average along normal
-                    // (original engine algorithm from UpdateObjectContacts)
-                    float totalMass = playerMass + objMass;
-                    float resvel = (playerDot * playerMass + objDot * objMass)
-                                    * 0.5f / totalMass;
-
-                    // Set new object velocity: remove old normal component,
-                    // add averaged result
-                    Vector3 newObjVel = objVel - norm * objDot + norm * resvel;
-                    dBodyEnable(odeBody);
-                    dBodySetLinearVel(odeBody,
-                        newObjVel.x, newObjVel.y, newObjVel.z);
-                }
+                // Player push of dynamic objects is deferred to Phase 6
+                // (script system) which will call makeDynamic() on specific
+                // objects and wire push via the velocity transfer algorithm.
             });
         // Set direct pointer for object stair stepping (ray-vs-OBB lookups).
         mPlayer.setObjectCollisionWorld(ocw);
@@ -824,17 +769,20 @@ public:
             glmMat3ToODE(body.rotation, R);
             dGeomSetRotation(geom, R);
 
-            // Check if this object should be dynamic. In the original engine,
-            // any object with a physics model that is NOT location-controlled
-            // is movable. We approximate: objects with P$PhysAttr.mass > 0 that
-            // are not managed by kinematic systems (doors, platforms, plates)
-            // become dynamic ODE bodies. Mass determines how hard they are to push,
-            // not whether they can be pushed.
+            // All objects start as STATIC ODE geoms. Dynamic simulation is
+            // activated per-object at runtime (via scripts, explosions, frob
+            // pickup/throw, etc.) by calling makeDynamic(objID). In the
+            // original engine, most objects with P$PhysAttr are NOT actively
+            // simulated — they just have collision shapes. Only specific
+            // objects get physics models registered at runtime.
+            //
+            // We read and cache P$PhysAttr for future dynamic activation
+            // but don't create dBodyIDs at load time.
             bool isDynamic = false;
             PropPhysAttr attr{};
-            if (propSvc && !(isKinematic && isKinematic(body.objID))) {
+            if (propSvc) {
                 if (getTypedProperty<PropPhysAttr>(propSvc, "PhysAttr", body.objID, attr)) {
-                    isDynamic = (attr.mass > 0.001f);
+                    // Cache material properties for future use
                 }
             }
 
@@ -899,6 +847,49 @@ public:
 
         std::fprintf(stderr, "ODE geoms: %d static, %d dynamic, 1 player capsule\n",
                      staticCount, dynamicCount);
+    }
+
+    /// Activate an object as a dynamic ODE body at runtime. Called by
+    /// scripts (Phase 6), explosions, or frob pickup/throw to make a
+    /// previously static object respond to physics forces.
+    /// Returns true if the body was created, false if already dynamic
+    /// or no geom exists for this object.
+    bool makeDynamic(int32_t objID, float mass, float friction = 0.5f,
+                     float elasticity = 0.1f) {
+        if (mODEBodies.find(objID) != mODEBodies.end()) return false;
+        auto geomIt = mODEGeoms.find(objID);
+        if (geomIt == mODEGeoms.end()) return false;
+
+        dGeomID geom = geomIt->second;
+        const ObjectCollisionBody *collBody =
+            mObjectCollision ? mObjectCollision->findBodyByObjID(objID) : nullptr;
+        if (!collBody) return false;
+
+        dBodyID odeBody = dBodyCreate(mODEWorld);
+        dMass odeMass;
+        if (collBody->shapeType == CollisionShapeType::OBB) {
+            dMassSetBox(&odeMass, 1.0,
+                collBody->edgeLengths.x, collBody->edgeLengths.y,
+                collBody->edgeLengths.z);
+        } else {
+            dMassSetSphere(&odeMass, 1.0, collBody->sphereRadius);
+        }
+        dMassAdjust(&odeMass, mass);
+        dBodySetMass(odeBody, &odeMass);
+
+        const dReal *pos = dGeomGetPosition(geom);
+        const dReal *R = dGeomGetRotation(geom);
+        dBodySetPosition(odeBody, pos[0], pos[1], pos[2]);
+        dBodySetRotation(odeBody, R);
+        dGeomSetBody(geom, odeBody);
+
+        // Update per-geom material data
+        auto *gd = static_cast<ODEGeomData *>(dGeomGetData(geom));
+        if (gd) { gd->friction = friction; gd->elasticity = elasticity; }
+
+        mODEBodies[objID] = odeBody;
+        mODEScales[objID] = collBody->objectScale;
+        return true;
     }
 
     /// Check if an object has a dynamic ODE body (for player push logic).
