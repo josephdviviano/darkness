@@ -311,6 +311,24 @@ struct PropLocked {
 };
 
 // ============================================================================
+// TPath link data (Moving Terrain / Elevators)
+// ============================================================================
+//
+// TPath links connect waypoints in a chain. Each link carries movement
+// parameters for the segment from source waypoint to destination waypoint.
+// The dtype definition is in t2-types.dtype as struct TPath (16 bytes).
+
+#pragma pack(push, 1)
+struct PropTPath {
+    float    speed;       // Movement speed along this segment (world units/sec)
+    int32_t  pausetime;   // Pause duration at destination waypoint (milliseconds)
+    uint32_t pathlimit;   // bool32: enforce hard position limit at waypoint
+    int32_t  zero;        // Padding/reserved
+};
+#pragma pack(pop)
+static_assert(sizeof(PropTPath) == 16, "PropTPath must match TPath dtype (16 bytes)");
+
+// ============================================================================
 // Tweq properties (Phase 5 — procedural object animation)
 // ============================================================================
 //
