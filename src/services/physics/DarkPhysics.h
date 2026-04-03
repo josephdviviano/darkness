@@ -373,20 +373,27 @@ public:
                 size_t prevCount = outContacts.size();
                 ocw->testPlayerSpheres(centers, radii, numSpheres,
                                        playerCell, outContacts);
-                // Push dynamic objects that the player is colliding with
+                // Gently push dynamic objects the player is walking into.
+                // Force is modest — the player nudges light objects but can't
+                // bulldoze heavy furniture. Objects heavier than the player
+                // (mass > 180) are effectively immovable by walking.
                 Vector3 playerVel = self->mPlayer.getVelocity();
                 float playerSpeed = glm::length(playerVel);
                 if (playerSpeed > 0.5f) {
                     for (size_t ci = prevCount; ci < outContacts.size(); ++ci) {
                         int32_t objID = outContacts[ci].objectId;
                         if (objID > 0 && self->hasDynamicBody(objID)) {
-                            // Push force: player velocity projected along contact normal,
-                            // scaled by player mass (180 kg) for appropriate momentum transfer
                             float pushAlongNormal = glm::dot(playerVel,
                                 -outContacts[ci].normal);
                             if (pushAlongNormal > 0.1f) {
+                                // Scale force by mass ratio: heavy objects barely move,
+                                // light objects get a gentle nudge. Cap at 1.0 so the
+                                // player never pushes harder than the object's own weight.
+                                float objMass = self->getDynamicBodyMass(objID);
+                                float massRatio = std::min(1.0f,
+                                    PLAYER_PUSH_FORCE / std::max(objMass, 1.0f));
                                 Vector3 force = -outContacts[ci].normal *
-                                    pushAlongNormal * 180.0f;
+                                    pushAlongNormal * objMass * massRatio;
                                 self->pushDynamicObject(objID, force);
                             }
                         }
@@ -459,6 +466,10 @@ private:
     }
 
     void shutdownODE() {
+        // Destroy world trimesh
+        if (mWorldTrimesh) { dGeomDestroy(mWorldTrimesh); mWorldTrimesh = nullptr; }
+        if (mWorldTrimeshData) { dGeomTriMeshDataDestroy(mWorldTrimeshData); mWorldTrimeshData = nullptr; }
+
         // Destroy player geom
         if (mPlayerGeom) { dGeomDestroy(mPlayerGeom); mPlayerGeom = nullptr; }
 
@@ -490,6 +501,12 @@ private:
     /// Maximum contact points per geom pair. 4 is sufficient for stable
     /// box-on-box stacking; more contacts = more solver work.
     static constexpr int MAX_ODE_CONTACTS = 4;
+
+    /// Maximum push force the player can exert by walking into objects.
+    /// Tuned so the player can nudge light objects (bottles, small crates)
+    /// but can't bulldoze heavy furniture (benches, tables, large crates).
+    /// Units: kg — objects heavier than this are effectively immovable.
+    static constexpr float PLAYER_PUSH_FORCE = 15.0f;
 
     /// Sentinel value stored in player geom's dGeomSetData
     static constexpr intptr_t PLAYER_GEOM_TAG = -999;
@@ -656,6 +673,72 @@ public:
     /// Called by darknessRender after world state is constructed.
     void setObjectStates(ObjectStateMap *states) { mObjectStates = states; }
 
+    /// Build ODE trimesh from WR cell solid polygons so dynamic objects
+    /// collide with floors, walls, and ceilings instead of falling through.
+    void buildWorldTrimesh() {
+        if (!mODESpace) return;
+        const auto &wr = mCollision.getWR();
+
+        // Collect all solid polygon triangles from all cells.
+        // Each polygon is a fan: vertex[0], vertex[1..n-1] form triangles.
+        std::vector<float> verts;
+        std::vector<dTriIndex> indices;
+
+        for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+            const auto &cell = wr.cells[ci];
+            int numSolid = cell.numPolygons - cell.numPortals;
+
+            for (int pi = 0; pi < numSolid; ++pi) {
+                const auto &poly = cell.polygons[pi];
+                if (poly.count < 3) continue;
+
+                const auto &idx = cell.polyIndices[pi];
+                // Fan triangulation: v0, v1, v2 ... vN → (v0,v1,v2), (v0,v2,v3), ...
+                uint32_t baseVertIdx = static_cast<uint32_t>(verts.size() / 3);
+
+                // Add all polygon vertices
+                for (int vi = 0; vi < poly.count; ++vi) {
+                    const Vector3 &v = cell.vertices[idx[vi]];
+                    verts.push_back(v.x);
+                    verts.push_back(v.y);
+                    verts.push_back(v.z);
+                }
+
+                // Fan triangulation
+                for (int ti = 1; ti < poly.count - 1; ++ti) {
+                    indices.push_back(static_cast<dTriIndex>(baseVertIdx));
+                    indices.push_back(static_cast<dTriIndex>(baseVertIdx + ti));
+                    indices.push_back(static_cast<dTriIndex>(baseVertIdx + ti + 1));
+                }
+            }
+        }
+
+        if (indices.empty()) return;
+
+        // Build ODE trimesh data — ODE takes ownership of the pointers,
+        // but we must keep the arrays alive for the lifetime of the trimesh.
+        mWorldVerts = std::move(verts);
+        mWorldIndices = std::move(indices);
+
+        mWorldTrimeshData = dGeomTriMeshDataCreate();
+        dGeomTriMeshDataBuildSingle(mWorldTrimeshData,
+            mWorldVerts.data(), 3 * sizeof(float),
+            static_cast<int>(mWorldVerts.size() / 3),
+            mWorldIndices.data(), static_cast<int>(mWorldIndices.size()),
+            3 * sizeof(dTriIndex));
+
+        mWorldTrimesh = dCreateTriMesh(mODESpace, mWorldTrimeshData,
+                                        nullptr, nullptr, nullptr);
+
+        // Static trimesh — no body, at world origin
+        dGeomSetPosition(mWorldTrimesh, 0, 0, 0);
+
+        int numTris = static_cast<int>(mWorldIndices.size() / 3);
+        int numVerts = static_cast<int>(mWorldVerts.size() / 3);
+        std::fprintf(stderr, "ODE world trimesh: %d triangles, %d vertices\n",
+                     numTris, numVerts);
+    }
+
     /// Create ODE geoms for all collision bodies. Static objects get geoms
     /// only; dynamic objects (P$PhysAttr.mass > 0) get dBodyID + dGeomID.
     /// isKinematic callback excludes objects managed by other systems
@@ -761,6 +844,15 @@ public:
         return mODEBodies.find(objID) != mODEBodies.end();
     }
 
+    /// Get the mass of a dynamic ODE body (0 if not found).
+    float getDynamicBodyMass(int32_t objID) const {
+        auto it = mODEBodies.find(objID);
+        if (it == mODEBodies.end()) return 0.0f;
+        dMass mass;
+        dBodyGetMass(it->second, &mass);
+        return static_cast<float>(mass.mass);
+    }
+
     /// Wake and push a dynamic object (called when player collides with it).
     void pushDynamicObject(int32_t objID, const Vector3 &force) {
         auto it = mODEBodies.find(objID);
@@ -800,6 +892,12 @@ private:
     dGeomID        mPlayerGeom  = nullptr;             // kinematic player capsule
     float          mODEAccum    = 0.0f;               // fixed-timestep accumulator for ODE
     ObjectStateMap *mObjectStates = nullptr;           // renderer transform sync (not owned)
+
+    // World geometry trimesh — solid WR cell polygons for object-vs-world collision
+    dTriMeshDataID mWorldTrimeshData = nullptr;
+    dGeomID        mWorldTrimesh     = nullptr;
+    std::vector<float>     mWorldVerts;    // vertex data (owned, ODE references it)
+    std::vector<dTriIndex> mWorldIndices;  // index data (owned, ODE references it)
 };
 
 } // namespace Darkness
