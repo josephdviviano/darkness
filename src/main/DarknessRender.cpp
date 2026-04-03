@@ -1406,6 +1406,11 @@ static void updateMovement(
         state.cam.pos[1] = eye.y;
         state.cam.pos[2] = eye.z;
         state.cam.roll = state.physics->getPlayerPhysics().getLeanTilt();
+
+        // Add view punch from object impacts (Source Engine spring-damper)
+        Darkness::Vector3 punch = state.physics->getPlayerPhysics().getViewPunch();
+        state.cam.pitch += punch.x;
+        state.cam.roll  += punch.z;
         return;
     }
 
@@ -2443,6 +2448,9 @@ int main(int argc, char *argv[]) {
         Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
         state.physics->buildObjectCollision(
             mission.objData.objects, mission.parsedModels, propSvc.get());
+
+        // Create ODE geoms mirroring all static collision bodies + player capsule
+        state.physics->buildODEGeoms();
 
         // Initialize edge trigger system from collision bodies with isEdgeTrigger=true
         edgeTriggerSystem.init(state.physics->getObjectCollisionWorld());
