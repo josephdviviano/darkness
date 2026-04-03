@@ -86,6 +86,7 @@
 #include "worldquery/ObjSysWorldState.h"
 #include "sim/DoorSystem.h"
 #include "sim/MovingTerrainSystem.h"
+#include "sim/EdgeTriggerSystem.h"
 #include "sim/PressurePlateSystem.h"
 #include "sim/TweqSystem.h"
 #include "sim/MessageDispatch.h"
@@ -2122,6 +2123,7 @@ int main(int argc, char *argv[]) {
     state.movingTerrainSystem = &movingTerrainSystem;
 
     Darkness::PressurePlateSystem pressurePlateSystem;
+    Darkness::EdgeTriggerSystem edgeTriggerSystem;
 
     // ── Initialize frob system ──
     // Casts a short ray from the camera each frame to find the nearest frobbable
@@ -2441,6 +2443,10 @@ int main(int argc, char *argv[]) {
         Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
         state.physics->buildObjectCollision(
             mission.objData.objects, mission.parsedModels, propSvc.get());
+
+        // Initialize edge trigger system from collision bodies with isEdgeTrigger=true
+        edgeTriggerSystem.init(state.physics->getObjectCollisionWorld());
+        edgeTriggerSystem.setMessageDispatch(&messageDispatch);
     }
 
     // Wire door collision updates: when doors animate, update their collision
@@ -2481,6 +2487,14 @@ int main(int argc, char *argv[]) {
         pressurePlateSystem.setPlayerOnObjectCallback(
             [&state](int32_t objID) -> bool {
                 return state.physics->getPlayerPhysics().isStandingOnObject(objID);
+            });
+    }
+
+    // Wire edge trigger player position query for volume entry/exit detection.
+    if (state.physics) {
+        edgeTriggerSystem.setPlayerPositionCallback(
+            [&state]() -> Darkness::Vector3 {
+                return state.physics->getPlayerPosition();
             });
     }
 
@@ -2709,6 +2723,7 @@ int main(int argc, char *argv[]) {
     simSvc->registerListener(&tweqSystem, 15);  // after doors (10), before physics (20+)
     simSvc->registerListener(&movingTerrainSystem, 12);  // after doors (10), before tweqs (15)
     simSvc->registerListener(&pressurePlateSystem, 13);  // after moving terrain (12)
+    simSvc->registerListener(&edgeTriggerSystem, 14);    // after pressure plates (13)
 
     // Set up door event callback: update audio blocking and log status changes.
     // When a door starts opening, remove sound blocking. When it finishes
@@ -2945,6 +2960,7 @@ int main(int argc, char *argv[]) {
     simSvc->unregisterListener(&tweqSystem);
     simSvc->unregisterListener(&movingTerrainSystem);
     simSvc->unregisterListener(&pressurePlateSystem);
+    simSvc->unregisterListener(&edgeTriggerSystem);
     simSvc->endSim();
 
     destroyGPUResources(gpu);
