@@ -2449,8 +2449,15 @@ int main(int argc, char *argv[]) {
         state.physics->buildObjectCollision(
             mission.objData.objects, mission.parsedModels, propSvc.get());
 
-        // Create ODE geoms mirroring all static collision bodies + player capsule
-        state.physics->buildODEGeoms();
+        // Create ODE geoms + dynamic bodies. Kinematic objects (doors, platforms,
+        // pressure plates) are excluded — they're driven by their own sim systems.
+        state.physics->setObjectStates(state.objectStates);
+        state.physics->buildODEGeoms(propSvc.get(),
+            [&doorSystem, &movingTerrainSystem, &pressurePlateSystem](int32_t objID) {
+                return doorSystem.isDoor(objID) ||
+                       movingTerrainSystem.isPlatform(objID) ||
+                       pressurePlateSystem.isPlate(objID);
+            });
 
         // Initialize edge trigger system from collision bodies with isEdgeTrigger=true
         edgeTriggerSystem.init(state.physics->getObjectCollisionWorld());
