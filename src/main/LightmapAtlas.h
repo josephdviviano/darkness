@@ -340,7 +340,8 @@ inline void blendAnimatedLightmap(
     const WRParsedData &wr,
     uint32_t cellIdx, int polyIdx,
     const LmapEntry &entry,
-    const std::unordered_map<int16_t, float> &intensities)
+    const std::unordered_map<int16_t, float> &intensities,
+    bool debugTint = false)
 {
     const auto &cell = wr.cells[cellIdx];
     const auto &li = cell.lightInfos[polyIdx];
@@ -398,6 +399,20 @@ inline void blendAnimatedLightmap(
     // Clamp to [0, 1]
     for (auto &v : blended)
         v = std::max(0.0f, std::min(1.0f, v));
+
+    // Debug tint: add magenta overlay to animated lightmap polygons.
+    // Blends 40% magenta (R=1, G=0, B=1) over the lightmap so the polygon
+    // is clearly visible while still showing the underlying lighting.
+    if (debugTint) {
+        for (int p = 0; p < pixelCount; ++p) {
+            float r = blended[p * 3 + 0];
+            float g = blended[p * 3 + 1];
+            float b = blended[p * 3 + 2];
+            blended[p * 3 + 0] = std::min(1.0f, r * 0.6f + 0.4f); // boost red
+            blended[p * 3 + 1] = g * 0.4f;                         // suppress green
+            blended[p * 3 + 2] = std::min(1.0f, b * 0.6f + 0.4f); // boost blue
+        }
+    }
 
     // Direct blit at 1:1 scale into atlas
     for (int py = 0; py < ly && (entry.pixelY + py) < atlas.size; ++py) {

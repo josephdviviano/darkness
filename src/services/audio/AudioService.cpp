@@ -23,6 +23,7 @@
 #include "AudioService.h"
 #include "AcousticMaterials.h"
 #include "CRFSoundLoader.h"
+#include "ProbeFile.h"
 #include "SchemaParser.h"
 #include "SchemaTypes.h"
 #include "ServiceCommon.h"
@@ -5064,7 +5065,7 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     std::fprintf(stderr, "Reflection bake complete: %d probes in %.1f seconds\n",
                  numProbes, reflBakeSec);
 
-    // Step 4: Serialize to disk (includes both pathing and reflection layers)
+    // Step 4: Serialize to memory buffer
     IPLSerializedObjectSettings soSettings{};
     soSettings.data = nullptr;
     soSettings.size = 0;
@@ -5082,22 +5083,61 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     IPLsize dataSize = iplSerializedObjectGetSize(serializedObject);
     IPLbyte *data = iplSerializedObjectGetData(serializedObject);
 
-    FILE *f = std::fopen(outputPath.c_str(), "wb");
-    if (!f) {
-        LOG_ERROR("AudioService: failed to open '%s' for writing", outputPath.c_str());
-        iplSerializedObjectRelease(&serializedObject);
-        iplProbeBatchRelease(&probeBatch);
-        return false;
+    // Step 5: Round-trip validation — deserialize in memory and verify probe count
+    // matches what we baked. Catches serialization bugs before they hit disk.
+    {
+        IPLSerializedObjectSettings rtSettings{};
+        rtSettings.data = data;
+        rtSettings.size = dataSize;
+        IPLSerializedObject rtObj = nullptr;
+        IPLProbeBatch rtBatch = nullptr;
+        err = iplSerializedObjectCreate(mIplContext, &rtSettings, &rtObj);
+        if (err != IPL_STATUS_SUCCESS) {
+            LOG_ERROR("AudioService: round-trip validation failed — "
+                      "iplSerializedObjectCreate returned %d", err);
+            iplSerializedObjectRelease(&serializedObject);
+            iplProbeBatchRelease(&probeBatch);
+            return false;
+        }
+        err = iplProbeBatchLoad(mIplContext, rtObj, &rtBatch);
+        iplSerializedObjectRelease(&rtObj);
+        if (err != IPL_STATUS_SUCCESS) {
+            LOG_ERROR("AudioService: round-trip validation failed — "
+                      "iplProbeBatchLoad returned %d", err);
+            iplSerializedObjectRelease(&serializedObject);
+            iplProbeBatchRelease(&probeBatch);
+            return false;
+        }
+        int rtCount = iplProbeBatchGetNumProbes(rtBatch);
+        iplProbeBatchRelease(&rtBatch);
+        if (rtCount != numProbes) {
+            LOG_ERROR("AudioService: round-trip validation failed — "
+                      "expected %d probes, deserialized %d", numProbes, rtCount);
+            iplSerializedObjectRelease(&serializedObject);
+            iplProbeBatchRelease(&probeBatch);
+            return false;
+        }
+        std::fprintf(stderr, "Round-trip validation passed (%d probes)\n", rtCount);
     }
 
-    std::fwrite(data, 1, dataSize, f);
-    std::fclose(f);
-
-    std::fprintf(stderr, "Saved %d probes to '%s' (%zu bytes)\n",
-                 numProbes, outputPath.c_str(), static_cast<size_t>(dataSize));
+    // Step 6: Write to disk with integrity header (atomic tmp+rename)
+    bool writeOk = writeProbeFile(
+        outputPath,
+        reinterpret_cast<const uint8_t *>(data),
+        static_cast<size_t>(dataSize),
+        static_cast<uint32_t>(numProbes));
 
     iplSerializedObjectRelease(&serializedObject);
     iplProbeBatchRelease(&probeBatch);
+
+    if (!writeOk) {
+        LOG_ERROR("AudioService: failed to write probe file '%s'", outputPath.c_str());
+        return false;
+    }
+
+    std::fprintf(stderr, "Saved %d probes to '%s' (%zu bytes + %zu header)\n",
+                 numProbes, outputPath.c_str(), static_cast<size_t>(dataSize),
+                 kProbeFileHeaderSize);
     return true;
 }
 
@@ -5119,26 +5159,28 @@ bool AudioService::loadProbes(const std::string &probePath)
         mProbeCount = 0;
     }
 
-    // Read file into memory
-    FILE *f = std::fopen(probePath.c_str(), "rb");
-    if (!f) {
+    // Load and validate the probe file (header + CRC check)
+    ProbeFileHeader hdr;
+    std::vector<uint8_t> payload;
+    ProbeFileStatus status = loadProbeFile(probePath, hdr, payload);
+
+    if (status == ProbeFileStatus::FileNotFound) {
         LOG_INFO("AudioService: no probe file at '%s' — pathing disabled",
                  probePath.c_str());
         return false;
     }
 
-    std::fseek(f, 0, SEEK_END);
-    size_t fileSize = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
+    if (status != ProbeFileStatus::Ok) {
+        LOG_ERROR("AudioService: probe file '%s' failed validation: %s — "
+                  "delete and re-bake",
+                  probePath.c_str(), probeFileStatusString(status));
+        return false;
+    }
 
-    std::vector<uint8_t> fileData(fileSize);
-    std::fread(fileData.data(), 1, fileSize, f);
-    std::fclose(f);
-
-    // Deserialize
+    // Deserialize the validated payload
     IPLSerializedObjectSettings soSettings{};
-    soSettings.data = reinterpret_cast<IPLbyte *>(fileData.data());
-    soSettings.size = static_cast<IPLsize>(fileSize);
+    soSettings.data = reinterpret_cast<IPLbyte *>(payload.data());
+    soSettings.size = static_cast<IPLsize>(payload.size());
 
     IPLSerializedObject serializedObject = nullptr;
     IPLerror err = iplSerializedObjectCreate(mIplContext, &soSettings, &serializedObject);
@@ -5160,6 +5202,17 @@ bool AudioService::loadProbes(const std::string &probePath)
     iplProbeBatchCommit(mIplProbeBatch);
     mProbeCount = iplProbeBatchGetNumProbes(mIplProbeBatch);
 
+    // Cross-check: probe count from header must match what Steam Audio loaded
+    if (mProbeCount != static_cast<int>(hdr.probeCount)) {
+        LOG_ERROR("AudioService: probe count mismatch — header says %u, "
+                  "Steam Audio loaded %d — discarding",
+                  hdr.probeCount, mProbeCount);
+        iplProbeBatchRelease(&mIplProbeBatch);
+        mIplProbeBatch = nullptr;
+        mProbeCount = 0;
+        return false;
+    }
+
     // Register with simulator
     waitForReflectionThread();
     iplSimulatorAddProbeBatch(mIplSimulator, mIplProbeBatch);
@@ -5174,10 +5227,10 @@ bool AudioService::loadProbes(const std::string &probePath)
     mProbesHaveReflections = (reflDataSize > 0);
 
     std::fprintf(stderr, "AudioService: loaded %d probes from '%s' "
-                 "(reflections=%s, refl_size=%zu bytes)\n",
+                 "(reflections=%s, refl_size=%zu bytes, crc=0x%08x)\n",
                  mProbeCount, probePath.c_str(),
                  mProbesHaveReflections ? "yes" : "no",
-                 static_cast<size_t>(reflDataSize));
+                 static_cast<size_t>(reflDataSize), hdr.crc32);
     return true;
 }
 
