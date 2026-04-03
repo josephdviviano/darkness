@@ -86,6 +86,7 @@
 #include "worldquery/ObjSysWorldState.h"
 #include "sim/DoorSystem.h"
 #include "sim/MovingTerrainSystem.h"
+#include "sim/PressurePlateSystem.h"
 #include "sim/TweqSystem.h"
 #include "sim/MessageDispatch.h"
 #include "FrobSystem.h"
@@ -137,6 +138,7 @@ static void printHelp() {
         "  --water-scroll <f> Water UV scroll speed, 0.0-1.0 (default: 0.05).\n"
         "  --step-log     Log stair step diagnostics to stderr ([STEP] prefix).\n"
         "  --toggle-platforms  Auto-activate all moving terrain at startup.\n"
+        "  --no-probes    Skip probe baking (no spatial audio, faster startup).\n"
         "  --debug-objects Dump per-object filtering diagnostics to stderr.\n"
         "  --config <path> Path to YAML config file (default: ./darknessRender.yaml).\n"
         "  --help         Show this help message.\n"
@@ -2078,7 +2080,8 @@ int main(int argc, char *argv[]) {
 
         // Try to load baked probe data from the darkness install folder.
         // If no probes exist, auto-bake them (with a progress bar).
-        {
+        // --no-probes skips baking entirely (no spatial audio, faster startup).
+        if (!cfg.noProbes) {
             std::string probePath = Darkness::AudioService::getProbeFilePath(misPath);
             if (!audioSvc->loadProbes(probePath)) {
                 // No baked probes — need to bake.
@@ -2087,6 +2090,8 @@ int main(int argc, char *argv[]) {
                 state.probeBakePath = probePath;
                 state.probeBakeNeeded = true;
             }
+        } else {
+            std::fprintf(stderr, "Probe baking skipped (--no-probes)\n");
         }
 
         // Store acoustic mesh data for debug wireframe overlay.
@@ -2115,6 +2120,8 @@ int main(int argc, char *argv[]) {
     Darkness::TweqSystem tweqSystem;
     Darkness::MovingTerrainSystem movingTerrainSystem;
     state.movingTerrainSystem = &movingTerrainSystem;
+
+    Darkness::PressurePlateSystem pressurePlateSystem;
 
     // ── Initialize frob system ──
     // Casts a short ray from the camera each frame to find the nearest frobbable
@@ -2415,6 +2422,17 @@ int main(int argc, char *argv[]) {
         movingTerrainSystem.setMessageDispatch(&messageDispatch);
     }
 
+    // ── Initialize pressure plate system ──
+    // Scans for objects with P$PhysPPlat property. Plates depress when the
+    // player stands on them and send TurnOn/TurnOff via SwitchLinks.
+    {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
+        pressurePlateSystem.init(propSvc.get(), objSvc.get(),
+                                 state.objectStates, &doorPlacements);
+        pressurePlateSystem.setMessageDispatch(&messageDispatch);
+    }
+
     // ── Build object collision bodies from .bin bounding boxes ──
     // Creates OBB/sphere collision bodies for placed objects (crates, furniture,
     // doors) so the player can't walk through them. Uses P$PhysType properties
@@ -2440,6 +2458,11 @@ int main(int argc, char *argv[]) {
                 [ocw](int32_t objID, const Darkness::Matrix4 &worldMatrix) {
                     ocw->updateBodyTransform(objID, worldMatrix);
                 });
+            // Pressure plates also need collision body updates
+            pressurePlateSystem.setCollisionUpdateCallback(
+                [ocw](int32_t objID, const Darkness::Matrix4 &worldMatrix) {
+                    ocw->updateBodyTransform(objID, worldMatrix);
+                });
         }
     }
 
@@ -2449,6 +2472,15 @@ int main(int argc, char *argv[]) {
         state.physics->getPlayerPhysics().setPlatformVelocityCallback(
             [&movingTerrainSystem](int32_t objID) -> const Darkness::Vector3 * {
                 return movingTerrainSystem.getVelocity(objID);
+            });
+    }
+
+    // Wire pressure plate weight detection: checks if player is standing on
+    // a plate's collision body via ground contact object IDs.
+    if (state.physics) {
+        pressurePlateSystem.setPlayerOnObjectCallback(
+            [&state](int32_t objID) -> bool {
+                return state.physics->getPlayerPhysics().isStandingOnObject(objID);
             });
     }
 
@@ -2676,6 +2708,7 @@ int main(int argc, char *argv[]) {
     simSvc->registerListener(&doorSystem, 10);
     simSvc->registerListener(&tweqSystem, 15);  // after doors (10), before physics (20+)
     simSvc->registerListener(&movingTerrainSystem, 12);  // after doors (10), before tweqs (15)
+    simSvc->registerListener(&pressurePlateSystem, 13);  // after moving terrain (12)
 
     // Set up door event callback: update audio blocking and log status changes.
     // When a door starts opening, remove sound blocking. When it finishes
@@ -2911,6 +2944,7 @@ int main(int argc, char *argv[]) {
     simSvc->unregisterListener(&doorSystem);
     simSvc->unregisterListener(&tweqSystem);
     simSvc->unregisterListener(&movingTerrainSystem);
+    simSvc->unregisterListener(&pressurePlateSystem);
     simSvc->endSim();
 
     destroyGPUResources(gpu);
