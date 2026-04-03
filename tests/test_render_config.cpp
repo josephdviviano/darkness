@@ -49,7 +49,7 @@ TEST_CASE("RenderConfig defaults", "[config]") {
     CHECK(cfg.showObjects      == true);
     CHECK(cfg.showFallbackCubes == false);
     CHECK(cfg.portalCulling    == true);
-    CHECK(cfg.forceFlicker     == false);
+
     CHECK(cfg.cameraCollision  == false);
 }
 
@@ -64,7 +64,6 @@ developer:
   show_objects: false
   show_fallback_cubes: true
   portal_culling: false
-  force_flicker: true
   camera_collision: true
 )");
 
@@ -79,7 +78,7 @@ developer:
     CHECK(cfg.showObjects      == false);
     CHECK(cfg.showFallbackCubes == true);
     CHECK(cfg.portalCulling    == false);
-    CHECK(cfg.forceFlicker     == true);
+
     CHECK(cfg.cameraCollision  == true);
 }
 
@@ -100,7 +99,6 @@ graphics:
     CHECK(cfg.sharpMips  == false);
     CHECK(cfg.showObjects   == true);
     CHECK(cfg.portalCulling == true);
-    CHECK(cfg.forceFlicker  == false);
 }
 
 TEST_CASE("YAML missing file returns false, config unchanged", "[config][yaml]") {
@@ -136,7 +134,7 @@ TEST_CASE("CLI flags override defaults", "[config][cli]") {
     std::vector<std::string> args = {
         "darknessRender", "mission.mis",
         "--no-objects", "--no-cull", "--filter",
-        "--lightmap-filtering", "bicubic", "--force-flicker",
+        "--lightmap-filtering", "bicubic",
         "--linear-mips", "--sharp-mips", "--show-fallback",
         "--collision"
     };
@@ -150,7 +148,7 @@ TEST_CASE("CLI flags override defaults", "[config][cli]") {
     CHECK(cfg.portalCulling    == false);
     CHECK(cfg.filterMode       == 1);
     CHECK(cfg.lightmapFiltering == 1);
-    CHECK(cfg.forceFlicker     == true);
+
     CHECK(cfg.linearMips       == true);
     CHECK(cfg.sharpMips        == true);
     CHECK(cfg.cameraCollision  == true);
