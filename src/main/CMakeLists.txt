@@ -146,6 +146,7 @@ add_dependencies(darknessRender compile_shaders)
 target_include_directories(darknessRender PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${GENERATED_SHADER_DIR}
+    ${DARKNESS_SOURCE_DIR}/src/scripts
 )
 
 target_link_libraries(darknessRender PRIVATE
