@@ -110,9 +110,9 @@ public:
 
                 if (mMsgDispatch) {
                     // Send PhysEnter message to the trigger object
-                    mMsgDispatch->sendMessage({objID, "PhysEnter", 0, 0});
-                    // Also send TurnOn via SwitchLinks for basic functionality
-                    // without the script system (Phase 6)
+                    mMsgDispatch->sendMessage({objID, "PhysEnter", 0, {}});
+                    // Also send TurnOn via ControlDevice links for basic
+                    // functionality without the script system
                     mMsgDispatch->turnOn(objID, objID);
                 }
 
@@ -123,8 +123,8 @@ public:
 
                 if (mMsgDispatch) {
                     // Send PhysExit message to the trigger object
-                    mMsgDispatch->sendMessage({objID, "PhysExit", 0, 0});
-                    // Also send TurnOff via SwitchLinks
+                    mMsgDispatch->sendMessage({objID, "PhysExit", 0, {}});
+                    // Also send TurnOff via ControlDevice links
                     mMsgDispatch->turnOff(objID, objID);
                 }
             }
