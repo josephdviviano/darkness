@@ -124,11 +124,11 @@ public:
     }
 };
 
-/// Minimal IWorldQuery mock for MessageDispatch SwitchLink tests.
+/// Minimal IWorldQuery mock for MessageDispatch ControlDevice tests.
 /// Only getLinks() is implemented — everything else returns defaults.
 class MockWorldQuery : public IWorldQuery {
 public:
-    // Configure: when getLinks(src, "SwitchLink", 0) is called, return these links
+    // Configure: when getLinks(src, "ControlDevice", 0) is called, return these links
     std::unordered_map<int32_t, std::vector<LinkInfo>> switchLinks;
 
     // Required IWorldQuery overrides (stubs)
@@ -147,13 +147,13 @@ public:
 
     RelationHandle resolveRelation(const std::string &relName) const override {
         RelationHandle h;
-        if (relName == "SwitchLink") h._internal = reinterpret_cast<void*>(1);
+        if (relName == "ControlDevice") h._internal = reinterpret_cast<void*>(1);
         return h;
     }
 
     std::vector<LinkInfo> getLinks(EntityID src, const std::string &relName,
                                     EntityID) const override {
-        if (relName != "SwitchLink") return {};
+        if (relName != "ControlDevice") return {};
         auto it = switchLinks.find(static_cast<int32_t>(src));
         if (it != switchLinks.end()) return it->second;
         return {};
@@ -162,7 +162,7 @@ public:
     std::vector<LinkInfo> getLinks(EntityID src, const RelationHandle &handle,
                                     EntityID) const override {
         if (!handle) return {};
-        return getLinks(src, std::string("SwitchLink"), EntityID(0));
+        return getLinks(src, std::string("ControlDevice"), EntityID(0));
     }
 
     std::vector<LinkInfo> getBackLinks(EntityID, const std::string &,
@@ -632,9 +632,9 @@ TEST_CASE("MessageDispatch: per-object consuming blocks global", "[MessageDispat
     REQUIRE(globalHit == false);
 }
 
-TEST_CASE("MessageDispatch: FrobWorldEnd follows SwitchLink", "[MessageDispatch]") {
+TEST_CASE("MessageDispatch: FrobWorldEnd follows ControlDevice", "[MessageDispatch]") {
     MockWorldQuery wq;
-    // Object 10 has SwitchLink to object 20
+    // Object 10 has ControlDevice to object 20
     wq.switchLinks[10] = {{1, 10, 20, 0}};
 
     MessageDispatch md;
@@ -648,14 +648,14 @@ TEST_CASE("MessageDispatch: FrobWorldEnd follows SwitchLink", "[MessageDispatch]
         return true;
     });
 
-    // FrobWorldEnd on object 10 should follow SwitchLink to send TurnOn to 20
+    // FrobWorldEnd on object 10 should follow ControlDevice to send TurnOn to 20
     md.sendMessageWithLinks({10, "FrobWorldEnd", 0, 0});
     REQUIRE(targetHit == true);
 }
 
-TEST_CASE("MessageDispatch: SwitchLink propagation is one-hop only", "[MessageDispatch]") {
+TEST_CASE("MessageDispatch: ControlDevice propagation is one-hop only", "[MessageDispatch]") {
     MockWorldQuery wq;
-    // Chain: 10 →SwitchLink→ 20 →SwitchLink→ 30
+    // Chain: 10 →ControlDevice→ 20 →ControlDevice→ 30
     wq.switchLinks[10] = {{1, 10, 20, 0}};
     wq.switchLinks[20] = {{2, 20, 30, 0}};
 

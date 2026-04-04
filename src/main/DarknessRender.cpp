@@ -2146,7 +2146,7 @@ int main(int argc, char *argv[]) {
 
     // ── Initialize message dispatch ──
     // Routes script messages (TurnOn, TurnOff, FrobWorldEnd) to handlers.
-    // SwitchLink traversal: frobbing a lever sends TurnOn to linked objects.
+    // ControlDevice link traversal: frobbing a lever sends TurnOn to linked objects.
     Darkness::MessageDispatch messageDispatch;
     messageDispatch.init(worldQuery.get());
 
@@ -2239,7 +2239,7 @@ int main(int argc, char *argv[]) {
             return doorSystem.activate(msg.to, Darkness::kDoorToggle);
         });
 
-    // Connect FrobSystem to MessageDispatch for SwitchLink traversal
+    // Connect FrobSystem to MessageDispatch for ControlDevice link traversal
     frobSystem.setMessageDispatch(&messageDispatch);
     state.messageDispatch = &messageDispatch;
 
@@ -2431,7 +2431,7 @@ int main(int argc, char *argv[]) {
 
     // ── Initialize pressure plate system ──
     // Scans for objects with P$PhysPPlat property. Plates depress when the
-    // player stands on them and send TurnOn/TurnOff via SwitchLinks.
+    // player stands on them and send TurnOn/TurnOff via ControlDevice links.
     {
         Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
         Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);

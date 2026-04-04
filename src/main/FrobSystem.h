@@ -180,14 +180,14 @@ public:
     }
 
     /// Execute frob on the current target. Returns true if action was taken.
-    /// Routes through MessageDispatch which handles SwitchLink traversal —
+    /// Routes through MessageDispatch which handles ControlDevice link traversal —
     /// frobbing a lever sends FrobWorldEnd to the lever, which follows
-    /// SwitchLink relations to send TurnOn to linked doors/objects.
+    /// ControlDevice relations to send TurnOn to linked doors/objects.
     bool executeFrob() {
         if (mTarget.objID == 0) return false;
 
         // Route through MessageDispatch if available — this handles
-        // SwitchLink traversal (lever→door) and built-in handlers
+        // ControlDevice link traversal (lever→door) and built-in handlers
         if (mMsgDispatch) {
             mMsgDispatch->frobWorldEnd(mTarget.objID, 0 /* player */);
             std::fprintf(stderr, "Frob: %s obj %d (%s) dist=%.1f\n",
@@ -216,7 +216,7 @@ public:
     void setFrobDistance(float dist) { mFrobDistance = dist; }
     float getFrobDistance() const { return mFrobDistance; }
 
-    /// Set the message dispatch system (for SwitchLink traversal).
+    /// Set the message dispatch system (for ControlDevice link traversal).
     void setMessageDispatch(MessageDispatch *md) { mMsgDispatch = md; }
 
 private:

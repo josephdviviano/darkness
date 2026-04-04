@@ -23,7 +23,7 @@
 //
 // Implements the Dark Engine pressure plate system: objects that depress
 // when sufficient weight is placed on them and send script messages to
-// linked targets via SwitchLink/ControlDevice.
+// linked targets via ControlDevice relations.
 //
 // Architecture:
 //   - PressurePlateSystem is a SimListener: receives simStep() from SimService
@@ -344,7 +344,7 @@ private:
 
         // Send PressurePlate* message names matching Dark Engine convention.
         // Scripts (e.g. StdPressurePlate) listen for these and route TurnOn/TurnOff
-        // via SwitchLink/ControlDevice. Without scripts, we send TurnOn/TurnOff
+        // via ControlDevice links. Without scripts, we send TurnOn/TurnOff
         // directly via MessageDispatch for connected objects.
         const char *msgName = nullptr;
         switch (status) {
@@ -371,7 +371,7 @@ private:
 
     void sendScriptMessage(int32_t objID, const char *msgName) {
         if (mMsgDispatch)
-            mMsgDispatch->sendMessage({objID, msgName, objID, 0});
+            mMsgDispatch->sendMessage({objID, msgName, objID, {}});
     }
 
     void sendTurnOn(int32_t objID) {
