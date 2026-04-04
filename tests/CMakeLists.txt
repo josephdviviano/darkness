@@ -30,6 +30,7 @@ target_include_directories(darkness_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/services
     ${CMAKE_SOURCE_DIR}/src/base
     ${CMAKE_SOURCE_DIR}/src/base/dyntype
+    ${CMAKE_SOURCE_DIR}/src/scripts
 )
 
 # Point tests to fixture zip and schema scripts
