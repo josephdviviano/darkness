@@ -58,6 +58,9 @@ struct DataScriptService;
 struct LockedScriptService;
 struct PhysicsScriptService;
 struct DoorScriptService;
+struct ContainerScriptService;
+struct DarkGameScriptService;
+struct DarkUIScriptService;
 
 // ============================================================================
 // IScriptServices — aggregate of all services available to scripts
@@ -90,6 +93,9 @@ struct IScriptServices {
     LockedScriptService *locked = nullptr;
     PhysicsScriptService *physics = nullptr;
     DoorScriptService *door = nullptr;
+    ContainerScriptService *container = nullptr;
+    DarkGameScriptService *darkGame = nullptr;
+    DarkUIScriptService *darkUI = nullptr;
 };
 
 } // namespace Darkness
