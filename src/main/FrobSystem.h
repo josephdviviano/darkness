@@ -220,6 +220,7 @@ public:
         // P$PhysType collision bodies. Uses the pre-built frob cache (built once
         // at init via buildFrobCache) to avoid per-frame property lookups.
         if (mTarget.objID == 0 && mWorldQuery) {
+            int nearCount = 0;
             for (const auto &entry : mFrobCache) {
                 // Get object position (from ObjectState or P$Position via IWorldQuery)
                 Vector3 objPos = mWorldQuery->getPosition(entry.objID);
@@ -228,10 +229,12 @@ public:
                 if (dist > mFrobDistance || dist < 0.1f)
                     continue;
 
+                nearCount++;
+
                 // Cone test: object must be roughly in front of the camera
-                // (within ~30 degrees of look direction)
+                // (within ~45 degrees of look direction for wider targeting)
                 float dotFwd = glm::dot(glm::normalize(toObj), forward);
-                if (dotFwd < 0.85f)
+                if (dotFwd < 0.7f)  // ~45 degrees
                     continue;
 
                 // Parametric distance along ray
