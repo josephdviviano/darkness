@@ -125,12 +125,15 @@ public:
         // Debug: log every few frames if we have object contacts
         static int frameCount = 0;
         if (mDebugLog && (++frameCount % 120 == 0)) {
-            int objContacts = 0;
-            for (const auto &c : contacts)
-                if (c.objectId >= 0) objContacts++;
-            if (objContacts > 0)
-                std::fprintf(stderr, "[PUSH-DBG] %zu contacts, %d object contacts, vel=(%.1f,%.1f,%.1f)\n",
-                             contacts.size(), objContacts, playerVelocity.x, playerVelocity.y, playerVelocity.z);
+            for (const auto &c : contacts) {
+                if (c.objectId >= 0) {
+                    bool pushable = mPushableObjects.count(c.objectId) > 0;
+                    std::fprintf(stderr, "[PUSH-DBG] objID=%d pushable=%d n=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f)\n",
+                                 c.objectId, pushable,
+                                 c.normal.x, c.normal.y, c.normal.z,
+                                 playerVelocity.x, playerVelocity.y, playerVelocity.z);
+                }
+            }
         }
 
         for (const auto &contact : contacts) {
