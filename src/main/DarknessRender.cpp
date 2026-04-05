@@ -90,6 +90,18 @@
 #include "sim/PressurePlateSystem.h"
 #include "sim/TweqSystem.h"
 #include "sim/MessageDispatch.h"
+#include "sim/ScriptManager.h"
+#include "sim/IScriptServices.h"
+#include "sim/ScriptServices.h"
+#include "sim/ObjectPushSystem.h"
+#include "StdDoor.h"
+#include "StdLever.h"
+#include "StdElevator.h"
+#include "StdTrap.h"
+#include "Triggers.h"
+#include "AnimLightScript.h"
+#include "SoundScripts.h"
+#include "GameLogic.h"
 #include "FrobSystem.h"
 #include "FunctionalLoopClient.h"
 
@@ -2273,6 +2285,83 @@ int main(int argc, char *argv[]) {
     frobSystem.setMessageDispatch(&messageDispatch);
     state.messageDispatch = &messageDispatch;
 
+    // ── Initialize Script System (Phase 6) ──
+    // ScriptManager reads P$Scripts from all concrete objects and instantiates
+    // C++ script classes (StdDoor, StdLever, AnimLight, traps, triggers, etc.).
+    // Scripts receive messages first; unhandled messages fall through to the
+    // global MessageDispatch handlers above (backward compat).
+    Darkness::ScriptManager scriptManager;
+    Darkness::ObjectPushSystem objectPushSystem;
+
+    // Script service wrappers — thin facades around existing OPDE services.
+    // These must outlive the ScriptManager (scripts hold pointers to them).
+    Darkness::LinkScriptService linkScriptSvc;
+    Darkness::ObjectScriptService objectScriptSvc;
+    Darkness::PropertyScriptService propertyScriptSvc;
+    Darkness::SoundScriptService soundScriptSvc;
+    Darkness::LightScriptService lightScriptSvc;
+    Darkness::DamageScriptService damageScriptSvc;
+    Darkness::DataScriptService dataScriptSvc;
+    Darkness::LockedScriptService lockedScriptSvc;
+    Darkness::PhysicsScriptService physicsScriptSvc;
+    Darkness::DoorScriptService doorScriptSvc;
+    Darkness::ContainerScriptService containerScriptSvc;
+    Darkness::DarkGameScriptService darkGameScriptSvc;
+    Darkness::DarkUIScriptService darkUIScriptSvc;
+    Darkness::IScriptServices scriptServices;  // aggregate — must outlive scripts
+
+    // Wire service wrappers to backing OPDE services
+    {
+        auto propSvc = GET_SERVICE(Darkness::PropertyService);
+        auto linkSvc = GET_SERVICE(Darkness::LinkService);
+        auto objSvc = GET_SERVICE(Darkness::ObjectService);
+
+        linkScriptSvc.linkSvc = linkSvc.get();
+        objectScriptSvc.objSvc = objSvc.get();
+        objectScriptSvc.worldQuery = worldQuery.get();
+        propertyScriptSvc.propSvc = propSvc.get();
+        // soundScriptSvc.audioSvc wired after AudioService init (below)
+        damageScriptSvc.msgDispatch = &messageDispatch;
+        lockedScriptSvc.propSvc = propSvc.get();
+        lockedScriptSvc.msgDispatch = &messageDispatch;
+        doorScriptSvc.doorSys = &doorSystem;
+        containerScriptSvc.linkSvc = linkSvc.get();
+
+        // Populate aggregate service struct for scripts
+        scriptServices.propertyService = propSvc.get();
+        scriptServices.linkService = linkSvc.get();
+        scriptServices.objectService = objSvc.get();
+        scriptServices.doorSystem = &doorSystem;
+        scriptServices.tweqSystem = &tweqSystem;
+        scriptServices.movingTerrainSystem = &movingTerrainSystem;
+        scriptServices.messageDispatch = &messageDispatch;
+        scriptServices.link = &linkScriptSvc;
+        scriptServices.object = &objectScriptSvc;
+        scriptServices.property = &propertyScriptSvc;
+        scriptServices.sound = &soundScriptSvc;
+        scriptServices.light = &lightScriptSvc;
+        scriptServices.damage = &damageScriptSvc;
+        scriptServices.data = &dataScriptSvc;
+        scriptServices.locked = &lockedScriptSvc;
+        scriptServices.physics = &physicsScriptSvc;
+        scriptServices.door = &doorScriptSvc;
+        scriptServices.container = &containerScriptSvc;
+        scriptServices.darkGame = &darkGameScriptSvc;
+        scriptServices.darkUI = &darkUIScriptSvc;
+
+        // Initialize ScriptManager and instantiate scripts from P$Scripts
+        scriptManager.init(propSvc.get(), linkSvc.get(), objSvc.get(),
+                           &messageDispatch, &scriptServices);
+        scriptManager.instantiateScripts();
+
+        // Initialize ObjectPushSystem (Task 61)
+        Darkness::ObjectCollisionWorld *ocw =
+            state.physics ? state.physics->getObjectCollisionWorld() : nullptr;
+        objectPushSystem.init(propSvc.get(), state.objectStates, ocw, &doorSystem);
+        if (state.physics)
+            state.physics->setPushSystem(&objectPushSystem);
+    }
+
     // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
     loadWorldTextures(misPath, resPath, mission);
 
@@ -2767,10 +2856,29 @@ int main(int argc, char *argv[]) {
     // Register DoorSystem as a SimListener so it receives simStep() calls.
     // Priority 10 = before physics (which would be 20+ when registered).
     simSvc->registerListener(&doorSystem, 10);
-    simSvc->registerListener(&tweqSystem, 15);  // after doors (10), before physics (20+)
-    simSvc->registerListener(&movingTerrainSystem, 12);  // after doors (10), before tweqs (15)
+    simSvc->registerListener(&movingTerrainSystem, 12);  // after doors (10)
     simSvc->registerListener(&pressurePlateSystem, 13);  // after moving terrain (12)
     simSvc->registerListener(&edgeTriggerSystem, 14);    // after pressure plates (13)
+    simSvc->registerListener(&tweqSystem, 15);            // after edge triggers (14)
+    simSvc->registerListener(&objectPushSystem, 16);      // after tweqs (15)
+    simSvc->registerListener(&scriptManager, 60);         // after physics, before render
+
+    // Hook TweqSystem completion events → ScriptManager TweqComplete messages
+    tweqSystem.setEventCallback([&scriptManager](int32_t objID, Darkness::eTweqType type,
+                                                  int action) {
+        Darkness::ScriptMessage msg;
+        msg.to = objID;
+        msg.name = "TweqComplete";
+        msg.from = objID;
+        msg.data = Darkness::Variant(static_cast<int>(type));   // tweq type
+        msg.data2 = Darkness::Variant(action);                   // direction/halt action
+        scriptManager.sendMessage(msg);
+    });
+
+    // Hook MovingTerrainSystem waypoint arrival → ScriptManager messages
+    // MovingTerrainSystem already uses MessageDispatch for TurnOn/TurnOff;
+    // we add a dedicated waypoint callback for StdElevator scripts.
+    movingTerrainSystem.setMessageDispatch(&messageDispatch);
 
     // Set up door event callback: update audio blocking and log status changes.
     // When a door starts opening, remove sound blocking. When it finishes
@@ -2779,9 +2887,24 @@ int main(int argc, char *argv[]) {
     {
     Darkness::AudioServicePtr audioForEvents = GET_SERVICE(Darkness::AudioService);
     Darkness::PropertyServicePtr propSvcForDoors = GET_SERVICE(Darkness::PropertyService);
-    doorSystem.setEventCallback([audioForEvents, propSvcForDoors](int32_t objID, Darkness::DoorStatus status,
+    Darkness::ScriptManager *scriptMgrPtr = &scriptManager;
+    doorSystem.setEventCallback([audioForEvents, propSvcForDoors, scriptMgrPtr](int32_t objID, Darkness::DoorStatus status,
                                     Darkness::DoorStatus oldStatus,
                                     const Darkness::DoorState &door) {
+        // Send door state message through ScriptManager for script handlers
+        // (StdDoor, TrigDoorOpen, etc.)
+        {
+            static const char *msgNames[] = {"DoorClose", "DoorOpen", "DoorClosing", "DoorOpening", "DoorHalt"};
+            if (status >= 0 && status <= 4) {
+                Darkness::ScriptMessage doorMsg;
+                doorMsg.to = objID;
+                doorMsg.name = msgNames[status];
+                doorMsg.from = objID;
+                doorMsg.data = Darkness::Variant(static_cast<int>(status));
+                doorMsg.data2 = Darkness::Variant(static_cast<int>(oldStatus));
+                scriptMgrPtr->sendMessage(doorMsg);
+            }
+        }
         // State name strings matching Dark Engine schema env_tag convention
         const char *stateNames[] = {"Closed", "Open", "Closing", "Opening", "Halted"};
         const char *statusName = (status >= 0 && status <= 4) ? stateNames[status] : "?";
