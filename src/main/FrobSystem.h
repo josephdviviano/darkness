@@ -104,6 +104,38 @@ public:
     /// that have FrobInfo but no P$PhysType collision body.
     void setWorldQuery(const IWorldQuery *wq) { mWorldQuery = wq; }
 
+    /// Build the frobbable-object cache: scans all positioned objects and stores
+    /// those with FrobInfo (via inheritance) that lack collision bodies.
+    /// Must be called after buildObjectCollision so collision bodies exist.
+    void buildFrobCache() {
+        if (!mPropSvc || !mWorldQuery) return;
+        mFrobCache.clear();
+
+        // Scan all positioned objects (same set as script instantiation)
+        auto allPositioned = getAllObjectsWithProperty(mPropSvc, "Position");
+        for (int objID : allPositioned) {
+            if (objID <= 0) continue;
+
+            // Skip objects that have collision bodies (handled by ray-vs-OBB)
+            if (mCollisionWorld && mCollisionWorld->findBodyByObjID(objID))
+                continue;
+
+            // Check FrobInfo via inheritance
+            PropFrobInfo frobInfo;
+            if (!getTypedProperty<PropFrobInfo>(mPropSvc, "FrobInfo", objID, frobInfo))
+                continue;
+            if (frobInfo.worldAction == 0 || (frobInfo.worldAction & kFrobIgnore))
+                continue;
+
+            FrobCacheEntry entry;
+            entry.objID = objID;
+            entry.worldAction = frobInfo.worldAction;
+            mFrobCache.push_back(entry);
+        }
+        std::fprintf(stderr, "[FrobSystem] %zu frobbable objects without collision bodies cached\n",
+                     mFrobCache.size());
+    }
+
     /// Update frob target each frame. Cast ray from camera and find nearest
     /// frobbable object. Call before render so highlight is current.
     void update(const Camera &cam) {
@@ -185,29 +217,12 @@ public:
 
         // ── Fallback: proximity-based frob for objects without collision bodies ──
         // Levers, switches, books, and other small frobbable objects often lack
-        // P$PhysType collision bodies. Test them by position + distance check.
-        if (mTarget.objID == 0 && mWorldQuery && mPropSvc) {
-            auto frobObjects = mWorldQuery->getAllWithProperty("FrobInfo");
-            for (EntityID eid : frobObjects) {
-                int32_t objID = static_cast<int32_t>(eid);
-                if (objID <= 0) continue;
-
-                // Skip objects that already have collision bodies (handled above)
-                if (mCollisionWorld && mCollisionWorld->findBodyByObjID(objID))
-                    continue;
-
-                // Skip doors (handled by collision body path)
-                if (mDoorSys && mDoorSys->isDoor(objID))
-                    continue;
-
-                PropFrobInfo frobInfo;
-                if (!getTypedProperty<PropFrobInfo>(mPropSvc, "FrobInfo", objID, frobInfo))
-                    continue;
-                if (frobInfo.worldAction == 0 || (frobInfo.worldAction & kFrobIgnore))
-                    continue;
-
+        // P$PhysType collision bodies. Uses the pre-built frob cache (built once
+        // at init via buildFrobCache) to avoid per-frame property lookups.
+        if (mTarget.objID == 0 && mWorldQuery) {
+            for (const auto &entry : mFrobCache) {
                 // Get object position (from ObjectState or P$Position via IWorldQuery)
-                Vector3 objPos = mWorldQuery->getPosition(eid);
+                Vector3 objPos = mWorldQuery->getPosition(entry.objID);
                 Vector3 toObj = objPos - rayStart;
                 float dist = glm::length(toObj);
                 if (dist > mFrobDistance || dist < 0.1f)
@@ -225,15 +240,15 @@ public:
                     continue;
 
                 bestT = t;
-                mTarget.objID = objID;
+                mTarget.objID = entry.objID;
                 mTarget.distance = dist;
                 mTarget.hitPoint = objPos;
                 mTarget.isDoor = false;
-                mTarget.frobActions = frobInfo.worldAction;
+                mTarget.frobActions = entry.worldAction;
                 if (mObjSvc) {
-                    mTarget.name = mObjSvc->getName(objID);
+                    mTarget.name = mObjSvc->getName(entry.objID);
                     if (mTarget.name.empty())
-                        mTarget.name = "obj " + std::to_string(objID);
+                        mTarget.name = "obj " + std::to_string(entry.objID);
                 }
             }
         }
@@ -288,6 +303,13 @@ private:
     const IWorldQuery *mWorldQuery = nullptr;
     FrobTarget mTarget;
     float mFrobDistance = kDefaultFrobDistance;
+
+    // Pre-built cache of frobbable objects without collision bodies
+    struct FrobCacheEntry {
+        int32_t objID;
+        uint32_t worldAction;
+    };
+    std::vector<FrobCacheEntry> mFrobCache;
 };
 
 } // namespace Darkness
