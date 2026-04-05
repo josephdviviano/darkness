@@ -122,6 +122,17 @@ public:
     /// Scans player contacts for object hits and applies push impulse.
     void processPlayerContacts(const std::vector<SphereContact> &contacts,
                                const Vector3 &playerVelocity) {
+        // Debug: log every few frames if we have object contacts
+        static int frameCount = 0;
+        if (mDebugLog && (++frameCount % 120 == 0)) {
+            int objContacts = 0;
+            for (const auto &c : contacts)
+                if (c.objectId >= 0) objContacts++;
+            if (objContacts > 0)
+                std::fprintf(stderr, "[PUSH-DBG] %zu contacts, %d object contacts, vel=(%.1f,%.1f,%.1f)\n",
+                             contacts.size(), objContacts, playerVelocity.x, playerVelocity.y, playerVelocity.z);
+        }
+
         for (const auto &contact : contacts) {
             if (contact.objectId < 0) continue;  // terrain contact
             if (!mPushableObjects.count(contact.objectId)) continue;
