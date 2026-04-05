@@ -132,28 +132,28 @@ public:
     }
 
     /// Read P$Scripts from all concrete objects and instantiate script classes.
-    /// Walks MetaProp inheritance when dontInherit is false.
+    /// Uses OPDE's inheritor system to resolve scripts from archetypes.
     void instantiateScripts() {
         if (!mPropSvc) return;
 
-        // Get all objects that directly have a Scripts property
-        auto directOwners = getAllObjectsWithProperty(mPropSvc, "Scripts");
-
-        // Also collect objects that inherit scripts via MetaProp
-        // We need to scan all concrete objects (positive IDs) that have
-        // the Scripts property through inheritance
         Property *scriptProp = mPropSvc->getProperty("Scripts");
         if (!scriptProp) {
             std::fprintf(stderr, "[ScriptManager] WARNING: P$Scripts property not registered\n");
             return;
         }
 
-        // Collect all concrete objects (positive IDs) that have scripts
-        // either directly or through inheritance
-        std::unordered_map<int32_t, PropScripts> objectScripts;
+        // We need to scan ALL concrete objects (positive IDs) because most
+        // objects inherit P$Scripts from archetypes rather than owning it
+        // directly. getTypedProperty uses the inheritor system to resolve.
+        // To find all concrete objects, scan the Position property which
+        // every placed object has directly.
+        auto allPositioned = getAllObjectsWithProperty(mPropSvc, "Position");
 
-        for (int objID : directOwners) {
+        std::unordered_map<int32_t, PropScripts> objectScripts;
+        for (int objID : allPositioned) {
+            if (objID <= 0) continue;  // skip archetypes
             PropScripts scripts;
+            // getTypedProperty resolves inheritance — walks archetype chain
             if (getTypedProperty<PropScripts>(mPropSvc, "Scripts", objID, scripts)) {
                 objectScripts[objID] = scripts;
             }

@@ -396,7 +396,16 @@ public:
 
     /// Set the object push system for kinematic pushing (Task 61).
     /// Called during main loop initialization, after ObjectPushSystem::init().
-    void setPushSystem(ObjectPushSystem *pushSys) { mPushSystem = pushSys; }
+    /// Also wires the IsPushable callback so stair stepping is suppressed
+    /// for pushable objects (player pushes them instead of climbing over).
+    void setPushSystem(ObjectPushSystem *pushSys) {
+        mPushSystem = pushSys;
+        if (pushSys) {
+            mPlayer.setIsPushableCallback([pushSys](int32_t objID) -> bool {
+                return pushSys->isPushable(objID);
+            });
+        }
+    }
 
     // ── Direct access for renderer integration ──
 

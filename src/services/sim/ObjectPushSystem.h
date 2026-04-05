@@ -270,6 +270,11 @@ public:
 
     // ── Query ──
 
+    /// Check if an object is pushable (used by PlayerPhysics to skip stair stepping).
+    bool isPushable(int32_t objID) const {
+        return mPushableObjects.count(objID) > 0;
+    }
+
     /// Number of currently moving objects.
     size_t activeCount() const { return mActiveObjects.size(); }
 

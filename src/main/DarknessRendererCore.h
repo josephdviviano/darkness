@@ -864,8 +864,9 @@ portalBFS(const Darkness::WRParsedData &wr,
     return visible;
 }
 
-// Build cell→room mapping using room point-in-convex-hull tests.
-// Each cell center is tested against all rooms to find which room it belongs to.
+// Build cell→room mapping by testing each cell center against Room bounding planes.
+// Also tries cell vertices as fallback if center fails (cells near room boundaries
+// may have centers outside the room's convex hull).
 // Returns a vector indexed by cellID containing the roomID (-1 if no room found).
 inline std::vector<int32_t>
 buildCellToRoomMap(const Darkness::WRParsedData &wr,
@@ -874,14 +875,31 @@ buildCellToRoomMap(const Darkness::WRParsedData &wr,
 
     for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
         const auto &cell = wr.cells[ci];
-        // Use cell center for room lookup
         Darkness::Vector3 center(cell.center.x, cell.center.y, cell.center.z);
 
+        // Try center point first
         for (const auto &room : rooms) {
             if (!room) continue;
             if (room->isInside(center)) {
                 cellToRoom[ci] = room->getRoomID();
                 break;
+            }
+        }
+
+        // If center failed, try a few cell vertices as fallback —
+        // narrow cells near portal boundaries may have their center outside
+        // the room's convex hull even though the cell is logically in that room
+        if (cellToRoom[ci] < 0 && !cell.vertices.empty()) {
+            for (size_t vi = 0; vi < cell.vertices.size() && cellToRoom[ci] < 0; vi += std::max(size_t(1), cell.vertices.size() / 4)) {
+                const auto &v = cell.vertices[vi];
+                Darkness::Vector3 pt(v.x, v.y, v.z);
+                for (const auto &room : rooms) {
+                    if (!room) continue;
+                    if (room->isInside(pt)) {
+                        cellToRoom[ci] = room->getRoomID();
+                        break;
+                    }
+                }
             }
         }
     }

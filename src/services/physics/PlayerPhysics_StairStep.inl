@@ -342,6 +342,11 @@
             if (body->isEdgeTrigger)
                 continue;
 
+            // Pushable objects — push them instead of stepping over.
+            // ObjectPushSystem handles the velocity transfer.
+            if (mIsPushableCb && mIsPushableCb(c.objectId))
+                continue;
+
             // Get the OBB face index from the encoded polyIdx.
             // polyIdx = (bodyIndex << 4) | (faceIdx & 0xF)
             int faceIdx = c.polyIdx & 0xF;
