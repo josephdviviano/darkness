@@ -2283,6 +2283,7 @@ int main(int argc, char *argv[]) {
 
     // Connect FrobSystem to MessageDispatch for ControlDevice link traversal
     frobSystem.setMessageDispatch(&messageDispatch);
+    frobSystem.setWorldQuery(worldQuery.get());
     state.messageDispatch = &messageDispatch;
 
     // ── Initialize Script System (Phase 6) ──

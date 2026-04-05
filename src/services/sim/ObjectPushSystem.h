@@ -126,26 +126,32 @@ public:
             if (contact.objectId < 0) continue;  // terrain contact
             if (!mPushableObjects.count(contact.objectId)) continue;
 
-            // Calculate push velocity: project player velocity onto contact normal
+            // Contact normal points FROM object surface TOWARD player.
+            // vDotN < 0 means player is moving into the object.
             float vDotN = glm::dot(playerVelocity, contact.normal);
             if (vDotN >= 0.0f) continue;  // moving away from object, no push
 
-            // Push strength scales inversely with mass ratio
-            // Player mass is assumed ~1.0 (normalized)
+            // Push strength scales inversely with mass
             float mass = mPushableMass.count(contact.objectId)
                              ? mPushableMass[contact.objectId]
                              : 10.0f;
             float massRatio = 1.0f / std::max(mass * 0.1f, 0.1f);
 
-            // Transfer velocity along contact normal (negated: normal points
-            // away from wall toward player, we want push direction into wall)
-            Vector3 pushVel = -contact.normal * vDotN * massRatio;
+            // Push direction = -normal (away from player, into the object).
+            // Magnitude = |vDotN| = -vDotN (vDotN is negative).
+            // pushVel = -normal * |vDotN| * massRatio = normal * vDotN * massRatio
+            Vector3 pushVel = contact.normal * vDotN * massRatio;
 
             // Constrain to horizontal plane (objects don't fly upward from pushes)
             pushVel.z = 0.0f;
 
             float pushSpeed = glm::length(pushVel);
-            if (pushSpeed < 0.1f) continue;  // too weak to bother
+            if (pushSpeed < 0.05f) continue;  // too weak to bother
+
+            if (mDebugLog) {
+                std::fprintf(stderr, "[PUSH] obj %d: vDotN=%.2f mass=%.1f pushSpeed=%.2f\n",
+                             contact.objectId, vDotN, mass, pushSpeed);
+            }
 
             // Clamp push speed to prevent extreme velocities
             constexpr float MAX_PUSH_SPEED = 8.0f;
@@ -310,6 +316,8 @@ private:
                diff.y < (aHalf.y + bHalf.y) &&
                diff.z < (aHalf.z + bHalf.z);
     }
+
+    bool mDebugLog = true;  // temporary debug logging for push events
 
     PropertyService *mPropSvc = nullptr;
     ObjectStateMap *mObjectStates = nullptr;
