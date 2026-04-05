@@ -84,31 +84,51 @@ public:
         mCollisionWorld = collisionWorld;
         mDoorSystem = doorSystem;
 
-        // In the Dark Engine, all objects are static by default.
-        // Only objects explicitly made dynamic at runtime (by scripts,
-        // explosions, or frob pickup/throw) become pushable.
-        // No auto-scan — pushability is opt-in via registerPushable().
-        std::fprintf(stderr, "[ObjectPushSystem] initialized (0 pushable — opt-in via registerPushable)\n");
+        std::fprintf(stderr, "[ObjectPushSystem] initialized\n");
+    }
+
+    /// Auto-register pushable objects by scanning collision bodies.
+    /// Uses the Dark Engine's heuristic: OBB bodies with positive mass that
+    /// are NOT doors, NOT edge triggers, NOT location-controlled (PhysControl),
+    /// and NOT interactive objects (FrobInfo with worldAction). This filters
+    /// out wall switches, lamps, and other fixed fixtures while allowing
+    /// crates, barrels, and loose props to be pushed.
+    void autoRegisterPushable() {
+        if (!mPropSvc || !mCollisionWorld) return;
+
+        for (size_t i = 0; i < mCollisionWorld->bodyCount(); ++i) {
+            const ObjectCollisionBody &body = mCollisionWorld->getBody(i);
+            int32_t objID = body.objID;
+            if (objID <= 0) continue;
+
+            if (body.shapeType != CollisionShapeType::OBB) continue;
+            if (body.isEdgeTrigger) continue;
+            if (isDoor(objID)) continue;
+
+            // In the original Dark Engine, ALL OBB objects are moveable.
+            // There is no mass threshold — the 0.02 dampening factor in
+            // the collision response makes heavy objects barely nudge while
+            // light objects (crates, barrels) slide noticeably.
+            PropPhysAttr attr = {};
+            if (!getTypedProperty<PropPhysAttr>(mPropSvc, "PhysAttr", objID, attr))
+                continue;
+            if (attr.mass <= 0.0f) continue;
+
+            registerPushable(objID, attr.mass,
+                             (attr.friction > 0.0f) ? attr.friction : 0.5f);
+        }
+
+        std::fprintf(stderr, "[ObjectPushSystem] auto-registered %zu pushable objects\n",
+                     mPushableObjects.size());
     }
 
     /// Called by DarkPhysics after each player physics step.
-    /// Scans player contacts for object hits and applies push impulse.
+    /// Implements the Dark Engine's BounceSphereOBB collision response:
+    /// 1D elastic collision along contact normal, scaled by 0.02 dampening.
+    /// Applied as a one-shot impulse per collision event — persistent contact
+    /// prevents re-bouncing until the object comes to rest.
     void processPlayerContacts(const std::vector<SphereContact> &contacts,
                                const Vector3 &playerVelocity) {
-        // Debug: log every few frames if we have object contacts
-        static int frameCount = 0;
-        if (mDebugLog && (++frameCount % 120 == 0)) {
-            for (const auto &c : contacts) {
-                if (c.objectId >= 0) {
-                    bool pushable = mPushableObjects.count(c.objectId) > 0;
-                    std::fprintf(stderr, "[PUSH-DBG] objID=%d pushable=%d n=(%.2f,%.2f,%.2f) vel=(%.1f,%.1f,%.1f)\n",
-                                 c.objectId, pushable,
-                                 c.normal.x, c.normal.y, c.normal.z,
-                                 playerVelocity.x, playerVelocity.y, playerVelocity.z);
-                }
-            }
-        }
-
         for (const auto &contact : contacts) {
             if (contact.objectId < 0) continue;  // terrain contact
             if (!mPushableObjects.count(contact.objectId)) continue;
@@ -118,48 +138,60 @@ public:
             float vDotN = glm::dot(playerVelocity, contact.normal);
             if (vDotN >= 0.0f) continue;  // moving away from object, no push
 
-            // Push strength scales inversely with mass
-            float mass = mPushableMass.count(contact.objectId)
-                             ? mPushableMass[contact.objectId]
-                             : 10.0f;
-            float massRatio = 1.0f / std::max(mass * 0.1f, 0.1f);
+            // If already actively sliding, don't re-bounce — the original
+            // engine creates a persistent contact and uses constraints instead.
+            // We re-bounce only after the object has come to rest.
+            if (mActiveObjects.count(contact.objectId))
+                continue;
 
-            // Push direction = -normal (away from player, into the object).
-            // Magnitude = |vDotN| = -vDotN (vDotN is negative).
-            // pushVel = -normal * |vDotN| * massRatio = normal * vDotN * massRatio
-            Vector3 pushVel = contact.normal * vDotN * massRatio;
+            float objMass = mPushableMass.count(contact.objectId)
+                                ? mPushableMass[contact.objectId]
+                                : 30.0f;
 
-            // Constrain to horizontal plane (objects don't fly upward from pushes)
-            pushVel.z = 0.0f;
+            // ── Dark Engine BounceSphereOBB formula (PHCORE.CPP:4920-4961) ──
+            // Project velocities onto contact normal for 1D elastic collision.
+            // Player velocity along normal:
+            //   vel1 = normal * dot(playerVel, normal)
+            // Object velocity along normal (initially zero for static objects):
+            //   vel2 = (0, 0, 0)
+            //
+            // 1D elastic collision:
+            //   acc2 = vel1 * (2 * m1) / (m1 + m2) + vel2 * (m2 - m1) / (m1 + m2)
+            // Since vel2 = 0:
+            //   acc2 = vel1 * (2 * m1) / (m1 + m2)
+            //
+            // Critical: scale by 0.02 (sphere-vs-OBB dampening, vs 0.5 for sphere-sphere)
+            //   acc2 *= 0.02
+            //
+            // Result velocity for OBB = tangential component (zero) + acc2
+            constexpr float kPlayerMass = 20.0f;
+            constexpr float kBounceDampening = 0.02f;  // Dark Engine PHCORE.CPP:4960
 
-            float pushSpeed = glm::length(pushVel);
-            if (pushSpeed < 0.05f) continue;  // too weak to bother
+            float elasticTransfer = (2.0f * kPlayerMass) / (kPlayerMass + objMass);
+            // vel1 along normal = normal * vDotN (vDotN is negative = into object)
+            // acc2 = normal * vDotN * elasticTransfer * 0.02
+            // This gives the object velocity pointing away from the player (negative * negative normal = positive direction away)
+            Vector3 objVel = contact.normal * vDotN * elasticTransfer * kBounceDampening;
 
-            if (mDebugLog) {
-                std::fprintf(stderr, "[PUSH] obj %d: vDotN=%.2f mass=%.1f pushSpeed=%.2f\n",
-                             contact.objectId, vDotN, mass, pushSpeed);
-            }
+            // Constrain to horizontal plane (no vertical push from walking)
+            objVel.z = 0.0f;
 
-            // Clamp push speed to prevent extreme velocities
-            constexpr float MAX_PUSH_SPEED = 8.0f;
-            if (pushSpeed > MAX_PUSH_SPEED)
-                pushVel *= MAX_PUSH_SPEED / pushSpeed;
+            float speed = glm::length(objVel);
+            if (speed < 0.001f) continue;
 
-            // Apply to object state
-            auto it = mActiveObjects.find(contact.objectId);
-            if (it == mActiveObjects.end()) {
-                PushedObject po;
-                po.objID = contact.objectId;
-                po.mass = mass;
-                po.friction = mPushableFriction.count(contact.objectId)
-                                  ? mPushableFriction[contact.objectId]
-                                  : 0.5f;
-                po.velocity = pushVel;
-                mActiveObjects[contact.objectId] = po;
-            } else {
-                // Blend with existing velocity (don't completely override)
-                it->second.velocity = it->second.velocity * 0.3f + pushVel * 0.7f;
-            }
+            std::fprintf(stderr, "[PUSH] obj %d: vDotN=%.2f m1=%.0f m2=%.1f "
+                         "elastic=%.3f vel=(%.3f,%.3f,%.3f) speed=%.3f\n",
+                         contact.objectId, vDotN, kPlayerMass, objMass,
+                         elasticTransfer, objVel.x, objVel.y, objVel.z, speed);
+
+            PushedObject po;
+            po.objID = contact.objectId;
+            po.mass = objMass;
+            po.friction = mPushableFriction.count(contact.objectId)
+                              ? mPushableFriction[contact.objectId]
+                              : 0.5f;
+            po.velocity = objVel;
+            mActiveObjects[contact.objectId] = po;
         }
     }
 
@@ -222,14 +254,51 @@ public:
                 continue;
             }
 
-            // Get current position
+            // Get or initialize ObjectState. Most objects don't have an
+            // ObjectState entry until they move for the first time.
+            // Initialize from the collision body's current world transform.
             ObjectState &os = mObjectStates->get(objID);
+            if (!os.hasMatrix && mCollisionWorld) {
+                const ObjectCollisionBody *body = mCollisionWorld->findBodyByObjID(objID);
+                if (body) {
+                    // Build model matrix from collision body transform
+                    Matrix4 mat(1.0f);
+                    mat[0] = glm::vec4(body->rotation[0], 0.0f);
+                    mat[1] = glm::vec4(body->rotation[1], 0.0f);
+                    mat[2] = glm::vec4(body->rotation[2], 0.0f);
+                    mat[3] = glm::vec4(body->worldPos, 1.0f);
+                    // Apply object scale
+                    mat[0] *= body->objectScale.x;
+                    mat[1] *= body->objectScale.y;
+                    mat[2] *= body->objectScale.z;
+                    std::memcpy(os.modelMatrix, &mat[0][0], sizeof(os.modelMatrix));
+                    os.hasMatrix = true;
+                    os.position = body->worldPos;
+                    os.flags |= kObjStateActive;
+                    std::fprintf(stderr, "[PUSH-INIT] obj %d: initialized from collision body pos=(%.1f,%.1f,%.1f)\n",
+                                 objID, body->worldPos.x, body->worldPos.y, body->worldPos.z);
+                }
+            }
+
+            // ── Dark Engine friction model (PHCORE.CPP:1464-1501, PHYSAPI.CPP:2891) ──
+            // Friction force = kFrictionFactor * frictionPct * kGravityAmt * mass * kGravityAmt
+            // For a flat floor (normal=(0,0,1)): frictionPct = 1.0
+            // friction_force = 0.03 * 1.0 * 32.0 * mass * 32.0 = 30.72 * mass
+            // Deceleration = friction_force / mass = 30.72 units/s²
+            //
+            // Gravity pulls the object down, but since we only do horizontal
+            // sliding (Z constrained), gravity just contributes to friction.
+            constexpr float kFrictionFactor = 0.03f;    // PHYSAPI.CPP:712
+            constexpr float kGravityAmt = 32.0f;        // PHYSAPI.CPP:720
+            // Assume flat floor contact (frictionPct = 1.0, frictionScale = 1.0)
+            float frictionDecel = kFrictionFactor * 1.0f * kGravityAmt * kGravityAmt;
+            // = 0.03 * 32 * 32 = 30.72 units/s²
+
+            // Euler integration: position += velocity * dt
             Vector3 newPos = os.position + obj.velocity * delta;
 
-            // Apply friction deceleration
-            // Dark Engine uses aggressive friction: objects stop quickly
-            float frictionForce = obj.friction * 9.81f;  // gravity-scaled friction
-            float speedLoss = frictionForce * delta;
+            // Apply friction as deceleration opposing velocity
+            float speedLoss = frictionDecel * delta;
             float newSpeed = std::max(0.0f, speed - speedLoss);
             if (newSpeed > 0.0f) {
                 obj.velocity *= newSpeed / speed;

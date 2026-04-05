@@ -264,7 +264,7 @@ public:
             }
 
             // Log first 5 frames per tweq for debugging
-            if (tw.logFrames < 5) {
+            if (tw.logFrames < 1) {
                 const ObjectState *os = mObjectStates ? mObjectStates->tryGet(tw.objID) : nullptr;
                 std::fprintf(stderr, "[TWEQ] obj=%d type=%s frame=%d "
                              "val=(%.1f,%.1f,%.1f) elapsed=%.0fms curFrame=%d "
@@ -826,7 +826,7 @@ private:
                 }
 
                 // Log model swap with GPU lookup check
-                if (tw.logFrames < 8 && mParsedModels) {
+                if (tw.logFrames < 1 && mParsedModels) {
                     bool parsed = mParsedModels->count(newModelName) > 0;
                     std::fprintf(stderr, "[TWEQ_MODEL] obj=%d swap '%s' -> '%s' "
                                  "parsed=%d pos=(%.2f,%.2f,%.2f)\n",
