@@ -125,7 +125,6 @@ struct DoorState {
     int renderIndex = -1;
 
     // Debug: frame counter for per-activation logging (reset on each activate)
-    int logFrames = 0;
     int blockingLogCount = 0;  // one-shot counter for blocking factor logs
 };
 
@@ -180,7 +179,6 @@ public:
         if (it == mDoors.end()) return false;
 
         DoorState &door = it->second;
-        door.logFrames = 0;  // reset per-activation debug counter
         switch (action) {
         case kDoorDoOpen:
             startOpening(door);
@@ -284,57 +282,6 @@ public:
         for (auto &[id, door] : mDoors) {
             if (door.status == kDoorOpening || door.status == kDoorClosing) {
                 updateDoor(door, delta);
-
-                // Log first 3 frames of each activation + final frame
-                if (door.logFrames < 3 ||
-                    door.status == kDoorOpen || door.status == kDoorClosed) {
-                    const ObjectState *os = mObjectStates ? mObjectStates->tryGet(id) : nullptr;
-                    if (os && os->hasMatrix) {
-                        const float *m = os->modelMatrix;
-                        // Compute where hinge and far-edge ended up in world space
-                        // by transforming local-space points through the bx row-major matrix.
-                        // bx row-major: result = v * M (row-vector convention)
-                        auto xformPt = [&](float lx, float ly, float lz) -> Vector3 {
-                            return Vector3(
-                                lx*m[0] + ly*m[4] + lz*m[8]  + m[12],
-                                lx*m[1] + ly*m[5] + lz*m[9]  + m[13],
-                                lx*m[2] + ly*m[6] + lz*m[10] + m[14]);
-                        };
-                        // Log all 8 bbox corners transformed to world space.
-                        // Get model bbox from parsedModels via placement modelName.
-                        float bmin[3] = {-2, -0.1f, -4};  // fallback
-                        float bmax[3] = { 2,  0.1f,  4};
-                        if (mPlacements) {
-                            auto pit = mPlacements->find(id);
-                            if (pit != mPlacements->end()) {
-                                std::string mname(pit->second.modelName,
-                                    strnlen(pit->second.modelName, 16));
-                                if (mParsedModels) {
-                                    auto mit = mParsedModels->find(mname);
-                                    if (mit != mParsedModels->end()) {
-                                        for (int i = 0; i < 3; ++i) {
-                                            bmin[i] = mit->second.bboxMin[i];
-                                            bmax[i] = mit->second.bboxMax[i];
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        std::fprintf(stderr, "  Door %d frame %d: val=%.3f bbox=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)\n",
-                                     id, door.logFrames, door.currentValue,
-                                     bmin[0], bmin[1], bmin[2], bmax[0], bmax[1], bmax[2]);
-                        // Transform and log all 8 corners
-                        for (int ci = 0; ci < 8; ++ci) {
-                            float cx = (ci & 1) ? bmax[0] : bmin[0];
-                            float cy = (ci & 2) ? bmax[1] : bmin[1];
-                            float cz = (ci & 4) ? bmax[2] : bmin[2];
-                            Vector3 w = xformPt(cx, cy, cz);
-                            std::fprintf(stderr, "    v%d local=(%.1f,%.1f,%.1f) -> world=(%.2f,%.2f,%.2f)\n",
-                                         ci, cx, cy, cz, w.x, w.y, w.z);
-                        }
-                    }
-                    ++door.logFrames;
-                }
 
                 // Update audio blocking continuously during animation.
                 // Blocking scales with closed fraction: fully closed = full blocking,
