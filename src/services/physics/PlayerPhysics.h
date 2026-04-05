@@ -478,6 +478,13 @@ public:
         mObjectWorld = ocw;
     }
 
+    /// Callback that returns true if an object is pushable (skip stair stepping).
+    /// Set by ObjectPushSystem so the player pushes objects instead of climbing over.
+    using IsPushableCallback = std::function<bool(int32_t objID)>;
+    void setIsPushableCallback(IsPushableCallback cb) {
+        mIsPushableCb = std::move(cb);
+    }
+
     /// Set per-texture friction lookup table (indexed by TXLIST texture index).
     /// Built at mission load from P$Friction on texture archetypes in dark.gam.
     void setFrictionTable(const std::vector<float> &table) {
@@ -836,6 +843,7 @@ private:
     FootstepCallback mFootstepCb;            // footstep sound event (stride-based)
     LandingCallback mLandingCb;              // landing impact sound event
     ObjectCollisionCallback mObjectCollisionCb;  // player-vs-object collision (Task 26)
+    IsPushableCallback mIsPushableCb;              // skip stair step for pushable objects
     PlatformVelocityCallback mPlatformVelocityCb;  // moving terrain velocity query (Task 57)
     const ObjectCollisionWorld *mObjectWorld = nullptr;  // for OBB lookup in object stepping
 
