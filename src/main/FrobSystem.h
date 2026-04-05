@@ -99,6 +99,11 @@ public:
         mMsgDispatch = msgDispatch;
     }
 
+    /// Set world query for position lookups of objects without collision bodies.
+    /// Enables frob targeting of levers, switches, books, and other small objects
+    /// that have FrobInfo but no P$PhysType collision body.
+    void setWorldQuery(const IWorldQuery *wq) { mWorldQuery = wq; }
+
     /// Update frob target each frame. Cast ray from camera and find nearest
     /// frobbable object. Call before render so highlight is current.
     void update(const Camera &cam) {
@@ -177,6 +182,61 @@ public:
                 }
             }
         }
+
+        // ── Fallback: proximity-based frob for objects without collision bodies ──
+        // Levers, switches, books, and other small frobbable objects often lack
+        // P$PhysType collision bodies. Test them by position + distance check.
+        if (mTarget.objID == 0 && mWorldQuery && mPropSvc) {
+            auto frobObjects = mWorldQuery->getAllWithProperty("FrobInfo");
+            for (EntityID eid : frobObjects) {
+                int32_t objID = static_cast<int32_t>(eid);
+                if (objID <= 0) continue;
+
+                // Skip objects that already have collision bodies (handled above)
+                if (mCollisionWorld && mCollisionWorld->findBodyByObjID(objID))
+                    continue;
+
+                // Skip doors (handled by collision body path)
+                if (mDoorSys && mDoorSys->isDoor(objID))
+                    continue;
+
+                PropFrobInfo frobInfo;
+                if (!getTypedProperty<PropFrobInfo>(mPropSvc, "FrobInfo", objID, frobInfo))
+                    continue;
+                if (frobInfo.worldAction == 0 || (frobInfo.worldAction & kFrobIgnore))
+                    continue;
+
+                // Get object position (from ObjectState or P$Position via IWorldQuery)
+                Vector3 objPos = mWorldQuery->getPosition(eid);
+                Vector3 toObj = objPos - rayStart;
+                float dist = glm::length(toObj);
+                if (dist > mFrobDistance || dist < 0.1f)
+                    continue;
+
+                // Cone test: object must be roughly in front of the camera
+                // (within ~30 degrees of look direction)
+                float dotFwd = glm::dot(glm::normalize(toObj), forward);
+                if (dotFwd < 0.85f)
+                    continue;
+
+                // Parametric distance along ray
+                float t = dist / mFrobDistance;
+                if (t >= bestT)
+                    continue;
+
+                bestT = t;
+                mTarget.objID = objID;
+                mTarget.distance = dist;
+                mTarget.hitPoint = objPos;
+                mTarget.isDoor = false;
+                mTarget.frobActions = frobInfo.worldAction;
+                if (mObjSvc) {
+                    mTarget.name = mObjSvc->getName(objID);
+                    if (mTarget.name.empty())
+                        mTarget.name = "obj " + std::to_string(objID);
+                }
+            }
+        }
     }
 
     /// Execute frob on the current target. Returns true if action was taken.
@@ -225,6 +285,7 @@ private:
     DoorSystem *mDoorSys = nullptr;
     ObjectCollisionWorld *mCollisionWorld = nullptr;
     MessageDispatch *mMsgDispatch = nullptr;
+    const IWorldQuery *mWorldQuery = nullptr;
     FrobTarget mTarget;
     float mFrobDistance = kDefaultFrobDistance;
 };
