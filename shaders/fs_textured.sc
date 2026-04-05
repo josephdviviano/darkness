@@ -22,6 +22,9 @@ void main()
     vec4 finalColor = texColor * v_color0;
     // Apply per-object opacity (1.0 for opaque objects, < 1.0 for translucent)
     finalColor.a *= u_objectParams.x;
+    // Frob highlight: additive brightness boost (Dark Engine convention).
+    // u_objectParams.y = highlight intensity (0.0 = none, ~0.47 = full highlight).
+    finalColor.rgb += vec3_splat(u_objectParams.y);
     // Linear distance fog
     float fogFactor = clamp(v_fogDist / u_fogParams.y, 0.0, 1.0) * u_fogParams.x;
     finalColor.rgb = mix(finalColor.rgb, u_fogColor.rgb, fogFactor);

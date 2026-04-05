@@ -84,38 +84,11 @@ public:
         mCollisionWorld = collisionWorld;
         mDoorSystem = doorSystem;
 
-        // Scan for pushable objects: iterate all collision bodies, check for
-        // OBB shape with positive mass (via inherited P$PhysAttr), exclude
-        // doors/triggers/platforms. Most objects inherit PhysAttr from archetypes.
-        if (!propSvc || !collisionWorld) return;
-
-        // Iterate all collision bodies in the world
-        for (size_t i = 0; i < collisionWorld->bodyCount(); ++i) {
-            const ObjectCollisionBody &body = collisionWorld->getBody(i);
-            int32_t objID = body.objID;
-            if (objID <= 0) continue;  // skip archetypes
-
-            // Only OBB-type bodies are pushable
-            if (body.shapeType != CollisionShapeType::OBB) continue;
-            if (body.isEdgeTrigger) continue;
-
-            // Skip doors — they have their own movement system
-            if (isDoor(objID)) continue;
-
-            // Read mass from P$PhysAttr (with archetype inheritance)
-            PropPhysAttr attr = {};
-            if (!getTypedProperty<PropPhysAttr>(propSvc, "PhysAttr", objID, attr))
-                continue;
-
-            if (attr.mass <= 0.0f) continue;
-
-            mPushableObjects.insert(objID);
-            mPushableMass[objID] = attr.mass;
-            mPushableFriction[objID] = (attr.friction > 0.0f) ? attr.friction : 0.5f;
-        }
-
-        std::fprintf(stderr, "[ObjectPushSystem] %zu pushable objects identified\n",
-                     mPushableObjects.size());
+        // In the Dark Engine, all objects are static by default.
+        // Only objects explicitly made dynamic at runtime (by scripts,
+        // explosions, or frob pickup/throw) become pushable.
+        // No auto-scan — pushability is opt-in via registerPushable().
+        std::fprintf(stderr, "[ObjectPushSystem] initialized (0 pushable — opt-in via registerPushable)\n");
     }
 
     /// Called by DarkPhysics after each player physics step.
@@ -286,6 +259,27 @@ public:
         for (int32_t id : toRemove) {
             mActiveObjects.erase(id);
         }
+    }
+
+    // ── Registration ──
+
+    /// Register an object as pushable at runtime (called by scripts, makeDynamic, etc.).
+    /// Objects must have a collision body in the ObjectCollisionWorld.
+    void registerPushable(int32_t objID, float mass, float friction = 0.5f) {
+        if (mass <= 0.0f) return;
+        mPushableObjects.insert(objID);
+        mPushableMass[objID] = mass;
+        mPushableFriction[objID] = friction;
+        std::fprintf(stderr, "[ObjectPushSystem] registerPushable: obj=%d mass=%.1f friction=%.2f\n",
+                     objID, mass, friction);
+    }
+
+    /// Unregister a pushable object (when destroyed, picked up, etc.).
+    void unregisterPushable(int32_t objID) {
+        mPushableObjects.erase(objID);
+        mPushableMass.erase(objID);
+        mPushableFriction.erase(objID);
+        mActiveObjects.erase(objID);
     }
 
     // ── Query ──

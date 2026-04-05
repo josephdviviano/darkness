@@ -116,36 +116,44 @@ public:
         if (!mPropSvc) return;
         mFrobCache.clear();
 
+        int frobCount = 0, doorCount = 0;
         for (const auto &[objID, placement] : allPlacements) {
             if (objID <= 0) continue;
 
-            // Skip objects that have collision bodies (handled by ray-vs-OBB)
-            if (mCollisionWorld && mCollisionWorld->findBodyByObjID(objID))
-                continue;
+            bool isDoor = mDoorSys && mDoorSys->isDoor(objID);
 
-            // Check FrobInfo via inheritance
-            PropFrobInfo frobInfo;
-            if (!getTypedProperty<PropFrobInfo>(mPropSvc, "FrobInfo", objID, frobInfo))
-                continue;
-            if (frobInfo.worldAction == 0 || (frobInfo.worldAction & kFrobIgnore))
-                continue;
+            // Non-doors: check FrobInfo via inheritance
+            if (!isDoor) {
+                PropFrobInfo frobInfo;
+                if (!getTypedProperty<PropFrobInfo>(mPropSvc, "FrobInfo", objID, frobInfo))
+                    continue;
+                if (frobInfo.worldAction == 0 || (frobInfo.worldAction & kFrobIgnore))
+                    continue;
 
-            FrobCacheEntry entry;
-            entry.objID = objID;
-            entry.worldAction = frobInfo.worldAction;
-            entry.position = Vector3(placement.x, placement.y, placement.z);
-            mFrobCache.push_back(entry);
+                FrobCacheEntry entry;
+                entry.objID = objID;
+                entry.worldAction = frobInfo.worldAction;
+                entry.position = Vector3(placement.x, placement.y, placement.z);
+                mFrobCache.push_back(entry);
+                frobCount++;
+            } else {
+                // Doors: always frobbable (worldAction unused, isDoor flag handles it)
+                FrobCacheEntry entry;
+                entry.objID = objID;
+                entry.worldAction = kFrobScript;
+                entry.position = Vector3(placement.x, placement.y, placement.z);
+                mFrobCache.push_back(entry);
+                doorCount++;
+            }
         }
-        std::fprintf(stderr, "[FrobSystem] %zu frobbable objects without collision bodies cached\n",
-                     mFrobCache.size());
+        std::fprintf(stderr, "[FrobSystem] cached %d frobbable + %d doors = %zu total\n",
+                     frobCount, doorCount, mFrobCache.size());
     }
 
     /// Update frob target each frame. Cast ray from camera and find nearest
     /// frobbable object. Call before render so highlight is current.
     void update(const Camera &cam) {
         mTarget = {};  // clear
-
-        if (!mCollisionWorld) return;
 
         // Compute ray from camera position along look direction
         float cosPitch = std::cos(cam.pitch);
@@ -157,13 +165,10 @@ public:
         Vector3 rayStart(cam.pos[0], cam.pos[1], cam.pos[2]);
         Vector3 rayEnd = rayStart + forward * mFrobDistance;
 
-        // Test all collision bodies against the ray.
-        // We iterate all bodies rather than doing spatial lookup because
-        // the frob ray is very short (~5 units) and there are typically
-        // only a few hundred objects. If this becomes a bottleneck,
-        // we can add spatial pre-filtering.
+        // Test all collision bodies against the ray (if collision world available).
         float bestT = 2.0f;  // > 1.0 means no hit yet
 
+        if (mCollisionWorld) {
         const auto &bodies = mCollisionWorld->getBodies();
         for (const auto &body : bodies) {
             // Quick AABB pre-test: skip bodies whose AABB is far from ray
@@ -218,28 +223,38 @@ public:
                 }
             }
         }
+        } // end mCollisionWorld
 
-        // ── Fallback: proximity-based frob for objects without collision bodies ──
-        // Levers, switches, books, and other small frobbable objects often lack
-        // P$PhysType collision bodies. Uses the pre-built frob cache (built once
-        // at init via buildFrobCache) to avoid per-frame property lookups.
-        if (mTarget.objID == 0 && !mFrobCache.empty()) {
-            int nearCount = 0;
+        // ── Proximity-based frob for all frobbable objects ──
+        // Most frobbable objects (levers, switches, books, doors) are small and
+        // may lack collision bodies. Use the pre-built frob cache with a cone
+        // test from the crosshair direction. This also covers doors (which are
+        // brush geometry without OBB collision bodies).
+        if (!mFrobCache.empty()) {
+            // Debug: log closest object stats every N frames
+            mDbgFrame++;
+            float dbgClosestDist = 999.0f;
+            int dbgInRange = 0;
+            int dbgInCone = 0;
+
             for (const auto &entry : mFrobCache) {
-                // Use cached position from allPlacements (reliable, binary format)
                 Vector3 objPos = entry.position;
                 Vector3 toObj = objPos - rayStart;
                 float dist = glm::length(toObj);
+
+                if (dist < dbgClosestDist)
+                    dbgClosestDist = dist;
+
                 if (dist > mFrobDistance || dist < 0.1f)
                     continue;
-
-                nearCount++;
+                dbgInRange++;
 
                 // Cone test: object must be roughly in front of the camera
-                // (within ~45 degrees of look direction for wider targeting)
+                // (within ~30 degrees of look direction for crosshair targeting)
                 float dotFwd = glm::dot(glm::normalize(toObj), forward);
-                if (dotFwd < 0.7f)  // ~45 degrees
+                if (dotFwd < 0.85f)  // ~30 degrees
                     continue;
+                dbgInCone++;
 
                 // Parametric distance along ray
                 float t = dist / mFrobDistance;
@@ -250,13 +265,22 @@ public:
                 mTarget.objID = entry.objID;
                 mTarget.distance = dist;
                 mTarget.hitPoint = objPos;
-                mTarget.isDoor = false;
+                mTarget.isDoor = (mDoorSys && mDoorSys->isDoor(entry.objID));
                 mTarget.frobActions = entry.worldAction;
                 if (mObjSvc) {
                     mTarget.name = mObjSvc->getName(entry.objID);
                     if (mTarget.name.empty())
                         mTarget.name = "obj " + std::to_string(entry.objID);
                 }
+            }
+
+            if (mDbgFrame % 120 == 0) {
+                std::fprintf(stderr, "[FrobDbg] pos=(%.1f,%.1f,%.1f) fwd=(%.2f,%.2f,%.2f) "
+                             "frobDist=%.1f closestObj=%.1f inRange=%d inCone=%d target=%d\n",
+                             rayStart.x, rayStart.y, rayStart.z,
+                             forward.x, forward.y, forward.z,
+                             mFrobDistance, dbgClosestDist,
+                             dbgInRange, dbgInCone, mTarget.objID);
             }
         }
     }
@@ -268,10 +292,11 @@ public:
     bool executeFrob() {
         if (mTarget.objID == 0) return false;
 
-        std::fprintf(stderr, "Frob: %s obj %d (%s) dist=%.1f actions=0x%x\n",
+        std::fprintf(stderr, "Frob: %s obj %d (%s) dist=%.1f actions=0x%x hasScripts=%d\n",
                      mTarget.isDoor ? "door" : "object",
                      mTarget.objID, mTarget.name.c_str(),
-                     mTarget.distance, mTarget.frobActions);
+                     mTarget.distance, mTarget.frobActions,
+                     mScriptManager ? (int)mScriptManager->hasScripts(mTarget.objID) : -1);
 
         // Route through ScriptManager if available — scripts get first crack
         // at FrobWorldEnd, then fall through to global MessageDispatch handlers.
@@ -328,8 +353,9 @@ private:
     const IWorldQuery *mWorldQuery = nullptr;
     FrobTarget mTarget;
     float mFrobDistance = kDefaultFrobDistance;
+    int mDbgFrame = 0;  // debug frame counter for periodic logging
 
-    // Pre-built cache of frobbable objects without collision bodies
+    // Pre-built cache of frobbable objects (includes doors)
     struct FrobCacheEntry {
         int32_t objID;
         uint32_t worldAction;

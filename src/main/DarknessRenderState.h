@@ -256,6 +256,11 @@ struct RuntimeState {
     // Mode description string for title bar (points to string literal)
     const char *modeStr = "flat-shaded";
 
+    // Frob highlight (Dark Engine convention: additive brightness boost)
+    // Fades in/out over ~130ms matching the original engine.
+    int32_t frobHighlightObjID = 0;   // currently highlighted object (0 = none)
+    float frobHighlightLevel = 0.0f;  // current highlight intensity (0.0-0.47)
+
     // Portal culling stats (for title bar)
     uint32_t cullVisibleCells = 0;
     uint32_t cullTotalCells = 0;

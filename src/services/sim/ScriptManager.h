@@ -220,7 +220,7 @@ public:
                 std::fprintf(stderr,
                              "  [ScriptManager] Unregistered: \"%s\" (%d refs)\n",
                              name.c_str(), count);
-                if (++shown >= 10) break;
+                if (++shown >= 40) break;
             }
         }
     }
@@ -252,15 +252,18 @@ public:
 
         bool handled = deliverToScripts(msg);
 
-        // Fall through to MessageDispatch (which handles ControlDevice traversal)
+        // Fall through to MessageDispatch global handlers (without re-sending)
         if (mMsgDispatch) {
             if (!handled)
                 handled = mMsgDispatch->sendMessage(msg);
 
-            // ControlDevice propagation always happens for activation messages
+            // ControlDevice link propagation — done here in ScriptManager
+            // so that linked TurnOn/TurnOff messages are routed through
+            // sendMessage() (scripts get first crack), not directly through
+            // MessageDispatch which would bypass scripts entirely.
             if (msg.name == "TurnOn" || msg.name == "TurnOff" ||
                 msg.name == "FrobWorldEnd") {
-                mMsgDispatch->sendMessageWithLinks(msg);
+                propagateControlDeviceLinks(msg.to, msg.from, msg.name);
             }
         }
 
@@ -427,6 +430,29 @@ public:
         return result;
     }
 
+    // ── ControlDevice link propagation ──
+    // Follows ControlDevice relations from srcObjID and sends TurnOn/TurnOff
+    // to linked targets through ScriptManager::sendMessage() (scripts first).
+
+    void propagateControlDeviceLinks(int32_t srcObjID, int32_t fromID,
+                                      const std::string &triggerMsg) {
+        std::string linkMsg;
+        if (triggerMsg == "TurnOn") {
+            linkMsg = "TurnOn";
+        } else if (triggerMsg == "TurnOff") {
+            linkMsg = "TurnOff";
+        } else if (triggerMsg == "FrobWorldEnd") {
+            // FrobWorldEnd on a scriptless switch: toggle state.
+            // Track per-object on/off state so repeated frobs alternate.
+            bool &isOn = mFrobToggleState[srcObjID];
+            isOn = !isOn;
+            linkMsg = isOn ? "TurnOff" : "TurnOn";
+        } else {
+            linkMsg = "TurnOn";
+        }
+        broadcastOnAllLinks(srcObjID, linkMsg, "ControlDevice", {});
+    }
+
     // ── Link traversal helpers (used by ScriptBase::broadcastOnAllLinks) ──
 
     void broadcastOnAllLinks(int32_t srcObjID, const std::string &msgName,
@@ -512,6 +538,11 @@ private:
 
     // ── Script data store ──
     std::unordered_map<ScriptDatumTag, Variant, ScriptDatumTagHash> mScriptData;
+
+    // ── Frob toggle state for scriptless switches ──
+    // Tracks on/off state per object so FrobWorldEnd alternates TurnOn/TurnOff
+    // on ControlDevice links. Objects with scripts handle this themselves.
+    std::unordered_map<int32_t, bool> mFrobToggleState;
 };
 
 // ============================================================================

@@ -738,7 +738,10 @@ static void renderObjects(
                 // Compute final alpha: (1 - matTrans) * renderAlpha
                 // matTrans convention: 0=opaque, 0.3=30% transparent glass
                 float finalAlpha = (1.0f - sm.matTrans) * obj.renderAlpha;
-                float objAlpha[4] = { finalAlpha, 0.0f, 0.0f, 0.0f };
+                // Frob highlight: additive brightness for the targeted object
+                float highlight = (obj.objID == state.frobHighlightObjID)
+                    ? state.frobHighlightLevel : 0.0f;
+                float objAlpha[4] = { finalAlpha, highlight, 0.0f, 0.0f };
 
                 uint64_t drawState = opaquePass ? fc.renderState : translucentState;
 
@@ -1293,41 +1296,9 @@ static void handleEvents(
             }
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_f
                    && !ev.key.repeat) {
-            // F: frob the object under the crosshair, or nearest door if no target.
-            // Brush doors have no collision body so frob raycast can't hit them —
-            // fall back to nearest-door-by-distance for those.
+            // F: frob the object under the crosshair (doors, levers, switches, etc.)
             if (state.frobSystem && state.frobSystem->hasTarget()) {
                 state.frobSystem->executeFrob();
-            } else if (state.doorSystem) {
-                Darkness::Vector3 camPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
-                auto doorIDs = state.doorSystem->getAllDoorIDs();
-                int32_t nearestID = 0;
-                float nearestDist = Darkness::kDefaultFrobDistance * Darkness::kDefaultFrobDistance;
-                for (int32_t did : doorIDs) {
-                    const auto *d = state.doorSystem->getDoor(did);
-                    if (!d) continue;
-                    float dx = d->basePosition.x - camPos.x;
-                    float dy = d->basePosition.y - camPos.y;
-                    float dz = d->basePosition.z - camPos.z;
-                    float distSq = dx*dx + dy*dy + dz*dz;
-                    if (distSq < nearestDist) { nearestDist = distSq; nearestID = did; }
-                }
-                if (nearestID != 0) {
-                    // Route through ScriptManager so door scripts get the message
-                    if (state.scriptManager) {
-                        Darkness::ScriptMessage msg;
-                        msg.to = nearestID;
-                        msg.name = "FrobWorldEnd";
-                        msg.from = 0;
-                        state.scriptManager->sendMessageWithLinks(msg);
-                    } else if (state.messageDispatch) {
-                        state.messageDispatch->frobWorldEnd(nearestID, 0);
-                    } else {
-                        state.doorSystem->activate(nearestID, Darkness::kDoorToggle);
-                    }
-                    std::fprintf(stderr, "Frob fallback: door %d (dist=%.1f)\n",
-                                 nearestID, std::sqrt(nearestDist));
-                }
             }
         }
     }
@@ -1467,7 +1438,8 @@ static void updateMovement(
 static void updateLightmaps(
     float dt, const Darkness::BuiltMeshes &meshes,
     Darkness::MissionData &mission, Darkness::GPUResources &gpu,
-    bool debugTint = false, bool forceFlicker = false)
+    bool debugTint = false, bool forceFlicker = false,
+    bool scriptLightDirty = false)
 {
     if (!meshes.lightmappedMode || gpu.lmAtlasSet.atlases.empty()) return;
 
@@ -1520,6 +1492,11 @@ static void updateLightmaps(
             ? light.brightness / light.maxBright : 0.0f;
         currentIntensities[lightNum] = intensity;
         if (changed) anyLightChanged = true;
+    }
+
+    // Check if LightScriptService changed any lights (script-driven on/off)
+    if (scriptLightDirty) {
+        anyLightChanged = true;
     }
 
     // Force full re-blend when debug mode toggles
@@ -2308,6 +2285,7 @@ int main(int argc, char *argv[]) {
     Darkness::PropertyScriptService propertyScriptSvc;
     Darkness::SoundScriptService soundScriptSvc;
     Darkness::LightScriptService lightScriptSvc;
+    lightScriptSvc.lightSources = &mission.lightSources;
     Darkness::DamageScriptService damageScriptSvc;
     Darkness::DataScriptService dataScriptSvc;
     Darkness::LockedScriptService lockedScriptSvc;
@@ -2328,7 +2306,13 @@ int main(int argc, char *argv[]) {
         objectScriptSvc.objSvc = objSvc.get();
         objectScriptSvc.worldQuery = worldQuery.get();
         propertyScriptSvc.propSvc = propSvc.get();
-        // soundScriptSvc.audioSvc wired after AudioService init (below)
+        {
+            auto audioSvc = GET_SERVICE(Darkness::AudioService);
+            soundScriptSvc.audioSvc = audioSvc.get();
+            std::fprintf(stderr, "[SoundScriptService] audioSvc=%p\n",
+                         (void*)soundScriptSvc.audioSvc);
+        }
+        soundScriptSvc.placements = &mission.objData.allPlacements;
         damageScriptSvc.msgDispatch = &messageDispatch;
         lockedScriptSvc.propSvc = propSvc.get();
         lockedScriptSvc.msgDispatch = &messageDispatch;
@@ -3046,6 +3030,30 @@ int main(int argc, char *argv[]) {
                 state.frobSystem->update(state.cam);
             }
 
+            // Update frob highlight fade (Dark Engine: ~130ms fade in/out)
+            {
+                constexpr float kHighlightMax = 0.27f;   // 0.47f original engine default
+                constexpr float kFadeTime = 0.129f;       // 129ms fade
+                int32_t targetID = state.frobSystem && state.frobSystem->hasTarget()
+                    ? state.frobSystem->getTarget().objID : 0;
+
+                if (targetID != state.frobHighlightObjID) {
+                    // Target changed — fade out old, start fading in new
+                    state.frobHighlightObjID = targetID;
+                    state.frobHighlightLevel = 0.0f;
+                }
+
+                if (targetID != 0) {
+                    // Fade in
+                    state.frobHighlightLevel = std::min(kHighlightMax,
+                        state.frobHighlightLevel + (kHighlightMax / kFadeTime) * dt);
+                } else {
+                    // Fade out
+                    state.frobHighlightLevel = std::max(0.0f,
+                        state.frobHighlightLevel - (kHighlightMax / kFadeTime) * dt);
+                }
+            }
+
             // Set audio listener position before AudioService::loopStep runs
             Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
             audioSvc->setListenerTransform(
@@ -3075,8 +3083,11 @@ int main(int argc, char *argv[]) {
                 return;
             }
 
+            bool scriptDirty = lightScriptSvc.dirty;
+            if (scriptDirty) lightScriptSvc.dirty = false;
             updateLightmaps(dt, meshes, mission, gpu,
-                            state.debugAnimLightmaps, state.forceFlicker);
+                            state.debugAnimLightmaps, state.forceFlicker,
+                            scriptDirty);
 
             // ── Prepare frame: matrices, fog, samplers, culling ──
             auto fc = prepareFrame(state, mission);
