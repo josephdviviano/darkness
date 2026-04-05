@@ -51,6 +51,8 @@
 
 namespace Darkness {
 
+class ScriptManager;  // forward declaration — defined in sim/ScriptManager.h
+
 // ── FrobInfo property (from Dark Engine) ──
 // P$FrobInfo: 16 bytes, 3 action fields + padding.
 // Each field is a bitfield of frob actions for that context.
@@ -266,14 +268,26 @@ public:
     bool executeFrob() {
         if (mTarget.objID == 0) return false;
 
-        // Route through MessageDispatch if available — this handles
-        // ControlDevice link traversal (lever→door) and built-in handlers
+        std::fprintf(stderr, "Frob: %s obj %d (%s) dist=%.1f actions=0x%x\n",
+                     mTarget.isDoor ? "door" : "object",
+                     mTarget.objID, mTarget.name.c_str(),
+                     mTarget.distance, mTarget.frobActions);
+
+        // Route through ScriptManager if available — scripts get first crack
+        // at FrobWorldEnd, then fall through to global MessageDispatch handlers.
+        // ScriptManager also handles ControlDevice link propagation.
+        if (mScriptManager) {
+            ScriptMessage msg;
+            msg.to = mTarget.objID;
+            msg.name = "FrobWorldEnd";
+            msg.from = 0;  // player
+            mScriptManager->sendMessageWithLinks(msg);
+            return true;
+        }
+
+        // Fallback: route through MessageDispatch directly (no script support)
         if (mMsgDispatch) {
-            mMsgDispatch->frobWorldEnd(mTarget.objID, 0 /* player */);
-            std::fprintf(stderr, "Frob: %s obj %d (%s) dist=%.1f\n",
-                         mTarget.isDoor ? "door" : "object",
-                         mTarget.objID, mTarget.name.c_str(),
-                         mTarget.distance);
+            mMsgDispatch->frobWorldEnd(mTarget.objID, 0);
             return true;
         }
 
@@ -299,12 +313,18 @@ public:
     /// Set the message dispatch system (for ControlDevice link traversal).
     void setMessageDispatch(MessageDispatch *md) { mMsgDispatch = md; }
 
+    /// Set the script manager for routing frobs through scripts.
+    /// When set, FrobWorldEnd goes through ScriptManager (scripts get first
+    /// crack) instead of directly to MessageDispatch.
+    void setScriptManager(ScriptManager *sm) { mScriptManager = sm; }
+
 private:
     PropertyService *mPropSvc = nullptr;
     ObjectService *mObjSvc = nullptr;
     DoorSystem *mDoorSys = nullptr;
     ObjectCollisionWorld *mCollisionWorld = nullptr;
     MessageDispatch *mMsgDispatch = nullptr;
+    ScriptManager *mScriptManager = nullptr;
     const IWorldQuery *mWorldQuery = nullptr;
     FrobTarget mTarget;
     float mFrobDistance = kDefaultFrobDistance;
