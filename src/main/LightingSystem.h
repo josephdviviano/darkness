@@ -372,19 +372,19 @@ inline bool updateLightAnimation(LightSource &light, float dt) {
         }
 
         case ANIM_MIN_BRIGHT:
-            // Static at minimum brightness — no animation
+            // Static at minimum brightness — report change if just switched
             light.brightness = light.minBright;
-            return false;
+            return (light.brightness != prevBrightness);
 
         case ANIM_MAX_BRIGHT:
-            // Static at maximum brightness — no animation
+            // Static at maximum brightness — report change if just switched
             light.brightness = light.maxBright;
-            return false;
+            return (light.brightness != prevBrightness);
 
         case ANIM_ZERO:
-            // Static at zero brightness — no animation
+            // Static at zero brightness — report change if just switched
             light.brightness = 0.0f;
-            return false;
+            return (light.brightness != prevBrightness);
 
         case ANIM_BRIGHTEN: {
             // One-shot linear fade to max, then stop
