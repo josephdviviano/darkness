@@ -167,6 +167,24 @@
             // triple the push, causing jittery over-correction.
             mPushes.clear();
             for (const auto &c : mIterContacts) {
+                Vector3 pushNormal = c.normal;
+
+                // For pushable objects, suppress upward push — prevents the
+                // player from being lifted over crates/barrels by the constraint
+                // solver. The original Dark Engine has no stair-step logic for
+                // OBB objects; the constraint system only blocks horizontally.
+                if (c.objectId >= 0 && mIsPushableCb && mIsPushableCb(c.objectId)) {
+                    static int dbgCount = 0;
+                    if (dbgCount++ < 20)
+                        std::fprintf(stderr, "[PUSH-COLLIDE] obj=%d n=(%.2f,%.2f,%.2f) pen=%.3f sub=%d\n",
+                                     c.objectId, c.normal.x, c.normal.y, c.normal.z,
+                                     c.penetration, c.submodelIdx);
+                    if (pushNormal.z > 0.0f) pushNormal.z = 0.0f;
+                    float len = glm::length(pushNormal);
+                    if (len < 0.001f) continue;  // purely upward contact — skip
+                    pushNormal /= len;  // re-normalize
+                }
+
                 bool merged = false;
                 for (auto &p : mPushes) {
                     if (glm::dot(c.normal, p.first) > 0.99f) {
@@ -177,7 +195,7 @@
                     }
                 }
                 if (!merged) {
-                    mPushes.push_back({c.normal, c.penetration});
+                    mPushes.push_back({pushNormal, c.penetration});
                 }
             }
             for (const auto &p : mPushes) {
