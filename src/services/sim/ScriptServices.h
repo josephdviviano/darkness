@@ -37,7 +37,12 @@
 #include <string>
 #include <vector>
 
+#include <sstream>
+
 #include "DarknessMath.h"
+#include "LightingSystem.h"
+#include "audio/AudioService.h"
+#include "audio/SchemaTypes.h"
 #include "dyntype/Variant.h"
 #include "link/LinkCommon.h"
 #include "link/LinkService.h"
@@ -276,15 +281,42 @@ struct PropertyScriptService {
 struct SoundScriptService {
     AudioService *audioSvc = nullptr;
 
+    // Object position lookup for 3D spatialization.
+    const std::unordered_map<int32_t, ObjectPlacement> *placements = nullptr;
+
     /// Play an environmental schema (tag-based lookup). Returns handle.
+    /// Tags are space-separated "Key Value" pairs, e.g. "Event Activate"
+    /// or "Event StateChange, DirectionState Forward" (comma-separated groups).
     int32_t playEnvSchema(int32_t objID, const std::string &tags,
                           int32_t srcID = 0) {
-        // AudioService's playEnvSchema takes a vector of SchemaTagValue.
-        // Scripts pass simplified tag strings — we parse into tags here.
-        // Stub: log and return invalid handle until AudioService is wired.
-        std::fprintf(stderr, "[SoundScriptService] playEnvSchema(obj=%d, tags=\"%s\")\n",
-                     objID, tags.c_str());
-        return -1;
+        if (!audioSvc) return -1;
+
+        // Parse tag string into SchemaTagValue vector
+        std::vector<SchemaTagValue> tagVec;
+        std::istringstream iss(tags);
+        std::string key, value;
+        while (iss >> key) {
+            if (!key.empty() && key.back() == ',') key.pop_back();
+            if (key.empty()) continue;
+            if (!(iss >> value)) break;
+            if (!value.empty() && value.back() == ',') value.pop_back();
+            SchemaTagValue tv;
+            tv.tagName = key;
+            tv.enumValues.push_back(value);
+            tagVec.push_back(std::move(tv));
+        }
+
+        // Look up object position for 3D spatialization
+        Vector3 pos(0.0f);
+        if (placements) {
+            auto it = placements->find(objID);
+            if (it != placements->end())
+                pos = Vector3(it->second.x, it->second.y, it->second.z);
+        }
+
+        std::fprintf(stderr, "[SoundScriptService] playEnvSchema(obj=%d, tags=\"%s\", pos=(%.1f,%.1f,%.1f), %zu parsed)\n",
+                     objID, tags.c_str(), pos.x, pos.y, pos.z, tagVec.size());
+        return static_cast<int32_t>(audioSvc->playEnvSchema(tagVec, pos));
     }
 
     /// Play a named schema directly. Returns handle.
@@ -312,29 +344,78 @@ struct SoundScriptService {
 // Wraps LightingSystem for AnimLight control.
 
 struct LightScriptService {
-    // LightingSystem is header-only with free functions; we need a reference
-    // to the animLights map and the dirty-region update callback.
-    // These are wired by the main loop after LightingSystem is initialized.
+    // Pointer to the mission's lightSources map (keyed by lightNum).
+    // Set by the main loop after LightingSystem is initialized.
+    std::unordered_map<int16_t, LightSource> *lightSources = nullptr;
+
+    // Set true when any light is changed by a script. The render loop
+    // checks and clears this to force a lightmap atlas re-blend.
+    bool dirty = false;
+
+    /// Find a LightSource by Dark Engine object ID.
+    /// Returns nullptr if not found.
+    LightSource *findByObjID(int32_t objID) {
+        if (!lightSources) return nullptr;
+        for (auto &[lightNum, ls] : *lightSources) {
+            if (ls.objectId == objID) return &ls;
+        }
+        return nullptr;
+    }
 
     /// Change an animated light's mode at runtime.
     void setMode(int32_t objID, int mode) {
+        LightSource *ls = findByObjID(objID);
+        if (!ls) return;
+        ls->mode = static_cast<uint16_t>(mode);
+        ls->inactive = false;
+        // Reset countdown so the new mode takes effect immediately
+        ls->countdown = 0.0f;
+        dirty = true;
         std::fprintf(stderr, "[LightScriptService] setMode(obj=%d, mode=%d)\n",
                      objID, mode);
-        // Will be wired to LightingSystem's animLights map
     }
 
-    /// Activate a light (start animation).
+    /// Activate a light — set to max brightness mode and mark active.
     void activate(int32_t objID) {
-        std::fprintf(stderr, "[LightScriptService] activate(obj=%d)\n", objID);
+        LightSource *ls = findByObjID(objID);
+        if (!ls) {
+            std::fprintf(stderr, "[LightScriptService] activate(obj=%d) — not found\n", objID);
+            return;
+        }
+        float prevBright = ls->brightness;
+        ls->inactive = false;
+        ls->mode = ANIM_MAX_BRIGHT;
+        ls->brightness = ls->maxBright;
+        // Only mark dirty if brightness actually changed (avoid spurious
+        // re-blend on startup when lights are already at max brightness)
+        if (ls->brightness != prevBright) dirty = true;
+        std::fprintf(stderr, "[LightScriptService] activate(obj=%d) lightNum=%d brightness=%.2f\n",
+                     objID, ls->lightNum, ls->brightness);
     }
 
-    /// Deactivate a light (stop animation, set to min brightness).
+    /// Deactivate a light — set to zero brightness mode.
     void deactivate(int32_t objID) {
-        std::fprintf(stderr, "[LightScriptService] deactivate(obj=%d)\n", objID);
+        LightSource *ls = findByObjID(objID);
+        if (!ls) {
+            std::fprintf(stderr, "[LightScriptService] deactivate(obj=%d) — not found\n", objID);
+            return;
+        }
+        float prevBright = ls->brightness;
+        ls->mode = ANIM_ZERO;
+        ls->brightness = 0.0f;
+        ls->inactive = false;  // must remain active so the zero brightness is applied
+        if (ls->brightness != prevBright) dirty = true;
+        std::fprintf(stderr, "[LightScriptService] deactivate(obj=%d) lightNum=%d\n",
+                     objID, ls->lightNum);
     }
 
     /// Set direct brightness value (0.0-1.0).
     void setBrightness(int32_t objID, float brightness) {
+        LightSource *ls = findByObjID(objID);
+        if (!ls) return;
+        ls->brightness = brightness;
+        ls->inactive = false;
+        dirty = true;
         std::fprintf(stderr, "[LightScriptService] setBrightness(obj=%d, %.2f)\n",
                      objID, brightness);
     }

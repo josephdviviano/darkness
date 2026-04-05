@@ -177,7 +177,6 @@ public:
         sendMessageWithLinks({objID, "FrobWorldEnd", frobberID, {}});
     }
 
-private:
     /// Follow ControlDevice link relations from an object and send messages
     /// to targets. "TurnOn" and "FrobWorldEnd" send "TurnOn" to linked objects.
     /// "TurnOff" sends "TurnOff" to linked objects. One-hop only to prevent
@@ -193,10 +192,18 @@ private:
         // (Thief 1/2 missions use "ControlDevice", not "SwitchLink")
         auto links = mWorldQuery->getLinks(srcObjID, "ControlDevice", 0);
 
+        if (links.empty()) {
+            std::fprintf(stderr, "[MsgDispatch] propagate %s from obj %d: no ControlDevice links\n",
+                         triggerMsg.c_str(), srcObjID);
+        }
+
         for (const auto &link : links) {
             int32_t targetID = static_cast<int32_t>(link.dst);
             if (targetID == 0 || targetID == srcObjID)
                 continue;  // skip self-links and null
+
+            std::fprintf(stderr, "[MsgDispatch] propagate %s: obj %d -> %s -> obj %d\n",
+                         triggerMsg.c_str(), srcObjID, linkMsg.c_str(), targetID);
 
             // Send the message to the linked target (no further ControlDevice
             // propagation to avoid infinite loops)
