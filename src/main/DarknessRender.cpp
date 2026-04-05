@@ -1712,8 +1712,27 @@ static Darkness::FrameContext prepareFrame(
         frustum.extractFromVP(vp);
 
         int32_t camCell = findCameraCell(mission.wrData, state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+        // Build door-blocking callback: when a portal connects cells in different
+        // rooms with a closed vision-blocking door, skip the portal traversal.
+        PortalBlockedCallback doorBlocking = nullptr;
+        if (!mission.cellToRoom.empty() && state.doorSystem) {
+            doorBlocking = [&](uint32_t srcCell, uint32_t tgtCell) -> bool {
+                if (srcCell >= mission.cellToRoom.size() ||
+                    tgtCell >= mission.cellToRoom.size())
+                    return false;
+                int32_t srcRoom = mission.cellToRoom[srcCell];
+                int32_t tgtRoom = mission.cellToRoom[tgtCell];
+                if (srcRoom < 0 || tgtRoom < 0 || srcRoom == tgtRoom)
+                    return false;
+                // Check if a door between these rooms is closed and vision-blocking
+                float openFrac = state.doorSystem->getOpenFractionForRooms(srcRoom, tgtRoom);
+                return openFrac < 0.01f;  // fully closed = block
+            };
+        }
+
         fc.visibleCells = portalBFS(mission.wrData, mission.cellPortals, camCell, frustum,
-                                     state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+                                     state.cam.pos[0], state.cam.pos[1], state.cam.pos[2],
+                                     doorBlocking);
         state.cullVisibleCells = static_cast<uint32_t>(fc.visibleCells.size());
 
         // Build a tighter frustum from the actual rendering projection for
@@ -1809,6 +1828,17 @@ int main(int argc, char *argv[]) {
     // ── Load mission data: WR geometry, portals, spawn, lights, sky, fog, flow ──
     if (!loadMissionData(misPath, mission))
         return 1;
+
+    // Build cell→room mapping for door visibility blocking.
+    // Each cell center is tested against room bounding planes to find which
+    // room it belongs to. Used by portalBFS to skip portals blocked by doors.
+    {
+        auto roomSvc = GET_SERVICE(Darkness::RoomService);
+        if (roomSvc && roomSvc->isLoaded()) {
+            mission.cellToRoom = buildCellToRoomMap(
+                mission.wrData, roomSvc->getAllRooms());
+        }
+    }
 
     // Create physics world from parsed WR cell geometry.
     // Must be created after loadMissionData() so mission.wrData is valid.

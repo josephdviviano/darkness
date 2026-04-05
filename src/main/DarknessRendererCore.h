@@ -37,11 +37,14 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <queue>
+#include <functional>
+#include <memory>
 
 #include <bgfx/bgfx.h>
 #include <bx/math.h>
 
 #include "WRChunkParser.h"
+#include "room/Room.h"
 #include "CellGeometry.h"
 
 namespace Darkness {
@@ -798,14 +801,21 @@ struct ViewFrustum {
     }
 };
 
+// Callback type for door visibility blocking: given source and target cell IDs,
+// returns true if the portal between them is blocked (e.g., by a closed door).
+// When nullptr, no door blocking is applied.
+using PortalBlockedCallback = std::function<bool(uint32_t srcCell, uint32_t tgtCell)>;
+
 // BFS portal traversal: starting from the camera cell, follow portals
 // that are visible to the view frustum. Returns the set of visible cell IDs.
+// Optional portalBlocked callback allows doors to block portal traversal.
 inline std::unordered_set<uint32_t>
 portalBFS(const Darkness::WRParsedData &wr,
           const std::vector<std::vector<CellPortalInfo>> &cellPortals,
           int32_t startCell,
           const ViewFrustum &frustum,
-          float camX, float camY, float camZ) {
+          float camX, float camY, float camZ,
+          const PortalBlockedCallback &portalBlocked = nullptr) {
     std::unordered_set<uint32_t> visible;
 
     if (startCell < 0 || startCell >= static_cast<int32_t>(wr.numCells))
@@ -828,6 +838,11 @@ portalBFS(const Darkness::WRParsedData &wr,
             if (visible.count(portal.tgtCell))
                 continue;
 
+            // Door blocking: if a closed door blocks this portal, skip it.
+            // This prevents rendering rooms behind closed doors.
+            if (portalBlocked && portalBlocked(ci, portal.tgtCell))
+                continue;
+
             // Backface test: skip portals facing away from the camera.
             // Camera must be on the positive side of the portal plane
             // (Dark Engine cell planes face inward).
@@ -847,6 +862,36 @@ portalBFS(const Darkness::WRParsedData &wr,
     }
 
     return visible;
+}
+
+// Build cell→room mapping using room point-in-convex-hull tests.
+// Each cell center is tested against all rooms to find which room it belongs to.
+// Returns a vector indexed by cellID containing the roomID (-1 if no room found).
+inline std::vector<int32_t>
+buildCellToRoomMap(const Darkness::WRParsedData &wr,
+                   const std::vector<std::unique_ptr<Darkness::Room>> &rooms) {
+    std::vector<int32_t> cellToRoom(wr.numCells, -1);
+
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        const auto &cell = wr.cells[ci];
+        // Use cell center for room lookup
+        Darkness::Vector3 center(cell.center.x, cell.center.y, cell.center.z);
+
+        for (const auto &room : rooms) {
+            if (!room) continue;
+            if (room->isInside(center)) {
+                cellToRoom[ci] = room->getRoomID();
+                break;
+            }
+        }
+    }
+
+    int mapped = 0;
+    for (auto r : cellToRoom) if (r >= 0) mapped++;
+    std::fprintf(stderr, "[PortalCull] Cell→room mapping: %d/%u cells mapped to rooms\n",
+                 mapped, wr.numCells);
+
+    return cellToRoom;
 }
 
 // ── Fog parameters ──

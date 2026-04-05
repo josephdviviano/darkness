@@ -104,6 +104,9 @@ struct MissionData {
     // Built from P$Friction on texture archetype objects in dark.gam.
     std::vector<float>                                frictionTable;
 
+    // Cell→room mapping for door visibility blocking (indexed by cellID, -1 if unmapped)
+    std::vector<int32_t>                              cellToRoom;
+
     // Per-texture climbability factor (indexed by TXLIST texture index, default 0.0).
     // Built from P$Climbabil on texture archetype objects in dark.gam.
     // Non-zero values boost friction on steep surfaces (NOT a climb-mode trigger).
