@@ -2313,6 +2313,7 @@ int main(int argc, char *argv[]) {
                          (void*)soundScriptSvc.audioSvc);
         }
         soundScriptSvc.placements = &mission.objData.allPlacements;
+        soundScriptSvc.propSvc = propSvc.get();
         damageScriptSvc.msgDispatch = &messageDispatch;
         lockedScriptSvc.propSvc = propSvc.get();
         lockedScriptSvc.msgDispatch = &messageDispatch;
@@ -2579,6 +2580,7 @@ int main(int argc, char *argv[]) {
         // so collision bodies exist for the pushability check.
         objectPushSystem.init(propSvc.get(), state.objectStates,
                               state.physics->getObjectCollisionWorld(), &doorSystem);
+        objectPushSystem.autoRegisterPushable();
         state.physics->setPushSystem(&objectPushSystem);
 
         // Build frob cache for objects without collision bodies (levers, switches, etc.)

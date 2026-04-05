@@ -280,6 +280,7 @@ struct PropertyScriptService {
 
 struct SoundScriptService {
     AudioService *audioSvc = nullptr;
+    PropertyService *propSvc = nullptr;
 
     // Object position lookup for 3D spatialization.
     const std::unordered_map<int32_t, ObjectPlacement> *placements = nullptr;
@@ -287,6 +288,8 @@ struct SoundScriptService {
     /// Play an environmental schema (tag-based lookup). Returns handle.
     /// Tags are space-separated "Key Value" pairs, e.g. "Event Activate"
     /// or "Event StateChange, DirectionState Forward" (comma-separated groups).
+    /// ClassTags from the object (e.g. "SwitchType BPush", "Material Metal")
+    /// are automatically appended for schema matching.
     int32_t playEnvSchema(int32_t objID, const std::string &tags,
                           int32_t srcID = 0) {
         if (!audioSvc) return -1;
@@ -306,6 +309,30 @@ struct SoundScriptService {
             tagVec.push_back(std::move(tv));
         }
 
+        // Append ClassTags from the object (e.g. "SwitchType BPush").
+        // These are needed for schema matching — "Event Activate" alone
+        // is too generic to match specific switch/button sounds.
+        if (propSvc) {
+            struct { uint32_t val; char text[252]; } classTags = {};
+            int32_t lookupID = (srcID > 0) ? srcID : objID;
+            for (const char *pname : {"ClassTags", "Class Tags", "Class Tag"}) {
+                if (getTypedProperty<decltype(classTags)>(propSvc, pname, lookupID, classTags))
+                    break;
+            }
+            std::string tagStr(classTags.text,
+                strnlen(classTags.text, sizeof(classTags.text)));
+            if (!tagStr.empty()) {
+                std::istringstream ctIss(tagStr);
+                std::string ctKey, ctVal;
+                while (ctIss >> ctKey >> ctVal) {
+                    SchemaTagValue tv;
+                    tv.tagName = ctKey;
+                    tv.enumValues.push_back(ctVal);
+                    tagVec.push_back(std::move(tv));
+                }
+            }
+        }
+
         // Look up object position for 3D spatialization
         Vector3 pos(0.0f);
         if (placements) {
@@ -314,8 +341,8 @@ struct SoundScriptService {
                 pos = Vector3(it->second.x, it->second.y, it->second.z);
         }
 
-        std::fprintf(stderr, "[SoundScriptService] playEnvSchema(obj=%d, tags=\"%s\", pos=(%.1f,%.1f,%.1f), %zu parsed)\n",
-                     objID, tags.c_str(), pos.x, pos.y, pos.z, tagVec.size());
+        std::fprintf(stderr, "[SoundScriptService] playEnvSchema(obj=%d, tags=\"%s\", %zu total tags)\n",
+                     objID, tags.c_str(), tagVec.size());
         return static_cast<int32_t>(audioSvc->playEnvSchema(tagVec, pos));
     }
 

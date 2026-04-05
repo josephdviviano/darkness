@@ -53,16 +53,6 @@ namespace Darkness {
 
 class ScriptManager;  // forward declaration — defined in sim/ScriptManager.h
 
-// ── FrobInfo property (from Dark Engine) ──
-// P$FrobInfo: 16 bytes, 3 action fields + padding.
-// Each field is a bitfield of frob actions for that context.
-struct PropFrobInfo {
-    uint32_t worldAction;      // actions when frobbed in world
-    uint32_t invAction;        // actions when frobbed in inventory
-    uint32_t toolAction;       // actions when used as tool
-    uint32_t pad;              // zero padding
-};
-
 // Frob action flags (from Dark Engine)
 static constexpr uint32_t kFrobMove        = 0x001;  // pick up object
 static constexpr uint32_t kFrobScript      = 0x002;  // run script
