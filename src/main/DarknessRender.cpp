@@ -2354,12 +2354,7 @@ int main(int argc, char *argv[]) {
                            &messageDispatch, &scriptServices);
         scriptManager.instantiateScripts();
 
-        // Initialize ObjectPushSystem (Task 61)
-        Darkness::ObjectCollisionWorld *ocw =
-            state.physics ? state.physics->getObjectCollisionWorld() : nullptr;
-        objectPushSystem.init(propSvc.get(), state.objectStates, ocw, &doorSystem);
-        if (state.physics)
-            state.physics->setPushSystem(&objectPushSystem);
+        // ObjectPushSystem init deferred until after buildObjectCollision (below)
     }
 
     // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
@@ -2583,6 +2578,12 @@ int main(int argc, char *argv[]) {
         // Initialize edge trigger system from collision bodies with isEdgeTrigger=true
         edgeTriggerSystem.init(state.physics->getObjectCollisionWorld());
         edgeTriggerSystem.setMessageDispatch(&messageDispatch);
+
+        // Initialize ObjectPushSystem (Task 61) — must be after buildObjectCollision
+        // so collision bodies exist for the pushability check.
+        objectPushSystem.init(propSvc.get(), state.objectStates,
+                              state.physics->getObjectCollisionWorld(), &doorSystem);
+        state.physics->setPushSystem(&objectPushSystem);
     }
 
     // Wire door collision updates: when doors animate, update their collision
