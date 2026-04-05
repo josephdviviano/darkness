@@ -2585,6 +2585,9 @@ int main(int argc, char *argv[]) {
         objectPushSystem.init(propSvc.get(), state.objectStates,
                               state.physics->getObjectCollisionWorld(), &doorSystem);
         state.physics->setPushSystem(&objectPushSystem);
+
+        // Build frob cache for objects without collision bodies (levers, switches, etc.)
+        frobSystem.buildFrobCache();
     }
 
     // Wire door collision updates: when doors animate, update their collision
