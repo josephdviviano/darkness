@@ -84,22 +84,30 @@ public:
         mCollisionWorld = collisionWorld;
         mDoorSystem = doorSystem;
 
-        // Scan for pushable objects: positive mass, collision body, not door/trigger
-        if (!propSvc) return;
+        // Scan for pushable objects: iterate all collision bodies, check for
+        // OBB shape with positive mass (via inherited P$PhysAttr), exclude
+        // doors/triggers/platforms. Most objects inherit PhysAttr from archetypes.
+        if (!propSvc || !collisionWorld) return;
 
-        auto allPhysAttr = getAllObjectsWithProperty(propSvc, "PhysAttr");
-        for (int objID : allPhysAttr) {
+        // Iterate all collision bodies in the world
+        for (size_t i = 0; i < collisionWorld->bodyCount(); ++i) {
+            const ObjectCollisionBody &body = collisionWorld->getBody(i);
+            int32_t objID = body.objID;
             if (objID <= 0) continue;  // skip archetypes
 
+            // Only OBB-type bodies are pushable
+            if (body.shapeType != CollisionShapeType::OBB) continue;
+            if (body.isEdgeTrigger) continue;
+
+            // Skip doors — they have their own movement system
+            if (isDoor(objID)) continue;
+
+            // Read mass from P$PhysAttr (with archetype inheritance)
             PropPhysAttr attr = {};
             if (!getTypedProperty<PropPhysAttr>(propSvc, "PhysAttr", objID, attr))
                 continue;
 
             if (attr.mass <= 0.0f) continue;
-            if (attr.edgeTrigger) continue;
-
-            // Skip doors — they have their own movement system
-            if (isDoor(objID)) continue;
 
             mPushableObjects.insert(objID);
             mPushableMass[objID] = attr.mass;
