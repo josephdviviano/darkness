@@ -85,6 +85,10 @@ public:
     // ── World management ──
 
     void step(float dt) override {
+        // Capture pre-collision velocity for push system — after collision
+        // resolution, the velocity component into walls/objects is zeroed out.
+        Vector3 preCollisionVel = mPlayer.getVelocity();
+
         // Step player physics (custom 5-sphere constraint model)
         mPlayer.step(dt, mContactCb);
 
@@ -112,10 +116,12 @@ public:
         // Sync dynamic bodies back to collision geometry + renderer
         syncDynamicBodies();
 
-        // Feed player-object contacts to push system for kinematic pushing
+        // Feed player-object contacts to push system for kinematic pushing.
+        // Use pre-collision velocity — post-collision velocity has the component
+        // into the object zeroed out by the constraint solver.
         if (mPushSystem) {
             mPushSystem->processPlayerContacts(
-                mPlayer.getLastContacts(), mPlayer.getVelocity());
+                mPlayer.getLastContacts(), preCollisionVel);
         }
 
         // Update view punch spring

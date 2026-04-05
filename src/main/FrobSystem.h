@@ -104,16 +104,17 @@ public:
     /// that have FrobInfo but no P$PhysType collision body.
     void setWorldQuery(const IWorldQuery *wq) { mWorldQuery = wq; }
 
-    /// Build the frobbable-object cache: scans all positioned objects and stores
-    /// those with FrobInfo (via inheritance) that lack collision bodies.
-    /// Must be called after buildObjectCollision so collision bodies exist.
-    void buildFrobCache() {
-        if (!mPropSvc || !mWorldQuery) return;
+    /// Build the frobbable-object cache from the placement map.
+    /// Scans all positioned objects and stores those with FrobInfo (via
+    /// inheritance) that lack collision bodies — includes their positions
+    /// from the allPlacements map (reliable, unlike PropertyService Variant
+    /// access which may fail for P$Position's binary format).
+    template <typename PlacementMap>
+    void buildFrobCache(const PlacementMap &allPlacements) {
+        if (!mPropSvc) return;
         mFrobCache.clear();
 
-        // Scan all positioned objects (same set as script instantiation)
-        auto allPositioned = getAllObjectsWithProperty(mPropSvc, "Position");
-        for (int objID : allPositioned) {
+        for (const auto &[objID, placement] : allPlacements) {
             if (objID <= 0) continue;
 
             // Skip objects that have collision bodies (handled by ray-vs-OBB)
@@ -130,6 +131,7 @@ public:
             FrobCacheEntry entry;
             entry.objID = objID;
             entry.worldAction = frobInfo.worldAction;
+            entry.position = Vector3(placement.x, placement.y, placement.z);
             mFrobCache.push_back(entry);
         }
         std::fprintf(stderr, "[FrobSystem] %zu frobbable objects without collision bodies cached\n",
@@ -219,11 +221,11 @@ public:
         // Levers, switches, books, and other small frobbable objects often lack
         // P$PhysType collision bodies. Uses the pre-built frob cache (built once
         // at init via buildFrobCache) to avoid per-frame property lookups.
-        if (mTarget.objID == 0 && mWorldQuery) {
+        if (mTarget.objID == 0 && !mFrobCache.empty()) {
             int nearCount = 0;
             for (const auto &entry : mFrobCache) {
-                // Get object position (from ObjectState or P$Position via IWorldQuery)
-                Vector3 objPos = mWorldQuery->getPosition(entry.objID);
+                // Use cached position from allPlacements (reliable, binary format)
+                Vector3 objPos = entry.position;
                 Vector3 toObj = objPos - rayStart;
                 float dist = glm::length(toObj);
                 if (dist > mFrobDistance || dist < 0.1f)
@@ -311,6 +313,7 @@ private:
     struct FrobCacheEntry {
         int32_t objID;
         uint32_t worldAction;
+        Vector3 position;  // from allPlacements at load time
     };
     std::vector<FrobCacheEntry> mFrobCache;
 };

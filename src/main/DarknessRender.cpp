@@ -2587,7 +2587,8 @@ int main(int argc, char *argv[]) {
         state.physics->setPushSystem(&objectPushSystem);
 
         // Build frob cache for objects without collision bodies (levers, switches, etc.)
-        frobSystem.buildFrobCache();
+        // Uses allPlacements for reliable position data (P$Position binary format).
+        frobSystem.buildFrobCache(mission.objData.allPlacements);
     }
 
     // Wire door collision updates: when doors animate, update their collision
