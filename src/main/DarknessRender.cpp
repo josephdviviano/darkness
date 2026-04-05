@@ -1313,8 +1313,14 @@ static void handleEvents(
                     if (distSq < nearestDist) { nearestDist = distSq; nearestID = did; }
                 }
                 if (nearestID != 0) {
-                    // Route through MessageDispatch so lock checks apply
-                    if (state.messageDispatch) {
+                    // Route through ScriptManager so door scripts get the message
+                    if (state.scriptManager) {
+                        Darkness::ScriptMessage msg;
+                        msg.to = nearestID;
+                        msg.name = "FrobWorldEnd";
+                        msg.from = 0;
+                        state.scriptManager->sendMessageWithLinks(msg);
+                    } else if (state.messageDispatch) {
                         state.messageDispatch->frobWorldEnd(nearestID, 0);
                     } else {
                         state.doorSystem->activate(nearestID, Darkness::kDoorToggle);
@@ -2284,6 +2290,7 @@ int main(int argc, char *argv[]) {
     // Connect FrobSystem to MessageDispatch for ControlDevice link traversal
     frobSystem.setMessageDispatch(&messageDispatch);
     frobSystem.setWorldQuery(worldQuery.get());
+    // frobSystem.setScriptManager wired below after ScriptManager declaration
     state.messageDispatch = &messageDispatch;
 
     // ── Initialize Script System (Phase 6) ──
@@ -2357,6 +2364,10 @@ int main(int argc, char *argv[]) {
 
         // ObjectPushSystem init deferred until after buildObjectCollision (below)
     }
+
+    // Wire ScriptManager to frob system and state (after ScriptManager is declared)
+    frobSystem.setScriptManager(&scriptManager);
+    state.scriptManager = &scriptManager;
 
     // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
     loadWorldTextures(misPath, resPath, mission);

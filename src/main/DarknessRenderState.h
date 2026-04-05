@@ -61,6 +61,7 @@ class DoorSystem;
 class MovingTerrainSystem;
 class FrobSystem;
 class MessageDispatch;
+class ScriptManager;
 
 // ── MissionData — CPU-side parsed mission content ──
 // Everything loaded from the .mis/.gam files and CRF archives before
@@ -250,6 +251,7 @@ struct RuntimeState {
     // Message dispatch — non-owning pointer, for routing frob/TurnOn/TurnOff
     // through global handlers (which enforce lock checks, etc.)
     MessageDispatch *messageDispatch = nullptr;
+    ScriptManager *scriptManager = nullptr;
 
     // Mode description string for title bar (points to string literal)
     const char *modeStr = "flat-shaded";
