@@ -309,6 +309,9 @@ public:
     /// Linear velocity
     const Vector3 &getVelocity() const { return mVelocity; }
 
+    /// Last frame's contacts (for push system to inspect object collisions).
+    const std::vector<SphereContact> &getLastContacts() const { return mLastContacts; }
+
     /// Forward direction (X-Y plane, from yaw). Z-up coordinate system.
     Vector3 getForward() const {
         return Vector3(mCosYaw, mSinYaw, 0.0f);

@@ -53,9 +53,13 @@
 #include "PlayerPhysics.h"
 #include "RayCaster.h"
 #include "sim/SimCommon.h"
+#include "sim/ObjectPushSystem.h"
 #include "property/TypedProperty.h"
 
 namespace Darkness {
+
+// Forward declaration
+class ObjectPushSystem;
 
 /// Concrete IPhysicsWorld implementation for the Darkness engine.
 /// Owns the CollisionGeometry, PlayerPhysics, and (in Task 26) ODE world.
@@ -107,6 +111,12 @@ public:
 
         // Sync dynamic bodies back to collision geometry + renderer
         syncDynamicBodies();
+
+        // Feed player-object contacts to push system for kinematic pushing
+        if (mPushSystem) {
+            mPushSystem->processPlayerContacts(
+                mPlayer.getLastContacts(), mPlayer.getVelocity());
+        }
 
         // Update view punch spring
         mPlayer.updateViewPunch(dt);
@@ -383,6 +393,10 @@ public:
     size_t objectCollisionBodyCount() const {
         return mObjectCollision ? mObjectCollision->bodyCount() : 0;
     }
+
+    /// Set the object push system for kinematic pushing (Task 61).
+    /// Called during main loop initialization, after ObjectPushSystem::init().
+    void setPushSystem(ObjectPushSystem *pushSys) { mPushSystem = pushSys; }
 
     // ── Direct access for renderer integration ──
 
@@ -923,6 +937,8 @@ private:
     // Used for ALL player-vs-object collision (static and dynamic).
     // Dynamic bodies sync ODE rotation back via updateBodyTransform() each frame.
     std::unique_ptr<ObjectCollisionWorld> mObjectCollision;
+
+    ObjectPushSystem *mPushSystem = nullptr;  // kinematic object pushing (Task 61)
 
     PlayerPhysics mPlayer;           // custom player movement simulation
 
