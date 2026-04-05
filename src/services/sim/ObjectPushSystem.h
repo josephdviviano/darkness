@@ -58,6 +58,7 @@ namespace Darkness {
 // Forward declarations
 class ObjectCollisionWorld;
 class DoorSystem;
+struct ObjectCollisionBody;
 
 // ── Per-object push state ──
 struct PushedObject {
@@ -161,6 +162,49 @@ public:
         }
     }
 
+    /// Called when a door is moving — check for overlaps with pushable objects
+    /// and push them out of the way. doorObjID is the door, doorBody is its
+    /// current collision body with updated world position.
+    void processDoorCollision(int32_t doorObjID, const ObjectCollisionBody &doorBody) {
+        if (!mCollisionWorld || !mObjectStates) return;
+
+        // Check all pushable objects for AABB overlap with the door
+        for (int32_t objID : mPushableObjects) {
+            if (objID == doorObjID) continue;
+
+            const ObjectCollisionBody *objBody = mCollisionWorld->findBodyByObjID(objID);
+            if (!objBody) continue;
+
+            // Quick AABB overlap test
+            if (!aabbOverlap(doorBody, *objBody)) continue;
+
+            // Compute push direction: from door center to object center
+            Vector3 pushDir = objBody->worldPos - doorBody.worldPos;
+            pushDir.z = 0.0f;  // horizontal only
+            float dist = glm::length(pushDir);
+            if (dist < 0.001f) pushDir = Vector3(1, 0, 0);  // degenerate case
+            else pushDir /= dist;
+
+            // Push speed proportional to door velocity (estimated from position change)
+            constexpr float DOOR_PUSH_SPEED = 4.0f;
+
+            Vector3 pushVel = pushDir * DOOR_PUSH_SPEED;
+
+            auto it = mActiveObjects.find(objID);
+            if (it == mActiveObjects.end()) {
+                float mass = mPushableMass.count(objID) ? mPushableMass[objID] : 10.0f;
+                PushedObject po;
+                po.objID = objID;
+                po.mass = mass;
+                po.friction = mPushableFriction.count(objID) ? mPushableFriction[objID] : 0.5f;
+                po.velocity = pushVel;
+                mActiveObjects[objID] = po;
+            } else {
+                it->second.velocity = pushVel;
+            }
+        }
+    }
+
     // ── SimListener interface ──
 
     void simStep(float simTime, float delta) override {
@@ -240,6 +284,18 @@ private:
         if (!mPropSvc) return false;
         return hasProperty(mPropSvc, "RotDoor", objID) ||
                hasProperty(mPropSvc, "TransDoor", objID);
+    }
+
+    /// Quick AABB overlap test between two collision bodies.
+    static bool aabbOverlap(const ObjectCollisionBody &a,
+                             const ObjectCollisionBody &b) {
+        // Half-extent AABB from body dimensions
+        Vector3 aHalf = a.edgeLengths * 0.5f;
+        Vector3 bHalf = b.edgeLengths * 0.5f;
+        Vector3 diff = glm::abs(a.worldPos - b.worldPos);
+        return diff.x < (aHalf.x + bHalf.x) &&
+               diff.y < (aHalf.y + bHalf.y) &&
+               diff.z < (aHalf.z + bHalf.z);
     }
 
     PropertyService *mPropSvc = nullptr;
