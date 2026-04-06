@@ -72,6 +72,7 @@ struct RenderConfig {
     bool stepLog          = false;  // stair step diagnostics to stderr ([STEP] prefix)
     bool togglePlatforms  = false;  // auto-activate all moving terrain at startup
     bool noProbes         = false;  // skip probe baking (no spatial audio)
+    bool audioLog         = false;  // enable audio/sound/schema log output
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -334,6 +335,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cfg.togglePlatforms = true;
         } else if (std::strcmp(argv[i], "--no-probes") == 0) {
             cfg.noProbes = true;
+        } else if (std::strcmp(argv[i], "--audio-log") == 0) {
+            cfg.audioLog = true;
         } else if (std::strcmp(argv[i], "--physics-rate") == 0 && i + 1 < argc) {
             int val = std::atoi(argv[++i]);
             if (val <= 12) cfg.physicsRate = 12;

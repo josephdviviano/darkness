@@ -196,10 +196,17 @@ public:
     /// Activate a platform: start moving along its waypoint path.
     bool activate(int32_t objID) {
         auto it = mPlatforms.find(objID);
-        if (it == mPlatforms.end()) return false;
+        if (it == mPlatforms.end()) {
+            static int w = 0; if (w++ < 5)
+                std::fprintf(stderr, "[FALLBACK] MovingTerrainSystem::activate: obj %d not a platform\n", objID);
+            return false;
+        }
 
         PlatformState &plat = it->second;
-        if (plat.waypoints.empty()) return false;
+        if (plat.waypoints.empty()) {
+            std::fprintf(stderr, "[FALLBACK] MovingTerrainSystem::activate: obj %d has no waypoints\n", objID);
+            return false;
+        }
 
         // If already moving or paused, do nothing
         if (plat.status != kPlatformStopped) return true;
@@ -343,18 +350,27 @@ private:
                             Relation *tpathRel) {
         // Find the starting waypoint via TPathInit link
         int tpathInitFlavor = linkSvc->nameToFlavor("TPathInit");
-        if (tpathInitFlavor < 0) return false;
+        if (tpathInitFlavor < 0) {
+            std::fprintf(stderr, "[FALLBACK] MovingTerrainSystem: TPathInit relation not registered\n");
+            return false;
+        }
 
         LinkQueryResultPtr initLinks = linkSvc->getAllLinks(
             tpathInitFlavor, plat.objID, 0);
-        if (!initLinks || initLinks->end()) return false;
+        if (!initLinks || initLinks->end()) {
+            std::fprintf(stderr, "[FALLBACK] MovingTerrainSystem: obj %d has no TPathInit link (no starting waypoint)\n", plat.objID);
+            return false;
+        }
 
         const Link &initLink = initLinks->next();
         int32_t firstWaypoint = initLink.dst();
 
         // Follow the TPath link chain from the starting waypoint
         int tpathFlavor = linkSvc->nameToFlavor("TPath");
-        if (tpathFlavor < 0) return false;
+        if (tpathFlavor < 0) {
+            std::fprintf(stderr, "[FALLBACK] MovingTerrainSystem: TPath relation not registered\n");
+            return false;
+        }
 
         int32_t currentWP = firstWaypoint;
         std::unordered_map<int32_t, bool> visited;  // cycle detection
@@ -436,7 +452,12 @@ private:
         // Read raw link data bytes and interpret as PropTPath
         size_t dataSize = 0;
         const uint8_t *data = tpathRel->getRawLinkData(linkID, dataSize);
-        if (!data || dataSize < sizeof(PropTPath)) return;
+        if (!data || dataSize < sizeof(PropTPath)) {
+            static int w = 0; if (w++ < 10)
+                std::fprintf(stderr, "[DEFAULT] MovingTerrainSystem: TPath link %d->%d has no data (%zu bytes), using default speed=5.0\n",
+                             srcObj, dstObj, dataSize);
+            return;
+        }
 
         PropTPath tpath;
         std::memcpy(&tpath, data, sizeof(PropTPath));

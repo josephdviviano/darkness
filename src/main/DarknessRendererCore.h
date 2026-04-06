@@ -904,10 +904,54 @@ buildCellToRoomMap(const Darkness::WRParsedData &wr,
         }
     }
 
+    int mappedDirect = 0;
+    for (auto r : cellToRoom) if (r >= 0) mappedDirect++;
+
+    // Propagate room assignments through portal connections.
+    // Unmapped cells (portal corridors, boundary cells) inherit the room
+    // of their nearest mapped neighbor. Multiple passes until stable.
+    bool changed = true;
+    int propagated = 0;
+    for (int pass = 0; pass < 10 && changed; ++pass) {
+        changed = false;
+        for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+            if (cellToRoom[ci] >= 0) continue;  // already mapped
+            const auto &cell = wr.cells[ci];
+            // Check portal-connected neighbors
+            int numSolid = cell.numPolygons - cell.numPortals;
+            for (int pi = numSolid; pi < cell.numPolygons; ++pi) {
+                int32_t tgt = static_cast<int32_t>(cell.polygons[pi].tgtCell);
+                if (tgt >= 0 && tgt < static_cast<int32_t>(wr.numCells) &&
+                    cellToRoom[tgt] >= 0) {
+                    cellToRoom[ci] = cellToRoom[tgt];
+                    changed = true;
+                    ++propagated;
+                    break;
+                }
+            }
+        }
+    }
+
     int mapped = 0;
     for (auto r : cellToRoom) if (r >= 0) mapped++;
-    std::fprintf(stderr, "[PortalCull] Cell→room mapping: %d/%u cells mapped to rooms\n",
-                 mapped, wr.numCells);
+    std::fprintf(stderr, "[PortalCull] Cell→room mapping: %d/%u cells mapped (%d direct, %d propagated)\n",
+                 mapped, wr.numCells, mappedDirect, propagated);
+
+    // Log unmapped cells for diagnostics
+    int unmappedCount = 0;
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        if (cellToRoom[ci] < 0) {
+            const auto &cell = wr.cells[ci];
+            int nPortals = cell.numPortals;
+            if (unmappedCount < 20)
+                std::fprintf(stderr, "[PortalCull] unmapped cell %d: center=(%.1f,%.1f,%.1f) verts=%zu polys=%d portals=%d\n",
+                             ci, cell.center.x, cell.center.y, cell.center.z,
+                             cell.vertices.size(), cell.numPolygons, nPortals);
+            ++unmappedCount;
+        }
+    }
+    if (unmappedCount > 20)
+        std::fprintf(stderr, "[PortalCull] ... and %d more unmapped cells\n", unmappedCount - 20);
 
     return cellToRoom;
 }

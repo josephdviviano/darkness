@@ -43,6 +43,7 @@
 #include <unordered_map>
 #include <list>
 #include <zzip/zzip.h>
+#include "AudioLog.h"
 
 namespace Darkness {
 
@@ -64,11 +65,11 @@ public:
         zzip_error_t err = ZZIP_NO_ERROR;
         mDir = zzip_dir_open(crfPath.c_str(), &err);
         if (!mDir) {
-            std::fprintf(stderr, "CRFSoundLoader: Failed to open %s (error %d)\n",
+            AUDIO_LOG( "CRFSoundLoader: Failed to open %s (error %d)\n",
                          crfPath.c_str(), err);
         } else {
             buildIndex();
-            std::fprintf(stderr, "CRFSoundLoader: Opened %s (%zu files indexed)\n",
+            AUDIO_LOG( "CRFSoundLoader: Opened %s (%zu files indexed)\n",
                          crfPath.c_str(), mNameIndex.size());
         }
     }
@@ -176,12 +177,12 @@ private:
         // WAV validation: RIFF header + WAVE subtype + minimum size
         if (buf.size() < 44) return {};
         if (buf[0] != 'R' || buf[1] != 'I' || buf[2] != 'F' || buf[3] != 'F') {
-            std::fprintf(stderr, "CRFSoundLoader: %s is not a RIFF file\n",
+            AUDIO_LOG( "CRFSoundLoader: %s is not a RIFF file\n",
                          path.c_str());
             return {};
         }
         if (buf[8] != 'W' || buf[9] != 'A' || buf[10] != 'V' || buf[11] != 'E') {
-            std::fprintf(stderr, "CRFSoundLoader: %s is RIFF but not WAV\n",
+            AUDIO_LOG( "CRFSoundLoader: %s is RIFF but not WAV\n",
                          path.c_str());
             return {};
         }
