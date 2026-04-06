@@ -199,14 +199,25 @@ public:
     /// Get the current status of a door.
     DoorStatus getStatus(int32_t objID) const {
         auto it = mDoors.find(objID);
-        return (it != mDoors.end()) ? it->second.status : kDoorClosed;
+        if (it == mDoors.end()) {
+            static int warnCount = 0;
+            if (warnCount++ < 5)
+                std::fprintf(stderr, "[DEFAULT] DoorSystem::getStatus: obj %d not a door, returning kDoorClosed\n", objID);
+            return kDoorClosed;
+        }
+        return it->second.status;
     }
 
     /// Get the open fraction (0.0 = closed, 1.0 = open) for portal blocking.
     float getOpenFraction(int32_t objID) const {
         static constexpr float kTwoPi = 2.0f * 3.14159265f;
         auto it = mDoors.find(objID);
-        if (it == mDoors.end()) return 1.0f;
+        if (it == mDoors.end()) {
+            static int warnCount = 0;
+            if (warnCount++ < 5)
+                std::fprintf(stderr, "[DEFAULT] DoorSystem::getOpenFraction: obj %d not a door, returning 1.0 (fully open)\n", objID);
+            return 1.0f;
+        }
         const DoorState &door = it->second;
         float signedOpen = door.openValue;
         float signedClosed = door.closedValue;
@@ -215,7 +226,13 @@ public:
             signedClosed = (door.closedValue > 0.01f) ? -(kTwoPi - door.closedValue) : 0.0f;
         }
         float range = signedOpen - signedClosed;
-        if (std::abs(range) < 1e-6f) return 1.0f;
+        if (std::abs(range) < 1e-6f) {
+            static int warnCount = 0;
+            if (warnCount++ < 5)
+                std::fprintf(stderr, "[FALLBACK] DoorSystem::getOpenFraction: obj %d range~0 (open=%.3f closed=%.3f), returning 1.0\n",
+                             objID, signedOpen, signedClosed);
+            return 1.0f;
+        }
         return std::clamp((door.currentValue - signedClosed) / range, 0.0f, 1.0f);
     }
 
@@ -235,7 +252,11 @@ public:
         auto it = mRoomPairToDoor.find(key);
         if (it == mRoomPairToDoor.end()) return 0.0f;
         auto doorIt = mDoors.find(it->second);
-        if (doorIt == mDoors.end()) return 0.0f;
+        if (doorIt == mDoors.end()) {
+            std::fprintf(stderr, "[FALLBACK] DoorSystem::getSoundBlockingForRooms: room pair %d<->%d mapped to door %d but door not in mDoors!\n",
+                         room1, room2, it->second);
+            return 0.0f;
+        }
         const DoorState &door = doorIt->second;
         // Blocking scales inversely with open fraction: closed=full blocking, open=none
         float openFrac = getOpenFraction(door.objID);
@@ -474,14 +495,14 @@ private:
                 door.baseRotation = Matrix4(glm::mat3(
                     glm::eulerAngleZYX(h, pit, b)));
             } else {
-                std::fprintf(stderr, "  WARNING: Door %d: not found in allPlacements — "
+                std::fprintf(stderr, "[FALLBACK] DoorSystem: door %d not found in allPlacements — "
                              "baseRotation will be identity. Door will snap on first activation.\n", objID);
                 if (mObjSvc) {
                     door.basePosition = mObjSvc->position(objID);
                 }
             }
         } else {
-            std::fprintf(stderr, "  WARNING: Door %d: no placement data provided — "
+            std::fprintf(stderr, "[FALLBACK] DoorSystem: door %d no placement data provided — "
                          "baseRotation will be identity.\n", objID);
             if (mObjSvc) {
                 door.basePosition = mObjSvc->position(objID);
@@ -514,6 +535,9 @@ private:
         // Fall back to model bounding box if PhysDims has no size.
         // Apply door.baseScale since PhysDims.size already includes scale
         // but raw model bbox dimensions do not.
+        if (glm::length(edgeLengths) < 0.01f) {
+            std::fprintf(stderr, "[FALLBACK] DoorSystem::computePivotOffset: door %d has no P$PhysDims size, trying model bbox\n", objID);
+        }
         if (glm::length(edgeLengths) < 0.01f && mParsedModels) {
             // Look up model name
             char modelName[16] = {};
@@ -528,6 +552,10 @@ private:
                         mesh.bboxMax[2] - mesh.bboxMin[2]) * door.baseScale;
                 }
             }
+        }
+
+        if (glm::length(edgeLengths) < 0.01f) {
+            std::fprintf(stderr, "[DEFAULT] DoorSystem::computePivotOffset: door %d has no PhysDims AND no model bbox — pivotOffset will be zero!\n", objID);
         }
 
         // Compute COG offset matching the Dark Engine convention

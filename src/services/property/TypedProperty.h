@@ -81,8 +81,19 @@ inline bool getTypedProperty(PropertyService *propSvc,
                              const std::string &propName, int objID, T &out) {
     size_t size = 0;
     const uint8_t *data = getPropertyRawData(propSvc, propName, objID, size);
-    if (!data || size < sizeof(T))
+    if (!data)
+        return false;  // property not found on object or archetype chain (normal)
+    if (size < sizeof(T)) {
+        // Data exists but is smaller than the struct — likely a struct layout
+        // mismatch between our definition and the on-disk format. This is a
+        // real bug that would cause the caller to use default struct values.
+        static int warnCount = 0;
+        if (warnCount++ < 50)
+            std::fprintf(stderr, "[DEFAULT] getTypedProperty: P$%s obj %d size mismatch: "
+                         "on-disk %zu bytes < struct %zu bytes — caller will use defaults!\n",
+                         propName.c_str(), objID, size, sizeof(T));
         return false;
+    }
 
     std::memcpy(&out, data, sizeof(T));
     return true;

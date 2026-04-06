@@ -21,6 +21,7 @@
  *****************************************************************************/
 
 #include "AudioService.h"
+#include "AudioLog.h"
 #include "AcousticMaterials.h"
 #include "CRFSoundLoader.h"
 #include "ProbeFile.h"
@@ -565,7 +566,7 @@ static void startRecording(uint32_t sampleRate) {
     std::string path = "darkness_audio_capture.wav";
     sRecordFile = std::fopen(path.c_str(), "wb");
     if (!sRecordFile) {
-        std::fprintf(stderr, "[RECORD] Failed to open %s\n", path.c_str());
+        AUDIO_LOG( "[RECORD] Failed to open %s\n", path.c_str());
         return;
     }
 
@@ -599,7 +600,7 @@ static void startRecording(uint32_t sampleRate) {
         std::fclose(posFile);
     }
 
-    std::fprintf(stderr, "[RECORD] Started: %s (48kHz stereo float32)\n", path.c_str());
+    AUDIO_LOG( "[RECORD] Started: %s (48kHz stereo float32)\n", path.c_str());
     sRecording.store(true, std::memory_order_release);
 }
 
@@ -619,7 +620,7 @@ static void stopRecording() {
     sRecordFile = nullptr;
 
     float durSec = sRecordSamples / 48000.0f;
-    std::fprintf(stderr, "[RECORD] Stopped: %u samples (%.1f seconds)\n",
+    AUDIO_LOG( "[RECORD] Stopped: %u samples (%.1f seconds)\n",
                  sRecordSamples, durSec);
 }
 
@@ -1227,7 +1228,7 @@ struct ActiveVoice {
                 while (sub.processedSeq.load(std::memory_order_acquire) < target) {
                     if (sub.shutdown.load(std::memory_order_relaxed)) break;
                     if (std::chrono::steady_clock::now() >= deadline) {
-                        std::fprintf(stderr, "[AUDIO] WARNING: ~ActiveVoice worker drain "
+                        AUDIO_LOG( "[AUDIO] WARNING: ~ActiveVoice worker drain "
                                      "timed out — releasing effect anyway\n");
                         break;
                     }
@@ -1332,7 +1333,7 @@ bool AudioService::initMiniaudio()
     ma_result result = ma_engine_init(&config, mMaEngine);
     if (result != MA_SUCCESS) {
         LOG_ERROR("AudioService: miniaudio init failed (error %d)", result);
-        std::fprintf(stderr, "AudioService: miniaudio init FAILED (error %d)\n", result);
+        AUDIO_LOG( "AudioService: miniaudio init FAILED (error %d)\n", result);
         delete mMaEngine;
         mMaEngine = nullptr;
         return false;
@@ -1351,7 +1352,7 @@ bool AudioService::initMiniaudio()
         if (periodSize > 0) {
             mFrameSize = periodSize;
         }
-        std::fprintf(stderr, "AudioService: miniaudio engine %u Hz → device '%s' @ %u Hz, %u ch, "
+        AUDIO_LOG( "AudioService: miniaudio engine %u Hz → device '%s' @ %u Hz, %u ch, "
                      "period=%u frames\n",
                      mDeviceSampleRate, device->playback.name,
                      device->sampleRate, device->playback.channels,
@@ -1449,7 +1450,7 @@ bool AudioService::loadSoundResources(const std::string &resPath,
     // Explicit path from --schemas CLI flag
     if (!schemasPath.empty()) {
         if (mSchemaParser->loadDirectory(schemasPath)) {
-            std::fprintf(stderr, "AudioService: loaded %zu schemas from %s\n",
+            AUDIO_LOG( "AudioService: loaded %zu schemas from %s\n",
                          mSchemaParser->schemaCount(), schemasPath.c_str());
             schemasLoaded = true;
         }
@@ -1464,7 +1465,7 @@ bool AudioService::loadSoundResources(const std::string &resPath,
         for (const char *suffix : searchPaths) {
             std::string dir = resPath + suffix;
             if (mSchemaParser->loadDirectory(dir)) {
-                std::fprintf(stderr, "AudioService: loaded %zu schemas from %s\n",
+                AUDIO_LOG( "AudioService: loaded %zu schemas from %s\n",
                              mSchemaParser->schemaCount(), dir.c_str());
                 schemasLoaded = true;
                 break;
@@ -1473,18 +1474,18 @@ bool AudioService::loadSoundResources(const std::string &resPath,
     }
 
     if (!schemasLoaded) {
-        std::fprintf(stderr, "AudioService: no schema files found — use --schemas <path>\n");
+        AUDIO_LOG( "AudioService: no schema files found — use --schemas <path>\n");
         mSchemaParser.reset();
     }
 
     LOG_INFO("AudioService: Sound resources loaded from %s", resPath.c_str());
-    std::fprintf(stderr, "AudioService: loaded %zu schemas, sound resources ready\n",
+    AUDIO_LOG( "AudioService: loaded %zu schemas, sound resources ready\n",
                  mSchemaParser ? mSchemaParser->schemaCount() : 0);
 
     // Now that schemas and sound loader are ready, load ambient sounds
     // from mission data (P$AmbientHack properties parsed during onDBLoad).
     loadAmbientSounds();
-    std::fprintf(stderr, "AudioService: %zu ambient sounds, %zu active voices\n",
+    AUDIO_LOG( "AudioService: %zu ambient sounds, %zu active voices\n",
                  mAmbients.size(), mVoices.size());
 
     return true;
@@ -1657,16 +1658,16 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
 
         // Create the reflection pipeline (mixer + ambisonics decode + mix node)
         // This is optional — if it fails, direct effects still work
-        std::fprintf(stderr, "REFL: about to call initReflectionPipeline()\n");
+        AUDIO_LOG( "REFL: about to call initReflectionPipeline()\n");
         if (!initReflectionPipeline()) {
             LOG_ERROR("AudioService: reflection pipeline init failed — "
                       "direct effects only");
         }
-        std::fprintf(stderr, "REFL: initReflectionPipeline returned\n");
+        AUDIO_LOG( "REFL: initReflectionPipeline returned\n");
 
         LOG_INFO("AudioService: acoustic scene built — %zu vertices, %zu triangles, "
                  "%zu materials", numVertices, numTriangles, materials.size());
-        std::fprintf(stderr, "AudioService: acoustic scene built (%zu tris, %zu mats)\n",
+        AUDIO_LOG( "AudioService: acoustic scene built (%zu tris, %zu mats)\n",
                      numTriangles, materials.size());
         return true;
 
@@ -1684,7 +1685,7 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
 //------------------------------------------------------
 bool AudioService::initReflectionPipeline()
 {
-    std::fprintf(stderr, "REFL: initReflectionPipeline enter\n");
+    AUDIO_LOG( "REFL: initReflectionPipeline enter\n");
     if (!mIplContext || !mIplHrtf || !mMaEngine || !mIplSimulator)
         return false;
 
@@ -1700,7 +1701,7 @@ bool AudioService::initReflectionPipeline()
     mAmbisonicsChannels = (mAmbisonicsOrder + 1) * (mAmbisonicsOrder + 1);
     IPLint32 numAmbiChannels = static_cast<IPLint32>(mAmbisonicsChannels);
 
-    std::fprintf(stderr, "REFL: creating mixer (irSize=%d, channels=%d, rate=%d, frame=%d, 1/%d rate)\n",
+    AUDIO_LOG( "REFL: creating mixer (irSize=%d, channels=%d, rate=%d, frame=%d, 1/%d rate)\n",
                  irSize, numAmbiChannels,
                  audioSettings.samplingRate, audioSettings.frameSize,
                  mReflectionRateDivisor);
@@ -1717,7 +1718,7 @@ bool AudioService::initReflectionPipeline()
         LOG_ERROR("AudioService: iplReflectionMixerCreate failed (error %d)", err);
         return false;
     }
-    std::fprintf(stderr, "REFL: mixer created OK\n");
+    AUDIO_LOG( "REFL: mixer created OK\n");
 
     // Create ambisonics decode effect (ambisonics → binaural stereo via HRTF).
     // This also runs at the reflection rate — output is upsampled in the mix node.
@@ -1780,7 +1781,7 @@ bool AudioService::initReflectionPipeline()
         return false;
     }
     rmn.nodeInitialized = true;
-    std::fprintf(stderr, "REFL: node initialized, attaching to endpoint\n");
+    AUDIO_LOG( "REFL: node initialized, attaching to endpoint\n");
 
     // Connect: reflection mix node → engine endpoint
     ma_result r = ma_node_attach_output_bus(&rmn.base, 0,
@@ -1812,7 +1813,7 @@ bool AudioService::initReflectionPipeline()
 
     // Initialize the master bus DSP chain (EQ, compressor, limiter coefficients)
     rmn.initDSP(mDeviceSampleRate);
-    std::fprintf(stderr, "REFL: DSP chain initialized (limiter=%s knee=%.2f, compressor=%s %.0fdB/%g:1, eq=%s %gHz/%+gdB, ducking=%s)\n",
+    AUDIO_LOG( "REFL: DSP chain initialized (limiter=%s knee=%.2f, compressor=%s %.0fdB/%g:1, eq=%s %gHz/%+gdB, ducking=%s)\n",
                  rmn.limiterEnabled ? "on" : "off", rmn.limiterKnee,
                  rmn.compressorEnabled ? "on" : "off", rmn.compThresholdDb, rmn.compRatio,
                  rmn.eqEnabled ? "on" : "off", rmn.eqFreq, rmn.eqGainDb,
@@ -1919,11 +1920,11 @@ bool AudioService::initReflectionPipeline()
         // Wire the mix node to the worker
         rmn.convWorker = mConvolutionWorker.get();
 
-        std::fprintf(stderr, "REFL: convolution started (%d sub-workers, off-thread)\n",
+        AUDIO_LOG( "REFL: convolution started (%d sub-workers, off-thread)\n",
                      cw.numWorkers);
     }
 
-    std::fprintf(stderr, "AudioService: reflection pipeline initialized "
+    AUDIO_LOG( "AudioService: reflection pipeline initialized "
                  "(convolution, order %d (%dch), IR %d samples, %uHz, 1/%d rate, max %d voices%s)\n",
                  mAmbisonicsOrder, mAmbisonicsChannels,
                  irSize, mReflectionSampleRate, mReflectionRateDivisor,
@@ -2059,11 +2060,11 @@ void AudioService::bootstrapFinished()
 
     if (mAudioReady) {
         LOG_INFO("AudioService: fully initialized");
-        std::fprintf(stderr, "AudioService: fully initialized (miniaudio + Steam Audio)\n");
+        AUDIO_LOG( "AudioService: fully initialized (miniaudio + Steam Audio)\n");
     } else {
         LOG_ERROR("AudioService: initialized with errors (miniaudio=%s, steam_audio=%s)",
                   maOk ? "ok" : "FAILED", saOk ? "ok" : "FAILED");
-        std::fprintf(stderr, "AudioService: INIT FAILED (miniaudio=%s, steam_audio=%s)\n",
+        AUDIO_LOG( "AudioService: INIT FAILED (miniaudio=%s, steam_audio=%s)\n",
                      maOk ? "ok" : "FAILED", saOk ? "ok" : "FAILED");
     }
 }
@@ -2136,10 +2137,10 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
                 if (eaxIdx < 26)
                     mRoomEAXPresets[static_cast<int32_t>(i)] = eaxIdx;
             }
-            std::fprintf(stderr, "AudioService: parsed ROOM_EAX chunk — %u rooms with EAX presets\n", count);
+            AUDIO_LOG( "AudioService: parsed ROOM_EAX chunk — %u rooms with EAX presets\n", count);
         }
     } else {
-        std::fprintf(stderr, "AudioService: no ROOM_EAX chunk in mission (EAX presets unavailable)\n");
+        AUDIO_LOG( "AudioService: no ROOM_EAX chunk in mission (EAX presets unavailable)\n");
     }
 
     LOG_INFO("AudioService: mission data loaded");
@@ -2647,7 +2648,7 @@ void AudioService::loopStep(float deltaTime)
                 // Diagnostic: log Steam Audio direct params for door sounds
                 if (voice->skipPortalRouting) {
                     const auto &dp = voice->dspNode.directParams;
-                    std::fprintf(stderr, "[DOOR_SND] h=%u '%s' distAtten=%.3f "
+                    AUDIO_LOG( "[DOOR_SND] h=%u '%s' distAtten=%.3f "
                                  "occl=%.3f trans=(%.2f,%.2f,%.2f) "
                                  "portalRoute=%d portalAtten=%.3f blocking=%.3f\n",
                                  handle, voice->schemaName.c_str(),
@@ -2731,18 +2732,18 @@ void AudioService::loopStep(float deltaTime)
                     // that were dry don't need a tail — there's no convolution
                     // state to ring out.
                     voice->tailTimer = mReflectionDuration;
-                    std::fprintf(stderr, "[VOICE] TAIL_START h=%d '%s' tail=%.1fs\n",
+                    AUDIO_LOG( "[VOICE] TAIL_START h=%d '%s' tail=%.1fs\n",
                                  handle, voice->schemaName.c_str(), voice->tailTimer);
                 } else {
                     voice->finished.store(true, std::memory_order_release);
-                    std::fprintf(stderr, "[VOICE] END_NOTAIL h=%d '%s'\n",
+                    AUDIO_LOG( "[VOICE] END_NOTAIL h=%d '%s'\n",
                                  handle, voice->schemaName.c_str());
                 }
             } else {
                 voice->tailTimer -= deltaTime;
                 if (voice->tailTimer <= 0.0f) {
                     voice->finished.store(true, std::memory_order_release);
-                    std::fprintf(stderr, "[VOICE] TAIL_DONE h=%d '%s'\n",
+                    AUDIO_LOG( "[VOICE] TAIL_DONE h=%d '%s'\n",
                                  handle, voice->schemaName.c_str());
                 }
             }
@@ -2975,7 +2976,7 @@ void AudioService::waitForConvolutionWorker()
         while (sub.processedSeq.load(std::memory_order_acquire) < target) {
             if (sub.shutdown.load(std::memory_order_relaxed)) break;
             if (std::chrono::steady_clock::now() >= deadline) {
-                std::fprintf(stderr, "[AUDIO] WARNING: convolution sub-worker wait timed out "
+                AUDIO_LOG( "[AUDIO] WARNING: convolution sub-worker wait timed out "
                              "(target=%llu, processed=%llu)\n",
                              (unsigned long long)target,
                              (unsigned long long)sub.processedSeq.load(std::memory_order_relaxed));
@@ -2993,7 +2994,7 @@ void AudioService::cleanupFinishedVoices()
     // This avoids cross-thread calls to ma_sound_at_end().
     for (auto it = mVoices.begin(); it != mVoices.end();) {
         if (it->second->finished.load(std::memory_order_acquire)) {
-            std::fprintf(stderr, "[VOICE] CLEANUP h=%d '%s' srcEnded=%d tail=%.1f\n",
+            AUDIO_LOG( "[VOICE] CLEANUP h=%d '%s' srcEnded=%d tail=%.1f\n",
                          it->second->handle, it->second->schemaName.c_str(),
                          it->second->sourceEnded ? 1 : 0, it->second->tailTimer);
             removeVoiceSource(*it->second);
@@ -3302,7 +3303,7 @@ bool AudioService::evictLowestPriority(int newPriority)
     if (lowestHandle == SOUND_HANDLE_INVALID)
         return false;  // All existing voices have equal or higher priority
 
-    std::fprintf(stderr, "[VOICE] EVICT h=%d pri=%d for new pri=%d\n",
+    AUDIO_LOG( "[VOICE] EVICT h=%d pri=%d for new pri=%d\n",
                  lowestHandle, lowestPriority, newPriority);
     haltSound(lowestHandle);
     return true;
@@ -3321,7 +3322,7 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
     // Enforce voice limit — evict lowest priority if full
     if (static_cast<int>(mVoices.size()) >= MAX_ACTIVE_VOICES) {
         if (!evictLowestPriority(priority)) {
-            std::fprintf(stderr, "[VOICE] POOL_FULL cannot play '%s' pri=%d voices=%zu\n",
+            AUDIO_LOG( "[VOICE] POOL_FULL cannot play '%s' pri=%d voices=%zu\n",
                          schemaName.c_str(), priority, mVoices.size());
             return SOUND_HANDLE_INVALID;
         }
@@ -3395,10 +3396,10 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
     // If DSP setup failed, not available, or bypassed — connect directly to endpoint
     if (!voice->dspNode.effectsReady) {
         if (sBypassSteamAudio) {
-            std::fprintf(stderr, "[VOICE] BYPASS '%s' — Steam Audio disabled via env\n",
+            AUDIO_LOG( "[VOICE] BYPASS '%s' — Steam Audio disabled via env\n",
                          schemaName.c_str());
         } else {
-            std::fprintf(stderr, "[VOICE] DSP_FAIL '%s' sample='%s' — raw bypass to endpoint\n",
+            AUDIO_LOG( "[VOICE] DSP_FAIL '%s' sample='%s' — raw bypass to endpoint\n",
                          schemaName.c_str(), sampleName.c_str());
         }
         ma_node_attach_output_bus(&voice->sound, 0,
@@ -3435,7 +3436,7 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
     ma_uint32 decCh = voice->decoder.outputChannels;
     float durMs = (decRate > 0) ? (totalFrames * 1000.0f / decRate) : 0.0f;
 
-    std::fprintf(stderr, "[VOICE] START h=%d '%s' sample='%s' pri=%d voices=%zu "
+    AUDIO_LOG( "[VOICE] START h=%d '%s' sample='%s' pri=%d voices=%zu "
                  "wavBytes=%zu decoded=%lluframes %uHz %uch %.0fms\n",
                  h, schemaName.c_str(), sampleName.c_str(),
                  priority, mVoices.size() + 1,
@@ -3616,7 +3617,7 @@ SoundHandle AudioService::playEnvSchema(const std::vector<SchemaTagValue> &tags,
     // sides of a door. Steam Audio HRTF and distance attenuation still apply.
     if (bypassPortalBlocking && h != SOUND_HANDLE_INVALID && mVoices.count(h)) {
         mVoices[h]->skipPortalRouting = true;
-        std::fprintf(stderr, "[DOOR_SND] CREATE h=%u '%s' vol=%.3f "
+        AUDIO_LOG( "[DOOR_SND] CREATE h=%u '%s' vol=%.3f "
                      "schemaVol=%d pos=(%.1f,%.1f,%.1f)\n",
                      h, schema->name.c_str(), vol,
                      schema->playParams.volume,
@@ -3634,7 +3635,7 @@ void AudioService::haltSound(SoundHandle handle)
     auto it = mVoices.find(handle);
     if (it != mVoices.end()) {
         auto &voice = *it->second;
-        std::fprintf(stderr, "[VOICE] HALT h=%d '%s' hasRefl=%d\n",
+        AUDIO_LOG( "[VOICE] HALT h=%d '%s' hasRefl=%d\n",
                      handle, voice.schemaName.c_str(),
                      voice.dspNode.reflectionEffect ? 1 : 0);
         if (voice.initialized) {
@@ -3719,7 +3720,7 @@ void AudioService::loadAmbientSounds()
             }
         }
         if (loudRoomCount > 0) {
-            std::fprintf(stderr, "AudioService: loaded %d LoudRoom transmission factors\n",
+            AUDIO_LOG( "AudioService: loaded %d LoudRoom transmission factors\n",
                          loudRoomCount);
         }
 
@@ -3727,9 +3728,9 @@ void AudioService::loadAmbientSounds()
         // This verifies that Steam Audio's physics-based reverb produces results
         // comparable to the original designers' EAX preset intentions.
         if (!mRoomEAXPresets.empty()) {
-            std::fprintf(stderr, "\n=== Room Acoustic Verification (EAX presets vs Steam Audio) ===\n");
-            std::fprintf(stderr, "  Room | ObjID | EAX Preset         | Decay(s) | Damp | Height | LoudRoom\n");
-            std::fprintf(stderr, "  -----|-------|--------------------|---------:|-----:|-------:|---------\n");
+            AUDIO_LOG( "\n=== Room Acoustic Verification (EAX presets vs Steam Audio) ===\n");
+            AUDIO_LOG( "  Room | ObjID | EAX Preset         | Decay(s) | Damp | Height | LoudRoom\n");
+            AUDIO_LOG( "  -----|-------|--------------------|---------:|-----:|-------:|---------\n");
             for (const auto &room : rooms) {
                 if (!room) continue;
                 int16_t roomID = room->getRoomID();
@@ -3769,10 +3770,10 @@ void AudioService::loadAmbientSounds()
                 if (lrIt != mRoomTransmission.end())
                     loudRoom = lrIt->second;
 
-                std::fprintf(stderr, "  %4d | %5d | %-18s | %7.2f  | %4d | %6d | %.2f\n",
+                AUDIO_LOG( "  %4d | %5d | %-18s | %7.2f  | %4d | %6d | %.2f\n",
                              roomID, objID, presetName, decayTime, dampening, height, loudRoom);
             }
-            std::fprintf(stderr, "=== End Room Acoustic Verification ===\n\n");
+            AUDIO_LOG( "=== End Room Acoustic Verification ===\n\n");
         }
     }
 
@@ -3876,7 +3877,7 @@ void AudioService::updateAmbientVolumes()
                 float atten = v.dspNode.lastAtten.load(std::memory_order_relaxed);
                 bool portal = v.dspNode.usePortalRouting;
                 float pAtten = v.dspNode.portalAttenuation;
-                std::fprintf(stderr, "  [AMB] '%s' dist=%.0f rad=%.0f atten=%.3f portal=%d(%.3f) pos=(%.0f,%.0f,%.0f)\n",
+                AUDIO_LOG( "  [AMB] '%s' dist=%.0f rad=%.0f atten=%.3f portal=%d(%.3f) pos=(%.0f,%.0f,%.0f)\n",
                              amb.schemaName.c_str(), d, amb.radius, atten,
                              portal?1:0, pAtten,
                              amb.position.x, amb.position.y, amb.position.z);
@@ -3885,7 +3886,7 @@ void AudioService::updateAmbientVolumes()
 
         float portalAvgUs = portalCalls > 0 ? static_cast<float>(portalUs) / portalCalls : 0.0f;
 
-        std::fprintf(stderr, "[Audio] %zu voices (%d refl, %d tail), %d/%zu ambients | "
+        AUDIO_LOG( "[Audio] %zu voices (%d refl, %d tail), %d/%zu ambients | "
                      "cb: total=%.0f/%.0fµs (%.0f%%) voice=%.0fµs mix=%.0fµs | "
                      "main: loop=%.1fms commit=%.1fms portal=%.0fµs(%dcalls,avg=%.0f) | "
                      "sim: direct=%.1fms refl=%.1fms(%dsteps) rays/s=%.0f | "
@@ -3902,9 +3903,9 @@ void AudioService::updateAmbientVolumes()
                 float ms = subPtr->peakMs.exchange(0.0f, std::memory_order_relaxed);
                 if (ms > maxMs) maxMs = ms;
             }
-            std::fprintf(stderr, " | conv: %.1fms (%dw)", maxMs, mConvolutionWorker->numWorkers);
+            AUDIO_LOG( " | conv: %.1fms (%dw)", maxMs, mConvolutionWorker->numWorkers);
         }
-        std::fprintf(stderr, "\n");
+        AUDIO_LOG( "\n");
     }
 
     for (auto &amb : mAmbients) {
@@ -4188,7 +4189,7 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
                 else ++footActive;
             }
         }
-        std::fprintf(stderr, "[FOOT] h=%d '%s' vol=%.2f spd=%.1f active=%d tail=%d\n",
+        AUDIO_LOG( "[FOOT] h=%d '%s' vol=%.2f spd=%.1f active=%d tail=%d\n",
                      h, sample.name.c_str(), finalVol, speed, footActive, footTail);
     }
 }
@@ -4497,7 +4498,7 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
 
         static int sFailCount = 0;
         if (sFailCount < 5) {
-            std::fprintf(stderr, "[PORTAL] propagateSound: NULL room after fallback "
+            AUDIO_LOG( "[PORTAL] propagateSound: NULL room after fallback "
                          "src=(%.1f,%.1f,%.1f)→%s lst=(%.1f,%.1f,%.1f)→%s dist=%.1f\n",
                          sourcePos.x, sourcePos.y, sourcePos.z,
                          sourceRoom ? "OK" : "NULL",
@@ -4506,7 +4507,7 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
             // Find the closest room to the listener and dump its data
             if (sFailCount == 0) {
                 auto &rooms = mRoomService->getAllRooms();
-                std::fprintf(stderr, "[PORTAL] %zu rooms loaded.\n", rooms.size());
+                AUDIO_LOG( "[PORTAL] %zu rooms loaded.\n", rooms.size());
 
                 // Find closest room center to listener
                 float bestDist = 1e9f;
@@ -4518,12 +4519,12 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
                 }
                 if (bestRoom) {
                     auto c = bestRoom->getCenter();
-                    std::fprintf(stderr, "[PORTAL] Closest room %d: center=(%.1f,%.1f,%.1f) dist=%.1f\n",
+                    AUDIO_LOG( "[PORTAL] Closest room %d: center=(%.1f,%.1f,%.1f) dist=%.1f\n",
                                  bestRoom->getRoomID(), c.x, c.y, c.z, bestDist);
                     const Plane *planes = bestRoom->getBoundingPlanes();
                     for (int p = 0; p < 6; ++p) {
                         float dist = planes[p].getDistance(listenerPos);
-                        std::fprintf(stderr, "[PORTAL]   plane[%d]: n=(%.3f,%.3f,%.3f) d=%.3f dist_to_listener=%.3f %s\n",
+                        AUDIO_LOG( "[PORTAL]   plane[%d]: n=(%.3f,%.3f,%.3f) d=%.3f dist_to_listener=%.3f %s\n",
                                      p, planes[p].normal.x, planes[p].normal.y, planes[p].normal.z,
                                      planes[p].d, dist, dist < 0 ? "OUTSIDE" : "inside");
                     }
@@ -4927,7 +4928,7 @@ bool AudioService::bakeProbes(const std::string &outputPath,
         return false;
     }
 
-    std::fprintf(stderr, "Baking probes: spacing=%.1f height=%.1f ...\n", spacing, height);
+    AUDIO_LOG( "Baking probes: spacing=%.1f height=%.1f ...\n", spacing, height);
 
     // Step 1: Generate probes on a uniform floor grid
     IPLProbeArray probeArray = nullptr;
@@ -4953,7 +4954,7 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     transform.elements[3][2] = center.z;   // Z translation
     transform.elements[3][3] = 1.0f;
 
-    std::fprintf(stderr, "Scene bounds: (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) extent=(%.0f,%.0f,%.0f)\n",
+    AUDIO_LOG( "Scene bounds: (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) extent=(%.0f,%.0f,%.0f)\n",
                  mSceneMin.x, mSceneMin.y, mSceneMin.z,
                  mSceneMax.x, mSceneMax.y, mSceneMax.z,
                  extent.x, extent.y, extent.z);
@@ -4967,7 +4968,7 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     iplProbeArrayGenerateProbes(probeArray, mIplScene, &genParams);
 
     int numProbes = iplProbeArrayGetNumProbes(probeArray);
-    std::fprintf(stderr, "Generated %d probes (spacing=%.1f, height=%.1f)\n",
+    AUDIO_LOG( "Generated %d probes (spacing=%.1f, height=%.1f)\n",
                  numProbes, spacing, height);
 
     if (numProbes == 0) {
@@ -4990,7 +4991,7 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     iplProbeArrayRelease(&probeArray);  // batch now owns the probe data
 
     // Step 3: Bake pathing data (visibility graph + shortest paths)
-    std::fprintf(stderr, "Baking pathing data for %d probes...\n", numProbes);
+    AUDIO_LOG( "Baking pathing data for %d probes...\n", numProbes);
 
     IPLBakedDataIdentifier pathId{};
     pathId.type = IPL_BAKEDDATATYPE_PATHING;
@@ -5018,14 +5019,14 @@ bool AudioService::bakeProbes(const std::string &outputPath,
 
     auto bakeEnd = std::chrono::steady_clock::now();
     float bakeSec = std::chrono::duration<float>(bakeEnd - bakeStart).count();
-    std::fprintf(stderr, "Pathing bake complete: %d probes in %.1f seconds\n",
+    AUDIO_LOG( "Pathing bake complete: %d probes in %.1f seconds\n",
                  numProbes, bakeSec);
 
     // Step 3b: Bake reflection IRs at each probe position.
     // This pre-computes reverb impulse responses so that voices outside the
     // real-time top-N can use baked reverb instead of being dry.
     // Uses REVERB variation — one bake covers all sources (listener-position-based).
-    std::fprintf(stderr, "Baking reflection IRs for %d probes (rays=%d bounces=%d duration=%.1fs)...\n",
+    AUDIO_LOG( "Baking reflection IRs for %d probes (rays=%d bounces=%d duration=%.1fs)...\n",
                  numProbes, mReflectionNumRays, mReflectionNumBounces, mReflectionDuration);
 
     IPLBakedDataIdentifier reflId{};
@@ -5062,7 +5063,7 @@ bool AudioService::bakeProbes(const std::string &outputPath,
 
     auto reflBakeEnd = std::chrono::steady_clock::now();
     float reflBakeSec = std::chrono::duration<float>(reflBakeEnd - reflBakeStart).count();
-    std::fprintf(stderr, "Reflection bake complete: %d probes in %.1f seconds\n",
+    AUDIO_LOG( "Reflection bake complete: %d probes in %.1f seconds\n",
                  numProbes, reflBakeSec);
 
     // Step 4: Serialize to memory buffer
@@ -5117,7 +5118,7 @@ bool AudioService::bakeProbes(const std::string &outputPath,
             iplProbeBatchRelease(&probeBatch);
             return false;
         }
-        std::fprintf(stderr, "Round-trip validation passed (%d probes)\n", rtCount);
+        AUDIO_LOG( "Round-trip validation passed (%d probes)\n", rtCount);
     }
 
     // Step 6: Write to disk with integrity header (atomic tmp+rename)
@@ -5135,7 +5136,7 @@ bool AudioService::bakeProbes(const std::string &outputPath,
         return false;
     }
 
-    std::fprintf(stderr, "Saved %d probes to '%s' (%zu bytes + %zu header)\n",
+    AUDIO_LOG( "Saved %d probes to '%s' (%zu bytes + %zu header)\n",
                  numProbes, outputPath.c_str(), static_cast<size_t>(dataSize),
                  kProbeFileHeaderSize);
     return true;
@@ -5226,7 +5227,7 @@ bool AudioService::loadProbes(const std::string &probePath)
     IPLsize reflDataSize = iplProbeBatchGetDataSize(mIplProbeBatch, &reflId);
     mProbesHaveReflections = (reflDataSize > 0);
 
-    std::fprintf(stderr, "AudioService: loaded %d probes from '%s' "
+    AUDIO_LOG( "AudioService: loaded %d probes from '%s' "
                  "(reflections=%s, refl_size=%zu bytes, crc=0x%08x)\n",
                  mProbeCount, probePath.c_str(),
                  mProbesHaveReflections ? "yes" : "no",

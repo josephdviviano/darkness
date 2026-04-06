@@ -92,9 +92,15 @@ public:
     /// Values override the hardcoded defaults. Call once after construction.
     void applyConfig(const PlayerPhysicsConfig &cfg) {
         mMass = cfg.mass;
-        mDensity = std::max(cfg.density, 0.01f);  // clamp to prevent division by zero
+        if (cfg.density < 0.01f)
+            std::fprintf(stderr, "[DEFAULT] PlayerPhysics: density=%.4f clamped to 0.01 (prevent zero-division)\n", cfg.density);
+        mDensity = std::max(cfg.density, 0.01f);
         // Clamp radii to minimum 0.1 to prevent zero-division in collision
+        if (cfg.headRadius < 0.1f)
+            std::fprintf(stderr, "[DEFAULT] PlayerPhysics: headRadius=%.4f clamped to 0.1\n", cfg.headRadius);
         mSphereRadii[0] = std::max(cfg.headRadius, 0.1f);
+        if (cfg.bodyRadius < 0.1f)
+            std::fprintf(stderr, "[DEFAULT] PlayerPhysics: bodyRadius=%.4f clamped to 0.1\n", cfg.bodyRadius);
         mSphereRadii[1] = std::max(cfg.bodyRadius, 0.1f);
         // SHIN/KNEE/FOOT stay at zero radius (point detectors, not in P$PhysDims)
         mSphereOffsetsBase[0] = cfg.headOffsetZ;
@@ -188,6 +194,7 @@ public:
 
         // Validate timestep config — recover from invalid values
         if (mTimestep.fixedDt <= 0.0f || mTimestep.fixedDt > 1.0f) {
+            std::fprintf(stderr, "[FALLBACK] PlayerPhysics: invalid timestep fixedDt=%.4f, resetting to MODERN (60Hz)\n", mTimestep.fixedDt);
             mTimestep = MODERN;
         }
 

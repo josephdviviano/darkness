@@ -20,6 +20,7 @@
  *****************************************************************************/
 
 #include "SchemaParser.h"
+#include "AudioLog.h"
 
 #include <algorithm>
 #include <cctype>
@@ -301,7 +302,7 @@ bool SchemaParser::loadDirectory(const std::string &dirPath)
         }
     }
 
-    std::fprintf(stderr, "SchemaParser: loaded %zu schemas, %zu tags, "
+    AUDIO_LOG("SchemaParser: loaded %zu schemas, %zu tags, "
                  "%zu voices, %zu concepts from %s (%d archetypes resolved)\n",
                  mSchemas.size(), mTags.size(), mVoices.size(),
                  mConcepts.size(), dirPath.c_str(), deferredResolved);

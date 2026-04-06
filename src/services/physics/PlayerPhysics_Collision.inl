@@ -169,20 +169,51 @@
             for (const auto &c : mIterContacts) {
                 Vector3 pushNormal = c.normal;
 
-                // For pushable objects, suppress upward push — prevents the
-                // player from being lifted over crates/barrels by the constraint
-                // solver. The original Dark Engine has no stair-step logic for
-                // OBB objects; the constraint system only blocks horizontally.
+                // For pushable objects, convert upward contacts to horizontal
+                // blocking. Without this, the player climbs onto crates/barrels
+                // because upward push gets suppressed and no horizontal resistance
+                // remains. Instead: redirect the push horizontally away from the
+                // object center, preserving the penetration depth so the player
+                // is pushed back rather than lifted up.
                 if (c.objectId >= 0 && mIsPushableCb && mIsPushableCb(c.objectId)) {
                     static int dbgCount = 0;
-                    if (dbgCount++ < 20)
+                    if (dbgCount++ < 40)
                         std::fprintf(stderr, "[PUSH-COLLIDE] obj=%d n=(%.2f,%.2f,%.2f) pen=%.3f sub=%d\n",
                                      c.objectId, c.normal.x, c.normal.y, c.normal.z,
                                      c.penetration, c.submodelIdx);
-                    if (pushNormal.z > 0.0f) pushNormal.z = 0.0f;
-                    float len = glm::length(pushNormal);
-                    if (len < 0.001f) continue;  // purely upward contact — skip
-                    pushNormal /= len;  // re-normalize
+                    if (pushNormal.z > 0.3f) {
+                        // Upward-facing contact (top of crate/barrel) — redirect
+                        // to horizontal push away from the object center.
+                        if (mObjectWorld) {
+                            const auto *body = mObjectWorld->findBodyByObjID(c.objectId);
+                            if (body) {
+                                Vector3 toPlayer = mPosition - body->worldPos;
+                                toPlayer.z = 0.0f;  // horizontal only
+                                float hLen = glm::length(toPlayer);
+                                if (hLen > 0.01f) {
+                                    pushNormal = toPlayer / hLen;
+                                } else {
+                                    // Player directly above object center — push along velocity
+                                    Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
+                                    float vLen = glm::length(hVel);
+                                    if (vLen > 0.01f)
+                                        pushNormal = -hVel / vLen;  // push back against movement
+                                    else
+                                        continue;  // no useful push direction
+                                }
+                            } else {
+                                pushNormal.z = 0.0f;
+                                float len = glm::length(pushNormal);
+                                if (len < 0.001f) continue;
+                                pushNormal /= len;
+                            }
+                        } else {
+                            pushNormal.z = 0.0f;
+                            float len = glm::length(pushNormal);
+                            if (len < 0.001f) continue;
+                            pushNormal /= len;
+                        }
+                    }
                 }
 
                 bool merged = false;

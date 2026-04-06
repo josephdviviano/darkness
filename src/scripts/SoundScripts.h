@@ -30,6 +30,7 @@
 #include "sim/ScriptManager.h"
 #include "sim/ScriptServices.h"
 #include "sim/IScriptServices.h"
+#include "audio/AudioLog.h"
 
 namespace Darkness {
 
@@ -71,11 +72,11 @@ protected:
     void onTurnOn(ScriptMessage &msg) override {
         // Set ambient active — when AmbientHacked management is fully wired,
         // this will enable the ambient sound. For now, log.
-        std::fprintf(stderr, "[ActivateAmbient] obj %d: TurnOn (ambient enabled)\n", self);
+        AUDIO_LOG( "[ActivateAmbient] obj %d: TurnOn (ambient enabled)\n", self);
     }
 
     void onTurnOff(ScriptMessage &msg) override {
-        std::fprintf(stderr, "[ActivateAmbient] obj %d: TurnOff (ambient disabled)\n", self);
+        AUDIO_LOG( "[ActivateAmbient] obj %d: TurnOff (ambient disabled)\n", self);
     }
 };
 

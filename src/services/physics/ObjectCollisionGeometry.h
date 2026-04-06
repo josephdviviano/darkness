@@ -567,14 +567,31 @@ public:
                 continue;
             }
 
-            // Skip objects whose model wasn't loaded
+            // Look up parsed model for bounding box. If model isn't loaded,
+            // we can still create a collision body from P$PhysDims alone.
             std::string modelName(obj.modelName);
-            auto mit = models.find(modelName);
-            if (mit == models.end() || !mit->second.valid) {
+
+            // Skip particle emitters — they are point/sprite effects, not
+            // collidable geometry. Creating collision bodies for them wastes
+            // broadphase cycles and floods logs with FALLBACK messages.
+            if (modelName.find("fx_particle") != std::string::npos) {
                 ++skippedNoModel;
                 continue;
             }
-            const auto &mesh = mit->second;
+
+            auto mit = models.find(modelName);
+            bool hasModel = (mit != models.end() && mit->second.valid);
+            // Use a dummy mesh with zero bbox if model not found — PhysDims
+            // override will provide the actual dimensions.
+            static const ParsedBinMesh emptyMesh{};
+            const auto &mesh = hasModel ? mit->second : emptyMesh;
+            if (!hasModel) {
+                ++skippedNoModel;
+                static int noModelWarn = 0;
+                if (noModelWarn++ < 10)
+                    std::fprintf(stderr, "[FALLBACK] ObjectCollision: obj %d model '%s' not loaded, using empty mesh + P$PhysDims for dimensions\n",
+                                 obj.objID, obj.modelName);
+            }
 
             // Determine collision shape type from P$PhysType (with inheritance).
             // Objects without P$PhysType don't participate in physics collision at all
@@ -658,8 +675,12 @@ public:
                         ++skippedNoCollision;
                         continue;
                     }
+                } else {
+                    // No P$CollisionType property — default is to have bounce collision.
+                    static int noCollWarn = 0;
+                    if (noCollWarn++ < 20)
+                        std::fprintf(stderr, "[DEFAULT] ObjectCollision: obj %d has no P$CollisionType, defaulting to bounce collision\n", obj.objID);
                 }
-                // If no P$CollisionType property exists, default is to have bounce collision.
             }
 
             // Build the collision body
@@ -737,7 +758,16 @@ public:
                         // Only override if explicit sizes are set (non-zero). Use values directly.
                         if (sx > 0.001f && sy > 0.001f && sz > 0.001f) {
                             body.edgeLengths = Vector3(sx, sy, sz);
+                        } else {
+                            static int w = 0; if (w++ < 10)
+                                std::fprintf(stderr, "[DEFAULT] ObjectCollision: OBB obj %d P$PhysDims size=(%.3f,%.3f,%.3f) near-zero, using bbox*scale=(%.2f,%.2f,%.2f)\n",
+                                             obj.objID, sx, sy, sz, body.edgeLengths.x, body.edgeLengths.y, body.edgeLengths.z);
                         }
+                    } else if (!hasModel) {
+                        // No P$PhysDims AND no model — edgeLengths will be zero
+                        static int w = 0; if (w++ < 10)
+                            std::fprintf(stderr, "[DEFAULT] ObjectCollision: OBB obj %d has no model AND no P$PhysDims size data (dimSize=%zu), edgeLengths will be zero!\n",
+                                         obj.objID, dimSize);
                     }
                 }
 
@@ -746,12 +776,26 @@ public:
                 body.worldPos = Vector3(obj.x, obj.y, obj.z) + rotatedCenter;
                 body.bboxCenter = bboxCenter;
 
+                if (body.edgeLengths.x < 0.01f && body.edgeLengths.y < 0.01f &&
+                    body.edgeLengths.z < 0.01f) {
+                    static int zeroWarnCount = 0;
+                    if (zeroWarnCount++ < 10) {
+                        std::fprintf(stderr, "[OBB-WARN] obj=%d model='%s' zero edgeLengths! "
+                                     "bbox=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f) scale=(%.2f,%.2f,%.2f)\n",
+                                     obj.objID, obj.modelName,
+                                     mesh.bboxMin[0], mesh.bboxMin[1], mesh.bboxMin[2],
+                                     mesh.bboxMax[0], mesh.bboxMax[1], mesh.bboxMax[2],
+                                     scale.x, scale.y, scale.z);
+                    }
+                }
+
                 ++createdOBB;
             } else {
                 // Sphere shape — use P$PhysDims.radius[0] or model sphere radius
                 body.sphereRadius = std::max({bboxSize.x, bboxSize.y, bboxSize.z}) * 0.5f
                                     * std::max({scale.x, scale.y, scale.z});
 
+                bool hasDimsOverride = false;
                 if (propSvc) {
                     size_t dimSize = 0;
                     const uint8_t *dimData = getPropertyRawData(propSvc, "PhysDims", obj.objID, dimSize);
@@ -760,8 +804,24 @@ public:
                         std::memcpy(&r0, dimData, sizeof(float));
                         if (r0 > 0.001f) {
                             body.sphereRadius = r0 * std::max({scale.x, scale.y, scale.z});
+                            hasDimsOverride = true;
                         }
                     }
+                }
+                if (!hasDimsOverride) {
+                    static int w = 0; if (w++ < 20)
+                        std::fprintf(stderr, "[DEFAULT] ObjectCollision: sphere obj %d has no P$PhysDims radius, using bbox-derived r=%.2f\n",
+                                     obj.objID, body.sphereRadius);
+                }
+
+                // Skip degenerate zero-radius spheres — they can never collide
+                // and waste broadphase cycles. Typically caused by unloaded models
+                // (empty bbox) without P$PhysDims radius override.
+                if (body.sphereRadius < 0.01f) {
+                    std::fprintf(stderr, "[DEFAULT] ObjectCollision: sphere obj %d radius=%.4f too small, skipping collision body\n",
+                                 obj.objID, body.sphereRadius);
+                    ++skippedNoCollision;
+                    continue;
                 }
 
                 body.worldPos = Vector3(obj.x, obj.y, obj.z);
@@ -848,6 +908,29 @@ public:
             int32_t tgtCell = static_cast<int32_t>(cell.polygons[pi].tgtCell);
             if (tgtCell >= 0 && tgtCell < static_cast<int32_t>(mWR->numCells)) {
                 collectCandidatesFromCell(tgtCell);
+            }
+        }
+
+        // Debug: log broadphase candidate count periodically
+        static int dbgBroadphaseFrame = 0;
+        if (++dbgBroadphaseFrame % 300 == 0 && !mCandidates.empty()) {
+            std::fprintf(stderr, "[OBJ-COLL] broadphase: cell=%d candidates=%zu "
+                         "playerPos=(%.1f,%.1f,%.1f)\n",
+                         playerCell, mCandidates.size(),
+                         sphereCenters[1].x, sphereCenters[1].y, sphereCenters[1].z);
+            // Log nearest 3 candidates with distance
+            for (size_t ci = 0; ci < std::min(mCandidates.size(), (size_t)5); ++ci) {
+                const auto &b = mBodies[mCandidates[ci]];
+                float dx = b.worldPos.x - sphereCenters[1].x;
+                float dy = b.worldPos.y - sphereCenters[1].y;
+                float dz = b.worldPos.z - sphereCenters[1].z;
+                const char *shapeNames[] = {"OBB","Sphere","SphHat","None"};
+                std::fprintf(stderr, "  candidate[%zu]: obj=%d %s pos=(%.1f,%.1f,%.1f) "
+                             "obb=(%.1f,%.1f,%.1f) sphR=%.1f dist=%.1f\n",
+                             ci, b.objID, shapeNames[(int)b.shapeType],
+                             b.worldPos.x, b.worldPos.y, b.worldPos.z,
+                             b.edgeLengths.x, b.edgeLengths.y, b.edgeLengths.z,
+                             b.sphereRadius, std::sqrt(dx*dx+dy*dy+dz*dz));
             }
         }
 

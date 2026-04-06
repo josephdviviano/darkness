@@ -226,6 +226,8 @@ parseAnimLightProperties(const std::string &misPath)
                 ls.posX = offsetX;
                 ls.posY = offsetY;
                 ls.posZ = offsetZ;
+                std::fprintf(stderr, "[FALLBACK] LightingSystem: light %d (obj %d) has no P$Position, using offset only (%.1f,%.1f,%.1f)\n",
+                             lightnum, ls.objectId, offsetX, offsetY, offsetZ);
             }
 
             ls.radius = radius;
@@ -267,9 +269,15 @@ parseAnimLightProperties(const std::string &misPath)
             // Set initial countdown if not loaded from save
             if (ls.countdown <= 0.0f) {
                 ls.countdown = ls.isRising ? ls.brightenTime : ls.dimTime;
+                std::fprintf(stderr, "[DEFAULT] LightingSystem: light %d countdown<=0, set to %.3fs (%s)\n",
+                             lightnum, ls.countdown, ls.isRising ? "brightenTime" : "dimTime");
             }
 
             // Compute initial intensity for dirty tracking
+            if (ls.maxBright <= 0.0f) {
+                std::fprintf(stderr, "[DEFAULT] LightingSystem: light %d maxBright=%.3f <= 0, prevIntensity defaulting to 0.0\n",
+                             lightnum, ls.maxBright);
+            }
             ls.prevIntensity = (ls.maxBright > 0.0f)
                 ? ls.brightness / ls.maxBright : 0.0f;
 
@@ -307,7 +315,13 @@ inline bool updateLightAnimation(LightSource &light, float dt) {
     if (light.inactive) return false;
 
     float range = light.maxBright - light.minBright;
-    if (range <= 0.0f) return false;
+    if (range <= 0.0f) {
+        static int warnCount = 0;
+        if (warnCount++ < 5)
+            std::fprintf(stderr, "[DEFAULT] LightingSystem::updateLightAnimation: light %d range=%.3f (max=%.3f min=%.3f) <= 0, skipping\n",
+                         light.lightNum, range, light.maxBright, light.minBright);
+        return false;
+    }
 
     float prevBrightness = light.brightness;
 
@@ -365,8 +379,10 @@ inline bool updateLightAnimation(LightSource &light, float dt) {
                 // Alternate between brighten and dim timings
                 light.isRising = !light.isRising;
                 light.countdown = light.isRising ? light.brightenTime : light.dimTime;
-                if (light.countdown <= 0.0f)
+                if (light.countdown <= 0.0f) {
                     light.countdown = 0.1f; // prevent zero-timer spin
+                    std::fprintf(stderr, "[DEFAULT] LightingSystem: light %d countdown reset to 0.1s (prevent zero-timer spin)\n", light.lightNum);
+                }
             }
             break;
         }

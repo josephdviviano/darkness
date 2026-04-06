@@ -213,11 +213,15 @@ public:
         auto it = mBodyDescs.find(id);
         if (it != mBodyDescs.end())
             return it->second.position;
+        static int w = 0; if (w++ < 5)
+            std::fprintf(stderr, "[DEFAULT] DarkPhysics::getPosition: entity %d not found, returning origin\n", id);
         return Vector3(0.0f);
     }
 
     Vector3 getVelocity(EntityID id) const override {
-        // TODO (Task 26): dBodyGetLinearVel for ODE bodies
+        // TODO (Task 26): dBodyGetLinearVel for ODE bodies — stub returns zero
+        static int w = 0; if (w++ < 5)
+            std::fprintf(stderr, "[DEFAULT] DarkPhysics::getVelocity: STUB returning zero for entity %d\n", id);
         (void)id;
         return Vector3(0.0f);
     }
