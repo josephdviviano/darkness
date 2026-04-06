@@ -503,6 +503,9 @@ private:
         tw.cfgHalt  = cfg.halt;
         tw.cfgMisc  = cfg.misc;
         tw.cfgRate  = cfg.rate;
+        if (cfg.rate == 0 && (cfg.anim & kTweqAnimSim)) {
+            std::fprintf(stderr, "[DEFAULT] TweqSystem: obj %d Flicker cfgRate=0 with Sim flag — instant cycle, likely parse issue\n", tw.objID);
+        }
     }
 
     /// Extract config fields (Models config)
@@ -512,6 +515,9 @@ private:
         tw.cfgHalt  = cfg.halt;
         tw.cfgMisc  = cfg.misc;
         tw.cfgRate  = cfg.rate;
+        if (cfg.rate == 0 && (cfg.anim & kTweqAnimSim)) {
+            std::fprintf(stderr, "[DEFAULT] TweqSystem: obj %d Models cfgRate=0 with Sim flag — instant cycle, likely parse issue\n", tw.objID);
+        }
         // Copy model names. modelCount = index of first empty slot (not last
         // non-empty). The Dark Engine stops cycling at the first empty name;
         // slots after the gap (e.g., mecgas0 at [5] after empty [4]) are
@@ -726,6 +732,8 @@ private:
                 pl.sx, pl.sy, pl.sz);
         } else {
             // Fallback: set position from SimTransform
+            std::fprintf(stderr, "[FALLBACK] TweqSystem: obj %d not in placements map, using base transform pos=(%.1f,%.1f,%.1f)\n",
+                         tw.objID, tw.base.position.x, tw.base.position.y, tw.base.position.z);
             ObjectState &os = mObjectStates->get(tw.objID);
             os.position = tw.base.position;
             os.scale = tw.base.scale;
@@ -962,9 +970,19 @@ private:
     /// Returns the Z coordinate of the bbox minimum (model-space bottom).
     /// Returns 0 if the model isn't found.
     float getModelBBoxBottomZ(const std::string &modelName) const {
-        if (!mParsedModels || modelName.empty()) return 0.0f;
+        if (!mParsedModels || modelName.empty()) {
+            static int warnCount = 0;
+            if (warnCount++ < 5)
+                std::fprintf(stderr, "[DEFAULT] TweqSystem::getModelBBoxBottomZ: no parsedModels or empty name '%s', returning 0.0\n", modelName.c_str());
+            return 0.0f;
+        }
         auto it = mParsedModels->find(modelName);
-        if (it == mParsedModels->end() || !it->second.valid) return 0.0f;
+        if (it == mParsedModels->end() || !it->second.valid) {
+            static int warnCount = 0;
+            if (warnCount++ < 5)
+                std::fprintf(stderr, "[DEFAULT] TweqSystem::getModelBBoxBottomZ: model '%s' not found or invalid, returning 0.0\n", modelName.c_str());
+            return 0.0f;
+        }
         return it->second.bboxMin[2];  // Z = vertical in Dark Engine
     }
 

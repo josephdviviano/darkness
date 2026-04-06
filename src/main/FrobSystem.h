@@ -208,8 +208,10 @@ public:
             if (mObjSvc) {
                 mTarget.name = mObjSvc->getName(body.objID);
                 if (mTarget.name.empty()) {
-                    // Fall back to archetype name
                     mTarget.name = "obj " + std::to_string(body.objID);
+                    static int w = 0; if (w++ < 10)
+                        std::fprintf(stderr, "[DEFAULT] FrobSystem: obj %d has no name, using fallback '%s'\n",
+                                     body.objID, mTarget.name.c_str());
                 }
             }
         }
@@ -302,16 +304,20 @@ public:
 
         // Fallback: route through MessageDispatch directly (no script support)
         if (mMsgDispatch) {
+            std::fprintf(stderr, "[FALLBACK] FrobSystem: no ScriptManager, routing obj %d through MessageDispatch directly\n", mTarget.objID);
             mMsgDispatch->frobWorldEnd(mTarget.objID, 0);
             return true;
         }
 
         // Fallback: direct door toggle if no message dispatch
         if (mTarget.isDoor && mDoorSys) {
+            std::fprintf(stderr, "[FALLBACK] FrobSystem: no ScriptManager or MessageDispatch, direct door toggle obj %d\n", mTarget.objID);
             mDoorSys->activate(mTarget.objID, kDoorToggle);
             return true;
         }
 
+        std::fprintf(stderr, "[FALLBACK] FrobSystem: no frob handler available for obj %d (no ScriptMgr, no MsgDispatch, %s)\n",
+                     mTarget.objID, mTarget.isDoor ? "isDoor but no DoorSys" : "not a door");
         return false;
     }
 

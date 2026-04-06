@@ -76,6 +76,7 @@
 #include "room/RoomService.h"
 #include "sim/SimService.h"
 #include "physics/PhysicsService.h"
+#include "audio/AudioLog.h"
 #include "audio/AudioService.h"
 #include "audio/AcousticMaterials.h"
 #include "motion/MotionService.h"
@@ -151,6 +152,7 @@ static void printHelp() {
         "  --water-scroll <f> Water UV scroll speed, 0.0-1.0 (default: 0.05).\n"
         "  --step-log     Log stair step diagnostics to stderr ([STEP] prefix).\n"
         "  --toggle-platforms  Auto-activate all moving terrain at startup.\n"
+        "  --audio-log    Enable audio/sound/schema log output (off by default).\n"
         "  --no-probes    Skip probe baking (no spatial audio, faster startup).\n"
         "  --debug-objects Dump per-object filtering diagnostics to stderr.\n"
         "  --config <path> Path to YAML config file (default: ./darknessRender.yaml).\n"
@@ -690,6 +692,16 @@ static void renderObjects(
             if (objState->hasMatrix) {
                 // Use pre-built matrix directly — avoids lossy Euler extraction
                 std::memcpy(objMtx, objState->modelMatrix, sizeof(objMtx));
+                // Diagnostic: log when a pushed object renders via ObjectState hasMatrix path
+                {
+                    static std::unordered_set<int32_t> loggedObjs;
+                    if (loggedObjs.find(obj.objID) == loggedObjs.end() && loggedObjs.size() < 20) {
+                        loggedObjs.insert(obj.objID);
+                        std::fprintf(stderr, "[RENDER-STATE] obj %d hasMatrix path: pos=(%.2f,%.2f,%.2f) mtx[12..14]=(%.2f,%.2f,%.2f) flags=0x%x\n",
+                                     obj.objID, objState->position.x, objState->position.y, objState->position.z,
+                                     objMtx[12], objMtx[13], objMtx[14], objState->flags);
+                    }
+                }
             } else {
                 // Build matrix from runtime state angles (already in radians)
                 const float negH = -objState->heading;
@@ -981,6 +993,11 @@ static void registerConsoleSettings(
         [&state]() { return state.physics ? state.physics->getPlayerPhysics().stepLogEnabled() : false; },
         [&state](bool v) { if (state.physics) state.physics->getPlayerPhysics().setStepLog(v); },
         "Log stair-step diagnostics to stderr ([STEP] prefix)");
+
+    dbgConsole.addBool("audio_log",
+        []() { return Darkness::gAudioLogVerbose; },
+        [](bool v) { Darkness::gAudioLogVerbose = v; },
+        "Audio/sound/schema log output (off by default)");
 
     dbgConsole.addBool("physics_log",
         [&state]() { return state.physics ? state.physics->getPlayerPhysics().isLogging() : false; },
@@ -1896,6 +1913,12 @@ int main(int argc, char *argv[]) {
         }
 
         state.physics->applyPlayerConfig(cfg);
+    }
+
+    // Enable audio logging if --audio-log was passed (off by default to reduce noise)
+    if (cfg.audioLog) {
+        Darkness::gAudioLogVerbose = true;
+        std::fprintf(stderr, "Audio logging enabled (--audio-log)\n");
     }
 
     // Enable stair step diagnostics if --step-log was passed
@@ -2912,7 +2935,7 @@ int main(int argc, char *argv[]) {
         const char *stateNames[] = {"Closed", "Open", "Closing", "Opening", "Halted"};
         const char *statusName = (status >= 0 && status <= 4) ? stateNames[status] : "?";
         const char *oldName = (oldStatus >= 0 && oldStatus <= 4) ? stateNames[oldStatus] : "?";
-        std::fprintf(stderr, "Door %d: %s (was %s, room %d<->%d)\n",
+        AUDIO_LOG("Door %d: %s (was %s, room %d<->%d)\n",
                      objID, statusName, oldName, door.room1, door.room2);
 
         // Play door sound via general-purpose env_tag schema matching.
@@ -2957,7 +2980,7 @@ int main(int argc, char *argv[]) {
                     // Parse tag pairs from the string (e.g., "DoorType Wood1sm")
                     std::string tagStr(classTags.text,
                         strnlen(classTags.text, sizeof(classTags.text)));
-                    std::fprintf(stderr, "  Door %d ClassTags: \"%s\"\n",
+                    AUDIO_LOG("  Door %d ClassTags: \"%s\"\n",
                                  objID, tagStr.c_str());
                     // Split into key-value pairs
                     std::istringstream iss(tagStr);
@@ -2971,7 +2994,7 @@ int main(int argc, char *argv[]) {
                 } else {
                     static int warnCount = 0;
                     if (warnCount < 3) {
-                        std::fprintf(stderr, "  Door %d: ClassTags property not found\n", objID);
+                        AUDIO_LOG("  Door %d: ClassTags property not found\n", objID);
                         ++warnCount;
                     }
                 }
@@ -2988,7 +3011,7 @@ int main(int argc, char *argv[]) {
             auto h = audioForEvents->playEnvSchema(tags, posA, true);
             audioForEvents->playEnvSchema(tags, posB, true);
             if (h == Darkness::SOUND_HANDLE_INVALID) {
-                std::fprintf(stderr, "  Door %d: no schema matched env_tags "
+                AUDIO_LOG("  Door %d: no schema matched env_tags "
                              "(OpenState=%s OldOpenState=%s)\n",
                              objID, statusName, oldName);
             }
@@ -3162,6 +3185,10 @@ int main(int argc, char *argv[]) {
     simSvc->unregisterListener(&pressurePlateSystem);
     simSvc->unregisterListener(&edgeTriggerSystem);
     simSvc->endSim();
+
+    // Destroy runtime GPU resources not in GPUResources struct
+    if (bgfx::isValid(state.acousticVBH))
+        bgfx::destroy(state.acousticVBH);
 
     destroyGPUResources(gpu);
     shutdownWindow(window);

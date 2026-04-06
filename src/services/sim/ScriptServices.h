@@ -41,6 +41,7 @@
 
 #include "DarknessMath.h"
 #include "LightingSystem.h"
+#include "audio/AudioLog.h"
 #include "audio/AudioService.h"
 #include "audio/SchemaTypes.h"
 #include "dyntype/Variant.h"
@@ -73,7 +74,17 @@ struct LinkScriptService {
     int getFlavor(const std::string &name) {
         auto it = mFlavorCache.find(name);
         if (it != mFlavorCache.end()) return it->second;
-        int f = linkSvc ? linkSvc->nameToFlavor(name) : -1;
+        if (!linkSvc) {
+            std::fprintf(stderr, "[FALLBACK] LinkScriptService::getFlavor: linkSvc is null, returning -1 for '%s'\n", name.c_str());
+            mFlavorCache[name] = -1;
+            return -1;
+        }
+        int f = linkSvc->nameToFlavor(name);
+        if (f < 0) {
+            static int warnCount = 0;
+            if (warnCount++ < 20)
+                std::fprintf(stderr, "[DEFAULT] LinkScriptService::getFlavor: relation '%s' not found, returning -1\n", name.c_str());
+        }
         mFlavorCache[name] = f;
         return f;
     }
@@ -198,12 +209,19 @@ struct ObjectScriptService {
 
     Vector3 position(int32_t objID) const {
         if (worldQuery) return worldQuery->getPosition(objID);
-        return objSvc ? objSvc->position(objID) : Vector3(0);
+        if (objSvc) return objSvc->position(objID);
+        static int warnCount = 0;
+        if (warnCount++ < 5)
+            std::fprintf(stderr, "[FALLBACK] ObjectScriptService::position: no worldQuery or objSvc, returning origin for obj %d\n", objID);
+        return Vector3(0);
     }
 
     Vector3 facing(int32_t objID) const {
         // Return Euler angles from ObjectState or P$Position
         // Stub: return zero facing for now
+        static int warnCount = 0;
+        if (warnCount++ < 5)
+            std::fprintf(stderr, "[DEFAULT] ObjectScriptService::facing: STUB returning zero facing for obj %d\n", objID);
         return Vector3(0);
     }
 
@@ -292,7 +310,12 @@ struct SoundScriptService {
     /// are automatically appended for schema matching.
     int32_t playEnvSchema(int32_t objID, const std::string &tags,
                           int32_t srcID = 0) {
-        if (!audioSvc) return -1;
+        if (!audioSvc) {
+            static int warnCount = 0;
+            if (warnCount++ < 5)
+                std::fprintf(stderr, "[FALLBACK] SoundScriptService::playEnvSchema: audioSvc is null, returning -1 for obj %d\n", objID);
+            return -1;
+        }
 
         // Parse tag string into SchemaTagValue vector
         std::vector<SchemaTagValue> tagVec;
@@ -341,27 +364,27 @@ struct SoundScriptService {
                 pos = Vector3(it->second.x, it->second.y, it->second.z);
         }
 
-        std::fprintf(stderr, "[SoundScriptService] playEnvSchema(obj=%d, tags=\"%s\", %zu total tags)\n",
+        AUDIO_LOG("[SoundScriptService] playEnvSchema(obj=%d, tags=\"%s\", %zu total tags)\n",
                      objID, tags.c_str(), tagVec.size());
         return static_cast<int32_t>(audioSvc->playEnvSchema(tagVec, pos));
     }
 
     /// Play a named schema directly. Returns handle.
     int32_t playSchema(int32_t objID, const std::string &schemaName) {
-        std::fprintf(stderr, "[SoundScriptService] playSchema(obj=%d, schema=\"%s\")\n",
+        AUDIO_LOG("[SoundScriptService] playSchema(obj=%d, schema=\"%s\")\n",
                      objID, schemaName.c_str());
         return -1;
     }
 
     /// Halt a specific schema on an object.
     void haltSchema(int32_t objID, const std::string &schemaName) {
-        std::fprintf(stderr, "[SoundScriptService] haltSchema(obj=%d, schema=\"%s\")\n",
+        AUDIO_LOG("[SoundScriptService] haltSchema(obj=%d, schema=\"%s\")\n",
                      objID, schemaName.c_str());
     }
 
     /// Halt all speech on an object.
     void haltSpeech(int32_t objID) {
-        std::fprintf(stderr, "[SoundScriptService] haltSpeech(obj=%d)\n", objID);
+        AUDIO_LOG("[SoundScriptService] haltSpeech(obj=%d)\n", objID);
     }
 };
 
@@ -382,7 +405,12 @@ struct LightScriptService {
     /// Find a LightSource by Dark Engine object ID.
     /// Returns nullptr if not found.
     LightSource *findByObjID(int32_t objID) {
-        if (!lightSources) return nullptr;
+        if (!lightSources) {
+            static int warnCount = 0;
+            if (warnCount++ < 3)
+                std::fprintf(stderr, "[FALLBACK] LightScriptService::findByObjID: lightSources map not wired, returning nullptr for obj %d\n", objID);
+            return nullptr;
+        }
         for (auto &[lightNum, ls] : *lightSources) {
             if (ls.objectId == objID) return &ls;
         }
@@ -392,7 +420,10 @@ struct LightScriptService {
     /// Change an animated light's mode at runtime.
     void setMode(int32_t objID, int mode) {
         LightSource *ls = findByObjID(objID);
-        if (!ls) return;
+        if (!ls) {
+            std::fprintf(stderr, "[FALLBACK] LightScriptService::setMode(obj=%d, mode=%d) — light not found\n", objID, mode);
+            return;
+        }
         ls->mode = static_cast<uint16_t>(mode);
         ls->inactive = false;
         // Reset countdown so the new mode takes effect immediately
@@ -439,7 +470,10 @@ struct LightScriptService {
     /// Set direct brightness value (0.0-1.0).
     void setBrightness(int32_t objID, float brightness) {
         LightSource *ls = findByObjID(objID);
-        if (!ls) return;
+        if (!ls) {
+            std::fprintf(stderr, "[FALLBACK] LightScriptService::setBrightness(obj=%d, %.2f) — light not found\n", objID, brightness);
+            return;
+        }
         ls->brightness = brightness;
         ls->inactive = false;
         dirty = true;
@@ -514,7 +548,11 @@ struct LockedScriptService {
     MessageDispatch *msgDispatch = nullptr;
 
     bool isLocked(int32_t objID) const {
-        if (!propSvc) return false;
+        if (!propSvc) {
+            static int w = 0; if (w++ < 3)
+                std::fprintf(stderr, "[FALLBACK] LockedScriptService::isLocked: propSvc null, returning false for obj %d\n", objID);
+            return false;
+        }
         PropLocked locked{};
         if (getTypedProperty<PropLocked>(propSvc, "Locked", objID, locked))
             return locked.isLocked != 0;
@@ -522,7 +560,11 @@ struct LockedScriptService {
     }
 
     void setLocked(int32_t objID, bool locked) {
-        if (!propSvc) return;
+        if (!propSvc) {
+            static int w = 0; if (w++ < 3)
+                std::fprintf(stderr, "[FALLBACK] LockedScriptService::setLocked: propSvc null for obj %d\n", objID);
+            return;
+        }
         // Set the property value
         propSvc->set(objID, "Locked", "", Variant(locked ? 1u : 0u));
 
@@ -577,19 +619,39 @@ struct DoorScriptService {
     DoorSystem *doorSys = nullptr;
 
     DoorStatus getDoorState(int32_t objID) const {
-        return doorSys ? doorSys->getStatus(objID) : kDoorClosed;
+        if (!doorSys) {
+            static int w = 0; if (w++ < 3)
+                std::fprintf(stderr, "[FALLBACK] DoorScriptService::getDoorState: doorSys null, returning kDoorClosed for obj %d\n", objID);
+            return kDoorClosed;
+        }
+        return doorSys->getStatus(objID);
     }
 
     bool openDoor(int32_t objID) {
-        return doorSys ? doorSys->activate(objID, kDoorDoOpen) : false;
+        if (!doorSys) {
+            static int w = 0; if (w++ < 3)
+                std::fprintf(stderr, "[FALLBACK] DoorScriptService::openDoor: doorSys null for obj %d\n", objID);
+            return false;
+        }
+        return doorSys->activate(objID, kDoorDoOpen);
     }
 
     bool closeDoor(int32_t objID) {
-        return doorSys ? doorSys->activate(objID, kDoorDoClose) : false;
+        if (!doorSys) {
+            static int w = 0; if (w++ < 3)
+                std::fprintf(stderr, "[FALLBACK] DoorScriptService::closeDoor: doorSys null for obj %d\n", objID);
+            return false;
+        }
+        return doorSys->activate(objID, kDoorDoClose);
     }
 
     bool toggleDoor(int32_t objID) {
-        return doorSys ? doorSys->activate(objID, kDoorToggle) : false;
+        if (!doorSys) {
+            static int w = 0; if (w++ < 3)
+                std::fprintf(stderr, "[FALLBACK] DoorScriptService::toggleDoor: doorSys null for obj %d\n", objID);
+            return false;
+        }
+        return doorSys->activate(objID, kDoorToggle);
     }
 
     bool isDoor(int32_t objID) const {
@@ -597,7 +659,12 @@ struct DoorScriptService {
     }
 
     float getOpenFraction(int32_t objID) const {
-        return doorSys ? doorSys->getOpenFraction(objID) : 0.0f;
+        if (!doorSys) {
+            static int w = 0; if (w++ < 3)
+                std::fprintf(stderr, "[FALLBACK] DoorScriptService::getOpenFraction: doorSys null, returning 0.0 for obj %d\n", objID);
+            return 0.0f;
+        }
+        return doorSys->getOpenFraction(objID);
     }
 };
 

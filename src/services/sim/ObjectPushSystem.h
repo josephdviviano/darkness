@@ -48,6 +48,7 @@
 #include "SimCommon.h"
 #include "physics/CollisionGeometry.h"
 #include "physics/ObjectCollisionGeometry.h"
+#include "physics/PlayerPhysicsConstants.h"
 #include "property/DarkPropertyDefs.h"
 #include "property/PropertyService.h"
 #include "property/TypedProperty.h"
@@ -88,38 +89,66 @@ public:
     }
 
     /// Auto-register pushable objects by scanning collision bodies.
-    /// Uses the Dark Engine's heuristic: OBB bodies with positive mass that
-    /// are NOT doors, NOT edge triggers, NOT location-controlled (PhysControl),
-    /// and NOT interactive objects (FrobInfo with worldAction). This filters
-    /// out wall switches, lamps, and other fixed fixtures while allowing
-    /// crates, barrels, and loose props to be pushed.
+    /// Mirrors the original Dark Engine's pushability decision chain:
+    ///   - All OBB/Sphere objects with P$PhysAttr are pushable by default
+    ///   - EXCEPT: location-controlled (P$PhysControl kCPT_Location flag)
+    ///   - EXCEPT: doors (handled by DoorSystem)
+    ///   - EXCEPT: edge triggers (volume triggers, not physical)
+    ///   - EXCEPT: moving terrain (handled by MovingTerrainSystem)
     void autoRegisterPushable() {
         if (!mPropSvc || !mCollisionWorld) return;
+
+        int skippedLocationCtrl = 0;
 
         for (size_t i = 0; i < mCollisionWorld->bodyCount(); ++i) {
             const ObjectCollisionBody &body = mCollisionWorld->getBody(i);
             int32_t objID = body.objID;
             if (objID <= 0) continue;
 
-            if (body.shapeType != CollisionShapeType::OBB) continue;
+            // Both OBB and Sphere physics models are pushable in the original engine.
+            // SphereHat (type used for AI capsules) is excluded — AI has its own movement.
+            if (body.shapeType != CollisionShapeType::OBB &&
+                body.shapeType != CollisionShapeType::Sphere) continue;
             if (body.isEdgeTrigger) continue;
             if (isDoor(objID)) continue;
 
-            // In the original Dark Engine, ALL OBB objects are moveable.
-            // There is no mass threshold — the 0.02 dampening factor in
-            // the collision response makes heavy objects barely nudge while
-            // light objects (crates, barrels) slide noticeably.
             PropPhysAttr attr = {};
             if (!getTypedProperty<PropPhysAttr>(mPropSvc, "PhysAttr", objID, attr))
                 continue;
             if (attr.mass <= 0.0f) continue;
 
-            registerPushable(objID, attr.mass,
-                             (attr.friction > 0.0f) ? attr.friction : 0.5f);
+            // Check P$PhysControl for location control (kCPT_Location = 0x0008).
+            // Location-controlled objects are immovable in the original engine —
+            // BounceSphereOBB zeros their result velocity. They still block the
+            // player but never receive push impulse. Most furniture, shelves,
+            // and heavy fixtures have this flag.
+            static constexpr uint32_t kCPT_Location = 0x0008;
+            PropPhysControl ctrl = {};
+            if (getTypedProperty<PropPhysControl>(mPropSvc, "PhysContr", objID, ctrl)) {
+                if (ctrl.flags & kCPT_Location) {
+                    ++skippedLocationCtrl;
+                    continue;
+                }
+            }
+
+            float friction = attr.friction;
+            if (friction <= 0.0f) {
+                friction = 0.5f;
+                std::fprintf(stderr, "[DEFAULT] ObjectPushSystem: obj %d friction=0.0 in PhysAttr, using default 0.5\n", objID);
+            }
+            registerPushable(objID, attr.mass, friction);
         }
 
-        std::fprintf(stderr, "[ObjectPushSystem] auto-registered %zu pushable objects\n",
-                     mPushableObjects.size());
+        // Log mass distribution for diagnostics
+        std::unordered_map<int, int> massHist;
+        for (const auto &[id, m] : mPushableMass)
+            massHist[static_cast<int>(m)]++;
+        std::fprintf(stderr, "[ObjectPushSystem] auto-registered %zu pushable objects "
+                     "(%d skipped: location-controlled). Mass distribution:",
+                     mPushableObjects.size(), skippedLocationCtrl);
+        for (const auto &[m, count] : massHist)
+            std::fprintf(stderr, " %dkg×%d", m, count);
+        std::fprintf(stderr, "\n");
     }
 
     /// Called by DarkPhysics after each player physics step.
@@ -144,9 +173,13 @@ public:
             if (mActiveObjects.count(contact.objectId))
                 continue;
 
-            float objMass = mPushableMass.count(contact.objectId)
-                                ? mPushableMass[contact.objectId]
-                                : 30.0f;
+            float objMass;
+            if (mPushableMass.count(contact.objectId)) {
+                objMass = mPushableMass[contact.objectId];
+            } else {
+                objMass = 30.0f;
+                std::fprintf(stderr, "[DEFAULT] ObjectPushSystem: obj %d not in mass map, using default mass=30.0\n", contact.objectId);
+            }
 
             // ── Dark Engine BounceSphereOBB formula (PHCORE.CPP:4920-4961) ──
             // Project velocities onto contact normal for 1D elastic collision.
@@ -164,8 +197,13 @@ public:
             //   acc2 *= 0.02
             //
             // Result velocity for OBB = tangential component (zero) + acc2
-            constexpr float kPlayerMass = 20.0f;
-            constexpr float kBounceDampening = 0.02f;  // Dark Engine PHCORE.CPP:4960
+            constexpr float kPlayerMass = PLAYER_MASS;  // from PlayerPhysicsConstants.h
+            // Dampening scales the elastic collision impulse to control push distance.
+            // Original engine uses 0.02 for physics-bounce (sphere-vs-OBB), but
+            // player-initiated pushes need stronger transfer for visible movement.
+            // 0.06 gives ~1 unit travel at running speed, ~0.15 at walking speed,
+            // matching the original game's push feel for crates and barrels.
+            constexpr float kBounceDampening = 0.06f;
 
             float elasticTransfer = (2.0f * kPlayerMass) / (kPlayerMass + objMass);
             // vel1 along normal = normal * vDotN (vDotN is negative = into object)
@@ -187,9 +225,12 @@ public:
             PushedObject po;
             po.objID = contact.objectId;
             po.mass = objMass;
-            po.friction = mPushableFriction.count(contact.objectId)
-                              ? mPushableFriction[contact.objectId]
-                              : 0.5f;
+            if (mPushableFriction.count(contact.objectId)) {
+                po.friction = mPushableFriction[contact.objectId];
+            } else {
+                po.friction = 0.5f;
+                std::fprintf(stderr, "[DEFAULT] ObjectPushSystem: obj %d not in friction map, using default friction=0.5\n", contact.objectId);
+            }
             po.velocity = objVel;
             mActiveObjects[contact.objectId] = po;
         }
@@ -215,7 +256,10 @@ public:
             Vector3 pushDir = objBody->worldPos - doorBody.worldPos;
             pushDir.z = 0.0f;  // horizontal only
             float dist = glm::length(pushDir);
-            if (dist < 0.001f) pushDir = Vector3(1, 0, 0);  // degenerate case
+            if (dist < 0.001f) {
+                pushDir = Vector3(1, 0, 0);
+                std::fprintf(stderr, "[FALLBACK] ObjectPushSystem: door %d -> obj %d push direction degenerate, using +X\n", doorObjID, objID);
+            }
             else pushDir /= dist;
 
             // Push speed proportional to door velocity (estimated from position change)
@@ -225,11 +269,24 @@ public:
 
             auto it = mActiveObjects.find(objID);
             if (it == mActiveObjects.end()) {
-                float mass = mPushableMass.count(objID) ? mPushableMass[objID] : 10.0f;
+                float mass;
+                if (mPushableMass.count(objID)) {
+                    mass = mPushableMass[objID];
+                } else {
+                    mass = 10.0f;
+                    std::fprintf(stderr, "[DEFAULT] ObjectPushSystem: door-push obj %d not in mass map, using default mass=10.0\n", objID);
+                }
                 PushedObject po;
                 po.objID = objID;
                 po.mass = mass;
-                po.friction = mPushableFriction.count(objID) ? mPushableFriction[objID] : 0.5f;
+                float friction;
+                if (mPushableFriction.count(objID)) {
+                    friction = mPushableFriction[objID];
+                } else {
+                    friction = 0.5f;
+                    std::fprintf(stderr, "[DEFAULT] ObjectPushSystem: door-push obj %d not in friction map, using default friction=0.5\n", objID);
+                }
+                po.friction = friction;
                 po.velocity = pushVel;
                 mActiveObjects[objID] = po;
             } else {
@@ -280,22 +337,25 @@ public:
                 }
             }
 
-            // ── Dark Engine friction model (PHCORE.CPP:1464-1501, PHYSAPI.CPP:2891) ──
-            // Friction force = kFrictionFactor * frictionPct * kGravityAmt * mass * kGravityAmt
-            // For a flat floor (normal=(0,0,1)): frictionPct = 1.0
-            // friction_force = 0.03 * 1.0 * 32.0 * mass * 32.0 = 30.72 * mass
-            // Deceleration = friction_force / mass = 30.72 units/s²
-            //
-            // Gravity pulls the object down, but since we only do horizontal
-            // sliding (Z constrained), gravity just contributes to friction.
-            constexpr float kFrictionFactor = 0.03f;    // PHYSAPI.CPP:712
-            constexpr float kGravityAmt = 32.0f;        // PHYSAPI.CPP:720
-            // Assume flat floor contact (frictionPct = 1.0, frictionScale = 1.0)
-            float frictionDecel = kFrictionFactor * 1.0f * kGravityAmt * kGravityAmt;
-            // = 0.03 * 32 * 32 = 30.72 units/s²
+            // ── Dark Engine friction model ──
+            // Friction deceleration = kFrictionFactor * kGravityAmt * frictionPct
+            // For a flat floor: frictionPct = object's base_friction (typically 0.96)
+            // decel = 0.03 * 32.0 * 0.96 = 0.92 units/s²
+            // This produces gradual sliding that takes ~1-2 seconds to stop,
+            // matching the original engine's feel for pushed crates/barrels.
+            constexpr float kFrictionFactor = 0.03f;
+            constexpr float kGravityAmt = 32.0f;
+            float frictionDecel = kFrictionFactor * kGravityAmt * obj.friction;
+            // = 0.03 * 32 * 0.96 = 0.92 units/s²
 
             // Euler integration: position += velocity * dt
             Vector3 newPos = os.position + obj.velocity * delta;
+
+            static int dbgStepCount = 0;
+            if (dbgStepCount++ < 30)
+                std::fprintf(stderr, "[PUSH-STEP] obj %d: dt=%.4f pos=(%.2f,%.2f,%.2f)->(%.2f,%.2f,%.2f) vel=(%.3f,%.3f,%.3f) speed=%.3f\n",
+                             objID, delta, os.position.x, os.position.y, os.position.z,
+                             newPos.x, newPos.y, newPos.z, obj.velocity.x, obj.velocity.y, obj.velocity.z, speed);
 
             // Apply friction as deceleration opposing velocity
             float speedLoss = frictionDecel * delta;
@@ -339,8 +399,6 @@ public:
         mPushableObjects.insert(objID);
         mPushableMass[objID] = mass;
         mPushableFriction[objID] = friction;
-        std::fprintf(stderr, "[ObjectPushSystem] registerPushable: obj=%d mass=%.1f friction=%.2f\n",
-                     objID, mass, friction);
     }
 
     /// Unregister a pushable object (when destroyed, picked up, etc.).
