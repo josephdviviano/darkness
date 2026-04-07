@@ -594,9 +594,20 @@ public:
             }
 
             // Determine collision shape type from P$PhysType (with inheritance).
-            // Objects without P$PhysType don't participate in physics collision at all
+            // Objects without P$PhysType don't participate in physics collision at all.
             // Defaulting to OBB for objects without it would create
             // collision bodies for visual-only decorations (room pieces, terrain, etc.).
+            //
+            // IMPORTANT: P$PhysType stores the ON-DISK property enum (eModelType
+            // from PHPROPS.H / physmodeltype from t2-types.dtype), NOT the internal
+            // physics engine enum (ePhysModelType from PHMOD.H). The engine converts
+            // between them in PHPROP.CPP when saving.
+            //
+            // On-disk enum (physmodeltype):
+            //   0 = BoundingBox (OBB), 1 = Sphere, 2 = SphereHat, 3 = None
+            //
+            // Internal enum (ePhysModelType, NOT stored on disk):
+            //   0 = Sphere, 1 = BSP, 2 = Point, 3 = OBB, 4 = SphereHat
             CollisionShapeType shapeType = CollisionShapeType::OBB;
             bool hasPhysType = false;
             bool isSpecial = false;     // P$PhysType.special flag
@@ -610,13 +621,21 @@ public:
                     std::memcpy(&ptype, rawData, sizeof(uint32_t));
                     hasPhysType = true;
 
+                    // On-disk physmodeltype enum:
+                    //   0 = BoundingBox (OBB), 1 = Sphere, 2 = SphereHat, 3 = None
                     if (ptype == 3) {
-                        // PhysType.type == None — skip, no collision
+                        // None — object has no physics collision
                         ++skippedNone;
                         continue;
-                    } else if (ptype == 1 || ptype == 2) {
+                    } else if (ptype == 1) {
                         shapeType = CollisionShapeType::Sphere;
+                    } else if (ptype == 2) {
+                        shapeType = CollisionShapeType::SphereHat;
+                    } else if (ptype == 0) {
+                        shapeType = CollisionShapeType::OBB;
                     } else {
+                        std::fprintf(stderr, "[FALLBACK] obj %d has unknown PhysType=%u, treating as OBB\n",
+                                     obj.objID, ptype);
                         shapeType = CollisionShapeType::OBB;
                     }
 
