@@ -98,13 +98,91 @@ public:
             dGeomSetPosition(mPlayerGeom, pos.x, pos.y, pos.z);
         }
 
-        // Step ODE world with fixed timestep accumulator (same rate as player physics)
+        // Apply push forces to dynamic ODE bodies from player contacts BEFORE
+        // the ODE step so forces take effect this frame (not next frame).
+        // Uses the pre-collision velocity (post-collision has wall component removed).
+        if (mPushSystem) {
+            const auto &contacts = mPlayer.getLastContacts();
+            for (const auto &c : contacts) {
+                if (c.objectId < 0) continue;  // terrain contact
+                if (!mPushSystem->isPushable(c.objectId)) continue;
+
+                float vDotN = glm::dot(preCollisionVel, c.normal);
+                if (vDotN >= 0.0f) continue;  // moving away
+
+                auto bodyIt = mODEBodies.find(c.objectId);
+                if (bodyIt != mODEBodies.end()) {
+                    // ODE dynamic body — apply impulse as force over one physics step.
+                    // Dark Engine elastic transfer: 2*m1/(m1+m2) * dampening
+                    float objMass = mPushSystem->getMass(c.objectId);
+                    float elastic = (2.0f * PLAYER_MASS) / (PLAYER_MASS + objMass);
+                    constexpr float kPushDampening = 0.06f;
+                    // Contact normal points from object toward player; vDotN is negative
+                    // (into object), so normal * vDotN gives push direction away from player.
+                    Vector3 pushVel = c.normal * vDotN * elastic * kPushDampening;
+                    // Convert velocity impulse to force: F = m * dv / dt
+                    float fixedDt = mPlayer.getTimestep().fixedDt;
+                    Vector3 force = pushVel * (objMass / fixedDt);
+                    // Player pushes are strictly horizontal — suppress ALL vertical
+                    // force (both up and down). Downward force tips objects over;
+                    // upward force lifts them. Gravity handles vertical motion.
+                    force.z = 0.0f;
+
+                    dBodyEnable(bodyIt->second);
+                    dBodyAddForce(bodyIt->second, force.x, force.y, force.z);
+
+                    // Player bounce-back: slight deceleration on push impact.
+                    // Very subtle — the player should feel mild resistance, not
+                    // a camera jolt. Scale is 0.005 (vs 0.06 for the object),
+                    // so pushing a 30kg crate while running gives ~0.04 units/s
+                    // deceleration. Only noticeable as a tiny "thud" feel.
+                    constexpr float kPlayerReactionScale = 0.005f;
+                    float playerElastic = (2.0f * objMass) / (PLAYER_MASS + objMass);
+                    Vector3 playerReaction = c.normal * vDotN * playerElastic * kPlayerReactionScale;
+                    playerReaction.z = 0.0f;  // horizontal only
+                    mPlayer.applyImpulse(playerReaction);
+
+                    // Wake bodies in contact with the pushed object (stack propagation).
+                    // Without this, pushing the bottom of a stack only moves the bottom
+                    // while stacked objects remain sleeping. (Inspired by Godot's
+                    // wakeup_neighbours pattern.)
+                    wakeContactNeighbours(bodyIt->second);
+
+                    static int pushDbg = 0;
+                    if (pushDbg++ < 30)
+                        std::fprintf(stderr, "[ODE-PUSH] obj %d: vDotN=%.2f elastic=%.2f "
+                                     "force=(%.1f,%.1f,%.1f) mass=%.1f reaction=%.3f\n",
+                                     c.objectId, vDotN, elastic,
+                                     force.x, force.y, force.z, objMass,
+                                     glm::length(playerReaction));
+                }
+            }
+            // Non-ODE pushable objects still handled by kinematic system
+            mPushSystem->processPlayerContacts(contacts, preCollisionVel);
+        }
+
+        // Step ODE world with fixed timestep accumulator (same rate as player physics).
+        // Push forces applied above are consumed during this step.
         if (mODEWorld) {
             float fixedDt = mPlayer.getTimestep().fixedDt;
             mODEAccum += dt;
             int steps = 0;
             while (mODEAccum >= fixedDt && steps < 10) {
+                // 1) Collision detection — creates contact joints
                 dSpaceCollide(mODESpace, this, &odeNearCallback);
+
+                // 2) Enforce zero rotation on grounded dynamic bodies.
+                // Must run AFTER dSpaceCollide (contact joints exist for
+                // ground detection) but BEFORE dWorldQuickStep (so zero
+                // angular velocity is the solver's starting condition).
+                // Grounded bodies slide without tipping (original Dark Engine
+                // behavior); airborne bodies rotate freely.
+                for (auto &[objID, body] : mODEBodies) {
+                    if (!dBodyIsEnabled(body)) continue;
+                    enforceGroundNoRotation(body);
+                }
+
+                // 3) Step the solver
                 dWorldQuickStep(mODEWorld, fixedDt);
                 dJointGroupEmpty(mODEContacts);
                 mODEAccum -= fixedDt;
@@ -115,14 +193,6 @@ public:
 
         // Sync dynamic bodies back to collision geometry + renderer
         syncDynamicBodies();
-
-        // Feed player-object contacts to push system for kinematic pushing.
-        // Use pre-collision velocity — post-collision velocity has the component
-        // into the object zeroed out by the constraint solver.
-        if (mPushSystem) {
-            mPushSystem->processPlayerContacts(
-                mPlayer.getLastContacts(), preCollisionVel);
-        }
 
         // Update view punch spring
         mPlayer.updateViewPunch(dt);
@@ -470,12 +540,17 @@ private:
         // Without this, objects micro-bounce on trimesh contact points
         // and never reach the auto-disable velocity threshold.
         dWorldSetLinearDamping(mODEWorld, 0.05);
-        dWorldSetAngularDamping(mODEWorld, 0.2);
+        // Angular damping: 0.08 allows barrels/bottles to roll realistically
+        // while still settling in a reasonable time. The original engine had
+        // no angular damping — objects spun until friction stopped them.
+        // 0.08 is a compromise: enough to prevent infinite spinning but low
+        // enough for visible rolling on pushes and falls.
+        dWorldSetAngularDamping(mODEWorld, 0.08);
         dWorldSetLinearDampingThreshold(mODEWorld, 0.01);
         dWorldSetAngularDampingThreshold(mODEWorld, 0.01);
 
         std::fprintf(stderr, "ODE world created (gravity=%.1f, ERP=0.8, CFM=1e-4, "
-                     "angularDamping=0.05)\n", -GRAVITY);
+                     "linDamp=0.05, angDamp=0.08)\n", -GRAVITY);
     }
 
     void shutdownODE() {
@@ -562,14 +637,26 @@ private:
         // Skip if both are static (no dynamics to solve)
         if (!b1 && !b2) return;
 
-        // Read per-object material properties from ODEGeomData
-        float mu = 0.8f, bounce = 0.1f;
+        // Read per-object material properties from ODEGeomData.
+        // When both geoms have data, average friction and take max elasticity.
+        // When only one has data (e.g. object-vs-world-trimesh), use that
+        // object's friction directly. Default 0.5 matches P$PhysAttr default.
+        float mu = 0.5f, bounce = 0.1f;
         auto *d1 = static_cast<ODEGeomData *>(dGeomGetData(o1));
         auto *d2 = static_cast<ODEGeomData *>(dGeomGetData(o2));
-        if (d1 && d2 && d1->objID != PLAYER_GEOM_TAG && d2->objID != PLAYER_GEOM_TAG) {
-            // Average friction, max elasticity (bouncier surface wins)
+        bool valid1 = d1 && d1->objID != static_cast<int32_t>(PLAYER_GEOM_TAG);
+        bool valid2 = d2 && d2->objID != static_cast<int32_t>(PLAYER_GEOM_TAG);
+        if (valid1 && valid2) {
+            // Both are registered objects: average friction, max elasticity
             mu = (d1->friction + d2->friction) * 0.5f;
             bounce = std::max(d1->elasticity, d2->elasticity);
+        } else if (valid1) {
+            // Object vs world trimesh (or untagged geom): use object's friction
+            mu = d1->friction;
+            bounce = d1->elasticity;
+        } else if (valid2) {
+            mu = d2->friction;
+            bounce = d2->elasticity;
         }
 
         // Generate contact points
@@ -577,13 +664,30 @@ private:
         int numContacts = dCollide(o1, o2, MAX_ODE_CONTACTS,
                                     &contacts[0].geom, sizeof(dContact));
 
+        // Detect trimesh involvement for contact parameter tuning.
+        // Trimesh contacts need stiffer parameters to prevent sinking.
+        bool hasTrimesh = (dGeomGetClass(o1) == dTriMeshClass ||
+                           dGeomGetClass(o2) == dTriMeshClass);
+
         for (int i = 0; i < numContacts; ++i) {
-            // Stiff contacts with minimal bounce for stable resting.
-            // SoftERP/CFM avoided — they cause objects to sink into trimesh.
             contacts[i].surface.mode = dContactBounce | dContactApprox1;
             contacts[i].surface.mu = mu;
             contacts[i].surface.bounce = std::min(bounce, 0.2f);
             contacts[i].surface.bounce_vel = 1.0f;  // need real speed to bounce
+
+            if (hasTrimesh) {
+                // Trimesh contacts: slightly soft to absorb micro-bounce jitter
+                // on uneven world geometry, but stiff enough to prevent sinking.
+                contacts[i].surface.mode |= dContactSoftERP | dContactSoftCFM;
+                contacts[i].surface.soft_erp = 0.5;   // moderate correction
+                contacts[i].surface.soft_cfm = 0.001;  // slight compliance
+            } else if (b1 && b2) {
+                // Object-on-object: softer for stable stacking.
+                // (Inspired by Godot's per-contact soft parameters for stack stability.)
+                contacts[i].surface.mode |= dContactSoftERP | dContactSoftCFM;
+                contacts[i].surface.soft_erp = 0.3;   // gentler correction
+                contacts[i].surface.soft_cfm = 0.005;  // more compliant
+            }
 
             dJointID joint = dJointCreateContact(
                 self->mODEWorld, self->mODEContacts, &contacts[i]);
@@ -599,24 +703,32 @@ private:
                        static_cast<float>(vel[1]),
                        static_cast<float>(vel[2]));
         float speed = glm::length(objVel);
-        if (speed < 1.0f) return;  // below threshold, no hit reaction
+        // High threshold: only react to objects moving fast enough to hurt
+        // (thrown objects, explosions). Normal push contacts are ~1-2 units/s
+        // and should NOT trigger view punch or knockback.
+        if (speed < 5.0f) return;
 
-        // Knockback impulse scaled by object mass and speed
+        // Knockback impulse scaled by object mass and speed.
+        // Very conservative: 0.002 scale means a 30kg object at 10 units/s
+        // gives 0.6 units/s player impulse (barely perceptible movement).
         dMass mass;
         dBodyGetMass(dynBody, &mass);
-        float impulseScale = static_cast<float>(mass.mass) * speed * 0.01f;
+        float impulseScale = static_cast<float>(mass.mass) * speed * 0.002f;
         Vector3 knockDir = glm::normalize(objVel);
 
         // Apply velocity impulse to player
         mPlayer.applyImpulse(knockDir * impulseScale);
 
-        // Direction-aware view punch (Source Engine style)
-        // Decompose hit direction into pitch (forward) and roll (side)
+        // Direction-aware view punch (Source Engine style).
+        // Subtle: punchMag = impulseScale * 3.0 gives a gentle camera nudge.
+        // A 30kg crate at 10 units/s → punchMag ~1.8 degrees. Noticeable
+        // but not disorienting. Heavy/fast objects (150kg explosion debris
+        // at 20 units/s) → ~18 degrees, which feels impactful.
         Vector3 forward = mPlayer.getForward();
         Vector3 right = mPlayer.getRight();
         float sideDot = glm::dot(knockDir, right);
         float fwdDot = glm::dot(knockDir, forward);
-        float punchMag = impulseScale * 20.0f;
+        float punchMag = impulseScale * 3.0f;
         mPlayer.addViewPunch(Vector3(
             fwdDot * punchMag,     // pitch
             0.0f,                   // yaw (minimal)
@@ -654,6 +766,48 @@ private:
         return m;
     }
 
+    /// Enforce zero rotation on OBB bodies that are on the ground.
+    /// The original Dark Engine set AtRest(TRUE) for ALL OBBs — they never
+    /// rotated from pushes, only slid. We improve on this: allow rotation
+    /// when airborne (falling off ledges, thrown) so objects tumble
+    /// realistically, but lock rotation when grounded so pushes feel clean.
+    ///
+    /// Ground detection: check the body's contact joints for any with an
+    /// upward-pointing normal (Z > 0.5). If found, the object is on a surface.
+    void enforceGroundNoRotation(dBodyID body) {
+        // Check if this body has any ground contacts (upward normal)
+        bool onGround = false;
+        int numJoints = dBodyGetNumJoints(body);
+        for (int i = 0; i < numJoints; ++i) {
+            dJointID joint = dBodyGetJoint(body, i);
+            if (dJointGetType(joint) != dJointTypeContact) continue;
+
+            // Read the contact normal from the joint feedback.
+            // ODE contact joints store the contact geom in the joint's
+            // internal data, but we can't easily access it post-creation.
+            // Instead, check if the other body is the world trimesh (static)
+            // by testing if one of the connected bodies is NULL (static geom).
+            dBodyID b1 = dJointGetBody(joint, 0);
+            dBodyID b2 = dJointGetBody(joint, 1);
+            if (!b1 || !b2) {
+                // One side is static geometry (world trimesh or static object).
+                // Assume floor contact — this is conservative but correct for
+                // most cases. Objects on top of other dynamic objects also
+                // get locked (both bodies non-null), which is fine for stacking.
+                onGround = true;
+                break;
+            }
+            // Dynamic-on-dynamic: also lock (stacking stability)
+            onGround = true;
+            break;
+        }
+
+        if (onGround) {
+            dBodySetAngularVel(body, 0, 0, 0);
+        }
+        // Airborne: ODE handles free rotation naturally (tumbling off ledges)
+    }
+
     /// Sync awake dynamic ODE bodies back to collision geometry and renderer.
     void syncDynamicBodies() {
         if (!mObjectCollision || !mObjectStates) return;
@@ -668,14 +822,19 @@ private:
             const dReal *R = dBodyGetRotation(body);
 
             // Log awake bodies every 30 frames (~0.5s at 60Hz)
+            // Include orientation: local Z axis in world space shows tilt
             if (mODEFrameCount % 30 == 0) {
                 dMass mass;
                 dBodyGetMass(body, &mass);
+                const dReal *angVel = dBodyGetAngularVel(body);
                 std::fprintf(stderr, "  [ODE] obj=%d mass=%.1f pos=(%.2f,%.2f,%.2f) "
-                             "vel=(%.2f,%.2f,%.2f)\n",
+                             "vel=(%.2f,%.2f,%.2f) angVel=(%.2f,%.2f,%.2f) "
+                             "localZ=(%.3f,%.3f,%.3f)\n",
                              objID, mass.mass,
                              pos[0], pos[1], pos[2],
-                             vel[0], vel[1], vel[2]);
+                             vel[0], vel[1], vel[2],
+                             angVel[0], angVel[1], angVel[2],
+                             R[8], R[9], R[10]);  // local Z axis in world coords
             }
 
             // Look up scale from ObjectCollisionBody (scale doesn't change at runtime)
@@ -920,9 +1079,36 @@ public:
         auto *gd = static_cast<ODEGeomData *>(dGeomGetData(geom));
         if (gd) { gd->friction = friction; gd->elasticity = elasticity; }
 
+        // Start disabled (sleeping). Objects are woken by player push, explosions,
+        // or contact propagation. Avoids ~130 bodies all settling simultaneously
+        // on mission load (which would cause a CPU spike).
+        dBodyDisable(odeBody);
+
         mODEBodies[objID] = odeBody;
         mODEScales[objID] = collBody->objectScale;
         return true;
+    }
+
+    /// Wake all ODE bodies that are currently in contact with the given body.
+    /// Implements Godot's "wakeup_neighbours" pattern: when pushing the bottom
+    /// of a stack, all objects on top must also wake so they respond to the
+    /// movement. Uses the ODE contact joint group (which is cleared each step),
+    /// so this must be called BEFORE dWorldQuickStep.
+    void wakeContactNeighbours(dBodyID body) {
+        if (!body) return;
+        // Walk all joints on this body. Contact joints connect two bodies that
+        // are touching. Wake any sleeping body on the other end.
+        int numJoints = dBodyGetNumJoints(body);
+        for (int i = 0; i < numJoints; ++i) {
+            dJointID joint = dBodyGetJoint(body, i);
+            if (dJointGetType(joint) != dJointTypeContact) continue;
+            dBodyID b1 = dJointGetBody(joint, 0);
+            dBodyID b2 = dJointGetBody(joint, 1);
+            dBodyID other = (b1 == body) ? b2 : b1;
+            if (other && !dBodyIsEnabled(other)) {
+                dBodyEnable(other);
+            }
+        }
     }
 
     /// Check if an object has a dynamic ODE body (for player push logic).

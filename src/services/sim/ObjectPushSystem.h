@@ -105,10 +105,10 @@ public:
             int32_t objID = body.objID;
             if (objID <= 0) continue;
 
-            // Both OBB and Sphere physics models are pushable in the original engine.
-            // SphereHat (type used for AI capsules) is excluded — AI has its own movement.
-            if (body.shapeType != CollisionShapeType::OBB &&
-                body.shapeType != CollisionShapeType::Sphere) continue;
+            // OBB, Sphere, and SphereHat physics models are all pushable in the
+            // original engine. SphereHat is used for crates/barrels (sphere with
+            // flat top), not just AI capsules. Only "None" type is excluded.
+            if (body.shapeType == CollisionShapeType::None) continue;
             if (body.isEdgeTrigger) continue;
             if (isDoor(objID)) continue;
 
@@ -156,11 +156,19 @@ public:
     /// 1D elastic collision along contact normal, scaled by 0.02 dampening.
     /// Applied as a one-shot impulse per collision event — persistent contact
     /// prevents re-bouncing until the object comes to rest.
+    /// Set callback to check if an object has an ODE dynamic body.
+    /// Objects with ODE bodies are pushed via dBodyAddForce in DarkPhysics,
+    /// not through kinematic integration here.
+    using HasDynamicBodyCb = std::function<bool(int32_t)>;
+    void setHasDynamicBodyCb(HasDynamicBodyCb cb) { mHasDynamicBodyCb = std::move(cb); }
+
     void processPlayerContacts(const std::vector<SphereContact> &contacts,
                                const Vector3 &playerVelocity) {
         for (const auto &contact : contacts) {
             if (contact.objectId < 0) continue;  // terrain contact
             if (!mPushableObjects.count(contact.objectId)) continue;
+            // Skip objects handled by ODE dynamic simulation
+            if (mHasDynamicBodyCb && mHasDynamicBodyCb(contact.objectId)) continue;
 
             // Contact normal points FROM object surface TOWARD player.
             // vDotN < 0 means player is moving into the object.
@@ -401,6 +409,17 @@ public:
         mPushableFriction[objID] = friction;
     }
 
+    /// Access the pushable object set (for ODE dynamic body activation).
+    const std::unordered_set<int32_t> &getPushableObjects() const { return mPushableObjects; }
+    float getMass(int32_t objID) const {
+        auto it = mPushableMass.find(objID);
+        return it != mPushableMass.end() ? it->second : 10.0f;
+    }
+    float getFriction(int32_t objID) const {
+        auto it = mPushableFriction.find(objID);
+        return it != mPushableFriction.end() ? it->second : 0.5f;
+    }
+
     /// Unregister a pushable object (when destroyed, picked up, etc.).
     void unregisterPushable(int32_t objID) {
         mPushableObjects.erase(objID);
@@ -453,6 +472,7 @@ private:
     }
 
     bool mDebugLog = true;  // temporary debug logging for push events
+    HasDynamicBodyCb mHasDynamicBodyCb;  // callback to check if obj has ODE dynamic body
 
     PropertyService *mPropSvc = nullptr;
     ObjectStateMap *mObjectStates = nullptr;
