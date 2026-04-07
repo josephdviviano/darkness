@@ -633,11 +633,9 @@ private:
         //     frame's constrainVelocity() call.
         resolveCollisions(contactCb);
 
-        // 10b. Stair stepping — after collision resolution finds wall contacts
-        //      at leg level, try to step up small ledges. Must run before
-        //      detectGround() so the stepped position is used for ground state.
-        //      Only when grounded and moving horizontally.
-        tryStairStep();
+        // 10b. Stair stepping is now integrated into resolveCollisions() above,
+        //      matching the original engine where CheckStep runs DURING collision
+        //      and replaces the bounce response when successful.
 
         // 10c. Climbing — detect/maintain/break climb on climbable OBB objects.
         //      Must run after collision resolution (needs fresh contacts) and after

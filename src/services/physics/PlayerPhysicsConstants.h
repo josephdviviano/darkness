@@ -139,11 +139,15 @@ static constexpr float CLIMB_MULT     = 0.5f;
 
 // Physics parameters
 static constexpr float GRAVITY        = 32.0f;   // units/sec² (runtime-adjustable)
-// Slope handling — purely friction-based. GROUND_NORMAL_MIN: any surface with normal.z above this
-// counts as "ground" for state/landing. There is NO hard walkable slope angle — friction
-// (0.03 * normal.z * gravity) naturally decreases on steeper slopes, reducing movement control
-// and allowing gravity's slope-parallel component to dominate. Sliding is emergent.
-static constexpr float GROUND_NORMAL_MIN = 0.01f;  // near-zero epsilon, matches original engine's normal.z > 0
+// Slope handling constants from the original Dark Engine:
+// GROUND_NORMAL_MIN: any surface with normal.z above this counts as "ground" for
+// state/landing detection (prevents false Jump transitions on near-vertical walls).
+static constexpr float GROUND_NORMAL_MIN = 0.01f;  // near-zero epsilon for ground state detection
+// WALKABLE_SLOPE_THRESHOLD: surfaces steeper than this can't be walked on — the player
+// slides down under gravity instead. cos(45°) = 0.7071 matches the original engine's
+// mantle/walkability cutoff. Surfaces with normal.z < this only provide collision
+// (wall-like push-out) but not ground movement control or slope projection.
+static constexpr float WALKABLE_SLOPE_THRESHOLD = 0.7071f;  // cos(45°) — from original engine
 
 // Jump requires friction > JUMP_MIN_FRICTION. Flat ground friction=0.96; threshold 0.5
 // corresponds to slopes steeper than ~58° (normal.z < 0.52).
@@ -162,10 +166,11 @@ static constexpr int CONTACT_MAX_AGE = 3;
 // iterations. Modern/Ultra: 1 iteration (higher Hz compensates with more steps/sec).
 
 // Stair stepping — 3-phase raycast algorithm for stepping up small ledges during ground movement.
-// Triggered when FOOT/SHIN/KNEE contacts have steep/vertical normal (z < STEP_WALL_THRESHOLD).
-// Phase 1: UP (clearance), Phase 2: FORWARD (space on ledge), Phase 3: DOWN (find surface).
-// Lift = max(STEP_MIN_ZDELTA, hit_z - foot_z) + STEP_CLEARANCE.
-static constexpr float STEP_WALL_THRESHOLD = 0.4f;   // normal.z below this = "wall" (steep surface)
+// Triggered when FOOT/SHIN/KNEE hit a stair riser (vertical face of a step). These contacts
+// have near-horizontal normals (z < STEP_WALL_THRESHOLD), indicating the player's legs ran
+// into something wall-like. The algorithm then probes UP→FORWARD→DOWN to find a walkable
+// ledge surface above. Lift = max(STEP_MIN_ZDELTA, hit_z - foot_z) + STEP_CLEARANCE.
+static constexpr float STEP_WALL_THRESHOLD = 0.4f;   // leg contact with normal.z below this triggers step attempt
 static constexpr float STEP_UP_DIST        = 2.0f;   // upward probe distance (units)
 static constexpr float STEP_FWD_SCALE      = 0.01f;  // forward probe = velocity * this
 static constexpr float STEP_UP_EPSILON     = 0.01f;  // UP ray start offset above foot (collision skin)

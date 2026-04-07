@@ -14,7 +14,11 @@
         int constraintCount = 0;
 
         for (const auto &c : mLastContacts) {
-            // Only constrain if velocity is moving into the surface
+            // Use FULL normals for velocity constraints (matches original engine's
+            // AddConstraint which stores the unmodified surface normal). This removes
+            // velocity going INTO the surface in 3D, allowing natural sliding along it.
+            // The position push-out (resolveCollisions) separately uses horizontal-only
+            // normals for steep surfaces to prevent upward lift.
             float vn = glm::dot(mVelocity, c.normal);
             if (vn >= 0.0f) continue;
 
@@ -162,6 +166,25 @@
             if (mIterContacts.empty())
                 break; // No contacts — done
 
+            // ── Stair stepping (integrated into collision loop) ──
+            // Original Dark Engine calls CheckStep DURING collision resolution.
+            // When a leg-level riser contact is found and stepping succeeds, the
+            // normal bounce response is SKIPPED (early return), then
+            // PostCollisionUpdate re-runs the physics pipeline for remaining time.
+            if (isOnGround()) {
+                // Estimate remaining frame time. Original engine tracks exact
+                // collision time; we approximate with half the fixed timestep
+                // (step likely occurs mid-integration).
+                float remainingDt = mTimestep.fixedDt * 0.5f;
+                bool stepped = tryStairStepFromContacts(mIterContacts, remainingDt);
+                if (stepped) {
+                    // Step succeeded + re-integration done — skip push-out.
+                    // Re-integration already generated fresh contacts in mLastContacts.
+                    // Break out of collision loop (re-integration handled everything).
+                    break;
+                }
+            }
+
             // Push body center out of penetrations. De-duplicate by normal direction (dot > 0.99):
             // keep only max penetration per wall. Without this, 3 spheres hitting one wall would
             // triple the push, causing jittery over-correction.
@@ -169,51 +192,29 @@
             for (const auto &c : mIterContacts) {
                 Vector3 pushNormal = c.normal;
 
-                // For pushable objects, convert upward contacts to horizontal
-                // blocking. Without this, the player climbs onto crates/barrels
-                // because upward push gets suppressed and no horizontal resistance
-                // remains. Instead: redirect the push horizontally away from the
-                // object center, preserving the penetration depth so the player
-                // is pushed back rather than lifted up.
+                // Steep surface handling: surfaces with normal.z > 0 but below
+                // the walkable threshold (45°) act as walls — flatten their push
+                // normal to horizontal. This prevents the player from riding up
+                // steep surfaces using velocity: the position push-out is purely
+                // horizontal, and constrainVelocity() will also see the flattened
+                // normal, removing only horizontal velocity into the wall.
+                // Matches original Dark Engine behavior where steep surfaces
+                // triggered sliding, not climbing.
+                if (pushNormal.z > 0.0f && pushNormal.z < WALKABLE_SLOPE_THRESHOLD) {
+                    pushNormal.z = 0.0f;
+                    float len = glm::length(pushNormal);
+                    if (len > 0.001f)
+                        pushNormal /= len;
+                    else
+                        continue;  // nearly vertical — no useful horizontal push
+                }
+
                 if (c.objectId >= 0 && mIsPushableCb && mIsPushableCb(c.objectId)) {
                     static int dbgCount = 0;
                     if (dbgCount++ < 40)
                         std::fprintf(stderr, "[PUSH-COLLIDE] obj=%d n=(%.2f,%.2f,%.2f) pen=%.3f sub=%d\n",
                                      c.objectId, c.normal.x, c.normal.y, c.normal.z,
                                      c.penetration, c.submodelIdx);
-                    if (pushNormal.z > 0.3f) {
-                        // Upward-facing contact (top of crate/barrel) — redirect
-                        // to horizontal push away from the object center.
-                        if (mObjectWorld) {
-                            const auto *body = mObjectWorld->findBodyByObjID(c.objectId);
-                            if (body) {
-                                Vector3 toPlayer = mPosition - body->worldPos;
-                                toPlayer.z = 0.0f;  // horizontal only
-                                float hLen = glm::length(toPlayer);
-                                if (hLen > 0.01f) {
-                                    pushNormal = toPlayer / hLen;
-                                } else {
-                                    // Player directly above object center — push along velocity
-                                    Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
-                                    float vLen = glm::length(hVel);
-                                    if (vLen > 0.01f)
-                                        pushNormal = -hVel / vLen;  // push back against movement
-                                    else
-                                        continue;  // no useful push direction
-                                }
-                            } else {
-                                pushNormal.z = 0.0f;
-                                float len = glm::length(pushNormal);
-                                if (len < 0.001f) continue;
-                                pushNormal /= len;
-                            }
-                        } else {
-                            pushNormal.z = 0.0f;
-                            float len = glm::length(pushNormal);
-                            if (len < 0.001f) continue;
-                            pushNormal /= len;
-                        }
-                    }
                 }
 
                 bool merged = false;

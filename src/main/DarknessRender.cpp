@@ -2604,6 +2604,29 @@ int main(int argc, char *argv[]) {
         objectPushSystem.init(propSvc.get(), state.objectStates,
                               state.physics->getObjectCollisionWorld(), &doorSystem);
         objectPushSystem.autoRegisterPushable();
+
+        // Promote pushable objects to ODE dynamic bodies. ODE handles gravity,
+        // object-object collision, wall collision (via world trimesh), and settling.
+        // This replaces ObjectPushSystem's kinematic Euler integration.
+        {
+            int activated = 0;
+            for (int32_t objID : objectPushSystem.getPushableObjects()) {
+                float mass = objectPushSystem.getMass(objID);
+                float friction = objectPushSystem.getFriction(objID);
+                // Elasticity: low for crates/barrels (0.05), matching original engine's
+                // 0.02 bounce dampening. Slightly higher than zero so objects don't
+                // feel perfectly dead on impact.
+                if (state.physics->makeDynamic(objID, mass, friction, 0.05f))
+                    ++activated;
+            }
+            std::fprintf(stderr, "[ODE] Activated %d/%zu pushable objects as dynamic bodies\n",
+                         activated, objectPushSystem.getPushableObjects().size());
+        }
+
+        // Wire ODE dynamic body check so ObjectPushSystem skips ODE-handled objects
+        objectPushSystem.setHasDynamicBodyCb([&state](int32_t objID) {
+            return state.physics->hasDynamicBody(objID);
+        });
         state.physics->setPushSystem(&objectPushSystem);
 
         // Build frob cache for objects without collision bodies (levers, switches, etc.)

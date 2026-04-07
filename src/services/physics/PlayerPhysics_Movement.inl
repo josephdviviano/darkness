@@ -8,8 +8,14 @@
         if (mCurrentMode == PlayerMode::Climb || mMantling)
             return;
 
+        // Gravity only applies when airborne or during ground grace period.
+        // On ground: floor contacts provide support; no gravity needed.
+        // During grace: gravity pulls naturally (walking off ledge → fall arc).
+        // Slope sliding is handled by the collision system's horizontal-only
+        // push-out for steep surfaces (normal.z flattened to 0) combined with
+        // reduced friction on steep slopes. This approach avoids fighting the
+        // stair stepping system, which needs the player to stay at stepped height.
         if (!isOnGround() || mGroundGraceActive) {
-            // Z-up: gravity pulls downward (uses scaled gravity for per-room variation)
             mVelocity.z -= mGravityMag * mTimestep.fixedDt;
         }
         // Buoyancy: always active when COG is in water, uses raw GRAVITY (not room-scaled).
@@ -83,9 +89,10 @@
     /// slopes). Falls back to mGroundNormal if no contacts (stable standing), then to
     /// WATER_BASE_FRICTION in swim mode. Returns 0 in air.
     inline float computeGroundFriction() const {
-        // Sum friction from all upward-facing contacts. Critical: on 60° slope, single-contact
-        // friction=0.48 (below 0.5 jump gate), but summed ≈1.44 (well above) — player can still
-        // jump on 60° slopes, matching original engine.
+        // Sum friction from all upward-facing contacts. Friction is continuous and
+        // proportional to normal.z (original engine formula: 0.03 * normal.z * 32).
+        // Steep slopes contribute less friction naturally — no hard cutoff needed.
+        // Gravity overcomes friction on slopes steeper than ~45°, causing sliding.
         float totalFriction = 0.0f;
         for (const auto &c : mLastContacts) {
             if (c.normal.z > 0.0f) {
@@ -161,9 +168,11 @@
                 desired -= mGroundNormal * dot;
             }
 
-            // No additional slope penalty — base friction (0.03 * normal.z * gravity) already provides
-            // slope-dependent control. Steeper slopes → lower friction → gravity dominates. Sliding
-            // is emergent from this single formula, not from an explicit threshold.
+            // No hard walkable slope threshold — friction is continuous, proportional
+            // to normal.z (original engine formula: 0.03 * normal.z * 32). Steeper
+            // slopes have less friction, so gravity's slope-parallel component
+            // dominates and sliding emerges naturally. Movement control scales with
+            // friction, so the player has progressively less control on steeper slopes.
 
             // Control rate (mass cancels → exponential convergence). Friction summed across contacts;
             // on flat ground with ~3 contacts: friction ≈ 2.88, rate = capped at 2000.
