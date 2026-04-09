@@ -583,12 +583,32 @@
 
             if (!transitioned) {
                 // Destroy contact — matches original DestroyTerrainContact
-                if (mStepLog && c.submodelIdx == 4 && c.normal.z > GROUND_NORMAL_MIN) {
+                bool wasFoot = (c.submodelIdx == 4 && c.normal.z > GROUND_NORMAL_MIN);
+                if (mStepLog && wasFoot) {
                     std::fprintf(stderr, "[STEP-TRANSITION] contact DESTROYED: "
                         "cell=%d poly=%d (gravity takes over)\n",
                         c.cellIdx, c.polyIdx);
                 }
                 mContacts.erase(mContacts.begin() + ci);
+
+                // LeaveGround (D19): when the last FOOT floor contact is destroyed,
+                // immediately transition to Jump. Original (PHCORE.CPP line 360-361):
+                // if (!pModel->GetFaceContacts(PLAYER_FOOT, &pDummy))
+                //     g_pPlayerMovement->LeaveGround();
+                if (wasFoot && isOnGround()) {
+                    bool hasFootFloor = false;
+                    for (const auto &rc : mContacts) {
+                        if (rc.submodelIdx == 4 && rc.normal.z > GROUND_NORMAL_MIN) {
+                            hasFootFloor = true;
+                            break;
+                        }
+                    }
+                    if (!hasFootFloor) {
+                        mCurrentMode = PlayerMode::Jump;
+                        mGroundGraceTimer = 0.0f;
+                        mGroundGraceActive = false;
+                    }
+                }
             }
         }
     }
