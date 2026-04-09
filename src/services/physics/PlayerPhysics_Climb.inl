@@ -7,7 +7,7 @@
 
     /// Check for climbable OBB contacts and enter climbing mode.
     /// Called from fixedStep() after collision resolution when NOT already climbing.
-    /// Scans mLastContacts for object contacts on climbable OBB faces that the
+    /// Scans mContacts for object contacts on climbable OBB faces that the
     /// player is facing toward (dot(forward, faceNormal) <= 0).
     inline bool checkClimb() {
         if (!mObjectWorld)
@@ -16,7 +16,7 @@
         // Player's facing direction (XY plane)
         Vector3 forward(mCosYaw, mSinYaw, 0.0f);
 
-        for (const auto &c : mLastContacts) {
+        for (const auto &c : mContacts) {
             // Only object contacts (terrain contacts have objectId < 0)
             if (c.objectId < 0 || c.cellIdx != -1)
                 continue;
@@ -126,7 +126,7 @@
         int lastFace = -1;
         int faceCount = 0;
 
-        for (const auto &c : mLastContacts) {
+        for (const auto &c : mContacts) {
             if (c.objectId != mClimbingObjId || c.cellIdx != -1)
                 continue;
 
@@ -158,7 +158,7 @@
         // Adjacent OBB transfer: if we have no contacts on the current climbing
         // object but ARE touching a different climbable OBB, transfer directly.
         if (!hasCurrentContact) {
-            for (const auto &c : mLastContacts) {
+            for (const auto &c : mContacts) {
                 if (c.objectId <= 0 || c.objectId == mClimbingObjId || c.cellIdx != -1)
                     continue;
 

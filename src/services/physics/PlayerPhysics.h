@@ -317,7 +317,7 @@ public:
     const Vector3 &getVelocity() const { return mVelocity; }
 
     /// Last frame's contacts (for push system to inspect object collisions).
-    const std::vector<SphereContact> &getLastContacts() const { return mLastContacts; }
+    const std::vector<SphereContact> &getContacts() const { return mContacts; }
 
     /// Forward direction (X-Y plane, from yaw). Z-up coordinate system.
     Vector3 getForward() const {
@@ -374,7 +374,7 @@ public:
     /// Used by PressurePlateSystem to detect player weight on plates.
     bool isStandingOnObject(int32_t objID) const {
         if (!isOnGround()) return false;
-        for (const auto &c : mLastContacts) {
+        for (const auto &c : mContacts) {
             if (c.objectId == objID && c.normal.z > GROUND_NORMAL_MIN)
                 return true;
         }
@@ -428,7 +428,7 @@ public:
         mCurrentMode = PlayerMode::Jump; // will detect ground on next step
         mGroundGraceTimer = 0.0f;
         mGroundGraceActive = false;
-        mPersistentContacts.clear();
+        mContacts.clear();
 
         // Reset spring state — teleporting should not carry old spring velocity
         // into the new position, which would cause oscillation on arrival.
@@ -615,11 +615,22 @@ private:
 
         // 7. Pre-constrain velocity against known contact surfaces from the
         //    previous frame. This removes velocity going into walls BEFORE
-        //    position integration, so the player slides along surfaces instead
-        //    of moving into them and being pushed back out.
+        //    Matches original flow: ConstrainFromTerrain runs FIRST (validates
+        //    contacts, destroys invalid ones), THEN ApplyConstraints uses the
+        //    validated set to remove velocity into surfaces.
+
+        // 7a. Validate existing contacts — destroys stale/invalid contacts.
+        //     Must run BEFORE constrainVelocity so that wall contacts from the
+        //     previous frame's collision detection are removed before they block
+        //     movement. Matches original ConstrainFromTerrain (phcore.cpp lines
+        //     262-368) which validates contacts before ApplyConstraints.
+        validateContacts();
+
+        // 7b. Pre-constrain velocity against validated contacts.
         constrainVelocity();
 
-        // 8. Integrate position
+        // 8. Integrate position — save old position for swept collision detection
+        mPrevPosition = mPosition;
         integrate();
 
         // 9. Update cell index BEFORE collision — if integration moved
@@ -629,7 +640,7 @@ private:
 
         // 10. Resolve collisions via 5-sphere constraint projection.
         //     Position correction for any remaining penetrations (new contacts,
-        //     cell transitions). Also refreshes mLastContacts for the next
+        //     cell transitions). Merges fresh contacts into mContacts for the next
         //     frame's constrainVelocity() call.
         resolveCollisions(contactCb);
 
@@ -704,6 +715,7 @@ private:
     PhysicsTimestep mTimestep = MODERN;  // active timestep configuration
 
     Vector3 mPosition{0.0f};       // body center position (ground + 4.2 on flat ground)
+    Vector3 mPrevPosition{0.0f};   // position before integration (for swept collision)
     Vector3 mVelocity{0.0f};       // linear velocity
     float mYaw = 0.0f;            // look direction (radians)
     float mCosYaw = 1.0f;         // cached cos(mYaw), updated per step and setYaw()
@@ -742,6 +754,7 @@ private:
 
     // ── Overridable physics parameters (from P$PhysAttr/P$PhysDims or defaults) ──
     float mMass = PLAYER_MASS;
+    float mElasticity = 1.0f;       // model elasticity (default 1.0, from P$PhysAttr)
     float mDensity = 0.9f;          // buoyancy density — 0.9 (positive)
     float mSphereRadii[NUM_SPHERES] = {
         SPHERE_RADIUS, SPHERE_RADIUS, 0.0f, 0.0f, 0.0f
@@ -817,15 +830,14 @@ private:
     int   mLeanDir        = 0;    // lean direction: -1=left, 0=center, +1=right
     float mLeanAmount     = 0.0f; // collision-limited lateral offset (derived from spring each frame)
 
-    // Contacts from last collision resolution (used by detectGround and velocity removal). After
-    // persistence merge, contains fresh (age=0) and maintained (age 1..CONTACT_MAX_AGE) contacts.
-    std::vector<SphereContact> mLastContacts;
-
-    // Persistent contact buffer — survives across frames with aging. Matched by (cellIdx, polyIdx)
-    // identity; stale contacts culled after CONTACT_MAX_AGE frames without re-detection.
-    std::vector<SphereContact> mPersistentContacts;
+    // Live contact list — validated each frame by validateContacts(), new contacts
+    // added during resolveCollisions(). Matches original Dark Engine where contacts
+    // persist in a linked list, validated by ConstrainFromTerrain, destroyed immediately
+    // when invalid. No age-based persistence.
+    std::vector<SphereContact> mContacts;
 
     // Pre-allocated scratch buffers for resolveCollisions() — avoids per-step heap allocs
+    std::vector<SphereContact> mFreshContacts;               // per-frame fresh contact accumulator
     std::vector<SphereContact> mIterContacts;                // per-iteration contact accumulator
     std::vector<std::pair<Vector3, float>> mPushes;          // de-duplicated push normals
 

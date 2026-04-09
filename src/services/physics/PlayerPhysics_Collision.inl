@@ -5,15 +5,25 @@
     /// surfaces and needing to be pushed back out (reduces jitter). The position-correction pass
     /// in resolveCollisions() still runs after integration to handle new contacts.
     inline void constrainVelocity() {
-        if (mLastContacts.empty()) return;
+        if (mContacts.empty()) return;
 
-        // Collect unique constraint normals from previous frame's contacts.
+        if (mStepLog && !mContacts.empty()) {
+            std::fprintf(stderr, "[CONSTRAIN] %zu contacts, vel=(%.2f,%.2f,%.2f)\n",
+                mContacts.size(), mVelocity.x, mVelocity.y, mVelocity.z);
+            for (const auto &c : mContacts) {
+                std::fprintf(stderr, "[CONSTRAIN]   sub=%d n=(%.2f,%.2f,%.2f) cell=%d poly=%d fresh=%d\n",
+                    c.submodelIdx, c.normal.x, c.normal.y, c.normal.z,
+                    c.cellIdx, c.polyIdx, c.fresh);
+            }
+        }
+
+        // Collect unique constraint normals from validated contacts.
         // Bounded by de-duplication — at most ~5 unique wall directions.
         static constexpr int MAX_CONSTRAINTS = 8;
         Vector3 constraintBuf[MAX_CONSTRAINTS];
         int constraintCount = 0;
 
-        for (const auto &c : mLastContacts) {
+        for (const auto &c : mContacts) {
             // Use FULL normals for velocity constraints (matches original engine's
             // AddConstraint which stores the unmodified surface normal). This removes
             // velocity going INTO the surface in 3D, allowing natural sliding along it.
@@ -79,12 +89,13 @@
         // HEAD/BODY offsets are pose-driven (mPoseCurrent.z, mBodyPoseCurrent.z) for smooth
         // collision sphere transitions during crouch/uncrouch.
 
-        // Age persistent contacts — re-detected ones get age reset to 0.
-        for (auto &c : mPersistentContacts)
-            c.age++;
-
-        mLastContacts.clear();
-        mLastContacts.reserve(16);
+        // Fresh contacts from this frame's collision detection are accumulated in
+        // mFreshContacts. After collision resolution, they're merged into mContacts
+        // (deduplicated by cellIdx+polyIdx). No persistence aging — matches original
+        // Dark Engine where contacts are validated each frame by ConstrainFromTerrain
+        // and destroyed immediately when invalid.
+        mFreshContacts.clear();
+        mFreshContacts.reserve(16);
 
         for (int iter = 0; iter < mTimestep.collisionIters; ++iter) {
             if (mCellIdx < 0)
@@ -101,40 +112,110 @@
                 else if (s == 1) poseOffsetZ = mBodyPoseCurrent.z; // BODY
                 float offsetZ = mSphereOffsetsBase[s] + poseOffsetZ;
                 Vector3 sphereCenter = mPosition + Vector3(0.0f, 0.0f, offsetZ);
+                Vector3 oldSphereCenter = mPrevPosition + Vector3(0.0f, 0.0f, offsetZ);
 
                 // Track contact count to tag new contacts with submodel index.
                 size_t contactsBefore = mIterContacts.size();
 
-                // Test against the body center's cell
-                mCollision.sphereVsCellPolygons(
-                    sphereCenter, sphereR, mCellIdx, mIterContacts);
+                // ── Collision dispatch by submodel type ──
+                // Matches original Dark Engine (PHMODSPH.CPP lines 132-282):
+                // - Sphere submodels (HEAD/BODY, radius > 0): SphrSpherecastStatic
+                //   (swept sphere from old→new + static overlap)
+                // - Point submodels (SHIN/KNEE/FOOT, radius = 0): PortalRaycast
+                //   (line-segment raycast from old→new position)
+                //
+                // The original's point submodel collision (PHMODSPH.CPP line 174-240)
+                // uses PortalRaycast to detect polygon crossings. On hit, it creates
+                // a kPC_TerrainFace collision event with the crossing time. This is how
+                // stair riser contacts are detected for CheckStep triggering.
 
-                // Test the submodel's own cell if it differs from body center's cell
-                // (handles straddling portal boundaries, e.g. feet in one cell, head in another)
-                int32_t sphereCell = mCollision.findCell(sphereCenter);
-                if (sphereCell >= 0 && sphereCell != mCellIdx) {
+                if (sphereR > 0.001f) {
+                    // ── Sphere path (HEAD/BODY): static + swept sphere tests ──
+
+                    // Static test at new position
                     mCollision.sphereVsCellPolygons(
-                        sphereCenter, sphereR, sphereCell, mIterContacts);
-                }
+                        sphereCenter, sphereR, mCellIdx, mIterContacts);
 
-                // Test adjacent cells via portals. For point detectors (r=0), use
-                // POINT_PORTAL_REACH to avoid missing floor contacts near portal boundaries.
-                constexpr float POINT_PORTAL_REACH = 0.5f;
-                float portalReach = (sphereR > 0.001f) ? sphereR : POINT_PORTAL_REACH;
-                const auto &cell = mCollision.getWR().cells[mCellIdx];
-                int numSolid = cell.numPolygons - cell.numPortals;
-                for (int pi = numSolid; pi < cell.numPolygons; ++pi) {
-                    const auto &poly = cell.polygons[pi];
-                    if (poly.count < 3) continue;
-                    const auto &plane = cell.planes[poly.plane];
-                    float dist = plane.getDistance(sphereCenter);
-                    if (dist < portalReach) {
-                        int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
-                        if (tgtCell >= 0 && tgtCell != mCellIdx && tgtCell != sphereCell
-                            && tgtCell < static_cast<int32_t>(mCollision.getWR().numCells)) {
-                            mCollision.sphereVsCellPolygons(
-                                sphereCenter, sphereR, tgtCell, mIterContacts);
+                    int32_t sphereCell = mCollision.findCell(sphereCenter);
+                    if (sphereCell >= 0 && sphereCell != mCellIdx) {
+                        mCollision.sphereVsCellPolygons(
+                            sphereCenter, sphereR, sphereCell, mIterContacts);
+                    }
+
+                    // Portal adjacency
+                    int32_t portalBaseCell = (sphereCell >= 0) ? sphereCell : mCellIdx;
+                    if (portalBaseCell >= 0 && portalBaseCell < static_cast<int32_t>(mCollision.getWR().numCells)) {
+                        const auto &portalCell = mCollision.getWR().cells[portalBaseCell];
+                        int numSolidPortal = portalCell.numPolygons - portalCell.numPortals;
+                        for (int pi = numSolidPortal; pi < portalCell.numPolygons; ++pi) {
+                            const auto &poly = portalCell.polygons[pi];
+                            if (poly.count < 3) continue;
+                            const auto &plane = portalCell.planes[poly.plane];
+                            float dist = plane.getDistance(sphereCenter);
+                            if (dist < sphereR) {
+                                int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
+                                if (tgtCell >= 0 && tgtCell != mCellIdx && tgtCell != sphereCell
+                                    && tgtCell != portalBaseCell
+                                    && tgtCell < static_cast<int32_t>(mCollision.getWR().numCells)) {
+                                    mCollision.sphereVsCellPolygons(
+                                        sphereCenter, sphereR, tgtCell, mIterContacts);
+                                }
+                            }
                         }
+                    }
+
+                    // Swept sphere from old→new
+                    int32_t oldSphereCell = mCollision.findCell(oldSphereCenter);
+                    mCollision.sweptSphereVsCellPolygons(
+                        oldSphereCenter, sphereCenter, sphereR, mCellIdx, mIterContacts);
+                    if (sphereCell >= 0 && sphereCell != mCellIdx)
+                        mCollision.sweptSphereVsCellPolygons(
+                            oldSphereCenter, sphereCenter, sphereR, sphereCell, mIterContacts);
+                    if (oldSphereCell >= 0 && oldSphereCell != mCellIdx && oldSphereCell != sphereCell)
+                        mCollision.sweptSphereVsCellPolygons(
+                            oldSphereCenter, sphereCenter, sphereR, oldSphereCell, mIterContacts);
+                    if (portalBaseCell >= 0 && portalBaseCell < static_cast<int32_t>(mCollision.getWR().numCells)) {
+                        const auto &portalCell = mCollision.getWR().cells[portalBaseCell];
+                        int numSolidPortal = portalCell.numPolygons - portalCell.numPortals;
+                        for (int pi = numSolidPortal; pi < portalCell.numPolygons; ++pi) {
+                            const auto &poly = portalCell.polygons[pi];
+                            if (poly.count < 3) continue;
+                            int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
+                            if (tgtCell >= 0 && tgtCell != mCellIdx && tgtCell != sphereCell
+                                && tgtCell != oldSphereCell && tgtCell != portalBaseCell
+                                && tgtCell < static_cast<int32_t>(mCollision.getWR().numCells)) {
+                                mCollision.sweptSphereVsCellPolygons(
+                                    oldSphereCenter, sphereCenter, sphereR, tgtCell, mIterContacts);
+                            }
+                        }
+                    }
+
+                } else {
+                    // ── Point path (SHIN/KNEE/FOOT): PortalRaycast ──
+                    // Matches original PHMODSPH.CPP lines 174-240: point-type submodels
+                    // use PortalRaycast (line-segment old→new) instead of sphere sweep.
+                    // On hit, creates a kPC_TerrainFace collision with crossing time.
+                    // This is how stair riser contacts are generated for CheckStep.
+                    RayHit pointHit;
+                    if (raycastWorld(mCollision.getWR(), oldSphereCenter, sphereCenter, pointHit)) {
+                        // Compute parametric collision time [0,1]
+                        Vector3 delta = sphereCenter - oldSphereCenter;
+                        float rayLen = glm::length(delta);
+                        float hitTime = (rayLen > 1e-6f) ? pointHit.distance / rayLen : 0.5f;
+                        hitTime = std::clamp(hitTime, 0.0f, 1.0f);
+
+                        SphereContact contact;
+                        contact.normal = pointHit.normal;
+                        // Penetration = how far past the surface the endpoint is.
+                        // For a raycast hit, compute distance from endpoint to hit plane.
+                        float endDist = glm::dot(pointHit.normal, sphereCenter - pointHit.point);
+                        contact.penetration = std::max(-endDist, 0.0f);
+                        contact.cellIdx = pointHit.cellIdx >= 0 ? pointHit.cellIdx : mCellIdx;
+                        contact.polyIdx = pointHit.polyIdx;
+                        contact.textureIdx = pointHit.textureIndex;
+                        contact.time = hitTime;
+                        contact.isEdge = false;  // face contact (kPC_TerrainFace)
+                        mIterContacts.push_back(contact);
                     }
                 }
 
@@ -166,22 +247,130 @@
             if (mIterContacts.empty())
                 break; // No contacts — done
 
-            // ── Stair stepping (integrated into collision loop) ──
-            // Original Dark Engine calls CheckStep DURING collision resolution.
-            // When a leg-level riser contact is found and stepping succeeds, the
-            // normal bounce response is SKIPPED (early return), then
-            // PostCollisionUpdate re-runs the physics pipeline for remaining time.
-            if (isOnGround()) {
-                // Estimate remaining frame time. Original engine tracks exact
-                // collision time; we approximate with half the fixed timestep
-                // (step likely occurs mid-integration).
-                float remainingDt = mTimestep.fixedDt * 0.5f;
-                bool stepped = tryStairStepFromContacts(mIterContacts, remainingDt);
-                if (stepped) {
-                    // Step succeeded + re-integration done — skip push-out.
-                    // Re-integration already generated fresh contacts in mLastContacts.
-                    // Break out of collision loop (re-integration handled everything).
-                    break;
+            // ── Stair stepping via time-ordered collision processing ──
+            // Matches original Dark Engine: ResolveCollisions (phcore.cpp lines 6276-6305)
+            // finds the earliest collision, calls IntegrateToCollision to back up the
+            // model to the collision point (90% along trajectory), then CheckStep.
+            //
+            // Find the earliest leg-level riser contact with a valid collision time.
+            // The swept test stores time ∈ [0,1] for contacts detected during the
+            // sweep from mPrevPosition → mPosition.
+            {   // No ground-state prerequisite for stair stepping — match original
+                // engine (phcore.cpp line 6134). Original checks ONLY: terrain face,
+                // steep normal (fabs(z) < 0.4), leg submodel (foot/shin/knee).
+                // NO isOnGround() guard. CheckStep's own validation (3-phase raycast
+                // + BODY sphere check) rejects invalid steps.
+
+                // ── Diagnostic: dump all 5 submodel positions, velocity, contacts ──
+                if (mStepLog) {
+                    static const char *subNames[NUM_SPHERES] = {"HEAD", "BODY", "SHIN", "KNEE", "FOOT"};
+                    std::fprintf(stderr, "[STEP-DIAG] === Frame iter=%d contacts=%zu ===\n",
+                        iter, mIterContacts.size());
+                    std::fprintf(stderr, "[STEP-DIAG] prevPos=(%.3f,%.3f,%.3f) pos=(%.3f,%.3f,%.3f)\n",
+                        mPrevPosition.x, mPrevPosition.y, mPrevPosition.z,
+                        mPosition.x, mPosition.y, mPosition.z);
+                    std::fprintf(stderr, "[STEP-DIAG] vel=(%.3f,%.3f,%.3f)\n",
+                        mVelocity.x, mVelocity.y, mVelocity.z);
+                    for (int si = 0; si < NUM_SPHERES; ++si) {
+                        float poz = 0.0f;
+                        if (si == 0) poz = mPoseCurrent.z;
+                        else if (si == 1) poz = mBodyPoseCurrent.z;
+                        float offZ = mSphereOffsetsBase[si] + poz;
+                        Vector3 sc = mPosition + Vector3(0.0f, 0.0f, offZ);
+                        std::fprintf(stderr, "[STEP-DIAG]   %s[%d] r=%.1f absPos=(%.3f,%.3f,%.3f)\n",
+                            subNames[si], si, mSphereRadii[si], sc.x, sc.y, sc.z);
+                    }
+                    // Contact summary
+                    int floorCt = 0, wallCt = 0, sweptCt = 0;
+                    for (const auto &cc : mIterContacts) {
+                        if (cc.time >= 0.0f) sweptCt++;
+                        else if (std::fabs(cc.normal.z) >= STEP_WALL_THRESHOLD) floorCt++;
+                        else wallCt++;
+                    }
+                    std::fprintf(stderr, "[STEP-DIAG] contacts: floor=%d wall=%d swept=%d\n",
+                        floorCt, wallCt, sweptCt);
+                    // Each riser candidate
+                    for (int ci = 0; ci < static_cast<int>(mIterContacts.size()); ++ci) {
+                        const auto &cc = mIterContacts[ci];
+                        if (cc.submodelIdx < 2) continue;
+                        if (std::fabs(cc.normal.z) >= STEP_WALL_THRESHOLD) continue;
+                        std::fprintf(stderr, "[STEP-DIAG]   riser[%d] sub=%d n=(%.3f,%.3f,%.3f) "
+                            "pen=%.3f t=%.3f edge=%d obj=%d\n",
+                            ci, cc.submodelIdx, cc.normal.x, cc.normal.y, cc.normal.z,
+                            cc.penetration, cc.time, cc.isEdge, cc.objectId);
+                    }
+                }
+
+                float earliestTime = 2.0f;  // > 1.0 = no valid swept contact found
+                int bestContactIdx = -1;
+                for (int ci = 0; ci < static_cast<int>(mIterContacts.size()); ++ci) {
+                    const auto &c = mIterContacts[ci];
+                    if (c.submodelIdx < 2) continue;          // only SHIN/KNEE/FOOT
+                    if (std::fabs(c.normal.z) >= STEP_WALL_THRESHOLD) continue;
+                    if (c.isEdge) continue;  // face contacts only (kPC_TerrainFace)
+                    // Prefer swept contacts (time >= 0) — they have accurate timing.
+                    // Static contacts (time < 0) use fallback timing.
+                    float t = c.time;
+                    if (t < 0.0f) t = 0.5f;  // static contact: estimate mid-frame
+                    if (t < earliestTime) {
+                        earliestTime = t;
+                        bestContactIdx = ci;
+                    }
+                }
+
+                if (bestContactIdx >= 0) {
+                    // Compute remaining frame time from collision time.
+                    // Original: PostCollisionUpdate receives dt - pClsn->GetTime()
+                    // (phcore.cpp line 6143).
+                    float collisionTimeFrac = std::clamp(earliestTime, 0.0f, 1.0f);
+                    float remainingDt = mTimestep.fixedDt * (1.0f - collisionTimeFrac);
+                    remainingDt = std::max(remainingDt, 0.0001f);
+
+                    // IntegrateToCollision: back up model to the collision point along
+                    // the trajectory. Matches phcore.cpp lines 5120-5121:
+                    //   new_pos = old_pos + velocity * (collision_time * kPartialBackupAmt)
+                    // where kPartialBackupAmt = 0.9 (90% of collision distance).
+                    Vector3 backupPos = mPrevPosition + mVelocity *
+                        (collisionTimeFrac * mTimestep.fixedDt * kPartialBackupAmt);
+
+                    bool stepped = tryStairStepFromContacts(mIterContacts, remainingDt, backupPos);
+                    if (stepped) {
+                        // Step succeeded + re-integration done — skip push-out.
+                        // Matches original: PostCollisionUpdate called, collision consumed.
+                        break;
+                    }
+
+                    // ResolveBounce: when CheckStep fails, reflect velocity off the riser.
+                    // Matches original Dark Engine BounceObject (phcore.cpp lines 4232-4246):
+                    // dp = dot(velocity, normal); if (dp < 0) velocity -= normal * dp * (1 + dampen)
+                    // dampen = model_elasticity * kTerrainBounce (0.1). For player with
+                    // default elasticity 1.0: dampen = 0.1 (10% energy return).
+                    if (bestContactIdx >= 0) {
+                        const auto &riserContact = mIterContacts[bestContactIdx];
+                        float dp = glm::dot(mVelocity, riserContact.normal);
+                        if (dp < 0.0f) {
+                            float dampen = mElasticity * kTerrainBounce;
+                            mVelocity -= riserContact.normal * dp * (1.0f + dampen);
+                            if (mStepLog) {
+                                std::fprintf(stderr, "[STEP] BOUNCE: dp=%.3f n=(%.2f,%.2f,%.2f) "
+                                    "dampen=%.2f vel->(%.2f,%.2f,%.2f)\n",
+                                    dp, riserContact.normal.x, riserContact.normal.y, riserContact.normal.z,
+                                    dampen, mVelocity.x, mVelocity.y, mVelocity.z);
+                            }
+                        }
+
+                        // PostCollisionUpdate: original engine re-runs the full physics
+                        // pipeline after ResolveBounce, even on CheckStep FAILURE
+                        // (phcore.cpp lines 6254-6260). Without this, the bounce zeros
+                        // velocity and the player sits motionless until the next frame.
+                        // With this, input + gravity + integration are re-applied for
+                        // the remaining frame time, so the player slides along the wall
+                        // immediately.
+                        if (remainingDt > 0.0001f) {
+                            postStepReIntegrate(remainingDt);
+                        }
+                        break;  // collision consumed by bounce + re-integration
+                    }
                 }
             }
 
@@ -234,9 +423,9 @@
                 mPosition += p.first * p.second;
             }
 
-            // Accumulate contacts for ground detection and velocity removal
-            mLastContacts.insert(mLastContacts.end(),
-                                 mIterContacts.begin(), mIterContacts.end());
+            // Accumulate fresh contacts for later merge into mContacts
+            mFreshContacts.insert(mFreshContacts.end(),
+                                  mIterContacts.begin(), mIterContacts.end());
 
             // Push may have moved through a portal — update cell.
             // Use portal-based tracking (not brute-force) to avoid jumping to
@@ -291,60 +480,50 @@
             mCellIdx = origCell;
         }
 
-        // ── Contact persistence: merge new contacts into persistent set ──
-        // Match by (cellIdx, polyIdx). Matched: age reset + data refreshed. Unmatched: added.
-        // Stale (age > CONTACT_MAX_AGE): culled.
-        for (const auto &nc : mLastContacts) {
+        // ── Merge fresh contacts into mContacts ──
+        // Matches original Dark Engine: contacts are created during collision
+        // resolution (CheckTerrainContact, phcore.cpp lines 4305-4378) and
+        // persist until explicitly destroyed by ConstrainFromTerrain validation.
+        // No age-based persistence — contacts are validated each frame.
+        //
+        // Deduplicate by (cellIdx, polyIdx): if a fresh contact matches an
+        // existing validated contact, refresh the data. Otherwise add it.
+        for (auto &nc : mFreshContacts) {
             bool matched = false;
-            for (auto &pc : mPersistentContacts) {
-                if (pc.cellIdx == nc.cellIdx && pc.polyIdx == nc.polyIdx) {
+            for (auto &ec : mContacts) {
+                if (ec.cellIdx == nc.cellIdx && ec.polyIdx == nc.polyIdx) {
                     // Same polygon — refresh with latest detection data
-                    pc.normal = nc.normal;
-                    pc.penetration = nc.penetration;
-                    pc.textureIdx = nc.textureIdx;
-                    pc.age = 0;
+                    ec.normal = nc.normal;
+                    ec.penetration = nc.penetration;
+                    ec.textureIdx = nc.textureIdx;
+                    ec.fresh = true;
                     matched = true;
                     break;
                 }
             }
             if (!matched) {
-                SphereContact pc = nc;
-                pc.age = 0;
-                mPersistentContacts.push_back(pc);
+                nc.fresh = true;
+                mContacts.push_back(nc);
 
                 // ── Damped bounce on first object OBB contact ──
-                // Small elastic bounce (0.02 scale) — nearly imperceptible but makes objects feel
-                // slightly elastic vs perfectly rigid. WR contacts (cellIdx >= 0) have no bounce.
-                // ODE UPGRADE: replaced by dContact.surface.bounce = 0.02.
+                // Small elastic bounce (0.02 scale) — nearly imperceptible but makes
+                // objects feel slightly elastic vs perfectly rigid. WR contacts
+                // (cellIdx >= 0) have no bounce.
                 if (nc.cellIdx == -1) {
                     float dp = glm::dot(mVelocity, nc.normal);
                     if (dp < 0.0f) {
-                        // Remove normal component (dp < 0 = into surface) and
-                        // reflect 2% back out. Factor = 1.0 (zero) + 0.02 (bounce).
-                        constexpr float kBounceScale = 0.02f;  // matches kOBBBounceScale
+                        constexpr float kBounceScale = 0.02f;
                         mVelocity -= nc.normal * dp * (1.0f + kBounceScale);
                     }
                 }
             }
         }
 
-        // Cull stale contacts not re-detected within the persistence window
-        mPersistentContacts.erase(
-            std::remove_if(mPersistentContacts.begin(), mPersistentContacts.end(),
-                           [](const SphereContact &c) {
-                               return c.age > CONTACT_MAX_AGE;
-                           }),
-            mPersistentContacts.end());
-
-        // Replace transient mLastContacts with persistent set (fresh + maintained contacts) for
-        // all downstream consumers (detectGround, computeGroundFriction, constrainVelocity).
-        mLastContacts = mPersistentContacts;
-
-        // Fire contact callbacks for downstream consumers (audio, AI, scripts). Only fire for
-        // fresh contacts (age=0) to prevent duplicates. Contact point is approximate (HEAD radius).
+        // Fire contact callbacks for newly-detected contacts only.
+        // Matches original: contact events fire on creation, not maintenance.
         if (contactCb) {
-            for (const auto &c : mLastContacts) {
-                if (c.age > 0) continue;  // skip persistent-only contacts
+            for (const auto &c : mContacts) {
+                if (!c.fresh) continue;  // skip maintained contacts
                 ContactEvent event;
                 event.bodyA = -1; // player entity (archetype ID, placeholder)
                 event.bodyB = 0;  // world geometry

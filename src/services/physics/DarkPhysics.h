@@ -102,7 +102,7 @@ public:
         // the ODE step so forces take effect this frame (not next frame).
         // Uses the pre-collision velocity (post-collision has wall component removed).
         if (mPushSystem) {
-            const auto &contacts = mPlayer.getLastContacts();
+            const auto &contacts = mPlayer.getContacts();
             for (const auto &c : contacts) {
                 if (c.objectId < 0) continue;  // terrain contact
                 if (!mPushSystem->isPushable(c.objectId)) continue;

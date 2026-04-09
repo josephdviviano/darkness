@@ -83,6 +83,8 @@ struct RayHit {
     float distance;
     EntityID hitEntity; // 0 if world geometry hit
     int32_t textureIndex = -1; // WR polygon texture index (-1 = unknown/no texture)
+    int32_t cellIdx = -1;      // WR cell where hit occurred (-1 = unknown)
+    int32_t polyIdx = -1;      // WR polygon index within cell (-1 = unknown)
 };
 
 /// Axis-aligned bounding box.

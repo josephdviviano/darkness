@@ -157,11 +157,6 @@ static constexpr float JUMP_MIN_FRICTION = 0.5f;
 // travel 0.1 units (contact break distance): t = sqrt(2 * 0.1 / 32) ≈ 0.079s.
 static constexpr float GROUND_GRACE_DURATION = 0.08f;
 
-// Contact persistence — breaks terrain contacts at 0.1 units separation or 5.0 u/s relative
-// velocity. This age-based system complements the grace period for all contacts (walls,
-// ceilings, etc.). Contacts not re-detected within CONTACT_MAX_AGE frames are culled.
-static constexpr int CONTACT_MAX_AGE = 3;
-
 // Collision iteration count — per-preset via PhysicsTimestep.collisionIters. Vintage (12.5Hz): 3
 // iterations. Modern/Ultra: 1 iteration (higher Hz compensates with more steps/sec).
 
@@ -176,6 +171,7 @@ static constexpr float STEP_FWD_SCALE      = 0.01f;  // forward probe = velocity
 static constexpr float STEP_UP_EPSILON     = 0.01f;  // UP ray start offset above foot (collision skin)
 static constexpr float STEP_MIN_ZDELTA     = 0.3f;   // minimum lift height (units)
 static constexpr float STEP_CLEARANCE      = 0.02f;  // additional clearance above step surface
+static constexpr float STEP_VALIDATE_EPS   = 0.001f; // validation penetration tolerance (matches SPHR_EPSILON)
 
 static constexpr float LANDING_MIN_VEL  = 2.0f;    // minimum downward speed for landing pose
 static constexpr float LANDING_MIN_TIME = 0.2f;    // minimum 200ms between landing events
