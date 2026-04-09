@@ -70,7 +70,7 @@ struct SphereContact {
     int32_t cellIdx;       // which cell the contact polygon belongs to
     int32_t polyIdx;       // polygon index within that cell
     int32_t textureIdx;    // texture index (-1 if untextured)
-    uint8_t age = 0;       // frames since last detection (0 = just detected this frame)
+    bool fresh = false;    // true = newly detected this frame (for callback filtering)
     int8_t submodelIdx = -1; // which player submodel generated this contact (0-4, -1=unknown)
     int32_t objectId = -1; // object ID for object contacts (-1 = terrain contact).
                            // Set during testPlayerSpheres() for player-vs-object collisions.
@@ -80,6 +80,10 @@ struct SphereContact {
                            // The original engine classifies contacts as TerrainFace,
                            // TerrainEdge, or TerrainVertex. Only TerrainFace triggers
                            // stair stepping (CheckStep uses == kPC_TerrainFace).
+    float time = -1.0f;   // collision time along the sweep [0,1], or -1 for static contacts.
+                           // Matches original engine's sSphrContact.time (sphrcst.cpp).
+                           // 0 = contact at sweep start, 1 = contact at sweep end.
+                           // Used for time-ordered collision processing.
 };
 
 /// Collision geometry wrapper over WR parsed data.
@@ -272,6 +276,98 @@ public:
         }
 
         return found;
+    }
+
+    /// Swept sphere/point collision detection — matches the original Dark Engine's
+    /// SphrSpherecastStatic. Tests a sphere moving from oldCenter to newCenter against
+    /// solid polygons in the given cell. Detects contacts that the static test
+    /// (sphereVsCellPolygons) misses when the sphere passes completely through thin
+    /// geometry during a single frame (e.g. stair risers, thin walls).
+    ///
+    /// For each solid polygon, computes whether the sphere crossed from outside to
+    /// inside the plane during the sweep. If so, interpolates the crossing point and
+    /// tests polygon containment. Contacts are appended with penetration computed at
+    /// the NEW position (for push-out compatibility).
+    ///
+    /// This function only generates contacts for crossings that the static test would
+    /// MISS (sphere was outside at start and either inside or past at end, but the
+    /// static test rejected it because d_end < -maxBehind). The static test should
+    /// still be called for normal overlapping contacts.
+    inline void sweptSphereVsCellPolygons(
+        const Vector3 &oldCenter, const Vector3 &newCenter, float radius,
+        int32_t cellIdx, std::vector<SphereContact> &outContacts) const
+    {
+        if (cellIdx < 0 || cellIdx >= static_cast<int32_t>(mWR.numCells))
+            return;
+
+        const auto &cell = mWR.cells[cellIdx];
+        int numSolid = cell.numPolygons - cell.numPortals;
+
+        for (int pi = 0; pi < numSolid; ++pi) {
+            const auto &poly = cell.polygons[pi];
+            if (poly.count < 3)
+                continue;
+
+            const auto &plane = cell.planes[poly.plane];
+
+            // Signed distances from plane to sphere surface (center minus radius)
+            float dStart = plane.getDistance(oldCenter);
+            float dEnd   = plane.getDistance(newCenter);
+
+            // Crossing detection: sphere was outside at start and inside at end.
+            // Original engine's RegisterContact (sphrcst.cpp lines 462-493) has NO
+            // filter on end-position penetration depth — ALL plane crossings with
+            // valid time [0,1] generate contacts. We match this: generate contacts
+            // for any crossing where dStart >= radius (outside) and dEnd < radius
+            // (crossed in). Duplicate contacts with the static test are harmless
+            // (merged by push-out dedup in resolveCollisions).
+            constexpr float POINT_MAX_PENETRATION = 0.5f;
+            float maxBehind = (radius > 0.001f) ? radius : POINT_MAX_PENETRATION;
+
+            if (dStart < radius)
+                continue;  // was already inside at start — static test handles
+            if (dEnd >= radius)
+                continue;  // still outside at end — no contact
+
+            // Sweep crossing detected: sphere went from outside to past the wall.
+            // Compute the parametric crossing time.
+            float denom = dStart - dEnd;
+            if (denom < 1e-7f)
+                continue;
+            float t = (dStart - radius) / denom;
+            if (t < 0.0f || t > 1.0f)
+                continue;
+
+            // Interpolate sphere center at crossing time
+            Vector3 crossCenter = oldCenter + (newCenter - oldCenter) * t;
+
+            // Project crossing center onto the polygon plane
+            float crossDist = plane.getDistance(crossCenter);
+            Vector3 projected = crossCenter - plane.normal * crossDist;
+
+            // Test if projected point is inside the polygon
+            Vector3 windNormal(-plane.normal.x, -plane.normal.y, -plane.normal.z);
+            if (!pointInConvexPolygon(projected, cell.vertices,
+                                       cell.polyIndices[pi], windNormal))
+                continue;
+
+            // Generate contact with collision time and end-position penetration.
+            // Original engine stores contact time (sSphrContact.time) and backs up
+            // to the collision point — no inflated penetration needed.
+            SphereContact contact;
+            contact.normal = plane.normal;
+            contact.penetration = radius - dEnd;  // actual penetration at end position
+            contact.time = t;                     // normalized collision time [0,1]
+            contact.cellIdx = cellIdx;
+            contact.polyIdx = pi;
+
+            if (pi < static_cast<int>(cell.numTextured))
+                contact.textureIdx = static_cast<int32_t>(cell.texturing[pi].txt);
+            else
+                contact.textureIdx = -1;
+
+            outContacts.push_back(contact);
+        }
     }
 
     /// Access the underlying WR data (for raycast delegation, etc.)

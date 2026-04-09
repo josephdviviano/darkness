@@ -78,6 +78,15 @@ inline uint8_t getCameraMediaType(const WRParsedData &wr,
 // Test if a point (assumed to lie on the polygon's plane) is inside a convex polygon.
 // Uses the winding/cross-product method: the point must be on the interior side of
 // every edge when traversed in order, relative to the polygon's plane normal.
+//
+// Epsilon tolerance matches the original Dark Engine's HULL_TEST_EPSILON (0.00025),
+// scaled by edge L1-norm (Manhattan distance) to match the original's 2D projected
+// hull test. The original projects onto the dominant axis plane and computes a 2D
+// perpendicular-edge dot product, scaling epsilon by (|perpEdge.x| + |perpEdge.y|).
+// Our 3D equivalent scales by the L1-norm of the edge vector, which gives comparable
+// magnitude for edges in the dominant plane.
+static constexpr float PIP_EPSILON = 0.00025f;
+
 inline bool pointInConvexPolygon(const Vector3 &p,
                                  const std::vector<Vector3> &verts,
                                  const std::vector<uint8_t> &indices,
@@ -91,7 +100,11 @@ inline bool pointInConvexPolygon(const Vector3 &p,
         Vector3 edge = b - a;
         Vector3 toP  = p - a;
         Vector3 cross = glm::cross(edge, toP);
-        if (glm::dot(cross, normal) < 0.0f)
+        float dot = glm::dot(cross, normal);
+        // Scale epsilon by L1-norm of the edge vector, matching the original engine's
+        // scaling by Manhattan distance of the 2D perpendicular edge.
+        float edgeL1 = std::fabs(edge.x) + std::fabs(edge.y) + std::fabs(edge.z);
+        if (dot < -PIP_EPSILON * edgeL1)
             return false;
     }
     return true;

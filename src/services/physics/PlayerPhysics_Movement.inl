@@ -1,23 +1,24 @@
 // Included inside PlayerPhysics class body — do not include standalone.
 
-    /// Apply gravity to velocity. During ground grace period, player stays in ground mode for
-    /// friction/stride but gravity still applies — walking off a ledge transitions naturally
-    /// into a fall instead of hovering for the grace duration.
+    /// Apply gravity to velocity. Matches original engine's UpdateModelTransDynamics
+    /// (phcore.cpp lines 1417-1421) which applies gravity EVERY frame unconditionally
+    /// (except climbing/mantling). Floor contacts remove the downward component via
+    /// constrainVelocity() (matching original's ApplyConstraints at line 1861).
+    /// The downward velocity component during the frame is essential for swept collision
+    /// to detect stair risers below the foot — without it, the swept path is purely
+    /// horizontal and misses the riser wall.
     inline void applyGravity() {
         // No gravity while climbing or mantling. Climbing friction handles wall traction instead.
         if (mCurrentMode == PlayerMode::Climb || mMantling)
             return;
 
-        // Gravity only applies when airborne or during ground grace period.
-        // On ground: floor contacts provide support; no gravity needed.
-        // During grace: gravity pulls naturally (walking off ledge → fall arc).
-        // Slope sliding is handled by the collision system's horizontal-only
-        // push-out for steep surfaces (normal.z flattened to 0) combined with
-        // reduced friction on steep slopes. This approach avoids fighting the
-        // stair stepping system, which needs the player to stay at stepped height.
-        if (!isOnGround() || mGroundGraceActive) {
-            mVelocity.z -= mGravityMag * mTimestep.fixedDt;
-        }
+        // Gravity applied every frame — matches original (phcore.cpp lines 1417-1421).
+        // On ground: constrainVelocity() removes the downward component against floor
+        // contacts (matching original's PhysRemNormComp at phutils.cpp line 117).
+        // The brief presence of downward velocity before constraint removal ensures
+        // the swept collision path has a downward component, which is essential for
+        // detecting stair risers when walking off tread edges.
+        mVelocity.z -= mGravityMag * mTimestep.fixedDt;
         // Buoyancy: always active when COG is in water, uses raw GRAVITY (not room-scaled).
         // With density=0.9: buoyancy=32/0.9=35.6 > gravity=32 → player floats up.
         if (isInWater()) {
@@ -94,7 +95,7 @@
         // Steep slopes contribute less friction naturally — no hard cutoff needed.
         // Gravity overcomes friction on slopes steeper than ~45°, causing sliding.
         float totalFriction = 0.0f;
-        for (const auto &c : mLastContacts) {
+        for (const auto &c : mContacts) {
             if (c.normal.z > 0.0f) {
                 float terrainScale = getTerrainFriction(c.textureIdx);
                 totalFriction += FRICTION_FACTOR * terrainScale * c.normal.z * mGravityMag;
@@ -114,7 +115,7 @@
         float maxFriction = FRICTION_FACTOR * mGravityMag;
         if (totalFriction < maxFriction) {
             float climbFactor = 0.0f;
-            for (const auto &c : mLastContacts) {
+            for (const auto &c : mContacts) {
                 if (c.normal.z > 0.0f)
                     climbFactor = std::max(climbFactor, getTerrainClimbability(c.textureIdx));
             }
@@ -340,7 +341,229 @@
         }
     }
 
-    /// Integrate position from velocity
+    /// Direct contact transition — maintains foot-ground contact when the foot
+    /// slides off one polygon onto an adjacent one. Matches original Dark Engine
+    /// ConstrainFromTerrain (phcore.cpp lines 262-368).
+    ///
+    /// When the foot has a floor contact from the previous frame, check if the foot
+    /// is still on that polygon. If not, raycast 0.1 units INTO the old surface to
+    /// find the adjacent polygon. If found, create a new contact immediately —
+    /// no gravity-fall-then-collide cycle needed. This is critical for smooth stair
+    /// descent: the foot transitions directly from one tread to the next.
+    ///
+    /// Validate existing contacts each frame, matching original Dark Engine's
+    /// ConstrainFromTerrain (phcore.cpp lines 262-368). For each contact in
+    /// mContacts, check if the submodel is still on the polygon (distance +
+    /// point-in-polygon). Valid contacts are kept for constrainVelocity().
+    /// Invalid contacts are destroyed immediately (no age-based persistence).
+    ///
+    /// For FOOT floor contacts that fail validation, attempt a transition
+    /// raycast (0.1 units along -normal) to find the adjacent floor polygon.
+    /// This handles coplanar polygon-to-polygon transitions on flat surfaces.
+    /// For stair descent (0.5-unit drops), the probe is too short — the contact
+    /// is destroyed and gravity handles the drop naturally.
+    static constexpr float kBreakTerrainContactDist = 0.1f;  // original: kBreakTerrainContactDist
+    static constexpr float kContactTransitionDist = 0.1f;    // original: look_offset scale
+
+    inline void validateContacts() {
+        if (mCellIdx < 0) return;
+
+        // Iterate backwards for safe erasure
+        for (int ci = static_cast<int>(mContacts.size()) - 1; ci >= 0; --ci) {
+            auto &c = mContacts[ci];
+
+            // Reset fresh flag — will be set to true again during collision
+            // detection if the contact is re-detected this frame.
+            c.fresh = false;
+
+            // ── Object contact validation (ConstrainFromObjects, phcore.cpp lines 443-611) ──
+            // Checks surface distance (PhysGetObjsNorm) and geometric containment
+            // (SubModOnPoly with grow_poly=TRUE). Breaks contact if distance exceeds
+            // kBreakObjectContactDist (0.2) or sphere has slid off the OBB face.
+            // Refreshes contact normal from current OBB orientation.
+            if (c.cellIdx < 0) {
+                if (!mObjectWorld) {
+                    mContacts.erase(mContacts.begin() + ci);
+                    continue;
+                }
+                const auto *body = mObjectWorld->findBodyByObjID(c.objectId);
+                if (!body) {
+                    mContacts.erase(mContacts.begin() + ci);
+                    continue;
+                }
+
+                // Compute submodel position for this contact
+                int subIdx = std::clamp(static_cast<int>(c.submodelIdx), 0, NUM_SPHERES - 1);
+                float poseOZ = 0.0f;
+                if (subIdx == 0) poseOZ = mPoseCurrent.z;
+                else if (subIdx == 1) poseOZ = mBodyPoseCurrent.z;
+                float offZ = mSphereOffsetsBase[subIdx] + poseOZ;
+                Vector3 subPos = mPosition + Vector3(0.0f, 0.0f, offZ);
+                float subRadius = mSphereRadii[subIdx];
+
+                int faceIdx = c.polyIdx & 0xF;
+
+                if (body->shapeType == CollisionShapeType::OBB && faceIdx <= 5) {
+                    // OBB face validation
+                    Vector3 faceNormal = getOBBFaceNormal(*body, faceIdx);
+                    int axis = faceIdx % 3;
+                    float halfExtent = body->edgeLengths[axis] * 0.5f;
+                    Vector3 faceCenter = body->worldPos + faceNormal * halfExtent;
+
+                    // Surface distance: dot(sphereCenter, faceNormal) - planeConst - radius
+                    // Matches original PhysGetObjsNorm → GetSphereVsOBBNormal (phmodutl.cpp lines 92-107)
+                    float centerDist = glm::dot(subPos - faceCenter, faceNormal);
+                    float surfaceDist = centerDist - subRadius;
+
+                    if (surfaceDist > kBreakObjectContactDist) {
+                        mContacts.erase(mContacts.begin() + ci);
+                        continue;
+                    }
+
+                    // On-face check: SubModOnPoly with grow_poly=TRUE (phcore.cpp line 488)
+                    // Projects sphere center onto face tangent axes, checks against
+                    // halfExtent + expansion. Expansion = sphereRadius for sphere submodels.
+                    Vector3 toSub = subPos - body->worldPos;
+                    int axis1 = (axis + 1) % 3;
+                    int axis2 = (axis + 2) % 3;
+                    float d1 = glm::dot(toSub, body->rotation[axis1]);
+                    float d2 = glm::dot(toSub, body->rotation[axis2]);
+                    float halfE1 = body->edgeLengths[axis1] * 0.5f;
+                    float halfE2 = body->edgeLengths[axis2] * 0.5f;
+                    float expand = (subRadius > 0.001f) ? subRadius : 0.1f;
+
+                    if (std::fabs(d1) > halfE1 + expand + 0.01f ||
+                        std::fabs(d2) > halfE2 + expand + 0.01f) {
+                        mContacts.erase(mContacts.begin() + ci);
+                        continue;
+                    }
+
+                    // Refresh normal from current OBB orientation.
+                    // Original recomputes via PhysGetObjsNorm each frame and uses
+                    // the fresh normal for AddConstraint (phcore.cpp line 543).
+                    c.normal = faceNormal;
+
+                } else if (body->shapeType == CollisionShapeType::Sphere) {
+                    // Sphere object: center-to-center distance check
+                    float dist = glm::length(subPos - body->worldPos)
+                                 - subRadius - body->sphereRadius;
+                    if (dist > kBreakObjectContactDist) {
+                        mContacts.erase(mContacts.begin() + ci);
+                        continue;
+                    }
+                } else {
+                    // Unknown shape or invalid face index — destroy
+                    mContacts.erase(mContacts.begin() + ci);
+                    continue;
+                }
+
+                // Contact valid — keep
+                continue;
+            }
+
+            // Validate terrain contact: distance + point-in-polygon
+            if (c.cellIdx >= static_cast<int32_t>(mCollision.getWR().numCells)) {
+                mContacts.erase(mContacts.begin() + ci);
+                continue;
+            }
+            const auto &cell = mCollision.getWR().cells[c.cellIdx];
+            if (c.polyIdx < 0 || c.polyIdx >= cell.numPolygons) {
+                mContacts.erase(mContacts.begin() + ci);
+                continue;
+            }
+
+            // Compute submodel position for this contact
+            float poseOffsetZ = 0.0f;
+            if (c.submodelIdx == 0) poseOffsetZ = mPoseCurrent.z;
+            else if (c.submodelIdx == 1) poseOffsetZ = mBodyPoseCurrent.z;
+            int subIdx = std::clamp(static_cast<int>(c.submodelIdx), 0, NUM_SPHERES - 1);
+            float offsetZ = mSphereOffsetsBase[subIdx] + poseOffsetZ;
+            Vector3 subPos = mPosition + Vector3(0.0f, 0.0f, offsetZ);
+
+            const auto &plane = cell.planes[cell.polygons[c.polyIdx].plane];
+            float distToPlane = plane.getDistance(subPos);
+
+            bool closeToPlane = (std::fabs(distToPlane) <= kBreakTerrainContactDist);
+            bool insidePoly = false;
+            if (closeToPlane) {
+                Vector3 projected = subPos - plane.normal * distToPlane;
+                Vector3 windNormal = -plane.normal;
+                insidePoly = pointInConvexPolygon(projected, cell.vertices,
+                                                  cell.polyIndices[c.polyIdx],
+                                                  windNormal);
+            }
+
+            if (closeToPlane && insidePoly) {
+                // Contact still valid — keep it for constrainVelocity
+                continue;
+            }
+
+            // Contact invalid — try transition for FOOT floor contacts
+            bool transitioned = false;
+            if (c.submodelIdx == 4 && c.normal.z > GROUND_NORMAL_MIN) {
+                // FOOT floor contact: attempt transition raycast
+                Vector3 footPos = subPos;
+                int32_t footCell = mCollision.findCell(footPos);
+                if (footCell < 0) footCell = c.cellIdx;
+
+                Vector3 probeEnd = footPos - c.normal * kContactTransitionDist;
+                RayHit transitionHit;
+                bool hit = raycastWorld(mCollision.getWR(), footPos, probeEnd,
+                                        transitionHit, nullptr, footCell);
+
+                // Reject self-hits
+                if (hit && transitionHit.cellIdx == c.cellIdx &&
+                    transitionHit.polyIdx == c.polyIdx) {
+                    hit = false;
+                }
+
+                if (hit && transitionHit.normal.z > GROUND_NORMAL_MIN) {
+                    // Transition to adjacent floor polygon
+                    c.normal = transitionHit.normal;
+                    c.penetration = 0.01f;
+                    c.cellIdx = transitionHit.cellIdx >= 0 ? transitionHit.cellIdx : c.cellIdx;
+                    c.polyIdx = transitionHit.polyIdx;
+                    c.textureIdx = transitionHit.textureIndex;
+                    c.fresh = true;
+                    transitioned = true;
+
+                    if (mStepLog) {
+                        std::fprintf(stderr, "[STEP-TRANSITION] foot contact transition: "
+                            "-> cell=%d poly=%d n=(%.2f,%.2f,%.2f)\n",
+                            c.cellIdx, c.polyIdx,
+                            c.normal.x, c.normal.y, c.normal.z);
+                    }
+                }
+            }
+
+            if (!transitioned) {
+                // Destroy contact — matches original DestroyTerrainContact
+                if (mStepLog && c.submodelIdx == 4 && c.normal.z > GROUND_NORMAL_MIN) {
+                    std::fprintf(stderr, "[STEP-TRANSITION] contact DESTROYED: "
+                        "cell=%d poly=%d (gravity takes over)\n",
+                        c.cellIdx, c.polyIdx);
+                }
+                mContacts.erase(mContacts.begin() + ci);
+            }
+        }
+    }
+
+    /// Collision backup factor — original Dark Engine kPartialBackupAmt = 0.9
+    /// (phcore.cpp line 5010, "nasty hack to try to avoid epsilon issues").
+    /// Used ONLY in IntegrateToCollision (backing up to collision point) and
+    /// the Integrate() collision-context function (lines 5018/5035). NOT used
+    /// in normal position integration — UpdateTargetLocation (PHMOD.CPP line 1871)
+    /// uses pure position = position + velocity * dt.
+    static constexpr float kPartialBackupAmt = 0.9f;
+
+    /// Terrain bounce elasticity — original Dark Engine kTerrainBounce (PHCONST.H line 73).
+    /// Combined with model elasticity: dampen = model_elasticity * kTerrainBounce.
+    /// Player default elasticity = 1.0, so dampen = 0.1 (10% energy return on bounce).
+    static constexpr float kTerrainBounce = 0.1f;
+
+    /// Integrate position from velocity. Matches original UpdateTargetLocation
+    /// (PHMOD.CPP line 1871): position = position + velocity * dt.
+    /// No backup factor — kPartialBackupAmt is only for collision backup contexts.
     inline void integrate() {
         mPosition += mVelocity * mTimestep.fixedDt;
     }
@@ -353,12 +576,19 @@
 
         // Check contacts from collision resolution. Track most upward-facing ground normal and
         // texture index for footstep material lookup (Phase 3 Audio).
+        // Prefer fresh contacts over maintained contacts for texture/normal selection.
+        // Fresh contacts (just detected this frame) are more accurate for material.
         float bestGroundZ = -1.0f;
-        for (const auto &c : mLastContacts) {
+        bool bestIsFresh = false;
+        for (const auto &c : mContacts) {
             if (c.normal.z > GROUND_NORMAL_MIN) {
                 onGround = true;
-                if (c.normal.z > bestGroundZ) {
+                bool isFresh = c.fresh;
+                // Fresh contacts always win over maintained. Among same freshness, pick highest Z.
+                if ((isFresh && !bestIsFresh) ||
+                    (isFresh == bestIsFresh && c.normal.z > bestGroundZ)) {
                     bestGroundZ = c.normal.z;
+                    bestIsFresh = isFresh;
                     mGroundNormal = c.normal;
                     mGroundTextureIdx = c.textureIdx;
                 }
@@ -405,7 +635,7 @@
         // contact between adjacent polygons. Synthesized contact enables tryStairStep().
         if (onGround) {
             bool footHasGround = false;
-            for (const auto &c : mLastContacts) {
+            for (const auto &c : mContacts) {
                 if (c.submodelIdx == 4 && c.normal.z > GROUND_NORMAL_MIN) {
                     footHasGround = true;
                     break;
@@ -425,7 +655,7 @@
                     fc.polyIdx = -1; // synthetic contact
                     fc.textureIdx = footProbe.textureIndex;
                     fc.submodelIdx = 4; // FOOT
-                    mLastContacts.push_back(fc);
+                    mContacts.push_back(fc);
                 }
             }
         }
@@ -622,7 +852,7 @@
 
         // Scan ground contacts for a moving terrain object
         int32_t newPlatformID = 0;
-        for (const auto &c : mLastContacts) {
+        for (const auto &c : mContacts) {
             if (c.objectId > 0 && c.normal.z > GROUND_NORMAL_MIN) {
                 // Check if this object is a moving platform
                 const Vector3 *platVel = mPlatformVelocityCb(c.objectId);

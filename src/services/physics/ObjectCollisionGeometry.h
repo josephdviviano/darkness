@@ -983,7 +983,7 @@ public:
                     // distinct from OBB face indices (0-5) and avoids false matches.
                     contact.polyIdx = static_cast<int32_t>((bi << 4) | (cr.faceIdx & 0xF));
                     contact.textureIdx = -1;
-                    contact.age = 0;
+                    contact.fresh = true;
                     // Tag with object ID and player submodel index for
                     // object stepping decisions in tryStairStep().
                     contact.objectId = body.objID;
