@@ -86,14 +86,22 @@
         Vector3 origPos = mPosition;
         int32_t origCell = mCellIdx;
 
-        // HEAD/BODY offsets are pose-driven (mPoseCurrent.z, mBodyPoseCurrent.z) for smooth
-        // collision sphere transitions during crouch/uncrouch.
+        // ── UpdatePositions: commit end position ──
+        // Matches original: after UpdateModel computes EndLocationVec, UpdatePositions
+        // commits EndLocationVec → LocationVec. Collision detection then runs on the
+        // committed position. We do this upfront so the iterative push-out loop
+        // operates from the correct base position.
+        mPosition = mEndPosition;
+
+        // Update cell for the new position — only if valid
+        {
+            int32_t endCell = mCollision.findCell(mPosition);
+            if (endCell >= 0) mCellIdx = endCell;
+        }
 
         // Fresh contacts from this frame's collision detection are accumulated in
         // mFreshContacts. After collision resolution, they're merged into mContacts
-        // (deduplicated by cellIdx+polyIdx). No persistence aging — matches original
-        // Dark Engine where contacts are validated each frame by ConstrainFromTerrain
-        // and destroyed immediately when invalid.
+        // (deduplicated by cellIdx+polyIdx).
         mFreshContacts.clear();
         mFreshContacts.reserve(16);
 
@@ -112,7 +120,10 @@
                 else if (s == 1) poseOffsetZ = mBodyPoseCurrent.z; // BODY
                 float offsetZ = mSphereOffsetsBase[s] + poseOffsetZ;
                 Vector3 sphereCenter = mPosition + Vector3(0.0f, 0.0f, offsetZ);
-                Vector3 oldSphereCenter = mPrevPosition + Vector3(0.0f, 0.0f, offsetZ);
+                // Swept test from pre-commit position to current (pushed) position.
+                // On the first iteration this sweeps from origPos to mEndPosition.
+                // On subsequent iterations the swept distance is zero (static only).
+                Vector3 oldSphereCenter = origPos + Vector3(0.0f, 0.0f, offsetZ);
 
                 // Track contact count to tag new contacts with submodel index.
                 size_t contactsBefore = mIterContacts.size();
@@ -326,11 +337,12 @@
                     float remainingDt = mTimestep.fixedDt * (1.0f - collisionTimeFrac);
                     remainingDt = std::max(remainingDt, 0.0001f);
 
-                    // IntegrateToCollision: back up model to the collision point along
-                    // the trajectory. Matches phcore.cpp lines 5120-5121:
-                    //   new_pos = old_pos + velocity * (collision_time * kPartialBackupAmt)
-                    // where kPartialBackupAmt = 0.9 (90% of collision distance).
-                    Vector3 backupPos = mPrevPosition + mVelocity *
+                    // IntegrateToCollision: compute the collision backup position.
+                    // Matches original (PHCORE.CPP line 5120):
+                    //   new_pos = LocationVec + velocity * integration_time * kPartialBackupAmt
+                    // origPos is the LocationVec at frame start (before UpdatePositions).
+                    // The backup is 90% of the way from origPos to the collision point.
+                    Vector3 backupPos = origPos + mVelocity *
                         (collisionTimeFrac * mTimestep.fixedDt * kPartialBackupAmt);
 
                     bool stepped = tryStairStepFromContacts(mIterContacts, remainingDt, backupPos);

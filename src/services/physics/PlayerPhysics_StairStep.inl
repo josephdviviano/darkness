@@ -437,164 +437,37 @@
                 mIterContacts.size(), mPosition.x, mPosition.y, mPosition.z);
         }
 
-        // ── Collision cascade (matching original ResolveCollisions queue) ──
-        // Original PostCollisionUpdate (phcore.cpp line 4150) re-checks collisions
-        // via CheckModelTerrainCollisions. New collisions are queued and processed
-        // by the same frame's ResolveCollisions loop (lines 6276-6305). This creates
-        // cascading resolution: bounce off riser → re-integrate → detect next riser
-        // → step down. Max kMaxFrameCollisions (32) per submodel per frame.
-        static constexpr int kMaxCascadeCollisions = 8;  // conservative limit
-        for (int cascade = 0; cascade < kMaxCascadeCollisions; ++cascade) {
-            // Push out of any penetrations
-            if (!mIterContacts.empty()) {
-                mPushes.clear();
-                for (const auto &c : mIterContacts) {
-                    Vector3 pushNormal = c.normal;
-                    // Steep surface flattening (same as main collision loop)
-                    if (pushNormal.z > 0.0f && pushNormal.z < WALKABLE_SLOPE_THRESHOLD) {
-                        pushNormal.z = 0.0f;
-                        float len = glm::length(pushNormal);
-                        if (len > 0.001f) pushNormal /= len;
-                        else continue;
-                    }
-                    bool merged = false;
-                    for (auto &p : mPushes) {
-                        if (glm::dot(c.normal, p.first) > 0.99f) {
-                            p.second = std::max(p.second, c.penetration);
-                            merged = true;
-                            break;
-                        }
-                    }
-                    if (!merged)
-                        mPushes.push_back({pushNormal, c.penetration});
+        // Push out of any penetrations from re-integration
+        if (!mIterContacts.empty()) {
+            mPushes.clear();
+            for (const auto &c : mIterContacts) {
+                Vector3 pushNormal = c.normal;
+                if (pushNormal.z > 0.0f && pushNormal.z < WALKABLE_SLOPE_THRESHOLD) {
+                    pushNormal.z = 0.0f;
+                    float len = glm::length(pushNormal);
+                    if (len > 0.001f) pushNormal /= len;
+                    else continue;
                 }
-                for (const auto &p : mPushes)
-                    mPosition += p.first * p.second;
-
-                // Accumulate real contacts for next frame's constrainVelocity
-                mFreshContacts.insert(mFreshContacts.end(),
-                                     mIterContacts.begin(), mIterContacts.end());
-            }
-
-            // Check for riser contacts that should trigger stair stepping.
-            // Matches original: ResolveCollisions processes each queued collision,
-            // calling CheckStep for terrain face contacts on leg submodels.
-            float earliestTime = 2.0f;
-            int bestRiserIdx = -1;
-            for (int ci = 0; ci < static_cast<int>(mIterContacts.size()); ++ci) {
-                const auto &c = mIterContacts[ci];
-                if (c.submodelIdx < 2) continue;          // only SHIN/KNEE/FOOT
-                if (std::fabs(c.normal.z) >= STEP_WALL_THRESHOLD) continue;
-                if (c.isEdge) continue;                    // face contacts only
-                float t = c.time >= 0.0f ? c.time : 0.5f;
-                if (t < earliestTime) {
-                    earliestTime = t;
-                    bestRiserIdx = ci;
-                }
-            }
-
-            if (bestRiserIdx < 0)
-                break;  // no riser contacts — done cascading
-
-            // Attempt stair step from the riser contact
-            float cascadeFrac = std::clamp(earliestTime, 0.0f, 1.0f);
-            float cascadeRemaining = dt * (1.0f - cascadeFrac);
-            cascadeRemaining = std::max(cascadeRemaining, 0.0001f);
-
-            // IntegrateToCollision: advance position to the collision point.
-            // Original (PHCORE.CPP line 5158) calls SetLocationVec(i, old + vel * t * 0.9)
-            // BEFORE CheckStep runs. This moves the FOOT past the riser, so CheckStep's
-            // P2 FWD starts from past the riser and P3 DOWN hits the NEXT tread (not the
-            // current one). Without this, CheckStep runs from before the riser and produces
-            // a spurious 0.32-unit mini-step (kMinZDelta clamp on near-zero raw zDelta).
-            Vector3 cascadeBackup = preReintegratePos + mVelocity *
-                (cascadeFrac * dt * kPartialBackupAmt);
-            mPosition = cascadeBackup;  // advance body center past the riser
-
-            if (mStepLog) {
-                std::fprintf(stderr, "[STEP-REINT] cascade[%d]: riser sub=%d n=(%.2f,%.2f,%.2f) "
-                    "remaining=%.4f advPos=(%.3f,%.3f,%.3f)\n",
-                    cascade, mIterContacts[bestRiserIdx].submodelIdx,
-                    mIterContacts[bestRiserIdx].normal.x,
-                    mIterContacts[bestRiserIdx].normal.y,
-                    mIterContacts[bestRiserIdx].normal.z, cascadeRemaining,
-                    mPosition.x, mPosition.y, mPosition.z);
-            }
-
-            if (tryStairStepFromContacts(mIterContacts, cascadeRemaining, cascadeBackup)) {
-                // Step succeeded — tryStairStep already called postStepReIntegrate
-                // recursively, handling further cascades. Done.
-                return;
-            }
-
-            // Step failed — ResolveBounce (matching original phcore.cpp lines 6204, 6259)
-            const auto &riserContact = mIterContacts[bestRiserIdx];
-            float dp = glm::dot(mVelocity, riserContact.normal);
-            if (dp < 0.0f) {
-                float dampen = mElasticity * kTerrainBounce;
-                mVelocity -= riserContact.normal * dp * (1.0f + dampen);
-                if (mStepLog) {
-                    std::fprintf(stderr, "[STEP-REINT] cascade BOUNCE: dp=%.3f dampen=%.2f "
-                        "vel->(%.2f,%.2f,%.2f)\n", dp, dampen,
-                        mVelocity.x, mVelocity.y, mVelocity.z);
-                }
-            }
-
-            // Re-apply gravity and re-integrate for remaining time (PostCollisionUpdate)
-            mVelocity.z -= mGravityMag * cascadeRemaining;
-            constrainVelocity();
-            preReintegratePos = mPosition;
-            mPosition += mVelocity * cascadeRemaining;
-            int32_t cascadeCell = mCollision.findCell(mPosition);
-            if (cascadeCell >= 0) mCellIdx = cascadeCell;
-
-            // Re-run collision detection for the cascade
-            mIterContacts.clear();
-            for (int s = 0; s < NUM_SPHERES; ++s) {
-                float poseOffsetZ = 0.0f;
-                if (s == 0) poseOffsetZ = mPoseCurrent.z;
-                else if (s == 1) poseOffsetZ = mBodyPoseCurrent.z;
-                float offsetZ = mSphereOffsetsBase[s] + poseOffsetZ;
-                Vector3 sc = mPosition + Vector3(0.0f, 0.0f, offsetZ);
-                Vector3 oldSc = preReintegratePos + Vector3(0.0f, 0.0f, offsetZ);
-
-                size_t before = mIterContacts.size();
-                if (mSphereRadii[s] > 0.001f) {
-                    mCollision.sphereVsCellPolygons(sc, mSphereRadii[s], mCellIdx, mIterContacts);
-                    int32_t sCell = mCollision.findCell(sc);
-                    if (sCell >= 0 && sCell != mCellIdx)
-                        mCollision.sphereVsCellPolygons(sc, mSphereRadii[s], sCell, mIterContacts);
-                    mCollision.sweptSphereVsCellPolygons(oldSc, sc, mSphereRadii[s], mCellIdx, mIterContacts);
-                    if (sCell >= 0 && sCell != mCellIdx)
-                        mCollision.sweptSphereVsCellPolygons(oldSc, sc, mSphereRadii[s], sCell, mIterContacts);
-                } else {
-                    RayHit ph;
-                    if (raycastWorld(mCollision.getWR(), oldSc, sc, ph)) {
-                        Vector3 d = sc - oldSc;
-                        float rl = glm::length(d);
-                        float ht = (rl > 1e-6f) ? ph.distance / rl : 0.5f;
-                        ht = std::clamp(ht, 0.0f, 1.0f);
-                        SphereContact cc;
-                        cc.normal = ph.normal;
-                        float ed = glm::dot(ph.normal, sc - ph.point);
-                        cc.penetration = std::max(-ed, 0.0f);
-                        cc.cellIdx = ph.cellIdx >= 0 ? ph.cellIdx : mCellIdx;
-                        cc.polyIdx = ph.polyIdx;
-                        cc.textureIdx = ph.textureIndex;
-                        cc.time = ht;
-                        cc.isEdge = false;
-                        mIterContacts.push_back(cc);
+                bool merged = false;
+                for (auto &p : mPushes) {
+                    if (glm::dot(c.normal, p.first) > 0.99f) {
+                        p.second = std::max(p.second, c.penetration);
+                        merged = true;
+                        break;
                     }
                 }
-                for (size_t ci = before; ci < mIterContacts.size(); ++ci)
-                    mIterContacts[ci].submodelIdx = static_cast<int8_t>(s);
+                if (!merged)
+                    mPushes.push_back({pushNormal, c.penetration});
             }
+            for (const auto &p : mPushes)
+                mPosition += p.first * p.second;
 
-            if (mIterContacts.empty())
-                break;  // no more contacts — done cascading
+            // Accumulate contacts for next frame's constrainVelocity
+            mFreshContacts.insert(mFreshContacts.end(),
+                                 mIterContacts.begin(), mIterContacts.end());
         }
 
-        // Update cell after push-out / cascade
+        // Update cell after push-out
         int32_t finalCell = mCollision.findCell(mPosition);
         if (finalCell >= 0) mCellIdx = finalCell;
 
