@@ -86,12 +86,21 @@
         Vector3 origPos = mPosition;
         int32_t origCell = mCellIdx;
 
-        // ── UpdatePositions: commit end position ──
-        // Matches original: after UpdateModel computes EndLocationVec, UpdatePositions
-        // commits EndLocationVec → LocationVec. Collision detection then runs on the
-        // committed position. We do this upfront so the iterative push-out loop
-        // operates from the correct base position.
-        mPosition = mEndPosition;
+        // ── UpdatePositions: commit end position with move_backup ──
+        // Matches original (PHCORE.CPP lines 6437-6455): commits EndLocationVec →
+        // LocationVec, but pulls the position back by min(0.01, moveLen) along the
+        // movement direction. This keeps the spherecaster's epsilon happy by ensuring
+        // the committed position doesn't land exactly on a polygon plane.
+        {
+            Vector3 moveVec = mEndPosition - mPosition;
+            float moveLen = glm::length(moveVec);
+            if (moveLen > 1e-7f) {
+                float backupDist = std::min(0.01f, moveLen);
+                mPosition = mEndPosition - (moveVec / moveLen) * backupDist;
+            } else {
+                mPosition = mEndPosition;
+            }
+        }
 
         // Update cell for the new position — only if valid
         {
@@ -226,6 +235,7 @@
                         contact.textureIdx = pointHit.textureIndex;
                         contact.time = hitTime;
                         contact.isEdge = false;  // face contact (kPC_TerrainFace)
+                        contact.hitPoint = pointHit.point;  // store for IntegrateToCollision
                         mIterContacts.push_back(contact);
                     }
                 }
@@ -323,6 +333,20 @@
                     // Static contacts (time < 0) use fallback timing.
                     float t = c.time;
                     if (t < 0.0f) t = 0.5f;  // static contact: estimate mid-frame
+                    // Skip contacts where the submodel starts ON or BEHIND the plane.
+                    // Matches original: PortalRaycast with use_zero_epsilon=TRUE (used for
+                    // point submodel collision, PHMODSPH.CPP line 198) has the check
+                    // `if (start_dist > 0.0)` at WRCAST.C line 770 — planes at distance
+                    // ≤ 0 from the ray start are skipped. This prevents re-detecting a
+                    // riser the foot was placed on by a previous stair step.
+                    // We check the contact's hitPoint: if the foot's start position is
+                    // not strictly in front of the hit plane, skip the contact.
+                    if (c.submodelIdx >= 2 && c.time >= 0.0f) {
+                        float footOffsetZ = mSphereOffsetsBase[c.submodelIdx];
+                        Vector3 footStart = origPos + Vector3(0.0f, 0.0f, footOffsetZ);
+                        float startDist = glm::dot(c.normal, footStart - c.hitPoint);
+                        if (startDist <= 0.0f) continue;  // foot starts ON or behind the plane
+                    }
                     if (t < earliestTime) {
                         earliestTime = t;
                         bestContactIdx = ci;
@@ -338,12 +362,29 @@
                     remainingDt = std::max(remainingDt, 0.0001f);
 
                     // IntegrateToCollision: compute the collision backup position.
-                    // Matches original (PHCORE.CPP line 5120):
-                    //   new_pos = LocationVec + velocity * integration_time * kPartialBackupAmt
+                    // Original (PHCORE.CPP lines 5087-5201) has TWO paths:
+                    //   - POINT submodels (line 5145): use hit location directly
+                    //       new_pos = currentPos + (hitLoc - currentPos) * 0.9
+                    //   - SPHERE submodels (line 5120): use velocity integration
+                    //       new_pos = currentPos + velocity * integration_time * 0.9
                     // origPos is the LocationVec at frame start (before UpdatePositions).
-                    // The backup is 90% of the way from origPos to the collision point.
-                    Vector3 backupPos = origPos + mVelocity *
-                        (collisionTimeFrac * mTimestep.fixedDt * kPartialBackupAmt);
+                    const auto &bestContact = mIterContacts[bestContactIdx];
+                    Vector3 backupPos;
+                    if (bestContact.submodelIdx >= 2) {
+                        // Point submodel (SHIN/KNEE/FOOT): backup toward hit location.
+                        // Original uses double-precision (PHCORE.CPP line 5145-5151):
+                        //   movement = (hitLoc - GetLocationVec(i)) * integration_backup
+                        //   new_pos = GetLocationVec(i) + movement
+                        float footOffsetZ = mSphereOffsetsBase[bestContact.submodelIdx];
+                        Vector3 footPos = origPos + Vector3(0.0f, 0.0f, footOffsetZ);
+                        Vector3 footBackup = footPos + (bestContact.hitPoint - footPos) * kPartialBackupAmt;
+                        // Convert foot backup to body center backup (subtract foot offset)
+                        backupPos = footBackup - Vector3(0.0f, 0.0f, footOffsetZ);
+                    } else {
+                        // Sphere submodel: velocity-based integration
+                        backupPos = origPos + mVelocity *
+                            (collisionTimeFrac * mTimestep.fixedDt * kPartialBackupAmt);
+                    }
 
                     bool stepped = tryStairStepFromContacts(mIterContacts, remainingDt, backupPos);
                     if (stepped) {
@@ -353,13 +394,28 @@
                     }
 
                     // ResolveBounce: when CheckStep fails, reflect velocity off the riser.
-                    // Matches original Dark Engine BounceObject (phcore.cpp lines 4232-4246):
-                    // dp = dot(velocity, normal); if (dp < 0) velocity -= normal * dp * (1 + dampen)
-                    // dampen = model_elasticity * kTerrainBounce (0.1). For player with
-                    // default elasticity 1.0: dampen = 0.1 (10% energy return).
-                    if (bestContactIdx >= 0) {
+                    // Matches original Dark Engine flow (phcore.cpp lines 6199-6262):
+                    //   1. CheckTerrainContact — if low velocity, create persistent contact
+                    //   2. BounceObject — reflect velocity off surface
+                    //   3. PostCollisionUpdate — re-integrate for remaining time
+                    {
                         const auto &riserContact = mIterContacts[bestContactIdx];
                         float dp = glm::dot(mVelocity, riserContact.normal);
+
+                        // CheckTerrainContact (phcore.cpp lines 4305-4378):
+                        // If velocity into the surface is low, create a persistent contact.
+                        // Original threshold: |dp| < 5.0 * elasticity. This prevents the
+                        // player from drifting into the wall next frame.
+                        static constexpr float kStickingThreshold = 5.0f;
+                        if (dp < 0.0f && std::fabs(dp) < kStickingThreshold * mElasticity) {
+                            // Create persistent contact from this collision
+                            SphereContact stickContact = riserContact;
+                            stickContact.fresh = true;
+                            mFreshContacts.push_back(stickContact);
+                        }
+
+                        // BounceObject (phcore.cpp lines 4211-4248):
+                        // dp = dot(velocity, normal); if (dp < 0) vel -= normal * dp * (1 + dampen)
                         if (dp < 0.0f) {
                             float dampen = mElasticity * kTerrainBounce;
                             mVelocity -= riserContact.normal * dp * (1.0f + dampen);
@@ -371,13 +427,8 @@
                             }
                         }
 
-                        // PostCollisionUpdate: original engine re-runs the full physics
-                        // pipeline after ResolveBounce, even on CheckStep FAILURE
-                        // (phcore.cpp lines 6254-6260). Without this, the bounce zeros
-                        // velocity and the player sits motionless until the next frame.
-                        // With this, input + gravity + integration are re-applied for
-                        // the remaining frame time, so the player slides along the wall
-                        // immediately.
+                        // PostCollisionUpdate: re-run physics pipeline for remaining time
+                        // (phcore.cpp lines 6254-6260).
                         if (remainingDt > 0.0001f) {
                             postStepReIntegrate(remainingDt);
                         }
