@@ -122,14 +122,17 @@ static constexpr float SPHERE_RADII[NUM_SPHERES] = {
 // CrawlLeft HEAD=-2.5/BODY=-1.0, CrawlRight HEAD=-2.5/BODY=-1.0.
 
 // Movement speeds (world units/sec).
-// The Dark Engine game module uses a base slew speed of 15.0 u/s, with the
-// default (no modifier) walking at half that. These are the walk-mode base
-// speeds; run multiplies by 2× and creep by 0.5×.
-static constexpr float WALK_SPEED     = 7.5f;    // default forward walk
-static constexpr float RUN_SPEED      = 15.0f;   // sprint (2× walk)
-static constexpr float CREEP_SPEED    = 3.75f;   // sneak (0.5× walk)
-static constexpr float SIDESTEP_SPEED = 5.25f;   // lateral strafe (0.7× walk)
-static constexpr float BACKWARD_SPEED = 3.75f;   // reverse movement (0.5× walk)
+// Original Dark Engine speed constants (PLYRSPD.H):
+//   MOVE_SPEED = 11.0, SLOW_MOVE_SPEED = 5.5 (default walk = SLOW)
+//   FAST_MOVE_SPEED = 22.0, SIDESTEP_SPEED = 7.7, BACK_SPEED = 5.5
+// Default forward state is SLOWSPEED, so walk = SLOW_MOVE_SPEED = 5.5.
+// Run = SLOW * 2 = 11.0. Sneak = SLOW / 2 = 2.75.
+// Mode multipliers stack: Stand=1.0, Crouch=0.6, Swim=0.7, Climb=0.5.
+static constexpr float WALK_SPEED     = 5.5f;    // SLOW_MOVE_SPEED (default walk)
+static constexpr float RUN_SPEED      = 11.0f;   // SLOW * 2 (sprint)
+static constexpr float CREEP_SPEED    = 2.75f;   // SLOW / 2 (sneak)
+static constexpr float SIDESTEP_SPEED = 3.85f;   // SLOW_SIDESTEP_SPEED (7.7 / 2)
+static constexpr float BACKWARD_SPEED = 2.75f;   // SLOW_BACK_SPEED (5.5 / 2)
 static constexpr float JUMP_IMPULSE   = 14.0f;   // upward velocity on jump
 
 // Speed multipliers for movement modes
