@@ -12,17 +12,20 @@
         if (mCurrentMode == PlayerMode::Climb || mMantling)
             return;
 
-        // Gravity applied every frame — matches original (phcore.cpp lines 1417-1421).
-        // On ground: constrainVelocity() removes the downward component against floor
-        // contacts (matching original's PhysRemNormComp at phutils.cpp line 117).
-        // The brief presence of downward velocity before constraint removal ensures
-        // the swept collision path has a downward component, which is essential for
-        // detecting stair risers when walking off tread edges.
-        mVelocity.z -= mGravityMag * mTimestep.fixedDt;
-        // Buoyancy: always active when COG is in water, uses raw GRAVITY (not room-scaled).
-        // With density=0.9: buoyancy=32/0.9=35.6 > gravity=32 → player floats up.
+        // Original (PHCORE.CPP lines 1413-1421): gravity added to sum_forces.
+        // When in water, ALL forces halved first (line 1413: sum_forces *= 0.5).
+        // Then buoyancy added (line 1424-1427).
+        float gravForce = mGravityMag;
+        float buoyForce = 0.0f;
         if (isInWater()) {
-            mVelocity.z += (GRAVITY / mDensity) * mTimestep.fixedDt;
+            // D8: Water force halving — original halves ALL forces in water
+            gravForce *= 0.5f;
+            // Buoyancy: (1/density) * gravity * mass / mass = (1/density) * gravity
+            buoyForce = (GRAVITY / mDensity) * 0.5f;  // also halved by water
+        }
+        mVelocity.z -= gravForce * mTimestep.fixedDt;
+        if (buoyForce > 0.0f) {
+            mVelocity.z += buoyForce * mTimestep.fixedDt;
         }
     }
 
@@ -148,79 +151,121 @@
         return 0.0f;
     }
 
-    /// Apply movement — force/mass-based velocity control:
-    ///   friction = sum of contact contributions (computeGroundFriction)
-    ///   rate = min(CONTROL_MULTIPLIER * mass * friction / VELOCITY_RATE, MAX_CONTROL_RATE)
-    ///   alpha = rate * dt / mass   →  vel += (desired - vel) * alpha
-    /// Exponential approach to desired velocity (tau ~0.095s on flat ground). When desired=0,
-    /// velocity decays exponentially — no separate deceleration constant needed.
+    /// Apply movement — matches original UpdateModelTransDynamics + ControlVelocity.
+    ///
+    /// Original flow (PHCORE.CPP lines 1349-1509, PHCTRL.CPP lines 130-220):
+    ///   1. ControlVelocity() computes ctrl_accel = (desired - current) * rate
+    ///   2. ctrl_accel added to sum_forces (acceleration accumulator)
+    ///   3. Gravity added to sum_forces
+    ///   4. ideal_velocity = velocity + (sum_forces / mass) * dt
+    ///   5. If velocity-controlled: NO friction (actual = ideal)
+    ///   6. If NOT controlled: friction applied, actual = velocity + (sum_forces_with_friction / mass) * dt
+    ///   7. Reversal check: if dot(actual, ideal) < 0 → actual = 0
+    ///
+    /// Key: friction is ONLY applied when player has NO movement input (D16).
+    /// With active input, control acceleration handles all speed regulation.
     inline void applyMovement() {
         Vector3 desired = computeDesiredVelocity();
         const float dt = mTimestep.fixedDt;
 
-        // Compute friction from all ground contacts (replaces inline single-normal calc)
+        // Compute friction from all ground contacts
         float friction = computeGroundFriction();
+
+        // Determine if player has active velocity control (movement input)
+        // Original: IsVelocityControlled() returns true when any axis has input
+        bool velocityControlled = (std::fabs(mInputForward) > 0.001f ||
+                                   std::fabs(mInputRight) > 0.001f);
 
         if (isOnGround() && !mGroundGraceActive) {
             // Project desired velocity onto ground plane so walking on slopes
-            // doesn't fight gravity. Always project when on any ground surface.
+            // doesn't fight gravity.
             if (mGroundNormal.z > GROUND_NORMAL_MIN) {
                 float dot = glm::dot(desired, mGroundNormal);
                 desired -= mGroundNormal * dot;
             }
 
-            // No hard walkable slope threshold — friction is continuous, proportional
-            // to normal.z (original engine formula: 0.03 * normal.z * 32). Steeper
-            // slopes have less friction, so gravity's slope-parallel component
-            // dominates and sliding emerges naturally. Movement control scales with
-            // friction, so the player has progressively less control on steeper slopes.
-
-            // Control rate (mass cancels → exponential convergence). Friction summed across contacts;
-            // on flat ground with ~3 contacts: friction ≈ 2.88, rate = capped at 2000.
+            // Control acceleration: rate * (desired - current)
+            // Original (PHCTRL.CPP line 211): rate = 11 * mass * friction / velocity_rate
             float rate = CONTROL_MULTIPLIER * mMass * friction / VELOCITY_RATE;
             rate = std::min(rate, MAX_CONTROL_RATE);
-            float alpha = rate * dt / mMass;
-            alpha = std::min(alpha, 1.0f);  // safety cap: prevent overshoot at low framerates
 
-            // Converge horizontal velocity. Z is SET from slope projection (not converged —
-            // accumulation on slopes would launch player off ramps).
             float prevZ = mVelocity.z;
             Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
             Vector3 hDesired(desired.x, desired.y, 0.0f);
 
-            // Force-based convergence: vel += (desired - vel) * alpha
-            Vector3 hNew = hVel + (hDesired - hVel) * alpha;
+            // Control acceleration added to forces (matching original PHCTRL.CPP line 214)
+            Vector3 ctrlAccel = (hDesired - hVel) * rate;
 
-            // Velocity reversal check — prevent oscillation around zero from overshooting.
-            if (glm::length2(hDesired) < 0.001f && glm::dot(hNew, hVel) < 0.0f) {
-                hNew = Vector3(0.0f);
+            // Integrate forces: ideal_velocity = velocity + (ctrl_accel / mass) * dt
+            Vector3 hIdeal = hVel + ctrlAccel * (dt / mMass);
+
+            Vector3 hActual;
+            if (velocityControlled) {
+                // Original (PHCORE.CPP line 1465): friction SKIPPED when velocity-controlled.
+                // Control acceleration alone regulates speed toward desired.
+                hActual = hIdeal;
+            } else {
+                // No input — apply friction to decelerate.
+                // Original: friction opposes ideal_velocity direction, magnitude =
+                // friction_amt * mass * gravity * drag_scale
+                float frictionMag = friction * mMass * mGravityMag;
+
+                // Velocity-dependent drag (D3): scale = clamp(50 * |vel| / mass, 0.25, 10)
+                float velMag = glm::length(hVel);
+                float dragScale = std::clamp(50.0f * velMag / mMass, 0.25f, 10.0f);
+                frictionMag *= dragScale;
+
+                // Z-axis friction boost (D4): friction.z *= 1.4
+                // Applied later if needed for vertical component
+
+                if (glm::length2(hIdeal) > 1e-8f) {
+                    Vector3 frictionDir = -glm::normalize(hIdeal);
+                    Vector3 frictionForce = frictionDir * frictionMag;
+                    hActual = hVel + (ctrlAccel + frictionForce) * (dt / mMass);
+
+                    // Reversal check (D2): if friction reversed direction, zero velocity
+                    if (glm::dot(hActual, hIdeal) < 0.0f)
+                        hActual = Vector3(0.0f);
+                } else {
+                    hActual = Vector3(0.0f);
+                }
             }
 
-            mVelocity.x = hNew.x;
-            mVelocity.y = hNew.y;
-
-            // Z component: set from slope projection (not converged)
+            mVelocity.x = hActual.x;
+            mVelocity.y = hActual.y;
             mVelocity.z = desired.z != 0.0f ? desired.z : prevZ;
         } else if (isOnGround()) {
-            // Grace period: ground mode for friction/stride but no slope projection. Slope
-            // projection would use stale mGroundNormal, causing plummeting at ledge edges instead
-            // of natural arcs. Full ground friction for movement control continuity.
+            // Grace period: same control model but no slope projection.
             float rate = CONTROL_MULTIPLIER * mMass * friction / VELOCITY_RATE;
             rate = std::min(rate, MAX_CONTROL_RATE);
-            float alpha = rate * dt / mMass;
-            alpha = std::min(alpha, 1.0f);
 
             Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
             Vector3 hDesired(desired.x, desired.y, 0.0f);
-            Vector3 hNew = hVel + (hDesired - hVel) * alpha;
+            Vector3 ctrlAccel = (hDesired - hVel) * rate;
+            Vector3 hIdeal = hVel + ctrlAccel * (dt / mMass);
 
-            if (glm::length2(hDesired) < 0.001f && glm::dot(hNew, hVel) < 0.0f) {
-                hNew = Vector3(0.0f);
+            Vector3 hActual;
+            if (velocityControlled) {
+                hActual = hIdeal;
+            } else {
+                float frictionMag = friction * mMass * mGravityMag;
+                float velMag = glm::length(hVel);
+                float dragScale = std::clamp(50.0f * velMag / mMass, 0.25f, 10.0f);
+                frictionMag *= dragScale;
+
+                if (glm::length2(hIdeal) > 1e-8f) {
+                    Vector3 frictionDir = -glm::normalize(hIdeal);
+                    Vector3 frictionForce = frictionDir * frictionMag;
+                    hActual = hVel + (ctrlAccel + frictionForce) * (dt / mMass);
+                    if (glm::dot(hActual, hIdeal) < 0.0f)
+                        hActual = Vector3(0.0f);
+                } else {
+                    hActual = Vector3(0.0f);
+                }
             }
 
-            mVelocity.x = hNew.x;
-            mVelocity.y = hNew.y;
-            // Z unchanged — gravity handles it during grace
+            mVelocity.x = hActual.x;
+            mVelocity.y = hActual.y;
         } else if (mCurrentMode == PlayerMode::Swim) {
             // ── Swimming: 3D movement with look-direction Z control ──
             // Unlike air/ground which strip Z, swimming uses camera pitch for 3D movement.
