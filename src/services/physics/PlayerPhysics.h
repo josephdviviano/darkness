@@ -410,6 +410,7 @@ public:
     /// caller often passes camera/eye position, and cell geometry may not extend below the floor).
     inline void setPosition(const Vector3 &pos) {
         mPosition = pos;
+        mEndPosition = pos;  // sync so resolveCollisions doesn't teleport to stale {0,0,0}
         mVelocity = Vector3(0.0f);
         mCellIdx = mCollision.findCell(pos);
         if (mCellIdx < 0) {
@@ -603,52 +604,43 @@ private:
         // 3. Update motion pose system (stride targets, progressive blend).
         updateMotionPose();
 
-        // 4. Apply gravity (if airborne — always, even when disabled)
-        applyGravity();
+        // 4. Validate existing contacts — destroys stale/invalid contacts.
+        //    Matches original: ConstrainFromTerrain (phcore.cpp lines 262-368)
+        //    runs in UpdateDynamics BEFORE UpdateModelTransDynamics.
+        validateContacts();
 
-        // 5. Apply horizontal movement from input (skip when disabled)
+        // 5. Apply forces to velocity: gravity + movement input.
+        //    Original: UpdateModelTransDynamics accumulates all forces (gravity,
+        //    buoyancy, friction, control) then integrates in one step.
+        applyGravity();
         if (!mMotionDisabled)
             applyMovement();
 
-        // 6. Update head spring — runs BEFORE collision
-        updateHeadSpring();
-
-        // 7. Pre-constrain velocity against known contact surfaces from the
-        //    previous frame. This removes velocity going into walls BEFORE
-        //    Matches original flow: ConstrainFromTerrain runs FIRST (validates
-        //    contacts, destroys invalid ones), THEN ApplyConstraints uses the
-        //    validated set to remove velocity into surfaces.
-
-        // 7a. Validate existing contacts — destroys stale/invalid contacts.
-        //     Must run BEFORE constrainVelocity so that wall contacts from the
-        //     previous frame's collision detection are removed before they block
-        //     movement. Matches original ConstrainFromTerrain (phcore.cpp lines
-        //     262-368) which validates contacts before ApplyConstraints.
-        validateContacts();
-
-        // 7b. Pre-constrain velocity against validated contacts.
+        // 6. Constrain velocity against validated contacts.
+        //    Matches original: ApplyConstraints (phmod.cpp line 1861) removes
+        //    velocity components going into surfaces AFTER dynamics.
         constrainVelocity();
 
-        // 8. Integrate position — save old position for swept collision detection
-        mPrevPosition = mPosition;
-        integrate();
+        // 7. Update head spring — uses current pose target + spring dynamics
+        updateHeadSpring();
 
-        // 9. Update cell index BEFORE collision — if integration moved
-        //    the player through a portal, collision must test against
-        //    the new cell's walls, not the old cell's.
-        updateCell();
+        // 8. Compute end position WITHOUT moving mPosition.
+        //    Matches original: UpdateModel → UpdateTargetLocation →
+        //    UpdateEndLocation computes EndLocationVec = LocationVec + velocity*dt.
+        //    Position (LocationVec) does NOT advance until UpdatePositions at
+        //    frame end. Collision detection sweeps from LocationVec to EndLocationVec.
+        mPrevPosition = mPosition;  // save for head spring / mantle reference
+        mEndPosition = mPosition + mVelocity * mTimestep.fixedDt;
 
-        // 10. Resolve collisions via 5-sphere constraint projection.
-        //     Position correction for any remaining penetrations (new contacts,
-        //     cell transitions). Merges fresh contacts into mContacts for the next
-        //     frame's constrainVelocity() call.
+        // 9. Resolve collisions: sweep from mPosition to mEndPosition,
+        //    IntegrateToCollision + CheckStep/Bounce, then commit
+        //    mPosition = mEndPosition (UpdatePositions equivalent).
         resolveCollisions(contactCb);
 
-        // 10b. Stair stepping is now integrated into resolveCollisions() above,
-        //      matching the original engine where CheckStep runs DURING collision
-        //      and replaces the bounce response when successful.
+        // 10. Update cell after collision resolution committed position
+        updateCell();
 
-        // 10c. Climbing — detect/maintain/break climb on climbable OBB objects.
+        // 11. Climbing — detect/maintain/break climb on climbable OBB objects.
         //      Must run after collision resolution (needs fresh contacts) and after
         //      stair step (stair step breaks climb). Before detectGround so climbing
         //      prevents ground transition.
@@ -714,8 +706,9 @@ private:
     const CollisionGeometry &mCollision;  // world collision geometry (not owned)
     PhysicsTimestep mTimestep = MODERN;  // active timestep configuration
 
-    Vector3 mPosition{0.0f};       // body center position (ground + 4.2 on flat ground)
-    Vector3 mPrevPosition{0.0f};   // position before integration (for swept collision)
+    Vector3 mPosition{0.0f};       // body center position (LocationVec equivalent)
+    Vector3 mEndPosition{0.0f};    // projected end position (EndLocationVec equivalent)
+    Vector3 mPrevPosition{0.0f};   // position before frame (for head spring, mantle)
     Vector3 mVelocity{0.0f};       // linear velocity
     float mYaw = 0.0f;            // look direction (radians)
     float mCosYaw = 1.0f;         // cached cos(mYaw), updated per step and setYaw()
