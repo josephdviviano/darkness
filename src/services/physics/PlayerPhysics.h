@@ -632,6 +632,25 @@ private:
         mPrevPosition = mPosition;  // save for head spring / mantle reference
         mEndPosition = mPosition + mVelocity * mTimestep.fixedDt;
 
+        // 8b. PreventPlayerFall (D10): original (PHMOD.CPP lines 1660-1721) raycasts
+        //     9 units downward from target position. If a fall is detected while
+        //     moving slowly, resets position to current (prevents walking off edges
+        //     at creep speed). Speed threshold: 0.9× walk (stand) or 0.6× walk (crouch).
+        if (isOnGround() && mCellIdx >= 0) {
+            float hSpeed = horizontalSpeed();
+            float threshold = (mCurrentMode == PlayerMode::Crouch)
+                ? WALK_SPEED * 0.6f : WALK_SPEED * 0.9f;
+            if (hSpeed > 0.1f && hSpeed < threshold) {
+                Vector3 footEnd = mEndPosition + Vector3(0.0f, 0.0f, mSphereOffsetsBase[4]);
+                Vector3 fallProbe = footEnd - Vector3(0.0f, 0.0f, 9.0f);
+                RayHit fallHit;
+                if (!raycastWorld(mCollision.getWR(), footEnd, fallProbe, fallHit)) {
+                    // No ground within 9 units below target — cancel movement
+                    mEndPosition = mPosition;
+                }
+            }
+        }
+
         // 9. Resolve collisions: sweep from mPosition to mEndPosition,
         //    IntegrateToCollision + CheckStep/Bounce, then commit
         //    mPosition = mEndPosition (UpdatePositions equivalent).
