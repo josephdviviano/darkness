@@ -84,6 +84,10 @@ struct SphereContact {
                            // Matches original engine's sSphrContact.time (sphrcst.cpp).
                            // 0 = contact at sweep start, 1 = contact at sweep end.
                            // Used for time-ordered collision processing.
+    Vector3 hitPoint{0.0f}; // collision hit location (world space). For point submodels:
+                           // the raycast intersection on the polygon surface. Used by
+                           // IntegrateToCollision (PHCORE.CPP lines 5145-5151) which
+                           // computes backup from the hit location directly for points.
 };
 
 /// Collision geometry wrapper over WR parsed data.
