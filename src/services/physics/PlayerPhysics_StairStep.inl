@@ -308,21 +308,40 @@
                 mVelocity.x, mVelocity.y, mVelocity.z);
         }
 
-        // 1. Apply gravity for remaining time — unconditionally.
+        // 1. Rebuild constraints from current contacts.
+        //    Original PostCollisionUpdate (phcore.cpp lines 4131-4136):
+        //      ClearConstraints()
+        //      ConstrainFromObjects(i) + ConstrainFromTerrain(i) for each submodel
+        //    The synthetic FOOT contact created by CheckStep needs to produce a
+        //    floor constraint so gravity doesn't pull the player through the tread.
+        //    Without this, constrainVelocity() uses stale constraints from the
+        //    frame start — missing the new tread's floor constraint.
+        mConstraints.clear();
+        for (const auto &c : mContacts) {
+            if (c.isEdge) {
+                // Edge: distance-only check (simplified — contact just created)
+                mConstraints.push_back({c.normal, c.objectId});
+            } else {
+                // Face: trust the contact is valid (just created by CheckStep or
+                // validated at frame start). Original rebuilds from persistent
+                // contacts without re-validating distance/polygon.
+                mConstraints.push_back({c.normal, c.objectId});
+            }
+        }
+
+        // 2. Apply gravity for remaining time — unconditionally.
         //    Original: PostCollisionUpdate (phcore.cpp line 4142) calls
         //    UpdateModelDynamics which applies gravity every frame (lines 1417-1421).
-        //    No ground-state guard. constrainVelocity() removes the downward
-        //    component if floor contacts exist.
         mVelocity.z -= mGravityMag * dt;
 
-        // 2. Apply movement control for remaining time
+        // 3. Apply movement control for remaining time
         //    Original: UpdateModelControls applies player input.
-        //    Uses the NEW contacts (synthetic foot) for friction calculation.
         applyMovement();
 
-        // 3. Constrain velocity against new contacts
-        //    Original: ClearConstraints + ConstrainFromTerrain + ApplyConstraints.
-        //    The synthetic foot contact prevents downward velocity.
+        // 4. Constrain velocity against rebuilt contacts.
+        //    Original: ApplyConstraints (phmod.cpp line 1861) removes velocity
+        //    into surfaces. The new tread's floor constraint removes downward
+        //    velocity from gravity, preventing the player from falling through.
         constrainVelocity();
 
         if (mStepLog) {
@@ -466,6 +485,16 @@
                 if (t < earliestRiserTime) {
                     earliestRiserTime = t;
                     bestRiserIdx = ci;
+                }
+            }
+
+            if (mStepLog) {
+                std::fprintf(stderr, "[STEP-REINT] cascade search: %zu contacts, bestRiser=%d\n",
+                    mIterContacts.size(), bestRiserIdx);
+                for (int ci = 0; ci < static_cast<int>(mIterContacts.size()); ++ci) {
+                    const auto &c = mIterContacts[ci];
+                    std::fprintf(stderr, "[STEP-REINT]   [%d] sub=%d n=(%.2f,%.2f,%.2f) t=%.3f edge=%d\n",
+                        ci, c.submodelIdx, c.normal.x, c.normal.y, c.normal.z, c.time, c.isEdge);
                 }
             }
 
