@@ -57,6 +57,14 @@
 
 namespace Darkness {
 
+/// Per-frame velocity constraint — rebuilt from validated contacts each frame.
+/// Matches the original Dark Engine's tConstraint { ObjID cause; mxs_vector dir; }.
+/// Constraints are ephemeral (cleared + rebuilt every frame); contacts are persistent.
+struct VelocityConstraint {
+    Vector3 normal;      // constraint direction (prevents motion in this direction)
+    int32_t objectId;    // which object caused this constraint (-1 = terrain)
+};
+
 /// Player physics simulation — custom 5-submodel polygon collision (2 real spheres + 3 point detectors).
 /// Owns the player's position, velocity, and movement state.
 /// Updated each frame by DarkPhysics::step().
@@ -319,6 +327,10 @@ public:
     /// Last frame's contacts (for push system to inspect object collisions).
     const std::vector<SphereContact> &getContacts() const { return mContacts; }
 
+    /// Object ID of the surface the player's feet are touching (-1 = none/terrain cell).
+    /// Matches original Dark Engine's GetGroundObj(). Used for footstep sounds.
+    int32_t getGroundObjID() const { return mGroundObjID; }
+
     /// Forward direction (X-Y plane, from yaw). Z-up coordinate system.
     Vector3 getForward() const {
         return Vector3(mCosYaw, mSinYaw, 0.0f);
@@ -430,6 +442,7 @@ public:
         mGroundGraceTimer = 0.0f;
         mGroundGraceActive = false;
         mContacts.clear();
+        mConstraints.clear();
 
         // Reset spring state — teleporting should not carry old spring velocity
         // into the new position, which would cause oscillation on arrival.
@@ -809,9 +822,13 @@ private:
     // Stride timing — last stride activation time for diagnostics/logging
     float mLastStrideSimTime   = 0.0f;  // simTime when last stride was activated
 
-    // Ground contact normal and texture from last collision pass
+    // Ground contact normal, texture, and object from last collision pass.
+    // mGroundObjID matches original Dark Engine's m_GroundObj — tracks which terrain
+    // or object the player's feet are touching. Updated during validateContacts()
+    // on FOOT contact transitions. Used for footstep sound placement and material lookup.
     Vector3 mGroundNormal{0.0f, 0.0f, 1.0f};
     int32_t mGroundTextureIdx = -1;  // texture index of ground surface (for footstep material)
+    int32_t mGroundObjID = -1;       // object ID of ground surface (-1 = none/terrain cell)
 
     // Platform riding state — tracks which moving platform the player is standing on.
     // When grounded on a moving terrain object, its velocity is added to the player's
@@ -843,10 +860,15 @@ private:
     float mLeanAmount     = 0.0f; // collision-limited lateral offset (derived from spring each frame)
 
     // Live contact list — validated each frame by validateContacts(), new contacts
-    // added during resolveCollisions(). Matches original Dark Engine where contacts
-    // persist in a linked list, validated by ConstrainFromTerrain, destroyed immediately
-    // when invalid. No age-based persistence.
+    // added during resolveCollisions(). Contacts are persistent collision records
+    // that survive across frames (destroyed only when validation fails).
     std::vector<SphereContact> mContacts;
+
+    // Per-frame velocity constraints — rebuilt from validated contacts each frame
+    // by validateContacts(). Constraints are ephemeral velocity normals that prevent
+    // penetration. Matches original Dark Engine separation: contacts persist in
+    // g_PhysContactLinks, constraints rebuilt in ConstrainFromTerrain/Objects each frame.
+    std::vector<VelocityConstraint> mConstraints;
 
     // Pre-allocated scratch buffers for resolveCollisions() — avoids per-step heap allocs
     std::vector<SphereContact> mFreshContacts;               // per-frame fresh contact accumulator

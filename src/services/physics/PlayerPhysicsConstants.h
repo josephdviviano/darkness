@@ -284,8 +284,14 @@ static inline Vector3 computeSpringVelocity(
     newVel.z *= zScale;
     newVel = newVel + oldVel * dampingEff;
 
+    // Velocity capping — original (PHMOD.CPP lines 2313-2323): cap is raised when
+    // falling so the spring doesn't fight gravity. Prevents visual "bounce" on landing.
+    // if (-velocity.z > maxmag) maxmag = -velocity.z
+    float effectiveCap = velCap;
+    if (-newVel.z > effectiveCap)
+        effectiveCap = -newVel.z;
     float mag = glm::length(newVel);
-    if (mag > velCap) newVel *= velCap / mag;
+    if (mag > effectiveCap) newVel *= effectiveCap / mag;
     return newVel;
 }
 
