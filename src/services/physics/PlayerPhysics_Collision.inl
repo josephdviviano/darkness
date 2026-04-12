@@ -384,12 +384,19 @@
                     // Static contacts (time < 0) use fallback timing.
                     float t = c.time;
                     if (t < 0.0f) t = 0.5f;  // static contact: estimate mid-frame
-                    // NOTE: The original's PortalRaycast use_zero_epsilon=TRUE has a
-                    // `start_dist > 0.0` check (WRCAST.C line 770), but this operates on
-                    // the EXTENDED early_point (ray origin - 2*delta), not the actual ray
-                    // start. Our raycastWorld already implements the early_point extension
-                    // internally, so the equivalent filtering happens inside the raycast.
-                    // No additional startDist filter is needed here.
+                    // Both engines have the same 2× backward ray extension (earlyPoint)
+                    // that can detect riser planes behind the actual ray start. Filter
+                    // contacts where the foot has already crossed the riser — these are
+                    // false positives from the earlyPoint extension. The original absorbs
+                    // the resulting 0.32 cascade step within the same PhysicsFrame; we
+                    // filter it here to prevent it appearing as a separate frame's step.
+                    if (c.submodelIdx >= 2 && c.time >= 0.0f &&
+                        glm::length2(c.hitPoint) > 1e-6f) {
+                        float footOffsetZ = mSphereOffsetsBase[c.submodelIdx];
+                        Vector3 footStart = origPos + Vector3(0.0f, 0.0f, footOffsetZ);
+                        float startDist = glm::dot(c.normal, footStart - c.hitPoint);
+                        if (startDist <= 0.0f) continue;
+                    }
                     if (t < earliestTime) {
                         earliestTime = t;
                         bestContactIdx = ci;
