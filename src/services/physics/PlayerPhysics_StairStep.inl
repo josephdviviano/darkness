@@ -441,31 +441,81 @@
                 mIterContacts.size(), mPosition.x, mPosition.y, mPosition.z);
         }
 
-        // Push out of any penetrations from re-integration
+        // ── Cascade collision processing (matching original PostCollisionUpdate) ──
+        // Original: CheckModelTerrainCollisions queues new collisions, ResolveCollisions
+        // processes them with IntegrateToCollision + CheckStep. The model_time tracking
+        // ensures IntegrateToCollision only advances by the remaining time fraction.
+        // We check for riser contacts and attempt CheckStep before doing push-out.
         if (!mIterContacts.empty()) {
-            mPushes.clear();
-            for (const auto &c : mIterContacts) {
-                Vector3 pushNormal = c.normal;
-                if (pushNormal.z > 0.0f && pushNormal.z < WALKABLE_SLOPE_THRESHOLD) {
-                    pushNormal.z = 0.0f;
-                    float len = glm::length(pushNormal);
-                    if (len > 0.001f) pushNormal /= len;
-                    else continue;
+            // Check for riser contacts that should trigger cascade stair step
+            float earliestRiserTime = 2.0f;
+            int bestRiserIdx = -1;
+            for (int ci = 0; ci < static_cast<int>(mIterContacts.size()); ++ci) {
+                const auto &c = mIterContacts[ci];
+                if (c.submodelIdx < 2) continue;
+                if (std::fabs(c.normal.z) >= STEP_WALL_THRESHOLD) continue;
+                if (c.isEdge) continue;
+                float t = c.time >= 0.0f ? c.time : 0.5f;
+                // Skip contacts at sweep start (foot ON the plane)
+                if (c.submodelIdx >= 2 && c.time >= 0.0f) {
+                    float footOff = mSphereOffsetsBase[c.submodelIdx];
+                    Vector3 footSt = preReintegratePos + Vector3(0.0f, 0.0f, footOff);
+                    float sDist = glm::dot(c.normal, footSt - c.hitPoint);
+                    if (sDist <= 0.0f) continue;
                 }
-                bool merged = false;
-                for (auto &p : mPushes) {
-                    if (glm::dot(c.normal, p.first) > 0.99f) {
-                        p.second = std::max(p.second, c.penetration);
-                        merged = true;
-                        break;
-                    }
+                if (t < earliestRiserTime) {
+                    earliestRiserTime = t;
+                    bestRiserIdx = ci;
                 }
-                if (!merged)
-                    mPushes.push_back({pushNormal, c.penetration});
             }
-            for (const auto &p : mPushes)
-                mPosition += p.first * p.second;
 
+            if (bestRiserIdx >= 0) {
+                // Cascade CheckStep — matches original PostCollisionUpdate → ResolveCollisions
+                float cascadeFrac = std::clamp(earliestRiserTime, 0.0f, 1.0f);
+                float cascadeRemaining = dt * (1.0f - cascadeFrac);
+                cascadeRemaining = std::max(cascadeRemaining, 0.0001f);
+
+                // IntegrateToCollision for point submodel (use hit location)
+                const auto &rc = mIterContacts[bestRiserIdx];
+                Vector3 cascadeBackup;
+                if (rc.submodelIdx >= 2) {
+                    float footOff = mSphereOffsetsBase[rc.submodelIdx];
+                    Vector3 footPos = preReintegratePos + Vector3(0.0f, 0.0f, footOff);
+                    Vector3 footBk = footPos + (rc.hitPoint - footPos) * kPartialBackupAmt;
+                    cascadeBackup = footBk - Vector3(0.0f, 0.0f, footOff);
+                } else {
+                    cascadeBackup = preReintegratePos + mVelocity *
+                        (cascadeFrac * dt * kPartialBackupAmt);
+                }
+
+                if (mStepLog) {
+                    std::fprintf(stderr, "[STEP-REINT] cascade riser sub=%d n=(%.2f,%.2f,%.2f) "
+                        "remaining=%.4f\n", rc.submodelIdx,
+                        rc.normal.x, rc.normal.y, rc.normal.z, cascadeRemaining);
+                }
+
+                if (tryStairStepFromContacts(mIterContacts, cascadeRemaining, cascadeBackup)) {
+                    // Cascade step succeeded — postStepReIntegrate already called recursively
+                    return;
+                }
+
+                // Cascade step failed — bounce and continue
+                float dp = glm::dot(mVelocity, rc.normal);
+                if (dp < 0.0f) {
+                    float dampen = mElasticity * kTerrainBounce;
+                    mVelocity -= rc.normal * dp * (1.0f + dampen);
+                }
+            }
+
+            // No push-out in PostCollisionUpdate — the original engine does NOT
+            // do position += normal * penetration during collision resolution.
+            // Collision response is purely velocity-based (bounce reflection)
+            // plus position advancement (IntegrateToCollision). Push-out only
+            // exists in the main resolveCollisions loop, not in the post-step
+            // re-integration path. See PHCORE.CPP lines 4122-4152.
+            //
+            // We still accumulate contacts for next frame's constrainVelocity,
+            // but do NOT modify mPosition based on penetration.
             // Accumulate contacts for next frame's constrainVelocity
             mFreshContacts.insert(mFreshContacts.end(),
                                  mIterContacts.begin(), mIterContacts.end());
