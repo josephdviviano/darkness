@@ -384,20 +384,12 @@
                     // Static contacts (time < 0) use fallback timing.
                     float t = c.time;
                     if (t < 0.0f) t = 0.5f;  // static contact: estimate mid-frame
-                    // Skip contacts where the submodel starts ON or BEHIND the plane.
-                    // Matches original: PortalRaycast with use_zero_epsilon=TRUE (used for
-                    // point submodel collision, PHMODSPH.CPP line 198) has the check
-                    // `if (start_dist > 0.0)` at WRCAST.C line 770 — planes at distance
-                    // ≤ 0 from the ray start are skipped. This prevents re-detecting a
-                    // riser the foot was placed on by a previous stair step.
-                    // We check the contact's hitPoint: if the foot's start position is
-                    // not strictly in front of the hit plane, skip the contact.
-                    if (c.submodelIdx >= 2 && c.time >= 0.0f) {
-                        float footOffsetZ = mSphereOffsetsBase[c.submodelIdx];
-                        Vector3 footStart = origPos + Vector3(0.0f, 0.0f, footOffsetZ);
-                        float startDist = glm::dot(c.normal, footStart - c.hitPoint);
-                        if (startDist <= 0.0f) continue;  // foot starts ON or behind the plane
-                    }
+                    // NOTE: The original's PortalRaycast use_zero_epsilon=TRUE has a
+                    // `start_dist > 0.0` check (WRCAST.C line 770), but this operates on
+                    // the EXTENDED early_point (ray origin - 2*delta), not the actual ray
+                    // start. Our raycastWorld already implements the early_point extension
+                    // internally, so the equivalent filtering happens inside the raycast.
+                    // No additional startDist filter is needed here.
                     if (t < earliestTime) {
                         earliestTime = t;
                         bestContactIdx = ci;
