@@ -88,6 +88,10 @@ struct SphereContact {
                            // the raycast intersection on the polygon surface. Used by
                            // IntegrateToCollision (PHCORE.CPP lines 5145-5151) which
                            // computes backup from the hit location directly for points.
+    Vector3 edgeStart{0.0f}; // edge contact start vertex (world space). Stored so
+    Vector3 edgeEnd{0.0f};   // validateContacts can recompute closest-point distance
+                           // each frame, matching original's cEdgeContact::GetDist()
+                           // (PHCONTCT.CPP lines 425-452).
 };
 
 /// Collision geometry wrapper over WR parsed data.
@@ -449,6 +453,9 @@ private:
                 contact.polyIdx = pi;
                 contact.textureIdx = textureIdx;
                 contact.isEdge = true;  // edge contact (kPC_TerrainEdge equivalent)
+                contact.hitPoint = closest; // closest point on edge
+                contact.edgeStart = a;      // store endpoints for GetDist validation
+                contact.edgeEnd = b;
                 outContacts.push_back(contact);
             }
         }
@@ -517,6 +524,9 @@ private:
                 contact.polyIdx = pi;
                 contact.textureIdx = textureIdx;
                 contact.isEdge = true;  // edge contact (kPC_TerrainEdge equivalent)
+                contact.hitPoint = closest; // closest point on edge
+                contact.edgeStart = a;      // store endpoints for GetDist validation
+                contact.edgeEnd = b;
                 outContacts.push_back(contact);
             }
         }

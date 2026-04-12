@@ -262,6 +262,10 @@
             footContact.fresh = true;
             footContact.submodelIdx = 4;
             mContacts.push_back(footContact);
+            // SetGroundObj (D20): update ground surface on stair step.
+            // Matches original (PHCORE.CPP line 5511):
+            // g_pPlayerMovement->SetGroundObj(new_contact.GetObjID())
+            mGroundObjID = footContact.objectId;
         }
 
         // Break any active climb state before mode transition.
@@ -596,6 +600,10 @@
             objContact.submodelIdx = 4;
             objContact.objectId = stepOBB->objID;
             mContacts.push_back(objContact);
+            // SetGroundObj (D20): update ground surface on object stair step.
+            // Matches original (PHCORE.CPP line 5537):
+            // g_pPlayerMovement->SetGroundObj(pOBBModel->GetObjID())
+            mGroundObjID = stepOBB->objID;
         }
 
         if (mCurrentMode != PlayerMode::Stand &&

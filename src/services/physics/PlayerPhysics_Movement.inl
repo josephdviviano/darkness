@@ -206,28 +206,40 @@
                 hActual = hIdeal;
             } else {
                 // No input — apply friction to decelerate.
-                // Original: friction opposes ideal_velocity direction, magnitude =
-                // friction_amt * mass * gravity * drag_scale
+                // Original PHCORE.CPP: friction is 3D, opposes ideal_velocity direction,
+                // magnitude = friction_amt * mass * gravity * drag_scale
                 float frictionMag = friction * mMass * mGravityMag;
 
                 // Velocity-dependent drag (D3): scale = clamp(50 * |vel| / mass, 0.25, 10)
-                float velMag = glm::length(hVel);
+                Vector3 vel3D(hVel.x, hVel.y, prevZ);
+                float velMag = glm::length(vel3D);
                 float dragScale = std::clamp(50.0f * velMag / mMass, 0.25f, 10.0f);
                 frictionMag *= dragScale;
 
-                // Z-axis friction boost (D4): friction.z *= 1.4
-                // Applied later if needed for vertical component
+                // Use 3D ideal velocity for friction direction (original is fully 3D)
+                Vector3 ideal3D(hIdeal.x, hIdeal.y, prevZ);
 
-                if (glm::length2(hIdeal) > 1e-8f) {
-                    Vector3 frictionDir = -glm::normalize(hIdeal);
-                    Vector3 frictionForce = frictionDir * frictionMag;
-                    hActual = hVel + (ctrlAccel + frictionForce) * (dt / mMass);
+                if (glm::length2(ideal3D) > 1e-8f) {
+                    Vector3 frictionForce = -glm::normalize(ideal3D) * frictionMag;
+
+                    // Z-axis friction boost (D4): PHCORE.CPP lines 1474-1477
+                    bool onPlatform = (mPlatformObjID != 0);
+                    if (onPlatform && ideal3D.z < 0.0f)
+                        frictionForce.z = 0.0f;
+                    else
+                        frictionForce.z *= 1.4f;
+
+                    Vector3 actual3D = vel3D + (Vector3(ctrlAccel.x, ctrlAccel.y, 0.0f) + frictionForce) * (dt / mMass);
 
                     // Reversal check (D2): if friction reversed direction, zero velocity
-                    if (glm::dot(hActual, hIdeal) < 0.0f)
-                        hActual = Vector3(0.0f);
+                    if (glm::dot(actual3D, ideal3D) < 0.0f)
+                        actual3D = Vector3(0.0f);
+
+                    hActual = Vector3(actual3D.x, actual3D.y, 0.0f);
+                    prevZ = actual3D.z;
                 } else {
                     hActual = Vector3(0.0f);
+                    prevZ = 0.0f;
                 }
             }
 
@@ -248,19 +260,35 @@
             if (velocityControlled) {
                 hActual = hIdeal;
             } else {
+                // 3D friction with Z-axis boost, same as main ground path
                 float frictionMag = friction * mMass * mGravityMag;
-                float velMag = glm::length(hVel);
+                float prevZ = mVelocity.z;
+                Vector3 vel3D(hVel.x, hVel.y, prevZ);
+                float velMag = glm::length(vel3D);
                 float dragScale = std::clamp(50.0f * velMag / mMass, 0.25f, 10.0f);
                 frictionMag *= dragScale;
 
-                if (glm::length2(hIdeal) > 1e-8f) {
-                    Vector3 frictionDir = -glm::normalize(hIdeal);
-                    Vector3 frictionForce = frictionDir * frictionMag;
-                    hActual = hVel + (ctrlAccel + frictionForce) * (dt / mMass);
-                    if (glm::dot(hActual, hIdeal) < 0.0f)
-                        hActual = Vector3(0.0f);
+                Vector3 ideal3D(hIdeal.x, hIdeal.y, prevZ);
+
+                if (glm::length2(ideal3D) > 1e-8f) {
+                    Vector3 frictionForce = -glm::normalize(ideal3D) * frictionMag;
+
+                    // Z-axis friction boost (D4): PHCORE.CPP lines 1474-1477
+                    bool onPlatform = (mPlatformObjID != 0);
+                    if (onPlatform && ideal3D.z < 0.0f)
+                        frictionForce.z = 0.0f;
+                    else
+                        frictionForce.z *= 1.4f;
+
+                    Vector3 actual3D = vel3D + (Vector3(ctrlAccel.x, ctrlAccel.y, 0.0f) + frictionForce) * (dt / mMass);
+                    if (glm::dot(actual3D, ideal3D) < 0.0f)
+                        actual3D = Vector3(0.0f);
+
+                    hActual = Vector3(actual3D.x, actual3D.y, 0.0f);
+                    mVelocity.z = actual3D.z;
                 } else {
                     hActual = Vector3(0.0f);
+                    mVelocity.z = 0.0f;
                 }
             }
 
@@ -411,6 +439,13 @@
     static constexpr float kContactTransitionDist = 0.1f;    // original: look_offset scale
 
     inline void validateContacts() {
+        // Clear per-frame constraints FIRST — rebuilt from validated contacts below.
+        // Matches original Dark Engine ClearConstraints() (PHMOD.H lines 1276-1282)
+        // called at the start of each frame before ConstrainFromTerrain/Objects.
+        // Must happen before the early return so stale constraints don't persist
+        // when player is outside collision geometry.
+        mConstraints.clear();
+
         if (mCellIdx < 0) return;
 
         // Iterate backwards for safe erasure
@@ -440,10 +475,11 @@
                 // Compute submodel position for this contact
                 int subIdx = std::clamp(static_cast<int>(c.submodelIdx), 0, NUM_SPHERES - 1);
                 float poseOZ = 0.0f;
-                if (subIdx == 0) poseOZ = mPoseCurrent.z;
+                Vector3 springOff(0.0f);
+                if (subIdx == 0) { poseOZ = mSpringPos.z; springOff = Vector3(mSpringPos.x, mSpringPos.y, 0.0f); }
                 else if (subIdx == 1) poseOZ = mBodyPoseCurrent.z;
                 float offZ = mSphereOffsetsBase[subIdx] + poseOZ;
-                Vector3 subPos = mPosition + Vector3(0.0f, 0.0f, offZ);
+                Vector3 subPos = mPosition + Vector3(0.0f, 0.0f, offZ) + springOff;
                 float subRadius = mSphereRadii[subIdx];
 
                 int faceIdx = c.polyIdx & 0xF;
@@ -502,7 +538,15 @@
                     continue;
                 }
 
-                // Contact valid — keep
+                // Contact valid — create constraint from it.
+                // Matches original ConstrainFromObjects (PHCORE.CPP line 543):
+                // pModel->AddConstraint(pModel2->GetObjID(), i, normal)
+                mConstraints.push_back({c.normal, c.objectId});
+                // SetGroundObj (D20): track ground surface for FOOT floor contacts on objects.
+                // Matches original (PHCORE.CPP line 5537):
+                // g_pPlayerMovement->SetGroundObj(pOBBModel->GetObjID())
+                if (c.submodelIdx == 4 && c.normal.z > GROUND_NORMAL_MIN)
+                    mGroundObjID = c.objectId;
                 continue;
             }
 
@@ -519,28 +563,81 @@
 
             // Compute submodel position for this contact
             float poseOffsetZ = 0.0f;
-            if (c.submodelIdx == 0) poseOffsetZ = mPoseCurrent.z;
+            Vector3 springOff2(0.0f);
+            if (c.submodelIdx == 0) { poseOffsetZ = mSpringPos.z; springOff2 = Vector3(mSpringPos.x, mSpringPos.y, 0.0f); }
             else if (c.submodelIdx == 1) poseOffsetZ = mBodyPoseCurrent.z;
             int subIdx = std::clamp(static_cast<int>(c.submodelIdx), 0, NUM_SPHERES - 1);
             float offsetZ = mSphereOffsetsBase[subIdx] + poseOffsetZ;
-            Vector3 subPos = mPosition + Vector3(0.0f, 0.0f, offsetZ);
+            Vector3 subPos = mPosition + Vector3(0.0f, 0.0f, offsetZ) + springOff2;
 
             const auto &plane = cell.planes[cell.polygons[c.polyIdx].plane];
             float distToPlane = plane.getDistance(subPos);
 
             bool closeToPlane = (std::fabs(distToPlane) <= kBreakTerrainContactDist);
-            bool insidePoly = false;
-            if (closeToPlane) {
-                Vector3 projected = subPos - plane.normal * distToPlane;
-                Vector3 windNormal = -plane.normal;
-                insidePoly = pointInConvexPolygon(projected, cell.vertices,
-                                                  cell.polyIndices[c.polyIdx],
-                                                  windNormal);
-            }
 
-            if (closeToPlane && insidePoly) {
-                // Contact still valid — keep it for constrainVelocity
-                continue;
+            if (c.isEdge) {
+                // Edge/vertex contacts: distance-only validation (no point-in-polygon).
+                // Matches original ConstrainFromTerrain (PHCORE.CPP lines 370-438):
+                // TerrainDistance calls cEdgeContact::GetDist (PHCONTCT.CPP lines 425-452)
+                // which computes the closest-point-on-segment distance each frame.
+                // Algorithm: project subPos onto the edge line. If past either endpoint,
+                // use endpoint distance. Otherwise use perpendicular distance via cross product.
+                float subRadius = mSphereRadii[subIdx];
+                float edgeDist;
+                if (glm::length2(c.edgeStart) > 1e-6f || glm::length2(c.edgeEnd) > 1e-6f) {
+                    // Proper closest-point-on-segment distance (original GetDist formula)
+                    Vector3 v1c = subPos - c.edgeStart;
+                    Vector3 v2c = subPos - c.edgeEnd;
+                    Vector3 edgeVec = c.edgeStart - c.edgeEnd;
+
+                    if (glm::dot(v1c, edgeVec) > 0.0f) {
+                        // Past start vertex — use distance to start
+                        edgeDist = glm::length(subPos - c.edgeStart) - subRadius;
+                    } else if (glm::dot(v2c, edgeVec) < 0.0f) {
+                        // Past end vertex — use distance to end
+                        edgeDist = glm::length(subPos - c.edgeEnd) - subRadius;
+                    } else {
+                        // Between vertices — perpendicular distance via cross product
+                        // ||cross(v1c, edge)|| / ||edge|| = distance from line
+                        Vector3 crossProd = glm::cross(v1c, edgeVec);
+                        float edgeLenSq = glm::dot(edgeVec, edgeVec);
+                        edgeDist = (edgeLenSq > 1e-12f)
+                            ? std::sqrt(glm::dot(crossProd, crossProd) / edgeLenSq) - subRadius
+                            : glm::length(v1c) - subRadius;
+                    }
+                } else {
+                    // Edge endpoints not stored — fall back to plane distance
+                    edgeDist = std::fabs(distToPlane) - subRadius;
+                }
+                if (edgeDist < kBreakTerrainContactDist) {
+                    mConstraints.push_back({c.normal, c.objectId});
+                    continue;
+                }
+            } else {
+                // Face contacts: distance + point-in-polygon validation.
+                // Matches original ConstrainFromTerrain (PHCORE.CPP lines 269-368):
+                // Face contacts require SubModOnPoly() in addition to distance check.
+                bool insidePoly = false;
+                if (closeToPlane) {
+                    Vector3 projected = subPos - plane.normal * distToPlane;
+                    Vector3 windNormal = -plane.normal;
+                    insidePoly = pointInConvexPolygon(projected, cell.vertices,
+                                                      cell.polyIndices[c.polyIdx],
+                                                      windNormal);
+                }
+
+                if (closeToPlane && insidePoly) {
+                    // Contact still valid — create constraint from it.
+                    // Matches original (PHCORE.CPP line 288):
+                    // pModel->AddConstraint(pFaceContact->GetObjID(), i, pFaceContact->GetNormal())
+                    mConstraints.push_back({c.normal, c.objectId});
+                    // SetGroundObj (D20): track ground surface for FOOT floor contacts.
+                    // Matches original (PHCORE.CPP line 329):
+                    // g_pPlayerMovement->SetGroundObj(faceContact.GetObjID())
+                    if (c.submodelIdx == 4 && c.normal.z > GROUND_NORMAL_MIN)
+                        mGroundObjID = c.objectId;
+                    continue;
+                }
             }
 
             // Contact invalid — try transition for FOOT floor contacts
@@ -571,6 +668,11 @@
                     c.textureIdx = transitionHit.textureIndex;
                     c.fresh = true;
                     transitioned = true;
+
+                    // Create constraint from transitioned contact
+                    mConstraints.push_back({c.normal, c.objectId});
+                    // SetGroundObj (D20): update ground surface on FOOT transition
+                    mGroundObjID = c.objectId;
 
                     if (mStepLog) {
                         std::fprintf(stderr, "[STEP-TRANSITION] foot contact transition: "
@@ -607,6 +709,7 @@
                         mCurrentMode = PlayerMode::Jump;
                         mGroundGraceTimer = 0.0f;
                         mGroundGraceActive = false;
+                        mGroundObjID = -1;
                     }
                 }
             }
