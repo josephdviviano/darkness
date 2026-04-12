@@ -1,80 +1,127 @@
 // Included inside PlayerPhysics class body — do not include standalone.
 
-    /// Pre-constrain velocity against known contact surfaces from the previous frame. Removes
-    /// velocity components going into known walls/floor, preventing the body from moving into
-    /// surfaces and needing to be pushed back out (reduces jitter). The position-correction pass
-    /// in resolveCollisions() still runs after integration to handle new contacts.
+    /// Pre-constrain velocity against per-frame constraints (rebuilt from validated contacts
+    /// by validateContacts()). Removes velocity components going into known surfaces,
+    /// preventing the body from moving into walls/floor and needing to be pushed back out.
+    /// Matches original Dark Engine's ApplyConstraints (PHMOD.CPP lines 1053-1118).
     inline void constrainVelocity() {
-        if (mContacts.empty()) return;
+        if (mConstraints.empty()) return;
 
-        if (mStepLog && !mContacts.empty()) {
-            std::fprintf(stderr, "[CONSTRAIN] %zu contacts, vel=(%.2f,%.2f,%.2f)\n",
-                mContacts.size(), mVelocity.x, mVelocity.y, mVelocity.z);
-            for (const auto &c : mContacts) {
-                std::fprintf(stderr, "[CONSTRAIN]   sub=%d n=(%.2f,%.2f,%.2f) cell=%d poly=%d fresh=%d\n",
-                    c.submodelIdx, c.normal.x, c.normal.y, c.normal.z,
-                    c.cellIdx, c.polyIdx, c.fresh);
+        if (mStepLog) {
+            std::fprintf(stderr, "[CONSTRAIN] %zu constraints, vel=(%.2f,%.2f,%.2f)\n",
+                mConstraints.size(), mVelocity.x, mVelocity.y, mVelocity.z);
+            for (const auto &con : mConstraints) {
+                std::fprintf(stderr, "[CONSTRAIN]   n=(%.2f,%.2f,%.2f) obj=%d\n",
+                    con.normal.x, con.normal.y, con.normal.z, con.objectId);
             }
         }
 
-        // Collect unique constraint normals from validated contacts.
-        // Bounded by de-duplication — at most ~5 unique wall directions.
-        static constexpr int MAX_CONSTRAINTS = 8;
+        // Collect constraint normals from mConstraints (built by validateContacts).
+        // Matches original PhysConstrain (PHUTILS.CPP lines 147-154): extracts
+        // direction vectors from tConstraint list for PhysRemNormComp.
+        static constexpr int MAX_CONSTRAINTS = 12;
         Vector3 constraintBuf[MAX_CONSTRAINTS];
         int constraintCount = 0;
 
-        for (const auto &c : mContacts) {
-            // Use FULL normals for velocity constraints (matches original engine's
-            // AddConstraint which stores the unmodified surface normal). This removes
-            // velocity going INTO the surface in 3D, allowing natural sliding along it.
-            // The position push-out (resolveCollisions) separately uses horizontal-only
-            // normals for steep surfaces to prevent upward lift.
-            float vn = glm::dot(mVelocity, c.normal);
-            if (vn >= 0.0f) continue;
-
+        for (const auto &con : mConstraints) {
+            if (constraintCount >= MAX_CONSTRAINTS) break;
+            // De-duplicate by normal direction to prevent double-removal
             bool duplicate = false;
             for (int i = 0; i < constraintCount; ++i) {
-                if (glm::dot(c.normal, constraintBuf[i]) > 0.99f) { duplicate = true; break; }
+                if (glm::dot(con.normal, constraintBuf[i]) > 0.99f) { duplicate = true; break; }
             }
-            if (!duplicate && constraintCount < MAX_CONSTRAINTS)
-                constraintBuf[constraintCount++] = c.normal;
+            if (!duplicate)
+                constraintBuf[constraintCount++] = con.normal;
         }
 
-        // Apply constraint-based velocity removal
+        // PhysRemNormComp — faithful reimplementation (PHUTILS.CPP lines 26-113).
+        // Removes velocity components going into constrained surfaces.
+        //
+        // The original ALWAYS routes through the N-constraint solver for 2+ constraints.
+        // The N-solver filters by actual violation first (dot <= 0), then decides whether
+        // to use the 2-constraint crease slide or sequential single-constraint removal.
+        // We must NOT short-circuit to the crease slide for 2 constraints — a floor + wall
+        // combination where velocity only violates one surface must apply single removal,
+        // not crease projection (which would lock movement to the floor/wall edge).
         if (constraintCount == 1) {
-            // Single surface — remove velocity component along the normal
+            // Single constraint: remove component along normal (lines 115-122).
             float vn = glm::dot(mVelocity, constraintBuf[0]);
             if (vn < 0.0f)
                 mVelocity -= constraintBuf[0] * vn;
 
-        } else if (constraintCount == 2) {
-            // Two surfaces (crease/wedge) — slide along the edge between them
-            Vector3 edge = glm::cross(constraintBuf[0], constraintBuf[1]);
-            float edgeLen = glm::length(edge);
-            if (edgeLen > 1e-6f) {
-                edge /= edgeLen;
-                mVelocity = edge * glm::dot(mVelocity, edge);
-            } else {
-                float vn = glm::dot(mVelocity, constraintBuf[0]);
-                if (vn < 0.0f)
-                    mVelocity -= constraintBuf[0] * vn;
+        } else if (constraintCount >= 2) {
+            // N-constraint solver (lines 26-113): filter, test 2-pairs, sequential fallback.
+            Vector3 origVel = mVelocity;
+
+            // Step 1: Find which constraints are actually violated (dot <= 0).
+            int realCount = 0;
+            int realIdx1 = -1, realIdx2 = -1;
+            for (int i = 0; i < constraintCount; ++i) {
+                if (glm::dot(mVelocity, constraintBuf[i]) <= 0.0f) {
+                    realCount++;
+                    if (realCount > 2) break;
+                    if (realIdx1 < 0) realIdx1 = i;
+                    else realIdx2 = i;
+                }
             }
 
-        } else if (constraintCount >= 3) {
-            // Corner (3+ surfaces) — project onto edge, validate direction
-            Vector3 origVel = mVelocity;
-            Vector3 edge = glm::cross(constraintBuf[0], constraintBuf[1]);
-            float edgeLen = glm::length(edge);
-            if (edgeLen > 1e-6f) {
-                edge /= edgeLen;
-                Vector3 projected = edge * glm::dot(mVelocity, edge);
-                if (glm::dot(projected, origVel) < 0.0f)
-                    mVelocity = Vector3(0.0f);
-                else
-                    mVelocity = projected;
-            } else {
-                mVelocity = Vector3(0.0f);
+            // Step 2: If exactly 2 violated, test if one alone suffices (lines 63-81).
+            if (realCount == 2) {
+                Vector3 testVel = mVelocity;
+                // Try removing constraint 1 only
+                float vn1 = glm::dot(testVel, constraintBuf[realIdx1]);
+                if (vn1 < 0.0f) testVel -= constraintBuf[realIdx1] * vn1;
+                // Check if constraint 2 is still violated
+                if (glm::dot(testVel, constraintBuf[realIdx2]) <= 0.0f) {
+                    // Constraint 1 alone didn't suffice. Try constraint 2 alone.
+                    testVel = mVelocity;
+                    float vn2 = glm::dot(testVel, constraintBuf[realIdx2]);
+                    if (vn2 < 0.0f) testVel -= constraintBuf[realIdx2] * vn2;
+                    if (glm::dot(testVel, constraintBuf[realIdx1]) <= 0.0f) {
+                        // Neither alone suffices — apply both via crease slide
+                        applyTwoConstraints(constraintBuf[realIdx1], constraintBuf[realIdx2]);
+                        return; // original returns here (line 78)
+                    }
+                }
+                // Fall through: one constraint sufficed, apply all individually below
             }
+
+            // Step 3: Sequential single-constraint pass (lines 84-88).
+            // Each violated constraint is removed individually via PhysRemNormComp.
+            for (int i = 0; i < constraintCount; ++i) {
+                float vn = glm::dot(mVelocity, constraintBuf[i]);
+                if (vn < 0.0f)
+                    mVelocity -= constraintBuf[i] * vn;
+            }
+
+            // Step 4: Backward check (lines 94-101).
+            if (glm::dot(mVelocity, origVel) < 0.0f)
+                mVelocity = Vector3(0.0f);
+
+            // Step 5: Final validation — ensure no constraint still violated (lines 104-112).
+            for (int i = 0; i < constraintCount; ++i) {
+                if (glm::dot(mVelocity, constraintBuf[i]) < -0.0001f) {
+                    mVelocity = Vector3(0.0f);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Two-constraint removal — crease/wedge slide.
+    /// Matches original PhysRemNormComp 2-vector overload (PHUTILS.CPP lines 124-143).
+    inline void applyTwoConstraints(const Vector3 &n0, const Vector3 &n1) {
+        Vector3 edge = glm::cross(n0, n1);
+        float edgeLenSq = glm::dot(edge, edge);
+        if (edgeLenSq > 1e-12f) {
+            edge /= std::sqrt(edgeLenSq);
+            mVelocity = edge * glm::dot(mVelocity, edge);
+        } else {
+            // Parallel normals — apply both constraints separately (lines 134-135).
+            float vn0 = glm::dot(mVelocity, n0);
+            if (vn0 < 0.0f) mVelocity -= n0 * vn0;
+            float vn1 = glm::dot(mVelocity, n1);
+            if (vn1 < 0.0f) mVelocity -= n1 * vn1;
         }
     }
 
@@ -86,21 +133,10 @@
         Vector3 origPos = mPosition;
         int32_t origCell = mCellIdx;
 
-        // ── UpdatePositions: commit end position with move_backup ──
-        // Matches original (PHCORE.CPP lines 6437-6455): commits EndLocationVec →
-        // LocationVec, but pulls the position back by min(0.01, moveLen) along the
-        // movement direction. This keeps the spherecaster's epsilon happy by ensuring
-        // the committed position doesn't land exactly on a polygon plane.
-        {
-            Vector3 moveVec = mEndPosition - mPosition;
-            float moveLen = glm::length(moveVec);
-            if (moveLen > 1e-7f) {
-                float backupDist = std::min(0.01f, moveLen);
-                mPosition = mEndPosition - (moveVec / moveLen) * backupDist;
-            } else {
-                mPosition = mEndPosition;
-            }
-        }
+        // ── UpdatePositions: commit end position ──
+        // Advance mPosition to the intended end position. The iterative push-out
+        // loop will adjust from here if there are penetrations.
+        mPosition = mEndPosition;
 
         // Update cell for the new position — only if valid
         {
@@ -125,14 +161,28 @@
                 // HEAD and BODY get pose-driven vertical offsets for smooth crouch transitions.
                 // SHIN/KNEE/FOOT (s >= 2) always use their standing offsets.
                 float poseOffsetZ = 0.0f;
-                if (s == 0) poseOffsetZ = mPoseCurrent.z;        // HEAD
-                else if (s == 1) poseOffsetZ = mBodyPoseCurrent.z; // BODY
+                Vector3 springOffset(0.0f);     // base spring offset (start position)
+                Vector3 springEndOffset(0.0f);  // spring offset at sweep endpoint
+                if (s == 0) {
+                    // HEAD: use spring position for start, spring position + velocity*dt for end.
+                    // Matches original Dark Engine (PHMOD.CPP lines 1576-1586):
+                    // HEAD EndLocationVec = HEAD position + spring_velocity * dt.
+                    // The spring velocity contribution extends the sweep to where the
+                    // head is actually moving, so collisions are detected along the
+                    // spring-driven path (important during crouch transitions/bob).
+                    poseOffsetZ = mSpringPos.z;
+                    springOffset = Vector3(mSpringPos.x, mSpringPos.y, 0.0f);
+                    springEndOffset = springOffset + Vector3(mSpringVel.x, mSpringVel.y, mSpringVel.z) * mTimestep.fixedDt;
+                } else if (s == 1) {
+                    poseOffsetZ = mBodyPoseCurrent.z; // BODY
+                }
                 float offsetZ = mSphereOffsetsBase[s] + poseOffsetZ;
-                Vector3 sphereCenter = mPosition + Vector3(0.0f, 0.0f, offsetZ);
                 // Swept test from pre-commit position to current (pushed) position.
                 // On the first iteration this sweeps from origPos to mEndPosition.
                 // On subsequent iterations the swept distance is zero (static only).
-                Vector3 oldSphereCenter = origPos + Vector3(0.0f, 0.0f, offsetZ);
+                // HEAD uses spring end offset (includes velocity*dt) for the new position.
+                Vector3 sphereCenter = mPosition + Vector3(0.0f, 0.0f, offsetZ) + springEndOffset;
+                Vector3 oldSphereCenter = origPos + Vector3(0.0f, 0.0f, offsetZ) + springOffset;
 
                 // Track contact count to tag new contacts with submodel index.
                 size_t contactsBefore = mIterContacts.size();
@@ -256,10 +306,11 @@
                 Vector3 sphereCenters[NUM_SPHERES];
                 for (int s = 0; s < NUM_SPHERES; ++s) {
                     float poseOffsetZ = 0.0f;
-                    if (s == 0) poseOffsetZ = mPoseCurrent.z;
+                    Vector3 sOff(0.0f);
+                    if (s == 0) { poseOffsetZ = mSpringPos.z; sOff = Vector3(mSpringPos.x, mSpringPos.y, 0.0f); }
                     else if (s == 1) poseOffsetZ = mBodyPoseCurrent.z;
                     float offsetZ = mSphereOffsetsBase[s] + poseOffsetZ;
-                    sphereCenters[s] = mPosition + Vector3(0.0f, 0.0f, offsetZ);
+                    sphereCenters[s] = mPosition + Vector3(0.0f, 0.0f, offsetZ) + sOff;
                 }
                 mObjectCollisionCb(sphereCenters, mSphereRadii,
                                    NUM_SPHERES, mCellIdx, mIterContacts);
@@ -403,11 +454,12 @@
                         float dp = glm::dot(mVelocity, riserContact.normal);
 
                         // CheckTerrainContact (phcore.cpp lines 4305-4378):
-                        // If velocity into the surface is low, create a persistent contact.
-                        // Original threshold: |dp| < 5.0 * elasticity. This prevents the
-                        // player from drifting into the wall next frame.
+                        // Original: dp = dot(vel, normal) * elasticity; if |dp| < 5.0.
+                        // This means |dot| * elasticity < 5.0, i.e. |dot| < 5.0 / elasticity.
+                        // Higher elasticity → lower threshold → fewer sticking contacts.
                         static constexpr float kStickingThreshold = 5.0f;
-                        if (dp < 0.0f && std::fabs(dp) < kStickingThreshold * mElasticity) {
+                        float dpScaled = std::fabs(dp) * mElasticity;
+                        if (dp < 0.0f && dpScaled < kStickingThreshold) {
                             // Create persistent contact from this collision
                             SphereContact stickContact = riserContact;
                             stickContact.fresh = true;
@@ -528,16 +580,47 @@
                     if (newCell >= 0) {
                         mCellIdx = newCell;
                     } else {
-                        // Pushed outside all cells.
-                        mPosition = origPos;
-                        mCellIdx = origCell;
-                        return;
+                        // Push-out moved outside all cells. Undo THIS iteration's
+                        // push-out only — don't reset the entire frame's movement.
+                        // The original engine tracks cells through portal crossings
+                        // and doesn't have this failure mode. Our brute-force
+                        // findCell can fail near thin cell boundaries.
+                        // Revert push-out by going back to pre-push position.
+                        mPosition = mEndPosition;
+                        // Try to find cell at the un-pushed position
+                        newCell = mCollision.findCell(mPosition);
+                        if (newCell >= 0) {
+                            mCellIdx = newCell;
+                        }
+                        // Don't return — continue to contact merge
+                        break;  // exit iteration loop, proceed to merge
                     }
                 }
             }
         }
 
-        // Final validation — body center must still be in a valid cell
+        // ── move_backup: pull position back along movement direction ──
+        // Matches original UpdatePositions (PHCORE.CPP lines 6437-6455): after all
+        // collision resolution is complete, pull the final position back by
+        // min(0.01, moveLen) along the movement direction. This keeps the next
+        // frame's spherecaster epsilon happy — prevents landing exactly on a polygon
+        // plane where float precision could cause missed contacts.
+        // Applied AFTER collision resolution, matching original placement.
+        {
+            Vector3 moveVec = mPosition - origPos;
+            float moveLen = glm::length(moveVec);
+            if (moveLen > 1e-7f) {
+                float backupDist = std::min(0.01f, moveLen);
+                mPosition -= (moveVec / moveLen) * backupDist;
+            }
+        }
+
+        // Final validation — body center must still be in a valid cell.
+        // If move_backup pushed us outside, try mEndPosition (before backup).
+        // Only reset to origPos as absolute last resort.
+        if (mCollision.findCell(mPosition) < 0) {
+            mPosition = mEndPosition;
+        }
         if (mCollision.findCell(mPosition) < 0) {
             mPosition = origPos;
             mCellIdx = origCell;
@@ -555,10 +638,16 @@
             bool matched = false;
             for (auto &ec : mContacts) {
                 if (ec.cellIdx == nc.cellIdx && ec.polyIdx == nc.polyIdx) {
-                    // Same polygon — refresh with latest detection data
+                    // Same polygon — refresh with latest detection data.
+                    // Matches original: re-creates the entire contact via
+                    // CreateTerrainContact(), ensuring all fields match.
                     ec.normal = nc.normal;
                     ec.penetration = nc.penetration;
                     ec.textureIdx = nc.textureIdx;
+                    ec.submodelIdx = nc.submodelIdx;
+                    ec.isEdge = nc.isEdge;
+                    ec.hitPoint = nc.hitPoint;
+                    ec.time = nc.time;
                     ec.fresh = true;
                     matched = true;
                     break;

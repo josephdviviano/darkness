@@ -47,6 +47,9 @@
             mClimbFaceNormal = faceNormal;
             mClimbFaceIdx = faceIdx;
             mCurrentMode = PlayerMode::Climb;
+            // SetGroundObj (D20): set ground to climbing object on climb entry.
+            // Matches original PHCLIMB.CPP lines 325, 371, 416.
+            mGroundObjID = c.objectId;
 
             // Remove velocity component going into the wall (preserve tangential).
             // The original engine applies face constraints on entry rather than
@@ -176,6 +179,7 @@
                 mClimbingObjId = c.objectId;
                 mClimbFaceIdx = newFace;
                 mClimbFaceNormal = getOBBFaceNormal(*newBody, newFace);
+                mGroundObjID = c.objectId; // SetGroundObj on climb transfer
                 if (mClimbLog) {
                     std::fprintf(stderr, "[CLIMB] Transfer to objID=%d face=%d "
                         "normal=(%.2f,%.2f,%.2f)\n",
@@ -261,6 +265,8 @@
 
         // Clear climbing state
         mClimbingObjId = -1;
+        // SetGroundObj(OBJ_NULL) on climb exit — matches original PHCLIMB.CPP line 270.
+        mGroundObjID = -1;
         mClimbFaceIdx = -1;
         mClimbFaceNormal = Vector3(0.0f);
 
