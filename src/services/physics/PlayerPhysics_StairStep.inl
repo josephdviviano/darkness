@@ -25,16 +25,20 @@
         const std::vector<SphereContact> &contacts, float remainingDt,
         const Vector3 &backupPos)
     {
-        // Movement direction from desired velocity.
-        // Original uses pModel->GetVelocity(subModId) at collision time (pre-constraint).
-        // Since we're inside the collision loop, desired velocity is the closest match.
-        Vector3 desired = computeDesiredVelocity();
-        Vector3 hDesired(desired.x, desired.y, 0.0f);
-        float hSpeed = glm::length(hDesired);
-        if (hSpeed < 0.1f)
+        // Movement direction from actual velocity at collision time.
+        // Original (PHCORE.CPP line 5338): pModel->GetVelocity(subModId) — the
+        // full 3D velocity vector, scaled by 0.01 for the forward probe (line 5371).
+        // The original does NOT zero the Z component — on slopes, the probe tilts.
+        // We use mVelocity directly, matching the original. The speed magnitude
+        // determines probe distance; the normalized direction determines probe angle.
+        float speed = glm::length(mVelocity);
+        if (speed < 0.1f)
             return false;
 
-        Vector3 moveDir = hDesired / hSpeed;
+        Vector3 moveDir = mVelocity / speed;
+        // Horizontal speed for the minimum-speed gate on object step fallback
+        float hSpeed = std::sqrt(mVelocity.x * mVelocity.x + mVelocity.y * mVelocity.y);
+        if (hSpeed < 0.1f) hSpeed = speed;  // fallback for pure vertical motion
 
         // ── Find trigger: leg-level wall contact ──
         // Original: fabs(normal.z) < 0.4, FOOT/SHIN/KNEE, terrain face only.
@@ -99,7 +103,9 @@
         }
 
         // ── Phase 2: Raycast FORWARD (velocity * 0.01) ──
-        float fwdDist = hSpeed * STEP_FWD_SCALE;
+        // Original (PHCORE.CPP line 5371): movement_dir scaled by 0.01.
+        // movement_dir is the full velocity vector, so fwdDist = |velocity| * 0.01.
+        float fwdDist = speed * STEP_FWD_SCALE;
         Vector3 fwdPos = upPos + moveDir * fwdDist;
 
         if (mStepLog) {
@@ -146,6 +152,11 @@
         // ── Compute step height ──
         // Original: z_delta = hit_z - foot_z, clamp to min 0.3, add 0.02.
         // NO max cap — original relies on BODY sphere validation only.
+        // No rawZDelta rejection — matches original engine which always clamps
+        // to STEP_MIN_ZDELTA. Phantom 0.32 lifts (when foot is already on the
+        // surface) are absorbed by gravity + constraints in the subsequent
+        // postStepReIntegrate call, which re-runs the full physics pipeline
+        // for the remaining frame time.
         float zDelta = hitZ - footPos.z;
         if (zDelta < STEP_MIN_ZDELTA)
             zDelta = STEP_MIN_ZDELTA;
@@ -297,10 +308,13 @@
         return true;
     }
 
-    /// Re-integration after a successful stair step, matching the original engine's
-    /// PostCollisionUpdate. Re-runs the core physics pipeline for the remaining
-    /// frame time so the player doesn't sit at the stepped position with stale
-    /// velocity/contacts until the next frame.
+    /// Re-integration after collision (step or bounce), matching the original
+    /// engine's PostCollisionUpdate (PHCORE.CPP 4122-4152). Re-runs the core
+    /// physics pipeline for the remaining frame time: rebuild constraints,
+    /// re-apply dynamics (gravity + movement + friction), compute a target
+    /// position (endLocation), sweep from current to target for new collisions,
+    /// then commit position. The target-based model prevents phantom cascades:
+    /// with small remaining dt, the sweep is short and doesn't reach the next riser.
     inline void postStepReIntegrate(float dt) {
         if (mStepLog) {
             std::fprintf(stderr, "[STEP-REINT] dt=%.4f pos=(%.3f,%.3f,%.3f) vel=(%.3f,%.3f,%.3f)\n",
@@ -308,40 +322,33 @@
                 mVelocity.x, mVelocity.y, mVelocity.z);
         }
 
-        // 1. Rebuild constraints from current contacts.
-        //    Original PostCollisionUpdate (phcore.cpp lines 4131-4136):
-        //      ClearConstraints()
-        //      ConstrainFromObjects(i) + ConstrainFromTerrain(i) for each submodel
-        //    The synthetic FOOT contact created by CheckStep needs to produce a
-        //    floor constraint so gravity doesn't pull the player through the tread.
-        //    Without this, constrainVelocity() uses stale constraints from the
-        //    frame start — missing the new tread's floor constraint.
+        // 1. Rebuild constraints from current contacts (trust without re-validation).
+        //    Original PostCollisionUpdate calls ClearConstraints + ConstrainFromTerrain
+        //    for each submodel (lines 4131-4136). ConstrainFromTerrain rebuilds
+        //    constraints from persistent contacts — it does NOT destroy contacts that
+        //    fail geometric checks within PostCollisionUpdate. We match this by
+        //    trusting mContacts without running validateContacts().
         mConstraints.clear();
         for (const auto &c : mContacts) {
-            if (c.isEdge) {
-                // Edge: distance-only check (simplified — contact just created)
-                mConstraints.push_back({c.normal, c.objectId});
-            } else {
-                // Face: trust the contact is valid (just created by CheckStep or
-                // validated at frame start). Original rebuilds from persistent
-                // contacts without re-validating distance/polygon.
-                mConstraints.push_back({c.normal, c.objectId});
-            }
+            mConstraints.push_back({c.normal, c.objectId});
         }
 
-        // 2. Apply gravity for remaining time — unconditionally.
-        //    Original: PostCollisionUpdate (phcore.cpp line 4142) calls
-        //    UpdateModelDynamics which applies gravity every frame (lines 1417-1421).
+        // 2. Apply gravity for remaining time.
+        //    Original: UpdateModelDynamics applies gravity (line 4142).
+        //    Use the partial dt, not the full frame timestep.
         mVelocity.z -= mGravityMag * dt;
 
-        // 3. Apply movement control for remaining time
-        //    Original: UpdateModelControls applies player input.
+        // 3. Apply movement control for remaining time.
+        //    Original: UpdateModelControls (line 4141) applies player input.
+        //    Override the dt used by applyMovement so it uses the partial
+        //    remaining time, not the full frame timestep.
+        float savedFixedDt = mTimestep.fixedDt;
+        mTimestep.fixedDt = dt;
         applyMovement();
+        mTimestep.fixedDt = savedFixedDt;
 
         // 4. Constrain velocity against rebuilt contacts.
-        //    Original: ApplyConstraints (phmod.cpp line 1861) removes velocity
-        //    into surfaces. The new tread's floor constraint removes downward
-        //    velocity from gravity, preventing the player from falling through.
+        //    Original: ApplyConstraints removes velocity into surfaces.
         constrainVelocity();
 
         if (mStepLog) {
@@ -349,29 +356,26 @@
                 mVelocity.x, mVelocity.y, mVelocity.z);
         }
 
-        // 4. Integrate position for remaining time.
-        //    Matches original: PostCollisionUpdate → UpdateModel →
-        //    UpdateTargetLocation (PHMOD.CPP line 1871) uses pure velocity * dt.
-        //    No kPartialBackupAmt — that's only for IntegrateToCollision backup.
-        Vector3 preReintegratePos = mPosition;  // save for swept test
-        mPosition += mVelocity * dt;
+        // 5. Compute target position (endLocation) WITHOUT advancing mPosition.
+        //    Matches original: UpdateModel → UpdateTargetLocation computes
+        //    EndLocationVec = LocationVec + velocity * dt (PHMOD.CPP line 1871).
+        //    Position (LocationVec) does NOT advance until after collision detection.
+        Vector3 endLocation = mPosition + mVelocity * dt;
 
         if (mStepLog) {
-            std::fprintf(stderr, "[STEP-REINT] post-integrate pos=(%.3f,%.3f,%.3f)\n",
-                mPosition.x, mPosition.y, mPosition.z);
+            std::fprintf(stderr, "[STEP-REINT] endLocation=(%.3f,%.3f,%.3f)\n",
+                endLocation.x, endLocation.y, endLocation.z);
         }
 
-        // 5. Update cell
-        int32_t newCell = mCollision.findCell(mPosition);
-        if (newCell >= 0) mCellIdx = newCell;
+        // 6. Update cell for the target position (for collision queries).
+        int32_t endCell = mCollision.findCell(endLocation);
+        if (endCell < 0) endCell = mCellIdx;
 
-        // 6. Re-run collision detection at new position
-        //    Original: CheckModelTerrainCollisions + CheckModelObjectCollisions.
-        //    This generates real floor contacts (replacing the synthetic one)
-        //    and handles any new penetrations from the re-integration movement.
-        //    Note: this can trigger another step (cascade), matching original behavior.
-        //    We don't pass a contactCb here — object collision testing will happen
-        //    on the next full frame. Terrain collision is sufficient for stability.
+        // 7. Re-run collision detection: sweep from mPosition → endLocation.
+        //    Original: CheckModelTerrainCollisions sweeps LocationVec → EndLocationVec
+        //    (line 4150). With small remaining dt, this sweep is short — the foot
+        //    barely moves, so it doesn't reach the next riser. This naturally
+        //    prevents phantom cascade steps.
         mIterContacts.clear();
         Vector3 sphereCenters[NUM_SPHERES];
         for (int s = 0; s < NUM_SPHERES; ++s) {
@@ -379,40 +383,35 @@
             if (s == 0) poseOffsetZ = mPoseCurrent.z;
             else if (s == 1) poseOffsetZ = mBodyPoseCurrent.z;
             float offsetZ = mSphereOffsetsBase[s] + poseOffsetZ;
-            Vector3 sphereCenter = mPosition + Vector3(0.0f, 0.0f, offsetZ);
-            Vector3 oldSphereCenter = preReintegratePos + Vector3(0.0f, 0.0f, offsetZ);
+            // Start = current position (mPosition, unchanged since step)
+            Vector3 oldSphereCenter = mPosition + Vector3(0.0f, 0.0f, offsetZ);
+            // End = computed target (endLocation)
+            Vector3 sphereCenter = endLocation + Vector3(0.0f, 0.0f, offsetZ);
             sphereCenters[s] = sphereCenter;
 
             size_t contactsBefore = mIterContacts.size();
 
-            // Collision dispatch by submodel type — must match the main collision
-            // loop (PlayerPhysics_Collision.inl). Original PostCollisionUpdate
-            // (phcore.cpp line 4150) calls CheckModelTerrainCollisions which uses
-            // the same dispatch: sphere submodels → SphrSpherecastStatic, point
-            // submodels → PortalRaycast.
             if (mSphereRadii[s] > 0.001f) {
-                // ── Sphere path (HEAD/BODY): static + swept sphere tests ──
+                // Sphere path (HEAD/BODY): static at target + swept from current→target
                 mCollision.sphereVsCellPolygons(sphereCenter, mSphereRadii[s],
-                                                 mCellIdx, mIterContacts);
+                                                 endCell, mIterContacts);
                 int32_t sphereCell = mCollision.findCell(sphereCenter);
-                if (sphereCell >= 0 && sphereCell != mCellIdx)
+                if (sphereCell >= 0 && sphereCell != endCell)
                     mCollision.sphereVsCellPolygons(sphereCenter, mSphereRadii[s],
                                                      sphereCell, mIterContacts);
 
-                // Swept test from pre-integration to post-integration position.
                 mCollision.sweptSphereVsCellPolygons(
                     oldSphereCenter, sphereCenter, mSphereRadii[s], mCellIdx, mIterContacts);
-                if (sphereCell >= 0 && sphereCell != mCellIdx)
+                if (endCell != mCellIdx)
                     mCollision.sweptSphereVsCellPolygons(
-                        oldSphereCenter, sphereCenter, mSphereRadii[s], sphereCell, mIterContacts);
-                // Also test adjacent cells from submodel's cell
-                int32_t portalBase = (sphereCell >= 0) ? sphereCell : mCellIdx;
+                        oldSphereCenter, sphereCenter, mSphereRadii[s], endCell, mIterContacts);
+                int32_t portalBase = (sphereCell >= 0) ? sphereCell : endCell;
                 if (portalBase >= 0 && portalBase < static_cast<int32_t>(mCollision.getWR().numCells)) {
                     const auto &pc = mCollision.getWR().cells[portalBase];
                     int nSolid = pc.numPolygons - pc.numPortals;
                     for (int pi = nSolid; pi < pc.numPolygons; ++pi) {
                         int32_t tgt = static_cast<int32_t>(pc.polygons[pi].tgtCell);
-                        if (tgt >= 0 && tgt != mCellIdx && tgt != sphereCell
+                        if (tgt >= 0 && tgt != mCellIdx && tgt != endCell && tgt != sphereCell
                             && tgt < static_cast<int32_t>(mCollision.getWR().numCells)) {
                             mCollision.sweptSphereVsCellPolygons(
                                 oldSphereCenter, sphereCenter, mSphereRadii[s], tgt, mIterContacts);
@@ -420,10 +419,7 @@
                     }
                 }
             } else {
-                // ── Point path (SHIN/KNEE/FOOT): PortalRaycast ──
-                // Matches original: point submodels use PortalRaycast (line-segment
-                // old→new) for portal-traversing polygon detection. This is critical
-                // for detecting riser faces across cell boundaries during cascade.
+                // Point path (SHIN/KNEE/FOOT): raycast from current→target
                 RayHit pointHit;
                 if (raycastWorld(mCollision.getWR(), oldSphereCenter, sphereCenter, pointHit)) {
                     Vector3 delta = sphereCenter - oldSphereCenter;
@@ -439,7 +435,8 @@
                     contact.polyIdx = pointHit.polyIdx;
                     contact.textureIdx = pointHit.textureIndex;
                     contact.time = hitTime;
-                    contact.isEdge = false;  // face contact (kPC_TerrainFace)
+                    contact.isEdge = false;
+                    contact.hitPoint = pointHit.point;
                     mIterContacts.push_back(contact);
                 }
             }
@@ -448,25 +445,34 @@
                 mIterContacts[ci].submodelIdx = static_cast<int8_t>(s);
         }
 
-        // Object collision pass — previously missing from re-integration.
-        // Original engine's PostCollisionUpdate re-checks both terrain AND objects.
+        // Object collision pass at target position.
         if (mObjectCollisionCb) {
             mObjectCollisionCb(sphereCenters, mSphereRadii,
-                               NUM_SPHERES, mCellIdx, mIterContacts);
+                               NUM_SPHERES, endCell, mIterContacts);
         }
 
         if (mStepLog) {
-            std::fprintf(stderr, "[STEP-REINT] re-collision: %zu contacts, pos=(%.3f,%.3f,%.3f)\n",
-                mIterContacts.size(), mPosition.x, mPosition.y, mPosition.z);
+            std::fprintf(stderr, "[STEP-REINT] re-collision: %zu contacts, endLoc=(%.3f,%.3f,%.3f)\n",
+                mIterContacts.size(), endLocation.x, endLocation.y, endLocation.z);
         }
 
-        // ── Cascade collision processing (matching original PostCollisionUpdate) ──
-        // Original: CheckModelTerrainCollisions queues new collisions, ResolveCollisions
-        // processes them with IntegrateToCollision + CheckStep. The model_time tracking
-        // ensures IntegrateToCollision only advances by the remaining time fraction.
-        // We check for riser contacts and attempt CheckStep before doing push-out.
+        // 8. Commit position to endLocation BEFORE cascade processing.
+        //    In the original, UpdateModel already advanced LocationVec to the
+        //    endLocation equivalent. When IntegrateToCollision runs for a cascade
+        //    collision, model_time = frame end → integration_time = 0 → no backup.
+        //    CheckStep uses the current LocationVec (= endLocation). We must
+        //    commit mPosition here so cascade CheckStep sees the advanced position.
+        mPosition = endLocation;
+        mModelTime += dt;
+        {
+            int32_t commitCell = mCollision.findCell(mPosition);
+            if (commitCell >= 0) mCellIdx = commitCell;
+        }
+
+        // 8b. Cascade collision processing.
+        //     Original: CheckModelTerrainCollisions queues new collisions,
+        //     ResolveCollisions processes them. We check inline for riser contacts.
         if (!mIterContacts.empty()) {
-            // Check for riser contacts that should trigger cascade stair step
             float earliestRiserTime = 2.0f;
             int bestRiserIdx = -1;
             for (int ci = 0; ci < static_cast<int>(mIterContacts.size()); ++ci) {
@@ -475,13 +481,8 @@
                 if (std::fabs(c.normal.z) >= STEP_WALL_THRESHOLD) continue;
                 if (c.isEdge) continue;
                 float t = c.time >= 0.0f ? c.time : 0.5f;
-                // Skip contacts at sweep start (foot ON the plane)
-                if (c.submodelIdx >= 2 && c.time >= 0.0f) {
-                    float footOff = mSphereOffsetsBase[c.submodelIdx];
-                    Vector3 footSt = preReintegratePos + Vector3(0.0f, 0.0f, footOff);
-                    float sDist = glm::dot(c.normal, footSt - c.hitPoint);
-                    if (sDist <= 0.0f) continue;
-                }
+                // Skip risers the player is not moving toward.
+                if (glm::dot(mVelocity, c.normal) >= 0.0f) continue;
                 if (t < earliestRiserTime) {
                     earliestRiserTime = t;
                     bestRiserIdx = ci;
@@ -499,22 +500,36 @@
             }
 
             if (bestRiserIdx >= 0) {
-                // Cascade CheckStep — matches original PostCollisionUpdate → ResolveCollisions
                 float cascadeFrac = std::clamp(earliestRiserTime, 0.0f, 1.0f);
-                float cascadeRemaining = dt * (1.0f - cascadeFrac);
+                float cascadeCollisionTime = dt * cascadeFrac;
+                float cascadeRemaining = dt - cascadeCollisionTime;
                 cascadeRemaining = std::max(cascadeRemaining, 0.0001f);
 
-                // IntegrateToCollision for point submodel (use hit location)
+                // IntegrateToCollision: compute backup toward collision point.
+                // Original (PHCORE.CPP line 5115): integration_time = t0 + dt - model_time.
+                // If model_time >= t0 + dt, integration_time <= 0 → no backup (model
+                // already at or past collision point). This prevents double-integration
+                // in cascade collisions: after postStepReIntegrate committed position
+                // to endLocation, model_time = accumulated_dt, and the cascade collision
+                // time is within that already-integrated window.
+                float integrationTime = cascadeCollisionTime - mModelTime;
+
                 const auto &rc = mIterContacts[bestRiserIdx];
                 Vector3 cascadeBackup;
-                if (rc.submodelIdx >= 2) {
+                if (integrationTime <= 0.0f) {
+                    // Model already at or past collision point — use current position.
+                    // Matches original: IntegrateToCollision returns immediately when
+                    // integration_time <= 0 (line 5117). CheckStep uses the current
+                    // LocationVec which is the fully-advanced position.
+                    cascadeBackup = mPosition;
+                } else if (rc.submodelIdx >= 2) {
                     float footOff = mSphereOffsetsBase[rc.submodelIdx];
-                    Vector3 footPos = preReintegratePos + Vector3(0.0f, 0.0f, footOff);
+                    Vector3 footPos = mPosition + Vector3(0.0f, 0.0f, footOff);
                     Vector3 footBk = footPos + (rc.hitPoint - footPos) * kPartialBackupAmt;
                     cascadeBackup = footBk - Vector3(0.0f, 0.0f, footOff);
                 } else {
-                    cascadeBackup = preReintegratePos + mVelocity *
-                        (cascadeFrac * dt * kPartialBackupAmt);
+                    cascadeBackup = mPosition + mVelocity *
+                        (integrationTime * kPartialBackupAmt);
                 }
 
                 if (mStepLog) {
@@ -524,11 +539,10 @@
                 }
 
                 if (tryStairStepFromContacts(mIterContacts, cascadeRemaining, cascadeBackup)) {
-                    // Cascade step succeeded — postStepReIntegrate already called recursively
-                    return;
+                    return;  // cascade step succeeded — recursion handles rest
                 }
 
-                // Cascade step failed — bounce and continue
+                // Cascade step failed — bounce
                 float dp = glm::dot(mVelocity, rc.normal);
                 if (dp < 0.0f) {
                     float dampen = mElasticity * kTerrainBounce;
@@ -536,24 +550,12 @@
                 }
             }
 
-            // No push-out in PostCollisionUpdate — the original engine does NOT
-            // do position += normal * penetration during collision resolution.
-            // Collision response is purely velocity-based (bounce reflection)
-            // plus position advancement (IntegrateToCollision). Push-out only
-            // exists in the main resolveCollisions loop, not in the post-step
-            // re-integration path. See PHCORE.CPP lines 4122-4152.
-            //
-            // We still accumulate contacts for next frame's constrainVelocity,
-            // but do NOT modify mPosition based on penetration.
-            // Accumulate contacts for next frame's constrainVelocity
+            // Accumulate contacts for next frame (no push-out in PostCollisionUpdate)
             mFreshContacts.insert(mFreshContacts.end(),
                                  mIterContacts.begin(), mIterContacts.end());
         }
 
-        // Update cell after push-out
-        int32_t finalCell = mCollision.findCell(mPosition);
-        if (finalCell >= 0) mCellIdx = finalCell;
-
+        // Position was already committed before cascade processing (step 8).
         if (mStepLog) {
             std::fprintf(stderr, "[STEP-REINT] final pos=(%.3f,%.3f,%.3f) cell=%d\n",
                 mPosition.x, mPosition.y, mPosition.z, mCellIdx);

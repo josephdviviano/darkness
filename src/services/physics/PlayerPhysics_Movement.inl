@@ -683,6 +683,10 @@
                 }
             }
 
+            // No step-descent probe — matches original engine. Stair descent is
+            // handled naturally: foot walks off tread edge, contact breaks, gravity
+            // drops the player, swept test catches the lower tread within a few frames.
+
             if (!transitioned) {
                 // Destroy contact — matches original DestroyTerrainContact
                 bool wasFoot = (c.submodelIdx == 4 && c.normal.z > GROUND_NORMAL_MIN);
@@ -709,7 +713,7 @@
                         mCurrentMode = PlayerMode::Jump;
                         mGroundGraceTimer = 0.0f;
                         mGroundGraceActive = false;
-                        mGroundObjID = -1;
+                        leaveGround();
                     }
                 }
             }
@@ -889,7 +893,7 @@
                         mCurrentMode = PlayerMode::Jump;
                         if (mLeanDir == 0)
                             activatePose(POSE_NORMAL);
-                        mStrideDist = 0.0f;
+                        leaveGround();
                     }
                     // else: still in grace period, stay in ground mode
                 }
