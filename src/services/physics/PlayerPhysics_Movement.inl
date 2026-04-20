@@ -7,6 +7,15 @@
     /// The downward velocity component during the frame is essential for swept collision
     /// to detect stair risers below the foot — without it, the swept path is purely
     /// horizontal and misses the riser wall.
+    ///
+    /// Note on pre-constraint vz: when the player is stationary on flat ground with
+    /// no input, applyMovement()'s friction branch runs between gravity and constraint.
+    /// That branch applies a 3D friction force with a 1.4× Z-boost which partially
+    /// cancels the gravity impulse, so the vz reaching constrainVelocity() is smaller
+    /// than gravity×dt. At 60Hz with default constants the pre-constraint vz is
+    /// ≈ −0.354 rather than the raw −0.533 (≈ 2/3 ratio). The constraint then zeroes
+    /// whichever residual arrives. This three-layer cancellation (gravity → friction
+    /// → constraint) is the original engine's design, not a scaling artefact.
     inline void applyGravity() {
         // No gravity while climbing or mantling. Climbing friction handles wall traction instead.
         if (mCurrentMode == PlayerMode::Climb || mMantling)
@@ -211,9 +220,12 @@
                 float frictionMag = friction * mMass * mGravityMag;
 
                 // Velocity-dependent drag (D3): scale = clamp(50 * |vel| / mass, 0.25, 10)
+                // Original uses PRE-gravity velocity magnitude here (sum_forces hasn't
+                // been integrated yet when this scale is computed). Matching that so
+                // drag isn't inflated by the current frame's gravity kick during descent.
                 Vector3 vel3D(hVel.x, hVel.y, prevZ);
-                float velMag = glm::length(vel3D);
-                float dragScale = std::clamp(50.0f * velMag / mMass, 0.25f, 10.0f);
+                float dragScale = std::clamp(
+                    50.0f * glm::length(mPreGravityVelocity) / mMass, 0.25f, 10.0f);
                 frictionMag *= dragScale;
 
                 // Use 3D ideal velocity for friction direction (original is fully 3D)
@@ -264,8 +276,9 @@
                 float frictionMag = friction * mMass * mGravityMag;
                 float prevZ = mVelocity.z;
                 Vector3 vel3D(hVel.x, hVel.y, prevZ);
-                float velMag = glm::length(vel3D);
-                float dragScale = std::clamp(50.0f * velMag / mMass, 0.25f, 10.0f);
+                // Pre-gravity velocity magnitude — see main ground path for rationale.
+                float dragScale = std::clamp(
+                    50.0f * glm::length(mPreGravityVelocity) / mMass, 0.25f, 10.0f);
                 frictionMag *= dragScale;
 
                 Vector3 ideal3D(hIdeal.x, hIdeal.y, prevZ);

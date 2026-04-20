@@ -646,8 +646,19 @@ private:
 
         // 5. Apply forces to velocity: gravity + movement input.
         //    Original: UpdateModelTransDynamics accumulates all forces (gravity,
-        //    buoyancy, friction, control) then integrates in one step.
+        //    buoyancy, friction, control) then integrates in one step. We match
+        //    by running gravity, then movement (which integrates friction), then
+        //    constraint — so pre-constraint vz is typically gravity impulse
+        //    partially cancelled by the friction Z-boost, not raw gravity×dt.
+        //    Snapshot pre-gravity velocity so the friction drag-scale clamp sees
+        //    the same magnitude the original engine does (|velocity|, not
+        //    |velocity+gravity×dt|). Diverges only during motion, but kept
+        //    unconditionally for clarity.
+        mPreGravityVelocity = mVelocity;
         applyGravity();
+        // Post-gravity, pre-movement snapshot — surfaced by the [CONSTRAIN] log
+        // so the friction contribution to vz is legible alongside the final value.
+        mPreMovementVelocity = mVelocity;
         if (!mMotionDisabled)
             applyMovement();
 
@@ -764,6 +775,14 @@ private:
     Vector3 mEndPosition{0.0f};    // projected end position (EndLocationVec equivalent)
     Vector3 mPrevPosition{0.0f};   // position before frame (for head spring, mantle)
     Vector3 mVelocity{0.0f};       // linear velocity
+    // Transient snapshots used by friction and diagnostics to see velocity state
+    // mid-step. mPreGravityVelocity is the velocity before any current-frame
+    // forces are added — its magnitude feeds the friction drag-scale clamp so
+    // drag depends on the previous-frame speed rather than the post-gravity
+    // speed. mPreMovementVelocity is post-gravity, pre-movement, printed by
+    // the [CONSTRAIN] log so the gravity-vs-friction contribution is legible.
+    Vector3 mPreGravityVelocity{0.0f};
+    Vector3 mPreMovementVelocity{0.0f};
     float mYaw = 0.0f;            // look direction (radians)
     float mCosYaw = 1.0f;         // cached cos(mYaw), updated per step and setYaw()
     float mSinYaw = 0.0f;         // cached sin(mYaw), updated per step and setYaw()
