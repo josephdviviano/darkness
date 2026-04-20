@@ -8,8 +8,15 @@
         if (mConstraints.empty()) return;
 
         if (mStepLog) {
-            std::fprintf(stderr, "[CONSTRAIN] %zu constraints, vel=(%.2f,%.2f,%.2f)\n",
-                mConstraints.size(), mVelocity.x, mVelocity.y, mVelocity.z);
+            // Print both post-gravity (pre-movement) and post-movement velocity so the
+            // friction contribution to vz is legible. On stationary ground the two
+            // usually differ by the 1.4×-boosted friction Z-push that partially cancels
+            // gravity before this function zeroes the residual.
+            std::fprintf(stderr,
+                "[CONSTRAIN] %zu constraints, vel=(%.2f,%.2f,%.2f) preMove.z=%.2f\n",
+                mConstraints.size(),
+                mVelocity.x, mVelocity.y, mVelocity.z,
+                mPreMovementVelocity.z);
             for (const auto &con : mConstraints) {
                 std::fprintf(stderr, "[CONSTRAIN]   n=(%.2f,%.2f,%.2f) obj=%d\n",
                     con.normal.x, con.normal.y, con.normal.z, con.objectId);
