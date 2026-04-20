@@ -40,12 +40,21 @@
         // Offset footstep laterally to alternate left/right foot for spatial audio immersion.
         // The "right" vector in Z-up is (sin(yaw), -cos(yaw), 0); left foot gets negative offset.
         // Crouched stance is slightly wider than standing for a subtle but noticeable effect.
-        if (mStepLog) {
+        //
+        // Sound gating matches the Dark Engine convention: only Stand/Crouch on ground
+        // produce audible footsteps. Jump/Climb/etc. are silent — the original engine
+        // activates stride motion separately from playing the sound, and only the Stand
+        // and Crouch modes (plus Swim, which uses a different sound) have an audible
+        // case. The stride motion (head-bob) still fires here — only the callback is gated.
+        bool audibleStride = (mCurrentMode == PlayerMode::Stand ||
+                              mCurrentMode == PlayerMode::Crouch) &&
+                             isOnGround();
+        if (mStepLog && audibleStride) {
             std::fprintf(stderr, "[FOOTSTEP] stride at simT=%.3f pos=(%.1f,%.1f,%.1f) hSpd=%.1f tex=%d\n",
                 mSimTime, mPosition.x, mPosition.y, mPosition.z,
                 horizontalSpeed(), mGroundTextureIdx);
         }
-        if (mFootstepCb) {
+        if (mFootstepCb && audibleStride) {
             constexpr float FOOT_OFFSET_STAND  = 0.8f;  // lateral offset from center (standing)
             constexpr float FOOT_OFFSET_CROUCH = 1.0f;  // wider stance when crouched
 
