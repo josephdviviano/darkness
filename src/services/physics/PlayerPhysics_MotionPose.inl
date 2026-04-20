@@ -40,6 +40,11 @@
         // Offset footstep laterally to alternate left/right foot for spatial audio immersion.
         // The "right" vector in Z-up is (sin(yaw), -cos(yaw), 0); left foot gets negative offset.
         // Crouched stance is slightly wider than standing for a subtle but noticeable effect.
+        if (mStepLog) {
+            std::fprintf(stderr, "[FOOTSTEP] stride at simT=%.3f pos=(%.1f,%.1f,%.1f) hSpd=%.1f tex=%d\n",
+                mSimTime, mPosition.x, mPosition.y, mPosition.z,
+                horizontalSpeed(), mGroundTextureIdx);
+        }
         if (mFootstepCb) {
             constexpr float FOOT_OFFSET_STAND  = 0.8f;  // lateral offset from center (standing)
             constexpr float FOOT_OFFSET_CROUCH = 1.0f;  // wider stance when crouched
@@ -65,11 +70,6 @@
     /// travel exceeds computeFootstepDist(). Velocity thresholds: >1.0 u/s tracking, >1.5 u/s
     /// stride activation. When stopped, blend completes and transitions to rest pose.
     inline void updateMotionPose() {
-        float hSpeed = horizontalSpeed();
-        // Lean suppresses stride bob (spring lateral axis driven by lean offset; stride would conflict).
-        bool isLeaning = (mLeanDir != 0);
-        bool isWalking = (isOnGround() && hSpeed > 1.5f && !isLeaning);
-
         // Advance pose timer
         mPoseTimer += mTimestep.fixedDt;
 
@@ -108,41 +108,25 @@
             }
         }
 
-        // ── Distance-based stride accumulation (not time-based) ──
-        bool strideTriggered = false;
-        if (isOnGround() && hSpeed > 1.0f) {
-            mStrideDist += hSpeed * mTimestep.fixedDt;
-            float footstepDist = computeFootstepDist(hSpeed);
-            if (isWalking && mStrideDist >= footstepDist) {
-                strideTriggered = true;
-                mStrideDist -= footstepDist;  // carry over excess distance
-            }
-        } else {
-            mStrideDist = 0.0f;
-        }
+        // ── Absolute-position stride system (matching original PLYRMOV.CPP) ──
+        // The original tracks the 3D foot position at the last stride and computes
+        // distance to the current foot position each frame. Strides fire when this
+        // distance exceeds the velocity-dependent threshold. The position persists
+        // through brief airborne moments, preventing double footsteps on stairs.
+        float speed = glm::length(mVelocity);  // 3D speed (original uses mx_mag_vec)
+        Vector3 footLoc = mPosition + Vector3(0.0f, 0.0f, mSphereOffsetsBase[4]);
+        float curDist2 = glm::length2(mLastFootLoc - footLoc);
+        float footstepDist = computeFootstepDist(speed);
+        bool isLeaning = (mLeanDir != 0);
 
-        // Per-mode rest pose (idle position for current mode)
+        // Per-mode rest pose
         const MotionPoseData &restPose = *getModeMotion(mCurrentMode).restPose;
 
-        // ── Pose chaining state machine ──
-        //
-        // Priority order:
-        // 1. Landing bump — must complete before stride resumes
-        // 2. Walking strides — distance-triggered
-        // 3. Idle — return to mode's rest pose
-
-        // Landing bump takes priority over normal strides
+        // Landing bump takes priority — must complete before stride resumes
         if (mLandingActive) {
             if (poseReady) {
                 mLandingActive = false;
-                // After landing, resume walking or return to idle.
-                // If leaning, re-activate the lean pose — gates
-                // rest pose activation on is_leaning, so lean survives landing.
-                if (isWalking) {
-                    activateStride();
-                    mStrideDist = 0.0f;
-                } else if (isLeaning) {
-                    // Re-activate lean pose so spring target stays at lean offset
+                if (isLeaning) {
                     activatePose(isCrouching()
                         ? (mLeanDir < 0 ? POSE_CLNLEAN_LEFT : POSE_CLNLEAN_RIGHT)
                         : (mLeanDir < 0 ? POSE_LEAN_LEFT : POSE_LEAN_RIGHT));
@@ -151,41 +135,59 @@
                 }
             }
         }
-        // Walking: distance-triggered strides with rest-condition interrupt ~100ms after each
-        // stride. Interrupts blend at ~30% → characteristic subtle bob (without this: ~3× too much).
-        else if (isWalking) {
-            if (!mWasWalking) {
-                // Just started walking — activate first stride immediately
-                activateStride();
-                mStrideDist = 0.0f;
-            } else if (strideTriggered) {
-                // Foot traveled enough distance — activate next stride.
-                activateStride();
-            } else if ((mSimTime - mLastStrideSimTime) > 0.1f &&
-                       mStrideDist > computeFootstepDist(hSpeed) * 0.5f) {
-                // Rest-condition interrupt: >100ms since stride AND past half-footstep distance.
-                // Creates stride→rest oscillation, limiting effective bob to ~1/3 of stride target.
-                activatePose(restPose);
+        // Stride distance check (original PLYRMOV.CPP lines 197-240)
+        else if (speed > 1.0f && (mLastFootTime < 0.0f || curDist2 > footstepDist * footstepDist)) {
+            bool onGround = isOnGround();
+
+            // Update foot location/time — but NOT in Jump mode, and Stand/Crouch
+            // require on_ground. Original (PLYRMOV.CPP lines 203-207):
+            // if ((mode != kPM_Jump) && ((mode != kPM_Stand) || on_ground))
+            bool canUpdate = (mCurrentMode != PlayerMode::Jump) &&
+                             (mCurrentMode == PlayerMode::Swim ||
+                              mCurrentMode == PlayerMode::Climb ||
+                              onGround);
+            if (canUpdate) {
+                mLastFootLoc = footLoc;
+                mLastFootTime = mSimTime;
             }
-        }
-        // Not walking: return to rest pose. Exception: while leaning, hold at lean target
-        // indefinitely — setLeanDirection(0) activates rest pose on key release.
-        else {
-            if (mWasWalking && !mLandingActive && !isLeaning) {
-                // Just stopped walking — immediately interrupt stride with rest pose. Same-motion
-                // guard in activatePose() prevents re-triggering on subsequent idle frames.
-                activatePose(restPose);
-            } else if (poseReady && !isLeaning) {
-                // Idle — activate rest pose if current target differs (e.g. landing bump
-                // returning to idle, or mode changed Stand→Crouch).
-                Vector3 restTarget(restPose.fwd, restPose.lat, restPose.vert);
-                if (glm::length(mPoseEnd - restTarget) > 0.01f) {
-                    activatePose(restPose);
+
+            // Stride activation — requires speed > 1.5 and ground for Stand/Crouch
+            if (speed > 1.5f && !isLeaning) {
+                bool doStride = true;
+                // Stand/Crouch must be on ground for head bob
+                if (mCurrentMode == PlayerMode::Stand ||
+                    mCurrentMode == PlayerMode::Crouch) {
+                    if (!onGround) doStride = false;
+                }
+                if (doStride) {
+                    if (mStepLog) std::fprintf(stderr, "[STRIDE] distance trigger (dist2=%.2f thresh2=%.2f)\n",
+                        curDist2, footstepDist * footstepDist);
+                    activateStride();
                 }
             }
         }
+        // Rest interrupt (original PLYRMOV.CPP lines 243-247):
+        // >100ms since last stride AND velocity > 0.1 AND
+        // (past half stride distance OR velocity < 1.5)
+        else if (mLastFootTime >= 0.0f &&
+                 (mSimTime - mLastFootTime) > 0.1f &&
+                 speed > 0.1f &&
+                 (curDist2 > (footstepDist * 0.5f) * (footstepDist * 0.5f) || speed < 1.5f)) {
+            activatePose(restPose);
+        }
+        // Idle — return to rest pose when not walking and pose is ready
+        else if (poseReady && !isLeaning) {
+            Vector3 restTarget(restPose.fwd, restPose.lat, restPose.vert);
+            if (glm::length(mPoseEnd - restTarget) > 0.01f) {
+                activatePose(restPose);
+            }
+        }
 
-        mWasWalking = isWalking;
+        // Velocity stop (original PLYRMOV.CPP line 250-251):
+        // Reset foot time when velocity drops below 1.0 — next movement triggers
+        // immediate stride (mLastFootTime < 0 flag).
+        if (speed < 1.0f)
+            mLastFootTime = -1.0f;
     }
 
     /// Compute raw (un-interpolated) eye position: body center + head offset + eye-above-head

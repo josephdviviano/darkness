@@ -444,6 +444,11 @@ public:
         mContacts.clear();
         mConstraints.clear();
 
+        // Teleport is semantically equivalent to an airborne transition: snapshot
+        // the foot position so the stride tracker doesn't see a huge cur_dist²
+        // between the old mLastFootLoc and the new spawn/teleport position.
+        leaveGround();
+
         // Reset spring state — teleporting should not carry old spring velocity
         // into the new position, which would cause oscillation on arrival.
         mSpringPos = Vector3(0.0f);
@@ -534,6 +539,19 @@ public:
 private:
     // ── Internal simulation steps ──
 
+    /// Called on every airborne transition (last floor contact destroyed, grace-timer
+    /// expired, or teleport). Matches original Dark Engine LeaveGround: clears ground
+    /// object and snapshots the current FOOT position / sim time into the stride tracker
+    /// so cur_dist² starts near zero on the first airborne frame. Without this, a stale
+    /// mLastFootLoc (e.g. constructor default or last-stride location from before the
+    /// ledge) produces a huge cur_dist² that fires a stride every frame — the in-Jump
+    /// `canUpdate` guard then prevents refresh, so the spam never stops.
+    inline void leaveGround() {
+        mGroundObjID = -1;
+        mLastFootLoc = mPosition + Vector3(0.0f, 0.0f, mSphereOffsetsBase[4]);
+        mLastFootTime = mSimTime;
+    }
+
     /// Single fixed-timestep physics step
     inline void fixedStep(const ContactCallback &contactCb) {
         // Advance simulation time (for landing throttle, animation timing, etc.)
@@ -590,7 +608,7 @@ private:
                     // DON'T override an active lean.
                     if (mLeanDir == 0)
                         activatePose(POSE_NORMAL);
-                    mStrideDist = 0.0f;
+                    mLastFootTime = -1.0f;
                 }
             } else if (mCurrentMode == PlayerMode::Swim) {
                 // Water jump — vertical kick from treading water.
@@ -602,7 +620,7 @@ private:
                 mGroundGraceActive = false;
                 if (mLeanDir == 0)
                     activatePose(POSE_NORMAL);
-                mStrideDist = 0.0f;
+                mLastFootTime = -1.0f;
             }
         }
         // NOTE: mJumpRequested is cleared after mantle check (step 13) so that
@@ -617,9 +635,13 @@ private:
         // 3. Update motion pose system (stride targets, progressive blend).
         updateMotionPose();
 
-        // 4. Validate existing contacts — destroys stale/invalid contacts.
-        //    Matches original: ConstrainFromTerrain (phcore.cpp lines 262-368)
-        //    runs in UpdateDynamics BEFORE UpdateModelTransDynamics.
+        // 4. Reset model time tracking for this frame.
+        //    Matches original StartFrame which resets collision state each frame.
+        mModelTime = 0.0f;
+
+        // 4b. Validate existing contacts — destroys stale/invalid contacts.
+        //     Matches original: ConstrainFromTerrain (phcore.cpp lines 262-368)
+        //     runs in UpdateDynamics BEFORE UpdateModelTransDynamics.
         validateContacts();
 
         // 5. Apply forces to velocity: gravity + movement input.
@@ -815,12 +837,19 @@ private:
     // Stride tracking — distance-based triggering.
     // Strides activate when foot travel distance exceeds computeFootstepDist().
     bool  mStrideIsLeft  = true;  // which foot is next (alternates each stride)
-    bool  mWasWalking    = false; // was the player walking last frame (edge detection)
     bool  mLandingActive = false; // true while landing bump pose is active
-    float mStrideDist    = 0.0f;  // accumulated horizontal foot travel distance
 
-    // Stride timing — last stride activation time for diagnostics/logging
-    float mLastStrideSimTime   = 0.0f;  // simTime when last stride was activated
+    // Stride tracking — absolute position-based, matching original Dark Engine
+    // (PLYRMOV.CPP m_LastFootLoc / m_LastFootTime). Distance is computed each
+    // frame as dist2(mLastFootLoc, currentFootLoc). Strides fire when distance
+    // exceeds the velocity-dependent threshold. Refreshed to current foot
+    // position on every airborne transition via leaveGround() — without this,
+    // stale values (constructor default or last-stride location from before a
+    // ledge) produce a huge cur_dist² and trigger a stride every frame while
+    // the in-Jump canUpdate guard prevents refresh.
+    Vector3 mLastFootLoc{0.0f};      // 3D foot position at last stride
+    float   mLastFootTime = -1.0f;   // sim time at last stride (-1 = no stride yet)
+    float   mLastStrideSimTime = 0.0f;  // simTime when last stride was activated
 
     // Ground contact normal, texture, and object from last collision pass.
     // mGroundObjID matches original Dark Engine's m_GroundObj — tracks which terrain
@@ -829,6 +858,15 @@ private:
     Vector3 mGroundNormal{0.0f, 0.0f, 1.0f};
     int32_t mGroundTextureIdx = -1;  // texture index of ground surface (for footstep material)
     int32_t mGroundObjID = -1;       // object ID of ground surface (-1 = none/terrain cell)
+
+    // Model time tracking — how much of the current frame has been consumed by
+    // position integration. Matches original Dark Engine's pDynamics->GetCurrentTime()
+    // (PHCORE.CPP line 5114). Used by IntegrateToCollision to compute remaining
+    // integration time: integration_time = collision_time - mModelTime. When
+    // mModelTime equals the frame's total dt, integration_time = 0 and the model
+    // is already at its end position — cascade collisions use the current position
+    // without additional backup. Reset to 0 at frame start.
+    float mModelTime = 0.0f;
 
     // Platform riding state — tracks which moving platform the player is standing on.
     // When grounded on a moving terrain object, its velocity is added to the player's
