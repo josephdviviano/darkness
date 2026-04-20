@@ -384,19 +384,10 @@
                     // Static contacts (time < 0) use fallback timing.
                     float t = c.time;
                     if (t < 0.0f) t = 0.5f;  // static contact: estimate mid-frame
-                    // Both engines have the same 2× backward ray extension (earlyPoint)
-                    // that can detect riser planes behind the actual ray start. Filter
-                    // contacts where the foot has already crossed the riser — these are
-                    // false positives from the earlyPoint extension. The original absorbs
-                    // the resulting 0.32 cascade step within the same PhysicsFrame; we
-                    // filter it here to prevent it appearing as a separate frame's step.
-                    if (c.submodelIdx >= 2 && c.time >= 0.0f &&
-                        glm::length2(c.hitPoint) > 1e-6f) {
-                        float footOffsetZ = mSphereOffsetsBase[c.submodelIdx];
-                        Vector3 footStart = origPos + Vector3(0.0f, 0.0f, footOffsetZ);
-                        float startDist = glm::dot(c.normal, footStart - c.hitPoint);
-                        if (startDist <= 0.0f) continue;
-                    }
+                    // No startDist filter — matches original engine (PHCORE.CPP line 6134).
+                    // Any swept riser collision triggers CheckStep regardless of whether
+                    // the foot starts behind or at the riser plane. CheckStep's own
+                    // 3-phase raycast + sphere validation handles rejection.
                     if (t < earliestTime) {
                         earliestTime = t;
                         bestContactIdx = ci;
@@ -408,8 +399,14 @@
                     // Original: PostCollisionUpdate receives dt - pClsn->GetTime()
                     // (phcore.cpp line 6143).
                     float collisionTimeFrac = std::clamp(earliestTime, 0.0f, 1.0f);
-                    float remainingDt = mTimestep.fixedDt * (1.0f - collisionTimeFrac);
+                    float collisionTime = mTimestep.fixedDt * collisionTimeFrac;
+                    float remainingDt = mTimestep.fixedDt - collisionTime;
                     remainingDt = std::max(remainingDt, 0.0001f);
+
+                    // Track model time — matches original's SetCurrentTime(t0 + dt)
+                    // in IntegrateToCollision (PHCORE.CPP line 5170). This prevents
+                    // double-integration in cascade collisions.
+                    mModelTime = collisionTime;
 
                     // IntegrateToCollision: compute the collision backup position.
                     // Original (PHCORE.CPP lines 5087-5201) has TWO paths:

@@ -273,5 +273,5 @@
         // Reset stride system
         if (mLeanDir == 0)
             activatePose(POSE_NORMAL);
-        mStrideDist = 0.0f;
+        mLastFootTime = -1.0f;
     }
