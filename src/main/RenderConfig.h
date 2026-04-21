@@ -70,6 +70,7 @@ struct RenderConfig {
     bool cameraCollision  = false;  // sphere collision against world geometry
     bool debugObjects     = false;  // dump per-object filtering diagnostics to stderr
     bool stepLog          = false;  // stair step diagnostics to stderr ([STEP] prefix)
+    std::string headLogPath;         // path for per-render-frame head/viewport CSV log ("" = disabled)
     bool togglePlatforms  = false;  // auto-activate all moving terrain at startup
     bool noProbes         = false;  // skip probe baking (no spatial audio)
     bool audioLog         = false;  // enable audio/sound/schema log output
@@ -331,6 +332,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cfg.debugObjects = true;
         } else if (std::strcmp(argv[i], "--step-log") == 0) {
             cfg.stepLog = true;
+        } else if (std::strcmp(argv[i], "--head-log") == 0 && i + 1 < argc) {
+            cfg.headLogPath = argv[++i];
         } else if (std::strcmp(argv[i], "--toggle-platforms") == 0) {
             cfg.togglePlatforms = true;
         } else if (std::strcmp(argv[i], "--no-probes") == 0) {

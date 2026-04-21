@@ -34,6 +34,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -268,6 +269,18 @@ struct RuntimeState {
     // Probe baking state (auto-bake on first run)
     bool probeBakeNeeded = false;
     std::string probeBakePath;
+
+    // ── Head/viewport log (per-render-frame CSV) ──
+    // Records the actual camera state at display rate, complementary to the
+    // per-fixed-step physics_log. Used for diagnosing head-bob smoothness and
+    // animation snap that only manifest at the render rate (between physics
+    // steps). Enabled via --head-log <path> or the head_log console toggle.
+    FILE    *headLog = nullptr;
+    uint64_t headLogStartUs   = 0;      // monotonic epoch for relative wall time
+    uint64_t headLogPrevUs    = 0;      // previous-frame timestamp (for frameDt)
+    uint64_t headLogPrevSteps = 0;      // previous-frame PlayerPhysics step count
+    uint64_t headLogPrevPPF   = 0;      // previous-frame PPF cancellation count
+    uint32_t headLogFlushCtr  = 0;      // flush every N rows
 
     // Debug: acoustic mesh wireframe overlay
     bool showAcousticMesh = false;

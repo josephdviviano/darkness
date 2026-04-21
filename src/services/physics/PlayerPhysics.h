@@ -415,6 +415,32 @@ public:
     /// Is the player currently mantling? (Stub — implemented in Phase 5)
     bool isMantling() const { return mMantling; }
 
+    // ── Head-bob / pose-spring accessors (for per-render-frame diagnostic logging) ──
+    /// Current head-spring displacement {fwd, lat, vert} in player-local coords.
+    const Vector3 &getSpringPos() const { return mSpringPos; }
+    /// Currently-blended pose offset (head spring's target this frame).
+    const Vector3 &getPoseCurrent() const { return mPoseCurrent; }
+    /// End target of the current pose blend (target the spring is chasing).
+    const Vector3 &getPoseEnd() const { return mPoseEnd; }
+    /// Collision-clamped lean amount (world units along lean direction).
+    float getLeanAmount() const { return mLeanAmount; }
+    /// Horizontal speed magnitude (XY plane only).
+    float getHorizontalSpeed() const {
+        return std::sqrt(mVelocity.x * mVelocity.x + mVelocity.y * mVelocity.y);
+    }
+    /// Fix-your-timestep blend factor (accumulator remainder / fixedDt) used by
+    /// getEyePosition() to interpolate between mPrevEyePos and computeRawEyePos().
+    float getInterpAlpha() const { return mInterpAlpha; }
+    /// Monotonic fixed-step counter — increments once per fixedStep() call.
+    /// Caller can take deltas to count how many physics steps fell in a render frame.
+    uint64_t getTotalFixedSteps() const { return mTotalFixedSteps; }
+    /// Monotonic PPF-cancel counter — increments every time the anti-fall probe
+    /// cancelled this step's movement. Useful for diagnosing stuck-on-floor cases.
+    uint64_t getPPFCancels() const { return mPPFCancels; }
+    /// Current movement input (set by renderer via setMovement/setPlayerMovement).
+    float getInputForward() const { return mInputForward; }
+    float getInputRight() const { return mInputRight; }
+
     // ── Teleport ──
 
     /// Set player position directly (for spawn, teleport). Resets velocity and updates cell index.
@@ -451,9 +477,17 @@ public:
 
         // Reset spring state — teleporting should not carry old spring velocity
         // into the new position, which would cause oscillation on arrival.
-        mSpringPos = Vector3(0.0f);
-        mSpringVel = Vector3(0.0f);
+        mSpringPos     = Vector3(0.0f);
+        mSpringVel     = Vector3(0.0f);
+        mSpringPrevPos = Vector3(0.0f);
+        mSpringPrevVel = Vector3(0.0f);
+        mSpringNextPos = Vector3(0.0f);
+        mSpringNextVel = Vector3(0.0f);
+        mSpringAccum   = 0.0f;
+        mPoseStart = Vector3(0.0f);
         mPoseCurrent = Vector3(0.0f);
+        mPoseEnd = Vector3(0.0f);
+        mBodyPoseStart = Vector3(0.0f);
         mBodyPoseCurrent = Vector3(0.0f);
         mBodyPoseEnd = Vector3(0.0f);
 
@@ -556,6 +590,7 @@ private:
     inline void fixedStep(const ContactCallback &contactCb) {
         // Advance simulation time (for landing throttle, animation timing, etc.)
         mSimTime += mTimestep.fixedDt;
+        ++mTotalFixedSteps;
 
         // ── Mantle takes over the full step when active ──
         // During mantling, normal movement/gravity/collision are suppressed.
@@ -678,21 +713,62 @@ private:
         mPrevPosition = mPosition;  // save for head spring / mantle reference
         mEndPosition = mPosition + mVelocity * mTimestep.fixedDt;
 
-        // 8b. PreventPlayerFall (D10): original (PHMOD.CPP lines 1660-1721) raycasts
-        //     9 units downward from target position. If a fall is detected while
-        //     moving slowly, resets position to current (prevents walking off edges
-        //     at creep speed). Speed threshold: 0.9× walk (stand) or 0.6× walk (crouch).
+        // 8b. Anti-fall probe (Dark Engine convention): at sub-walk speeds on ground,
+        //     raycast 9 units down from the target foot; if nothing is found, cancel
+        //     this frame's movement so the player can't shuffle off an edge at creep
+        //     speed. Speed threshold: 0.9× walk (stand) or 0.6× walk (crouch).
+        //
+        //     Speed compare is 3D (|v|² vs threshold²) so a player dropping at the
+        //     edge of a ledge isn't saved just because horizontal speed alone is low.
+        //     The ray origin is lifted ~0.5 units above the foot (with the ray length
+        //     extended to match) — the original probes from a submodel-owned foot
+        //     location that sits slightly above the contact surface, and our body-
+        //     center-derived origin can land a hair below the floor before the
+        //     post-collision ground-snap happens, producing false "no ground" hits.
         if (isOnGround() && mCellIdx >= 0) {
-            float hSpeed = horizontalSpeed();
-            float threshold = (mCurrentMode == PlayerMode::Crouch)
-                ? WALK_SPEED * 0.6f : WALK_SPEED * 0.9f;
-            if (hSpeed > 0.1f && hSpeed < threshold) {
-                Vector3 footEnd = mEndPosition + Vector3(0.0f, 0.0f, mSphereOffsetsBase[4]);
-                Vector3 fallProbe = footEnd - Vector3(0.0f, 0.0f, 9.0f);
+            // Threshold is the per-mode walk-speed cap (WALK_SPEED × mode_trans_scale)
+            // times the mode-specific anti-fall multiplier (0.9 stand / 0.6 crouch).
+            // The mode-scale MUST be baked in — omitting it makes crouch fire whenever
+            // the player is below un-scaled walk speed, i.e. always during crouching.
+            float modeScale  = MODE_SPEEDS[static_cast<int>(mCurrentMode)].trans;
+            float antiFallMul = (mCurrentMode == PlayerMode::Crouch) ? 0.6f : 0.9f;
+            float threshold  = WALK_SPEED * modeScale * antiFallMul;
+            if (glm::length2(mVelocity) < threshold * threshold) {
+                constexpr float PROBE_ORIGIN_LIFT = 0.5f;
+                Vector3 origin = mEndPosition +
+                    Vector3(0.0f, 0.0f, mSphereOffsetsBase[4] + PROBE_ORIGIN_LIFT);
+                Vector3 end = origin -
+                    Vector3(0.0f, 0.0f, 9.0f + PROBE_ORIGIN_LIFT);
+                // Pass the player's current cell as starting hint (Dark Engine
+                // convention). Without this, the raycaster's fallback linear
+                // scan can land on a neighbour cell whose local floor polygon
+                // doesn't cover the origin's (x,y) — the portal traversal then
+                // misses the floor and PPF false-fires on open interior ground.
                 RayHit fallHit;
-                if (!raycastWorld(mCollision.getWR(), footEnd, fallProbe, fallHit)) {
-                    // No ground within 9 units below target — cancel movement
+                int32_t terminalCell = -1;
+                bool found = raycastWorld(mCollision.getWR(), origin, end, fallHit,
+                                          &terminalCell,
+                                          /*startCellHint=*/mCellIdx);
+                if (!found) {
+                    // No ground within 9 units below target foot — cancel movement
                     mEndPosition = mPosition;
+                    ++mPPFCancels;
+                    if (mStepLog && mPPFCancels <= 40) {
+                        std::fprintf(stderr,
+                            "[PPF] miss: origin=(%.3f,%.3f,%.3f) end=(%.3f,%.3f,%.3f) "
+                            "startCell=%d terminalCell=%d mode=%s hSpd=%.2f\n",
+                            origin.x, origin.y, origin.z, end.x, end.y, end.z,
+                            mCellIdx, terminalCell, modeName(mCurrentMode),
+                            horizontalSpeed());
+                    }
+                } else if (mStepLog && mPPFCancels == 0 && (mTotalFixedSteps % 240) == 0) {
+                    // Occasional sanity print of a successful PPF probe (4 Hz)
+                    std::fprintf(stderr,
+                        "[PPF] hit: origin=(%.3f,%.3f,%.3f) hit=(%.3f,%.3f,%.3f) "
+                        "distance=%.3f startCell=%d terminalCell=%d\n",
+                        origin.x, origin.y, origin.z,
+                        fallHit.point.x, fallHit.point.y, fallHit.point.z,
+                        fallHit.distance, mCellIdx, terminalCell);
                 }
             }
         }
@@ -783,6 +859,14 @@ private:
     // the [CONSTRAIN] log so the gravity-vs-friction contribution is legible.
     Vector3 mPreGravityVelocity{0.0f};
     Vector3 mPreMovementVelocity{0.0f};
+    // Monotonic fixed-step counter — exposed via getTotalFixedSteps(). The renderer
+    // reads this each frame and takes deltas so the head log knows how many physics
+    // steps actually occurred in a given render frame (useful for diagnosing bob
+    // artefacts that correlate with render-rate-over-physics-rate ratio).
+    uint64_t mTotalFixedSteps = 0;
+    // Monotonic counter for PPF (anti-fall probe) cancellations. A stuck player
+    // shows up as this counter incrementing once per step while position stays fixed.
+    uint64_t mPPFCancels = 0;
     float mYaw = 0.0f;            // look direction (radians)
     float mCosYaw = 1.0f;         // cached cos(mYaw), updated per step and setYaw()
     float mSinYaw = 0.0f;         // cached sin(mYaw), updated per step and setYaw()
@@ -834,19 +918,32 @@ private:
     float mSimTime    = 0.0f;     // total simulation time (for landing throttle, etc.)
     float mLastLandingTime = -1.0f; // time of last landing event (for throttling)
 
-    // ── 3D head spring state ──
-    // Direct discrete spring (dt-dependent formula) tracking pose targets in player-local coords
-    // {fwd, lat, vert}. XY axes near-critical; Z (0.5× tension) overdamped → dominant vertical bob.
-    Vector3 mSpringPos{0.0f};     // current spring position {fwd, lat, vert}
-    Vector3 mSpringVel{0.0f};     // spring velocity (used by direct discrete formula)
+    // ── 3D head spring state (virtualised at 12.5 Hz) ──
+    // The original discrete spring formula is advanced at SPRING_NATIVE_DT (0.08 s)
+    // regardless of physics rate. mSpringPrev/Next cache the virtual sample state;
+    // mSpringAccum is the wall-time offset since the last virtual sample crossing.
+    // mSpringPos/Vel are the *displayed* values produced by cubic-Hermite
+    // interpolation between Prev and Next using their cached velocities as slopes.
+    // See feedback_exact_player_dynamics.md for the design principle.
+    Vector3 mSpringPos{0.0f};       // displayed spring position (Hermite-interpolated)
+    Vector3 mSpringVel{0.0f};       // exposed virt-next velocity (for diagnostic log parity)
+    Vector3 mSpringPrevPos{0.0f};   // position at virtual sample N
+    Vector3 mSpringPrevVel{0.0f};   // velocity at virtual sample N
+    Vector3 mSpringNextPos{0.0f};   // position at virtual sample N+1
+    Vector3 mSpringNextVel{0.0f};   // velocity at virtual sample N+1
+    float   mSpringAccum = 0.0f;    // seconds since virtual sample N, in [0, SPRING_NATIVE_DT)
 
     // ── Motion pose state ──
-    // Stride-driven pose system: progressive blend + head spring. Rest-condition interrupt fires
-    // ~100ms after each stride, creating stride→rest→stride oscillation at ~30% blend depth.
-    // The head spring adds dynamic response on top (overshoot, lag).
+    // Stride-driven pose system: linear blend (mPoseStart → mPoseEnd over
+    // mPoseDuration) + head spring for organic smoothing. mPoseStart is
+    // snapshotted from mPoseCurrent at activatePose() so mid-blend interrupts
+    // restart cleanly from the current interpolated point rather than chasing
+    // a moving target.
+    Vector3 mPoseStart{0.0f};     // HEAD blend start offset (captured on activatePose)
     Vector3 mPoseEnd{0.0f};       // HEAD blend target offset {fwd, lat, vert}
     Vector3 mPoseCurrent{0.0f};   // HEAD current interpolated pose offset
-    Vector3 mBodyPoseEnd{0.0f};       // BODY blend target offset {fwd, lat, vert}
+    Vector3 mBodyPoseStart{0.0f};     // BODY blend start offset
+    Vector3 mBodyPoseEnd{0.0f};       // BODY blend target offset
     Vector3 mBodyPoseCurrent{0.0f};   // BODY current blended offset
     float mPoseTimer    = 0.0f;   // elapsed time in current blend/hold (shared HEAD+BODY)
     float mPoseDuration = 0.8f;   // current blend duration (from pose data)
