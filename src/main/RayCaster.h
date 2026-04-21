@@ -92,6 +92,45 @@ inline bool raycastWorld(const WRParsedData &wr,
         return false;
     }
 
+    // ── Cell-straddle correction ────────────────────────────────────────────
+    // findCameraCell allows ~0.1u of slack, so a ray origin can be reported as
+    // inside cell A when it's actually a hair past A's boundary into neighbour
+    // B. The main traversal loop then looks up an exit plane of A at the origin's
+    // (x,y) that doesn't correspond to any polygon — classic false-miss.
+    //
+    // Fix: before entering the main loop, detect the "barely past the boundary"
+    // case. For each plane of the start cell, if the ray origin has
+    // non-positive distance (i.e., is on or past the plane) AND the plane
+    // carries a portal polygon containing the origin, advance into the portal's
+    // target cell. One-shot; bounded by MAX_STRADDLE_HOPS to avoid pathological
+    // multi-plane cases.
+    constexpr int MAX_STRADDLE_HOPS = 3;
+    constexpr float STRADDLE_EPSILON = 0.11f;   // slightly > findCameraCell's 0.1
+    for (int hop = 0; hop < MAX_STRADDLE_HOPS; ++hop) {
+        if (curCell < 0 || curCell >= static_cast<int32_t>(wr.numCells)) break;
+        const auto &cell = wr.cells[curCell];
+        int numSolid = cell.numPolygons - cell.numPortals;
+        int32_t nextCell = -1;
+        for (int pi = 0; pi < static_cast<int>(cell.numPlanes); ++pi) {
+            const auto &plane = cell.planes[pi];
+            float d = plane.getDistance(from);
+            if (d > 0.0f || d < -STRADDLE_EPSILON) continue;   // inside, or too far past
+            // Check portal polygons on this plane.
+            Vector3 windingNormal = -plane.normal;
+            for (int p = numSolid; p < static_cast<int>(cell.numPolygons); ++p) {
+                if (cell.polygons[p].plane != pi) continue;
+                if (pointInConvexPolygon(from, cell.vertices,
+                                          cell.polyIndices[p], windingNormal)) {
+                    nextCell = static_cast<int32_t>(cell.polygons[p].tgtCell);
+                    break;
+                }
+            }
+            if (nextCell >= 0) break;
+        }
+        if (nextCell < 0 || nextCell == curCell) break;
+        curCell = nextCell;
+    }
+
     // ── Parametric epsilon setup ──
     // Space epsilon is a fixed spatial tolerance. Time epsilon scales
     // inversely with ray length so short rays get proportionally more
