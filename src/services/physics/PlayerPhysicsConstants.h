@@ -253,24 +253,33 @@ struct PlayerPhysicsConfig {
     float bodyOffsetZ  = BODY_OFFSET_Z;
 };
 
-// ── Head spring constants — dt-dependent formula with clamped spring dt:
-//   springDt = min(dt, 0.05),  tension_eff = BASE_TENSION / springDt,
-//   damping_eff = BASE_DAMPING + (1-BASE_DAMPING) * springDt,
-//   vel = displacement * tension_eff + old_vel * damping_eff,  vel.z *= Z_SCALE,
-//   pos += vel * dt  (full dt, not clamped)
-// At 12.5Hz (80ms): tension_eff=12.0 (not 7.5, +60%), damping_eff=0.069 (not 0.098, -30%).
-// dt clamping makes the spring stiffer than naive implementation at low Hz.
-// Note: NOT rate-independent (behavior differs at 60Hz). Once 12.5Hz is confirmed correct,
-// a rate-independent analytical solution can be derived.
+// ── Head spring — original discrete formula, virtualised at 12.5 Hz ──
+// The head-bob spring uses the Dark Engine's original discrete formula (see
+// computeSpringVelocity below) advanced at SPRING_NATIVE_DT regardless of the
+// physics rate. Between virtual samples the displayed position is cubic-
+// Hermite interpolated using the cached pos+vel at each endpoint, so at
+// physicsDt == SPRING_NATIVE_DT the virtualisation is a no-op (identical to
+// running the formula at physics rate) and at higher rates we get smooth
+// between-sample motion that preserves the 12.5 Hz sample grid exactly.
+// See feedback_exact_player_dynamics.md for the design principle.
+//
+// Parameters are the original's native values:
+//   • tension=0.6  / dt_internal=0.05 → effective 12 /s on displacement
+//   • damping=0.02 — velocity retention base (becomes 0.069 after dt scaling)
+//   • zScale=0.5   — Z-axis half-strength on the spring-pull term
+//   • velCap=25.0  — magnitude cap (raised when falling so the spring can't
+//                    fight gravity and produce a landing bounce)
+static constexpr float SPRING_NATIVE_DT         = 0.08f;  // 12.5 Hz native step
 static constexpr float HEAD_SPRING_BASE_TENSION = 0.6f;   // spring tension constant
 static constexpr float HEAD_SPRING_BASE_DAMPING = 0.02f;  // velocity retention base
 static constexpr float HEAD_SPRING_Z_SCALE      = 0.5f;   // Z-axis half-strength
 static constexpr float HEAD_SPRING_VEL_CAP      = 25.0f;  // max spring velocity magnitude
-static constexpr float HEAD_SPRING_MAX_DT       = 0.05f;  // spring dt cap (50ms) — clamps dt for spring calc
+static constexpr float HEAD_SPRING_MAX_DT       = 0.05f;  // internal spring-dt cap (50ms)
 
-/// Compute spring velocity from the dt-dependent formula. Returns new velocity; caller integrates
-/// position (pos += vel * dt). Separation allows velocity modification before integration
-/// (e.g., mantle velocity multipliers in states 3/4).
+/// One-shot original discrete spring-velocity update. Returns new velocity;
+/// caller integrates position (pos += vel * dt). Used by both the virtualised
+/// head-bob spring (one call per 12.5 Hz virtual step) and the mantle
+/// animation (one call per physics step, with per-phase tension overrides).
 static inline Vector3 computeSpringVelocity(
     const Vector3& pos, const Vector3& oldVel, const Vector3& target,
     float tension, float damping, float zScale, float velCap, float dt)
@@ -284,9 +293,8 @@ static inline Vector3 computeSpringVelocity(
     newVel.z *= zScale;
     newVel = newVel + oldVel * dampingEff;
 
-    // Velocity capping — original (PHMOD.CPP lines 2313-2323): cap is raised when
-    // falling so the spring doesn't fight gravity. Prevents visual "bounce" on landing.
-    // if (-velocity.z > maxmag) maxmag = -velocity.z
+    // Velocity cap: raised when falling so the spring doesn't fight gravity
+    // (prevents a visible "bounce" on landing).
     float effectiveCap = velCap;
     if (-newVel.z > effectiveCap)
         effectiveCap = -newVel.z;

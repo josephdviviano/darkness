@@ -122,6 +122,99 @@ using namespace Darkness;
 
 #include "DarknessRenderInit.h"
 
+// ── Head / viewport log ──────────────────────────────────────────────────
+// Per-render-frame CSV capturing what the camera actually renders, plus
+// underlying physics-side pose/spring state. Sampled at display rate so the
+// interpolated eye position (between fixed steps) is visible and any
+// render-rate discontinuities show up. Complementary to the fixed-step
+// physics_log written by PlayerPhysics::writeLogRow().
+
+static uint64_t monotonicMicros() {
+    using clk = std::chrono::steady_clock;
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        clk::now().time_since_epoch()).count();
+}
+
+static void openHeadLog(Darkness::RuntimeState &state, const std::string &path) {
+    if (state.headLog) std::fclose(state.headLog);
+    state.headLog = std::fopen(path.c_str(), "w");
+    if (!state.headLog) {
+        std::fprintf(stderr, "[head-log] Failed to open %s\n", path.c_str());
+        return;
+    }
+    std::fprintf(state.headLog,
+        "wallTime,frameDt,physSteps,ppfCancels,mode,hSpeed,inputFwd,inputRight,onGround,mantling,"
+        "camX,camY,camZ,camYaw,camPitch,camRoll,"
+        "bodyX,bodyY,bodyZ,"
+        "springX,springY,springZ,"
+        "poseCurX,poseCurY,poseCurZ,"
+        "poseEndX,poseEndY,poseEndZ,"
+        "leanAmount,interpAlpha\n");
+    state.headLogStartUs   = monotonicMicros();
+    state.headLogPrevUs    = state.headLogStartUs;
+    state.headLogPrevSteps = state.physics
+        ? state.physics->getPlayerPhysics().getTotalFixedSteps() : 0;
+    state.headLogPrevPPF   = state.physics
+        ? state.physics->getPlayerPhysics().getPPFCancels() : 0;
+    state.headLogFlushCtr  = 0;
+    std::fprintf(stderr, "[head-log] Writing per-frame viewport log to %s\n", path.c_str());
+}
+
+static void closeHeadLog(Darkness::RuntimeState &state) {
+    if (state.headLog) {
+        std::fclose(state.headLog);
+        state.headLog = nullptr;
+        std::fprintf(stderr, "[head-log] Closed\n");
+    }
+}
+
+static void writeHeadLogRow(Darkness::RuntimeState &state) {
+    if (!state.headLog || !state.physics) return;
+    auto &player = state.physics->getPlayerPhysics();
+
+    uint64_t nowUs = monotonicMicros();
+    double wallTime = (nowUs - state.headLogStartUs) * 1e-6;
+    double frameDt  = (nowUs - state.headLogPrevUs)  * 1e-6;
+    uint64_t totalSteps   = player.getTotalFixedSteps();
+    uint32_t stepsThisFrame = static_cast<uint32_t>(totalSteps - state.headLogPrevSteps);
+    uint64_t totalPPF     = player.getPPFCancels();
+    uint32_t ppfThisFrame = static_cast<uint32_t>(totalPPF - state.headLogPrevPPF);
+    state.headLogPrevUs    = nowUs;
+    state.headLogPrevSteps = totalSteps;
+    state.headLogPrevPPF   = totalPPF;
+
+    const Darkness::Vector3 &spring  = player.getSpringPos();
+    const Darkness::Vector3 &poseCur = player.getPoseCurrent();
+    const Darkness::Vector3 &poseEnd = player.getPoseEnd();
+    const Darkness::Vector3 &body    = player.getPosition();
+
+    std::fprintf(state.headLog,
+        "%.6f,%.6f,%u,%u,%s,%.4f,%.2f,%.2f,%d,%d,"
+        "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,"
+        "%.4f,%.4f,%.4f,"
+        "%.5f,%.5f,%.5f,"
+        "%.5f,%.5f,%.5f,"
+        "%.5f,%.5f,%.5f,"
+        "%.5f,%.5f\n",
+        wallTime, frameDt, stepsThisFrame, ppfThisFrame,
+        Darkness::PlayerPhysics::modeName(player.getMode()),
+        player.getHorizontalSpeed(),
+        player.getInputForward(), player.getInputRight(),
+        player.isOnGround() ? 1 : 0, player.isMantling() ? 1 : 0,
+        state.cam.pos[0], state.cam.pos[1], state.cam.pos[2],
+        state.cam.yaw, state.cam.pitch, state.cam.roll,
+        body.x, body.y, body.z,
+        spring.x, spring.y, spring.z,
+        poseCur.x, poseCur.y, poseCur.z,
+        poseEnd.x, poseEnd.y, poseEnd.z,
+        player.getLeanAmount(), player.getInterpAlpha());
+
+    if (++state.headLogFlushCtr >= 30) {
+        std::fflush(state.headLog);
+        state.headLogFlushCtr = 0;
+    }
+}
+
 static void printHelp() {
     std::fprintf(stderr,
         "darknessRender — Dark Engine world geometry viewer\n"
@@ -151,6 +244,9 @@ static void printHelp() {
         "  --water-rot <f> Water UV rotation speed in rad/s, 0.0-1.0 (default: 0.015).\n"
         "  --water-scroll <f> Water UV scroll speed, 0.0-1.0 (default: 0.05).\n"
         "  --step-log     Log stair step diagnostics to stderr ([STEP] prefix).\n"
+        "  --head-log <path>\n"
+        "                 Write per-render-frame head/viewport CSV to <path> for\n"
+        "                 diagnosing head-bob smoothness and animation snap.\n"
         "  --toggle-platforms  Auto-activate all moving terrain at startup.\n"
         "  --audio-log    Enable audio/sound/schema log output (off by default).\n"
         "  --no-probes    Skip probe baking (no spatial audio, faster startup).\n"
@@ -1009,6 +1105,14 @@ static void registerConsoleSettings(
         },
         "Write per-timestep physics data to physics_log.csv");
 
+    dbgConsole.addBool("head_log",
+        [&state]() { return state.headLog != nullptr; },
+        [&state](bool v) {
+            if (v) openHeadLog(state, "head_log.csv");
+            else   closeHeadLog(state);
+        },
+        "Write per-render-frame head/viewport state to head_log.csv");
+
     // ── Water ──
 
     dbgConsole.setGroup("Water");
@@ -1417,6 +1521,12 @@ static void updateMovement(
         Darkness::Vector3 punch = state.physics->getPlayerPhysics().getViewPunch();
         state.cam.pitch += punch.x;
         state.cam.roll  += punch.z;
+
+        // Per-render-frame head/viewport log — sampled after all camera mutations so
+        // it captures the exact state that will render this frame. Counts how many
+        // fixed physics steps occurred since the previous write so post-analysis can
+        // detect render-rate-over-physics-rate aliasing.
+        writeHeadLogRow(state);
         return;
     }
 
@@ -1925,6 +2035,11 @@ int main(int argc, char *argv[]) {
     if (cfg.stepLog && state.physics) {
         state.physics->getPlayerPhysics().setStepLog(true);
         std::fprintf(stderr, "Stair step logging enabled (--step-log)\n");
+    }
+
+    // Open per-render-frame head log if --head-log was passed.
+    if (!cfg.headLogPath.empty()) {
+        openHeadLog(state, cfg.headLogPath);
     }
 
     // ── Load motion capture data from motions.crf ──
@@ -3212,6 +3327,9 @@ int main(int argc, char *argv[]) {
     // Destroy runtime GPU resources not in GPUResources struct
     if (bgfx::isValid(state.acousticVBH))
         bgfx::destroy(state.acousticVBH);
+
+    // Flush and close the head log before destroying physics / GPU resources.
+    closeHeadLog(state);
 
     destroyGPUResources(gpu);
     shutdownWindow(window);
