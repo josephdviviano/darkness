@@ -343,9 +343,15 @@
         if (std::fabs(mLeanAmount) > 0.01f && mCellIdx >= 0) {
             float sinYaw = mSinYaw;
             float cosYaw = mCosYaw;
-            // HEAD collision position for lean: standing offset + pose-driven drop
-            float headOffset = mSphereOffsetsBase[0] + mPoseCurrent.z;
-            float leanBaseZ = headOffset + mSpringPos.z;
+            // HEAD collision position for lean: must match what computeRawEyePos
+            // actually uses for the rendered eye height — body center + base
+            // sphere offset + spring Z displacement. Earlier this code added
+            // mPoseCurrent.z on top of mSpringPos.z, which double-counts the
+            // pose dip (the spring already tracks the pose) — in crouch mode
+            // that placed the sphere ~2u below the actual head, intersecting
+            // the floor every frame and producing erratic lateral jitter as
+            // the body slid over floor-polygon boundaries.
+            float leanBaseZ = mSphereOffsetsBase[0] + mSpringPos.z;
             // Base (unleaned) head position
             Vector3 baseHead = mPosition + Vector3(0.0f, 0.0f, leanBaseZ);
 
@@ -444,12 +450,28 @@
     }
 
     /// Snap the virtualised head spring's virtual grid to the current
-    /// wall-clock time. Captures the currently-displayed spring state
-    /// (pos from Hermite interpolation, vel from the Hermite derivative)
-    /// as the new Prev sample, then advances one virtual step using the
-    /// current pose parameters to populate Next. Called by activatePose()
-    /// so the spring responds to a new pose target immediately instead of
+    /// wall-clock time. Captures the currently-displayed spring position
+    /// as the new Prev sample, recomputes the Prev velocity from the
+    /// spring formula against the NEW pose target, then advances one
+    /// virtual step to populate Next. Called by activatePose() so the
+    /// spring responds to a new pose target immediately instead of
     /// continuing the pre-activation virt-next for up to SPRING_NATIVE_DT.
+    ///
+    /// Why the Prev velocity is recomputed (not captured from the Hermite
+    /// derivative as it once was): the Hermite derivative describes the
+    /// SHAPE of the prior interpolation curve, not the spring's physical
+    /// response to the current target. When a pose activation reverses
+    /// target direction (e.g. stride→rest at every footfall), the
+    /// derivative still points in the OLD direction. The first-virt-span
+    /// Hermite curve then blends an old-direction Prev velocity with a
+    /// new-direction Next velocity, producing a small (~0.001 u) extremum
+    /// bump that reads as visible jitter at footfall. Recomputing Prev
+    /// velocity from the formula at the new target makes Prev/Next
+    /// velocities co-directional, so the curve is monotonic.
+    ///
+    /// Position continuity is preserved exactly (Prev pos = display pos);
+    /// velocity is allowed to slope-kink at the snap moment, which is
+    /// imperceptible at the small target deltas of stride/rest cycling.
     ///
     /// At physicsDt = SPRING_NATIVE_DT this is effectively a no-op — the
     /// accumulator is already 0 right after each virt-step advance, so
@@ -457,49 +479,52 @@
     /// scales up with physics rate as required by the design principle in
     /// feedback_exact_player_dynamics.md.
     inline void snapSpringVirtualGridToNow() {
-        // Hermite derivative H'(s) / SPRING_NATIVE_DT gives the velocity
-        // at the current interpolation parameter. Basis derivatives:
-        //   h00'(s) =  6s² - 6s     h10'(s) = 3s² - 4s + 1
-        //   h01'(s) = -6s² + 6s     h11'(s) = 3s² - 2s
-        const float s  = mSpringAccum / SPRING_NATIVE_DT;
-        const float s2 = s * s;
-        const float dh00 =  6.0f * s2 - 6.0f * s;
-        const float dh10 =  3.0f * s2 - 4.0f * s + 1.0f;
-        const float dh01 = -6.0f * s2 + 6.0f * s;
-        const float dh11 =  3.0f * s2 - 2.0f * s;
-
-        const Vector3 currentVel =
-              (dh00 * mSpringPrevPos + dh01 * mSpringNextPos) / SPRING_NATIVE_DT
-            +  dh10 * mSpringPrevVel + dh11 * mSpringNextVel;
-
-        mSpringPrevPos = mSpringPos;   // display value computed last updateHeadSpring
-        mSpringPrevVel = currentVel;
-        mSpringAccum   = 0.0f;
-
-        // Populate Next by running one virtual step of the original
-        // discrete formula, using the pose target at (now + NATIVE_DT).
-        // The caller just updated pose state (activation/etc.) so this
-        // captures the new target's immediate effect.
-        const float   virtSampleTime = mSimTime + SPRING_NATIVE_DT;
-        const Vector3 target         = poseTargetAtTime(virtSampleTime);
-        mSpringNextVel = computeSpringVelocity(
-            mSpringPrevPos, mSpringPrevVel, target,
+        // Recompute Prev velocity from the spring formula against the new
+        // target (evaluated at the snap moment, not 80 ms ahead). The
+        // existing mSpringNextVel — the formula's output for the prior
+        // virt step — is the best available "old velocity" input; with
+        // damping retention ~0.07 it contributes only weakly, so the new
+        // velocity is dominated by the displacement-toward-target term and
+        // points the right way under any target reversal.
+        const Vector3 targetNow = poseTargetAtTime(mSimTime);
+        const Vector3 newPrevVel = computeSpringVelocity(
+            mSpringPos, mSpringNextVel, targetNow,
             HEAD_SPRING_BASE_TENSION, HEAD_SPRING_BASE_DAMPING,
             HEAD_SPRING_Z_SCALE, HEAD_SPRING_VEL_CAP, SPRING_NATIVE_DT);
-        mSpringNextPos = mSpringPrevPos + mSpringNextVel * SPRING_NATIVE_DT;
+
+        // Prime mSpringNext so that advanceSpringVirtualStep's next→prev
+        // shift preserves our captured state as the new Prev. The accumulator
+        // reset anchors the virt grid to now: new Prev is at mSimTime, new
+        // Next will be at mSimTime + SPRING_NATIVE_DT. advance internally
+        // evaluates the pose target at new-next's time, matching the 12.5 Hz
+        // discrete semantics.
+        mSpringNextPos = mSpringPos;   // display value from last updateHeadSpring
+        mSpringNextVel = newPrevVel;
+        mSpringAccum   = 0.0f;
+        advanceSpringVirtualStep(mSimTime);
     }
 
     /// Advance the virtual spring state (mSpringPrev → mSpringNext) by one
     /// 12.5 Hz native step. Uses the original Dark Engine discrete formula
-    /// (computeSpringVelocity + pos += vel*dt) with dt = SPRING_NATIVE_DT,
-    /// applied to whatever pose target is current at the virtual sample's
-    /// wall-clock time (precise recompute, not the current-physics value).
-    inline void advanceSpringVirtualStep(float virtSampleTime) {
+    /// (computeSpringVelocity + pos += vel*dt) with dt = SPRING_NATIVE_DT.
+    ///
+    /// The target is evaluated at the NEW NEXT's wall-clock time
+    /// (newPrevTime + SPRING_NATIVE_DT), matching the 12.5 Hz discrete
+    /// semantics where each tick advances velocity using the pose target
+    /// that has been updated this tick (i.e., the pose at the end of the
+    /// step, not the start). Using the start-of-step target instead would
+    /// cause two consecutive virt steps after a pose activation to reuse
+    /// the same target — stalling the spring's response for one virt period
+    /// and producing a visible lateral/vertical bump when the Hermite
+    /// interpolant between prev (accelerating) and next (near-stationary)
+    /// curves into a local extremum.
+    inline void advanceSpringVirtualStep(float newPrevTime) {
         // Shift: current next becomes new prev; we'll compute a new next.
         mSpringPrevPos = mSpringNextPos;
         mSpringPrevVel = mSpringNextVel;
 
-        const Vector3 target = poseTargetAtTime(virtSampleTime);
+        const float   newNextTime = newPrevTime + SPRING_NATIVE_DT;
+        const Vector3 target      = poseTargetAtTime(newNextTime);
 
         mSpringNextVel = computeSpringVelocity(
             mSpringPrevPos, mSpringPrevVel, target,
@@ -543,6 +568,18 @@
         // how far into the current virtual interval the wall clock sits.
         // Velocities are scaled by SPRING_NATIVE_DT so the Hermite basis
         // matches standard [0,1] parameterisation.
+        //
+        // Per-axis Fritsch–Carlson monotonic clipping is applied to the
+        // endpoint velocities BEFORE the Hermite eval. The original 12.5 Hz
+        // spring formula can produce |V_prev| ≫ |V_next| when target reverses
+        // (e.g. stride→rest at a footfall), and the unclipped Hermite curve
+        // then dips a fraction of a unit past the Next sample before climbing
+        // back to it — visible as a small jitter at every bob extremum.
+        // Clipping limits the slope magnitudes so the curve stays monotonic
+        // between Prev and Next when the data itself is monotonic, while
+        // leaving non-monotonic spans (e.g. across a true bob extremum)
+        // untouched. Sample positions and velocities at virt-grid points are
+        // unchanged — only the between-sample curvature is constrained.
         const float s  = mSpringAccum / SPRING_NATIVE_DT;
         const float s2 = s * s;
         const float s3 = s2 * s;
@@ -551,10 +588,33 @@
         const float h01 = -2.0f * s3 + 3.0f * s2;
         const float h11 =         s3 -        s2;
 
+        Vector3 prevVelClipped = mSpringPrevVel;
+        Vector3 nextVelClipped = mSpringNextVel;
+        for (int i = 0; i < 3; ++i) {
+            const float deltaPos = mSpringNextPos[i] - mSpringPrevPos[i];
+            // Skip when endpoints coincide — secant slope is zero/undefined,
+            // any velocity is "non-monotonic" and the Hermite stays close to
+            // the shared endpoint regardless.
+            if (std::fabs(deltaPos) < 1e-6f) continue;
+            const float secant = deltaPos / SPRING_NATIVE_DT;
+            const float alpha  = mSpringPrevVel[i] / secant;
+            const float beta   = mSpringNextVel[i] / secant;
+            // Same-sign-as-secant test: if either endpoint velocity opposes
+            // the secant, the segment crosses an extremum and Hermite must
+            // be free to curve through it.
+            if (alpha < 0.0f || beta < 0.0f) continue;
+            const float r2 = alpha * alpha + beta * beta;
+            if (r2 > 9.0f) {
+                const float tau = 3.0f / std::sqrt(r2);
+                prevVelClipped[i] = tau * mSpringPrevVel[i];
+                nextVelClipped[i] = tau * mSpringNextVel[i];
+            }
+        }
+
         mSpringPos = h00 * mSpringPrevPos
-                   + h10 * mSpringPrevVel * SPRING_NATIVE_DT
+                   + h10 * prevVelClipped * SPRING_NATIVE_DT
                    + h01 * mSpringNextPos
-                   + h11 * mSpringNextVel * SPRING_NATIVE_DT;
+                   + h11 * nextVelClipped * SPRING_NATIVE_DT;
 
         // Clamp to sane range — prevents runaway on large target jumps.
         // ±4.0 accommodates crouch transition (2.02 units) plus overshoot.
