@@ -450,6 +450,26 @@ public:
     float getInputForward() const { return mInputForward; }
     float getInputRight() const { return mInputRight; }
 
+    /// Previous-tick eye snapshot — the source of the render interpolation
+    /// lerp. mix(getPrevEyePos(), getRawEyePos(), getInterpAlpha()) reproduces
+    /// what getEyePosition() returns. Exposed for diagnostic logging.
+    const Vector3 &getPrevEyePos() const { return mPrevEyePos; }
+
+    /// Current-tick (un-interpolated) eye position. The target of the render
+    /// interpolation lerp. Returns the same value computeRawEyePos() uses
+    /// inside getEyePosition().
+    Vector3 getRawEyePos() const { return computeRawEyePos(); }
+
+    /// Per-frame world-space displacement applied to the eye when the HEAD
+    /// sphere bumps a wall (left over from the most recent fixed step).
+    /// Stays nonzero only while the player is leaning into a wall.
+    const Vector3 &getHeadClamp() const { return mHeadClamp; }
+
+    /// Pending knockback impulse — accumulated by applyKnockback() and bled
+    /// into mVelocity exponentially each fixedStep by integrateKnockback.
+    /// Diagnostic exposure so the log can show how much shove is queued.
+    const Vector3 &getPendingKnockback() const { return mPendingKnockback; }
+
     // ── Teleport ──
 
     /// Set player position directly (for spawn, teleport). Resets velocity and updates cell index.
