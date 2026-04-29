@@ -340,16 +340,28 @@ public:
         return Vector3(mSinYaw, -mCosYaw, 0.0f);
     }
 
-    /// Apply a velocity impulse to the player (knockback from object impacts).
+    /// Apply a velocity impulse to the player (instant velocity addition).
+    /// Used for jumps, water exit, etc. For object-impact knockback prefer
+    /// applyKnockback below — that channel bleeds in over many ticks for a
+    /// lagged shove instead of a one-frame teleport.
     void applyImpulse(const Vector3 &impulse) {
         mVelocity += impulse;
     }
 
+    /// Apply a knockback impulse from an external impact (thrown object,
+    /// explosion). The impulse is accumulated into mPendingKnockback and
+    /// transferred to mVelocity exponentially over several ticks by
+    /// integrateKnockback(), so the player feels a smooth shove instead of
+    /// a one-frame jolt. Multiple impulses in the same frame are summed.
+    void applyKnockback(const Vector3 &impulse) {
+        mPendingKnockback += impulse;
+    }
+
     // ── View punch — spring-driven camera kick from object impacts ──
     //
-    // Source Engine style: angular velocity impulse decays via a critically
-    // damped spring. Produces a satisfying snap-then-settle when the player
-    // is hit by a fast-moving object.
+    // Source Engine style: angular velocity impulse decays via a damped
+    // spring. Tuned slow + slightly overdamped so a hit produces a soft,
+    // lagged camera tilt that crawls back to neutral without overshoot.
 
     /// Add angular velocity impulse to the view punch spring.
     void addViewPunch(const Vector3 &angleVel) {
@@ -570,6 +582,25 @@ public:
 private:
     // ── Internal simulation steps ──
 
+    /// Bleed pending knockback into mVelocity. Each tick transfers an
+    /// exponential fraction of the pending impulse, so the shove from a
+    /// thrown object spreads across multiple ticks instead of arriving as
+    /// a one-frame velocity jump. Time constant ≈ 1 / kRate so most of the
+    /// impulse delivers within ~3 / kRate seconds. Friction in applyMovement
+    /// then drags the transferred velocity back to zero over walk-decel time,
+    /// which is the desired "lagged shove that fades" feel.
+    inline void integrateKnockback() {
+        if (glm::length(mPendingKnockback) < 1e-4f) {
+            mPendingKnockback = Vector3(0.0f);
+            return;
+        }
+        constexpr float kRate = 4.0f;  // 1 / time_constant in seconds
+        float k = 1.0f - std::exp(-kRate * mTimestep.fixedDt);
+        Vector3 transferred = mPendingKnockback * k;
+        mVelocity += transferred;
+        mPendingKnockback -= transferred;
+    }
+
     /// Called on every airborne transition (last floor contact destroyed, grace-timer
     /// expired, or teleport). Matches original Dark Engine LeaveGround: clears ground
     /// object and snapshots the current FOOT position / sim time into the stride tracker
@@ -692,6 +723,15 @@ private:
         mPreMovementVelocity = mVelocity;
         if (!mMotionDisabled)
             applyMovement();
+
+        // 5b. Bleed pending knockback into mVelocity. Object-impact handlers
+        //     (DarkPhysics::handlePlayerDynamicContact) push impulses into
+        //     mPendingKnockback rather than mVelocity directly so the response
+        //     spreads across many ticks — a lagged shove instead of a one-tick
+        //     velocity jump. Runs after applyMovement so player input does not
+        //     starve the knockback transfer; constrainVelocity below still
+        //     removes any component going into a wall.
+        integrateKnockback();
 
         // 6. Constrain velocity against validated contacts.
         //    Matches original: ApplyConstraints (phmod.cpp line 1861) removes
@@ -1040,12 +1080,21 @@ private:
     std::vector<float> mClimbabilityTable;
 
     // ── View punch spring (Source Engine style camera kick) ──
-    // Spring-driven angular offset from object impacts. Snaps away from
-    // the hit direction then settles back to zero.
-    static constexpr float PUNCH_DAMPING = 9.0f;
-    static constexpr float PUNCH_SPRING  = 65.0f;
+    // Spring-driven angular offset from object impacts. Tuned slow and
+    // slightly overdamped (ω₀≈4.7 rad/s, ζ≈1.17): a hit tilts the camera
+    // and it crawls back to neutral over ~1 s with no oscillation. The
+    // earlier values (SPRING=65, DAMPING=9; ω₀≈8, ζ≈0.56) were stiff and
+    // underdamped — a noticeable snap that felt twitchy on light impacts.
+    static constexpr float PUNCH_DAMPING = 11.0f;
+    static constexpr float PUNCH_SPRING  = 22.0f;
     Vector3 mPunchAngle{0.0f};      // current angular offset (pitch, yaw, roll)
     Vector3 mPunchAngleVel{0.0f};   // angular velocity of the spring
+
+    // ── Knockback channel ──
+    // Pending velocity impulse from object impacts, bled into mVelocity
+    // exponentially each fixedStep by integrateKnockback. Smooths the
+    // shove from being hit so the player slides instead of teleporting.
+    Vector3 mPendingKnockback{0.0f};
 
     // ── Callbacks ──
     FootstepCallback mFootstepCb;            // footstep sound event (stride-based)
