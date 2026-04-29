@@ -750,19 +750,22 @@ private:
         float impulseScale = static_cast<float>(mass.mass) * speed * 0.002f;
         Vector3 knockDir = glm::normalize(objVel);
 
-        // Apply velocity impulse to player
-        mPlayer.applyImpulse(knockDir * impulseScale);
+        // Push the impulse into the lagged knockback channel rather than
+        // adding it directly to velocity. PlayerPhysics::integrateKnockback
+        // bleeds it into mVelocity over ~750 ms with an exponential transfer,
+        // so the player feels a smooth shove instead of a one-tick teleport.
+        mPlayer.applyKnockback(knockDir * impulseScale);
 
-        // Direction-aware view punch (Source Engine style).
-        // Subtle: punchMag = impulseScale * 3.0 gives a gentle camera nudge.
-        // A 30kg crate at 10 units/s → punchMag ~1.8 degrees. Noticeable
-        // but not disorienting. Heavy/fast objects (150kg explosion debris
-        // at 20 units/s) → ~18 degrees, which feels impactful.
+        // Direction-aware view punch. The spring is now slow + slightly
+        // overdamped (PUNCH_SPRING=22, PUNCH_DAMPING=11), so the camera
+        // crawls back over ~1 s without overshoot. Magnitude is halved
+        // (3.0 → 1.5) to keep the kick from over-rotating against the
+        // softer spring — the impulse persists much longer now.
         Vector3 forward = mPlayer.getForward();
         Vector3 right = mPlayer.getRight();
         float sideDot = glm::dot(knockDir, right);
         float fwdDot = glm::dot(knockDir, forward);
-        float punchMag = impulseScale * 3.0f;
+        float punchMag = impulseScale * 1.5f;
         mPlayer.addViewPunch(Vector3(
             fwdDot * punchMag,     // pitch
             0.0f,                   // yaw (minimal)
