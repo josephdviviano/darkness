@@ -48,6 +48,7 @@
 #include "object/ObjectService.h"
 #include "sim/DoorSystem.h"
 #include "sim/MessageDispatch.h"
+#include "worldquery/ObjectState.h"
 
 namespace Darkness {
 
@@ -95,6 +96,15 @@ public:
     /// Enables frob targeting of levers, switches, books, and other small objects
     /// that have FrobInfo but no P$PhysType collision body.
     void setWorldQuery(const IWorldQuery *wq) { mWorldQuery = wq; }
+
+    /// Live position source for the proximity-cone frob path. The cache
+    /// stores the load-time placement, but objects can move at runtime
+    /// (dropped/thrown crates, doors, etc.). When set, the cone loop uses
+    /// the StateMap's current position whenever it has one — falls back
+    /// to the cached placement only for objects that have never moved.
+    /// Phase 2 will replace the proximity cone with a mesh-padded raycast,
+    /// at which point this setter and the cache both go away.
+    void setObjectStates(const ObjectStateMap *states) { mStates = states; }
 
     /// Build the frobbable-object cache from the placement map.
     /// Scans all positioned objects and stores those with FrobInfo (via
@@ -230,7 +240,16 @@ public:
             int dbgInCone = 0;
 
             for (const auto &entry : mFrobCache) {
+                // Prefer the live runtime position if the StateMap has one;
+                // fall back to the load-time placement for objects that
+                // have never been touched. Without this, dropped or thrown
+                // objects remain frobbable from their original spawn point.
                 Vector3 objPos = entry.position;
+                if (mStates) {
+                    if (const ObjectState *s = mStates->tryGet(entry.objID)) {
+                        objPos = s->position;
+                    }
+                }
                 Vector3 toObj = objPos - rayStart;
                 float dist = glm::length(toObj);
 
@@ -347,6 +366,7 @@ private:
     MessageDispatch *mMsgDispatch = nullptr;
     ScriptManager *mScriptManager = nullptr;
     const IWorldQuery *mWorldQuery = nullptr;
+    const ObjectStateMap *mStates = nullptr;
     FrobTarget mTarget;
     float mFrobDistance = kDefaultFrobDistance;
     int mDbgFrame = 0;  // debug frame counter for periodic logging

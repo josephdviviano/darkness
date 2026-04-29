@@ -2467,6 +2467,7 @@ int main(int argc, char *argv[]) {
     // Connect FrobSystem to MessageDispatch for ControlDevice link traversal
     frobSystem.setMessageDispatch(&messageDispatch);
     frobSystem.setWorldQuery(worldQuery.get());
+    frobSystem.setObjectStates(state.objectStates);  // live-position source for cone path
     // frobSystem.setScriptManager wired below after ScriptManager declaration
     state.messageDispatch = &messageDispatch;
 
