@@ -65,7 +65,6 @@ namespace Darkness {
 // Forward declarations
 class PropertyService;
 class ObjectStateMap;
-class MessageDispatch;
 
 // ── Platform movement status ──
 enum PlatformStatus : int32_t {
@@ -82,6 +81,13 @@ struct WaypointSegment {
     float pauseDuration = 0.0f;  // Pause time AT this waypoint (seconds)
     bool pathLimit = false;      // Enforce hard position limit
 };
+
+// ── Callback for waypoint arrival events (script messages, sounds, etc.) ──
+// Fired when a platform reaches a waypoint. The wiring layer is responsible
+// for fanning out to ScriptManager (MovingTerrainWaypoint message), audio
+// schemas, particle effects, etc. Mirrors the DoorSystem/TweqSystem pattern.
+using MovingTerrainWaypointCallback =
+    std::function<void(int32_t platformID, int32_t waypointID, int waypointIdx)>;
 
 // ── Per-platform runtime state ──
 struct PlatformState {
@@ -267,9 +273,11 @@ public:
         mCollisionUpdateCb = std::move(cb);
     }
 
-    /// Set MessageDispatch for sending script messages on waypoint arrival.
-    void setMessageDispatch(MessageDispatch *msgDispatch) {
-        mMsgDispatch = msgDispatch;
+    /// Set callback fired on waypoint arrival. The wiring layer routes this
+    /// to ScriptManager (MovingTerrainWaypoint message) and any peer
+    /// subsystems that need to react (audio, particles, etc.).
+    void setEventCallback(MovingTerrainWaypointCallback cb) {
+        mEventCallback = std::move(cb);
     }
 
     /// Get all platform IDs (for debug enumeration).
@@ -556,7 +564,7 @@ private:
                      wp.position.x, wp.position.y, wp.position.z,
                      wp.pauseDuration);
 
-        // Send script messages via MessageDispatch
+        // Notify wiring layer (script messages, sounds, etc.)
         sendWaypointMessages(plat, wp);
 
         // Compute next waypoint index based on direction
@@ -596,16 +604,13 @@ private:
         }
     }
 
-    /// Send MovingTerrainWaypoint and WaypointReached script messages.
+    /// Fire the waypoint-arrival callback. The wiring layer translates this
+    /// into a MovingTerrainWaypoint script message (consumed by StdElevator
+    /// to deactivate at destinations) and any peer-subsystem reactions.
     void sendWaypointMessages(const PlatformState &plat,
                               const WaypointSegment &wp) {
-        if (!mMsgDispatch) return;
-
-        // These messages are sent via MessageDispatch for script handlers
-        // to react to (e.g. triggering sounds, opening doors, etc.)
-        // MovingTerrainWaypoint → platform object
-        // WaypointReached → waypoint object
-        // Implementation deferred to 57e when MessageDispatch is wired up
+        if (mEventCallback)
+            mEventCallback(plat.objID, wp.waypointID, plat.currentWaypointIdx);
     }
 
     // ── Transform helpers ──
@@ -646,7 +651,7 @@ private:
     ObjectService *mObjSvc = nullptr;
     const std::unordered_map<int32_t, ObjPlacementInfo> *mPlacements = nullptr;
     PlatformCollisionCallback mCollisionUpdateCb;
-    MessageDispatch *mMsgDispatch = nullptr;
+    MovingTerrainWaypointCallback mEventCallback;
     uint32_t mFrameCount = 0;
 };
 
