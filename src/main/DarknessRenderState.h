@@ -288,6 +288,15 @@ struct RuntimeState {
     uint64_t headLogPrevPPF   = 0;      // previous-frame PPF cancellation count
     uint32_t headLogFlushCtr  = 0;      // flush every N rows
 
+    // ── View-punch displacement bookkeeping ──
+    // mPunchAngle from PlayerPhysics is an absolute offset from neutral (the
+    // current spring displacement), not a per-frame delta. Adding it to
+    // state.cam.pitch every render frame would integrate the offset and run
+    // pitch off to infinity — we have to subtract last frame's contribution
+    // before adding this frame's. Roll has no equivalent because cam.roll is
+    // overwritten each frame by getLeanTilt() before the punch is applied.
+    float lastAppliedPunchPitch = 0.0f;
+
     // Debug: acoustic mesh wireframe overlay
     bool showAcousticMesh = false;
     std::vector<float> acousticVerts;     // x,y,z flat array
