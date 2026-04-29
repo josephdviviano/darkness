@@ -947,9 +947,15 @@ public:
             if (body.isEdgeTrigger) continue;
             if (body.shapeType == CollisionShapeType::None) continue;
 
-            // Create geom for the shape
+            // Create geom for the shape. SphereHat is treated as OBB —
+            // the original engine's sphere+plane composite was a workaround
+            // for missing OBB-vs-OBB collision; ODE provides true OBB-vs-OBB
+            // via dBoxBox so we build SphereHats as boxes from the model bbox.
+            const bool boxLike =
+                (body.shapeType == CollisionShapeType::OBB ||
+                 body.shapeType == CollisionShapeType::SphereHat);
             dGeomID geom = nullptr;
-            if (body.shapeType == CollisionShapeType::OBB) {
+            if (boxLike) {
                 geom = dCreateBox(mODESpace,
                     body.edgeLengths.x, body.edgeLengths.y, body.edgeLengths.z);
             } else {
@@ -991,9 +997,9 @@ public:
                 // Create rigid body
                 dBodyID odeBody = dBodyCreate(mODEWorld);
 
-                // Set mass from P$PhysAttr
+                // Set mass from P$PhysAttr — match the box/sphere choice above.
                 dMass odeMass;
-                if (body.shapeType == CollisionShapeType::OBB) {
+                if (boxLike) {
                     dMassSetBox(&odeMass, 1.0,
                         body.edgeLengths.x, body.edgeLengths.y, body.edgeLengths.z);
                 } else {
@@ -1059,7 +1065,11 @@ public:
 
         dBodyID odeBody = dBodyCreate(mODEWorld);
         dMass odeMass;
-        if (collBody->shapeType == CollisionShapeType::OBB) {
+        // SphereHat shares the OBB-style box geom (see buildODEGeoms).
+        const bool boxLike =
+            (collBody->shapeType == CollisionShapeType::OBB ||
+             collBody->shapeType == CollisionShapeType::SphereHat);
+        if (boxLike) {
             dMassSetBox(&odeMass, 1.0,
                 collBody->edgeLengths.x, collBody->edgeLengths.y,
                 collBody->edgeLengths.z);

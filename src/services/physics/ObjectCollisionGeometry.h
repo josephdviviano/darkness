@@ -131,7 +131,12 @@ constexpr uint32_t COLLISION_NORESULT = 0x10;  // detect collision but no physic
 enum class CollisionShapeType : uint8_t {
     OBB       = 0,  // Oriented bounding box (most furniture, doors, crates)
     Sphere    = 1,  // Bounding sphere
-    SphereHat = 2,  // Sphere with flat top (AI heads) — treated as sphere for now
+    SphereHat = 2,  // Original engine: sphere + dynamic flat-plane cap, used
+                    //   for crates/barrels/AI heads. The cap workaround was
+                    //   needed because the original lacked OBB-vs-OBB. With
+                    //   ODE we have proper OBB-vs-OBB, so SphereHat objects
+                    //   are built and simulated as OBBs from the model bbox.
+                    //   Treated identically to OBB throughout collision.
     None      = 3   // No collision (markers, scripts, particles)
 };
 
@@ -708,13 +713,18 @@ public:
             body.shapeType = shapeType;
             body.isSpecial = isSpecial;
 
-            // Read P$PhysAttr for object stepping fields (OBB-only).
+            // Read P$PhysAttr for object stepping fields (OBB-shaped only).
             // P$PhysAttr layout (52 bytes): gravity(0), mass(4), density(8),
             // elasticity(12), base_friction(16), cog_offset(20), rot_axes(32),
             // rest_axes(36), climbable_sides(40), edge_trigger(44), pore_size(48).
             // climbable_sides: 6-bit bitmask of climbable OBB faces.
             // edge_trigger: BOOL (int32) — volume trigger, not physical.
-            if (propSvc && shapeType == CollisionShapeType::OBB) {
+            // SphereHat objects are treated as OBBs for collision (their
+            // radii data is unused; the bounding box drives the box geom).
+            const bool isBoxLike =
+                (shapeType == CollisionShapeType::OBB ||
+                 shapeType == CollisionShapeType::SphereHat);
+            if (propSvc && isBoxLike) {
                 size_t attrSize = 0;
                 const uint8_t *attrData = getPropertyRawData(
                     propSvc, "PhysAttr", obj.objID, attrSize);
@@ -750,11 +760,13 @@ public:
             Vector3 scale(obj.scaleX, obj.scaleY, obj.scaleZ);
             body.objectScale = scale;
 
-            if (shapeType == CollisionShapeType::OBB) {
+            if (isBoxLike) {
                 // Default edge lengths = model bbox dimensions * scale * 0.999.
                 body.edgeLengths = bboxSize * scale * kOBBEdgeShrink;
 
-                // Check P$PhysDims for explicit size override.
+                // Check P$PhysDims for explicit size override (OBB only —
+                // SphereHat objects don't carry .size data on disk; we
+                // always use bbox*scale for them).
                 // each concrete object gets its own copy. InitPhysProperty writes the model
                 // bbox * scale into PhysDims.size, and UpdatePhysModel then applies
                 // PhysDims.size as the final edge lengths (overriding the 0.999 shrink).
@@ -762,7 +774,7 @@ public:
                 // PhysDims.size values ALREADY INCLUDE the object's scale — they are
                 // the FINAL edge lengths, not unscaled dimensions. Do NOT multiply by
                 // scale again. Also no 0.999 shrink.
-                if (propSvc) {
+                if (propSvc && shapeType == CollisionShapeType::OBB) {
                     size_t dimSize = 0;
                     const uint8_t *dimData = getPropertyRawData(propSvc, "PhysDims", obj.objID, dimSize);
                     if (dimData && dimSize >= 44) {
@@ -961,10 +973,13 @@ public:
             for (int s = 0; s < numSpheres; ++s) {
                 OBBCollisionResult cr;
 
-                if (body.shapeType == CollisionShapeType::OBB) {
+                if (body.shapeType == CollisionShapeType::OBB ||
+                    body.shapeType == CollisionShapeType::SphereHat) {
+                    // SphereHat is treated as an OBB built from the model bbox
+                    // (the original engine's sphere+plane composite is replaced
+                    // by an OBB now that ODE provides true OBB-vs-OBB).
                     cr = checkSphereVsOBB(sphereCenters[s], sphereRadii[s], body);
-                } else if (body.shapeType == CollisionShapeType::Sphere ||
-                           body.shapeType == CollisionShapeType::SphereHat) {
+                } else if (body.shapeType == CollisionShapeType::Sphere) {
                     cr = checkSphereVsSphere(sphereCenters[s], sphereRadii[s], body);
                 } else {
                     continue; // None type — shouldn't be in mBodies, but guard
@@ -1041,7 +1056,10 @@ public:
         body.worldPos = Vector3(centerWorld.x, centerWorld.y, centerWorld.z);
 
         // Extract rotation: normalize columns of the upper-left 3x3 to strip scale.
-        if (body.shapeType == CollisionShapeType::OBB) {
+        // Box-shaped bodies (OBB and SphereHat-as-OBB) need the rotation; pure
+        // spheres are rotation-invariant.
+        if (body.shapeType == CollisionShapeType::OBB ||
+            body.shapeType == CollisionShapeType::SphereHat) {
             glm::mat3 upper3x3 = glm::mat3(modelMatrix);
             body.rotation[0] = glm::normalize(upper3x3[0]);
             body.rotation[1] = glm::normalize(upper3x3[1]);
@@ -1107,10 +1125,11 @@ private:
     // ── AABB computation ──
 
     /// Compute world-space axis-aligned bounding box for a collision body.
-    /// For OBBs: enumerate all 8 rotated corners.
+    /// For box-shaped (OBB and SphereHat): enumerate all 8 rotated corners.
     /// For spheres: center +/- radius.
     static void computeAABB(ObjectCollisionBody &body) {
-        if (body.shapeType == CollisionShapeType::OBB) {
+        if (body.shapeType == CollisionShapeType::OBB ||
+            body.shapeType == CollisionShapeType::SphereHat) {
             // Scale rotation columns by half-extents to get corner offsets
             Vector3 halfExt = body.edgeLengths * 0.5f;
             Vector3 ax = body.rotation[0] * halfExt.x;
