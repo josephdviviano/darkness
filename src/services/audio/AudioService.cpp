@@ -3348,10 +3348,17 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
         }
     }
     if (!snd.valid()) {
+        // Skip if this sample has already failed once — avoids re-walking
+        // the CRF index every frame for ambients that reference missing
+        // assets (e.g. mission .sch points at a sample not in snd.crf).
+        if (mFailedSamples.count(sampleName))
+            return SOUND_HANDLE_INVALID;
+
         snd = mSoundLoader->loadSound(sampleName);
         if (!snd.valid()) {
             LOG_ERROR("AudioService: failed to load sample '%s' for schema '%s'",
                       sampleName.c_str(), schemaName.c_str());
+            mFailedSamples.insert(sampleName);
             return SOUND_HANDLE_INVALID;
         }
         if (mSoundCache) {
@@ -3791,7 +3798,13 @@ void AudioService::loadAmbientSounds()
     // Find all objects with P$AmbientHack (property name "AmbientHa" in the gamesys)
     auto objIDs = getAllObjectsWithProperty(mPropertyService.get(), "AmbientHa");
 
+    // Track schemas we've already warned about so we emit one warning per
+    // unique missing name regardless of how many objects reference it.
+    // (e.g. miss6.mis references the undefined schema "m06subson" on 7 objects.)
+    std::unordered_set<std::string> warnedMissing;
+
     int loaded = 0;
+    int skipped = 0;
     for (int objID : objIDs) {
         // Only process concrete objects (positive IDs), not archetypes
         if (objID <= 0)
@@ -3821,6 +3834,25 @@ void AudioService::loadAmbientSounds()
         if (amb.schemaName.empty())
             continue;
 
+        // Validate that the referenced schema exists, or — failing that —
+        // that snd.crf contains a raw WAV with the same name (the runtime
+        // fallback path in updateAmbientVolumes also tries this). If both
+        // miss, the original game data has a dangling reference; drop the
+        // ambient so we don't churn through a doomed lookup every frame.
+        bool schemaExists = mSchemaParser &&
+                            mSchemaParser->findSchema(amb.schemaName) != nullptr;
+        bool rawSampleExists = mSoundLoader &&
+                               mSoundLoader->hasSound(amb.schemaName);
+        if (!schemaExists && !rawSampleExists) {
+            if (warnedMissing.insert(amb.schemaName).second) {
+                LOG_ERROR("AudioService: AmbientHack on obj %d references "
+                          "unknown schema/sample '%s' — skipping",
+                          objID, amb.schemaName.c_str());
+            }
+            ++skipped;
+            continue;
+        }
+
         // Register ambient data only — voices are started/stopped dynamically
         // in updateAmbientVolumes() based on listener distance.
         mAmbients.push_back(std::move(amb));
@@ -3829,6 +3861,10 @@ void AudioService::loadAmbientSounds()
 
     if (loaded > 0) {
         LOG_INFO("AudioService: registered %d ambient sounds from P$AmbientHack", loaded);
+    }
+    if (skipped > 0) {
+        LOG_INFO("AudioService: skipped %d ambient sound(s) with missing schemas/samples",
+                 skipped);
     }
 }
 
