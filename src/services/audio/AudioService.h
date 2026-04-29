@@ -43,6 +43,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Forward declarations for audio backend types (defined in .cpp via C headers)
@@ -493,6 +494,12 @@ private:
 
     /// LRU cache for recently-used decoded sounds (default 64MB budget)
     std::unique_ptr<SoundCache> mSoundCache;
+
+    /// Negative cache of sample names that have already failed to load.
+    /// Avoids re-attempting the CRF lookup every frame for missing assets
+    /// (e.g. mission references a schema/sample not present in snd.crf),
+    /// and gates the load-failure log to a single message per sample.
+    std::unordered_set<std::string> mFailedSamples;
 
     /// Schema parser (.sch/.spc/.arc files — sound selection rules)
     std::unique_ptr<SchemaParser> mSchemaParser;

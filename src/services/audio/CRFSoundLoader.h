@@ -85,6 +85,17 @@ public:
 
     bool isOpen() const { return mDir != nullptr; }
 
+    /// Cheap existence check — does the archive contain a WAV with this
+    /// bare name? Uses the prebuilt index, no decompression. Useful for
+    /// validating mission references at load time without paying the
+    /// cost of reading and validating the full file.
+    bool hasSound(const std::string &name) const {
+        if (!mDir) return false;
+        std::string key = name;
+        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+        return mNameIndex.find(key) != mNameIndex.end();
+    }
+
     /// Load a sound by bare name (as referenced in .sch schema files).
     /// Uses the pre-built filename index to resolve the bare name to its
     /// full path within the CRF archive, regardless of subdirectory.
