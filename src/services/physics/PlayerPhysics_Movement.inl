@@ -505,7 +505,13 @@
 
                 int faceIdx = c.polyIdx & 0xF;
 
-                if (body->shapeType == CollisionShapeType::OBB && faceIdx <= 5) {
+                // Box-shaped bodies: OBB and SphereHat (the latter is a sphere
+                // with a flat-plane cap in the original engine; we model it as
+                // an OBB built from the model bbox).
+                const bool boxLike =
+                    (body->shapeType == CollisionShapeType::OBB ||
+                     body->shapeType == CollisionShapeType::SphereHat);
+                if (boxLike && faceIdx <= 5) {
                     // OBB face validation
                     Vector3 faceNormal = getOBBFaceNormal(*body, faceIdx);
                     int axis = faceIdx % 3;
