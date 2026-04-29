@@ -619,7 +619,38 @@ private:
             dBodyID dynBody = dGeomGetBody(otherGeom);
             if (!dynBody) return;  // static geom — custom system handles it
 
-            // Player-vs-dynamic: extract hit reaction (Task 61 will add dynamic bodies)
+            // dSpaceCollide only does broadphase (AABB overlap). Confirm
+            // actual contact before reacting — without this, a held object
+            // re-enabled near the player capsule fires the dynamic-contact
+            // handler on AABB overlap alone, view-punching the thrower
+            // from their own throw.
+            dContact tmp[MAX_ODE_CONTACTS];
+            int numContacts = dCollide(o1, o2, MAX_ODE_CONTACTS,
+                                        &tmp[0].geom, sizeof(dContact));
+            if (numContacts == 0) return;
+
+            // Closing-velocity gate: only react when the object is moving
+            // toward the player along player→object. Filters out the
+            // common "I just threw this" case (object moves away from
+            // player → closingSpeed ≤ 0) while still catching incoming
+            // projectiles (closingSpeed > 0).
+            const dReal *playerPosR = dGeomGetPosition(isPlayer1 ? o1 : o2);
+            const dReal *objPosR = dGeomGetPosition(otherGeom);
+            Vector3 playerToObj(
+                static_cast<float>(objPosR[0] - playerPosR[0]),
+                static_cast<float>(objPosR[1] - playerPosR[1]),
+                static_cast<float>(objPosR[2] - playerPosR[2]));
+            float pToObjLen = glm::length(playerToObj);
+            if (pToObjLen > 1e-3f) {
+                Vector3 axis = playerToObj / pToObjLen;
+                const dReal *vel = dBodyGetLinearVel(dynBody);
+                Vector3 objVel(static_cast<float>(vel[0]),
+                               static_cast<float>(vel[1]),
+                               static_cast<float>(vel[2]));
+                float closingSpeed = -glm::dot(objVel, axis);
+                if (closingSpeed < 0.5f) return;  // moving away or stationary
+            }
+
             self->handlePlayerDynamicContact(otherGeom, dynBody);
             return;
         }
