@@ -148,9 +148,16 @@ static void openHeadLog(Darkness::RuntimeState &state, const std::string &path) 
         "wallTime,frameDt,physSteps,ppfCancels,mode,hSpeed,inputFwd,inputRight,onGround,mantling,"
         "camX,camY,camZ,camYaw,camPitch,camRoll,"
         "bodyX,bodyY,bodyZ,"
+        "velX,velY,velZ,"
         "springX,springY,springZ,"
         "poseCurX,poseCurY,poseCurZ,"
         "poseEndX,poseEndY,poseEndZ,"
+        "headClampX,headClampY,headClampZ,"
+        "prevEyeX,prevEyeY,prevEyeZ,"
+        "rawEyeX,rawEyeY,rawEyeZ,"
+        "knockX,knockY,knockZ,"
+        "punchPitch,punchYaw,punchRoll,"
+        "groundObjID,"
         "leanAmount,interpAlpha\n");
     state.headLogStartUs   = monotonicMicros();
     state.headLogPrevUs    = state.headLogStartUs;
@@ -185,18 +192,31 @@ static void writeHeadLogRow(Darkness::RuntimeState &state) {
     state.headLogPrevSteps = totalSteps;
     state.headLogPrevPPF   = totalPPF;
 
-    const Darkness::Vector3 &spring  = player.getSpringPos();
-    const Darkness::Vector3 &poseCur = player.getPoseCurrent();
-    const Darkness::Vector3 &poseEnd = player.getPoseEnd();
-    const Darkness::Vector3 &body    = player.getPosition();
+    const Darkness::Vector3 &spring   = player.getSpringPos();
+    const Darkness::Vector3 &poseCur  = player.getPoseCurrent();
+    const Darkness::Vector3 &poseEnd  = player.getPoseEnd();
+    const Darkness::Vector3 &body     = player.getPosition();
+    const Darkness::Vector3 &vel      = player.getVelocity();
+    const Darkness::Vector3 &clamp    = player.getHeadClamp();
+    const Darkness::Vector3 &prevEye  = player.getPrevEyePos();
+    const Darkness::Vector3  rawEye   = player.getRawEyePos();
+    const Darkness::Vector3 &knock    = player.getPendingKnockback();
+    const Darkness::Vector3 &punch    = player.getViewPunch();
 
     std::fprintf(state.headLog,
         "%.6f,%.6f,%u,%u,%s,%.4f,%.2f,%.2f,%d,%d,"
         "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,"
         "%.4f,%.4f,%.4f,"
+        "%.4f,%.4f,%.4f,"
         "%.5f,%.5f,%.5f,"
         "%.5f,%.5f,%.5f,"
         "%.5f,%.5f,%.5f,"
+        "%.5f,%.5f,%.5f,"
+        "%.5f,%.5f,%.5f,"
+        "%.5f,%.5f,%.5f,"
+        "%.5f,%.5f,%.5f,"
+        "%.5f,%.5f,%.5f,"
+        "%d,"
         "%.5f,%.5f\n",
         wallTime, frameDt, stepsThisFrame, ppfThisFrame,
         Darkness::PlayerPhysics::modeName(player.getMode()),
@@ -206,9 +226,16 @@ static void writeHeadLogRow(Darkness::RuntimeState &state) {
         state.cam.pos[0], state.cam.pos[1], state.cam.pos[2],
         state.cam.yaw, state.cam.pitch, state.cam.roll,
         body.x, body.y, body.z,
+        vel.x, vel.y, vel.z,
         spring.x, spring.y, spring.z,
         poseCur.x, poseCur.y, poseCur.z,
         poseEnd.x, poseEnd.y, poseEnd.z,
+        clamp.x, clamp.y, clamp.z,
+        prevEye.x, prevEye.y, prevEye.z,
+        rawEye.x, rawEye.y, rawEye.z,
+        knock.x, knock.y, knock.z,
+        punch.x, punch.y, punch.z,
+        player.getGroundObjID(),
         spring.y, player.getInterpAlpha());
 
     if (++state.headLogFlushCtr >= 30) {
