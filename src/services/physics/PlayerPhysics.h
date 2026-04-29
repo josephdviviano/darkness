@@ -657,6 +657,34 @@ private:
         // When friction is between 0.5 and 1.0, jump velocity is scaled down
         // proportionally, making slope-edge jumps weaker.
         if (mJumpRequested && !mMotionDisabled) {
+            // Diagnostic: classify what happens to every jump press. The narrow
+            // jump branch below silently drops requests that don't match any
+            // mode arm (e.g. PlayerMode::Jump because the player flickered to
+            // airborne for one tick), so the user-visible "jump didn't work"
+            // case leaves no trace without this. Print BEFORE the branch so
+            // every press is counted; the per-arm code may add detail.
+            {
+                const char *modeStr = "?";
+                switch (mCurrentMode) {
+                    case PlayerMode::Stand:     modeStr = "Stand"; break;
+                    case PlayerMode::Crouch:    modeStr = "Crouch"; break;
+                    case PlayerMode::BodyCarry: modeStr = "BodyCarry"; break;
+                    case PlayerMode::Slide:     modeStr = "Slide"; break;
+                    case PlayerMode::Jump:      modeStr = "Jump"; break;
+                    case PlayerMode::Swim:      modeStr = "Swim"; break;
+                    case PlayerMode::Climb:     modeStr = "Climb"; break;
+                    case PlayerMode::Dead:      modeStr = "Dead"; break;
+                }
+                int upCt = 0;
+                for (const auto &c : mContacts)
+                    if (c.normal.z > 0.0f) ++upCt;
+                std::fprintf(stderr,
+                    "[JUMP-PRESS] mode=%s onGround=%d groundObj=%d "
+                    "contacts=%zu upContacts=%d posZ=%.3f velZ=%.3f\n",
+                    modeStr, isOnGround() ? 1 : 0, mGroundObjID,
+                    mContacts.size(), upCt, mPosition.z, mVelocity.z);
+            }
+
             if (mCurrentMode == PlayerMode::Climb) {
                 // Jump off climbing surface — reflected/projected impulse away from wall
                 breakClimb(true);
@@ -709,6 +737,38 @@ private:
                     // Cancel any active ground grace — we're definitely airborne now
                     mGroundGraceTimer = 0.0f;
                     mGroundGraceActive = false;
+
+                    // ── Lift-off: foot has just left every surface it was on ──
+                    // The original engine re-tests contacts from scratch each
+                    // frame, so the moment the foot leaves the floor,
+                    // GetFaceContacts(PLAYER_FOOT) returns false. Our system
+                    // maintains stale contacts via the closeToPlane tolerance
+                    // window (kBreakTerrainContactDist = 0.1u). Within a single
+                    // tick the body advances ~0.87u upward, well past that
+                    // window, but the maintained contact is only re-validated
+                    // at the START of the next tick — so for the rest of the
+                    // current tick mContacts still claims the foot is on the
+                    // floor. detectGround (step 11) then sees onGround=true on
+                    // mode=Jump with positive velZ, unconditionally flips mode
+                    // to Stand at landing-line 903, and next tick's
+                    // applyMovement applies the Stand-mode 1.4× Z-friction
+                    // boost to the still-rising velocity. That decel was
+                    // crushing 60-70% of the jump impulse within 2-3 ticks.
+                    //
+                    // Match original semantics by destroying the now-stale
+                    // FOOT floor contacts here, immediately. leaveGround()
+                    // then clears mGroundObjID and resets stride tracking,
+                    // mirroring the original LeaveGround() call site.
+                    for (auto it = mContacts.begin(); it != mContacts.end(); ) {
+                        if (it->submodelIdx == 4 &&
+                            it->normal.z > GROUND_NORMAL_MIN) {
+                            it = mContacts.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    leaveGround();
+
                     // Reset stride bob — locks motion to POSE_NORMAL during jump mode.
                     // DON'T override an active lean.
                     if (mLeanDir == 0)
