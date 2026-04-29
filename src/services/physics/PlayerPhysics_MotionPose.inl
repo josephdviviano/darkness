@@ -318,15 +318,21 @@
     }
 
     /// Compute raw lean tilt — camera roll proportional to effective lateral displacement.
-    /// Stride sway (±0.1u) → ~0.2° roll (imperceptible); lean (±2.2u) → full ~5° roll.
-    /// Effective lat = spring lat plus the projection of mHeadClamp onto the local
-    /// right axis (sinYaw, -cosYaw, 0), so leaning into a wall reduces both the
-    /// lateral camera offset AND the roll amount in lock-step.
+    /// Stride sway (±0.1u) → ~0.2° roll (imperceptible); standing lean (±2.2u) → full ~5°
+    /// roll; crouch lean (±1.7u) → ~3.8° roll (smaller, since the spring target is smaller).
+    /// Effective lat = spring lat plus the projection of mHeadClamp onto the local right axis
+    /// (sinYaw, -cosYaw, 0), so leaning into a wall reduces both the lateral camera offset
+    /// AND the roll amount in lock-step.
+    ///
+    /// The divisor is the standing-lean distance, NOT a mode-dependent constant. The pose
+    /// target itself already encodes the active lean magnitude (POSE_LEAN_* chases ±2.2,
+    /// POSE_CLNLEAN_* chases ±1.7) — the spring naturally tracks the right magnitude, so a
+    /// constant divisor produces a smooth tilt across mode flips. A mode-switched divisor
+    /// would discontinuously rescale tilt the instant a C-tap flipped isCrouching() while
+    /// the spring was at full standing-lean extent, producing a visible 1-frame tilt jump.
     inline float computeRawLeanTilt() const {
-        float maxDist = isCrouching() ? CROUCH_LEAN_DISTANCE : LEAN_DISTANCE;
-        if (maxDist < 0.01f) return 0.0f;
         float clampLat = mHeadClamp.x * mSinYaw - mHeadClamp.y * mCosYaw;
-        return ((mSpringPos.y + clampLat) / maxDist) * LEAN_TILT;
+        return ((mSpringPos.y + clampLat) / LEAN_DISTANCE) * LEAN_TILT;
     }
 
     /// Compute the pose-blend target at an arbitrary wall-clock time — used
