@@ -1310,6 +1310,16 @@ public:
                                      &hit, sizeof(dContactGeom));
                     dGeomDestroy(rayGeom);
                     if (n > 0 && hit.depth < releaseDist + circumR) {
+                        // TODO(audio): the player gets no in-game feedback for
+                        // a blocked release today — the F/R press just appears
+                        // to do nothing. Once inventory-event SFX are wired up,
+                        // emit a short "thump"/"clunk" here so the carrier
+                        // knows why the throw didn't fire. See
+                        // NOTES.PROJECT.md "Open: audio cue for blocked
+                        // release" for context. Static OBB objects (columns,
+                        // statues) are also NOT yet covered by this clearance
+                        // ray; widen when Phase 1 (convex-hull migration)
+                        // unifies their representation.
                         std::fprintf(stderr,
                             "[DarkPhysics] release obj=%d DENIED — wall at "
                             "%.2fu blocks release at %.2fu (+%.2fu circumR)\n",
