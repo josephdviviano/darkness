@@ -485,12 +485,20 @@
                     continue;
                 }
 
-                // Compute submodel position for this contact
+                // Compute submodel position for this contact. mSpringPos is player-local
+                // (fwd, lat, vert) — rotate fwd/lat into world XY; vert is world Z.
+                // mHeadClamp captures last frame's HEAD wall response so contact validation
+                // tests at the actually-clamped HEAD position.
                 int subIdx = std::clamp(static_cast<int>(c.submodelIdx), 0, NUM_SPHERES - 1);
                 float poseOZ = 0.0f;
                 Vector3 springOff(0.0f);
-                if (subIdx == 0) { poseOZ = mSpringPos.z; springOff = Vector3(mSpringPos.x, mSpringPos.y, 0.0f); }
-                else if (subIdx == 1) poseOZ = mBodyPoseCurrent.z;
+                if (subIdx == 0) {
+                    poseOZ = mSpringPos.z;
+                    springOff = Vector3(
+                        mCosYaw * mSpringPos.x + mSinYaw * mSpringPos.y,
+                        mSinYaw * mSpringPos.x - mCosYaw * mSpringPos.y,
+                        0.0f) + mHeadClamp;
+                } else if (subIdx == 1) poseOZ = mBodyPoseCurrent.z;
                 float offZ = mSphereOffsetsBase[subIdx] + poseOZ;
                 Vector3 subPos = mPosition + Vector3(0.0f, 0.0f, offZ) + springOff;
                 float subRadius = mSphereRadii[subIdx];
@@ -574,11 +582,18 @@
                 continue;
             }
 
-            // Compute submodel position for this contact
+            // Compute submodel position for this contact (rotate spring fwd/lat into
+            // world XY; apply mHeadClamp so HEAD contact validation matches the
+            // clamped position established by last frame's collision response).
             float poseOffsetZ = 0.0f;
             Vector3 springOff2(0.0f);
-            if (c.submodelIdx == 0) { poseOffsetZ = mSpringPos.z; springOff2 = Vector3(mSpringPos.x, mSpringPos.y, 0.0f); }
-            else if (c.submodelIdx == 1) poseOffsetZ = mBodyPoseCurrent.z;
+            if (c.submodelIdx == 0) {
+                poseOffsetZ = mSpringPos.z;
+                springOff2 = Vector3(
+                    mCosYaw * mSpringPos.x + mSinYaw * mSpringPos.y,
+                    mSinYaw * mSpringPos.x - mCosYaw * mSpringPos.y,
+                    0.0f) + mHeadClamp;
+            } else if (c.submodelIdx == 1) poseOffsetZ = mBodyPoseCurrent.z;
             int subIdx = std::clamp(static_cast<int>(c.submodelIdx), 0, NUM_SPHERES - 1);
             float offsetZ = mSphereOffsetsBase[subIdx] + poseOffsetZ;
             Vector3 subPos = mPosition + Vector3(0.0f, 0.0f, offsetZ) + springOff2;
