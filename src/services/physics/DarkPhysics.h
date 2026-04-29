@@ -161,13 +161,22 @@ public:
             mPushSystem->processPlayerContacts(contacts, preCollisionVel);
         }
 
-        // Step ODE world with fixed timestep accumulator (same rate as player physics).
-        // Push forces applied above are consumed during this step.
+        // Step ODE world at a fixed 100 Hz, decoupled from the player's
+        // 12.5 Hz tick. The player rate is locked by the engine convention
+        // ("preserve 12.5 Hz behavior exactly"), but ODE's discrete trimesh
+        // collision tunnels small fast bodies through floors at 80 ms steps:
+        // a key-sized geom under gravity covers more than its own thickness
+        // per step. 10 ms substeps give ~8x more collision opportunities and
+        // eliminate the dropped-key-through-floor failure mode without
+        // changing any player dynamics. Push forces applied above are
+        // consumed during the first substep (ODE clears forces after each
+        // dWorldQuickStep), which is fine — push is a per-tick impulse.
         if (mODEWorld) {
-            float fixedDt = mPlayer.getTimestep().fixedDt;
+            constexpr float kODEFixedDt = 1.0f / 100.0f;
+            constexpr int kMaxODEStepsPerFrame = 30;  // 300 ms wall-clock cap
             mODEAccum += dt;
             int steps = 0;
-            while (mODEAccum >= fixedDt && steps < 10) {
+            while (mODEAccum >= kODEFixedDt && steps < kMaxODEStepsPerFrame) {
                 // 1) Collision detection — creates contact joints
                 dSpaceCollide(mODESpace, this, &odeNearCallback);
 
@@ -175,12 +184,12 @@ public:
                 //    resting stability — the original engine accumulated
                 //    rotational velocity from contacts with per-axis filtering
                 //    by P$PhysAttr.rot_axes; it never locked rotation outright.
-                dWorldQuickStep(mODEWorld, fixedDt);
+                dWorldQuickStep(mODEWorld, kODEFixedDt);
                 dJointGroupEmpty(mODEContacts);
-                mODEAccum -= fixedDt;
+                mODEAccum -= kODEFixedDt;
                 ++steps;
             }
-            if (steps >= 10) mODEAccum = 0.0f;  // prevent spiral of death
+            if (steps >= kMaxODEStepsPerFrame) mODEAccum = 0.0f;  // spiral guard
         }
 
         // Sync dynamic bodies back to collision geometry + renderer
