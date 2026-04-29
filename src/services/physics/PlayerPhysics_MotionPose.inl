@@ -309,116 +309,27 @@
             eye.y += sinYaw * mSpringPos.x;
         }
 
-        // Collision-limited lateral offset (stride sway + lean flow through mLeanAmount, set from
-        // mSpringPos.y in updateLean()). Stride sway produces ~0.2° roll (imperceptible).
-        if (std::fabs(mLeanAmount) > 0.001f) {
-            eye.x += sinYaw * mLeanAmount;
-            eye.y -= cosYaw * mLeanAmount;
+        // Lateral offset from spring lateral displacement (stride sway + lean).
+        // Stride sway produces ~0.2° roll (imperceptible); lean (±2.2u) produces
+        // full ~5° roll. Wall collisions feed back via the body collision pipeline:
+        // when the head submodel's swept sphere hits a wall it pushes the body
+        // away, so leaning into a wall slides the body rather than clamping the
+        // visible offset against the wall surface.
+        if (std::fabs(mSpringPos.y) > 0.001f) {
+            eye.x += sinYaw * mSpringPos.y;
+            eye.y -= cosYaw * mSpringPos.y;
         }
 
         return eye;
     }
 
-    /// Compute raw lean tilt — camera roll proportional to mLeanAmount (not gated on lean-active).
+    /// Compute raw lean tilt — camera roll proportional to spring lateral displacement.
     /// Stride sway (±0.1u) → ~0.2° roll (imperceptible); lean (±2.2u) → full ~5° roll.
-    /// On key release, spring decays mLeanAmount to zero → smooth roll return.
+    /// On key release, spring decays to zero → smooth roll return.
     inline float computeRawLeanTilt() const {
         float maxDist = isCrouching() ? CROUCH_LEAN_DISTANCE : LEAN_DISTANCE;
         if (maxDist < 0.01f) return 0.0f;
-        return (mLeanAmount / maxDist) * LEAN_TILT;
-    }
-
-    /// Update lean — collision-limited lean derived from spring lateral displacement (mSpringPos.y).
-    /// Lean driven through pose system (setLeanDirection→POSE_LEAN_*) with spring easing.
-    /// Sweeps HEAD sphere along the lean path testing both world geometry and objects
-    /// (doors, crates) for continuous collision coverage. Stores result in mLeanAmount.
-    inline void updateLean() {
-        // Read lean from spring lateral displacement
-        mLeanAmount = mSpringPos.y;
-
-        // Collision check — sweep HEAD sphere along the lean path testing both
-        // world geometry and objects. Samples in steps no larger than sphere radius
-        // for continuous coverage of thin obstacles (e.g. doors).
-        // Lean holds at wall/object surface rather than snapping back to standing.
-        if (std::fabs(mLeanAmount) > 0.01f && mCellIdx >= 0) {
-            float sinYaw = mSinYaw;
-            float cosYaw = mCosYaw;
-            // HEAD collision position for lean: must match what computeRawEyePos
-            // actually uses for the rendered eye height — body center + base
-            // sphere offset + spring Z displacement. Earlier this code added
-            // mPoseCurrent.z on top of mSpringPos.z, which double-counts the
-            // pose dip (the spring already tracks the pose) — in crouch mode
-            // that placed the sphere ~2u below the actual head, intersecting
-            // the floor every frame and producing erratic lateral jitter as
-            // the body slid over floor-polygon boundaries.
-            float leanBaseZ = mSphereOffsetsBase[0] + mSpringPos.z;
-            // Base (unleaned) head position
-            Vector3 baseHead = mPosition + Vector3(0.0f, 0.0f, leanBaseZ);
-
-            float leanSign = (mLeanAmount > 0.0f) ? 1.0f : -1.0f;
-            Vector3 leanDir(sinYaw * leanSign, -cosYaw * leanSign, 0.0f);
-
-            float absLean = std::fabs(mLeanAmount);
-            float sphereR = mSphereRadii[0];
-            constexpr float LEAN_WALL_MARGIN = 0.05f;
-
-            // Sample lean path in steps no larger than sphere radius. Each sample's
-            // sphere overlaps the previous, giving continuous coverage that catches
-            // thin objects (doors) an endpoint-only test would miss.
-            int numSteps = std::max(1, static_cast<int>(std::ceil(absLean / sphereR)));
-            float safeLean = absLean;
-
-            for (int i = 1; i <= numSteps; ++i) {
-                float sampleDist = absLean * float(i) / float(numSteps);
-                Vector3 sampleHead = baseHead + leanDir * sampleDist;
-
-                // Find cell at sample position for broadphase accuracy
-                int32_t sampleCell = mCollision.findCell(sampleHead);
-                if (sampleCell < 0) {
-                    // Outside world geometry — lean can't extend this far
-                    safeLean = std::min(safeLean, std::max(0.0f,
-                        sampleDist - sphereR));
-                    break;
-                }
-
-                std::vector<SphereContact> contacts;
-
-                // Test against world geometry
-                mCollision.sphereVsCellPolygons(
-                    sampleHead, sphereR, sampleCell, contacts);
-                // Also check body center's cell if different (portal boundary)
-                if (sampleCell != mCellIdx) {
-                    mCollision.sphereVsCellPolygons(
-                        sampleHead, sphereR, mCellIdx, contacts);
-                }
-
-                // Test against objects (doors, crates, furniture)
-                if (mObjectWorld) {
-                    mObjectWorld->testPlayerSpheres(
-                        &sampleHead, &sphereR, 1, sampleCell, contacts);
-                }
-
-                if (!contacts.empty()) {
-                    // Find maximum pushback opposing the lean at this sample.
-                    // Project each contact's push (normal * penetration) onto the
-                    // negative lean direction — how much the wall opposes the lean.
-                    float maxPushback = 0.0f;
-                    for (const auto &c : contacts) {
-                        float pushInLeanDir =
-                            glm::dot(c.normal * c.penetration, -leanDir);
-                        if (pushInLeanDir > maxPushback)
-                            maxPushback = pushInLeanDir;
-                    }
-                    // Safe lean at this sample: distance minus pushback minus margin.
-                    // Minimum across all samples handles thin objects detected only
-                    // at one intermediate position.
-                    float safeLeanHere = sampleDist - maxPushback - LEAN_WALL_MARGIN;
-                    safeLean = std::min(safeLean, safeLeanHere);
-                }
-            }
-
-            mLeanAmount = std::max(0.0f, safeLean) * leanSign;
-        }
+        return (mSpringPos.y / maxDist) * LEAN_TILT;
     }
 
     /// Compute the pose-blend target at an arbitrary wall-clock time — used

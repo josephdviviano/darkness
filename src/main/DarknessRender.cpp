@@ -207,7 +207,7 @@ static void writeHeadLogRow(Darkness::RuntimeState &state) {
         spring.x, spring.y, spring.z,
         poseCur.x, poseCur.y, poseCur.z,
         poseEnd.x, poseEnd.y, poseEnd.z,
-        player.getLeanAmount(), player.getInterpAlpha());
+        spring.y, player.getInterpAlpha());
 
     if (++state.headLogFlushCtr >= 30) {
         std::fflush(state.headLog);
