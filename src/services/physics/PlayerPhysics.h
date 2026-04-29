@@ -1021,7 +1021,16 @@ private:
     // Pre-allocated scratch buffers for resolveCollisions() — avoids per-step heap allocs
     std::vector<SphereContact> mFreshContacts;               // per-frame fresh contact accumulator
     std::vector<SphereContact> mIterContacts;                // per-iteration contact accumulator
-    std::vector<std::pair<Vector3, float>> mPushes;          // de-duplicated push normals
+    std::vector<std::pair<Vector3, float>> mPushes;          // de-duplicated body push normals
+    std::vector<std::pair<Vector3, float>> mHeadPushes;      // de-duplicated HEAD-only push normals
+
+    // World-space displacement applied to the HEAD sphere position to prevent it
+    // penetrating walls. Reset each step in resolveCollisions(); accumulated from
+    // HEAD-submodel wall contacts. Read by computeRawEyePos / computeRawLeanTilt
+    // to clamp the rendered camera offset, and by the next iter's HEAD-sphere
+    // collision test. Reproduces the original engine's submodel collision response
+    // (wall push adjusts HEAD's m_position only, body stays put).
+    Vector3 mHeadClamp{0.0f};
 
     // ── Per-texture friction table (indexed by TXLIST texture index, default 1.0) ──
     std::vector<float> mFrictionTable;

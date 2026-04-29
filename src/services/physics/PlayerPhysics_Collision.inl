@@ -136,9 +136,22 @@
     /// positions against cell polygons, accumulates contacts, and pushes the body center out.
     /// HEAD/BODY are real spheres (r=1.2) for wall/ceiling; SHIN/KNEE/FOOT are point detectors
     /// (r=0) that sense floor contacts and generate upward normals for ground support.
+    ///
+    /// HEAD sphere wall contacts do NOT push the body — instead they accumulate into
+    /// mHeadClamp, a world-space displacement applied to the HEAD sphere position.
+    /// This reproduces the original engine's submodel collision response (HEAD has its
+    /// own m_position; wall push adjusts HEAD only, body stays put). Without this
+    /// filter, leaning into a wall slides the body laterally as the spring keeps
+    /// extending the head sphere into the wall every frame.
     inline void resolveCollisions(const ContactCallback &contactCb) {
         Vector3 origPos = mPosition;
         int32_t origCell = mCellIdx;
+
+        // Reset HEAD wall clamp — re-derived each step from current spring state +
+        // world geometry. Spring state stays pure (still targets the pose lateral),
+        // mHeadClamp absorbs the wall-collision response so the head sphere stops
+        // at the wall surface while the body is unaffected.
+        mHeadClamp = Vector3(0.0f);
 
         // ── UpdatePositions: commit end position ──
         // Advance mPosition to the intended end position. The iterative push-out
@@ -149,6 +162,73 @@
         {
             int32_t endCell = mCollision.findCell(mPosition);
             if (endCell >= 0) mCellIdx = endCell;
+        }
+
+        // ── Pre-iter HEAD sweep for full spring extension ──
+        // The HEAD sphere can be at full spring extent (e.g., lean lat=2.2), which
+        // may be well past a wall in the lean direction. The static test rejects
+        // "spurious" contacts when the sphere center is more than radius past a
+        // wall plane — so a fully-leaned head past a thin/narrow wall fails to
+        // register a contact, leaving mHeadClamp = 0 and the visible head leaking
+        // through. Solve by sweeping the HEAD sphere from the base (no-spring)
+        // position to the full extended position once per step, before the iter
+        // loop. sweptSphereVsCellPolygons has no spurious-rejection cap and finds
+        // any wall crossed during the sweep regardless of end-position depth.
+        // The earliest crossing time bounds how much of the spring offset can be
+        // applied; mHeadClamp pulls back the disallowed portion.
+        if (mCellIdx >= 0) {
+            float headRadius = mSphereRadii[0];
+            Vector3 worldSpringXY(
+                mCosYaw * mSpringPos.x + mSinYaw * mSpringPos.y,
+                mSinYaw * mSpringPos.x - mCosYaw * mSpringPos.y,
+                0.0f);
+            if (glm::length2(worldSpringXY) > 1e-6f) {
+                Vector3 baseHead = mPosition
+                    + Vector3(0.0f, 0.0f, mSphereOffsetsBase[0] + mSpringPos.z);
+                Vector3 fullHead = baseHead + worldSpringXY;
+
+                std::vector<SphereContact> headSweptContacts;
+                mCollision.sweptSphereVsCellPolygons(
+                    baseHead, fullHead, headRadius, mCellIdx, headSweptContacts);
+
+                int32_t fullCell = mCollision.findCell(fullHead);
+                if (fullCell >= 0 && fullCell != mCellIdx) {
+                    mCollision.sweptSphereVsCellPolygons(
+                        baseHead, fullHead, headRadius, fullCell, headSweptContacts);
+                }
+
+                // Sweep the HEAD across portal-adjacent cells too — the sweep
+                // path may cross a non-body cell whose solid wall is what blocks
+                // the lean. Cells already tested above are skipped.
+                if (mCellIdx < static_cast<int32_t>(mCollision.getWR().numCells)) {
+                    const auto &cell = mCollision.getWR().cells[mCellIdx];
+                    int numSolid = cell.numPolygons - cell.numPortals;
+                    for (int pi = numSolid; pi < cell.numPolygons; ++pi) {
+                        const auto &poly = cell.polygons[pi];
+                        if (poly.count < 3) continue;
+                        int32_t tgtCell = static_cast<int32_t>(poly.tgtCell);
+                        if (tgtCell < 0 || tgtCell == mCellIdx || tgtCell == fullCell
+                            || tgtCell >= static_cast<int32_t>(mCollision.getWR().numCells))
+                            continue;
+                        mCollision.sweptSphereVsCellPolygons(
+                            baseHead, fullHead, headRadius, tgtCell, headSweptContacts);
+                    }
+                }
+
+                // Take the earliest sweep crossing — that's the wall the sphere
+                // hits first along the lean path. Apply a small margin so the
+                // sphere stops just shy of the surface (avoids alternating-frame
+                // static contact / no-contact at the wall plane).
+                float earliestT = 1.0f;
+                for (const auto &c : headSweptContacts) {
+                    if (c.time < earliestT) earliestT = c.time;
+                }
+                if (earliestT < 1.0f) {
+                    constexpr float HEAD_WALL_MARGIN_FRAC = 0.02f;
+                    float effT = std::max(0.0f, earliestT - HEAD_WALL_MARGIN_FRAC);
+                    mHeadClamp = -worldSpringXY * (1.0f - effT);
+                }
+            }
         }
 
         // Fresh contacts from this frame's collision detection are accumulated in
@@ -172,14 +252,28 @@
                 Vector3 springEndOffset(0.0f);  // spring offset at sweep endpoint
                 if (s == 0) {
                     // HEAD: use spring position for start, spring position + velocity*dt for end.
-                    // Matches original Dark Engine (PHMOD.CPP lines 1576-1586):
-                    // HEAD EndLocationVec = HEAD position + spring_velocity * dt.
                     // The spring velocity contribution extends the sweep to where the
                     // head is actually moving, so collisions are detected along the
                     // spring-driven path (important during crouch transitions/bob).
+                    //
+                    // mSpringPos/mSpringVel are player-local (fwd, lat, vert) — rotate
+                    // fwd/lat into world XY before applying as a sphere-center offset.
+                    // mHeadClamp is the world-space wall-clamp from prior iters; it
+                    // pulls the head out of any walls the spring would otherwise drive
+                    // it into so each iteration tests the sphere at its already-clamped
+                    // position (and accumulates further clamp if still penetrating).
                     poseOffsetZ = mSpringPos.z;
-                    springOffset = Vector3(mSpringPos.x, mSpringPos.y, 0.0f);
-                    springEndOffset = springOffset + Vector3(mSpringVel.x, mSpringVel.y, mSpringVel.z) * mTimestep.fixedDt;
+                    Vector3 worldSpringXY(
+                        mCosYaw * mSpringPos.x + mSinYaw * mSpringPos.y,
+                        mSinYaw * mSpringPos.x - mCosYaw * mSpringPos.y,
+                        0.0f);
+                    Vector3 worldSpringVelXY(
+                        mCosYaw * mSpringVel.x + mSinYaw * mSpringVel.y,
+                        mSinYaw * mSpringVel.x - mCosYaw * mSpringVel.y,
+                        mSpringVel.z);  // Z stays world-aligned
+                    springOffset = worldSpringXY + mHeadClamp;
+                    springEndOffset = worldSpringXY + worldSpringVelXY * mTimestep.fixedDt
+                                    + mHeadClamp;
                 } else if (s == 1) {
                     poseOffsetZ = mBodyPoseCurrent.z; // BODY
                 }
@@ -309,13 +403,19 @@
             // (cellIdx=-1 sentinel) into mIterContacts alongside WR contacts.
             if (mObjectCollisionCb) {
                 // Build sphere center array from current body position + offsets
-                // (same computation as the per-sphere loop above)
+                // (same computation as the per-sphere loop above; HEAD spring offset
+                // rotated to world coords + mHeadClamp).
                 Vector3 sphereCenters[NUM_SPHERES];
                 for (int s = 0; s < NUM_SPHERES; ++s) {
                     float poseOffsetZ = 0.0f;
                     Vector3 sOff(0.0f);
-                    if (s == 0) { poseOffsetZ = mSpringPos.z; sOff = Vector3(mSpringPos.x, mSpringPos.y, 0.0f); }
-                    else if (s == 1) poseOffsetZ = mBodyPoseCurrent.z;
+                    if (s == 0) {
+                        poseOffsetZ = mSpringPos.z;
+                        sOff = Vector3(
+                            mCosYaw * mSpringPos.x + mSinYaw * mSpringPos.y,
+                            mSinYaw * mSpringPos.x - mCosYaw * mSpringPos.y,
+                            0.0f) + mHeadClamp;
+                    } else if (s == 1) poseOffsetZ = mBodyPoseCurrent.z;
                     float offsetZ = mSphereOffsetsBase[s] + poseOffsetZ;
                     sphereCenters[s] = mPosition + Vector3(0.0f, 0.0f, offsetZ) + sOff;
                 }
@@ -495,7 +595,13 @@
             // Push body center out of penetrations. De-duplicate by normal direction (dot > 0.99):
             // keep only max penetration per wall. Without this, 3 spheres hitting one wall would
             // triple the push, causing jittery over-correction.
+            //
+            // HEAD-submodel contacts are routed into mHeadPushes instead of mPushes —
+            // they clamp the HEAD sphere's world-space offset (via mHeadClamp) rather
+            // than displacing the body. This matches the original engine's per-submodel
+            // collision response.
             mPushes.clear();
+            mHeadPushes.clear();
             for (const auto &c : mIterContacts) {
                 Vector3 pushNormal = c.normal;
 
@@ -524,8 +630,9 @@
                                      c.penetration, c.submodelIdx);
                 }
 
+                auto &target = (c.submodelIdx == 0) ? mHeadPushes : mPushes;
                 bool merged = false;
-                for (auto &p : mPushes) {
+                for (auto &p : target) {
                     if (glm::dot(c.normal, p.first) > 0.99f) {
                         // Same wall — keep the deeper penetration
                         p.second = std::max(p.second, c.penetration);
@@ -534,11 +641,14 @@
                     }
                 }
                 if (!merged) {
-                    mPushes.push_back({pushNormal, c.penetration});
+                    target.push_back({pushNormal, c.penetration});
                 }
             }
             for (const auto &p : mPushes) {
                 mPosition += p.first * p.second;
+            }
+            for (const auto &p : mHeadPushes) {
+                mHeadClamp += p.first * p.second;
             }
 
             // Accumulate fresh contacts for later merge into mContacts

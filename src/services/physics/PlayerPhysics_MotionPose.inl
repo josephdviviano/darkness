@@ -288,48 +288,45 @@
             mLastFootTime = -1.0f;
     }
 
-    /// Compute raw (un-interpolated) eye position: body center + head offset + eye-above-head
-    /// + spring displacement (player-local, rotated by yaw) + collision-limited lean.
+    /// Rotate a player-local offset (fwd, lat, vert) into world coords using
+    /// the cached yaw. Forward axis is (cosYaw, sinYaw, 0); right (lat+) axis
+    /// is (sinYaw, -cosYaw, 0); vertical is world Z.
+    inline Vector3 playerLocalToWorld(const Vector3 &local) const {
+        return Vector3(
+            mCosYaw * local.x + mSinYaw * local.y,
+            mSinYaw * local.x - mCosYaw * local.y,
+            local.z);
+    }
+
+    /// Compute raw (un-interpolated) eye position: body center + head offset
+    /// + eye-above-head + world-space spring displacement + HEAD wall clamp.
     inline Vector3 computeRawEyePos() const {
         // During mantling, camera tracks spring-driven virtual head (smooth despite body teleports).
         if (mMantling) {
             return mMantleHeadPos + Vector3(0.0f, 0.0f, EYE_ABOVE_HEAD);
         }
 
-        // Head Z offset always HEAD_OFFSET_Z. Crouch lowers eye via mSpringPos.z (POSE_CROUCH).
-        Vector3 eye = mPosition + Vector3(0.0f, 0.0f, mSphereOffsetsBase[0] + EYE_ABOVE_HEAD + mSpringPos.z);
-
-        // Use cached sin/cos (updated in setYaw() and fixedStep())
-        float sinYaw = mSinYaw;
-        float cosYaw = mCosYaw;
-
-        // Spring forward displacement (mSpringPos.x = forward axis in player-local coords)
-        if (std::fabs(mSpringPos.x) > 0.001f) {
-            eye.x += cosYaw * mSpringPos.x;
-            eye.y += sinYaw * mSpringPos.x;
-        }
-
-        // Lateral offset from spring lateral displacement (stride sway + lean).
-        // Stride sway produces ~0.2° roll (imperceptible); lean (±2.2u) produces
-        // full ~5° roll. Wall collisions feed back via the body collision pipeline:
-        // when the head submodel's swept sphere hits a wall it pushes the body
-        // away, so leaning into a wall slides the body rather than clamping the
-        // visible offset against the wall surface.
-        if (std::fabs(mSpringPos.y) > 0.001f) {
-            eye.x += sinYaw * mSpringPos.y;
-            eye.y -= cosYaw * mSpringPos.y;
-        }
-
-        return eye;
+        // mSpringPos is player-local (fwd, lat, vert). Rotate fwd/lat into world XY;
+        // vert is already world Z. mHeadClamp is the world-space displacement that
+        // collision response applies to the HEAD sphere when it bumps a wall — this
+        // matches the original engine's submodel collision response (wall push
+        // adjusts HEAD's m_position, leaving the body untouched).
+        return mPosition
+             + Vector3(0.0f, 0.0f, mSphereOffsetsBase[0] + EYE_ABOVE_HEAD)
+             + playerLocalToWorld(mSpringPos)
+             + mHeadClamp;
     }
 
-    /// Compute raw lean tilt — camera roll proportional to spring lateral displacement.
+    /// Compute raw lean tilt — camera roll proportional to effective lateral displacement.
     /// Stride sway (±0.1u) → ~0.2° roll (imperceptible); lean (±2.2u) → full ~5° roll.
-    /// On key release, spring decays to zero → smooth roll return.
+    /// Effective lat = spring lat plus the projection of mHeadClamp onto the local
+    /// right axis (sinYaw, -cosYaw, 0), so leaning into a wall reduces both the
+    /// lateral camera offset AND the roll amount in lock-step.
     inline float computeRawLeanTilt() const {
         float maxDist = isCrouching() ? CROUCH_LEAN_DISTANCE : LEAN_DISTANCE;
         if (maxDist < 0.01f) return 0.0f;
-        return (mSpringPos.y / maxDist) * LEAN_TILT;
+        float clampLat = mHeadClamp.x * mSinYaw - mHeadClamp.y * mCosYaw;
+        return ((mSpringPos.y + clampLat) / maxDist) * LEAN_TILT;
     }
 
     /// Compute the pose-blend target at an arbitrary wall-clock time — used
