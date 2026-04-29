@@ -1227,36 +1227,38 @@ public:
     /// rad/sec (defaults to zero). After release, syncDynamicBodies takes
     /// over and overwrites ObjectStateMap each frame from the live ODE
     /// position — no special cleanup needed on the renderer side.
-    /// Returns true if a held body was released.
     ///
-    /// Before re-enabling the geom, the body is snapped forward of the
-    /// player capsule (out to capsule_radius + obj_circumradius + ε along
-    /// player→object). This mirrors the original engine's PUSHOUT pattern
-    /// and prevents the freshly-enabled box AABB from overlapping the
-    /// player capsule's AABB on the very next broadphase, which would
-    /// otherwise trigger spurious player-vs-dynamic contacts on the
-    /// thrower from their own throw.
+    /// Returns true on success, false if the release was DENIED because the
+    /// chosen release position would penetrate world geometry. On denial NO
+    /// state is mutated — the body stays held and the caller (GrabSystem)
+    /// keeps the grab active. This is the engine-side equivalent of the
+    /// player having to back away from a wall before they can throw.
+    ///
+    /// Geometry: the body is normally snapped forward of the player capsule
+    /// (out to capsule_radius + obj_circumradius + ε along player→object).
+    /// This mirrors the original engine's PUSHOUT pattern. Before applying
+    /// the snap, we raycast the path from player to the proposed release
+    /// position; if a wall blocks it, the release is denied so a clipped
+    /// snap doesn't drop the crate touching a wall (which would then push
+    /// the player back the moment ODE catches the contact).
     bool releaseFromHold(int32_t objID, const Vector3 &linVel,
                          const Vector3 &angVel = Vector3(0.0f)) {
-        // Clear the player-narrowphase skip flag so the body collides again
-        // once it's airborne.
-        if (mObjectCollision) mObjectCollision->setSkipPlayerCollision(objID, false);
-
         auto gIt = mODEGeoms.find(objID);
         auto bIt = mODEBodies.find(objID);
         if (bIt == mODEBodies.end()) return false;
         dBodyID body = bIt->second;
 
-        // Geometric pushout: ensure the held object is at least
-        // capsule_radius + obj_circumradius + ε from the player center
-        // along the player→object axis. The held position already places
-        // the object roughly holdDistance (≈2u) ahead of the camera, but
-        // a fat object (e.g. a crate ≈1u edge) still has its near face
-        // close to the capsule. Snapping pre-empts AABB overlap on
-        // re-enable so view-punch isn't fired by the throw itself.
+        // ── Compute desired release position ──
+        // Pushout target if the carry pose is too close; current geom pose
+        // otherwise. We don't mutate anything yet — we have to validate
+        // clearance first so denial is a true no-op.
+        Vector3 releasePos;
+        bool needsSnap = false;
+        float circumR = 0.0f;
+
         if (gIt != mODEGeoms.end()) {
             dGeomID geom = gIt->second;
-            float circumR = computeGeomCircumradius(geom);
+            circumR = computeGeomCircumradius(geom);
             const dReal *gPos = dGeomGetPosition(geom);
             const Vector3 playerPos = mPlayer.getPosition();
             Vector3 objPos(static_cast<float>(gPos[0]),
@@ -1268,8 +1270,6 @@ public:
             constexpr float kEpsilon = 0.05f;
             float minDist = kPlayerCapsuleRadius + circumR + kEpsilon;
             if (toObjLen < minDist) {
-                // Use linVel direction if we have one (throw); fall back to
-                // player→object axis (drop or zero-velocity release).
                 Vector3 dir;
                 float linLen = glm::length(linVel);
                 if (linLen > 1e-3f) {
@@ -1280,12 +1280,58 @@ public:
                     // Truly degenerate: snap straight up so gravity takes over.
                     dir = Vector3(0.0f, 0.0f, 1.0f);
                 }
-                Vector3 snapPos = playerPos + dir * minDist;
-                dGeomSetPosition(geom, snapPos.x, snapPos.y, snapPos.z);
-                dBodySetPosition(body, snapPos.x, snapPos.y, snapPos.z);
+                releasePos = playerPos + dir * minDist;
+                needsSnap = true;
+            } else {
+                releasePos = objPos;
+            }
+
+            // ── Clearance check against the world trimesh ──
+            // Cast a ray from the player to (releasePos + leading-face
+            // margin). If anything blocks the path closer than the box's
+            // leading face would reach, deny the release. The carrier
+            // keeps the object and has to step away from the wall.
+            //
+            // We only test the world trimesh today; static OBB objects
+            // (columns, statues) aren't covered. Phase 1 (convex hulls)
+            // changes how those are represented; revisit then.
+            if (mWorldTrimesh) {
+                Vector3 fromPlayer = releasePos - playerPos;
+                float releaseDist = glm::length(fromPlayer);
+                if (releaseDist > 1e-3f) {
+                    Vector3 rayDir = fromPlayer / releaseDist;
+                    float maxRay = releaseDist + circumR + 0.1f;
+                    dGeomID rayGeom = dCreateRay(0, maxRay);
+                    dGeomRaySet(rayGeom,
+                        playerPos.x, playerPos.y, playerPos.z,
+                        rayDir.x, rayDir.y, rayDir.z);
+                    dContactGeom hit;
+                    int n = dCollide(rayGeom, mWorldTrimesh, 1,
+                                     &hit, sizeof(dContactGeom));
+                    dGeomDestroy(rayGeom);
+                    if (n > 0 && hit.depth < releaseDist + circumR) {
+                        std::fprintf(stderr,
+                            "[DarkPhysics] release obj=%d DENIED — wall at "
+                            "%.2fu blocks release at %.2fu (+%.2fu circumR)\n",
+                            objID, static_cast<float>(hit.depth),
+                            releaseDist, circumR);
+                        return false;
+                    }
+                }
+            }
+
+            // ── Commit: apply snap, enable geom ──
+            if (needsSnap) {
+                dGeomSetPosition(geom, releasePos.x, releasePos.y, releasePos.z);
+                dBodySetPosition(body, releasePos.x, releasePos.y, releasePos.z);
             }
             dGeomEnable(geom);
         }
+
+        // Clear the player-narrowphase skip flag now that we've committed
+        // to releasing. (Done late so a denial above leaves the flag set
+        // and the grab loop can keep running cleanly.)
+        if (mObjectCollision) mObjectCollision->setSkipPlayerCollision(objID, false);
 
         dBodyEnable(body);
         dBodySetLinearVel(body, linVel.x, linVel.y, linVel.z);
