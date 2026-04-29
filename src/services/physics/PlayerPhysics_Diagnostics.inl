@@ -31,7 +31,7 @@
             mPoseCurrent.x, mPoseCurrent.y, mPoseCurrent.z,
             mBodyPoseCurrent.x, mBodyPoseCurrent.y, mBodyPoseCurrent.z,
             mPoseTimer, mPoseDuration, (int)mPoseHolding,
-            mLastFootTime, (int)mStrideIsLeft, mLeanDir, mLeanAmount,
+            mLastFootTime, (int)mStrideIsLeft, mLeanDir, mSpringPos.y,
             mCellIdx, mInputForward, mInputRight);
 
         // Flush periodically so data isn't lost on crash

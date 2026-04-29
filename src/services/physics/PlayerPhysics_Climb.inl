@@ -58,10 +58,10 @@
             if (normalVel < 0.0f)
                 mVelocity -= faceNormal * normalVel;
 
-            // Cancel any active lean
+            // Cancel any active lean — pose target snaps to POSE_NORMAL (lat=0);
+            // the head spring smoothly decays mSpringPos.y to zero from there.
             if (mLeanDir != 0) {
                 mLeanDir = 0;
-                mLeanAmount = 0.0f;
                 activatePose(POSE_NORMAL);
             }
 
