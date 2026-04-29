@@ -1185,6 +1185,14 @@ public:
     /// over and overwrites ObjectStateMap each frame from the live ODE
     /// position — no special cleanup needed on the renderer side.
     /// Returns true if a held body was released.
+    ///
+    /// Before re-enabling the geom, the body is snapped forward of the
+    /// player capsule (out to capsule_radius + obj_circumradius + ε along
+    /// player→object). This mirrors the original engine's PUSHOUT pattern
+    /// and prevents the freshly-enabled box AABB from overlapping the
+    /// player capsule's AABB on the very next broadphase, which would
+    /// otherwise trigger spurious player-vs-dynamic contacts on the
+    /// thrower from their own throw.
     bool releaseFromHold(int32_t objID, const Vector3 &linVel,
                          const Vector3 &angVel = Vector3(0.0f)) {
         // Clear the player-narrowphase skip flag so the body collides again
@@ -1192,11 +1200,50 @@ public:
         if (mObjectCollision) mObjectCollision->setSkipPlayerCollision(objID, false);
 
         auto gIt = mODEGeoms.find(objID);
-        if (gIt != mODEGeoms.end()) dGeomEnable(gIt->second);
-
         auto bIt = mODEBodies.find(objID);
         if (bIt == mODEBodies.end()) return false;
         dBodyID body = bIt->second;
+
+        // Geometric pushout: ensure the held object is at least
+        // capsule_radius + obj_circumradius + ε from the player center
+        // along the player→object axis. The held position already places
+        // the object roughly holdDistance (≈2u) ahead of the camera, but
+        // a fat object (e.g. a crate ≈1u edge) still has its near face
+        // close to the capsule. Snapping pre-empts AABB overlap on
+        // re-enable so view-punch isn't fired by the throw itself.
+        if (gIt != mODEGeoms.end()) {
+            dGeomID geom = gIt->second;
+            float circumR = computeGeomCircumradius(geom);
+            const dReal *gPos = dGeomGetPosition(geom);
+            const Vector3 playerPos = mPlayer.getPosition();
+            Vector3 objPos(static_cast<float>(gPos[0]),
+                           static_cast<float>(gPos[1]),
+                           static_cast<float>(gPos[2]));
+            Vector3 toObj = objPos - playerPos;
+            float toObjLen = glm::length(toObj);
+            constexpr float kPlayerCapsuleRadius = 1.2f;
+            constexpr float kEpsilon = 0.05f;
+            float minDist = kPlayerCapsuleRadius + circumR + kEpsilon;
+            if (toObjLen < minDist) {
+                // Use linVel direction if we have one (throw); fall back to
+                // player→object axis (drop or zero-velocity release).
+                Vector3 dir;
+                float linLen = glm::length(linVel);
+                if (linLen > 1e-3f) {
+                    dir = linVel / linLen;
+                } else if (toObjLen > 1e-3f) {
+                    dir = toObj / toObjLen;
+                } else {
+                    // Truly degenerate: snap straight up so gravity takes over.
+                    dir = Vector3(0.0f, 0.0f, 1.0f);
+                }
+                Vector3 snapPos = playerPos + dir * minDist;
+                dGeomSetPosition(geom, snapPos.x, snapPos.y, snapPos.z);
+                dBodySetPosition(body, snapPos.x, snapPos.y, snapPos.z);
+            }
+            dGeomEnable(geom);
+        }
+
         dBodyEnable(body);
         dBodySetLinearVel(body, linVel.x, linVel.y, linVel.z);
         dBodySetAngularVel(body, angVel.x, angVel.y, angVel.z);
@@ -1205,6 +1252,33 @@ public:
             "[DarkPhysics] release obj=%d linVel=(%.2f,%.2f,%.2f)\n",
             objID, linVel.x, linVel.y, linVel.z);
         return true;
+    }
+
+    /// Conservative bounding-sphere radius for a dGeom. Used by the release
+    /// pushout above to keep the freshly-re-enabled body clear of the
+    /// player capsule. Box class returns half-diagonal; sphere returns
+    /// radius; everything else falls back to the geom AABB half-extent.
+    static float computeGeomCircumradius(dGeomID geom) {
+        switch (dGeomGetClass(geom)) {
+            case dBoxClass: {
+                dVector3 sides;
+                dGeomBoxGetLengths(geom, sides);
+                return 0.5f * std::sqrt(
+                    static_cast<float>(sides[0] * sides[0] +
+                                       sides[1] * sides[1] +
+                                       sides[2] * sides[2]));
+            }
+            case dSphereClass:
+                return static_cast<float>(dGeomSphereGetRadius(geom));
+            default: {
+                dReal aabb[6];
+                dGeomGetAABB(geom, aabb);
+                float dx = static_cast<float>(aabb[1] - aabb[0]);
+                float dy = static_cast<float>(aabb[3] - aabb[2]);
+                float dz = static_cast<float>(aabb[5] - aabb[4]);
+                return 0.5f * std::sqrt(dx * dx + dy * dy + dz * dz);
+            }
+        }
     }
 
 private:
