@@ -1597,9 +1597,18 @@ static void updateMovement(
         state.cam.pos[2] = eye.z;
         state.cam.roll = state.physics->getPlayerPhysics().getLeanTilt();
 
-        // Add view punch from object impacts (Source Engine spring-damper)
+        // Add view punch from object impacts (Source Engine spring-damper).
+        // mPunchAngle is the absolute spring displacement from neutral, not a
+        // per-frame delta — so we have to subtract last frame's value from
+        // cam.pitch before adding this frame's, otherwise the offset would
+        // integrate every render frame and pitch would run off to infinity
+        // (a 1 rad punch + 120 fps = ~6800°/s drift). Roll has no equivalent
+        // bookkeeping because cam.roll is overwritten each frame by the line
+        // above before the punch is applied.
         Darkness::Vector3 punch = state.physics->getPlayerPhysics().getViewPunch();
+        state.cam.pitch -= state.lastAppliedPunchPitch;
         state.cam.pitch += punch.x;
+        state.lastAppliedPunchPitch = punch.x;
         state.cam.roll  += punch.z;
 
         // Per-render-frame head/viewport log — sampled after all camera mutations so
