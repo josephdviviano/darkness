@@ -2128,16 +2128,14 @@ int main(int argc, char *argv[]) {
     // pre-scripted offset poses (matching the original engine's PlayerMotionTable),
     // NOT raw motion capture data — mocap is only for third-person creature animation.
     std::unique_ptr<Darkness::MotionService> motionSvc;
-    if (!resPath.empty()) {
-        motionSvc = std::make_unique<Darkness::MotionService>();
-        if (motionSvc->loadFromCRF(resPath)) {
-            std::fprintf(stderr, "Motion: loaded %d clips from motions.crf (for future NPC use)\n",
-                         motionSvc->clipCount());
-        } else {
-            std::fprintf(stderr, "WARNING: failed to load motions.crf from %s\n"
-                                 "         NPC animation will not be available.\n",
-                         resPath.c_str());
-        }
+    motionSvc = std::make_unique<Darkness::MotionService>();
+    if (motionSvc->loadFromCRF(resPath)) {
+        std::fprintf(stderr, "Motion: loaded %d clips from motions.crf (for future NPC use)\n",
+                     motionSvc->clipCount());
+    } else {
+        std::fprintf(stderr, "WARNING: failed to load motions.crf from %s\n"
+                             "         NPC animation will not be available.\n",
+                     resPath.c_str());
     }
 
     // ── Load sound resources from snd.crf + schema directory ──
