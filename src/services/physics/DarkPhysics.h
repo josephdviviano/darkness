@@ -1143,6 +1143,118 @@ public:
         dBodyAddForce(it->second, force.x, force.y, force.z);
     }
 
+    // ── Held-object primitives (used by GrabSystem) ──
+    //
+    // While an object is held, ODE simulation is suspended for it: the body
+    // is disabled (no integration) and the geom is disabled (no collision
+    // queries). The grab system then teleports the geom to a player-driven
+    // target each frame via setHoldTransform(). On release, the body is
+    // re-enabled and given an initial velocity (zero for drop, forward
+    // impulse for throw).
+
+    /// Suspend simulation for objID — disables both the dynamic body and
+    /// the geom so the object stops integrating, doesn't collide with the
+    /// world or the player capsule, and zero its velocities. Also flags
+    /// the ObjectCollisionWorld body so the player's custom narrowphase
+    /// (testPlayerSpheres) ignores it — without this, the held OBB tracking
+    /// the camera would push the player capsule on every frame.
+    /// Returns true if the object had a dynamic body to suspend.
+    bool enterHold(int32_t objID) {
+        auto it = mODEBodies.find(objID);
+        if (it == mODEBodies.end()) return false;
+        dBodyID body = it->second;
+        // Stop any current motion before suspension.
+        dBodySetLinearVel(body, 0, 0, 0);
+        dBodySetAngularVel(body, 0, 0, 0);
+        dBodyDisable(body);
+
+        // Remove from ODE collision space — the held geom shouldn't generate
+        // contacts with the world trimesh or the player capsule. Matches the
+        // original engine: held items clip through walls and don't collide
+        // with the carrier.
+        auto gIt = mODEGeoms.find(objID);
+        if (gIt != mODEGeoms.end()) dGeomDisable(gIt->second);
+
+        // Tell the player's custom narrowphase to skip this body too. ODE's
+        // player capsule and the engine's sphere-vs-OBB system are independent
+        // collision paths; both must ignore the held object to prevent the
+        // player's head/body spheres from being pushed by their own carry.
+        if (mObjectCollision) mObjectCollision->setSkipPlayerCollision(objID, true);
+        return true;
+    }
+
+    /// While an object is held, drive its world transform every frame.
+    /// Updates the ODE geom (kept in sync so re-enable picks up the right
+    /// pose) and the renderer state (via the same applyModelMatrix path
+    /// that all sim systems use, so scale + matrix flag match what
+    /// syncDynamicBodies will overwrite on release).
+    /// rotMat3 is column-major (glm convention).
+    /// ObjectCollisionWorld AABBs are NOT updated — the body is flagged
+    /// skipPlayerCollision in enterHold, so its stored worldPos is unused
+    /// while held.
+    void setHoldTransform(int32_t objID, const Vector3 &pos,
+                          const glm::mat3 &rotMat3) {
+        auto gIt = mODEGeoms.find(objID);
+        if (gIt == mODEGeoms.end()) return;
+        dGeomID geom = gIt->second;
+        dGeomSetPosition(geom, pos.x, pos.y, pos.z);
+        dMatrix3 R;
+        glmMat3ToODE(rotMat3, R);
+        dGeomSetRotation(geom, R);
+
+        // Body pose tracks geom — when re-enabled, integration starts from here.
+        auto bIt = mODEBodies.find(objID);
+        if (bIt != mODEBodies.end()) {
+            dBodySetPosition(bIt->second, pos.x, pos.y, pos.z);
+            dBodySetRotation(bIt->second, R);
+        }
+
+        // Mirror into the renderer using the same code path as the dynamics
+        // sync. This applies the correct P$Scale (looked up from mODEScales)
+        // so the held object renders at its actual size instead of unit
+        // scale, and sets ObjectState.hasMatrix consistently with what
+        // syncDynamicBodies will write after release.
+        if (mObjectStates) {
+            Vector3 scale(1.0f);
+            auto sIt = mODEScales.find(objID);
+            if (sIt != mODEScales.end()) scale = sIt->second;
+
+            // Build the same row-major model matrix syncDynamicBodies uses.
+            // odeToGlmMatrix takes ODE pos/R + scale; reuse it for parity.
+            const dReal posR[3] = {pos.x, pos.y, pos.z};
+            Matrix4 modelMatrix = odeToGlmMatrix(posR, R, scale);
+            applyModelMatrix(*mObjectStates, objID, modelMatrix, pos, scale);
+        }
+    }
+
+    /// End the hold: clear collision flags, re-enable body+geom, apply
+    /// initial linear velocity. linVel is in world units/sec; angVel in
+    /// rad/sec (defaults to zero). After release, syncDynamicBodies takes
+    /// over and overwrites ObjectStateMap each frame from the live ODE
+    /// position — no special cleanup needed on the renderer side.
+    /// Returns true if a held body was released.
+    bool releaseFromHold(int32_t objID, const Vector3 &linVel,
+                         const Vector3 &angVel = Vector3(0.0f)) {
+        // Clear the player-narrowphase skip flag so the body collides again
+        // once it's airborne.
+        if (mObjectCollision) mObjectCollision->setSkipPlayerCollision(objID, false);
+
+        auto gIt = mODEGeoms.find(objID);
+        if (gIt != mODEGeoms.end()) dGeomEnable(gIt->second);
+
+        auto bIt = mODEBodies.find(objID);
+        if (bIt == mODEBodies.end()) return false;
+        dBodyID body = bIt->second;
+        dBodyEnable(body);
+        dBodySetLinearVel(body, linVel.x, linVel.y, linVel.z);
+        dBodySetAngularVel(body, angVel.x, angVel.y, angVel.z);
+
+        std::fprintf(stderr,
+            "[DarkPhysics] release obj=%d linVel=(%.2f,%.2f,%.2f)\n",
+            objID, linVel.x, linVel.y, linVel.z);
+        return true;
+    }
+
 private:
     // ── Data members ──
 

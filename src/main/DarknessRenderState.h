@@ -61,6 +61,7 @@ class ObjectStateMap;
 class DoorSystem;
 class MovingTerrainSystem;
 class FrobSystem;
+class GrabSystem;
 class MessageDispatch;
 class ScriptManager;
 
@@ -248,6 +249,11 @@ struct RuntimeState {
 
     // Frob system — non-owning pointer, for player interaction with objects
     FrobSystem *frobSystem = nullptr;
+
+    // Grab system — non-owning pointer, for held-object physics manipulation
+    // (carry / drop / throw). Decoupled from FrobSystem so future grip modes
+    // (e.g. Amnesia-style hinge drag) can extend without touching frob.
+    GrabSystem *grabSystem = nullptr;
 
     // Message dispatch — non-owning pointer, for routing frob/TurnOn/TurnOff
     // through global handlers (which enforce lock checks, etc.)

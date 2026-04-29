@@ -104,6 +104,7 @@
 #include "SoundScripts.h"
 #include "GameLogic.h"
 #include "FrobSystem.h"
+#include "GrabSystem.h"
 #include "FunctionalLoopClient.h"
 
 // TODO: Make these configurable via command-line or config file
@@ -1420,9 +1421,57 @@ static void handleEvents(
             }
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_f
                    && !ev.key.repeat) {
-            // F: frob the object under the crosshair (doors, levers, switches, etc.)
-            if (state.frobSystem && state.frobSystem->hasTarget()) {
+            // F: triple-purpose, ordered by priority:
+            //   1. If holding something → throw with original engine's
+            //      power=30 model (velocity = forward * 30 * coeff, where
+            //      coeff = launcherMass / (objMass + launcherMass)).
+            //      Heavy objects still move, just slower — matches Thief.
+            //   2. Else if frob target has kFrobMove and is a dynamic body
+            //      → grab it.
+            //   3. Else → standard frob (doors, levers, scripts, etc.).
+            // Drop is on R (uses power=0.05, basically zero — gravity wins).
+            bool handled = false;
+            if (state.grabSystem && state.grabSystem->isGrabbingAny()) {
+                // Camera forward in Z-up Dark Engine convention.
+                const float cosPitch = std::cos(state.cam.pitch);
+                const Darkness::Vector3 fwd(
+                    std::cos(state.cam.yaw) * cosPitch,
+                    std::sin(state.cam.yaw) * cosPitch,
+                    std::sin(state.cam.pitch));
+                // Original engine's throw callback uses power=30.0 for player
+                // throws (Dark Engine convention). Tunable via YAML in a follow-up.
+                constexpr float kThrowPower = 30.0f;
+                state.grabSystem->releaseAllWithPower(fwd, kThrowPower);
+                handled = true;
+            }
+            if (!handled && state.grabSystem && state.frobSystem
+                && state.frobSystem->hasTarget() && state.physics) {
+                const auto &t = state.frobSystem->getTarget();
+                const bool canMove = (t.frobActions & Darkness::kFrobMove) != 0;
+                if (canMove && state.physics->hasDynamicBody(t.objID)) {
+                    Darkness::GrabRequest req;
+                    req.objID = t.objID;
+                    req.gripPointWorld = t.hitPoint;
+                    req.mode = Darkness::GrabMode::kCarry;
+                    handled = state.grabSystem->grab(req, state.cam);
+                }
+            }
+            if (!handled && state.frobSystem && state.frobSystem->hasTarget()) {
                 state.frobSystem->executeFrob();
+            }
+        } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_r
+                   && !ev.key.repeat) {
+            // R: drop. Original engine routes drop through the same throw
+            // path with power=0.05 — effectively zero forward velocity,
+            // gravity dominates immediately.
+            if (state.grabSystem && state.grabSystem->isGrabbingAny()) {
+                const float cosPitch = std::cos(state.cam.pitch);
+                const Darkness::Vector3 fwd(
+                    std::cos(state.cam.yaw) * cosPitch,
+                    std::sin(state.cam.yaw) * cosPitch,
+                    std::sin(state.cam.pitch));
+                constexpr float kDropPower = 0.05f;
+                state.grabSystem->releaseAllWithPower(fwd, kDropPower);
             }
         }
     }
@@ -2309,6 +2358,16 @@ int main(int argc, char *argv[]) {
         // MessageDispatch connected below after creation
     }
     state.frobSystem = &frobSystem;
+
+    // ── Initialize grab system ──
+    // Carries the held object lifecycle (pickup, per-frame attach to camera,
+    // drop, throw). Lives outside FrobSystem so future grip modes (force
+    // drag, hinge drag) can be added without touching frob targeting.
+    Darkness::GrabSystem grabSystem;
+    if (state.physics) {
+        grabSystem.init(state.physics.get(), state.objectStates);
+    }
+    state.grabSystem = &grabSystem;
 
     // ── Initialize message dispatch ──
     // Routes script messages (TurnOn, TurnOff, FrobWorldEnd) to handlers.
@@ -3205,6 +3264,13 @@ int main(int argc, char *argv[]) {
             // Update frob target — cast ray from camera to find nearest frobbable object
             if (state.frobSystem) {
                 state.frobSystem->update(state.cam);
+            }
+
+            // Drive any held objects toward their carry target. Run after
+            // movement (so the camera position is final for this frame) but
+            // before any physics step that consumes the held geom transform.
+            if (state.grabSystem) {
+                state.grabSystem->update(state.cam, dt);
             }
 
             // Update frob highlight fade (Dark Engine: ~130ms fade in/out)

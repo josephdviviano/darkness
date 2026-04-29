@@ -195,6 +195,13 @@ struct ObjectCollisionBody {
     // returns immediately when encountering an edge trigger OBB. Default false.
     bool isEdgeTrigger = false;
 
+    // skipPlayerCollision: when true, the player's narrowphase (testPlayerSpheres)
+    // ignores this body. Used by the grab system to suspend collision for an
+    // object the player is holding so the carried object doesn't push the
+    // player capsule around. Cleared on release. Mirrors the original engine's
+    // behavior — held items move with the player without colliding back.
+    bool skipPlayerCollision = false;
+
     // Precomputed world-space AABB for quick rejection tests
     Vector3 aabbMin;
     Vector3 aabbMax;
@@ -970,6 +977,12 @@ public:
             size_t bi = mCandidates[ci];
             const auto &body = mBodies[bi];
 
+            // Skip objects the player is currently grabbing — they ride along
+            // with the camera and shouldn't push the player capsule. Matches
+            // the original engine's hold semantics where carried items don't
+            // collide with the carrier.
+            if (body.skipPlayerCollision) continue;
+
             for (int s = 0; s < numSpheres; ++s) {
                 OBBCollisionResult cr;
 
@@ -1031,6 +1044,16 @@ public:
     const ObjectCollisionBody *findBodyByObjID(int32_t objID) const {
         auto it = mObjIDToBody.find(objID);
         return (it != mObjIDToBody.end()) ? &mBodies[it->second] : nullptr;
+    }
+
+    /// Set the skipPlayerCollision flag on a body. Used by GrabSystem (via
+    /// DarkPhysics) to suspend collision while an object is held.
+    /// Returns true if the body was found.
+    bool setSkipPlayerCollision(int32_t objID, bool skip) {
+        auto it = mObjIDToBody.find(objID);
+        if (it == mObjIDToBody.end()) return false;
+        mBodies[it->second].skipPlayerCollision = skip;
+        return true;
     }
 
     /// Update a collision body's transform from a new world-space model matrix.
