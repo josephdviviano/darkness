@@ -171,18 +171,10 @@ public:
                 // 1) Collision detection — creates contact joints
                 dSpaceCollide(mODESpace, this, &odeNearCallback);
 
-                // 2) Enforce zero rotation on grounded dynamic bodies.
-                // Must run AFTER dSpaceCollide (contact joints exist for
-                // ground detection) but BEFORE dWorldQuickStep (so zero
-                // angular velocity is the solver's starting condition).
-                // Grounded bodies slide without tipping (original Dark Engine
-                // behavior); airborne bodies rotate freely.
-                for (auto &[objID, body] : mODEBodies) {
-                    if (!dBodyIsEnabled(body)) continue;
-                    enforceGroundNoRotation(body);
-                }
-
-                // 3) Step the solver
+                // 2) Step the solver. Angular damping + auto-disable handle
+                //    resting stability — the original engine accumulated
+                //    rotational velocity from contacts with per-axis filtering
+                //    by P$PhysAttr.rot_axes; it never locked rotation outright.
                 dWorldQuickStep(mODEWorld, fixedDt);
                 dJointGroupEmpty(mODEContacts);
                 mODEAccum -= fixedDt;
@@ -536,10 +528,12 @@ private:
         dWorldSetAutoDisableSteps(mODEWorld, 5);
         dWorldSetAutoDisableTime(mODEWorld, 0.5);  // sleep after 0.5s of low activity
 
-        // Aggressive damping so objects settle quickly on trimesh surfaces.
-        // Without this, objects micro-bounce on trimesh contact points
-        // and never reach the auto-disable velocity threshold.
-        dWorldSetLinearDamping(mODEWorld, 0.05);
+        // Light linear damping so objects on trimesh surfaces still settle
+        // (auto-disable threshold catches them once below 0.05 u/s) without
+        // visibly slowing thrown/pushed objects in flight. The original
+        // engine had no global linear damping at all; 0.01 is a small
+        // numerical cushion against micro-bounce jitter on trimesh contacts.
+        dWorldSetLinearDamping(mODEWorld, 0.01);
         // Angular damping: 0.08 allows barrels/bottles to roll realistically
         // while still settling in a reasonable time. The original engine had
         // no angular damping — objects spun until friction stopped them.
@@ -550,7 +544,7 @@ private:
         dWorldSetAngularDampingThreshold(mODEWorld, 0.01);
 
         std::fprintf(stderr, "ODE world created (gravity=%.1f, ERP=0.8, CFM=1e-4, "
-                     "linDamp=0.05, angDamp=0.08)\n", -GRAVITY);
+                     "linDamp=0.01, angDamp=0.08)\n", -GRAVITY);
     }
 
     void shutdownODE() {
@@ -764,48 +758,6 @@ private:
         m[3][1] = static_cast<float>(pos[1]);
         m[3][2] = static_cast<float>(pos[2]);
         return m;
-    }
-
-    /// Enforce zero rotation on OBB bodies that are on the ground.
-    /// The original Dark Engine set AtRest(TRUE) for ALL OBBs — they never
-    /// rotated from pushes, only slid. We improve on this: allow rotation
-    /// when airborne (falling off ledges, thrown) so objects tumble
-    /// realistically, but lock rotation when grounded so pushes feel clean.
-    ///
-    /// Ground detection: check the body's contact joints for any with an
-    /// upward-pointing normal (Z > 0.5). If found, the object is on a surface.
-    void enforceGroundNoRotation(dBodyID body) {
-        // Check if this body has any ground contacts (upward normal)
-        bool onGround = false;
-        int numJoints = dBodyGetNumJoints(body);
-        for (int i = 0; i < numJoints; ++i) {
-            dJointID joint = dBodyGetJoint(body, i);
-            if (dJointGetType(joint) != dJointTypeContact) continue;
-
-            // Read the contact normal from the joint feedback.
-            // ODE contact joints store the contact geom in the joint's
-            // internal data, but we can't easily access it post-creation.
-            // Instead, check if the other body is the world trimesh (static)
-            // by testing if one of the connected bodies is NULL (static geom).
-            dBodyID b1 = dJointGetBody(joint, 0);
-            dBodyID b2 = dJointGetBody(joint, 1);
-            if (!b1 || !b2) {
-                // One side is static geometry (world trimesh or static object).
-                // Assume floor contact — this is conservative but correct for
-                // most cases. Objects on top of other dynamic objects also
-                // get locked (both bodies non-null), which is fine for stacking.
-                onGround = true;
-                break;
-            }
-            // Dynamic-on-dynamic: also lock (stacking stability)
-            onGround = true;
-            break;
-        }
-
-        if (onGround) {
-            dBodySetAngularVel(body, 0, 0, 0);
-        }
-        // Airborne: ODE handles free rotation naturally (tumbling off ledges)
     }
 
     /// Sync awake dynamic ODE bodies back to collision geometry and renderer.
