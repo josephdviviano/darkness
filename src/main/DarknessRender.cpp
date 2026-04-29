@@ -34,6 +34,7 @@
 #include <unordered_set>
 #include <sstream>
 #include <unistd.h> // dup2, fileno
+#include <sys/stat.h> // stat, S_ISDIR
 
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -1987,12 +1988,39 @@ int main(int argc, char *argv[]) {
     state.waterRotation    = cfg.waterRotation;
     state.waterScrollSpeed = cfg.waterScrollSpeed;
 
-    mission.texturedMode = !resPath.empty();
+    // ── Mandatory game-resource paths ──
+    // The renderer needs both snd.crf (sounds) and the schema directory
+    // (.sch files mapping schema names to actual sample files). Without
+    // either, audio fails silently in confusing ways (every ambient retries
+    // load forever in the background). Treat both as required.
+    if (resPath.empty()) {
+        std::fprintf(stderr,
+            "ERROR: --res is required.\n"
+            "       Pass --res <path> pointing to the Thief 2 RES directory\n"
+            "       containing fam.crf, obj.crf, snd.crf (typically the\n"
+            "       installed game's RES folder, e.g. /Volumes/THIEF2_INSTALL_C/THIEF2/RES).\n");
+        return 1;
+    }
+    {
+        struct stat st;
+        if (::stat(resPath.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+            std::fprintf(stderr,
+                "ERROR: --res path '%s' does not exist or is not a directory.\n",
+                resPath.c_str());
+            return 1;
+        }
+    }
+    mission.texturedMode = true;
 
     // ── Initialize logging (required before ServiceManager) ──
+    // Register a stderr listener and run at INFO level so audio + service
+    // init messages (miniaudio init, Steam Audio init, snd.crf load,
+    // probe baking) are visible. Without this, LOG_INFO / LOG_ERROR have
+    // no destination and audio-init failures are invisible.
     Darkness::Logger logger;
     Darkness::StdLog stdlog;
-    logger.setLogLevel(Darkness::Logger::LOG_LEVEL_FATAL);
+    logger.registerLogListener(&stdlog);
+    logger.setLogLevel(Darkness::Logger::LOG_LEVEL_INFO);
     Darkness::ConsoleBackend console;
 
     // ── Initialize service stack, load database, construct IWorldQuery ──
@@ -2112,13 +2140,21 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // ── Load sound resources from snd.crf ──
-    if (!resPath.empty()) {
+    // ── Load sound resources from snd.crf + schema directory ──
+    // Both snd.crf (in resPath) and the schema directory are required —
+    // without schemas, ambient/event playback falls back to looking up
+    // sample files by schema name, which never resolves and silently
+    // floods the log with load failures. Hard-fail at startup instead.
+    {
         Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
         if (!audioSvc->loadSoundResources(resPath, cli.schemasPath)) {
-            std::fprintf(stderr, "WARNING: failed to load snd.crf from %s\n"
-                                 "         Sound playback will not be available.\n",
-                         resPath.c_str());
+            std::fprintf(stderr,
+                "ERROR: audio resource initialization failed.\n"
+                "       --res must point to a directory containing snd.crf\n"
+                "       and the schema directory must be locatable. Either pass\n"
+                "       --schemas <path> explicitly (e.g. /Volumes/THIEF2_CD2/EDITOR/SCHEMA),\n"
+                "       or place the schemas next to RES at <res>/../EDITOR/SCHEMA.\n");
+            return 1;
         }
     }
 

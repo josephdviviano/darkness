@@ -1474,8 +1474,19 @@ bool AudioService::loadSoundResources(const std::string &resPath,
     }
 
     if (!schemasLoaded) {
-        AUDIO_LOG( "AudioService: no schema files found — use --schemas <path>\n");
+        // Hard failure: schemas are required. Without them, every ambient
+        // and event-driven schema lookup falls through to a name-as-sample
+        // fallback that always misses (samples in snd.crf don't share
+        // schema names), so the level is silent and the log fills with
+        // load-error retries. The renderer caller treats false as fatal.
+        LOG_ERROR("AudioService: no schema directory found.\n"
+                  "  Pass --schemas <path> to the EDITOR/SCHEMA directory,\n"
+                  "  or place the schemas next to RES at %s/../EDITOR/SCHEMA.",
+                  resPath.c_str());
         mSchemaParser.reset();
+        mSoundLoader.reset();
+        mSoundCache.reset();
+        return false;
     }
 
     LOG_INFO("AudioService: Sound resources loaded from %s", resPath.c_str());
