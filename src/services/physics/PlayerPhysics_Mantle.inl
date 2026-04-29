@@ -1,10 +1,63 @@
 // Included inside PlayerPhysics class body — do not include standalone.
 
+    /// Combined ray-vs-WR + ray-vs-OBB raycast for mantle. Returns true if
+    /// either world geometry or any registered OBB is intersected, and fills
+    /// `hit` with whichever is closest. Crates / chests / containers live in
+    /// ObjectCollisionWorld (not WR), so a world-only raycast misses them
+    /// entirely — that's why pre-fix mantle never engaged on dynamic objects.
+    inline bool raycastMantle(const Vector3 &start, const Vector3 &end,
+                              RayHit &hit) const {
+        bool hitAny = raycastWorld(mCollision.getWR(), start, end, hit);
+
+        if (!mObjectWorld) return hitAny;
+
+        Vector3 segment = end - start;
+        float segLen = glm::length(segment);
+        if (segLen < 1e-6f) return hitAny;
+
+        // Track closest hit by parametric t along the ray. WR hit's distance
+        // is in world units; convert to t for apples-to-apples comparison.
+        float bestT = hitAny ? (hit.distance / segLen) : 1.0f;
+
+        const auto &bodies = mObjectWorld->getBodies();
+        for (const auto &body : bodies) {
+            if (body.skipPlayerCollision) continue;
+            // Mantle climbs onto box-like surfaces; sphere-shaped objects
+            // (barrels, balls) aren't valid ledge surfaces.
+            if (body.shapeType != CollisionShapeType::OBB &&
+                body.shapeType != CollisionShapeType::SphereHat)
+                continue;
+
+            RayOBBResult r = rayVsOBB(start, end, body);
+            if (!r.hit) continue;
+            if (r.t >= bestT) continue;
+
+            bestT = r.t;
+            hit.point = r.point;
+            hit.distance = r.t * segLen;
+            // Clear WR-specific fields so callers don't pick up stale state.
+            hit.cellIdx = -1;
+            hit.polyIdx = -1;
+            hit.textureIndex = -1;
+            // Approximate surface normal via the OBB's hit face. faceIdx
+            // 0..2 = +X/+Y/+Z, 3..5 = -X/-Y/-Z (rotation-matrix columns).
+            int axis = r.faceIdx % 3;
+            Vector3 n = body.rotation[axis];
+            if (r.faceIdx >= 3) n = -n;
+            hit.normal = n;
+            hit.hitEntity = body.objID;
+            hitAny = true;
+        }
+        return hitAny;
+    }
+
     /// Check for mantleable ledge using 3-ray detection (airborne + pressing forward).
     /// 1. UP from head (3.5u headroom), 2. FWD from top (2.4u clear path),
     /// 3. DOWN from fwd pos (7.0u ledge surface), 4. FWD from HEAD/BODY/FOOT (XY target).
     /// Rise target is INTERMEDIATE (head peeks above lip): riseZ = ledge.z + r*1.02 -
     /// HEAD_OFFSET + 1.0. Full standing height via FinalRise after forward compression.
+    /// Each phase tests both WR cell geometry and OBB objects so dynamic crates,
+    /// chests, etc. count as valid ledges (and as obstructions overhead).
     inline bool checkMantle() {
         if (mCurrentMode != PlayerMode::Jump || mInputForward < 0.1f || mMantling)
             return false;
@@ -16,7 +69,7 @@
         // Phase 1: upward — check headroom (3.5 units above head)
         Vector3 upTarget = headPos + Vector3(0.0f, 0.0f, MANTLE_UP_DIST);
         RayHit hit;
-        if (raycastWorld(mCollision.getWR(), headPos, upTarget, hit))
+        if (raycastMantle(headPos, upTarget, hit))
             return false;  // ceiling too low
 
         // Forward direction (horizontal, unit length, from cached yaw)
@@ -25,12 +78,12 @@
 
         // Phase 2: forward — check clear path above the ledge
         Vector3 fwdTarget = upTarget + moveDir;
-        if (raycastWorld(mCollision.getWR(), upTarget, fwdTarget, hit))
+        if (raycastMantle(upTarget, fwdTarget, hit))
             return false;  // wall in the way
 
         // Phase 3: downward — find ledge surface (7.0 units down)
         Vector3 downTarget = fwdTarget + Vector3(0.0f, 0.0f, -MANTLE_DOWN_DIST);
-        if (!raycastWorld(mCollision.getWR(), fwdTarget, downTarget, hit))
+        if (!raycastMantle(fwdTarget, downTarget, hit))
             return false;  // no ledge found
 
         float ledgeZ = hit.point.z;
@@ -47,7 +100,7 @@
         for (int i = 0; i < 3 && !foundFwdSurface; ++i) {
             Vector3 spherePos = mPosition + Vector3(0.0f, 0.0f, fwdSurfaceOffsets[i]);
             Vector3 sphereFwd = spherePos + moveDir;
-            if (raycastWorld(mCollision.getWR(), spherePos, sphereFwd, hit)) {
+            if (raycastMantle(spherePos, sphereFwd, hit)) {
                 fwdHitPoint = hit.point;
                 foundFwdSurface = true;
             }
