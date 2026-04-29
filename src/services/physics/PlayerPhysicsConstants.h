@@ -376,7 +376,8 @@ static constexpr MotionPoseData POSE_CARRY_RIGHT  = {0.6f,  0.01f, 0.0f,  -0.15f
 static constexpr MotionPoseData POSE_WEAPON_SWING       = {0.0f,  0.0f, 0.8f,  0.0f,   0.0f,    0.0f,  0.0f,  0.0f};
 static constexpr MotionPoseData POSE_WEAPON_SWING_CROUCH = {0.0f, 0.0f, 0.8f,  0.0f,  -2.02f,  0.8f,  0.0f, -1.0f};
 
-// Standing lean — 1.5s blend, collision-limited via updateLean(). lat positive = right.
+// Standing lean — 1.5s blend; head spring eases the lateral offset, wall pushback
+// flows through the body collision pipeline. lat positive = right.
 static constexpr MotionPoseData POSE_LEAN_LEFT    = {1.5f,  0.0f,  0.0f,  -2.2f,    0.0f,   0.0f,  0.0f,  0.0f};
 static constexpr MotionPoseData POSE_LEAN_RIGHT   = {1.5f,  0.0f,  0.0f,   2.2f,    0.0f,   0.0f,  0.0f,  0.0f};
 static constexpr MotionPoseData POSE_LEAN_FWD     = {1.5f,  0.0f,  2.2f,   0.0f,    0.0f,   0.0f,  0.0f,  0.0f};

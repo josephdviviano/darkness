@@ -314,8 +314,7 @@ public:
     }
 
     /// Camera roll/bank angle from leaning (radians), interpolated. Positive = tilting right.
-    /// Proportional to collision-limited lean extent (mLeanAmount), derived from spring lateral
-    /// displacement each frame.
+    /// Proportional to spring lateral displacement (mSpringPos.y).
     inline float getLeanTilt() const {
         float current = computeRawLeanTilt();
         return mPrevLeanTilt + (current - mPrevLeanTilt) * mInterpAlpha;
@@ -422,8 +421,6 @@ public:
     const Vector3 &getPoseCurrent() const { return mPoseCurrent; }
     /// End target of the current pose blend (target the spring is chasing).
     const Vector3 &getPoseEnd() const { return mPoseEnd; }
-    /// Collision-clamped lean amount (world units along lean direction).
-    float getLeanAmount() const { return mLeanAmount; }
     /// Horizontal speed magnitude (XY plane only).
     float getHorizontalSpeed() const {
         return std::sqrt(mVelocity.x * mVelocity.x + mVelocity.y * mVelocity.y);
@@ -600,7 +597,6 @@ private:
             updateCell();
             updateMotionPose();
             updateHeadSpring();
-            updateLean();
             return;
         }
 
@@ -824,10 +820,7 @@ private:
         }
         mJumpRequested = false;  // clear after both jump (step 1) and mantle (step 13)
 
-        // 14. Update lean (visual-only lateral camera offset with collision)
-        updateLean();
-
-        // 15. Write diagnostic log row (if logging enabled)
+        // 14. Write diagnostic log row (if logging enabled)
         writeLogRow();
     }
 
@@ -1009,9 +1002,10 @@ private:
     float   mPrevLeanTilt = 0.0f; // lean tilt from before the last physics step
     float   mInterpAlpha  = 1.0f; // interpolation fraction (1.0 = show current state)
 
-    // Lean state — driven through motion poses (spring provides easing)
+    // Lean state — driven through motion poses (spring provides easing).
+    // Lateral camera offset is read directly from mSpringPos.y; wall pushback
+    // flows through the body collision pipeline rather than a per-frame clamp.
     int   mLeanDir        = 0;    // lean direction: -1=left, 0=center, +1=right
-    float mLeanAmount     = 0.0f; // collision-limited lateral offset (derived from spring each frame)
 
     // Live contact list — validated each frame by validateContacts(), new contacts
     // added during resolveCollisions(). Contacts are persistent collision records
