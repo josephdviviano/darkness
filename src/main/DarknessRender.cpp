@@ -2678,7 +2678,7 @@ int main(int argc, char *argv[]) {
         Darkness::LinkServicePtr linkSvc = GET_SERVICE(Darkness::LinkService);
         movingTerrainSystem.init(propSvc.get(), objSvc.get(), linkSvc.get(),
                                  state.objectStates, &doorPlacements);
-        movingTerrainSystem.setMessageDispatch(&messageDispatch);
+        // Waypoint callback wired below, after ScriptManager is declared.
     }
 
     // ── Initialize pressure plate system ──
@@ -3042,10 +3042,21 @@ int main(int argc, char *argv[]) {
         scriptManager.sendMessage(msg);
     });
 
-    // Hook MovingTerrainSystem waypoint arrival → ScriptManager messages
-    // MovingTerrainSystem already uses MessageDispatch for TurnOn/TurnOff;
-    // we add a dedicated waypoint callback for StdElevator scripts.
-    movingTerrainSystem.setMessageDispatch(&messageDispatch);
+    // Hook MovingTerrainSystem waypoint arrival → ScriptManager MovingTerrainWaypoint.
+    // StdElevator listens for this to deactivate at the destination waypoint;
+    // without it, platforms loop continuously. The callback also gives us a
+    // place to fan out to peer subsystems (audio schemas, particles) later.
+    movingTerrainSystem.setEventCallback([&scriptManager](int32_t platformID,
+                                                          int32_t waypointID,
+                                                          int waypointIdx) {
+        Darkness::ScriptMessage msg;
+        msg.to = platformID;
+        msg.name = "MovingTerrainWaypoint";
+        msg.from = waypointID;  // StdElevator's "Call" path keys off msg.from
+        msg.data = Darkness::Variant(waypointID);
+        msg.data2 = Darkness::Variant(waypointIdx);
+        scriptManager.sendMessage(msg);
+    });
 
     // Set up door event callback: update audio blocking and log status changes.
     // When a door starts opening, remove sound blocking. When it finishes
