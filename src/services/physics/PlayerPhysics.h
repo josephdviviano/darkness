@@ -663,6 +663,29 @@ private:
                 // Don't clear mJumpRequested yet — mantle check at step 13 may use it
             } else if (isOnGround()) {
                 float jumpFriction = computeGroundFriction();
+
+                // Diagnostic: when jumping off a non-terrain surface (e.g. a
+                // crate), dump per-contact friction breakdown so we can see
+                // why the jump feels lower than off solid floor. Compare with
+                // a regular floor jump in the same log to spot the delta.
+                if (mGroundObjID >= 0) {
+                    int upContacts = 0;
+                    float maxNZ = 0.0f, minNZ = 1.0f;
+                    for (const auto &c : mContacts) {
+                        if (c.normal.z <= 0.0f) continue;
+                        ++upContacts;
+                        if (c.normal.z > maxNZ) maxNZ = c.normal.z;
+                        if (c.normal.z < minNZ) minNZ = c.normal.z;
+                    }
+                    std::fprintf(stderr,
+                        "[JUMP-DIAG] from obj=%d friction=%.3f upContacts=%d "
+                        "normalZ=[%.3f..%.3f] threshold=%.3f scale=%.3f%s\n",
+                        mGroundObjID, jumpFriction, upContacts, minNZ, maxNZ,
+                        JUMP_MIN_FRICTION,
+                        (jumpFriction <= 1.0f) ? jumpFriction : 1.0f,
+                        (jumpFriction <= JUMP_MIN_FRICTION) ? " REJECTED" : "");
+                }
+
                 if (jumpFriction > JUMP_MIN_FRICTION) {
                     // Remove vertical velocity component, boost horizontal by 5%,
                     // add jump impulse upward, then scale the ENTIRE velocity by
