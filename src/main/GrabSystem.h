@@ -182,11 +182,15 @@ public:
     /// Release with a raw world-space linear velocity. Escape hatch for
     /// callers that compute their own velocity (e.g. explosions, springs).
     /// Most call sites should use releaseWithPower() instead.
+    ///
+    /// Returns false (and keeps the grab active) if the physics layer
+    /// refuses the release for clearance reasons. Callers should surface
+    /// this as "can't drop here — back away from the wall" feedback.
     bool releaseWithVelocity(int32_t objID, const Vector3 &linVel) {
         auto it = std::find_if(mGrabs.begin(), mGrabs.end(),
             [&](const ActiveGrab &g) { return g.objID == objID; });
         if (it == mGrabs.end()) return false;
-        mPhysics->releaseFromHold(objID, linVel);
+        if (!mPhysics->releaseFromHold(objID, linVel)) return false;
         mGrabs.erase(it);
         return true;
     }
@@ -198,6 +202,11 @@ public:
     /// for throws — drop = 0.05, player throw = 30.0). `direction` is a
     /// unit vector (typically camera forward). The mass attenuation models
     /// the player absorbing recoil from launching the object.
+    ///
+    /// Returns false (and keeps the grab active) if the physics layer
+    /// refuses the release for clearance reasons — e.g. the player is
+    /// pressed against a wall and there's no room ahead to safely drop
+    /// the object. The carrier has to step away before the throw lands.
     bool releaseWithPower(int32_t objID, const Vector3 &direction, float power) {
         auto it = std::find_if(mGrabs.begin(), mGrabs.end(),
             [&](const ActiveGrab &g) { return g.objID == objID; });
@@ -207,7 +216,12 @@ public:
         const float coeff = mLauncherMass / (objMass + mLauncherMass);
         const Vector3 vel = direction * (power * coeff);
 
-        mPhysics->releaseFromHold(objID, vel);
+        if (!mPhysics->releaseFromHold(objID, vel)) {
+            std::fprintf(stderr,
+                "[GrabSystem] release(%d) BLOCKED — keeping grab active "
+                "(power=%.2f mass=%.1f)\n", objID, power, objMass);
+            return false;
+        }
         mGrabs.erase(it);
 
         std::fprintf(stderr,
@@ -219,13 +233,19 @@ public:
     }
 
     /// Release every active grab with the same power + direction. The
-    /// common "throw whatever I'm holding" case.
-    void releaseAllWithPower(const Vector3 &direction, float power) {
+    /// common "throw whatever I'm holding" case. Per-object failures
+    /// (release blocked by geometry) are silent here — the per-object
+    /// log line in releaseWithPower already calls them out.
+    /// Returns true if at least one release succeeded.
+    bool releaseAllWithPower(const Vector3 &direction, float power) {
         // Iterate over a snapshot since release mutates mGrabs.
         std::vector<int32_t> ids;
         ids.reserve(mGrabs.size());
         for (const auto &g : mGrabs) ids.push_back(g.objID);
-        for (int32_t id : ids) releaseWithPower(id, direction, power);
+        bool any = false;
+        for (int32_t id : ids)
+            any = releaseWithPower(id, direction, power) || any;
+        return any;
     }
 
     bool isGrabbing(int32_t objID) const {
