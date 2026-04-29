@@ -998,13 +998,28 @@
         // smoothly over blend duration. Collision uses blended offsets for ceiling clearance.
 
         // ── Crouch transitions (only on ground modes) ──
+        // Dark Engine convention: the rest-motion activation that drives the eye
+        // up/down is GATED by the leaning state — when the player is leaning, the
+        // current lean motion stays active across mode changes. The pose target is
+        // not re-activated, so the visible eye height does not change on a
+        // C-press while leaning. The crouch becomes visible later, when lean is
+        // released: setLeanDirection(0) activates the mode's rest pose
+        // (POSE_CROUCH or POSE_NORMAL), and the spring smoothly blends the
+        // current lean offset toward that rest target.
+        //
+        // An earlier port-only attempt re-activated POSE_CLNLEAN_*/POSE_LEAN_* on
+        // mode change mid-lean to make the crouch immediately visible. That
+        // re-activation re-anchored the head spring's virtual grid
+        // (snapSpringVirtualGridToNow) and produced a 1-frame camera discontinuity
+        // — a "jitter" — every time the C key was tapped while leaning. Match the
+        // original instead.
         if (isOnGround()) {
             if (mWantsCrouch && !isCrouching()) {
-                // Start crouching — explicitly activate POSE_CROUCH so spring drives eye down.
-                // Without this, idle check would fail transitioning from POSE_NORMAL (all zeros).
                 mCurrentMode = PlayerMode::Crouch;
                 if (mLeanDir == 0)
                     activatePose(POSE_CROUCH);
+                // else: lean motion stays active; rest motion deferred until
+                // setLeanDirection(0) fires on lean release.
             } else if (!mWantsCrouch && isCrouching()) {
                 // Try to un-crouch — check if there's room above.
                 // Test HEAD sphere at standing height (no crouch offset applied)
@@ -1016,9 +1031,9 @@
                 // Only un-crouch if head has no collisions at standing height
                 if (headContacts.empty()) {
                     mCurrentMode = PlayerMode::Stand;
-                    // Activate standing rest pose so the spring drives eye back up
                     if (mLeanDir == 0)
                         activatePose(POSE_NORMAL);
+                    // else: lean motion stays active across the mode change.
                 }
                 // else: ceiling too low, stay crouched
             }

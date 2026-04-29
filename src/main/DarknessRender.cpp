@@ -1391,8 +1391,11 @@ static void handleEvents(
             std::fprintf(stderr, "Teleported to spawn (%.1f, %.1f, %.1f)\n",
                          state.spawnX, state.spawnY, state.spawnZ);
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_c
-                   && state.physicsMode) {
-            // C in physics mode: toggle crouch on/off
+                   && !ev.key.repeat && state.physicsMode) {
+            // C in physics mode: toggle crouch on/off (edge-triggered).
+            // Without the !repeat filter, the OS sends KEYDOWN repeats every
+            // ~30 ms while C is held, flipping the toggle 30×/sec — visible as
+            // the player rapidly oscillating between Stand and Crouch.
             state.crouchToggled = !state.crouchToggled;
         } else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_SPACE
                    && !ev.key.repeat && state.physicsMode && state.physics) {
