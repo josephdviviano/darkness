@@ -42,6 +42,8 @@
 #ifndef __DARKPHYSICS_H
 #define __DARKPHYSICS_H
 
+#include <array>
+#include <cstring>
 #include <memory>
 #include <unordered_map>
 
@@ -112,24 +114,36 @@ public:
 
                 auto bodyIt = mODEBodies.find(c.objectId);
                 if (bodyIt != mODEBodies.end()) {
-                    // ODE dynamic body — apply impulse as force over one physics step.
+                    // ODE dynamic body — apply impulse as a direct velocity bump.
                     // Dark Engine elastic transfer: 2*m1/(m1+m2) * dampening
                     float objMass = mPushSystem->getMass(c.objectId);
                     float elastic = (2.0f * PLAYER_MASS) / (PLAYER_MASS + objMass);
-                    constexpr float kPushDampening = 0.06f;
+                    // Impulse fraction transferred per contact, tuned so a
+                    // typical crate slides visibly (~1 u/s for a 30 kg crate
+                    // at running speed).
+                    constexpr float kPushDampening = 0.10f;
                     // Contact normal points from object toward player; vDotN is negative
                     // (into object), so normal * vDotN gives push direction away from player.
                     Vector3 pushVel = c.normal * vDotN * elastic * kPushDampening;
-                    // Convert velocity impulse to force: F = m * dv / dt
-                    float fixedDt = mPlayer.getTimestep().fixedDt;
-                    Vector3 force = pushVel * (objMass / fixedDt);
-                    // Player pushes are strictly horizontal — suppress ALL vertical
-                    // force (both up and down). Downward force tips objects over;
-                    // upward force lifts them. Gravity handles vertical motion.
-                    force.z = 0.0f;
 
+                    // Inject velocity directly rather than going through F = m·dv/dt.
+                    // Direct velocity addition is independent of the ODE substep rate
+                    // and matches how throw release seeds linear velocity, so the full
+                    // impulse lands deterministically on the body each player tick.
+                    // Preserve current Z so gravity remains in charge of vertical motion.
                     dBodyEnable(bodyIt->second);
-                    dBodyAddForce(bodyIt->second, force.x, force.y, force.z);
+                    const dReal *cur = dBodyGetLinearVel(bodyIt->second);
+                    dBodySetLinearVel(bodyIt->second,
+                                      cur[0] + pushVel.x,
+                                      cur[1] + pushVel.y,
+                                      cur[2]);
+
+                    static int dbgPushForce = 0;
+                    if (dbgPushForce++ < 200)
+                        std::fprintf(stderr,
+                            "[PUSH-FORCE] obj=%d dv=(%.3f,%.3f,%.3f) bodyVel=(%.3f,%.3f,%.3f)\n",
+                            c.objectId, pushVel.x, pushVel.y, pushVel.z,
+                            cur[0] + pushVel.x, cur[1] + pushVel.y, cur[2]);
 
                     // Player bounce-back: slight deceleration on push impact.
                     // Very subtle — the player should feel mild resistance, not
@@ -180,6 +194,7 @@ public:
                 dJointGroupEmpty(mODEContacts);
                 mODEAccum -= kODEFixedDt;
                 ++steps;
+                ++mODEFrameCount;  // ODE substep counter (used by drop-soften window)
             }
             if (steps >= kMaxODEStepsPerFrame) mODEAccum = 0.0f;  // spiral guard
         }
@@ -585,6 +600,12 @@ private:
     /// box-on-box stacking; more contacts = more solver work.
     static constexpr int MAX_ODE_CONTACTS = 4;
 
+    // Post-drop softening window. ODE steps at 100 Hz, so 20 substeps = 0.2 s.
+    static constexpr uint32_t kDropSoftenFrames = 20;
+    // Linear-velocity threshold separating "drop" from "throw" at release time.
+    // Drop power=0.05 yields ~0.04 u/s; throw power=30 yields several u/s.
+    static constexpr float kDropVelThreshold = 0.5f;
+
     // Player push uses the original engine's velocity transfer algorithm:
     // mass-weighted average along contact normal, directly setting the
     // object's velocity. No ODE forces — much more stable than impulses.
@@ -695,10 +716,31 @@ private:
         bool hasTrimesh = (dGeomGetClass(o1) == dTriMeshClass ||
                            dGeomGetClass(o2) == dTriMeshClass);
 
+        // Post-drop softening: if either body was dropped within
+        // kDropSoftenFrames substeps, ramp bounce 0→full and CFM very-soft→normal
+        // over the window. This kills the sharp impulse from a placed box's
+        // corners poking the surface below before ERP resolves the penetration.
+        float dropSoftenT = 1.0f;  // 1.0 = no softening (default)
+        {
+            auto checkDrop = [&](int32_t objID) {
+                auto it = self->mLastDropFrame.find(objID);
+                if (it == self->mLastDropFrame.end()) return;
+                uint32_t age = self->mODEFrameCount - it->second;
+                if (age >= kDropSoftenFrames) {
+                    self->mLastDropFrame.erase(it);
+                    return;
+                }
+                float t = static_cast<float>(age) / static_cast<float>(kDropSoftenFrames);
+                if (t < dropSoftenT) dropSoftenT = t;
+            };
+            if (valid1) checkDrop(d1->objID);
+            if (valid2) checkDrop(d2->objID);
+        }
+
         for (int i = 0; i < numContacts; ++i) {
             contacts[i].surface.mode = dContactBounce | dContactApprox1;
             contacts[i].surface.mu = mu;
-            contacts[i].surface.bounce = std::min(bounce, 0.2f);
+            contacts[i].surface.bounce = std::min(bounce, 0.2f) * dropSoftenT;  // ramp 0→full
             contacts[i].surface.bounce_vel = 1.0f;  // need real speed to bounce
 
             if (hasTrimesh) {
@@ -706,13 +748,22 @@ private:
                 // on uneven world geometry, but stiff enough to prevent sinking.
                 contacts[i].surface.mode |= dContactSoftERP | dContactSoftCFM;
                 contacts[i].surface.soft_erp = 0.5;   // moderate correction
-                contacts[i].surface.soft_cfm = 0.001;  // slight compliance
+                // CFM: lerp from very-soft (0.05) at drop-time toward normal (0.001)
+                // as the window progresses. Higher CFM = more compliant contact =
+                // smaller impulse to resolve corner penetration.
+                constexpr double kDropSoftCFM = 0.05;
+                constexpr double kNormalSoftCFM = 0.001;
+                contacts[i].surface.soft_cfm =
+                    kNormalSoftCFM + (kDropSoftCFM - kNormalSoftCFM) * (1.0 - dropSoftenT);
             } else if (b1 && b2) {
                 // Object-on-object: softer for stable stacking.
                 // (Inspired by Godot's per-contact soft parameters for stack stability.)
                 contacts[i].surface.mode |= dContactSoftERP | dContactSoftCFM;
                 contacts[i].surface.soft_erp = 0.3;   // gentler correction
-                contacts[i].surface.soft_cfm = 0.005;  // more compliant
+                constexpr double kDropSoftCFM = 0.05;
+                constexpr double kNormalSoftCFM = 0.005;
+                contacts[i].surface.soft_cfm =
+                    kNormalSoftCFM + (kDropSoftCFM - kNormalSoftCFM) * (1.0 - dropSoftenT);
             }
 
             dJointID joint = dJointCreateContact(
@@ -798,7 +849,9 @@ private:
     /// Sync awake dynamic ODE bodies back to collision geometry and renderer.
     void syncDynamicBodies() {
         if (!mObjectCollision || !mObjectStates) return;
-        ++mODEFrameCount;
+        // mODEFrameCount is incremented per ODE substep (100 Hz) in the
+        // step loop above — drop-soften window measures in substeps. Used
+        // here only for throttled logging (substep cadence is fine).
         int awakeCount = 0;
         for (auto &[objID, body] : mODEBodies) {
             if (!dBodyIsEnabled(body)) continue;  // sleeping — no update needed
@@ -1083,6 +1136,18 @@ public:
 
         mODEBodies[objID] = odeBody;
         mODEScales[objID] = collBody->objectScale;
+
+        // Cache the spawn-time rotation. Read it back from the body — the
+        // pointer R from dGeomGetRotation above was invalidated by
+        // dGeomSetBody, which frees the geom's standalone posr when it
+        // starts sharing the body's posr. The body's rotation memory is
+        // stable for the body's lifetime. Stored as dReal[12] (dMatrix3
+        // with row stride of 4); restored on drop so a placed crate lands
+        // flat instead of corner-first.
+        std::array<dReal, 12> spawnR;
+        std::memcpy(spawnR.data(), dBodyGetRotation(odeBody),
+                    sizeof(dReal) * 12);
+        mSpawnRotation[objID] = spawnR;
         return true;
     }
 
@@ -1339,6 +1404,31 @@ public:
         dBodySetLinearVel(body, linVel.x, linVel.y, linVel.z);
         dBodySetAngularVel(body, angVel.x, angVel.y, angVel.z);
 
+        // Mark drops (low release velocity) for a brief contact-softening
+        // window. The near callback consults mLastDropFrame to ramp bounce
+        // and CFM, so the body lands without a sharp corner impulse. Throws
+        // (high release velocity) skip this entirely.
+        if (glm::length(linVel) < kDropVelThreshold) {
+            mLastDropFrame[objID] = mODEFrameCount;
+            std::fprintf(stderr,
+                "[DROP-SOFTEN] obj=%d frame=%u window=%u substeps\n",
+                objID, mODEFrameCount, kDropSoftenFrames);
+
+            // Snap to spawn rotation so a stacked face lands flat on the
+            // surface below. Combined with the post-drop CFM/bounce softening
+            // window, this removes the corner-poke impulse that makes box
+            // stacking jarring. Throws (linVel >= kDropVelThreshold) skip
+            // this entirely so they keep their carried orientation.
+            auto rIt = mSpawnRotation.find(objID);
+            if (rIt != mSpawnRotation.end()) {
+                dBodySetRotation(body, rIt->second.data());
+                // dBodySetRotation propagates to the attached geom because
+                // dGeomSetBody linked them in makeDynamic.
+                std::fprintf(stderr,
+                    "[DROP-SOFTEN] obj=%d snapped to spawn rotation\n", objID);
+            }
+        }
+
         std::fprintf(stderr,
             "[DarkPhysics] release obj=%d linVel=(%.2f,%.2f,%.2f)\n",
             objID, linVel.x, linVel.y, linVel.z);
@@ -1401,6 +1491,17 @@ private:
     std::unordered_map<int32_t, dGeomID>  mODEGeoms;   // objID → geom (static or dynamic)
     std::unordered_map<int32_t, dBodyID>  mODEBodies;  // objID → dynamic body
     std::unordered_map<int32_t, Vector3>  mODEScales;  // objID → object scale for matrix
+    // Frame index (in ODE substep counter, mODEFrameCount) at which an object
+    // was last dropped. Contacts involving these bodies are softened for
+    // kDropSoftenFrames substeps after the drop to avoid a sharp impact
+    // impulse from corner penetration. Throws (linVel > kDropVelThreshold)
+    // don't enter this map. Entries self-clear in the near callback once
+    // the window expires.
+    std::unordered_map<int32_t, uint32_t> mLastDropFrame;
+    // Spawn-time rotation (the geom's rotation at makeDynamic time). Reapplied
+    // on a drop release so a placed crate lands with its canonical face down,
+    // eliminating corner-vs-surface contact spikes during stacking.
+    std::unordered_map<int32_t, std::array<dReal, 12>> mSpawnRotation;
     std::vector<ODEGeomData *>            mGeomDataPtrs; // owned per-geom data for cleanup
     dGeomID        mPlayerGeom  = nullptr;             // kinematic player capsule
     float          mODEAccum    = 0.0f;               // fixed-timestep accumulator for ODE

@@ -624,7 +624,7 @@
 
                 if (c.objectId >= 0 && mIsPushableCb && mIsPushableCb(c.objectId)) {
                     static int dbgCount = 0;
-                    if (dbgCount++ < 40)
+                    if (dbgCount++ < 100)
                         std::fprintf(stderr, "[PUSH-COLLIDE] obj=%d n=(%.2f,%.2f,%.2f) pen=%.3f sub=%d\n",
                                      c.objectId, c.normal.x, c.normal.y, c.normal.z,
                                      c.penetration, c.submodelIdx);
