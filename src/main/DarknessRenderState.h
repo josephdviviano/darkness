@@ -52,6 +52,9 @@
 #include "SpawnFinder.h"
 #include "TXListParser.h"
 #include "PCXDecoder.h"
+#include "RenderParamsParser.h"
+#include "ObjectIllumination.h"
+#include "DynamicLightList.h"
 #include "physics/DarkPhysics.h"
 
 namespace Darkness {
@@ -92,6 +95,9 @@ struct MissionData {
 
     // Fog
     FogParams                                         fogParams;
+
+    // Per-mission ambient + sun lighting parameters (from RENDPARAMS chunk).
+    RenderParams                                      renderParams;
 
     // Animated lights
     std::unordered_map<int16_t, LightSource>          lightSources;
@@ -156,6 +162,7 @@ struct GPUResources {
     bgfx::UniformHandle u_fogColor     = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_fogParams    = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_objectParams = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_objectLight  = BGFX_INVALID_HANDLE;  // .rgb = per-object lighting tint
     bgfx::UniformHandle u_lmAtlasSize  = BGFX_INVALID_HANDLE;
 
     // World geometry
@@ -228,6 +235,22 @@ struct RuntimeState {
     bool texturedMode = false;
     bool hasWater = false;
     bool hasSkybox = false;
+
+    // Per-object lighting (Dark Engine convention: ambient + cell-light-list
+    // sum + sun + P$ExtraLight). When disabled, objects render at their
+    // material color (the historical behavior). Toggle via debug console.
+    //
+    // Marked `mutable` because the illuminator carries an internal shadow
+    // cache that compute() updates as a transparent optimization; the render
+    // pipeline passes RuntimeState by const ref everywhere, so this lets the
+    // const draw lambdas still poke the cache.
+    mutable ObjectIlluminator objectIlluminator;
+    bool objectLightingEnabled = true;
+
+    // Per-frame dynamic light registry. Reset at the start of each render
+    // frame; gameplay systems push transient lights (player flashlight,
+    // fire arrows, mage spells, creature glow) before object draws begin.
+    DynamicLightList dynamicLights;
 
     // Physics simulation (created after WR data is parsed, nullptr until then)
     // In physics mode the camera position is driven by PlayerPhysics::getEyePosition().

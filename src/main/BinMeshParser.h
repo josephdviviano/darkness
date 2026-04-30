@@ -74,6 +74,11 @@ struct ParsedBinMesh {
     std::vector<uint32_t> indices;
     float bboxMin[3];
     float bboxMax[3];
+    // Bounding sphere radius from the .bin header (Dark Engine `sphere_rad`).
+    // Used by per-object lighting to position the virtual sun far enough
+    // away that the object isn't "inside" it. Falls back to 1.0 if the
+    // field wasn't read.
+    float sphereRadius = 1.0f;
     std::vector<BinSubMesh> subMeshes;
     std::vector<BinMatInfo> materials;
     bool valid; // false if parsing failed
@@ -155,11 +160,12 @@ private:
             return result;
         }
 
-        // Copy bounding box
+        // Copy bounding box and bsphere radius
         for (int i = 0; i < 3; ++i) {
             result.bboxMin[i] = mHdr.bbox_min[i];
             result.bboxMax[i] = mHdr.bbox_max[i];
         }
+        result.sphereRadius = (mHdr.sphere_rad > 0.0f) ? mHdr.sphere_rad : 1.0f;
 
         // Calculate derived counts (same as ObjectMeshLoader::load())
         mNumUVs = (mHdr.offset_vhots - mHdr.offset_uv) / (sizeof(float) * 2);

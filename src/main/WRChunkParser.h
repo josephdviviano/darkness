@@ -146,12 +146,50 @@ struct WRParsedCell {
     // animLightmaps[polyIdx][overlayIdx] = raw pixel data (same size as static lmap)
     // Overlays are in bit order of animflags (lowest set bit first)
     std::vector<std::vector<std::vector<uint8_t>>> animLightmaps;
+    // Static lights potentially affecting this cell. Element 0 holds the count;
+    // elements [1..count] index into WRParsedData::staticLights. Built at level
+    // bake; treated as a precomputed visibility filter (object lighting still
+    // raycasts per-light to handle dynamic occlusion changes from doors etc.).
+    std::vector<uint16_t> lightIndices;
 };
+
+// One entry in the static light table (Dark Engine "RGB lighting" build layout,
+// 48 bytes on disk). Located at end of the WR/WRRGB chunk, after the per-cell
+// stream. Slot 0 is reserved for the sun (overwritten per-evaluation by the
+// object lighting code; on-disk values for slot 0 are scratch).
+//
+// `bright` is pre-divided by the bake-time light_scale (32.0) for non-sun
+// slots. The sun's brightness is patched at runtime from RENDPARAMS' computed
+// sun_scaled_rgb (which is NOT pre-divided).
+//
+// `inner` and `outer` are cosines of half-angles (inner > outer); inner = -1.0
+// is the omni-directional sentinel (no spotlight cone applied).
+struct WRStaticLight {
+    Vector3 loc;
+    Vector3 dir;
+    Vector3 bright;
+    float   inner;
+    float   outer;
+    float   radius;
+};
+// Lock the on-disk byte layout for the RGB build. Vector3 = glm::vec3 has
+// no tail padding (12 B / 4 B align), so the natural struct layout matches
+// the original engine's mls_multi_light record exactly. If a future GLM
+// upgrade switches to padded vec3, this assert catches it before we read
+// garbage from disk.
+static_assert(sizeof(WRStaticLight) == 48,
+              "WRStaticLight must be exactly 48 bytes to match Dark Engine "
+              "RGB-build mls_multi_light on-disk layout");
 
 struct WRParsedData {
     uint32_t numCells;
     int lightSize; // 1 for WR (grayscale), 2 for WRRGB (xBGR 5:5:5)
     std::vector<WRParsedCell> cells;
+    // Static light table (active count + entries). On disk: int32 num_light,
+    // int32 num_dyn, then 768 fixed-size entries followed by 32 scratch
+    // entries. We keep only the active slice [0..numStaticLights).
+    int32_t                    numStaticLights = 0;
+    std::vector<WRStaticLight> staticLights;
 };
 
 // ── Helpers ──
@@ -256,11 +294,88 @@ inline WRParsedData parseWRChunk(const std::string &misPath) {
             }
         }
 
-        // 6d. light_indices (skip for Phase 1)
-        uint32_t lightCount;
-        *chunk >> lightCount;
-        if (lightCount > 0)
-            chunk->seek(lightCount * 2, File::FSEEK_CUR);
+        // 6d. light_indices: int32 num (= active count + 1) followed by num
+        // ushorts. Element 0 is the count itself; elements [1..count] are
+        // indices into the static light table. Empty cells (e.g. fully solid
+        // or sealed-off) have num == 0.
+        uint32_t numLightIndices;
+        *chunk >> numLightIndices;
+        if (numLightIndices > 0) {
+            cell.lightIndices.resize(numLightIndices);
+            chunk->read(cell.lightIndices.data(),
+                        static_cast<size_t>(numLightIndices) * sizeof(uint16_t));
+        }
+    }
+
+    // After the per-cell stream, the engine writes a BSP tree used by the
+    // portal-cell hit tests, immediately followed by the static light table.
+    //
+    // BSP layout:
+    //   int32  numExtraPlanes
+    //   { vec3 normal; float plane_constant; } extras[numExtraPlanes]      (16 B each)
+    //   int32  bspTreeSize
+    //   { uint parent_index; int cell_id; int plane_id;
+    //     uint inside_index; uint outside_index; } nodes[bspTreeSize]      (20 B each)
+    //
+    // We don't currently use the BSP tree (our portal traversal uses cells
+    // directly), so we skip it. Layout discovered by tracing the original
+    // engine's WriteWR -> wrBspTreeWrite path.
+    {
+        int32_t numExtraPlanes = 0;
+        *chunk >> numExtraPlanes;
+        if (numExtraPlanes > 0)
+            chunk->seek(static_cast<size_t>(numExtraPlanes) * 16,
+                        File::FSEEK_CUR);
+
+        int32_t bspTreeSize = 0;
+        *chunk >> bspTreeSize;
+        if (bspTreeSize > 0)
+            chunk->seek(static_cast<size_t>(bspTreeSize) * 20,
+                        File::FSEEK_CUR);
+    }
+
+    // Static light table. Layout at end of chunk:
+    //   int32  num_light    (active light count, including slot 0 = sun)
+    //   int32  num_dyn      (always 0 in saved data)
+    //   WRStaticLight light_data[768]   (MAX_STATIC; only [0..num_light) active)
+    //   WRStaticLight light_this[32]    (scratch buffer; skipped)
+    //   int32  num_anim_light_to_cell   (mapping table for the lightmap path)
+    //   <anim_light_to_cell entries>    (skipped — handled by LightingSystem)
+    //
+    // We read all 768 entries (so disk offsets stay valid for any later chunk
+    // reads) but surface only the active slice via numStaticLights.
+    //
+    // The on-disk record layout is RGB-build only (48 bytes per entry).
+    // Grayscale-build missions (Thief 1) use a different 32-byte layout —
+    // we don't currently support those for object lighting. The ObjectIlluminator
+    // still works; the per-object output just won't include cell-light
+    // contributions for those missions.
+    constexpr int kMaxStaticLights = 768;
+    constexpr int kLightThisCount  = 32;
+    if (lightSize != 2) {
+        // Grayscale WR: skip the static light section entirely; object
+        // lighting will use ambient + sun + ExtraLight only.
+        std::fprintf(stderr,
+            "[WR] grayscale WR chunk — static light table not parsed "
+            "(object lighting falls back to ambient+sun)\n");
+        return result;
+    }
+    {
+        int32_t numLight = 0, numDyn = 0;
+        *chunk >> numLight >> numDyn;
+        result.numStaticLights = numLight;
+
+        result.staticLights.resize(kMaxStaticLights);
+        chunk->read(result.staticLights.data(),
+                    static_cast<size_t>(kMaxStaticLights) * sizeof(WRStaticLight));
+
+        // Skip the scratch buffer.
+        chunk->seek(static_cast<size_t>(kLightThisCount) * sizeof(WRStaticLight),
+                    File::FSEEK_CUR);
+
+        // Trim to active slice for memory hygiene; capacity stays.
+        if (numLight >= 0 && numLight <= kMaxStaticLights)
+            result.staticLights.resize(numLight);
     }
 
     return result;
