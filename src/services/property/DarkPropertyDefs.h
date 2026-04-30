@@ -68,6 +68,17 @@ struct PropSelfIllum {
     float brightness;
 };
 
+// P$ExtraLigh — dtype: ExtraLigh, inheritor: always, 8 bytes
+// Per-object lighting modifier. `factor` is in [-1, 1]; when `isAdditive` is
+// nonzero, factor is added to the ambient term (clamped so factor + frob
+// highlight stays ≤ 1.0). When zero, factor overrides the ambient term and
+// also forces ambient-only mode (suppresses contribution from cell lights).
+struct PropExtraLight {
+    float    factor;
+    uint32_t isAdditive;     // BOOL32: nonzero = additive, zero = override
+};
+static_assert(sizeof(PropExtraLight) == 8);
+
 // ============================================================================
 // Light properties
 // ============================================================================

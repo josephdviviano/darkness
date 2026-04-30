@@ -119,6 +119,10 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
         // Scale uses "never" inheritor — kPropertyNoInherit in the original engine.
         // Archetype scales are physics bounding boxes, not visual model scales.
         registerRawProp("ModelScale",  "Scale",     "never");
+        // Note: P$ExtraLigh (ExtraLight) is in t2-props.pldef and gets
+        // registered automatically by the schema loop above under the pldef
+        // name "ExtraLigh" — do NOT re-register it here, that would create
+        // a duplicate watcher on the same chunk. Lookup uses "ExtraLigh".
 
         std::fprintf(stderr, "Schema: registered %d properties, %d relations\n",
                      propCount, relCount);
@@ -226,7 +230,8 @@ static bool loadMissionData(const char *misPath,
         std::fprintf(stderr, "Failed to parse WR chunk: %s\n", e.what());
         return false;
     }
-    std::fprintf(stderr, "Loaded %u cells\n", mission.wrData.numCells);
+    std::fprintf(stderr, "Loaded %u cells, %d static lights\n",
+                 mission.wrData.numCells, mission.wrData.numStaticLights);
 
     // Build portal adjacency graph for portal culling
     mission.cellPortals = buildPortalGraph(mission.wrData);
@@ -295,6 +300,10 @@ static bool loadMissionData(const char *misPath,
 
     // Parse global fog parameters from FOG chunk (if present)
     mission.fogParams = parseFogChunk(misPath);
+
+    // Parse per-mission ambient + sun parameters (RENDPARAMS chunk). These
+    // feed into per-object lighting via ObjectIlluminator.
+    mission.renderParams = Darkness::parseRenderParamsChunk(misPath);
 
     // Parse water flow data — FLOW_TEX (texture mapping) and CELL_MOTION (animation state)
     mission.flowData = parseFlowData(misPath);
@@ -765,6 +774,8 @@ static bool createGPUResources(const Darkness::MissionData &mission,
     gpu.u_fogParams = bgfx::createUniform("u_fogParams", bgfx::UniformType::Vec4);
     // Per-object params: x = alpha (1.0 = opaque, < 1.0 = translucent via RenderAlpha property)
     gpu.u_objectParams = bgfx::createUniform("u_objectParams", bgfx::UniformType::Vec4);
+    // Per-object RGB lighting tint: .rgb = sum of ambient + visible cell lights + sun + ExtraLight
+    gpu.u_objectLight  = bgfx::createUniform("u_objectLight",  bgfx::UniformType::Vec4);
     // Atlas dimensions for bicubic shader texel-space calculations
     gpu.u_lmAtlasSize = bgfx::createUniform("u_lmAtlasSize", bgfx::UniformType::Vec4);
 
@@ -1289,6 +1300,7 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
     bgfx::destroy(gpu.u_fogColor);
     bgfx::destroy(gpu.u_fogParams);
     bgfx::destroy(gpu.u_objectParams);
+    bgfx::destroy(gpu.u_objectLight);
     bgfx::destroy(gpu.u_lmAtlasSize);
 
     bgfx::destroy(gpu.ibh);

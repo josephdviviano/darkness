@@ -12,6 +12,11 @@ uniform vec4 u_fogParams;
 // Used by RenderAlpha property for semi-transparent objects (e.g. windows)
 uniform vec4 u_objectParams;
 
+// u_objectLight.rgb = per-object lighting tint computed by ObjectIlluminator
+// (ambient + visible cell lights + sun + ExtraLight). When per-object
+// lighting is disabled, the renderer submits white so this is a no-op.
+uniform vec4 u_objectLight;
+
 void main()
 {
     vec4 texColor = texture2D(s_texColor, v_texcoord0);
@@ -22,6 +27,9 @@ void main()
     vec4 finalColor = texColor * v_color0;
     // Apply per-object opacity (1.0 for opaque objects, < 1.0 for translucent)
     finalColor.a *= u_objectParams.x;
+    // Modulate by per-object lighting tint (Dark Engine convention: a single
+    // RGB color from cell lights + ambient applied uniformly across the model).
+    finalColor.rgb *= u_objectLight.rgb;
     // Frob highlight: additive brightness boost (Dark Engine convention).
     // u_objectParams.y = highlight intensity (0.0 = none, ~0.47 = full highlight).
     finalColor.rgb += vec3_splat(u_objectParams.y);
