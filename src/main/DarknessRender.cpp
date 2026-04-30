@@ -364,10 +364,15 @@ static void renderSky(
 
     // Inline sky fog uniform helper
     float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    // Sky and other non-object passes still feed shaders that read
+    // u_objectLight (fs_basic, fs_textured); pass white so the multiply is
+    // a no-op for those passes.
+    float whiteLight[4] = { 1.0f, 1.0f, 1.0f, 0.0f };
     auto setFogSky = [&]() {
         bgfx::setUniform(gpu.u_fogColor, fc.fogColorArr);
         bgfx::setUniform(gpu.u_fogParams, fc.skyFogArr);
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+        bgfx::setUniform(gpu.u_objectLight, whiteLight);
     };
 
     if (mission.hasSkybox && bgfx::isValid(gpu.skyboxVBH)) {
@@ -408,10 +413,12 @@ static void renderWorld(
     bx::mtxIdentity(model);
 
     float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    float whiteLight[4]   = { 1.0f, 1.0f, 1.0f, 0.0f };
     auto setFogOn = [&]() {
         bgfx::setUniform(gpu.u_fogColor, fc.fogColorArr);
         bgfx::setUniform(gpu.u_fogParams, fc.fogOnArr);
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+        bgfx::setUniform(gpu.u_objectLight, whiteLight);
     };
 
     auto isCellVisible = [&](uint32_t cellID) -> bool {
@@ -510,10 +517,12 @@ static void renderWater(
     // No BGFX_STATE_CULL_* — water is visible from both sides
 
     float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    float whiteLight[4]   = { 1.0f, 1.0f, 1.0f, 0.0f };
     auto setFogOn = [&]() {
         bgfx::setUniform(gpu.u_fogColor, fc.fogColorArr);
         bgfx::setUniform(gpu.u_fogParams, fc.fogOnArr);
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+        bgfx::setUniform(gpu.u_objectLight, whiteLight);
     };
 
     for (const auto &grp : meshes.waterMesh.groups) {
@@ -666,9 +675,11 @@ static void renderDebugOverlay(
                            | BGFX_STATE_PT_LINES;
         bgfx::setState(lineState);
         float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+        float whiteLight[4]   = { 1.0f, 1.0f, 1.0f, 0.0f };
         bgfx::setUniform(gpu.u_fogColor, fc.fogColorArr);
         bgfx::setUniform(gpu.u_fogParams, fc.fogOnArr);
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+        bgfx::setUniform(gpu.u_objectLight, whiteLight);
         bgfx::submit(2, gpu.flatProgram);
     }
     // Acoustic mesh wireframe overlay
@@ -686,7 +697,9 @@ static void renderDebugOverlay(
         bgfx::setUniform(gpu.u_fogColor, noFog);
         bgfx::setUniform(gpu.u_fogParams, noFog);
         float opaqueParams[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+        bgfx::setUniform(gpu.u_objectLight, whiteLight);
         bgfx::submit(2, gpu.flatProgram);
     }
 
@@ -756,10 +769,12 @@ static void renderObjects(
 
     // Helper: set fog uniforms (bgfx clears uniforms after each submit)
     float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
+    float whiteLight[4]   = { 1.0f, 1.0f, 1.0f, 0.0f };
     auto setFogOn = [&]() {
         bgfx::setUniform(gpu.u_fogColor, fc.fogColorArr);
         bgfx::setUniform(gpu.u_fogParams, fc.fogOnArr);
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+        bgfx::setUniform(gpu.u_objectLight, whiteLight);
     };
 
     // Helper: draw one object's submeshes, filtering by opacity.
@@ -854,6 +869,52 @@ static void renderObjects(
         if (it != gpu.objModelGPU.end() && it->second.valid) {
             const auto &gpuModel = it->second;
 
+            // Live world-space position for object lighting. Moving objects
+            // (doors/platforms/tweqs) need their current position, not the
+            // P$Position baseline; stationary objects fall through to obj.x/y/z.
+            float litX = obj.x, litY = obj.y, litZ = obj.z;
+            if (objState) {
+                litX = objState->position.x;
+                litY = objState->position.y;
+                litZ = objState->position.z;
+            }
+            // Cell hint: stationary objects have a precomputed cell in
+            // objCellIDs (built once at load); moving objects fall back to
+            // the cell-find inside ObjectIlluminator.
+            int32_t litCell = -1;
+            if (!objState && oi < mission.objCellIDs.size())
+                litCell = mission.objCellIDs[oi];
+
+            // Object radius (used to offset the virtual sun position) is
+            // the bounding sphere radius from the .bin header, scaled by
+            // the object's per-axis scale (taking the largest scale to
+            // stay conservative — the sun should be outside the object).
+            const auto *parsed = mission.parsedModels.count(modelName)
+                ? &mission.parsedModels.at(modelName) : nullptr;
+            float litRadius = 1.0f;
+            if (parsed) {
+                float maxScale = std::max({obj.scaleX, obj.scaleY, obj.scaleZ});
+                if (objState) {
+                    maxScale = std::max({objState->scale.x,
+                                         objState->scale.y,
+                                         objState->scale.z});
+                }
+                litRadius = parsed->sphereRadius * std::max(maxScale, 1.0f);
+            }
+
+            // Compute per-object RGB lighting. When disabled (debug toggle),
+            // we pass white so the shader's multiplication is a no-op and
+            // visible behavior matches the pre-lighting historical look.
+            Darkness::Vector3 litRGB(1.0f, 1.0f, 1.0f);
+            if (state.objectLightingEnabled) {
+                litRGB = state.objectIlluminator.compute(
+                    obj.objID,
+                    Darkness::Vector3(litX, litY, litZ),
+                    litRadius,
+                    litCell);
+            }
+            float litArr[4] = { litRGB.x, litRGB.y, litRGB.z, 0.0f };
+
             for (const auto &sm : gpuModel.subMeshes) {
                 if (sm.indexCount == 0) continue;
 
@@ -885,6 +946,7 @@ static void renderObjects(
                 bgfx::setUniform(gpu.u_fogColor, fc.fogColorArr);
                 bgfx::setUniform(gpu.u_fogParams, fc.fogOnArr);
                 bgfx::setUniform(gpu.u_objectParams, objAlpha);
+                bgfx::setUniform(gpu.u_objectLight, litArr);
                 bgfx::setTransform(objMtx);
                 bgfx::setVertexBuffer(0, gpuModel.vbh);
                 bgfx::setIndexBuffer(gpuModel.ibh, sm.firstIndex, sm.indexCount);
@@ -1041,6 +1103,16 @@ static void registerConsoleSettings(
         [&state]() { return state.forceFlicker; },
         [&state](bool v) { state.forceFlicker = v; },
         "Override all animated lights to flicker mode");
+
+    dbgConsole.addBool("object_lighting",
+        [&state]() { return state.objectLightingEnabled; },
+        [&state](bool v) {
+            state.objectLightingEnabled = v;
+            // Drop the cache so the next compute() rebuilds visibility from
+            // scratch (in case the toggle is being used to compare results).
+            state.objectIlluminator.clear();
+        },
+        "Per-object illumination from cell light list (off = flat material color)");
 
     // Model isolation: "all" = show everything, then one entry per loaded model name.
     // sortedModelNames is populated during init before this registration runs.
@@ -2383,6 +2455,17 @@ int main(int argc, char *argv[]) {
     // Give the renderer access to the mutable object state map (owned by worldQuery)
     state.objectStates = &worldQuery->objectStates();
 
+    // Bind the per-object illumination subsystem to the loaded WR data,
+    // mission render parameters, and property service. Computation runs
+    // per visible object per frame in the render loop.
+    {
+        Darkness::PropertyServicePtr illumPropSvc = GET_SERVICE(Darkness::PropertyService);
+        state.objectIlluminator.setMissionData(&mission.wrData,
+                                               &mission.renderParams,
+                                               illumPropSvc.get());
+        state.objectIlluminator.setDynamicLights(&state.dynamicLights);
+    }
+
     // Declare DoorSystem early so frob/message systems can reference it.
     // Actual init is deferred until after loadObjectAssets (which populates
     // allPlacements with position/angle data for ALL concrete objects).
@@ -3403,6 +3486,12 @@ int main(int argc, char *argv[]) {
             renderWorld(fc, meshes, gpu, mission, state);
 
             // ── Object meshes ──
+            // Reset the dynamic-light list once per frame before drawing
+            // objects. Gameplay systems (player flashlight / fire arrows /
+            // mage spells / creature glow) are responsible for re-adding
+            // their lights each frame; absent any caller, the list stays
+            // empty and only static-light + ambient illumination apply.
+            state.dynamicLights.reset();
             renderObjects(fc, gpu, mission, state);
 
             // ── Water surfaces ──
