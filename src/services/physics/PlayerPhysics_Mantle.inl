@@ -164,6 +164,9 @@
         mMantleCompressed = false;
         mMantleState = MantleState::None;
         mCurrentMode = mWantsCrouch ? PlayerMode::Crouch : PlayerMode::Stand;
+        // Sync mEndPosition with the restored start position so resolveCollisions
+        // doesn't drag the body back to a stale projected end (see Complete state).
+        mEndPosition = mPosition;
         updateCell();
         resolveCollisions([](const ContactEvent&) {});
         updateCell();
@@ -427,6 +430,12 @@
             mMantleState = MantleState::None;
             mCurrentMode = mWantsCrouch ? PlayerMode::Crouch : PlayerMode::Stand;
             mVelocity = Vector3(0.0f);
+            // Sync mEndPosition: applyMovement was suppressed during mantling so
+            // mEndPosition still holds the pre-mantle value. resolveCollisions's
+            // first line is `mPosition = mEndPosition`, which would teleport us
+            // back to the pre-jump location. The mantle state machine drove
+            // mPosition directly, so the new mPosition IS the intended end pos.
+            mEndPosition = mPosition;
             updateCell();
             resolveCollisions([](const ContactEvent&) {});
             updateCell();
