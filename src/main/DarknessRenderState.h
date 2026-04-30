@@ -102,6 +102,11 @@ struct MissionData {
     // Animated lights
     std::unordered_map<int16_t, LightSource>          lightSources;
     std::unordered_map<int16_t, std::vector<std::pair<uint32_t, int>>> animLightIndex;
+    // Map from animated lightnum to its slot in WRParsedData::staticLights.
+    // Built at load by position-matching LightSource.pos against
+    // staticLights[i].loc. Lets the per-frame anim update modulate the
+    // per-object lighting path (so torches blinking off dim nearby objects).
+    std::unordered_map<int16_t, int32_t>              animLightToStaticIdx;
 
     // Objects
     ObjectPropData                                    objData;

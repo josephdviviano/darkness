@@ -88,10 +88,12 @@ TEST_CASE("ObjectIlluminator: 1/r distance falloff for omni light",
     ill.setMissionData(&wr, &rp, nullptr);
 
     // Object at origin: distance to light = 10 → contribution = bright/10.
+    // The blue channel pre-clamp would be 12/10 = 1.2 — output is clamped
+    // at 1.0 per channel (matches the engine's CLUT clamp at 0.99).
     Vector3 r = ill.compute(/*objId=*/1, Vector3(0.0f), /*radius=*/0.0f, /*cell=*/0);
     CHECK_THAT(r.x, WithinAbs(0.4f, 1e-4f));
     CHECK_THAT(r.y, WithinAbs(0.8f, 1e-4f));
-    CHECK_THAT(r.z, WithinAbs(1.2f, 1e-4f));
+    CHECK_THAT(r.z, WithinAbs(1.0f, 1e-4f));  // clamped from 1.2
 }
 
 // ── Spotlight cone ─────────────────────────────────────────────────────────
@@ -230,6 +232,66 @@ TEST_CASE("ObjectIlluminator: ambient passes through with no lights",
     CHECK_THAT(r.x, WithinAbs(0.1f, 1e-4f));
     CHECK_THAT(r.y, WithinAbs(0.2f, 1e-4f));
     CHECK_THAT(r.z, WithinAbs(0.3f, 1e-4f));
+}
+
+// ── Animated-light multiplier ──────────────────────────────────────────────
+
+TEST_CASE("ObjectIlluminator: setLightMultiplier scales static contribution",
+          "[lighting]") {
+    WRParsedData wr = makeOpenWorld(2);
+    wr.staticLights[0] = WRStaticLight{};
+    wr.staticLights[0].inner = -1.0f;
+    // Slot 1: omni light at +X = 10, brightness (1, 1, 1).
+    wr.staticLights[1] = WRStaticLight{
+        Vector3(10.0f, 0.0f, 0.0f), Vector3(0.0f), Vector3(1.0f, 1.0f, 1.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+
+    RenderParams rp = makeQuietRenderParams();
+    ObjectIlluminator ill;
+    ill.setMissionData(&wr, &rp, nullptr);
+
+    // Default multiplier 1.0 → contribution = 1/10 = 0.1.
+    Vector3 full = ill.compute(1, Vector3(0.0f), 0.0f, 0);
+    CHECK_THAT(full.x, WithinAbs(0.1f, 1e-4f));
+
+    // Multiplier 0.5 → contribution = 0.05.
+    ill.setLightMultiplier(1, 0.5f);
+    Vector3 half = ill.compute(2, Vector3(0.0f), 0.0f, 0);
+    CHECK_THAT(half.x, WithinAbs(0.05f, 1e-4f));
+
+    // Multiplier 0 → contribution skipped entirely (light is "off").
+    ill.setLightMultiplier(1, 0.0f);
+    Vector3 off = ill.compute(3, Vector3(0.0f), 0.0f, 0);
+    CHECK_THAT(off.x, WithinAbs(0.0f, 1e-4f));
+
+    // resetLightMultipliers brings everyone back to 1.0.
+    ill.resetLightMultipliers();
+    Vector3 again = ill.compute(4, Vector3(0.0f), 0.0f, 0);
+    CHECK_THAT(again.x, WithinAbs(0.1f, 1e-4f));
+}
+
+// ── Output clamping ────────────────────────────────────────────────────────
+
+TEST_CASE("ObjectIlluminator: output clamps to 1.0 per channel",
+          "[lighting]") {
+    WRParsedData wr = makeOpenWorld(2);
+    wr.staticLights[0] = WRStaticLight{};
+    wr.staticLights[0].inner = -1.0f;
+    // Slot 1: very bright light at distance 1 → contribution = 50 per ch.
+    wr.staticLights[1] = WRStaticLight{
+        Vector3(1.0f, 0.0f, 0.0f), Vector3(0.0f), Vector3(50.0f, 50.0f, 50.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+
+    RenderParams rp = makeQuietRenderParams();
+    ObjectIlluminator ill;
+    ill.setMissionData(&wr, &rp, nullptr);
+
+    Vector3 r = ill.compute(1, Vector3(0.0f), 0.0f, 0);
+    CHECK_THAT(r.x, WithinAbs(1.0f, 1e-4f));
+    CHECK_THAT(r.y, WithinAbs(1.0f, 1e-4f));
+    CHECK_THAT(r.z, WithinAbs(1.0f, 1e-4f));
 }
 
 // ── Empty cell light list ──────────────────────────────────────────────────
