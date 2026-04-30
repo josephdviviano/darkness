@@ -1711,8 +1711,6 @@ static void updateLightmaps(
     bool debugTint = false, bool forceFlicker = false,
     bool scriptLightDirty = false)
 {
-    if (!meshes.lightmappedMode || gpu.lmAtlasSet.atlases.empty()) return;
-
     // Track debug mode transitions so we can force a full re-blend
     static bool prevDebugTint = false;
     bool debugChanged = (debugTint != prevDebugTint);
@@ -1781,6 +1779,13 @@ static void updateLightmaps(
         if (it == currentIntensities.end()) continue;
         objectIlluminator.setLightMultiplier(idx, it->second);
     }
+
+    // Atlas blend only runs when lightmapped rendering is active and the
+    // GPU atlas is ready. Per-object lighting (above) is independent and
+    // must update every frame regardless — gating it on the atlas would
+    // freeze object illumination at the moment the user e.g. flips a
+    // light switch in a non-lightmapped configuration.
+    if (!meshes.lightmappedMode || gpu.lmAtlasSet.atlases.empty()) return;
 
     // Force full re-blend when debug mode toggles
     bool forceAll = debugChanged;
