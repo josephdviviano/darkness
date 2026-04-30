@@ -313,11 +313,11 @@ static bool loadMissionData(const char *misPath,
     {
         const auto &sl = mission.wrData.staticLights;
         int matched = 0;
-        // Position match within 1.5 world units. Empirically the static-table
-        // entry for an animated light tends to sit ~1u above the AnimLight's
-        // position+offset (a bake-time vertical bias). Take the nearest
-        // static light within range as the unique match.
+        // Position match within a generous radius. Empirically the static-
+        // table entry for an animated light tends to sit ~1u away from the
+        // AnimLight's (P$Position + offset) — a bake-time bias.
         constexpr float kPosMatchEps = 4.0f;
+        int loggedMatches = 0;
         for (auto &[lightNum, ls] : mission.lightSources) {
             Darkness::Vector3 lp(ls.posX, ls.posY, ls.posZ);
             int32_t bestIdx = -1;
@@ -334,6 +334,24 @@ static bool loadMissionData(const char *misPath,
             if (bestIdx >= 0) {
                 mission.animLightToStaticIdx[lightNum] = bestIdx;
                 ++matched;
+                if (loggedMatches < 8) {
+                    int refsCells = 0;
+                    for (const auto &c : mission.wrData.cells) {
+                        if (c.lightIndices.empty()) continue;
+                        int n = c.lightIndices[0];
+                        for (int k = 1; k <= n && k < (int)c.lightIndices.size(); ++k)
+                            if (c.lightIndices[k] == bestIdx) { ++refsCells; break; }
+                    }
+                    std::fprintf(stderr,
+                        "  match: lightnum=%d -> static#%d dist=%.2f "
+                        "obj=%d refsCells=%d static_bright=(%.2f,%.2f,%.2f) "
+                        "anim_min=%.2f anim_max=%.2f mode=%d\n",
+                        lightNum, bestIdx, std::sqrt(bestDist2),
+                        ls.objectId, refsCells,
+                        sl[bestIdx].bright.x, sl[bestIdx].bright.y, sl[bestIdx].bright.z,
+                        ls.minBright, ls.maxBright, ls.mode);
+                    ++loggedMatches;
+                }
             }
         }
         std::fprintf(stderr,
