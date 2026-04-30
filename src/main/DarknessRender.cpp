@@ -857,14 +857,24 @@ static void renderObjects(
             for (const auto &sm : gpuModel.subMeshes) {
                 if (sm.indexCount == 0) continue;
 
+                // Held objects render at half opacity so the carrier can see
+                // the world behind whatever they're carrying. Routes through
+                // the existing translucent pass via the renderAlpha check
+                // below — no separate render path needed.
+                float effectiveRenderAlpha = obj.renderAlpha;
+                if (state.grabSystem &&
+                    state.grabSystem->isGrabbing(obj.objID)) {
+                    effectiveRenderAlpha *= 0.5f;
+                }
+
                 // Determine if this submesh is translucent:
                 // either the material has translucency or the object has RenderAlpha
-                bool isTranslucent = (sm.matTrans > 0.0f) || (obj.renderAlpha < 1.0f);
+                bool isTranslucent = (sm.matTrans > 0.0f) || (effectiveRenderAlpha < 1.0f);
                 if (opaquePass == isTranslucent) continue;  // wrong pass
 
                 // Compute final alpha: (1 - matTrans) * renderAlpha
                 // matTrans convention: 0=opaque, 0.3=30% transparent glass
-                float finalAlpha = (1.0f - sm.matTrans) * obj.renderAlpha;
+                float finalAlpha = (1.0f - sm.matTrans) * effectiveRenderAlpha;
                 // Frob highlight: additive brightness for the targeted object
                 float highlight = (obj.objID == state.frobHighlightObjID)
                     ? state.frobHighlightLevel : 0.0f;
@@ -2832,10 +2842,18 @@ int main(int argc, char *argv[]) {
             for (int32_t objID : objectPushSystem.getPushableObjects()) {
                 float mass = objectPushSystem.getMass(objID);
                 float friction = objectPushSystem.getFriction(objID);
+                (void)friction;  // retained for future tuning / informational lookups
+                // P$PhysAttr.friction was a kinematic decel coefficient in the
+                // original engine, not a Coulomb µ. Pass a reduced value into ODE
+                // so the slide is visible while still settling within ~1-2 s.
+                // At g=32 this gives ~1.6 u/s² Coulomb deceleration on flat
+                // ground, comparable to the original engine's effective slide
+                // friction.
+                constexpr float kODEPushFriction = 0.20f;
                 // Elasticity: low for crates/barrels (0.05), matching original engine's
                 // 0.02 bounce dampening. Slightly higher than zero so objects don't
                 // feel perfectly dead on impact.
-                if (state.physics->makeDynamic(objID, mass, friction, 0.05f))
+                if (state.physics->makeDynamic(objID, mass, kODEPushFriction, 0.05f))
                     ++activated;
             }
             std::fprintf(stderr, "[ODE] Activated %d/%zu pushable objects as dynamic bodies\n",
