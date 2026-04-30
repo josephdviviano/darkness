@@ -88,6 +88,11 @@ public:
         mRp = rp;
         mPropSvc = propSvc;
         mCache.clear();
+        // Per-light brightness multiplier — defaults to 1.0 (full intensity
+        // per the disk-loaded static value). Animated lights (P$AnimLight)
+        // drive these per-frame so torches blinking on/off are reflected on
+        // nearby objects. See setLightMultiplier() / resetLightMultipliers().
+        mLightMultiplier.assign(wr ? wr->staticLights.size() : 0, 1.0f);
     }
 
     // Bind the per-frame dynamic light list. Caller (the render loop) is
@@ -95,6 +100,20 @@ public:
     // (player flashlight, fire arrows, mage spells, …) push lights into it
     // before any object is drawn.
     void setDynamicLights(const DynamicLightList *dyn) { mDyn = dyn; }
+
+    // Set the brightness multiplier for one static-light slot. Used by the
+    // animated lighting system to propagate AnimLight intensity changes
+    // (FLICKER mode, brighten/dim transitions, on/off via tweqs) to the
+    // per-object lighting path. Multiplier 0.0 effectively turns the light
+    // off for object lighting; 1.0 = full disk-loaded brightness.
+    void setLightMultiplier(int32_t lightIdx, float multiplier) {
+        if (lightIdx < 0 || lightIdx >= static_cast<int32_t>(mLightMultiplier.size()))
+            return;
+        mLightMultiplier[lightIdx] = multiplier;
+    }
+    void resetLightMultipliers() {
+        std::fill(mLightMultiplier.begin(), mLightMultiplier.end(), 1.0f);
+    }
 
     void clear() { mCache.clear(); }
 
@@ -135,6 +154,7 @@ private:
     const RenderParams     *mRp      = nullptr;
     PropertyService        *mPropSvc = nullptr;
     const DynamicLightList *mDyn     = nullptr;
+    std::vector<float>      mLightMultiplier;  // per static-light brightness scale
 
     // Sun slot patched per-evaluation (`compute()` writes loc/bright before
     // applying the contribution). Held as a mutable member rather than a
@@ -276,6 +296,19 @@ inline Vector3 ObjectIlluminator::compute(int32_t objId,
         }
     }
 
+    // Clamp per channel at 1.0 so stacked bright contributions can't drive
+    // dim textures past their natural color when multiplied in the shader.
+    // This mirrors the original engine's CLUT path which clamps brightness
+    // at 0.99 before indexing the palette table; modern GPUs would clamp at
+    // the framebuffer stage anyway, but doing it here keeps dim textures
+    // from washing out toward white when bright lights sum past 1.0.
+    if (total.x > 1.0f) total.x = 1.0f;
+    if (total.y > 1.0f) total.y = 1.0f;
+    if (total.z > 1.0f) total.z = 1.0f;
+    if (total.x < 0.0f) total.x = 0.0f;
+    if (total.y < 0.0f) total.y = 0.0f;
+    if (total.z < 0.0f) total.z = 0.0f;
+
     return total;
 }
 
@@ -308,12 +341,21 @@ inline void ObjectIlluminator::applyOneLight(int32_t lightIdx,
 
     // Slot 0: take the patched sun copy that compute() wrote earlier.
     const WRStaticLight *L = nullptr;
+    float multiplier = 1.0f;
     if (lightIdx == 0) {
         L = &mSunSlot;
+        // Sun slot: no animated multiplier (sun is constant).
     } else {
         if (lightIdx < 0 || lightIdx >= static_cast<int32_t>(mWr->staticLights.size()))
             return;
         L = &mWr->staticLights[lightIdx];
+        // Per-light brightness scale from the animated-light system: a
+        // flickering torch reduces its multiplier toward zero, dimming any
+        // object close enough to be lit by it. Multiplier of 0 means the
+        // light is fully off → skip work entirely.
+        if (lightIdx < static_cast<int32_t>(mLightMultiplier.size()))
+            multiplier = mLightMultiplier[lightIdx];
+        if (multiplier <= 0.0f) return;
     }
 
     // Radius cutoff (skip lights that are out of range for this point).
@@ -343,17 +385,19 @@ inline void ObjectIlluminator::applyOneLight(int32_t lightIdx,
         if (scale <= 0.0f) return;
     }
 
-    // 1/r distance attenuation, applied per RGB channel.
+    // 1/r distance attenuation, applied per RGB channel. Matches the
+    // engine's CLUT-path attenuation. The animated-light multiplier scales
+    // the entire contribution from this slot.
     Vector3 d = L->loc - pos;
     float mag = glm::length(d);
     if (mag < 1e-6f) {
         // Coincident light and object — clamp to avoid divide-by-zero. The
         // contribution would be huge anyway; cap at brightness to keep the
         // result finite.
-        total += L->bright * scale;
+        total += L->bright * (scale * multiplier);
         return;
     }
-    total += L->bright * (scale / mag);
+    total += L->bright * (scale * multiplier / mag);
 }
 
 } // namespace Darkness

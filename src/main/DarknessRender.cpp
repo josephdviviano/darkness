@@ -1707,6 +1707,7 @@ static void updateMovement(
 static void updateLightmaps(
     float dt, const Darkness::BuiltMeshes &meshes,
     Darkness::MissionData &mission, Darkness::GPUResources &gpu,
+    Darkness::ObjectIlluminator &objectIlluminator,
     bool debugTint = false, bool forceFlicker = false,
     bool scriptLightDirty = false)
 {
@@ -1766,6 +1767,19 @@ static void updateLightmaps(
     // Check if LightScriptService changed any lights (script-driven on/off)
     if (scriptLightDirty) {
         anyLightChanged = true;
+    }
+
+    // Propagate animated intensities to per-object lighting. Each animated
+    // light's static-light-table slot gets a multiplier of (current/max),
+    // so when a torch animation drops to 0 (off via tweq, mid-flicker, dim
+    // phase) any object whose cell.lightIndices references that slot dims
+    // accordingly. Non-animated static lights stay at multiplier 1.0 from
+    // the last reset (in setMissionData / objectIlluminator.clear()).
+    objectIlluminator.resetLightMultipliers();
+    for (const auto &[lightNum, idx] : mission.animLightToStaticIdx) {
+        auto it = currentIntensities.find(lightNum);
+        if (it == currentIntensities.end()) continue;
+        objectIlluminator.setLightMultiplier(idx, it->second);
     }
 
     // Force full re-blend when debug mode toggles
@@ -3472,6 +3486,7 @@ int main(int argc, char *argv[]) {
             bool scriptDirty = lightScriptSvc.dirty;
             if (scriptDirty) lightScriptSvc.dirty = false;
             updateLightmaps(dt, meshes, mission, gpu,
+                            state.objectIlluminator,
                             state.debugAnimLightmaps, state.forceFlicker,
                             scriptDirty);
 
