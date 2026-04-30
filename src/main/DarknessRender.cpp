@@ -1031,14 +1031,19 @@ static void updateTitleBar(SDL_Window *window, const Darkness::RuntimeState &sta
             state.physics->getPlayerCell(), state.physics->getPhysicsHz());
     }
 
+    int dimmedLights = state.objectIlluminator.dimmedLightCount();
+    char dimSuffix[32] = "";
+    if (dimmedLights > 0)
+        std::snprintf(dimSuffix, sizeof(dimSuffix), " [dim:%d]", dimmedLights);
+
     if (state.portalCulling) {
         std::snprintf(title, sizeof(title),
-            "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s] [lm:%s] [%s]%s%s",
-            state.modeStr, state.moveSpeed, state.cullVisibleCells, state.cullTotalCells, filterStr, lmStr, moveStr, isoSuffix, physSuffix);
+            "darkness — %s [speed: %.1f] [cull: %u/%u cells] [%s] [lm:%s] [%s]%s%s%s",
+            state.modeStr, state.moveSpeed, state.cullVisibleCells, state.cullTotalCells, filterStr, lmStr, moveStr, isoSuffix, physSuffix, dimSuffix);
     } else {
         std::snprintf(title, sizeof(title),
-            "darkness — %s [speed: %.1f] [cull: OFF] [%s] [lm:%s] [%s]%s%s",
-            state.modeStr, state.moveSpeed, filterStr, lmStr, moveStr, isoSuffix, physSuffix);
+            "darkness — %s [speed: %.1f] [cull: OFF] [%s] [lm:%s] [%s]%s%s%s",
+            state.modeStr, state.moveSpeed, filterStr, lmStr, moveStr, isoSuffix, physSuffix, dimSuffix);
     }
     SDL_SetWindowTitle(window, title);
 }

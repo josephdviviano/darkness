@@ -115,6 +115,17 @@ public:
         std::fill(mLightMultiplier.begin(), mLightMultiplier.end(), 1.0f);
     }
 
+    // Count of static-light slots currently driven below ~99% intensity (off
+    // or mid-fade). Flips up when a switch turns torches off so we can
+    // confirm the chain at runtime. Watching this count change after a frob
+    // verifies that animated-light state is reaching the per-object path.
+    int dimmedLightCount() const {
+        int n = 0;
+        for (float m : mLightMultiplier)
+            if (m < 0.99f) ++n;
+        return n;
+    }
+
     void clear() { mCache.clear(); }
 
     // Drop the cache entry for one object; safe to call even if the object
