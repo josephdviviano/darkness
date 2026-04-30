@@ -949,29 +949,6 @@ public:
             }
         }
 
-        // Debug: log broadphase candidate count periodically
-        static int dbgBroadphaseFrame = 0;
-        if (++dbgBroadphaseFrame % 300 == 0 && !mCandidates.empty()) {
-            std::fprintf(stderr, "[OBJ-COLL] broadphase: cell=%d candidates=%zu "
-                         "playerPos=(%.1f,%.1f,%.1f)\n",
-                         playerCell, mCandidates.size(),
-                         sphereCenters[1].x, sphereCenters[1].y, sphereCenters[1].z);
-            // Log nearest 3 candidates with distance
-            for (size_t ci = 0; ci < std::min(mCandidates.size(), (size_t)5); ++ci) {
-                const auto &b = mBodies[mCandidates[ci]];
-                float dx = b.worldPos.x - sphereCenters[1].x;
-                float dy = b.worldPos.y - sphereCenters[1].y;
-                float dz = b.worldPos.z - sphereCenters[1].z;
-                const char *shapeNames[] = {"OBB","Sphere","SphHat","None"};
-                std::fprintf(stderr, "  candidate[%zu]: obj=%d %s pos=(%.1f,%.1f,%.1f) "
-                             "obb=(%.1f,%.1f,%.1f) sphR=%.1f dist=%.1f\n",
-                             ci, b.objID, shapeNames[(int)b.shapeType],
-                             b.worldPos.x, b.worldPos.y, b.worldPos.z,
-                             b.edgeLengths.x, b.edgeLengths.y, b.edgeLengths.z,
-                             b.sphereRadius, std::sqrt(dx*dx+dy*dy+dz*dz));
-            }
-        }
-
         // ── Narrowphase: test each sphere against each candidate ──
         for (size_t ci = 0; ci < mCandidates.size(); ++ci) {
             size_t bi = mCandidates[ci];

@@ -147,14 +147,6 @@ public:
                     // while stacked objects remain sleeping. (Inspired by Godot's
                     // wakeup_neighbours pattern.)
                     wakeContactNeighbours(bodyIt->second);
-
-                    static int pushDbg = 0;
-                    if (pushDbg++ < 30)
-                        std::fprintf(stderr, "[ODE-PUSH] obj %d: vDotN=%.2f elastic=%.2f "
-                                     "force=(%.1f,%.1f,%.1f) mass=%.1f reaction=%.3f\n",
-                                     c.objectId, vDotN, elastic,
-                                     force.x, force.y, force.z, objMass,
-                                     glm::length(playerReaction));
                 }
             }
             // Non-ODE pushable objects still handled by kinematic system

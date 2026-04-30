@@ -817,16 +817,6 @@ static void renderObjects(
             if (objState->hasMatrix) {
                 // Use pre-built matrix directly — avoids lossy Euler extraction
                 std::memcpy(objMtx, objState->modelMatrix, sizeof(objMtx));
-                // Diagnostic: log when a pushed object renders via ObjectState hasMatrix path
-                {
-                    static std::unordered_set<int32_t> loggedObjs;
-                    if (loggedObjs.find(obj.objID) == loggedObjs.end() && loggedObjs.size() < 20) {
-                        loggedObjs.insert(obj.objID);
-                        std::fprintf(stderr, "[RENDER-STATE] obj %d hasMatrix path: pos=(%.2f,%.2f,%.2f) mtx[12..14]=(%.2f,%.2f,%.2f) flags=0x%x\n",
-                                     obj.objID, objState->position.x, objState->position.y, objState->position.z,
-                                     objMtx[12], objMtx[13], objMtx[14], objState->flags);
-                    }
-                }
             } else {
                 // Build matrix from runtime state angles (already in radians)
                 const float negH = -objState->heading;
@@ -1572,25 +1562,6 @@ static void updateMovement(
 
         // Read back eye position and lean tilt from physics into camera
         Darkness::Vector3 eye = state.physics->getPlayerEyePosition();
-
-        // DEBUG: detect large per-frame eye position jumps (visible teleportation)
-        {
-            float dx = eye.x - state.cam.pos[0];
-            float dy = eye.y - state.cam.pos[1];
-            float dz = eye.z - state.cam.pos[2];
-            float eyeJump = std::sqrt(dx*dx + dy*dy + dz*dz);
-            if (eyeJump > 2.0f && state.cam.pos[0] != 0.0f) { // skip first frame
-                fprintf(stderr, "[EYE-JUMP] dt=%.4f  dist=%.2f  eye=(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)  "
-                    "cell=%d  body=(%.1f,%.1f,%.1f)\n",
-                    dt, eyeJump,
-                    state.cam.pos[0], state.cam.pos[1], state.cam.pos[2],
-                    eye.x, eye.y, eye.z,
-                    state.physics->getPlayerCell(),
-                    state.physics->getPlayerPosition().x,
-                    state.physics->getPlayerPosition().y,
-                    state.physics->getPlayerPosition().z);
-            }
-        }
 
         state.cam.pos[0] = eye.x;
         state.cam.pos[1] = eye.y;

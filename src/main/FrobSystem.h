@@ -233,12 +233,6 @@ public:
         // test from the crosshair direction. This also covers doors (which are
         // brush geometry without OBB collision bodies).
         if (!mFrobCache.empty()) {
-            // Debug: log closest object stats every N frames
-            mDbgFrame++;
-            float dbgClosestDist = 999.0f;
-            int dbgInRange = 0;
-            int dbgInCone = 0;
-
             for (const auto &entry : mFrobCache) {
                 // Prefer the live runtime position if the StateMap has one;
                 // fall back to the load-time placement for objects that
@@ -253,19 +247,14 @@ public:
                 Vector3 toObj = objPos - rayStart;
                 float dist = glm::length(toObj);
 
-                if (dist < dbgClosestDist)
-                    dbgClosestDist = dist;
-
                 if (dist > mFrobDistance || dist < 0.1f)
                     continue;
-                dbgInRange++;
 
                 // Cone test: object must be roughly in front of the camera
                 // (within ~30 degrees of look direction for crosshair targeting)
                 float dotFwd = glm::dot(glm::normalize(toObj), forward);
                 if (dotFwd < 0.85f)  // ~30 degrees
                     continue;
-                dbgInCone++;
 
                 // Parametric distance along ray
                 float t = dist / mFrobDistance;
@@ -283,15 +272,6 @@ public:
                     if (mTarget.name.empty())
                         mTarget.name = "obj " + std::to_string(entry.objID);
                 }
-            }
-
-            if (mDbgFrame % 120 == 0) {
-                std::fprintf(stderr, "[FrobDbg] pos=(%.1f,%.1f,%.1f) fwd=(%.2f,%.2f,%.2f) "
-                             "frobDist=%.1f closestObj=%.1f inRange=%d inCone=%d target=%d\n",
-                             rayStart.x, rayStart.y, rayStart.z,
-                             forward.x, forward.y, forward.z,
-                             mFrobDistance, dbgClosestDist,
-                             dbgInRange, dbgInCone, mTarget.objID);
             }
         }
     }
@@ -369,7 +349,6 @@ private:
     const ObjectStateMap *mStates = nullptr;
     FrobTarget mTarget;
     float mFrobDistance = kDefaultFrobDistance;
-    int mDbgFrame = 0;  // debug frame counter for periodic logging
 
     // Pre-built cache of frobbable objects (includes doors)
     struct FrobCacheEntry {
