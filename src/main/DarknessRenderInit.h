@@ -305,6 +305,42 @@ static bool loadMissionData(const char *misPath,
     // feed into per-object lighting via ObjectIlluminator.
     mission.renderParams = Darkness::parseRenderParamsChunk(misPath);
 
+    // Build the animated-lightnum → static-light-index map by position
+    // matching. Animated lights are baked into the static light table at
+    // their max brightness; the runtime modulates that brightness via a
+    // multiplier so per-object lighting tracks AnimLight intensity (torch
+    // flicker, on/off via tweqs) the same way the world lightmap atlas does.
+    {
+        const auto &sl = mission.wrData.staticLights;
+        int matched = 0;
+        // Position match within 1.5 world units. Empirically the static-table
+        // entry for an animated light tends to sit ~1u above the AnimLight's
+        // position+offset (a bake-time vertical bias). Take the nearest
+        // static light within range as the unique match.
+        constexpr float kPosMatchEps = 4.0f;
+        for (auto &[lightNum, ls] : mission.lightSources) {
+            Darkness::Vector3 lp(ls.posX, ls.posY, ls.posZ);
+            int32_t bestIdx = -1;
+            float bestDist2 = kPosMatchEps * kPosMatchEps;
+            // Start at index 1 (slot 0 is the sun, never an animated light).
+            for (size_t i = 1; i < sl.size(); ++i) {
+                Darkness::Vector3 d = sl[i].loc - lp;
+                float d2 = glm::dot(d, d);
+                if (d2 < bestDist2) {
+                    bestDist2 = d2;
+                    bestIdx = static_cast<int32_t>(i);
+                }
+            }
+            if (bestIdx >= 0) {
+                mission.animLightToStaticIdx[lightNum] = bestIdx;
+                ++matched;
+            }
+        }
+        std::fprintf(stderr,
+            "  AnimLight->StaticLight matches: %d / %zu (within %.2fu)\n",
+            matched, mission.lightSources.size(), kPosMatchEps);
+    }
+
     // Parse water flow data — FLOW_TEX (texture mapping) and CELL_MOTION (animation state)
     mission.flowData = parseFlowData(misPath);
 
