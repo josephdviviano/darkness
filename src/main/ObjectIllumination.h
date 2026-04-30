@@ -366,6 +366,20 @@ inline void ObjectIlluminator::applyOneLight(int32_t lightIdx,
         // light is fully off → skip work entirely.
         if (lightIdx < static_cast<int32_t>(mLightMultiplier.size()))
             multiplier = mLightMultiplier[lightIdx];
+        // Diagnostic: log when a dimmed-light slot is actually being read by
+        // applyOneLight. If this never fires while [dim:N] is non-zero, the
+        // shadow cache is hiding the slot from compute() (cell.lightIndices
+        // doesn't reference it) — distinguishes "multiplier wasn't reaching
+        // applyOneLight" from "applyOneLight ran but contribution was small".
+        if (multiplier < 0.99f) {
+            static int sLogged = 0;
+            if (sLogged++ < 20)
+                std::fprintf(stderr,
+                    "[OBJ-LIGHT] applyOneLight slot=%d mult=%.2f "
+                    "bright=(%.2f,%.2f,%.2f)\n",
+                    lightIdx, multiplier,
+                    L->bright.x, L->bright.y, L->bright.z);
+        }
         if (multiplier <= 0.0f) return;
     }
 
