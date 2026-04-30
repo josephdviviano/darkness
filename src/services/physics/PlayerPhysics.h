@@ -657,62 +657,12 @@ private:
         // When friction is between 0.5 and 1.0, jump velocity is scaled down
         // proportionally, making slope-edge jumps weaker.
         if (mJumpRequested && !mMotionDisabled) {
-            // Diagnostic: classify what happens to every jump press. The narrow
-            // jump branch below silently drops requests that don't match any
-            // mode arm (e.g. PlayerMode::Jump because the player flickered to
-            // airborne for one tick), so the user-visible "jump didn't work"
-            // case leaves no trace without this. Print BEFORE the branch so
-            // every press is counted; the per-arm code may add detail.
-            {
-                const char *modeStr = "?";
-                switch (mCurrentMode) {
-                    case PlayerMode::Stand:     modeStr = "Stand"; break;
-                    case PlayerMode::Crouch:    modeStr = "Crouch"; break;
-                    case PlayerMode::BodyCarry: modeStr = "BodyCarry"; break;
-                    case PlayerMode::Slide:     modeStr = "Slide"; break;
-                    case PlayerMode::Jump:      modeStr = "Jump"; break;
-                    case PlayerMode::Swim:      modeStr = "Swim"; break;
-                    case PlayerMode::Climb:     modeStr = "Climb"; break;
-                    case PlayerMode::Dead:      modeStr = "Dead"; break;
-                }
-                int upCt = 0;
-                for (const auto &c : mContacts)
-                    if (c.normal.z > 0.0f) ++upCt;
-                std::fprintf(stderr,
-                    "[JUMP-PRESS] mode=%s onGround=%d groundObj=%d "
-                    "contacts=%zu upContacts=%d posZ=%.3f velZ=%.3f\n",
-                    modeStr, isOnGround() ? 1 : 0, mGroundObjID,
-                    mContacts.size(), upCt, mPosition.z, mVelocity.z);
-            }
-
             if (mCurrentMode == PlayerMode::Climb) {
                 // Jump off climbing surface — reflected/projected impulse away from wall
                 breakClimb(true);
                 // Don't clear mJumpRequested yet — mantle check at step 13 may use it
             } else if (isOnGround()) {
                 float jumpFriction = computeGroundFriction();
-
-                // Diagnostic: when jumping off a non-terrain surface (e.g. a
-                // crate), dump per-contact friction breakdown so we can see
-                // why the jump feels lower than off solid floor. Compare with
-                // a regular floor jump in the same log to spot the delta.
-                if (mGroundObjID >= 0) {
-                    int upContacts = 0;
-                    float maxNZ = 0.0f, minNZ = 1.0f;
-                    for (const auto &c : mContacts) {
-                        if (c.normal.z <= 0.0f) continue;
-                        ++upContacts;
-                        if (c.normal.z > maxNZ) maxNZ = c.normal.z;
-                        if (c.normal.z < minNZ) minNZ = c.normal.z;
-                    }
-                    std::fprintf(stderr,
-                        "[JUMP-DIAG] from obj=%d friction=%.3f upContacts=%d "
-                        "normalZ=[%.3f..%.3f] threshold=%.3f scale=%.3f%s\n",
-                        mGroundObjID, jumpFriction, upContacts, minNZ, maxNZ,
-                        JUMP_MIN_FRICTION,
-                        (jumpFriction <= 1.0f) ? jumpFriction : 1.0f,
-                        (jumpFriction <= JUMP_MIN_FRICTION) ? " REJECTED" : "");
-                }
 
                 if (jumpFriction > JUMP_MIN_FRICTION) {
                     // Remove vertical velocity component, boost horizontal by 5%,
