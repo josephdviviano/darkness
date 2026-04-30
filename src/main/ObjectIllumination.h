@@ -51,6 +51,7 @@
 #include <cmath>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Darkness {
@@ -366,14 +367,12 @@ inline void ObjectIlluminator::applyOneLight(int32_t lightIdx,
         // light is fully off → skip work entirely.
         if (lightIdx < static_cast<int32_t>(mLightMultiplier.size()))
             multiplier = mLightMultiplier[lightIdx];
-        // Diagnostic: log when a dimmed-light slot is actually being read by
-        // applyOneLight. If this never fires while [dim:N] is non-zero, the
-        // shadow cache is hiding the slot from compute() (cell.lightIndices
-        // doesn't reference it) — distinguishes "multiplier wasn't reaching
-        // applyOneLight" from "applyOneLight ran but contribution was small".
+        // Diagnostic: log the first time each slot is read with a dimmed
+        // multiplier. Per-slot dedup so a permanently-off slot (e.g. one
+        // baked at zero brightness) doesn't drown out real toggle events.
         if (multiplier < 0.99f) {
-            static int sLogged = 0;
-            if (sLogged++ < 20)
+            static std::unordered_set<int32_t> sSeen;
+            if (sSeen.insert(lightIdx).second)
                 std::fprintf(stderr,
                     "[OBJ-LIGHT] applyOneLight slot=%d mult=%.2f "
                     "bright=(%.2f,%.2f,%.2f)\n",
