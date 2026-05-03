@@ -306,10 +306,13 @@ static bool loadMissionData(const char *misPath,
     mission.renderParams = Darkness::parseRenderParamsChunk(misPath);
 
     // Build the animated-lightnum → static-light-index map by position
-    // matching. Animated lights are baked into the static light table at
-    // their max brightness; the runtime modulates that brightness via a
-    // multiplier so per-object lighting tracks AnimLight intensity (torch
-    // flicker, on/off via tweqs) the same way the world lightmap atlas does.
+    // matching. Then synthesize each animated light's effective max
+    // brightness from anim_max + P$LightColor (hue/sat) and overwrite
+    // the static table's bright field. This is necessary because some
+    // animated lights are baked at min-brightness mode (so their disk
+    // bright is zero); without overwriting, the multiplier mechanism
+    // would scale "zero × multiplier = zero" and the user's switches
+    // would never visibly affect those torches.
     {
         const auto &sl = mission.wrData.staticLights;
         int matched = 0;

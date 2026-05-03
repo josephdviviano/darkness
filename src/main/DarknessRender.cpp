@@ -2484,6 +2484,40 @@ int main(int argc, char *argv[]) {
     // per visible object per frame in the render loop.
     {
         Darkness::PropertyServicePtr illumPropSvc = GET_SERVICE(Darkness::PropertyService);
+
+        // Synthesize the static-light-table bright field for animated
+        // lights from anim_max + P$LightColor. Some torches were baked
+        // in ANIM_MIN_BRIGHT mode at zero brightness, so their disk slot
+        // has bright=(0,0,0) — without this overwrite the multiplier
+        // mechanism scales nothing and switches don't visibly affect
+        // those torches. Using anim_max as the base gives the multiplier
+        // a meaningful 0..1 range to modulate against.
+        constexpr float kBakeLightScale = 32.0f;
+        int patched = 0;
+        for (const auto &[lightNum, idx] : mission.animLightToStaticIdx) {
+            auto lsIt = mission.lightSources.find(lightNum);
+            if (lsIt == mission.lightSources.end()) continue;
+            const auto &ls = lsIt->second;
+            if (ls.maxBright <= 0.0f) continue;
+
+            float hue = 0.0f, sat = 0.0f;  // default white
+            Darkness::PropLightColor col{};
+            if (ls.objectId != 0 &&
+                Darkness::getTypedProperty<Darkness::PropLightColor>(
+                    illumPropSvc.get(), "LightColo", ls.objectId, col)) {
+                hue = col.hue;
+                sat = col.saturation;
+            }
+            Darkness::Vector3 colorRgb = Darkness::hsbToRgb(hue, sat);
+            Darkness::Vector3 effective =
+                colorRgb * (ls.maxBright / kBakeLightScale);
+
+            mission.wrData.staticLights[idx].bright = effective;
+            ++patched;
+        }
+        std::fprintf(stderr,
+            "  Synthesized bright for %d animated light slots\n", patched);
+
         state.objectIlluminator.setMissionData(&mission.wrData,
                                                &mission.renderParams,
                                                illumPropSvc.get());
