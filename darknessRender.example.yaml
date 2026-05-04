@@ -81,86 +81,97 @@ developer:
 
 
 audio:
-  # Reflection convolution rate divisor (1, 2, or 4).
-  # 1 = full rate (48kHz), 2 = half rate (24kHz), 4 = quarter rate (12kHz).
-  # Higher divisors reduce per-voice cost. Reverb is perceptually transparent
-  # at quarter rate (6kHz bandwidth captures all reverb character).
-  reflection_rate_divisor: 2
+  # Audio is organized into eight subsections. Skip any subsection to use
+  # defaults; each setting is independent. Bracketed numbers are valid ranges.
 
-  # Number of parallel convolution worker threads (0 = auto).
-  # Auto selects hardware_concurrency - 3. More workers = more voices.
-  convolution_workers: 0
+  performance:
+    # Engine + ray-trace throughput. Touch these to trade CPU for fidelity.
+    sample_rate: 48000           # device sample rate (22050|32000|44100|48000|96000)
+    frame_size: 1024             # audio engine block size (256–4096)
+    sound_cache_mb: 64           # decoded-audio LRU cache budget (4–1024 MB)
+    rate_divisor: 2              # reflection pipeline rate (1=48k, 2=24k, 4=12k)
+    convolution_workers: 0       # parallel convolution threads (0 = auto: hwconc-3)
+    simulator_threads: 0         # ray-tracing sim threads (0 = auto: hwconc-2)
+    max_active_voices: 64        # hard cap on simultaneous voices (8–256)
+    max_reflection_voices: 16    # voices with per-source convolution (1–64)
+    reflection_throttle: 4       # run reflection sim every Nth frame (1–32)
+    sim_max_occlusion_samples: 32  # Steam Audio per-source occlusion cap (4–256)
+    sim_max_rays: 4096           # Steam Audio per-step ray cap (must be >= reflections.rays)
+    sim_max_sources: 32          # Steam Audio source pool size (4–256)
+    scene_type: default          # IPL scene backend ("default" or "embree")
 
-  # Maximum voices with per-source reflection convolution (1-64).
-  # With multiple workers, higher values are feasible.
-  max_reflection_voices: 16
+  reflections:
+    # Convolution-reverb feel. Drives perceived room size & detail.
+    enabled: true                # master toggle (R key in console)
+    rays: 4096                   # rays per reflection sim step (128–8192)
+    bounces: 4                   # bounces per ray (1–8). More = wraps further around corners.
+    duration: 2.0                # max reverb tail in seconds (0.5–4.0)
+    ambisonics_order: 0          # 0=omnidirectional (1ch, cheap), 1=directional (4ch)
 
-  # Ambisonics order for reflection reverb (0 or 1).
-  # 0 = omnidirectional (cheap), 1 = directional (4x cost, more spatial)
-  ambisonics_order: 0
+  occlusion:
+    # Source occlusion + global material multipliers.
+    # `radius` is in engine feet, converted to meters at the Steam Audio
+    # boundary. Rough sizing guide:
+    #   2  ≈ point source / candle
+    #   5  ≈ lamp / small source            <- default
+    #   10 ≈ small machine / chest
+    #   16 ≈ large machinery (door floor)
+    #   25+≈ ambient drone / industrial vent
+    # Door/local-sound voices automatically raise this floor to 16 ft so
+    # narrow doorways don't over-occlude — see AudioService.cpp.
+    radius: 5.0                  # volumetric source sphere (feet, 0.3–30)
+    samples: 16                  # rays per source for occlusion gradient (4–64)
+    transmission_scale: 1.0      # material transmission multiplier (0.1–100; 10=game-friendly)
+    absorption_scale: 1.0        # material absorption multiplier (0.01–10; <1 = more reflective)
+    diffuse_samples: 64          # realtime scattering samples per bounce (16–256)
+    bake_diffuse_samples: 128    # probe-bake scattering samples (32–512; requires re-bake)
 
-  # Rays per reflection simulation step (background thread, 128-8192)
-  reflection_rays: 4096
+  propagation:
+    # Portal-graph + door blocking for AI hearing and through-wall sounds.
+    portal_routing: true         # route sound through portal graph (doorways)
+    probe_pathing: true          # baked probe diffraction (when probes loaded)
+    max_distance: 200.0          # max propagation distance (world units, 10–5000)
+    door_lpf_open_hz: 20000      # LPF cutoff for fully open door (Hz, 1k–24k)
+    door_lpf_blocked_hz: 800     # LPF cutoff for fully blocked door (Hz, 100–10k)
+    min_attenuation: 0.001       # propagation floor (0–0.1; prevents FP-noise dropouts)
 
-  # Bounces per ray (1-8). More bounces = sound reaches further around corners.
-  reflection_bounces: 4
+  spatialization:
+    # Listener-side HRTF + distance attenuation curve.
+    hrtf_volume: 1.0             # HRTF output gain (0–4)
+    hrtf_interpolation: bilinear # "nearest" or "bilinear" (HRTF dataset interpolation)
+    spatial_blend: 1.0           # 0=mono center, 1=full HRTF spatialization
+    distance_model: default      # "default" or "inverse_distance"
 
-  # Max reverb tail in seconds (0.5-4.0)
-  reflection_duration: 2.0
+  ambient:
+    # P$AmbientHack-driven looping sounds (mission ambients).
+    hysteresis_start_mul: 1.5    # multiplier on radius for activation (1–5)
+    hysteresis_stop_mul: 2.0     # multiplier on radius for deactivation (1–5; > start)
+    falloff_curve: quadratic     # "linear" or "quadratic" (when AMB_NO_FADE is unset)
+    default_priority: 64         # priority for ambients without explicit value (0–255)
 
-  # Run reflection simulation every Nth frame (1-32)
-  reflection_throttle: 4
+  mixer:
+    # Global gains.
+    master_gain: 1.0             # global output multiplier (0–4)
+    reflection_gain: 1.0         # reverb wet bus multiplier (0–4)
+    reflection_ramp_ms: 10.0     # fade-in time on first reflection activation (1–1000 ms)
 
-  # Volumetric occlusion source sphere radius in world units (0.1-10).
-  # Larger = smoother transitions around corners (1.5 = lamp, 3.0 = machinery).
-  occlusion_radius: 1.5
+  dsp:
+    # Master bus DSP chain. Processing order: Low-shelf EQ → Compressor → Limiter
+    limiter_enabled: true              # soft tanh limiter (prevents digital clipping)
+    limiter_knee: 0.8                  # onset threshold (0.5–0.95)
 
-  # Volumetric occlusion ray samples per source (4-64).
-  # More = smoother gradient but higher CPU cost per source.
-  occlusion_samples: 16
+    compressor_enabled: true           # tames transients
+    compressor_threshold_db: -15.0     # dBFS threshold (-30 to 0)
+    compressor_ratio: 3.0              # compression ratio (1.5–10)
+    compressor_attack_ms: 10.0         # attack time (1–100 ms)
+    compressor_release_ms: 250.0       # release time (50–2000 ms)
 
-  # Material transmission multiplier (0.1-100).
-  # 1.0 = physically accurate, 10.0 = game-friendly (audible through walls)
-  transmission_scale: 1.0
+    eq_enabled: true                   # low-shelf EQ (adds bass weight)
+    eq_freq_hz: 120.0                  # center frequency (60–500 Hz)
+    eq_gain_db: 3.0                    # shelf gain (-6 to +6 dB)
+    eq_q: 0.707                        # filter Q (0.3–2.0; 0.707 = Butterworth)
 
-  # Material absorption multiplier (0.01-10).
-  # 1.0 = physically accurate, 0.5 = more reflective surfaces, richer reverb.
-  # Requires probe re-bake (delete .probes file).
-  absorption_scale: 1.0
-
-  # Diffuse scattering samples per bounce for real-time simulation (16-256)
-  diffuse_samples: 64
-
-  # Diffuse scattering samples per bounce for probe baking (32-512)
-  # Requires probe re-bake.
-  bake_diffuse_samples: 128
-
-  # Propagation layer toggles (all on by default — debug use only)
-  # portal_routing: true
-  # probe_pathing: true
-  # realtime_reflections: true
-
-  # -- Master bus DSP chain --
-  # Processing order: Low-shelf EQ → Compressor → Soft Limiter
-
-  # Soft limiter — replaces hard digital clipping with smooth tanh saturation.
-  # Transparent below the knee, smoothly curves to ±1.0 above.
-  dsp_limiter: true
-  dsp_limiter_knee: 0.8    # onset threshold (0.5–0.95, higher = later/subtler)
-
-  # Master bus compressor — tames transients to preserve dynamic detail.
-  # Keeps explosions and machinery from drowning out subtle ambients.
-  dsp_compressor: true
-  dsp_comp_threshold: -15   # dBFS threshold (-30 to 0)
-  dsp_comp_ratio: 3.0       # compression ratio (1.5 to 10)
-
-  # Low-shelf EQ — adds physical weight to the low end of the soundscape.
-  # Enhances footsteps, distant machinery, and stone resonance.
-  dsp_eq: true
-  dsp_eq_freq: 120          # center frequency in Hz (60–500)
-  dsp_eq_gain: 3.0          # shelf gain in dB (-6 to +6)
-
-  # Ambient ducking — reduces ambient volumes when SFX voices play.
-  # Keeps dialog, footsteps, and alerts prominent. Disabled by default.
-  dsp_ducking: false
-  dsp_duck_amount: 0.5      # ambient volume during ducking (0.1–1.0)
+    ducking_enabled: false             # duck ambients when SFX plays
+    ducking_amount: 0.5                # ambient volume during ducking (0.1–1.0)
+    ducking_attack_ms: 50.0            # ducking attack (10–500 ms)
+    ducking_release_ms: 500.0          # ducking release (50–5000 ms)

@@ -31,8 +31,14 @@
 // schemas from PLDef/DType files, loads the mission database (.gam + .mis),
 // constructs the IWorldQuery facade, and runs verification diagnostics.
 // Logger objects must be constructed before calling this (they live in main).
+//
+// `cfg` provides early-init audio/perf settings that must be applied to the
+// AudioService BEFORE its bootstrapFinished() runs (which constructs the
+// miniaudio engine + Steam Audio HRTF). Other audio knobs are applied later
+// in the render path; see DarknessRender.cpp for the full apply block.
 static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
-    const char *misPath, const std::string &scriptsDir)
+    const char *misPath, const std::string &scriptsDir,
+    const Darkness::RenderConfig &cfg)
 {
     // Create service manager with all 12 services
     {
@@ -51,6 +57,28 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
         svcMgr->registerFactory<Darkness::SimServiceFactory>();
         svcMgr->registerFactory<Darkness::PhysicsServiceFactory>();
         svcMgr->registerFactory<Darkness::AudioServiceFactory>();
+
+        // Apply early-init audio settings: these are read inside
+        // AudioService::bootstrapFinished (initMiniaudio + initSteamAudio)
+        // so they MUST be set before svcMgr->bootstrapFinished() below.
+        // Acquiring the service via GET_SERVICE constructs it lazily;
+        // bootstrapFinished isn't dispatched until the call below.
+        {
+            Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+            audioSvc->setAudioSampleRate(cfg.audioSampleRate);
+            audioSvc->setAudioFrameSize(cfg.audioFrameSize);
+            audioSvc->setSoundCacheMB(cfg.audioSoundCacheMB);
+            audioSvc->setHRTFVolume(cfg.hrtfVolume);
+            // HRTF interp / spatial blend / distance model live in audio-thread
+            // atomics; publish them now so the first audio callback sees them.
+            audioSvc->setHRTFInterpolation(cfg.hrtfInterpolation);
+            audioSvc->setSpatialBlend(cfg.spatialBlend);
+            audioSvc->setDistanceModel(cfg.distanceModel);
+            audioSvc->setDoorLpfOpenHz(cfg.doorLpfOpenHz);
+            audioSvc->setDoorLpfBlockedHz(cfg.doorLpfBlockedHz);
+            audioSvc->setPropMinAttenuation(cfg.propMinAttenuation);
+            audioSvc->publishAudioThreadParams();
+        }
 
         svcMgr->bootstrapFinished();
     }
