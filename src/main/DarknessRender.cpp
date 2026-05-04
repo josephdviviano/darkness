@@ -245,96 +245,109 @@ static void writeHeadLogRow(Darkness::RuntimeState &state) {
 }
 
 static void printHelp() {
+    // Help text is the canonical reference for every YAML key — it lists every
+    // field whether or not the user's local config mentions it. When you add
+    // a new YAML knob, also add it here so `--help` stays authoritative.
     std::fprintf(stderr,
-        "darknessRender — Dark Engine world geometry viewer\n"
+        "darknessRender — Dark Engine world geometry + audio viewer\n"
         "\n"
-        "Usage:\n"
-        "  darknessRender <mission.mis> [--res <path>] [--config <path>] [--lightmap-filtering <mode>]\n"
+        "USAGE\n"
+        "  darknessRender <mission.mis> [--res <path>] [--schemas <path>]\n"
+        "                                [--config <path>] [-h | --help]\n"
         "\n"
-        "Options:\n"
-        "  --res <path>   Path to Thief 2 RES directory containing fam.crf.\n"
-        "                 Enables lightmapped+textured rendering. Without this\n"
-        "                 flag, geometry is rendered with flat Lambertian shading.\n"
-        "  --lightmap-filtering <mode>\n"
-        "                 Lightmap filtering mode: bilinear (default) or bicubic.\n"
-        "                 bilinear = GPU hardware filtering (fast, matches original engine).\n"
-        "                 bicubic  = cubic B-spline shader (smoother, minimal GPU cost).\n"
-        "  --no-objects   Disable object mesh rendering (world geometry only).\n"
-        "  --no-cull      Start with portal culling disabled (see all geometry).\n"
-        "  --collision    Start with camera collision enabled (clip to world).\n"
-        "  --filter       Start with bilinear texture filtering (default: point/crispy).\n"
-        "  --linear-mips  Gamma-correct mipmap generation (sRGB linearization).\n"
-        "  --sharp-mips   Sharpen mip levels to preserve detail at distance.\n"
-        "  --physics-rate <hz>\n"
-        "                 Physics timestep: 12 (vintage), 60 (modern/default), 120 (ultra).\n"
-        "  --show-fallback Show colored cubes for objects with missing models.\n"
-        "  --wave-amp <f> Water wave amplitude, 0.0-10.0 (default: 0.3).\n"
-        "  --uv-distort <f> Water UV distortion, 0.0-0.1 (default: 0.015).\n"
-        "  --water-rot <f> Water UV rotation speed in rad/s, 0.0-1.0 (default: 0.015).\n"
-        "  --water-scroll <f> Water UV scroll speed, 0.0-1.0 (default: 0.05).\n"
-        "  --step-log     Log stair step diagnostics to stderr ([STEP] prefix).\n"
-        "  --head-log <path>\n"
-        "                 Write per-render-frame head/viewport CSV to <path> for\n"
-        "                 diagnosing head-bob smoothness and animation snap.\n"
-        "  --toggle-platforms  Auto-activate all moving terrain at startup.\n"
-        "  --audio-log    Enable audio/sound/schema log output (off by default).\n"
-        "  --no-probes    Skip probe baking (no spatial audio, faster startup).\n"
-        "  --debug-objects Dump per-object filtering diagnostics to stderr.\n"
-        "  --config <path> Path to YAML config file (default: ./darknessRender.yaml).\n"
-        "  --help         Show this help message.\n"
+        "  All other tunables live in the YAML config (default: ./darknessRender.yaml).\n"
+        "  Run with --help to see every supported config key.\n"
         "\n"
-        "Controls:\n"
-        "  WASD           Move forward/left/back/right\n"
-        "  Mouse          Look around\n"
-        "  Space/LShift   Move up/down\n"
-        "  Q/E            Move up/down (alternate)\n"
-        "  Ctrl           Sprint (3x speed)\n"
-        "  Scroll wheel   Adjust movement speed (shown in title bar)\n"
-        "  ` (backtick)   Open settings console\n"
-        "  Home           Teleport to player spawn point\n"
-        "  Esc            Quit\n"
+        "CLI FLAGS\n"
+        "  <mission.mis>     Path to the .mis file to load (required, positional).\n"
+        "  --res <path>      Thief 2 RES directory (fam.crf, obj.crf, snd.crf).\n"
+        "                    Overrides paths.res from YAML.\n"
+        "  --schemas <path>  Schema directory (.sch / .spc / .arc). Overrides\n"
+        "                    paths.schemas; default: search next to RES.\n"
+        "  --config <path>   YAML config path. Default: ./darknessRender.yaml.\n"
+        "  -h, --help        Show this message and exit.\n"
         "\n"
-        "Debug console (` backtick to open):\n"
-        "  portal_culling     Toggle portal culling on/off\n"
-        "  filter_mode        Cycle texture filtering (point/bilinear/trilinear/aniso)\n"
-        "  lightmap_filtering Toggle lightmap filtering (bilinear/bicubic)\n"
-        "  camera_collision   Toggle camera collision (clip/noclip) [fly mode only]\n"
-        "  physics_mode       Toggle physics mode (walk with gravity/fly noclip)\n"
-        "  isolate_model      Cycle model isolation\n"
-        "  physics_log        Toggle physics diagnostic log (physics_log.csv)\n"
-        "  show_raycast       Toggle raycast debug visualization\n"
-        "  refl_enabled       Toggle audio reflections (convolution reverb)\n"
+        "YAML CONFIG REFERENCE (defaults shown; see darknessRender.example.yaml)\n"
         "\n"
-        "Physics mode controls (when physics_mode is on):\n"
-        "  WASD           Walk forward/strafe\n"
-        "  Space           Jump (when on ground)\n"
-        "  C               Crouch (toggle)\n"
-        "  LShift          Sneak/creep (hold, 0.5x speed)\n"
-        "  Q/E             Lean left/right\n"
-        "  Ctrl            Sprint/run (2x speed)\n"
+        "  paths:\n"
+        "    res: <path>                     Thief 2 RES directory (CLI --res overrides)\n"
+        "    schemas: <path>                 Schema dir (CLI --schemas overrides)\n"
         "\n"
-        "Resource setup:\n"
-        "  The --res path should point to a directory containing fam.crf, which\n"
-        "  holds the PCX textures used by Dark Engine levels. This can come from:\n"
+        "  graphics:\n"
+        "    texture_filter: point           point | bilinear | trilinear | anisotropic\n"
+        "    lightmap_filter: bilinear       bilinear | bicubic\n"
+        "    linear_mips: false              gamma-correct mipmap generation\n"
+        "    sharp_mips:  false              unsharp mask on mip levels\n"
         "\n"
-        "  1. Mounted ISO (macOS):\n"
-        "     hdiutil mount ../disk_images/thief_2_disk_1.iso\n"
-        "     --res /Volumes/THIEF2_INSTALL_C/THIEF2/RES\n"
+        "  water:\n"
+        "    wave_amplitude: 0.3             vertex Z displacement, 0.0–10.0\n"
+        "    uv_distortion:  0.015           UV wobble strength, 0.0–0.1\n"
+        "    rotation_speed: 0.015           UV rotation rad/s, 0.0–1.0\n"
+        "    scroll_speed:   0.05            UV scroll units/s, 0.0–1.0\n"
         "\n"
-        "  2. GOG/Steam install directory:\n"
-        "     --res /path/to/Thief2/RES\n"
+        "  physics:\n"
+        "    rate: 60                        12=vintage (12.5Hz) | 60=modern | 120=ultra\n"
         "\n"
-        "  3. Any directory containing fam.crf\n"
+        "  developer:\n"
+        "    show_objects: true              render object meshes\n"
+        "    show_fallback_cubes: false      colored cubes for missing models\n"
+        "    portal_culling: true            portal/frustum culling\n"
+        "    camera_collision: false         clip to world (fly mode only)\n"
+        "    step_log: false                 stair-step CSV to stderr\n"
+        "    debug_objects: false            per-object filtering diagnostics\n"
+        "    toggle_platforms: false         auto-activate moving terrain at startup\n"
+        "    no_probes: false                skip Steam Audio probe baking\n"
+        "    audio_log: false                audio/sound/schema log output\n"
         "\n"
-        "Examples:\n"
-        "  # Flat-shaded (no external resources needed):\n"
+        "  audio: (eight subsections — see darknessRender.example.yaml for the full set)\n"
+        "    audio.performance.*    sample rate, frame size, voice/thread caps, scene type\n"
+        "    audio.reflections.*    enabled, rays, bounces, duration, ambisonics_order\n"
+        "    audio.occlusion.*      radius, samples, transmission/absorption_scale, diffuse\n"
+        "    audio.propagation.*    portal_routing, probe_pathing, max_distance, door LPF\n"
+        "    audio.spatialization.* hrtf_volume, hrtf_interpolation, spatial_blend, distance_model\n"
+        "    audio.ambient.*        hysteresis, falloff_curve, default_priority\n"
+        "    audio.mixer.*          master_gain, reflection_gain, reflection_ramp_ms\n"
+        "    audio.dsp.*            limiter, compressor, EQ, ducking (per-stage)\n"
+        "\n"
+        "RUNTIME CONTROLS (in window)\n"
+        "  WASD              Move forward/left/back/right\n"
+        "  Mouse             Look around\n"
+        "  Space/LShift      Move up/down (fly) or jump/crouch (physics mode)\n"
+        "  Ctrl              Sprint (3x speed fly / 2x speed walk)\n"
+        "  Scroll wheel      Adjust movement speed (shown in title bar)\n"
+        "  Home              Teleport to player spawn\n"
+        "  ` (backtick)      Open settings console (live-tune any config knob)\n"
+        "  Esc               Quit\n"
+        "\n"
+        "DEBUG CONSOLE (` backtick to open) — selected toggles\n"
+        "  texture_filter      Cycle point | bilinear | trilinear | anisotropic\n"
+        "  lightmap_filter     Cycle bilinear | bicubic\n"
+        "  portal_culling      Toggle portal culling\n"
+        "  camera_collision    Toggle camera collision (fly mode)\n"
+        "  physics_mode        Toggle fly ↔ walk-with-gravity\n"
+        "  refl_enabled        Toggle audio reflections (convolution reverb)\n"
+        "  head_log            Write per-frame head/viewport CSV to ./head_log.csv\n"
+        "  physics_log         Write physics diagnostics to ./physics_log.csv\n"
+        "  show_raycast        Toggle raycast debug visualization\n"
+        "  isolate_model       Cycle model isolation (debug)\n"
+        "\n"
+        "RESOURCE SETUP\n"
+        "  The RES path must contain fam.crf, obj.crf, snd.crf. Sources:\n"
+        "    1. Mounted ISO (macOS):\n"
+        "       hdiutil mount ../disk_images/thief_2_disk_1.iso\n"
+        "       /Volumes/THIEF2_INSTALL_C/THIEF2/RES\n"
+        "    2. GOG/Steam install: /path/to/Thief2/RES\n"
+        "    3. Any directory containing the three CRF files.\n"
+        "\n"
+        "EXAMPLES\n"
+        "  # YAML provides paths.res, just point to a mission:\n"
         "  darknessRender path/to/miss6.mis\n"
         "\n"
-        "  # Textured, using mounted Thief 2 disc:\n"
+        "  # One-shot override:\n"
         "  darknessRender path/to/miss6.mis --res /Volumes/THIEF2_INSTALL_C/THIEF2/RES\n"
         "\n"
-        "  # Textured, using GOG install:\n"
-        "  darknessRender path/to/miss6.mis --res ~/GOG/Thief2/RES\n"
+        "  # Use an alternate config for testing:\n"
+        "  darknessRender path/to/miss6.mis --config experiments/dry-room.yaml\n"
     );
 }
 
@@ -902,16 +915,40 @@ static void renderObjects(
                 litRadius = parsed->sphereRadius * std::max(maxScale, 1.0f);
             }
 
-            // Compute per-object RGB lighting. When disabled (debug toggle),
-            // we pass white so the shader's multiplication is a no-op and
-            // visible behavior matches the pre-lighting historical look.
+            // Two lighting paths share the same visibility/sun/cache logic
+            // inside ObjectIlluminator; they only differ in what they emit
+            // and which programs/uniforms the renderer feeds:
+            //
+            //   - Per-vertex (default when enabled): buildLightArray() packs
+            //     the cell's visible lights into a GPU array. Vertex shader
+            //     applies cos(angle)/dist per vertex → front/back contrast.
+            //
+            //   - Scalar fallback: compute() returns one RGB value, the
+            //     fragment shader multiplies it across the whole object.
+            //
+            // When `objectLightingEnabled` is off we pass white through the
+            // scalar path so the look matches the pre-lighting historical
+            // appearance (a no-op multiply).
+            const bool useScalarPath =
+                !state.objectLightingEnabled ||
+                !state.perVertexObjectLightingEnabled;
+
             Darkness::Vector3 litRGB(1.0f, 1.0f, 1.0f);
-            if (state.objectLightingEnabled) {
-                litRGB = state.objectIlluminator.compute(
+            if (useScalarPath) {
+                if (state.objectLightingEnabled) {
+                    litRGB = state.objectIlluminator.compute(
+                        obj.objID,
+                        Darkness::Vector3(litX, litY, litZ),
+                        litRadius,
+                        litCell);
+                }
+            } else {
+                state.objectIlluminator.buildLightArray(
                     obj.objID,
                     Darkness::Vector3(litX, litY, litZ),
                     litRadius,
-                    litCell);
+                    litCell,
+                    state.gpuLightScratch);
             }
             float litArr[4] = { litRGB.x, litRGB.y, litRGB.z, 0.0f };
 
@@ -939,7 +976,14 @@ static void renderObjects(
                 // Frob highlight: additive brightness for the targeted object
                 float highlight = (obj.objID == state.frobHighlightObjID)
                     ? state.frobHighlightLevel : 0.0f;
-                float objAlpha[4] = { finalAlpha, highlight, 0.0f, 0.0f };
+                // Per-material self-illumination: additive floor consumed by
+                // the per-vertex shader so a lamp's casing glows even when its
+                // outward-facing normals leave the interior light below
+                // Lambertian's half-space cutoff. The scalar shaders ignore
+                // this slot — they get the same effect via the load-time
+                // baked vertex tint. Future enhancement: multiply by
+                // P$SelfIllum per-object scale (default 1.0).
+                float objAlpha[4] = { finalAlpha, highlight, sm.matIllum, 0.0f };
 
                 uint64_t drawState = opaquePass ? fc.renderState : translucentState;
 
@@ -947,21 +991,49 @@ static void renderObjects(
                 bgfx::setUniform(gpu.u_fogParams, fc.fogOnArr);
                 bgfx::setUniform(gpu.u_objectParams, objAlpha);
                 bgfx::setUniform(gpu.u_objectLight, litArr);
+
+                if (!useScalarPath) {
+                    // Per-vertex: feed the GPU light array. The shader reads
+                    // only [0, count) so leftover entries from prior draws
+                    // are harmless. SoA layout means each .loc/.dir/.bright
+                    // array is a contiguous run of vec4s — exactly what
+                    // bgfx::setUniform expects for an array uniform.
+                    const auto &arr = state.gpuLightScratch;
+                    float countV[4]   = { (float)arr.count, 0.0f, 0.0f, 0.0f };
+                    float ambientV[4] = { arr.ambient.x, arr.ambient.y,
+                                          arr.ambient.z, 0.0f };
+                    bgfx::setUniform(gpu.u_objectLightCount,  countV);
+                    bgfx::setUniform(gpu.u_objectAmbient,     ambientV);
+                    if (arr.count > 0) {
+                        bgfx::setUniform(gpu.u_objectLightLoc,
+                            arr.loc, arr.count);
+                        bgfx::setUniform(gpu.u_objectLightDir,
+                            arr.dir, arr.count);
+                        bgfx::setUniform(gpu.u_objectLightBright,
+                            arr.bright, arr.count);
+                    }
+                }
+
                 bgfx::setTransform(objMtx);
                 bgfx::setVertexBuffer(0, gpuModel.vbh);
                 bgfx::setIndexBuffer(gpuModel.ibh, sm.firstIndex, sm.indexCount);
                 bgfx::setState(drawState);
 
+                bgfx::ProgramHandle texturedProg = useScalarPath
+                    ? gpu.texturedProgram : gpu.texturedPerVertexProgram;
+                bgfx::ProgramHandle flatProg = useScalarPath
+                    ? gpu.flatProgram : gpu.basicPerVertexProgram;
+
                 if (sm.textured) {
                     auto texIt = gpu.objTextureHandles.find(sm.matName);
                     if (texIt != gpu.objTextureHandles.end()) {
                         bgfx::setTexture(0, gpu.s_texColor, texIt->second, fc.texSampler);
-                        bgfx::submit(1, gpu.texturedProgram);
+                        bgfx::submit(1, texturedProg);
                     } else {
-                        bgfx::submit(1, gpu.flatProgram);
+                        bgfx::submit(1, flatProg);
                     }
                 } else {
-                    bgfx::submit(1, gpu.flatProgram);
+                    bgfx::submit(1, flatProg);
                 }
             }
         } else if (state.showFallbackCubes && opaquePass) {
@@ -1064,12 +1136,14 @@ static void registerConsoleSettings(
 
     dbgConsole.setGroup("Rendering");
 
-    dbgConsole.addCategorical("filter_mode",
+    // Naming mirrors graphics.texture_filter / graphics.lightmap_filter in YAML.
+    // Cycling exposes all four texture modes including anisotropic.
+    dbgConsole.addCategorical("texture_filter",
         {"point", "bilinear", "trilinear", "anisotropic"},
         [&state]() { return state.filterMode; },
         [&state, refreshTitle](int v) { state.filterMode = v; refreshTitle(); });
 
-    dbgConsole.addCategorical("lightmap_filtering",
+    dbgConsole.addCategorical("lightmap_filter",
         {"bilinear", "bicubic"},
         [&state]() { return state.lightmapFiltering; },
         [&state, refreshTitle](int v) { state.lightmapFiltering = v; refreshTitle(); });
@@ -1118,6 +1192,11 @@ static void registerConsoleSettings(
             state.objectIlluminator.clear();
         },
         "Per-object illumination from cell light list (off = flat material color)");
+
+    dbgConsole.addBool("per_vertex_object_lighting",
+        [&state]() { return state.perVertexObjectLightingEnabled; },
+        [&state](bool v) { state.perVertexObjectLightingEnabled = v; },
+        "Per-vertex Lambertian object shading (off = single scalar tint per object)");
 
     // Model isolation: "all" = show everything, then one entry per loaded model name.
     // sortedModelNames is populated during init before this registration runs.
@@ -2087,9 +2166,12 @@ int main(int argc, char *argv[]) {
     Darkness::MissionData mission;
     Darkness::RuntimeState state;
 
-    // Unpack mutable config into state structs
+    // Unpack mutable config into state structs.
+    // Resource paths: CLI flag overrides paths.* in YAML if both are present.
+    // This lets the YAML carry a sensible default (e.g. mounted disc path)
+    // while still allowing one-off overrides on the command line.
     const char *misPath    = cli.misPath;
-    std::string resPath    = cli.resPath;
+    std::string resPath    = !cli.resPath.empty() ? cli.resPath : cfg.resPath;
     state.showObjects       = cfg.showObjects;
     state.showFallbackCubes = cfg.showFallbackCubes;
     state.portalCulling     = cfg.portalCulling;
@@ -2108,10 +2190,13 @@ int main(int argc, char *argv[]) {
     // load forever in the background). Treat both as required.
     if (resPath.empty()) {
         std::fprintf(stderr,
-            "ERROR: --res is required.\n"
-            "       Pass --res <path> pointing to the Thief 2 RES directory\n"
-            "       containing fam.crf, obj.crf, snd.crf (typically the\n"
-            "       installed game's RES folder, e.g. /Volumes/THIEF2_INSTALL_C/THIEF2/RES).\n");
+            "ERROR: a Thief 2 RES directory is required.\n"
+            "       Set it via either:\n"
+            "         --res <path>           (CLI override)\n"
+            "         paths.res: <path>      (YAML; persists across runs)\n"
+            "       The path must contain fam.crf, obj.crf, snd.crf — typically\n"
+            "       the installed game's RES folder, e.g.\n"
+            "       /Volumes/THIEF2_INSTALL_C/THIEF2/RES.\n");
         return 1;
     }
     {
@@ -2224,16 +2309,14 @@ int main(int argc, char *argv[]) {
         std::fprintf(stderr, "Audio logging enabled (--audio-log)\n");
     }
 
-    // Enable stair step diagnostics if --step-log was passed
+    // Enable stair step diagnostics if developer.step_log is true
     if (cfg.stepLog && state.physics) {
         state.physics->getPlayerPhysics().setStepLog(true);
-        std::fprintf(stderr, "Stair step logging enabled (--step-log)\n");
+        std::fprintf(stderr, "Stair step logging enabled (developer.step_log)\n");
     }
 
-    // Open per-render-frame head log if --head-log was passed.
-    if (!cfg.headLogPath.empty()) {
-        openHeadLog(state, cfg.headLogPath);
-    }
+    // Per-render-frame head log can be opened at runtime via the debug
+    // console (`head_log` toggle, writes to ./head_log.csv).
 
     // ── Load motion capture data from motions.crf ──
     // motions.crf is present in ALL Dark Engine games (Thief 1/2, System Shock 2).
@@ -2258,13 +2341,18 @@ int main(int argc, char *argv[]) {
     // floods the log with load failures. Hard-fail at startup instead.
     {
         Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
-        if (!audioSvc->loadSoundResources(resPath, cli.schemasPath)) {
+        // CLI --schemas wins; otherwise paths.schemas from YAML; otherwise let
+        // AudioService search the default locations next to RES.
+        std::string schemasPath = !cli.schemasPath.empty() ? cli.schemasPath : cfg.schemasPath;
+        if (!audioSvc->loadSoundResources(resPath, schemasPath)) {
             std::fprintf(stderr,
                 "ERROR: audio resource initialization failed.\n"
-                "       --res must point to a directory containing snd.crf\n"
-                "       and the schema directory must be locatable. Either pass\n"
-                "       --schemas <path> explicitly (e.g. /Volumes/THIEF2_CD2/EDITOR/SCHEMA),\n"
-                "       or place the schemas next to RES at <res>/../EDITOR/SCHEMA.\n");
+                "       The RES path must contain snd.crf, and the schema directory\n"
+                "       must be locatable. Set the schema directory via either:\n"
+                "         --schemas <path>          (CLI override)\n"
+                "         paths.schemas: <path>     (YAML; persists across runs)\n"
+                "       e.g. /Volumes/THIEF2_CD2/EDITOR/SCHEMA. Alternatively,\n"
+                "       place the schemas next to RES at <res>/../EDITOR/SCHEMA.\n");
             return 1;
         }
     }

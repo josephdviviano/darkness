@@ -46,6 +46,7 @@
 #include "DynamicLightList.h"
 #include "property/DarkPropertyDefs.h"
 #include "property/TypedProperty.h"
+#include "../../shaders/object_lighting_constants.h"
 
 #include <algorithm>
 #include <cmath>
@@ -55,6 +56,43 @@
 #include <vector>
 
 namespace Darkness {
+
+// Per-object light cap shared between the C++ array-build and the
+// per-vertex shaders. See shaders/object_lighting_constants.h for the
+// rationale and the cost analysis.
+constexpr int kObjectLightCap = OBJECT_LIGHT_CAP;
+
+// What buildLightArray() emits for one object's per-frame draw call.
+// Layout matches what the per-vertex shaders' uniform arrays expect.
+// SoA (struct-of-arrays) so each `loc` / `dir` / `bright` array is
+// contiguous in memory — `bgfx::setUniform` walks an array as N × 16-byte
+// vec4s, so the three sub-arrays MUST each be tightly packed (no
+// interleaving). An AoS layout breaks this: bgfx would walk past the
+// first element into the next field instead of the next array slot,
+// scrambling the data and (when crossing the buffer boundary) faulting
+// on a write into protected memory.
+//
+// Per-light slot semantics (one i across all three arrays):
+//   loc[i]    .xyz = world position of the light
+//             .w   = cos(inner) for spotlight; -1.0 sentinel = omni
+//   dir[i]    .xyz = spotlight direction (zero for omni)
+//             .w   = cos(outer) for spotlight; unused when loc.w == -1
+//   bright[i] .rgb = pre-scaled radiant intensity (LightColor × multiplier)
+//             .w   = radius²; 0 = no distance cutoff
+//
+// "Pre-scaled" means the C++ side has already applied the per-light
+// multiplier from the animated-light system — the shader doesn't know
+// about animation.
+//
+// Only the prefix [0, count) is meaningful; entries past `count` are
+// untouched between frames and the shader is gated by `count`.
+struct GPULightArray {
+    int       count = 0;
+    Vector3   ambient = Vector3(0.0f);
+    glm::vec4 loc[kObjectLightCap];
+    glm::vec4 dir[kObjectLightCap];
+    glm::vec4 bright[kObjectLightCap];
+};
 
 // Per-object cache of static-light visibility within the object's cell.
 // Each bit in `bits` corresponds to an entry in cell.lightIndices[1..N]:
@@ -144,6 +182,26 @@ public:
                     const Vector3 &pos,
                     float radius,
                     int32_t cellHint = -1);
+
+    // Build the per-object GPU light array for the per-vertex Lambertian
+    // path. Mirrors `compute()` for visibility (cell light list, shadow
+    // cache, dynamic-light raycast) but emits the array of lights the
+    // shader will iterate per vertex, *without* folding cosine or 1/dist.
+    //
+    // Output is written into `out`. The shader reads `out.count` and
+    // `out.ambient`; entries `[0, count)` of `out.lights` are valid. The
+    // tail beyond `count` is left undefined; the shader is gated by
+    // `count` and never reads past it.
+    //
+    // ExtraLight in additive-override mode (`isAdditive == 0`) still
+    // forces ambient-only output: the array is emitted with `count = 0`,
+    // so the shader sums no per-light contributions. This matches the
+    // scalar path's early-return behavior.
+    void buildLightArray(int32_t objId,
+                         const Vector3 &pos,
+                         float radius,
+                         int32_t cellHint,
+                         GPULightArray &out);
 
 private:
     // Returns true if the static light at index `lightIdx` is visible from
@@ -322,6 +380,134 @@ inline Vector3 ObjectIlluminator::compute(int32_t objId,
     if (total.z < 0.0f) total.z = 0.0f;
 
     return total;
+}
+
+inline void ObjectIlluminator::buildLightArray(int32_t objId,
+                                                const Vector3 &pos,
+                                                float radius,
+                                                int32_t cellHint,
+                                                GPULightArray &out) {
+    out.count = 0;
+    out.ambient = Vector3(0.0f);
+    if (!mWr || !mRp) return;
+
+    // Steps 1-2 mirror `compute()`: resolve cell, ambient + ExtraLight.
+    int32_t cell = (cellHint >= 0 && cellHint < static_cast<int32_t>(mWr->numCells))
+                 ? cellHint
+                 : findCameraCell(*mWr, pos.x, pos.y, pos.z);
+
+    Vector3 ambient = mRp->ambientLight;
+    bool ambientOnly = false;
+    if (mPropSvc) {
+        PropExtraLight el{};
+        if (getTypedProperty<PropExtraLight>(mPropSvc, "ExtraLigh", objId, el)) {
+            for (int c = 0; c < 3; ++c) {
+                ambient[c] += el.factor;
+                if (ambient[c] > 1.0f) ambient[c] = 1.0f;
+            }
+            if (el.isAdditive == 0)
+                ambientOnly = true;
+        }
+    }
+    out.ambient = ambient;
+
+    if (ambientOnly) return;
+    if (cell < 0 || cell >= static_cast<int32_t>(mWr->numCells)) return;
+
+    const auto &lt = mWr->cells[cell].lightIndices;
+    if (lt.empty()) return;
+    int n = static_cast<int>(lt[0]);
+    if (n <= 0) return;
+
+    // Step 3: patch the sun slot for this object's position. Same as
+    // `compute()`. The sun is conceptually placed `kSunlightDistance +
+    // radius` units along the inverted sunlight vector; the per-vertex
+    // shader will see this as a near-directional light because that
+    // distance is large compared to typical object size.
+    mSunSlot.loc = pos + mRp->sunlightNorm * (kSunlightDistance + radius);
+    mSunSlot.dir = Vector3(0.0f);
+    mSunSlot.bright = mRp->sunScaledRgb;
+    mSunSlot.inner = -1.0f;
+    mSunSlot.outer = 0.0f;
+    mSunSlot.radius = 0.0f;
+
+    // Step 4: shadow cache refresh. Identical logic to `compute()` —
+    // both lighting paths share the same per-object visibility set.
+    auto &cache = mCache[objId];
+    bool needRebuild = !cache.valid || cache.cellId != cell;
+    if (!needRebuild) {
+        Vector3 d = pos - cache.pos;
+        if (glm::dot(d, d) > kShadowCacheRepollEps * kShadowCacheRepollEps)
+            needRebuild = true;
+    }
+    if (needRebuild) {
+        cache.bits[0] = cache.bits[1] = cache.bits[2] = 0;
+        int evalN = std::min(n, 96);
+        for (int i = 0; i < evalN; ++i) {
+            int idx = lt[1 + i];
+            if (locationSeesLight(pos, cell, idx)) {
+                cache.bits[i >> 5] |= (1u << (i & 31));
+            }
+        }
+        cache.cellId = cell;
+        cache.pos = pos;
+        cache.valid = true;
+    }
+
+    // Step 5: pack visible static lights into `out.{loc,dir,bright}[i]`.
+    // Unlike `compute()` we skip the cosine and the 1/dist factors —
+    // the GPU applies both per-vertex. The animated-light multiplier
+    // IS folded here (the shader doesn't know about animation).
+    int evalN = std::min(n, kObjectLightCap);
+    for (int i = 0; i < evalN && out.count < kObjectLightCap; ++i) {
+        if (!(cache.bits[i >> 5] & (1u << (i & 31)))) continue;
+
+        int32_t lightIdx = lt[1 + i];
+        const WRStaticLight *L = nullptr;
+        float multiplier = 1.0f;
+        if (lightIdx == 0) {
+            L = &mSunSlot;
+        } else {
+            if (lightIdx < 0 ||
+                lightIdx >= static_cast<int32_t>(mWr->staticLights.size()))
+                continue;
+            L = &mWr->staticLights[lightIdx];
+            if (lightIdx < static_cast<int32_t>(mLightMultiplier.size()))
+                multiplier = mLightMultiplier[lightIdx];
+            if (multiplier <= 0.0f) continue;
+        }
+
+        int slot = out.count++;
+        out.loc[slot]    = glm::vec4(L->loc, L->inner);
+        out.dir[slot]    = glm::vec4(L->dir, L->outer);
+        out.bright[slot] = glm::vec4(L->bright * multiplier,
+                                     L->radius > 0.0f ? L->radius * L->radius : 0.0f);
+    }
+
+    // Step 6: dynamic lights — same portal raycast as `compute()`,
+    // packed as omni (loc.w = -1, dir = 0). Dropped silently if the
+    // array is already at the cap; in shipping content the static
+    // count is far below the cap so this is a paper edge case.
+    if (mDyn) {
+        for (int i = 0; i < mDyn->count() && out.count < kObjectLightCap; ++i) {
+            const DynamicLight &dl = (*mDyn)[i];
+            if (dl.radius > 0.0f) {
+                Vector3 d = pos - dl.loc;
+                if (glm::dot(d, d) > dl.radius * dl.radius) continue;
+            }
+            RayHit hit;
+            int32_t terminalCell = -1;
+            bool blocked = raycastWorld(*mWr, pos, dl.loc, hit,
+                                        &terminalCell, cell);
+            if (blocked) continue;
+
+            int slot = out.count++;
+            out.loc[slot]    = glm::vec4(dl.loc, -1.0f);
+            out.dir[slot]    = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+            out.bright[slot] = glm::vec4(dl.bright,
+                                         dl.radius > 0.0f ? dl.radius * dl.radius : 0.0f);
+        }
+    }
 }
 
 inline bool ObjectIlluminator::locationSeesLight(const Vector3 &from,
