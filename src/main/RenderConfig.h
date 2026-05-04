@@ -26,38 +26,77 @@ struct RenderConfig {
     float waterRotation   = 0.015f;  // UV rotation speed in rad/s (0 = no rotation)
     float waterScrollSpeed = 0.05f;  // UV scroll speed in world units/s (0 = no drift)
 
-    // -- audio --
-    int  reflectionRateDivisor = 2;    // 1=full (48kHz), 2=half (24kHz), 4=quarter (12kHz)
-    int  convolutionWorkers = 0;       // parallel convolution worker threads (0=auto)
-    int  maxReflectionVoices = 8;      // max ACTIVE voices with reflection convolution (tail voices are free)
-    int  ambisonicsOrder = 0;          // 0 = omnidirectional reverb (1ch, 4x cheaper), 1 = directional (4ch)
-    int  reflectionNumRays   = 1024;   // rays per reflection sim step (128–8192)
-    int  reflectionNumBounces = 4;     // bounces per ray (1–8)
-    float reflectionDuration = 2.0f;   // max reverb tail in seconds (0.5–4.0)
-    int  reflectionThrottle  = 4;      // run reflection sim every Nth frame (1–32)
-    float transmissionScale  = 10.0f;  // multiply all material transmission coefficients (1=physical, 10=audible through walls)
-    float absorptionScale    = 1.0f;   // multiply all material absorption coefficients (1=physical, 0.5=more reflective)
-    int   diffuseSamples     = 64;     // diffuse scattering samples for real-time reflection sim (16-256)
-    int   bakeDiffuseSamples = 128;    // diffuse scattering samples for probe baking (32-512, higher=smoother)
-    float occlusionRadius    = 3.0f;   // volumetric occlusion source sphere radius (world units, 0.1-10)
-    int   occlusionSamples   = 16;     // volumetric occlusion ray samples per source (4-64)
+    // -- audio.performance: engine + sim throughput knobs --
+    int  audioSampleRate         = 48000; // device output sample rate (Hz; clamped to 22050/32000/44100/48000/96000)
+    int  audioFrameSize          = 1024;  // audio engine frame size in samples (256–4096)
+    int  audioSoundCacheMB       = 64;    // decoded-audio LRU cache budget (MB)
+    int  reflectionRateDivisor   = 2;     // reflection pipeline rate: 1=full 48kHz, 2=half 24kHz, 4=quarter 12kHz
+    int  convolutionWorkers      = 0;     // convolution worker threads (0 = auto: hwconc-3)
+    int  simulatorThreads        = 0;     // ray-tracing sim threads (0 = auto: hwconc-2)
+    int  maxActiveVoices         = 64;    // hard cap on simultaneous voices (Dark Engine baseline)
+    int  maxReflectionVoices     = 16;    // max voices with per-source convolution reverb
+    int  reflectionThrottle      = 4;     // run reflection sim every Nth frame (1–32)
+    int  simMaxOcclusionSamples  = 32;    // upper bound on per-source occlusion samples (Steam Audio sim)
+    int  simMaxRays              = 4096;  // upper bound on rays per sim step (Steam Audio sim)
+    int  simMaxSources           = 32;    // Steam Audio simulator source pool size
+    std::string sceneType        = "default"; // IPL scene backend: "default" or "embree"
 
-    // Propagation layer toggles (all on by default — debug use only)
-    bool portalRouting       = true;   // portal-graph sound routing through doorways
-    bool probePathing        = true;   // baked probe diffraction/pathing (when available)
-    bool realtimeReflections = true;   // Steam Audio real-time convolution reverb
+    // -- audio.reflections: convolution reverb feel --
+    bool  realtimeReflections = true;  // master enable for convolution reverb
+    int   reflectionNumRays   = 4096;  // rays per reflection sim step (128–8192)
+    int   reflectionNumBounces = 4;    // bounces per ray (1–8)
+    float reflectionDuration  = 2.0f;  // max reverb tail in seconds (0.5–4.0)
+    int   ambisonicsOrder     = 0;     // 0 = omnidirectional (1ch, 4x cheaper), 1 = directional (4ch)
 
-    // -- audio DSP chain --
-    bool  dspLimiter    = true;    // soft tanh limiter (prevents digital clipping)
-    float dspLimiterKnee = 0.8f;   // knee threshold (0.5–0.95, higher = later onset)
-    bool  dspCompressor = true;    // master bus compressor (tames transients)
-    float dspCompThreshold = -15.0f; // compressor threshold in dBFS (-30 to 0)
-    float dspCompRatio = 3.0f;     // compression ratio (1.5 to 10)
-    bool  dspEQ         = true;    // low-shelf EQ (adds bass weight)
-    float dspEQFreq     = 120.0f;  // EQ center frequency in Hz (60–500)
-    float dspEQGain     = 3.0f;    // EQ gain in dB (-6 to +6)
-    bool  dspDucking    = false;   // ambient ducking when SFX plays (disabled by default)
-    float dspDuckAmount = 0.5f;    // ambient volume during ducking (0.1–1.0)
+    // -- audio.occlusion: occlusion + material scaling --
+    float occlusionRadius     = 5.0f;  // volumetric occlusion sphere radius (world units = feet, 0.3–30)
+    int   occlusionSamples    = 16;    // ray samples per source for occlusion gradient (4–64)
+    float transmissionScale   = 1.0f;  // multiplier for material transmission (1=physical, 10=through-walls game-friendly)
+    float absorptionScale     = 1.0f;  // multiplier for material absorption (1=physical, <1=more reflective)
+    int   diffuseSamples      = 64;    // realtime diffuse scattering samples per bounce (16–256)
+    int   bakeDiffuseSamples  = 128;   // offline bake diffuse samples per bounce (32–512)
+
+    // -- audio.propagation: portal/probe pathing + door blocking --
+    bool  portalRouting       = true;   // portal-graph sound routing through doorways
+    bool  probePathing        = true;   // baked probe diffraction (when available)
+    float propagationMaxDist  = 200.0f; // max sound propagation distance through portal graph (world units)
+    float doorLpfOpenHz       = 20000.0f; // LPF cutoff for fully open door (Hz)
+    float doorLpfBlockedHz    = 800.0f;   // LPF cutoff for fully blocked door (Hz)
+    float propMinAttenuation  = 0.001f;   // floor on propagation/portal scale (prevents total silence from FP noise)
+
+    // -- audio.spatialization: HRTF + distance model --
+    float hrtfVolume          = 1.0f;   // HRTF output gain (1.0 = raw HRTF, lower = quieter)
+    std::string hrtfInterpolation = "bilinear"; // HRTF interpolation: "nearest" or "bilinear"
+    float spatialBlend        = 1.0f;   // binaural blend (0=mono, 1=full HRTF)
+    std::string distanceModel = "default"; // distance attenuation: "default" or "inverse_distance"
+
+    // -- audio.ambient: P$AmbientHack tuning --
+    float ambHysteresisStartMul = 1.5f; // multiplier on radius for ambient activation distance
+    float ambHysteresisStopMul  = 2.0f; // multiplier on radius for ambient deactivation distance
+    std::string ambFalloffCurve = "quadratic"; // ambient distance falloff: "linear" or "quadratic"
+    int   ambDefaultPriority    = 64;   // priority for ambients without explicit value
+
+    // -- audio.mixer: global gains --
+    float mixerMasterGain     = 1.0f;   // global output gain multiplier
+    float mixerReflectionGain = 1.0f;   // reverb wet bus gain multiplier
+    float reflectionRampMs    = 10.0f;  // reflection-bus fade-in time (ms) on first activation
+
+    // -- audio.dsp: master bus DSP chain --
+    bool  dspLimiter         = true;    // soft tanh limiter (prevents digital clipping)
+    float dspLimiterKnee     = 0.8f;    // knee threshold (0.5–0.95, higher = later onset)
+    bool  dspCompressor      = true;    // master bus compressor (tames transients)
+    float dspCompThreshold   = -15.0f;  // compressor threshold in dBFS (-30 to 0)
+    float dspCompRatio       = 3.0f;    // compression ratio (1.5 to 10)
+    float dspCompAttackMs    = 10.0f;   // compressor attack time (1–100 ms)
+    float dspCompReleaseMs   = 250.0f;  // compressor release time (50–2000 ms)
+    bool  dspEQ              = true;    // low-shelf EQ (adds bass weight)
+    float dspEQFreq          = 120.0f;  // EQ center frequency in Hz (60–500)
+    float dspEQGain          = 3.0f;    // EQ gain in dB (-6 to +6)
+    float dspEQQ             = 0.707f;  // EQ filter Q (0.3–2.0; 0.707 = Butterworth)
+    bool  dspDucking         = false;   // ambient ducking when SFX plays (disabled by default)
+    float dspDuckAmount      = 0.5f;    // ambient volume during ducking (0.1–1.0)
+    float dspDuckAttackMs    = 50.0f;   // ducking attack time (10–500 ms)
+    float dspDuckReleaseMs   = 500.0f;  // ducking release time (50–5000 ms)
 
 
     // -- physics --
@@ -134,126 +173,298 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             }
         }
 
-        // audio section
+        // audio section — organized into named subsections.
+        // Layout: audio.{performance,reflections,occlusion,propagation,
+        //               spatialization,ambient,mixer,dsp}
         if (YAML::Node audio = root["audio"]) {
-            if (audio["half_rate_reflections"]) {
-                // Backward-compatible: bool → divisor 2 or 1
-                cfg.reflectionRateDivisor = audio["half_rate_reflections"].as<bool>() ? 2 : 1;
+            // -- audio.performance --
+            if (YAML::Node perf = audio["performance"]) {
+                if (perf["sample_rate"]) {
+                    int v = perf["sample_rate"].as<int>();
+                    // Snap to one of the supported rates
+                    if      (v <= 22050) cfg.audioSampleRate = 22050;
+                    else if (v <= 32000) cfg.audioSampleRate = 32000;
+                    else if (v <= 44100) cfg.audioSampleRate = 44100;
+                    else if (v <= 48000) cfg.audioSampleRate = 48000;
+                    else                 cfg.audioSampleRate = 96000;
+                }
+                if (perf["frame_size"]) {
+                    cfg.audioFrameSize = perf["frame_size"].as<int>();
+                    if (cfg.audioFrameSize < 256)  cfg.audioFrameSize = 256;
+                    if (cfg.audioFrameSize > 4096) cfg.audioFrameSize = 4096;
+                }
+                if (perf["sound_cache_mb"]) {
+                    cfg.audioSoundCacheMB = perf["sound_cache_mb"].as<int>();
+                    if (cfg.audioSoundCacheMB < 4)    cfg.audioSoundCacheMB = 4;
+                    if (cfg.audioSoundCacheMB > 1024) cfg.audioSoundCacheMB = 1024;
+                }
+                if (perf["rate_divisor"]) {
+                    int div = perf["rate_divisor"].as<int>();
+                    cfg.reflectionRateDivisor = (div >= 4) ? 4 : (div >= 2) ? 2 : 1;
+                }
+                if (perf["convolution_workers"]) {
+                    cfg.convolutionWorkers = perf["convolution_workers"].as<int>();
+                    if (cfg.convolutionWorkers < 0)  cfg.convolutionWorkers = 0;
+                    if (cfg.convolutionWorkers > 16) cfg.convolutionWorkers = 16;
+                }
+                if (perf["simulator_threads"]) {
+                    cfg.simulatorThreads = perf["simulator_threads"].as<int>();
+                    if (cfg.simulatorThreads < 0)  cfg.simulatorThreads = 0;
+                    if (cfg.simulatorThreads > 64) cfg.simulatorThreads = 64;
+                }
+                if (perf["max_active_voices"]) {
+                    cfg.maxActiveVoices = perf["max_active_voices"].as<int>();
+                    if (cfg.maxActiveVoices < 8)   cfg.maxActiveVoices = 8;
+                    if (cfg.maxActiveVoices > 256) cfg.maxActiveVoices = 256;
+                }
+                if (perf["max_reflection_voices"]) {
+                    cfg.maxReflectionVoices = perf["max_reflection_voices"].as<int>();
+                    if (cfg.maxReflectionVoices < 1)  cfg.maxReflectionVoices = 1;
+                    if (cfg.maxReflectionVoices > 64) cfg.maxReflectionVoices = 64;
+                }
+                if (perf["reflection_throttle"]) {
+                    cfg.reflectionThrottle = perf["reflection_throttle"].as<int>();
+                    if (cfg.reflectionThrottle < 1)  cfg.reflectionThrottle = 1;
+                    if (cfg.reflectionThrottle > 32) cfg.reflectionThrottle = 32;
+                }
+                if (perf["sim_max_occlusion_samples"]) {
+                    cfg.simMaxOcclusionSamples = perf["sim_max_occlusion_samples"].as<int>();
+                    if (cfg.simMaxOcclusionSamples < 4)   cfg.simMaxOcclusionSamples = 4;
+                    if (cfg.simMaxOcclusionSamples > 256) cfg.simMaxOcclusionSamples = 256;
+                }
+                if (perf["sim_max_rays"]) {
+                    cfg.simMaxRays = perf["sim_max_rays"].as<int>();
+                    if (cfg.simMaxRays < 128)   cfg.simMaxRays = 128;
+                    if (cfg.simMaxRays > 16384) cfg.simMaxRays = 16384;
+                }
+                if (perf["sim_max_sources"]) {
+                    cfg.simMaxSources = perf["sim_max_sources"].as<int>();
+                    if (cfg.simMaxSources < 4)   cfg.simMaxSources = 4;
+                    if (cfg.simMaxSources > 256) cfg.simMaxSources = 256;
+                }
+                if (perf["scene_type"]) {
+                    cfg.sceneType = perf["scene_type"].as<std::string>();
+                    if (cfg.sceneType != "default" && cfg.sceneType != "embree")
+                        cfg.sceneType = "default";
+                }
             }
-            if (audio["reflection_rate_divisor"]) {
-                int div = audio["reflection_rate_divisor"].as<int>();
-                cfg.reflectionRateDivisor = (div >= 4) ? 4 : (div >= 2) ? 2 : 1;
-            }
-            if (audio["convolution_workers"]) {
-                cfg.convolutionWorkers = audio["convolution_workers"].as<int>();
-                if (cfg.convolutionWorkers < 0) cfg.convolutionWorkers = 0;
-                if (cfg.convolutionWorkers > 16) cfg.convolutionWorkers = 16;
-            }
-            if (audio["ambisonics_order"]) {
-                cfg.ambisonicsOrder = audio["ambisonics_order"].as<int>();
-                if (cfg.ambisonicsOrder < 0) cfg.ambisonicsOrder = 0;
-                if (cfg.ambisonicsOrder > 1) cfg.ambisonicsOrder = 1;
-            }
-            if (audio["max_reflection_voices"]) {
-                cfg.maxReflectionVoices = audio["max_reflection_voices"].as<int>();
-                if (cfg.maxReflectionVoices < 1) cfg.maxReflectionVoices = 1;
-                if (cfg.maxReflectionVoices > 64) cfg.maxReflectionVoices = 64;
-            }
-            if (audio["reflection_rays"]) {
-                cfg.reflectionNumRays = audio["reflection_rays"].as<int>();
-                if (cfg.reflectionNumRays < 128) cfg.reflectionNumRays = 128;
-                if (cfg.reflectionNumRays > 8192) cfg.reflectionNumRays = 8192;
-            }
-            if (audio["reflection_bounces"]) {
-                cfg.reflectionNumBounces = audio["reflection_bounces"].as<int>();
-                if (cfg.reflectionNumBounces < 1) cfg.reflectionNumBounces = 1;
-                if (cfg.reflectionNumBounces > 8) cfg.reflectionNumBounces = 8;
-            }
-            if (audio["reflection_duration"]) {
-                cfg.reflectionDuration = audio["reflection_duration"].as<float>();
-                if (cfg.reflectionDuration < 0.5f) cfg.reflectionDuration = 0.5f;
-                if (cfg.reflectionDuration > 4.0f) cfg.reflectionDuration = 4.0f;
-            }
-            if (audio["reflection_throttle"]) {
-                cfg.reflectionThrottle = audio["reflection_throttle"].as<int>();
-                if (cfg.reflectionThrottle < 1) cfg.reflectionThrottle = 1;
-                if (cfg.reflectionThrottle > 32) cfg.reflectionThrottle = 32;
-            }
-            if (audio["transmission_scale"]) {
-                cfg.transmissionScale = audio["transmission_scale"].as<float>();
-                if (cfg.transmissionScale < 0.1f) cfg.transmissionScale = 0.1f;
-                if (cfg.transmissionScale > 100.0f) cfg.transmissionScale = 100.0f;
-            }
-            if (audio["absorption_scale"]) {
-                cfg.absorptionScale = audio["absorption_scale"].as<float>();
-                if (cfg.absorptionScale < 0.01f) cfg.absorptionScale = 0.01f;
-                if (cfg.absorptionScale > 10.0f) cfg.absorptionScale = 10.0f;
-            }
-            if (audio["diffuse_samples"]) {
-                cfg.diffuseSamples = audio["diffuse_samples"].as<int>();
-                if (cfg.diffuseSamples < 16) cfg.diffuseSamples = 16;
-                if (cfg.diffuseSamples > 256) cfg.diffuseSamples = 256;
-            }
-            if (audio["bake_diffuse_samples"]) {
-                cfg.bakeDiffuseSamples = audio["bake_diffuse_samples"].as<int>();
-                if (cfg.bakeDiffuseSamples < 32) cfg.bakeDiffuseSamples = 32;
-                if (cfg.bakeDiffuseSamples > 512) cfg.bakeDiffuseSamples = 512;
-            }
-            if (audio["occlusion_radius"]) {
-                cfg.occlusionRadius = audio["occlusion_radius"].as<float>();
-                if (cfg.occlusionRadius < 0.1f) cfg.occlusionRadius = 0.1f;
-                if (cfg.occlusionRadius > 10.0f) cfg.occlusionRadius = 10.0f;
-            }
-            if (audio["occlusion_samples"]) {
-                cfg.occlusionSamples = audio["occlusion_samples"].as<int>();
-                if (cfg.occlusionSamples < 4) cfg.occlusionSamples = 4;
-                if (cfg.occlusionSamples > 64) cfg.occlusionSamples = 64;
-            }
-            if (audio["portal_routing"])
-                cfg.portalRouting = audio["portal_routing"].as<bool>();
-            if (audio["probe_pathing"])
-                cfg.probePathing = audio["probe_pathing"].as<bool>();
-            if (audio["realtime_reflections"])
-                cfg.realtimeReflections = audio["realtime_reflections"].as<bool>();
 
-            // DSP chain settings
-            if (audio["dsp_limiter"])
-                cfg.dspLimiter = audio["dsp_limiter"].as<bool>();
-            if (audio["dsp_limiter_knee"]) {
-                cfg.dspLimiterKnee = audio["dsp_limiter_knee"].as<float>();
-                if (cfg.dspLimiterKnee < 0.5f) cfg.dspLimiterKnee = 0.5f;
-                if (cfg.dspLimiterKnee > 0.95f) cfg.dspLimiterKnee = 0.95f;
+            // -- audio.reflections --
+            if (YAML::Node refl = audio["reflections"]) {
+                if (refl["enabled"]) cfg.realtimeReflections = refl["enabled"].as<bool>();
+                if (refl["rays"]) {
+                    cfg.reflectionNumRays = refl["rays"].as<int>();
+                    if (cfg.reflectionNumRays < 128)  cfg.reflectionNumRays = 128;
+                    if (cfg.reflectionNumRays > 8192) cfg.reflectionNumRays = 8192;
+                }
+                if (refl["bounces"]) {
+                    cfg.reflectionNumBounces = refl["bounces"].as<int>();
+                    if (cfg.reflectionNumBounces < 1) cfg.reflectionNumBounces = 1;
+                    if (cfg.reflectionNumBounces > 8) cfg.reflectionNumBounces = 8;
+                }
+                if (refl["duration"]) {
+                    cfg.reflectionDuration = refl["duration"].as<float>();
+                    if (cfg.reflectionDuration < 0.5f) cfg.reflectionDuration = 0.5f;
+                    if (cfg.reflectionDuration > 4.0f) cfg.reflectionDuration = 4.0f;
+                }
+                if (refl["ambisonics_order"]) {
+                    cfg.ambisonicsOrder = refl["ambisonics_order"].as<int>();
+                    if (cfg.ambisonicsOrder < 0) cfg.ambisonicsOrder = 0;
+                    if (cfg.ambisonicsOrder > 1) cfg.ambisonicsOrder = 1;
+                }
             }
-            if (audio["dsp_compressor"])
-                cfg.dspCompressor = audio["dsp_compressor"].as<bool>();
-            if (audio["dsp_comp_threshold"]) {
-                cfg.dspCompThreshold = audio["dsp_comp_threshold"].as<float>();
-                if (cfg.dspCompThreshold < -30.0f) cfg.dspCompThreshold = -30.0f;
-                if (cfg.dspCompThreshold > 0.0f) cfg.dspCompThreshold = 0.0f;
+
+            // -- audio.occlusion --
+            if (YAML::Node occ = audio["occlusion"]) {
+                if (occ["radius"]) {
+                    cfg.occlusionRadius = occ["radius"].as<float>();
+                    // Range in engine units (feet). Converted to meters at the
+                    // IPL boundary, so 30 ft ≈ 9 m caps a "very large industrial
+                    // source" which is about as wide as makes physical sense.
+                    if (cfg.occlusionRadius < 0.3f) cfg.occlusionRadius = 0.3f;
+                    if (cfg.occlusionRadius > 30.0f) cfg.occlusionRadius = 30.0f;
+                }
+                if (occ["samples"]) {
+                    cfg.occlusionSamples = occ["samples"].as<int>();
+                    if (cfg.occlusionSamples < 4)  cfg.occlusionSamples = 4;
+                    if (cfg.occlusionSamples > 64) cfg.occlusionSamples = 64;
+                }
+                if (occ["transmission_scale"]) {
+                    cfg.transmissionScale = occ["transmission_scale"].as<float>();
+                    if (cfg.transmissionScale < 0.1f)   cfg.transmissionScale = 0.1f;
+                    if (cfg.transmissionScale > 100.0f) cfg.transmissionScale = 100.0f;
+                }
+                if (occ["absorption_scale"]) {
+                    cfg.absorptionScale = occ["absorption_scale"].as<float>();
+                    if (cfg.absorptionScale < 0.01f) cfg.absorptionScale = 0.01f;
+                    if (cfg.absorptionScale > 10.0f) cfg.absorptionScale = 10.0f;
+                }
+                if (occ["diffuse_samples"]) {
+                    cfg.diffuseSamples = occ["diffuse_samples"].as<int>();
+                    if (cfg.diffuseSamples < 16)  cfg.diffuseSamples = 16;
+                    if (cfg.diffuseSamples > 256) cfg.diffuseSamples = 256;
+                }
+                if (occ["bake_diffuse_samples"]) {
+                    cfg.bakeDiffuseSamples = occ["bake_diffuse_samples"].as<int>();
+                    if (cfg.bakeDiffuseSamples < 32)  cfg.bakeDiffuseSamples = 32;
+                    if (cfg.bakeDiffuseSamples > 512) cfg.bakeDiffuseSamples = 512;
+                }
             }
-            if (audio["dsp_comp_ratio"]) {
-                cfg.dspCompRatio = audio["dsp_comp_ratio"].as<float>();
-                if (cfg.dspCompRatio < 1.5f) cfg.dspCompRatio = 1.5f;
-                if (cfg.dspCompRatio > 10.0f) cfg.dspCompRatio = 10.0f;
+
+            // -- audio.propagation --
+            if (YAML::Node prop = audio["propagation"]) {
+                if (prop["portal_routing"]) cfg.portalRouting = prop["portal_routing"].as<bool>();
+                if (prop["probe_pathing"])  cfg.probePathing  = prop["probe_pathing"].as<bool>();
+                if (prop["max_distance"]) {
+                    cfg.propagationMaxDist = prop["max_distance"].as<float>();
+                    if (cfg.propagationMaxDist < 10.0f)   cfg.propagationMaxDist = 10.0f;
+                    if (cfg.propagationMaxDist > 5000.0f) cfg.propagationMaxDist = 5000.0f;
+                }
+                if (prop["door_lpf_open_hz"]) {
+                    cfg.doorLpfOpenHz = prop["door_lpf_open_hz"].as<float>();
+                    if (cfg.doorLpfOpenHz < 1000.0f)  cfg.doorLpfOpenHz = 1000.0f;
+                    if (cfg.doorLpfOpenHz > 24000.0f) cfg.doorLpfOpenHz = 24000.0f;
+                }
+                if (prop["door_lpf_blocked_hz"]) {
+                    cfg.doorLpfBlockedHz = prop["door_lpf_blocked_hz"].as<float>();
+                    if (cfg.doorLpfBlockedHz < 100.0f)  cfg.doorLpfBlockedHz = 100.0f;
+                    if (cfg.doorLpfBlockedHz > 10000.0f) cfg.doorLpfBlockedHz = 10000.0f;
+                }
+                if (prop["min_attenuation"]) {
+                    cfg.propMinAttenuation = prop["min_attenuation"].as<float>();
+                    if (cfg.propMinAttenuation < 0.0f)   cfg.propMinAttenuation = 0.0f;
+                    if (cfg.propMinAttenuation > 0.1f)   cfg.propMinAttenuation = 0.1f;
+                }
             }
-            if (audio["dsp_eq"])
-                cfg.dspEQ = audio["dsp_eq"].as<bool>();
-            if (audio["dsp_eq_freq"]) {
-                cfg.dspEQFreq = audio["dsp_eq_freq"].as<float>();
-                if (cfg.dspEQFreq < 60.0f) cfg.dspEQFreq = 60.0f;
-                if (cfg.dspEQFreq > 500.0f) cfg.dspEQFreq = 500.0f;
+
+            // -- audio.spatialization --
+            if (YAML::Node spat = audio["spatialization"]) {
+                if (spat["hrtf_volume"]) {
+                    cfg.hrtfVolume = spat["hrtf_volume"].as<float>();
+                    if (cfg.hrtfVolume < 0.0f) cfg.hrtfVolume = 0.0f;
+                    if (cfg.hrtfVolume > 4.0f) cfg.hrtfVolume = 4.0f;
+                }
+                if (spat["hrtf_interpolation"]) {
+                    cfg.hrtfInterpolation = spat["hrtf_interpolation"].as<std::string>();
+                    if (cfg.hrtfInterpolation != "nearest" && cfg.hrtfInterpolation != "bilinear")
+                        cfg.hrtfInterpolation = "bilinear";
+                }
+                if (spat["spatial_blend"]) {
+                    cfg.spatialBlend = spat["spatial_blend"].as<float>();
+                    if (cfg.spatialBlend < 0.0f) cfg.spatialBlend = 0.0f;
+                    if (cfg.spatialBlend > 1.0f) cfg.spatialBlend = 1.0f;
+                }
+                if (spat["distance_model"]) {
+                    cfg.distanceModel = spat["distance_model"].as<std::string>();
+                    if (cfg.distanceModel != "default" && cfg.distanceModel != "inverse_distance")
+                        cfg.distanceModel = "default";
+                }
             }
-            if (audio["dsp_eq_gain"]) {
-                cfg.dspEQGain = audio["dsp_eq_gain"].as<float>();
-                if (cfg.dspEQGain < -6.0f) cfg.dspEQGain = -6.0f;
-                if (cfg.dspEQGain > 6.0f) cfg.dspEQGain = 6.0f;
+
+            // -- audio.ambient --
+            if (YAML::Node amb = audio["ambient"]) {
+                if (amb["hysteresis_start_mul"]) {
+                    cfg.ambHysteresisStartMul = amb["hysteresis_start_mul"].as<float>();
+                    if (cfg.ambHysteresisStartMul < 1.0f) cfg.ambHysteresisStartMul = 1.0f;
+                    if (cfg.ambHysteresisStartMul > 5.0f) cfg.ambHysteresisStartMul = 5.0f;
+                }
+                if (amb["hysteresis_stop_mul"]) {
+                    cfg.ambHysteresisStopMul = amb["hysteresis_stop_mul"].as<float>();
+                    if (cfg.ambHysteresisStopMul < 1.0f) cfg.ambHysteresisStopMul = 1.0f;
+                    if (cfg.ambHysteresisStopMul > 5.0f) cfg.ambHysteresisStopMul = 5.0f;
+                }
+                if (amb["falloff_curve"]) {
+                    cfg.ambFalloffCurve = amb["falloff_curve"].as<std::string>();
+                    if (cfg.ambFalloffCurve != "linear" && cfg.ambFalloffCurve != "quadratic")
+                        cfg.ambFalloffCurve = "quadratic";
+                }
+                if (amb["default_priority"]) {
+                    cfg.ambDefaultPriority = amb["default_priority"].as<int>();
+                    if (cfg.ambDefaultPriority < 0)   cfg.ambDefaultPriority = 0;
+                    if (cfg.ambDefaultPriority > 255) cfg.ambDefaultPriority = 255;
+                }
             }
-            if (audio["dsp_ducking"])
-                cfg.dspDucking = audio["dsp_ducking"].as<bool>();
-            if (audio["dsp_duck_amount"]) {
-                cfg.dspDuckAmount = audio["dsp_duck_amount"].as<float>();
-                if (cfg.dspDuckAmount < 0.1f) cfg.dspDuckAmount = 0.1f;
-                if (cfg.dspDuckAmount > 1.0f) cfg.dspDuckAmount = 1.0f;
+
+            // -- audio.mixer --
+            if (YAML::Node mix = audio["mixer"]) {
+                if (mix["master_gain"]) {
+                    cfg.mixerMasterGain = mix["master_gain"].as<float>();
+                    if (cfg.mixerMasterGain < 0.0f) cfg.mixerMasterGain = 0.0f;
+                    if (cfg.mixerMasterGain > 4.0f) cfg.mixerMasterGain = 4.0f;
+                }
+                if (mix["reflection_gain"]) {
+                    cfg.mixerReflectionGain = mix["reflection_gain"].as<float>();
+                    if (cfg.mixerReflectionGain < 0.0f) cfg.mixerReflectionGain = 0.0f;
+                    if (cfg.mixerReflectionGain > 4.0f) cfg.mixerReflectionGain = 4.0f;
+                }
+                if (mix["reflection_ramp_ms"]) {
+                    cfg.reflectionRampMs = mix["reflection_ramp_ms"].as<float>();
+                    if (cfg.reflectionRampMs < 1.0f)   cfg.reflectionRampMs = 1.0f;
+                    if (cfg.reflectionRampMs > 1000.0f) cfg.reflectionRampMs = 1000.0f;
+                }
+            }
+
+            // -- audio.dsp --
+            if (YAML::Node dsp = audio["dsp"]) {
+                if (dsp["limiter_enabled"]) cfg.dspLimiter = dsp["limiter_enabled"].as<bool>();
+                if (dsp["limiter_knee"]) {
+                    cfg.dspLimiterKnee = dsp["limiter_knee"].as<float>();
+                    if (cfg.dspLimiterKnee < 0.5f)  cfg.dspLimiterKnee = 0.5f;
+                    if (cfg.dspLimiterKnee > 0.95f) cfg.dspLimiterKnee = 0.95f;
+                }
+                if (dsp["compressor_enabled"]) cfg.dspCompressor = dsp["compressor_enabled"].as<bool>();
+                if (dsp["compressor_threshold_db"]) {
+                    cfg.dspCompThreshold = dsp["compressor_threshold_db"].as<float>();
+                    if (cfg.dspCompThreshold < -30.0f) cfg.dspCompThreshold = -30.0f;
+                    if (cfg.dspCompThreshold > 0.0f)   cfg.dspCompThreshold = 0.0f;
+                }
+                if (dsp["compressor_ratio"]) {
+                    cfg.dspCompRatio = dsp["compressor_ratio"].as<float>();
+                    if (cfg.dspCompRatio < 1.5f) cfg.dspCompRatio = 1.5f;
+                    if (cfg.dspCompRatio > 10.0f) cfg.dspCompRatio = 10.0f;
+                }
+                if (dsp["compressor_attack_ms"]) {
+                    cfg.dspCompAttackMs = dsp["compressor_attack_ms"].as<float>();
+                    if (cfg.dspCompAttackMs < 1.0f)   cfg.dspCompAttackMs = 1.0f;
+                    if (cfg.dspCompAttackMs > 100.0f) cfg.dspCompAttackMs = 100.0f;
+                }
+                if (dsp["compressor_release_ms"]) {
+                    cfg.dspCompReleaseMs = dsp["compressor_release_ms"].as<float>();
+                    if (cfg.dspCompReleaseMs < 50.0f)   cfg.dspCompReleaseMs = 50.0f;
+                    if (cfg.dspCompReleaseMs > 2000.0f) cfg.dspCompReleaseMs = 2000.0f;
+                }
+                if (dsp["eq_enabled"]) cfg.dspEQ = dsp["eq_enabled"].as<bool>();
+                if (dsp["eq_freq_hz"]) {
+                    cfg.dspEQFreq = dsp["eq_freq_hz"].as<float>();
+                    if (cfg.dspEQFreq < 60.0f)  cfg.dspEQFreq = 60.0f;
+                    if (cfg.dspEQFreq > 500.0f) cfg.dspEQFreq = 500.0f;
+                }
+                if (dsp["eq_gain_db"]) {
+                    cfg.dspEQGain = dsp["eq_gain_db"].as<float>();
+                    if (cfg.dspEQGain < -6.0f) cfg.dspEQGain = -6.0f;
+                    if (cfg.dspEQGain > 6.0f)  cfg.dspEQGain = 6.0f;
+                }
+                if (dsp["eq_q"]) {
+                    cfg.dspEQQ = dsp["eq_q"].as<float>();
+                    if (cfg.dspEQQ < 0.3f) cfg.dspEQQ = 0.3f;
+                    if (cfg.dspEQQ > 2.0f) cfg.dspEQQ = 2.0f;
+                }
+                if (dsp["ducking_enabled"]) cfg.dspDucking = dsp["ducking_enabled"].as<bool>();
+                if (dsp["ducking_amount"]) {
+                    cfg.dspDuckAmount = dsp["ducking_amount"].as<float>();
+                    if (cfg.dspDuckAmount < 0.1f) cfg.dspDuckAmount = 0.1f;
+                    if (cfg.dspDuckAmount > 1.0f) cfg.dspDuckAmount = 1.0f;
+                }
+                if (dsp["ducking_attack_ms"]) {
+                    cfg.dspDuckAttackMs = dsp["ducking_attack_ms"].as<float>();
+                    if (cfg.dspDuckAttackMs < 10.0f)  cfg.dspDuckAttackMs = 10.0f;
+                    if (cfg.dspDuckAttackMs > 500.0f) cfg.dspDuckAttackMs = 500.0f;
+                }
+                if (dsp["ducking_release_ms"]) {
+                    cfg.dspDuckReleaseMs = dsp["ducking_release_ms"].as<float>();
+                    if (cfg.dspDuckReleaseMs < 50.0f)   cfg.dspDuckReleaseMs = 50.0f;
+                    if (cfg.dspDuckReleaseMs > 5000.0f) cfg.dspDuckReleaseMs = 5000.0f;
+                }
             }
         }
 
