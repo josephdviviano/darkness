@@ -398,3 +398,263 @@ TEST_CASE("RenderParamsParser: recompute populates derived fields",
     // With sunlight_vector pointing "down" (-Z), the normal points up (+Z).
     CHECK_THAT(rp.sunlightNorm.z, WithinAbs(1.0f, 1e-4f));
 }
+
+// ── buildLightArray (per-vertex GPU path) ──────────────────────────────────
+// These tests exercise the array-build side only. The cosine and 1/dist
+// factors are applied in the vertex shader, so the C++ output should pack
+// the raw light data without folding either factor. Visual correctness of
+// the per-vertex sum is a GPU integration test — covered by visual A/B.
+
+TEST_CASE("buildLightArray: empty cell yields ambient-only result",
+          "[lighting][pervertex]") {
+    WRParsedData wr = makeOpenWorld(0);
+    RenderParams rp = makeQuietRenderParams();
+    rp.ambientLight = Vector3(0.1f, 0.2f, 0.3f);
+
+    ObjectIlluminator ill;
+    ill.setMissionData(&wr, &rp, nullptr);
+
+    GPULightArray out;
+    ill.buildLightArray(/*objId=*/1, Vector3(0.0f), /*radius=*/0.0f,
+                        /*cell=*/0, out);
+
+    CHECK(out.count == 0);
+    CHECK_THAT(out.ambient.x, WithinAbs(0.1f, 1e-4f));
+    CHECK_THAT(out.ambient.y, WithinAbs(0.2f, 1e-4f));
+    CHECK_THAT(out.ambient.z, WithinAbs(0.3f, 1e-4f));
+}
+
+TEST_CASE("buildLightArray: single omni light packed without cosine/dist",
+          "[lighting][pervertex]") {
+    WRParsedData wr = makeOpenWorld(2);
+    // Slot 0 is the sun (zero brightness in quiet rp — won't contribute
+    // visually but is still packed because it's listed in lightIndices).
+    wr.staticLights[0] = WRStaticLight{
+        Vector3(0.0f), Vector3(0.0f), Vector3(0.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+    // Slot 1: omni at (10, 0, 0), brightness (4, 8, 12), no radius.
+    wr.staticLights[1] = WRStaticLight{
+        Vector3(10.0f, 0.0f, 0.0f), Vector3(0.0f), Vector3(4.0f, 8.0f, 12.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+
+    RenderParams rp = makeQuietRenderParams();
+    ObjectIlluminator ill;
+    ill.setMissionData(&wr, &rp, nullptr);
+
+    GPULightArray out;
+    ill.buildLightArray(/*objId=*/1, Vector3(0.0f), /*radius=*/0.0f,
+                        /*cell=*/0, out);
+
+    REQUIRE(out.count == 2);
+    // Slot 1 was packed at index 1 (sun at index 0). Find it by location.
+    int slot1 = -1;
+    for (int i = 0; i < out.count; ++i) {
+        if (out.loc[i].x > 5.0f) { slot1 = i; break; }
+    }
+    REQUIRE(slot1 >= 0);
+
+    // loc.xyz = light position; loc.w = inner cosine (-1 = omni).
+    CHECK_THAT(out.loc[slot1].x, WithinAbs(10.0f, 1e-4f));
+    CHECK_THAT(out.loc[slot1].y, WithinAbs(0.0f, 1e-4f));
+    CHECK_THAT(out.loc[slot1].z, WithinAbs(0.0f, 1e-4f));
+    CHECK_THAT(out.loc[slot1].w, WithinAbs(-1.0f, 1e-4f));
+
+    // bright.rgb = raw bright (multiplier = 1.0). The 1/r factor is GPU-side.
+    CHECK_THAT(out.bright[slot1].x, WithinAbs(4.0f, 1e-4f));
+    CHECK_THAT(out.bright[slot1].y, WithinAbs(8.0f, 1e-4f));
+    CHECK_THAT(out.bright[slot1].z, WithinAbs(12.0f, 1e-4f));
+    // bright.w = radius² (0 here = no cutoff).
+    CHECK_THAT(out.bright[slot1].w, WithinAbs(0.0f, 1e-4f));
+}
+
+TEST_CASE("buildLightArray: spotlight inner/outer packed in loc.w / dir.w",
+          "[lighting][pervertex]") {
+    WRParsedData wr = makeOpenWorld(2);
+    wr.staticLights[0] = WRStaticLight{
+        Vector3(0.0f), Vector3(0.0f), Vector3(0.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+    // Spotlight at (0, 0, 5) pointing -Z, cos(inner)=0.95, cos(outer)=0.5.
+    wr.staticLights[1] = WRStaticLight{
+        Vector3(0.0f, 0.0f, 5.0f),
+        Vector3(0.0f, 0.0f, -1.0f),
+        Vector3(2.0f, 2.0f, 2.0f),
+        0.95f, 0.5f, 0.0f
+    };
+
+    RenderParams rp = makeQuietRenderParams();
+    ObjectIlluminator ill;
+    ill.setMissionData(&wr, &rp, nullptr);
+
+    GPULightArray out;
+    ill.buildLightArray(/*objId=*/1, Vector3(0.0f), /*radius=*/0.0f,
+                        /*cell=*/0, out);
+
+    REQUIRE(out.count == 2);
+    // Sun slot is also packed (at index 0 by the engine convention); find
+    // the spotlight by its non-zero direction vector.
+    int slot1 = -1;
+    for (int i = 0; i < out.count; ++i) {
+        if (std::fabs(out.dir[i].z) > 0.5f) { slot1 = i; break; }
+    }
+    REQUIRE(slot1 >= 0);
+
+    CHECK_THAT(out.loc[slot1].w, WithinAbs(0.95f, 1e-4f));   // inner cosine
+    CHECK_THAT(out.dir[slot1].x, WithinAbs(0.0f, 1e-4f));
+    CHECK_THAT(out.dir[slot1].y, WithinAbs(0.0f, 1e-4f));
+    CHECK_THAT(out.dir[slot1].z, WithinAbs(-1.0f, 1e-4f));
+    CHECK_THAT(out.dir[slot1].w, WithinAbs(0.5f, 1e-4f));    // outer cosine
+}
+
+TEST_CASE("buildLightArray: light multiplier scales packed bright",
+          "[lighting][pervertex]") {
+    WRParsedData wr = makeOpenWorld(2);
+    wr.staticLights[0] = WRStaticLight{
+        Vector3(0.0f), Vector3(0.0f), Vector3(0.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+    wr.staticLights[1] = WRStaticLight{
+        Vector3(10.0f, 0.0f, 0.0f), Vector3(0.0f), Vector3(4.0f, 8.0f, 12.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+
+    RenderParams rp = makeQuietRenderParams();
+    ObjectIlluminator ill;
+    ill.setMissionData(&wr, &rp, nullptr);
+    ill.setLightMultiplier(/*lightIdx=*/1, /*multiplier=*/0.25f);
+
+    GPULightArray out;
+    ill.buildLightArray(/*objId=*/1, Vector3(0.0f), /*radius=*/0.0f,
+                        /*cell=*/0, out);
+
+    REQUIRE(out.count == 2);
+    int slot1 = -1;
+    for (int i = 0; i < out.count; ++i) {
+        if (out.loc[i].x > 5.0f) { slot1 = i; break; }
+    }
+    REQUIRE(slot1 >= 0);
+    // Bright must be pre-scaled by the multiplier (the shader doesn't
+    // know about animation). 0.25 × 4 = 1.0, etc.
+    CHECK_THAT(out.bright[slot1].x, WithinAbs(1.0f, 1e-4f));
+    CHECK_THAT(out.bright[slot1].y, WithinAbs(2.0f, 1e-4f));
+    CHECK_THAT(out.bright[slot1].z, WithinAbs(3.0f, 1e-4f));
+}
+
+TEST_CASE("buildLightArray: zero multiplier drops the light",
+          "[lighting][pervertex]") {
+    WRParsedData wr = makeOpenWorld(2);
+    wr.staticLights[0] = WRStaticLight{
+        Vector3(0.0f), Vector3(0.0f), Vector3(0.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+    wr.staticLights[1] = WRStaticLight{
+        Vector3(10.0f, 0.0f, 0.0f), Vector3(0.0f), Vector3(4.0f, 8.0f, 12.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+
+    RenderParams rp = makeQuietRenderParams();
+    ObjectIlluminator ill;
+    ill.setMissionData(&wr, &rp, nullptr);
+    ill.setLightMultiplier(1, 0.0f);  // light off
+
+    GPULightArray out;
+    ill.buildLightArray(/*objId=*/1, Vector3(0.0f), /*radius=*/0.0f,
+                        /*cell=*/0, out);
+
+    // Only the sun slot remains; slot 1 was filtered.
+    CHECK(out.count == 1);
+}
+
+TEST_CASE("buildLightArray: sun slot patched at kSunlightDistance",
+          "[lighting][pervertex]") {
+    WRParsedData wr = makeOpenWorld(1);
+    // The on-disk slot 0 is scratch; buildLightArray() overwrites it.
+    wr.staticLights[0] = WRStaticLight{
+        Vector3(999.0f), Vector3(999.0f), Vector3(999.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+
+    RenderParams rp = makeQuietRenderParams();
+    rp.sunlightVector = Vector3(0.0f, 0.0f, -1.0f);
+    rp.sunBrightness = 100.0f;
+    rp.sunSaturation = 1.0f;
+    rp.sunHue = 0.0f;
+    recomputeRenderParamsDerived(rp);
+
+    ObjectIlluminator ill;
+    ill.setMissionData(&wr, &rp, nullptr);
+
+    GPULightArray out;
+    Vector3 objPos(1.0f, 2.0f, 3.0f);
+    ill.buildLightArray(/*objId=*/1, objPos, /*radius=*/0.5f,
+                        /*cell=*/0, out);
+
+    REQUIRE(out.count == 1);
+    // Sun is placed at objPos + sunlightNorm × (kSunlightDistance + radius).
+    // sunlightNorm = +Z here (since sunlight points -Z).
+    Vector3 expected = objPos + Vector3(0.0f, 0.0f, 1.0f) * (kSunlightDistance + 0.5f);
+    CHECK_THAT(out.loc[0].x, WithinAbs(expected.x, 1e-3f));
+    CHECK_THAT(out.loc[0].y, WithinAbs(expected.y, 1e-3f));
+    CHECK_THAT(out.loc[0].z, WithinAbs(expected.z, 1e-3f));
+    CHECK_THAT(out.loc[0].w, WithinAbs(-1.0f, 1e-4f));   // omni sentinel
+    // Sun bright = sunScaledRgb (red channel = 100 here).
+    CHECK_THAT(out.bright[0].x, WithinAbs(100.0f, 1e-3f));
+}
+
+TEST_CASE("buildLightArray: dynamic light packed as omni after statics",
+          "[lighting][pervertex]") {
+    WRParsedData wr = makeOpenWorld(1);
+    wr.staticLights[0] = WRStaticLight{
+        Vector3(0.0f), Vector3(0.0f), Vector3(0.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+
+    RenderParams rp = makeQuietRenderParams();
+    DynamicLightList dyn;
+    dyn.add(Vector3(5.0f, 0.0f, 0.0f), Vector3(7.0f, 0.0f, 0.0f),
+            /*radius=*/20.0f);
+
+    ObjectIlluminator ill;
+    ill.setMissionData(&wr, &rp, nullptr);
+    ill.setDynamicLights(&dyn);
+
+    GPULightArray out;
+    ill.buildLightArray(/*objId=*/1, Vector3(0.0f), /*radius=*/0.0f,
+                        /*cell=*/0, out);
+
+    // 1 sun + 1 dynamic.
+    REQUIRE(out.count == 2);
+    // Find dynamic by its unique +5 X position.
+    int dynIdx = -1;
+    for (int i = 0; i < out.count; ++i) {
+        if (std::fabs(out.loc[i].x - 5.0f) < 1e-3f) { dynIdx = i; break; }
+    }
+    REQUIRE(dynIdx >= 0);
+    CHECK_THAT(out.loc[dynIdx].w, WithinAbs(-1.0f, 1e-4f));      // omni
+    CHECK_THAT(out.bright[dynIdx].x, WithinAbs(7.0f, 1e-4f));
+    CHECK_THAT(out.bright[dynIdx].w, WithinAbs(400.0f, 1e-3f));  // radius² = 20²
+}
+
+TEST_CASE("buildLightArray: emits ambient when there are no listed lights",
+          "[lighting][pervertex]") {
+    // Cell exists but has zero light_indices entries — buildLightArray
+    // returns early after writing ambient. Exercises the same observable
+    // contract as the ambient-only ExtraLight override (count=0, ambient
+    // set), without needing a real PropertyService to drive ExtraLight.
+    WRParsedData wr = makeOpenWorld(0);
+
+    RenderParams rp = makeQuietRenderParams();
+    rp.ambientLight = Vector3(0.4f, 0.4f, 0.4f);
+
+    ObjectIlluminator ill;
+    ill.setMissionData(&wr, &rp, nullptr);
+
+    GPULightArray out;
+    ill.buildLightArray(/*objId=*/1, Vector3(0.0f), /*radius=*/0.0f,
+                        /*cell=*/0, out);
+
+    CHECK(out.count == 0);
+    CHECK_THAT(out.ambient.x, WithinAbs(0.4f, 1e-4f));
+}

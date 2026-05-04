@@ -796,6 +796,7 @@ static SDL_Window *initWindow(const Darkness::FogParams &fogParams,
     Darkness::PosColorVertex::init();
     Darkness::PosColorUVVertex::init();
     Darkness::PosUV2Vertex::init();
+    Darkness::PosColorUVNormalVertex::init();
 
     return window;
 }
@@ -851,6 +852,18 @@ static bool createGPUResources(const Darkness::MissionData &mission,
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_water"),
         true);
 
+    // Per-vertex Lambertian object programs — share one vertex shader
+    // (the Lambertian sum lives there) with two fragment shaders
+    // (textured / flat).
+    gpu.texturedPerVertexProgram = bgfx::createProgram(
+        bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_textured_pervertex"),
+        bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_textured_pervertex"),
+        true);
+    gpu.basicPerVertexProgram = bgfx::createProgram(
+        bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_textured_pervertex"),
+        bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_basic_pervertex"),
+        true);
+
     gpu.s_texColor = bgfx::createUniform("s_texColor", bgfx::UniformType::Sampler);
     gpu.s_texLightmap = bgfx::createUniform("s_texLightmap", bgfx::UniformType::Sampler);
     gpu.u_waterParams = bgfx::createUniform("u_waterParams", bgfx::UniformType::Vec4);
@@ -863,6 +876,20 @@ static bool createGPUResources(const Darkness::MissionData &mission,
     gpu.u_objectLight  = bgfx::createUniform("u_objectLight",  bgfx::UniformType::Vec4);
     // Atlas dimensions for bicubic shader texel-space calculations
     gpu.u_lmAtlasSize = bgfx::createUniform("u_lmAtlasSize", bgfx::UniformType::Vec4);
+
+    // Per-object light array uniforms feeding the per-vertex shaders.
+    // Array sizes come from the shared OBJECT_LIGHT_CAP constant
+    // (shaders/object_lighting_constants.h ↔ kObjectLightCap).
+    gpu.u_objectLightCount  = bgfx::createUniform(
+        "u_objectLightCount",  bgfx::UniformType::Vec4);
+    gpu.u_objectAmbient     = bgfx::createUniform(
+        "u_objectAmbient",     bgfx::UniformType::Vec4);
+    gpu.u_objectLightLoc    = bgfx::createUniform(
+        "u_objectLightLoc",    bgfx::UniformType::Vec4, Darkness::kObjectLightCap);
+    gpu.u_objectLightDir    = bgfx::createUniform(
+        "u_objectLightDir",    bgfx::UniformType::Vec4, Darkness::kObjectLightCap);
+    gpu.u_objectLightBright = bgfx::createUniform(
+        "u_objectLightBright", bgfx::UniformType::Vec4, Darkness::kObjectLightCap);
 
     // ── Build lightmap atlas (if textured mode) ──
 
@@ -1130,8 +1157,13 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 }
             }
 
-            // Convert BinVert -> PosColorUVVertex
-            std::vector<PosColorUVVertex> gpuVerts(mesh.vertices.size());
+            // Convert BinVert -> PosColorUVNormalVertex.
+            // Normals come straight through from the parsed .bin model and
+            // are consumed by the per-vertex Lambertian shading path. The
+            // existing scalar shader (fs_textured) ignores a_normal — bgfx
+            // attaches attributes by name — so this buffer feeds both
+            // lighting paths from a single vertex stream.
+            std::vector<PosColorUVNormalVertex> gpuVerts(mesh.vertices.size());
             for (size_t i = 0; i < mesh.vertices.size(); ++i) {
                 const auto &bv = mesh.vertices[i];
 
@@ -1166,15 +1198,16 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 gpuVerts[i] = {
                     bv.x, bv.y, bv.z,
                     vertColor,
-                    bv.u, bv.v
+                    bv.u, bv.v,
+                    bv.nx, bv.ny, bv.nz
                 };
             }
 
             ObjectModelGPU objGPUEntry;
             objGPUEntry.vbh = bgfx::createVertexBuffer(
                 bgfx::copy(gpuVerts.data(),
-                    static_cast<uint32_t>(gpuVerts.size() * sizeof(PosColorUVVertex))),
-                PosColorUVVertex::layout);
+                    static_cast<uint32_t>(gpuVerts.size() * sizeof(PosColorUVNormalVertex))),
+                PosColorUVNormalVertex::layout);
             objGPUEntry.ibh = bgfx::createIndexBuffer(
                 bgfx::copy(mesh.indices.data(),
                     static_cast<uint32_t>(mesh.indices.size() * sizeof(uint32_t))),
@@ -1187,10 +1220,12 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 gsm.indexCount = sm.indexCount;
                 gsm.textured = false;
                 gsm.matTrans = 0.0f;
+                gsm.matIllum = 0.0f;
                 if (sm.matIndex >= 0 && sm.matIndex < static_cast<int>(mesh.materials.size())) {
                     const auto &mat = mesh.materials[sm.matIndex];
                     gsm.textured = (mat.type == Darkness::MD_MAT_TMAP);
                     gsm.matTrans = mat.trans;  // per-material translucency
+                    gsm.matIllum = mat.illum;  // per-material self-illumination (lamp glow, etc.)
                     // Lowercase material name for texture lookup
                     gsm.matName = mat.name;
                     std::transform(gsm.matName.begin(), gsm.matName.end(),
@@ -1387,6 +1422,11 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
     bgfx::destroy(gpu.u_objectParams);
     bgfx::destroy(gpu.u_objectLight);
     bgfx::destroy(gpu.u_lmAtlasSize);
+    bgfx::destroy(gpu.u_objectLightCount);
+    bgfx::destroy(gpu.u_objectAmbient);
+    bgfx::destroy(gpu.u_objectLightLoc);
+    bgfx::destroy(gpu.u_objectLightDir);
+    bgfx::destroy(gpu.u_objectLightBright);
 
     bgfx::destroy(gpu.ibh);
     bgfx::destroy(gpu.vbh);
@@ -1396,6 +1436,8 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
     if (bgfx::isValid(gpu.lightmappedBicubicProgram))
         bgfx::destroy(gpu.lightmappedBicubicProgram);
     bgfx::destroy(gpu.waterProgram);
+    bgfx::destroy(gpu.texturedPerVertexProgram);
+    bgfx::destroy(gpu.basicPerVertexProgram);
 }
 
 // Shut down bgfx and SDL2 window.

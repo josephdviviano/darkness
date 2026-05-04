@@ -97,6 +97,30 @@ struct PosUV2Vertex {
     }
 };
 
+// Object vertex: position + per-vertex baked colour + UV + normal.
+// Normals come from the .bin model files (Dark Engine's 10-bit packed
+// format, decoded in BinMeshParser) and feed the per-vertex Lambertian
+// shading path. The existing scalar object path also draws from this
+// buffer; bgfx attaches attributes by name, so a shader that doesn't
+// declare a_normal simply ignores the trailing 12 bytes per vertex.
+struct PosColorUVNormalVertex {
+    float x, y, z;
+    uint32_t abgr;
+    float u, v;
+    float nx, ny, nz;
+
+    inline static bgfx::VertexLayout layout;
+
+    static void init() {
+        layout.begin()
+            .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
+            .add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Uint8, true)
+            .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
+            .add(bgfx::Attrib::Normal, 3, bgfx::AttribType::Float)
+            .end();
+    }
+};
+
 // ── Cell+texture group for batched draw calls with portal culling ──
 // Groups are sorted by (cellID, txtIndex) so per-cell index ranges are contiguous.
 // When portal culling is active, only groups whose cellID is in the visible set
@@ -526,6 +550,11 @@ struct ObjectSubMeshGPU {
     std::string matName;   // lowercase material name, for texture lookup
     bool textured;         // true = Darkness::MD_MAT_TMAP, false = Darkness::MD_MAT_COLOR
     float matTrans;        // per-material translucency from .bin mat_extra (0=opaque)
+    float matIllum;        // per-material self-illumination from .bin mat_extra (0=none).
+                           // Additive floor in the per-vertex lighting path: a lamp
+                           // casing with illum > 0 glows uniformly even when its
+                           // outward-facing normals leave the interior light below
+                           // the Lambertian half-space.
 };
 
 // GPU buffers for a single unique model (shared by all instances)

@@ -256,7 +256,11 @@ private:
     }
 
     // Read per-material transparency and illumination from mat_extra section.
-    // Only present in version 4+ models with mat_flags & MD_MAT_TRANS.
+    // Only present in version 4+ models. Either MD_MAT_TRANS (=0x1) or
+    // MD_MAT_ILLUM (=0x2) being set means the section exists; lamps with
+    // illum-only materials skip MD_MAT_TRANS but still need mat_extra
+    // parsed, otherwise their casings load with illum=0 and the per-vertex
+    // path's additive self-illumination floor is missing.
     // Each record is {float trans, float illum} (8 bytes minimum).
     void readMaterialsExtra() {
         mMaterialsExtra.resize(mHdr.num_mats);
@@ -266,7 +270,7 @@ private:
         }
 
         if (mVersion < 4) return;
-        if (!(mHdr.mat_flags & MD_MAT_TRANS)) return;
+        if (!(mHdr.mat_flags & (MD_MAT_TRANS | MD_MAT_ILLUM))) return;
         if (mHdr.offset_mat_extra <= 0 || mHdr.size_mat_extra < 8) return;
 
         uint32_t extraOffset = static_cast<uint32_t>(mHdr.offset_mat_extra);

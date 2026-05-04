@@ -33,6 +33,9 @@
 #include "glsl/fs_lightmapped_bicubic.sc.bin.h"
 #include "glsl/vs_water.sc.bin.h"
 #include "glsl/fs_water.sc.bin.h"
+#include "glsl/vs_textured_pervertex.sc.bin.h"
+#include "glsl/fs_textured_pervertex.sc.bin.h"
+#include "glsl/fs_basic_pervertex.sc.bin.h"
 
 // ESSL (OpenGL ES) — all platforms
 #include "essl/vs_basic.sc.bin.h"
@@ -45,6 +48,9 @@
 #include "essl/fs_lightmapped_bicubic.sc.bin.h"
 #include "essl/vs_water.sc.bin.h"
 #include "essl/fs_water.sc.bin.h"
+#include "essl/vs_textured_pervertex.sc.bin.h"
+#include "essl/fs_textured_pervertex.sc.bin.h"
+#include "essl/fs_basic_pervertex.sc.bin.h"
 
 // SPIR-V (Vulkan) — all platforms
 #include "spirv/vs_basic.sc.bin.h"
@@ -57,6 +63,9 @@
 #include "spirv/fs_lightmapped_bicubic.sc.bin.h"
 #include "spirv/vs_water.sc.bin.h"
 #include "spirv/fs_water.sc.bin.h"
+#include "spirv/vs_textured_pervertex.sc.bin.h"
+#include "spirv/fs_textured_pervertex.sc.bin.h"
+#include "spirv/fs_basic_pervertex.sc.bin.h"
 
 // Metal — macOS / iOS only
 #if BGFX_PLATFORM_SUPPORTS_METAL
@@ -70,6 +79,9 @@
 #include "metal/fs_lightmapped_bicubic.sc.bin.h"
 #include "metal/vs_water.sc.bin.h"
 #include "metal/fs_water.sc.bin.h"
+#include "metal/vs_textured_pervertex.sc.bin.h"
+#include "metal/fs_textured_pervertex.sc.bin.h"
+#include "metal/fs_basic_pervertex.sc.bin.h"
 #endif
 
 // DXBC (Direct3D 11/12) — Windows only
@@ -84,6 +96,9 @@
 #include "dx11/fs_lightmapped_bicubic.sc.bin.h"
 #include "dx11/vs_water.sc.bin.h"
 #include "dx11/fs_water.sc.bin.h"
+#include "dx11/vs_textured_pervertex.sc.bin.h"
+#include "dx11/fs_textured_pervertex.sc.bin.h"
+#include "dx11/fs_basic_pervertex.sc.bin.h"
 #endif
 
 // ── Embedded shader lookup table ──
@@ -100,5 +115,8 @@ static const bgfx::EmbeddedShader s_embeddedShaders[] = {
     BGFX_EMBEDDED_SHADER(fs_lightmapped_bicubic),
     BGFX_EMBEDDED_SHADER(vs_water),
     BGFX_EMBEDDED_SHADER(fs_water),
+    BGFX_EMBEDDED_SHADER(vs_textured_pervertex),
+    BGFX_EMBEDDED_SHADER(fs_textured_pervertex),
+    BGFX_EMBEDDED_SHADER(fs_basic_pervertex),
     BGFX_EMBEDDED_SHADER_END()
 };
