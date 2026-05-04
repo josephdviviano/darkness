@@ -356,8 +356,9 @@ struct AudioService::ReflectionMixNode {
     // at 48kHz). Once at 1.0, stays there (subsequent IR updates are handled
     // by Steam Audio's internal crossfading).
     float reflGain = 0.0f;           // current gain (0=silent, 1=full)
-    float reflGainTarget = 1.0f;     // target gain
-    static constexpr float kReflRampRate = 1.0f / 480.0f; // per-sample increment (~10ms at 48kHz)
+    float reflGainTarget = 1.0f;     // target = mixer.reflection_gain (set in initDSP)
+    float reflRampRate = 1.0f / 480.0f; // per-sample increment (set in initDSP from mixer.reflection_ramp_ms)
+    float masterGain = 1.0f;         // post-limiter master multiplier
 
     // ── Master bus DSP chain ──
     // Processing order: Low-shelf EQ → Compressor → Soft Limiter
@@ -374,6 +375,8 @@ struct AudioService::ReflectionMixNode {
     float compThresholdDb = -15.0f;  // dBFS threshold
     float compThresholdLin = 0.178f; // linear threshold (computed from dB in initDSP)
     float compRatio = 3.0f;         // compression ratio (3:1)
+    float compAttackMs = 10.0f;     // attack time in ms (config-driven; pushed before initDSP)
+    float compReleaseMs = 250.0f;   // release time in ms (config-driven; pushed before initDSP)
     float compAttackCoeff = 0.0f;   // per-sample attack smoothing coefficient
     float compReleaseCoeff = 0.0f;  // per-sample release smoothing coefficient
     float compMakeupDb = 0.0f;      // makeup gain in dB (auto-computed from threshold/ratio)
@@ -398,6 +401,8 @@ struct AudioService::ReflectionMixNode {
     // by duckGain, which smoothly transitions based on SFX activity.
     bool duckingEnabled = false;
     float duckAmount = 0.5f;       // target ambient volume multiplier during SFX
+    float duckAttackMs = 50.0f;    // ducking attack in ms (config-driven; pushed before initDSP)
+    float duckReleaseMs = 500.0f;  // ducking release in ms (config-driven; pushed before initDSP)
     float duckAttackCoeff = 0.0f;  // per-frame attack coefficient
     float duckReleaseCoeff = 0.0f; // per-frame release coefficient
     float duckGain = 1.0f;         // current ducking multiplier (1.0 = no duck)
@@ -405,10 +410,10 @@ struct AudioService::ReflectionMixNode {
     /// Initialize DSP chain coefficients from sample rate. Must be called after
     /// frameSize is set and before the first audio callback.
     void initDSP(uint32_t sampleRate) {
-        // Compressor attack/release coefficients (per-sample exponential)
-        // attack = 10ms, release = 250ms
-        float attackTimeSec = 0.010f;
-        float releaseTimeSec = 0.250f;
+        // Compressor attack/release coefficients (per-sample exponential).
+        // Times come from config (default 10ms attack, 250ms release).
+        float attackTimeSec = compAttackMs * 0.001f;
+        float releaseTimeSec = compReleaseMs * 0.001f;
         compAttackCoeff = 1.0f - std::exp(-1.0f / (static_cast<float>(sampleRate) * attackTimeSec));
         compReleaseCoeff = 1.0f - std::exp(-1.0f / (static_cast<float>(sampleRate) * releaseTimeSec));
 
@@ -442,10 +447,11 @@ struct AudioService::ReflectionMixNode {
         eqA1 = a1 * invA0;
         eqA2 = a2 * invA0;
 
-        // Ducking coefficients (per-frame, not per-sample — called from loopStep)
-        // Attack: 50ms, Release: 500ms, assuming ~60fps
-        duckAttackCoeff = 1.0f - std::exp(-1.0f / (60.0f * 0.050f));
-        duckReleaseCoeff = 1.0f - std::exp(-1.0f / (60.0f * 0.500f));
+        // Ducking coefficients (per-frame, not per-sample — called from loopStep).
+        // Times come from config (default 50ms attack, 500ms release).
+        // Per-frame coefficient assumes a ~60fps loop step.
+        duckAttackCoeff = 1.0f - std::exp(-1.0f / (60.0f * duckAttackMs * 0.001f));
+        duckReleaseCoeff = 1.0f - std::exp(-1.0f / (60.0f * duckReleaseMs * 0.001f));
     }
 };
 
@@ -550,6 +556,41 @@ static ma_node_vtable sReflectionMixNodeVtable = {
 /// mono input through as dual-mono stereo. Helps isolate node graph issues.
 /// DSP bypass level (0=full pipeline, 3=mono passthrough, 4=stereo passthrough)
 static std::atomic<int> sDSPBypassLevel{0};
+
+// ── Engine ↔ Steam Audio unit conversion ──
+// The Dark Engine convention is 1 world unit = 1 foot (player is 6 units tall,
+// gravity is 32 units/s² ≈ 9.8 m/s² in feet). Steam Audio's IPL API has no
+// "scale" knob: distances are interpreted as METERS by its physics models —
+// air absorption is computed per-meter, IRs scale with path length, distance
+// attenuation curves treat the input value as meters. Feeding raw feet makes
+// the virtual scene look ~3.28× larger than reality, with over-attenuated
+// highs, exaggerated reverb tails, and wrong reflection delays.
+//
+// Fix: every position, geometry vertex, and distance-shaped parameter that
+// crosses into the IPL API gets scaled by kFeetToMeters. Scalars that stay
+// inside the engine (our portal-graph distances, effectiveDistance, etc.)
+// remain in feet — the conversion is strictly at the IPL boundary.
+//
+// The dimensionless quantities (occlusion sample counts, ray counts, material
+// absorption coefficients, frequencies in Hz, durations in seconds) are
+// untouched: they were never affected by the unit mismatch.
+constexpr float kFeetToMeters = 0.3048f;
+
+// ── Audio-thread tunables ──
+// File-scope atomics published by AudioService setters and read on the audio
+// thread. These belong to per-voice processing paths that don't have direct
+// access to AudioService members; using atomics avoids data races even though
+// the values are typically only set once at startup from RenderConfig.
+//   sHrtfInterpolation: 0 = nearest, 1 = bilinear
+//   sDistanceModel:     0 = default, 1 = inverse_distance
+static std::atomic<int>   sHrtfInterpolation{1};
+static std::atomic<float> sSpatialBlend{1.0f};
+static std::atomic<float> sDoorLpfOpenHz{20000.0f};
+static std::atomic<float> sDoorLpfBlockedHz{800.0f};
+static std::atomic<float> sPropMinAttenuation{0.001f};
+static std::atomic<int>   sDistanceModel{0};
+/// Engine sample rate published for audio-thread DSP that needs it (door LPF, etc.)
+static std::atomic<uint32_t> sEngineSampleRate{48000};
 
 // ── Debug audio recording ──
 // Captures the final stereo output to a WAV file for offline analysis.
@@ -768,7 +809,8 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         if (node->usePortalRouting) {
             atten *= node->portalAttenuation;
         }
-        if (atten < 0.001f) atten = 0.001f;
+        float minAtten = sPropMinAttenuation.load(std::memory_order_relaxed);
+        if (atten < minAtten) atten = minAtten;
         node->lastAtten.store(atten, std::memory_order_relaxed);
     }
 
@@ -793,8 +835,10 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
 
         IPLBinauralEffectParams binParams{};
         binParams.direction = node->direction;
-        binParams.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;
-        binParams.spatialBlend = 1.0f;
+        binParams.interpolation = (sHrtfInterpolation.load(std::memory_order_relaxed) == 0)
+                                  ? IPL_HRTFINTERPOLATION_NEAREST
+                                  : IPL_HRTFINTERPOLATION_BILINEAR;
+        binParams.spatialBlend = sSpatialBlend.load(std::memory_order_relaxed);
         binParams.hrtf = node->hrtf;
         binParams.peakDelays = nullptr;
 
@@ -805,7 +849,8 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         // and separate from the direct effect applied above.
         if (runAtten && !node->skipAttenuation && node->usePortalRouting) {
             float portalScale = node->portalAttenuation;
-            if (portalScale < 0.001f) portalScale = 0.001f;
+            float minAtten = sPropMinAttenuation.load(std::memory_order_relaxed);
+            if (portalScale < minAtten) portalScale = minAtten;
             for (ma_uint32 i = 0; i < frameCount; ++i) {
                 chL[i] *= portalScale;
                 chR[i] *= portalScale;
@@ -814,13 +859,15 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             // Low-pass filter for door blocking — closed doors absorb high
             // frequencies more than low frequencies, producing a muffled
             // quality. Uses a 1-pole IIR LPF whose cutoff decreases with
-            // increasing blocking factor: 0 blocking = no filter (20kHz),
-            // full blocking = heavy filter (~800Hz).
+            // increasing blocking factor along an exponential map between
+            // open and blocked cutoffs (config-driven; defaults 20kHz→800Hz).
             float blocking = node->portalBlocking;
             if (blocking > 0.01f) {
-                // Map blocking 0→1 to cutoff 20000→800 Hz (exponential)
-                float cutoff = 20000.0f * std::pow(0.04f, blocking);  // 0.04 = 800/20000
-                constexpr float sampleRate = 48000.0f;
+                float openHz    = sDoorLpfOpenHz.load(std::memory_order_relaxed);
+                float blockedHz = sDoorLpfBlockedHz.load(std::memory_order_relaxed);
+                float cutoff = openHz * std::pow(blockedHz / openHz, blocking);
+                float sampleRate = static_cast<float>(
+                    sEngineSampleRate.load(std::memory_order_relaxed));
                 float rc = 1.0f / (2.0f * 3.14159265f * cutoff);
                 float dt = 1.0f / sampleRate;
                 float alpha = dt / (rc + dt);
@@ -973,7 +1020,7 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             // Additive mix with gain ramp
             for (ma_uint32 i = 0; i < outSamples; ++i) {
                 if (node->reflGain < node->reflGainTarget)
-                    node->reflGain = std::min(node->reflGain + node->kReflRampRate, node->reflGainTarget);
+                    node->reflGain = std::min(node->reflGain + node->reflRampRate, node->reflGainTarget);
                 float g = node->reflGain;
                 stereoOut[i * 2]     += sub.stereoL[front][i] * g;
                 stereoOut[i * 2 + 1] += sub.stereoR[front][i] * g;
@@ -1092,7 +1139,15 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         }
     }
 
-    // Stage 3: Soft limiter — smooth tanh saturation above the knee threshold.
+    // Stage 3a: Master gain — applied PRE-limiter so that boosting above 1.0
+    // is reined in by the limiter rather than clipping.
+    if (node->masterGain != 1.0f) {
+        float mg = node->masterGain;
+        for (ma_uint32 i = 0; i < frameCount * 2; ++i)
+            stereoOut[i] *= mg;
+    }
+
+    // Stage 3b: Soft limiter — smooth tanh saturation above the knee threshold.
     // Transparent below the knee (default 0.8), smoothly curves to ±1.0 above.
     // Replaces the old hard clamp which produced audible click artifacts.
     if (node->limiterEnabled) {
@@ -1321,14 +1376,16 @@ bool AudioService::initMiniaudio()
 {
     mMaEngine = new ma_engine();
 
-    // Use 48kHz — the standard rate that Steam Audio's HRTF supports.
-    // miniaudio handles resampling to the device's native rate (e.g. 96kHz).
+    // Engine sample rate is configurable (default 48kHz).
+    // 48kHz is preferred — Steam Audio's HRTF dataset is native at 48kHz and any
+    // other rate forces internal resampling. miniaudio still resamples between
+    // engine and device rates if those differ.
     ma_engine_config config = ma_engine_config_init();
-    config.channels = 2;           // stereo output
-    config.sampleRate = 48000;     // 48kHz for Steam Audio HRTF compatibility
+    config.channels = 2;           // stereo output (hardcoded — binaural HRTF requires stereo)
+    config.sampleRate = static_cast<ma_uint32>(mAudioSampleRateCfg);
     config.noDevice = MA_FALSE;    // create output device
     config.listenerCount = 1;      // one listener for 3D spatialization
-    config.periodSizeInFrames = 1024; // power-of-2 period for Steam Audio HRTF compatibility
+    config.periodSizeInFrames = static_cast<ma_uint32>(mAudioFrameSizeCfg);
 
     ma_result result = ma_engine_init(&config, mMaEngine);
     if (result != MA_SUCCESS) {
@@ -1359,8 +1416,24 @@ bool AudioService::initMiniaudio()
                      mFrameSize);
     }
 
+    // Publish engine sample rate to audio-thread DSP that needs it (door LPF).
+    sEngineSampleRate.store(mDeviceSampleRate, std::memory_order_relaxed);
+
     LOG_INFO("AudioService: miniaudio initialized");
     return true;
+}
+
+//------------------------------------------------------
+void AudioService::publishAudioThreadParams()
+{
+    sHrtfInterpolation.store(mHRTFInterpolation == "nearest" ? 0 : 1,
+                             std::memory_order_relaxed);
+    sSpatialBlend.store(mSpatialBlend, std::memory_order_relaxed);
+    sDoorLpfOpenHz.store(mDoorLpfOpenHz, std::memory_order_relaxed);
+    sDoorLpfBlockedHz.store(mDoorLpfBlockedHz, std::memory_order_relaxed);
+    sPropMinAttenuation.store(mPropMinAttenuation, std::memory_order_relaxed);
+    sDistanceModel.store(mDistanceModel == "inverse_distance" ? 1 : 0,
+                         std::memory_order_relaxed);
 }
 
 //------------------------------------------------------
@@ -1396,7 +1469,7 @@ bool AudioService::initSteamAudio()
 
     IPLHRTFSettings hrtfSettings{};
     hrtfSettings.type = IPL_HRTFTYPE_DEFAULT;
-    hrtfSettings.volume = 1.0f;  // 1.0 = use HRTF data as-is (0.0 = silence!)
+    hrtfSettings.volume = mHRTFVolume;  // 1.0 = HRTF as-is; 0.0 = silence!
 
     err = iplHRTFCreate(mIplContext, &audioSettings, &hrtfSettings, &mIplHrtf);
     if (err != IPL_STATUS_SUCCESS) {
@@ -1438,8 +1511,9 @@ bool AudioService::loadSoundResources(const std::string &resPath,
         return false;
     }
 
-    // Create LRU sound cache (64MB budget)
-    mSoundCache = std::make_unique<SoundCache>();
+    // Create LRU sound cache (configurable budget; default 64MB)
+    mSoundCache = std::make_unique<SoundCache>(
+        static_cast<size_t>(mSoundCacheMBCfg) * 1024u * 1024u);
 
     // Load schema files (.spc, .arc, .sch).
     // Thief 2 stores schemas on disc 2 at EDITOR/SCHEMA/ or disc 1 at EDITOR/schemas/.
@@ -1532,10 +1606,18 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
     // Wrap scene construction in try-catch so that any C++ exception
     // (e.g. from std::vector allocation) cleans up partially-created
     // Steam Audio objects instead of leaking them.
+    // Resolve scene type once for both the scene and the simulator below.
+    IPLSceneType sceneTypeEnum = IPL_SCENETYPE_DEFAULT;
+    if (mSceneTypeCfg == "embree") {
+        // Embree only takes effect if Steam Audio was built with embree support;
+        // otherwise the IPL fall back is to DEFAULT internally.
+        sceneTypeEnum = IPL_SCENETYPE_EMBREE;
+    }
+
     try {
         // Step 1: Create IPLScene (Steam Audio's built-in CPU raytracer)
         IPLSceneSettings sceneSettings{};
-        sceneSettings.type = IPL_SCENETYPE_DEFAULT;
+        sceneSettings.type = sceneTypeEnum;
 
         IPLerror err = iplSceneCreate(mIplContext, &sceneSettings, &mIplScene);
         if (err != IPL_STATUS_SUCCESS) {
@@ -1583,8 +1665,12 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             materialIndices.push_back(it != texToMaterialIdx.end() ? it->second : 0);
         }
 
-        // Step 3: Convert vertex data to IPLVector3 array and compute scene bounds
-        // (IPLVector3 is {float x, y, z} — same layout as our flat array)
+        // Step 3: Convert vertex data to IPLVector3 array and compute scene bounds.
+        // Engine vertices are in feet; IPL expects meters. Scale at the boundary
+        // so Steam Audio sees physically-correct dimensions for air absorption,
+        // reverb decay, and reflection delays.
+        // mSceneMin/mSceneMax stay in FEET — they're used for our own probe-extent
+        // computations and are converted to meters at the IPL transform.
         mSceneMin = Vector3( 1e9f,  1e9f,  1e9f);
         mSceneMax = Vector3(-1e9f, -1e9f, -1e9f);
         std::vector<IPLVector3> iplVertices(numVertices);
@@ -1592,9 +1678,11 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             float x = data.vertices[i * 3];
             float y = data.vertices[i * 3 + 1];
             float z = data.vertices[i * 3 + 2];
-            iplVertices[i] = {x, y, z};
+            // Bounds in engine units (feet)
             mSceneMin = glm::min(mSceneMin, Vector3(x, y, z));
             mSceneMax = glm::max(mSceneMax, Vector3(x, y, z));
+            // Vertex shipped to IPL in meters
+            iplVertices[i] = {x * kFeetToMeters, y * kFeetToMeters, z * kFeetToMeters};
         }
 
         // Convert index data to IPLTriangle array
@@ -1638,18 +1726,23 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         IPLSimulationSettings simSettings{};
         simSettings.flags = static_cast<IPLSimulationFlags>(
             IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
-        simSettings.sceneType = IPL_SCENETYPE_DEFAULT;
+        simSettings.sceneType = sceneTypeEnum;
         simSettings.reflectionType = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-        simSettings.maxNumOcclusionSamples = 32;
-        simSettings.maxNumRays = 4096;       // max rays (runtime uses mReflectionNumRays)
+        // Sim caps — these are upper bounds; runtime uses mReflectionNumRays etc.
+        // maxNumRays must be >= the runtime ray count; auto-bump if user set both.
+        simSettings.maxNumOcclusionSamples = mSimMaxOcclusionSamplesCfg;
+        simSettings.maxNumRays = std::max(mSimMaxRaysCfg, mReflectionNumRays);
         simSettings.numDiffuseSamples = mDiffuseSamples;
         simSettings.maxDuration = mReflectionDuration;
         simSettings.maxOrder = mAmbisonicsOrder;
-        simSettings.maxNumSources = 32;      // voice pool size
-        // Use most available cores for parallel ray tracing.
-        // Reserve 2 cores for main + audio threads.
-        unsigned int hwThreads = std::thread::hardware_concurrency();
-        simSettings.numThreads = std::max(2u, hwThreads > 2 ? hwThreads - 2 : 2u);
+        simSettings.maxNumSources = mSimMaxSourcesCfg;
+        // Ray-trace thread count: 0 = auto (reserve 2 cores for main + audio).
+        if (mSimulatorThreadsCfg > 0) {
+            simSettings.numThreads = mSimulatorThreadsCfg;
+        } else {
+            unsigned int hwThreads = std::thread::hardware_concurrency();
+            simSettings.numThreads = std::max(2u, hwThreads > 2 ? hwThreads - 2 : 2u);
+        }
         simSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
         simSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
 
@@ -1816,13 +1909,29 @@ bool AudioService::initReflectionPipeline()
     rmn.compressorEnabled = mDSPCompressorEnabled;
     rmn.compThresholdDb = mDSPCompThreshold;
     rmn.compRatio = mDSPCompRatio;
+    rmn.compAttackMs = mDSPCompAttackMs;
+    rmn.compReleaseMs = mDSPCompReleaseMs;
     rmn.eqEnabled = mDSPEQEnabled;
     rmn.eqFreq = mDSPEQFreq;
     rmn.eqGainDb = mDSPEQGain;
+    rmn.eqQ = mDSPEQQ;
     rmn.duckingEnabled = mDSPDuckingEnabled;
     rmn.duckAmount = mDSPDuckAmount;
+    rmn.duckAttackMs = mDSPDuckAttackMs;
+    rmn.duckReleaseMs = mDSPDuckReleaseMs;
 
-    // Initialize the master bus DSP chain (EQ, compressor, limiter coefficients)
+    // Mixer config — global gains + reflection ramp time.
+    // reflRampRate is the per-sample increment such that a full 0→1 ramp takes
+    // mReflectionRampMs milliseconds at the current sample rate.
+    rmn.masterGain = mMasterGain;
+    rmn.reflGainTarget = mReflectionGain;
+    {
+        float rampSamples = (mReflectionRampMs * 0.001f) * static_cast<float>(mDeviceSampleRate);
+        rmn.reflRampRate = (rampSamples > 1.0f) ? (1.0f / rampSamples) : 1.0f;
+    }
+
+    // Initialize the master bus DSP chain (EQ, compressor, limiter coefficients).
+    // Must be called AFTER pushing config — initDSP reads compAttackMs/eqQ/etc.
     rmn.initDSP(mDeviceSampleRate);
     AUDIO_LOG( "REFL: DSP chain initialized (limiter=%s knee=%.2f, compressor=%s %.0fdB/%g:1, eq=%s %gHz/%+gdB, ducking=%s)\n",
                  rmn.limiterEnabled ? "on" : "off", rmn.limiterKnee,
@@ -2293,8 +2402,12 @@ void AudioService::loopStep(float deltaTime)
         Vector3 ahead(cosY * cosP, sinY * cosP, sinP);
         Vector3 up(-cosY * sinP, -sinY * sinP, cosP);
 
+        // Listener origin → IPL in meters (engine stores feet).
+        // Direction vectors are unit-length, no scaling needed.
         IPLCoordinateSpace3 listenerCoord{};
-        listenerCoord.origin = {mListenerPos.x, mListenerPos.y, mListenerPos.z};
+        listenerCoord.origin = {mListenerPos.x * kFeetToMeters,
+                                mListenerPos.y * kFeetToMeters,
+                                mListenerPos.z * kFeetToMeters};
         listenerCoord.ahead  = {ahead.x, ahead.y, ahead.z};
         listenerCoord.right  = {right.x, right.y, right.z};
         listenerCoord.up     = {up.x, up.y, up.z};
@@ -2420,7 +2533,8 @@ void AudioService::loopStep(float deltaTime)
                     && !voice->skipPortalRouting) {
                     if (voice->propagationCountdown <= 0) {
                         auto prT0 = std::chrono::steady_clock::now();
-                        prop = propagateSoundBlended(voice->worldPos);
+                        prop = propagateSoundBlended(voice->worldPos,
+                                                     mPropagationMaxDist);
                         auto prT1 = std::chrono::steady_clock::now();
                         float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
                         sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
@@ -2483,15 +2597,19 @@ void AudioService::loopStep(float deltaTime)
                 // correct frequency-dependent occlusion for the final visible
                 // segment. Same-room voices use their real position for full
                 // same-room occlusion (pillars, furniture, etc.).
+                // Source origin → IPL in meters (engine positions are in feet).
+                // Cross-room sounds project from the last portal's center
+                // (prop.virtualPosition) so distance attenuation reflects the
+                // longer path. Both feet, both converted here.
                 IPLCoordinateSpace3 sourceCoord{};
                 if (isCrossRoom && prop.reached) {
-                    sourceCoord.origin = {prop.virtualPosition.x,
-                                          prop.virtualPosition.y,
-                                          prop.virtualPosition.z};
+                    sourceCoord.origin = {prop.virtualPosition.x * kFeetToMeters,
+                                          prop.virtualPosition.y * kFeetToMeters,
+                                          prop.virtualPosition.z * kFeetToMeters};
                 } else {
-                    sourceCoord.origin = {voice->worldPos.x,
-                                          voice->worldPos.y,
-                                          voice->worldPos.z};
+                    sourceCoord.origin = {voice->worldPos.x * kFeetToMeters,
+                                          voice->worldPos.y * kFeetToMeters,
+                                          voice->worldPos.z * kFeetToMeters};
                 }
                 sourceCoord.ahead = {1.0f, 0.0f, 0.0f};
                 sourceCoord.right = {0.0f, 1.0f, 0.0f};
@@ -2506,7 +2624,10 @@ void AudioService::loopStep(float deltaTime)
                     IPL_DIRECTSIMULATIONFLAGS_OCCLUSION |
                     IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
                 inputs.source = sourceCoord;
-                inputs.distanceAttenuationModel.type = IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
+                inputs.distanceAttenuationModel.type =
+                    (sDistanceModel.load(std::memory_order_relaxed) == 1)
+                        ? IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE
+                        : IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
                 inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
                 // Volumetric occlusion models the source as a sphere — as the
                 // sphere partially disappears behind a corner, occlusion ramps
@@ -2517,9 +2638,15 @@ void AudioService::loopStep(float deltaTime)
                 // over-occluded by narrow door frames. The larger sphere means more
                 // rays see around edges, producing gentle partial occlusion instead
                 // of heavy blocking. Works correctly for both player and NPC doors.
-                inputs.occlusionRadius = voice->skipPortalRouting
-                    ? std::max(mOcclusionRadius, 5.0f)
+                // Engine radius is in feet (matches occlusion_radius YAML key);
+                // convert to meters at the IPL boundary.
+                // 16 ft floor ≈ 4.88 m at IPL — generous enough for typical
+                // doorways (~3 ft wide) so a partially-open door produces gentle
+                // ramping rather than abrupt blocking.
+                float occRadiusFt = voice->skipPortalRouting
+                    ? std::max(mOcclusionRadius, 16.0f)
                     : mOcclusionRadius;
+                inputs.occlusionRadius = occRadiusFt * kFeetToMeters;
                 inputs.numOcclusionSamples = mOcclusionSamples;
                 inputs.numTransmissionRays = 8;
 
@@ -3330,8 +3457,10 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
     if (!mMaEngine || !mSoundLoader)
         return SOUND_HANDLE_INVALID;
 
-    // Enforce voice limit — evict lowest priority if full
-    if (static_cast<int>(mVoices.size()) >= MAX_ACTIVE_VOICES) {
+    // Enforce voice limit — evict lowest priority if full.
+    // Effective cap is min(config, compile-time max for array sizing).
+    int effectiveCap = std::min(mMaxActiveVoicesCfg, MAX_ACTIVE_VOICES);
+    if (static_cast<int>(mVoices.size()) >= effectiveCap) {
         if (!evictLowestPriority(priority)) {
             AUDIO_LOG( "[VOICE] POOL_FULL cannot play '%s' pri=%d voices=%zu\n",
                          schemaName.c_str(), priority, mVoices.size());
@@ -3962,11 +4091,13 @@ void AudioService::updateAmbientVolumes()
         // on radius. Room routing handles cross-room propagation for voices
         // in the voice update loop (Step 2b), not here.
         //
-        // Start voices at 1.5x radius (before audible) so the distance-based
-        // volume curve fades in smoothly. Stop at 2x radius (hysteresis).
+        // Start voices BEFORE the source becomes audible so the distance-based
+        // volume curve fades in smoothly. Stop at a wider hysteresis radius
+        // to avoid rapid start/stop oscillation when the listener hovers near
+        // the boundary. Multipliers come from audio.ambient config.
         float dist = glm::length(mListenerPos - amb.position);
-        float startRadius = amb.radius * 1.5f;
-        float stopRadius = amb.radius * 2.0f;
+        float startRadius = amb.radius * mAmbHysteresisStartMul;
+        float stopRadius = amb.radius * mAmbHysteresisStopMul;
 
         bool alreadyPlaying = (amb.handle != SOUND_HANDLE_INVALID);
         bool inRange = (amb.radius > 0.0f &&
@@ -3999,7 +4130,7 @@ void AudioService::updateAmbientVolumes()
                 // Fallback: try loading schema name as a raw sound
                 if (amb.handle == SOUND_HANDLE_INVALID) {
                     amb.handle = startVoice(amb.schemaName, amb.schemaName, amb.position,
-                                            64, isLooping, amb.objID, 0.0f);
+                                            mAmbDefaultPriority, isLooping, amb.objID, 0.0f);
                     if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle)) {
                         mVoices[amb.handle]->isAmbient = isEnvironmental;
                         justCreated = true;
@@ -4023,7 +4154,11 @@ void AudioService::updateAmbientVolumes()
                 float distFactor;
                 if (isEnvironmental) {
                     distFactor = std::max(0.0f, 1.0f - (dist / amb.radius));
-                    if (!(amb.flags & AMB_NO_FADE))
+                    // Falloff curve from audio.ambient.falloff_curve.
+                    // AMB_NO_FADE flag forces linear regardless of config.
+                    bool useQuadratic = (mAmbFalloffCurve == "quadratic")
+                                        && !(amb.flags & AMB_NO_FADE);
+                    if (useQuadratic)
                         distFactor *= distFactor;
                 } else {
                     // Object ambients — Steam Audio handles distance.
@@ -4987,29 +5122,33 @@ bool AudioService::bakeProbes(const std::string &outputPath,
 
     // Use the actual acoustic scene bounding box for probe generation.
     // The OBB transform maps a unit cube [-0.5, 0.5]³ to world space.
+    // mSceneMin/Max are in FEET; the IPL transform and probe spacing must be
+    // in METERS so probe positions land at the same physical points as the
+    // (already-converted) static mesh vertices.
     Vector3 center = (mSceneMin + mSceneMax) * 0.5f;
     Vector3 extent = mSceneMax - mSceneMin;
-    // Add a small margin to ensure probes cover the edges
+    // Add a small margin (in feet, matching `spacing`) to ensure probes cover edges
     extent += Vector3(spacing * 2.0f);
 
     IPLMatrix4x4 transform{};
-    transform.elements[0][0] = extent.x;   // X scale
-    transform.elements[1][1] = extent.y;   // Y scale
-    transform.elements[2][2] = extent.z;   // Z scale
-    transform.elements[3][0] = center.x;   // X translation
-    transform.elements[3][1] = center.y;   // Y translation
-    transform.elements[3][2] = center.z;   // Z translation
+    transform.elements[0][0] = extent.x * kFeetToMeters; // X scale (m)
+    transform.elements[1][1] = extent.y * kFeetToMeters; // Y scale (m)
+    transform.elements[2][2] = extent.z * kFeetToMeters; // Z scale (m)
+    transform.elements[3][0] = center.x * kFeetToMeters; // X translation (m)
+    transform.elements[3][1] = center.y * kFeetToMeters; // Y translation (m)
+    transform.elements[3][2] = center.z * kFeetToMeters; // Z translation (m)
     transform.elements[3][3] = 1.0f;
 
-    AUDIO_LOG( "Scene bounds: (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) extent=(%.0f,%.0f,%.0f)\n",
+    AUDIO_LOG( "Scene bounds (ft): (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) extent=(%.0f,%.0f,%.0f)\n",
                  mSceneMin.x, mSceneMin.y, mSceneMin.z,
                  mSceneMax.x, mSceneMax.y, mSceneMax.z,
                  extent.x, extent.y, extent.z);
 
     IPLProbeGenerationParams genParams{};
     genParams.type = IPL_PROBEGENERATIONTYPE_UNIFORMFLOOR;
-    genParams.spacing = spacing;
-    genParams.height = height;
+    // spacing/height are passed in feet; IPL grid is in meters.
+    genParams.spacing = spacing * kFeetToMeters;
+    genParams.height  = height  * kFeetToMeters;
     genParams.transform = transform;
 
     iplProbeArrayGenerateProbes(probeArray, mIplScene, &genParams);
@@ -5044,16 +5183,18 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     pathId.type = IPL_BAKEDDATATYPE_PATHING;
     pathId.variation = IPL_BAKEDDATAVARIATION_DYNAMIC;
 
+    // Pathing bake — all distance-shaped fields cross into IPL, so feet → meters.
+    // `spacing` and `mPropagationMaxDist` live in engine feet; convert here.
     IPLPathBakeParams bakeParams{};
     bakeParams.scene = mIplScene;
     bakeParams.probeBatch = probeBatch;
     bakeParams.identifier = pathId;
-    bakeParams.numSamples = 4;       // visibility test samples (rays = numSamples²)
-    bakeParams.radius = spacing;     // probe influence radius
-    bakeParams.threshold = 0.1f;     // visibility threshold
-    bakeParams.visRange = 200.0f;    // max visibility distance (SOUND_MAX_DIST)
-    bakeParams.pathRange = 200.0f;   // max path length
-    bakeParams.numThreads = 4;       // parallel baking
+    bakeParams.numSamples = 4;                                   // visibility test samples (rays = numSamples²)
+    bakeParams.radius = spacing * kFeetToMeters;                 // probe influence radius (m)
+    bakeParams.threshold = 0.1f;                                 // visibility threshold (dimensionless)
+    bakeParams.visRange  = mPropagationMaxDist * kFeetToMeters;  // max visibility distance (m)
+    bakeParams.pathRange = mPropagationMaxDist * kFeetToMeters;  // max path length (m)
+    bakeParams.numThreads = 4;                                   // parallel baking
 
     auto bakeStart = std::chrono::steady_clock::now();
 
@@ -5081,12 +5222,15 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     reflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
 
     unsigned int hwThreads = std::thread::hardware_concurrency();
-    int bakeThreads = std::max(2u, hwThreads > 2 ? hwThreads - 2 : 2u);
+    int bakeThreads = (mSimulatorThreadsCfg > 0)
+        ? mSimulatorThreadsCfg
+        : std::max(2u, hwThreads > 2 ? hwThreads - 2 : 2u);
 
     IPLReflectionsBakeParams reflBakeParams{};
     reflBakeParams.scene = mIplScene;
     reflBakeParams.probeBatch = probeBatch;
-    reflBakeParams.sceneType = IPL_SCENETYPE_DEFAULT;
+    reflBakeParams.sceneType = (mSceneTypeCfg == "embree")
+        ? IPL_SCENETYPE_EMBREE : IPL_SCENETYPE_DEFAULT;
     reflBakeParams.identifier = reflId;
     reflBakeParams.bakeFlags = static_cast<IPLReflectionsBakeFlags>(
         IPL_REFLECTIONSBAKEFLAGS_BAKECONVOLUTION);
@@ -5097,6 +5241,9 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     reflBakeParams.savedDuration = mReflectionDuration;  // save full IR
     reflBakeParams.order = mAmbisonicsOrder;
     reflBakeParams.numThreads = bakeThreads;
+    // irradianceMinDistance is in METERS (Steam Audio convention) — clamps the
+    // inner radius of the irradiance integral to avoid singularities for sources
+    // very close to a probe. 1.0m ≈ 3.28 ft is a sensible physical default.
     reflBakeParams.irradianceMinDistance = 1.0f;
 
     auto reflBakeStart = std::chrono::steady_clock::now();

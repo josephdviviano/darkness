@@ -328,7 +328,7 @@ public:
     void setDiffuseSamples(int n) { mDiffuseSamples = std::max(16, std::min(n, 256)); }
     void setBakeDiffuseSamples(int n) { mBakeDiffuseSamples = std::max(32, std::min(n, 512)); }
 
-    void setOcclusionRadius(float r) { mOcclusionRadius = std::max(0.1f, std::min(r, 10.0f)); }
+    void setOcclusionRadius(float r) { mOcclusionRadius = std::max(0.3f, std::min(r, 30.0f)); }
     float getOcclusionRadius() const { return mOcclusionRadius; }
     void setOcclusionSamples(int n) { mOcclusionSamples = std::max(4, std::min(n, 64)); }
     int  getOcclusionSamples() const { return mOcclusionSamples; }
@@ -352,15 +352,67 @@ public:
     void setDSPCompressorEnabled(bool v) { mDSPCompressorEnabled = v; }
     void setDSPCompThreshold(float t) { mDSPCompThreshold = std::max(-30.0f, std::min(t, 0.0f)); }
     void setDSPCompRatio(float r) { mDSPCompRatio = std::max(1.5f, std::min(r, 10.0f)); }
+    void setDSPCompAttackMs(float ms) { mDSPCompAttackMs = std::max(1.0f, std::min(ms, 100.0f)); }
+    void setDSPCompReleaseMs(float ms) { mDSPCompReleaseMs = std::max(50.0f, std::min(ms, 2000.0f)); }
 
     /// Configure the low-shelf EQ (bass boost/cut)
     void setDSPEQEnabled(bool v) { mDSPEQEnabled = v; }
     void setDSPEQFreq(float f) { mDSPEQFreq = std::max(60.0f, std::min(f, 500.0f)); }
     void setDSPEQGain(float g) { mDSPEQGain = std::max(-6.0f, std::min(g, 6.0f)); }
+    void setDSPEQQ(float q) { mDSPEQQ = std::max(0.3f, std::min(q, 2.0f)); }
 
     /// Configure the ambient ducking system (disabled by default)
     void setDSPDuckingEnabled(bool v) { mDSPDuckingEnabled = v; }
     void setDSPDuckAmount(float a) { mDSPDuckAmount = std::max(0.1f, std::min(a, 1.0f)); }
+    void setDSPDuckAttackMs(float ms) { mDSPDuckAttackMs = std::max(10.0f, std::min(ms, 500.0f)); }
+    void setDSPDuckReleaseMs(float ms) { mDSPDuckReleaseMs = std::max(50.0f, std::min(ms, 5000.0f)); }
+
+    // ── Mixer / global gains ──
+    void setMasterGain(float g) { mMasterGain = std::max(0.0f, std::min(g, 4.0f)); }
+    void setReflectionGain(float g) { mReflectionGain = std::max(0.0f, std::min(g, 4.0f)); }
+    void setReflectionRampMs(float ms) { mReflectionRampMs = std::max(1.0f, std::min(ms, 1000.0f)); }
+
+    // ── Spatialization (HRTF + distance model) ──
+    /// Must be set BEFORE bootstrapFinished()/init — used during HRTF creation.
+    void setHRTFVolume(float v) { mHRTFVolume = std::max(0.0f, std::min(v, 4.0f)); }
+    /// "nearest" or "bilinear". Must be set BEFORE per-source effects are created.
+    void setHRTFInterpolation(const std::string& s) { mHRTFInterpolation = (s == "nearest" ? "nearest" : "bilinear"); }
+    void setSpatialBlend(float b) { mSpatialBlend = std::max(0.0f, std::min(b, 1.0f)); }
+    /// "default" or "inverse_distance"
+    void setDistanceModel(const std::string& s) { mDistanceModel = (s == "inverse_distance" ? "inverse_distance" : "default"); }
+
+    // ── Propagation tuning ──
+    void setPropagationMaxDist(float d) { mPropagationMaxDist = std::max(10.0f, std::min(d, 5000.0f)); }
+    void setDoorLpfOpenHz(float hz) { mDoorLpfOpenHz = std::max(1000.0f, std::min(hz, 24000.0f)); }
+    void setDoorLpfBlockedHz(float hz) { mDoorLpfBlockedHz = std::max(100.0f, std::min(hz, 10000.0f)); }
+    void setPropMinAttenuation(float a) { mPropMinAttenuation = std::max(0.0f, std::min(a, 0.1f)); }
+
+    // ── Ambient tuning ──
+    void setAmbHysteresisStartMul(float m) { mAmbHysteresisStartMul = std::max(1.0f, std::min(m, 5.0f)); }
+    void setAmbHysteresisStopMul(float m)  { mAmbHysteresisStopMul  = std::max(1.0f, std::min(m, 5.0f)); }
+    /// "linear" or "quadratic"
+    void setAmbFalloffCurve(const std::string& s) { mAmbFalloffCurve = (s == "linear" ? "linear" : "quadratic"); }
+    void setAmbDefaultPriority(int p) { mAmbDefaultPriority = std::max(0, std::min(p, 255)); }
+
+    // ── Performance tuning (some MUST be set BEFORE buildAcousticScene) ──
+    void setMaxActiveVoices(int n) { mMaxActiveVoicesCfg = std::max(8, std::min(n, 256)); }
+    int  getMaxActiveVoices() const { return mMaxActiveVoicesCfg; }
+    void setSimulatorThreads(int n) { mSimulatorThreadsCfg = std::max(0, std::min(n, 64)); }
+    void setSimMaxOcclusionSamples(int n) { mSimMaxOcclusionSamplesCfg = std::max(4, std::min(n, 256)); }
+    void setSimMaxRays(int n) { mSimMaxRaysCfg = std::max(128, std::min(n, 16384)); }
+    void setSimMaxSources(int n) { mSimMaxSourcesCfg = std::max(4, std::min(n, 256)); }
+    /// "default" or "embree"
+    void setSceneType(const std::string& s) { mSceneTypeCfg = (s == "embree" ? "embree" : "default"); }
+
+    // Audio engine (must be set BEFORE bootstrapFinished())
+    void setAudioSampleRate(int r) { mAudioSampleRateCfg = r; }
+    void setAudioFrameSize(int n)  { mAudioFrameSizeCfg = std::max(256, std::min(n, 4096)); }
+    void setSoundCacheMB(int mb)   { mSoundCacheMBCfg = std::max(4, std::min(mb, 1024)); }
+
+    /// Publish settings used on the audio thread (HRTF interp, spatial blend,
+    /// door LPF, propagation min, distance model) into thread-safe storage.
+    /// Call after configuration setters so the next audio callback picks them up.
+    void publishAudioThreadParams();
 
     /** Bake acoustic probes for the current scene.
      *  Generates probes on a uniform floor grid, bakes pathing visibility,
@@ -634,9 +686,13 @@ private:
     /// Diffuse scattering samples for probe baking (32-512, higher=smoother)
     int mBakeDiffuseSamples = 128;
 
-    /// Volumetric occlusion source sphere radius (world units).
-    /// Larger = smoother transitions around corners, smaller = tighter response.
-    float mOcclusionRadius = 3.0f;
+    /// Volumetric occlusion source sphere radius (engine feet — converted to
+    /// meters at the IPL boundary). Larger = smoother transitions around corners,
+    /// smaller = tighter response. ~5 ft = lamp/small source, ~10 = small machine,
+    /// ~16 = large machinery; the door/local-sound floor in AudioService.cpp
+    /// raises this to 16 ft for skipPortalRouting voices so doorways aren't
+    /// over-occluded by narrow frames.
+    float mOcclusionRadius = 10.0f;
     /// Number of ray samples for volumetric occlusion (4-64).
     /// More samples = smoother gradient, higher CPU cost per source.
     int mOcclusionSamples = 16;
@@ -652,11 +708,50 @@ private:
     bool  mDSPCompressorEnabled = true;
     float mDSPCompThreshold = -15.0f;
     float mDSPCompRatio = 3.0f;
+    float mDSPCompAttackMs = 10.0f;
+    float mDSPCompReleaseMs = 250.0f;
     bool  mDSPEQEnabled = true;
     float mDSPEQFreq = 120.0f;
     float mDSPEQGain = 3.0f;
+    float mDSPEQQ    = 0.707f;
     bool  mDSPDuckingEnabled = false;
     float mDSPDuckAmount = 0.5f;
+    float mDSPDuckAttackMs = 50.0f;
+    float mDSPDuckReleaseMs = 500.0f;
+
+    // ── Mixer (global gains) ──
+    float mMasterGain        = 1.0f;
+    float mReflectionGain    = 1.0f;
+    float mReflectionRampMs  = 10.0f;
+
+    // ── Spatialization (HRTF + distance attenuation) ──
+    float       mHRTFVolume        = 1.0f;
+    std::string mHRTFInterpolation = "bilinear"; // "nearest" or "bilinear"
+    float       mSpatialBlend      = 1.0f;
+    std::string mDistanceModel     = "default";  // "default" or "inverse_distance"
+
+    // ── Propagation tuning (portal graph + door blocking) ──
+    float mPropagationMaxDist  = 200.0f;
+    float mDoorLpfOpenHz       = 20000.0f;
+    float mDoorLpfBlockedHz    = 800.0f;
+    float mPropMinAttenuation  = 0.001f;
+
+    // ── Ambient tuning (P$AmbientHack) ──
+    float       mAmbHysteresisStartMul = 1.5f;
+    float       mAmbHysteresisStopMul  = 2.0f;
+    std::string mAmbFalloffCurve       = "quadratic"; // "linear" or "quadratic"
+    int         mAmbDefaultPriority    = 64;
+
+    // ── Performance/infrastructure (must be set BEFORE init/buildAcousticScene) ──
+    int         mMaxActiveVoicesCfg        = MAX_ACTIVE_VOICES;
+    int         mSimulatorThreadsCfg       = 0;       // 0 = auto (hwconc-2)
+    int         mSimMaxOcclusionSamplesCfg = 32;
+    int         mSimMaxRaysCfg             = 4096;
+    int         mSimMaxSourcesCfg          = 32;
+    std::string mSceneTypeCfg              = "default"; // "default" or "embree"
+    int         mAudioSampleRateCfg        = 48000;
+    int         mAudioFrameSizeCfg         = 1024;
+    int         mSoundCacheMBCfg           = 64;
 
     // ── Baked probe pathing ──
 

@@ -2138,7 +2138,7 @@ int main(int argc, char *argv[]) {
 
     // ── Initialize service stack, load database, construct IWorldQuery ──
     std::string scriptsDir = "scripts/thief2";
-    auto worldQuery = initServiceStack(misPath, scriptsDir);
+    auto worldQuery = initServiceStack(misPath, scriptsDir, cfg);
 
     // ── Load mission data: WR geometry, portals, spawn, lights, sky, fog, flow ──
     if (!loadMissionData(misPath, mission))
@@ -2410,36 +2410,89 @@ int main(int argc, char *argv[]) {
         std::fprintf(stderr, "Acoustic mesh: %zu vertices, %zu triangles (%u cells)\n",
                      numVerts, numTris, wr.numCells);
 
-        // Apply audio config before building the acoustic scene
+        // Apply audio config before building the acoustic scene.
+        // Subsections (audio.performance / .reflections / .occlusion / .propagation
+        // / .spatialization / .ambient / .mixer / .dsp) all live as flat fields on
+        // RenderConfig; the YAML loader fills them from the nested layout.
+
+        // -- audio.performance (engine + sim throughput) --
+        // Note: sample_rate / frame_size / sound_cache_mb take effect on the next
+        // engine init (currently set during bootstrapFinished); change them via
+        // YAML and restart for now.
+        audioSvc->setAudioSampleRate(cfg.audioSampleRate);
+        audioSvc->setAudioFrameSize(cfg.audioFrameSize);
+        audioSvc->setSoundCacheMB(cfg.audioSoundCacheMB);
         audioSvc->setReflectionRateDivisor(cfg.reflectionRateDivisor);
         audioSvc->setConvolutionWorkerCount(cfg.convolutionWorkers);
-        audioSvc->setAmbisonicsOrder(cfg.ambisonicsOrder);
+        audioSvc->setSimulatorThreads(cfg.simulatorThreads);
+        audioSvc->setMaxActiveVoices(cfg.maxActiveVoices);
         audioSvc->setMaxReflectionVoices(cfg.maxReflectionVoices);
+        audioSvc->setReflectionThrottle(cfg.reflectionThrottle);
+        audioSvc->setSimMaxOcclusionSamples(cfg.simMaxOcclusionSamples);
+        audioSvc->setSimMaxRays(cfg.simMaxRays);
+        audioSvc->setSimMaxSources(cfg.simMaxSources);
+        audioSvc->setSceneType(cfg.sceneType);
+
+        // -- audio.reflections --
+        audioSvc->setReflectionsEnabled(cfg.realtimeReflections);
         audioSvc->setReflectionNumRays(cfg.reflectionNumRays);
         audioSvc->setReflectionNumBounces(cfg.reflectionNumBounces);
         audioSvc->setReflectionDuration(cfg.reflectionDuration);
-        audioSvc->setReflectionThrottle(cfg.reflectionThrottle);
+        audioSvc->setAmbisonicsOrder(cfg.ambisonicsOrder);
+
+        // -- audio.occlusion --
+        audioSvc->setOcclusionRadius(cfg.occlusionRadius);
+        audioSvc->setOcclusionSamples(cfg.occlusionSamples);
         audioSvc->setTransmissionScale(cfg.transmissionScale);
         audioSvc->setAbsorptionScale(cfg.absorptionScale);
         audioSvc->setDiffuseSamples(cfg.diffuseSamples);
         audioSvc->setBakeDiffuseSamples(cfg.bakeDiffuseSamples);
-        audioSvc->setOcclusionRadius(cfg.occlusionRadius);
-        audioSvc->setOcclusionSamples(cfg.occlusionSamples);
+
+        // -- audio.propagation --
         audioSvc->setPortalRoutingEnabled(cfg.portalRouting);
         audioSvc->setProbePathingEnabled(cfg.probePathing);
-        audioSvc->setReflectionsEnabled(cfg.realtimeReflections);
+        audioSvc->setPropagationMaxDist(cfg.propagationMaxDist);
+        audioSvc->setDoorLpfOpenHz(cfg.doorLpfOpenHz);
+        audioSvc->setDoorLpfBlockedHz(cfg.doorLpfBlockedHz);
+        audioSvc->setPropMinAttenuation(cfg.propMinAttenuation);
 
-        // DSP chain config (soft limiter, compressor, EQ, ducking)
+        // -- audio.spatialization --
+        audioSvc->setHRTFVolume(cfg.hrtfVolume);
+        audioSvc->setHRTFInterpolation(cfg.hrtfInterpolation);
+        audioSvc->setSpatialBlend(cfg.spatialBlend);
+        audioSvc->setDistanceModel(cfg.distanceModel);
+
+        // -- audio.ambient --
+        audioSvc->setAmbHysteresisStartMul(cfg.ambHysteresisStartMul);
+        audioSvc->setAmbHysteresisStopMul(cfg.ambHysteresisStopMul);
+        audioSvc->setAmbFalloffCurve(cfg.ambFalloffCurve);
+        audioSvc->setAmbDefaultPriority(cfg.ambDefaultPriority);
+
+        // -- audio.mixer --
+        audioSvc->setMasterGain(cfg.mixerMasterGain);
+        audioSvc->setReflectionGain(cfg.mixerReflectionGain);
+        audioSvc->setReflectionRampMs(cfg.reflectionRampMs);
+
+        // -- audio.dsp (master bus chain: EQ → compressor → limiter; plus duck) --
         audioSvc->setDSPLimiterEnabled(cfg.dspLimiter);
         audioSvc->setDSPLimiterKnee(cfg.dspLimiterKnee);
         audioSvc->setDSPCompressorEnabled(cfg.dspCompressor);
         audioSvc->setDSPCompThreshold(cfg.dspCompThreshold);
         audioSvc->setDSPCompRatio(cfg.dspCompRatio);
+        audioSvc->setDSPCompAttackMs(cfg.dspCompAttackMs);
+        audioSvc->setDSPCompReleaseMs(cfg.dspCompReleaseMs);
         audioSvc->setDSPEQEnabled(cfg.dspEQ);
         audioSvc->setDSPEQFreq(cfg.dspEQFreq);
         audioSvc->setDSPEQGain(cfg.dspEQGain);
+        audioSvc->setDSPEQQ(cfg.dspEQQ);
         audioSvc->setDSPDuckingEnabled(cfg.dspDucking);
         audioSvc->setDSPDuckAmount(cfg.dspDuckAmount);
+        audioSvc->setDSPDuckAttackMs(cfg.dspDuckAttackMs);
+        audioSvc->setDSPDuckReleaseMs(cfg.dspDuckReleaseMs);
+
+        // Push audio-thread-side params (HRTF interp, door LPF, etc.) into
+        // file-scope atomics so the next audio callback observes them.
+        audioSvc->publishAudioThreadParams();
 
         if (!audioSvc->buildAcousticScene(fullScene)) {
             std::fprintf(stderr, "WARNING: failed to build acoustic scene\n"
