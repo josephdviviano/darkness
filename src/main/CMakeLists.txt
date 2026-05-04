@@ -131,6 +131,53 @@ bgfx_compile_shaders(
     AS_HEADERS
 )
 
+# Per-vertex Lambertian shader (object lighting) — uses varying_pervertex.def.sc.
+# One vertex shader feeds two fragment shaders (textured + flat) so the per-light
+# loop is written once.
+bgfx_compile_shaders(
+    TYPE VERTEX
+    SHADERS ${SHADER_DIR}/vs_textured_pervertex.sc
+    VARYING_DEF ${SHADER_DIR}/varying_pervertex.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR PERVERTEX_VS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_textured_pervertex.sc
+    VARYING_DEF ${SHADER_DIR}/varying_pervertex.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR PERVERTEX_TEXTURED_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_basic_pervertex.sc
+    VARYING_DEF ${SHADER_DIR}/varying_pervertex.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR PERVERTEX_BASIC_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+# bgfx_compile_shaders() doesn't track .h includes — when
+# object_lighting_constants.h changes (e.g. bumping OBJECT_LIGHT_CAP)
+# the per-vertex bytecode would otherwise stay stale. Mirror the .h
+# mtime onto the .sc files so the next build picks up the new value.
+set(PERVERTEX_CONSTANTS_H ${SHADER_DIR}/object_lighting_constants.h)
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/.pervertex_constants_stamp
+    COMMAND ${CMAKE_COMMAND} -E touch_nocreate
+        ${SHADER_DIR}/vs_textured_pervertex.sc
+        ${SHADER_DIR}/fs_textured_pervertex.sc
+        ${SHADER_DIR}/fs_basic_pervertex.sc
+    COMMAND ${CMAKE_COMMAND} -E touch
+        ${CMAKE_CURRENT_BINARY_DIR}/.pervertex_constants_stamp
+    DEPENDS ${PERVERTEX_CONSTANTS_H}
+    COMMENT "Per-vertex shader constants changed — re-touching shader sources"
+)
+
 # Custom target so shaders rebuild when .sc sources change
 add_custom_target(compile_shaders DEPENDS
     ${BASIC_VS_OUTPUTS} ${BASIC_FS_OUTPUTS}
@@ -138,6 +185,9 @@ add_custom_target(compile_shaders DEPENDS
     ${LIGHTMAPPED_VS_OUTPUTS} ${LIGHTMAPPED_FS_OUTPUTS}
     ${LIGHTMAPPED_BICUBIC_VS_OUTPUTS} ${LIGHTMAPPED_BICUBIC_FS_OUTPUTS}
     ${WATER_VS_OUTPUTS} ${WATER_FS_OUTPUTS}
+    ${PERVERTEX_VS_OUTPUTS}
+    ${PERVERTEX_TEXTURED_FS_OUTPUTS} ${PERVERTEX_BASIC_FS_OUTPUTS}
+    ${CMAKE_CURRENT_BINARY_DIR}/.pervertex_constants_stamp
 )
 
 add_executable(darknessRender DarknessRender.cpp)

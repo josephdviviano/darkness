@@ -152,14 +152,18 @@ struct BuiltMeshes {
 // cleanup can destroy everything in one pass.
 
 struct GPUResources {
-    // Shader programs (5)
+    // Shader programs
     bgfx::ProgramHandle flatProgram                = BGFX_INVALID_HANDLE;
     bgfx::ProgramHandle texturedProgram            = BGFX_INVALID_HANDLE;
     bgfx::ProgramHandle lightmappedProgram         = BGFX_INVALID_HANDLE;
     bgfx::ProgramHandle lightmappedBicubicProgram  = BGFX_INVALID_HANDLE;
     bgfx::ProgramHandle waterProgram               = BGFX_INVALID_HANDLE;
+    // Per-vertex Lambertian object programs — alternative to the scalar
+    // texturedProgram / flatProgram pair when per-vertex shading is on.
+    bgfx::ProgramHandle texturedPerVertexProgram   = BGFX_INVALID_HANDLE;
+    bgfx::ProgramHandle basicPerVertexProgram      = BGFX_INVALID_HANDLE;
 
-    // Uniforms (8)
+    // Uniforms
     bgfx::UniformHandle s_texColor     = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle s_texLightmap  = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_waterParams  = BGFX_INVALID_HANDLE;
@@ -167,8 +171,18 @@ struct GPUResources {
     bgfx::UniformHandle u_fogColor     = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_fogParams    = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_objectParams = BGFX_INVALID_HANDLE;
-    bgfx::UniformHandle u_objectLight  = BGFX_INVALID_HANDLE;  // .rgb = per-object lighting tint
+    bgfx::UniformHandle u_objectLight  = BGFX_INVALID_HANDLE;  // .rgb = per-object lighting tint (scalar path)
     bgfx::UniformHandle u_lmAtlasSize  = BGFX_INVALID_HANDLE;
+
+    // Per-object light array uniforms (per-vertex path). Sized at
+    // creation by kObjectLightCap (single source of truth in
+    // shaders/object_lighting_constants.h, mirrored to C++ in
+    // ObjectIllumination.h).
+    bgfx::UniformHandle u_objectLightCount  = BGFX_INVALID_HANDLE;  // .x = count
+    bgfx::UniformHandle u_objectAmbient     = BGFX_INVALID_HANDLE;  // .rgb = ambient + ExtraLight
+    bgfx::UniformHandle u_objectLightLoc    = BGFX_INVALID_HANDLE;  // vec4 × cap
+    bgfx::UniformHandle u_objectLightDir    = BGFX_INVALID_HANDLE;  // vec4 × cap
+    bgfx::UniformHandle u_objectLightBright = BGFX_INVALID_HANDLE;  // vec4 × cap
 
     // World geometry
     bgfx::VertexBufferHandle  vbh = BGFX_INVALID_HANDLE;
@@ -251,6 +265,20 @@ struct RuntimeState {
     // const draw lambdas still poke the cache.
     mutable ObjectIlluminator objectIlluminator;
     bool objectLightingEnabled = true;
+
+    // Per-vertex Lambertian shading for objects. When true, the renderer
+    // uploads the cell's visible light array to the GPU and the vertex
+    // shader does cos(angle)/dist per vertex; when false, the scalar
+    // tint path runs (one RGB value uniform across the whole object).
+    // Per-vertex produces front/back contrast for objects near point
+    // lights (an AI walking past a torch); the scalar path is flatter
+    // but cheaper and faithful to the original engine's CLUT path.
+    bool perVertexObjectLightingEnabled = true;
+
+    // Scratch buffer for buildLightArray() output. Held as state to
+    // avoid reallocating ~96 vec4s every per-object draw call. Not
+    // thread-safe; the renderer is single-threaded.
+    mutable GPULightArray gpuLightScratch;
 
     // Per-frame dynamic light registry. Reset at the start of each render
     // frame; gameplay systems push transient lights (player flashlight,
