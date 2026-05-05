@@ -235,6 +235,13 @@ struct SteamAudioDSPNode {
     // last portal the sound passed through.
     bool usePortalRouting = false;
     bool skipAttenuation = false;        // true for player-emitted sounds (footsteps, within 5 units)
+    // ── Footstep reflection diagnostic ──
+    // Set true at startVoice time for "foot_*" / "land_*" schemas. The audio
+    // and main threads both gate one-shot diagnostic logs on this so we can
+    // confirm whether transient sounds reach the convolution path. Cleared
+    // when the voice is destroyed.
+    bool isFootstepDiag = false;
+    std::atomic<int> reflInputLogCount{0};  // audio thread: limit log spam to first few frames
     float portalAttenuation = 0.0f;      // inverse-square from effective distance
     float portalBlocking = 0.0f;         // 0.0=open, 1.0=fully blocked (for LPF)
     IPLVector3 portalDirection{1.0f, 0.0f, 0.0f}; // direction toward virtual source (portal center)
@@ -358,6 +365,7 @@ struct AudioService::ReflectionMixNode {
     float reflGain = 0.0f;           // current gain (0=silent, 1=full)
     float reflGainTarget = 1.0f;     // target = mixer.reflection_gain (set in initDSP)
     float reflRampRate = 1.0f / 480.0f; // per-sample increment (set in initDSP from mixer.reflection_ramp_ms)
+    float directGain = 1.0f;         // dry-bus multiplier (applied during direct passthrough)
     float masterGain = 1.0f;         // post-limiter master multiplier
 
     // ── Master bus DSP chain ──
@@ -505,6 +513,10 @@ struct ConvolutionWorker {
         std::shared_ptr<std::atomic<bool>> validityToken;
         int reflFrameSize = 0;
         bool active = false;
+        // Diagnostic: tag forwarded from the voice's DSP node so the worker
+        // can log the wet-output peak only for footstep voices, keeping the
+        // log focused.
+        bool isFootstepDiag = false;
     };
     static constexpr int kMaxSlots = MAX_ACTIVE_VOICES;
 
@@ -902,6 +914,25 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 // Apply distance attenuation to mono (no occlusion — reflected
                 // paths are independent of direct-path wall blocking)
                 float reflAtten = node->directParams.distanceAttenuation;
+
+                // Diagnostic: for footstep voices, log the convolution input
+                // amplitude on the first few audio callbacks so we can confirm
+                // the dry signal actually reaches Steam Audio. Bounded to ~3
+                // frames per voice so the log stays readable.
+                if (node->isFootstepDiag) {
+                    int n = node->reflInputLogCount.fetch_add(1, std::memory_order_relaxed);
+                    if (n < 3) {
+                        float monoPeak = 0.0f;
+                        for (ma_uint32 i = 0; i < frameCount; ++i)
+                            monoPeak = std::max(monoPeak, std::fabs(mono[i]));
+                        AUDIO_LOG("[FOOT_REFL_IN] frame=%d monoPeak=%.4f distAtten=%.3f "
+                                  "reflAtten=%.4f scaledPeak=%.4f irSize=%d\n",
+                                  n, monoPeak,
+                                  node->directParams.distanceAttenuation,
+                                  reflAtten, monoPeak * reflAtten,
+                                  node->reflectionParams.irSize);
+                    }
+                }
                 ma_uint32 reflFrames = static_cast<ma_uint32>(node->reflectionFrameSize);
 
                 if (node->rateDivisor > 1 && !node->decimatedMono.empty()) {
@@ -932,6 +963,7 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 slot.params = node->reflectionParams;
                 slot.reflFrameSize = node->reflectionFrameSize;
                 slot.active = true;
+                slot.isFootstepDiag = node->isFootstepDiag;  // propagate for worker log
             }
         }
 
@@ -996,9 +1028,18 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
     float* stereoOut = ppFramesOut[0];
     const float* stereoIn = ppFramesIn[0];
 
-    // Always pass through the direct audio (from per-voice DSP nodes)
-    if (stereoIn && stereoOut && frameCount > 0)
-        std::memcpy(stereoOut, stereoIn, frameCount * 2 * sizeof(float));
+    // Always pass through the direct audio (from per-voice DSP nodes).
+    // directGain scales just the dry path so the direct/indirect ratio
+    // can be tuned independently of master + reflection gains.
+    if (stereoIn && stereoOut && frameCount > 0) {
+        float dg = node->directGain;
+        if (dg == 1.0f) {
+            std::memcpy(stereoOut, stereoIn, frameCount * 2 * sizeof(float));
+        } else {
+            for (ma_uint32 i = 0; i < frameCount * 2; ++i)
+                stereoOut[i] = stereoIn[i] * dg;
+        }
+    }
 
     // If reflection pipeline not ready, just pass through.
     if (!node->ready || !node->simulationRan) {
@@ -1010,11 +1051,15 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
     // Read all sub-workers' front buffers (previous frame's decoded reverb)
     // and sum into the output. Each sub-worker double-buffers independently.
     ConvolutionWorker *cw = node->convWorker;
+    float wetPeakL = 0.0f;  // diagnostic: peak |wet stereo| this block
+    float wetPeakR = 0.0f;
+    int   wetWorkersHit = 0;  // diagnostic: how many sub-workers actually contributed
     if (cw) {
         ma_uint32 outSamples = std::min(static_cast<ma_uint32>(cw->frameSize), frameCount);
         for (auto &subPtr : cw->workers) {
             auto &sub = *subPtr;
             if (!sub.hasProducedOutput.load(std::memory_order_acquire)) continue;
+            ++wetWorkersHit;
             int front = sub.frontIdx.load(std::memory_order_acquire);
 
             // Additive mix with gain ramp
@@ -1022,9 +1067,26 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 if (node->reflGain < node->reflGainTarget)
                     node->reflGain = std::min(node->reflGain + node->reflRampRate, node->reflGainTarget);
                 float g = node->reflGain;
-                stereoOut[i * 2]     += sub.stereoL[front][i] * g;
-                stereoOut[i * 2 + 1] += sub.stereoR[front][i] * g;
+                float l = sub.stereoL[front][i] * g;
+                float r = sub.stereoR[front][i] * g;
+                stereoOut[i * 2]     += l;
+                stereoOut[i * 2 + 1] += r;
+                wetPeakL = std::max(wetPeakL, std::fabs(l));
+                wetPeakR = std::max(wetPeakR, std::fabs(r));
             }
+        }
+    }
+    // Diagnostic: log the summed wet bus peak ~once per second so we can see
+    // whether reverb is actually reaching the output. Independent of which
+    // voices are convolving — if wet peaks are non-zero, reverb exists in the
+    // mix; if zero or near-zero, no reverb is being produced (workers behind,
+    // IRs empty, or all voices below floor).
+    {
+        static std::atomic<int> sWetLogTick{0};
+        int tick = sWetLogTick.fetch_add(1, std::memory_order_relaxed);
+        if ((tick & 0x3F) == 0) {  // every ~64 callbacks ≈ 1.4s @ 1024@48k
+            AUDIO_LOG("[WET_BUS] peakL=%.4f peakR=%.4f workersHit=%d/3 reflGain=%.2f\n",
+                      wetPeakL, wetPeakR, wetWorkersHit, node->reflGain);
         }
     }
 
@@ -1040,7 +1102,21 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         int w = cw->writeIdx.load(std::memory_order_relaxed);
         int newW = 1 - w;
         if (cw->workersReading.load(std::memory_order_acquire) > 0) {
-            // Sub-workers still reading — drop this frame
+            // Sub-workers still reading — drop this frame.
+            // Diagnostic: count how often we drop and how many voices were
+            // sacrificed. Logged once per ~5 s alongside the perf summary.
+            static std::atomic<int> sFrameDropCount{0};
+            static std::atomic<int> sVoicesDroppedTotal{0};
+            sFrameDropCount.fetch_add(1, std::memory_order_relaxed);
+            sVoicesDroppedTotal.fetch_add(cw->stagingCount[w],
+                                           std::memory_order_relaxed);
+            // Periodic dump (cheap — only fires every 256 drops).
+            int dc = sFrameDropCount.load(std::memory_order_relaxed);
+            if ((dc & 0xFF) == 0) {
+                int vd = sVoicesDroppedTotal.load(std::memory_order_relaxed);
+                AUDIO_LOG("[CONV_DROP] frames=%d voices_lost=%d (workers behind)\n",
+                          dc, vd);
+            }
             cw->stagingCount[w] = 0;
         } else {
             int count = cw->stagingCount[w];
@@ -1221,6 +1297,7 @@ struct ActiveVoice {
     bool playerEmitted = false;        // true for footsteps/landing — skip DSP attenuation
     bool skipPortalRouting = false;    // true for door sounds — use Steam Audio but skip portal blocking
     bool isAmbient = false;            // true for ambient voices — distance handled by ambient system
+    bool loggedReflActivationMain = false;  // diagnostic: footstep convolution-activation log fired once
 
     // Re-propagation throttle: nearby sounds update every frame, distant
     // sounds every 8-16 frames. Matching the original engine's adaptive
@@ -1421,6 +1498,29 @@ bool AudioService::initMiniaudio()
 
     LOG_INFO("AudioService: miniaudio initialized");
     return true;
+}
+
+//------------------------------------------------------
+// Live-tunable mixer gains. Setters update the AudioService member AND, if the
+// reflection mix node is alive, push the new value into it so the change takes
+// effect on the next audio callback. Plain float writes match the lock-free
+// update pattern used elsewhere in this file (e.g. listenerOrientation).
+void AudioService::setMasterGain(float g)
+{
+    mMasterGain = std::max(0.0f, std::min(g, 4.0f));
+    if (mReflectionMixNode) mReflectionMixNode->masterGain = mMasterGain;
+}
+
+void AudioService::setReflectionGain(float g)
+{
+    mReflectionGain = std::max(0.0f, std::min(g, 4.0f));
+    if (mReflectionMixNode) mReflectionMixNode->reflGainTarget = mReflectionGain;
+}
+
+void AudioService::setDirectGain(float g)
+{
+    mDirectGain = std::max(0.0f, std::min(g, 4.0f));
+    if (mReflectionMixNode) mReflectionMixNode->directGain = mDirectGain;
 }
 
 //------------------------------------------------------
@@ -1924,6 +2024,7 @@ bool AudioService::initReflectionPipeline()
     // reflRampRate is the per-sample increment such that a full 0→1 ramp takes
     // mReflectionRampMs milliseconds at the current sample rate.
     rmn.masterGain = mMasterGain;
+    rmn.directGain = mDirectGain;
     rmn.reflGainTarget = mReflectionGain;
     {
         float rampSamples = (mReflectionRampMs * 0.001f) * static_cast<float>(mDeviceSampleRate);
@@ -2446,11 +2547,30 @@ void AudioService::loopStep(float deltaTime)
 
             // Step 2a: Pre-compute reflection voice ranking (top-N closest).
             // Done before setInputs so we can set inputs.baked for non-top-N voices.
+            //
+            // Player-emitted voices (footsteps, landing impacts) are EXCLUDED
+            // from the top-N pool — they always use the baked-probe reverb path
+            // instead. Rationale:
+            //   • Source ≈ listener for player-emitted sounds, so the room IR
+            //     at listener position (what baked reverb captures) is an
+            //     excellent approximation of the source-position IR.
+            //   • The real-time ray-trace sim takes ~200-400 ms per step.
+            //     Footsteps last ~200 ms, so without baked routing many
+            //     footsteps end before their IR is computed — they vanish
+            //     from the indirect path entirely.
+            //   • Baked lookup is O(1) and frees real-time sim budget for
+            //     voices whose source position genuinely matters (NPC dialogue,
+            //     gunshots in other corridors, etc.).
+            // Requires probes to be loaded (`mProbesHaveReflections`); if not,
+            // player-emitted voices fall through to the same path as everything
+            // else and the timing race may reappear.
             if (mReflectionsEnabled) {
                 reflCandidates.reserve(mVoices.size());
                 for (auto &[h, v] : mVoices) {
                     if (v->sourceEnded)
                         continue;
+                    if (v->playerEmitted && mProbesHaveReflections)
+                        continue;  // routed via baked-probe path below
                     if (v->iplSource && v->dspNode.effectsReady && v->dspNode.reflectionEffect) {
                         Vector3 delta = v->worldPos - mListenerPos;
                         reflCandidates.push_back({h, glm::dot(delta, delta)});
@@ -2519,9 +2639,18 @@ void AudioService::loopStep(float deltaTime)
                 if (!voice->iplSource)
                     continue;
 
-                // Player-emitted sounds (footsteps, landing) bypass DSP
-                // attenuation — the player's own sounds are never wall-occluded.
-                voice->dspNode.skipAttenuation = voice->playerEmitted;
+                // Player-emitted voices (footsteps, landing) follow the full DSP
+                // path like every other voice — same direct attenuation, same
+                // portal routing, same reflection convolution staging. The
+                // original feet-to-head occlusion-cutoff bug is handled by a
+                // surgical clamp in the per-voice audio callback (occlusion
+                // forced to 1.0 when distanceAttenuation > 0.9, i.e. source
+                // within ~3 units of listener). Skipping the entire DSP block
+                // for player-emitted voices was overkill and had been silently
+                // preventing footsteps from contributing to the reflection
+                // convolution path even when reflectionsActive=true on the
+                // surface.
+                voice->dspNode.skipAttenuation = false;
 
                 // Run portal propagation to determine reachability and path.
                 // Throttled: nearby voices update every frame, distant voices
@@ -2529,7 +2658,7 @@ void AudioService::loopStep(float deltaTime)
                 // update frequency. Uses cached result between updates.
                 SoundPropInfo prop{};
                 bool isCrossRoom = false;
-                if (mPortalRoutingEnabled && !voice->sourceEnded && !voice->playerEmitted
+                if (mPortalRoutingEnabled && !voice->sourceEnded
                     && !voice->skipPortalRouting) {
                     if (voice->propagationCountdown <= 0) {
                         auto prT0 = std::chrono::steady_clock::now();
@@ -2618,11 +2747,22 @@ void AudioService::loopStep(float deltaTime)
                 IPLSimulationInputs inputs{};
                 inputs.flags = static_cast<IPLSimulationFlags>(
                     IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
-                inputs.directFlags = static_cast<IPLDirectSimulationFlags>(
+                // Player-emitted voices (footsteps, landings) emit from the
+                // player's own body — there is no "wall" between the player's
+                // feet and ears, so occlusion + transmission are skipped at
+                // the Steam Audio API level. Distance attenuation, air
+                // absorption, and reflections still run normally so footsteps
+                // produce reverb the same way as any other voice.
+                IPLDirectSimulationFlags directFlags = static_cast<IPLDirectSimulationFlags>(
                     IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
-                    IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION |
-                    IPL_DIRECTSIMULATIONFLAGS_OCCLUSION |
-                    IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
+                    IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION);
+                if (!voice->playerEmitted) {
+                    directFlags = static_cast<IPLDirectSimulationFlags>(
+                        directFlags
+                        | IPL_DIRECTSIMULATIONFLAGS_OCCLUSION
+                        | IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
+                }
+                inputs.directFlags = directFlags;
                 inputs.source = sourceCoord;
                 inputs.distanceAttenuationModel.type =
                     (sDistanceModel.load(std::memory_order_relaxed) == 1)
@@ -2650,10 +2790,19 @@ void AudioService::loopStep(float deltaTime)
                 inputs.numOcclusionSamples = mOcclusionSamples;
                 inputs.numTransmissionRays = 8;
 
-                // Non-top-N voices use baked probe reflections instead of
-                // real-time ray tracing.
+                // Voices route to baked-probe reflections when:
+                //   • They are not in the top-N closest (real-time budget
+                //     reserved for the most audible source-position-sensitive
+                //     voices), OR
+                //   • They are player-emitted (footsteps, landings) — see the
+                //     candidate-selection comment above for rationale: source
+                //     ≈ listener so listener-position baked IR is correct, and
+                //     it sidesteps the real-time sim's 200-400 ms latency
+                //     which is longer than a footstep.
                 bool isTopN = reflCandidateSet.count(handle) > 0;
-                if (!isTopN && mProbesHaveReflections) {
+                bool useBaked = (!isTopN || voice->playerEmitted)
+                                && mProbesHaveReflections;
+                if (useBaked) {
                     inputs.baked = IPL_TRUE;
                     inputs.bakedDataIdentifier = bakedReflId;
                 }
@@ -2773,6 +2922,19 @@ void AudioService::loopStep(float deltaTime)
                     // Override distanceAttenuation to 1.0 so the reflection
                     // convolution input isn't distance-scaled either
                     voice->dspNode.directParams.distanceAttenuation = 1.0f;
+                } else if (voice->playerEmitted) {
+                    // Player's own sounds (footsteps, landings) — skip
+                    // occlusion + transmission (no "wall" between feet and
+                    // ears) AND override distanceAttenuation to 1.0 so the
+                    // dry path is full volume and the convolution input
+                    // isn't distance-scaled. The room's reflection IR
+                    // already encodes natural attenuation along bounce
+                    // paths; layering source-listener distance on top would
+                    // double-count it. Symmetric with the isAmbient branch.
+                    voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
+                        IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
+                        IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
+                    voice->dspNode.directParams.distanceAttenuation = 1.0f;
                 } else {
                     voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
                         IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
@@ -2833,8 +2995,45 @@ void AudioService::loopStep(float deltaTime)
 
                     voice->dspNode.reflectionsActive.store(true, std::memory_order_release);
                     ++activeConvolutionCount;
+
+                    // Diagnostic: confirm footstep voices entered the
+                    // convolution path and capture the IR / direct params at
+                    // activation. One-shot per voice so the log is readable
+                    // even when many footsteps fire in quick succession.
+                    if (voice->dspNode.isFootstepDiag && !voice->loggedReflActivationMain) {
+                        voice->loggedReflActivationMain = true;
+                        float voiceDist = glm::length(voice->worldPos - mListenerPos);
+                        AUDIO_LOG("[FOOT_REFL_ON] h=%u '%s' dist=%.1f irSize=%d distAtten=%.3f "
+                                  "occl=%.3f trans=(%.2f,%.2f,%.2f) src=%s ambiCh=%d\n",
+                                  handle, voice->schemaName.c_str(), voiceDist,
+                                  voice->dspNode.reflectionParams.irSize,
+                                  voice->dspNode.directParams.distanceAttenuation,
+                                  voice->dspNode.directParams.occlusion,
+                                  voice->dspNode.directParams.transmission[0],
+                                  voice->dspNode.directParams.transmission[1],
+                                  voice->dspNode.directParams.transmission[2],
+                                  isReflVoice ? "topN" : "baked",
+                                  static_cast<int>(mAmbisonicsChannels));
+                    }
                 } else {
                     voice->dspNode.reflectionsActive.store(false, std::memory_order_relaxed);
+
+                    // Diagnostic: log footsteps that were rejected from the
+                    // convolution path, so we can tell "didn't get a slot" from
+                    // "got a slot but no audible reverb."
+                    if (voice->dspNode.isFootstepDiag && !voice->loggedReflActivationMain) {
+                        voice->loggedReflActivationMain = true;
+                        float voiceDist = glm::length(voice->worldPos - mListenerPos);
+                        AUDIO_LOG("[FOOT_REFL_OFF] h=%u '%s' dist=%.1f reason=%s "
+                                  "irSize=%d slots=%d/%d hasBaked=%d\n",
+                                  handle, voice->schemaName.c_str(), voiceDist,
+                                  isReflVoice ? "no-cap" :
+                                  (hasBakedData ? "no-cap-baked" :
+                                   (canAffordConvolution ? "not-topN-no-baked" : "cap-full")),
+                                  outputs.reflections.irSize,
+                                  activeConvolutionCount, mMaxReflectionVoices,
+                                  hasBakedData ? 1 : 0);
+                    }
                 }
 
                 // Direction update moved above isPending guard so all voices
@@ -2980,6 +3179,26 @@ void AudioService::convolutionSubWorkerMain(int workerIdx)
         std::memset(sub.stereoL[back].data(), 0, cw.frameSize * sizeof(float));
         std::memset(sub.stereoR[back].data(), 0, cw.frameSize * sizeof(float));
 
+        // Diagnostic: report worker iteration entry state. If assignCount=0
+        // we know workers are running but receiving no work. If >0 but the
+        // ANY_SLOT_WET diagnostic doesn't fire, slots are failing the early
+        // continue checks.
+        {
+            static std::atomic<int> sWorkerEntryLogCount{0};
+            int n = sWorkerEntryLogCount.fetch_add(1, std::memory_order_relaxed);
+            if (n < 24) {
+                int activeSlots = 0;
+                for (int j = 0; j < assignCount; ++j) {
+                    int i = sub.assignedSlots[j];
+                    if (i < 0 || i >= ConvolutionWorker::kMaxSlots) continue;
+                    auto &slot = cw.staging[readBuf][i];
+                    if (slot.active) activeSlots++;
+                }
+                AUDIO_LOG("[WORKER_ENTRY] w=%d readBuf=%d assignCount=%d activeSlots=%d\n",
+                          workerIdx, readBuf, assignCount, activeSlots);
+            }
+        }
+
         // Process assigned voice slots through this sub-worker's mixer
         int nch = cw.ambiChannels;
         for (int j = 0; j < assignCount; ++j) {
@@ -3013,6 +3232,49 @@ void AudioService::convolutionSubWorkerMain(int workerIdx)
             // Apply convolution, accumulating into this sub-worker's mixer
             iplReflectionEffectApply(slot.effect, &slot.params,
                                       &reflIn, &reflOut, sub.mixer);
+
+            // Diagnostic: log every Nth slot the worker processes so we can
+            // tell apart "worker not seeing slot" vs. "worker seeing slot but
+            // isFootstepDiag flag not propagated." Reports the flag value.
+            {
+                static std::atomic<int> sAnySlotLogCount{0};
+                int n = sAnySlotLogCount.fetch_add(1, std::memory_order_relaxed);
+                if (n < 24) {
+                    float inPeak = 0.0f;
+                    for (int s = 0; s < slot.reflFrameSize; ++s)
+                        inPeak = std::max(inPeak, std::fabs(slot.mono[s]));
+                    float wPeak = 0.0f;
+                    for (int s = 0; s < slot.reflFrameSize; ++s)
+                        wPeak = std::max(wPeak, std::fabs(sub.voiceAmbi0[s]));
+                    AUDIO_LOG("[ANY_SLOT_WET] w=%d slotIdx=%d isFootDiag=%d "
+                              "inPeak=%.4f wOutPeak=%.4f irSize=%d nch=%d\n",
+                              workerIdx, i, slot.isFootstepDiag ? 1 : 0,
+                              inPeak, wPeak,
+                              slot.params.irSize, slot.params.numChannels);
+                }
+            }
+
+            // Diagnostic: for footstep slots, report input + output peak
+            // amplitudes so we can confirm convolution is actually producing
+            // audible wet signal. The W (omnidirectional) ambisonics channel
+            // is the right metric for "total wet energy."
+            if (slot.isFootstepDiag) {
+                static std::atomic<int> sFootWetLogCount{0};
+                int n = sFootWetLogCount.fetch_add(1, std::memory_order_relaxed);
+                if (n < 12) {  // ~12 sample frames is enough to characterize
+                    float inPeak = 0.0f;
+                    for (int s = 0; s < slot.reflFrameSize; ++s)
+                        inPeak = std::max(inPeak, std::fabs(slot.mono[s]));
+                    float wPeak = 0.0f;
+                    for (int s = 0; s < slot.reflFrameSize; ++s)
+                        wPeak = std::max(wPeak, std::fabs(sub.voiceAmbi0[s]));
+                    AUDIO_LOG("[FOOT_REFL_WET] worker=%d inPeak=%.4f wOutPeak=%.4f "
+                              "irSize=%d nch=%d ratio=%.3f\n",
+                              workerIdx, inPeak, wPeak,
+                              slot.params.irSize, slot.params.numChannels,
+                              inPeak > 1e-6f ? wPeak / inPeak : 0.0f);
+                }
+            }
         }
 
         // Release staging slot references for this sub-worker's assigned slots.
@@ -3500,6 +3762,14 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
     voice->handle = mNextHandle++;
     voice->schemaName = schemaName;
     voice->priority = priority;
+
+    // Diagnostic: tag footstep / landing voices for reflection-path tracing.
+    // Used by main- and audio-thread one-shot logs to confirm whether transient
+    // sounds reach the convolution effect. Schema names follow Dark Engine
+    // conventions: "foot_*" for ground footsteps, "land_*" for landing impacts.
+    bool isFoot = (schemaName.compare(0, 5, "foot_") == 0
+                   || schemaName.compare(0, 5, "land_") == 0);
+    voice->dspNode.isFootstepDiag = isFoot;
     voice->objID = objID;
     voice->worldPos = position;
 
