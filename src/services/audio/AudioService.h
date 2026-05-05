@@ -368,9 +368,19 @@ public:
     void setDSPDuckReleaseMs(float ms) { mDSPDuckReleaseMs = std::max(50.0f, std::min(ms, 5000.0f)); }
 
     // ── Mixer / global gains ──
-    void setMasterGain(float g) { mMasterGain = std::max(0.0f, std::min(g, 4.0f)); }
-    void setReflectionGain(float g) { mReflectionGain = std::max(0.0f, std::min(g, 4.0f)); }
-    void setReflectionRampMs(float ms) { mReflectionRampMs = std::max(1.0f, std::min(ms, 1000.0f)); }
+    // Setters push live to the running mix node (if active) so console tweaks
+    // take effect immediately without restarting the audio pipeline.
+    void  setMasterGain(float g);
+    float getMasterGain() const { return mMasterGain; }
+    void  setReflectionGain(float g);
+    float getReflectionGain() const { return mReflectionGain; }
+    /// Dry-bus multiplier (direct path). Independent of master + reflection
+    /// gains — lets you tune the direct/indirect ratio for "around the corner"
+    /// audibility without raising overall volume.
+    void  setDirectGain(float g);
+    float getDirectGain() const { return mDirectGain; }
+    void  setReflectionRampMs(float ms) { mReflectionRampMs = std::max(1.0f, std::min(ms, 1000.0f)); }
+    float getReflectionRampMs() const { return mReflectionRampMs; }
 
     // ── Spatialization (HRTF + distance model) ──
     /// Must be set BEFORE bootstrapFinished()/init — used during HRTF creation.
@@ -382,10 +392,25 @@ public:
     void setDistanceModel(const std::string& s) { mDistanceModel = (s == "inverse_distance" ? "inverse_distance" : "default"); }
 
     // ── Propagation tuning ──
-    void setPropagationMaxDist(float d) { mPropagationMaxDist = std::max(10.0f, std::min(d, 5000.0f)); }
-    void setDoorLpfOpenHz(float hz) { mDoorLpfOpenHz = std::max(1000.0f, std::min(hz, 24000.0f)); }
-    void setDoorLpfBlockedHz(float hz) { mDoorLpfBlockedHz = std::max(100.0f, std::min(hz, 10000.0f)); }
-    void setPropMinAttenuation(float a) { mPropMinAttenuation = std::max(0.0f, std::min(a, 0.1f)); }
+    // Setters republish to the audio thread so runtime tweaks (e.g. via the
+    // debug console) take effect on the next audio callback.
+    void  setPropagationMaxDist(float d) { mPropagationMaxDist = std::max(10.0f, std::min(d, 5000.0f)); }
+    float getPropagationMaxDist() const { return mPropagationMaxDist; }
+    void  setDoorLpfOpenHz(float hz) {
+        mDoorLpfOpenHz = std::max(1000.0f, std::min(hz, 24000.0f));
+        publishAudioThreadParams();
+    }
+    float getDoorLpfOpenHz() const { return mDoorLpfOpenHz; }
+    void  setDoorLpfBlockedHz(float hz) {
+        mDoorLpfBlockedHz = std::max(100.0f, std::min(hz, 10000.0f));
+        publishAudioThreadParams();
+    }
+    float getDoorLpfBlockedHz() const { return mDoorLpfBlockedHz; }
+    void  setPropMinAttenuation(float a) {
+        mPropMinAttenuation = std::max(0.0f, std::min(a, 0.1f));
+        publishAudioThreadParams();
+    }
+    float getPropMinAttenuation() const { return mPropMinAttenuation; }
 
     // ── Ambient tuning ──
     void setAmbHysteresisStartMul(float m) { mAmbHysteresisStartMul = std::max(1.0f, std::min(m, 5.0f)); }
@@ -721,6 +746,7 @@ private:
 
     // ── Mixer (global gains) ──
     float mMasterGain        = 1.0f;
+    float mDirectGain        = 1.0f;
     float mReflectionGain    = 1.0f;
     float mReflectionRampMs  = 10.0f;
 

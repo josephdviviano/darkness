@@ -955,24 +955,15 @@ static void renderObjects(
             for (const auto &sm : gpuModel.subMeshes) {
                 if (sm.indexCount == 0) continue;
 
-                // Held objects render at half opacity so the carrier can see
-                // the world behind whatever they're carrying. Routes through
-                // the existing translucent pass via the renderAlpha check
-                // below — no separate render path needed.
-                float effectiveRenderAlpha = obj.renderAlpha;
-                if (state.grabSystem &&
-                    state.grabSystem->isGrabbing(obj.objID)) {
-                    effectiveRenderAlpha *= 0.5f;
-                }
-
-                // Determine if this submesh is translucent:
-                // either the material has translucency or the object has RenderAlpha
-                bool isTranslucent = (sm.matTrans > 0.0f) || (effectiveRenderAlpha < 1.0f);
+                // Held objects render fully opaque; visibility past them
+                // comes from CarryParams::heightOffset placing the object
+                // below the crosshair so the player can see over it.
+                bool isTranslucent = (sm.matTrans > 0.0f) || (obj.renderAlpha < 1.0f);
                 if (opaquePass == isTranslucent) continue;  // wrong pass
 
                 // Compute final alpha: (1 - matTrans) * renderAlpha
                 // matTrans convention: 0=opaque, 0.3=30% transparent glass
-                float finalAlpha = (1.0f - sm.matTrans) * effectiveRenderAlpha;
+                float finalAlpha = (1.0f - sm.matTrans) * obj.renderAlpha;
                 // Frob highlight: additive brightness for the targeted object
                 float highlight = (obj.objID == state.frobHighlightObjID)
                     ? state.frobHighlightLevel : 0.0f;
@@ -1445,6 +1436,100 @@ static void registerConsoleSettings(
         },
         [](float) { /* read-only — set via YAML, requires scene rebuild */ },
         "Material transmission multiplier (1=physical, 10=audible through walls, set via YAML)");
+
+    // ── Mixer gains (live A/B for direct vs. indirect levels) ──
+
+    dbgConsole.addFloat("master_gain", 0.0f, 4.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getMasterGain() : 1.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setMasterGain(v);
+        },
+        "Global output multiplier (post-mix, applied to direct + indirect)");
+
+    dbgConsole.addFloat("direct_gain", 0.0f, 4.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getDirectGain() : 1.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setDirectGain(v);
+        },
+        "Dry-bus multiplier — direct (line-of-sight) path only");
+
+    dbgConsole.addFloat("reflection_gain", 0.0f, 4.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getReflectionGain() : 1.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setReflectionGain(v);
+        },
+        "Wet-bus multiplier — indirect (bounced) reverb path only");
+
+    // ── Volumetric occlusion (direct-path attenuation) ──
+
+    dbgConsole.addFloat("occlusion_radius", 0.3f, 30.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getOcclusionRadius() : 10.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setOcclusionRadius(v);
+        },
+        "Volumetric source sphere radius (engine ft) — larger = softer LOS occlusion");
+
+    dbgConsole.addFloat("occlusion_samples", 4.0f, 64.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? static_cast<float>(svc->getOcclusionSamples()) : 16.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setOcclusionSamples(static_cast<int>(v));
+        },
+        "Ray samples for volumetric occlusion (more = smoother, more CPU)");
+
+    // ── Door LPF / propagation (drives "around the corner" muffling) ──
+
+    dbgConsole.addFloat("door_lpf_open_hz", 1000.0f, 24000.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getDoorLpfOpenHz() : 20000.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setDoorLpfOpenHz(v);
+        },
+        "LPF cutoff for sounds through open doors/portals (Hz, higher = brighter)");
+
+    dbgConsole.addFloat("door_lpf_blocked_hz", 100.0f, 10000.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getDoorLpfBlockedHz() : 800.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setDoorLpfBlockedHz(v);
+        },
+        "LPF cutoff for sounds through closed doors (Hz, lower = more muffled)");
+
+    dbgConsole.addFloat("prop_min_attenuation", 0.0f, 0.1f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getPropMinAttenuation() : 0.001f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setPropMinAttenuation(v);
+        },
+        "Floor on portal-routed path attenuation (higher = quieter through walls)");
 
     // Bake probes: set to "on" to trigger re-baking
     dbgConsole.addBool("bake_probes",
@@ -2558,6 +2643,7 @@ int main(int argc, char *argv[]) {
 
         // -- audio.mixer --
         audioSvc->setMasterGain(cfg.mixerMasterGain);
+        audioSvc->setDirectGain(cfg.mixerDirectGain);
         audioSvc->setReflectionGain(cfg.mixerReflectionGain);
         audioSvc->setReflectionRampMs(cfg.reflectionRampMs);
 
@@ -3140,6 +3226,14 @@ int main(int argc, char *argv[]) {
             }
             std::fprintf(stderr, "[ODE] Activated %d/%zu pushable objects as dynamic bodies\n",
                          activated, objectPushSystem.getPushableObjects().size());
+
+            // One-shot snap: any dynamic body placed mid-air in the
+            // level is dropped straight down to rest on the surface
+            // below it. Mirrors what the original level editor's
+            // drop-to-floor pass did at edit time — pure Z translation,
+            // no rotation or bounce. Stacked props snap bottom-up so
+            // upper boxes rest on the freshly-snapped lower ones.
+            state.physics->snapDynamicBodiesToRest();
         }
 
         // Wire ODE dynamic body check so ObjectPushSystem skips ODE-handled objects
@@ -3617,7 +3711,7 @@ int main(int argc, char *argv[]) {
 
             // Update frob highlight fade (Dark Engine: ~130ms fade in/out)
             {
-                constexpr float kHighlightMax = 0.27f;   // 0.47f original engine default
+                constexpr float kHighlightMax = 0.10f;   // subtle white overlay; 0.47 was the original engine default
                 constexpr float kFadeTime = 0.129f;       // 129ms fade
                 int32_t targetID = state.frobSystem && state.frobSystem->hasTarget()
                     ? state.frobSystem->getTarget().objID : 0;
