@@ -1,19 +1,30 @@
 # darknessRender configuration
-# Copy this file to  in your working directory.
-# CLI flags override any values set here.
+# Copy this file to ./darknessRender.yaml in your working directory.
+# CLI surface is intentionally minimal — every tunable lives here.
+# CLI flags --res and --schemas override paths.* below for one-off runs.
+
+# ── paths ──
+# Optional. Set these once and you can launch with just a mission file.
+# CLI --res / --schemas override these for one-off runs.
+paths:
+  res: ""        # Thief 2 RES directory (fam.crf, obj.crf, snd.crf). e.g.
+                 #   /Volumes/THIEF2_INSTALL_C/THIEF2/RES
+  schemas: ""    # Schema directory (.sch / .spc / .arc). e.g.
+                 #   /Volumes/THIEF2_CD2/EDITOR/SCHEMA
+                 # If empty, AudioService searches <res>/../EDITOR/SCHEMA.
 
 graphics:
-  # Lightmap filtering mode (default: bilinear)
+  # Texture filter mode (default: point)
+  # point        = crispy, authentic Dark Engine look
+  # bilinear     = soft GPU bilinear
+  # trilinear    = bilinear with mip blending
+  # anisotropic  = 16x AF for grazing-angle surfaces
+  texture_filter: point
+
+  # Lightmap filter mode (default: bilinear)
   # bilinear = GPU hardware filtering (fast, matches original engine)
   # bicubic  = cubic B-spline shader (smoother, minimal GPU cost)
-  lightmap_filtering: bilinear
-
-  # Texture filtering mode (default: 0)
-  # 0 = point (crispy, authentic)
-  # 1 = bilinear
-  # 2 = trilinear
-  # 3 = anisotropic
-  filter_mode: 0
+  lightmap_filter: bilinear
 
   # Gamma-correct mipmap generation (default: false)
   # Linearizes sRGB textures before downsampling for correct blending
@@ -63,21 +74,29 @@ developer:
   show_fallback_cubes: false
 
   # Portal/frustum culling (default: true)
-  # Toggle at runtime with C key
+  # Toggle at runtime in the debug console (`portal_culling`)
   portal_culling: true
 
-  # Force all animated lights to flicker mode (default: false)
-  # Useful for debugging light animation
-  force_flicker: false
-
   # Camera collision with world geometry (default: false)
-  # Toggle at runtime with V key
+  # Toggle at runtime in the debug console (`camera_collision`)
   camera_collision: false
 
   # Log stair step diagnostics to stderr (default: false)
   # Prints [STEP] messages for debugging stair-step logic
-  # CLI: --step-log
   step_log: false
+
+  # Dump per-object filtering diagnostics to stderr (default: false)
+  debug_objects: false
+
+  # Auto-activate all moving terrain at startup (default: false)
+  toggle_platforms: false
+
+  # Skip Steam Audio probe baking (default: false)
+  # Faster startup but no spatial audio reflections
+  no_probes: false
+
+  # Enable audio/sound/schema log output (default: false)
+  audio_log: false
 
 
 audio:
@@ -150,9 +169,12 @@ audio:
     default_priority: 64         # priority for ambients without explicit value (0–255)
 
   mixer:
-    # Global gains.
+    # Global gains. Independent direct/indirect knobs let you tune the
+    # "around the corner" cue: lower direct_gain or raise reflection_gain
+    # to make bounced sounds more prominent vs. line-of-sight sounds.
     master_gain: 1.0             # global output multiplier (0–4)
-    reflection_gain: 1.0         # reverb wet bus multiplier (0–4)
+    direct_gain: 1.0             # dry-bus multiplier — direct path only (0–4)
+    reflection_gain: 1.0         # reverb wet bus multiplier — indirect path (0–4)
     reflection_ramp_ms: 10.0     # fade-in time on first reflection activation (1–1000 ms)
 
   dsp:

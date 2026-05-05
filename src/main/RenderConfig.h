@@ -15,10 +15,18 @@ namespace Darkness {
 // Defaults match the original hardcoded values.
 struct RenderConfig {
     // -- graphics --
-    int  lightmapFiltering = 0; // lightmap filtering: 0=bilinear (default), 1=bicubic
-    int  filterMode = 0;        // texture filtering: 0=point, 1=bilinear, 2=trilinear, 3=aniso
-    bool linearMips = false;  // gamma-correct mipmap generation
-    bool sharpMips  = false;  // unsharp mask on mip levels
+    // Filter terminology: both keys end in "_filter" and use string enums.
+    //   texture_filter:  point | bilinear | trilinear | anisotropic
+    //   lightmap_filter: bilinear | bicubic
+    // Internally still stored as small ints to keep the runtime hot path branchless.
+    int  filterMode        = 0;     // texture filter: 0=point, 1=bilinear, 2=trilinear, 3=anisotropic
+    int  lightmapFiltering = 0;     // lightmap filter: 0=bilinear (default), 1=bicubic
+    bool linearMips        = false; // gamma-correct mipmap generation
+    bool sharpMips         = false; // unsharp mask on mip levels
+
+    // -- paths -- (CLI flags --res / --schemas override these)
+    std::string resPath;     // Thief 2 RES directory containing fam.crf / obj.crf / snd.crf
+    std::string schemasPath; // schema directory (.sch / .spc / .arc files)
 
     // -- water --
     float waveAmplitude   = 0.3f;    // vertex Z displacement in world units (0 = flat)
@@ -78,6 +86,7 @@ struct RenderConfig {
 
     // -- audio.mixer: global gains --
     float mixerMasterGain     = 1.0f;   // global output gain multiplier
+    float mixerDirectGain     = 1.0f;   // dry-bus multiplier (direct path only)
     float mixerReflectionGain = 1.0f;   // reverb wet bus gain multiplier
     float reflectionRampMs    = 10.0f;  // reflection-bus fade-in time (ms) on first activation
 
@@ -109,7 +118,6 @@ struct RenderConfig {
     bool cameraCollision  = false;  // sphere collision against world geometry
     bool debugObjects     = false;  // dump per-object filtering diagnostics to stderr
     bool stepLog          = false;  // stair step diagnostics to stderr ([STEP] prefix)
-    std::string headLogPath;         // path for per-render-frame head/viewport CSV log ("" = disabled)
     bool togglePlatforms  = false;  // auto-activate all moving terrain at startup
     bool noProbes         = false;  // skip probe baking (no spatial audio)
     bool audioLog         = false;  // enable audio/sound/schema log output
@@ -137,14 +145,27 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
     try {
         YAML::Node root = YAML::LoadFile(path);
 
-        // graphics section
+        // paths section — fallback values used when --res / --schemas not given
+        if (YAML::Node paths = root["paths"]) {
+            if (paths["res"])     cfg.resPath     = paths["res"].as<std::string>();
+            if (paths["schemas"]) cfg.schemasPath = paths["schemas"].as<std::string>();
+        }
+
+        // graphics section — both filter knobs use string enums for symmetry.
         if (YAML::Node gfx = root["graphics"]) {
-            if (gfx["lightmap_filtering"]) {
-                std::string val = gfx["lightmap_filtering"].as<std::string>();
-                if (val == "bicubic") cfg.lightmapFiltering = 1;
-                else cfg.lightmapFiltering = 0;  // "bilinear" or unknown → default
+            if (gfx["texture_filter"]) {
+                std::string val = gfx["texture_filter"].as<std::string>();
+                if      (val == "point")        cfg.filterMode = 0;
+                else if (val == "bilinear")     cfg.filterMode = 1;
+                else if (val == "trilinear")    cfg.filterMode = 2;
+                else if (val == "anisotropic")  cfg.filterMode = 3;
+                else                            cfg.filterMode = 0; // unknown → default
             }
-            if (gfx["filter_mode"])  cfg.filterMode = gfx["filter_mode"].as<int>();
+            if (gfx["lightmap_filter"]) {
+                std::string val = gfx["lightmap_filter"].as<std::string>();
+                if      (val == "bicubic")  cfg.lightmapFiltering = 1;
+                else                        cfg.lightmapFiltering = 0; // "bilinear" or unknown → default
+            }
             if (gfx["linear_mips"])  cfg.linearMips = gfx["linear_mips"].as<bool>();
             if (gfx["sharp_mips"])   cfg.sharpMips  = gfx["sharp_mips"].as<bool>();
         }
@@ -392,6 +413,11 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.mixerMasterGain < 0.0f) cfg.mixerMasterGain = 0.0f;
                     if (cfg.mixerMasterGain > 4.0f) cfg.mixerMasterGain = 4.0f;
                 }
+                if (mix["direct_gain"]) {
+                    cfg.mixerDirectGain = mix["direct_gain"].as<float>();
+                    if (cfg.mixerDirectGain < 0.0f) cfg.mixerDirectGain = 0.0f;
+                    if (cfg.mixerDirectGain > 4.0f) cfg.mixerDirectGain = 4.0f;
+                }
                 if (mix["reflection_gain"]) {
                     cfg.mixerReflectionGain = mix["reflection_gain"].as<float>();
                     if (cfg.mixerReflectionGain < 0.0f) cfg.mixerReflectionGain = 0.0f;
@@ -491,11 +517,15 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
 
         // developer section
         if (YAML::Node dev = root["developer"]) {
-            if (dev["show_objects"])        cfg.showObjects      = dev["show_objects"].as<bool>();
+            if (dev["show_objects"])        cfg.showObjects       = dev["show_objects"].as<bool>();
             if (dev["show_fallback_cubes"]) cfg.showFallbackCubes = dev["show_fallback_cubes"].as<bool>();
             if (dev["portal_culling"])      cfg.portalCulling     = dev["portal_culling"].as<bool>();
             if (dev["camera_collision"])    cfg.cameraCollision   = dev["camera_collision"].as<bool>();
             if (dev["step_log"])            cfg.stepLog           = dev["step_log"].as<bool>();
+            if (dev["debug_objects"])       cfg.debugObjects      = dev["debug_objects"].as<bool>();
+            if (dev["toggle_platforms"])    cfg.togglePlatforms   = dev["toggle_platforms"].as<bool>();
+            if (dev["no_probes"])           cfg.noProbes          = dev["no_probes"].as<bool>();
+            if (dev["audio_log"])           cfg.audioLog          = dev["audio_log"].as<bool>();
         }
 
         std::fprintf(stderr, "Loaded config from %s\n", path.c_str());
@@ -507,10 +537,21 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
     }
 }
 
-// Parse CLI arguments into the config struct and extract CLI-only values.
-// Processes all flags in a single pass using else-if chain.
+// Parse CLI arguments. The CLI surface is intentionally minimal — every
+// other tunable lives in the YAML config. The flags below are the things
+// that genuinely need per-invocation override:
+//   <mission.mis>      first non-flag arg, the mission to load
+//   --res <path>       runtime asset directory (overrides paths.res)
+//   --schemas <path>   schema directory (overrides paths.schemas)
+//   --config <path>    YAML path (defaults to ./darknessRender.yaml)
+//   --help / -h        print usage
+//
+// Unknown flags are reported but otherwise ignored — when a removed flag
+// shows up in old shell history, the user gets a clear message instead
+// of a silent parse miss.
 inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
     CliResult cli;
+    (void)cfg; // currently nothing is set on cfg via CLI
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
@@ -521,60 +562,13 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cli.schemasPath = argv[++i];
         } else if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             cli.configPath = argv[++i];
-        } else if (std::strcmp(argv[i], "--lightmap-filtering") == 0 && i + 1 < argc) {
-            const char *val = argv[++i];
-            if (std::strcmp(val, "bicubic") == 0) cfg.lightmapFiltering = 1;
-            else cfg.lightmapFiltering = 0;  // "bilinear" or unknown → default
-        } else if (std::strcmp(argv[i], "--no-objects") == 0) {
-            cfg.showObjects = false;
-        } else if (std::strcmp(argv[i], "--show-fallback") == 0) {
-            cfg.showFallbackCubes = true;
-        } else if (std::strcmp(argv[i], "--no-cull") == 0) {
-            cfg.portalCulling = false;
-        } else if (std::strcmp(argv[i], "--filter") == 0) {
-            cfg.filterMode = 1;  // bilinear
-        } else if (std::strcmp(argv[i], "--linear-mips") == 0) {
-            cfg.linearMips = true;
-        } else if (std::strcmp(argv[i], "--sharp-mips") == 0) {
-            cfg.sharpMips = true;
-        } else if (std::strcmp(argv[i], "--collision") == 0) {
-            cfg.cameraCollision = true;
-        } else if (std::strcmp(argv[i], "--debug-objects") == 0) {
-            cfg.debugObjects = true;
-        } else if (std::strcmp(argv[i], "--step-log") == 0) {
-            cfg.stepLog = true;
-        } else if (std::strcmp(argv[i], "--head-log") == 0 && i + 1 < argc) {
-            cfg.headLogPath = argv[++i];
-        } else if (std::strcmp(argv[i], "--toggle-platforms") == 0) {
-            cfg.togglePlatforms = true;
-        } else if (std::strcmp(argv[i], "--no-probes") == 0) {
-            cfg.noProbes = true;
-        } else if (std::strcmp(argv[i], "--audio-log") == 0) {
-            cfg.audioLog = true;
-        } else if (std::strcmp(argv[i], "--physics-rate") == 0 && i + 1 < argc) {
-            int val = std::atoi(argv[++i]);
-            if (val <= 12) cfg.physicsRate = 12;
-            else if (val >= 120) cfg.physicsRate = 120;
-            else cfg.physicsRate = 60;
-        } else if (std::strcmp(argv[i], "--wave-amp") == 0 && i + 1 < argc) {
-            cfg.waveAmplitude = static_cast<float>(std::atof(argv[++i]));
-            if (cfg.waveAmplitude < 0.0f) cfg.waveAmplitude = 0.0f;
-            if (cfg.waveAmplitude > 10.0f) cfg.waveAmplitude = 10.0f;
-        } else if (std::strcmp(argv[i], "--uv-distort") == 0 && i + 1 < argc) {
-            cfg.uvDistortion = static_cast<float>(std::atof(argv[++i]));
-            if (cfg.uvDistortion < 0.0f) cfg.uvDistortion = 0.0f;
-            if (cfg.uvDistortion > 0.1f) cfg.uvDistortion = 0.1f;
-        } else if (std::strcmp(argv[i], "--water-rot") == 0 && i + 1 < argc) {
-            cfg.waterRotation = static_cast<float>(std::atof(argv[++i]));
-            if (cfg.waterRotation < 0.0f) cfg.waterRotation = 0.0f;
-            if (cfg.waterRotation > 1.0f) cfg.waterRotation = 1.0f;
-        } else if (std::strcmp(argv[i], "--water-scroll") == 0 && i + 1 < argc) {
-            cfg.waterScrollSpeed = static_cast<float>(std::atof(argv[++i]));
-            if (cfg.waterScrollSpeed < 0.0f) cfg.waterScrollSpeed = 0.0f;
-            if (cfg.waterScrollSpeed > 1.0f) cfg.waterScrollSpeed = 1.0f;
         } else if (argv[i][0] != '-' && !cli.misPath) {
             // First non-flag argument is the mission file
             cli.misPath = argv[i];
+        } else if (argv[i][0] == '-') {
+            std::fprintf(stderr,
+                "Warning: unknown CLI flag '%s' (ignored). All tunables live in the YAML config; run --help for the full list.\n",
+                argv[i]);
         }
     }
 
