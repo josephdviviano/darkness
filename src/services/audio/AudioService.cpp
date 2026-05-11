@@ -2639,27 +2639,38 @@ void AudioService::loopStep(float deltaTime)
                 if (!voice->iplSource)
                     continue;
 
-                // Player-emitted voices (footsteps, landing) follow the full DSP
-                // path like every other voice — same direct attenuation, same
-                // portal routing, same reflection convolution staging. The
-                // original feet-to-head occlusion-cutoff bug is handled by a
-                // surgical clamp in the per-voice audio callback (occlusion
-                // forced to 1.0 when distanceAttenuation > 0.9, i.e. source
-                // within ~3 units of listener). Skipping the entire DSP block
-                // for player-emitted voices was overkill and had been silently
-                // preventing footsteps from contributing to the reflection
-                // convolution path even when reflectionsActive=true on the
-                // surface.
+                // Player-emitted voices (footsteps, landing) run the per-voice
+                // DSP node like every other voice — direct attenuation, HRTF,
+                // and reflection convolution staging all happen normally.
+                // What's different for them is configured at the simulator
+                // input level below: occlusion + transmission disabled, dist
+                // attenuation forced to 1.0, baked reflections routed through
+                // the listener-position probe IR, and (just below) portal
+                // routing skipped. Together those replace the older broad
+                // "skipAttenuation skips the entire DSP block" bypass which
+                // had been silently preventing footsteps from reaching the
+                // convolution path as a side-effect.
                 voice->dspNode.skipAttenuation = false;
 
                 // Run portal propagation to determine reachability and path.
                 // Throttled: nearby voices update every frame, distant voices
                 // every 8-16 frames. Matching the original engine's adaptive
                 // update frequency. Uses cached result between updates.
+                //
+                // Player-emitted voices (footsteps, landings) are always in
+                // the same "room" as the listener by definition — the source
+                // IS the player. Skipping portal propagation entirely avoids
+                // a 953d322-class bug: head↔feet distance is ~5-6 ft (just
+                // over the 5-unit same-room threshold below), so at floor or
+                // ceiling room boundaries a footstep can flicker into
+                // isCrossRoom=true, get its source moved to a portal anchor,
+                // and end up portal-attenuated + door-LPF'd into silence on
+                // the dry path. Direct path stays at full volume; baked
+                // reflection routing handles the wet path independently.
                 SoundPropInfo prop{};
                 bool isCrossRoom = false;
                 if (mPortalRoutingEnabled && !voice->sourceEnded
-                    && !voice->skipPortalRouting) {
+                    && !voice->skipPortalRouting && !voice->playerEmitted) {
                     if (voice->propagationCountdown <= 0) {
                         auto prT0 = std::chrono::steady_clock::now();
                         prop = propagateSoundBlended(voice->worldPos,
@@ -3545,6 +3556,44 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
         iplDirectEffectRelease(&dsp.directEffect);
         dsp.directEffect = nullptr;
         return;
+    }
+
+    // Pre-warm the binaural effect's overlap-add history buffer with one
+    // frame of silence. Without this, the first real audio frame for a new
+    // voice gets attenuated by ~50% because overlap-add convolution against
+    // a zero-history buffer drops the leading samples.
+    //
+    // Audible only on short transients (footsteps, impacts, glass breaks)
+    // where the leading edge IS the perceived sound. Long voices fade in
+    // imperceptibly. Voices spawn at arbitrary phases within the audio
+    // buffer cycle, so the impact transient lands in the first frame for
+    // some voices and in subsequent frames for others — producing an A/B
+    // alternation in perceived loudness unrelated to source position.
+    //
+    // One-time ~50 µs cost at voice creation; negligible.
+    {
+        std::vector<float> warmMono(mFrameSize, 0.0f);
+        std::vector<float> warmL(mFrameSize, 0.0f);
+        std::vector<float> warmR(mFrameSize, 0.0f);
+        float *warmInPtr = warmMono.data();
+        IPLAudioBuffer warmIn{};
+        warmIn.numChannels = 1;
+        warmIn.numSamples = static_cast<IPLint32>(mFrameSize);
+        warmIn.data = &warmInPtr;
+
+        float *warmOutChans[2] = {warmL.data(), warmR.data()};
+        IPLAudioBuffer warmOut{};
+        warmOut.numChannels = 2;
+        warmOut.numSamples = static_cast<IPLint32>(mFrameSize);
+        warmOut.data = warmOutChans;
+
+        IPLBinauralEffectParams warmParams{};
+        warmParams.direction = {0.0f, 0.0f, -1.0f};  // ahead, neutral
+        warmParams.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;
+        warmParams.spatialBlend = 1.0f;
+        warmParams.hrtf = mIplHrtf;
+        warmParams.peakDelays = nullptr;
+        iplBinauralEffectApply(dsp.binauralEffect, &warmParams, &warmIn, &warmOut);
     }
 
     // Create per-voice reflection convolution effect (optional — only if mixer exists).
