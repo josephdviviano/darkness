@@ -102,9 +102,11 @@ struct CarryParams {
     float holdDistance = 2.0f;
 
     // Vertical offset relative to the camera (added along world Z, since
-    // Dark Engine is Z-up). Slightly negative places the object below the
-    // crosshair, matching Thief's "hold it where I can see my feet" feel.
-    float heightOffset = -0.3f;
+    // Dark Engine is Z-up). Held objects sit well below the crosshair so
+    // the player can see the world over the top of whatever they're
+    // carrying — held objects render opaque, so this offset is what
+    // preserves forward visibility.
+    float heightOffset = -0.7f;
 
     // If true, the held object's orientation rotates with the camera so its
     // initial relative pose is preserved — turning your head turns the

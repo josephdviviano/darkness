@@ -49,10 +49,25 @@ public:
     void read(const FilePtr &sf);
     void write(const FilePtr &sf);
 
+    /// Resolve every portal's src/dest Room pointer. Must be called after
+    /// every Room in the level has been read and registered in
+    /// RoomService::mRoomsByID — see RoomPortal::linkRooms for the
+    /// rationale (forward references would otherwise null out the graph).
+    void linkPortals();
+
     int32_t getObjectID() const { return mObjectID; };
     int16_t getRoomID() const { return mRoomID; };
 
-    bool isInside(const Vector3 &point);
+    /// Raw OBB convex containment test. Returns true iff `point` is on the
+    /// positive side of all 6 bounding planes of this room. NOTE: multiple
+    /// rooms can return true for the same point — OBBs overlap at portal
+    /// boundaries by design. Do NOT use this as a "is this point in this
+    /// room" oracle. Use RoomService::roomFromPoint for room membership;
+    /// it disambiguates overlapping candidates via portal planes.
+    /// Kept public for one legitimate caller (startup-time cell→room
+    /// seeding in DarknessRendererCore::buildCellToRoomMap, which has its
+    /// own propagation fallback) and for use inside RoomService.
+    bool obbContains(const Vector3 &point);
 
     /** Gets portal for a given position
      * @param pos The position to find portal for

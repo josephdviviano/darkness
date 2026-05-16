@@ -46,7 +46,20 @@ struct RenderConfig {
     int  reflectionThrottle      = 4;     // run reflection sim every Nth frame (1–32)
     int  simMaxOcclusionSamples  = 32;    // upper bound on per-source occlusion samples (Steam Audio sim)
     int  simMaxRays              = 4096;  // upper bound on rays per sim step (Steam Audio sim)
-    int  simMaxSources           = 32;    // Steam Audio simulator source pool size
+    // Source pools: direct sim is cheap per-source so it can be much larger
+    // than the reflection pool. Legacy YAML key `sim_max_sources` (if present)
+    // is mapped to `reflectionMaxSources` for back-compat.
+    int  directMaxSources        = 256;   // Steam Audio direct-only simulator source pool size (4–1024)
+    int  reflectionMaxSources    = 32;    // Steam Audio reflection simulator source pool size (4–256)
+    // Demote-only fallback (stage 2.2): every voice starts with a
+    // reflection source so it routes through baked reverb by default.
+    // Normal voices that stay outside the top-N reflection candidate pool
+    // for this many consecutive frames release their source and play dry
+    // for the rest of their life. Default ≈10 s at 60 fps — intentionally
+    // high so this fires only as a sparing fallback when convolution/sim
+    // budget is under genuine pressure. PlayerEmitted + Ambient voices
+    // are excluded.
+    int  reflectionDemoteHysteresisFrames = 600; // (1–3600)
     std::string sceneType        = "default"; // IPL scene backend: "default" or "embree"
 
     // -- audio.reflections: convolution reverb feel --
@@ -55,6 +68,15 @@ struct RenderConfig {
     int   reflectionNumBounces = 4;    // bounces per ray (1–8)
     float reflectionDuration  = 2.0f;  // max reverb tail in seconds (0.5–4.0)
     int   ambisonicsOrder     = 0;     // 0 = omnidirectional (1ch, 4x cheaper), 1 = directional (4ch)
+
+    // -- audio.probes: baked-probe grid generation --
+    // Spacing/height feed bakeProbes(); a denser grid produces smoother reverb
+    // interpolation at the cost of ~(spacing_old/spacing_new)^2 disk space and
+    // proportionally longer bake time. The defaults match the prior hardcoded
+    // values; halve spacing (e.g. 2.5) to test whether residual footstep
+    // reverb A/B variance is driven by probe sparsity.
+    float audioProbeSpacingFt = 5.0f;  // grid spacing in feet (1.0–20.0; requires re-bake to take effect)
+    float audioProbeHeightFt  = 5.0f;  // probe height above floor in feet (0.5–20.0)
 
     // -- audio.occlusion: occlusion + material scaling --
     float occlusionRadius     = 5.0f;  // volumetric occlusion sphere radius (world units = feet, 0.3–30)
@@ -83,6 +105,14 @@ struct RenderConfig {
     float ambHysteresisStopMul  = 2.0f; // multiplier on radius for ambient deactivation distance
     std::string ambFalloffCurve = "quadratic"; // ambient distance falloff: "linear" or "quadratic"
     int   ambDefaultPriority    = 64;   // priority for ambients without explicit value
+    // Per-voice spatialBlend override for AMB_ENVIRONMENTAL ambients (room
+    // tone, wind, church reverberance). 1.0 = full HRTF point-source pan;
+    // 0.0 = mono passthrough (no directional cue). Object-attached ambients
+    // (no AMB_ENVIRONMENTAL flag) keep full HRTF at 1.0 regardless.
+    // Default 0.3 = mostly diffuse with a subtle directional hint, so
+    // "wind from outside" still leans in the right direction but doesn't
+    // feel like a laser pointer.
+    float ambEnvironmentalSpatialBlend = 0.3f;  // (0.0–1.0)
 
     // -- audio.mixer: global gains --
     float mixerMasterGain     = 1.0f;   // global output gain multiplier
@@ -258,10 +288,29 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.simMaxRays < 128)   cfg.simMaxRays = 128;
                     if (cfg.simMaxRays > 16384) cfg.simMaxRays = 16384;
                 }
+                // Legacy alias: `sim_max_sources` maps to the reflection cap
+                // so existing configs keep their old reflection-sim behavior.
+                // New configs should prefer the split keys below.
                 if (perf["sim_max_sources"]) {
-                    cfg.simMaxSources = perf["sim_max_sources"].as<int>();
-                    if (cfg.simMaxSources < 4)   cfg.simMaxSources = 4;
-                    if (cfg.simMaxSources > 256) cfg.simMaxSources = 256;
+                    cfg.reflectionMaxSources = perf["sim_max_sources"].as<int>();
+                    if (cfg.reflectionMaxSources < 4)   cfg.reflectionMaxSources = 4;
+                    if (cfg.reflectionMaxSources > 256) cfg.reflectionMaxSources = 256;
+                }
+                if (perf["direct_max_sources"]) {
+                    cfg.directMaxSources = perf["direct_max_sources"].as<int>();
+                    if (cfg.directMaxSources < 4)    cfg.directMaxSources = 4;
+                    if (cfg.directMaxSources > 1024) cfg.directMaxSources = 1024;
+                }
+                if (perf["reflection_max_sources"]) {
+                    cfg.reflectionMaxSources = perf["reflection_max_sources"].as<int>();
+                    if (cfg.reflectionMaxSources < 4)   cfg.reflectionMaxSources = 4;
+                    if (cfg.reflectionMaxSources > 256) cfg.reflectionMaxSources = 256;
+                }
+                if (perf["reflection_demote_hysteresis_frames"]) {
+                    cfg.reflectionDemoteHysteresisFrames =
+                        perf["reflection_demote_hysteresis_frames"].as<int>();
+                    if (cfg.reflectionDemoteHysteresisFrames < 1)    cfg.reflectionDemoteHysteresisFrames = 1;
+                    if (cfg.reflectionDemoteHysteresisFrames > 3600) cfg.reflectionDemoteHysteresisFrames = 3600;
                 }
                 if (perf["scene_type"]) {
                     cfg.sceneType = perf["scene_type"].as<std::string>();
@@ -291,7 +340,24 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 if (refl["ambisonics_order"]) {
                     cfg.ambisonicsOrder = refl["ambisonics_order"].as<int>();
                     if (cfg.ambisonicsOrder < 0) cfg.ambisonicsOrder = 0;
-                    if (cfg.ambisonicsOrder > 1) cfg.ambisonicsOrder = 1;
+                    if (cfg.ambisonicsOrder > 3) cfg.ambisonicsOrder = 3;
+                }
+            }
+
+            // -- audio.probes --
+            // Bake-time grid parameters. A halved spacing quadruples probe
+            // count on a 2D floor grid and adds proportional bake time, but
+            // reduces footstep-reverb amplitude variance between probes.
+            if (YAML::Node prb = audio["probes"]) {
+                if (prb["spacing"]) {
+                    cfg.audioProbeSpacingFt = prb["spacing"].as<float>();
+                    if (cfg.audioProbeSpacingFt < 1.0f)  cfg.audioProbeSpacingFt = 1.0f;
+                    if (cfg.audioProbeSpacingFt > 20.0f) cfg.audioProbeSpacingFt = 20.0f;
+                }
+                if (prb["height"]) {
+                    cfg.audioProbeHeightFt = prb["height"].as<float>();
+                    if (cfg.audioProbeHeightFt < 0.5f)  cfg.audioProbeHeightFt = 0.5f;
+                    if (cfg.audioProbeHeightFt > 20.0f) cfg.audioProbeHeightFt = 20.0f;
                 }
             }
 
@@ -403,6 +469,11 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     cfg.ambDefaultPriority = amb["default_priority"].as<int>();
                     if (cfg.ambDefaultPriority < 0)   cfg.ambDefaultPriority = 0;
                     if (cfg.ambDefaultPriority > 255) cfg.ambDefaultPriority = 255;
+                }
+                if (amb["environmental_spatial_blend"]) {
+                    cfg.ambEnvironmentalSpatialBlend = amb["environmental_spatial_blend"].as<float>();
+                    if (cfg.ambEnvironmentalSpatialBlend < 0.0f) cfg.ambEnvironmentalSpatialBlend = 0.0f;
+                    if (cfg.ambEnvironmentalSpatialBlend > 1.0f) cfg.ambEnvironmentalSpatialBlend = 1.0f;
                 }
             }
 
@@ -531,8 +602,17 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
         std::fprintf(stderr, "Loaded config from %s\n", path.c_str());
         return true;
     } catch (const YAML::Exception& e) {
-        std::fprintf(stderr, "Warning: failed to parse config %s: %s\n",
-                     path.c_str(), e.what());
+        // The file existed and we tried to parse it — a syntax error here
+        // means everything past the bad line was silently skipped, leaving
+        // the program running with a half-applied config. The library only
+        // returns false (so unit tests can exercise this path); the BINARY
+        // is expected to detect "file existed but parse failed" and abort.
+        // See DarknessRender.cpp's call site for the abort.
+        std::fprintf(stderr,
+            "\nERROR: failed to parse %s\n"
+            "  %s\n"
+            "Fix the syntax error or remove the file to run with defaults.\n",
+            path.c_str(), e.what());
         return false;
     }
 }

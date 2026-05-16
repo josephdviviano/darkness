@@ -27,12 +27,20 @@ endif()
 # Core services that work without a renderer
 set(HEADLESS_SERVICES_SOURCES
     audio/AcousticMaterials.h
+    audio/AIHearingData.h
     audio/AudioService.cpp
     audio/AudioService.h
     audio/CRFSoundLoader.h
+    audio/EnvSoundDatabase.cpp
+    audio/EnvSoundDatabase.h
+    audio/SchemaPropertyOverrides.h
+    audio/SchemaSamplesChunk.cpp
+    audio/SchemaSamplesChunk.h
     audio/SchemaTypes.h
     audio/SchemaParser.h
     audio/SchemaParser.cpp
+    audio/SpeechDatabase.cpp
+    audio/SpeechDatabase.h
     config/ConfigService.cpp
     config/ConfigService.h
     database/DatabaseService.cpp

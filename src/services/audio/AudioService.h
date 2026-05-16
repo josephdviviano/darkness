@@ -33,6 +33,7 @@
 #include "database/DatabaseCommon.h"
 #include "loop/LoopCommon.h"
 #include "audio/SchemaTypes.h"
+#include "room/RoomService.h"  // SoundPropInfo / SoundPropParams / SoundPathHop
 
 #include <atomic>
 #include <condition_variable>
@@ -107,6 +108,19 @@ constexpr SoundHandle SOUND_HANDLE_INVALID = -1;
 /// Active voice — owns WAV data, miniaudio decoder + sound (defined in AudioService.cpp)
 struct ActiveVoice;
 
+/// Voice classification, set at startVoice time so the per-class default
+/// directParams (distanceAttenuation = 1.0, occlusion-disabled flags etc.)
+/// can be applied inside createVoiceSource — i.e. before ma_sound_start
+/// kicks off audio-thread playback. Without this, the audio thread reads
+/// the silent initVoiceDSP defaults for the first ~21 ms callback after
+/// voice creation, since the per-frame loopStep override doesn't fire
+/// until the next frame.
+enum class VoiceClass {
+    Normal,         ///< NPC dialogue, world FX, gunshots, etc.
+    PlayerEmitted,  ///< Footsteps, landings — source ≈ listener; no occlusion / distance
+    Ambient,        ///< Environmental ambients — distance handled by ambient system
+};
+
 /// On-disk layout of P$AmbientHack property (60 bytes).
 /// Ambient sound objects in the mission use this to define looping environmental sounds.
 #pragma pack(push, 1)
@@ -141,7 +155,35 @@ struct AmbientSound {
     float radius = 0.0f;             ///< Propagation radius
     int32_t volume = -1;              ///< Volume in millibels
     uint32_t flags = 0;               ///< AmbientHackFlags
+    /// Per-ambient SHARP-falloff flag, captured from the schema's
+    /// SCH_SHARP_FALLOFF (= original engine's SFXFLG_SHARP) at load time.
+    /// True → use the 4th-power curve `(d/r)^4` in updateAmbientVolumes;
+    /// false → linear `(d/r)`. SHARP is the original engine's default
+    /// for ambients (most use it); schemas opt out via an explicit
+    /// `flags` directive that clears bit 12.
+    bool isSharp = true;
+    /// Per-schema attenuation-factor divisor for the volume formula,
+    /// loaded from P$SchAttFac at startup (default 1.0). Higher values
+    /// make this schema fall off less aggressively. Examples in MISS6:
+    /// m06bell=20.0, KARRAS_SCRIPTED=3.0, AI_CONV=1.7, HIT_EXPLOSION=2.0.
+    float attenuationFactor = 1.0f;
     SoundHandle handle = SOUND_HANDLE_INVALID; ///< Active voice handle (if playing)
+};
+
+/// Spot ambient — alternative ambient encoding with a hard inner/outer
+/// falloff envelope (loaded from P$SpotAmb). Unlike AmbientSound (single
+/// radius, linear/SHARP falloff), spot ambients are flat-volume within
+/// the inner radius, linearly fading to silence between inner and outer,
+/// and silent beyond. The original engine ties these to specific scene
+/// objects (e.g. mech floor lamps in MISS6).
+struct SpotAmbient {
+    int objID = 0;
+    std::string schemaName;       ///< Schema name (resolved from emitter object's archetype)
+    Vector3 position{0, 0, 0};
+    float inner = 0.0f;           ///< Distance inside which volume = level
+    float outer = 0.0f;           ///< Distance beyond which volume = 0
+    float level = 1.0f;           ///< Volume scalar at d <= inner
+    SoundHandle handle = SOUND_HANDLE_INVALID;
 };
 
 /// Maximum simultaneous active voices (matches Dark Engine's limit)
@@ -156,15 +198,9 @@ constexpr int DEFAULT_MAX_REFLECTION_VOICES = 16;
 /// Default maximum sound propagation distance (world units)
 constexpr float SOUND_MAX_DIST = 200.0f;
 
-/// Result of sound propagation through the portal graph.
-/// Describes how a sound reaches a listener after traversing portals and doors.
-struct SoundPropInfo {
-    float effectiveDistance = 0.0f;   ///< Distance with blocking penalties applied
-    float realDistance = 0.0f;        ///< Actual physical distance through portal chain
-    float totalBlocking = 0.0f;      ///< Cumulative blocking factor [0,1] (max of all portals)
-    Vector3 virtualPosition{0, 0, 0}; ///< Where the sound appears to come from (last portal center)
-    bool reached = false;            ///< Whether the sound can reach the listener
-};
+/// SoundPropInfo / SoundPathHop / SoundPropParams are declared in
+/// room/RoomService.h — they describe portal-graph propagation, a
+/// room-system concern that AudioService consumes.
 
 /** @brief Audio service — manages all sound playback, schema resolution,
  *  Steam Audio spatialization, and AI sound propagation.
@@ -216,8 +252,13 @@ public:
                               bool bypassPortalBlocking = false);
 
     /** Halt a specific active sound.
-     *  @param handle  Sound handle from playSchema/playSchemaOnObj */
-    void haltSound(SoundHandle handle);
+     *  @param handle  Sound handle from playSchema/playSchemaOnObj
+     *  @param fadeMs  Fade-out duration in milliseconds. Default 15 ms is the
+     *                 minimum needed to suppress click/pop from an abrupt
+     *                 cut. Use a longer fade (~200 ms) when halting an
+     *                 ambient that has gracefully aged out of audible range
+     *                 so the voice fades out rather than cuts. */
+    void haltSound(SoundHandle handle, int fadeMs = 15);
 
     /** Halt all active sounds (e.g. on mission unload). */
     void haltAll();
@@ -418,6 +459,14 @@ public:
     /// "linear" or "quadratic"
     void setAmbFalloffCurve(const std::string& s) { mAmbFalloffCurve = (s == "linear" ? "linear" : "quadratic"); }
     void setAmbDefaultPriority(int p) { mAmbDefaultPriority = std::max(0, std::min(p, 255)); }
+    // Per-voice spatialBlend override applied to AMB_ENVIRONMENTAL ambients
+    // at activation time. 1.0 = full HRTF point-source pan; 0.0 = mono
+    // passthrough. Lower values make room ambients (wind, church) feel
+    // less like they emit from a single point. Object-attached ambients
+    // (no AMB_ENVIRONMENTAL flag) ignore this and stay at full HRTF.
+    void setAmbEnvironmentalSpatialBlend(float b) {
+        mAmbEnvironmentalSpatialBlend = std::max(0.0f, std::min(b, 1.0f));
+    }
 
     // ── Performance tuning (some MUST be set BEFORE buildAcousticScene) ──
     void setMaxActiveVoices(int n) { mMaxActiveVoicesCfg = std::max(8, std::min(n, 256)); }
@@ -425,7 +474,18 @@ public:
     void setSimulatorThreads(int n) { mSimulatorThreadsCfg = std::max(0, std::min(n, 64)); }
     void setSimMaxOcclusionSamples(int n) { mSimMaxOcclusionSamplesCfg = std::max(4, std::min(n, 256)); }
     void setSimMaxRays(int n) { mSimMaxRaysCfg = std::max(128, std::min(n, 16384)); }
-    void setSimMaxSources(int n) { mSimMaxSourcesCfg = std::max(4, std::min(n, 256)); }
+    // Direct simulator's source cap — runs synchronously and per-source cost is
+    // ~constant, so this can be set much higher than the reflection cap.
+    void setDirectMaxSources(int n) { mDirectMaxSourcesCfg = std::max(4, std::min(n, 1024)); }
+    // Reflection simulator's source cap — convolution + IR memory scale with
+    // this, so it's the expensive one. Keep modest unless quality budget allows.
+    void setReflectionMaxSources(int n) { mReflectionMaxSourcesCfg = std::max(4, std::min(n, 256)); }
+    // Number of consecutive frames a Normal voice must stay out of the top-N
+    // reflection candidate pool before its reflection source is released
+    // and the voice goes fully dry for the rest of its life. This is a
+    // sparing fallback — default is high (~10 s at 60 fps) so it fires
+    // only when the convolution/sim budget is under real pressure.
+    void setReflectionDemoteHysteresisFrames(int n) { mReflectionDemoteHysteresisCfg = std::max(1, std::min(n, 3600)); }
     /// "default" or "embree"
     void setSceneType(const std::string& s) { mSceneTypeCfg = (s == "embree" ? "embree" : "default"); }
 
@@ -450,7 +510,7 @@ public:
      *  @return true if baking succeeded */
     bool bakeProbes(const std::string &outputPath,
                     std::atomic<float> *progress = nullptr,
-                    float spacing = 5.0f, float height = 5.0f);
+                    float spacing = -1.0f, float height = -1.0f);
 
     /** Load baked probe data from disk and register with simulator.
      *  @param probePath  Path to .probes file
@@ -459,6 +519,27 @@ public:
 
     /** @return number of loaded probes (0 if none) */
     int getProbeCount() const;
+
+    /** Bake-time grid configuration. Takes effect on the next bakeProbes()
+     *  call — does NOT relocate existing probes. Range-clamped to keep CPU
+     *  cost reasonable. */
+    void setProbeSpacingFt(float ft) { mProbeSpacingFt = std::max(1.0f, std::min(ft, 20.0f)); }
+    float getProbeSpacingFt() const { return mProbeSpacingFt; }
+    void setProbeHeightFt(float ft) { mProbeHeightFt = std::max(0.5f, std::min(ft, 20.0f)); }
+    float getProbeHeightFt() const { return mProbeHeightFt; }
+
+    /** Snapshot of probe positions in feet (engine units). Populated by
+     *  bakeProbes() and loadProbes(); empty if no probes are loaded. Used
+     *  by the renderer to draw a debug overlay. The vector is rebuilt on
+     *  every bake/load, so cache by index — values do not change between
+     *  re-bakes. */
+    const std::vector<Vector3> &getProbePositions() const { return mProbePositions; }
+
+    /** Diagnostic: is any player-emitted voice currently making sound?
+     *  Used by the renderer to flash a listener-position marker so a user
+     *  can visually correlate footstep loudness with where they are
+     *  standing relative to baked probes. Cheap atomic load. */
+    bool isPlayerEmittedVoiceActive() const { return mPlayerEmittedActive.load(std::memory_order_relaxed); }
 
     /** Start/stop recording the final audio output to WAV + position CSV.
      *  Files are written to the current working directory:
@@ -497,7 +578,9 @@ public:
      *  Order 0 = 1 channel (omnidirectional reverb), 4x cheaper per voice.
      *  Order 1 = 4 channels (directional reverb), more spatial detail in tails.
      *  Direct path HRTF is unaffected — spatial positioning stays full quality. */
-    void setAmbisonicsOrder(int order) { mAmbisonicsOrder = std::max(0, std::min(order, 1)); }
+    // Ambisonic order: 0 = omnidirectional (1ch), 1 = directional (4ch),
+    // 2 = (9ch), 3 = (16ch). Memory + decode cost scale with (N+1)^2 channels.
+    void setAmbisonicsOrder(int order) { mAmbisonicsOrder = std::max(0, std::min(order, 3)); }
     int  getAmbisonicsOrder() const { return mAmbisonicsOrder; }
 
     /** @return the actual reflection pipeline sample rate (24000 or 48000) */
@@ -604,6 +687,110 @@ private:
     /// Load ambient sound objects from mission data
     void loadAmbientSounds();
 
+    /// Overlay per-archetype schema property overrides from the gamesys
+    /// onto our parsed SchemaEntry table. Reads P$SchPlayPa (play params:
+    /// flags, audio class, volume, pan, delay, fade), P$SchLoopPa (loop
+    /// params: flags, max samples, loop count, interval), P$SchPriori
+    /// (priority override) and P$SchMsg (AI message label). Matches the
+    /// schema-archetype object to a SchemaEntry by SymName.
+    void loadSchemaPropertyOverrides();
+
+    // ── Spot ambients (Unit B) ──
+
+    /// Active spot-ambient instances parsed from P$SpotAmb properties.
+    /// Unlike P$AmbientHack (single radius, linear/SHARP falloff), spot
+    /// ambients have inner/outer envelope: full volume inside `inner`,
+    /// linear fade to 0 between `inner` and `outer`, silent beyond.
+    std::vector<SpotAmbient> mSpotAmbients;
+
+    /// Load spot ambients from mission data (P$SpotAmb on objects).
+    void loadSpotAmbients();
+
+    /// Update spot-ambient voice volumes based on listener distance.
+    /// Mirrors updateAmbientVolumes for the envelope-falloff model.
+    void updateSpotAmbientVolumes();
+
+    // ── Miscellaneous per-archetype sound data (Unit G) ──
+
+    /// P$PrjSound — schema name to play for a projectile archetype's
+    /// flight/impact sound. Keyed by archetype objID (negative). The
+    /// projectile-spawning code consults this map when emitting a
+    /// projectile to pick the right flight schema.
+    std::unordered_map<int32_t, std::string> mProjectileSounds;
+
+    /// P$Heartbeat — interval (ms) between heartbeat sounds for a given
+    /// object archetype/instance. Keyed by objID. Default-zero entries
+    /// are not stored. Used by health-low / AI-frightened heartbeat
+    /// schemas; the runtime consults this to pace the heartbeat trigger.
+    std::unordered_map<int32_t, int32_t> mHeartbeatIntervals;
+
+    /// P$SchLastSa — last-played sample index per schema archetype.
+    /// Runtime-mutable: written when a schema plays, restored from save
+    /// data on load. Drives SCH_NO_REPEAT behavior across save/load.
+    /// Keyed by schema name (SymName of the archetype object).
+    std::unordered_map<std::string, int32_t> mSchemaLastSampleSaved;
+
+    /// Load the small per-archetype sound props above from mission data.
+    /// Called from loadAmbientSounds() after the schema-override pass.
+    void loadMiscSoundProperties();
+
+    // ── Mission-level sound data (Unit H) ──
+
+    /// Raw 4-byte AMBIENT chunk contents (loaded as uint32). Mission-
+    /// level ambient enable flag or similar — the original engine wrote
+    /// this per-mission to control whether the ambient layer is active.
+    /// Empty (no value) when the mission has no AMBIENT chunk.
+    bool mHasAmbientChunk = false;
+    uint32_t mAmbientChunkValue = 0;
+
+    /// L$SoundDesc links — sound-descriptor relations attached to objects
+    /// (e.g. triggered/scripted sounds distinct from P$AmbientHack). Each
+    /// entry is a (source-object, destination-object, link-id) tuple.
+    /// The destination is typically a sound-descriptor archetype carrying
+    /// the schema name; runtime triggers walk these on script events.
+    struct SoundDescLink {
+        int32_t src;
+        int32_t dst;
+        uint32_t linkID;
+    };
+    std::vector<SoundDescLink> mSoundDescLinks;
+
+    /// Load mission-level sound data (AMBIENT chunk + L$SoundDesc).
+    /// Called from onDBLoad after the ROOM_EAX block.
+    void loadMissionSoundData(const FileGroupPtr &db);
+
+    // ── Sound chunk databases (Units D, E, F) ──
+
+    /// Compiled environmental-sound tag database from the ENV_SOUND
+    /// chunk in dark.gam. First-pass: capture raw bytes; full decoding
+    /// of the binary tag-tree is deferred.
+    std::unique_ptr<class EnvSoundDatabase> mEnvSoundDB;
+
+    /// Compiled speech database from the Speech_DB chunk in dark.gam.
+    /// First-pass: capture raw bytes; full decoding of voice/concept
+    /// trees is deferred.
+    std::unique_ptr<class SpeechDatabase> mSpeechDB;
+
+    /// Schema → samples mapping from the SchSamp chunk in dark.gam.
+    /// Canonical compiled form of what we currently re-derive from .sch
+    /// files. Loaded for cross-check + to cover gam-only schemas.
+    std::unique_ptr<class SchemaSamplesChunk> mSchemaSamplesDB;
+
+    /// Global AI hearing-stats / sound-tweaks chunks (Unit C). Both
+    /// optional; populated only when the gamesys contains the chunks.
+    /// Storage uses the parser's value types; default-constructed when
+    /// absent. See audio/AIHearingData.h for layout.
+    bool mHasAIHearingStats = false;
+    bool mHasAISoundTweaks = false;
+    /// Backing storage as raw bytes so we don't pull AIHearingData.h
+    /// into this header (keeps the include surface narrow).
+    uint8_t mAIHearingStatsBytes[48] = {0};
+    uint8_t mAISoundTweaksBytes[24] = {0};
+
+    /// Load all global sound chunk databases (ENV_SOUND, Speech_DB,
+    /// SchSamp, AIHearStat, AISNDTWK). Called from onDBLoad.
+    void loadSoundChunkDatabases(const FileGroupPtr &db);
+
     /// Update ambient volumes based on listener distance (per-frame)
     void updateAmbientVolumes();
 
@@ -644,8 +831,20 @@ private:
     /// Static mesh within the scene (world geometry + material assignments)
     IPLStaticMesh mIplStaticMesh = nullptr;
 
-    /// Simulator for direct/reflection/reverb computation
-    IPLSimulator mIplSimulator = nullptr;
+    /// Simulator for ray-traced reflection/reverb computation. Runs on a
+    /// background thread (`reflectionSimWorkerMain`); source-add/remove
+    /// must be deferred via `mPendingSourceAdds` / `mPendingSourceRemovals`
+    /// when the worker is running, since `iplSimulatorRunReflections`
+    /// internally iterates the simulator's source list.
+    IPLSimulator mReflectionSimulator = nullptr;
+
+    /// Simulator for direct path (distance attenuation, occlusion, air
+    /// absorption, transmission). Runs synchronously on the main thread in
+    /// `loopStep`, so its source list is never iterated concurrently —
+    /// `iplSourceAdd` / `iplSourceRemove` are always safe to call inline.
+    /// Shares `mIplScene` with the reflection simulator (refcounted via
+    /// `iplSceneRetain`); world geometry is not duplicated.
+    IPLSimulator mDirectSimulator = nullptr;
 
     /// Whether an acoustic scene is currently active (built and committed).
     /// Atomic as a defensive measure — currently only accessed from the main
@@ -763,6 +962,7 @@ private:
     float mPropMinAttenuation  = 0.001f;
 
     // ── Ambient tuning (P$AmbientHack) ──
+    float       mAmbEnvironmentalSpatialBlend = 0.3f;
     float       mAmbHysteresisStartMul = 1.5f;
     float       mAmbHysteresisStopMul  = 2.0f;
     std::string mAmbFalloffCurve       = "quadratic"; // "linear" or "quadratic"
@@ -773,7 +973,22 @@ private:
     int         mSimulatorThreadsCfg       = 0;       // 0 = auto (hwconc-2)
     int         mSimMaxOcclusionSamplesCfg = 32;
     int         mSimMaxRaysCfg             = 4096;
-    int         mSimMaxSourcesCfg          = 32;
+    // Source-cap split: direct sim is cheap per source so it gets a larger
+    // pool by default; reflection sim is the expensive one and stays modest.
+    // Stage 2.2 (lazy reflection-source allocation) will let many more voices
+    // exist with direct-only spatialization while only top-N voices hold a
+    // reflection source.
+    int         mDirectMaxSourcesCfg       = 256;
+    int         mReflectionMaxSourcesCfg   = 32;
+    // Demote fallback (stage 2.2): every voice starts with a reflection
+    // source. When a Normal voice has stayed outside the top-N reflection
+    // candidate pool for this many consecutive frames, its reflection
+    // source is released and the voice plays dry for the remainder of
+    // its life. Default ≈10 s at 60 fps — intentionally high so this is
+    // a sparing fallback for genuinely long-lived "stuck distant" voices,
+    // not the steady-state path. See AudioService.cpp
+    // demoteFromRealtimeReflection and the loopStep demote pass.
+    int         mReflectionDemoteHysteresisCfg = 600;
     std::string mSceneTypeCfg              = "default"; // "default" or "embree"
     int         mAudioSampleRateCfg        = 48000;
     int         mAudioFrameSizeCfg         = 1024;
@@ -784,6 +999,22 @@ private:
     IPLProbeBatch mIplProbeBatch = nullptr;  ///< Loaded probe data (positions + baked paths + reflections)
     int mProbeCount = 0;                     ///< Number of probes in the batch
     bool mProbesHaveReflections = false;     ///< True if loaded probes contain baked reflection IRs
+
+    /// Grid parameters used at bake time. Read by bakeProbes() if no explicit
+    /// spacing/height argument is provided. Live-tunable via console but only
+    /// take effect on the next re-bake.
+    float mProbeSpacingFt = 5.0f;
+    float mProbeHeightFt  = 5.0f;
+
+    /// Probe positions in feet (engine units). Populated by bakeProbes() and
+    /// loaded from a sidecar file by loadProbes(). Used purely for debug
+    /// overlay rendering — Steam Audio holds the canonical copy internally.
+    std::vector<Vector3> mProbePositions;
+
+    /// True while any voice flagged playerEmitted is producing sound. Set by
+    /// loopStep() on the main thread, read by the renderer for the debug
+    /// listener-marker overlay. Atomic so renderer can read without locking.
+    std::atomic<bool> mPlayerEmittedActive{false};
 
     /// Scene bounding box (computed during buildAcousticScene)
     Vector3 mSceneMin{0, 0, 0};
@@ -829,6 +1060,14 @@ private:
 
     /// IPL sources awaiting deferred add (accumulated while any sim thread is busy).
     std::vector<IPLSource> mPendingSourceAdds;
+
+    /// Count of voices that currently hold a real-time reflection source
+    /// (promoted). Incremented in promoteToRealtimeReflection, decremented
+    /// in demoteFromRealtimeReflection / removeVoiceSource. Atomic so the
+    /// debug console / perf overlay can read without locking. Validates
+    /// against leaks in the promote/demote state machine — should equal the
+    /// number of voices in mVoices with a non-null reflectionSource.
+    std::atomic<int> mActiveReflectionSources{0};
 
     /// Join the background reflection thread if it's running.
     /// Must be called before any source mutation (add/remove/commit)
@@ -887,12 +1126,27 @@ private:
     void destroyReflectionPipeline();
     void createVoiceSource(ActiveVoice &voice);
     void removeVoiceSource(ActiveVoice &voice);
+
+    /// Reflection-source demote fallback (stage 2.2):
+    /// Every voice is created with a reflectionSource in createVoiceSource
+    /// so the baseline path is "voice has reverb" (baked by default,
+    /// upgraded to realtime when it enters top-N via inputs.baked = false).
+    /// This helper releases the reflection source for a voice that has
+    /// stayed outside the top-N reflection candidate pool for
+    /// `mReflectionDemoteHysteresisCfg` consecutive frames — a sparing
+    /// fallback that trims `mSourceData[0]` iteration cost when convolution
+    /// or sim budget is genuinely under pressure. Once demoted the voice
+    /// plays dry for the remainder of its life. PlayerEmitted and Ambient
+    /// voices are excluded; the caller in loopStep filters them out.
+    /// Release uses `mPendingSourceRemovals` when the sim thread is busy.
+    void demoteFromRealtimeReflection(ActiveVoice &voice);
     void initVoiceDSP(ActiveVoice &voice);
     int selectSample(const std::string &schemaName, int sampleCount, int totalFreq,
                      const int *frequencies);
     SoundHandle startVoice(const std::string &schemaName, const std::string &sampleName,
                            const Vector3 &position, int priority, bool looping,
-                           int objID, float volume = 1.0f);
+                           int objID, float volume = 1.0f,
+                           VoiceClass cls = VoiceClass::Normal);
     bool evictLowestPriority(int newPriority);
 };
 

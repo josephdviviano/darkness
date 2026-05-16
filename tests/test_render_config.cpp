@@ -1,6 +1,7 @@
 // Unit tests for RenderConfig (YAML + CLI configuration).
 // The CLI surface is intentionally minimal; almost all tunables live in YAML.
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 
 #include <cstdio>
 #include <filesystem>
@@ -329,5 +330,136 @@ TEST_CASE("water YAML clamping", "[config][clamp]") {
         Darkness::RenderConfig cfg;
         Darkness::loadConfigFromYAML(tmp.path.string(), cfg);
         CHECK(cfg.waterScrollSpeed == 1.0f);
+    }
+}
+
+TEST_CASE("audio source-cap split: direct + reflection YAML keys", "[config][yaml][audio]") {
+    SECTION("defaults: direct=256, reflection=32") {
+        Darkness::RenderConfig cfg;
+        CHECK(cfg.directMaxSources     == 256);
+        CHECK(cfg.reflectionMaxSources == 32);
+    }
+    SECTION("explicit split keys override independently") {
+        TmpFile tmp(R"(
+audio:
+  performance:
+    direct_max_sources: 128
+    reflection_max_sources: 48
+)");
+        Darkness::RenderConfig cfg;
+        REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
+        CHECK(cfg.directMaxSources     == 128);
+        CHECK(cfg.reflectionMaxSources == 48);
+    }
+    SECTION("legacy sim_max_sources maps to reflection cap; direct keeps default") {
+        TmpFile tmp(R"(
+audio:
+  performance:
+    sim_max_sources: 16
+)");
+        Darkness::RenderConfig cfg;
+        REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
+        CHECK(cfg.reflectionMaxSources == 16);
+        CHECK(cfg.directMaxSources     == 256);  // default unchanged
+    }
+    SECTION("split keys override legacy alias when both present") {
+        TmpFile tmp(R"(
+audio:
+  performance:
+    sim_max_sources: 8
+    reflection_max_sources: 64
+)");
+        Darkness::RenderConfig cfg;
+        REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
+        CHECK(cfg.reflectionMaxSources == 64);
+    }
+    SECTION("clamping: direct 0 → 4, direct 9999 → 1024") {
+        TmpFile lo("audio:\n  performance:\n    direct_max_sources: 0\n");
+        Darkness::RenderConfig cfg1;
+        Darkness::loadConfigFromYAML(lo.path.string(), cfg1);
+        CHECK(cfg1.directMaxSources == 4);
+
+        TmpFile hi("audio:\n  performance:\n    direct_max_sources: 9999\n");
+        Darkness::RenderConfig cfg2;
+        Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
+        CHECK(cfg2.directMaxSources == 1024);
+    }
+    SECTION("clamping: reflection 0 → 4, reflection 9999 → 256") {
+        TmpFile lo("audio:\n  performance:\n    reflection_max_sources: 0\n");
+        Darkness::RenderConfig cfg1;
+        Darkness::loadConfigFromYAML(lo.path.string(), cfg1);
+        CHECK(cfg1.reflectionMaxSources == 4);
+
+        TmpFile hi("audio:\n  performance:\n    reflection_max_sources: 9999\n");
+        Darkness::RenderConfig cfg2;
+        Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
+        CHECK(cfg2.reflectionMaxSources == 256);
+    }
+}
+
+// Stage 2.2 — demote-only reflection-source fallback: covers the
+// `reflection_demote_hysteresis_frames` YAML key. Every voice starts
+// with a reflection source; this knob controls how long a Normal voice
+// must sit outside the top-N reflection-candidate pool before its source
+// is released and the voice goes dry. Default is intentionally high
+// (~10 s at 60 fps) so the fallback is sparing — it only fires when
+// convolution/sim budget is under real pressure.
+TEST_CASE("audio reflection demote hysteresis YAML key", "[config][yaml][audio]") {
+    SECTION("default is 600 frames (~10s at 60 fps)") {
+        Darkness::RenderConfig cfg;
+        CHECK(cfg.reflectionDemoteHysteresisFrames == 600);
+    }
+    SECTION("explicit value overrides default") {
+        TmpFile tmp(R"(
+audio:
+  performance:
+    reflection_demote_hysteresis_frames: 90
+)");
+        Darkness::RenderConfig cfg;
+        REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
+        CHECK(cfg.reflectionDemoteHysteresisFrames == 90);
+    }
+    SECTION("clamping: 0 → 1, 99999 → 3600") {
+        TmpFile lo("audio:\n  performance:\n    reflection_demote_hysteresis_frames: 0\n");
+        Darkness::RenderConfig cfg1;
+        Darkness::loadConfigFromYAML(lo.path.string(), cfg1);
+        CHECK(cfg1.reflectionDemoteHysteresisFrames == 1);
+
+        TmpFile hi("audio:\n  performance:\n    reflection_demote_hysteresis_frames: 99999\n");
+        Darkness::RenderConfig cfg2;
+        Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
+        CHECK(cfg2.reflectionDemoteHysteresisFrames == 3600);
+    }
+}
+
+// Q3 — per-voice spatialBlend override for AMB_ENVIRONMENTAL ambients.
+// Makes room ambients (wind, church reverberance) feel less point-source-like
+// while leaving object-attached ambients (no AMB_ENVIRONMENTAL flag)
+// directional. 1.0 = full HRTF; 0.0 = mono passthrough.
+TEST_CASE("audio environmental ambient spatial blend YAML key", "[config][yaml][audio]") {
+    SECTION("default is 0.3 (mostly diffuse with subtle directional hint)") {
+        Darkness::RenderConfig cfg;
+        CHECK(cfg.ambEnvironmentalSpatialBlend == Catch::Approx(0.3f));
+    }
+    SECTION("explicit value overrides default") {
+        TmpFile tmp(R"(
+audio:
+  ambient:
+    environmental_spatial_blend: 0.6
+)");
+        Darkness::RenderConfig cfg;
+        REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
+        CHECK(cfg.ambEnvironmentalSpatialBlend == Catch::Approx(0.6f));
+    }
+    SECTION("clamping: -1.0 → 0.0, 2.0 → 1.0") {
+        TmpFile lo("audio:\n  ambient:\n    environmental_spatial_blend: -1.0\n");
+        Darkness::RenderConfig cfg1;
+        Darkness::loadConfigFromYAML(lo.path.string(), cfg1);
+        CHECK(cfg1.ambEnvironmentalSpatialBlend == Catch::Approx(0.0f));
+
+        TmpFile hi("audio:\n  ambient:\n    environmental_spatial_blend: 2.0\n");
+        Darkness::RenderConfig cfg2;
+        Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
+        CHECK(cfg2.ambEnvironmentalSpatialBlend == Catch::Approx(1.0f));
     }
 }

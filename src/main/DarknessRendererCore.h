@@ -906,10 +906,14 @@ buildCellToRoomMap(const Darkness::WRParsedData &wr,
         const auto &cell = wr.cells[ci];
         Darkness::Vector3 center(cell.center.x, cell.center.y, cell.center.z);
 
-        // Try center point first
+        // Try center point first. Using the raw OBB test (obbContains) is
+        // intentional here: this is a one-shot startup mapping with a
+        // portal-propagation fallback (below), so picking the first room
+        // whose OBB contains the cell center is good enough — the
+        // propagation pass smooths out any overlap-induced misassignments.
         for (const auto &room : rooms) {
             if (!room) continue;
-            if (room->isInside(center)) {
+            if (room->obbContains(center)) {
                 cellToRoom[ci] = room->getRoomID();
                 break;
             }
@@ -924,7 +928,7 @@ buildCellToRoomMap(const Darkness::WRParsedData &wr,
                 Darkness::Vector3 pt(v.x, v.y, v.z);
                 for (const auto &room : rooms) {
                     if (!room) continue;
-                    if (room->isInside(pt)) {
+                    if (room->obbContains(pt)) {
                         cellToRoom[ci] = room->getRoomID();
                         break;
                     }

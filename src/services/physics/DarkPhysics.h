@@ -42,10 +42,12 @@
 #ifndef __DARKPHYSICS_H
 #define __DARKPHYSICS_H
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include <ode/ode.h>
 
@@ -192,6 +194,7 @@ public:
                 //    by P$PhysAttr.rot_axes; it never locked rotation outright.
                 dWorldQuickStep(mODEWorld, kODEFixedDt);
                 dJointGroupEmpty(mODEContacts);
+                applyObjectFriction(kODEFixedDt);
                 mODEAccum -= kODEFixedDt;
                 ++steps;
                 ++mODEFrameCount;  // ODE substep counter (used by drop-soften window)
@@ -537,10 +540,22 @@ private:
         dWorldSetQuickStepNumIterations(mODEWorld, 20);    // solver iterations
 
         // Auto-sleep for stable resting contacts (critical for stacked crates).
-        // Higher thresholds than typical ODE defaults so objects settle quickly.
+        // Threshold sits at the ODE default; the per-substep object-friction
+        // pass (applyObjectFriction) snaps near-rest velocities to zero via
+        // the Coulomb reversal check, so bodies fall under this threshold
+        // cleanly and trip auto-disable within the consecutive-step window.
         dWorldSetAutoDisableFlag(mODEWorld, 1);
         dWorldSetAutoDisableLinearThreshold(mODEWorld, 0.05);
-        dWorldSetAutoDisableAngularThreshold(mODEWorld, 0.05);
+        // Angular threshold loosened from the ODE default (0.05) to 0.15 rad/s
+        // (~8.6°/s). The Coulomb friction pass sleeps linear motion exactly via
+        // its reversal check, but angular motion in mid-stack bodies bleeds in
+        // from neighbours' contact joints and persistently oscillates around
+        // the linear threshold, preventing auto-disable from accumulating its
+        // 5-substep window. At 0.15 rad/s the pre-sleep motion is ≤0.4° per
+        // substep — visually settled. The 0.08 angular damping continues to
+        // bring large rotations down toward this gate; this widens the gate
+        // enough to let stack noise pass through it.
+        dWorldSetAutoDisableAngularThreshold(mODEWorld, 0.15);
         dWorldSetAutoDisableSteps(mODEWorld, 5);
         dWorldSetAutoDisableTime(mODEWorld, 0.5);  // sleep after 0.5s of low activity
 
@@ -614,10 +629,17 @@ private:
     static constexpr intptr_t PLAYER_GEOM_TAG = -999;
 
     /// Per-geom data stored via dGeomSetData for nearCallback material lookup.
+    /// `friction` feeds ODE's per-contact `mu` (kinetic-friction coefficient);
+    /// `frictionScale` feeds the Coulomb-style object-friction pass and matches
+    /// the Dark Engine's per-object `friction_scale` (default 1.0). They are
+    /// kept separate because ODE's mu and the original engine's friction_scale
+    /// model different things — mu caps tangential force at the contact level,
+    /// while friction_scale multiplies the per-body decel formula.
     struct ODEGeomData {
         int32_t objID;
         float friction;
         float elasticity;
+        float frictionScale = 1.0f;  // Dark Engine default
     };
 
     /// ODE near callback — called for each potentially colliding geom pair.
@@ -769,6 +791,23 @@ private:
             dJointID joint = dJointCreateContact(
                 self->mODEWorld, self->mODEContacts, &contacts[i]);
             dJointAttach(joint, b1, b2);
+
+            // Dark Engine convention: per-contact friction accumulator.
+            // For gravity = (0,0,-1), friction_pct per contact = -min(0, n·g)
+            // = max(0, n.z) when the normal points from the other geom into
+            // the body. ODE's contact normal points from o2 toward o1, so
+            // body-on-o1 reads +n.z and body-on-o2 reads -n.z. Each body
+            // accumulates against its own contact set, scaled by its per-
+            // object friction_scale (Dark Engine default 1.0; not ODE's mu).
+            const float nz = static_cast<float>(contacts[i].geom.normal[2]);
+            if (b1 && valid1) {
+                float pct = std::max(0.0f, nz) * d1->frictionScale;
+                if (pct > 0.0f) self->mFrictionPct[d1->objID] += pct;
+            }
+            if (b2 && valid2) {
+                float pct = std::max(0.0f, -nz) * d2->frictionScale;
+                if (pct > 0.0f) self->mFrictionPct[d2->objID] += pct;
+            }
         }
     }
 
@@ -886,6 +925,26 @@ private:
             Vector3 position(static_cast<float>(pos[0]),
                              static_cast<float>(pos[1]),
                              static_cast<float>(pos[2]));
+
+            // odeToGlmMatrix anchors the matrix at the body's ODE
+            // position, which is the OBB *center*. The renderer draws
+            // the .bin mesh from its authored origin, and
+            // updateBodyTransform recomputes worldPos as
+            // modelMatrix * bboxCenter — both expect a mesh-anchored
+            // matrix. Subtract the rotated+scaled bboxCenter so the
+            // translation column equals the mesh's authored origin.
+            const ObjectCollisionBody *cb =
+                mObjectCollision->findBodyByObjID(objID);
+            if (cb) {
+                const glm::vec3 rsc =
+                    glm::mat3(modelMatrix) * cb->bboxCenter;
+                modelMatrix[3][0] -= rsc.x;
+                modelMatrix[3][1] -= rsc.y;
+                modelMatrix[3][2] -= rsc.z;
+                position.x -= rsc.x;
+                position.y -= rsc.y;
+                position.z -= rsc.z;
+            }
 
             // Sync collision geometry (AABB, rotation, cell registration)
             mObjectCollision->updateBodyTransform(objID, modelMatrix);
@@ -1173,6 +1232,60 @@ public:
         }
     }
 
+    /// Per-substep object friction pass — Dark Engine convention for
+    /// non-velocity-controlled bodies (crates, barrels, bodies). Coulomb-
+    /// style linear friction force opposes velocity, with a reversal check
+    /// that snaps to rest when the integration step would overshoot zero.
+    /// That reversal check is the static-friction sticky bit: when |v| drops
+    /// below a_mag·dt the next decel exceeds the remaining velocity, the
+    /// dot product flips sign, and the body is zeroed exactly. ODE's
+    /// auto-disable then sleeps the body within a few substeps.
+    ///
+    /// friction_pct is summed during the near callback (one term per contact
+    /// = max(0, n.z) · friction_scale). Bodies with friction_pct ≤ 0 are
+    /// airborne and skipped — gravity acts unimpeded in flight, friction
+    /// only kicks in once a contact gives a normal-force foothold. The
+    /// accumulator is cleared at the end of the pass for the next substep.
+    ///
+    /// Angular motion is intentionally NOT modulated here. The original
+    /// engine had a per-contact angular friction term, but porting it
+    /// naively to ODE's per-substep contact regeneration produces visible
+    /// snap-to-zero flicker on bodies that contact intermittently. The
+    /// global angular damping (dWorldSetAngularDamping = 0.08) and the
+    /// loosened angular auto-disable threshold (0.15 rad/s) handle settling.
+    inline void applyObjectFriction(float dt) {
+        constexpr float kFrictionFactor  = 0.03f;  // global Dark Engine constant
+        constexpr float kZFrictionMul    = 1.4f;   // extra Z-axis friction
+        constexpr float kFrictionEpsilon = 1e-4f;  // already at rest
+        for (auto &kv : mODEBodies) {
+            dBodyID body = kv.second;
+            if (!dBodyIsEnabled(body)) continue;
+
+            auto fIt = mFrictionPct.find(kv.first);
+            if (fIt == mFrictionPct.end() || fIt->second <= 0.0f) continue;
+            const float frictionPct = fIt->second;
+
+            const dReal *lv = dBodyGetLinearVel(body);
+            Vector3 vPre(static_cast<float>(lv[0]),
+                         static_cast<float>(lv[1]),
+                         static_cast<float>(lv[2]));
+            const float speed = glm::length(vPre);
+            if (speed < kFrictionEpsilon) continue;
+
+            const float aMag = kFrictionFactor * frictionPct * GRAVITY;
+            Vector3 decel = -(vPre / speed) * aMag;
+            decel.z *= kZFrictionMul;
+            Vector3 vNew = vPre + decel * dt;
+
+            // Coulomb static-friction reversal check.
+            if (glm::dot(vNew, vPre) < 0.0f)
+                vNew = Vector3(0.0f);
+
+            dBodySetLinearVel(body, vNew.x, vNew.y, vNew.z);
+        }
+        mFrictionPct.clear();
+    }
+
     /// Check if an object has a dynamic ODE body (for player push logic).
     bool hasDynamicBody(int32_t objID) const {
         return mODEBodies.find(objID) != mODEBodies.end();
@@ -1193,6 +1306,118 @@ public:
         if (it == mODEBodies.end()) return;
         dBodyEnable(it->second);
         dBodyAddForce(it->second, force.x, force.y, force.z);
+    }
+
+    /// One-shot pass: drop every dynamic body straight down so it rests
+    /// on the surface beneath it (world trimesh, static OBB, or another
+    /// already-snapped dynamic body). Pure Z translation — authored
+    /// rotation is preserved, so nothing tumbles or bounces. Bodies are
+    /// processed in ascending Z so a stacked tower snaps from the
+    /// bottom up: each upper body sees the lower bodies in their final
+    /// poses. Bodies that aren't floating (already in contact or
+    /// penetrating) are left where they are.
+    void snapDynamicBodiesToRest() {
+        if (mODEBodies.empty()) return;
+
+        struct Entry { int32_t objID; dBodyID body; dGeomID geom; float z; };
+        std::vector<Entry> entries;
+        entries.reserve(mODEBodies.size());
+        for (auto &kv : mODEBodies) {
+            auto gIt = mODEGeoms.find(kv.first);
+            if (gIt == mODEGeoms.end()) continue;
+            const dReal *p = dBodyGetPosition(kv.second);
+            entries.push_back({ kv.first, kv.second, gIt->second,
+                                static_cast<float>(p[2]) });
+        }
+        std::sort(entries.begin(), entries.end(),
+            [](const Entry &a, const Entry &b) { return a.z < b.z; });
+
+        struct ProbeCtx {
+            dGeomID self;
+            dReal   bestSurfZ;
+            bool    anyHit;
+        };
+        auto probeCb = [](void *data, dGeomID o1, dGeomID o2) {
+            auto *c = static_cast<ProbeCtx *>(data);
+            // Skip the body's own geom — the ray starts inside it and
+            // must not register the body it's testing.
+            if (o1 == c->self || o2 == c->self) return;
+            if (dGeomIsSpace(o1) || dGeomIsSpace(o2)) return;
+            dContactGeom hit;
+            int n = dCollide(o1, o2, 1, &hit, sizeof(dContactGeom));
+            if (n > 0 && hit.pos[2] > c->bestSurfZ) {
+                c->bestSurfZ = hit.pos[2];
+                c->anyHit = true;
+            }
+        };
+
+        // Ray length is generous so we always find the surface beneath;
+        // the snap *distance* is capped separately at kMaxSnapDist so a
+        // body floating more than a unit above its support stays put
+        // (likely a level-data error or the ray escaped through a hole
+        // to the floor below — better to leave it visibly floating
+        // than to teleport it through a real floor).
+        constexpr dReal kRayLength   = 1024.0;
+        constexpr dReal kMaxSnapDist = 2.0;
+        int snapped = 0, noHit = 0, alreadySeated = 0, tooFar = 0;
+        for (const auto &e : entries) {
+            dReal aabb[6];
+            dGeomGetAABB(e.geom, aabb);
+            const dReal aabbMinZ = aabb[4];
+
+            const dReal *bp = dBodyGetPosition(e.body);
+            dGeomID ray = dCreateRay(0, kRayLength);
+            dGeomRaySet(ray, bp[0], bp[1], bp[2], 0.0, 0.0, -1.0);
+
+            ProbeCtx ctx{ e.geom, -1.0e30, false };
+            dSpaceCollide2(ray, reinterpret_cast<dGeomID>(mODESpace),
+                           &ctx, probeCb);
+            dGeomDestroy(ray);
+
+            if (!ctx.anyHit) {
+                std::fprintf(stderr,
+                    "[snap-diag] obj=%d pos=(%.2f,%.2f,%.2f) "
+                    "aabbMinZ=%.2f NO HIT\n",
+                    e.objID, (float)bp[0], (float)bp[1], (float)bp[2],
+                    (float)aabbMinZ);
+                ++noHit;
+                continue;
+            }
+
+            const dReal dZ = ctx.bestSurfZ - aabbMinZ;
+            if (dZ >= -1.0e-4) {
+                std::fprintf(stderr,
+                    "[snap-diag] obj=%d pos=(%.2f,%.2f,%.2f) "
+                    "aabbMinZ=%.2f surfZ=%.2f dZ=%.2f SEATED\n",
+                    e.objID, (float)bp[0], (float)bp[1], (float)bp[2],
+                    (float)aabbMinZ, (float)ctx.bestSurfZ, (float)dZ);
+                ++alreadySeated;
+                continue;
+            }
+            if (dZ < -kMaxSnapDist) {
+                std::fprintf(stderr,
+                    "[snap-diag] obj=%d pos=(%.2f,%.2f,%.2f) "
+                    "aabbMinZ=%.2f surfZ=%.2f dZ=%.2f TOO FAR\n",
+                    e.objID, (float)bp[0], (float)bp[1], (float)bp[2],
+                    (float)aabbMinZ, (float)ctx.bestSurfZ, (float)dZ);
+                ++tooFar;
+                continue;
+            }
+
+            const dReal newZ = bp[2] + dZ;
+            dBodySetPosition(e.body, bp[0], bp[1], newZ);
+            // Wake only bodies we actually snapped — they may have a
+            // residual sub-unit gap from the AABB+single-ray
+            // approximation that ODE can close in a few steps. Bodies
+            // we left alone (NO HIT, SEATED, TOO FAR) stay asleep so
+            // they don't free-fall or oscillate.
+            dBodyEnable(e.body);
+            ++snapped;
+        }
+        std::fprintf(stderr,
+                     "[ODE] snap-to-rest: %d/%zu snapped, %d no-hit, "
+                     "%d already seated, %d too-far\n",
+                     snapped, entries.size(), noHit, alreadySeated, tooFar);
     }
 
     // ── Held-object primitives (used by GrabSystem) ──
@@ -1232,6 +1457,11 @@ public:
         // collision paths; both must ignore the held object to prevent the
         // player's head/body spheres from being pushed by their own carry.
         if (mObjectCollision) mObjectCollision->setSkipPlayerCollision(objID, true);
+
+        // If the player was standing on this body, drop them off so they
+        // start falling now instead of hovering through the ground-grace
+        // window until the next contact pass notices the disappearance.
+        mPlayer.dropGroundContactOn(objID);
         return true;
     }
 
@@ -1275,7 +1505,27 @@ public:
             // odeToGlmMatrix takes ODE pos/R + scale; reuse it for parity.
             const dReal posR[3] = {pos.x, pos.y, pos.z};
             Matrix4 modelMatrix = odeToGlmMatrix(posR, R, scale);
-            applyModelMatrix(*mObjectStates, objID, modelMatrix, pos, scale);
+
+            // odeToGlmMatrix is OBB-center-anchored; convert to a
+            // mesh-anchored matrix so the rendered mesh's authored
+            // origin lands at `pos` minus the rotated+scaled
+            // bboxCenter — matching syncDynamicBodies and avoiding a
+            // visible jump at grab/release.
+            Vector3 meshPos = pos;
+            const ObjectCollisionBody *cb =
+                mObjectCollision ? mObjectCollision->findBodyByObjID(objID)
+                                 : nullptr;
+            if (cb) {
+                const glm::vec3 rsc =
+                    glm::mat3(modelMatrix) * cb->bboxCenter;
+                modelMatrix[3][0] -= rsc.x;
+                modelMatrix[3][1] -= rsc.y;
+                modelMatrix[3][2] -= rsc.z;
+                meshPos.x -= rsc.x;
+                meshPos.y -= rsc.y;
+                meshPos.z -= rsc.z;
+            }
+            applyModelMatrix(*mObjectStates, objID, modelMatrix, meshPos, scale);
         }
     }
 
@@ -1491,6 +1741,10 @@ private:
     std::unordered_map<int32_t, dGeomID>  mODEGeoms;   // objID → geom (static or dynamic)
     std::unordered_map<int32_t, dBodyID>  mODEBodies;  // objID → dynamic body
     std::unordered_map<int32_t, Vector3>  mODEScales;  // objID → object scale for matrix
+    // Per-substep friction accumulator. Written by odeNearCallback for each
+    // contact involving a dynamic body (objID → Σ max(0, ±n.z) · friction_scale),
+    // consumed and cleared by applyObjectFriction after dWorldQuickStep.
+    std::unordered_map<int32_t, float>    mFrictionPct;
     // Frame index (in ODE substep counter, mODEFrameCount) at which an object
     // was last dropped. Contacts involving these bodies are softened for
     // kDropSoftenFrames substeps after the drop to avoid a sharp impact

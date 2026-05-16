@@ -59,6 +59,11 @@ enum SchemaFlags : uint32_t {
     SCH_NO_COMBAT      = 1 << 7,   // Don't play during combat
     SCH_NET_AMBIENT    = 1 << 8,   // Broadcast ambient over network
     SCH_LOC_SPATIAL    = 1 << 9,   // Local-only spatial sound
+    SCH_SHARP_FALLOFF  = 1 << 12,  // Steeper (4th-power) distance attenuation curve.
+                                   // Matches original engine's SFXFLG_SHARP — sounds
+                                   // tagged with this stay near full volume for most
+                                   // of their radius and drop quickly near the edge,
+                                   // versus the default linear-in-centibels falloff.
 };
 
 /// Tracks which SchemaPlayParams fields were explicitly set by the parser,
@@ -75,13 +80,45 @@ enum SchemaFieldSet : uint32_t {
 
 /// Playback parameters (maps to sSchemaPlayParams, 20 bytes on disk)
 struct SchemaPlayParams {
-    uint32_t flags = 0;           // SchemaFlags bitfield
+    // Default flags = SCH_SHARP_FALLOFF only.
+    //
+    // Why: the original Dark Engine stores schema play params in
+    // P$SchPlayPa, whose dtype defaults the `flags` field to 0x7F00.
+    // 0x7F00 sets bits 8–14, including bit 12 (SFXFLG_SHARP). So a
+    // schema with no explicit P$SchPlayPa record — or with no `flags`
+    // directive in its .sch source — gets SHARP falloff by default.
+    //
+    // We only model the SHARP bit here (bits 8/9/10/11/13/14 are not
+    // currently consulted by our audio path; setting them defensively
+    // would silently change other behavior). Leaving them off matches
+    // the bits the original engine's runtime actually inspects.
+    //
+    // Effect on the volume curve: SHARP is the (d/r)^4 curve, which
+    // stays near full volume across most of the radius and drops
+    // quickly near the edge (-3 dB at 0.5r, -50 dB at radius). The
+    // default we used to have here (flags=0) selected the linear curve
+    // (-25 dB at 0.5r) — far more aggressive in the mid-range than the
+    // original engine.
+    uint32_t flags = SCH_SHARP_FALLOFF;
     int volume = -1;              // Nominal volume (-10000 to -1)
     int pan = 0;                  // Pan position or range
     int initialDelay = 0;         // Delay before start (ms)
     int fade = 0;                 // Fade in/out duration (ms)
     SchemaAudioClass audioClass = SchemaAudioClass::Noise;
     int priority = 128;           // 0-255, default 128
+    /// Per-schema attenuation-factor divisor for the volume formula.
+    /// Loaded from the schema archetype's P$SchAttFac property at
+    /// startup. Default 1.0 (no effect). Values > 1.0 make the schema
+    /// fall off less aggressively (e.g. m06bell has 20.0, so the bell
+    /// is audible across essentially its entire radius).
+    ///
+    /// volume_centibels = gain - falloffPct * (5000 + gain) / attenuationFactor
+    ///
+    /// Note: in the original engine this is per-PLAY-INSTANCE (passed
+    /// into cPropSndInst::Init). We treat it as per-schema since that's
+    /// how it's authored — every play of a given schema uses the same
+    /// factor.
+    float attenuationFactor = 1.0f;
     uint32_t fieldsSet = 0;       // SchemaFieldSet bitmask — tracks explicit parser assignments
 };
 

@@ -360,6 +360,35 @@ struct RuntimeState {
     bgfx::VertexBufferHandle acousticVBH = BGFX_INVALID_HANDLE;
     bgfx::IndexBufferHandle  acousticIBH = BGFX_INVALID_HANDLE;
     uint32_t acousticLineCount = 0;
+
+    // Debug: acoustic probe overlay — scatter a colored cube at every baked
+    // probe position (queried from AudioService) and flash a marker at the
+    // listener while any player-emitted voice (footstep / land) is sounding.
+    // Single toggle: the marker only makes sense alongside the probe grid,
+    // since the whole point is correlating listener-to-probe distance with
+    // perceived footstep loudness.
+    bool  showProbes        = false;
+    float probeMarkerSize   = 1.0f;   // half-extent of the cube in feet
+
+    // Debug: room/portal wireframe overlay. Per-room edges are computed at
+    // startup from the room's 6 bounding planes and the portal-edge planes
+    // (see RoomDebugViz.h). Colors are deterministic per-room-ID so adjacent
+    // rooms read as visually distinct.
+    bool showRooms = false;
+    bgfx::VertexBufferHandle roomVBH = BGFX_INVALID_HANDLE;
+    uint32_t roomLineCount = 0;
+    // One entry per labelled point per room. We push the room's center
+    // (used to flag the listener's current room with a "*" suffix) plus
+    // every polytope corner (so wherever you look at a wireframe, a
+    // nearby label tells you which room ID that wireframe belongs to —
+    // essential for manually auditing overlapping subdivisions of a
+    // single visual room).
+    struct RoomLabel {
+        Vector3 pos;
+        int16_t roomID;
+        bool    isCenter;   // true → primary label, eligible for "*" current marker
+    };
+    std::vector<RoomLabel> roomLabels;
 };
 
 // ── FrameContext — Per-frame computed values ──
