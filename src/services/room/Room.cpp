@@ -47,10 +47,24 @@ void Room::read(const FilePtr &sf) {
 
     for (size_t i = 0; i < 6; ++i) {
         *sf >> mPlanes[i];
-        // Dark Engine stores plane distance as dot(normal, point) >= d (positive),
-        // but our Plane::getDistance computes dot(normal, point) + d.
-        // Negate d to convert: dot(n, p) + (-d) >= 0 ↔ dot(n, p) >= d
-        mPlanes[i].d = -mPlanes[i].d;
+        // ROOM_DB stores room bounding planes with OUTWARD-facing normals
+        // and the equation `dot(normal, point) + d = 0` (same equation
+        // form as our Plane struct). To convert to an equivalent inward-
+        // facing representation — which lets every getDistance/getSide
+        // caller follow the natural "positive side = inside" convention,
+        // and avoids per-call-site polarity bugs — negate both the
+        // normal and `d`. Negating both preserves the plane's
+        // location: dot(-n, p) + (-d) = -(dot(n, p) + d), so the zero
+        // set is identical; only the labeling of "in front of" vs
+        // "behind" flips.
+        //
+        // Earlier versions of this code negated only `d`, which moved
+        // every plane to its antipodal position across the origin —
+        // visible in the show_rooms wireframe overlay as room boxes
+        // floating in the positive-Z "sky" for levels whose play space
+        // lives at negative Z.
+        mPlanes[i].normal = -mPlanes[i].normal;
+        mPlanes[i].d      = -mPlanes[i].d;
     }
 
     *sf >> mPortalCount;
@@ -92,15 +106,26 @@ void Room::read(const FilePtr &sf) {
 }
 
 //------------------------------------------------------
+void Room::linkPortals() {
+    for (size_t i = 0; i < mPortalCount; ++i) {
+        if (mPortals[i])
+            mPortals[i]->linkRooms();
+    }
+}
+
+//------------------------------------------------------
 void Room::write(const FilePtr &sf) {
     *sf << mObjectID << mRoomID << mCenter;
 
     for (size_t i = 0; i < 6; ++i) {
-        // NOTE: mPlanes[i].d was negated on load (see read()) to convert from
-        // Dark Engine convention (dot(n,p) >= d = inside, outward-facing normals)
-        // to our convention (dot(n,p) + d >= 0 = inside). If we ever re-save
-        // ROOM_DB, we must negate d again here to restore the on-disk convention.
-        *sf << mPlanes[i];
+        // Disk has outward-facing normals; we store them inward (negate
+        // both normal and d on load) so all callers can use a consistent
+        // positive-side = inside convention. Round-trip by reversing
+        // the load-time transformation. See read() for details.
+        Plane onDisk;
+        onDisk.normal = -mPlanes[i].normal;
+        onDisk.d      = -mPlanes[i].d;
+        *sf << onDisk;
     }
 
     // write the portals
@@ -134,7 +159,7 @@ void Room::write(const FilePtr &sf) {
 }
 
 //------------------------------------------------------
-bool Room::isInside(const Vector3 &point) {
+bool Room::obbContains(const Vector3 &point) {
     // iterate over all the planes. Have to have positive side
     for (size_t i = 0; i < 6; ++i) {
         if (mPlanes[i].getSide(point) == Plane::NEGATIVE_SIDE)
@@ -148,6 +173,8 @@ bool Room::isInside(const Vector3 &point) {
 RoomPortal *Room::getPortalForPoint(const Vector3 &pos) {
     for (size_t i = 0; i < mPortalCount; ++i) {
         RoomPortal *rp = mPortals[i].get();
+        // RoomPortal::isInside is a portal-disk test, unrelated to the
+        // Room OBB test renamed to obbContains.
         if (rp->isInside(pos))
             return rp;
     }

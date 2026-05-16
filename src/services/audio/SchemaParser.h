@@ -60,6 +60,12 @@ public:
     /// Find a schema by name (case-insensitive)
     const SchemaEntry *findSchema(const std::string &name) const;
 
+    /// Mutable schema lookup. Used by code that loads per-schema property
+    /// overrides from the game database (P$SchAttFac, P$SchPlayPa, etc.)
+    /// after the .sch files are parsed. Same case-insensitive lookup as
+    /// findSchema. Returns null if the name is unknown.
+    SchemaEntry *findSchemaMutable(const std::string &name);
+
     /// Find all schemas whose env_tags match the given query tags.
     /// A schema matches if ALL of its env_tags are satisfied by the query.
     std::vector<const SchemaEntry *>

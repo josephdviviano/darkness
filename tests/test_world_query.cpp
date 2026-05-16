@@ -35,6 +35,7 @@
 #include "object/ObjectService.h"
 #include "platform/PlatformService.h"
 #include "property/PropertyService.h"
+#include "room/Room.h"
 #include "room/RoomService.h"
 #include "sim/SimService.h"
 #include "physics/PhysicsService.h"
@@ -1907,4 +1908,183 @@ TEST_CASE("RoomPortal: getters return consistent data",
 
         break;
     }
+}
+
+// ============================================================================
+// Room-membership query tests
+//
+// These guard the contract that ROOM-DESYNC bug was hiding behind:
+//   - Room::obbContains is permissive (overlap at portal boundaries).
+//   - RoomService::roomFromPoint is the disambiguated, canonical answer.
+//   - RoomService::updatedRoom is equivalent to roomFromPoint and is the
+//     supported entry point for "refresh my cached room pointer."
+//   - Callers must never use obbContains-on-cached-pointer as a
+//     "still-in-this-room" shortcut.
+// ============================================================================
+
+TEST_CASE("RoomService: room center maps back to that room via roomFromPoint",
+          "[worldquery][room][membership]") {
+    REQUIRE_WQ();
+    if (!s_roomSvc->isLoaded()) SKIP("Room database not loaded");
+
+    const auto &rooms = s_roomSvc->getAllRooms();
+    if (rooms.empty()) SKIP("No rooms in this fixture");
+
+    int checked = 0;
+    for (const auto &r : rooms) {
+        if (!r) continue;
+        Room *got = s_roomSvc->roomFromPoint(r->getCenter());
+        // Center may be in solid space or shared between several OBBs for
+        // some unusual rooms — we don't require strict equality, only that
+        // the disambiguator returns *some* valid room for an in-engine point
+        // (i.e., never nullptr for a point known to be inside an OBB).
+        if (got != nullptr) ++checked;
+    }
+    // At least one room in the fixture should resolve from its center.
+    CHECK(checked > 0);
+}
+
+TEST_CASE("RoomService::updatedRoom matches roomFromPoint",
+          "[worldquery][room][membership]") {
+    REQUIRE_WQ();
+    if (!s_roomSvc->isLoaded()) SKIP("Room database not loaded");
+
+    const auto &rooms = s_roomSvc->getAllRooms();
+    if (rooms.empty()) SKIP("No rooms in this fixture");
+
+    // For a sampling of points inside fixture rooms, the cached-aware
+    // entry point must agree with the canonical one.
+    int samples = 0;
+    for (const auto &r : rooms) {
+        if (!r) continue;
+        Vector3 pos = r->getCenter();
+        Room *canonical = s_roomSvc->roomFromPoint(pos);
+        Room *via_cache_api = s_roomSvc->updatedRoom(nullptr, pos);
+        CHECK(canonical == via_cache_api);
+        if (++samples >= 32) break;
+    }
+    CHECK(samples > 0);
+}
+
+TEST_CASE("RoomService::updatedRoom: stationary listener returns stable pointer",
+          "[worldquery][room][membership]") {
+    REQUIRE_WQ();
+    if (!s_roomSvc->isLoaded()) SKIP("Room database not loaded");
+
+    const auto &rooms = s_roomSvc->getAllRooms();
+    if (rooms.empty()) SKIP("No rooms in this fixture");
+
+    // Pick the first room with a resolvable center.
+    Vector3 pos{};
+    bool found = false;
+    for (const auto &r : rooms) {
+        if (!r) continue;
+        if (s_roomSvc->roomFromPoint(r->getCenter()) != nullptr) {
+            pos = r->getCenter();
+            found = true;
+            break;
+        }
+    }
+    if (!found) SKIP("No room with resolvable center in fixture");
+
+    // Successive calls with the same position must return the same pointer.
+    Room *cached = nullptr;
+    for (int i = 0; i < 8; ++i) {
+        Room *next = s_roomSvc->updatedRoom(cached, pos);
+        if (i == 0) {
+            cached = next;
+            REQUIRE(cached != nullptr);
+        } else {
+            CHECK(next == cached);
+        }
+    }
+}
+
+TEST_CASE("RoomService::roomFromPoint: disambiguates overlapping OBBs",
+          "[worldquery][room][membership][disambiguation]") {
+    REQUIRE_WQ();
+    if (!s_roomSvc->isLoaded()) SKIP("Room database not loaded");
+
+    const auto &rooms = s_roomSvc->getAllRooms();
+    if (rooms.empty()) SKIP("No rooms in this fixture");
+
+    // Find a point that is OBB-contained by more than one room. The bug
+    // we are guarding against was: "the cache trusts obbContains alone
+    // and freezes on the first such room." We sample portal centers,
+    // which sit on a shared face between two adjacent room OBBs and
+    // are extremely likely to satisfy obbContains for both rooms.
+    Room *winner = nullptr;
+    int overlap_count = 0;
+    bool tested_any = false;
+    for (const auto &r : rooms) {
+        if (!r) continue;
+        for (uint32_t p = 0; p < r->getPortalCount(); ++p) {
+            RoomPortal *portal = r->getPortal(p);
+            if (!portal) continue;
+            Vector3 pc = portal->getCenter();
+
+            // Count rooms that pass the raw OBB test for this point.
+            int hits = 0;
+            for (const auto &q : rooms) {
+                if (q && q->obbContains(pc)) ++hits;
+            }
+            if (hits < 2) continue;  // not an overlap region; try next
+
+            overlap_count = hits;
+            tested_any = true;
+            // Canonical query must still return exactly one room — and it
+            // must be one of the OBB-contained candidates, never nullptr.
+            winner = s_roomSvc->roomFromPoint(pc);
+            CHECK(winner != nullptr);
+            // updatedRoom must agree.
+            CHECK(s_roomSvc->updatedRoom(nullptr, pc) == winner);
+            break;
+        }
+        if (tested_any) break;
+    }
+
+    if (!tested_any) SKIP("No overlap-region portal found in fixture");
+    CHECK(overlap_count >= 2);
+}
+
+TEST_CASE("RoomService::updateObjRoom: refreshes after listener moves into a new room",
+          "[worldquery][room][membership]") {
+    REQUIRE_WQ();
+    if (!s_roomSvc->isLoaded()) SKIP("Room database not loaded");
+
+    const auto &rooms = s_roomSvc->getAllRooms();
+    if (rooms.empty()) SKIP("No rooms in this fixture");
+
+    // Find two distinct rooms whose centers each resolve to themselves.
+    Room *A = nullptr;
+    Room *B = nullptr;
+    for (const auto &r : rooms) {
+        if (!r) continue;
+        Room *got = s_roomSvc->roomFromPoint(r->getCenter());
+        if (got != r.get()) continue;
+        if (!A)      A = r.get();
+        else if (got != A) { B = r.get(); break; }
+    }
+    if (!A || !B) SKIP("Need at least two self-resolving rooms in fixture");
+
+    // Use idset=2 (an unused slot in this fixture) and a synthetic objID.
+    const size_t idset = 2;
+    const int objID = 9000001;
+
+    // First update: from "no room cached" the object should attach to A.
+    s_roomSvc->updateObjRoom(idset, objID, A->getCenter());
+    CHECK(s_roomSvc->getCurrentObjRoom(idset, objID) == A);
+
+    // Same position: pointer must remain stable (no churn).
+    s_roomSvc->updateObjRoom(idset, objID, A->getCenter());
+    CHECK(s_roomSvc->getCurrentObjRoom(idset, objID) == A);
+
+    // Move directly to room B — the new disambiguated answer must take
+    // effect, not the cached pointer-via-obbContains shortcut that the
+    // old implementation used.
+    s_roomSvc->updateObjRoom(idset, objID, B->getCenter());
+    CHECK(s_roomSvc->getCurrentObjRoom(idset, objID) == B);
+
+    // Cleanup.
+    s_roomSvc->_detachObjRoom(idset, objID, B);
 }

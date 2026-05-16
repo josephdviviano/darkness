@@ -42,8 +42,17 @@ public:
     RoomPortal(RoomService *owner);
     ~RoomPortal();
 
-    /// reads the room portal from the specified file
+    /// reads the room portal from the specified file. Stores the
+    /// source/destination room IDs but does NOT resolve them to Room
+    /// pointers — those rooms may not be loaded yet at this point. Call
+    /// linkRooms() once every room has been read.
     void read(const FilePtr &sf);
+
+    /// Resolve mSrcRoom and mDestRoom from the IDs captured during read().
+    /// Must be called after every Room has been registered in
+    /// RoomService::mRoomsByID. Logs a [FALLBACK] and leaves the pointer
+    /// null if either ID does not resolve — that portal is then unusable.
+    void linkRooms();
 
     /// writes the room portal into the specified file
     void write(const FilePtr &sf);
@@ -116,11 +125,19 @@ private:
     uint32_t mEdgeCount;
     /// Plane list - planes that make up the portal
     std::vector<Plane> mEdges;
-    // Source and destination rooms
+    // Source and destination rooms. Pointers stay null until linkRooms()
+    // runs in a second pass — the on-disk IDs are captured by read() into
+    // the mSrc/mDestRoomID fields below, and only resolved once every Room
+    // has been registered in RoomService::mRoomsByID. Reading rooms
+    // sequentially and resolving inline produced null pointers for any
+    // forward reference, breaking the room-portal graph.
     /// room number this portal goes to
     Room *mDestRoom;
     /// the source room number
     Room *mSrcRoom;
+    /// Captured on-disk room IDs, resolved to mSrc/mDestRoom by linkRooms()
+    int32_t mSrcRoomID = -1;
+    int32_t mDestRoomID = -1;
     /// center point of the portal. (should not be in solid space)
     Vector3 mCenter;
     /// portal ID on the other side of this portal

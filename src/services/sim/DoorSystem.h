@@ -44,6 +44,7 @@
 
 #include "DarknessMath.h"
 #include "SimCommon.h"
+#include "audio/AudioLog.h"
 #include "object/ObjectService.h"
 #include "property/DarkPropertyDefs.h"
 #include "property/PropertyService.h"
@@ -179,6 +180,7 @@ public:
         if (it == mDoors.end()) return false;
 
         DoorState &door = it->second;
+        DoorStatus prevStatus = door.status;
         switch (action) {
         case kDoorDoOpen:
             startOpening(door);
@@ -193,6 +195,9 @@ public:
                 startOpening(door);
             break;
         }
+        AUDIO_LOG("[DOOR_ACT] obj=%d action=%d status:%d->%d rooms(%d,%d) sndBlock=%.2f\n",
+                  objID, (int)action, (int)prevStatus, (int)door.status,
+                  door.room1, door.room2, door.soundBlocking);
         return true;
     }
 
@@ -429,11 +434,17 @@ private:
         door.axis = prop.axis;
         door.status = static_cast<DoorStatus>(prop.status);
         door.hardLimits = (prop.hardLimits != 0);
-        // blockSound is a 0-100 percentage (Dark Engine default: 60).
-        // Halved because Steam Audio's geometry-based occlusion provides
-        // additional attenuation through door frame walls — without the
-        // reduction, sounds behind closed doors are over-attenuated.
-        door.soundBlocking = prop.blockSound / 200.0f;
+        // blockSound is a 0-100 percentage matching the Dark Engine
+        // convention (default: 60 = 0.6 transmission loss). An earlier
+        // version of this code halved the value (divided by 200) "to
+        // compensate for Steam Audio's geometry-based occlusion through
+        // door frame walls" — but doors are not in the Steam Audio
+        // acoustic scene (only WR cell geometry is), so there was no
+        // compensating attenuation, and doors blocked ~30% instead of
+        // ~60%. Long portal-graph paths with several closed doors then
+        // transmitted too much sound (e.g., church ambient audible from
+        // spawn rooms away).
+        door.soundBlocking = prop.blockSound / 100.0f;
         door.visionBlocking = (prop.blockVision != 0);
         door.pushMass = prop.pushMass;
         door.room1 = prop.room1;
@@ -456,8 +467,8 @@ private:
         door.axis = prop.axis;
         door.status = static_cast<DoorStatus>(prop.status);
         door.hardLimits = (prop.hardLimits != 0);
-        // Halved — same reasoning as RotDoor (Steam Audio additive occlusion)
-        door.soundBlocking = prop.blockSound / 200.0f;
+        // See RotDoor initializer above for the divisor rationale.
+        door.soundBlocking = prop.blockSound / 100.0f;
         door.visionBlocking = (prop.blockVision != 0);
         door.pushMass = prop.pushMass;
         door.room1 = prop.room1;

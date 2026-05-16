@@ -7,7 +7,13 @@ add_executable(darkness_tests
     test_render_config.cpp
     test_typed_properties.cpp
     test_world_query.cpp
+    test_ai_hearing_data.cpp
+    test_env_sound_database.cpp
     test_schema_parser.cpp
+    test_schema_property_overrides.cpp
+    test_schema_samples_chunk.cpp
+    test_speech_database.cpp
+    test_spot_ambient_envelope.cpp
     test_acoustic_materials.cpp
     test_worker_thread_pool.cpp
     test_object_state.cpp

@@ -32,6 +32,7 @@
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
+#include <limits>
 #include <sstream>
 #include <unistd.h> // dup2, fileno
 #include <sys/stat.h> // stat, S_ISDIR
@@ -56,6 +57,7 @@
 #include "RenderConfig.h"
 #include "RayCaster.h"
 #include "DebugConsole.h"
+#include "RoomDebugViz.h"
 
 // Logging (must be initialized before ServiceManager)
 #include "logger.h"
@@ -75,6 +77,8 @@
 #include "platform/PlatformService.h"
 #include "property/PropertyService.h"
 #include "room/RoomService.h"
+#include "room/Room.h"
+#include "room/RoomPortal.h"
 #include "sim/SimService.h"
 #include "physics/PhysicsService.h"
 #include "audio/AudioLog.h"
@@ -587,6 +591,130 @@ static void renderWater(
     }
 }
 
+// Render the room-ID overlay (HUD line + per-corner labels). Called
+// from the main render loop AFTER the frob-hint section so the labels
+// survive the dbgTextClear at the top of that section. Wireframe edges
+// for show_rooms are drawn separately inside renderDebugOverlay — only
+// the text portion lives here.
+static void renderRoomLabelsOverlay(
+    const Darkness::FrameContext &fc,
+    const Darkness::RuntimeState &state)
+{
+    if (!state.showRooms) return;
+
+    Darkness::RoomServicePtr roomSvc = GET_SERVICE(Darkness::RoomService);
+    Darkness::Room *currentRoom = nullptr;
+    // Collect every room whose raw OBB contains the camera position, plus
+    // the closest room by center distance. The "current cam room" is the
+    // canonical (disambiguator-resolved) answer; the OBB list reveals
+    // whether the cam sits inside multiple overlapping OBBs (expected at
+    // portal boundaries) or no OBB at all (a gap, in which case the
+    // closest-room readout tells you which side you're nearer to).
+    Vector3 camPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+    constexpr int kMaxObbHits = 8;
+    int16_t obbHits[kMaxObbHits];
+    int     numObbHits = 0;
+    int16_t closestRoomID = -1;
+    float   closestDist   = std::numeric_limits<float>::infinity();
+    if (roomSvc && roomSvc->isLoaded()) {
+        currentRoom = roomSvc->roomFromPoint(camPos);
+        for (const auto &rp : roomSvc->getAllRooms()) {
+            if (!rp) continue;
+            if (rp->obbContains(camPos) && numObbHits < kMaxObbHits) {
+                obbHits[numObbHits++] = rp->getRoomID();
+            }
+            float d = glm::length(rp->getCenter() - camPos);
+            if (d < closestDist) {
+                closestDist = d;
+                closestRoomID = rp->getRoomID();
+            }
+        }
+    }
+    int16_t currentRoomID = currentRoom ? currentRoom->getRoomID() : -1;
+
+    // HUD line at top-left. Three shapes:
+    //   "current cam room: 217"                        — sole OBB match
+    //   "current cam room: 217 (OBBs: 217, 219)"       — disambiguator picked
+    //                                                    one of multiple overlapping OBBs
+    //   "current cam room: Null (217 closest, d=0.6)"  — no OBB contains
+    //                                                    camPos
+    char detailBuf[160];
+    if (numObbHits == 0) {
+        if (closestRoomID >= 0) {
+            std::snprintf(detailBuf, sizeof(detailBuf),
+                "Null (%d closest, d=%.1f)", closestRoomID, closestDist);
+        } else {
+            std::snprintf(detailBuf, sizeof(detailBuf), "Null (no rooms loaded)");
+        }
+    } else if (numObbHits == 1) {
+        std::snprintf(detailBuf, sizeof(detailBuf), "%d", currentRoomID);
+    } else {
+        // List every OBB hit, marking the disambiguator's pick with '*'.
+        char list[128];
+        size_t off = 0;
+        for (int i = 0; i < numObbHits; ++i) {
+            int written = std::snprintf(list + off, sizeof(list) - off,
+                "%s%d%s",
+                (i == 0 ? "" : ", "),
+                obbHits[i],
+                (obbHits[i] == currentRoomID ? "*" : ""));
+            if (written < 0 || static_cast<size_t>(written) >= sizeof(list) - off) break;
+            off += static_cast<size_t>(written);
+        }
+        std::snprintf(detailBuf, sizeof(detailBuf),
+            "%d (OBBs: %s)", currentRoomID, list);
+    }
+    bgfx::dbgTextPrintf(2, 1, 0x0F,
+        "ROOM DEBUG — (`%s) current cam room: %s",
+        "show_rooms", detailBuf);
+
+    // Project each room label into screen space and place at the
+    // appropriate dbgText character cell.
+    const bgfx::Stats *stats = bgfx::getStats();
+    if (!stats || stats->width <= 0 || stats->height <= 0) return;
+    float fbWidth  = static_cast<float>(stats->width);
+    float fbHeight = static_cast<float>(stats->height);
+    constexpr float cellW = 8.0f;
+    constexpr float cellH = 16.0f;
+
+    float vp[16];
+    bx::mtxMul(vp, fc.view, fc.proj);
+
+    for (const auto &lbl : state.roomLabels) {
+        float p[4] = { lbl.pos.x, lbl.pos.y, lbl.pos.z, 1.0f };
+        float c[4];
+        bx::vec4MulMtx(c, p, vp);
+        if (c[3] <= 0.001f) continue;  // behind camera
+        float ndcX = c[0] / c[3];
+        float ndcY = c[1] / c[3];
+        if (ndcX < -1.0f || ndcX > 1.0f) continue;
+        if (ndcY < -1.0f || ndcY > 1.0f) continue;
+
+        float sx = (ndcX * 0.5f + 0.5f) * fbWidth;
+        float sy = (1.0f - (ndcY * 0.5f + 0.5f)) * fbHeight;
+        int col = static_cast<int>(sx / cellW);
+        int row = static_cast<int>(sy / cellH);
+        if (col < 0 || row < 0) continue;
+
+        bool isCurrent = (lbl.roomID == currentRoomID);
+        // Attribute byte: high nibble = bg, low nibble = fg.
+        //   Current room (center): bright yellow on black with "*"
+        //   Other rooms (center):  bright cyan on black
+        //   Corner labels:         dim cyan on black (less visual noise —
+        //     8 corners per room — but legible from a few feet away).
+        uint8_t attr;
+        if (isCurrent && lbl.isCenter) {
+            attr = 0x0E;
+        } else if (lbl.isCenter) {
+            attr = 0x0B;
+        } else {
+            attr = 0x03;
+        }
+        bgfx::dbgTextPrintf(col, row, attr, "%d%s",
+            lbl.roomID, (isCurrent && lbl.isCenter) ? "*" : "");
+    }
+}
+
 // Render debug raycast visualization + HUD text into View 2.
 // Casts a ray from camera forward, draws cross at hit point, normal line,
 // and HUD text overlay with hit details.
@@ -596,10 +724,25 @@ static void renderDebugOverlay(
     const Darkness::MissionData &mission,
     const Darkness::RuntimeState &state)
 {
-    if (!state.showRaycast && !state.showAcousticMesh) return;
+    // Skip view-state setup if nothing in this overlay is enabled. The probe
+    // overlay covers both the grid and the listener-flash marker; we only
+    // pay the AudioService GET_SERVICE call when it's on.
+    if (!state.showRaycast && !state.showAcousticMesh
+        && !state.showProbes && !state.showRooms) {
+        return;
+    }
 
     // Set up view 2 with same transform as view 1
     bgfx::setViewTransform(2, fc.view, fc.proj);
+
+    // Enable bgfx debug-text mode once for the whole function, so any
+    // sub-overlay (raycast HUD, room ID labels, future debug text) can
+    // dbgTextPrintf into the framebuffer. Previously this was buried
+    // inside the `if (state.showRaycast)` branch, which meant any other
+    // overlay that wanted text was invisible unless show_raycast was
+    // also on.
+    bgfx::setDebug(BGFX_DEBUG_TEXT);
+    bgfx::dbgTextClear();
 
     // ── Raycast debug lines ──
     if (state.showRaycast) {
@@ -695,30 +838,11 @@ static void renderDebugOverlay(
         bgfx::setUniform(gpu.u_objectLight, whiteLight);
         bgfx::submit(2, gpu.flatProgram);
     }
-    // Acoustic mesh wireframe overlay
-    if (state.showAcousticMesh && bgfx::isValid(state.acousticVBH)) {
-        float identity[16];
-        bx::mtxIdentity(identity);
-        bgfx::setTransform(identity);
-        bgfx::setVertexBuffer(0, state.acousticVBH, 0, state.acousticLineCount);
-        uint64_t wireState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                           | BGFX_STATE_PT_LINES
-                           | BGFX_STATE_BLEND_ALPHA
-                           | BGFX_STATE_DEPTH_TEST_LESS;
-        bgfx::setState(wireState);
-        float noFog[4] = {0, 0, 0, 0};
-        bgfx::setUniform(gpu.u_fogColor, noFog);
-        bgfx::setUniform(gpu.u_fogParams, noFog);
-        float opaqueParams[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-        float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
-        bgfx::setUniform(gpu.u_objectParams, opaqueParams);
-        bgfx::setUniform(gpu.u_objectLight, whiteLight);
-        bgfx::submit(2, gpu.flatProgram);
-    }
-
-    // HUD text overlay showing raycast results
-    bgfx::setDebug(BGFX_DEBUG_TEXT);
-    bgfx::dbgTextClear();
+    // (Debug-text mode and dbgTextClear were already set up at the top
+    // of renderDebugOverlay so every show_* overlay can dbgTextPrintf,
+    // not only show_raycast. Acoustic-mesh and room-wireframe overlays
+    // are submitted OUTSIDE this if-block so they aren't gated on
+    // show_raycast — see after `} // end showRaycast` below.)
 
     // Screen-center crosshair (160 cols x 45 rows at 1280x720)
     uint8_t cross_attr = 0x0E; // yellow on black
@@ -754,6 +878,185 @@ static void renderDebugOverlay(
     bgfx::dbgTextPrintf(2, 10, hud_attr, "Camera:  (%.2f, %.2f, %.2f)  cell=%d",
         state.cam.pos[0], state.cam.pos[1], state.cam.pos[2], camCellIdx);
     } // end showRaycast
+
+    // ── Acoustic mesh wireframe overlay ──
+    // Cyan line wireframe of the Steam Audio acoustic scene mesh, gated
+    // on `show_acoustic_mesh`. Submitted to view 2 with the same
+    // identity transform / line topology setup as the room wireframe.
+    if (state.showAcousticMesh && bgfx::isValid(state.acousticVBH)) {
+        float identity[16];
+        bx::mtxIdentity(identity);
+        bgfx::setTransform(identity);
+        bgfx::setVertexBuffer(0, state.acousticVBH, 0, state.acousticLineCount);
+        uint64_t wireState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                           | BGFX_STATE_PT_LINES
+                           | BGFX_STATE_BLEND_ALPHA
+                           | BGFX_STATE_DEPTH_TEST_LESS;
+        bgfx::setState(wireState);
+        float noFog[4] = {0, 0, 0, 0};
+        bgfx::setUniform(gpu.u_fogColor, noFog);
+        bgfx::setUniform(gpu.u_fogParams, noFog);
+        float opaqueParams[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
+        bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+        bgfx::setUniform(gpu.u_objectLight, whiteLight);
+        bgfx::submit(2, gpu.flatProgram);
+    }
+
+    // ── Room/portal wireframe overlay ──
+    // Identity transform, line topology, alpha-blended, depth-test
+    // ALWAYS so wireframes draw on top of world geometry (LESS would
+    // hide them behind walls when the OBBs are correctly positioned
+    // *inside* the architecture). Gated on `show_rooms` only — used
+    // to be inside the `if (state.showRaycast)` scope by accident,
+    // which is why the wireframes only appeared when both flags were
+    // on.
+    if (state.showRooms && bgfx::isValid(state.roomVBH)) {
+        float identity[16];
+        bx::mtxIdentity(identity);
+        bgfx::setTransform(identity);
+        bgfx::setVertexBuffer(0, state.roomVBH, 0, state.roomLineCount);
+        uint64_t wireState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                           | BGFX_STATE_PT_LINES
+                           | BGFX_STATE_BLEND_ALPHA
+                           | BGFX_STATE_DEPTH_TEST_ALWAYS;
+        bgfx::setState(wireState);
+        float noFog[4] = {0, 0, 0, 0};
+        bgfx::setUniform(gpu.u_fogColor, noFog);
+        bgfx::setUniform(gpu.u_fogParams, noFog);
+        float opaqueParams[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
+        bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+        bgfx::setUniform(gpu.u_objectLight, whiteLight);
+        bgfx::submit(2, gpu.flatProgram);
+    }
+
+    // ── Room ID labels (screen-space text via bgfx::dbgTextPrintf) ──
+    //
+    // For each room center, project to clip space using the current view +
+    // projection matrices. If the result lands inside the viewport and in
+    // front of the camera, convert to the debug-text character grid and
+    // print the room ID. The character grid is ~160×45 at 1280×720, so the
+    // labels are coarse but immediately readable.
+    //
+    // (The room-ID label overlay used to live here, but the main render
+    // loop calls `bgfx::dbgTextClear()` again after renderDebugOverlay
+    // returns — to set up a clean text buffer for the frob hint and
+    // console — which wiped everything we wrote. The label rendering
+    // has been moved into the main loop after that final clear; see
+    // the call to `renderRoomLabelsOverlay` there. Wireframe drawing
+    // for show_rooms still happens above in this function, since lines
+    // are written into the 3D view buffer and aren't affected by
+    // dbgTextClear.)
+
+    // ── Probe + listener-marker overlay ──
+    // Independent of show_raycast. One bgfx draw per probe (using the fallback
+    // cube). With typical bake densities (≤2000 probes) the per-frame submit
+    // budget is well within bgfx's headroom; if it ever becomes a bottleneck
+    // the fix is instanced draws — but until then, the per-probe submit keeps
+    // the code simple and lets us tint each cube individually.
+    if (state.showProbes
+        && bgfx::isValid(gpu.fallbackCubeVBH)
+        && bgfx::isValid(gpu.fallbackCubeIBH))
+    {
+        auto audioSvc = GET_SERVICE(Darkness::AudioService);
+
+        // Probe scatter: cyan cubes at every probe position, with the probe
+        // nearest the listener highlighted in orange. Depth disabled so the
+        // grid is visible through walls.
+        if (audioSvc) {
+            const auto &probes = audioSvc->getProbePositions();
+            Darkness::Vector3 listenerPos = audioSvc->getListenerPos();
+            int   nearestIdx  = -1;
+            float nearestDist = 1e9f;
+            for (size_t i = 0; i < probes.size(); ++i) {
+                float d = glm::length(probes[i] - listenerPos);
+                if (d < nearestDist) { nearestDist = d; nearestIdx = static_cast<int>(i); }
+            }
+
+            uint64_t probeState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                                | BGFX_STATE_CULL_CW;
+            float opaque[4]    = {1.0f, 0.0f, 0.0f, 0.0f};
+            float cyanTint[4]  = {0.0f, 0.8f, 1.0f, 0.0f};
+            float nearTint[4]  = {1.0f, 0.3f, 0.0f, 0.0f};
+            for (size_t i = 0; i < probes.size(); ++i) {
+                const auto &p = probes[i];
+                float mtx[16];
+                bx::mtxSRT(mtx,
+                    state.probeMarkerSize, state.probeMarkerSize, state.probeMarkerSize,
+                    0.0f, 0.0f, 0.0f,
+                    p.x, p.y, p.z);
+                bgfx::setTransform(mtx);
+                bgfx::setVertexBuffer(0, gpu.fallbackCubeVBH);
+                bgfx::setIndexBuffer(gpu.fallbackCubeIBH);
+                bgfx::setState(probeState);
+                float noFog[4] = {0, 0, 0, 0};
+                bgfx::setUniform(gpu.u_fogColor,  noFog);
+                bgfx::setUniform(gpu.u_fogParams, noFog);
+                bgfx::setUniform(gpu.u_objectParams, opaque);
+                bgfx::setUniform(gpu.u_objectLight,
+                    (static_cast<int>(i) == nearestIdx) ? nearTint : cyanTint);
+                bgfx::submit(2, gpu.flatProgram);
+            }
+        }
+
+        // Listener marker: a yellow cube at the listener while any
+        // player-emitted voice (footstep / land) is sounding. The marker
+        // visibly flashes on each step, pinned to where you're standing —
+        // so dips in audible reverb correlate directly with how close
+        // the flash is to the nearest (orange) probe.
+        bool markerVisibleThisFrame = false;
+        if (audioSvc && audioSvc->isPlayerEmittedVoiceActive())
+        {
+            Darkness::Vector3 lp = audioSvc->getListenerPos();
+            float sz = state.probeMarkerSize * 2.0f;  // slightly larger than probe markers
+            float mtx[16];
+            bx::mtxSRT(mtx, sz, sz, sz, 0.0f, 0.0f, 0.0f, lp.x, lp.y, lp.z);
+            bgfx::setTransform(mtx);
+            bgfx::setVertexBuffer(0, gpu.fallbackCubeVBH);
+            bgfx::setIndexBuffer(gpu.fallbackCubeIBH);
+            uint64_t markerState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                                 | BGFX_STATE_CULL_CW;
+            bgfx::setState(markerState);
+            float noFog[4]  = {0, 0, 0, 0};
+            float opaque[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+            float yellow[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+            bgfx::setUniform(gpu.u_fogColor,  noFog);
+            bgfx::setUniform(gpu.u_fogParams, noFog);
+            bgfx::setUniform(gpu.u_objectParams, opaque);
+            bgfx::setUniform(gpu.u_objectLight,  yellow);
+            bgfx::submit(2, gpu.flatProgram);
+            markerVisibleThisFrame = true;
+        }
+
+        // HUD readout. Lives here (not inside the showRaycast HUD block
+        // above, which incorrectly nests the acoustic-mesh and other
+        // overlays under show_raycast). Always tells you whether positions
+        // are loaded; otherwise it's too easy to think "the overlay is
+        // broken" when really the sidecar hasn't been written yet.
+        bgfx::setDebug(BGFX_DEBUG_TEXT);
+        int probeCount = audioSvc
+            ? static_cast<int>(audioSvc->getProbePositions().size())
+            : 0;
+        bool footActive = audioSvc && audioSvc->isPlayerEmittedVoiceActive();
+        const uint8_t labelAttr = 0x0F;  // white on black
+        const uint8_t valAttr   = 0x0A;  // green on black
+        const uint8_t warnAttr  = 0x0C;  // red on black
+        if (probeCount > 0) {
+            bgfx::dbgTextPrintf(2, 14, valAttr,
+                "Probes: %d  (size=%.1fft, orange = nearest to listener)",
+                probeCount, state.probeMarkerSize);
+        } else {
+            bgfx::dbgTextPrintf(2, 14, warnAttr,
+                "Probes: 0 positions loaded — run `bake_probes on` "
+                "in console to regenerate the sidecar");
+        }
+        bgfx::dbgTextPrintf(2, 15,
+            markerVisibleThisFrame ? valAttr : labelAttr,
+            "Listener marker: %s (playerEmittedActive=%s)",
+            markerVisibleThisFrame ? "VISIBLE this frame" : "hidden (no active player voice)",
+            footActive ? "yes" : "no");
+    }
 }
 
 // ── Object rendering ──
@@ -1114,6 +1417,103 @@ static void updateTitleBar(SDL_Window *window, const Darkness::RuntimeState &sta
 // ── Register debug console settings ──
 // Binds 15 runtime-changeable settings to the debug console (opened with backtick).
 // Lambdas capture state by reference and update the title bar when relevant settings change.
+// ── Progress-bar bake helper ──
+// Runs bakeProbes() on a background thread while pumping a bgfx debug-text
+// progress bar on the main thread (so the window stays responsive and the
+// user can see the bake actually running). Used by both the first-run
+// auto-bake and the console-triggered `bake_probes on` action; the SAME
+// helper for both paths avoids the foot-gun where one path freezes the
+// window. Returns true if the bake completed and probes were reloaded.
+static bool runBakeWithProgressBar(
+    SDL_Window *window,
+    Darkness::RuntimeState &state,
+    Darkness::AudioServicePtr audioSvc,
+    const std::string &bakePath)
+{
+    if (!audioSvc) return false;
+    (void)window;  // event-pumping uses SDL_PollEvent, not the window ptr
+
+    std::atomic<float> bakeProgress{0.0f};
+    std::atomic<bool>  bakeDone{false};
+    bool bakeSuccess = false;
+
+    std::thread bakeThread([&]() {
+        bakeSuccess = audioSvc->bakeProbes(bakePath, &bakeProgress);
+        bakeDone.store(true, std::memory_order_release);
+    });
+
+    // The bake runs 3 sequential stages, each reporting 0→1 progress.
+    // We detect stage transitions when progress drops and map to overall
+    // 0→100% with weighted allocation (stages 0+1 = 20%, stage 2 = 80%).
+    int   bakeStage = 0;
+    float lastProg  = 0.0f;
+    const char *stageNames[] = {
+        "Baking pathing visibility...",
+        "Computing shortest paths...",
+        "Baking reflection IRs (this takes a while)..."
+    };
+    const float stageStart[]  = {0.0f, 0.10f, 0.20f};
+    const float stageWeight[] = {0.10f, 0.10f, 0.80f};
+
+    while (!bakeDone.load(std::memory_order_acquire)) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                state.running = false;
+                break;
+            }
+        }
+        if (!state.running) break;
+
+        float rawProg = bakeProgress.load(std::memory_order_relaxed);
+        if (rawProg < lastProg - 0.1f && bakeStage < 2) bakeStage++;
+        lastProg = rawProg;
+
+        float prog = stageStart[bakeStage] + rawProg * stageWeight[bakeStage];
+        prog = std::min(prog, 1.0f);
+        int pct = static_cast<int>(prog * 100.0f);
+
+        // Render progress bar using bgfx debug text on view 0
+        bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+                           0x1a1a2eFF, 1.0f, 0);
+        bgfx::setViewRect(0, 0, 0, 1280, 720);
+        bgfx::touch(0);
+
+        bgfx::setDebug(BGFX_DEBUG_TEXT);
+        bgfx::dbgTextClear();
+
+        bgfx::dbgTextPrintf(2, 10, 0x0f, "DARKNESS ENGINE");
+        bgfx::dbgTextPrintf(2, 12, 0x07, "Baking acoustic probes (stage %d/3):",
+                            bakeStage + 1);
+        bgfx::dbgTextPrintf(2, 13, 0x07, "  %s", stageNames[bakeStage]);
+
+        int barWidth = 40;
+        int filled = static_cast<int>(prog * barWidth);
+        char bar[64] = {};
+        for (int i = 0; i < barWidth; ++i)
+            bar[i] = (i < filled) ? '#' : '-';
+        bar[barWidth] = '\0';
+
+        bgfx::dbgTextPrintf(2, 15, 0x0a, "[%s] %d%%", bar, pct);
+        bgfx::dbgTextPrintf(2, 17, 0x08, "Probe data will be cached in:");
+        bgfx::dbgTextPrintf(2, 18, 0x08, "  %s", bakePath.c_str());
+
+        bgfx::frame();
+        SDL_Delay(50);  // ~20fps progress display
+    }
+
+    bakeThread.join();
+    bgfx::setDebug(0);
+
+    if (bakeSuccess && state.running) {
+        audioSvc->loadProbes(bakePath);
+        std::fprintf(stderr, "Probe baking complete — %d probes loaded\n",
+                     audioSvc->getProbeCount());
+        return true;
+    }
+    return false;
+}
+
 static void registerConsoleSettings(
     Darkness::DebugConsole &dbgConsole,
     Darkness::RuntimeState &state,
@@ -1163,6 +1563,11 @@ static void registerConsoleSettings(
         [&state]() { return state.showAcousticMesh; },
         [&state](bool v) { state.showAcousticMesh = v; },
         "Cyan wireframe overlay of the acoustic scene geometry");
+
+    dbgConsole.addBool("show_rooms",
+        [&state]() { return state.showRooms; },
+        [&state](bool v) { state.showRooms = v; },
+        "Wireframe overlay of room OBBs and portal polygons, with room ID labels. Current room marked with '*'.");
 
     dbgConsole.addBool("debug_anim_lightmaps",
         [&state]() { return state.debugAnimLightmaps; },
@@ -1327,6 +1732,82 @@ static void registerConsoleSettings(
             if (svc) svc->setPortalRoutingEnabled(v);
         },
         "Route sound through doorways via portal graph (indirect paths)");
+
+    // One-shot diagnostic: print the closest door's state, properties, the
+    // audio-side blocking factor for its room pair, AND the portal topology
+    // of both rooms with each portal's current blocking factor. If room1 has
+    // an unblocked portal to room2 that bypasses this door, BFS will detour
+    // around the door and `totalBlocking` will collapse to 0.
+    dbgConsole.addBool("dump_nearest_door",
+        []() { return false; },  // action, not a state
+        [&state](bool v) {
+            if (!v || !state.doorSystem) return;
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            auto roomSvc = GET_SERVICE(Darkness::RoomService);
+            const Darkness::Vector3 camPos(
+                state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+            auto ids = state.doorSystem->getAllDoorIDs();
+            int32_t bestID = 0;
+            float   bestDist = std::numeric_limits<float>::infinity();
+            for (int32_t id : ids) {
+                const auto *d = state.doorSystem->getDoor(id);
+                if (!d) continue;
+                float dist = glm::length(d->basePosition - camPos);
+                if (dist < bestDist) { bestDist = dist; bestID = id; }
+            }
+            if (bestID == 0) {
+                std::fprintf(stderr, "[DOOR_DUMP] no doors in level\n");
+                return;
+            }
+            const auto *d = state.doorSystem->getDoor(bestID);
+            float openFrac = state.doorSystem->getOpenFraction(bestID);
+            float audioBlock = svc
+                ? svc->getBlockingFactor(d->room1, d->room2) : -1.0f;
+
+            Darkness::Room *listenerRoom = roomSvc
+                ? roomSvc->roomFromPoint(camPos) : nullptr;
+            int listenerRoomID = listenerRoom ? listenerRoom->getRoomID() : -1;
+
+            std::fprintf(stderr,
+                "[DOOR_DUMP] obj=%d distFromCam=%.1f listenerRoom=%d\n"
+                "  basePos=(%.1f,%.1f,%.1f) status=%d openFrac=%.2f\n"
+                "  rooms=(%d,%d) sndBlock=%.2f visBlock=%d isBrush=%d\n"
+                "  AudioService.getBlockingFactor(%d,%d) = %.3f\n",
+                bestID, bestDist, listenerRoomID,
+                d->basePosition.x, d->basePosition.y, d->basePosition.z,
+                (int)d->status, openFrac,
+                d->room1, d->room2, d->soundBlocking,
+                (int)d->visionBlocking, (int)d->isBrushDoor,
+                d->room1, d->room2, audioBlock);
+
+            // Dump the portal topology of room1 and room2 so we can see if
+            // there's an alternate (unblocked) edge between them that lets
+            // the BFS bypass this door.
+            if (roomSvc && svc) {
+                auto dumpRoomPortals = [&](int32_t roomID) {
+                    Darkness::Room *r = roomSvc->getRoomByID(roomID);
+                    if (!r) {
+                        std::fprintf(stderr, "  room %d: NOT FOUND in RoomService\n", roomID);
+                        return;
+                    }
+                    uint32_t pc = r->getPortalCount();
+                    std::fprintf(stderr, "  room %d has %u portals:\n", roomID, pc);
+                    for (uint32_t i = 0; i < pc; ++i) {
+                        Darkness::RoomPortal *p = r->getPortal(i);
+                        if (!p) continue;
+                        Darkness::Room *far = p->getFarRoom();
+                        int32_t farID = far ? far->getRoomID() : -1;
+                        float blk = svc->getBlockingFactor(roomID, farID);
+                        std::fprintf(stderr,
+                            "    [%u] -> room %d  blockingFactor=%.3f\n",
+                            i, farID, blk);
+                    }
+                };
+                dumpRoomPortals(d->room1);
+                dumpRoomPortals(d->room2);
+            }
+        },
+        "Print nearest door's state, blocking factor, and room portal topology");
 
     dbgConsole.addBool("probe_pathing",
         []() {
@@ -1531,20 +2012,21 @@ static void registerConsoleSettings(
         },
         "Floor on portal-routed path attenuation (higher = quieter through walls)");
 
-    // Bake probes: set to "on" to trigger re-baking
+    // Bake probes: set to "on" to trigger re-baking.
+    // The action runs on a background thread with a progress-bar overlay
+    // (same helper as the first-run auto-bake) so the window stays
+    // responsive instead of freezing for the duration of the bake.
     dbgConsole.addBool("bake_probes",
         []() { return false; },  // always shows "off" (it's an action, not a state)
-        [misPath](bool v) {
+        [misPath, &state, window](bool v) {
             if (!v) return;
             auto svc = GET_SERVICE(Darkness::AudioService);
             if (!svc) return;
             std::string probePath = Darkness::AudioService::getProbeFilePath(misPath);
             std::fprintf(stderr, "Re-baking probes → %s\n", probePath.c_str());
-            if (svc->bakeProbes(probePath)) {
-                svc->loadProbes(probePath);
-            }
+            runBakeWithProgressBar(window, state, svc, probePath);
         },
-        "Re-bake acoustic probes (blocking, ~10-60s). Auto-baked on first run.");
+        "Re-bake acoustic probes (~10-60s with progress bar). Auto-baked on first run.");
 
     dbgConsole.addFloat("probe_count", 0.0f, 99999.0f,
         []() {
@@ -1553,6 +2035,48 @@ static void registerConsoleSettings(
         },
         [](float) { /* read-only */ },
         "Number of loaded acoustic probes (read-only)");
+
+    // Bake-time grid parameters. Changes take effect on the next bake_probes
+    // trigger — existing probes are not relocated. To test whether residual
+    // footstep-reverb A/B variance is driven by probe sparsity, lower the
+    // spacing (e.g. 2.5 ft) and re-bake. Disk + bake time scale with 1/spacing².
+    dbgConsole.addFloat("probe_spacing_ft", 1.0f, 20.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getProbeSpacingFt() : 5.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setProbeSpacingFt(v);
+        },
+        "Probe grid spacing in feet (requires bake_probes to take effect)");
+
+    dbgConsole.addFloat("probe_height_ft", 0.5f, 20.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getProbeHeightFt() : 5.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setProbeHeightFt(v);
+        },
+        "Probe height above floor in feet (requires bake_probes)");
+
+    // ── Audio debug overlay ──
+    // Scatter cubes at every baked probe (cyan; orange = nearest to listener)
+    // and flash a yellow cube at the listener on each player-emitted voice
+    // (footstep / land). Single toggle: the listener flash only makes sense
+    // alongside the probe grid, since the whole point is correlating
+    // listener-to-probe distance with perceived footstep loudness.
+    dbgConsole.addBool("show_probes",
+        [&state]() { return state.showProbes; },
+        [&state](bool v) { state.showProbes = v; },
+        "Probe grid (cyan; orange=nearest) + yellow listener flash on each footstep");
+
+    dbgConsole.addFloat("probe_marker_size", 0.1f, 10.0f,
+        [&state]() { return state.probeMarkerSize; },
+        [&state](float v) { state.probeMarkerSize = std::max(0.1f, std::min(v, 10.0f)); },
+        "Size in feet of probe/listener debug cubes");
 
     dbgConsole.addBool("record_audio",
         []() {
@@ -2240,9 +2764,26 @@ int main(int argc, char *argv[]) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     dup2(fileno(stdout), fileno(stderr));
 
-    // Load YAML config (defaults to ./darknessRender.yaml if no --config flag)
+    // Load YAML config (defaults to ./darknessRender.yaml if no --config flag).
+    //
+    // The library returns false in two cases: (1) file doesn't exist —
+    // fine, run with defaults; (2) file exists but YAML parse / type
+    // conversion failed — abort, because everything past the bad line was
+    // silently skipped, leaving us running with a half-applied config.
+    // (1) and (2) are distinguished by whether the file is on disk.
     std::string configPath = cli.configPath.empty() ? "darknessRender.yaml" : cli.configPath;
-    Darkness::loadConfigFromYAML(configPath, cfg);
+    bool ok = Darkness::loadConfigFromYAML(configPath, cfg);
+    if (!ok) {
+        struct stat st{};
+        bool fileExists = (stat(configPath.c_str(), &st) == 0);
+        if (fileExists) {
+            std::fprintf(stderr,
+                "\nAborting: config file present but unreadable. "
+                "Fix the YAML error above (or pass a different --config path) "
+                "and re-run.\n");
+            return 1;
+        }
+    }
 
     // Re-apply CLI so flags always win over YAML values
     cli = Darkness::applyCliOverrides(argc, argv, cfg);
@@ -2603,7 +3144,9 @@ int main(int argc, char *argv[]) {
         audioSvc->setReflectionThrottle(cfg.reflectionThrottle);
         audioSvc->setSimMaxOcclusionSamples(cfg.simMaxOcclusionSamples);
         audioSvc->setSimMaxRays(cfg.simMaxRays);
-        audioSvc->setSimMaxSources(cfg.simMaxSources);
+        audioSvc->setDirectMaxSources(cfg.directMaxSources);
+        audioSvc->setReflectionMaxSources(cfg.reflectionMaxSources);
+        audioSvc->setReflectionDemoteHysteresisFrames(cfg.reflectionDemoteHysteresisFrames);
         audioSvc->setSceneType(cfg.sceneType);
 
         // -- audio.reflections --
@@ -2612,6 +3155,13 @@ int main(int argc, char *argv[]) {
         audioSvc->setReflectionNumBounces(cfg.reflectionNumBounces);
         audioSvc->setReflectionDuration(cfg.reflectionDuration);
         audioSvc->setAmbisonicsOrder(cfg.ambisonicsOrder);
+
+        // -- audio.probes --
+        // Bake-time grid parameters. Applied before the auto-bake on first
+        // run (so a denser YAML setting takes effect on the initial bake)
+        // and read by manual bake_probes triggers from the debug console.
+        audioSvc->setProbeSpacingFt(cfg.audioProbeSpacingFt);
+        audioSvc->setProbeHeightFt(cfg.audioProbeHeightFt);
 
         // -- audio.occlusion --
         audioSvc->setOcclusionRadius(cfg.occlusionRadius);
@@ -2640,6 +3190,7 @@ int main(int argc, char *argv[]) {
         audioSvc->setAmbHysteresisStopMul(cfg.ambHysteresisStopMul);
         audioSvc->setAmbFalloffCurve(cfg.ambFalloffCurve);
         audioSvc->setAmbDefaultPriority(cfg.ambDefaultPriority);
+        audioSvc->setAmbEnvironmentalSpatialBlend(cfg.ambEnvironmentalSpatialBlend);
 
         // -- audio.mixer --
         audioSvc->setMasterGain(cfg.mixerMasterGain);
@@ -3342,6 +3893,100 @@ int main(int argc, char *argv[]) {
         state.acousticIndices.shrink_to_fit();
     }
 
+    // ── Build room/portal wireframe overlay buffer ──
+    //
+    // For each Room we compute the corners of its bounding polytope (the
+    // half-space intersection of its 6 stored planes), the edges between
+    // those corners, and the polygon boundary of each of its portals.
+    // Everything is emitted into one PT_LINES vertex buffer with the room
+    // ID's hash as a per-vertex color, plus a labels list for the per-frame
+    // dbgTextPrintf overlay.
+    //
+    // Build is one-shot — the room database is static for the life of the
+    // mission. Toggle via the `show_rooms` debug-console boolean.
+    {
+        Darkness::RoomServicePtr roomSvc = GET_SERVICE(Darkness::RoomService);
+        if (roomSvc && roomSvc->isLoaded()) {
+            const auto &rooms = roomSvc->getAllRooms();
+            std::vector<Darkness::PosColorVertex> lineVerts;
+            // Reservation budget: 12 edges/room × 2 vertices, plus 4 edges/portal
+            // × 2 vertices, plus a generous overhead for non-axis-aligned rooms
+            // that produce more than 8 corners.
+            lineVerts.reserve(rooms.size() * 64);
+
+            for (const auto &rp : rooms) {
+                if (!rp) continue;
+                Darkness::Room *room = rp.get();
+                int16_t roomID = room->getRoomID();
+                uint32_t color = Darkness::colorFromRoomID(roomID);
+
+                // Room polytope edges.
+                const Plane *planes = room->getBoundingPlanes();
+                auto corners = Darkness::computeRoomCorners(planes);
+                auto edges = Darkness::computeRoomEdges(corners);
+                for (const auto &e : edges) {
+                    const auto &a = corners[e.a].pos;
+                    const auto &b = corners[e.b].pos;
+                    lineVerts.push_back({a.x, a.y, a.z, color});
+                    lineVerts.push_back({b.x, b.y, b.z, color});
+                }
+
+                // Portal polygons — drawn in the same per-room color so
+                // they read as "openings owned by this room." A portal
+                // appears once from each side of the wall (each room
+                // owns its own outgoing portal record), so this naturally
+                // renders the doorway in two overlaid colors.
+                uint32_t pc = room->getPortalCount();
+                for (uint32_t pi = 0; pi < pc; ++pi) {
+                    Darkness::RoomPortal *portal = room->getPortal(pi);
+                    if (!portal) continue;
+                    auto poly = Darkness::computePortalPolygon(*portal);
+                    if (poly.size() < 2) continue;
+                    // Closed line strip: emit consecutive pairs, including
+                    // the wrap-around segment from last to first vertex.
+                    for (size_t v = 0; v < poly.size(); ++v) {
+                        const auto &a = poly[v];
+                        const auto &b = poly[(v + 1) % poly.size()];
+                        lineVerts.push_back({a.x, a.y, a.z, color});
+                        lineVerts.push_back({b.x, b.y, b.z, color});
+                    }
+                }
+
+                // Record the room ID label at the center (used to mark
+                // the listener's current room with a "*") and at every
+                // polytope corner. Per-corner labels are essential when
+                // visually-overlapping subdivisions share a screen area:
+                // the center label may be hidden inside geometry or
+                // collide with another room's label, but corner labels
+                // appear at the actual wireframe vertices so each
+                // wireframe is reliably tagged.
+                state.roomLabels.push_back({room->getCenter(), roomID, true});
+                for (const auto &c : corners) {
+                    state.roomLabels.push_back({c.pos, roomID, false});
+                }
+            }
+
+            if (!lineVerts.empty()) {
+                state.roomLineCount = static_cast<uint32_t>(lineVerts.size());
+                const bgfx::Memory *mem = bgfx::copy(
+                    lineVerts.data(),
+                    static_cast<uint32_t>(lineVerts.size() *
+                                          sizeof(Darkness::PosColorVertex)));
+                state.roomVBH = bgfx::createVertexBuffer(
+                    mem, Darkness::PosColorVertex::layout);
+                std::fprintf(stderr,
+                    "Room debug overlay: %zu rooms, %u line verts, "
+                    "%zu labels (toggle with `show_rooms`)\n",
+                    rooms.size(), state.roomLineCount,
+                    state.roomLabels.size());
+            } else {
+                std::fprintf(stderr,
+                    "Room debug overlay: %zu rooms, no geometry produced "
+                    "(check polytope intersection)\n", rooms.size());
+            }
+        }
+    }
+
     // ── Initialize runtime state: mode string, model isolation, spawn/camera ──
     initRuntimeState(mission, meshes, gpu, camX, camY, camZ, state);
 
@@ -3369,98 +4014,7 @@ int main(int argc, char *argv[]) {
     // ── Auto-bake probes if needed (with progress bar) ──
     if (state.probeBakeNeeded) {
         Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
-        if (audioSvc) {
-            std::atomic<float> bakeProgress{0.0f};
-            std::atomic<bool> bakeDone{false};
-            bool bakeSuccess = false;
-
-            // Run baking on a background thread so we can render progress
-            std::thread bakeThread([&]() {
-                bakeSuccess = audioSvc->bakeProbes(state.probeBakePath,
-                                                    &bakeProgress);
-                bakeDone.store(true, std::memory_order_release);
-            });
-
-            // Render progress bar until baking completes.
-            // The bake runs 3 sequential stages, each reporting 0→1 progress:
-            //   Stage 0: Probe placement + pathing visibility (fast, ~10s)
-            //   Stage 1: Pathing shortest paths (fast, ~10s)
-            //   Stage 2: Reflection IR baking (slow, minutes)
-            // We detect stage transitions when progress drops and map to
-            // overall 0→100% with weighted allocation (stages 0+1 = 20%, stage 2 = 80%).
-            int bakeStage = 0;
-            float lastProg = 0.0f;
-            const char *stageNames[] = {
-                "Baking pathing visibility...",
-                "Computing shortest paths...",
-                "Baking reflection IRs (this takes a while)..."
-            };
-            // Weight allocation: pathing stages are fast, reflection is slow
-            const float stageStart[] = {0.0f, 0.10f, 0.20f};
-            const float stageWeight[] = {0.10f, 0.10f, 0.80f};
-
-            while (!bakeDone.load(std::memory_order_acquire)) {
-                SDL_Event ev;
-                while (SDL_PollEvent(&ev)) {
-                    if (ev.type == SDL_QUIT) {
-                        state.running = false;
-                        break;
-                    }
-                }
-                if (!state.running) break;
-
-                float rawProg = bakeProgress.load(std::memory_order_relaxed);
-                // Detect stage transition: progress drops back toward 0
-                if (rawProg < lastProg - 0.1f && bakeStage < 2) bakeStage++;
-                lastProg = rawProg;
-
-                // Map to overall progress with weighted stages
-                float prog = stageStart[bakeStage] + rawProg * stageWeight[bakeStage];
-                prog = std::min(prog, 1.0f);
-                int pct = static_cast<int>(prog * 100.0f);
-
-                // Render progress bar using bgfx debug text
-                bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
-                                   0x1a1a2eFF, 1.0f, 0);
-                bgfx::setViewRect(0, 0, 0, 1280, 720);
-                bgfx::touch(0);
-
-                bgfx::setDebug(BGFX_DEBUG_TEXT);
-                bgfx::dbgTextClear();
-
-                // Title + stage name
-                bgfx::dbgTextPrintf(2, 10, 0x0f, "DARKNESS ENGINE");
-                bgfx::dbgTextPrintf(2, 12, 0x07, "Baking acoustic probes (stage %d/3):",
-                                    bakeStage + 1);
-                bgfx::dbgTextPrintf(2, 13, 0x07, "  %s", stageNames[bakeStage]);
-
-                // Progress bar (40 chars wide)
-                int barWidth = 40;
-                int filled = static_cast<int>(prog * barWidth);
-                char bar[64] = {};
-                for (int i = 0; i < barWidth; ++i)
-                    bar[i] = (i < filled) ? '#' : '-';
-                bar[barWidth] = '\0';
-
-                bgfx::dbgTextPrintf(2, 15, 0x0a, "[%s] %d%%", bar, pct);
-                bgfx::dbgTextPrintf(2, 17, 0x08, "This only happens once per mission.");
-                bgfx::dbgTextPrintf(2, 18, 0x08, "Probe data will be cached in:");
-                bgfx::dbgTextPrintf(2, 19, 0x08, "  %s", state.probeBakePath.c_str());
-
-                bgfx::frame();
-                SDL_Delay(50);  // ~20fps for the progress display
-            }
-
-            bakeThread.join();
-
-            if (bakeSuccess && state.running) {
-                audioSvc->loadProbes(state.probeBakePath);
-                std::fprintf(stderr, "Probe baking complete — %d probes loaded\n",
-                             audioSvc->getProbeCount());
-            }
-
-            bgfx::setDebug(0);  // disable debug text
-        }
+        runBakeWithProgressBar(window, state, audioSvc, state.probeBakePath);
         state.probeBakeNeeded = false;
     }
 
@@ -3500,19 +4054,40 @@ int main(int argc, char *argv[]) {
             });
     }
 
-    // Apply initial blocking for all doors that start closed
+    // Apply initial blocking for all doors that start closed.
+    // Also log every door so we can see why some don't contribute to the
+    // blocking map (status != closed, soundBlocking == 0, or rooms invalid).
+    // This pass runs once at startup so unconditional fprintf is OK.
     {
         Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+        int applied = 0, rejected = 0;
         for (int32_t id : doorSystem.getAllDoorIDs()) {
             const auto *door = doorSystem.getDoor(id);
-            if (door && door->status == Darkness::kDoorClosed &&
-                door->soundBlocking > 0.0f &&
-                door->room1 >= 0 && door->room2 >= 0 &&
-                door->room1 != door->room2) {
+            if (!door) continue;
+            const bool statusOk    = (door->status == Darkness::kDoorClosed);
+            const bool blockOk     = (door->soundBlocking > 0.0f);
+            const bool roomsOk     = (door->room1 >= 0 && door->room2 >= 0 &&
+                                       door->room1 != door->room2);
+            if (statusOk && blockOk && roomsOk) {
                 audioSvc->setBlockingFactor(door->room1, door->room2,
                                              door->soundBlocking);
+                ++applied;
+            } else {
+                std::fprintf(stderr,
+                    "[DOOR_INIT_BLOCK] reject obj=%d status=%d sndBlock=%.2f "
+                    "rooms=(%d,%d) reason=%s%s%s\n",
+                    id, (int)door->status, door->soundBlocking,
+                    door->room1, door->room2,
+                    statusOk ? "" : "not-closed ",
+                    blockOk  ? "" : "zero-block ",
+                    roomsOk  ? "" : "bad-rooms");
+                ++rejected;
             }
         }
+        std::fprintf(stderr,
+            "[DOOR_INIT_BLOCK] %d/%zu doors contributed initial blocking "
+            "(%d rejected)\n",
+            applied, doorSystem.getAllDoorIDs().size(), rejected);
     }
 
     // Register DoorSystem as a SimListener so it receives simStep() calls.
@@ -3809,6 +4384,11 @@ int main(int argc, char *argv[]) {
                 if (col < 0) col = 0;
                 bgfx::dbgTextPrintf(col, 24, 0x0f, "[ %s ]", target.name.c_str());
             }
+
+            // Room-ID label overlay (only when show_rooms is on).
+            // Must happen AFTER the dbgTextClear above; otherwise the
+            // labels are written and then immediately wiped.
+            renderRoomLabelsOverlay(fc, state);
 
             // Debug console overlay (draws on top of frob hint when open)
             dbgConsole.render();
