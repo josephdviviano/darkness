@@ -285,6 +285,110 @@ struct PropSchemaLoopParams {
     int16_t maxInterval;
 };
 
+// P$SchemaAttenuationFactor — dtype: SchAttFac, 4 bytes.
+// Per-schema attenuation-factor divisor (default 1.0). At runtime, the
+// volume formula is:
+//   volume_centibels = gain - (d/r) * (5000 + gain) / attenuation
+// So values > 1.0 make the schema fall off LESS aggressively (volume
+// drops to e.g. -25 dB at radius instead of -50 dB for attenuation=2.0).
+// Set per-archetype on the schema's object record in dark.gam.
+struct PropSchAttFac {
+    float attenuation;
+};
+
+// P$SchemaPriority — dtype: SchPriori, 4 bytes.
+// Per-schema priority value used by the voice manager to decide which
+// sound to drop when the active-voice budget is exceeded. Range 0–255
+// per original engine; some schemas (e.g. M06 ambient archetype) use
+// 255 to stay above ordinary sounds.
+struct PropSchPriori {
+    int32_t priority;
+};
+
+// P$SchemaMessage — dtype: SchMsg, 16 bytes.
+// Optional message label fired to scripts when the schema is triggered.
+// E.g. AI alerts use this to announce "MetalImpact" when an arrow hits
+// armor. Null-terminated char[16].
+struct PropSchMsg {
+    char label[16];
+};
+
+// P$SchemaLastSample — dtype: SchLastSa, 4 bytes. Runtime-mutable: index
+// of the last sample played from this schema. Used by SCH_NO_REPEAT to
+// avoid replaying the same sample twice in a row. Not authored — written
+// at runtime as the schema plays.
+struct PropSchLastSa {
+    int32_t value;
+};
+
+// P$SpotAmbient — dtype: SpotAmb, 12 bytes.
+// Alternative ambient-sound encoding with a hard inner/outer falloff
+// envelope. Unlike P$AmbientHack (which uses a single radius), spot
+// ambients have:
+//   • inner radius   — distance up to which the ambient plays at the
+//                      `ambient` level (constant).
+//   • outer radius   — beyond this distance the ambient is silent.
+//   • Between inner and outer it linearly interpolates toward 0.
+// The `ambient` field is the volume scalar (1.0 = nominal).
+struct PropSpotAmb {
+    float inner;
+    float outer;
+    float ambient;
+};
+
+// P$Heartbeat — dtype: Heartbeat, 4 bytes.
+// Heartbeat sound timing — int32 milliseconds between beats. Set on
+// objects (typically the player or AIs) to drive a periodic "heartbeat"
+// schema (e.g. health-low warning).
+struct PropHeartbeat {
+    int32_t time;
+};
+
+// P$MaxSpeechPause — dtype: MaxSpchPa, 4 bytes.
+// Per-AI maximum pause between speech utterances (ms).
+struct PropMaxSpchPa {
+    int32_t time;
+};
+
+// P$MinSpeechPause — dtype: MinSpchPa, 4 bytes.
+// Per-AI minimum pause between speech utterances (ms).
+struct PropMinSpchPa {
+    int32_t time;
+};
+
+// P$AIHearing — dtype: aiaptitude (aliased), 4 bytes.
+// Per-AI hearing sensitivity rating (default 3 = "Normal"). Values
+// 1–5 = VeryLow → VeryHigh. Drives AIHearStat dist_muls / db_adds.
+struct PropAI_Hearin {
+    uint32_t rating;
+};
+
+// P$AISoundType — dtype: AI_SndTyp, 40 bytes.
+// Maps a schema (or sound class) to an AI-side sound type for awareness
+// propagation. `type` is an `aisoundtype` enum, `signal` is the script
+// signal name fired when this sound is heard.
+struct PropAI_SndTyp {
+    uint32_t type;
+    char     signal[32];
+    int32_t  zero;
+};
+
+// P$VoiceIndex — dtype: VoiceIdx, 4 bytes.
+// Per-object voice-list index. Drives speech selection: each AI archetype
+// points at a slot in the global voice list (Speech_DB) so the same
+// concept ("Greet", "Alert") plays a different sample for different
+// guards.
+struct PropVoiceIdx {
+    int32_t voice;
+};
+
+// P$SpeechVoice — dtype: SpchVoice, 16 bytes.
+// String name of the voice this AI uses. Resolved to a Speech_DB voice
+// slot at runtime. Null-terminated char[16].
+struct PropSpchVoice {
+    char label[16];
+};
+
 // ============================================================================
 // Gameplay properties
 // ============================================================================

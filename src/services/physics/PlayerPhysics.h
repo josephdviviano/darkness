@@ -404,6 +404,29 @@ public:
         return false;
     }
 
+    /// An object's collision body has just been disabled (picked up,
+    /// destroyed, etc.). Drop any cached contacts referencing it and, if
+    /// the player was standing on it, transition to Jump immediately
+    /// instead of riding out the ground-grace window — the surface really
+    /// is gone, no need to wait a tick to confirm.
+    inline void dropGroundContactOn(int32_t objID) {
+        if (objID == 0) return;
+        const bool wasStandingOn = isStandingOnObject(objID);
+
+        for (auto it = mContacts.begin(); it != mContacts.end(); ) {
+            if (it->objectId == objID) it = mContacts.erase(it);
+            else                       ++it;
+        }
+        if (mGroundObjID == objID) mGroundObjID = -1;
+
+        if (wasStandingOn) {
+            mCurrentMode = PlayerMode::Jump;
+            mGroundGraceTimer = 0.0f;
+            mGroundGraceActive = false;
+            leaveGround();
+        }
+    }
+
     /// Check if the player's center of gravity is in a water cell.
     /// Used for buoyancy, jump scaling, and mode transitions.
     bool isInWater() const {

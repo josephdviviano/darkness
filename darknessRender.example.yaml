@@ -116,7 +116,24 @@ audio:
     reflection_throttle: 4       # run reflection sim every Nth frame (1–32)
     sim_max_occlusion_samples: 32  # Steam Audio per-source occlusion cap (4–256)
     sim_max_rays: 4096           # Steam Audio per-step ray cap (must be >= reflections.rays)
-    sim_max_sources: 32          # Steam Audio source pool size (4–256)
+    # Source pools are split: direct-only sim is cheap per source so its cap
+    # can be much higher than the reflection sim's cap (which scales with
+    # convolution + IR memory). Legacy key `sim_max_sources` maps to
+    # `reflection_max_sources` for back-compat.
+    direct_max_sources: 256      # Direct-sim source pool (4–1024)
+    reflection_max_sources: 32   # Reflection-sim source pool (4–256)
+    # Demote-only fallback (stage 2.2): every voice starts with a
+    # reflection source and routes through baked reverb by default
+    # (upgraded to ray-traced realtime when in the top-N closest pool).
+    # If a Normal voice stays outside the top-N pool for this many
+    # consecutive frames it releases its reflection source and plays dry
+    # for the rest of its life. This is a *sparing* fallback for genuinely
+    # long-lived "stuck distant" voices — the default is high so it only
+    # fires when convolution / sim budget is under real pressure. Lower
+    # the value to make the fallback more aggressive when stress-testing.
+    # PlayerEmitted (footsteps, landings) and Ambient voices are excluded
+    # — they keep their reflection source for life.
+    reflection_demote_hysteresis_frames: 600  # (1–3600; ≈10 s at 60 fps)
     scene_type: default          # IPL scene backend ("default" or "embree")
 
   reflections:
@@ -125,20 +142,46 @@ audio:
     rays: 4096                   # rays per reflection sim step (128–8192)
     bounces: 4                   # bounces per ray (1–8). More = wraps further around corners.
     duration: 2.0                # max reverb tail in seconds (0.5–4.0)
-    ambisonics_order: 0          # 0=omnidirectional (1ch, cheap), 1=directional (4ch)
+    # Ambisonic order: 0=omnidirectional (1ch, cheapest), 1=directional (4ch),
+    # 2=(9ch), 3=(16ch). Memory + decode cost scale with (N+1)^2 channels.
+    # Bump to 2 once the reflection budget allows (after stage 2.2 lazy alloc).
+    ambisonics_order: 0          # 0–3
+
+  probes:
+    # Baked-probe grid parameters. Probes are points where Steam Audio
+    # samples reflection IRs at bake time; the runtime interpolates between
+    # the nearest 8 to produce a listener-position-dependent reverb.
+    #
+    # A halved spacing quadruples probe count and roughly quadruples bake
+    # time, but reduces the audible amplitude swings as the listener walks
+    # between probes (footsteps in particular). If footstep reverb feels
+    # patchy with spacing=5, try 2.5 and re-bake (`bake_probes` in console).
+    spacing: 5.0                 # grid spacing in feet (1.0–20.0; re-bake required)
+    height: 5.0                  # probe height above floor in feet (0.5–20.0)
 
   occlusion:
     # Source occlusion + global material multipliers.
+    #
     # `radius` is in engine feet, converted to meters at the Steam Audio
-    # boundary. Rough sizing guide:
-    #   2  ≈ point source / candle
-    #   5  ≈ lamp / small source            <- default
-    #   10 ≈ small machine / chest
-    #   16 ≈ large machinery (door floor)
+    # boundary. Volumetric occlusion samples N points from a sphere of
+    # this radius centered on the SOURCE and casts rays from each to the
+    # listener; fraction unoccluded = unoccluded fraction. Tuning notes:
+    #   • Too small → many sample points fall INSIDE the source's own
+    #     visible mesh (e.g. a street-lamp embedded in its lamp-post
+    #     model). Rays from those interior points hit the mesh on their
+    #     way out → near-total self-occlusion. Listener hears nothing
+    #     until they move/jump above the fixture.
+    #   • Too big → rays from the far side can travel through walls
+    #     before hitting the listener → falsely-unoccluded for sources
+    #     that really are walled off.
+    #
+    # Rough sizing guide:
+    #   5  ≈ candle / point source
+    #   10 ≈ lamp / small fixture
+    #   16 ≈ doorway / small machinery
+    #   20 ≈ machinery / chest-sized solid source
     #   25+≈ ambient drone / industrial vent
-    # Door/local-sound voices automatically raise this floor to 16 ft so
-    # narrow doorways don't over-occlude — see AudioService.cpp.
-    radius: 5.0                  # volumetric source sphere (feet, 0.3–30)
+    radius: 10.0                 # volumetric source sphere (feet, 0.3–30)
     samples: 16                  # rays per source for occlusion gradient (4–64)
     transmission_scale: 1.0      # material transmission multiplier (0.1–100; 10=game-friendly)
     absorption_scale: 1.0        # material absorption multiplier (0.01–10; <1 = more reflective)
@@ -167,6 +210,14 @@ audio:
     hysteresis_stop_mul: 2.0     # multiplier on radius for deactivation (1–5; > start)
     falloff_curve: quadratic     # "linear" or "quadratic" (when AMB_NO_FADE is unset)
     default_priority: 64         # priority for ambients without explicit value (0–255)
+    # Per-voice HRTF spatial-blend override for room-attached ambients
+    # (AMB_ENVIRONMENTAL: wind, church reverberance, generic room tone).
+    # 1.0 = full HRTF point-source pan (default for everything else);
+    # 0.0 = mono passthrough with no directional cue. Lower values make
+    # room ambients feel diffuse rather than coming from a single point.
+    # Object-attached ambients (no AMB_ENVIRONMENTAL flag) ignore this
+    # and keep full HRTF so e.g. a generator hum stays directional.
+    environmental_spatial_blend: 0.3  # (0.0–1.0)
 
   mixer:
     # Global gains. Independent direct/indirect knobs let you tune the

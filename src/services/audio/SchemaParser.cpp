@@ -813,6 +813,12 @@ const SchemaEntry *SchemaParser::findSchema(const std::string &name) const
     return (it != mSchemas.end()) ? &it->second : nullptr;
 }
 
+SchemaEntry *SchemaParser::findSchemaMutable(const std::string &name)
+{
+    auto it = mSchemas.find(toLower(name));
+    return (it != mSchemas.end()) ? &it->second : nullptr;
+}
+
 const TagDefinition *SchemaParser::findTag(const std::string &name) const
 {
     auto it = mTags.find(toLower(name));
@@ -829,6 +835,12 @@ SchemaParser::findByEnvTags(const std::vector<SchemaTagValue> &queryTags) const
 
         // Multiple env_tag lines are alternatives (OR): ANY group can match.
         // Within a single env_tag line, ALL tags must match (AND).
+        // Matching is symmetric: every schema tag must be satisfied by the
+        // query AND every query tag must be constrained by the schema. The
+        // symmetry is what distinguishes e.g. land_rock_p (has Landing=True)
+        // from ft_rock_p (no Landing tag) when a query specifies Landing=True
+        // — without it, the footstep schema would falsely match landing queries
+        // because it doesn't constrain Landing at all.
         bool anyGroupMatched = false;
         for (const auto &group : schema.envTagGroups) {
             bool allMatch = true;
@@ -874,6 +886,26 @@ SchemaParser::findByEnvTags(const std::vector<SchemaTagValue> &queryTags) const
                     break;
                 }
             }
+
+            // Symmetric check: every query tag name must appear in this group.
+            // Without this, a schema with fewer constraints would match a more
+            // specific query (e.g. ft_rock_p matching a Landing=True query).
+            if (allMatch) {
+                for (const auto &qTag : queryTags) {
+                    bool groupHasTag = false;
+                    for (const auto &sTag : group) {
+                        if (toLower(sTag.tagName) == toLower(qTag.tagName)) {
+                            groupHasTag = true;
+                            break;
+                        }
+                    }
+                    if (!groupHasTag) {
+                        allMatch = false;
+                        break;
+                    }
+                }
+            }
+
             if (allMatch) {
                 anyGroupMatched = true;
                 break;
