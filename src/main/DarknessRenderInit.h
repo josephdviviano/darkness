@@ -24,6 +24,7 @@
 #pragma once
 
 #include <unordered_set>
+#include "ai/AIHearingService.h"
 #include "sim/TweqSystem.h"
 
 // ── Initialize service stack and load mission database ──
@@ -57,6 +58,7 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
         svcMgr->registerFactory<Darkness::SimServiceFactory>();
         svcMgr->registerFactory<Darkness::PhysicsServiceFactory>();
         svcMgr->registerFactory<Darkness::AudioServiceFactory>();
+        svcMgr->registerFactory<Darkness::AIHearingServiceFactory>();
 
         // Apply early-init audio settings: these are read inside
         // AudioService::bootstrapFinished (initMiniaudio + initSteamAudio)
@@ -78,6 +80,16 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
             audioSvc->setDoorLpfBlockedHz(cfg.doorLpfBlockedHz);
             audioSvc->setPropMinAttenuation(cfg.propMinAttenuation);
             audioSvc->publishAudioThreadParams();
+        }
+
+        // Force creation of AIHearingService so it subscribes to the
+        // audio sound-emission events during bootstrapFinished. The
+        // ServiceManager only lazy-creates services on demand, and the
+        // AI hearing subsystem has no other caller that would pull it.
+        {
+            Darkness::AIHearingServicePtr aiHearSvc =
+                GET_SERVICE(Darkness::AIHearingService);
+            (void)aiHearSvc;
         }
 
         svcMgr->bootstrapFinished();
