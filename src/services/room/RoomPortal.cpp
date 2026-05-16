@@ -28,6 +28,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace Darkness {
 /*----------------------------------------------------*/
@@ -208,33 +209,46 @@ bool RoomPortal::raycast(const Vector3 &origin, const Vector3 &dir) const
 }
 
 //------------------------------------------------------
-bool RoomPortal::getRaycastProjection(const Vector3 &origin, const Vector3 &dir,
-                                       Vector3 &projPt) const
+Vector3 RoomPortal::closestPointOnPolygon(const Vector3 &ref) const
 {
-    // Intersect ray with portal plane to get the base point.
-    float denom = glm::dot(mPlane.normal, dir);
-    if (std::fabs(denom) < 1e-7f)
-        return false;  // parallel
+    // Step 1: project ref onto the portal's plane. mPlane.getDistance is
+    // the signed offset; subtracting normal*offset moves the point onto
+    // the plane.
+    Vector3 p = ref - mPlane.normal * mPlane.getDistance(ref);
 
-    float t = -mPlane.getDistance(origin) / denom;
-    projPt = origin + dir * t;
+    if (mEdgeCount == 0) return p;
 
-    // Iterative edge clamping: for each violated edge, project the point
-    // onto the edge plane. This is the Dark Engine's approximate nearest-
-    // point algorithm. With outward-pointing edge normals, "outside this
-    // edge" means getDistance > epsilon; we move the point inward by
-    // subtracting the (positive) violation along the edge normal.
-    constexpr float kEpsilon = 0.0001f;
-    for (uint32_t i = 0; i < mEdgeCount; ++i) {
-        float dist = mEdges[i].getDistance(projPt);
-        if (dist > kEpsilon) {
-            // Point is outside this edge. Project onto the edge plane.
-            // dist is positive (outside); subtracting normal*dist moves inward.
-            projPt -= mEdges[i].normal * dist;
+    // Step 2: if the projection lies inside the polygon (every edge in
+    // its negative half-space, with a small ε for floating-point slack),
+    // we are done — that point is the genuine nearest.
+    //
+    // Step 3: otherwise clamp ITERATIVELY against the MOST-VIOLATED edge
+    // plane each pass. Picking the worst edge first guarantees we land on
+    // an actual edge (a line, not a corner) for the common case where two
+    // or three edges are violated simultaneously. The legacy ordering
+    // (sequential edge index) would bounce the point to a corner — the
+    // root cause of the audible "anchor pulse" investigated under
+    // PLAN.SOUND_PROPAGATION_NEXT.md SP-2.
+    //
+    // Convex polygons converge in at most mEdgeCount passes in practice
+    // (each pass either accepts or strictly reduces the worst violation);
+    // we bound the loop generously as a safety net.
+    constexpr float kEps = 1e-4f;
+    const uint32_t kMaxIter = mEdgeCount * 2 + 4;
+    for (uint32_t iter = 0; iter < kMaxIter; ++iter) {
+        float worst = -std::numeric_limits<float>::infinity();
+        uint32_t worstIdx = 0;
+        for (uint32_t i = 0; i < mEdgeCount; ++i) {
+            float d = mEdges[i].getDistance(p);
+            if (d > worst) {
+                worst = d;
+                worstIdx = i;
+            }
         }
+        if (worst <= kEps) break;
+        p -= mEdges[worstIdx].normal * worst;
     }
-
-    return true;
+    return p;
 }
 
 //------------------------------------------------------

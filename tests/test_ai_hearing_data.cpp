@@ -26,9 +26,10 @@ using namespace Darkness;
 
 TEST_CASE("AIHearingStats is 48 bytes", "[ai_hearing][parser]") {
     CHECK(sizeof(AIHearingStats) == 48);
-    // 6 floats dist_muls + 6 floats db_adds = 12 * 4 bytes.
+    // 6 floats dist_muls + 6 int32 db_adds = 12 * 4 bytes.
     CHECK(sizeof(AIHearingStats) ==
-          sizeof(float) * AI_HEARING_COUNT * 2);
+          sizeof(float)   * AI_HEARING_COUNT +
+          sizeof(int32_t) * AI_HEARING_COUNT);
 }
 
 TEST_CASE("AISoundTweaks is 24 bytes", "[ai_hearing][parser]") {
@@ -39,14 +40,14 @@ TEST_CASE("AISoundTweaks is 24 bytes", "[ai_hearing][parser]") {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// AIHearStat chunk decoder — 48-byte little-endian floats round-trip.
+// AIHearStat chunk decoder — 48-byte buffer: 6 floats then 6 int32s.
 // ════════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("readAIHearStat round-trips synthetic 48-byte buffer",
           "[ai_hearing][parser]") {
-    // Build a synthetic chunk: 6 dist_muls then 6 db_adds.
-    const float wantDist[6] = { 0.0f, 0.1f, 0.5f, 1.0f, 2.0f, 4.5f };
-    const float wantDb[6]   = { 99999.0f, 500.0f, 100.0f, 0.0f, -100.0f, -500.0f };
+    // Build a synthetic chunk: 6 float dist_muls then 6 int32 db_adds.
+    const float   wantDist[6] = { 0.0f, 0.1f, 0.5f, 1.0f, 2.0f, 4.5f };
+    const int32_t wantDb  [6] = { 99999, 500, 100, 0, -100, -500 };
 
     uint8_t buf[48];
     std::memcpy(buf + 0,  wantDist, sizeof(wantDist));
@@ -59,6 +60,31 @@ TEST_CASE("readAIHearStat round-trips synthetic 48-byte buffer",
         CHECK(out.dist_muls[i] == wantDist[i]);
         CHECK(out.db_adds[i]   == wantDb[i]);
     }
+}
+
+// Regression: the original engine stores db_adds as int32, not float.
+// Verify the exact byte sequence the gam file ships with round-trips to
+// the expected integer centibel values. Decoding bytes 24-47 as floats
+// (the previous buggy behavior) produced denormals and NaNs.
+TEST_CASE("readAIHearStat decodes original-engine default bytes",
+          "[ai_hearing][parser]") {
+    const float   wantDist[6] = { 0.0f, 0.25f, 0.65f, 1.0f, 1.5f, 3.0f };
+    const int32_t wantDb  [6] = { 1000000, 1000, 200, 0, -200, -1000 };
+
+    uint8_t buf[48];
+    std::memcpy(buf + 0,  wantDist, sizeof(wantDist));
+    std::memcpy(buf + 24, wantDb,   sizeof(wantDb));
+
+    AIHearingStats out{};
+    REQUIRE(readAIHearStat(buf, sizeof(buf), out));
+
+    for (int i = 0; i < AI_HEARING_COUNT; ++i) {
+        CHECK(out.dist_muls[i] == wantDist[i]);
+        CHECK(out.db_adds[i]   == wantDb[i]);
+    }
+    CHECK(out.db_adds[AI_HEARING_DEAF]      == 1000000);
+    CHECK(out.db_adds[AI_HEARING_NORMAL]    == 0);
+    CHECK(out.db_adds[AI_HEARING_VERY_HIGH] == -1000);
 }
 
 TEST_CASE("readAIHearStat rejects size mismatch", "[ai_hearing][parser]") {
@@ -125,8 +151,8 @@ TEST_CASE("readAISndTwk rejects size mismatch", "[ai_hearing][parser]") {
 
 TEST_CASE("kDefaultAIHearingStats matches original engine defaults",
           "[ai_hearing][parser]") {
-    const float expectedDist[6] = { 0.0f, 0.25f, 0.65f, 1.0f, 1.5f, 3.0f };
-    const float expectedDb[6]   = { 1000000.0f, 1000.0f, 200.0f, 0.0f, -200.0f, -1000.0f };
+    const float   expectedDist[6] = { 0.0f, 0.25f, 0.65f, 1.0f, 1.5f, 3.0f };
+    const int32_t expectedDb  [6] = { 1000000, 1000, 200, 0, -200, -1000 };
 
     for (int i = 0; i < AI_HEARING_COUNT; ++i) {
         CHECK(kDefaultAIHearingStats.dist_muls[i] == expectedDist[i]);
@@ -136,11 +162,11 @@ TEST_CASE("kDefaultAIHearingStats matches original engine defaults",
     // Deaf slot specifically — distance multiplier zero and a giant dB add,
     // so the AI cannot hear anything.
     CHECK(kDefaultAIHearingStats.dist_muls[AI_HEARING_DEAF] == 0.0f);
-    CHECK(kDefaultAIHearingStats.db_adds[AI_HEARING_DEAF]   == 1000000.0f);
+    CHECK(kDefaultAIHearingStats.db_adds[AI_HEARING_DEAF]   == 1000000);
 
     // Normal slot is the identity — distance unmodified, no dB add.
     CHECK(kDefaultAIHearingStats.dist_muls[AI_HEARING_NORMAL] == 1.0f);
-    CHECK(kDefaultAIHearingStats.db_adds[AI_HEARING_NORMAL]   == 0.0f);
+    CHECK(kDefaultAIHearingStats.db_adds[AI_HEARING_NORMAL]   == 0);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

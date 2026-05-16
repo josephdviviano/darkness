@@ -98,17 +98,31 @@ public:
     /// @return true if the ray passes through the portal polygon
     bool raycast(const Vector3 &origin, const Vector3 &dir) const;
 
-    /// Find the closest point on the portal boundary to a ray that missed.
-    /// Intersects the ray with the portal plane, then projects onto any violated
-    /// edge planes. The result is an "anchor point" where sound bends around the
-    /// portal frame. Based on the Dark Engine's portal edge projection algorithm
-    /// (inspired by OPDE's RoomPortal).
-    /// @param origin  Ray origin
-    /// @param dir     Ray direction
-    /// @param[out] projPt  The projected point on (or near) the portal boundary
-    /// @return true if a projection was found (false only if ray is parallel to portal plane)
-    bool getRaycastProjection(const Vector3 &origin, const Vector3 &dir,
-                              Vector3 &projPt) const;
+    /// Closest point on the (convex) portal polygon to an external
+    /// reference point. Drives the sound-propagation anchor projection
+    /// algorithm:
+    ///
+    ///   1. Project `ref` onto the portal's plane.
+    ///   2. If the projection lies inside the polygon (all edge planes
+    ///      satisfied), return it.
+    ///   3. Otherwise clamp iteratively against the MOST-violated edge
+    ///      plane until inside. Always picking the worst-violated edge
+    ///      first guarantees the result lands on an actual edge (not
+    ///      sequentially-clamped to a polygon corner), which is the
+    ///      geometric source of the audible "anchor pulse" the
+    ///      legacy `getRaycastProjection` used to produce when
+    ///      multiple edges were violated at once.
+    ///
+    /// This is the only "where on the polygon does the sound path bend"
+    /// primitive in the engine. Both the BFS hop-cost heuristic and the
+    /// per-portal anchor projection share it — keeping chain selection
+    /// and final-distance computation geometrically consistent.
+    ///
+    /// @param ref  External reference point (source position, listener
+    ///             position, or a previously-resolved bend point on an
+    ///             adjacent polygon)
+    /// @return The closest point on the polygon to `ref`.
+    Vector3 closestPointOnPolygon(const Vector3 &ref) const;
 
 private:
     void clear();

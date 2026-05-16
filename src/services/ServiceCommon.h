@@ -61,6 +61,7 @@ This file contains some global definitions common to all services
 #define __SERVICE_ID_PLATFORM 22
 #define __SERVICE_ID_PLAYER 23
 #define __SERVICE_ID_AUDIO 24
+#define __SERVICE_ID_AI_HEARING 25
 
 // --------------------------------------
 // ---  Bitmasks for service masking  ---
@@ -175,6 +176,7 @@ namespace Darkness {
 class ServiceManager;
 
 // Services
+class AIHearingService;
 class AudioService;
 class CameraService;
 class ConfigService;
@@ -199,6 +201,7 @@ class ScriptService;
 class SimService;
 class WorldRepService;
 
+using AIHearingServicePtr = std::shared_ptr<AIHearingService>;
 using AudioServicePtr = std::shared_ptr<AudioService>;
 using CameraServicePtr = std::shared_ptr<CameraService>;
 using ConfigServicePtr = std::shared_ptr<ConfigService>;

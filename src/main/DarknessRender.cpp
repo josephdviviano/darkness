@@ -1569,6 +1569,11 @@ static void registerConsoleSettings(
         [&state](bool v) { state.showRooms = v; },
         "Wireframe overlay of room OBBs and portal polygons, with room ID labels. Current room marked with '*'.");
 
+    dbgConsole.addBool("show_pos",
+        [&state]() { return state.showPos; },
+        [&state](bool v) { state.showPos = v; },
+        "Show camera world-space (x, y, z) position on the HUD. Z-up Dark Engine coords, units = feet.");
+
     dbgConsole.addBool("debug_anim_lightmaps",
         [&state]() { return state.debugAnimLightmaps; },
         [&state](bool v) { state.debugAnimLightmaps = v; },
@@ -3178,6 +3183,8 @@ int main(int argc, char *argv[]) {
         audioSvc->setDoorLpfOpenHz(cfg.doorLpfOpenHz);
         audioSvc->setDoorLpfBlockedHz(cfg.doorLpfBlockedHz);
         audioSvc->setPropMinAttenuation(cfg.propMinAttenuation);
+        audioSvc->setPropMaxPaths(cfg.propMaxPaths);
+        audioSvc->setPropMaxPathDiff(cfg.propMaxPathDiff);
 
         // -- audio.spatialization --
         audioSvc->setHRTFVolume(cfg.hrtfVolume);
@@ -4383,6 +4390,14 @@ int main(int argc, char *argv[]) {
                 int col = 80 - static_cast<int>(target.name.size()) / 2 - 2;
                 if (col < 0) col = 0;
                 bgfx::dbgTextPrintf(col, 24, 0x0f, "[ %s ]", target.name.c_str());
+            }
+
+            // Camera position HUD (only when show_pos is on). Row 0 so
+            // it sits above the show_rooms / show_raycast lines on row 1.
+            if (state.showPos) {
+                bgfx::dbgTextPrintf(2, 0, 0x0F,
+                    "POS — (`show_pos) cam = (%.2f, %.2f, %.2f)",
+                    state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
             }
 
             // Room-ID label overlay (only when show_rooms is on).

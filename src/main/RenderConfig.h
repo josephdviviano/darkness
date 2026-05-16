@@ -93,6 +93,14 @@ struct RenderConfig {
     float doorLpfOpenHz       = 20000.0f; // LPF cutoff for fully open door (Hz)
     float doorLpfBlockedHz    = 800.0f;   // LPF cutoff for fully blocked door (Hz)
     float propMinAttenuation  = 0.001f;   // floor on propagation/portal scale (prevents total silence from FP noise)
+    // N-path BFS: how many simultaneous portal-graph paths to keep per
+    // listener room. 1 = single shortest path; 2 = original Dark Engine
+    // (cBFRoomInfo::previous_room_2); 3+ = modernized. Clamped to [1, 4].
+    uint32_t propMaxPaths     = 2;
+    // Alternates kept only if their effective distance is within this
+    // many world units of the primary. Matches the original engine's
+    // kMaxDistDiff = 10. Clamped to [0, 50].
+    float    propMaxPathDiff  = 10.0f;
 
     // -- audio.spatialization: HRTF + distance model --
     float hrtfVolume          = 1.0f;   // HRTF output gain (1.0 = raw HRTF, lower = quieter)
@@ -421,6 +429,17 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     cfg.propMinAttenuation = prop["min_attenuation"].as<float>();
                     if (cfg.propMinAttenuation < 0.0f)   cfg.propMinAttenuation = 0.0f;
                     if (cfg.propMinAttenuation > 0.1f)   cfg.propMinAttenuation = 0.1f;
+                }
+                if (prop["max_paths"]) {
+                    int n = prop["max_paths"].as<int>();
+                    if (n < 1) n = 1;
+                    if (n > 4) n = 4;
+                    cfg.propMaxPaths = static_cast<uint32_t>(n);
+                }
+                if (prop["max_path_diff"]) {
+                    cfg.propMaxPathDiff = prop["max_path_diff"].as<float>();
+                    if (cfg.propMaxPathDiff < 0.0f)  cfg.propMaxPathDiff = 0.0f;
+                    if (cfg.propMaxPathDiff > 50.0f) cfg.propMaxPathDiff = 50.0f;
                 }
             }
 

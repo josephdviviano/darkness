@@ -27,7 +27,10 @@
 //   AIHearStat (48 bytes) — per-hearing-rating distance multiplier and
 //     dB add. Six ratings: Deaf, VeryLow, Low, Normal, High, VeryHigh.
 //     Layout on disk: 6 little-endian floats of dist_muls, followed by
-//     6 little-endian floats of db_adds.
+//     6 little-endian int32s of db_adds (centibels). Note the type change
+//     mid-chunk — db_adds are stored as signed integers in the original
+//     engine, e.g. Deaf=1000000, Normal=0, VeryHigh=-1000. Decoding them
+//     as floats produces denormals/NaNs.
 //
 //   AISNDTWK  (24 bytes) — default audible-range (in world units) for
 //     each of six AI sound types: Untyped, Inform, MinorAnomaly,
@@ -76,16 +79,17 @@ enum AISoundType : int {
 //
 // For an emitted sound with apparent SPL `db` at distance `d`, an AI with
 // rating `r` perceives loudness `db + db_adds[r]` after the distance is
-// scaled by `dist_muls[r]`. Slot 0 (Deaf) uses `0 * dist + 1e6 dB add`
+// scaled by `dist_muls[r]`. Slot 0 (Deaf) uses `0 * dist + 1000000 dB add`
 // — the AI is effectively deaf.
 //
-// The struct is plain old data, layout-matched to the on-disk chunk
-// (12 floats, no padding). Total size: 48 bytes.
+// db_adds are in centibels (0.1 dB), stored as int32 on disk. dist_muls
+// are floats. The struct is plain old data, layout-matched to the on-disk
+// chunk (6 floats + 6 int32s, no padding). Total size: 48 bytes.
 // ════════════════════════════════════════════════════════════════════════════
 
 struct AIHearingStats {
-    float dist_muls[AI_HEARING_COUNT];
-    float db_adds[AI_HEARING_COUNT];
+    float   dist_muls[AI_HEARING_COUNT];
+    int32_t db_adds  [AI_HEARING_COUNT];
 };
 
 static_assert(sizeof(AIHearingStats) == 48,
@@ -96,7 +100,7 @@ static_assert(sizeof(AIHearingStats) == 48,
 // loud enough to be heard.
 static constexpr AIHearingStats kDefaultAIHearingStats = {
     /* dist_muls */ { 0.0f, 0.25f, 0.65f, 1.0f, 1.5f, 3.0f },
-    /* db_adds   */ { 1000000.0f, 1000.0f, 200.0f, 0.0f, -200.0f, -1000.0f },
+    /* db_adds   */ { 1000000, 1000, 200, 0, -200, -1000 },
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -122,10 +126,12 @@ static_assert(sizeof(AISoundTweaks) == 24,
 inline bool readAIHearStat(const uint8_t *bytes, size_t sz, AIHearingStats &out) {
     if (bytes == nullptr || sz != sizeof(AIHearingStats))
         return false;
-    // The on-disk layout is identical to the struct (12 little-endian floats
-    // packed back-to-back, no padding). On all supported target platforms
-    // floats are little-endian, so a raw memcpy is sufficient.
-    std::memcpy(&out, bytes, sizeof(AIHearingStats));
+    // On-disk layout: 6 little-endian floats (dist_muls) followed by 6
+    // little-endian int32s (db_adds, in centibels). Struct field order
+    // matches, and all supported targets are little-endian, so we can
+    // memcpy each half directly into the struct.
+    std::memcpy(out.dist_muls, bytes + 0,  sizeof(out.dist_muls));
+    std::memcpy(out.db_adds,   bytes + 24, sizeof(out.db_adds));
     return true;
 }
 

@@ -32,6 +32,7 @@
 #include "SchemaSamplesChunk.h"
 #include "SchemaTypes.h"
 #include "SpeechDatabase.h"
+#include "SpeechSelector.h"
 #include "ServiceCommon.h"
 #include <algorithm>
 #include <atomic>
@@ -203,6 +204,194 @@ static IPLMaterial lookupAcousticMaterial(const std::string &texName)
     auto it = kKeywordToIPLMaterial.find(keyword);
     return (it != kKeywordToIPLMaterial.end()) ? it->second : kGenericMaterial;
 }
+
+/*----------------------------------------------------*/
+/*----- NaN/Inf guards and denormal-flush helpers ----*/
+/*----------------------------------------------------*/
+//
+// The audio pipeline contains many IIR filters (master EQ biquad, per-voice
+// door-blocking LPF, compressor envelope) whose state evolves recursively:
+// a single non-finite sample sticks in the state forever and silences every
+// subsequent sample on that channel.  The downstream compressor / limiter
+// stages have asymmetric NaN behavior (`std::max(NaN, x)` typically returns
+// `x`; `NaN > knee` is false), so a NaN'd left channel can persist while
+// the right channel continues to play — exactly the "left channel goes
+// silent" symptom we observe in the field.
+//
+// The producers of non-finite samples are not fully known (Steam Audio HRTF
+// edge cases, large transient clicks/pops driving the IIRs into overshoot,
+// 0/0 in occasional coefficient computations).  Rather than chase every
+// producer, we sanitize at every state-mutating boundary: per-voice DSP
+// output, per-voice IIR state, master mix input, post-EQ state, post-
+// compressor state, and the final output.  Each guard zeros the offending
+// sample (or resets the IIR state to a safe value) and emits a rate-limited
+// log so the producer can still be tracked down.
+
+/// Sanitize a deinterleaved float buffer in-place.  Replaces any non-finite
+/// sample with 0.  Returns true if at least one sample was replaced.
+/// Hot path — called once per buffer per audio callback.
+static inline bool audioSanitizeBuffer(float *buf, std::size_t n) {
+    if (!buf) return false;
+    bool anyBad = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(buf[i])) {
+            buf[i] = 0.0f;
+            anyBad = true;
+        }
+    }
+    return anyBad;
+}
+
+/// Sanitize an interleaved stereo buffer in-place (length = frames*2 samples).
+/// Identical to audioSanitizeBuffer; named separately for code clarity at
+/// call sites that operate on interleaved data.
+static inline bool audioSanitizeInterleaved(float *interleaved, std::size_t frames) {
+    return audioSanitizeBuffer(interleaved, frames * 2);
+}
+
+/// Sanitize a single scalar (typically an IIR state value).  Returns the
+/// sanitized value: original if finite, otherwise `fallback`.
+static inline float audioSanitizeScalar(float v, float fallback = 0.0f) {
+    return std::isfinite(v) ? v : fallback;
+}
+
+/// Enable flush-to-zero and denormals-are-zero on the calling thread.
+/// Denormal arithmetic does not produce NaN, but it does cause severe
+/// performance cliffs (10-100× slowdown) inside IIRs whose state decays
+/// toward zero — which then back-pressures the audio callback and produces
+/// dropouts that look indistinguishable from NaN-silenced channels.  Worth
+/// enabling on every thread that runs DSP code.
+///
+/// macOS arm64: set FPCR bits FZ (24) and the per-input flush bit (FZ16,
+/// bit 19).  x86 (Intel macOS, Linux, Windows): use the SSE MXCSR macros.
+/// Both calls are idempotent; safe to invoke at the top of every audio
+/// callback (cost is a single register read/write).
+static inline void audioEnableDenormalFlush() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    uint64_t fpcr;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (uint64_t(1) << 24);  // FZ
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr));
+#elif defined(__SSE__) || defined(_M_IX86) || defined(_M_X64)
+    // _MM_SET_FLUSH_ZERO_MODE / _MM_SET_DENORMALS_ZERO_MODE require xmmintrin.h
+    // and pmmintrin.h, which we don't include at the top of this file.  Use
+    // the raw stmxcsr/ldmxcsr to avoid pulling them in.
+    unsigned int mxcsr;
+    __asm__ __volatile__("stmxcsr %0" : "=m"(mxcsr));
+    mxcsr |= (1u << 15) | (1u << 6);  // FTZ | DAZ
+    __asm__ __volatile__("ldmxcsr %0" : : "m"(mxcsr));
+#endif
+}
+
+/*----------------------------------------------------*/
+/*----------- Gain-staging meters --------------------*/
+/*----------------------------------------------------*/
+//
+// One meter per major DSP stage in the master bus.  Each meter accumulates
+// per-block peak (max |sample|) and per-block sum-of-squares (for RMS) into
+// a running window, flushed periodically by the mix node as a [GAIN] log
+// line per stage.  Clipping at the output is almost always due to one
+// specific stage pushing too hot — the per-stage peak/RMS delta points
+// directly at which one (e.g. EQ shelf gain too aggressive, compressor
+// makeup over-compensating, master gain set above the headroom budget).
+//
+// dB conversion uses a -120 dB floor so silent windows don't print "-inf".
+// L and R are tracked separately because asymmetric loudness is informative
+// (e.g. binaural pan to far right pushes R hot while L stays quiet).
+struct StageMeter {
+    float    peakL = 0.0f;
+    float    peakR = 0.0f;
+    double   sumSqL = 0.0;
+    double   sumSqR = 0.0;
+    uint64_t sampleCount = 0;
+
+    /// Accumulate peak + sum-of-squares for an interleaved stereo block.
+    /// frames is the number of stereo frames (so 2*frames samples total).
+    void measure(const float* interleaved, std::size_t frames) {
+        if (!interleaved) return;
+        for (std::size_t i = 0; i < frames; ++i) {
+            float sL = interleaved[i * 2];
+            float sR = interleaved[i * 2 + 1];
+            float aL = std::fabs(sL);
+            float aR = std::fabs(sR);
+            if (aL > peakL) peakL = aL;
+            if (aR > peakR) peakR = aR;
+            sumSqL += static_cast<double>(sL) * sL;
+            sumSqR += static_cast<double>(sR) * sR;
+        }
+        sampleCount += frames;
+    }
+
+    /// Accumulate peak + sum-of-squares for separate L and R deinterleaved
+    /// buffers (the format the per-voice binaural effect produces before
+    /// the interleave step).
+    void measureDeinterleaved(const float* chL, const float* chR,
+                               std::size_t frames) {
+        if (!chL || !chR) return;
+        for (std::size_t i = 0; i < frames; ++i) {
+            float sL = chL[i];
+            float sR = chR[i];
+            float aL = std::fabs(sL);
+            float aR = std::fabs(sR);
+            if (aL > peakL) peakL = aL;
+            if (aR > peakR) peakR = aR;
+            sumSqL += static_cast<double>(sL) * sL;
+            sumSqR += static_cast<double>(sR) * sR;
+        }
+        sampleCount += frames;
+    }
+
+    /// Accumulate peak + sum-of-squares for a mono buffer.  Both L and R
+    /// fields are kept synchronized so the [GAIN] dump shows identical
+    /// L/R values for mono stages (direct effect, reflection input, etc.)
+    /// instead of a misleading -120 dB on the right.
+    void measureMono(const float* mono, std::size_t samples) {
+        if (!mono) return;
+        for (std::size_t i = 0; i < samples; ++i) {
+            float s = mono[i];
+            float a = std::fabs(s);
+            if (a > peakL) peakL = a;
+            sumSqL += static_cast<double>(s) * s;
+        }
+        sampleCount += samples;
+        peakR = peakL;
+        sumSqR = sumSqL;
+    }
+
+    /// Merge another meter's values into this one — used to fold per-
+    /// sub-worker convolution meters into the mix node's combined view
+    /// at log time without coupling those threads through atomics.
+    void mergeIn(const StageMeter &other) {
+        if (other.peakL > peakL) peakL = other.peakL;
+        if (other.peakR > peakR) peakR = other.peakR;
+        sumSqL += other.sumSqL;
+        sumSqR += other.sumSqR;
+        sampleCount += other.sampleCount;
+    }
+
+    void reset() {
+        peakL = peakR = 0.0f;
+        sumSqL = sumSqR = 0.0;
+        sampleCount = 0;
+    }
+
+    /// Linear amplitude → dBFS with a -120 dB floor (avoids -inf prints).
+    static inline float toDb(float x) {
+        return (x > 1e-6f) ? 20.0f * std::log10(x) : -120.0f;
+    }
+
+    float peakDbL() const { return toDb(peakL); }
+    float peakDbR() const { return toDb(peakR); }
+
+    float rmsDbL() const {
+        if (sampleCount == 0) return -120.0f;
+        return toDb(static_cast<float>(std::sqrt(sumSqL / sampleCount)));
+    }
+    float rmsDbR() const {
+        if (sampleCount == 0) return -120.0f;
+        return toDb(static_cast<float>(std::sqrt(sumSqR / sampleCount)));
+    }
+};
 
 /*----------------------------------------------------*/
 /*----------- Steam Audio DSP Processing Node --------*/
@@ -390,6 +579,15 @@ struct SteamAudioDSPNode {
     std::atomic<uint32_t> lastFrameCount{0}; // last frame count delivered by miniaudio
     std::atomic<float> lastAtten{1.0f};     // last attenuation factor applied
 
+    // NaN/Inf guard counters (audio thread).  Each location that sanitizes
+    // non-finite samples increments its own counter; we log the first few
+    // occurrences per voice so the producer can be tracked down without
+    // flooding the log on a sustained NaN burst.
+    std::atomic<uint32_t> nanCountDirect{0};   // post iplDirectEffect
+    std::atomic<uint32_t> nanCountBinaural{0}; // post iplBinauralEffect
+    std::atomic<uint32_t> nanCountLpf{0};      // door-LPF state reset
+    std::atomic<uint32_t> nanCountRamp{0};     // portal-atten / door-alpha ramp reset
+
 };
 
 /// vtable for the Steam Audio DSP custom node
@@ -501,6 +699,32 @@ struct AudioService::ReflectionMixNode {
     float eqZ1L = 0.0f, eqZ2L = 0.0f;  // left channel
     float eqZ1R = 0.0f, eqZ2R = 0.0f;  // right channel
 
+    // NaN/Inf guard counters for the master DSP chain (audio thread).
+    // Each location that sanitizes non-finite samples or resets a stuck
+    // IIR state increments its own counter; we log the first few
+    // occurrences so the producer can be tracked.
+    std::atomic<uint32_t> nanCountInput{0};   // input from per-voice dry sum
+    std::atomic<uint32_t> nanCountWet{0};     // input from reflection wet bus
+    std::atomic<uint32_t> nanCountEq{0};      // post-EQ biquad state reset
+    std::atomic<uint32_t> nanCountComp{0};    // compressor envelope reset
+    std::atomic<uint32_t> nanCountOutput{0};  // final output stage clamp
+
+    // Gain-staging meters — one per stage of the master DSP chain.
+    // Read & written from the audio thread only (no atomic — single writer,
+    // single reader on the same thread).  Flushed every ~1.4 s as a
+    // [GAIN] log block (see kGainLogIntervalCallbacks).
+    StageMeter meterDryIn;     // post per-voice sum, before wet add
+    StageMeter meterPostWet;   // after wet bus add
+    StageMeter meterPostEq;    // after EQ biquad
+    StageMeter meterPostComp;  // after compressor
+    StageMeter meterPostGain;  // after master gain (pre-limiter)
+    StageMeter meterPostLim;   // after limiter (== device input)
+    // Per-block totals over the same window.
+    uint64_t   meterClipCount = 0;    // |x| > 0.99 at FINAL output (true clip danger)
+    uint64_t   meterLimitHits = 0;    // samples that hit the soft-limiter knee (> knee or < -knee)
+    uint64_t   meterTotalSamples = 0; // denominator for hit-rate percent
+    uint64_t   meterBlocksSinceLog = 0;
+
     // Ducking system — ducks ambient sounds when SFX voices are active.
     // Disabled by default. When enabled, ambient voice volumes are multiplied
     // by duckGain, which smoothly transitions based on SFX activity.
@@ -591,6 +815,15 @@ struct ConvolutionSubWorker {
     std::atomic<uint64_t> processedSeq{0};   // last frameSeq the worker finished
     std::atomic<bool> shutdown{false};
     std::atomic<float> peakMs{0.0f};
+
+    // Gain-staging meters (per sub-worker, written only by this worker
+    // thread, read by the master mix node at [GAIN] dump time with
+    // accept-tearing semantics — diagnostic, no correctness impact).
+    // The mix node folds all sub-worker meters into a combined view
+    // before logging via StageMeter::mergeIn.
+    StageMeter saMeterReflIn;     // mono input to iplReflectionEffectApply
+    StageMeter saMeterReflW;      // W (omni) channel of convolution output
+    StageMeter saMeterDecodeOut;  // stereo output of iplAmbisonicsDecodeEffect
 };
 
 /// Off-thread convolution worker with K parallel sub-workers.
@@ -746,6 +979,26 @@ static std::atomic<int>   sDistanceModel{0};
 /// Engine sample rate published for audio-thread DSP that needs it (door LPF, etc.)
 static std::atomic<uint32_t> sEngineSampleRate{48000};
 
+// ── Steam Audio per-voice gain-staging meters ──
+//
+// Aggregated across ALL active per-voice DSP nodes (so a single hot voice
+// shows up in the max/peak even if other voices are quiet).  Written by
+// the audio thread inside steamAudioNodeProcess — miniaudio runs the
+// per-voice callbacks serially on the audio thread, so plain non-atomic
+// fields are safe.  Read & reset by the master mix node every [GAIN]
+// window (same thread, same callback chain).
+//
+// Resonance in the iplDirectEffect 3-band EQ shows up as a spike in
+// sSaMeterDirectOut peak/RMS *above* sSaMeterDirectIn.  Resonance in the
+// HRTF binaural is rare but shows up the same way at sSaMeterBinaural.
+// A spike at sSaMeterPostLpf above sSaMeterBinaural means the door-LPF
+// IIR is misbehaving (state corruption, or a degenerate cutoff value
+// turning the 1-pole filter into a resonator).
+static StageMeter sSaMeterDirectIn;   // mono input to iplDirectEffectApply
+static StageMeter sSaMeterDirectOut;  // mono output of iplDirectEffectApply
+static StageMeter sSaMeterBinaural;   // stereo output of iplBinauralEffectApply
+static StageMeter sSaMeterPostLpf;    // stereo post per-voice LPF + portal atten
+
 // ── Debug audio recording ──
 // Captures the final stereo output to a WAV file for offline analysis.
 // Toggled via the debug console (record_audio setting).
@@ -858,6 +1111,10 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                                    float** ppFramesOut, ma_uint32* pFrameCountOut)
 {
     auto t0 = std::chrono::steady_clock::now();
+    // Keep denormals from creeping into IIR state across many small samples —
+    // a flushed-zero subnormal is mathematically the same as zero but avoids
+    // the 10-100× microcode slowdown that can starve the audio callback.
+    audioEnableDenormalFlush();
     auto* node = reinterpret_cast<SteamAudioDSPNode*>(pNode);
     ma_uint32 frameCount = *pFrameCountOut;
 
@@ -870,6 +1127,41 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
     // Track diagnostics
     node->callCount.fetch_add(1, std::memory_order_relaxed);
     node->lastFrameCount.store(frameCount, std::memory_order_relaxed);
+
+    // Recover IIR state from any non-finite values carried over from the
+    // previous callback.  Without this, a single bad sample anywhere in the
+    // pipeline could silence this voice for the rest of its lifetime —
+    // door-LPF state in particular is a 1-pole IIR that NaN-locks the moment
+    // the state goes bad.  Cheap (six scalar checks per voice per callback)
+    // and worth the worst-case one-callback discontinuity vs. permanent
+    // silence.
+    {
+        bool badLpf = !std::isfinite(node->lpfStateL)
+                   || !std::isfinite(node->lpfStateR);
+        bool badRamp = !std::isfinite(node->currentPortalAtten)
+                    || !std::isfinite(node->currentDoorAlpha);
+        if (badLpf) {
+            node->lpfStateL = 0.0f;
+            node->lpfStateR = 0.0f;
+            uint32_t n = node->nanCountLpf.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4) {
+                AUDIO_LOG("[NAN_GUARD] node=%p lpfState reset to 0 "
+                          "(occurrence %u)\n",
+                          static_cast<void*>(node), n + 1);
+            }
+        }
+        if (badRamp) {
+            // Reset to safe defaults: full attenuation passthrough, open door.
+            node->currentPortalAtten = 1.0f;
+            node->currentDoorAlpha   = 1.0f;
+            uint32_t n = node->nanCountRamp.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4) {
+                AUDIO_LOG("[NAN_GUARD] node=%p portalAtten/doorAlpha ramp "
+                          "reset to passthrough (occurrence %u)\n",
+                          static_cast<void*>(node), n + 1);
+            }
+        }
+    }
 
     float* stereoOut = ppFramesOut[0];  // interleaved stereo output
 
@@ -983,8 +1275,45 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         directOut.numSamples = static_cast<IPLint32>(frameCount);
         directOut.data = &directOutPtr;
 
+        // Gain-staging: record the mono input level to iplDirectEffectApply
+        // for this voice.  The direct effect is a 3-band parametric EQ
+        // (distance / air absorption / occlusion / transmission), and
+        // pathological coefficient combinations can cause it to resonate
+        // — comparing the directIn meter against the directOut meter at
+        // [GAIN] dump time surfaces that.
+        sSaMeterDirectIn.measureMono(directInPtr, frameCount);
+
         iplDirectEffectApply(node->directEffect, &node->directParams,
                              &directIn, &directOut);
+
+        // Companion measurement: directOut.  A peak > directIn peak by
+        // more than ~6 dB across a sustained window means a band is
+        // resonating and pushing energy into the rest of the chain.
+        sSaMeterDirectOut.measureMono(directOutPtr, frameCount);
+
+        // Sanitize the direct-effect output before it feeds the binaural
+        // stage.  iplDirectEffectApply produces NaN/Inf if any of its inputs
+        // (airAbsorption coefficient, distanceAttenuation, occlusion,
+        // transmission band) is non-finite — and propagating that into the
+        // HRTF would silence the entire pipeline.
+        if (audioSanitizeBuffer(directOutPtr, frameCount)) {
+            uint32_t n = node->nanCountDirect.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4) {
+                AUDIO_LOG("[NAN_GUARD] node=%p directEffect output had "
+                          "non-finite samples (occurrence %u) "
+                          "distAtt=%.4f occl=%.4f trans=(%.3f,%.3f,%.3f) "
+                          "airAbs=(%.3f,%.3f,%.3f)\n",
+                          static_cast<void*>(node), n + 1,
+                          node->directParams.distanceAttenuation,
+                          node->directParams.occlusion,
+                          node->directParams.transmission[0],
+                          node->directParams.transmission[1],
+                          node->directParams.transmission[2],
+                          node->directParams.airAbsorption[0],
+                          node->directParams.airAbsorption[1],
+                          node->directParams.airAbsorption[2]);
+            }
+        }
         binauralMono = directOutPtr;  // feed filtered mono to HRTF
 
         // Diagnostic: track per-stage peak across voice lifetime.
@@ -1057,7 +1386,64 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         binParams.hrtf = node->hrtf;
         binParams.peakDelays = nullptr;
 
+        // Defence in depth: if the HRTF was asked for a non-finite direction
+        // (e.g. listener exactly on top of the source produces a 0/0 in the
+        // dot products upstream), Steam Audio will gladly write NaN into the
+        // output buffer.  Clamp the direction to a safe default — straight
+        // ahead — before the apply so the binaural never sees bad inputs.
+        if (!std::isfinite(binParams.direction.x) ||
+            !std::isfinite(binParams.direction.y) ||
+            !std::isfinite(binParams.direction.z)) {
+            binParams.direction = {0.0f, 0.0f, -1.0f};  // IPL ahead, neutral
+        }
+
         iplBinauralEffectApply(node->binauralEffect, &binParams, &binauralIn, &outBuf);
+
+        // Sanitize the binaural output before any downstream IIR touches it.
+        // We have field evidence (log.log) of the HRTF occasionally writing
+        // peakL=0.0000 — a NaN-shaped variant of that same fault would
+        // permanently NaN-lock the per-voice door-LPF state, then the master
+        // EQ biquad, then silence the whole left channel for the rest of the
+        // session.  The check is per-sample on the deinterleaved buffers so
+        // we catch asymmetric L-only or R-only corruption.
+        bool badL = audioSanitizeBuffer(chL, frameCount);
+        bool badR = audioSanitizeBuffer(chR, frameCount);
+        if (badL || badR) {
+            uint32_t n = node->nanCountBinaural.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4) {
+                AUDIO_LOG("[NAN_GUARD] node=%p binaural output had "
+                          "non-finite samples L=%d R=%d (occurrence %u) "
+                          "dir=(%.3f,%.3f,%.3f) spatialBlend=%.3f\n",
+                          static_cast<void*>(node),
+                          badL ? 1 : 0, badR ? 1 : 0, n + 1,
+                          binParams.direction.x, binParams.direction.y,
+                          binParams.direction.z, binParams.spatialBlend);
+            }
+        }
+
+        // HRTF headroom trim.  Steam Audio's iplBinauralEffectApply can
+        // produce samples above 0 dBFS — known issue #350, and confirmed
+        // empirically in [GAIN] logs where sa_binaural peaks reach +3.6 dB
+        // even though the mono input never exceeds -0.5 dB.  A constant
+        // -3 dB trim on the binaural output reclaims that headroom for
+        // the downstream chain without touching the perceived spatial
+        // image (both ears attenuated identically — pure level change,
+        // no panning shift).
+        //
+        // Applied BEFORE the post-binaural meter so sa_binaural reads
+        // the actual level the rest of the pipeline sees.
+        constexpr float kHrtfTrim = 0.7079458f;  // 10^(-3/20) = -3 dBFS
+        for (ma_uint32 i = 0; i < frameCount; ++i) {
+            chL[i] *= kHrtfTrim;
+            chR[i] *= kHrtfTrim;
+        }
+
+        // Gain-staging: post-binaural (post-trim) deinterleaved output,
+        // per voice, aggregated across all voices via the file-scope
+        // meter.  Peak above directOut peak now indicates HRTF overshoot
+        // that survived the trim — should be rare.  Peak well below
+        // directOut indicates the trim was over-aggressive.
+        sSaMeterBinaural.measureDeinterleaved(chL, chR, frameCount);
 
         // Apply portal routing — excess-path attenuation through the portal
         // graph, plus low-pass blocking for closed doors. Both are applied
@@ -1088,7 +1474,10 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             // Target portal-attenuation scalar — clamped against the
             // configurable "min audible" floor so a fully-blocked voice
             // still has a tiny audible residue (debugging aid).
-            float portalTarget = node->portalAttenuation;
+            // Sanitize first: if propagateSoundBlended ever returns a
+            // non-finite scalar, we'd otherwise feed NaN into the slew
+            // loop and NaN-lock the door-LPF state.
+            float portalTarget = audioSanitizeScalar(node->portalAttenuation, 1.0f);
             float minAtten = sPropMinAttenuation.load(std::memory_order_relaxed);
             if (portalTarget < minAtten) portalTarget = minAtten;
 
@@ -1104,7 +1493,12 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             // Formulae preserved from the previous implementation:
             //   cutoff(blocking) = openHz · (blockedHz / openHz) ^ blocking
             //   α(cutoff) = ω / (1 + ω), ω = tan(π · cutoff / sampleRate)
-            float blocking  = node->portalBlocking;
+            // Sanitize portalBlocking: std::pow(positive, NaN) = NaN, which
+            // would propagate through cutoff → omega → alphaTarget → IIR
+            // state.  0.0 is the safe fallback (door fully open, no LPF).
+            float blocking  = audioSanitizeScalar(node->portalBlocking, 0.0f);
+            if (blocking < 0.0f) blocking = 0.0f;
+            else if (blocking > 1.0f) blocking = 1.0f;
             float openHz    = sDoorLpfOpenHz.load(std::memory_order_relaxed);
             float blockedHz = sDoorLpfBlockedHz.load(std::memory_order_relaxed);
             float cutoff    = openHz * std::pow(blockedHz / openHz, blocking);
@@ -1113,6 +1507,13 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             if (cutoff < 1.0f)              cutoff = 1.0f;
             float omega = std::tan(3.14159265f * cutoff / sampleRate);
             float alphaTarget = omega / (1.0f + omega);
+            // Final clamp for the loop target — covers the case where
+            // openHz / blockedHz config values produced a degenerate cutoff
+            // or tan() overshot.  α must stay in [0,1] for the IIR to be
+            // well-behaved.
+            alphaTarget = audioSanitizeScalar(alphaTarget, 1.0f);
+            if (alphaTarget < 0.0f) alphaTarget = 0.0f;
+            else if (alphaTarget > 1.0f) alphaTarget = 1.0f;
 
             float curAtten = node->currentPortalAtten;
             float curAlpha = node->currentDoorAlpha;
@@ -1152,6 +1553,14 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             node->currentPortalAtten = curAtten;
             node->currentDoorAlpha   = curAlpha;
         }
+
+        // Gain-staging: post per-voice LPF + portal attenuation (the
+        // signal that gets summed into the dry bus).  Peak here above
+        // binaural peak indicates the door-LPF IIR is resonating
+        // (degenerate cutoff coefficient or stale state).  Below
+        // binaural peak by a few dB is the expected behaviour with a
+        // partial door close.
+        sSaMeterPostLpf.measureDeinterleaved(chL, chR, frameCount);
 
         // Apply reflection convolution — feeds attenuated mono input through
         // per-voice convolution IR and accumulates the ambisonics result into
@@ -1335,6 +1744,7 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
                                       float** ppFramesOut, ma_uint32* pFrameCountOut)
 {
     auto mixT0 = std::chrono::steady_clock::now();
+    audioEnableDenormalFlush();
     auto* node = reinterpret_cast<AudioService::ReflectionMixNode*>(pNode);
     ma_uint32 frameCount = *pFrameCountOut;
 
@@ -1359,8 +1769,30 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         }
     }
 
-    // If reflection pipeline not ready, just pass through.
+    // Sanitize the summed dry input before any IIR-bearing stage touches it.
+    // This is the last opportunity to catch a non-finite sample from any
+    // per-voice DSP node before it NaN-locks the master EQ biquad — once
+    // eqZ1L/eqZ2L go non-finite, every subsequent left sample is NaN for
+    // the rest of the session.
+    if (stereoOut && frameCount > 0) {
+        if (audioSanitizeInterleaved(stereoOut, frameCount)) {
+            uint32_t n = node->nanCountInput.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4) {
+                AUDIO_LOG("[NAN_GUARD] mixNode dry input had non-finite "
+                          "samples (occurrence %u)\n", n + 1);
+            }
+        }
+        // Gain-staging stage 1: peak + RMS of the post-per-voice-DSP sum
+        // (no wet bus yet, no master DSP).  This is the "starting level"
+        // against which every downstream stage's contribution is judged.
+        node->meterDryIn.measure(stereoOut, frameCount);
+    }
+
+    // If reflection pipeline not ready, just pass through.  Still measure
+    // post-wet (== dry, since there is no wet) so the log line is uniform.
     if (!node->ready || !node->simulationRan) {
+        if (stereoOut && frameCount > 0)
+            node->meterPostWet.measure(stereoOut, frameCount);
         pFrameCountIn[0] = frameCount;
         *pFrameCountOut = frameCount;
         return;
@@ -1380,20 +1812,39 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             ++wetWorkersHit;
             int front = sub.frontIdx.load(std::memory_order_acquire);
 
-            // Additive mix with gain ramp
+            // Additive mix with gain ramp.  Per-sample finite check on the
+            // wet buffers — a NaN slipped through by the convolution
+            // worker would otherwise infect stereoOut and then the EQ
+            // biquad state via `+=`.  Replace bad samples with 0 silently
+            // (the wet-workersHit log already surfaces wet bus health).
+            bool wetSawBad = false;
             for (ma_uint32 i = 0; i < outSamples; ++i) {
                 if (node->reflGain < node->reflGainTarget)
                     node->reflGain = std::min(node->reflGain + node->reflRampRate, node->reflGainTarget);
                 float g = node->reflGain;
-                float l = sub.stereoL[front][i] * g;
-                float r = sub.stereoR[front][i] * g;
+                float lRaw = sub.stereoL[front][i] * g;
+                float rRaw = sub.stereoR[front][i] * g;
+                float l = std::isfinite(lRaw) ? lRaw : (wetSawBad = true, 0.0f);
+                float r = std::isfinite(rRaw) ? rRaw : (wetSawBad = true, 0.0f);
                 stereoOut[i * 2]     += l;
                 stereoOut[i * 2 + 1] += r;
                 wetPeakL = std::max(wetPeakL, std::fabs(l));
                 wetPeakR = std::max(wetPeakR, std::fabs(r));
             }
+            if (wetSawBad) {
+                uint32_t n = node->nanCountWet.fetch_add(1, std::memory_order_relaxed);
+                if (n < 4) {
+                    AUDIO_LOG("[NAN_GUARD] mixNode wet sub-worker output had "
+                              "non-finite samples (occurrence %u)\n", n + 1);
+                }
+            }
         }
     }
+    // Gain-staging stage 2: post-wet sum.  The delta from meterDryIn shows
+    // how much energy the reflection bus is adding on top of the dry path.
+    if (stereoOut && frameCount > 0)
+        node->meterPostWet.measure(stereoOut, frameCount);
+
     // Diagnostic: log the summed wet bus peak ~once per second so we can see
     // whether reverb is actually reaching the output. Independent of which
     // voices are convolving — if wet peaks are non-zero, reverb exists in the
@@ -1483,7 +1934,24 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
 
     // Stage 1: Low-shelf EQ — adds weight to low frequencies (biquad filter).
     // Direct Form II Transposed: y[n] = b0*x[n] + z1; z1 = b1*x[n] - a1*y[n] + z2; z2 = b2*x[n] - a2*y[n]
+    //
+    // The biquad state (eqZ1L/eqZ2L/eqZ1R/eqZ2R) is the canonical place
+    // where a single bad sample silences a channel for the rest of the
+    // session — the recurrence locks NaN into the IIR.  Recover at the
+    // top of the stage if state went non-finite between callbacks, and
+    // recheck after to catch in-stage corruption.
     if (node->eqEnabled) {
+        bool eqStateBad = !std::isfinite(node->eqZ1L) || !std::isfinite(node->eqZ2L)
+                       || !std::isfinite(node->eqZ1R) || !std::isfinite(node->eqZ2R);
+        if (eqStateBad) {
+            node->eqZ1L = node->eqZ2L = 0.0f;
+            node->eqZ1R = node->eqZ2R = 0.0f;
+            uint32_t n = node->nanCountEq.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4) {
+                AUDIO_LOG("[NAN_GUARD] mixNode EQ state pre-reset to 0 "
+                          "(occurrence %u)\n", n + 1);
+            }
+        }
         for (ma_uint32 i = 0; i < frameCount; ++i) {
             // Left channel
             float xL = stereoOut[i * 2];
@@ -1499,7 +1967,29 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             node->eqZ2R = node->eqB2 * xR - node->eqA2 * yR;
             stereoOut[i * 2 + 1] = yR;
         }
+        // Post-stage state check — catches a NaN introduced mid-loop
+        // (e.g. by a denormal-edge sample interacting with stale state
+        // that was finite but pathological).  Same recovery as above.
+        if (!std::isfinite(node->eqZ1L) || !std::isfinite(node->eqZ2L)
+         || !std::isfinite(node->eqZ1R) || !std::isfinite(node->eqZ2R)) {
+            node->eqZ1L = node->eqZ2L = 0.0f;
+            node->eqZ1R = node->eqZ2R = 0.0f;
+            uint32_t n = node->nanCountEq.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4) {
+                AUDIO_LOG("[NAN_GUARD] mixNode EQ state post-reset to 0 "
+                          "(occurrence %u)\n", n + 1);
+            }
+            // Output may also contain non-finite samples written before
+            // the state went bad — sanitize to keep the compressor input
+            // clean.
+            audioSanitizeInterleaved(stereoOut, frameCount);
+        }
     }
+    // Gain-staging stage 3: post-EQ.  Delta from post-wet shows the shelf
+    // gain's contribution; if RMS jumps several dB here the EQ gain setting
+    // is eating your headroom.
+    if (stereoOut && frameCount > 0)
+        node->meterPostEq.measure(stereoOut, frameCount);
 
     // Stage 2: Compressor — linked stereo peak envelope follower.
     // Tames transients to keep loud sounds (explosions, machinery) from drowning
@@ -1511,6 +2001,18 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
     // exceeds threshold. This is mathematically equivalent to the dB formulation
     // but uses a single powf call with a precomputed exponent.
     if (node->compressorEnabled) {
+        // Reset stuck envelope at the start of the stage.  compEnvelope is
+        // also a recurrence; a NaN here would `>` always false, never
+        // recover, and zero out the gain forever.
+        if (!std::isfinite(node->compEnvelope)) {
+            node->compEnvelope = 0.0f;
+            uint32_t n = node->nanCountComp.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4) {
+                AUDIO_LOG("[NAN_GUARD] mixNode compressor envelope reset to 0 "
+                          "(occurrence %u)\n", n + 1);
+            }
+        }
+
         float threshLin = node->compThresholdLin;
         float exponent = 1.0f - 1.0f / node->compRatio;  // e.g., 2/3 for 3:1
         float makeup = node->compMakeupLin;
@@ -1519,7 +2021,14 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             float sL = stereoOut[i * 2];
             float sR = stereoOut[i * 2 + 1];
 
-            // Linked stereo peak detection
+            // Linked stereo peak detection.  std::max(NaN, x) is platform-
+            // dependent (typically returns x), so an upstream NaN that
+            // slipped past our earlier guards would silently disable
+            // envelope tracking on the NaN'd channel and leave the clean
+            // channel compressed wrong.  Force-sanitize each sample here
+            // so the envelope follower always sees finite input.
+            if (!std::isfinite(sL)) sL = 0.0f;
+            if (!std::isfinite(sR)) sR = 0.0f;
             float peak = std::max(std::fabs(sL), std::fabs(sR));
 
             // Envelope follower (attack/release asymmetric smoothing)
@@ -1539,6 +2048,12 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             stereoOut[i * 2 + 1] = sR * totalGain;
         }
     }
+    // Gain-staging stage 4: post-compressor.  Compare against post-EQ:
+    // peak should be lower (transients tamed), RMS should be similar or
+    // higher (makeup gain restoring loudness).  If post-comp RMS is well
+    // above post-EQ RMS the makeup gain is over-compensating.
+    if (stereoOut && frameCount > 0)
+        node->meterPostComp.measure(stereoOut, frameCount);
 
     // Stage 3a: Master gain — applied PRE-limiter so that boosting above 1.0
     // is reined in by the limiter rather than clipping.
@@ -1547,28 +2062,186 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         for (ma_uint32 i = 0; i < frameCount * 2; ++i)
             stereoOut[i] *= mg;
     }
+    // Gain-staging stage 5: post-master-gain.  This is the signal handed
+    // to the limiter.  Peak well above 0 dBFS here means the limiter is
+    // doing the heavy lifting; consider trimming masterGain or the comp
+    // makeup instead so the limiter only catches occasional transients.
+    if (stereoOut && frameCount > 0)
+        node->meterPostGain.measure(stereoOut, frameCount);
 
     // Stage 3b: Soft limiter — smooth tanh saturation above the knee threshold.
     // Transparent below the knee (default 0.8), smoothly curves to ±1.0 above.
     // Replaces the old hard clamp which produced audible click artifacts.
+    // The limiter's comparisons (`x > knee`, `x < -knee`) are *both* false
+    // for NaN, so NaN samples pass through unchanged.  We add an explicit
+    // finite check so the limiter is also a NaN clamp.
     if (node->limiterEnabled) {
         float knee = node->limiterKnee;
         float range = 1.0f - knee;
         float invRange = 1.0f / range;
+        uint64_t limHits = 0;  // count of samples that triggered the limiter
         for (ma_uint32 i = 0; i < frameCount * 2; ++i) {
             float x = stereoOut[i];
-            if (x > knee)
+            if (!std::isfinite(x))
+                stereoOut[i] = 0.0f;
+            else if (x > knee) {
                 stereoOut[i] = knee + range * std::tanh((x - knee) * invRange);
-            else if (x < -knee)
+                ++limHits;
+            }
+            else if (x < -knee) {
                 stereoOut[i] = -(knee + range * std::tanh((-x - knee) * invRange));
+                ++limHits;
+            }
         }
+        node->meterLimitHits += limHits;
     } else {
         // Safety hard clamp as absolute last resort (should not be reached
-        // if limiter is enabled, but guards against runaway signals)
+        // if limiter is enabled, but guards against runaway signals).
+        // Same NaN consideration as the limiter branch above.
+        uint64_t limHits = 0;
         for (ma_uint32 i = 0; i < frameCount * 2; ++i) {
-            if (stereoOut[i] > 1.0f) stereoOut[i] = 1.0f;
-            else if (stereoOut[i] < -1.0f) stereoOut[i] = -1.0f;
+            if (!std::isfinite(stereoOut[i])) stereoOut[i] = 0.0f;
+            else if (stereoOut[i] > 1.0f) { stereoOut[i] = 1.0f; ++limHits; }
+            else if (stereoOut[i] < -1.0f) { stereoOut[i] = -1.0f; ++limHits; }
         }
+        node->meterLimitHits += limHits;
+    }
+
+    // Near-clip counter: any sample with |x| > 0.99 at the *output*.  With
+    // the soft limiter engaged this should be zero in normal operation —
+    // any non-zero reading means the limiter wasn't able to bring a sample
+    // back below the danger threshold, which is the symptom of red-lining.
+    {
+        uint64_t clips = 0;
+        for (ma_uint32 i = 0; i < frameCount * 2; ++i) {
+            if (std::fabs(stereoOut[i]) > 0.99f) ++clips;
+        }
+        node->meterClipCount += clips;
+    }
+
+    // Final defence-in-depth pass: by here every IIR-bearing stage has
+    // been guarded, but a future regression in the master chain could
+    // still leak NaN/Inf to the audio device.  One last finite-clamp on
+    // the output buffer ensures Core Audio / WASAPI / ALSA never sees a
+    // non-finite sample — the symptom that motivated all of this work.
+    if (stereoOut && frameCount > 0) {
+        if (audioSanitizeInterleaved(stereoOut, frameCount)) {
+            uint32_t n = node->nanCountOutput.fetch_add(1, std::memory_order_relaxed);
+            if (n < 4) {
+                AUDIO_LOG("[NAN_GUARD] mixNode final output had non-finite "
+                          "samples (occurrence %u) — earlier guards leaked\n",
+                          n + 1);
+            }
+        }
+        // Gain-staging stage 6: final output (== device input).  Compare
+        // peak against post-gain peak to see how hard the limiter is
+        // working; compare RMS against post-gain RMS to see how much
+        // perceived loudness the limiter is costing.
+        node->meterPostLim.measure(stereoOut, frameCount);
+        node->meterTotalSamples += frameCount * 2;
+    }
+
+    // Emit a [GAIN] block periodically so the operator can tune the YAML
+    // knobs (eq.gain_db, comp.threshold_db / ratio, master_gain, limiter
+    // knee) toward "loud and oppressive without redlining."  One log block
+    // per ~1.4 seconds (64 callbacks at 1024 frames @ 48 kHz) is dense
+    // enough to follow during play, sparse enough not to flood the log.
+    constexpr uint64_t kGainLogIntervalCallbacks = 64;
+    ++node->meterBlocksSinceLog;
+    if (node->meterBlocksSinceLog >= kGainLogIntervalCallbacks) {
+        const float secs =
+            static_cast<float>(node->meterDryIn.sampleCount) /
+            static_cast<float>(sEngineSampleRate.load(std::memory_order_relaxed));
+        // One line per stage so each is greppable in isolation.
+        // Format: stage_name | peak L/R dBFS | RMS L/R dBFS
+        auto emit = [&](const char *name, const StageMeter &m) {
+            AUDIO_LOG("[GAIN] %-11s pk=%+6.1f/%+6.1f dB  rms=%+6.1f/%+6.1f dB\n",
+                      name,
+                      m.peakDbL(), m.peakDbR(),
+                      m.rmsDbL(), m.rmsDbR());
+        };
+        AUDIO_LOG("[GAIN] === %llu callbacks (%.2fs) — chain analysis ===\n",
+                  static_cast<unsigned long long>(node->meterBlocksSinceLog), secs);
+        // Steam Audio per-voice dry path.  Numbers here aggregate across
+        // every active voice in the window — a single hot voice pulls
+        // the peak up even if other voices are quiet.  Watch for
+        // sa_directO > sa_directI (3-band EQ resonating), sa_binaural >
+        // sa_directO (HRTF overshoot, Steam Audio #350), or
+        // sa_postLpf > sa_binaural (door-LPF IIR resonating).
+        emit("sa_directI", sSaMeterDirectIn);
+        emit("sa_directO", sSaMeterDirectOut);
+        emit("sa_binaural",sSaMeterBinaural);
+        emit("sa_postLpf", sSaMeterPostLpf);
+        // Steam Audio wet path (reflection convolution + ambisonics
+        // decode).  Combine all sub-workers' meters into a unified
+        // view so the [GAIN] line shows the wet bus before it lands
+        // in the master mix node's wet sum.  Watch for sa_reflW >>
+        // sa_reflIn (IR has resonant peaks — room-mode buildup in the
+        // baked reflections) or sa_decodeO >> sa_reflW (ambisonics
+        // decode HRTF amplifying excessively).
+        StageMeter combinedReflIn, combinedReflW, combinedDecodeOut;
+        if (node->convWorker) {
+            for (auto &subPtr : node->convWorker->workers) {
+                combinedReflIn.mergeIn(subPtr->saMeterReflIn);
+                combinedReflW.mergeIn(subPtr->saMeterReflW);
+                combinedDecodeOut.mergeIn(subPtr->saMeterDecodeOut);
+            }
+        }
+        emit("sa_reflI",  combinedReflIn);
+        emit("sa_reflW",  combinedReflW);
+        emit("sa_decodeO",combinedDecodeOut);
+        // Master bus stages (the chain inside this mix node).
+        emit("dry_in",   node->meterDryIn);
+        emit("post_wet", node->meterPostWet);
+        emit("post_eq",  node->meterPostEq);
+        emit("post_comp",node->meterPostComp);
+        emit("post_gain",node->meterPostGain);
+        emit("post_lim", node->meterPostLim);
+        // Activity counters — limiter hits & near-clip samples.  The
+        // hit-rate gives "how often was the limiter audibly engaged";
+        // clip count > 0 means a sample escaped the limiter (or the
+        // limiter is disabled and the safety clamp kicked in) — that's
+        // the red-line we want to drive to zero.
+        const double totalDen = node->meterTotalSamples
+            ? static_cast<double>(node->meterTotalSamples) : 1.0;
+        const double limPct = 100.0 *
+            static_cast<double>(node->meterLimitHits) / totalDen;
+        const double clipPct = 100.0 *
+            static_cast<double>(node->meterClipCount) / totalDen;
+        AUDIO_LOG("[GAIN] limiter hits=%llu (%.3f%% of samples)  "
+                  "near-clip (|x|>0.99)=%llu (%.4f%%)\n",
+                  static_cast<unsigned long long>(node->meterLimitHits), limPct,
+                  static_cast<unsigned long long>(node->meterClipCount), clipPct);
+
+        // Reset everything for the next window so values reflect recent
+        // activity rather than monotonic lifetime peaks.  Per-voice SA
+        // meters are file-scope statics; sub-worker meters live on the
+        // workers themselves.  Both are written from the audio / worker
+        // threads — resetting here from the mix-node callback is safe
+        // because the mix node fires *after* all per-voice callbacks
+        // for the same buffer cycle, and conv-worker reset is the
+        // standard accept-tearing diagnostic convention.
+        sSaMeterDirectIn.reset();
+        sSaMeterDirectOut.reset();
+        sSaMeterBinaural.reset();
+        sSaMeterPostLpf.reset();
+        if (node->convWorker) {
+            for (auto &subPtr : node->convWorker->workers) {
+                subPtr->saMeterReflIn.reset();
+                subPtr->saMeterReflW.reset();
+                subPtr->saMeterDecodeOut.reset();
+            }
+        }
+        node->meterDryIn.reset();
+        node->meterPostWet.reset();
+        node->meterPostEq.reset();
+        node->meterPostComp.reset();
+        node->meterPostGain.reset();
+        node->meterPostLim.reset();
+        node->meterClipCount = 0;
+        node->meterLimitHits = 0;
+        node->meterTotalSamples = 0;
+        node->meterBlocksSinceLog = 0;
     }
 
     pFrameCountIn[0] = frameCount;
@@ -2742,6 +3415,28 @@ void AudioService::shutdown()
 //------------------------------------------------------
 void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
 {
+    // onDBLoad fires once per loaded FileGroup with `curmask` indicating
+    // which data classes that file contributed:
+    //   • DBM_OBJTREE_GAMESYS — the gam (dark.gam) load. Global tables
+    //     live here: ENV_SOUND, Speech_DB, SchSamp, AIHearStat, AISNDTWK.
+    //   • DBM_MIS_DATA        — the mis load. Per-mission chunks live
+    //     here: ROOM_EAX, AMBIENT, L$SoundDesc.
+    // We dispatch per-mask so that loading a mission (which fires both
+    // events in sequence) populates everything, and loading the gam
+    // standalone still populates the global tables.
+
+    // ── Gamesys-level data ───────────────────────────────────────────
+    // The global sound chunk databases are stored in dark.gam, so we
+    // load them on the GAMESYS pass. Some missions also embed copies
+    // (e.g. modified schemas), so we still try the MIS pass below if
+    // GAMESYS didn't surface them — `loadSoundChunkDatabases` is
+    // idempotent and `db->hasFile` returns false for missing chunks.
+    if (curmask & DBM_OBJTREE_GAMESYS) {
+        loadSoundChunkDatabases(db);
+    }
+
+    // Everything below is mission-level — bail if this isn't the MIS
+    // pass.
     if (!(curmask & DBM_MIS_DATA))
         return;
 
@@ -2771,9 +3466,9 @@ void AudioService::onDBLoad(const FileGroupPtr &db, uint32_t curmask)
         AUDIO_LOG( "AudioService: no ROOM_EAX chunk in mission (EAX presets unavailable)\n");
     }
 
-    // Parse global sound chunk databases (ENV_SOUND, Speech_DB, SchSamp,
-    // AIHearStat, AISNDTWK). Most live in dark.gam but a mission's
-    // FileGroup includes the gamesys, so a single getFile() works.
+    // Retry global sound databases against the MIS FileGroup in case
+    // a mission overrides one (the call is idempotent — chunks already
+    // loaded on the GAMESYS pass remain unless overwritten).
     loadSoundChunkDatabases(db);
 
     // Parse mission-level sound data: AMBIENT chunk + L$SoundDesc links.
@@ -2853,9 +3548,6 @@ void AudioService::loopStep(float deltaTime)
         return;
 
     auto loopStepStart = std::chrono::steady_clock::now();
-
-    // Compute portal blend state for this frame (once, reused by all propagation calls)
-    computePortalBlend();
 
     // Update ambient volumes early so newly created ambient voices exist before
     // the simulation runs. This ensures same-frame occlusion for new ambients —
@@ -3119,19 +3811,18 @@ void AudioService::loopStep(float deltaTime)
             // rays from the doorway, not from behind a wall. Same-room voices
             // use their real position. Unreachable voices skip simulation.
             //
-            // Listener-room update: when a portal blend is active for this
-            // frame, the blend's primary room is the stable answer (set by
-            // updatePortalBlend). Otherwise route through the canonical
-            // RoomService::updatedRoom query, which always disambiguates
-            // overlapping room OBBs via portal planes. The previous
-            // implementation early-outed on Room::obbContains (renamed from
-            // isInside), which silently froze mListenerRoom inside any room
-            // whose OBB overlapped the listener's current room — producing
-            // the [ROOM-DESYNC]-class bug captured in
-            // HANDOFF.AUDIO_VOICE_INIT_STAGE2.md.
-            if (mPortalBlend.active) {
-                mListenerRoom = mPortalBlend.roomA;
-            } else if (mRoomService) {
+            // Listener-room update: canonical RoomService::updatedRoom
+            // query — always disambiguates overlapping room OBBs via
+            // portal planes (the disambiguator polarity fix from the
+            // 2026-05 cleanup made this deterministic). Previous
+            // implementation also gated on a portal-blend state to
+            // sustain the room assignment near boundaries; that blend
+            // has been removed because its hysteresis produced
+            // asymmetric "louder walking away" volume artifacts —
+            // matches the original engine which has no propagation
+            // hysteresis. See NOTES.PROJECT.md "Sound Propagation
+            // Model".
+            if (mRoomService) {
                 mListenerRoom = mRoomService->updatedRoom(mListenerRoom, mListenerPos);
             } else {
                 mListenerRoom = nullptr;
@@ -3192,8 +3883,8 @@ void AudioService::loopStep(float deltaTime)
                     // propagating at ~25 ft of portal-graph path even
                     // through open archways. Matches Dark Engine
                     // m_MaxDistance per-source semantics.
-                    prop = propagateSoundBlended(voice->worldPos,
-                                                 voice->maxAudibleDist);
+                    prop = propagateSound(voice->worldPos, mListenerPos,
+                                          voice->maxAudibleDist);
                     auto prT1 = std::chrono::steady_clock::now();
                     float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
                     sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
@@ -3887,6 +4578,14 @@ void AudioService::convolutionSubWorkerMain(int workerIdx)
     auto &sub = *cw.workers[workerIdx];
     uint64_t lastSeq = 0;
 
+    // Convolution sub-workers run their own DSP (iplReflectionEffectApply,
+    // iplAmbisonicsDecodeEffectApply) on dedicated threads.  Enable FTZ so
+    // the per-thread MXCSR / FPCR matches the audio thread's denormal
+    // handling — otherwise long-tail IRs can decay into denormals and
+    // produce performance cliffs that look indistinguishable from broken
+    // audio.
+    audioEnableDenormalFlush();
+
     while (!sub.shutdown.load(std::memory_order_relaxed)) {
         // Wait for the mix node to signal new data
         uint64_t seq = sub.frameSeq.load(std::memory_order_acquire);
@@ -3959,7 +4658,21 @@ void AudioService::convolutionSubWorkerMain(int workerIdx)
             reflOut.numSamples = static_cast<IPLint32>(slot.reflFrameSize);
             reflOut.data = ambiPtrs;
 
-            // Apply convolution, accumulating into this sub-worker's mixer
+            // Gain-staging: record the mono input level to convolution
+            // (per voice, this sub-worker only).  The convolution IR can
+            // be tens of thousands of samples long and accumulates a
+            // ringing tail; the saMeterReflW (measured AFTER the mixer
+            // apply, below) vs saMeterReflIn ratio captures how much
+            // energy the IRs are adding for the current listener/source
+            // set.
+            sub.saMeterReflIn.measureMono(monoPtr, slot.reflFrameSize);
+
+            // Apply convolution, accumulating into this sub-worker's
+            // mixer.  Important: when the 5th arg (mixer) is non-null,
+            // Steam Audio writes the per-voice result *into the mixer*
+            // and leaves reflOut/ambiPtrs untouched — so we cannot
+            // measure per-voice W here.  W is measured once after
+            // iplReflectionMixerApply extracts the summed result below.
             iplReflectionEffectApply(slot.effect, &slot.params,
                                       &reflIn, &reflOut, sub.mixer);
 
@@ -4039,6 +4752,17 @@ void AudioService::convolutionSubWorkerMain(int workerIdx)
         mixerParams.numChannels = nch;
         iplReflectionMixerApply(sub.mixer, &mixerParams, &ambiOut);
 
+        // Gain-staging: now that the mixer has extracted the summed
+        // per-voice convolution into ambiCh0..3, measure the W channel
+        // (ambiCh0 == 0th SH coefficient == total omni energy).  This
+        // is the correct measurement point — measuring inside the
+        // iplReflectionEffectApply loop reads stale data because that
+        // call routes the per-voice result into the mixer when the
+        // mixer arg is non-null.  A peak here significantly above
+        // sa_reflI is the resonance signature for the convolution IR.
+        if (!sub.ambiCh0.empty())
+            sub.saMeterReflW.measureMono(sub.ambiCh0.data(), reflFrameCount);
+
         // Decode ambisonics to binaural stereo
         float *decodedPtrs[2] = {sub.decodedL.data(), sub.decodedR.data()};
         IPLAudioBuffer decodedBuf{};
@@ -4053,6 +4777,24 @@ void AudioService::convolutionSubWorkerMain(int workerIdx)
         decodeParams.binaural = IPL_TRUE;
         iplAmbisonicsDecodeEffectApply(sub.ambiDecodeEffect, &decodeParams,
                                         &ambiOut, &decodedBuf);
+
+        // Sanitize the decoded stereo from the ambisonics decoder before it
+        // lands in the front buffer that the master mix node reads.  A NaN
+        // here would otherwise propagate into stereoOut at line ~1588 and
+        // poison the master EQ.  The mix node has its own guard for this
+        // (nanCountWet) but stopping it at the source is cheaper and gives
+        // the worker thread credit for the detection in the log.
+        audioSanitizeBuffer(sub.decodedL.data(), reflFrameCount);
+        audioSanitizeBuffer(sub.decodedR.data(), reflFrameCount);
+
+        // Gain-staging: post-decode stereo.  The mix node combines this
+        // with all sub-workers' meters via StageMeter::mergeIn so the
+        // [GAIN] dump shows a unified wet bus level.  Peak above the
+        // saMeterReflW peak indicates the ambisonics decoder + HRTF is
+        // amplifying — usually fine and expected (HRTF can boost) but
+        // useful to watch alongside the dry binaural meter.
+        sub.saMeterDecodeOut.measureDeinterleaved(
+            sub.decodedL.data(), sub.decodedR.data(), reflFrameCount);
 
         // Write decoded stereo to this sub-worker's back buffer.
         // Handle upsampling from reflection rate to device rate.
@@ -5519,6 +6261,228 @@ void AudioService::loadMiscSoundProperties()
 }
 
 //------------------------------------------------------
+std::string AudioService::getProjectileSound(int32_t objID) const
+{
+    if (!mPropertyService) return std::string();
+
+    // Walk the MetaProp inheritance chain to find the archetype that
+    // actually stores the schema name. Property::getEffectiveID handles
+    // the chain walk for us; for concrete projectile instances spawned
+    // from an archetype, this maps back to the negative archetype ID
+    // where mProjectileSounds keeps the entry.
+    Property *prj = mPropertyService->getProperty("PrjSound");
+    if (!prj) return std::string();
+    int effective = prj->getEffectiveID(objID);
+    if (effective == 0) return std::string();
+    auto it = mProjectileSounds.find(effective);
+    if (it == mProjectileSounds.end()) return std::string();
+    return it->second;
+}
+
+//------------------------------------------------------
+// AI speech utterance — Speech_DB-driven schema selection + playback.
+//
+// Resolves the emitter's voice (P$VoiceIdx preferred — raw int32 voice
+// index; falls back to P$SpchVoice for completeness even though stock
+// Thief 2 lacks a voice-name lookup table in Speech_DB) via the MetaProp
+// inheritance chain, queries the SpeechSelector for matching schemas,
+// resolves the chosen schema-archetype objID → schema name via
+// ObjectService, starts a voice via the normal schema-play path, and
+// publishes a SoundEmissionEvent so AIHearingService sees it.
+//
+// Fire-and-forget: returns SoundHandle for callers that want to halt;
+// most callers ignore the return value.
+SoundHandle AudioService::playSpeech(int32_t emitterObjID,
+                                     const std::string &conceptName,
+                                     const std::vector<SchemaTagValue> &tags)
+{
+    if (!mAudioReady || !mSchemaParser) return SOUND_HANDLE_INVALID;
+    if (!mPropertyService || !mObjectService) return SOUND_HANDLE_INVALID;
+    if (!mSpeechDB || !mSpeechDB->isLoaded()) {
+        // Loud fallback — speech DB never loaded means every playSpeech
+        // call is silently a no-op without this. Log once per missing
+        // concept by appending the concept name to the message.
+        std::fprintf(stderr,
+            "[FALLBACK] AudioService::playSpeech: Speech_DB not loaded; "
+            "cannot play concept '%s' on obj %d\n",
+            conceptName.c_str(), emitterObjID);
+        return SOUND_HANDLE_INVALID;
+    }
+
+    // ── Resolve voice index ───────────────────────────────────────────
+    //
+    // P$VoiceIdx is the canonical source on AI archetypes (e.g. Karras=2).
+    // We walk the MetaProp chain via Property::getEffectiveID so concrete
+    // AI instances resolve to the archetype that actually carries the
+    // property. P$SpchVoice is the legacy 16-byte label — we read it for
+    // completeness, but the stock Speech_DB does not embed a voice-name
+    // lookup, so the label path is currently always "no match" and falls
+    // back to the loud-fallback branch below.
+    int32_t voiceIndex = -1;
+    if (Property *prop = mPropertyService->getProperty("VoiceIdx")) {
+        int eff = prop->getEffectiveID(emitterObjID);
+        if (eff != 0) {
+            if (DataStorage *st = prop->getStorage()) {
+                size_t sz = 0;
+                const uint8_t *bytes = st->getRawData(eff, sz);
+                if (bytes && sz >= sizeof(int32_t)) {
+                    int32_t v;
+                    std::memcpy(&v, bytes, sizeof(int32_t));
+                    voiceIndex = v;
+                }
+            }
+        }
+    }
+    if (voiceIndex < 0) {
+        // Try P$SpchVoice — informational; resolved by selector if the
+        // speech domain ever ships with a voice-name map.
+        if (Property *prop = mPropertyService->getProperty("SpchVoice")) {
+            int eff = prop->getEffectiveID(emitterObjID);
+            if (eff != 0) {
+                if (DataStorage *st = prop->getStorage()) {
+                    size_t sz = 0;
+                    const uint8_t *bytes = st->getRawData(eff, sz);
+                    if (bytes && sz >= 16) {
+                        char buf[17] = {0};
+                        std::memcpy(buf, bytes, 16);
+                        SpeechSelector tmp(*mSpeechDB);
+                        voiceIndex = tmp.findVoiceByName(
+                            std::string(buf, ::strnlen(buf, 16)));
+                    }
+                }
+            }
+        }
+    }
+    if (voiceIndex < 0) {
+        std::fprintf(stderr,
+            "[FALLBACK] AudioService::playSpeech: obj %d has no P$VoiceIdx "
+            "(nor a resolvable P$SpchVoice) for concept '%s'\n",
+            emitterObjID, conceptName.c_str());
+        return SOUND_HANDLE_INVALID;
+    }
+
+    // ── Translate SchemaTagValue → SpeechSelector::TagQuery ───────────
+    //
+    // SchemaTagValue is the .sch-parser flavour (enumValues+rangeMin/Max);
+    // SpeechSelector::TagQuery is the runtime flavour (intValue|enumValues).
+    // The bridge keeps the selector's API independent of schema-parser
+    // types — the selector is purely about Speech_DB shape.
+    std::vector<SpeechSelector::TagQuery> query;
+    query.reserve(tags.size());
+    for (const auto &t : tags) {
+        SpeechSelector::TagQuery q;
+        q.tagName = t.tagName;
+        if (t.isIntRange) {
+            // Caller-supplied int ranges collapse to the midpoint when
+            // passed to a leaf range check; we just pass the min through
+            // since stock Thief 2 query sites always set min==max for
+            // exact-value integer tags (e.g. Damage=37).
+            q.hasInt   = true;
+            q.intValue = t.rangeMin;
+        }
+        q.enumValues = t.enumValues;
+        query.push_back(std::move(q));
+    }
+
+    // ── Run the selector ─────────────────────────────────────────────
+    SpeechSelector sel(*mSpeechDB);
+    sel.seed(mRng());  // re-seed from the AudioService RNG so picks vary
+    auto matches = sel.selectMatches(voiceIndex, conceptName, query);
+    if (matches.empty()) {
+        std::fprintf(stderr,
+            "[FALLBACK] AudioService::playSpeech: no Speech_DB match for "
+            "voice=%d concept='%s' (%zu query tags) on obj %d\n",
+            voiceIndex, conceptName.c_str(), tags.size(), emitterObjID);
+        return SOUND_HANDLE_INVALID;
+    }
+    auto pick = sel.pickOne(matches, mRng);
+    if (pick.schemaObjID == 0) return SOUND_HANDLE_INVALID;
+
+    // ── Resolve schema-archetype objID → schema name → SchemaEntry ───
+    //
+    // The selector returns the schema-archetype object ID baked into
+    // Speech_DB. ObjectService maps it back to its SymName (the schema
+    // name as registered in the .sch parser).
+    std::string schemaName = mObjectService->getName(pick.schemaObjID);
+    if (schemaName.empty()) {
+        std::fprintf(stderr,
+            "[FALLBACK] AudioService::playSpeech: schema archetype %d has "
+            "no SymName (voice=%d concept='%s')\n",
+            pick.schemaObjID, voiceIndex, conceptName.c_str());
+        return SOUND_HANDLE_INVALID;
+    }
+    const SchemaEntry *schema = mSchemaParser->findSchema(schemaName);
+    if (!schema || schema->samples.empty()) {
+        std::fprintf(stderr,
+            "[FALLBACK] AudioService::playSpeech: schema '%s' (obj %d) not "
+            "registered or has no samples\n",
+            schemaName.c_str(), pick.schemaObjID);
+        return SOUND_HANDLE_INVALID;
+    }
+
+    // ── Pick a sample and start the voice ────────────────────────────
+    //
+    // Mirrors playSchema: frequency-weighted random sample selection with
+    // SCH_NO_REPEAT honored via mLastSampleIdx (keyed by schema name).
+    std::vector<int> freqs;
+    freqs.reserve(schema->samples.size());
+    for (const auto &s : schema->samples) freqs.push_back(s.frequency);
+    int totalFreq = schema->totalFrequency();
+    if (totalFreq <= 0) return SOUND_HANDLE_INVALID;
+
+    int idx = selectSample(schemaName,
+                           static_cast<int>(schema->samples.size()),
+                           totalFreq, freqs.data());
+    if (idx < 0 || idx >= static_cast<int>(schema->samples.size()))
+        return SOUND_HANDLE_INVALID;
+    if ((schema->playParams.flags & SCH_NO_REPEAT)
+        && schema->samples.size() > 1)
+    {
+        auto it = mLastSampleIdx.find(schemaName);
+        if (it != mLastSampleIdx.end() && it->second == idx) {
+            idx = selectSample(schemaName,
+                               static_cast<int>(schema->samples.size()),
+                               totalFreq, freqs.data());
+            if (idx < 0 || idx >= static_cast<int>(schema->samples.size()))
+                return SOUND_HANDLE_INVALID;
+        }
+    }
+    mLastSampleIdx[schemaName] = idx;
+
+    const SchemaSample &sample = schema->samples[idx];
+
+    // Use the emitter's live position (never frozen at spawn) so AI
+    // speech follows the emitter as it moves between rooms.
+    Vector3 pos = mObjectService->position(emitterObjID);
+    float vol  = schemaVolumeToLinear(schema->playParams.volume);
+    bool looping = schema->loopParams.isLooping;
+
+    SoundHandle h = startVoice(schemaName, sample.name, pos,
+                               schema->playParams.priority, looping,
+                               emitterObjID, vol, VoiceClass::Normal);
+    if (h == SOUND_HANDLE_INVALID) return h;
+
+    // ── Publish to AI hearing / debug listeners ──────────────────────
+    //
+    // soundType=0 (Untyped) — speech doesn't carry a P$AI_SndTyp by
+    // default; AI hearing will treat it as untyped and apply default
+    // range. The schema's authored volume (millibels) is forwarded as
+    // gainDb so listeners can apply per-type loudness biasing. baseRange
+    // is the schema's nominal radius if exposed; we pass the propagation
+    // cap as a conservative default — AIHearingService re-derives its
+    // own range from the AISNDTWK ranges anyway.
+    SoundEmissionEvent ev{};
+    ev.emitterObjID = emitterObjID;
+    ev.position     = pos;
+    ev.schemaName   = schemaName;
+    ev.soundType    = 0;
+    ev.baseRange    = mPropagationMaxDist;
+    ev.gainDb       = static_cast<float>(schema->playParams.volume);
+    publishSoundEmission(ev);
+    return h;
+}
+
+//------------------------------------------------------
 void AudioService::loadSpotAmbients()
 {
     if (!mPropertyService || !mObjectService)
@@ -5587,16 +6551,21 @@ void AudioService::loadSpotAmbients()
 //------------------------------------------------------
 void AudioService::updateSpotAmbientVolumes()
 {
-    // Per-frame envelope evaluation for spot ambients. Currently this
-    // computes the target volume for diagnostic purposes; actual voice
-    // playback for spot-ambient instances is a follow-up — the runtime
-    // path is shared with updateAmbientVolumes but uses the envelope
-    // (inner/outer/level) instead of the radius-based curve.
+    // Per-frame envelope evaluation and voice lifecycle for spot ambients.
+    // Mirrors updateAmbientVolumes' start/stop/update pattern but uses the
+    // hard inner/outer envelope (P$SpotAmb) instead of the radius-based
+    // SHARP/linear curve.
     //
     // Envelope (per the original engine):
     //   d <= inner          → volume = level
     //   inner < d < outer   → volume = level * (outer - d) / (outer - inner)
     //   d >= outer          → volume = 0
+    //
+    // `level` is interpreted as a millibel gain (same convention as
+    // AmbientSound::volume). Positive values are clamped to unity by
+    // schemaVolumeToLinear; negative values attenuate. When envVol > 0 a
+    // voice is started/maintained; at envVol == 0 (d ≥ outer) the voice
+    // is halted with a short fade.
     if (mSpotAmbients.empty())
         return;
 
@@ -5607,20 +6576,97 @@ void AudioService::updateSpotAmbientVolumes()
     if (emitLog) spotDebugTimer = 0.0f;
 
     int audible = 0;
-    for (const auto &se : mSpotAmbients) {
+    int playing = 0;
+    for (auto &se : mSpotAmbients) {
         float d = glm::distance(mListenerPos, se.position);
-        float vol = 0.0f;
+
+        // Envelope-faded target gain (in the same domain as se.level).
+        float envVol;
         if (d <= se.inner) {
-            vol = se.level;
-        } else if (d < se.outer) {
-            float t = (se.outer - d) / (se.outer - se.inner);
-            vol = se.level * t;
+            envVol = se.level;
+        } else if (d >= se.outer) {
+            envVol = 0.0f;
+        } else {
+            envVol = se.level * (se.outer - d) / (se.outer - se.inner);
         }
-        if (vol > 0.0f) ++audible;
+
+        if (envVol > 0.0f) ++audible;
+
+        if (envVol > 0.0f) {
+            // In range — ensure a voice is playing and update its volume.
+            bool justCreated = false;
+            if (se.handle == SOUND_HANDLE_INVALID) {
+                if (se.schemaName.empty()) {
+                    // Unresolved schema — can't start anything. Skip
+                    // (already counted in the load-time diagnostic).
+                    continue;
+                }
+                if (!mSchemaParser) continue;
+                const SchemaEntry *schema = mSchemaParser->findSchema(se.schemaName);
+                if (!schema || schema->samples.empty()) continue;
+                const SchemaSample &sample = schema->samples[0];
+                // Spot ambients are looping by definition (they describe a
+                // sustained sound bubble around an emitter). Use the
+                // Ambient voice class so they get the same diffuse
+                // spatialBlend treatment as room-attached ambients.
+                bool isLooping = true;
+                VoiceClass cls = VoiceClass::Ambient;
+                // Start at volume 0 — the volume is set below on the same
+                // frame (the silent-defaults-until-occlusion concern that
+                // applies to AmbientHack-style ambients doesn't apply
+                // here: the envelope has already established audibility).
+                se.handle = startVoice(se.schemaName, sample.name, se.position,
+                                       schema->playParams.priority, isLooping,
+                                       se.objID, 0.0f, cls);
+                if (se.handle != SOUND_HANDLE_INVALID && mVoices.count(se.handle)) {
+                    justCreated = true;
+                    auto vIt = mVoices.find(se.handle);
+                    if (vIt != mVoices.end()) {
+                        // Cap BFS propagation at the outer envelope — past
+                        // outer the source is silent anyway.
+                        vIt->second->maxAudibleDist = se.outer;
+                        // Match AMB_ENVIRONMENTAL diffuse-spatialBlend
+                        // treatment so the source feels diffuse rather
+                        // than pinpoint.
+                        vIt->second->dspNode.spatialBlendOverride.store(
+                            mAmbEnvironmentalSpatialBlend,
+                            std::memory_order_relaxed);
+                    }
+                }
+            }
+
+            if (se.handle != SOUND_HANDLE_INVALID) {
+                auto it = mVoices.find(se.handle);
+                if (it == mVoices.end()) {
+                    // Voice died (e.g. priority eviction). Clear and let
+                    // the next frame attempt re-creation.
+                    se.handle = SOUND_HANDLE_INVALID;
+                    continue;
+                }
+                // Interpret envVol as a millibel gain (matches
+                // AmbientSound::volume convention). Apply duck multiplier
+                // inline, same as updateAmbientVolumes.
+                float linearVol = schemaVolumeToLinear(static_cast<int>(envVol));
+                float duck = (mReflectionMixNode && mReflectionMixNode->duckingEnabled)
+                             ? mReflectionMixNode->duckGain : 1.0f;
+                ma_sound_set_volume(&it->second->sound, linearVol * duck);
+                if (!justCreated) ++playing;
+                else ++playing;
+            }
+        } else {
+            // Out of envelope — stop the voice if one is playing. Use a
+            // long fade so the trailing edge is graceful (mirrors the
+            // 200ms used in updateAmbientVolumes).
+            if (se.handle != SOUND_HANDLE_INVALID) {
+                haltSound(se.handle, /*fadeMs=*/200);
+                se.handle = SOUND_HANDLE_INVALID;
+            }
+        }
     }
     if (emitLog && audible > 0) {
-        AUDIO_LOG("AudioService: [SPOT_AMB] %d/%zu spot ambient(s) audible\n",
-                  audible, mSpotAmbients.size());
+        AUDIO_LOG("AudioService: [SPOT_AMB] %d/%zu spot ambient(s) audible "
+                  "(%d voice(s) active)\n",
+                  audible, mSpotAmbients.size(), playing);
     }
 }
 
@@ -5646,56 +6692,59 @@ static bool readChunkBytes(const FileGroupPtr &db, const std::string &name,
 
 void AudioService::loadSoundChunkDatabases(const FileGroupPtr &db)
 {
+    // Idempotent: only the chunks actually present in this FileGroup
+    // are reparsed. Chunks loaded on a prior pass (e.g. the GAMESYS
+    // pass) survive the subsequent MIS pass intact when the MIS doesn't
+    // include them. This lets onDBLoad fire twice during a mission load
+    // (once for dark.gam, once for the mis) without clobbering global
+    // tables.
+
     // ENV_SOUND — compiled environmental-sound tag database.
-    mEnvSoundDB.reset();
     {
         std::vector<uint8_t> bytes;
         if (readChunkBytes(db, "ENV_SOUND", bytes)) {
-            mEnvSoundDB = std::make_unique<EnvSoundDatabase>();
-            if (mEnvSoundDB->loadFromChunk(bytes.data(), bytes.size())) {
+            auto fresh = std::make_unique<EnvSoundDatabase>();
+            if (fresh->loadFromChunk(bytes.data(), bytes.size())) {
+                mEnvSoundDB = std::move(fresh);
                 AUDIO_LOG("AudioService: parsed ENV_SOUND chunk (%zu bytes)\n",
                           bytes.size());
             } else {
                 AUDIO_LOG("AudioService: failed to parse ENV_SOUND chunk "
-                          "(%zu bytes) — ignoring\n", bytes.size());
-                mEnvSoundDB.reset();
+                          "(%zu bytes) — keeping prior state\n", bytes.size());
             }
         }
     }
 
     // Speech_DB — compiled speech voice/concept database.
-    mSpeechDB.reset();
     {
         std::vector<uint8_t> bytes;
         if (readChunkBytes(db, "Speech_DB", bytes)) {
-            mSpeechDB = std::make_unique<SpeechDatabase>();
-            if (mSpeechDB->loadFromChunk(bytes.data(), bytes.size())) {
+            auto fresh = std::make_unique<SpeechDatabase>();
+            if (fresh->loadFromChunk(bytes.data(), bytes.size())) {
+                mSpeechDB = std::move(fresh);
                 AUDIO_LOG("AudioService: parsed Speech_DB chunk (%zu bytes)\n",
                           bytes.size());
-            } else {
-                mSpeechDB.reset();
             }
         }
     }
 
     // SchSamp — canonical schema → samples mapping.
-    mSchemaSamplesDB.reset();
     {
         std::vector<uint8_t> bytes;
         if (readChunkBytes(db, "SchSamp", bytes)) {
-            mSchemaSamplesDB = std::make_unique<SchemaSamplesChunk>();
-            if (mSchemaSamplesDB->loadFromChunk(bytes.data(), bytes.size())) {
+            auto fresh = std::make_unique<SchemaSamplesChunk>();
+            if (fresh->loadFromChunk(bytes.data(), bytes.size())) {
+                mSchemaSamplesDB = std::move(fresh);
                 AUDIO_LOG("AudioService: parsed SchSamp chunk: %zu records\n",
                           mSchemaSamplesDB->recordCount());
             } else {
-                AUDIO_LOG("AudioService: failed to parse SchSamp chunk\n");
-                mSchemaSamplesDB.reset();
+                AUDIO_LOG("AudioService: failed to parse SchSamp chunk — "
+                          "keeping prior state\n");
             }
         }
     }
 
     // AIHearStat — per-rating distance/dB hearing-stats globals.
-    mHasAIHearingStats = false;
     {
         std::vector<uint8_t> bytes;
         if (readChunkBytes(db, "AIHearStat", bytes)) {
@@ -5704,7 +6753,7 @@ void AudioService::loadSoundChunkDatabases(const FileGroupPtr &db)
                 std::memcpy(mAIHearingStatsBytes, &stats, sizeof(stats));
                 mHasAIHearingStats = true;
                 AUDIO_LOG("AudioService: parsed AIHearStat chunk "
-                          "(dist_muls[normal]=%.2f, db_adds[normal]=%.0f)\n",
+                          "(dist_muls[normal]=%.2f, db_adds[normal]=%d)\n",
                           stats.dist_muls[AI_HEARING_NORMAL],
                           stats.db_adds[AI_HEARING_NORMAL]);
             }
@@ -5712,7 +6761,6 @@ void AudioService::loadSoundChunkDatabases(const FileGroupPtr &db)
     }
 
     // AISNDTWK — per-sound-type default audible-range globals.
-    mHasAISoundTweaks = false;
     {
         std::vector<uint8_t> bytes;
         if (readChunkBytes(db, "AISNDTWK", bytes)) {
@@ -5732,21 +6780,27 @@ void AudioService::loadSoundChunkDatabases(const FileGroupPtr &db)
 //------------------------------------------------------
 void AudioService::loadMissionSoundData(const FileGroupPtr &db)
 {
-    // AMBIENT (4 bytes in MISS6) — mission-level ambient enable/flag.
-    // Original engine uses this to gate the ambient layer at level
-    // start; we capture it so the runtime can honor the same semantics.
+    // AMBIENT (4 bytes) — single int32 ObjID of the environmental
+    // ambient that was active at save time. 0 == none. NOT a level-wide
+    // enable flag (spot ambients are independent and always run on
+    // proximity). All 15 shipping Thief 2 missions ship with 0 except
+    // miss14, which ships with a nonzero env-ambient objID pre-set as
+    // the level-start environmental sound. Resume / level-start playback
+    // of that one ambient is deferred until the env-ambient runtime
+    // lands (currently only spot ambients are wired up).
     mHasAmbientChunk = false;
-    mAmbientChunkValue = 0;
+    mEnvAmbientObjID = 0;
     if (db->hasFile("AMBIENT")) {
         FilePtr f = db->getFile("AMBIENT");
-        if (f && f->size() >= sizeof(uint32_t)) {
-            uint32_t value = 0;
+        if (f && f->size() >= sizeof(int32_t)) {
+            int32_t value = 0;
             f->seek(0);
             *f >> value;
-            mAmbientChunkValue = value;
+            mEnvAmbientObjID = value;
             mHasAmbientChunk = true;
-            AUDIO_LOG("AudioService: parsed AMBIENT chunk = 0x%08x (%u)\n",
-                      value, value);
+            AUDIO_LOG("AudioService: AMBIENT chunk envObjID=%d%s\n",
+                      value,
+                      value == 0 ? " (no pre-set env ambient)" : "");
         }
     }
 
@@ -5981,6 +7035,22 @@ void AudioService::updateAmbientVolumes()
                             mAmbEnvironmentalSpatialBlend,
                             std::memory_order_relaxed);
                     }
+                }
+
+                // Fan out a sound-emission event so AI hearing /
+                // diagnostic listeners can observe the new ambient.
+                // soundType defaults to Untyped (0); ambients aren't
+                // typed in P$AmbientHack. gainDb uses the schema-
+                // authored volume (millibels — caller can interpret).
+                if (justCreated && amb.handle != SOUND_HANDLE_INVALID) {
+                    SoundEmissionEvent ev{};
+                    ev.emitterObjID = amb.objID;
+                    ev.position     = amb.position;
+                    ev.schemaName   = amb.schemaName;
+                    ev.soundType    = 0; // Untyped — ambients don't carry an AI sound type
+                    ev.baseRange    = amb.radius;
+                    ev.gainDb       = static_cast<float>(amb.volume);
+                    publishSoundEmission(ev);
                 }
             }
 
@@ -6419,209 +7489,6 @@ void AudioService::playLanding(const Vector3 &pos, float fallSpeed, int textureI
     }
 }
 
-// ── Portal blend: smooth room transitions ──
-
-//------------------------------------------------------
-void AudioService::computePortalBlend()
-{
-    if (!mRoomService || !mRoomService->isLoaded()) {
-        mPortalBlend = {};
-        return;
-    }
-
-    constexpr float kBlendRadius = 3.0f;
-
-    // If blend is already active, KEEP the existing roomA/roomB assignment
-    // and only update the blend weight. This prevents the room assignment from
-    // flickering frame-to-frame in narrow hallways where roomFromPoint returns
-    // different rooms on each frame.
-    //
-    // Sustain path: only check plane distance, NOT polygon containment.
-    // The initial detection validates isInside() to pick the right portal,
-    // but the sustain path must be lenient — the listener can slide along
-    // a wall near a portal and temporarily leave the polygon projection
-    // while still being in the blend zone. Checking isInside here caused
-    // blend to drop and re-engage every frame, oscillating all attenuation.
-    // Use a wider exit threshold (2x blend radius) for hysteresis.
-    constexpr float kExitRadius = kBlendRadius * 2.0f;
-    if (mPortalBlend.active && mPortalBlend.roomA && mPortalBlend.roomB) {
-        RoomPortal *activePortal = nullptr;
-        float activeDist = 0.0f;
-
-        // Search roomA's portals for one connecting to roomB
-        for (uint32_t i = 0; i < mPortalBlend.roomA->getPortalCount(); ++i) {
-            RoomPortal *p = mPortalBlend.roomA->getPortal(i);
-            if (p && p->getFarRoom() == mPortalBlend.roomB) {
-                float d = std::fabs(p->getPlane().getDistance(mListenerPos));
-                // Sustain: only plane distance, no isInside — wider exit zone
-                if (d < kExitRadius) {
-                    activePortal = p;
-                    activeDist = p->getPlane().getDistance(mListenerPos);
-                    break;
-                }
-            }
-        }
-
-        if (activePortal) {
-            // Still in the blend zone — update weight only, keep rooms pinned.
-            // Use the original blend radius for the weight calculation so the
-            // blend reaches 0/1 at the boundary. Beyond kBlendRadius the weight
-            // clamps to 0 or 1, but the blend stays active until kExitRadius.
-            float blend = 0.5f - activeDist / (2.0f * kBlendRadius);
-            mPortalBlend.blend = std::max(0.0f, std::min(1.0f, blend));
-            return;
-        }
-
-        // Left the exit zone — deactivate and fall through to fresh detection
-        mPortalBlend = {};
-    }
-
-    // Fresh portal detection: find the closest portal to the listener
-    Room *primaryRoom = mRoomService->roomFromPoint(mListenerPos);
-    if (!primaryRoom) {
-        mPortalBlend = {};
-        return;
-    }
-
-    float bestAbsDist = kBlendRadius;
-    RoomPortal *bestPortal = nullptr;
-    float bestSignedDist = 0.0f;
-
-    uint32_t portalCount = primaryRoom->getPortalCount();
-    for (uint32_t i = 0; i < portalCount; ++i) {
-        RoomPortal *portal = primaryRoom->getPortal(i);
-        if (!portal || !portal->getFarRoom())
-            continue;
-
-        float signedDist = portal->getPlane().getDistance(mListenerPos);
-        float absDist = std::fabs(signedDist);
-
-        if (absDist >= bestAbsDist)
-            continue;
-
-        if (!portal->isInside(mListenerPos))
-            continue;
-
-        bestAbsDist = absDist;
-        bestPortal = portal;
-        bestSignedDist = signedDist;
-    }
-
-    if (!bestPortal) {
-        mPortalBlend = {};
-        return;
-    }
-
-    float blend = 0.5f - bestSignedDist / (2.0f * kBlendRadius);
-    blend = std::max(0.0f, std::min(1.0f, blend));
-
-    mPortalBlend.active = true;
-    mPortalBlend.roomA  = primaryRoom;
-    mPortalBlend.roomB  = bestPortal->getFarRoom();
-    mPortalBlend.blend  = blend;
-}
-
-//------------------------------------------------------
-SoundPropInfo AudioService::propagateSoundBlended(const Vector3 &sourcePos,
-                                                   float maxDist) const
-{
-    if (!mPortalBlend.active) {
-        return propagateSound(sourcePos, mListenerPos, maxDist);
-    }
-
-    // Resolve source room once (shared between both calls)
-    Room *sourceRoom = mRoomService ? mRoomService->roomFromPoint(sourcePos) : nullptr;
-
-    // ── Same-room short-circuit ──
-    //
-    // When the listener's ACTUAL position resolves to the same room as
-    // the source, the path is geometrically direct — there is no portal
-    // between them to traverse. Bypass the two-BFS blend in that case
-    // and use the listener-actual room for the path computation
-    // (matches the original Dark Engine, which always uses the listener
-    // object's actual room as the BFS endpoint — see PSNDINST.CPP's
-    // EnterCallback / FindSoundPath).
-    //
-    // Why this is needed: `mPortalBlend.active` extends for a
-    // kExitRadius zone past the portal plane, during which one BFS
-    // computation is pinned to the listener's previous room (roomA).
-    // If the listener has geometrically crossed to the source's room
-    // but is still inside that exit zone, propA's BFS assumes
-    // listener-in-roomA but the actual listener position is on the
-    // source's side of the portal. The source→listener ray then
-    // doesn't cross the portal cleanly (near-parallel or hit point
-    // outside the polygon) → anchor projection produces a corner
-    // virtualPosition → inflated effective distance → audio cuts out.
-    // Same-room short-circuiting eliminates that case while leaving
-    // the blend system intact for genuine cross-room transitions.
-    Room *actualListenerRoom = mRoomService
-        ? mRoomService->roomFromPoint(mListenerPos) : nullptr;
-    if (sourceRoom && actualListenerRoom == sourceRoom) {
-        return propagateSound(sourcePos, mListenerPos,
-                              sourceRoom, sourceRoom, maxDist);
-    }
-
-    // Propagate assuming listener is in roomA
-    SoundPropInfo propA = propagateSound(sourcePos, mListenerPos,
-                                          sourceRoom, mPortalBlend.roomA, maxDist);
-    // Propagate assuming listener is in roomB
-    SoundPropInfo propB = propagateSound(sourcePos, mListenerPos,
-                                          sourceRoom, mPortalBlend.roomB, maxDist);
-
-    float t = mPortalBlend.blend;
-
-    // If neither side reached, nothing audible — return an unreached result
-    // so downstream BFS-failed handling (silence + full LPF) applies.
-    if (!propA.reached && !propB.reached) return propA;
-
-    // One-sided BFS reachability: instead of short-circuiting to the
-    // reaching side (which causes a one-frame jump as t evolves across
-    // the blend zone — virtualPosition, effectiveDistance, etc. all
-    // teleport at the threshold where reachability flips), synthesize a
-    // "barely-audible" placeholder for the failing side and let the
-    // standard lerp below produce a smooth transition.
-    //
-    // The placeholder is constructed so that:
-    //   • effectiveDistance is very large → (real/eff)² → 0 in the
-    //     downstream portalAttenuation formula, i.e. the failing side
-    //     contributes ~silence to the blend.
-    //   • doorBlocking / totalBlocking = 1 → fully muffled LPF for the
-    //     failing side's contribution to the blend.
-    //   • virtualPosition = sourcePos → the lerp degenerates gracefully
-    //     toward the real source position rather than the {0,0,0}
-    //     default.
-    // As t evolves through the blend zone, the voice naturally fades
-    // between "fully audible" and "barely audible" instead of snapping.
-    auto synthesizeUnreachable = [&](const SoundPropInfo &other) {
-        SoundPropInfo s;
-        s.reached = true;
-        s.realDistance = other.realDistance;
-        // 4× the larger of (maxDist, other.realDistance) gives
-        // (real/eff)² ≤ (1/4)² = 0.0625, i.e. ≤ -24 dB. Far enough below
-        // the audible threshold to feel like "the side that can't hear
-        // the source," but not so extreme that float underflow becomes a
-        // concern.
-        float farDist = std::max(maxDist, other.realDistance) * 4.0f;
-        s.effectiveDistance = farDist;
-        s.totalBlocking = 1.0f;
-        s.doorBlocking  = 1.0f;
-        s.virtualPosition = sourcePos;
-        return s;
-    };
-    if (propA.reached && !propB.reached) propB = synthesizeUnreachable(propA);
-    if (!propA.reached && propB.reached) propA = synthesizeUnreachable(propB);
-
-    // Blend the results
-    SoundPropInfo blended;
-    blended.reached = true;
-    blended.effectiveDistance = propA.effectiveDistance * (1.0f - t) + propB.effectiveDistance * t;
-    blended.realDistance = propA.realDistance * (1.0f - t) + propB.realDistance * t;
-    blended.totalBlocking = propA.totalBlocking * (1.0f - t) + propB.totalBlocking * t;
-    blended.doorBlocking  = propA.doorBlocking  * (1.0f - t) + propB.doorBlocking  * t;
-    blended.virtualPosition = propA.virtualPosition * (1.0f - t) + propB.virtualPosition * t;
-    return blended;
-}
-
 // ── Sound propagation through portal graph ──
 
 //------------------------------------------------------
@@ -6670,6 +7537,12 @@ SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
         auto it = mRoomTransmission.find(roomID);
         return (it != mRoomTransmission.end()) ? it->second : 1.0f;
     };
+    // N-path BFS configuration — see NOTES.PROJECT.md "Sound Propagation
+    // Model". BFS hop costs use closest-point-on-polygon distances; final
+    // path distance comes from the bidirectional anchor projection in
+    // RoomService::propagateSoundPath.
+    params.maxPaths    = mPropMaxPaths;
+    params.maxPathDiff = mPropMaxPathDiff;
 
     return mRoomService->propagateSoundPath(
         sourcePos, listenerPos, sourceRoom, listenerRoom, params);
@@ -6710,6 +7583,50 @@ float AudioService::getBlockingFactor(int room1, int room2) const
     // no artificial penalty. Door blocking is set explicitly via
     // setBlockingFactor() when doors close.
     return 0.0f;
+}
+
+// ── Global AI hearing data accessors (Unit C) ──
+//
+// Both copy the stored raw bytes into the caller-supplied struct, returning
+// false when no chunk was loaded (the gamesys did not contain the chunk in
+// onDBLoad). On false the caller should fall back to kDefaultAIHearingStats
+// from audio/AIHearingData.h.
+
+//------------------------------------------------------
+bool AudioService::getAIHearingStats(AIHearingStats &out) const
+{
+    if (!mHasAIHearingStats)
+        return false;
+    return readAIHearStat(mAIHearingStatsBytes,
+                          sizeof(mAIHearingStatsBytes), out);
+}
+
+//------------------------------------------------------
+bool AudioService::getAISoundTweaks(AISoundTweaks &out) const
+{
+    if (!mHasAISoundTweaks)
+        return false;
+    return readAISndTwk(mAISoundTweaksBytes,
+                        sizeof(mAISoundTweaksBytes), out);
+}
+
+// ── Sound emission pub/sub ──
+
+//------------------------------------------------------
+void AudioService::registerSoundEmissionListener(SoundEmissionListener cb)
+{
+    if (cb)
+        mSoundEmissionListeners.push_back(std::move(cb));
+}
+
+//------------------------------------------------------
+void AudioService::publishSoundEmission(const SoundEmissionEvent &ev)
+{
+    // Synchronous dispatch on the main thread — listeners must be cheap.
+    for (auto &cb : mSoundEmissionListeners) {
+        if (cb)
+            cb(ev);
+    }
 }
 
 /*---------------------- Factory ----------------------*/

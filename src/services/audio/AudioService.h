@@ -38,6 +38,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -98,6 +99,27 @@ struct AcousticSceneData {
     /// Per-triangle texture name from TXLIST (family/name path, for material lookup)
     std::vector<std::string> texNames;
 };
+
+// Forward declarations for AI hearing data structs (defined in audio/AIHearingData.h)
+struct AIHearingStats;
+struct AISoundTweaks;
+
+/// Event published by AudioService whenever a sound is emitted into the
+/// world. Listeners (AI hearing subsystem, debug overlays, recording
+/// systems) subscribe via registerSoundEmissionListener(). Carries the
+/// minimum metadata needed for AI awareness gating; the underlying voice
+/// is not exposed (callers should treat this as fire-and-forget).
+struct SoundEmissionEvent {
+    int32_t     emitterObjID;   ///< Who emitted (-1 for player / world-anchored)
+    Vector3     position;       ///< World-space emit position
+    std::string schemaName;     ///< Schema name as defined in .sch files
+    int32_t     soundType;      ///< AI sound type slot (0=Untyped..5=Combat)
+    float       baseRange;      ///< Unmodified audible range in world units
+    float       gainDb;         ///< Base loudness in centibels (negative = quieter)
+};
+
+/// Listener callback signature for sound-emission notifications.
+using SoundEmissionListener = std::function<void(const SoundEmissionEvent &)>;
 
 /// Handle to an active sound (returned by play functions, used to halt/query)
 using SoundHandle = int32_t;
@@ -377,6 +399,38 @@ public:
     /// Get the current listener position (for door sound placement, etc.)
     Vector3 getListenerPos() const { return mListenerPos; }
 
+    /// Returns the P$PrjSound schema name for `objID`, walking the
+    /// MetaProp inheritance chain so concrete projectile instances
+    /// resolve to their archetype's schema. Returns empty when no
+    /// projectile sound is set anywhere in the chain. Projectile-spawn
+    /// code should consult this when emitting a projectile to play
+    /// the right flight/impact schema.
+    std::string getProjectileSound(int32_t objID) const;
+
+    /// Play an AI speech utterance for the given concept (e.g. "Greet",
+    /// "Alert", "atlevelzero") on the emitter object. The voice is
+    /// resolved from the emitter's P$VoiceIdx (preferred — int32) or
+    /// P$SpchVoice (16-byte label) via the MetaProp inheritance chain;
+    /// AIs almost always carry these on archetypes, not instances.
+    ///
+    /// `tags` is an optional tag-value query forwarded to the
+    /// SpeechSelector (e.g. {Event: Idle, Damage: <int>}). Matching
+    /// follows the original engine's "query is a superset of the leaf's
+    /// constraints" rule.
+    ///
+    /// Returns the SoundHandle of the started voice, or
+    /// SOUND_HANDLE_INVALID on miss (no voice set, unknown concept,
+    /// no matching schema, schema lookup failed, sample failed to load).
+    /// On success, also publishes a SoundEmissionEvent so AI hearing /
+    /// debug overlays can observe the utterance.
+    ///
+    /// Fire-and-forget — the returned handle is informational; callers
+    /// that want to halt the voice can pass it to haltSound, but most
+    /// will simply let it play out.
+    SoundHandle playSpeech(int32_t emitterObjID,
+                           const std::string &conceptName,
+                           const std::vector<SchemaTagValue> &tags = {});
+
     // Propagation layer toggles (all on by default)
     void setPortalRoutingEnabled(bool v) { mPortalRoutingEnabled = v; }
     bool getPortalRoutingEnabled() const { return mPortalRoutingEnabled; }
@@ -437,6 +491,14 @@ public:
     // debug console) take effect on the next audio callback.
     void  setPropagationMaxDist(float d) { mPropagationMaxDist = std::max(10.0f, std::min(d, 5000.0f)); }
     float getPropagationMaxDist() const { return mPropagationMaxDist; }
+    void  setPropMaxPaths(uint32_t n) {
+        mPropMaxPaths = std::max<uint32_t>(1u, std::min<uint32_t>(n, 4u));
+    }
+    uint32_t getPropMaxPaths() const { return mPropMaxPaths; }
+    void  setPropMaxPathDiff(float d) {
+        mPropMaxPathDiff = std::max(0.0f, std::min(d, 50.0f));
+    }
+    float getPropMaxPathDiff() const { return mPropMaxPathDiff; }
     void  setDoorLpfOpenHz(float hz) {
         mDoorLpfOpenHz = std::max(1000.0f, std::min(hz, 24000.0f));
         publishAudioThreadParams();
@@ -589,6 +651,26 @@ public:
     /** @return number of triangles in the current acoustic scene */
     int  getAcousticSceneTriCount() const { return mAcousticTriCount; }
 
+    // ── Global AI hearing data accessors (Unit C) ──
+
+    /** Copy the parsed AIHearStat chunk into `out`.
+     *  @return true if the gamesys contained an AIHearStat chunk and `out`
+     *          was populated; false when no chunk was loaded (caller should
+     *          fall back to kDefaultAIHearingStats from AIHearingData.h). */
+    bool getAIHearingStats(AIHearingStats &out) const;
+
+    /** Copy the parsed AISNDTWK chunk into `out`.
+     *  @return true if the gamesys contained an AISNDTWK chunk and `out`
+     *          was populated; false otherwise. */
+    bool getAISoundTweaks(AISoundTweaks &out) const;
+
+    // ── Sound emission pub/sub ──
+
+    /** Register a listener that fires whenever a sound is emitted into the
+     *  world. Listeners are called synchronously on the main thread from
+     *  whatever code site published the event; keep callbacks cheap. */
+    void registerSoundEmissionListener(SoundEmissionListener cb);
+
     /** Per-frame audio update — voice cleanup, Steam Audio simulation step.
      *  Called from the render binary's main loop (LoopService is not used
      *  in the render binary; this provides a direct entry point).
@@ -736,12 +818,21 @@ private:
 
     // ── Mission-level sound data (Unit H) ──
 
-    /// Raw 4-byte AMBIENT chunk contents (loaded as uint32). Mission-
-    /// level ambient enable flag or similar — the original engine wrote
-    /// this per-mission to control whether the ambient layer is active.
-    /// Empty (no value) when the mission has no AMBIENT chunk.
+    /// AMBIENT chunk — single int32 holding the ObjID of the
+    /// environmental ambient (the single global "background music-like"
+    /// ambient slot, distinct from spot ambients) that was active at
+    /// save time. 0 means "no environmental ambient was active". The
+    /// original engine wrote it from AmbientSave() to support save-game
+    /// resume; pristine shipping missions ship with 0 (only one Thief 2
+    /// mission, miss14, ships with a nonzero pre-set env ambient).
+    ///
+    /// Spot ambients (P$SpotAmb / `mSpotAmbients`) are orthogonal —
+    /// they live on individual objects and are started by player
+    /// proximity, not gated by this value. This field is captured for
+    /// future SAV-file resume + the miss14-style level-start env
+    /// ambient case; it is NOT a level-wide enable flag.
     bool mHasAmbientChunk = false;
-    uint32_t mAmbientChunkValue = 0;
+    int32_t mEnvAmbientObjID = 0;
 
     /// L$SoundDesc links — sound-descriptor relations attached to objects
     /// (e.g. triggered/scripted sounds distinct from P$AmbientHack). Each
@@ -956,10 +1047,15 @@ private:
     std::string mDistanceModel     = "default";  // "default" or "inverse_distance"
 
     // ── Propagation tuning (portal graph + door blocking) ──
-    float mPropagationMaxDist  = 200.0f;
-    float mDoorLpfOpenHz       = 20000.0f;
-    float mDoorLpfBlockedHz    = 800.0f;
-    float mPropMinAttenuation  = 0.001f;
+    float    mPropagationMaxDist  = 200.0f;
+    float    mDoorLpfOpenHz       = 20000.0f;
+    float    mDoorLpfBlockedHz    = 800.0f;
+    float    mPropMinAttenuation  = 0.001f;
+    // N-path BFS knobs. Default 2 = original Dark Engine behavior (the
+    // dual-predecessor scheme + MergeSounds). Setters clamp to legal
+    // ranges; values plumbed through SoundPropParams in propagateSound.
+    uint32_t mPropMaxPaths        = 2;
+    float    mPropMaxPathDiff     = 10.0f;
 
     // ── Ambient tuning (P$AmbientHack) ──
     float       mAmbEnvironmentalSpatialBlend = 0.3f;
@@ -1074,29 +1170,6 @@ private:
     /// to prevent Steam Audio from accessing freed source data.
     void waitForReflectionThread();
 
-    // ── Portal blending for smooth room transitions ──
-
-    /// Per-frame portal blend state. When the listener stands in a doorway
-    /// between two rooms, this provides a smooth positional blend between
-    /// the propagation results from both rooms, eliminating the flicker from
-    /// roomFromPoint alternating between rooms at the boundary.
-    struct PortalBlendState {
-        bool        active = false;     ///< True when listener is near a portal
-        Room       *roomA = nullptr;    ///< Primary room (from roomFromPoint)
-        Room       *roomB = nullptr;    ///< Secondary room (far side of portal)
-        float       blend = 0.0f;       ///< 0.0 = fully roomA, 1.0 = fully roomB
-    };
-    PortalBlendState mPortalBlend;
-
-    /// Compute portal blend state for the current listener position.
-    /// Called once per frame at the start of loopStep().
-    void computePortalBlend();
-
-    /// Propagate sound with portal blending. Uses mPortalBlend to interpolate
-    /// between both rooms when the listener straddles a portal boundary.
-    SoundPropInfo propagateSoundBlended(const Vector3 &sourcePos,
-                                         float maxDist = SOUND_MAX_DIST) const;
-
     /// Room-explicit propagateSound overload (bypasses internal roomFromPoint).
     SoundPropInfo propagateSound(const Vector3 &sourcePos,
                                   const Vector3 &listenerPos,
@@ -1115,6 +1188,15 @@ private:
 
     /// Whether the player's feet are currently in water (for footstep override)
     bool mPlayerInWater = false;
+
+    // ── Sound emission pub/sub (Unit AI-hearing runtime) ──
+
+    /// Registered listeners. Called synchronously inside publishSoundEmission.
+    std::vector<SoundEmissionListener> mSoundEmissionListeners;
+
+    /// Dispatch a sound emission event to all registered listeners.
+    /// Called from audio code whenever a new voice/ambient/footstep starts.
+    void publishSoundEmission(const SoundEmissionEvent &ev);
 
     // Private helpers
     bool initMiniaudio();
