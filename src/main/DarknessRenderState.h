@@ -375,6 +375,11 @@ struct RuntimeState {
     // (see RoomDebugViz.h). Colors are deterministic per-room-ID so adjacent
     // rooms read as visually distinct.
     bool showRooms = false;
+    // Debug: camera world-space position readout on the HUD. Off by
+    // default; toggle via `show_pos` in the debug console. Useful when
+    // navigating to a specific coordinate (e.g. for audio-propagation
+    // verification at a known room/portal boundary).
+    bool showPos = false;
     bgfx::VertexBufferHandle roomVBH = BGFX_INVALID_HANDLE;
     uint32_t roomLineCount = 0;
     // One entry per labelled point per room. We push the room's center

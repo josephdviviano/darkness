@@ -423,6 +423,16 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
             result.effectiveDistance = dist;
             result.totalBlocking = 0.0f;
             result.virtualPosition = sourcePos;
+            // Synthesize a single-path record so multi-path consumers see
+            // a consistent shape even on the euclidean fallback.
+            SoundPathRecord rec;
+            rec.effectiveDistance = dist;
+            rec.realDistance      = dist;
+            rec.totalBlocking     = 0.0f;
+            rec.doorBlocking      = 0.0f;
+            rec.virtualPosition   = sourcePos;
+            rec.predecessorRoomID = -1;
+            result.paths.push_back(rec);
             if (params.pathOut) {
                 SoundPathHop hop{};
                 hop.roomID = sourceRoom ? sourceRoom->getRoomID()
@@ -484,6 +494,14 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
             result.effectiveDistance = dist;
             result.totalBlocking = 0.0f;
             result.virtualPosition = sourcePos;
+            SoundPathRecord rec;
+            rec.effectiveDistance = dist;
+            rec.realDistance      = dist;
+            rec.totalBlocking     = 0.0f;
+            rec.doorBlocking      = 0.0f;
+            rec.virtualPosition   = sourcePos;
+            rec.predecessorRoomID = -1;
+            result.paths.push_back(rec);
             if (params.pathOut) {
                 SoundPathHop hop{};
                 hop.roomID = sourceRoom->getRoomID();
@@ -498,12 +516,24 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
         return result;
     }
 
-    // ── Dijkstra BFS through room portal graph ──
-    // Uses the precomputed portal-to-portal distance matrix within each
-    // room (from ROOM_DB) instead of euclidean entry-point-to-portal
-    // distances. Tracks enter-portal indices for matrix lookup and path
-    // reconstruction. Based on the Dark Engine's cRoomPropAgent::PropagateBF
-    // algorithm.
+    // ── Dijkstra-style N-path BFS through room portal graph ──
+    //
+    // Hop cost is the distance between consecutive "lead points" — the
+    // closest point on each portal polygon to the previous one, computed
+    // via RoomPortal::closestPointOnPolygon. This replaces the legacy
+    // portal-CENTER-to-CENTER heuristic that systematically overestimated
+    // costs for large portals: when a level subdivides one open volume
+    // into two rooms, the shared "portal" polygon is the entire shared
+    // face. Its center can be far from the source even when the nearest
+    // point on the polygon is right under the source. The center-based
+    // BFS would then pick a chain that started with a smaller, closer
+    // portal — and produce massive effective-distance inflation when
+    // anchor projection then tried to thread the geometry through that
+    // wrong chain.
+    //
+    // Generalizes the Dark Engine's dual-predecessor scheme
+    // (cBFRoomInfo::previous_room_2 + MergeSounds) to N configurable
+    // paths; N=1 single-shortest, N=2 reproduces the original engine.
     struct BFSEntry {
         Room    *room;
         float    realDist;
@@ -511,22 +541,99 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
         float    cumulativeTransmission;     // door × LoudRoom
         float    cumulativeDoorTransmission; // door only — drives the LPF cutoff
         int32_t  enterPortalIdx;             // portal we entered through (-1 = source)
-        Room    *prevRoom;                   // BFS predecessor
-        Vector3  enterPortalCenter;          // portal center, or sourcePos for source room
+        Room    *prevRoom;                   // BFS predecessor — path-class distinctor
+        Vector3  enterLeadPt;                // closest-point on entry portal to the
+                                             // previous lead pt; sourcePos for source room
+        Vector3  enterPortalCenter;          // portal CENTER (diagnostic only — pathOut emits this)
 
         bool operator>(const BFSEntry &o) const {
             return effectiveDist > o.effectiveDist;
         }
     };
 
+    const uint32_t maxPaths    = std::max<uint32_t>(1u, std::min<uint32_t>(params.maxPaths, 4u));
+    const float    maxPathDiff = params.maxPathDiff;
+
     std::priority_queue<BFSEntry, std::vector<BFSEntry>, std::greater<BFSEntry>> pq;
+    // Per-room: up to maxPaths entries with DISTINCT prevRoom IDs, sorted
+    // by effectiveDist ascending. Front is the primary (loudest) path;
+    // alternates trail. The same prevRoom never appears twice — same-prev
+    // duplicates collapse to the better one.
+    thread_local std::unordered_map<int32_t, std::vector<BFSEntry>> reachedFrom;
+    reachedFrom.clear();
+    // Mirrors paths.front().effectiveDist for the cutoff comparison; kept
+    // separately so the kMaxDistDiff filter is a single map lookup.
     thread_local std::unordered_map<int32_t, float> bestDist;
     bestDist.clear();
-    thread_local std::unordered_map<int32_t, BFSEntry> reachedFrom;
-    reachedFrom.clear();
 
     const auto &blockingFn = params.doorBlocking;
     const auto &loudFn     = params.loudRoom;
+
+    // Insertion helper. Returns true if cand was accepted into
+    // reachedFrom[cand.room] — caller should then push it onto the PQ.
+    // Rules:
+    //   (1) Same-prev entry exists ⇒ keep the better effDist.
+    //   (2) Different prev ⇒ accept if within maxPathDiff of the current
+    //       primary AND either there's room (size < maxPaths) or it beats
+    //       the worst entry.
+    // After any change, paths are re-sorted and entries no longer within
+    // maxPathDiff of the new primary are pruned.
+    auto tryAccept = [&](const BFSEntry &cand) -> bool {
+        int32_t rid = cand.room->getRoomID();
+        int32_t candPrev = cand.prevRoom ? cand.prevRoom->getRoomID() : -1;
+        auto &paths = reachedFrom[rid];
+
+        bool changed = false;
+        bool sameFound = false;
+        for (auto &existing : paths) {
+            int32_t existPrev = existing.prevRoom ? existing.prevRoom->getRoomID() : -1;
+            if (existPrev == candPrev) {
+                sameFound = true;
+                if (cand.effectiveDist < existing.effectiveDist) {
+                    existing = cand;
+                    changed = true;
+                }
+                break;
+            }
+        }
+
+        if (!sameFound) {
+            auto bestIt = bestDist.find(rid);
+            if (bestIt != bestDist.end() &&
+                cand.effectiveDist >= bestIt->second + maxPathDiff)
+                return false;
+
+            if (paths.size() < maxPaths) {
+                paths.push_back(cand);
+                changed = true;
+            } else {
+                auto worst = std::max_element(paths.begin(), paths.end(),
+                    [](const BFSEntry &a, const BFSEntry &b) {
+                        return a.effectiveDist < b.effectiveDist;
+                    });
+                if (cand.effectiveDist < worst->effectiveDist) {
+                    *worst = cand;
+                    changed = true;
+                }
+            }
+        }
+
+        if (!changed) return false;
+
+        std::sort(paths.begin(), paths.end(),
+            [](const BFSEntry &a, const BFSEntry &b) {
+                return a.effectiveDist < b.effectiveDist;
+            });
+        const float newPrimary = paths.front().effectiveDist;
+        if (paths.size() > 1) {
+            paths.erase(std::remove_if(paths.begin() + 1, paths.end(),
+                [newPrimary, maxPathDiff](const BFSEntry &e) {
+                    return e.effectiveDist >= newPrimary + maxPathDiff;
+                }), paths.end());
+        }
+        bestDist[rid] = newPrimary;
+        return true;
+    };
 
     BFSEntry start{};
     start.room = sourceRoom;
@@ -536,28 +643,25 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
     start.cumulativeDoorTransmission = 1.0f;
     start.enterPortalIdx = -1;
     start.prevRoom = nullptr;
-    start.enterPortalCenter = sourcePos;
+    start.enterLeadPt        = sourcePos;
+    start.enterPortalCenter  = sourcePos;
+    tryAccept(start);
     pq.push(start);
-    bestDist[sourceRoom->getRoomID()] = 0.0f;
-
-    BFSEntry listenerEntry{};
-    bool foundListener = false;
 
     while (!pq.empty()) {
         BFSEntry cur = pq.top();
         pq.pop();
 
-        auto it = bestDist.find(cur.room->getRoomID());
-        if (it != bestDist.end() && cur.effectiveDist > it->second)
-            continue;
-
-        reachedFrom[cur.room->getRoomID()] = cur;
-
-        if (cur.room == listenerRoom) {
-            listenerEntry = cur;
-            foundListener = true;
+        // Early termination: once the cheapest queue entry exceeds the
+        // listener's primary effective distance by more than maxPathDiff,
+        // no future pop can produce a path-class within the merge
+        // threshold. With N=1 + maxPathDiff = 10 this still lets the
+        // listener's primary stabilize before breaking; with N>1 it lets
+        // alternates surface before we stop.
+        auto lstBestIt = bestDist.find(listenerRoom->getRoomID());
+        if (lstBestIt != bestDist.end() &&
+            cur.effectiveDist > lstBestIt->second + maxPathDiff)
             break;
-        }
 
         uint32_t portalCount = cur.room->getPortalCount();
         for (uint32_t i = 0; i < portalCount; ++i) {
@@ -570,12 +674,15 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
             Room *nextRoom = portal->getFarRoom();
             if (!nextRoom) continue;
 
-            float segDist;
-            if (cur.enterPortalIdx >= 0) {
-                segDist = cur.room->getPortalDist(i, static_cast<uint32_t>(cur.enterPortalIdx));
-            } else {
-                segDist = glm::length(portal->getCenter() - sourcePos);
-            }
+            // Closest-point hop: resolve the lead point on this portal
+            // polygon to the previous lead point. Cost is the Euclidean
+            // distance between the two lead points. Replaces the legacy
+            // portal-center-to-portal-center matrix lookup, which can
+            // overestimate dramatically for large portals (whole-face
+            // shared interfaces between open-air rooms).
+            Vector3 nextLeadPt = portal->closestPointOnPolygon(cur.enterLeadPt);
+            float segDist = glm::length(nextLeadPt - cur.enterLeadPt);
+
             float newRealDist = cur.realDist + segDist;
 
             float blocking = blockingFn ? blockingFn(cur.room->getRoomID(),
@@ -584,6 +691,18 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
             float newEffDist = cur.effectiveDist + segDist;
             if (blocking > 0.0f && newEffDist < maxDist) {
                 newEffDist += (maxDist - newEffDist) * blocking;
+            }
+
+            // When this hop lands in the listener room, include the final
+            // segment from the entry lead-point to the listener position.
+            // Without this, BFS would treat two chains as equal-cost even
+            // if one chain enters listenerRoom adjacent to the listener
+            // and the other enters far across the room — making chain
+            // selection blind to the listener's actual position.
+            if (nextRoom == listenerRoom) {
+                float finalSeg = glm::length(listenerPos - nextLeadPt);
+                newRealDist += finalSeg;
+                newEffDist  += finalSeg;
             }
 
             if (newEffDist > maxDist)
@@ -595,12 +714,6 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
 
             float loud = loudFn ? loudFn(nextRoom->getRoomID()) : 1.0f;
             newTransmission *= loud;
-
-            int32_t nextID = nextRoom->getRoomID();
-            auto bestIt = bestDist.find(nextID);
-            if (bestIt != bestDist.end() && newEffDist >= bestIt->second)
-                continue;
-            bestDist[nextID] = newEffDist;
 
             int32_t farPortalIdx = -1;
             int32_t destPortalID = portal->getDestPortalID();
@@ -620,10 +733,16 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
             next.cumulativeDoorTransmission = newDoorTransmission;
             next.enterPortalIdx = farPortalIdx;
             next.prevRoom = cur.room;
-            next.enterPortalCenter = portal->getCenter();
-            pq.push(next);
+            next.enterLeadPt        = nextLeadPt;
+            next.enterPortalCenter  = portal->getCenter();
+            if (tryAccept(next))
+                pq.push(next);
         }
     }
+
+    auto listenerIt = reachedFrom.find(listenerRoom->getRoomID());
+    const bool foundListener = (listenerIt != reachedFrom.end()
+                                && !listenerIt->second.empty());
 
     if (!foundListener) {
         // BFS exhausted the queue without reaching the listener's room.
@@ -651,119 +770,240 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
         return result;
     }
 
-    // ── Path reconstruction + anchor projection ──
-    // Walk backward from listener room to source via prevRoom pointers to
-    // build the portal chain. Then run a forward pass with raycast +
-    // edge-projection to find the shortest geometric path that threads
-    // through every portal opening. Based on the Dark Engine's
-    // FindSoundPath algorithm.
+    // ── Per-path reconstruction + bidirectional anchor projection ──
+    //
+    // For each listener-room entry, walk back through prevRoom pointers
+    // (picking the primary at each intermediate room) to reconstruct the
+    // portal chain. Then compute the geometric path through that chain
+    // using a bidirectional closest-point pass:
+    //
+    //   1. Clean-threading short-circuit: if the source→listener line
+    //      pierces every polygon inside the polygon, the path is direct
+    //      Euclidean — no bend, virtualPosition = sourcePos. This is the
+    //      common case for open-air subdivisions where multiple rooms
+    //      share a wide-open polygon (e.g. MISS6 rooms 61↔207).
+    //
+    //   2. Otherwise: forward pass resolves F_i = closestPointOnPolygon(
+    //      portal_i, F_(i-1)) starting from source; backward pass resolves
+    //      B_i = closestPointOnPolygon(portal_i, B_(i+1)) starting from
+    //      listener. The per-polygon bend point is the midpoint of F_i
+    //      and B_i — this is the projection of the (still hypothetical)
+    //      straight source→listener line onto the polygon, anchored to
+    //      the real source and listener positions rather than to either
+    //      end alone. Within ~3% of the optimal single-bend path in
+    //      practice; never produces the corner snaps the legacy
+    //      sequential-edge-clamp `getRaycastProjection` did.
     struct PortalInfo {
         RoomPortal *portal;
         Room       *fromRoom;
     };
-    std::vector<PortalInfo> portalChain;
-    {
-        Room *walkRoom = listenerRoom;
+
+    const std::vector<BFSEntry> listenerEntries = listenerIt->second;
+
+    auto reconstructChain = [&](const BFSEntry &lstEntry) {
+        std::vector<PortalInfo> chain;
+        Room *walkRoom   = listenerRoom;
+        BFSEntry curEntry = lstEntry;
         while (walkRoom != sourceRoom) {
-            auto it = reachedFrom.find(walkRoom->getRoomID());
-            if (it == reachedFrom.end()) break;
-            const BFSEntry &entry = it->second;
-            if (!entry.prevRoom) break;
-            for (uint32_t i = 0; i < entry.prevRoom->getPortalCount(); ++i) {
-                RoomPortal *p = entry.prevRoom->getPortal(i);
+            if (!curEntry.prevRoom) break;
+            for (uint32_t i = 0; i < curEntry.prevRoom->getPortalCount(); ++i) {
+                RoomPortal *p = curEntry.prevRoom->getPortal(i);
                 if (p && p->getFarRoom() == walkRoom) {
-                    portalChain.push_back({p, entry.prevRoom});
+                    chain.push_back({p, curEntry.prevRoom});
                     break;
                 }
             }
-            walkRoom = entry.prevRoom;
-        }
-        std::reverse(portalChain.begin(), portalChain.end());
-    }
-
-    struct Anchor {
-        Vector3 pos;
-        bool valid = false;
-    };
-    std::vector<Anchor> anchors(portalChain.size());
-
-    Vector3 leadPt = sourcePos;
-    for (size_t i = 0; i < portalChain.size(); ++i) {
-        Vector3 target = (i + 1 < portalChain.size())
-                         ? portalChain[i + 1].portal->getCenter()
-                         : listenerPos;
-        Vector3 dir = target - leadPt;
-        if (!portalChain[i].portal->raycast(leadPt, dir)) {
-            Vector3 projPt;
-            if (portalChain[i].portal->getRaycastProjection(leadPt, dir, projPt)) {
-                anchors[i].pos = projPt;
-                anchors[i].valid = true;
-                leadPt = projPt;
-            }
-        }
-    }
-
-    float pathDist = 0.0f;
-    int lastAnchor = -1;
-    Vector3 virtualPos = sourcePos;
-    for (size_t i = 0; i < anchors.size(); ++i) {
-        if (anchors[i].valid) {
-            if (lastAnchor < 0) {
-                pathDist += glm::length(anchors[i].pos - sourcePos);
-            } else {
-                pathDist += glm::length(anchors[i].pos - anchors[lastAnchor].pos);
-            }
-            lastAnchor = static_cast<int>(i);
-            virtualPos = anchors[i].pos;
-        }
-    }
-    if (lastAnchor < 0) {
-        pathDist += glm::length(listenerPos - sourcePos);
-        virtualPos = sourcePos;
-    } else {
-        pathDist += glm::length(listenerPos - anchors[lastAnchor].pos);
-        virtualPos = anchors[lastAnchor].pos;
-    }
-
-    // Apply blocking to path distance (Dark Engine munged-distance formula).
-    // totalBlocking = 1 - cumulativeTransmission. Includes both door
-    // blocking and LoudRoom multipliers — both inflate the *perceived*
-    // distance for volume-attenuation purposes.
-    float totalBlocking = 1.0f - listenerEntry.cumulativeTransmission;
-    float effDist = pathDist;
-    if (totalBlocking > 0.0f && effDist < maxDist) {
-        effDist += (maxDist - effDist) * totalBlocking;
-    }
-    // Door-only blocking drives the LPF cutoff downstream. LoudRoom is
-    // excluded so sound passing between LoudRoom-modified subdivisions of
-    // one open space gets quieter but not muffled.
-    float doorBlocking = 1.0f - listenerEntry.cumulativeDoorTransmission;
-
-    if (effDist <= maxDist) {
-        result.reached = true;
-        result.realDistance = pathDist;
-        result.effectiveDistance = effDist;
-        result.totalBlocking = totalBlocking;
-        result.doorBlocking  = doorBlocking;
-        result.virtualPosition = virtualPos;
-    }
-
-    // ── Optional path-detail emission (diagnostic) ──
-    if (params.pathOut && result.reached) {
-        // Walk the reachedFrom chain forward from source to listener.
-        std::vector<BFSEntry> chain;
-        Room *walkRoom = listenerRoom;
-        while (walkRoom) {
-            auto it = reachedFrom.find(walkRoom->getRoomID());
-            if (it == reachedFrom.end()) break;
-            chain.push_back(it->second);
-            if (it->second.prevRoom == nullptr || walkRoom == sourceRoom) break;
-            walkRoom = it->second.prevRoom;
+            Room *prev = curEntry.prevRoom;
+            walkRoom = prev;
+            if (walkRoom == sourceRoom) break;
+            auto pit = reachedFrom.find(prev->getRoomID());
+            if (pit == reachedFrom.end() || pit->second.empty()) break;
+            // Take the primary path at the predecessor — gives a stable,
+            // deterministic walk-back. Full per-class chain tracking is
+            // deferred (sufficient for SP-1 MVP's two-distinct-doorway
+            // case; an SP-1-full enhancement could plumb a path-class
+            // index through BFSEntry to make all N walk-backs independent).
+            curEntry = pit->second.front();
         }
         std::reverse(chain.begin(), chain.end());
+        return chain;
+    };
 
-        for (size_t i = 0; i < chain.size(); ++i) {
-            const BFSEntry &entry = chain[i];
+    std::vector<SoundPathRecord> pathRecords;
+    pathRecords.reserve(listenerEntries.size());
+    // Track the primary path's hop chain for the optional pathOut diagnostic.
+    std::vector<BFSEntry> primaryHopChain;
+
+    // Helper: does the source→listener line cross every polygon in the
+    // chain inside the polygon? If yes, the path is purely Euclidean —
+    // no anchor bends needed, no inflation. Most cross-room sound paths
+    // in open architecture (Thief atria, cathedrals, courtyards) thread
+    // cleanly through every doorway/opening and should produce direct
+    // straight-line distance.
+    auto lineThreadsAllPolygons = [&](const std::vector<PortalInfo> &chain) {
+        Vector3 sToL = listenerPos - sourcePos;
+        constexpr float kEps = 1e-4f;
+        for (const auto &info : chain) {
+            const Plane &pl = info.portal->getPlane();
+            float denom = glm::dot(pl.normal, sToL);
+            if (std::fabs(denom) < 1e-7f) return false;  // parallel to portal
+            float t = -pl.getDistance(sourcePos) / denom;
+            if (t <= 0.0f || t >= 1.0f) return false;    // crossing outside [source, listener]
+            Vector3 crossPt = sourcePos + sToL * t;
+            for (uint32_t e = 0; e < info.portal->getEdgeCount(); ++e) {
+                if (info.portal->getEdgePlane(e).getDistance(crossPt) > kEps)
+                    return false;
+            }
+        }
+        return true;
+    };
+
+    for (size_t pi = 0; pi < listenerEntries.size(); ++pi) {
+        const BFSEntry &lstEntry = listenerEntries[pi];
+        std::vector<PortalInfo> portalChain = reconstructChain(lstEntry);
+
+        float   pathDist;
+        Vector3 virtualPos;
+
+        if (portalChain.empty() || lineThreadsAllPolygons(portalChain)) {
+            // Clean threading — direct Euclidean distance, no bend
+            pathDist   = glm::length(listenerPos - sourcePos);
+            virtualPos = sourcePos;
+        } else {
+            // Bidirectional closest-point pass + midpoint bend per
+            // polygon. Each bend lies on the segment between the
+            // source-side projection (F) and the listener-side projection
+            // (B) on the polygon; the midpoint approximates the optimal
+            // single-bend point. Avoids the corner-snap of legacy edge
+            // clamping and stays anchored to real source/listener
+            // positions rather than relying on portal centers.
+            const size_t N = portalChain.size();
+            std::vector<Vector3> F(N), B(N), P(N);
+
+            // Forward pass
+            Vector3 leadPt = sourcePos;
+            for (size_t i = 0; i < N; ++i) {
+                F[i] = portalChain[i].portal->closestPointOnPolygon(leadPt);
+                leadPt = F[i];
+            }
+            // Backward pass
+            Vector3 trailPt = listenerPos;
+            for (size_t i = N; i-- > 0; ) {
+                B[i] = portalChain[i].portal->closestPointOnPolygon(trailPt);
+                trailPt = B[i];
+            }
+            for (size_t i = 0; i < N; ++i) {
+                P[i] = (F[i] + B[i]) * 0.5f;
+            }
+
+            pathDist = glm::length(P.front() - sourcePos);
+            for (size_t i = 1; i < N; ++i) {
+                pathDist += glm::length(P[i] - P[i - 1]);
+            }
+            pathDist += glm::length(listenerPos - P.back());
+            virtualPos = P.back();
+        }
+
+        // Apply blocking to path distance (Dark Engine munged-distance formula).
+        // totalBlocking = 1 - cumulativeTransmission. Includes both door
+        // blocking and LoudRoom multipliers — both inflate the *perceived*
+        // distance for volume-attenuation purposes.
+        float totalBlocking_p = 1.0f - lstEntry.cumulativeTransmission;
+        float effDist_p = pathDist;
+        if (totalBlocking_p > 0.0f && effDist_p < maxDist) {
+            effDist_p += (maxDist - effDist_p) * totalBlocking_p;
+        }
+        // Door-only blocking drives the LPF cutoff downstream. LoudRoom is
+        // excluded so sound passing between LoudRoom-modified subdivisions of
+        // one open space gets quieter but not muffled.
+        float doorBlocking_p = 1.0f - lstEntry.cumulativeDoorTransmission;
+
+        if (effDist_p > maxDist) continue;
+
+        SoundPathRecord rec;
+        rec.effectiveDistance = effDist_p;
+        rec.realDistance      = pathDist;
+        rec.totalBlocking     = totalBlocking_p;
+        rec.doorBlocking      = doorBlocking_p;
+        rec.virtualPosition   = virtualPos;
+        rec.predecessorRoomID = lstEntry.prevRoom
+                                  ? lstEntry.prevRoom->getRoomID() : -1;
+        pathRecords.push_back(rec);
+
+        // pi==0 is the primary (lowest effectiveDist by sort order).
+        if (pi == 0) {
+            // Walk forward through the same BFSEntry chain to populate
+            // primaryHopChain for the diagnostic pathOut emission.
+            std::vector<BFSEntry> chain;
+            Room *walkRoom    = listenerRoom;
+            BFSEntry curEntry = lstEntry;
+            while (true) {
+                chain.push_back(curEntry);
+                if (!curEntry.prevRoom || walkRoom == sourceRoom) break;
+                Room *prev = curEntry.prevRoom;
+                walkRoom = prev;
+                auto pit = reachedFrom.find(prev->getRoomID());
+                if (pit == reachedFrom.end() || pit->second.empty()) break;
+                curEntry = pit->second.front();
+                if (walkRoom == sourceRoom) {
+                    chain.push_back(curEntry);
+                    break;
+                }
+            }
+            std::reverse(chain.begin(), chain.end());
+            primaryHopChain = std::move(chain);
+        }
+    }
+
+    if (pathRecords.empty()) {
+        // All reconstructed paths exceeded maxDist after anchor projection
+        // (geometric path turned out longer than BFS estimate). Treat as
+        // unreached.
+        return result;
+    }
+
+    // pathRecords is naturally ordered by effectiveDist ascending because
+    // listenerEntries was sorted in tryAccept; the per-path anchor
+    // projection can only inflate effDist (geometric ≥ BFS estimate is
+    // not strictly guaranteed, but in practice the projection adds
+    // distance for corner-snap cases — re-sort defensively to keep the
+    // pathRecords[0]-is-primary invariant clean for downstream code).
+    std::sort(pathRecords.begin(), pathRecords.end(),
+        [](const SoundPathRecord &a, const SoundPathRecord &b) {
+            return a.effectiveDistance < b.effectiveDistance;
+        });
+
+    // ── Merge: min effDist drives scalar fields; inv-d² weighted vPos. ──
+    // Matches the original engine's MergeSounds (PSNDINST.CPP) policy of
+    // taking the loudest contribution for volume + LPF, while letting the
+    // virtual position blend so panning reflects multi-opening geometry.
+    const SoundPathRecord &best = pathRecords.front();
+    Vector3 vPosNum(0.0f, 0.0f, 0.0f);
+    float   vPosDen = 0.0f;
+    for (const auto &p : pathRecords) {
+        float d2 = std::max(p.effectiveDistance * p.effectiveDistance, 0.01f);
+        float w  = 1.0f / d2;
+        vPosNum += p.virtualPosition * w;
+        vPosDen += w;
+    }
+    Vector3 mergedVirtualPos = (vPosDen > 0.0f)
+                                  ? (vPosNum / vPosDen)
+                                  : best.virtualPosition;
+
+    result.reached          = true;
+    result.realDistance     = best.realDistance;
+    result.effectiveDistance = best.effectiveDistance;
+    result.totalBlocking    = best.totalBlocking;
+    result.doorBlocking     = best.doorBlocking;
+    result.virtualPosition  = mergedVirtualPos;
+    result.paths            = std::move(pathRecords);
+
+    // ── Optional path-detail emission (diagnostic) ──
+    // Emits the PRIMARY path's hop chain only. Multi-path consumers read
+    // result.paths for the full per-path breakdown.
+    if (params.pathOut && result.reached) {
+        for (size_t i = 0; i < primaryHopChain.size(); ++i) {
+            const BFSEntry &entry = primaryHopChain[i];
             SoundPathHop hop{};
             hop.roomID = entry.room->getRoomID();
             hop.cumRealDist = entry.realDist;
@@ -778,7 +1018,7 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
                 hop.loudRoom     = 1.0f;
                 hop.segmentDist  = 0.0f;
             } else {
-                const BFSEntry &prev = chain[i - 1];
+                const BFSEntry &prev = primaryHopChain[i - 1];
                 float doorRatio = (prev.cumulativeDoorTransmission > 1e-9f)
                                   ? (entry.cumulativeDoorTransmission / prev.cumulativeDoorTransmission)
                                   : 0.0f;

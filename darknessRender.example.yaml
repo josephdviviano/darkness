@@ -196,6 +196,16 @@ audio:
     door_lpf_open_hz: 20000      # LPF cutoff for fully open door (Hz, 1k–24k)
     door_lpf_blocked_hz: 800     # LPF cutoff for fully blocked door (Hz, 100–10k)
     min_attenuation: 0.001       # propagation floor (0–0.1; prevents FP-noise dropouts)
+    # N-path BFS: keep multiple portal-graph routes when a sound can reach
+    # the listener through more than one doorway. 1 = single shortest path
+    # (single-source behavior); 2 = original Dark Engine (dual-predecessor
+    # scheme matching cBFRoomInfo + MergeSounds); 3+ = modernized.
+    max_paths: 2                 # simultaneous propagation paths per listener (1–4)
+    # An alternate path is kept only if its effective distance is within
+    # this many world units of the primary. Matches the original engine's
+    # kMaxDistDiff. Larger values let weaker alternates contribute; smaller
+    # values converge on single-path behavior.
+    max_path_diff: 10.0          # alternate-path distance window (world units, 0–50)
 
   spatialization:
     # Listener-side HRTF + distance attenuation curve.
@@ -223,9 +233,18 @@ audio:
     # Global gains. Independent direct/indirect knobs let you tune the
     # "around the corner" cue: lower direct_gain or raise reflection_gain
     # to make bounced sounds more prominent vs. line-of-sight sounds.
+    #
+    # direct_gain + reflection_gain default to 0.5 (paired -6 dB) because
+    # [GAIN] logs showed Steam Audio's ambisonics decode pushing the wet
+    # bus to +10 dBFS peak — lowering both gains by -6 dB in lockstep
+    # gives the master chain ~6 dB of headroom for the EQ shelf and
+    # compressor makeup while preserving the wet/dry ratio of the mix
+    # (so the soundscape stays equally "spatial" but quieter overall).
+    # Use master_gain or compressor settings to claw perceived loudness
+    # back if needed.
     master_gain: 1.0             # global output multiplier (0–4)
-    direct_gain: 1.0             # dry-bus multiplier — direct path only (0–4)
-    reflection_gain: 1.0         # reverb wet bus multiplier — indirect path (0–4)
+    direct_gain: 0.5             # dry-bus multiplier — direct path only (0–4)
+    reflection_gain: 0.5         # reverb wet bus multiplier — indirect path (0–4)
     reflection_ramp_ms: 10.0     # fade-in time on first reflection activation (1–1000 ms)
 
   dsp:
@@ -234,8 +253,13 @@ audio:
     limiter_knee: 0.8                  # onset threshold (0.5–0.95)
 
     compressor_enabled: true           # tames transients
-    compressor_threshold_db: -15.0     # dBFS threshold (-30 to 0)
-    compressor_ratio: 3.0              # compression ratio (1.5–10)
+    # Threshold raised from -15 to -12 dB and ratio bumped from 3:1 to 5:1
+    # to keep the "oppressive" character on loud transients while engaging
+    # less often on the median signal (the 3:1 @ -15 dB setting averaged
+    # 6.6% of samples limited in heavy windows — audible gain pumping
+    # rather than transient catching).
+    compressor_threshold_db: -12.0     # dBFS threshold (-30 to 0)
+    compressor_ratio: 5.0              # compression ratio (1.5–10)
     compressor_attack_ms: 10.0         # attack time (1–100 ms)
     compressor_release_ms: 250.0       # release time (50–2000 ms)
 

@@ -424,29 +424,103 @@ static void printSoundChunks(const FileGroupPtr &db) {
         std::cout << "AMBIENT: not present\n";
     }
 
-    // ENV_SOUND
+    // Pre-load Speech_DB so the ENV_SOUND printer can project its raw
+    // tag-type / enum-byte indices through the speech domain's name
+    // maps — the ENV_SOUND chunk itself carries no name maps.
+    SpeechDatabase speechDB;
+    bool speechLoaded = false;
+    if (readChunkBytesHL(db, "Speech_DB", bytes)) {
+        speechLoaded = speechDB.loadFromChunk(bytes.data(), bytes.size());
+    }
+
+    // ENV_SOUND — decoded as a cTagDBDatabase tag tree. Each surfaced
+    // entry corresponds to a key-path that resolves to one or more
+    // schema ObjIDs (with matching weight). The chunk preamble carries
+    // a "required tag" bitarray that gates which tag-types must appear
+    // in queries.
     if (readChunkBytesHL(db, "ENV_SOUND", bytes)) {
         EnvSoundDatabase env;
         bool ok = env.loadFromChunk(bytes.data(), bytes.size());
-        std::printf("ENV_SOUND: %zu bytes  loaded=%s\n",
-                    bytes.size(), ok ? "yes" : "no");
+        std::printf("ENV_SOUND: %zu bytes  loaded=%s  entries=%zu  "
+                    "required-tag-bytes=%zu  tail=%zu  (names=%s)\n",
+                    bytes.size(), ok ? "yes" : "no",
+                    env.entries().size(),
+                    env.localTagRequired().size(),
+                    env.tailBytes().size(),
+                    speechLoaded ? "resolved via Speech_DB" : "raw indices");
         if (ok) {
             std::cout << "  header: ";
             hexDump(env.headerBytes(16), 16);
+            const size_t n = std::min<size_t>(env.entries().size(), 3);
+            for (size_t i = 0; i < n; ++i) {
+                const auto &e = env.entries()[i];
+                std::printf("  [%zu] keys=%zu  data=%zu  first=(obj=%d w=%.2f)\n",
+                            i, e.keyPath.size(), e.data.size(),
+                            e.data.empty() ? 0 : e.data[0].schemaObjID,
+                            e.data.empty() ? 0.0f : e.data[0].weight);
+                // Project raw {keyType, payload} segments through the
+                // speech domain when available; fall back to raw indices
+                // when Speech_DB is missing so we always emit something.
+                for (size_t k = 0; k < e.keyPath.size(); ++k) {
+                    const auto &seg = e.keyPath[k];
+                    if (speechLoaded) {
+                        std::printf("       key[%zu] %s\n",
+                                    k, speechDB.formatKey(seg).c_str());
+                    } else {
+                        std::printf("       key[%zu] type=%u [%d..%d]\n",
+                                    k, seg.keyType, seg.keyMin, seg.keyMax);
+                    }
+                }
+            }
         }
     } else {
         std::cout << "ENV_SOUND: not present\n";
     }
 
-    // Speech_DB
-    if (readChunkBytesHL(db, "Speech_DB", bytes)) {
-        SpeechDatabase sp;
-        bool ok = sp.loadFromChunk(bytes.data(), bytes.size());
-        std::printf("Speech_DB: %zu bytes  loaded=%s\n",
-                    bytes.size(), ok ? "yes" : "no");
-        if (ok) {
+    // Speech_DB — full decode: three name maps (concept/tag/value),
+    // per-concept priorities, per-tag flags, then nVoices voices each
+    // holding one tag-DB per concept. Voice + concept indices in each
+    // entry join back to the name maps for human-readable display.
+    if (speechLoaded || readChunkBytesHL(db, "Speech_DB", bytes)) {
+        // If we couldn't load above (rare), reload now so the per-block
+        // bytes-size / tail metrics below still reflect a fresh decode.
+        if (!speechLoaded) {
+            speechLoaded = speechDB.loadFromChunk(bytes.data(), bytes.size());
+        }
+        const auto &sp = speechDB;
+        std::printf("Speech_DB: %zu bytes  loaded=%s  concepts=%zu  tags=%zu  "
+                    "values=%zu  voices=%u  entries=%zu  tail=%zu\n",
+                    sp.rawSize(), speechLoaded ? "yes" : "no",
+                    sp.conceptNames().size(),
+                    sp.tagNames().size(),
+                    sp.valueNames().size(),
+                    sp.voiceCount(),
+                    sp.entries().size(),
+                    sp.tailBytes().size());
+        if (speechLoaded) {
             std::cout << "  header: ";
             hexDump(sp.headerBytes(16), 16);
+            const size_t cn = std::min<size_t>(sp.conceptNames().size(), 3);
+            for (size_t i = 0; i < cn; ++i) {
+                std::printf("  concept[%zu] = \"%s\"\n",
+                            i, sp.conceptNames()[i].c_str());
+            }
+            const size_t n = std::min<size_t>(sp.entries().size(), 3);
+            for (size_t i = 0; i < n; ++i) {
+                const auto &e = sp.entries()[i];
+                std::printf("  [%zu] voice=%u  concept=%u(%s)  keys=%zu  data=%zu\n",
+                            i, e.voiceIndex, e.conceptIndex,
+                            sp.conceptName(e.conceptIndex).c_str(),
+                            e.keyPath.size(), e.data.size());
+                if (!e.keyPath.empty()) {
+                    std::printf("       path: %s\n",
+                                sp.formatKeyPath(e.keyPath).c_str());
+                }
+                if (!e.data.empty()) {
+                    std::printf("       first=(obj=%d w=%.2f)\n",
+                                e.data[0].schemaObjID, e.data[0].weight);
+                }
+            }
         }
     } else {
         std::cout << "Speech_DB: not present\n";
@@ -483,7 +557,7 @@ static void printSoundChunks(const FileGroupPtr &db) {
         if (ok) {
             std::cout << "  rating         dist_mul   db_add\n";
             for (int i = 0; i < AI_HEARING_COUNT; ++i) {
-                std::printf("  %-13s  %8.2f  %8.0f\n",
+                std::printf("  %-13s  %8.2f  %8d\n",
                             aiHearingRatingName(i),
                             st.dist_muls[i], st.db_adds[i]);
             }

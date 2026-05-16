@@ -26,6 +26,8 @@ endif()
 
 # Core services that work without a renderer
 set(HEADLESS_SERVICES_SOURCES
+    ai/AIHearingService.cpp
+    ai/AIHearingService.h
     audio/AcousticMaterials.h
     audio/AIHearingData.h
     audio/AudioService.cpp
@@ -41,6 +43,8 @@ set(HEADLESS_SERVICES_SOURCES
     audio/SchemaParser.cpp
     audio/SpeechDatabase.cpp
     audio/SpeechDatabase.h
+    audio/SpeechSelector.cpp
+    audio/SpeechSelector.h
     config/ConfigService.cpp
     config/ConfigService.h
     database/DatabaseService.cpp

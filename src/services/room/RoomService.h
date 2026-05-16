@@ -47,26 +47,59 @@ namespace Darkness {
 /// pull in the audio header just to share a sensible default.
 constexpr float kSoundMaxDist = 200.0f;
 
+/// One reconstructed path's contribution to a multi-path propagation
+/// result. Each instance describes a topologically distinct route the
+/// sound took from source to listener room (e.g., two parallel doorways
+/// would yield two records). The merged scalar fields on SoundPropInfo
+/// summarize across these records for callers that don't care about
+/// per-path detail.
+struct SoundPathRecord {
+    /// Effective distance for this path (with door + LoudRoom inflation).
+    float effectiveDistance = 0.0f;
+    /// Geometric path distance through the portal chain.
+    float realDistance = 0.0f;
+    /// Combined transmission loss [0,1] — doors + LoudRoom.
+    float totalBlocking = 0.0f;
+    /// Door-only transmission loss [0,1].
+    float doorBlocking = 0.0f;
+    /// Last anchor on this path (the sound's apparent origin direction
+    /// for spatialization if this path were chosen alone).
+    Vector3 virtualPosition{0, 0, 0};
+    /// Room ID of the listener room's predecessor along this path —
+    /// distinguishes path-classes when two paths converge at the listener.
+    /// -1 if source == listener (same-room short-circuit).
+    int32_t predecessorRoomID = -1;
+};
+
 /// Result of sound propagation through the portal graph.
 /// Describes how a sound reaches a listener after traversing portals and doors.
+/// Scalar fields below are merged across all paths in `paths` (see
+/// RoomService::propagateSoundPath); single-path callers can ignore the
+/// vector and consume the merged scalars unchanged. The original Dark
+/// Engine kept up to two predecessor paths per room (cBFRoomInfo's
+/// previous_room_2 + MergeSounds); SP-1 generalizes to N configurable
+/// paths.
 struct SoundPropInfo {
-    /// Path distance with full transmission losses (door blocking + per-room
-    /// LoudRoom factors). Drives volume attenuation.
+    /// Merged effective distance (min over paths). Drives volume.
     float effectiveDistance = 0.0f;
-    /// Actual physical distance through the portal chain (no penalties).
+    /// Merged real distance (from the path with min effectiveDistance).
     float realDistance = 0.0f;
-    /// Combined transmission loss [0,1] — doors + LoudRoom. Used to inflate
-    /// effectiveDistance for volume attenuation only.
+    /// Merged combined transmission loss [0,1] (from min-eff path).
     float totalBlocking = 0.0f;
-    /// Door-only transmission loss [0,1]. Drives the low-pass filter cutoff
-    /// downstream. LoudRoom is intentionally excluded — it represents
-    /// level-designer "this space is acoustically dead" volume attenuation,
-    /// not material absorption, and should not muffle the spectrum.
+    /// Merged door-only transmission loss [0,1] (from min-eff path).
+    /// Drives the LPF cutoff downstream.
     float doorBlocking = 0.0f;
-    /// Where the sound appears to come from (last portal anchor on the path).
+    /// Merged virtual position: inverse-distance² weighted average of
+    /// each path's anchor. Collapses to a single path's anchor when
+    /// only one path exists; produces a directional average when
+    /// multiple openings simultaneously route sound to the listener.
     Vector3 virtualPosition{0, 0, 0};
     /// Whether the sound can reach the listener at all.
     bool reached = false;
+    /// Per-path detail. Empty when `reached == false`. Single entry for
+    /// N=1 / same-room / disconnected cases. Sorted by effectiveDistance
+    /// ascending (paths[0] is the loudest).
+    std::vector<SoundPathRecord> paths;
 };
 
 /// One hop in the BFS path from source room to listener room. Populated
@@ -110,9 +143,21 @@ struct SoundPropParams {
     /// < 1.0 reduce transmission. If null, every room contributes factor
     /// 1.0.
     std::function<float(int32_t roomID)> loudRoom;
+    /// Maximum number of simultaneous BFS paths kept per listener room.
+    /// 1 = today's single-shortest-path behavior; 2 = the original Dark
+    /// Engine's dual-predecessor scheme (cBFRoomInfo::previous_room_2);
+    /// up to 4 supported. Clamped to [1, 4] inside propagateSoundPath.
+    /// Default 2 reproduces the original engine.
+    uint32_t maxPaths = 2;
+    /// An alternate path is kept only if its effective distance is
+    /// within this many world units of the primary (best) path. Beyond
+    /// this, alternates contribute too little to the merge to matter.
+    /// Default 10.0 matches the original engine's kMaxDistDiff.
+    float maxPathDiff = 10.0f;
     /// Diagnostic accumulator. If non-null, the BFS path from source to
     /// listener is appended to this vector (one entry per visited room).
-    /// Cleared before write. Only populated on successful propagation.
+    /// For multi-path runs, this receives the primary (lowest-effDist)
+    /// chain only. Cleared before write. Only populated on success.
     std::vector<SoundPathHop> *pathOut = nullptr;
 };
 
