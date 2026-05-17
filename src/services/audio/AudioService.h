@@ -611,18 +611,18 @@ public:
 
     /** Bake-time grid configuration. Takes effect on the next bakeProbes()
      *  call — does NOT relocate existing probes. Range-clamped to keep CPU
-     *  cost reasonable. */
-    void setProbeSpacingFt(float ft) { mProbeSpacingFt = std::max(1.0f, std::min(ft, 20.0f)); }
-    float getProbeSpacingFt() const { return mProbeSpacingFt; }
-    void setProbeHeightFt(float ft) { mProbeHeightFt = std::max(0.5f, std::min(ft, 20.0f)); }
-    float getProbeHeightFt() const { return mProbeHeightFt; }
+     *  cost reasonable. Forwards to the underlying ProbeManager. */
+    void setProbeSpacingFt(float ft);
+    float getProbeSpacingFt() const;
+    void setProbeHeightFt(float ft);
+    float getProbeHeightFt() const;
 
     /** Snapshot of probe positions in feet (engine units). Populated by
      *  bakeProbes() and loadProbes(); empty if no probes are loaded. Used
      *  by the renderer to draw a debug overlay. The vector is rebuilt on
      *  every bake/load, so cache by index — values do not change between
      *  re-bakes. */
-    const std::vector<Vector3> &getProbePositions() const { return mProbePositions; }
+    const std::vector<Vector3> &getProbePositions() const;
 
     /** Diagnostic: is any player-emitted voice currently making sound?
      *  Used by the renderer to flash a listener-position marker so a user
@@ -1094,21 +1094,12 @@ private:
     int         mSoundCacheMBCfg           = 64;
 
     // ── Baked probe pathing ──
+    //
+    // The probe batch, position mirror, and bake/load orchestration live in
+    // ProbeManager (audio/ProbeManager.h). AudioService keeps thin facades
+    // for bakeProbes/loadProbes and the spacing/height/positions accessors.
 
-    IPLProbeBatch mIplProbeBatch = nullptr;  ///< Loaded probe data (positions + baked paths + reflections)
-    int mProbeCount = 0;                     ///< Number of probes in the batch
-    bool mProbesHaveReflections = false;     ///< True if loaded probes contain baked reflection IRs
-
-    /// Grid parameters used at bake time. Read by bakeProbes() if no explicit
-    /// spacing/height argument is provided. Live-tunable via console but only
-    /// take effect on the next re-bake.
-    float mProbeSpacingFt = 5.0f;
-    float mProbeHeightFt  = 5.0f;
-
-    /// Probe positions in feet (engine units). Populated by bakeProbes() and
-    /// loaded from a sidecar file by loadProbes(). Used purely for debug
-    /// overlay rendering — Steam Audio holds the canonical copy internally.
-    std::vector<Vector3> mProbePositions;
+    std::unique_ptr<class ProbeManager> mProbeManager;
 
     /// True while any voice flagged playerEmitted is producing sound. Set by
     /// loopStep() on the main thread, read by the renderer for the debug

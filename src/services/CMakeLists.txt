@@ -37,6 +37,9 @@ set(HEADLESS_SERVICES_SOURCES
     audio/CRFSoundLoader.h
     audio/EnvSoundDatabase.cpp
     audio/EnvSoundDatabase.h
+    audio/ProbeFile.h
+    audio/ProbeManager.cpp
+    audio/ProbeManager.h
     audio/SchemaPropertyOverrides.h
     audio/SchemaSamplesChunk.cpp
     audio/SchemaSamplesChunk.h
