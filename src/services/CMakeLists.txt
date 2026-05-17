@@ -34,6 +34,8 @@ set(HEADLESS_SERVICES_SOURCES
     audio/AmbientSoundManager.h
     audio/AudioDSPChain.cpp
     audio/AudioDSPChain.h
+    audio/AudioOcclusion.cpp
+    audio/AudioOcclusion.h
     audio/AudioService.cpp
     audio/AudioService.h
     audio/CRFSoundLoader.h
@@ -48,6 +50,8 @@ set(HEADLESS_SERVICES_SOURCES
     audio/SchemaTypes.h
     audio/SchemaParser.h
     audio/SchemaParser.cpp
+    audio/SoundPropagation.cpp
+    audio/SoundPropagation.h
     audio/SpeechDatabase.cpp
     audio/SpeechDatabase.h
     audio/SpeechSelector.cpp

@@ -24,6 +24,7 @@
 #include "AIHearingData.h"
 #include "AmbientSoundManager.h"
 #include "AudioLog.h"
+#include "AudioOcclusion.h"
 #include "AcousticMaterials.h"
 #include "CRFSoundLoader.h"
 #include "EnvSoundDatabase.h"
@@ -33,6 +34,7 @@
 #include "SchemaPropertyOverrides.h"
 #include "SchemaSamplesChunk.h"
 #include "SchemaTypes.h"
+#include "SoundPropagation.h"
 #include "SpeechDatabase.h"
 #include "SpeechSelector.h"
 #include "VoicePool.h"
@@ -2225,6 +2227,17 @@ AudioService::AudioService(ServiceManager *manager, const std::string &name)
     // (for the ducking multiplier). All ambient/spot-ambient lifecycle
     // and per-frame volume updates run through this object.
     mAmbientManager = std::make_unique<AmbientSoundManager>(this);
+
+    // Construct the volumetric occlusion configuration owner. Holds
+    // radius (engine feet) + sample count for Steam Audio's volumetric
+    // occlusion model. RenderConfig calls setOcclusionRadius /
+    // setOcclusionSamples before init/scene build so the values are
+    // ready when loopStep first pushes inputs to the simulator. The
+    // IPLScene handle is plumbed in later (in buildAcousticScene).
+    mAudioOcclusion = std::make_unique<AudioOcclusion>();
+
+    // SoundPropagation requires RoomService, which is acquired in
+    // bootstrapFinished() — construct there.
 }
 
 //------------------------------------------------------
@@ -2622,6 +2635,11 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             LOG_ERROR("AudioService: iplSceneCreate failed (error %d)", err);
             return false;
         }
+
+        // Hand the scene handle to AudioOcclusion so future scene-aware
+        // occlusion paths (e.g. out-of-band ray casts) can reach it
+        // without needing access to AudioService's private state.
+        if (mAudioOcclusion) mAudioOcclusion->setScene(mIplScene);
 
         // Step 2: Build material palette from unique texture names
         // Map each unique texture name to a material index
@@ -3190,6 +3208,10 @@ void AudioService::destroyAcousticScene()
         iplSceneRelease(&aliased);            // drops the retain
         iplSceneRelease(&mIplScene);          // drops the original create-ref
     }
+
+    // Drop the dangling-pointer aliased scene handle that AudioOcclusion
+    // cached at build time so it doesn't survive across rebuilds.
+    if (mAudioOcclusion) mAudioOcclusion->setScene(nullptr);
 }
 
 // ── Service lifecycle ──
@@ -3208,6 +3230,12 @@ void AudioService::bootstrapFinished()
     mRoomService = GET_SERVICE(RoomService);
     mPropertyService = GET_SERVICE(PropertyService);
     mObjectService = GET_SERVICE(ObjectService);
+
+    // Sound propagation owns the per-portal door blocking map + per-room
+    // LoudRoom transmission map and forwards propagateSound() into
+    // RoomService::propagateSoundPath. It can only be constructed once
+    // RoomService is resolved.
+    mSoundPropagation = std::make_unique<SoundPropagation>(mRoomService.get());
 
     // Register as a database listener — load after rooms are ready
     mDbService->registerListener(this, DBP_AUDIO);
@@ -3359,9 +3387,8 @@ void AudioService::onDBDrop(uint32_t dropmask)
         return;
 
     haltAll();
-    mBlockingFactors.clear();
+    if (mSoundPropagation) mSoundPropagation->clear();
     mListenerRoom = nullptr;
-    mRoomTransmission.clear();
     mRoomEAXPresets.clear();
     if (mVoicePool) mVoicePool->resetAllocator();
 
@@ -3774,24 +3801,26 @@ void AudioService::loopStep(float deltaTime)
                     // chain into voice->cachedChain for the show_vpos
                     // debug overlay. The wrapper propagateSound() doesn't
                     // expose params.chainOut.
-                    if (mRoomService) {
+                    if (mRoomService && mSoundPropagation) {
+                        // Resolve source/listener rooms now so we can pass
+                        // their IDs through to SoundPropagation. -1 means
+                        // "outside all rooms" (euclidean fallback).
                         Room *srcRoomP = mRoomService->roomFromPoint(voice->worldPos);
                         Room *lstRoomP = mRoomService->roomFromPoint(mListenerPos);
+                        int32_t srcID = srcRoomP ? srcRoomP->getRoomID() : -1;
+                        int32_t lstID = lstRoomP ? lstRoomP->getRoomID() : -1;
+                        // Build the params struct ourselves so we can plug
+                        // the per-voice chainOut accumulator in (used by
+                        // the show_vpos debug overlay). SoundPropagation
+                        // overwrites doorBlocking / loudRoom with its own
+                        // callbacks before forwarding to RoomService.
                         SoundPropParams pp;
-                        pp.maxDist = voice->maxAudibleDist;
-                        pp.doorBlocking = [this](int32_t a, int32_t b) {
-                            return getBlockingFactor(a, b);
-                        };
-                        pp.loudRoom = [this](int32_t roomID) -> float {
-                            auto it = mRoomTransmission.find(roomID);
-                            return (it != mRoomTransmission.end()) ? it->second : 1.0f;
-                        };
+                        pp.maxDist     = voice->maxAudibleDist;
                         pp.maxPaths    = mPropMaxPaths;
                         pp.maxPathDiff = mPropMaxPathDiff;
                         pp.chainOut    = &voice->cachedChain;
-                        prop = mRoomService->propagateSoundPath(
-                            voice->worldPos, mListenerPos,
-                            srcRoomP, lstRoomP, pp);
+                        prop = mSoundPropagation->propagateSoundWithParams(
+                            voice->worldPos, mListenerPos, srcID, lstID, pp);
                     } else {
                         prop = propagateSound(voice->worldPos, mListenerPos,
                                               voice->maxAudibleDist);
@@ -4000,8 +4029,8 @@ void AudioService::loopStep(float deltaTime)
                 // `audio.occlusion.radius` (clamped 0.3–30 at config
                 // load). No runtime floor — the value you set in the
                 // config is exactly the value used.
-                inputs.occlusionRadius = mOcclusionRadius * kFeetToMeters;
-                inputs.numOcclusionSamples = mOcclusionSamples;
+                inputs.occlusionRadius = mAudioOcclusion->getRadiusMeters();
+                inputs.numOcclusionSamples = mAudioOcclusion->getSamples();
                 inputs.numTransmissionRays = 8;
 
                 // Voices route to baked-probe reflections when:
@@ -5911,8 +5940,9 @@ void AudioService::loadAuxiliarySoundData()
     // LoudRoom is a single float (default 1.0) that multiplicatively scales
     // sound energy passing through a room during portal propagation.
     // Values < 1.0 dampen (closets, padded rooms), > 1.0 amplify (marble halls).
-    mRoomTransmission.clear();
-    if (mRoomService) {
+    // Storage now lives in SoundPropagation — clearing happens at the same
+    // call site as mBlockingFactors (onDBDrop and clear()).
+    if (mRoomService && mSoundPropagation) {
         const auto &rooms = mRoomService->getAllRooms();
         int loudRoomCount = 0;
         for (const auto &room : rooms) {
@@ -5925,7 +5955,8 @@ void AudioService::loadAuxiliarySoundData()
                 float transmission;
                 std::memcpy(&transmission, raw, sizeof(float));
                 if (transmission != 1.0f) {  // only store non-default values
-                    mRoomTransmission[room->getRoomID()] = transmission;
+                    mSoundPropagation->setRoomTransmission(
+                        room->getRoomID(), transmission);
                     ++loudRoomCount;
                 }
             }
@@ -5976,10 +6007,9 @@ void AudioService::loadAuxiliarySoundData()
                 }
 
                 // LoudRoom transmission factor (already loaded above)
-                float loudRoom = 1.0f;
-                auto lrIt = mRoomTransmission.find(roomID);
-                if (lrIt != mRoomTransmission.end())
-                    loudRoom = lrIt->second;
+                float loudRoom = mSoundPropagation
+                                     ? mSoundPropagation->getRoomTransmission(roomID)
+                                     : 1.0f;
 
                 AUDIO_LOG( "  %4d | %5d | %-18s | %7.2f  | %4d | %6d | %.2f\n",
                              roomID, objID, presetName, decayTime, dampening, height, loudRoom);
@@ -7083,100 +7113,55 @@ void AudioService::playLanding(const Vector3 &pos, float fallSpeed, int textureI
     }
 }
 
-// ── Sound propagation through portal graph ──
+// ── Sound propagation through portal graph (facades over SoundPropagation) ──
 
 //------------------------------------------------------
 SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
                                             const Vector3 &listenerPos,
                                             float maxDist) const
 {
-    if (!mRoomService || !mRoomService->isLoaded())
+    if (!mSoundPropagation)
         return {};
-
-    Room *sourceRoom = mRoomService->roomFromPoint(sourcePos);
-    Room *listenerRoom = mRoomService->roomFromPoint(listenerPos);
-
-    // If source or listener is outside all room OBBs, the 5-arg overload
-    // handles it with a euclidean distance fallback. This matches the original
-    // Dark Engine behavior: objects outside the room database cannot propagate
-    // sound through the room portal graph. The ambient system uses euclidean
-    // distance directly (matching AMBIENT.C), so this fallback only affects
-    // non-ambient voices (footsteps, one-shots) that happen to be outside rooms.
-    return propagateSound(sourcePos, listenerPos, sourceRoom, listenerRoom, maxDist);
-}
-
-//------------------------------------------------------
-SoundPropInfo AudioService::propagateSound(const Vector3 &sourcePos,
-                                            const Vector3 &listenerPos,
-                                            Room *sourceRoom, Room *listenerRoom,
-                                            float maxDist) const
-{
-    // BFS body now lives in RoomService::propagateSoundPath — that lets
-    // the headless trace-path tool exercise the same graph traversal
-    // without an audio backend. We thread our runtime cost data through
-    // as callbacks: door blocking (closed doors set via setBlockingFactor)
-    // and LoudRoom multipliers (from P$LoudRoom). Anything else about the
-    // result — the per-portal raycast / edge projection, the
-    // virtualPosition anchor selection, the BFS-failure log — happens
-    // inside RoomService and is unchanged behaviorally.
-    if (!mRoomService)
-        return {};
-
-    SoundPropParams params;
-    params.maxDist = maxDist;
-    params.doorBlocking = [this](int32_t a, int32_t b) {
-        return getBlockingFactor(a, b);
-    };
-    params.loudRoom = [this](int32_t roomID) -> float {
-        auto it = mRoomTransmission.find(roomID);
-        return (it != mRoomTransmission.end()) ? it->second : 1.0f;
-    };
-    // N-path BFS configuration — see NOTES.PROJECT.md "Sound Propagation
-    // Model". BFS hop costs use closest-point-on-polygon distances; final
-    // path distance comes from the bidirectional anchor projection in
-    // RoomService::propagateSoundPath.
-    params.maxPaths    = mPropMaxPaths;
-    params.maxPathDiff = mPropMaxPathDiff;
-
-    return mRoomService->propagateSoundPath(
-        sourcePos, listenerPos, sourceRoom, listenerRoom, params);
+    return mSoundPropagation->propagateSound(
+        sourcePos, listenerPos, maxDist, mPropMaxPaths, mPropMaxPathDiff);
 }
 
 //------------------------------------------------------
 void AudioService::setBlockingFactor(int room1, int room2, float factor)
 {
-    // Store bidirectionally so lookup works in either direction
-    uint32_t key1 = (static_cast<uint32_t>(room1) << 16) |
-                     static_cast<uint32_t>(room2 & 0xFFFF);
-    uint32_t key2 = (static_cast<uint32_t>(room2) << 16) |
-                     static_cast<uint32_t>(room1 & 0xFFFF);
-
-    if (factor <= 0.0f) {
-        // Remove blocking (fully open)
-        mBlockingFactors.erase(key1);
-        mBlockingFactors.erase(key2);
-    } else {
-        mBlockingFactors[key1] = factor;
-        mBlockingFactors[key2] = factor;
-    }
-
-    AUDIO_LOG("[DOOR_BLOCK] setBlockingFactor room(%d,%d) factor=%.3f mapSize=%zu\n",
-              room1, room2, factor, mBlockingFactors.size());
+    if (mSoundPropagation)
+        mSoundPropagation->setBlockingFactor(room1, room2, factor);
 }
 
 //------------------------------------------------------
 float AudioService::getBlockingFactor(int room1, int room2) const
 {
-    uint32_t key = (static_cast<uint32_t>(room1) << 16) |
-                    static_cast<uint32_t>(room2 & 0xFFFF);
-    auto it = mBlockingFactors.find(key);
-    if (it != mBlockingFactors.end())
-        return it->second;
-    // Open portals have zero blocking. Room portals are real architectural
-    // doorways (not BSP cell boundaries), so traversing an open doorway has
-    // no artificial penalty. Door blocking is set explicitly via
-    // setBlockingFactor() when doors close.
-    return 0.0f;
+    return mSoundPropagation ? mSoundPropagation->getBlockingFactor(room1, room2)
+                             : 0.0f;
+}
+
+//------------------------------------------------------
+void AudioService::setOcclusionRadius(float r)
+{
+    if (mAudioOcclusion) mAudioOcclusion->setRadius(r);
+}
+
+//------------------------------------------------------
+float AudioService::getOcclusionRadius() const
+{
+    return mAudioOcclusion ? mAudioOcclusion->getRadius() : 10.0f;
+}
+
+//------------------------------------------------------
+void AudioService::setOcclusionSamples(int n)
+{
+    if (mAudioOcclusion) mAudioOcclusion->setSamples(n);
+}
+
+//------------------------------------------------------
+int AudioService::getOcclusionSamples() const
+{
+    return mAudioOcclusion ? mAudioOcclusion->getSamples() : 16;
 }
 
 // ── Global AI hearing data accessors (Unit C) ──
