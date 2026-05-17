@@ -24,6 +24,16 @@
 // All audio-related fprintf() calls should use AUDIO_LOG() instead.
 // Controlled by gAudioLogVerbose (default: false). Toggle at runtime
 // via the 'A' key or --audio-log CLI flag.
+//
+// Dual role: gAudioLogVerbose also gates the audio-thread / loopStep
+// performance counters defined at the top of AudioService.cpp.  Reading
+// the flag once per audio callback (or per loopStep iteration) lets us
+// skip ~11 atomic RMWs in the hot path when profiling is disabled.
+// Enabling logging therefore also re-enables those counters; this is
+// intentional — the textual `[Audio] perf=` dump that consumes them
+// is itself an AUDIO_LOG() output, so users who want the perf line
+// already have audio logging on.  See the perf-counter block in
+// AudioService.cpp for details.
 
 #pragma once
 
