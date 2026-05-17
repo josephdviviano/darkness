@@ -973,18 +973,23 @@ inline Vector3 iplToEnginePos(const IPLVector3 &p) {
 }
 
 // ── Audio-thread tunables ──
-// File-scope atomics published by AudioService setters and read on the audio
-// thread. These belong to per-voice processing paths that don't have direct
-// access to AudioService members; using atomics avoids data races even though
-// the values are typically only set once at startup from RenderConfig.
+// Namespace-scope atomics published by AudioService setters and read on the
+// audio thread. These belong to per-voice processing paths that don't have
+// direct access to AudioService members; using atomics avoids data races
+// even though the values are typically only set once at startup from
+// RenderConfig.
 //   sHrtfInterpolation: 0 = nearest, 1 = bilinear
 //   sDistanceModel:     0 = default, 1 = inverse_distance
-static std::atomic<int>   sHrtfInterpolation{1};
-static std::atomic<float> sSpatialBlend{1.0f};
-static std::atomic<float> sDoorLpfOpenHz{20000.0f};
-static std::atomic<float> sDoorLpfBlockedHz{800.0f};
-static std::atomic<float> sPropMinAttenuation{0.001f};
-static std::atomic<int>   sDistanceModel{0};
+//
+// These have external linkage so AudioDSPChain.cpp's publish helper can
+// write to them via extern declarations; the audio callback in this TU
+// continues to read them with no extra indirection.
+std::atomic<int>   sHrtfInterpolation{1};
+std::atomic<float> sSpatialBlend{1.0f};
+std::atomic<float> sDoorLpfOpenHz{20000.0f};
+std::atomic<float> sDoorLpfBlockedHz{800.0f};
+std::atomic<float> sPropMinAttenuation{0.001f};
+std::atomic<int>   sDistanceModel{0};
 /// Engine sample rate published for audio-thread DSP that needs it (door LPF, etc.)
 static std::atomic<uint32_t> sEngineSampleRate{48000};
 
@@ -2586,39 +2591,40 @@ bool AudioService::initMiniaudio()
 }
 
 //------------------------------------------------------
-// Live-tunable mixer gains. Setters update the AudioService member AND, if the
-// reflection mix node is alive, push the new value into it so the change takes
-// effect on the next audio callback. Plain float writes match the lock-free
-// update pattern used elsewhere in this file (e.g. listenerOrientation).
+// Live-tunable mixer gains. Setters update the AudioDSPChain member AND, if
+// the reflection mix node is alive, push the new value into it so the change
+// takes effect on the next audio callback. Plain float writes match the
+// lock-free update pattern used elsewhere in this file (e.g.
+// listenerOrientation). The clamp + storage lives in AudioDSPChain; the
+// live node poke stays here because ReflectionMixNode is private to this TU.
 void AudioService::setMasterGain(float g)
 {
-    mMasterGain = std::max(0.0f, std::min(g, 4.0f));
-    if (mReflectionMixNode) mReflectionMixNode->masterGain = mMasterGain;
+    mDSPChain->setMasterGain(g);
+    if (mReflectionMixNode) mReflectionMixNode->masterGain = mDSPChain->getMasterGain();
 }
 
 void AudioService::setReflectionGain(float g)
 {
-    mReflectionGain = std::max(0.0f, std::min(g, 4.0f));
-    if (mReflectionMixNode) mReflectionMixNode->reflGainTarget = mReflectionGain;
+    mDSPChain->setReflectionGain(g);
+    if (mReflectionMixNode) mReflectionMixNode->reflGainTarget = mDSPChain->getReflectionGain();
 }
 
 void AudioService::setDirectGain(float g)
 {
-    mDirectGain = std::max(0.0f, std::min(g, 4.0f));
-    if (mReflectionMixNode) mReflectionMixNode->directGain = mDirectGain;
+    mDSPChain->setDirectGain(g);
+    if (mReflectionMixNode) mReflectionMixNode->directGain = mDSPChain->getDirectGain();
 }
 
 //------------------------------------------------------
+// Forwards to AudioDSPChain, which writes to the file-scope atomics defined
+// above (sHrtfInterpolation / sSpatialBlend / sDoorLpfOpenHz /
+// sDoorLpfBlockedHz / sPropMinAttenuation / sDistanceModel) via extern
+// declarations in AudioDSPChain.cpp. Keeping the atomic definitions in this
+// TU means the audio callback continues to read them with no extra
+// indirection.
 void AudioService::publishAudioThreadParams()
 {
-    sHrtfInterpolation.store(mHRTFInterpolation == "nearest" ? 0 : 1,
-                             std::memory_order_relaxed);
-    sSpatialBlend.store(mSpatialBlend, std::memory_order_relaxed);
-    sDoorLpfOpenHz.store(mDoorLpfOpenHz, std::memory_order_relaxed);
-    sDoorLpfBlockedHz.store(mDoorLpfBlockedHz, std::memory_order_relaxed);
-    sPropMinAttenuation.store(mPropMinAttenuation, std::memory_order_relaxed);
-    sDistanceModel.store(mDistanceModel == "inverse_distance" ? 1 : 0,
-                         std::memory_order_relaxed);
+    mDSPChain->publishAudioThreadParams();
 }
 
 //------------------------------------------------------
@@ -2654,7 +2660,7 @@ bool AudioService::initSteamAudio()
 
     IPLHRTFSettings hrtfSettings{};
     hrtfSettings.type = IPL_HRTFTYPE_DEFAULT;
-    hrtfSettings.volume = mHRTFVolume;  // 1.0 = HRTF as-is; 0.0 = silence!
+    hrtfSettings.volume = mDSPChain->getHRTFVolume();  // 1.0 = HRTF as-is; 0.0 = silence!
 
     err = iplHRTFCreate(mIplContext, &audioSettings, &hrtfSettings, &mIplHrtf);
     if (err != IPL_STATUS_SUCCESS) {
@@ -3125,33 +3131,33 @@ bool AudioService::initReflectionPipeline()
         return false;
     }
 
-    // Apply DSP chain config from AudioService members (set by RenderConfig).
+    // Apply DSP chain config from AudioDSPChain (set by RenderConfig).
     // Must be done BEFORE setting ready=true so the audio callback never sees
     // uninitialized coefficients (ready + simulationRan gate the DSP path).
-    rmn.limiterEnabled = mDSPLimiterEnabled;
-    rmn.limiterKnee = mDSPLimiterKnee;
-    rmn.compressorEnabled = mDSPCompressorEnabled;
-    rmn.compThresholdDb = mDSPCompThreshold;
-    rmn.compRatio = mDSPCompRatio;
-    rmn.compAttackMs = mDSPCompAttackMs;
-    rmn.compReleaseMs = mDSPCompReleaseMs;
-    rmn.eqEnabled = mDSPEQEnabled;
-    rmn.eqFreq = mDSPEQFreq;
-    rmn.eqGainDb = mDSPEQGain;
-    rmn.eqQ = mDSPEQQ;
-    rmn.duckingEnabled = mDSPDuckingEnabled;
-    rmn.duckAmount = mDSPDuckAmount;
-    rmn.duckAttackMs = mDSPDuckAttackMs;
-    rmn.duckReleaseMs = mDSPDuckReleaseMs;
+    rmn.limiterEnabled    = mDSPChain->getDSPLimiterEnabled();
+    rmn.limiterKnee       = mDSPChain->getDSPLimiterKnee();
+    rmn.compressorEnabled = mDSPChain->getDSPCompressorEnabled();
+    rmn.compThresholdDb   = mDSPChain->getDSPCompThreshold();
+    rmn.compRatio         = mDSPChain->getDSPCompRatio();
+    rmn.compAttackMs      = mDSPChain->getDSPCompAttackMs();
+    rmn.compReleaseMs     = mDSPChain->getDSPCompReleaseMs();
+    rmn.eqEnabled         = mDSPChain->getDSPEQEnabled();
+    rmn.eqFreq            = mDSPChain->getDSPEQFreq();
+    rmn.eqGainDb          = mDSPChain->getDSPEQGain();
+    rmn.eqQ               = mDSPChain->getDSPEQQ();
+    rmn.duckingEnabled    = mDSPChain->getDSPDuckingEnabled();
+    rmn.duckAmount        = mDSPChain->getDSPDuckAmount();
+    rmn.duckAttackMs      = mDSPChain->getDSPDuckAttackMs();
+    rmn.duckReleaseMs     = mDSPChain->getDSPDuckReleaseMs();
 
     // Mixer config — global gains + reflection ramp time.
     // reflRampRate is the per-sample increment such that a full 0→1 ramp takes
-    // mReflectionRampMs milliseconds at the current sample rate.
-    rmn.masterGain = mMasterGain;
-    rmn.directGain = mDirectGain;
-    rmn.reflGainTarget = mReflectionGain;
+    // getReflectionRampMs() milliseconds at the current sample rate.
+    rmn.masterGain     = mDSPChain->getMasterGain();
+    rmn.directGain     = mDSPChain->getDirectGain();
+    rmn.reflGainTarget = mDSPChain->getReflectionGain();
     {
-        float rampSamples = (mReflectionRampMs * 0.001f) * static_cast<float>(mDeviceSampleRate);
+        float rampSamples = (mDSPChain->getReflectionRampMs() * 0.001f) * static_cast<float>(mDeviceSampleRate);
         rmn.reflRampRate = (rampSamples > 1.0f) ? (1.0f / rampSamples) : 1.0f;
     }
 
