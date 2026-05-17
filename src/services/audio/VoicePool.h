@@ -183,8 +183,14 @@ struct SteamAudioDSPNode {
 
     // Per-voice low-pass filter state for door blocking (audio thread only).
     // Simulates high-frequency absorption through closed doors.
+    //   lpfStateL/R   — applied to the post-binaural stereo dry output.
+    //   reflSendLpfState — applied to the mono reflection-send before it is
+    //                      handed to the convolution worker, so the reverb
+    //                      tail from a source behind a closed door is also
+    //                      muffled (matches the dry-path coloration).
     float lpfStateL = 0.0f;
     float lpfStateR = 0.0f;
+    float reflSendLpfState = 0.0f;
 
     // Per-voice ramp state for portal-routing scalars (audio thread only).
     // The main thread writes `portalAttenuation` / `portalBlocking` once per
