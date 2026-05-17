@@ -27,6 +27,7 @@
 #include "CRFSoundLoader.h"
 #include "EnvSoundDatabase.h"
 #include "ProbeFile.h"
+#include "ProbeManager.h"
 #include "SchemaParser.h"
 #include "SchemaPropertyOverrides.h"
 #include "SchemaSamplesChunk.h"
@@ -2670,6 +2671,16 @@ bool AudioService::initSteamAudio()
         return false;
     }
 
+    // Probe baking/loading lives in ProbeManager (audio/ProbeManager.h).
+    // It needs the IPL context and a hook to quiesce the reflection-sim
+    // worker before any probe-batch mutation.
+    {
+        ProbeManagerDeps deps;
+        deps.context = mIplContext;
+        deps.waitForReflectionThread = [this]() { this->waitForReflectionThread(); };
+        mProbeManager = std::make_unique<ProbeManager>(std::move(deps));
+    }
+
     LOG_INFO("AudioService: Steam Audio initialized (HRTF ready)");
     return true;
 }
@@ -2677,6 +2688,9 @@ bool AudioService::initSteamAudio()
 //------------------------------------------------------
 void AudioService::shutdownSteamAudio()
 {
+    // ProbeManager owns the probe batch handle, which holds an internal
+    // reference to the IPL context — release it before the context.
+    mProbeManager.reset();
     if (mIplHrtf) {
         iplHRTFRelease(&mIplHrtf);
         mIplHrtf = nullptr;
@@ -3351,12 +3365,8 @@ void AudioService::destroyAcousticScene()
     destroyReflectionPipeline();
 
     // Release probe batch before simulator (it's registered with the simulator)
-    if (mIplProbeBatch) {
-        if (mReflectionSimulator)
-            iplSimulatorRemoveProbeBatch(mReflectionSimulator, mIplProbeBatch);
-        iplProbeBatchRelease(&mIplProbeBatch);
-        mIplProbeBatch = nullptr;
-        mProbeCount = 0;
+    if (mProbeManager) {
+        mProbeManager->releaseBatch(mReflectionSimulator);
     }
 
     if (mReflectionSimulator) {
@@ -3777,7 +3787,7 @@ void AudioService::loopStep(float deltaTime)
             //   • Baked lookup is O(1) and frees real-time sim budget for
             //     voices whose source position genuinely matters (NPC dialogue,
             //     gunshots in other corridors, etc.).
-            // Requires probes to be loaded (`mProbesHaveReflections`); if not,
+            // Requires probes to be loaded (`mProbeManager->hasReflections()`); if not,
             // player-emitted voices fall through to the same path as everything
             // else and the timing race may reappear.
             if (mReflectionsEnabled) {
@@ -3805,7 +3815,7 @@ void AudioService::loopStep(float deltaTime)
                 for (auto &[h, v] : mVoices) {
                     if (v->sourceEnded)
                         continue;
-                    if (v->playerEmitted && mProbesHaveReflections)
+                    if (v->playerEmitted && mProbeManager->hasReflections())
                         continue;  // routed via baked-probe path below
                     // Voices demoted by the stage 2.2 fallback have
                     // reflectionSource == nullptr — exclude them from the
@@ -4204,7 +4214,7 @@ void AudioService::loopStep(float deltaTime)
                 //     which is longer than a footstep.
                 bool isTopN = reflCandidateSet.count(handle) > 0;
                 bool useBaked = (!isTopN || voice->playerEmitted)
-                                && mProbesHaveReflections;
+                                && mProbeManager->hasReflections();
                 if (useBaked) {
                     inputs.baked = IPL_TRUE;
                     inputs.bakedDataIdentifier = bakedReflId;
@@ -4405,7 +4415,7 @@ void AudioService::loopStep(float deltaTime)
                 // the pre-count, this prevents overshoot.
                 bool isReflVoice = reflCandidateSet.count(handle) > 0;
                 bool canAffordConvolution = (activeConvolutionCount < mMaxReflectionVoices);
-                bool hasBakedData = mProbesHaveReflections
+                bool hasBakedData = mProbeManager->hasReflections()
                                     && outputs.reflections.irSize > 0
                                     && voice->dspNode.reflectionEffect;
                 // Pending reflection sources have no valid sim outputs yet
@@ -7078,8 +7088,9 @@ void AudioService::updateAmbientVolumes()
         // with the listener-anchored IR, not a per-source one).
         int   listenerNearestProbe = -1;
         float listenerNearestDist  = -1.0f;
-        for (size_t i = 0; i < mProbePositions.size(); ++i) {
-            float d = glm::length(mProbePositions[i] - mListenerPos);
+        const auto &probePositions = mProbeManager->getProbePositions();
+        for (size_t i = 0; i < probePositions.size(); ++i) {
+            float d = glm::length(probePositions[i] - mListenerPos);
             if (listenerNearestProbe < 0 || d < listenerNearestDist) {
                 listenerNearestProbe = static_cast<int>(i);
                 listenerNearestDist  = d;
@@ -7121,8 +7132,8 @@ void AudioService::updateAmbientVolumes()
                 // for runaway reverb.
                 int   srcNearestProbe = -1;
                 float srcNearestDist  = -1.0f;
-                for (size_t i = 0; i < mProbePositions.size(); ++i) {
-                    float dp = glm::length(mProbePositions[i] - amb.position);
+                for (size_t i = 0; i < probePositions.size(); ++i) {
+                    float dp = glm::length(probePositions[i] - amb.position);
                     if (srcNearestProbe < 0 || dp < srcNearestDist) {
                         srcNearestProbe = static_cast<int>(i);
                         srcNearestDist  = dp;
@@ -7609,8 +7620,9 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
         // (e.g. --no-probes) — nearestIdx stays -1.
         int   nearestIdx  = -1;
         float nearestDist = -1.0f;
-        for (size_t i = 0; i < mProbePositions.size(); ++i) {
-            float d = glm::length(mProbePositions[i] - mListenerPos);
+        const auto &footProbePositions = mProbeManager->getProbePositions();
+        for (size_t i = 0; i < footProbePositions.size(); ++i) {
+            float d = glm::length(footProbePositions[i] - mListenerPos);
             if (nearestIdx < 0 || d < nearestDist) {
                 nearestIdx = static_cast<int>(i);
                 nearestDist = d;
@@ -7914,12 +7926,12 @@ Service *AudioServiceFactory::createInstance(ServiceManager *manager)
     return new AudioService(manager, mName);
 }
 
-// ── Probe baking and loading ──
+// ── Probe baking and loading (facades over ProbeManager) ──
 
 //------------------------------------------------------
 int AudioService::getProbeCount() const
 {
-    return mProbeCount;
+    return mProbeManager ? mProbeManager->getProbeCount() : 0;
 }
 
 void AudioService::startAudioRecording()
@@ -7941,612 +7953,74 @@ bool AudioService::isRecordingAudio() const
 std::string AudioService::getProbeFilePath(const std::string &misPath,
                                             const std::string &gameName)
 {
-    // Extract mission filename without extension
-    std::string missionName;
-    auto lastSlash = misPath.find_last_of("/\\");
-    std::string filename = (lastSlash != std::string::npos)
-        ? misPath.substr(lastSlash + 1) : misPath;
-    auto dotPos = filename.rfind('.');
-    missionName = (dotPos != std::string::npos)
-        ? filename.substr(0, dotPos) : filename;
+    return ProbeManager::getProbeFilePath(misPath, gameName);
+}
 
-    // Convert to lowercase for consistency
-    for (auto &c : missionName) c = static_cast<char>(std::tolower(c));
+//------------------------------------------------------
+void  AudioService::setProbeSpacingFt(float ft)
+{
+    if (mProbeManager) mProbeManager->setProbeSpacingFt(ft);
+}
 
-    // Build path: ~/darkness/{gameName}/baked_probes/{missionName}.probes
-    const char *home = std::getenv("HOME");
-    if (!home) home = ".";
-    std::string dir = std::string(home) + "/darkness/" + gameName + "/baked_probes";
+float AudioService::getProbeSpacingFt() const
+{
+    return mProbeManager ? mProbeManager->getProbeSpacingFt() : 5.0f;
+}
 
-    // Create directories (mkdir -p equivalent)
-    std::string pathSoFar;
-    for (size_t i = 0; i < dir.size(); ++i) {
-        if (dir[i] == '/' || i == dir.size() - 1) {
-            pathSoFar = dir.substr(0, i + 1);
-#ifdef _WIN32
-            _mkdir(pathSoFar.c_str());
-#else
-            mkdir(pathSoFar.c_str(), 0755);
-#endif
-        }
-    }
+void  AudioService::setProbeHeightFt(float ft)
+{
+    if (mProbeManager) mProbeManager->setProbeHeightFt(ft);
+}
 
-    return dir + "/" + missionName + ".probes";
+float AudioService::getProbeHeightFt() const
+{
+    return mProbeManager ? mProbeManager->getProbeHeightFt() : 5.0f;
+}
+
+const std::vector<Vector3> &AudioService::getProbePositions() const
+{
+    static const std::vector<Vector3> kEmpty;
+    return mProbeManager ? mProbeManager->getProbePositions() : kEmpty;
 }
 
 bool AudioService::bakeProbes(const std::string &outputPath,
                                std::atomic<float> *progress,
                                float spacing, float height)
 {
-    if (!mIplContext || !mIplScene) {
+    if (!mProbeManager || !mIplScene) {
         LOG_ERROR("AudioService: cannot bake probes — no acoustic scene");
         return false;
     }
 
-    // Negative sentinel → use the service's configured spacing/height. Callers
-    // who want an explicit one-off bake spacing can still pass a positive value.
-    if (spacing <= 0.0f) spacing = mProbeSpacingFt;
-    if (height  <= 0.0f) height  = mProbeHeightFt;
+    // Snapshot the bake-time tuning into ProbeBakeParams. The override
+    // sentinels (negative) are forwarded so ProbeManager falls back to its
+    // own configured spacing/height.
+    ProbeBakeParams params;
+    params.sceneMin              = mSceneMin;
+    params.sceneMax              = mSceneMax;
+    params.propagationMaxDist    = mPropagationMaxDist;
+    params.reflectionNumRays     = mReflectionNumRays;
+    params.reflectionNumBounces  = mReflectionNumBounces;
+    params.reflectionDuration    = mReflectionDuration;
+    params.bakeDiffuseSamples    = mBakeDiffuseSamples;
+    params.simulatorThreads      = mSimulatorThreadsCfg;
+    params.ambisonicsOrder       = mAmbisonicsOrder;
+    params.sceneType             = mSceneTypeCfg;
+    params.spacingFtOverride     = spacing;
+    params.heightFtOverride      = height;
 
-    AUDIO_LOG( "Baking probes: spacing=%.1f height=%.1f ...\n", spacing, height);
-
-    // Step 1: Generate probes on a uniform floor grid
-    IPLProbeArray probeArray = nullptr;
-    IPLerror err = iplProbeArrayCreate(mIplContext, &probeArray);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: iplProbeArrayCreate failed (%d)", err);
-        return false;
-    }
-
-    // Build the OBB transform for IPL_PROBEGENERATIONTYPE_UNIFORMFLOOR. Per
-    // the Steam Audio docs, the transform maps an axis-aligned UNIT CUBE
-    // [0,1]³ into world space. Probes are then generated by raycasting along
-    // IPL -Y (its "down") to find floor surfaces, offset by `height` along
-    // IPL +Y.
-    //
-    // Two non-obvious things to get right:
-    //   1. The unit cube is [0,1]³ — NOT [-0.5, 0.5]³.  Using `center` as
-    //      the translation would silently shift the entire probe volume by
-    //      `extent/2` (symptoms: probes outside the playable area, above
-    //      the player, behind walls in the +shift direction).
-    //   2. IPL is Y-up while the engine is Z-up.  The mesh, listener, and
-    //      sources are all in IPL Y-up space at this point (engineToIplPos
-    //      at the boundary), so the probe OBB must be defined in IPL space
-    //      too — otherwise UNIFORMFLOOR raycasts along the wrong axis and
-    //      places probes wherever it happens to hit a wall.
-    //
-    // Mapping: an engine AABB at [(minX,minY,minZ), (maxX,maxY,maxZ)] in
-    // feet maps to IPL [(minX, minZ, -maxY), (maxX, maxZ, -minY)] in meters.
-    // We expand by one spacing on every side so probes cover near-edge
-    // areas, then express the result as a [0,1]³ scale + translation.
-    const Vector3 marginFt(spacing);
-    Vector3 origMin = mSceneMin - marginFt;       // engine-space, feet
-    Vector3 origMax = mSceneMax + marginFt;
-    IPLVector3 iplCornerA = engineToIplPos(origMin);  // one IPL-space corner
-    IPLVector3 iplCornerB = engineToIplPos(origMax);  // the opposite one
-    IPLVector3 iplMin{ std::min(iplCornerA.x, iplCornerB.x),
-                       std::min(iplCornerA.y, iplCornerB.y),
-                       std::min(iplCornerA.z, iplCornerB.z) };
-    IPLVector3 iplMax{ std::max(iplCornerA.x, iplCornerB.x),
-                       std::max(iplCornerA.y, iplCornerB.y),
-                       std::max(iplCornerA.z, iplCornerB.z) };
-
-    IPLMatrix4x4 transform{};
-    transform.elements[0][0] = iplMax.x - iplMin.x;  // IPL X scale (m)
-    transform.elements[1][1] = iplMax.y - iplMin.y;  // IPL Y scale (m) — engine Z extent
-    transform.elements[2][2] = iplMax.z - iplMin.z;  // IPL Z scale (m) — engine Y extent
-    transform.elements[3][0] = iplMin.x;             // IPL X translation
-    transform.elements[3][1] = iplMin.y;             // IPL Y translation
-    transform.elements[3][2] = iplMin.z;             // IPL Z translation
-    transform.elements[3][3] = 1.0f;
-
-    AUDIO_LOG( "Scene bounds engine-ft: (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)\n"
-               "Probe OBB engine-ft:     (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)\n"
-               "Probe OBB IPL-m:         (%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f)\n",
-                 mSceneMin.x, mSceneMin.y, mSceneMin.z,
-                 mSceneMax.x, mSceneMax.y, mSceneMax.z,
-                 origMin.x, origMin.y, origMin.z,
-                 origMax.x, origMax.y, origMax.z,
-                 iplMin.x, iplMin.y, iplMin.z,
-                 iplMax.x, iplMax.y, iplMax.z);
-
-    IPLProbeGenerationParams genParams{};
-    genParams.type = IPL_PROBEGENERATIONTYPE_UNIFORMFLOOR;
-    // spacing/height are passed in feet; IPL grid is in meters.
-    genParams.spacing = spacing * kFeetToMeters;
-    genParams.height  = height  * kFeetToMeters;
-    genParams.transform = transform;
-
-    iplProbeArrayGenerateProbes(probeArray, mIplScene, &genParams);
-
-    int numProbes = iplProbeArrayGetNumProbes(probeArray);
-    AUDIO_LOG( "Generated %d probes (spacing=%.1f, height=%.1f)\n",
-                 numProbes, spacing, height);
-
-    if (numProbes == 0) {
-        LOG_ERROR("AudioService: no probes generated — check scene geometry");
-        iplProbeArrayRelease(&probeArray);
-        return false;
-    }
-
-    // Step 2: Create probe batch and add the generated probes
-    IPLProbeBatch probeBatch = nullptr;
-    err = iplProbeBatchCreate(mIplContext, &probeBatch);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: iplProbeBatchCreate failed (%d)", err);
-        iplProbeArrayRelease(&probeArray);
-        return false;
-    }
-
-    // Snapshot probe centers BEFORE releasing the probeArray. We mirror them
-    // into engine feet (Z-up) so the renderer's debug overlay doesn't need
-    // to know anything about IPL's coordinate system.  iplToEnginePos
-    // reverses both the metric scale AND the Y-up→Z-up axis swap that we
-    // applied at the boundary above.
-    mProbePositions.clear();
-    mProbePositions.reserve(static_cast<size_t>(numProbes));
-    for (int i = 0; i < numProbes; ++i) {
-        IPLSphere s = iplProbeArrayGetProbe(probeArray, i);
-        mProbePositions.push_back(iplToEnginePos(s.center));
-    }
-
-    iplProbeBatchAddProbeArray(probeBatch, probeArray);
-    iplProbeBatchCommit(probeBatch);
-    iplProbeArrayRelease(&probeArray);  // batch now owns the probe data
-
-    // Step 3: Bake pathing data (visibility graph + shortest paths)
-    AUDIO_LOG( "Baking pathing data for %d probes...\n", numProbes);
-
-    IPLBakedDataIdentifier pathId{};
-    pathId.type = IPL_BAKEDDATATYPE_PATHING;
-    pathId.variation = IPL_BAKEDDATAVARIATION_DYNAMIC;
-
-    // Pathing bake — all distance-shaped fields cross into IPL, so feet → meters.
-    // `spacing` and `mPropagationMaxDist` live in engine feet; convert here.
-    IPLPathBakeParams bakeParams{};
-    bakeParams.scene = mIplScene;
-    bakeParams.probeBatch = probeBatch;
-    bakeParams.identifier = pathId;
-    bakeParams.numSamples = 4;                                   // visibility test samples (rays = numSamples²)
-    bakeParams.radius = spacing * kFeetToMeters;                 // probe influence radius (m)
-    bakeParams.threshold = 0.1f;                                 // visibility threshold (dimensionless)
-    bakeParams.visRange  = mPropagationMaxDist * kFeetToMeters;  // max visibility distance (m)
-    bakeParams.pathRange = mPropagationMaxDist * kFeetToMeters;  // max path length (m)
-    bakeParams.numThreads = 4;                                   // parallel baking
-
-    auto bakeStart = std::chrono::steady_clock::now();
-
-    iplPathBakerBake(mIplContext, &bakeParams,
-        [](IPLfloat32 p, void *userData) {
-            auto *prog = static_cast<std::atomic<float> *>(userData);
-            if (prog) prog->store(p, std::memory_order_relaxed);
-        },
-        progress);
-
-    auto bakeEnd = std::chrono::steady_clock::now();
-    float bakeSec = std::chrono::duration<float>(bakeEnd - bakeStart).count();
-    AUDIO_LOG( "Pathing bake complete: %d probes in %.1f seconds\n",
-                 numProbes, bakeSec);
-
-    // Step 3b: Bake reflection IRs at each probe position.
-    // This pre-computes reverb impulse responses so that voices outside the
-    // real-time top-N can use baked reverb instead of being dry.
-    // Uses REVERB variation — one bake covers all sources (listener-position-based).
-    AUDIO_LOG( "Baking reflection IRs for %d probes (rays=%d bounces=%d duration=%.1fs)...\n",
-                 numProbes, mReflectionNumRays, mReflectionNumBounces, mReflectionDuration);
-
-    IPLBakedDataIdentifier reflId{};
-    reflId.type = IPL_BAKEDDATATYPE_REFLECTIONS;
-    reflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
-
-    unsigned int hwThreads = std::thread::hardware_concurrency();
-    int bakeThreads = (mSimulatorThreadsCfg > 0)
-        ? mSimulatorThreadsCfg
-        : std::max(2u, hwThreads > 2 ? hwThreads - 2 : 2u);
-
-    IPLReflectionsBakeParams reflBakeParams{};
-    reflBakeParams.scene = mIplScene;
-    reflBakeParams.probeBatch = probeBatch;
-    reflBakeParams.sceneType = (mSceneTypeCfg == "embree")
-        ? IPL_SCENETYPE_EMBREE : IPL_SCENETYPE_DEFAULT;
-    reflBakeParams.identifier = reflId;
-    reflBakeParams.bakeFlags = static_cast<IPLReflectionsBakeFlags>(
-        IPL_REFLECTIONSBAKEFLAGS_BAKECONVOLUTION);
-    reflBakeParams.numRays = mReflectionNumRays;
-    reflBakeParams.numDiffuseSamples = mBakeDiffuseSamples;
-    reflBakeParams.numBounces = mReflectionNumBounces;
-    reflBakeParams.simulatedDuration = mReflectionDuration;
-    reflBakeParams.savedDuration = mReflectionDuration;  // save full IR
-    reflBakeParams.order = mAmbisonicsOrder;
-    reflBakeParams.numThreads = bakeThreads;
-    // irradianceMinDistance is in METERS (Steam Audio convention) — clamps the
-    // inner radius of the irradiance integral to avoid singularities for sources
-    // very close to a probe. 1.0m ≈ 3.28 ft is a sensible physical default.
-    reflBakeParams.irradianceMinDistance = 1.0f;
-
-    auto reflBakeStart = std::chrono::steady_clock::now();
-
-    iplReflectionsBakerBake(mIplContext, &reflBakeParams,
-        [](IPLfloat32 p, void *userData) {
-            auto *prog = static_cast<std::atomic<float> *>(userData);
-            if (prog) prog->store(p, std::memory_order_relaxed);
-        },
-        progress);
-
-    auto reflBakeEnd = std::chrono::steady_clock::now();
-    float reflBakeSec = std::chrono::duration<float>(reflBakeEnd - reflBakeStart).count();
-    AUDIO_LOG( "Reflection bake complete: %d probes in %.1f seconds\n",
-                 numProbes, reflBakeSec);
-
-    // Step 3c: Per-probe IR energy audit.
-    //
-    // Baked IRs vary wildly in total energy across probes. Probes sitting in
-    // small enclosed spaces with hard surfaces accumulate disproportionate
-    // diffuse-field energy compared to probes in open or absorbent areas.
-    // When the listener's nearest probe is one of these "hot" IRs and a
-    // continuous source (ambient) feeds the convolver, the wet bus saturates.
-    //
-    // This audit dumps per-probe metrics so we can identify outliers and
-    // decide whether the fix belongs in bake parameters (absorption, bounces),
-    // in probe rejection (skip outliers), or in IR normalization.
-    //
-    // The Steam Audio energy field is a 3D histogram of size
-    // (#channels × #bands × #bins), with each bin being 10 ms of arrival time.
-    // We compute:
-    //   - totalEnergy: integrated energy across all channels/bands/bins
-    //     (broadband, omnidirectional reverb intensity)
-    //   - peakBin:     largest single-bin value (early-reflection clustering)
-    //   - earlyEnergy: integrated energy in the first 50 ms (5 bins) — high
-    //                  values mean clustered close-wall reflections
-    //   - bandEnergy[3]: per-band totals — to spot frequency-specific spikes
-    //                    (hard walls reflect highs; absorbent surfaces don't)
-    //
-    // Output is a `.energy.csv` sidecar next to the .probes file, plus a
-    // stderr summary noting min/max/median total energy so outliers are
-    // visible without grepping the CSV.
-    {
-        IPLEnergyFieldSettings efSettings{};
-        efSettings.duration = mReflectionDuration;
-        efSettings.order    = mAmbisonicsOrder;
-        IPLEnergyField energyField = nullptr;
-        IPLerror efErr = iplEnergyFieldCreate(mIplContext, &efSettings,
-                                              &energyField);
-        if (efErr != IPL_STATUS_SUCCESS || !energyField) {
-            LOG_INFO("AudioService: skipping IR energy audit — "
-                     "iplEnergyFieldCreate returned %d", efErr);
-        } else {
-            int numChannels = iplEnergyFieldGetNumChannels(energyField);
-            int numBins     = iplEnergyFieldGetNumBins(energyField);
-            int numBands    = IPL_NUM_BANDS;
-
-            std::string energyPath = outputPath + ".energy.csv";
-            FILE *ef = std::fopen(energyPath.c_str(), "w");
-            if (ef) {
-                std::fprintf(ef, "# Per-probe IR energy metrics — written by "
-                                 "AudioService::bakeProbes.\n"
-                                 "# duration=%.2fs order=%d channels=%d "
-                                 "bands=%d bins=%d (10ms per bin)\n",
-                             mReflectionDuration, mAmbisonicsOrder,
-                             numChannels, numBands, numBins);
-                std::fprintf(ef, "index,x,y,z,totalEnergy,peakBin,"
-                                 "earlyEnergy50ms,bandLow,bandMid,bandHigh\n");
-            }
-
-            std::vector<float> totals(numProbes, 0.0f);
-            int earlyBins = std::min(5, numBins);  // first 50 ms
-
-            for (int p = 0; p < numProbes; ++p) {
-                iplEnergyFieldReset(energyField);
-                iplProbeBatchGetEnergyField(probeBatch, &reflId, p,
-                                             energyField);
-
-                // Only the W channel (channel 0) is the omnidirectional
-                // energy term and is guaranteed non-negative. Higher-order
-                // Ambisonic channels are signed spherical-harmonic
-                // coefficients that encode directional variation; summing
-                // them produces meaningless near-zero/negative totals
-                // because the harmonics cancel. The W coefficient is
-                // proportional to the angular integral of incident energy,
-                // which is exactly the per-probe "total reverb energy"
-                // metric we want.
-                double totalEnergy = 0.0;
-                double earlyEnergy = 0.0;
-                float  peakBin     = 0.0f;
-                double bandEnergy[IPL_NUM_BANDS] = {0.0, 0.0, 0.0};
-
-                for (int b = 0; b < numBands; ++b) {
-                    const float *bins = iplEnergyFieldGetBand(
-                        energyField, /*channel=*/0, b);
-                    if (!bins) continue;
-                    for (int t = 0; t < numBins; ++t) {
-                        float v = bins[t];
-                        totalEnergy   += v;
-                        bandEnergy[b] += v;
-                        if (t < earlyBins) earlyEnergy += v;
-                        if (v > peakBin) peakBin = v;
-                    }
-                }
-                totals[p] = static_cast<float>(totalEnergy);
-
-                if (ef && p < static_cast<int>(mProbePositions.size())) {
-                    const auto &pos = mProbePositions[p];
-                    std::fprintf(ef,
-                        "%d,%.3f,%.3f,%.3f,%.6e,%.6e,%.6e,%.6e,%.6e,%.6e\n",
-                        p, pos.x, pos.y, pos.z,
-                        totalEnergy, peakBin, earlyEnergy,
-                        bandEnergy[0], bandEnergy[1], bandEnergy[2]);
-                }
-            }
-
-            if (ef) {
-                std::fclose(ef);
-                AUDIO_LOG("Wrote probe IR energy sidecar '%s' (%d rows)\n",
-                          energyPath.c_str(), numProbes);
-            }
-
-            // Stderr summary: min/median/max + indices so the outliers
-            // jump out without inspecting the CSV. Probes whose totalEnergy
-            // sits >10× above the median are the suspects for runaway
-            // reverb when the listener parks near them.
-            if (numProbes > 0) {
-                std::vector<int> sorted(numProbes);
-                for (int i = 0; i < numProbes; ++i) sorted[i] = i;
-                std::sort(sorted.begin(), sorted.end(),
-                          [&](int a, int b){ return totals[a] < totals[b]; });
-                int minIdx = sorted.front();
-                int maxIdx = sorted.back();
-                int medIdx = sorted[numProbes / 2];
-                float minE = totals[minIdx];
-                float medE = totals[medIdx];
-                float maxE = totals[maxIdx];
-                int hotCount = 0;
-                float hotThreshold = medE * 10.0f;
-                for (float t : totals)
-                    if (t > hotThreshold) ++hotCount;
-                AUDIO_LOG("[PROBE_ENERGY] min=%.3e (probe %d) "
-                          "median=%.3e (probe %d) max=%.3e (probe %d) "
-                          "hot(>10×median)=%d/%d\n",
-                          minE, minIdx, medE, medIdx, maxE, maxIdx,
-                          hotCount, numProbes);
-            }
-
-            iplEnergyFieldRelease(&energyField);
-        }
-    }
-
-    // Step 4: Serialize to memory buffer
-    IPLSerializedObjectSettings soSettings{};
-    soSettings.data = nullptr;
-    soSettings.size = 0;
-
-    IPLSerializedObject serializedObject = nullptr;
-    err = iplSerializedObjectCreate(mIplContext, &soSettings, &serializedObject);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: iplSerializedObjectCreate failed (%d)", err);
-        iplProbeBatchRelease(&probeBatch);
-        return false;
-    }
-
-    iplProbeBatchSave(probeBatch, serializedObject);
-
-    IPLsize dataSize = iplSerializedObjectGetSize(serializedObject);
-    IPLbyte *data = iplSerializedObjectGetData(serializedObject);
-
-    // Step 5: Round-trip validation — deserialize in memory and verify probe count
-    // matches what we baked. Catches serialization bugs before they hit disk.
-    {
-        IPLSerializedObjectSettings rtSettings{};
-        rtSettings.data = data;
-        rtSettings.size = dataSize;
-        IPLSerializedObject rtObj = nullptr;
-        IPLProbeBatch rtBatch = nullptr;
-        err = iplSerializedObjectCreate(mIplContext, &rtSettings, &rtObj);
-        if (err != IPL_STATUS_SUCCESS) {
-            LOG_ERROR("AudioService: round-trip validation failed — "
-                      "iplSerializedObjectCreate returned %d", err);
-            iplSerializedObjectRelease(&serializedObject);
-            iplProbeBatchRelease(&probeBatch);
-            return false;
-        }
-        err = iplProbeBatchLoad(mIplContext, rtObj, &rtBatch);
-        iplSerializedObjectRelease(&rtObj);
-        if (err != IPL_STATUS_SUCCESS) {
-            LOG_ERROR("AudioService: round-trip validation failed — "
-                      "iplProbeBatchLoad returned %d", err);
-            iplSerializedObjectRelease(&serializedObject);
-            iplProbeBatchRelease(&probeBatch);
-            return false;
-        }
-        int rtCount = iplProbeBatchGetNumProbes(rtBatch);
-        iplProbeBatchRelease(&rtBatch);
-        if (rtCount != numProbes) {
-            LOG_ERROR("AudioService: round-trip validation failed — "
-                      "expected %d probes, deserialized %d", numProbes, rtCount);
-            iplSerializedObjectRelease(&serializedObject);
-            iplProbeBatchRelease(&probeBatch);
-            return false;
-        }
-        AUDIO_LOG( "Round-trip validation passed (%d probes)\n", rtCount);
-    }
-
-    // Step 6: Write to disk with integrity header (atomic tmp+rename)
-    bool writeOk = writeProbeFile(
-        outputPath,
-        reinterpret_cast<const uint8_t *>(data),
-        static_cast<size_t>(dataSize),
-        static_cast<uint32_t>(numProbes));
-
-    iplSerializedObjectRelease(&serializedObject);
-    iplProbeBatchRelease(&probeBatch);
-
-    if (!writeOk) {
-        LOG_ERROR("AudioService: failed to write probe file '%s'", outputPath.c_str());
-        return false;
-    }
-
-    AUDIO_LOG( "Saved %d probes to '%s' (%zu bytes + %zu header)\n",
-                 numProbes, outputPath.c_str(), static_cast<size_t>(dataSize),
-                 kProbeFileHeaderSize);
-
-    // Sidecar: dump probe positions as a plain CSV for the debug overlay.
-    // The Steam Audio public API does NOT expose per-probe positions on a
-    // deserialized IPLProbeBatch, so we mirror them ourselves. Plain text
-    // keeps the file inspectable; cost is ~25 bytes/probe so even 50k probes
-    // fits in ~1.2 MB. Failure to write is non-fatal — the overlay just
-    // won't have positions until the next bake.
-    {
-        std::string posPath = outputPath + ".positions.csv";
-        FILE *pf = std::fopen(posPath.c_str(), "w");
-        if (pf) {
-            std::fprintf(pf, "# Probe positions in engine feet — written by "
-                              "AudioService::bakeProbes. spacing=%.2f height=%.2f\n",
-                          spacing, height);
-            std::fprintf(pf, "index,x,y,z\n");
-            for (size_t i = 0; i < mProbePositions.size(); ++i) {
-                const auto &p = mProbePositions[i];
-                std::fprintf(pf, "%zu,%.3f,%.3f,%.3f\n", i, p.x, p.y, p.z);
-            }
-            std::fclose(pf);
-            AUDIO_LOG("Wrote probe positions sidecar '%s' (%zu rows)\n",
-                      posPath.c_str(), mProbePositions.size());
-        } else {
-            LOG_INFO("AudioService: could not write probe positions sidecar '%s' "
-                     "(debug overlay will be empty until next bake)",
-                     posPath.c_str());
-        }
-    }
-    return true;
+    return mProbeManager->bakeProbes(mIplScene, outputPath, params, progress);
 }
 
 //------------------------------------------------------
 bool AudioService::loadProbes(const std::string &probePath)
 {
-    if (!mIplContext || !mReflectionSimulator) {
-        LOG_ERROR("AudioService: cannot load probes — no context/simulator");
+    if (!mProbeManager) {
+        LOG_ERROR("AudioService: cannot load probes — ProbeManager not initialized");
         return false;
     }
-
-    // Release any previously loaded probes
-    if (mIplProbeBatch) {
-        waitForReflectionThread();
-        iplSimulatorRemoveProbeBatch(mReflectionSimulator, mIplProbeBatch);
-        iplSimulatorCommit(mReflectionSimulator);
-        iplProbeBatchRelease(&mIplProbeBatch);
-        mIplProbeBatch = nullptr;
-        mProbeCount = 0;
-    }
-    // Drop stale positions; we'll repopulate from the sidecar (or leave empty
-    // if missing — overlay simply won't show anything in that case).
-    mProbePositions.clear();
-
-    // Load and validate the probe file (header + CRC check)
-    ProbeFileHeader hdr;
-    std::vector<uint8_t> payload;
-    ProbeFileStatus status = loadProbeFile(probePath, hdr, payload);
-
-    if (status == ProbeFileStatus::FileNotFound) {
-        LOG_INFO("AudioService: no probe file at '%s' — pathing disabled",
-                 probePath.c_str());
-        return false;
-    }
-
-    if (status != ProbeFileStatus::Ok) {
-        LOG_ERROR("AudioService: probe file '%s' failed validation: %s — "
-                  "delete and re-bake",
-                  probePath.c_str(), probeFileStatusString(status));
-        return false;
-    }
-
-    // Deserialize the validated payload
-    IPLSerializedObjectSettings soSettings{};
-    soSettings.data = reinterpret_cast<IPLbyte *>(payload.data());
-    soSettings.size = static_cast<IPLsize>(payload.size());
-
-    IPLSerializedObject serializedObject = nullptr;
-    IPLerror err = iplSerializedObjectCreate(mIplContext, &soSettings, &serializedObject);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: iplSerializedObjectCreate failed (%d) loading '%s'",
-                  err, probePath.c_str());
-        return false;
-    }
-
-    err = iplProbeBatchLoad(mIplContext, serializedObject, &mIplProbeBatch);
-    iplSerializedObjectRelease(&serializedObject);
-
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: iplProbeBatchLoad failed (%d) for '%s'",
-                  err, probePath.c_str());
-        return false;
-    }
-
-    iplProbeBatchCommit(mIplProbeBatch);
-    mProbeCount = iplProbeBatchGetNumProbes(mIplProbeBatch);
-
-    // Cross-check: probe count from header must match what Steam Audio loaded
-    if (mProbeCount != static_cast<int>(hdr.probeCount)) {
-        LOG_ERROR("AudioService: probe count mismatch — header says %u, "
-                  "Steam Audio loaded %d — discarding",
-                  hdr.probeCount, mProbeCount);
-        iplProbeBatchRelease(&mIplProbeBatch);
-        mIplProbeBatch = nullptr;
-        mProbeCount = 0;
-        return false;
-    }
-
-    // Register with simulator
-    waitForReflectionThread();
-    iplSimulatorAddProbeBatch(mReflectionSimulator, mIplProbeBatch);
-    iplSimulatorCommit(mReflectionSimulator);
-
-    // Check if the probe batch contains baked reflection IRs.
-    // If so, non-top-N voices can use baked reverb instead of being dry.
-    IPLBakedDataIdentifier reflId{};
-    reflId.type = IPL_BAKEDDATATYPE_REFLECTIONS;
-    reflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
-    IPLsize reflDataSize = iplProbeBatchGetDataSize(mIplProbeBatch, &reflId);
-    mProbesHaveReflections = (reflDataSize > 0);
-
-    AUDIO_LOG( "AudioService: loaded %d probes from '%s' "
-                 "(reflections=%s, refl_size=%zu bytes, crc=0x%08x)\n",
-                 mProbeCount, probePath.c_str(),
-                 mProbesHaveReflections ? "yes" : "no",
-                 static_cast<size_t>(reflDataSize), hdr.crc32);
-
-    // Load the positions sidecar (written by bakeProbes alongside the .probes
-    // file). The Steam Audio public API doesn't expose per-probe positions on
-    // a deserialized batch, so we keep our own mirror. If the sidecar is
-    // missing or stale (count mismatch), debug overlays will simply be empty
-    // until the next bake.
-    std::string posPath = probePath + ".positions.csv";
-    FILE *pf = std::fopen(posPath.c_str(), "r");
-    if (pf) {
-        char line[256];
-        std::vector<Vector3> loaded;
-        loaded.reserve(static_cast<size_t>(mProbeCount));
-        while (std::fgets(line, sizeof(line), pf)) {
-            if (line[0] == '#' || line[0] == 'i') continue;  // comment or header row
-            int idx = 0;
-            float x = 0.0f, y = 0.0f, z = 0.0f;
-            if (std::sscanf(line, "%d,%f,%f,%f", &idx, &x, &y, &z) == 4) {
-                loaded.emplace_back(x, y, z);
-            }
-        }
-        std::fclose(pf);
-        if (static_cast<int>(loaded.size()) == mProbeCount) {
-            mProbePositions = std::move(loaded);
-            AUDIO_LOG("AudioService: loaded %zu probe positions from sidecar '%s'\n",
-                      mProbePositions.size(), posPath.c_str());
-        } else {
-            LOG_INFO("AudioService: probe positions sidecar count mismatch "
-                     "(%zu in sidecar vs %d in batch) — overlay disabled until re-bake",
-                     loaded.size(), mProbeCount);
-        }
-    } else {
-        LOG_INFO("AudioService: no probe positions sidecar at '%s' — "
-                 "overlay disabled until re-bake (existing probe data is fine)",
-                 posPath.c_str());
-    }
-    return true;
+    return mProbeManager->loadProbes(probePath, mReflectionSimulator);
 }
+
 
 } // namespace Darkness
