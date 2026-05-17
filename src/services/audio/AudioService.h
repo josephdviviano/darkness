@@ -390,10 +390,13 @@ public:
     void setDiffuseSamples(int n) { mDiffuseSamples = std::max(16, std::min(n, 256)); }
     void setBakeDiffuseSamples(int n) { mBakeDiffuseSamples = std::max(32, std::min(n, 512)); }
 
-    void setOcclusionRadius(float r) { mOcclusionRadius = std::max(0.1f, std::min(r, 200.0f)); }
-    float getOcclusionRadius() const { return mOcclusionRadius; }
-    void setOcclusionSamples(int n) { mOcclusionSamples = std::max(4, std::min(n, 64)); }
-    int  getOcclusionSamples() const { return mOcclusionSamples; }
+    // Occlusion tuning — storage + clamps live in AudioOcclusion.
+    // These facades preserve the historical public AudioService API so
+    // RenderConfig and DebugConsole keep working unchanged.
+    void  setOcclusionRadius(float r);
+    float getOcclusionRadius() const;
+    void  setOcclusionSamples(int n);
+    int   getOcclusionSamples() const;
 
     /// Get the current listener position (for door sound placement, etc.)
     Vector3 getListenerPos() const { return mListenerPos; }
@@ -704,9 +707,23 @@ private:
     PropertyServicePtr mPropertyService;
     ObjectServicePtr mObjectService;
 
-    // ── Portal blocking factors for AI hearing propagation ──
-    // Key: (room1 << 16) | room2 (bidirectional — stored both ways)
-    std::unordered_map<uint32_t, float> mBlockingFactors;
+    // ── Sound propagation through portal graph ──
+    //
+    // The portal blocking factor map (was mBlockingFactors), the per-room
+    // LoudRoom transmission map (was mRoomTransmission), and the BFS
+    // forwarder into RoomService::propagateSoundPath all live in
+    // SoundPropagation. AudioService keeps thin facades (propagateSound,
+    // setBlockingFactor, getBlockingFactor) that forward to it; the
+    // per-voice loopStep path reads / mutates it directly via this owner.
+    std::unique_ptr<class SoundPropagation> mSoundPropagation;
+
+    // ── Volumetric occlusion configuration ──
+    //
+    // Radius (engine feet) + sample count for Steam Audio's volumetric
+    // occlusion model. setOcclusionRadius / setOcclusionSamples (and the
+    // public getters) forward to this. The clamp on radius is widened to
+    // [0.1, 200] (was [0.3, 30]) — preserved here.
+    std::unique_ptr<class AudioOcclusion> mAudioOcclusion;
 
     // Voice handle allocation now lives in VoicePool (mVoicePool->allocate()).
     // The previous mNextHandle counter moved with it.
@@ -927,11 +944,10 @@ private:
     void loadSoundChunkDatabases(const FileGroupPtr &db);
 
     // ── Texture material mapping (for footstep schema selection) ──
-
-    /// Per-room LoudRoom transmission factor (keyed by room ID, default 1.0).
-    /// Values < 1.0 dampen sound passing through the room, > 1.0 amplify.
-    /// Parsed from P$LoudRoom property on room objects.
-    std::unordered_map<int32_t, float> mRoomTransmission;
+    //
+    // Per-room LoudRoom transmission factors moved to SoundPropagation
+    // (mSoundPropagation->setRoomTransmission / getRoomTransmission).
+    // Used in propagation BFS as the per-room transmission multiplier.
 
     /// Per-texture material keyword (indexed by TXLIST texture index).
     /// E.g., "stone", "metal", "wood", "carpet", "generic" (default).
@@ -1042,16 +1058,12 @@ private:
     /// Diffuse scattering samples for probe baking (32-512, higher=smoother)
     int mBakeDiffuseSamples = 128;
 
-    /// Volumetric occlusion source sphere radius (engine feet — converted to
-    /// meters at the IPL boundary). Larger = smoother transitions around corners,
-    /// smaller = tighter response. ~5 ft = lamp/small source, ~10 = small machine,
-    /// ~16 = large machinery; the door/local-sound floor in AudioService.cpp
-    /// raises this to 16 ft for skipPortalRouting voices so doorways aren't
-    /// over-occluded by narrow frames.
-    float mOcclusionRadius = 10.0f;
-    /// Number of ray samples for volumetric occlusion (4-64).
-    /// More samples = smoother gradient, higher CPU cost per source.
-    int mOcclusionSamples = 16;
+    // Volumetric occlusion sphere radius + sample count moved to
+    // AudioOcclusion (mAudioOcclusion). The setters/getters above are
+    // facades that forward into it. Larger radius = smoother transitions
+    // around corners; the door/local-sound floor in AudioService.cpp
+    // raises radius to 16 ft for skipPortalRouting voices so doorways
+    // aren't over-occluded by narrow frames.
 
     /// Propagation layer toggles (debug — all on by default)
     bool mPortalRoutingEnabled = true;   ///< Portal-graph routing through doorways
@@ -1175,11 +1187,11 @@ private:
     /// to prevent Steam Audio from accessing freed source data.
     void waitForReflectionThread();
 
-    /// Room-explicit propagateSound overload (bypasses internal roomFromPoint).
-    SoundPropInfo propagateSound(const Vector3 &sourcePos,
-                                  const Vector3 &listenerPos,
-                                  Room *sourceRoom, Room *listenerRoom,
-                                  float maxDist = SOUND_MAX_DIST) const;
+    // Room-explicit propagateSound is now SoundPropagation's responsibility
+    // and takes a RoomID (int32_t) — see SoundPropagation::propagateSound.
+    // Resolving Room* from an ID at call time eliminates the latent
+    // dangling-pointer hazard the old `Room *` overload had if the room
+    // database was rebuilt between caller capture and BFS.
 
     // ── Listener state (updated each frame from render binary) ──
 
