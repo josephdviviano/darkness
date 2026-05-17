@@ -82,6 +82,25 @@ public:
     /// Portal ID on the other side of this portal
     int32_t getDestPortalID() const { return mDestPortal; }
 
+    /// True if this portal represents an actual physical opening — a
+    /// hole in the BSP geometry that sound can traverse. False for
+    /// "phantom" portals: DromEd records that exist in ROOM_DB but
+    /// where the BSP between the two rooms is in fact solid. Phantoms
+    /// arise because ROOM_DB encodes *logical spatial adjacency* (two
+    /// rooms share a face) while the BSP encodes *visible architecture*
+    /// (which may have a wall in that face). The original Dark Engine
+    /// had no mechanism to distinguish them and routed sound through
+    /// every ROOM_DB portal regardless — its other approximations
+    /// (coarser BFS heuristic, steeper attenuation curve) implicitly
+    /// masked the resulting artefacts.
+    ///
+    /// Set by RoomService::validatePortals at level load, which calls
+    /// the renderer-supplied BSP raycaster across each portal's plane.
+    /// Defaults to TRUE (assume valid) so missions loaded without a
+    /// validator behave like the original engine.
+    bool isAcousticallyValid() const { return mAcousticallyValid; }
+    void setAcousticallyValid(bool v) { mAcousticallyValid = v; }
+
     /// Number of edge planes defining the portal boundary
     uint32_t getEdgeCount() const { return mEdgeCount; }
 
@@ -156,6 +175,9 @@ private:
     Vector3 mCenter;
     /// portal ID on the other side of this portal
     int32_t mDestPortal;
+    /// BSP-validation result. See isAcousticallyValid() for the model.
+    /// Default true so unvalidated missions match original-engine behavior.
+    bool mAcousticallyValid = true;
 };
 
 /// Shared pointer to a room portal instance
