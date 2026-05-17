@@ -32,6 +32,7 @@
 #include "DarknessMath.h"
 #include "database/DatabaseCommon.h"
 #include "loop/LoopCommon.h"
+#include "audio/AudioDSPChain.h"
 #include "audio/SchemaTypes.h"
 #include "room/RoomService.h"  // SoundPropInfo / SoundPropParams / SoundPathHop
 
@@ -466,54 +467,60 @@ public:
     void setProbePathingEnabled(bool v) { mProbePathingEnabled = v; }
     bool getProbePathingEnabled() const { return mProbePathingEnabled; }
 
-    // ── Master bus DSP chain config (applied when reflection pipeline initializes) ──
+    // ── Master bus DSP chain + mixer + spatialization + door LPF ──
+    //
+    // Storage and clamps live in AudioDSPChain (see AudioDSPChain.h). These
+    // facades preserve the historical public AudioService API used by
+    // RenderConfig and DebugConsole so callers don't need any changes.
+    // setMaster/Direct/ReflectionGain stay out-of-line because they also
+    // poke the live ReflectionMixNode (private to AudioService.cpp).
 
     /// Configure the soft limiter (prevents digital clipping)
-    void setDSPLimiterEnabled(bool v) { mDSPLimiterEnabled = v; }
-    void setDSPLimiterKnee(float k) { mDSPLimiterKnee = std::max(0.5f, std::min(k, 0.95f)); }
+    void setDSPLimiterEnabled(bool v) { mDSPChain->setDSPLimiterEnabled(v); }
+    void setDSPLimiterKnee(float k)   { mDSPChain->setDSPLimiterKnee(k); }
 
     /// Configure the master bus compressor (tames transients)
-    void setDSPCompressorEnabled(bool v) { mDSPCompressorEnabled = v; }
-    void setDSPCompThreshold(float t) { mDSPCompThreshold = std::max(-30.0f, std::min(t, 0.0f)); }
-    void setDSPCompRatio(float r) { mDSPCompRatio = std::max(1.5f, std::min(r, 10.0f)); }
-    void setDSPCompAttackMs(float ms) { mDSPCompAttackMs = std::max(1.0f, std::min(ms, 100.0f)); }
-    void setDSPCompReleaseMs(float ms) { mDSPCompReleaseMs = std::max(50.0f, std::min(ms, 2000.0f)); }
+    void setDSPCompressorEnabled(bool v) { mDSPChain->setDSPCompressorEnabled(v); }
+    void setDSPCompThreshold(float t)    { mDSPChain->setDSPCompThreshold(t); }
+    void setDSPCompRatio(float r)        { mDSPChain->setDSPCompRatio(r); }
+    void setDSPCompAttackMs(float ms)    { mDSPChain->setDSPCompAttackMs(ms); }
+    void setDSPCompReleaseMs(float ms)   { mDSPChain->setDSPCompReleaseMs(ms); }
 
     /// Configure the low-shelf EQ (bass boost/cut)
-    void setDSPEQEnabled(bool v) { mDSPEQEnabled = v; }
-    void setDSPEQFreq(float f) { mDSPEQFreq = std::max(60.0f, std::min(f, 500.0f)); }
-    void setDSPEQGain(float g) { mDSPEQGain = std::max(-6.0f, std::min(g, 6.0f)); }
-    void setDSPEQQ(float q) { mDSPEQQ = std::max(0.3f, std::min(q, 2.0f)); }
+    void setDSPEQEnabled(bool v) { mDSPChain->setDSPEQEnabled(v); }
+    void setDSPEQFreq(float f)   { mDSPChain->setDSPEQFreq(f); }
+    void setDSPEQGain(float g)   { mDSPChain->setDSPEQGain(g); }
+    void setDSPEQQ(float q)      { mDSPChain->setDSPEQQ(q); }
 
     /// Configure the ambient ducking system (disabled by default)
-    void setDSPDuckingEnabled(bool v) { mDSPDuckingEnabled = v; }
-    void setDSPDuckAmount(float a) { mDSPDuckAmount = std::max(0.1f, std::min(a, 1.0f)); }
-    void setDSPDuckAttackMs(float ms) { mDSPDuckAttackMs = std::max(10.0f, std::min(ms, 500.0f)); }
-    void setDSPDuckReleaseMs(float ms) { mDSPDuckReleaseMs = std::max(50.0f, std::min(ms, 5000.0f)); }
+    void setDSPDuckingEnabled(bool v)   { mDSPChain->setDSPDuckingEnabled(v); }
+    void setDSPDuckAmount(float a)      { mDSPChain->setDSPDuckAmount(a); }
+    void setDSPDuckAttackMs(float ms)   { mDSPChain->setDSPDuckAttackMs(ms); }
+    void setDSPDuckReleaseMs(float ms)  { mDSPChain->setDSPDuckReleaseMs(ms); }
 
     // ── Mixer / global gains ──
     // Setters push live to the running mix node (if active) so console tweaks
     // take effect immediately without restarting the audio pipeline.
     void  setMasterGain(float g);
-    float getMasterGain() const { return mMasterGain; }
+    float getMasterGain() const { return mDSPChain->getMasterGain(); }
     void  setReflectionGain(float g);
-    float getReflectionGain() const { return mReflectionGain; }
+    float getReflectionGain() const { return mDSPChain->getReflectionGain(); }
     /// Dry-bus multiplier (direct path). Independent of master + reflection
     /// gains — lets you tune the direct/indirect ratio for "around the corner"
     /// audibility without raising overall volume.
     void  setDirectGain(float g);
-    float getDirectGain() const { return mDirectGain; }
-    void  setReflectionRampMs(float ms) { mReflectionRampMs = std::max(1.0f, std::min(ms, 1000.0f)); }
-    float getReflectionRampMs() const { return mReflectionRampMs; }
+    float getDirectGain() const { return mDSPChain->getDirectGain(); }
+    void  setReflectionRampMs(float ms) { mDSPChain->setReflectionRampMs(ms); }
+    float getReflectionRampMs() const { return mDSPChain->getReflectionRampMs(); }
 
     // ── Spatialization (HRTF + distance model) ──
     /// Must be set BEFORE bootstrapFinished()/init — used during HRTF creation.
-    void setHRTFVolume(float v) { mHRTFVolume = std::max(0.0f, std::min(v, 4.0f)); }
+    void setHRTFVolume(float v) { mDSPChain->setHRTFVolume(v); }
     /// "nearest" or "bilinear". Must be set BEFORE per-source effects are created.
-    void setHRTFInterpolation(const std::string& s) { mHRTFInterpolation = (s == "nearest" ? "nearest" : "bilinear"); }
-    void setSpatialBlend(float b) { mSpatialBlend = std::max(0.0f, std::min(b, 1.0f)); }
+    void setHRTFInterpolation(const std::string& s) { mDSPChain->setHRTFInterpolation(s); }
+    void setSpatialBlend(float b) { mDSPChain->setSpatialBlend(b); }
     /// "default" or "inverse_distance"
-    void setDistanceModel(const std::string& s) { mDistanceModel = (s == "inverse_distance" ? "inverse_distance" : "default"); }
+    void setDistanceModel(const std::string& s) { mDSPChain->setDistanceModel(s); }
 
     // ── Propagation tuning ──
     // Setters republish to the audio thread so runtime tweaks (e.g. via the
@@ -528,21 +535,12 @@ public:
         mPropMaxPathDiff = std::max(0.0f, std::min(d, 50.0f));
     }
     float getPropMaxPathDiff() const { return mPropMaxPathDiff; }
-    void  setDoorLpfOpenHz(float hz) {
-        mDoorLpfOpenHz = std::max(1000.0f, std::min(hz, 24000.0f));
-        publishAudioThreadParams();
-    }
-    float getDoorLpfOpenHz() const { return mDoorLpfOpenHz; }
-    void  setDoorLpfBlockedHz(float hz) {
-        mDoorLpfBlockedHz = std::max(100.0f, std::min(hz, 10000.0f));
-        publishAudioThreadParams();
-    }
-    float getDoorLpfBlockedHz() const { return mDoorLpfBlockedHz; }
-    void  setPropMinAttenuation(float a) {
-        mPropMinAttenuation = std::max(0.0f, std::min(a, 0.1f));
-        publishAudioThreadParams();
-    }
-    float getPropMinAttenuation() const { return mPropMinAttenuation; }
+    void  setDoorLpfOpenHz(float hz)    { mDSPChain->setDoorLpfOpenHz(hz); }
+    float getDoorLpfOpenHz() const      { return mDSPChain->getDoorLpfOpenHz(); }
+    void  setDoorLpfBlockedHz(float hz) { mDSPChain->setDoorLpfBlockedHz(hz); }
+    float getDoorLpfBlockedHz() const   { return mDSPChain->getDoorLpfBlockedHz(); }
+    void  setPropMinAttenuation(float a){ mDSPChain->setPropMinAttenuation(a); }
+    float getPropMinAttenuation() const { return mDSPChain->getPropMinAttenuation(); }
 
     // ── Ambient tuning ──
     void setAmbHysteresisStartMul(float m) { mAmbHysteresisStartMul = std::max(1.0f, std::min(m, 5.0f)); }
@@ -1045,41 +1043,17 @@ private:
     bool mPortalRoutingEnabled = true;   ///< Portal-graph routing through doorways
     bool mProbePathingEnabled = true;    ///< Baked probe diffraction (when available)
 
-    // ── Master bus DSP chain config (stored until reflection pipeline init) ──
+    // ── Master bus DSP chain + mixer + spatialization + door LPF config ──
+    //
+    // Limiter / compressor / EQ / ducker tuning, the global master/direct/
+    // reflection gains, the HRTF/spatial-blend/distance-model knobs and the
+    // door LPF + propagation-min-attenuation values all live in
+    // AudioDSPChain. AudioService still seeds the live ReflectionMixNode
+    // from these values inside initReflectionPipeline().
+    std::unique_ptr<AudioDSPChain> mDSPChain = std::make_unique<AudioDSPChain>();
 
-    bool  mDSPLimiterEnabled = true;
-    float mDSPLimiterKnee = 0.8f;
-    bool  mDSPCompressorEnabled = true;
-    float mDSPCompThreshold = -15.0f;
-    float mDSPCompRatio = 3.0f;
-    float mDSPCompAttackMs = 10.0f;
-    float mDSPCompReleaseMs = 250.0f;
-    bool  mDSPEQEnabled = true;
-    float mDSPEQFreq = 120.0f;
-    float mDSPEQGain = 3.0f;
-    float mDSPEQQ    = 0.707f;
-    bool  mDSPDuckingEnabled = false;
-    float mDSPDuckAmount = 0.5f;
-    float mDSPDuckAttackMs = 50.0f;
-    float mDSPDuckReleaseMs = 500.0f;
-
-    // ── Mixer (global gains) ──
-    float mMasterGain        = 1.0f;
-    float mDirectGain        = 1.0f;
-    float mReflectionGain    = 1.0f;
-    float mReflectionRampMs  = 10.0f;
-
-    // ── Spatialization (HRTF + distance attenuation) ──
-    float       mHRTFVolume        = 1.0f;
-    std::string mHRTFInterpolation = "bilinear"; // "nearest" or "bilinear"
-    float       mSpatialBlend      = 1.0f;
-    std::string mDistanceModel     = "default";  // "default" or "inverse_distance"
-
-    // ── Propagation tuning (portal graph + door blocking) ──
+    // ── Propagation tuning (portal graph) ──
     float    mPropagationMaxDist  = 200.0f;
-    float    mDoorLpfOpenHz       = 20000.0f;
-    float    mDoorLpfBlockedHz    = 800.0f;
-    float    mPropMinAttenuation  = 0.001f;
     // N-path BFS knobs. Default 2 = original Dark Engine behavior (the
     // dual-predecessor scheme + MergeSounds). Setters clamp to legal
     // ranges; values plumbed through SoundPropParams in propagateSound.
