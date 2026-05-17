@@ -30,6 +30,8 @@ set(HEADLESS_SERVICES_SOURCES
     ai/AIHearingService.h
     audio/AcousticMaterials.h
     audio/AIHearingData.h
+    audio/AmbientSoundManager.cpp
+    audio/AmbientSoundManager.h
     audio/AudioDSPChain.cpp
     audio/AudioDSPChain.h
     audio/AudioService.cpp
