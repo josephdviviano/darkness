@@ -52,6 +52,8 @@ set(HEADLESS_SERVICES_SOURCES
     audio/SpeechDatabase.h
     audio/SpeechSelector.cpp
     audio/SpeechSelector.h
+    audio/VoicePool.cpp
+    audio/VoicePool.h
     config/ConfigService.cpp
     config/ConfigService.h
     database/DatabaseService.cpp
