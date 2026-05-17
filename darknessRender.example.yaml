@@ -184,7 +184,7 @@ audio:
     radius: 10.0                 # volumetric source sphere (feet, 0.3–30)
     samples: 16                  # rays per source for occlusion gradient (4–64)
     transmission_scale: 1.0      # material transmission multiplier (0.1–100; 10=game-friendly)
-    absorption_scale: 1.0        # material absorption multiplier (0.01–10; <1 = more reflective)
+    absorption_scale: 0.75        # material absorption multiplier (0.01–10; <1 = more reflective)
     diffuse_samples: 64          # realtime scattering samples per bounce (16–256)
     bake_diffuse_samples: 128    # probe-bake scattering samples (32–512; requires re-bake)
 

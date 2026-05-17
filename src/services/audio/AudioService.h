@@ -130,6 +130,27 @@ constexpr SoundHandle SOUND_HANDLE_INVALID = -1;
 /// Active voice — owns WAV data, miniaudio decoder + sound (defined in AudioService.cpp)
 struct ActiveVoice;
 
+/// Debug snapshot of one voice's spatial state — what the propagation
+/// system thinks "where" the voice is. Used by the renderer's
+/// show_vpos overlay to draw per-voice path arrows for diagnosis of
+/// audible jumps. Captured on the main thread from the cached prop
+/// result; no audio-thread synchronisation needed.
+struct VoiceSpatialSnapshot {
+    std::string schemaName;       ///< schema that spawned this voice
+    Vector3     sourcePos;        ///< actual world position
+    Vector3     virtualPos;       ///< prop.virtualPosition (where Steam Audio thinks the source is)
+    bool        reached;          ///< prop.reached
+    bool        usePortal;        ///< true when cross-room (virtualPos != sourcePos)
+    bool        isAmbient;        ///< true for AMB_ENVIRONMENTAL ambients
+    /// Per-portal anchor bend points along the primary path, in
+    /// source→listener order. Empty for same-room / clean-threaded
+    /// paths. The renderer connects these with line segments
+    /// (source → bend₀ → bend₁ → … → bendₙ → listener) to show what
+    /// the propagation algorithm thinks the sound's geometric path
+    /// actually is.
+    std::vector<Vector3> chain;
+};
+
 /// Voice classification, set at startVoice time so the per-class default
 /// directParams (distanceAttenuation = 1.0, occlusion-disabled flags etc.)
 /// can be applied inside createVoiceSource — i.e. before ma_sound_start
@@ -398,6 +419,14 @@ public:
 
     /// Get the current listener position (for door sound placement, etc.)
     Vector3 getListenerPos() const { return mListenerPos; }
+
+    /// Debug snapshot of every active voice's spatial state — source
+    /// position, virtual position (what Steam Audio sees), and reached
+    /// flag. Renderer overlay (`show_vpos`) consumes this to draw
+    /// per-voice path arrows for diagnosing audible jumps. Captured
+    /// from the cached prop result on the main thread; no audio-thread
+    /// synchronisation needed.
+    std::vector<VoiceSpatialSnapshot> getVoiceSpatialSnapshots() const;
 
     /// Returns the P$PrjSound schema name for `objID`, walking the
     /// MetaProp inheritance chain so concrete projectile instances

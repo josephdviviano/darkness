@@ -69,6 +69,11 @@ struct SoundPathRecord {
     /// distinguishes path-classes when two paths converge at the listener.
     /// -1 if source == listener (same-room short-circuit).
     int32_t predecessorRoomID = -1;
+    /// Per-portal anchor bend points along this path, in source→listener
+    /// order (midpoint of forward / backward closest-point passes).
+    /// Empty for same-room or clean-threaded paths (no bends needed).
+    /// Diagnostic — used by the renderer's show_vpos overlay.
+    std::vector<Vector3> chain;
 };
 
 /// Result of sound propagation through the portal graph.
@@ -159,6 +164,13 @@ struct SoundPropParams {
     /// For multi-path runs, this receives the primary (lowest-effDist)
     /// chain only. Cleared before write. Only populated on success.
     std::vector<SoundPathHop> *pathOut = nullptr;
+    /// Diagnostic accumulator for the geometric bend chain of the
+    /// PRIMARY path. If non-null, populated with the per-portal anchor
+    /// bend points (midpoint of forward / backward closest-point passes)
+    /// in source→listener order. Empty if the path was clean-threaded
+    /// (no bends needed). Cleared before write. Used by the renderer's
+    /// `show_vpos` overlay to visualise the actual propagation chain.
+    std::vector<Vector3> *chainOut = nullptr;
 };
 
 /** @brief Room service - service providing a Room database.
@@ -289,6 +301,32 @@ public:
                                       Room *sourceRoom,
                                       Room *listenerRoom,
                                       const SoundPropParams &params) const;
+
+    /// "Is the segment from `a` to `b` unobstructed by BSP solid
+    /// geometry?" — used by `validatePortals` to test whether each
+    /// ROOM_DB portal actually corresponds to a physical opening.
+    /// Returns true when the segment is clear (no BSP hit). The
+    /// renderer (which owns the BSP data) supplies the implementation.
+    using LineOfSightFn = std::function<bool(const Vector3 &a, const Vector3 &b)>;
+
+    /// Mark every portal whose center is bracketed by solid BSP as
+    /// acoustically invalid. ROOM_DB encodes spatial adjacency between
+    /// convex rooms; not every adjacency is actually a hole in the
+    /// architecture. For each portal we cast a short segment across
+    /// its plane (1 unit each side of the center). If the BSP says
+    /// the segment hits solid, the portal is a phantom and is excluded
+    /// from BFS in propagateSoundPath.
+    ///
+    /// Idempotent — safe to call multiple times. Logs `[PORTAL_PHANTOM]`
+    /// to stderr once per phantom for offline diagnostic.
+    ///
+    /// Note: this is a band-aid for a structural data issue. The
+    /// proper fix (route through BSP-cell graph or Steam Audio's path
+    /// baker rather than ROOM_DB) is discussed in
+    /// HANDOFF.SOUND_PROPAGATION_REALISM.md.
+    ///
+    /// @return Number of phantoms found.
+    size_t validatePortals(const LineOfSightFn &losClear);
 
 protected:
     void setCurrentObjRoom(size_t idset, int objID, Room *room);
