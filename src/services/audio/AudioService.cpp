@@ -24,12 +24,15 @@
 #include "AIHearingData.h"
 #include "AmbientSoundManager.h"
 #include "AudioLog.h"
+#include "AudioMetering.h"
 #include "AudioOcclusion.h"
 #include "AcousticMaterials.h"
+#include "ConvolutionWorkerPool.h"
 #include "CRFSoundLoader.h"
 #include "EnvSoundDatabase.h"
 #include "ProbeFile.h"
 #include "ProbeManager.h"
+#include "ReflectionSimulator.h"
 #include "SchemaParser.h"
 #include "SchemaPropertyOverrides.h"
 #include "SchemaSamplesChunk.h"
@@ -303,100 +306,10 @@ static inline void audioEnableDenormalFlush() {
 // dB conversion uses a -120 dB floor so silent windows don't print "-inf".
 // L and R are tracked separately because asymmetric loudness is informative
 // (e.g. binaural pan to far right pushes R hot while L stays quiet).
-struct StageMeter {
-    float    peakL = 0.0f;
-    float    peakR = 0.0f;
-    double   sumSqL = 0.0;
-    double   sumSqR = 0.0;
-    uint64_t sampleCount = 0;
-
-    /// Accumulate peak + sum-of-squares for an interleaved stereo block.
-    /// frames is the number of stereo frames (so 2*frames samples total).
-    void measure(const float* interleaved, std::size_t frames) {
-        if (!interleaved) return;
-        for (std::size_t i = 0; i < frames; ++i) {
-            float sL = interleaved[i * 2];
-            float sR = interleaved[i * 2 + 1];
-            float aL = std::fabs(sL);
-            float aR = std::fabs(sR);
-            if (aL > peakL) peakL = aL;
-            if (aR > peakR) peakR = aR;
-            sumSqL += static_cast<double>(sL) * sL;
-            sumSqR += static_cast<double>(sR) * sR;
-        }
-        sampleCount += frames;
-    }
-
-    /// Accumulate peak + sum-of-squares for separate L and R deinterleaved
-    /// buffers (the format the per-voice binaural effect produces before
-    /// the interleave step).
-    void measureDeinterleaved(const float* chL, const float* chR,
-                               std::size_t frames) {
-        if (!chL || !chR) return;
-        for (std::size_t i = 0; i < frames; ++i) {
-            float sL = chL[i];
-            float sR = chR[i];
-            float aL = std::fabs(sL);
-            float aR = std::fabs(sR);
-            if (aL > peakL) peakL = aL;
-            if (aR > peakR) peakR = aR;
-            sumSqL += static_cast<double>(sL) * sL;
-            sumSqR += static_cast<double>(sR) * sR;
-        }
-        sampleCount += frames;
-    }
-
-    /// Accumulate peak + sum-of-squares for a mono buffer.  Both L and R
-    /// fields are kept synchronized so the [GAIN] dump shows identical
-    /// L/R values for mono stages (direct effect, reflection input, etc.)
-    /// instead of a misleading -120 dB on the right.
-    void measureMono(const float* mono, std::size_t samples) {
-        if (!mono) return;
-        for (std::size_t i = 0; i < samples; ++i) {
-            float s = mono[i];
-            float a = std::fabs(s);
-            if (a > peakL) peakL = a;
-            sumSqL += static_cast<double>(s) * s;
-        }
-        sampleCount += samples;
-        peakR = peakL;
-        sumSqR = sumSqL;
-    }
-
-    /// Merge another meter's values into this one — used to fold per-
-    /// sub-worker convolution meters into the mix node's combined view
-    /// at log time without coupling those threads through atomics.
-    void mergeIn(const StageMeter &other) {
-        if (other.peakL > peakL) peakL = other.peakL;
-        if (other.peakR > peakR) peakR = other.peakR;
-        sumSqL += other.sumSqL;
-        sumSqR += other.sumSqR;
-        sampleCount += other.sampleCount;
-    }
-
-    void reset() {
-        peakL = peakR = 0.0f;
-        sumSqL = sumSqR = 0.0;
-        sampleCount = 0;
-    }
-
-    /// Linear amplitude → dBFS with a -120 dB floor (avoids -inf prints).
-    static inline float toDb(float x) {
-        return (x > 1e-6f) ? 20.0f * std::log10(x) : -120.0f;
-    }
-
-    float peakDbL() const { return toDb(peakL); }
-    float peakDbR() const { return toDb(peakR); }
-
-    float rmsDbL() const {
-        if (sampleCount == 0) return -120.0f;
-        return toDb(static_cast<float>(std::sqrt(sumSqL / sampleCount)));
-    }
-    float rmsDbR() const {
-        if (sampleCount == 0) return -120.0f;
-        return toDb(static_cast<float>(std::sqrt(sumSqR / sampleCount)));
-    }
-};
+//
+// StageMeter struct moved to AudioMetering.h so the per-sub-worker meters
+// inside ConvolutionWorkerPool can share the same accumulator without
+// dragging this struct's full definition out of the AudioService TU.
 
 /*----------------------------------------------------*/
 /*----------- Steam Audio DSP Processing Node --------*/
@@ -614,134 +527,11 @@ struct AudioService::ReflectionMixNode {
     }
 };
 
-/// Per-thread convolution sub-worker. Each sub-worker owns its own Steam Audio
-/// mixer/decoder pipeline and processes a subset of voice slots assigned by
-/// the mix node callback. Completely independent — no shared mutable state
-/// between sub-workers during processing.
-struct ConvolutionSubWorker {
-    // Own Steam Audio pipeline (not thread-safe — one per worker)
-    IPLReflectionMixer mixer = nullptr;
-    IPLAmbisonicsDecodeEffect ambiDecodeEffect = nullptr;
-
-    // Own scratch buffers for ambisonics processing
-    std::vector<float> ambiCh0, ambiCh1, ambiCh2, ambiCh3;
-    std::vector<float> voiceAmbi0, voiceAmbi1, voiceAmbi2, voiceAmbi3;
-    std::vector<float> decodedL, decodedR;
-
-    // Own double-buffered stereo output (deinterleaved)
-    std::vector<float> stereoL[2], stereoR[2];
-    std::atomic<int> frontIdx{0};
-    std::atomic<bool> hasProducedOutput{false};
-
-    // Assignment: indices into shared staging[readBuf].
-    // Written by mix node BEFORE signal, read by worker AFTER signal.
-    // The atomic frameSeq provides the acquire-release barrier.
-    int assignedSlots[MAX_ACTIVE_VOICES];
-    int assignedCount = 0;
-
-    // Thread control
-    std::thread thread;
-    std::atomic<uint64_t> frameSeq{0};       // incremented by mix node to signal new data
-    std::atomic<uint64_t> processedSeq{0};   // last frameSeq the worker finished
-    std::atomic<bool> shutdown{false};
-    std::atomic<float> peakMs{0.0f};
-
-    // Gain-staging meters (per sub-worker, written only by this worker
-    // thread, read by the master mix node at [GAIN] dump time with
-    // accept-tearing semantics — diagnostic, no correctness impact).
-    // The mix node folds all sub-worker meters into a combined view
-    // before logging via StageMeter::mergeIn.
-    StageMeter saMeterReflIn;     // mono input to iplReflectionEffectApply
-    StageMeter saMeterReflW;      // W (omni) channel of convolution output
-    StageMeter saMeterDecodeOut;  // stereo output of iplAmbisonicsDecodeEffect
-};
-
-/// Off-thread convolution worker with K parallel sub-workers.
-/// The audio callback writes voice mono snapshots to shared staging buffers.
-/// The mix node callback distributes voice slots across sub-workers (round-robin)
-/// and signals them. Each sub-worker processes its subset independently and
-/// writes to its own double-buffered stereo output. The mix node reads and
-/// sums all sub-worker outputs on the next callback. No barrier sync needed.
-struct ConvolutionWorker {
-    // Per-voice mono input snapshots (filled by audio thread, read by sub-workers)
-    struct VoiceSlot {
-        std::vector<float> mono;          // processed mono data (post-distance-atten, post-decimate)
-        IPLReflectionEffect effect = nullptr;
-        IPLReflectionEffectParams params{};
-        // Shared validity token — reference-counted so workers can safely
-        // dereference it even after the owning ActiveVoice has been destroyed.
-        std::shared_ptr<std::atomic<bool>> validityToken;
-        int reflFrameSize = 0;
-        bool active = false;
-        // Diagnostic: tag forwarded from the voice's DSP node so the worker
-        // can log the wet-output peak only for footstep voices, keeping the
-        // log focused.
-        bool isFootstepDiag = false;
-    };
-    static constexpr int kMaxSlots = MAX_ACTIVE_VOICES;
-
-    // Double-buffered voice slots: audio thread writes to staging[writeIdx],
-    // sub-workers read from staging[readBuf]. Swapped atomically via writeIdx.
-    VoiceSlot staging[2][kMaxSlots];
-    int stagingCount[2] = {0, 0};        // count per buffer
-    std::atomic<int> writeIdx{0};        // audio thread writes to this index
-    std::atomic<int> readyCount{0};      // count of the buffer just completed
-
-    // Track how many sub-workers are still reading the staging buffer.
-    // Mix node checks this before swapping — if > 0, drops the frame.
-    std::atomic<int> workersReading{0};
-
-    // Which staging buffer sub-workers should read (plain int — visibility
-    // guaranteed by the acquire-release on sub-worker frameSeq signals).
-    int currentReadBuf = -1;
-
-    // Sub-workers (K parallel threads, each with own mixer/decoder/output).
-    // unique_ptr because ConvolutionSubWorker contains std::atomic (non-movable).
-    std::vector<std::unique_ptr<ConvolutionSubWorker>> workers;
-    int numWorkers = 1;
-
-    // Shared read-only state (set at init, never modified during processing)
-    IPLHRTF hrtf = nullptr;
-    IPLContext context = nullptr;
-    int frameSize = 1024;
-    int reflectionFrameSize = 1024;
-    int ambiChannels = 1;
-    int ambiOrder = 0;
-    int rateDivisor = 2;  // 1=full, 2=half, 4=quarter
-
-    // Listener orientation snapshot (written by mix node, read by all workers)
-    IPLCoordinateSpace3 listenerOrientation = {
-        {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f}
-    };
-};
-
-/// Drain all sub-workers' pending frames. Called from ~ActiveVoice (defined
-/// in VoicePool.cpp) before releasing the IPLReflectionEffect — the worker
-/// holds a pointer to that effect and must not be mid-iteration when it's
-/// released. ConvolutionWorker is .cpp-private to this TU, so this helper
-/// lets VoicePool.cpp drain without dragging the struct's full definition
-/// into VoicePool.h.
-///
-/// Returns true on clean drain, false if the deadline expired (caller logs
-/// and continues — the validity-token mechanism still keeps the worker safe
-/// from reading freed memory, this just bounds the post-cleanup tail).
-bool drainConvolutionWorker(ConvolutionWorker *cw, int deadlineMs)
-{
-    if (!cw) return true;
-    auto deadline = std::chrono::steady_clock::now()
-                  + std::chrono::milliseconds(deadlineMs);
-    for (auto &subPtr : cw->workers) {
-        auto &sub = *subPtr;
-        uint64_t target = sub.frameSeq.load(std::memory_order_acquire);
-        while (sub.processedSeq.load(std::memory_order_acquire) < target) {
-            if (sub.shutdown.load(std::memory_order_relaxed)) break;
-            if (std::chrono::steady_clock::now() >= deadline)
-                return false;
-            std::this_thread::yield();
-        }
-    }
-    return true;
-}
+// ConvolutionSubWorker, ConvolutionWorker, and the drainConvolutionWorker
+// helper that ~ActiveVoice calls all live in ConvolutionWorkerPool.h/.cpp
+// now. The reflection mix node and the per-voice DSP node use the worker
+// via the ConvolutionWorker* pointer threaded in during init — see
+// node->convWorker / dsp.convWorker on the audio thread.
 
 /// vtable for the global reflection mix node
 static ma_node_vtable sReflectionMixNodeVtable = {
@@ -963,12 +753,15 @@ static std::atomic<float> sCommitPeakMs{0.0f};         // peak iplSimulatorCommi
 // ── Main thread + sim worker profiling ──
 static std::atomic<float> sLoopStepPeakMs{0.0f};      // peak loopStep total time (ms)
 static std::atomic<float> sDirectSimPeakMs{0.0f};     // peak iplSimulatorRunDirect time (ms)
-static std::atomic<float> sReflSimPeakMs{0.0f};       // peak iplSimulatorRunReflections time (ms)
+// sReflSimPeakMs and sReflFramesRun moved to ReflectionSimulator.cpp (the
+// only thread that writes them). Declared extern here so the periodic dump
+// can still read+exchange them.
+extern std::atomic<float> sReflSimPeakMs;
+extern std::atomic<int>   sReflFramesRun;
 static std::atomic<int>   sPortalRoutingTotalUs{0};     // accumulated portal routing time per dump (µs, int)
 static std::atomic<int>   sPortalRoutingCount{0};      // portal routing calls per dump
 static std::atomic<int>   sVoicesCreated{0};           // voices started since last dump
 static std::atomic<int>   sVoicesDestroyed{0};         // voices cleaned up since last dump
-static std::atomic<int>   sReflFramesRun{0};           // reflection sim steps since last dump
 
 // Accumulates per-voice time within a single audio callback cycle.
 // Reset by the mix node after reading. Not truly thread-safe between
@@ -2236,6 +2029,19 @@ AudioService::AudioService(ServiceManager *manager, const std::string &name)
     // IPLScene handle is plumbed in later (in buildAcousticScene).
     mAudioOcclusion = std::make_unique<AudioOcclusion>();
 
+    // Construct the reflection-sim subsystem. Its background thread is
+    // started later in bootstrapFinished (after audio backends init); the
+    // IPLSimulator handle is plugged in by buildAcousticScene. The
+    // convolution-worker drain hook is wired here so demoteVoice can
+    // safely release reflection effects mid-life.
+    mReflectionSim = std::make_unique<ReflectionSimulator>();
+    mReflectionSim->setConvolutionDrainHook([this]() {
+        if (mConvolutionPool) mConvolutionPool->waitForCompletion();
+    });
+    mReflectionSim->setSimulationRanHook([this]() {
+        if (mReflectionMixNode) mReflectionMixNode->simulationRan = true;
+    });
+
     // SoundPropagation requires RoomService, which is acquired in
     // bootstrapFinished() — construct there.
 }
@@ -2329,6 +2135,42 @@ void AudioService::setDirectGain(float g)
 {
     mDSPChain->setDirectGain(g);
     if (mReflectionMixNode) mReflectionMixNode->directGain = mDSPChain->getDirectGain();
+}
+
+// ── ReflectionSimulator facades ──
+// The throttle/rate-divisor/demote-hysteresis state moved to the
+// ReflectionSimulator subsystem (see audio/ReflectionSimulator.h). These
+// facades preserve the public AudioService API so RenderConfig / DebugConsole
+// keep working unchanged. The setHalfRateReflections / getHalfRateReflections
+// pair is kept as a deprecated wrapper for the old bool API.
+void AudioService::setReflectionThrottle(int n)
+{
+    if (mReflectionSim) mReflectionSim->setThrottle(n);
+}
+int AudioService::getReflectionThrottle() const
+{
+    return mReflectionSim ? mReflectionSim->getThrottle() : 4;
+}
+void AudioService::setReflectionRateDivisor(int div)
+{
+    if (mReflectionSim) mReflectionSim->setRateDivisor(div);
+}
+int AudioService::getReflectionRateDivisor() const
+{
+    return mReflectionSim ? mReflectionSim->getRateDivisor() : 2;
+}
+void AudioService::setHalfRateReflections(bool enabled)
+{
+    if (mReflectionSim) mReflectionSim->setRateDivisor(enabled ? 2 : 1);
+}
+bool AudioService::getHalfRateReflections() const
+{
+    return mReflectionSim ? mReflectionSim->getRateDivisor() >= 2 : true;
+}
+void AudioService::setReflectionDemoteHysteresisFrames(int n)
+{
+    if (mReflectionSim)
+        mReflectionSim->setDemoteHysteresis(std::max(1, std::min(n, 3600)));
 }
 
 //------------------------------------------------------
@@ -2479,7 +2321,9 @@ bool AudioService::initSteamAudio()
     {
         ProbeManagerDeps deps;
         deps.context = mIplContext;
-        deps.waitForReflectionThread = [this]() { this->waitForReflectionThread(); };
+        deps.waitForReflectionThread = [this]() {
+            if (mReflectionSim) mReflectionSim->waitForCompletion();
+        };
         mProbeManager = std::make_unique<ProbeManager>(std::move(deps));
     }
 
@@ -2733,9 +2577,12 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
 
         // Compute reflection pipeline rate — reduced rate lowers per-voice FFT
         // cost while keeping HRTF at full device rate (48kHz).
-        // Divisor 1=full rate, 2=half (24kHz), 4=quarter (12kHz).
-        mReflectionSampleRate = mDeviceSampleRate / static_cast<uint32_t>(mReflectionRateDivisor);
-        mReflectionFrameSize = mFrameSize / static_cast<uint32_t>(mReflectionRateDivisor);
+        // Divisor 1=full rate, 2=half (24kHz), 4=quarter (12kHz). Rate divisor
+        // is owned by ReflectionSimulator now (see initial setRateDivisor()
+        // in bootstrapFinished()).
+        int rateDivisor = mReflectionSim ? mReflectionSim->getRateDivisor() : 2;
+        mReflectionSampleRate = mDeviceSampleRate / static_cast<uint32_t>(rateDivisor);
+        mReflectionFrameSize = mFrameSize / static_cast<uint32_t>(rateDivisor);
 
         // Step 6: Create the simulator for direct occlusion + reflections + reverb.
         // The simulator uses the reflection sample rate — IRs are generated at this
@@ -2763,16 +2610,21 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         simSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
         simSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
 
-        err = iplSimulatorCreate(mIplContext, &simSettings, &mReflectionSimulator);
+        IPLSimulator reflectionSimHandle = nullptr;
+        err = iplSimulatorCreate(mIplContext, &simSettings, &reflectionSimHandle);
         if (err != IPL_STATUS_SUCCESS) {
             LOG_ERROR("AudioService: iplSimulatorCreate failed (error %d)", err);
             destroyAcousticScene();
             return false;
         }
 
+        // Install the freshly-created simulator handle onto the
+        // ReflectionSimulator subsystem so its worker thread can pump it.
+        if (mReflectionSim) mReflectionSim->setSimulator(reflectionSimHandle);
+
         // Bind the scene to the reflection simulator
-        iplSimulatorSetScene(mReflectionSimulator, mIplScene);
-        iplSimulatorCommit(mReflectionSimulator);
+        iplSimulatorSetScene(reflectionSimHandle, mIplScene);
+        iplSimulatorCommit(reflectionSimHandle);
 
         // Step 6b: Create the direct-only simulator. Runs synchronously on
         // the main thread in loopStep, so it has no background source-list
@@ -2845,8 +2697,10 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
 bool AudioService::initReflectionPipeline()
 {
     AUDIO_LOG( "REFL: initReflectionPipeline enter\n");
-    if (!mIplContext || !mIplHrtf || !mMaEngine || !mReflectionSimulator)
+    IPLSimulator reflectionSimHandle = mReflectionSim ? mReflectionSim->simulator() : nullptr;
+    if (!mIplContext || !mIplHrtf || !mMaEngine || !reflectionSimHandle)
         return false;
+    const int rateDivisor = mReflectionSim->getRateDivisor();
 
     // Reflection pipeline uses the reflection sample rate (24kHz or 48kHz).
     // This rate was computed in buildAcousticScene and must match the simulator.
@@ -2863,7 +2717,7 @@ bool AudioService::initReflectionPipeline()
     AUDIO_LOG( "REFL: creating mixer (irSize=%d, channels=%d, rate=%d, frame=%d, 1/%d rate)\n",
                  irSize, numAmbiChannels,
                  audioSettings.samplingRate, audioSettings.frameSize,
-                 mReflectionRateDivisor);
+                 rateDivisor);
 
     // Create shared reflection mixer — accumulates all per-voice convolution outputs
     IPLReflectionEffectSettings reflSettings{};
@@ -2999,113 +2853,52 @@ bool AudioService::initReflectionPipeline()
     // callback never executes the DSP chain with default/uninitialized values.
     rmn.ready = true;
 
-    // NOTE: rmn.convWorker is set AFTER the worker is created (below).
-
-    // Create the off-thread convolution worker with K parallel sub-workers.
-    // Each sub-worker owns its own IPLReflectionMixer and IPLAmbisonicsDecodeEffect.
-    mConvolutionWorker = std::make_unique<ConvolutionWorker>();
-    auto &cw = *mConvolutionWorker;
-    cw.context = mIplContext;
-    cw.hrtf = mIplHrtf;
-    cw.frameSize = static_cast<int>(mFrameSize);
-    cw.reflectionFrameSize = static_cast<int>(mReflectionFrameSize);
-    cw.rateDivisor = mReflectionRateDivisor;
-    cw.ambiChannels = mAmbisonicsChannels;
-    cw.ambiOrder = mAmbisonicsOrder;
+    // NOTE: rmn.convWorker is set AFTER the worker pool is created (below).
 
     // Determine number of sub-workers
+    int numWorkers;
     if (mConvolutionWorkerCount > 0) {
-        cw.numWorkers = mConvolutionWorkerCount;
+        numWorkers = mConvolutionWorkerCount;
     } else {
         // Auto: use available cores minus 3 (main + audio + sim), minimum 1
         unsigned int hwThreads = std::thread::hardware_concurrency();
-        cw.numWorkers = std::max(1, static_cast<int>(hwThreads) - 3);
+        numWorkers = std::max(1, static_cast<int>(hwThreads) - 3);
     }
 
-    // Allocate shared per-voice mono staging buffers (both double-buffer sides)
-    for (int b = 0; b < 2; ++b) {
-        for (int i = 0; i < ConvolutionWorker::kMaxSlots; ++i) {
-            cw.staging[b][i].mono.resize(mReflectionFrameSize, 0.0f);
-        }
+    // Hand off to the ConvolutionWorkerPool — it creates the pool's
+    // ConvolutionWorker struct, allocates per-sub-worker Steam Audio
+    // pipelines (own mixer + decoder), and spawns the threads.
+    ConvolutionWorkerPool::Config poolCfg;
+    poolCfg.context = mIplContext;
+    poolCfg.hrtf = mIplHrtf;
+    poolCfg.frameSize = static_cast<int>(mFrameSize);
+    poolCfg.reflectionFrameSize = static_cast<int>(mReflectionFrameSize);
+    poolCfg.rateDivisor = rateDivisor;
+    poolCfg.ambiChannels = mAmbisonicsChannels;
+    poolCfg.ambiOrder = mAmbisonicsOrder;
+    poolCfg.numWorkers = numWorkers;
+    poolCfg.audioSettings = audioSettings;
+    poolCfg.reflSettings = reflSettings;
+    mConvolutionPool = std::make_unique<ConvolutionWorkerPool>();
+    if (!mConvolutionPool->init(poolCfg)) {
+        mConvolutionPool.reset();
     }
 
-    // Create K sub-workers, each with own mixer + decoder + scratch + output
-    for (int i = 0; i < cw.numWorkers; ++i)
-        cw.workers.push_back(std::make_unique<ConvolutionSubWorker>());
-    bool allWorkersOk = true;
-    for (int wk = 0; wk < cw.numWorkers; ++wk) {
-        auto &sub = *cw.workers[wk];
-
-        // Create sub-worker's own reflection mixer
-        err = iplReflectionMixerCreate(mIplContext, &audioSettings,
-                                        &reflSettings, &sub.mixer);
-        if (err != IPL_STATUS_SUCCESS) {
-            LOG_ERROR("AudioService: sub-worker %d mixer create failed (%d)", wk, err);
-            allWorkersOk = false;
-            break;
-        }
-
-        // Create sub-worker's own ambisonics decode effect
-        err = iplAmbisonicsDecodeEffectCreate(mIplContext, &audioSettings,
-                                               &decodeSettings, &sub.ambiDecodeEffect);
-        if (err != IPL_STATUS_SUCCESS) {
-            LOG_ERROR("AudioService: sub-worker %d decode create failed (%d)", wk, err);
-            iplReflectionMixerRelease(&sub.mixer);
-            sub.mixer = nullptr;
-            allWorkersOk = false;
-            break;
-        }
-
-        // Allocate double-buffered stereo output
-        for (int b = 0; b < 2; ++b) {
-            sub.stereoL[b].resize(mFrameSize, 0.0f);
-            sub.stereoR[b].resize(mFrameSize, 0.0f);
-        }
-
-        // Allocate scratch buffers
-        sub.ambiCh0.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 1) sub.ambiCh1.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 2) sub.ambiCh2.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 3) sub.ambiCh3.resize(mReflectionFrameSize, 0.0f);
-        sub.decodedL.resize(mReflectionFrameSize, 0.0f);
-        sub.decodedR.resize(mReflectionFrameSize, 0.0f);
-        sub.voiceAmbi0.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 1) sub.voiceAmbi1.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 2) sub.voiceAmbi2.resize(mReflectionFrameSize, 0.0f);
-        if (mAmbisonicsChannels > 3) sub.voiceAmbi3.resize(mReflectionFrameSize, 0.0f);
-    }
-
-    if (!allWorkersOk) {
-        // Clean up partially created sub-workers
-        for (auto &subPtr : cw.workers) {
-            if (subPtr->ambiDecodeEffect)
-                iplAmbisonicsDecodeEffectRelease(&subPtr->ambiDecodeEffect);
-            if (subPtr->mixer)
-                iplReflectionMixerRelease(&subPtr->mixer);
-        }
-        mConvolutionWorker.reset();
-    }
-
-    if (mConvolutionWorker) {
-        // Spawn sub-worker threads
-        for (int wk = 0; wk < cw.numWorkers; ++wk) {
-            cw.workers[wk]->shutdown.store(false, std::memory_order_relaxed);
-            cw.workers[wk]->thread = std::thread([this, wk]() { convolutionSubWorkerMain(wk); });
-        }
-
-        // Wire the mix node to the worker
-        rmn.convWorker = mConvolutionWorker.get();
+    if (mConvolutionPool) {
+        // Wire the mix node to the worker (pool exposes the raw struct
+        // pointer so the audio-thread fast path stays unchanged).
+        rmn.convWorker = mConvolutionPool->worker();
 
         AUDIO_LOG( "REFL: convolution started (%d sub-workers, off-thread)\n",
-                     cw.numWorkers);
+                     mConvolutionPool->numWorkers());
     }
 
     AUDIO_LOG( "AudioService: reflection pipeline initialized "
                  "(convolution, order %d (%dch), IR %d samples, %uHz, 1/%d rate, max %d voices%s)\n",
                  mAmbisonicsOrder, mAmbisonicsChannels,
-                 irSize, mReflectionSampleRate, mReflectionRateDivisor,
+                 irSize, mReflectionSampleRate, rateDivisor,
                  mMaxReflectionVoices,
-                 mConvolutionWorker ? ", off-thread" : ", on-thread fallback");
+                 mConvolutionPool ? ", off-thread" : ", on-thread fallback");
     return true;
 }
 
@@ -3113,39 +2906,18 @@ bool AudioService::initReflectionPipeline()
 void AudioService::destroyReflectionPipeline()
 {
     // Shut down all convolution sub-workers before destroying any Steam Audio objects
-    if (mConvolutionWorker) {
-        for (auto &subPtr : mConvolutionWorker->workers) {
-            subPtr->shutdown.store(true, std::memory_order_release);
-            subPtr->frameSeq.fetch_add(1, std::memory_order_release);  // wake it
-        }
-        for (auto &subPtr : mConvolutionWorker->workers) {
-            if (subPtr->thread.joinable())
-                subPtr->thread.join();
-            // Release sub-worker-owned Steam Audio objects
-            if (subPtr->ambiDecodeEffect)
-                iplAmbisonicsDecodeEffectRelease(&subPtr->ambiDecodeEffect);
-            if (subPtr->mixer)
-                iplReflectionMixerRelease(&subPtr->mixer);
-        }
-        mConvolutionWorker.reset();
+    if (mConvolutionPool) {
+        mConvolutionPool->shutdown();
+        mConvolutionPool.reset();
     }
 
     // Wait for any in-flight simulation tasks to finish on the worker thread
-    waitForReflectionThread();
-
-    // Flush deferred IPL source adds — never added to simulator, just release
-    for (auto &src : mPendingSourceAdds) {
-        iplSourceRelease(&src);
-    }
-    mPendingSourceAdds.clear();
-
-    // Flush deferred IPL source removals before destroying the simulator
-    if (!mPendingSourceRemovals.empty() && mReflectionSimulator) {
-        for (auto &src : mPendingSourceRemovals) {
-            iplSourceRemove(src, mReflectionSimulator);
-            iplSourceRelease(&src);
-        }
-        mPendingSourceRemovals.clear();
+    if (mReflectionSim) {
+        mReflectionSim->waitForCompletion();
+        // Flush deferred IPL source adds — never added to simulator, just release
+        mReflectionSim->releasePendingAdds();
+        // Flush deferred IPL source removals before destroying the simulator
+        mReflectionSim->flushPendingRemovals();
     }
 
     // Order matters: mix node references mixer/decode, so destroy it first
@@ -3176,13 +2948,14 @@ void AudioService::destroyAcousticScene()
     destroyReflectionPipeline();
 
     // Release probe batch before simulator (it's registered with the simulator)
-    if (mProbeManager) {
-        mProbeManager->releaseBatch(mReflectionSimulator);
+    if (mProbeManager && mReflectionSim) {
+        mProbeManager->releaseBatch(mReflectionSim->simulator());
     }
 
-    if (mReflectionSimulator) {
-        iplSimulatorRelease(&mReflectionSimulator);
-        mReflectionSimulator = nullptr;
+    if (mReflectionSim && mReflectionSim->simulator()) {
+        IPLSimulator handle = mReflectionSim->simulator();
+        iplSimulatorRelease(&handle);
+        mReflectionSim->setSimulator(nullptr);
     }
     // Direct simulator runs synchronously on the main thread, so it has
     // no in-flight worker to wait for. Release after the reflection sim
@@ -3251,9 +3024,8 @@ void AudioService::bootstrapFinished()
 
     // Start the reflection simulation worker thread (background, latency-tolerant).
     // Direct sim runs synchronously on the main thread for same-frame occlusion.
-    if (mAudioReady) {
-        mReflectionSimShutdown.store(false, std::memory_order_relaxed);
-        mReflectionSimThread = std::thread(&AudioService::reflectionSimWorkerMain, this);
+    if (mAudioReady && mReflectionSim) {
+        mReflectionSim->start();
     }
 
     if (mAudioReady) {
@@ -3278,10 +3050,7 @@ void AudioService::shutdown()
     mSoundLoader.reset();
 
     // Shut down the reflection simulation worker thread before destroying the scene
-    mReflectionSimShutdown.store(true, std::memory_order_release);
-    mReflectionSimCV.notify_one();
-    if (mReflectionSimThread.joinable())
-        mReflectionSimThread.join();
+    if (mReflectionSim) mReflectionSim->stop();
 
     // Release acoustic scene before the Steam Audio context it depends on
     destroyAcousticScene();
@@ -3470,45 +3239,31 @@ void AudioService::loopStep(float deltaTime)
     // Steam Audio uses double-buffering: setInputs writes to the staging buffer,
     // while runReflections reads from the committed (active) buffer.
     // Only commit() copies staging → active, so commit must wait for reflections.
-    bool reflBusy = mReflectionSimRunning.load(std::memory_order_acquire);
+    bool reflBusy = mReflectionSim && mReflectionSim->isRunning();
     bool canMutate = !reflBusy;
+    IPLSimulator reflectionSimHandle = mReflectionSim ? mReflectionSim->simulator() : nullptr;
 
-    if (canMutate) {
+    if (canMutate && mReflectionSim) {
 
-        // Flush deferred IPL source adds
-        if (!mPendingSourceAdds.empty() && mReflectionSimulator) {
-            for (auto &src : mPendingSourceAdds) {
-                iplSourceAdd(src, mReflectionSimulator);
-            }
-            mPendingSourceAdds.clear();
-            mSimulatorDirty = true;
-        }
-
-        // Flush deferred IPL source removals
-        if (!mPendingSourceRemovals.empty() && mReflectionSimulator) {
-            for (auto &src : mPendingSourceRemovals) {
-                iplSourceRemove(src, mReflectionSimulator);
-                iplSourceRelease(&src);
-            }
-            mPendingSourceRemovals.clear();
-        }
+        // Flush deferred IPL source adds / removals via ReflectionSimulator.
+        mReflectionSim->flushPendingAdds();
+        mReflectionSim->flushPendingRemovals();
     }
 
     // Commit copies staging → active buffer. Must wait for reflection sim to
     // be idle since it reads from the active buffer. Direct sim runs inline
     // (after commit), so no conflict there.
-    if (canMutate && mSimulatorDirty && mReflectionSimulator) {
+    if (canMutate && mReflectionSim && mReflectionSim->isSimulatorDirty() && reflectionSimHandle) {
         if (profOn) {
             auto ct0 = std::chrono::steady_clock::now();
-            iplSimulatorCommit(mReflectionSimulator);
+            mReflectionSim->commitIfDirty();
             auto ct1 = std::chrono::steady_clock::now();
             float cMs = std::chrono::duration<float, std::milli>(ct1 - ct0).count();
             float prevC = sCommitPeakMs.load(std::memory_order_relaxed);
             if (cMs > prevC) sCommitPeakMs.store(cMs, std::memory_order_relaxed);
         } else {
-            iplSimulatorCommit(mReflectionSimulator);
+            mReflectionSim->commitIfDirty();
         }
-        mSimulatorDirty = false;
     }
 
     // Always clean up finished voices (defers IPL removal if sim busy)
@@ -3535,7 +3290,7 @@ void AudioService::loopStep(float deltaTime)
     }
 
     // Run Steam Audio simulation for all active sources
-    if (mSceneReady && mReflectionSimulator && !mVoicePool->empty()) {
+    if (mSceneReady && reflectionSimHandle && !mVoicePool->empty()) {
         float cosY = std::cos(mListenerYaw), sinY = std::sin(mListenerYaw);
         float cosP = std::cos(mListenerPitch), sinP = std::sin(mListenerPitch);
 
@@ -3596,7 +3351,7 @@ void AudioService::loopStep(float deltaTime)
             // these calls require no synchronisation between them.
             iplSimulatorSetSharedInputs(mDirectSimulator,
                 IPL_SIMULATIONFLAGS_DIRECT, &sharedInputs);
-            iplSimulatorSetSharedInputs(mReflectionSimulator,
+            iplSimulatorSetSharedInputs(reflectionSimHandle,
                 IPL_SIMULATIONFLAGS_REFLECTIONS, &sharedInputs);
 
             // Step 2a: Pre-compute reflection voice ranking (top-N closest).
@@ -3695,8 +3450,8 @@ void AudioService::loopStep(float deltaTime)
             // PlayerEmitted and Ambient voices are excluded — PE uses baked
             // routing as its steady-state path, Ambient voices are
             // long-lived and intentionally part of the room ambience.
-            if (mReflectionsEnabled && mReflectionSimulator) {
-                int hysteresis = mReflectionDemoteHysteresisCfg;
+            if (mReflectionsEnabled && reflectionSimHandle && mReflectionSim) {
+                int hysteresis = mReflectionSim->getDemoteHysteresis();
                 for (auto &[h, v] : mVoicePool->voices()) {
                     if (v->sourceEnded) continue;
                     if (v->playerEmitted) continue;  // baked routing, never demoted
@@ -3708,7 +3463,7 @@ void AudioService::loopStep(float deltaTime)
                     if (inTopN) {
                         v->framesOutOfTopN = 0;
                     } else if (++v->framesOutOfTopN >= hysteresis) {
-                        demoteFromRealtimeReflection(*v);
+                        mReflectionSim->demoteVoice(*v);
                     }
                 }
             }
@@ -4070,11 +3825,10 @@ void AudioService::loopStep(float deltaTime)
             // Step 3: Run direct sim and signal reflection thread.
             // Direct sim runs synchronously every frame.
             // Reflection sim runs on background thread, throttled.
+            // The throttle counter / divisor live on ReflectionSimulator now.
             bool wantReflections = mReflectionsEnabled && mIplReflectionMixer
-                && !reflBusy
-                && (++mReflectionFrameCounter >= mReflectionThrottle);
-            if (wantReflections)
-                mReflectionFrameCounter = 0;
+                && !reflBusy && mReflectionSim
+                && mReflectionSim->throttleTickAndConsume();
 
             // Run direct sim synchronously on the main thread (2-5ms).
             // Same-frame results: every voice (including newly created ones)
@@ -4097,13 +3851,8 @@ void AudioService::loopStep(float deltaTime)
             }
 
             // Signal reflection sim (throttled, latency-tolerant, background thread)
-            if (wantReflections) {
-                mReflectionSimRunning.store(true, std::memory_order_release);
-                {
-                    std::lock_guard<std::mutex> lock(mReflectionSimMutex);
-                    mReflectionSimWant = true;
-                }
-                mReflectionSimCV.notify_one();
+            if (wantReflections && mReflectionSim) {
+                mReflectionSim->signal();
             }
         }
 
@@ -4148,9 +3897,7 @@ void AudioService::loopStep(float deltaTime)
             // uninitialized values. Keep the existing dspNode.reflectionParams
             // until the source is flushed and the sim processes it.
             bool isReflectionPending = !voice->reflectionSource
-                || std::find(mPendingSourceAdds.begin(),
-                             mPendingSourceAdds.end(),
-                             voice->reflectionSource) != mPendingSourceAdds.end();
+                || (mReflectionSim && mReflectionSim->isAddPending(voice->reflectionSource));
             if (mReflectionsEnabled && !isReflectionPending) {
                 iplSourceGetOutputs(voice->reflectionSource,
                     IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
@@ -4530,333 +4277,21 @@ void AudioService::loopStep(float deltaTime)
     }
 }
 
-//------------------------------------------------------
-void AudioService::reflectionSimWorkerMain()
-{
-    // Dedicated thread for reflection simulation (ray-traced reverb).
-    // Runs every Nth frame, can take 50-200ms — latency-tolerant because
-    // reverb tails change slowly with listener movement.
-    // Separated from direct sim so it never blocks occlusion updates.
-    while (true) {
-        {
-            std::unique_lock<std::mutex> lock(mReflectionSimMutex);
-            mReflectionSimCV.wait(lock, [this] {
-                return mReflectionSimWant
-                       || mReflectionSimShutdown.load(std::memory_order_relaxed);
-            });
-            if (mReflectionSimShutdown.load(std::memory_order_relaxed))
-                break;
-            mReflectionSimWant = false;
-        }
+// AudioService::reflectionSimWorkerMain moved to
+// ReflectionSimulator::workerMain (audio/ReflectionSimulator.cpp).
+//
+// AudioService::convolutionSubWorkerMain moved to
+// ConvolutionWorkerPool::subWorkerMain (audio/ConvolutionWorkerPool.cpp).
+//
+// AudioService::waitForReflectionThread moved to
+// ReflectionSimulator::waitForCompletion.
+//
+// AudioService::waitForConvolutionWorker moved to
+// ConvolutionWorkerPool::waitForCompletion.
+//
+// AudioService::demoteFromRealtimeReflection moved to
+// ReflectionSimulator::demoteVoice.
 
-        // Read profiling flag once per reflection sim cycle.
-        const bool profOn = ::Darkness::gAudioLogVerbose;
-        if (profOn) {
-            auto t0 = std::chrono::steady_clock::now();
-            iplSimulatorRunReflections(mReflectionSimulator);
-            auto t1 = std::chrono::steady_clock::now();
-            float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
-            float prev = sReflSimPeakMs.load(std::memory_order_relaxed);
-            if (ms > prev) sReflSimPeakMs.store(ms, std::memory_order_relaxed);
-            sReflFramesRun.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            iplSimulatorRunReflections(mReflectionSimulator);
-        }
-        if (mReflectionMixNode)
-            mReflectionMixNode->simulationRan = true;
-        mReflectionSimRunning.store(false, std::memory_order_release);
-    }
-}
-
-//------------------------------------------------------
-void AudioService::convolutionSubWorkerMain(int workerIdx)
-{
-    if (!mConvolutionWorker) return;
-    auto &cw = *mConvolutionWorker;
-    if (workerIdx < 0 || workerIdx >= static_cast<int>(cw.workers.size())) return;
-    auto &sub = *cw.workers[workerIdx];
-    uint64_t lastSeq = 0;
-
-    // Convolution sub-workers run their own DSP (iplReflectionEffectApply,
-    // iplAmbisonicsDecodeEffectApply) on dedicated threads.  Enable FTZ so
-    // the per-thread MXCSR / FPCR matches the audio thread's denormal
-    // handling — otherwise long-tail IRs can decay into denormals and
-    // produce performance cliffs that look indistinguishable from broken
-    // audio.
-    audioEnableDenormalFlush();
-
-    while (!sub.shutdown.load(std::memory_order_relaxed)) {
-        // Wait for the mix node to signal new data
-        uint64_t seq = sub.frameSeq.load(std::memory_order_acquire);
-        if (seq == lastSeq) {
-            std::this_thread::yield();
-            continue;
-        }
-        lastSeq = seq;
-
-        auto t0 = std::chrono::steady_clock::now();
-
-        // workersReading was pre-set by the mix node before signaling us.
-        // We only decrement when done — no increment needed here.
-
-        int readBuf = cw.currentReadBuf;  // visible via frameSeq acquire barrier
-        int assignCount = sub.assignedCount;  // likewise
-        int back = 1 - sub.frontIdx.load(std::memory_order_relaxed);
-
-        // Clear this sub-worker's back stereo buffers
-        std::memset(sub.stereoL[back].data(), 0, cw.frameSize * sizeof(float));
-        std::memset(sub.stereoR[back].data(), 0, cw.frameSize * sizeof(float));
-
-        // Diagnostic: report worker iteration entry state. If assignCount=0
-        // we know workers are running but receiving no work. If >0 but the
-        // ANY_SLOT_WET diagnostic doesn't fire, slots are failing the early
-        // continue checks.
-        {
-            static std::atomic<int> sWorkerEntryLogCount{0};
-            int n = sWorkerEntryLogCount.fetch_add(1, std::memory_order_relaxed);
-            if (n < 24) {
-                int activeSlots = 0;
-                for (int j = 0; j < assignCount; ++j) {
-                    int i = sub.assignedSlots[j];
-                    if (i < 0 || i >= ConvolutionWorker::kMaxSlots) continue;
-                    auto &slot = cw.staging[readBuf][i];
-                    if (slot.active) activeSlots++;
-                }
-                AUDIO_LOG("[WORKER_ENTRY] w=%d readBuf=%d assignCount=%d activeSlots=%d\n",
-                          workerIdx, readBuf, assignCount, activeSlots);
-            }
-        }
-
-        // Process assigned voice slots through this sub-worker's mixer
-        int nch = cw.ambiChannels;
-        for (int j = 0; j < assignCount; ++j) {
-            int i = sub.assignedSlots[j];
-            if (i < 0 || i >= ConvolutionWorker::kMaxSlots) continue;
-            auto &slot = cw.staging[readBuf][i];
-            if (!slot.active || !slot.effect || slot.params.irSize <= 0)
-                continue;
-            if (slot.validityToken && !slot.validityToken->load(std::memory_order_acquire))
-                continue;
-
-            // Build input buffer from the mono snapshot
-            float *monoPtr = slot.mono.data();
-            IPLAudioBuffer reflIn{};
-            reflIn.numChannels = 1;
-            reflIn.numSamples = static_cast<IPLint32>(slot.reflFrameSize);
-            reflIn.data = &monoPtr;
-
-            // Build output buffer (sub-worker-owned per-voice ambisonics scratch)
-            float *ambiPtrs[4] = {
-                sub.voiceAmbi0.data(),
-                !sub.voiceAmbi1.empty() ? sub.voiceAmbi1.data() : nullptr,
-                !sub.voiceAmbi2.empty() ? sub.voiceAmbi2.data() : nullptr,
-                !sub.voiceAmbi3.empty() ? sub.voiceAmbi3.data() : nullptr
-            };
-            IPLAudioBuffer reflOut{};
-            reflOut.numChannels = slot.params.numChannels;
-            reflOut.numSamples = static_cast<IPLint32>(slot.reflFrameSize);
-            reflOut.data = ambiPtrs;
-
-            // Gain-staging: record the mono input level to convolution
-            // (per voice, this sub-worker only).  The convolution IR can
-            // be tens of thousands of samples long and accumulates a
-            // ringing tail; the saMeterReflW (measured AFTER the mixer
-            // apply, below) vs saMeterReflIn ratio captures how much
-            // energy the IRs are adding for the current listener/source
-            // set.
-            sub.saMeterReflIn.measureMono(monoPtr, slot.reflFrameSize);
-
-            // Apply convolution, accumulating into this sub-worker's
-            // mixer.  Important: when the 5th arg (mixer) is non-null,
-            // Steam Audio writes the per-voice result *into the mixer*
-            // and leaves reflOut/ambiPtrs untouched — so we cannot
-            // measure per-voice W here.  W is measured once after
-            // iplReflectionMixerApply extracts the summed result below.
-            iplReflectionEffectApply(slot.effect, &slot.params,
-                                      &reflIn, &reflOut, sub.mixer);
-
-            // Diagnostic: log every Nth slot the worker processes so we can
-            // tell apart "worker not seeing slot" vs. "worker seeing slot but
-            // isFootstepDiag flag not propagated." Reports the flag value.
-            {
-                static std::atomic<int> sAnySlotLogCount{0};
-                int n = sAnySlotLogCount.fetch_add(1, std::memory_order_relaxed);
-                if (n < 24) {
-                    float inPeak = 0.0f;
-                    for (int s = 0; s < slot.reflFrameSize; ++s)
-                        inPeak = std::max(inPeak, std::fabs(slot.mono[s]));
-                    float wPeak = 0.0f;
-                    for (int s = 0; s < slot.reflFrameSize; ++s)
-                        wPeak = std::max(wPeak, std::fabs(sub.voiceAmbi0[s]));
-                    AUDIO_LOG("[ANY_SLOT_WET] w=%d slotIdx=%d isFootDiag=%d "
-                              "inPeak=%.4f wOutPeak=%.4f irSize=%d nch=%d\n",
-                              workerIdx, i, slot.isFootstepDiag ? 1 : 0,
-                              inPeak, wPeak,
-                              slot.params.irSize, slot.params.numChannels);
-                }
-            }
-
-            // Diagnostic: for footstep slots, report input + output peak
-            // amplitudes so we can confirm convolution is actually producing
-            // audible wet signal. The W (omnidirectional) ambisonics channel
-            // is the right metric for "total wet energy."
-            if (slot.isFootstepDiag) {
-                static std::atomic<int> sFootWetLogCount{0};
-                int n = sFootWetLogCount.fetch_add(1, std::memory_order_relaxed);
-                if (n < 12) {  // ~12 sample frames is enough to characterize
-                    float inPeak = 0.0f;
-                    for (int s = 0; s < slot.reflFrameSize; ++s)
-                        inPeak = std::max(inPeak, std::fabs(slot.mono[s]));
-                    float wPeak = 0.0f;
-                    for (int s = 0; s < slot.reflFrameSize; ++s)
-                        wPeak = std::max(wPeak, std::fabs(sub.voiceAmbi0[s]));
-                    AUDIO_LOG("[FOOT_REFL_WET] worker=%d inPeak=%.4f wOutPeak=%.4f "
-                              "irSize=%d nch=%d ratio=%.3f\n",
-                              workerIdx, inPeak, wPeak,
-                              slot.params.irSize, slot.params.numChannels,
-                              inPeak > 1e-6f ? wPeak / inPeak : 0.0f);
-                }
-            }
-        }
-
-        // Release staging slot references for this sub-worker's assigned slots.
-        // Each sub-worker operates on disjoint slots (round-robin) — no contention.
-        for (int j = 0; j < assignCount; ++j) {
-            int i = sub.assignedSlots[j];
-            if (i < 0 || i >= ConvolutionWorker::kMaxSlots) continue;
-            auto &slot = cw.staging[readBuf][i];
-            slot.effect = nullptr;
-            slot.validityToken.reset();
-            slot.active = false;
-        }
-
-        // Done reading shared staging
-        cw.workersReading.fetch_sub(1, std::memory_order_acq_rel);
-
-        // Extract accumulated ambisonics from this sub-worker's mixer
-        ma_uint32 reflFrameCount = static_cast<ma_uint32>(cw.reflectionFrameSize);
-        float *ambiChannels[4] = {
-            sub.ambiCh0.data(),
-            nch > 1 ? sub.ambiCh1.data() : nullptr,
-            nch > 2 ? sub.ambiCh2.data() : nullptr,
-            nch > 3 ? sub.ambiCh3.data() : nullptr
-        };
-        IPLAudioBuffer ambiOut{};
-        ambiOut.numChannels = nch;
-        ambiOut.numSamples = static_cast<IPLint32>(reflFrameCount);
-        ambiOut.data = ambiChannels;
-
-        IPLReflectionEffectParams mixerParams{};
-        mixerParams.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-        mixerParams.numChannels = nch;
-        iplReflectionMixerApply(sub.mixer, &mixerParams, &ambiOut);
-
-        // Gain-staging: now that the mixer has extracted the summed
-        // per-voice convolution into ambiCh0..3, measure the W channel
-        // (ambiCh0 == 0th SH coefficient == total omni energy).  This
-        // is the correct measurement point — measuring inside the
-        // iplReflectionEffectApply loop reads stale data because that
-        // call routes the per-voice result into the mixer when the
-        // mixer arg is non-null.  A peak here significantly above
-        // sa_reflI is the resonance signature for the convolution IR.
-        if (!sub.ambiCh0.empty())
-            sub.saMeterReflW.measureMono(sub.ambiCh0.data(), reflFrameCount);
-
-        // Decode ambisonics to binaural stereo
-        float *decodedPtrs[2] = {sub.decodedL.data(), sub.decodedR.data()};
-        IPLAudioBuffer decodedBuf{};
-        decodedBuf.numChannels = 2;
-        decodedBuf.numSamples = static_cast<IPLint32>(reflFrameCount);
-        decodedBuf.data = decodedPtrs;
-
-        IPLAmbisonicsDecodeEffectParams decodeParams{};
-        decodeParams.order = cw.ambiOrder;
-        decodeParams.hrtf = cw.hrtf;
-        decodeParams.orientation = cw.listenerOrientation;
-        decodeParams.binaural = IPL_TRUE;
-        iplAmbisonicsDecodeEffectApply(sub.ambiDecodeEffect, &decodeParams,
-                                        &ambiOut, &decodedBuf);
-
-        // Sanitize the decoded stereo from the ambisonics decoder before it
-        // lands in the front buffer that the master mix node reads.  A NaN
-        // here would otherwise propagate into stereoOut at line ~1588 and
-        // poison the master EQ.  The mix node has its own guard for this
-        // (nanCountWet) but stopping it at the source is cheaper and gives
-        // the worker thread credit for the detection in the log.
-        audioSanitizeBuffer(sub.decodedL.data(), reflFrameCount);
-        audioSanitizeBuffer(sub.decodedR.data(), reflFrameCount);
-
-        // Gain-staging: post-decode stereo.  The mix node combines this
-        // with all sub-workers' meters via StageMeter::mergeIn so the
-        // [GAIN] dump shows a unified wet bus level.  Peak above the
-        // saMeterReflW peak indicates the ambisonics decoder + HRTF is
-        // amplifying — usually fine and expected (HRTF can boost) but
-        // useful to watch alongside the dry binaural meter.
-        sub.saMeterDecodeOut.measureDeinterleaved(
-            sub.decodedL.data(), sub.decodedR.data(), reflFrameCount);
-
-        // Write decoded stereo to this sub-worker's back buffer.
-        // Handle upsampling from reflection rate to device rate.
-        int div = cw.rateDivisor;
-        if (div > 1) {
-            // Linear interpolation upsample by rateDivisor
-            ma_uint32 inFrames = std::min(reflFrameCount,
-                static_cast<ma_uint32>(cw.frameSize / div));
-            for (ma_uint32 j = 0; j < inFrames; ++j) {
-                float l0 = sub.decodedL[j];
-                float r0 = sub.decodedR[j];
-                float l1 = (j + 1 < reflFrameCount) ? sub.decodedL[j + 1] : l0;
-                float r1 = (j + 1 < reflFrameCount) ? sub.decodedR[j + 1] : r0;
-                for (int d = 0; d < div; ++d) {
-                    float t = static_cast<float>(d) / static_cast<float>(div);
-                    sub.stereoL[back][j * div + d] = l0 + (l1 - l0) * t;
-                    sub.stereoR[back][j * div + d] = r0 + (r1 - r0) * t;
-                }
-            }
-        } else {
-            ma_uint32 outSamples = std::min(reflFrameCount, static_cast<ma_uint32>(cw.frameSize));
-            std::memcpy(sub.stereoL[back].data(), sub.decodedL.data(), outSamples * sizeof(float));
-            std::memcpy(sub.stereoR[back].data(), sub.decodedR.data(), outSamples * sizeof(float));
-        }
-
-        // Swap: make back buffer the new front
-        sub.frontIdx.store(back, std::memory_order_release);
-        sub.hasProducedOutput.store(true, std::memory_order_release);
-
-        auto t1 = std::chrono::steady_clock::now();
-        float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
-        float prev = sub.peakMs.load(std::memory_order_relaxed);
-        if (ms > prev) sub.peakMs.store(ms, std::memory_order_relaxed);
-
-        // Signal that this frame's data has been fully processed
-        sub.processedSeq.store(lastSeq, std::memory_order_release);
-    }
-}
-
-//------------------------------------------------------
-void AudioService::waitForConvolutionWorker()
-{
-    if (!mConvolutionWorker) return;
-    auto &cw = *mConvolutionWorker;
-
-    // Wait until ALL sub-workers have finished processing ALL frames signaled so far.
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-    for (auto &subPtr : cw.workers) {
-        auto &sub = *subPtr;
-        uint64_t target = sub.frameSeq.load(std::memory_order_acquire);
-        while (sub.processedSeq.load(std::memory_order_acquire) < target) {
-            if (sub.shutdown.load(std::memory_order_relaxed)) break;
-            if (std::chrono::steady_clock::now() >= deadline) {
-                AUDIO_LOG( "[AUDIO] WARNING: convolution sub-worker wait timed out "
-                             "(target=%llu, processed=%llu)\n",
-                             (unsigned long long)target,
-                             (unsigned long long)sub.processedSeq.load(std::memory_order_relaxed));
-                break;
-            }
-            std::this_thread::yield();
-        }
-    }
-}
 
 //------------------------------------------------------
 void AudioService::cleanupFinishedVoices()
@@ -4916,7 +4351,8 @@ void AudioService::cleanupFinishedVoices()
 //------------------------------------------------------
 void AudioService::createVoiceSource(ActiveVoice &voice)
 {
-    if (!mDirectSimulator || !mReflectionSimulator || !mSceneReady)
+    IPLSimulator reflectionSimHandle = mReflectionSim ? mReflectionSim->simulator() : nullptr;
+    if (!mDirectSimulator || !reflectionSimHandle || !mSceneReady)
         return;
 
     // ── Direct source ──
@@ -4957,17 +4393,17 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
     // thread is running, we MUST defer the add — adding mid-iteration would
     // race inside Steam Audio.
     //
-    // Voices may later release their source via demoteFromRealtimeReflection
+    // Voices may later release their source via ReflectionSimulator::demoteVoice
     // — a sparing fallback that fires only after a voice has stayed out of
-    // the top-N pool for mReflectionDemoteHysteresisCfg consecutive frames.
-    // The default hysteresis (≈10 s) means the demote is reserved for
-    // genuinely long-lived "stuck-distant" voices; short-lived voices keep
-    // their baked reverb for their full lifetime.
+    // the top-N pool for the demote-hysteresis frame count. Default ≈10 s
+    // means the demote is reserved for genuinely long-lived "stuck-distant"
+    // voices; short-lived voices keep their baked reverb for their full
+    // lifetime.
     {
         IPLSourceSettings srcSettings{};
         srcSettings.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
 
-        IPLerror err = iplSourceCreate(mReflectionSimulator, &srcSettings, &voice.reflectionSource);
+        IPLerror err = iplSourceCreate(reflectionSimHandle, &srcSettings, &voice.reflectionSource);
         if (err != IPL_STATUS_SUCCESS) {
             LOG_ERROR("AudioService: reflection iplSourceCreate failed (error %d)", err);
             // Direct source already created above; don't leak it. Caller
@@ -4979,29 +4415,18 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
             return;
         }
 
-        if (mReflectionSimRunning.load(std::memory_order_acquire)) {
-            mPendingSourceAdds.push_back(voice.reflectionSource);
+        if (mReflectionSim->isRunning()) {
+            mReflectionSim->queueSourceAdd(voice.reflectionSource);
         } else {
-            iplSourceAdd(voice.reflectionSource, mReflectionSimulator);
+            iplSourceAdd(voice.reflectionSource, reflectionSimHandle);
         }
-        mSimulatorDirty = true;
-        mActiveReflectionSources.fetch_add(1, std::memory_order_relaxed);
+        mReflectionSim->setSimulatorDirty();
+        mReflectionSim->incrementActiveSources();
     }
 
     // Per-class default directParams are set in initVoiceDSP — see the
     // long comment there for why it has to happen there (audio thread races
     // the gap between initVoiceDSP and createVoiceSource).
-}
-
-//------------------------------------------------------
-void AudioService::waitForReflectionThread()
-{
-    // Spin-wait for the reflection sim to complete on its background thread.
-    // Called infrequently (voice removal, shutdown). Direct sim runs inline
-    // on the main thread so it's never concurrent here.
-    while (mReflectionSimRunning.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
 }
 
 //------------------------------------------------------
@@ -5018,8 +4443,8 @@ void AudioService::removeVoiceSource(ActiveVoice &voice)
     voice.dspNode.effectsReady.store(false, std::memory_order_release);
     voice.dspNode.reflectionsActive.store(false, std::memory_order_release);
 
-    // Wait for the worker to finish processing all current frames.
-    waitForConvolutionWorker();
+    // Wait for the convolution worker to finish processing all current frames.
+    if (mConvolutionPool) mConvolutionPool->waitForCompletion();
 
     // ── Direct source ──
     // No background thread iterates the direct simulator, so removal is
@@ -5041,10 +4466,7 @@ void AudioService::removeVoiceSource(ActiveVoice &voice)
     // run BEFORE the sim-busy check — otherwise when sim threads are idle
     // we'd call iplSourceRemove on a source that was never iplSourceAdd'ed,
     // crashing inside Steam Audio (pointer authentication failure / SIGSEGV).
-    auto addIt = std::find(mPendingSourceAdds.begin(),
-                           mPendingSourceAdds.end(), voice.reflectionSource);
-    if (addIt != mPendingSourceAdds.end()) {
-        mPendingSourceAdds.erase(addIt);
+    if (mReflectionSim && mReflectionSim->removeFromPendingAdds(voice.reflectionSource)) {
         iplSourceRelease(&voice.reflectionSource);
         return;
     }
@@ -5052,104 +4474,19 @@ void AudioService::removeVoiceSource(ActiveVoice &voice)
     // If the reflection sim thread is running, we can't safely call
     // iplSourceRemove (it races with iplSimulatorRunReflections).
     // Defer the removal — queue the IPL source handle for later cleanup.
-    if (mReflectionSimRunning.load(std::memory_order_acquire)) {
-        mPendingSourceRemovals.push_back(voice.reflectionSource);
+    if (mReflectionSim && mReflectionSim->isRunning()) {
+        mReflectionSim->queueSourceRemove(voice.reflectionSource);
         voice.reflectionSource = nullptr;  // detach from voice (we own it now)
-        mSimulatorDirty = true;
+        mReflectionSim->setSimulatorDirty();
         return;
     }
 
-    if (mReflectionSimulator) {
-        iplSourceRemove(voice.reflectionSource, mReflectionSimulator);
-        mSimulatorDirty = true;
+    if (mReflectionSim && mReflectionSim->simulator()) {
+        iplSourceRemove(voice.reflectionSource, mReflectionSim->simulator());
+        mReflectionSim->setSimulatorDirty();
     }
     iplSourceRelease(&voice.reflectionSource);
-    mActiveReflectionSources.fetch_sub(1, std::memory_order_relaxed);
-}
-
-//------------------------------------------------------
-// Stage 2.2 — demote-only fallback for the per-voice reflection source.
-//
-// Every voice starts with a reflection source (eager allocation in
-// createVoiceSource) so the baseline path is "voice has reverb." This
-// helper is the only way a voice loses its source mid-life. Called from
-// the per-frame loopStep demote pass when a voice has been outside the
-// top-N reflection candidate pool for mReflectionDemoteHysteresisCfg
-// consecutive frames — a deliberately conservative threshold so the
-// demote is a true fallback, not the common case.
-//
-// The dance reuses the existing defer-flush logic
-// (mPendingSourceRemovals) so it is safe to call while the reflection
-// sim thread is running — the actual iplSourceRemove + iplSourceRelease
-// lands at the next idle flush + commit.
-//
-// Invariants:
-//   • mActiveReflectionSources reflects the number of voices in mVoices
-//     with a non-null reflectionSource (including ones pending add).
-//   • PlayerEmitted and Ambient voices are never demoted (the caller
-//     filters them out before invoking this helper).
-//   • demote on a voice without a reflectionSource is a no-op
-//     (idempotent — the caller's pass also short-circuits on null).
-//------------------------------------------------------
-void AudioService::demoteFromRealtimeReflection(ActiveVoice &voice)
-{
-    if (!voice.reflectionSource) return;
-
-    // Pending-promotion fast path: the source was created in this same
-    // idle window but never actually added to the simulator. Nothing has
-    // computed an IR for it yet, so nothing the convolution worker is
-    // holding can reference its state — direct release is safe and the
-    // worker drain is unnecessary.
-    auto addIt = std::find(mPendingSourceAdds.begin(),
-                           mPendingSourceAdds.end(), voice.reflectionSource);
-    if (addIt != mPendingSourceAdds.end()) {
-        mPendingSourceAdds.erase(addIt);
-        iplSourceRelease(&voice.reflectionSource);
-        voice.framesOutOfTopN = 0;
-        mActiveReflectionSources.fetch_sub(1, std::memory_order_relaxed);
-        AUDIO_LOG("[REFL_DEMOTE] h=%d '%s' (cancelled-pending) active=%d\n",
-                  voice.handle, voice.schemaName.c_str(),
-                  mActiveReflectionSources.load(std::memory_order_relaxed));
-        return;
-    }
-
-    // The voice's reflection source has been processed by the sim at
-    // least once, so the convolution worker may hold a staged slot whose
-    // params.ir points into this source's reflection state. We must:
-    //   1. Block new staging by clearing reflectionsActive — the audio
-    //      thread checks it before staging at AudioService.cpp:1048.
-    //   2. Drain any already-staged frames so the worker stops touching
-    //      the IR pointer before we release the source.
-    // After the drain, the convolution effect (dspNode.reflectionEffect)
-    // stays alive and continues to apply silence-padded output until the
-    // dspNode is destroyed — its internal tail buffers ring out cleanly
-    // even though the source-side IR is gone.
-    //
-    // Same pattern as removeVoiceSource, but does NOT touch effectsReady
-    // (the voice is still alive — just losing its reflection source).
-    voice.dspNode.reflectionsActive.store(false, std::memory_order_release);
-    waitForConvolutionWorker();
-
-    if (mReflectionSimRunning.load(std::memory_order_acquire)) {
-        // Defer-flush: the loopStep flush at the next idle frame runs
-        // iplSourceRemove + iplSourceRelease, after the convolution
-        // worker has already been drained above. Safe.
-        mPendingSourceRemovals.push_back(voice.reflectionSource);
-        voice.reflectionSource = nullptr;
-        mSimulatorDirty = true;
-    } else if (mReflectionSimulator) {
-        iplSourceRemove(voice.reflectionSource, mReflectionSimulator);
-        iplSourceRelease(&voice.reflectionSource);
-        mSimulatorDirty = true;
-    } else {
-        iplSourceRelease(&voice.reflectionSource);
-    }
-    voice.framesOutOfTopN = 0;
-    mActiveReflectionSources.fetch_sub(1, std::memory_order_relaxed);
-
-    AUDIO_LOG("[REFL_DEMOTE] h=%d '%s' active=%d\n",
-              voice.handle, voice.schemaName.c_str(),
-              mActiveReflectionSources.load(std::memory_order_relaxed));
+    if (mReflectionSim) mReflectionSim->decrementActiveSources();
 }
 
 //------------------------------------------------------
@@ -5159,10 +4496,11 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
         return;
 
     auto &dsp = voice.dspNode;
+    const int rateDivisor = mReflectionSim ? mReflectionSim->getRateDivisor() : 2;
     dsp.hrtf = mIplHrtf;
     dsp.frameSize = static_cast<int>(mFrameSize);
     dsp.reflectionFrameSize = static_cast<int>(mReflectionFrameSize);
-    dsp.rateDivisor = mReflectionRateDivisor;
+    dsp.rateDivisor = rateDivisor;
 
     // Allocate processing buffers (once, never reallocated — audio thread safe)
     dsp.monoScratch.resize(dsp.frameSize);
@@ -5173,7 +4511,7 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     if (mAmbisonicsChannels > 1) dsp.ambiScratch1.resize(mReflectionFrameSize, 0.0f);
     if (mAmbisonicsChannels > 2) dsp.ambiScratch2.resize(mReflectionFrameSize, 0.0f);
     if (mAmbisonicsChannels > 3) dsp.ambiScratch3.resize(mReflectionFrameSize, 0.0f);
-    if (mReflectionRateDivisor > 1)
+    if (rateDivisor > 1)
         dsp.decimatedMono.resize(mReflectionFrameSize, 0.0f);
 
     // Create IPLDirectEffect (per-voice, frequency-dependent 3-band EQ)
@@ -5261,7 +4599,7 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
                                          &reflSettings, &dsp.reflectionEffect);
         if (err == IPL_STATUS_SUCCESS) {
             dsp.reflectionMixer = mIplReflectionMixer;
-            dsp.convWorker = mConvolutionWorker.get();
+            dsp.convWorker = mConvolutionPool ? mConvolutionPool->worker() : nullptr;
         } else {
             LOG_ERROR("AudioService: iplReflectionEffectCreate failed (error %d) "
                       "— direct effects only for this voice", err);
@@ -5832,7 +5170,7 @@ void AudioService::haltAll()
     // Wait for both sim threads to finish — they hold pointers to committed
     // sources that we're about to destroy. Without this, ~ActiveVoice can
     // release IPL sources while iplSimulatorRunDirect/Reflections still uses them.
-    waitForReflectionThread();
+    if (mReflectionSim) mReflectionSim->waitForCompletion();
 
     // Remove all Steam Audio sources before destroying voices.
     // Since we just joined both threads, removeVoiceSource will take the
@@ -5850,18 +5188,10 @@ void AudioService::haltAll()
     // Flush any pending deferred adds/removals. Pending adds were never added
     // to the simulator — just release them. Pending removals were already
     // detached from their voices — remove from simulator and release.
-    for (auto &src : mPendingSourceAdds) {
-        iplSourceRelease(&src);
+    if (mReflectionSim) {
+        mReflectionSim->releasePendingAdds();
+        mReflectionSim->flushPendingRemovals();
     }
-    mPendingSourceAdds.clear();
-
-    if (mReflectionSimulator) {
-        for (auto &src : mPendingSourceRemovals) {
-            iplSourceRemove(src, mReflectionSimulator);
-            iplSourceRelease(&src);
-        }
-    }
-    mPendingSourceRemovals.clear();
 
     if (mVoicePool) mVoicePool->resetAllocator();
 }
@@ -6746,13 +6076,14 @@ void AudioService::dumpAudioStatusPeriodic()
                  directMs, reflMs, reflFrames, raysPerSec,
                  created, destroyed);
     // Append convolution sub-worker stats if active
-    if (mConvolutionWorker) {
+    if (mConvolutionPool && mConvolutionPool->isActive()) {
+        ConvolutionWorker *cw = mConvolutionPool->worker();
         float maxMs = 0.0f;
-        for (auto &subPtr : mConvolutionWorker->workers) {
+        for (auto &subPtr : cw->workers) {
             float ms = subPtr->peakMs.exchange(0.0f, std::memory_order_relaxed);
             if (ms > maxMs) maxMs = ms;
         }
-        AUDIO_LOG( " | conv: %.1fms (%dw)", maxMs, mConvolutionWorker->numWorkers);
+        AUDIO_LOG( " | conv: %.1fms (%dw)", maxMs, cw->numWorkers);
     }
     AUDIO_LOG( "\n");
 }
@@ -7320,7 +6651,8 @@ bool AudioService::loadProbes(const std::string &probePath)
         LOG_ERROR("AudioService: cannot load probes — ProbeManager not initialized");
         return false;
     }
-    return mProbeManager->loadProbes(probePath, mReflectionSimulator);
+    return mProbeManager->loadProbes(probePath,
+                                     mReflectionSim ? mReflectionSim->simulator() : nullptr);
 }
 
 

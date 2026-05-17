@@ -73,7 +73,10 @@ typedef _IPLProbeBatch_t* IPLProbeBatch;
 struct _IPLPathEffect_t;
 typedef _IPLPathEffect_t* IPLPathEffect;
 
-// Forward declaration for off-thread convolution worker (defined in AudioService.cpp)
+// Forward declarations for the reflection-sim / convolution-pool subsystems
+// (defined in ReflectionSimulator.h / ConvolutionWorkerPool.h respectively —
+// included from AudioService.cpp, not this header, to keep the include
+// footprint narrow).
 
 namespace Darkness {
 
@@ -81,7 +84,9 @@ namespace Darkness {
 class Room;
 class RoomPortal;
 
-// Forward declaration for off-thread convolution worker (defined in AudioService.cpp)
+// Owned subsystem types — full definitions live in their own headers.
+class ReflectionSimulator;
+class ConvolutionWorkerPool;
 struct ConvolutionWorker;
 
 // Forward declarations for sound resource types (defined in CRFSoundLoader.h)
@@ -375,8 +380,8 @@ public:
     void setReflectionDuration(float d) { mReflectionDuration = std::max(0.5f, std::min(d, 4.0f)); }
     float getReflectionDuration() const { return mReflectionDuration; }
 
-    void setReflectionThrottle(int n) { mReflectionThrottle = std::max(1, std::min(n, 32)); }
-    int  getReflectionThrottle() const { return mReflectionThrottle; }
+    void setReflectionThrottle(int n);
+    int  getReflectionThrottle() const;
 
     void setMaxReflectionVoices(int n) { mMaxReflectionVoices = std::max(1, std::min(n, MAX_ACTIVE_VOICES)); }
     int  getMaxReflectionVoices() const { return mMaxReflectionVoices; }
@@ -552,7 +557,7 @@ public:
     // and the voice goes fully dry for the rest of its life. This is a
     // sparing fallback — default is high (~10 s at 60 fps) so it fires
     // only when the convolution/sim budget is under real pressure.
-    void setReflectionDemoteHysteresisFrames(int n) { mReflectionDemoteHysteresisCfg = std::max(1, std::min(n, 3600)); }
+    void setReflectionDemoteHysteresisFrames(int n);
     /// "default" or "embree"
     void setSceneType(const std::string& s) { mSceneTypeCfg = (s == "embree" ? "embree" : "default"); }
 
@@ -627,12 +632,12 @@ public:
      *  Higher divisors reduce per-voice convolution cost proportionally.
      *  Reverb is perceptually transparent at 24kHz; 12kHz cuts above 6kHz
      *  but reverb tails are dominated by frequencies below 4kHz anyway. */
-    void setReflectionRateDivisor(int div) { mReflectionRateDivisor = (div >= 4) ? 4 : (div >= 2) ? 2 : 1; }
-    int  getReflectionRateDivisor() const { return mReflectionRateDivisor; }
+    void setReflectionRateDivisor(int div);
+    int  getReflectionRateDivisor() const;
 
     /// Backward-compatible wrapper for the old bool API
-    void setHalfRateReflections(bool enabled) { mReflectionRateDivisor = enabled ? 2 : 1; }
-    bool getHalfRateReflections() const { return mReflectionRateDivisor >= 2; }
+    void setHalfRateReflections(bool enabled);
+    bool getHalfRateReflections() const;
 
     /** Number of parallel convolution worker threads (0=auto, based on hardware).
      *  Must be set BEFORE buildAcousticScene() — cannot change at runtime.
@@ -979,12 +984,12 @@ private:
     /// Static mesh within the scene (world geometry + material assignments)
     IPLStaticMesh mIplStaticMesh = nullptr;
 
-    /// Simulator for ray-traced reflection/reverb computation. Runs on a
-    /// background thread (`reflectionSimWorkerMain`); source-add/remove
-    /// must be deferred via `mPendingSourceAdds` / `mPendingSourceRemovals`
-    /// when the worker is running, since `iplSimulatorRunReflections`
-    /// internally iterates the simulator's source list.
-    IPLSimulator mReflectionSimulator = nullptr;
+    /// Reflection simulation owner — wraps the Steam Audio reflection
+    /// IPLSimulator handle, its dedicated background worker thread, the
+    /// deferred source-add/remove queues, throttle counter, rate divisor,
+    /// demote hysteresis and the Stage 2.2 demote fallback. See
+    /// ReflectionSimulator.h for the full threading contract.
+    std::unique_ptr<ReflectionSimulator> mReflectionSim;
 
     /// Simulator for direct path (distance attenuation, occlusion, air
     /// absorption, transmission). Runs synchronously on the main thread in
@@ -998,10 +1003,6 @@ private:
     /// Atomic as a defensive measure — currently only accessed from the main
     /// thread, but the reflection sim thread could plausibly need it in future.
     std::atomic<bool> mSceneReady{false};
-
-    /// Deferred simulator commit flag — set when sources are added/removed,
-    /// committed once per frame in loopStep() before simulation runs.
-    bool mSimulatorDirty = false;
 
     // ── Reflection pipeline (convolution reverb → ambisonics → binaural) ──
 
@@ -1020,26 +1021,18 @@ private:
     /// engine endpoint. Reads the convolution worker's output and adds to direct.
     std::unique_ptr<ReflectionMixNode> mReflectionMixNode;
 
-    /// Off-thread convolution worker — processes all per-voice reflection
-    /// convolution on a dedicated thread with double-buffered stereo output.
-    std::unique_ptr<ConvolutionWorker> mConvolutionWorker;
-
-    /// Wait for the convolution worker to finish its current frame.
-    /// Must be called before releasing any IPLReflectionEffect.
-    void waitForConvolutionWorker();
-
-    /// Convolution sub-worker thread entry point (one per parallel worker).
-    void convolutionSubWorkerMain(int workerIdx);
-
-    /// Frame counter for throttling reflection simulation (every Nth frame)
-    int mReflectionFrameCounter = 0;
+    /// Off-thread convolution worker pool — owns the ConvolutionWorker (with
+    /// its K sub-worker threads) that consume per-voice mono snapshots,
+    /// run iplReflectionEffectApply against the reflection IRs, decode
+    /// ambisonics to binaural stereo, and write double-buffered output for
+    /// the reflection mix node to read on the next callback.
+    std::unique_ptr<ConvolutionWorkerPool> mConvolutionPool;
 
     // ── Tunable reflection parameters ──
 
     int mReflectionNumRays = 1024;     ///< Rays per simulation step (128–8192)
     int mReflectionNumBounces = 4;     ///< Bounces per ray (1–8)
     float mReflectionDuration = 2.0f;  ///< Max reverb tail in seconds (0.5–4.0)
-    int mReflectionThrottle = 4;       ///< Run every Nth frame (1–32)
     int mMaxReflectionVoices = DEFAULT_MAX_REFLECTION_VOICES;
     int mAcousticTriCount = 0;         ///< Triangles in current acoustic scene
 
@@ -1102,15 +1095,8 @@ private:
     // reflection source.
     int         mDirectMaxSourcesCfg       = 256;
     int         mReflectionMaxSourcesCfg   = 32;
-    // Demote fallback (stage 2.2): every voice starts with a reflection
-    // source. When a Normal voice has stayed outside the top-N reflection
-    // candidate pool for this many consecutive frames, its reflection
-    // source is released and the voice plays dry for the remainder of
-    // its life. Default ≈10 s at 60 fps — intentionally high so this is
-    // a sparing fallback for genuinely long-lived "stuck distant" voices,
-    // not the steady-state path. See AudioService.cpp
-    // demoteFromRealtimeReflection and the loopStep demote pass.
-    int         mReflectionDemoteHysteresisCfg = 600;
+    // Demote-fallback hysteresis moved to ReflectionSimulator
+    // (mReflectionSim->setDemoteHysteresis / getDemoteHysteresis).
     std::string mSceneTypeCfg              = "default"; // "default" or "embree"
     int         mAudioSampleRateCfg        = 48000;
     int         mAudioFrameSizeCfg         = 1024;
@@ -1133,11 +1119,8 @@ private:
     Vector3 mSceneMin{0, 0, 0};
     Vector3 mSceneMax{0, 0, 0};
 
-    /// Reflection rate divisor: 1=full (48kHz), 2=half (24kHz), 4=quarter (12kHz).
-    /// Set before buildAcousticScene(). Higher divisors reduce per-voice cost.
-    int mReflectionRateDivisor = 2;
-
     /// Number of parallel convolution worker threads (0=auto).
+    /// Rate divisor lives on mReflectionSim now.
     int mConvolutionWorkerCount = 0;
 
     /// Ambisonics order for reflections (0 = 1 channel, 1 = 4 channels).
@@ -1157,35 +1140,10 @@ private:
     // - Reflection sim (ray-traced reverb): runs throttled, expensive, 50-200ms
     //
     // Source mutations (add/remove/commit) must wait for BOTH threads to be idle.
-
-    /// Reflection simulation worker — runs ray-traced reverb on a throttled schedule.
-    /// Latency-tolerant: reverb tails change slowly with listener movement.
-    std::thread mReflectionSimThread;
-    std::mutex mReflectionSimMutex;
-    std::condition_variable mReflectionSimCV;
-    bool mReflectionSimWant = false;  ///< protected by mReflectionSimMutex
-    std::atomic<bool> mReflectionSimRunning{false};
-    std::atomic<bool> mReflectionSimShutdown{false};
-    void reflectionSimWorkerMain();
-
-    /// IPL sources awaiting deferred removal (accumulated while any sim thread is busy).
-    std::vector<IPLSource> mPendingSourceRemovals;
-
-    /// IPL sources awaiting deferred add (accumulated while any sim thread is busy).
-    std::vector<IPLSource> mPendingSourceAdds;
-
-    /// Count of voices that currently hold a real-time reflection source
-    /// (promoted). Incremented in promoteToRealtimeReflection, decremented
-    /// in demoteFromRealtimeReflection / removeVoiceSource. Atomic so the
-    /// debug console / perf overlay can read without locking. Validates
-    /// against leaks in the promote/demote state machine — should equal the
-    /// number of voices in mVoicePool with a non-null reflectionSource.
-    std::atomic<int> mActiveReflectionSources{0};
-
-    /// Join the background reflection thread if it's running.
-    /// Must be called before any source mutation (add/remove/commit)
-    /// to prevent Steam Audio from accessing freed source data.
-    void waitForReflectionThread();
+    //
+    // The reflection-side thread + mutex + CV + want/running/shutdown atomics,
+    // the deferred source-add/remove queues, the throttle counter, the rate
+    // divisor and the active-source counter ALL live on mReflectionSim.
 
     // Room-explicit propagateSound is now SoundPropagation's responsibility
     // and takes a RoomID (int32_t) — see SoundPropagation::propagateSound.
@@ -1227,18 +1185,10 @@ private:
     void removeVoiceSource(ActiveVoice &voice);
 
     /// Reflection-source demote fallback (stage 2.2):
-    /// Every voice is created with a reflectionSource in createVoiceSource
-    /// so the baseline path is "voice has reverb" (baked by default,
-    /// upgraded to realtime when it enters top-N via inputs.baked = false).
-    /// This helper releases the reflection source for a voice that has
-    /// stayed outside the top-N reflection candidate pool for
-    /// `mReflectionDemoteHysteresisCfg` consecutive frames — a sparing
-    /// fallback that trims `mSourceData[0]` iteration cost when convolution
-    /// or sim budget is genuinely under pressure. Once demoted the voice
-    /// plays dry for the remainder of its life. PlayerEmitted and Ambient
-    /// voices are excluded; the caller in loopStep filters them out.
-    /// Release uses `mPendingSourceRemovals` when the sim thread is busy.
-    void demoteFromRealtimeReflection(ActiveVoice &voice);
+    /// Stage 2.2 demote fallback now lives on ReflectionSimulator
+    /// (mReflectionSim->demoteVoice). loopStep calls it directly when a
+    /// voice has stayed outside the top-N pool for the configured
+    /// hysteresis frames.
     void initVoiceDSP(ActiveVoice &voice);
     int selectSample(const std::string &schemaName, int sampleCount, int totalFreq,
                      const int *frequencies);
