@@ -1092,6 +1092,14 @@ static void recordAudioFrame(const float *stereoInterleaved, uint32_t frameCount
 
 // ── Audio thread profiling (written by audio thread, read by main thread) ──
 // Tracks peak time spent in audio callbacks to detect buffer underruns.
+// Updated only when audio_log profiling is enabled — see AudioLog.h
+// (gAudioLogVerbose gates both textual logging and these perf counters).
+// Each producer reads the flag once per callback / loop iteration into a
+// local, then branches per write site to avoid 11 atomic RMWs in the hot
+// path when profiling is off.  Readers (the periodic dumper) always run;
+// they'll just observe stale 0s when profiling was off.  We deliberately
+// do NOT zero counters on toggle-off — that would race with the audio
+// thread.
 static std::atomic<float> sPerVoicePeakUs{0.0f};    // peak per-voice DSP time (µs)
 static std::atomic<float> sMixNodePeakUs{0.0f};      // peak global mix node time (µs)
 static std::atomic<float> sTotalCallbackPeakUs{0.0f}; // peak total audio callback time (µs)
@@ -1119,7 +1127,12 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                                    ma_uint32* pFrameCountIn,
                                    float** ppFramesOut, ma_uint32* pFrameCountOut)
 {
-    auto t0 = std::chrono::steady_clock::now();
+    // Read the profiling flag once per callback. When false, skip all the
+    // chrono captures and atomic RMWs that would otherwise update the perf
+    // counters at the bottom of this function.
+    const bool profOn = ::Darkness::gAudioLogVerbose;
+    auto t0 = profOn ? std::chrono::steady_clock::now()
+                     : std::chrono::steady_clock::time_point{};
     // Keep denormals from creeping into IIR state across many small samples —
     // a flushed-zero subnormal is mathematically the same as zero but avoids
     // the 10-100× microcode slowdown that can starve the audio callback.
@@ -1749,16 +1762,19 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
     pFrameCountIn[0] = frameCount;
     *pFrameCountOut = frameCount;
 
-    // Profile: track peak per-voice DSP time and accumulate for total callback
-    auto t1 = std::chrono::steady_clock::now();
-    float us = std::chrono::duration<float, std::micro>(t1 - t0).count();
-    float prev = sPerVoicePeakUs.load(std::memory_order_relaxed);
-    if (us > prev) sPerVoicePeakUs.store(us, std::memory_order_relaxed);
-    // Accumulate per-voice time for total callback measurement (C++17 CAS loop)
-    float oldAccum = sCallbackAccumUs.load(std::memory_order_relaxed);
-    while (!sCallbackAccumUs.compare_exchange_weak(oldAccum, oldAccum + us,
-                                                     std::memory_order_relaxed)) {}
-    sPerVoiceCallCount.fetch_add(1, std::memory_order_relaxed);
+    // Profile: track peak per-voice DSP time and accumulate for total callback.
+    // Skipped entirely when audio_log profiling is off — see AudioLog.h.
+    if (profOn) {
+        auto t1 = std::chrono::steady_clock::now();
+        float us = std::chrono::duration<float, std::micro>(t1 - t0).count();
+        float prev = sPerVoicePeakUs.load(std::memory_order_relaxed);
+        if (us > prev) sPerVoicePeakUs.store(us, std::memory_order_relaxed);
+        // Accumulate per-voice time for total callback measurement (C++17 CAS loop)
+        float oldAccum = sCallbackAccumUs.load(std::memory_order_relaxed);
+        while (!sCallbackAccumUs.compare_exchange_weak(oldAccum, oldAccum + us,
+                                                         std::memory_order_relaxed)) {}
+        sPerVoiceCallCount.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 /// Audio-thread callback for the global reflection mix node.
@@ -1769,7 +1785,11 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
                                       ma_uint32* pFrameCountIn,
                                       float** ppFramesOut, ma_uint32* pFrameCountOut)
 {
-    auto mixT0 = std::chrono::steady_clock::now();
+    // Read the profiling flag once per callback. When false, skip all the
+    // chrono captures and atomic RMWs that update the perf counters below.
+    const bool profOn = ::Darkness::gAudioLogVerbose;
+    auto mixT0 = profOn ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
     audioEnableDenormalFlush();
     auto* node = reinterpret_cast<AudioService::ReflectionMixNode*>(pNode);
     ma_uint32 frameCount = *pFrameCountOut;
@@ -2277,15 +2297,22 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
     if (stereoOut && frameCount > 0)
         recordAudioFrame(stereoOut, frameCount);
 
-    // Profile: track peak mix node time and total callback time
-    auto mixT1 = std::chrono::steady_clock::now();
-    float mixUs = std::chrono::duration<float, std::micro>(mixT1 - mixT0).count();
-    float prevMix = sMixNodePeakUs.load(std::memory_order_relaxed);
-    if (mixUs > prevMix) sMixNodePeakUs.store(mixUs, std::memory_order_relaxed);
-    // Total = all per-voice DSP time + this mix node time
-    float totalUs = sCallbackAccumUs.exchange(0.0f, std::memory_order_relaxed) + mixUs;
-    float prevTotal = sTotalCallbackPeakUs.load(std::memory_order_relaxed);
-    if (totalUs > prevTotal) sTotalCallbackPeakUs.store(totalUs, std::memory_order_relaxed);
+    // Profile: track peak mix node time and total callback time.
+    // Skipped entirely when audio_log profiling is off — see AudioLog.h.
+    if (profOn) {
+        auto mixT1 = std::chrono::steady_clock::now();
+        float mixUs = std::chrono::duration<float, std::micro>(mixT1 - mixT0).count();
+        float prevMix = sMixNodePeakUs.load(std::memory_order_relaxed);
+        if (mixUs > prevMix) sMixNodePeakUs.store(mixUs, std::memory_order_relaxed);
+        // Total = all per-voice DSP time + this mix node time.
+        // Note: we drain sCallbackAccumUs only when profiling is on, so when
+        // profiling toggles off the accumulator may hold a stale residual.
+        // It will be drained on the next on-cycle; readers always see a
+        // freshly-exchanged value, so no harm done.
+        float totalUs = sCallbackAccumUs.exchange(0.0f, std::memory_order_relaxed) + mixUs;
+        float prevTotal = sTotalCallbackPeakUs.load(std::memory_order_relaxed);
+        if (totalUs > prevTotal) sTotalCallbackPeakUs.store(totalUs, std::memory_order_relaxed);
+    }
 }
 
 /*----------------------------------------------------*/
@@ -3580,7 +3607,12 @@ void AudioService::loopStep(float deltaTime)
     if (!mAudioReady)
         return;
 
-    auto loopStepStart = std::chrono::steady_clock::now();
+    // Read profiling flag once per loopStep. When off, all the perf-counter
+    // writes scattered through this function and its callees become no-ops.
+    // See AudioLog.h for the toggle.
+    const bool profOn = ::Darkness::gAudioLogVerbose;
+    auto loopStepStart = profOn ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
 
     // Update ambient volumes early so newly created ambient voices exist before
     // the simulation runs. This ensures same-frame occlusion for new ambients —
@@ -3622,12 +3654,16 @@ void AudioService::loopStep(float deltaTime)
     // be idle since it reads from the active buffer. Direct sim runs inline
     // (after commit), so no conflict there.
     if (canMutate && mSimulatorDirty && mReflectionSimulator) {
-        auto ct0 = std::chrono::steady_clock::now();
-        iplSimulatorCommit(mReflectionSimulator);
-        auto ct1 = std::chrono::steady_clock::now();
-        float cMs = std::chrono::duration<float, std::milli>(ct1 - ct0).count();
-        float prevC = sCommitPeakMs.load(std::memory_order_relaxed);
-        if (cMs > prevC) sCommitPeakMs.store(cMs, std::memory_order_relaxed);
+        if (profOn) {
+            auto ct0 = std::chrono::steady_clock::now();
+            iplSimulatorCommit(mReflectionSimulator);
+            auto ct1 = std::chrono::steady_clock::now();
+            float cMs = std::chrono::duration<float, std::milli>(ct1 - ct0).count();
+            float prevC = sCommitPeakMs.load(std::memory_order_relaxed);
+            if (cMs > prevC) sCommitPeakMs.store(cMs, std::memory_order_relaxed);
+        } else {
+            iplSimulatorCommit(mReflectionSimulator);
+        }
         mSimulatorDirty = false;
     }
 
@@ -3908,7 +3944,8 @@ void AudioService::loopStep(float deltaTime)
                     // it produced 200–2000 ms of audible latency between
                     // listener-room changes and the voice's gain following, which
                     // is well above the perceptual threshold for ambient cues.
-                    auto prT0 = std::chrono::steady_clock::now();
+                    auto prT0 = profOn ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
                     // Use the voice's per-source maxAudibleDist instead
                     // of the global cap: BFS won't bother exploring
                     // paths longer than the schema's effective radius,
@@ -3942,10 +3979,12 @@ void AudioService::loopStep(float deltaTime)
                         prop = propagateSound(voice->worldPos, mListenerPos,
                                               voice->maxAudibleDist);
                     }
-                    auto prT1 = std::chrono::steady_clock::now();
-                    float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
-                    sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
-                    sPortalRoutingCount.fetch_add(1, std::memory_order_relaxed);
+                    if (profOn) {
+                        auto prT1 = std::chrono::steady_clock::now();
+                        float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
+                        sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
+                        sPortalRoutingCount.fetch_add(1, std::memory_order_relaxed);
+                    }
 
                     voice->cachedProp = prop;
 
@@ -4199,12 +4238,16 @@ void AudioService::loopStep(float deltaTime)
             // newly added direct sources are processed from frame 1 (no
             // defer-flush race for the direct path).
             {
-                auto dt0 = std::chrono::steady_clock::now();
-                iplSimulatorRunDirect(mDirectSimulator);
-                auto dt1 = std::chrono::steady_clock::now();
-                float dMs = std::chrono::duration<float, std::milli>(dt1 - dt0).count();
-                float prevD = sDirectSimPeakMs.load(std::memory_order_relaxed);
-                if (dMs > prevD) sDirectSimPeakMs.store(dMs, std::memory_order_relaxed);
+                if (profOn) {
+                    auto dt0 = std::chrono::steady_clock::now();
+                    iplSimulatorRunDirect(mDirectSimulator);
+                    auto dt1 = std::chrono::steady_clock::now();
+                    float dMs = std::chrono::duration<float, std::milli>(dt1 - dt0).count();
+                    float prevD = sDirectSimPeakMs.load(std::memory_order_relaxed);
+                    if (dMs > prevD) sDirectSimPeakMs.store(dMs, std::memory_order_relaxed);
+                } else {
+                    iplSimulatorRunDirect(mDirectSimulator);
+                }
             }
 
             // Signal reflection sim (throttled, latency-tolerant, background thread)
@@ -4493,8 +4536,9 @@ void AudioService::loopStep(float deltaTime)
 
     // (ambient volumes updated at top of loopStep, before simulation)
 
-    // loopStep total time (main thread)
-    {
+    // loopStep total time (main thread). Skipped when audio_log is off —
+    // see AudioLog.h.
+    if (profOn) {
         auto loopStepEnd = std::chrono::steady_clock::now();
         float ms = std::chrono::duration<float, std::milli>(loopStepEnd - loopStepStart).count();
         float prev = sLoopStepPeakMs.load(std::memory_order_relaxed);
@@ -4659,13 +4703,19 @@ void AudioService::reflectionSimWorkerMain()
             mReflectionSimWant = false;
         }
 
-        auto t0 = std::chrono::steady_clock::now();
-        iplSimulatorRunReflections(mReflectionSimulator);
-        auto t1 = std::chrono::steady_clock::now();
-        float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
-        float prev = sReflSimPeakMs.load(std::memory_order_relaxed);
-        if (ms > prev) sReflSimPeakMs.store(ms, std::memory_order_relaxed);
-        sReflFramesRun.fetch_add(1, std::memory_order_relaxed);
+        // Read profiling flag once per reflection sim cycle.
+        const bool profOn = ::Darkness::gAudioLogVerbose;
+        if (profOn) {
+            auto t0 = std::chrono::steady_clock::now();
+            iplSimulatorRunReflections(mReflectionSimulator);
+            auto t1 = std::chrono::steady_clock::now();
+            float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+            float prev = sReflSimPeakMs.load(std::memory_order_relaxed);
+            if (ms > prev) sReflSimPeakMs.store(ms, std::memory_order_relaxed);
+            sReflFramesRun.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            iplSimulatorRunReflections(mReflectionSimulator);
+        }
         if (mReflectionMixNode)
             mReflectionMixNode->simulationRan = true;
         mReflectionSimRunning.store(false, std::memory_order_release);
@@ -5007,7 +5057,10 @@ void AudioService::cleanupFinishedVoices()
                       v.playerEmitted ? 1 : 0);
             removeVoiceSource(v);
             it = mVoices.erase(it);
-            sVoicesDestroyed.fetch_add(1, std::memory_order_relaxed);
+            // Voice-lifecycle perf counter — only updated when audio_log
+            // profiling is on (see AudioLog.h).
+            if (::Darkness::gAudioLogVerbose)
+                sVoicesDestroyed.fetch_add(1, std::memory_order_relaxed);
         } else {
             ++it;
         }
@@ -5711,7 +5764,10 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
                  voice->data.wavData.size(), (unsigned long long)totalFrames,
                  decRate, decCh, durMs);
     mVoices[h] = std::move(voice);
-    sVoicesCreated.fetch_add(1, std::memory_order_relaxed);
+    // Voice-lifecycle perf counter — only updated when audio_log profiling
+    // is on (see AudioLog.h).
+    if (::Darkness::gAudioLogVerbose)
+        sVoicesCreated.fetch_add(1, std::memory_order_relaxed);
     return h;
 }
 
