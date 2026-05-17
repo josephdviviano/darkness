@@ -591,6 +591,42 @@ static void renderWater(
     }
 }
 
+// Indices into state.roomDebug for the closest-N rooms to camPos. If
+// debugRoomMaxCount is 0 or >= number of rooms, every room is returned
+// (in original order — no sorting wasted). Otherwise we partial-sort by
+// squared distance to room center and return the closest N indices in
+// nearest-first order.
+//
+// Used by both renderDebugOverlay (wireframe/portal overlay) and
+// renderRoomLabelsOverlay so they agree on which rooms are visible: the
+// labels you can read always correspond to the wireframes you can see,
+// and vice versa.
+static std::vector<size_t> selectClosestRooms(
+    const Darkness::RuntimeState &state,
+    const Darkness::Vector3 &camPos)
+{
+    const auto &rd = state.roomDebug;
+    std::vector<size_t> indices;
+    indices.reserve(rd.size());
+    for (size_t i = 0; i < rd.size(); ++i) indices.push_back(i);
+
+    int cap = state.debugRoomMaxCount;
+    if (cap <= 0 || static_cast<size_t>(cap) >= rd.size()) {
+        return indices;  // no cull
+    }
+
+    // Partial sort: we only need the closest `cap`, so nth_element +
+    // sort of the head is cheaper than a full sort of the room list.
+    std::nth_element(indices.begin(), indices.begin() + cap, indices.end(),
+        [&](size_t a, size_t b) {
+            float da = glm::length2(rd[a].center - camPos);
+            float db = glm::length2(rd[b].center - camPos);
+            return da < db;
+        });
+    indices.resize(cap);
+    return indices;
+}
+
 // Render the room-ID overlay (HUD line + per-corner labels). Called
 // from the main render loop AFTER the frob-hint section so the labels
 // survive the dbgTextClear at the top of that section. Wireframe edges
@@ -680,38 +716,48 @@ static void renderRoomLabelsOverlay(
     float vp[16];
     bx::mtxMul(vp, fc.view, fc.proj);
 
-    for (const auto &lbl : state.roomLabels) {
-        float p[4] = { lbl.pos.x, lbl.pos.y, lbl.pos.z, 1.0f };
-        float c[4];
-        bx::vec4MulMtx(c, p, vp);
-        if (c[3] <= 0.001f) continue;  // behind camera
-        float ndcX = c[0] / c[3];
-        float ndcY = c[1] / c[3];
-        if (ndcX < -1.0f || ndcX > 1.0f) continue;
-        if (ndcY < -1.0f || ndcY > 1.0f) continue;
+    // Apply the same closest-N cull as the wireframe overlay so the
+    // labels visible on-screen match the wireframes drawn behind them.
+    // Without this, labels for distant rooms would still print on top
+    // of nearby wireframes and re-introduce all the clutter the cull
+    // was meant to remove.
+    Darkness::Vector3 cullCamPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+    auto picks = selectClosestRooms(state, cullCamPos);
 
-        float sx = (ndcX * 0.5f + 0.5f) * fbWidth;
-        float sy = (1.0f - (ndcY * 0.5f + 0.5f)) * fbHeight;
-        int col = static_cast<int>(sx / cellW);
-        int row = static_cast<int>(sy / cellH);
-        if (col < 0 || row < 0) continue;
+    for (size_t idx : picks) {
+        for (const auto &lbl : state.roomDebug[idx].labels) {
+            float p[4] = { lbl.pos.x, lbl.pos.y, lbl.pos.z, 1.0f };
+            float c[4];
+            bx::vec4MulMtx(c, p, vp);
+            if (c[3] <= 0.001f) continue;  // behind camera
+            float ndcX = c[0] / c[3];
+            float ndcY = c[1] / c[3];
+            if (ndcX < -1.0f || ndcX > 1.0f) continue;
+            if (ndcY < -1.0f || ndcY > 1.0f) continue;
 
-        bool isCurrent = (lbl.roomID == currentRoomID);
-        // Attribute byte: high nibble = bg, low nibble = fg.
-        //   Current room (center): bright yellow on black with "*"
-        //   Other rooms (center):  bright cyan on black
-        //   Corner labels:         dim cyan on black (less visual noise —
-        //     8 corners per room — but legible from a few feet away).
-        uint8_t attr;
-        if (isCurrent && lbl.isCenter) {
-            attr = 0x0E;
-        } else if (lbl.isCenter) {
-            attr = 0x0B;
-        } else {
-            attr = 0x03;
+            float sx = (ndcX * 0.5f + 0.5f) * fbWidth;
+            float sy = (1.0f - (ndcY * 0.5f + 0.5f)) * fbHeight;
+            int col = static_cast<int>(sx / cellW);
+            int row = static_cast<int>(sy / cellH);
+            if (col < 0 || row < 0) continue;
+
+            bool isCurrent = (lbl.roomID == currentRoomID);
+            // Attribute byte: high nibble = bg, low nibble = fg.
+            //   Current room (center): bright yellow on black with "*"
+            //   Other rooms (center):  bright cyan on black
+            //   Corner labels:         dim cyan on black (less visual noise —
+            //     8 corners per room — but legible from a few feet away).
+            uint8_t attr;
+            if (isCurrent && lbl.isCenter) {
+                attr = 0x0E;
+            } else if (lbl.isCenter) {
+                attr = 0x0B;
+            } else {
+                attr = 0x03;
+            }
+            bgfx::dbgTextPrintf(col, row, attr, "%d%s",
+                lbl.roomID, (isCurrent && lbl.isCenter) ? "*" : "");
         }
-        bgfx::dbgTextPrintf(col, row, attr, "%d%s",
-            lbl.roomID, (isCurrent && lbl.isCenter) ? "*" : "");
     }
 }
 
@@ -727,8 +773,15 @@ static void renderDebugOverlay(
     // Skip view-state setup if nothing in this overlay is enabled. The probe
     // overlay covers both the grid and the listener-flash marker; we only
     // pay the AudioService GET_SERVICE call when it's on.
+    //
+    // EVERY show_* boolean that gets drawn inside this function must
+    // appear here, otherwise the wireframe silently requires another
+    // overlay to be on first — the exact bug this gate was supposed to
+    // prevent. show_portals and show_vpos were added later and missed
+    // the list.
     if (!state.showRaycast && !state.showAcousticMesh
-        && !state.showProbes && !state.showRooms) {
+        && !state.showProbes && !state.showRooms
+        && !state.showPortals && !state.showVPos) {
         return;
     }
 
@@ -911,11 +964,25 @@ static void renderDebugOverlay(
     // to be inside the `if (state.showRaycast)` scope by accident,
     // which is why the wireframes only appeared when both flags were
     // on.
-    if (state.showRooms && bgfx::isValid(state.roomVBH)) {
+    //
+    // Geometry is rebuilt every frame from per-room CPU buffers
+    // (state.roomDebug) into a transient vertex buffer. The closest-N
+    // cull (debug_room_max_count) keeps visual clutter manageable in
+    // levels with hundreds of rooms — sorting a few hundred floats per
+    // frame is negligible compared to even one draw call.
+    auto submitWireframeBatch = [&](const std::vector<Darkness::PosColorVertex> &verts) {
+        if (verts.empty()) return;
+        uint32_t count = static_cast<uint32_t>(verts.size());
+        if (bgfx::getAvailTransientVertexBuffer(count, Darkness::PosColorVertex::layout) < count)
+            return;
+        bgfx::TransientVertexBuffer tvb;
+        bgfx::allocTransientVertexBuffer(&tvb, count, Darkness::PosColorVertex::layout);
+        std::memcpy(tvb.data, verts.data(), count * sizeof(Darkness::PosColorVertex));
+
         float identity[16];
         bx::mtxIdentity(identity);
         bgfx::setTransform(identity);
-        bgfx::setVertexBuffer(0, state.roomVBH, 0, state.roomLineCount);
+        bgfx::setVertexBuffer(0, &tvb, 0, count);
         uint64_t wireState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                            | BGFX_STATE_PT_LINES
                            | BGFX_STATE_BLEND_ALPHA
@@ -929,6 +996,134 @@ static void renderDebugOverlay(
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
         bgfx::setUniform(gpu.u_objectLight, whiteLight);
         bgfx::submit(2, gpu.flatProgram);
+    };
+
+    if ((state.showRooms || state.showPortals) && !state.roomDebug.empty()) {
+        Darkness::Vector3 camPos(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+        auto picks = selectClosestRooms(state, camPos);
+
+        // Concatenate the per-room buffers for whichever overlay(s) are
+        // enabled, then submit each as a single draw call. The buffers
+        // never share verts between overlays (different colors), so
+        // show_rooms and show_portals each get their own TVB.
+        if (state.showRooms) {
+            size_t total = 0;
+            for (size_t idx : picks) total += state.roomDebug[idx].roomLines.size();
+            std::vector<Darkness::PosColorVertex> batch;
+            batch.reserve(total);
+            for (size_t idx : picks) {
+                const auto &rl = state.roomDebug[idx].roomLines;
+                batch.insert(batch.end(), rl.begin(), rl.end());
+            }
+            submitWireframeBatch(batch);
+        }
+
+        // Portal-only overlay (light pink). Independent of show_rooms;
+        // useful for tracing BFS path geometry without the room-OBB
+        // wireframe clutter. Same closest-N cull as show_rooms.
+        if (state.showPortals) {
+            size_t total = 0;
+            for (size_t idx : picks) total += state.roomDebug[idx].portalLines.size();
+            std::vector<Darkness::PosColorVertex> batch;
+            batch.reserve(total);
+            for (size_t idx : picks) {
+                const auto &pl = state.roomDebug[idx].portalLines;
+                batch.insert(batch.end(), pl.begin(), pl.end());
+            }
+            submitWireframeBatch(batch);
+        }
+    }
+
+    // ── Per-voice virtual-position overlay (show_vpos) ──
+    //
+    // For each active voice, draw two line segments:
+    //   • Cyan: actual source position → virtualPosition (the BFS
+    //     anchor / Steam Audio "where the sound comes from")
+    //   • Yellow: virtualPosition → listener
+    //
+    // The yellow segment is what Steam Audio's distanceAttenuation is
+    // computed from. When yellow JUMPS frame-to-frame (chain change in
+    // BFS), Steam Audio's distance — and therefore the voice's volume
+    // — jumps audibly. Watching the lines makes this visible.
+    if (state.showVPos) {
+        Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+        if (audioSvc) {
+            auto snapshots = audioSvc->getVoiceSpatialSnapshots();
+            // Worst-case vert count: each voice = source + N bends + listener
+            // segments = (N + 1) segments * 2 verts. Bound by 16 bends/voice.
+            uint32_t needed = 0;
+            for (const auto &s : snapshots) {
+                if (!s.reached) continue;
+                size_t bends = s.chain.size();
+                needed += static_cast<uint32_t>((bends + 1) * 2);
+            }
+            if (needed > 0 &&
+                bgfx::getAvailTransientVertexBuffer(
+                    needed, Darkness::PosColorVertex::layout) >= needed) {
+                bgfx::TransientVertexBuffer tvb;
+                bgfx::allocTransientVertexBuffer(
+                    &tvb, needed, Darkness::PosColorVertex::layout);
+                auto *verts = reinterpret_cast<Darkness::PosColorVertex *>(tvb.data);
+                uint32_t n = 0;
+                // Colour the segments so the chain reads source-to-listener:
+                //   • Source → first bend: bright cyan (first leg)
+                //   • Between bends: light blue (intermediate legs)
+                //   • Last bend → listener: bright yellow (last leg, the
+                //     segment Steam Audio uses for distance)
+                // For clean-threaded paths (no bends), the whole line is
+                // a single magenta segment from source to listener.
+                constexpr uint32_t kCyan      = 0xFFFFFF00u;  // ABGR
+                constexpr uint32_t kLightBlue = 0xFFFFAA00u;
+                constexpr uint32_t kYellow    = 0xFF00FFFFu;
+                constexpr uint32_t kMagenta   = 0xFFFF00FFu;
+                Vector3 lst(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+                auto emit = [&](const Vector3 &p, uint32_t c) {
+                    verts[n].x = p.x;
+                    verts[n].y = p.y;
+                    verts[n].z = p.z;
+                    verts[n].abgr = c;
+                    ++n;
+                };
+                for (const auto &s : snapshots) {
+                    if (!s.reached) continue;
+                    if (s.chain.empty()) {
+                        // Same-room or clean-threaded — single segment.
+                        emit(s.sourcePos, kMagenta);
+                        emit(lst,         kMagenta);
+                    } else {
+                        // Multi-bend chain. Connect:
+                        // source → chain[0] → chain[1] → … → chain[back] → listener
+                        emit(s.sourcePos, kCyan);
+                        emit(s.chain.front(), kCyan);
+                        for (size_t i = 1; i < s.chain.size(); ++i) {
+                            emit(s.chain[i - 1], kLightBlue);
+                            emit(s.chain[i],     kLightBlue);
+                        }
+                        emit(s.chain.back(), kYellow);
+                        emit(lst,            kYellow);
+                    }
+                }
+                if (n > 0) {
+                    float identity[16];
+                    bx::mtxIdentity(identity);
+                    bgfx::setTransform(identity);
+                    bgfx::setVertexBuffer(0, &tvb, 0, n);
+                    uint64_t lineState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                                       | BGFX_STATE_PT_LINES
+                                       | BGFX_STATE_BLEND_ALPHA
+                                       | BGFX_STATE_DEPTH_TEST_ALWAYS;
+                    bgfx::setState(lineState);
+                    float noFog[4] = {0, 0, 0, 0};
+                    bgfx::setUniform(gpu.u_fogColor, noFog);
+                    bgfx::setUniform(gpu.u_fogParams, noFog);
+                    float opaqueParams[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+                    float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
+                    bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+                    bgfx::setUniform(gpu.u_objectLight, whiteLight);
+                    bgfx::submit(2, gpu.flatProgram);
+                }
+            }
+        }
     }
 
     // ── Room ID labels (screen-space text via bgfx::dbgTextPrintf) ──
@@ -1573,6 +1768,46 @@ static void registerConsoleSettings(
         [&state]() { return state.showPos; },
         [&state](bool v) { state.showPos = v; },
         "Show camera world-space (x, y, z) position on the HUD. Z-up Dark Engine coords, units = feet.");
+
+    dbgConsole.addBool("show_portals",
+        [&state]() { return state.showPortals; },
+        [&state](bool v) { state.showPortals = v; },
+        "Highlight portal polygons in light pink (independent of show_rooms). Useful for tracing BFS audio paths through the level geometry.");
+
+    // Cap how many rooms participate in the show_rooms / show_portals
+    // overlays, picked by camera distance to room center. Levels with
+    // hundreds of rooms (the typical Thief 2 mission) become unreadable
+    // when every wireframe + ID label is drawn at once; restricting to
+    // a handful nearest the camera keeps the overlay legible while you
+    // walk around. "all" disables the cull.
+    {
+        // Stored as int on RuntimeState; categorical maps an option
+        // index in [0..options.size()) onto our cap value. "all" → 0
+        // (the sentinel selectClosestRooms reads as "no limit").
+        static const std::vector<std::string> kCountOptions = {
+            "5", "10", "20", "50", "100", "all"
+        };
+        static const std::vector<int> kCountValues = {5, 10, 20, 50, 100, 0};
+
+        dbgConsole.addCategorical("debug_room_max_count", kCountOptions,
+            [&state]() -> int {
+                for (size_t i = 0; i < kCountValues.size(); ++i) {
+                    if (kCountValues[i] == state.debugRoomMaxCount)
+                        return static_cast<int>(i);
+                }
+                return 2;  // fall back to "20" (the default)
+            },
+            [&state](int idx) {
+                if (idx >= 0 && idx < static_cast<int>(kCountValues.size()))
+                    state.debugRoomMaxCount = kCountValues[idx];
+            },
+            "Cap rooms drawn by show_rooms / show_portals overlays to the camera-nearest N. 'all' disables the cull. Reduces visual clutter in dense levels.");
+    }
+
+    dbgConsole.addBool("show_vpos",
+        [&state]() { return state.showVPos; },
+        [&state](bool v) { state.showVPos = v; },
+        "Per-voice spatial overlay. Cyan: source -> virtualPosition (anchor). Yellow: virtualPosition -> listener (what Steam Audio sees as the source distance). Yellow segment jumping = chain switch causing the audible volume pulse.");
 
     dbgConsole.addBool("debug_anim_lightmaps",
         [&state]() { return state.debugAnimLightmaps; },
@@ -2868,6 +3103,19 @@ int main(int argc, char *argv[]) {
         if (roomSvc && roomSvc->isLoaded()) {
             mission.cellToRoom = buildCellToRoomMap(
                 mission.wrData, roomSvc->getAllRooms());
+
+            // BSP-validate every ROOM_DB portal. Phantom portals
+            // (ROOM_DB adjacencies where the BSP says there's no
+            // physical opening) get marked invalid so sound
+            // propagation BFS won't route through them. See
+            // RoomService::validatePortals + NOTES.PROJECT.md "Sound
+            // Propagation Model" → phantom-portal section.
+            roomSvc->validatePortals(
+                [&mission](const Darkness::Vector3 &a,
+                           const Darkness::Vector3 &b) -> bool {
+                    Darkness::RayHit hit;
+                    return !Darkness::raycastWorld(mission.wrData, a, b, hit);
+                });
         }
     }
 
@@ -3900,26 +4148,36 @@ int main(int argc, char *argv[]) {
         state.acousticIndices.shrink_to_fit();
     }
 
-    // ── Build room/portal wireframe overlay buffer ──
+    // ── Build per-room debug geometry (room/portal wireframe overlay) ──
     //
     // For each Room we compute the corners of its bounding polytope (the
     // half-space intersection of its 6 stored planes), the edges between
     // those corners, and the polygon boundary of each of its portals.
-    // Everything is emitted into one PT_LINES vertex buffer with the room
-    // ID's hash as a per-vertex color, plus a labels list for the per-frame
-    // dbgTextPrintf overlay.
+    // Geometry is stored PER ROOM so the renderer can sort by camera
+    // distance each frame and emit only the closest N into a transient
+    // vertex buffer — the room database can run into the hundreds, and
+    // drawing every wireframe + ID label at once is unreadable.
     //
     // Build is one-shot — the room database is static for the life of the
-    // mission. Toggle via the `show_rooms` debug-console boolean.
+    // mission. Toggle via the `show_rooms` / `show_portals` booleans;
+    // adjust the cull cap via `debug_room_max_count`.
     {
         Darkness::RoomServicePtr roomSvc = GET_SERVICE(Darkness::RoomService);
         if (roomSvc && roomSvc->isLoaded()) {
             const auto &rooms = roomSvc->getAllRooms();
-            std::vector<Darkness::PosColorVertex> lineVerts;
-            // Reservation budget: 12 edges/room × 2 vertices, plus 4 edges/portal
-            // × 2 vertices, plus a generous overhead for non-axis-aligned rooms
-            // that produce more than 8 corners.
-            lineVerts.reserve(rooms.size() * 64);
+            state.roomDebug.clear();
+            state.roomDebug.reserve(rooms.size());
+
+            // Uniform light-pink color for valid portals. Phantom
+            // portals (rejected by validatePortals because the BSP
+            // says no opening) draw in red so the diagnostic value of
+            // show_portals doubles as a phantom-portal map.
+            constexpr uint32_t kLightPink  = 0xFFB4B4FFu;  // ABGR
+            constexpr uint32_t kPhantomRed = 0xFF3030FFu;  // ABGR
+
+            size_t totalRoomVerts = 0;
+            size_t totalPortalVerts = 0;
+            size_t totalLabels = 0;
 
             for (const auto &rp : rooms) {
                 if (!rp) continue;
@@ -3927,35 +4185,47 @@ int main(int argc, char *argv[]) {
                 int16_t roomID = room->getRoomID();
                 uint32_t color = Darkness::colorFromRoomID(roomID);
 
+                Darkness::RuntimeState::PerRoomDebug prd;
+                prd.center = room->getCenter();
+                prd.roomID = roomID;
+
                 // Room polytope edges.
                 const Plane *planes = room->getBoundingPlanes();
                 auto corners = Darkness::computeRoomCorners(planes);
                 auto edges = Darkness::computeRoomEdges(corners);
+                prd.roomLines.reserve(edges.size() * 2);
                 for (const auto &e : edges) {
                     const auto &a = corners[e.a].pos;
                     const auto &b = corners[e.b].pos;
-                    lineVerts.push_back({a.x, a.y, a.z, color});
-                    lineVerts.push_back({b.x, b.y, b.z, color});
+                    prd.roomLines.push_back({a.x, a.y, a.z, color});
+                    prd.roomLines.push_back({b.x, b.y, b.z, color});
                 }
 
-                // Portal polygons — drawn in the same per-room color so
-                // they read as "openings owned by this room." A portal
-                // appears once from each side of the wall (each room
-                // owns its own outgoing portal record), so this naturally
-                // renders the doorway in two overlaid colors.
+                // Portal polygons. The show_rooms overlay paints them in
+                // the same per-room color so they read as "openings owned
+                // by this room" (a portal appears once from each side, so
+                // doorways naturally render in two overlaid colors). The
+                // show_portals overlay paints the SAME polygons in
+                // uniform light pink so they stand out from world
+                // architecture — used to trace which polygons the BFS
+                // chain is threading.
                 uint32_t pc = room->getPortalCount();
                 for (uint32_t pi = 0; pi < pc; ++pi) {
                     Darkness::RoomPortal *portal = room->getPortal(pi);
                     if (!portal) continue;
                     auto poly = Darkness::computePortalPolygon(*portal);
                     if (poly.size() < 2) continue;
+                    uint32_t portalColor = portal->isAcousticallyValid()
+                                               ? kLightPink : kPhantomRed;
                     // Closed line strip: emit consecutive pairs, including
                     // the wrap-around segment from last to first vertex.
                     for (size_t v = 0; v < poly.size(); ++v) {
                         const auto &a = poly[v];
                         const auto &b = poly[(v + 1) % poly.size()];
-                        lineVerts.push_back({a.x, a.y, a.z, color});
-                        lineVerts.push_back({b.x, b.y, b.z, color});
+                        prd.roomLines.push_back({a.x, a.y, a.z, color});
+                        prd.roomLines.push_back({b.x, b.y, b.z, color});
+                        prd.portalLines.push_back({a.x, a.y, a.z, portalColor});
+                        prd.portalLines.push_back({b.x, b.y, b.z, portalColor});
                     }
                 }
 
@@ -3967,30 +4237,25 @@ int main(int argc, char *argv[]) {
                 // collide with another room's label, but corner labels
                 // appear at the actual wireframe vertices so each
                 // wireframe is reliably tagged.
-                state.roomLabels.push_back({room->getCenter(), roomID, true});
+                prd.labels.reserve(1 + corners.size());
+                prd.labels.push_back({room->getCenter(), roomID, true});
                 for (const auto &c : corners) {
-                    state.roomLabels.push_back({c.pos, roomID, false});
+                    prd.labels.push_back({c.pos, roomID, false});
                 }
+
+                totalRoomVerts   += prd.roomLines.size();
+                totalPortalVerts += prd.portalLines.size();
+                totalLabels      += prd.labels.size();
+                state.roomDebug.push_back(std::move(prd));
             }
 
-            if (!lineVerts.empty()) {
-                state.roomLineCount = static_cast<uint32_t>(lineVerts.size());
-                const bgfx::Memory *mem = bgfx::copy(
-                    lineVerts.data(),
-                    static_cast<uint32_t>(lineVerts.size() *
-                                          sizeof(Darkness::PosColorVertex)));
-                state.roomVBH = bgfx::createVertexBuffer(
-                    mem, Darkness::PosColorVertex::layout);
-                std::fprintf(stderr,
-                    "Room debug overlay: %zu rooms, %u line verts, "
-                    "%zu labels (toggle with `show_rooms`)\n",
-                    rooms.size(), state.roomLineCount,
-                    state.roomLabels.size());
-            } else {
-                std::fprintf(stderr,
-                    "Room debug overlay: %zu rooms, no geometry produced "
-                    "(check polytope intersection)\n", rooms.size());
-            }
+            std::fprintf(stderr,
+                "Room debug overlay: %zu rooms, %zu room line verts, "
+                "%zu portal line verts, %zu labels (toggle with "
+                "`show_rooms` / `show_portals`; cap with "
+                "`debug_room_max_count`)\n",
+                state.roomDebug.size(), totalRoomVerts,
+                totalPortalVerts, totalLabels);
         }
     }
 

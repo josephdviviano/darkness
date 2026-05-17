@@ -380,8 +380,20 @@ struct RuntimeState {
     // navigating to a specific coordinate (e.g. for audio-propagation
     // verification at a known room/portal boundary).
     bool showPos = false;
-    bgfx::VertexBufferHandle roomVBH = BGFX_INVALID_HANDLE;
-    uint32_t roomLineCount = 0;
+    // Debug: portal polygons rendered in light pink, independent of the
+    // full room/portal wireframe (`show_rooms`). Off by default; toggle
+    // via `show_portals`. Lets you trace exactly which polygons the BFS
+    // path is threading — small doorways vs large open atria are
+    // immediately visible. Drawn always-on-top with alpha blending.
+    bool showPortals = false;
+    // Debug: per-voice spatial visualization. Draws an arrow from each
+    // active voice's source position to its virtualPosition (where the
+    // propagation system tells Steam Audio the sound is coming from),
+    // then a second segment to the listener. Off by default; toggle via
+    // `show_vpos`. Lets you watch the BFS anchor jump frame-to-frame
+    // and correlate it with audible volume/direction changes.
+    bool showVPos = false;
+
     // One entry per labelled point per room. We push the room's center
     // (used to flag the listener's current room with a "*" suffix) plus
     // every polytope corner (so wherever you look at a wireframe, a
@@ -393,7 +405,29 @@ struct RuntimeState {
         int16_t roomID;
         bool    isCenter;   // true → primary label, eligible for "*" current marker
     };
-    std::vector<RoomLabel> roomLabels;
+
+    // Per-room CPU-side debug geometry. Built once at level load (the
+    // room database is static for the life of the mission) and consumed
+    // each frame by the closest-N cull in renderDebugOverlay /
+    // renderRoomLabelsOverlay. Splitting by room (rather than baking
+    // everything into one big VBH up front) lets the renderer keep
+    // visual clutter down by only emitting the rooms nearest the camera.
+    struct PerRoomDebug {
+        Vector3 center;                          // for distance sort
+        int16_t roomID;
+        std::vector<PosColorVertex> roomLines;   // colored by room-ID hash
+        std::vector<PosColorVertex> portalLines; // uniform light pink
+        std::vector<RoomLabel>      labels;      // center + corner labels
+    };
+    std::vector<PerRoomDebug> roomDebug;
+
+    // Cap on number of rooms drawn into the show_rooms / show_portals
+    // overlays. The camera-nearest N rooms (by center distance) are kept;
+    // the rest are culled. 0 means "no limit, draw everything". Default
+    // 20 is tuned against typical Thief 2 missions where ~200 rooms make
+    // an uncapped overlay unreadable. Exposed via `debug_room_max_count`
+    // in the debug console.
+    int debugRoomMaxCount = 20;
 };
 
 // ── FrameContext — Per-frame computed values ──

@@ -399,6 +399,81 @@ void RoomService::setCurrentObjRoom(size_t idset, int objID, Room *room) {
 }
 
 //------------------------------------------------------
+size_t RoomService::validatePortals(const LineOfSightFn &losClear)
+{
+    if (!losClear) return 0;
+
+    // 1-unit offset each side of the portal plane. Walls in Thief 2
+    // are typically ≥ 2 units thick; this segment crosses the portal
+    // cleanly when there's a real opening and hits BSP when there isn't.
+    // Each portal is owned by one room and references its reciprocal in
+    // the neighbour room — we test once and mark BOTH copies invalid
+    // so BFS rejects regardless of which side it traverses from.
+    constexpr float kProbeOffset = 1.0f;
+
+    size_t phantoms = 0;
+    size_t tested   = 0;
+    for (const auto &rp : mRooms) {
+        if (!rp) continue;
+        Room *room = rp.get();
+        for (uint32_t i = 0; i < room->getPortalCount(); ++i) {
+            RoomPortal *p = room->getPortal(i);
+            if (!p) continue;
+            // Reset to TRUE before testing — re-validation must not
+            // permanently disable a portal that was once invalid.
+            p->setAcousticallyValid(true);
+        }
+    }
+
+    for (const auto &rp : mRooms) {
+        if (!rp) continue;
+        Room *room = rp.get();
+        int16_t roomID = room->getRoomID();
+        for (uint32_t i = 0; i < room->getPortalCount(); ++i) {
+            RoomPortal *p = room->getPortal(i);
+            if (!p || !p->getFarRoom()) continue;
+            // Skip portals already invalidated via their reciprocal
+            // (each portal is recorded in both rooms; we only need to
+            // test once).
+            if (!p->isAcousticallyValid()) continue;
+
+            const Plane  &pl = p->getPlane();
+            const Vector3 c  = p->getCenter();
+            Vector3 a = c - pl.normal * kProbeOffset;
+            Vector3 b = c + pl.normal * kProbeOffset;
+            bool clear = losClear(a, b);
+            ++tested;
+            if (!clear) {
+                p->setAcousticallyValid(false);
+                ++phantoms;
+                std::fprintf(stderr,
+                    "[PORTAL_PHANTOM] portal id=%d room=%d↔%d "
+                    "center=(%.1f,%.1f,%.1f) — BSP says solid; excluded from BFS\n",
+                    p->getPortalID(), roomID,
+                    p->getFarRoom()->getRoomID(),
+                    c.x, c.y, c.z);
+                // Invalidate the reciprocal portal in the neighbour
+                // room — both sides must agree to keep BFS consistent.
+                Room *far = p->getFarRoom();
+                int32_t destPortalID = p->getDestPortalID();
+                for (uint32_t j = 0; j < far->getPortalCount(); ++j) {
+                    RoomPortal *recip = far->getPortal(j);
+                    if (recip && recip->getPortalID() == destPortalID) {
+                        recip->setAcousticallyValid(false);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    std::fprintf(stderr,
+        "[PORTAL_VALIDATION] tested %zu portals, %zu phantoms rejected\n",
+        tested, phantoms);
+    return phantoms;
+}
+
+//------------------------------------------------------
 SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
                                                const Vector3 &listenerPos,
                                                Room *sourceRoom,
@@ -411,6 +486,8 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
     // Helper: clear path output (only appended on a successful propagation)
     if (params.pathOut)
         params.pathOut->clear();
+    if (params.chainOut)
+        params.chainOut->clear();
 
     if (!sourceRoom || !listenerRoom) {
         // Both rooms should be resolved by the caller's nearest-room
@@ -674,6 +751,12 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
             Room *nextRoom = portal->getFarRoom();
             if (!nextRoom) continue;
 
+            // Skip phantom portals — see RoomService::validatePortals.
+            // ROOM_DB records spatial adjacency between convex rooms;
+            // BSP encodes actual openings. Phantom portals (adjacency
+            // with no opening) get marked invalid at level load.
+            if (!portal->isAcousticallyValid()) continue;
+
             // Closest-point hop: resolve the lead point on this portal
             // polygon to the previous lead point. Cost is the Euclidean
             // distance between the two lead points. Replaces the legacy
@@ -864,6 +947,7 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
 
         float   pathDist;
         Vector3 virtualPos;
+        std::vector<Vector3> P;  // bend points (empty for clean-threaded)
 
         if (portalChain.empty() || lineThreadsAllPolygons(portalChain)) {
             // Clean threading — direct Euclidean distance, no bend
@@ -878,7 +962,8 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
             // clamping and stays anchored to real source/listener
             // positions rather than relying on portal centers.
             const size_t N = portalChain.size();
-            std::vector<Vector3> F(N), B(N), P(N);
+            std::vector<Vector3> F(N), B(N);
+            P.resize(N);
 
             // Forward pass
             Vector3 leadPt = sourcePos;
@@ -928,7 +1013,8 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
         rec.virtualPosition   = virtualPos;
         rec.predecessorRoomID = lstEntry.prevRoom
                                   ? lstEntry.prevRoom->getRoomID() : -1;
-        pathRecords.push_back(rec);
+        rec.chain             = std::move(P);
+        pathRecords.push_back(std::move(rec));
 
         // pi==0 is the primary (lowest effectiveDist by sort order).
         if (pi == 0) {
@@ -972,6 +1058,14 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
         [](const SoundPathRecord &a, const SoundPathRecord &b) {
             return a.effectiveDistance < b.effectiveDistance;
         });
+
+    // Diagnostic chain output: take the bend chain of the merge primary
+    // (lowest post-projection effDist). This is the chain that drives
+    // Steam Audio's source coordinate via the merged virtualPosition;
+    // the renderer's show_vpos overlay visualises THIS chain.
+    if (params.chainOut && !pathRecords.empty()) {
+        *params.chainOut = pathRecords.front().chain;
+    }
 
     // ── Merge: min effDist drives scalar fields; inv-d² weighted vPos. ──
     // Matches the original engine's MergeSounds (PSNDINST.CPP) policy of

@@ -579,6 +579,15 @@ struct SteamAudioDSPNode {
     std::atomic<uint32_t> lastFrameCount{0}; // last frame count delivered by miniaudio
     std::atomic<float> lastAtten{1.0f};     // last attenuation factor applied
 
+    // Per-voice peak of the mono signal staged for convolution
+    // (= the actual reverb-send level for this voice, post reflAtten scaling).
+    // Atomic max written every audio callback; read+reset by the main thread
+    // 5 s [AMB] dump so we can attribute wet-bus energy to specific voices
+    // and correlate with the [WET_BUS] global IR ratio. For ambient voices
+    // distanceAttenuation is forced to 1.0, so this equals the raw mono peak
+    // — i.e. how loud the ambient is feeding the convolver.
+    std::atomic<float> reflSendPeak{0.0f};
+
     // NaN/Inf guard counters (audio thread).  Each location that sanitizes
     // non-finite samples increments its own counter; we log the first few
     // occurrences per voice so the producer can be tracked down without
@@ -1474,9 +1483,9 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             // Target portal-attenuation scalar — clamped against the
             // configurable "min audible" floor so a fully-blocked voice
             // still has a tiny audible residue (debugging aid).
-            // Sanitize first: if propagateSoundBlended ever returns a
-            // non-finite scalar, we'd otherwise feed NaN into the slew
-            // loop and NaN-lock the door-LPF state.
+            // Sanitize first: if propagateSound ever returns a non-finite
+            // scalar, we'd otherwise feed NaN into the slew loop and
+            // NaN-lock the door-LPF state.
             float portalTarget = audioSanitizeScalar(node->portalAttenuation, 1.0f);
             float minAtten = sPropMinAttenuation.load(std::memory_order_relaxed);
             if (portalTarget < minAtten) portalTarget = minAtten;
@@ -1633,6 +1642,23 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 slot.reflFrameSize = node->reflectionFrameSize;
                 slot.active = true;
                 slot.isFootstepDiag = node->isFootstepDiag;  // propagate for worker log
+
+                // Per-voice reverb-send peak. Measures the mono buffer
+                // *after* reflAtten scaling — i.e. exactly the signal
+                // handed to iplReflectionEffectApply. Sampled+reset by
+                // the 5 s [AMB] dump on the main thread; combined with
+                // the [WET_BUS] global IR ratio, this lets us attribute
+                // runaway reverb to specific voices.
+                {
+                    float sPeak = 0.0f;
+                    for (int i = 0; i < node->reflectionFrameSize; ++i) {
+                        float a = std::fabs(slot.mono[i]);
+                        if (a > sPeak) sPeak = a;
+                    }
+                    float prev = node->reflSendPeak.load(std::memory_order_relaxed);
+                    while (sPeak > prev && !node->reflSendPeak.compare_exchange_weak(
+                               prev, sPeak, std::memory_order_relaxed)) {}
+                }
             }
         }
 
@@ -2298,13 +2324,13 @@ struct ActiveVoice {
     bool loggedReflActivationMain = false;  // diagnostic: footstep convolution-activation log fired once
 
     // Per-voice maximum audible portal-graph distance. The BFS in
-    // propagateSoundBlended terminates when accumulated effective
-    // distance exceeds this value — anything beyond is treated as
-    // unreachable. Defaults to the global mPropagationMaxDist; ambient
-    // voices override this at startVoice time with a value derived from
-    // their schema radius (so a wind ambient with radius=25 doesn't
-    // propagate 200 ft through open corridors). Matches the Dark Engine
-    // `m_MaxDistance` per-source convention.
+    // RoomService::propagateSoundPath terminates when accumulated
+    // effective distance exceeds this value — anything beyond is
+    // treated as unreachable. Defaults to the global mPropagationMaxDist;
+    // ambient voices override this at startVoice time with a value
+    // derived from their schema radius (so a wind ambient with radius=25
+    // doesn't propagate 200 ft through open corridors). Matches the
+    // Dark Engine `m_MaxDistance` per-source convention.
     float maxAudibleDist = 200.0f;
 
     // Last propagation result, retained only so external readers (debug
@@ -2312,6 +2338,13 @@ struct ActiveVoice {
     // path without re-running BFS. The path itself is recomputed every
     // frame in loopStep; nothing here gates that.
     SoundPropInfo cachedProp{};
+    // Per-portal anchor bend points along the primary path, in
+    // source→listener order. Empty for clean-threaded paths (no bends
+    // needed). Populated by propagateSoundPath's chainOut hook and
+    // surfaced through getVoiceSpatialSnapshots() for the renderer's
+    // show_vpos overlay. Diagnostic only — propagation itself does not
+    // consume this.
+    std::vector<Vector3> cachedChain;
 
     // Steam Audio simulation sources. Split across two simulators so the
     // direct path is never blocked by the reflection sim's background
@@ -3883,8 +3916,32 @@ void AudioService::loopStep(float deltaTime)
                     // propagating at ~25 ft of portal-graph path even
                     // through open archways. Matches Dark Engine
                     // m_MaxDistance per-source semantics.
-                    prop = propagateSound(voice->worldPos, mListenerPos,
-                                          voice->maxAudibleDist);
+                    // Inline propagation call so we can capture the bend
+                    // chain into voice->cachedChain for the show_vpos
+                    // debug overlay. The wrapper propagateSound() doesn't
+                    // expose params.chainOut.
+                    if (mRoomService) {
+                        Room *srcRoomP = mRoomService->roomFromPoint(voice->worldPos);
+                        Room *lstRoomP = mRoomService->roomFromPoint(mListenerPos);
+                        SoundPropParams pp;
+                        pp.maxDist = voice->maxAudibleDist;
+                        pp.doorBlocking = [this](int32_t a, int32_t b) {
+                            return getBlockingFactor(a, b);
+                        };
+                        pp.loudRoom = [this](int32_t roomID) -> float {
+                            auto it = mRoomTransmission.find(roomID);
+                            return (it != mRoomTransmission.end()) ? it->second : 1.0f;
+                        };
+                        pp.maxPaths    = mPropMaxPaths;
+                        pp.maxPathDiff = mPropMaxPathDiff;
+                        pp.chainOut    = &voice->cachedChain;
+                        prop = mRoomService->propagateSoundPath(
+                            voice->worldPos, mListenerPos,
+                            srcRoomP, lstRoomP, pp);
+                    } else {
+                        prop = propagateSound(voice->worldPos, mListenerPos,
+                                              voice->maxAudibleDist);
+                    }
                     auto prT1 = std::chrono::steady_clock::now();
                     float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
                     sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
@@ -3907,7 +3964,7 @@ void AudioService::loopStep(float deltaTime)
 
                 // Store propagation result on DSP node for the audio callback.
                 //
-                // portalAttenuation is now a *continuous* excess-path
+                // portalAttenuation is a *continuous* excess-path
                 // attenuation. The previous formula (1/(1+effDist²·0.001))
                 // was gated by isCrossRoom, so it switched on at the portal
                 // boundary, producing an audible pop. The new formula uses
@@ -3915,9 +3972,14 @@ void AudioService::loopStep(float deltaTime)
                 // which is:
                 //   • 1.0 for same-room voices (real == effective)
                 //   • < 1.0 only when the BFS path detours through portals,
-                //   • naturally continuous across the portal threshold
-                //     because propagateSoundBlended already smoothly blends
-                //     realDistance and effectiveDistance via mPortalBlend.
+                //   • continuous in the limit at the room boundary because
+                //     a chain that's geometrically clean enough to threadle
+                //     end-to-end produces real ≈ effective, yielding a
+                //     ratio close to 1.0 just like the same-room case.
+                //     Real/effective and door blocking themselves change
+                //     discretely at the regime switch though — that
+                //     residual step is one of the symptoms tracked in
+                //     HANDOFF.SOUND_PROPAGATION_REALISM.
                 if (prop.reached) {
                     // LPF cutoff is driven by *door* blocking only — not by
                     // the combined door+LoudRoom transmission loss
@@ -4006,13 +4068,6 @@ void AudioService::loopStep(float deltaTime)
                 //     traces rays from the doorway — the "occlusion-via-
                 //     virtual-source" trick that makes cross-room voices
                 //     audible without ray-tracing through walls.
-                //   • Inside the portal-blend zone: propagateSoundBlended
-                //     linearly interpolates virtualPosition between the
-                //     roomA and roomB results, so the perceived source
-                //     position glides smoothly from "portal anchor" to
-                //     "real source" as the listener crosses the doorway.
-                //     This is what eliminates the binary
-                //     real-pos↔portal-anchor jump at the threshold.
                 //   • BFS-failed cross-room (!prop.reached, isCrossRoom):
                 //     virtualPosition is the default {0,0,0}. The voice is
                 //     silenced by portalAttenuation = 0 from Change 2, so
@@ -4024,19 +4079,17 @@ void AudioService::loopStep(float deltaTime)
                 //     fall back to the real worldPos and let Steam Audio
                 //     handle distance/occlusion in isolation.
                 //
-                // Edge case (inherited, not regressed by this change):
-                // inside the blend zone, propagateSoundBlended returns
-                // propA when only A reaches and propB when only B reaches
-                // (one-sided BFS failure). propA's virtualPosition is the
-                // portal anchor while propB's is the real source (or vice
-                // versa), so if the success-side flips frame-to-frame
-                // virtualPosition can jump in a single frame. In practice
-                // this is rare — the only way for one side to fail within
-                // the blend radius is if its room is disconnected from the
-                // source room in the portal graph, which doesn't flicker
-                // frame-to-frame for static geometry. The pre-change code
-                // had a strictly worse version of this discontinuity
-                // (binary worldPos↔portal switch every threshold crossing).
+                // Edge case: virtualPosition can step at the moment the
+                // listener crosses a room boundary, because the regime
+                // switches from "real source" (same-room) to "portal
+                // anchor" (cross-room) in one frame. roomFromPoint's
+                // OBB+portal-plane disambiguator keeps that switch
+                // deterministic — no per-frame flicker — but the step
+                // is still audible as a small panning shift at the
+                // doorway. Smoothing it out is one of the items
+                // tracked in HANDOFF.SOUND_PROPAGATION_REALISM
+                // (research direction 1, "smooth the regime
+                // transition").
                 // Engine→IPL conversion (feet→meters AND Z-up→Y-up) happens
                 // via engineToIplPos so the source sits in the same frame
                 // as the listener and mesh.
@@ -4492,13 +4545,61 @@ void AudioService::loopStep(float deltaTime)
                 // simply not in the top-N this frame.
                 const char *occlStr =
                     voice->playerEmitted ? "skip" : "active";
+                // Calibration diagnostic: compute what the original
+                // Dark Engine's volume formula would produce for this
+                // voice's path, and log it next to our actual output
+                // gain. If `oursLin` is materially below `origLin` the
+                // voice is over-attenuated (Steam Audio distAtt +
+                // engine portalAtt stacking past the original's single-
+                // centibel-curve attenuation). If much higher, under-
+                // attenuated. See APPSFX.CPP:964 + PSNDINST.CPP:1844.
+                float origLin = 0.0f;
+                float oursLin = 0.0f;
+                if (mSchemaParser) {
+                    const SchemaEntry *sch =
+                        mSchemaParser->findSchema(voice->schemaName);
+                    if (sch) {
+                        int gainCb = sch->playParams.volume;
+                        float attenFactor = sch->playParams.attenuationFactor;
+                        if (attenFactor < 0.01f) attenFactor = 1.0f;
+                        bool isSharp = (sch->playParams.flags & 0x1000) != 0;  // SFXFLG_SHARP
+                        constexpr float kAtnFactor = 55.0f;
+                        float mScaleDist = (5000.0f + gainCb) / kAtnFactor;
+                        float mMaxDist   = mScaleDist * attenFactor;
+                        float pathDist   = p.reached ? p.effectiveDistance : 1e9f;
+                        float objDist;
+                        if (isSharp) {
+                            float t = (mMaxDist > 0.01f) ? (pathDist / mMaxDist) : 0.0f;
+                            objDist = (t*t*t*t) * mScaleDist;
+                        } else {
+                            objDist = (mMaxDist > 0.01f)
+                                          ? (pathDist / mMaxDist) * mScaleDist
+                                          : pathDist;
+                        }
+                        objDist /= attenFactor;
+                        float volumeCb = gainCb - objDist * kAtnFactor;
+                        // cb→linear: 1 cb = 0.01 dB → linear = 10^(cb/2000).
+                        origLin = std::pow(10.0f, volumeCb * 0.0005f);
+                    }
+                    // Our actual: schema_linear × portalAtten × distAtt.
+                    // (HRTF + reflection contributions sit on top of this
+                    //  but are direction/timing, not gain.)
+                    if (sch) {
+                        float schemaLin = std::pow(
+                            10.0f, sch->playParams.volume * 0.0005f);
+                        oursLin = schemaLin
+                                * voice->dspNode.portalAttenuation
+                                * dp.distanceAttenuation;
+                    }
+                }
                 AUDIO_LOG("[VOICE] h=%u '%s' pE=%d amb=%d "
                           "pos=(%.0f,%.0f,%.0f) d=%.1f rm=%d | "
                           "prop: reached=%d effD=%.1f block=%.2f vPos=(%.0f,%.0f,%.0f) | "
                           "dir(LR,UD,FB)=(%+.2f,%+.2f,%+.2f) usePortal=%d "
                           "portalAtt=%.3f portalBlk=%.2f | "
                           "refl: active=%d irSize=%d | "
-                          "dry: distAtt=%.3f occl=%s ended=%d\n",
+                          "dry: distAtt=%.3f occl=%s ended=%d | "
+                          "calib: ours=%.4f orig=%.4f ratio=%.2f\n",
                           handle, voice->schemaName.c_str(),
                           voice->playerEmitted ? 1 : 0,
                           voice->isAmbient ? 1 : 0,
@@ -4513,7 +4614,9 @@ void AudioService::loopStep(float deltaTime)
                           reflActive ? 1 : 0,
                           voice->dspNode.reflectionParams.irSize,
                           dp.distanceAttenuation, occlStr,
-                          voice->sourceEnded.load(std::memory_order_relaxed) ? 1 : 0);
+                          voice->sourceEnded.load(std::memory_order_relaxed) ? 1 : 0,
+                          oursLin, origLin,
+                          origLin > 1e-9f ? (oursLin / origLin) : 0.0f);
             }
         }
     }
@@ -6261,6 +6364,34 @@ void AudioService::loadMiscSoundProperties()
 }
 
 //------------------------------------------------------
+std::vector<VoiceSpatialSnapshot> AudioService::getVoiceSpatialSnapshots() const
+{
+    std::vector<VoiceSpatialSnapshot> out;
+    out.reserve(mVoices.size());
+    for (const auto &kv : mVoices) {
+        const ActiveVoice *v = kv.second.get();
+        if (!v || !v->initialized) continue;
+        VoiceSpatialSnapshot snap;
+        snap.schemaName = v->schemaName;
+        snap.sourcePos  = v->worldPos;
+        // virtualPos is the propagation anchor — what Steam Audio sees
+        // as the source location. When unreached or when reached=true
+        // but virtualPos defaulted to sourcePos (same-room or
+        // clean-threading short-circuit), this equals sourcePos.
+        snap.virtualPos = v->cachedProp.reached
+                              ? v->cachedProp.virtualPosition
+                              : v->worldPos;
+        snap.reached    = v->cachedProp.reached;
+        snap.usePortal  = v->cachedProp.reached
+                       && (glm::length(snap.virtualPos - snap.sourcePos) > 0.1f);
+        snap.isAmbient  = v->isAmbient;
+        snap.chain      = v->cachedChain;
+        out.push_back(std::move(snap));
+    }
+    return out;
+}
+
+//------------------------------------------------------
 std::string AudioService::getProjectileSound(int32_t objID) const
 {
     if (!mPropertyService) return std::string();
@@ -6880,7 +7011,28 @@ void AudioService::updateAmbientVolumes()
         // Effective rays/sec (rays * reflection sim steps run in this dump period)
         float raysPerSec = (reflFrames * mReflectionNumRays) / 5.0f;  // 5s dump interval
 
-        // Log active ambient details to diagnose distant sound leaks
+        // Compute listener's nearest probe once for the whole dump — every
+        // ambient row references the same value (their reverb send convolves
+        // with the listener-anchored IR, not a per-source one).
+        int   listenerNearestProbe = -1;
+        float listenerNearestDist  = -1.0f;
+        for (size_t i = 0; i < mProbePositions.size(); ++i) {
+            float d = glm::length(mProbePositions[i] - mListenerPos);
+            if (listenerNearestProbe < 0 || d < listenerNearestDist) {
+                listenerNearestProbe = static_cast<int>(i);
+                listenerNearestDist  = d;
+            }
+        }
+
+        // Log active ambient details to diagnose distant sound leaks AND to
+        // attribute wet-bus energy spikes to specific ambient voices.
+        // reflIn is the peak mono signal this voice handed to convolution
+        // since the last dump (resets here). Pair with [WET_BUS]'s peakDb /
+        // reflGain and the listener/source nearestProbe distances to identify
+        // the "ambient + small-space probe" pathological combination:
+        // a high reflIn on a voice whose source AND the listener are both
+        // close to the same probe, with [WET_BUS] peakDb spiking, confirms
+        // the IR-energy hypothesis.
         for (const auto &amb : mAmbients) {
             if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle)) {
                 float d = glm::length(mListenerPos - amb.position);
@@ -6897,11 +7049,32 @@ void AudioService::updateAmbientVolumes()
                 bool xRoom = v.dspNode.usePortalRouting;
                 float pAtten = v.dspNode.portalAttenuation;
                 float pBlock = v.dspNode.portalBlocking;
+                // Peak reverb-send this voice contributed since last dump.
+                // Read-and-reset so the next dump period is independent.
+                float reflIn = v.dspNode.reflSendPeak.exchange(0.0f,
+                                   std::memory_order_relaxed);
+                // Source's nearest probe — small distance here means the
+                // ambient sits inside a probe's catchment, which combined
+                // with a small listener-to-probe distance is the worst case
+                // for runaway reverb.
+                int   srcNearestProbe = -1;
+                float srcNearestDist  = -1.0f;
+                for (size_t i = 0; i < mProbePositions.size(); ++i) {
+                    float dp = glm::length(mProbePositions[i] - amb.position);
+                    if (srcNearestProbe < 0 || dp < srcNearestDist) {
+                        srcNearestProbe = static_cast<int>(i);
+                        srcNearestDist  = dp;
+                    }
+                }
                 AUDIO_LOG( "  [AMB] '%s' dist=%.0f rad=%.0f atten=%.3f "
-                             "pAtten=%.3f pBlock=%.2f xRoom=%d pos=(%.0f,%.0f,%.0f)\n",
+                             "pAtten=%.3f pBlock=%.2f xRoom=%d pos=(%.0f,%.0f,%.0f) "
+                             "reflIn=%.4f lProbe=%d d=%.1f sProbe=%d d=%.1f\n",
                              amb.schemaName.c_str(), d, amb.radius, atten,
                              pAtten, pBlock, xRoom?1:0,
-                             amb.position.x, amb.position.y, amb.position.z);
+                             amb.position.x, amb.position.y, amb.position.z,
+                             reflIn,
+                             listenerNearestProbe, listenerNearestDist,
+                             srcNearestProbe, srcNearestDist);
             }
         }
 
@@ -6990,21 +7163,52 @@ void AudioService::updateAmbientVolumes()
                 // Set the voice's per-source max audible distance from
                 // the ambient's radius. BFS terminates beyond this, so
                 // the sound naturally stops propagating once the portal-
-                // graph path exceeds the ambient's reach — even through
-                // open archway chains. Without this gate, the global
-                // mPropagationMaxDist (200 ft) lets a radius-25 wind
-                // sound carry 200 ft across the level through open
-                // doorways, which is what produced the "I hear the
-                // church ambient from spawn" symptom.
+                // graph path exceeds the source's effective reach.
                 //
-                // 2x radius gives a small safety margin (a sound right
-                // at radius is at distFactor=0 already, so paths
-                // slightly longer than radius are inaudible anyway, but
-                // the margin avoids hard BFS-fail at the edge case).
+                // Per-source BFS-termination distance, matching the
+                // original Dark Engine's APPSFX.CPP:964
+                //   SFX_MaxDist(gain) = (5000 + gain) / attenuation_factor
+                //   m_MaxDistance = SFX_MaxDist(gain) * atten_factor
+                // with attenuation_factor = 55 (config_get_float default).
+                //
+                // This is the IMPLICIT phantom-portal filter in the
+                // original engine: a typical ambient with gain = -3000
+                // (-30 dB) and atten_factor = 1.0 gets m_MaxDistance =
+                // (5000 - 3000) / 55 * 1.0 ≈ 36.4 ft. BFS exhausts that
+                // budget before reaching distant listeners through
+                // phantom chains, naturally silencing audio that
+                // shouldn't propagate.
+                //
+                // History: this used to be `amb.radius * 2.0f`, which
+                // for a typical-radius ambient produces ~110 ft — about
+                // 3× the original's per-source budget for the same
+                // schema. The radius gate worked for the obvious "wind
+                // ambient with radius=25" case but allowed long phantom
+                // chains for higher-radius ambients (cathedral mech-
+                // angels, etc.) to reach listeners they shouldn't.
                 if (amb.handle != SOUND_HANDLE_INVALID && mVoices.count(amb.handle)) {
                     auto vIt = mVoices.find(amb.handle);
                     if (vIt != mVoices.end()) {
-                        vIt->second->maxAudibleDist = amb.radius * 2.0f;
+                        constexpr float kAttenuationFactor = 55.0f;
+                        // Re-look-up the schema; the outer-scope
+                        // `schema` pointer is out of scope here. Gain
+                        // is in centibels (negative = attenuated, 0 =
+                        // full). Some ambients spawn through the raw-
+                        // sound fallback and have no schema — default
+                        // to gain=0 for those.
+                        int gainCb = 0;
+                        if (mSchemaParser) {
+                            const SchemaEntry *sch =
+                                mSchemaParser->findSchema(amb.schemaName);
+                            if (sch) gainCb = sch->playParams.volume;
+                        }
+                        const float gain = static_cast<float>(gainCb);
+                        const float attenFactor = (amb.attenuationFactor > 0.01f)
+                                                     ? amb.attenuationFactor
+                                                     : 1.0f;
+                        float sfxMaxDist = (5000.0f + gain) / kAttenuationFactor;
+                        if (sfxMaxDist < 1.0f) sfxMaxDist = 1.0f;
+                        vIt->second->maxAudibleDist = sfxMaxDist * attenFactor;
                     }
                 }
 
@@ -7911,6 +8115,142 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     float reflBakeSec = std::chrono::duration<float>(reflBakeEnd - reflBakeStart).count();
     AUDIO_LOG( "Reflection bake complete: %d probes in %.1f seconds\n",
                  numProbes, reflBakeSec);
+
+    // Step 3c: Per-probe IR energy audit.
+    //
+    // Baked IRs vary wildly in total energy across probes. Probes sitting in
+    // small enclosed spaces with hard surfaces accumulate disproportionate
+    // diffuse-field energy compared to probes in open or absorbent areas.
+    // When the listener's nearest probe is one of these "hot" IRs and a
+    // continuous source (ambient) feeds the convolver, the wet bus saturates.
+    //
+    // This audit dumps per-probe metrics so we can identify outliers and
+    // decide whether the fix belongs in bake parameters (absorption, bounces),
+    // in probe rejection (skip outliers), or in IR normalization.
+    //
+    // The Steam Audio energy field is a 3D histogram of size
+    // (#channels × #bands × #bins), with each bin being 10 ms of arrival time.
+    // We compute:
+    //   - totalEnergy: integrated energy across all channels/bands/bins
+    //     (broadband, omnidirectional reverb intensity)
+    //   - peakBin:     largest single-bin value (early-reflection clustering)
+    //   - earlyEnergy: integrated energy in the first 50 ms (5 bins) — high
+    //                  values mean clustered close-wall reflections
+    //   - bandEnergy[3]: per-band totals — to spot frequency-specific spikes
+    //                    (hard walls reflect highs; absorbent surfaces don't)
+    //
+    // Output is a `.energy.csv` sidecar next to the .probes file, plus a
+    // stderr summary noting min/max/median total energy so outliers are
+    // visible without grepping the CSV.
+    {
+        IPLEnergyFieldSettings efSettings{};
+        efSettings.duration = mReflectionDuration;
+        efSettings.order    = mAmbisonicsOrder;
+        IPLEnergyField energyField = nullptr;
+        IPLerror efErr = iplEnergyFieldCreate(mIplContext, &efSettings,
+                                              &energyField);
+        if (efErr != IPL_STATUS_SUCCESS || !energyField) {
+            LOG_INFO("AudioService: skipping IR energy audit — "
+                     "iplEnergyFieldCreate returned %d", efErr);
+        } else {
+            int numChannels = iplEnergyFieldGetNumChannels(energyField);
+            int numBins     = iplEnergyFieldGetNumBins(energyField);
+            int numBands    = IPL_NUM_BANDS;
+
+            std::string energyPath = outputPath + ".energy.csv";
+            FILE *ef = std::fopen(energyPath.c_str(), "w");
+            if (ef) {
+                std::fprintf(ef, "# Per-probe IR energy metrics — written by "
+                                 "AudioService::bakeProbes.\n"
+                                 "# duration=%.2fs order=%d channels=%d "
+                                 "bands=%d bins=%d (10ms per bin)\n",
+                             mReflectionDuration, mAmbisonicsOrder,
+                             numChannels, numBands, numBins);
+                std::fprintf(ef, "index,x,y,z,totalEnergy,peakBin,"
+                                 "earlyEnergy50ms,bandLow,bandMid,bandHigh\n");
+            }
+
+            std::vector<float> totals(numProbes, 0.0f);
+            int earlyBins = std::min(5, numBins);  // first 50 ms
+
+            for (int p = 0; p < numProbes; ++p) {
+                iplEnergyFieldReset(energyField);
+                iplProbeBatchGetEnergyField(probeBatch, &reflId, p,
+                                             energyField);
+
+                // Only the W channel (channel 0) is the omnidirectional
+                // energy term and is guaranteed non-negative. Higher-order
+                // Ambisonic channels are signed spherical-harmonic
+                // coefficients that encode directional variation; summing
+                // them produces meaningless near-zero/negative totals
+                // because the harmonics cancel. The W coefficient is
+                // proportional to the angular integral of incident energy,
+                // which is exactly the per-probe "total reverb energy"
+                // metric we want.
+                double totalEnergy = 0.0;
+                double earlyEnergy = 0.0;
+                float  peakBin     = 0.0f;
+                double bandEnergy[IPL_NUM_BANDS] = {0.0, 0.0, 0.0};
+
+                for (int b = 0; b < numBands; ++b) {
+                    const float *bins = iplEnergyFieldGetBand(
+                        energyField, /*channel=*/0, b);
+                    if (!bins) continue;
+                    for (int t = 0; t < numBins; ++t) {
+                        float v = bins[t];
+                        totalEnergy   += v;
+                        bandEnergy[b] += v;
+                        if (t < earlyBins) earlyEnergy += v;
+                        if (v > peakBin) peakBin = v;
+                    }
+                }
+                totals[p] = static_cast<float>(totalEnergy);
+
+                if (ef && p < static_cast<int>(mProbePositions.size())) {
+                    const auto &pos = mProbePositions[p];
+                    std::fprintf(ef,
+                        "%d,%.3f,%.3f,%.3f,%.6e,%.6e,%.6e,%.6e,%.6e,%.6e\n",
+                        p, pos.x, pos.y, pos.z,
+                        totalEnergy, peakBin, earlyEnergy,
+                        bandEnergy[0], bandEnergy[1], bandEnergy[2]);
+                }
+            }
+
+            if (ef) {
+                std::fclose(ef);
+                AUDIO_LOG("Wrote probe IR energy sidecar '%s' (%d rows)\n",
+                          energyPath.c_str(), numProbes);
+            }
+
+            // Stderr summary: min/median/max + indices so the outliers
+            // jump out without inspecting the CSV. Probes whose totalEnergy
+            // sits >10× above the median are the suspects for runaway
+            // reverb when the listener parks near them.
+            if (numProbes > 0) {
+                std::vector<int> sorted(numProbes);
+                for (int i = 0; i < numProbes; ++i) sorted[i] = i;
+                std::sort(sorted.begin(), sorted.end(),
+                          [&](int a, int b){ return totals[a] < totals[b]; });
+                int minIdx = sorted.front();
+                int maxIdx = sorted.back();
+                int medIdx = sorted[numProbes / 2];
+                float minE = totals[minIdx];
+                float medE = totals[medIdx];
+                float maxE = totals[maxIdx];
+                int hotCount = 0;
+                float hotThreshold = medE * 10.0f;
+                for (float t : totals)
+                    if (t > hotThreshold) ++hotCount;
+                AUDIO_LOG("[PROBE_ENERGY] min=%.3e (probe %d) "
+                          "median=%.3e (probe %d) max=%.3e (probe %d) "
+                          "hot(>10×median)=%d/%d\n",
+                          minE, minIdx, medE, medIdx, maxE, maxIdx,
+                          hotCount, numProbes);
+            }
+
+            iplEnergyFieldRelease(&energyField);
+        }
+    }
 
     // Step 4: Serialize to memory buffer
     IPLSerializedObjectSettings soSettings{};
