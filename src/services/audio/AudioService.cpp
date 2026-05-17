@@ -806,12 +806,14 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
     // silence.
     {
         bool badLpf = !std::isfinite(node->lpfStateL)
-                   || !std::isfinite(node->lpfStateR);
+                   || !std::isfinite(node->lpfStateR)
+                   || !std::isfinite(node->reflSendLpfState);
         bool badRamp = !std::isfinite(node->currentPortalAtten)
                     || !std::isfinite(node->currentDoorAlpha);
         if (badLpf) {
             node->lpfStateL = 0.0f;
             node->lpfStateR = 0.0f;
+            node->reflSendLpfState = 0.0f;
             uint32_t n = node->nanCountLpf.fetch_add(1, std::memory_order_relaxed);
             if (n < 4) {
                 AUDIO_LOG("[NAN_GUARD] node=%p lpfState reset to 0 "
@@ -1249,9 +1251,30 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             if (slotIdx < ConvolutionWorker::kMaxSlots) {
                 auto &slot = cw.staging[w][slotIdx];
 
-                // Apply distance attenuation to mono (no occlusion — reflected
-                // paths are independent of direct-path wall blocking)
+                // Apply distance attenuation to mono. Steam Audio's
+                // direct-path occlusion (walls between source and listener)
+                // is INTENTIONALLY not folded in — wall occlusion only
+                // blocks the line-of-sight path; reflected energy can still
+                // arrive via room bounces and shouldn't be silenced.
+                //
+                // Door blocking is different: a closed door is a physical
+                // seal between rooms, so the reverb tail from a source on
+                // the other side should be both quieter and muffled. We
+                // multiply in the post-ramp portalAttenuation (volume) and
+                // — further below — pre-LPF the mono signal with the same
+                // door alpha used for the dry path. Both `currentPortalAtten`
+                // and `currentDoorAlpha` were just updated by the dry-path
+                // block above; reuse them so the wet bus tracks the dry bus
+                // exactly through transitions (door swinging closed/open).
+                //
+                // If runAtten is false (bypassLevel == 2 — binaural-only
+                // debug path), skip both. Matches the dry-path bypass.
                 float reflAtten = node->directParams.distanceAttenuation;
+                float reflSendAlpha = 1.0f;  // 1.0 = passthrough LPF
+                if (runAtten && !node->skipAttenuation) {
+                    reflAtten     *= node->currentPortalAtten;
+                    reflSendAlpha  = node->currentDoorAlpha;
+                }
 
                 // Diagnostic: for footstep voices, log the convolution input
                 // amplitude on the first few audio callbacks so we can confirm
@@ -1273,6 +1296,12 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 }
                 ma_uint32 reflFrames = static_cast<ma_uint32>(node->reflectionFrameSize);
 
+                // 1-pole IIR LPF state for the reflection-send mono. Same
+                // formula as the dry-path stereo LPF:
+                //   y[n] = α·x[n] + (1-α)·y[n-1]
+                // α = 1 collapses to passthrough (open door), so the
+                // unconditional run is free when no door blocks the path.
+                float reflLpf = node->reflSendLpfState;
                 if (node->rateDivisor > 1 && !node->decimatedMono.empty()) {
                     // Decimate from device rate to reflection rate (averaging groups)
                     float *dec = node->decimatedMono.data();
@@ -1283,18 +1312,24 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                         float sum = 0.0f;
                         for (int d = 0; d < div; ++d)
                             sum += mono[i * div + d];
-                        dec[i] = sum * invDiv * reflAtten;
+                        float in = sum * invDiv * reflAtten;
+                        reflLpf += reflSendAlpha * (in - reflLpf);
+                        dec[i] = reflLpf;
                     }
                     for (ma_uint32 i = outFrames; i < reflFrames; ++i)
                         dec[i] = 0.0f;
                     std::memcpy(slot.mono.data(), dec, reflFrames * sizeof(float));
                 } else {
-                    // Copy mono with distance attenuation applied
-                    for (ma_uint32 i = 0; i < std::min(frameCount, reflFrames); ++i)
-                        slot.mono[i] = mono[i] * reflAtten;
+                    // Copy mono with portal attenuation + door LPF applied
+                    for (ma_uint32 i = 0; i < std::min(frameCount, reflFrames); ++i) {
+                        float in = mono[i] * reflAtten;
+                        reflLpf += reflSendAlpha * (in - reflLpf);
+                        slot.mono[i] = reflLpf;
+                    }
                     for (ma_uint32 i = frameCount; i < reflFrames; ++i)
                         slot.mono[i] = 0.0f;
                 }
+                node->reflSendLpfState = reflLpf;
 
                 slot.effect = node->reflectionEffect;
                 slot.validityToken = node->validityToken;  // shared_ptr copy — prevents use-after-free
