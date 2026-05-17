@@ -231,10 +231,10 @@ class AudioService : public ServiceImpl<AudioService>,
                      public LoopClient {
     // AmbientSoundManager is an extracted subsystem that owns ambient
     // lifecycle (P$AmbientHack + P$SpotAmb). It needs to reach this
-    // service's private state (mVoices, mReflectionMixNode, mSchemaParser,
-    // startVoice, haltSound, publishSoundEmission, mListenerPos) through
-    // its back-pointer — befriending keeps that access narrow and
-    // avoids widening the public API.
+    // service's private state (mVoicePool, mReflectionMixNode,
+    // mSchemaParser, startVoice, haltSound, publishSoundEmission,
+    // mListenerPos) through its back-pointer — befriending keeps that
+    // access narrow and avoids widening the public API.
     friend class AmbientSoundManager;
 
 public:
@@ -708,8 +708,8 @@ private:
     // Key: (room1 << 16) | room2 (bidirectional — stored both ways)
     std::unordered_map<uint32_t, float> mBlockingFactors;
 
-    /// Next sound handle to assign
-    SoundHandle mNextHandle = 0;
+    // Voice handle allocation now lives in VoicePool (mVoicePool->allocate()).
+    // The previous mNextHandle counter moved with it.
 
     // ── Audio backends ──
 
@@ -750,11 +750,17 @@ private:
 
     // ── Active voice management ──
 
-    /// Map of active voices (handle → voice). Voices own their WAV data,
-    /// miniaudio decoder, and sound object. Cleaned up in loopStep().
-    std::unordered_map<SoundHandle, std::unique_ptr<ActiveVoice>> mVoices;
+    /// Active-voice pool — owns the handle→voice map and handle allocator.
+    /// Voices store their own WAV data, miniaudio decoder, and sound object;
+    /// the pool's cleanupFinished() sweep runs each frame from loopStep().
+    /// AudioService still owns voice STARTUP (createVoiceSource / initVoiceDSP
+    /// / ma_sound_start) and the removeVoiceSource() side of TEARDOWN — the
+    /// pool just owns lifetime + iteration.
+    std::unique_ptr<class VoicePool> mVoicePool;
 
-    /// Remove finished voices from the active map
+    /// Per-frame sweep — drops voices whose end-callback fired and routes
+    /// each through removeVoiceSource() + a [VOICE_PEAK] summary log.
+    /// Implemented as a thin facade over VoicePool::cleanupFinished(hook).
     void cleanupFinishedVoices();
 
     /// Random number generator for sample selection
@@ -808,7 +814,7 @@ private:
     // slice of voice state — these helpers keep that surface narrow and
     // mean AmbientSoundManager.cpp doesn't need to see the full structs.
     //
-    // Returns true iff `handle` resolves to a live voice in mVoices.
+    // Returns true iff `handle` resolves to a live voice in the pool.
     bool voiceExists(SoundHandle handle) const;
     // Falloff distance to use for ambient volume computation: prefers the
     // BFS `cachedProp.effectiveDistance` when reached, otherwise returns
@@ -1161,7 +1167,7 @@ private:
     /// in demoteFromRealtimeReflection / removeVoiceSource. Atomic so the
     /// debug console / perf overlay can read without locking. Validates
     /// against leaks in the promote/demote state machine — should equal the
-    /// number of voices in mVoices with a non-null reflectionSource.
+    /// number of voices in mVoicePool with a non-null reflectionSource.
     std::atomic<int> mActiveReflectionSources{0};
 
     /// Join the background reflection thread if it's running.
