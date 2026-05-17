@@ -412,7 +412,7 @@ public:
     void setDiffuseSamples(int n) { mDiffuseSamples = std::max(16, std::min(n, 256)); }
     void setBakeDiffuseSamples(int n) { mBakeDiffuseSamples = std::max(32, std::min(n, 512)); }
 
-    void setOcclusionRadius(float r) { mOcclusionRadius = std::max(0.3f, std::min(r, 30.0f)); }
+    void setOcclusionRadius(float r) { mOcclusionRadius = std::max(0.1f, std::min(r, 200.0f)); }
     float getOcclusionRadius() const { return mOcclusionRadius; }
     void setOcclusionSamples(int n) { mOcclusionSamples = std::max(4, std::min(n, 64)); }
     int  getOcclusionSamples() const { return mOcclusionSamples; }
