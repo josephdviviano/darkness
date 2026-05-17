@@ -34,16 +34,21 @@ set(HEADLESS_SERVICES_SOURCES
     audio/AmbientSoundManager.h
     audio/AudioDSPChain.cpp
     audio/AudioDSPChain.h
+    audio/AudioMetering.h
     audio/AudioOcclusion.cpp
     audio/AudioOcclusion.h
     audio/AudioService.cpp
     audio/AudioService.h
+    audio/ConvolutionWorkerPool.cpp
+    audio/ConvolutionWorkerPool.h
     audio/CRFSoundLoader.h
     audio/EnvSoundDatabase.cpp
     audio/EnvSoundDatabase.h
     audio/ProbeFile.h
     audio/ProbeManager.cpp
     audio/ProbeManager.h
+    audio/ReflectionSimulator.cpp
+    audio/ReflectionSimulator.h
     audio/SchemaPropertyOverrides.h
     audio/SchemaSamplesChunk.cpp
     audio/SchemaSamplesChunk.h
