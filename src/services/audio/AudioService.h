@@ -90,6 +90,9 @@ class SoundCache;
 struct SoundData;
 class SchemaParser;
 
+// Forward declaration — defined in AmbientSoundManager.h
+class AmbientSoundManager;
+
 /// Data transfer struct for world geometry → Steam Audio acoustic scene.
 /// Filled by the render binary from WR chunk data, passed to AudioService.
 struct AcousticSceneData {
@@ -191,44 +194,10 @@ enum AmbientHackFlags : uint32_t {
     AMB_AUTO_OFF = 0x100,     ///< Auto-disable when out of range
 };
 
-/// Tracked ambient sound instance (attached to a mission object)
-struct AmbientSound {
-    int objID = 0;                    ///< Mission object ID
-    std::string schemaName;           ///< Schema to play
-    Vector3 position{0, 0, 0};       ///< World-space position
-    float radius = 0.0f;             ///< Propagation radius
-    int32_t volume = -1;              ///< Volume in millibels
-    uint32_t flags = 0;               ///< AmbientHackFlags
-    /// Per-ambient SHARP-falloff flag, captured from the schema's
-    /// SCH_SHARP_FALLOFF (= original engine's SFXFLG_SHARP) at load time.
-    /// True → use the 4th-power curve `(d/r)^4` in updateAmbientVolumes;
-    /// false → linear `(d/r)`. SHARP is the original engine's default
-    /// for ambients (most use it); schemas opt out via an explicit
-    /// `flags` directive that clears bit 12.
-    bool isSharp = true;
-    /// Per-schema attenuation-factor divisor for the volume formula,
-    /// loaded from P$SchAttFac at startup (default 1.0). Higher values
-    /// make this schema fall off less aggressively. Examples in MISS6:
-    /// m06bell=20.0, KARRAS_SCRIPTED=3.0, AI_CONV=1.7, HIT_EXPLOSION=2.0.
-    float attenuationFactor = 1.0f;
-    SoundHandle handle = SOUND_HANDLE_INVALID; ///< Active voice handle (if playing)
-};
-
-/// Spot ambient — alternative ambient encoding with a hard inner/outer
-/// falloff envelope (loaded from P$SpotAmb). Unlike AmbientSound (single
-/// radius, linear/SHARP falloff), spot ambients are flat-volume within
-/// the inner radius, linearly fading to silence between inner and outer,
-/// and silent beyond. The original engine ties these to specific scene
-/// objects (e.g. mech floor lamps in MISS6).
-struct SpotAmbient {
-    int objID = 0;
-    std::string schemaName;       ///< Schema name (resolved from emitter object's archetype)
-    Vector3 position{0, 0, 0};
-    float inner = 0.0f;           ///< Distance inside which volume = level
-    float outer = 0.0f;           ///< Distance beyond which volume = 0
-    float level = 1.0f;           ///< Volume scalar at d <= inner
-    SoundHandle handle = SOUND_HANDLE_INVALID;
-};
+/// AmbientSound and SpotAmbient structs are owned by AmbientSoundManager
+/// (see AmbientSoundManager.h). The manager is responsible for parsing
+/// P$AmbientHack / P$SpotAmb, per-frame voice lifecycle, and applying the
+/// unified AmbientVolumeModel.
 
 /// Maximum simultaneous active voices (matches Dark Engine's limit)
 constexpr int MAX_ACTIVE_VOICES = 64;
@@ -260,6 +229,14 @@ constexpr float SOUND_MAX_DIST = 200.0f;
 class AudioService : public ServiceImpl<AudioService>,
                      public DatabaseListener,
                      public LoopClient {
+    // AmbientSoundManager is an extracted subsystem that owns ambient
+    // lifecycle (P$AmbientHack + P$SpotAmb). It needs to reach this
+    // service's private state (mVoices, mReflectionMixNode, mSchemaParser,
+    // startVoice, haltSound, publishSoundEmission, mListenerPos) through
+    // its back-pointer — befriending keeps that access narrow and
+    // avoids widening the public API.
+    friend class AmbientSoundManager;
+
 public:
     /// Forward declaration — defined in AudioService.cpp (needs public access
     /// for the free-function audio-thread callback reflectionMixNodeProcess)
@@ -542,20 +519,18 @@ public:
     void  setPropMinAttenuation(float a){ mDSPChain->setPropMinAttenuation(a); }
     float getPropMinAttenuation() const { return mDSPChain->getPropMinAttenuation(); }
 
-    // ── Ambient tuning ──
-    void setAmbHysteresisStartMul(float m) { mAmbHysteresisStartMul = std::max(1.0f, std::min(m, 5.0f)); }
-    void setAmbHysteresisStopMul(float m)  { mAmbHysteresisStopMul  = std::max(1.0f, std::min(m, 5.0f)); }
+    // ── Ambient tuning (facades — forwarded to AmbientSoundManager) ──
+    void setAmbHysteresisStartMul(float m);
+    void setAmbHysteresisStopMul(float m);
     /// "linear" or "quadratic"
-    void setAmbFalloffCurve(const std::string& s) { mAmbFalloffCurve = (s == "linear" ? "linear" : "quadratic"); }
-    void setAmbDefaultPriority(int p) { mAmbDefaultPriority = std::max(0, std::min(p, 255)); }
+    void setAmbFalloffCurve(const std::string &s);
+    void setAmbDefaultPriority(int p);
     // Per-voice spatialBlend override applied to AMB_ENVIRONMENTAL ambients
     // at activation time. 1.0 = full HRTF point-source pan; 0.0 = mono
     // passthrough. Lower values make room ambients (wind, church) feel
     // less like they emit from a single point. Object-attached ambients
     // (no AMB_ENVIRONMENTAL flag) ignore this and stay at full HRTF.
-    void setAmbEnvironmentalSpatialBlend(float b) {
-        mAmbEnvironmentalSpatialBlend = std::max(0.0f, std::min(b, 1.0f));
-    }
+    void setAmbEnvironmentalSpatialBlend(float b);
 
     // ── Performance tuning (some MUST be set BEFORE buildAcousticScene) ──
     void setMaxActiveVoices(int n) { mMaxActiveVoicesCfg = std::max(8, std::min(n, 256)); }
@@ -789,12 +764,25 @@ private:
     std::unordered_map<std::string, int> mLastSampleIdx;
 
     // ── Ambient sound management ──
+    //
+    // P$AmbientHack and P$SpotAmb lifecycle (load, per-frame volume
+    // updates with hysteresis + falloff) lives in AmbientSoundManager.
+    // This service owns the manager and forwards tuning setters to it;
+    // it also exposes the manager to the friend class via the back-
+    // pointer in AmbientSoundManager.
+    std::unique_ptr<AmbientSoundManager> mAmbientManager;
 
-    /// Active ambient sounds parsed from P$AmbientHack properties
-    std::vector<AmbientSound> mAmbients;
+    /// Periodic (~5 s) audio status dump — voice counts, callback budget,
+    /// per-ambient diagnostic rows. Called from loopStep(). Used to live
+    /// at the head of updateAmbientVolumes() before the extraction; now
+    /// it reads ambient state from mAmbientManager.
+    void dumpAudioStatusPeriodic();
 
-    /// Load ambient sound objects from mission data
-    void loadAmbientSounds();
+    /// Per-frame ducking envelope update — counts non-ambient SFX voices
+    /// and ramps the global duck multiplier toward its target. Read by
+    /// the AmbientSoundManager update path (and elsewhere) when applying
+    /// per-voice ducking. Was previously the tail of updateAmbientVolumes.
+    void updateAmbientDuckingEnvelope();
 
     /// Overlay per-archetype schema property overrides from the gamesys
     /// onto our parsed SchemaEntry table. Reads P$SchPlayPa (play params:
@@ -804,20 +792,43 @@ private:
     /// schema-archetype object to a SchemaEntry by SymName.
     void loadSchemaPropertyOverrides();
 
-    // ── Spot ambients (Unit B) ──
+    /// Load auxiliary per-schema / per-room sound data from mission +
+    /// gamesys properties (P$SchAttFac, schema overlays, P$PrjSound /
+    /// P$Heartbeat / P$SchLastSa, P$LoudRoom, P$Acoustics verification),
+    /// then trigger AmbientSoundManager::loadAmbientSounds() and the
+    /// spot-ambient loader. Called from loadSoundResources after the
+    /// schema parser is ready.
+    void loadAuxiliarySoundData();
 
-    /// Active spot-ambient instances parsed from P$SpotAmb properties.
-    /// Unlike P$AmbientHack (single radius, linear/SHARP falloff), spot
-    /// ambients have inner/outer envelope: full volume inside `inner`,
-    /// linear fade to 0 between `inner` and `outer`, silent beyond.
-    std::vector<SpotAmbient> mSpotAmbients;
-
-    /// Load spot ambients from mission data (P$SpotAmb on objects).
-    void loadSpotAmbients();
-
-    /// Update spot-ambient voice volumes based on listener distance.
-    /// Mirrors updateAmbientVolumes for the envelope-falloff model.
-    void updateSpotAmbientVolumes();
+    // ── Voice-state accessors exposed to AmbientSoundManager ──
+    //
+    // ActiveVoice and ReflectionMixNode are defined inside AudioService.cpp
+    // (their definitions pull in miniaudio + Steam Audio implementation
+    // details). The AmbientSoundManager only needs a small, well-defined
+    // slice of voice state — these helpers keep that surface narrow and
+    // mean AmbientSoundManager.cpp doesn't need to see the full structs.
+    //
+    // Returns true iff `handle` resolves to a live voice in mVoices.
+    bool voiceExists(SoundHandle handle) const;
+    // Falloff distance to use for ambient volume computation: prefers the
+    // BFS `cachedProp.effectiveDistance` when reached, otherwise returns
+    // `fallbackEuclideanDist`. Returns the input fallback when the voice
+    // is not found (no caller currently relies on that path, but it keeps
+    // the helper total).
+    float voiceFalloffDistance(SoundHandle handle, float fallbackEuclideanDist) const;
+    // Set the voice's per-source BFS-termination distance. Used by the
+    // ambient/spot loaders to bake the per-source max audible distance.
+    void voiceSetMaxAudibleDist(SoundHandle handle, float maxDist);
+    // Override the voice's HRTF/mono spatialBlend (atomic, audio-thread
+    // safe). Used for AMB_ENVIRONMENTAL ambients + spot ambients.
+    void voiceSetSpatialBlendOverride(SoundHandle handle, float blend);
+    // Apply a final ma_sound_set_volume() to the voice. AmbientSoundManager
+    // computes the linear gain and applies the duck multiplier; this
+    // helper crosses the ActiveVoice/miniaudio boundary in one shot.
+    void voiceSetLinearVolume(SoundHandle handle, float linearVol);
+    // Current global ducking multiplier (1.0 = no duck). Returns 1.0 if
+    // ducking is disabled or the mix node isn't ready.
+    float currentDuckGain() const;
 
     // ── Miscellaneous per-archetype sound data (Unit G) ──
 
@@ -853,10 +864,10 @@ private:
     /// resume; pristine shipping missions ship with 0 (only one Thief 2
     /// mission, miss14, ships with a nonzero pre-set env ambient).
     ///
-    /// Spot ambients (P$SpotAmb / `mSpotAmbients`) are orthogonal —
-    /// they live on individual objects and are started by player
-    /// proximity, not gated by this value. This field is captured for
-    /// future SAV-file resume + the miss14-style level-start env
+    /// Spot ambients (P$SpotAmb, owned by AmbientSoundManager) are
+    /// orthogonal — they live on individual objects and are started by
+    /// player proximity, not gated by this value. This field is captured
+    /// for future SAV-file resume + the miss14-style level-start env
     /// ambient case; it is NOT a level-wide enable flag.
     bool mHasAmbientChunk = false;
     int32_t mEnvAmbientObjID = 0;
@@ -908,9 +919,6 @@ private:
     /// Load all global sound chunk databases (ENV_SOUND, Speech_DB,
     /// SchSamp, AIHearStat, AISNDTWK). Called from onDBLoad.
     void loadSoundChunkDatabases(const FileGroupPtr &db);
-
-    /// Update ambient volumes based on listener distance (per-frame)
-    void updateAmbientVolumes();
 
     // ── Texture material mapping (for footstep schema selection) ──
 
@@ -1061,11 +1069,8 @@ private:
     float    mPropMaxPathDiff     = 10.0f;
 
     // ── Ambient tuning (P$AmbientHack) ──
-    float       mAmbEnvironmentalSpatialBlend = 0.3f;
-    float       mAmbHysteresisStartMul = 1.5f;
-    float       mAmbHysteresisStopMul  = 2.0f;
-    std::string mAmbFalloffCurve       = "quadratic"; // "linear" or "quadratic"
-    int         mAmbDefaultPriority    = 64;
+    // Moved to AmbientSoundManager — the setAmb* facade methods on this
+    // service forward to mAmbientManager.
 
     // ── Performance/infrastructure (must be set BEFORE init/buildAcousticScene) ──
     int         mMaxActiveVoicesCfg        = MAX_ACTIVE_VOICES;
