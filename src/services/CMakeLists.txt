@@ -61,6 +61,7 @@ set(HEADLESS_SERVICES_SOURCES
     audio/SpeechDatabase.h
     audio/SpeechSelector.cpp
     audio/SpeechSelector.h
+    audio/SubSourceSlots.h
     audio/VoicePool.cpp
     audio/VoicePool.h
     config/ConfigService.cpp
@@ -116,6 +117,8 @@ set(HEADLESS_SERVICES_SOURCES
     property/Property.h
     property/PropertyService.cpp
     property/PropertyService.h
+    room/ProbeGraph.cpp
+    room/ProbeGraph.h
     room/RoomCommon.h
     room/Room.cpp
     room/Room.h

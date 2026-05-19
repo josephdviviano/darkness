@@ -40,6 +40,7 @@
 #include "SoundPropagation.h"
 #include "SpeechDatabase.h"
 #include "SpeechSelector.h"
+#include "SubSourceSlots.h"
 #include "VoicePool.h"
 #include "ServiceCommon.h"
 #include <algorithm>
@@ -406,6 +407,31 @@ struct AudioService::ReflectionMixNode {
     float directGain = 1.0f;         // dry-bus multiplier (applied during direct passthrough)
     float masterGain = 1.0f;         // post-limiter master multiplier
 
+    // ── Wet-bus tape saturation ──
+    // Soft tanh saturator applied to the summed wet bus AFTER reflGain ramp
+    // and BEFORE the wet path is added to the dry stereoOut. Models analog
+    // tape / phonograph compression: nearly transparent for quiet reverb,
+    // harmonic coloration at moderate levels, brick-wall ceiling at loud
+    // peaks. The Thief gothic-steampunk aesthetic benefits from intentional
+    // analog character on reverb, and the same curve doubles as a graceful
+    // clip-handler for pathological hot probes (a player inside a small
+    // metal container with an ambient inside) without polluting the dry
+    // signal.
+    //
+    // Curve: out = tanh(in * drive) / drive
+    //   - drive=1.0 (default): nearly linear small-signal, soft ceiling at ±1
+    //   - drive=2-4: audible tape-like warmth, peak capped at 1/drive
+    //   - drive=5-10: phonograph character, heavy compression and harmonics
+    // Unity small-signal gain: tanh(x*d)/d ≈ x for small x. Peak ceiling: 1/d.
+    bool  wetSaturationEnabled = false;
+    float wetSaturationDrive   = 1.0f;
+    // Scratch buffers used to sum sub-worker wet output before saturation,
+    // so the soft tanh sees the full wet contribution (post reflGain ramp)
+    // rather than per-sub-worker contributions. Sized at frameSize in
+    // initReflectionPipeline.
+    std::vector<float> wetScratchL;
+    std::vector<float> wetScratchR;
+
     // ── Master bus DSP chain ──
     // Processing order: Low-shelf EQ → Compressor → Soft Limiter
     // Each stage can be independently enabled/disabled via config.
@@ -632,6 +658,16 @@ std::atomic<int>   sDistanceModel{0};
 /// Engine sample rate published for audio-thread DSP that needs it (door LPF, etc.)
 static std::atomic<uint32_t> sEngineSampleRate{48000};
 
+/// Runtime cap on the number of simultaneous sub-source slots assigned per
+/// voice. Independent of mPropMaxPaths (which caps how many paths the BFS
+/// keeps); the effective per-voice cap is min(mPropMaxPaths, sMaxSubSources).
+/// Phase 4 default = 4. Per-path occlusion via per-slot IPLSource +
+/// iplSimulatorRunDirect makes higher path counts physically meaningful
+/// (each path contributes its own distance attenuation, air absorption,
+/// volumetric occlusion, and transmission). Clamped against kMaxSubSources
+/// at the slot-assignment call site.
+static std::atomic<uint32_t> sMaxSubSources{4};
+
 // ── Steam Audio per-voice gain-staging meters ──
 //
 // Aggregated across ALL active per-voice DSP nodes (so a single hot voice
@@ -805,18 +841,16 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
     // and worth the worst-case one-callback discontinuity vs. permanent
     // silence.
     {
-        bool badLpf = !std::isfinite(node->lpfStateL)
-                   || !std::isfinite(node->lpfStateR)
-                   || !std::isfinite(node->reflSendLpfState);
+        // Per-voice WET-bus LPF state (the DRY LPF state lives per-slot
+        // in SubSource and is sanitized inside the slot loop).
+        bool badLpf = !std::isfinite(node->reflSendLpfState);
         bool badRamp = !std::isfinite(node->currentPortalAtten)
                     || !std::isfinite(node->currentDoorAlpha);
         if (badLpf) {
-            node->lpfStateL = 0.0f;
-            node->lpfStateR = 0.0f;
             node->reflSendLpfState = 0.0f;
             uint32_t n = node->nanCountLpf.fetch_add(1, std::memory_order_relaxed);
             if (n < 4) {
-                AUDIO_LOG("[NAN_GUARD] node=%p lpfState reset to 0 "
+                AUDIO_LOG("[NAN_GUARD] node=%p reflSendLpfState reset to 0 "
                           "(occurrence %u)\n",
                           static_cast<void*>(node), n + 1);
             }
@@ -894,7 +928,18 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
     // Level 0: direct effect + binaural (full pipeline)
     // Level 1: direct attenuation only (no binaural — mono passthrough)
     // Level 2: binaural only (no direct attenuation)
-    bool runBinaural = (bypassLevel == 0 || bypassLevel == 2) && node->binauralEffect;
+    // ── Multi-path slot pipeline gates ──
+    // Phase 2: the audio callback iterates non-Free sub-source slots and
+    // sums each slot's binaural output into stereoL/R. The legacy single
+    // direct/binaural effects on SteamAudioDSPNode are gone; each slot
+    // carries its own pair (pre-allocated in initVoiceDSP). Slot 0 is
+    // the only slot that's normally ACTIVE under the Phase 2 cap=1
+    // policy, so steady-state output equals the legacy single-source
+    // pipeline. Transition frames briefly see slot 0 DRAINING with a
+    // second slot ACTIVE; both run their effects, gain-snap (Phase 2)
+    // or per-sample crossfade (Phase 3) produces clickless handover.
+    bool runBinaural = (bypassLevel == 0 || bypassLevel == 2)
+                       && node->subSources[0].binauralEffect;
     bool runAtten = (bypassLevel == 0 || bypassLevel == 1);
 
     // ── Memory-ordering investigation ──
@@ -928,297 +973,310 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         }
     }
 
-    // Apply Steam Audio direct effect — frequency-dependent 3-band EQ covering
-    // distance attenuation, air absorption, occlusion, and wall transmission.
-    // Processes mono input to a separate output buffer so the raw mono stays
-    // pristine for convolution staging (reverb uses unfiltered mono × distance).
-    float* binauralMono = mono;  // default: feed raw mono to HRTF
-    if (runAtten && !node->skipAttenuation && node->directEffect) {
-        float* directInPtr = mono;
-        IPLAudioBuffer directIn{};
-        directIn.numChannels = 1;
-        directIn.numSamples = static_cast<IPLint32>(frameCount);
-        directIn.data = &directInPtr;
-
-        float* directOutPtr = node->directEffectOut.data();
-        IPLAudioBuffer directOut{};
-        directOut.numChannels = 1;
-        directOut.numSamples = static_cast<IPLint32>(frameCount);
-        directOut.data = &directOutPtr;
-
-        // Gain-staging: record the mono input level to iplDirectEffectApply
-        // for this voice.  The direct effect is a 3-band parametric EQ
-        // (distance / air absorption / occlusion / transmission), and
-        // pathological coefficient combinations can cause it to resonate
-        // — comparing the directIn meter against the directOut meter at
-        // [GAIN] dump time surfaces that.
-        sSaMeterDirectIn.measureMono(directInPtr, frameCount);
-
-        iplDirectEffectApply(node->directEffect, &node->directParams,
-                             &directIn, &directOut);
-
-        // Companion measurement: directOut.  A peak > directIn peak by
-        // more than ~6 dB across a sustained window means a band is
-        // resonating and pushing energy into the rest of the chain.
-        sSaMeterDirectOut.measureMono(directOutPtr, frameCount);
-
-        // Sanitize the direct-effect output before it feeds the binaural
-        // stage.  iplDirectEffectApply produces NaN/Inf if any of its inputs
-        // (airAbsorption coefficient, distanceAttenuation, occlusion,
-        // transmission band) is non-finite — and propagating that into the
-        // HRTF would silence the entire pipeline.
-        if (audioSanitizeBuffer(directOutPtr, frameCount)) {
-            uint32_t n = node->nanCountDirect.fetch_add(1, std::memory_order_relaxed);
-            if (n < 4) {
-                AUDIO_LOG("[NAN_GUARD] node=%p directEffect output had "
-                          "non-finite samples (occurrence %u) "
-                          "distAtt=%.4f occl=%.4f trans=(%.3f,%.3f,%.3f) "
-                          "airAbs=(%.3f,%.3f,%.3f)\n",
-                          static_cast<void*>(node), n + 1,
-                          node->directParams.distanceAttenuation,
-                          node->directParams.occlusion,
-                          node->directParams.transmission[0],
-                          node->directParams.transmission[1],
-                          node->directParams.transmission[2],
-                          node->directParams.airAbsorption[0],
-                          node->directParams.airAbsorption[1],
-                          node->directParams.airAbsorption[2]);
-            }
-        }
-        binauralMono = directOutPtr;  // feed filtered mono to HRTF
-
-        // Diagnostic: track per-stage peak across voice lifetime.
-        // monoIn = ma_sound output * volume (pre-DSP).
-        // monoOut = post iplDirectEffect (post air abs + dist atten).
-        // Together with lifetimePeakL/R (post HRTF binaural), these three
-        // pin down which stage of the per-voice pipeline introduces the
-        // peak variation seen in [VOICE_PEAK].
-        {
-            float mInPeak = 0.0f, mOutPeak = 0.0f;
-            for (ma_uint32 i = 0; i < frameCount; ++i) {
-                float aIn  = std::fabs(mono[i]);
-                float aOut = std::fabs(directOutPtr[i]);
-                if (aIn  > mInPeak)  mInPeak  = aIn;
-                if (aOut > mOutPeak) mOutPeak = aOut;
-            }
-            float prev = node->monoInPeak.load(std::memory_order_relaxed);
-            while (mInPeak > prev && !node->monoInPeak.compare_exchange_weak(
-                       prev, mInPeak, std::memory_order_relaxed)) {}
-            prev = node->monoOutPeak.load(std::memory_order_relaxed);
-            while (mOutPeak > prev && !node->monoOutPeak.compare_exchange_weak(
-                       prev, mOutPeak, std::memory_order_relaxed)) {}
-        }
-
-        // Store scalar attenuation estimate for debug logging and
-        // reflection voice distance ranking (broadband approximation).
-        // portalAttenuation is applied unconditionally — it collapses to
-        // 1.0 for same-room voices and only drops below 1.0 when there
-        // is a real portal-graph detour, so this multiply is a no-op for
-        // direct-line voices and a continuous attenuation for routed ones.
-        float atten = node->directParams.distanceAttenuation
-                    * node->directParams.occlusion
-                    * node->portalAttenuation;
-        float minAtten = sPropMinAttenuation.load(std::memory_order_relaxed);
-        if (atten < minAtten) atten = minAtten;
-        node->lastAtten.store(atten, std::memory_order_relaxed);
-    }
-
-    // Apply binaural effect (mono → stereo HRTF spatialization).
-    // Uses filtered mono (post-direct-effect) so frequency-dependent
-    // attenuation is spatialized correctly to the listener's head.
+    // ─────────────────────────────────────────────────────────────────
+    // Per-slot dry-path pipeline (Phase 3a)
+    //
+    // Each sub-source slot runs its own directEffect → binaural → LPF
+    // chain and accumulates into voice-level stereoL/R with per-sample
+    // gain ramping. Slot 0 is the only ACTIVE slot under the Phase 3
+    // cap=1 policy (Phase 3b will raise it). Transition frames briefly
+    // see slot 0 DRAINING + slot N ACTIVE; the gain ramp + the slot's
+    // own LPF state produce a clickless crossfade between paths.
+    //
+    // The LPF is per-slot (slot.targetDoorBlocking → α, slot.lpfStateL/R)
+    // so a path through a closed door gets its OWN spectral coloration
+    // independent of other paths. The per-voice door LPF that used to
+    // run post-summation is gone; the post-summation pass now only
+    // applies the per-voice portalAttenuation ramp (still scalar) and
+    // computes the per-voice currentDoorAlpha for the reflection-send
+    // bus.
+    // ─────────────────────────────────────────────────────────────────
     if (runBinaural) {
-        float* binauralMonoPtr = binauralMono;
-        IPLAudioBuffer binauralIn{};
-        binauralIn.numChannels = 1;
-        binauralIn.numSamples = static_cast<IPLint32>(frameCount);
-        binauralIn.data = &binauralMonoPtr;
-
         float* chL = node->stereoL.data();
         float* chR = node->stereoR.data();
-        float* stereoChannels[2] = {chL, chR};
+        std::memset(chL, 0, frameCount * sizeof(float));
+        std::memset(chR, 0, frameCount * sizeof(float));
 
-        IPLAudioBuffer outBuf{};
-        outBuf.numChannels = 2;
-        outBuf.numSamples = static_cast<IPLint32>(frameCount);
-        outBuf.data = stereoChannels;
+        float* slotL = node->subSlotStereoL.data();
+        float* slotR = node->subSlotStereoR.data();
+        float* directOutPtr = node->directEffectOut.data();
 
-        IPLBinauralEffectParams binParams{};
-        binParams.direction = node->direction;
-        binParams.interpolation = (sHrtfInterpolation.load(std::memory_order_relaxed) == 0)
-                                  ? IPL_HRTFINTERPOLATION_NEAREST
-                                  : IPL_HRTFINTERPOLATION_BILINEAR;
-        // Multiplicative blend: global slider × per-voice override. The
-        // global slider (sSpatialBlend) is a master quality knob; the
-        // per-voice override (spatialBlendOverride) lowers it for voices
-        // that should feel less point-source-like (e.g. AMB_ENVIRONMENTAL
-        // room ambients).
-        binParams.spatialBlend = sSpatialBlend.load(std::memory_order_relaxed)
-                                 * node->spatialBlendOverride.load(std::memory_order_relaxed);
-        binParams.hrtf = node->hrtf;
-        binParams.peakDelays = nullptr;
+        const float sampleRate = static_cast<float>(
+            sEngineSampleRate.load(std::memory_order_relaxed));
+        const float rampSamples = std::max(1.0f, sampleRate * 0.010f);
+        const float maxStep = 1.0f / rampSamples;
 
-        // Defence in depth: if the HRTF was asked for a non-finite direction
-        // (e.g. listener exactly on top of the source produces a 0/0 in the
-        // dot products upstream), Steam Audio will gladly write NaN into the
-        // output buffer.  Clamp the direction to a safe default — straight
-        // ahead — before the apply so the binaural never sees bad inputs.
-        if (!std::isfinite(binParams.direction.x) ||
-            !std::isfinite(binParams.direction.y) ||
-            !std::isfinite(binParams.direction.z)) {
-            binParams.direction = {0.0f, 0.0f, -1.0f};  // IPL ahead, neutral
-        }
+        // Door-LPF cutoff formula constants — same for every slot in
+        // this callback (depend on global config + sample rate, not
+        // per-slot blocking).
+        const float openHz    = sDoorLpfOpenHz.load(std::memory_order_relaxed);
+        const float blockedHz = sDoorLpfBlockedHz.load(std::memory_order_relaxed);
+        const float nyquist   = 0.5f * sampleRate;
+        const float hzRatio   = blockedHz / openHz;
 
-        iplBinauralEffectApply(node->binauralEffect, &binParams, &binauralIn, &outBuf);
-
-        // Sanitize the binaural output before any downstream IIR touches it.
-        // We have field evidence (log.log) of the HRTF occasionally writing
-        // peakL=0.0000 — a NaN-shaped variant of that same fault would
-        // permanently NaN-lock the per-voice door-LPF state, then the master
-        // EQ biquad, then silence the whole left channel for the rest of the
-        // session.  The check is per-sample on the deinterleaved buffers so
-        // we catch asymmetric L-only or R-only corruption.
-        bool badL = audioSanitizeBuffer(chL, frameCount);
-        bool badR = audioSanitizeBuffer(chR, frameCount);
-        if (badL || badR) {
-            uint32_t n = node->nanCountBinaural.fetch_add(1, std::memory_order_relaxed);
-            if (n < 4) {
-                AUDIO_LOG("[NAN_GUARD] node=%p binaural output had "
-                          "non-finite samples L=%d R=%d (occurrence %u) "
-                          "dir=(%.3f,%.3f,%.3f) spatialBlend=%.3f\n",
-                          static_cast<void*>(node),
-                          badL ? 1 : 0, badR ? 1 : 0, n + 1,
-                          binParams.direction.x, binParams.direction.y,
-                          binParams.direction.z, binParams.spatialBlend);
-            }
-        }
-
-        // HRTF headroom trim.  Steam Audio's iplBinauralEffectApply can
-        // produce samples above 0 dBFS — known issue #350, and confirmed
-        // empirically in [GAIN] logs where sa_binaural peaks reach +3.6 dB
-        // even though the mono input never exceeds -0.5 dB.  A constant
-        // -3 dB trim on the binaural output reclaims that headroom for
-        // the downstream chain without touching the perceived spatial
-        // image (both ears attenuated identically — pure level change,
-        // no panning shift).
-        //
-        // Applied BEFORE the post-binaural meter so sa_binaural reads
-        // the actual level the rest of the pipeline sees.
-        constexpr float kHrtfTrim = 0.7079458f;  // 10^(-3/20) = -3 dBFS
+        // Mono input peak (independent of slots — same input).
+        float monoInPeak = 0.0f;
         for (ma_uint32 i = 0; i < frameCount; ++i) {
-            chL[i] *= kHrtfTrim;
-            chR[i] *= kHrtfTrim;
+            float a = std::fabs(mono[i]);
+            if (a > monoInPeak) monoInPeak = a;
+        }
+        if (runAtten && !node->skipAttenuation) {
+            sSaMeterDirectIn.measureMono(mono, frameCount);
         }
 
-        // Gain-staging: post-binaural (post-trim) deinterleaved output,
-        // per voice, aggregated across all voices via the file-scope
-        // meter.  Peak above directOut peak now indicates HRTF overshoot
-        // that survived the trim — should be rare.  Peak well below
-        // directOut indicates the trim was over-aggressive.
-        sSaMeterBinaural.measureDeinterleaved(chL, chR, frameCount);
+        float monoOutPeak = 0.0f;
+        bool anyDirectRan = false;
 
-        // Apply portal routing — excess-path attenuation through the portal
-        // graph, plus low-pass blocking for closed doors. Both are applied
-        // unconditionally: portalAttenuation = 1.0 for same-room voices
-        // (no-op multiply) and < 1.0 only when the BFS path is longer
-        // than the straight line; portalBlocking is 0.0 unless a door in
-        // the path is closed.
-        //
-        // Both scalars are *ramped* per sample toward their target values
-        // (written by main thread once per frame). The previous code
-        // applied them as constants over the entire ~21 ms callback,
-        // which made any frame-to-frame jump audible as a step. The
-        // original Dark Engine got the same effect for free because
-        // DirectSound's SetVolume / EAX's Set3DOcclusion internally slew
-        // their state per sample. We have to do it explicitly.
-        //
-        // Ramp slew rate: 10 ms scaled to the active sample rate (not
-        // hardcoded — sample rate varies across bgfx backends / device
-        // configurations). 10 ms is the sweet spot between "audibly
-        // smooth" (≥ ~5 ms) and "still feels responsive to listener
-        // motion" (≤ ~20 ms).
-        if (runAtten && !node->skipAttenuation) {
-            float sampleRate = static_cast<float>(
-                sEngineSampleRate.load(std::memory_order_relaxed));
-            float rampSamples = std::max(1.0f, sampleRate * 0.010f);
-            float maxStep = 1.0f / rampSamples;
+        for (int slotIdx = 0; slotIdx < kMaxSubSources; ++slotIdx) {
+            SubSource& slot = node->subSources[slotIdx];
+            if (slot.state == SubSourceState::Free) continue;
+            if (!slot.binauralEffect) continue;
 
-            // Target portal-attenuation scalar — clamped against the
-            // configurable "min audible" floor so a fully-blocked voice
-            // still has a tiny audible residue (debugging aid).
-            // Sanitize first: if propagateSound ever returns a non-finite
-            // scalar, we'd otherwise feed NaN into the slew loop and
-            // NaN-lock the door-LPF state.
-            float portalTarget = audioSanitizeScalar(node->portalAttenuation, 1.0f);
-            float minAtten = sPropMinAttenuation.load(std::memory_order_relaxed);
-            if (portalTarget < minAtten) portalTarget = minAtten;
+            // Snap currentDir to targetDir at callback boundary.
+            // Steam Audio's internal bilinear interpolation handles
+            // smoothing between this callback's direction and the
+            // previous one; we don't ramp direction per sample.
+            slot.currentDir = slot.targetDir;
+            if (!std::isfinite(slot.currentDir.x)
+                || !std::isfinite(slot.currentDir.y)
+                || !std::isfinite(slot.currentDir.z)) {
+                slot.currentDir = {0.0f, 0.0f, -1.0f};
+            }
 
-            // Door-blocking LPF coefficient target. Same bilinear-transformed
-            // 1-pole IIR design as before (α ∈ [0,1], 1 = passthrough), but
-            // we now ramp α directly rather than recomputing it from a
-            // ramped blocking factor each sample — that would cost a pow()
-            // per sample. Ramping α linearly is a slight curve-shape
-            // approximation vs. ramping the cutoff itself, but α is the
-            // quantity that actually appears in the IIR, so a linear ramp
-            // of α produces a smooth audible transition by construction.
+            // ── Per-slot direct effect (Phase 4: per-path params) ──
             //
-            // Formulae preserved from the previous implementation:
-            //   cutoff(blocking) = openHz · (blockedHz / openHz) ^ blocking
-            //   α(cutoff) = ω / (1 + ω), ω = tan(π · cutoff / sampleRate)
-            // Sanitize portalBlocking: std::pow(positive, NaN) = NaN, which
-            // would propagate through cutoff → omega → alphaTarget → IIR
-            // state.  0.0 is the safe fallback (door fully open, no LPF).
-            float blocking  = audioSanitizeScalar(node->portalBlocking, 0.0f);
-            if (blocking < 0.0f) blocking = 0.0f;
+            // Each slot's directEffect runs with its OWN
+            // IPLDirectEffectParams from this slot's IPLSource —
+            // populated by iplSimulatorRunDirect using the slot's
+            // path virtualPosition. So a slot routed through an open
+            // doorway and a slot routed through a partially-walled
+            // path get genuinely distinct distance attenuation, air
+            // absorption, occlusion, and transmission spectra. The
+            // legacy single-source node->directParams (sourced from
+            // voice->directSource at the centroid prop.virtualPosition)
+            // is still maintained for the reflection-send path below
+            // but is no longer consumed here.
+            float* binauralMono = mono;
+            if (runAtten && !node->skipAttenuation && slot.directEffect) {
+                float* directInPtr = mono;
+                IPLAudioBuffer directIn{};
+                directIn.numChannels = 1;
+                directIn.numSamples = static_cast<IPLint32>(frameCount);
+                directIn.data = &directInPtr;
+                IPLAudioBuffer directOut{};
+                directOut.numChannels = 1;
+                directOut.numSamples = static_cast<IPLint32>(frameCount);
+                directOut.data = &directOutPtr;
+
+                iplDirectEffectApply(slot.directEffect,
+                                     &slot.targetDirectParams,
+                                     &directIn, &directOut);
+
+                if (audioSanitizeBuffer(directOutPtr, frameCount)) {
+                    uint32_t n = node->nanCountDirect.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (n < 4) {
+                        AUDIO_LOG("[NAN_GUARD] node=%p slot=%d directEffect "
+                                  "output had non-finite samples "
+                                  "(occurrence %u) "
+                                  "distAtt=%.4f occl=%.4f trans=(%.3f,%.3f,%.3f) "
+                                  "airAbs=(%.3f,%.3f,%.3f)\n",
+                                  static_cast<void*>(node), slotIdx, n + 1,
+                                  slot.targetDirectParams.distanceAttenuation,
+                                  slot.targetDirectParams.occlusion,
+                                  slot.targetDirectParams.transmission[0],
+                                  slot.targetDirectParams.transmission[1],
+                                  slot.targetDirectParams.transmission[2],
+                                  slot.targetDirectParams.airAbsorption[0],
+                                  slot.targetDirectParams.airAbsorption[1],
+                                  slot.targetDirectParams.airAbsorption[2]);
+                    }
+                }
+                binauralMono = directOutPtr;
+                anyDirectRan = true;
+
+                for (ma_uint32 i = 0; i < frameCount; ++i) {
+                    float a = std::fabs(directOutPtr[i]);
+                    if (a > monoOutPeak) monoOutPeak = a;
+                }
+            }
+
+            // ── Per-slot binaural (uses slot.currentDir). ──
+            float* binauralMonoPtr = binauralMono;
+            IPLAudioBuffer binauralIn{};
+            binauralIn.numChannels = 1;
+            binauralIn.numSamples = static_cast<IPLint32>(frameCount);
+            binauralIn.data = &binauralMonoPtr;
+
+            float* slotChans[2] = {slotL, slotR};
+            IPLAudioBuffer slotOut{};
+            slotOut.numChannels = 2;
+            slotOut.numSamples = static_cast<IPLint32>(frameCount);
+            slotOut.data = slotChans;
+
+            IPLBinauralEffectParams binParams{};
+            binParams.direction = slot.currentDir;
+            binParams.interpolation =
+                (sHrtfInterpolation.load(std::memory_order_relaxed) == 0)
+                    ? IPL_HRTFINTERPOLATION_NEAREST
+                    : IPL_HRTFINTERPOLATION_BILINEAR;
+            binParams.spatialBlend =
+                sSpatialBlend.load(std::memory_order_relaxed)
+                * node->spatialBlendOverride.load(std::memory_order_relaxed);
+            binParams.hrtf = node->hrtf;
+            binParams.peakDelays = nullptr;
+
+            iplBinauralEffectApply(slot.binauralEffect, &binParams,
+                                   &binauralIn, &slotOut);
+
+            bool badL = audioSanitizeBuffer(slotL, frameCount);
+            bool badR = audioSanitizeBuffer(slotR, frameCount);
+            if (badL || badR) {
+                uint32_t n = node->nanCountBinaural.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (n < 4) {
+                    AUDIO_LOG("[NAN_GUARD] node=%p slot=%d binaural output had "
+                              "non-finite samples L=%d R=%d (occurrence %u) "
+                              "dir=(%.3f,%.3f,%.3f) spatialBlend=%.3f\n",
+                              static_cast<void*>(node), slotIdx,
+                              badL ? 1 : 0, badR ? 1 : 0, n + 1,
+                              binParams.direction.x, binParams.direction.y,
+                              binParams.direction.z, binParams.spatialBlend);
+                }
+            }
+
+            // ── Per-slot LPF α target (Maekawa-ish 1-pole IIR
+            // coefficient derived from slot.targetDoorBlocking). One
+            // pow() per slot per callback; cheap. ──
+            float blocking = audioSanitizeScalar(slot.targetDoorBlocking, 0.0f);
+            if      (blocking < 0.0f) blocking = 0.0f;
             else if (blocking > 1.0f) blocking = 1.0f;
-            float openHz    = sDoorLpfOpenHz.load(std::memory_order_relaxed);
-            float blockedHz = sDoorLpfBlockedHz.load(std::memory_order_relaxed);
-            float cutoff    = openHz * std::pow(blockedHz / openHz, blocking);
-            float nyquist   = 0.5f * sampleRate;
-            if (cutoff >= 0.99f * nyquist) cutoff = 0.99f * nyquist;
-            if (cutoff < 1.0f)              cutoff = 1.0f;
+            float cutoff = openHz * std::pow(hzRatio, blocking);
+            if      (cutoff >= 0.99f * nyquist) cutoff = 0.99f * nyquist;
+            else if (cutoff < 1.0f)              cutoff = 1.0f;
             float omega = std::tan(3.14159265f * cutoff / sampleRate);
-            float alphaTarget = omega / (1.0f + omega);
-            // Final clamp for the loop target — covers the case where
-            // openHz / blockedHz config values produced a degenerate cutoff
-            // or tan() overshot.  α must stay in [0,1] for the IIR to be
-            // well-behaved.
-            alphaTarget = audioSanitizeScalar(alphaTarget, 1.0f);
-            if (alphaTarget < 0.0f) alphaTarget = 0.0f;
+            float alphaTarget = audioSanitizeScalar(omega / (1.0f + omega), 1.0f);
+            if      (alphaTarget < 0.0f) alphaTarget = 0.0f;
             else if (alphaTarget > 1.0f) alphaTarget = 1.0f;
 
-            float curAtten = node->currentPortalAtten;
-            float curAlpha = node->currentDoorAlpha;
+            // Defence in depth: recover any non-finite ramped state.
+            if (!std::isfinite(slot.currentGain))      slot.currentGain      = 0.0f;
+            if (!std::isfinite(slot.currentDoorAlpha)) slot.currentDoorAlpha = 1.0f;
+            if (!std::isfinite(slot.lpfStateL))        slot.lpfStateL        = 0.0f;
+            if (!std::isfinite(slot.lpfStateR))        slot.lpfStateR        = 0.0f;
 
-            // Combined ramp loop. We do attenuation + LPF in one pass so
-            // we touch each sample once. The IIR is always run (even when
-            // α ≈ 1) because (a) it keeps lpfState fresh for instant
-            // response when a door closes later, and (b) at α=1 the IIR
-            // collapses to y[n] = x[n] — one mul + one add per sample is
-            // cheap enough that the special-case fast-path of the old
-            // code isn't worth the branch.
+            // ── Per-sample ramp + LPF + accumulate into chL/chR. ──
+            float curGain  = slot.currentGain;
+            float curAlpha = slot.currentDoorAlpha;
+            const float targetGain = slot.targetGain;
+            float lpfL = slot.lpfStateL;
+            float lpfR = slot.lpfStateR;
+
             for (ma_uint32 i = 0; i < frameCount; ++i) {
-                // Slew attenuation toward target (constant slew rate).
-                float da = portalTarget - curAtten;
-                if      (da >  maxStep) da =  maxStep;
-                else if (da < -maxStep) da = -maxStep;
-                curAtten += da;
+                // Slew gain toward target (~10 ms slew rate). The slot
+                // ramps up from 0 on cold allocation and down to 0 on
+                // drain — that's the click-prevention crossfade between
+                // paths during transitions.
+                float dg = targetGain - curGain;
+                if      (dg >  maxStep) dg =  maxStep;
+                else if (dg < -maxStep) dg = -maxStep;
+                curGain += dg;
 
-                // Slew door-LPF α toward target (same slew rate).
+                // Slew door-LPF α toward target.
                 float dAlpha = alphaTarget - curAlpha;
                 if      (dAlpha >  maxStep) dAlpha =  maxStep;
                 else if (dAlpha < -maxStep) dAlpha = -maxStep;
                 curAlpha += dAlpha;
 
-                // Apply portal attenuation.
-                float sL = chL[i] * curAtten;
-                float sR = chR[i] * curAtten;
+                // Per-slot 1-pole IIR door LPF.
+                lpfL += curAlpha * (slotL[i] - lpfL);
+                lpfR += curAlpha * (slotR[i] - lpfR);
 
-                // Apply door-blocking 1-pole IIR LPF.
-                //   y[n] = α·x[n] + (1-α)·y[n-1]
-                node->lpfStateL += curAlpha * (sL - node->lpfStateL);
-                node->lpfStateR += curAlpha * (sR - node->lpfStateR);
-                chL[i] = node->lpfStateL;
-                chR[i] = node->lpfStateR;
+                // Accumulate × per-slot gain. Open-door, full-gain slot
+                // contributes its full binaural output; draining slot
+                // ramps to zero contribution; multi-active slots in
+                // Phase 3b sum coherently.
+                chL[i] += lpfL * curGain;
+                chR[i] += lpfR * curGain;
+            }
+
+            slot.currentGain      = curGain;
+            slot.currentDoorAlpha = curAlpha;
+            slot.lpfStateL        = lpfL;
+            slot.lpfStateR        = lpfR;
+        }
+
+        // Per-stage peak diagnostics (aggregated across slots — same
+        // semantics as legacy [VOICE_PEAK] reads).
+        if (anyDirectRan) {
+            sSaMeterDirectOut.measureMono(directOutPtr, frameCount);
+            float prev = node->monoInPeak.load(std::memory_order_relaxed);
+            while (monoInPeak > prev && !node->monoInPeak.compare_exchange_weak(
+                       prev, monoInPeak, std::memory_order_relaxed)) {}
+            prev = node->monoOutPeak.load(std::memory_order_relaxed);
+            while (monoOutPeak > prev && !node->monoOutPeak.compare_exchange_weak(
+                       prev, monoOutPeak, std::memory_order_relaxed)) {}
+
+            float atten = node->directParams.distanceAttenuation
+                        * node->directParams.occlusion
+                        * node->portalAttenuation;
+            float minAtten = sPropMinAttenuation.load(std::memory_order_relaxed);
+            if (atten < minAtten) atten = minAtten;
+            node->lastAtten.store(atten, std::memory_order_relaxed);
+        }
+
+        // HRTF headroom trim — applied to summed output (linearly
+        // commutes with summation, so this is equivalent to trimming
+        // each slot's binaural output independently).
+        constexpr float kHrtfTrim = 0.7079458f;  // 10^(-3/20) = -3 dBFS
+        for (ma_uint32 i = 0; i < frameCount; ++i) {
+            chL[i] *= kHrtfTrim;
+            chR[i] *= kHrtfTrim;
+        }
+        sSaMeterBinaural.measureDeinterleaved(chL, chR, frameCount);
+
+        // ── Per-voice ramp updates for reflection-send (Phase 4) ──
+        //
+        // With per-slot IPLSources providing per-path distance
+        // attenuation and per-slot LPF providing per-path door
+        // coloration, the dry chL/chR have already absorbed both. The
+        // legacy post-summation `chL *= currentPortalAtten` and per-
+        // voice door LPF would now double-attenuate, so the dry apply
+        // is gone. We keep the ramps themselves running, however, so
+        // node->currentPortalAtten and node->currentDoorAlpha stay in
+        // sync with their targets — the reflection-send block below
+        // still reads both for its centroid-based mono scaling and
+        // wet-bus LPF coloration (the reverb tail is single-source,
+        // centroid is the right summary).
+        if (runAtten && !node->skipAttenuation) {
+            float portalTarget = audioSanitizeScalar(node->portalAttenuation, 1.0f);
+            float minAtten = sPropMinAttenuation.load(std::memory_order_relaxed);
+            if (portalTarget < minAtten) portalTarget = minAtten;
+
+            float voiceBlocking = audioSanitizeScalar(node->portalBlocking, 0.0f);
+            if      (voiceBlocking < 0.0f) voiceBlocking = 0.0f;
+            else if (voiceBlocking > 1.0f) voiceBlocking = 1.0f;
+            float voiceCutoff = openHz * std::pow(hzRatio, voiceBlocking);
+            if      (voiceCutoff >= 0.99f * nyquist) voiceCutoff = 0.99f * nyquist;
+            else if (voiceCutoff < 1.0f)             voiceCutoff = 1.0f;
+            float voiceOmega = std::tan(3.14159265f * voiceCutoff / sampleRate);
+            float voiceAlphaTarget = audioSanitizeScalar(voiceOmega / (1.0f + voiceOmega), 1.0f);
+            if      (voiceAlphaTarget < 0.0f) voiceAlphaTarget = 0.0f;
+            else if (voiceAlphaTarget > 1.0f) voiceAlphaTarget = 1.0f;
+
+            float curAtten = node->currentPortalAtten;
+            float curAlpha = node->currentDoorAlpha;
+
+            for (ma_uint32 i = 0; i < frameCount; ++i) {
+                float da = portalTarget - curAtten;
+                if      (da >  maxStep) da =  maxStep;
+                else if (da < -maxStep) da = -maxStep;
+                curAtten += da;
+
+                float dAlpha = voiceAlphaTarget - curAlpha;
+                if      (dAlpha >  maxStep) dAlpha =  maxStep;
+                else if (dAlpha < -maxStep) dAlpha = -maxStep;
+                curAlpha += dAlpha;
             }
 
             node->currentPortalAtten = curAtten;
@@ -1427,12 +1485,34 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             }
         }
     } else {
-        // No binaural — duplicate filtered mono to both channels.
-        // Direct effect was already applied above (binauralMono points to
-        // filtered output if attenuation is active).
+        // No binaural — bypass level 1 (direct only) or level 2 with
+        // binaural effects unavailable. Run slot 0's direct effect
+        // standalone (mirrors the legacy "direct then output mono"
+        // shape) and emit the filtered mono as dual mono. Skipped if
+        // the voice opted out of attenuation (player-emitted) or has
+        // no direct effect handle.
+        float* monoOut = mono;
+        if (runAtten && !node->skipAttenuation
+            && node->subSources[0].directEffect) {
+            float* directInPtr = mono;
+            IPLAudioBuffer directIn{};
+            directIn.numChannels = 1;
+            directIn.numSamples = static_cast<IPLint32>(frameCount);
+            directIn.data = &directInPtr;
+            float* directOutPtr = node->directEffectOut.data();
+            IPLAudioBuffer directOut{};
+            directOut.numChannels = 1;
+            directOut.numSamples = static_cast<IPLint32>(frameCount);
+            directOut.data = &directOutPtr;
+            iplDirectEffectApply(node->subSources[0].directEffect,
+                                 &node->directParams,
+                                 &directIn, &directOut);
+            audioSanitizeBuffer(directOutPtr, frameCount);
+            monoOut = directOutPtr;
+        }
         float peakOut = 0.0f;
         for (ma_uint32 i = 0; i < frameCount; ++i) {
-            float s = binauralMono[i];
+            float s = monoOut[i];
             stereoOut[i * 2]     = s;
             stereoOut[i * 2 + 1] = s;
             float a = std::fabs(s);
@@ -1527,24 +1607,36 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
     }
 
     // Read all sub-workers' front buffers (previous frame's decoded reverb)
-    // and sum into the output. Each sub-worker double-buffers independently.
+    // and sum into the wet scratch buffers. The dedicated scratch path is
+    // necessary so the tape saturator (below) sees the FULL summed wet bus
+    // contribution rather than per-sub-worker pieces — saturating each piece
+    // independently would clip transients that, summed, would cancel.
     ConvolutionWorker *cw = node->convWorker;
-    float wetPeakL = 0.0f;  // diagnostic: peak |wet stereo| this block
+    float wetPeakPreSat  = 0.0f;  // diagnostic: peak |wet| before saturation
+    float wetPeakL = 0.0f;        // diagnostic: peak |wet stereo| after saturation
     float wetPeakR = 0.0f;
-    int   wetWorkersHit = 0;  // diagnostic: how many sub-workers actually contributed
+    int   wetWorkersHit = 0;      // diagnostic: how many sub-workers actually contributed
     if (cw) {
         ma_uint32 outSamples = std::min(static_cast<ma_uint32>(cw->frameSize), frameCount);
+
+        // Clear scratch — accumulating across sub-workers below.
+        if (node->wetScratchL.size() >= outSamples
+            && node->wetScratchR.size() >= outSamples) {
+            std::memset(node->wetScratchL.data(), 0, outSamples * sizeof(float));
+            std::memset(node->wetScratchR.data(), 0, outSamples * sizeof(float));
+        }
+
         for (auto &subPtr : cw->workers) {
             auto &sub = *subPtr;
             if (!sub.hasProducedOutput.load(std::memory_order_acquire)) continue;
             ++wetWorkersHit;
             int front = sub.frontIdx.load(std::memory_order_acquire);
 
-            // Additive mix with gain ramp.  Per-sample finite check on the
-            // wet buffers — a NaN slipped through by the convolution
-            // worker would otherwise infect stereoOut and then the EQ
-            // biquad state via `+=`.  Replace bad samples with 0 silently
-            // (the wet-workersHit log already surfaces wet bus health).
+            // Sum into scratch with gain ramp. Per-sample finite check on the
+            // wet buffers — a NaN slipped through by the convolution worker
+            // would otherwise infect the wet scratch and propagate downstream.
+            // Replace bad samples with 0 silently (the wet-workersHit log
+            // already surfaces wet bus health).
             bool wetSawBad = false;
             for (ma_uint32 i = 0; i < outSamples; ++i) {
                 if (node->reflGain < node->reflGainTarget)
@@ -1554,10 +1646,8 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 float rRaw = sub.stereoR[front][i] * g;
                 float l = std::isfinite(lRaw) ? lRaw : (wetSawBad = true, 0.0f);
                 float r = std::isfinite(rRaw) ? rRaw : (wetSawBad = true, 0.0f);
-                stereoOut[i * 2]     += l;
-                stereoOut[i * 2 + 1] += r;
-                wetPeakL = std::max(wetPeakL, std::fabs(l));
-                wetPeakR = std::max(wetPeakR, std::fabs(r));
+                node->wetScratchL[i] += l;
+                node->wetScratchR[i] += r;
             }
             if (wetSawBad) {
                 uint32_t n = node->nanCountWet.fetch_add(1, std::memory_order_relaxed);
@@ -1566,6 +1656,45 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
                               "non-finite samples (occurrence %u)\n", n + 1);
                 }
             }
+        }
+
+        // Apply optional tape/phonograph saturation to the summed wet bus.
+        // out = tanh(in * drive) / drive. Unity small-signal gain, peak
+        // capped at ±(1/drive). Above the soft knee, samples are smoothly
+        // compressed toward the ceiling — graceful for pathological hot
+        // probes (player inside a small metal container with ambient inside)
+        // and a stylistic aesthetic for the Thief tape/phonograph feel.
+        // When disabled or drive==1, runs nothing — keeps the path metric-
+        // equivalent to the original passthrough for benchmarking.
+        if (node->wetSaturationEnabled && node->wetSaturationDrive > 1.0f
+            && node->wetScratchL.size() >= outSamples) {
+            float d    = node->wetSaturationDrive;
+            float invD = 1.0f / d;
+            for (ma_uint32 i = 0; i < outSamples; ++i) {
+                float pre = std::max(std::fabs(node->wetScratchL[i]),
+                                     std::fabs(node->wetScratchR[i]));
+                if (pre > wetPeakPreSat) wetPeakPreSat = pre;
+                node->wetScratchL[i] = std::tanh(node->wetScratchL[i] * d) * invD;
+                node->wetScratchR[i] = std::tanh(node->wetScratchR[i] * d) * invD;
+            }
+        } else {
+            // Saturator disabled — diagnostic pre/post peaks are identical.
+            for (ma_uint32 i = 0; i < outSamples; ++i) {
+                float pre = std::max(std::fabs(node->wetScratchL[i]),
+                                     std::fabs(node->wetScratchR[i]));
+                if (pre > wetPeakPreSat) wetPeakPreSat = pre;
+            }
+        }
+
+        // Add saturated wet to the (already dry-loaded) stereoOut, and
+        // measure post-saturation peaks for the [WET_BUS] log.
+        for (ma_uint32 i = 0; i < outSamples; ++i) {
+            float l = node->wetScratchL[i];
+            float r = node->wetScratchR[i];
+            stereoOut[i * 2]     += l;
+            stereoOut[i * 2 + 1] += r;
+            wetPeakL = std::max(wetPeakL, std::fabs(l));
+            wetPeakR = std::max(wetPeakR, std::fabs(r));
         }
     }
     // Gain-staging stage 2: post-wet sum.  The delta from meterDryIn shows
@@ -1587,9 +1716,14 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             // at -120 dB so silent-bus frames don't print "-inf".
             float peakStereo = std::max(wetPeakL, wetPeakR);
             float peakDb = (peakStereo > 1e-6f) ? 20.0f * std::log10(peakStereo) : -120.0f;
-            AUDIO_LOG("[WET_BUS] peakL=%.4f peakR=%.4f peakDb=%.1f workersHit=%d/3 "
-                      "reflGain=%.2f listenerPos=(%.1f,%.1f,%.1f)\n",
-                      wetPeakL, wetPeakR, peakDb, wetWorkersHit, node->reflGain,
+            float preDb = (wetPeakPreSat > 1e-6f) ? 20.0f * std::log10(wetPeakPreSat) : -120.0f;
+            float satDeltaDb = preDb - peakDb;  // 0 = passthrough, >0 = saturator working
+            AUDIO_LOG("[WET_BUS] peakL=%.4f peakR=%.4f peakDb=%.1f preDb=%.1f satΔ=%.1fdB "
+                      "drive=%.2f workersHit=%d/3 reflGain=%.2f "
+                      "listenerPos=(%.1f,%.1f,%.1f)\n",
+                      wetPeakL, wetPeakR, peakDb, preDb, satDeltaDb,
+                      node->wetSaturationEnabled ? node->wetSaturationDrive : 1.0f,
+                      wetWorkersHit, node->reflGain,
                       node->listenerPosX, node->listenerPosY, node->listenerPosZ);
         }
     }
@@ -2805,6 +2939,10 @@ bool AudioService::initReflectionPipeline()
     if (mAmbisonicsChannels > 3) rmn.ambiCh3.resize(mReflectionFrameSize, 0.0f);
     rmn.decodedL.resize(mReflectionFrameSize, 0.0f);
     rmn.decodedR.resize(mReflectionFrameSize, 0.0f);
+    // Wet saturation scratch (full engine frame size — saturator runs after
+    // sub-worker output is upsampled to device rate via the reflection mix).
+    rmn.wetScratchL.resize(mFrameSize, 0.0f);
+    rmn.wetScratchR.resize(mFrameSize, 0.0f);
 
     // Initialize the miniaudio node
     ma_uint32 inputChannels[1] = {2};
@@ -2863,6 +3001,8 @@ bool AudioService::initReflectionPipeline()
     rmn.duckAmount        = mDSPChain->getDSPDuckAmount();
     rmn.duckAttackMs      = mDSPChain->getDSPDuckAttackMs();
     rmn.duckReleaseMs     = mDSPChain->getDSPDuckReleaseMs();
+    rmn.wetSaturationEnabled = mDSPChain->getDSPWetSaturationEnabled();
+    rmn.wetSaturationDrive   = mDSPChain->getDSPWetSaturationDrive();
 
     // Mixer config — global gains + reflection ramp time.
     // reflRampRate is the per-sample increment such that a full 0→1 ramp takes
@@ -3002,6 +3142,7 @@ void AudioService::destroyAcousticScene()
         iplSimulatorRelease(&mDirectSimulator);
         mDirectSimulator = nullptr;
     }
+
     if (mIplStaticMesh) {
         iplStaticMeshRelease(&mIplStaticMesh);
         mIplStaticMesh = nullptr;
@@ -3731,6 +3872,80 @@ void AudioService::loopStep(float deltaTime)
                     voice->dspNode.portalBlocking = 0.0f;
                 }
 
+                // ── Phase 1: multi-path sub-source slot fan-out ──
+                //
+                // Populate voice->dspNode.subSources[] from this frame's
+                // propagation paths so per-slot DSP state stays attached
+                // to the physical path it represents (keyed by
+                // SoundPathRecord::predecessorRoomID). The audio thread
+                // does NOT consume these slots yet — the legacy single-
+                // source pipeline above is still authoritative. The fan-
+                // out runs in parallel so we can verify slot-assignment
+                // stability against real BFS output before Phase 2 wires
+                // up the audio-thread consumer. See
+                // PLAN.MULTI_PATH_AMBISONICS.md for the rollout plan.
+                //
+                // The direction closure converts world-space
+                // listener→path delta into IPL listener-local frame —
+                // same right/up/ahead basis used by the legacy
+                // node->direction write above so Phase 2 can drop the
+                // legacy field without a frame shift.
+                auto computeDirForPath = [&](const SoundPathRecord& p) -> IPLVector3 {
+                    Vector3 toPath = p.virtualPosition - mListenerPos;
+                    float   dist   = glm::length(toPath);
+                    if (dist < 0.001f) {
+                        return IPLVector3{0.0f, 0.0f, -1.0f};  // ahead fallback
+                    }
+                    toPath /= dist;
+                    return IPLVector3{
+                        glm::dot(toPath, right),
+                        glm::dot(toPath, up),
+                        -glm::dot(toPath, ahead)
+                    };
+                };
+
+                const int maxN = static_cast<int>(std::min<uint32_t>(
+                    sMaxSubSources.load(std::memory_order_relaxed),
+                    static_cast<uint32_t>(kMaxSubSources)));
+
+                if (prop.reached && !prop.paths.empty()) {
+                    updateSubSourceSlots(voice->dspNode.subSources, prop,
+                                         maxN, computeDirForPath);
+                } else if (isCrossRoom) {
+                    // BFS-failed cross-room: legitimately silenced.
+                    // Drain any active slots.
+                    drainAllSubSourceSlots(voice->dspNode.subSources);
+                } else {
+                    // No propagation result available (player-emitted
+                    // voice, skipPortalRouting voice, portal routing
+                    // globally disabled, or voice without room data).
+                    // Treat as a direct-line same-room source so slot 0
+                    // stays active and the audio callback's per-slot
+                    // loop still produces output. Synthesize a single
+                    // SoundPathRecord at voice->worldPos with no door
+                    // blocking — matches the legacy
+                    // (!usePortalRouting) audio behaviour where the
+                    // dry path runs at full volume with direction =
+                    // (worldPos - listenerPos).
+                    SoundPropInfo synth;
+                    synth.reached = true;
+                    SoundPathRecord rec;
+                    rec.predecessorRoomID = -1;   // same-room sentinel
+                    rec.virtualPosition   = voice->worldPos;
+                    Vector3 vd            = voice->worldPos - mListenerPos;
+                    float   dist          = glm::length(vd);
+                    rec.realDistance      = dist;
+                    rec.effectiveDistance = dist;
+                    rec.doorBlocking      = 0.0f;
+                    rec.totalBlocking     = 0.0f;
+                    synth.paths.push_back(rec);
+                    synth.virtualPosition   = rec.virtualPosition;
+                    synth.realDistance      = rec.realDistance;
+                    synth.effectiveDistance = rec.effectiveDistance;
+                    updateSubSourceSlots(voice->dspNode.subSources, synth,
+                                         maxN, computeDirForPath);
+                }
+
                 // Architecture B: set the IPLSource position to
                 // `prop.virtualPosition`. This collapses to the right thing
                 // in every regime by construction:
@@ -3854,6 +4069,38 @@ void AudioService::loopStep(float deltaTime)
                 if (voice->reflectionSource) {
                     iplSourceSetInputs(voice->reflectionSource,
                         IPL_SIMULATIONFLAGS_REFLECTIONS, &inputs);
+                }
+
+                // Per-slot direct-source inputs (Phase 4 multi-path).
+                // Each ACTIVE slot's source is positioned at its path's
+                // virtualPosition — the doorway anchor for cross-room
+                // paths, sourcePos for same-room. All other simulation
+                // parameters (distance model, air absorption, occlusion
+                // type/radius/samples, transmission rays) are inherited
+                // from the voice-level `inputs` above so per-slot
+                // sampling uses the same configuration knobs. The flags
+                // word is copied verbatim — including playerEmitted's
+                // OCCL/TRANS skip — because those are per-voice
+                // characteristics that apply to every path.
+                //
+                // Draining slots intentionally retain their last-set
+                // inputs: their gain is ramping down, the audio thread
+                // skips reading their outputs, so refreshing inputs
+                // would be wasted work.
+                for (auto &slot : voice->dspNode.subSources) {
+                    if (slot.state != SubSourceState::Active) continue;
+                    if (!slot.directSource) continue;
+                    Vector3 slotWorldPos = voice->worldPos;
+                    for (const auto &p : prop.paths) {
+                        if (p.predecessorRoomID == slot.predecessorRoomID) {
+                            slotWorldPos = p.virtualPosition;
+                            break;
+                        }
+                    }
+                    IPLSimulationInputs slotInputs = inputs;
+                    slotInputs.source.origin = engineToIplPos(slotWorldPos);
+                    iplSourceSetInputs(slot.directSource,
+                        IPL_SIMULATIONFLAGS_DIRECT, &slotInputs);
                 }
             }
 
@@ -3998,6 +4245,51 @@ void AudioService::loopStep(float deltaTime)
                 }
                 voice->dspNode.directParams.transmissionType =
                     IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+
+                // ── Per-slot direct outputs (Phase 4 multi-path) ──
+                //
+                // Read each ACTIVE slot's iplSimulatorRunDirect outputs
+                // into slot.targetDirectParams so the audio thread's
+                // per-slot directEffect sees per-PATH distance
+                // attenuation, air absorption, occlusion, and
+                // transmission. The same per-class flag overrides as
+                // the voice-level block above apply to every slot —
+                // ambient and player-emitted voices keep
+                // distanceAttenuation = 1.0 (the ambient/player volume
+                // logic owns scaling on the dry path) and skip the
+                // occlusion / transmission flags that don't physically
+                // apply to them. Draining slots keep their last-set
+                // params; the audio thread will continue running
+                // direct effect on them with the previous frame's
+                // params while their currentGain ramps to 0.
+                for (auto &slot : voice->dspNode.subSources) {
+                    if (slot.state != SubSourceState::Active) continue;
+                    if (!slot.directSource) continue;
+                    IPLSimulationOutputs slotOutputs{};
+                    iplSourceGetOutputs(slot.directSource,
+                        IPL_SIMULATIONFLAGS_DIRECT, &slotOutputs);
+                    slot.targetDirectParams = slotOutputs.direct;
+                    if (voice->isAmbient) {
+                        slot.targetDirectParams.flags = static_cast<IPLDirectEffectFlags>(
+                            IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
+                            IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
+                            IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+                        slot.targetDirectParams.distanceAttenuation = 1.0f;
+                    } else if (voice->playerEmitted) {
+                        slot.targetDirectParams.flags = static_cast<IPLDirectEffectFlags>(
+                            IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
+                            IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
+                        slot.targetDirectParams.distanceAttenuation = 1.0f;
+                    } else {
+                        slot.targetDirectParams.flags = static_cast<IPLDirectEffectFlags>(
+                            IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
+                            IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
+                            IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
+                            IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+                    }
+                    slot.targetDirectParams.transmissionType =
+                        IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+                }
 
                 // Diagnostic: log Steam Audio direct params for door sounds
                 if (voice->skipPortalRouting) {
@@ -4459,6 +4751,72 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
         mReflectionSim->incrementActiveSources();
     }
 
+    // ── Per-slot direct sources (multi-path ambisonics, Phase 4) ──
+    //
+    // Each sub-source slot owns its own IPLSource in the direct
+    // simulator. Per-frame loopStep positions each ACTIVE slot's
+    // source at that slot's path virtualPosition and writes the
+    // appropriate simulation flags. iplSimulatorRunDirect then
+    // computes per-path distance attenuation, air absorption,
+    // occlusion, and transmission — read back into
+    // slot.targetDirectParams and consumed by the per-slot
+    // directEffect in the audio callback. The voice-level
+    // voice.directSource above stays for reflection-related
+    // bookkeeping (top-N ranking, reflection-send mono scaling) and
+    // is no longer the source of the dry path's directParams.
+    //
+    // Pre-allocate ALL kMaxSubSources slots up front so the audio
+    // thread never has to wait on Steam Audio source create/destroy
+    // (which is main-thread-only). Idle slots have stale inputs;
+    // iplSimulatorRunDirect still processes them but the outputs go
+    // unread until the slot becomes ACTIVE.
+    {
+        IPLSourceSettings srcSettings{};
+        srcSettings.flags = IPL_SIMULATIONFLAGS_DIRECT;
+        int builtSlotSources = 0;
+        for (auto &slot : voice.dspNode.subSources) {
+            IPLerror err = iplSourceCreate(mDirectSimulator, &srcSettings,
+                                           &slot.directSource);
+            if (err != IPL_STATUS_SUCCESS) {
+                LOG_ERROR("AudioService: per-slot iplSourceCreate failed "
+                          "(error %d) at slot %d", err, builtSlotSources);
+                // Roll back this slot's source and any previously-built
+                // slot sources, plus the voice-level direct + reflection
+                // handles, so the voice ends up with no Steam Audio state
+                // (matches the legacy create-all-or-create-none policy).
+                slot.directSource = nullptr;
+                for (auto &s2 : voice.dspNode.subSources) {
+                    if (s2.directSource) {
+                        iplSourceRemove(s2.directSource, mDirectSimulator);
+                        iplSourceRelease(&s2.directSource);
+                    }
+                }
+                iplSimulatorCommit(mDirectSimulator);
+                iplSourceRemove(voice.directSource, mDirectSimulator);
+                iplSourceRelease(&voice.directSource);
+                if (voice.reflectionSource) {
+                    if (mReflectionSim && mReflectionSim->isRunning()) {
+                        mReflectionSim->queueSourceRemove(voice.reflectionSource);
+                        voice.reflectionSource = nullptr;
+                    } else {
+                        if (mReflectionSim && mReflectionSim->simulator()) {
+                            iplSourceRemove(voice.reflectionSource,
+                                            mReflectionSim->simulator());
+                        }
+                        iplSourceRelease(&voice.reflectionSource);
+                    }
+                }
+                iplSimulatorCommit(mDirectSimulator);
+                return;
+            }
+            iplSourceAdd(slot.directSource, mDirectSimulator);
+            ++builtSlotSources;
+        }
+        // One commit after batching all kMaxSubSources adds, same as the
+        // voice-level direct source's single commit above.
+        iplSimulatorCommit(mDirectSimulator);
+    }
+
     // Per-class default directParams are set in initVoiceDSP — see the
     // long comment there for why it has to happen there (audio thread races
     // the gap between initVoiceDSP and createVoiceSource).
@@ -4481,14 +4839,28 @@ void AudioService::removeVoiceSource(ActiveVoice &voice)
     // Wait for the convolution worker to finish processing all current frames.
     if (mConvolutionPool) mConvolutionPool->waitForCompletion();
 
-    // ── Direct source ──
+    // ── Direct source + per-slot direct sources ──
     // No background thread iterates the direct simulator, so removal is
-    // always immediately safe.
-    if (voice.directSource && mDirectSimulator) {
-        iplSourceRemove(voice.directSource, mDirectSimulator);
+    // always immediately safe. Batch the per-slot removes with the
+    // voice-level remove and commit once at the end.
+    if (mDirectSimulator) {
+        if (voice.directSource) {
+            iplSourceRemove(voice.directSource, mDirectSimulator);
+        }
+        for (auto &slot : voice.dspNode.subSources) {
+            if (slot.directSource) {
+                iplSourceRemove(slot.directSource, mDirectSimulator);
+            }
+        }
         iplSimulatorCommit(mDirectSimulator);
-        iplSourceRelease(&voice.directSource);
-        // iplSourceRelease nulls the pointer.
+        if (voice.directSource) {
+            iplSourceRelease(&voice.directSource);
+        }
+        for (auto &slot : voice.dspNode.subSources) {
+            if (slot.directSource) {
+                iplSourceRelease(&slot.directSource);
+            }
+        }
     }
 
     // ── Reflection source ──
@@ -4542,6 +4914,8 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     dsp.directEffectOut.resize(dsp.frameSize, 0.0f);
     dsp.stereoL.resize(dsp.frameSize);
     dsp.stereoR.resize(dsp.frameSize);
+    dsp.subSlotStereoL.resize(dsp.frameSize, 0.0f);
+    dsp.subSlotStereoR.resize(dsp.frameSize, 0.0f);
     dsp.ambiScratch0.resize(mReflectionFrameSize, 0.0f);
     if (mAmbisonicsChannels > 1) dsp.ambiScratch1.resize(mReflectionFrameSize, 0.0f);
     if (mAmbisonicsChannels > 2) dsp.ambiScratch2.resize(mReflectionFrameSize, 0.0f);
@@ -4558,30 +4932,73 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     IPLDirectEffectSettings directSettings{};
     directSettings.numChannels = 1;  // mono processing
 
-    IPLerror err = iplDirectEffectCreate(mIplContext, &audioSettings,
-                                          &directSettings, &dsp.directEffect);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: iplDirectEffectCreate failed (error %d)", err);
-        return;
-    }
-
-    // Create IPLBinauralEffect (mono → stereo HRTF spatialization)
     IPLBinauralEffectSettings binauralSettings{};
     binauralSettings.hrtf = mIplHrtf;
 
-    err = iplBinauralEffectCreate(mIplContext, &audioSettings,
-                                   &binauralSettings, &dsp.binauralEffect);
+    // ── Per-slot direct + binaural effects (multi-path sub-source slots) ──
+    //
+    // Each of the kMaxSubSources slots owns its own pair of IPL effects so
+    // that the per-slot HRTF interpolation state and direct-effect smoothing
+    // state stay attached to the physical path mapped to that slot (keyed by
+    // SoundPathRecord::predecessorRoomID in the slot fan-out — see
+    // SubSourceSlots.h). All slot effects are pre-allocated up front so the
+    // audio thread never needs to create / destroy IPL handles. In Phase 2
+    // only one slot is ever ACTIVE at a time (sMaxSubSources clamped to 1),
+    // but allocating all of them keeps the lifecycle uniform and lets
+    // transitions briefly use a second slot for the draining tail without
+    // touching the IPL handle pool from the audio thread.
+    //
+    // On any per-slot creation failure we tear down the slots we've already
+    // built and bail out — matches the legacy single-effect "create or
+    // refuse the voice" policy.
+    IPLerror err = IPL_STATUS_SUCCESS;
+    int      builtSlots = 0;
+    for (int i = 0; i < kMaxSubSources; ++i) {
+        SubSource &slot = dsp.subSources[i];
+
+        err = iplDirectEffectCreate(mIplContext, &audioSettings,
+                                    &directSettings, &slot.directEffect);
+        if (err != IPL_STATUS_SUCCESS) {
+            LOG_ERROR("AudioService: iplDirectEffectCreate failed for slot %d "
+                      "(error %d)", i, err);
+            break;
+        }
+
+        err = iplBinauralEffectCreate(mIplContext, &audioSettings,
+                                      &binauralSettings, &slot.binauralEffect);
+        if (err != IPL_STATUS_SUCCESS) {
+            LOG_ERROR("AudioService: iplBinauralEffectCreate failed for slot %d "
+                      "(error %d)", i, err);
+            iplDirectEffectRelease(&slot.directEffect);
+            slot.directEffect = nullptr;
+            break;
+        }
+
+        ++builtSlots;
+    }
+
     if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: iplBinauralEffectCreate failed (error %d)", err);
-        iplDirectEffectRelease(&dsp.directEffect);
-        dsp.directEffect = nullptr;
+        // Roll back the slots we did build so the voice is left with no
+        // partially-initialised IPL effects (matches legacy: create-all-
+        // or-create-none).
+        for (int i = 0; i < builtSlots; ++i) {
+            SubSource &slot = dsp.subSources[i];
+            if (slot.binauralEffect) {
+                iplBinauralEffectRelease(&slot.binauralEffect);
+                slot.binauralEffect = nullptr;
+            }
+            if (slot.directEffect) {
+                iplDirectEffectRelease(&slot.directEffect);
+                slot.directEffect = nullptr;
+            }
+        }
         return;
     }
 
-    // Pre-warm the binaural effect's overlap-add history buffer with one
-    // frame of silence. Without this, the first real audio frame for a new
-    // voice gets attenuated by ~50% because overlap-add convolution against
-    // a zero-history buffer drops the leading samples.
+    // Pre-warm each slot's binaural effect's overlap-add history buffer with
+    // one frame of silence. Without this, the first real audio frame for a
+    // new voice gets attenuated by ~50% because overlap-add convolution
+    // against a zero-history buffer drops the leading samples.
     //
     // Audible only on short transients (footsteps, impacts, glass breaks)
     // where the leading edge IS the perceived sound. Long voices fade in
@@ -4590,7 +5007,7 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     // some voices and in subsequent frames for others — producing an A/B
     // alternation in perceived loudness unrelated to source position.
     //
-    // One-time ~50 µs cost at voice creation; negligible.
+    // One-time ~50 µs per slot at voice creation; negligible.
     {
         std::vector<float> warmMono(mFrameSize, 0.0f);
         std::vector<float> warmL(mFrameSize, 0.0f);
@@ -4613,7 +5030,12 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
         warmParams.spatialBlend = 1.0f;
         warmParams.hrtf = mIplHrtf;
         warmParams.peakDelays = nullptr;
-        iplBinauralEffectApply(dsp.binauralEffect, &warmParams, &warmIn, &warmOut);
+        for (auto &slot : dsp.subSources) {
+            if (slot.binauralEffect) {
+                iplBinauralEffectApply(slot.binauralEffect, &warmParams,
+                                       &warmIn, &warmOut);
+            }
+        }
     }
 
     // Create per-voice reflection convolution effect (optional — only if mixer exists).
@@ -4663,10 +5085,20 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
             iplReflectionEffectRelease(&dsp.reflectionEffect);
             dsp.reflectionEffect = nullptr;
         }
-        iplBinauralEffectRelease(&dsp.binauralEffect);
-        dsp.binauralEffect = nullptr;
-        iplDirectEffectRelease(&dsp.directEffect);
-        dsp.directEffect = nullptr;
+        // Roll back all per-slot IPL effects pre-allocated above. Same
+        // create-all-or-create-none policy that the per-slot loop itself
+        // enforces — if the node graph can't be wired up we leave the
+        // voice with no Steam Audio state at all.
+        for (auto &slot : dsp.subSources) {
+            if (slot.binauralEffect) {
+                iplBinauralEffectRelease(&slot.binauralEffect);
+                slot.binauralEffect = nullptr;
+            }
+            if (slot.directEffect) {
+                iplDirectEffectRelease(&slot.directEffect);
+                slot.directEffect = nullptr;
+            }
+        }
         return;
     }
     dsp.nodeInitialized = true;
@@ -5581,6 +6013,30 @@ std::vector<VoiceSpatialSnapshot> AudioService::getVoiceSpatialSnapshots() const
                        && (glm::length(snap.virtualPos - snap.sourcePos) > 0.1f);
         snap.isAmbient  = v->isAmbient;
         snap.chain      = v->cachedChain;
+        // Per-path snapshots — populated from the propagation result so
+        // the show_vpos overlay can render every active sub-source slot
+        // independently (the legacy single chain showed only paths[0]).
+        // For the multi-path renderer to look "right" visually, the
+        // overlay needs to draw what each slot is actually doing.
+        snap.paths.reserve(v->cachedProp.paths.size());
+        for (const auto &p : v->cachedProp.paths) {
+            VoiceSpatialSnapshot::PathSnapshot ps;
+            ps.endpoint = p.virtualPosition;
+            ps.chain    = p.chain;
+            ps.backend  = p.backend;
+            snap.paths.push_back(std::move(ps));
+        }
+        // Divergence overlay fields. Primary effective distance is the
+        // merged scalar from the cell-graph (or whichever backend the
+        // service has selected). Secondary is the side-by-side result
+        // when available — null in Phase 1 of the cell-graph migration.
+        snap.primaryEffectiveDistance = v->cachedProp.effectiveDistance;
+        if (v->cachedProp.secondaryBackendResult
+            && v->cachedProp.secondaryBackendResult->reached) {
+            snap.secondaryEffectiveDistance =
+                v->cachedProp.secondaryBackendResult->effectiveDistance;
+            snap.hasSecondaryBackend = true;
+        }
         out.push_back(std::move(snap));
     }
     return out;
@@ -6500,6 +6956,14 @@ void AudioService::setBlockingFactor(int room1, int room2, float factor)
 }
 
 //------------------------------------------------------
+void AudioService::setSoundPathLineOfSightFn(
+    std::function<bool(const Vector3 &a, const Vector3 &b)> fn)
+{
+    if (mSoundPropagation)
+        mSoundPropagation->setLineOfSightFn(std::move(fn));
+}
+
+//------------------------------------------------------
 float AudioService::getBlockingFactor(int room1, int room2) const
 {
     return mSoundPropagation ? mSoundPropagation->getBlockingFactor(room1, room2)
@@ -6679,6 +7143,7 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     return mProbeManager->bakeProbes(mIplScene, outputPath, params, progress);
 }
 
+
 //------------------------------------------------------
 bool AudioService::loadProbes(const std::string &probePath)
 {
@@ -6687,7 +7152,7 @@ bool AudioService::loadProbes(const std::string &probePath)
         return false;
     }
     return mProbeManager->loadProbes(probePath,
-                                     mReflectionSim ? mReflectionSim->simulator() : nullptr);
+        mReflectionSim ? mReflectionSim->simulator() : nullptr);
 }
 
 

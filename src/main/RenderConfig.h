@@ -86,7 +86,7 @@ struct RenderConfig {
     int   diffuseSamples      = 64;    // realtime diffuse scattering samples per bounce (16–256)
     int   bakeDiffuseSamples  = 128;   // offline bake diffuse samples per bounce (32–512)
 
-    // -- audio.propagation: portal/probe pathing + door blocking --
+    // -- audio.propagation: cell-graph sound routing + door blocking --
     bool  portalRouting       = true;   // portal-graph sound routing through doorways
     bool  probePathing        = true;   // baked probe diffraction (when available)
     float propagationMaxDist  = 200.0f; // max sound propagation distance through portal graph (world units)
@@ -144,6 +144,8 @@ struct RenderConfig {
     float dspDuckAmount      = 0.5f;    // ambient volume during ducking (0.1–1.0)
     float dspDuckAttackMs    = 50.0f;   // ducking attack time (10–500 ms)
     float dspDuckReleaseMs   = 500.0f;  // ducking release time (50–5000 ms)
+    bool  dspWetSaturation       = false;  // wet-bus tape/phonograph saturator (off = transparent)
+    float dspWetSaturationDrive  = 1.0f;   // saturation drive (1.0 = brick-wall only, 2-4 = tape, 5-10 = phonograph)
 
 
     // -- physics --
@@ -580,6 +582,12 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     cfg.dspDuckReleaseMs = dsp["ducking_release_ms"].as<float>();
                     if (cfg.dspDuckReleaseMs < 50.0f)   cfg.dspDuckReleaseMs = 50.0f;
                     if (cfg.dspDuckReleaseMs > 5000.0f) cfg.dspDuckReleaseMs = 5000.0f;
+                }
+                if (dsp["wet_saturation_enabled"]) cfg.dspWetSaturation = dsp["wet_saturation_enabled"].as<bool>();
+                if (dsp["wet_saturation_drive"]) {
+                    cfg.dspWetSaturationDrive = dsp["wet_saturation_drive"].as<float>();
+                    if (cfg.dspWetSaturationDrive < 1.0f)  cfg.dspWetSaturationDrive = 1.0f;
+                    if (cfg.dspWetSaturationDrive > 10.0f) cfg.dspWetSaturationDrive = 10.0f;
                 }
             }
         }

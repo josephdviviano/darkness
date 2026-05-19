@@ -28,6 +28,7 @@
 #include <memory>
 #include <functional>
 #include <unordered_map>
+#include <cstdint>
 
 #include "DarkCommon.h"
 #include "DarknessService.h"
@@ -46,6 +47,16 @@ namespace Darkness {
 /// of propagateSoundPath (e.g. the headless trace-path tool) don't need to
 /// pull in the audio header just to share a sensible default.
 constexpr float kSoundMaxDist = 200.0f;
+
+/// Tag identifying which propagation backend produced a SoundPathRecord.
+/// Today this is always RoomGraph (the ROOM_DB portal-graph BFS); a
+/// future Phase 2 may add SteamAudio for player audio. The divergence
+/// overlay (show_vpos) reads this tag plus the secondary-backend slot
+/// on SoundPropInfo to render side-by-side comparisons.
+enum class PropagationBackend : uint8_t {
+    RoomGraph  = 0,
+    SteamAudio = 1,
+};
 
 /// One reconstructed path's contribution to a multi-path propagation
 /// result. Each instance describes a topologically distinct route the
@@ -74,6 +85,12 @@ struct SoundPathRecord {
     /// Empty for same-room or clean-threaded paths (no bends needed).
     /// Diagnostic — used by the renderer's show_vpos overlay.
     std::vector<Vector3> chain;
+    /// Which propagation backend produced this record. The room-graph
+    /// BFS tags every record RoomGraph; the Phase-2 Steam Audio
+    /// integration would tag its records SteamAudio. show_vpos uses
+    /// this to choose render styling (solid for room-graph, dashed for
+    /// Steam Audio).
+    PropagationBackend backend = PropagationBackend::RoomGraph;
 };
 
 /// Result of sound propagation through the portal graph.
@@ -105,6 +122,17 @@ struct SoundPropInfo {
     /// N=1 / same-room / disconnected cases. Sorted by effectiveDistance
     /// ascending (paths[0] is the loudest).
     std::vector<SoundPathRecord> paths;
+    /// Optional secondary-backend result for the divergence overlay.
+    /// Null in Phase 1; populated in Phase 2 when Steam Audio's pathing
+    /// runs side-by-side with the cell graph for player audio. The
+    /// renderer's show_vpos overlay computes a per-voice
+    /// 20 * log10(secondary.effectiveDistance / effectiveDistance) and
+    /// colour-codes the label (green ≤3 dB, yellow 3-8 dB, red >8 dB
+    /// or audibility-decision flip).
+    ///
+    /// Implementation note: shared_ptr because SoundPropInfo otherwise
+    /// owns itself recursively. Empty pointer = no comparison available.
+    std::shared_ptr<SoundPropInfo> secondaryBackendResult;
 };
 
 /// One hop in the BFS path from source room to listener room. Populated
@@ -159,6 +187,15 @@ struct SoundPropParams {
     /// this, alternates contribute too little to the merge to matter.
     /// Default 10.0 matches the original engine's kMaxDistDiff.
     float maxPathDiff = 10.0f;
+    /// Max number of probe candidates per endpoint (source + listener)
+    /// for the multi-probe weighted-blend pass. Each query runs K_src ×
+    /// K_lst A* searches; raising this smooths cross-portal blending in
+    /// multi-doorway rooms (atria, cathedrals, hub spaces) at quadratic
+    /// CPU cost. Cost on the fixture: K=2 ≈ 2 ms/voice/frame, K=3 ≈
+    /// 4.5 ms, K=4 ≈ 8 ms. Clamped to [1, 4] inside propagateSoundPath.
+    /// Default 2 covers the binary cross-portal case (probes from the
+    /// listener's old room phase out and new-room probes phase in as
+    /// the listener crosses).
     /// Diagnostic accumulator. If non-null, the BFS path from source to
     /// listener is appended to this vector (one entry per visited room).
     /// For multi-path runs, this receives the primary (lowest-effDist)
@@ -171,6 +208,19 @@ struct SoundPropParams {
     /// (no bends needed). Cleared before write. Used by the renderer's
     /// `show_vpos` overlay to visualise the actual propagation chain.
     std::vector<Vector3> *chainOut = nullptr;
+    /// Optional BSP-aware line-of-sight callback. Returns true iff the
+    /// segment `a → b` is unobstructed by world geometry. When set,
+    /// propagateSoundPath validates every bend segment in the
+    /// reconstructed chain (source → bend_0 → … → bend_n → listener).
+    /// A blocked segment triggers a per-portal bend-refinement search
+    /// (sliding the bend across the portal polygon to find a clear
+    /// position); a path that can't be made clear is dropped entirely.
+    /// If all paths get dropped, propagateSoundPath returns
+    /// reached=false — the voice is muted rather than rendered with a
+    /// wall-piercing chain. Without this callback the BFS returns the
+    /// raw closest-point chain unvalidated (matches original-engine
+    /// behaviour).
+    std::function<bool(const Vector3 &a, const Vector3 &b)> losClear;
 };
 
 /** @brief Room service - service providing a Room database.
@@ -303,30 +353,12 @@ public:
                                       const SoundPropParams &params) const;
 
     /// "Is the segment from `a` to `b` unobstructed by BSP solid
-    /// geometry?" — used by `validatePortals` to test whether each
-    /// ROOM_DB portal actually corresponds to a physical opening.
-    /// Returns true when the segment is clear (no BSP hit). The
-    /// renderer (which owns the BSP data) supplies the implementation.
+    /// geometry?" — runtime callback supplied by the renderer (which
+    /// owns the BSP data). Used inside propagateSoundPath's chain
+    /// reconstruction to validate every bend segment is BSP-clear; a
+    /// blocked segment triggers a per-portal bend-refinement search
+    /// and, if no clear bend exists, the path is dropped.
     using LineOfSightFn = std::function<bool(const Vector3 &a, const Vector3 &b)>;
-
-    /// Mark every portal whose center is bracketed by solid BSP as
-    /// acoustically invalid. ROOM_DB encodes spatial adjacency between
-    /// convex rooms; not every adjacency is actually a hole in the
-    /// architecture. For each portal we cast a short segment across
-    /// its plane (1 unit each side of the center). If the BSP says
-    /// the segment hits solid, the portal is a phantom and is excluded
-    /// from BFS in propagateSoundPath.
-    ///
-    /// Idempotent — safe to call multiple times. Logs `[PORTAL_PHANTOM]`
-    /// to stderr once per phantom for offline diagnostic.
-    ///
-    /// Note: this is a band-aid for a structural data issue. The
-    /// proper fix (route through BSP-cell graph or Steam Audio's path
-    /// baker rather than ROOM_DB) is discussed in
-    /// HANDOFF.SOUND_PROPAGATION_REALISM.md.
-    ///
-    /// @return Number of phantoms found.
-    size_t validatePortals(const LineOfSightFn &losClear);
 
 protected:
     void setCurrentObjRoom(size_t idset, int objID, Room *room);
@@ -368,6 +400,8 @@ private:
 
     /// Sets of object id's
     ObjectIDSets mIDSets;
+
+
 };
 
 /// Factory for the RoomService objects

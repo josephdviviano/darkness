@@ -189,7 +189,11 @@ audio:
     bake_diffuse_samples: 128    # probe-bake scattering samples (32–512; requires re-bake)
 
   propagation:
-    # Portal-graph + door blocking for AI hearing and through-wall sounds.
+    # BSP-cell-graph + door blocking for AI hearing and through-wall sounds.
+    # Phase 1 of PLAN.CELL_GRAPH_PROPAGATION migrated player audio and AI
+    # hearing to a single shared propagation algorithm; the per-mission
+    # cell graph is built once at level load (~5ms on MISS6) and consulted
+    # via a lazy per-source Dijkstra tree cache at runtime.
     portal_routing: true         # route sound through portal graph (doorways)
     probe_pathing: true          # baked probe diffraction (when probes loaded)
     max_distance: 200.0          # max propagation distance (world units, 10–5000)
@@ -199,13 +203,27 @@ audio:
     # N-path BFS: keep multiple portal-graph routes when a sound can reach
     # the listener through more than one doorway. 1 = single shortest path
     # (single-source behavior); 2 = original Dark Engine (dual-predecessor
-    # scheme matching cBFRoomInfo + MergeSounds); 3+ = modernized.
+    # scheme matching cBFRoomInfo + MergeSounds); 3-4 = modernized. The
+    # multi-path-ambisonics renderer allocates up to 4 sub-source slots
+    # per voice (kMaxSubSources in VoicePool.h), so set this to 4 to
+    # keep every reachable doorway continuously active and avoid audible
+    # loudness jumps when the kept-paths set swaps across listener
+    # motion. Lower values pin the slot count and produce the legacy
+    # set-swap behavior on cue.
     max_paths: 2                 # simultaneous propagation paths per listener (1–4)
     # An alternate path is kept only if its effective distance is within
-    # this many world units of the primary. Matches the original engine's
-    # kMaxDistDiff. Larger values let weaker alternates contribute; smaller
-    # values converge on single-path behavior.
-    max_path_diff: 10.0          # alternate-path distance window (world units, 0–50)
+    # this many world units of the primary. Filter runs MID-BFS (at
+    # intermediate rooms, not only at the listener room), so a tight
+    # window kills alternates early and they never reach the listener.
+    # The legacy default (10) came from the original engine's
+    # kMaxDistDiff and was tuned for a single-source renderer where
+    # alternates only modulated a centroid. For the multi-path renderer
+    # use 50 (the clamp ceiling) so essentially every distinct-
+    # predecessor alternate within the propagation horizon stays
+    # active — the per-slot renderer needs the unblocked-doorway path
+    # available even when its effDist is notably longer than the
+    # primary's wall-edge anchor path.
+    max_path_diff: 50.0          # alternate-path distance window (world units, 0–50)
 
   spatialization:
     # Listener-side HRTF + distance attenuation curve.
@@ -272,3 +290,19 @@ audio:
     ducking_amount: 0.5                # ambient volume during ducking (0.1–1.0)
     ducking_attack_ms: 50.0            # ducking attack (10–500 ms)
     ducking_release_ms: 500.0          # ducking release (50–5000 ms)
+
+    # Wet-bus tape saturation — applies a soft tanh saturator to the SUMMED
+    # reverb bus (post reflGain ramp, before mixing with dry path). Models
+    # analog tape / phonograph compression — nearly transparent for quiet
+    # reverb, harmonic warmth at moderate levels, brick-wall ceiling at loud
+    # peaks. Doubles as a graceful clip-handler for pathological hot probes
+    # (e.g. a player inside a small metal container with an interior ambient)
+    # without polluting the dry signal.
+    #
+    # drive  feel                                       peak ceiling
+    #   1.0  soft brick-wall only, no audible color     ±1.0
+    #   2-3  audible tape-like warmth                   ±0.5..0.33
+    #   4-6  vintage phonograph character               ±0.25..0.16
+    #   8-10 heavy, almost lo-fi                        ±0.13..0.10
+    wet_saturation_enabled: false      # apply tanh saturation to wet bus
+    wet_saturation_drive: 1.0          # saturation drive (1.0–10.0)

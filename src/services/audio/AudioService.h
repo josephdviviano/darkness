@@ -147,7 +147,7 @@ struct ActiveVoice;
 struct VoiceSpatialSnapshot {
     std::string schemaName;       ///< schema that spawned this voice
     Vector3     sourcePos;        ///< actual world position
-    Vector3     virtualPos;       ///< prop.virtualPosition (where Steam Audio thinks the source is)
+    Vector3     virtualPos;       ///< prop.virtualPosition (centroid — where Steam Audio's *reflection-send* sees the source; with multi-path the per-slot direct path uses each path's own virtualPosition)
     bool        reached;          ///< prop.reached
     bool        usePortal;        ///< true when cross-room (virtualPos != sourcePos)
     bool        isAmbient;        ///< true for AMB_ENVIRONMENTAL ambients
@@ -158,6 +158,37 @@ struct VoiceSpatialSnapshot {
     /// the propagation algorithm thinks the sound's geometric path
     /// actually is.
     std::vector<Vector3> chain;
+    /// One entry per ACTIVE propagation path (Phase 4 multi-path:
+    /// the audio renderer mixes up to kMaxSubSources of these
+    /// simultaneously). `endpoint` is the path's last anchor (the
+    /// per-slot virtualPosition); `chain` is the bend chain that
+    /// got the sound from source to that endpoint (empty for
+    /// clean-threaded / same-room paths). The renderer overlays
+    /// these in distinct colors per slot so the visualisation
+    /// matches what's actually summed into the audio bus —
+    /// otherwise the user sees only the primary path's chain (the
+    /// single `chain` field above) and can't tell what the other
+    /// slots are doing.
+    struct PathSnapshot {
+        Vector3              endpoint;
+        std::vector<Vector3> chain;
+        /// Propagation backend that produced this path. show_vpos
+        /// renders cell-graph chains as solid lines and (when the
+        /// Phase-2 Steam Audio integration lands) Steam Audio chains
+        /// as dashed lines.
+        PropagationBackend   backend = PropagationBackend::RoomGraph;
+    };
+    std::vector<PathSnapshot> paths;
+    /// Per-voice divergence-overlay data. `primaryEffectiveDistance`
+    /// is the cell-graph result driving audio; `secondaryEffectiveDistance`
+    /// is the alternate backend's result when available (Phase 2). In
+    /// Phase 1 secondaryEffectiveDistance is always 0 and
+    /// hasSecondaryBackend is false — the overlay code reads these
+    /// fields and skips the dB-delta colour-coding when no comparison
+    /// is available.
+    float primaryEffectiveDistance   = 0.0f;
+    float secondaryEffectiveDistance = 0.0f;
+    bool  hasSecondaryBackend        = false;
 };
 
 /// Voice classification, set at startVoice time so the per-class default
@@ -342,6 +373,18 @@ public:
      *  @param materials  Per-texture material keywords (e.g., "stone", "metal", "wood") */
     void setTextureMaterials(std::vector<std::string> materials);
 
+    /** Install a BSP-aware line-of-sight callback for sound propagation.
+     *  The callback must return true iff the segment a→b is unobstructed
+     *  by world geometry. When provided, propagateSoundPath runs per-bend
+     *  BSP validation during chain reconstruction: a blocked segment
+     *  triggers a search for an alternate bend position on the same
+     *  portal polygon, and a path that can't be made clear is dropped.
+     *
+     *  Renderer-supplied (BSP data lives in the renderer). Call once
+     *  after the service is bootstrapped. */
+    void setSoundPathLineOfSightFn(
+        std::function<bool(const Vector3 &a, const Vector3 &b)> fn);
+
     /** Play a footstep sound for a specific material and speed.
      *  Selects a schema via env_tag matching: (Event Footstep) + (Material <keyword>).
      *  When in water, overrides material with water-specific schema tags.
@@ -482,6 +525,12 @@ public:
     void setDSPDuckAmount(float a)      { mDSPChain->setDSPDuckAmount(a); }
     void setDSPDuckAttackMs(float ms)   { mDSPChain->setDSPDuckAttackMs(ms); }
     void setDSPDuckReleaseMs(float ms)  { mDSPChain->setDSPDuckReleaseMs(ms); }
+
+    /// Configure the wet-bus tape saturation. See AudioDSPChain for semantics.
+    void setDSPWetSaturationEnabled(bool v) { mDSPChain->setDSPWetSaturationEnabled(v); }
+    bool getDSPWetSaturationEnabled() const { return mDSPChain->getDSPWetSaturationEnabled(); }
+    void setDSPWetSaturationDrive(float d)  { mDSPChain->setDSPWetSaturationDrive(d); }
+    float getDSPWetSaturationDrive() const  { return mDSPChain->getDSPWetSaturationDrive(); }
 
     // ── Mixer / global gains ──
     // Setters push live to the running mix node (if active) so console tweaks
@@ -1073,11 +1122,37 @@ private:
 
     // ── Propagation tuning (portal graph) ──
     float    mPropagationMaxDist  = 200.0f;
-    // N-path BFS knobs. Default 2 = original Dark Engine behavior (the
-    // dual-predecessor scheme + MergeSounds). Setters clamp to legal
-    // ranges; values plumbed through SoundPropParams in propagateSound.
-    uint32_t mPropMaxPaths        = 2;
-    float    mPropMaxPathDiff     = 10.0f;
+    // N-path BFS knobs. Default 4 = matches the multi-path-ambisonics
+    // sub-source slot cap (kMaxSubSources, see VoicePool.h), so the
+    // BFS delivers enough paths to keep every reachable doorway
+    // simultaneously active. Under the legacy default of 2 the slot
+    // assigner could only ever drive two slots ACTIVE, and the SET of
+    // kept paths swapped as the listener moved, producing audible
+    // loudness jumps when a third reachable path entered or left the
+    // set (the 40× distAtt swing diagnosed at the miss6 (68,56,-36)
+    // m06wingedM source when the listener traverses the three-rooms-
+    // side-by-side region). Setters clamp to legal ranges; values
+    // plumbed through SoundPropParams in propagateSound.
+    uint32_t mPropMaxPaths        = 4;
+    // maxPathDiff is the effective-distance window for "alternate path
+    // worth keeping": at each BFS-reached room, any path whose
+    // effDist is ≥ primary's effDist + maxPathDiff is PRUNED — and
+    // because the pruning runs mid-BFS (at intermediate rooms, not
+    // only at the listener room), alternates die early and never get
+    // a chance to reach the listener. The legacy default of 10 came
+    // from the original engine's kMaxDistDiff and was tuned for a
+    // single-source renderer where alternates only modulated a
+    // centroid by a few percent. For the multi-path renderer a tight
+    // window discards physically-meaningful alternates whose
+    // direction-of-arrival differs sharply from the primary —
+    // producing the "sound goes into the wall" perception when the
+    // primary path's anchor lands at a wall-edge but a longer
+    // alternate enters through a clearly-open doorway. 50 (the
+    // setter's clamp ceiling) keeps essentially every distinct-
+    // predecessor alternate within the propagation horizon active,
+    // so the per-slot renderer always has the unblocked doorway as
+    // one of its sub-sources.
+    float    mPropMaxPathDiff     = 50.0f;
 
     // ── Ambient tuning (P$AmbientHack) ──
     // Moved to AmbientSoundManager — the setAmb* facade methods on this

@@ -397,16 +397,25 @@ void AmbientSoundManager::updateAmbientVolumes()
                 // Fan out a sound-emission event so AI hearing /
                 // diagnostic listeners can observe the new ambient.
                 // soundType defaults to Untyped (0); ambients aren't
-                // typed in P$AmbientHack. gainDb uses the schema-
-                // authored volume (millibels — caller can interpret).
+                // typed in P$AmbientHack. gainDb combines the schema-
+                // authored volume with the AmbientHack per-object override
+                // (both centibels, additive) — matching the radius-curve
+                // gain in updateAmbientVolumes so the AI hearing system
+                // sees the same amplitude the player will actually hear.
                 if (justCreated && amb.handle != SOUND_HANDLE_INVALID) {
+                    int schemaVolCb = 0;
+                    if (mHost->mSchemaParser) {
+                        const SchemaEntry *sch =
+                            mHost->mSchemaParser->findSchema(amb.schemaName);
+                        if (sch) schemaVolCb = sch->playParams.volume;
+                    }
                     SoundEmissionEvent ev{};
                     ev.emitterObjID = amb.objID;
                     ev.position     = amb.position;
                     ev.schemaName   = amb.schemaName;
                     ev.soundType    = 0; // Untyped — ambients don't carry an AI sound type
                     ev.baseRange    = amb.radius;
-                    ev.gainDb       = static_cast<float>(amb.volume);
+                    ev.gainDb       = static_cast<float>(amb.volume + schemaVolCb);
                     mHost->publishSoundEmission(ev);
                 }
             }
@@ -461,7 +470,22 @@ void AmbientSoundManager::updateAmbientVolumes()
                 // bit-for-bit when inner == 0.
                 float falloffPct = AmbientVolumeModel::computeFalloff(
                     falloffDist, /*inner=*/0.0f, /*outer=*/amb.radius, curve);
-                float gainCb = static_cast<float>(amb.volume);
+                // Combine the schema's authored gain with the AmbientHack
+                // per-object override. Both are in centibels, so summing
+                // them is equivalent to multiplying their linear amplitudes.
+                // For the typical case where prop->volume == 0 (level
+                // designer didn't override the schema), this restores the
+                // schema-author's intended attenuation — without this the
+                // ambient plays at unity regardless of how quiet the schema
+                // says the sample should be (e.g. torch_flame authors
+                // -1700cB ≈ -17dB, which was being silently dropped).
+                int schemaVolCb = 0;
+                if (mHost->mSchemaParser) {
+                    const SchemaEntry *sch =
+                        mHost->mSchemaParser->findSchema(amb.schemaName);
+                    if (sch) schemaVolCb = sch->playParams.volume;
+                }
+                float gainCb = static_cast<float>(amb.volume + schemaVolCb);
                 // The original engine's m_ScaleDistance term works out to
                 // (5000+gain) once the global attenuation_factor cancels.
                 // We replicate that here so the per-radius dB drop is
@@ -592,14 +616,24 @@ void AmbientSoundManager::updateSpotAmbientVolumes()
                     continue;
                 }
                 // Interpret envVol as a millibel gain (matches
-                // AmbientSound::volume convention). Apply duck multiplier
-                // inline, same as updateAmbientVolumes.
+                // AmbientSound::volume convention). Combined with the
+                // schema's authored gain (same convention) — this restores
+                // schema attenuation that was silently dropped when only
+                // envVol drove the gain. See updateAmbientVolumes for the
+                // background. Apply duck multiplier inline, same as the
+                // AmbientHack path.
                 // Equivalent to the file-static schemaVolumeToLinear in
                 // AudioService.cpp — duplicated here to avoid widening
                 // the AudioService API surface. millibels → linear:
                 //   -1 (or 0+) = full volume, -10000 = silence,
                 //   otherwise  10^(volume/2000).
-                int volMb = static_cast<int>(envVol);
+                int schemaVolCb = 0;
+                if (mHost->mSchemaParser) {
+                    const SchemaEntry *sch =
+                        mHost->mSchemaParser->findSchema(se.schemaName);
+                    if (sch) schemaVolCb = sch->playParams.volume;
+                }
+                int volMb = static_cast<int>(envVol) + schemaVolCb;
                 float linearVol;
                 if (volMb >= 0)              linearVol = 1.0f;
                 else if (volMb <= -10000)    linearVol = 0.0f;
