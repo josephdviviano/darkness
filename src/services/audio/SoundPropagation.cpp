@@ -54,6 +54,11 @@ void SoundPropagation::setBlockingFactor(int room1, int room2, float factor)
         mBlockingFactors[key2] = factor;
     }
 
+    // RoomService::propagateSoundPath re-runs BFS on each call so we
+    // don't need to invalidate any per-source cache here — the next
+    // BFS query will read the updated blocking map directly via the
+    // params.doorBlocking callback.
+
     AUDIO_LOG("[DOOR_BLOCK] setBlockingFactor room(%d,%d) factor=%.3f mapSize=%zu\n",
               room1, room2, factor, mBlockingFactors.size());
 }
@@ -82,6 +87,9 @@ void SoundPropagation::setRoomTransmission(int32_t roomID, float transmission)
     } else {
         mRoomTransmission[roomID] = transmission;
     }
+
+    // LoudRoom multiplier is read on every BFS query via the
+    // params.loudRoom callback so no invalidation work is required.
 }
 
 //------------------------------------------------------
@@ -176,6 +184,13 @@ SoundPropInfo SoundPropagation::propagateSoundWithParams(
     params.loudRoom = [this](int32_t roomID) -> float {
         return getRoomTransmission(roomID);
     };
+    // Plumb the BSP-aware line-of-sight callback (installed at level
+    // load) into the per-bend chain validation. Without this, the BFS
+    // returns its best-effort closest-point chain even when it pierces
+    // walls; with this, blocked bends get refined or paths are dropped.
+    if (mLineOfSightFn && !params.losClear) {
+        params.losClear = mLineOfSightFn;
+    }
 
     return mRoomService->propagateSoundPath(
         sourcePos, listenerPos, sourceRoom, listenerRoom, params);

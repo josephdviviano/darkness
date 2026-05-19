@@ -101,13 +101,21 @@ ActiveVoice::~ActiveVoice()
         }
     }
 
-    if (dspNode.directEffect) {
-        iplDirectEffectRelease(&dspNode.directEffect);
-        dspNode.directEffect = nullptr;
-    }
-    if (dspNode.binauralEffect) {
-        iplBinauralEffectRelease(&dspNode.binauralEffect);
-        dspNode.binauralEffect = nullptr;
+    // Release per-slot Steam Audio effects. Each sub-source slot owns its
+    // own direct + binaural pair so the per-slot HRTF interp / direct-
+    // effect smoothing state stayed attached to the physical propagation
+    // path mapped to that slot during the voice's lifetime. The handles
+    // are pre-allocated in initVoiceDSP (all-or-nothing for the voice) so
+    // either every slot has them or none does.
+    for (auto &slot : dspNode.subSources) {
+        if (slot.binauralEffect) {
+            iplBinauralEffectRelease(&slot.binauralEffect);
+            slot.binauralEffect = nullptr;
+        }
+        if (slot.directEffect) {
+            iplDirectEffectRelease(&slot.directEffect);
+            slot.directEffect = nullptr;
+        }
     }
     if (dspNode.reflectionEffect) {
         iplReflectionEffectRelease(&dspNode.reflectionEffect);
@@ -121,9 +129,18 @@ ActiveVoice::~ActiveVoice()
         ma_decoder_uninit(&decoder);
     }
 
-    // Release IPLSources (removeVoiceSource should have been called, but be safe)
+    // Release IPLSources (removeVoiceSource should have been called, but be safe).
+    // Per-slot direct sources mirror the voice-level directSource handling —
+    // they're added to the same mDirectSimulator and removed in
+    // removeVoiceSource, but if that hook wasn't run we at least release
+    // the handles here so the IPL refcount drops to zero.
     if (directSource) {
         iplSourceRelease(&directSource);
+    }
+    for (auto &slot : dspNode.subSources) {
+        if (slot.directSource) {
+            iplSourceRelease(&slot.directSource);
+        }
     }
     if (reflectionSource) {
         iplSourceRelease(&reflectionSource);

@@ -76,6 +76,18 @@ public:
     void setDSPEQQ(float q);
     float getDSPEQQ() const { return mDSPEQQ; }
 
+    /// Configure the wet-bus tape saturation (analog character on reverb path).
+    /// Applies a soft tanh saturator to the summed wet bus before it's mixed
+    /// with the dry path. Designed to model analog tape / phonograph
+    /// compression — nearly transparent for quiet reverb, harmonic
+    /// coloration at moderate levels, brick-wall ceiling at loud peaks.
+    /// Doubles as a graceful clip-handler for pathological hot probes
+    /// (small enclosed rooms with ambients) without polluting the dry signal.
+    void setDSPWetSaturationEnabled(bool v) { mDSPWetSaturationEnabled = v; }
+    bool getDSPWetSaturationEnabled() const { return mDSPWetSaturationEnabled; }
+    void setDSPWetSaturationDrive(float d);
+    float getDSPWetSaturationDrive() const { return mDSPWetSaturationDrive; }
+
     /// Configure the ambient ducking system (disabled by default)
     void setDSPDuckingEnabled(bool v) { mDSPDuckingEnabled = v; }
     bool getDSPDuckingEnabled() const { return mDSPDuckingEnabled; }
@@ -149,6 +161,8 @@ private:
     float mDSPDuckAmount = 0.5f;
     float mDSPDuckAttackMs = 50.0f;
     float mDSPDuckReleaseMs = 500.0f;
+    bool  mDSPWetSaturationEnabled = false;
+    float mDSPWetSaturationDrive = 1.0f;
 
     // ── Mixer (global gains) ──
     float mMasterGain        = 1.0f;

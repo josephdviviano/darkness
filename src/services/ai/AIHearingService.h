@@ -91,6 +91,11 @@ private:
     AudioServicePtr     mAudioService;
     PropertyServicePtr  mPropertyService;
     ObjectServicePtr    mObjectService;
+    /// Optional handle into RoomService for cell-graph propagation
+    /// audibility queries (Phase 1 of PLAN.CELL_GRAPH_PROPAGATION). May
+    /// be null when running in a fixture without rooms; the service
+    /// falls back to Euclidean distance in that case.
+    RoomServicePtr      mRoomService;
 
     /// Global hearing tables, cached at bootstrap time. The tables don't
     /// change after the gamesys is loaded, so caching avoids the per-event
