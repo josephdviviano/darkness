@@ -60,6 +60,7 @@
 // SteamAudioDSPNode whose members are mostly IPL* types.
 #include <phonon.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -76,6 +77,95 @@ namespace Darkness {
 // hold a raw pointer); SteamAudioDSPNode references it.
 struct ConvolutionWorker;
 
+// ── Multi-path ambisonics sub-source state machine ──
+//
+// Each voice may render up to kMaxSubSources simultaneous directional
+// contributions through Steam Audio (see PLAN.MULTI_PATH_AMBISONICS.md
+// for the full rationale). A sub-source represents one physical
+// propagation path from source to listener: its own virtual position,
+// its own per-path Steam Audio direct/binaural chain, its own door LPF
+// memory. Slots are keyed by SoundPathRecord::predecessorRoomID so DSP
+// state stays attached to the path it represents even when BFS
+// reorders paths between frames.
+//
+// Phase 1: the per-slot IPL handles are NOT yet allocated; only the
+// storage + main-thread slot-assignment state is in place so the audio
+// thread continues to use the legacy single-effect pipeline. Allocation
+// + audio-thread consumption land in Phase 2.
+//
+//   FREE     — no path assigned, currentGain == 0, DSP idle.
+//   ACTIVE   — path assigned, normal processing.
+//   DRAINING — path was removed or evicted, targetGain ramping to 0;
+//              DSP keeps running so the LPF tail flushes naturally.
+//              Returns to FREE when currentGain decays below 1e-4.
+enum class SubSourceState : uint8_t {
+    Free     = 0,
+    Active   = 1,
+    Draining = 2,
+};
+
+struct SubSource {
+    // ── Per-slot IPL handles ──
+    //
+    // directSource is registered with AudioService::mDirectSimulator so
+    // iplSimulatorRunDirect computes per-path distance attenuation,
+    // air absorption, occlusion, and transmission from THIS path's
+    // virtual position (the doorway anchor for cross-room slots, the
+    // real source position for same-room). Each slot's directEffect
+    // then applies those per-slot params, so a path through an open
+    // doorway and a path through a closed door produce distinct
+    // amplitude / spectral coloration even when summed into the same
+    // voice. binauralEffect carries HRTF interpolation state per slot
+    // so the bilinear interp tracks each path's direction smoothly
+    // across callbacks. All three handles are pre-allocated in
+    // initVoiceDSP and released in ~ActiveVoice.
+    IPLSource             directSource       = nullptr;
+    IPLDirectEffect       directEffect       = nullptr;
+    IPLBinauralEffect     binauralEffect     = nullptr;
+
+    // Direct-sim outputs for this slot (written by the main thread
+    // after iplSimulatorRunDirect; read by the audio thread inside the
+    // per-slot signal chain). Default-initialised so a brand-new slot
+    // with a pending sim run still produces sensible passthrough audio
+    // (distAtten = 0, flags = 0) — silent until the first real sim
+    // result lands.
+    IPLDirectEffectParams targetDirectParams{};
+
+    // ── Slot identity & lifecycle (main thread writes, audio thread reads) ──
+    int32_t        predecessorRoomID = -1;          // -1 sentinel = FREE
+    SubSourceState state             = SubSourceState::Free;
+
+    // ── Audio-thread ramp targets (main thread writes once per frame) ──
+    // No normalization: Steam Audio's per-path inv-d² at the relocated
+    // IPLSource carries the absolute amplitude. targetGain is a unit-
+    // scale fade coefficient (1.0 = full output) used only to ramp the
+    // slot in/out across Free↔Active and Active↔Draining transitions.
+    //
+    // targetDoorBlocking is the raw [0,1] door blocking factor from the
+    // path — 0 = open, 1 = fully blocked. The audio thread converts this
+    // to a 1-pole-IIR LPF coefficient (alpha) per callback using the
+    // global open/blocked-Hz parameters + sample rate, then ramps
+    // currentDoorAlpha toward it per sample. Storing raw blocking here
+    // keeps the main-thread fan-out independent of the LPF formula.
+    IPLVector3 targetDir{1.0f, 0.0f, 0.0f};
+    float      targetGain         = 0.0f;
+    float      targetDoorBlocking = 0.0f;
+
+    // ── Audio-thread ramped state ──
+    IPLVector3 currentDir{1.0f, 0.0f, 0.0f};
+    float      currentGain      = 0.0f;
+    float      currentDoorAlpha = 1.0f;  // LPF α (1.0 = passthrough)
+
+    // ── Per-slot door LPF IIR memory (stereo, post-binaural) ──
+    float lpfStateL = 0.0f;
+    float lpfStateR = 0.0f;
+};
+
+// Compile-time cap on simultaneous directional contributions per voice.
+// SoundPropParams::maxPaths is already clamped to [1, 4]; keep these in
+// sync so we don't allocate slots the propagator can never populate.
+inline constexpr int kMaxSubSources = 4;
+
 /// Custom miniaudio node for Steam Audio DSP processing.
 /// Sits between a voice's ma_sound (mono) and the engine endpoint (stereo).
 /// Applies IPLDirectEffect (frequency-dependent attenuation) followed by
@@ -87,10 +177,6 @@ struct ConvolutionWorker;
 /// AudioService.cpp — only the layout moves.
 struct SteamAudioDSPNode {
     ma_node_base base;  // Must be first member (miniaudio node graph requirement)
-
-    // Steam Audio effects (per-voice, processed on audio thread)
-    IPLDirectEffect directEffect = nullptr;
-    IPLBinauralEffect binauralEffect = nullptr;
 
     // Shared reference (NOT owned — AudioService manages HRTF lifetime)
     IPLHRTF hrtf = nullptr;
@@ -181,15 +267,14 @@ struct SteamAudioDSPNode {
     float portalBlocking = 0.0f;         // 0.0=open, 1.0=fully blocked (for LPF)
     IPLVector3 portalDirection{1.0f, 0.0f, 0.0f}; // direction toward virtual source (portal center)
 
-    // Per-voice low-pass filter state for door blocking (audio thread only).
-    // Simulates high-frequency absorption through closed doors.
-    //   lpfStateL/R   — applied to the post-binaural stereo dry output.
-    //   reflSendLpfState — applied to the mono reflection-send before it is
-    //                      handed to the convolution worker, so the reverb
-    //                      tail from a source behind a closed door is also
-    //                      muffled (matches the dry-path coloration).
-    float lpfStateL = 0.0f;
-    float lpfStateR = 0.0f;
+    // Per-voice low-pass filter state for door blocking on the WET
+    // (reflection-send) bus. The dry bus has its own per-slot LPF
+    // state inside each SubSource (slot.lpfStateL/R) — driven by the
+    // path's individual door blocking, not the voice-level centroid —
+    // so the dry-path post-summation no longer carries a per-voice
+    // LPF. The wet bus stays single-source (centroid prop.doorBlocking
+    // via node->portalBlocking → currentDoorAlpha), since reflections
+    // are inherently directionally diffuse.
     float reflSendLpfState = 0.0f;
 
     // Per-voice ramp state for portal-routing scalars (audio thread only).
@@ -209,6 +294,17 @@ struct SteamAudioDSPNode {
     float currentPortalAtten = 1.0f;
     float currentDoorAlpha   = 1.0f;  // 1.0 = passthrough (open door)
 
+    // ── Multi-path ambisonics sub-source slots ──
+    // Storage for up to kMaxSubSources concurrent directional contributions
+    // per voice. Main thread writes slot assignments + ramp targets in
+    // loopStep (keyed by SoundPathRecord::predecessorRoomID for state
+    // stability across BFS reorders). The audio thread reads these to
+    // run per-path direct + binaural effects and sum coherently. In
+    // Phase 1 the IPL handles inside each SubSource are null and the
+    // audio thread continues to use the legacy binauralEffect /
+    // directEffect fields above; only the main-thread fan-out runs.
+    std::array<SubSource, kMaxSubSources> subSources{};
+
     // Reflection convolution effect (per-voice, feeds into shared mixer)
     IPLReflectionEffect reflectionEffect = nullptr;
 
@@ -227,8 +323,16 @@ struct SteamAudioDSPNode {
     // (allocated once at init, never reallocated — safe for audio thread)
     std::vector<float> monoScratch;   // mono channel (raw downmix, preserved for convolution)
     std::vector<float> directEffectOut; // mono output from iplDirectEffectApply (filtered)
-    std::vector<float> stereoL;       // left channel (binaural output)
-    std::vector<float> stereoR;       // right channel (binaural output)
+    std::vector<float> stereoL;       // left channel (accumulated binaural across sub-source slots)
+    std::vector<float> stereoR;       // right channel (accumulated binaural across sub-source slots)
+
+    // Per-slot binaural scratch (one slot's stereo output before it is
+    // gain-multiplied and summed into stereoL / stereoR). Reused across
+    // slots within the same audio callback since slot iteration is
+    // sequential and the previous slot's contribution has already been
+    // accumulated by the time the next slot runs.
+    std::vector<float> subSlotStereoL;
+    std::vector<float> subSlotStereoR;
 
     // Per-voice ambisonics scratch for reflection convolution output
     // (required by iplReflectionEffectApply even when using mixer accumulation)

@@ -22,6 +22,7 @@ add_executable(darkness_tests
     test_sim_systems.cpp
     test_probe_file.cpp
     test_object_illumination.cpp
+    test_subsource_slots.cpp
 )
 
 target_link_libraries(darkness_tests PRIVATE

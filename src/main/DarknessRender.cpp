@@ -1036,26 +1036,43 @@ static void renderDebugOverlay(
 
     // ── Per-voice virtual-position overlay (show_vpos) ──
     //
-    // For each active voice, draw two line segments:
-    //   • Cyan: actual source position → virtualPosition (the BFS
-    //     anchor / Steam Audio "where the sound comes from")
-    //   • Yellow: virtualPosition → listener
+    // For each active voice, draw one polyline per ACTIVE propagation
+    // path (the multi-path renderer mixes up to kMaxSubSources of
+    // these simultaneously). Each path's polyline runs
+    // source → bend₀ → bend₁ → … → endpoint → listener and is
+    // coloured by slot index so two paths through different doorways
+    // are visually distinct. Same-room / clean-threaded paths render
+    // as a single straight magenta segment from source to listener.
     //
-    // The yellow segment is what Steam Audio's distanceAttenuation is
-    // computed from. When yellow JUMPS frame-to-frame (chain change in
-    // BFS), Steam Audio's distance — and therefore the voice's volume
-    // — jumps audibly. Watching the lines makes this visible.
+    // What to look for:
+    //   • A single jumpy line per voice ⇒ propagation is keeping
+    //     only one path (legacy single-source behaviour or
+    //     maxPaths == 1).
+    //   • Multiple stable lines per voice ⇒ multi-path renderer is
+    //     working as intended; the listener perceives a spatial
+    //     spread across all the doorways the lines pass through.
+    //   • A line ending inside solid geometry ⇒ that path's
+    //     endpoint is mis-positioned. The audio for that slot will
+    //     point HRTF panning into the wall and may interact badly
+    //     with Steam Audio's per-slot volumetric occlusion sampling.
     if (state.showVPos) {
         Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
         if (audioSvc) {
             auto snapshots = audioSvc->getVoiceSpatialSnapshots();
-            // Worst-case vert count: each voice = source + N bends + listener
-            // segments = (N + 1) segments * 2 verts. Bound by 16 bends/voice.
+            // Worst-case vert count: each voice = Σ_paths (bends + 1) * 2.
+            // Bound paths by kMaxSubSources (4) and bends by ~16 per path.
             uint32_t needed = 0;
             for (const auto &s : snapshots) {
                 if (!s.reached) continue;
-                size_t bends = s.chain.size();
-                needed += static_cast<uint32_t>((bends + 1) * 2);
+                if (!s.paths.empty()) {
+                    for (const auto &p : s.paths) {
+                        needed += static_cast<uint32_t>((p.chain.size() + 1) * 2);
+                    }
+                } else {
+                    // Fallback to the legacy single-chain rendering if the
+                    // propagation result didn't expose per-path data.
+                    needed += static_cast<uint32_t>((s.chain.size() + 1) * 2);
+                }
             }
             if (needed > 0 &&
                 bgfx::getAvailTransientVertexBuffer(
@@ -1065,17 +1082,16 @@ static void renderDebugOverlay(
                     &tvb, needed, Darkness::PosColorVertex::layout);
                 auto *verts = reinterpret_cast<Darkness::PosColorVertex *>(tvb.data);
                 uint32_t n = 0;
-                // Colour the segments so the chain reads source-to-listener:
-                //   • Source → first bend: bright cyan (first leg)
-                //   • Between bends: light blue (intermediate legs)
-                //   • Last bend → listener: bright yellow (last leg, the
-                //     segment Steam Audio uses for distance)
-                // For clean-threaded paths (no bends), the whole line is
-                // a single magenta segment from source to listener.
-                constexpr uint32_t kCyan      = 0xFFFFFF00u;  // ABGR
-                constexpr uint32_t kLightBlue = 0xFFFFAA00u;
-                constexpr uint32_t kYellow    = 0xFF00FFFFu;
-                constexpr uint32_t kMagenta   = 0xFFFF00FFu;
+                // One distinct hue per sub-source slot (ABGR; bright +
+                // saturated for visibility on the dark engine palette).
+                // Slot 0 (primary path) keeps the legacy cyan/yellow so
+                // existing screenshots / muscle memory still read.
+                constexpr uint32_t kSlot0     = 0xFF00FFFFu;  // yellow
+                constexpr uint32_t kSlot1     = 0xFF00FF00u;  // green
+                constexpr uint32_t kSlot2     = 0xFFFF8800u;  // orange
+                constexpr uint32_t kSlot3     = 0xFFFF00FFu;  // magenta
+                constexpr uint32_t kSlotOther = 0xFFFFAA00u;  // light blue (overflow)
+                constexpr uint32_t kClean     = 0xFFFF00FFu;  // magenta (clean-threaded)
                 Vector3 lst(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
                 auto emit = [&](const Vector3 &p, uint32_t c) {
                     verts[n].x = p.x;
@@ -1084,23 +1100,92 @@ static void renderDebugOverlay(
                     verts[n].abgr = c;
                     ++n;
                 };
+                auto slotColor = [&](size_t slotIdx) -> uint32_t {
+                    switch (slotIdx) {
+                        case 0:  return kSlot0;
+                        case 1:  return kSlot1;
+                        case 2:  return kSlot2;
+                        case 3:  return kSlot3;
+                        default: return kSlotOther;
+                    }
+                };
+                // Divergence overlay (Phase 1 of PLAN.CELL_GRAPH_PROPAGATION):
+                //   • Cell-graph paths render as the existing solid polyline.
+                //   • Steam-Audio paths (Phase 2) will render as dashed
+                //     polyline segments — gap pattern hard-coded to skip
+                //     every other segment so the two overlays don't
+                //     overlap visually.
+                //   • Per-voice colour gradient (cell-graph slot0):
+                //       green ≤3 dB delta between backends
+                //       yellow 3..8 dB
+                //       red    >8 dB OR no secondary backend reached
+                //     With no secondary backend (Phase 1 default), the
+                //     overlay stays on the slot-default cyan/yellow palette.
+                constexpr uint32_t kDelta_Green  = 0xFF00FF00u;
+                constexpr uint32_t kDelta_Yellow = 0xFF00FFFFu;
+                constexpr uint32_t kDelta_Red    = 0xFF0000FFu;
+                auto emitChain = [&](const Vector3 &src, const Vector3 &lst,
+                                      const std::vector<Vector3> &chain,
+                                      uint32_t col, bool dashed) {
+                    if (chain.empty()) {
+                        emit(src, col);
+                        emit(lst, col);
+                        return;
+                    }
+                    // Dashed rendering: drop every other segment so the
+                    // line shows as a gapped stipple, distinguishing
+                    // Steam Audio's chain from the cell-graph chain
+                    // when both are drawn together.
+                    auto addSeg = [&](const Vector3 &a, const Vector3 &b,
+                                       size_t idx) {
+                        if (dashed && (idx & 1u)) return;
+                        emit(a, col);
+                        emit(b, col);
+                    };
+                    addSeg(src, chain.front(), 0);
+                    for (size_t i = 1; i < chain.size(); ++i) {
+                        addSeg(chain[i - 1], chain[i], i);
+                    }
+                    addSeg(chain.back(), lst, chain.size());
+                };
                 for (const auto &s : snapshots) {
                     if (!s.reached) continue;
-                    if (s.chain.empty()) {
-                        // Same-room or clean-threaded — single segment.
-                        emit(s.sourcePos, kMagenta);
-                        emit(lst,         kMagenta);
-                    } else {
-                        // Multi-bend chain. Connect:
-                        // source → chain[0] → chain[1] → … → chain[back] → listener
-                        emit(s.sourcePos, kCyan);
-                        emit(s.chain.front(), kCyan);
-                        for (size_t i = 1; i < s.chain.size(); ++i) {
-                            emit(s.chain[i - 1], kLightBlue);
-                            emit(s.chain[i],     kLightBlue);
+                    // Per-voice divergence colour: applied to the
+                    // primary chain's slot-0 entry so the operator can
+                    // tell at a glance whether the two backends agree.
+                    uint32_t primaryCol = kSlot0;
+                    if (s.hasSecondaryBackend
+                        && s.primaryEffectiveDistance > 0.0f
+                        && s.secondaryEffectiveDistance > 0.0f) {
+                        float deltaDb = 20.0f * std::log10(
+                            s.secondaryEffectiveDistance
+                                / s.primaryEffectiveDistance);
+                        float absDb = std::fabs(deltaDb);
+                        if (absDb <= 3.0f)      primaryCol = kDelta_Green;
+                        else if (absDb <= 8.0f) primaryCol = kDelta_Yellow;
+                        else                    primaryCol = kDelta_Red;
+                    }
+
+                    if (s.paths.empty()) {
+                        // Legacy single-chain rendering (fallback if
+                        // propagation didn't surface per-path data).
+                        if (s.chain.empty()) {
+                            emit(s.sourcePos, kClean);
+                            emit(lst,         kClean);
+                        } else {
+                            emitChain(s.sourcePos, lst, s.chain,
+                                       primaryCol, /*dashed=*/false);
                         }
-                        emit(s.chain.back(), kYellow);
-                        emit(lst,            kYellow);
+                        continue;
+                    }
+                    for (size_t pi = 0; pi < s.paths.size(); ++pi) {
+                        const auto &p = s.paths[pi];
+                        uint32_t col = (pi == 0) ? primaryCol : slotColor(pi);
+                        // Steam Audio backend (Phase 2) renders dashed;
+                        // cell-graph renders solid.
+                        bool dashed = (p.backend ==
+                            Darkness::PropagationBackend::SteamAudio);
+                        emitChain(s.sourcePos, lst, p.chain, col, dashed);
                     }
                 }
                 if (n > 0) {
@@ -3104,18 +3189,23 @@ int main(int argc, char *argv[]) {
             mission.cellToRoom = buildCellToRoomMap(
                 mission.wrData, roomSvc->getAllRooms());
 
-            // BSP-validate every ROOM_DB portal. Phantom portals
-            // (ROOM_DB adjacencies where the BSP says there's no
-            // physical opening) get marked invalid so sound
-            // propagation BFS won't route through them. See
-            // RoomService::validatePortals + NOTES.PROJECT.md "Sound
-            // Propagation Model" → phantom-portal section.
-            roomSvc->validatePortals(
-                [&mission](const Darkness::Vector3 &a,
-                           const Darkness::Vector3 &b) -> bool {
-                    Darkness::RayHit hit;
-                    return !Darkness::raycastWorld(mission.wrData, a, b, hit);
-                });
+            // BSP-aware line-of-sight callback. The room-graph BFS uses
+            // this at chain reconstruction time to validate each bend
+            // segment is unobstructed by world geometry; blocked
+            // segments trigger a per-portal bend-refinement search and,
+            // if no clear bend can be found, the path is rejected
+            // outright. The renderer owns the BSP data, so the
+            // callback lives here.
+            auto losClear = [&mission](const Darkness::Vector3 &a,
+                                       const Darkness::Vector3 &b) -> bool {
+                Darkness::RayHit hit;
+                return !Darkness::raycastWorld(mission.wrData, a, b, hit);
+            };
+
+            auto audioSvcForLos = GET_SERVICE(Darkness::AudioService);
+            if (audioSvcForLos) {
+                audioSvcForLos->setSoundPathLineOfSightFn(losClear);
+            }
         }
     }
 
@@ -3469,6 +3559,8 @@ int main(int argc, char *argv[]) {
         audioSvc->setDSPDuckAmount(cfg.dspDuckAmount);
         audioSvc->setDSPDuckAttackMs(cfg.dspDuckAttackMs);
         audioSvc->setDSPDuckReleaseMs(cfg.dspDuckReleaseMs);
+        audioSvc->setDSPWetSaturationEnabled(cfg.dspWetSaturation);
+        audioSvc->setDSPWetSaturationDrive(cfg.dspWetSaturationDrive);
 
         // Push audio-thread-side params (HRTF interp, door LPF, etc.) into
         // file-scope atomics so the next audio callback observes them.
@@ -4168,12 +4260,11 @@ int main(int argc, char *argv[]) {
             state.roomDebug.clear();
             state.roomDebug.reserve(rooms.size());
 
-            // Uniform light-pink color for valid portals. Phantom
-            // portals (rejected by validatePortals because the BSP
-            // says no opening) draw in red so the diagnostic value of
-            // show_portals doubles as a phantom-portal map.
+            // Uniform light-pink color for portals — the BFS treats
+            // every ROOM_DB portal as a potentially-traversable opening
+            // and runs per-bend BSP validation at chain reconstruction,
+            // so there's no "phantom portal" status to colour here.
             constexpr uint32_t kLightPink  = 0xFFB4B4FFu;  // ABGR
-            constexpr uint32_t kPhantomRed = 0xFF3030FFu;  // ABGR
 
             size_t totalRoomVerts = 0;
             size_t totalPortalVerts = 0;
@@ -4215,8 +4306,7 @@ int main(int argc, char *argv[]) {
                     if (!portal) continue;
                     auto poly = Darkness::computePortalPolygon(*portal);
                     if (poly.size() < 2) continue;
-                    uint32_t portalColor = portal->isAcousticallyValid()
-                                               ? kLightPink : kPhantomRed;
+                    uint32_t portalColor = kLightPink;
                     // Closed line strip: emit consecutive pairs, including
                     // the wrap-around segment from last to first vertex.
                     for (size_t v = 0; v < poly.size(); ++v) {

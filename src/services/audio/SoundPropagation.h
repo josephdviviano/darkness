@@ -41,7 +41,9 @@
 #include "room/RoomService.h"  // SoundPropInfo / SoundPropParams
 
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
+#include <utility>
 
 namespace Darkness {
 
@@ -128,8 +130,19 @@ public:
         return mRoomTransmission;
     }
 
+    /// Install a BSP-aware line-of-sight callback. When set,
+    /// propagateSoundWithParams plumbs it into RoomService's chain
+    /// reconstruction via SoundPropParams::losClear — per-bend segments
+    /// get raycast against the BSP, and bends that land on
+    /// wall-overlapping regions of a portal polygon get refined to
+    /// adjacent positions (or the path is dropped if no clear bend
+    /// exists).
+    using LineOfSightFn = std::function<bool(const Vector3 &a, const Vector3 &b)>;
+    void setLineOfSightFn(LineOfSightFn fn) { mLineOfSightFn = std::move(fn); }
+
 private:
     RoomService *mRoomService = nullptr;
+    LineOfSightFn mLineOfSightFn;
 
     /// Portal blocking factors for AI hearing propagation.
     /// Key: (room1 << 16) | room2 (bidirectional — stored both ways).

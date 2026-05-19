@@ -28,6 +28,8 @@
 #include "property/Property.h"
 #include "property/PropertyService.h"
 #include "property/TypedProperty.h"
+#include "room/Room.h"
+#include "room/RoomService.h"
 #include "logger.h"
 
 #include <algorithm>
@@ -67,6 +69,10 @@ void AIHearingService::bootstrapFinished()
     mAudioService    = GET_SERVICE(AudioService);
     mPropertyService = GET_SERVICE(PropertyService);
     mObjectService   = GET_SERVICE(ObjectService);
+    // RoomService is optional — when the mission has no ROOM_DB (or
+    // we're in a fixture that didn't build the cell graph), audibility
+    // falls back to Euclidean distance.
+    mRoomService     = GET_SERVICE(RoomService);
 
     if (!mAudioService || !mPropertyService || !mObjectService) {
         LOG_ERROR("AIHearingService: missing dependency (audio=%p prop=%p obj=%p)",
@@ -118,6 +124,7 @@ void AIHearingService::shutdown()
     mAudioService.reset();
     mPropertyService.reset();
     mObjectService.reset();
+    mRoomService.reset();
 }
 
 //------------------------------------------------------
@@ -241,7 +248,60 @@ void AIHearingService::onSoundEmitted(const SoundEmissionEvent &ev)
         if (isAbstract)
             continue;
 
-        float d = glm::distance(aiPos, ev.position);
+        // ── Room-graph audibility ──
+        //
+        // AI hearing consults the same room-portal-graph BFS the player
+        // audio uses (RoomService::propagateSoundPath). A two-stage
+        // filter keeps the per-emission cost bounded:
+        //   1. Cheap Euclidean pre-filter — if the straight-line
+        //      distance already exceeds the maximum possible audible
+        //      range (baseRange × dist_muls[max] × slack), skip the
+        //      propagateSoundPath call. Effective distance is ≥
+        //      Euclidean by triangle inequality, so an Euclidean miss
+        //      is a guaranteed BFS miss.
+        //   2. Otherwise call propagateSoundPath. The room graph is
+        //      ~200 rooms on Thief 2 missions so per-call BFS is fast.
+        //
+        // When the room database isn't loaded (fixture without rooms,
+        // map-load race, etc.) we fall back to Euclidean.
+        const float euclidean = glm::distance(aiPos, ev.position);
+        float d = euclidean;
+        if (mRoomService && mRoomService->isLoaded()) {
+            // Tightest possible upper bound on audible range: max
+            // distance multiplier across all hearing ratings × baseRange
+            // + the biggest type-tweak bonus. Anything past that is
+            // unhearable; skip propagateSoundPath.
+            float maxMul = 0.0f;
+            for (int i = 0; i < AI_HEARING_COUNT; ++i) {
+                if (mStats.dist_muls[i] > maxMul) maxMul = mStats.dist_muls[i];
+            }
+            float maxTypeBonus = 0.0f;
+            if (ev.soundType >= 0 && ev.soundType < AI_SOUND_TYPE_COUNT) {
+                int tb = mTweaks.defaultRanges[ev.soundType];
+                if (tb > 0) maxTypeBonus = static_cast<float>(tb);
+            }
+            const float maxAudible = ev.baseRange * maxMul + maxTypeBonus;
+            // 20% slack above the strict bound — keeps the gate robust
+            // to edge-case rating distributions where the per-AI rating
+            // is at the very top of the table.
+            const float prefilterBound = maxAudible * 1.2f;
+            if (euclidean <= prefilterBound && prefilterBound > 0.0f) {
+                Darkness::SoundPropParams params;
+                params.maxDist = prefilterBound;
+                Darkness::Room *srcRoom = mRoomService->roomFromPoint(ev.position);
+                Darkness::Room *aiRoom  = mRoomService->roomFromPoint(aiPos);
+                Darkness::SoundPropInfo info = mRoomService->propagateSoundPath(
+                    ev.position, aiPos, srcRoom, aiRoom, params);
+                if (info.reached) {
+                    d = info.effectiveDistance;
+                } else {
+                    // Unreachable through the cell graph (separate
+                    // component, beyond maxDist, etc.) — treat as
+                    // unhearable by setting d above the audible bound.
+                    d = prefilterBound + 1.0f;
+                }
+            }
+        }
 
         // The effective range computation lives in the pure helper so it
         // can be unit-tested without standing up the service stack.

@@ -8,14 +8,18 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <queue>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <zzip/zzip.h>
@@ -36,6 +40,7 @@
 #include "platform/PlatformService.h"
 #include "property/PropertyService.h"
 #include "room/Room.h"
+#include "room/RoomPortal.h"
 #include "room/RoomService.h"
 #include "sim/SimService.h"
 #include "physics/PhysicsService.h"
@@ -263,6 +268,12 @@ static void ensureLoaded() {
                 [](const Vector3 &from, const Vector3 &to, RayHit &hit) {
                     return raycastWorld(s_wrData, from, to, hit);
                 });
+
+            // Room-portal-graph propagation runs per-call BFS on the
+            // ROOM_DB graph — no build step needed beyond the room data
+            // already loaded by GameService::load. Tests that want
+            // BSP-aware chain validation install a losClear callback
+            // via SoundPropParams.
         } catch (const std::exception &e) {
             std::fprintf(stderr, "Test: failed to parse WR chunk: %s\n", e.what());
         }
@@ -2141,23 +2152,33 @@ TEST_CASE("propagateSoundPath: N=1 yields at most one path record",
     REQUIRE_WQ();
     if (!s_roomSvc->isLoaded()) SKIP("No rooms in fixture");
 
+    // Find any reachable room pair (the fixture has many disconnected
+    // probe-graph components, so picking the first two non-isolated
+    // rooms often picks two in different components).
     const auto &rooms = s_roomSvc->getAllRooms();
-    Room *A = nullptr, *B = nullptr;
+    std::vector<Room *> nonIsolated;
     for (const auto &r : rooms) {
-        if (!r || r->getPortalCount() == 0) continue;
-        if (!A) A = r.get();
-        else if (r.get() != A) { B = r.get(); break; }
+        if (r && r->getPortalCount() > 0 && r->getRoomID() > 0)
+            nonIsolated.push_back(r.get());
     }
-    if (!A || !B) SKIP("Need two non-isolated rooms");
+    if (nonIsolated.size() < 2) SKIP("Need 2+ non-isolated rooms");
 
     SoundPropParams params;
     params.maxDist    = kSoundMaxDist;
     params.maxPaths   = 1;
     params.maxPathDiff = 10.0f;
 
-    auto info = s_roomSvc->propagateSoundPath(
-        A->getCenter(), B->getCenter(), A, B, params);
-    if (!info.reached) SKIP("A/B not reachable in fixture");
+    SoundPropInfo info;
+    bool found = false;
+    for (size_t i = 0; i < nonIsolated.size() && !found; ++i) {
+        for (size_t j = i + 1; j < nonIsolated.size() && !found; ++j) {
+            info = s_roomSvc->propagateSoundPath(
+                nonIsolated[i]->getCenter(), nonIsolated[j]->getCenter(),
+                nonIsolated[i], nonIsolated[j], params);
+            if (info.reached) found = true;
+        }
+    }
+    if (!found) SKIP("No reachable pair in fixture");
     CHECK(info.paths.size() == 1);
 }
 
@@ -2169,7 +2190,8 @@ TEST_CASE("propagateSoundPath: N=2 paths.size() in [1, 2], effDist non-increasin
     const auto &rooms = s_roomSvc->getAllRooms();
     std::vector<Room *> nonIsolated;
     for (const auto &r : rooms) {
-        if (r && r->getPortalCount() > 0) nonIsolated.push_back(r.get());
+        if (r && r->getPortalCount() > 0 && r->getRoomID() > 0)
+            nonIsolated.push_back(r.get());
     }
     if (nonIsolated.size() < 2) SKIP("Need 2+ non-isolated rooms");
 
@@ -2196,8 +2218,13 @@ TEST_CASE("propagateSoundPath: N=2 paths.size() in [1, 2], effDist non-increasin
             CHECK(r2.reached);
             CHECK(r2.paths.size() >= 1);
             CHECK(r2.paths.size() <= 2);
-            // N=2 must find a primary at least as good as N=1.
-            CHECK(r2.effectiveDistance <= r1.effectiveDistance + 1e-3f);
+            // N=2 must find a primary path at least as good as N=1.
+            // Note we compare paths.front().effectiveDistance, not the
+            // merged scalar: the latter is a weighted blend across all
+            // N=2 paths and can be slightly larger than N=1's primary
+            // when an alternate route pulls the blend up.
+            CHECK(r2.paths.front().effectiveDistance
+                  <= r1.paths.front().effectiveDistance + 1e-3f);
             // Per-path records are sorted ascending by effectiveDistance.
             // The maxPathDiff window is enforced at BFS time on the
             // estimate, not on the final per-path anchor projection
@@ -2223,35 +2250,46 @@ TEST_CASE("propagateSoundPath: merged scalar fields equal paths[0] except vPos",
     if (!s_roomSvc->isLoaded()) SKIP("No rooms in fixture");
 
     const auto &rooms = s_roomSvc->getAllRooms();
-    Room *src = nullptr, *dst = nullptr;
+    std::vector<Room *> nonIsolated;
     for (const auto &r : rooms) {
-        if (!r || r->getPortalCount() == 0) continue;
-        if (!src) src = r.get();
-        else { dst = r.get(); break; }
+        if (r && r->getPortalCount() > 0 && r->getRoomID() > 0)
+            nonIsolated.push_back(r.get());
     }
-    if (!src || !dst) SKIP("Need two non-isolated rooms");
+    if (nonIsolated.size() < 2) SKIP("Need 2+ non-isolated rooms");
 
     SoundPropParams params;
     params.maxDist     = kSoundMaxDist;
     params.maxPaths    = 4;
     params.maxPathDiff = 10.0f;
 
-    auto info = s_roomSvc->propagateSoundPath(
-        src->getCenter(), dst->getCenter(), src, dst, params);
-    if (!info.reached) SKIP("src/dst not reachable in fixture");
+    SoundPropInfo info;
+    bool found = false;
+    for (size_t i = 0; i < nonIsolated.size() && !found; ++i) {
+        for (size_t j = i + 1; j < nonIsolated.size() && !found; ++j) {
+            info = s_roomSvc->propagateSoundPath(
+                nonIsolated[i]->getCenter(), nonIsolated[j]->getCenter(),
+                nonIsolated[i], nonIsolated[j], params);
+            if (info.reached) found = true;
+        }
+    }
+    if (!found) SKIP("No reachable pair in fixture");
 
     REQUIRE(!info.paths.empty());
     const SoundPathRecord &primary = info.paths.front();
-    CHECK(info.effectiveDistance == primary.effectiveDistance);
-    CHECK(info.realDistance      == primary.realDistance);
-    CHECK(info.totalBlocking     == primary.totalBlocking);
-    CHECK(info.doorBlocking      == primary.doorBlocking);
-    // virtualPosition is the inverse-d² weighted average — equals
-    // primary only when there's one path, otherwise blended.
+    // With multi-probe entry weighting the merged scalar fields are a
+    // spatial-weight × inverse-d² blend across paths, not strictly
+    // equal to the primary. They collapse to (approximately) primary
+    // when there's a single path; minor float rounding from the
+    // weighted-mean / (sum_of_weights) division keeps us from asserting
+    // bit-exact equality even in that case.
+    CHECK(info.effectiveDistance == Catch::Approx(primary.effectiveDistance));
+    CHECK(info.realDistance      == Catch::Approx(primary.realDistance));
+    CHECK(info.totalBlocking     == Catch::Approx(primary.totalBlocking));
+    CHECK(info.doorBlocking      == Catch::Approx(primary.doorBlocking));
     if (info.paths.size() == 1) {
-        CHECK(info.virtualPosition.x == primary.virtualPosition.x);
-        CHECK(info.virtualPosition.y == primary.virtualPosition.y);
-        CHECK(info.virtualPosition.z == primary.virtualPosition.z);
+        CHECK(info.virtualPosition.x == Catch::Approx(primary.virtualPosition.x));
+        CHECK(info.virtualPosition.y == Catch::Approx(primary.virtualPosition.y));
+        CHECK(info.virtualPosition.z == Catch::Approx(primary.virtualPosition.z));
     }
 }
 
@@ -2387,7 +2425,8 @@ TEST_CASE("propagateSoundPath: maxPathDiff=0 collapses to single primary",
     const auto &rooms = s_roomSvc->getAllRooms();
     std::vector<Room *> nonIsolated;
     for (const auto &r : rooms) {
-        if (r && r->getPortalCount() > 0) nonIsolated.push_back(r.get());
+        if (r && r->getPortalCount() > 0 && r->getRoomID() > 0)
+            nonIsolated.push_back(r.get());
     }
     if (nonIsolated.size() < 2) SKIP("Need 2+ non-isolated rooms");
 
@@ -2408,9 +2447,320 @@ TEST_CASE("propagateSoundPath: maxPathDiff=0 collapses to single primary",
             // could in theory survive, so we allow paths.size() ≥ 1 but
             // require sane scalar/primary correspondence.
             CHECK(info.paths.size() >= 1);
-            CHECK(info.effectiveDistance == info.paths.front().effectiveDistance);
+            // Multi-probe weighted-blend merge: merged ~= primary modulo
+            // float rounding (single-path case) or a small inv-d²-spatial
+            // blend (multi-path case). Hard equality no longer holds.
+            CHECK(info.effectiveDistance ==
+                  Catch::Approx(info.paths.front().effectiveDistance));
             ++tested;
         }
     }
     if (tested == 0) SKIP("No reachable pairs");
 }
+
+// ============================================================================
+// propagateSoundPath chain geometry — the room-BFS produces a sequence
+// of portal-polygon bend midpoints (computed by bidirectional closest-
+// point passes on each portal). The tests below validate the chain's
+// runtime contract:
+//   • same-room paths produce empty chains and Euclidean distances
+//   • cross-room chains contain at least one bend point lying on a real
+//     portal polygon
+//   • virtualPosition equals the last chain bend
+//   • realDistance equals the sum of polyline segment lengths
+//     (source → bend_0 → … → bend_n → listener)
+// ============================================================================
+
+// Helper: every bend point in the chain must lie on SOME portal polygon
+// in the loaded fixture. Bend midpoints are produced by projecting onto
+// the portal plane + clamping inside the polygon edges; they satisfy
+//   |plane.getDistance(anchor)| < ε  AND  every edge.getDistance ≤ ε
+// for at least one portal in the world.
+static bool anchorLiesOnSomePortalPolygon(const Vector3 &anchor,
+                                          const std::vector<std::unique_ptr<Room>> &rooms,
+                                          float planeTol = 1e-2f,
+                                          float edgeTol  = 1e-2f) {
+    for (const auto &r : rooms) {
+        if (!r) continue;
+        for (uint32_t pi = 0; pi < r->getPortalCount(); ++pi) {
+            RoomPortal *p = r->getPortal(pi);
+            if (!p) continue;
+            if (std::fabs(p->getPlane().getDistance(anchor)) > planeTol) continue;
+            bool insideAll = true;
+            for (uint32_t e = 0; e < p->getEdgeCount(); ++e) {
+                if (p->getEdgePlane(e).getDistance(anchor) > edgeTol) {
+                    insideAll = false;
+                    break;
+                }
+            }
+            if (insideAll) return true;
+        }
+    }
+    return false;
+}
+
+TEST_CASE("propagateSoundPath: same-room chain is empty and distance is Euclidean",
+          "[soundprop][chain]") {
+    REQUIRE_WQ();
+    if (!s_roomSvc->isLoaded()) SKIP("No rooms in fixture");
+
+    Room *anyRoom = nullptr;
+    for (const auto &r : s_roomSvc->getAllRooms()) {
+        if (r) { anyRoom = r.get(); break; }
+    }
+    REQUIRE(anyRoom != nullptr);
+
+    Vector3 a = anyRoom->getCenter();
+    Vector3 b = a + Vector3(2.0f, 1.0f, 0.5f);
+    SoundPropParams params;
+    params.maxDist     = kSoundMaxDist;
+    params.maxPaths    = 1;
+    params.maxPathDiff = 10.0f;
+
+    auto info = s_roomSvc->propagateSoundPath(a, b, anyRoom, anyRoom, params);
+    REQUIRE(info.reached);
+    REQUIRE(info.paths.size() == 1);
+    const auto &p = info.paths.front();
+    CHECK(p.chain.empty());
+    float euclidean = glm::length(b - a);
+    CHECK(p.realDistance == Catch::Approx(euclidean).margin(1e-3f));
+    CHECK(p.virtualPosition.x == Catch::Approx(a.x).margin(1e-3f));
+    CHECK(p.virtualPosition.y == Catch::Approx(a.y).margin(1e-3f));
+    CHECK(p.virtualPosition.z == Catch::Approx(a.z).margin(1e-3f));
+}
+
+TEST_CASE("propagateSoundPath: cross-room chain bends lie on portal polygons",
+          "[soundprop][chain]") {
+    REQUIRE_WQ();
+    if (!s_roomSvc->isLoaded()) SKIP("No rooms in fixture");
+
+    const auto &rooms = s_roomSvc->getAllRooms();
+    std::vector<Room *> nonIsolated;
+    for (const auto &r : rooms) {
+        if (r && r->getPortalCount() > 0 && r->getRoomID() > 0)
+            nonIsolated.push_back(r.get());
+    }
+    if (nonIsolated.size() < 2) SKIP("Need 2+ non-isolated rooms");
+
+    SoundPropParams params;
+    params.maxDist     = kSoundMaxDist;
+    params.maxPaths    = 1;
+    params.maxPathDiff = 10.0f;
+
+    int tested = 0;
+    int chainsWithAnchors = 0;
+    for (size_t i = 0; i < nonIsolated.size() && tested < 40; ++i) {
+        for (size_t j = i + 1; j < nonIsolated.size() && tested < 40; ++j) {
+            auto info = s_roomSvc->propagateSoundPath(
+                nonIsolated[i]->getCenter(), nonIsolated[j]->getCenter(),
+                nonIsolated[i], nonIsolated[j], params);
+            if (!info.reached) continue;
+            ++tested;
+            const auto &p = info.paths.front();
+            if (p.chain.empty()) continue;
+            ++chainsWithAnchors;
+            // Every bend midpoint should sit on some real portal polygon.
+            bool anyOnPolygon = false;
+            for (const auto &anchor : p.chain) {
+                if (anchorLiesOnSomePortalPolygon(anchor, rooms)) {
+                    anyOnPolygon = true; break;
+                }
+            }
+            INFO("Path between rooms " << nonIsolated[i]->getRoomID()
+                  << " and " << nonIsolated[j]->getRoomID()
+                  << " chain.size=" << p.chain.size());
+            CHECK(anyOnPolygon);
+        }
+    }
+    if (tested == 0) SKIP("No reachable pairs");
+    INFO("tested=" << tested << " chains-with-anchors=" << chainsWithAnchors);
+    CHECK(tested > 0);
+}
+
+TEST_CASE("propagateSoundPath: virtualPosition is the last chain bend (or source)",
+          "[soundprop][chain]") {
+    REQUIRE_WQ();
+    if (!s_roomSvc->isLoaded()) SKIP("No rooms in fixture");
+
+    const auto &rooms = s_roomSvc->getAllRooms();
+    std::vector<Room *> nonIsolated;
+    for (const auto &r : rooms) {
+        if (r && r->getPortalCount() > 0 && r->getRoomID() > 0)
+            nonIsolated.push_back(r.get());
+    }
+    if (nonIsolated.size() < 2) SKIP("Need 2+ non-isolated rooms");
+
+    SoundPropParams params;
+    params.maxDist     = kSoundMaxDist;
+    params.maxPaths    = 1;
+    params.maxPathDiff = 10.0f;
+
+    int tested = 0;
+    for (size_t i = 0; i < nonIsolated.size() && tested < 30; ++i) {
+        for (size_t j = i + 1; j < nonIsolated.size() && tested < 30; ++j) {
+            Vector3 src = nonIsolated[i]->getCenter();
+            auto info = s_roomSvc->propagateSoundPath(
+                src, nonIsolated[j]->getCenter(),
+                nonIsolated[i], nonIsolated[j], params);
+            if (!info.reached) continue;
+            const auto &p = info.paths.front();
+            if (p.chain.empty()) {
+                // Clean-threaded short-circuit: virtualPos = source.
+                CHECK(p.virtualPosition.x == Catch::Approx(src.x).margin(1e-3f));
+                CHECK(p.virtualPosition.y == Catch::Approx(src.y).margin(1e-3f));
+                CHECK(p.virtualPosition.z == Catch::Approx(src.z).margin(1e-3f));
+            } else {
+                const Vector3 &last = p.chain.back();
+                CHECK(p.virtualPosition.x == Catch::Approx(last.x).margin(1e-3f));
+                CHECK(p.virtualPosition.y == Catch::Approx(last.y).margin(1e-3f));
+                CHECK(p.virtualPosition.z == Catch::Approx(last.z).margin(1e-3f));
+            }
+            ++tested;
+        }
+    }
+    if (tested == 0) SKIP("No reachable pairs");
+}
+
+TEST_CASE("propagateSoundPath: realDistance equals reassembled chain segments",
+          "[soundprop][chain]") {
+    REQUIRE_WQ();
+    if (!s_roomSvc->isLoaded()) SKIP("No rooms in fixture");
+
+    const auto &rooms = s_roomSvc->getAllRooms();
+    std::vector<Room *> nonIsolated;
+    for (const auto &r : rooms) {
+        if (r && r->getPortalCount() > 0 && r->getRoomID() > 0)
+            nonIsolated.push_back(r.get());
+    }
+    if (nonIsolated.size() < 2) SKIP("Need 2+ non-isolated rooms");
+
+    SoundPropParams params;
+    params.maxDist     = kSoundMaxDist;
+    params.maxPaths    = 1;
+    params.maxPathDiff = 10.0f;
+
+    int tested = 0;
+    for (size_t i = 0; i < nonIsolated.size() && tested < 25; ++i) {
+        for (size_t j = i + 1; j < nonIsolated.size() && tested < 25; ++j) {
+            Vector3 src = nonIsolated[i]->getCenter();
+            Vector3 dst = nonIsolated[j]->getCenter();
+            auto info = s_roomSvc->propagateSoundPath(
+                src, dst, nonIsolated[i], nonIsolated[j], params);
+            if (!info.reached) continue;
+            const auto &p = info.paths.front();
+            // Reassemble: src → chain[0] → ... → chain[N-1] → listener.
+            float expected;
+            if (p.chain.empty()) {
+                expected = glm::length(dst - src);
+            } else {
+                expected = glm::length(p.chain.front() - src);
+                for (size_t k = 1; k < p.chain.size(); ++k) {
+                    expected += glm::length(p.chain[k] - p.chain[k - 1]);
+                }
+                expected += glm::length(dst - p.chain.back());
+            }
+            CHECK(p.realDistance == Catch::Approx(expected).margin(1e-2f));
+            // Triangle inequality.
+            CHECK(p.realDistance >= glm::length(dst - src) - 1e-3f);
+            ++tested;
+        }
+    }
+    if (tested == 0) SKIP("No reachable pairs");
+}
+
+TEST_CASE("propagateSoundPath: with losClear, no chain segment pierces BSP",
+          "[soundprop][losclear]") {
+    REQUIRE_WQ();
+    if (!s_roomSvc->isLoaded()) SKIP("No rooms in fixture");
+    if (s_wrData.numCells == 0) SKIP("No BSP geometry available");
+
+    auto losClear = [](const Vector3 &a, const Vector3 &b) -> bool {
+        RayHit hit;
+        return !raycastWorld(s_wrData, a, b, hit);
+    };
+
+    const auto &rooms = s_roomSvc->getAllRooms();
+    std::vector<Room *> nonIsolated;
+    for (const auto &r : rooms) {
+        if (r && r->getPortalCount() > 0 && r->getRoomID() > 0)
+            nonIsolated.push_back(r.get());
+    }
+    if (nonIsolated.size() < 2) SKIP("Need 2+ non-isolated rooms");
+
+    SoundPropParams params;
+    params.maxDist     = kSoundMaxDist;
+    params.maxPaths    = 2;
+    params.maxPathDiff = 10.0f;
+    params.losClear    = losClear;
+
+    int reachedPairs    = 0;
+    int totalSegments   = 0;
+    int blockedSegments = 0;
+    int totalPaths      = 0;
+    for (size_t i = 0; i < nonIsolated.size() && reachedPairs < 30; ++i) {
+        for (size_t j = i + 1; j < nonIsolated.size() && reachedPairs < 30; ++j) {
+            Vector3 src = nonIsolated[i]->getCenter();
+            Vector3 dst = nonIsolated[j]->getCenter();
+            auto info = s_roomSvc->propagateSoundPath(
+                src, dst, nonIsolated[i], nonIsolated[j], params);
+            if (!info.reached) continue;
+            ++reachedPairs;
+            for (const auto &p : info.paths) {
+                ++totalPaths;
+                Vector3 prev = src;
+                for (const auto &bend : p.chain) {
+                    ++totalSegments;
+                    if (!losClear(prev, bend)) ++blockedSegments;
+                    prev = bend;
+                }
+                ++totalSegments;
+                if (!losClear(prev, dst)) ++blockedSegments;
+            }
+        }
+    }
+    INFO("Tested " << reachedPairs << " reachable room pairs, "
+         << totalPaths << " paths, "
+         << totalSegments << " segments, "
+         << blockedSegments << " BSP-blocked");
+    if (reachedPairs == 0) SKIP("No reachable pairs in fixture");
+    // The BSP-aware bend refinement is supposed to either fix every
+    // bend or drop the path. After refinement zero chain segments
+    // should pierce BSP solid.
+    CHECK(blockedSegments == 0);
+}
+
+TEST_CASE("Portal-clip raycast equivalence on fixture portals",
+          "[soundprop][portal_clip]") {
+    REQUIRE_WQ();
+    if (!s_roomSvc->isLoaded()) SKIP("No rooms in fixture");
+
+    // Property check: a ray pointing through the portal's center along
+    // the portal-plane normal (from one side to the other) must pass
+    // the polygon-clip test. A ray pointing perpendicular to the normal
+    // (parallel to the plane) must fail.
+    int probed = 0;
+    for (const auto &r : s_roomSvc->getAllRooms()) {
+        if (!r) continue;
+        for (uint32_t pi = 0; pi < r->getPortalCount() && probed < 8; ++pi) {
+            RoomPortal *portal = r->getPortal(pi);
+            if (!portal) continue;
+            const Plane &pl = portal->getPlane();
+            Vector3 c = portal->getCenter();
+            // Through-center ray, both directions: must hit polygon.
+            CHECK(portal->raycast(c - pl.normal * 5.0f, pl.normal * 10.0f));
+            CHECK(portal->raycast(c + pl.normal * 5.0f, -pl.normal * 10.0f));
+            // Parallel ray: denominator near zero → false.
+            // Pick a tangent direction inside the plane.
+            Vector3 tangent;
+            if (std::fabs(pl.normal.x) < 0.9f)
+                tangent = glm::normalize(glm::cross(pl.normal, Vector3(1.0f, 0.0f, 0.0f)));
+            else
+                tangent = glm::normalize(glm::cross(pl.normal, Vector3(0.0f, 1.0f, 0.0f)));
+            CHECK_FALSE(portal->raycast(c - pl.normal * 5.0f, tangent * 10.0f));
+            ++probed;
+        }
+        if (probed >= 8) break;
+    }
+    if (probed == 0) SKIP("No usable portals in fixture");
+}
+

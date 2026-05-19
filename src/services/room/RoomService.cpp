@@ -23,11 +23,16 @@
 
 #include "RoomService.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <functional>
 #include <limits>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include "FileGroup.h"
 #include "DarknessException.h"
 #include "DarknessServiceManager.h"
@@ -399,81 +404,6 @@ void RoomService::setCurrentObjRoom(size_t idset, int objID, Room *room) {
 }
 
 //------------------------------------------------------
-size_t RoomService::validatePortals(const LineOfSightFn &losClear)
-{
-    if (!losClear) return 0;
-
-    // 1-unit offset each side of the portal plane. Walls in Thief 2
-    // are typically ≥ 2 units thick; this segment crosses the portal
-    // cleanly when there's a real opening and hits BSP when there isn't.
-    // Each portal is owned by one room and references its reciprocal in
-    // the neighbour room — we test once and mark BOTH copies invalid
-    // so BFS rejects regardless of which side it traverses from.
-    constexpr float kProbeOffset = 1.0f;
-
-    size_t phantoms = 0;
-    size_t tested   = 0;
-    for (const auto &rp : mRooms) {
-        if (!rp) continue;
-        Room *room = rp.get();
-        for (uint32_t i = 0; i < room->getPortalCount(); ++i) {
-            RoomPortal *p = room->getPortal(i);
-            if (!p) continue;
-            // Reset to TRUE before testing — re-validation must not
-            // permanently disable a portal that was once invalid.
-            p->setAcousticallyValid(true);
-        }
-    }
-
-    for (const auto &rp : mRooms) {
-        if (!rp) continue;
-        Room *room = rp.get();
-        int16_t roomID = room->getRoomID();
-        for (uint32_t i = 0; i < room->getPortalCount(); ++i) {
-            RoomPortal *p = room->getPortal(i);
-            if (!p || !p->getFarRoom()) continue;
-            // Skip portals already invalidated via their reciprocal
-            // (each portal is recorded in both rooms; we only need to
-            // test once).
-            if (!p->isAcousticallyValid()) continue;
-
-            const Plane  &pl = p->getPlane();
-            const Vector3 c  = p->getCenter();
-            Vector3 a = c - pl.normal * kProbeOffset;
-            Vector3 b = c + pl.normal * kProbeOffset;
-            bool clear = losClear(a, b);
-            ++tested;
-            if (!clear) {
-                p->setAcousticallyValid(false);
-                ++phantoms;
-                std::fprintf(stderr,
-                    "[PORTAL_PHANTOM] portal id=%d room=%d↔%d "
-                    "center=(%.1f,%.1f,%.1f) — BSP says solid; excluded from BFS\n",
-                    p->getPortalID(), roomID,
-                    p->getFarRoom()->getRoomID(),
-                    c.x, c.y, c.z);
-                // Invalidate the reciprocal portal in the neighbour
-                // room — both sides must agree to keep BFS consistent.
-                Room *far = p->getFarRoom();
-                int32_t destPortalID = p->getDestPortalID();
-                for (uint32_t j = 0; j < far->getPortalCount(); ++j) {
-                    RoomPortal *recip = far->getPortal(j);
-                    if (recip && recip->getPortalID() == destPortalID) {
-                        recip->setAcousticallyValid(false);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    std::fprintf(stderr,
-        "[PORTAL_VALIDATION] tested %zu portals, %zu phantoms rejected\n",
-        tested, phantoms);
-    return phantoms;
-}
-
-//------------------------------------------------------
 SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
                                                const Vector3 &listenerPos,
                                                Room *sourceRoom,
@@ -751,12 +681,6 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
             Room *nextRoom = portal->getFarRoom();
             if (!nextRoom) continue;
 
-            // Skip phantom portals — see RoomService::validatePortals.
-            // ROOM_DB records spatial adjacency between convex rooms;
-            // BSP encodes actual openings. Phantom portals (adjacency
-            // with no opening) get marked invalid at level load.
-            if (!portal->isAcousticallyValid()) continue;
-
             // Closest-point hop: resolve the lead point on this portal
             // polygon to the previous lead point. Cost is the Euclidean
             // distance between the two lead points. Replaces the legacy
@@ -949,10 +873,28 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
         Vector3 virtualPos;
         std::vector<Vector3> P;  // bend points (empty for clean-threaded)
 
-        if (portalChain.empty() || lineThreadsAllPolygons(portalChain)) {
+        // The "clean threading" short-circuit (direct Euclidean line)
+        // is accepted ONLY when either no portals lie on the chain OR
+        // the straight source→listener line passes through every portal
+        // polygon AND is BSP-clear. The BSP check guards against the
+        // case where a straight line technically threads every portal
+        // polygon but still pierces a wall sitting between the portals
+        // (rare in well-authored geometry, common around offset
+        // doorways).
+        bool tryDirect = portalChain.empty() || lineThreadsAllPolygons(portalChain);
+        if (tryDirect && params.losClear) {
+            tryDirect = params.losClear(sourcePos, listenerPos);
+        }
+
+        if (tryDirect) {
             // Clean threading — direct Euclidean distance, no bend
             pathDist   = glm::length(listenerPos - sourcePos);
             virtualPos = sourcePos;
+        } else if (portalChain.empty()) {
+            // Same-component but no portal chain to bend through (BFS
+            // shouldn't actually reach here cross-room, but defensively
+            // skip).
+            continue;
         } else {
             // Bidirectional closest-point pass + midpoint bend per
             // polygon. Each bend lies on the segment between the
@@ -980,6 +922,99 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
             for (size_t i = 0; i < N; ++i) {
                 P[i] = (F[i] + B[i]) * 0.5f;
             }
+
+            // ── BSP-aware bend refinement ──
+            //
+            // The bidirectional midpoint above is geometrically optimal
+            // but doesn't know about world geometry — a bend can land at
+            // a point on the portal polygon where the segment to its
+            // neighbour pierces a wall. When losClear is supplied, walk
+            // every bend and verify both incoming and outgoing segments
+            // are BSP-clear. For each blocked bend, try alternate
+            // candidate positions on the portal polygon (forward
+            // projection, backward projection, polygon center, the
+            // projection of the straight prev→next line onto the
+            // polygon). If any candidate produces clear segments on
+            // both sides, swap it in. Iterate up to a few passes
+            // because refining bend i may invalidate bend i-1 or i+1.
+            //
+            // A path that can't be refined to BSP-clear gets dropped
+            // entirely — better to mute the voice than render audio
+            // along a wall-piercing line.
+            bool pathBSPClear = true;
+            if (params.losClear) {
+                auto refineBend = [&](size_t i,
+                                      const Vector3 &prevPt,
+                                      const Vector3 &nextPt,
+                                      Vector3 &outPt) -> bool {
+                    RoomPortal *portal = portalChain[i].portal;
+                    // Candidate positions in preference order. Start
+                    // with the current midpoint (no-op if already
+                    // clear), then alternate projections, then portal
+                    // center, then the projection of the straight
+                    // prev→next line onto this polygon.
+                    Vector3 candidates[5];
+                    candidates[0] = P[i];
+                    candidates[1] = F[i];
+                    candidates[2] = B[i];
+                    candidates[3] = portal->getCenter();
+                    {
+                        const Plane &plane = portal->getPlane();
+                        Vector3 dir = nextPt - prevPt;
+                        float denom = glm::dot(plane.normal, dir);
+                        Vector3 projected;
+                        if (std::fabs(denom) > 1e-7f) {
+                            float t = -plane.getDistance(prevPt) / denom;
+                            projected = prevPt + dir * t;
+                            projected = portal->closestPointOnPolygon(projected);
+                        } else {
+                            projected = portal->getCenter();
+                        }
+                        candidates[4] = projected;
+                    }
+                    for (const Vector3 &c : candidates) {
+                        if (params.losClear(prevPt, c)
+                            && params.losClear(c, nextPt)) {
+                            outPt = c;
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+
+                for (int pass = 0; pass < 3; ++pass) {
+                    bool changed  = false;
+                    bool allClear = true;
+                    for (size_t i = 0; i < N; ++i) {
+                        Vector3 prev = (i == 0) ? sourcePos : P[i - 1];
+                        Vector3 next = (i + 1 < N) ? P[i + 1] : listenerPos;
+                        if (params.losClear(prev, P[i])
+                            && params.losClear(P[i], next)) continue;
+                        Vector3 refined;
+                        if (refineBend(i, prev, next, refined)) {
+                            if (glm::length(refined - P[i]) > 1e-4f) {
+                                P[i] = refined;
+                                changed = true;
+                            }
+                        } else {
+                            allClear = false;
+                        }
+                    }
+                    if (allClear) break;
+                    if (!changed) break;
+                }
+                // Final verification — drop the path if any segment
+                // remains BSP-blocked after refinement.
+                for (size_t i = 0; i < N && pathBSPClear; ++i) {
+                    Vector3 prev = (i == 0) ? sourcePos : P[i - 1];
+                    Vector3 next = (i + 1 < N) ? P[i + 1] : listenerPos;
+                    if (!params.losClear(prev, P[i])
+                        || !params.losClear(P[i], next)) {
+                        pathBSPClear = false;
+                    }
+                }
+            }
+            if (!pathBSPClear) continue;
 
             pathDist = glm::length(P.front() - sourcePos);
             for (size_t i = 1; i < N; ++i) {

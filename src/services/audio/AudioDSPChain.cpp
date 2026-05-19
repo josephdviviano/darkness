@@ -45,6 +45,14 @@ void AudioDSPChain::setDSPLimiterKnee(float k)
     mDSPLimiterKnee = std::max(0.5f, std::min(k, 0.95f));
 }
 
+void AudioDSPChain::setDSPWetSaturationDrive(float d)
+{
+    // Drive range: 1.0 = effectively transparent soft brick-wall at ±1.0;
+    // 2-4 = audible tape warmth; 5-10 = heavy phonograph character.
+    // Above 10 the effect is so colored it stops sounding like reverb at all.
+    mDSPWetSaturationDrive = std::max(1.0f, std::min(d, 10.0f));
+}
+
 void AudioDSPChain::setDSPCompThreshold(float t)
 {
     mDSPCompThreshold = std::max(-30.0f, std::min(t, 0.0f));
