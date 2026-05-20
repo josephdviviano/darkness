@@ -31,14 +31,19 @@
 /// histogram resolves that by tracking the full latency distribution and
 /// computing p50/p95/p99 at log time.
 ///
-/// Layout: log-spaced bins, base 1.5, anchored at 10 µs. With 28 bins
-/// that covers ~10 µs to ~140 s — plenty for any audio-pipeline stage
-/// short of "the worker is hung." Bin counts are atomic so multiple
-/// writers (e.g. several sub-worker threads sharing one histogram) are
-/// safe; the reader serialises at the call site (main-thread periodic
-/// dump). Snapshot uses atomic exchange-to-zero per-bucket so each dump
-/// window is independent. A racy producer write between exchanges can
-/// drift the percentile by at most one bin — acceptable for diagnostics.
+/// Layout: log-spaced bins, base 1.3, anchored at 10 µs. With 50 bins
+/// that covers ~10 µs to ~13 s — plenty for any audio-pipeline stage
+/// short of "the worker is hung." The 1.3 base (vs the earlier 1.5)
+/// gives ~30% per-bin resolution, fine enough to distinguish e.g. a
+/// 100 ms sim cycle from a 130 ms one (different bins). The earlier
+/// base-1.5 collapsed most of the 100-500 ms range into 3 bins
+/// (137 / 206 / 309 ms centers), making sim-cycle distribution
+/// unreadable. Bin counts are atomic so multiple writers (e.g. several
+/// sub-worker threads sharing one histogram) are safe; the reader
+/// serialises at the call site (main-thread periodic dump). Snapshot
+/// uses atomic exchange-to-zero per-bucket so each dump window is
+/// independent. A racy producer write between exchanges can drift the
+/// percentile by at most one bin — acceptable for diagnostics.
 
 #include <array>
 #include <atomic>
@@ -50,8 +55,8 @@ namespace Darkness {
 
 class LatencyHistogram {
 public:
-    static constexpr int    kNumBins = 28;
-    static constexpr double kBase    = 1.5;
+    static constexpr int    kNumBins = 50;
+    static constexpr double kBase    = 1.3;
     static constexpr double kAnchorMs = 0.01;  // 10 µs
 
     LatencyHistogram() {
