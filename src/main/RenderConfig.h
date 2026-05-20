@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <yaml-cpp/yaml.h>
 
@@ -77,6 +78,15 @@ struct RenderConfig {
     // reverb A/B variance is driven by probe sparsity.
     float audioProbeSpacingFt = 5.0f;  // grid spacing in feet (1.0–20.0; requires re-bake to take effect)
     float audioProbeHeightFt  = 5.0f;  // probe height above floor in feet (0.5–20.0)
+    // Extra elevation tier (in feet, above each floor probe) to densify
+    // pathing coverage for wall-mounted torches and ceiling lamps. Default
+    // {10.0} covers wall-height emitters. Empty = floor-only (legacy).
+    std::vector<float> audioProbeElevations = { 10.0f };
+    // Add a 4-probe ring (±0.5 m on the portal plane) around each
+    // RoomService portal centroid. Densifies the pathing visibility
+    // graph at doorways so cross-room chains route through the doorway
+    // rather than wrapping around through grid probes on either side.
+    bool audioProbePortalRings = true;
 
     // -- audio.occlusion: occlusion + material scaling --
     float occlusionRadius     = 5.0f;  // volumetric occlusion sphere radius (world units = feet, 0.3–30)
@@ -101,6 +111,11 @@ struct RenderConfig {
     // many world units of the primary. Matches the original engine's
     // kMaxDistDiff = 10. Clamped to [0, 50].
     float    propMaxPathDiff  = 10.0f;
+    // Multiplier on the scalar gain produced by Steam Audio's baked
+    // pathing eqCoeffs. 1.0 = identity. Use > 1 to make through-portal
+    // sound louder than the bake implies, without re-baking. Does NOT
+    // affect the LPF blocking factor. Clamped to [0.1, 10.0].
+    float    pathingGainScale = 1.0f;
 
     // -- audio.spatialization: HRTF + distance model --
     float hrtfVolume          = 1.0f;   // HRTF output gain (1.0 = raw HRTF, lower = quieter)
@@ -369,6 +384,18 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.audioProbeHeightFt < 0.5f)  cfg.audioProbeHeightFt = 0.5f;
                     if (cfg.audioProbeHeightFt > 20.0f) cfg.audioProbeHeightFt = 20.0f;
                 }
+                if (prb["elevations"]) {
+                    cfg.audioProbeElevations.clear();
+                    for (const auto &el : prb["elevations"]) {
+                        float v = el.as<float>();
+                        if (v > 0.0f && v < 200.0f) {
+                            cfg.audioProbeElevations.push_back(v);
+                        }
+                    }
+                }
+                if (prb["portal_rings"]) {
+                    cfg.audioProbePortalRings = prb["portal_rings"].as<bool>();
+                }
             }
 
             // -- audio.occlusion --
@@ -442,6 +469,11 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     cfg.propMaxPathDiff = prop["max_path_diff"].as<float>();
                     if (cfg.propMaxPathDiff < 0.0f)  cfg.propMaxPathDiff = 0.0f;
                     if (cfg.propMaxPathDiff > 50.0f) cfg.propMaxPathDiff = 50.0f;
+                }
+                if (prop["pathing_gain_scale"]) {
+                    cfg.pathingGainScale = prop["pathing_gain_scale"].as<float>();
+                    if (cfg.pathingGainScale < 0.1f)  cfg.pathingGainScale = 0.1f;
+                    if (cfg.pathingGainScale > 10.0f) cfg.pathingGainScale = 10.0f;
                 }
             }
 

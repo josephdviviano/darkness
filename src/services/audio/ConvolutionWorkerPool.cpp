@@ -128,8 +128,8 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
     cw.ambiOrder = cfg.ambiOrder;
     cw.numWorkers = cfg.numWorkers;
 
-    // Allocate shared per-voice mono staging buffers (both double-buffer sides)
-    for (int b = 0; b < 2; ++b) {
+    // Allocate shared per-voice mono staging buffers (triple-buffered).
+    for (int b = 0; b < ConvolutionWorker::kStagingBuffers; ++b) {
         for (int i = 0; i < ConvolutionWorker::kMaxSlots; ++i) {
             cw.staging[b][i].mono.resize(cfg.reflectionFrameSize, 0.0f);
         }
@@ -484,19 +484,50 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
         // Handle upsampling from reflection rate to device rate.
         int div = cw.rateDivisor;
         if (div > 1) {
-            // Linear interpolation upsample by rateDivisor
+            // Linear interpolation upsample by rateDivisor.
+            //
+            // Anchoring: the device-rate sample at position j*div should
+            // equal the reflection-rate sample decodedL[j-1] (i.e. each
+            // reflection sample defines the START of its own div-sample
+            // group, and the slope to the next reflection sample fills
+            // the remainder).  To keep the bridge between consecutive
+            // reflection frames continuous, we hold the last decoded
+            // sample of the previous frame as state in
+            // prevDecodedTail{L,R} and use it as the "left anchor" for
+            // the first output group of this frame.  Cost: one
+            // reflection-rate sample of latency (~42 µs at 24 kHz),
+            // inaudible.  Without this, the previous code held the
+            // final decoded sample flat for div samples and then
+            // started the next frame at decodedL[0] — a step
+            // discontinuity at every frame boundary, audible as a low
+            // buzz at reflRate / reflFrameSize Hz.
             std::uint32_t inFrames = std::min(reflFrameCount,
                 static_cast<std::uint32_t>(cw.frameSize / div));
-            for (std::uint32_t j = 0; j < inFrames; ++j) {
-                float l0 = sub.decodedL[j];
-                float r0 = sub.decodedR[j];
-                float l1 = (j + 1 < reflFrameCount) ? sub.decodedL[j + 1] : l0;
-                float r1 = (j + 1 < reflFrameCount) ? sub.decodedR[j + 1] : r0;
-                for (int d = 0; d < div; ++d) {
-                    float t = static_cast<float>(d) / static_cast<float>(div);
-                    sub.stereoL[back][j * div + d] = l0 + (l1 - l0) * t;
-                    sub.stereoR[back][j * div + d] = r0 + (r1 - r0) * t;
+            if (inFrames > 0) {
+                // Bridge from prev-frame tail → this frame's first sample.
+                {
+                    float l0 = sub.prevDecodedTailL, l1 = sub.decodedL[0];
+                    float r0 = sub.prevDecodedTailR, r1 = sub.decodedR[0];
+                    for (int d = 0; d < div; ++d) {
+                        float t = static_cast<float>(d) / static_cast<float>(div);
+                        sub.stereoL[back][d] = l0 + (l1 - l0) * t;
+                        sub.stereoR[back][d] = r0 + (r1 - r0) * t;
+                    }
                 }
+                // Middle groups: decodedL[j] → decodedL[j+1], written to
+                // device-rate positions (j+1)*div .. (j+2)*div - 1.
+                for (std::uint32_t j = 0; j + 1 < inFrames; ++j) {
+                    float l0 = sub.decodedL[j],   l1 = sub.decodedL[j + 1];
+                    float r0 = sub.decodedR[j],   r1 = sub.decodedR[j + 1];
+                    for (int d = 0; d < div; ++d) {
+                        float t = static_cast<float>(d) / static_cast<float>(div);
+                        sub.stereoL[back][(j + 1) * div + d] = l0 + (l1 - l0) * t;
+                        sub.stereoR[back][(j + 1) * div + d] = r0 + (r1 - r0) * t;
+                    }
+                }
+                // Save tail sample for the next frame's bridge.
+                sub.prevDecodedTailL = sub.decodedL[inFrames - 1];
+                sub.prevDecodedTailR = sub.decodedR[inFrames - 1];
             }
         } else {
             std::uint32_t outSamples = std::min(reflFrameCount, static_cast<std::uint32_t>(cw.frameSize));
@@ -512,6 +543,25 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
         float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
         float prev = sub.peakMs.load(std::memory_order_relaxed);
         if (ms > prev) sub.peakMs.store(ms, std::memory_order_relaxed);
+
+        // Diagnostic: log iterations that risk overrunning the audio
+        // callback period (1024 @ 48 kHz = ~21.3 ms).  When ms exceeds
+        // the threshold, the mix node on the next callback is likely to
+        // read a still-stale `front` buffer because the worker hasn't
+        // flipped frontIdx yet — the front-buffer freshness counter in
+        // [WET_BUS] will rise in lockstep.  Throttled to ~once per 64
+        // overruns per sub-worker so the log stays usable when the
+        // pipeline is consistently behind.
+        if (ms > 18.0f) {
+            static std::atomic<uint32_t> sLagLogCount[16] = {};
+            int idx = workerIdx & 0xF;
+            uint32_t n = sLagLogCount[idx].fetch_add(1, std::memory_order_relaxed);
+            if ((n & 0x3F) == 0) {
+                AUDIO_LOG("[CONV_LAG] w=%d ms=%.2f assignCount=%d "
+                          "(overrun #%u, cb=21.3ms)\n",
+                          workerIdx, ms, assignCount, n + 1);
+            }
+        }
 
         // Signal that this frame's data has been fully processed
         sub.processedSeq.store(lastSeq, std::memory_order_release);

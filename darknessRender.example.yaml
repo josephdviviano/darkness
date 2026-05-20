@@ -158,6 +158,19 @@ audio:
     # patchy with spacing=5, try 2.5 and re-bake (`bake_probes` in console).
     spacing: 5.0                 # grid spacing in feet (1.0–20.0; re-bake required)
     height: 5.0                  # probe height above floor in feet (0.5–20.0)
+    # Extra elevations (feet, above each floor probe) to replicate the
+    # floor grid at. Improves Steam Audio pathing for wall-mounted
+    # torches and ceiling-mounted lamps, which would otherwise snap to
+    # the floor probe directly underneath them. Default [10.0] covers
+    # the common case. Set to [] to disable (floor-only). Re-bake
+    # required.
+    elevations: [10.0]
+    # Add a 4-probe ring (±0.5 m on the portal plane) around every
+    # RoomService portal centroid. Densifies the pathing visibility
+    # graph at doorways so cross-room paths route through the doorway
+    # rather than wrapping around through grid probes on either side.
+    # Re-bake required.
+    portal_rings: true
 
   occlusion:
     # Source occlusion + global material multipliers.
@@ -224,6 +237,12 @@ audio:
     # available even when its effDist is notably longer than the
     # primary's wall-edge anchor path.
     max_path_diff: 50.0          # alternate-path distance window (world units, 0–50)
+    # Multiplier on the scalar gain produced by Steam Audio's baked pathing
+    # eqCoeffs. 1.0 = identity (use baked values as-is). Bump above 1 when
+    # cross-room/through-doorway sound feels too dead and a re-bake (with
+    # lower visibility threshold / denser probes) is too expensive. Does
+    # NOT affect the LPF blocking factor — only amplitude.
+    pathing_gain_scale: 1.0      # multiplier on pathing gain (0.1–10.0)
 
   spatialization:
     # Listener-side HRTF + distance attenuation curve.
