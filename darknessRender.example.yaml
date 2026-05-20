@@ -112,7 +112,11 @@ audio:
     convolution_workers: 0       # parallel convolution threads (0 = auto: hwconc-3)
     simulator_threads: 0         # ray-tracing sim threads (0 = auto: hwconc-2)
     max_active_voices: 64        # hard cap on simultaneous voices (8–256)
-    max_reflection_voices: 16    # voices with per-source convolution (1–64)
+    # max_reflection_voices: hybrid convolution is roughly half the CPU per
+    # voice of the old full-tail convolution (the parametric tail is much
+    # cheaper than another 2 s of FFT). Phase 6 bumps the cap from 4 to 8;
+    # walk it higher only after watching [CONV_LAG] for overruns under load.
+    max_reflection_voices: 8     # voices with per-source convolution (1–64)
     reflection_throttle: 4       # run reflection sim every Nth frame (1–32)
     sim_max_occlusion_samples: 32  # Steam Audio per-source occlusion cap (4–256)
     sim_max_rays: 4096           # Steam Audio per-step ray cap (must be >= reflections.rays)
@@ -169,20 +173,27 @@ audio:
     hybrid_overlap_percent: 0.25 # fraction of transition_time used for crossfade
 
     # Realtime simulation params (running every reflection_throttle frames).
+    # Phase 4 lowered rays from 4096 and bounces from 8 toward Steam Audio's
+    # recommended realtime defaults — the late-tail beauty now lives in the
+    # parametric portion, so realtime doesn't need to over-sample.
     realtime:
-      rays: 4096                 # rays per realtime sim step (128–8192)
-      bounces: 4                 # bounces per ray (1–8); more = wraps further around corners
-      duration: 2.0              # IR duration in seconds (0.5–4.0; for hybrid: must be > hybrid_transition_time)
-      diffuse_samples: 64        # diffuse scattering samples per bounce (16–256)
+      rays: 2048                 # rays per realtime sim step (128–8192)
+      bounces: 4                 # bounces per ray (1–8); biggest CPU lever (each +1 doubles ray-segment work)
+      duration: 2.1              # IR duration in seconds (0.5–4.0; must exceed hybrid_transition_time by margin)
+      diffuse_samples: 32        # diffuse scattering samples per bounce (16–256)
 
     # Offline bake params (run once per mission; cached as .probes files).
-    # Higher quality than realtime is cheap because we only pay for it once.
+    # Phase 5 raised these toward Unity's offline reference values so
+    # adjacent probes have significantly less Monte Carlo noise variance.
+    # Per-probe bake cost is roughly 32x higher than the old settings;
+    # the Phase-8 adaptive probe spacing is what makes the total bake
+    # time stay reasonable for shipping levels.
     bake:
-      rays: 4096                 # rays per bake step (1024–65536)
-      bounces: 4                 # bake bounces (1–64)
-      duration: 2.0              # bake IR duration in seconds (>= realtime.duration)
-      diffuse_samples: 128       # bake diffuse samples (32–4096)
-      ambisonics_order: 0        # bake ambisonic order (0–3; can be higher than realtime)
+      rays: 16384                # rays per bake step (1024–65536)
+      bounces: 16                # bake bounces (1–64)
+      duration: 4.0              # bake IR duration in seconds (>= realtime.duration)
+      diffuse_samples: 1024      # bake diffuse samples (32–4096)
+      ambisonics_order: 2        # bake ambisonic order (0–3; higher than realtime is fine)
 
   probes:
     # Baked-probe grid parameters. Probes are points where Steam Audio
