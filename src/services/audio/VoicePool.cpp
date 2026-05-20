@@ -121,7 +121,6 @@ ActiveVoice::~ActiveVoice()
         iplReflectionEffectRelease(&dspNode.reflectionEffect);
         dspNode.reflectionEffect = nullptr;
     }
-    dspNode.reflectionMixer = nullptr;  // shared ref, not owned
 
     // Destroy sound and decoder
     if (initialized) {
