@@ -2502,10 +2502,55 @@ AudioService::~AudioService()
 
 // ── miniaudio backend ──
 
+// Device data callback. We own the playback device ourselves (instead of
+// letting ma_engine_init build one) so we can set `ma_device_config.periods`
+// — the engine config does not expose period count, so its internal device
+// is always created at MA_DEFAULT_PERIODS (= 3). A lower period count
+// directly cuts device-buffer latency, which dominates the total
+// output-latency budget. The trade-off is less slack for the OS scheduler
+// before underrun; periods=2 matches what FMOD/Wwise use on PC by default.
+static void engineDeviceDataCallback(ma_device *pDevice, void *pFramesOut,
+                                     const void *pFramesIn, ma_uint32 frameCount)
+{
+    (void)pFramesIn;
+    auto *pEngine = static_cast<ma_engine*>(pDevice->pUserData);
+    if (pEngine)
+        ma_engine_read_pcm_frames(pEngine, pFramesOut, frameCount, nullptr);
+}
+
 //------------------------------------------------------
 bool AudioService::initMiniaudio()
 {
     mMaEngine = new ma_engine();
+
+    // Build our own playback device first so we can pin `periods`. The
+    // device config has the field we need (line 7108 of miniaudio.h); the
+    // engine config does not. Without this override miniaudio defaults to
+    // MA_DEFAULT_PERIODS = 3, which adds ~64 ms of device-buffer latency at
+    // 1024-frame periods. periods=2 halves that to ~43 ms.
+    ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
+    deviceConfig.playback.format     = ma_format_f32;
+    deviceConfig.playback.channels   = 2;          // stereo (HRTF requires it)
+    deviceConfig.sampleRate          = static_cast<ma_uint32>(mAudioSampleRateCfg);
+    deviceConfig.periodSizeInFrames  = static_cast<ma_uint32>(mAudioFrameSizeCfg);
+    deviceConfig.periods             = 2;          // tighter latency than default 3
+    deviceConfig.performanceProfile  = ma_performance_profile_low_latency;
+    deviceConfig.dataCallback        = engineDeviceDataCallback;
+    deviceConfig.pUserData           = mMaEngine;
+    deviceConfig.noPreSilencedOutputBuffer = MA_TRUE;  // we fill every frame
+    deviceConfig.noClip              = MA_TRUE;        // engine clips itself
+
+    mMaDevice = new ma_device();
+    ma_result result = ma_device_init(nullptr, &deviceConfig, mMaDevice);
+    if (result != MA_SUCCESS) {
+        LOG_ERROR("AudioService: ma_device_init failed (error %d)", result);
+        AUDIO_LOG("AudioService: ma_device_init FAILED (error %d)\n", result);
+        delete mMaDevice;
+        mMaDevice = nullptr;
+        delete mMaEngine;
+        mMaEngine = nullptr;
+        return false;
+    }
 
     // Engine sample rate is configurable (default 48kHz).
     // 48kHz is preferred — Steam Audio's HRTF dataset is native at 48kHz and any
@@ -2514,14 +2559,19 @@ bool AudioService::initMiniaudio()
     ma_engine_config config = ma_engine_config_init();
     config.channels = 2;           // stereo output (hardcoded — binaural HRTF requires stereo)
     config.sampleRate = static_cast<ma_uint32>(mAudioSampleRateCfg);
-    config.noDevice = MA_FALSE;    // create output device
     config.listenerCount = 1;      // one listener for 3D spatialization
     config.periodSizeInFrames = static_cast<ma_uint32>(mAudioFrameSizeCfg);
+    // Pre-built device: engine skips its own device creation and uses ours.
+    // The data callback we installed above forwards into ma_engine_read_pcm_frames.
+    config.pDevice = mMaDevice;
 
-    ma_result result = ma_engine_init(&config, mMaEngine);
+    result = ma_engine_init(&config, mMaEngine);
     if (result != MA_SUCCESS) {
         LOG_ERROR("AudioService: miniaudio init failed (error %d)", result);
         AUDIO_LOG( "AudioService: miniaudio init FAILED (error %d)\n", result);
+        ma_device_uninit(mMaDevice);
+        delete mMaDevice;
+        mMaDevice = nullptr;
         delete mMaEngine;
         mMaEngine = nullptr;
         return false;
@@ -2543,12 +2593,19 @@ bool AudioService::initMiniaudio()
         // LOG_INFO (not AUDIO_LOG) so we always capture the engine↔device
         // rate relationship — critical for diagnosing rate-mismatch
         // resampling artefacts, and needed for triage even when the
-        // verbose audio log is off.
+        // verbose audio log is off. Includes `internalPeriods` so the
+        // current device-buffer latency is computable from the log:
+        //   buffer_ms = (period_frames * periods) / sample_rate * 1000
+        ma_uint32 periodCount = device->playback.internalPeriods;
+        float bufferMs = 0.0f;
+        if (device->sampleRate > 0)
+            bufferMs = 1000.0f * static_cast<float>(periodSize * periodCount)
+                     / static_cast<float>(device->sampleRate);
         LOG_INFO("AudioService: miniaudio engine %u Hz \xe2\x86\x92 device '%s' @ %u Hz, "
-                 "%u ch, period=%u frames",
+                 "%u ch, period=%u frames, periods=%u (buffer=%.1f ms)",
                  mDeviceSampleRate, device->playback.name,
                  device->sampleRate, device->playback.channels,
-                 mFrameSize);
+                 mFrameSize, periodCount, bufferMs);
     }
 
     // Publish engine sample rate to audio-thread DSP that needs it (door LPF).
@@ -2715,12 +2772,20 @@ float AudioService::currentDuckGain() const
 //------------------------------------------------------
 void AudioService::shutdownMiniaudio()
 {
+    // Engine before device: ma_engine_uninit only tears down node graph and
+    // listeners — it does NOT uninit pDevice when one was supplied
+    // externally (see ma_engine_init source). We own the device's lifetime.
     if (mMaEngine) {
         ma_engine_uninit(mMaEngine);
         delete mMaEngine;
         mMaEngine = nullptr;
-        LOG_INFO("AudioService: miniaudio shut down");
     }
+    if (mMaDevice) {
+        ma_device_uninit(mMaDevice);
+        delete mMaDevice;
+        mMaDevice = nullptr;
+    }
+    LOG_INFO("AudioService: miniaudio shut down");
 }
 
 // ── Steam Audio backend ──
@@ -5066,29 +5131,61 @@ void AudioService::loopStep(float deltaTime)
                                     ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
                                     : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
                         voice->pinnedParams.numChannels = mAmbisonicsChannels;
-                        // delay = 0: parametric runs from t=0 alongside
-                        // convolution. Both decay simultaneously — conv
-                        // via its IR, parametric via its FDN driven by
-                        // RT60. Their outputs sum as one coherent
-                        // reverb. Earlier attempts with delay > 0
-                        // produced an audible "second reverb starting
-                        // fresh at t=delay" because Steam Audio's
-                        // hybrid `delay` field appears to make parametric
-                        // start a FRESH impulse-driven FDN response at
-                        // that sample (NOT continue from internal
-                        // accumulated state). With delay=0, no fresh
-                        // start — both signals are already running and
-                        // co-decaying.
+                        // delay = 0: parametric FDN runs from t=0,
+                        // co-decaying with the convolution.
                         //
-                        // This only works correctly when reverbTimes
-                        // are properly populated (non-zero per-band
-                        // RT60 from baked probes via
-                        // iplProbeBatchGetReverb above). Earlier
-                        // delay=0 attempts had reverbTimes=[0,0,0]
-                        // which made parametric ring at full amplitude
-                        // indefinitely (Steam Audio default-fallback
-                        // behavior with RT60=0), producing the
-                        // "doubled reverb" symptom.
+                        // Steam Audio's hybrid design (per phonon.h
+                        // docs + hybrid_reverb_estimator.cpp) is that
+                        // delay should be `rampStart =
+                        // (1-overlap)·transitionTime·Fs`, at which
+                        // point an IR-domain equal-power crossfade is
+                        // supposed to mask the parametric onset: the
+                        // conv IR is multiplied by sqrt(alpha) in the
+                        // ramp window [rampStart, rampEnd], and the
+                        // parametric's expected impulse response is
+                        // subtracted from channel 0 of the conv IR so
+                        // the sum stays energy-flat. Past rampEnd the
+                        // conv IR is zeroed and parametric carries
+                        // the tail alone. Steam Audio's own simulator
+                        // computes this same value and writes it to
+                        // outputs.reflections.delay.
+                        //
+                        // Empirically that doesn't work in our setup
+                        // — every non-zero delay we've tried (rampStart
+                        // = 18000, rampEnd = 24000, irSize = 26400)
+                        // is audible as a distinct "second reverb
+                        // onset" at t=delay. Suspected reasons:
+                        //   • The IR-side cancellation only touches
+                        //     channel 0 (W). Channels 1..N (X/Y/Z and
+                        //     up) are faded by sqrt(alpha) but not
+                        //     cancelled, so the spatial character of
+                        //     the wet field jumps even when energy
+                        //     stays flat.
+                        //   • Energy-flat ≠ perceptually-flat: the
+                        //     timbre of an FDN onset is distinguishable
+                        //     from the truncated room IR even at
+                        //     matched RMS.
+                        // Driving the parametric from t=0 sidesteps
+                        // both — the two signals co-decay from the
+                        // same instant, so there's no second event
+                        // to localize in time.
+                        //
+                        // Tradeoff: in the [0, rampStart] window the
+                        // wet bus carries both the full early-
+                        // reflection IR AND the parametric's initial
+                        // FDN response, which is technically "doubled
+                        // wet energy." In practice this manifests as
+                        // a slightly wetter onset, not a second-event
+                        // artifact, and is what was measured to sound
+                        // best when the user A/B'd it against
+                        // delay=rampStart and delay=rampEnd.
+                        //
+                        // Requires reverbTimes to be populated below
+                        // (via iplProbeBatchGetReverb) — with
+                        // RT60=0 Steam Audio's parametric default-
+                        // fallback rings at full amplitude and
+                        // produces a very different "doubled reverb"
+                        // symptom.
                         voice->pinnedParams.delay = 0;
 
                         // Fetch baked reverbTimes from the nearest probe
