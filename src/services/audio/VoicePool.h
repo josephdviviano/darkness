@@ -453,6 +453,29 @@ struct ActiveVoice {
     // are excluded from the dance and this counter is unused for them.
     int framesOutOfTopN = 0;
 
+    // ── Sticky reflection-slot ownership (replaces per-frame top-N churn) ──
+    //
+    // The pre-sticky design re-ranked every voice by distSq every frame and
+    // picked the top-N closest as "realtime" — but voices near the cap
+    // boundary flipped in/out of top-N every frame as small distance
+    // changes shuffled the ranking. Each flip changed the voice's IR mode
+    // (baked-probe lookup ↔ real-time ray-traced), producing the low-
+    // frequency wet-bus wobble that hybrid reverb was supposed to kill.
+    //
+    // The replacement: each voice's realtime-vs-baked decision is made
+    // ONCE when it first gets a chance at a slot (first loopStep frame
+    // with valid reflection outputs) and retained for the voice's entire
+    // lifetime including the reverb tail. Slots are released only when
+    // sourceEnded + tail expired. If all slots are full when a new
+    // eligible voice spawns, the new voice goes baked-only for life —
+    // accepted trade-off vs the per-frame mode-flip artifact.
+    //
+    // `reflSlotDecided` flips true on the voice's first eligible loopStep.
+    // `reflSlotOwned` records the result of that decision and never
+    // changes until slot release at end-of-tail.
+    bool reflSlotDecided = false;
+    bool reflSlotOwned   = false;
+
     // World-space position for spatial audio (updated for moving objects)
     Vector3 worldPos{0.0f, 0.0f, 0.0f};
 
