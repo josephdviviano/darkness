@@ -413,15 +413,54 @@ public:
     bool getReflectionsEnabled() const { return mReflectionsEnabled; }
 
     // ── Tunable reflection parameters (exposed for console binding) ──
+    //
+    // Realtime params drive the per-frame `iplSimulatorRunReflections` step
+    // and the per-voice `iplReflectionEffectApply` IR length. Bake params
+    // drive the offline `iplReflectionsBakerBake` pass and are persisted into
+    // the .probes cache file — bake changes require a re-bake.
 
-    void setReflectionNumRays(int n) { mReflectionNumRays = std::max(128, std::min(n, 8192)); }
-    int  getReflectionNumRays() const { return mReflectionNumRays; }
+    /// Reflection effect algorithm. Hybrid mode uses Steam Audio's existing
+    /// reflection-effect API with `type=HYBRID`: an early convolution portion
+    /// (length = `hybridTransitionTime`) and a parametric tail thereafter.
+    /// Parametric tails cannot beat from per-frame IR crossfade stacking,
+    /// which is the failure mode targeted by PLAN.HYBRID_REVERB.md.
+    enum class ReflectionType { Convolution, Hybrid, Parametric };
+    void setReflectionType(ReflectionType t) { mReflectionType = t; }
+    ReflectionType getReflectionType() const { return mReflectionType; }
 
-    void setReflectionNumBounces(int n) { mReflectionNumBounces = std::max(1, std::min(n, 8)); }
-    int  getReflectionNumBounces() const { return mReflectionNumBounces; }
+    /// Length (seconds) of the convolution portion of the IR when running
+    /// hybrid. Must be < the IR duration — Steam Audio crashes otherwise.
+    void  setHybridTransitionTime(float s) { mHybridTransitionTime = std::max(0.1f, std::min(s, 8.0f)); }
+    float getHybridTransitionTime() const  { return mHybridTransitionTime; }
 
-    void setReflectionDuration(float d) { mReflectionDuration = std::max(0.5f, std::min(d, 4.0f)); }
-    float getReflectionDuration() const { return mReflectionDuration; }
+    /// Fraction of `hybridTransitionTime` used for the convolution↔
+    /// parametric crossfade. Anchored at the END of the transition.
+    void  setHybridOverlapPercent(float f) { mHybridOverlapPercent = std::max(0.0f, std::min(f, 1.0f)); }
+    float getHybridOverlapPercent() const  { return mHybridOverlapPercent; }
+
+    // Realtime simulation params (used by iplSimulatorRunReflections,
+    // iplReflectionEffectCreate's irSize, and the per-frame ambisonics
+    // pipeline).
+    void setRealtimeNumRays(int n) { mRealtimeNumRays = std::max(128, std::min(n, 8192)); }
+    int  getRealtimeNumRays() const { return mRealtimeNumRays; }
+    void setRealtimeNumBounces(int n) { mRealtimeNumBounces = std::max(1, std::min(n, 8)); }
+    int  getRealtimeNumBounces() const { return mRealtimeNumBounces; }
+    void setRealtimeDuration(float d) { mRealtimeDuration = std::max(0.5f, std::min(d, 4.0f)); }
+    float getRealtimeDuration() const { return mRealtimeDuration; }
+    void setRealtimeDiffuseSamples(int n) { mRealtimeDiffuseSamples = std::max(16, std::min(n, 256)); }
+    int  getRealtimeDiffuseSamples() const { return mRealtimeDiffuseSamples; }
+
+    // Offline bake params (used by iplReflectionsBakerBake).
+    void setBakeNumRays(int n) { mBakeNumRays = std::max(1024, std::min(n, 65536)); }
+    int  getBakeNumRays() const { return mBakeNumRays; }
+    void setBakeNumBounces(int n) { mBakeNumBounces = std::max(1, std::min(n, 64)); }
+    int  getBakeNumBounces() const { return mBakeNumBounces; }
+    void setBakeDuration(float d) { mBakeDuration = std::max(0.5f, std::min(d, 8.0f)); }
+    float getBakeDuration() const { return mBakeDuration; }
+    void setBakeDiffuseSamples(int n) { mBakeDiffuseSamples = std::max(32, std::min(n, 4096)); }
+    int  getBakeDiffuseSamples() const { return mBakeDiffuseSamples; }
+    void setBakeAmbisonicsOrder(int n) { mBakeAmbisonicsOrder = std::max(0, std::min(n, 3)); }
+    int  getBakeAmbisonicsOrder() const { return mBakeAmbisonicsOrder; }
 
     void setReflectionThrottle(int n);
     int  getReflectionThrottle() const;
@@ -434,9 +473,6 @@ public:
 
     void setAbsorptionScale(float s) { mAbsorptionScale = std::max(0.01f, std::min(s, 10.0f)); }
     float getAbsorptionScale() const { return mAbsorptionScale; }
-
-    void setDiffuseSamples(int n) { mDiffuseSamples = std::max(16, std::min(n, 256)); }
-    void setBakeDiffuseSamples(int n) { mBakeDiffuseSamples = std::max(32, std::min(n, 512)); }
 
     // Occlusion tuning — storage + clamps live in AudioOcclusion.
     // These facades preserve the historical public AudioService API so
@@ -1134,10 +1170,42 @@ private:
     std::unique_ptr<ConvolutionWorkerPool> mConvolutionPool;
 
     // ── Tunable reflection parameters ──
+    //
+    // Split into realtime + bake groups: realtime drives every-frame
+    // iplSimulatorRunReflections + per-voice iplReflectionEffectApply, bake
+    // drives the one-shot iplReflectionsBakerBake and is persisted into the
+    // .probes cache file. Changes to bake params require a re-bake to take
+    // effect; changes to realtime params take effect on the next callback.
 
-    int mReflectionNumRays = 1024;     ///< Rays per simulation step (128–8192)
-    int mReflectionNumBounces = 4;     ///< Bounces per ray (1–8)
-    float mReflectionDuration = 2.0f;  ///< Max reverb tail in seconds (0.5–4.0)
+    /// Reflection effect algorithm. Hybrid splits the IR into an early
+    /// convolution portion (length = `mHybridTransitionTime`) and a late
+    /// parametric portion. Parametric tails cannot beat from per-frame IR
+    /// crossfade stacking — the failure mode targeted by PLAN.HYBRID_REVERB.md.
+    ReflectionType mReflectionType = ReflectionType::Convolution;
+
+    /// Length (seconds) of the convolution portion of the IR for hybrid.
+    /// Steam Audio crashes if this exceeds the IR duration, so we enforce
+    /// mRealtimeDuration > mHybridTransitionTime with a small margin in
+    /// initReflectionPipeline.
+    float mHybridTransitionTime = 2.0f;
+
+    /// Fraction of `mHybridTransitionTime` used for the convolution↔
+    /// parametric crossfade, anchored at the END of the transition.
+    float mHybridOverlapPercent = 0.25f;
+
+    // Realtime simulation params (used per audio frame).
+    int   mRealtimeNumRays         = 1024;  ///< Rays per realtime sim step (128–8192)
+    int   mRealtimeNumBounces      = 4;     ///< Bounces per ray (1–8)
+    float mRealtimeDuration        = 2.0f;  ///< Realtime IR duration in seconds (0.5–4.0)
+    int   mRealtimeDiffuseSamples  = 32;    ///< Diffuse samples per bounce (16–256)
+
+    // Offline bake params (one-shot per mission).
+    int   mBakeNumRays             = 4096;  ///< Rays per bake step (1024–65536)
+    int   mBakeNumBounces          = 8;     ///< Bake bounces (1–64)
+    float mBakeDuration            = 4.0f;  ///< Bake IR duration in seconds (>= realtime)
+    int   mBakeDiffuseSamples      = 256;   ///< Bake diffuse samples (32–4096)
+    int   mBakeAmbisonicsOrder     = 1;     ///< Bake ambisonic order (0–3)
+
     int mMaxReflectionVoices = DEFAULT_MAX_REFLECTION_VOICES;
     int mAcousticTriCount = 0;         ///< Triangles in current acoustic scene
 
@@ -1150,11 +1218,6 @@ private:
     /// Values > 1.0 make surfaces more absorptive (deader rooms).
     /// 1.0 = physically accurate. 0.5 = half absorption (twice as reflective).
     float mAbsorptionScale = 1.0f;
-
-    /// Diffuse scattering samples for real-time reflection simulation (16-256)
-    int mDiffuseSamples = 64;
-    /// Diffuse scattering samples for probe baking (32-512, higher=smoother)
-    int mBakeDiffuseSamples = 128;
 
     /// Per-mission extra probe placement, snapshot at config-load time and
     /// consumed by `bakeProbes`. `mProbeElevations` adds elevated copies
