@@ -66,6 +66,12 @@
 
 #include <unordered_set>
 #include <cmath>
+#include <thread>
+
+#if defined(__APPLE__)
+#  include <pthread.h>
+#  include <sys/qos.h>
+#endif
 
 // miniaudio — single-header C library, implementation compiled here
 #define MINIAUDIO_IMPLEMENTATION
@@ -2020,9 +2026,17 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             for (auto &subPtr : cw->workers)
                 subPtr->signalTimeNs.store(signalNs, std::memory_order_release);
 
-            // Signal all sub-workers that new data is available
-            for (auto &subPtr : cw->workers)
+            // Signal all sub-workers that new data is available. The
+            // frameSeq bump is the canonical seq advance (acquire/release
+            // pair with the worker's predicate check); the notify_one
+            // wakes the worker if it's currently in cv.wait(). Order
+            // matters: bump frameSeq BEFORE notify so the worker's
+            // predicate check inside cv.wait sees the new value if it
+            // wakes due to our notify (vs spurious wake).
+            for (auto &subPtr : cw->workers) {
                 subPtr->frameSeq.fetch_add(1, std::memory_order_release);
+                subPtr->wakeCv.notify_one();
+            }
         }
     }
 
@@ -3106,8 +3120,36 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         simSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
         simSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
 
+        // Spawn the reflection simulator from a temporary thread already
+        // at QOS_CLASS_UTILITY so any internal worker pool Steam Audio
+        // creates here inherits UTILITY at create time. macOS QoS
+        // propagates from the spawning thread at the moment of thread
+        // creation; if we called iplSimulatorCreate from the main thread
+        // (QOS_CLASS_DEFAULT) and demoted only our wrapper later, Steam
+        // Audio's internal sim workers would be stuck at DEFAULT —
+        // negating the demotion done in ReflectionSimulator::workerMain.
+        // The empty join below ensures the temporary thread completes
+        // before we touch reflectionSimHandle. Belt-and-suspenders with
+        // the wrapper-thread demotion: if Steam Audio creates the pool
+        // lazily on first run() instead of eagerly here, the wrapper's
+        // UTILITY still wins.
         IPLSimulator reflectionSimHandle = nullptr;
-        err = iplSimulatorCreate(mIplContext, &simSettings, &reflectionSimHandle);
+        err = IPL_STATUS_FAILURE;
+        {
+            std::thread creator([&]() {
+#if defined(__APPLE__)
+                pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+                qos_class_t qos = QOS_CLASS_UNSPECIFIED;
+                int relPri = 0;
+                if (pthread_get_qos_class_np(pthread_self(), &qos, &relPri) == 0) {
+                    AUDIO_LOG("[SIM_QOS] simulator-create thread qos=%u rel=%d\n",
+                              qos, relPri);
+                }
+#endif
+                err = iplSimulatorCreate(mIplContext, &simSettings, &reflectionSimHandle);
+            });
+            creator.join();
+        }
         if (err != IPL_STATUS_SUCCESS) {
             LOG_ERROR("AudioService: iplSimulatorCreate failed (error %d)", err);
             destroyAcousticScene();
