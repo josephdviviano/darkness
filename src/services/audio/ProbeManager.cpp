@@ -368,9 +368,10 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     // This pre-computes reverb impulse responses so that voices outside the
     // real-time top-N can use baked reverb instead of being dry.
     // Uses REVERB variation — one bake covers all sources (listener-position-based).
-    AUDIO_LOG( "Baking reflection IRs for %d probes (rays=%d bounces=%d duration=%.1fs)...\n",
-                 numProbes, params.reflectionNumRays, params.reflectionNumBounces,
-                 params.reflectionDuration);
+    AUDIO_LOG( "Baking reflection IRs for %d probes (rays=%d bounces=%d duration=%.1fs diffuse=%d order=%d)...\n",
+                 numProbes, params.bakeNumRays, params.bakeNumBounces,
+                 params.bakeDuration, params.bakeDiffuseSamples,
+                 params.ambisonicsOrder);
 
     IPLBakedDataIdentifier reflId{};
     reflId.type = IPL_BAKEDDATATYPE_REFLECTIONS;
@@ -389,11 +390,11 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     reflBakeParams.identifier = reflId;
     reflBakeParams.bakeFlags = static_cast<IPLReflectionsBakeFlags>(
         IPL_REFLECTIONSBAKEFLAGS_BAKECONVOLUTION);
-    reflBakeParams.numRays = params.reflectionNumRays;
+    reflBakeParams.numRays = params.bakeNumRays;
     reflBakeParams.numDiffuseSamples = params.bakeDiffuseSamples;
-    reflBakeParams.numBounces = params.reflectionNumBounces;
-    reflBakeParams.simulatedDuration = params.reflectionDuration;
-    reflBakeParams.savedDuration = params.reflectionDuration;  // save full IR
+    reflBakeParams.numBounces = params.bakeNumBounces;
+    reflBakeParams.simulatedDuration = params.bakeDuration;
+    reflBakeParams.savedDuration = params.bakeDuration;  // save full IR
     reflBakeParams.order = params.ambisonicsOrder;
     reflBakeParams.numThreads = bakeThreads;
     // irradianceMinDistance is in METERS (Steam Audio convention) — clamps the
@@ -443,7 +444,7 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     // visible without grepping the CSV.
     {
         IPLEnergyFieldSettings efSettings{};
-        efSettings.duration = params.reflectionDuration;
+        efSettings.duration = params.bakeDuration;
         efSettings.order    = params.ambisonicsOrder;
         IPLEnergyField energyField = nullptr;
         IPLerror efErr = iplEnergyFieldCreate(mDeps.context, &efSettings,
@@ -463,7 +464,7 @@ bool ProbeManager::bakeProbes(IPLScene scene,
                                  "ProbeManager::bakeProbes.\n"
                                  "# duration=%.2fs order=%d channels=%d "
                                  "bands=%d bins=%d (10ms per bin)\n",
-                             params.reflectionDuration, params.ambisonicsOrder,
+                             params.bakeDuration, params.ambisonicsOrder,
                              numChannels, numBands, numBins);
                 std::fprintf(ef, "index,x,y,z,totalEnergy,peakBin,"
                                  "earlyEnergy50ms,bandLow,bandMid,bandHigh\n");

@@ -2833,13 +2833,21 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         simSettings.flags = static_cast<IPLSimulationFlags>(
             IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
         simSettings.sceneType = sceneTypeEnum;
-        simSettings.reflectionType = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-        // Sim caps — these are upper bounds; runtime uses mReflectionNumRays etc.
+        // Reflection algorithm: convolution / hybrid / parametric. The
+        // simulator-side type must match the per-effect type and the
+        // per-call `params.type` (phonon.h enforces this) — we set all three
+        // from `mReflectionType` and a small translation table.
+        simSettings.reflectionType = (mReflectionType == ReflectionType::Hybrid)
+            ? IPL_REFLECTIONEFFECTTYPE_HYBRID
+            : (mReflectionType == ReflectionType::Parametric)
+                ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
+                : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+        // Sim caps — these are upper bounds; runtime uses mRealtimeNumRays etc.
         // maxNumRays must be >= the runtime ray count; auto-bump if user set both.
         simSettings.maxNumOcclusionSamples = mSimMaxOcclusionSamplesCfg;
-        simSettings.maxNumRays = std::max(mSimMaxRaysCfg, mReflectionNumRays);
-        simSettings.numDiffuseSamples = mDiffuseSamples;
-        simSettings.maxDuration = mReflectionDuration;
+        simSettings.maxNumRays = std::max(mSimMaxRaysCfg, mRealtimeNumRays);
+        simSettings.numDiffuseSamples = mRealtimeDiffuseSamples;
+        simSettings.maxDuration = mRealtimeDuration;
         simSettings.maxOrder = mAmbisonicsOrder;
         simSettings.maxNumSources = mReflectionMaxSourcesCfg;
         // Ray-trace thread count: 0 = auto (reserve 2 cores for main + audio).
@@ -2965,8 +2973,12 @@ bool AudioService::initReflectionPipeline()
     audioSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
     audioSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
 
-    // irSize = maxDuration * samplingRate (matches simulator settings)
-    IPLint32 irSize = static_cast<IPLint32>(mReflectionDuration * mReflectionSampleRate);
+    // irSize = realtime duration * sampling rate (matches simulator settings).
+    // For hybrid, this covers the WHOLE IR (convolution portion plus a small
+    // margin for the parametric crossfade) — Steam Audio crashes if
+    // hybridReverbTransitionTime > irSize/samplingRate, so we keep
+    // mRealtimeDuration > mHybridTransitionTime as policy.
+    IPLint32 irSize = static_cast<IPLint32>(mRealtimeDuration * mReflectionSampleRate);
     // Compute ambisonics channel count: (order+1)^2. Order 0=1ch, order 1=4ch.
     mAmbisonicsChannels = (mAmbisonicsOrder + 1) * (mAmbisonicsOrder + 1);
     IPLint32 numAmbiChannels = static_cast<IPLint32>(mAmbisonicsChannels);
@@ -3618,9 +3630,9 @@ void AudioService::loopStep(float deltaTime)
             // Step 1: Set listener position for the simulator
             IPLSimulationSharedInputs sharedInputs{};
             sharedInputs.listener = listenerCoord;
-            sharedInputs.numRays = mReflectionNumRays;
-            sharedInputs.numBounces = mReflectionNumBounces;
-            sharedInputs.duration = mReflectionDuration;
+            sharedInputs.numRays = mRealtimeNumRays;
+            sharedInputs.numBounces = mRealtimeNumBounces;
+            sharedInputs.duration = mRealtimeDuration;
             sharedInputs.order = mAmbisonicsOrder;
             sharedInputs.irradianceMinDistance = 1.0f;
             // Listener pose goes to both simulators; reflection params
@@ -4761,7 +4773,7 @@ void AudioService::loopStep(float deltaTime)
                     // convolution (was in the top-N or had a baked slot). Voices
                     // that were dry don't need a tail — there's no convolution
                     // state to ring out.
-                    voice->tailTimer = mReflectionDuration;
+                    voice->tailTimer = mRealtimeDuration;
                     AUDIO_LOG( "[VOICE] TAIL_START h=%d '%s' tail=%.1fs\n",
                                  handle, voice->schemaName.c_str(), voice->tailTimer);
                 } else {
@@ -5367,14 +5379,18 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     // Create per-voice reflection convolution effect (optional — only if mixer exists).
     // Uses the reflection sample rate (24kHz or 48kHz) to match the mixer and simulator.
     if (mIplReflectionMixer) {
-        IPLint32 irSize = static_cast<IPLint32>(mReflectionDuration * mReflectionSampleRate);
+        IPLint32 irSize = static_cast<IPLint32>(mRealtimeDuration * mReflectionSampleRate);
 
         IPLAudioSettings reflAudioSettings{};
         reflAudioSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
         reflAudioSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
 
         IPLReflectionEffectSettings reflSettings{};
-        reflSettings.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+        reflSettings.type = (mReflectionType == ReflectionType::Hybrid)
+            ? IPL_REFLECTIONEFFECTTYPE_HYBRID
+            : (mReflectionType == ReflectionType::Parametric)
+                ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
+                : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
         reflSettings.irSize = irSize;
         reflSettings.numChannels = static_cast<IPLint32>(mAmbisonicsChannels);
 
@@ -6810,7 +6826,7 @@ void AudioService::dumpAudioStatusPeriodic()
     }
 
     // Effective rays/sec (rays * reflection sim steps run in this dump period)
-    float raysPerSec = (reflFrames * mReflectionNumRays) / 5.0f;  // 5s dump interval
+    float raysPerSec = (reflFrames * mRealtimeNumRays) / 5.0f;  // 5s dump interval
 
     // Compute listener's nearest probe once for the whole dump — every
     // ambient row references the same value (their reverb send convolves
@@ -7466,12 +7482,12 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     params.sceneMin              = mSceneMin;
     params.sceneMax              = mSceneMax;
     params.propagationMaxDist    = mPropagationMaxDist;
-    params.reflectionNumRays     = mReflectionNumRays;
-    params.reflectionNumBounces  = mReflectionNumBounces;
-    params.reflectionDuration    = mReflectionDuration;
+    params.bakeNumRays           = mBakeNumRays;
+    params.bakeNumBounces        = mBakeNumBounces;
+    params.bakeDuration          = mBakeDuration;
     params.bakeDiffuseSamples    = mBakeDiffuseSamples;
     params.simulatorThreads      = mSimulatorThreadsCfg;
-    params.ambisonicsOrder       = mAmbisonicsOrder;
+    params.ambisonicsOrder       = mBakeAmbisonicsOrder;
     params.sceneType             = mSceneTypeCfg;
     params.spacingFtOverride     = spacing;
     params.heightFtOverride      = height;

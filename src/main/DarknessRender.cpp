@@ -2389,35 +2389,35 @@ static void registerConsoleSettings(
     dbgConsole.addFloat("refl_rays", 128.0f, 8192.0f,
         []() {
             auto svc = GET_SERVICE(Darkness::AudioService);
-            return svc ? static_cast<float>(svc->getReflectionNumRays()) : 4096.0f;
+            return svc ? static_cast<float>(svc->getRealtimeNumRays()) : 4096.0f;
         },
         [](float v) {
             auto svc = GET_SERVICE(Darkness::AudioService);
-            if (svc) svc->setReflectionNumRays(static_cast<int>(v));
+            if (svc) svc->setRealtimeNumRays(static_cast<int>(v));
         },
-        "Rays per reflection sim step (background thread)");
+        "Rays per realtime reflection sim step (background thread)");
 
     dbgConsole.addFloat("refl_bounces", 1.0f, 8.0f,
         []() {
             auto svc = GET_SERVICE(Darkness::AudioService);
-            return svc ? static_cast<float>(svc->getReflectionNumBounces()) : 4.0f;
+            return svc ? static_cast<float>(svc->getRealtimeNumBounces()) : 4.0f;
         },
         [](float v) {
             auto svc = GET_SERVICE(Darkness::AudioService);
-            if (svc) svc->setReflectionNumBounces(static_cast<int>(v));
+            if (svc) svc->setRealtimeNumBounces(static_cast<int>(v));
         },
-        "Bounces per ray (more = multi-room reverb propagation)");
+        "Realtime bounces per ray (more = multi-room reverb propagation)");
 
     dbgConsole.addFloat("refl_duration", 0.5f, 4.0f,
         []() {
             auto svc = GET_SERVICE(Darkness::AudioService);
-            return svc ? svc->getReflectionDuration() : 2.0f;
+            return svc ? svc->getRealtimeDuration() : 2.0f;
         },
         [](float v) {
             auto svc = GET_SERVICE(Darkness::AudioService);
-            if (svc) svc->setReflectionDuration(v);
+            if (svc) svc->setRealtimeDuration(v);
         },
-        "Max reverb tail length in seconds");
+        "Realtime reverb tail length in seconds (must exceed hybrid_transition_time)");
 
     dbgConsole.addFloat("refl_throttle", 1.0f, 32.0f,
         []() {
@@ -3757,10 +3757,37 @@ int main(int argc, char *argv[]) {
 
         // -- audio.reflections --
         audioSvc->setReflectionsEnabled(cfg.realtimeReflections);
-        audioSvc->setReflectionNumRays(cfg.reflectionNumRays);
-        audioSvc->setReflectionNumBounces(cfg.reflectionNumBounces);
-        audioSvc->setReflectionDuration(cfg.reflectionDuration);
         audioSvc->setAmbisonicsOrder(cfg.ambisonicsOrder);
+        // Reflection algorithm: hybrid migration in progress
+        // (see PLAN.HYBRID_REVERB.md). Type set here forwards to all three
+        // Steam Audio call sites (simulator settings, per-voice effect
+        // creation, per-frame params.type).
+        {
+            AudioService::ReflectionType t = AudioService::ReflectionType::Convolution;
+            switch (cfg.reflectionType) {
+                case RenderConfig::ReflectionType::Convolution:
+                    t = AudioService::ReflectionType::Convolution;
+                    break;
+                case RenderConfig::ReflectionType::Hybrid:
+                    t = AudioService::ReflectionType::Hybrid;
+                    break;
+                case RenderConfig::ReflectionType::Parametric:
+                    t = AudioService::ReflectionType::Parametric;
+                    break;
+            }
+            audioSvc->setReflectionType(t);
+        }
+        audioSvc->setHybridTransitionTime(cfg.hybridTransitionTime);
+        audioSvc->setHybridOverlapPercent(cfg.hybridOverlapPercent);
+        audioSvc->setRealtimeNumRays(cfg.realtimeNumRays);
+        audioSvc->setRealtimeNumBounces(cfg.realtimeNumBounces);
+        audioSvc->setRealtimeDuration(cfg.realtimeDuration);
+        audioSvc->setRealtimeDiffuseSamples(cfg.realtimeDiffuseSamples);
+        audioSvc->setBakeNumRays(cfg.bakeNumRays);
+        audioSvc->setBakeNumBounces(cfg.bakeNumBounces);
+        audioSvc->setBakeDuration(cfg.bakeDuration);
+        audioSvc->setBakeDiffuseSamples(cfg.bakeDiffuseSamples);
+        audioSvc->setBakeAmbisonicsOrder(cfg.bakeAmbisonicsOrder);
 
         // -- audio.probes --
         // Bake-time grid parameters. Applied before the auto-bake on first
@@ -3776,8 +3803,6 @@ int main(int argc, char *argv[]) {
         audioSvc->setOcclusionSamples(cfg.occlusionSamples);
         audioSvc->setTransmissionScale(cfg.transmissionScale);
         audioSvc->setAbsorptionScale(cfg.absorptionScale);
-        audioSvc->setDiffuseSamples(cfg.diffuseSamples);
-        audioSvc->setBakeDiffuseSamples(cfg.bakeDiffuseSamples);
 
         // -- audio.propagation --
         audioSvc->setPortalRoutingEnabled(cfg.portalRouting);
