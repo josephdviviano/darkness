@@ -356,8 +356,10 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
 struct AudioService::ReflectionMixNode {
     ma_node_base base{};  // Must be first member (miniaudio node graph requirement)
 
-    // Shared handles (NOT owned — AudioService manages lifetimes)
-    IPLReflectionMixer mixer = nullptr;
+    // Shared handles (NOT owned — AudioService manages lifetimes).
+    // No reflection mixer here: the post-Phase-3 worker pool sums per-voice
+    // ambisonics manually (Steam Audio's reflection mixer rejects
+    // HYBRID/PARAMETRIC modes).
     IPLAmbisonicsDecodeEffect ambiDecodeEffect = nullptr;
     IPLHRTF hrtf = nullptr;
 
@@ -3001,24 +3003,19 @@ bool AudioService::initReflectionPipeline()
     mAmbisonicsChannels = (mAmbisonicsOrder + 1) * (mAmbisonicsOrder + 1);
     IPLint32 numAmbiChannels = static_cast<IPLint32>(mAmbisonicsChannels);
 
-    AUDIO_LOG( "REFL: creating mixer (irSize=%d, channels=%d, rate=%d, frame=%d, 1/%d rate)\n",
+    AUDIO_LOG( "REFL: creating ambi decoder (irSize=%d, channels=%d, rate=%d, frame=%d, 1/%d rate, type=%s)\n",
                  irSize, numAmbiChannels,
                  audioSettings.samplingRate, audioSettings.frameSize,
-                 rateDivisor);
+                 rateDivisor,
+                 mReflectionType == ReflectionType::Hybrid     ? "hybrid"     :
+                 mReflectionType == ReflectionType::Parametric ? "parametric" : "convolution");
 
-    // Create shared reflection mixer — accumulates all per-voice convolution outputs
-    IPLReflectionEffectSettings reflSettings{};
-    reflSettings.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-    reflSettings.irSize = irSize;
-    reflSettings.numChannels = numAmbiChannels;
-
-    IPLerror err = iplReflectionMixerCreate(mIplContext, &audioSettings,
-                                             &reflSettings, &mIplReflectionMixer);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("AudioService: iplReflectionMixerCreate failed (error %d)", err);
-        return false;
-    }
-    AUDIO_LOG( "REFL: mixer created OK\n");
+    // Note: the global IPLReflectionMixer is intentionally NOT created.
+    // The pre-Phase-3 design accumulated per-voice convolution into a shared
+    // mixer; PLAN.HYBRID_REVERB.md Phase 3 dropped it because Steam Audio's
+    // mixer overload of iplReflectionEffectApply is restricted to
+    // CONVOLUTION/TAN and rejects HYBRID/PARAMETRIC. The sub-workers now
+    // sum per-voice ambisonics manually, which works for all three modes.
 
     // Create ambisonics decode effect (ambisonics → binaural stereo via HRTF).
     // This also runs at the reflection rate — output is upsampled in the mix node.
@@ -3027,12 +3024,10 @@ bool AudioService::initReflectionPipeline()
     decodeSettings.hrtf = mIplHrtf;
     decodeSettings.maxOrder = mAmbisonicsOrder;
 
-    err = iplAmbisonicsDecodeEffectCreate(mIplContext, &audioSettings,
+    IPLerror err = iplAmbisonicsDecodeEffectCreate(mIplContext, &audioSettings,
                                            &decodeSettings, &mIplAmbiDecodeEffect);
     if (err != IPL_STATUS_SUCCESS) {
         LOG_ERROR("AudioService: iplAmbisonicsDecodeEffectCreate failed (error %d)", err);
-        iplReflectionMixerRelease(&mIplReflectionMixer);
-        mIplReflectionMixer = nullptr;
         return false;
     }
 
@@ -3041,7 +3036,6 @@ bool AudioService::initReflectionPipeline()
     // resampling when the reflection pipeline runs at half rate.
     mReflectionMixNode = std::make_unique<ReflectionMixNode>();
     auto& rmn = *mReflectionMixNode;
-    rmn.mixer = mIplReflectionMixer;
     rmn.ambiDecodeEffect = mIplAmbiDecodeEffect;
     rmn.hrtf = mIplHrtf;
     rmn.frameSize = static_cast<int>(mFrameSize);
@@ -3080,8 +3074,6 @@ bool AudioService::initReflectionPipeline()
         mReflectionMixNode.reset();
         iplAmbisonicsDecodeEffectRelease(&mIplAmbiDecodeEffect);
         mIplAmbiDecodeEffect = nullptr;
-        iplReflectionMixerRelease(&mIplReflectionMixer);
-        mIplReflectionMixer = nullptr;
         return false;
     }
     rmn.nodeInitialized = true;
@@ -3096,8 +3088,6 @@ bool AudioService::initReflectionPipeline()
         mReflectionMixNode.reset();
         iplAmbisonicsDecodeEffectRelease(&mIplAmbiDecodeEffect);
         mIplAmbiDecodeEffect = nullptr;
-        iplReflectionMixerRelease(&mIplReflectionMixer);
-        mIplReflectionMixer = nullptr;
         return false;
     }
 
@@ -3160,7 +3150,18 @@ bool AudioService::initReflectionPipeline()
 
     // Hand off to the ConvolutionWorkerPool — it creates the pool's
     // ConvolutionWorker struct, allocates per-sub-worker Steam Audio
-    // pipelines (own mixer + decoder), and spawns the threads.
+    // pipelines (decoder + scratch + output buffers), and spawns threads.
+    // reflSettings is forwarded for backwards-compat: post-Phase-3 the pool
+    // no longer creates a per-sub-worker mixer, but the field is still in
+    // the Config struct in case future modes need it.
+    IPLReflectionEffectSettings poolReflSettings{};
+    poolReflSettings.type = (mReflectionType == ReflectionType::Hybrid)
+        ? IPL_REFLECTIONEFFECTTYPE_HYBRID
+        : (mReflectionType == ReflectionType::Parametric)
+            ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
+            : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+    poolReflSettings.irSize = irSize;
+    poolReflSettings.numChannels = numAmbiChannels;
     ConvolutionWorkerPool::Config poolCfg;
     poolCfg.context = mIplContext;
     poolCfg.hrtf = mIplHrtf;
@@ -3171,7 +3172,7 @@ bool AudioService::initReflectionPipeline()
     poolCfg.ambiOrder = mAmbisonicsOrder;
     poolCfg.numWorkers = numWorkers;
     poolCfg.audioSettings = audioSettings;
-    poolCfg.reflSettings = reflSettings;
+    poolCfg.reflSettings = poolReflSettings;
     mConvolutionPool = std::make_unique<ConvolutionWorkerPool>();
     if (!mConvolutionPool->init(poolCfg)) {
         mConvolutionPool.reset();
@@ -3225,10 +3226,6 @@ void AudioService::destroyReflectionPipeline()
     if (mIplAmbiDecodeEffect) {
         iplAmbisonicsDecodeEffectRelease(&mIplAmbiDecodeEffect);
         mIplAmbiDecodeEffect = nullptr;
-    }
-    if (mIplReflectionMixer) {
-        iplReflectionMixerRelease(&mIplReflectionMixer);
-        mIplReflectionMixer = nullptr;
     }
 }
 
@@ -4360,7 +4357,12 @@ void AudioService::loopStep(float deltaTime)
             // Direct sim runs synchronously every frame.
             // Reflection sim runs on background thread, throttled.
             // The throttle counter / divisor live on ReflectionSimulator now.
-            bool wantReflections = mReflectionsEnabled && mIplReflectionMixer
+            // The reflection pipeline is considered ready when both the
+            // ambisonics decoder and the convolution worker pool are alive
+            // (post-Phase-3 the global IPLReflectionMixer is gone — the
+            // worker pool sums ambisonics manually).
+            bool wantReflections = mReflectionsEnabled
+                && mIplAmbiDecodeEffect && mConvolutionPool && mConvolutionPool->isActive()
                 && !reflBusy && mReflectionSim
                 && mReflectionSim->throttleTickAndConsume();
 
@@ -4800,7 +4802,7 @@ void AudioService::loopStep(float deltaTime)
 
     // Tick reverb tail timers for voices whose source audio has ended.
     // The voice stays alive during the tail so the per-voice convolution
-    // continues feeding its IR tail into the reflection mixer.
+    // continues feeding its IR tail.
     for (auto &[handle, voice] : mVoicePool->voices()) {
         if (voice->sourceEnded && !voice->finished.load(std::memory_order_relaxed)) {
             if (voice->tailTimer <= 0.0f) {
@@ -5417,9 +5419,11 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
         }
     }
 
-    // Create per-voice reflection convolution effect (optional — only if mixer exists).
-    // Uses the reflection sample rate (24kHz or 48kHz) to match the mixer and simulator.
-    if (mIplReflectionMixer) {
+    // Create per-voice reflection effect. Gated on the convolution worker
+    // pool being alive (post-Phase-3 the global mixer is gone — readiness is
+    // signalled by mConvolutionPool->isActive() instead). The reflection
+    // sample rate (24kHz or 48kHz) must match the simulator's.
+    if (mConvolutionPool && mConvolutionPool->isActive()) {
         IPLint32 irSize = static_cast<IPLint32>(mRealtimeDuration * mReflectionSampleRate);
 
         IPLAudioSettings reflAudioSettings{};
@@ -5438,8 +5442,7 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
         err = iplReflectionEffectCreate(mIplContext, &reflAudioSettings,
                                          &reflSettings, &dsp.reflectionEffect);
         if (err == IPL_STATUS_SUCCESS) {
-            dsp.reflectionMixer = mIplReflectionMixer;
-            dsp.convWorker = mConvolutionPool ? mConvolutionPool->worker() : nullptr;
+            dsp.convWorker = mConvolutionPool->worker();
         } else {
             LOG_ERROR("AudioService: iplReflectionEffectCreate failed (error %d) "
                       "— direct effects only for this voice", err);

@@ -305,12 +305,10 @@ struct SteamAudioDSPNode {
     // directEffect fields above; only the main-thread fan-out runs.
     std::array<SubSource, kMaxSubSources> subSources{};
 
-    // Reflection convolution effect (per-voice, feeds into shared mixer)
+    // Per-voice reflection effect. Output flows through the convolution
+    // worker pool (convWorker below); the pre-Phase-3 IPLReflectionMixer
+    // is gone — the worker pool sums ambisonics manually.
     IPLReflectionEffect reflectionEffect = nullptr;
-
-    // Shared reference to the reflection mixer (NOT owned — AudioService manages)
-    // Only used if convolution worker is not active (on-thread fallback).
-    IPLReflectionMixer reflectionMixer = nullptr;
 
     // Pointer to the off-thread convolution worker (set during initVoiceDSP)
     ConvolutionWorker *convWorker = nullptr;
