@@ -388,8 +388,19 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     reflBakeParams.sceneType = (params.sceneType == "embree")
         ? IPL_SCENETYPE_EMBREE : IPL_SCENETYPE_DEFAULT;
     reflBakeParams.identifier = reflId;
+    // Both flags required for HYBRID reverb mode:
+    //   BAKECONVOLUTION — per-probe ambisonic IR (early reflections,
+    //                     deterministic, spatial)
+    //   BAKEPARAMETRIC  — per-probe 3-band RT60 reverb times (late
+    //                     tail, drives parametric FDN decay)
+    // Without BAKEPARAMETRIC, iplProbeBatchGetReverb returns zeros,
+    // which leaves IPLReflectionEffectParams.reverbTimes at 0 in
+    // hybrid-mode apply calls. Steam Audio's parametric reverb then
+    // runs with undefined decay, producing the "second reverb
+    // playing fully" artefact the user reported (2026-05-20).
     reflBakeParams.bakeFlags = static_cast<IPLReflectionsBakeFlags>(
-        IPL_REFLECTIONSBAKEFLAGS_BAKECONVOLUTION);
+        IPL_REFLECTIONSBAKEFLAGS_BAKECONVOLUTION
+        | IPL_REFLECTIONSBAKEFLAGS_BAKEPARAMETRIC);
     reflBakeParams.numRays = params.bakeNumRays;
     reflBakeParams.numDiffuseSamples = params.bakeDiffuseSamples;
     reflBakeParams.numBounces = params.bakeNumBounces;
