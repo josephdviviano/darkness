@@ -82,6 +82,51 @@ struct ProbeBakeParams {
     /// to ProbeManager's configured spacing/height.
     float   spacingFtOverride    = -1.0f;
     float   heightFtOverride     = -1.0f;
+
+    /// Extra elevations (engine feet, above each floor probe position) at
+    /// which to add replicated probes. Empty = floor-grid only (legacy
+    /// behaviour). Typical values: {10.0f} to cover wall-mounted torches
+    /// and ceiling-mounted lamps that emit well above floor height.
+    /// Steam Audio's pathing matches source/listener to nearest probe; if
+    /// only floor probes exist, an elevated emitter routes to the floor
+    /// probe at its (x,y), which misrepresents its actual geometric
+    /// location and can produce odd pathing chains.
+    std::vector<float> additionalElevations;
+
+    /// Per-portal axial anchors (in engine feet) to seed extra probes at.
+    /// Each entry contributes up to 2 probes — one at `center + normal *
+    /// axialOffsetFt` and one at `center - normal * axialOffsetFt` — so
+    /// each adjoining room gets a probe just inside its volume rather
+    /// than a ring sitting ON the doorway plane.  The on-plane ring
+    /// design produced two pathological hotspots:
+    ///   (a) doorway-shaped IRs (rays from 0.5 m off the plane bounced
+    ///       within the narrow doorway corridor → very high early energy)
+    ///   (b) duplicate probes per shared doorway (each portal appears in
+    ///       both adjoining rooms' portal lists; the basis symmetry made
+    ///       the 4 ring positions identical between the two directions →
+    ///       8 probes at 4 unique points per doorway).
+    /// AudioService now visits each portal pair in canonical orientation
+    /// only and supplies the inward-facing `normal`; ProbeManager handles
+    /// the ±offset expansion plus a proximity-dedup pass against the
+    /// floor + elevation tiers so window-style openings still seed cover
+    /// but doorways already covered by the floor grid don't double-count.
+    /// Empty = floor grid only (no portal-centric anchors).
+    struct PortalAxis {
+        Vector3 center;
+        Vector3 normal;   ///< Unit, oriented arbitrarily — both ± sides emit
+    };
+    std::vector<PortalAxis> portalAxes;
+
+    /// Axial probe offset on each side of `PortalAxis::center` (engine
+    /// feet). 1 ft (≈0.3 m) is far enough to bake the *room's* acoustics
+    /// rather than the narrow corridor's.
+    float portalAxialOffsetFt = 1.0f;
+
+    /// Skip a portal-axis candidate if any existing floor/elevation probe
+    /// lies within this many feet — the floor grid already covers it.
+    /// One floor spacing is a sensible default (≈ the radius at which
+    /// IPL would natively interpolate between neighbours anyway).
+    float portalDedupRadiusFt = 5.0f;
 };
 
 /// Construction-time wiring. ProbeManager holds a reference to the IPL

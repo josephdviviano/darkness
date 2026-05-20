@@ -576,6 +576,16 @@ public:
     void  setPropMinAttenuation(float a){ mDSPChain->setPropMinAttenuation(a); }
     float getPropMinAttenuation() const { return mDSPChain->getPropMinAttenuation(); }
 
+    /** Runtime multiplier on the scalar gain produced by
+     *  `eqCoeffsToDspMapping`. 1.0 = identity (baked behaviour). Values
+     *  above 1 make through-portal sound louder than the bake would
+     *  imply — useful when the baked pathing visibility threshold or
+     *  probe coverage feels too aggressive and re-baking is expensive.
+     *  Does NOT affect the LPF blocking factor; only amplitude.
+     *  Range: [0.1, 10.0]. */
+    void  setPathingGainScale(float s) { mPathingGainScale = std::max(0.1f, std::min(s, 10.0f)); }
+    float getPathingGainScale() const  { return mPathingGainScale; }
+
     // ── Ambient tuning (facades — forwarded to AmbientSoundManager) ──
     void setAmbHysteresisStartMul(float m);
     void setAmbHysteresisStopMul(float m);
@@ -649,12 +659,49 @@ public:
     void setProbeHeightFt(float ft);
     float getProbeHeightFt() const;
 
+    /** Extra elevation tier (engine feet, above each floor probe) that
+     *  bakeProbes will replicate the floor grid at, so wall-mounted /
+     *  ceiling-mounted emitters route through pathing probes near their
+     *  actual height. Empty vector = floor-only (legacy). */
+    void setProbeElevations(std::vector<float> heights);
+    /** Toggle the per-portal probe ring. When true, bakeProbes adds 4
+     *  probes (±0.5 m on the portal plane) around each RoomService
+     *  portal centroid. */
+    void setProbePortalRings(bool enabled);
+
     /** Snapshot of probe positions in feet (engine units). Populated by
      *  bakeProbes() and loadProbes(); empty if no probes are loaded. Used
      *  by the renderer to draw a debug overlay. The vector is rebuilt on
      *  every bake/load, so cache by index — values do not change between
      *  re-bakes. */
     const std::vector<Vector3> &getProbePositions() const;
+
+    /** Per-probe reachability classification, parallel to
+     *  getProbePositions(). Populated by classifyProbeReachability();
+     *  empty until that runs. Used by the renderer to tint the probe
+     *  overlay so we can preview which probes a future reachability
+     *  filter would prune before committing to a re-bake. */
+    enum class ProbeFate : uint8_t {
+        Kept        = 0,  ///< In a room reachable from a mapper-placed object
+        NoRoom      = 1,  ///< roomFromPoint returned null (BSP void)
+        Unreachable = 2,  ///< Has a room, but no mapper-placed object's
+                          ///< portal-graph component touches it
+    };
+    const std::vector<ProbeFate> &getProbeFates() const { return mProbeFates; }
+
+    /** Recompute mProbeFates by:
+     *    1) Collecting every concrete (positive-ID) object whose P$Position
+     *       is directly owned (not inherited) and whose enclosing room is
+     *       non-null. Each such room is a BFS seed.
+     *    2) Multi-seed BFS over the room-portal graph (Room::getPortal(i)
+     *       ->getFarRoom()), unioning all reached rooms into a single
+     *       playable set. This covers levels with teleporter-only-
+     *       reachable subgraphs — every gameplay component contains at
+     *       least one mapper-placed seed.
+     *    3) For each probe: roomFromPoint(pos) → null = NoRoom; not in
+     *       playable set = Unreachable; else = Kept.
+     *  @return number of probes that would be pruned (NoRoom + Unreachable). */
+    size_t classifyProbeReachability();
 
     /** Diagnostic: is any player-emitted voice currently making sound?
      *  Used by the renderer to flash a listener-position marker so a user
@@ -1048,6 +1095,15 @@ private:
     /// `iplSceneRetain`); world geometry is not duplicated.
     IPLSimulator mDirectSimulator = nullptr;
 
+    /// True once the loaded probe batch has been attached to mDirectSimulator
+    /// for Steam Audio pathing. Steam Audio's pathing simulator looks up the
+    /// nearest probe to source/listener via the batches registered on the
+    /// simulator handle — separate from the reflection simulator's batch
+    /// list. Idempotent: attached once per probe-load, with iplProbeBatchRetain
+    /// so the ProbeManager's release path (which releases on the reflection
+    /// sim) doesn't free the batch from under us.
+    bool mDirectProbeBatchAdded = false;
+
     /// Whether an acoustic scene is currently active (built and committed).
     /// Atomic as a defensive measure — currently only accessed from the main
     /// thread, but the reflection sim thread could plausibly need it in future.
@@ -1099,6 +1155,14 @@ private:
     int mDiffuseSamples = 64;
     /// Diffuse scattering samples for probe baking (32-512, higher=smoother)
     int mBakeDiffuseSamples = 128;
+
+    /// Per-mission extra probe placement, snapshot at config-load time and
+    /// consumed by `bakeProbes`. `mProbeElevations` adds elevated copies
+    /// of the floor grid (heights in engine feet); `mProbePortalRings`
+    /// triggers a 4-probe ring around each RoomService portal centroid.
+    /// Both take effect only on the NEXT bake.
+    std::vector<float> mProbeElevations = { 10.0f };
+    bool               mProbePortalRings = true;
 
     // Volumetric occlusion sphere radius + sample count moved to
     // AudioOcclusion (mAudioOcclusion). The setters/getters above are
@@ -1154,6 +1218,11 @@ private:
     // one of its sub-sources.
     float    mPropMaxPathDiff     = 50.0f;
 
+    /// Multiplier on the scalar gain emitted by `eqCoeffsToDspMapping`.
+    /// 1.0 = identity. Tunable at runtime via yaml/console to compensate
+    /// for under-amplitude baked pathing without re-baking.
+    float    mPathingGainScale    = 1.0f;
+
     // ── Ambient tuning (P$AmbientHack) ──
     // Moved to AmbientSoundManager — the setAmb* facade methods on this
     // service forward to mAmbientManager.
@@ -1184,6 +1253,12 @@ private:
     // for bakeProbes/loadProbes and the spacing/height/positions accessors.
 
     std::unique_ptr<class ProbeManager> mProbeManager;
+
+    /// Per-probe reachability classification, parallel to
+    /// mProbeManager->getProbePositions(). Cleared on every load/bake and
+    /// recomputed by classifyProbeReachability(). Used only by the debug
+    /// probe overlay — runtime sim ignores it. See ProbeFate for buckets.
+    std::vector<ProbeFate> mProbeFates;
 
     /// True while any voice flagged playerEmitted is producing sound. Set by
     /// loopStep() on the main thread, read by the renderer for the debug

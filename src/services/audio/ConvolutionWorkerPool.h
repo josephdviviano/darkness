@@ -42,9 +42,14 @@
 ///     drives the staging-buffer swap inside the reflection mix node).
 ///   • Audio thread writes per-voice mono into `staging[writeIdx][slotIdx]`
 ///     while sub-workers read from `staging[readBuf][slotIdx]` for the
-///     PREVIOUS frame. The swap (writeIdx flip) happens in the reflection
-///     mix node callback, guarded by `workersReading == 0` so a swap
-///     never strands an in-flight read.
+///     PREVIOUS frame. Staging is **triple-buffered**: at each swap the
+///     mix node picks the buffer that is neither the one just filled
+///     (which becomes the new read target) nor the one workers might
+///     still be on. Workers are allowed to fall one frame behind without
+///     forcing the audio thread to drop a swap. Only if any worker is
+///     two-or-more signals behind (frameSeq − processedSeq ≥ 2) does the
+///     mix node fall back to the legacy drop path, since three buffers
+///     can no longer cover the three simultaneously-live read positions.
 ///   • Sub-worker wake-up uses an atomic `frameSeq` with release/acquire
 ///     ordering; the corresponding `processedSeq` is bumped at the end of
 ///     each iteration so wait loops (drainConvolutionWorker,
@@ -115,6 +120,14 @@ struct ConvolutionSubWorker {
     std::atomic<int> frontIdx{0};
     std::atomic<bool> hasProducedOutput{false};
 
+    // Last decoded sample of the previous reflection frame, kept as state
+    // for the rateDivisor>1 upsampler so the bridge between consecutive
+    // frames is a continuous piecewise-linear curve instead of a held-flat
+    // sample + step discontinuity at every reflection-frame boundary
+    // (audible as a low buzz at reflRate / reflFrameSize Hz).
+    float prevDecodedTailL = 0.0f;
+    float prevDecodedTailR = 0.0f;
+
     // Assignment: indices into shared staging[readBuf].
     // Written by mix node BEFORE signal, read by worker AFTER signal.
     // The atomic frameSeq provides the acquire-release barrier.
@@ -164,15 +177,27 @@ struct ConvolutionWorker {
     };
     static constexpr int kMaxSlots = MAX_ACTIVE_VOICES;
 
-    // Double-buffered voice slots: audio thread writes to staging[writeIdx],
-    // sub-workers read from staging[readBuf]. Swapped atomically via writeIdx.
-    VoiceSlot staging[2][kMaxSlots];
-    int stagingCount[2] = {0, 0};        // count per buffer
+    // Triple-buffered voice slots. Rotation pattern at each swap:
+    //   • writeIdx (just filled by audio thread) → becomes new currentReadBuf
+    //   • currentReadBuf (workers' previous target, may still be in flight)
+    //     → becomes the next writeIdx
+    //   • the remaining buffer is the one workers were NOT on
+    // This way the audio thread never has to drop a swap just because a
+    // worker is finishing the previous frame. Drops only happen if any
+    // worker is ≥ 2 frames behind (catastrophic backlog), since then all
+    // three buffers are simultaneously live.
+    static constexpr int kStagingBuffers = 3;
+    VoiceSlot staging[kStagingBuffers][kMaxSlots];
+    int stagingCount[kStagingBuffers] = {0, 0, 0};  // count per buffer
     std::atomic<int> writeIdx{0};        // audio thread writes to this index
     std::atomic<int> readyCount{0};      // count of the buffer just completed
 
-    // Track how many sub-workers are still reading the staging buffer.
-    // Mix node checks this before swapping — if > 0, drops the frame.
+    // Number of sub-workers that have woken on the current signal but
+    // have not yet finished their iteration. Decremented to 0 by workers
+    // after they release their staging slot references. Vestigial for
+    // safety (drop logic) since the two-frames-behind check on
+    // frameSeq/processedSeq is now the primary back-pressure signal;
+    // kept for shutdown drain diagnostics.
     std::atomic<int> workersReading{0};
 
     // Which staging buffer sub-workers should read (plain int — visibility

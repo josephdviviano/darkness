@@ -39,6 +39,7 @@
 #include "SchemaTypes.h"
 #include "SoundPropagation.h"
 #include "SpeechDatabase.h"
+#include "SteamAudioPathing.h"
 #include "SpeechSelector.h"
 #include "SubSourceSlots.h"
 #include "VoicePool.h"
@@ -1616,6 +1617,7 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
     float wetPeakL = 0.0f;        // diagnostic: peak |wet stereo| after saturation
     float wetPeakR = 0.0f;
     int   wetWorkersHit = 0;      // diagnostic: how many sub-workers actually contributed
+    int   wetStaleFronts = 0;     // diagnostic: how many sub-workers had a stale front buffer
     if (cw) {
         ma_uint32 outSamples = std::min(static_cast<ma_uint32>(cw->frameSize), frameCount);
 
@@ -1626,24 +1628,45 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             std::memset(node->wetScratchR.data(), 0, outSamples * sizeof(float));
         }
 
+        // Per-sub-worker front-buffer freshness diagnostic: count how
+        // often the mix node reads a `front` that the worker hasn't
+        // flipped since the previous callback. Non-zero `stale` means
+        // the worker's output write is lagging past the audio-callback
+        // boundary — the wet bus repeats the previous frame, audible
+        // as low-frequency amplitude modulation ("beating").
+        // Note: workersReading is decremented as soon as the worker
+        // finishes reading staging, well before frontIdx is flipped,
+        // so the existing [CONV_DROP] log doesn't catch this case.
+        static uint64_t sLastConsumedSeq[ConvolutionWorker::kMaxSlots] = {};
         for (auto &subPtr : cw->workers) {
             auto &sub = *subPtr;
             if (!sub.hasProducedOutput.load(std::memory_order_acquire)) continue;
             ++wetWorkersHit;
             int front = sub.frontIdx.load(std::memory_order_acquire);
 
-            // Sum into scratch with gain ramp. Per-sample finite check on the
-            // wet buffers — a NaN slipped through by the convolution worker
-            // would otherwise infect the wet scratch and propagate downstream.
+            // Freshness: has processedSeq advanced since the last callback?
+            // Indexed by sub-worker position in cw->workers; bounded by
+            // kMaxSlots which is always >> reasonable worker counts.
+            size_t wkIdx = (&subPtr - &cw->workers[0]);
+            if (wkIdx < ConvolutionWorker::kMaxSlots) {
+                uint64_t p = sub.processedSeq.load(std::memory_order_acquire);
+                if (p == sLastConsumedSeq[wkIdx]) ++wetStaleFronts;
+                sLastConsumedSeq[wkIdx] = p;
+            }
+
+            // Sum into scratch. Per-sample finite check on the wet buffers
+            // — a NaN slipped through by the convolution worker would
+            // otherwise infect the wet scratch and propagate downstream.
             // Replace bad samples with 0 silently (the wet-workersHit log
             // already surfaces wet bus health).
+            //
+            // No gain ramp: early reflections need the full transient
+            // edge intact, so the wet bus is summed at unity. Any global
+            // wet-bus level adjustment belongs downstream of this point.
             bool wetSawBad = false;
             for (ma_uint32 i = 0; i < outSamples; ++i) {
-                if (node->reflGain < node->reflGainTarget)
-                    node->reflGain = std::min(node->reflGain + node->reflRampRate, node->reflGainTarget);
-                float g = node->reflGain;
-                float lRaw = sub.stereoL[front][i] * g;
-                float rRaw = sub.stereoR[front][i] * g;
+                float lRaw = sub.stereoL[front][i];
+                float rRaw = sub.stereoR[front][i];
                 float l = std::isfinite(lRaw) ? lRaw : (wetSawBad = true, 0.0f);
                 float r = std::isfinite(rRaw) ? rRaw : (wetSawBad = true, 0.0f);
                 node->wetScratchL[i] += l;
@@ -1709,6 +1732,23 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
     // IRs empty, or all voices below floor).
     {
         static std::atomic<int> sWetLogTick{0};
+        // Aggregate sub-worker freshness across the 64-callback window so the
+        // [WET_BUS] dump shows total stale vs fresh front-buffer reads. A
+        // non-zero stale count means the convolution worker's output write
+        // is lagging past at least one audio-callback boundary — the wet bus
+        // is reading a `front` that hasn't been flipped since last callback,
+        // so the same wet stereo content is being summed twice in a row.
+        // That is the structural cause of audible LF amplitude modulation
+        // ("beating") that the existing [CONV_DROP] check does NOT detect
+        // (workersReading is dropped after the staging read, well before
+        // the worker finishes its output write).
+        static std::atomic<int> sStaleAccum{0};
+        static std::atomic<int> sFreshAccum{0};
+        if (cw) {
+            int fresh = std::max(0, wetWorkersHit - wetStaleFronts);
+            sStaleAccum.fetch_add(wetStaleFronts, std::memory_order_relaxed);
+            sFreshAccum.fetch_add(fresh,          std::memory_order_relaxed);
+        }
         int tick = sWetLogTick.fetch_add(1, std::memory_order_relaxed);
         if ((tick & 0x3F) == 0) {  // every ~64 callbacks ≈ 1.4s @ 1024@48k
             // Convert peak to dBFS so the dynamic range is readable (raw 0.0006 vs
@@ -1718,12 +1758,16 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             float peakDb = (peakStereo > 1e-6f) ? 20.0f * std::log10(peakStereo) : -120.0f;
             float preDb = (wetPeakPreSat > 1e-6f) ? 20.0f * std::log10(wetPeakPreSat) : -120.0f;
             float satDeltaDb = preDb - peakDb;  // 0 = passthrough, >0 = saturator working
+            int staleW = sStaleAccum.exchange(0, std::memory_order_relaxed);
+            int freshW = sFreshAccum.exchange(0, std::memory_order_relaxed);
+            int totalW = staleW + freshW;
+            float stalePct = (totalW > 0) ? (100.0f * staleW / totalW) : 0.0f;
             AUDIO_LOG("[WET_BUS] peakL=%.4f peakR=%.4f peakDb=%.1f preDb=%.1f satΔ=%.1fdB "
-                      "drive=%.2f workersHit=%d/3 reflGain=%.2f "
+                      "drive=%.2f workersHit=%d stale=%d fresh=%d stale%%=%.1f "
                       "listenerPos=(%.1f,%.1f,%.1f)\n",
                       wetPeakL, wetPeakR, peakDb, preDb, satDeltaDb,
                       node->wetSaturationEnabled ? node->wetSaturationDrive : 1.0f,
-                      wetWorkersHit, node->reflGain,
+                      wetWorkersHit, staleW, freshW, stalePct,
                       node->listenerPosX, node->listenerPosY, node->listenerPosZ);
         }
     }
@@ -1733,32 +1777,65 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
     if (cw) {
         cw->listenerOrientation = node->listenerOrientation;
 
-        // Swap staging buffers: the write buffer (just filled by voice callbacks)
-        // becomes the read buffer for sub-workers. Start a fresh write buffer.
-        // Guard: if ANY sub-worker is still reading, skip the swap and drop
-        // this frame's staging data to prevent corruption.
+        // Triple-buffered staging swap.
+        //
+        // Buffer layout (3 staging slots):
+        //   • writeIdx  — audio thread is filling this one over the current callback
+        //   • prevRead  — workers' most recently published target; workers either
+        //                 are reading it right now, or already finished and are
+        //                 idle waiting for the next signal
+        //   • the third buffer — guaranteed free under normal operation, becomes
+        //                 the next writeIdx
+        //
+        // After the swap: the buffer we just filled (`w`) is published as the
+        // new read target. The third buffer becomes the new writeIdx. workers
+        // are signaled. Under one-frame-behind worker lag this is still safe
+        // because the new writeIdx is neither `w` (workers' new target) nor the
+        // previous read buffer (slow workers' lingering target).
+        //
+        // Catastrophic-backlog fallback: if any worker is two-or-more signals
+        // behind (frameSeq − processedSeq ≥ 2), three buffers are no longer
+        // enough to cover the live read positions. Fall through to the legacy
+        // drop path. In practice this only fires under sustained CONV_LAG.
         int w = cw->writeIdx.load(std::memory_order_relaxed);
-        int newW = 1 - w;
-        if (cw->workersReading.load(std::memory_order_acquire) > 0) {
-            // Sub-workers still reading — drop this frame.
-            // Diagnostic: count how often we drop and how many voices were
-            // sacrificed. Logged once per ~5 s alongside the perf summary.
+        int prevRead = cw->currentReadBuf;
+
+        bool workersTwoBehind = false;
+        for (auto &subPtr : cw->workers) {
+            uint64_t fs = subPtr->frameSeq.load(std::memory_order_relaxed);
+            uint64_t ps = subPtr->processedSeq.load(std::memory_order_relaxed);
+            if (fs >= ps + 2) { workersTwoBehind = true; break; }
+        }
+
+        if (workersTwoBehind) {
+            // Catastrophic backlog — drop this frame to avoid overwriting a
+            // staging buffer a still-running worker is reading. Same diagnostic
+            // shape as the legacy double-buffer drop, but should be rare.
             static std::atomic<int> sFrameDropCount{0};
             static std::atomic<int> sVoicesDroppedTotal{0};
             sFrameDropCount.fetch_add(1, std::memory_order_relaxed);
             sVoicesDroppedTotal.fetch_add(cw->stagingCount[w],
                                            std::memory_order_relaxed);
-            // Periodic dump (cheap — only fires every 256 drops).
             int dc = sFrameDropCount.load(std::memory_order_relaxed);
-            if ((dc & 0xFF) == 0) {
+            if ((dc & 0xF) == 0) {
                 int vd = sVoicesDroppedTotal.load(std::memory_order_relaxed);
-                AUDIO_LOG("[CONV_DROP] frames=%d voices_lost=%d (workers behind)\n",
+                AUDIO_LOG("[CONV_DROP] frames=%d voices_lost=%d (workers ≥2 frames behind)\n",
                           dc, vd);
             }
             cw->stagingCount[w] = 0;
         } else {
             int count = cw->stagingCount[w];
             cw->readyCount.store(count, std::memory_order_relaxed);
+
+            // Pick the third buffer: not `w` (about to become read target),
+            // not `prevRead` (slow workers may still be on it). First-frame
+            // bootstrap: prevRead == -1 — pick any other buffer.
+            int newW;
+            if (prevRead < 0) {
+                newW = (w + 1) % ConvolutionWorker::kStagingBuffers;
+            } else {
+                newW = (0 + 1 + 2) - w - prevRead;  // the remaining index
+            }
             cw->stagingCount[newW] = 0;
             cw->writeIdx.store(newW, std::memory_order_release);
 
@@ -1772,14 +1849,10 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 sub.assignedSlots[sub.assignedCount++] = i;
             }
 
-            // Set which staging buffer sub-workers should read.
-            // This write is visible to workers via the frameSeq acquire barrier.
-            cw->currentReadBuf = w;  // the buffer we just swapped away from
+            // Publish the new read target before signaling so workers see it
+            // through the frameSeq acquire barrier.
+            cw->currentReadBuf = w;
 
-            // Pre-set workersReading BEFORE signaling to close the TOCTOU gap.
-            // Without this, a sub-worker could wake from the signal but not yet
-            // increment workersReading, letting the next mix node callback see 0
-            // and swap the buffer out from under it.
             cw->workersReading.store(numW, std::memory_order_release);
 
             // Signal all sub-workers that new data is available
@@ -2809,10 +2882,25 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         // is not in the flags. Direct cap is decoupled from the reflection cap
         // (typically much larger — direct sim cost is ~constant per source).
         IPLSimulationSettings directSettings{};
-        directSettings.flags = IPL_SIMULATIONFLAGS_DIRECT;
+        // DIRECT carries distance/occlusion/transmission/air-absorption;
+        // PATHING carries the probe-graph baked path lookup that feeds the
+        // per-voice eqCoeffs gain + LPF for player audio. Both run on the
+        // same direct simulator handle so iplSimulatorRunDirect /
+        // iplSimulatorRunPathing share the staged source list — no
+        // cross-thread synchronisation needed since loopStep runs both
+        // synchronously on the main thread.
+        directSettings.flags = static_cast<IPLSimulationFlags>(
+            IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_PATHING);
         directSettings.sceneType = sceneTypeEnum;
         directSettings.maxNumOcclusionSamples = mSimMaxOcclusionSamplesCfg;
         directSettings.maxNumSources = mDirectMaxSourcesCfg;
+        // Probe-to-probe visibility sampling count for pathing — when a
+        // baked path is occluded by dynamic geometry and findAlternatePaths
+        // re-runs path finding, this controls how many rays test each
+        // candidate edge. 16 matches the benchmark prototype's setting;
+        // higher = smoother dynamic obstruction at proportionally higher
+        // cost.
+        directSettings.numVisSamples = 16;
         // Direct sim runs on the main thread so internal worker threads
         // here are mostly for parallel occlusion ray-traces. Match the
         // reflection sim's choice for now.
@@ -3122,9 +3210,25 @@ void AudioService::destroyAcousticScene()
     // Destroy reflection pipeline before simulator (it references simulator sources)
     destroyReflectionPipeline();
 
-    // Release probe batch before simulator (it's registered with the simulator)
-    if (mProbeManager && mReflectionSim) {
-        mProbeManager->releaseBatch(mReflectionSim->simulator());
+    // Release probe batch before simulator (it's registered with the simulator).
+    // The batch may be attached to BOTH the reflection sim (for baked reverb
+    // lookups) AND the direct sim (for Steam Audio pathing). Detach from the
+    // direct sim first, releasing the iplProbeBatchRetain we took at
+    // loadProbes time, then hand off to ProbeManager which detaches from the
+    // reflection sim and releases the create-time reference.
+    if (mProbeManager) {
+        IPLProbeBatch batch = mProbeManager->getProbeBatch();
+        if (batch && mDirectProbeBatchAdded && mDirectSimulator) {
+            iplSimulatorRemoveProbeBatch(mDirectSimulator, batch);
+            iplSimulatorCommit(mDirectSimulator);
+            iplProbeBatchRelease(&batch);  // drops our retain (batch is aliased,
+                                           // ProbeManager still holds the original
+                                           // create-time reference)
+        }
+        mDirectProbeBatchAdded = false;
+        if (mReflectionSim) {
+            mProbeManager->releaseBatch(mReflectionSim->simulator());
+        }
     }
 
     if (mReflectionSim && mReflectionSim->simulator()) {
@@ -3691,6 +3795,31 @@ void AudioService::loopStep(float deltaTime)
                 // callback after createVoiceSource.
                 voice->dspNode.skipAttenuation = false;
 
+                // Decide which propagation backend drives this voice this
+                // frame. Player audio (everything in mVoicePool) uses Steam
+                // Audio's pathing simulator when the probe batch is attached
+                // to the direct sim AND mProbePathingEnabled is true — gives
+                // a smooth, continuous 3-band eqCoeffs envelope instead of
+                // the room-graph BFS's discrete same-room/cross-room snap
+                // at portal crossings. Player-emitted voices (footsteps,
+                // landings) are excluded — source is approximately the
+                // listener, so the pathing graph collapses to a self-loop
+                // with eqCoeffs ≡ 1.0 anyway, and running it would just
+                // churn the same direct sim. Setting
+                // audio.propagation.probe_pathing: false in YAML (or
+                // toggling probe_pathing in the debug console) flips this
+                // off at runtime, forcing the BFS branch back — used for
+                // A/B testing the two backends without re-baking probes or
+                // restarting the renderer. AI hearing is unaffected
+                // regardless: AIHearingService still calls
+                // RoomService::propagateSoundPath directly (room-BFS), and
+                // its discrete heard/not-heard semantics tolerate the BFS's
+                // step change.
+                bool useSteamAudioPathing = mDirectProbeBatchAdded
+                                          && mProbePathingEnabled
+                                          && !voice->playerEmitted
+                                          && !voice->skipPortalRouting;
+
                 // Run portal propagation to determine reachability and path.
                 // Throttled: nearby voices update every frame, distant voices
                 // every 8-16 frames. Matching the original engine's adaptive
@@ -3709,7 +3838,8 @@ void AudioService::loopStep(float deltaTime)
                 // belt-and-suspenders distance threshold below.
                 SoundPropInfo prop{};
                 bool isCrossRoom = false;
-                if (mPortalRoutingEnabled && !voice->sourceEnded
+                if (!useSteamAudioPathing && mPortalRoutingEnabled
+                    && !voice->sourceEnded
                     && !voice->skipPortalRouting && !voice->playerEmitted) {
                     // Run portal propagation every frame. Per-voice BFS averages
                     // ~3 µs (see `[Audio] portal=...avg=` stats), so ~20 voices ×
@@ -3796,7 +3926,40 @@ void AudioService::loopStep(float deltaTime)
                 //     discretely at the regime switch though — that
                 //     residual step is one of the symptoms tracked in
                 //     HANDOFF.SOUND_PROPAGATION_REALISM.
-                if (prop.reached) {
+                if (useSteamAudioPathing) {
+                    // Steam Audio pathing branch.
+                    //
+                    // portalAttenuation + portalBlocking will be overwritten
+                    // from the per-voice pathing eqCoeffs read after
+                    // iplSimulatorRunPathing fires in the simulation-step
+                    // block below. Pre-seed neutral defaults so the audio
+                    // thread reads stable values during this frame's
+                    // window between dspNode write here and the eqCoeffs
+                    // overwrite a few hundred microseconds later.
+                    //
+                    // usePortalRouting stays false: HRTF direction always
+                    // points at the real source position, which the audio
+                    // callback writes via the existing !usePortalRouting
+                    // branch (toSource = voice->worldPos − mListenerPos).
+                    // Pointing at "first bend in the pathing chain" is a
+                    // Phase 5 refinement and tracked there.
+                    voice->dspNode.usePortalRouting = false;
+                    voice->dspNode.portalAttenuation = 1.0f;
+                    voice->dspNode.portalBlocking    = 0.0f;
+
+                    // maxAudibleDist hard cutoff — same authored value
+                    // that gates AI hearing's BFS, so a wind ambient with
+                    // radius=25 still goes silent at 25 ft of straight-
+                    // line distance. Steam Audio's distance attenuation
+                    // would taper to ~0 at this range anyway, but the
+                    // schema-authored radius is treated as an absolute
+                    // boundary in the original engine.
+                    float lineDist = glm::length(voice->worldPos - mListenerPos);
+                    if (lineDist > voice->maxAudibleDist) {
+                        voice->dspNode.portalAttenuation = 0.0f;
+                        voice->dspNode.portalBlocking    = 1.0f;
+                    }
+                } else if (prop.reached) {
                     // LPF cutoff is driven by *door* blocking only — not by
                     // the combined door+LoudRoom transmission loss
                     // (`totalBlocking`). LoudRoom is a level-designer
@@ -3996,8 +4159,19 @@ void AudioService::loopStep(float deltaTime)
                 sourceCoord.up    = { 0.0f,  1.0f,  0.0f };
 
                 IPLSimulationInputs inputs{};
+                // DIRECT + PATHING share the same direct simulator handle;
+                // REFLECTIONS lives on its own simulator. Pathing fields
+                // below (pathingProbes, visRadius, visThreshold, visRange,
+                // pathingOrder, enableValidation, findAlternatePaths) are
+                // only read when the PATHING flag is set on the
+                // iplSourceSetInputs call below, so the same struct can be
+                // pushed to the reflection simulator with REFLECTIONS only
+                // — Steam Audio ignores fields not selected by the flag
+                // argument.
                 inputs.flags = static_cast<IPLSimulationFlags>(
-                    IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
+                    IPL_SIMULATIONFLAGS_DIRECT
+                    | IPL_SIMULATIONFLAGS_REFLECTIONS
+                    | IPL_SIMULATIONFLAGS_PATHING);
                 // Player-emitted voices (footsteps, landings) emit from the
                 // player's own body — there is no "wall" between the player's
                 // feet and ears, so occlusion + transmission are skipped at
@@ -4055,6 +4229,30 @@ void AudioService::loopStep(float deltaTime)
                     inputs.bakedDataIdentifier = bakedReflId;
                 }
 
+                // Steam Audio pathing inputs — used only when the probe
+                // batch has been attached to mDirectSimulator and the
+                // voice is not player-emitted (player-emitted voices
+                // emit from the listener, so the pathing graph collapses
+                // to a self-loop with eqCoeffs ≡ 1.0; running it is wasted
+                // work). visRange is the per-voice maximum audible
+                // distance (the schema-authored radius), so Steam Audio
+                // stops exploring long detours through the probe graph
+                // beyond what the schema considers audible. pathingOrder
+                // = 0 keeps the path effect mono — we drive the gain +
+                // LPF through portalAttenuation / portalBlocking on the
+                // existing DSP chain rather than as a spatialized
+                // ambisonic field.
+                if (mDirectProbeBatchAdded && mProbePathingEnabled
+                    && !voice->playerEmitted) {
+                    inputs.pathingProbes      = mProbeManager->getProbeBatch();
+                    inputs.visRadius          = 0.5f;   // meters
+                    inputs.visThreshold       = 0.1f;
+                    inputs.visRange           = voice->maxAudibleDist * kFeetToMeters;
+                    inputs.pathingOrder       = 0;
+                    inputs.enableValidation   = IPL_TRUE;
+                    inputs.findAlternatePaths = IPL_TRUE;
+                }
+
                 // Push inputs to both simulators. Each call only consumes
                 // the fields relevant to its flag, so the same struct works
                 // for both. Per phonon.h, no synchronisation is required
@@ -4062,6 +4260,15 @@ void AudioService::loopStep(float deltaTime)
                 // direct- and reflection-side staging buffers.
                 iplSourceSetInputs(voice->directSource,
                     IPL_SIMULATIONFLAGS_DIRECT, &inputs);
+                // Pathing inputs ride on the same direct simulator handle
+                // (we configured it with DIRECT|PATHING flags). The
+                // setInputs call selects which subset of fields the
+                // simulator consumes via the flags argument.
+                if (mDirectProbeBatchAdded && mProbePathingEnabled
+                    && !voice->playerEmitted) {
+                    iplSourceSetInputs(voice->directSource,
+                        IPL_SIMULATIONFLAGS_PATHING, &inputs);
+                }
                 // Stage 2.2: Normal voices without a reflectionSource
                 // (not yet promoted, or recently demoted) have nothing on
                 // the reflection side to update. Skip the call to avoid
@@ -4132,6 +4339,19 @@ void AudioService::loopStep(float deltaTime)
                 }
             }
 
+            // Run Steam Audio pathing on the same direct-sim handle. Cheap
+            // when no probe batch is attached (mDirectProbeBatchAdded =
+            // false) — Steam Audio skips per-source pathing work since
+            // pathingProbes is null for every source. Driven by the
+            // per-voice eqCoeffs read in the output block below. Also
+            // bypassed entirely when mProbePathingEnabled is off
+            // (audio.propagation.probe_pathing: false), so flipping the
+            // toggle saves the full pathing-sim cost rather than just
+            // discarding the outputs.
+            if (mDirectProbeBatchAdded && mProbePathingEnabled) {
+                iplSimulatorRunPathing(mDirectSimulator);
+            }
+
             // Signal reflection sim (throttled, latency-tolerant, background thread)
             if (wantReflections && mReflectionSim) {
                 mReflectionSim->signal();
@@ -4183,6 +4403,86 @@ void AudioService::loopStep(float deltaTime)
             if (mReflectionsEnabled && !isReflectionPending) {
                 iplSourceGetOutputs(voice->reflectionSource,
                     IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+            }
+
+            // Steam Audio pathing → portalAttenuation + portalBlocking.
+            //
+            // Same gating as the setInputs block in Step 2a: voice must
+            // not be player-emitted, must not be skipPortalRouting'd, and
+            // the probe batch must be attached to the direct simulator.
+            // When all three hold, eqCoeffs[3] is a smooth 3-band
+            // attenuation envelope along the resolved probe-graph path —
+            // 1.0 unobstructed, trending toward 0.0 as the path is
+            // increasingly attenuated.
+            //
+            // Mapping (matches PLAN.PLAYER_AUDIO_STEAM_PATHING.md
+            // "eqCoeffs → audio mapping"):
+            //   gain   = 0.25·low + 0.50·mid + 0.25·high  → portalAttenuation
+            //   t      = 1 − high                          → portalBlocking
+            //
+            // Skip when the voice's listener-source distance exceeds
+            // maxAudibleDist (the schema-authored hard cutoff applied in
+            // the Step 2a setInputs block above zeroed portalAttenuation
+            // already). Skip when sourceEnded (no fresh source content;
+            // the convolution tail is still ringing out the previous
+            // pathing state).
+            bool useSteamAudioPathing = mDirectProbeBatchAdded
+                                      && mProbePathingEnabled
+                                      && !voice->playerEmitted
+                                      && !voice->skipPortalRouting;
+            if (useSteamAudioPathing && !voice->sourceEnded) {
+                float lineDist = glm::length(voice->worldPos - mListenerPos);
+                if (lineDist <= voice->maxAudibleDist) {
+                    IPLSimulationOutputs pathingOut{};
+                    iplSourceGetOutputs(voice->directSource,
+                        IPL_SIMULATIONFLAGS_PATHING, &pathingOut);
+
+                    // ── Closed-door blocking layer (PLAN.* "Option A") ──
+                    //
+                    // Steam Audio's pathing graph is baked once, so it
+                    // doesn't see runtime door state changes. We re-introduce
+                    // door-state-dependent muffling here by querying the
+                    // canonical room-pair blocking factor map (updated by
+                    // door open/close logic via setBlockingFactor) for the
+                    // source-room ↔ listener-room edge. The factor varies
+                    // continuously with door angle (the door's JointPos
+                    // interpolates 0..1), so the resulting LPF cutoff and
+                    // gain reduction track door state smoothly.
+                    //
+                    // Implemented as a hashmap lookup rather than a BSP
+                    // raycast (the spec's literal Option A): the raycast's
+                    // "hit a closed door object → look up factor" collapses
+                    // to the same outcome via the room-pair edge, which is
+                    // the canonical place door logic writes its blocking
+                    // value. O(1), so no Euclidean pre-filter against the
+                    // nearest door is needed; we only enter this branch
+                    // for cross-room voices anyway.
+                    //
+                    // Failure mode parallels the spec's raycast variant: a
+                    // closed door that's NOT on the direct source ↔
+                    // listener room boundary (sound routes around it) is
+                    // not gated — correct geometrically, since the
+                    // probe-graph path already routed around it.
+                    float doorBlocking = 0.0f;
+                    if (mSoundPropagation && mRoomService) {
+                        Room *srcR = mRoomService->roomFromPoint(voice->worldPos);
+                        Room *lstR = mRoomService->roomFromPoint(mListenerPos);
+                        if (srcR && lstR && srcR != lstR) {
+                            doorBlocking = mSoundPropagation->getBlockingFactor(
+                                srcR->getRoomID(), lstR->getRoomID());
+                        }
+                    }
+
+                    PathingDspMapping m = eqCoeffsToDspMapping(
+                        pathingOut.pathing.eqCoeffs[0],
+                        pathingOut.pathing.eqCoeffs[1],
+                        pathingOut.pathing.eqCoeffs[2],
+                        doorBlocking,
+                        mPathingGainScale);
+
+                    voice->dspNode.portalAttenuation = m.gain;
+                    voice->dspNode.portalBlocking    = m.blocking;
+                }
             }
 
             if (voice->dspNode.effectsReady) {
@@ -4245,6 +4545,32 @@ void AudioService::loopStep(float deltaTime)
                 }
                 voice->dspNode.directParams.transmissionType =
                     IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
+
+                // pathing_gain_scale knob — boost the dry-path distance
+                // attenuation when Steam Audio pathing reports the voice
+                // is substantially obstructed. The portalAttenuation
+                // value computed above (= m.gain × pathing_gain_scale)
+                // is currently only applied to the wet bus (see the
+                // reflection-send `reflAtten *= currentPortalAtten` at
+                // around AudioService.cpp:1334) — the dry path is driven
+                // by IPL's DirectEffect, which reads distanceAttenuation
+                // and occlusion but knows nothing about pathing eqCoeffs.
+                //
+                // Result without this block: wet bus responds to the
+                // scale knob, dry path does not, which masks the knob
+                // as "no audible change" for ambient sources whose wet
+                // tail is small relative to the dry signal.
+                //
+                // The < 0.95 threshold scopes the boost to genuinely
+                // obstructed voices (cross-room / occluded line-of-
+                // sight). Same-room voices have m.gain ≈ 1 and don't
+                // need lifting — without the gate, raising the scale
+                // would brighten in-room voices too, which is not what
+                // a "cross-room intelligibility" knob should do.
+                if (useSteamAudioPathing && !voice->sourceEnded
+                    && voice->dspNode.portalAttenuation < 0.95f) {
+                    voice->dspNode.directParams.distanceAttenuation *= mPathingGainScale;
+                }
 
                 // ── Per-slot direct outputs (Phase 4 multi-path) ──
                 //
@@ -7108,6 +7434,16 @@ float AudioService::getProbeHeightFt() const
     return mProbeManager ? mProbeManager->getProbeHeightFt() : 5.0f;
 }
 
+void AudioService::setProbeElevations(std::vector<float> heights)
+{
+    mProbeElevations = std::move(heights);
+}
+
+void AudioService::setProbePortalRings(bool enabled)
+{
+    mProbePortalRings = enabled;
+}
+
 const std::vector<Vector3> &AudioService::getProbePositions() const
 {
     static const std::vector<Vector3> kEmpty;
@@ -7139,8 +7475,125 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     params.sceneType             = mSceneTypeCfg;
     params.spacingFtOverride     = spacing;
     params.heightFtOverride      = height;
+    params.additionalElevations  = mProbeElevations;
 
-    return mProbeManager->bakeProbes(mIplScene, outputPath, params, progress);
+    // Build per-portal axial anchors from RoomService at bake time.
+    // For each portal we contribute up to two probe candidates:
+    //   center + normal * axialOffsetFt   (into room A)
+    //   center - normal * axialOffsetFt   (into room B)
+    // ProbeManager applies a proximity dedup against the floor +
+    // elevation tiers so anchors that fall on top of existing grid
+    // probes are dropped before the bake.
+    //
+    // Two filters live here on the audio side because they need
+    // RoomService (the portal+room graph) which ProbeManager doesn't:
+    //
+    //   1. Canonical-orientation dedup. Each shared doorway portal is
+    //      stored in BOTH adjoining rooms' portal lists. We only emit
+    //      when `portal->getPortalID() < portal->getDestPortalID()` so
+    //      a single ProbeAxis represents the pair. (The previous ring
+    //      design emitted both directions, which doubled every doorway
+    //      because the basis symmetry made the 4 ring positions match
+    //      exactly between the two passes.)
+    //
+    //   2. Sky-portal filter. Tall outdoor cells extending to the
+    //      skybox produce portals at the geometric center of their
+    //      shared face — which is up in the sky, far from any floor.
+    //      On miss6 ~250 portal centroids sit above z=+5 ft (well above
+    //      every playable floor in the level). We approximate each
+    //      adjoining room's floor Z by projecting the room center onto
+    //      the most upward-facing bounding plane, then skip the portal
+    //      if its centroid is more than `kSkyThresholdFt` above the
+    //      lower of the two floors. The lower bound is permissive — we
+    //      only drop portals that are unrealistically high above BOTH
+    //      adjoining floors.
+    if (mProbePortalRings && mRoomService) {
+        // 30 ft above floor is well clear of any realistic indoor or
+        // mezzanine portal — typical room ceilings are 8–16 ft. Outdoor
+        // sky portals in miss6 sit ~70 ft above their room floors.
+        constexpr float kSkyThresholdFt = 30.0f;
+
+        auto roomFloorZ = [](Room *r) -> float {
+            // Bounding planes face inward (positive distance = inside).
+            // The most upward-facing plane is the room's floor. Solve
+            // `dot(normal, p) + d = 0` for z at the room's center (x,y).
+            // For axis-aligned rooms this is exact; for OBB-rotated
+            // rooms it gives the floor height under the center, which
+            // is good enough for a "is this portal in the sky?" check.
+            const Plane *planes = r->getBoundingPlanes();
+            int   floorIdx = 0;
+            float bestNz   = -1e9f;
+            for (int i = 0; i < 6; ++i) {
+                if (planes[i].normal.z > bestNz) {
+                    bestNz   = planes[i].normal.z;
+                    floorIdx = i;
+                }
+            }
+            const Plane &fp = planes[floorIdx];
+            if (std::abs(fp.normal.z) < 1e-4f) return r->getCenter().z;
+            const Vector3 c = r->getCenter();
+            return -(fp.normal.x * c.x + fp.normal.y * c.y + fp.d) / fp.normal.z;
+        };
+
+        const auto &rooms = mRoomService->getAllRooms();
+        int totalPortals = 0, skippedDup = 0, skippedSky = 0, emitted = 0;
+        for (const auto &roomPtr : rooms) {
+            if (!roomPtr) continue;
+            const uint32_t portalCount = roomPtr->getPortalCount();
+            for (uint32_t i = 0; i < portalCount; ++i) {
+                RoomPortal *portal = roomPtr->getPortal(i);
+                if (!portal) continue;
+                ++totalPortals;
+
+                // Canonical orientation: keep the lower portal ID only.
+                // For self-loop portals (shouldn't exist but be safe)
+                // myID == destID — keep them.
+                const int32_t myID   = portal->getPortalID();
+                const int32_t destID = portal->getDestPortalID();
+                if (myID > destID) { ++skippedDup; continue; }
+
+                const Vector3 center = portal->getCenter();
+                const Plane  &plane  = portal->getPlane();
+                Vector3 normal{plane.normal.x, plane.normal.y, plane.normal.z};
+                float nLen = glm::length(normal);
+                if (nLen < 1e-4f) continue;
+                normal /= nLen;
+
+                // Sky-portal filter: compare centroid Z to the floors of
+                // both adjoining rooms. Use the lower (more permissive)
+                // floor as the reference so legitimate high-mezzanine
+                // portals survive when one adjoining room has a low floor.
+                Room *roomA = roomPtr.get();
+                Room *roomB = portal->getFarRoom();
+                float bottomA = roomFloorZ(roomA);
+                float bottomB = roomB ? roomFloorZ(roomB) : bottomA;
+                float minBottom = std::min(bottomA, bottomB);
+                if (center.z > minBottom + kSkyThresholdFt) {
+                    ++skippedSky;
+                    continue;
+                }
+
+                ProbeBakeParams::PortalAxis axis;
+                axis.center = center;
+                axis.normal = normal;
+                params.portalAxes.push_back(axis);
+                ++emitted;
+            }
+        }
+        AUDIO_LOG("Portal-axis emit: %d portals walked, %d back-direction "
+                  "dups skipped, %d sky portals skipped, %d emitted "
+                  "(→ up to %d probe candidates pre-dedup)\n",
+                  totalPortals, skippedDup, skippedSky, emitted, emitted * 2);
+    }
+
+    bool ok = mProbeManager->bakeProbes(mIplScene, outputPath, params, progress);
+    if (ok) {
+        // Classify the freshly-baked probes so the overlay can show which
+        // ones a future reachability filter would prune. Cheap and only
+        // the debug overlay reads the result.
+        classifyProbeReachability();
+    }
+    return ok;
 }
 
 
@@ -7151,8 +7604,148 @@ bool AudioService::loadProbes(const std::string &probePath)
         LOG_ERROR("AudioService: cannot load probes — ProbeManager not initialized");
         return false;
     }
-    return mProbeManager->loadProbes(probePath,
+    // If a previous probe batch is still attached to the direct simulator,
+    // detach it BEFORE ProbeManager swaps in a new batch. ProbeManager's
+    // loadProbes only knows about the reflection simulator, so its release
+    // path won't touch the direct sim; leaving the old batch attached
+    // produces a dangling reference once ProbeManager releases its
+    // create-time ref. Symmetric with destroyAcousticScene's teardown.
+    if (mDirectProbeBatchAdded && mDirectSimulator && mProbeManager) {
+        IPLProbeBatch oldBatch = mProbeManager->getProbeBatch();
+        if (oldBatch) {
+            iplSimulatorRemoveProbeBatch(mDirectSimulator, oldBatch);
+            iplSimulatorCommit(mDirectSimulator);
+            iplProbeBatchRelease(&oldBatch);  // drops our retain
+        }
+        mDirectProbeBatchAdded = false;
+    }
+
+    bool ok = mProbeManager->loadProbes(probePath,
         mReflectionSim ? mReflectionSim->simulator() : nullptr);
+    if (!ok) return false;
+
+    // Attach the freshly loaded probe batch to the direct simulator too,
+    // so Steam Audio's pathing can walk the probe graph from each voice's
+    // source to the listener. Retain so ProbeManager's release path on the
+    // reflection simulator side doesn't free the batch out from under us.
+    if (mDirectSimulator) {
+        IPLProbeBatch batch = mProbeManager->getProbeBatch();
+        if (batch) {
+            iplProbeBatchRetain(batch);
+            iplSimulatorAddProbeBatch(mDirectSimulator, batch);
+            iplSimulatorCommit(mDirectSimulator);
+            mDirectProbeBatchAdded = true;
+            AUDIO_LOG("AudioService: attached probe batch (%d probes) to "
+                      "direct simulator for pathing\n",
+                      mProbeManager->getProbeCount());
+        }
+    }
+    // Classify reachability so the debug overlay can preview which probes
+    // a future bake-time filter would prune. Cheap (a few ms even for
+    // thousands of probes) and only the overlay reads the result.
+    classifyProbeReachability();
+    return true;
+}
+
+
+//------------------------------------------------------
+size_t AudioService::classifyProbeReachability()
+{
+    mProbeFates.clear();
+    if (!mProbeManager) return 0;
+
+    const auto &positions = mProbeManager->getProbePositions();
+    if (positions.empty()) return 0;
+
+    if (!mRoomService) {
+        // Without rooms we can't classify anything sensibly. Mark every
+        // probe NoRoom so the overlay still has parallel data.
+        mProbeFates.assign(positions.size(), ProbeFate::NoRoom);
+        AUDIO_LOG("classifyProbeReachability: no RoomService — flagged all "
+                  "%zu probes NoRoom\n",
+                  positions.size());
+        return positions.size();
+    }
+
+    mProbeFates.assign(positions.size(), ProbeFate::Kept);
+
+    // Step 1: collect seed rooms — every room that contains at least one
+    // concrete (mapper-placed) object that directly owns a P$Position.
+    // `owns` (not `has`) skips archetype inheritance, so archetypes whose
+    // position is (0,0,0) don't seed BFS in some unroomed void cell. This
+    // seeding strategy is what handles disconnected playable subgraphs
+    // (e.g. teleporter-only-reachable areas): every gameplay component
+    // must contain at least one mapper-placed object, so it self-seeds.
+    std::unordered_set<Room *> seedRooms;
+    if (mObjectService && mPropertyService) {
+        Property *propPos = mPropertyService->getProperty("Position");
+        if (propPos && propPos->getStorage()) {
+            IntIteratorPtr it = propPos->getStorage()->getAllStoredObjects();
+            while (it && !it->end()) {
+                int id = it->next();
+                if (id <= 0) continue;            // skip archetypes
+                if (!mObjectService->exists(id)) continue;
+                Vector3 pos = mObjectService->position(id);
+                Room *r = mRoomService->roomFromPoint(pos);
+                if (r) seedRooms.insert(r);
+            }
+        }
+    }
+
+    if (seedRooms.empty()) {
+        AUDIO_LOG("[FALLBACK] classifyProbeReachability: no seed rooms "
+                  "found (ObjectService=%p PropertyService=%p) — every "
+                  "probe with a room will be marked Unreachable. Overlay "
+                  "may show entire level red.\n",
+                  static_cast<void *>(mObjectService.get()),
+                  static_cast<void *>(mPropertyService.get()));
+    }
+
+    // Step 2: multi-seed BFS over the room-portal graph. `playable` is the
+    // union of all rooms reachable from any seed.
+    std::unordered_set<Room *> playable;
+    std::queue<Room *> frontier;
+    for (Room *seed : seedRooms) {
+        if (playable.insert(seed).second) frontier.push(seed);
+    }
+    while (!frontier.empty()) {
+        Room *cur = frontier.front();
+        frontier.pop();
+        const uint32_t pc = cur->getPortalCount();
+        for (uint32_t i = 0; i < pc; ++i) {
+            RoomPortal *p = cur->getPortal(i);
+            if (!p) continue;
+            Room *neighbor = p->getFarRoom();
+            if (!neighbor) continue;
+            if (playable.insert(neighbor).second) frontier.push(neighbor);
+        }
+    }
+
+    // Step 3: per-probe classification.
+    size_t kept = 0, noRoom = 0, unreach = 0;
+    for (size_t i = 0; i < positions.size(); ++i) {
+        Room *r = mRoomService->roomFromPoint(positions[i]);
+        if (!r) {
+            mProbeFates[i] = ProbeFate::NoRoom;
+            ++noRoom;
+        } else if (playable.count(r) == 0) {
+            mProbeFates[i] = ProbeFate::Unreachable;
+            ++unreach;
+        } else {
+            mProbeFates[i] = ProbeFate::Kept;
+            ++kept;
+        }
+    }
+
+    AUDIO_LOG("classifyProbeReachability: seeds=%zu rooms → %zu playable; "
+              "probes kept=%zu, noRoom=%zu, unreachable=%zu (would prune "
+              "%zu / %zu = %.1f%%)\n",
+              seedRooms.size(), playable.size(),
+              kept, noRoom, unreach,
+              noRoom + unreach, positions.size(),
+              positions.size() ? 100.0f * (noRoom + unreach) / positions.size() : 0.0f);
+
+    return noRoom + unreach;
 }
 
 

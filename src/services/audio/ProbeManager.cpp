@@ -218,8 +218,117 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     }
 
     iplProbeBatchAddProbeArray(probeBatch, probeArray);
-    iplProbeBatchCommit(probeBatch);
     iplProbeArrayRelease(&probeArray);  // batch now owns the probe data
+
+    // ── Extra coverage: elevation tier + portal-centric rings ──
+    //
+    // Pathing greedy-routes through the nearest visible probes. With
+    // floor-only probes:
+    //   - Elevated emitters (wall torches, ceiling lamps) snap to the
+    //     floor probe under them — pathing reports their position as
+    //     ground-level, distorting eqCoeffs near vertical edges.
+    //   - Portal openings can be densely surrounded by floor probes
+    //     that sit on either side of the wall but none in the doorway
+    //     itself — pathing wraps around through adjacent grid probes
+    //     and stretches chains.
+    //
+    // Both tiers are extra `iplProbeBatchAddProbe` calls with the same
+    // sphere radius as floor probes (one `spacing` worth, in meters).
+    // Steam Audio uses these in the visibility graph alongside the
+    // floor probes — no special treatment needed at bake or runtime.
+
+    // Mirror count for sidecar / debug overlay alignment.
+    int extraProbeCount = 0;
+
+    if (!params.additionalElevations.empty()) {
+        const float probeRadiusM = spacing * kFeetToMeters;
+        const size_t floorProbeCount = mProbePositions.size();
+        for (float elevFt : params.additionalElevations) {
+            if (elevFt <= 0.0f) continue;
+            for (size_t i = 0; i < floorProbeCount; ++i) {
+                Vector3 elevated = mProbePositions[i];
+                elevated.z += elevFt;
+                IPLSphere s{};
+                s.center = engineToIplPos(elevated);
+                s.radius = probeRadiusM;
+                iplProbeBatchAddProbe(probeBatch, s);
+                mProbePositions.push_back(elevated);
+                ++extraProbeCount;
+            }
+        }
+        AUDIO_LOG("Added %d elevation-tier probes "
+                  "(floor count=%zu, tiers=%zu)\n",
+                  extraProbeCount, floorProbeCount,
+                  params.additionalElevations.size());
+    }
+
+    if (!params.portalAxes.empty()) {
+        // Replace the legacy 4-probe on-portal-plane ring with up to 2
+        // axial-offset probes per portal. Each candidate is dropped if
+        // an existing floor/elevation probe already sits within
+        // `dedupRadiusFt` — the floor grid covers it and a portal-anchor
+        // there would only contribute duplicate IR weight at runtime.
+        // Surviving candidates are the "openings without nearby grid
+        // coverage" case (windows, vents, isolated hatches).
+        const float probeRadiusM   = spacing * kFeetToMeters;
+        const float axialOffsetFt  = params.portalAxialOffsetFt;
+        const float dedupRadiusFt  = params.portalDedupRadiusFt;
+        const float dedupRadiusSq  = dedupRadiusFt * dedupRadiusFt;
+
+        // Snapshot the floor+elevation tier size BEFORE adding portal
+        // probes so the proximity test only considers grid neighbours,
+        // not the portal anchors we add inside the loop (otherwise the
+        // second candidate of a portal pair would dedup against the
+        // first, which is exactly the doorway hotspot we're fixing).
+        const size_t gridProbeCount = mProbePositions.size();
+
+        int portalProbeCount = 0;
+        int dedupedCount     = 0;
+        for (const auto &axis : params.portalAxes) {
+            const Vector3 candidates[2] = {
+                axis.center + axis.normal * axialOffsetFt,
+                axis.center - axis.normal * axialOffsetFt,
+            };
+            for (const Vector3 &p : candidates) {
+                // O(grid) brute scan — at miss6 sizes (~10k grid × ~1k
+                // candidates) this is ~10M float ops, well under a
+                // second. If bake density ever grows to where this
+                // matters, swap to a uniform-cell hash on (x,y) — but
+                // until then the simpler code is the better trade.
+                bool tooClose = false;
+                for (size_t i = 0; i < gridProbeCount; ++i) {
+                    Vector3 d = mProbePositions[i] - p;
+                    if (glm::dot(d, d) < dedupRadiusSq) { tooClose = true; break; }
+                }
+                if (tooClose) { ++dedupedCount; continue; }
+
+                IPLSphere s{};
+                s.center = engineToIplPos(p);
+                s.radius = probeRadiusM;
+                iplProbeBatchAddProbe(probeBatch, s);
+                mProbePositions.push_back(p);
+                ++extraProbeCount;
+                ++portalProbeCount;
+            }
+        }
+        AUDIO_LOG("Added %d portal-axis probes around %zu portals "
+                  "(axialOffset=%.1fft, dedupRadius=%.1fft, "
+                  "%d candidates deduped against floor grid)\n",
+                  portalProbeCount, params.portalAxes.size(),
+                  axialOffsetFt, dedupRadiusFt, dedupedCount);
+    }
+
+    if (extraProbeCount > 0) {
+        // Keep numProbes in sync with the actual batch size so downstream
+        // bake stages, the round-trip validation, and the .energy.csv
+        // audit all iterate the full set.
+        numProbes = static_cast<int>(mProbePositions.size());
+        AUDIO_LOG("Total probes after extension: %d "
+                  "(floor=%d, extra=%d)\n",
+                  numProbes, numProbes - extraProbeCount, extraProbeCount);
+    }
+
+    iplProbeBatchCommit(probeBatch);
 
     // Step 3: Bake pathing data (visibility graph + shortest paths)
     AUDIO_LOG( "Baking pathing data for %d probes...\n", numProbes);

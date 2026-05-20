@@ -780,6 +780,7 @@ static void renderDebugOverlay(
     // prevent. show_portals and show_vpos were added later and missed
     // the list.
     if (!state.showRaycast && !state.showAcousticMesh
+        && !state.showAcousticHit
         && !state.showProbes && !state.showRooms
         && !state.showPortals && !state.showVPos) {
         return;
@@ -954,6 +955,166 @@ static void renderDebugOverlay(
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
         bgfx::setUniform(gpu.u_objectLight, whiteLight);
         bgfx::submit(2, gpu.flatProgram);
+    }
+
+    // ── Acoustic-mesh raycast highlighter ──
+    // Casts a ray from the camera along the forward direction against the
+    // stored acoustic triangles (CPU brute-force Möller-Trumbore) and
+    // renders the closest hit triangle solid red. HUD shows hit distance
+    // + per-triangle texture name. Designed to scan for holes — anywhere
+    // the user expects a wall but no triangle highlights within the
+    // configured range indicates missing geometry in the acoustic mesh.
+    if (state.showAcousticHit
+        && !state.acousticIndices.empty()
+        && !state.acousticVerts.empty())
+    {
+        // Engine Z-up camera forward (matches show_raycast above).
+        const float cosPitch = std::cos(state.cam.pitch);
+        const float fwdX = std::cos(state.cam.yaw) * cosPitch;
+        const float fwdY = std::sin(state.cam.yaw) * cosPitch;
+        const float fwdZ = std::sin(state.cam.pitch);
+        const float ox = state.cam.pos[0];
+        const float oy = state.cam.pos[1];
+        const float oz = state.cam.pos[2];
+
+        constexpr float kRayMaxDist = 500.0f;  // engine feet
+        const size_t numTris = state.acousticIndices.size() / 3;
+
+        // Möller-Trumbore single-precision, two-sided (audio meshes
+        // have no consistent winding rule). Tracks closest positive-t hit.
+        float bestT = std::numeric_limits<float>::infinity();
+        size_t bestTri = static_cast<size_t>(-1);
+        float bestVx0=0, bestVy0=0, bestVz0=0;
+        float bestVx1=0, bestVy1=0, bestVz1=0;
+        float bestVx2=0, bestVy2=0, bestVz2=0;
+        const float *verts = state.acousticVerts.data();
+        const int32_t *idx = state.acousticIndices.data();
+
+        for (size_t t = 0; t < numTris; ++t) {
+            int32_t i0 = idx[t*3 + 0];
+            int32_t i1 = idx[t*3 + 1];
+            int32_t i2 = idx[t*3 + 2];
+            float ax = verts[i0*3+0], ay = verts[i0*3+1], az = verts[i0*3+2];
+            float bx_ = verts[i1*3+0], by = verts[i1*3+1], bz = verts[i1*3+2];
+            float cx = verts[i2*3+0], cy = verts[i2*3+1], cz = verts[i2*3+2];
+            float e1x = bx_-ax, e1y = by-ay, e1z = bz-az;
+            float e2x = cx-ax, e2y = cy-ay, e2z = cz-az;
+            // h = dir × e2
+            float hx = fwdY*e2z - fwdZ*e2y;
+            float hy = fwdZ*e2x - fwdX*e2z;
+            float hz = fwdX*e2y - fwdY*e2x;
+            float a = e1x*hx + e1y*hy + e1z*hz;
+            if (std::fabs(a) < 1e-7f) continue;
+            float f = 1.0f / a;
+            float sx = ox - ax, sy = oy - ay, sz = oz - az;
+            float u = f * (sx*hx + sy*hy + sz*hz);
+            if (u < 0.0f || u > 1.0f) continue;
+            // q = s × e1
+            float qx = sy*e1z - sz*e1y;
+            float qy = sz*e1x - sx*e1z;
+            float qz = sx*e1y - sy*e1x;
+            float vv = f * (fwdX*qx + fwdY*qy + fwdZ*qz);
+            if (vv < 0.0f || u + vv > 1.0f) continue;
+            float tt = f * (e2x*qx + e2y*qy + e2z*qz);
+            if (tt > 1e-4f && tt < bestT && tt < kRayMaxDist) {
+                bestT = tt;
+                bestTri = t;
+                bestVx0 = ax; bestVy0 = ay; bestVz0 = az;
+                bestVx1 = bx_; bestVy1 = by; bestVz1 = bz;
+                bestVx2 = cx; bestVy2 = cy; bestVz2 = cz;
+            }
+        }
+
+        // HUD readout — always emit, hit or miss, since "miss within
+        // kRayMaxDist" is the signal we're hunting.
+        uint8_t hudAttr = 0x4f;  // white on red — high contrast
+        if (bestTri == static_cast<size_t>(-1)) {
+            bgfx::dbgTextPrintf(2, 12, hudAttr,
+                "Acoustic mesh: NO HIT within %.0f ft (camera forward) — likely hole in mesh",
+                kRayMaxDist);
+        } else {
+            const char *texName = (bestTri < state.acousticTexNames.size())
+                ? state.acousticTexNames[bestTri].c_str() : "<unknown>";
+            float hx = ox + fwdX * bestT;
+            float hy = oy + fwdY * bestT;
+            float hz = oz + fwdZ * bestT;
+            bgfx::dbgTextPrintf(2, 12, 0x2f,  // white on green
+                "Acoustic mesh hit: tri=%zu t=%.2f ft  pos=(%.1f,%.1f,%.1f)  tex='%s'",
+                bestTri, bestT, hx, hy, hz, texName);
+
+            // Nudge the triangle slightly toward the camera along its
+            // surface normal. The hit triangle lies on the exact same
+            // surface as the rendered wall (the world pass drew the
+            // same poly at the same depth), so without an offset the
+            // highlight z-fights or fails DEPTH_TEST. 0.05 ft = 1.5 cm
+            // — invisible at any normal viewing distance, more than
+            // enough to break the tie.
+            float nx_ = (bestVy1 - bestVy0) * (bestVz2 - bestVz0)
+                      - (bestVz1 - bestVz0) * (bestVy2 - bestVy0);
+            float ny_ = (bestVz1 - bestVz0) * (bestVx2 - bestVx0)
+                      - (bestVx1 - bestVx0) * (bestVz2 - bestVz0);
+            float nz_ = (bestVx1 - bestVx0) * (bestVy2 - bestVy0)
+                      - (bestVy1 - bestVy0) * (bestVx2 - bestVx0);
+            float nLen = std::sqrt(nx_*nx_ + ny_*ny_ + nz_*nz_);
+            if (nLen > 1e-6f) {
+                nx_ /= nLen; ny_ /= nLen; nz_ /= nLen;
+                // Orient toward the camera (flip if facing away).
+                if (nx_ * fwdX + ny_ * fwdY + nz_ * fwdZ > 0.0f) {
+                    nx_ = -nx_; ny_ = -ny_; nz_ = -nz_;
+                }
+                constexpr float kBias = 0.05f;
+                bestVx0 += nx_ * kBias; bestVy0 += ny_ * kBias; bestVz0 += nz_ * kBias;
+                bestVx1 += nx_ * kBias; bestVy1 += ny_ * kBias; bestVz1 += nz_ * kBias;
+                bestVx2 += nx_ * kBias; bestVy2 += ny_ * kBias; bestVz2 += nz_ * kBias;
+            }
+
+            // Render via transient VB — same pattern as show_raycast
+            // above. Solid bright magenta. Depth test LEQUAL with the
+            // 0.05 ft camera-ward bias above: the hit triangle's bias
+            // is more than enough to win the depth comparison against
+            // the wall the ray actually hit (which is exactly the
+            // same surface, so they z-fight without the bias), but
+            // nowhere near enough to escape occlusion by any closer
+            // geometry. Net effect: the highlight is visible when
+            // the camera has line-of-sight to the hit triangle, and
+            // hidden when a closer wall (that may or may not be in
+            // the acoustic mesh itself) sits between camera and hit.
+            // The latter case is the smoking-gun for a hole in the
+            // acoustic mesh: HUD reports a hit at e.g. 80 ft, but
+            // the user sees a wall 10 ft ahead and no magenta — the
+            // raycast went THROUGH the visible wall because it's
+            // missing from the acoustic mesh. No fog. No cull —
+            // brute-force raycast is two-sided.
+            constexpr uint32_t kHitVerts = 3;
+            if (bgfx::getAvailTransientVertexBuffer(
+                    kHitVerts, Darkness::PosColorVertex::layout) >= kHitVerts) {
+                bgfx::TransientVertexBuffer hitTvb;
+                bgfx::allocTransientVertexBuffer(
+                    &hitTvb, kHitVerts, Darkness::PosColorVertex::layout);
+                auto *tv = reinterpret_cast<Darkness::PosColorVertex *>(hitTvb.data);
+                tv[0] = {bestVx0, bestVy0, bestVz0, 0xFFFF00FFu};
+                tv[1] = {bestVx1, bestVy1, bestVz1, 0xFFFF00FFu};
+                tv[2] = {bestVx2, bestVy2, bestVz2, 0xFFFF00FFu};
+
+                float identity[16];
+                bx::mtxIdentity(identity);
+                bgfx::setTransform(identity);
+                bgfx::setVertexBuffer(0, &hitTvb, 0, kHitVerts);
+                uint64_t triState = BGFX_STATE_WRITE_RGB
+                                  | BGFX_STATE_WRITE_A
+                                  | BGFX_STATE_DEPTH_TEST_LEQUAL
+                                  | BGFX_STATE_BLEND_ALPHA;
+                bgfx::setState(triState);
+                float noFog[4] = {0, 0, 0, 0};
+                bgfx::setUniform(gpu.u_fogColor, noFog);
+                bgfx::setUniform(gpu.u_fogParams, noFog);
+                float opaqueParams[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+                float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
+                bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+                bgfx::setUniform(gpu.u_objectLight, whiteLight);
+                bgfx::submit(2, gpu.flatProgram);
+            }
+        }
     }
 
     // ── Room/portal wireframe overlay ──
@@ -1241,26 +1402,60 @@ static void renderDebugOverlay(
     {
         auto audioSvc = GET_SERVICE(Darkness::AudioService);
 
-        // Probe scatter: cyan cubes at every probe position, with the probe
-        // nearest the listener highlighted in orange. Depth disabled so the
-        // grid is visible through walls.
+        // Probe scatter with reachability preview. Each probe gets one of
+        // four tints (depth disabled so the grid is visible through walls):
+        //
+        //   white   — nearest to listener (was orange; bumped to white so
+        //             "active" reads as distinct from the warm reds below)
+        //   cyan    — Kept (in a room reachable from a mapper-placed object)
+        //   red     — NoRoom (BSP void / unroomed cell)
+        //   magenta — Unreachable (has a room, but isolated from playable
+        //             space — would prune at bake-time even though IPL placed
+        //             it on a real floor)
+        //
+        // Classification comes from AudioService::getProbeFates(), which is
+        // populated by classifyProbeReachability() automatically after every
+        // load/bake (and on-demand via the `classify_probes` console action).
+        // The vector is parallel to getProbePositions(); if it's empty or
+        // wrong-length we fall back to the cyan-only legacy view.
         if (audioSvc) {
             const auto &probes = audioSvc->getProbePositions();
+            const auto &fates  = audioSvc->getProbeFates();
+            const bool fatesValid = fates.size() == probes.size();
             Darkness::Vector3 listenerPos = audioSvc->getListenerPos();
+
+            // Squared cull radius — zero (or negative) disables culling.
+            // Compare against squared distance throughout to skip the sqrt
+            // per probe; relevant when probe count is in the thousands.
+            const float cullRadius = state.probeRenderRadius;
+            const float cullRadiusSq = (cullRadius > 0.0f) ? cullRadius * cullRadius : 0.0f;
+            const bool  cullEnabled  = cullRadiusSq > 0.0f;
+
             int   nearestIdx  = -1;
-            float nearestDist = 1e9f;
+            float nearestDistSq = std::numeric_limits<float>::max();
             for (size_t i = 0; i < probes.size(); ++i) {
-                float d = glm::length(probes[i] - listenerPos);
-                if (d < nearestDist) { nearestDist = d; nearestIdx = static_cast<int>(i); }
+                Darkness::Vector3 d = probes[i] - listenerPos;
+                float ds = glm::dot(d, d);
+                if (ds < nearestDistSq) { nearestDistSq = ds; nearestIdx = static_cast<int>(i); }
             }
 
             uint64_t probeState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                                 | BGFX_STATE_CULL_CW;
-            float opaque[4]    = {1.0f, 0.0f, 0.0f, 0.0f};
-            float cyanTint[4]  = {0.0f, 0.8f, 1.0f, 0.0f};
-            float nearTint[4]  = {1.0f, 0.3f, 0.0f, 0.0f};
+            float opaque[4]      = {1.0f, 0.0f, 0.0f, 0.0f};
+            float keptTint[4]    = {0.0f, 0.8f, 1.0f, 0.0f};  // cyan
+            float noRoomTint[4]  = {1.0f, 0.0f, 0.0f, 0.0f};  // red
+            float unreachTint[4] = {0.9f, 0.0f, 0.7f, 0.0f};  // magenta
+            float nearestTint[4] = {1.0f, 1.0f, 1.0f, 0.0f};  // white
             for (size_t i = 0; i < probes.size(); ++i) {
                 const auto &p = probes[i];
+                // Listener-relative distance cull. The nearest probe is
+                // exempted so the active-probe indicator never disappears
+                // even if it happens to sit slightly outside the radius
+                // (e.g. listener standing in a probe-sparse region).
+                if (cullEnabled && static_cast<int>(i) != nearestIdx) {
+                    Darkness::Vector3 d = p - listenerPos;
+                    if (glm::dot(d, d) > cullRadiusSq) continue;
+                }
                 float mtx[16];
                 bx::mtxSRT(mtx,
                     state.probeMarkerSize, state.probeMarkerSize, state.probeMarkerSize,
@@ -1274,8 +1469,22 @@ static void renderDebugOverlay(
                 bgfx::setUniform(gpu.u_fogColor,  noFog);
                 bgfx::setUniform(gpu.u_fogParams, noFog);
                 bgfx::setUniform(gpu.u_objectParams, opaque);
-                bgfx::setUniform(gpu.u_objectLight,
-                    (static_cast<int>(i) == nearestIdx) ? nearTint : cyanTint);
+
+                float *tint = keptTint;
+                if (static_cast<int>(i) == nearestIdx) {
+                    tint = nearestTint;
+                } else if (fatesValid) {
+                    switch (fates[i]) {
+                        case Darkness::AudioService::ProbeFate::NoRoom:
+                            tint = noRoomTint; break;
+                        case Darkness::AudioService::ProbeFate::Unreachable:
+                            tint = unreachTint; break;
+                        case Darkness::AudioService::ProbeFate::Kept:
+                        default:
+                            tint = keptTint; break;
+                    }
+                }
+                bgfx::setUniform(gpu.u_objectLight, tint);
                 bgfx::submit(2, gpu.flatProgram);
             }
         }
@@ -1323,9 +1532,25 @@ static void renderDebugOverlay(
         const uint8_t valAttr   = 0x0A;  // green on black
         const uint8_t warnAttr  = 0x0C;  // red on black
         if (probeCount > 0) {
+            // Break the count down by reachability bucket so the user can see
+            // at a glance how many probes a future filter would prune without
+            // having to scrub the stderr log.
+            int kept = 0, noRoom = 0, unreach = 0;
+            if (audioSvc) {
+                const auto &fates = audioSvc->getProbeFates();
+                if (static_cast<int>(fates.size()) == probeCount) {
+                    for (auto f : fates) {
+                        switch (f) {
+                            case Darkness::AudioService::ProbeFate::Kept:        ++kept;    break;
+                            case Darkness::AudioService::ProbeFate::NoRoom:      ++noRoom;  break;
+                            case Darkness::AudioService::ProbeFate::Unreachable: ++unreach; break;
+                        }
+                    }
+                }
+            }
             bgfx::dbgTextPrintf(2, 14, valAttr,
-                "Probes: %d  (size=%.1fft, orange = nearest to listener)",
-                probeCount, state.probeMarkerSize);
+                "Probes: %d  (white=nearest, cyan=%d kept, red=%d noRoom, magenta=%d unreach, size=%.1fft)",
+                probeCount, kept, noRoom, unreach, state.probeMarkerSize);
         } else {
             bgfx::dbgTextPrintf(2, 14, warnAttr,
                 "Probes: 0 positions loaded — run `bake_probes on` "
@@ -1844,6 +2069,11 @@ static void registerConsoleSettings(
         [&state](bool v) { state.showAcousticMesh = v; },
         "Cyan wireframe overlay of the acoustic scene geometry");
 
+    dbgConsole.addBool("show_acoustic_hit",
+        [&state]() { return state.showAcousticHit; },
+        [&state](bool v) { state.showAcousticHit = v; },
+        "Raycast from camera forward against the acoustic mesh; highlight the closest hit triangle in red. HUD shows hit distance + texture name. Use to scan for holes: if you look at a wall and no triangle highlights within range, the acoustic mesh is missing geometry there (likely a BSP-split non-rendered portal silently excluded from the mesh).");
+
     dbgConsole.addBool("show_rooms",
         [&state]() { return state.showRooms; },
         [&state](bool v) { state.showRooms = v; },
@@ -2337,6 +2567,17 @@ static void registerConsoleSettings(
         },
         "Floor on portal-routed path attenuation (higher = quieter through walls)");
 
+    dbgConsole.addFloat("pathing_gain_scale", 0.1f, 10.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getPathingGainScale() : 1.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setPathingGainScale(v);
+        },
+        "Runtime multiplier on baked-pathing gain (1=identity, >1=louder through doorways)");
+
     // Bake probes: set to "on" to trigger re-baking.
     // The action runs on a background thread with a progress-bar overlay
     // (same helper as the first-run auto-bake) so the window stays
@@ -2352,6 +2593,23 @@ static void registerConsoleSettings(
             runBakeWithProgressBar(window, state, svc, probePath);
         },
         "Re-bake acoustic probes (~10-60s with progress bar). Auto-baked on first run.");
+
+    // Re-run the reachability classification used by the probe overlay.
+    // Auto-runs after every load/bake, but exposing a manual trigger lets
+    // you tune the heuristic (e.g. after teleporting / spawning more
+    // objects / poking RoomService) without restarting the binary.
+    dbgConsole.addBool("classify_probes",
+        []() { return false; },
+        [](bool v) {
+            if (!v) return;
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (!svc) return;
+            size_t pruneCount = svc->classifyProbeReachability();
+            std::fprintf(stderr,
+                "Probe reachability reclassified: %zu would be pruned "
+                "(see stderr above for breakdown).\n", pruneCount);
+        },
+        "Recompute the probe-reachability overlay (red=NoRoom, magenta=Unreachable).");
 
     dbgConsole.addFloat("probe_count", 0.0f, 99999.0f,
         []() {
@@ -2402,6 +2660,11 @@ static void registerConsoleSettings(
         [&state]() { return state.probeMarkerSize; },
         [&state](float v) { state.probeMarkerSize = std::max(0.1f, std::min(v, 10.0f)); },
         "Size in feet of probe/listener debug cubes");
+
+    dbgConsole.addFloat("probe_render_radius", 0.0f, 10000.0f,
+        [&state]() { return state.probeRenderRadius; },
+        [&state](float v) { state.probeRenderRadius = std::max(0.0f, v); },
+        "Listener-relative cull radius for probe overlay in feet (0 = draw all)");
 
     dbgConsole.addBool("record_audio",
         []() {
@@ -3505,6 +3768,8 @@ int main(int argc, char *argv[]) {
         // and read by manual bake_probes triggers from the debug console.
         audioSvc->setProbeSpacingFt(cfg.audioProbeSpacingFt);
         audioSvc->setProbeHeightFt(cfg.audioProbeHeightFt);
+        audioSvc->setProbeElevations(cfg.audioProbeElevations);
+        audioSvc->setProbePortalRings(cfg.audioProbePortalRings);
 
         // -- audio.occlusion --
         audioSvc->setOcclusionRadius(cfg.occlusionRadius);
@@ -3523,6 +3788,7 @@ int main(int argc, char *argv[]) {
         audioSvc->setPropMinAttenuation(cfg.propMinAttenuation);
         audioSvc->setPropMaxPaths(cfg.propMaxPaths);
         audioSvc->setPropMaxPathDiff(cfg.propMaxPathDiff);
+        audioSvc->setPathingGainScale(cfg.pathingGainScale);
 
         // -- audio.spatialization --
         audioSvc->setHRTFVolume(cfg.hrtfVolume);
@@ -3587,10 +3853,16 @@ int main(int argc, char *argv[]) {
             std::fprintf(stderr, "Probe baking skipped (--no-probes)\n");
         }
 
-        // Store acoustic mesh data for debug wireframe overlay.
-        // GPU buffer is created later after bgfx::init.
+        // Store acoustic mesh data for debug wireframe overlay AND the
+        // per-frame `show_acoustic_hit` raycast highlighter. GPU buffer
+        // is created later after bgfx::init; the CPU-side copy stays
+        // resident for the lifetime of the mission so the raycast tool
+        // can do Möller-Trumbore against every triangle each frame.
+        // Memory is ~12 B/vertex × ~3·numTris + small per-tri name
+        // string — single-digit MB on Thief 2 missions.
         state.acousticVerts = fullScene.vertices;
         state.acousticIndices = fullScene.indices;
+        state.acousticTexNames = fullScene.texNames;
     }
 
     // Inject raycaster into the world query facade — enables ray-vs-world
@@ -4233,11 +4505,15 @@ int main(int argc, char *argv[]) {
         state.acousticVBH = bgfx::createVertexBuffer(mem, Darkness::PosColorVertex::layout);
         std::fprintf(stderr, "Acoustic debug mesh: %zu tris, %u line verts\n",
                      numTris, state.acousticLineCount);
-        // Free CPU-side data now that GPU buffer is created
-        state.acousticVerts.clear();
-        state.acousticVerts.shrink_to_fit();
-        state.acousticIndices.clear();
-        state.acousticIndices.shrink_to_fit();
+        // Note: the CPU-side acousticVerts / acousticIndices /
+        // acousticTexNames are intentionally retained for the
+        // `show_acoustic_hit` raycast tool. Cost is single-digit MB on
+        // Thief 2 missions and survives only for the mission's lifetime.
+
+        // (acousticHitVBH is unused — show_acoustic_hit allocates a
+        // transient VB each frame instead, matching the show_raycast
+        // pattern. State field kept for ABI stability with any external
+        // tools; safe to remove in a follow-up.)
     }
 
     // ── Build per-room debug geometry (room/portal wireframe overlay) ──
@@ -4800,6 +5076,8 @@ int main(int argc, char *argv[]) {
     // Destroy runtime GPU resources not in GPUResources struct
     if (bgfx::isValid(state.acousticVBH))
         bgfx::destroy(state.acousticVBH);
+    if (bgfx::isValid(state.acousticHitVBH))
+        bgfx::destroy(state.acousticHitVBH);
 
     // Flush and close the head log before destroying physics / GPU resources.
     closeHeadLog(state);

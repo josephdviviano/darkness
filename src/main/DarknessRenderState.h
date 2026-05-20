@@ -357,9 +357,23 @@ struct RuntimeState {
     bool showAcousticMesh = false;
     std::vector<float> acousticVerts;     // x,y,z flat array
     std::vector<int32_t> acousticIndices; // triangle indices
+    // Per-triangle TXLIST texture name (or "_portal" for rendered portal
+    // polygons). Used by the show_acoustic_hit raycast tool's HUD.
+    std::vector<std::string> acousticTexNames;
     bgfx::VertexBufferHandle acousticVBH = BGFX_INVALID_HANDLE;
     bgfx::IndexBufferHandle  acousticIBH = BGFX_INVALID_HANDLE;
     uint32_t acousticLineCount = 0;
+
+    // Debug: acoustic-mesh raycast highlighter. Casts a ray from the
+    // camera along the forward direction against the acoustic mesh
+    // triangles and renders the closest hit triangle as a solid red
+    // overlay, plus HUD text with distance + texture name. Toggle via
+    // `show_acoustic_hit` in the debug console. Identifies holes:
+    // anywhere the camera "should" hit a wall but the ray misses
+    // (within the configured max range) signals a missing triangle in
+    // the acoustic mesh.
+    bool showAcousticHit = false;
+    bgfx::DynamicVertexBufferHandle acousticHitVBH = BGFX_INVALID_HANDLE;
 
     // Debug: acoustic probe overlay — scatter a colored cube at every baked
     // probe position (queried from AudioService) and flash a marker at the
@@ -369,6 +383,13 @@ struct RuntimeState {
     // perceived footstep loudness.
     bool  showProbes        = false;
     float probeMarkerSize   = 1.0f;   // half-extent of the cube in feet
+    // Cull probes farther than this from the listener before submitting.
+    // Each probe is its own bgfx draw call; at high bake densities (thousands
+    // of probes, e.g. with elevations + portal rings + sub-5-ft spacing) the
+    // per-frame submit count tanks the frame rate. 0 = no cull (draw all).
+    // Listener-relative, not camera-relative, so the visualization stays
+    // aligned with the audio system's notion of "near."
+    float probeRenderRadius = 100.0f; // feet; 0 disables culling
 
     // Debug: room/portal wireframe overlay. Per-room edges are computed at
     // startup from the room's 6 bounding planes and the portal-edge planes
