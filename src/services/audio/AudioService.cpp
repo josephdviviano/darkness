@@ -5033,30 +5033,62 @@ void AudioService::loopStep(float deltaTime)
                                   && (isReflVoice || hasBakedData);
 
                 if (enableRefl) {
-                    voice->dspNode.reflectionParams = outputs.reflections;
-                    // Per-call effect-type. Must match the effect-create-time
-                    // type and the simulator's reflectionType (phonon.h
-                    // enforces this). Translated from mReflectionType so the
-                    // three places stay coherent.
-                    voice->dspNode.reflectionParams.type =
-                        (mReflectionType == ReflectionType::Hybrid)
-                            ? IPL_REFLECTIONEFFECTTYPE_HYBRID
-                            : (mReflectionType == ReflectionType::Parametric)
-                                ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
-                                : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-                    voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
+                    // ── Per-voice IR pinning (2026-05-20) ──
+                    //
+                    // First time a voice has valid IR data, COPY the full IR
+                    // payload into voice->pinnedIRData and pin the params
+                    // struct (with .ir pointing at our copy) for the voice's
+                    // entire lifetime. Subsequent sim cycles produce updated
+                    // IRs in outputs.reflections, but we ignore them — keeping
+                    // the convolution effect's params.ir pointer stable
+                    // eliminates the Steam-Audio-internal IR crossfade that
+                    // produces the ~5 Hz amplitude pulse ("beating") in the
+                    // wet bus. See VoicePool.h "Pinned per-voice IR" docs.
+                    if (!voice->reflectionIRPinned
+                        && outputs.reflections.irSize > 0
+                        && outputs.reflections.ir != nullptr) {
+                        // outputs.reflections.ir is an opaque
+                        // IPLReflectionEffectIR handle owned by Steam
+                        // Audio; we hold the handle as-is and never
+                        // refresh it. Force the type + numChannels to
+                        // match what the effect was created with
+                        // (defence-in-depth in case outputs.reflections
+                        // has stale values from sim-settings drift).
+                        voice->pinnedParams = outputs.reflections;
+                        voice->pinnedParams.type =
+                            (mReflectionType == ReflectionType::Hybrid)
+                                ? IPL_REFLECTIONEFFECTTYPE_HYBRID
+                                : (mReflectionType == ReflectionType::Parametric)
+                                    ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
+                                    : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+                        voice->pinnedParams.numChannels = mAmbisonicsChannels;
+                        voice->reflectionIRPinned = true;
+                        AUDIO_LOG("[PINNED_IR] h=%u '%s' irSize=%d numChannels=%d\n",
+                                  handle, voice->schemaName.c_str(),
+                                  outputs.reflections.irSize,
+                                  outputs.reflections.numChannels);
+                    }
 
-                    // Per-source LOD truncation used to live here, scaling
-                    // irSize linearly with distance to save convolution
-                    // CPU. It was deleted alongside the sticky-slot
-                    // refactor: every per-frame irSize change forced Steam
-                    // Audio to internally crossfade to the new IR length,
-                    // producing the same low-frequency wet-bus wobble as
-                    // the per-frame mode-flip artefact. CPU savings were
-                    // modest in hybrid mode (convolution portion is
-                    // already bounded by hybridReverbTransitionTime); the
-                    // sticky max_reflection_voices cap is the real CPU
-                    // governor now.
+                    if (voice->reflectionIRPinned) {
+                        // Use the pinned params unconditionally — no further
+                        // ir-pointer or sample updates ever happen for this
+                        // voice. This is the architectural invariant that
+                        // suppresses the per-sim-cycle beating artefact.
+                        voice->dspNode.reflectionParams = voice->pinnedParams;
+                    } else {
+                        // Pre-pin (first ever loopStep for this voice with
+                        // outputs.reflections still pending): copy through
+                        // current outputs unchanged. The next cycle should
+                        // pin proper data.
+                        voice->dspNode.reflectionParams = outputs.reflections;
+                        voice->dspNode.reflectionParams.type =
+                            (mReflectionType == ReflectionType::Hybrid)
+                                ? IPL_REFLECTIONEFFECTTYPE_HYBRID
+                                : (mReflectionType == ReflectionType::Parametric)
+                                    ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
+                                    : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+                        voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
+                    }
 
                     voice->dspNode.reflectionsActive.store(true, std::memory_order_release);
                     ++activeConvolutionCount;
