@@ -96,6 +96,7 @@ typedef _IPLReflectionEffect_t* IPLReflectionEffect;
 #include <phonon.h>
 
 #include "AudioMetering.h"  // StageMeter
+#include "LatencyHistogram.h"  // per-stage CPU profiling
 
 namespace Darkness {
 
@@ -158,6 +159,19 @@ struct ConvolutionSubWorker {
     StageMeter saMeterReflIn;     // mono input to iplReflectionEffectApply
     StageMeter saMeterReflW;      // W (omni) channel of convolution output
     StageMeter saMeterDecodeOut;  // stereo output of iplAmbisonicsDecodeEffect
+
+    // ── Per-stage latency histograms ─────────────────────────────────────
+    //
+    // Writer: this sub-worker thread (one writer per histogram, so the
+    // atomic bucket counts are sufficient). Reader: AudioService periodic
+    // dump merges all sub-workers' histograms before computing percentiles.
+    // Histograms are gated by `Darkness::gAudioLogVerbose` at the call site
+    // so production builds with `audio_log: false` pay nothing.
+    LatencyHistogram perfApplyMs;     // iplReflectionEffectApply per voice
+    LatencyHistogram perfSumMs;       // manual ambisonics sum per voice
+    LatencyHistogram perfDecodeMs;    // iplAmbisonicsDecodeEffectApply per frame
+    LatencyHistogram perfUpsampleMs;  // rate-divisor upsample + bridge per frame
+    LatencyHistogram perfIterMs;      // total per-iteration time (= old peakMs)
 };
 
 // ── Off-thread convolution worker with K parallel sub-workers ──────────
