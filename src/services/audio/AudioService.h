@@ -238,11 +238,11 @@ enum AmbientHackFlags : uint32_t {
 /// Maximum simultaneous active voices (matches Dark Engine's limit)
 constexpr int MAX_ACTIVE_VOICES = 64;
 
-/// Default maximum voices with reflection convolution enabled simultaneously.
+/// Default maximum voices with reverb (convolution) enabled simultaneously.
 /// Per-voice convolution is expensive. Remaining voices use direct path only
 /// (HRTF + distance attenuation + occlusion), which is cheap.
-/// Tunable at runtime via setMaxReflectionVoices().
-constexpr int DEFAULT_MAX_REFLECTION_VOICES = 16;
+/// Tunable at runtime via setReverbVoices().
+constexpr int DEFAULT_REVERB_VOICES = 16;
 
 /// Default maximum sound propagation distance (world units)
 constexpr float SOUND_MAX_DIST = 200.0f;
@@ -465,23 +465,22 @@ public:
     void setReflectionThrottle(int n);
     int  getReflectionThrottle() const;
 
-    // [REFLECTIONS-total] Cap on total convolution voices (realtime + baked
-    // combined). 0 is a legitimate value meaning "no convolution at all" —
-    // both the realtime sticky-slot pool AND baked-probe voices are
-    // disabled when the cap is 0. To run baked-only, keep this positive
-    // and set max_realtime_voices = 0.
-    void setMaxReflectionVoices(int n) { mMaxReflectionVoices = std::max(0, std::min(n, MAX_ACTIVE_VOICES)); }
-    int  getMaxReflectionVoices() const { return mMaxReflectionVoices; }
+    // [REFLECTIONS] Cap on total reverb voices (realtime + baked combined).
+    // Every reverb voice runs a per-source convolution regardless of mode,
+    // so this is the worker-pool CPU governor. 0 disables all reverb
+    // convolution entirely (fully dry). To run baked-only, keep this
+    // positive and set reverb_voices_realtime = 0.
+    void setReverbVoices(int n) { mReverbVoices = std::max(0, std::min(n, MAX_ACTIVE_VOICES)); }
+    int  getReverbVoices() const { return mReverbVoices; }
 
-    // [REALTIME-only] Cap on the sticky realtime-slot pool. Defaults to the
-    // total cap above (preserves pre-split behaviour). Set to 0 to disable
-    // realtime entirely while leaving baked voices intact. Service-init
-    // path should pass -1 to mean "follow mMaxReflectionVoices."
-    void setMaxRealtimeVoices(int n) {
-        if (n < 0) mMaxRealtimeVoices = mMaxReflectionVoices;  // -1 sentinel: follow total
-        else       mMaxRealtimeVoices = std::min(n, MAX_ACTIVE_VOICES);
+    // [REALTIME] Of the reverb voices above, how many may run with
+    // realtime ray-traced IRs. 0 = baked-only (all eligible voices route
+    // through baked-probe reverb). Any positive value <= reverb_voices
+    // splits the budget: that many realtime slots, remainder for baked.
+    void setReverbVoicesRealtime(int n) {
+        mReverbVoicesRealtime = std::max(0, std::min(n, MAX_ACTIVE_VOICES));
     }
-    int  getMaxRealtimeVoices() const { return mMaxRealtimeVoices; }
+    int  getReverbVoicesRealtime() const { return mReverbVoicesRealtime; }
 
     void setTransmissionScale(float s) { mTransmissionScale = std::max(0.1f, std::min(s, 100.0f)); }
     float getTransmissionScale() const { return mTransmissionScale; }
@@ -653,22 +652,35 @@ public:
     // ── Performance tuning (some MUST be set BEFORE buildAcousticScene) ──
     void setMaxActiveVoices(int n) { mMaxActiveVoicesCfg = std::max(8, std::min(n, 256)); }
     int  getMaxActiveVoices() const { return mMaxActiveVoicesCfg; }
-    void setSimulatorThreads(int n) { mSimulatorThreadsCfg = std::max(0, std::min(n, 64)); }
     void setSimMaxOcclusionSamples(int n) { mSimMaxOcclusionSamplesCfg = std::max(4, std::min(n, 256)); }
-    void setSimMaxRays(int n) { mSimMaxRaysCfg = std::max(128, std::min(n, 16384)); }
-    // Direct simulator's source cap — runs synchronously and per-source cost is
-    // ~constant, so this can be set much higher than the reflection cap.
-    void setDirectMaxSources(int n) { mDirectMaxSourcesCfg = std::max(4, std::min(n, 1024)); }
-    // Reflection simulator's source cap — convolution + IR memory scale with
-    // this, so it's the expensive one. Keep modest unless quality budget allows.
-    void setReflectionMaxSources(int n) { mReflectionMaxSourcesCfg = std::max(4, std::min(n, 256)); }
-    // Number of consecutive frames a Normal voice must stay out of the top-N
-    // reflection candidate pool before its reflection source is released
-    // and the voice goes fully dry for the rest of its life. This is a
-    // sparing fallback — default is high (~10 s at 60 fps) so it fires
-    // only when the convolution/sim budget is under real pressure.
-    void setReflectionDemoteHysteresisFrames(int n);
-    /// "default" or "embree"
+
+    // ── Thread budget (merged convolution + sim) ──
+    // Total threads dedicated to reverb work, split between the per-voice
+    // convolution worker pool and Steam Audio's ray-trace simulator. The
+    // invariant `conv_workers + sim_threads == reverb_threads` is enforced
+    // at init time — guarantees no over-allocation regardless of how the
+    // user sets the share.
+    //
+    // 0 = auto: total = max(2, hwconc - 2). Reserves 2 cores for main +
+    // audio threads.
+    void  setReverbThreads(int n) { mReverbThreadsCfg = std::max(0, std::min(n, 64)); }
+    int   getReverbThreads() const { return mReverbThreadsCfg; }
+    // Fraction of the reverb-thread budget assigned to convolution
+    // workers (vs the ray-trace simulator). -1 = auto: chosen at init
+    // based on whether realtime is enabled (baked-only configs bias
+    // toward convolution since the sim is largely idle work in that
+    // mode; realtime configs bias toward sim since the cycle is the
+    // expensive one). Any value in [0.0, 1.0] is honored literally.
+    void  setReverbThreadsConvShare(float share) {
+        mReverbThreadsConvShareCfg = (share < 0.0f) ? -1.0f
+                                                    : std::max(0.0f, std::min(share, 1.0f));
+    }
+    float getReverbThreadsConvShare() const { return mReverbThreadsConvShareCfg; }
+
+    /// "default" or "embree". Embree requires a Steam Audio build with
+    /// Embree linked; AudioService falls back to "default" with a loud
+    /// [FALLBACK] stderr message if iplSceneCreate refuses the embree
+    /// scene type.
     void setSceneType(const std::string& s) { mSceneTypeCfg = (s == "embree" ? "embree" : "default"); }
 
     // Audio engine (must be set BEFORE bootstrapFinished())
@@ -786,11 +798,13 @@ public:
     void setHalfRateReflections(bool enabled);
     bool getHalfRateReflections() const;
 
-    /** Number of parallel convolution worker threads (0=auto, based on hardware).
-     *  Must be set BEFORE buildAcousticScene() — cannot change at runtime.
-     *  More workers enable more simultaneous convolution voices. */
-    void setConvolutionWorkerCount(int n) { mConvolutionWorkerCount = std::max(0, std::min(n, 16)); }
+    // Convolution worker count / simulator thread count are no longer
+    // independent knobs — they are derived at init time from
+    // mReverbThreadsCfg + mReverbThreadsConvShareCfg (see setReverbThreads
+    // / setReverbThreadsConvShare above). Getters expose the derived
+    // values for diagnostics.
     int  getConvolutionWorkerCount() const { return mConvolutionWorkerCount; }
+    int  getSimulatorThreadCount() const { return mSimulatorThreadCount; }
 
     /** Ambisonics order for reflection convolution (0 or 1).
      *  Must be set BEFORE buildAcousticScene() — cannot change at runtime.
@@ -1225,10 +1239,10 @@ private:
     int   mBakeDiffuseSamples      = 256;   ///< Bake diffuse samples (32–4096)
     int   mBakeAmbisonicsOrder     = 1;     ///< Bake ambisonic order (0–3)
 
-    int mMaxReflectionVoices = DEFAULT_MAX_REFLECTION_VOICES;
-    // Realtime cap defaults to the total above on init; set explicitly by
-    // RenderConfig wiring if the yaml specifies `max_realtime_voices`.
-    int mMaxRealtimeVoices   = DEFAULT_MAX_REFLECTION_VOICES;
+    int mReverbVoices         = DEFAULT_REVERB_VOICES;
+    // Subset of mReverbVoices that runs realtime ray-traced IRs. 0 =
+    // baked-only (the user's default). Set by RenderConfig wiring.
+    int mReverbVoicesRealtime = 0;
     int mAcousticTriCount = 0;         ///< Triangles in current acoustic scene
 
     /// Global multiplier for material transmission coefficients.
@@ -1314,18 +1328,16 @@ private:
 
     // ── Performance/infrastructure (must be set BEFORE init/buildAcousticScene) ──
     int         mMaxActiveVoicesCfg        = MAX_ACTIVE_VOICES;
-    int         mSimulatorThreadsCfg       = 0;       // 0 = auto (hwconc-2)
     int         mSimMaxOcclusionSamplesCfg = 32;
-    int         mSimMaxRaysCfg             = 4096;
-    // Source-cap split: direct sim is cheap per source so it gets a larger
-    // pool by default; reflection sim is the expensive one and stays modest.
-    // Stage 2.2 (lazy reflection-source allocation) will let many more voices
-    // exist with direct-only spatialization while only top-N voices hold a
-    // reflection source.
-    int         mDirectMaxSourcesCfg       = 256;
-    int         mReflectionMaxSourcesCfg   = 32;
-    // Demote-fallback hysteresis moved to ReflectionSimulator
-    // (mReflectionSim->setDemoteHysteresis / getDemoteHysteresis).
+    // Thread budget for reverb work (convolution + sim combined). The
+    // share knob divides it; the actual derived counts land in
+    // mConvolutionWorkerCount / mSimulatorThreadCount at init time.
+    // 0 = auto: hwconc - 2 (reserve 2 cores for main + audio).
+    int         mReverbThreadsCfg          = 0;
+    // -1 = auto split (depends on whether realtime is enabled). Else
+    // literal fraction in [0.0, 1.0] of the budget assigned to
+    // convolution workers; remainder goes to simulator threads.
+    float       mReverbThreadsConvShareCfg = -1.0f;
     std::string mSceneTypeCfg              = "default"; // "default" or "embree"
     int         mAudioSampleRateCfg        = 48000;
     int         mAudioFrameSizeCfg         = 1024;
@@ -1354,9 +1366,11 @@ private:
     Vector3 mSceneMin{0, 0, 0};
     Vector3 mSceneMax{0, 0, 0};
 
-    /// Number of parallel convolution worker threads (0=auto).
+    /// Derived counts populated at initReflectionPipeline time from
+    /// mReverbThreadsCfg + mReverbThreadsConvShareCfg. Sum == budget.
     /// Rate divisor lives on mReflectionSim now.
     int mConvolutionWorkerCount = 0;
+    int mSimulatorThreadCount   = 0;
 
     /// Ambisonics order for reflections (0 = 1 channel, 1 = 4 channels).
     /// Order 0 is 4x cheaper per voice. Set before buildAcousticScene().
