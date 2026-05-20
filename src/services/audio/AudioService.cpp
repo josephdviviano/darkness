@@ -3730,98 +3730,103 @@ void AudioService::loopStep(float deltaTime)
             // Requires probes to be loaded (`mProbeManager->hasReflections()`); if not,
             // player-emitted voices fall through to the same path as everything
             // else and the timing race may reappear.
-            if (mReflectionsEnabled) {
-                // Tail voices (source ended, reverb still ringing) keep their
-                // convolution slot until the IR finishes — they're carried over
-                // from previous frames and can't be cheaply disabled mid-
-                // convolution without an audible click.  They consume budget
-                // that would otherwise go to new top-N voices, so we count
-                // them BEFORE selecting top-N and shrink the top-N cap by
-                // tailCount.  Without this step, top-N + tails together
-                // overshoot mMaxReflectionVoices, which is exactly the
-                // "17–21 refl with max=16" behaviour the perf log shows.
-                int tailCount = 0;
-                for (auto &[h, v] : mVoicePool->voices()) {
-                    if (v->sourceEnded
-                        && !v->finished.load(std::memory_order_relaxed)
-                        && v->dspNode.reflectionsActive.load(std::memory_order_relaxed))
-                    {
-                        ++tailCount;
-                    }
-                }
-                int topNCap = std::max(0, mMaxReflectionVoices - tailCount);
-
-                reflCandidates.reserve(mVoicePool->size());
-                for (auto &[h, v] : mVoicePool->voices()) {
-                    if (v->sourceEnded)
-                        continue;
-                    if (v->playerEmitted && mProbeManager->hasReflections())
-                        continue;  // routed via baked-probe path below
-                    // Voices demoted by the stage 2.2 fallback have
-                    // reflectionSource == nullptr — exclude them from the
-                    // top-N pool (they've gone fully dry until the voice
-                    // ends; no need to re-rank them every frame).
-                    if (v->reflectionSource && v->dspNode.effectsReady && v->dspNode.reflectionEffect) {
-                        Vector3 delta = v->worldPos - mListenerPos;
-                        reflCandidates.push_back({h, glm::dot(delta, delta)});
-                    }
-                }
-                if (static_cast<int>(reflCandidates.size()) > topNCap) {
-                    std::partial_sort(reflCandidates.begin(),
-                                      reflCandidates.begin() + topNCap,
-                                      reflCandidates.end(),
-                                      [](const VoiceDist &a, const VoiceDist &b) {
-                                          return a.distSq < b.distSq;
-                                      });
-                    reflCandidates.resize(topNCap);
-                }
-            }
-
-            // Build a set for O(1) lookup of top-N membership
-            for (const auto &rc : reflCandidates)
-                reflCandidateSet.insert(rc.handle);
-
-            // Stage 2.2 — demote-only fallback pass.
+            // ── Sticky reflection-slot allocation ──
             //
-            // Every voice starts with a reflectionSource (eager allocation
-            // in createVoiceSource), so by default it routes through baked
-            // reverb. The per-frame inputs.baked flip below upgrades the
-            // closest top-N voices to ray-traced realtime reflections.
+            // Replaces the pre-2026-05 per-frame top-N partial_sort + demote
+            // hysteresis pass. The old design re-ranked every voice by distSq
+            // every frame and let voices flip in/out of top-N as small
+            // distance changes shuffled the ranking; each flip changed a
+            // voice's IR mode (baked-probe lookup ↔ real-time ray-traced),
+            // producing the low-frequency wet-bus wobble that the hybrid-
+            // reverb migration was supposed to kill.
             //
-            // The demote fallback below is reserved for voices that have
-            // sat out of top-N for mReflectionDemoteHysteresisCfg
-            // consecutive frames — i.e., genuinely long-lived voices that
-            // have stayed distant/quiet for a long time. Releasing their
-            // source trims mSourceData[0] iteration cost in the reflection
-            // sim cycle. The cost: those voices then play dry (no realtime
-            // and no baked) for the rest of their lifetime. Default
-            // hysteresis (≈10 s at 60 fps) is intentionally high so this
-            // only fires when convolution/sim budget is genuinely under
-            // pressure — the steady-state assumption is that every voice
-            // keeps its baked reverb for life.
+            // The new contract:
+            //   1. Each eligible voice's realtime-vs-baked decision is
+            //      made ONCE, on its first loopStep with valid reflection
+            //      outputs (isReflectionPending=false), and retained for
+            //      the voice's entire lifetime including the reverb tail.
+            //   2. Slots are released only when sourceEnded + tailTimer
+            //      expired. No mid-playback eviction.
+            //   3. If all slots are full when a new eligible voice spawns,
+            //      the new voice goes baked-only for life. Accepted trade-
+            //      off vs the per-frame mode-flip artefact.
             //
-            // Decisions are made against the live mListenerPos every frame,
-            // not frozen at spawn — a voice that's far at startVoice can
-            // be close 10 seconds later (and vice versa) in a large level.
+            // Eligibility for realtime:
+            //   - !playerEmitted        (player ≈ listener, baked is correct)
+            //   - !isAmbient            (long-lived, would hog slots forever)
+            //   - has a reflectionSource AND effectsReady AND reflectionEffect
             //
-            // PlayerEmitted and Ambient voices are excluded — PE uses baked
-            // routing as its steady-state path, Ambient voices are
-            // long-lived and intentionally part of the room ambience.
+            // PlayerEmitted + Ambient voices fall through to the baked-probe
+            // path below (inputs.baked = IPL_TRUE).
             if (mReflectionsEnabled && reflectionSimHandle && mReflectionSim) {
-                int hysteresis = mReflectionSim->getDemoteHysteresis();
+                // Step 1: count currently-owned slots, including tail voices.
+                int slotsHeld = 0;
                 for (auto &[h, v] : mVoicePool->voices()) {
-                    if (v->sourceEnded) continue;
-                    if (v->playerEmitted) continue;  // baked routing, never demoted
-                    if (v->isAmbient)     continue;  // long-lived, never demoted
-                    if (!v->dspNode.effectsReady) continue;
-                    if (!v->reflectionSource) continue;  // already demoted
+                    if (v->reflSlotOwned) ++slotsHeld;
+                }
+                int slotsAvailable = std::max(0, mMaxReflectionVoices - slotsHeld);
 
-                    bool inTopN = reflCandidateSet.count(h) > 0;
-                    if (inTopN) {
-                        v->framesOutOfTopN = 0;
-                    } else if (++v->framesOutOfTopN >= hysteresis) {
-                        mReflectionSim->demoteVoice(*v);
+                // Step 2: collect undecided candidates eligible for promotion.
+                std::vector<VoiceDist> newCandidates;
+                newCandidates.reserve(mVoicePool->size());
+                for (auto &[h, v] : mVoicePool->voices()) {
+                    if (v->reflSlotDecided) continue;             // already decided
+                    if (v->sourceEnded)     continue;             // ended before decision
+                    if (v->playerEmitted)   continue;             // always baked
+                    if (v->isAmbient)       continue;             // always baked
+                    if (!v->reflectionSource)                continue;
+                    if (!v->dspNode.effectsReady)            continue;
+                    if (!v->dspNode.reflectionEffect)        continue;
+                    // Pending sim-add → wait until the sim has the source
+                    // before committing. Avoids deciding before the voice
+                    // has any IR to render.
+                    if (mReflectionSim->isAddPending(v->reflectionSource)) continue;
+                    Vector3 delta = v->worldPos - mListenerPos;
+                    newCandidates.push_back({h, glm::dot(delta, delta)});
+                }
+
+                // Step 3: when multiple voices are eligible in the same
+                // frame and slots are scarce, the closest get priority.
+                // After this, the decision sticks regardless of later
+                // distance changes — by design.
+                if (!newCandidates.empty()) {
+                    std::sort(newCandidates.begin(), newCandidates.end(),
+                              [](const VoiceDist &a, const VoiceDist &b) {
+                                  return a.distSq < b.distSq;
+                              });
+                    for (auto &cand : newCandidates) {
+                        ActiveVoice *v = mVoicePool->find(cand.handle);
+                        if (!v) continue;
+                        if (slotsAvailable > 0) {
+                            v->reflSlotOwned   = true;
+                            v->reflSlotDecided = true;
+                            --slotsAvailable;
+                        } else {
+                            v->reflSlotOwned   = false;
+                            v->reflSlotDecided = true;
+                        }
                     }
+                }
+
+                // Step 4: release slots from voices whose source has ended
+                // AND whose reverb tail has expired. tailTimer is ticked
+                // down in a later loop further below in loopStep; we look
+                // at sourceEnded + (tailTimer <= 0) which is exactly the
+                // "audibly silent, safe to demote" condition. demoteVoice
+                // releases the IPLSource (frees a slot in the sim too).
+                for (auto &[h, v] : mVoicePool->voices()) {
+                    if (!v->reflSlotOwned) continue;
+                    if (!v->sourceEnded)   continue;          // still playing
+                    if (v->tailTimer > 0.0f) continue;        // tail still ringing
+                    v->reflSlotOwned = false;
+                    if (v->reflectionSource) mReflectionSim->demoteVoice(*v);
+                }
+
+                // Step 5: build the set used downstream for inputs.baked /
+                // enableRefl decisions. Membership == "owns a realtime
+                // slot right now."
+                for (auto &[h, v] : mVoicePool->voices()) {
+                    if (v->reflSlotOwned) reflCandidateSet.insert(h);
                 }
             }
 
@@ -4769,38 +4774,17 @@ void AudioService::loopStep(float deltaTime)
                                 : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
                     voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
 
-                    // Per-source LOD: reduce IR length for distant voices.
-                    // Nearby voices get full IR, distant voices get shorter tails.
-                    // This reduces convolution cost proportionally to distance.
-                    //
-                    // Hybrid mode safety floor: Steam Audio crashes if
-                    // `hybridReverbTransitionTime * sampleRate > irSize`. The
-                    // LOD scale can drop the IR well below the transition
-                    // time at distance (the 0.25× floor at 140+ units could
-                    // truncate 2.1s @ 24kHz down to ~12600 samples — well
-                    // below the 48000-sample transition floor for the
-                    // default 2.0s transition). Clamp the LOD'd size to
-                    // hybridTransition + one reflection-frame margin so a
-                    // distant voice cannot become a ticking crash.
-                    float voiceDist = glm::length(voice->worldPos - mListenerPos);
-                    int maxIrSize = voice->dspNode.reflectionParams.irSize;
-                    if (maxIrSize > 0 && voiceDist > 20.0f) {
-                        // Linear ramp: full IR at 20 units, quarter IR at 140+ units
-                        float lodScale = std::max(0.25f, 1.0f - (voiceDist - 20.0f) / 120.0f);
-                        int lodIrSize = static_cast<int>(maxIrSize * lodScale);
-                        lodIrSize = (lodIrSize / static_cast<int>(mReflectionFrameSize))
-                                  * static_cast<int>(mReflectionFrameSize);
-                        if (lodIrSize < static_cast<int>(mReflectionFrameSize))
-                            lodIrSize = static_cast<int>(mReflectionFrameSize);
-                        if (mReflectionType == ReflectionType::Hybrid) {
-                            int hybridFloor = static_cast<int>(
-                                mHybridTransitionTime * mReflectionSampleRate)
-                                + static_cast<int>(mReflectionFrameSize);
-                            if (lodIrSize < hybridFloor) lodIrSize = hybridFloor;
-                            if (lodIrSize > maxIrSize)   lodIrSize = maxIrSize;
-                        }
-                        voice->dspNode.reflectionParams.irSize = lodIrSize;
-                    }
+                    // Per-source LOD truncation used to live here, scaling
+                    // irSize linearly with distance to save convolution
+                    // CPU. It was deleted alongside the sticky-slot
+                    // refactor: every per-frame irSize change forced Steam
+                    // Audio to internally crossfade to the new IR length,
+                    // producing the same low-frequency wet-bus wobble as
+                    // the per-frame mode-flip artefact. CPU savings were
+                    // modest in hybrid mode (convolution portion is
+                    // already bounded by hybridReverbTransitionTime); the
+                    // sticky max_reflection_voices cap is the real CPU
+                    // governor now.
 
                     voice->dspNode.reflectionsActive.store(true, std::memory_order_release);
                     ++activeConvolutionCount;
