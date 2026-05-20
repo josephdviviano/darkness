@@ -4722,6 +4722,16 @@ void AudioService::loopStep(float deltaTime)
                     // Per-source LOD: reduce IR length for distant voices.
                     // Nearby voices get full IR, distant voices get shorter tails.
                     // This reduces convolution cost proportionally to distance.
+                    //
+                    // Hybrid mode safety floor: Steam Audio crashes if
+                    // `hybridReverbTransitionTime * sampleRate > irSize`. The
+                    // LOD scale can drop the IR well below the transition
+                    // time at distance (the 0.25× floor at 140+ units could
+                    // truncate 2.1s @ 24kHz down to ~12600 samples — well
+                    // below the 48000-sample transition floor for the
+                    // default 2.0s transition). Clamp the LOD'd size to
+                    // hybridTransition + one reflection-frame margin so a
+                    // distant voice cannot become a ticking crash.
                     float voiceDist = glm::length(voice->worldPos - mListenerPos);
                     int maxIrSize = voice->dspNode.reflectionParams.irSize;
                     if (maxIrSize > 0 && voiceDist > 20.0f) {
@@ -4732,6 +4742,13 @@ void AudioService::loopStep(float deltaTime)
                                   * static_cast<int>(mReflectionFrameSize);
                         if (lodIrSize < static_cast<int>(mReflectionFrameSize))
                             lodIrSize = static_cast<int>(mReflectionFrameSize);
+                        if (mReflectionType == ReflectionType::Hybrid) {
+                            int hybridFloor = static_cast<int>(
+                                mHybridTransitionTime * mReflectionSampleRate)
+                                + static_cast<int>(mReflectionFrameSize);
+                            if (lodIrSize < hybridFloor) lodIrSize = hybridFloor;
+                            if (lodIrSize > maxIrSize)   lodIrSize = maxIrSize;
+                        }
                         voice->dspNode.reflectionParams.irSize = lodIrSize;
                     }
 
