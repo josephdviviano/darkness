@@ -35,45 +35,40 @@ struct RenderConfig {
     float waterRotation   = 0.015f;  // UV rotation speed in rad/s (0 = no rotation)
     float waterScrollSpeed = 0.05f;  // UV scroll speed in world units/s (0 = no drift)
 
-    // -- audio.performance: engine + sim throughput knobs --
-    int  audioSampleRate         = 48000; // device output sample rate (Hz; clamped to 22050/32000/44100/48000/96000)
-    int  audioFrameSize          = 1024;  // audio engine frame size in samples (256–4096)
-    int  audioSoundCacheMB       = 64;    // decoded-audio LRU cache budget (MB)
-    int  reflectionRateDivisor   = 2;     // reflection pipeline rate: 1=full 48kHz, 2=half 24kHz, 4=quarter 12kHz
-    int  convolutionWorkers      = 0;     // convolution worker threads (0 = auto: hwconc-3)
-    int  simulatorThreads        = 0;     // ray-tracing sim threads (0 = auto: hwconc-2)
-    int  maxActiveVoices         = 64;    // hard cap on simultaneous voices (Dark Engine baseline)
-    // [REFLECTIONS-total] Cap on total convolution voices (realtime + baked
-    // combined). CPU governor — every reflection voice runs a per-source
-    // convolution regardless of mode, so the worker pool needs a hard
-    // upper bound. Setting to 0 disables ALL reflection convolution
-    // (fully dry — no realtime, no baked-probe reverb).
-    int  maxReflectionVoices     = 16;
-    // [REALTIME-only] Cap on the sticky realtime-slot pool (subset of the
-    // total above). -1 (default) means "follow maxReflectionVoices",
-    // preserving pre-split behaviour where one cap governed both. 0 means
-    // "no realtime — all eligible voices route through baked-probe reverb"
-    // (assuming maxReflectionVoices > 0). Any positive value < max splits
-    // the budget: that many realtime slots, remainder available for baked.
-    int  maxRealtimeVoices       = -1;
+    // -- audio.performance: engine + reverb throughput knobs --
+    // Scope tags:
+    //   [GLOBAL]      audio engine / hardware
+    //   [DIRECT]      direct path only (no reflections)
+    //   [REALTIME]    realtime ray-traced reflections only
+    //   [BAKE]        offline probe bake only
+    //   [REFLECTIONS] both realtime + baked-probe reflection convolution
+    int  audioSampleRate         = 48000; // [GLOBAL] device output sample rate (22050|32000|44100|48000|96000)
+    int  audioFrameSize          = 1024;  // [GLOBAL] audio engine frame size in samples (256–4096)
+    int  audioSoundCacheMB       = 64;    // [GLOBAL] decoded-audio LRU cache budget (MB)
+    int  reflectionRateDivisor   = 2;     // [REFLECTIONS] reflection pipeline rate: 1=full 48kHz, 2=half 24kHz, 4=quarter 12kHz
+    int  maxActiveVoices         = 64;    // [GLOBAL] hard cap on simultaneous voices (Dark Engine baseline)
+    // [REFLECTIONS] Cap on total reverb voices (realtime + baked combined).
+    // CPU governor — every reverb voice runs a per-source convolution
+    // regardless of mode. Setting to 0 disables all reverb convolution
+    // entirely (fully dry).
+    int  reverbVoices            = 16;
+    // [REALTIME] Of the reverb voices above, how many may run with
+    // realtime ray-traced IRs. 0 = baked-only (recommended; all eligible
+    // voices route through baked-probe reverb). Range [0, reverbVoices].
+    int  reverbVoicesRealtime    = 0;
     int  reflectionThrottle      = 4;     // [REALTIME] run sim every Nth frame (1–32)
-    int  simMaxOcclusionSamples  = 32;    // upper bound on per-source occlusion samples (Steam Audio sim)
-    int  simMaxRays              = 4096;  // upper bound on rays per sim step (Steam Audio sim)
-    // Source pools: direct sim is cheap per-source so it can be much larger
-    // than the reflection pool. Legacy YAML key `sim_max_sources` (if present)
-    // is mapped to `reflectionMaxSources` for back-compat.
-    int  directMaxSources        = 256;   // Steam Audio direct-only simulator source pool size (4–1024)
-    int  reflectionMaxSources    = 32;    // Steam Audio reflection simulator source pool size (4–256)
-    // Demote-only fallback (stage 2.2): every voice starts with a
-    // reflection source so it routes through baked reverb by default.
-    // Normal voices that stay outside the top-N reflection candidate pool
-    // for this many consecutive frames release their source and play dry
-    // for the rest of their life. Default ≈10 s at 60 fps — intentionally
-    // high so this fires only as a sparing fallback when convolution/sim
-    // budget is under genuine pressure. PlayerEmitted + Ambient voices
-    // are excluded.
-    int  reflectionDemoteHysteresisFrames = 600; // (1–3600)
-    std::string sceneType        = "default"; // IPL scene backend: "default" or "embree"
+    int  simMaxOcclusionSamples  = 32;    // [DIRECT+REFLECTIONS] per-source occlusion sample cap (Steam Audio sim) (4–256)
+    // Thread budget for reverb work (convolution workers + ray-trace
+    // simulator threads combined). 0 = auto: hwconc - 2. The share knob
+    // splits this between the two consumers; the invariant
+    // `conv + sim == total` guarantees no over-allocation regardless of
+    // how the share is set.
+    int   reverbThreads          = 0;
+    // -1 = auto split (baked-only configs bias toward convolution; realtime
+    // configs bias toward sim). Else literal fraction in [0.0, 1.0] of
+    // the budget assigned to convolution workers.
+    float reverbThreadsConvShare = -1.0f;
+    std::string sceneType        = "default"; // [REFLECTIONS] IPL scene backend ("default" or "embree" — embree falls back to default if Steam Audio wasn't built with embree)
 
     // -- audio.reflections: convolution reverb feel --
     //
@@ -322,32 +317,22 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     int div = perf["rate_divisor"].as<int>();
                     cfg.reflectionRateDivisor = (div >= 4) ? 4 : (div >= 2) ? 2 : 1;
                 }
-                if (perf["convolution_workers"]) {
-                    cfg.convolutionWorkers = perf["convolution_workers"].as<int>();
-                    if (cfg.convolutionWorkers < 0)  cfg.convolutionWorkers = 0;
-                    if (cfg.convolutionWorkers > 16) cfg.convolutionWorkers = 16;
-                }
-                if (perf["simulator_threads"]) {
-                    cfg.simulatorThreads = perf["simulator_threads"].as<int>();
-                    if (cfg.simulatorThreads < 0)  cfg.simulatorThreads = 0;
-                    if (cfg.simulatorThreads > 64) cfg.simulatorThreads = 64;
-                }
                 if (perf["max_active_voices"]) {
                     cfg.maxActiveVoices = perf["max_active_voices"].as<int>();
                     if (cfg.maxActiveVoices < 8)   cfg.maxActiveVoices = 8;
                     if (cfg.maxActiveVoices > 256) cfg.maxActiveVoices = 256;
                 }
-                if (perf["max_reflection_voices"]) {
-                    cfg.maxReflectionVoices = perf["max_reflection_voices"].as<int>();
-                    if (cfg.maxReflectionVoices < 0)  cfg.maxReflectionVoices = 0;
-                    if (cfg.maxReflectionVoices > 64) cfg.maxReflectionVoices = 64;
+                // Reverb voice caps (renamed from max_reflection_voices /
+                // max_realtime_voices in 2026-05 config cleanup).
+                if (perf["reverb_voices"]) {
+                    cfg.reverbVoices = perf["reverb_voices"].as<int>();
+                    if (cfg.reverbVoices < 0)  cfg.reverbVoices = 0;
+                    if (cfg.reverbVoices > 64) cfg.reverbVoices = 64;
                 }
-                if (perf["max_realtime_voices"]) {
-                    cfg.maxRealtimeVoices = perf["max_realtime_voices"].as<int>();
-                    // -1 is the "follow max_reflection_voices" sentinel — only
-                    // applied at service-init time, not clamped here.
-                    if (cfg.maxRealtimeVoices < -1) cfg.maxRealtimeVoices = -1;
-                    if (cfg.maxRealtimeVoices > 64) cfg.maxRealtimeVoices = 64;
+                if (perf["reverb_voices_realtime"]) {
+                    cfg.reverbVoicesRealtime = perf["reverb_voices_realtime"].as<int>();
+                    if (cfg.reverbVoicesRealtime < 0)  cfg.reverbVoicesRealtime = 0;
+                    if (cfg.reverbVoicesRealtime > 64) cfg.reverbVoicesRealtime = 64;
                 }
                 if (perf["reflection_throttle"]) {
                     cfg.reflectionThrottle = perf["reflection_throttle"].as<int>();
@@ -359,39 +344,40 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.simMaxOcclusionSamples < 4)   cfg.simMaxOcclusionSamples = 4;
                     if (cfg.simMaxOcclusionSamples > 256) cfg.simMaxOcclusionSamples = 256;
                 }
-                if (perf["sim_max_rays"]) {
-                    cfg.simMaxRays = perf["sim_max_rays"].as<int>();
-                    if (cfg.simMaxRays < 128)   cfg.simMaxRays = 128;
-                    if (cfg.simMaxRays > 16384) cfg.simMaxRays = 16384;
+                // Thread budget for reverb work (convolution + sim combined).
+                if (perf["reverb_threads"]) {
+                    cfg.reverbThreads = perf["reverb_threads"].as<int>();
+                    if (cfg.reverbThreads < 0)  cfg.reverbThreads = 0;
+                    if (cfg.reverbThreads > 64) cfg.reverbThreads = 64;
                 }
-                // Legacy alias: `sim_max_sources` maps to the reflection cap
-                // so existing configs keep their old reflection-sim behavior.
-                // New configs should prefer the split keys below.
-                if (perf["sim_max_sources"]) {
-                    cfg.reflectionMaxSources = perf["sim_max_sources"].as<int>();
-                    if (cfg.reflectionMaxSources < 4)   cfg.reflectionMaxSources = 4;
-                    if (cfg.reflectionMaxSources > 256) cfg.reflectionMaxSources = 256;
-                }
-                if (perf["direct_max_sources"]) {
-                    cfg.directMaxSources = perf["direct_max_sources"].as<int>();
-                    if (cfg.directMaxSources < 4)    cfg.directMaxSources = 4;
-                    if (cfg.directMaxSources > 1024) cfg.directMaxSources = 1024;
-                }
-                if (perf["reflection_max_sources"]) {
-                    cfg.reflectionMaxSources = perf["reflection_max_sources"].as<int>();
-                    if (cfg.reflectionMaxSources < 4)   cfg.reflectionMaxSources = 4;
-                    if (cfg.reflectionMaxSources > 256) cfg.reflectionMaxSources = 256;
-                }
-                if (perf["reflection_demote_hysteresis_frames"]) {
-                    cfg.reflectionDemoteHysteresisFrames =
-                        perf["reflection_demote_hysteresis_frames"].as<int>();
-                    if (cfg.reflectionDemoteHysteresisFrames < 1)    cfg.reflectionDemoteHysteresisFrames = 1;
-                    if (cfg.reflectionDemoteHysteresisFrames > 3600) cfg.reflectionDemoteHysteresisFrames = 3600;
+                if (perf["reverb_threads_conv_share"]) {
+                    cfg.reverbThreadsConvShare = perf["reverb_threads_conv_share"].as<float>();
+                    if (cfg.reverbThreadsConvShare < 0.0f) cfg.reverbThreadsConvShare = -1.0f;
+                    if (cfg.reverbThreadsConvShare > 1.0f) cfg.reverbThreadsConvShare = 1.0f;
                 }
                 if (perf["scene_type"]) {
                     cfg.sceneType = perf["scene_type"].as<std::string>();
                     if (cfg.sceneType != "default" && cfg.sceneType != "embree")
                         cfg.sceneType = "default";
+                }
+                // Deprecated keys — emit one-shot warnings so existing yamls
+                // get a friendly notice. AudioService auto-derives the
+                // equivalent values now (see NOTES.AUDIO_CONFIG_AUDIT.md).
+                static const char* kDeprecated[] = {
+                    "convolution_workers", "simulator_threads",
+                    "max_reflection_voices", "max_realtime_voices",
+                    "sim_max_rays", "direct_max_sources",
+                    "reflection_max_sources", "sim_max_sources",
+                    "reflection_demote_hysteresis_frames",
+                };
+                for (const char* key : kDeprecated) {
+                    if (perf[key]) {
+                        std::fprintf(stderr,
+                            "WARN: audio.performance.%s is no longer used "
+                            "(replaced by reverb_voices/reverb_voices_realtime/"
+                            "reverb_threads or auto-derived). Safe to remove "
+                            "from darknessRender.yaml.\n", key);
+                    }
                 }
             }
 

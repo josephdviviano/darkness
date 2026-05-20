@@ -333,103 +333,116 @@ TEST_CASE("water YAML clamping", "[config][clamp]") {
     }
 }
 
-TEST_CASE("audio source-cap split: direct + reflection YAML keys", "[config][yaml][audio]") {
-    SECTION("defaults: direct=256, reflection=32") {
+// Reverb voice caps (renamed from max_reflection_voices /
+// max_realtime_voices in 2026-05 config cleanup). reverb_voices is the
+// total convolution-pool budget; reverb_voices_realtime is the subset
+// that runs realtime ray-traced IRs (0 = baked-only).
+TEST_CASE("audio reverb voice cap YAML keys", "[config][yaml][audio]") {
+    SECTION("defaults: reverb_voices=16, reverb_voices_realtime=0") {
         Darkness::RenderConfig cfg;
-        CHECK(cfg.directMaxSources     == 256);
-        CHECK(cfg.reflectionMaxSources == 32);
+        CHECK(cfg.reverbVoices         == 16);
+        CHECK(cfg.reverbVoicesRealtime == 0);
     }
-    SECTION("explicit split keys override independently") {
+    SECTION("explicit values override defaults") {
         TmpFile tmp(R"(
 audio:
   performance:
-    direct_max_sources: 128
-    reflection_max_sources: 48
+    reverb_voices: 8
+    reverb_voices_realtime: 4
 )");
         Darkness::RenderConfig cfg;
         REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
-        CHECK(cfg.directMaxSources     == 128);
-        CHECK(cfg.reflectionMaxSources == 48);
+        CHECK(cfg.reverbVoices         == 8);
+        CHECK(cfg.reverbVoicesRealtime == 4);
     }
-    SECTION("legacy sim_max_sources maps to reflection cap; direct keeps default") {
-        TmpFile tmp(R"(
-audio:
-  performance:
-    sim_max_sources: 16
-)");
-        Darkness::RenderConfig cfg;
-        REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
-        CHECK(cfg.reflectionMaxSources == 16);
-        CHECK(cfg.directMaxSources     == 256);  // default unchanged
-    }
-    SECTION("split keys override legacy alias when both present") {
-        TmpFile tmp(R"(
-audio:
-  performance:
-    sim_max_sources: 8
-    reflection_max_sources: 64
-)");
-        Darkness::RenderConfig cfg;
-        REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
-        CHECK(cfg.reflectionMaxSources == 64);
-    }
-    SECTION("clamping: direct 0 → 4, direct 9999 → 1024") {
-        TmpFile lo("audio:\n  performance:\n    direct_max_sources: 0\n");
+    SECTION("clamping: reverb_voices < 0 → 0, > 64 → 64") {
+        TmpFile lo("audio:\n  performance:\n    reverb_voices: -5\n");
         Darkness::RenderConfig cfg1;
         Darkness::loadConfigFromYAML(lo.path.string(), cfg1);
-        CHECK(cfg1.directMaxSources == 4);
+        CHECK(cfg1.reverbVoices == 0);
 
-        TmpFile hi("audio:\n  performance:\n    direct_max_sources: 9999\n");
+        TmpFile hi("audio:\n  performance:\n    reverb_voices: 999\n");
         Darkness::RenderConfig cfg2;
         Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
-        CHECK(cfg2.directMaxSources == 1024);
+        CHECK(cfg2.reverbVoices == 64);
     }
-    SECTION("clamping: reflection 0 → 4, reflection 9999 → 256") {
-        TmpFile lo("audio:\n  performance:\n    reflection_max_sources: 0\n");
-        Darkness::RenderConfig cfg1;
-        Darkness::loadConfigFromYAML(lo.path.string(), cfg1);
-        CHECK(cfg1.reflectionMaxSources == 4);
-
-        TmpFile hi("audio:\n  performance:\n    reflection_max_sources: 9999\n");
-        Darkness::RenderConfig cfg2;
-        Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
-        CHECK(cfg2.reflectionMaxSources == 256);
+    SECTION("clamping: reverb_voices_realtime same as total") {
+        TmpFile hi("audio:\n  performance:\n    reverb_voices_realtime: 999\n");
+        Darkness::RenderConfig cfg;
+        Darkness::loadConfigFromYAML(hi.path.string(), cfg);
+        CHECK(cfg.reverbVoicesRealtime == 64);
     }
 }
 
-// Stage 2.2 — demote-only reflection-source fallback: covers the
-// `reflection_demote_hysteresis_frames` YAML key. Every voice starts
-// with a reflection source; this knob controls how long a Normal voice
-// must sit outside the top-N reflection-candidate pool before its source
-// is released and the voice goes dry. Default is intentionally high
-// (~10 s at 60 fps) so the fallback is sparing — it only fires when
-// convolution/sim budget is under real pressure.
-TEST_CASE("audio reflection demote hysteresis YAML key", "[config][yaml][audio]") {
-    SECTION("default is 600 frames (~10s at 60 fps)") {
+// Reverb thread budget (merged convolution_workers + simulator_threads
+// in 2026-05 config cleanup). reverb_threads is the total; the share
+// knob splits it between conv workers and the simulator. -1 = auto.
+TEST_CASE("audio reverb thread budget YAML keys", "[config][yaml][audio]") {
+    SECTION("defaults: reverb_threads=0 (auto), conv_share=-1 (auto)") {
         Darkness::RenderConfig cfg;
-        CHECK(cfg.reflectionDemoteHysteresisFrames == 600);
+        CHECK(cfg.reverbThreads          == 0);
+        CHECK(cfg.reverbThreadsConvShare == -1.0f);
     }
-    SECTION("explicit value overrides default") {
+    SECTION("explicit values override defaults") {
         TmpFile tmp(R"(
 audio:
   performance:
-    reflection_demote_hysteresis_frames: 90
+    reverb_threads: 6
+    reverb_threads_conv_share: 0.4
 )");
         Darkness::RenderConfig cfg;
         REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
-        CHECK(cfg.reflectionDemoteHysteresisFrames == 90);
+        CHECK(cfg.reverbThreads          == 6);
+        CHECK(cfg.reverbThreadsConvShare == Catch::Approx(0.4f));
     }
-    SECTION("clamping: 0 → 1, 99999 → 3600") {
-        TmpFile lo("audio:\n  performance:\n    reflection_demote_hysteresis_frames: 0\n");
+    SECTION("clamping: reverb_threads < 0 → 0, > 64 → 64") {
+        TmpFile lo("audio:\n  performance:\n    reverb_threads: -1\n");
         Darkness::RenderConfig cfg1;
         Darkness::loadConfigFromYAML(lo.path.string(), cfg1);
-        CHECK(cfg1.reflectionDemoteHysteresisFrames == 1);
+        CHECK(cfg1.reverbThreads == 0);
 
-        TmpFile hi("audio:\n  performance:\n    reflection_demote_hysteresis_frames: 99999\n");
+        TmpFile hi("audio:\n  performance:\n    reverb_threads: 999\n");
         Darkness::RenderConfig cfg2;
         Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
-        CHECK(cfg2.reflectionDemoteHysteresisFrames == 3600);
+        CHECK(cfg2.reverbThreads == 64);
     }
+    SECTION("conv_share: negative collapses to -1 (auto); > 1.0 clamps to 1.0") {
+        TmpFile neg("audio:\n  performance:\n    reverb_threads_conv_share: -0.5\n");
+        Darkness::RenderConfig cfg1;
+        Darkness::loadConfigFromYAML(neg.path.string(), cfg1);
+        CHECK(cfg1.reverbThreadsConvShare == -1.0f);
+
+        TmpFile hi("audio:\n  performance:\n    reverb_threads_conv_share: 5.0\n");
+        Darkness::RenderConfig cfg2;
+        Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
+        CHECK(cfg2.reverbThreadsConvShare == Catch::Approx(1.0f));
+    }
+}
+
+// Deprecated keys (removed in 2026-05 cleanup) should be parsed without
+// crashing — the loader emits a WARN to stderr and otherwise ignores
+// them. Test verifies the loader returns true on a yaml containing only
+// deprecated keys.
+TEST_CASE("audio deprecated keys parse without error", "[config][yaml][audio]") {
+    TmpFile tmp(R"(
+audio:
+  performance:
+    convolution_workers: 4
+    simulator_threads: 2
+    max_reflection_voices: 8
+    max_realtime_voices: 0
+    sim_max_rays: 4096
+    direct_max_sources: 256
+    reflection_max_sources: 32
+    sim_max_sources: 16
+    reflection_demote_hysteresis_frames: 600
+)");
+    Darkness::RenderConfig cfg;
+    REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
+    // Deprecated keys ignored — fields fall back to RenderConfig defaults.
+    CHECK(cfg.reverbVoices         == 16);
+    CHECK(cfg.reverbVoicesRealtime == 0);
+    CHECK(cfg.reverbThreads        == 0);
 }
 
 // Q3 — per-voice spatialBlend override for AMB_ENVIRONMENTAL ambients.

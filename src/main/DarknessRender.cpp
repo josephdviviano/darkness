@@ -2438,16 +2438,16 @@ static void registerConsoleSettings(
         [](float) { /* read-only */ },
         "Triangles in acoustic scene (read-only)");
 
-    dbgConsole.addFloat("refl_max_voices", 1.0f, 32.0f,
+    dbgConsole.addFloat("reverb_voices", 1.0f, 32.0f,
         []() {
             auto svc = GET_SERVICE(Darkness::AudioService);
-            return svc ? static_cast<float>(svc->getMaxReflectionVoices()) : 4.0f;
+            return svc ? static_cast<float>(svc->getReverbVoices()) : 4.0f;
         },
         [](float v) {
             auto svc = GET_SERVICE(Darkness::AudioService);
-            if (svc) svc->setMaxReflectionVoices(static_cast<int>(v));
+            if (svc) svc->setReverbVoices(static_cast<int>(v));
         },
-        "Max active voices with convolution reverb");
+        "Max active voices with reverb (realtime + baked combined)");
 
     dbgConsole.addFloat("refl_sample_rate", 0.0f, 48000.0f,
         []() {
@@ -3743,20 +3743,13 @@ int main(int argc, char *argv[]) {
         audioSvc->setAudioFrameSize(cfg.audioFrameSize);
         audioSvc->setSoundCacheMB(cfg.audioSoundCacheMB);
         audioSvc->setReflectionRateDivisor(cfg.reflectionRateDivisor);
-        audioSvc->setConvolutionWorkerCount(cfg.convolutionWorkers);
-        audioSvc->setSimulatorThreads(cfg.simulatorThreads);
         audioSvc->setMaxActiveVoices(cfg.maxActiveVoices);
-        audioSvc->setMaxReflectionVoices(cfg.maxReflectionVoices);
-        // Realtime cap must be set AFTER total cap so the -1 sentinel
-        // ("follow max_reflection_voices") resolves against the already-
-        // applied total. Passing -1 makes the setter mirror the total.
-        audioSvc->setMaxRealtimeVoices(cfg.maxRealtimeVoices);
+        audioSvc->setReverbVoices(cfg.reverbVoices);
+        audioSvc->setReverbVoicesRealtime(cfg.reverbVoicesRealtime);
+        audioSvc->setReverbThreads(cfg.reverbThreads);
+        audioSvc->setReverbThreadsConvShare(cfg.reverbThreadsConvShare);
         audioSvc->setReflectionThrottle(cfg.reflectionThrottle);
         audioSvc->setSimMaxOcclusionSamples(cfg.simMaxOcclusionSamples);
-        audioSvc->setSimMaxRays(cfg.simMaxRays);
-        audioSvc->setDirectMaxSources(cfg.directMaxSources);
-        audioSvc->setReflectionMaxSources(cfg.reflectionMaxSources);
-        audioSvc->setReflectionDemoteHysteresisFrames(cfg.reflectionDemoteHysteresisFrames);
         audioSvc->setSceneType(cfg.sceneType);
 
         // -- audio.reflections --

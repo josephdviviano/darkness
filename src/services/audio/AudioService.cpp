@@ -807,6 +807,19 @@ static LatencyHistogram sPerfReflMixMs;       // ReflectionMixNode callback (aud
 // (iplSimulatorRunReflections) — same extern pattern as sReflSimPeakMs.
 extern LatencyHistogram sPerfReflSimMs;
 
+// ── Inter-callback period histogram (H1' of perf-tuning) ───────────────
+//
+// Records the wall-clock gap between two consecutive entries to
+// reflectionMixNodeProcess. The nominal period at 1024 @ 48 kHz is
+// 21.333 ms; we want to know how tight that distribution actually is.
+// If p99 is materially shorter than p50 (i.e. CoreAudio occasionally
+// fires the callback faster than expected), it explains how all 4
+// workers can simultaneously appear stale despite having ~10 ms of slack
+// on iter time — they may have less than that on some pairs of callbacks.
+// Writer: audio thread (one). Reader: main-thread periodic dump.
+static LatencyHistogram sPerfInterCallbackMs;
+static std::atomic<long long> sLastCallbackNs{0};
+
 // ── Wet-bus beat detector ──
 //
 // Audio thread pushes one envelope sample (stereo peak) per reflection
@@ -1584,6 +1597,25 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
     const bool profOn = ::Darkness::gAudioLogVerbose;
     auto mixT0 = profOn ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{};
+
+    // H1' inter-callback period. Measured even when profiling is off
+    // since it's just one timestamp + one subtract — far cheaper than the
+    // existing FTZ enable below. The first sample (sLastCallbackNs==0)
+    // is skipped to avoid recording an enormous fake interval relative
+    // to the steady_clock epoch.
+    {
+        const long long nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const long long lastNs = sLastCallbackNs.exchange(
+            nowNs, std::memory_order_relaxed);
+        if (lastNs > 0) {
+            const long long deltaNs = nowNs - lastNs;
+            if (deltaNs > 0) {
+                sPerfInterCallbackMs.record(
+                    static_cast<double>(deltaNs) / 1.0e6);
+            }
+        }
+    }
     audioEnableDenormalFlush();
     auto* node = reinterpret_cast<AudioService::ReflectionMixNode*>(pNode);
     ma_uint32 frameCount = *pFrameCountOut;
@@ -1681,7 +1713,37 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             size_t wkIdx = (&subPtr - &cw->workers[0]);
             if (wkIdx < ConvolutionWorker::kMaxSlots) {
                 uint64_t p = sub.processedSeq.load(std::memory_order_acquire);
-                if (p == sLastConsumedSeq[wkIdx]) ++wetStaleFronts;
+                const bool wasStale = (p == sLastConsumedSeq[wkIdx]);
+                if (wasStale) {
+                    ++wetStaleFronts;
+                    // H3' per-stale-event gap log. The gap = now − the
+                    // signal time of the most recent frameSeq bump for
+                    // this worker. If the gap is comparable to one
+                    // callback period (~21 ms), the worker is one frame
+                    // behind because it didn't finish iter N before we
+                    // arrived to do iter N+1's freshness check. If it's
+                    // much larger, the worker was scheduled out for
+                    // multiple periods. Throttled to ~1 of every 32
+                    // events so a sustained backlog doesn't drown the log.
+                    static std::atomic<uint32_t> sStaleLogCount{0};
+                    uint32_t n = sStaleLogCount.fetch_add(1, std::memory_order_relaxed);
+                    if ((n & 0x1F) == 0) {
+                        const long long signalNs = sub.signalTimeNs.load(
+                            std::memory_order_acquire);
+                        const long long nowNs = std::chrono::duration_cast<
+                            std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+                        const double gapMs = (signalNs > 0)
+                            ? static_cast<double>(nowNs - signalNs) / 1.0e6
+                            : -1.0;
+                        AUDIO_LOG("[STALE_GAP] w=%zu since_signal_ms=%.3f "
+                                  "processedSeq=%llu lastConsumed=%llu (occurrence #%u)\n",
+                                  wkIdx, gapMs,
+                                  (unsigned long long)p,
+                                  (unsigned long long)sLastConsumedSeq[wkIdx],
+                                  n + 1);
+                    }
+                }
                 sLastConsumedSeq[wkIdx] = p;
             }
 
@@ -1775,10 +1837,57 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         // the worker finishes its output write).
         static std::atomic<int> sStaleAccum{0};
         static std::atomic<int> sFreshAccum{0};
+
+        // H3 stale-burst tracker (callback-level, not worker-frame-level).
+        //
+        // The stale% above counts worker-frames (workers × callbacks). It
+        // tells us the rate but not the temporal pattern. A "burst" here
+        // is a run of consecutive callbacks where at least one sub-worker
+        // had a stale front buffer — exactly the pattern that produces
+        // audible amplitude modulation on the wet bus (held-flat held
+        // for K callbacks in a row → step discontinuity perceived as a
+        // K × callbackPeriod-long modulation).
+        //
+        // sCurrentBurstLen — running burst length, resets on first clean
+        //                    callback. Atomic only for hygiene; only the
+        //                    mix node (one thread) writes it.
+        // sBurstCount      — number of bursts started in the current
+        //                    [WET_BUS] window. burstCount / window =
+        //                    burst rate.
+        // sMaxBurstLen     — longest burst seen in the window. A long
+        //                    burst (≥3 consecutive degraded callbacks)
+        //                    means the worker pool fell that far behind.
+        // sDegradedCb /
+        // sCleanCb         — callbacks classified at the callback level.
+        //                    Different from staleAccum/freshAccum which
+        //                    are worker-frame totals.
+        static std::atomic<int> sCurrentBurstLen{0};
+        static std::atomic<int> sBurstCount{0};
+        static std::atomic<int> sMaxBurstLen{0};
+        static std::atomic<int> sDegradedCb{0};
+        static std::atomic<int> sCleanCb{0};
         if (cw) {
             int fresh = std::max(0, wetWorkersHit - wetStaleFronts);
             sStaleAccum.fetch_add(wetStaleFronts, std::memory_order_relaxed);
             sFreshAccum.fetch_add(fresh,          std::memory_order_relaxed);
+
+            const bool cbDegraded = (wetStaleFronts > 0);
+            if (cbDegraded) {
+                int newLen = sCurrentBurstLen.fetch_add(
+                    1, std::memory_order_relaxed) + 1;
+                if (newLen == 1)
+                    sBurstCount.fetch_add(1, std::memory_order_relaxed);
+                int curMax = sMaxBurstLen.load(std::memory_order_relaxed);
+                while (newLen > curMax
+                       && !sMaxBurstLen.compare_exchange_weak(
+                            curMax, newLen, std::memory_order_relaxed)) {
+                    // curMax updated by CAS on failure; retry.
+                }
+                sDegradedCb.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                sCurrentBurstLen.store(0, std::memory_order_relaxed);
+                sCleanCb.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         int tick = sWetLogTick.fetch_add(1, std::memory_order_relaxed);
         if ((tick & 0x3F) == 0) {  // every ~64 callbacks ≈ 1.4s @ 1024@48k
@@ -1793,12 +1902,26 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             int freshW = sFreshAccum.exchange(0, std::memory_order_relaxed);
             int totalW = staleW + freshW;
             float stalePct = (totalW > 0) ? (100.0f * staleW / totalW) : 0.0f;
+
+            // H3 burst stats. NOTE: do NOT reset sCurrentBurstLen — a
+            // burst may straddle the log window boundary. The other
+            // counters are window-local and reset here.
+            int bursts     = sBurstCount.exchange(0, std::memory_order_relaxed);
+            int maxBurst   = sMaxBurstLen.exchange(0, std::memory_order_relaxed);
+            int degradedCb = sDegradedCb.exchange(0, std::memory_order_relaxed);
+            int cleanCb    = sCleanCb.exchange(0, std::memory_order_relaxed);
+            int totalCb    = degradedCb + cleanCb;
+            float cbDegradedPct = (totalCb > 0)
+                ? (100.0f * degradedCb / totalCb) : 0.0f;
+
             AUDIO_LOG("[WET_BUS] peakL=%.4f peakR=%.4f peakDb=%.1f preDb=%.1f satΔ=%.1fdB "
                       "drive=%.2f workersHit=%d stale=%d fresh=%d stale%%=%.1f "
+                      "bursts=%d maxBurst=%d cbDeg=%d/%d (%.1f%%) "
                       "listenerPos=(%.1f,%.1f,%.1f)\n",
                       wetPeakL, wetPeakR, peakDb, preDb, satDeltaDb,
                       node->wetSaturationEnabled ? node->wetSaturationDrive : 1.0f,
                       wetWorkersHit, staleW, freshW, stalePct,
+                      bursts, maxBurst, degradedCb, totalCb, cbDegradedPct,
                       node->listenerPosX, node->listenerPosY, node->listenerPosZ);
         }
     }
@@ -1885,6 +2008,17 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             cw->currentReadBuf = w;
 
             cw->workersReading.store(numW, std::memory_order_release);
+
+            // Stamp the signal time on each worker BEFORE bumping
+            // frameSeq. The worker's acquire-load on frameSeq makes this
+            // write visible to the worker, which uses it to compute the
+            // signal→pickup latency for the H2' diagnostic. Plain `store`
+            // with release is sufficient because frameSeq's bump below
+            // carries the happens-before edge.
+            const long long signalNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            for (auto &subPtr : cw->workers)
+                subPtr->signalTimeNs.store(signalNs, std::memory_order_release);
 
             // Signal all sub-workers that new data is available
             for (auto &subPtr : cw->workers)
@@ -2392,11 +2526,15 @@ bool AudioService::initMiniaudio()
         if (periodSize > 0) {
             mFrameSize = periodSize;
         }
-        AUDIO_LOG( "AudioService: miniaudio engine %u Hz → device '%s' @ %u Hz, %u ch, "
-                     "period=%u frames\n",
-                     mDeviceSampleRate, device->playback.name,
-                     device->sampleRate, device->playback.channels,
-                     mFrameSize);
+        // LOG_INFO (not AUDIO_LOG) so we always capture the engine↔device
+        // rate relationship — critical for diagnosing rate-mismatch
+        // resampling artefacts, and needed for triage even when the
+        // verbose audio log is off.
+        LOG_INFO("AudioService: miniaudio engine %u Hz \xe2\x86\x92 device '%s' @ %u Hz, "
+                 "%u ch, period=%u frames",
+                 mDeviceSampleRate, device->playback.name,
+                 device->sampleRate, device->playback.channels,
+                 mFrameSize);
     }
 
     // Publish engine sample rate to audio-thread DSP that needs it (door LPF).
@@ -2461,12 +2599,6 @@ bool AudioService::getHalfRateReflections() const
 {
     return mReflectionSim ? mReflectionSim->getRateDivisor() >= 2 : true;
 }
-void AudioService::setReflectionDemoteHysteresisFrames(int n)
-{
-    if (mReflectionSim)
-        mReflectionSim->setDemoteHysteresis(std::max(1, std::min(n, 3600)));
-}
-
 //------------------------------------------------------
 // Forwards to AudioDSPChain, which writes to the file-scope atomics defined
 // above (sHrtfInterpolation / sSpatialBlend / sDoorLpfOpenHz /
@@ -2758,17 +2890,31 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
     // Resolve scene type once for both the scene and the simulator below.
     IPLSceneType sceneTypeEnum = IPL_SCENETYPE_DEFAULT;
     if (mSceneTypeCfg == "embree") {
-        // Embree only takes effect if Steam Audio was built with embree support;
-        // otherwise the IPL fall back is to DEFAULT internally.
         sceneTypeEnum = IPL_SCENETYPE_EMBREE;
     }
 
     try {
-        // Step 1: Create IPLScene (Steam Audio's built-in CPU raytracer)
+        // Step 1: Create IPLScene (Steam Audio's built-in CPU raytracer).
+        // If the user asked for embree and Steam Audio wasn't built with
+        // embree linked, iplSceneCreate returns an error — fall back to
+        // the default raytracer with a loud [FALLBACK] message so the
+        // user notices and either fixes the build or drops the knob.
         IPLSceneSettings sceneSettings{};
         sceneSettings.type = sceneTypeEnum;
 
         IPLerror err = iplSceneCreate(mIplContext, &sceneSettings, &mIplScene);
+        if (err != IPL_STATUS_SUCCESS && sceneTypeEnum == IPL_SCENETYPE_EMBREE) {
+            std::fprintf(stderr,
+                "[FALLBACK] iplSceneCreate(embree) failed (error %d) — Steam Audio "
+                "was not built with Embree support. Falling back to scene_type=default. "
+                "Set audio.performance.scene_type: default in darknessRender.yaml to "
+                "silence this warning.\n",
+                err);
+            sceneTypeEnum = IPL_SCENETYPE_DEFAULT;
+            mSceneTypeCfg = "default";
+            sceneSettings.type = sceneTypeEnum;
+            err = iplSceneCreate(mIplContext, &sceneSettings, &mIplScene);
+        }
         if (err != IPL_STATUS_SUCCESS) {
             LOG_ERROR("AudioService: iplSceneCreate failed (error %d)", err);
             return false;
@@ -2878,6 +3024,56 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         mReflectionSampleRate = mDeviceSampleRate / static_cast<uint32_t>(rateDivisor);
         mReflectionFrameSize = mFrameSize / static_cast<uint32_t>(rateDivisor);
 
+        // ── Reverb-thread budget split ──
+        //
+        // Total budget: mReverbThreadsCfg (0 = auto: hwconc - 2, reserving
+        // 2 cores for main + audio). Split between convolution workers and
+        // ray-trace simulator threads using mReverbThreadsConvShareCfg.
+        //
+        // Auto-split policy (-1): bias toward sim in both modes. Empirically
+        // (see SESSION_LOGS 2026-05-20) the sim is the bottleneck regardless
+        // of whether realtime voices consume its output: per-cycle cost is
+        // hundreds of ms and scales with maxNumRays + numDiffuseSamples,
+        // both of which are paid up front at simulator-create time.
+        // Convolution has plenty of headroom — for the typical 12-16 voice
+        // load each apply is ~2-3 ms and parallelizes trivially across
+        // workers, so 3-4 workers is enough to stay well under the 21 ms
+        // callback budget. Realtime configs bias slightly more toward
+        // convolution because realtime voices add per-voice apply work.
+        //
+        // The invariant `conv + sim == total` is enforced here so the user
+        // cannot over-allocate regardless of how the share is set.
+        {
+            int totalThreads;
+            if (mReverbThreadsCfg > 0) {
+                totalThreads = mReverbThreadsCfg;
+            } else {
+                unsigned int hwThreads = std::thread::hardware_concurrency();
+                totalThreads = static_cast<int>(std::max(4u,
+                    hwThreads > 2 ? hwThreads - 2 : 2u));
+            }
+            // Each side needs at least 1; clamp to a sensible floor.
+            if (totalThreads < 2) totalThreads = 2;
+
+            float convShare;
+            if (mReverbThreadsConvShareCfg < 0.0f) {
+                convShare = (mReverbVoicesRealtime == 0) ? 0.35f : 0.45f;
+            } else {
+                convShare = mReverbThreadsConvShareCfg;
+            }
+            mConvolutionWorkerCount = std::max(1,
+                static_cast<int>(static_cast<float>(totalThreads) * convShare + 0.5f));
+            mSimulatorThreadCount   = std::max(1, totalThreads - mConvolutionWorkerCount);
+            // Re-adjust if rounding pushed convolution above total - 1.
+            if (mConvolutionWorkerCount + mSimulatorThreadCount > totalThreads) {
+                mConvolutionWorkerCount = totalThreads - mSimulatorThreadCount;
+            }
+            AUDIO_LOG("[REVERB_THREADS] budget=%d conv=%d sim=%d (share=%.2f%s, realtime=%d)\n",
+                      totalThreads, mConvolutionWorkerCount, mSimulatorThreadCount,
+                      convShare, mReverbThreadsConvShareCfg < 0.0f ? " auto" : "",
+                      mReverbVoicesRealtime);
+        }
+
         // Step 6: Create the simulator for direct occlusion + reflections + reverb.
         // The simulator uses the reflection sample rate — IRs are generated at this
         // rate, which must match the reflection effects and mixer.
@@ -2894,21 +3090,19 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             : (mReflectionType == ReflectionType::Parametric)
                 ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
                 : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-        // Sim caps — these are upper bounds; runtime uses mRealtimeNumRays etc.
-        // maxNumRays must be >= the runtime ray count; auto-bump if user set both.
+        // Sim caps. maxNumRays must be >= whichever pipeline branch (realtime
+        // or bake) will fire the most rays per cycle; auto-derived rather
+        // than a separate knob.
         simSettings.maxNumOcclusionSamples = mSimMaxOcclusionSamplesCfg;
-        simSettings.maxNumRays = std::max(mSimMaxRaysCfg, mRealtimeNumRays);
+        simSettings.maxNumRays = std::max(mRealtimeNumRays, mBakeNumRays);
         simSettings.numDiffuseSamples = mRealtimeDiffuseSamples;
         simSettings.maxDuration = mRealtimeDuration;
         simSettings.maxOrder = mAmbisonicsOrder;
-        simSettings.maxNumSources = mReflectionMaxSourcesCfg;
-        // Ray-trace thread count: 0 = auto (reserve 2 cores for main + audio).
-        if (mSimulatorThreadsCfg > 0) {
-            simSettings.numThreads = mSimulatorThreadsCfg;
-        } else {
-            unsigned int hwThreads = std::thread::hardware_concurrency();
-            simSettings.numThreads = std::max(2u, hwThreads > 2 ? hwThreads - 2 : 2u);
-        }
+        // Reflection-sim source pool — every reverb voice (realtime or
+        // baked) registers a source here, so it must be >= reverb_voices.
+        // The 8 floor keeps a tiny safety margin for cap=0 edge cases.
+        simSettings.maxNumSources = std::max(8, mReverbVoices);
+        simSettings.numThreads = mSimulatorThreadCount;
         simSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
         simSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
 
@@ -2953,7 +3147,10 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_PATHING);
         directSettings.sceneType = sceneTypeEnum;
         directSettings.maxNumOcclusionSamples = mSimMaxOcclusionSamplesCfg;
-        directSettings.maxNumSources = mDirectMaxSourcesCfg;
+        // Direct-sim source pool — every voice (regardless of reverb
+        // status) registers a direct source. Cost is ~constant per
+        // source so we size to the voice cap with a 64 floor.
+        directSettings.maxNumSources = std::max(64, mMaxActiveVoicesCfg);
         // Probe-to-probe visibility sampling count for pathing — when a
         // baked path is occluded by dynamic geometry and findAlternatePaths
         // re-runs path finding, this controls how many rays test each
@@ -3188,15 +3385,10 @@ bool AudioService::initReflectionPipeline()
 
     // NOTE: rmn.convWorker is set AFTER the worker pool is created (below).
 
-    // Determine number of sub-workers
-    int numWorkers;
-    if (mConvolutionWorkerCount > 0) {
-        numWorkers = mConvolutionWorkerCount;
-    } else {
-        // Auto: use available cores minus 3 (main + audio + sim), minimum 1
-        unsigned int hwThreads = std::thread::hardware_concurrency();
-        numWorkers = std::max(1, static_cast<int>(hwThreads) - 3);
-    }
+    // Sub-worker count was computed earlier in buildAcousticScene from the
+    // unified reverb-thread budget split (mReverbThreadsCfg /
+    // mReverbThreadsConvShareCfg). See [REVERB_THREADS] log line.
+    int numWorkers = mConvolutionWorkerCount;
 
     // Hand off to the ConvolutionWorkerPool — it creates the pool's
     // ConvolutionWorker struct, allocates per-sub-worker Steam Audio
@@ -3223,6 +3415,41 @@ bool AudioService::initReflectionPipeline()
     poolCfg.numWorkers = numWorkers;
     poolCfg.audioSettings = audioSettings;
     poolCfg.reflSettings = poolReflSettings;
+    // ── Rate / framing summary ─────────────────────────────────────────
+    // One-shot diagnostic so we never have to fish for these numbers
+    // across multiple init log lines. The four rates that matter for the
+    // reflection pipeline are:
+    //   • mDeviceSampleRate        — what we configured miniaudio's
+    //                                engine to expect (= what Steam Audio
+    //                                is told to run at). miniaudio
+    //                                resamples to the actual hardware
+    //                                rate transparently.
+    //   • mReflectionSampleRate    — convolution rate inside the worker
+    //                                (= device rate ÷ rateDivisor).
+    //   • mFrameSize               — audio thread frame size (samples).
+    //                                Period in ms = mFrameSize ÷
+    //                                mDeviceSampleRate × 1000.
+    //   • mReflectionFrameSize     — worker output frame (samples at
+    //                                reflection rate).
+    {
+        const double devicePeriodMs = (mDeviceSampleRate > 0)
+            ? (1000.0 * static_cast<double>(mFrameSize)
+                       / static_cast<double>(mDeviceSampleRate))
+            : 0.0;
+        // Use LOG_INFO (always-on logger) rather than AUDIO_LOG so this
+        // fires even when gAudioLogVerbose hasn't been set true yet — the
+        // YAML `audio_log: true` toggle takes effect after this init path,
+        // so AUDIO_LOG here would silently no-op.
+        LOG_INFO("[RATES] device=%u Hz reflection=%u Hz "
+                 "frame=%u smp (%.3f ms nominal) reflFrame=%u smp "
+                 "ambiOrder=%d ambiCh=%d rateDiv=%d workers=%d",
+                 mDeviceSampleRate, mReflectionSampleRate,
+                 mFrameSize, devicePeriodMs,
+                 mReflectionFrameSize,
+                 mAmbisonicsOrder, mAmbisonicsChannels,
+                 rateDivisor, numWorkers);
+    }
+
     mConvolutionPool = std::make_unique<ConvolutionWorkerPool>();
     if (!mConvolutionPool->init(poolCfg)) {
         mConvolutionPool.reset();
@@ -3241,7 +3468,7 @@ bool AudioService::initReflectionPipeline()
                  "(convolution, order %d (%dch), IR %d samples, %uHz, 1/%d rate, max %d voices%s)\n",
                  mAmbisonicsOrder, mAmbisonicsChannels,
                  irSize, mReflectionSampleRate, rateDivisor,
-                 mMaxReflectionVoices,
+                 mReverbVoices,
                  mConvolutionPool ? ", off-thread" : ", on-thread fallback");
     return true;
 }
@@ -3764,10 +3991,10 @@ void AudioService::loopStep(float deltaTime)
                 for (auto &[h, v] : mVoicePool->voices()) {
                     if (v->reflSlotOwned) ++slotsHeld;
                 }
-                // Realtime sticky-slot pool size = `mMaxRealtimeVoices`, which
-                // defaults to mMaxReflectionVoices but can be set lower (or 0)
+                // Realtime sticky-slot pool size = `mReverbVoicesRealtime`, which
+                // defaults to mReverbVoices but can be set lower (or 0)
                 // to reserve total-convolution budget for baked voices only.
-                int slotsAvailable = std::max(0, mMaxRealtimeVoices - slotsHeld);
+                int slotsAvailable = std::max(0, mReverbVoicesRealtime - slotsHeld);
 
                 // Step 2: collect undecided candidates eligible for promotion.
                 std::vector<VoiceDist> newCandidates;
@@ -4475,7 +4702,7 @@ void AudioService::loopStep(float deltaTime)
         // Tail voices (sourceEnded, still ringing out reverb) are counted first
         // since they already have reflectionsActive=true and can't be cheaply
         // disabled mid-convolution. Remaining slots go to active voices: top-N
-        // closest first, then baked voices fill remaining up to mMaxReflectionVoices.
+        // closest first, then baked voices fill remaining up to mReverbVoices.
         int tailConvolutionCount = 0;
         for (auto &[h, v] : mVoicePool->voices()) {
             if (v->sourceEnded && !v->finished.load(std::memory_order_relaxed)
@@ -4739,17 +4966,17 @@ void AudioService::loopStep(float deltaTime)
                 // Enable reflection convolution up to the global budget.
                 // Top-N closest voices (real-time) get priority, then baked
                 // voices fill remaining slots. Total convolution voices are
-                // capped at mMaxReflectionVoices to stay within the audio
+                // capped at mReverbVoices to stay within the audio
                 // callback budget (~1.5ms per convolution voice).
                 //
                 // Note: reflCandidates was already shrunk to
-                // (mMaxReflectionVoices − tailCount) above, so in normal flow
+                // (mReverbVoices − tailCount) above, so in normal flow
                 // an isReflVoice voice always has slot budget here.  We still
                 // gate by canAffordConvolution as defence-in-depth — if the
                 // cap was lowered at runtime, or a tail voice was missed in
                 // the pre-count, this prevents overshoot.
                 bool isReflVoice = reflCandidateSet.count(handle) > 0;
-                bool canAffordConvolution = (activeConvolutionCount < mMaxReflectionVoices);
+                bool canAffordConvolution = (activeConvolutionCount < mReverbVoices);
                 bool hasBakedData = mProbeManager->hasReflections()
                                     && outputs.reflections.irSize > 0
                                     && voice->dspNode.reflectionEffect;
@@ -4833,7 +5060,7 @@ void AudioService::loopStep(float deltaTime)
                                   handle, voice->schemaName.c_str(), voiceDist,
                                   reason,
                                   outputs.reflections.irSize,
-                                  activeConvolutionCount, mMaxReflectionVoices,
+                                  activeConvolutionCount, mReverbVoices,
                                   hasBakedData ? 1 : 0);
                     }
                 }
@@ -7089,6 +7316,10 @@ void AudioService::dumpAudioStatusPeriodic()
     auto mixP    = sPerfReflMixMs.snapshotAndReset();
     auto simP    = sPerfReflSimMs.snapshotAndReset();
     LatencyHistogram::Percentiles applyP{}, sumP{}, decP{}, upP{}, iterP{};
+    // H2 per-iter aggregate histograms — see ConvolutionSubWorker for rationale.
+    LatencyHistogram::Percentiles maxApplyP{}, sumApplyP{}, residualP{};
+    // H2' signal→pickup latency (worker side).
+    LatencyHistogram::Percentiles pickupP{};
     if (mConvolutionPool && mConvolutionPool->isActive()) {
         ConvolutionWorker *cw = mConvolutionPool->worker();
         // Snapshot each sub-worker histogram and accumulate bin counts
@@ -7106,15 +7337,25 @@ void AudioService::dumpAudioStatusPeriodic()
             auto d = subPtr->perfDecodeMs.snapshotAndReset();
             auto u = subPtr->perfUpsampleMs.snapshotAndReset();
             auto it = subPtr->perfIterMs.snapshotAndReset();
+            auto mx = subPtr->perfMaxApplyMs.snapshotAndReset();
+            auto sa = subPtr->perfSumApplyMs.snapshotAndReset();
+            auto rs = subPtr->perfResidualMs.snapshotAndReset();
+            auto pk = subPtr->perfSignalPickupMs.snapshotAndReset();
             // Take the percentile values of the worker with the most
             // samples — most representative of pool behaviour under load.
-            if (a.n  > applyP.n) applyP = a;
-            if (s.n  > sumP.n)   sumP   = s;
-            if (d.n  > decP.n)   decP   = d;
-            if (u.n  > upP.n)    upP    = u;
-            if (it.n > iterP.n)  iterP  = it;
+            if (a.n   > applyP.n)     applyP    = a;
+            if (s.n   > sumP.n)       sumP      = s;
+            if (d.n   > decP.n)       decP      = d;
+            if (u.n   > upP.n)        upP       = u;
+            if (it.n  > iterP.n)      iterP     = it;
+            if (mx.n  > maxApplyP.n)  maxApplyP = mx;
+            if (sa.n  > sumApplyP.n)  sumApplyP = sa;
+            if (rs.n  > residualP.n)  residualP = rs;
+            if (pk.n  > pickupP.n)    pickupP   = pk;
         }
     }
+    // H1' inter-callback period (one writer = audio thread).
+    auto interCbP = sPerfInterCallbackMs.snapshotAndReset();
     auto fmtMs = [](double v) -> double { return v; };  // identity, leave for future tuning
     AUDIO_LOG(
         "[PERF audio] dsp_node n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
@@ -7134,6 +7375,51 @@ void AudioService::dumpAudioStatusPeriodic()
         (unsigned long long)decP.n,   fmtMs(decP.p50),   fmtMs(decP.p95),   fmtMs(decP.p99),
         (unsigned long long)upP.n,    fmtMs(upP.p50),    fmtMs(upP.p95),    fmtMs(upP.p99),
         (unsigned long long)iterP.n,  fmtMs(iterP.p50),  fmtMs(iterP.p95),  fmtMs(iterP.p99));
+
+    // H2 per-iter aggregate distribution (apply-distribution + residual).
+    //
+    // sum_apply  — convolution work the worker actually does per iter.
+    //              Compare against iter p99: if sum_apply ≈ iter, DSP is
+    //              the whole cost. If sum_apply ≪ iter, look at residual.
+    // max_apply  — worst single apply() call within an iter. If max ≈
+    //              sum_apply, one expensive voice is the bottleneck.
+    //              If max ≪ sum_apply / assignCount, costs are balanced
+    //              — attack per-voice cost (rate_divisor, order) not
+    //              assignment policy.
+    // residual   — iter − (sumApply + sumStage + decode + upsample). All
+    //              non-DSP time: memset, atomics, buffer flip, scheduler
+    //              preemption. residual p99 ≫ p50 = thread scheduling
+    //              jitter (H1) or contention; residual p50 large = static
+    //              overhead (mempset/atomics) we can attack.
+    AUDIO_LOG(
+        "[PERF worker_iter] sum_apply n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | max_apply n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | residual n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+        (unsigned long long)sumApplyP.n, fmtMs(sumApplyP.p50), fmtMs(sumApplyP.p95), fmtMs(sumApplyP.p99),
+        (unsigned long long)maxApplyP.n, fmtMs(maxApplyP.p50), fmtMs(maxApplyP.p95), fmtMs(maxApplyP.p99),
+        (unsigned long long)residualP.n, fmtMs(residualP.p50), fmtMs(residualP.p95), fmtMs(residualP.p99));
+
+    // H1' / H2' — signal pipeline timing.
+    //
+    // inter_cb    — wall-clock between consecutive audio callbacks.
+    //               Nominal at 1024 @ 48 kHz: 21.333 ms. If p99 ≪ p50,
+    //               CoreAudio is firing some callbacks early (e.g. two
+    //               in quick succession) and no worker can possibly
+    //               advance between them — that would explain the
+    //               all-4-stale-or-none pattern in [WET_BUS].
+    //
+    // signal_pickup — wall-clock from `frameSeq++` on the mix node side
+    //               to the worker's observation of the new seq on its
+    //               next yield-poll cycle. Lower bound on how long a
+    //               worker spent unscheduled (or yield-pollling) before
+    //               picking up its work. Large p99 here = the
+    //               yield()-based wake path is the bottleneck → look at
+    //               replacing it with a condvar / semaphore.
+    AUDIO_LOG(
+        "[PERF timing] inter_cb n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | signal_pickup n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+        (unsigned long long)interCbP.n, fmtMs(interCbP.p50), fmtMs(interCbP.p95), fmtMs(interCbP.p99),
+        (unsigned long long)pickupP.n,  fmtMs(pickupP.p50),  fmtMs(pickupP.p95),  fmtMs(pickupP.p99));
 
     // ── [BEAT] wet-bus autocorrelation ──
     //
@@ -7729,7 +8015,7 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     params.bakeNumBounces        = mBakeNumBounces;
     params.bakeDuration          = mBakeDuration;
     params.bakeDiffuseSamples    = mBakeDiffuseSamples;
-    params.simulatorThreads      = mSimulatorThreadsCfg;
+    params.simulatorThreads      = mSimulatorThreadCount;
     params.ambisonicsOrder       = mBakeAmbisonicsOrder;
     params.sceneType             = mSceneTypeCfg;
     params.spacingFtOverride     = spacing;

@@ -443,16 +443,6 @@ struct ActiveVoice {
     IPLSource directSource     = nullptr;  // owned by mDirectSimulator
     IPLSource reflectionSource = nullptr;  // owned by mReflectionSimulator
 
-    // Lazy reflection-source state machine (stage 2.2): Normal voices only
-    // hold a reflectionSource while they are in (or recently in) the top-N
-    // reflection-candidate pool, recomputed every frame against the live
-    // listener position. This counter tracks consecutive frames the voice
-    // has been out of top-N; once it reaches mReflectionDemoteHysteresisCfg
-    // the voice is demoted and reflectionSource is released. Reset to 0
-    // every frame the voice is in top-N. PlayerEmitted / Ambient voices
-    // are excluded from the dance and this counter is unused for them.
-    int framesOutOfTopN = 0;
-
     // ── Sticky reflection-slot ownership (replaces per-frame top-N churn) ──
     //
     // The pre-sticky design re-ranked every voice by distSq every frame and

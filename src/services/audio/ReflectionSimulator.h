@@ -202,11 +202,6 @@ public:
     }
     int  getRateDivisor() const { return mRateDivisor; }
 
-    /// Demote hysteresis (frames a voice can sit outside the top-N closest
-    /// pool before its reflection source is released). Set from RenderConfig.
-    void setDemoteHysteresis(int frames) { mDemoteHysteresisCfg = frames; }
-    int  getDemoteHysteresis() const { return mDemoteHysteresisCfg; }
-
     // ── Active-reflection-source counter ──
 
     /// Number of voices currently holding a reflection IPLSource (whether
@@ -223,12 +218,12 @@ public:
         return mActiveSources.load(std::memory_order_relaxed);
     }
 
-    // ── Stage 2.2 demote fallback ──
+    // ── Sticky-slot demote ──
 
-    /// Release the reflection IPLSource for a voice that has stayed
-    /// outside the top-N reflection candidate pool long enough that the
-    /// caller has decided it should fall through to dry-only playback for
-    /// the remainder of its life.
+    /// Release the reflection IPLSource for a voice that has finished
+    /// playback AND whose reverb tail has rung out (the sticky-slot
+    /// allocator's release condition). Called from AudioService::loopStep
+    /// when `sourceEnded && tailTimer <= 0`.
     ///
     /// Reuses the same defer-flush logic as removeVoiceSource: if the
     /// worker thread is running, the IPLSource is queued for cleanup at
@@ -237,9 +232,9 @@ public:
     /// before releasing the source — the worker may hold a staged frame
     /// whose params.ir points at the source's reflection state.
     ///
-    /// Sets `voice.reflectionsActive=false`, resets `framesOutOfTopN`,
-    /// decrements the active-source counter, and nulls
-    /// `voice.reflectionSource` when defer-flush is required.
+    /// Sets `voice.reflectionsActive=false`, decrements the active-source
+    /// counter, and nulls `voice.reflectionSource` when defer-flush is
+    /// required.
     void demoteVoice(ActiveVoice &voice);
 
 private:
@@ -267,11 +262,10 @@ private:
     // ── Simulator commit state ──
     bool mSimulatorDirty = false;
 
-    // ── Throttle / rate divisor / demote config ──
+    // ── Throttle / rate divisor ──
     int mThrottle = 4;                   ///< run every Nth wantReflections (1..32)
     int mFrameCounter = 0;               ///< increments on each throttleTick
     int mRateDivisor = 2;                ///< 1/2/4 — sample-rate denominator
-    int mDemoteHysteresisCfg = 600;      ///< frames out-of-top-N → demote
 
     // ── Active reflection source counter ──
     std::atomic<int> mActiveSources{0};
