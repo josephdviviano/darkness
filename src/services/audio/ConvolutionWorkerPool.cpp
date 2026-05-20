@@ -27,12 +27,25 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <thread>
 
 #include <phonon.h>
 
 #include "logger.h"
+
+// Thread naming + QoS introspection for the one-shot [WORKER_QOS] log.
+// On macOS the OS scheduler can place threads on either P-cores (fast) or
+// E-cores (~2-3× slower for FFT-bound work), so confirming each worker's
+// scheduling class is the first step in diagnosing iter-time tail latency.
+#if defined(__APPLE__)
+#  include <pthread.h>
+#  include <pthread/qos.h>
+#elif defined(__linux__)
+#  include <pthread.h>
+#  include <sched.h>
+#endif
 
 namespace Darkness {
 
@@ -208,6 +221,7 @@ void ConvolutionWorkerPool::shutdown()
     for (auto &subPtr : mWorker->workers) {
         subPtr->shutdown.store(true, std::memory_order_release);
         subPtr->frameSeq.fetch_add(1, std::memory_order_release);  // wake it
+        subPtr->wakeCv.notify_one();  // condvar wake (yield-poll → cv since 2026-05)
     }
     for (auto &subPtr : mWorker->workers) {
         if (subPtr->thread.joinable())
@@ -260,16 +274,126 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
     // audio.
     audioEnableDenormalFlush();
 
+    // Promote the worker thread to a real-time-grade scheduling class
+    // BEFORE doing any other work, so the first iter benefits.
+    //
+    // Spawned threads inherit QoS from the caller (the audio init path on
+    // the main thread, which lands at QOS_CLASS_DEFAULT = 21 on macOS).
+    // At DEFAULT the scheduler can preempt the worker on equal footing
+    // with the render thread; under load that has been observed to leave
+    // a worker un-scheduled for >21 ms (one audio-callback period), at
+    // which point the mix node reads the previous frame and the wet bus
+    // is held flat — audible amplitude modulation on the reverb. Diagnosis
+    // pinned this on the H1 hypothesis in HANDOFF.AUDIO_PERFORMANCE_TUNING.md:
+    // iter time is 5–12 ms (well under the 21 ms budget) yet bursts of
+    // 1–4 stale callbacks still occur, which can only be a wait-for-signal
+    // scheduling gap, not a DSP overrun.
+    //
+    // USER_INTERACTIVE is what CoreAudio uses for its own callback thread;
+    // matching that here puts the workers at the same priority tier and
+    // tells the macOS scheduler these are user-perceptible-latency tasks
+    // (→ P-core preference, low scheduler-jitter). The CoreAudio thread
+    // itself is unaffected by our setting — we're only raising the workers
+    // to its level, not above. No realtime-budget syscall is involved
+    // (cf. `thread_policy_set` with `THREAD_TIME_CONSTRAINT_POLICY`) since
+    // that requires per-frame budget hints we'd have to keep in sync with
+    // the audio-callback period.
+    //
+    // We log the post-set QoS via `pthread_get_qos_class_np` so the
+    // [WORKER_QOS] log line in production output confirms the value stuck
+    // (a silent failure would leave qos=21 visible and reveal it).
+    {
+        char threadName[16];
+        std::snprintf(threadName, sizeof(threadName), "conv-w%d", workerIdx);
+#if defined(__APPLE__)
+        pthread_setname_np(threadName);
+        int qosSetRc = pthread_set_qos_class_self_np(
+            QOS_CLASS_USER_INTERACTIVE, 0);
+        qos_class_t qos = QOS_CLASS_UNSPECIFIED;
+        int relPri = 0;
+        if (pthread_get_qos_class_np(pthread_self(), &qos, &relPri) == 0) {
+            AUDIO_LOG("[WORKER_QOS] w=%d name=%s qos=%u rel=%d setRc=%d\n",
+                      workerIdx, threadName,
+                      static_cast<unsigned>(qos), relPri, qosSetRc);
+        } else {
+            AUDIO_LOG("[WORKER_QOS] w=%d name=%s qos=query-failed setRc=%d\n",
+                      workerIdx, threadName, qosSetRc);
+        }
+#elif defined(__linux__)
+        // Linux has no QoS equivalent; the closest path is SCHED_FIFO/RR
+        // via pthread_setschedparam, which requires CAP_SYS_NICE or root
+        // and is unsafe to enable by default. The same wobble symptom
+        // would need to be confirmed on Linux before adding a privileged
+        // priority bump there.
+        pthread_setname_np(pthread_self(), threadName);
+        int cpu = sched_getcpu();
+        int policy = sched_getscheduler(0);
+        AUDIO_LOG("[WORKER_QOS] w=%d name=%s startCpu=%d schedPolicy=%d\n",
+                  workerIdx, threadName, cpu, policy);
+#else
+        AUDIO_LOG("[WORKER_QOS] w=%d name=%s (no introspection on this platform)\n",
+                  workerIdx, threadName);
+#endif
+    }
+
     while (!sub.shutdown.load(std::memory_order_relaxed)) {
-        // Wait for the mix node to signal new data
-        uint64_t seq = sub.frameSeq.load(std::memory_order_acquire);
-        if (seq == lastSeq) {
-            std::this_thread::yield();
-            continue;
+        // Wait for the mix node to signal new data. Condvar-based wake
+        // (replaces previous yield-poll loop, 2026-05). yield-poll spun
+        // the worker thread, and during macOS scheduler stalls — most
+        // notably at iplSimulatorRunReflections cycle completion when
+        // 6 sim threads all become non-runnable at once — the worker
+        // could miss a frameSeq bump for an entire callback period
+        // (~21 ms). Because the worker then jumps straight to the
+        // latest seq without processing the missed frame, the wet bus
+        // mix node observed a stale `processedSeq` for that callback
+        // and replayed the previous 21.3 ms of reverb output —
+        // producing the per-sim-cycle "thump" / wobble artefact.
+        // The cv.wait predicate re-checks frameSeq atomically under
+        // lock, so a missed notify_one (worker not in wait at the
+        // moment of notify) is harmless. See NOTES.PROJECT.md
+        // "Reflection sim ↔ conv worker contention pattern".
+        uint64_t seq;
+        {
+            std::unique_lock<std::mutex> lock(sub.wakeMtx);
+            sub.wakeCv.wait(lock, [&] {
+                return sub.frameSeq.load(std::memory_order_acquire) != lastSeq
+                       || sub.shutdown.load(std::memory_order_relaxed);
+            });
+            if (sub.shutdown.load(std::memory_order_relaxed)) break;
+            seq = sub.frameSeq.load(std::memory_order_acquire);
         }
         lastSeq = seq;
 
         auto t0 = std::chrono::steady_clock::now();
+
+        // H2' signal→pickup latency. The mix node wrote signalTimeNs
+        // immediately before bumping frameSeq; the acquire load above
+        // makes that write visible here. The gap captures yield-poll
+        // wakeup latency + OS dispatch + cache rewarm — none of which
+        // is included in iter time (which starts at t0). signalTimeNs=0
+        // is the bootstrap value before the first bump; skip the record
+        // until the producer has actually written one to avoid recording
+        // an enormous fake latency.
+        const long long signalNs = sub.signalTimeNs.load(std::memory_order_acquire);
+        if (signalNs > 0) {
+            const long long pickupNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                t0.time_since_epoch()).count() - signalNs;
+            if (pickupNs >= 0) {
+                sub.perfSignalPickupMs.record(static_cast<double>(pickupNs) / 1.0e6);
+            }
+        }
+
+        // Per-iteration accumulators for H2 (apply-distribution histograms).
+        // These mirror the existing per-call histograms but aggregate over
+        // the iter so we can attribute the iter-time tail to either the
+        // accumulated apply cost, a single dominant voice, or non-DSP
+        // residual (memset/atomics/scheduler). Cost: a few doubles in
+        // automatic storage + a few add/max ops per voice; negligible.
+        double iterApplySumMs    = 0.0;
+        double iterApplyMaxMs    = 0.0;
+        double iterSumStageMs    = 0.0;
+        double iterDecodeMs      = 0.0;
+        double iterUpsampleMs    = 0.0;
 
         // workersReading was pre-set by the mix node before signaling us.
         // We only decrement when done — no increment needed here.
@@ -370,15 +494,25 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
             // (mixer=nullptr → direct buffer output). This is the only
             // overload that supports HYBRID/PARAMETRIC; the mixer overload
             // is restricted to CONVOLUTION/TAN.
+            //
+            // Explicit timing (rather than ScopedLatencyTimer) so the
+            // elapsed value also feeds the per-iter sum/max accumulators
+            // for the perfSumApplyMs / perfMaxApplyMs histograms.
             {
-                ScopedLatencyTimer applyTimer(sub.perfApplyMs);
+                auto applyT0 = std::chrono::steady_clock::now();
                 iplReflectionEffectApply(slot.effect, &slot.params,
                                           &reflIn, &voiceOut, /*mixer=*/nullptr);
+                auto applyT1 = std::chrono::steady_clock::now();
+                double applyMs = std::chrono::duration<double, std::milli>(
+                    applyT1 - applyT0).count();
+                sub.perfApplyMs.record(applyMs);
+                iterApplySumMs += applyMs;
+                if (applyMs > iterApplyMaxMs) iterApplyMaxMs = applyMs;
             }
 
             // Sum per-voice output into the per-worker accumulator.
             {
-                ScopedLatencyTimer sumTimer(sub.perfSumMs);
+                auto sumT0 = std::chrono::steady_clock::now();
                 const int voiceCh = std::min(slot.params.numChannels, nch);
                 for (int c = 0; c < voiceCh; ++c) {
                     const float *src = voicePtrs[c];
@@ -390,6 +524,11 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
                     for (std::uint32_t s = 0; s < reflFrameCount; ++s)
                         dst[s] += src[s];
                 }
+                auto sumT1 = std::chrono::steady_clock::now();
+                double sumMs = std::chrono::duration<double, std::milli>(
+                    sumT1 - sumT0).count();
+                sub.perfSumMs.record(sumMs);
+                iterSumStageMs += sumMs;
             }
 
             // Diagnostic: log every Nth slot the worker processes. With
@@ -478,9 +617,13 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
         decodeParams.orientation = cw.listenerOrientation;
         decodeParams.binaural = IPL_TRUE;
         {
-            ScopedLatencyTimer decodeTimer(sub.perfDecodeMs);
+            auto decT0 = std::chrono::steady_clock::now();
             iplAmbisonicsDecodeEffectApply(sub.ambiDecodeEffect, &decodeParams,
                                             &ambiOut, &decodedBuf);
+            auto decT1 = std::chrono::steady_clock::now();
+            iterDecodeMs = std::chrono::duration<double, std::milli>(
+                decT1 - decT0).count();
+            sub.perfDecodeMs.record(iterDecodeMs);
         }
 
         // Sanitize the decoded stereo from the ambisonics decoder before it
@@ -503,7 +646,10 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
 
         // Write decoded stereo to this sub-worker's back buffer.
         // Handle upsampling from reflection rate to device rate.
-        ScopedLatencyTimer upsampleTimer(sub.perfUpsampleMs);
+        //
+        // Explicit timing (rather than ScopedLatencyTimer) so the elapsed
+        // value also feeds the per-iter residual-time calculation below.
+        auto upT0 = std::chrono::steady_clock::now();
         int div = cw.rateDivisor;
         if (div > 1) {
             // Linear interpolation upsample by rateDivisor.
@@ -556,6 +702,16 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
             std::memcpy(sub.stereoL[back].data(), sub.decodedL.data(), outSamples * sizeof(float));
             std::memcpy(sub.stereoR[back].data(), sub.decodedR.data(), outSamples * sizeof(float));
         }
+        // Close the upsample timing span (opened just before `int div = ...`).
+        // The buffer-flip atomics + processedSeq store below are intentionally
+        // outside this span — they're accounted for in the perfResidualMs
+        // bucket via `iter − (sum stages)` below.
+        {
+            auto upT1 = std::chrono::steady_clock::now();
+            iterUpsampleMs = std::chrono::duration<double, std::milli>(
+                upT1 - upT0).count();
+            sub.perfUpsampleMs.record(iterUpsampleMs);
+        }
 
         // Swap: make back buffer the new front
         sub.frontIdx.store(back, std::memory_order_release);
@@ -569,6 +725,26 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
         // single iteration since the last reset; perfIterMs gives the full
         // distribution (p50/p95/p99) over the window.
         sub.perfIterMs.record(static_cast<double>(ms));
+
+        // H2: per-iter apply-distribution + residual histograms.
+        //
+        // Only record sum/max when this iter actually processed voices —
+        // an iter with assignCount=0 has iterApplySumMs==0 and would
+        // dominate the p50 with zeros, masking the real distribution.
+        // perfResidualMs is always recorded: it captures the non-DSP
+        // floor (memset + entry diag + atomics + buffer flip + scheduler
+        // preemption) which exists every iter regardless of voice count.
+        if (assignCount > 0) {
+            sub.perfSumApplyMs.record(iterApplySumMs);
+            sub.perfMaxApplyMs.record(iterApplyMaxMs);
+        }
+        const double iterTotalMs       = static_cast<double>(ms);
+        const double knownStagesMs     = iterApplySumMs + iterSumStageMs
+                                       + iterDecodeMs + iterUpsampleMs;
+        const double residualMs        = (iterTotalMs > knownStagesMs)
+                                       ? (iterTotalMs - knownStagesMs)
+                                       : 0.0;
+        sub.perfResidualMs.record(residualMs);
 
         // Diagnostic: log iterations that risk overrunning the audio
         // callback period (1024 @ 48 kHz = ~21.3 ms).  When ms exceeds

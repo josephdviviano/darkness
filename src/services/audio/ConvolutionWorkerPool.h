@@ -64,9 +64,11 @@
 #include "AudioService.h"   // MAX_ACTIVE_VOICES
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -151,6 +153,21 @@ struct ConvolutionSubWorker {
     std::atomic<bool> shutdown{false};
     std::atomic<float> peakMs{0.0f};
 
+    // Wake mechanism. The worker sleeps on `wakeCv` whenever
+    // `frameSeq == lastSeq && !shutdown`. The audio thread bumps
+    // `frameSeq` (atomic store, no lock needed) then calls
+    // `wakeCv.notify_one()` to wake the worker. cv.wait re-checks the
+    // predicate after each wake, so a missed notify (worker not in
+    // wait at the moment of notify) is harmless — the worker either
+    // sees the new seq on the next predicate check (no wait) or wakes
+    // immediately when notify lands. This replaces the previous
+    // yield-poll loop which would miss signals during macOS scheduler
+    // stalls (typically at reflection-sim cycle completion); see
+    // NOTES.PROJECT.md "Reflection sim ↔ conv worker contention
+    // pattern" for the diagnosis.
+    std::mutex wakeMtx;
+    std::condition_variable wakeCv;
+
     // Gain-staging meters (per sub-worker, written only by this worker
     // thread, read by the master mix node at [GAIN] dump time with
     // accept-tearing semantics — diagnostic, no correctness impact).
@@ -172,6 +189,55 @@ struct ConvolutionSubWorker {
     LatencyHistogram perfDecodeMs;    // iplAmbisonicsDecodeEffectApply per frame
     LatencyHistogram perfUpsampleMs;  // rate-divisor upsample + bridge per frame
     LatencyHistogram perfIterMs;      // total per-iteration time (= old peakMs)
+
+    // ── Per-iteration apply-distribution histograms (H2 of perf-tuning) ──
+    //
+    // perfApplyMs above already records each individual apply() call. These
+    // histograms aggregate per-iter to answer two diagnostic questions that
+    // the per-call distribution cannot:
+    //
+    //   • perfSumApplyMs   — sum of all apply() calls in one iter. The
+    //                        per-call distribution can't tell us how those
+    //                        costs add up across the 4 voices assigned to
+    //                        one worker. This is the convolution work the
+    //                        worker actually does per iter — directly
+    //                        comparable to iter time.
+    //   • perfMaxApplyMs   — max single apply() call in one iter. If the
+    //                        iter tail is driven by one expensive voice
+    //                        rather than the accumulated 4, max = sum
+    //                        (single dominant voice); if balanced, max ≈
+    //                        sum / N. Tells us whether to attack the
+    //                        per-voice cost or the assignment policy.
+    //   • perfResidualMs   — iter − (sumApply + sumStage + decode +
+    //                        upsample). All non-DSP time inside an iter:
+    //                        memset, atomic store, buffer flip, cache
+    //                        warmup, scheduler preemption. If residual p99
+    //                        is large, the bottleneck is NOT DSP and lever
+    //                        1–3 (yaml knobs) won't help — likely thread
+    //                        scheduling (H1) or contention.
+    LatencyHistogram perfMaxApplyMs;
+    LatencyHistogram perfSumApplyMs;
+    LatencyHistogram perfResidualMs;
+
+    // ── Signal → pickup latency (H2' of perf-tuning) ────────────────────
+    //
+    // Written by the mix node at the moment it bumps `frameSeq`, read by
+    // the worker the moment it detects the new seq. The diff captures the
+    // gap between "signal sent" and "worker started processing" — i.e.
+    // the cost of the worker's wait-loop (yield-poll or condvar) plus any
+    // scheduler delay between the worker becoming runnable and being
+    // dispatched onto a core. Iter time alone cannot see this — that
+    // timer starts AFTER the new seq is observed.
+    //
+    // ns since steady_clock epoch (kept as raw nanoseconds so we don't
+    // have to commit to a duration type across header/cpp boundaries).
+    // Atomic for cross-thread visibility; ordering is acquire/release
+    // around the frameSeq bump, so the write happens-before the worker's
+    // observation of the new seq value.
+    std::atomic<long long> signalTimeNs{0};
+
+    // Histogram of (worker observation time − signalTimeNs) per iter.
+    LatencyHistogram perfSignalPickupMs;
 };
 
 // ── Off-thread convolution worker with K parallel sub-workers ──────────

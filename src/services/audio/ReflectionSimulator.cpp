@@ -28,6 +28,11 @@
 #include <algorithm>
 #include <chrono>
 
+#if defined(__APPLE__)
+#  include <pthread.h>
+#  include <sys/qos.h>
+#endif
+
 // Steam Audio C API (for iplSimulatorRunReflections, iplSourceAdd, etc.)
 #include <phonon.h>
 
@@ -185,6 +190,33 @@ void ReflectionSimulator::workerMain()
     // counter via signal()), can take 50-200ms — latency-tolerant because
     // reverb tails change slowly with listener movement.
     // Separated from direct sim so it never blocks occlusion updates.
+
+    // Drop our QoS to UTILITY so the convolution workers
+    // (QOS_CLASS_USER_INTERACTIVE, set in ConvolutionWorkerPool::init)
+    // preempt us cleanly whenever the audio callback needs CPU. Steam
+    // Audio's internal worker pool inherits this QoS at the point of
+    // iplSimulatorRunReflections, so all sim threads (this wrapper
+    // thread + the N internal workers Steam Audio spawns) end up at
+    // UTILITY. macOS biases UTILITY threads toward E-cores under load,
+    // leaving P-cores free for convolution + audio + main. See
+    // NOTES.PROJECT.md "Reflection sim ↔ conv worker contention
+    // pattern" for why this matters — the alternative (sim at
+    // QOS_CLASS_DEFAULT, conv at USER_INTERACTIVE) leaves too small a
+    // QoS gap for the scheduler to preempt sim reliably at sim cycle
+    // completion, producing the per-cycle dropped frame in the
+    // convolution pipeline.
+#if defined(__APPLE__)
+    {
+        int qosSetRc = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+        qos_class_t qos = QOS_CLASS_UNSPECIFIED;
+        int relPri = 0;
+        if (pthread_get_qos_class_np(pthread_self(), &qos, &relPri) == 0) {
+            AUDIO_LOG("[SIM_QOS] reflection-sim qos=%u rel=%d setRc=%d\n",
+                      qos, relPri, qosSetRc);
+        }
+    }
+#endif
+
     while (true) {
         {
             std::unique_lock<std::mutex> lock(mMutex);

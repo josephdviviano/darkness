@@ -222,7 +222,7 @@ audio:
       bounces: 16                # bake bounces (1–64)
       duration: 4.0              # bake IR duration in seconds (>= realtime.duration)
       diffuse_samples: 1024      # bake diffuse samples (32–4096)
-      ambisonics_order: 2        # bake ambisonic order (0–3; higher than realtime is fine)
+      ambisonics_order: 1        # bake ambisonic order (0–3); match runtime ambisonics_order to skip the downmix step at probe-interp time
 
   probes:
     # Baked-probe grid parameters. Probes are points where Steam Audio
