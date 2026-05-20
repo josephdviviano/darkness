@@ -465,8 +465,23 @@ public:
     void setReflectionThrottle(int n);
     int  getReflectionThrottle() const;
 
-    void setMaxReflectionVoices(int n) { mMaxReflectionVoices = std::max(1, std::min(n, MAX_ACTIVE_VOICES)); }
+    // [REFLECTIONS-total] Cap on total convolution voices (realtime + baked
+    // combined). 0 is a legitimate value meaning "no convolution at all" —
+    // both the realtime sticky-slot pool AND baked-probe voices are
+    // disabled when the cap is 0. To run baked-only, keep this positive
+    // and set max_realtime_voices = 0.
+    void setMaxReflectionVoices(int n) { mMaxReflectionVoices = std::max(0, std::min(n, MAX_ACTIVE_VOICES)); }
     int  getMaxReflectionVoices() const { return mMaxReflectionVoices; }
+
+    // [REALTIME-only] Cap on the sticky realtime-slot pool. Defaults to the
+    // total cap above (preserves pre-split behaviour). Set to 0 to disable
+    // realtime entirely while leaving baked voices intact. Service-init
+    // path should pass -1 to mean "follow mMaxReflectionVoices."
+    void setMaxRealtimeVoices(int n) {
+        if (n < 0) mMaxRealtimeVoices = mMaxReflectionVoices;  // -1 sentinel: follow total
+        else       mMaxRealtimeVoices = std::min(n, MAX_ACTIVE_VOICES);
+    }
+    int  getMaxRealtimeVoices() const { return mMaxRealtimeVoices; }
 
     void setTransmissionScale(float s) { mTransmissionScale = std::max(0.1f, std::min(s, 100.0f)); }
     float getTransmissionScale() const { return mTransmissionScale; }
@@ -1211,6 +1226,9 @@ private:
     int   mBakeAmbisonicsOrder     = 1;     ///< Bake ambisonic order (0–3)
 
     int mMaxReflectionVoices = DEFAULT_MAX_REFLECTION_VOICES;
+    // Realtime cap defaults to the total above on init; set explicitly by
+    // RenderConfig wiring if the yaml specifies `max_realtime_voices`.
+    int mMaxRealtimeVoices   = DEFAULT_MAX_REFLECTION_VOICES;
     int mAcousticTriCount = 0;         ///< Triangles in current acoustic scene
 
     /// Global multiplier for material transmission coefficients.
