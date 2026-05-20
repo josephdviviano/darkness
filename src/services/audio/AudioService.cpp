@@ -2978,6 +2978,24 @@ bool AudioService::initReflectionPipeline()
     // margin for the parametric crossfade) — Steam Audio crashes if
     // hybridReverbTransitionTime > irSize/samplingRate, so we keep
     // mRealtimeDuration > mHybridTransitionTime as policy.
+    //
+    // Safety clamp for hybrid mode: Steam Audio crashes if
+    // hybridReverbTransitionTime > irDuration. If the user's yaml puts
+    // realtime.duration < hybrid_transition_time, pull the transition down
+    // to leave a 0.1 s margin. Loud stderr [FALLBACK] so the user notices
+    // the clamp and fixes the config rather than relying on it.
+    if (mReflectionType == ReflectionType::Hybrid
+        && mHybridTransitionTime > mRealtimeDuration - 0.1f) {
+        float clamped = std::max(0.1f, mRealtimeDuration - 0.1f);
+        std::fprintf(stderr,
+            "[FALLBACK] hybrid_transition_time (%.2fs) > realtime.duration (%.2fs) — "
+            "clamping transition to %.2fs to avoid Steam Audio hybrid-IR crash. "
+            "Fix darknessRender.yaml: raise reflections.realtime.duration or "
+            "lower reflections.hybrid_transition_time.\n",
+            mHybridTransitionTime, mRealtimeDuration, clamped);
+        mHybridTransitionTime = clamped;
+    }
+
     IPLint32 irSize = static_cast<IPLint32>(mRealtimeDuration * mReflectionSampleRate);
     // Compute ambisonics channel count: (order+1)^2. Order 0=1ch, order 1=4ch.
     mAmbisonicsChannels = (mAmbisonicsOrder + 1) * (mAmbisonicsOrder + 1);
@@ -4224,6 +4242,21 @@ void AudioService::loopStep(float deltaTime)
                 inputs.numOcclusionSamples = mAudioOcclusion->getSamples();
                 inputs.numTransmissionRays = 8;
 
+                // Hybrid/parametric tuning, always populated. reverbScale[]
+                // defaults to {0,0,0} on zero-init — which silences the
+                // parametric tail entirely. Set to {1,1,1} so Steam Audio
+                // uses the simulated RT60 unmodified across all three bands.
+                // The two hybrid fields are only consulted when the effect
+                // type is HYBRID (Steam Audio ignores them otherwise), so
+                // it's safe to set unconditionally. Plan target:
+                // transitionTime=2.0 s, overlap=0.25 → 0..1.5 s pure
+                // convolution, 1.5..2.0 s blend, 2.0+ s pure parametric.
+                inputs.reverbScale[0] = 1.0f;
+                inputs.reverbScale[1] = 1.0f;
+                inputs.reverbScale[2] = 1.0f;
+                inputs.hybridReverbTransitionTime = mHybridTransitionTime;
+                inputs.hybridReverbOverlapPercent = mHybridOverlapPercent;
+
                 // Voices route to baked-probe reflections when:
                 //   • They are not in the top-N closest (real-time budget
                 //     reserved for the most audible source-position-sensitive
@@ -4672,8 +4705,16 @@ void AudioService::loopStep(float deltaTime)
 
                 if (enableRefl) {
                     voice->dspNode.reflectionParams = outputs.reflections;
+                    // Per-call effect-type. Must match the effect-create-time
+                    // type and the simulator's reflectionType (phonon.h
+                    // enforces this). Translated from mReflectionType so the
+                    // three places stay coherent.
                     voice->dspNode.reflectionParams.type =
-                        IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+                        (mReflectionType == ReflectionType::Hybrid)
+                            ? IPL_REFLECTIONEFFECTTYPE_HYBRID
+                            : (mReflectionType == ReflectionType::Parametric)
+                                ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
+                                : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
                     voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
 
                     // Per-source LOD: reduce IR length for distant voices.

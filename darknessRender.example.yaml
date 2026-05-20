@@ -162,7 +162,7 @@ audio:
     # Hybrid requires the per-source `IPLSimulationInputs.hybridReverbTransitionTime`
     # to be <= the IR duration; we keep `realtime.duration` slightly above
     # `hybrid_transition_time` for that reason.
-    type: convolution            # convolution | hybrid | parametric
+    type: hybrid                 # convolution | hybrid | parametric
 
     # Hybrid-specific (only consulted when type=hybrid)
     hybrid_transition_time: 2.0  # seconds; pure conv 0..(T*(1-O))s, blend T*(1-O)..T s
