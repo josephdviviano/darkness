@@ -221,15 +221,14 @@ void ReflectionSimulator::workerMain()
 }
 
 //------------------------------------------------------
-// Stage 2.2 — demote-only fallback for the per-voice reflection source.
+// Sticky-slot demote — release the per-voice reflection source.
 //
 // Every voice starts with a reflection source (eager allocation in
 // createVoiceSource) so the baseline path is "voice has reverb." This
 // helper is the only way a voice loses its source mid-life. Called from
-// AudioService::loopStep's demote pass when a voice has been outside the
-// top-N reflection candidate pool for `mDemoteHysteresisCfg` consecutive
-// frames — a deliberately conservative threshold so the demote is a true
-// fallback, not the common case.
+// AudioService::loopStep when `sourceEnded && tailTimer <= 0` — i.e.,
+// the voice has finished playback AND its reverb tail has rung out, so
+// the slot is safe to release back to the budget.
 //
 // The dance reuses the existing defer-flush logic (mPendingRemovals) so it
 // is safe to call while the reflection sim thread is running — the actual
@@ -254,7 +253,6 @@ void ReflectionSimulator::demoteVoice(ActiveVoice &voice)
     // worker drain is unnecessary.
     if (removeFromPendingAdds(voice.reflectionSource)) {
         iplSourceRelease(&voice.reflectionSource);
-        voice.framesOutOfTopN = 0;
         mActiveSources.fetch_sub(1, std::memory_order_relaxed);
         AUDIO_LOG("[REFL_DEMOTE] h=%d '%s' (cancelled-pending) active=%d\n",
                   voice.handle, voice.schemaName.c_str(),
@@ -293,7 +291,6 @@ void ReflectionSimulator::demoteVoice(ActiveVoice &voice)
     } else {
         iplSourceRelease(&voice.reflectionSource);
     }
-    voice.framesOutOfTopN = 0;
     mActiveSources.fetch_sub(1, std::memory_order_relaxed);
 
     AUDIO_LOG("[REFL_DEMOTE] h=%d '%s' active=%d\n",

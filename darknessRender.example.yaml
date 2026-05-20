@@ -104,7 +104,7 @@ audio:
   # defaults; each setting is independent. Bracketed numbers are valid ranges.
 
   performance:
-    # Engine + ray-trace throughput. Touch these to trade CPU for fidelity.
+    # Engine + reverb throughput. Touch these to trade CPU for fidelity.
     #
     # Scope tags annotate which pipeline branch each setting affects:
     #   [GLOBAL]      audio engine / hardware
@@ -112,40 +112,59 @@ audio:
     #   [REALTIME]    realtime ray-traced reflections only
     #   [BAKE]        offline probe bake only
     #   [REFLECTIONS] both realtime + baked-probe reflection convolution
-    #   [VESTIGIAL]   no longer consulted; parsed for backward compat
-    sample_rate: 48000           # [GLOBAL]   device sample rate (22050|32000|44100|48000|96000)
-    frame_size: 1024             # [GLOBAL]   audio engine block size (256–4096)
-    sound_cache_mb: 64           # [GLOBAL]   decoded-audio LRU cache budget (4–1024 MB)
-    rate_divisor: 2              # [REFLECTIONS] reflection convolution pipeline rate (1=48k, 2=24k, 4=12k)
-    convolution_workers: 0       # [REFLECTIONS] per-voice convolution thread count (affects realtime + baked equally; 0 = auto: hwconc-3)
-    simulator_threads: 0         # [REALTIME] ray-tracing thread count for the realtime sim (0 = auto: hwconc-2)
-    max_active_voices: 64        # [GLOBAL]   hard cap on simultaneous voices (8–256)
-    # [REFLECTIONS] Cap on total convolution voices (realtime + baked
-    # combined). Every reflection voice runs a per-source convolution
-    # regardless of mode, so this is the worker-pool CPU governor.
-    # Setting to 0 disables ALL reflection convolution (fully dry).
-    max_reflection_voices: 8     # (0–64)
-    # [REALTIME] Cap on the sticky realtime-slot pool (subset of the total
-    # above). -1 means "follow max_reflection_voices" (preserves single-cap
-    # behaviour). 0 means "no realtime — all eligible voices route through
-    # baked-probe reverb" (assuming max_reflection_voices > 0). Any positive
-    # value less than max splits the budget: that many realtime slots,
-    # remainder for baked.
-    max_realtime_voices: -1      # follow max_reflection_voices (0–64, -1 = follow total)
-    reflection_throttle: 4       # [REALTIME] run sim every Nth audio frame (1–32)
-    sim_max_occlusion_samples: 32  # [DIRECT] Steam Audio per-source occlusion sample cap (4–256)
-    sim_max_rays: 4096           # [REFLECTIONS] per-step ray cap; must be ≥ reflections.bake.rays AND ≥ reflections.realtime.rays
-    # Source pools are split: direct-only sim is cheap per source so its cap
-    # can be much higher than the reflection sim's cap (which scales with
-    # convolution + IR memory). Legacy key `sim_max_sources` maps to
-    # `reflection_max_sources` for back-compat.
-    direct_max_sources: 256      # [DIRECT]   Direct-sim source pool (4–1024) — every voice has a direct source
-    reflection_max_sources: 32   # [REALTIME] Realtime-sim source pool (4–256) — only realtime-slot voices register
-    # [VESTIGIAL] sticky-slot allocator (2026-05) replaced the per-frame
-    # demote logic; this knob is no longer consulted but still parsed for
-    # backward compat. Safe to remove from yaml.
-    reflection_demote_hysteresis_frames: 600
-    scene_type: default          # [REFLECTIONS] IPL scene backend ("default" or "embree")
+
+    # ── audio device (immutable after boot) ──
+    sample_rate: 48000           # [GLOBAL] device sample rate (22050|32000|44100|48000|96000)
+    frame_size: 1024             # [GLOBAL] audio engine block size (256–4096); callback period = frame_size / sample_rate
+    sound_cache_mb: 64           # [GLOBAL] decoded-audio LRU cache budget (4–1024 MB)
+
+    # ── voice budgets ──
+    max_active_voices: 64        # [GLOBAL] hard cap on simultaneous voices (8–256)
+    # [REFLECTIONS] Cap on total reverb voices (realtime + baked combined).
+    # Every reverb voice runs a per-source convolution regardless of mode,
+    # so this is the worker-pool CPU governor. 0 disables reverb entirely
+    # (fully dry). Direct-sim source pool is auto-derived from
+    # max_active_voices; reflection-sim source pool from this cap.
+    reverb_voices: 8             # (0–64)
+    # [REALTIME] Of the reverb voices above, how many may run with realtime
+    # ray-traced IRs. 0 = baked-only (recommended for now — see
+    # NOTES.AUDIO_CONFIG_AUDIT.md Finding 1 about realtime sim cost).
+    # Range [0, reverb_voices].
+    reverb_voices_realtime: 0
+
+    # ── reverb pipeline cost ──
+    # rate_divisor halves CPU per step at the cost of reverb bandwidth.
+    # 24 kHz is transparent for most material; 12 kHz dulls the highest
+    # harmonics. Reverb tails are dominated by frequencies below 4 kHz.
+    rate_divisor: 2              # [REFLECTIONS] 1=48k, 2=24k, 4=12k
+    # reflection_throttle = run the realtime ray-trace sim every Nth audio
+    # callback. Higher = less CPU, longer reverb-update latency.
+    reflection_throttle: 4       # [REALTIME] (1–32)
+    # Steam Audio per-source occlusion sample cap. Used by BOTH the direct
+    # and reflection simulators' occlusion solvers.
+    sim_max_occlusion_samples: 32  # [DIRECT+REFLECTIONS] (4–256)
+
+    # ── thread budget ──
+    # Total threads dedicated to reverb work (convolution workers + the
+    # ray-trace simulator combined). The invariant
+    # `conv_workers + sim_threads == reverb_threads` is enforced at init,
+    # so over-allocation is impossible regardless of how the share is set.
+    # 0 = auto: hwconc - 2 (reserves 2 cores for main + audio threads).
+    reverb_threads: 0
+    # Fraction of the budget above assigned to convolution workers (rest
+    # goes to the simulator). -1 = auto: 0.35 in baked-only mode, 0.45
+    # with realtime voices. The sim is the bottleneck in both modes
+    # (hundreds of ms per cycle); convolution has plenty of headroom for
+    # typical voice counts, so we give the sim the majority of threads
+    # by default. Override with an explicit 0.0–1.0 value.
+    reverb_threads_conv_share: -1
+
+    # ── scene backend ──
+    # "default" = Steam Audio's built-in CPU raytracer.
+    # "embree"  = Embree (faster on large meshes) — requires a Steam Audio
+    #             rebuild with Embree linked; falls back to "default" with
+    #             a loud [FALLBACK] log if iplSceneCreate refuses.
+    scene_type: default          # [REFLECTIONS]
 
   reflections:
     # Convolution-reverb feel. Drives perceived room size & detail.
