@@ -347,8 +347,14 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
                 (nch > 2 && !sub.voiceAmbi2.empty()) ? sub.voiceAmbi2.data() : nullptr,
                 (nch > 3 && !sub.voiceAmbi3.empty()) ? sub.voiceAmbi3.data() : nullptr
             };
+            // Defensive clamp: numChannels MUST NOT exceed the worker's
+            // own channel count (nch). The audio thread populates this
+            // from mAmbisonicsChannels which equals nch in current use,
+            // but if a future staging path forgets to set numChannels or
+            // a wrong-mode params struct sneaks through, the loop below
+            // would dereference null entries in voicePtrs. Cheap min().
             IPLAudioBuffer voiceOut{};
-            voiceOut.numChannels = slot.params.numChannels;
+            voiceOut.numChannels = std::min(slot.params.numChannels, nch);
             voiceOut.numSamples  = static_cast<IPLint32>(slot.reflFrameSize);
             voiceOut.data        = voicePtrs;
 
