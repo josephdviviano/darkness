@@ -115,7 +115,7 @@ audio:
 
     # ── audio device (immutable after boot) ──
     sample_rate: 48000           # [GLOBAL] device sample rate (22050|32000|44100|48000|96000)
-    frame_size: 1024             # [GLOBAL] audio engine block size (256–4096); callback period = frame_size / sample_rate
+    frame_size: 512              # [GLOBAL] audio engine block size (256–4096); callback period = frame_size / sample_rate. 512 chosen for low total output latency (~32 ms with periods=2); halves the async convolution pipeline gap vs 1024.
     sound_cache_mb: 64           # [GLOBAL] decoded-audio LRU cache budget (4–1024 MB)
 
     # ── voice budgets ──

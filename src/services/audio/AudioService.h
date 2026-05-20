@@ -1350,7 +1350,7 @@ private:
     float       mReverbThreadsConvShareCfg = -1.0f;
     std::string mSceneTypeCfg              = "default"; // "default" or "embree"
     int         mAudioSampleRateCfg        = 48000;
-    int         mAudioFrameSizeCfg         = 1024;
+    int         mAudioFrameSizeCfg         = 512;
     int         mSoundCacheMBCfg           = 64;
 
     // ── Baked probe pathing ──
