@@ -4800,6 +4800,61 @@ void AudioService::loopStep(float deltaTime)
         }
     }
 
+    // ── [ROOM_ACOUSTICS] diagnostic ──
+    //
+    // Periodic log line comparing the designer-tagged EAX preset's T60
+    // against Steam Audio's geometry-derived per-band RT60 for the
+    // listener's room. Fires on room change with a 2 s anti-flicker
+    // throttle. Informational only — does not change behaviour. Surfaces
+    // mismatches that would benefit from a per-source `reverbScale[3]`
+    // correction (which the simulation inputs above already plumb).
+    if (mAudioReady && mListenerRoom && !mRoomEAXPresets.empty()) {
+        static int sLastLoggedRoomId = INT32_MIN;
+        static auto sLastLoggedTime  = std::chrono::steady_clock::now();
+        int currentRoomId = static_cast<int>(mListenerRoom->getRoomID());
+        auto now = std::chrono::steady_clock::now();
+        auto sinceLastLog =
+            std::chrono::duration_cast<std::chrono::seconds>(now - sLastLoggedTime).count();
+        bool roomChanged = (currentRoomId != sLastLoggedRoomId);
+        if (roomChanged && sinceLastLog >= 2) {
+            auto eaxIt = mRoomEAXPresets.find(static_cast<int32_t>(currentRoomId));
+            if (eaxIt != mRoomEAXPresets.end() && eaxIt->second < 26) {
+                uint32_t eaxIdx = eaxIt->second;
+                const char *eaxName = kEAXPresets[eaxIdx].name;
+                float eaxT60        = kEAXPresets[eaxIdx].decayTime;
+                // Find an active reflection voice and use its reverbTimes
+                // as the derived value. Steam Audio populates these per
+                // source from the simulator's geometry trace + parametric
+                // reverb estimation; they're the same numbers the hybrid
+                // tail uses, so the comparison is apples-to-apples.
+                float rtLow = 0.0f, rtMid = 0.0f, rtHigh = 0.0f;
+                bool found = false;
+                for (auto &[h, v] : mVoicePool->voices()) {
+                    if (v->dspNode.reflectionsActive.load(std::memory_order_relaxed)
+                        && v->dspNode.reflectionParams.irSize > 0) {
+                        rtLow  = v->dspNode.reflectionParams.reverbTimes[0];
+                        rtMid  = v->dspNode.reflectionParams.reverbTimes[1];
+                        rtHigh = v->dspNode.reflectionParams.reverbTimes[2];
+                        found  = true;
+                        break;
+                    }
+                }
+                if (found) {
+                    AUDIO_LOG("[ROOM_ACOUSTICS] room=%d eax=%s (T60=%.2fs) "
+                              "derived_rt60_band=(%.2f, %.2f, %.2f)s\n",
+                              currentRoomId, eaxName, eaxT60,
+                              rtLow, rtMid, rtHigh);
+                } else {
+                    AUDIO_LOG("[ROOM_ACOUSTICS] room=%d eax=%s (T60=%.2fs) "
+                              "derived_rt60_band=(no active reflection voice yet)\n",
+                              currentRoomId, eaxName, eaxT60);
+                }
+                sLastLoggedRoomId = currentRoomId;
+                sLastLoggedTime   = now;
+            }
+        }
+    }
+
     // Tick reverb tail timers for voices whose source audio has ended.
     // The voice stays alive during the tail so the per-voice convolution
     // continues feeding its IR tail.
