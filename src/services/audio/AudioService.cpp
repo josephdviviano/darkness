@@ -5050,10 +5050,30 @@ void AudioService::loopStep(float deltaTime)
                         // outputs.reflections.ir is an opaque
                         // IPLReflectionEffectIR handle owned by Steam
                         // Audio; we hold the handle as-is and never
-                        // refresh it. Force the type + numChannels to
-                        // match what the effect was created with
-                        // (defence-in-depth in case outputs.reflections
-                        // has stale values from sim-settings drift).
+                        // refresh it. We override several fields from
+                        // our known-good config values rather than
+                        // trusting whatever Steam Audio happened to
+                        // leave in outputs.reflections — those output
+                        // fields may not be populated on the first
+                        // cycle, and pinning a wrong value sticks for
+                        // the voice's lifetime.
+                        //
+                        // CRITICAL: `delay` tells Steam Audio's
+                        // hybrid-mode apply WHERE in the IR the
+                        // convolution ends and the parametric tail
+                        // begins. If left at 0 (which it apparently is
+                        // when not explicitly set), parametric kicks
+                        // in at t=0 and plays IN PARALLEL with
+                        // convolution from the start — both signals
+                        // are driven by the same baked data so they
+                        // sound nearly identical, producing the
+                        // "same reverb playing twice" symptom. The
+                        // parametric tail also extends past the IR
+                        // end via RT60 decay, so the user perceives
+                        // a delayed second trail. Setting delay =
+                        // transition_time × samplingRate ensures
+                        // sequential conv → parametric handoff, not
+                        // parallel.
                         voice->pinnedParams = outputs.reflections;
                         voice->pinnedParams.type =
                             (mReflectionType == ReflectionType::Hybrid)
@@ -5062,11 +5082,22 @@ void AudioService::loopStep(float deltaTime)
                                     ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
                                     : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
                         voice->pinnedParams.numChannels = mAmbisonicsChannels;
+                        // Compute hybrid handoff sample from our
+                        // configured transition time (post safety-
+                        // clamp value in mHybridTransitionTime) and
+                        // the reflection-pipeline sample rate.
+                        voice->pinnedParams.delay = static_cast<IPLint32>(
+                            mHybridTransitionTime
+                            * static_cast<float>(mReflectionSampleRate));
                         voice->reflectionIRPinned = true;
-                        AUDIO_LOG("[PINNED_IR] h=%u '%s' irSize=%d numChannels=%d\n",
+                        AUDIO_LOG("[PINNED_IR] h=%u '%s' irSize=%d numChannels=%d "
+                                  "delay=%d (=transition %.2fs × %uHz)\n",
                                   handle, voice->schemaName.c_str(),
                                   outputs.reflections.irSize,
-                                  outputs.reflections.numChannels);
+                                  outputs.reflections.numChannels,
+                                  voice->pinnedParams.delay,
+                                  mHybridTransitionTime,
+                                  mReflectionSampleRate);
                     }
 
                     if (voice->reflectionIRPinned) {
