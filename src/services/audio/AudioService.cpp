@@ -5058,22 +5058,6 @@ void AudioService::loopStep(float deltaTime)
                         // cycle, and pinning a wrong value sticks for
                         // the voice's lifetime.
                         //
-                        // CRITICAL: `delay` tells Steam Audio's
-                        // hybrid-mode apply WHERE in the IR the
-                        // convolution ends and the parametric tail
-                        // begins. If left at 0 (which it apparently is
-                        // when not explicitly set), parametric kicks
-                        // in at t=0 and plays IN PARALLEL with
-                        // convolution from the start — both signals
-                        // are driven by the same baked data so they
-                        // sound nearly identical, producing the
-                        // "same reverb playing twice" symptom. The
-                        // parametric tail also extends past the IR
-                        // end via RT60 decay, so the user perceives
-                        // a delayed second trail. Setting delay =
-                        // transition_time × samplingRate ensures
-                        // sequential conv → parametric handoff, not
-                        // parallel.
                         voice->pinnedParams = outputs.reflections;
                         voice->pinnedParams.type =
                             (mReflectionType == ReflectionType::Hybrid)
@@ -5082,22 +5066,90 @@ void AudioService::loopStep(float deltaTime)
                                     ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
                                     : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
                         voice->pinnedParams.numChannels = mAmbisonicsChannels;
-                        // Compute hybrid handoff sample from our
-                        // configured transition time (post safety-
-                        // clamp value in mHybridTransitionTime) and
-                        // the reflection-pipeline sample rate.
-                        voice->pinnedParams.delay = static_cast<IPLint32>(
-                            mHybridTransitionTime
-                            * static_cast<float>(mReflectionSampleRate));
+                        // delay = 0: parametric runs from t=0 alongside
+                        // convolution. Both decay simultaneously — conv
+                        // via its IR, parametric via its FDN driven by
+                        // RT60. Their outputs sum as one coherent
+                        // reverb. Earlier attempts with delay > 0
+                        // produced an audible "second reverb starting
+                        // fresh at t=delay" because Steam Audio's
+                        // hybrid `delay` field appears to make parametric
+                        // start a FRESH impulse-driven FDN response at
+                        // that sample (NOT continue from internal
+                        // accumulated state). With delay=0, no fresh
+                        // start — both signals are already running and
+                        // co-decaying.
+                        //
+                        // This only works correctly when reverbTimes
+                        // are properly populated (non-zero per-band
+                        // RT60 from baked probes via
+                        // iplProbeBatchGetReverb above). Earlier
+                        // delay=0 attempts had reverbTimes=[0,0,0]
+                        // which made parametric ring at full amplitude
+                        // indefinitely (Steam Audio default-fallback
+                        // behavior with RT60=0), producing the
+                        // "doubled reverb" symptom.
+                        voice->pinnedParams.delay = 0;
+
+                        // Fetch baked reverbTimes from the nearest probe
+                        // to the listener. Steam Audio does NOT populate
+                        // outputs.reflections.reverbTimes for baked
+                        // sources — we have to query the probe batch
+                        // directly via iplProbeBatchGetReverbTimes.
+                        // Without this, reverbTimes stays at the
+                        // outputs default (observed: all zeros), which
+                        // makes the parametric reverb in hybrid mode
+                        // run with undefined / default-fallback decay,
+                        // producing the audible "second reverb" the
+                        // user heard after IR pinning landed.
+                        //
+                        // We use the listener-nearest probe (not the
+                        // source-nearest) because reverbTimes describe
+                        // "how long does the room ring at this point
+                        // in space" — that's the LISTENER's experience
+                        // of the room's RT60.
+                        int probeLookupIdx = -1;
+                        if (mProbeManager && mProbeManager->hasReflections()) {
+                            IPLProbeBatch pb = mProbeManager->getProbeBatch();
+                            const auto &probePos = mProbeManager->getProbePositions();
+                            if (pb && !probePos.empty()) {
+                                int nearestIdx = 0;
+                                float nearestDistSq = std::numeric_limits<float>::max();
+                                for (size_t i = 0; i < probePos.size(); ++i) {
+                                    Vector3 d = probePos[i] - mListenerPos;
+                                    float dsq = glm::dot(d, d);
+                                    if (dsq < nearestDistSq) {
+                                        nearestDistSq = dsq;
+                                        nearestIdx = static_cast<int>(i);
+                                    }
+                                }
+                                IPLBakedDataIdentifier reflId{};
+                                reflId.type = IPL_BAKEDDATATYPE_REFLECTIONS;
+                                reflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
+                                iplProbeBatchGetReverb(pb, &reflId, nearestIdx,
+                                    voice->pinnedParams.reverbTimes);
+                                probeLookupIdx = nearestIdx;
+                            }
+                        }
+
                         voice->reflectionIRPinned = true;
                         AUDIO_LOG("[PINNED_IR] h=%u '%s' irSize=%d numChannels=%d "
-                                  "delay=%d (=transition %.2fs × %uHz)\n",
+                                  "delay=%d reverbTimes=[%.3f,%.3f,%.3f] "
+                                  "eq=[%.3f,%.3f,%.3f] probeLookupIdx=%d "
+                                  "hasReflections=%d probeCount=%zu\n",
                                   handle, voice->schemaName.c_str(),
                                   outputs.reflections.irSize,
                                   outputs.reflections.numChannels,
                                   voice->pinnedParams.delay,
-                                  mHybridTransitionTime,
-                                  mReflectionSampleRate);
+                                  voice->pinnedParams.reverbTimes[0],
+                                  voice->pinnedParams.reverbTimes[1],
+                                  voice->pinnedParams.reverbTimes[2],
+                                  voice->pinnedParams.eq[0],
+                                  voice->pinnedParams.eq[1],
+                                  voice->pinnedParams.eq[2],
+                                  probeLookupIdx,
+                                  mProbeManager ? mProbeManager->hasReflections() : -1,
+                                  mProbeManager ? mProbeManager->getProbePositions().size() : 0);
                     }
 
                     if (voice->reflectionIRPinned) {
