@@ -3747,6 +3747,10 @@ int main(int argc, char *argv[]) {
         audioSvc->setSimulatorThreads(cfg.simulatorThreads);
         audioSvc->setMaxActiveVoices(cfg.maxActiveVoices);
         audioSvc->setMaxReflectionVoices(cfg.maxReflectionVoices);
+        // Realtime cap must be set AFTER total cap so the -1 sentinel
+        // ("follow max_reflection_voices") resolves against the already-
+        // applied total. Passing -1 makes the setter mirror the total.
+        audioSvc->setMaxRealtimeVoices(cfg.maxRealtimeVoices);
         audioSvc->setReflectionThrottle(cfg.reflectionThrottle);
         audioSvc->setSimMaxOcclusionSamples(cfg.simMaxOcclusionSamples);
         audioSvc->setSimMaxRays(cfg.simMaxRays);

@@ -105,40 +105,47 @@ audio:
 
   performance:
     # Engine + ray-trace throughput. Touch these to trade CPU for fidelity.
-    sample_rate: 48000           # device sample rate (22050|32000|44100|48000|96000)
-    frame_size: 1024             # audio engine block size (256–4096)
-    sound_cache_mb: 64           # decoded-audio LRU cache budget (4–1024 MB)
-    rate_divisor: 2              # reflection pipeline rate (1=48k, 2=24k, 4=12k)
-    convolution_workers: 0       # parallel convolution threads (0 = auto: hwconc-3)
-    simulator_threads: 0         # ray-tracing sim threads (0 = auto: hwconc-2)
-    max_active_voices: 64        # hard cap on simultaneous voices (8–256)
-    # max_reflection_voices: hybrid convolution is roughly half the CPU per
-    # voice of the old full-tail convolution (the parametric tail is much
-    # cheaper than another 2 s of FFT). Phase 6 bumps the cap from 4 to 8;
-    # walk it higher only after watching [CONV_LAG] for overruns under load.
-    max_reflection_voices: 8     # voices with per-source convolution (1–64)
-    reflection_throttle: 4       # run reflection sim every Nth frame (1–32)
-    sim_max_occlusion_samples: 32  # Steam Audio per-source occlusion cap (4–256)
-    sim_max_rays: 4096           # Steam Audio per-step ray cap (must be >= reflections.rays)
+    #
+    # Scope tags annotate which pipeline branch each setting affects:
+    #   [GLOBAL]      audio engine / hardware
+    #   [DIRECT]      direct path only (no reflections)
+    #   [REALTIME]    realtime ray-traced reflections only
+    #   [BAKE]        offline probe bake only
+    #   [REFLECTIONS] both realtime + baked-probe reflection convolution
+    #   [VESTIGIAL]   no longer consulted; parsed for backward compat
+    sample_rate: 48000           # [GLOBAL]   device sample rate (22050|32000|44100|48000|96000)
+    frame_size: 1024             # [GLOBAL]   audio engine block size (256–4096)
+    sound_cache_mb: 64           # [GLOBAL]   decoded-audio LRU cache budget (4–1024 MB)
+    rate_divisor: 2              # [REFLECTIONS] reflection convolution pipeline rate (1=48k, 2=24k, 4=12k)
+    convolution_workers: 0       # [REFLECTIONS] per-voice convolution thread count (affects realtime + baked equally; 0 = auto: hwconc-3)
+    simulator_threads: 0         # [REALTIME] ray-tracing thread count for the realtime sim (0 = auto: hwconc-2)
+    max_active_voices: 64        # [GLOBAL]   hard cap on simultaneous voices (8–256)
+    # [REFLECTIONS] Cap on total convolution voices (realtime + baked
+    # combined). Every reflection voice runs a per-source convolution
+    # regardless of mode, so this is the worker-pool CPU governor.
+    # Setting to 0 disables ALL reflection convolution (fully dry).
+    max_reflection_voices: 8     # (0–64)
+    # [REALTIME] Cap on the sticky realtime-slot pool (subset of the total
+    # above). -1 means "follow max_reflection_voices" (preserves single-cap
+    # behaviour). 0 means "no realtime — all eligible voices route through
+    # baked-probe reverb" (assuming max_reflection_voices > 0). Any positive
+    # value less than max splits the budget: that many realtime slots,
+    # remainder for baked.
+    max_realtime_voices: -1      # follow max_reflection_voices (0–64, -1 = follow total)
+    reflection_throttle: 4       # [REALTIME] run sim every Nth audio frame (1–32)
+    sim_max_occlusion_samples: 32  # [DIRECT] Steam Audio per-source occlusion sample cap (4–256)
+    sim_max_rays: 4096           # [REFLECTIONS] per-step ray cap; must be ≥ reflections.bake.rays AND ≥ reflections.realtime.rays
     # Source pools are split: direct-only sim is cheap per source so its cap
     # can be much higher than the reflection sim's cap (which scales with
     # convolution + IR memory). Legacy key `sim_max_sources` maps to
     # `reflection_max_sources` for back-compat.
-    direct_max_sources: 256      # Direct-sim source pool (4–1024)
-    reflection_max_sources: 32   # Reflection-sim source pool (4–256)
-    # Demote-only fallback (stage 2.2): every voice starts with a
-    # reflection source and routes through baked reverb by default
-    # (upgraded to ray-traced realtime when in the top-N closest pool).
-    # If a Normal voice stays outside the top-N pool for this many
-    # consecutive frames it releases its reflection source and plays dry
-    # for the rest of its life. This is a *sparing* fallback for genuinely
-    # long-lived "stuck distant" voices — the default is high so it only
-    # fires when convolution / sim budget is under real pressure. Lower
-    # the value to make the fallback more aggressive when stress-testing.
-    # PlayerEmitted (footsteps, landings) and Ambient voices are excluded
-    # — they keep their reflection source for life.
-    reflection_demote_hysteresis_frames: 600  # (1–3600; ≈10 s at 60 fps)
-    scene_type: default          # IPL scene backend ("default" or "embree")
+    direct_max_sources: 256      # [DIRECT]   Direct-sim source pool (4–1024) — every voice has a direct source
+    reflection_max_sources: 32   # [REALTIME] Realtime-sim source pool (4–256) — only realtime-slot voices register
+    # [VESTIGIAL] sticky-slot allocator (2026-05) replaced the per-frame
+    # demote logic; this knob is no longer consulted but still parsed for
+    # backward compat. Safe to remove from yaml.
+    reflection_demote_hysteresis_frames: 600
+    scene_type: default          # [REFLECTIONS] IPL scene backend ("default" or "embree")
 
   reflections:
     # Convolution-reverb feel. Drives perceived room size & detail.
@@ -148,13 +155,15 @@ audio:
     # realtime simulation. The bake runs once per mission and is cached
     # to disk; realtime runs every `reflection_throttle` audio frames and
     # drives the CPU budget for live sources.
-    enabled: true                # master toggle (R key in console)
-    # Ambisonic order: 0=omnidirectional (1ch, cheapest), 1=directional (4ch),
-    # 2=(9ch), 3=(16ch). Memory + decode cost scale with (N+1)^2 channels.
-    # This is the REALTIME order — `bake.ambisonics_order` can be higher
-    # (the runtime decoder downmixes baked higher-order IRs as needed).
+    enabled: true                # [REFLECTIONS] master toggle (R key in console)
+    # [REALTIME] ambisonic order: 0=omnidirectional (1ch, cheapest),
+    # 1=directional (4ch), 2=(9ch), 3=(16ch). Memory + decode cost scale
+    # with (N+1)^2 channels. Bake-side order is `bake.ambisonics_order`
+    # below and can be higher than realtime — the runtime decoder downmixes
+    # baked higher-order IRs as needed.
     ambisonics_order: 0          # 0–3
-    # Reflection effect algorithm:
+    # [REFLECTIONS] effect algorithm — applies to BOTH realtime AND baked
+    # voices (Steam Audio uses the same effect-create-time type for both):
     #   convolution — full FFT convolution against the IR (highest fidelity,
     #                  highest CPU; long tails can produce slow amplitude
     #                  wobble in steady-state ambience because per-frame
@@ -168,7 +177,8 @@ audio:
     # `hybrid_transition_time` for that reason.
     type: hybrid                 # convolution | hybrid | parametric
 
-    # Hybrid-specific (only consulted when type=hybrid)
+    # [REFLECTIONS] Hybrid-specific (only consulted when type=hybrid).
+    # Applies to BOTH realtime AND baked voices.
     hybrid_transition_time: 2.0  # seconds; pure conv 0..(T*(1-O))s, blend T*(1-O)..T s
     hybrid_overlap_percent: 0.25 # fraction of transition_time used for crossfade
 

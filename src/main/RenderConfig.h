@@ -43,8 +43,20 @@ struct RenderConfig {
     int  convolutionWorkers      = 0;     // convolution worker threads (0 = auto: hwconc-3)
     int  simulatorThreads        = 0;     // ray-tracing sim threads (0 = auto: hwconc-2)
     int  maxActiveVoices         = 64;    // hard cap on simultaneous voices (Dark Engine baseline)
-    int  maxReflectionVoices     = 16;    // max voices with per-source convolution reverb
-    int  reflectionThrottle      = 4;     // run reflection sim every Nth frame (1–32)
+    // [REFLECTIONS-total] Cap on total convolution voices (realtime + baked
+    // combined). CPU governor — every reflection voice runs a per-source
+    // convolution regardless of mode, so the worker pool needs a hard
+    // upper bound. Setting to 0 disables ALL reflection convolution
+    // (fully dry — no realtime, no baked-probe reverb).
+    int  maxReflectionVoices     = 16;
+    // [REALTIME-only] Cap on the sticky realtime-slot pool (subset of the
+    // total above). -1 (default) means "follow maxReflectionVoices",
+    // preserving pre-split behaviour where one cap governed both. 0 means
+    // "no realtime — all eligible voices route through baked-probe reverb"
+    // (assuming maxReflectionVoices > 0). Any positive value < max splits
+    // the budget: that many realtime slots, remainder available for baked.
+    int  maxRealtimeVoices       = -1;
+    int  reflectionThrottle      = 4;     // [REALTIME] run sim every Nth frame (1–32)
     int  simMaxOcclusionSamples  = 32;    // upper bound on per-source occlusion samples (Steam Audio sim)
     int  simMaxRays              = 4096;  // upper bound on rays per sim step (Steam Audio sim)
     // Source pools: direct sim is cheap per-source so it can be much larger
@@ -327,8 +339,15 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 }
                 if (perf["max_reflection_voices"]) {
                     cfg.maxReflectionVoices = perf["max_reflection_voices"].as<int>();
-                    if (cfg.maxReflectionVoices < 1)  cfg.maxReflectionVoices = 1;
+                    if (cfg.maxReflectionVoices < 0)  cfg.maxReflectionVoices = 0;
                     if (cfg.maxReflectionVoices > 64) cfg.maxReflectionVoices = 64;
+                }
+                if (perf["max_realtime_voices"]) {
+                    cfg.maxRealtimeVoices = perf["max_realtime_voices"].as<int>();
+                    // -1 is the "follow max_reflection_voices" sentinel — only
+                    // applied at service-init time, not clamped here.
+                    if (cfg.maxRealtimeVoices < -1) cfg.maxRealtimeVoices = -1;
+                    if (cfg.maxRealtimeVoices > 64) cfg.maxRealtimeVoices = 64;
                 }
                 if (perf["reflection_throttle"]) {
                     cfg.reflectionThrottle = perf["reflection_throttle"].as<int>();
