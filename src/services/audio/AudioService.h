@@ -51,6 +51,7 @@
 
 // Forward declarations for audio backend types (defined in .cpp via C headers)
 struct ma_engine;
+struct ma_device;
 // Steam Audio uses DECLARE_OPAQUE_HANDLE: typedef struct _IPLFoo_t* IPLFoo
 struct _IPLContext_t;
 typedef _IPLContext_t* IPLContext;
@@ -898,6 +899,15 @@ private:
 
     /// miniaudio engine (heap-allocated to keep ma_engine out of header)
     ma_engine *mMaEngine = nullptr;
+
+    /// miniaudio playback device. We own the device explicitly (rather than
+    /// letting ma_engine_init create one for us) so we can set
+    /// `ma_device_config.periods` — the engine config exposes only
+    /// `periodSizeInFrames`, leaving period COUNT at miniaudio's default of 3.
+    /// Two periods at the same period size halves the device-buffer latency
+    /// component (the largest contributor to total output latency on our
+    /// pipeline). See AudioService.cpp `initMiniaudio` for the wiring.
+    ma_device *mMaDevice = nullptr;
 
     /// Steam Audio context
     IPLContext mIplContext = nullptr;
