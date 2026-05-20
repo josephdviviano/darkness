@@ -69,13 +69,16 @@ struct ProbeBakeParams {
     /// Reverb max distance (used as pathing visibility/path range).
     float   propagationMaxDist  = 200.0f;
 
-    /// Reflection bake quality.
-    int     reflectionNumRays    = 1024;
-    int     reflectionNumBounces = 4;
-    float   reflectionDuration   = 2.0f;
-    int     bakeDiffuseSamples   = 128;
+    /// Reflection bake quality. Split from realtime params in PLAN.HYBRID_REVERB.md
+    /// so the offline bake can afford higher quality (more rays, more bounces,
+    /// longer duration, more diffuse samples) without affecting the per-frame
+    /// realtime sim cost.
+    int     bakeNumRays          = 4096;
+    int     bakeNumBounces       = 8;
+    float   bakeDuration         = 4.0f;
+    int     bakeDiffuseSamples   = 256;
     int     simulatorThreads     = 0;       ///< 0 = auto
-    int     ambisonicsOrder      = 0;
+    int     ambisonicsOrder      = 1;       ///< Bake-side ambisonic order
     std::string sceneType        = "default";  ///< "default" or "embree"
 
     /// Override grid spacing/height in engine feet. Use -1.0f to fall back

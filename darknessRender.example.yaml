@@ -138,14 +138,51 @@ audio:
 
   reflections:
     # Convolution-reverb feel. Drives perceived room size & detail.
+    #
+    # Bake vs realtime parameters are split into two sub-blocks because the
+    # offline bake can afford much higher quality settings than the per-frame
+    # realtime simulation. The bake runs once per mission and is cached
+    # to disk; realtime runs every `reflection_throttle` audio frames and
+    # drives the CPU budget for live sources.
     enabled: true                # master toggle (R key in console)
-    rays: 4096                   # rays per reflection sim step (128–8192)
-    bounces: 4                   # bounces per ray (1–8). More = wraps further around corners.
-    duration: 2.0                # max reverb tail in seconds (0.5–4.0)
     # Ambisonic order: 0=omnidirectional (1ch, cheapest), 1=directional (4ch),
     # 2=(9ch), 3=(16ch). Memory + decode cost scale with (N+1)^2 channels.
-    # Bump to 2 once the reflection budget allows (after stage 2.2 lazy alloc).
+    # This is the REALTIME order — `bake.ambisonics_order` can be higher
+    # (the runtime decoder downmixes baked higher-order IRs as needed).
     ambisonics_order: 0          # 0–3
+    # Reflection effect algorithm:
+    #   convolution — full FFT convolution against the IR (highest fidelity,
+    #                  highest CPU; long tails can produce slow amplitude
+    #                  wobble in steady-state ambience because per-frame
+    #                  crossfades stack on long IRs)
+    #   hybrid      — convolution for the first `hybrid_transition_time`
+    #                  seconds, parametric (energy-based) reverb for the
+    #                  late tail. Parametric tails cannot beat. Recommended.
+    #   parametric — pure parametric reverb (cheap but lacks discrete echoes).
+    # Hybrid requires the per-source `IPLSimulationInputs.hybridReverbTransitionTime`
+    # to be <= the IR duration; we keep `realtime.duration` slightly above
+    # `hybrid_transition_time` for that reason.
+    type: convolution            # convolution | hybrid | parametric
+
+    # Hybrid-specific (only consulted when type=hybrid)
+    hybrid_transition_time: 2.0  # seconds; pure conv 0..(T*(1-O))s, blend T*(1-O)..T s
+    hybrid_overlap_percent: 0.25 # fraction of transition_time used for crossfade
+
+    # Realtime simulation params (running every reflection_throttle frames).
+    realtime:
+      rays: 4096                 # rays per realtime sim step (128–8192)
+      bounces: 4                 # bounces per ray (1–8); more = wraps further around corners
+      duration: 2.0              # IR duration in seconds (0.5–4.0; for hybrid: must be > hybrid_transition_time)
+      diffuse_samples: 64        # diffuse scattering samples per bounce (16–256)
+
+    # Offline bake params (run once per mission; cached as .probes files).
+    # Higher quality than realtime is cheap because we only pay for it once.
+    bake:
+      rays: 4096                 # rays per bake step (1024–65536)
+      bounces: 4                 # bake bounces (1–64)
+      duration: 2.0              # bake IR duration in seconds (>= realtime.duration)
+      diffuse_samples: 128       # bake diffuse samples (32–4096)
+      ambisonics_order: 0        # bake ambisonic order (0–3; can be higher than realtime)
 
   probes:
     # Baked-probe grid parameters. Probes are points where Steam Audio
@@ -198,8 +235,6 @@ audio:
     samples: 16                  # rays per source for occlusion gradient (4–64)
     transmission_scale: 1.0      # material transmission multiplier (0.1–100; 10=game-friendly)
     absorption_scale: 0.75        # material absorption multiplier (0.01–10; <1 = more reflective)
-    diffuse_samples: 64          # realtime scattering samples per bounce (16–256)
-    bake_diffuse_samples: 128    # probe-bake scattering samples (32–512; requires re-bake)
 
   propagation:
     # BSP-cell-graph + door blocking for AI hearing and through-wall sounds.

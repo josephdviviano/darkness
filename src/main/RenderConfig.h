@@ -64,11 +64,42 @@ struct RenderConfig {
     std::string sceneType        = "default"; // IPL scene backend: "default" or "embree"
 
     // -- audio.reflections: convolution reverb feel --
+    //
+    // Bake and realtime parameters are split: the bake runs once per
+    // mission and is cached as a .probes file, so it can afford much
+    // higher quality settings than the realtime sim, which runs every
+    // reflection_throttle audio frames.
+    //
+    // `ambisonicsOrder` here is the REALTIME order; the bake can record
+    // a higher order in `bakeAmbisonicsOrder` since the runtime decoder
+    // downmixes higher-order baked IRs to the requested realtime order.
+
+    /// Reflection effect algorithm. Hybrid splits the IR into an early
+    /// convolution portion (length = `hybridTransitionTime`) and a late
+    /// parametric portion; parametric tails cannot beat from
+    /// per-frame IR crossfade stacking (the failure mode that prompted
+    /// the migration).
+    enum class ReflectionType { Convolution, Hybrid, Parametric };
+
     bool  realtimeReflections = true;  // master enable for convolution reverb
-    int   reflectionNumRays   = 4096;  // rays per reflection sim step (128–8192)
-    int   reflectionNumBounces = 4;    // bounces per ray (1–8)
-    float reflectionDuration  = 2.0f;  // max reverb tail in seconds (0.5–4.0)
-    int   ambisonicsOrder     = 0;     // 0 = omnidirectional (1ch, 4x cheaper), 1 = directional (4ch)
+    ReflectionType reflectionType = ReflectionType::Convolution;
+    float hybridTransitionTime = 2.0f;  // seconds — convolution portion of IR
+    float hybridOverlapPercent = 0.25f; // fraction of transition_time for crossfade
+
+    int   ambisonicsOrder     = 0;      // realtime ambisonic order (0–3)
+
+    // Realtime simulation params (running every reflection_throttle frames)
+    int   realtimeNumRays         = 1024;  // rays per realtime sim step (128–8192)
+    int   realtimeNumBounces      = 4;     // bounces per ray (1–8)
+    float realtimeDuration        = 2.0f;  // IR duration in seconds (0.5–4.0)
+    int   realtimeDiffuseSamples  = 32;    // diffuse scattering samples per bounce (16–256)
+
+    // Offline bake params (run once per mission; cached as .probes files).
+    int   bakeNumRays             = 4096;  // rays per bake step (1024–65536)
+    int   bakeNumBounces          = 8;     // bake bounces (1–64)
+    float bakeDuration            = 4.0f;  // bake IR duration in seconds
+    int   bakeDiffuseSamples      = 256;   // bake diffuse samples (32–4096)
+    int   bakeAmbisonicsOrder     = 1;     // bake ambisonic order (0–3)
 
     // -- audio.probes: baked-probe grid generation --
     // Spacing/height feed bakeProbes(); a denser grid produces smoother reverb
@@ -89,12 +120,13 @@ struct RenderConfig {
     bool audioProbePortalRings = true;
 
     // -- audio.occlusion: occlusion + material scaling --
+    // (diffuseSamples / bakeDiffuseSamples moved to realtimeDiffuseSamples /
+    //  bakeDiffuseSamples under reflections — legacy occlusion.diffuse_samples
+    //  / occlusion.bake_diffuse_samples keys still parsed with deprecation warning.)
     float occlusionRadius     = 5.0f;  // volumetric occlusion sphere radius (world units = feet, 0.3–30)
     int   occlusionSamples    = 16;    // ray samples per source for occlusion gradient (4–64)
     float transmissionScale   = 1.0f;  // multiplier for material transmission (1=physical, 10=through-walls game-friendly)
     float absorptionScale     = 1.0f;  // multiplier for material absorption (1=physical, <1=more reflective)
-    int   diffuseSamples      = 64;    // realtime diffuse scattering samples per bounce (16–256)
-    int   bakeDiffuseSamples  = 128;   // offline bake diffuse samples per bounce (32–512)
 
     // -- audio.propagation: cell-graph sound routing + door blocking --
     bool  portalRouting       = true;   // portal-graph sound routing through doorways
@@ -345,27 +377,94 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             }
 
             // -- audio.reflections --
+            //
+            // Layout (see PLAN.HYBRID_REVERB.md):
+            //   reflections.enabled / ambisonics_order   — shared
+            //   reflections.type / hybrid_*              — algorithm select
+            //   reflections.realtime.{rays,bounces,duration,diffuse_samples}
+            //   reflections.bake.{rays,bounces,duration,diffuse_samples,ambisonics_order}
             if (YAML::Node refl = audio["reflections"]) {
                 if (refl["enabled"]) cfg.realtimeReflections = refl["enabled"].as<bool>();
-                if (refl["rays"]) {
-                    cfg.reflectionNumRays = refl["rays"].as<int>();
-                    if (cfg.reflectionNumRays < 128)  cfg.reflectionNumRays = 128;
-                    if (cfg.reflectionNumRays > 8192) cfg.reflectionNumRays = 8192;
-                }
-                if (refl["bounces"]) {
-                    cfg.reflectionNumBounces = refl["bounces"].as<int>();
-                    if (cfg.reflectionNumBounces < 1) cfg.reflectionNumBounces = 1;
-                    if (cfg.reflectionNumBounces > 8) cfg.reflectionNumBounces = 8;
-                }
-                if (refl["duration"]) {
-                    cfg.reflectionDuration = refl["duration"].as<float>();
-                    if (cfg.reflectionDuration < 0.5f) cfg.reflectionDuration = 0.5f;
-                    if (cfg.reflectionDuration > 4.0f) cfg.reflectionDuration = 4.0f;
-                }
+
                 if (refl["ambisonics_order"]) {
                     cfg.ambisonicsOrder = refl["ambisonics_order"].as<int>();
                     if (cfg.ambisonicsOrder < 0) cfg.ambisonicsOrder = 0;
                     if (cfg.ambisonicsOrder > 3) cfg.ambisonicsOrder = 3;
+                }
+
+                if (refl["type"]) {
+                    std::string val = refl["type"].as<std::string>();
+                    if      (val == "hybrid")     cfg.reflectionType = RenderConfig::ReflectionType::Hybrid;
+                    else if (val == "parametric") cfg.reflectionType = RenderConfig::ReflectionType::Parametric;
+                    else if (val == "convolution") cfg.reflectionType = RenderConfig::ReflectionType::Convolution;
+                    else {
+                        std::fprintf(stderr,
+                            "WARN: unknown reflections.type '%s' — falling back to 'convolution'\n",
+                            val.c_str());
+                        cfg.reflectionType = RenderConfig::ReflectionType::Convolution;
+                    }
+                }
+                if (refl["hybrid_transition_time"]) {
+                    cfg.hybridTransitionTime = refl["hybrid_transition_time"].as<float>();
+                    if (cfg.hybridTransitionTime < 0.1f) cfg.hybridTransitionTime = 0.1f;
+                    if (cfg.hybridTransitionTime > 8.0f) cfg.hybridTransitionTime = 8.0f;
+                }
+                if (refl["hybrid_overlap_percent"]) {
+                    cfg.hybridOverlapPercent = refl["hybrid_overlap_percent"].as<float>();
+                    if (cfg.hybridOverlapPercent < 0.0f) cfg.hybridOverlapPercent = 0.0f;
+                    if (cfg.hybridOverlapPercent > 1.0f) cfg.hybridOverlapPercent = 1.0f;
+                }
+
+                if (YAML::Node rt = refl["realtime"]) {
+                    if (rt["rays"]) {
+                        cfg.realtimeNumRays = rt["rays"].as<int>();
+                        if (cfg.realtimeNumRays < 128)  cfg.realtimeNumRays = 128;
+                        if (cfg.realtimeNumRays > 8192) cfg.realtimeNumRays = 8192;
+                    }
+                    if (rt["bounces"]) {
+                        cfg.realtimeNumBounces = rt["bounces"].as<int>();
+                        if (cfg.realtimeNumBounces < 1) cfg.realtimeNumBounces = 1;
+                        if (cfg.realtimeNumBounces > 8) cfg.realtimeNumBounces = 8;
+                    }
+                    if (rt["duration"]) {
+                        cfg.realtimeDuration = rt["duration"].as<float>();
+                        if (cfg.realtimeDuration < 0.5f) cfg.realtimeDuration = 0.5f;
+                        if (cfg.realtimeDuration > 4.0f) cfg.realtimeDuration = 4.0f;
+                    }
+                    if (rt["diffuse_samples"]) {
+                        cfg.realtimeDiffuseSamples = rt["diffuse_samples"].as<int>();
+                        if (cfg.realtimeDiffuseSamples < 16)  cfg.realtimeDiffuseSamples = 16;
+                        if (cfg.realtimeDiffuseSamples > 256) cfg.realtimeDiffuseSamples = 256;
+                    }
+                }
+
+                // New bake sub-block.
+                if (YAML::Node bk = refl["bake"]) {
+                    if (bk["rays"]) {
+                        cfg.bakeNumRays = bk["rays"].as<int>();
+                        if (cfg.bakeNumRays < 1024)  cfg.bakeNumRays = 1024;
+                        if (cfg.bakeNumRays > 65536) cfg.bakeNumRays = 65536;
+                    }
+                    if (bk["bounces"]) {
+                        cfg.bakeNumBounces = bk["bounces"].as<int>();
+                        if (cfg.bakeNumBounces < 1)  cfg.bakeNumBounces = 1;
+                        if (cfg.bakeNumBounces > 64) cfg.bakeNumBounces = 64;
+                    }
+                    if (bk["duration"]) {
+                        cfg.bakeDuration = bk["duration"].as<float>();
+                        if (cfg.bakeDuration < 0.5f) cfg.bakeDuration = 0.5f;
+                        if (cfg.bakeDuration > 8.0f) cfg.bakeDuration = 8.0f;
+                    }
+                    if (bk["diffuse_samples"]) {
+                        cfg.bakeDiffuseSamples = bk["diffuse_samples"].as<int>();
+                        if (cfg.bakeDiffuseSamples < 32)   cfg.bakeDiffuseSamples = 32;
+                        if (cfg.bakeDiffuseSamples > 4096) cfg.bakeDiffuseSamples = 4096;
+                    }
+                    if (bk["ambisonics_order"]) {
+                        cfg.bakeAmbisonicsOrder = bk["ambisonics_order"].as<int>();
+                        if (cfg.bakeAmbisonicsOrder < 0) cfg.bakeAmbisonicsOrder = 0;
+                        if (cfg.bakeAmbisonicsOrder > 3) cfg.bakeAmbisonicsOrder = 3;
+                    }
                 }
             }
 
@@ -422,16 +521,6 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     cfg.absorptionScale = occ["absorption_scale"].as<float>();
                     if (cfg.absorptionScale < 0.01f) cfg.absorptionScale = 0.01f;
                     if (cfg.absorptionScale > 10.0f) cfg.absorptionScale = 10.0f;
-                }
-                if (occ["diffuse_samples"]) {
-                    cfg.diffuseSamples = occ["diffuse_samples"].as<int>();
-                    if (cfg.diffuseSamples < 16)  cfg.diffuseSamples = 16;
-                    if (cfg.diffuseSamples > 256) cfg.diffuseSamples = 256;
-                }
-                if (occ["bake_diffuse_samples"]) {
-                    cfg.bakeDiffuseSamples = occ["bake_diffuse_samples"].as<int>();
-                    if (cfg.bakeDiffuseSamples < 32)  cfg.bakeDiffuseSamples = 32;
-                    if (cfg.bakeDiffuseSamples > 512) cfg.bakeDiffuseSamples = 512;
                 }
             }
 
