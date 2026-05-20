@@ -22,6 +22,7 @@
 #include "ReflectionSimulator.h"
 
 #include "AudioLog.h"
+#include "LatencyHistogram.h"
 #include "VoicePool.h"
 
 #include <algorithm>
@@ -47,6 +48,10 @@ namespace Darkness {
 // reset still drains the residual at toggle-off.
 std::atomic<float> sReflSimPeakMs{0.0f};
 std::atomic<int>   sReflFramesRun{0};
+// Per-iteration histogram for iplSimulatorRunReflections. Same writer
+// (sim worker thread) and same reader (AudioService dump) pattern as the
+// peak/frame counters above.
+LatencyHistogram   sPerfReflSimMs;
 
 //------------------------------------------------------
 ReflectionSimulator::ReflectionSimulator() = default;
@@ -202,6 +207,11 @@ void ReflectionSimulator::workerMain()
             float prev = sReflSimPeakMs.load(std::memory_order_relaxed);
             if (ms > prev) sReflSimPeakMs.store(ms, std::memory_order_relaxed);
             sReflFramesRun.fetch_add(1, std::memory_order_relaxed);
+            // Feed the per-stage histogram — same data as the peak above,
+            // but distribution-resolved so the [PERF] dump can compute
+            // p50/p95/p99. Useful for spotting "rare 300 ms outlier vs
+            // steady 50 ms" where the peak alone is ambiguous.
+            sPerfReflSimMs.record(static_cast<double>(ms));
         } else if (mSimulator) {
             iplSimulatorRunReflections(mSimulator);
         }

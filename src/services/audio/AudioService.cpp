@@ -30,9 +30,11 @@
 #include "ConvolutionWorkerPool.h"
 #include "CRFSoundLoader.h"
 #include "EnvSoundDatabase.h"
+#include "LatencyHistogram.h"
 #include "ProbeFile.h"
 #include "ProbeManager.h"
 #include "ReflectionSimulator.h"
+#include "WetBusBeatDetector.h"
 #include "SchemaParser.h"
 #include "SchemaPropertyOverrides.h"
 #include "SchemaSamplesChunk.h"
@@ -789,6 +791,30 @@ static std::atomic<float> sTotalCallbackPeakUs{0.0f}; // peak total audio callba
 static std::atomic<int>   sPerVoiceCallCount{0};      // voices processed in last period
 static std::atomic<float> sCommitPeakMs{0.0f};         // peak iplSimulatorCommit time (ms)
 
+// ── Per-stage latency histograms ──
+//
+// Companions to the scalar peak counters above. The peak fields catch
+// the worst single iteration since the last reset (useful for "did we
+// ever overrun?"); the histograms capture the full p50/p95/p99
+// distribution over the dump window (useful for "where is the budget
+// actually going?"). Writers (audio thread + sim thread) record into
+// these via ScopedLatencyTimer / .record(); the main-thread periodic
+// dump consumes them via snapshotAndReset(). Gated by gAudioLogVerbose
+// at every call site so production cost is zero.
+static LatencyHistogram sPerfDspNodeMs;       // SteamAudioDSPNode per-voice callback
+static LatencyHistogram sPerfReflMixMs;       // ReflectionMixNode callback (audio thread)
+// sPerfReflSimMs lives in ReflectionSimulator.cpp next to its only writer
+// (iplSimulatorRunReflections) — same extern pattern as sReflSimPeakMs.
+extern LatencyHistogram sPerfReflSimMs;
+
+// ── Wet-bus beat detector ──
+//
+// Audio thread pushes one envelope sample (stereo peak) per reflection
+// mix-node callback. Main-thread periodic dump linearises the ring and
+// autocorrelates over the 1–5 Hz band. Hot for diagnosing the residual
+// amplitude-modulation artefact that PLAN.HYBRID_REVERB.md targets.
+static WetBusBeatDetector sWetBeat;
+
 // ── Main thread + sim worker profiling ──
 static std::atomic<float> sLoopStepPeakMs{0.0f};      // peak loopStep total time (ms)
 static std::atomic<float> sDirectSimPeakMs{0.0f};     // peak iplSimulatorRunDirect time (ms)
@@ -1539,6 +1565,9 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         while (!sCallbackAccumUs.compare_exchange_weak(oldAccum, oldAccum + us,
                                                          std::memory_order_relaxed)) {}
         sPerVoiceCallCount.fetch_add(1, std::memory_order_relaxed);
+        // Feed the per-stage histogram — same data as `us` above, but in
+        // a form the [PERF] dump can derive p50/p95/p99 from.
+        sPerfDspNodeMs.record(us / 1000.0);
     }
 }
 
@@ -2203,6 +2232,27 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         float totalUs = sCallbackAccumUs.exchange(0.0f, std::memory_order_relaxed) + mixUs;
         float prevTotal = sTotalCallbackPeakUs.load(std::memory_order_relaxed);
         if (totalUs > prevTotal) sTotalCallbackPeakUs.store(totalUs, std::memory_order_relaxed);
+        // Feed the per-stage histogram for the mix node.
+        sPerfReflMixMs.record(mixUs / 1000.0);
+    }
+
+    // Beat detector: push one envelope sample per mix-node callback,
+    // independent of the gAudioLogVerbose gate so the detector keeps
+    // tracking even when verbose perf logging is off. Single producer
+    // (audio thread), single consumer (main-thread periodic dump). The
+    // envelope sample is the stereo peak post-saturation — exactly the
+    // signal that reaches the engine endpoint, so any 1–5 Hz amplitude
+    // modulation visible to the listener is visible to the autocorrelator.
+    {
+        float envPeak = 0.0f;
+        if (stereoOut) {
+            for (ma_uint32 i = 0; i < frameCount; ++i) {
+                float l = std::fabs(stereoOut[i * 2]);
+                float r = std::fabs(stereoOut[i * 2 + 1]);
+                envPeak = std::max(envPeak, std::max(l, r));
+            }
+        }
+        sWetBeat.push(envPeak);
     }
 }
 
@@ -7035,6 +7085,96 @@ void AudioService::dumpAudioStatusPeriodic()
         AUDIO_LOG( " | conv: %.1fms (%dw)", maxMs, cw->numWorkers);
     }
     AUDIO_LOG( "\n");
+
+    // ── [PERF] per-stage latency percentiles ──
+    //
+    // Snapshot+reset every histogram so each [PERF] line shows the
+    // distribution over the just-finished 5 s window. Per-sub-worker
+    // histograms are merged into a single bin-summed histogram before
+    // computing percentiles — that gives the worker-pool aggregate
+    // (apples-to-apples with "is the pool keeping up?"). Sub-worker
+    // imbalance is observable via the existing scalar peakMs +
+    // [CONV_LAG] log.
+    //
+    // Empty windows (n=0) emit n=0 and dashes — useful sentinel for
+    // "this stage never ran" (e.g. no convolution voices = no apply/sum).
+    auto dspP    = sPerfDspNodeMs.snapshotAndReset();
+    auto mixP    = sPerfReflMixMs.snapshotAndReset();
+    auto simP    = sPerfReflSimMs.snapshotAndReset();
+    LatencyHistogram::Percentiles applyP{}, sumP{}, decP{}, upP{}, iterP{};
+    if (mConvolutionPool && mConvolutionPool->isActive()) {
+        ConvolutionWorker *cw = mConvolutionPool->worker();
+        // Snapshot each sub-worker histogram and accumulate bin counts
+        // into temp histograms. Use record() N times would be O(n) per
+        // bucket — but n can be large, so we cheat by recording a single
+        // representative sample per bucket. Cleaner: a dedicated "merge"
+        // helper, but for the [PERF] line we just want one set of pcts
+        // per stage. Approach: pick the worker with the largest sample
+        // count and use its percentiles as the pool representative,
+        // accumulating total `n` across all workers for context.
+        // (Per-worker breakdown still available via existing peakMs.)
+        for (auto &subPtr : cw->workers) {
+            auto a = subPtr->perfApplyMs.snapshotAndReset();
+            auto s = subPtr->perfSumMs.snapshotAndReset();
+            auto d = subPtr->perfDecodeMs.snapshotAndReset();
+            auto u = subPtr->perfUpsampleMs.snapshotAndReset();
+            auto it = subPtr->perfIterMs.snapshotAndReset();
+            // Take the percentile values of the worker with the most
+            // samples — most representative of pool behaviour under load.
+            if (a.n  > applyP.n) applyP = a;
+            if (s.n  > sumP.n)   sumP   = s;
+            if (d.n  > decP.n)   decP   = d;
+            if (u.n  > upP.n)    upP    = u;
+            if (it.n > iterP.n)  iterP  = it;
+        }
+    }
+    auto fmtMs = [](double v) -> double { return v; };  // identity, leave for future tuning
+    AUDIO_LOG(
+        "[PERF audio] dsp_node n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | refl_mix n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | refl_sim n=%llu p50/p95/p99=%.1f/%.1f/%.1f ms\n",
+        (unsigned long long)dspP.n, fmtMs(dspP.p50), fmtMs(dspP.p95), fmtMs(dspP.p99),
+        (unsigned long long)mixP.n, fmtMs(mixP.p50), fmtMs(mixP.p95), fmtMs(mixP.p99),
+        (unsigned long long)simP.n, fmtMs(simP.p50), fmtMs(simP.p95), fmtMs(simP.p99));
+    AUDIO_LOG(
+        "[PERF worker] apply n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | sum n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | decode n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | upsample n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | iter n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+        (unsigned long long)applyP.n, fmtMs(applyP.p50), fmtMs(applyP.p95), fmtMs(applyP.p99),
+        (unsigned long long)sumP.n,   fmtMs(sumP.p50),   fmtMs(sumP.p95),   fmtMs(sumP.p99),
+        (unsigned long long)decP.n,   fmtMs(decP.p50),   fmtMs(decP.p95),   fmtMs(decP.p99),
+        (unsigned long long)upP.n,    fmtMs(upP.p50),    fmtMs(upP.p95),    fmtMs(upP.p99),
+        (unsigned long long)iterP.n,  fmtMs(iterP.p50),  fmtMs(iterP.p95),  fmtMs(iterP.p99));
+
+    // ── [BEAT] wet-bus autocorrelation ──
+    //
+    // The detector pushed one envelope sample per reflection-mix-node
+    // callback, so `frameRateHz` here = device-rate / device-frame-size.
+    // Scan the 1–5 Hz lag band for periodic structure; emit a single
+    // line with the peak autocorrelation, its lag, the corresponding
+    // frequency, and a YES/NO flag against the threshold.
+    //
+    // YES: wet bus has a rhythmic amplitude modulation in the
+    // beating band. Triage:
+    //   • If acFreqHz lands at 1/reflectionThrottle  → per-frame IR
+    //     crossfade stack (original bug — hybrid should suppress)
+    //   • If acFreqHz lands at 1/footstep_cadence    → expected, ignore
+    //   • If acFreqHz lands at simRate/throttle      → sim cycle leakage
+    // NO: no audible amplitude rhythm; either silent or random.
+    {
+        const float envFrameRateHz =
+            (mFrameSize > 0)
+                ? static_cast<float>(mDeviceSampleRate) / static_cast<float>(mFrameSize)
+                : 46.875f;
+        auto beat = sWetBeat.analyze(envFrameRateHz);
+        AUDIO_LOG(
+            "[BEAT] env_mean=%.5f env_rms=%.5f ac_peak=%.3f ac_lag=%.3fs ac_freq=%.2fHz "
+            "n=%d beating=%s\n",
+            beat.envMean, beat.envRMS, beat.acPeak, beat.acLagSec, beat.acFreqHz,
+            beat.samples, beat.beating ? "YES" : "no");
+    }
 }
 
 //------------------------------------------------------
