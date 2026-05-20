@@ -3764,7 +3764,10 @@ void AudioService::loopStep(float deltaTime)
                 for (auto &[h, v] : mVoicePool->voices()) {
                     if (v->reflSlotOwned) ++slotsHeld;
                 }
-                int slotsAvailable = std::max(0, mMaxReflectionVoices - slotsHeld);
+                // Realtime sticky-slot pool size = `mMaxRealtimeVoices`, which
+                // defaults to mMaxReflectionVoices but can be set lower (or 0)
+                // to reserve total-convolution budget for baked voices only.
+                int slotsAvailable = std::max(0, mMaxRealtimeVoices - slotsHeld);
 
                 // Step 2: collect undecided candidates eligible for promotion.
                 std::vector<VoiceDist> newCandidates;
