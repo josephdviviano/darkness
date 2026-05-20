@@ -1145,14 +1145,18 @@ private:
     /// thread, but the reflection sim thread could plausibly need it in future.
     std::atomic<bool> mSceneReady{false};
 
-    // ── Reflection pipeline (convolution reverb → ambisonics → binaural) ──
+    // ── Reflection pipeline (per-voice reflection effect → ambisonics → binaural) ──
+    //
+    // The pre-Phase-3 design held a shared IPLReflectionMixer here and
+    // routed per-voice convolution into it. PLAN.HYBRID_REVERB.md Phase 3
+    // dropped the mixer entirely: Steam Audio's mixer overload only handles
+    // CONVOLUTION/TAN and rejects HYBRID/PARAMETRIC, so we now sum per-voice
+    // ambisonics manually inside each ConvolutionSubWorker. The ambisonics
+    // decoder below is still needed (one global decode of the summed
+    // ambisonics to binaural stereo).
 
-    /// Shared reflection mixer — accumulates convolution output from all
-    /// per-voice reflection effects into a single ambisonics buffer.
-    IPLReflectionMixer mIplReflectionMixer = nullptr;
-
-    /// Ambisonics decode effect — converts accumulated reflection ambisonics
-    /// (from the mixer) to binaural stereo via HRTF.
+    /// Ambisonics decode effect — converts the per-worker-summed reflection
+    /// ambisonics to binaural stereo via HRTF.
     IPLAmbisonicsDecodeEffect mIplAmbiDecodeEffect = nullptr;
 
     /// Whether reflections are enabled (toggled at runtime with R key)

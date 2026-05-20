@@ -106,11 +106,20 @@ namespace Darkness {
 // Completely independent — no shared mutable state between sub-workers
 // during processing.
 struct ConvolutionSubWorker {
-    // Own Steam Audio pipeline (not thread-safe — one per worker)
-    IPLReflectionMixer mixer = nullptr;
+    // Own Steam Audio ambisonics decoder (not thread-safe — one per worker).
+    // The reflection MIXER was dropped during PLAN.HYBRID_REVERB.md Phase 3:
+    // Steam Audio's mixer only supports CONVOLUTION and TAN, not HYBRID or
+    // PARAMETRIC. The sub-worker now accumulates per-voice ambisonics
+    // manually into ambiCh*, which works for all three modes (convolution,
+    // hybrid, parametric).
     IPLAmbisonicsDecodeEffect ambiDecodeEffect = nullptr;
 
-    // Own scratch buffers for ambisonics processing
+    // Own scratch buffers for ambisonics processing.
+    //   ambiCh{0..3}      — per-worker accumulator (sum of all per-voice
+    //                       outputs assigned to this worker for this frame).
+    //   voiceAmbi{0..3}   — per-voice output of one iplReflectionEffectApply
+    //                       call. Cleared/overwritten by every voice.
+    //   decodedL/R         — stereo binaural after ambisonics decode.
     std::vector<float> ambiCh0, ambiCh1, ambiCh2, ambiCh3;
     std::vector<float> voiceAmbi0, voiceAmbi1, voiceAmbi2, voiceAmbi3;
     std::vector<float> decodedL, decodedR;

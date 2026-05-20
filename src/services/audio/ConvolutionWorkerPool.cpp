@@ -142,9 +142,13 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
     decodeSettings.maxOrder = cfg.ambiOrder;
 
     IPLAudioSettings audioSettings = cfg.audioSettings;
-    IPLReflectionEffectSettings reflSettings = cfg.reflSettings;
+    (void)cfg.reflSettings;  // reflSettings was used for the mixer; mixer is gone.
 
-    // Create K sub-workers, each with own mixer + decoder + scratch + output
+    // Create K sub-workers, each with own decoder + scratch + output.
+    // Mixers were dropped in PLAN.HYBRID_REVERB.md Phase 3 — Steam Audio's
+    // reflection mixer only supports CONVOLUTION/TAN, not HYBRID/PARAMETRIC.
+    // We accumulate per-voice ambisonics manually into sub.ambiCh* in
+    // subWorkerMain, which works for all three modes.
     for (int i = 0; i < cfg.numWorkers; ++i)
         cw.workers.push_back(std::make_unique<ConvolutionSubWorker>());
 
@@ -152,20 +156,10 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
     for (int wk = 0; wk < cfg.numWorkers; ++wk) {
         auto &sub = *cw.workers[wk];
 
-        IPLerror err = iplReflectionMixerCreate(cfg.context, &audioSettings,
-                                                 &reflSettings, &sub.mixer);
-        if (err != IPL_STATUS_SUCCESS) {
-            LOG_ERROR("ConvolutionWorkerPool: sub-worker %d mixer create failed (%d)", wk, err);
-            allWorkersOk = false;
-            break;
-        }
-
-        err = iplAmbisonicsDecodeEffectCreate(cfg.context, &audioSettings,
+        IPLerror err = iplAmbisonicsDecodeEffectCreate(cfg.context, &audioSettings,
                                                &decodeSettings, &sub.ambiDecodeEffect);
         if (err != IPL_STATUS_SUCCESS) {
             LOG_ERROR("ConvolutionWorkerPool: sub-worker %d decode create failed (%d)", wk, err);
-            iplReflectionMixerRelease(&sub.mixer);
-            sub.mixer = nullptr;
             allWorkersOk = false;
             break;
         }
@@ -194,8 +188,6 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
         for (auto &subPtr : cw.workers) {
             if (subPtr->ambiDecodeEffect)
                 iplAmbisonicsDecodeEffectRelease(&subPtr->ambiDecodeEffect);
-            if (subPtr->mixer)
-                iplReflectionMixerRelease(&subPtr->mixer);
         }
         mWorker.reset();
         return false;
@@ -222,8 +214,6 @@ void ConvolutionWorkerPool::shutdown()
             subPtr->thread.join();
         if (subPtr->ambiDecodeEffect)
             iplAmbisonicsDecodeEffectRelease(&subPtr->ambiDecodeEffect);
-        if (subPtr->mixer)
-            iplReflectionMixerRelease(&subPtr->mixer);
     }
     mWorker.reset();
 }
@@ -312,8 +302,24 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
             }
         }
 
-        // Process assigned voice slots through this sub-worker's mixer
+        // Per-worker ambisonics accumulator. Cleared each frame, then we add
+        // each voice's iplReflectionEffectApply output into it. Replaces the
+        // pre-Phase-3 iplReflectionMixer accumulation path (which Steam Audio
+        // forbids for HYBRID/PARAMETRIC).
         int nch = cw.ambiChannels;
+        std::uint32_t reflFrameCount = static_cast<std::uint32_t>(cw.reflectionFrameSize);
+        if (!sub.ambiCh0.empty())
+            std::memset(sub.ambiCh0.data(), 0, reflFrameCount * sizeof(float));
+        if (nch > 1 && !sub.ambiCh1.empty())
+            std::memset(sub.ambiCh1.data(), 0, reflFrameCount * sizeof(float));
+        if (nch > 2 && !sub.ambiCh2.empty())
+            std::memset(sub.ambiCh2.data(), 0, reflFrameCount * sizeof(float));
+        if (nch > 3 && !sub.ambiCh3.empty())
+            std::memset(sub.ambiCh3.data(), 0, reflFrameCount * sizeof(float));
+
+        // Process assigned voice slots — one iplReflectionEffectApply per
+        // voice into per-voice scratch (voiceAmbi*), then sum into the
+        // per-worker accumulator (ambiCh*).
         for (int j = 0; j < assignCount; ++j) {
             int i = sub.assignedSlots[j];
             if (i < 0 || i >= ConvolutionWorker::kMaxSlots) continue;
@@ -330,39 +336,53 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
             reflIn.numSamples = static_cast<IPLint32>(slot.reflFrameSize);
             reflIn.data = &monoPtr;
 
-            // Build output buffer (sub-worker-owned per-voice ambisonics scratch)
-            float *ambiPtrs[4] = {
+            // Build output buffer pointing at the per-voice ambisonics
+            // scratch. iplReflectionEffectApply with mixer=nullptr writes
+            // the result directly here. numChannels here is the per-call
+            // count from slot.params, which may be lower than the effect's
+            // create-time max (used as a CPU saver for distant voices).
+            float *voicePtrs[4] = {
                 sub.voiceAmbi0.data(),
-                !sub.voiceAmbi1.empty() ? sub.voiceAmbi1.data() : nullptr,
-                !sub.voiceAmbi2.empty() ? sub.voiceAmbi2.data() : nullptr,
-                !sub.voiceAmbi3.empty() ? sub.voiceAmbi3.data() : nullptr
+                (nch > 1 && !sub.voiceAmbi1.empty()) ? sub.voiceAmbi1.data() : nullptr,
+                (nch > 2 && !sub.voiceAmbi2.empty()) ? sub.voiceAmbi2.data() : nullptr,
+                (nch > 3 && !sub.voiceAmbi3.empty()) ? sub.voiceAmbi3.data() : nullptr
             };
-            IPLAudioBuffer reflOut{};
-            reflOut.numChannels = slot.params.numChannels;
-            reflOut.numSamples = static_cast<IPLint32>(slot.reflFrameSize);
-            reflOut.data = ambiPtrs;
+            IPLAudioBuffer voiceOut{};
+            voiceOut.numChannels = slot.params.numChannels;
+            voiceOut.numSamples  = static_cast<IPLint32>(slot.reflFrameSize);
+            voiceOut.data        = voicePtrs;
 
-            // Gain-staging: record the mono input level to convolution
-            // (per voice, this sub-worker only).  The convolution IR can
-            // be tens of thousands of samples long and accumulates a
-            // ringing tail; the saMeterReflW (measured AFTER the mixer
-            // apply, below) vs saMeterReflIn ratio captures how much
-            // energy the IRs are adding for the current listener/source
-            // set.
+            // Gain-staging: per-voice input level to convolution. The
+            // convolution IR can be tens of thousands of samples long and
+            // accumulates a ringing tail; the saMeterReflW (measured after
+            // the per-worker sum below) vs saMeterReflIn ratio captures
+            // how much energy the IRs are adding for the current
+            // listener/source set.
             sub.saMeterReflIn.measureMono(monoPtr, slot.reflFrameSize);
 
-            // Apply convolution, accumulating into this sub-worker's
-            // mixer.  Important: when the 5th arg (mixer) is non-null,
-            // Steam Audio writes the per-voice result *into the mixer*
-            // and leaves reflOut/ambiPtrs untouched — so we cannot
-            // measure per-voice W here.  W is measured once after
-            // iplReflectionMixerApply extracts the summed result below.
+            // Apply the reflection effect into the per-voice scratch
+            // (mixer=nullptr → direct buffer output). This is the only
+            // overload that supports HYBRID/PARAMETRIC; the mixer overload
+            // is restricted to CONVOLUTION/TAN.
             iplReflectionEffectApply(slot.effect, &slot.params,
-                                      &reflIn, &reflOut, sub.mixer);
+                                      &reflIn, &voiceOut, /*mixer=*/nullptr);
 
-            // Diagnostic: log every Nth slot the worker processes so we can
-            // tell apart "worker not seeing slot" vs. "worker seeing slot but
-            // isFootstepDiag flag not propagated." Reports the flag value.
+            // Sum per-voice output into the per-worker accumulator.
+            const int voiceCh = std::min(slot.params.numChannels, nch);
+            for (int c = 0; c < voiceCh; ++c) {
+                const float *src = voicePtrs[c];
+                float *dst = (c == 0) ? sub.ambiCh0.data()
+                           : (c == 1) ? (sub.ambiCh1.empty() ? nullptr : sub.ambiCh1.data())
+                           : (c == 2) ? (sub.ambiCh2.empty() ? nullptr : sub.ambiCh2.data())
+                                      : (sub.ambiCh3.empty() ? nullptr : sub.ambiCh3.data());
+                if (!src || !dst) continue;
+                for (std::uint32_t s = 0; s < reflFrameCount; ++s)
+                    dst[s] += src[s];
+            }
+
+            // Diagnostic: log every Nth slot the worker processes. With
+            // manual-sum mode the per-voice peak is directly available in
+            // voiceAmbi0 (was inaccessible under the mixer path).
             {
                 static std::atomic<int> sAnySlotLogCount{0};
                 int n = sAnySlotLogCount.fetch_add(1, std::memory_order_relaxed);
@@ -381,10 +401,6 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
                 }
             }
 
-            // Diagnostic: for footstep slots, report input + output peak
-            // amplitudes so we can confirm convolution is actually producing
-            // audible wet signal. The W (omnidirectional) ambisonics channel
-            // is the right metric for "total wet energy."
             if (slot.isFootstepDiag) {
                 static std::atomic<int> sFootWetLogCount{0};
                 int n = sFootWetLogCount.fetch_add(1, std::memory_order_relaxed);
@@ -418,8 +434,8 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
         // Done reading shared staging
         cw.workersReading.fetch_sub(1, std::memory_order_acq_rel);
 
-        // Extract accumulated ambisonics from this sub-worker's mixer
-        std::uint32_t reflFrameCount = static_cast<std::uint32_t>(cw.reflectionFrameSize);
+        // Build the IPLAudioBuffer view of the summed ambisonics. ambiCh*
+        // already holds the per-worker total — no mixer-extract call needed.
         float *ambiChannels[4] = {
             sub.ambiCh0.data(),
             nch > 1 ? sub.ambiCh1.data() : nullptr,
@@ -428,22 +444,12 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
         };
         IPLAudioBuffer ambiOut{};
         ambiOut.numChannels = nch;
-        ambiOut.numSamples = static_cast<IPLint32>(reflFrameCount);
-        ambiOut.data = ambiChannels;
+        ambiOut.numSamples  = static_cast<IPLint32>(reflFrameCount);
+        ambiOut.data        = ambiChannels;
 
-        IPLReflectionEffectParams mixerParams{};
-        mixerParams.type = IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
-        mixerParams.numChannels = nch;
-        iplReflectionMixerApply(sub.mixer, &mixerParams, &ambiOut);
-
-        // Gain-staging: now that the mixer has extracted the summed
-        // per-voice convolution into ambiCh0..3, measure the W channel
-        // (ambiCh0 == 0th SH coefficient == total omni energy).  This
-        // is the correct measurement point — measuring inside the
-        // iplReflectionEffectApply loop reads stale data because that
-        // call routes the per-voice result into the mixer when the
-        // mixer arg is non-null.  A peak here significantly above
-        // sa_reflI is the resonance signature for the convolution IR.
+        // Gain-staging: per-worker W (ambiCh0 = 0th SH coefficient = total
+        // omni energy). A peak here significantly above sa_reflI is the
+        // resonance signature for the convolution IR.
         if (!sub.ambiCh0.empty())
             sub.saMeterReflW.measureMono(sub.ambiCh0.data(), reflFrameCount);
 
