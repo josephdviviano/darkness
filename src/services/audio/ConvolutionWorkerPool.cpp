@@ -370,20 +370,26 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
             // (mixer=nullptr → direct buffer output). This is the only
             // overload that supports HYBRID/PARAMETRIC; the mixer overload
             // is restricted to CONVOLUTION/TAN.
-            iplReflectionEffectApply(slot.effect, &slot.params,
-                                      &reflIn, &voiceOut, /*mixer=*/nullptr);
+            {
+                ScopedLatencyTimer applyTimer(sub.perfApplyMs);
+                iplReflectionEffectApply(slot.effect, &slot.params,
+                                          &reflIn, &voiceOut, /*mixer=*/nullptr);
+            }
 
             // Sum per-voice output into the per-worker accumulator.
-            const int voiceCh = std::min(slot.params.numChannels, nch);
-            for (int c = 0; c < voiceCh; ++c) {
-                const float *src = voicePtrs[c];
-                float *dst = (c == 0) ? sub.ambiCh0.data()
-                           : (c == 1) ? (sub.ambiCh1.empty() ? nullptr : sub.ambiCh1.data())
-                           : (c == 2) ? (sub.ambiCh2.empty() ? nullptr : sub.ambiCh2.data())
-                                      : (sub.ambiCh3.empty() ? nullptr : sub.ambiCh3.data());
-                if (!src || !dst) continue;
-                for (std::uint32_t s = 0; s < reflFrameCount; ++s)
-                    dst[s] += src[s];
+            {
+                ScopedLatencyTimer sumTimer(sub.perfSumMs);
+                const int voiceCh = std::min(slot.params.numChannels, nch);
+                for (int c = 0; c < voiceCh; ++c) {
+                    const float *src = voicePtrs[c];
+                    float *dst = (c == 0) ? sub.ambiCh0.data()
+                               : (c == 1) ? (sub.ambiCh1.empty() ? nullptr : sub.ambiCh1.data())
+                               : (c == 2) ? (sub.ambiCh2.empty() ? nullptr : sub.ambiCh2.data())
+                                          : (sub.ambiCh3.empty() ? nullptr : sub.ambiCh3.data());
+                    if (!src || !dst) continue;
+                    for (std::uint32_t s = 0; s < reflFrameCount; ++s)
+                        dst[s] += src[s];
+                }
             }
 
             // Diagnostic: log every Nth slot the worker processes. With
@@ -471,8 +477,11 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
         decodeParams.hrtf = cw.hrtf;
         decodeParams.orientation = cw.listenerOrientation;
         decodeParams.binaural = IPL_TRUE;
-        iplAmbisonicsDecodeEffectApply(sub.ambiDecodeEffect, &decodeParams,
-                                        &ambiOut, &decodedBuf);
+        {
+            ScopedLatencyTimer decodeTimer(sub.perfDecodeMs);
+            iplAmbisonicsDecodeEffectApply(sub.ambiDecodeEffect, &decodeParams,
+                                            &ambiOut, &decodedBuf);
+        }
 
         // Sanitize the decoded stereo from the ambisonics decoder before it
         // lands in the front buffer that the master mix node reads.  A NaN
@@ -494,6 +503,7 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
 
         // Write decoded stereo to this sub-worker's back buffer.
         // Handle upsampling from reflection rate to device rate.
+        ScopedLatencyTimer upsampleTimer(sub.perfUpsampleMs);
         int div = cw.rateDivisor;
         if (div > 1) {
             // Linear interpolation upsample by rateDivisor.
@@ -555,6 +565,10 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
         float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
         float prev = sub.peakMs.load(std::memory_order_relaxed);
         if (ms > prev) sub.peakMs.store(ms, std::memory_order_relaxed);
+        // Also feed the per-iteration histogram — peakMs gives the worst
+        // single iteration since the last reset; perfIterMs gives the full
+        // distribution (p50/p95/p99) over the window.
+        sub.perfIterMs.record(static_cast<double>(ms));
 
         // Diagnostic: log iterations that risk overrunning the audio
         // callback period (1024 @ 48 kHz = ~21.3 ms).  When ms exceeds
