@@ -466,6 +466,40 @@ struct ActiveVoice {
     bool reflSlotDecided = false;
     bool reflSlotOwned   = false;
 
+    // ── Pinned per-voice IR (one-shot, never updated) ──
+    //
+    // The original architecture re-read outputs.reflections (the IR handle
+    // + reverb-tail params) every loopStep, letting Steam Audio's per-cycle
+    // baked-probe interp output flow into the convolution effect. Steam
+    // Audio internally crossfades between successive IRs, producing an
+    // audible amplitude pulse at the sim-cycle rate (the "beating" the
+    // wet-bus autocorrelator picked up in 2026-05-20 testing — `[BEAT]
+    // beating=YES ac_freq=5.21Hz` matched 8 × audio-callback-period in
+    // the test config).
+    //
+    // The fix: each voice captures its IR EXACTLY ONCE — on its first
+    // loopStep with valid IR data — and reuses the captured params for
+    // its entire lifetime. `outputs.reflections.ir` is an OPAQUE handle
+    // (IPLReflectionEffectIR) owned by Steam Audio; we cannot copy the
+    // underlying samples directly. We hold the handle as-is and never
+    // refresh it. If Steam Audio uses COW / per-cycle separate storage,
+    // pinning the handle effectively pins the data; if it reuses storage
+    // in-place, this is best-effort but the convolution effect's internal
+    // crossfade-on-pointer-change at minimum stops triggering. Empirical
+    // test required to confirm beating goes away.
+    //
+    // Steam Audio continues to run RunReflections each cycle for the
+    // source pool's benefit (new voices still need a current IR to pin);
+    // pinned voices just ignore subsequent updates.
+    //
+    // Trade-off: a long-lived source (NPC walking through space) keeps
+    // its original IR even as listener+source move. Reverb spatialization
+    // becomes stale for moving sources. For Thief's content (mostly
+    // static ambients + short footsteps), the trade-off favors stability
+    // — beating is audible, sub-probe IR drift is not.
+    bool                       reflectionIRPinned = false;
+    IPLReflectionEffectParams  pinnedParams{};     // captured once, never refreshed
+
     // World-space position for spatial audio (updated for moving objects)
     Vector3 worldPos{0.0f, 0.0f, 0.0f};
 
