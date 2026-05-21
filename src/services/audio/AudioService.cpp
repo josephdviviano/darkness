@@ -403,6 +403,14 @@ struct AudioService::ReflectionMixNode {
     int reflectionFrameSize = 1024;   // reflection frame size (24kHz or 48kHz)
     int ambiChannels = 1;             // ambisonics channel count (1 for order 0, 4 for order 1)
     int ambiOrder = 0;                // ambisonics order (0 or 1)
+    // Sync-in-callback wait deadline. Set at init from
+    // 0.70 * callback_period_ms (frameSize / sampleRate). When workers
+    // overrun this, the wet bus falls through to last-frame's output
+    // (which is what the pre-sync pipeline did unconditionally). Larger
+    // values give workers more headroom but bring the audio thread
+    // closer to the underrun cliff; 0.70 leaves ~30 % of the period for
+    // master DSP + node-graph overhead.
+    float syncDeadlineMs = 7.5f;
     std::atomic<bool> ready{false};   // true once pipeline is initialized
     std::atomic<bool> simulationRan{false};  // true after first iplSimulatorRunReflections completes
     bool nodeInitialized = false;
@@ -809,6 +817,17 @@ static std::atomic<float> sCommitPeakMs{0.0f};         // peak iplSimulatorCommi
 // at every call site so production cost is zero.
 static LatencyHistogram sPerfDspNodeMs;       // SteamAudioDSPNode per-voice callback
 static LatencyHistogram sPerfReflMixMs;       // ReflectionMixNode callback (audio thread)
+// Sync-in-callback: time the audio thread spends blocked at the top of the
+// reflection mix node waiting for convolution workers to finish processing
+// the CURRENT callback's mono input. Eliminates the 1-callback dry/wet gap
+// the async pipeline produces; the deadline-fallback path is still present
+// so a worker overrun doesn't underrun the device — it just gracefully
+// reverts to "use last frame's wet" for that one callback.
+static LatencyHistogram sPerfSyncWaitMs;
+// Counter: number of callbacks where the sync wait expired without all
+// workers reaching their target processedSeq. Logged alongside SYNC_WAIT
+// in the periodic perf dump.
+static std::atomic<int> sSyncTimeoutCount{0};
 // sPerfReflSimMs lives in ReflectionSimulator.cpp next to its only writer
 // (iplSimulatorRunReflections) — same extern pattern as sReflSimPeakMs.
 extern LatencyHistogram sPerfReflSimMs;
@@ -1676,12 +1695,182 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         return;
     }
 
-    // Read all sub-workers' front buffers (previous frame's decoded reverb)
-    // and sum into the wet scratch buffers. The dedicated scratch path is
-    // necessary so the tape saturator (below) sees the FULL summed wet bus
-    // contribution rather than per-sub-worker pieces — saturating each piece
-    // independently would clip transients that, summed, would cancel.
     ConvolutionWorker *cw = node->convWorker;
+
+    // ── Sync-in-callback: kick off convolution for the CURRENT callback's
+    // mono input and wait for it before reading the wet bus. ───────────
+    //
+    // Before this change the worker handoff happened AFTER the wet bus
+    // read, so workers ran asynchronously on the next callback period and
+    // the wet bus we summed was always one callback period (~10.7 ms at
+    // 512/48k) behind the dry path — a static pre-delay added to every
+    // reflection, indistinguishable from "every space is a small room."
+    //
+    // Now: per-voice DSP nodes have already written their mono into
+    // staging[writeIdx] by the time we get here. We assign slots + signal
+    // workers immediately, then wait (bounded by `syncDeadlineMs`) for
+    // their processedSeq to advance before reading the front buffers.
+    // Workers process in parallel with each other on their own threads —
+    // the audio thread blocks only for the longest sub-worker's iter.
+    //
+    // Deadline fallback: if the wait expires, we fall through and read
+    // whatever's currently in the front buffers (== the previous frame's
+    // output, same as the pre-change behaviour). One callback of stale
+    // wet is far better than an underrun. The existing [WET_BUS] staleness
+    // tracking naturally flags these events; the SYNC_WAIT histogram +
+    // sSyncTimeoutCount counter give per-window rates.
+    uint64_t targetSeq[64] = {0};
+    int numSignalled = 0;
+    if (cw) {
+        cw->listenerOrientation = node->listenerOrientation;
+
+        // Triple-buffered staging swap.
+        //
+        // Buffer layout (3 staging slots):
+        //   • writeIdx  — audio thread is filling this one over the current callback
+        //   • prevRead  — workers' most recently published target; workers either
+        //                 are reading it right now, or already finished and are
+        //                 idle waiting for the next signal
+        //   • the third buffer — guaranteed free under normal operation, becomes
+        //                 the next writeIdx
+        //
+        // After the swap: the buffer we just filled (`w`) is published as the
+        // new read target. The third buffer becomes the new writeIdx. workers
+        // are signaled. Under one-frame-behind worker lag this is still safe
+        // because the new writeIdx is neither `w` (workers' new target) nor the
+        // previous read buffer (slow workers' lingering target).
+        //
+        // Catastrophic-backlog fallback: if any worker is two-or-more signals
+        // behind (frameSeq − processedSeq ≥ 2), three buffers are no longer
+        // enough to cover the live read positions. Fall through to the legacy
+        // drop path. With sync-in-callback this should essentially never fire
+        // — the wait loop blocks the audio thread until workers catch up — but
+        // it's retained as a safety net for shutdown / deadline-expiry paths.
+        int w = cw->writeIdx.load(std::memory_order_relaxed);
+        int prevRead = cw->currentReadBuf;
+
+        bool workersTwoBehind = false;
+        for (auto &subPtr : cw->workers) {
+            uint64_t fs = subPtr->frameSeq.load(std::memory_order_relaxed);
+            uint64_t ps = subPtr->processedSeq.load(std::memory_order_relaxed);
+            if (fs >= ps + 2) { workersTwoBehind = true; break; }
+        }
+
+        if (workersTwoBehind) {
+            static std::atomic<int> sFrameDropCount{0};
+            static std::atomic<int> sVoicesDroppedTotal{0};
+            sFrameDropCount.fetch_add(1, std::memory_order_relaxed);
+            sVoicesDroppedTotal.fetch_add(cw->stagingCount[w],
+                                           std::memory_order_relaxed);
+            int dc = sFrameDropCount.load(std::memory_order_relaxed);
+            if ((dc & 0xF) == 0) {
+                int vd = sVoicesDroppedTotal.load(std::memory_order_relaxed);
+                AUDIO_LOG("[CONV_DROP] frames=%d voices_lost=%d (workers ≥2 frames behind)\n",
+                          dc, vd);
+            }
+            cw->stagingCount[w] = 0;
+        } else {
+            int count = cw->stagingCount[w];
+            cw->readyCount.store(count, std::memory_order_relaxed);
+
+            // Pick the third buffer: not `w` (about to become read target),
+            // not `prevRead` (slow workers may still be on it). First-frame
+            // bootstrap: prevRead == -1 — pick any other buffer.
+            int newW;
+            if (prevRead < 0) {
+                newW = (w + 1) % ConvolutionWorker::kStagingBuffers;
+            } else {
+                newW = (0 + 1 + 2) - w - prevRead;  // the remaining index
+            }
+            cw->stagingCount[newW] = 0;
+            cw->writeIdx.store(newW, std::memory_order_release);
+
+            // Distribute voice slots to sub-workers (round-robin)
+            int numW = cw->numWorkers;
+            for (int wk = 0; wk < numW; ++wk)
+                cw->workers[wk]->assignedCount = 0;
+            for (int i = 0; i < count && i < ConvolutionWorker::kMaxSlots; ++i) {
+                int wk = i % numW;
+                auto &sub = *cw->workers[wk];
+                sub.assignedSlots[sub.assignedCount++] = i;
+            }
+
+            // Publish the new read target before signaling so workers see it
+            // through the frameSeq acquire barrier.
+            cw->currentReadBuf = w;
+
+            cw->workersReading.store(numW, std::memory_order_release);
+
+            // Stamp the signal time on each worker BEFORE bumping frameSeq.
+            // The worker's acquire-load on frameSeq makes this write visible
+            // to the worker, which uses it to compute the signal→pickup
+            // latency for the H2' diagnostic.
+            const long long signalNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            for (auto &subPtr : cw->workers)
+                subPtr->signalTimeNs.store(signalNs, std::memory_order_release);
+
+            // Signal all sub-workers and snapshot their target seq for the
+            // wait loop below. The frameSeq bump is the canonical seq
+            // advance (acquire/release pair with the worker's predicate
+            // check); the notify_one wakes the worker if it's currently
+            // in cv.wait(). Order matters: bump frameSeq BEFORE notify so
+            // the worker's predicate check inside cv.wait sees the new
+            // value if it wakes due to our notify (vs spurious wake).
+            const int maxSnap = sizeof(targetSeq) / sizeof(targetSeq[0]);
+            for (auto &subPtr : cw->workers) {
+                uint64_t newSeq = subPtr->frameSeq.fetch_add(
+                    1, std::memory_order_release) + 1;
+                subPtr->wakeCv.notify_one();
+                if (numSignalled < maxSnap)
+                    targetSeq[numSignalled++] = newSeq;
+            }
+        }
+    }
+
+    // ── Bounded wait for sub-workers ───────────────────────────────────
+    //
+    // Yield-spin until each signalled sub-worker's processedSeq reaches
+    // its target value, bounded by `node->syncDeadlineMs`. Workers run
+    // their DSP on dedicated threads in parallel; the audio thread's only
+    // job here is to wait the longest sub-worker out. With the per-frame
+    // worker iter time landing at ~2.5–6 ms typical (512-frame callback,
+    // 4 workers, baked IRs) and a deadline around 70 % of the callback
+    // period, this should expire only on pathological tail spikes.
+    auto syncT0 = std::chrono::steady_clock::now();
+    bool syncTimedOut = false;
+    if (cw && numSignalled > 0) {
+        const auto deadline = syncT0 + std::chrono::microseconds(
+            static_cast<long long>(node->syncDeadlineMs * 1000.0f));
+        for (int i = 0; i < numSignalled; ++i) {
+            auto &sub = *cw->workers[i];
+            while (sub.processedSeq.load(std::memory_order_acquire)
+                   < targetSeq[i]) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    syncTimedOut = true;
+                    break;
+                }
+                std::this_thread::yield();
+            }
+            if (syncTimedOut) break;
+        }
+    }
+    {
+        auto syncT1 = std::chrono::steady_clock::now();
+        double waitMs = std::chrono::duration<double, std::milli>(
+            syncT1 - syncT0).count();
+        sPerfSyncWaitMs.record(waitMs);
+        if (syncTimedOut)
+            sSyncTimeoutCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Read all sub-workers' front buffers (now CURRENT callback's decoded
+    // reverb, if the sync wait succeeded — otherwise the previous frame's
+    // output as a graceful fallback) and sum into the wet scratch buffers.
+    // The dedicated scratch path is necessary so the tape saturator (below)
+    // sees the FULL summed wet bus contribution rather than per-sub-worker
+    // pieces — saturating each piece independently would clip transients
+    // that, summed, would cancel.
     float wetPeakPreSat  = 0.0f;  // diagnostic: peak |wet| before saturation
     float wetPeakL = 0.0f;        // diagnostic: peak |wet stereo| after saturation
     float wetPeakR = 0.0f;
@@ -1932,113 +2121,8 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         }
     }
 
-    // Distribute voice slots to sub-workers and signal them.
-    // Snapshot the listener orientation for ambisonics decode.
-    if (cw) {
-        cw->listenerOrientation = node->listenerOrientation;
-
-        // Triple-buffered staging swap.
-        //
-        // Buffer layout (3 staging slots):
-        //   • writeIdx  — audio thread is filling this one over the current callback
-        //   • prevRead  — workers' most recently published target; workers either
-        //                 are reading it right now, or already finished and are
-        //                 idle waiting for the next signal
-        //   • the third buffer — guaranteed free under normal operation, becomes
-        //                 the next writeIdx
-        //
-        // After the swap: the buffer we just filled (`w`) is published as the
-        // new read target. The third buffer becomes the new writeIdx. workers
-        // are signaled. Under one-frame-behind worker lag this is still safe
-        // because the new writeIdx is neither `w` (workers' new target) nor the
-        // previous read buffer (slow workers' lingering target).
-        //
-        // Catastrophic-backlog fallback: if any worker is two-or-more signals
-        // behind (frameSeq − processedSeq ≥ 2), three buffers are no longer
-        // enough to cover the live read positions. Fall through to the legacy
-        // drop path. In practice this only fires under sustained CONV_LAG.
-        int w = cw->writeIdx.load(std::memory_order_relaxed);
-        int prevRead = cw->currentReadBuf;
-
-        bool workersTwoBehind = false;
-        for (auto &subPtr : cw->workers) {
-            uint64_t fs = subPtr->frameSeq.load(std::memory_order_relaxed);
-            uint64_t ps = subPtr->processedSeq.load(std::memory_order_relaxed);
-            if (fs >= ps + 2) { workersTwoBehind = true; break; }
-        }
-
-        if (workersTwoBehind) {
-            // Catastrophic backlog — drop this frame to avoid overwriting a
-            // staging buffer a still-running worker is reading. Same diagnostic
-            // shape as the legacy double-buffer drop, but should be rare.
-            static std::atomic<int> sFrameDropCount{0};
-            static std::atomic<int> sVoicesDroppedTotal{0};
-            sFrameDropCount.fetch_add(1, std::memory_order_relaxed);
-            sVoicesDroppedTotal.fetch_add(cw->stagingCount[w],
-                                           std::memory_order_relaxed);
-            int dc = sFrameDropCount.load(std::memory_order_relaxed);
-            if ((dc & 0xF) == 0) {
-                int vd = sVoicesDroppedTotal.load(std::memory_order_relaxed);
-                AUDIO_LOG("[CONV_DROP] frames=%d voices_lost=%d (workers ≥2 frames behind)\n",
-                          dc, vd);
-            }
-            cw->stagingCount[w] = 0;
-        } else {
-            int count = cw->stagingCount[w];
-            cw->readyCount.store(count, std::memory_order_relaxed);
-
-            // Pick the third buffer: not `w` (about to become read target),
-            // not `prevRead` (slow workers may still be on it). First-frame
-            // bootstrap: prevRead == -1 — pick any other buffer.
-            int newW;
-            if (prevRead < 0) {
-                newW = (w + 1) % ConvolutionWorker::kStagingBuffers;
-            } else {
-                newW = (0 + 1 + 2) - w - prevRead;  // the remaining index
-            }
-            cw->stagingCount[newW] = 0;
-            cw->writeIdx.store(newW, std::memory_order_release);
-
-            // Distribute voice slots to sub-workers (round-robin)
-            int numW = cw->numWorkers;
-            for (int wk = 0; wk < numW; ++wk)
-                cw->workers[wk]->assignedCount = 0;
-            for (int i = 0; i < count && i < ConvolutionWorker::kMaxSlots; ++i) {
-                int wk = i % numW;
-                auto &sub = *cw->workers[wk];
-                sub.assignedSlots[sub.assignedCount++] = i;
-            }
-
-            // Publish the new read target before signaling so workers see it
-            // through the frameSeq acquire barrier.
-            cw->currentReadBuf = w;
-
-            cw->workersReading.store(numW, std::memory_order_release);
-
-            // Stamp the signal time on each worker BEFORE bumping
-            // frameSeq. The worker's acquire-load on frameSeq makes this
-            // write visible to the worker, which uses it to compute the
-            // signal→pickup latency for the H2' diagnostic. Plain `store`
-            // with release is sufficient because frameSeq's bump below
-            // carries the happens-before edge.
-            const long long signalNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            for (auto &subPtr : cw->workers)
-                subPtr->signalTimeNs.store(signalNs, std::memory_order_release);
-
-            // Signal all sub-workers that new data is available. The
-            // frameSeq bump is the canonical seq advance (acquire/release
-            // pair with the worker's predicate check); the notify_one
-            // wakes the worker if it's currently in cv.wait(). Order
-            // matters: bump frameSeq BEFORE notify so the worker's
-            // predicate check inside cv.wait sees the new value if it
-            // wakes due to our notify (vs spurious wake).
-            for (auto &subPtr : cw->workers) {
-                subPtr->frameSeq.fetch_add(1, std::memory_order_release);
-                subPtr->wakeCv.notify_one();
-            }
-        }
-    }
+    // (Worker signal + sync wait have moved to the top of the mix node,
+    // before the wet bus read. See the "Sync-in-callback" block earlier.)
 
     // ── Master bus DSP chain ──
     // Processing order: Low-shelf EQ → Compressor → Soft Limiter
@@ -3396,6 +3480,13 @@ bool AudioService::initReflectionPipeline()
     rmn.reflectionFrameSize = static_cast<int>(mReflectionFrameSize);
     rmn.ambiChannels = mAmbisonicsChannels;
     rmn.ambiOrder = mAmbisonicsOrder;
+    // Sync-in-callback deadline: 70 % of the audio callback period. At
+    // 512 frames / 48 kHz that's ~7.47 ms, leaving ~3.2 ms for the rest
+    // of the mix node + master DSP chain inside one ~10.7 ms callback.
+    if (mDeviceSampleRate > 0)
+        rmn.syncDeadlineMs =
+            0.70f * 1000.0f * static_cast<float>(mFrameSize)
+                            / static_cast<float>(mDeviceSampleRate);
 
     // Allocate scratch buffers at the reflection frame size.
     // Only allocate channels needed for the configured ambisonics order.
@@ -7674,6 +7765,28 @@ void AudioService::dumpAudioStatusPeriodic()
         " | signal_pickup n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
         (unsigned long long)interCbP.n, fmtMs(interCbP.p50), fmtMs(interCbP.p95), fmtMs(interCbP.p99),
         (unsigned long long)pickupP.n,  fmtMs(pickupP.p50),  fmtMs(pickupP.p95),  fmtMs(pickupP.p99));
+
+    // sync_wait — wall-clock time the audio thread spent at the top of
+    // the reflection mix node waiting for sub-workers to finish processing
+    // the CURRENT callback's mono input (sync-in-callback). p50 ≈ longest
+    // worker iter time + signal/pickup overhead. Compare against
+    // node->syncDeadlineMs (default 70 % of callback period) — p99
+    // approaching the deadline means the pool is close to falling back
+    // to last-frame's wet, which would reintroduce the 1-callback gap.
+    // timeouts: number of callbacks in the window where the wait expired
+    // without all workers reaching their target.
+    {
+        auto syncP = sPerfSyncWaitMs.snapshotAndReset();
+        int timeouts = sSyncTimeoutCount.exchange(0, std::memory_order_relaxed);
+        float deadlineMs = (mReflectionMixNode)
+            ? mReflectionMixNode->syncDeadlineMs : 0.0f;
+        AUDIO_LOG(
+            "[PERF sync_wait] n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+            " | timeouts=%d (deadline=%.2f ms)\n",
+            (unsigned long long)syncP.n,
+            fmtMs(syncP.p50), fmtMs(syncP.p95), fmtMs(syncP.p99),
+            timeouts, static_cast<double>(deadlineMs));
+    }
 
     // ── [BEAT] wet-bus autocorrelation ──
     //
