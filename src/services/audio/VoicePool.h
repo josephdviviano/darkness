@@ -318,11 +318,15 @@ struct ActiveVoice {
     // getVoiceSpatialSnapshots() for the renderer's show_vpos overlay.
     std::vector<Vector3> cachedChain;
 
-    // Steam Audio sim sources split across two simulators so the direct
-    // path is never blocked by the reflection sim's background iteration.
-    // Both nullptr if scene not ready or non-spatial.
+    // Steam Audio sim sources split across three simulators so the direct
+    // path is never blocked by the reflection or pathing sim background
+    // iterations. All nullptr if scene not ready or non-spatial. The
+    // pathing source is also nullptr for `playerEmitted` voices (the
+    // player IS the listener, so the pathing graph collapses to a
+    // self-loop and the iteration cost is wasted).
     IPLSource directSource     = nullptr;  // owned by mDirectSimulator
-    IPLSource reflectionSource = nullptr;  // owned by mReflectionSimulator
+    IPLSource reflectionSource = nullptr;  // owned by mReflectionSim
+    IPLSource pathingSource    = nullptr;  // owned by mPathingSim
 
     // True once iplSourceGetOutputs(PATHING) ever returned a non-sentinel
     // triple. Set on first real read in the per-voice output-staging

@@ -90,6 +90,7 @@ class RoomPortal;
 
 // Owned subsystem types — full definitions live in their own headers.
 class ReflectionSimulator;
+class PathingSimulator;
 class ConvolutionWorkerPool;
 struct ConvolutionWorker;
 
@@ -1302,14 +1303,22 @@ private:
     /// `iplSceneRetain`); world geometry is not duplicated.
     IPLSimulator mDirectSimulator = nullptr;
 
-    /// True once the loaded probe batch has been attached to mDirectSimulator
-    /// for Steam Audio pathing. Steam Audio's pathing simulator looks up the
-    /// nearest probe to source/listener via the batches registered on the
-    /// simulator handle — separate from the reflection simulator's batch
-    /// list. Idempotent: attached once per probe-load, with iplProbeBatchRetain
-    /// so the ProbeManager's release path (which releases on the reflection
-    /// sim) doesn't free the batch from under us.
-    bool mDirectProbeBatchAdded = false;
+    /// Pathing simulator owner — wraps the Steam Audio pathing IPLSimulator
+    /// handle and its dedicated background worker thread that pumps
+    /// iplSimulatorRunPathing. Split off from the direct sim to keep the
+    /// 50–11000 ms pathing iteration off the main loop. See
+    /// PathingSimulator.h for the full threading contract.
+    std::unique_ptr<PathingSimulator> mPathingSim;
+
+    /// True once the loaded probe batch has been attached to the pathing
+    /// simulator. Steam Audio's pathing solver looks up the nearest probe
+    /// to each source/listener via the batches registered on the pathing
+    /// simulator handle (separate from the reflection simulator's batch
+    /// list). Idempotent: attached once per probe-load, with
+    /// iplProbeBatchRetain so the ProbeManager's release path (which
+    /// releases on the reflection sim) doesn't free the batch from under
+    /// us.
+    bool mPathingProbeBatchAdded = false;
 
     /// Whether an acoustic scene is currently active (built and committed).
     /// Atomic as a defensive measure — currently only accessed from the main
