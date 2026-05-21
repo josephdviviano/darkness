@@ -380,13 +380,11 @@ audio:
     hrtf_volume: 1.0             # HRTF output gain (0–4)
     hrtf_interpolation: bilinear # "nearest" or "bilinear" (HRTF dataset interpolation)
     spatial_blend: 1.0           # 0=mono center, 1=full HRTF spatialization
-    distance_model: default      # "default" or "inverse_distance"
 
   ambient:
     # P$AmbientHack-driven looping sounds (mission ambients).
     hysteresis_start_mul: 1.5    # multiplier on radius for activation (1–5)
     hysteresis_stop_mul: 2.0     # multiplier on radius for deactivation (1–5; > start)
-    falloff_curve: quadratic     # "linear" or "quadratic" (when AMB_NO_FADE is unset)
     default_priority: 64         # priority for ambients without explicit value (0–255)
     # Per-voice HRTF spatial-blend override for room-attached ambients
     # (AMB_ENVIRONMENTAL: wind, church reverberance, generic room tone).

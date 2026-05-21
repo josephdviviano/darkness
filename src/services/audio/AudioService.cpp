@@ -711,7 +711,6 @@ inline IPLMatrix4x4 engineToIplMatrix(const Matrix4 &m) {
 // even though the values are typically only set once at startup from
 // RenderConfig.
 //   sHrtfInterpolation: 0 = nearest, 1 = bilinear
-//   sDistanceModel:     0 = default, 1 = inverse_distance
 //
 // These have external linkage so AudioDSPChain.cpp's publish helper can
 // write to them via extern declarations; the audio callback in this TU
@@ -721,7 +720,6 @@ std::atomic<float> sSpatialBlend{1.0f};
 std::atomic<float> sDoorLpfOpenHz{20000.0f};
 std::atomic<float> sDoorLpfBlockedHz{800.0f};
 std::atomic<float> sPropMinAttenuation{0.001f};
-std::atomic<int>   sDistanceModel{0};
 /// Engine sample rate published for audio-thread DSP that needs it (door LPF, etc.)
 static std::atomic<uint32_t> sEngineSampleRate{kDefaultDeviceSampleRate};
 
@@ -3041,10 +3039,9 @@ bool AudioService::getHalfRateReflections() const
 //------------------------------------------------------
 // Forwards to AudioDSPChain, which writes to the file-scope atomics defined
 // above (sHrtfInterpolation / sSpatialBlend / sDoorLpfOpenHz /
-// sDoorLpfBlockedHz / sPropMinAttenuation / sDistanceModel) via extern
-// declarations in AudioDSPChain.cpp. Keeping the atomic definitions in this
-// TU means the audio callback continues to read them with no extra
-// indirection.
+// sDoorLpfBlockedHz / sPropMinAttenuation) via extern declarations in
+// AudioDSPChain.cpp. Keeping the atomic definitions in this TU means the
+// audio callback continues to read them with no extra indirection.
 void AudioService::publishAudioThreadParams()
 {
     mDSPChain->publishAudioThreadParams();
@@ -3065,12 +3062,6 @@ void AudioService::setAmbHysteresisStopMul(float m)
 {
     if (mAmbientManager)
         mAmbientManager->setHysteresisStopMul(std::max(1.0f, std::min(m, 5.0f)));
-}
-
-void AudioService::setAmbFalloffCurve(const std::string &s)
-{
-    if (mAmbientManager)
-        mAmbientManager->setFalloffCurve(s);
 }
 
 void AudioService::setAmbDefaultPriority(int p)
@@ -3107,6 +3098,18 @@ void AudioService::voiceSetMaxAudibleDist(SoundHandle handle, float maxDist)
     ActiveVoice *v = mVoicePool->find(handle);
     if (!v) return;
     v->maxAudibleDist = maxDist;
+}
+
+void AudioService::voiceSetAttenuationFactor(SoundHandle handle, float factor)
+{
+    if (!mVoicePool) return;
+    ActiveVoice *v = mVoicePool->find(handle);
+    if (!v) return;
+    // Clamp to a sane range. Steam Audio's INVERSEDISTANCE minDistance
+    // is in meters, so factor=0.1 → 0.1m (effectively no full-volume zone)
+    // and factor=100 → 100m (sound essentially never attenuates with
+    // distance). The Dark Engine ships factors in [1, ~20].
+    v->attenuationFactor = std::max(0.1f, std::min(factor, 100.0f));
 }
 
 void AudioService::voiceSetSpatialBlendOverride(SoundHandle handle, float blend)
@@ -5274,10 +5277,18 @@ void AudioService::loopStep(float deltaTime)
                 }
                 inputs.directFlags = directFlags;
                 inputs.source = sourceCoord;
+                // Steam Audio distance model: always INVERSEDISTANCE with
+                // minDistance scaled by the schema's P$SchAttFac
+                // (attenuationFactor). attenuationFactor=1 → minDistance=1m
+                // (matches DEFAULT model behaviour); attenuationFactor=20
+                // → minDistance=20m, keeping a sound at full volume out to
+                // 20m before 1/d falloff. Per-voice; default factor 1.0 set
+                // at voice creation in VoicePool, schemas with non-default
+                // P$SchAttFac override via AmbientSoundManager → voiceSetAttenuationFactor.
                 inputs.distanceAttenuationModel.type =
-                    (sDistanceModel.load(std::memory_order_relaxed) == 1)
-                        ? IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE
-                        : IPL_DISTANCEATTENUATIONTYPE_DEFAULT;
+                    IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
+                inputs.distanceAttenuationModel.minDistance =
+                    1.0f * voice->attenuationFactor;
                 inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
                 // Volumetric occlusion models the source as a sphere — as the
                 // sphere partially disappears behind a corner, occlusion ramps

@@ -123,9 +123,6 @@ public:
     const std::string& getHRTFInterpolation() const { return mHRTFInterpolation; }
     void setSpatialBlend(float b);
     float getSpatialBlend() const { return mSpatialBlend; }
-    /// "default" or "inverse_distance"
-    void setDistanceModel(const std::string& s);
-    const std::string& getDistanceModel() const { return mDistanceModel; }
 
     // ── Propagation tuning that the audio thread reads ──
     //
@@ -174,7 +171,6 @@ private:
     float       mHRTFVolume        = 1.0f;
     std::string mHRTFInterpolation = "bilinear"; // "nearest" or "bilinear"
     float       mSpatialBlend      = 1.0f;
-    std::string mDistanceModel     = "default";  // "default" or "inverse_distance"
 
     // ── Propagation tuning (door LPF + minimum attenuation) ──
     float    mDoorLpfOpenHz       = 20000.0f;
