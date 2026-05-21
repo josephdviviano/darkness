@@ -140,6 +140,15 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
     cw.ambiChannels = cfg.ambiChannels;
     cw.ambiOrder = cfg.ambiOrder;
     cw.numWorkers = cfg.numWorkers;
+    // Cache the audio callback period so [CONV_LAG] can size its threshold
+    // (default 80 % of the period) and report the period in its log line.
+    // Falls back to the historical 21.333 ms (1024 @ 48 kHz) if the
+    // settings struct is unfilled.
+    if (cfg.audioSettings.samplingRate > 0 && cfg.frameSize > 0) {
+        cw.callbackPeriodMs = 1000.0f
+            * static_cast<float>(cfg.frameSize)
+            / static_cast<float>(cfg.audioSettings.samplingRate);
+    }
 
     // Allocate shared per-voice mono staging buffers (triple-buffered).
     for (int b = 0; b < ConvolutionWorker::kStagingBuffers; ++b) {
@@ -747,21 +756,26 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
         sub.perfResidualMs.record(residualMs);
 
         // Diagnostic: log iterations that risk overrunning the audio
-        // callback period (1024 @ 48 kHz = ~21.3 ms).  When ms exceeds
-        // the threshold, the mix node on the next callback is likely to
-        // read a still-stale `front` buffer because the worker hasn't
-        // flipped frontIdx yet — the front-buffer freshness counter in
-        // [WET_BUS] will rise in lockstep.  Throttled to ~once per 64
-        // overruns per sub-worker so the log stays usable when the
-        // pipeline is consistently behind.
-        if (ms > 18.0f) {
+        // callback period (frameSize / sampleRate). Sync-in-callback means
+        // the audio thread waits for our processedSeq before reading wet —
+        // so an overrun directly forces a deadline timeout in the mix
+        // node, which the [PERF sync_wait] "timeouts" counter records.
+        // Threshold = 80 % of callback period; warns before the mix
+        // node's 70 % wait deadline so we can attribute timeouts to a
+        // specific worker. Throttled to ~once per 64 overruns per
+        // sub-worker so the log stays usable when the pipeline is
+        // consistently behind.
+        const float cbMs = cw.callbackPeriodMs;
+        const float lagThresholdMs = 0.80f * cbMs;
+        if (ms > lagThresholdMs) {
             static std::atomic<uint32_t> sLagLogCount[16] = {};
             int idx = workerIdx & 0xF;
             uint32_t n = sLagLogCount[idx].fetch_add(1, std::memory_order_relaxed);
             if ((n & 0x3F) == 0) {
                 AUDIO_LOG("[CONV_LAG] w=%d ms=%.2f assignCount=%d "
-                          "(overrun #%u, cb=21.3ms)\n",
-                          workerIdx, ms, assignCount, n + 1);
+                          "(overrun #%u, cb=%.2fms thr=%.2fms)\n",
+                          workerIdx, ms, assignCount, n + 1,
+                          cbMs, lagThresholdMs);
             }
         }
 

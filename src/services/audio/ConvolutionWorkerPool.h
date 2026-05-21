@@ -306,6 +306,12 @@ struct ConvolutionWorker {
     int ambiChannels = 1;
     int ambiOrder = 0;
     int rateDivisor = 2;  // 1=full, 2=half, 4=quarter
+    // Audio callback period in milliseconds (frameSize / sampleRate * 1000).
+    // Set at init from cfg.audioSettings.samplingRate; the worker uses it
+    // to size the [CONV_LAG] threshold (a fraction of the callback period)
+    // and to report the period in the log line. Cached here so the worker
+    // thread doesn't need access to the engine config.
+    float callbackPeriodMs = 21.333f;
 
     // Listener orientation snapshot (written by mix node, read by all workers)
     IPLCoordinateSpace3 listenerOrientation = {
