@@ -396,6 +396,12 @@ audio:
     # Object-attached ambients (no AMB_ENVIRONMENTAL flag) ignore this
     # and keep full HRTF so e.g. a generator hum stays directional.
     environmental_spatial_blend: 0.3  # (0.0–1.0)
+    # Global linear multiplier applied to every ambient + spot-ambient
+    # voice. Compensates for the ambient-volume re-baseline introduced
+    # when Steam Audio became the sole player-audio propagation authority
+    # (the per-radius centibel falloff curve is retired). Single tuning
+    # knob, default 1.0 = no change. Adjust by ear.
+    global_volume_scale: 1.0     # (0.0–4.0)
 
   mixer:
     # Global gains. Independent direct/indirect knobs let you tune the
