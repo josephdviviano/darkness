@@ -35,36 +35,59 @@
 #include "logger.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <unordered_set>
 
 namespace Darkness {
 
+namespace {
+
+/// Look up authored schema volume in centibels. Returns 0 when the schema
+/// is unresolved (matches the previous behaviour of treating "no schema
+/// found" as gain=0).
+int schemaVolumeCb(SchemaParser *parser, const std::string &name)
+{
+    if (!parser) return 0;
+    const SchemaEntry *sch = parser->findSchema(name);
+    return sch ? sch->playParams.volume : 0;
+}
+
+/// Centibels → linear amplitude with -10000 clamped to silence.
+float centibelsToLinear(float cb)
+{
+    if (cb <= -10000.0f) return 0.0f;
+    return std::pow(10.0f, cb / 2000.0f);
+}
+
+/// Millibel-style integer gain → linear amplitude. Positive values clamp
+/// to unity (matches the SpotAmb level convention).
+float milliBelIntToLinear(int volMb)
+{
+    if (volMb >= 0)              return 1.0f;
+    if (volMb <= -10000)         return 0.0f;
+    return std::pow(10.0f, volMb / 2000.0f);
+}
+
+} // anonymous namespace
+
 //------------------------------------------------------
 float AmbientVolumeModel::computeFalloff(float distance, float inner,
                                          float outer, FalloffCurve curve)
 {
-    // Inner/outer envelope, normalised to [0,1] across the fade band.
-    // d <= inner → 0   (fully audible, no falloff applied)
-    // d >= outer → 1   (silenced)
-    // in band   → curve-shaped fraction
+    // Inner/outer envelope normalised to [0,1]. d<=inner → 0 (full volume),
+    // d>=outer → 1 (silent), in-band → curve-shaped fraction.
     if (outer <= inner) {
-        // Degenerate envelope: a single step at `outer`. Avoids divide-by-zero.
-        return (distance >= outer) ? 1.0f : 0.0f;
+        return (distance >= outer) ? 1.0f : 0.0f;  // degenerate envelope: step at `outer`
     }
     if (distance <= inner) return 0.0f;
     if (distance >= outer) return 1.0f;
-    float t = (distance - inner) / (outer - inner);
+    const float t = (distance - inner) / (outer - inner);
     switch (curve) {
-        case FalloffCurve::Linear:
-            return t;
-        case FalloffCurve::Quartic:
-            // (d/r)^4 in the inner==0 case — matches the original engine's
-            // SHARP-falloff curve. Equivalent to a four-multiply chain
-            // since `t` is already in [0,1].
-            return t * t * t * t;
+        case FalloffCurve::Linear:  return t;
+        case FalloffCurve::Quartic: return t * t * t * t;  // original engine's SHARP curve
     }
-    return t;  // unreachable; satisfies non-void warning
+    return t;
 }
 
 //------------------------------------------------------
@@ -100,21 +123,17 @@ void AmbientSoundManager::loadAmbientSounds()
     if (!mHost->mPropertyService || !mHost->mObjectService || !mHost->mAudioReady)
         return;
 
-    // Find all objects with P$AmbientHack (property name "AmbientHa" in the gamesys)
+    // Objects with P$AmbientHack (property name "AmbientHa" in the gamesys).
     auto objIDs = getAllObjectsWithProperty(mHost->mPropertyService.get(),
                                             "AmbientHa");
 
-    // Track schemas we've already warned about so we emit one warning per
-    // unique missing name regardless of how many objects reference it.
-    // (e.g. miss6.mis references the undefined schema "m06subson" on 7 objects.)
+    // One warning per unique missing schema across all references.
     std::unordered_set<std::string> warnedMissing;
 
     int loaded = 0;
     int skipped = 0;
     for (int objID : objIDs) {
-        // Only process concrete objects (positive IDs), not archetypes
-        if (objID <= 0)
-            continue;
+        if (objID <= 0) continue;  // archetypes only carry templates
 
         size_t rawSize = 0;
         const uint8_t *raw = getPropertyRawData(
@@ -123,8 +142,6 @@ void AmbientSoundManager::loadAmbientSounds()
             continue;
 
         const auto *prop = reinterpret_cast<const PropAmbientHack *>(raw);
-
-        // Skip turned-off ambients
         if (prop->flags & AMB_TURNED_OFF)
             continue;
 
@@ -136,14 +153,10 @@ void AmbientSoundManager::loadAmbientSounds()
         amb.volume = prop->volume;
         amb.flags = prop->flags;
         amb.position = mHost->mObjectService->position(objID);
-        // Capture per-schema falloff parameters at ambient creation.
-        // SHARP is the original engine's default for schemas (P$SchPlayPa
-        // dtype default is 0x7F00, which includes bit 12 = SFXFLG_SHARP).
-        // The .sch parser also defaults SchemaPlayParams.flags to
-        // SCH_SHARP_FALLOFF, so any schema without an explicit `flags`
-        // directive that clears bit 12 ends up with SHARP. The
-        // attenuation factor comes from P$SchAttFac (applied earlier on
-        // schema load).
+
+        // Per-schema falloff params. SHARP is the engine's default for ambients
+        // (P$SchPlayPa dtype default 0x7F00 includes bit 12 = SFXFLG_SHARP);
+        // schemas opt out via an explicit `flags` directive that clears it.
         if (mHost->mSchemaParser) {
             if (const SchemaEntry *sch = mHost->mSchemaParser->findSchema(amb.schemaName)) {
                 amb.isSharp = (sch->playParams.flags & SCH_SHARP_FALLOFF) != 0;
@@ -154,15 +167,12 @@ void AmbientSoundManager::loadAmbientSounds()
         if (amb.schemaName.empty())
             continue;
 
-        // Validate that the referenced schema exists, or — failing that —
-        // that snd.crf contains a raw WAV with the same name (the runtime
-        // fallback path in updateAmbientVolumes also tries this). If both
-        // miss, the original game data has a dangling reference; drop the
-        // ambient so we don't churn through a doomed lookup every frame.
-        bool schemaExists = mHost->mSchemaParser &&
-                            mHost->mSchemaParser->findSchema(amb.schemaName) != nullptr;
-        bool rawSampleExists = mHost->mSoundLoader &&
-                               mHost->mSoundLoader->hasSound(amb.schemaName);
+        // Drop ambients with no resolvable schema AND no raw-sample fallback,
+        // so we don't churn through doomed lookups every frame.
+        const bool schemaExists = mHost->mSchemaParser &&
+                                  mHost->mSchemaParser->findSchema(amb.schemaName) != nullptr;
+        const bool rawSampleExists = mHost->mSoundLoader &&
+                                     mHost->mSoundLoader->hasSound(amb.schemaName);
         if (!schemaExists && !rawSampleExists) {
             if (warnedMissing.insert(amb.schemaName).second) {
                 LOG_ERROR("AudioService: AmbientHack on obj %d references "
@@ -173,8 +183,6 @@ void AmbientSoundManager::loadAmbientSounds()
             continue;
         }
 
-        // Register ambient data only — voices are started/stopped dynamically
-        // in updateAmbientVolumes() based on listener distance.
         mAmbients.push_back(std::move(amb));
         ++loaded;
     }
@@ -206,7 +214,7 @@ void AmbientSoundManager::loadSpotAmbients()
     int skippedNoSchema = 0;
     while (!it->end()) {
         int objID = it->next();
-        if (objID <= 0) continue;  // archetypes only carry templates
+        if (objID <= 0) continue;
 
         size_t sz = 0;
         const uint8_t *bytes = storage->getRawData(objID, sz);
@@ -214,7 +222,6 @@ void AmbientSoundManager::loadSpotAmbients()
         PropSpotAmb sa;
         std::memcpy(&sa, bytes, sizeof(sa));
 
-        // Sanity: outer >= inner > 0, level >= 0.
         if (sa.outer <= 0.0f || sa.outer < sa.inner || sa.ambient < 0.0f)
             continue;
 
@@ -225,13 +232,9 @@ void AmbientSoundManager::loadSpotAmbients()
         se.outer = sa.outer;
         se.level = sa.ambient;
 
-        // Resolve the schema name. The original engine ties a spot
-        // ambient to whatever ambient schema the object would otherwise
-        // play — typically the object's P$AmbientHack (concrete or
-        // inherited). If the object also carries an AmbientHa property
-        // we reuse its schema field; otherwise this spot ambient has no
-        // schema mapping yet (logged for diagnostics — the data is still
-        // captured so a follow-up resolver can complete it).
+        // The schema name is borrowed from the object's P$AmbientHack
+        // (concrete or inherited). If absent, the spot ambient is captured
+        // but won't start (logged for diagnostics).
         size_t ahSize = 0;
         const uint8_t *ahRaw = getPropertyRawData(
             mHost->mPropertyService.get(), "AmbientHa", objID, ahSize);
@@ -261,397 +264,221 @@ void AmbientSoundManager::updateAmbientVolumes()
         return;
 
     for (auto &amb : mAmbients) {
-        // Ambient sound activation uses EUCLIDEAN distance, matching the
-        // original Dark Engine's ambient system. The room portal system was
-        // never used for ambient activation — ambients work purely on radius.
-        // Room routing handles cross-room propagation for voices in the
-        // voice update loop (Step 2b), not here.
-        //
-        // Start voices BEFORE the source becomes audible so the distance-based
-        // volume curve fades in smoothly. Stop at a wider hysteresis radius
-        // to avoid rapid start/stop oscillation when the listener hovers near
-        // the boundary. Multipliers come from audio.ambient config.
-        float dist = glm::length(mHost->mListenerPos - amb.position);
-        float startRadius = amb.radius * mHysteresisStartMul;
-        float stopRadius  = amb.radius * mHysteresisStopMul;
+        // Ambient activation uses Euclidean distance — radius-based; portal
+        // routing handles cross-room propagation downstream. Start radius is
+        // narrower than stop radius (asymmetric hysteresis) to prevent
+        // start/stop oscillation when the listener hovers near the boundary.
+        const float dist = glm::length(mHost->mListenerPos - amb.position);
+        const float startRadius = amb.radius * mHysteresisStartMul;
+        const float stopRadius  = amb.radius * mHysteresisStopMul;
 
-        bool alreadyPlaying = (amb.handle != SOUND_HANDLE_INVALID);
-        bool inRange = (amb.radius > 0.0f &&
-                        (alreadyPlaying ? dist < stopRadius : dist < startRadius));
+        const bool alreadyPlaying = (amb.handle != SOUND_HANDLE_INVALID);
+        const bool inRange = (amb.radius > 0.0f &&
+                              (alreadyPlaying ? dist < stopRadius : dist < startRadius));
 
-        if (inRange) {
-            // Start voice if not already playing
-            bool justCreated = false;
-            bool isEnvironmental = (amb.flags & AMB_ENVIRONMENTAL) != 0;
-            if (amb.handle == SOUND_HANDLE_INVALID) {
-                bool isLooping = !(amb.flags & AMB_ONCE_ONLY);
-                // Environmental ambients use the ambient system's radius
-                // curve for distance; object ambients use Steam Audio
-                // distance. Decide BEFORE startVoice so the VoiceClass tag
-                // is set before createVoiceSource applies its per-class
-                // default directParams — otherwise the first audio callback
-                // reads the silent initVoiceDSP defaults (~21 ms gap).
-                VoiceClass cls = isEnvironmental ? VoiceClass::Ambient
-                                                 : VoiceClass::Normal;
-                if (mHost->mSchemaParser) {
-                    const SchemaEntry *schema =
-                        mHost->mSchemaParser->findSchema(amb.schemaName);
-                    if (schema && !schema->samples.empty()) {
-                        const SchemaSample &sample = schema->samples[0];
-                        // Start at volume 0 — stays silent until the sim has
-                        // processed this source (next frame) so occlusion is
-                        // applied before the voice is audible.
-                        amb.handle = mHost->startVoice(amb.schemaName, sample.name,
-                                                      amb.position,
-                                                      schema->playParams.priority,
-                                                      isLooping, amb.objID, 0.0f, cls);
-                    }
-                }
-                if (mHost->voiceExists(amb.handle)) {
-                    justCreated = true;
-                }
-                // Fallback: try loading schema name as a raw sound
-                if (amb.handle == SOUND_HANDLE_INVALID) {
-                    amb.handle = mHost->startVoice(amb.schemaName, amb.schemaName,
-                                                  amb.position, mDefaultPriority,
-                                                  isLooping, amb.objID, 0.0f, cls);
-                    if (mHost->voiceExists(amb.handle)) {
-                        justCreated = true;
-                    }
-                }
-
-                // Set the voice's per-source max audible distance from
-                // the ambient's radius. BFS terminates beyond this, so
-                // the sound naturally stops propagating once the portal-
-                // graph path exceeds the source's effective reach.
-                //
-                // Per-source BFS-termination distance, matching the
-                // original Dark Engine's per-source attenuation:
-                //   SFX_MaxDist(gain) = (5000 + gain) / attenuation_factor
-                //   m_MaxDistance = SFX_MaxDist(gain) * atten_factor
-                // with attenuation_factor = 55 (engine-config default).
-                //
-                // This is the IMPLICIT phantom-portal filter in the
-                // original engine: a typical ambient with gain = -3000
-                // (-30 dB) and atten_factor = 1.0 gets m_MaxDistance =
-                // (5000 - 3000) / 55 * 1.0 ≈ 36.4 ft. BFS exhausts that
-                // budget before reaching distant listeners through
-                // phantom chains, naturally silencing audio that
-                // shouldn't propagate.
-                //
-                // History: this used to be `amb.radius * 2.0f`, which
-                // for a typical-radius ambient produces ~110 ft — about
-                // 3× the original's per-source budget for the same
-                // schema. The radius gate worked for the obvious "wind
-                // ambient with radius=25" case but allowed long phantom
-                // chains for higher-radius ambients (cathedral mech-
-                // angels, etc.) to reach listeners they shouldn't.
-                if (mHost->voiceExists(amb.handle)) {
-                    constexpr float kAttenuationFactor = 55.0f;
-                    // Re-look-up the schema; the outer-scope `schema`
-                    // pointer is out of scope here. Gain is in centibels
-                    // (negative = attenuated, 0 = full). Some ambients
-                    // spawn through the raw-sound fallback and have no
-                    // schema — default to gain=0 for those.
-                    int gainCb = 0;
-                    if (mHost->mSchemaParser) {
-                        const SchemaEntry *sch =
-                            mHost->mSchemaParser->findSchema(amb.schemaName);
-                        if (sch) gainCb = sch->playParams.volume;
-                    }
-                    const float gain = static_cast<float>(gainCb);
-                    const float attenFactor = (amb.attenuationFactor > 0.01f)
-                                                 ? amb.attenuationFactor
-                                                 : 1.0f;
-                    float sfxMaxDist = (5000.0f + gain) / kAttenuationFactor;
-                    if (sfxMaxDist < 1.0f) sfxMaxDist = 1.0f;
-                    mHost->voiceSetMaxAudibleDist(amb.handle,
-                                                  sfxMaxDist * attenFactor);
-                }
-
-                // Per-voice spatialBlend override for room-attached
-                // ambients (AMB_ENVIRONMENTAL: wind, church reverberance,
-                // generic "room tone"). Lowering binaural spatialBlend
-                // mixes the HRTF output with mono passthrough so the
-                // sound feels diffuse rather than coming from a single
-                // point in space. Object-attached ambients (no
-                // AMB_ENVIRONMENTAL flag) skip this override and keep the
-                // default 1.0 so they stay directional (e.g. an audible
-                // generator hum should still point at the generator).
-                //
-                // Setting once at activation is correct: the override is
-                // an atomic that the audio thread reads every callback,
-                // and the value is constant for the voice's lifetime
-                // (the AMB_ENVIRONMENTAL flag doesn't change post-spawn).
-                // The audio thread may fire one callback before this
-                // store lands (~21 ms of full HRTF before the diffuse
-                // override takes effect); ambients start at volume 0 and
-                // ramp up in updateAmbientVolumes, so any leakage during
-                // that window is below the audibility threshold anyway.
-                if (justCreated && isEnvironmental
-                    && mHost->voiceExists(amb.handle)) {
-                    mHost->voiceSetSpatialBlendOverride(
-                        amb.handle, mEnvironmentalSpatialBlend);
-                }
-
-                // Fan out a sound-emission event so AI hearing /
-                // diagnostic listeners can observe the new ambient.
-                // soundType defaults to Untyped (0); ambients aren't
-                // typed in P$AmbientHack. gainDb combines the schema-
-                // authored volume with the AmbientHack per-object override
-                // (both centibels, additive) — matching the radius-curve
-                // gain in updateAmbientVolumes so the AI hearing system
-                // sees the same amplitude the player will actually hear.
-                if (justCreated && amb.handle != SOUND_HANDLE_INVALID) {
-                    int schemaVolCb = 0;
-                    if (mHost->mSchemaParser) {
-                        const SchemaEntry *sch =
-                            mHost->mSchemaParser->findSchema(amb.schemaName);
-                        if (sch) schemaVolCb = sch->playParams.volume;
-                    }
-                    SoundEmissionEvent ev{};
-                    ev.emitterObjID = amb.objID;
-                    ev.position     = amb.position;
-                    ev.schemaName   = amb.schemaName;
-                    ev.soundType    = 0; // Untyped — ambients don't carry an AI sound type
-                    ev.baseRange    = amb.radius;
-                    ev.gainDb       = static_cast<float>(amb.volume + schemaVolCb);
-                    mHost->publishSoundEmission(ev);
-                }
-            }
-
-            // Update volume.
-            // Just-created voices stay at 0 — silent defaults in initVoiceDSP
-            // ensure iplDirectEffectApply outputs silence until the sim provides
-            // real occlusion/distance data (next frame).
-            if (!justCreated && amb.handle != SOUND_HANDLE_INVALID) {
-                if (!mHost->voiceExists(amb.handle)) {
-                    amb.handle = SOUND_HANDLE_INVALID;
-                    continue;
-                }
-
-                // Distance-attenuated volume, per the original engine's
-                // formula. Combines the schema-authored gain (centibels)
-                // with the BFS-munged path distance against the ambient's
-                // authored radius:
-                //
-                //   volume_centibels = gain - falloffPct * (5000 + gain)
-                //   falloffPct       = (d/r)        for default (linear)
-                //                    = (d/r)^4      for SCH_SHARP_FALLOFF
-                //   linearAmplitude  = 10^(volume_centibels / 2000)
-                //
-                // At d=0: volume_centibels = gain (the schema's authored
-                // level — full volume of the sample). At d=radius:
-                // volume_centibels = gain - (5000 + gain), i.e. -50 dB
-                // relative to a gain=0 reference. The curve is linear in
-                // centibels (= linear in dB) so the rate of change is
-                // constant, with no cliff near radius.
-                //
-                // SHARP-tagged ambients use (d/r)^4 instead: near-full
-                // volume across most of the radius, falling quickly only
-                // near the edge. The original engine sets SFXFLG_SHARP on
-                // sound effects where the designer wants tighter
-                // localization (e.g. small machine hums) vs. ambient room
-                // tones that need to fill a large volume.
-                //
-                // Fallback to Euclidean when the voice's BFS path hasn't
-                // resolved (cachedProp.reached == false; e.g. first frame
-                // before propagation runs).
-                float falloffDist = mHost->voiceFalloffDistance(amb.handle, dist);
-                // AMB_NO_FADE forces linear regardless of schema's SHARP
-                // flag — the level designer explicitly tagged this
-                // ambient as "no fade", so we use the gentlest curve.
-                bool useSharp = amb.isSharp && !(amb.flags & AMB_NO_FADE);
-                FalloffCurve curve = useSharp ? FalloffCurve::Quartic
-                                              : FalloffCurve::Linear;
-                // Unified envelope: inner=0, outer=radius — d <= 0 gives 0
-                // (full gain), d >= radius gives 1 (full attenuation step).
-                // Matches the previous explicit (d/r) and (d/r)^4 code paths
-                // bit-for-bit when inner == 0.
-                float falloffPct = AmbientVolumeModel::computeFalloff(
-                    falloffDist, /*inner=*/0.0f, /*outer=*/amb.radius, curve);
-                // Combine the schema's authored gain with the AmbientHack
-                // per-object override. Both are in centibels, so summing
-                // them is equivalent to multiplying their linear amplitudes.
-                // For the typical case where prop->volume == 0 (level
-                // designer didn't override the schema), this restores the
-                // schema-author's intended attenuation — without this the
-                // ambient plays at unity regardless of how quiet the schema
-                // says the sample should be (e.g. torch_flame authors
-                // -1700cB ≈ -17dB, which was being silently dropped).
-                int schemaVolCb = 0;
-                if (mHost->mSchemaParser) {
-                    const SchemaEntry *sch =
-                        mHost->mSchemaParser->findSchema(amb.schemaName);
-                    if (sch) schemaVolCb = sch->playParams.volume;
-                }
-                float gainCb = static_cast<float>(amb.volume + schemaVolCb);
-                // The original engine's m_ScaleDistance term works out to
-                // (5000+gain) once the global attenuation_factor cancels.
-                // We replicate that here so the per-radius dB drop is
-                // independent of the global tunable (which we don't expose
-                // — we apply the original engine's value of 55 implicitly).
-                //
-                // Per-schema attenuation factor (from P$SchAttFac) is a
-                // divisor on the per-radius dB drop: factor=2.0 halves
-                // the drop (so -25 dB at radius instead of -50), factor=20
-                // (e.g. m06bell) means only ~-2.5 dB at radius. Default
-                // 1.0 = no effect.
-                float attenuation = amb.attenuationFactor > 0.0f
-                                    ? amb.attenuationFactor : 1.0f;
-                float volumeCb = gainCb
-                                 - (falloffPct * (5000.0f + gainCb)) / attenuation;
-                float linearVol = (volumeCb <= -10000.0f)
-                                  ? 0.0f
-                                  : std::pow(10.0f, volumeCb / 2000.0f);
-
-                // Apply ducking multiplier inline (not as a separate pass)
-                // to avoid compounding volume decay across frames.
-                float duck = mHost->currentDuckGain();
-                mHost->voiceSetLinearVolume(amb.handle, linearVol * duck);
-            }
-        } else {
-            // Out of range — stop voice to free the slot and DSP resources.
-            // Use a long fade (200 ms) so a graceful "aged out of audible
-            // radius" retirement is heard as a fade-out rather than a hard
-            // cut. Start of voice already ramps up smoothly (volume = 0
-            // at creation, distFactor evolves from 0 over the first few
-            // frames), so this restores symmetry on the trailing edge.
+        if (!inRange) {
+            // Out of range — fade out (mirror the smooth ramp-up at start).
             if (amb.handle != SOUND_HANDLE_INVALID) {
                 mHost->haltSound(amb.handle, /*fadeMs=*/200);
                 amb.handle = SOUND_HANDLE_INVALID;
             }
+            continue;
         }
+
+        const bool isEnvironmental = (amb.flags & AMB_ENVIRONMENTAL) != 0;
+        bool justCreated = false;
+
+        if (amb.handle == SOUND_HANDLE_INVALID) {
+            const bool isLooping = !(amb.flags & AMB_ONCE_ONLY);
+            // Decide VoiceClass BEFORE startVoice so createVoiceSource applies
+            // the per-class default directParams on the first audio callback
+            // (otherwise it reads silent initVoiceDSP defaults for ~21 ms).
+            const VoiceClass cls = isEnvironmental ? VoiceClass::Ambient
+                                                   : VoiceClass::Normal;
+
+            const SchemaEntry *schema = mHost->mSchemaParser
+                ? mHost->mSchemaParser->findSchema(amb.schemaName) : nullptr;
+
+            if (schema && !schema->samples.empty()) {
+                amb.handle = mHost->startVoice(amb.schemaName, schema->samples[0].name,
+                                               amb.position,
+                                               schema->playParams.priority,
+                                               isLooping, amb.objID, 0.0f, cls);
+            }
+            if (amb.handle == SOUND_HANDLE_INVALID) {
+                // Fallback: try the schema name as a raw sample.
+                std::fprintf(stderr,
+                    "[FALLBACK] AmbientSoundManager: schema '%s' on obj %d "
+                    "had no usable samples — trying raw sample of the same name\n",
+                    amb.schemaName.c_str(), amb.objID);
+                amb.handle = mHost->startVoice(amb.schemaName, amb.schemaName,
+                                               amb.position, mDefaultPriority,
+                                               isLooping, amb.objID, 0.0f, cls);
+            }
+            justCreated = mHost->voiceExists(amb.handle);
+
+            if (justCreated) {
+                // Per-source BFS-termination distance, matching the original
+                // Dark Engine's per-source attenuation:
+                //   SFX_MaxDist(gain) = (5000 + gain) / 55
+                //   m_MaxDistance     = SFX_MaxDist(gain) * atten_factor
+                // The implicit phantom-portal filter: a -3000cB ambient with
+                // atten_factor=1.0 gets ~36 ft, so BFS exhausts before
+                // reaching distant listeners through phantom chains.
+                constexpr float kAttenuationFactor = 55.0f;
+                const int   gainCb = schemaVolumeCb(mHost->mSchemaParser.get(),
+                                                   amb.schemaName);
+                const float gain   = static_cast<float>(gainCb);
+                const float atten  = (amb.attenuationFactor > 0.01f)
+                                     ? amb.attenuationFactor : 1.0f;
+                float sfxMaxDist = (5000.0f + gain) / kAttenuationFactor;
+                if (sfxMaxDist < 1.0f) sfxMaxDist = 1.0f;
+                mHost->voiceSetMaxAudibleDist(amb.handle, sfxMaxDist * atten);
+
+                // AMB_ENVIRONMENTAL: diffuse spatial blend (wind, room tone)
+                // — mixes HRTF with mono passthrough so the source feels
+                // ambient rather than pinpoint. Object-attached ambients
+                // keep 1.0 (full HRTF) so a generator hum still points at
+                // the generator. The audio thread reads the atomic every
+                // callback; one early callback may use 1.0 before this
+                // store lands, but ambients ramp up from volume 0 so the
+                // leakage is below audibility.
+                if (isEnvironmental) {
+                    mHost->voiceSetSpatialBlendOverride(
+                        amb.handle, mEnvironmentalSpatialBlend);
+                }
+
+                // Fan out an emission event so AI hearing observes the new
+                // ambient. gainDb = AmbientHack override + schema-authored
+                // (both centibels, additive) — matches the player-audible
+                // gain in the volume formula below.
+                SoundEmissionEvent ev{};
+                ev.emitterObjID = amb.objID;
+                ev.position     = amb.position;
+                ev.schemaName   = amb.schemaName;
+                ev.soundType    = 0;  // ambients aren't AI-typed
+                ev.baseRange    = amb.radius;
+                ev.gainDb       = static_cast<float>(amb.volume + gainCb);
+                mHost->publishSoundEmission(ev);
+            }
+        }
+
+        // Just-created voices stay at 0 — silent defaults in initVoiceDSP
+        // hold iplDirectEffectApply silent until the sim provides real
+        // occlusion/distance data next frame.
+        if (justCreated || amb.handle == SOUND_HANDLE_INVALID)
+            continue;
+        if (!mHost->voiceExists(amb.handle)) {
+            amb.handle = SOUND_HANDLE_INVALID;
+            continue;
+        }
+
+        // Distance-attenuated volume, original engine formula:
+        //   vol_cb       = gain - falloffPct * (5000 + gain) / atten_factor
+        //   falloffPct   = (d/r)   linear (default), (d/r)^4 SHARP
+        //   linearVol    = 10^(vol_cb / 2000)
+        // At d=0 vol_cb = gain; at d=radius vol_cb = gain - (5000+gain)/atten
+        // (= -50 dB for atten=1, gain=0). AMB_NO_FADE forces linear regardless
+        // of schema's SHARP flag — designer explicitly tagged "no fade".
+        const float falloffDist = mHost->voiceFalloffDistance(amb.handle, dist);
+        const bool  useSharp    = amb.isSharp && !(amb.flags & AMB_NO_FADE);
+        const FalloffCurve curve = useSharp ? FalloffCurve::Quartic
+                                            : FalloffCurve::Linear;
+        const float falloffPct = AmbientVolumeModel::computeFalloff(
+            falloffDist, /*inner=*/0.0f, /*outer=*/amb.radius, curve);
+
+        // Combine schema-authored gain with the per-object AmbientHack override
+        // (both centibels — additive = multiplicative on linear amplitudes).
+        // Without this, schemas authored at -1700cB (≈-17dB) play at unity.
+        const float gainCb = static_cast<float>(
+            amb.volume + schemaVolumeCb(mHost->mSchemaParser.get(), amb.schemaName));
+        // Per-schema attenuation factor (P$SchAttFac) divides the per-radius
+        // dB drop. Default 1.0 = original (-50 dB at radius for gain=0).
+        const float attenuation = amb.attenuationFactor > 0.0f
+                                  ? amb.attenuationFactor : 1.0f;
+        const float volumeCb = gainCb - (falloffPct * (5000.0f + gainCb)) / attenuation;
+        const float linearVol = centibelsToLinear(volumeCb);
+
+        // Ducking applied inline so it doesn't compound across frames.
+        mHost->voiceSetLinearVolume(amb.handle, linearVol * mHost->currentDuckGain());
     }
 }
 
 //------------------------------------------------------
 void AmbientSoundManager::updateSpotAmbientVolumes()
 {
-    // Per-frame envelope evaluation and voice lifecycle for spot ambients.
-    // Mirrors updateAmbientVolumes' start/stop/update pattern but uses the
-    // hard inner/outer envelope (P$SpotAmb) instead of the radius-based
-    // SHARP/linear curve.
-    //
-    // Envelope (per the original engine):
-    //   d <= inner          → volume = level
-    //   inner < d < outer   → volume = level * (outer - d) / (outer - inner)
-    //   d >= outer          → volume = 0
-    //
-    // `level` is interpreted as a millibel gain (same convention as
-    // AmbientSound::volume). Positive values are clamped to unity by
-    // schemaVolumeToLinear; negative values attenuate. When envVol > 0 a
-    // voice is started/maintained; at envVol == 0 (d ≥ outer) the voice
-    // is halted with a short fade.
+    // Per-frame envelope evaluation + lifecycle for P$SpotAmb. Uses the
+    // hard inner/outer envelope:
+    //   d <= inner → volume = level
+    //   in band   → volume = level * (outer - d) / (outer - inner)
+    //   d >= outer → volume = 0
+    // `level` is millibel gain (same convention as AmbientSound::volume).
     if (mSpotAmbients.empty())
         return;
 
-    // Throttle the diagnostic log so it doesn't spam every frame.
+    // Diagnostic log throttle.
     static float spotDebugTimer = 0.0f;
-    spotDebugTimer += 1.0f / 60.0f;  // rough per-frame increment
-    bool emitLog = (spotDebugTimer > 5.0f);
+    spotDebugTimer += 1.0f / 60.0f;
+    const bool emitLog = (spotDebugTimer > 5.0f);
     if (emitLog) spotDebugTimer = 0.0f;
 
     int audible = 0;
     int playing = 0;
     for (auto &se : mSpotAmbients) {
-        float d = glm::distance(mHost->mListenerPos, se.position);
+        const float d = glm::distance(mHost->mListenerPos, se.position);
 
-        // Unified envelope: Linear curve in [inner..outer], converted to
-        // the level-domain target by complement (target = level * (1 - pct))
-        // so d == inner → level, d == outer → 0. Bit-for-bit equivalent to
-        // the previous `level * (outer - d) / (outer - inner)` expression.
-        float falloffPct = AmbientVolumeModel::computeFalloff(
+        // Unified envelope (Linear curve), converted to level-domain target
+        // by complement: target = level * (1 - pct).
+        const float falloffPct = AmbientVolumeModel::computeFalloff(
             d, se.inner, se.outer, FalloffCurve::Linear);
-        float envVol = se.level * (1.0f - falloffPct);
+        const float envVol = se.level * (1.0f - falloffPct);
 
-        if (envVol > 0.0f) ++audible;
-
-        if (envVol > 0.0f) {
-            // In range — ensure a voice is playing and update its volume.
-            bool justCreated = false;
-            if (se.handle == SOUND_HANDLE_INVALID) {
-                if (se.schemaName.empty()) {
-                    // Unresolved schema — can't start anything. Skip
-                    // (already counted in the load-time diagnostic).
-                    continue;
-                }
-                if (!mHost->mSchemaParser) continue;
-                const SchemaEntry *schema =
-                    mHost->mSchemaParser->findSchema(se.schemaName);
-                if (!schema || schema->samples.empty()) continue;
-                const SchemaSample &sample = schema->samples[0];
-                // Spot ambients are looping by definition (they describe a
-                // sustained sound bubble around an emitter). Use the
-                // Ambient voice class so they get the same diffuse
-                // spatialBlend treatment as room-attached ambients.
-                bool isLooping = true;
-                VoiceClass cls = VoiceClass::Ambient;
-                // Start at volume 0 — the volume is set below on the same
-                // frame (the silent-defaults-until-occlusion concern that
-                // applies to AmbientHack-style ambients doesn't apply
-                // here: the envelope has already established audibility).
-                se.handle = mHost->startVoice(se.schemaName, sample.name,
-                                              se.position,
-                                              schema->playParams.priority,
-                                              isLooping, se.objID, 0.0f, cls);
-                if (mHost->voiceExists(se.handle)) {
-                    justCreated = true;
-                    // Cap BFS propagation at the outer envelope — past
-                    // outer the source is silent anyway.
-                    mHost->voiceSetMaxAudibleDist(se.handle, se.outer);
-                    // Match AMB_ENVIRONMENTAL diffuse-spatialBlend
-                    // treatment so the source feels diffuse rather
-                    // than pinpoint.
-                    mHost->voiceSetSpatialBlendOverride(
-                        se.handle, mEnvironmentalSpatialBlend);
-                }
-            }
-
-            if (se.handle != SOUND_HANDLE_INVALID) {
-                if (!mHost->voiceExists(se.handle)) {
-                    // Voice died (e.g. priority eviction). Clear and let
-                    // the next frame attempt re-creation.
-                    se.handle = SOUND_HANDLE_INVALID;
-                    continue;
-                }
-                // Interpret envVol as a millibel gain (matches
-                // AmbientSound::volume convention). Combined with the
-                // schema's authored gain (same convention) — this restores
-                // schema attenuation that was silently dropped when only
-                // envVol drove the gain. See updateAmbientVolumes for the
-                // background. Apply duck multiplier inline, same as the
-                // AmbientHack path.
-                // Equivalent to the file-static schemaVolumeToLinear in
-                // AudioService.cpp — duplicated here to avoid widening
-                // the AudioService API surface. millibels → linear:
-                //   -1 (or 0+) = full volume, -10000 = silence,
-                //   otherwise  10^(volume/2000).
-                int schemaVolCb = 0;
-                if (mHost->mSchemaParser) {
-                    const SchemaEntry *sch =
-                        mHost->mSchemaParser->findSchema(se.schemaName);
-                    if (sch) schemaVolCb = sch->playParams.volume;
-                }
-                int volMb = static_cast<int>(envVol) + schemaVolCb;
-                float linearVol;
-                if (volMb >= 0)              linearVol = 1.0f;
-                else if (volMb <= -10000)    linearVol = 0.0f;
-                else                         linearVol = std::pow(10.0f, volMb / 2000.0f);
-                float duck = mHost->currentDuckGain();
-                mHost->voiceSetLinearVolume(se.handle, linearVol * duck);
-                if (!justCreated) ++playing;
-                else ++playing;
-            }
-        } else {
-            // Out of envelope — stop the voice if one is playing. Use a
-            // long fade so the trailing edge is graceful (mirrors the
-            // 200ms used in updateAmbientVolumes).
+        if (envVol <= 0.0f) {
+            // Out of envelope — fade out.
             if (se.handle != SOUND_HANDLE_INVALID) {
                 mHost->haltSound(se.handle, /*fadeMs=*/200);
                 se.handle = SOUND_HANDLE_INVALID;
             }
+            continue;
         }
+
+        ++audible;
+
+        bool justCreated = false;
+        if (se.handle == SOUND_HANDLE_INVALID) {
+            if (se.schemaName.empty()) continue;  // already counted at load
+            if (!mHost->mSchemaParser) continue;
+            const SchemaEntry *schema = mHost->mSchemaParser->findSchema(se.schemaName);
+            if (!schema || schema->samples.empty()) continue;
+
+            // Spot ambients are looping by definition + Ambient class for
+            // diffuse spatialBlend treatment.
+            se.handle = mHost->startVoice(se.schemaName, schema->samples[0].name,
+                                          se.position, schema->playParams.priority,
+                                          /*isLooping=*/true, se.objID, 0.0f,
+                                          VoiceClass::Ambient);
+            if (mHost->voiceExists(se.handle)) {
+                justCreated = true;
+                // Cap BFS at outer envelope — past outer the source is silent.
+                mHost->voiceSetMaxAudibleDist(se.handle, se.outer);
+                mHost->voiceSetSpatialBlendOverride(se.handle, mEnvironmentalSpatialBlend);
+            }
+        }
+
+        if (se.handle == SOUND_HANDLE_INVALID) continue;
+        if (!mHost->voiceExists(se.handle)) {
+            // Voice died (priority eviction) — clear, retry next frame.
+            se.handle = SOUND_HANDLE_INVALID;
+            continue;
+        }
+
+        // Combine envVol (millibel) with schema-authored gain (centibel).
+        const int schemaVolCb = schemaVolumeCb(mHost->mSchemaParser.get(), se.schemaName);
+        const int volMb = static_cast<int>(envVol) + schemaVolCb;
+        const float linearVol = milliBelIntToLinear(volMb);
+        mHost->voiceSetLinearVolume(se.handle, linearVol * mHost->currentDuckGain());
+        ++playing;
+        (void)justCreated;
     }
     if (emitLog && audible > 0) {
         AUDIO_LOG("AudioService: [SPOT_AMB] %d/%zu spot ambient(s) audible "

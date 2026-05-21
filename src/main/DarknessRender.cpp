@@ -2589,6 +2589,17 @@ static void registerConsoleSettings(
         },
         "Runtime multiplier on baked-pathing gain (1=identity, >1=louder through doorways)");
 
+    dbgConsole.addFloat("pathing_update_interval", 0.0f, 1.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getPathingUpdateInterval() : 0.1f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setPathingUpdateInterval(v);
+        },
+        "Min seconds between Steam Audio pathing-sim updates (0=every frame, 0.1=10 Hz default)");
+
     // Bake probes: set to "on" to trigger re-baking.
     // The action runs on a background thread with a progress-bar overlay
     // (same helper as the first-run auto-bake) so the window stays
@@ -3806,6 +3817,9 @@ int main(int argc, char *argv[]) {
         audioSvc->setProbeHeightFt(cfg.audioProbeHeightFt);
         audioSvc->setProbeElevations(cfg.audioProbeElevations);
         audioSvc->setProbePortalRings(cfg.audioProbePortalRings);
+        audioSvc->setProbeMinWallClearanceFt(cfg.audioProbeMinWallClearanceFt);
+        audioSvc->setProbeElevationSparsityMul(cfg.audioProbeElevationSparsityMul);
+        audioSvc->setProbeGlobalDedupRadiusFt(cfg.audioProbeGlobalDedupRadiusFt);
 
         // -- audio.occlusion --
         audioSvc->setOcclusionRadius(cfg.occlusionRadius);
@@ -3823,6 +3837,11 @@ int main(int argc, char *argv[]) {
         audioSvc->setPropMaxPaths(cfg.propMaxPaths);
         audioSvc->setPropMaxPathDiff(cfg.propMaxPathDiff);
         audioSvc->setPathingGainScale(cfg.pathingGainScale);
+        audioSvc->setPathingBlockingScale(cfg.pathingBlockingScale);
+        audioSvc->setPathingUpdateInterval(cfg.pathingUpdateInterval);
+        audioSvc->setPathingGainBandWeights(cfg.pathingGainWeightLow,
+                                            cfg.pathingGainWeightMid,
+                                            cfg.pathingGainWeightHigh);
 
         // -- audio.spatialization --
         audioSvc->setHRTFVolume(cfg.hrtfVolume);
@@ -4724,6 +4743,21 @@ int main(int argc, char *argv[]) {
                 if (audioForBlocking)
                     audioForBlocking->setBlockingFactor(room1, room2, factor);
             });
+
+        // Register every door's audio geometry with the acoustic scene and
+        // hook the per-frame transform callback. This is the geometry-aware
+        // door blocking pipeline: Steam Audio's pathing validation rejects
+        // baked path edges that intersect a closed door's OBB. Done after
+        // buildAcousticScene + DoorSystem::init so the scene exists and
+        // every door has its world transform settled.
+        if (audioForBlocking) {
+            auto doorAudioGeom = doorSystem.getAudioGeometryInventory();
+            audioForBlocking->registerDoorGeometry(doorAudioGeom);
+            doorSystem.setAudioMeshUpdateCallback(
+                [audioForBlocking](int32_t objID, const Darkness::Matrix4 &xform) {
+                    audioForBlocking->setDoorTransform(objID, xform);
+                });
+        }
     }
 
     // Apply initial blocking for all doors that start closed.

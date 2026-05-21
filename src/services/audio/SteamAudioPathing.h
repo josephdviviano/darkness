@@ -23,40 +23,46 @@
 #define __STEAM_AUDIO_PATHING_H
 
 /// @file SteamAudioPathing.h
-/// Pure helpers for mapping Steam Audio's 3-band path attenuation
-/// (`IPLPathingOutputs::eqCoeffs[3]`) into the engine's per-voice DSP
-/// state (portalAttenuation + portalBlocking) plus the runtime closed-
-/// door blocking layer.
-///
-/// Kept header-only so they can be unit-tested without standing up a
-/// full Steam Audio simulator / acoustic scene — the live integration in
-/// AudioService.cpp consumes the same functions.
-///
-/// Both inputs and outputs are in [0, 1]:
-///   eqCoeffs[i] = 1.0 → unobstructed band, 0.0 → fully attenuated band
-///   gain        = scalar voice gain folded into portalAttenuation
-///   blocking    = scalar in [0,1] folded into portalBlocking, where the
-///                 audio callback maps it to LPF cutoff via
-///                 `cutoff_hz = openHz * pow(blockedHz/openHz, blocking)`
-///
-/// See PLAN.PLAYER_AUDIO_STEAM_PATHING.md "eqCoeffs → audio mapping" for
-/// the rationale behind the weighting.
+/// Pure helpers mapping Steam Audio's 3-band path attenuation
+/// (IPLPathingOutputs::eqCoeffs) into per-voice DSP state
+/// (portalAttenuation + portalBlocking) plus runtime door-closed blocking.
+/// Header-only so it can be unit-tested without a live Steam Audio scene.
+/// All values in [0,1]: eqCoeffs[i] = 1 unobstructed, 0 fully blocked.
+
+#include "AudioUnits.h"
 
 #include <algorithm>
 #include <cmath>
 
 namespace Darkness {
 
-/// Result of mapping Steam Audio's pathing outputs into the engine's
-/// per-voice DSP gain + LPF-blocking values.
+/// Pathing-solver ray-visibility threshold. Used by BOTH bake
+/// (IPLPathBakeParams::threshold) and runtime
+/// (IPLSimulationInputs::visThreshold) — they must agree or marginal
+/// paths the bake accepted get rejected at runtime. Matches Steam
+/// Audio's Unity default. Lower values (e.g. 0.01) admit single stray
+/// rays through mesh seams, producing the "audio passes through walls"
+/// pathology.
+constexpr float kPathingVisThreshold = 0.1f;
+
+/// Probe-influence visibility radius (meters). Used by BOTH bake
+/// (IPLPathBakeParams::radius) and runtime
+/// (IPLSimulationInputs::visRadius); runtime values below the bake
+/// radius cause iplSimulatorRunPathing to fail finding an entry probe
+/// for sources placed off-probe, returning eqCoeffs=[0,0,0] (full
+/// pathing failure).
+inline float pathingVisRadiusMeters(float spacingFt)
+{
+    return spacingFt * kFeetToMeters;
+}
+
 struct PathingDspMapping {
-    float gain;     ///< Scalar gain in [0,1] for portalAttenuation
-    float blocking; ///< Scalar in [0,1] for portalBlocking → LPF cutoff
+    float gain;     ///< scalar gain → portalAttenuation
+    float blocking; ///< [0,1] → portalBlocking → LPF cutoff
 };
 
-/// Clamp a single eqCoeff band to [0,1], turning NaN/inf into 1.0
-/// (treat ill-formed bake outputs as fully audible so the voice stays
-/// hearable rather than silently dying).
+/// Clamp a band to [0,1]; NaN/inf → 1.0 (treat ill-formed bake outputs
+/// as audible rather than silently muting).
 inline float sanitizeEqCoeff(float v)
 {
     if (!std::isfinite(v)) return 1.0f;
@@ -65,27 +71,25 @@ inline float sanitizeEqCoeff(float v)
     return v;
 }
 
-/// Map a raw `eqCoeffs[3]` triple plus an optional door blocking factor
-/// (room-pair lookup, 0 fully open / 1 fully closed) to the per-voice
-/// portalAttenuation + portalBlocking pair.
+/// Map eqCoeffs[3] + door blocking factor (0 open / 1 closed) to per-voice
+/// (gain, blocking). Door multiplies all bands by (1-doorBlocking).
 ///
-/// The door factor multiplies onto all three bands as a `(1 - factor)`
-/// passthrough so a fully closed door collapses the bands toward 0 (LPF
-/// pegged at blockedHz, gain pegged at silence). Open doors are
-/// passthrough — `doorBlocking == 0.0f` leaves eqCoeffs untouched.
-///
-/// `gainScale` is a runtime multiplier on the final scalar gain only
-/// (NOT on the eqCoeffs themselves, so it doesn't affect the LPF
-/// blocking factor). 1.0 = identity. Use values > 1 to make
-/// through-portal sound louder than the bake would imply when the
-/// baked eqCoeffs feel under-cooked — physically unrealistic but
-/// useful for compensating sparse probe coverage or a too-strict
-/// pathing visibility threshold without paying for a re-bake.
+/// `gainScale` multiplies the scalar gain only (not eqCoeffs → not the
+/// LPF). 1.0 = identity. Use >1 to compensate sparse probe coverage.
+/// `blockingScale` multiplies the LPF blocking factor only; 0 = LPF
+/// never closes, 1 = legacy (`1 - eqHigh`).
+/// `gainBandWeights` controls how the 3 bands sum into gain. Default
+/// {0.25, 0.50, 0.25} is mid-heavy (roughly A-weighted). Sums != 1 act
+/// as flat boost/cut.
 inline PathingDspMapping eqCoeffsToDspMapping(float eqLow,
                                               float eqMid,
                                               float eqHigh,
                                               float doorBlocking,
-                                              float gainScale = 1.0f)
+                                              float gainScale = 1.0f,
+                                              float blockingScale = 1.0f,
+                                              float gainWeightLow  = 0.25f,
+                                              float gainWeightMid  = 0.50f,
+                                              float gainWeightHigh = 0.25f)
 {
     eqLow  = sanitizeEqCoeff(eqLow);
     eqMid  = sanitizeEqCoeff(eqMid);
@@ -94,6 +98,16 @@ inline PathingDspMapping eqCoeffsToDspMapping(float eqLow,
     if (doorBlocking < 0.0f)             doorBlocking = 0.0f;
     else if (doorBlocking > 1.0f)        doorBlocking = 1.0f;
     if (!std::isfinite(gainScale) || gainScale < 0.0f) gainScale = 1.0f;
+    if (!std::isfinite(blockingScale) || blockingScale < 0.0f) blockingScale = 1.0f;
+    if (blockingScale > 1.0f) blockingScale = 1.0f;
+    // Clamp weights to [0,1]; sum can still be 0..3 (intentional — callers
+    // use >1 sums for boost effects).
+    if (!std::isfinite(gainWeightLow)  || gainWeightLow  < 0.0f) gainWeightLow  = 0.0f;
+    if (!std::isfinite(gainWeightMid)  || gainWeightMid  < 0.0f) gainWeightMid  = 0.0f;
+    if (!std::isfinite(gainWeightHigh) || gainWeightHigh < 0.0f) gainWeightHigh = 0.0f;
+    if (gainWeightLow  > 1.0f) gainWeightLow  = 1.0f;
+    if (gainWeightMid  > 1.0f) gainWeightMid  = 1.0f;
+    if (gainWeightHigh > 1.0f) gainWeightHigh = 1.0f;
 
     if (doorBlocking > 0.0f) {
         const float passFactor = 1.0f - doorBlocking;
@@ -103,8 +117,10 @@ inline PathingDspMapping eqCoeffsToDspMapping(float eqLow,
     }
 
     PathingDspMapping out{};
-    out.gain     = (0.25f * eqLow + 0.50f * eqMid + 0.25f * eqHigh) * gainScale;
-    out.blocking = 1.0f - eqHigh;
+    out.gain     = (gainWeightLow  * eqLow
+                  + gainWeightMid  * eqMid
+                  + gainWeightHigh * eqHigh) * gainScale;
+    out.blocking = (1.0f - eqHigh) * blockingScale;
     return out;
 }
 
