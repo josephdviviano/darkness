@@ -466,6 +466,16 @@ public:
     void setReflectionThrottle(int n);
     int  getReflectionThrottle() const;
 
+    // Runtime IR-length clamp (milliseconds). 0 = disabled. >0 = cap the
+    // per-voice `params.irSize` handed to iplReflectionEffectApply to this
+    // value (converted to samples at the reflection rate). Steam Audio
+    // convolves the first irSize samples of the effect's IR, so this
+    // directly reduces convolution CPU at apply time without re-baking.
+    // Useful for A/B-testing the perceptual cost of shorter IRs before
+    // committing to a re-bake at a smaller bake.duration.
+    void  setRuntimeIrClampMs(float ms);
+    float getRuntimeIrClampMs() const { return mRuntimeIrClampMs; }
+
     // [REFLECTIONS] Cap on total reverb voices (realtime + baked combined).
     // Every reverb voice runs a per-source convolution regardless of mode,
     // so this is the worker-pool CPU governor. 0 disables all reverb
@@ -1248,6 +1258,12 @@ private:
     float mBakeDuration            = 4.0f;  ///< Bake IR duration in seconds (>= realtime)
     int   mBakeDiffuseSamples      = 256;   ///< Bake diffuse samples (32–4096)
     int   mBakeAmbisonicsOrder     = 1;     ///< Bake ambisonic order (0–3)
+
+    /// Runtime IR-length clamp in milliseconds (0 = disabled). Live-tunable
+    /// CPU knob — applied to `slot.params.irSize` per-voice before
+    /// iplReflectionEffectApply. Cheaper than re-baking when sweeping for
+    /// the shortest acceptable IR.
+    float mRuntimeIrClampMs        = 0.0f;
 
     int mReverbVoices         = DEFAULT_REVERB_VOICES;
     // Subset of mReverbVoices that runs realtime ray-traced IRs. 0 =

@@ -108,6 +108,13 @@ struct RenderConfig {
     int   bakeDiffuseSamples      = 256;   // bake diffuse samples (32–4096)
     int   bakeAmbisonicsOrder     = 1;     // bake ambisonic order (0–3)
 
+    // Runtime IR-length clamp (0 = disabled). Live A/B knob for the cost
+    // of per-voice convolution: capped irSize directly reduces
+    // iplReflectionEffectApply CPU. Independent of bake.duration —
+    // useful for finding the shortest acceptable IR before committing
+    // to a re-bake.
+    float runtimeIrClampMs        = 0.0f;
+
     // -- audio.probes: baked-probe grid generation --
     // Spacing/height feed bakeProbes(); a denser grid produces smoother reverb
     // interpolation at the cost of ~(spacing_old/spacing_new)^2 disk space and
@@ -470,6 +477,16 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                         if (cfg.bakeAmbisonicsOrder < 0) cfg.bakeAmbisonicsOrder = 0;
                         if (cfg.bakeAmbisonicsOrder > 3) cfg.bakeAmbisonicsOrder = 3;
                     }
+                }
+
+                // [REFLECTIONS] Runtime IR-length clamp (ms). 0 = disabled.
+                // >0 = cap per-voice convolution length to this value at
+                // iplReflectionEffectApply time. A/B knob for CPU cost vs
+                // perceptual quality before committing to a re-bake.
+                if (refl["runtime_ir_clamp_ms"]) {
+                    cfg.runtimeIrClampMs = refl["runtime_ir_clamp_ms"].as<float>();
+                    if (cfg.runtimeIrClampMs < 0.0f)    cfg.runtimeIrClampMs = 0.0f;
+                    if (cfg.runtimeIrClampMs > 4000.0f) cfg.runtimeIrClampMs = 4000.0f;
                 }
             }
 

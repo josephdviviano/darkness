@@ -224,6 +224,14 @@ audio:
       diffuse_samples: 1024      # bake diffuse samples (32–4096)
       ambisonics_order: 1        # bake ambisonic order (0–3); match runtime ambisonics_order to skip the downmix step at probe-interp time
 
+    # [REFLECTIONS] Runtime IR-length clamp (ms). 0 = disabled. >0 = cap
+    # per-voice iplReflectionEffectApply convolution to the first N ms of
+    # the IR (does NOT require a re-bake). Direct CPU saver — convolution
+    # cost scales roughly linearly in irSize. Useful for A/B-testing the
+    # perceptual cost of shorter IRs before committing to a smaller
+    # bake.duration. Applied uniformly to both realtime and baked voices.
+    runtime_ir_clamp_ms: 0       # (0–4000; 0 disables the clamp)
+
   probes:
     # Baked-probe grid parameters. Probes are points where Steam Audio
     # samples reflection IRs at bake time; the runtime interpolates between
