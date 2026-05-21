@@ -687,6 +687,16 @@ static std::atomic<uint32_t> sEngineSampleRate{48000};
 /// at the slot-assignment call site.
 static std::atomic<uint32_t> sMaxSubSources{4};
 
+/// Runtime IR-length clamp (samples at the reflection rate). 0 = disabled
+/// (use whatever irSize the simulator / baked probe produced). >0 = cap
+/// per-voice `slot.params.irSize` to this value before handing it to
+/// iplReflectionEffectApply. Steam Audio convolves with the first N
+/// samples of the IR, so a smaller value means cheaper convolution per
+/// voice — useful for A/B-testing the perceptual cost of shorter IRs
+/// without re-baking. Set from AudioService::setRuntimeIrClampMs (which
+/// converts ms → samples using the reflection sample rate).
+static std::atomic<int> sRuntimeIrClampSamples{0};
+
 // ── Steam Audio per-voice gain-staging meters ──
 //
 // Aggregated across ALL active per-voice DSP nodes (so a single hot voice
@@ -1459,6 +1469,20 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 slot.effect = node->reflectionEffect;
                 slot.validityToken = node->validityToken;  // shared_ptr copy — prevents use-after-free
                 slot.params = node->reflectionParams;
+                // Runtime IR clamp: cap the convolution length to a
+                // configurable maximum (in reflection-rate samples). 0 =
+                // disabled. Steam Audio convolves the first irSize samples
+                // of the effect's IR, so reducing irSize directly reduces
+                // per-voice CPU at iplReflectionEffectApply time. Both
+                // baked-probe and realtime-simulated voices flow through
+                // here, so a single knob covers both. Live-tunable from
+                // setRuntimeIrClampMs (sampled atomically every frame).
+                {
+                    int clampSamples = sRuntimeIrClampSamples.load(
+                        std::memory_order_relaxed);
+                    if (clampSamples > 0 && slot.params.irSize > clampSamples)
+                        slot.params.irSize = clampSamples;
+                }
                 slot.reflFrameSize = node->reflectionFrameSize;
                 slot.active = true;
                 slot.isFootstepDiag = node->isFootstepDiag;  // propagate for worker log
@@ -2750,6 +2774,25 @@ void AudioService::setHalfRateReflections(bool enabled)
 {
     if (mReflectionSim) mReflectionSim->setRateDivisor(enabled ? 2 : 1);
 }
+void AudioService::setRuntimeIrClampMs(float ms)
+{
+    // Clamp to [0, 4000] — 4 s is the longest IR Steam Audio supports in
+    // any of our paths, so values beyond that are a typo. 0 disables.
+    mRuntimeIrClampMs = std::max(0.0f, std::min(ms, 4000.0f));
+    // Convert ms → reflection-rate samples and publish to the atomic the
+    // audio thread reads at staging-slot setup. If the reflection sample
+    // rate isn't known yet (call before initReflectionPipeline), the
+    // conversion uses 0 → clamp disabled until the pipeline init re-runs
+    // this conversion via a second setRuntimeIrClampMs from the config
+    // pump on subsequent loop steps.
+    int samples = 0;
+    if (mReflectionSampleRate > 0 && mRuntimeIrClampMs > 0.0f) {
+        samples = static_cast<int>(0.001f * mRuntimeIrClampMs
+            * static_cast<float>(mReflectionSampleRate));
+        if (samples < 1) samples = 1;
+    }
+    sRuntimeIrClampSamples.store(samples, std::memory_order_relaxed);
+}
 bool AudioService::getHalfRateReflections() const
 {
     return mReflectionSim ? mReflectionSim->getRateDivisor() >= 2 : true;
@@ -3186,6 +3229,13 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         int rateDivisor = mReflectionSim ? mReflectionSim->getRateDivisor() : 2;
         mReflectionSampleRate = mDeviceSampleRate / static_cast<uint32_t>(rateDivisor);
         mReflectionFrameSize = mFrameSize / static_cast<uint32_t>(rateDivisor);
+        // Re-publish the runtime IR clamp now that mReflectionSampleRate
+        // is known. The setter call from RenderConfig wiring at startup
+        // ran before this, when sample rate was still 0 → the atomic
+        // would have been left at 0 (clamp disabled) even if a non-zero
+        // ms value was configured. Re-running with the same ms now
+        // converts to a real sample count.
+        setRuntimeIrClampMs(mRuntimeIrClampMs);
 
         // ── Reverb-thread budget split ──
         //

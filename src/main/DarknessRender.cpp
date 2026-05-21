@@ -2419,6 +2419,17 @@ static void registerConsoleSettings(
         },
         "Realtime reverb tail length in seconds (must exceed hybrid_transition_time)");
 
+    dbgConsole.addFloat("refl_runtime_ir_clamp_ms", 0.0f, 4000.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getRuntimeIrClampMs() : 0.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setRuntimeIrClampMs(v);
+        },
+        "Cap per-voice convolution length (ms). 0 = use baked length. Live CPU knob.");
+
     dbgConsole.addFloat("refl_throttle", 1.0f, 32.0f,
         []() {
             auto svc = GET_SERVICE(Darkness::AudioService);
@@ -3785,6 +3796,7 @@ int main(int argc, char *argv[]) {
         audioSvc->setBakeDuration(cfg.bakeDuration);
         audioSvc->setBakeDiffuseSamples(cfg.bakeDiffuseSamples);
         audioSvc->setBakeAmbisonicsOrder(cfg.bakeAmbisonicsOrder);
+        audioSvc->setRuntimeIrClampMs(cfg.runtimeIrClampMs);
 
         // -- audio.probes --
         // Bake-time grid parameters. Applied before the auto-bake on first
