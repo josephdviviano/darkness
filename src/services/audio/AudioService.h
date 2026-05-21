@@ -241,8 +241,8 @@ enum AmbientHackFlags : uint32_t {
 
 /// AmbientSound and SpotAmbient structs are owned by AmbientSoundManager
 /// (see AmbientSoundManager.h). The manager is responsible for parsing
-/// P$AmbientHack / P$SpotAmb, per-frame voice lifecycle, and applying the
-/// unified AmbientVolumeModel.
+/// P$AmbientHack / P$SpotAmb and per-frame voice lifecycle. Loudness
+/// shaping is delegated to Steam Audio's per-voice DSP chain.
 
 /// Maximum simultaneous active voices (matches Dark Engine's limit)
 constexpr int MAX_ACTIVE_VOICES = 64;
@@ -732,6 +732,11 @@ public:
     // less like they emit from a single point. Object-attached ambients
     // (no AMB_ENVIRONMENTAL flag) ignore this and stay at full HRTF.
     void setAmbEnvironmentalSpatialBlend(float b);
+    /// Global linear volume multiplier on every ambient + spot-ambient
+    /// voice (1.0 = no change). Compensates for the loudness re-baseline
+    /// introduced when Steam Audio became the sole player-audio propagation
+    /// authority. Tuned by ear at the YAML layer.
+    void setAmbGlobalVolumeScale(float s);
 
     // ── Performance tuning (some MUST be set BEFORE buildAcousticScene) ──
     void setMaxActiveVoices(int n) { mMaxActiveVoicesCfg = std::max(8, std::min(n, 256)); }
@@ -1120,12 +1125,6 @@ private:
     //
     // Returns true iff `handle` resolves to a live voice in the pool.
     bool voiceExists(SoundHandle handle) const;
-    // Falloff distance to use for ambient volume computation: prefers the
-    // BFS `cachedProp.effectiveDistance` when reached, otherwise returns
-    // `fallbackEuclideanDist`. Returns the input fallback when the voice
-    // is not found (no caller currently relies on that path, but it keeps
-    // the helper total).
-    float voiceFalloffDistance(SoundHandle handle, float fallbackEuclideanDist) const;
     // Set the voice's per-source BFS-termination distance. Used by the
     // ambient/spot loaders to bake the per-source max audible distance.
     void voiceSetMaxAudibleDist(SoundHandle handle, float maxDist);

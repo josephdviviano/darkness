@@ -3086,6 +3086,12 @@ void AudioService::setAmbEnvironmentalSpatialBlend(float b)
             std::max(0.0f, std::min(b, 1.0f)));
 }
 
+void AudioService::setAmbGlobalVolumeScale(float s)
+{
+    if (mAmbientManager)
+        mAmbientManager->setGlobalVolumeScale(std::max(0.0f, std::min(s, 4.0f)));
+}
+
 //------------------------------------------------------
 // Voice-state accessors used by AmbientSoundManager. Defined here (rather
 // than inline in the header) so AmbientSoundManager.cpp doesn't need to
@@ -3093,47 +3099,6 @@ void AudioService::setAmbEnvironmentalSpatialBlend(float b)
 bool AudioService::voiceExists(SoundHandle handle) const
 {
     return mVoicePool && mVoicePool->exists(handle);
-}
-
-float AudioService::voiceFalloffDistance(SoundHandle handle,
-                                         float fallbackEuclideanDist) const
-{
-    if (!mVoicePool) return fallbackEuclideanDist;
-    const ActiveVoice *v = mVoicePool->find(handle);
-    if (!v) return fallbackEuclideanDist;
-    if (v->cachedProp.reached)
-        return v->cachedProp.effectiveDistance;
-
-    // BFS reported the source unreachable via the portal graph. Returning
-    // Euclidean here was the original "safe" fallback, but it OVER-amplifies
-    // the voice: a transformer hum inside a sealed building is genuinely
-    // unreachable, yet the listener-to-source line-of-sight distance can be
-    // short, producing near-full ambient volume against a heavily-blocked
-    // DSP chain → audible modulation as Steam Audio's pathing solver flickers
-    // between blocked-path eqCoeffs. Match the failure direction to reality:
-    // unreachable = silent, not artificially loud.
-    //
-    // Returning a "huge" distance pushes AmbientVolumeManager's falloff curve
-    // past amb.radius (clamped to 1.0 → -50 dB ish via the centibel formula),
-    // which is the right physical answer: if there's no portal path, sound
-    // shouldn't reach the listener.
-    //
-    // Logged loudly per project's "no silent fallbacks" policy. Rate-limited
-    // by handle to one [FALLBACK] line on the first transition to unreachable
-    // — recurring per-frame would spam the log without adding signal.
-    {
-        static thread_local std::unordered_set<SoundHandle> sLoggedUnreached;
-        if (sLoggedUnreached.insert(handle).second) {
-            std::fprintf(stderr,
-                "[FALLBACK] voiceFalloffDistance: voice h=%d '%s' BFS reported "
-                "unreachable — returning silencing distance instead of "
-                "Euclidean %.1f ft (avoids amplifying through-wall ambient "
-                "via fallback)\n",
-                handle, v->schemaName.c_str(), fallbackEuclideanDist);
-        }
-    }
-    constexpr float kUnreachableSilencingDistance = 1.0e6f;
-    return kUnreachableSilencingDistance;
 }
 
 void AudioService::voiceSetMaxAudibleDist(SoundHandle handle, float maxDist)
@@ -4951,143 +4916,51 @@ void AudioService::loopStep(float deltaTime)
                 // callback after createVoiceSource.
                 voice->dspNode.skipAttenuation = false;
 
-                // Decide which propagation backend drives this voice this
-                // frame. Player audio (everything in mVoicePool) uses Steam
-                // Audio's pathing simulator when the probe batch is attached
-                // to the direct sim AND mProbePathingEnabled is true — gives
-                // a smooth, continuous 3-band eqCoeffs envelope instead of
-                // the room-graph BFS's discrete same-room/cross-room snap
-                // at portal crossings. Player-emitted voices (footsteps,
-                // landings) are excluded — source is approximately the
-                // listener, so the pathing graph collapses to a self-loop
-                // with eqCoeffs ≡ 1.0 anyway, and running it would just
-                // churn the same direct sim. Setting
-                // audio.propagation.probe_pathing: false in YAML (or
-                // toggling probe_pathing in the debug console) flips this
-                // off at runtime, forcing the BFS branch back — used for
-                // A/B testing the two backends without re-baking probes or
-                // restarting the renderer. AI hearing is unaffected
-                // regardless: AIHearingService still calls
-                // RoomService::propagateSoundPath directly (room-BFS), and
-                // its discrete heard/not-heard semantics tolerate the BFS's
-                // step change.
+                // Player-audio portal-eq backend toggle. When true, Steam
+                // Audio's pathing simulator drives portalAttenuation /
+                // portalBlocking via 3-band eqCoeffs. When false (legacy
+                // mode), the room-BFS branch below fills the same fields
+                // from effectiveDistance/realDistance. The non-pathing
+                // Steam Audio DSP chain (direct effect, HRTF, reflections,
+                // air absorption, occlusion/transmission) runs in both
+                // modes — this gate is only the portal-eq source. AI
+                // hearing is unaffected: AIHearingService calls
+                // RoomService::propagateSoundPath directly, independent
+                // of this gate. Player-emitted voices (footsteps, landings)
+                // sit in the same room as the listener by definition, so
+                // both backends short-circuit on the playerEmitted flag.
                 bool useSteamAudioPathing = mDirectProbeBatchAdded
                                           && mProbePathingEnabled
                                           && !voice->playerEmitted
                                           && !voice->skipPortalRouting;
 
-                // Run portal propagation to determine reachability and path.
-                // Throttled: nearby voices update every frame, distant voices
-                // every 8-16 frames. Matching the original engine's adaptive
-                // update frequency. Uses cached result between updates.
-                //
-                // Player-emitted voices (footsteps, landings) are always in
-                // the same "room" as the listener by definition — the source
-                // IS the player. Skipping portal propagation entirely avoids
-                // head↔feet straddling: foot-level sound emitter vs head-level
-                // listener can flicker into different rooms at floor or ceiling
-                // boundaries, falsely tripping isCrossRoom and routing the
-                // voice through a portal anchor with door-LPF on the dry path.
-                // Direct path stays at full volume; baked reflection routing
-                // handles the wet path independently. This skip is the single
-                // defense against that flicker — there is no longer a
-                // belt-and-suspenders distance threshold below.
-                // BFS gate previously included `!useSteamAudioPathing`, which
-                // disabled the entire room-graph propagation whenever Steam
-                // Audio pathing was active. That made sense in the original
-                // "SA replaces the BFS" design, but it overshoots: Steam
-                // Audio produces eqCoeffs (3-band DSP attenuation) consumed
-                // by portalAttenuation / portalBlocking, NOT a portal-graph
-                // effective distance. AmbientSoundManager's falloff curve
-                // still needs that distance (via voiceFalloffDistance →
-                // cachedProp.effectiveDistance) to compute per-voice volume,
-                // and there is no equivalent Steam Audio output to feed it.
-                // With the gate in place, `cachedProp.reached` stayed at the
-                // default `false` for every ambient and voiceFalloffDistance
-                // silently took its Euclidean fallback — making the fallback
-                // load-bearing for ambient volume. Removing the gate lets BFS
-                // run alongside Steam Audio pathing; the two systems feed
-                // distinct downstream paths (BFS → ambient volume; SA → DSP
-                // eq) and don't conflict. BFS is ~3 µs/voice/frame per the
-                // existing throughput comment.
+                // Legacy player-audio portal-eq path: room-BFS fills
+                // portalAttenuation / portalBlocking via the prop.reached
+                // branches below. Gated off when Steam Audio pathing owns
+                // those fields (the shipping default), so the two backends
+                // don't compete to write the same dspNode fields.
                 SoundPropInfo prop{};
                 bool isCrossRoom = false;
-                if (mPortalRoutingEnabled
+                if (!useSteamAudioPathing && mPortalRoutingEnabled
                     && !voice->sourceEnded
                     && !voice->skipPortalRouting && !voice->playerEmitted) {
-                    // Run portal propagation every frame. Per-voice BFS averages
-                    // ~3 µs (see `[Audio] portal=...avg=` stats), so ~20 voices ×
-                    // 60 Hz = ~60 µs/frame total — negligible. The previous
-                    // adaptive-throttle approach (FramesUntilUpdate = dist/10,
-                    // capped at 16) was a 12.5 Hz-era CPU optimization. At 60+ Hz
-                    // it produced 200–2000 ms of audible latency between
-                    // listener-room changes and the voice's gain following, which
-                    // is well above the perceptual threshold for ambient cues.
+                    // BFS every frame (~3 µs/voice). The cap is decoupled
+                    // from per-voice audibility radius: maxDist inside
+                    // propagateSoundPath is both the BFS depth bound AND
+                    // the door-blocking saturation target, so tying them
+                    // together made small-radius voices unreachable after
+                    // one or two portal hops.
                     auto prT0 = profOn ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
-                    // Use the voice's per-source maxAudibleDist instead
-                    // of the global cap: BFS won't bother exploring
-                    // paths longer than the schema's effective radius,
-                    // so e.g. a wind ambient with radius=25 stops
-                    // propagating at ~25 ft of portal-graph path even
-                    // through open archways. Matches Dark Engine
-                    // m_MaxDistance per-source semantics.
-                    // Inline propagation call so we can capture the bend
-                    // chain into voice->cachedChain for the show_vpos
-                    // debug overlay. The wrapper propagateSound() doesn't
-                    // expose params.chainOut.
                     if (mRoomService && mSoundPropagation) {
-                        // Resolve source/listener rooms now so we can pass
-                        // their IDs through to SoundPropagation. -1 means
-                        // "outside all rooms" (euclidean fallback).
                         Room *srcRoomP = mRoomService->roomFromPoint(voice->worldPos);
                         Room *lstRoomP = mRoomService->roomFromPoint(mListenerPos);
                         int32_t srcID = srcRoomP ? srcRoomP->getRoomID() : -1;
                         int32_t lstID = lstRoomP ? lstRoomP->getRoomID() : -1;
-                        // Build the params struct ourselves so we can plug
-                        // the per-voice chainOut accumulator in (used by
-                        // the show_vpos debug overlay). SoundPropagation
-                        // overwrites doorBlocking / loudRoom with its own
-                        // callbacks before forwarding to RoomService.
+                        // Inline params so we can plug chainOut in (used
+                        // by the show_vpos debug overlay; the
+                        // propagateSound wrapper doesn't expose it).
                         SoundPropParams pp;
-                        // BFS exploration cap decoupled from per-voice
-                        // audibility radius. The previous design tied
-                        // them together (`pp.maxDist =
-                        // voice->maxAudibleDist`) — but `maxDist` does
-                        // double-duty inside propagateSoundPath: it's
-                        // both the depth-bound on the BFS frontier
-                        // (RoomService.cpp line 715: `if (newEffDist >
-                        // maxDist) continue;`) AND the door-blocking
-                        // accumulator's saturation target (`newEffDist
-                        // += (maxDist - newEffDist) * blocking`). With
-                        // a small per-voice radius (strlight_lp ~25 ft)
-                        // the doorBlocking inflation pushes effDist
-                        // past the radius after only one or two portal
-                        // hops, even when the listener is geometrically
-                        // a few feet from the source.
-                        //
-                        // Result: `prop.reached = false` for nearby
-                        // cross-room voices whose actual portal-graph
-                        // distance is small. Other audio-pipeline
-                        // consumers (AmbientVolumeManager's falloff
-                        // curve, AI hearing distance, multi-path slot
-                        // virtual-position routing) then fall back to
-                        // Euclidean — which misses cross-wall
-                        // attenuation entirely.
-                        //
-                        // Decoupling: BFS gets the project-wide
-                        // propagation cap (mPropagationMaxDist, 200 ft
-                        // default — the absolute upper bound any voice
-                        // could be authored at) OR the voice's own
-                        // radius if larger (rare; covers exotic
-                        // long-range sounds like thunder). Audibility
-                        // gating happens downstream — AmbientVolumeManager
-                        // uses `amb.radius` against `prop.effectiveDistance`
-                        // for the falloff curve, and the per-voice
-                        // maxAudibleDist check in this loop's
-                        // useSteamAudioPathing branch (line ~5084) still
-                        // silences truly out-of-range voices via the
-                        // Euclidean fast-path.
                         pp.maxDist     = std::max(voice->maxAudibleDist, mPropagationMaxDist);
                         pp.maxPaths    = mPropMaxPaths;
                         pp.maxPathDiff = mPropMaxPathDiff;
@@ -5107,15 +4980,9 @@ void AudioService::loopStep(float deltaTime)
 
                     voice->cachedProp = prop;
 
-                    // Determine if the voice is in a different room from the listener.
-                    // No physical-distance threshold here: a previous 5-ft gate was
-                    // leftover defense against player-source head/feet straddling,
-                    // which is now handled cleanly by the voice->playerEmitted skip
-                    // above. With the gate in place, crossing 5 ft from a cross-room
-                    // source caused two audible pops — an HRTF direction snap (real
-                    // source → portal anchor) and a mute cliff when BFS failed
-                    // (full volume → silence). Letting cross-room status track the
-                    // actual room assignment removes both discontinuities.
+                    // Cross-room flag tracks actual room assignment — no
+                    // distance gate. The playerEmitted skip above handles
+                    // head/feet straddling for player-sourced voices.
                     Room *srcRoom = mRoomService ? mRoomService->roomFromPoint(voice->worldPos) : nullptr;
                     isCrossRoom = (srcRoom && listenerRoom && srcRoom != listenerRoom);
                 }
@@ -5256,9 +5123,15 @@ void AudioService::loopStep(float deltaTime)
                 // does NOT consume these slots yet — the legacy single-
                 // source pipeline above is still authoritative. The fan-
                 // out runs in parallel so we can verify slot-assignment
-                // stability against real BFS output before Phase 2 wires
+                // stability against the BFS output before Phase 2 wires
                 // up the audio-thread consumer. See
                 // PLAN.MULTI_PATH_AMBISONICS.md for the rollout plan.
+                //
+                // In Steam Audio pathing mode `prop.paths` is empty (the
+                // BFS branch above is gated off), so this collapses to
+                // the synthesised single-path fallback below. Phase 2+
+                // multi-path will need to be driven from Steam Audio
+                // path data rather than BFS.
                 //
                 // The direction closure converts world-space
                 // listener→path delta into IPL listener-local frame —
@@ -8276,6 +8149,10 @@ void AudioService::loadMiscSoundProperties()
 //------------------------------------------------------
 std::vector<VoiceSpatialSnapshot> AudioService::getVoiceSpatialSnapshots() const
 {
+    // Chain / paths data here is BFS-driven (cachedProp), so the show_vpos
+    // overlay's path visualisation is empty when probe_pathing is true (the
+    // shipping default) and the BFS branch is gated off for player audio.
+    // A Steam-Audio-driven path overlay is a separate future task.
     std::vector<VoiceSpatialSnapshot> out;
     out.reserve(mVoicePool->size());
     for (const auto &kv : mVoicePool->voices()) {
