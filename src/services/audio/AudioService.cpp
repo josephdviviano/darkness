@@ -1060,15 +1060,12 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
     // Level 1: direct attenuation only (no binaural — mono passthrough)
     // Level 2: binaural only (no direct attenuation)
     // ── Multi-path slot pipeline gates ──
-    // Phase 2: the audio callback iterates non-Free sub-source slots and
-    // sums each slot's binaural output into stereoL/R. The legacy single
-    // direct/binaural effects on SteamAudioDSPNode are gone; each slot
-    // carries its own pair (pre-allocated in initVoiceDSP). Slot 0 is
-    // the only slot that's normally ACTIVE under the Phase 2 cap=1
-    // policy, so steady-state output equals the legacy single-source
-    // pipeline. Transition frames briefly see slot 0 DRAINING with a
-    // second slot ACTIVE; both run their effects, gain-snap (Phase 2)
-    // or per-sample crossfade (Phase 3) produces clickless handover.
+    // The audio callback iterates non-Free sub-source slots and sums
+    // each slot's binaural output into stereoL/R. Each slot owns its
+    // own direct + binaural effect pair (pre-allocated in initVoiceDSP).
+    // In SA mode only slot 0 is ever ACTIVE; in BFS mode up to
+    // kMaxSubSources slots run simultaneously for multi-portal voices.
+    // See PLAN.MULTI_PATH_SA_MIGRATION.md for the regime split.
     bool runBinaural = (bypassLevel == 0 || bypassLevel == 2)
                        && node->subSources[0].binauralEffect;
     bool runAtten = (bypassLevel == 0 || bypassLevel == 1);
@@ -5117,30 +5114,32 @@ void AudioService::loopStep(float deltaTime)
                     voice->dspNode.portalBlocking = 0.0f;
                 }
 
-                // ── Phase 1: multi-path sub-source slot fan-out ──
+                // ── Sub-source slot fan-out ──
                 //
-                // Populate voice->dspNode.subSources[] from this frame's
-                // propagation paths so per-slot DSP state stays attached
-                // to the physical path it represents (keyed by
-                // SoundPathRecord::predecessorRoomID). The audio thread
-                // does NOT consume these slots yet — the legacy single-
-                // source pipeline above is still authoritative. The fan-
-                // out runs in parallel so we can verify slot-assignment
-                // stability against the BFS output before Phase 2 wires
-                // up the audio-thread consumer. See
-                // PLAN.MULTI_PATH_AMBISONICS.md for the rollout plan.
+                // Steam Audio mode (`probe_pathing: true`, shipping default):
+                // Steam Audio's pathing solver folds multi-path propagation
+                // into a single eqCoeffs[3] + combined ambisonic SH field,
+                // not into N independent (direction, gain) tuples. The
+                // multi-path-multi-portal data model the original Phase-2
+                // design assumed cannot be reconstructed from SA's output.
+                // We force slot-0-only: a synthesised single path at
+                // voice->worldPos, with slots 1-3 drained. Steam Audio's
+                // eqCoeffs (via portalAttenuation / portalBlocking) carries
+                // the cross-room attenuation work upstream of this slot;
+                // same-room voices end up at eqCoeffs ≈ 1.
                 //
-                // In Steam Audio pathing mode `prop.paths` is empty (the
-                // BFS branch above is gated off), so this collapses to
-                // the synthesised single-path fallback below. Phase 2+
-                // multi-path will need to be driven from Steam Audio
-                // path data rather than BFS.
+                // Legacy BFS mode (`probe_pathing: false`): the BFS branch
+                // above populated prop.paths with up to maxPaths discrete
+                // routes; multi-portal scenes get true multi-direction
+                // HRTF fan-out via updateSubSourceSlots.
                 //
-                // The direction closure converts world-space
-                // listener→path delta into IPL listener-local frame —
-                // same right/up/ahead basis used by the legacy
-                // node->direction write above so Phase 2 can drop the
-                // legacy field without a frame shift.
+                // Player-emitted + skipPortalRouting voices stay slot-0-only
+                // in both modes — source ≈ listener, portal routing N/A.
+                //
+                // See PLAN.MULTI_PATH_SA_MIGRATION.md for the rationale.
+                // PLAN.MULTI_PATH_AMBISONICS.md (the original Phase-1..4
+                // design) is superseded by this for the SA-mode regime;
+                // Phases 2-4 remain valid for the legacy BFS mode.
                 auto computeDirForPath = [&](const SoundPathRecord& p) -> IPLVector3 {
                     Vector3 toPath = p.virtualPosition - mListenerPos;
                     float   dist   = glm::length(toPath);
@@ -5155,29 +5154,12 @@ void AudioService::loopStep(float deltaTime)
                     };
                 };
 
-                const int maxN = static_cast<int>(std::min<uint32_t>(
-                    sMaxSubSources.load(std::memory_order_relaxed),
-                    static_cast<uint32_t>(kMaxSubSources)));
-
-                if (prop.reached && !prop.paths.empty()) {
-                    updateSubSourceSlots(voice->dspNode.subSources, prop,
-                                         maxN, computeDirForPath);
-                } else if (isCrossRoom) {
-                    // BFS-failed cross-room: legitimately silenced.
-                    // Drain any active slots.
-                    drainAllSubSourceSlots(voice->dspNode.subSources);
-                } else {
-                    // No propagation result available (player-emitted
-                    // voice, skipPortalRouting voice, portal routing
-                    // globally disabled, or voice without room data).
-                    // Treat as a direct-line same-room source so slot 0
-                    // stays active and the audio callback's per-slot
-                    // loop still produces output. Synthesize a single
-                    // SoundPathRecord at voice->worldPos with no door
-                    // blocking — matches the legacy
-                    // (!usePortalRouting) audio behaviour where the
-                    // dry path runs at full volume with direction =
-                    // (worldPos - listenerPos).
+                // Synthesised single-path record at the source's actual
+                // world position. Used for the slot-0-only path
+                // (SA-mode, player-emitted, skipPortalRouting, and the
+                // legacy "no room data" fallback). Reuse here to avoid
+                // duplicating the construction across branches.
+                auto makeSyntheticSinglePath = [&]() -> SoundPropInfo {
                     SoundPropInfo synth;
                     synth.reached = true;
                     SoundPathRecord rec;
@@ -5193,8 +5175,39 @@ void AudioService::loopStep(float deltaTime)
                     synth.virtualPosition   = rec.virtualPosition;
                     synth.realDistance      = rec.realDistance;
                     synth.effectiveDistance = rec.effectiveDistance;
+                    return synth;
+                };
+
+                if (useSteamAudioPathing
+                    || voice->playerEmitted
+                    || voice->skipPortalRouting) {
+                    // Slot-0-only. maxN=1 causes updateSubSourceSlots to
+                    // drain slots 1-3 (if any are ACTIVE from a prior
+                    // BFS-mode session, or from a runtime toggle) and
+                    // keep slot 0 ACTIVE with the synthesised path.
+                    SoundPropInfo synth = makeSyntheticSinglePath();
                     updateSubSourceSlots(voice->dspNode.subSources, synth,
-                                         maxN, computeDirForPath);
+                                         /*maxN=*/1, computeDirForPath);
+                } else {
+                    // Legacy BFS mode: BFS produced prop.paths (or it
+                    // didn't reach). Use the configured sMaxSubSources
+                    // clamp.
+                    const int maxN = static_cast<int>(std::min<uint32_t>(
+                        sMaxSubSources.load(std::memory_order_relaxed),
+                        static_cast<uint32_t>(kMaxSubSources)));
+                    if (prop.reached && !prop.paths.empty()) {
+                        updateSubSourceSlots(voice->dspNode.subSources, prop,
+                                             maxN, computeDirForPath);
+                    } else if (isCrossRoom) {
+                        // BFS-failed cross-room: legitimately silenced.
+                        drainAllSubSourceSlots(voice->dspNode.subSources);
+                    } else {
+                        // BFS didn't run (no room data, etc.) — same
+                        // synthesised single-path fallback as SA mode.
+                        SoundPropInfo synth = makeSyntheticSinglePath();
+                        updateSubSourceSlots(voice->dspNode.subSources, synth,
+                                             maxN, computeDirForPath);
+                    }
                 }
 
                 // Architecture B: set the IPLSource position to
@@ -6927,16 +6940,27 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
     // bookkeeping (top-N ranking, reflection-send mono scaling) and
     // is no longer the source of the dry path's directParams.
     //
-    // Pre-allocate ALL kMaxSubSources slots up front so the audio
-    // thread never has to wait on Steam Audio source create/destroy
-    // (which is main-thread-only). Idle slots have stale inputs;
-    // iplSimulatorRunDirect still processes them but the outputs go
-    // unread until the slot becomes ACTIVE.
+    // Pre-allocate sub-source slots. In SA mode (probe_pathing: true,
+    // shipping default) only slot 0 is ever ACTIVE per the
+    // PLAN.MULTI_PATH_SA_MIGRATION.md decision, so we skip slots 1-3
+    // to save ~3× per-voice IPLSource + IPLDirectEffect + IPLBinauralEffect
+    // memory and the eager source-register / simulator-commit cost. In
+    // BFS mode (probe_pathing: false) all four are needed for multi-
+    // portal fan-out. Teardown (~ActiveVoice and removeVoiceSource)
+    // skips slots with null IPL handles so a partial allocation is safe.
+    //
+    // mProbePathingEnabled is captured at voice spawn; runtime toggle of
+    // probe_pathing is not supported by the slot lifecycle today (would
+    // require re-allocating slots on flip). No setter exists so this
+    // can't happen in practice; document the constraint here if a
+    // setter is added later.
+    const int slotsToAlloc = mProbePathingEnabled ? 1 : kMaxSubSources;
     {
         IPLSourceSettings srcSettings{};
         srcSettings.flags = IPL_SIMULATIONFLAGS_DIRECT;
         int builtSlotSources = 0;
-        for (auto &slot : voice.dspNode.subSources) {
+        for (int slotIdx = 0; slotIdx < slotsToAlloc; ++slotIdx) {
+            auto &slot = voice.dspNode.subSources[slotIdx];
             IPLerror err = iplSourceCreate(mDirectSimulator, &srcSettings,
                                            &slot.directSource);
             if (err != IPL_STATUS_SUCCESS) {
@@ -7099,23 +7123,21 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
 
     // ── Per-slot direct + binaural effects (multi-path sub-source slots) ──
     //
-    // Each of the kMaxSubSources slots owns its own pair of IPL effects so
-    // that the per-slot HRTF interpolation state and direct-effect smoothing
-    // state stay attached to the physical path mapped to that slot (keyed by
-    // SoundPathRecord::predecessorRoomID in the slot fan-out — see
-    // SubSourceSlots.h). All slot effects are pre-allocated up front so the
-    // audio thread never needs to create / destroy IPL handles. In Phase 2
-    // only one slot is ever ACTIVE at a time (sMaxSubSources clamped to 1),
-    // but allocating all of them keeps the lifecycle uniform and lets
-    // transitions briefly use a second slot for the draining tail without
-    // touching the IPL handle pool from the audio thread.
+    // Each sub-source slot owns its own pair of IPL effects so per-slot
+    // HRTF interpolation + direct-effect smoothing stays attached to the
+    // physical path mapped to that slot. In SA mode (probe_pathing: true)
+    // only slot 0 is ever ACTIVE, so we allocate just one slot's worth;
+    // in BFS mode (probe_pathing: false) we allocate all kMaxSubSources
+    // for multi-portal fan-out. See PLAN.MULTI_PATH_SA_MIGRATION.md.
     //
-    // On any per-slot creation failure we tear down the slots we've already
-    // built and bail out — matches the legacy single-effect "create or
-    // refuse the voice" policy.
+    // Audio callback's per-slot loop skips slots with null binauralEffect
+    // (SubSource defaults state=Free + null IPL handles), so a partial
+    // allocation is safe. On any creation failure within the allocated
+    // range we tear down the slots we've already built and bail out.
+    const int slotsToAlloc = mProbePathingEnabled ? 1 : kMaxSubSources;
     IPLerror err = IPL_STATUS_SUCCESS;
     int      builtSlots = 0;
-    for (int i = 0; i < kMaxSubSources; ++i) {
+    for (int i = 0; i < slotsToAlloc; ++i) {
         SubSource &slot = dsp.subSources[i];
 
         err = iplDirectEffectCreate(mIplContext, &audioSettings,
