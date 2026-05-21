@@ -4992,9 +4992,27 @@ void AudioService::loopStep(float deltaTime)
                 // handles the wet path independently. This skip is the single
                 // defense against that flicker — there is no longer a
                 // belt-and-suspenders distance threshold below.
+                // BFS gate previously included `!useSteamAudioPathing`, which
+                // disabled the entire room-graph propagation whenever Steam
+                // Audio pathing was active. That made sense in the original
+                // "SA replaces the BFS" design, but it overshoots: Steam
+                // Audio produces eqCoeffs (3-band DSP attenuation) consumed
+                // by portalAttenuation / portalBlocking, NOT a portal-graph
+                // effective distance. AmbientSoundManager's falloff curve
+                // still needs that distance (via voiceFalloffDistance →
+                // cachedProp.effectiveDistance) to compute per-voice volume,
+                // and there is no equivalent Steam Audio output to feed it.
+                // With the gate in place, `cachedProp.reached` stayed at the
+                // default `false` for every ambient and voiceFalloffDistance
+                // silently took its Euclidean fallback — making the fallback
+                // load-bearing for ambient volume. Removing the gate lets BFS
+                // run alongside Steam Audio pathing; the two systems feed
+                // distinct downstream paths (BFS → ambient volume; SA → DSP
+                // eq) and don't conflict. BFS is ~3 µs/voice/frame per the
+                // existing throughput comment.
                 SoundPropInfo prop{};
                 bool isCrossRoom = false;
-                if (!useSteamAudioPathing && mPortalRoutingEnabled
+                if (mPortalRoutingEnabled
                     && !voice->sourceEnded
                     && !voice->skipPortalRouting && !voice->playerEmitted) {
                     // Run portal propagation every frame. Per-voice BFS averages
