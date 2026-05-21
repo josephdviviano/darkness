@@ -318,6 +318,14 @@ void AmbientSoundManager::updateAmbientVolumes()
                 if (sfxMaxDist < 1.0f) sfxMaxDist = 1.0f;
                 mHost->voiceSetMaxAudibleDist(amb.handle, sfxMaxDist * atten);
 
+                // Push the schema's P$SchAttFac into Steam Audio's distance
+                // model as a per-voice rolloff factor (mapped to
+                // INVERSEDISTANCE minDistance × atten — sound stays at full
+                // volume out to N meters before 1/d falloff). Default 1.0
+                // matches Steam Audio's DEFAULT model. Schemas like m06bell
+                // ship factors up to ~20 for long-carry sounds.
+                mHost->voiceSetAttenuationFactor(amb.handle, atten);
+
                 // AMB_ENVIRONMENTAL: diffuse spatial blend (wind, room tone)
                 // — mixes HRTF with mono passthrough so the source feels
                 // ambient rather than pinpoint. Object-attached ambients
@@ -365,9 +373,9 @@ void AmbientSoundManager::updateAmbientVolumes()
         // centibel falloff curve over schema radius double-attenuated
         // against that chain and confused authoring.
         //
-        // amb.attenuationFactor (P$SchAttFac) is preserved on the
-        // struct but no longer consumed here — future tuning pass will
-        // map it onto Steam Audio's rolloffFactor.
+        // amb.attenuationFactor (P$SchAttFac) is plumbed into Steam Audio's
+        // INVERSEDISTANCE distance model at voice spawn (see
+        // voiceSetAttenuationFactor call earlier). Not re-read per-frame.
         const float gainCb = static_cast<float>(
             amb.volume + schemaVolumeCb(mHost->mSchemaParser.get(), amb.schemaName));
         const float linearVol = centibelsToLinear(gainCb);
@@ -434,6 +442,10 @@ void AmbientSoundManager::updateSpotAmbientVolumes()
                 justCreated = true;
                 // Cap BFS at outer envelope — past outer the source is silent.
                 mHost->voiceSetMaxAudibleDist(se.handle, se.outer);
+                // Spot ambients don't carry a per-schema P$SchAttFac override
+                // in the gamesys today (it's an ambient-class property in the
+                // existing data). Leave attenuationFactor at the voice's
+                // default (1.0 = Steam Audio's DEFAULT distance behaviour).
                 mHost->voiceSetSpatialBlendOverride(se.handle, mEnvironmentalSpatialBlend);
             }
         }

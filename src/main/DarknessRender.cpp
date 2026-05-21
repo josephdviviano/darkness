@@ -308,8 +308,8 @@ static void printHelp() {
         "    audio.reflections.*    enabled, rays, bounces, duration, ambisonics_order\n"
         "    audio.occlusion.*      radius, samples, transmission/absorption_scale, diffuse\n"
         "    audio.propagation.*    portal_routing, probe_pathing, max_distance, door LPF\n"
-        "    audio.spatialization.* hrtf_volume, hrtf_interpolation, spatial_blend, distance_model\n"
-        "    audio.ambient.*        hysteresis, falloff_curve, default_priority\n"
+        "    audio.spatialization.* hrtf_volume, hrtf_interpolation, spatial_blend\n"
+        "    audio.ambient.*        hysteresis, default_priority, global_volume_scale\n"
         "    audio.mixer.*          master_gain, reflection_gain, reflection_ramp_ms\n"
         "    audio.dsp.*            limiter, compressor, EQ, ducking (per-stage)\n"
         "\n"
@@ -3847,12 +3847,10 @@ int main(int argc, char *argv[]) {
         audioSvc->setHRTFVolume(cfg.hrtfVolume);
         audioSvc->setHRTFInterpolation(cfg.hrtfInterpolation);
         audioSvc->setSpatialBlend(cfg.spatialBlend);
-        audioSvc->setDistanceModel(cfg.distanceModel);
 
         // -- audio.ambient --
         audioSvc->setAmbHysteresisStartMul(cfg.ambHysteresisStartMul);
         audioSvc->setAmbHysteresisStopMul(cfg.ambHysteresisStopMul);
-        audioSvc->setAmbFalloffCurve(cfg.ambFalloffCurve);
         audioSvc->setAmbDefaultPriority(cfg.ambDefaultPriority);
         audioSvc->setAmbEnvironmentalSpatialBlend(cfg.ambEnvironmentalSpatialBlend);
         audioSvc->setAmbGlobalVolumeScale(cfg.ambGlobalVolumeScale);

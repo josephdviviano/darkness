@@ -643,8 +643,6 @@ public:
     /// "nearest" or "bilinear". Must be set BEFORE per-source effects are created.
     void setHRTFInterpolation(const std::string& s) { mDSPChain->setHRTFInterpolation(s); }
     void setSpatialBlend(float b) { mDSPChain->setSpatialBlend(b); }
-    /// "default" or "inverse_distance"
-    void setDistanceModel(const std::string& s) { mDSPChain->setDistanceModel(s); }
 
     // ── Propagation tuning ──
     // Setters republish to the audio thread so runtime tweaks (e.g. via the
@@ -723,8 +721,6 @@ public:
     // ── Ambient tuning (facades — forwarded to AmbientSoundManager) ──
     void setAmbHysteresisStartMul(float m);
     void setAmbHysteresisStopMul(float m);
-    /// "linear" or "quadratic"
-    void setAmbFalloffCurve(const std::string &s);
     void setAmbDefaultPriority(int p);
     // Per-voice spatialBlend override applied to AMB_ENVIRONMENTAL ambients
     // at activation time. 1.0 = full HRTF point-source pan; 0.0 = mono
@@ -1128,6 +1124,11 @@ private:
     // Set the voice's per-source BFS-termination distance. Used by the
     // ambient/spot loaders to bake the per-source max audible distance.
     void voiceSetMaxAudibleDist(SoundHandle handle, float maxDist);
+    // Per-voice distance-attenuation rolloff factor (P$SchAttFac).
+    // Default 1.0 → minDistance=1m in Steam Audio's INVERSEDISTANCE model
+    // (= DEFAULT model behaviour). Factor > 1 keeps the sound at full
+    // volume out to N meters before 1/d falloff. Clamped [0.1, 100].
+    void voiceSetAttenuationFactor(SoundHandle handle, float factor);
     // Override the voice's HRTF/mono spatialBlend (atomic, audio-thread
     // safe). Used for AMB_ENVIRONMENTAL ambients + spot ambients.
     void voiceSetSpatialBlendOverride(SoundHandle handle, float blend);

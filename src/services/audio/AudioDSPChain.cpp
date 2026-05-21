@@ -36,7 +36,6 @@ extern std::atomic<float> sSpatialBlend;
 extern std::atomic<float> sDoorLpfOpenHz;
 extern std::atomic<float> sDoorLpfBlockedHz;
 extern std::atomic<float> sPropMinAttenuation;
-extern std::atomic<int>   sDistanceModel;
 
 // ── Master bus DSP chain config ──
 
@@ -146,11 +145,6 @@ void AudioDSPChain::setSpatialBlend(float b)
     mSpatialBlend = std::max(0.0f, std::min(b, 1.0f));
 }
 
-void AudioDSPChain::setDistanceModel(const std::string& s)
-{
-    mDistanceModel = (s == "inverse_distance" ? "inverse_distance" : "default");
-}
-
 // ── Propagation tuning ──
 
 void AudioDSPChain::setDoorLpfOpenHz(float hz)
@@ -185,8 +179,6 @@ void AudioDSPChain::publishAudioThreadParams() const
     sDoorLpfOpenHz.store(mDoorLpfOpenHz, std::memory_order_relaxed);
     sDoorLpfBlockedHz.store(mDoorLpfBlockedHz, std::memory_order_relaxed);
     sPropMinAttenuation.store(mPropMinAttenuation, std::memory_order_relaxed);
-    sDistanceModel.store(mDistanceModel == "inverse_distance" ? 1 : 0,
-                         std::memory_order_relaxed);
 }
 
 } // namespace Darkness
