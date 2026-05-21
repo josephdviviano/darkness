@@ -43,17 +43,11 @@ struct AmbientSound {
     float radius = 0.0f;              ///< Propagation radius
     int32_t volume = -1;              ///< Volume in millibels
     uint32_t flags = 0;               ///< AmbientHackFlags
-    /// Per-ambient SHARP-falloff flag, captured from the schema's
-    /// SCH_SHARP_FALLOFF (= original engine's SFXFLG_SHARP) at load time.
-    /// True → use the 4th-power curve `(d/r)^4` in updateAmbientVolumes;
-    /// false → linear `(d/r)`. SHARP is the original engine's default
-    /// for ambients (most use it); schemas opt out via an explicit
-    /// `flags` directive that clears bit 12.
+    /// Schema's SCH_SHARP_FALLOFF flag — true uses `(d/r)^4`, false `(d/r)`.
+    /// SHARP is the engine's default for ambients.
     bool isSharp = true;
-    /// Per-schema attenuation-factor divisor for the volume formula,
-    /// loaded from P$SchAttFac at startup (default 1.0). Higher values
-    /// make this schema fall off less aggressively. Examples in MISS6:
-    /// m06bell=20.0, KARRAS_SCRIPTED=3.0, AI_CONV=1.7, HIT_EXPLOSION=2.0.
+    /// P$SchAttFac divisor on the volume formula's per-radius dB drop
+    /// (default 1.0). Higher = less aggressive falloff.
     float attenuationFactor = 1.0f;
     SoundHandle handle = SOUND_HANDLE_INVALID; ///< Active voice handle (if playing)
 };
@@ -84,24 +78,11 @@ enum class FalloffCurve {
     Quartic,
 };
 
-/// Unified ambient volume envelope. Returns a normalised "falloff
-/// percentage" in [0,1] where 0 means fully inside (d <= inner, voice at
-/// authored gain) and 1 means fully outside (d >= outer, voice silent).
-/// The two ambient subsystems apply this falloff value to their own
-/// gain-domain formulae:
-///   • P$AmbientHack uses `volumeCb = gain - falloffPct * (5000 + gain) / atten`
-///     with inner = 0, outer = radius, and Linear or Quartic from the schema's
-///     SCH_SHARP_FALLOFF bit.
-///   • P$SpotAmb uses `targetGain = level * (1 - falloffPct)` (a complement of
-///     the normalised falloff, in level-domain). inner/outer come from the
-///     property; the curve is always Linear (matches the original engine's
-///     inner/outer envelope).
-///
-/// Behaviour parity with the prior two implementations is preserved
-/// exactly: when inner == 0, Linear yields `d/outer` and Quartic yields
-/// `(d/outer)^4`, matching the previous P$AmbientHack code paths. The
-/// previous P$SpotAmb code path computed `(outer - d)/(outer - inner)`
-/// (= 1 - linearFalloff), which equals `1 - computeFalloff(...,Linear)`.
+/// Unified ambient volume envelope. Returns falloff in [0,1]: 0 = fully
+/// inside (d<=inner, full gain), 1 = fully outside (d>=outer, silent).
+/// P$AmbientHack uses inner=0, outer=radius + Linear/Quartic from
+/// SCH_SHARP_FALLOFF. P$SpotAmb uses property inner/outer + Linear
+/// (target = level * (1 - falloff)).
 struct AmbientVolumeModel {
     static float computeFalloff(float distance, float inner, float outer,
                                 FalloffCurve curve);
@@ -142,19 +123,16 @@ public:
     /// to have already called haltAll() before clearing the bookkeeping.
     void clear();
 
-    /// Tunable hysteresis multipliers. start >= 1.0, stop > start
-    /// recommended (the original engine's hysteresis is asymmetric to
-    /// avoid start/stop oscillation when the listener hovers near the
-    /// boundary). Clamped by the public AudioService API.
+    /// Asymmetric hysteresis multipliers — start >= 1.0, stop > start.
+    /// Prevents start/stop oscillation near the radius boundary.
     void setHysteresisStartMul(float m) { mHysteresisStartMul = m; }
     void setHysteresisStopMul(float m)  { mHysteresisStopMul  = m; }
     float getHysteresisStartMul() const { return mHysteresisStartMul; }
     float getHysteresisStopMul() const  { return mHysteresisStopMul; }
 
-    /// "linear" or "quadratic" — string passthrough kept for compatibility
-    /// with the previous AudioService API. The actual per-ambient curve
-    /// is chosen from the schema's SCH_SHARP_FALLOFF bit, not this
-    /// setting; this remains for future use.
+    /// "linear" or "quadratic" — passthrough kept for API compat. Actual
+    /// per-ambient curve comes from the schema's SCH_SHARP_FALLOFF bit;
+    /// this setting is retained for future use.
     void setFalloffCurve(const std::string &s) {
         mFalloffCurve = (s == "linear" ? "linear" : "quadratic");
     }
