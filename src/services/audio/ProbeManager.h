@@ -23,25 +23,19 @@
 #define __PROBE_MANAGER_H
 
 /// @file ProbeManager.h
-/// Acoustic probe baking, loading, saving, and in-memory storage.
+/// Acoustic probe baking, loading, saving, and in-memory storage. Owns the
+/// Steam Audio probe batch + mirrored probe-position array used by debug
+/// overlays.
 ///
-/// Extracted from AudioService — owns the Steam Audio probe batch and the
-/// mirrored probe-position array used by debug overlays. AudioService keeps
-/// thin facades (bakeProbes/loadProbes/getProbeCount/getProbePositions) that
-/// forward to ProbeManager so callers in the renderer and debug console need
-/// no changes.
-///
-/// Threading: ProbeManager is owned and called only from the main thread.
-/// `bakeProbes` is a blocking call (~10-60 s) and uses an `std::atomic<float>`
-/// progress hook so a UI thread can poll. The Steam Audio probe batch handle
-/// returned by `getProbeBatch()` is read by the reflection-sim worker on a
-/// separate thread; the caller is responsible for invoking the supplied
-/// `waitForReflectionThread` callback before any mutation (release/load) of
-/// the batch.
+/// Threading: main-thread only. `bakeProbes` is blocking (~10-60s) and
+/// reports via an atomic float so a UI thread can poll. The probe batch
+/// is read by the reflection-sim worker; callers MUST invoke the supplied
+/// `waitForReflectionThread` callback before any batch mutation.
 
 #include "DarknessMath.h"
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -58,6 +52,26 @@ typedef _IPLProbeBatch_t* IPLProbeBatch;
 
 namespace Darkness {
 
+/// Outcome of bake-time filter. Nudge = recoverable displacement;
+/// preserves probes just too close to a wall while still dropping those
+/// inside solid geometry.
+enum class ProbeFilterResult {
+    Accept,
+    Reject,
+    Nudge,
+};
+
+struct ProbeFilterDecision {
+    ProbeFilterResult result = ProbeFilterResult::Accept;
+    /// Unit vector pointing away from the offending surface (Nudge only).
+    Vector3 nudgeDir{0.0f, 0.0f, 0.0f};
+    /// Engine feet — minimum displacement to satisfy the filter next iter.
+    /// Callers add a small margin to avoid boundary ping-pong from jitter.
+    float nudgeDistFt = 0.0f;
+};
+
+using ProbeFilterFn = std::function<ProbeFilterDecision(const Vector3 &)>;
+
 /// Per-bake parameters supplied by AudioService (read from its tuning state).
 /// All distance fields are in engine feet (ProbeManager converts to meters
 /// at the IPL boundary internally).
@@ -69,10 +83,8 @@ struct ProbeBakeParams {
     /// Reverb max distance (used as pathing visibility/path range).
     float   propagationMaxDist  = 200.0f;
 
-    /// Reflection bake quality. Split from realtime params in PLAN.HYBRID_REVERB.md
-    /// so the offline bake can afford higher quality (more rays, more bounces,
-    /// longer duration, more diffuse samples) without affecting the per-frame
-    /// realtime sim cost.
+    /// Reflection bake quality — separate from realtime params so the bake
+    /// can afford higher quality without affecting per-frame sim cost.
     int     bakeNumRays          = 4096;
     int     bakeNumBounces       = 8;
     float   bakeDuration         = 4.0f;
@@ -86,69 +98,63 @@ struct ProbeBakeParams {
     float   spacingFtOverride    = -1.0f;
     float   heightFtOverride     = -1.0f;
 
-    /// Extra elevations (engine feet, above each floor probe position) at
-    /// which to add replicated probes. Empty = floor-grid only (legacy
-    /// behaviour). Typical values: {10.0f} to cover wall-mounted torches
-    /// and ceiling-mounted lamps that emit well above floor height.
-    /// Steam Audio's pathing matches source/listener to nearest probe; if
-    /// only floor probes exist, an elevated emitter routes to the floor
-    /// probe at its (x,y), which misrepresents its actual geometric
-    /// location and can produce odd pathing chains.
+    /// Extra elevations (feet, above floor) for replicated probes. Empty
+    /// = floor-grid only. Without elevated probes an elevated emitter
+    /// routes to the floor probe at its (x,y), misrepresenting geometry.
     std::vector<float> additionalElevations;
 
-    /// Per-portal axial anchors (in engine feet) to seed extra probes at.
-    /// Each entry contributes up to 2 probes — one at `center + normal *
-    /// axialOffsetFt` and one at `center - normal * axialOffsetFt` — so
-    /// each adjoining room gets a probe just inside its volume rather
-    /// than a ring sitting ON the doorway plane.  The on-plane ring
-    /// design produced two pathological hotspots:
-    ///   (a) doorway-shaped IRs (rays from 0.5 m off the plane bounced
-    ///       within the narrow doorway corridor → very high early energy)
-    ///   (b) duplicate probes per shared doorway (each portal appears in
-    ///       both adjoining rooms' portal lists; the basis symmetry made
-    ///       the 4 ring positions identical between the two directions →
-    ///       8 probes at 4 unique points per doorway).
-    /// AudioService now visits each portal pair in canonical orientation
-    /// only and supplies the inward-facing `normal`; ProbeManager handles
-    /// the ±offset expansion plus a proximity-dedup pass against the
-    /// floor + elevation tiers so window-style openings still seed cover
-    /// but doorways already covered by the floor grid don't double-count.
-    /// Empty = floor grid only (no portal-centric anchors).
+    /// Per-portal axial anchors. Each contributes up to 2 probes (center
+    /// ± normal · offset) so each adjoining room gets a probe just
+    /// inside its volume rather than on the doorway plane. Caller
+    /// supplies canonical orientation only; ProbeManager handles ±
+    /// expansion + dedup against floor/elevation tiers.
     struct PortalAxis {
         Vector3 center;
-        Vector3 normal;   ///< Unit, oriented arbitrarily — both ± sides emit
+        Vector3 normal;   ///< Unit; both ± sides emit
     };
     std::vector<PortalAxis> portalAxes;
 
-    /// Axial probe offset on each side of `PortalAxis::center` (engine
-    /// feet). 1 ft (≈0.3 m) is far enough to bake the *room's* acoustics
-    /// rather than the narrow corridor's.
+    /// Axial probe offset on each side of PortalAxis::center (feet).
+    /// 1 ft ≈ 0.3 m — far enough to bake the room's acoustics, not the
+    /// narrow corridor's.
     float portalAxialOffsetFt = 1.0f;
 
-    /// Skip a portal-axis candidate if any existing floor/elevation probe
-    /// lies within this many feet — the floor grid already covers it.
-    /// One floor spacing is a sensible default (≈ the radius at which
-    /// IPL would natively interpolate between neighbours anyway).
+    /// Skip a portal-axis candidate if an existing floor/elevation probe
+    /// is within this many feet (the floor grid already covers it).
     float portalDedupRadiusFt = 5.0f;
+
+    /// Elevation-tier sparsity multiplier. Floor probes are binned with
+    /// binSize = floorSpacing × this; one elevation probe per bin centroid
+    /// per tier. 2.0 = 1:4 ratio (default); 1.0 = 1:1 (legacy).
+    float elevationSparsityMul = 2.0f;
+
+    /// Global dedup radius (feet) applied AFTER all placement passes.
+    /// Earlier passes have priority (floor always wins). 0 = disabled.
+    float globalDedupRadiusFt = 2.0f;
+
+    /// Pre-bake validity filter applied to every candidate. Returns
+    /// Accept / Reject / Nudge. Pre-filtering avoids near-zero IRs from
+    /// in-wall probes and comb-filtering from near-wall probes. Empty
+    /// = keep everything.
+    ProbeFilterFn probeFilter;
+
+    /// Informational — what wall clearance (feet) the caller's filter
+    /// enforces; logged for traceability. Does NOT derive the filter.
+    float minWallClearanceFt = 0.0f;
 };
 
-/// Construction-time wiring. ProbeManager holds a reference to the IPL
-/// context for the lifetime of the audio service, plus a callback used to
-/// quiesce the reflection-sim worker before any probe-batch mutation.
+/// Construction-time wiring.
 struct ProbeManagerDeps {
-    /// Steam Audio context — supplied by AudioService at init time.
     IPLContext context = nullptr;
-
-    /// Function that blocks until the reflection-sim background thread is
-    /// idle. Called before any probe-batch register/unregister/release so
-    /// Steam Audio never sees a torn batch. Required.
+    /// Blocks until the reflection-sim worker is idle. Required — called
+    /// before any probe-batch register/unregister/release so Steam Audio
+    /// never sees a torn batch.
     std::function<void()> waitForReflectionThread;
 };
 
-/// Owns the Steam Audio probe batch, the mirrored probe-position array, and
-/// the bake-time grid configuration. Persistent across mission boundaries —
-/// `loadProbes` and `bakeProbes` both call `releaseBatch` internally before
-/// installing a new batch.
+/// Owns the Steam Audio probe batch + mirrored probe-position array +
+/// bake-time grid config. Persistent across missions — loadProbes/
+/// bakeProbes both call releaseBatch internally before installing a new one.
 class ProbeManager {
 public:
     explicit ProbeManager(ProbeManagerDeps deps);
@@ -157,71 +163,38 @@ public:
     ProbeManager(const ProbeManager &) = delete;
     ProbeManager &operator=(const ProbeManager &) = delete;
 
-    // ── Bake / Load / Save ────────────────────────────────────────────────
-
-    /** Bake acoustic probes for the current scene.
-     *  Generates probes on a uniform floor grid, bakes pathing visibility,
-     *  bakes reflection IRs, and writes them to `outputPath` (with a CRC
-     *  integrity envelope, plus sidecar CSVs for positions/energy).
-     *  Blocking call (~10-60 seconds). Progress is reported via the atomic
-     *  float (0.0-1.0).
-     *  @param scene       Acoustic scene to bake against (raycast target)
-     *  @param outputPath  File path for the .probes output
-     *  @param params      Per-bake tuning, scene bounds, and grid overrides
-     *  @param progress    Atomic float updated with bake progress (optional)
-     *  @return true if baking succeeded */
+    /// Bake probes for the current scene. Generates a floor grid, bakes
+    /// pathing + reflection IRs, writes `.probes` with CRC envelope.
+    /// Blocking (~10-60s); progress is reported via the atomic float.
     bool bakeProbes(IPLScene scene,
                     const std::string &outputPath,
                     const ProbeBakeParams &params,
                     std::atomic<float> *progress);
 
-    /** Load baked probe data from disk and register with the reflection
-     *  simulator.  Releases any previously-loaded batch first.
-     *  @param probePath           Path to .probes file
-     *  @param reflectionSimulator Simulator to register the batch with
-     *  @return true if loaded successfully */
+    /// Load probes from disk + register with the reflection simulator.
+    /// Releases any previously-loaded batch first.
     bool loadProbes(const std::string &probePath,
                     IPLSimulator reflectionSimulator);
 
-    /** Release the currently-loaded probe batch.
-     *  If a reflection simulator is supplied (and non-null), the batch is
-     *  unregistered from it first.  Safe to call when no batch is loaded.
-     *  Caller must ensure the reflection-sim background thread is idle
-     *  (the deps `waitForReflectionThread` is invoked internally). */
+    /// Release the loaded batch. Unregisters from `reflectionSimulator`
+    /// if supplied. Safe when no batch is loaded. waitForReflectionThread
+    /// is invoked internally before any IPL mutation.
     void releaseBatch(IPLSimulator reflectionSimulator);
 
-    /** Standard probe file path for a mission: stored in
-     *  `~/darkness/{gameName}/baked_probes/{missionName}.probes`. Creates
-     *  intermediate directories if they don't exist. */
+    /// Standard mission probe path:
+    /// ~/darkness/{gameName}/baked_probes/{missionName}.probes
     static std::string getProbeFilePath(const std::string &misPath,
                                          const std::string &gameName = "thief2");
 
-    // ── Accessors ─────────────────────────────────────────────────────────
-
-    /// Number of probes currently loaded (0 if no batch is installed).
     int getProbeCount() const { return mProbeCount; }
-
-    /// True iff the loaded batch carries baked reflection IRs (some legacy
-    /// .probes files only contain pathing data).
+    /// Legacy .probes files only contain pathing data — false then.
     bool hasReflections() const { return mProbesHaveReflections; }
-
-    /// Opaque handle to the underlying Steam Audio probe batch. May be
-    /// nullptr if no batch is loaded. Read-only — callers must not release
-    /// the handle directly; use `releaseBatch` instead.
+    /// Read-only. Callers must use releaseBatch(), not direct release.
     IPLProbeBatch getProbeBatch() const { return mIplProbeBatch; }
-
-    /// Snapshot of probe positions in engine feet. Populated by
-    /// `bakeProbes` and `loadProbes`; empty if no probes are loaded.
-    /// Used by the renderer to draw a debug overlay. The vector is
-    /// rebuilt on every bake/load, so cache by index — values do not
-    /// change between re-bakes.
+    /// Probe positions (feet). Rebuilt on every bake/load.
     const std::vector<Vector3> &getProbePositions() const { return mProbePositions; }
 
-    // ── Bake-time grid configuration ──────────────────────────────────────
-    //
-    // Takes effect on the next bakeProbes() call — does NOT relocate
-    // existing probes. Range-clamped to keep CPU cost reasonable.
-
+    // Bake-time grid config — takes effect on next bake. Does NOT relocate.
     void  setProbeSpacingFt(float ft) { mProbeSpacingFt = std::max(1.0f, std::min(ft, 20.0f)); }
     float getProbeSpacingFt() const { return mProbeSpacingFt; }
     void  setProbeHeightFt(float ft) { mProbeHeightFt = std::max(0.5f, std::min(ft, 20.0f)); }
@@ -230,21 +203,15 @@ public:
 private:
     ProbeManagerDeps mDeps;
 
-    // ── Owned state ───────────────────────────────────────────────────────
+    IPLProbeBatch mIplProbeBatch = nullptr;
+    int  mProbeCount = 0;
+    bool mProbesHaveReflections = false;
 
-    IPLProbeBatch mIplProbeBatch = nullptr;  ///< Loaded probe data (positions + baked paths + reflections)
-    int  mProbeCount = 0;                    ///< Number of probes in the batch
-    bool mProbesHaveReflections = false;     ///< True if loaded probes contain baked reflection IRs
-
-    /// Grid parameters used at bake time. Read by bakeProbes() when the
-    /// caller passes a negative override. Live-tunable via console but only
-    /// take effect on the next re-bake.
+    /// Negative override → use these values at bake time.
     float mProbeSpacingFt = 5.0f;
     float mProbeHeightFt  = 5.0f;
 
-    /// Probe positions in engine feet. Populated by bakeProbes() and loaded
-    /// from a sidecar file by loadProbes(). Used purely for debug overlay
-    /// rendering — Steam Audio holds the canonical copy internally.
+    /// Debug-overlay mirror (Steam Audio holds the canonical copy).
     std::vector<Vector3> mProbePositions;
 };
 

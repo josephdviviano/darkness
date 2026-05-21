@@ -23,16 +23,20 @@
 
 #include "AudioLog.h"
 #include "ProbeFile.h"
+#include "SteamAudioPathing.h"
 #include "logger.h"
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <sys/stat.h>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -43,26 +47,11 @@
 
 namespace Darkness {
 
-// ── Engine ↔ Steam Audio coordinate-system bridge ─────────────────────────
-//
-// Dark Engine uses a right-handed Z-up system: +X right, +Y forward, +Z up.
-// Steam Audio uses a right-handed Y-up system: +X right, +Y up, -Z ahead.
-//
-// Mapping (matches AudioService.cpp boundary helpers):
-//   engine +X (yaw=0 ahead) → IPL -Z (IPL ahead)
-//   engine +Y (engine fwd)  → IPL -X (IPL left)
-//   engine +Z (up)          → IPL +Y (up)
-//
-// In coordinate form: engine (x, y, z) → IPL (-y, z, -x).  Determinant
-// of the rotation matrix is +1 (handedness preserved).
-//
-// Probe generation with UNIFORMFLOOR raycasts along IPL -Y to find floors,
-// so the transformed scene MUST be Y-up at the IPL boundary. Distance fields
-// crossing into IPL are scaled by kFeetToMeters.
+// Engine ↔ IPL coord bridge. Engine: RH Z-up (+X right, +Y forward, +Z up).
+// IPL: RH Y-up (+X right, +Y up, -Z ahead). Mapping: engine (x,y,z) →
+// IPL (-y, z, -x), det=+1 (handedness preserved). Distance fields crossing
+// the boundary scale by kFeetToMeters. Matches AudioService.cpp helpers.
 namespace {
-
-constexpr float kFeetToMeters = 0.3048f;
-constexpr float kMetersToFeet = 1.0f / kFeetToMeters;
 
 inline IPLVector3 engineToIplPos(const Vector3 &p) {
     return { -p.y * kFeetToMeters,
@@ -73,6 +62,41 @@ inline Vector3 iplToEnginePos(const IPLVector3 &p) {
     return Vector3(-p.z * kMetersToFeet,
                    -p.x * kMetersToFeet,
                     p.y * kMetersToFeet);
+}
+
+struct PlaceResult {
+    bool    ok;
+    Vector3 pos;
+    int     iters;  // 0=accepted as-is; N>0=nudged N times (or hit cap if !ok)
+};
+
+/// Place a probe through the filter, nudging up to maxIters times. 4
+/// iterations is generous — typical recovery converges in 1-2. Adds a
+/// 0.5 ft margin to each nudge so the next eval lands inside the valid
+/// region (avoids float-jitter ping-pong at the boundary).
+inline PlaceResult tryPlaceProbe(Vector3 pos, const ProbeFilterFn &filter,
+                                 int maxIters = 4)
+{
+    if (!filter) return { true, pos, 0 };
+    constexpr float kNudgeMarginFt = 0.5f;
+    Vector3 cur = pos;
+    for (int it = 0; it <= maxIters; ++it) {
+        ProbeFilterDecision d = filter(cur);
+        switch (d.result) {
+            case ProbeFilterResult::Accept:
+                return { true, cur, it };
+            case ProbeFilterResult::Reject:
+                return { false, cur, it };
+            case ProbeFilterResult::Nudge:
+                // Degenerate direction → reject rather than spin.
+                if (glm::dot(d.nudgeDir, d.nudgeDir) < 1e-6f) {
+                    return { false, cur, it };
+                }
+                cur += d.nudgeDir * (d.nudgeDistFt + kNudgeMarginFt);
+                break;
+        }
+    }
+    return { false, cur, maxIters };
 }
 
 } // namespace
@@ -86,10 +110,8 @@ ProbeManager::ProbeManager(ProbeManagerDeps deps)
 
 ProbeManager::~ProbeManager()
 {
-    // Release the probe batch if still loaded. We do not have a simulator
-    // handle here (AudioService releases the simulator first in
-    // destroyAcousticScene and then releases the manager), so this is a
-    // pure release without simulator de-registration.
+    // Pure release — AudioService releases the simulator first, so no
+    // simulator de-registration is needed here.
     if (mIplProbeBatch) {
         iplProbeBatchRelease(&mIplProbeBatch);
         mIplProbeBatch = nullptr;
@@ -109,13 +131,14 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         return false;
     }
 
-    // Negative sentinel → use the manager's configured spacing/height.
-    // Callers who want an explicit one-off bake spacing can pass a positive
-    // value via ProbeBakeParams.
+    // Negative override → manager defaults.
     float spacing = (params.spacingFtOverride > 0.0f) ? params.spacingFtOverride : mProbeSpacingFt;
     float height  = (params.heightFtOverride  > 0.0f) ? params.heightFtOverride  : mProbeHeightFt;
 
-    AUDIO_LOG( "Baking probes: spacing=%.1f height=%.1f ...\n", spacing, height);
+    AUDIO_LOG( "Baking probes: spacing=%.1f height=%.1f "
+               "(min_wall_clearance=%.1fft, filter=%s)\n",
+                 spacing, height, params.minWallClearanceFt,
+                 params.probeFilter ? "enabled" : "disabled");
 
     // Step 1: Generate probes on a uniform floor grid
     IPLProbeArray probeArray = nullptr;
@@ -125,27 +148,11 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         return false;
     }
 
-    // Build the OBB transform for IPL_PROBEGENERATIONTYPE_UNIFORMFLOOR. Per
-    // the Steam Audio docs, the transform maps an axis-aligned UNIT CUBE
-    // [0,1]³ into world space. Probes are then generated by raycasting along
-    // IPL -Y (its "down") to find floor surfaces, offset by `height` along
-    // IPL +Y.
-    //
-    // Two non-obvious things to get right:
-    //   1. The unit cube is [0,1]³ — NOT [-0.5, 0.5]³.  Using `center` as
-    //      the translation would silently shift the entire probe volume by
-    //      `extent/2` (symptoms: probes outside the playable area, above
-    //      the player, behind walls in the +shift direction).
-    //   2. IPL is Y-up while the engine is Z-up.  The mesh, listener, and
-    //      sources are all in IPL Y-up space at this point (engineToIplPos
-    //      at the boundary), so the probe OBB must be defined in IPL space
-    //      too — otherwise UNIFORMFLOOR raycasts along the wrong axis and
-    //      places probes wherever it happens to hit a wall.
-    //
-    // Mapping: an engine AABB at [(minX,minY,minZ), (maxX,maxY,maxZ)] in
-    // feet maps to IPL [(minX, minZ, -maxY), (maxX, maxZ, -minY)] in meters.
-    // We expand by one spacing on every side so probes cover near-edge
-    // areas, then express the result as a [0,1]³ scale + translation.
+    // UNIFORMFLOOR transform maps the UNIT CUBE [0,1]³ into world space (NOT
+    // [-0.5,0.5]³ — using `center` as translation shifts the volume by
+    // extent/2 and silently misplaces probes). OBB must be in IPL Y-up
+    // space — raycasts go along IPL -Y to find floors. Expanded by one
+    // spacing margin so probes cover near-edge areas.
     const Vector3 marginFt(spacing);
     Vector3 origMin = params.sceneMin - marginFt;       // engine-space, feet
     Vector3 origMax = params.sceneMax + marginFt;
@@ -205,20 +212,46 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         return false;
     }
 
-    // Snapshot probe centers BEFORE releasing the probeArray. We mirror them
-    // into engine feet (Z-up) so the renderer's debug overlay doesn't need
-    // to know anything about IPL's coordinate system.  iplToEnginePos
-    // reverses both the metric scale AND the Y-up→Z-up axis swap that we
-    // applied at the boundary above.
+    // Per-probe filtered add — drops in-wall / wall-adjacent / unreachable
+    // candidates BEFORE baking, so the .probes file never contains bad
+    // probes. Placement passes APPEND to mProbePositions; the IPL batch
+    // is populated in a single final loop after a global dedup pass
+    // filters cross-pass overlaps. Index in mProbePositions = batch index
+    // (sidecars + energy audit address by that index).
     mProbePositions.clear();
     mProbePositions.reserve(static_cast<size_t>(numProbes));
+    int rejectedFloor = 0;
+    int nudgedFloor   = 0;
     for (int i = 0; i < numProbes; ++i) {
         IPLSphere s = iplProbeArrayGetProbe(probeArray, i);
-        mProbePositions.push_back(iplToEnginePos(s.center));
+        Vector3 enginePos = iplToEnginePos(s.center);
+        PlaceResult pr = tryPlaceProbe(enginePos, params.probeFilter);
+        if (!pr.ok) {
+            ++rejectedFloor;
+            continue;
+        }
+        if (pr.iters > 0) ++nudgedFloor;
+        mProbePositions.push_back(pr.pos);
     }
+    iplProbeArrayRelease(&probeArray);  // generator output no longer needed
 
-    iplProbeBatchAddProbeArray(probeBatch, probeArray);
-    iplProbeArrayRelease(&probeArray);  // batch now owns the probe data
+    const int floorKept = static_cast<int>(mProbePositions.size());
+    AUDIO_LOG("Floor probes: %d kept (%d nudged), %d rejected by filter "
+              "(%d candidates)\n",
+              floorKept, nudgedFloor, rejectedFloor, numProbes);
+
+    if (floorKept == 0) {
+        // Misconfigured filter (clearance too aggressive); fail loudly
+        // rather than write an empty .probes file that breaks reverb.
+        LOG_ERROR("ProbeManager: filter rejected every floor probe "
+                  "(%d candidates) — refusing to bake an empty batch. "
+                  "Check audio.probes.min_wall_clearance_ft.",
+                  numProbes);
+        iplProbeBatchRelease(&probeBatch);
+        return false;
+    }
+    // numProbes now refers to the actual batch size (elevation/portal add to this).
+    numProbes = floorKept;
 
     // ── Extra coverage: elevation tier + portal-centric rings ──
     //
@@ -241,60 +274,83 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     int extraProbeCount = 0;
 
     if (!params.additionalElevations.empty()) {
-        const float probeRadiusM = spacing * kFeetToMeters;
+        // Sparse elevation: bin floor probes on a coarser (x,y) grid and
+        // emit one elevation probe per non-empty bin (centroid). With
+        // sparsityMul=2 + 5ft spacing → 10ft bins → 1:4 elevation:floor
+        // ratio. Enough density for vertical inter-level connectivity
+        // via probe-to-probe visibility.
         const size_t floorProbeCount = mProbePositions.size();
+        const float  binSizeFt       = spacing
+                                     * std::max(1.0f, params.elevationSparsityMul);
+        const float  invBinSizeFt    = 1.0f / binSizeFt;
+
+        struct BinAcc { Vector3 sum{0.0f, 0.0f, 0.0f}; int count = 0; };
+        std::map<std::pair<int, int>, BinAcc> bins;
+        for (size_t i = 0; i < floorProbeCount; ++i) {
+            const Vector3 &p = mProbePositions[i];
+            int bx = static_cast<int>(std::floor(p.x * invBinSizeFt));
+            int by = static_cast<int>(std::floor(p.y * invBinSizeFt));
+            auto &b = bins[{bx, by}];
+            b.sum.x += p.x;
+            b.sum.y += p.y;
+            b.sum.z += p.z;
+            b.count++;
+        }
+
+        int rejectedElev = 0;
+        int nudgedElev   = 0;
+        int addedElev    = 0;
         for (float elevFt : params.additionalElevations) {
             if (elevFt <= 0.0f) continue;
-            for (size_t i = 0; i < floorProbeCount; ++i) {
-                Vector3 elevated = mProbePositions[i];
-                elevated.z += elevFt;
-                IPLSphere s{};
-                s.center = engineToIplPos(elevated);
-                s.radius = probeRadiusM;
-                iplProbeBatchAddProbe(probeBatch, s);
-                mProbePositions.push_back(elevated);
+            for (auto &kv : bins) {
+                const BinAcc &b = kv.second;
+                const float invCount = 1.0f / static_cast<float>(b.count);
+                Vector3 centroid(b.sum.x * invCount,
+                                 b.sum.y * invCount,
+                                 b.sum.z * invCount);
+                centroid.z += elevFt;
+                PlaceResult pr = tryPlaceProbe(centroid, params.probeFilter);
+                if (!pr.ok) { ++rejectedElev; continue; }
+                if (pr.iters > 0) ++nudgedElev;
+                mProbePositions.push_back(pr.pos);
                 ++extraProbeCount;
+                ++addedElev;
             }
         }
         AUDIO_LOG("Added %d elevation-tier probes "
-                  "(floor count=%zu, tiers=%zu)\n",
-                  extraProbeCount, floorProbeCount,
-                  params.additionalElevations.size());
+                  "(floor count=%zu, tiers=%zu, bins=%zu, sparsityMul=%.1f, "
+                  "%d nudged, %d rejected by filter)\n",
+                  addedElev, floorProbeCount,
+                  params.additionalElevations.size(),
+                  bins.size(), params.elevationSparsityMul,
+                  nudgedElev, rejectedElev);
     }
 
     if (!params.portalAxes.empty()) {
-        // Replace the legacy 4-probe on-portal-plane ring with up to 2
-        // axial-offset probes per portal. Each candidate is dropped if
-        // an existing floor/elevation probe already sits within
-        // `dedupRadiusFt` — the floor grid covers it and a portal-anchor
-        // there would only contribute duplicate IR weight at runtime.
-        // Surviving candidates are the "openings without nearby grid
-        // coverage" case (windows, vents, isolated hatches).
-        const float probeRadiusM   = spacing * kFeetToMeters;
+        // Up to 2 axial-offset probes per portal. Drop candidates within
+        // dedupRadiusFt of an existing floor/elevation probe (already
+        // covered). Survivors are openings without nearby grid coverage
+        // (windows, vents, isolated hatches).
         const float axialOffsetFt  = params.portalAxialOffsetFt;
         const float dedupRadiusFt  = params.portalDedupRadiusFt;
         const float dedupRadiusSq  = dedupRadiusFt * dedupRadiusFt;
 
-        // Snapshot the floor+elevation tier size BEFORE adding portal
-        // probes so the proximity test only considers grid neighbours,
-        // not the portal anchors we add inside the loop (otherwise the
-        // second candidate of a portal pair would dedup against the
-        // first, which is exactly the doorway hotspot we're fixing).
+        // Snapshot BEFORE adding portal probes — otherwise the second
+        // candidate of a pair dedups against the first (the doorway
+        // hotspot we're fixing).
         const size_t gridProbeCount = mProbePositions.size();
 
         int portalProbeCount = 0;
         int dedupedCount     = 0;
+        int rejectedCount    = 0;
+        int nudgedCount      = 0;
         for (const auto &axis : params.portalAxes) {
             const Vector3 candidates[2] = {
                 axis.center + axis.normal * axialOffsetFt,
                 axis.center - axis.normal * axialOffsetFt,
             };
             for (const Vector3 &p : candidates) {
-                // O(grid) brute scan — at miss6 sizes (~10k grid × ~1k
-                // candidates) this is ~10M float ops, well under a
-                // second. If bake density ever grows to where this
-                // matters, swap to a uniform-cell hash on (x,y) — but
-                // until then the simpler code is the better trade.
+                // O(grid) brute scan — at miss6 scale this is ~10M ops, fine.
                 bool tooClose = false;
                 for (size_t i = 0; i < gridProbeCount; ++i) {
                     Vector3 d = mProbePositions[i] - p;
@@ -302,30 +358,75 @@ bool ProbeManager::bakeProbes(IPLScene scene,
                 }
                 if (tooClose) { ++dedupedCount; continue; }
 
-                IPLSphere s{};
-                s.center = engineToIplPos(p);
-                s.radius = probeRadiusM;
-                iplProbeBatchAddProbe(probeBatch, s);
-                mProbePositions.push_back(p);
+                // Portal anchors sit ~1ft off the doorway plane — wall-
+                // adjacent by design. Nudge loop pushes anchors near
+                // thick frames further into the room rather than dropping.
+                PlaceResult pr = tryPlaceProbe(p, params.probeFilter);
+                if (!pr.ok) { ++rejectedCount; continue; }
+                if (pr.iters > 0) ++nudgedCount;
+
+                mProbePositions.push_back(pr.pos);
                 ++extraProbeCount;
                 ++portalProbeCount;
             }
         }
         AUDIO_LOG("Added %d portal-axis probes around %zu portals "
                   "(axialOffset=%.1fft, dedupRadius=%.1fft, "
-                  "%d candidates deduped against floor grid)\n",
+                  "%d deduped, %d nudged, %d rejected by filter)\n",
                   portalProbeCount, params.portalAxes.size(),
-                  axialOffsetFt, dedupRadiusFt, dedupedCount);
+                  axialOffsetFt, dedupRadiusFt, dedupedCount,
+                  nudgedCount, rejectedCount);
     }
 
     if (extraProbeCount > 0) {
-        // Keep numProbes in sync with the actual batch size so downstream
-        // bake stages, the round-trip validation, and the .energy.csv
-        // audit all iterate the full set.
-        numProbes = static_cast<int>(mProbePositions.size());
-        AUDIO_LOG("Total probes after extension: %d "
+        AUDIO_LOG("Probes after placement (pre-dedup): %zu "
                   "(floor=%d, extra=%d)\n",
-                  numProbes, numProbes - extraProbeCount, extraProbeCount);
+                  mProbePositions.size(),
+                  static_cast<int>(mProbePositions.size()) - extraProbeCount,
+                  extraProbeCount);
+    }
+
+    // Global dedup: walk in placement order; drop probes within
+    // globalDedupRadiusFt of an earlier-kept probe. Earlier passes
+    // (floor → elevation → portal → emitter) win. Safety net for
+    // cross-pass overlap. O(N²) at bake time only.
+    if (params.globalDedupRadiusFt > 0.0f && mProbePositions.size() > 1) {
+        const float dedupRadiusSq = params.globalDedupRadiusFt
+                                  * params.globalDedupRadiusFt;
+        std::vector<Vector3> kept;
+        kept.reserve(mProbePositions.size());
+        int globalDeduped = 0;
+        for (const Vector3 &p : mProbePositions) {
+            bool tooClose = false;
+            for (const Vector3 &k : kept) {
+                Vector3 d = k - p;
+                if (glm::dot(d, d) < dedupRadiusSq) { tooClose = true; break; }
+            }
+            if (tooClose) { ++globalDeduped; continue; }
+            kept.push_back(p);
+        }
+        if (globalDeduped > 0) {
+            AUDIO_LOG("Global dedup: kept %zu / %zu probes "
+                      "(%d deduped at %.1f ft)\n",
+                      kept.size(), mProbePositions.size(),
+                      globalDeduped, params.globalDedupRadiusFt);
+        }
+        mProbePositions = std::move(kept);
+    }
+
+    // Commit survivors to the IPL batch. Uniform radius (one floor
+    // spacing in meters) matches bake `radius` and runtime `visRadius`
+    // for consistent visibility across passes.
+    {
+        const float probeRadiusM = spacing * kFeetToMeters;
+        for (const Vector3 &p : mProbePositions) {
+            IPLSphere s{};
+            s.center = engineToIplPos(p);
+            s.radius = probeRadiusM;
+            iplProbeBatchAddProbe(probeBatch, s);
+        }
+        numProbes = static_cast<int>(mProbePositions.size());
+        AUDIO_LOG("Emitted %d probes to IPL batch\n", numProbes);
     }
 
     iplProbeBatchCommit(probeBatch);
@@ -337,18 +438,18 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     pathId.type = IPL_BAKEDDATATYPE_PATHING;
     pathId.variation = IPL_BAKEDDATAVARIATION_DYNAMIC;
 
-    // Pathing bake — all distance-shaped fields cross into IPL, so feet → meters.
-    // `spacing` and `propagationMaxDist` live in engine feet; convert here.
+    // Pathing bake — all distances are feet → meters at the IPL boundary.
+    // radius/threshold/visRange MUST agree with runtime IPLSimulationInputs.
     IPLPathBakeParams bakeParams{};
     bakeParams.scene = scene;
     bakeParams.probeBatch = probeBatch;
     bakeParams.identifier = pathId;
-    bakeParams.numSamples = 4;                                          // visibility test samples (rays = numSamples²)
-    bakeParams.radius = spacing * kFeetToMeters;                        // probe influence radius (m)
-    bakeParams.threshold = 0.1f;                                        // visibility threshold (dimensionless)
-    bakeParams.visRange  = params.propagationMaxDist * kFeetToMeters;   // max visibility distance (m)
-    bakeParams.pathRange = params.propagationMaxDist * kFeetToMeters;   // max path length (m)
-    bakeParams.numThreads = 4;                                          // parallel baking
+    bakeParams.numSamples = 4;                                          // rays = numSamples²
+    bakeParams.radius = pathingVisRadiusMeters(spacing);
+    bakeParams.threshold = kPathingVisThreshold;
+    bakeParams.visRange  = params.propagationMaxDist * kFeetToMeters;
+    bakeParams.pathRange = params.propagationMaxDist * kFeetToMeters;
+    bakeParams.numThreads = 4;
 
     auto bakeStart = std::chrono::steady_clock::now();
 
@@ -364,10 +465,9 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     AUDIO_LOG( "Pathing bake complete: %d probes in %.1f seconds\n",
                  numProbes, bakeSec);
 
-    // Step 3b: Bake reflection IRs at each probe position.
-    // This pre-computes reverb impulse responses so that voices outside the
-    // real-time top-N can use baked reverb instead of being dry.
-    // Uses REVERB variation — one bake covers all sources (listener-position-based).
+    // Step 3b: Bake reflection IRs. REVERB variation = one bake covers
+    // all sources (listener-position-based); lets voices outside the
+    // realtime top-N use baked reverb instead of going dry.
     AUDIO_LOG( "Baking reflection IRs for %d probes (rays=%d bounces=%d duration=%.1fs diffuse=%d order=%d)...\n",
                  numProbes, params.bakeNumRays, params.bakeNumBounces,
                  params.bakeDuration, params.bakeDiffuseSamples,
@@ -388,16 +488,10 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     reflBakeParams.sceneType = (params.sceneType == "embree")
         ? IPL_SCENETYPE_EMBREE : IPL_SCENETYPE_DEFAULT;
     reflBakeParams.identifier = reflId;
-    // Both flags required for HYBRID reverb mode:
-    //   BAKECONVOLUTION — per-probe ambisonic IR (early reflections,
-    //                     deterministic, spatial)
-    //   BAKEPARAMETRIC  — per-probe 3-band RT60 reverb times (late
-    //                     tail, drives parametric FDN decay)
-    // Without BAKEPARAMETRIC, iplProbeBatchGetReverb returns zeros,
-    // which leaves IPLReflectionEffectParams.reverbTimes at 0 in
-    // hybrid-mode apply calls. Steam Audio's parametric reverb then
-    // runs with undefined decay, producing the "second reverb
-    // playing fully" artefact the user reported (2026-05-20).
+    // HYBRID needs BOTH flags: BAKECONVOLUTION = per-probe ambisonic IR
+    // (early reflections); BAKEPARAMETRIC = per-probe 3-band RT60 (late
+    // tail). Without PARAMETRIC, reverbTimes stays 0 → undefined decay
+    // → "second reverb fully audible" artefact.
     reflBakeParams.bakeFlags = static_cast<IPLReflectionsBakeFlags>(
         IPL_REFLECTIONSBAKEFLAGS_BAKECONVOLUTION
         | IPL_REFLECTIONSBAKEFLAGS_BAKEPARAMETRIC);
@@ -405,13 +499,12 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     reflBakeParams.numDiffuseSamples = params.bakeDiffuseSamples;
     reflBakeParams.numBounces = params.bakeNumBounces;
     reflBakeParams.simulatedDuration = params.bakeDuration;
-    reflBakeParams.savedDuration = params.bakeDuration;  // save full IR
+    reflBakeParams.savedDuration = params.bakeDuration;
     reflBakeParams.order = params.ambisonicsOrder;
     reflBakeParams.numThreads = bakeThreads;
-    // irradianceMinDistance is in METERS (Steam Audio convention) — clamps the
-    // inner radius of the irradiance integral to avoid singularities for sources
-    // very close to a probe. 1.0m ≈ 3.28 ft is a sensible physical default.
-    reflBakeParams.irradianceMinDistance = 1.0f;
+    // Meters. Shared with runtime sim (AudioUnits.h) — bake and runtime
+    // MUST agree on this singularity clamp or IR energies desync.
+    reflBakeParams.irradianceMinDistance = kIrradianceMinDistanceMeters;
 
     auto reflBakeStart = std::chrono::steady_clock::now();
 
@@ -427,32 +520,12 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     AUDIO_LOG( "Reflection bake complete: %d probes in %.1f seconds\n",
                  numProbes, reflBakeSec);
 
-    // Step 3c: Per-probe IR energy audit.
-    //
-    // Baked IRs vary wildly in total energy across probes. Probes sitting in
-    // small enclosed spaces with hard surfaces accumulate disproportionate
-    // diffuse-field energy compared to probes in open or absorbent areas.
-    // When the listener's nearest probe is one of these "hot" IRs and a
-    // continuous source (ambient) feeds the convolver, the wet bus saturates.
-    //
-    // This audit dumps per-probe metrics so we can identify outliers and
-    // decide whether the fix belongs in bake parameters (absorption, bounces),
-    // in probe rejection (skip outliers), or in IR normalization.
-    //
-    // The Steam Audio energy field is a 3D histogram of size
-    // (#channels × #bands × #bins), with each bin being 10 ms of arrival time.
-    // We compute:
-    //   - totalEnergy: integrated energy across all channels/bands/bins
-    //     (broadband, omnidirectional reverb intensity)
-    //   - peakBin:     largest single-bin value (early-reflection clustering)
-    //   - earlyEnergy: integrated energy in the first 50 ms (5 bins) — high
-    //                  values mean clustered close-wall reflections
-    //   - bandEnergy[3]: per-band totals — to spot frequency-specific spikes
-    //                    (hard walls reflect highs; absorbent surfaces don't)
-    //
-    // Output is a `.energy.csv` sidecar next to the .probes file, plus a
-    // stderr summary noting min/max/median total energy so outliers are
-    // visible without grepping the CSV.
+    // Step 3c: Per-probe IR energy audit. Baked IRs vary wildly in total
+    // energy; "hot" probes (small hard-surfaced rooms) saturate the wet bus
+    // when listened to. Dumps a `.energy.csv` sidecar + stderr min/median/
+    // max summary so outliers are visible. Metrics per probe: totalEnergy,
+    // peakBin (early-cluster signature), earlyEnergy (first 50ms),
+    // bandEnergy[3] (per-frequency-band totals).
     {
         IPLEnergyFieldSettings efSettings{};
         efSettings.duration = params.bakeDuration;
@@ -489,15 +562,11 @@ bool ProbeManager::bakeProbes(IPLScene scene,
                 iplProbeBatchGetEnergyField(probeBatch, &reflId, p,
                                              energyField);
 
-                // Only the W channel (channel 0) is the omnidirectional
-                // energy term and is guaranteed non-negative. Higher-order
-                // Ambisonic channels are signed spherical-harmonic
-                // coefficients that encode directional variation; summing
-                // them produces meaningless near-zero/negative totals
-                // because the harmonics cancel. The W coefficient is
-                // proportional to the angular integral of incident energy,
-                // which is exactly the per-probe "total reverb energy"
-                // metric we want.
+                // Only W channel (channel 0) — omni energy, non-negative.
+                // Higher-order channels are signed SH coefficients; summing
+                // them produces meaningless near-zero totals as harmonics
+                // cancel. W is proportional to the angular integral of
+                // incident energy = the per-probe "total reverb" metric.
                 double totalEnergy = 0.0;
                 double earlyEnergy = 0.0;
                 float  peakBin     = 0.0f;
@@ -533,10 +602,8 @@ bool ProbeManager::bakeProbes(IPLScene scene,
                           energyPath.c_str(), numProbes);
             }
 
-            // Stderr summary: min/median/max + indices so the outliers
-            // jump out without inspecting the CSV. Probes whose totalEnergy
-            // sits >10× above the median are the suspects for runaway
-            // reverb when the listener parks near them.
+            // Stderr summary — outliers >10× median are the suspect probes
+            // for runaway reverb when the listener parks near them.
             if (numProbes > 0) {
                 std::vector<int> sorted(numProbes);
                 for (int i = 0; i < numProbes; ++i) sorted[i] = i;
@@ -581,8 +648,7 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     IPLsize dataSize = iplSerializedObjectGetSize(serializedObject);
     IPLbyte *data = iplSerializedObjectGetData(serializedObject);
 
-    // Step 5: Round-trip validation — deserialize in memory and verify probe count
-    // matches what we baked. Catches serialization bugs before they hit disk.
+    // Round-trip validate before writing to disk.
     {
         IPLSerializedObjectSettings rtSettings{};
         rtSettings.data = data;
@@ -637,12 +703,9 @@ bool ProbeManager::bakeProbes(IPLScene scene,
                  numProbes, outputPath.c_str(), static_cast<size_t>(dataSize),
                  kProbeFileHeaderSize);
 
-    // Sidecar: dump probe positions as a plain CSV for the debug overlay.
-    // The Steam Audio public API does NOT expose per-probe positions on a
-    // deserialized IPLProbeBatch, so we mirror them ourselves. Plain text
-    // keeps the file inspectable; cost is ~25 bytes/probe so even 50k probes
-    // fits in ~1.2 MB. Failure to write is non-fatal — the overlay just
-    // won't have positions until the next bake.
+    // CSV sidecar — Steam Audio doesn't expose per-probe positions on a
+    // deserialized batch, so we mirror them. Failure is non-fatal (the
+    // overlay just lacks positions until the next bake).
     {
         std::string posPath = outputPath + ".positions.csv";
         FILE *pf = std::fopen(posPath.c_str(), "w");
@@ -750,25 +813,34 @@ bool ProbeManager::loadProbes(const std::string &probePath,
     iplSimulatorAddProbeBatch(reflectionSimulator, mIplProbeBatch);
     iplSimulatorCommit(reflectionSimulator);
 
-    // Check if the probe batch contains baked reflection IRs.
-    // If so, non-top-N voices can use baked reverb instead of being dry.
+    // Reflection IRs present? Non-top-N voices use baked reverb when yes.
     IPLBakedDataIdentifier reflId{};
     reflId.type = IPL_BAKEDDATATYPE_REFLECTIONS;
     reflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
     IPLsize reflDataSize = iplProbeBatchGetDataSize(mIplProbeBatch, &reflId);
     mProbesHaveReflections = (reflDataSize > 0);
 
+    // Pathing graph present? A batch can have one without the other.
+    // Missing graph → iplSimulatorRunPathing returns eqCoeffs=[0,0,0]
+    // (audible as per-callback choppy gaps in the wet bus on ambients).
+    IPLBakedDataIdentifier pathId{};
+    pathId.type = IPL_BAKEDDATATYPE_PATHING;
+    pathId.variation = IPL_BAKEDDATAVARIATION_DYNAMIC;
+    IPLsize pathDataSize = iplProbeBatchGetDataSize(mIplProbeBatch, &pathId);
+
     AUDIO_LOG( "ProbeManager: loaded %d probes from '%s' "
-                 "(reflections=%s, refl_size=%zu bytes, crc=0x%08x)\n",
+                 "(reflections=%s, refl_size=%zu bytes, "
+                 "pathing=%s, path_size=%zu bytes, crc=0x%08x)\n",
                  mProbeCount, probePath.c_str(),
                  mProbesHaveReflections ? "yes" : "no",
-                 static_cast<size_t>(reflDataSize), hdr.crc32);
+                 static_cast<size_t>(reflDataSize),
+                 (pathDataSize > 0) ? "yes" : "no",
+                 static_cast<size_t>(pathDataSize),
+                 hdr.crc32);
 
-    // Load the positions sidecar (written by bakeProbes alongside the .probes
-    // file). The Steam Audio public API doesn't expose per-probe positions on
-    // a deserialized batch, so we keep our own mirror. If the sidecar is
-    // missing or stale (count mismatch), debug overlays will simply be empty
-    // until the next bake.
+    // Load positions sidecar (Steam Audio doesn't expose per-probe positions
+    // on a deserialized batch). Missing/stale sidecar disables the overlay
+    // only — the IPL batch itself is fine.
     std::string posPath = probePath + ".positions.csv";
     FILE *pf = std::fopen(posPath.c_str(), "r");
     if (pf) {
@@ -824,24 +896,20 @@ void ProbeManager::releaseBatch(IPLSimulator reflectionSimulator)
 std::string ProbeManager::getProbeFilePath(const std::string &misPath,
                                             const std::string &gameName)
 {
-    // Extract mission filename without extension
+    // Mission filename without extension, lowercased.
     std::string missionName;
-    auto lastSlash = misPath.find_last_of("/\\");
+    const auto lastSlash = misPath.find_last_of("/\\");
     std::string filename = (lastSlash != std::string::npos)
         ? misPath.substr(lastSlash + 1) : misPath;
-    auto dotPos = filename.rfind('.');
-    missionName = (dotPos != std::string::npos)
-        ? filename.substr(0, dotPos) : filename;
-
-    // Convert to lowercase for consistency
+    const auto dotPos = filename.rfind('.');
+    missionName = (dotPos != std::string::npos) ? filename.substr(0, dotPos) : filename;
     for (auto &c : missionName) c = static_cast<char>(std::tolower(c));
 
-    // Build path: ~/darkness/{gameName}/baked_probes/{missionName}.probes
+    // ~/darkness/{gameName}/baked_probes/{missionName}.probes — mkdir -p.
     const char *home = std::getenv("HOME");
     if (!home) home = ".";
-    std::string dir = std::string(home) + "/darkness/" + gameName + "/baked_probes";
+    const std::string dir = std::string(home) + "/darkness/" + gameName + "/baked_probes";
 
-    // Create directories (mkdir -p equivalent)
     std::string pathSoFar;
     for (size_t i = 0; i < dir.size(); ++i) {
         if (dir[i] == '/' || i == dir.size() - 1) {

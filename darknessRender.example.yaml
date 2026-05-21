@@ -256,6 +256,31 @@ audio:
     # rather than wrapping around through grid probes on either side.
     # Re-bake required.
     portal_rings: true
+    # Minimum clearance, in engine feet, between a baked probe and the
+    # nearest wall of its containing room. Drops two pathological cases
+    # before baking:
+    #   - inside-solid candidates (no containing room) → near-zero IR
+    #   - wall-adjacent candidates → strong first-bounce reflection
+    #     that comb-filters audio at multiples of c/(2·distance)
+    # 0 disables the clearance check (inside-solid rejection still runs).
+    # Default 5 ≈ 1.5 m, just outside the comb-filter danger zone
+    # (~0.5–1 m). Setting above ~half a corridor's width rejects every
+    # probe in that corridor — drop to 3 if you see coverage gaps. Re-bake
+    # required.
+    min_wall_clearance_ft: 5.0   # (0–50; 0 = clearance check off)
+    # Elevation-tier sparsity. Floor probes are binned on a coarser
+    # (x, y) grid (binSize = spacing × this) and ONE elevation probe is
+    # placed at each bin's centroid per tier. 2.0 = 2×2 binning = 1:4
+    # ratio of elevation to floor probes; 1.0 = legacy 1:1. With
+    # emitter-anchored probes covering wall/ceiling emitters at their
+    # actual positions, the elevation tier only needs enough density
+    # for vertical sound propagation between levels.
+    elevation_sparsity_mul: 2.0  # (1.0–8.0; higher = sparser; re-bake required)
+    # Global dedup pass radius (engine feet). After all probe placement
+    # (floor + elevation + portal + emitter), probes within this distance
+    # of an earlier-kept probe get dropped. Catches cross-pass overlaps.
+    # 0 = dedup disabled.
+    global_dedup_radius_ft: 2.0  # (0.0–10.0; re-bake required)
 
   occlusion:
     # Source occlusion + global material multipliers.
@@ -326,6 +351,29 @@ audio:
     # lower visibility threshold / denser probes) is too expensive. Does
     # NOT affect the LPF blocking factor — only amplitude.
     pathing_gain_scale: 1.0      # multiplier on pathing gain (0.1–10.0)
+    # Steam Audio pathing-simulation throttle. iplSimulatorRunPathing runs
+    # synchronously on the main loop thread; running it every frame can
+    # stall the audio callback and produce reverb-path dropouts on busy
+    # scenes. 0.1 s (10 Hz) matches the Unity/Unreal Steam Audio
+    # integration defaults — the listener moves <1 ft per update at
+    # walking speed, well below the threshold for hearing
+    # portalAttenuation/portalBlocking changes. Output reads (eqCoeffs →
+    # portal gain/LPF) still happen every frame and use Steam Audio's
+    # last-cached values, so audio stays smooth between sim runs. Set
+    # to 0.0 to update every frame (legacy / A-B diagnostic).
+    pathing_update_interval: 0.1 # min seconds between pathing-sim updates (0.0–1.0)
+    # Per-band weights for collapsing Steam Audio's 3-band eqCoeffs into
+    # the scalar portalAttenuation gain. Applied as
+    #   gain = wL·eqLow + wM·eqMid + wH·eqHigh
+    # then scaled by pathing_gain_scale. Default {0.25, 0.50, 0.25} is
+    # mid-heavy (roughly A-weighted). Weights NOT auto-normalised —
+    # sums other than 1.0 produce a flat boost/cut. Each component
+    # clamped to [0, 1]. Typical tunings:
+    #   [0.25, 0.50, 0.25] default mid-heavy
+    #   [0.50, 0.40, 0.10] bass-heavy — fuller cross-room sounds
+    #   [0.33, 0.34, 0.33] flat — highs contribute equally
+    #   [0.10, 0.40, 0.50] treble-heavy — muffled = quiet
+    pathing_gain_band_weights: [0.25, 0.50, 0.25]
 
   spatialization:
     # Listener-side HRTF + distance attenuation curve.

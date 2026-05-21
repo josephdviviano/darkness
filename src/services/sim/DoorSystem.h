@@ -50,6 +50,7 @@
 #include "property/PropertyService.h"
 #include "property/TypedProperty.h"
 #include "BinMeshParser.h"
+#include "sim/DoorAudioGeometry.h"
 #include "worldquery/ObjectState.h"
 
 namespace Darkness {
@@ -121,6 +122,12 @@ struct DoorState {
     // the axis perpendicular to the rotation axis.
     Vector3 pivotOffset = {0.0f, 0.0f, 0.0f};
 
+    // OBB dimensions in world units. Sourced from P$PhysDims, falling back to
+    // model bounding box multiplied by baseScale. Already in final (post-scale)
+    // world size, so audio-geometry consumers should NOT multiply by baseScale
+    // again. Zero means the door has no usable bounds (logged at init time).
+    Vector3 edgeLengths = {0.0f, 0.0f, 0.0f};
+
     // Renderer index — index into mission.objData.objects[] for quick lookup.
     // -1 if not found (archetype-only door, shouldn't happen for concrete objects).
     int renderIndex = -1;
@@ -133,6 +140,11 @@ struct DoorState {
 using DoorEventCallback = std::function<void(int32_t objID, DoorStatus newStatus,
                                               DoorStatus oldStatus,
                                               const DoorState &door)>;
+
+// DoorAudioGeometry lives in sim/DoorAudioGeometry.h so AudioService.cpp can
+// consume it without pulling in this header's transitive BinMeshParser.h
+// dependency (which lives in src/main and isn't visible from DarknessServices
+// translation units).
 
 // ============================================================================
 // DoorSystem — manages all doors in the level
@@ -291,6 +303,41 @@ public:
     /// position, allowing the player to walk through open doors.
     using CollisionUpdateCallback = std::function<void(int32_t objID, const Matrix4 &worldMatrix)>;
     void setCollisionUpdateCallback(CollisionUpdateCallback cb) { mCollisionUpdateCb = std::move(cb); }
+
+    /// Set callback for runtime audio-geometry transform updates. Called
+    /// per-frame with (objID, audioWorldMatrix) while a door is moving — the
+    /// matrix is the door's pose WITHOUT scale baked in (since door audio
+    /// meshes already encode their final dimensions in their vertices). The
+    /// callback should push the new transform into Steam Audio's acoustic
+    /// scene via iplInstancedMeshUpdateTransform so geometry-aware path
+    /// validation sees doors at their current position.
+    using AudioMeshUpdateCallback = std::function<void(int32_t objID, const Matrix4 &worldMatrix)>;
+    void setAudioMeshUpdateCallback(AudioMeshUpdateCallback cb) { mAudioMeshUpdateCb = std::move(cb); }
+
+    /// Snapshot every door's audio geometry — local-space OBB mesh + initial
+    /// world transform — for one-shot registration with the audio scene
+    /// (AudioService::registerDoorGeometry). Doors with zero edgeLengths are
+    /// skipped: they have no usable bounds and would degenerate the BVH.
+    /// Call AFTER init() and after the renderer has populated parsedModels.
+    std::vector<DoorAudioGeometry> getAudioGeometryInventory() const {
+        std::vector<DoorAudioGeometry> out;
+        out.reserve(mDoors.size());
+        for (const auto &[id, door] : mDoors) {
+            if (glm::length(door.edgeLengths) < 0.01f) {
+                std::fprintf(stderr,
+                    "[FALLBACK] DoorSystem::getAudioGeometryInventory: door %d "
+                    "has zero edgeLengths — skipping (no audio occlusion mesh)\n",
+                    id);
+                continue;
+            }
+            DoorAudioGeometry geom;
+            geom.objID = id;
+            buildBoxMesh(door.edgeLengths, geom.localVertices, geom.indices);
+            geom.worldTransform = computeAudioWorldMatrix(door);
+            out.push_back(std::move(geom));
+        }
+        return out;
+    }
 
     /// Get all door IDs (for debug enumeration).
     std::vector<int32_t> getAllDoorIDs() const {
@@ -569,6 +616,10 @@ private:
             std::fprintf(stderr, "[DEFAULT] DoorSystem::computePivotOffset: door %d has no PhysDims AND no model bbox — pivotOffset will be zero!\n", objID);
         }
 
+        // Cache the OBB dimensions for downstream consumers (e.g. audio
+        // geometry registration). Already in final post-scale world size.
+        door.edgeLengths = edgeLengths;
+
         // Compute COG offset matching the Dark Engine convention
         door.pivotOffset = Vector3(0.0f);
         switch (door.axis) {
@@ -736,11 +787,97 @@ private:
         if (reachedClosed) emitEvent(door, kDoorClosed, kDoorClosing);
     }
 
+    // Compute the door's world transform WITHOUT baseScale applied. Used by
+    // audio geometry (door OBB mesh already encodes its world dimensions in
+    // vertex coords, so a second scale multiply would double-scale).
+    Matrix4 computeAudioWorldMatrix(const DoorState &door) const {
+        Matrix4 worldTranslate = glm::translate(Matrix4(1.0f), door.basePosition);
+
+        if (door.type == kDoorRotating) {
+            const Matrix4 &baseMat = door.baseRotation;
+            Vector3 axisVec(0.0f);
+            switch (door.axis) {
+            case 0: axisVec.x = 1.0f; break;
+            case 1: axisVec.y = 1.0f; break;
+            case 2: axisVec.z = 1.0f; break;
+            }
+            if (std::abs(door.currentValue) < 1e-7f) {
+                return worldTranslate * baseMat;
+            }
+            Matrix4 offsetRot = glm::rotate(Matrix4(1.0f), door.currentValue, axisVec);
+            Matrix4 toPivot   = glm::translate(Matrix4(1.0f), -door.pivotOffset);
+            Matrix4 fromPivot = glm::translate(Matrix4(1.0f),  door.pivotOffset);
+            return worldTranslate * baseMat * fromPivot * offsetRot * toPivot;
+        }
+
+        // Translating door
+        float offset = door.currentValue;
+        Vector3 localOffset(0.0f);
+        switch (door.axis) {
+        case 0: localOffset.x = offset; break;
+        case 1: localOffset.y = offset; break;
+        case 2: localOffset.z = offset; break;
+        }
+        Matrix3 rotMat = Matrix3(door.baseRotation);
+        Vector3 worldOffset = rotMat * localOffset;
+        Matrix4 transMat = glm::translate(Matrix4(1.0f), worldOffset);
+        return worldTranslate * transMat * door.baseRotation;
+    }
+
+    // Build a closed-box triangle mesh centred at the model origin with the
+    // given edge lengths. 8 vertices, 12 triangles, outward-facing winding.
+    // Used for door audio OBB occluders.
+    static void buildBoxMesh(const Vector3 &edges,
+                             std::vector<float> &outVerts,
+                             std::vector<int32_t> &outIndices) {
+        const float hx = edges.x * 0.5f;
+        const float hy = edges.y * 0.5f;
+        const float hz = edges.z * 0.5f;
+        const float v[8][3] = {
+            {-hx, -hy, -hz}, { hx, -hy, -hz}, { hx,  hy, -hz}, {-hx,  hy, -hz},
+            {-hx, -hy,  hz}, { hx, -hy,  hz}, { hx,  hy,  hz}, {-hx,  hy,  hz},
+        };
+        outVerts.clear();
+        outVerts.reserve(24);
+        for (int i = 0; i < 8; ++i) {
+            outVerts.push_back(v[i][0]);
+            outVerts.push_back(v[i][1]);
+            outVerts.push_back(v[i][2]);
+        }
+        // 12 triangles, outward-facing (CCW from outside). For Steam Audio's
+        // ray-cast, winding only matters when materials use one-sided masks;
+        // CCW is the safe default.
+        static const int32_t tri[12][3] = {
+            // -Z face
+            {0, 2, 1}, {0, 3, 2},
+            // +Z face
+            {4, 5, 6}, {4, 6, 7},
+            // -Y face
+            {0, 1, 5}, {0, 5, 4},
+            // +Y face
+            {3, 6, 2}, {3, 7, 6},
+            // -X face
+            {0, 4, 7}, {0, 7, 3},
+            // +X face
+            {1, 2, 6}, {1, 6, 5},
+        };
+        outIndices.clear();
+        outIndices.reserve(36);
+        for (int i = 0; i < 12; ++i) {
+            outIndices.push_back(tri[i][0]);
+            outIndices.push_back(tri[i][1]);
+            outIndices.push_back(tri[i][2]);
+        }
+    }
+
     void applyDoorTransform(DoorState &door) {
         if (!mObjectStates) return;
 
         ObjectState &os = mObjectStates->get(door.objID);
         Matrix4 fullGlm(1.0f);
+        // Audio mesh uses the unscaled transform — its vertices already encode
+        // world dimensions (see DoorAudioGeometry / buildBoxMesh).
+        Matrix4 audioGlm = computeAudioWorldMatrix(door);
 
         if (door.type == kDoorRotating) {
             // Rotate around the hinge edge, not the model center.
@@ -827,6 +964,14 @@ private:
         if (mCollisionUpdateCb) {
             mCollisionUpdateCb(door.objID, fullGlm);
         }
+
+        // Push the unscaled transform into the audio acoustic scene so Steam
+        // Audio's geometry-aware path validation sees the door at its current
+        // pose. Skipped silently when no door audio mesh is registered for
+        // this object (zero-edgeLengths doors are filtered at registration).
+        if (mAudioMeshUpdateCb) {
+            mAudioMeshUpdateCb(door.objID, audioGlm);
+        }
     }
 
     void emitEvent(const DoorState &door, DoorStatus newStatus, DoorStatus oldStatus) {
@@ -853,6 +998,7 @@ private:
     DoorEventCallback mEventCallback;
     AudioBlockingCallback mAudioBlockingCallback;
     CollisionUpdateCallback mCollisionUpdateCb;
+    AudioMeshUpdateCallback mAudioMeshUpdateCb;
     uint32_t mFrameCount = 0;
 };
 

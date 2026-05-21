@@ -33,6 +33,7 @@
 #include "database/DatabaseCommon.h"
 #include "loop/LoopCommon.h"
 #include "audio/AudioDSPChain.h"
+#include "audio/AudioUnits.h"
 #include "audio/SchemaTypes.h"
 #include "room/RoomService.h"  // SoundPropInfo / SoundPropParams / SoundPathHop
 
@@ -61,6 +62,8 @@ struct _IPLScene_t;
 typedef _IPLScene_t* IPLScene;
 struct _IPLStaticMesh_t;
 typedef _IPLStaticMesh_t* IPLStaticMesh;
+struct _IPLInstancedMesh_t;
+typedef _IPLInstancedMesh_t* IPLInstancedMesh;
 struct _IPLSimulator_t;
 typedef _IPLSimulator_t* IPLSimulator;
 struct _IPLReflectionMixer_t;
@@ -113,6 +116,11 @@ struct AcousticSceneData {
 // Forward declarations for AI hearing data structs (defined in audio/AIHearingData.h)
 struct AIHearingStats;
 struct AISoundTweaks;
+
+// Forward declaration — defined in sim/DoorSystem.h. The audio service consumes
+// these to register door geometry with Steam Audio's acoustic scene so closed
+// doors block sound via geometry-aware path validation.
+struct DoorAudioGeometry;
 
 /// Event published by AudioService whenever a sound is emitted into the
 /// world. Listeners (AI hearing subsystem, debug overlays, recording
@@ -331,6 +339,27 @@ public:
     /** Get the portal blocking factor between two rooms.
      *  @return Blocking factor (0.0–1.0), or 0.0 if not set */
     float getBlockingFactor(int room1, int room2) const;
+
+    /** Register every door's audio geometry with the acoustic scene.
+     *  Builds one `IPLStaticMesh` + `IPLInstancedMesh` per door (mesh in the
+     *  door's model-local frame, instance at the door's current world pose)
+     *  so Steam Audio's geometry-aware pathing-validation can reject baked
+     *  path edges that pass through closed doors.
+     *
+     *  Must be called AFTER `buildAcousticScene` (mIplScene must exist) and
+     *  AFTER DoorSystem::init has populated door state. Doors with zero
+     *  edgeLengths are skipped at the DoorSystem side; this call expects a
+     *  pre-filtered list. Subsequent transform updates flow through
+     *  `setDoorTransform`. */
+    void registerDoorGeometry(const std::vector<DoorAudioGeometry> &doors);
+
+    /** Push a door's current world transform into the acoustic scene. The
+     *  transform should be the door's pose WITHOUT scale baked in — the
+     *  door's audio static mesh already encodes its final world dimensions
+     *  in its vertex coordinates (see DoorAudioGeometry). Setting a
+     *  transform marks the scene as needing a commit; the commit is
+     *  coalesced once per loopStep after reflection-sim is drained. */
+    void setDoorTransform(int32_t doorObjID, const Matrix4 &worldTransform);
 
     /** Load sound resources from a Thief 2 RES directory.
      *  Opens snd.crf and prepares the sound cache.
@@ -647,6 +676,50 @@ public:
     void  setPathingGainScale(float s) { mPathingGainScale = std::max(0.1f, std::min(s, 10.0f)); }
     float getPathingGainScale() const  { return mPathingGainScale; }
 
+    /** Companion knob to `setPathingGainScale`, but for the door-LPF
+     *  closure factor. The legacy mapping `blocking = 1 − eqHigh`
+     *  closes the LPF to ~400 Hz for typical cross-room ambients
+     *  (eqHigh ≈ 0.02), producing unrecognisably muffled output.
+     *  Multiplier in [0, 1]; lower values keep the LPF more open.
+     *  Does NOT affect gain. Range: [0.0, 1.0]. */
+    void  setPathingBlockingScale(float s) { mPathingBlockingScale = std::max(0.0f, std::min(s, 1.0f)); }
+    float getPathingBlockingScale() const  { return mPathingBlockingScale; }
+
+    /** Per-band weights that control how Steam Audio's 3-band eqCoeffs
+     *  collapse into the scalar portalAttenuation gain. Applied as
+     *  `gain = wL·eqLow + wM·eqMid + wH·eqHigh`, then multiplied by
+     *  `pathingGainScale`. Default {0.25, 0.50, 0.25} (mid-heavy
+     *  perceptual weighting). Weights are NOT auto-normalised — sums
+     *  other than 1.0 act as an additional flat boost or cut. Each
+     *  component clamped to [0, 1] at the setter. */
+    void  setPathingGainBandWeights(float low, float mid, float high) {
+        auto clamp01 = [](float v) {
+            if (!std::isfinite(v) || v < 0.0f) return 0.0f;
+            return v > 1.0f ? 1.0f : v;
+        };
+        mPathingGainWeightLow  = clamp01(low);
+        mPathingGainWeightMid  = clamp01(mid);
+        mPathingGainWeightHigh = clamp01(high);
+    }
+    float getPathingGainWeightLow()  const { return mPathingGainWeightLow;  }
+    float getPathingGainWeightMid()  const { return mPathingGainWeightMid;  }
+    float getPathingGainWeightHigh() const { return mPathingGainWeightHigh; }
+
+    /** Minimum interval (seconds) between successive Steam Audio
+     *  pathing-simulation updates. iplSimulatorRunPathing runs
+     *  synchronously on the main loop thread; throttling here also
+     *  skips the per-voice iplSourceSetInputs(...PATHING) staging on
+     *  the same frames. Output reads (eqCoeffs → portalAttenuation /
+     *  portalBlocking) keep running every frame and use Steam Audio's
+     *  last-cached outputs, so audio stays smooth between sim runs.
+     *  Default 0.1 s (10 Hz) matches the Unity/Unreal integration
+     *  defaults. 0.0 = update every frame (legacy / A-B diagnostic).
+     *  Range: [0.0, 1.0]. */
+    void  setPathingUpdateInterval(float s) {
+        mPathingUpdateInterval = std::max(0.0f, std::min(s, 1.0f));
+    }
+    float getPathingUpdateInterval() const { return mPathingUpdateInterval; }
+
     // ── Ambient tuning (facades — forwarded to AmbientSoundManager) ──
     void setAmbHysteresisStartMul(float m);
     void setAmbHysteresisStopMul(float m);
@@ -742,6 +815,36 @@ public:
      *  probes (±0.5 m on the portal plane) around each RoomService
      *  portal centroid. */
     void setProbePortalRings(bool enabled);
+
+    /** Minimum clearance, in engine feet, between any baked probe and
+     *  the nearest VERTICAL wall of its containing room. Bake-time
+     *  filter only — candidates within this margin are dropped before
+     *  any reflection rays are cast. 0 disables the clearance check.
+     *  Floor and ceiling planes are intentionally excluded: probes are
+     *  placed a fixed `height` above the floor by design, and short
+     *  outdoor rooms (rooftops, balconies) often have a low audio-
+     *  ceiling plane that would otherwise reject every probe inside
+     *  them. The inside-solid (no-room) check always runs regardless
+     *  of clearance value. Clamped to [0, 50] at the setter. */
+    void setProbeMinWallClearanceFt(float ft);
+    float getProbeMinWallClearanceFt() const { return mProbeMinWallClearanceFt; }
+
+    /** Elevation-tier sparsity multiplier (see ProbeBakeParams). 1.0 =
+     *  1:1 with floor probes (legacy), 2.0 = 2×2 binning (1:4), etc.
+     *  Clamped to [1.0, 8.0]. Requires re-bake. */
+    void setProbeElevationSparsityMul(float mul) {
+        mProbeElevationSparsityMul = std::max(1.0f, std::min(mul, 8.0f));
+    }
+    float getProbeElevationSparsityMul() const { return mProbeElevationSparsityMul; }
+
+    /** Global dedup pass radius in engine feet (see ProbeBakeParams).
+     *  Probes within this distance of an earlier-kept probe (in
+     *  placement order: floor → elevation → portal → emitter) get
+     *  dropped. 0 = disabled. Clamped to [0.0, 10.0]. Requires re-bake. */
+    void setProbeGlobalDedupRadiusFt(float ft) {
+        mProbeGlobalDedupRadiusFt = std::max(0.0f, std::min(ft, 10.0f));
+    }
+    float getProbeGlobalDedupRadiusFt() const { return mProbeGlobalDedupRadiusFt; }
 
     /** Snapshot of probe positions in feet (engine units). Populated by
      *  bakeProbes() and loadProbes(); empty if no probes are loaded. Used
@@ -853,12 +956,6 @@ public:
      *  whatever code site published the event; keep callbacks cheap. */
     void registerSoundEmissionListener(SoundEmissionListener cb);
 
-    /** Per-frame audio update — voice cleanup, Steam Audio simulation step.
-     *  Called from the render binary's main loop (LoopService is not used
-     *  in the render binary; this provides a direct entry point).
-     *  @param deltaTime  Frame delta in seconds */
-    void updateAudio(float deltaTime);
-
 protected:
     // ── Service lifecycle ──
 
@@ -928,11 +1025,15 @@ private:
     /// Whether audio backends initialized successfully
     bool mAudioReady = false;
 
-    /// Actual device sample rate (detected at init, used by Steam Audio)
-    uint32_t mDeviceSampleRate = 48000;
+    /// Actual device sample rate (detected at init, used by Steam Audio).
+    /// Initial value is the engine default from AudioUnits.h — overwritten
+    /// at init by the negotiated device rate.
+    uint32_t mDeviceSampleRate = kDefaultDeviceSampleRate;
 
-    /// Audio processing frame size (aligned with Steam Audio)
-    uint32_t mFrameSize = 1024;
+    /// Audio processing frame size (aligned with Steam Audio). Initial
+    /// value is the engine default from AudioUnits.h — overwritten at
+    /// init by the YAML-configured `audio.performance.frame_size`.
+    uint32_t mFrameSize = kDefaultDeviceFrameSize;
 
     // ── Sound resource loading ──
 
@@ -1165,6 +1266,27 @@ private:
     /// Static mesh within the scene (world geometry + material assignments)
     IPLStaticMesh mIplStaticMesh = nullptr;
 
+    /// Per-door dynamic acoustic geometry. Each entry owns:
+    ///   - a sub-scene containing the door's local-space OBB mesh
+    ///   - a static mesh inside that sub-scene (geometry + material)
+    ///   - an instanced mesh in the main scene that references the sub-scene
+    /// We keep our own reference to the sub-scene for the lifetime of the
+    /// instance: Steam Audio's docs do not explicitly state that
+    /// iplInstancedMeshCreate retains the sub-scene, so releasing it
+    /// immediately after iplInstancedMeshAdd risks a dangling reference at
+    /// the next scene-commit (seen as a boot-time hang on some builds).
+    struct DoorAudioInstance {
+        IPLScene         subScene      = nullptr;
+        IPLStaticMesh    staticMesh    = nullptr;
+        IPLInstancedMesh instancedMesh = nullptr;
+    };
+    std::unordered_map<int32_t, DoorAudioInstance> mDoorAudioInstances;
+
+    /// Set by setDoorTransform; consumed (and cleared) at the top of the
+    /// next loopStep. Coalesces multiple per-frame door transform updates
+    /// into one BVH refit.
+    std::atomic<bool> mSceneNeedsCommit{false};
+
     /// Reflection simulation owner — wraps the Steam Audio reflection
     /// IPLSimulator handle, its dedicated background worker thread, the
     /// deferred source-add/remove queues, throttle counter, rate divisor,
@@ -1289,6 +1411,21 @@ private:
     std::vector<float> mProbeElevations = { 10.0f };
     bool               mProbePortalRings = true;
 
+    /// Minimum probe-to-wall clearance (engine feet) enforced at bake
+    /// time. Probes whose containing room reports a nearer plane are
+    /// dropped before any reflection rays are cast. 0 = clearance check
+    /// disabled (inside-solid rejection still runs).  Tunable from YAML
+    /// (audio.probes.min_wall_clearance_ft) and clamped at the setter.
+    float              mProbeMinWallClearanceFt = 5.0f;
+
+    /// Elevation-tier sparsity multiplier; see setProbeElevationSparsityMul.
+    /// Default 2.0 = 2×2 binning = 1:4 ratio of elevation to floor probes.
+    float              mProbeElevationSparsityMul = 2.0f;
+
+    /// Global dedup pass radius (engine feet); see setProbeGlobalDedupRadiusFt.
+    /// Default 2.0 = catches obvious overlaps without trimming the grid.
+    float              mProbeGlobalDedupRadiusFt = 2.0f;
+
     // Volumetric occlusion sphere radius + sample count moved to
     // AudioOcclusion (mAudioOcclusion). The setters/getters above are
     // facades that forward into it. Larger radius = smoother transitions
@@ -1299,6 +1436,19 @@ private:
     /// Propagation layer toggles (debug — all on by default)
     bool mPortalRoutingEnabled = true;   ///< Portal-graph routing through doorways
     bool mProbePathingEnabled = true;    ///< Baked probe diffraction (when available)
+
+    /// Pathing-simulation throttle. iplSimulatorRunPathing runs on the
+    /// main loop thread; mPathingUpdateInterval bounds its rate so we
+    /// don't pay full CPU cost every frame. mPathingAccumSec accumulates
+    /// deltaTime across loopStep calls; mPathingDueThisStep is set true
+    /// for the current loopStep whenever the accumulator crosses the
+    /// interval (and the accumulator resets). Per-voice
+    /// iplSourceSetInputs(...PATHING) calls + the iplSimulatorRunPathing
+    /// invocation are gated on this flag. Default 0.1 s (10 Hz) matches
+    /// Unity/Unreal Steam Audio integration defaults. 0.0 = every frame.
+    float mPathingUpdateInterval = 0.1f;
+    float mPathingAccumSec       = 0.0f;
+    bool  mPathingDueThisStep    = false;
 
     // ── Master bus DSP chain + mixer + spatialization + door LPF config ──
     //
@@ -1348,6 +1498,23 @@ private:
     /// for under-amplitude baked pathing without re-baking.
     float    mPathingGainScale    = 1.0f;
 
+    /// Multiplier on the LPF blocking factor emitted by
+    /// `eqCoeffsToDspMapping`. Range [0, 1]. 1.0 = identity (legacy
+    /// behaviour). Lower values keep the door-LPF more open so distant
+    /// cross-room ambients don't drop to ~400 Hz cutoff just because
+    /// their eqHigh band is near zero.
+    float    mPathingBlockingScale = 1.0f;
+
+    /// Per-band weights applied when collapsing Steam Audio's eqCoeffs
+    /// into the scalar portalAttenuation gain. Default {0.25, 0.50, 0.25}
+    /// matches the legacy hardcoded mid-heavy perceptual weighting.
+    /// Components clamped to [0, 1] at the setter; sum is NOT normalised
+    /// (callers use unit-sum weights for level-neutral shaping; sums >1
+    /// produce a flat boost).
+    float    mPathingGainWeightLow  = 0.25f;
+    float    mPathingGainWeightMid  = 0.50f;
+    float    mPathingGainWeightHigh = 0.25f;
+
     // ── Ambient tuning (P$AmbientHack) ──
     // Moved to AmbientSoundManager — the setAmb* facade methods on this
     // service forward to mAmbientManager.
@@ -1365,7 +1532,7 @@ private:
     // convolution workers; remainder goes to simulator threads.
     float       mReverbThreadsConvShareCfg = -1.0f;
     std::string mSceneTypeCfg              = "default"; // "default" or "embree"
-    int         mAudioSampleRateCfg        = 48000;
+    int         mAudioSampleRateCfg        = static_cast<int>(kDefaultDeviceSampleRate);
     int         mAudioFrameSizeCfg         = 512;
     int         mSoundCacheMBCfg           = 64;
 
@@ -1403,9 +1570,11 @@ private:
     int mAmbisonicsOrder = 0;
     int mAmbisonicsChannels = 1;  ///< (mAmbisonicsOrder+1)^2, computed at init
 
-    /// Reflection pipeline sample rate and frame size (derived from mReflectionRateDivisor)
-    uint32_t mReflectionSampleRate = 48000;
-    uint32_t mReflectionFrameSize = 1024;
+    /// Reflection pipeline sample rate and frame size (derived from
+    /// mReflectionRateDivisor). Initial values are engine defaults from
+    /// AudioUnits.h — overwritten at init once the rate divisor is known.
+    uint32_t mReflectionSampleRate = kDefaultDeviceSampleRate;
+    uint32_t mReflectionFrameSize = kDefaultDeviceFrameSize;
 
     // ── Background simulation threads ──
     //

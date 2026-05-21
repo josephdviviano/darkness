@@ -23,19 +23,11 @@
 #define __SOUND_PROPAGATION_H
 
 /// @file SoundPropagation.h
-/// Portal-graph sound propagation + runtime door/loud-room cost tables.
-///
-/// Extracted from AudioService — owns the per-portal door blocking factor
-/// map and the per-room LoudRoom transmission map, and forwards
-/// propagateSound() calls to RoomService::propagateSoundPath with those
-/// runtime tables wired in as callbacks. AudioService keeps thin facades
-/// (propagateSound / setBlockingFactor / getBlockingFactor) that route
-/// here so existing callers in DarknessRender and AI hearing need no
-/// changes.
-///
-/// Threading: all calls are expected to come from the main thread (same
-/// constraint as AudioService's per-frame propagation). The internal maps
-/// are not locked.
+/// Portal-graph sound propagation + runtime door / loud-room cost tables.
+/// Owns the per-portal blocking factor map and per-room LoudRoom
+/// transmission map; forwards propagateSound() into
+/// RoomService::propagateSoundPath with those tables wired as callbacks.
+/// Main-thread only; internal maps are not locked.
 
 #include "DarknessMath.h"
 #include "room/RoomService.h"  // SoundPropInfo / SoundPropParams
@@ -50,59 +42,42 @@ namespace Darkness {
 class Room;
 class RoomService;
 
-/// Default propagation cutoff. Kept identical to the long-standing
-/// AudioService::SOUND_MAX_DIST value so the public propagateSound
+/// Matches AudioService::SOUND_MAX_DIST so the public propagateSound
 /// signature on AudioService is unchanged.
 constexpr float kDefaultSoundMaxDist = 200.0f;
 
-/// Owns the runtime cost tables (door blocking + LoudRoom transmission)
-/// and forwards propagateSound() into RoomService's portal-graph BFS.
 class SoundPropagation {
 public:
-    /// Construct with a back-reference to RoomService. The reference must
-    /// remain valid for the lifetime of this object — RoomService is
-    /// looked up in AudioService::bootstrapFinished() and released in
-    /// shutdown(), and SoundPropagation lives only between those two
-    /// points.
+    /// `roomService` must outlive this object.
     explicit SoundPropagation(RoomService *roomService);
     ~SoundPropagation();
 
-    /// Set the portal blocking factor between two rooms.
-    /// Used by door open/close logic to control AI sound propagation.
-    /// @param room1   First room ID
-    /// @param room2   Second room ID
-    /// @param factor  0.0 = fully open, 1.0 = fully blocked
+    /// Portal blocking factor: 0=open, 1=fully blocked. Drives AI hearing
+    /// + door LPF.
     void setBlockingFactor(int room1, int room2, float factor);
-
-    /// @return Blocking factor [0,1], or 0.0 (fully open) if not set.
+    /// 0.0 if unset.
     float getBlockingFactor(int room1, int room2) const;
 
-    /// Set the LoudRoom transmission multiplier for a room (default 1.0 =
-    /// no effect). Values < 1.0 dampen sound passing through, > 1.0 amplify.
-    /// Loaded from P$LoudRoom on room objects.
+    /// LoudRoom transmission multiplier (<1 dampens, >1 amplifies sound
+    /// passing through). Loaded from P$LoudRoom.
     void setRoomTransmission(int32_t roomID, float transmission);
-
-    /// @return Transmission factor for `roomID`, or 1.0 if unset.
+    /// 1.0 if unset.
     float getRoomTransmission(int32_t roomID) const;
 
-    /// Wipe both maps (called on mission unload).
+    /// Mission-unload reset.
     void clear();
 
-    /// Propagate a sound from `sourcePos` to `listenerPos` through the
-    /// room portal graph. Resolves source/listener rooms via
-    /// RoomService::roomFromPoint internally.
+    /// Propagate sourcePos → listenerPos through the portal graph.
+    /// Resolves rooms via RoomService::roomFromPoint.
     SoundPropInfo propagateSound(const Vector3 &sourcePos,
                                  const Vector3 &listenerPos,
                                  float maxDist,
                                  uint32_t maxPaths,
                                  float maxPathDiff) const;
 
-    /// Room-explicit overload. `sourceRoomID` / `listenerRoomID` of -1
-    /// indicate "outside all rooms" — the underlying BFS falls back to
-    /// euclidean distance. RoomService is responsible for resolving the
-    /// integer IDs back to Room pointers, so callers can stash room IDs
-    /// across frames without risking dangling pointers if the room
-    /// database is rebuilt.
+    /// Room-explicit. -1 = outside all rooms → BFS falls back to
+    /// Euclidean. Callers can stash room IDs across frames since
+    /// RoomService resolves them internally.
     SoundPropInfo propagateSound(const Vector3 &sourcePos,
                                  const Vector3 &listenerPos,
                                  int32_t sourceRoomID,
@@ -111,32 +86,23 @@ public:
                                  uint32_t maxPaths,
                                  float maxPathDiff) const;
 
-    /// Full-control overload used by loopStep, which wants to plug its
-    /// own `chainOut` accumulator into the params (for the show_vpos
-    /// debug overlay). The caller fills `paramsInOut.maxDist /
-    /// maxPaths / maxPathDiff / chainOut`; this method overwrites the
-    /// doorBlocking + loudRoom callbacks with the ones backed by our
-    /// internal maps, then forwards into RoomService.
+    /// Full-control overload used by loopStep — caller fills maxDist/
+    /// maxPaths/maxPathDiff/chainOut; this method overwrites the
+    /// doorBlocking + loudRoom callbacks with ones backed by our maps.
     SoundPropInfo propagateSoundWithParams(const Vector3 &sourcePos,
                                            const Vector3 &listenerPos,
                                            int32_t sourceRoomID,
                                            int32_t listenerRoomID,
                                            SoundPropParams &paramsInOut) const;
 
-    /// Read-only access to the LoudRoom map for callers that need to
-    /// iterate it (e.g. the acoustic verification dump in
-    /// loadAuxiliarySoundData).
+    /// Read-only access for the acoustic-verification dump.
     const std::unordered_map<int32_t, float> &roomTransmissionMap() const {
         return mRoomTransmission;
     }
 
-    /// Install a BSP-aware line-of-sight callback. When set,
-    /// propagateSoundWithParams plumbs it into RoomService's chain
-    /// reconstruction via SoundPropParams::losClear — per-bend segments
-    /// get raycast against the BSP, and bends that land on
-    /// wall-overlapping regions of a portal polygon get refined to
-    /// adjacent positions (or the path is dropped if no clear bend
-    /// exists).
+    /// BSP-aware line-of-sight callback for chain reconstruction. When set,
+    /// per-bend segments get raycast against the BSP and bends that land
+    /// on wall-overlapping portal regions get refined or dropped.
     using LineOfSightFn = std::function<bool(const Vector3 &a, const Vector3 &b)>;
     void setLineOfSightFn(LineOfSightFn fn) { mLineOfSightFn = std::move(fn); }
 
@@ -144,13 +110,9 @@ private:
     RoomService *mRoomService = nullptr;
     LineOfSightFn mLineOfSightFn;
 
-    /// Portal blocking factors for AI hearing propagation.
-    /// Key: (room1 << 16) | room2 (bidirectional — stored both ways).
+    /// Key: (room1 << 16) | room2 — stored both ways (bidirectional).
     std::unordered_map<uint32_t, float> mBlockingFactors;
-
-    /// Per-room LoudRoom transmission factor (keyed by room ID, default 1.0).
-    /// Values < 1.0 dampen sound passing through the room, > 1.0 amplify.
-    /// Parsed from P$LoudRoom property on room objects.
+    /// Per-room transmission factor (default 1.0).
     std::unordered_map<int32_t, float> mRoomTransmission;
 };
 

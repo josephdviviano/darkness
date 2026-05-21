@@ -62,6 +62,7 @@
 #include "property/DarkPropertyDefs.h"
 #include "property/PropertyService.h"
 #include "property/TypedProperty.h"
+#include "sim/DoorAudioGeometry.h"  // DoorAudioGeometry passed to registerDoorGeometry
 #include "logger.h"
 
 #include <unordered_set>
@@ -399,8 +400,8 @@ struct AudioService::ReflectionMixNode {
     std::vector<float> decodedL; // binaural left
     std::vector<float> decodedR; // binaural right
 
-    int frameSize = 1024;             // engine frame size (48kHz)
-    int reflectionFrameSize = 1024;   // reflection frame size (24kHz or 48kHz)
+    int frameSize = static_cast<int>(kDefaultDeviceFrameSize);  // engine frame size
+    int reflectionFrameSize = static_cast<int>(kDefaultDeviceFrameSize);  // reflection frame size (post rate-divisor)
     int ambiChannels = 1;             // ambisonics channel count (1 for order 0, 4 for order 1)
     int ambiOrder = 0;                // ambisonics order (0 or 1)
     // Sync-in-callback wait deadline. Set at init from
@@ -609,8 +610,10 @@ static std::atomic<int> sDSPBypassLevel{0};
 // The dimensionless quantities (occlusion sample counts, ray counts, material
 // absorption coefficients, frequencies in Hz, durations in seconds) are
 // untouched: they were never affected by the unit mismatch.
-constexpr float kFeetToMeters = 0.3048f;
-constexpr float kMetersToFeet = 1.0f / kFeetToMeters;
+//
+// kFeetToMeters / kMetersToFeet live in AudioUnits.h so every audio file
+// resolves to the same literal — see that header for the consolidation
+// rationale.
 
 // ── Engine ↔ Steam Audio coordinate-system bridge ──
 //
@@ -656,6 +659,51 @@ inline Vector3 iplToEnginePos(const IPLVector3 &p) {
                     p.y * kMetersToFeet);
 }
 
+// Convert a 4x4 affine transform from engine space (Z-up, feet) to IPL space
+// (Y-up, meters) for IPLInstancedMeshSettings / iplInstancedMeshUpdateTransform.
+//
+// Derivation: if x_ipl = P * x_engine where P maps positions engine→IPL, then
+// for an engine transform M_e we need M_i = P * M_e * P^-1. P decomposes as
+// (kFeetToMeters * Q) where Q is the basis permutation+sign engine→IPL. The
+// feet/meter scaling cancels in the linear part (P * R_e * P^-1 = Q * R_e *
+// Q^-1) and survives only in the translation column.
+//
+// Concretely: column j of R_ipl equals engineToIplDir(R_engine applied to the
+// engine vector that maps to IPL basis j). Walking IPL bases (1,0,0), (0,1,0),
+// (0,0,1) through iplToEnginePos (without metric scale) gives engine vectors
+// (0,-1,0), (0,0,1), (-1,0,0) — so R_ipl.col[0] = eToIDir(-R_e.col[1]),
+// R_ipl.col[1] = eToIDir(R_e.col[2]), R_ipl.col[2] = eToIDir(-R_e.col[0]).
+// Translation goes through engineToIplPos (metric scale included).
+inline IPLMatrix4x4 engineToIplMatrix(const Matrix4 &m) {
+    auto eToI = [](const Vector3 &d) -> Vector3 {
+        return Vector3(-d.y, d.z, -d.x);
+    };
+    // GLM column-major: m[col][row]. Extract engine columns.
+    Vector3 col0_e(m[0][0], m[0][1], m[0][2]);
+    Vector3 col1_e(m[1][0], m[1][1], m[1][2]);
+    Vector3 col2_e(m[2][0], m[2][1], m[2][2]);
+    Vector3 trans_e(m[3][0], m[3][1], m[3][2]);
+
+    Vector3 col0_i = eToI(-col1_e);
+    Vector3 col1_i = eToI( col2_e);
+    Vector3 col2_i = eToI(-col0_e);
+    Vector3 trans_i(-trans_e.y * kFeetToMeters,
+                     trans_e.z * kFeetToMeters,
+                    -trans_e.x * kFeetToMeters);
+
+    IPLMatrix4x4 r{};
+    // IPLMatrix4x4 elements[row][col] is row-major.
+    r.elements[0][0] = col0_i.x; r.elements[0][1] = col1_i.x;
+    r.elements[0][2] = col2_i.x; r.elements[0][3] = trans_i.x;
+    r.elements[1][0] = col0_i.y; r.elements[1][1] = col1_i.y;
+    r.elements[1][2] = col2_i.y; r.elements[1][3] = trans_i.y;
+    r.elements[2][0] = col0_i.z; r.elements[2][1] = col1_i.z;
+    r.elements[2][2] = col2_i.z; r.elements[2][3] = trans_i.z;
+    r.elements[3][0] = 0.0f;     r.elements[3][1] = 0.0f;
+    r.elements[3][2] = 0.0f;     r.elements[3][3] = 1.0f;
+    return r;
+}
+
 // ── Audio-thread tunables ──
 // Namespace-scope atomics published by AudioService setters and read on the
 // audio thread. These belong to per-voice processing paths that don't have
@@ -675,7 +723,15 @@ std::atomic<float> sDoorLpfBlockedHz{800.0f};
 std::atomic<float> sPropMinAttenuation{0.001f};
 std::atomic<int>   sDistanceModel{0};
 /// Engine sample rate published for audio-thread DSP that needs it (door LPF, etc.)
-static std::atomic<uint32_t> sEngineSampleRate{48000};
+static std::atomic<uint32_t> sEngineSampleRate{kDefaultDeviceSampleRate};
+
+/// Silent-voice convolution skip threshold (in audio callbacks). Derived
+/// via `reflSilentSkipFrames()` (AudioUnits.h) from the live
+/// `realtime.duration`, reflection sample rate, and reflection frame
+/// size. Updated by `recomputeReflSilentSkipFrames()` at every event
+/// that changes any of those inputs (init, YAML reload, debug-console
+/// edit) so the audio callback never reads a stale literal.
+std::atomic<int> sReflSilentSkipFrames{192};
 
 /// Runtime cap on the number of simultaneous sub-source slots assigned per
 /// voice. Independent of mPropMaxPaths (which caps how many paths the BFS
@@ -1168,6 +1224,14 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                                   slot.targetDirectParams.airAbsorption[1],
                                   slot.targetDirectParams.airAbsorption[2]);
                     }
+                    // Drop the direct effect's internal IIR / EQ state so
+                    // the next call doesn't keep producing NaN from the
+                    // same poisoned coefficients (matches the binaural
+                    // reset below). The direct effect's IIR cascade
+                    // (occlusion + air absorption + transmission EQ)
+                    // accumulates state per-call; resetting clears the
+                    // history without reallocation.
+                    iplDirectEffectReset(slot.directEffect);
                 }
                 binauralMono = directOutPtr;
                 anyDirectRan = true;
@@ -1220,6 +1284,22 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                               binParams.direction.x, binParams.direction.y,
                               binParams.direction.z, binParams.spatialBlend);
                 }
+                // Break the NaN cascade. The sanitize above replaces the
+                // output buffer with zeros, but Steam Audio's binaural
+                // effect keeps its OWN internal FFT delay line + HRIR
+                // overlap-add history — once those are poisoned, every
+                // subsequent call produces NaN again from the same stale
+                // state. Resetting drops the internal buffers to zero so
+                // the next call starts clean. Audibly this is a single
+                // pop at the reset point (output goes from sanitize-zero
+                // to fresh-output discontinuously), which is preferable
+                // to a perpetual stream of NaN→zero substitutions —
+                // perceptually a continuous crackle exactly like a DAW
+                // running with too-small buffers (the user's report).
+                //
+                // No-allocation, audio-thread-safe — `iplBinauralEffectReset`
+                // is documented to be cheap and lock-free.
+                iplBinauralEffectReset(slot.binauralEffect);
             }
 
             // ── Per-slot LPF α target (Maekawa-ish 1-pole IIR
@@ -1287,12 +1367,13 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         // semantics as legacy [VOICE_PEAK] reads).
         if (anyDirectRan) {
             sSaMeterDirectOut.measureMono(directOutPtr, frameCount);
-            float prev = node->monoInPeak.load(std::memory_order_relaxed);
-            while (monoInPeak > prev && !node->monoInPeak.compare_exchange_weak(
-                       prev, monoInPeak, std::memory_order_relaxed)) {}
-            prev = node->monoOutPeak.load(std::memory_order_relaxed);
-            while (monoOutPeak > prev && !node->monoOutPeak.compare_exchange_weak(
-                       prev, monoOutPeak, std::memory_order_relaxed)) {}
+            // Single audio-thread writer per voice (see [VOICE_PEAK] note
+            // below); CAS retry loop is uncontested by design, so a plain
+            // store-if-greater suffices and avoids the RMW.
+            if (monoInPeak  > node->monoInPeak.load(std::memory_order_relaxed))
+                node->monoInPeak.store(monoInPeak,  std::memory_order_relaxed);
+            if (monoOutPeak > node->monoOutPeak.load(std::memory_order_relaxed))
+                node->monoOutPeak.store(monoOutPeak, std::memory_order_relaxed);
 
             float atten = node->directParams.distanceAttenuation
                         * node->directParams.occlusion
@@ -1378,8 +1459,18 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         // Snapshot mono for the off-thread convolution worker.
         // The worker processes all voice convolutions in parallel with the
         // next audio callback, writing to a double-buffered stereo output.
+        // Reflection apply gate.
+        //   • CONVOLUTION / HYBRID: need a real IR (irSize > 0). HYBRID
+        //     additionally consults reverbTimes for the parametric tail,
+        //     but the convolution front still requires irSize.
+        //   • PARAMETRIC: no IR ever exists — the apply call uses only
+        //     reverbTimes. Gate solely on the type field.
+        const bool reflParamsValid =
+            (node->reflectionParams.type == IPL_REFLECTIONEFFECTTYPE_PARAMETRIC)
+                ? true
+                : (node->reflectionParams.irSize > 0);
         if (node->reflectionsActive && node->reflectionEffect
-            && node->reflectionParams.irSize > 0 && node->convWorker) {
+            && reflParamsValid && node->convWorker) {
             auto &cw = *node->convWorker;
             int w = cw.writeIdx.load(std::memory_order_relaxed);
             int slotIdx = cw.stagingCount[w]++;
@@ -1466,8 +1557,51 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 }
                 node->reflSendLpfState = reflLpf;
 
+                // Sanitize the reflection-send mono buffer BEFORE handing it
+                // off to the convolution worker. A single NaN/Inf sample here
+                // gets convolved against an IR of tens of thousands of taps
+                // (~52800 at 48 kHz for ambisonics-order-1) before the wet-bus
+                // NaN guard catches it post-effect — by then a long patch of
+                // wet output is already corrupted (silence-replacement looks
+                // like broadband grain after IR smearing). Sanitizing the
+                // *input* contains the blast radius to one sample and surfaces
+                // the upstream producer via [NAN_GUARD] so the real source
+                // (reflAtten, reflSendAlpha, or the mono pre-LPF) can be
+                // tracked down. Replaces non-finite samples with 0 in-place.
+                if (audioSanitizeBuffer(slot.mono.data(),
+                                        static_cast<std::size_t>(node->reflectionFrameSize))) {
+                    uint32_t n = node->nanCountReflInput.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (n < 4) {
+                        AUDIO_LOG("[NAN_GUARD] node=%p reflection input had "
+                                  "non-finite samples before convolution "
+                                  "(occurrence %u) reflAtten=%.4f "
+                                  "reflSendAlpha=%.4f reflLpfState=%.6g\n",
+                                  static_cast<void*>(node), n + 1,
+                                  reflAtten, reflSendAlpha,
+                                  static_cast<double>(node->reflSendLpfState));
+                    }
+                    // If the LPF state itself went non-finite, it would
+                    // re-poison every subsequent callback. Reset it to a
+                    // safe value so the corruption can't persist across
+                    // callbacks even if the upstream producer keeps emitting
+                    // bad samples.
+                    if (!std::isfinite(node->reflSendLpfState))
+                        node->reflSendLpfState = 0.0f;
+                }
+
                 slot.effect = node->reflectionEffect;
-                slot.validityToken = node->validityToken;  // shared_ptr copy — prevents use-after-free
+                // The shared_ptr keeps the validity-atomic alive past the
+                // owning ActiveVoice's destruction (workers may still read
+                // it between iterations — see ~ActiveVoice in VoicePool.cpp).
+                // Voice→slot assignment is stable in steady state, so the
+                // common case is "slot already holds this voice's token"
+                // and we can skip the assignment entirely. Avoiding the
+                // copy avoids two atomic ref-count RMWs per voice per
+                // callback (~10 voices × 93 Hz = ~2 k atomics/sec); only
+                // matters cumulatively, but free to eliminate.
+                if (slot.validityToken.get() != node->validityToken.get())
+                    slot.validityToken = node->validityToken;
                 slot.params = node->reflectionParams;
                 // Runtime IR clamp: cap the convolution length to a
                 // configurable maximum (in reflection-rate samples). 0 =
@@ -1480,11 +1614,80 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 {
                     int clampSamples = sRuntimeIrClampSamples.load(
                         std::memory_order_relaxed);
-                    if (clampSamples > 0 && slot.params.irSize > clampSamples)
+                    if (clampSamples > 0 && slot.params.irSize > clampSamples) {
+                        // One-shot log per clamp engagement: prints first
+                        // ~8 times to confirm the knob is reaching the apply
+                        // path. Throttled hard so it doesn't flood under
+                        // many active voices.
+                        static std::atomic<int> sClampLogCount{0};
+                        int n = sClampLogCount.fetch_add(1, std::memory_order_relaxed);
+                        if (n < 8) {
+                            AUDIO_LOG("[IR_CLAMP] before=%d after=%d "
+                                      "(clamp=%d samples) #%d\n",
+                                      slot.params.irSize, clampSamples,
+                                      clampSamples, n + 1);
+                        }
                         slot.params.irSize = clampSamples;
+                    }
                 }
                 slot.reflFrameSize = node->reflectionFrameSize;
-                slot.active = true;
+
+                // ── Silent-voice apply elision ───────────────────────────────
+                //
+                // After the reflection-send mono has been written above (with
+                // reflAtten + door LPF applied), peek the buffer for any
+                // nonzero sample. Tail voices in the convolution pool
+                // (sourceEnded but reflectionsActive=true while their reverb
+                // rings out) — and even active voices whose distance
+                // attenuation has driven the send to ~zero — feed all-zero
+                // mono into iplReflectionEffectApply, which costs the same
+                // CPU as a non-silent voice but produces no useful output
+                // once the IR delay line has drained.
+                //
+                // We feed zeros through apply() for kReflSilentSkipFrames
+                // consecutive callbacks first — long enough that the
+                // convolution's internal delay line (≈ irSize samples) and
+                // the FDN parametric tail have fully decayed. Past that
+                // point the worker can safely skip the apply: there is no
+                // stale history left that the next non-zero input would
+                // smear against incorrectly. We signal the skip by setting
+                // slot.active = false; the worker's existing slot loop in
+                // ConvolutionWorkerPool.cpp already short-circuits on that.
+                //
+                // The skip restores per-callback worker iter time to the
+                // pre-CONV_LAG envelope: ~N_audible_voices × apply_cost
+                // rather than N_total_voices × apply_cost. Each IR-update
+                // crossfade roughly doubles apply_cost, so the savings are
+                // most pronounced exactly at the sim-cycle boundaries where
+                // the [CONV_LAG] overruns previously fired.
+                //
+                // Threshold derives from the live `realtime.duration` knob
+                // via reflSilentSkipFrames() in AudioUnits.h: we feed zeros
+                // for `(IR length in callbacks) × 2 + 1` callbacks so both
+                // the conv delay-line and the FDN parametric tail drain
+                // before the apply is elided. Raising `realtime.duration`
+                // automatically widens the skip window — no manual update
+                // needed.
+                {
+                    const int kReflSilentSkipFrames =
+                        sReflSilentSkipFrames.load(std::memory_order_relaxed);
+                    constexpr float kSilenceEpsilon = 1.0e-6f;
+                    float reflInPeak = 0.0f;
+                    for (ma_uint32 i = 0; i < reflFrames; ++i) {
+                        const float a = std::fabs(slot.mono[i]);
+                        if (a > reflInPeak) reflInPeak = a;
+                    }
+                    if (reflInPeak > kSilenceEpsilon) {
+                        node->framesSinceNonzeroReflInput = 0;
+                    } else if (node->framesSinceNonzeroReflInput
+                               < kReflSilentSkipFrames + 1) {
+                        // Cap the counter at threshold+1 so it doesn't
+                        // wrap around for very-long-silent voices.
+                        ++node->framesSinceNonzeroReflInput;
+                    }
+                    slot.active =
+                        (node->framesSinceNonzeroReflInput <= kReflSilentSkipFrames);
+                }
                 slot.isFootstepDiag = node->isFootstepDiag;  // propagate for worker log
 
                 // Per-voice reverb-send peak. Measures the mono buffer
@@ -1499,9 +1702,9 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                         float a = std::fabs(slot.mono[i]);
                         if (a > sPeak) sPeak = a;
                     }
-                    float prev = node->reflSendPeak.load(std::memory_order_relaxed);
-                    while (sPeak > prev && !node->reflSendPeak.compare_exchange_weak(
-                               prev, sPeak, std::memory_order_relaxed)) {}
+                    // Single audio-thread writer per voice — non-CAS store.
+                    if (sPeak > node->reflSendPeak.load(std::memory_order_relaxed))
+                        node->reflSendPeak.store(sPeak, std::memory_order_relaxed);
                 }
             }
         }
@@ -1526,9 +1729,9 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         node->peakOutput.store(peakOut, std::memory_order_relaxed);
 
         // Per-voice lifetime peak (atomic max).  Used by [VOICE_PEAK] log at
-        // CLEANUP.  Compare-and-swap loop because std::atomic<float> doesn't
-        // have fetch_max; this is uncontested in practice (only one audio
-        // thread writes per voice).
+        // CLEANUP.  std::atomic<float> doesn't have fetch_max, but this is
+        // single-writer (only one audio thread writes per voice), so a plain
+        // store-if-greater replaces the CAS retry — same result, no RMW.
         {
             int prevFrames = node->lifetimeFrameCount.fetch_add(1, std::memory_order_relaxed);
             float prevL = node->lifetimePeakL.load(std::memory_order_relaxed);
@@ -1538,15 +1741,13 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             // peaks AND different direction-at-peak vectors, the listener
             // is moving during voice playback and HRTF gain is varying.
             bool updated = false;
-            while (peakL > prevL && !node->lifetimePeakL.compare_exchange_weak(
-                       prevL, peakL, std::memory_order_relaxed)) { /* retry */ }
-            if (peakL >= node->lifetimePeakL.load(std::memory_order_relaxed) - 1e-9f
-                && peakL > 0.0f) {
-                updated = true;
+            if (peakL > prevL) {
+                node->lifetimePeakL.store(peakL, std::memory_order_relaxed);
+                if (peakL > 0.0f) updated = true;
             }
             float prevR = node->lifetimePeakR.load(std::memory_order_relaxed);
-            while (peakR > prevR && !node->lifetimePeakR.compare_exchange_weak(
-                       prevR, peakR, std::memory_order_relaxed)) { /* retry */ }
+            if (peakR > prevR)
+                node->lifetimePeakR.store(peakR, std::memory_order_relaxed);
             if (updated) {
                 node->directionAtPeakX.store(node->direction.x, std::memory_order_relaxed);
                 node->directionAtPeakY.store(node->direction.y, std::memory_order_relaxed);
@@ -1854,30 +2055,41 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
 
     // ── Bounded wait for sub-workers ───────────────────────────────────
     //
-    // Yield-spin until each signalled sub-worker's processedSeq reaches
-    // its target value, bounded by `node->syncDeadlineMs`. Workers run
-    // their DSP on dedicated threads in parallel; the audio thread's only
-    // job here is to wait the longest sub-worker out. With the per-frame
-    // worker iter time landing at ~2.5–6 ms typical (512-frame callback,
-    // 4 workers, baked IRs) and a deadline around 70 % of the callback
-    // period, this should expire only on pathological tail spikes.
+    // Wait until each signalled sub-worker's processedSeq reaches its
+    // target value, bounded by `node->syncDeadlineMs`. Workers run their
+    // DSP on dedicated threads in parallel; the audio thread's only job
+    // here is to wait the longest sub-worker out.
+    //
+    // Previous design yield-polled with std::this_thread::yield() inside
+    // the deadline window. On macOS, yield doesn't put the thread to
+    // sleep — it just gives up the rest of the quantum — so when any
+    // worker was preempted (typical when the reflection sim cycle ends
+    // and 6 sim threads all become non-runnable simultaneously) the
+    // audio thread would burn the full deadline yield-spinning before
+    // falling back to stale wet. Observed in [PERF sync_wait]: p50 ≈
+    // half the callback period, periodic timeout bursts of 12–82
+    // callbacks per window.
+    //
+    // Condvar wait_until lets the audio thread actually sleep, frees
+    // the core for the workers, and wakes the instant any worker
+    // bumps its processedSeq + notify_one. Predicate re-checks every
+    // worker so a single notify suffices regardless of which worker
+    // signalled.
     auto syncT0 = std::chrono::steady_clock::now();
     bool syncTimedOut = false;
     if (cw && numSignalled > 0) {
         const auto deadline = syncT0 + std::chrono::microseconds(
             static_cast<long long>(node->syncDeadlineMs * 1000.0f));
-        for (int i = 0; i < numSignalled; ++i) {
-            auto &sub = *cw->workers[i];
-            while (sub.processedSeq.load(std::memory_order_acquire)
-                   < targetSeq[i]) {
-                if (std::chrono::steady_clock::now() >= deadline) {
-                    syncTimedOut = true;
-                    break;
-                }
-                std::this_thread::yield();
+        std::unique_lock<std::mutex> lk(cw->doneMtx);
+        bool ok = cw->doneCv.wait_until(lk, deadline, [&]() {
+            for (int i = 0; i < numSignalled; ++i) {
+                if (cw->workers[i]->processedSeq.load(
+                        std::memory_order_acquire) < targetSeq[i])
+                    return false;
             }
-            if (syncTimedOut) break;
-        }
+            return true;
+        });
+        syncTimedOut = !ok;
     }
     {
         auto syncT1 = std::chrono::steady_clock::now();
@@ -1991,6 +2203,32 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
                               "non-finite samples (occurrence %u)\n", n + 1);
                 }
             }
+        }
+
+        // Apply global reflection-bus gain + first-activation fade-in ramp.
+        // `reflGainTarget` is the YAML `audio.mixer.reflection_gain` value
+        // (updated live by setMixerSettings). `reflGain` ramps from 0 toward
+        // the target at `reflRampRate` per sample so the first time reverb
+        // engages it fades in over `reflection_ramp_ms`, then stays at the
+        // target. Once at target the loop is a single multiply per sample.
+        // The previous wet-bus refactor (triple-buffered staging) dropped
+        // this multiply entirely — reflection_gain stopped affecting the
+        // output because nothing multiplied by it anywhere. Applied here
+        // (after sub-worker sum, before saturator) so the saturator sees
+        // the gain-scaled signal that's about to hit the dry bus.
+        if (node->wetScratchL.size() >= outSamples) {
+            float g = node->reflGain;
+            const float target = node->reflGainTarget;
+            const float step = node->reflRampRate;
+            for (ma_uint32 i = 0; i < outSamples; ++i) {
+                if (g < target) {
+                    g += step;
+                    if (g > target) g = target;
+                }
+                node->wetScratchL[i] *= g;
+                node->wetScratchR[i] *= g;
+            }
+            node->reflGain = g;
         }
 
         // Apply optional tape/phonograph saturation to the summed wet bus.
@@ -2792,6 +3030,9 @@ void AudioService::setRuntimeIrClampMs(float ms)
         if (samples < 1) samples = 1;
     }
     sRuntimeIrClampSamples.store(samples, std::memory_order_relaxed);
+    LOG_INFO("AudioService: runtime IR clamp set to %.1f ms = %d samples "
+             "(refl rate=%u Hz)", mRuntimeIrClampMs, samples,
+             mReflectionSampleRate);
 }
 bool AudioService::getHalfRateReflections() const
 {
@@ -2862,7 +3103,37 @@ float AudioService::voiceFalloffDistance(SoundHandle handle,
     if (!v) return fallbackEuclideanDist;
     if (v->cachedProp.reached)
         return v->cachedProp.effectiveDistance;
-    return fallbackEuclideanDist;
+
+    // BFS reported the source unreachable via the portal graph. Returning
+    // Euclidean here was the original "safe" fallback, but it OVER-amplifies
+    // the voice: a transformer hum inside a sealed building is genuinely
+    // unreachable, yet the listener-to-source line-of-sight distance can be
+    // short, producing near-full ambient volume against a heavily-blocked
+    // DSP chain → audible modulation as Steam Audio's pathing solver flickers
+    // between blocked-path eqCoeffs. Match the failure direction to reality:
+    // unreachable = silent, not artificially loud.
+    //
+    // Returning a "huge" distance pushes AmbientVolumeManager's falloff curve
+    // past amb.radius (clamped to 1.0 → -50 dB ish via the centibel formula),
+    // which is the right physical answer: if there's no portal path, sound
+    // shouldn't reach the listener.
+    //
+    // Logged loudly per project's "no silent fallbacks" policy. Rate-limited
+    // by handle to one [FALLBACK] line on the first transition to unreachable
+    // — recurring per-frame would spam the log without adding signal.
+    {
+        static thread_local std::unordered_set<SoundHandle> sLoggedUnreached;
+        if (sLoggedUnreached.insert(handle).second) {
+            std::fprintf(stderr,
+                "[FALLBACK] voiceFalloffDistance: voice h=%d '%s' BFS reported "
+                "unreachable — returning silencing distance instead of "
+                "Euclidean %.1f ft (avoids amplifying through-wall ambient "
+                "via fallback)\n",
+                handle, v->schemaName.c_str(), fallbackEuclideanDist);
+        }
+    }
+    constexpr float kUnreachableSilencingDistance = 1.0e6f;
+    return kUnreachableSilencingDistance;
 }
 
 void AudioService::voiceSetMaxAudibleDist(SoundHandle handle, float maxDist)
@@ -3237,6 +3508,17 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         // converts to a real sample count.
         setRuntimeIrClampMs(mRuntimeIrClampMs);
 
+        // Re-publish the silent-voice-skip threshold for the same reason.
+        // It is derived from mRealtimeDuration + the rates we just settled
+        // above; if it weren't republished here, the audio callback would
+        // continue reading the bootstrap default until the next call to
+        // setRealtimeDuration / setRateDivisor.
+        sReflSilentSkipFrames.store(
+            reflSilentSkipFrames(mRealtimeDuration,
+                                 static_cast<int>(mReflectionSampleRate),
+                                 static_cast<int>(mReflectionFrameSize)),
+            std::memory_order_relaxed);
+
         // ── Reverb-thread budget split ──
         //
         // Total budget: mReverbThreadsCfg (0 = auto: hwconc - 2, reserving
@@ -3395,10 +3677,15 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         // Probe-to-probe visibility sampling count for pathing — when a
         // baked path is occluded by dynamic geometry and findAlternatePaths
         // re-runs path finding, this controls how many rays test each
-        // candidate edge. 16 matches the benchmark prototype's setting;
-        // higher = smoother dynamic obstruction at proportionally higher
-        // cost.
-        directSettings.numVisSamples = 16;
+        // candidate edge. Steam Audio's Unity integration defaults to 4
+        // for the BAKE equivalent (`bakingVisibilitySamples`), and the
+        // runtime is conventionally aligned with the bake — running the
+        // runtime at 16 (= 256 rays per edge via the N² rule) makes
+        // dynamic validation 16× more expensive than the bake it's
+        // validating against, for no perceptible quality gain on static-
+        // geometry-dominant scenes with a handful of dynamic doors.
+        // 4 matches Steam Audio's shipping convention.
+        directSettings.numVisSamples = 4;
         // Direct sim runs on the main thread so internal worker threads
         // here are mostly for parallel occlusion ray-traces. Match the
         // reflection sim's choice for now.
@@ -3469,21 +3756,36 @@ bool AudioService::initReflectionPipeline()
     // hybridReverbTransitionTime > irSize/samplingRate, so we keep
     // mRealtimeDuration > mHybridTransitionTime as policy.
     //
-    // Safety clamp for hybrid mode: Steam Audio crashes if
-    // hybridReverbTransitionTime > irDuration. If the user's yaml puts
-    // realtime.duration < hybrid_transition_time, pull the transition down
-    // to leave a 0.1 s margin. Loud stderr [FALLBACK] so the user notices
-    // the clamp and fixes the config rather than relying on it.
+    // Hard config validation: Steam Audio crashes if
+    // hybridReverbTransitionTime > irDuration. Earlier this code silently
+    // clamped the transition down; that hid the misconfig and made the
+    // user's actual setting irrelevant. Refuse to init the reflection
+    // pipeline instead so the user fixes the YAML.
     if (mReflectionType == ReflectionType::Hybrid
         && mHybridTransitionTime > mRealtimeDuration - 0.1f) {
-        float clamped = std::max(0.1f, mRealtimeDuration - 0.1f);
-        std::fprintf(stderr,
-            "[FALLBACK] hybrid_transition_time (%.2fs) > realtime.duration (%.2fs) — "
-            "clamping transition to %.2fs to avoid Steam Audio hybrid-IR crash. "
-            "Fix darknessRender.yaml: raise reflections.realtime.duration or "
-            "lower reflections.hybrid_transition_time.\n",
-            mHybridTransitionTime, mRealtimeDuration, clamped);
-        mHybridTransitionTime = clamped;
+        LOG_ERROR(
+            "AudioService: reflections.hybrid_transition_time (%.2fs) >= "
+            "reflections.realtime.duration (%.2fs) - 0.1s margin — Steam "
+            "Audio's hybrid reverb would crash on the first apply. Reflection "
+            "pipeline NOT initialized. Fix darknessRender.yaml: raise "
+            "reflections.realtime.duration above hybrid_transition_time + "
+            "0.1s, or lower hybrid_transition_time.",
+            mHybridTransitionTime, mRealtimeDuration);
+        return false;
+    }
+
+    // Hard config validation: the runtime ambisonic decoder must match
+    // the order the probes were baked at, or the wet bus silently
+    // downmixes per callback (cost + quality loss). Refuse to init so
+    // the user notices instead of paying the downmix tax forever.
+    if (mAmbisonicsOrder != mBakeAmbisonicsOrder) {
+        LOG_ERROR(
+            "AudioService: reflections.ambisonics_order (%d) != "
+            "reflections.bake.ambisonics_order (%d) — runtime decode would "
+            "downmix the baked IRs every callback. Reflection pipeline NOT "
+            "initialized. Fix darknessRender.yaml so the two values match.",
+            mAmbisonicsOrder, mBakeAmbisonicsOrder);
+        return false;
     }
 
     IPLint32 irSize = static_cast<IPLint32>(mRealtimeDuration * mReflectionSampleRate);
@@ -3799,6 +4101,31 @@ void AudioService::destroyAcousticScene()
         mDirectSimulator = nullptr;
     }
 
+    // Tear down per-door dynamic meshes before the scene. Each instanced mesh
+    // must be removed from the scene before its static mesh is released, or
+    // Steam Audio's refcount won't reach zero. We don't commit between
+    // removals — the scene is being destroyed; the final iplSceneRelease drops
+    // any uncommitted state.
+    if (!mDoorAudioInstances.empty()) {
+        for (auto &[id, inst] : mDoorAudioInstances) {
+            if (inst.instancedMesh) {
+                iplInstancedMeshRemove(inst.instancedMesh, mIplScene);
+                iplInstancedMeshRelease(&inst.instancedMesh);
+                inst.instancedMesh = nullptr;
+            }
+            if (inst.staticMesh) {
+                iplStaticMeshRelease(&inst.staticMesh);
+                inst.staticMesh = nullptr;
+            }
+            if (inst.subScene) {
+                iplSceneRelease(&inst.subScene);
+                inst.subScene = nullptr;
+            }
+        }
+        mDoorAudioInstances.clear();
+    }
+    mSceneNeedsCommit.store(false, std::memory_order_relaxed);
+
     if (mIplStaticMesh) {
         iplStaticMeshRelease(&mIplStaticMesh);
         mIplStaticMesh = nullptr;
@@ -3817,6 +4144,202 @@ void AudioService::destroyAcousticScene()
     // Drop the dangling-pointer aliased scene handle that AudioOcclusion
     // cached at build time so it doesn't survive across rebuilds.
     if (mAudioOcclusion) mAudioOcclusion->setScene(nullptr);
+}
+
+// ── Door dynamic geometry (geometry-aware door blocking) ──
+//
+// Each door registers a small OBB-shaped IPLStaticMesh in its model-local
+// frame plus an IPLInstancedMesh that places that mesh into the world. At
+// runtime, DoorSystem's audio-mesh callback pushes new transforms through
+// setDoorTransform — that's enough for Steam Audio's pathing-validation
+// (iplSimulatorRunPathing's ray-cast pass with `enableValidation = TRUE`) to
+// reject baked path edges that pass through closed doors. Open doors carry
+// the same mesh out of the doorway, so the BVH simply doesn't intersect the
+// portal column anymore and the same baked edge re-validates.
+//
+// The mesh material is "door" from the keyword table (wood, low transmission
+// across all bands) so even transmitted sound is meaningfully attenuated.
+//
+//------------------------------------------------------
+void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &doors)
+{
+    if (!mIplScene) {
+        std::fprintf(stderr,
+            "[DOOR_AUDIO] registerDoorGeometry: scene not built — skipping\n");
+        return;
+    }
+    if (doors.empty()) {
+        std::fprintf(stderr,
+            "[DOOR_AUDIO] registerDoorGeometry: no doors to register\n");
+        return;
+    }
+    std::fprintf(stderr,
+        "[DOOR_AUDIO] registerDoorGeometry: registering %zu doors...\n",
+        doors.size());
+
+    // Steam Audio's docs warn that iplSceneCommit cannot run concurrently with
+    // any simulation function. Static/instanced-mesh adds defer their effect
+    // until commit, so the add calls themselves are safe, but the commit at
+    // the end is not. Drain the reflection sim before touching scene state.
+    // At boot this is a no-op (no voices yet → sim idle), but cheap insurance.
+    if (mReflectionSim) mReflectionSim->waitForCompletion();
+
+    // Cache the "door" material once. Falls back to generic if the keyword
+    // table is missing the entry (kept defensive — table is in this TU).
+    IPLMaterial doorMaterial = lookupAcousticMaterial("door");
+
+    int created = 0;
+    int skipped = 0;
+    for (const auto &g : doors) {
+        if (g.localVertices.size() < 9 || g.indices.size() < 3 ||
+            (g.localVertices.size() % 3) != 0 || (g.indices.size() % 3) != 0) {
+            std::fprintf(stderr,
+                "[FALLBACK] registerDoorGeometry: door %d has malformed mesh "
+                "(verts=%zu, indices=%zu) — skipping\n",
+                g.objID, g.localVertices.size(), g.indices.size());
+            ++skipped;
+            continue;
+        }
+
+        const size_t numVerts = g.localVertices.size() / 3;
+        const size_t numTris  = g.indices.size() / 3;
+
+        // Convert vertices from engine local-feet to IPL local-meters. Same
+        // engineToIplPos used for world geometry; for a static mesh in a
+        // local frame this just orients the mesh consistently with the
+        // instanced-mesh transform (engineToIplMatrix below).
+        std::vector<IPLVector3> iplVerts(numVerts);
+        for (size_t i = 0; i < numVerts; ++i) {
+            Vector3 v(g.localVertices[i * 3 + 0],
+                      g.localVertices[i * 3 + 1],
+                      g.localVertices[i * 3 + 2]);
+            iplVerts[i] = engineToIplPos(v);
+        }
+
+        std::vector<IPLTriangle> iplTris(numTris);
+        for (size_t i = 0; i < numTris; ++i) {
+            iplTris[i].indices[0] = g.indices[i * 3 + 0];
+            iplTris[i].indices[1] = g.indices[i * 3 + 1];
+            iplTris[i].indices[2] = g.indices[i * 3 + 2];
+        }
+
+        // One material per door mesh ("door" → wood). Single-material mesh,
+        // so materialIndices is all-zero (initialized by IPLint32 default).
+        std::vector<IPLint32> matIdx(numTris, 0);
+        IPLMaterial mats[1] = { doorMaterial };
+
+        // Local-frame static mesh held by a 1-shot single-mesh subScene.
+        // Steam Audio's IPLInstancedMesh references an entire IPLScene, not
+        // an IPLStaticMesh directly — we build a tiny per-door scene that
+        // contains the static mesh, then instance THAT into the world scene.
+        IPLSceneSettings subSettings{};
+        subSettings.type = IPL_SCENETYPE_DEFAULT;  // doors don't need embree
+        IPLScene subScene = nullptr;
+        if (iplSceneCreate(mIplContext, &subSettings, &subScene) != IPL_STATUS_SUCCESS) {
+            std::fprintf(stderr,
+                "[FALLBACK] registerDoorGeometry: iplSceneCreate(sub) failed for door %d\n",
+                g.objID);
+            ++skipped;
+            continue;
+        }
+
+        IPLStaticMeshSettings meshSettings{};
+        meshSettings.numVertices    = static_cast<IPLint32>(numVerts);
+        meshSettings.numTriangles   = static_cast<IPLint32>(numTris);
+        meshSettings.numMaterials   = 1;
+        meshSettings.vertices       = iplVerts.data();
+        meshSettings.triangles      = iplTris.data();
+        meshSettings.materialIndices = matIdx.data();
+        meshSettings.materials      = mats;
+
+        IPLStaticMesh sMesh = nullptr;
+        if (iplStaticMeshCreate(subScene, &meshSettings, &sMesh) != IPL_STATUS_SUCCESS) {
+            std::fprintf(stderr,
+                "[FALLBACK] registerDoorGeometry: iplStaticMeshCreate failed for door %d\n",
+                g.objID);
+            iplSceneRelease(&subScene);
+            ++skipped;
+            continue;
+        }
+        iplStaticMeshAdd(sMesh, subScene);
+        iplSceneCommit(subScene);  // commit the sub-scene's own BVH
+
+        // Instance the sub-scene into the main scene at the door's current
+        // world pose. The transform converts engine Z-up feet to IPL Y-up
+        // meters (see engineToIplMatrix derivation above).
+        IPLInstancedMeshSettings instSettings{};
+        instSettings.subScene  = subScene;
+        instSettings.transform = engineToIplMatrix(g.worldTransform);
+
+        IPLInstancedMesh iMesh = nullptr;
+        if (iplInstancedMeshCreate(mIplScene, &instSettings, &iMesh) != IPL_STATUS_SUCCESS) {
+            std::fprintf(stderr,
+                "[FALLBACK] registerDoorGeometry: iplInstancedMeshCreate failed for door %d\n",
+                g.objID);
+            iplStaticMeshRelease(&sMesh);
+            iplSceneRelease(&subScene);
+            ++skipped;
+            continue;
+        }
+        iplInstancedMeshAdd(iMesh, mIplScene);
+
+        // Hold onto the sub-scene reference for the lifetime of the
+        // instanced mesh. Steam Audio's docs do not guarantee that
+        // iplInstancedMeshCreate retains the sub-scene, and an early
+        // iplSceneRelease has manifested as a boot-time hang on some
+        // builds (BVH walks following a dangling pointer). We release it
+        // in destroyAcousticScene instead.
+        DoorAudioInstance inst;
+        inst.subScene      = subScene;
+        inst.staticMesh    = sMesh;
+        inst.instancedMesh = iMesh;
+        mDoorAudioInstances[g.objID] = inst;
+        ++created;
+    }
+
+    // Single commit on the main scene rebuilds its BVH once for all the new
+    // instances. Cheaper than committing per-add.
+    std::fprintf(stderr,
+        "[DOOR_AUDIO] registerDoorGeometry: committing scene "
+        "(created=%d, skipped=%d)...\n", created, skipped);
+    iplSceneCommit(mIplScene);
+
+    std::fprintf(stderr,
+        "[DOOR_AUDIO] registerDoorGeometry: done — %d instanced meshes "
+        "(of %zu doors)\n", created, doors.size());
+}
+
+//------------------------------------------------------
+void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTransform)
+{
+    auto it = mDoorAudioInstances.find(doorObjID);
+    if (it == mDoorAudioInstances.end() || !it->second.instancedMesh || !mIplScene) {
+        // Door not registered for audio (e.g. zero edgeLengths) — silently
+        // no-op. The DoorSystem callback fires for every animating door
+        // regardless, so this path is hit per-frame for un-registered doors.
+        return;
+    }
+    IPLMatrix4x4 ipl = engineToIplMatrix(worldTransform);
+    iplInstancedMeshUpdateTransform(it->second.instancedMesh, mIplScene, ipl);
+    // Coalesce into one iplSceneCommit per loopStep (see loopStep header).
+    mSceneNeedsCommit.store(true, std::memory_order_release);
+
+    // Diagnostic: log the first few transform pushes per door so we can
+    // verify the animation callback is firing. Rate-limited to keep the
+    // log readable while doors animate over many frames.
+    {
+        static std::unordered_map<int32_t, int> sCountByDoor;
+        int &c = sCountByDoor[doorObjID];
+        if (c < 4 || (c % 32) == 0) {
+            std::fprintf(stderr,
+                "[DOOR_AUDIO] setDoorTransform obj=%d trans=(%.2f,%.2f,%.2f) "
+                "(call #%d)\n",
+                doorObjID,
+                worldTransform[3][0], worldTransform[3][1], worldTransform[3][2],
+                c + 1);
+        }
+        ++c;
+    }
 }
 
 // ── Service lifecycle ──
@@ -4012,12 +4535,6 @@ void AudioService::onDBDrop(uint32_t dropmask)
 }
 
 //------------------------------------------------------
-void AudioService::updateAudio(float deltaTime)
-{
-    loopStep(deltaTime);
-}
-
-//------------------------------------------------------
 void AudioService::setListenerTransform(const Vector3 &pos, float yaw, float pitch)
 {
     mListenerPos = pos;
@@ -4043,6 +4560,33 @@ void AudioService::loopStep(float deltaTime)
 {
     if (!mAudioReady)
         return;
+
+    // Steam Audio pathing-simulation throttle. iplSimulatorRunPathing runs
+    // synchronously on this thread and is CPU-heavy; running it every loopStep
+    // can stall the audio callback (the Unity/Unreal integrations expose an
+    // equivalent "Simulation Update Interval" knob for the same reason).
+    // Accumulate deltaTime and only mark the pathing step "due" once the
+    // configured interval elapses. mPathingDueThisStep is read by the
+    // per-voice pathing-input staging loop and by the iplSimulatorRunPathing
+    // invocation further below. mPathingUpdateInterval == 0 means update every
+    // frame (legacy behaviour; preserved as an A-B diagnostic).
+    //
+    // This previously lived in updateAudio(), which was the AudioService's
+    // own per-frame entrypoint. updateAudio() was decommissioned when the
+    // service moved to LoopService-driven loopStep() (DarknessRender.cpp
+    // comment "the manual audioSvc->updateAudio(dt) call is removed"), but
+    // the throttle update was left behind in the old function — so
+    // mPathingDueThisStep stayed false forever, iplSimulatorRunPathing
+    // never ran, and every source's pathing eqCoeffs stayed at Steam
+    // Audio's create-time default of 0.1f (per simulation_data.cpp:120-124).
+    if (mPathingUpdateInterval <= 0.0f) {
+        mPathingDueThisStep = true;
+        mPathingAccumSec    = 0.0f;
+    } else {
+        mPathingAccumSec += deltaTime;
+        mPathingDueThisStep = (mPathingAccumSec >= mPathingUpdateInterval);
+        if (mPathingDueThisStep) mPathingAccumSec = 0.0f;
+    }
 
     // Read profiling flag once per loopStep. When off, all the perf-counter
     // writes scattered through this function and its callees become no-ops.
@@ -4095,6 +4639,47 @@ void AudioService::loopStep(float deltaTime)
             if (cMs > prevC) sCommitPeakMs.store(cMs, std::memory_order_relaxed);
         } else {
             mReflectionSim->commitIfDirty();
+        }
+    }
+
+    // Coalesced acoustic-scene commit for door dynamic geometry.
+    // setDoorTransform queues iplInstancedMeshUpdateTransform calls and flips
+    // mSceneNeedsCommit. iplSceneCommit (BVH refit) cannot run concurrently
+    // with any simulation function per Steam Audio's API contract — so we
+    // gate on `canMutate` (same flag the reflection-sim source-mutation
+    // commit above uses): if the reflection sim is currently running we
+    // skip and try next frame, rather than block on waitForCompletion().
+    // Door transforms are sticky in mSceneNeedsCommit, so postponing a
+    // frame just delays validation by ~16 ms — imperceptible. Pathing and
+    // direct sims run synchronously later in this same loopStep, so they
+    // always observe a committed scene.
+    if (mIplScene && mSceneNeedsCommit.load(std::memory_order_acquire)) {
+        if (canMutate) {
+            auto c0 = std::chrono::steady_clock::now();
+            iplSceneCommit(mIplScene);
+            auto c1 = std::chrono::steady_clock::now();
+            mSceneNeedsCommit.store(false, std::memory_order_release);
+
+            static std::atomic<int> sCommitCount{0};
+            int n = sCommitCount.fetch_add(1, std::memory_order_relaxed);
+            if (n < 8 || (n % 32) == 0) {
+                float ms = std::chrono::duration<float, std::milli>(c1 - c0).count();
+                std::fprintf(stderr,
+                    "[DOOR_AUDIO] iplSceneCommit (door BVH refit) took "
+                    "%.2f ms (call #%d)\n", ms, n + 1);
+            }
+        } else {
+            // Refl-sim busy. Track how long the door commit has been
+            // deferred so we can spot the pathological case where it
+            // never commits (refl-sim always running). Logs every 64
+            // deferred frames.
+            static std::atomic<int> sCommitDeferred{0};
+            int d = sCommitDeferred.fetch_add(1, std::memory_order_relaxed);
+            if ((d % 64) == 0) {
+                std::fprintf(stderr,
+                    "[DOOR_AUDIO] scene commit deferred — reflection sim "
+                    "busy (deferred #%d times so far)\n", d + 1);
+            }
         }
     }
 
@@ -4174,7 +4759,7 @@ void AudioService::loopStep(float deltaTime)
             sharedInputs.numBounces = mRealtimeNumBounces;
             sharedInputs.duration = mRealtimeDuration;
             sharedInputs.order = mAmbisonicsOrder;
-            sharedInputs.irradianceMinDistance = 1.0f;
+            sharedInputs.irradianceMinDistance = kIrradianceMinDistanceMeters;
             // Listener pose goes to both simulators; reflection params
             // (numRays/numBounces/duration/order/irradianceMinDistance) are
             // only consumed when the REFLECTIONS flag is set, so passing the
@@ -4185,6 +4770,17 @@ void AudioService::loopStep(float deltaTime)
                 IPL_SIMULATIONFLAGS_DIRECT, &sharedInputs);
             iplSimulatorSetSharedInputs(reflectionSimHandle,
                 IPL_SIMULATIONFLAGS_REFLECTIONS, &sharedInputs);
+            // Pathing also needs the listener pose per-frame. Without
+            // this call, iplSimulatorRunPathing has no listener position
+            // for the PATHING flag, silently skips all sources, and
+            // iplSourceGetOutputs returns the source's
+            // SimulationData::pathingOutputs.eq init value of
+            // [0.1, 0.1, 0.1] (see Steam Audio simulation_data.cpp).
+            // The pathing pass shares the same direct simulator handle,
+            // so this is a second flag-scoped call on mDirectSimulator,
+            // not a separate simulator.
+            iplSimulatorSetSharedInputs(mDirectSimulator,
+                IPL_SIMULATIONFLAGS_PATHING, &sharedInputs);
 
             // Step 2a: Pre-compute reflection voice ranking (top-N closest).
             // Done before setInputs so we can set inputs.baked for non-top-N voices.
@@ -4436,7 +5032,45 @@ void AudioService::loopStep(float deltaTime)
                         // overwrites doorBlocking / loudRoom with its own
                         // callbacks before forwarding to RoomService.
                         SoundPropParams pp;
-                        pp.maxDist     = voice->maxAudibleDist;
+                        // BFS exploration cap decoupled from per-voice
+                        // audibility radius. The previous design tied
+                        // them together (`pp.maxDist =
+                        // voice->maxAudibleDist`) — but `maxDist` does
+                        // double-duty inside propagateSoundPath: it's
+                        // both the depth-bound on the BFS frontier
+                        // (RoomService.cpp line 715: `if (newEffDist >
+                        // maxDist) continue;`) AND the door-blocking
+                        // accumulator's saturation target (`newEffDist
+                        // += (maxDist - newEffDist) * blocking`). With
+                        // a small per-voice radius (strlight_lp ~25 ft)
+                        // the doorBlocking inflation pushes effDist
+                        // past the radius after only one or two portal
+                        // hops, even when the listener is geometrically
+                        // a few feet from the source.
+                        //
+                        // Result: `prop.reached = false` for nearby
+                        // cross-room voices whose actual portal-graph
+                        // distance is small. Other audio-pipeline
+                        // consumers (AmbientVolumeManager's falloff
+                        // curve, AI hearing distance, multi-path slot
+                        // virtual-position routing) then fall back to
+                        // Euclidean — which misses cross-wall
+                        // attenuation entirely.
+                        //
+                        // Decoupling: BFS gets the project-wide
+                        // propagation cap (mPropagationMaxDist, 200 ft
+                        // default — the absolute upper bound any voice
+                        // could be authored at) OR the voice's own
+                        // radius if larger (rare; covers exotic
+                        // long-range sounds like thunder). Audibility
+                        // gating happens downstream — AmbientVolumeManager
+                        // uses `amb.radius` against `prop.effectiveDistance`
+                        // for the falloff curve, and the per-voice
+                        // maxAudibleDist check in this loop's
+                        // useSteamAudioPathing branch (line ~5084) still
+                        // silences truly out-of-range voices via the
+                        // Euclidean fast-path.
+                        pp.maxDist     = std::max(voice->maxAudibleDist, mPropagationMaxDist);
                         pp.maxPaths    = mPropMaxPaths;
                         pp.maxPathDiff = mPropMaxPathDiff;
                         pp.chainOut    = &voice->cachedChain;
@@ -4444,7 +5078,7 @@ void AudioService::loopStep(float deltaTime)
                             voice->worldPos, mListenerPos, srcID, lstID, pp);
                     } else {
                         prop = propagateSound(voice->worldPos, mListenerPos,
-                                              voice->maxAudibleDist);
+                                              std::max(voice->maxAudibleDist, mPropagationMaxDist));
                     }
                     if (profOn) {
                         auto prT1 = std::chrono::steady_clock::now();
@@ -4530,7 +5164,7 @@ void AudioService::loopStep(float deltaTime)
                     voice->dspNode.portalBlocking = prop.doorBlocking;
                     voice->dspNode.usePortalRouting = isCrossRoom;
 
-                    if (prop.effectiveDistance > 0.001f) {
+                    if (prop.effectiveDistance > kDistanceEpsilonFt) {
                         float ratio = prop.realDistance / prop.effectiveDistance;
                         // Clamp to [0,1]. The ratio cannot exceed 1 in
                         // theory (effectiveDistance ≥ realDistance for any
@@ -4550,7 +5184,7 @@ void AudioService::loopStep(float deltaTime)
                     if (isCrossRoom) {
                         Vector3 toPortal = prop.virtualPosition - mListenerPos;
                         float portalDist = glm::length(toPortal);
-                        if (portalDist > 0.001f) {
+                        if (portalDist > kDistanceEpsilonFt) {
                             toPortal /= portalDist;
                             voice->dspNode.direction = {
                                 glm::dot(toPortal, right),
@@ -4616,7 +5250,7 @@ void AudioService::loopStep(float deltaTime)
                 auto computeDirForPath = [&](const SoundPathRecord& p) -> IPLVector3 {
                     Vector3 toPath = p.virtualPosition - mListenerPos;
                     float   dist   = glm::length(toPath);
-                    if (dist < 0.001f) {
+                    if (dist < kDistanceEpsilonFt) {
                         return IPLVector3{0.0f, 0.0f, -1.0f};  // ahead fallback
                     }
                     toPath /= dist;
@@ -4817,14 +5451,86 @@ void AudioService::loopStep(float deltaTime)
                 // LPF through portalAttenuation / portalBlocking on the
                 // existing DSP chain rather than as a spatialized
                 // ambisonic field.
+                // Throttled: pathing input staging is skipped on frames
+                // when mPathingDueThisStep is false. The matching
+                // iplSourceSetInputs(...PATHING) call and the
+                // iplSimulatorRunPathing call below are gated on the
+                // same flag, so skipping the stamping here costs
+                // nothing (Steam Audio reads pathing fields only on
+                // the PATHING setInputs path).
+                // Per-voice audibility gate. Voices outside their
+                // schema-authored maxAudibleDist are inaudible regardless
+                // of pathing — skip the per-source staging (and the
+                // corresponding cost in iplSimulatorRunPathing) for them.
+                //
+                // We do NOT short-circuit on "same room" here. The room
+                // graph is too coarse-grained for that to be a reliable
+                // proxy for "no portal between source and listener" —
+                // many open spaces (halls, courtyards, outdoor areas)
+                // span multiple Room cells but should sonically behave
+                // as a single space, and the previous same-room hack
+                // would incorrectly skip pathing for voices across those
+                // cells. Let Steam Audio's solver decide; for true
+                // unobstructed paths it returns eqCoeffs ≈ 1.0 and the
+                // mapping naturally produces full passthrough.
+                float voicePathingDist = glm::length(voice->worldPos - mListenerPos);
+                bool  pathingWanted    = (voicePathingDist <= voice->maxAudibleDist);
                 if (mDirectProbeBatchAdded && mProbePathingEnabled
-                    && !voice->playerEmitted) {
+                    && mPathingDueThisStep
+                    && !voice->playerEmitted
+                    && pathingWanted) {
                     inputs.pathingProbes      = mProbeManager->getProbeBatch();
-                    inputs.visRadius          = 0.5f;   // meters
-                    inputs.visThreshold       = 0.1f;
-                    inputs.visRange           = voice->maxAudibleDist * kFeetToMeters;
+                    // visRadius and visThreshold are derived from the
+                    // shared pathing helpers in SteamAudioPathing.h so
+                    // they stay locked to the bake-time parameters
+                    // (ProbeManager.cpp). A runtime value below the bake
+                    // radius causes iplSimulatorRunPathing to fail
+                    // finding an entry probe for sources placed
+                    // off-probe, returning eqCoeffs=[0,0,0] — audible as
+                    // per-callback choppy gaps in the reflection wet bus.
+                    inputs.visRadius          = pathingVisRadiusMeters(
+                        mProbeManager->getProbeSpacingFt());
+                    inputs.visThreshold       = kPathingVisThreshold;
+                    // visRange = maximum probe-to-probe distance the
+                    // solver will consider for a single edge. MUST equal
+                    // the bake-time value or the runtime considers edges
+                    // that don't exist in the graph (too high) /
+                    // silently rejects baked edges (too low).
+                    //
+                    // Matches Steam Audio's Unity convention of allowing
+                    // the solver to walk the full propagation graph;
+                    // per-frame cost is controlled via `numVisSamples`
+                    // and `visThreshold`, NOT by truncating the graph.
+                    inputs.visRange = mPropagationMaxDist * kFeetToMeters;
                     inputs.pathingOrder       = 0;
                     inputs.enableValidation   = IPL_TRUE;
+                    // findAlternatePaths ON.
+                    //
+                    // Required for correctness with dynamic door OBBs in
+                    // the acoustic scene. enableValidation alone discards
+                    // any baked path whose edge ray hits a door OBB; with
+                    // findAlternatePaths off, no replacement is sought and
+                    // the source's pathingState.eq stays at the 0.1f
+                    // sentinel — observed in practice as nearby sources
+                    // (24–37 ft, sProbe/lProbe well inside visRadius)
+                    // returning persistent sentinels because their
+                    // shortest baked path happens to skirt a door OBB
+                    // somewhere along the way.
+                    //
+                    // Cost was the reason this was OFF earlier (boot-time
+                    // main-thread freeze). Two changes reduce it to
+                    // acceptable now:
+                    //   • numVisSamples dropped from 16 to 4 in the
+                    //     direct-sim settings — 16× fewer rays per
+                    //     candidate edge during alternate-path search.
+                    //   • numVisSamples = 4 matches Steam Audio's
+                    //     Unity bake convention, so runtime and bake
+                    //     stay aligned.
+                    //
+                    // If [PATHING_SLOW] returns and blocks the main
+                    // thread, the next move is PLAN.PATHING_WORKER.md —
+                    // run the solver on a background thread so any
+                    // per-call cost becomes acceptable.
                     inputs.findAlternatePaths = IPL_TRUE;
                 }
 
@@ -4838,9 +5544,20 @@ void AudioService::loopStep(float deltaTime)
                 // Pathing inputs ride on the same direct simulator handle
                 // (we configured it with DIRECT|PATHING flags). The
                 // setInputs call selects which subset of fields the
-                // simulator consumes via the flags argument.
+                // simulator consumes via the flags argument. Throttled
+                // by mPathingDueThisStep so we don't stage pathing
+                // inputs more often than iplSimulatorRunPathing
+                // consumes them.
+                //
+                // The gate here must match the populate block above
+                // EXACTLY. Letting a voice through here without going
+                // through the populate path means Steam Audio reads
+                // `inputs.pathingProbes` as the default-initialised null
+                // pointer and segfaults inside the next runPathing.
                 if (mDirectProbeBatchAdded && mProbePathingEnabled
-                    && !voice->playerEmitted) {
+                    && mPathingDueThisStep
+                    && !voice->playerEmitted
+                    && pathingWanted) {
                     iplSourceSetInputs(voice->directSource,
                         IPL_SIMULATIONFLAGS_PATHING, &inputs);
                 }
@@ -4928,8 +5645,58 @@ void AudioService::loopStep(float deltaTime)
             // (audio.propagation.probe_pathing: false), so flipping the
             // toggle saves the full pathing-sim cost rather than just
             // discarding the outputs.
-            if (mDirectProbeBatchAdded && mProbePathingEnabled) {
-                iplSimulatorRunPathing(mDirectSimulator);
+            //
+            // Throttled by mPathingDueThisStep (audio.propagation.
+            // pathing_update_interval, default 0.1 s / 10 Hz). On
+            // skipped frames the previous run's eqCoeffs remain cached
+            // on each source, so the output read further down still
+            // produces stable portalAttenuation/portalBlocking values.
+            {
+                const bool gateProbeBatch = mDirectProbeBatchAdded;
+                const bool gateEnable     = mProbePathingEnabled;
+                const bool gateDue        = mPathingDueThisStep;
+                const bool ranPathing     = gateProbeBatch && gateEnable && gateDue;
+                if (ranPathing) {
+                    // Time every pathing run. Threshold dropped to 15 ms so
+                    // we capture the full cost distribution — even calls
+                    // below the per-frame budget contribute to perceptible
+                    // micro-stutter at 30+ FPS, so they're worth logging
+                    // for triage. Rate-limited (first 32 + every 64th
+                    // thereafter) to keep the log readable.
+                    auto p0 = std::chrono::steady_clock::now();
+                    iplSimulatorRunPathing(mDirectSimulator);
+                    auto p1 = std::chrono::steady_clock::now();
+                    float pMs = std::chrono::duration<float, std::milli>(p1 - p0).count();
+                    static std::atomic<int> sPathingSlowCount{0};
+                    if (pMs > 15.0f) {
+                        int sc = sPathingSlowCount.fetch_add(1, std::memory_order_relaxed);
+                        if (sc < 32 || (sc % 64) == 0) {
+                            std::fprintf(stderr,
+                                "[PATHING_SLOW] iplSimulatorRunPathing took "
+                                "%.1f ms (occurrence #%d)\n", pMs, sc + 1);
+                        }
+                    }
+                }
+                // DIAG: confirm iplSimulatorRunPathing is actually
+                // firing. eqCoeffs reading back as the Steam Audio
+                // default 0.1f (per simulation_data.cpp:120-124, source
+                // pathingState.eq[i] is initialized to 0.1f at source
+                // create time) means the solver never wrote new values
+                // — either runPathing isn't being called, or it's
+                // being called but the source isn't in its solve set.
+                static std::atomic<int> sRunPathingLogCount{0};
+                int n = sRunPathingLogCount.fetch_add(1, std::memory_order_relaxed);
+                if (n < 8) {
+                    AUDIO_LOG("[RUN_PATHING] called=%d probeBatchAdded=%d "
+                              "enabled=%d due=%d updateInterval=%.3f "
+                              "accumSec=%.3f (occurrence #%d)\n",
+                              ranPathing ? 1 : 0,
+                              gateProbeBatch ? 1 : 0,
+                              gateEnable ? 1 : 0,
+                              gateDue ? 1 : 0,
+                              mPathingUpdateInterval, mPathingAccumSec,
+                              n + 1);
+                }
             }
 
             // Signal reflection sim (throttled, latency-tolerant, background thread)
@@ -5012,56 +5779,354 @@ void AudioService::loopStep(float deltaTime)
                                       && !voice->skipPortalRouting;
             if (useSteamAudioPathing && !voice->sourceEnded) {
                 float lineDist = glm::length(voice->worldPos - mListenerPos);
-                if (lineDist <= voice->maxAudibleDist) {
+
+                // Mirror the setInputs gate from earlier in this loopStep.
+                // Voices we skipped staging for (out-of-range) must NOT
+                // read back eqCoeffs from the source — the solver never
+                // wrote new values, so getOutputs returns the source's
+                // pristine create-time pathingState.eq[i] = 0.1f sentinel.
+                // Feeding that into eqCoeffsToDspMapping produces gain
+                // ≈ 0.5 and blocking ≈ 0.36 — every skipped voice becomes
+                // audibly quiet and muffled (the "ambient jitter"
+                // pattern). Treat skipped voices as fully unobstructed.
+                if (lineDist > voice->maxAudibleDist) {
+                    // Out-of-range: nothing to do here. The defensive
+                    // per-frame default block (~line 5083 in this same
+                    // loopStep iteration, which runs unconditionally
+                    // for every Steam Audio voice) already wrote
+                    // portalAttenuation = 0.0 / portalBlocking = 1.0
+                    // for this case. We must NOT call
+                    // iplSourceGetOutputs here — the solver hasn't
+                    // staged this voice's pathing inputs (it's
+                    // skipped on the input-staging side too), so
+                    // getOutputs would return the source's
+                    // pristine 0.1f sentinel and feed it into
+                    // eqCoeffsToDspMapping. Just skip the read.
+                    //
+                    // (Earlier today this branch wrote
+                    // portalAttenuation = mPathingGainScale =
+                    // 5.0 — overriding the first block's silencing
+                    // and making out-of-range voices briefly LOUD
+                    // when they crossed their audible-radius
+                    // boundary during player motion. That has been
+                    // removed.)
+                } else {
                     IPLSimulationOutputs pathingOut{};
                     iplSourceGetOutputs(voice->directSource,
                         IPL_SIMULATIONFLAGS_PATHING, &pathingOut);
 
-                    // ── Closed-door blocking layer (PLAN.* "Option A") ──
+                    // Sentinel detection. Steam Audio initializes
+                    // pathingState.eq[i] to the bit-identical literal
+                    // 0.1f (0x3DCCCCCD) at source-create time, and
+                    // leaves it untouched if either (a) the source has
+                    // not yet had a successful pathing solve (startup
+                    // window — up to one throttle interval after voice
+                    // spawn) or (b) the bake graph has no reachable
+                    // path between the source and listener entry probes
+                    // (sparse bake / disconnected components / all
+                    // candidate paths invalidated). Feeding 0.1 in each
+                    // band into eqCoeffsToDspMapping produces gain ≈
+                    // 0.5 and blocking ≈ 0.36 — the audible "ambient
+                    // jitter" artefact (every new or unreachable voice
+                    // sounds quiet and muffled for the duration of the
+                    // condition).
                     //
-                    // Steam Audio's pathing graph is baked once, so it
-                    // doesn't see runtime door state changes. We re-introduce
-                    // door-state-dependent muffling here by querying the
-                    // canonical room-pair blocking factor map (updated by
-                    // door open/close logic via setBlockingFactor) for the
-                    // source-room ↔ listener-room edge. The factor varies
-                    // continuously with door angle (the door's JointPos
-                    // interpolates 0..1), so the resulting LPF cutoff and
-                    // gain reduction track door state smoothly.
+                    // Treat sentinel reads as "no pathing data available
+                    // — fall back to passthrough". Distance attenuation
+                    // and HRTF direction are still applied by the
+                    // direct path downstream, so the voice sounds
+                    // correct on its own line of sight; we just don't
+                    // attenuate based on a phantom obstruction.
                     //
-                    // Implemented as a hashmap lookup rather than a BSP
-                    // raycast (the spec's literal Option A): the raycast's
-                    // "hit a closed door object → look up factor" collapses
-                    // to the same outcome via the room-pair edge, which is
-                    // the canonical place door logic writes its blocking
-                    // value. O(1), so no Euclidean pre-filter against the
-                    // nearest door is needed; we only enter this branch
-                    // for cross-room voices anyway.
-                    //
-                    // Failure mode parallels the spec's raycast variant: a
-                    // closed door that's NOT on the direct source ↔
-                    // listener room boundary (sound routes around it) is
-                    // not gated — correct geometrically, since the
-                    // probe-graph path already routed around it.
-                    float doorBlocking = 0.0f;
-                    if (mSoundPropagation && mRoomService) {
-                        Room *srcR = mRoomService->roomFromPoint(voice->worldPos);
-                        Room *lstR = mRoomService->roomFromPoint(mListenerPos);
-                        if (srcR && lstR && srcR != lstR) {
-                            doorBlocking = mSoundPropagation->getBlockingFactor(
-                                srcR->getRoomID(), lstR->getRoomID());
+                    // Bit-pattern check (not float-equality) because
+                    // the sentinel is a known literal that we want to
+                    // catch precisely. Real eqCoeffs of exactly 0.1f
+                    // in all three bands would be vanishingly unlikely
+                    // and would round-trip through the mapping
+                    // identically to passthrough anyway.
+                    bool pathingSentinel = false;
+                    {
+                        uint32_t b0, b1, b2;
+                        std::memcpy(&b0, &pathingOut.pathing.eqCoeffs[0], 4);
+                        std::memcpy(&b1, &pathingOut.pathing.eqCoeffs[1], 4);
+                        std::memcpy(&b2, &pathingOut.pathing.eqCoeffs[2], 4);
+                        constexpr uint32_t kSentinel = 0x3DCCCCCD; // bits of 0.1f
+                        pathingSentinel = (b0 == kSentinel && b1 == kSentinel && b2 == kSentinel);
+                    }
+                    // Per-voice frame-counter book-keeping for sentinel-
+                    // cause diagnostics. Incremented every output read so
+                    // the [PATHING_SENTINEL] log can report:
+                    //   • spawn-age in loopSteps (startup window?)
+                    //   • frames-since-last-solve (steady sentinel or
+                    //     transient flicker?)
+                    // Reset of `loopStepsSinceLastSolve` happens in the
+                    // non-sentinel branch below.
+                    voice->loopStepsSinceSpawn++;
+                    if (pathingSentinel) voice->loopStepsSinceLastSolve++;
+
+                    if (pathingSentinel) {
+                        // One-shot diagnostic so we can distinguish
+                        // startup-window sentinels (logs once per new
+                        // voice, then quiet) from persistent
+                        // unreachable-bake-edge sentinels (the voice
+                        // keeps emitting until halted — actionable
+                        // bake / probe-graph diagnostic) from flicker
+                        // events (a voice that has solved before but
+                        // is now intermittently sentinel — points at
+                        // non-deterministic validation or scene
+                        // mutation between pathing-sim calls).
+                        static std::atomic<int> sSentinelLogCount{0};
+                        int n = sSentinelLogCount.fetch_add(1, std::memory_order_relaxed);
+                        if (n < 32 || (n % 256) == 0) {
+                            std::fprintf(stderr,
+                                "[PATHING_SENTINEL] h=%u '%s' dist=%.1f "
+                                "everSolved=%d sinceSpawn=%u sinceSolve=%u "
+                                "dueThisStep=%d — using cached or bypass "
+                                "[#%d]\n",
+                                handle, voice->schemaName.c_str(),
+                                lineDist,
+                                voice->pathingEverSolved ? 1 : 0,
+                                voice->loopStepsSinceSpawn,
+                                voice->loopStepsSinceLastSolve,
+                                mPathingDueThisStep ? 1 : 0,
+                                n + 1);
+                        }
+                    } else if (!voice->pathingEverSolved) {
+                        // First non-sentinel read for this voice — flip
+                        // the flag and emit a one-shot log so the
+                        // startup-window vs. persistent-sentinel
+                        // distinction is visible per-voice.
+                        voice->pathingEverSolved = true;
+                        static std::atomic<int> sFirstSolveLogCount{0};
+                        int n = sFirstSolveLogCount.fetch_add(1, std::memory_order_relaxed);
+                        if (n < 64 || (n % 256) == 0) {
+                            std::fprintf(stderr,
+                                "[PATHING_FIRST_SOLVE] h=%u '%s' dist=%.1f "
+                                "eq=[%.3f,%.3f,%.3f] sProbe=%d lProbe=%d [#%d]\n",
+                                handle, voice->schemaName.c_str(), lineDist,
+                                pathingOut.pathing.eqCoeffs[0],
+                                pathingOut.pathing.eqCoeffs[1],
+                                pathingOut.pathing.eqCoeffs[2],
+                                /*sProbe=*/-1, /*lProbe=*/-1, n + 1);
                         }
                     }
 
+                    // ── Closed-door blocking (geometry-aware via Steam Audio) ──
+                    //
+                    // Doors register `IPLInstancedMesh` geometry with the
+                    // acoustic scene (see registerDoorGeometry). Steam
+                    // Audio's pathing solver runs ray-cast validation on
+                    // every baked path edge (`enableValidation = TRUE` in
+                    // the per-voice setInputs above); edges that intersect
+                    // a closed door's geometry fail validation, and
+                    // `findAlternatePaths = TRUE` searches for a
+                    // geometrically-valid alternate. If none exists the
+                    // resulting eqCoeffs collapse toward zero. This makes
+                    // door blocking physically accurate and route-aware:
+                    // closing a door in a room with no alternate route
+                    // silences cross-room sound; closing a door in a room
+                    // with an alternate corridor only partially attenuates
+                    // (sound reroutes around). No per-frame BFS needed.
+                    //
+                    // The `setBlockingFactor` map is still maintained by
+                    // DoorSystem for AIHearingService and the legacy
+                    // room-BFS path (when `probe_pathing = false`), but is
+                    // not consulted here.
                     PathingDspMapping m = eqCoeffsToDspMapping(
                         pathingOut.pathing.eqCoeffs[0],
                         pathingOut.pathing.eqCoeffs[1],
                         pathingOut.pathing.eqCoeffs[2],
-                        doorBlocking,
-                        mPathingGainScale);
+                        /*doorBlocking=*/0.0f,
+                        mPathingGainScale,
+                        mPathingBlockingScale,
+                        mPathingGainWeightLow,
+                        mPathingGainWeightMid,
+                        mPathingGainWeightHigh);
 
-                    voice->dspNode.portalAttenuation = m.gain;
-                    voice->dspNode.portalBlocking    = m.blocking;
+                    // Pathing diagnostic. Surfaces transient bad values
+                    // (validation flicker, probe-graph misses) that
+                    // produce audible choppy gaps in the wet bus.
+                    // Periodic log every N pathing calls for cadence,
+                    // plus always-on SPIKE log when eqCoeffs sum drops
+                    // below the threshold (the canonical signature of a
+                    // failed Steam Audio pathing solve).
+                    {
+                        const float eqL = pathingOut.pathing.eqCoeffs[0];
+                        const float eqM = pathingOut.pathing.eqCoeffs[1];
+                        const float eqH = pathingOut.pathing.eqCoeffs[2];
+                        const float eqSum = eqL + eqM + eqH;
+                        static std::atomic<uint64_t> sPathLogCount{0};
+                        const uint64_t cc = sPathLogCount.fetch_add(
+                            1, std::memory_order_relaxed);
+                        const bool periodic = (cc % 256) == 0;
+                        const bool spike    = (eqSum < 1.5f);
+                        if (periodic || spike) {
+                            // Print exact bits as hex so we can spot
+                            // suspicious sentinel patterns (e.g. all
+                            // bands holding the bit-identical 0x3DCCCCCD
+                            // = 0.1f literal) vs naturally varying
+                            // visibility values.
+                            uint32_t eqLBits, eqMBits, eqHBits;
+                            std::memcpy(&eqLBits, &eqL, 4);
+                            std::memcpy(&eqMBits, &eqM, 4);
+                            std::memcpy(&eqHBits, &eqH, 4);
+
+                            // Nearest-probe diagnostic. The hypothesis is
+                            // that Steam Audio's source-probe lookup
+                            // silently skips sources whose distance to the
+                            // nearest probe exceeds an internal radius
+                            // (derived from bake spacing). When that
+                            // happens, pathing never runs for the source
+                            // and SimulationData::pathingOutputs.eq stays
+                            // at the init-default 0.1 across all bands —
+                            // matching every SPIKE we currently see.
+                            // sProbeD = source→nearest-probe distance (ft)
+                            // lProbeD = listener→nearest-probe distance
+                            // sProbeIdx / lProbeIdx = probe indices for
+                            // cross-referencing with the probe overlay.
+                            // Lookup is O(N_probes) but only runs inside
+                            // this periodic|spike-gated branch so cost is
+                            // bounded; never enters the per-frame hot
+                            // path. mProbeManager null-checked because
+                            // pathing-gated branch above already requires
+                            // mDirectProbeBatchAdded, but be defensive.
+                            int   sProbeIdx = -1, lProbeIdx = -1;
+                            float sProbeD = -1.0f, lProbeD = -1.0f;
+                            if (mProbeManager) {
+                                const auto &probePos = mProbeManager->getProbePositions();
+                                if (!probePos.empty()) {
+                                    float sBestSq = std::numeric_limits<float>::max();
+                                    float lBestSq = std::numeric_limits<float>::max();
+                                    for (size_t i = 0; i < probePos.size(); ++i) {
+                                        Vector3 ds = probePos[i] - voice->worldPos;
+                                        float sq = glm::dot(ds, ds);
+                                        if (sq < sBestSq) { sBestSq = sq; sProbeIdx = static_cast<int>(i); }
+                                        Vector3 dl = probePos[i] - mListenerPos;
+                                        float lq = glm::dot(dl, dl);
+                                        if (lq < lBestSq) { lBestSq = lq; lProbeIdx = static_cast<int>(i); }
+                                    }
+                                    sProbeD = std::sqrt(sBestSq);
+                                    lProbeD = std::sqrt(lBestSq);
+                                }
+                            }
+                            // doorBlk dropped from the format string: door
+                                      // blocking is now handled by Steam Audio's
+                                      // geometry-aware path validation (instanced
+                                      // door meshes in the IPLScene), not by the
+                                      // per-frame BFS lookup that used to populate
+                                      // this field.
+                            AUDIO_LOG("[PATH] h=%u '%s' dist=%.1f "
+                                      "eq=[%.6f,%.6f,%.6f] "
+                                      "eqBits=[%08x,%08x,%08x] "
+                                      "srcW=(%.1f,%.1f,%.1f) "
+                                      "lstW=(%.1f,%.1f,%.1f) "
+                                      "sProbe=%d d=%.1f lProbe=%d d=%.1f "
+                                      "gain=%.4f blk=%.4f%s\n",
+                                      handle, voice->schemaName.c_str(),
+                                      lineDist, eqL, eqM, eqH,
+                                      eqLBits, eqMBits, eqHBits,
+                                      voice->worldPos.x, voice->worldPos.y, voice->worldPos.z,
+                                      mListenerPos.x, mListenerPos.y, mListenerPos.z,
+                                      sProbeIdx, sProbeD, lProbeIdx, lProbeD,
+                                      m.gain, m.blocking,
+                                      spike ? " SPIKE" : "");
+                        }
+                    }
+
+                    if (pathingSentinel) {
+                        // Sentinel handling. Two paths:
+                        //
+                        //   (1) Voice has solved before (`pathingEverSolved
+                        //       == true`): freeze portalAttenuation /
+                        //       portalBlocking at the last-good cached
+                        //       values until the next successful solve.
+                        //       Eliminates the audible level-pop that
+                        //       happens when pathing flickers between
+                        //       real-eq and sentinel — a synthetic bypass
+                        //       value would produce a +6.7 dB jump for
+                        //       typical mid-range eqCoeffs at
+                        //       pathingGainScale ≈ 5.
+                        //
+                        //   (2) Voice has NEVER solved (startup window or
+                        //       genuinely unreachable bake path): fall
+                        //       back to the synthetic-passthrough bypass
+                        //       (gain = pathingGainScale, blocking = 0).
+                        //       Acoustically equivalent to "fully
+                        //       unobstructed"; distance attenuation
+                        //       downstream still pulls level for far
+                        //       sources. Without this, a brand-new voice
+                        //       would silently snap to whatever stale
+                        //       cached values it had — typically zero —
+                        //       and stay silent until first solve.
+                        if (voice->pathingEverSolved) {
+                            voice->dspNode.portalAttenuation =
+                                voice->lastGoodPortalAttenuation;
+                            voice->dspNode.portalBlocking    =
+                                voice->lastGoodPortalBlocking;
+                        } else {
+                            voice->dspNode.portalAttenuation = mPathingGainScale;
+                            voice->dspNode.portalBlocking    = 0.0f;
+                        }
+                    } else {
+                        voice->dspNode.portalAttenuation = m.gain;
+                        voice->dspNode.portalBlocking    = m.blocking;
+                        // Cache for replay on future sentinel reads.
+                        voice->lastGoodPortalAttenuation = m.gain;
+                        voice->lastGoodPortalBlocking    = m.blocking;
+                        voice->loopStepsSinceLastSolve   = 0;
+                    }
+
+                    // ── Diagnostic: catch per-pathing-tick value jitter ──
+                    //
+                    // The existing [PATH] log fires only on SPIKE (eqSum
+                    // < 1.5) or every 256 calls. That misses the case
+                    // we care about for "stuttering": a voice whose eq
+                    // alternates between two non-spike values every
+                    // throttle tick (or whose portalAtt swings between
+                    // a real-solve value and a sentinel bypass). At
+                    // the 3.3 Hz throttle rate, such oscillation
+                    // produces audible low-frequency amplitude
+                    // modulation — exactly what the user is hearing as
+                    // "ambient stuttering".
+                    //
+                    // Track each voice's last-applied portalAtt /
+                    // portalBlk and log whenever either changes by
+                    // more than a sub-step threshold. Rate-limited
+                    // per voice so a single oscillator doesn't flood
+                    // the log; the first dozen jumps tell us the
+                    // pattern.
+                    {
+                        static std::unordered_map<SoundHandle,
+                            std::pair<float,float>> sPrevPortal;
+                        static std::unordered_map<SoundHandle, int> sJumpCount;
+                        auto it = sPrevPortal.find(handle);
+                        if (it != sPrevPortal.end()) {
+                            float dGain  = std::fabs(voice->dspNode.portalAttenuation - it->second.first);
+                            float dBlock = std::fabs(voice->dspNode.portalBlocking    - it->second.second);
+                            // 0.05 ≈ −0.4 dB step. Most stable voices
+                            // sit ≤0.01 between ticks; legitimate
+                            // motion-driven changes ramp smoothly and
+                            // would log a few times in a row before
+                            // settling — visible as a continuous train
+                            // rather than alternating two values.
+                            if (dGain > 0.05f || dBlock > 0.05f) {
+                                int n = ++sJumpCount[handle];
+                                if (n <= 16 || (n % 32) == 0) {
+                                    std::fprintf(stderr,
+                                        "[PATH_JUMP] h=%u '%s' "
+                                        "gain %.3f→%.3f (Δ=%.3f) "
+                                        "blk %.3f→%.3f (Δ=%.3f) "
+                                        "sentinel=%d [#%d]\n",
+                                        handle, voice->schemaName.c_str(),
+                                        it->second.first, voice->dspNode.portalAttenuation, dGain,
+                                        it->second.second, voice->dspNode.portalBlocking, dBlock,
+                                        pathingSentinel ? 1 : 0, n);
+                                }
+                            }
+                        }
+                        sPrevPortal[handle] = {voice->dspNode.portalAttenuation,
+                                               voice->dspNode.portalBlocking};
+                    }
                 }
             }
 
@@ -5071,7 +6136,7 @@ void AudioService::loopStep(float deltaTime)
                 if (!voice->dspNode.usePortalRouting) {
                     Vector3 toSource = voice->worldPos - mListenerPos;
                     float dist = glm::length(toSource);
-                    if (dist > 0.001f) {
+                    if (dist > kDistanceEpsilonFt) {
                         toSource /= dist;
                         // Project world direction onto listener-local axes.
                         // Steam Audio convention: +X=right, +Y=up, -Z=ahead,
@@ -5225,9 +6290,21 @@ void AudioService::loopStep(float deltaTime)
                 // the pre-count, this prevents overshoot.
                 bool isReflVoice = reflCandidateSet.count(handle) > 0;
                 bool canAffordConvolution = (activeConvolutionCount < mReverbVoices);
-                bool hasBakedData = mProbeManager->hasReflections()
-                                    && outputs.reflections.irSize > 0
-                                    && voice->dspNode.reflectionEffect;
+                // Pure parametric mode produces no IR — Steam Audio's
+                // parametric reflection effect uses only reverbTimes[3]
+                // (per phonon.h: ir/irSize/eq/delay are CONVOLUTION/HYBRID
+                // -only fields). For baked sources the simulator never
+                // populates outputs.reflections.ir or irSize when
+                // reflectionType == PARAMETRIC; reverbTimes come from the
+                // probe batch via iplProbeBatchGetReverb in the pin block
+                // below. So the "has reflection data available" gate
+                // splits by mode: parametric needs only probe data;
+                // convolution / hybrid still need a real IR.
+                const bool isParametricMode =
+                    (mReflectionType == ReflectionType::Parametric);
+                bool hasBakedData = voice->dspNode.reflectionEffect
+                    && mProbeManager->hasReflections()
+                    && (isParametricMode || outputs.reflections.irSize > 0);
                 // Pending reflection sources have no valid sim outputs yet
                 // (we never called iplSourceGetOutputs on them above), so
                 // outputs.reflections.irSize is zero for them — but
@@ -5250,9 +6327,18 @@ void AudioService::loopStep(float deltaTime)
                     // eliminates the Steam-Audio-internal IR crossfade that
                     // produces the ~5 Hz amplitude pulse ("beating") in the
                     // wet bus. See VoicePool.h "Pinned per-voice IR" docs.
+                    // Pin-eligibility split by reflection algorithm:
+                    //   • CONVOLUTION / HYBRID: need a valid IR handle from
+                    //     the simulator (irSize > 0 && ir != nullptr).
+                    //   • PARAMETRIC: no IR is ever produced — pin as soon
+                    //     as a probe batch with parametric data is loaded,
+                    //     since the apply call needs only reverbTimes.
+                    const bool hasConvIR = outputs.reflections.irSize > 0
+                        && outputs.reflections.ir != nullptr;
+                    const bool canPinParametric = isParametricMode
+                        && mProbeManager && mProbeManager->hasReflections();
                     if (!voice->reflectionIRPinned
-                        && outputs.reflections.irSize > 0
-                        && outputs.reflections.ir != nullptr) {
+                        && (hasConvIR || canPinParametric)) {
                         // outputs.reflections.ir is an opaque
                         // IPLReflectionEffectIR handle owned by Steam
                         // Audio; we hold the handle as-is and never
@@ -5328,6 +6414,28 @@ void AudioService::loopStep(float deltaTime)
                         // produces a very different "doubled reverb"
                         // symptom.
                         voice->pinnedParams.delay = 0;
+
+                        // Per-call processing length. `irSize` in the params
+                        // struct is the per-call "samples to process" knob
+                        // (≤ effect's create-time irSize). For CONVOLUTION/
+                        // HYBRID this controls how much of the pinned IR is
+                        // convolved each call. For PARAMETRIC there is no
+                        // IR — but Steam Audio still consults this field as
+                        // the per-call processing length for the FDN: pass
+                        // 0 and apply() returns silence regardless of how
+                        // well-populated reverbTimes are (verified
+                        // empirically: pinned reverbTimes correct, footstep
+                        // mono peak ~0.3 reaching the worker, wet output
+                        // peak exactly 0.0). For baked CONVOLUTION/HYBRID
+                        // the outputs.reflections copy already carries a
+                        // valid irSize so we leave it alone; for PARAMETRIC
+                        // we force the create-time effect length so apply
+                        // produces full-length output.
+                        if (isParametricMode) {
+                            voice->pinnedParams.irSize = static_cast<IPLint32>(
+                                mRealtimeDuration
+                                * static_cast<float>(mReflectionSampleRate));
+                        }
 
                         // Fetch baked reverbTimes from the nearest probe
                         // to the listener. Steam Audio does NOT populate
@@ -5506,11 +6614,23 @@ void AudioService::loopStep(float deltaTime)
                 float rtLow = 0.0f, rtMid = 0.0f, rtHigh = 0.0f;
                 bool found = false;
                 for (auto &[h, v] : mVoicePool->voices()) {
-                    if (v->dspNode.reflectionsActive.load(std::memory_order_relaxed)
-                        && v->dspNode.reflectionParams.irSize > 0) {
-                        rtLow  = v->dspNode.reflectionParams.reverbTimes[0];
-                        rtMid  = v->dspNode.reflectionParams.reverbTimes[1];
-                        rtHigh = v->dspNode.reflectionParams.reverbTimes[2];
+                    // Accept any active reflection voice whose reverbTimes
+                    // are populated. CONVOLUTION/HYBRID populate irSize too;
+                    // PARAMETRIC has irSize == 0 by design but still carries
+                    // valid reverbTimes — gate on the type field, not irSize.
+                    if (!v->dspNode.reflectionsActive.load(std::memory_order_relaxed))
+                        continue;
+                    const auto &rp = v->dspNode.reflectionParams;
+                    const bool hasData =
+                        (rp.type == IPL_REFLECTIONEFFECTTYPE_PARAMETRIC)
+                            ? (rp.reverbTimes[0] > 0.0f
+                               || rp.reverbTimes[1] > 0.0f
+                               || rp.reverbTimes[2] > 0.0f)
+                            : (rp.irSize > 0);
+                    if (hasData) {
+                        rtLow  = rp.reverbTimes[0];
+                        rtMid  = rp.reverbTimes[1];
+                        rtHigh = rp.reverbTimes[2];
                         found  = true;
                         break;
                     }
@@ -5559,6 +6679,24 @@ void AudioService::loopStep(float deltaTime)
                 voice->tailTimer -= deltaTime;
                 if (voice->tailTimer <= 0.0f) {
                     voice->finished.store(true, std::memory_order_release);
+                    // Clear reflectionsActive at tail end. Without this the
+                    // staging guard in reflectionMixNodeProcess
+                    // (`if (node->reflectionsActive && node->reflectionEffect
+                    // && node->reflectionParams.irSize > 0 ...)`) keeps
+                    // matching every callback until the voice is fully
+                    // destroyed — so the convolution worker pool continues
+                    // applying iplReflectionEffectApply to a long-dead
+                    // voice. Over a busy session this accumulates: every
+                    // ended voice's slot stays allocated and consuming
+                    // CPU until destroyVoice runs, easily piling to the
+                    // full MAX_ACTIVE_VOICES (= 32) regardless of the
+                    // reverb_voices config cap. With this clear the
+                    // staging guard rejects the voice on the very next
+                    // callback after the tail finishes — same callback
+                    // the slot-release loop at line ~4419 frees
+                    // reflSlotOwned, in lockstep.
+                    voice->dspNode.reflectionsActive.store(
+                        false, std::memory_order_release);
                     AUDIO_LOG( "[VOICE] TAIL_DONE h=%d '%s'\n",
                                  handle, voice->schemaName.c_str());
                 }
@@ -5803,7 +6941,17 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
     // (or at worst second) audio callback.
     {
         IPLSourceSettings srcSettings{};
-        srcSettings.flags = IPL_SIMULATIONFLAGS_DIRECT;
+        // Source flags must include every simulation type the source will
+        // ever participate in — this is the per-source enrolment Steam
+        // Audio uses to decide which subsystems to attach state to. The
+        // simulator itself was created with DIRECT|PATHING (Line 3594),
+        // but the source only gets pathing state if PATHING is in its
+        // own flags as well. Omitting PATHING here is the root cause of
+        // iplSourceGetOutputs(PATHING) returning eqCoeffs=[0,0,0] for
+        // every voice: the source has no pathing slot for the solver to
+        // write into, so the read always returns zeros.
+        srcSettings.flags = static_cast<IPLSimulationFlags>(
+            IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_PATHING);
 
         IPLerror err = iplSourceCreate(mDirectSimulator, &srcSettings, &voice.directSource);
         if (err != IPL_STATUS_SUCCESS) {
@@ -8406,6 +9554,16 @@ void AudioService::setProbePortalRings(bool enabled)
     mProbePortalRings = enabled;
 }
 
+void AudioService::setProbeMinWallClearanceFt(float ft)
+{
+    // Negative or NaN → treat as disabled (0). Upper clamp guards
+    // against a YAML typo (e.g. metres mistaken for feet) that would
+    // reject every probe in the level.
+    if (!(ft >= 0.0f)) ft = 0.0f;
+    if (ft > 50.0f)    ft = 50.0f;
+    mProbeMinWallClearanceFt = ft;
+}
+
 const std::vector<Vector3> &AudioService::getProbePositions() const
 {
     static const std::vector<Vector3> kEmpty;
@@ -8438,6 +9596,8 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     params.spacingFtOverride     = spacing;
     params.heightFtOverride      = height;
     params.additionalElevations  = mProbeElevations;
+    params.elevationSparsityMul  = mProbeElevationSparsityMul;
+    params.globalDedupRadiusFt   = mProbeGlobalDedupRadiusFt;
 
     // Build per-portal axial anchors from RoomService at bake time.
     // For each portal we contribute up to two probe candidates:
@@ -8548,11 +9708,115 @@ bool AudioService::bakeProbes(const std::string &outputPath,
                   totalPortals, skippedDup, skippedSky, emitted, emitted * 2);
     }
 
+    // Validity filter applied to every probe candidate. Two rejection
+    // criteria, both producing the same outcome (probe is dropped from
+    // the batch before any reflection rays are cast):
+    //
+    //   1. No containing room → the candidate sits in BSP void or
+    //      inside solid geometry. Steam Audio's UNIFORMFLOOR generation
+    //      raycasts down to find a floor, which mostly avoids underground
+    //      placements, but elevation tiers and portal anchors don't get
+    //      that guarantee. roomFromPoint is the cheapest reliable
+    //      "inside the level" oracle we have.
+    //
+    //   2. Within `minClearanceFt` of the nearest room wall. Wall-
+    //      adjacent probes capture a single dominant first-bounce
+    //      reflection at t = 2·distance/c, which comb-filters input
+    //      audio at multiples of c/(2·distance). Pulling probes inward
+    //      from walls trades a small coverage gap near room edges for
+    //      far better-conditioned IRs everywhere else. We approximate
+    //      "distance to nearest wall" with min(positive distance over
+    //      the 6 room bounding planes) — exact for box-shaped rooms,
+    //      a slight over-estimate for L-shaped ones. Good enough for a
+    //      bake-time filter; if we ever need true per-cell clearance we
+    //      can swap in CollisionGeometry::sphereVsCellPolygons here.
+    //
+    // Filter is constructed inline so it captures live tuning state.
+    // Empty lambda = legacy behaviour (every candidate accepted).
+    const float minClearanceFt = mProbeMinWallClearanceFt;
+    if (mRoomService) {
+        params.minWallClearanceFt = minClearanceFt;
+        params.probeFilter =
+            [this, minClearanceFt](const Vector3 &p) -> ProbeFilterDecision {
+                ProbeFilterDecision d;
+                Room *r = mRoomService->roomFromPoint(p);
+                if (!r) {                              // (1) inside solid / void
+                    d.result = ProbeFilterResult::Reject;
+                    return d;
+                }
+                if (minClearanceFt <= 0.0f) {          // clearance disabled
+                    d.result = ProbeFilterResult::Accept;
+                    return d;
+                }
+                // (2) Lateral wall clearance only. Planes face inward,
+                //     so distance > 0 = inside; smallest positive
+                //     distance over the VERTICAL planes is the wall
+                //     clearance. See ProbeManager.h for the per-result
+                //     semantics; Reject = no recovery, Nudge = displace
+                //     by `nudgeDir × nudgeDistFt` and re-evaluate.
+                //
+                //     Floor/ceiling planes (|normal.z| > 0.5) are
+                //     excluded by design:
+                //       - The probe sits a fixed `height` above the
+                //         floor (default 5 ft = the default clearance).
+                //         Including the floor plane would place every
+                //         probe exactly at the threshold, where float-
+                //         precision jitter rejects half of them.
+                //       - Outdoor rooftop / balcony rooms often have an
+                //         audio-ceiling plane only a few feet above the
+                //         floor (it bounds the audio room, not the
+                //         physical sky). Including it would reject
+                //         every probe in those rooms even though they
+                //         sit in wide-open space.
+                //     The 0.5 threshold = 30° off vertical; Dark Engine
+                //     room OBBs are axis-aligned, so |normal.z| is
+                //     either ~0 (wall) or ~1 (floor/ceiling) — the cut
+                //     is unambiguous in practice.
+                const Plane *planes = r->getBoundingPlanes();
+                float minDist = 1e9f;
+                int   minIdx  = -1;
+                int   wallPlanes = 0;
+                for (int i = 0; i < 6; ++i) {
+                    if (std::abs(planes[i].normal.z) > 0.5f) continue;
+                    float dist = planes[i].getDistance(p);
+                    if (dist < minDist) { minDist = dist; minIdx = i; }
+                    ++wallPlanes;
+                }
+                // Degenerate case: room has no vertical walls (rare —
+                // possibly a malformed top/bottom-only bounds). Without
+                // walls to be adjacent to, accept the probe.
+                if (wallPlanes == 0 || minIdx < 0) {
+                    d.result = ProbeFilterResult::Accept;
+                    return d;
+                }
+                if (minDist >= minClearanceFt) {
+                    d.result = ProbeFilterResult::Accept;
+                    return d;
+                }
+                // Too close to a wall — nudge inward along the wall's
+                // inward normal by the missing clearance. ProbeManager
+                // adds a fixed 0.5 ft margin and re-evaluates.
+                d.result      = ProbeFilterResult::Nudge;
+                d.nudgeDir    = planes[minIdx].normal;
+                d.nudgeDistFt = minClearanceFt - minDist;
+                return d;
+            };
+    } else {
+        // No RoomService = no way to validate anything; let everything
+        // through and log so the operator notices. This is the same
+        // posture classifyProbeReachability takes below.
+        AUDIO_LOG("[FALLBACK] bakeProbes: no RoomService — probe filter "
+                  "disabled, every candidate will be baked\n");
+    }
+
     bool ok = mProbeManager->bakeProbes(mIplScene, outputPath, params, progress);
     if (ok) {
-        // Classify the freshly-baked probes so the overlay can show which
-        // ones a future reachability filter would prune. Cheap and only
-        // the debug overlay reads the result.
+        // Classify the freshly-baked probes so the overlay can show
+        // residual bad ones (e.g. unreachable disconnected rooms — those
+        // get past the filter because roomFromPoint returns a valid
+        // room, just one no playable seed reaches). With the filter
+        // active on a fresh bake this should be a small minority; if it
+        // isn't, the filter or seed-room logic needs another look.
         classifyProbeReachability();
     }
     return ok;
@@ -8602,10 +9866,31 @@ bool AudioService::loadProbes(const std::string &probePath)
                       mProbeManager->getProbeCount());
         }
     }
-    // Classify reachability so the debug overlay can preview which probes
-    // a future bake-time filter would prune. Cheap (a few ms even for
-    // thousands of probes) and only the overlay reads the result.
-    classifyProbeReachability();
+    // Classify reachability so the debug overlay can preview which
+    // probes the bake-time filter would now reject. With the filter
+    // active on a fresh bake the bad count should be ~0 (only the
+    // reachability check still finds disconnected components, and those
+    // are rare). If we load an OLD .probes file baked before the filter
+    // existed, the bad count can be a large fraction of total — warn
+    // the operator so they know a re-bake will clean things up.
+    size_t bad = classifyProbeReachability();
+    const auto &positionsForCheck = mProbeManager->getProbePositions();
+    if (!positionsForCheck.empty()) {
+        const float badFrac = static_cast<float>(bad)
+                            / static_cast<float>(positionsForCheck.size());
+        if (badFrac > 0.25f) {
+            std::fprintf(stderr,
+                "[STALE_PROBES] '%s' contains %zu/%zu (%.0f%%) probes "
+                "that the current filter would reject (inside solid or "
+                "wall-adjacent). The file was likely baked before "
+                "audio.probes.min_wall_clearance_ft was set. Re-bake from "
+                "the debug console (`bake_probes`) for clean reverb — "
+                "voices snapping to bad probes may sound dropout-prone "
+                "or comb-filtered until you do.\n",
+                probePath.c_str(), bad, positionsForCheck.size(),
+                100.0f * badFrac);
+        }
+    }
     return true;
 }
 

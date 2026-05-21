@@ -23,45 +23,26 @@
 #define __CONVOLUTION_WORKER_POOL_H
 
 /// @file ConvolutionWorkerPool.h
-/// Off-thread reflection convolution pool — consumes per-voice mono input
-/// snapshots produced by the audio thread, applies the convolution IRs
-/// returned by ReflectionSimulator (ambisonics), decodes ambisonics to
-/// binaural stereo and writes the result into double-buffered staging
-/// outputs that the reflection mix node reads on the next callback.
+/// Off-thread reflection convolution pool. The audio thread snapshots per-
+/// voice mono into shared staging buffers; the mix node distributes voice
+/// slots round-robin across N sub-workers and signals them by bumping
+/// `frameSeq` (release). Each sub-worker owns its own Steam Audio pipeline
+/// (no shared mutable state during iteration), applies the convolution IRs,
+/// decodes ambisonics to binaural stereo, and writes a double-buffered
+/// output that the mix node reads on the next callback.
 ///
-/// Extracted from AudioService. Each sub-worker owns its own Steam Audio
-/// pipeline (mixer + ambisonics decoder + scratch buffers) so processing
-/// is fully independent across workers — no shared mutable state during
-/// iteration. Per-voice slot assignment is round-robin and is signalled
-/// from the mix node callback via acquire-release `frameSeq` increments.
-///
-/// THREADING — PRESERVED from the pre-extraction implementation:
-///
-///   • Each ConvolutionSubWorker has its OWN background thread, so the
-///     pool runs N+1 threads (N sub-workers, plus the audio thread that
-///     drives the staging-buffer swap inside the reflection mix node).
-///   • Audio thread writes per-voice mono into `staging[writeIdx][slotIdx]`
-///     while sub-workers read from `staging[readBuf][slotIdx]` for the
-///     PREVIOUS frame. Staging is **triple-buffered**: at each swap the
-///     mix node picks the buffer that is neither the one just filled
-///     (which becomes the new read target) nor the one workers might
-///     still be on. Workers are allowed to fall one frame behind without
-///     forcing the audio thread to drop a swap. Only if any worker is
-///     two-or-more signals behind (frameSeq − processedSeq ≥ 2) does the
-///     mix node fall back to the legacy drop path, since three buffers
-///     can no longer cover the three simultaneously-live read positions.
-///   • Sub-worker wake-up uses an atomic `frameSeq` with release/acquire
-///     ordering; the corresponding `processedSeq` is bumped at the end of
-///     each iteration so wait loops (drainConvolutionWorker,
-///     waitForCompletion) can converge.
-///   • Per-sub-worker stereo output is double-buffered (front/back) so the
-///     mix node can read the front buffer while the worker fills the back
-///     buffer; the swap is a single `frontIdx.store(release)`.
-///   • Each sub-worker's `hasProducedOutput` flag latches once the worker
-///     has produced its first frame; the mix node skips workers that
-///     haven't started yet so we don't sum from a still-zeroed buffer.
+/// THREADING:
+///   • N sub-worker threads + audio thread.
+///   • Staging is **triple-buffered** so workers may lag one frame; only
+///     when any worker is ≥2 signals behind does the mix node fall back to
+///     the drop path.
+///   • Wake uses acquire-release atomics + condvar; processedSeq is bumped
+///     at iteration end so drain/waitForCompletion can converge.
+///   • Per-worker stereo output is double-buffered; swap is a single
+///     frontIdx.store(release).
 
 #include "AudioService.h"   // MAX_ACTIVE_VOICES
+#include "AudioUnits.h"     // kDefaultDeviceFrameSize
 
 #include <atomic>
 #include <condition_variable>
@@ -72,8 +53,8 @@
 #include <thread>
 #include <vector>
 
-// Steam Audio opaque handle types — mirror the typedefs from AudioService.h
-// so callers don't need to drag in phonon.h.
+// Steam Audio opaque types — mirror typedefs from AudioService.h so callers
+// don't need to drag in phonon.h.
 struct _IPLContext_t;
 typedef _IPLContext_t* IPLContext;
 struct _IPLHRTF_t;
@@ -85,16 +66,7 @@ typedef _IPLAmbisonicsDecodeEffect_t* IPLAmbisonicsDecodeEffect;
 struct _IPLReflectionEffect_t;
 typedef _IPLReflectionEffect_t* IPLReflectionEffect;
 
-// IPL types defined inside phonon.h. We need their full definitions for
-// the structs below (ConvolutionWorker.VoiceSlot.params, listenerOrientation).
-// Those structs are defined inline below; we include phonon.h in the .cpp
-// translation units that touch them rather than from this header. To keep
-// the header self-contained we forward-include phonon.h only when callers
-// explicitly need the full types — but VoiceSlot stores IPLReflectionEffectParams
-// by value, which means we DO need the full layout. The simplest path is to
-// include phonon.h from this header; consumers already include
-// AudioService.h which transitively includes other Steam Audio headers
-// via phonon.h.
+// VoiceSlot stores IPLReflectionEffectParams by value → need the full layout.
 #include <phonon.h>
 
 #include "AudioMetering.h"  // StageMeter
@@ -102,257 +74,190 @@ typedef _IPLReflectionEffect_t* IPLReflectionEffect;
 
 namespace Darkness {
 
-// ── Per-thread convolution sub-worker ──────────────────────────────────
-//
-// Each sub-worker owns its own Steam Audio mixer/decoder pipeline and
-// processes a subset of voice slots assigned by the mix node callback.
-// Completely independent — no shared mutable state between sub-workers
-// during processing.
+/// Per-thread sub-worker. Owns its own Steam Audio ambisonics decoder +
+/// scratch buffers — fully independent across workers. The reflection mixer
+/// was dropped (it only supports CONVOLUTION/TAN); workers accumulate
+/// ambisonics manually into ambiCh* so HYBRID and PARAMETRIC also work.
 struct ConvolutionSubWorker {
-    // Own Steam Audio ambisonics decoder (not thread-safe — one per worker).
-    // The reflection MIXER was dropped during PLAN.HYBRID_REVERB.md Phase 3:
-    // Steam Audio's mixer only supports CONVOLUTION and TAN, not HYBRID or
-    // PARAMETRIC. The sub-worker now accumulates per-voice ambisonics
-    // manually into ambiCh*, which works for all three modes (convolution,
-    // hybrid, parametric).
     IPLAmbisonicsDecodeEffect ambiDecodeEffect = nullptr;
 
-    // Own scratch buffers for ambisonics processing.
-    //   ambiCh{0..3}      — per-worker accumulator (sum of all per-voice
-    //                       outputs assigned to this worker for this frame).
-    //   voiceAmbi{0..3}   — per-voice output of one iplReflectionEffectApply
-    //                       call. Cleared/overwritten by every voice.
-    //   decodedL/R         — stereo binaural after ambisonics decode.
+    // Per-worker accumulator (sum of this worker's voice outputs this frame).
     std::vector<float> ambiCh0, ambiCh1, ambiCh2, ambiCh3;
+    // Per-voice output of one iplReflectionEffectApply (overwritten per voice).
     std::vector<float> voiceAmbi0, voiceAmbi1, voiceAmbi2, voiceAmbi3;
+    // Stereo binaural after ambisonics decode.
     std::vector<float> decodedL, decodedR;
 
-    // Own double-buffered stereo output (deinterleaved)
+    // Double-buffered stereo output (deinterleaved).
     std::vector<float> stereoL[2], stereoR[2];
     std::atomic<int> frontIdx{0};
     std::atomic<bool> hasProducedOutput{false};
 
-    // Last decoded sample of the previous reflection frame, kept as state
-    // for the rateDivisor>1 upsampler so the bridge between consecutive
-    // frames is a continuous piecewise-linear curve instead of a held-flat
-    // sample + step discontinuity at every reflection-frame boundary
-    // (audible as a low buzz at reflRate / reflFrameSize Hz).
-    float prevDecodedTailL = 0.0f;
-    float prevDecodedTailR = 0.0f;
+    // Delay-line history for the polyphase upsampler — (subLen-1) samples
+    // of the previous reflection frame per channel. Empty when rateDivisor=1.
+    std::vector<float> prevDecodedL;
+    std::vector<float> prevDecodedR;
 
-    // Assignment: indices into shared staging[readBuf].
-    // Written by mix node BEFORE signal, read by worker AFTER signal.
-    // The atomic frameSeq provides the acquire-release barrier.
+    // Slot assignment: indices into shared staging[readBuf]. Written by mix
+    // node BEFORE signal, read by worker AFTER signal — atomic frameSeq
+    // provides the acquire-release barrier.
     int assignedSlots[MAX_ACTIVE_VOICES];
     int assignedCount = 0;
 
-    // Thread control
     std::thread thread;
-    std::atomic<uint64_t> frameSeq{0};       // incremented by mix node to signal new data
-    std::atomic<uint64_t> processedSeq{0};   // last frameSeq the worker finished
+    std::atomic<uint64_t> frameSeq{0};      // mix node bumps to signal new data
+    std::atomic<uint64_t> processedSeq{0};  // last frameSeq this worker finished
     std::atomic<bool> shutdown{false};
     std::atomic<float> peakMs{0.0f};
 
-    // Wake mechanism. The worker sleeps on `wakeCv` whenever
-    // `frameSeq == lastSeq && !shutdown`. The audio thread bumps
-    // `frameSeq` (atomic store, no lock needed) then calls
-    // `wakeCv.notify_one()` to wake the worker. cv.wait re-checks the
-    // predicate after each wake, so a missed notify (worker not in
-    // wait at the moment of notify) is harmless — the worker either
-    // sees the new seq on the next predicate check (no wait) or wakes
-    // immediately when notify lands. This replaces the previous
-    // yield-poll loop which would miss signals during macOS scheduler
-    // stalls (typically at reflection-sim cycle completion); see
-    // NOTES.PROJECT.md "Reflection sim ↔ conv worker contention
-    // pattern" for the diagnosis.
+    // Worker sleeps on wakeCv when frameSeq==lastSeq && !shutdown. cv.wait
+    // re-checks the predicate so a missed notify is harmless. Replaces the
+    // previous yield-poll which missed signals during macOS scheduler stalls.
     std::mutex wakeMtx;
     std::condition_variable wakeCv;
 
-    // Gain-staging meters (per sub-worker, written only by this worker
-    // thread, read by the master mix node at [GAIN] dump time with
-    // accept-tearing semantics — diagnostic, no correctness impact).
-    // The mix node folds all sub-worker meters into a combined view
-    // before logging via StageMeter::mergeIn.
+    // Gain-staging meters (written only by this worker thread; read by the
+    // mix node at [GAIN] dump time with accept-tearing semantics).
     StageMeter saMeterReflIn;     // mono input to iplReflectionEffectApply
     StageMeter saMeterReflW;      // W (omni) channel of convolution output
     StageMeter saMeterDecodeOut;  // stereo output of iplAmbisonicsDecodeEffect
 
-    // ── Per-stage latency histograms ─────────────────────────────────────
-    //
-    // Writer: this sub-worker thread (one writer per histogram, so the
-    // atomic bucket counts are sufficient). Reader: AudioService periodic
-    // dump merges all sub-workers' histograms before computing percentiles.
-    // Histograms are gated by `Darkness::gAudioLogVerbose` at the call site
-    // so production builds with `audio_log: false` pay nothing.
+    // Per-stage latency histograms (one writer per histogram). AudioService
+    // periodic dump merges across sub-workers before computing percentiles.
     LatencyHistogram perfApplyMs;     // iplReflectionEffectApply per voice
     LatencyHistogram perfSumMs;       // manual ambisonics sum per voice
     LatencyHistogram perfDecodeMs;    // iplAmbisonicsDecodeEffectApply per frame
     LatencyHistogram perfUpsampleMs;  // rate-divisor upsample + bridge per frame
-    LatencyHistogram perfIterMs;      // total per-iteration time (= old peakMs)
+    LatencyHistogram perfIterMs;      // total per-iteration time
 
-    // ── Per-iteration apply-distribution histograms (H2 of perf-tuning) ──
-    //
-    // perfApplyMs above already records each individual apply() call. These
-    // histograms aggregate per-iter to answer two diagnostic questions that
-    // the per-call distribution cannot:
-    //
-    //   • perfSumApplyMs   — sum of all apply() calls in one iter. The
-    //                        per-call distribution can't tell us how those
-    //                        costs add up across the 4 voices assigned to
-    //                        one worker. This is the convolution work the
-    //                        worker actually does per iter — directly
-    //                        comparable to iter time.
-    //   • perfMaxApplyMs   — max single apply() call in one iter. If the
-    //                        iter tail is driven by one expensive voice
-    //                        rather than the accumulated 4, max = sum
-    //                        (single dominant voice); if balanced, max ≈
-    //                        sum / N. Tells us whether to attack the
-    //                        per-voice cost or the assignment policy.
-    //   • perfResidualMs   — iter − (sumApply + sumStage + decode +
-    //                        upsample). All non-DSP time inside an iter:
-    //                        memset, atomic store, buffer flip, cache
-    //                        warmup, scheduler preemption. If residual p99
-    //                        is large, the bottleneck is NOT DSP and lever
-    //                        1–3 (yaml knobs) won't help — likely thread
-    //                        scheduling (H1) or contention.
+    // Per-iter apply distribution:
+    //   perfSumApplyMs  — sum of apply() calls in one iter (worker's actual
+    //                     convolution work, comparable to iter time)
+    //   perfMaxApplyMs  — max single apply() call (single dominant voice
+    //                     vs balanced load)
+    //   perfResidualMs  — iter − DSP. Non-DSP time: memset, atomic store,
+    //                     buffer flip, scheduler preemption. Large p99 →
+    //                     bottleneck is not DSP, yaml knobs won't help.
     LatencyHistogram perfMaxApplyMs;
     LatencyHistogram perfSumApplyMs;
     LatencyHistogram perfResidualMs;
 
-    // ── Signal → pickup latency (H2' of perf-tuning) ────────────────────
-    //
-    // Written by the mix node at the moment it bumps `frameSeq`, read by
-    // the worker the moment it detects the new seq. The diff captures the
-    // gap between "signal sent" and "worker started processing" — i.e.
-    // the cost of the worker's wait-loop (yield-poll or condvar) plus any
-    // scheduler delay between the worker becoming runnable and being
-    // dispatched onto a core. Iter time alone cannot see this — that
-    // timer starts AFTER the new seq is observed.
-    //
-    // ns since steady_clock epoch (kept as raw nanoseconds so we don't
-    // have to commit to a duration type across header/cpp boundaries).
-    // Atomic for cross-thread visibility; ordering is acquire/release
-    // around the frameSeq bump, so the write happens-before the worker's
-    // observation of the new seq value.
+    // Signal→pickup latency. Mix node writes at frameSeq bump; worker reads
+    // when it observes the new seq. Captures wait-loop + scheduler delay.
+    // ns since steady_clock epoch.
     std::atomic<long long> signalTimeNs{0};
-
-    // Histogram of (worker observation time − signalTimeNs) per iter.
     LatencyHistogram perfSignalPickupMs;
+
+    // Per-stage NaN-guard counters. ambiCh* sanitised BEFORE decode (a NaN
+    // in W becomes NaN in both stereo channels post-decode); decodedL/R
+    // sanitised AFTER decode (catches decoder-introduced NaNs). Per-sample
+    // replacement with 0 produces audible clicks rather than full silence.
+    std::atomic<uint32_t> nanCountAmbi{0};
+    std::atomic<uint32_t> nanCountDecode{0};
 };
 
-// ── Off-thread convolution worker with K parallel sub-workers ──────────
-//
-// The audio callback writes voice mono snapshots to shared staging buffers.
-// The mix node callback distributes voice slots across sub-workers
-// (round-robin) and signals them. Each sub-worker processes its subset
-// independently and writes to its own double-buffered stereo output. The
-// mix node reads and sums all sub-worker outputs on the next callback.
-// No barrier sync needed.
+/// Off-thread convolution worker with K parallel sub-workers. Audio
+/// callback writes voice mono to shared staging; mix node distributes
+/// round-robin and signals workers; each sub-worker writes its own
+/// double-buffered stereo; mix node sums all sub-worker outputs on the
+/// next callback. No barrier sync needed.
 struct ConvolutionWorker {
-    // Per-voice mono input snapshots (filled by audio thread, read by sub-workers)
+    /// Per-voice mono input snapshot (audio thread writes, sub-workers read).
     struct VoiceSlot {
-        std::vector<float> mono;          // processed mono data (post-distance-atten, post-decimate)
+        std::vector<float> mono;          // post-distance-atten, post-decimate
         IPLReflectionEffect effect = nullptr;
         IPLReflectionEffectParams params{};
-        // Shared validity token — reference-counted so workers can safely
-        // dereference it even after the owning ActiveVoice has been destroyed.
+        // Reference-counted so workers can safely dereference even after
+        // the owning ActiveVoice has been destroyed.
         std::shared_ptr<std::atomic<bool>> validityToken;
         int reflFrameSize = 0;
         bool active = false;
-        // Diagnostic: tag forwarded from the voice's DSP node so the worker
-        // can log the wet-output peak only for footstep voices, keeping the
-        // log focused.
+        // Forwarded from the voice's DSP node — gates per-voice wet-peak log
+        // to footstep voices.
         bool isFootstepDiag = false;
     };
     static constexpr int kMaxSlots = MAX_ACTIVE_VOICES;
 
-    // Triple-buffered voice slots. Rotation pattern at each swap:
-    //   • writeIdx (just filled by audio thread) → becomes new currentReadBuf
-    //   • currentReadBuf (workers' previous target, may still be in flight)
-    //     → becomes the next writeIdx
-    //   • the remaining buffer is the one workers were NOT on
-    // This way the audio thread never has to drop a swap just because a
-    // worker is finishing the previous frame. Drops only happen if any
-    // worker is ≥ 2 frames behind (catastrophic backlog), since then all
-    // three buffers are simultaneously live.
+    // Triple-buffered staging. At each swap: writeIdx (just filled) becomes
+    // new currentReadBuf; the previous read buffer becomes writeIdx; the
+    // third buffer is the one workers were NOT on. Audio thread never has
+    // to drop a swap unless any worker is ≥2 frames behind (catastrophic
+    // backlog — all three buffers simultaneously live).
     static constexpr int kStagingBuffers = 3;
     VoiceSlot staging[kStagingBuffers][kMaxSlots];
-    int stagingCount[kStagingBuffers] = {0, 0, 0};  // count per buffer
-    std::atomic<int> writeIdx{0};        // audio thread writes to this index
-    std::atomic<int> readyCount{0};      // count of the buffer just completed
+    int stagingCount[kStagingBuffers] = {0, 0, 0};
+    std::atomic<int> writeIdx{0};
+    std::atomic<int> readyCount{0};
 
-    // Number of sub-workers that have woken on the current signal but
-    // have not yet finished their iteration. Decremented to 0 by workers
-    // after they release their staging slot references. Vestigial for
-    // safety (drop logic) since the two-frames-behind check on
-    // frameSeq/processedSeq is now the primary back-pressure signal;
-    // kept for shutdown drain diagnostics.
+    // Sub-workers active on the current signal (workers decrement to 0 after
+    // releasing staging slot references). Vestigial for safety since the
+    // ≥2-frames-behind check on frameSeq/processedSeq is the primary
+    // back-pressure signal; retained for shutdown drain diagnostics.
     std::atomic<int> workersReading{0};
 
-    // Which staging buffer sub-workers should read (plain int — visibility
-    // guaranteed by the acquire-release on sub-worker frameSeq signals).
+    // Which staging buffer sub-workers should read. Plain int — visibility
+    // guaranteed by acquire-release on sub-worker frameSeq signals.
     int currentReadBuf = -1;
 
-    // Sub-workers (K parallel threads, each with own mixer/decoder/output).
-    // unique_ptr because ConvolutionSubWorker contains std::atomic (non-movable).
+    // Sub-workers (K parallel threads). unique_ptr because
+    // ConvolutionSubWorker contains std::atomic (non-movable).
     std::vector<std::unique_ptr<ConvolutionSubWorker>> workers;
     int numWorkers = 1;
 
-    // Shared read-only state (set at init, never modified during processing)
+    // Shared read-only state (set at init, immutable during processing).
     IPLHRTF hrtf = nullptr;
     IPLContext context = nullptr;
-    int frameSize = 1024;
-    int reflectionFrameSize = 1024;
+    int frameSize = static_cast<int>(kDefaultDeviceFrameSize);
+    int reflectionFrameSize = static_cast<int>(kDefaultDeviceFrameSize);
     int ambiChannels = 1;
     int ambiOrder = 0;
     int rateDivisor = 2;  // 1=full, 2=half, 4=quarter
-    // Audio callback period in milliseconds (frameSize / sampleRate * 1000).
-    // Set at init from cfg.audioSettings.samplingRate; the worker uses it
-    // to size the [CONV_LAG] threshold (a fraction of the callback period)
-    // and to report the period in the log line. Cached here so the worker
-    // thread doesn't need access to the engine config.
+
+    // Polyphase upsample FIR (designed once at init from rateDivisor).
+    // Layout: [phase * subLen + tap]. Empty + subLen==0 when rateDivisor=1
+    // (passthrough memcpy). Replaces per-sample linear interpolation
+    // which had ~13 dB image rejection at source-Nyquist → audible grain
+    // in the upper output band.
+    std::vector<float> upsampleCoeffs;
+    int upsampleSubLen = 0;
+    // Audio callback period (ms) = frameSize/sampleRate * 1000. Used to
+    // size the [CONV_LAG] threshold + report in the log.
     float callbackPeriodMs = 21.333f;
 
-    // Listener orientation snapshot (written by mix node, read by all workers)
+    // Listener orientation snapshot (mix node writes, all workers read).
     IPLCoordinateSpace3 listenerOrientation = {
         {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f}
     };
+
+    // Worker→audio-thread completion signal. Replaces the previous yield-
+    // poll which burned the full sync deadline whenever any worker stalled.
+    // Single shared CV — audio thread is the only waiter, so notify_one
+    // from any worker wakes the predicate re-check which loads every
+    // worker's processedSeq atomically.
+    std::mutex             doneMtx;
+    std::condition_variable doneCv;
 };
 
-/// Drain all sub-workers' pending frames. Called from ~ActiveVoice (defined
-/// in VoicePool.cpp) before releasing the IPLReflectionEffect — the worker
-/// holds a pointer to that effect and must not be mid-iteration when it's
-/// released.
-///
-/// Returns true on clean drain, false if the deadline expired (caller logs
-/// and continues — the validity-token mechanism still keeps the worker safe
-/// from reading freed memory, this just bounds the post-cleanup tail).
+/// Drain all sub-workers' pending frames. Called from ~ActiveVoice before
+/// releasing the IPLReflectionEffect — the worker holds a pointer to that
+/// effect and must not be mid-iteration when it's released. Returns true
+/// on clean drain, false on deadline expiry (the validity token still
+/// keeps the worker safe; this just bounds the post-cleanup tail).
 bool drainConvolutionWorker(ConvolutionWorker *cw, int deadlineMs);
 
-// ── Pool front-end ─────────────────────────────────────────────────────
-//
-// AudioService constructs one of these inside initReflectionPipeline().
-// It owns the ConvolutionWorker (and its sub-worker threads), exposes the
-// worker pointer for the reflection mix node + per-voice DSP node staging,
-// and provides shutdown/drain helpers.
+/// Pool front-end. AudioService constructs one in initReflectionPipeline().
 class ConvolutionWorkerPool {
 public:
-    /// Configuration captured from RenderConfig / AudioService at init.
     struct Config {
         IPLContext context = nullptr;
         IPLHRTF    hrtf = nullptr;
-        int        frameSize = 1024;
-        int        reflectionFrameSize = 1024;
+        int        frameSize = static_cast<int>(kDefaultDeviceFrameSize);
+        int        reflectionFrameSize = static_cast<int>(kDefaultDeviceFrameSize);
         int        rateDivisor = 2;
         int        ambiChannels = 1;
         int        ambiOrder = 0;
-        /// Number of sub-workers (>0). Auto-derivation happens in the
-        /// caller before construction.
         int        numWorkers = 1;
-        /// IPL audio settings (sampling rate + frame size) used to create
-        /// each sub-worker's IPLReflectionMixer + IPLAmbisonicsDecodeEffect.
         IPLAudioSettings audioSettings{};
-        /// Reflection-effect settings — irSize + numChannels.
         IPLReflectionEffectSettings reflSettings{};
     };
 
@@ -362,35 +267,28 @@ public:
     ConvolutionWorkerPool(const ConvolutionWorkerPool&) = delete;
     ConvolutionWorkerPool& operator=(const ConvolutionWorkerPool&) = delete;
 
-    /// Construct the underlying ConvolutionWorker, allocate per-sub-worker
-    /// Steam Audio pipelines, spawn the threads. Returns false on any
-    /// IPL allocation failure (caller logs + falls back to on-thread).
+    /// Construct the worker, allocate per-sub-worker IPL pipelines, spawn
+    /// threads. False on any IPL alloc failure (caller falls back to
+    /// on-thread).
     bool init(const Config &cfg);
 
-    /// Block until every sub-worker has finished all frames signalled so far.
-    /// Spin-wait with a 500ms deadline; logs a warning on timeout.
+    /// Block until every sub-worker has finished all frames signalled so
+    /// far. Spin-wait with a 500ms deadline; warns on timeout.
     void waitForCompletion();
 
-    /// Shut down all sub-workers and release per-worker Steam Audio
-    /// resources. Idempotent.
+    /// Idempotent shutdown.
     void shutdown();
 
-    /// Pointer to the underlying worker struct (used by the reflection
-    /// mix node + per-voice DSP nodes for staging-buffer hand-off). May
-    /// return nullptr if init() has not been called or failed.
     ConvolutionWorker* worker() { return mWorker.get(); }
     const ConvolutionWorker* worker() const { return mWorker.get(); }
 
-    /// True if init() succeeded and the worker pool is operational.
     bool isActive() const { return mWorker != nullptr; }
-
-    /// Convenience: number of sub-workers actually spawned.
     int numWorkers() const { return mWorker ? mWorker->numWorkers : 0; }
 
 private:
-    /// Per-thread main — wakes on frameSeq increment, processes assigned
-    /// slots, runs ambisonics decode, writes deinterleaved stereo to the
-    /// back buffer, flips frontIdx, bumps processedSeq.
+    /// Per-thread main — wakes on frameSeq, processes assigned slots, runs
+    /// ambisonics decode, writes back stereo, flips frontIdx, bumps
+    /// processedSeq.
     void subWorkerMain(int workerIdx);
 
     std::unique_ptr<ConvolutionWorker> mWorker;
@@ -398,4 +296,4 @@ private:
 
 } // namespace Darkness
 
-#endif // __CONVOLUTION_WORKER_POOL_H
+#endif

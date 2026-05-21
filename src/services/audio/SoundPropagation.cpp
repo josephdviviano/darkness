@@ -39,26 +39,20 @@ SoundPropagation::~SoundPropagation() = default;
 //------------------------------------------------------
 void SoundPropagation::setBlockingFactor(int room1, int room2, float factor)
 {
-    // Store bidirectionally so lookup works in either direction
-    uint32_t key1 = (static_cast<uint32_t>(room1) << 16) |
-                     static_cast<uint32_t>(room2 & 0xFFFF);
-    uint32_t key2 = (static_cast<uint32_t>(room2) << 16) |
-                     static_cast<uint32_t>(room1 & 0xFFFF);
+    // Bidirectional — store both keys.
+    const uint32_t key1 = (static_cast<uint32_t>(room1) << 16) |
+                          static_cast<uint32_t>(room2 & 0xFFFF);
+    const uint32_t key2 = (static_cast<uint32_t>(room2) << 16) |
+                          static_cast<uint32_t>(room1 & 0xFFFF);
 
     if (factor <= 0.0f) {
-        // Remove blocking (fully open)
         mBlockingFactors.erase(key1);
         mBlockingFactors.erase(key2);
     } else {
         mBlockingFactors[key1] = factor;
         mBlockingFactors[key2] = factor;
     }
-
-    // RoomService::propagateSoundPath re-runs BFS on each call so we
-    // don't need to invalidate any per-source cache here — the next
-    // BFS query will read the updated blocking map directly via the
-    // params.doorBlocking callback.
-
+    // BFS reads the map fresh on each query — no cache invalidation needed.
     AUDIO_LOG("[DOOR_BLOCK] setBlockingFactor room(%d,%d) factor=%.3f mapSize=%zu\n",
               room1, room2, factor, mBlockingFactors.size());
 }
@@ -66,30 +60,21 @@ void SoundPropagation::setBlockingFactor(int room1, int room2, float factor)
 //------------------------------------------------------
 float SoundPropagation::getBlockingFactor(int room1, int room2) const
 {
-    uint32_t key = (static_cast<uint32_t>(room1) << 16) |
-                    static_cast<uint32_t>(room2 & 0xFFFF);
+    const uint32_t key = (static_cast<uint32_t>(room1) << 16) |
+                         static_cast<uint32_t>(room2 & 0xFFFF);
     auto it = mBlockingFactors.find(key);
-    if (it != mBlockingFactors.end())
-        return it->second;
-    // Open portals have zero blocking. Room portals are real architectural
-    // doorways (not BSP cell boundaries), so traversing an open doorway has
-    // no artificial penalty. Door blocking is set explicitly via
-    // setBlockingFactor() when doors close.
-    return 0.0f;
+    return (it != mBlockingFactors.end()) ? it->second : 0.0f;
 }
 
 //------------------------------------------------------
 void SoundPropagation::setRoomTransmission(int32_t roomID, float transmission)
 {
-    // Only store non-default values to keep the lookup table small.
+    // Sparse storage — drop default values. BFS reads the map fresh per query.
     if (transmission == 1.0f) {
         mRoomTransmission.erase(roomID);
     } else {
         mRoomTransmission[roomID] = transmission;
     }
-
-    // LoudRoom multiplier is read on every BFS query via the
-    // params.loudRoom callback so no invalidation work is required.
 }
 
 //------------------------------------------------------
@@ -119,15 +104,12 @@ SoundPropInfo SoundPropagation::propagateSound(const Vector3 &sourcePos,
     Room *sourceRoom = mRoomService->roomFromPoint(sourcePos);
     Room *listenerRoom = mRoomService->roomFromPoint(listenerPos);
 
-    int32_t srcID = sourceRoom ? sourceRoom->getRoomID() : -1;
-    int32_t lstID = listenerRoom ? listenerRoom->getRoomID() : -1;
+    const int32_t srcID = sourceRoom ? sourceRoom->getRoomID() : -1;
+    const int32_t lstID = listenerRoom ? listenerRoom->getRoomID() : -1;
 
-    // If source or listener is outside all room OBBs, the room-explicit
-    // overload handles it with a euclidean distance fallback. This matches
-    // the original Dark Engine behavior: objects outside the room database
-    // cannot propagate sound through the room portal graph. The ambient
-    // system uses euclidean distance directly, so this fallback only affects
-    // non-ambient voices (footsteps, one-shots) that happen to be outside rooms.
+    // -1 IDs trigger the Euclidean fallback inside the room-explicit
+    // overload — matches the original engine: objects outside the room
+    // database can't propagate through portals.
     return propagateSound(sourcePos, listenerPos, srcID, lstID,
                           maxDist, maxPaths, maxPathDiff);
 }
@@ -158,23 +140,15 @@ SoundPropInfo SoundPropagation::propagateSoundWithParams(
     int32_t listenerRoomID,
     SoundPropParams &params) const
 {
-    // BFS body lives in RoomService::propagateSoundPath — that lets the
-    // headless trace-path tool exercise the same graph traversal without
-    // an audio backend. We thread our runtime cost data through as
-    // callbacks: door blocking (closed doors set via setBlockingFactor)
-    // and LoudRoom multipliers (from P$LoudRoom). Anything else about the
-    // result — the per-portal raycast / edge projection, the
-    // virtualPosition anchor selection, the BFS-failure log — happens
-    // inside RoomService and is unchanged behaviorally.
+    // BFS lives in RoomService::propagateSoundPath; we thread our cost
+    // tables in as callbacks (doorBlocking + loudRoom). Per-portal
+    // raycasts, virtualPosition anchor selection, and BFS-failure logs
+    // are unchanged inside RoomService.
     if (!mRoomService)
         return {};
 
-    // Resolve the integer room IDs back to Room pointers at call time.
-    // Looking up here (rather than caching a Room* on the caller side)
-    // avoids the dangling-pointer hazard if the room database is rebuilt
-    // between the caller storing the ID and the BFS running. -1 means
-    // "outside all rooms"; RoomService treats a null Room* as the same
-    // fallback case (euclidean distance, no portal traversal).
+    // Resolve IDs at call time so a rebuilt room DB can't cause dangling
+    // Room pointers. -1 → nullptr → RoomService falls back to Euclidean.
     Room *sourceRoom   = (sourceRoomID   >= 0) ? mRoomService->getRoomByID(sourceRoomID)   : nullptr;
     Room *listenerRoom = (listenerRoomID >= 0) ? mRoomService->getRoomByID(listenerRoomID) : nullptr;
 
@@ -184,10 +158,8 @@ SoundPropInfo SoundPropagation::propagateSoundWithParams(
     params.loudRoom = [this](int32_t roomID) -> float {
         return getRoomTransmission(roomID);
     };
-    // Plumb the BSP-aware line-of-sight callback (installed at level
-    // load) into the per-bend chain validation. Without this, the BFS
-    // returns its best-effort closest-point chain even when it pierces
-    // walls; with this, blocked bends get refined or paths are dropped.
+    // BSP-aware LoS refines chain bends — without it, BFS may return a
+    // wall-piercing best-effort chain.
     if (mLineOfSightFn && !params.losClear) {
         params.losClear = mLineOfSightFn;
     }

@@ -132,6 +132,27 @@ struct RenderConfig {
     // graph at doorways so cross-room chains route through the doorway
     // rather than wrapping around through grid probes on either side.
     bool audioProbePortalRings = true;
+    // Bake-time validity filter. Drops any probe candidate that either
+    //   (a) doesn't sit inside any room (BSP void / inside solid), or
+    //   (b) is within this many engine feet of the nearest room wall.
+    // 0 disables the clearance check (the inside-solid check still
+    // runs). Higher values prefer well-conditioned IRs over coverage
+    // near walls; cranking past ~half the typical corridor width will
+    // start rejecting probes in narrow passages. Requires a re-bake.
+    float audioProbeMinWallClearanceFt = 5.0f;
+    // Elevation-tier sparsity multiplier. Floor probes are binned on a
+    // coarser (x, y) grid (binSize = spacing × this) and one elevation
+    // probe is placed at each bin's centroid per tier. Default 2.0 =
+    // 2×2 binning = 1:4 ratio (~75% fewer elevation probes vs legacy
+    // 1:1). Higher values further reduce density; 1.0 restores legacy
+    // 1:1 behaviour. Requires a re-bake.
+    float audioProbeElevationSparsityMul = 2.0f;
+    // Global dedup pass radius (engine feet) applied after all probe
+    // placement (floor, elevation, portal, emitter). Probes within this
+    // distance of an earlier-kept probe get dropped. Default 2.0 ft is
+    // conservative — catches obvious overlaps without eating into the
+    // 5 ft grid spacing. 0 = dedup disabled. Requires a re-bake.
+    float audioProbeGlobalDedupRadiusFt = 2.0f;
 
     // -- audio.occlusion: occlusion + material scaling --
     // (diffuseSamples / bakeDiffuseSamples moved to realtimeDiffuseSamples /
@@ -162,6 +183,39 @@ struct RenderConfig {
     // sound louder than the bake implies, without re-baking. Does NOT
     // affect the LPF blocking factor. Clamped to [0.1, 10.0].
     float    pathingGainScale = 1.0f;
+    // Companion knob: multiplier on the LPF blocking factor emitted
+    // by eqCoeffsToDspMapping. Legacy mapping (blocking = 1 − eqHigh)
+    // produces blocking ≈ 0.98 for typical cross-room ambients
+    // (eqHigh ≈ 0.02), pegging the door-LPF cutoff at ~400 Hz and
+    // making distant voices unrecognisably muffled. Lower this
+    // (e.g. 0.3-0.5) to keep the LPF more open. Clamped to [0.0, 1.0].
+    float    pathingBlockingScale = 1.0f;
+    // Minimum interval (seconds) between successive Steam Audio
+    // pathing-simulation updates. iplSimulatorRunPathing is CPU-heavy
+    // and runs synchronously on the main loop thread; throttling to
+    // 10 Hz (the Unity/Unreal integration default) cuts per-frame cost
+    // without perceptible loss in diffraction responsiveness — the
+    // listener moves < 1 ft per update at walking speed, well below
+    // the threshold for hearing portalAttenuation/blocking changes.
+    // 0.0 = run every frame (legacy / A-B diagnostic). Clamped to
+    // [0.0, 1.0] seconds.
+    float    pathingUpdateInterval = 0.1f;
+
+    // Per-band weights for collapsing Steam Audio's 3-band eqCoeffs into
+    // the scalar portalAttenuation gain. Applied as
+    //   gain = wL·eqLow + wM·eqMid + wH·eqHigh
+    // then scaled by pathingGainScale. Default {0.25, 0.50, 0.25}
+    // matches the legacy mid-heavy perceptual weighting (roughly
+    // A-weighted). Weights are NOT auto-normalised — sums other than
+    // 1.0 produce a flat boost/cut. Each component clamped to [0, 1].
+    // Typical tunings:
+    //   {0.25, 0.50, 0.25} default mid-heavy
+    //   {0.50, 0.40, 0.10} bass-heavy — fuller cross-room sounds
+    //   {0.33, 0.34, 0.33} flat — highs contribute equally to loudness
+    //   {0.10, 0.40, 0.50} treble-heavy — muffled = quiet
+    float    pathingGainWeightLow  = 0.25f;
+    float    pathingGainWeightMid  = 0.50f;
+    float    pathingGainWeightHigh = 0.25f;
 
     // -- audio.spatialization: HRTF + distance model --
     float hrtfVolume          = 1.0f;   // HRTF output gain (1.0 = raw HRTF, lower = quieter)
@@ -517,6 +571,32 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 if (prb["portal_rings"]) {
                     cfg.audioProbePortalRings = prb["portal_rings"].as<bool>();
                 }
+                if (prb["min_wall_clearance_ft"]) {
+                    cfg.audioProbeMinWallClearanceFt =
+                        prb["min_wall_clearance_ft"].as<float>();
+                    // Hard floor of 0 (disables check); upper guard
+                    // matches AudioService::setProbeMinWallClearanceFt.
+                    if (cfg.audioProbeMinWallClearanceFt < 0.0f)
+                        cfg.audioProbeMinWallClearanceFt = 0.0f;
+                    if (cfg.audioProbeMinWallClearanceFt > 50.0f)
+                        cfg.audioProbeMinWallClearanceFt = 50.0f;
+                }
+                if (prb["elevation_sparsity_mul"]) {
+                    cfg.audioProbeElevationSparsityMul =
+                        prb["elevation_sparsity_mul"].as<float>();
+                    if (cfg.audioProbeElevationSparsityMul < 1.0f)
+                        cfg.audioProbeElevationSparsityMul = 1.0f;
+                    if (cfg.audioProbeElevationSparsityMul > 8.0f)
+                        cfg.audioProbeElevationSparsityMul = 8.0f;
+                }
+                if (prb["global_dedup_radius_ft"]) {
+                    cfg.audioProbeGlobalDedupRadiusFt =
+                        prb["global_dedup_radius_ft"].as<float>();
+                    if (cfg.audioProbeGlobalDedupRadiusFt < 0.0f)
+                        cfg.audioProbeGlobalDedupRadiusFt = 0.0f;
+                    if (cfg.audioProbeGlobalDedupRadiusFt > 10.0f)
+                        cfg.audioProbeGlobalDedupRadiusFt = 10.0f;
+                }
             }
 
             // -- audio.occlusion --
@@ -585,6 +665,31 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     cfg.pathingGainScale = prop["pathing_gain_scale"].as<float>();
                     if (cfg.pathingGainScale < 0.1f)  cfg.pathingGainScale = 0.1f;
                     if (cfg.pathingGainScale > 10.0f) cfg.pathingGainScale = 10.0f;
+                }
+                if (prop["pathing_blocking_scale"]) {
+                    cfg.pathingBlockingScale = prop["pathing_blocking_scale"].as<float>();
+                    if (cfg.pathingBlockingScale < 0.0f) cfg.pathingBlockingScale = 0.0f;
+                    if (cfg.pathingBlockingScale > 1.0f) cfg.pathingBlockingScale = 1.0f;
+                }
+                if (prop["pathing_update_interval"]) {
+                    cfg.pathingUpdateInterval = prop["pathing_update_interval"].as<float>();
+                    if (cfg.pathingUpdateInterval < 0.0f) cfg.pathingUpdateInterval = 0.0f;
+                    if (cfg.pathingUpdateInterval > 1.0f) cfg.pathingUpdateInterval = 1.0f;
+                }
+                if (prop["pathing_gain_band_weights"]) {
+                    YAML::Node w = prop["pathing_gain_band_weights"];
+                    if (w.IsSequence() && w.size() == 3) {
+                        auto clamp01 = [](float v) {
+                            if (v < 0.0f) return 0.0f;
+                            return v > 1.0f ? 1.0f : v;
+                        };
+                        cfg.pathingGainWeightLow  = clamp01(w[0].as<float>());
+                        cfg.pathingGainWeightMid  = clamp01(w[1].as<float>());
+                        cfg.pathingGainWeightHigh = clamp01(w[2].as<float>());
+                    } else {
+                        std::fprintf(stderr, "[CONFIG] pathing_gain_band_weights must be a "
+                                     "3-element sequence [low, mid, high]; ignoring.\n");
+                    }
                 }
             }
 
