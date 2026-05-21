@@ -45,6 +45,8 @@ set(HEADLESS_SERVICES_SOURCES
     audio/EnvSoundDatabase.cpp
     audio/EnvSoundDatabase.h
     audio/ProbeFile.h
+    audio/PathingSimulator.cpp
+    audio/PathingSimulator.h
     audio/ProbeManager.cpp
     audio/ProbeManager.h
     audio/ReflectionSimulator.cpp

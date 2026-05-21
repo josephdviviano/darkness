@@ -31,6 +31,7 @@
 #include "CRFSoundLoader.h"
 #include "EnvSoundDatabase.h"
 #include "LatencyHistogram.h"
+#include "PathingSimulator.h"
 #include "ProbeFile.h"
 #include "ProbeManager.h"
 #include "ReflectionSimulator.h"
@@ -2825,6 +2826,13 @@ AudioService::AudioService(ServiceManager *manager, const std::string &name)
         if (mReflectionMixNode) mReflectionMixNode->simulationRan = true;
     });
 
+    // Construct the pathing-sim subsystem. Same lifecycle pattern as the
+    // reflection sim: thread starts in bootstrapFinished, simulator handle
+    // plugged in by buildAcousticScene. Moves iplSimulatorRunPathing off
+    // the main loop — the worst observed iteration was 11+ seconds on
+    // MISS6 with dynamic door geometry invalidating baked edges.
+    mPathingSim = std::make_unique<PathingSimulator>();
+
     // SoundPropagation requires RoomService, which is acquired in
     // bootstrapFinished() — construct there.
 }
@@ -3623,34 +3631,19 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         // zero — Steam Audio skips allocating those buffers when REFLECTIONS
         // is not in the flags. Direct cap is decoupled from the reflection cap
         // (typically much larger — direct sim cost is ~constant per source).
+        //
+        // Pathing was previously bundled onto this simulator (DIRECT|PATHING)
+        // but its iplSimulatorRunPathing iteration was observed to stall
+        // 50–11000 ms on MISS6. It now lives on a separate mPathingSimulator
+        // pumped by PathingSimulator's background worker — see below.
         IPLSimulationSettings directSettings{};
-        // DIRECT carries distance/occlusion/transmission/air-absorption;
-        // PATHING carries the probe-graph baked path lookup that feeds the
-        // per-voice eqCoeffs gain + LPF for player audio. Both run on the
-        // same direct simulator handle so iplSimulatorRunDirect /
-        // iplSimulatorRunPathing share the staged source list — no
-        // cross-thread synchronisation needed since loopStep runs both
-        // synchronously on the main thread.
-        directSettings.flags = static_cast<IPLSimulationFlags>(
-            IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_PATHING);
+        directSettings.flags = IPL_SIMULATIONFLAGS_DIRECT;
         directSettings.sceneType = sceneTypeEnum;
         directSettings.maxNumOcclusionSamples = mSimMaxOcclusionSamplesCfg;
         // Direct-sim source pool — every voice (regardless of reverb
         // status) registers a direct source. Cost is ~constant per
         // source so we size to the voice cap with a 64 floor.
         directSettings.maxNumSources = std::max(64, mMaxActiveVoicesCfg);
-        // Probe-to-probe visibility sampling count for pathing — when a
-        // baked path is occluded by dynamic geometry and findAlternatePaths
-        // re-runs path finding, this controls how many rays test each
-        // candidate edge. Steam Audio's Unity integration defaults to 4
-        // for the BAKE equivalent (`bakingVisibilitySamples`), and the
-        // runtime is conventionally aligned with the bake — running the
-        // runtime at 16 (= 256 rays per edge via the N² rule) makes
-        // dynamic validation 16× more expensive than the bake it's
-        // validating against, for no perceptible quality gain on static-
-        // geometry-dominant scenes with a handful of dynamic doors.
-        // 4 matches Steam Audio's shipping convention.
-        directSettings.numVisSamples = 4;
         // Direct sim runs on the main thread so internal worker threads
         // here are mostly for parallel occlusion ray-traces. Match the
         // reflection sim's choice for now.
@@ -3670,6 +3663,54 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         iplSceneRetain(mIplScene);
         iplSimulatorSetScene(mDirectSimulator, mIplScene);
         iplSimulatorCommit(mDirectSimulator);
+
+        // Step 6c: Create the pathing-only simulator. Iterated by
+        // PathingSimulator's background worker thread so the 50–11000 ms
+        // iplSimulatorRunPathing cost stays off the main loop.
+        //
+        // PATHING owns the probe-graph baked path lookup that feeds the
+        // per-voice eqCoeffs gain + LPF for cross-room audio. The probe
+        // batch attaches to this simulator (not the direct one) — see
+        // loadProbes. numVisSamples = 4 matches Steam Audio's Unity bake
+        // convention (16 rays per validation test); the runtime stays
+        // symmetric with the bake to avoid sentinel reads from edge-set
+        // mismatches.
+        {
+            IPLSimulationSettings pathingSettings{};
+            pathingSettings.flags = IPL_SIMULATIONFLAGS_PATHING;
+            pathingSettings.sceneType = sceneTypeEnum;
+            pathingSettings.maxNumSources = std::max(64, mMaxActiveVoicesCfg);
+            // Probe-to-probe visibility sampling count for pathing edge
+            // validation. Steam Audio's Unity integration defaults to 4
+            // for the BAKE equivalent (`bakingVisibilitySamples`); the
+            // runtime is conventionally aligned with the bake — 4 here
+            // matches the shipping convention. Higher values (16 = 256
+            // rays per edge via the N² rule) are 16× more expensive per
+            // edge for no perceptible quality gain on static-geometry-
+            // dominant scenes with a handful of dynamic doors.
+            pathingSettings.numVisSamples = 4;
+            // Worker thread already runs at UTILITY QoS; internal Steam
+            // Audio worker threads spawned for ray-traces will inherit
+            // that QoS. Match the reflection-sim choice for now.
+            pathingSettings.numThreads = simSettings.numThreads;
+
+            IPLSimulator pathingSimHandle = nullptr;
+            err = iplSimulatorCreate(mIplContext, &pathingSettings, &pathingSimHandle);
+            if (err != IPL_STATUS_SUCCESS) {
+                LOG_ERROR("AudioService: pathing iplSimulatorCreate failed (error %d)", err);
+                destroyAcousticScene();
+                return false;
+            }
+
+            // Retain the scene for the pathing simulator (same pattern as
+            // the direct sim above — refcount balances against the
+            // iplSceneRelease in destroyAcousticScene).
+            iplSceneRetain(mIplScene);
+            iplSimulatorSetScene(pathingSimHandle, mIplScene);
+            iplSimulatorCommit(pathingSimHandle);
+
+            if (mPathingSim) mPathingSim->setSimulator(pathingSimHandle);
+        }
 
         mSceneReady = true;
         mAcousticTriCount = static_cast<int>(numTriangles);
@@ -4029,22 +4070,37 @@ void AudioService::destroyAcousticScene()
     // Destroy reflection pipeline before simulator (it references simulator sources)
     destroyReflectionPipeline();
 
+    // Drain the pathing-sim worker so we can mutate its state safely. The
+    // pathing sim is the one that holds our probe batch (post-PT-13), so
+    // any release path that touches the batch must wait for the worker to
+    // finish its current iteration first.
+    if (mPathingSim) {
+        mPathingSim->waitForCompletion();
+        // Pending adds never landed — release the handles directly so
+        // we don't leak them with the simulator handle gone.
+        mPathingSim->releasePendingAdds();
+        // Pending removes still need to be applied + released so each
+        // iplSourceRelease balances its iplSourceCreate.
+        mPathingSim->flushPendingRemovals();
+    }
+
     // Release probe batch before simulator (it's registered with the simulator).
     // The batch may be attached to BOTH the reflection sim (for baked reverb
-    // lookups) AND the direct sim (for Steam Audio pathing). Detach from the
-    // direct sim first, releasing the iplProbeBatchRetain we took at
+    // lookups) AND the pathing sim (for Steam Audio pathing). Detach from the
+    // pathing sim first, releasing the iplProbeBatchRetain we took at
     // loadProbes time, then hand off to ProbeManager which detaches from the
     // reflection sim and releases the create-time reference.
     if (mProbeManager) {
         IPLProbeBatch batch = mProbeManager->getProbeBatch();
-        if (batch && mDirectProbeBatchAdded && mDirectSimulator) {
-            iplSimulatorRemoveProbeBatch(mDirectSimulator, batch);
-            iplSimulatorCommit(mDirectSimulator);
+        IPLSimulator pathingHandle = mPathingSim ? mPathingSim->simulator() : nullptr;
+        if (batch && mPathingProbeBatchAdded && pathingHandle) {
+            iplSimulatorRemoveProbeBatch(pathingHandle, batch);
+            iplSimulatorCommit(pathingHandle);
             iplProbeBatchRelease(&batch);  // drops our retain (batch is aliased,
                                            // ProbeManager still holds the original
                                            // create-time reference)
         }
-        mDirectProbeBatchAdded = false;
+        mPathingProbeBatchAdded = false;
         if (mReflectionSim) {
             mProbeManager->releaseBatch(mReflectionSim->simulator());
         }
@@ -4055,8 +4111,17 @@ void AudioService::destroyAcousticScene()
         iplSimulatorRelease(&handle);
         mReflectionSim->setSimulator(nullptr);
     }
+    // Pathing simulator — worker already drained above. Release the
+    // handle now that the probe batch is detached. The scene we attached
+    // to it was retained at create time; the iplSceneRelease below drops
+    // both that retain and the original create reference.
+    if (mPathingSim && mPathingSim->simulator()) {
+        IPLSimulator handle = mPathingSim->simulator();
+        iplSimulatorRelease(&handle);
+        mPathingSim->setSimulator(nullptr);
+    }
     // Direct simulator runs synchronously on the main thread, so it has
-    // no in-flight worker to wait for. Release after the reflection sim
+    // no in-flight worker to wait for. Release after the other sims
     // (order is irrelevant; this just keeps the parallel structure
     // visible). The scene we attached to it was retained at create time;
     // iplSceneRelease below drops both the original create-time reference
@@ -4145,9 +4210,12 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
     // Steam Audio's docs warn that iplSceneCommit cannot run concurrently with
     // any simulation function. Static/instanced-mesh adds defer their effect
     // until commit, so the add calls themselves are safe, but the commit at
-    // the end is not. Drain the reflection sim before touching scene state.
-    // At boot this is a no-op (no voices yet → sim idle), but cheap insurance.
+    // the end is not. Drain BOTH simulation workers before touching scene
+    // state — pathing and reflection each iterate the same shared scene.
+    // At boot this is a no-op (no voices yet → both sims idle), but cheap
+    // insurance.
     if (mReflectionSim) mReflectionSim->waitForCompletion();
+    if (mPathingSim)    mPathingSim->waitForCompletion();
 
     // Cache the "door" material once. Falls back to generic if the keyword
     // table is missing the entry (kept defensive — table is in this TU).
@@ -4347,6 +4415,13 @@ void AudioService::bootstrapFinished()
     if (mAudioReady && mReflectionSim) {
         mReflectionSim->start();
     }
+    // Start the pathing simulation worker thread. iplSimulatorRunPathing
+    // has been observed at 11+ seconds on MISS6 when dynamic door OBBs
+    // invalidate baked path edges and findAlternatePaths explores its
+    // search space — keeping it on the main thread froze the render loop.
+    if (mAudioReady && mPathingSim) {
+        mPathingSim->start();
+    }
 
     if (mAudioReady) {
         LOG_INFO("AudioService: fully initialized");
@@ -4369,8 +4444,12 @@ void AudioService::shutdown()
     mSoundCache.reset();
     mSoundLoader.reset();
 
-    // Shut down the reflection simulation worker thread before destroying the scene
+    // Shut down both simulation worker threads before destroying the scene.
+    // Order between them doesn't matter (they don't share state); the only
+    // requirement is that both stop BEFORE destroyAcousticScene tears down
+    // the simulator handles + scene.
     if (mReflectionSim) mReflectionSim->stop();
+    if (mPathingSim)    mPathingSim->stop();
 
     // Release acoustic scene before the Steam Audio context it depends on
     destroyAcousticScene();
@@ -4574,21 +4653,30 @@ void AudioService::loopStep(float deltaTime)
     }
     updateAmbientDuckingEnvelope();
 
-    // Source mutations (add/remove/commit) can race with the background reflection
-    // sim thread, so we defer them until it's idle. Direct sim runs synchronously
-    // on the main thread, so it's never concurrent with mutations.
-    // Steam Audio uses double-buffering: setInputs writes to the staging buffer,
-    // while runReflections reads from the committed (active) buffer.
-    // Only commit() copies staging → active, so commit must wait for reflections.
-    bool reflBusy = mReflectionSim && mReflectionSim->isRunning();
-    bool canMutate = !reflBusy;
+    // Source mutations (add/remove/commit) can race with the background
+    // reflection AND pathing sim threads, so we defer them until BOTH are
+    // idle. Direct sim runs synchronously on the main thread, so it's never
+    // concurrent with mutations. Steam Audio uses double-buffering:
+    // setInputs writes to the staging buffer, while runReflections /
+    // runPathing read from the committed (active) buffer. Only commit()
+    // copies staging → active, so commit must wait for both workers.
+    bool reflBusy  = mReflectionSim && mReflectionSim->isRunning();
+    bool pathBusy  = mPathingSim    && mPathingSim->isRunning();
+    bool canMutate = !reflBusy && !pathBusy;
     IPLSimulator reflectionSimHandle = mReflectionSim ? mReflectionSim->simulator() : nullptr;
+    IPLSimulator pathingSimHandle    = mPathingSim    ? mPathingSim->simulator()    : nullptr;
 
     if (canMutate && mReflectionSim) {
 
         // Flush deferred IPL source adds / removals via ReflectionSimulator.
         mReflectionSim->flushPendingAdds();
         mReflectionSim->flushPendingRemovals();
+    }
+    if (canMutate && mPathingSim) {
+        // Same defer-flush dance for the pathing simulator's pending
+        // source-add/remove queues.
+        mPathingSim->flushPendingAdds();
+        mPathingSim->flushPendingRemovals();
     }
 
     // Commit copies staging → active buffer. Must wait for reflection sim to
@@ -4605,6 +4693,11 @@ void AudioService::loopStep(float deltaTime)
         } else {
             mReflectionSim->commitIfDirty();
         }
+    }
+    // Pathing-sim commit. Same constraint as the reflection sim: cannot
+    // overlap with iplSimulatorRunPathing on the worker thread.
+    if (canMutate && mPathingSim && mPathingSim->isSimulatorDirty() && pathingSimHandle) {
+        mPathingSim->commitIfDirty();
     }
 
     // Coalesced acoustic-scene commit for door dynamic geometry.
@@ -4736,16 +4829,18 @@ void AudioService::loopStep(float deltaTime)
             iplSimulatorSetSharedInputs(reflectionSimHandle,
                 IPL_SIMULATIONFLAGS_REFLECTIONS, &sharedInputs);
             // Pathing also needs the listener pose per-frame. Without
-            // this call, iplSimulatorRunPathing has no listener position
-            // for the PATHING flag, silently skips all sources, and
-            // iplSourceGetOutputs returns the source's
-            // SimulationData::pathingOutputs.eq init value of
-            // [0.1, 0.1, 0.1] (see Steam Audio simulation_data.cpp).
-            // The pathing pass shares the same direct simulator handle,
-            // so this is a second flag-scoped call on mDirectSimulator,
-            // not a separate simulator.
-            iplSimulatorSetSharedInputs(mDirectSimulator,
-                IPL_SIMULATIONFLAGS_PATHING, &sharedInputs);
+            // this call, iplSimulatorRunPathing has no listener position,
+            // silently skips all sources, and iplSourceGetOutputs returns
+            // the source's SimulationData::pathingOutputs.eq init value
+            // of [0.1, 0.1, 0.1] (see Steam Audio simulation_data.cpp).
+            // Now lives on the separate pathing simulator handle owned
+            // by mPathingSim — both flags-on-this-simulator (here:
+            // PATHING) require their per-frame SetSharedInputs call
+            // even though only one is set.
+            if (pathingSimHandle) {
+                iplSimulatorSetSharedInputs(pathingSimHandle,
+                    IPL_SIMULATIONFLAGS_PATHING, &sharedInputs);
+            }
 
             // Step 2a: Pre-compute reflection voice ranking (top-N closest).
             // Done before setInputs so we can set inputs.baked for non-top-N voices.
@@ -4929,7 +5024,7 @@ void AudioService::loopStep(float deltaTime)
                 // of this gate. Player-emitted voices (footsteps, landings)
                 // sit in the same room as the listener by definition, so
                 // both backends short-circuit on the playerEmitted flag.
-                bool useSteamAudioPathing = mDirectProbeBatchAdded
+                bool useSteamAudioPathing = mPathingProbeBatchAdded
                                           && mProbePathingEnabled
                                           && !voice->playerEmitted
                                           && !voice->skipPortalRouting;
@@ -5390,7 +5485,7 @@ void AudioService::loopStep(float deltaTime)
                 // mapping naturally produces full passthrough.
                 float voicePathingDist = glm::length(voice->worldPos - mListenerPos);
                 bool  pathingWanted    = (voicePathingDist <= voice->maxAudibleDist);
-                if (mDirectProbeBatchAdded && mProbePathingEnabled
+                if (mPathingProbeBatchAdded && mProbePathingEnabled
                     && mPathingDueThisStep
                     && !voice->playerEmitted
                     && pathingWanted) {
@@ -5449,31 +5544,40 @@ void AudioService::loopStep(float deltaTime)
                     inputs.findAlternatePaths = IPL_TRUE;
                 }
 
-                // Push inputs to both simulators. Each call only consumes
-                // the fields relevant to its flag, so the same struct works
-                // for both. Per phonon.h, no synchronisation is required
-                // between the two calls — Steam Audio internally separates
-                // direct- and reflection-side staging buffers.
+                // Push inputs to each simulator. Every voice has a
+                // directSource (in mDirectSimulator); non-player-emitted
+                // voices also have a pathingSource (in the pathing sim)
+                // and reflection-eligible voices have a reflectionSource
+                // (in the reflection sim). Per phonon.h, no
+                // synchronisation is required between these calls — Steam
+                // Audio internally separates per-source staging buffers,
+                // and the staging-vs-active double buffer is safe to
+                // write from the main thread even while a worker is
+                // iterating (validated against Unity + Unreal reference
+                // integrations).
                 iplSourceSetInputs(voice->directSource,
                     IPL_SIMULATIONFLAGS_DIRECT, &inputs);
-                // Pathing inputs ride on the same direct simulator handle
-                // (we configured it with DIRECT|PATHING flags). The
-                // setInputs call selects which subset of fields the
-                // simulator consumes via the flags argument. Throttled
-                // by mPathingDueThisStep so we don't stage pathing
-                // inputs more often than iplSimulatorRunPathing
-                // consumes them.
+                // Pathing inputs go to the per-voice pathingSource (in
+                // the pathing simulator). Throttled by mPathingDueThisStep
+                // — we only stamp fresh inputs when the throttle has
+                // elapsed and the worker is about to be signalled. No
+                // !isRunning() gate: per N2 (RM.PLAN.PATHING_WORKER.md),
+                // iplSourceSetInputs is per-frame-safe via Steam Audio's
+                // internal double buffering, and both reference
+                // integrations call it every frame while the sim thread
+                // is mid-iteration.
                 //
                 // The gate here must match the populate block above
                 // EXACTLY. Letting a voice through here without going
                 // through the populate path means Steam Audio reads
                 // `inputs.pathingProbes` as the default-initialised null
                 // pointer and segfaults inside the next runPathing.
-                if (mDirectProbeBatchAdded && mProbePathingEnabled
+                if (mPathingProbeBatchAdded && mProbePathingEnabled
                     && mPathingDueThisStep
                     && !voice->playerEmitted
-                    && pathingWanted) {
-                    iplSourceSetInputs(voice->directSource,
+                    && pathingWanted
+                    && voice->pathingSource) {
+                    iplSourceSetInputs(voice->pathingSource,
                         IPL_SIMULATIONFLAGS_PATHING, &inputs);
                 }
                 // Stage 2.2: Normal voices without a reflectionSource
@@ -5551,46 +5655,49 @@ void AudioService::loopStep(float deltaTime)
                 }
             }
 
-            // Run Steam Audio pathing on the same direct-sim handle. Cheap
-            // when no probe batch is attached (mDirectProbeBatchAdded =
-            // false) — Steam Audio skips per-source pathing work since
-            // pathingProbes is null for every source. Driven by the
-            // per-voice eqCoeffs read in the output block below. Also
-            // bypassed entirely when mProbePathingEnabled is off
-            // (audio.propagation.probe_pathing: false), so flipping the
-            // toggle saves the full pathing-sim cost rather than just
-            // discarding the outputs.
+            // Signal the pathing-sim worker thread to run one
+            // iplSimulatorRunPathing iteration. Cheap when no probe batch
+            // is attached (mPathingProbeBatchAdded = false) — Steam Audio
+            // skips per-source pathing work since pathingProbes is null
+            // for every source. Bypassed entirely when mProbePathingEnabled
+            // is off (audio.propagation.probe_pathing: false).
             //
             // Throttled by mPathingDueThisStep (audio.propagation.
-            // pathing_update_interval, default 0.1 s / 10 Hz). On
-            // skipped frames the previous run's eqCoeffs remain cached
-            // on each source, so the output read further down still
-            // produces stable portalAttenuation/portalBlocking values.
+            // pathing_update_interval, default 0.1 s / 10 Hz). On skipped
+            // frames the previous run's eqCoeffs remain cached on each
+            // source, so the output read further down still produces
+            // stable portalAttenuation/portalBlocking values.
+            //
+            // The actual iplSimulatorRunPathing call (and its
+            // [PATHING_SLOW] timing log) now lives in
+            // PathingSimulator::workerMain — keeping it off the main
+            // thread eliminates the 50–11000 ms loop-stall hitches
+            // observed on MISS6 with dynamic door geometry.
             {
-                const bool gateProbeBatch = mDirectProbeBatchAdded;
+                const bool gateProbeBatch = mPathingProbeBatchAdded;
                 const bool gateEnable     = mProbePathingEnabled;
                 const bool gateDue        = mPathingDueThisStep;
-                const bool ranPathing     = gateProbeBatch && gateEnable && gateDue;
-                if (ranPathing) {
-                    // Time every pathing run. Threshold dropped to 15 ms so
-                    // we capture the full cost distribution — even calls
-                    // below the per-frame budget contribute to perceptible
-                    // micro-stutter at 30+ FPS, so they're worth logging
-                    // for triage. Rate-limited (first 32 + every 64th
-                    // thereafter) to keep the log readable.
-                    auto p0 = std::chrono::steady_clock::now();
-                    iplSimulatorRunPathing(mDirectSimulator);
-                    auto p1 = std::chrono::steady_clock::now();
-                    float pMs = std::chrono::duration<float, std::milli>(p1 - p0).count();
-                    static std::atomic<int> sPathingSlowCount{0};
-                    if (pMs > 15.0f) {
-                        int sc = sPathingSlowCount.fetch_add(1, std::memory_order_relaxed);
-                        if (sc < 32 || (sc % 64) == 0) {
+                const bool wantPathing    = gateProbeBatch && gateEnable && gateDue;
+                if (wantPathing && mPathingSim) {
+                    // PT-18 [PATHING_LAG] diagnostic. If we want to signal
+                    // a fresh iteration but the worker is still running
+                    // the previous one, the throttle interval is shorter
+                    // than the worker's actual iteration cost — eq-coeffs
+                    // will be stale for one extra throttle window.
+                    // Rate-limit (first 16 + every 64th thereafter).
+                    if (mPathingSim->isRunning()) {
+                        static std::atomic<int> sPathingLagCount{0};
+                        int lc = sPathingLagCount.fetch_add(1, std::memory_order_relaxed);
+                        if (lc < 16 || (lc % 64) == 0) {
                             std::fprintf(stderr,
-                                "[PATHING_SLOW] iplSimulatorRunPathing took "
-                                "%.1f ms (occurrence #%d)\n", pMs, sc + 1);
+                                "[PATHING_LAG] worker still running when "
+                                "throttle elapsed (interval=%.3fs, "
+                                "occurrence #%d) — eqCoeffs will be one "
+                                "interval stale this cycle\n",
+                                mPathingUpdateInterval, lc + 1);
                         }
                     }
+                    mPathingSim->signal();
                 }
                 // DIAG: confirm iplSimulatorRunPathing is actually
                 // firing. eqCoeffs reading back as the Steam Audio
@@ -5605,7 +5712,7 @@ void AudioService::loopStep(float deltaTime)
                     AUDIO_LOG("[RUN_PATHING] called=%d probeBatchAdded=%d "
                               "enabled=%d due=%d updateInterval=%.3f "
                               "accumSec=%.3f (occurrence #%d)\n",
-                              ranPathing ? 1 : 0,
+                              wantPathing ? 1 : 0,
                               gateProbeBatch ? 1 : 0,
                               gateEnable ? 1 : 0,
                               gateDue ? 1 : 0,
@@ -5688,10 +5795,11 @@ void AudioService::loopStep(float deltaTime)
             // already). Skip when sourceEnded (no fresh source content;
             // the convolution tail is still ringing out the previous
             // pathing state).
-            bool useSteamAudioPathing = mDirectProbeBatchAdded
+            bool useSteamAudioPathing = mPathingProbeBatchAdded
                                       && mProbePathingEnabled
                                       && !voice->playerEmitted
-                                      && !voice->skipPortalRouting;
+                                      && !voice->skipPortalRouting
+                                      && voice->pathingSource != nullptr;
             if (useSteamAudioPathing && !voice->sourceEnded) {
                 float lineDist = glm::length(voice->worldPos - mListenerPos);
 
@@ -5726,8 +5834,16 @@ void AudioService::loopStep(float deltaTime)
                     // boundary during player motion. That has been
                     // removed.)
                 } else {
+                    // iplSourceGetOutputs is safe from any thread; reads
+                    // the most recently committed sim result. No gating
+                    // on `mPathingSim->isRunning()` — the worker writes
+                    // outputs at the end of each iteration, and any read
+                    // mid-iteration returns the previous iteration's
+                    // cached values (which is exactly the throttle-skip
+                    // behaviour the legacy synchronous path also relied
+                    // on).
                     IPLSimulationOutputs pathingOut{};
-                    iplSourceGetOutputs(voice->directSource,
+                    iplSourceGetOutputs(voice->pathingSource,
                         IPL_SIMULATIONFLAGS_PATHING, &pathingOut);
 
                     // Sentinel detection. Steam Audio initializes
@@ -5904,7 +6020,7 @@ void AudioService::loopStep(float deltaTime)
                             // bounded; never enters the per-frame hot
                             // path. mProbeManager null-checked because
                             // pathing-gated branch above already requires
-                            // mDirectProbeBatchAdded, but be defensive.
+                            // mPathingProbeBatchAdded, but be defensive.
                             int   sProbeIdx = -1, lProbeIdx = -1;
                             float sProbeD = -1.0f, lProbeD = -1.0f;
                             if (mProbeManager) {
@@ -6854,19 +6970,16 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
     // populated by the next iplSimulatorRunDirect (≈one frame after creation),
     // so newly spawned voices are audible at the right level from their first
     // (or at worst second) audio callback.
+    //
+    // Source flags must include every simulation type the source will
+    // ever participate in — Steam Audio uses these to decide which
+    // per-source state slots to allocate. The direct simulator now
+    // carries DIRECT only (pathing moved to a separate simulator
+    // iterated by a background worker — see PathingSimulator.h); the
+    // pathing-side source is created below as `voice.pathingSource`.
     {
         IPLSourceSettings srcSettings{};
-        // Source flags must include every simulation type the source will
-        // ever participate in — this is the per-source enrolment Steam
-        // Audio uses to decide which subsystems to attach state to. The
-        // simulator itself was created with DIRECT|PATHING (Line 3594),
-        // but the source only gets pathing state if PATHING is in its
-        // own flags as well. Omitting PATHING here is the root cause of
-        // iplSourceGetOutputs(PATHING) returning eqCoeffs=[0,0,0] for
-        // every voice: the source has no pathing slot for the solver to
-        // write into, so the read always returns zeros.
-        srcSettings.flags = static_cast<IPLSimulationFlags>(
-            IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_PATHING);
+        srcSettings.flags = IPL_SIMULATIONFLAGS_DIRECT;
 
         IPLerror err = iplSourceCreate(mDirectSimulator, &srcSettings, &voice.directSource);
         if (err != IPL_STATUS_SUCCESS) {
@@ -6878,6 +6991,33 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
         // No mSimulatorDirty for the direct sim — its commit happens inline
         // immediately below (no concurrency concern).
         iplSimulatorCommit(mDirectSimulator);
+    }
+
+    // ── Pathing source ──
+    // Created against the pathing simulator. Player-emitted voices skip
+    // pathing entirely (source ≈ listener so the probe-graph collapses
+    // to a self-loop and the iteration cost is wasted). Same defer-add
+    // pattern as the reflection source: if the worker is mid-iteration
+    // we can't safely mutate the source list, so queue the add until
+    // the next idle frame in loopStep.
+    if (!voice.playerEmitted && mPathingSim && mPathingSim->simulator()) {
+        IPLSourceSettings srcSettings{};
+        srcSettings.flags = IPL_SIMULATIONFLAGS_PATHING;
+
+        IPLerror err = iplSourceCreate(mPathingSim->simulator(), &srcSettings,
+                                       &voice.pathingSource);
+        if (err != IPL_STATUS_SUCCESS) {
+            LOG_ERROR("AudioService: pathing iplSourceCreate failed (error %d)", err);
+            voice.pathingSource = nullptr;
+            // Continue without pathing — direct path still works and the
+            // per-frame setInputs / getOutputs blocks skip on null source.
+        } else if (mPathingSim->isRunning()) {
+            mPathingSim->queueSourceAdd(voice.pathingSource);
+            mPathingSim->setSimulatorDirty();
+        } else {
+            iplSourceAdd(voice.pathingSource, mPathingSim->simulator());
+            mPathingSim->setSimulatorDirty();
+        }
     }
 
     // ── Reflection source ──
@@ -6908,11 +7048,28 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
         IPLerror err = iplSourceCreate(reflectionSimHandle, &srcSettings, &voice.reflectionSource);
         if (err != IPL_STATUS_SUCCESS) {
             LOG_ERROR("AudioService: reflection iplSourceCreate failed (error %d)", err);
-            // Direct source already created above; don't leak it. Caller
-            // will treat the voice as having no spatial audio.
+            // Direct + pathing sources already created above; don't leak
+            // them. Caller will treat the voice as having no spatial
+            // audio.
             iplSourceRemove(voice.directSource, mDirectSimulator);
             iplSimulatorCommit(mDirectSimulator);
             iplSourceRelease(&voice.directSource);
+            if (voice.pathingSource && mPathingSim) {
+                // Symmetric defer-flush dance with the create path above.
+                if (mPathingSim->removeFromPendingAdds(voice.pathingSource)) {
+                    iplSourceRelease(&voice.pathingSource);
+                } else if (mPathingSim->isRunning()) {
+                    mPathingSim->queueSourceRemove(voice.pathingSource);
+                    voice.pathingSource = nullptr;
+                    mPathingSim->setSimulatorDirty();
+                } else if (mPathingSim->simulator()) {
+                    iplSourceRemove(voice.pathingSource, mPathingSim->simulator());
+                    iplSourceRelease(&voice.pathingSource);
+                    mPathingSim->setSimulatorDirty();
+                } else {
+                    iplSourceRelease(&voice.pathingSource);
+                }
+            }
             voice.reflectionSource = nullptr;
             return;
         }
@@ -6992,6 +7149,25 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
                         iplSourceRelease(&voice.reflectionSource);
                     }
                 }
+                // Pathing source rollback. Same defer-flush dance as
+                // reflectionSource — the worker may be mid-iteration
+                // and we can't safely call iplSourceRemove while it
+                // runs.
+                if (voice.pathingSource && mPathingSim) {
+                    if (mPathingSim->removeFromPendingAdds(voice.pathingSource)) {
+                        iplSourceRelease(&voice.pathingSource);
+                    } else if (mPathingSim->isRunning()) {
+                        mPathingSim->queueSourceRemove(voice.pathingSource);
+                        voice.pathingSource = nullptr;
+                        mPathingSim->setSimulatorDirty();
+                    } else if (mPathingSim->simulator()) {
+                        iplSourceRemove(voice.pathingSource, mPathingSim->simulator());
+                        iplSourceRelease(&voice.pathingSource);
+                        mPathingSim->setSimulatorDirty();
+                    } else {
+                        iplSourceRelease(&voice.pathingSource);
+                    }
+                }
                 iplSimulatorCommit(mDirectSimulator);
                 return;
             }
@@ -7011,7 +7187,7 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
 //------------------------------------------------------
 void AudioService::removeVoiceSource(ActiveVoice &voice)
 {
-    if (!voice.directSource && !voice.reflectionSource)
+    if (!voice.directSource && !voice.reflectionSource && !voice.pathingSource)
         return;
 
     // Invalidate this voice's effects BEFORE waiting for the worker.
@@ -7046,6 +7222,31 @@ void AudioService::removeVoiceSource(ActiveVoice &voice)
             if (slot.directSource) {
                 iplSourceRelease(&slot.directSource);
             }
+        }
+    }
+
+    // ── Pathing source ──
+    // Same defer-flush dance as the reflection source below — the
+    // pathing-sim worker may be mid-iteration and iplSourceRemove can't
+    // safely race iplSimulatorRunPathing on the same handle.
+    if (voice.pathingSource && mPathingSim) {
+        // If this pathing source was deferred for add but never actually
+        // added, just release it directly. (Mirror of the
+        // removeFromPendingAdds check on the reflection side below — same
+        // hazard: calling iplSourceRemove on a never-added source crashes
+        // inside Steam Audio.)
+        if (mPathingSim->removeFromPendingAdds(voice.pathingSource)) {
+            iplSourceRelease(&voice.pathingSource);
+        } else if (mPathingSim->isRunning()) {
+            mPathingSim->queueSourceRemove(voice.pathingSource);
+            voice.pathingSource = nullptr;
+            mPathingSim->setSimulatorDirty();
+        } else if (mPathingSim->simulator()) {
+            iplSourceRemove(voice.pathingSource, mPathingSim->simulator());
+            iplSourceRelease(&voice.pathingSource);
+            mPathingSim->setSimulatorDirty();
+        } else {
+            iplSourceRelease(&voice.pathingSource);
         }
     }
 
@@ -9758,39 +9959,48 @@ bool AudioService::loadProbes(const std::string &probePath)
         LOG_ERROR("AudioService: cannot load probes — ProbeManager not initialized");
         return false;
     }
-    // If a previous probe batch is still attached to the direct simulator,
+    // If a previous probe batch is still attached to the pathing simulator,
     // detach it BEFORE ProbeManager swaps in a new batch. ProbeManager's
     // loadProbes only knows about the reflection simulator, so its release
-    // path won't touch the direct sim; leaving the old batch attached
+    // path won't touch the pathing sim; leaving the old batch attached
     // produces a dangling reference once ProbeManager releases its
     // create-time ref. Symmetric with destroyAcousticScene's teardown.
-    if (mDirectProbeBatchAdded && mDirectSimulator && mProbeManager) {
+    //
+    // The pathing-sim worker must be drained before mutating its probe
+    // batch list — iplSimulatorRemoveProbeBatch is not safe to race
+    // iplSimulatorRunPathing on the same handle.
+    if (mPathingProbeBatchAdded && mPathingSim && mPathingSim->simulator() && mProbeManager) {
         IPLProbeBatch oldBatch = mProbeManager->getProbeBatch();
         if (oldBatch) {
-            iplSimulatorRemoveProbeBatch(mDirectSimulator, oldBatch);
-            iplSimulatorCommit(mDirectSimulator);
+            mPathingSim->waitForCompletion();
+            iplSimulatorRemoveProbeBatch(mPathingSim->simulator(), oldBatch);
+            iplSimulatorCommit(mPathingSim->simulator());
             iplProbeBatchRelease(&oldBatch);  // drops our retain
         }
-        mDirectProbeBatchAdded = false;
+        mPathingProbeBatchAdded = false;
     }
 
     bool ok = mProbeManager->loadProbes(probePath,
         mReflectionSim ? mReflectionSim->simulator() : nullptr);
     if (!ok) return false;
 
-    // Attach the freshly loaded probe batch to the direct simulator too,
-    // so Steam Audio's pathing can walk the probe graph from each voice's
-    // source to the listener. Retain so ProbeManager's release path on the
-    // reflection simulator side doesn't free the batch out from under us.
-    if (mDirectSimulator) {
+    // Attach the freshly loaded probe batch to the pathing simulator
+    // too, so Steam Audio's pathing solver can walk the probe graph from
+    // each voice's source to the listener. Retain so ProbeManager's
+    // release path on the reflection simulator side doesn't free the
+    // batch out from under us.
+    if (mPathingSim && mPathingSim->simulator()) {
         IPLProbeBatch batch = mProbeManager->getProbeBatch();
         if (batch) {
+            // Drain the worker before mutating the probe-batch list (same
+            // reason as the detach above).
+            mPathingSim->waitForCompletion();
             iplProbeBatchRetain(batch);
-            iplSimulatorAddProbeBatch(mDirectSimulator, batch);
-            iplSimulatorCommit(mDirectSimulator);
-            mDirectProbeBatchAdded = true;
+            iplSimulatorAddProbeBatch(mPathingSim->simulator(), batch);
+            iplSimulatorCommit(mPathingSim->simulator());
+            mPathingProbeBatchAdded = true;
             AUDIO_LOG("AudioService: attached probe batch (%d probes) to "
-                      "direct simulator for pathing\n",
+                      "pathing simulator for pathing\n",
                       mProbeManager->getProbeCount());
         }
     }
