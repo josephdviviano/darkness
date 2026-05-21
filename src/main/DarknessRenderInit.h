@@ -71,11 +71,10 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
             audioSvc->setAudioFrameSize(cfg.audioFrameSize);
             audioSvc->setSoundCacheMB(cfg.audioSoundCacheMB);
             audioSvc->setHRTFVolume(cfg.hrtfVolume);
-            // HRTF interp / spatial blend / distance model live in audio-thread
-            // atomics; publish them now so the first audio callback sees them.
+            // HRTF interp / spatial blend live in audio-thread atomics;
+            // publish them now so the first audio callback sees them.
             audioSvc->setHRTFInterpolation(cfg.hrtfInterpolation);
             audioSvc->setSpatialBlend(cfg.spatialBlend);
-            audioSvc->setDistanceModel(cfg.distanceModel);
             audioSvc->setDoorLpfOpenHz(cfg.doorLpfOpenHz);
             audioSvc->setDoorLpfBlockedHz(cfg.doorLpfBlockedHz);
             audioSvc->setPropMinAttenuation(cfg.propMinAttenuation);

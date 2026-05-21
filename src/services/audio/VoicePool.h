@@ -301,6 +301,16 @@ struct ActiveVoice {
     // 200ft through open corridors.
     float maxAudibleDist = 200.0f;
 
+    // Per-voice distance-attenuation rolloff factor, sourced from the
+    // schema's P$SchAttFac (Dark Engine attenuationFactor). Drives
+    // Steam Audio's IPLDistanceAttenuationModel::minDistance: minDistance
+    // = 1m × attenuationFactor, so attenuationFactor=20 keeps the sound
+    // at full volume out to 20m before 1/d falloff kicks in. Default 1.0
+    // matches Steam Audio's DEFAULT model (1m full-volume zone). Set at
+    // voice spawn from the schema (via voiceSetAttenuationFactor) and
+    // read every frame in the per-voice setInputs block.
+    float attenuationFactor = 1.0f;
+
     // Last propagation result — diagnostic only, recomputed every frame.
     SoundPropInfo cachedProp{};
     // Per-portal anchor bend points along the primary path (source→listener).

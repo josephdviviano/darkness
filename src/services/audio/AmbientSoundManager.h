@@ -115,15 +115,6 @@ public:
     float getHysteresisStartMul() const { return mHysteresisStartMul; }
     float getHysteresisStopMul() const  { return mHysteresisStopMul; }
 
-    /// No-op since loudness shaping moved to Steam Audio. Kept on the
-    /// API + YAML key for backwards compatibility; revisit if the
-    /// per-radius curve needs to come back as a designer-authoring
-    /// knob.
-    void setFalloffCurve(const std::string &s) {
-        mFalloffCurve = (s == "linear" ? "linear" : "quadratic");
-    }
-    const std::string &getFalloffCurve() const { return mFalloffCurve; }
-
     void setDefaultPriority(int p) { mDefaultPriority = p; }
     int  getDefaultPriority() const { return mDefaultPriority; }
 
@@ -160,7 +151,6 @@ private:
     float       mEnvironmentalSpatialBlend = 0.3f;
     float       mHysteresisStartMul        = 1.5f;
     float       mHysteresisStopMul         = 2.0f;
-    std::string mFalloffCurve              = "quadratic";
     int         mDefaultPriority           = 64;
     float       mGlobalVolumeScale         = 1.0f;
 };

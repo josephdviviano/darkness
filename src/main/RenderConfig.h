@@ -221,12 +221,10 @@ struct RenderConfig {
     float hrtfVolume          = 1.0f;   // HRTF output gain (1.0 = raw HRTF, lower = quieter)
     std::string hrtfInterpolation = "bilinear"; // HRTF interpolation: "nearest" or "bilinear"
     float spatialBlend        = 1.0f;   // binaural blend (0=mono, 1=full HRTF)
-    std::string distanceModel = "default"; // distance attenuation: "default" or "inverse_distance"
 
     // -- audio.ambient: P$AmbientHack tuning --
     float ambHysteresisStartMul = 1.5f; // multiplier on radius for ambient activation distance
     float ambHysteresisStopMul  = 2.0f; // multiplier on radius for ambient deactivation distance
-    std::string ambFalloffCurve = "quadratic"; // ambient distance falloff: "linear" or "quadratic"
     int   ambDefaultPriority    = 64;   // priority for ambients without explicit value
     // Per-voice spatialBlend override for AMB_ENVIRONMENTAL ambients (room
     // tone, wind, church reverberance). 1.0 = full HRTF point-source pan;
@@ -717,9 +715,11 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.spatialBlend > 1.0f) cfg.spatialBlend = 1.0f;
                 }
                 if (spat["distance_model"]) {
-                    cfg.distanceModel = spat["distance_model"].as<std::string>();
-                    if (cfg.distanceModel != "default" && cfg.distanceModel != "inverse_distance")
-                        cfg.distanceModel = "default";
+                    std::fprintf(stderr,
+                        "[CONFIG_DEPRECATED] audio.spatialization.distance_model "
+                        "is no longer supported. The distance model is now always "
+                        "INVERSEDISTANCE with per-voice minDistance derived from "
+                        "the schema's P$SchAttFac. Remove the key from your YAML.\n");
                 }
             }
 
@@ -736,9 +736,14 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.ambHysteresisStopMul > 5.0f) cfg.ambHysteresisStopMul = 5.0f;
                 }
                 if (amb["falloff_curve"]) {
-                    cfg.ambFalloffCurve = amb["falloff_curve"].as<std::string>();
-                    if (cfg.ambFalloffCurve != "linear" && cfg.ambFalloffCurve != "quadratic")
-                        cfg.ambFalloffCurve = "quadratic";
+                    std::fprintf(stderr,
+                        "[CONFIG_DEPRECATED] audio.ambient.falloff_curve is no "
+                        "longer supported. The Dark Engine centibel falloff curve "
+                        "was removed when Steam Audio became the sole player-audio "
+                        "propagation authority — Steam Audio's distance model "
+                        "handles all attenuation now. Tune audio.ambient."
+                        "global_volume_scale to compensate for the loudness "
+                        "re-baseline. Remove the key from your YAML.\n");
                 }
                 if (amb["default_priority"]) {
                     cfg.ambDefaultPriority = amb["default_priority"].as<int>();
