@@ -236,6 +236,12 @@ struct RenderConfig {
     // "wind from outside" still leans in the right direction but doesn't
     // feel like a laser pointer.
     float ambEnvironmentalSpatialBlend = 0.3f;  // (0.0–1.0)
+    // Global linear multiplier applied to every ambient + spot-ambient
+    // voice's per-frame volume. Compensates for the loudness re-baseline
+    // introduced when Steam Audio became the sole player-audio propagation
+    // authority (centibel falloff curve over schema radius retired). One
+    // knob, default 1.0 = no change. Tune by ear.
+    float ambGlobalVolumeScale = 1.0f;  // (0.0–4.0)
 
     // -- audio.mixer: global gains --
     float mixerMasterGain     = 1.0f;   // global output gain multiplier
@@ -743,6 +749,11 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     cfg.ambEnvironmentalSpatialBlend = amb["environmental_spatial_blend"].as<float>();
                     if (cfg.ambEnvironmentalSpatialBlend < 0.0f) cfg.ambEnvironmentalSpatialBlend = 0.0f;
                     if (cfg.ambEnvironmentalSpatialBlend > 1.0f) cfg.ambEnvironmentalSpatialBlend = 1.0f;
+                }
+                if (amb["global_volume_scale"]) {
+                    cfg.ambGlobalVolumeScale = amb["global_volume_scale"].as<float>();
+                    if (cfg.ambGlobalVolumeScale < 0.0f) cfg.ambGlobalVolumeScale = 0.0f;
+                    if (cfg.ambGlobalVolumeScale > 4.0f) cfg.ambGlobalVolumeScale = 4.0f;
                 }
             }
 

@@ -72,25 +72,6 @@ float milliBelIntToLinear(int volMb)
 } // anonymous namespace
 
 //------------------------------------------------------
-float AmbientVolumeModel::computeFalloff(float distance, float inner,
-                                         float outer, FalloffCurve curve)
-{
-    // Inner/outer envelope normalised to [0,1]. d<=inner → 0 (full volume),
-    // d>=outer → 1 (silent), in-band → curve-shaped fraction.
-    if (outer <= inner) {
-        return (distance >= outer) ? 1.0f : 0.0f;  // degenerate envelope: step at `outer`
-    }
-    if (distance <= inner) return 0.0f;
-    if (distance >= outer) return 1.0f;
-    const float t = (distance - inner) / (outer - inner);
-    switch (curve) {
-        case FalloffCurve::Linear:  return t;
-        case FalloffCurve::Quartic: return t * t * t * t;  // original engine's SHARP curve
-    }
-    return t;
-}
-
-//------------------------------------------------------
 AmbientSoundManager::AmbientSoundManager(AudioService *host)
     : mHost(host)
 {
@@ -264,10 +245,12 @@ void AmbientSoundManager::updateAmbientVolumes()
         return;
 
     for (auto &amb : mAmbients) {
-        // Ambient activation uses Euclidean distance — radius-based; portal
-        // routing handles cross-room propagation downstream. Start radius is
-        // narrower than stop radius (asymmetric hysteresis) to prevent
-        // start/stop oscillation when the listener hovers near the boundary.
+        // Ambient spawn/halt gate (CPU-side voice lifecycle): Euclidean
+        // distance against schema radius with asymmetric hysteresis.
+        // `amb.radius` is the authored CPU spawn boundary only — loudness
+        // shaping is delegated to Steam Audio (distance, portal, occlusion,
+        // air absorption), so the per-radius falloff curve is no longer
+        // applied below.
         const float dist = glm::length(mHost->mListenerPos - amb.position);
         const float startRadius = amb.radius * mHysteresisStartMul;
         const float stopRadius  = amb.radius * mHysteresisStopMul;
@@ -373,46 +356,39 @@ void AmbientSoundManager::updateAmbientVolumes()
             continue;
         }
 
-        // Distance-attenuated volume, original engine formula:
-        //   vol_cb       = gain - falloffPct * (5000 + gain) / atten_factor
-        //   falloffPct   = (d/r)   linear (default), (d/r)^4 SHARP
-        //   linearVol    = 10^(vol_cb / 2000)
-        // At d=0 vol_cb = gain; at d=radius vol_cb = gain - (5000+gain)/atten
-        // (= -50 dB for atten=1, gain=0). AMB_NO_FADE forces linear regardless
-        // of schema's SHARP flag — designer explicitly tagged "no fade".
-        const float falloffDist = mHost->voiceFalloffDistance(amb.handle, dist);
-        const bool  useSharp    = amb.isSharp && !(amb.flags & AMB_NO_FADE);
-        const FalloffCurve curve = useSharp ? FalloffCurve::Quartic
-                                            : FalloffCurve::Linear;
-        const float falloffPct = AmbientVolumeModel::computeFalloff(
-            falloffDist, /*inner=*/0.0f, /*outer=*/amb.radius, curve);
-
-        // Combine schema-authored gain with the per-object AmbientHack override
-        // (both centibels — additive = multiplicative on linear amplitudes).
-        // Without this, schemas authored at -1700cB (≈-17dB) play at unity.
+        // Voice loudness: schema-authored gain (centibels) + per-object
+        // AmbientHack override, converted to linear amplitude once.
+        // Steam Audio's per-voice DSP chain (iplDirectEffect distance
+        // attenuation + portalAttenuation + portalBlocking + air
+        // absorption + occlusion/transmission + HRTF) owns all distance
+        // / portal / occlusion shaping downstream — the Dark Engine
+        // centibel falloff curve over schema radius double-attenuated
+        // against that chain and confused authoring.
+        //
+        // amb.attenuationFactor (P$SchAttFac) is preserved on the
+        // struct but no longer consumed here — future tuning pass will
+        // map it onto Steam Audio's rolloffFactor.
         const float gainCb = static_cast<float>(
             amb.volume + schemaVolumeCb(mHost->mSchemaParser.get(), amb.schemaName));
-        // Per-schema attenuation factor (P$SchAttFac) divides the per-radius
-        // dB drop. Default 1.0 = original (-50 dB at radius for gain=0).
-        const float attenuation = amb.attenuationFactor > 0.0f
-                                  ? amb.attenuationFactor : 1.0f;
-        const float volumeCb = gainCb - (falloffPct * (5000.0f + gainCb)) / attenuation;
-        const float linearVol = centibelsToLinear(volumeCb);
+        const float linearVol = centibelsToLinear(gainCb);
 
         // Ducking applied inline so it doesn't compound across frames.
-        mHost->voiceSetLinearVolume(amb.handle, linearVol * mHost->currentDuckGain());
+        // mGlobalVolumeScale compensates for the ambient re-baseline
+        // introduced when Steam Audio became the sole player-audio
+        // propagation authority — one knob in YAML rather than per-schema.
+        mHost->voiceSetLinearVolume(amb.handle,
+            linearVol * mHost->currentDuckGain() * mGlobalVolumeScale);
     }
 }
 
 //------------------------------------------------------
 void AmbientSoundManager::updateSpotAmbientVolumes()
 {
-    // Per-frame envelope evaluation + lifecycle for P$SpotAmb. Uses the
-    // hard inner/outer envelope:
-    //   d <= inner → volume = level
-    //   in band   → volume = level * (outer - d) / (outer - inner)
-    //   d >= outer → volume = 0
-    // `level` is millibel gain (same convention as AmbientSound::volume).
+    // Per-frame lifecycle for P$SpotAmb. The authored inner/outer envelope
+    // is now used as a hard spawn/halt boundary only (d >= outer → halt);
+    // the in-band linear fade is delegated to Steam Audio's per-voice DSP
+    // chain (distance attenuation + portal/occlusion). Loudness is the
+    // authored level + schema gain, applied once.
     if (mSpotAmbients.empty())
         return;
 
@@ -427,14 +403,11 @@ void AmbientSoundManager::updateSpotAmbientVolumes()
     for (auto &se : mSpotAmbients) {
         const float d = glm::distance(mHost->mListenerPos, se.position);
 
-        // Unified envelope (Linear curve), converted to level-domain target
-        // by complement: target = level * (1 - pct).
-        const float falloffPct = AmbientVolumeModel::computeFalloff(
-            d, se.inner, se.outer, FalloffCurve::Linear);
-        const float envVol = se.level * (1.0f - falloffPct);
+        // Spawn/halt gate: voice is live whenever the listener is inside
+        // the authored outer envelope. Level<=0 spots never spawn.
+        const bool inEnvelope = (se.outer > 0.0f && d < se.outer && se.level > 0.0f);
 
-        if (envVol <= 0.0f) {
-            // Out of envelope — fade out.
+        if (!inEnvelope) {
             if (se.handle != SOUND_HANDLE_INVALID) {
                 mHost->haltSound(se.handle, /*fadeMs=*/200);
                 se.handle = SOUND_HANDLE_INVALID;
@@ -472,11 +445,14 @@ void AmbientSoundManager::updateSpotAmbientVolumes()
             continue;
         }
 
-        // Combine envVol (millibel) with schema-authored gain (centibel).
+        // Authored level (millibel) + schema-authored gain (centibel),
+        // converted to linear amplitude once. Steam Audio shapes distance
+        // / portal / occlusion downstream.
         const int schemaVolCb = schemaVolumeCb(mHost->mSchemaParser.get(), se.schemaName);
-        const int volMb = static_cast<int>(envVol) + schemaVolCb;
+        const int volMb = static_cast<int>(se.level) + schemaVolCb;
         const float linearVol = milliBelIntToLinear(volMb);
-        mHost->voiceSetLinearVolume(se.handle, linearVol * mHost->currentDuckGain());
+        mHost->voiceSetLinearVolume(se.handle,
+            linearVol * mHost->currentDuckGain() * mGlobalVolumeScale);
         ++playing;
         (void)justCreated;
     }

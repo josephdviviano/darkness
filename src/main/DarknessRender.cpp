@@ -3855,6 +3855,7 @@ int main(int argc, char *argv[]) {
         audioSvc->setAmbFalloffCurve(cfg.ambFalloffCurve);
         audioSvc->setAmbDefaultPriority(cfg.ambDefaultPriority);
         audioSvc->setAmbEnvironmentalSpatialBlend(cfg.ambEnvironmentalSpatialBlend);
+        audioSvc->setAmbGlobalVolumeScale(cfg.ambGlobalVolumeScale);
 
         // -- audio.mixer --
         audioSvc->setMasterGain(cfg.mixerMasterGain);

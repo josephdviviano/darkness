@@ -43,56 +43,40 @@ struct AmbientSound {
     float radius = 0.0f;              ///< Propagation radius
     int32_t volume = -1;              ///< Volume in millibels
     uint32_t flags = 0;               ///< AmbientHackFlags
-    /// Schema's SCH_SHARP_FALLOFF flag — true uses `(d/r)^4`, false `(d/r)`.
-    /// SHARP is the engine's default for ambients.
+    /// Schema's SCH_SHARP_FALLOFF flag (parsed from P$SchPlayPa).
+    /// Preserved-but-unused since loudness shaping moved to Steam Audio
+    /// — kept on the struct in case a future tuning pass maps it onto
+    /// Steam Audio rolloff parameters.
     bool isSharp = true;
-    /// P$SchAttFac divisor on the volume formula's per-radius dB drop
-    /// (default 1.0). Higher = less aggressive falloff.
+    /// P$SchAttFac. Preserved-but-unused since the per-radius centibel
+    /// falloff curve retired in favour of Steam Audio's distance model
+    /// — a future tuning pass will map this onto rolloffFactor.
     float attenuationFactor = 1.0f;
     SoundHandle handle = SOUND_HANDLE_INVALID; ///< Active voice handle (if playing)
 };
 
 /// Spot ambient — alternative ambient encoding with a hard inner/outer
-/// falloff envelope (loaded from P$SpotAmb). Unlike AmbientSound (single
-/// radius, linear/SHARP falloff), spot ambients are flat-volume within
-/// the inner radius, linearly fading to silence between inner and outer,
-/// and silent beyond. The original engine ties these to specific scene
-/// objects (e.g. mech floor lamps in MISS6).
+/// envelope (loaded from P$SpotAmb). The envelope is now used as a hard
+/// spawn/halt boundary only (d >= outer → halt); in-band volume shaping
+/// is delegated to Steam Audio's per-voice DSP chain. `inner` is preserved
+/// on the struct but no longer drives a fade-in zone; revisit if designers
+/// need authored fade-in distance back.
 struct SpotAmbient {
     int objID = 0;
     std::string schemaName;       ///< Schema name (resolved from emitter object's archetype)
     Vector3 position{0, 0, 0};
-    float inner = 0.0f;           ///< Distance inside which volume = level
-    float outer = 0.0f;           ///< Distance beyond which volume = 0
-    float level = 1.0f;           ///< Volume scalar at d <= inner
+    float inner = 0.0f;           ///< Authored inner radius (preserved; not currently consumed)
+    float outer = 0.0f;           ///< Hard halt boundary (d >= outer → voice halts)
+    float level = 1.0f;           ///< Authored linear volume scalar
     SoundHandle handle = SOUND_HANDLE_INVALID;
 };
 
-/// Falloff curves for ambient volume models.
-///   Linear    — `falloffPct = (d - inner) / (outer - inner)` (saturated to [0,1])
-///   Quartic   — `falloffPct = ((d - inner) / (outer - inner))^4`
-///               (= the original engine's SHARP curve; near-full volume across
-///               most of the radius, falling quickly only near the edge).
-enum class FalloffCurve {
-    Linear,
-    Quartic,
-};
-
-/// Unified ambient volume envelope. Returns falloff in [0,1]: 0 = fully
-/// inside (d<=inner, full gain), 1 = fully outside (d>=outer, silent).
-/// P$AmbientHack uses inner=0, outer=radius + Linear/Quartic from
-/// SCH_SHARP_FALLOFF. P$SpotAmb uses property inner/outer + Linear
-/// (target = level * (1 - falloff)).
-struct AmbientVolumeModel {
-    static float computeFalloff(float distance, float inner, float outer,
-                                FalloffCurve curve);
-};
-
 /// Manages ambient sound lifecycle: parses P$AmbientHack and P$SpotAmb
-/// from mission data, starts/stops voices based on listener distance with
-/// hysteresis, applies per-voice volume each frame via the unified
-/// falloff model. Owned by AudioService; constructed in the service's
-/// constructor and torn down with it.
+/// from mission data, starts/stops voices based on listener distance
+/// with hysteresis, and applies a per-voice linear volume each frame.
+/// Loudness shaping (distance / portal / occlusion) is delegated to
+/// Steam Audio's per-voice DSP chain. Owned by AudioService; constructed
+/// in the service's constructor and torn down with it.
 class AmbientSoundManager {
 public:
     explicit AmbientSoundManager(AudioService *host);
@@ -110,12 +94,13 @@ public:
     void loadSpotAmbients();
 
     /// Per-frame update for P$AmbientHack ambients: starts/stops voices
-    /// based on hysteresis around the authored radius and updates their
-    /// volume via the gain-domain falloff formula.
+    /// based on hysteresis around the authored radius and applies the
+    /// authored (centibel) volume + duck + global scale once per frame.
     void updateAmbientVolumes();
 
     /// Per-frame update for P$SpotAmb spot ambients: starts/stops voices
-    /// based on the inner/outer envelope and updates their volume.
+    /// based on the authored outer halt boundary and applies the
+    /// authored (millibel) level + duck + global scale once per frame.
     void updateSpotAmbientVolumes();
 
     /// Drop all parsed ambient/spot-ambient state. Voices are NOT halted
@@ -130,9 +115,10 @@ public:
     float getHysteresisStartMul() const { return mHysteresisStartMul; }
     float getHysteresisStopMul() const  { return mHysteresisStopMul; }
 
-    /// "linear" or "quadratic" — passthrough kept for API compat. Actual
-    /// per-ambient curve comes from the schema's SCH_SHARP_FALLOFF bit;
-    /// this setting is retained for future use.
+    /// No-op since loudness shaping moved to Steam Audio. Kept on the
+    /// API + YAML key for backwards compatibility; revisit if the
+    /// per-radius curve needs to come back as a designer-authoring
+    /// knob.
     void setFalloffCurve(const std::string &s) {
         mFalloffCurve = (s == "linear" ? "linear" : "quadratic");
     }
@@ -143,6 +129,14 @@ public:
 
     void setEnvironmentalSpatialBlend(float b) { mEnvironmentalSpatialBlend = b; }
     float getEnvironmentalSpatialBlend() const { return mEnvironmentalSpatialBlend; }
+
+    /// Global multiplier applied to every ambient + spot-ambient voice's
+    /// per-frame linear volume. Compensates for the loudness re-baseline
+    /// introduced when Steam Audio became the sole player-audio
+    /// propagation authority (no more centibel falloff curve over schema
+    /// radius). Default 1.0 = no change; designers tune by ear.
+    void setGlobalVolumeScale(float s) { mGlobalVolumeScale = (s < 0.0f ? 0.0f : s); }
+    float getGlobalVolumeScale() const { return mGlobalVolumeScale; }
 
     /// Read-only views (used for the global audio status dump in
     /// AudioService::loopStep and other diagnostics).
@@ -168,6 +162,7 @@ private:
     float       mHysteresisStopMul         = 2.0f;
     std::string mFalloffCurve              = "quadratic";
     int         mDefaultPriority           = 64;
+    float       mGlobalVolumeScale         = 1.0f;
 };
 
 } // namespace Darkness
