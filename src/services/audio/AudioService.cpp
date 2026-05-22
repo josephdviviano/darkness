@@ -3767,8 +3767,15 @@ bool AudioService::initReflectionPipeline()
     // clamped the transition down; that hid the misconfig and made the
     // user's actual setting irrelevant. Refuse to init the reflection
     // pipeline instead so the user fixes the YAML.
+    // Steam Audio crashes if hybrid_transition_time > IR duration; keep a
+    // 0.1s safety margin. Use a small epsilon to absorb float32 precision
+    // noise (e.g. 2.1f - 0.1f == 1.9999999f, which would falsely reject the
+    // documented 2.0/2.1 config). 1e-3f = 1 ms is large enough to absorb a
+    // few ULP of subtraction error and small enough to not change the real
+    // safety contract (still ~99 ms margin vs the IR duration).
+    constexpr float kHybridMarginSlack = 1e-3f;
     if (mReflectionType == ReflectionType::Hybrid
-        && mHybridTransitionTime > mRealtimeDuration - 0.1f) {
+        && mHybridTransitionTime > mRealtimeDuration - 0.1f + kHybridMarginSlack) {
         LOG_ERROR(
             "AudioService: reflections.hybrid_transition_time (%.2fs) >= "
             "reflections.realtime.duration (%.2fs) - 0.1s margin — Steam "
