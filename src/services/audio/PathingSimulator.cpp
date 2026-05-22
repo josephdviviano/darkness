@@ -110,8 +110,29 @@ bool PathingSimulator::removeFromPendingAdds(IPLSource src)
 void PathingSimulator::flushPendingAdds()
 {
     if (mPendingAdds.empty() || !mSimulator) return;
-    for (auto &src : mPendingAdds)
+    // [PATH_REG] flush-side trace — mirrors the create-side [PATH_REG] logs
+    // in AudioService.cpp. Records every source whose iplSourceAdd was
+    // deferred (worker was running at create time) and is now actually
+    // entering the simulator's source list. A SPIKE voice whose source
+    // appears here AFTER its first [PATHING_FIRST_SOLVE] would prove the
+    // "voice created but solver never saw it" pending-source race.
+    //
+    // Rate-limited to first 64 + every 64th to bound bursty load-time spam.
+    static std::atomic<int> sFlushLogCount{0};
+    const int fc = sFlushLogCount.fetch_add(1, std::memory_order_relaxed);
+    const bool verbose = (fc < 64) || ((fc % 64) == 0);
+    if (verbose) {
+        std::fprintf(stderr,
+            "[PATH_REG] flush_begin n=%zu (flush #%d)\n",
+            mPendingAdds.size(), fc + 1);
+    }
+    for (auto &src : mPendingAdds) {
+        if (verbose) {
+            std::fprintf(stderr,
+                "[PATH_REG] flush_add src=%p\n", static_cast<void *>(src));
+        }
         iplSourceAdd(src, mSimulator);
+    }
     mPendingAdds.clear();
     mSimulatorDirty = true;
 }

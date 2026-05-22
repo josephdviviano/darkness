@@ -178,68 +178,37 @@ TEST_CASE("ProbeBakeParams defaults to floor-only coverage",
           "[steam_audio][bake]") {
     ProbeBakeParams p;
     CHECK(p.additionalElevations.empty());
-    CHECK(p.portalAxes.empty());
-    // The new axial-emit defaults: 1 ft on each side, dedup against the
-    // floor grid at one spacing-radius. These get consumed by
-    // ProbeManager so the values can be tuned per-bake.
+    // portalAxialOffsetFt is now consumed by the PATHING batch (two
+    // probes per surviving RoomService portal at center ± normal *
+    // offset). The reflection batch's per-portal ring pass was removed
+    // when pathing got its own sparse batch.
     CHECK(p.portalAxialOffsetFt  == Approx(1.0f));
     CHECK(p.portalDedupRadiusFt  == Approx(5.0f));
 }
 
-TEST_CASE("PortalAxis carries a center and a portal-plane normal",
+TEST_CASE("Probe count upper bound with elevations",
           "[steam_audio][bake]") {
-    // PortalAxis (replacing the legacy 4-probe-on-plane PortalRing) holds
-    // the portal centroid and the inward-facing plane normal. ProbeManager
-    // expands this to up to two probe candidates at center ± normal *
-    // axialOffsetFt — one offset into each adjoining room. The on-plane
-    // ring layout produced two pathologies: (1) duplicate probes per
-    // shared doorway because every portal appears in both rooms' portal
-    // lists with the same basis vectors, and (2) doorway-shaped IRs that
-    // ramped wet-bus loudness as the listener walked through. Axial-into-
-    // room offsets dodge both.
-    ProbeBakeParams::PortalAxis axis;
-    axis.center = Vector3(10.0f, 20.0f, 5.0f);
-    axis.normal = Vector3(1.0f, 0.0f, 0.0f);
-
-    constexpr float kAxialOffsetFt = 1.0f;  // matches ProbeBakeParams default
-    const Vector3 expectedPlus  = axis.center + axis.normal * kAxialOffsetFt;
-    const Vector3 expectedMinus = axis.center - axis.normal * kAxialOffsetFt;
-
-    CHECK(expectedPlus.x  == Approx(11.0f));
-    CHECK(expectedMinus.x == Approx(9.0f));
-    // Offsets are purely axial → y/z unchanged from centroid.
-    CHECK(expectedPlus.y  == Approx(20.0f));
-    CHECK(expectedPlus.z  == Approx(5.0f));
-}
-
-TEST_CASE("Probe count upper bound with elevations and portals",
-          "[steam_audio][bake]") {
-    // Pre-dedup upper bound: floor + floor·#elevations + 2·#portalAxes.
-    // The actual count after the bake is ≤ this, because ProbeManager
-    // applies a proximity-dedup pass that drops axial candidates within
-    // portalDedupRadiusFt of an existing floor/elevation probe. The
-    // post-dedup count is data-dependent (depends on the floor grid +
-    // portal-centroid positions), so we only assert the upper bound here.
+    // Pre-dedup upper bound for the REFLECTION batch:
+    //   floor + floor · #elevations
+    // The post-dedup count is data-dependent (depends on the floor grid +
+    // emitter-anchor positions), so we only assert the upper bound here.
     const int floor = 100;
     const int elevations = 2;
-    const int portalAxes = 5;
-    const int upperExtra = floor * elevations + 2 * portalAxes;
+    const int upperExtra = floor * elevations;
     const int upperTotal = floor + upperExtra;
-    // 100 + (100*2 + 2*5) = 100 + 210 = 310
-    CHECK(upperTotal == 310);
-    CHECK(upperExtra == 210);
+    // 100 + (100*2) = 300
+    CHECK(upperTotal == 300);
+    CHECK(upperExtra == 200);
 }
 
-TEST_CASE("Empty elevations + portalAxes=empty reproduces legacy count",
+TEST_CASE("Empty elevations reproduces legacy floor-only count",
           "[steam_audio][bake]") {
-    // Cache-rebuild safety net: with both extension tiers off, the count
+    // Cache-rebuild safety net: with the elevation tier off, the count
     // matches the pre-Phase-2 floor-only path so old probe caches
     // round-trip validation without forcing a re-bake.
     ProbeBakeParams p;
     p.additionalElevations.clear();
-    p.portalAxes.clear();
     CHECK(p.additionalElevations.size() == 0);
-    CHECK(p.portalAxes.size() == 0);
 }
 
 TEST_CASE("Pathing gain scale multiplies only the scalar gain",
