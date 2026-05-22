@@ -642,7 +642,7 @@ static void printSoundDescLinks() {
 // Examples:
 //   prop-dump SchAttFac    → per-schema attenuation factors
 //   prop-dump SchPlayPa    → per-archetype schema play-param overrides
-//   prop-dump SpotAmb      → spot-ambient envelopes (inner/outer/level)
+//   prop-dump SpotAmb      → spotlight cones + ambient brightness (renderer)
 //   prop-dump LoudRoom     → per-room transmission multipliers
 //   prop-dump AmbientHa    → ambient sound emitters
 static std::string symNameFor(int objID) {
@@ -680,9 +680,11 @@ static void formatPropRecord(const std::string &propName, int objID,
         PropSchemaLoopParams lp; std::memcpy(&lp, bytes, sizeof(lp));
         p("flags=0x%02x maxSamples=%u loopCount=%d interval=[%d,%d]",
           lp.flags, lp.maxSamples, lp.loopCount, lp.minInterval, lp.maxInterval);
-    } else if (propName == "SpotAmb" && sz >= sizeof(PropSpotAmb)) {
-        PropSpotAmb sa; std::memcpy(&sa, bytes, sizeof(sa));
-        p("inner=%.2f outer=%.2f ambient=%.3f", sa.inner, sa.outer, sa.ambient);
+    } else if (propName == "SpotAmb" && sz >= sizeof(PropSpotlightAndAmbient)) {
+        PropSpotlightAndAmbient sa; std::memcpy(&sa, bytes, sizeof(sa));
+        // RENDERER property: spotlight cone + ambient brightness override.
+        p("innerAngleDeg=%.2f outerAngleDeg=%.2f ambientBrightness=%.3f",
+          sa.innerAngleDeg, sa.outerAngleDeg, sa.ambientBrightness);
     } else if (propName == "Heartbeat" && sz >= 4) {
         p("intervalMs=%d", readI32());
     } else if (propName == "MaxSpchPa" && sz >= 4) {

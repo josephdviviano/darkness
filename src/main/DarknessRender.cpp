@@ -627,6 +627,141 @@ static std::vector<size_t> selectClosestRooms(
     return indices;
 }
 
+// ── Shared pathing-probe layer-2 occlusion classifier ──
+//
+// Replicates the runtime filter Steam Audio applies before findPaths
+// runs: `ProbeNeighborhood::checkOcclusion` (probe_manager.cpp:51-82)
+// casts a single ray from the listener to each probe's center against
+// the acoustic scene. Probes whose ray hits geometry get dropped from
+// the neighborhood and cannot contribute to the wet bus.
+//
+// We approximate this here client-side using the renderer's CPU copy
+// of the acoustic mesh (Möller-Trumbore any-hit). Output is consumed
+// by BOTH show_probes (cube tint for pathing probes) and
+// show_probe_radius (wireframe sphere color) so the two overlays agree
+// per-probe. Single-probe state ordering matches the at-a-glance
+// triage colors:
+//   Visible    — listener inside sphere AND ray clears mesh (green)
+//   Occluded   — listener inside sphere AND ray hits mesh (red)
+//   OutOfRange — listener outside influence sphere (gray)
+//
+// Caveats baked into the implementation:
+//   • Door OBBs are NOT in state.acousticVerts/Indices (they're separate
+//     IPL instanced meshes on the audio scene). Closed doors won't
+//     affect this classifier; that's fine — this is a static-geometry
+//     wall-occlusion diagnostic, not a door-state diagnostic.
+//   • Single ray per probe matches Steam Audio's actual check exactly,
+//     so the classification faithfully reflects runtime behaviour
+//     including its single-ray-can-thread-through-seams fragility.
+namespace {
+
+enum class ProbeOccState : uint8_t {
+    OutOfRange = 0,  ///< Listener outside probe.influence sphere
+                     ///< (layer-1 culls before layer-2 runs).
+    Visible    = 1,  ///< In sphere AND ray clears → contributes.
+    Occluded   = 2,  ///< In sphere AND ray hit → layer-2 drops it.
+};
+
+// Möller-Trumbore any-hit, two-sided. Ray from `from` to `to` against
+// the triangle soup `aVerts` / `aIdx` (engine feet, Z-up). Hits at
+// t ∈ (epsT, length-epsT) — epsilon margin so listener-side and
+// probe-side touch points don't self-occlude. Returns true on first
+// hit (no closest-tri tracking).
+bool rayHitsAcousticMesh(const Darkness::Vector3 &from,
+                         const Darkness::Vector3 &to,
+                         const float *aVerts,
+                         const int32_t *aIdx,
+                         size_t numTris)
+{
+    const float dx = to.x - from.x;
+    const float dy = to.y - from.y;
+    const float dz = to.z - from.z;
+    const float maxT = std::sqrt(dx*dx + dy*dy + dz*dz);
+    if (maxT < 1e-3f) return false;
+    const float invLen = 1.0f / maxT;
+    const float rdx = dx * invLen;
+    const float rdy = dy * invLen;
+    const float rdz = dz * invLen;
+    constexpr float kEps = 1e-3f;
+    const float epsT = kEps;
+    const float testMax = maxT - kEps;
+    if (testMax <= epsT) return false;
+    for (size_t t = 0; t < numTris; ++t) {
+        int32_t i0 = aIdx[t*3 + 0];
+        int32_t i1 = aIdx[t*3 + 1];
+        int32_t i2 = aIdx[t*3 + 2];
+        float ax = aVerts[i0*3+0], ay = aVerts[i0*3+1], az = aVerts[i0*3+2];
+        float bx = aVerts[i1*3+0], by = aVerts[i1*3+1], bz = aVerts[i1*3+2];
+        float cx = aVerts[i2*3+0], cy = aVerts[i2*3+1], cz = aVerts[i2*3+2];
+        float e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+        float e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+        float px = rdy*e2z - rdz*e2y;
+        float py = rdz*e2x - rdx*e2z;
+        float pz = rdx*e2y - rdy*e2x;
+        float det = e1x*px + e1y*py + e1z*pz;
+        if (std::fabs(det) < 1e-8f) continue;
+        float invDet = 1.0f / det;
+        float tx = from.x - ax;
+        float ty = from.y - ay;
+        float tz = from.z - az;
+        float u = (tx*px + ty*py + tz*pz) * invDet;
+        if (u < 0.0f || u > 1.0f) continue;
+        float qx = ty*e1z - tz*e1y;
+        float qy = tz*e1x - tx*e1z;
+        float qz = tx*e1y - ty*e1x;
+        float v = (rdx*qx + rdy*qy + rdz*qz) * invDet;
+        if (v < 0.0f || u + v > 1.0f) continue;
+        float hitT = (e2x*qx + e2y*qy + e2z*qz) * invDet;
+        if (hitT > epsT && hitT < testMax) return true;
+    }
+    return false;
+}
+
+// Classify a single pathing probe relative to the listener.
+ProbeOccState classifyPathingProbe(const Darkness::Vector3 &listener,
+                                    const Darkness::Vector3 &probePos,
+                                    float probeRadiusFt,
+                                    const float *aVerts,
+                                    const int32_t *aIdx,
+                                    size_t numTris)
+{
+    Darkness::Vector3 d = probePos - listener;
+    float distSq = d.x*d.x + d.y*d.y + d.z*d.z;
+    float rSq    = probeRadiusFt * probeRadiusFt;
+    if (distSq > rSq)
+        return ProbeOccState::OutOfRange;
+    if (rayHitsAcousticMesh(listener, probePos, aVerts, aIdx, numTris))
+        return ProbeOccState::Occluded;
+    return ProbeOccState::Visible;
+}
+
+// State → ABGR uint32 for the vertex-color sphere shader.
+uint32_t probeStateToABGR(ProbeOccState s) {
+    switch (s) {
+        case ProbeOccState::Visible:    return 0xFF22FF22;  // green
+        case ProbeOccState::Occluded:   return 0xFF2222FF;  // red
+        case ProbeOccState::OutOfRange: return 0x80808080;  // dim gray
+    }
+    return 0xFFFFFFFF;
+}
+
+// State → RGBA float[4] for the flat-shaded cube uniform u_objectLight.
+// Alpha is unused by the flat program (set to 0 to match existing
+// tints in this file).
+void probeStateToRGBA(ProbeOccState s, float out[4]) {
+    out[3] = 0.0f;
+    switch (s) {
+        case ProbeOccState::Visible:
+            out[0] = 0.13f; out[1] = 1.00f; out[2] = 0.13f; break;
+        case ProbeOccState::Occluded:
+            out[0] = 1.00f; out[1] = 0.13f; out[2] = 0.13f; break;
+        case ProbeOccState::OutOfRange:
+            out[0] = 0.50f; out[1] = 0.50f; out[2] = 0.50f; break;
+    }
+}
+
+} // anonymous namespace
+
 // Render the room-ID overlay (HUD line + per-corner labels). Called
 // from the main render loop AFTER the frob-hint section so the labels
 // survive the dbgTextClear at the top of that section. Wireframe edges
@@ -782,7 +917,8 @@ static void renderDebugOverlay(
     if (!state.showRaycast && !state.showAcousticMesh
         && !state.showAcousticHit
         && !state.showProbes && !state.showRooms
-        && !state.showPortals && !state.showVPos) {
+        && !state.showPortals && !state.showVPos
+        && !state.showProbeRadius) {
         return;
     }
 
@@ -1479,57 +1615,86 @@ static void renderDebugOverlay(
     // dbgTextClear.)
 
     // ── Probe + listener-marker overlay ──
-    // Independent of show_raycast. One bgfx draw per probe (using the fallback
-    // cube). With typical bake densities (≤2000 probes) the per-frame submit
-    // budget is well within bgfx's headroom; if it ever becomes a bottleneck
-    // the fix is instanced draws — but until then, the per-probe submit keeps
-    // the code simple and lets us tint each cube individually.
+    // Independent of show_raycast. One bgfx draw per probe (using the
+    // fallback cube). Both reflection and pathing probes are drawn as
+    // cubes — they differ by tint and (per-class) size. Both share
+    // the same camera-nearest-rooms cull as show_probe_radius so the
+    // sphere overlay (when also on) appears/disappears in sync with
+    // the cubes.
     if (state.showProbes
         && bgfx::isValid(gpu.fallbackCubeVBH)
         && bgfx::isValid(gpu.fallbackCubeIBH))
     {
         auto audioSvc = GET_SERVICE(Darkness::AudioService);
 
-        // Probe scatter with reachability preview. Each probe gets one of
-        // five tints (depth disabled so the grid is visible through walls):
+        // Tints — reflection probes are colored by ProbeFate (cyan if
+        // Kept, plus warning palette for failure modes). Pathing probes
+        // are colored by layer-2 occlusion state via the shared
+        // classifier (matches show_probe_radius).
         //
-        //   white   — nearest to listener (was orange; bumped to white so
-        //             "active" reads as distinct from the warm reds below)
-        //   cyan    — Kept (in a room reachable from a mapper-placed object)
+        // ── Reflection-probe palette ──
+        //   cyan    — Kept (in a room reachable from a mapper-placed
+        //             object) AND the active (nearest) probe — the
+        //             active one stands out by SIZE, not color
         //   red     — NoRoom (BSP void / unroomed cell)
         //   magenta — Unreachable (has a room, but isolated from playable
-        //             space — would prune at bake-time even though IPL placed
-        //             it on a real floor)
+        //             space — would prune at bake-time even though IPL
+        //             placed it on a real floor)
         //   yellow  — Isolated (graph-isolated; Steam Audio's visibility
-        //             bake never formed an edge from this probe — populated
-        //             from runtime evidence: at least one voice associated
-        //             with this probe stayed in the 0.1f pathing sentinel
-        //             for > 30 loop-steps with no first-solve)
+        //             bake never formed an edge from this probe —
+        //             populated from runtime evidence)
         //
-        // Classification comes from AudioService::getProbeFates(), which is
-        // populated by classifyProbeReachability() automatically after every
-        // load/bake (and on-demand via the `classify_probes` console action).
-        // The vector is parallel to getProbePositions(); if it's empty or
-        // wrong-length we fall back to the cyan-only legacy view.
+        // ── Pathing-probe palette ── (same as show_probe_radius sphere)
+        //   green   — Visible (listener inside influence sphere, ray
+        //             clears the acoustic mesh — probe contributes)
+        //   red     — Occluded (listener inside sphere, ray hits the
+        //             acoustic mesh — Steam Audio's checkOcclusion
+        //             would drop this probe at runtime)
+        //   gray    — OutOfRange (listener outside influence sphere)
+        //
+        // Reflection fate classification comes from
+        // AudioService::getProbeFates(); if empty or wrong-length we
+        // fall back to cyan-only.
         if (audioSvc) {
-            const auto &probes = audioSvc->getProbePositions();
-            const auto &fates  = audioSvc->getProbeFates();
-            const bool fatesValid = fates.size() == probes.size();
+            const auto &reflProbes  = audioSvc->getProbePositions();
+            const auto &fates       = audioSvc->getProbeFates();
+            const bool  fatesValid  = fates.size() == reflProbes.size();
+            const auto  pathingViz  = audioSvc->getPathingProbeViz();
             Darkness::Vector3 listenerPos = audioSvc->getListenerPos();
 
-            // Squared cull radius — zero (or negative) disables culling.
-            // Compare against squared distance throughout to skip the sqrt
-            // per probe; relevant when probe count is in the thousands.
-            const float cullRadius = state.probeRenderRadius;
-            const float cullRadiusSq = (cullRadius > 0.0f) ? cullRadius * cullRadius : 0.0f;
-            const bool  cullEnabled  = cullRadiusSq > 0.0f;
+            // Camera-nearest-rooms cull (shared with show_probe_radius
+            // and show_rooms). Build a set of room IDs to keep so the
+            // per-probe filter is O(1). Empty keepRooms → no cull
+            // (debug_room_max_count was 0 or ≥ #rooms).
+            Darkness::Vector3 camPos(state.cam.pos[0],
+                                      state.cam.pos[1],
+                                      state.cam.pos[2]);
+            std::vector<size_t> nearestRoomIdx =
+                selectClosestRooms(state, camPos);
+            std::unordered_set<int32_t> keepRooms;
+            keepRooms.reserve(nearestRoomIdx.size());
+            for (size_t idx : nearestRoomIdx) {
+                if (idx < state.roomDebug.size()) {
+                    keepRooms.insert(state.roomDebug[idx].roomID);
+                }
+            }
+            const bool roomCullEnabled = !keepRooms.empty();
+
+            // Need RoomService to look up each reflection probe's
+            // enclosing room ID for the cull. Pathing probes carry
+            // their roomID inside PathingProbeViz.
+            Darkness::RoomServicePtr roomSvc =
+                GET_SERVICE(Darkness::RoomService);
 
             int   nearestIdx  = -1;
             float nearestDistSq = std::numeric_limits<float>::max();
-            for (size_t i = 0; i < probes.size(); ++i) {
-                Darkness::Vector3 d = probes[i] - listenerPos;
+            for (size_t i = 0; i < reflProbes.size(); ++i) {
+                Darkness::Vector3 d = reflProbes[i] - listenerPos;
                 float ds = glm::dot(d, d);
-                if (ds < nearestDistSq) { nearestDistSq = ds; nearestIdx = static_cast<int>(i); }
+                if (ds < nearestDistSq) {
+                    nearestDistSq = ds;
+                    nearestIdx = static_cast<int>(i);
+                }
             }
 
             uint64_t probeState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
@@ -1538,23 +1703,37 @@ static void renderDebugOverlay(
             float keptTint[4]    = {0.0f, 0.8f, 1.0f, 0.0f};  // cyan
             float noRoomTint[4]  = {1.0f, 0.0f, 0.0f, 0.0f};  // red
             float unreachTint[4] = {0.9f, 0.0f, 0.7f, 0.0f};  // magenta
-            float isolatedTint[4]= {1.0f, 0.85f, 0.0f, 0.0f}; // yellow — graph-isolated (runtime evidence)
-            float nearestTint[4] = {1.0f, 1.0f, 1.0f, 0.0f};  // white
-            for (size_t i = 0; i < probes.size(); ++i) {
-                const auto &p = probes[i];
-                // Listener-relative distance cull. The nearest probe is
-                // exempted so the active-probe indicator never disappears
-                // even if it happens to sit slightly outside the radius
-                // (e.g. listener standing in a probe-sparse region).
-                if (cullEnabled && static_cast<int>(i) != nearestIdx) {
-                    Darkness::Vector3 d = p - listenerPos;
-                    if (glm::dot(d, d) > cullRadiusSq) continue;
+            float isolatedTint[4]= {1.0f, 0.85f, 0.0f, 0.0f}; // yellow
+
+            // Reflection probes: shrunk to 25% of probeMarkerSize so
+            // the dense bake grid stops filling the view. The active
+            // (nearest-to-listener) probe stays at 50% (2x the new
+            // shrunk default) so it pops by SIZE rather than by a
+            // color swap — color stays the same cyan so the active
+            // indicator doesn't read as a different class.
+            const float kReflShrink     = 0.25f;
+            const float kReflActiveMul  = 2.0f;
+            const float reflSize        = state.probeMarkerSize * kReflShrink;
+            const float reflActiveSize  = reflSize * kReflActiveMul;
+            for (size_t i = 0; i < reflProbes.size(); ++i) {
+                const auto &p = reflProbes[i];
+                // Camera-nearest-rooms cull. Active probe is exempt
+                // so the listener can always find their nearest probe
+                // even when standing in an edge-of-set region.
+                if (roomCullEnabled && static_cast<int>(i) != nearestIdx) {
+                    int32_t rid = -1;
+                    if (roomSvc) {
+                        Darkness::Room *r = roomSvc->roomFromPoint(p);
+                        if (r) rid = r->getRoomID();
+                    }
+                    if (rid < 0 || keepRooms.find(rid) == keepRooms.end())
+                        continue;
                 }
+                const bool isActive = (static_cast<int>(i) == nearestIdx);
+                float sz = isActive ? reflActiveSize : reflSize;
                 float mtx[16];
-                bx::mtxSRT(mtx,
-                    state.probeMarkerSize, state.probeMarkerSize, state.probeMarkerSize,
-                    0.0f, 0.0f, 0.0f,
-                    p.x, p.y, p.z);
+                bx::mtxSRT(mtx, sz, sz, sz, 0.0f, 0.0f, 0.0f,
+                           p.x, p.y, p.z);
                 bgfx::setTransform(mtx);
                 bgfx::setVertexBuffer(0, gpu.fallbackCubeVBH);
                 bgfx::setIndexBuffer(gpu.fallbackCubeIBH);
@@ -1564,10 +1743,10 @@ static void renderDebugOverlay(
                 bgfx::setUniform(gpu.u_fogParams, noFog);
                 bgfx::setUniform(gpu.u_objectParams, opaque);
 
+                // Pick tint from ProbeFate. Active probe keeps the
+                // Kept (cyan) tint — pop-by-size, not color swap.
                 float *tint = keptTint;
-                if (static_cast<int>(i) == nearestIdx) {
-                    tint = nearestTint;
-                } else if (fatesValid) {
+                if (!isActive && fatesValid) {
                     switch (fates[i]) {
                         case Darkness::AudioService::ProbeFate::NoRoom:
                             tint = noRoomTint; break;
@@ -1582,6 +1761,51 @@ static void renderDebugOverlay(
                 }
                 bgfx::setUniform(gpu.u_objectLight, tint);
                 bgfx::submit(2, gpu.flatProgram);
+            }
+
+            // Pathing-batch probe overlay. Uses the same layer-2
+            // occlusion classification as show_probe_radius (shared
+            // file-scope helper classifyPathingProbe +
+            // probeStateToRGBA) so a probe's cube here and its sphere
+            // there always have the same color. Cube size unchanged
+            // (full probeMarkerSize) so pathing cubes still read as
+            // distinct from the shrunk reflection cubes by size alone.
+            if (!pathingViz.empty()) {
+                const size_t numAcousticTris =
+                    state.acousticIndices.size() / 3;
+                const float *aVerts = state.acousticVerts.data();
+                const int32_t *aIdx = state.acousticIndices.data();
+                const float pathSize = state.probeMarkerSize;
+                for (const auto &v : pathingViz) {
+                    // Camera-nearest-rooms cull (same as reflection
+                    // probes). PathingProbeViz already carries the
+                    // probe's roomID so no per-probe roomFromPoint
+                    // call is needed.
+                    if (v.roomID < 0) continue;  // BSP void
+                    if (roomCullEnabled
+                        && keepRooms.find(v.roomID) == keepRooms.end()) {
+                        continue;
+                    }
+                    ProbeOccState s = classifyPathingProbe(
+                        listenerPos, v.position, v.radiusFt,
+                        aVerts, aIdx, numAcousticTris);
+                    float pathTint[4];
+                    probeStateToRGBA(s, pathTint);
+                    float mtx[16];
+                    bx::mtxSRT(mtx, pathSize, pathSize, pathSize,
+                               0.0f, 0.0f, 0.0f,
+                               v.position.x, v.position.y, v.position.z);
+                    bgfx::setTransform(mtx);
+                    bgfx::setVertexBuffer(0, gpu.fallbackCubeVBH);
+                    bgfx::setIndexBuffer(gpu.fallbackCubeIBH);
+                    bgfx::setState(probeState);
+                    float noFog[4] = {0, 0, 0, 0};
+                    bgfx::setUniform(gpu.u_fogColor,  noFog);
+                    bgfx::setUniform(gpu.u_fogParams, noFog);
+                    bgfx::setUniform(gpu.u_objectParams, opaque);
+                    bgfx::setUniform(gpu.u_objectLight, pathTint);
+                    bgfx::submit(2, gpu.flatProgram);
+                }
             }
         }
 
@@ -1646,8 +1870,12 @@ static void renderDebugOverlay(
                 }
             }
             bgfx::dbgTextPrintf(2, 14, valAttr,
-                "Probes: %d  (white=nearest, cyan=%d kept, red=%d noRoom, magenta=%d unreach, yellow=%d isolated, size=%.1fft)",
-                probeCount, kept, noRoom, unreach, isolated, state.probeMarkerSize);
+                "Probes: %d refl  (cyan=%d kept (2x size=active), red=%d noRoom, "
+                "magenta=%d unreach, yellow=%d isolated, size=%.2fft) | "
+                "pathing cubes share show_probe_radius coloring "
+                "(green=LOS, red=occluded, gray=out-of-range)",
+                probeCount, kept, noRoom, unreach, isolated,
+                state.probeMarkerSize * 0.25f);
         } else {
             bgfx::dbgTextPrintf(2, 14, warnAttr,
                 "Probes: 0 positions loaded — run `bake_probes on` "
@@ -1658,6 +1886,188 @@ static void renderDebugOverlay(
             "Listener marker: %s (playerEmittedActive=%s)",
             markerVisibleThisFrame ? "VISIBLE this frame" : "hidden (no active player voice)",
             footActive ? "yes" : "no");
+    }
+
+    // ── Pathing-probe overlay (wireframe influence spheres) ──
+    //
+    // Separate from show_probes (cubes for both batches). Draws each
+    // pathing probe as a wireframe sphere sized to its adaptive
+    // influence radius so the Voronoi-ish placement is visible at a
+    // glance. Filtered by the camera-nearest rooms (shared with the
+    // room/portal overlay via debug_room_max_count) — without this
+    // filter the sphere mesh count tanks framerate in dense missions.
+    //
+    // Robust against early frames: getPathingProbeViz returns empty
+    // when the audio service isn't ready or the batch is empty; the
+    // roomID==-1 sentinel auto-filters out-of-room probes.
+    if (state.showProbeRadius) {
+        auto audioSvc = GET_SERVICE(Darkness::AudioService);
+        if (audioSvc) {
+            std::vector<Darkness::AudioService::PathingProbeViz> probes =
+                audioSvc->getPathingProbeViz();
+            if (!probes.empty()) {
+                // Resolve the camera-nearest-N room set to gate which
+                // probes are drawn. The room overlay uses size_t indices
+                // into state.roomDebug; we need real room IDs to match
+                // PathingProbeViz::roomID, so build that set first.
+                Darkness::Vector3 camPos(state.cam.pos[0],
+                                          state.cam.pos[1],
+                                          state.cam.pos[2]);
+                std::vector<size_t> nearest = selectClosestRooms(state, camPos);
+                std::unordered_set<int32_t> keepRooms;
+                keepRooms.reserve(nearest.size());
+                for (size_t idx : nearest) {
+                    if (idx < state.roomDebug.size()) {
+                        keepRooms.insert(state.roomDebug[idx].roomID);
+                    }
+                }
+
+                // Build line vertices: 3 orthogonal great circles per
+                // probe (XY, XZ, YZ), kSphereSegments segments each.
+                // Each circle = kSphereSegments line segments =
+                // 2×kSphereSegments verts. Per probe: 3 circles ×
+                // 2 × kSphereSegments verts.
+                constexpr uint32_t kSphereSegments = 32;
+                constexpr uint32_t kVertsPerCircle = kSphereSegments * 2;
+                constexpr uint32_t kVertsPerProbe  = kVertsPerCircle * 3;
+
+                // Filter probes first so the vertex budget is exact.
+                std::vector<const Darkness::AudioService::PathingProbeViz *> drawList;
+                drawList.reserve(probes.size());
+                for (const auto &p : probes) {
+                    if (p.roomID < 0) continue;       // BSP void
+                    if (!keepRooms.empty()
+                        && keepRooms.find(p.roomID) == keepRooms.end()) {
+                        continue;  // out of camera-nearest rooms
+                    }
+                    drawList.push_back(&p);
+                }
+
+                const uint32_t kMaxProbes = 256;  // 256 × 192 verts ≈ 49k verts
+                if (drawList.size() > kMaxProbes) drawList.resize(kMaxProbes);
+                const uint32_t needVerts =
+                    static_cast<uint32_t>(drawList.size()) * kVertsPerProbe;
+
+                // Hoisted out of the buffer-alloc block so the HUD
+                // line further down can read them even when the
+                // transient vertex buffer was rejected (low-budget
+                // frame). Updated in the per-probe classification
+                // loop inside the buffer block.
+                int nVisible = 0, nOccluded = 0, nOutOfRange = 0;
+                if (needVerts > 0
+                    && bgfx::getAvailTransientVertexBuffer(
+                            needVerts, Darkness::PosColorVertex::layout) >= needVerts) {
+                    bgfx::TransientVertexBuffer tvb;
+                    bgfx::allocTransientVertexBuffer(
+                        &tvb, needVerts, Darkness::PosColorVertex::layout);
+                    auto *verts = reinterpret_cast<Darkness::PosColorVertex *>(tvb.data);
+                    uint32_t numVerts = 0;
+
+                    // Per-probe layer-2 occlusion classification via
+                    // the shared file-scope helpers near the top of
+                    // this file (classifyPathingProbe +
+                    // probeStateToABGR). show_probes uses the same
+                    // helpers (with probeStateToRGBA) so the cube and
+                    // sphere for the same probe agree on color.
+                    // Counters live in the outer scope so the HUD line
+                    // below can read them even when the buffer alloc
+                    // failed.
+                    const Darkness::Vector3 listenerPos(state.cam.pos[0],
+                                                         state.cam.pos[1],
+                                                         state.cam.pos[2]);
+                    const size_t numAcousticTris =
+                        state.acousticIndices.size() / 3;
+                    const float *aVerts = state.acousticVerts.data();
+                    const int32_t *aIdx = state.acousticIndices.data();
+                    std::vector<uint32_t> probeColors;
+                    probeColors.reserve(drawList.size());
+                    for (const auto *p : drawList) {
+                        ProbeOccState s = classifyPathingProbe(
+                            listenerPos, p->position, p->radiusFt,
+                            aVerts, aIdx, numAcousticTris);
+                        switch (s) {
+                            case ProbeOccState::Visible:    ++nVisible;    break;
+                            case ProbeOccState::Occluded:   ++nOccluded;   break;
+                            case ProbeOccState::OutOfRange: ++nOutOfRange; break;
+                        }
+                        probeColors.push_back(probeStateToABGR(s));
+                    }
+
+                    const float twoPi = 6.28318530717958647692f;
+
+                    auto emitCircle = [&](const Darkness::Vector3 &c,
+                                          float r,
+                                          int planeAxis,
+                                          uint32_t color) {
+                        // planeAxis: 0=XY (z fixed), 1=XZ (y fixed),
+                        // 2=YZ (x fixed)
+                        for (uint32_t i = 0; i < kSphereSegments; ++i) {
+                            float t0 = (twoPi * i) / kSphereSegments;
+                            float t1 = (twoPi * (i + 1)) / kSphereSegments;
+                            float c0 = std::cos(t0), s0 = std::sin(t0);
+                            float c1 = std::cos(t1), s1 = std::sin(t1);
+                            Darkness::Vector3 a = c;
+                            Darkness::Vector3 b = c;
+                            if (planeAxis == 0) {
+                                a.x += r * c0; a.y += r * s0;
+                                b.x += r * c1; b.y += r * s1;
+                            } else if (planeAxis == 1) {
+                                a.x += r * c0; a.z += r * s0;
+                                b.x += r * c1; b.z += r * s1;
+                            } else {
+                                a.y += r * c0; a.z += r * s0;
+                                b.y += r * c1; b.z += r * s1;
+                            }
+                            verts[numVerts++] = { a.x, a.y, a.z, color };
+                            verts[numVerts++] = { b.x, b.y, b.z, color };
+                        }
+                    };
+
+                    for (size_t pi = 0; pi < drawList.size(); ++pi) {
+                        const auto *p = drawList[pi];
+                        uint32_t color = probeColors[pi];
+                        emitCircle(p->position, p->radiusFt, 0, color);
+                        emitCircle(p->position, p->radiusFt, 1, color);
+                        emitCircle(p->position, p->radiusFt, 2, color);
+                    }
+
+                    // Draw via view 2 (debug overlay), depth-disabled
+                    // so spheres remain visible through walls — matches
+                    // the existing show_probes cube overlay convention.
+                    float identity[16];
+                    bx::mtxIdentity(identity);
+                    bgfx::setTransform(identity);
+                    bgfx::setVertexBuffer(0, &tvb, 0, numVerts);
+                    uint64_t lineState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                                       | BGFX_STATE_PT_LINES;
+                    bgfx::setState(lineState);
+                    float opaque[4]    = {1.0f, 0.0f, 0.0f, 0.0f};
+                    float whiteLight[4]= {1.0f, 1.0f, 1.0f, 0.0f};
+                    float noFog[4]     = {0, 0, 0, 0};
+                    bgfx::setUniform(gpu.u_fogColor,    noFog);
+                    bgfx::setUniform(gpu.u_fogParams,   noFog);
+                    bgfx::setUniform(gpu.u_objectParams, opaque);
+                    bgfx::setUniform(gpu.u_objectLight,  whiteLight);
+                    bgfx::submit(2, gpu.flatProgram);
+                }
+
+                // HUD lines: probe counts + layer-2 occlusion
+                // classification breakdown. Colors match the legend:
+                // green = visible to listener, red = occluded by
+                // acoustic mesh (would be dropped by Steam Audio's
+                // `checkOcclusion`), gray = out of influence sphere
+                // (layer 1 would cull before layer 2 ran).
+                bgfx::setDebug(BGFX_DEBUG_TEXT);
+                bgfx::dbgTextPrintf(2, 16, 0x0F,
+                    "Pathing probes: %zu total, %zu drawn (room filter: "
+                    "%zu rooms via debug_room_max_count)",
+                    probes.size(), drawList.size(), keepRooms.size());
+                bgfx::dbgTextPrintf(2, 17, 0x0F,
+                    "  layer-2 occl: %d visible (green), %d occluded "
+                    "(red), %d out-of-range (gray)",
+                    nVisible, nOccluded, nOutOfRange);
+            }
+        }
     }
 }
 
@@ -2779,6 +3189,16 @@ static void registerConsoleSettings(
         [&state]() { return state.showProbes; },
         [&state](bool v) { state.showProbes = v; },
         "Probe grid (cyan; orange=nearest) + yellow listener flash on each footstep");
+
+    dbgConsole.addBool("show_probe_radius",
+        [&state]() { return state.showProbeRadius; },
+        [&state](bool v) { state.showProbeRadius = v; },
+        "Overlay each pathing probe's influence radius as a wireframe "
+        "sphere. Companion to show_probes (cubes). Both overlays share "
+        "the camera-nearest-rooms cull (debug_room_max_count) so cubes "
+        "and spheres appear in sync; both also share the layer-2 "
+        "occlusion coloring (red=ray-blocked, green=LOS, gray=out-of-"
+        "range), so a pathing probe's cube and sphere always agree.");
 
     dbgConsole.addFloat("probe_marker_size", 0.1f, 10.0f,
         [&state]() { return state.probeMarkerSize; },
@@ -4038,10 +4458,11 @@ int main(int argc, char *argv[]) {
         audioSvc->setProbeSpacingFt(cfg.audioProbeSpacingFt);
         audioSvc->setProbeHeightFt(cfg.audioProbeHeightFt);
         audioSvc->setProbeElevations(cfg.audioProbeElevations);
-        audioSvc->setProbePortalRings(cfg.audioProbePortalRings);
         audioSvc->setProbeMinWallClearanceFt(cfg.audioProbeMinWallClearanceFt);
         audioSvc->setProbeElevationSparsityMul(cfg.audioProbeElevationSparsityMul);
         audioSvc->setProbeGlobalDedupRadiusFt(cfg.audioProbeGlobalDedupRadiusFt);
+        audioSvc->setPathingProbeBatchEnabled(cfg.audioPathingProbesEnabled);
+        audioSvc->setPathingDedupRadiusFt(cfg.audioPathingDedupRadiusFt);
 
         // -- audio.occlusion --
         audioSvc->setOcclusionRadius(cfg.occlusionRadius);
@@ -4941,12 +5362,15 @@ int main(int argc, char *argv[]) {
 
     updateTitleBar(window, state);
 
-    // ── Auto-bake probes if needed (with progress bar) ──
-    if (state.probeBakeNeeded) {
-        Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
-        runBakeWithProgressBar(window, state, audioSvc, state.probeBakePath);
-        state.probeBakeNeeded = false;
-    }
+    // NOTE: auto-bake is intentionally deferred past door registration
+    // below — the bake reads mDoorAudioInstances (registered immediately
+    // after the LoopService block) to (1) classify which portals are
+    // doors so it can emit pair-probes flanking them, and (2) reject
+    // any candidate probe whose position falls inside a door OBB. Both
+    // become silent no-ops if the bake runs before doors are registered,
+    // which is the easy regression to introduce when moving these blocks
+    // around. See the corresponding `if (state.probeBakeNeeded)` block
+    // below the door-registration block.
 
     // ── Set up LoopService for priority-ordered frame dispatch ──
     //
@@ -4997,6 +5421,21 @@ int main(int argc, char *argv[]) {
                     audioForBlocking->setDoorTransform(objID, xform);
                 });
         }
+    }
+
+    // ── Auto-bake probes if needed (with progress bar) ──
+    // Intentionally placed AFTER door registration: AudioService::bakeProbes
+    // reads mDoorAudioInstances to (1) classify portals as door-flanking
+    // (which pushes a pair of probes ±portal-normal instead of one at the
+    // centroid) and (2) reject any candidate probe whose final position
+    // falls inside a door's world-AABB (the "probe-in-door-OBB" sound-
+    // bypass pathology). Both checks are silent no-ops if mDoorAudioInstances
+    // is empty, so reordering this block above registerDoorGeometry above
+    // regresses the bake topology without any error message.
+    if (state.probeBakeNeeded) {
+        Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+        runBakeWithProgressBar(window, state, audioSvc, state.probeBakePath);
+        state.probeBakeNeeded = false;
     }
 
     // Apply initial blocking for all doors that start closed.

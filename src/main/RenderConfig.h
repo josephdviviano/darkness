@@ -127,11 +127,6 @@ struct RenderConfig {
     // pathing coverage for wall-mounted torches and ceiling lamps. Default
     // {10.0} covers wall-height emitters. Empty = floor-only (legacy).
     std::vector<float> audioProbeElevations = { 10.0f };
-    // Add a 4-probe ring (±0.5 m on the portal plane) around each
-    // RoomService portal centroid. Densifies the pathing visibility
-    // graph at doorways so cross-room chains route through the doorway
-    // rather than wrapping around through grid probes on either side.
-    bool audioProbePortalRings = true;
     // Bake-time validity filter. Drops any probe candidate that either
     //   (a) doesn't sit inside any room (BSP void / inside solid), or
     //   (b) is within this many engine feet of the nearest room wall.
@@ -153,6 +148,29 @@ struct RenderConfig {
     // conservative — catches obvious overlaps without eating into the
     // 5 ft grid spacing. 0 = dedup disabled. Requires a re-bake.
     float audioProbeGlobalDedupRadiusFt = 2.0f;
+
+    // -- audio.pathing_probes: sparse ROOM_PORTAL pathing batch --
+    //
+    // Splits pathing probes onto a separate Steam Audio probe batch
+    // (sparse ROOM_PORTAL graph: one probe per room centroid, two per
+    // portal). Reflection probes remain dense (UNIFORMFLOOR + elevation
+    // + portal axes + emitter) for high-quality IR sampling.
+    //
+    // The cost of Steam Audio's `findAlternatePaths` is roughly quadratic
+    // in probe count when dynamic geometry (e.g. door OBBs) invalidates
+    // baked paths at runtime; a sparse pathing batch keeps that cost
+    // microsecond-scale. Disable to revert to single-batch baking (the
+    // .probes file will then contain only the reflection batch and
+    // runtime pathing falls back to the synthetic-bypass branch).
+    bool audioPathingProbesEnabled = true;
+
+    // Proximity dedup radius for the PATHING batch only (engine feet).
+    // Applied after all pathing-candidate emission (portal, centroid,
+    // emitter). 10 ft handles the typical compound-doorway / sub-room
+    // clusters in Thief 2 levels without dropping legitimately distinct
+    // probes. 0 disables the pass. Separate from `global_dedup_radius_ft`,
+    // which only affects the dense reflection batch.
+    float audioPathingDedupRadiusFt = 10.0f;
 
     // -- audio.occlusion: occlusion + material scaling --
     // (diffuseSamples / bakeDiffuseSamples moved to realtimeDiffuseSamples /
@@ -234,8 +252,8 @@ struct RenderConfig {
     // "wind from outside" still leans in the right direction but doesn't
     // feel like a laser pointer.
     float ambEnvironmentalSpatialBlend = 0.3f;  // (0.0–1.0)
-    // Global linear multiplier applied to every ambient + spot-ambient
-    // voice's per-frame volume. Compensates for the loudness re-baseline
+    // Global linear multiplier applied to every ambient voice's per-frame
+    // volume. Compensates for the loudness re-baseline
     // introduced when Steam Audio became the sole player-audio propagation
     // authority (centibel falloff curve over schema radius retired). One
     // knob, default 1.0 = no change. Tune by ear.
@@ -587,9 +605,6 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                         }
                     }
                 }
-                if (prb["portal_rings"]) {
-                    cfg.audioProbePortalRings = prb["portal_rings"].as<bool>();
-                }
                 if (prb["min_wall_clearance_ft"]) {
                     cfg.audioProbeMinWallClearanceFt =
                         prb["min_wall_clearance_ft"].as<float>();
@@ -615,6 +630,20 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                         cfg.audioProbeGlobalDedupRadiusFt = 0.0f;
                     if (cfg.audioProbeGlobalDedupRadiusFt > 10.0f)
                         cfg.audioProbeGlobalDedupRadiusFt = 10.0f;
+                }
+            }
+
+            // -- audio.pathing_probes --
+            if (YAML::Node pp = audio["pathing_probes"]) {
+                if (pp["enabled"])
+                    cfg.audioPathingProbesEnabled = pp["enabled"].as<bool>();
+                if (pp["dedup_radius_ft"]) {
+                    cfg.audioPathingDedupRadiusFt =
+                        pp["dedup_radius_ft"].as<float>();
+                    if (cfg.audioPathingDedupRadiusFt < 0.0f)
+                        cfg.audioPathingDedupRadiusFt = 0.0f;
+                    if (cfg.audioPathingDedupRadiusFt > 30.0f)
+                        cfg.audioPathingDedupRadiusFt = 30.0f;
                 }
             }
 

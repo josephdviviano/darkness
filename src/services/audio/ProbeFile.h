@@ -25,13 +25,29 @@
 /// @file ProbeFile.h
 /// Probe file format with integrity checking for baked acoustic probe data.
 ///
+/// === Version 2 (current) — multi-batch container ===
+///
 /// File layout (all fields little-endian):
-///   [0..3]   magic     "DKPr" (0x72504B44)
-///   [4..7]   version   format version (currently 1)
-///   [8..11]  probeCount  expected number of probes in the payload
-///   [12..15] payloadSize size of the Steam Audio serialized blob in bytes
-///   [16..19] crc32     CRC-32 of the payload bytes (ISO 3309 / zlib polynomial)
-///   [20..19+payloadSize]  payload (opaque Steam Audio probe batch data)
+///   [0..3]   magic       "DKPr" (0x72504B44)
+///   [4..7]   version     format version (currently 2)
+///   [8..11]  batchCount  number of probe batches that follow
+///   [12..15] totalProbes total probe count across all batches (sanity)
+///   [16..19] reserved    zero
+///
+/// Followed by `batchCount` batch records, each:
+///   [0..3]   purpose     ProbePurpose enum (0=Reflections, 1=Pathing)
+///   [4..7]   probeCount  probe count in this batch
+///   [8..11]  payloadSize size of the Steam Audio serialized blob in bytes
+///   [12..15] crc32       CRC-32 of the payload bytes
+///   [16..15+payloadSize] payload (opaque Steam Audio probe batch data)
+///
+/// === Version 1 (legacy) — single batch, no longer accepted ===
+///
+/// Pre-multi-batch files used a flat header { magic, version=1, probeCount,
+/// payloadSize, crc32 } followed by a single payload. loadProbeFile returns
+/// UnsupportedVersion for these; the user must delete the .probes file and
+/// re-bake. The format is unrecoverable because we cannot determine whether
+/// the single batch held reflections-only, pathing-only, or both.
 
 #include <array>
 #include <cstdint>
@@ -69,19 +85,39 @@ inline uint32_t crc32(const uint8_t *data, size_t length) {
 // ── Probe file header ─────────────────────────────────────────────────────
 
 static constexpr uint32_t kProbeFileMagic   = 0x72504B44u; // "DKPr" little-endian
-static constexpr uint32_t kProbeFileVersion = 1u;
+static constexpr uint32_t kProbeFileVersion = 2u;
 static constexpr size_t   kProbeFileHeaderSize = 20u;       // 5 x uint32_t
+static constexpr size_t   kProbeBatchRecordHeaderSize = 16u; // 4 x uint32_t
 
-/// On-disk probe file header. All fields are little-endian uint32_t.
+/// On-disk multi-batch file header (v2). All fields are little-endian uint32_t.
 struct ProbeFileHeader {
     uint32_t magic       = kProbeFileMagic;
     uint32_t version     = kProbeFileVersion;
+    uint32_t batchCount  = 0;
+    uint32_t totalProbes = 0;
+    uint32_t reserved    = 0;
+};
+static_assert(sizeof(ProbeFileHeader) == kProbeFileHeaderSize,
+              "ProbeFileHeader must be exactly 20 bytes");
+
+/// On-disk per-batch record header (v2). One precedes each batch payload.
+struct ProbeBatchRecordHeader {
+    uint32_t purpose     = 0;   // ProbePurpose (0=Reflections, 1=Pathing)
     uint32_t probeCount  = 0;
     uint32_t payloadSize = 0;
     uint32_t crc32       = 0;
 };
-static_assert(sizeof(ProbeFileHeader) == kProbeFileHeaderSize,
-              "ProbeFileHeader must be exactly 20 bytes");
+static_assert(sizeof(ProbeBatchRecordHeader) == kProbeBatchRecordHeaderSize,
+              "ProbeBatchRecordHeader must be exactly 16 bytes");
+
+/// Single in-memory probe batch read from disk. Matches one
+/// ProbeBatchRecordHeader + payload pair.
+struct ProbeBatchRecord {
+    uint32_t              purpose = 0;
+    uint32_t              probeCount = 0;
+    uint32_t              crc32 = 0;
+    std::vector<uint8_t>  payload;
+};
 
 /// Validation result for loadProbeFile / validateProbeFile.
 enum class ProbeFileStatus {
@@ -112,40 +148,45 @@ inline const char *probeFileStatusString(ProbeFileStatus s) {
 
 // ── Write ─────────────────────────────────────────────────────────────────
 
-/// Write a probe file with header + integrity envelope.
+/// Write a multi-batch probe file with header + per-batch integrity envelopes.
 /// Uses atomic write (tmp file + rename) so a crash never leaves a corrupt file.
 ///
 /// @param outputPath   Final destination path (e.g. "mission.probes")
-/// @param payload      Serialized Steam Audio probe batch data
-/// @param payloadSize  Size of the payload in bytes
-/// @param probeCount   Number of probes (stored in header for sanity checking on load)
+/// @param batches      Vector of per-batch records; CRC is computed per batch.
 /// @return true on success
 inline bool writeProbeFile(const std::string &outputPath,
-                           const uint8_t *payload, size_t payloadSize,
-                           uint32_t probeCount)
+                           const std::vector<ProbeBatchRecord> &batches)
 {
-    // Build header
+    // Build outer header
     ProbeFileHeader hdr;
-    hdr.probeCount  = probeCount;
-    hdr.payloadSize = static_cast<uint32_t>(payloadSize);
-    hdr.crc32       = crc32(payload, payloadSize);
+    hdr.batchCount = static_cast<uint32_t>(batches.size());
+    hdr.totalProbes = 0;
+    for (const auto &b : batches) hdr.totalProbes += b.probeCount;
 
-    // Write to a temporary file first (atomic write pattern)
     std::string tmpPath = outputPath + ".tmp";
     FILE *f = std::fopen(tmpPath.c_str(), "wb");
     if (!f) return false;
 
     bool ok = true;
 
-    // Write header
     if (std::fwrite(&hdr, sizeof(hdr), 1, f) != 1)
         ok = false;
 
-    // Write payload
-    if (ok && std::fwrite(payload, 1, payloadSize, f) != payloadSize)
-        ok = false;
+    for (const auto &batch : batches) {
+        if (!ok) break;
+        ProbeBatchRecordHeader rh;
+        rh.purpose     = batch.purpose;
+        rh.probeCount  = batch.probeCount;
+        rh.payloadSize = static_cast<uint32_t>(batch.payload.size());
+        rh.crc32       = crc32(batch.payload.data(), batch.payload.size());
 
-    // Flush to disk before rename
+        if (std::fwrite(&rh, sizeof(rh), 1, f) != 1) { ok = false; break; }
+        if (rh.payloadSize > 0 &&
+            std::fwrite(batch.payload.data(), 1, rh.payloadSize, f) != rh.payloadSize) {
+            ok = false; break;
+        }
+    }
+
     if (ok && std::fflush(f) != 0)
         ok = false;
 
@@ -167,58 +208,14 @@ inline bool writeProbeFile(const std::string &outputPath,
 
 // ── Read / Validate ───────────────────────────────────────────────────────
 
-/// Validate a probe file on disk without loading the full payload.
-/// Reads header + computes CRC of payload in streaming fashion.
-inline ProbeFileStatus validateProbeFile(const std::string &path) {
-    FILE *f = std::fopen(path.c_str(), "rb");
-    if (!f) return ProbeFileStatus::FileNotFound;
-
-    ProbeFileHeader hdr;
-    if (std::fread(&hdr, sizeof(hdr), 1, f) != 1) {
-        std::fclose(f);
-        return ProbeFileStatus::FileTooSmall;
-    }
-
-    if (hdr.magic != kProbeFileMagic) {
-        std::fclose(f);
-        return ProbeFileStatus::BadMagic;
-    }
-
-    if (hdr.version != kProbeFileVersion) {
-        std::fclose(f);
-        return ProbeFileStatus::UnsupportedVersion;
-    }
-
-    // Verify file has enough bytes for the declared payload
-    std::fseek(f, 0, SEEK_END);
-    long fileSize = std::ftell(f);
-    if (fileSize < 0 ||
-        static_cast<size_t>(fileSize) != kProbeFileHeaderSize + hdr.payloadSize) {
-        std::fclose(f);
-        return ProbeFileStatus::SizeMismatch;
-    }
-
-    // Read payload and verify CRC
-    std::fseek(f, kProbeFileHeaderSize, SEEK_SET);
-    std::vector<uint8_t> payload(hdr.payloadSize);
-    if (std::fread(payload.data(), 1, hdr.payloadSize, f) != hdr.payloadSize) {
-        std::fclose(f);
-        return ProbeFileStatus::ReadError;
-    }
-    std::fclose(f);
-
-    if (crc32(payload.data(), payload.size()) != hdr.crc32)
-        return ProbeFileStatus::CrcMismatch;
-
-    return ProbeFileStatus::Ok;
-}
-
-/// Load a probe file from disk, validating integrity.
-/// On success, outPayload contains the raw Steam Audio blob and
-/// outHeader contains the validated header (including probe count).
+/// Load a multi-batch probe file from disk, validating CRC for each batch.
+/// On success, `outHeader` carries the outer header and `outBatches` carries
+/// one entry per probe batch. Legacy v1 files return UnsupportedVersion —
+/// the caller must surface a clear "delete and re-bake" message.
 inline ProbeFileStatus loadProbeFile(const std::string &path,
                                      ProbeFileHeader &outHeader,
-                                     std::vector<uint8_t> &outPayload) {
+                                     std::vector<ProbeBatchRecord> &outBatches) {
+    outBatches.clear();
     FILE *f = std::fopen(path.c_str(), "rb");
     if (!f) return ProbeFileStatus::FileNotFound;
 
@@ -237,27 +234,30 @@ inline ProbeFileStatus loadProbeFile(const std::string &path,
         return ProbeFileStatus::UnsupportedVersion;
     }
 
-    // Verify file size matches header
-    std::fseek(f, 0, SEEK_END);
-    long fileSize = std::ftell(f);
-    if (fileSize < 0 ||
-        static_cast<size_t>(fileSize) != kProbeFileHeaderSize + outHeader.payloadSize) {
-        std::fclose(f);
-        return ProbeFileStatus::SizeMismatch;
-    }
-
-    // Read payload
-    std::fseek(f, kProbeFileHeaderSize, SEEK_SET);
-    outPayload.resize(outHeader.payloadSize);
-    if (std::fread(outPayload.data(), 1, outHeader.payloadSize, f) != outHeader.payloadSize) {
-        std::fclose(f);
-        return ProbeFileStatus::ReadError;
+    outBatches.reserve(outHeader.batchCount);
+    for (uint32_t i = 0; i < outHeader.batchCount; ++i) {
+        ProbeBatchRecordHeader rh;
+        if (std::fread(&rh, sizeof(rh), 1, f) != 1) {
+            std::fclose(f);
+            return ProbeFileStatus::FileTooSmall;
+        }
+        ProbeBatchRecord rec;
+        rec.purpose    = rh.purpose;
+        rec.probeCount = rh.probeCount;
+        rec.crc32      = rh.crc32;
+        rec.payload.resize(rh.payloadSize);
+        if (rh.payloadSize > 0 &&
+            std::fread(rec.payload.data(), 1, rh.payloadSize, f) != rh.payloadSize) {
+            std::fclose(f);
+            return ProbeFileStatus::ReadError;
+        }
+        if (crc32(rec.payload.data(), rec.payload.size()) != rh.crc32) {
+            std::fclose(f);
+            return ProbeFileStatus::CrcMismatch;
+        }
+        outBatches.push_back(std::move(rec));
     }
     std::fclose(f);
-
-    // Verify CRC
-    if (crc32(outPayload.data(), outPayload.size()) != outHeader.crc32)
-        return ProbeFileStatus::CrcMismatch;
 
     return ProbeFileStatus::Ok;
 }

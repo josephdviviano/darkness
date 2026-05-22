@@ -390,6 +390,18 @@ struct RuntimeState {
     // since the whole point is correlating listener-to-probe distance with
     // perceived footstep loudness.
     bool  showProbes        = false;
+    // Pathing-probe influence-radius overlay — complementary to
+    // showProbes (which draws CUBES for all probes). When true, render
+    // each pathing probe's influence sphere as a wireframe. Both
+    // overlays use the same camera-nearest-rooms culling
+    // (`debugRoomMaxCount`) so the cube and its sphere appear /
+    // disappear together as the listener moves. Both also use the
+    // same layer-2 occlusion classification (red = ray-blocked by
+    // acoustic mesh, green = clear LOS to listener, gray = listener
+    // outside influence sphere), so when both are on the cube and
+    // sphere change colour together. Toggle via `show_probe_radius`
+    // in the debug console.
+    bool  showProbeRadius   = false;
     float probeMarkerSize   = 1.0f;   // half-extent of the cube in feet
     // Cull probes farther than this from the listener before submitting.
     // Each probe is its own bgfx draw call; at high bake densities (thousands

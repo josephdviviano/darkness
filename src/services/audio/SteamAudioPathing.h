@@ -45,15 +45,56 @@ namespace Darkness {
 /// pathology.
 constexpr float kPathingVisThreshold = 0.1f;
 
-/// Probe-influence visibility radius (meters). Used by BOTH bake
-/// (IPLPathBakeParams::radius) and runtime
-/// (IPLSimulationInputs::visRadius); runtime values below the bake
-/// radius cause iplSimulatorRunPathing to fail finding an entry probe
-/// for sources placed off-probe, returning eqCoeffs=[0,0,0] (full
-/// pathing failure).
+/// Sampling-sphere radius (engine feet) used by Steam Audio's pathing
+/// visibility test (`path_visibility.cpp:50-91` — to determine
+/// probe-to-probe visibility, Steam Audio scatters numSamples points
+/// inside a sphere of this radius around each probe and traces
+/// numSamples² rays against the acoustic scene). Used by BOTH bake
+/// (`IPLPathBakeParams::radius`) and runtime
+/// (`IPLSimulationInputs::visRadius`). MUST be identical at bake and
+/// runtime; otherwise edges baked at one radius are silently rejected
+/// by the runtime visibility check and pathing collapses to the 0.1f
+/// untouched-by-solver sentinel.
+///
+/// IMPORTANT — what this is NOT:
+///   • This is NOT the per-probe `influence.radius` (IPLSphere.radius).
+///     That is the listener/source containment sphere used by
+///     `ProbeBatch::getInfluencingProbes` (probe_tree.cpp:158) to
+///     decide which probes a listener/source binds to.
+///     `influence.radius` is set per-probe in AudioService.cpp's
+///     adaptive-radius pass — they are independent dials.
+///   • This radius does NOT determine whether sound can bypass doors.
+///     Door-blocking is enforced by the acoustic-mesh ray test
+///     (`scene.isOccluded` in path_visibility.cpp:67/73/76): the door
+///     OBB lives in the acoustic scene, so any ray cast through the
+///     sampling spheres that would cross a closed door hits the OBB
+///     and is counted as occluded. Two probes' sampling spheres can
+///     overlap a door OBB on opposite sides — every ray between them
+///     still goes through the OBB and the visibility edge is rejected.
+///
+/// Past sessions tried to make this small "so the sphere doesn't
+/// bridge across a door OBB". That reasoning was wrong — the OBB
+/// blocks rays, not spheres. Larger values give the bake more samples
+/// to find a clear line of sight through doorways and around corners,
+/// improving graph robustness against mesh seams and small artifacts.
+///
+/// Matches Steam Audio's Unity default of `bakingVisibilityRadius =
+/// 1.0 m` (~3.28 ft). At numSamples=4 that's 16 rays per probe-pair
+/// test, spread across a 1 m sphere — robust without being expensive.
+constexpr float kPathingVisRadiusFt = 3.28f;
+
+/// Legacy helper: returns the fixed `kPathingVisRadiusFt × kFeetToMeters`
+/// regardless of its `spacingFt` argument. The argument is preserved
+/// only to minimize call-site churn; new code should reference
+/// `kPathingVisRadiusFt` directly. Both bake and runtime call sites
+/// MUST agree (verified inline at each call site — see
+/// ProbeManager.cpp::bakePathingBatch and
+/// AudioService.cpp::loopStep pathing-source setup).
+/// @deprecated use kPathingVisRadiusFt directly.
 inline float pathingVisRadiusMeters(float spacingFt)
 {
-    return spacingFt * kFeetToMeters;
+    (void)spacingFt;
+    return kPathingVisRadiusFt * kFeetToMeters;
 }
 
 struct PathingDspMapping {

@@ -325,19 +325,30 @@ struct PropSchLastSa {
     int32_t value;
 };
 
-// P$SpotAmbient — dtype: SpotAmb, 12 bytes.
-// Alternative ambient-sound encoding with a hard inner/outer falloff
-// envelope. Unlike P$AmbientHack (which uses a single radius), spot
-// ambients have:
-//   • inner radius   — distance up to which the ambient plays at the
-//                      `ambient` level (constant).
-//   • outer radius   — beyond this distance the ambient is silent.
-//   • Between inner and outer it linearly interpolates toward 0.
-// The `ambient` field is the volume scalar (1.0 = nominal).
-struct PropSpotAmb {
-    float inner;
-    float outer;
-    float ambient;
+// P$SpotlightAndAmbient — dtype: SpotAmb, 12 bytes. RENDERER property.
+//
+// Despite the audio-sounding "Ambient" name and the field names below, this
+// is a *lighting* property in the original engine — `g_SpotlightAndAmbientProp`
+// in the renderer's light-property table, paired with P$Light + P$Spotlight
+// to encode a spotlight that ALSO emits an omnidirectional ambient term.
+// The field names were lifted from an OPDE-era dtype guess that confused
+// this with sound data; semantically it is the same 3-float vector the
+// engine reads as a spotlight cone with an ambient brightness override.
+//
+// Field meanings (per the original engine's CalcSpotlightVec consumer):
+//   • innerAngleDeg     — inner cone half-angle (degrees); fully lit inside
+//   • outerAngleDeg     — outer cone half-angle (degrees); dark outside
+//   • ambientBrightness — overrides the base light's brightness for the
+//                         omnidirectional (ambient) component when this
+//                         spotlight is the "SpotlightAndAmbient" variant
+//
+// TODO(lighting): SpotlightAndAmbient is not yet implemented on the renderer
+// side. The struct sits here as a stub so callers parse the bytes correctly
+// once the feature lands. See TASKS.TODO.md "SpotlightAndAmbient lighting".
+struct PropSpotlightAndAmbient {
+    float innerAngleDeg;
+    float outerAngleDeg;
+    float ambientBrightness;
 };
 
 // P$Heartbeat — dtype: Heartbeat, 4 bytes.
