@@ -351,21 +351,9 @@ inline ObjectPropData parseObjectProps(PropertyService *propSvc,
                      sizeof(placement.modelName) - 1);
         placement.modelName[15] = '\0';
 
-        // Look up scale directly on this object (P$Scale does not inherit).
-        // Dark Engine's P$Scale property uses kPropertyNoInherit — archetype
-        // scales are physics bounding box dimensions, not visual model scales.
-        // We use ownsProperty() to check direct ownership only.
-        placement.scaleX = 1.0f;
-        placement.scaleY = 1.0f;
-        placement.scaleZ = 1.0f;
-        if (ownsProperty(propSvc, "ModelScale", id)) {
-            PropScale scale;
-            if (getTypedProperty<PropScale>(propSvc, "ModelScale", id, scale)) {
-                placement.scaleX = scale.x;
-                placement.scaleY = scale.y;
-                placement.scaleZ = scale.z;
-            }
-        }
+        // Scale was already resolved into posMap above via the P$Scale loop
+        // that runs before filtering (kPropertyNoInherit — direct ownership
+        // only). `placement = pos` carries it through.
 
         // Resolve render alpha through PropertyService inheritance.
         // RenderAlpha DOES inherit ("always" inheritance mode).

@@ -285,8 +285,14 @@ static bool loadMissionData(const char *misPath,
     // Find player spawn point from L$PlayerFactory + P$Position chunks
     mission.spawnInfo = Darkness::findSpawnPoint(misPath);
 
-    // Parse animated light properties from mission database
-    mission.lightSources = Darkness::parseAnimLightProperties(misPath);
+    // Parse animated light properties via PropertyService — single source
+    // of truth for the on-disk PropAnimLight layout (shared with prop-dump).
+    {
+        Darkness::PropertyServicePtr lightPropSvc =
+            GET_SERVICE(Darkness::PropertyService);
+        mission.lightSources =
+            Darkness::parseAnimLightProperties(lightPropSvc.get());
+    }
 
     // Build reverse index: lightnum → list of (cellIdx, polyIdx) affected
     mission.animLightIndex = Darkness::buildAnimLightIndex(mission.wrData);

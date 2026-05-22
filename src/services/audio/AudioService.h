@@ -36,6 +36,7 @@
 #include "audio/AudioUnits.h"
 #include "audio/SchemaTypes.h"
 #include "room/RoomService.h"  // SoundPropInfo / SoundPropParams / SoundPathHop
+#include "worldquery/WorldQueryTypes.h"  // RayHit (for diagnostic raycaster setter)
 
 #include <atomic>
 #include <condition_variable>
@@ -362,6 +363,21 @@ public:
      *  coalesced once per loopStep after reflection-sim is drained. */
     void setDoorTransform(int32_t doorObjID, const Matrix4 &worldTransform);
 
+    /** Debug overlay accessor — returns world-space triangle data for all
+     *  registered doors. Used by the renderer's `show_door_geometry`
+     *  wireframe overlay to visualize geometry the acoustic scene sees
+     *  beyond the static BSP mesh. Each `DoorMesh` packs vertices already
+     *  transformed into world space (engine feet, ready for direct GPU
+     *  upload) plus the index list. Recomputed live — door pose changes
+     *  reach the overlay on the next frame. Returns an empty vector when
+     *  no doors are registered or the acoustic scene isn't built. */
+    struct DebugDoorMesh {
+        int32_t                objID = 0;
+        std::vector<float>     worldVertices;  ///< flat float3 array, engine feet
+        std::vector<uint32_t>  indices;
+    };
+    std::vector<DebugDoorMesh> getDoorGeometryForDebug() const;
+
     /** Load sound resources from a Thief 2 RES directory.
      *  Opens snd.crf and prepares the sound cache.
      *  Called from DarknessRender.cpp after services are bootstrapped.
@@ -415,6 +431,22 @@ public:
      *  after the service is bootstrapped. */
     void setSoundPathLineOfSightFn(
         std::function<bool(const Vector3 &a, const Vector3 &b)> fn);
+
+    /** Diagnostic-only raycaster: returns true on hit, populates `hit`.
+     *
+     *  Used by the [PATH] periodic|spike diagnostic to answer "does our own
+     *  BSP raycaster agree that the line from a SPIKE'd voice to its nearest
+     *  probe is blocked?" — distinguishes "source in solid / wall in the
+     *  way" from "Steam Audio mesh interpretation differs from ours". Not
+     *  on any hot path; only fires inside an already-gated log block.
+     *
+     *  Renderer-supplied (WR data lives in the renderer). Call once after
+     *  the service is bootstrapped. Safe to leave unset — the diagnostic
+     *  reports -1 in that case. */
+    using AudioRaycastFn = std::function<bool(const Vector3 &from,
+                                              const Vector3 &to,
+                                              RayHit &hit)>;
+    void setRaycaster(AudioRaycastFn fn) { mRaycaster = std::move(fn); }
 
     /** Play a footstep sound for a specific material and speed.
      *  Selects a schema via env_tag matching: (Event Footstep) + (Material <keyword>).
@@ -865,6 +897,19 @@ public:
         NoRoom      = 1,  ///< roomFromPoint returned null (BSP void)
         Unreachable = 2,  ///< Has a room, but no mapper-placed object's
                           ///< portal-graph component touches it
+        Isolated    = 3,  ///< Spatially isolated — no other probe within
+                          ///< Steam Audio's probe-visibility radius
+                          ///< (= probeSpacingFt × probeIsolationMul, default
+                          ///< 1.5x). Steam Audio's pathing solver cannot
+                          ///< form a visibility edge from a probe without
+                          ///< nearby neighbors, so any source associated
+                          ///< with it returns the 0.1f sentinel forever.
+                          ///< Heuristic — does NOT test line-of-sight: a
+                          ///< probe with nearby neighbors but blocked LOS
+                          ///< will still classify as Kept yet fail at
+                          ///< runtime. Mostly catches isolated emitter-
+                          ///< anchored probes whose nudge landed away from
+                          ///< the rest of the grid.
     };
     const std::vector<ProbeFate> &getProbeFates() const { return mProbeFates; }
 
@@ -992,6 +1037,12 @@ private:
     // setBlockingFactor, getBlockingFactor) that forward to it; the
     // per-voice loopStep path reads / mutates it directly via this owner.
     std::unique_ptr<class SoundPropagation> mSoundPropagation;
+
+    // ── Diagnostic raycaster (renderer-injected) ──
+    // Used by the [PATH] periodic|spike block to verify whether a SPIKE'd
+    // voice's nearest-probe LOS is actually blocked by world geometry.
+    // Not on any hot path; only fires inside the gated diagnostic block.
+    AudioRaycastFn mRaycaster;
 
     // ── Volumetric occlusion configuration ──
     //
@@ -1280,6 +1331,13 @@ private:
         IPLScene         subScene      = nullptr;
         IPLStaticMesh    staticMesh    = nullptr;
         IPLInstancedMesh instancedMesh = nullptr;
+        /// Cached for the show_door_geometry debug overlay. Local-space
+        /// (door-relative) vertex floats + index triples, plus the current
+        /// world transform. Updated by setDoorTransform alongside the IPL
+        /// instance transform so the overlay sees doors in their live pose.
+        std::vector<float>    localVertices;
+        std::vector<int32_t>  indices;
+        Matrix4               worldTransform{1.0f};
     };
     std::unordered_map<int32_t, DoorAudioInstance> mDoorAudioInstances;
 

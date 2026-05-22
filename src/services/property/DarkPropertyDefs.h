@@ -100,8 +100,9 @@ struct PropLightColor {
 };
 
 // P$AnimLight — dtype: AnimLight, inheritor: archetype, 76 bytes
-// Already parsed in LightingSystem.h — this struct matches the on-disk format
-// for reference and future use via TypedProperty
+// Sole on-disk representation used by all consumers (LightingSystem,
+// DarknessHeadless prop-dump). Read via getTypedProperty<PropAnimLight>(...)
+// so layout drift can't desync parsers reading the same bytes.
 struct PropAnimLight {
     int32_t unk1;
     float offsetX, offsetY, offsetZ;
@@ -123,6 +124,9 @@ struct PropAnimLight {
     uint32_t quadLit;        // bool32
     float innerRadius;
 };
+static_assert(sizeof(PropAnimLight) == 76,
+    "PropAnimLight must match the 76-byte on-disk layout exactly — "
+    "every consumer memcpy's directly from PropertyService raw bytes");
 
 // ============================================================================
 // Physics properties (Phase 2)

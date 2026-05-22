@@ -36,16 +36,15 @@
 
 #pragma once
 
-#include "File.h"
-#include "FileGroup.h"
-#include "FileCompat.h"
 #include "WRChunkParser.h"
+#include "property/PropertyService.h"
+#include "property/DarkPropertyDefs.h"
+#include "property/TypedProperty.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -94,198 +93,197 @@ struct LightSource {
     bool isRising;             // true = brightening, false = dimming
     bool inactive;             // true = light is inactive/paused
     float prevIntensity;       // for dirty detection (0.0-1.0)
+
+    // Computed at parse time per the original engine's InitModes() logic
+    // (see GEN.SCR AnimLight). Scripts that turn the light on or off pick
+    // the per-light on/off mode here — never the hardcoded MAX/ZERO — so
+    // FLICKER, SMOOTH, RANDOM authoring survives a turn-on round-trip.
+    uint16_t onLiteMode;
+    uint16_t offLiteMode;
 };
+
+// Compute per-light on/off modes from the authored mode. Direct port of
+// the original engine's AnimLight script InitModes() semantics:
+//   mode == MIN          → off=MIN,        on=MAX            (alarm-style)
+//   mode == BRIGHTEN/DIM → off=DIM,        on=BRIGHTEN       (one-shot fade pair)
+//   mode == anything     → off=ZERO,       on=mode           (preserve FLICKER, etc.)
+inline void computeLiteModes(LightSource &ls) {
+    uint16_t mode = ls.mode;
+    uint16_t offmode, onmode;
+
+    if (mode == ANIM_MIN_BRIGHT) {
+        offmode = ANIM_MIN_BRIGHT;
+    } else if (mode == ANIM_BRIGHTEN || mode == ANIM_DIM) {
+        offmode = ANIM_DIM;
+    } else {
+        offmode = ANIM_ZERO;
+    }
+
+    if (mode != offmode) {
+        // Authored mode is the on-mode — this is the path that preserves
+        // FLICKER, RANDOM, SEMI_RANDOM, MAX, FLIP, SMOOTH as the activated
+        // animation. Anything that's not MIN/BRIGHTEN/DIM lands here.
+        onmode = mode;
+    } else {
+        // mode == offmode means the authored mode is intrinsically "off"
+        // (MIN or DIM). Fall back to the canonical opposite.
+        if (offmode == ANIM_DIM)
+            onmode = ANIM_BRIGHTEN;
+        else  // ANIM_MIN_BRIGHT
+            onmode = ANIM_MAX_BRIGHT;
+    }
+
+    ls.onLiteMode = onmode;
+    ls.offLiteMode = offmode;
+}
+
+// Switch a light to a new mode and prime brightness/countdown so the
+// updateLightAnimation tick picks up cleanly. Called by LightScriptService
+// for runtime on/off transitions (and shared with the parser's initial
+// brightness logic). Centralized so the mode → brightness mapping has one
+// source of truth.
+inline void setLiteMode(LightSource &ls, uint16_t newMode) {
+    ls.mode = newMode;
+    switch (newMode) {
+        case ANIM_MIN_BRIGHT:
+            ls.brightness = ls.minBright;
+            break;
+        case ANIM_ZERO:
+            ls.brightness = 0.0f;
+            break;
+        case ANIM_MAX_BRIGHT:
+            ls.brightness = ls.maxBright;
+            break;
+        case ANIM_BRIGHTEN:
+            // One-shot fade up — start at min so the animation has range to run.
+            ls.brightness = ls.minBright;
+            ls.isRising = true;
+            ls.countdown = ls.brightenTime;
+            break;
+        case ANIM_DIM:
+            // One-shot fade down — start at max.
+            ls.brightness = ls.maxBright;
+            ls.isRising = false;
+            ls.countdown = ls.dimTime;
+            break;
+        default:
+            // Animating modes (FLIP, SMOOTH, RANDOM, SEMI_RANDOM, FLICKER):
+            // start at max; updateLightAnimation drives subsequent values.
+            ls.brightness = ls.maxBright;
+            break;
+    }
+}
 
 // ── AnimLight property parser ──
 //
-// Reads P$AnimLight records (76 bytes each) from the mission file.
-// Also reads P$Position to get world position for each light object
-// (useful for future volumetric/dynamic lighting).
+// Iterates objects that own P$AnimLight via PropertyService and builds a
+// LightSource per record. Reads P$Position similarly for world position
+// (light position = object position + AnimLight.offset).
 //
-// P$AnimLight on-disk layout (76 bytes):
-//   int32  unk1              (offset 0)
-//   float3 offset            (offset 4)
-//   int32  unk2              (offset 16)
-//   int16  cellindex         (offset 20)
-//   int16  hitcells          (offset 22)
-//   int16  lightnum          (offset 24)
-//   uint16 mode              (offset 26)
-//   int32  brightentime_ms   (offset 28)
-//   int32  dimtime_ms        (offset 32)
-//   float  minbrightness     (offset 36)
-//   float  maxbrightness     (offset 40)
-//   int32  unk4              (offset 44)
-//   bool32 rising            (offset 48)
-//   int32  countdown_ms      (offset 52)
-//   bool32 inactive          (offset 56)
-//   float  radius            (offset 60)
-//   int32  unk5              (offset 64)
-//   bool32 quadlit           (offset 68)
-//   float  innerradius       (offset 72)
+// Layout details live in PropAnimLight (DarkPropertyDefs.h). Both this
+// parser and DarknessHeadless's prop-dump memcpy from the same raw bytes
+// via getTypedProperty<PropAnimLight>, so the two views cannot drift.
 
 inline std::unordered_map<int16_t, LightSource>
-parseAnimLightProperties(const std::string &misPath)
+parseAnimLightProperties(PropertyService *propSvc)
 {
     std::unordered_map<int16_t, LightSource> lights;
-
-    FilePtr fp(new StdFile(misPath, File::FILE_R));
-    FileGroupPtr db(new DarkFileGroup(fp));
-
-    // First pass: read P$Position for all objects so we can look up light positions
-    std::unordered_map<int32_t, std::array<float, 3>> positions;
-    if (db->hasFile("P$Position")) {
-        FilePtr posFile = db->getFile("P$Position");
-        while (static_cast<size_t>(posFile->tell()) + 8 <= posFile->size()) {
-            uint32_t objID, dataSize;
-            *posFile >> objID >> dataSize;
-
-            if (dataSize >= 12) {
-                float px, py, pz;
-                *posFile >> px >> py >> pz;
-                positions[static_cast<int32_t>(objID)] = {px, py, pz};
-                // Skip remaining bytes in this record
-                if (dataSize > 12)
-                    posFile->seek(dataSize - 12, File::FSEEK_CUR);
-            } else if (dataSize > 0) {
-                posFile->seek(dataSize, File::FSEEK_CUR);
-            }
-        }
+    if (!propSvc) {
+        std::fprintf(stderr, "[FALLBACK] parseAnimLightProperties: propSvc=null\n");
+        return lights;
     }
 
-    // Second pass: read P$AnimLight properties
-    const char *chunkName = "P$AnimLigh"; // truncated to 11 chars (10 + null)
-    if (!db->hasFile(chunkName)) {
-        // Try full name in case of different truncation
-        chunkName = "P$AnimLight";
-        if (!db->hasFile(chunkName)) {
-            std::fprintf(stderr, "LightingSystem: no P$AnimLight chunk found\n");
-            return lights;
-        }
-    }
-
-    FilePtr animFile = db->getFile(chunkName);
-
-    // P$ property records: {uint32_t objID, uint32_t dataSize, data[dataSize]}
+    auto objIDs = getAllObjectsWithProperty(propSvc, "AnimLight");
     int parsed = 0;
-    while (static_cast<size_t>(animFile->tell()) + 8 <= animFile->size()) {
-        uint32_t objID, dataSize;
-        *animFile >> objID >> dataSize;
+    for (int objID : objIDs) {
+        PropAnimLight prop{};
+        if (!getTypedProperty<PropAnimLight>(propSvc, "AnimLight", objID, prop))
+            continue;
 
-        if (dataSize >= 76) {
-            // Read the AnimLight struct fields
-            int32_t unk1;
-            float offsetX, offsetY, offsetZ;
-            int32_t unk2;
-            int16_t cellindex, hitcells, lightnum;
-            uint16_t mode;
-            int32_t brightentime, dimtime;
-            float minbrightness, maxbrightness;
-            int32_t unk4;
-            uint32_t rising;
-            int32_t countdown;
-            uint32_t inactive;
-            float radius;
-            int32_t unk5;
-            uint32_t quadlit;
-            float innerradius;
+        // Archetype records use lightNum=0 as the unauthored sentinel.
+        // Skip them — concrete instances re-author their own lightNum.
+        // (lightNum<0 is the original "invalid" sentinel from the engine.)
+        if (prop.lightNum <= 0) continue;
 
-            *animFile >> unk1;
-            *animFile >> offsetX >> offsetY >> offsetZ;
-            *animFile >> unk2;
-            *animFile >> cellindex >> hitcells >> lightnum;
-            *animFile >> mode;
-            *animFile >> brightentime >> dimtime;
-            *animFile >> minbrightness >> maxbrightness;
-            *animFile >> unk4;
-            *animFile >> rising;
-            *animFile >> countdown;
-            *animFile >> inactive;
-            *animFile >> radius;
-            *animFile >> unk5;
-            *animFile >> quadlit;
-            *animFile >> innerradius;
+        LightSource ls{};
+        ls.lightNum = prop.lightNum;
+        ls.objectId = objID;
 
-            // Skip remaining bytes if dataSize > 76
-            if (dataSize > 76)
-                animFile->seek(dataSize - 76, File::FSEEK_CUR);
-
-            // Skip lights with invalid lightnum
-            if (lightnum < 0) continue;
-
-            LightSource ls;
-            ls.lightNum = lightnum;
-            ls.objectId = static_cast<int32_t>(objID);
-
-            // Get world position from P$Position + offset
-            auto posIt = positions.find(ls.objectId);
-            if (posIt != positions.end()) {
-                ls.posX = posIt->second[0] + offsetX;
-                ls.posY = posIt->second[1] + offsetY;
-                ls.posZ = posIt->second[2] + offsetZ;
-            } else {
-                ls.posX = offsetX;
-                ls.posY = offsetY;
-                ls.posZ = offsetZ;
-                std::fprintf(stderr, "[FALLBACK] LightingSystem: light %d (obj %d) has no P$Position, using offset only (%.1f,%.1f,%.1f)\n",
-                             lightnum, ls.objectId, offsetX, offsetY, offsetZ);
-            }
-
-            ls.radius = radius;
-            ls.innerRadius = innerradius;
-            ls.mode = mode;
-            ls.brightenTime = brightentime / 1000.0f; // ms → seconds
-            ls.dimTime = dimtime / 1000.0f;
-            ls.minBright = minbrightness;
-            ls.maxBright = maxbrightness;
-            ls.isRising = (rising != 0);
-            ls.inactive = (inactive != 0);
-            ls.countdown = countdown / 1000.0f;
-
-            // Initialize brightness based on mode and state
-            switch (mode) {
-                case ANIM_MIN_BRIGHT:
-                    ls.brightness = ls.minBright;
-                    break;
-                case ANIM_ZERO:
-                    ls.brightness = 0.0f;
-                    break;
-                case ANIM_MAX_BRIGHT:
-                    ls.brightness = ls.maxBright;
-                    break;
-                case ANIM_DIM:
-                    // Start at max, will dim over time
-                    ls.brightness = ls.isRising ? ls.minBright : ls.maxBright;
-                    break;
-                case ANIM_BRIGHTEN:
-                    // Start at min, will brighten over time
-                    ls.brightness = ls.isRising ? ls.maxBright : ls.minBright;
-                    break;
-                default:
-                    // For animated modes, start based on rising/dimming state
-                    ls.brightness = ls.isRising ? ls.minBright : ls.maxBright;
-                    break;
-            }
-
-            // Set initial countdown if not loaded from save
-            if (ls.countdown <= 0.0f) {
-                ls.countdown = ls.isRising ? ls.brightenTime : ls.dimTime;
-                std::fprintf(stderr, "[DEFAULT] LightingSystem: light %d countdown<=0, set to %.3fs (%s)\n",
-                             lightnum, ls.countdown, ls.isRising ? "brightenTime" : "dimTime");
-            }
-
-            // Compute initial intensity for dirty tracking
-            if (ls.maxBright <= 0.0f) {
-                std::fprintf(stderr, "[DEFAULT] LightingSystem: light %d maxBright=%.3f <= 0, prevIntensity defaulting to 0.0\n",
-                             lightnum, ls.maxBright);
-            }
-            ls.prevIntensity = (ls.maxBright > 0.0f)
-                ? ls.brightness / ls.maxBright : 0.0f;
-
-            lights[lightnum] = ls;
-            ++parsed;
-        } else if (dataSize > 0) {
-            animFile->seek(dataSize, File::FSEEK_CUR);
+        // World position = P$Position + AnimLight.offset. PropertyService
+        // resolves archetype inheritance for Position automatically.
+        PropPosition pos{};
+        if (getTypedProperty<PropPosition>(propSvc, "Position", objID, pos)) {
+            ls.posX = pos.x + prop.offsetX;
+            ls.posY = pos.y + prop.offsetY;
+            ls.posZ = pos.z + prop.offsetZ;
+        } else {
+            ls.posX = prop.offsetX;
+            ls.posY = prop.offsetY;
+            ls.posZ = prop.offsetZ;
+            std::fprintf(stderr,
+                "[FALLBACK] LightingSystem: light %d (obj %d) has no Position, "
+                "using AnimLight.offset alone (%.1f,%.1f,%.1f)\n",
+                (int)prop.lightNum, objID, prop.offsetX, prop.offsetY, prop.offsetZ);
         }
+
+        ls.radius = prop.radius;
+        ls.innerRadius = prop.innerRadius;
+        ls.mode = prop.mode;
+        ls.brightenTime = prop.brightenTime / 1000.0f; // ms → seconds
+        ls.dimTime = prop.dimTime / 1000.0f;
+        ls.minBright = prop.minBrightness;
+        ls.maxBright = prop.maxBrightness;
+        ls.isRising = (prop.rising != 0);
+        ls.inactive = (prop.inactive != 0);
+        ls.countdown = prop.countdown / 1000.0f;
+
+        // Initialize brightness based on mode and state. Kept here (not via
+        // setLiteMode) because the parser must respect the on-disk `rising`
+        // bit for BRIGHTEN/DIM/SMOOTH state restoration — runtime activate()
+        // chooses its own direction.
+        switch (prop.mode) {
+            case ANIM_MIN_BRIGHT:
+                ls.brightness = ls.minBright;
+                break;
+            case ANIM_ZERO:
+                ls.brightness = 0.0f;
+                break;
+            case ANIM_MAX_BRIGHT:
+                ls.brightness = ls.maxBright;
+                break;
+            case ANIM_DIM:
+                ls.brightness = ls.isRising ? ls.minBright : ls.maxBright;
+                break;
+            case ANIM_BRIGHTEN:
+                ls.brightness = ls.isRising ? ls.maxBright : ls.minBright;
+                break;
+            default:
+                ls.brightness = ls.isRising ? ls.minBright : ls.maxBright;
+                break;
+        }
+
+        // Set initial countdown if not loaded from save
+        if (ls.countdown <= 0.0f) {
+            ls.countdown = ls.isRising ? ls.brightenTime : ls.dimTime;
+        }
+
+        if (ls.maxBright <= 0.0f) {
+            std::fprintf(stderr,
+                "[DEFAULT] LightingSystem: light %d maxBright=%.3f <= 0, "
+                "prevIntensity defaulting to 0.0\n",
+                (int)prop.lightNum, ls.maxBright);
+        }
+        ls.prevIntensity = (ls.maxBright > 0.0f)
+            ? ls.brightness / ls.maxBright : 0.0f;
+
+        // Compute on/off modes per the original engine's InitModes logic.
+        // LightScriptService::activate/deactivate use these instead of
+        // hardcoded MAX/ZERO so authored FLICKER/RANDOM/SMOOTH survive
+        // a turn-on round-trip.
+        computeLiteModes(ls);
+
+        lights[prop.lightNum] = ls;
+        ++parsed;
     }
 
     // Count animated (non-static) lights and report details
@@ -299,8 +297,10 @@ parseAnimLightProperties(const std::string &misPath)
             inactiveCount++;
     }
 
-    std::fprintf(stderr, "LightingSystem: parsed %d AnimLight properties (%d animated, %d static, %d inactive)\n",
-                 parsed, animatedCount, parsed - animatedCount, inactiveCount);
+    std::fprintf(stderr,
+        "LightingSystem: parsed %d AnimLight properties "
+        "(%d animated, %d static, %d inactive)\n",
+        parsed, animatedCount, parsed - animatedCount, inactiveCount);
 
     return lights;
 }
