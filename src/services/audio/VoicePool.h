@@ -215,6 +215,40 @@ struct SteamAudioDSPNode {
     IPLReflectionEffectParams reflectionParams{};
     std::atomic<bool> reflectionsActive{false};
 
+    // Per-voice IPLPathEffect (Phase 4 — Steam Audio sole authority for
+    // player routing + attenuation). Created in initVoiceDSP for non-
+    // player-emitted voices, released in removeVoiceSource/~ActiveVoice
+    // symmetric to reflectionEffect. Configured with spatialize=IPL_TRUE +
+    // binaural per Valve's Unity reference; output is HRTF-binaural stereo
+    // that mixes additively into the dry bus on top of the direct binaural
+    // path. Null for player-emitted voices (the player IS the listener; the
+    // pathing graph collapses to a self-loop and the effect has nothing to
+    // route).
+    IPLPathEffect pathEffect = nullptr;
+
+    // Audio-thread targets for iplPathEffectApply. Written by the main
+    // thread each frame from iplSourceGetOutputs(...PATHING).pathing; read
+    // by the audio thread inside iplPathEffectApply. The shCoeffs pointer
+    // is owned by Steam Audio's internal staging buffer — we copy the
+    // params struct verbatim so the pointer is stable across the per-
+    // callback read window.
+    IPLPathEffectParams pathTargetParams{};
+    // True iff pathTargetParams currently holds a non-sentinel,
+    // non-default snapshot the audio thread is allowed to feed into
+    // iplPathEffectApply this callback. Set on every non-sentinel
+    // main-thread read; cleared on sentinel reads when the voice has
+    // never solved (synthetic-passthrough — path effect bypassed). When
+    // false, the audio thread skips iplPathEffectApply and the dry bus
+    // is the only output (the original engine's "fully unobstructed"
+    // baseline).
+    std::atomic<bool> pathTargetValid{false};
+
+    // Stereo scratch for iplPathEffectApply output. Allocated once in
+    // initVoiceDSP at frameSize × 2; mixed additively into the voice's
+    // dry stereoL/stereoR after the per-slot binaural pipeline.
+    std::vector<float> pathOutL;
+    std::vector<float> pathOutR;
+
     // Scratch buffers (allocated once at init, never reallocated — safe
     // for audio thread).
     std::vector<float> monoScratch;        // raw downmix, preserved for convolution
@@ -335,16 +369,17 @@ struct ActiveVoice {
     // never solve (bake/probe coverage problem).
     bool pathingEverSolved = false;
 
-    // Last good (non-sentinel) pathing DSP mapping for this voice.
-    // Cached on every successful pathing read; replayed on subsequent
-    // sentinel reads so the voice's level/LPF freeze at their last
-    // computed value instead of snapping to a synthetic bypass value.
-    // Eliminates the audible +6.7 dB level pop when pathing flickers
-    // between real-eq and sentinel (the "ambient stutter" pattern).
-    // Defaults zero-init; valid only when `pathingEverSolved == true`.
-    // Before first solve, fall back to the synthetic bypass behaviour.
-    float lastGoodPortalAttenuation = 0.0f;
-    float lastGoodPortalBlocking    = 0.0f;
+    // Last good (non-sentinel) IPLPathEffectParams snapshot for this voice
+    // (Phase 4 — moved from the eqCoeffs → scalar mapping level to the raw
+    // pathing-output level). Captured on every successful pathing read;
+    // replayed on subsequent sentinel reads so the path effect's spatial
+    // routing + eq stay frozen at their last computed values instead of
+    // snapping to a synthetic bypass. Eliminates the audible level/pan
+    // pop when pathing flickers between real-eq and sentinel (the
+    // "ambient stutter" pattern). Valid only when `pathingEverSolved ==
+    // true`; before first solve, the audio thread skips iplPathEffectApply
+    // entirely (synthetic passthrough — dry binaural is the only output).
+    IPLPathEffectParams lastGoodPathParams{};
 
     // Frame counters for sentinel-cause diagnostics. `loopStepsSinceSpawn`
     // counts every loopStep iteration since the voice entered the pool;
