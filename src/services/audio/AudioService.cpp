@@ -951,6 +951,14 @@ static WetBusBeatDetector sWetBeat;
 
 // ── Main thread + sim worker profiling ──
 static std::atomic<float> sLoopStepPeakMs{0.0f};      // peak loopStep total time (ms)
+// Companion histogram to sLoopStepPeakMs. The peak is the worst single
+// loopStep call since the last dump (useful for "did the main loop ever
+// stall?"); the histogram captures the p50/p95/p99 distribution over the
+// 5 s dump window (useful for "what's the typical main-loop cost?"). The
+// PLAN.AUDIO_REALTIME_ARCHITECTURE.md Phase 1 DoD asks for p99 < 16 ms
+// under normal load — this is the diagnostic that lets us verify it.
+// Writer: main thread (loopStep). Reader: main-thread periodic dump.
+static LatencyHistogram sPerfLoopStepMs;
 static std::atomic<float> sDirectSimPeakMs{0.0f};     // peak iplSimulatorRunDirect time (ms)
 // sReflSimPeakMs and sReflFramesRun moved to ReflectionSimulator.cpp (the
 // only thread that writes them). Declared extern here so the periodic dump
@@ -6864,12 +6872,16 @@ void AudioService::loopStep(float deltaTime)
     // (ambient volumes updated at top of loopStep, before simulation)
 
     // loopStep total time (main thread). Skipped when audio_log is off —
-    // see AudioLog.h.
+    // see AudioLog.h. Records into both the scalar peak (for the [Audio]
+    // summary's loop= field) and the histogram (for the [PERF loopStep]
+    // p50/p95/p99 dump). Together they answer "did we ever overrun?" and
+    // "where is main-thread time actually going?".
     if (profOn) {
         auto loopStepEnd = std::chrono::steady_clock::now();
         float ms = std::chrono::duration<float, std::milli>(loopStepEnd - loopStepStart).count();
         float prev = sLoopStepPeakMs.load(std::memory_order_relaxed);
         if (ms > prev) sLoopStepPeakMs.store(ms, std::memory_order_relaxed);
+        sPerfLoopStepMs.record(ms);
     }
 
     // Periodic per-voice state snapshot (~1 Hz, gated behind audio_log).
@@ -9183,6 +9195,11 @@ void AudioService::dumpAudioStatusPeriodic()
     auto dspP    = sPerfDspNodeMs.snapshotAndReset();
     auto mixP    = sPerfReflMixMs.snapshotAndReset();
     auto simP    = sPerfReflSimMs.snapshotAndReset();
+    // Main-thread loopStep distribution. PLAN.AUDIO_REALTIME_ARCHITECTURE.md
+    // Phase 1 DoD #2: p99 must stay under 16 ms even with multiple cross-room
+    // ambients active and doors animating. Snapshotted before the PERF lines
+    // below so it shares the same 5 s window as the rest.
+    auto loopP   = sPerfLoopStepMs.snapshotAndReset();
     LatencyHistogram::Percentiles applyP{}, sumP{}, decP{}, upP{}, iterP{};
     // H2 per-iter aggregate histograms — see ConvolutionSubWorker for rationale.
     LatencyHistogram::Percentiles maxApplyP{}, sumApplyP{}, residualP{};
@@ -9232,6 +9249,14 @@ void AudioService::dumpAudioStatusPeriodic()
         (unsigned long long)dspP.n, fmtMs(dspP.p50), fmtMs(dspP.p95), fmtMs(dspP.p99),
         (unsigned long long)mixP.n, fmtMs(mixP.p50), fmtMs(mixP.p95), fmtMs(mixP.p99),
         (unsigned long long)simP.n, fmtMs(simP.p50), fmtMs(simP.p95), fmtMs(simP.p99));
+    // [PERF loopStep] — main-thread AudioService::loopStep wall-clock
+    // distribution. Target: p99 < 16 ms (one 60-fps frame budget); p95 < 8
+    // ms for 120 fps headroom. p99 approaching the budget = the main loop
+    // is doing too much work synchronously; lever order in
+    // PLAN.AUDIO_REALTIME_ARCHITECTURE.md §7.
+    AUDIO_LOG(
+        "[PERF loopStep] n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+        (unsigned long long)loopP.n, fmtMs(loopP.p50), fmtMs(loopP.p95), fmtMs(loopP.p99));
     AUDIO_LOG(
         "[PERF worker] apply n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
         " | sum n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
