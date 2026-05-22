@@ -121,6 +121,13 @@ ActiveVoice::~ActiveVoice()
         iplReflectionEffectRelease(&dspNode.reflectionEffect);
         dspNode.reflectionEffect = nullptr;
     }
+    // Phase 4: release the per-voice IPLPathEffect symmetric to the
+    // reflection effect above. createVoiceSource/initVoiceDSP skipped
+    // creation for playerEmitted voices, so this is a no-op for them.
+    if (dspNode.pathEffect) {
+        iplPathEffectRelease(&dspNode.pathEffect);
+        dspNode.pathEffect = nullptr;
+    }
 
     // Destroy sound and decoder
     if (initialized) {
