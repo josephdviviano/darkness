@@ -5168,11 +5168,14 @@ void AudioService::loopStep(float deltaTime)
                                           && !voice->playerEmitted
                                           && !voice->skipPortalRouting;
 
-                // Legacy player-audio portal-eq path: room-BFS fills
+                // Legacy BFS path — only reachable when probe_pathing: false.
+                // Steam Audio is the shipping default routing authority for
+                // player audio; this branch exists for A/B comparison and
+                // may be removed in a future revision. The room-BFS fills
                 // portalAttenuation / portalBlocking via the prop.reached
-                // branches below. Gated off when Steam Audio pathing owns
-                // those fields (the shipping default), so the two backends
-                // don't compete to write the same dspNode fields.
+                // branches below; gated off when Steam Audio pathing owns
+                // those fields so the two backends don't compete to write
+                // the same dspNode fields.
                 SoundPropInfo prop{};
                 bool isCrossRoom = false;
                 if (!useSteamAudioPathing && mPortalRoutingEnabled
