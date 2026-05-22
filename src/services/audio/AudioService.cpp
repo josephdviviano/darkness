@@ -745,6 +745,16 @@ static IPLCoordinateSpace3 sPathListenerCoord = {
 /// this is a non-owning shared reference.
 static std::atomic<IPLHRTF> sPathHrtf{nullptr};
 
+/// Audio-thread-visible runtime ambisonics order for iplPathEffectApply.
+/// Must equal the path effect's create-time IPLPathEffectSettings::maxOrder
+/// (which we set to mAmbisonicsOrder); Steam Audio's internal rotate stage
+/// asserts the encoded SH buffer's channel count == numCoeffsForOrder(order).
+/// Published once at init alongside sPathHrtf; the audio thread reads it
+/// when staging the per-call IPLPathEffectParams::order so the cached
+/// pathTargetParams / lastGoodPathParams replays still carry a valid order
+/// even before the first solve writes one.
+static std::atomic<int> sPathAmbisonicsOrder{0};
+
 /// Silent-voice convolution skip threshold (in audio callbacks). Derived
 /// via `reflSilentSkipFrames()` (AudioUnits.h) from the live
 /// `realtime.duration`, reflection sample rate, and reflection frame
@@ -1455,6 +1465,18 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             // the solver returns a small-but-non-sentinel value across
             // all three bands. Conservative default per phonon.h.
             pp.normalizeEQ = IPL_TRUE;
+            // order MUST equal the path effect's create-time maxOrder
+            // (= mAmbisonicsOrder). Steam Audio's internal rotate stage
+            // asserts the encoded SH buffer's channel count matches
+            // numCoeffsForOrder(params.order). The solver normally writes
+            // this when pathingOrder is set on the source inputs (we set
+            // it to mAmbisonicsOrder when staging IPLSimulationInputs),
+            // but we override here as a belt-and-suspenders for any stale
+            // cached params struct that predates the runtime order —
+            // including lastGoodPathParams entries cached before a
+            // runtime ambisonics_order change, and the early-startup
+            // window before the first solve completes.
+            pp.order       = sPathAmbisonicsOrder.load(std::memory_order_acquire);
 
             // pp.hrtf may legitimately be null during shutdown — skip
             // the apply rather than crash inside Steam Audio.
@@ -3300,6 +3322,11 @@ bool AudioService::initSteamAudio()
     // iplPathEffectApply (binaural=true). Audio thread reads via atomic
     // load; main thread writes once at init and once at shutdown.
     sPathHrtf.store(mIplHrtf, std::memory_order_release);
+    // Publish the runtime ambisonics order so the audio thread can stamp
+    // it onto every IPLPathEffectParams it passes to iplPathEffectApply —
+    // must equal IPLPathEffectSettings::maxOrder used at create time, or
+    // Steam Audio's internal rotate stage asserts.
+    sPathAmbisonicsOrder.store(mAmbisonicsOrder, std::memory_order_release);
 
     // Probe baking/loading lives in ProbeManager (audio/ProbeManager.h).
     // It needs the IPL context and a hook to quiesce the reflection-sim
@@ -3680,6 +3707,15 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         simSettings.numDiffuseSamples = mRealtimeDiffuseSamples;
         simSettings.maxDuration = mRealtimeDuration;
         simSettings.maxOrder = mAmbisonicsOrder;
+        // Re-publish the runtime ambisonics order for the audio thread.
+        // initSteamAudio publishes this too, but at that point
+        // mAmbisonicsOrder is still the default (the level-load code path
+        // calls setAmbisonicsOrder AFTER bootstrapFinished → initSteamAudio
+        // runs, so the early publish always sees 0). The path effect is
+        // created later in initVoiceDSP with maxOrder=mAmbisonicsOrder, and
+        // the audio thread must stamp params.order to match — re-publish
+        // here, when mAmbisonicsOrder is final and the simulator agrees.
+        sPathAmbisonicsOrder.store(mAmbisonicsOrder, std::memory_order_release);
         // Reflection-sim source pool — every reverb voice (realtime or
         // baked) registers a source here, so it must be >= reverb_voices.
         // The 8 floor keeps a tiny safety margin for cap=0 edge cases.
@@ -3794,6 +3830,17 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             pathingSettings.flags = IPL_SIMULATIONFLAGS_PATHING;
             pathingSettings.sceneType = sceneTypeEnum;
             pathingSettings.maxNumSources = std::max(64, mMaxActiveVoicesCfg);
+            // maxOrder MUST equal IPLPathEffectSettings::maxOrder used at
+            // per-voice path-effect create time (both = mAmbisonicsOrder).
+            // The pathing solver writes pathingOut.pathing.shCoeffs sized to
+            // (maxOrder+1)^2; Steam Audio's internal rotate stage in
+            // iplPathEffectApply then asserts the encoded SH buffer's
+            // channel count matches numCoeffsForOrder(params.order). Phase
+            // 4 inherited a zero-init maxOrder from the pre-path-effect
+            // implementation — invisible at runtime ambisonics_order=0
+            // (default trivially holds), crashed inside Steam Audio at
+            // ambisonics_order>0.
+            pathingSettings.maxOrder = mAmbisonicsOrder;
             // Probe-to-probe visibility sampling count for pathing edge
             // validation. Steam Audio's Unity integration defaults to 4
             // for the BAKE equivalent (`bakingVisibilitySamples`); the
@@ -5575,7 +5622,19 @@ void AudioService::loopStep(float deltaTime)
                     // per-frame cost is controlled via `numVisSamples`
                     // and `visThreshold`, NOT by truncating the graph.
                     inputs.visRange = mPropagationMaxDist * kFeetToMeters;
-                    inputs.pathingOrder       = 0;
+                    // pathingOrder MUST equal the path effect's create-time
+                    // maxOrder (= mAmbisonicsOrder). The solver writes
+                    // pathingOut.pathing.shCoeffs sized to (pathingOrder+1)^2
+                    // and pathingOut.pathing.order = pathingOrder. The path
+                    // effect's internal ambisonics-rotate stage asserts
+                    // `in.numChannels() == numCoeffsForOrder(params.order)`,
+                    // so the per-call params.order must match the channel
+                    // count of the encoded SH buffer. Phase 4 inherited a
+                    // legacy pathingOrder=0 from the pre-path-effect
+                    // implementation (where pathing only drove eqCoeffs +
+                    // scalar collapse) — at runtime ambisonics_order > 0
+                    // that mismatch crashed inside iplPathEffectApply.
+                    inputs.pathingOrder       = mAmbisonicsOrder;
                     inputs.enableValidation   = IPL_TRUE;
                     // findAlternatePaths ON.
                     //
