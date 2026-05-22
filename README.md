@@ -9,17 +9,21 @@
 
 - CMake 3.21+
 - C++17 compiler (Clang, GCC, or MSVC)
-- Git (for vcpkg submodule)
+- Git
 
 Dependencies are managed automatically via [vcpkg](https://vcpkg.io/) manifest mode:
-bgfx, GLM, SDL2, zziplib, ODE, yaml-cpp, Catch2.
+bgfx, GLM, SDL2, zziplib, ODE, yaml-cpp, Catch2, miniaudio, steam-audio.
 
 ### Building
 
 ```bash
-# Clone with vcpkg submodule
-git clone --recursive https://github.com/example/darkness.git
+# Clone the darkness repo
+git clone <darkness-repo-url>
 cd darkness
+
+# Fetch and bootstrap vcpkg into ./vcpkg/ (gitignored)
+git clone https://github.com/microsoft/vcpkg.git vcpkg
+./vcpkg/bootstrap-vcpkg.sh   # or bootstrap-vcpkg.bat on Windows
 
 # Configure and build (Debug)
 cmake --preset default
@@ -29,6 +33,8 @@ cmake --build build/default
 cmake --preset release
 cmake --build build/release
 ```
+
+The `default` preset wires vcpkg in via `vcpkg/scripts/buildsystems/vcpkg.cmake`; no extra toolchain flag is needed.
 
 This produces two binaries:
 
@@ -52,21 +58,19 @@ Users must supply their own legally obtained game files. `darkness` does not inc
 
 #### World viewer (`darknessRender`)
 
+`--res` is required; it must point to a directory containing `fam.crf` and `obj.crf` (the Dark Engine textures and object models).
+
 ```bash
-# Flat-shaded (no external resources needed)
-darknessRender path/to/miss6.mis
-
-# Textured + lightmapped (requires Thief 2 RES directory with fam.crf)
+# Textured + lightmapped
 darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES
-
-# With bicubic lightmap filtering (smoother shadows)
-darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES --lightmap-filtering bicubic
 
 # With sound schemas (enables spatial audio)
 darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES --schemas /path/to/EDITOR/SCHEMA
 ```
 
-The `--res` path should point to a directory containing `fam.crf` and `obj.crf`, which hold the textures and object models used by Dark Engine levels. The `--schemas` path enables spatial audio by loading sound schemas. These can come from:
+All other tunables (lightmap filtering, water parameters, physics rate, debug overlays, etc.) live in the YAML config — see `darknessRender.example.yaml`.
+
+The `--schemas` path enables spatial audio by loading sound schemas. Resources and schemas can come from:
 
 1. **Mounted ISOs (macOS):** `hdiutil mount ../disk_images/thief_2_disk_1.iso` then `--res /Volumes/THIEF2_INSTALL_C/THIEF2/RES` and `--schemas /Volumes/THIEF2_CD2/EDITOR/SCHEMA`
 2. **GOG/Steam install directory:** `--res /path/to/Thief2/RES`
@@ -78,25 +82,9 @@ Settings can be specified in a YAML config file, via CLI flags, or changed at ru
 
 Copy `darknessRender.example.yaml` to `darknessRender.yaml` in your working directory, or use `--config <path>` to point to a custom config file. The YAML file has sections for `graphics`, `water`, `physics`, `audio`, and `developer` settings. See the example file for full documentation of all options, including spatial audio reflection parameters and the master bus DSP chain (limiter, compressor, EQ, ducking).
 
-#### Controls — Fly mode
+#### Controls — Physics mode (default)
 
-The default camera mode is fly (noclip). Switch between fly and physics mode via the debug console (`physics_mode`).
-
-| Key | Action |
-|-----|--------|
-| WASD | Move forward / left / back / right |
-| Mouse | Look around |
-| Space / Q | Move up |
-| LShift / E | Move down |
-| LCtrl | Sprint (3x speed) |
-| Scroll wheel | Adjust movement speed (shown in title bar) |
-| Home | Teleport to player spawn point |
-| ` (backtick) | Open debug console |
-| Esc | Quit |
-
-#### Controls — Physics mode
-
-Walk-on-ground mode with gravity, collision, jumping, crouching, and leaning. Enable via the debug console (`physics_mode` = on).
+Walk-on-ground mode with gravity, collision, jumping, crouching, and leaning. Toggle to fly mode via the debug console (`physics_mode` = off).
 
 | Key | Action |
 |-----|--------|
@@ -108,6 +96,23 @@ Walk-on-ground mode with gravity, collision, jumping, crouching, and leaning. En
 | C | Toggle crouch |
 | Q / E | Lean left / right |
 | Home | Teleport to player spawn point |
+| ` (backtick) | Open debug console |
+| Esc | Quit |
+
+#### Controls — Fly mode
+
+Noclip free-look camera. Enable via the debug console (`physics_mode` = off).
+
+| Key | Action |
+|-----|--------|
+| WASD | Move forward / left / back / right |
+| Mouse | Look around |
+| Space, Q | Move up |
+| LShift, E | Move down |
+| LCtrl | Sprint (3x speed) |
+| Scroll wheel | Adjust movement speed (shown in title bar) |
+| Home | Teleport to player spawn point |
+| ` (backtick) | Open debug console |
 | Esc | Quit |
 
 #### Debug console
@@ -176,29 +181,17 @@ Press **\` (backtick)** to open the in-game settings console. All runtime settin
 
 #### CLI reference
 
+The CLI is intentionally minimal — all runtime tunables live in the YAML config (see `darknessRender.example.yaml`) and can be changed live via the debug console.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `<mission.mis>` | *(required)* | Path to mission file |
-| `--res <path>` | *(none)* | Thief 2 RES directory (enables textured+lightmapped rendering) |
-| `--schemas <path>` | *(none)* | Path to schemas directory (sound schemas, etc.) |
+| `--res <path>` | *(required)* | Thief 2 RES directory containing `fam.crf` and `obj.crf` |
+| `--schemas <path>` | *(none)* | Path to schemas directory (enables spatial audio) |
 | `--config <path>` | `./darknessRender.yaml` | Path to YAML config file |
-| `--lightmap-filtering <mode>` | `bilinear` | Lightmap filtering: `bilinear` or `bicubic` |
-| `--filter` | off | Start with bilinear texture filtering (default: point) |
-| `--collision` | off | Start with camera collision enabled |
-| `--no-objects` | off | Disable object mesh rendering |
-| `--no-cull` | off | Start with portal culling disabled |
-| `--show-fallback` | off | Show colored cubes for objects with missing models |
-| `--force-flicker` | off | Force all animated lights to flicker mode |
-| `--linear-mips` | off | Gamma-correct mipmap generation |
-| `--sharp-mips` | off | Sharpen mip levels to preserve detail at distance |
-| `--physics-rate <hz>` | `60` | Physics timestep: `12` (vintage), `60` (modern), `120` (ultra) |
-| `--wave-amp <f>` | `0.3` | Water wave amplitude (0.0 - 10.0) |
-| `--uv-distort <f>` | `0.015` | Water UV distortion (0.0 - 0.1) |
-| `--water-rot <f>` | `0.015` | Water UV rotation speed in rad/s (0.0 - 1.0) |
-| `--water-scroll <f>` | `0.05` | Water UV scroll speed (0.0 - 1.0) |
-| `--step-log` | off | Log stair step diagnostics to stderr |
-| `--debug-objects` | off | Dump per-object filtering diagnostics to stderr |
-| `--help` | | Show help message |
+| `--help` / `-h` | | Show help message |
+
+Unknown flags are ignored with a warning.
 
 #### Mission inspector (`darknessHeadless`)
 
@@ -239,7 +232,7 @@ All original code in this repository is released under the GPLv3 license. See LI
 The Dark Engine and any associated trademarks are the property of their respective owners. The use of these names within this project is solely for purposes of identification and interoperability, and does not imply any claim of ownership or affiliation.
 
 ### Purpose
-This project exists to preserve access to The Dark Engine-based games on modern hardware and operating systems, in a context where the original software is no longer commercially available, maintained, or supported by its rights holders. It also aims to provide the opportunity for the fan community to extend the core functionality of the game to take advantage of modern hardware for non commercial purposes only.
+This project exists to preserve access to The Dark Engine-based games on modern hardware and operating systems, in a context where the original software is no longer maintained or supported by its rights holders. It also aims to provide the opportunity for the fan community to extend the core functionality of the game to take advantage of modern hardware for non commercial purposes only.
 
 ### Good Faith
 This project is developed and distributed in good faith, on a non-commercial basis, by volunteer contributors. Should any rights holder have concerns regarding this project, we welcome direct communication at [joseph at viviano dot ca] and are committed to addressing any legitimate concerns promptly and in good faith.

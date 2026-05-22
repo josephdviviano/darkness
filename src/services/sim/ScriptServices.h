@@ -433,7 +433,10 @@ struct LightScriptService {
                      objID, mode);
     }
 
-    /// Activate a light — set to max brightness mode and mark active.
+    /// Activate a light — switch to its per-light on-mode (computed at parse
+    /// time per the original engine's InitModes logic). Preserves authored
+    /// FLICKER/RANDOM/SMOOTH; only MIN/BRIGHTEN/DIM authoring promotes to
+    /// MAX/BRIGHTEN respectively.
     void activate(int32_t objID) {
         LightSource *ls = findByObjID(objID);
         if (!ls) {
@@ -441,17 +444,18 @@ struct LightScriptService {
             return;
         }
         float prevBright = ls->brightness;
+        uint16_t prevMode = ls->mode;
         ls->inactive = false;
-        ls->mode = ANIM_MAX_BRIGHT;
-        ls->brightness = ls->maxBright;
-        // Only mark dirty if brightness actually changed (avoid spurious
-        // re-blend on startup when lights are already at max brightness)
-        if (ls->brightness != prevBright) dirty = true;
-        std::fprintf(stderr, "[LightScriptService] activate(obj=%d) lightNum=%d brightness=%.2f\n",
-                     objID, ls->lightNum, ls->brightness);
+        setLiteMode(*ls, ls->onLiteMode);
+        if (ls->brightness != prevBright || ls->mode != prevMode) dirty = true;
+        std::fprintf(stderr,
+            "[LightScriptService] activate(obj=%d) lightNum=%d mode=%u brightness=%.2f\n",
+            objID, ls->lightNum, (unsigned)ls->mode, ls->brightness);
     }
 
-    /// Deactivate a light — set to zero brightness mode.
+    /// Deactivate a light — switch to its per-light off-mode. MIN-authored
+    /// alarm lights return to MIN (not ZERO), preserving their original
+    /// dim-when-idle semantics.
     void deactivate(int32_t objID) {
         LightSource *ls = findByObjID(objID);
         if (!ls) {
@@ -459,12 +463,13 @@ struct LightScriptService {
             return;
         }
         float prevBright = ls->brightness;
-        ls->mode = ANIM_ZERO;
-        ls->brightness = 0.0f;
-        ls->inactive = false;  // must remain active so the zero brightness is applied
-        if (ls->brightness != prevBright) dirty = true;
-        std::fprintf(stderr, "[LightScriptService] deactivate(obj=%d) lightNum=%d\n",
-                     objID, ls->lightNum);
+        uint16_t prevMode = ls->mode;
+        ls->inactive = false;  // must remain active so the off-mode is applied
+        setLiteMode(*ls, ls->offLiteMode);
+        if (ls->brightness != prevBright || ls->mode != prevMode) dirty = true;
+        std::fprintf(stderr,
+            "[LightScriptService] deactivate(obj=%d) lightNum=%d mode=%u brightness=%.2f\n",
+            objID, ls->lightNum, (unsigned)ls->mode, ls->brightness);
     }
 
     /// Set direct brightness value (0.0-1.0).

@@ -566,6 +566,49 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
                 }
             }
 
+            // Per-voice [REFLECTION_VOICE] diagnostic — periodic dump of
+            // every slot occupant's in/wet peak so the user can see at a
+            // glance which voices are getting reflection processing AND
+            // whether their wet output is non-silent. Helps diagnose the
+            // "I have dry off but only some voices come through" class
+            // of question: silent slots reveal weak baked IRs (probable
+            // V8-class isolation) without requiring a re-bake. Rate-
+            // limited at the per-worker level — each worker iteration
+            // covers ~1/4 of the live slot set, so 1-of-N gating per
+            // worker still produces a complete picture across a few
+            // seconds of log.
+            {
+                static std::atomic<int> sReflVoiceLogCount{0};
+                int n = sReflVoiceLogCount.fetch_add(1, std::memory_order_relaxed);
+                // ~once per (period × workers × slots) iterations. With 4
+                // workers × ~4 active slots × 100 callbacks/s ≈ 1600
+                // iterations/s, period=256 → about 6 emissions/s across
+                // all voices. Comfortable for log readability.
+                if ((n & 0xFF) == 0) {
+                    float inPeak = 0.0f;
+                    for (int s = 0; s < slot.reflFrameSize; ++s)
+                        inPeak = std::max(inPeak, std::fabs(slot.mono[s]));
+                    float wPeak = 0.0f;
+                    for (int s = 0; s < slot.reflFrameSize; ++s)
+                        wPeak = std::max(wPeak, std::fabs(sub.voiceAmbi0[s]));
+                    float inDb = inPeak > 1e-6f
+                               ? 20.0f * std::log10(inPeak) : -120.0f;
+                    float wDb  = wPeak  > 1e-6f
+                               ? 20.0f * std::log10(wPeak)  : -120.0f;
+                    const char *schema = slot.schemaCStr
+                                       ? slot.schemaCStr
+                                       : "(unknown)";
+                    AUDIO_LOG("[REFLECTION_VOICE] h=%d schema='%s' "
+                              "inPeak=%.4f (%.1fdB) wOutPeak=%.4f (%.1fdB) "
+                              "ratio=%.3f irSize=%d nch=%d w=%d slot=%d\n",
+                              slot.voiceHandle, schema,
+                              inPeak, inDb, wPeak, wDb,
+                              inPeak > 1e-6f ? wPeak / inPeak : 0.0f,
+                              slot.params.irSize, slot.params.numChannels,
+                              workerIdx, i);
+                }
+            }
+
             if (slot.isFootstepDiag) {
                 static std::atomic<int> sFootWetLogCount{0};
                 int n = sFootWetLogCount.fetch_add(1, std::memory_order_relaxed);

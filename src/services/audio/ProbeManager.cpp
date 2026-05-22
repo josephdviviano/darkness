@@ -378,6 +378,107 @@ bool ProbeManager::bakeProbes(IPLScene scene,
                   nudgedCount, rejectedCount);
     }
 
+    // ── Emitter-anchored pass ─────────────────────────────────────────
+    //
+    // Phase 4 made Steam Audio the sole authority for player audio
+    // routing. Voices outside the floor/elevation/portal grid's
+    // visibility radius (typical case: wall-mounted ambients whose
+    // P$Position resolves inside the visual wall mesh) get the 0.1f
+    // pathing sentinel forever and fall into the synthetic-bypass
+    // branch in AudioService — i.e. they bypass IPLPathEffect and
+    // play through IPLDirectEffect alone, which leaks through walls.
+    //
+    // Anchoring a probe at every persistent emitter closes that gap:
+    // the pathing solver associates the source with a real graph node
+    // and produces routed eqCoeffs. Subject to the global-dedup pass
+    // below so a grid probe that already covers the emitter wins.
+    if (!params.emitterPositions.empty()) {
+        const float dedupRadiusSq = params.portalDedupRadiusFt
+                                  * params.portalDedupRadiusFt;
+        const size_t preEmitterCount = mProbePositions.size();
+        const ProbeFilterFn &emitterFilter = params.emitterProbeFilter
+                                           ? params.emitterProbeFilter
+                                           : params.probeFilter;
+        int emitterAdded    = 0;
+        int emitterDeduped  = 0;
+        int emitterNudged   = 0;
+        int emitterRejected = 0;
+        // Per-emitter placement history. Logged after the pass so
+        // we can correlate each accepted emitter probe with its
+        // pre-placement candidate (did it land where the source is?
+        // how many nudges? what's its spatial neighborhood?).
+        struct EmitterRecord {
+            Vector3 candidate;
+            Vector3 placed;
+            int     iters;
+            size_t  probeIdx;  // index into mProbePositions
+        };
+        std::vector<EmitterRecord> placed;
+        placed.reserve(params.emitterPositions.size());
+        for (const Vector3 &p : params.emitterPositions) {
+            // Pass-local dedup against earlier-pass probes (floor /
+            // elevation / portal). Global dedup runs again below and
+            // covers cross-emitter overlap.
+            bool tooClose = false;
+            for (size_t i = 0; i < preEmitterCount; ++i) {
+                Vector3 d = mProbePositions[i] - p;
+                if (glm::dot(d, d) < dedupRadiusSq) { tooClose = true; break; }
+            }
+            if (tooClose) { ++emitterDeduped; continue; }
+            PlaceResult pr = tryPlaceProbe(p, emitterFilter);
+            if (!pr.ok) { ++emitterRejected; continue; }
+            if (pr.iters > 0) ++emitterNudged;
+            mProbePositions.push_back(pr.pos);
+            placed.push_back({ p, pr.pos, pr.iters, mProbePositions.size() - 1 });
+            ++extraProbeCount;
+            ++emitterAdded;
+        }
+        AUDIO_LOG("Added %d emitter-anchored probes "
+                  "(%zu candidates, %d deduped, %d nudged, %d rejected)\n",
+                  emitterAdded,
+                  params.emitterPositions.size(),
+                  emitterDeduped, emitterNudged, emitterRejected);
+
+        // Per-emitter diagnostic: report the placement history + the
+        // spatial neighborhood (number of OTHER probes within useful
+        // distances). Helps distinguish "spatially isolated in open
+        // space" (no neighbors within visibility range → solver can't
+        // form edges no matter the geometry) from "spatially packed
+        // but visibility-test failing" (many neighbors, but rays don't
+        // cross intervening geometry). Pre-global-dedup snapshot —
+        // the dedup below may further winnow the picture, but at this
+        // point we have every emitter we placed in the position
+        // record. Threshold counts: 5 ft = within Steam Audio's
+        // bakeParams.radius (probe sample sphere) — these probes
+        // overlap our emitter's sphere directly. 15 ft = within ~3
+        // spacings — visibility should be cheap. 30 ft = within ~6
+        // spacings — visibility possible but increasingly statistical.
+        const size_t totalSoFar = mProbePositions.size();
+        constexpr float kNear5Sq  =  5.0f *  5.0f;
+        constexpr float kNear15Sq = 15.0f * 15.0f;
+        constexpr float kNear30Sq = 30.0f * 30.0f;
+        for (const EmitterRecord &r : placed) {
+            int n5 = 0, n15 = 0, n30 = 0;
+            for (size_t i = 0; i < totalSoFar; ++i) {
+                if (i == r.probeIdx) continue;
+                Vector3 d = mProbePositions[i] - r.placed;
+                float sq = glm::dot(d, d);
+                if (sq < kNear5Sq)  ++n5;
+                if (sq < kNear15Sq) ++n15;
+                if (sq < kNear30Sq) ++n30;
+            }
+            float displacement = glm::length(r.placed - r.candidate);
+            AUDIO_LOG("[EMITTER_PROBE] idx=%zu cand=(%.1f,%.1f,%.1f) "
+                      "placed=(%.1f,%.1f,%.1f) displaced=%.1fft iters=%d "
+                      "neighbors n5=%d n15=%d n30=%d\n",
+                      r.probeIdx,
+                      r.candidate.x, r.candidate.y, r.candidate.z,
+                      r.placed.x, r.placed.y, r.placed.z,
+                      displacement, r.iters,
+                      n5, n15, n30);
+        }
+    }
+
     if (extraProbeCount > 0) {
         AUDIO_LOG("Probes after placement (pre-dedup): %zu "
                   "(floor=%d, extra=%d)\n",

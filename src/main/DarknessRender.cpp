@@ -957,6 +957,94 @@ static void renderDebugOverlay(
         bgfx::submit(2, gpu.flatProgram);
     }
 
+    // ── Door geometry wireframe overlay ──
+    // Orange line wireframe of all doors registered with the audio scene
+    // as IPLInstancedMesh. Doors are the only geometry source NOT in the
+    // static acoustic mesh — they're tracked separately so the bake's
+    // visibility-edge tests + runtime path-validation can re-evaluate
+    // them as the doors open/close. Visualizing them alongside
+    // show_acoustic_mesh gives the full picture of geometry the Steam
+    // Audio scene actually sees, which is useful when diagnosing why an
+    // emitter probe's pathing fails to form expected edges (look for
+    // closed doors between the probe and its neighbors).
+    if (state.showDoorGeometry) {
+        auto audioSvc = GET_SERVICE(Darkness::AudioService);
+        if (audioSvc) {
+            auto doors = audioSvc->getDoorGeometryForDebug();
+            if (!doors.empty()) {
+                // Build a transient line buffer from the door triangles.
+                // For each triangle (a,b,c) we emit three line segments
+                // (a,b)(b,c)(c,a) so the GPU draws a wireframe at LINES
+                // topology. Total line-vertex count = numTris * 6.
+                size_t totalLineVerts = 0;
+                for (const auto &d : doors) totalLineVerts += d.indices.size() * 2;
+                bgfx::VertexLayout layout;
+                layout.begin()
+                      .add(bgfx::Attrib::Position,
+                           3, bgfx::AttribType::Float)
+                      .end();
+                if (totalLineVerts > 0
+                    && bgfx::getAvailTransientVertexBuffer(
+                           static_cast<uint32_t>(totalLineVerts), layout)
+                       == totalLineVerts)
+                {
+                    bgfx::TransientVertexBuffer tvb;
+                    bgfx::allocTransientVertexBuffer(
+                        &tvb,
+                        static_cast<uint32_t>(totalLineVerts),
+                        layout);
+                    float *vp = reinterpret_cast<float *>(tvb.data);
+                    size_t out = 0;
+                    auto pushLine = [&](const float *a, const float *b) {
+                        vp[out * 3 + 0] = a[0];
+                        vp[out * 3 + 1] = a[1];
+                        vp[out * 3 + 2] = a[2];
+                        ++out;
+                        vp[out * 3 + 0] = b[0];
+                        vp[out * 3 + 1] = b[1];
+                        vp[out * 3 + 2] = b[2];
+                        ++out;
+                    };
+                    for (const auto &d : doors) {
+                        const float *V = d.worldVertices.data();
+                        const size_t numTris = d.indices.size() / 3;
+                        for (size_t t = 0; t < numTris; ++t) {
+                            const float *a = &V[d.indices[t * 3 + 0] * 3];
+                            const float *b = &V[d.indices[t * 3 + 1] * 3];
+                            const float *c = &V[d.indices[t * 3 + 2] * 3];
+                            pushLine(a, b);
+                            pushLine(b, c);
+                            pushLine(c, a);
+                        }
+                    }
+                    float identity[16];
+                    bx::mtxIdentity(identity);
+                    bgfx::setTransform(identity);
+                    bgfx::setVertexBuffer(0, &tvb, 0,
+                                          static_cast<uint32_t>(out));
+                    uint64_t wireState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                                       | BGFX_STATE_PT_LINES
+                                       | BGFX_STATE_BLEND_ALPHA
+                                       | BGFX_STATE_DEPTH_TEST_LESS;
+                    bgfx::setState(wireState);
+                    float noFog[4] = {0, 0, 0, 0};
+                    bgfx::setUniform(gpu.u_fogColor, noFog);
+                    bgfx::setUniform(gpu.u_fogParams, noFog);
+                    float opaqueParams[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+                    // Orange (RGB 1.0 / 0.55 / 0.0) — visually distinct
+                    // from the cyan acoustic mesh, the warm yellow probe
+                    // markers, and the red/magenta probe-reachability
+                    // tints. Doors usually appear singly so a single
+                    // distinctive color is enough.
+                    float doorTint[4] = {1.0f, 0.55f, 0.0f, 0.0f};
+                    bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+                    bgfx::setUniform(gpu.u_objectLight, doorTint);
+                    bgfx::submit(2, gpu.flatProgram);
+                }
+            }
+        }
+    }
+
     // ── Acoustic-mesh raycast highlighter ──
     // Casts a ray from the camera along the forward direction against the
     // stored acoustic triangles (CPU brute-force Möller-Trumbore) and
@@ -1403,7 +1491,7 @@ static void renderDebugOverlay(
         auto audioSvc = GET_SERVICE(Darkness::AudioService);
 
         // Probe scatter with reachability preview. Each probe gets one of
-        // four tints (depth disabled so the grid is visible through walls):
+        // five tints (depth disabled so the grid is visible through walls):
         //
         //   white   — nearest to listener (was orange; bumped to white so
         //             "active" reads as distinct from the warm reds below)
@@ -1412,6 +1500,11 @@ static void renderDebugOverlay(
         //   magenta — Unreachable (has a room, but isolated from playable
         //             space — would prune at bake-time even though IPL placed
         //             it on a real floor)
+        //   yellow  — Isolated (graph-isolated; Steam Audio's visibility
+        //             bake never formed an edge from this probe — populated
+        //             from runtime evidence: at least one voice associated
+        //             with this probe stayed in the 0.1f pathing sentinel
+        //             for > 30 loop-steps with no first-solve)
         //
         // Classification comes from AudioService::getProbeFates(), which is
         // populated by classifyProbeReachability() automatically after every
@@ -1445,6 +1538,7 @@ static void renderDebugOverlay(
             float keptTint[4]    = {0.0f, 0.8f, 1.0f, 0.0f};  // cyan
             float noRoomTint[4]  = {1.0f, 0.0f, 0.0f, 0.0f};  // red
             float unreachTint[4] = {0.9f, 0.0f, 0.7f, 0.0f};  // magenta
+            float isolatedTint[4]= {1.0f, 0.85f, 0.0f, 0.0f}; // yellow — graph-isolated (runtime evidence)
             float nearestTint[4] = {1.0f, 1.0f, 1.0f, 0.0f};  // white
             for (size_t i = 0; i < probes.size(); ++i) {
                 const auto &p = probes[i];
@@ -1479,6 +1573,8 @@ static void renderDebugOverlay(
                             tint = noRoomTint; break;
                         case Darkness::AudioService::ProbeFate::Unreachable:
                             tint = unreachTint; break;
+                        case Darkness::AudioService::ProbeFate::Isolated:
+                            tint = isolatedTint; break;
                         case Darkness::AudioService::ProbeFate::Kept:
                         default:
                             tint = keptTint; break;
@@ -1535,22 +1631,23 @@ static void renderDebugOverlay(
             // Break the count down by reachability bucket so the user can see
             // at a glance how many probes a future filter would prune without
             // having to scrub the stderr log.
-            int kept = 0, noRoom = 0, unreach = 0;
+            int kept = 0, noRoom = 0, unreach = 0, isolated = 0;
             if (audioSvc) {
                 const auto &fates = audioSvc->getProbeFates();
                 if (static_cast<int>(fates.size()) == probeCount) {
                     for (auto f : fates) {
                         switch (f) {
-                            case Darkness::AudioService::ProbeFate::Kept:        ++kept;    break;
-                            case Darkness::AudioService::ProbeFate::NoRoom:      ++noRoom;  break;
-                            case Darkness::AudioService::ProbeFate::Unreachable: ++unreach; break;
+                            case Darkness::AudioService::ProbeFate::Kept:        ++kept;     break;
+                            case Darkness::AudioService::ProbeFate::NoRoom:      ++noRoom;   break;
+                            case Darkness::AudioService::ProbeFate::Unreachable: ++unreach;  break;
+                            case Darkness::AudioService::ProbeFate::Isolated:    ++isolated; break;
                         }
                     }
                 }
             }
             bgfx::dbgTextPrintf(2, 14, valAttr,
-                "Probes: %d  (white=nearest, cyan=%d kept, red=%d noRoom, magenta=%d unreach, size=%.1fft)",
-                probeCount, kept, noRoom, unreach, state.probeMarkerSize);
+                "Probes: %d  (white=nearest, cyan=%d kept, red=%d noRoom, magenta=%d unreach, yellow=%d isolated, size=%.1fft)",
+                probeCount, kept, noRoom, unreach, isolated, state.probeMarkerSize);
         } else {
             bgfx::dbgTextPrintf(2, 14, warnAttr,
                 "Probes: 0 positions loaded — run `bake_probes on` "
@@ -2068,6 +2165,11 @@ static void registerConsoleSettings(
         [&state]() { return state.showAcousticMesh; },
         [&state](bool v) { state.showAcousticMesh = v; },
         "Cyan wireframe overlay of the acoustic scene geometry");
+
+    dbgConsole.addBool("show_door_geometry",
+        [&state]() { return state.showDoorGeometry; },
+        [&state](bool v) { state.showDoorGeometry = v; },
+        "Orange wireframe overlay of all doors registered with the audio scene (IPLInstancedMesh). Complements show_acoustic_mesh — doors are the only dynamic geometry contributing to Steam Audio's pathing graph and are NOT in the static acoustic mesh. Use to verify whether a probe's reported isolation correlates with a door OBB sitting between it and its neighbors.");
 
     dbgConsole.addBool("show_acoustic_hit",
         [&state]() { return state.showAcousticHit; },
@@ -3083,6 +3185,126 @@ static void updateLightmaps(
         objectIlluminator.setLightMultiplier(idx, it->second);
     }
 
+    // Once-per-second verification tick: prove the multiplier chain is
+    // actually animating. Per-vertex path (the default) has no other runtime
+    // diagnostic, so without this you can't tell whether the chain is dead
+    // or just running silently.
+    //
+    // The sampling deliberately PREFERS slots with animating modes (FLIP,
+    // SMOOTH, RANDOM, BRIGHTEN, DIM, SEMI_RANDOM, FLICKER) — iteration order
+    // surfaces static-mode lights first since MAX_BRIGHT is the editor
+    // default, and they would falsely look like "nothing's moving" if shown.
+    // Reports the global intensity min/max so even if all 3 sample slots
+    // happen to be static, you can see whether any slot anywhere is moving.
+    // Once at first tick, also dumps a mode-distribution histogram.
+    {
+        static int sTickFrame = 0;
+        static int sFps = 60;
+        static bool sHistogramDumped = false;
+        // Estimate frame rate from dt to roughly hit one-per-second.
+        if (dt > 1e-4f) sFps = std::max(1, std::min(240, (int)(1.0f / dt + 0.5f)));
+        if (++sTickFrame >= sFps) {
+            sTickFrame = 0;
+
+            // First-tick mode histogram (subset of animLightToStaticIdx — the
+            // actually-mapped lights, which is the set that matters for
+            // object lighting). LightSource-level histogram from
+            // parseAnimLightProperties() reports ALL parsed lights, but here
+            // we want only those that survived position-matching.
+            if (!sHistogramDumped) {
+                sHistogramDumped = true;
+                int counts[10] = {0};
+                int inactiveMapped = 0;
+                int badRange = 0;
+                for (const auto &[lightNum, idx] : mission.animLightToStaticIdx) {
+                    auto lsIt = mission.lightSources.find(lightNum);
+                    if (lsIt == mission.lightSources.end()) continue;
+                    int m = (int)lsIt->second.mode;
+                    if (m >= 0 && m < 10) ++counts[m];
+                    if (lsIt->second.inactive) ++inactiveMapped;
+                    if (lsIt->second.maxBright - lsIt->second.minBright <= 0.0f)
+                        ++badRange;
+                }
+                static const char *kModeNames[10] = {
+                    "FLIP","SMOOTH","RANDOM","MINBRIGHT","MAXBRIGHT",
+                    "ZERO","BRIGHTEN","DIM","SEMI_RANDOM","FLICKER"
+                };
+                std::fprintf(stderr,
+                    "[OBJ-LIGHT-HIST] mapped=%zu inactive=%d badRange=%d",
+                    mission.animLightToStaticIdx.size(),
+                    inactiveMapped, badRange);
+                for (int i = 0; i < 10; ++i)
+                    if (counts[i] > 0)
+                        std::fprintf(stderr, " %s=%d", kModeNames[i], counts[i]);
+                std::fprintf(stderr, "\n");
+            }
+
+            int dimmed = objectIlluminator.dimmedLightCount();
+
+            // Scan all mapped lights for intensity range (global min/max).
+            float globalMin = 2.0f, globalMax = -1.0f;
+            int activelyAnimating = 0;
+            for (const auto &[lightNum, idx] : mission.animLightToStaticIdx) {
+                auto cit = currentIntensities.find(lightNum);
+                if (cit == currentIntensities.end()) continue;
+                float v = cit->second;
+                if (v < globalMin) globalMin = v;
+                if (v > globalMax) globalMax = v;
+                auto lsIt = mission.lightSources.find(lightNum);
+                if (lsIt != mission.lightSources.end()) {
+                    int m = (int)lsIt->second.mode;
+                    bool isAnim = (m == ANIM_FLIP || m == ANIM_SMOOTH ||
+                                   m == ANIM_RANDOM || m == ANIM_BRIGHTEN ||
+                                   m == ANIM_DIM || m == ANIM_SEMI_RANDOM ||
+                                   m == ANIM_FLICKER);
+                    if (isAnim && !lsIt->second.inactive) ++activelyAnimating;
+                }
+            }
+            if (globalMax < 0.0f) { globalMin = 0.0f; globalMax = 0.0f; }
+
+            std::fprintf(stderr,
+                "[OBJ-LIGHT-TICK] mapped=%zu animating=%d dimmed=%d "
+                "intensity=[%.2f,%.2f]",
+                mission.animLightToStaticIdx.size(),
+                activelyAnimating, dimmed, globalMin, globalMax);
+
+            // Prefer to sample slots whose source is actively animating.
+            // Two passes: first only animated modes; fall back to any.
+            auto pickSample = [&](bool animatedOnly, int &shown, int maxShow) {
+                for (const auto &[lightNum, idx] : mission.animLightToStaticIdx) {
+                    if (shown >= maxShow) return;
+                    auto cit = currentIntensities.find(lightNum);
+                    if (cit == currentIntensities.end()) continue;
+                    auto lsIt = mission.lightSources.find(lightNum);
+                    if (lsIt == mission.lightSources.end()) continue;
+                    int m = (int)lsIt->second.mode;
+                    bool isAnim = (m == ANIM_FLIP || m == ANIM_SMOOTH ||
+                                   m == ANIM_RANDOM || m == ANIM_BRIGHTEN ||
+                                   m == ANIM_DIM || m == ANIM_SEMI_RANDOM ||
+                                   m == ANIM_FLICKER);
+                    if (animatedOnly && (!isAnim || lsIt->second.inactive))
+                        continue;
+                    static const char *kModeNames[10] = {
+                        "FLIP","SMOOTH","RANDOM","MINBRIGHT","MAXBRIGHT",
+                        "ZERO","BRIGHTEN","DIM","SEMI_RANDOM","FLICKER"
+                    };
+                    const char *modeStr = (m >= 0 && m < 10) ? kModeNames[m] : "?";
+                    std::fprintf(stderr,
+                        " | ln=%d idx=%d mult=%.2f b=%.2f/%.2f mode=%s%s",
+                        lightNum, idx, cit->second,
+                        lsIt->second.brightness, lsIt->second.maxBright,
+                        modeStr, lsIt->second.inactive ? "/inactive" : "");
+                    ++shown;
+                }
+            };
+            int shown = 0;
+            pickSample(true, shown, 3);
+            if (shown == 0)
+                pickSample(false, shown, 3);
+            std::fprintf(stderr, "\n");
+        }
+    }
+
     // Atlas blend only runs when lightmapped rendering is active and the
     // GPU atlas is ready. Per-object lighting (above) is independent and
     // must update every frame regardless — gating it on the atlas would
@@ -3924,6 +4146,24 @@ int main(int argc, char *argv[]) {
                   Darkness::RayHit &hit) {
             return Darkness::raycastWorld(mission.wrData, from, to, hit);
         });
+
+    // Diagnostic raycaster for the [PATH] periodic|spike block in AudioService.
+    // Lets the diagnostic answer "is the voice's nearest-probe LOS actually
+    // blocked by BSP geometry?" — distinguishes a wall-embedded source from
+    // a Steam Audio mesh-interpretation mismatch. Same WR data as the
+    // worldQuery raycaster above; just exposes it to AudioService directly so
+    // we don't need to round-trip through IWorldQuery for a one-off log.
+    {
+        auto audioSvcForRay = GET_SERVICE(Darkness::AudioService);
+        if (audioSvcForRay) {
+            audioSvcForRay->setRaycaster(
+                [&mission](const Darkness::Vector3 &from,
+                           const Darkness::Vector3 &to,
+                           Darkness::RayHit &hit) {
+                    return Darkness::raycastWorld(mission.wrData, from, to, hit);
+                });
+        }
+    }
 
     // Give the renderer access to the mutable object state map (owned by worldQuery)
     state.objectStates = &worldQuery->objectStates();

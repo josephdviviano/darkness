@@ -146,6 +146,14 @@ struct SteamAudioDSPNode {
     // Footstep reflection diagnostics. Set at startVoice for "foot_*" /
     // "land_*" schemas; one-shot logs gate on this.
     bool isFootstepDiag = false;
+
+    // Voice identity forwarded to ConvolutionWorker::VoiceSlot so the
+    // reflection workers can label [REFLECTION_VOICE] diagnostics. The
+    // schema c-string points into the owning ActiveVoice's std::string;
+    // the worker's iteration is bounded by removeVoiceSource draining
+    // workers before voice destruction, so the pointer is stable.
+    int         voiceHandle      = -1;
+    const char *voiceSchemaCStr  = nullptr;
     std::atomic<int> reflInputLogCount{0};
     std::atomic<int> dryBalLogCount{0};
 
@@ -389,6 +397,12 @@ struct ActiveVoice {
     // persistent-no-solve voices from solved-then-flickered voices.
     uint32_t loopStepsSinceSpawn      = 0;
     uint32_t loopStepsSinceLastSolve  = 0;
+
+    // One-shot latch: once the persistent-sentinel branch has marked this
+    // voice's nearest probe as ProbeFate::Isolated, skip the O(N_probes)
+    // re-walk on subsequent sentinel hits. Reset implicitly when the voice
+    // is recycled into the pool (the slot returns to defaults at startVoice).
+    bool isolationProbeMarked = false;
 
     // ── Sticky reflection-slot ownership ──
     // Each voice's realtime-vs-baked decision is made ONCE on its first

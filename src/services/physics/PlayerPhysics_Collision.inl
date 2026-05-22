@@ -605,14 +605,18 @@
             for (const auto &c : mIterContacts) {
                 Vector3 pushNormal = c.normal;
 
-                // Steep surface handling: surfaces with normal.z > 0 but below
-                // the walkable threshold (45°) act as walls — flatten their push
-                // normal to horizontal. This prevents the player from riding up
-                // steep surfaces using velocity: the position push-out is purely
-                // horizontal, and constrainVelocity() will also see the flattened
-                // normal, removing only horizontal velocity into the wall.
-                // Matches original Dark Engine behavior where steep surfaces
-                // triggered sliding, not climbing.
+                // Steep-surface push-flatten — defensive safety net, NOT original
+                // behavior. The Dark Engine pushes out along the raw contact normal
+                // with a small per-iteration step (0.02–0.04u), so the +z
+                // component on a steep wall is negligible vs gravity. Our
+                // resolver pushes the full penetration in one step, so a deep
+                // penetration on a near-vertical wall could carry a meaningful
+                // +z that visibly nudges the player upward before gravity catches
+                // up. Flattening here clamps that to horizontal; constrainVelocity
+                // still uses the raw normal (via mConstraints), matching the
+                // original's velocity-removal direction. Threshold = 45°
+                // (cos = 0.7071), the same gate the friction-driven walkability
+                // emergence collapses near anyway.
                 if (pushNormal.z > 0.0f && pushNormal.z < WALKABLE_SLOPE_THRESHOLD) {
                     pushNormal.z = 0.0f;
                     float len = glm::length(pushNormal);

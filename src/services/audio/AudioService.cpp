@@ -1821,6 +1821,14 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                         (node->framesSinceNonzeroReflInput <= kReflSilentSkipFrames);
                 }
                 slot.isFootstepDiag = node->isFootstepDiag;  // propagate for worker log
+                // Forward voice handle + schema for [REFLECTION_VOICE]
+                // log (worker can't easily reach back into the voice
+                // pool, but the audio thread already has the binding).
+                // schemaName.c_str() points into the ActiveVoice's
+                // std::string — stable for the worker's iteration since
+                // removeVoiceSource drains the worker first.
+                slot.voiceHandle = node->voiceHandle;
+                slot.schemaCStr  = node->voiceSchemaCStr;
 
                 // Per-voice reverb-send peak. Measures the mono buffer
                 // *after* reflAtten scaling — i.e. exactly the signal
@@ -4512,6 +4520,13 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
         inst.subScene      = subScene;
         inst.staticMesh    = sMesh;
         inst.instancedMesh = iMesh;
+        // Cache geometry + initial transform for the show_door_geometry
+        // debug overlay. Local-space verts stored verbatim; worldTransform
+        // tracks the latest pose pushed by setDoorTransform so the overlay
+        // can rebuild world-space triangles on demand.
+        inst.localVertices = g.localVertices;
+        inst.indices       = g.indices;
+        inst.worldTransform = g.worldTransform;
         mDoorAudioInstances[g.objID] = inst;
         ++created;
     }
@@ -4540,6 +4555,10 @@ void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTrans
     }
     IPLMatrix4x4 ipl = engineToIplMatrix(worldTransform);
     iplInstancedMeshUpdateTransform(it->second.instancedMesh, mIplScene, ipl);
+    // Mirror the transform into the cached debug-overlay record. Same
+    // semantics as the IPL update, so the show_door_geometry wireframe
+    // tracks the live door pose without an extra plumbing path.
+    it->second.worldTransform = worldTransform;
     // Coalesce into one iplSceneCommit per loopStep (see loopStep header).
     mSceneNeedsCommit.store(true, std::memory_order_release);
 
@@ -4559,6 +4578,50 @@ void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTrans
         }
         ++c;
     }
+}
+
+//------------------------------------------------------
+std::vector<AudioService::DebugDoorMesh>
+AudioService::getDoorGeometryForDebug() const
+{
+    std::vector<DebugDoorMesh> out;
+    if (mDoorAudioInstances.empty()) return out;
+    out.reserve(mDoorAudioInstances.size());
+    for (const auto &kv : mDoorAudioInstances) {
+        const DoorAudioInstance &inst = kv.second;
+        if (inst.localVertices.empty() || inst.indices.empty()) continue;
+        DebugDoorMesh dm;
+        dm.objID = kv.first;
+        const size_t numVerts = inst.localVertices.size() / 3;
+        dm.worldVertices.resize(numVerts * 3);
+        // Transform each local vertex into world space using the cached
+        // worldTransform. Direct GLM matmul on a homogeneous point — door
+        // transforms are pure rigid (no projection / no perspective).
+        // localVertices are stored as flat (x,y,z) triples in engine-local
+        // feet relative to the door's pivot; worldTransform converts to
+        // world feet.
+        const Matrix4 &M = inst.worldTransform;
+        for (size_t i = 0; i < numVerts; ++i) {
+            float x = inst.localVertices[i * 3 + 0];
+            float y = inst.localVertices[i * 3 + 1];
+            float z = inst.localVertices[i * 3 + 2];
+            glm::vec4 wp = M * glm::vec4(x, y, z, 1.0f);
+            dm.worldVertices[i * 3 + 0] = wp.x;
+            dm.worldVertices[i * 3 + 1] = wp.y;
+            dm.worldVertices[i * 3 + 2] = wp.z;
+        }
+        // Copy + convert int32_t → uint32_t. Door indices originate as
+        // int32_t (matches Steam Audio's IPLTriangle indices and the
+        // upstream DoorAudioGeometry); the renderer's index buffer expects
+        // uint32_t. Door meshes are small (~dozens of triangles each) so
+        // the per-vertex/index copy cost is negligible.
+        dm.indices.resize(inst.indices.size());
+        for (size_t i = 0; i < inst.indices.size(); ++i) {
+            dm.indices[i] = static_cast<uint32_t>(inst.indices[i]);
+        }
+        out.push_back(std::move(dm));
+    }
+    return out;
 }
 
 // ── Service lifecycle ──
@@ -4840,35 +4903,43 @@ void AudioService::loopStep(float deltaTime)
     updateAmbientDuckingEnvelope();
 
     // Source mutations (add/remove/commit) can race with the background
-    // reflection AND pathing sim threads, so we defer them until BOTH are
-    // idle. Direct sim runs synchronously on the main thread, so it's never
-    // concurrent with mutations. Steam Audio uses double-buffering:
-    // setInputs writes to the staging buffer, while runReflections /
-    // runPathing read from the committed (active) buffer. Only commit()
-    // copies staging → active, so commit must wait for both workers.
+    // sim thread that owns each simulator, so we defer them per-simulator
+    // until that simulator's worker is idle. Steam Audio doesn't require
+    // the two simulators to be synchronised — each owns its own
+    // scene-reference and source list, so reflection mutations are safe
+    // while pathing is running and vice versa. Direct sim runs
+    // synchronously on the main thread, so it's never concurrent with
+    // mutations. Steam Audio uses double-buffering: setInputs writes to
+    // the staging buffer, while runReflections / runPathing read from the
+    // committed (active) buffer. Only commit() copies staging → active,
+    // so each commit must wait for its own worker (not the other one).
     bool reflBusy  = mReflectionSim && mReflectionSim->isRunning();
     bool pathBusy  = mPathingSim    && mPathingSim->isRunning();
+    // Scene-commit gate: iplSceneCommit (BVH refit) cannot run concurrently
+    // with ANY simulator per Steam Audio's API contract, so the door-scene
+    // commit below still needs the conjunctive gate.
     bool canMutate = !reflBusy && !pathBusy;
     IPLSimulator reflectionSimHandle = mReflectionSim ? mReflectionSim->simulator() : nullptr;
     IPLSimulator pathingSimHandle    = mPathingSim    ? mPathingSim->simulator()    : nullptr;
 
-    if (canMutate && mReflectionSim) {
+    if (!reflBusy && mReflectionSim) {
 
         // Flush deferred IPL source adds / removals via ReflectionSimulator.
         mReflectionSim->flushPendingAdds();
         mReflectionSim->flushPendingRemovals();
     }
-    if (canMutate && mPathingSim) {
+    if (!pathBusy && mPathingSim) {
         // Same defer-flush dance for the pathing simulator's pending
         // source-add/remove queues.
         mPathingSim->flushPendingAdds();
         mPathingSim->flushPendingRemovals();
     }
 
-    // Commit copies staging → active buffer. Must wait for reflection sim to
-    // be idle since it reads from the active buffer. Direct sim runs inline
-    // (after commit), so no conflict there.
-    if (canMutate && mReflectionSim && mReflectionSim->isSimulatorDirty() && reflectionSimHandle) {
+    // Commit copies staging → active buffer. Must wait for the reflection
+    // sim's own worker to be idle since it reads from the active buffer.
+    // Pathing-sim state is independent — it has its own active buffer and
+    // worker — so we don't gate on pathBusy here.
+    if (!reflBusy && mReflectionSim && mReflectionSim->isSimulatorDirty() && reflectionSimHandle) {
         if (profOn) {
             auto ct0 = std::chrono::steady_clock::now();
             mReflectionSim->commitIfDirty();
@@ -4880,9 +4951,9 @@ void AudioService::loopStep(float deltaTime)
             mReflectionSim->commitIfDirty();
         }
     }
-    // Pathing-sim commit. Same constraint as the reflection sim: cannot
-    // overlap with iplSimulatorRunPathing on the worker thread.
-    if (canMutate && mPathingSim && mPathingSim->isSimulatorDirty() && pathingSimHandle) {
+    // Pathing-sim commit. Same constraint as the reflection sim, but
+    // against its own worker only: cannot overlap with iplSimulatorRunPathing.
+    if (!pathBusy && mPathingSim && mPathingSim->isSimulatorDirty() && pathingSimHandle) {
         mPathingSim->commitIfDirty();
     }
 
@@ -5482,6 +5553,23 @@ void AudioService::loopStep(float deltaTime)
                 // pushed to the reflection simulator with REFLECTIONS only
                 // — Steam Audio ignores fields not selected by the flag
                 // argument.
+                //
+                // PATHING bit is set unconditionally (not gated on the
+                // per-voice populate block) so iplSourceSetInputs(PATHING)
+                // — when issued — always leaves pathingInputs.enabled=true.
+                // An earlier "drive enabled from the live gate" attempt
+                // caused a stale-eq window on out-of-range → in-range
+                // transitions: simulatePathing only writes
+                // pathingOutputs.eq while enabled=true, so flipping it
+                // false stranded the last in-range eq values in the
+                // output buffer, audible as "sound through walls" for
+                // ~one throttle interval when the listener moved past
+                // maxAudibleDist and back through changed geometry
+                // (typical case: through a doorway and back). Keeping
+                // the worker running findPaths for currently-out-of-range
+                // voices is the price of fresh eq across distance
+                // transients; output is already gated by maxAudibleDist
+                // so the unread writes don't reach the audio thread.
                 inputs.flags = static_cast<IPLSimulationFlags>(
                     IPL_SIMULATIONFLAGS_DIRECT
                     | IPL_SIMULATIONFLAGS_REFLECTIONS
@@ -5807,26 +5895,40 @@ void AudioService::loopStep(float deltaTime)
                 const bool gateProbeBatch = mPathingProbeBatchAdded;
                 const bool gateEnable     = mProbePathingEnabled;
                 const bool gateDue        = mPathingDueThisStep;
-                const bool wantPathing    = gateProbeBatch && gateEnable && gateDue;
-                if (wantPathing && mPathingSim) {
-                    // PT-18 [PATHING_LAG] diagnostic. If we want to signal
-                    // a fresh iteration but the worker is still running
-                    // the previous one, the throttle interval is shorter
-                    // than the worker's actual iteration cost — eq-coeffs
-                    // will be stale for one extra throttle window.
-                    // Rate-limit (first 16 + every 64th thereafter).
-                    if (mPathingSim->isRunning()) {
-                        static std::atomic<int> sPathingLagCount{0};
-                        int lc = sPathingLagCount.fetch_add(1, std::memory_order_relaxed);
-                        if (lc < 16 || (lc % 64) == 0) {
-                            std::fprintf(stderr,
-                                "[PATHING_LAG] worker still running when "
-                                "throttle elapsed (interval=%.3fs, "
-                                "occurrence #%d) — eqCoeffs will be one "
-                                "interval stale this cycle\n",
-                                mPathingUpdateInterval, lc + 1);
-                        }
+                // Mirror the reflection-sim gate: never signal while the
+                // worker is mid-iteration. Without this, a throttle elapse
+                // during a long pathing run (560 ms+ on MISS5) queued
+                // mWant=true and caused the worker to immediately re-enter
+                // iplSimulatorRunPathing the moment its current iteration
+                // returned. That re-entry raced the main thread's
+                // top-of-frame source mutation flush — flushPendingAdds /
+                // flushPendingRemovals / iplSimulatorCommit — and crashed
+                // inside ipl::SimulationManager::simulatePathing iterating
+                // a list whose entries had just been freed.
+                const bool gateNotBusy    = !pathBusy;
+                const bool wantPathing    = gateProbeBatch && gateEnable
+                                         && gateDue && gateNotBusy;
+
+                // [PATHING_LAG] diagnostic: throttle elapsed but the worker
+                // is still running the previous iteration. We skip signal()
+                // entirely in this branch (see gateNotBusy above for the
+                // race we're avoiding); eqCoeffs hold one extra interval
+                // until the worker idles and the next due frame signals
+                // it. Rate-limited (first 16 + every 64th thereafter).
+                if (gateProbeBatch && gateEnable && gateDue && pathBusy) {
+                    static std::atomic<int> sPathingLagCount{0};
+                    int lc = sPathingLagCount.fetch_add(1, std::memory_order_relaxed);
+                    if (lc < 16 || (lc % 64) == 0) {
+                        std::fprintf(stderr,
+                            "[PATHING_LAG] worker still running when "
+                            "throttle elapsed (interval=%.3fs, "
+                            "occurrence #%d) — signal skipped, eqCoeffs "
+                            "will be one interval stale this cycle\n",
+                            mPathingUpdateInterval, lc + 1);
                     }
+                }
+
+                if (wantPathing && mPathingSim) {
                     mPathingSim->signal();
                 }
                 // DIAG: confirm iplSimulatorRunPathing is actually
@@ -5840,12 +5942,13 @@ void AudioService::loopStep(float deltaTime)
                 int n = sRunPathingLogCount.fetch_add(1, std::memory_order_relaxed);
                 if (n < 8) {
                     AUDIO_LOG("[RUN_PATHING] called=%d probeBatchAdded=%d "
-                              "enabled=%d due=%d updateInterval=%.3f "
+                              "enabled=%d due=%d notBusy=%d updateInterval=%.3f "
                               "accumSec=%.3f (occurrence #%d)\n",
                               wantPathing ? 1 : 0,
                               gateProbeBatch ? 1 : 0,
                               gateEnable ? 1 : 0,
                               gateDue ? 1 : 0,
+                              gateNotBusy ? 1 : 0,
                               mPathingUpdateInterval, mPathingAccumSec,
                               n + 1);
                 }
@@ -6043,6 +6146,96 @@ void AudioService::loopStep(float deltaTime)
                                 mPathingDueThisStep ? 1 : 0,
                                 n + 1);
                         }
+
+                        // Runtime-evidence isolation marking. After the
+                        // startup window has lapsed AND the voice has
+                        // never solved, the source's nearest probe is
+                        // probably graph-isolated — Steam Audio's
+                        // visibility graph never formed an edge from
+                        // any probe near this voice to any probe near
+                        // the listener. Mark the source's nearest
+                        // probe Isolated so the show_probes overlay
+                        // surfaces it for the user. Idempotent —
+                        // re-marking the same probe is a no-op.
+                        //
+                        // The 30-loop-step threshold (~9 s at the
+                        // default 0.3 s pathing throttle) is long
+                        // enough that newly-spawned voices in the
+                        // normal startup window don't false-positive
+                        // and short enough to surface persistent
+                        // failures during a typical playtest.
+                        constexpr uint32_t kIsolationConfirmFrames = 30;
+                        if (!voice->pathingEverSolved
+                            && voice->loopStepsSinceSpawn > kIsolationConfirmFrames
+                            && mProbeManager
+                            && !voice->isolationProbeMarked)
+                        {
+                            const auto &probePos = mProbeManager->getProbePositions();
+                            if (!probePos.empty()
+                                && mProbeFates.size() == probePos.size())
+                            {
+                                int   bestIdx = -1;
+                                float bestSq  = std::numeric_limits<float>::max();
+                                for (size_t i = 0; i < probePos.size(); ++i) {
+                                    Vector3 d = probePos[i] - voice->worldPos;
+                                    float sq = glm::dot(d, d);
+                                    if (sq < bestSq) { bestSq = sq; bestIdx = static_cast<int>(i); }
+                                }
+                                if (bestIdx >= 0
+                                    && mProbeFates[bestIdx] == ProbeFate::Kept)
+                                {
+                                    mProbeFates[bestIdx] = ProbeFate::Isolated;
+                                    voice->isolationProbeMarked = true;
+                                    // Spatial neighborhood audit. Same buckets
+                                    // as the bake-time [EMITTER_PROBE] log
+                                    // (5/15/30 ft). Discriminates between:
+                                    //   • n15 > 0  → probe has neighbors, but
+                                    //     the bake didn't form edges from this
+                                    //     probe to them = BAKE-SIDE issue
+                                    //     (numSamples / threshold / Steam
+                                    //     Audio behaviour)
+                                    //   • n15 == 0 → probe is spatially
+                                    //     isolated regardless of LOS = PLACEMENT
+                                    //     issue (emit pass landed somewhere
+                                    //     with no probe density nearby)
+                                    // distToSrc separates emitter-anchored
+                                    // probes (≈0) from grid probes that
+                                    // happened to be nearest (>0).
+                                    int n5 = 0, n15 = 0, n30 = 0;
+                                    constexpr float kN5Sq  =  5.0f *  5.0f;
+                                    constexpr float kN15Sq = 15.0f * 15.0f;
+                                    constexpr float kN30Sq = 30.0f * 30.0f;
+                                    for (size_t i = 0; i < probePos.size(); ++i) {
+                                        if (static_cast<int>(i) == bestIdx) continue;
+                                        Vector3 d = probePos[i] - probePos[bestIdx];
+                                        float sq = glm::dot(d, d);
+                                        if (sq < kN5Sq)  ++n5;
+                                        if (sq < kN15Sq) ++n15;
+                                        if (sq < kN30Sq) ++n30;
+                                    }
+                                    Vector3 dToSrc = probePos[bestIdx] - voice->worldPos;
+                                    float distToSrc = std::sqrt(glm::dot(dToSrc, dToSrc));
+                                    std::fprintf(stderr,
+                                        "[PROBE_ISOLATED] probe=%d/%zu pos=(%.1f,%.1f,%.1f) "
+                                        "distToSrc=%.1fft neighbors n5=%d n15=%d n30=%d "
+                                        "voice=h%u '%s' sinceSpawn=%u\n",
+                                        bestIdx, probePos.size(),
+                                        probePos[bestIdx].x,
+                                        probePos[bestIdx].y,
+                                        probePos[bestIdx].z,
+                                        distToSrc,
+                                        n5, n15, n30,
+                                        handle, voice->schemaName.c_str(),
+                                        voice->loopStepsSinceSpawn);
+                                } else {
+                                    // Even if the probe was already marked
+                                    // Isolated (by an earlier voice), set the
+                                    // voice's flag so we don't re-walk the
+                                    // O(N) probe list on every sentinel hit.
+                                    voice->isolationProbeMarked = true;
+                                }
+                            }
+                        }
                     } else if (!voice->pathingEverSolved) {
                         // First non-sentinel read for this voice — flip
                         // the flag and emit a one-shot log so the
@@ -6182,18 +6375,49 @@ void AudioService::loopStep(float deltaTime)
                             // eqCoeffs feed iplPathEffectApply directly
                             // on the audio thread. The eqCoeffs themselves
                             // remain the load-bearing diagnostic.
+                            //
+                            // BSP-cell containment + LOS probe — answers
+                            //   "is source in solid?" via roomFromPoint, and
+                            //   "does our own BSP raycaster agree the line
+                            //    from source to nearest probe is blocked?"
+                            //   via the renderer-injected mRaycaster.
+                            // srcRoomID == -1 → source position lies in no
+                            // BSP cell (inside wall mesh). srcBlocked == 1
+                            // → our raycaster sees a wall between source
+                            // and nearest probe, mirroring what Steam
+                            // Audio's checkOcclusion would do internally.
+                            // -1 in srcBlocked means "not tested" (no
+                            // raycaster injected or no probe data).
+                            int32_t srcRoomID = -1, lstRoomID = -1;
+                            if (mRoomService) {
+                                Room *sr = mRoomService->roomFromPoint(voice->worldPos);
+                                Room *lr = mRoomService->roomFromPoint(mListenerPos);
+                                srcRoomID = sr ? sr->getRoomID() : -1;
+                                lstRoomID = lr ? lr->getRoomID() : -1;
+                            }
+                            int srcBlocked = -1;
+                            if (mRaycaster && sProbeIdx >= 0 && mProbeManager) {
+                                const auto &pp = mProbeManager->getProbePositions();
+                                if (sProbeIdx < static_cast<int>(pp.size())) {
+                                    RayHit hit{};
+                                    srcBlocked = mRaycaster(voice->worldPos, pp[sProbeIdx], hit) ? 1 : 0;
+                                }
+                            }
+
                             AUDIO_LOG("[PATH] h=%u '%s' dist=%.1f "
                                       "eq=[%.6f,%.6f,%.6f] "
                                       "eqBits=[%08x,%08x,%08x] "
                                       "srcW=(%.1f,%.1f,%.1f) "
                                       "lstW=(%.1f,%.1f,%.1f) "
-                                      "sProbe=%d d=%.1f lProbe=%d d=%.1f%s\n",
+                                      "sProbe=%d d=%.1f lProbe=%d d=%.1f "
+                                      "srcRoom=%d lstRoom=%d srcBlocked=%d%s\n",
                                       handle, voice->schemaName.c_str(),
                                       lineDist, eqL, eqM, eqH,
                                       eqLBits, eqMBits, eqHBits,
                                       voice->worldPos.x, voice->worldPos.y, voice->worldPos.z,
                                       mListenerPos.x, mListenerPos.y, mListenerPos.z,
                                       sProbeIdx, sProbeD, lProbeIdx, lProbeD,
+                                      srcRoomID, lstRoomID, srcBlocked,
                                       spike ? " SPIKE" : "");
                         }
                     }
@@ -7889,6 +8113,13 @@ SoundHandle AudioService::startVoice(const std::string &schemaName,
     bool isFoot = (schemaName.compare(0, 5, "foot_") == 0
                    || schemaName.compare(0, 5, "land_") == 0);
     voice->dspNode.isFootstepDiag = isFoot;
+    // Forward voice identity to the DSP node so the audio thread can
+    // copy it into the convolution worker's per-voice slot for the
+    // [REFLECTION_VOICE] log. Re-read each frame at the slot-assign
+    // site, so a voice that survives a handle reassignment (shouldn't
+    // happen, but defensively) updates correctly.
+    voice->dspNode.voiceHandle     = static_cast<int>(voice->handle);
+    voice->dspNode.voiceSchemaCStr = voice->schemaName.c_str();
     voice->objID = objID;
     voice->worldPos = position;
 
@@ -10159,6 +10390,115 @@ bool AudioService::bakeProbes(const std::string &outputPath,
                   "disabled, every candidate will be baked\n");
     }
 
+    // ── Emitter-anchored probes ───────────────────────────────────────
+    //
+    // Persistent ambient sources (P$AmbientHack + P$SpotAmb) get a
+    // graph node at their own position so the pathing solver always
+    // has an association within visibility radius. Without this,
+    // wall-mounted emitters whose P$Position resolves inside the wall
+    // mesh return the 0.1f sentinel forever and leak through the
+    // synthetic-bypass branch (no IPLPathEffect → IPLDirectEffect
+    // alone → wall transmission + partial occlusion = audible).
+    if (mAmbientManager) {
+        for (const auto &amb : mAmbientManager->getAmbients()) {
+            params.emitterPositions.push_back(amb.position);
+        }
+        for (const auto &sa : mAmbientManager->getSpotAmbients()) {
+            params.emitterPositions.push_back(sa.position);
+        }
+        AUDIO_LOG("Emitter anchors: %zu positions queued for the emitter pass\n",
+                  params.emitterPositions.size());
+    }
+
+    // Relaxed filter for the emitter pass. Differs from the grid filter
+    // at one critical point: when `roomFromPoint(p)` returns null
+    // (emitter sits inside solid geometry — typical for wall-mounted
+    // fixtures whose visual position is inside the wall mesh), we
+    // search nearby rooms by walking `getAllRooms()` and nudge toward
+    // the closest room's center. The grid filter rejects in this case;
+    // we can't, because losing an emitter probe re-opens the V8 leak.
+    //
+    // If no room is within `searchRadiusFt`, fall through to Reject —
+    // a truly isolated emitter we cannot graph-connect, and the leak
+    // for that one voice is preferable to a probe placed somewhere
+    // arbitrary that distorts surrounding solves.
+    if (mRoomService) {
+        const float spacingFt    = mProbeManager
+                                 ? mProbeManager->getProbeSpacingFt()
+                                 : 5.0f;
+        const float searchRadiusFt = std::max(spacingFt * 2.0f, 16.0f);
+        const float searchRadiusSq = searchRadiusFt * searchRadiusFt;
+        params.emitterProbeFilter =
+            [this, minClearanceFt, searchRadiusSq](const Vector3 &p) -> ProbeFilterDecision {
+                ProbeFilterDecision d;
+                Room *r = mRoomService->roomFromPoint(p);
+                if (!r) {
+                    // Search the room set for the nearest center within
+                    // searchRadiusFt. Linear scan — bake-time only, room
+                    // counts are O(thousands) so this is negligible.
+                    Room *nearest    = nullptr;
+                    float nearestSq  = searchRadiusSq;
+                    const auto &rooms = mRoomService->getAllRooms();
+                    for (const auto &cand : rooms) {
+                        if (!cand) continue;
+                        Vector3 delta = cand->getCenter() - p;
+                        float dsq = glm::dot(delta, delta);
+                        if (dsq < nearestSq) {
+                            nearestSq = dsq;
+                            nearest   = cand.get();
+                        }
+                    }
+                    if (!nearest) {
+                        d.result = ProbeFilterResult::Reject;
+                        return d;
+                    }
+                    Vector3 delta = nearest->getCenter() - p;
+                    float dist = std::sqrt(glm::dot(delta, delta));
+                    if (dist < 1e-4f) {
+                        d.result = ProbeFilterResult::Reject;
+                        return d;
+                    }
+                    d.result      = ProbeFilterResult::Nudge;
+                    d.nudgeDir    = delta / dist;
+                    // Overshoot by 1 ft past the room center to make
+                    // sure the next eval lands well inside the room
+                    // rather than on the room boundary.
+                    d.nudgeDistFt = dist + 1.0f;
+                    return d;
+                }
+                // In an open room — same wall-clearance logic as the
+                // grid filter. Inlined rather than refactored because
+                // the two filters diverge only in the in-solid branch
+                // and the wall-clearance block is small + stable.
+                if (minClearanceFt <= 0.0f) {
+                    d.result = ProbeFilterResult::Accept;
+                    return d;
+                }
+                const Plane *planes = r->getBoundingPlanes();
+                float minDist = 1e9f;
+                int   minIdx  = -1;
+                int   wallPlanes = 0;
+                for (int i = 0; i < 6; ++i) {
+                    if (std::abs(planes[i].normal.z) > 0.5f) continue;
+                    float dist = planes[i].getDistance(p);
+                    if (dist < minDist) { minDist = dist; minIdx = i; }
+                    ++wallPlanes;
+                }
+                if (wallPlanes == 0 || minIdx < 0) {
+                    d.result = ProbeFilterResult::Accept;
+                    return d;
+                }
+                if (minDist >= minClearanceFt) {
+                    d.result = ProbeFilterResult::Accept;
+                    return d;
+                }
+                d.result      = ProbeFilterResult::Nudge;
+                d.nudgeDir    = planes[minIdx].normal;
+                d.nudgeDistFt = minClearanceFt - minDist;
+                return d;
+            };
+    }
+
     bool ok = mProbeManager->bakeProbes(mIplScene, outputPath, params, progress);
     if (ok) {
         // Classify the freshly-baked probes so the overlay can show
@@ -10342,6 +10682,15 @@ size_t AudioService::classifyProbeReachability()
             ++kept;
         }
     }
+
+    // Note: ProbeFate::Isolated is NOT set here. Isolation is determined
+    // by runtime evidence — when the pathing-output read site sees a
+    // persistent sentinel (everSolved=0, sinceSpawn > kIsolationConfirmFrames)
+    // it calls markProbeIsolated() with the source's nearest probe index.
+    // Spatial heuristics (no neighbor within visibility radius) are too
+    // permissive — Steam Audio's edge formation depends on probe-to-probe
+    // LOS, which we can't cheaply test without rebuilding our own BVH or
+    // adding a custom raycaster on the acoustic-scene side.
 
     AUDIO_LOG("classifyProbeReachability: seeds=%zu rooms → %zu playable; "
               "probes kept=%zu, noRoom=%zu, unreachable=%zu (would prune "

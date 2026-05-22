@@ -186,15 +186,19 @@
                                    std::fabs(mInputRight) > 0.001f);
 
         if (isOnGround() && !mGroundGraceActive) {
-            // Project desired velocity onto ground plane so walking on slopes
-            // doesn't fight gravity.
-            if (mGroundNormal.z > GROUND_NORMAL_MIN) {
-                float dot = glm::dot(desired, mGroundNormal);
-                desired -= mGroundNormal * dot;
-            }
+            // Desired velocity is kept purely horizontal — Dark Engine convention.
+            // Slope traversal is emergent from collision response, NOT from rotating
+            // input into the slope's tangent plane: friction scales the control rate
+            // (low friction on steep slopes → small ctrl_accel), gravity adds the
+            // downward impulse every step, the velocity constraint removes the
+            // component going into the surface, and position push-out along the
+            // contact normal provides a tiny along-slope nudge. Projecting horizontal
+            // input onto the ground normal would create a strong upward velocity
+            // component on steep surfaces (clamping the player to walls); the original
+            // engine never does this.
 
             // Control acceleration: rate * (desired - current)
-            // Original (PHCTRL.CPP line 211): rate = 11 * mass * friction / velocity_rate
+            // Dark Engine convention: rate = 11 * mass * friction / velocity_rate
             float rate = CONTROL_MULTIPLIER * mMass * friction / VELOCITY_RATE;
             rate = std::min(rate, MAX_CONTROL_RATE);
 
@@ -257,7 +261,11 @@
 
             mVelocity.x = hActual.x;
             mVelocity.y = hActual.y;
-            mVelocity.z = desired.z != 0.0f ? desired.z : prevZ;
+            // vz preserved from prevZ — gravity (applyGravity) and the velocity
+            // constraint (constrainVelocity) drive Z. The pre-fix branch wrote
+            // desired.z here, which was nonzero only when the slope projection
+            // (now removed) rotated horizontal input into upward velocity.
+            mVelocity.z = prevZ;
         } else if (isOnGround()) {
             // Grace period: same control model but no slope projection.
             float rate = CONTROL_MULTIPLIER * mMass * friction / VELOCITY_RATE;
