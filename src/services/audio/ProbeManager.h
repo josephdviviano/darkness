@@ -23,13 +23,43 @@
 #define __PROBE_MANAGER_H
 
 /// @file ProbeManager.h
-/// Acoustic probe baking, loading, saving, and in-memory storage. Owns the
-/// Steam Audio probe batch + mirrored probe-position array used by debug
-/// overlays.
+/// Acoustic probe baking, loading, saving, and in-memory storage. Owns one
+/// or more Steam Audio probe batches (purpose-tagged) plus mirrored probe-
+/// position arrays for debug overlays.
+///
+/// === Multi-batch architecture ===
+///
+/// Steam Audio supports multiple probe batches attached to a single
+/// simulator. Each batch's bake data is keyed by `IPLBakedDataIdentifier`
+/// (Reflections / Pathing) and the simulator silently skips batches that
+/// don't carry data for the current query type (verified in
+/// `vcpkg/.../core/src/core/simulation_manager.cpp` and
+/// `baked_reflection_simulator.cpp`).
+///
+/// We exploit this to split probes by purpose:
+///
+///   * Reflections batch — dense UNIFORMFLOOR grid (typically 1500-3000
+///     probes on a Thief mission). Density matters for IR sampling at any
+///     listener position; portal-axis + elevation + emitter passes add
+///     coverage in the corners of the visibility graph that the floor grid
+///     misses.
+///
+///   * Pathing batch — sparse ROOM_PORTAL graph (typically 100-300 probes
+///     on a Thief mission). One probe at each room centroid, two probes
+///     ±offset across each portal plane. Steam Audio's `findAlternatePaths`
+///     cost is ~quadratic in probe count when door OBBs invalidate baked
+///     paths at runtime — sparse-graph pathing reduces a multi-second hang
+///     to microseconds.
+///
+/// Both batches are attached to both simulators (reflection sim + pathing
+/// sim). The reflection sim only consumes batches with reflections bake
+/// data; the pathing sim only consumes the one batch named on each
+/// source's `IPLSimulationInputs::pathingProbes` field (caller must point
+/// at `getPathingProbeBatch()`).
 ///
 /// Threading: main-thread only. `bakeProbes` is blocking (~10-60s) and
-/// reports via an atomic float so a UI thread can poll. The probe batch
-/// is read by the reflection-sim worker; callers MUST invoke the supplied
+/// reports via an atomic float so a UI thread can poll. Probe batches are
+/// read by the reflection-sim worker; callers MUST invoke the supplied
 /// `waitForReflectionThread` callback before any batch mutation.
 
 #include "DarknessMath.h"
@@ -52,6 +82,21 @@ typedef _IPLProbeBatch_t* IPLProbeBatch;
 
 namespace Darkness {
 
+/// Which simulator type this batch is built to serve. The disk-format
+/// uint32 values are wire-stable — do not renumber.
+enum class ProbePurpose : uint32_t {
+    Reflections = 0,
+    Pathing     = 1,
+};
+
+inline const char *probePurposeString(ProbePurpose p) {
+    switch (p) {
+        case ProbePurpose::Reflections: return "reflections";
+        case ProbePurpose::Pathing:     return "pathing";
+    }
+    return "unknown";
+}
+
 /// Outcome of bake-time filter. Nudge = recoverable displacement;
 /// preserves probes just too close to a wall while still dropping those
 /// inside solid geometry.
@@ -71,6 +116,30 @@ struct ProbeFilterDecision {
 };
 
 using ProbeFilterFn = std::function<ProbeFilterDecision(const Vector3 &)>;
+
+/// Why a pathing-graph node candidate was created. Drives policy in the
+/// post-dedup adaptive-radius pass and in the proximity dedup pass
+/// (DoorPair candidates are exempt from dedup so a door is always
+/// flanked by two non-overlapping probes that the runtime door
+/// validation can reject paths through).
+enum class PathingProbePurpose {
+    Portal,    ///< Non-door architectural portal — single probe at the centroid.
+    DoorPair,  ///< One of a pair of probes flanking a door OBB (±portal normal).
+    Centroid,  ///< Room geometric centroid (or sky-snapped floor+5ft fallback).
+    Emitter,   ///< Mirror of an ambient-emitter anchor.
+};
+
+/// One pathing-graph node candidate, supplied by AudioService. Each Room
+/// contributes one centroid candidate; each non-door portal contributes
+/// one (at the centroid); each door portal contributes two (flanking
+/// the door OBB along the portal normal); each persistent ambient
+/// emitter contributes one (mirror anchor). ProbeManager runs them
+/// through the supplied filter the same way it does floor probes.
+struct PathingProbeCandidate {
+    Vector3 position{0.0f, 0.0f, 0.0f};
+    float   radiusFt = 5.0f;   ///< Influence radius — sized adaptively post-dedup.
+    PathingProbePurpose purpose = PathingProbePurpose::Portal;
+};
 
 /// Per-bake parameters supplied by AudioService (read from its tuning state).
 /// All distance fields are in engine feet (ProbeManager converts to meters
@@ -103,24 +172,17 @@ struct ProbeBakeParams {
     /// routes to the floor probe at its (x,y), misrepresenting geometry.
     std::vector<float> additionalElevations;
 
-    /// Per-portal axial anchors. Each contributes up to 2 probes (center
-    /// ± normal · offset) so each adjoining room gets a probe just
-    /// inside its volume rather than on the doorway plane. Caller
-    /// supplies canonical orientation only; ProbeManager handles ±
-    /// expansion + dedup against floor/elevation tiers.
-    struct PortalAxis {
-        Vector3 center;
-        Vector3 normal;   ///< Unit; both ± sides emit
-    };
-    std::vector<PortalAxis> portalAxes;
-
-    /// Axial probe offset on each side of PortalAxis::center (feet).
-    /// 1 ft ≈ 0.3 m — far enough to bake the room's acoustics, not the
-    /// narrow corridor's.
+    /// Axial probe offset across a portal plane (feet). Used by the
+    /// PATHING batch — each surviving RoomService portal contributes two
+    /// pathing probes at `center ± normal * portalAxialOffsetFt`.
+    /// 1 ft ≈ 0.3 m, small enough that a closed-door OBB fits between
+    /// the pair without overlap.
     float portalAxialOffsetFt = 1.0f;
 
-    /// Skip a portal-axis candidate if an existing floor/elevation probe
-    /// is within this many feet (the floor grid already covers it).
+    /// Dedup radius (feet) for the emitter-anchored pass: a candidate is
+    /// dropped if any earlier-pass probe is within this distance. Named
+    /// "portal" for historical reasons (was shared with the old portal-
+    /// ring pass before that was removed).
     float portalDedupRadiusFt = 5.0f;
 
     /// Elevation-tier sparsity multiplier. Floor probes are binned with
@@ -132,17 +194,17 @@ struct ProbeBakeParams {
     /// Earlier passes have priority (floor always wins). 0 = disabled.
     float globalDedupRadiusFt = 2.0f;
 
-    /// Pre-bake validity filter applied to every candidate. Returns
-    /// Accept / Reject / Nudge. Pre-filtering avoids near-zero IRs from
-    /// in-wall probes and comb-filtering from near-wall probes. Empty
+    /// Pre-bake validity filter applied to every REFLECTIONS-batch candidate.
+    /// Returns Accept / Reject / Nudge. Pre-filtering avoids near-zero IRs
+    /// from in-wall probes and comb-filtering from near-wall probes. Empty
     /// = keep everything.
     ProbeFilterFn probeFilter;
 
-    /// Per-emitter anchor positions (engine feet). One probe is attempted
-    /// at each so persistent ambient sources have a graph node within
-    /// pathing visibility radius even when the floor/elevation/portal
-    /// grid leaves a coverage gap (e.g. wall-mounted fixtures whose
-    /// P$Position falls inside the visual wall mesh).
+    /// Per-emitter anchor positions (engine feet, REFLECTIONS batch). One
+    /// probe is attempted at each so persistent ambient sources have a
+    /// graph node within pathing visibility radius even when the floor/
+    /// elevation/portal grid leaves a coverage gap (e.g. wall-mounted
+    /// fixtures whose P$Position falls inside the visual wall mesh).
     std::vector<Vector3> emitterPositions;
 
     /// Filter applied specifically to the emitter-anchored pass. Should
@@ -155,6 +217,27 @@ struct ProbeBakeParams {
     /// Informational — what wall clearance (feet) the caller's filter
     /// enforces; logged for traceability. Does NOT derive the filter.
     float minWallClearanceFt = 0.0f;
+
+    // ── Pathing batch (sparse, ROOM_PORTAL-derived) ──────────────────────
+
+    /// True to bake a second probe batch tagged Pathing. When false, no
+    /// pathing batch is produced and pathing queries against this mission
+    /// return null routing (synthetic-bypass branch in AudioService).
+    bool   bakePathingBatch = true;
+
+    /// Caller-supplied pathing graph node candidates. One per room
+    /// centroid + two per portal (±offset). Order does not matter;
+    /// ProbeManager runs them through `pathingProbeFilter` and dedups
+    /// internally. Influence radius travels per-candidate so room-scale
+    /// and portal-scale probes can co-exist without false overlap.
+    std::vector<PathingProbeCandidate> pathingCandidates;
+
+    /// Filter for the pathing batch. Typically permissive (accept anything
+    /// inside a real Room) — pathing probes inside a wall mesh are useless
+    /// but a slightly-near-wall pathing probe is fine because we don't
+    /// bake reflections off it. Empty = keep everything that landed inside
+    /// the candidate list.
+    ProbeFilterFn pathingProbeFilter;
 };
 
 /// Construction-time wiring.
@@ -164,11 +247,37 @@ struct ProbeManagerDeps {
     /// before any probe-batch register/unregister/release so Steam Audio
     /// never sees a torn batch.
     std::function<void()> waitForReflectionThread;
+    /// Blocks until the pathing-sim worker is idle. Optional but
+    /// recommended — without it, runtime probe-batch swaps can race
+    /// `iplSimulatorRunPathing`. Symmetric with waitForReflectionThread.
+    std::function<void()> waitForPathingThread;
 };
 
-/// Owns the Steam Audio probe batch + mirrored probe-position array +
-/// bake-time grid config. Persistent across missions — loadProbes/
-/// bakeProbes both call releaseBatch internally before installing a new one.
+/// One probe batch held by ProbeManager. Mirrored positions are used by
+/// debug overlays and by AudioService's nearest-probe lookups; the IPL
+/// handle is the canonical batch.
+struct ProbeBatchEntry {
+    ProbePurpose          purpose = ProbePurpose::Reflections;
+    IPLProbeBatch         iplBatch = nullptr;
+    int                   probeCount = 0;
+    bool                  hasReflectionsData = false;
+    bool                  hasPathingData = false;
+    /// Engine-space positions in placement order (sidecar mirror).
+    std::vector<Vector3>  positions;
+    /// Per-probe influence radii in engine feet (sidecar mirror). Parallel
+    /// to `positions`. Currently populated only for the pathing batch
+    /// (where the adaptive Voronoi-ish sizing varies per probe); for the
+    /// reflection batch this is left empty (every probe uses the uniform
+    /// `spacing` radius). Consumed by the pathing-probe debug overlay
+    /// (DarknessRender::renderPathingProbeOverlay) to draw influence
+    /// spheres.
+    std::vector<float>    radiiFt;
+};
+
+/// Owns one or more Steam Audio probe batches + mirrored probe-position
+/// arrays + bake-time grid config. Persistent across missions —
+/// loadProbes/bakeProbes both call releaseBatches internally before
+/// installing new ones.
 class ProbeManager {
 public:
     explicit ProbeManager(ProbeManagerDeps deps);
@@ -177,36 +286,84 @@ public:
     ProbeManager(const ProbeManager &) = delete;
     ProbeManager &operator=(const ProbeManager &) = delete;
 
-    /// Bake probes for the current scene. Generates a floor grid, bakes
-    /// pathing + reflection IRs, writes `.probes` with CRC envelope.
-    /// Blocking (~10-60s); progress is reported via the atomic float.
+    /// Bake probes for the current scene. Generates a reflection batch
+    /// (UNIFORMFLOOR grid + elevation/portal/emitter passes) and an
+    /// optional pathing batch (ROOM_PORTAL nodes from
+    /// params.pathingCandidates). Writes a v2 `.probes` file with one
+    /// section per batch. Blocking (~10-60s); progress reports via the
+    /// atomic float.
     bool bakeProbes(IPLScene scene,
                     const std::string &outputPath,
                     const ProbeBakeParams &params,
                     std::atomic<float> *progress);
 
-    /// Load probes from disk + register with the reflection simulator.
-    /// Releases any previously-loaded batch first.
+    /// Load probes from disk + register every batch with both simulators.
+    /// Reflection sim silently ignores batches without reflections data;
+    /// pathing sim creates per-batch PathSimulators which are then named
+    /// per-source via IPLSimulationInputs::pathingProbes.
     bool loadProbes(const std::string &probePath,
-                    IPLSimulator reflectionSimulator);
+                    IPLSimulator reflectionSimulator,
+                    IPLSimulator pathingSimulator);
 
-    /// Release the loaded batch. Unregisters from `reflectionSimulator`
-    /// if supplied. Safe when no batch is loaded. waitForReflectionThread
-    /// is invoked internally before any IPL mutation.
-    void releaseBatch(IPLSimulator reflectionSimulator);
+    /// Release every loaded batch. Unregisters from both simulators if
+    /// supplied. Safe when no batch is loaded.
+    void releaseBatches(IPLSimulator reflectionSimulator,
+                        IPLSimulator pathingSimulator);
 
     /// Standard mission probe path:
     /// ~/darkness/{gameName}/baked_probes/{missionName}.probes
     static std::string getProbeFilePath(const std::string &misPath,
                                          const std::string &gameName = "thief2");
 
-    int getProbeCount() const { return mProbeCount; }
-    /// Legacy .probes files only contain pathing data — false then.
-    bool hasReflections() const { return mProbesHaveReflections; }
-    /// Read-only. Callers must use releaseBatch(), not direct release.
-    IPLProbeBatch getProbeBatch() const { return mIplProbeBatch; }
-    /// Probe positions (feet). Rebuilt on every bake/load.
-    const std::vector<Vector3> &getProbePositions() const { return mProbePositions; }
+    // ── Read-only accessors ────────────────────────────────────────────
+
+    /// Sum across all batches.
+    int getProbeCount() const { return mTotalProbeCount; }
+    /// Reflection batch carries baked reflection IRs? False on legacy
+    /// or pathing-only loads.
+    bool hasReflections() const { return mReflectionsBatch
+                                          && mReflectionsBatch->hasReflectionsData; }
+    /// Pathing batch present + baked?
+    bool hasPathing() const { return mPathingBatch
+                                     && mPathingBatch->hasPathingData; }
+
+    /// The single batch carrying reflection IRs (or nullptr if none).
+    /// Callers use this for `iplProbeBatchGetReverb` / per-probe lookups.
+    IPLProbeBatch getReflectionProbeBatch() const {
+        return mReflectionsBatch ? mReflectionsBatch->iplBatch : nullptr;
+    }
+    /// The single batch carrying baked paths (or nullptr if none).
+    /// Callers set `inputs.pathingProbes = getPathingProbeBatch()` on
+    /// every pathing source per-frame.
+    IPLProbeBatch getPathingProbeBatch() const {
+        return mPathingBatch ? mPathingBatch->iplBatch : nullptr;
+    }
+
+    /// Legacy single-batch accessor — returns the reflection batch (which
+    /// also held pathing data in v1 files). Retained for AudioService call
+    /// sites that have not yet been split between the two batches.
+    IPLProbeBatch getProbeBatch() const { return getReflectionProbeBatch(); }
+
+    /// Reflection-batch probe positions (feet). Rebuilt on bake/load.
+    /// Used for the debug overlay and per-source nearest-probe heuristics.
+    const std::vector<Vector3> &getProbePositions() const {
+        static const std::vector<Vector3> kEmpty;
+        return mReflectionsBatch ? mReflectionsBatch->positions : kEmpty;
+    }
+    /// Pathing-batch probe positions (feet). Empty if no pathing batch
+    /// is loaded.
+    const std::vector<Vector3> &getPathingProbePositions() const {
+        static const std::vector<Vector3> kEmpty;
+        return mPathingBatch ? mPathingBatch->positions : kEmpty;
+    }
+    /// Pathing-batch per-probe influence radii (feet), parallel to
+    /// `getPathingProbePositions()`. Empty if no pathing batch is loaded
+    /// or if the bake/load path could not recover per-probe radii
+    /// (sidecar missing). Consumed by the pathing-probe debug overlay.
+    const std::vector<float> &getPathingProbeRadii() const {
+        static const std::vector<float> kEmpty;
+        return mPathingBatch ? mPathingBatch->radiiFt : kEmpty;
+    }
 
     // Bake-time grid config — takes effect on next bake. Does NOT relocate.
     void  setProbeSpacingFt(float ft) { mProbeSpacingFt = std::max(1.0f, std::min(ft, 20.0f)); }
@@ -215,18 +372,48 @@ public:
     float getProbeHeightFt() const { return mProbeHeightFt; }
 
 private:
+    /// Bake one reflection batch from a UNIFORMFLOOR + elevation/portal/
+    /// emitter placement pass + iplReflectionsBakerBake. Returns a fully-
+    /// committed batch with reflection IR data attached, or nullptr on
+    /// failure. Caller takes ownership of the returned handle.
+    bool bakeReflectionBatch(IPLScene scene,
+                             const ProbeBakeParams &params,
+                             float spacing,
+                             float height,
+                             std::atomic<float> *progress,
+                             const std::string &outputPath,
+                             ProbeBatchEntry &outEntry);
+
+    /// Bake one pathing batch from caller-supplied ROOM_PORTAL candidates
+    /// + iplPathBakerBake. Returns a committed batch with pathing data
+    /// attached, or nullptr if no candidates survive filtering.
+    bool bakePathingBatch(IPLScene scene,
+                          const ProbeBakeParams &params,
+                          float spacing,
+                          std::atomic<float> *progress,
+                          ProbeBatchEntry &outEntry);
+
+    /// Release a single batch from the simulators it is attached to.
+    /// Internal use only — releaseBatches walks the vector.
+    void releaseEntry(ProbeBatchEntry &entry,
+                      IPLSimulator reflectionSimulator,
+                      IPLSimulator pathingSimulator);
+
     ProbeManagerDeps mDeps;
 
-    IPLProbeBatch mIplProbeBatch = nullptr;
-    int  mProbeCount = 0;
-    bool mProbesHaveReflections = false;
+    /// All batches. Owning. Each entry points at one IPLProbeBatch.
+    std::vector<ProbeBatchEntry> mBatches;
+    /// Convenience pointers into mBatches — the one entry tagged
+    /// Reflections and the one tagged Pathing. Re-resolved on every
+    /// bake/load.
+    ProbeBatchEntry *mReflectionsBatch = nullptr;
+    ProbeBatchEntry *mPathingBatch = nullptr;
+    /// Sum of probeCount across batches; convenience for accessors.
+    int  mTotalProbeCount = 0;
 
     /// Negative override → use these values at bake time.
     float mProbeSpacingFt = 5.0f;
     float mProbeHeightFt  = 5.0f;
-
-    /// Debug-overlay mirror (Steam Audio holds the canonical copy).
-    std::vector<Vector3> mProbePositions;
 };
 
 } // namespace Darkness

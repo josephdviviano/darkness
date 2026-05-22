@@ -22,7 +22,6 @@
 
 #include "AmbientSoundManager.h"
 
-#include "AudioLog.h"
 #include "AudioService.h"
 #include "CRFSoundLoader.h"
 #include "SchemaParser.h"
@@ -60,15 +59,6 @@ float centibelsToLinear(float cb)
     return std::pow(10.0f, cb / 2000.0f);
 }
 
-/// Millibel-style integer gain → linear amplitude. Positive values clamp
-/// to unity (matches the SpotAmb level convention).
-float milliBelIntToLinear(int volMb)
-{
-    if (volMb >= 0)              return 1.0f;
-    if (volMb <= -10000)         return 0.0f;
-    return std::pow(10.0f, volMb / 2000.0f);
-}
-
 } // anonymous namespace
 
 //------------------------------------------------------
@@ -84,7 +74,6 @@ AmbientSoundManager::~AmbientSoundManager() = default;
 void AmbientSoundManager::clear()
 {
     mAmbients.clear();
-    mSpotAmbients.clear();
 }
 
 //------------------------------------------------------
@@ -174,67 +163,6 @@ void AmbientSoundManager::loadAmbientSounds()
     if (skipped > 0) {
         LOG_INFO("AudioService: skipped %d ambient sound(s) with missing schemas/samples",
                  skipped);
-    }
-}
-
-//------------------------------------------------------
-void AmbientSoundManager::loadSpotAmbients()
-{
-    if (!mHost->mPropertyService || !mHost->mObjectService)
-        return;
-
-    mSpotAmbients.clear();
-
-    Property *prop = mHost->mPropertyService->getProperty("SpotAmb");
-    if (!prop || !prop->getStorage())
-        return;
-    DataStorage *storage = prop->getStorage();
-    IntIteratorPtr it = storage->getAllStoredObjects();
-
-    int loaded = 0;
-    int skippedNoSchema = 0;
-    while (!it->end()) {
-        int objID = it->next();
-        if (objID <= 0) continue;
-
-        size_t sz = 0;
-        const uint8_t *bytes = storage->getRawData(objID, sz);
-        if (!bytes || sz < sizeof(PropSpotAmb)) continue;
-        PropSpotAmb sa;
-        std::memcpy(&sa, bytes, sizeof(sa));
-
-        if (sa.outer <= 0.0f || sa.outer < sa.inner || sa.ambient < 0.0f)
-            continue;
-
-        SpotAmbient se;
-        se.objID = objID;
-        se.position = mHost->mObjectService->position(objID);
-        se.inner = sa.inner;
-        se.outer = sa.outer;
-        se.level = sa.ambient;
-
-        // The schema name is borrowed from the object's P$AmbientHack
-        // (concrete or inherited). If absent, the spot ambient is captured
-        // but won't start (logged for diagnostics).
-        size_t ahSize = 0;
-        const uint8_t *ahRaw = getPropertyRawData(
-            mHost->mPropertyService.get(), "AmbientHa", objID, ahSize);
-        if (ahRaw && ahSize >= sizeof(PropAmbientHack)) {
-            const auto *ah = reinterpret_cast<const PropAmbientHack *>(ahRaw);
-            se.schemaName.assign(ah->schema,
-                strnlen(ah->schema, sizeof(ah->schema)));
-        }
-        if (se.schemaName.empty())
-            ++skippedNoSchema;
-
-        mSpotAmbients.push_back(std::move(se));
-        ++loaded;
-    }
-
-    if (loaded > 0) {
-        AUDIO_LOG("AudioService: loaded %d spot ambient(s) (P$SpotAmb), "
-                  "%d without resolved schema name\n",
-                  loaded, skippedNoSchema);
     }
 }
 
@@ -366,16 +294,43 @@ void AmbientSoundManager::updateAmbientVolumes()
 
         // Voice loudness: schema-authored gain (centibels) + per-object
         // AmbientHack override, converted to linear amplitude once.
-        // Steam Audio's per-voice DSP chain (iplDirectEffect distance
-        // attenuation + portalAttenuation + portalBlocking + air
-        // absorption + occlusion/transmission + HRTF) owns all distance
-        // / portal / occlusion shaping downstream — the Dark Engine
-        // centibel falloff curve over schema radius double-attenuated
-        // against that chain and confused authoring.
+        // Steam Audio's per-voice DSP chain owns all distance / portal
+        // / occlusion shaping downstream:
+        //   • iplDirectEffect — distance attenuation (INVERSEDISTANCE
+        //     model with minDistance = 1m × P$SchAttFac), air
+        //     absorption, volumetric occlusion against world
+        //     geometry + door OBBs, frequency-dependent transmission
+        //   • iplPathEffect   — routed-around-obstacles wet bus
+        //     (3-band EQ from eqCoeffs + ambisonic SH direction)
+        //   • portalAttenuation / portalBlocking — derived from the
+        //     path solver's eqCoeffs (AudioService.cpp post-getOutputs
+        //     block); these drive the reflection-send door blocking
+        //     (reverb tail attenuates + muffles for sources behind
+        //     closed doors)
+        //   • iplReflectionEffect — room reverb tail
         //
-        // amb.attenuationFactor (P$SchAttFac) is plumbed into Steam Audio's
-        // INVERSEDISTANCE distance model at voice spawn (see
-        // voiceSetAttenuationFactor call earlier). Not re-read per-frame.
+        // No distance term is applied here at the miniaudio source-
+        // volume layer because Steam Audio's INVERSEDISTANCE model
+        // already does that on the dry path, the path effect does it
+        // internally on the wet pathing bus, and the reverb-send
+        // multiplies in directParams.distanceAttenuation. Adding a
+        // ma_sound_set_volume distance curve here would double-
+        // attenuate every downstream pathway.
+        //
+        // NOTE — distance-curved ma_sound_set_volume IS the right
+        // approach for the AI-hearing / BFS portal-graph propagation
+        // system (a separate subsystem in AIHearingService that
+        // operates on the legacy Dark Engine portal-graph propagation
+        // model). That system runs entirely outside Steam Audio and
+        // does its own per-source distance + door attenuation in the
+        // BFS graph traversal. Don't confuse the two pipelines: BFS
+        // is for AI listeners (NPCs hearing the player), Steam Audio
+        // is for the player listener (hearing the world).
+        //
+        // amb.attenuationFactor (P$SchAttFac) is plumbed into Steam
+        // Audio's INVERSEDISTANCE distance model at voice spawn (see
+        // voiceSetAttenuationFactor call earlier). Not re-read per-
+        // frame.
         const float gainCb = static_cast<float>(
             amb.volume + schemaVolumeCb(mHost->mSchemaParser.get(), amb.schemaName));
         const float linearVol = centibelsToLinear(gainCb);
@@ -386,92 +341,6 @@ void AmbientSoundManager::updateAmbientVolumes()
         // propagation authority — one knob in YAML rather than per-schema.
         mHost->voiceSetLinearVolume(amb.handle,
             linearVol * mHost->currentDuckGain() * mGlobalVolumeScale);
-    }
-}
-
-//------------------------------------------------------
-void AmbientSoundManager::updateSpotAmbientVolumes()
-{
-    // Per-frame lifecycle for P$SpotAmb. The authored inner/outer envelope
-    // is now used as a hard spawn/halt boundary only (d >= outer → halt);
-    // the in-band linear fade is delegated to Steam Audio's per-voice DSP
-    // chain (distance attenuation + portal/occlusion). Loudness is the
-    // authored level + schema gain, applied once.
-    if (mSpotAmbients.empty())
-        return;
-
-    // Diagnostic log throttle.
-    static float spotDebugTimer = 0.0f;
-    spotDebugTimer += 1.0f / 60.0f;
-    const bool emitLog = (spotDebugTimer > 5.0f);
-    if (emitLog) spotDebugTimer = 0.0f;
-
-    int audible = 0;
-    int playing = 0;
-    for (auto &se : mSpotAmbients) {
-        const float d = glm::distance(mHost->mListenerPos, se.position);
-
-        // Spawn/halt gate: voice is live whenever the listener is inside
-        // the authored outer envelope. Level<=0 spots never spawn.
-        const bool inEnvelope = (se.outer > 0.0f && d < se.outer && se.level > 0.0f);
-
-        if (!inEnvelope) {
-            if (se.handle != SOUND_HANDLE_INVALID) {
-                mHost->haltSound(se.handle, /*fadeMs=*/200);
-                se.handle = SOUND_HANDLE_INVALID;
-            }
-            continue;
-        }
-
-        ++audible;
-
-        bool justCreated = false;
-        if (se.handle == SOUND_HANDLE_INVALID) {
-            if (se.schemaName.empty()) continue;  // already counted at load
-            if (!mHost->mSchemaParser) continue;
-            const SchemaEntry *schema = mHost->mSchemaParser->findSchema(se.schemaName);
-            if (!schema || schema->samples.empty()) continue;
-
-            // Spot ambients are looping by definition + Ambient class for
-            // diffuse spatialBlend treatment.
-            se.handle = mHost->startVoice(se.schemaName, schema->samples[0].name,
-                                          se.position, schema->playParams.priority,
-                                          /*isLooping=*/true, se.objID, 0.0f,
-                                          VoiceClass::Ambient);
-            if (mHost->voiceExists(se.handle)) {
-                justCreated = true;
-                // Cap BFS at outer envelope — past outer the source is silent.
-                mHost->voiceSetMaxAudibleDist(se.handle, se.outer);
-                // Spot ambients don't carry a per-schema P$SchAttFac override
-                // in the gamesys today (it's an ambient-class property in the
-                // existing data). Leave attenuationFactor at the voice's
-                // default (1.0 = Steam Audio's DEFAULT distance behaviour).
-                mHost->voiceSetSpatialBlendOverride(se.handle, mEnvironmentalSpatialBlend);
-            }
-        }
-
-        if (se.handle == SOUND_HANDLE_INVALID) continue;
-        if (!mHost->voiceExists(se.handle)) {
-            // Voice died (priority eviction) — clear, retry next frame.
-            se.handle = SOUND_HANDLE_INVALID;
-            continue;
-        }
-
-        // Authored level (millibel) + schema-authored gain (centibel),
-        // converted to linear amplitude once. Steam Audio shapes distance
-        // / portal / occlusion downstream.
-        const int schemaVolCb = schemaVolumeCb(mHost->mSchemaParser.get(), se.schemaName);
-        const int volMb = static_cast<int>(se.level) + schemaVolCb;
-        const float linearVol = milliBelIntToLinear(volMb);
-        mHost->voiceSetLinearVolume(se.handle,
-            linearVol * mHost->currentDuckGain() * mGlobalVolumeScale);
-        ++playing;
-        (void)justCreated;
-    }
-    if (emitLog && audible > 0) {
-        AUDIO_LOG("AudioService: [SPOT_AMB] %d/%zu spot ambient(s) audible "
-                  "(%d voice(s) active)\n",
-                  audible, mSpotAmbients.size(), playing);
     }
 }
 

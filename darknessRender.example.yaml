@@ -250,12 +250,6 @@ audio:
     # the common case. Set to [] to disable (floor-only). Re-bake
     # required.
     elevations: [10.0]
-    # Add a 4-probe ring (±0.5 m on the portal plane) around every
-    # RoomService portal centroid. Densifies the pathing visibility
-    # graph at doorways so cross-room paths route through the doorway
-    # rather than wrapping around through grid probes on either side.
-    # Re-bake required.
-    portal_rings: true
     # Minimum clearance, in engine feet, between a baked probe and the
     # nearest wall of its containing room. Drops two pathological cases
     # before baking:
@@ -281,6 +275,30 @@ audio:
     # of an earlier-kept probe get dropped. Catches cross-pass overlaps.
     # 0 = dedup disabled.
     global_dedup_radius_ft: 2.0  # (0.0–10.0; re-bake required)
+
+  pathing_probes:
+    # Steam Audio pathing uses a separate, sparse probe batch
+    # (ROOM_PORTAL graph: one probe per room centroid + two probes
+    # ±offset across each portal plane). Keeping pathing density low
+    # makes `findAlternatePaths` microsecond-fast even when door OBBs
+    # invalidate baked paths at runtime; the dense reflection probe
+    # grid above is still used for IR sampling.
+    #
+    # Set to false to skip baking the pathing batch entirely. The
+    # .probes file then contains only the reflection batch and Steam
+    # Audio pathing falls back to the synthetic-bypass branch (no
+    # diffraction routing). Requires a re-bake to take effect.
+    enabled: true
+    # Proximity dedup radius (engine feet) applied after pathing-
+    # candidate emission. Drops any candidate within this distance
+    # of an earlier-emitted one — catches compound-doorway portal
+    # clusters, sub-room centroid overlap, and emitter-near-centroid
+    # coincidences. 10 ft is a good default for Thief 2 levels (room
+    # sizes 15-30 ft, compound doorways routinely cluster within 5
+    # ft). Independent of the reflection batch's
+    # global_dedup_radius_ft above. 0 disables the pass. Re-bake
+    # required.
+    dedup_radius_ft: 10.0  # (0.0–30.0)
 
   occlusion:
     # Source occlusion + global material multipliers.

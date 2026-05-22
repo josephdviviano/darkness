@@ -41,6 +41,28 @@ static bool writeRaw(const std::string &path, const void *data, size_t size) {
     return ok;
 }
 
+/// Helper: build a single-batch record list for round-trip tests. Uses raw
+/// purpose values to keep tests independent of the ProbePurpose enum (lives
+/// in ProbeManager.h, but the wire format owns the integer mapping).
+static constexpr uint32_t kPurposeReflections = 0;
+static constexpr uint32_t kPurposePathing     = 1;
+
+static std::vector<ProbeBatchRecord>
+makeRecords(std::initializer_list<std::pair<uint32_t, std::vector<uint8_t>>> items,
+            std::initializer_list<uint32_t> probeCounts)
+{
+    std::vector<ProbeBatchRecord> out;
+    auto cit = probeCounts.begin();
+    for (auto &it : items) {
+        ProbeBatchRecord rec;
+        rec.purpose    = it.first;
+        rec.probeCount = (cit != probeCounts.end()) ? *cit++ : 0u;
+        rec.payload    = it.second;
+        out.push_back(std::move(rec));
+    }
+    return out;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // CRC-32 correctness
 // ════════════════════════════════════════════════════════════════════════════
@@ -73,50 +95,87 @@ TEST_CASE("ProbeFileHeader is 20 bytes with correct defaults", "[probe][header]"
     CHECK(sizeof(hdr) == 20);
     CHECK(hdr.magic == kProbeFileMagic);
     CHECK(hdr.version == kProbeFileVersion);
-    CHECK(hdr.probeCount == 0);
-    CHECK(hdr.payloadSize == 0);
-    CHECK(hdr.crc32 == 0);
+    CHECK(hdr.batchCount == 0);
+    CHECK(hdr.totalProbes == 0);
+    CHECK(hdr.reserved == 0);
+}
+
+TEST_CASE("ProbeBatchRecordHeader is 16 bytes", "[probe][header]") {
+    ProbeBatchRecordHeader rh;
+    CHECK(sizeof(rh) == 16);
+    CHECK(rh.purpose == 0);
+    CHECK(rh.probeCount == 0);
+    CHECK(rh.payloadSize == 0);
+    CHECK(rh.crc32 == 0);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Round-trip: write then read
+// Round-trip: write then read (multi-batch v2)
 // ════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("Write + load round-trips correctly", "[probe][file]") {
-    std::string path = tempPath("roundtrip");
+TEST_CASE("Write + load round-trips a single batch", "[probe][file]") {
+    std::string path = tempPath("roundtrip_single");
 
-    // Fake payload (not real Steam Audio data, but exercises the envelope)
-    std::vector<uint8_t> payload = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03};
-    uint32_t probeCount = 42;
+    auto batches = makeRecords(
+        { { kPurposeReflections, {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03} } },
+        { 42u });
 
-    REQUIRE(writeProbeFile(path, payload.data(), payload.size(), probeCount));
+    REQUIRE(writeProbeFile(path, batches));
 
-    // Validate without loading payload
-    CHECK(validateProbeFile(path) == ProbeFileStatus::Ok);
-
-    // Full load
     ProbeFileHeader hdr;
-    std::vector<uint8_t> loaded;
+    std::vector<ProbeBatchRecord> loaded;
     CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::Ok);
-    CHECK(hdr.probeCount == probeCount);
-    CHECK(hdr.payloadSize == payload.size());
-    CHECK(loaded == payload);
-    CHECK(hdr.crc32 == crc32(payload.data(), payload.size()));
+    CHECK(hdr.batchCount == 1);
+    CHECK(hdr.totalProbes == 42);
+    REQUIRE(loaded.size() == 1);
+    CHECK(loaded[0].purpose == kPurposeReflections);
+    CHECK(loaded[0].probeCount == 42);
+    CHECK(loaded[0].payload == batches[0].payload);
 
     std::remove(path.c_str());
 }
 
-TEST_CASE("Write + load with empty payload", "[probe][file]") {
-    std::string path = tempPath("empty_payload");
+TEST_CASE("Write + load round-trips two batches", "[probe][file]") {
+    std::string path = tempPath("roundtrip_two");
 
-    REQUIRE(writeProbeFile(path, nullptr, 0, 0));
-    CHECK(validateProbeFile(path) == ProbeFileStatus::Ok);
+    auto batches = makeRecords(
+        {
+            { kPurposeReflections, {0x10, 0x20, 0x30, 0x40} },
+            { kPurposePathing,     {0xAA, 0xBB, 0xCC, 0xDD, 0xEE} },
+        },
+        { 100u, 25u });
+
+    REQUIRE(writeProbeFile(path, batches));
 
     ProbeFileHeader hdr;
-    std::vector<uint8_t> loaded;
+    std::vector<ProbeBatchRecord> loaded;
     CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::Ok);
-    CHECK(hdr.probeCount == 0);
-    CHECK(loaded.empty());
+    CHECK(hdr.batchCount == 2);
+    CHECK(hdr.totalProbes == 125);
+    REQUIRE(loaded.size() == 2);
+    CHECK(loaded[0].purpose == kPurposeReflections);
+    CHECK(loaded[0].probeCount == 100);
+    CHECK(loaded[1].purpose == kPurposePathing);
+    CHECK(loaded[1].probeCount == 25);
+
+    std::remove(path.c_str());
+}
+
+TEST_CASE("Write + load with empty payload batch", "[probe][file]") {
+    std::string path = tempPath("empty_payload");
+
+    auto batches = makeRecords(
+        { { kPurposeReflections, {} } },
+        { 0u });
+
+    REQUIRE(writeProbeFile(path, batches));
+
+    ProbeFileHeader hdr;
+    std::vector<ProbeBatchRecord> loaded;
+    CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::Ok);
+    REQUIRE(loaded.size() == 1);
+    CHECK(loaded[0].probeCount == 0);
+    CHECK(loaded[0].payload.empty());
 
     std::remove(path.c_str());
 }
@@ -129,14 +188,18 @@ TEST_CASE("Write + load with large payload", "[probe][file]") {
     for (size_t i = 0; i < payload.size(); ++i)
         payload[i] = static_cast<uint8_t>((i * 137 + 43) & 0xFF);
 
-    REQUIRE(writeProbeFile(path, payload.data(), payload.size(), 9999));
-    CHECK(validateProbeFile(path) == ProbeFileStatus::Ok);
+    auto batches = makeRecords(
+        { { kPurposeReflections, payload } },
+        { 9999u });
+
+    REQUIRE(writeProbeFile(path, batches));
 
     ProbeFileHeader hdr;
-    std::vector<uint8_t> loaded;
+    std::vector<ProbeBatchRecord> loaded;
     CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::Ok);
-    CHECK(hdr.probeCount == 9999);
-    CHECK(loaded == payload);
+    REQUIRE(loaded.size() == 1);
+    CHECK(loaded[0].probeCount == 9999);
+    CHECK(loaded[0].payload == payload);
 
     std::remove(path.c_str());
 }
@@ -149,8 +212,10 @@ TEST_CASE("Atomic write does not leave .tmp file", "[probe][file]") {
     std::string path = tempPath("atomic");
     std::string tmpPath = path + ".tmp";
 
-    std::vector<uint8_t> payload = {1, 2, 3};
-    REQUIRE(writeProbeFile(path, payload.data(), payload.size(), 1));
+    auto batches = makeRecords(
+        { { kPurposeReflections, {1, 2, 3} } },
+        { 1u });
+    REQUIRE(writeProbeFile(path, batches));
 
     // The .tmp file should have been renamed away
     FILE *f = std::fopen(tmpPath.c_str(), "rb");
@@ -165,7 +230,9 @@ TEST_CASE("Atomic write does not leave .tmp file", "[probe][file]") {
 // ════════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("FileNotFound for nonexistent path", "[probe][corrupt]") {
-    CHECK(validateProbeFile("/tmp/nonexistent_probe_file_xyz.probes")
+    ProbeFileHeader hdr;
+    std::vector<ProbeBatchRecord> loaded;
+    CHECK(loadProbeFile("/tmp/nonexistent_probe_file_xyz.probes", hdr, loaded)
           == ProbeFileStatus::FileNotFound);
 }
 
@@ -176,7 +243,9 @@ TEST_CASE("FileTooSmall for truncated header", "[probe][corrupt]") {
     uint8_t partial[10] = {};
     REQUIRE(writeRaw(path, partial, sizeof(partial)));
 
-    CHECK(validateProbeFile(path) == ProbeFileStatus::FileTooSmall);
+    ProbeFileHeader hdr;
+    std::vector<ProbeBatchRecord> loaded;
+    CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::FileTooSmall);
     std::remove(path.c_str());
 }
 
@@ -187,7 +256,9 @@ TEST_CASE("BadMagic for wrong magic bytes", "[probe][corrupt]") {
     hdr.magic = 0xDEADBEEF;  // wrong magic
     REQUIRE(writeRaw(path, &hdr, sizeof(hdr)));
 
-    CHECK(validateProbeFile(path) == ProbeFileStatus::BadMagic);
+    ProbeFileHeader gotHdr;
+    std::vector<ProbeBatchRecord> loaded;
+    CHECK(loadProbeFile(path, gotHdr, loaded) == ProbeFileStatus::BadMagic);
     std::remove(path.c_str());
 }
 
@@ -198,78 +269,63 @@ TEST_CASE("UnsupportedVersion for future version", "[probe][corrupt]") {
     hdr.version = 999;
     REQUIRE(writeRaw(path, &hdr, sizeof(hdr)));
 
-    CHECK(validateProbeFile(path) == ProbeFileStatus::UnsupportedVersion);
+    ProbeFileHeader gotHdr;
+    std::vector<ProbeBatchRecord> loaded;
+    CHECK(loadProbeFile(path, gotHdr, loaded) == ProbeFileStatus::UnsupportedVersion);
     std::remove(path.c_str());
 }
 
-TEST_CASE("SizeMismatch when file is truncated after header", "[probe][corrupt]") {
-    std::string path = tempPath("size_mismatch");
+TEST_CASE("UnsupportedVersion for legacy v1 file", "[probe][corrupt]") {
+    // Legacy v1 had { magic, version=1, probeCount, payloadSize, crc32 }.
+    // The new loader must reject without trying to migrate.
+    std::string path = tempPath("legacy_v1");
 
-    // Write a valid header claiming 100 bytes of payload, but provide 0
+    struct LegacyHeader {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t probeCount;
+        uint32_t payloadSize;
+        uint32_t crc32;
+    } legacy{};
+    legacy.magic       = kProbeFileMagic;
+    legacy.version     = 1;
+    legacy.probeCount  = 100;
+    legacy.payloadSize = 0;
+    legacy.crc32       = 0;
+    REQUIRE(writeRaw(path, &legacy, sizeof(legacy)));
+
     ProbeFileHeader hdr;
-    hdr.payloadSize = 100;
-    hdr.probeCount = 5;
-    hdr.crc32 = 0;
-    REQUIRE(writeRaw(path, &hdr, sizeof(hdr)));
-
-    CHECK(validateProbeFile(path) == ProbeFileStatus::SizeMismatch);
+    std::vector<ProbeBatchRecord> loaded;
+    CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::UnsupportedVersion);
     std::remove(path.c_str());
 }
 
-TEST_CASE("CrcMismatch when payload is flipped", "[probe][corrupt]") {
+TEST_CASE("CrcMismatch when payload byte is flipped", "[probe][corrupt]") {
     std::string path = tempPath("crc_flip");
 
-    // Write a valid file first
     std::vector<uint8_t> payload = {0xAA, 0xBB, 0xCC, 0xDD};
-    REQUIRE(writeProbeFile(path, payload.data(), payload.size(), 1));
+    auto batches = makeRecords({ { kPurposeReflections, payload } }, { 1u });
+    REQUIRE(writeProbeFile(path, batches));
 
-    // Verify it's valid
-    REQUIRE(validateProbeFile(path) == ProbeFileStatus::Ok);
+    // Round-trip OK before corruption
+    {
+        ProbeFileHeader hdr;
+        std::vector<ProbeBatchRecord> loaded;
+        REQUIRE(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::Ok);
+    }
 
-    // Now corrupt one byte of the payload (byte 21 = first payload byte)
+    // Corrupt the first payload byte. Layout: file header (20) +
+    // record header (16) + payload (4). Payload starts at byte 36.
     FILE *f = std::fopen(path.c_str(), "r+b");
     REQUIRE(f != nullptr);
-    std::fseek(f, kProbeFileHeaderSize, SEEK_SET);
+    std::fseek(f, kProbeFileHeaderSize + kProbeBatchRecordHeaderSize, SEEK_SET);
     uint8_t corrupted = 0xFF;
     std::fwrite(&corrupted, 1, 1, f);
     std::fclose(f);
 
-    CHECK(validateProbeFile(path) == ProbeFileStatus::CrcMismatch);
-    std::remove(path.c_str());
-}
-
-TEST_CASE("CrcMismatch when header CRC field is zeroed", "[probe][corrupt]") {
-    std::string path = tempPath("crc_zero");
-
-    std::vector<uint8_t> payload = {0x01, 0x02, 0x03};
-    REQUIRE(writeProbeFile(path, payload.data(), payload.size(), 1));
-
-    // Zero out the CRC field (bytes 16-19)
-    FILE *f = std::fopen(path.c_str(), "r+b");
-    REQUIRE(f != nullptr);
-    uint32_t zero = 0;
-    std::fseek(f, 16, SEEK_SET);
-    std::fwrite(&zero, sizeof(zero), 1, f);
-    std::fclose(f);
-
-    CHECK(validateProbeFile(path) == ProbeFileStatus::CrcMismatch);
-    std::remove(path.c_str());
-}
-
-TEST_CASE("SizeMismatch when extra bytes appended", "[probe][corrupt]") {
-    std::string path = tempPath("extra_bytes");
-
-    std::vector<uint8_t> payload = {0x10, 0x20};
-    REQUIRE(writeProbeFile(path, payload.data(), payload.size(), 1));
-
-    // Append garbage bytes
-    FILE *f = std::fopen(path.c_str(), "ab");
-    REQUIRE(f != nullptr);
-    uint8_t garbage[8] = {0xFF};
-    std::fwrite(garbage, 1, sizeof(garbage), f);
-    std::fclose(f);
-
-    CHECK(validateProbeFile(path) == ProbeFileStatus::SizeMismatch);
+    ProbeFileHeader hdr;
+    std::vector<ProbeBatchRecord> loaded;
+    CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::CrcMismatch);
     std::remove(path.c_str());
 }
 

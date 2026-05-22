@@ -55,28 +55,20 @@ struct AmbientSound {
     SoundHandle handle = SOUND_HANDLE_INVALID; ///< Active voice handle (if playing)
 };
 
-/// Spot ambient — alternative ambient encoding with a hard inner/outer
-/// envelope (loaded from P$SpotAmb). The envelope is now used as a hard
-/// spawn/halt boundary only (d >= outer → halt); in-band volume shaping
-/// is delegated to Steam Audio's per-voice DSP chain. `inner` is preserved
-/// on the struct but no longer drives a fade-in zone; revisit if designers
-/// need authored fade-in distance back.
-struct SpotAmbient {
-    int objID = 0;
-    std::string schemaName;       ///< Schema name (resolved from emitter object's archetype)
-    Vector3 position{0, 0, 0};
-    float inner = 0.0f;           ///< Authored inner radius (preserved; not currently consumed)
-    float outer = 0.0f;           ///< Hard halt boundary (d >= outer → voice halts)
-    float level = 1.0f;           ///< Authored linear volume scalar
-    SoundHandle handle = SOUND_HANDLE_INVALID;
-};
+// NOTE: there was previously a `SpotAmbient` struct here, plus a parallel
+// loader / per-frame lifecycle, that interpreted P$SpotAmb as a second
+// audio-ambient encoding (inner/outer/level). That was a misidentification
+// — P$SpotAmb is a renderer "SpotlightAndAmbient" property, not audio. The
+// audio path has been removed; the property struct now lives at
+// PropSpotlightAndAmbient in DarkPropertyDefs.h, awaiting renderer wiring.
+// See TASKS.TODO.md "SpotlightAndAmbient lighting".
 
-/// Manages ambient sound lifecycle: parses P$AmbientHack and P$SpotAmb
-/// from mission data, starts/stops voices based on listener distance
-/// with hysteresis, and applies a per-voice linear volume each frame.
-/// Loudness shaping (distance / portal / occlusion) is delegated to
-/// Steam Audio's per-voice DSP chain. Owned by AudioService; constructed
-/// in the service's constructor and torn down with it.
+/// Manages ambient sound lifecycle: parses P$AmbientHack from mission data,
+/// starts/stops voices based on listener distance with hysteresis, and
+/// applies a per-voice linear volume each frame. Loudness shaping (distance
+/// / portal / occlusion) is delegated to Steam Audio's per-voice DSP chain.
+/// Owned by AudioService; constructed in the service's constructor and torn
+/// down with it.
 class AmbientSoundManager {
 public:
     explicit AmbientSoundManager(AudioService *host);
@@ -90,22 +82,14 @@ public:
     /// parser, and the property/object services are ready first.
     void loadAmbientSounds();
 
-    /// Load spot ambients (P$SpotAmb) from mission data.
-    void loadSpotAmbients();
-
     /// Per-frame update for P$AmbientHack ambients: starts/stops voices
     /// based on hysteresis around the authored radius and applies the
     /// authored (centibel) volume + duck + global scale once per frame.
     void updateAmbientVolumes();
 
-    /// Per-frame update for P$SpotAmb spot ambients: starts/stops voices
-    /// based on the authored outer halt boundary and applies the
-    /// authored (millibel) level + duck + global scale once per frame.
-    void updateSpotAmbientVolumes();
-
-    /// Drop all parsed ambient/spot-ambient state. Voices are NOT halted
-    /// here — the caller (AudioService::shutdown / onDBDrop) is expected
-    /// to have already called haltAll() before clearing the bookkeeping.
+    /// Drop all parsed ambient state. Voices are NOT halted here — the
+    /// caller (AudioService::shutdown / onDBDrop) is expected to have
+    /// already called haltAll() before clearing the bookkeeping.
     void clear();
 
     /// Asymmetric hysteresis multipliers — start >= 1.0, stop > start.
@@ -121,18 +105,17 @@ public:
     void setEnvironmentalSpatialBlend(float b) { mEnvironmentalSpatialBlend = b; }
     float getEnvironmentalSpatialBlend() const { return mEnvironmentalSpatialBlend; }
 
-    /// Global multiplier applied to every ambient + spot-ambient voice's
-    /// per-frame linear volume. Compensates for the loudness re-baseline
-    /// introduced when Steam Audio became the sole player-audio
-    /// propagation authority (no more centibel falloff curve over schema
-    /// radius). Default 1.0 = no change; designers tune by ear.
+    /// Global multiplier applied to every ambient voice's per-frame linear
+    /// volume. Compensates for the loudness re-baseline introduced when
+    /// Steam Audio became the sole player-audio propagation authority (no
+    /// more centibel falloff curve over schema radius). Default 1.0 = no
+    /// change; designers tune by ear.
     void setGlobalVolumeScale(float s) { mGlobalVolumeScale = (s < 0.0f ? 0.0f : s); }
     float getGlobalVolumeScale() const { return mGlobalVolumeScale; }
 
-    /// Read-only views (used for the global audio status dump in
+    /// Read-only view (used for the global audio status dump in
     /// AudioService::loopStep and other diagnostics).
     const std::vector<AmbientSound> &getAmbients() const { return mAmbients; }
-    const std::vector<SpotAmbient> &getSpotAmbients() const { return mSpotAmbients; }
 
     /// Live ambient voice count — number of P$AmbientHack ambients with
     /// an active voice this frame. Used by the audio status dump.
@@ -143,9 +126,6 @@ private:
 
     /// Active ambient sounds parsed from P$AmbientHack properties.
     std::vector<AmbientSound> mAmbients;
-
-    /// Active spot-ambient instances parsed from P$SpotAmb properties.
-    std::vector<SpotAmbient> mSpotAmbients;
 
     // ── Tuning (mirrors of the previous AudioService fields) ──
     float       mEnvironmentalSpatialBlend = 0.3f;

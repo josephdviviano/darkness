@@ -241,10 +241,12 @@ enum AmbientHackFlags : uint32_t {
     AMB_AUTO_OFF = 0x100,     ///< Auto-disable when out of range
 };
 
-/// AmbientSound and SpotAmbient structs are owned by AmbientSoundManager
-/// (see AmbientSoundManager.h). The manager is responsible for parsing
-/// P$AmbientHack / P$SpotAmb and per-frame voice lifecycle. Loudness
-/// shaping is delegated to Steam Audio's per-voice DSP chain.
+/// AmbientSound is owned by AmbientSoundManager (see AmbientSoundManager.h).
+/// The manager is responsible for parsing P$AmbientHack and per-frame voice
+/// lifecycle. Loudness shaping is delegated to Steam Audio's per-voice DSP
+/// chain. (P$SpotAmb was previously mis-loaded here as a second ambient
+/// encoding; it's actually a renderer SpotlightAndAmbient property — see
+/// PropSpotlightAndAmbient in DarkPropertyDefs.h.)
 
 /// Maximum simultaneous active voices (matches Dark Engine's limit)
 constexpr int MAX_ACTIVE_VOICES = 64;
@@ -277,8 +279,8 @@ class AudioService : public ServiceImpl<AudioService>,
                      public DatabaseListener,
                      public LoopClient {
     // AmbientSoundManager is an extracted subsystem that owns ambient
-    // lifecycle (P$AmbientHack + P$SpotAmb). It needs to reach this
-    // service's private state (mVoicePool, mReflectionMixNode,
+    // lifecycle (P$AmbientHack). It needs to reach this service's
+    // private state (mVoicePool, mReflectionMixNode,
     // mSchemaParser, startVoice, haltSound, publishSoundEmission,
     // mListenerPos) through its back-pointer — befriending keeps that
     // access narrow and avoids widening the public API.
@@ -761,10 +763,10 @@ public:
     // less like they emit from a single point. Object-attached ambients
     // (no AMB_ENVIRONMENTAL flag) ignore this and stay at full HRTF.
     void setAmbEnvironmentalSpatialBlend(float b);
-    /// Global linear volume multiplier on every ambient + spot-ambient
-    /// voice (1.0 = no change). Compensates for the loudness re-baseline
-    /// introduced when Steam Audio became the sole player-audio propagation
-    /// authority. Tuned by ear at the YAML layer.
+    /// Global linear volume multiplier on every ambient voice (1.0 = no
+    /// change). Compensates for the loudness re-baseline introduced when
+    /// Steam Audio became the sole player-audio propagation authority.
+    /// Tuned by ear at the YAML layer.
     void setAmbGlobalVolumeScale(float s);
 
     // ── Performance tuning (some MUST be set BEFORE buildAcousticScene) ──
@@ -845,10 +847,6 @@ public:
      *  ceiling-mounted emitters route through pathing probes near their
      *  actual height. Empty vector = floor-only (legacy). */
     void setProbeElevations(std::vector<float> heights);
-    /** Toggle the per-portal probe ring. When true, bakeProbes adds 4
-     *  probes (±0.5 m on the portal plane) around each RoomService
-     *  portal centroid. */
-    void setProbePortalRings(bool enabled);
 
     /** Minimum clearance, in engine feet, between any baked probe and
      *  the nearest VERTICAL wall of its containing room. Bake-time
@@ -880,12 +878,53 @@ public:
     }
     float getProbeGlobalDedupRadiusFt() const { return mProbeGlobalDedupRadiusFt; }
 
+    /** Toggle the sparse ROOM_PORTAL pathing probe batch. When true (the
+     *  default), bakeProbes produces a second IPLProbeBatch with one
+     *  probe per Room centroid + two probes per RoomPortal. When false,
+     *  the .probes file contains only the dense reflection batch and
+     *  runtime Steam Audio pathing is effectively disabled (synthetic
+     *  bypass branch). Takes effect on the next bake. */
+    void setPathingProbeBatchEnabled(bool enabled) {
+        mProbePathingBatchEnabled = enabled;
+    }
+    bool getPathingProbeBatchEnabled() const { return mProbePathingBatchEnabled; }
+
+    /** Proximity dedup radius for the pathing batch (engine feet). Applied
+     *  after all pathing-candidate emission (portals → centroids →
+     *  emitters). Tuned independently from the reflection batch's
+     *  global_dedup_radius_ft. 0 disables the pass. Takes effect on
+     *  the next bake. */
+    void setPathingDedupRadiusFt(float ft) {
+        mProbePathingDedupRadiusFt = std::max(0.0f, std::min(ft, 30.0f));
+    }
+    float getPathingDedupRadiusFt() const { return mProbePathingDedupRadiusFt; }
+
     /** Snapshot of probe positions in feet (engine units). Populated by
      *  bakeProbes() and loadProbes(); empty if no probes are loaded. Used
      *  by the renderer to draw a debug overlay. The vector is rebuilt on
      *  every bake/load, so cache by index — values do not change between
      *  re-bakes. */
     const std::vector<Vector3> &getProbePositions() const;
+
+    /** Pathing-batch probe positions (feet). Empty if no pathing batch
+     *  is loaded (e.g. audio.pathing_probes.enabled = false in yaml).
+     *  Parallel API to getProbePositions(), which returns the reflection
+     *  batch — the two batches are independent and have different counts. */
+    const std::vector<Vector3> &getPathingProbePositions() const;
+
+    /** Per-pathing-probe debug visualization data. One entry per pathing
+     *  probe (parallel to getPathingProbePositions). `roomID` is set via
+     *  RoomService::roomFromPoint at call-time (so it picks up runtime
+     *  room edits) and falls back to -1 when the probe sits in BSP void
+     *  or RoomService is unavailable — the debug overlay filters those
+     *  out so they never render. Used by `show_probe_radius` to draw
+     *  influence spheres filtered to the camera-nearest rooms. */
+    struct PathingProbeViz {
+        Vector3 position{0.0f, 0.0f, 0.0f};
+        float   radiusFt = 0.0f;
+        int32_t roomID   = -1;
+    };
+    std::vector<PathingProbeViz> getPathingProbeViz() const;
 
     /** Per-probe reachability classification, parallel to
      *  getProbePositions(). Populated by classifyProbeReachability();
@@ -1128,11 +1167,11 @@ private:
 
     // ── Ambient sound management ──
     //
-    // P$AmbientHack and P$SpotAmb lifecycle (load, per-frame volume
-    // updates with hysteresis + falloff) lives in AmbientSoundManager.
-    // This service owns the manager and forwards tuning setters to it;
-    // it also exposes the manager to the friend class via the back-
-    // pointer in AmbientSoundManager.
+    // P$AmbientHack lifecycle (load, per-frame volume updates with
+    // hysteresis + falloff) lives in AmbientSoundManager. This service
+    // owns the manager and forwards tuning setters to it; it also
+    // exposes the manager to the friend class via the back-pointer in
+    // AmbientSoundManager.
     std::unique_ptr<AmbientSoundManager> mAmbientManager;
 
     /// Periodic (~5 s) audio status dump — voice counts, callback budget,
@@ -1158,9 +1197,8 @@ private:
     /// Load auxiliary per-schema / per-room sound data from mission +
     /// gamesys properties (P$SchAttFac, schema overlays, P$PrjSound /
     /// P$Heartbeat / P$SchLastSa, P$LoudRoom, P$Acoustics verification),
-    /// then trigger AmbientSoundManager::loadAmbientSounds() and the
-    /// spot-ambient loader. Called from loadSoundResources after the
-    /// schema parser is ready.
+    /// then trigger AmbientSoundManager::loadAmbientSounds(). Called
+    /// from loadSoundResources after the schema parser is ready.
     void loadAuxiliarySoundData();
 
     // ── Voice-state accessors exposed to AmbientSoundManager ──
@@ -1182,7 +1220,7 @@ private:
     // volume out to N meters before 1/d falloff. Clamped [0.1, 100].
     void voiceSetAttenuationFactor(SoundHandle handle, float factor);
     // Override the voice's HRTF/mono spatialBlend (atomic, audio-thread
-    // safe). Used for AMB_ENVIRONMENTAL ambients + spot ambients.
+    // safe). Used for AMB_ENVIRONMENTAL ambients.
     void voiceSetSpatialBlendOverride(SoundHandle handle, float blend);
     // Apply a final ma_sound_set_volume() to the voice. AmbientSoundManager
     // computes the linear gain and applies the duck multiplier; this
@@ -1220,17 +1258,15 @@ private:
 
     /// AMBIENT chunk — single int32 holding the ObjID of the
     /// environmental ambient (the single global "background music-like"
-    /// ambient slot, distinct from spot ambients) that was active at
-    /// save time. 0 means "no environmental ambient was active". The
-    /// original engine wrote it from AmbientSave() to support save-game
-    /// resume; pristine shipping missions ship with 0 (only one Thief 2
-    /// mission, miss14, ships with a nonzero pre-set env ambient).
+    /// ambient slot) that was active at save time. 0 means "no
+    /// environmental ambient was active". The original engine wrote it
+    /// from AmbientSave() to support save-game resume; pristine shipping
+    /// missions ship with 0 (only one Thief 2 mission, miss14, ships
+    /// with a nonzero pre-set env ambient).
     ///
-    /// Spot ambients (P$SpotAmb, owned by AmbientSoundManager) are
-    /// orthogonal — they live on individual objects and are started by
-    /// player proximity, not gated by this value. This field is captured
-    /// for future SAV-file resume + the miss14-style level-start env
-    /// ambient case; it is NOT a level-wide enable flag.
+    /// This field is captured for future SAV-file resume + the
+    /// miss14-style level-start env ambient case; it is NOT a level-wide
+    /// enable flag.
     bool mHasAmbientChunk = false;
     int32_t mEnvAmbientObjID = 0;
 
@@ -1338,8 +1374,24 @@ private:
         std::vector<float>    localVertices;
         std::vector<int32_t>  indices;
         Matrix4               worldTransform{1.0f};
+        /// Cached world-space AABB of the door mesh in ENGINE coordinates
+        /// (Z-up feet). Recomputed from localVertices × worldTransform by
+        /// registerDoorGeometry and setDoorTransform. Used by the
+        /// [PATH_PROBE_DOOR] diagnostic to check whether a baked probe sits
+        /// inside or near a door's footprint (the "probe-as-sound-transport
+        /// over a closed door" failure mode).
+        Vector3 worldAABBmin{0.0f, 0.0f, 0.0f};
+        Vector3 worldAABBmax{0.0f, 0.0f, 0.0f};
     };
     std::unordered_map<int32_t, DoorAudioInstance> mDoorAudioInstances;
+
+    /// Recompute worldAABBmin/max for a single door instance from its cached
+    /// localVertices × worldTransform. Called by registerDoorGeometry on
+    /// initial registration and by setDoorTransform on every transform push.
+    /// Engine coordinates (Z-up feet) — same frame as voice->worldPos and
+    /// ProbeManager::getProbePositions, so the [PATH_PROBE_DOOR] diagnostic
+    /// can compare directly without engine↔IPL conversion.
+    void recomputeDoorWorldAABB(DoorAudioInstance &inst) const;
 
     /// Set by setDoorTransform; consumed (and cleared) at the top of the
     /// next loopStep. Coalesces multiple per-frame door transform updates
@@ -1472,11 +1524,9 @@ private:
 
     /// Per-mission extra probe placement, snapshot at config-load time and
     /// consumed by `bakeProbes`. `mProbeElevations` adds elevated copies
-    /// of the floor grid (heights in engine feet); `mProbePortalRings`
-    /// triggers a 4-probe ring around each RoomService portal centroid.
-    /// Both take effect only on the NEXT bake.
+    /// of the floor grid (heights in engine feet). Takes effect only on
+    /// the NEXT bake.
     std::vector<float> mProbeElevations = { 10.0f };
-    bool               mProbePortalRings = true;
 
     /// Minimum probe-to-wall clearance (engine feet) enforced at bake
     /// time. Probes whose containing room reports a nearer plane are
@@ -1492,6 +1542,21 @@ private:
     /// Global dedup pass radius (engine feet); see setProbeGlobalDedupRadiusFt.
     /// Default 2.0 = catches obvious overlaps without trimming the grid.
     float              mProbeGlobalDedupRadiusFt = 2.0f;
+
+    /// Whether to bake a second probe batch (sparse ROOM_PORTAL graph)
+    /// for Steam Audio pathing. Default true. When false, the .probes
+    /// file contains the reflection batch only and runtime pathing is
+    /// effectively disabled (synthetic-bypass branch). Set from yaml
+    /// (`audio.pathing_probes.enabled`).
+    bool               mProbePathingBatchEnabled = true;
+
+    /// Proximity dedup radius for the PATHING batch (engine feet). 0
+    /// disables the pass. Tuned independently from the reflection
+    /// batch's global_dedup_radius_ft. Default 10 ft — empirically
+    /// drops most compound-doorway clusters in Thief 2 levels without
+    /// collapsing legitimately distinct rooms. Set from yaml
+    /// (`audio.pathing_probes.dedup_radius_ft`).
+    float              mProbePathingDedupRadiusFt = 10.0f;
 
     // Volumetric occlusion sphere radius + sample count moved to
     // AudioOcclusion (mAudioOcclusion). The setters/getters above are
