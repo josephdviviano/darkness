@@ -222,7 +222,7 @@ audio:
       bounces: 16                # bake bounces (1–64)
       duration: 4.0              # bake IR duration in seconds (>= realtime.duration)
       diffuse_samples: 1024      # bake diffuse samples (32–4096)
-      ambisonics_order: 1        # bake ambisonic order (0–3); match runtime ambisonics_order to skip the downmix step at probe-interp time
+      ambisonics_order: 2        # bake ambisonic order (0–3); may be higher than runtime ambisonics_order — Steam Audio's IPLReflectionEffectParams.numChannels lets the runtime process only the first N channels (per phonon.h: "May be less than the number of channels specified when creating the effect"), so a higher-order bake is read at the runtime cap with no extra work. The unused higher-order channels are dropped at apply time.
 
     # [REFLECTIONS] Runtime IR-length clamp (ms). 0 = disabled. >0 = cap
     # per-voice iplReflectionEffectApply convolution to the first N ms of
