@@ -458,30 +458,66 @@ inline void ObjectIlluminator::buildLightArray(int32_t objId,
     // Unlike `compute()` we skip the cosine and the 1/dist factors —
     // the GPU applies both per-vertex. The animated-light multiplier
     // IS folded here (the shader doesn't know about animation).
-    int evalN = std::min(n, kObjectLightCap);
-    for (int i = 0; i < evalN && out.count < kObjectLightCap; ++i) {
+    //
+    // Cell engine cap is 96 lights per cell; the GPU array cap is
+    // kObjectLightCap (32). When a cell has more visible lights than
+    // the GPU cap, partial-sort the non-sun candidates by squared
+    // distance and keep the nearest. The sun (idx 0) is exempt and
+    // always packed first — at its patched far distance it would lose
+    // every contest, but its directional contribution matters.
+    struct Cand {
+        const WRStaticLight *L;
+        float multiplier;
+        float dist2;
+    };
+    Cand cands[96];
+    int candCount = 0;
+    bool hasSun = false;
+
+    int evalN = std::min(n, 96);
+    for (int i = 0; i < evalN; ++i) {
         if (!(cache.bits[i >> 5] & (1u << (i & 31)))) continue;
 
         int32_t lightIdx = lt[1 + i];
-        const WRStaticLight *L = nullptr;
-        float multiplier = 1.0f;
         if (lightIdx == 0) {
-            L = &mSunSlot;
-        } else {
-            if (lightIdx < 0 ||
-                lightIdx >= static_cast<int32_t>(mWr->staticLights.size()))
-                continue;
-            L = &mWr->staticLights[lightIdx];
-            if (lightIdx < static_cast<int32_t>(mLightMultiplier.size()))
-                multiplier = mLightMultiplier[lightIdx];
-            if (multiplier <= 0.0f) continue;
+            hasSun = true;
+            continue;
         }
+        if (lightIdx < 0 ||
+            lightIdx >= static_cast<int32_t>(mWr->staticLights.size()))
+            continue;
+        float multiplier = 1.0f;
+        if (lightIdx < static_cast<int32_t>(mLightMultiplier.size()))
+            multiplier = mLightMultiplier[lightIdx];
+        if (multiplier <= 0.0f) continue;
 
+        const WRStaticLight &L = mWr->staticLights[lightIdx];
+        Vector3 d = L.loc - pos;
+        cands[candCount++] = Cand{&L, multiplier, glm::dot(d, d)};
+    }
+
+    int sunReserve = hasSun ? 1 : 0;
+    int budget = kObjectLightCap - sunReserve;
+    if (candCount > budget) {
+        std::partial_sort(cands, cands + budget, cands + candCount,
+            [](const Cand &a, const Cand &b) { return a.dist2 < b.dist2; });
+        candCount = budget;
+    }
+
+    if (hasSun) {
         int slot = out.count++;
-        out.loc[slot]    = glm::vec4(L->loc, L->inner);
-        out.dir[slot]    = glm::vec4(L->dir, L->outer);
-        out.bright[slot] = glm::vec4(L->bright * multiplier,
-                                     L->radius > 0.0f ? L->radius * L->radius : 0.0f);
+        out.loc[slot]    = glm::vec4(mSunSlot.loc, mSunSlot.inner);
+        out.dir[slot]    = glm::vec4(mSunSlot.dir, mSunSlot.outer);
+        out.bright[slot] = glm::vec4(mSunSlot.bright,
+                                     mSunSlot.radius > 0.0f ? mSunSlot.radius * mSunSlot.radius : 0.0f);
+    }
+    for (int i = 0; i < candCount && out.count < kObjectLightCap; ++i) {
+        const Cand &c = cands[i];
+        int slot = out.count++;
+        out.loc[slot]    = glm::vec4(c.L->loc, c.L->inner);
+        out.dir[slot]    = glm::vec4(c.L->dir, c.L->outer);
+        out.bright[slot] = glm::vec4(c.L->bright * c.multiplier,
+                                     c.L->radius > 0.0f ? c.L->radius * c.L->radius : 0.0f);
     }
 
     // Step 6: dynamic lights — same portal raycast as `compute()`,

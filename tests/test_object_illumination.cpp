@@ -658,3 +658,64 @@ TEST_CASE("buildLightArray: emits ambient when there are no listed lights",
     CHECK(out.count == 0);
     CHECK_THAT(out.ambient.x, WithinAbs(0.4f, 1e-4f));
 }
+
+TEST_CASE("buildLightArray: keeps nearest kObjectLightCap when cell has more",
+          "[lighting][pervertex]") {
+    // Cell holds 50 lights but the GPU array caps at kObjectLightCap (32).
+    // Slot 0 is the sun (exempt from the sort, always packed). Slots 1..49
+    // are placed at integer distances 1, 2, ..., 49 along +X with unique
+    // brightness so each can be identified after packing. With the sun
+    // reserving one slot, 31 of the 49 non-sun lights should survive — the
+    // nearest 31 (distances 1..31).
+    const int kListed = 50;
+    WRParsedData wr = makeOpenWorld(kListed);
+
+    // Sun slot (quiet — no contribution but always packed).
+    wr.staticLights[0] = WRStaticLight{
+        Vector3(0.0f), Vector3(0.0f), Vector3(0.0f),
+        -1.0f, 0.0f, 0.0f
+    };
+    // Other slots: omni at (i, 0, 0), bright.x = (float)i so we can identify
+    // each packed light by its red channel.
+    for (int i = 1; i < kListed; ++i) {
+        wr.staticLights[i] = WRStaticLight{
+            Vector3(static_cast<float>(i), 0.0f, 0.0f),
+            Vector3(0.0f),
+            Vector3(static_cast<float>(i), 0.0f, 0.0f),
+            -1.0f, 0.0f, 0.0f
+        };
+    }
+
+    RenderParams rp = makeQuietRenderParams();
+    ObjectIlluminator ill;
+    ill.setMissionData(&wr, &rp, nullptr);
+
+    GPULightArray out;
+    ill.buildLightArray(/*objId=*/1, Vector3(0.0f), /*radius=*/0.0f,
+                        /*cell=*/0, out);
+
+    REQUIRE(out.count == kObjectLightCap);
+
+    // Collect the bright.x values of the packed non-sun lights. Sun has
+    // bright = quiet sunScaledRgb = 0, so it lands in the zero bucket.
+    std::vector<int> kept;
+    bool sunPacked = false;
+    for (int i = 0; i < out.count; ++i) {
+        float r = out.bright[i].x;
+        int id = static_cast<int>(std::round(r));
+        if (id == 0) {
+            sunPacked = true;
+        } else {
+            kept.push_back(id);
+        }
+    }
+    CHECK(sunPacked);
+    REQUIRE(kept.size() == static_cast<size_t>(kObjectLightCap - 1));
+
+    // Expect exactly lights 1..31 (the 31 nearest non-sun). Sort the
+    // collected IDs and verify the contiguous run.
+    std::sort(kept.begin(), kept.end());
+    for (int i = 0; i < static_cast<int>(kept.size()); ++i) {
+        CHECK(kept[i] == i + 1);
+    }
+}
