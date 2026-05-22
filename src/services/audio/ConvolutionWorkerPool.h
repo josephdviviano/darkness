@@ -175,6 +175,13 @@ struct ConvolutionWorker {
         // Forwarded from the voice's DSP node — gates per-voice wet-peak log
         // to footstep voices.
         bool isFootstepDiag = false;
+        // Forwarded by the audio thread for the [REFLECTION_VOICE]
+        // diagnostic. The schemaCStr pointer references the owning
+        // ActiveVoice's std::string; safe within the worker's iteration
+        // because removeVoiceSource waits for the worker to drain before
+        // destroying the voice (validityToken pattern).
+        int voiceHandle = -1;
+        const char *schemaCStr = nullptr;
     };
     static constexpr int kMaxSlots = MAX_ACTIVE_VOICES;
 

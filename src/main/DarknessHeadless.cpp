@@ -712,6 +712,18 @@ static void formatPropRecord(const std::string &propName, int objID,
         std::memcpy(&dampen, bytes + 4, 4);
         std::memcpy(&height, bytes + 8, 4);
         p("eax=%u dampening=%d height=%d", eax, dampen, height);
+    } else if (propName == "AnimLight" && sz >= sizeof(PropAnimLight)) {
+        // Canonical 76-byte layout — same struct LightingSystem reads.
+        PropAnimLight al; std::memcpy(&al, bytes, sizeof(al));
+        static const char *kModeNames[10] = {
+            "FLIP","SMOOTH","RANDOM","MINBRIGHT","MAXBRIGHT",
+            "ZERO","BRIGHTEN","DIM","SEMI_RANDOM","FLICKER"
+        };
+        const char *ms = (al.mode < 10) ? kModeNames[al.mode] : "?";
+        p("ln=%d mode=%u(%s) min=%.1f max=%.1f bright=%dms dim=%dms rising=%u%s",
+          al.lightNum, al.mode, ms, al.minBrightness, al.maxBrightness,
+          al.brightenTime, al.dimTime, al.rising,
+          al.inactive ? " INACTIVE" : "");
     } else if (propName == "AmbientHa" && sz >= 60) {
         // P$AmbientHack layout: int32 radius, int32 volume, uint32 flags,
         // char[16] schema (+ 32 bytes aux we ignore here).

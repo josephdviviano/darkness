@@ -243,50 +243,6 @@ inline bool raycastWorld(const WRParsedData &wr,
 
         // ── Decision: portal pass-through or solid hit? ──
 
-        // TEMPORARY DIAGNOSTIC: log riser-plane exits to diagnose phantom cascades
-        bool riserDiag = (std::fabs(cell.planes[bestPlaneIdx].normal.y) > 0.9f ||
-                          std::fabs(cell.planes[bestPlaneIdx].normal.x) > 0.9f) &&
-                          std::fabs(cell.planes[bestPlaneIdx].normal.z) < 0.1f;
-        if (riserDiag) {
-            const auto &pn = cell.planes[bestPlaneIdx].normal;
-            std::fprintf(stderr, "[RAYCAST-DIAG] cell=%d plane=%d n=(%.3f,%.3f,%.3f) "
-                "hitPt=(%.3f,%.3f,%.3f) numSolid=%d numPortalExits=%d planeHasSolid=%d\n",
-                curCell, bestPlaneIdx, pn.x, pn.y, pn.z,
-                hitPoint.x, hitPoint.y, hitPoint.z,
-                numSolid, numPortalExits, planeHasSolid);
-            // Dump portal polygon Z bounds
-            Vector3 windNorm = -pn;
-            for (int pi = 0; pi < numPortalExits; ++pi) {
-                int pIdx = portalExits[pi].polyIdx;
-                const auto &poly = cell.polygons[pIdx];
-                const auto &indices = cell.polyIndices[pIdx];
-                float minZ = 1e9f, maxZ = -1e9f;
-                for (int vi = 0; vi < poly.count; ++vi) {
-                    float z = cell.vertices[indices[vi]].z;
-                    if (z < minZ) minZ = z;
-                    if (z > maxZ) maxZ = z;
-                }
-                bool inPoly = pointInConvexPolygon(hitPoint, cell.vertices, indices, windNorm);
-                std::fprintf(stderr, "[RAYCAST-DIAG]   portal[%d] poly=%d tgt=%d zRange=[%.3f,%.3f] inPoly=%d\n",
-                    pi, pIdx, portalExits[pi].tgtCell, minZ, maxZ, inPoly);
-            }
-            // Dump solid polygons on this plane
-            for (int si = 0; si < numSolid; ++si) {
-                if (cell.polygons[si].plane != bestPlaneIdx) continue;
-                const auto &poly = cell.polygons[si];
-                const auto &indices = cell.polyIndices[si];
-                float minZ = 1e9f, maxZ = -1e9f;
-                for (int vi = 0; vi < poly.count; ++vi) {
-                    float z = cell.vertices[indices[vi]].z;
-                    if (z < minZ) minZ = z;
-                    if (z > maxZ) maxZ = z;
-                }
-                bool inPoly = pointInConvexPolygon(hitPoint, cell.vertices, indices, windNorm);
-                std::fprintf(stderr, "[RAYCAST-DIAG]   solid[%d] poly=%d zRange=[%.3f,%.3f] inPoly=%d\n",
-                    si, si, minZ, maxZ, inPoly);
-            }
-        }
-
         // No portals on this plane → solid hit
         if (numPortalExits == 0) {
             // Find which solid polygon was hit (for texture info).

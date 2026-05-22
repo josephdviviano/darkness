@@ -138,6 +138,20 @@ struct ProbeBakeParams {
     /// = keep everything.
     ProbeFilterFn probeFilter;
 
+    /// Per-emitter anchor positions (engine feet). One probe is attempted
+    /// at each so persistent ambient sources have a graph node within
+    /// pathing visibility radius even when the floor/elevation/portal
+    /// grid leaves a coverage gap (e.g. wall-mounted fixtures whose
+    /// P$Position falls inside the visual wall mesh).
+    std::vector<Vector3> emitterPositions;
+
+    /// Filter applied specifically to the emitter-anchored pass. Should
+    /// be more permissive than `probeFilter` — typically converts the
+    /// grid filter's "in-solid → Reject (no recovery)" into
+    /// "in-solid → Nudge toward the nearest open audio room". Empty =
+    /// fall back to `probeFilter`.
+    ProbeFilterFn emitterProbeFilter;
+
     /// Informational — what wall clearance (feet) the caller's filter
     /// enforces; logged for traceability. Does NOT derive the filter.
     float minWallClearanceFt = 0.0f;

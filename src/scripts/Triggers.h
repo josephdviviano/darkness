@@ -92,7 +92,12 @@ protected:
     void onBeginScript(ScriptMessage &) override {
         if (svc && svc->physics)
             svc->physics->subscribeMsg(self, PhysicsScriptService::kEnterExitMsg);
-        setData("Population", Variant(0));
+        // Only seed Population on first script start. A re-begin (save/restore,
+        // script reload) must preserve any in-progress occupant count;
+        // otherwise objects already inside the volume would never fire TurnOff
+        // and a re-entry would re-fire TurnOn.
+        if (!isDataSet("Population"))
+            setData("Population", Variant(0));
     }
 
     void onEndScript(ScriptMessage &) override {

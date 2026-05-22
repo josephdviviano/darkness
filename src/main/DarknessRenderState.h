@@ -355,6 +355,14 @@ struct RuntimeState {
 
     // Debug: acoustic mesh wireframe overlay
     bool showAcousticMesh = false;
+
+    // Debug: door geometry wireframe overlay. Doors are registered with
+    // the audio scene as IPLInstancedMesh (separate from the static
+    // acoustic mesh) so visualizing them alongside show_acoustic_mesh
+    // gives the full picture of geometry the Steam Audio scene actually
+    // sees. Useful when diagnosing missing visibility edges between
+    // probes — closed doors are the most common dynamic occluder.
+    bool showDoorGeometry = false;
     std::vector<float> acousticVerts;     // x,y,z flat array
     std::vector<int32_t> acousticIndices; // triangle indices
     // Per-triangle TXLIST texture name (or "_portal" for rendered portal
