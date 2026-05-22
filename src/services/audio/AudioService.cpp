@@ -3787,17 +3787,27 @@ bool AudioService::initReflectionPipeline()
         return false;
     }
 
-    // Hard config validation: the runtime ambisonic decoder must match
-    // the order the probes were baked at, or the wet bus silently
-    // downmixes per callback (cost + quality loss). Refuse to init so
-    // the user notices instead of paying the downmix tax forever.
-    if (mAmbisonicsOrder != mBakeAmbisonicsOrder) {
+    // Hard config validation: the bake order must be >= the runtime
+    // (realtime) order. Steam Audio's per-frame IPLReflectionEffectParams
+    // accepts numChannels <= the effect's create-time numChannels (per
+    // phonon.h IPLReflectionEffectParams::numChannels: "May be less than
+    // the number of channels specified when creating the effect, in which
+    // case CPU usage will be reduced"). When the bake order matches or
+    // exceeds the runtime order, the runtime processes the first
+    // (runtime_order+1)^2 channels of each baked IR — extra higher-order
+    // baked channels are simply ignored at apply time. The reverse (bake
+    // order < runtime order) leaves the runtime effect handle expecting
+    // more channels than the baked IRs carry, which Steam Audio cannot
+    // synthesise. Reject only that case.
+    if (mBakeAmbisonicsOrder < mAmbisonicsOrder) {
         LOG_ERROR(
-            "AudioService: reflections.ambisonics_order (%d) != "
-            "reflections.bake.ambisonics_order (%d) — runtime decode would "
-            "downmix the baked IRs every callback. Reflection pipeline NOT "
-            "initialized. Fix darknessRender.yaml so the two values match.",
-            mAmbisonicsOrder, mBakeAmbisonicsOrder);
+            "AudioService: reflections.bake.ambisonics_order (%d) < "
+            "reflections.ambisonics_order (%d) — runtime would expect more "
+            "ambisonic channels than the bake produced. Reflection pipeline "
+            "NOT initialized. Fix darknessRender.yaml: raise "
+            "reflections.bake.ambisonics_order to at least the runtime value, "
+            "or lower reflections.ambisonics_order.",
+            mBakeAmbisonicsOrder, mAmbisonicsOrder);
         return false;
     }
 

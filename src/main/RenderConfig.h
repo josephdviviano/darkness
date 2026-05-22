@@ -448,11 +448,26 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
 
             // -- audio.reflections --
             //
-            // Layout (see PLAN.HYBRID_REVERB.md):
-            //   reflections.enabled / ambisonics_order   — shared
+            // Layout (see PLAN.AUDIO_REALTIME_ARCHITECTURE.md):
+            //   reflections.enabled                      — master toggle
+            //   reflections.ambisonics_order             — REALTIME ambisonic
+            //                                              order (top-level
+            //                                              key, for symmetry
+            //                                              with the existing
+            //                                              ambisonicsOrder
+            //                                              consumers in
+            //                                              AudioService).
             //   reflections.type / hybrid_*              — algorithm select
             //   reflections.realtime.{rays,bounces,duration,diffuse_samples}
             //   reflections.bake.{rays,bounces,duration,diffuse_samples,ambisonics_order}
+            //
+            // bake.ambisonics_order may be >= the realtime order — the
+            // runtime IPLReflectionEffect processes only the first
+            // (realtime_order+1)^2 channels of each baked IR (Steam Audio
+            // truncates the higher-order channels at apply time). The
+            // AudioService validator rejects bake_order < realtime_order
+            // only (the runtime cannot synthesise channels that the bake
+            // did not generate).
             if (YAML::Node refl = audio["reflections"]) {
                 if (refl["enabled"]) cfg.realtimeReflections = refl["enabled"].as<bool>();
 
