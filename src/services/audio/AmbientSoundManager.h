@@ -53,6 +53,14 @@ struct AmbientSound {
     /// — a future tuning pass will map this onto rolloffFactor.
     float attenuationFactor = 1.0f;
     SoundHandle handle = SOUND_HANDLE_INVALID; ///< Active voice handle (if playing)
+    /// Sticky one-way memo: set to true the first frame both startVoice
+    /// attempts (schema sample then raw schemaName) return
+    /// SOUND_HANDLE_INVALID. Gates the per-frame retry block in
+    /// updateAmbientVolumes so a permanently unresolvable ambient does
+    /// not re-emit its [FALLBACK] log every host tick. Never cleared —
+    /// the missing-sample condition does not change at runtime (CRF
+    /// resources are immutable), so we transition once and stay.
+    bool resolutionFailed = false;
 };
 
 // NOTE: there was previously a `SpotAmbient` struct here, plus a parallel

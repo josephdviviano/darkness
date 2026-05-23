@@ -199,7 +199,13 @@ void AmbientSoundManager::updateAmbientVolumes()
         const bool isEnvironmental = (amb.flags & AMB_ENVIRONMENTAL) != 0;
         bool justCreated = false;
 
-        if (amb.handle == SOUND_HANDLE_INVALID) {
+        if (amb.handle == SOUND_HANDLE_INVALID && !amb.resolutionFailed) {
+            // Memo invariant: once both startVoice attempts below fail in
+            // one frame, amb.resolutionFailed latches true and this block
+            // is skipped forever. CRF resources are immutable at runtime
+            // so a sample that's missing now will be missing every frame
+            // — without the memo, the [FALLBACK] log fires every host
+            // tick (5000+ lines per 10 broken schemas in a single run).
             const bool isLooping = !(amb.flags & AMB_ONCE_ONLY);
             // Decide VoiceClass BEFORE startVoice so createVoiceSource applies
             // the per-class default directParams on the first audio callback
@@ -210,7 +216,12 @@ void AmbientSoundManager::updateAmbientVolumes()
             const SchemaEntry *schema = mHost->mSchemaParser
                 ? mHost->mSchemaParser->findSchema(amb.schemaName) : nullptr;
 
+            // Remember the sample name we tried via the schema (for the
+            // one-shot disable log below) — empty string if the schema
+            // itself was missing or had no samples.
+            std::string schemaSampleAttempted;
             if (schema && !schema->samples.empty()) {
+                schemaSampleAttempted = schema->samples[0].name;
                 amb.handle = mHost->startVoice(amb.schemaName, schema->samples[0].name,
                                                amb.position,
                                                schema->playParams.priority,
@@ -218,13 +229,27 @@ void AmbientSoundManager::updateAmbientVolumes()
             }
             if (amb.handle == SOUND_HANDLE_INVALID) {
                 // Fallback: try the schema name as a raw sample.
-                std::fprintf(stderr,
-                    "[FALLBACK] AmbientSoundManager: schema '%s' on obj %d "
-                    "had no usable samples — trying raw sample of the same name\n",
-                    amb.schemaName.c_str(), amb.objID);
                 amb.handle = mHost->startVoice(amb.schemaName, amb.schemaName,
                                                amb.position, mDefaultPriority,
                                                isLooping, amb.objID, 0.0f, cls);
+            }
+            if (amb.handle == SOUND_HANDLE_INVALID) {
+                // Both attempts failed — latch the memo and emit ONE
+                // self-contained [FALLBACK] line. Per
+                // feedback_no_silent_fallbacks the message must be loud
+                // and identify (a) schema, (b) object, (c) what samples
+                // were attempted, and (d) the permanent-disable
+                // transition. After this frame, the retry block is gated
+                // off so this ambient stays silent without further logs.
+                amb.resolutionFailed = true;
+                std::fprintf(stderr,
+                    "[FALLBACK] AmbientSoundManager: schema '%s' on obj %d "
+                    "has no resolvable samples — disabling permanently "
+                    "(tried schema sample '%s' and raw '%s', "
+                    "disabled_permanently=1)\n",
+                    amb.schemaName.c_str(), amb.objID,
+                    schemaSampleAttempted.c_str(), amb.schemaName.c_str());
+                continue;
             }
             justCreated = mHost->voiceExists(amb.handle);
 
