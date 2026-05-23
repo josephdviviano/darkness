@@ -1206,6 +1206,40 @@ void ProbeManager::releaseBatches(IPLSimulator reflectionSimulator,
     mTotalProbeCount = 0;
 }
 
+// ── T2.4 IR cache stats dump ─────────────────────────────────────────────
+//
+// Self-throttled to ~1 Hz. Caller passes the worker pool's active-slot
+// snapshot (active vs MAX) and the eviction count from
+// `ConvolutionWorker::slotEvictionsTotal`. We read+reset our own hit/miss
+// counters so each emission window is independent.
+
+void ProbeManager::pollPerfPeriodic(int activeSlots, int maxSlots,
+                                    uint64_t evictionsSinceLast)
+{
+    static std::chrono::steady_clock::time_point sLast{};
+    auto now = std::chrono::steady_clock::now();
+    if (sLast.time_since_epoch().count() != 0) {
+        auto ms = std::chrono::duration<double, std::milli>(now - sLast).count();
+        if (ms < 1000.0) return;
+    }
+    sLast = now;
+
+    uint64_t hits   = mCacheHits.exchange(0, std::memory_order_relaxed);
+    uint64_t misses = mCacheMisses.exchange(0, std::memory_order_relaxed);
+    uint64_t total  = hits + misses;
+    double rate     = (total > 0)
+                    ? static_cast<double>(hits) / static_cast<double>(total)
+                    : 0.0;
+    AUDIO_LOG(
+        "[PERF refl_cache] hits=%llu misses=%llu hitRate=%.3f"
+        " evictions=%llu activeSlots=%d/%d\n",
+        static_cast<unsigned long long>(hits),
+        static_cast<unsigned long long>(misses),
+        rate,
+        static_cast<unsigned long long>(evictionsSinceLast),
+        activeSlots, maxSlots);
+}
+
 // ── Mission-relative probe file path ──────────────────────────────────────
 
 std::string ProbeManager::getProbeFilePath(const std::string &misPath,

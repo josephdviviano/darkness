@@ -154,6 +154,55 @@ struct ConvolutionSubWorker {
     // replacement with 0 produces audible clicks rather than full silence.
     std::atomic<uint32_t> nanCountAmbi{0};
     std::atomic<uint32_t> nanCountDecode{0};
+
+    // ── Slot-eviction tracking (T1.4) ──
+    //
+    // The IR "slot" the worker writes to each iter is just an index into
+    // staging[readBuf][i]; the IPLReflectionEffect itself is owned by the
+    // voice (slot.effect is rebound by the mix node every callback). When
+    // two different voices reuse the same staging-slot index across
+    // consecutive iterations we treat it as a slot recycle and emit
+    // `[REFL_EVICT]` once per transition. Tracking is per-sub-worker
+    // because each sub-worker iterates its own subset of slot indices.
+    //
+    // Stored across iterations:
+    //   prevSlotVoice[i]  = handle that occupied slot i last iter, or -1
+    //                       if the slot was unoccupied / fresh.
+    //   prevSlotSchemaBuf — small ring of schema names so the log line
+    //                       can cite the old voice's schema. We can't
+    //                       hold a raw const-char* across iters (the
+    //                       owning ActiveVoice may have been destroyed);
+    //                       copy into a fixed-size buffer per slot.
+    static constexpr int kSchemaNameBufLen = 24;
+    int  prevSlotVoice[MAX_ACTIVE_VOICES];
+    char prevSlotSchemaBuf[MAX_ACTIVE_VOICES][kSchemaNameBufLen];
+
+    // ── First-apply tracking (T0.2) ──
+    //
+    // First time we see a voice handle in any slot across this sub-worker
+    // we emit `[REFL_FIRST_APPLY]` so the orchestrator can distinguish
+    // "IR unpopulated for short-lived voices" from "convolution state
+    // isn't initialised on the first apply for transients". The entry
+    // is removed from the set on slot eviction so each voice incarnation
+    // gets one log line.
+    //
+    // Tracked by voice handle so a voice that bounces across sub-workers
+    // doesn't double-log within the same sub-worker — but it can log
+    // once per sub-worker (acceptable; distinct sub-workers see distinct
+    // first-apply states).
+    static constexpr int kFirstApplyTrackCap = MAX_ACTIVE_VOICES * 2;
+    int  firstAppliedHandles[kFirstApplyTrackCap];
+    int  firstAppliedCount = 0;
+
+    // ── Queue-depth for T2.3 [PERF refl_worker] ──
+    //
+    // perfQueueDepth — assignCount sampled at iter entry, one observation
+    //                  per worker iter (so percentiles count iters, not
+    //                  voices). Surfaces the "8/8 voices fed to two
+    //                  workers" vs "4/4 each" imbalance. The existing
+    //                  perfApplyMs histogram covers the apply wall-clock
+    //                  half of T2.3.
+    LatencyHistogram perfQueueDepth;
 };
 
 /// Off-thread convolution worker with K parallel sub-workers. Audio
@@ -243,6 +292,19 @@ struct ConvolutionWorker {
     // worker's processedSeq atomically.
     std::mutex             doneMtx;
     std::condition_variable doneCv;
+
+    // Counter for catastrophic-backlog frame drops + slot evictions. Both
+    // are counters, not histograms: a [PERF refl_worker] cadence of 1 Hz
+    // can read-and-reset them. Updated:
+    //   • droppedFramesTotal — by the mix node when workersTwoBehind=true
+    //                          (AudioService.cpp catastrophic-backlog
+    //                          path). The pool exposes a setter so
+    //                          AudioService can bump without taking a
+    //                          dependency on the pool's internal struct.
+    //   • slotEvictionsTotal — by the worker when a slot's voiceHandle
+    //                          changes across iters (see T1.4).
+    std::atomic<uint64_t> droppedFramesTotal{0};
+    std::atomic<uint64_t> slotEvictionsTotal{0};
 };
 
 /// Drain all sub-workers' pending frames. Called from ~ActiveVoice before
@@ -288,6 +350,24 @@ public:
 
     ConvolutionWorker* worker() { return mWorker.get(); }
     const ConvolutionWorker* worker() const { return mWorker.get(); }
+
+    /// Main-thread-paced perf log emitter for T2.3 [PERF refl_worker].
+    /// Caller invokes once per main-loop tick; we self-throttle to ~1 Hz
+    /// using a monotonic timestamp so the log cadence is stable even when
+    /// the caller's tick rate fluctuates. Reads percentiles from every
+    /// sub-worker's perfQueueDepth + perfApplyMs and emits one log line.
+    /// Idempotent if called before mWorker is constructed (early-return).
+    void pollPerfPeriodic();
+
+    /// Bumped by the mix node (AudioService.cpp catastrophic-backlog
+    /// branch) when N voice slots were thrown away because workers were
+    /// >=2 frames behind. Plain counter; pollPerfPeriodic exchanges to 0
+    /// each emission window so the next window is independent.
+    void recordDroppedVoices(int n) {
+        if (n <= 0 || !mWorker) return;
+        mWorker->droppedFramesTotal.fetch_add(
+            static_cast<uint64_t>(n), std::memory_order_relaxed);
+    }
 
     bool isActive() const { return mWorker != nullptr; }
     int numWorkers() const { return mWorker ? mWorker->numWorkers : 0; }
