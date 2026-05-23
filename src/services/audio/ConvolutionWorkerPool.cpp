@@ -279,11 +279,14 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
             sub.prevDecodedR.assign(cw.upsampleSubLen - 1, 0.0f);
         }
 
-        // Slot-eviction tracking init (T1.4) — -1 = "no prior occupant".
-        // Zero out schema buffer so first-iter log lines show oldSchema=''.
+        // Voice-eviction tracking init (T1.4, 2026-05-22 fix): start with
+        // an empty prev-active set. Arrays are pre-sized at MAX_ACTIVE_VOICES
+        // so the per-iter sweep never allocates; zero the schema buffers
+        // up-front so an uninitialised slot can never leak into a log line.
+        sub.prevActiveCount = 0;
         for (int i = 0; i < ConvolutionWorker::kMaxSlots; ++i) {
-            sub.prevSlotVoice[i] = -1;
-            sub.prevSlotSchemaBuf[i][0] = '\0';
+            sub.prevActiveHandles[i] = -1;
+            sub.prevActiveSchemaBuf[i][0] = '\0';
         }
         // First-apply set starts empty; refilled lazily as voices appear.
         sub.firstAppliedCount = 0;
@@ -505,40 +508,78 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
         std::memset(sub.stereoL[back].data(), 0, cw.frameSize * sizeof(float));
         std::memset(sub.stereoR[back].data(), 0, cw.frameSize * sizeof(float));
 
-        // ── T1.4 slot-eviction sweep ──
+        // ── T1.4 voice-eviction sweep (per-voice, 2026-05-22 fix) ──
         //
-        // Detect any (assigned slot index) whose occupant voiceHandle has
-        // changed since the previous iter. Sweep BEFORE the per-voice apply
-        // loop so the log line cites the old occupant's schema before the
-        // new occupant overwrites slot.schemaCStr. Limited to assignedSlots
-        // so we don't false-trigger on stale entries outside this sub-
-        // worker's stripe.
-        for (int j = 0; j < assignCount; ++j) {
-            int i = sub.assignedSlots[j];
-            if (i < 0 || i >= ConvolutionWorker::kMaxSlots) continue;
-            auto &slot = cw.staging[readBuf][i];
-            int newH = slot.active ? slot.voiceHandle : -1;
-            int prevH = sub.prevSlotVoice[i];
-            if (newH != prevH && prevH != -1) {
-                // Real eviction (the slot held a *different* voice last
-                // iter, not "was empty"). Bump the global counter feeding
-                // [PERF refl_worker] + ProbeManager refl_cache.
-                cw.slotEvictionsTotal.fetch_add(1, std::memory_order_relaxed);
-                const char *newSchema = slot.schemaCStr
-                                      ? slot.schemaCStr
-                                      : "(unknown)";
-                AUDIO_LOG("[REFL_EVICT] slot=%d oldSchema='%s' oldH=%d "
-                          "newSchema='%s' newH=%d w=%d\n",
-                          i, sub.prevSlotSchemaBuf[i], prevH,
-                          newSchema, newH, workerIdx);
-                // Eviction resets the new voice's first-apply window:
-                // its IR slot just changed, so the next apply IS a
-                // first apply for this slot/voice pair, even if we'd
-                // previously logged it on a different slot. Removing
-                // it from firstAppliedHandles guarantees we re-log.
-                if (newH >= 0) {
+        // Two-set diff: build the current iter's active-voice-handle set
+        // from this sub-worker's assigned staging slots, then compare to
+        // the previous iter's set stored on the sub-worker. A handle
+        // present last iter but absent this iter is a true eviction (the
+        // voice dropped out of this worker's stripe entirely). Staging-
+        // index permutations of voices in both sets are silent — earlier
+        // we tracked prevSlotVoice[i] indexed by staging-buffer slot
+        // index, which counted every per-callback packer permutation as
+        // a false eviction (~100/sec with only 16 voices). Sweep runs
+        // BEFORE the per-voice apply loop so the log line can cite the
+        // dropped voice's schema before slot.schemaCStr is overwritten.
+        //
+        // Scratch state lives on the stack but bounded by kMaxSlots, so
+        // no allocation occurs in the hot path.
+        {
+            int  curHandles[ConvolutionWorker::kMaxSlots];
+            char curSchemaBuf[ConvolutionWorker::kMaxSlots]
+                             [ConvolutionSubWorker::kSchemaNameBufLen];
+            int  curCount = 0;
+            for (int j = 0; j < assignCount; ++j) {
+                int i = sub.assignedSlots[j];
+                if (i < 0 || i >= ConvolutionWorker::kMaxSlots) continue;
+                auto &slot = cw.staging[readBuf][i];
+                if (!slot.active) continue;
+                int h = slot.voiceHandle;
+                if (h < 0) continue;
+                // Sanity bound: curCount cannot exceed assignCount which is
+                // bounded by kMaxSlots, so the array is safe by construction.
+                if (curCount >= ConvolutionWorker::kMaxSlots) {
+                    // Defensive: should be unreachable. Loud per memory rule.
+                    AUDIO_LOG("[FALLBACK] eviction sweep curHandles overflow"
+                              " curCount=%d kMaxSlots=%d w=%d\n",
+                              curCount, ConvolutionWorker::kMaxSlots,
+                              workerIdx);
+                    break;
+                }
+                curHandles[curCount] = h;
+                const char *schema = slot.schemaCStr ? slot.schemaCStr : "";
+                std::snprintf(curSchemaBuf[curCount],
+                              ConvolutionSubWorker::kSchemaNameBufLen,
+                              "%s", schema);
+                ++curCount;
+            }
+
+            // For each handle in the previous set, is it still present?
+            // Linear scan — kMaxSlots is 64 so the O(N²) sweep is trivial.
+            for (int p = 0; p < sub.prevActiveCount; ++p) {
+                int prevH = sub.prevActiveHandles[p];
+                if (prevH < 0) continue;
+                bool stillPresent = false;
+                for (int c = 0; c < curCount; ++c) {
+                    if (curHandles[c] == prevH) { stillPresent = true; break; }
+                }
+                if (!stillPresent) {
+                    // Genuine eviction: voice dropped out of this worker's
+                    // active set. Bump the counter feeding [PERF refl_worker]
+                    // + ProbeManager refl_cache.
+                    cw.slotEvictionsTotal.fetch_add(1, std::memory_order_relaxed);
+                    AUDIO_LOG("[REFL_EVICT] voice h=%d schema='%s' w=%d\n",
+                              prevH, sub.prevActiveSchemaBuf[p], workerIdx);
+                    // The dropped voice's first-apply tracking is no longer
+                    // meaningful in this sub-worker — clear it so if the
+                    // voice ever reappears (e.g. distance ranking shifts
+                    // back) we re-emit [REFL_FIRST_APPLY]. The previous
+                    // implementation reset the *new* slot occupant's
+                    // first-apply state; with per-voice semantics we reset
+                    // the *evicted* voice instead, which is the correct
+                    // mapping.
                     for (int k = 0; k < sub.firstAppliedCount; ++k) {
-                        if (sub.firstAppliedHandles[k] == newH) {
+                        if (sub.firstAppliedHandles[k] == prevH) {
                             sub.firstAppliedHandles[k] =
                                 sub.firstAppliedHandles[--sub.firstAppliedCount];
                             break;
@@ -546,16 +587,17 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
                     }
                 }
             }
-            // Update the per-slot tracker — copy out the current schema
-            // so the next iter's log line has it even after the owning
-            // voice is destroyed.
-            sub.prevSlotVoice[i] = newH;
-            const char *curSchema = slot.schemaCStr
-                                  ? slot.schemaCStr
-                                  : "";
-            std::snprintf(sub.prevSlotSchemaBuf[i],
-                          ConvolutionSubWorker::kSchemaNameBufLen,
-                          "%s", curSchema);
+
+            // Save current set as the new previous set. Copy schemas now
+            // (before the owning ActiveVoice can be destroyed between
+            // iters) so the next iter's eviction log line still has the
+            // schema name available.
+            sub.prevActiveCount = curCount;
+            for (int c = 0; c < curCount; ++c) {
+                sub.prevActiveHandles[c] = curHandles[c];
+                std::memcpy(sub.prevActiveSchemaBuf[c], curSchemaBuf[c],
+                            ConvolutionSubWorker::kSchemaNameBufLen);
+            }
         }
 
         // Iter entry diagnostic — distinguishes "no work" from "work but
