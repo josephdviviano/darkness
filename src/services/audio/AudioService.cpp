@@ -5754,6 +5754,65 @@ void AudioService::loopStep(float deltaTime)
                     return synth;
                 };
 
+                // [PATH_CONSUME] diagnostic — placed ABOVE the routing
+                // branch split (sa / synth / bfs) so it fires for every
+                // voice every frame regardless of which backend handles
+                // it. The previous placement inside the legacy BFS `else`
+                // branch was dead code under the shipping default
+                // (probe_pathing: true), which routes every voice through
+                // the SA branch and never enters the BFS branch — yielding
+                // 0 emissions even in 31k-line logs.
+                //
+                // The `mode=` field is the whole point: it lets a future
+                // reader distinguish "SA reached but data lost downstream"
+                // from "SA didn't reach" from "BFS path used and reached".
+                //   • mode=sa    — Steam Audio pathing owns the
+                //                  per-voice portal eq + sub-source slot
+                //                  (slot-0-only synthesised path; SA
+                //                  fills eqCoeffs via IPLPathEffect).
+                //   • mode=synth — slot-0-only synthesised path with no
+                //                  routing solve at all (playerEmitted
+                //                  or skipPortalRouting voices: source
+                //                  ≈ listener, portal routing N/A).
+                //   • mode=bfs   — legacy room-BFS branch
+                //                  (probe_pathing: false). prop.reached,
+                //                  prop.effectiveDistance, prop.paths
+                //                  are the routing source of truth.
+                //
+                // `effD`, `block`, and `paths` are taken verbatim from
+                // the in-scope `prop` struct. For mode=sa/synth the BFS
+                // never ran, so prop is default-initialised
+                // (reached=false, effD=0, block=0, paths empty) — values
+                // logged are honest about that. For mode=bfs they
+                // reflect the BFS result for that frame.
+                //
+                // Throttled to one emission per second per voice via a
+                // static per-handle timestamp map.
+                {
+                    using clk = std::chrono::steady_clock;
+                    static std::unordered_map<SoundHandle, clk::time_point>
+                        sLastPathConsumeLog;
+                    auto now = clk::now();
+                    auto it = sLastPathConsumeLog.find(handle);
+                    bool due = (it == sLastPathConsumeLog.end())
+                        || std::chrono::duration<float>(
+                               now - it->second).count() >= 1.0f;
+                    if (due && Darkness::gAudioLogVerbose) {
+                        sLastPathConsumeLog[handle] = now;
+                        const char *modeStr = useSteamAudioPathing ? "sa"
+                            : (voice->playerEmitted || voice->skipPortalRouting)
+                              ? "synth" : "bfs";
+                        AUDIO_LOG("[PATH_CONSUME] h=%u schema='%s' mode=%s "
+                                  "reached=%d effD=%.1f block=%.2f paths=%zu\n",
+                                  handle, voice->schemaName.c_str(),
+                                  modeStr,
+                                  prop.reached ? 1 : 0,
+                                  prop.effectiveDistance,
+                                  prop.totalBlocking,
+                                  prop.paths.size());
+                    }
+                }
+
                 if (useSteamAudioPathing
                     || voice->playerEmitted
                     || voice->skipPortalRouting) {
