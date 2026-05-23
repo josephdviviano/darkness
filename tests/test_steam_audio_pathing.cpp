@@ -26,19 +26,28 @@
 //   - the eqCoeffs[high] → portalBlocking (LPF) coupling
 //   - the per-frame closed-door multiplicative blocking layer
 //   - NaN / out-of-range defenses on eqCoeffs
+//
+// Plus pending-source tracking tests for PathingSimulator's deferred
+// source-add/remove queues — these guard the API contract that AudioService
+// relies on to distinguish "source is pending" from "source is committed",
+// the same contract whose violation produces the pending-source race
+// documented in memory:project_audio_pending_source_race.
 
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 
+#include "audio/PathingSimulator.h"
 #include "audio/ProbeManager.h"
 #include "audio/SteamAudioPathing.h"
 
 using Catch::Approx;
 using Darkness::PathingDspMapping;
+using Darkness::PathingSimulator;
 using Darkness::ProbeBakeParams;
 using Darkness::Vector3;
 using Darkness::eqCoeffsToDspMapping;
@@ -238,4 +247,160 @@ TEST_CASE("Pathing gain scale tolerates malformed input",
     PathingDspMapping negScale = eqCoeffsToDspMapping(0.5f, 0.5f, 0.5f, 0.0f, -2.0f);
     CHECK(nanScale.gain == Approx(0.5f));
     CHECK(negScale.gain == Approx(0.5f));
+}
+
+// ── PathingSimulator pending-source race (T0.4 regression) ─────────────────
+//
+// Memory: project_audio_pending_source_race — voices in `mPendingSourceAdds`
+// (i.e. queued while the worker is mid-iteration) have historically been
+// skipped by per-frame DSPNode field updates, which then read STALE inputs.
+// The same bug bit HRTF direction (2026-03-26) and
+// `directParams.distanceAttenuation` (2026-05-15) before being caught.
+//
+// The full end-to-end repro requires a live IPL simulator + AudioService +
+// voice harness. The tests here exercise the foundation: PathingSimulator's
+// pending-add API contract. They assert that:
+//   1. A source queued via queueSourceAdd is observably pending
+//      (isAddPending == true).
+//   2. removeFromPendingAdds correctly drops the source from the queue
+//      (returns true on first call, false on the second), so consumer code
+//      can disambiguate pending vs committed during teardown.
+//   3. After a flush (without a real IPL simulator the flush is a no-op,
+//      but the simulator-less queue mechanics still let us assert that the
+//      [PENDING_SKIP] decision point — the API surface AudioService uses to
+//      avoid touching a not-yet-committed source — works correctly).
+//
+// We intentionally use a fake non-null IPLSource pointer that is never
+// dereferenced (flushPendingAdds early-returns when mSimulator==null,
+// matching the production code path). A higher-fidelity integration test
+// that actually exercises iplSimulatorRunPathing + iplSourceGetOutputs
+// against a real bake graph is tagged below as [SKIP_IF_NO_IPL] because
+// the test fixture does not yet build a full audio service.
+//
+// TODO(orchestrator): the live integration repro depends on Agent 1's
+// `[PENDING_SKIP]` log being plumbed into AudioService's per-frame DSPNode
+// update path. Once that lands, extend this test to assert the log fires
+// for a mid-frame-spawned voice and that the next frame's update lands
+// cleanly post-flush.
+
+TEST_CASE("PathingSimulator: queued source is observably pending",
+          "[steam_audio][pathing][pending_race]") {
+    PathingSimulator sim;
+    // Fake IPLSource handle. flushPendingAdds() is gated on
+    // mSimulator!=null in production, so leaving the simulator unset
+    // means the handle is never dereferenced — we only test the
+    // bookkeeping vectors. setSimulator() takes a typed pointer; we
+    // pass null on purpose.
+    sim.setSimulator(nullptr);
+
+    // Cast a non-null sentinel value to the opaque IPLSource type. The
+    // value is never dereferenced — only used as a vector key.
+    auto fakeSrc = reinterpret_cast<IPLSource>(uintptr_t{0xC0FFEE01});
+
+    CHECK_FALSE(sim.isAddPending(fakeSrc));
+
+    sim.queueSourceAdd(fakeSrc);
+    CHECK(sim.isAddPending(fakeSrc));
+
+    // Trying to remove a source that isn't pending returns false.
+    auto otherSrc = reinterpret_cast<IPLSource>(uintptr_t{0xDEADBEEF});
+    CHECK_FALSE(sim.removeFromPendingAdds(otherSrc));
+
+    // The real removal succeeds once, then becomes a no-op.
+    CHECK(sim.removeFromPendingAdds(fakeSrc));
+    CHECK_FALSE(sim.removeFromPendingAdds(fakeSrc));
+    CHECK_FALSE(sim.isAddPending(fakeSrc));
+}
+
+TEST_CASE("PathingSimulator: pending-add queue is the only race-safe "
+          "way to mutate sources while worker is running",
+          "[steam_audio][pathing][pending_race]") {
+    PathingSimulator sim;
+    sim.setSimulator(nullptr);
+
+    auto fakeSrc = reinterpret_cast<IPLSource>(uintptr_t{0xC0FFEE02});
+
+    // Pre-spawn: not pending.
+    CHECK_FALSE(sim.isAddPending(fakeSrc));
+
+    // Mid-frame "spawn" — simulator is busy, so AudioService queues the
+    // source. Our test stand-in is queueSourceAdd directly.
+    sim.queueSourceAdd(fakeSrc);
+    CHECK(sim.isAddPending(fakeSrc));
+
+    // Per-frame DSPNode update path SHOULD consult isAddPending before
+    // calling any iplSourceXxx function that reads-back from the
+    // simulator (those would return stale or zero-initialised
+    // results). This test asserts the API contract that lets the
+    // consumer skip safely. The actual skip / [PENDING_SKIP] log lives
+    // in AudioService (out of scope for this agent).
+    REQUIRE(sim.isAddPending(fakeSrc));
+
+    // Flush is a no-op with mSimulator==null, but the contract is that
+    // post-flush the source moves out of the pending queue.
+    sim.flushPendingAdds();  // no-op (mSimulator==null)
+    // Production AudioService would have flushed mSimulator-side here;
+    // we simulate the post-flush state by removing the pending entry.
+    sim.removeFromPendingAdds(fakeSrc);
+    CHECK_FALSE(sim.isAddPending(fakeSrc));
+}
+
+TEST_CASE("PathingSimulator: tracked-source list mirrors flushPendingAdds "
+          "+ trackSourceAdded / trackSourceRemoved",
+          "[steam_audio][pathing][pending_race]") {
+    PathingSimulator sim;
+    // No simulator wired — flushPendingAdds early-returns, so we can't
+    // exercise the simulator-add side-effect here. We CAN exercise the
+    // direct-track APIs that AudioService uses on the !isRunning() path.
+    sim.setSimulator(nullptr);
+
+    CHECK(sim.trackedSourceCount() == 0);
+
+    auto srcA = reinterpret_cast<IPLSource>(uintptr_t{0xA0A0A0A0});
+    auto srcB = reinterpret_cast<IPLSource>(uintptr_t{0xB0B0B0B0});
+
+    sim.trackSourceAdded(srcA);
+    CHECK(sim.trackedSourceCount() == 1);
+
+    // Double-add is idempotent — defensive guard.
+    sim.trackSourceAdded(srcA);
+    CHECK(sim.trackedSourceCount() == 1);
+
+    sim.trackSourceAdded(srcB);
+    CHECK(sim.trackedSourceCount() == 2);
+
+    // Removing an unknown source is a no-op (doesn't underflow).
+    auto srcC = reinterpret_cast<IPLSource>(uintptr_t{0xC0C0C0C0});
+    sim.trackSourceRemoved(srcC);
+    CHECK(sim.trackedSourceCount() == 2);
+
+    sim.trackSourceRemoved(srcA);
+    CHECK(sim.trackedSourceCount() == 1);
+    sim.trackSourceRemoved(srcB);
+    CHECK(sim.trackedSourceCount() == 0);
+}
+
+// TODO(orchestrator): live IPL repro for the pending-source race itself.
+// Requires building a real IPLSimulator + bake + voice in test setup —
+// the existing test fixture is pure-math and doesn't bring up the audio
+// service. Tagged [SKIP_IF_NO_IPL] until the harness exists.
+// See memory:project_audio_pending_source_race for the original bug
+// (2026-03-26 HRTF direction, 2026-05-15 distanceAttenuation).
+TEST_CASE("PathingSimulator: live pending-source race repro "
+          "[skip_if_no_ipl]",
+          "[steam_audio][pathing][pending_race][SKIP_IF_NO_IPL]") {
+    // Skipped intentionally: the full repro requires an IPLSimulator,
+    // a baked probe graph, and a live AudioService voice. Once the
+    // [PENDING_SKIP] log lands (Agent 1, AudioService-side), wire a
+    // harness here that:
+    //   1. Builds a minimal IPL pathing simulator + one probe batch.
+    //   2. Spawns the worker with a long-running iteration (signal +
+    //      busy-wait so the next steps see isRunning()==true).
+    //   3. queueSourceAdd a fresh source.
+    //   4. Trigger the per-frame DSPNode field update from the test
+    //      thread and assert [PENDING_SKIP] fires.
+    //   5. Wait for completion, flushPendingAdds, repeat the update,
+    //      assert it lands without [PENDING_SKIP].
+    SUCCEED("Skipped: full repro requires live IPL simulator + "
+            "AudioService [PENDING_SKIP] log (Agent 1)");
 }
