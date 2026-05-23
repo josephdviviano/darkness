@@ -194,6 +194,8 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
     cw.frameSize = cfg.frameSize;
     cw.reflectionFrameSize = cfg.reflectionFrameSize;
     cw.rateDivisor = cfg.rateDivisor;
+    cw.droppedFramesTotal.store(0, std::memory_order_relaxed);
+    cw.slotEvictionsTotal.store(0, std::memory_order_relaxed);
 
     // Polyphase upsample FIR for rateDivisor > 1. 16 taps × β=8 → ~75 dB
     // stopband. Cutoff 0.45/div on the output axis leaves a clean
@@ -276,6 +278,15 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
             sub.prevDecodedL.assign(cw.upsampleSubLen - 1, 0.0f);
             sub.prevDecodedR.assign(cw.upsampleSubLen - 1, 0.0f);
         }
+
+        // Slot-eviction tracking init (T1.4) — -1 = "no prior occupant".
+        // Zero out schema buffer so first-iter log lines show oldSchema=''.
+        for (int i = 0; i < ConvolutionWorker::kMaxSlots; ++i) {
+            sub.prevSlotVoice[i] = -1;
+            sub.prevSlotSchemaBuf[i][0] = '\0';
+        }
+        // First-apply set starts empty; refilled lazily as voices appear.
+        sub.firstAppliedCount = 0;
     }
 
     if (!allWorkersOk) {
@@ -294,6 +305,60 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
         cw.workers[wk]->thread = std::thread([this, wk]() { subWorkerMain(wk); });
     }
     return true;
+}
+
+//------------------------------------------------------
+// T2.3 — periodic [PERF refl_worker] emission. Self-throttled to ~1 Hz;
+// caller is expected to invoke from the main-thread loop step at any
+// rate >=1 Hz. We snapshot+reset every sub-worker's queue-depth +
+// apply-time histograms and pick the worker with the most samples as
+// the pool representative — matches the convention used by the existing
+// [PERF worker] line. The dropped-frames + eviction counters are flat
+// counters: dropped is exchanged-to-zero here so each emission window
+// is independent; evictions is read (not exchanged) because the
+// ProbeManager refl_cache line may want the same value within the
+// same 1 s window.
+void ConvolutionWorkerPool::pollPerfPeriodic()
+{
+    if (!mWorker) return;
+    auto &cw = *mWorker;
+
+    static std::chrono::steady_clock::time_point sLast{};
+    auto now = std::chrono::steady_clock::now();
+    if (sLast.time_since_epoch().count() != 0) {
+        auto ms = std::chrono::duration<double, std::milli>(now - sLast).count();
+        if (ms < 1000.0) return;
+    }
+    sLast = now;
+
+    LatencyHistogram::Percentiles queueP{}, applyP{};
+    for (auto &subPtr : cw.workers) {
+        auto q = subPtr->perfQueueDepth.snapshotAndReset();
+        auto a = subPtr->perfApplyMs.snapshotAndReset();
+        if (q.n > queueP.n) queueP = q;
+        if (a.n > applyP.n) applyP = a;
+    }
+
+    uint64_t dropped =
+        cw.droppedFramesTotal.exchange(0, std::memory_order_relaxed);
+    uint64_t evictions =
+        cw.slotEvictionsTotal.load(std::memory_order_relaxed);
+
+    AUDIO_LOG(
+        "[PERF refl_worker] queue_p50=%.1f p95=%.1f p99=%.1f"
+        " applyMs_p50=%.3f p95=%.3f p99=%.3f dropped=%llu evictions=%llu\n",
+        queueP.p50, queueP.p95, queueP.p99,
+        applyP.p50, applyP.p95, applyP.p99,
+        static_cast<unsigned long long>(dropped),
+        static_cast<unsigned long long>(evictions));
+
+    // NOTE: perfApplyMs has been read-and-reset here. The pre-existing
+    // [PERF worker] line in AudioService::dumpAudioStatusPeriodic also
+    // reads perfApplyMs via snapshotAndReset, so when both dumps run in
+    // the same 5 s window the [PERF worker] line will see only the
+    // samples accumulated since this dump (and vice versa). Acceptable
+    // — both lines still produce real percentiles; they just split the
+    // sample stream rather than seeing identical totals.
 }
 
 //------------------------------------------------------
@@ -434,8 +499,68 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
         int assignCount = sub.assignedCount;   // likewise
         int back = 1 - sub.frontIdx.load(std::memory_order_relaxed);
 
+        // T2.3 queue depth: per-iter snapshot of assigned-slot count.
+        // This is the "jobs waiting at iter start" for this sub-worker —
+        // a proxy for queue depth that doesn't require a real submit-side
+        // sample (the mix node's stagingCount is what feeds this, and
+        // round-robin distributes evenly across workers).
+        sub.perfQueueDepth.record(static_cast<double>(assignCount));
+
         std::memset(sub.stereoL[back].data(), 0, cw.frameSize * sizeof(float));
         std::memset(sub.stereoR[back].data(), 0, cw.frameSize * sizeof(float));
+
+        // ── T1.4 slot-eviction sweep ──
+        //
+        // Detect any (assigned slot index) whose occupant voiceHandle has
+        // changed since the previous iter. Sweep BEFORE the per-voice apply
+        // loop so the log line cites the old occupant's schema before the
+        // new occupant overwrites slot.schemaCStr. Limited to assignedSlots
+        // so we don't false-trigger on stale entries outside this sub-
+        // worker's stripe.
+        for (int j = 0; j < assignCount; ++j) {
+            int i = sub.assignedSlots[j];
+            if (i < 0 || i >= ConvolutionWorker::kMaxSlots) continue;
+            auto &slot = cw.staging[readBuf][i];
+            int newH = slot.active ? slot.voiceHandle : -1;
+            int prevH = sub.prevSlotVoice[i];
+            if (newH != prevH && prevH != -1) {
+                // Real eviction (the slot held a *different* voice last
+                // iter, not "was empty"). Bump the global counter feeding
+                // [PERF refl_worker] + ProbeManager refl_cache.
+                cw.slotEvictionsTotal.fetch_add(1, std::memory_order_relaxed);
+                const char *newSchema = slot.schemaCStr
+                                      ? slot.schemaCStr
+                                      : "(unknown)";
+                AUDIO_LOG("[REFL_EVICT] slot=%d oldSchema='%s' oldH=%d "
+                          "newSchema='%s' newH=%d w=%d\n",
+                          i, sub.prevSlotSchemaBuf[i], prevH,
+                          newSchema, newH, workerIdx);
+                // Eviction resets the new voice's first-apply window:
+                // its IR slot just changed, so the next apply IS a
+                // first apply for this slot/voice pair, even if we'd
+                // previously logged it on a different slot. Removing
+                // it from firstAppliedHandles guarantees we re-log.
+                if (newH >= 0) {
+                    for (int k = 0; k < sub.firstAppliedCount; ++k) {
+                        if (sub.firstAppliedHandles[k] == newH) {
+                            sub.firstAppliedHandles[k] =
+                                sub.firstAppliedHandles[--sub.firstAppliedCount];
+                            break;
+                        }
+                    }
+                }
+            }
+            // Update the per-slot tracker — copy out the current schema
+            // so the next iter's log line has it even after the owning
+            // voice is destroyed.
+            sub.prevSlotVoice[i] = newH;
+            const char *curSchema = slot.schemaCStr
+                                  ? slot.schemaCStr
+                                  : "";
+            std::snprintf(sub.prevSlotSchemaBuf[i],
+                          ConvolutionSubWorker::kSchemaNameBufLen,
+                          "%s", curSchema);
+        }
 
         // Iter entry diagnostic — distinguishes "no work" from "work but
         // slots fail the early-continue checks".
@@ -523,6 +648,68 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
                 sub.perfApplyMs.record(applyMs);
                 iterApplySumMs += applyMs;
                 if (applyMs > iterApplyMaxMs) iterApplyMaxMs = applyMs;
+            }
+
+            // ── T0.2 [REFL_FIRST_APPLY] — first apply per (voice, slot) ──
+            //
+            // Emit once per (this sub-worker, voice handle). The log line
+            // captures the L1 norm of the ambisonic-W (channel 0) output
+            // so the reader can distinguish:
+            //   • IR exists but is silent (irNorm ≈ 0, irNumSamples > 0,
+            //                              reflStatePtr non-null)
+            //   • IR is null (reflStatePtr=0 — paired [FALLBACK] line)
+            //   • IR is healthy (irNorm large, follow-up [REFLECTION_VOICE]
+            //                    shows non-zero ratio)
+            // We use the wet output (rather than reading the IR directly
+            // — Steam Audio doesn't expose the IR samples) as a proxy:
+            // an IR that produces zero output for a non-zero input on
+            // its very first frame is almost certainly an unpopulated IR
+            // or an uninitialised reflection-effect state (the T0.2
+            // hypothesis).
+            //
+            // Limited to ~MAX_ACTIVE_VOICES*2 distinct handles per sub-
+            // worker over the lifetime of the run. When the set fills,
+            // new voices are still logged but old entries are not pruned
+            // — the log goes quiet on the next eviction, which is fine.
+            {
+                int handle = slot.voiceHandle;
+                bool already = false;
+                for (int k = 0; k < sub.firstAppliedCount; ++k) {
+                    if (sub.firstAppliedHandles[k] == handle) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already && handle >= 0) {
+                    if (sub.firstAppliedCount < ConvolutionSubWorker::kFirstApplyTrackCap)
+                        sub.firstAppliedHandles[sub.firstAppliedCount++] = handle;
+
+                    double irNorm = 0.0;
+                    const float *ch0 = sub.voiceAmbi0.data();
+                    for (int s = 0; s < slot.reflFrameSize; ++s) {
+                        irNorm += static_cast<double>(std::fabs(ch0[s]));
+                    }
+                    const char *schemaForLog = slot.schemaCStr
+                                              ? slot.schemaCStr
+                                              : "(unknown)";
+                    AUDIO_LOG("[REFL_FIRST_APPLY] schema='%s' slot=%d "
+                              "irNorm=%.6e irNumSamples=%d reflStatePtr=%p\n",
+                              schemaForLog, i, irNorm, slot.params.irSize,
+                              reinterpret_cast<void*>(slot.effect));
+
+                    // Loud no-fallback announce per project memory
+                    // feedback_no_silent_fallbacks: a null reflection-
+                    // effect handle reached the worker — that should be
+                    // impossible (the mix node gates on
+                    // node->reflectionEffect) but if it ever happens we
+                    // want a [FALLBACK] line, not a silent skip.
+                    if (!slot.effect) {
+                        std::fprintf(stderr,
+                            "[FALLBACK] reflection state null for voice %d "
+                            "(slot=%d schema=%s)\n",
+                            handle, i, schemaForLog);
+                    }
+                }
             }
 
             // Sum per-voice output into per-worker accumulator.

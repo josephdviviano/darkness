@@ -371,6 +371,33 @@ public:
     void  setProbeHeightFt(float ft) { mProbeHeightFt = std::max(0.5f, std::min(ft, 20.0f)); }
     float getProbeHeightFt() const { return mProbeHeightFt; }
 
+    // ── T2.4 IR cache stats ──
+    //
+    // ProbeManager itself owns disk→memory IR data via the IPLProbeBatch
+    // handle, but per-voice IR lookups happen in AudioService when it
+    // calls iplProbeBatchGetReverb (or when Steam Audio's reflection sim
+    // copies a baked IR into a voice's reflectionParams). We accept the
+    // hit/miss signal from AudioService so the [PERF refl_cache] line
+    // surfaces the IR-population success rate.
+    //
+    //   recordCacheHit  — a voice acquired baked IR data (irSize>0) from
+    //                     the loaded probe batch.
+    //   recordCacheMiss — a voice was eligible for reflection but the
+    //                     probe lookup produced no usable IR.
+    //
+    // Lock-free atomics — multiple AudioService loop-step paths can bump.
+    void recordCacheHit()  { mCacheHits.fetch_add(1, std::memory_order_relaxed); }
+    void recordCacheMiss() { mCacheMisses.fetch_add(1, std::memory_order_relaxed); }
+
+    /// Emit [PERF refl_cache] once per ~1 s window. Caller passes the
+    /// active-slot snapshot from the convolution worker pool (we don't
+    /// own that; keeping the cross-class wiring explicit) plus the
+    /// pool's evictions counter (read out of
+    /// `ConvolutionWorker::slotEvictionsTotal` — callers can pass 0 if
+    /// they don't have it; the line still reports hits/misses).
+    void pollPerfPeriodic(int activeSlots, int maxSlots,
+                          uint64_t evictionsSinceLast);
+
 private:
     /// Bake one reflection batch from a UNIFORMFLOOR + elevation/portal/
     /// emitter placement pass + iplReflectionsBakerBake. Returns a fully-
@@ -414,6 +441,10 @@ private:
     /// Negative override → use these values at bake time.
     float mProbeSpacingFt = 5.0f;
     float mProbeHeightFt  = 5.0f;
+
+    // ── T2.4 IR cache stats (see public recordCacheHit/Miss) ──
+    std::atomic<uint64_t> mCacheHits{0};
+    std::atomic<uint64_t> mCacheMisses{0};
 };
 
 } // namespace Darkness
