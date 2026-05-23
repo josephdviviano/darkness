@@ -370,6 +370,19 @@ struct ActiveVoice {
     IPLSource reflectionSource = nullptr;  // owned by mReflectionSim
     IPLSource pathingSource    = nullptr;  // owned by mPathingSim
 
+    // Reflection-simulator completed-cycle counter at the moment THIS
+    // voice's reflectionSource was actually added to the simulator
+    // (immediate path: createVoiceSource right after iplSourceAdd;
+    // deferred path: flushPendingAdds callback). The pin gate in
+    // AudioService::loopStep refuses to snapshot outputs.reflections into
+    // pinnedParams until ReflectionSimulator::completedCycles() exceeds
+    // this value — guaranteeing the simulator has run at least one full
+    // iteration containing this source. Before that point,
+    // outputs.reflections.ir may carry a non-null handle with all-zero
+    // content (simulator "no output yet" state); pinning that produced
+    // permanently-silent wet bus for the voice's entire lifetime.
+    uint64_t reflectionSimCycleAtAdd = 0;
+
     // True once iplSourceGetOutputs(PATHING) ever returned a non-sentinel
     // triple. Set on first real read in the per-voice output-staging
     // block; never cleared. Drives a one-shot [PATHING_FIRST_SOLVE] log

@@ -141,11 +141,20 @@ bool ReflectionSimulator::removeFromPendingAdds(IPLSource src)
 }
 
 //------------------------------------------------------
-void ReflectionSimulator::flushPendingAdds()
+void ReflectionSimulator::flushPendingAdds(const SourceAddedFn &onAdded)
 {
     if (mPendingAdds.empty() || !mSimulator) return;
-    for (auto &src : mPendingAdds)
+    for (auto &src : mPendingAdds) {
         iplSourceAdd(src, mSimulator);
+        // Invoke per-source callback AFTER the source is in the simulator.
+        // AudioService uses this to capture the current completed-cycle
+        // counter into the voice's reflectionSimCycleAtAdd. Capturing at
+        // FLUSH (not QUEUE) is mandatory — between queue and flush an
+        // arbitrary number of simulator cycles may have run, and we want
+        // the pin gate keyed off the cycle counter AT THE MOMENT the
+        // source actually entered the simulator's source list.
+        if (onAdded) onAdded(src);
+    }
     mPendingAdds.clear();
     mSimulatorDirty = true;
 }
@@ -248,6 +257,23 @@ void ReflectionSimulator::workerMain()
             iplSimulatorRunReflections(mSimulator);
         }
         if (mSimRanHook) mSimRanHook();
+
+        // Bump completed-cycles counter AFTER the simulator has finished
+        // writing its outputs (and after the mix-node hook has had a chance
+        // to consume them) but BEFORE flipping mRunning=false. Main thread
+        // reads this counter with acquire ordering; the release-store here
+        // synchronises-with that acquire-load so the simulator's per-source
+        // output writes are guaranteed visible to anyone who sees
+        // completedCycles() > N.
+        //
+        // The pin gate in AudioService::loopStep refuses to snapshot a
+        // voice's IR until completedCycles() > voice->reflectionSimCycleAtAdd
+        // — the invariant that fixes the all-zero-IR pin bug: a voice's
+        // reflection source must have been part of at least one full
+        // iplSimulatorRunReflections cycle before its outputs can be
+        // trusted as anything other than the simulator's "no output yet"
+        // sentinel state.
+        mCompletedCycles.fetch_add(1, std::memory_order_release);
         mRunning.store(false, std::memory_order_release);
     }
 }

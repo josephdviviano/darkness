@@ -5111,7 +5111,32 @@ void AudioService::loopStep(float deltaTime)
     if (!reflBusy && mReflectionSim) {
 
         // Flush deferred IPL source adds / removals via ReflectionSimulator.
-        mReflectionSim->flushPendingAdds();
+        //
+        // The flushPendingAdds callback is the FLUSH-time hook for the
+        // cycle-counter-tracking invariant (see VoicePool.h
+        // reflectionSimCycleAtAdd doc): for every source that just entered
+        // the simulator, look up its owning voice and record the current
+        // completed-cycle counter. The pin gate later in loopStep requires
+        // completedCycles() > voice->reflectionSimCycleAtAdd before it
+        // will snapshot outputs.reflections — without this, voices whose
+        // sources arrived via the deferred path would have
+        // reflectionSimCycleAtAdd=0 and pin a still-unwritten (all-zeros)
+        // IR on the very first frame after being added.
+        //
+        // O(N_voices) per flushed source is acceptable: the deferred-add
+        // queue typically holds a handful of voices per frame and
+        // mVoicePool->voices() is a small unordered_map.
+        const uint64_t cycleAtFlush =
+            mReflectionSim->completedCycles();
+        mReflectionSim->flushPendingAdds([&](IPLSource src) {
+            if (!mVoicePool || !src) return;
+            for (auto &[h, v] : mVoicePool->voices()) {
+                if (v && v->reflectionSource == src) {
+                    v->reflectionSimCycleAtAdd = cycleAtFlush;
+                    break;
+                }
+            }
+        });
         mReflectionSim->flushPendingRemovals();
     }
     if (!pathBusy && mPathingSim) {
@@ -7521,16 +7546,43 @@ void AudioService::loopStep(float deltaTime)
                     // wet bus. See VoicePool.h "Pinned per-voice IR" docs.
                     // Pin-eligibility split by reflection algorithm:
                     //   • CONVOLUTION / HYBRID: need a valid IR handle from
-                    //     the simulator (irSize > 0 && ir != nullptr).
+                    //     the simulator (irSize > 0 && ir != nullptr) AND
+                    //     at least one full reflection-sim cycle must have
+                    //     completed since this voice's source was added.
                     //   • PARAMETRIC: no IR is ever produced — pin as soon
                     //     as a probe batch with parametric data is loaded,
                     //     since the apply call needs only reverbTimes.
+                    //
+                    // The simCycleAfterAdd gate fixes the all-zero-IR pin
+                    // bug. Prior to this gate, `hasConvIR` could be true
+                    // the FIRST frame after a source left mPendingSourceAdds
+                    // — but iplSimulatorRunReflections hadn't yet run a
+                    // cycle containing this new source, so `outputs.reflections.ir`
+                    // pointed at the simulator's "no output yet" sentinel
+                    // (non-null handle, all zeros inside). Pinning that
+                    // permanent-silence IR stuck the voice's wet bus at zero
+                    // for its entire lifetime. The smoking gun: [PINNED_IR]
+                    // entries with eq=[0,0,0] — `eq` is populated by the sim
+                    // output, so all-zero eq proves the sim hadn't written
+                    // for this source.
+                    //
+                    // The cycle counter is bumped at the end of every
+                    // reflection-sim iteration; each voice captured the
+                    // counter value at the moment its source entered the
+                    // simulator (createVoiceSource immediate path) or at
+                    // the FLUSH (flushPendingAdds callback for the
+                    // deferred path). Strict greater-than ensures at least
+                    // one cycle has fully run since the source was added.
                     const bool hasConvIR = outputs.reflections.irSize > 0
                         && outputs.reflections.ir != nullptr;
+                    const uint64_t simCyclesCompleted = mReflectionSim
+                        ? mReflectionSim->completedCycles() : 0;
+                    const bool simCycleAfterAdd =
+                        simCyclesCompleted > voice->reflectionSimCycleAtAdd;
                     const bool canPinParametric = isParametricMode
                         && mProbeManager && mProbeManager->hasReflections();
                     if (!voice->reflectionIRPinned
-                        && (hasConvIR || canPinParametric)) {
+                        && ((hasConvIR && simCycleAfterAdd) || canPinParametric)) {
                         // outputs.reflections.ir is an opaque
                         // IPLReflectionEffectIR handle owned by Steam
                         // Audio; we hold the handle as-is and never
@@ -7682,7 +7734,8 @@ void AudioService::loopStep(float deltaTime)
                         AUDIO_LOG("[PINNED_IR] h=%u '%s' irSize=%d numChannels=%d "
                                   "delay=%d reverbTimes=[%.3f,%.3f,%.3f] "
                                   "eq=[%.3f,%.3f,%.3f] probeLookupIdx=%d "
-                                  "hasReflections=%d probeCount=%zu\n",
+                                  "hasReflections=%d probeCount=%zu "
+                                  "simCyclesCompleted=%llu cycleAtAdd=%llu\n",
                                   handle, voice->schemaName.c_str(),
                                   outputs.reflections.irSize,
                                   outputs.reflections.numChannels,
@@ -7695,7 +7748,9 @@ void AudioService::loopStep(float deltaTime)
                                   voice->pinnedParams.eq[2],
                                   probeLookupIdx,
                                   mProbeManager ? mProbeManager->hasReflections() : -1,
-                                  mProbeManager ? mProbeManager->getProbePositions().size() : 0);
+                                  mProbeManager ? mProbeManager->getProbePositions().size() : 0,
+                                  static_cast<unsigned long long>(simCyclesCompleted),
+                                  static_cast<unsigned long long>(voice->reflectionSimCycleAtAdd));
                     }
 
                     if (voice->reflectionIRPinned) {
@@ -8335,9 +8390,24 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
         }
 
         if (mReflectionSim->isRunning()) {
+            // Deferred-add path: capture the cycle counter at FLUSH time
+            // via the flushPendingAdds callback below — NOT here. Between
+            // queue and flush an arbitrary number of cycles may have
+            // elapsed; the pin gate must compare against the cycle counter
+            // at the moment the source actually entered the simulator's
+            // source list, not the moment we asked for it to be added.
+            // (See project_audio_pending_source_race — third recurrence of
+            // this class of bug.)
             mReflectionSim->queueSourceAdd(voice.reflectionSource);
         } else {
+            // Immediate-add path: source is in the simulator before this
+            // function returns. The next worker iteration will see it, so
+            // capture the cycle counter as "the value just before that
+            // first containing-cycle bumps it." The pin gate is strict
+            // greater-than, so this voice unblocks once the next cycle
+            // completes.
             iplSourceAdd(voice.reflectionSource, reflectionSimHandle);
+            voice.reflectionSimCycleAtAdd = mReflectionSim->completedCycles();
         }
         mReflectionSim->setSimulatorDirty();
         mReflectionSim->incrementActiveSources();

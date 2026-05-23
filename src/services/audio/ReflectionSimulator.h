@@ -49,6 +49,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -150,7 +151,18 @@ public:
 
     /// Apply queued source-adds to the simulator. Must be called only when
     /// `isRunning() == false`.
-    void flushPendingAdds();
+    ///
+    /// `onAdded` (optional) is invoked once per source AFTER it is added to
+    /// the simulator. AudioService uses this to capture the current
+    /// `completedCycles()` value into each voice's `reflectionSimCycleAtAdd`
+    /// — i.e. the cycle-counter value at FLUSH time, not at QUEUE time.
+    /// (See `project_audio_pending_source_race`: capturing per-voice state
+    /// at queue time and not at flush time has bit us three times — the
+    /// queue-time snapshot can race the simulator visibility, leaving
+    /// voices wired with state that the simulator hasn't actually
+    /// produced yet.)
+    using SourceAddedFn = std::function<void(IPLSource)>;
+    void flushPendingAdds(const SourceAddedFn &onAdded = {});
 
     /// Apply queued source-removals + release each source. Must be called
     /// only when `isRunning() == false`.
@@ -269,6 +281,32 @@ private:
 
     // ── Active reflection source counter ──
     std::atomic<int> mActiveSources{0};
+
+    // ── Completed-cycle counter ──
+    //
+    // Bumped at the END of every worker iteration (after
+    // iplSimulatorRunReflections returns) with release ordering. Main
+    // thread reads with acquire ordering; the release/acquire pair
+    // guarantees that any output writes the simulator made for sources in
+    // its current source list are visible to the reader once the
+    // post-bump value is observed.
+    //
+    // Voices capture this counter at source-add time (immediate path) or
+    // at flush time (deferred path) into ActiveVoice::reflectionSimCycleAtAdd.
+    // The pin gate in loopStep refuses to snapshot the IR until
+    //   completedCycles() > voice->reflectionSimCycleAtAdd
+    // so we only ever pin AFTER at least one full simulator cycle has run
+    // since the source was registered. Without this gate, voices were
+    // pinning all-zero IRs (the simulator's "no output yet" state) and
+    // sticking with silence for their entire lifetime.
+    std::atomic<uint64_t> mCompletedCycles{0};
+
+public:
+    uint64_t completedCycles() const {
+        return mCompletedCycles.load(std::memory_order_acquire);
+    }
+
+private:
 
     // ── Convolution drain hook ──
     ConvolutionDrainFn mDrainHook;
