@@ -355,8 +355,14 @@ public:
     /// Caller invokes once per main-loop tick; we self-throttle to ~1 Hz
     /// using a monotonic timestamp so the log cadence is stable even when
     /// the caller's tick rate fluctuates. Reads percentiles from every
-    /// sub-worker's perfQueueDepth + perfApplyMs and emits one log line.
+    /// sub-worker's perfQueueDepth and emits one log line.
     /// Idempotent if called before mWorker is constructed (early-return).
+    ///
+    /// NOTE: applyMs is owned by [PERF worker] in
+    /// AudioService::dumpAudioStatusPeriodic (which drains perfApplyMs via
+    /// snapshotAndReset earlier in the same dump cycle). This method must
+    /// NOT touch perfApplyMs — doing so would double-empty the histogram
+    /// and produce 0.000-ms percentiles in whichever line runs second.
     void pollPerfPeriodic();
 
     /// Bumped by the mix node (AudioService.cpp catastrophic-backlog

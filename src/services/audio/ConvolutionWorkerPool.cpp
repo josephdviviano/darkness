@@ -310,14 +310,20 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
 //------------------------------------------------------
 // T2.3 — periodic [PERF refl_worker] emission. Self-throttled to ~1 Hz;
 // caller is expected to invoke from the main-thread loop step at any
-// rate >=1 Hz. We snapshot+reset every sub-worker's queue-depth +
-// apply-time histograms and pick the worker with the most samples as
-// the pool representative — matches the convention used by the existing
+// rate >=1 Hz. We snapshot+reset every sub-worker's queue-depth
+// histogram and pick the worker with the most samples as the pool
+// representative — matches the convention used by the existing
 // [PERF worker] line. The dropped-frames + eviction counters are flat
 // counters: dropped is exchanged-to-zero here so each emission window
 // is independent; evictions is read (not exchanged) because the
 // ProbeManager refl_cache line may want the same value within the
 // same 1 s window.
+//
+// applyMs is owned by [PERF worker] in AudioService::dumpAudioStatusPeriodic;
+// this method only owns the per-worker queue/dropped/evictions counters.
+// Draining perfApplyMs here would double-empty the histogram (AudioService
+// drains it first within the same dump cycle), so this method would always
+// see n=0 and report applyMs=0.000 — exactly the bug T2.3 originally exposed.
 void ConvolutionWorkerPool::pollPerfPeriodic()
 {
     if (!mWorker) return;
@@ -331,12 +337,10 @@ void ConvolutionWorkerPool::pollPerfPeriodic()
     }
     sLast = now;
 
-    LatencyHistogram::Percentiles queueP{}, applyP{};
+    LatencyHistogram::Percentiles queueP{};
     for (auto &subPtr : cw.workers) {
         auto q = subPtr->perfQueueDepth.snapshotAndReset();
-        auto a = subPtr->perfApplyMs.snapshotAndReset();
         if (q.n > queueP.n) queueP = q;
-        if (a.n > applyP.n) applyP = a;
     }
 
     uint64_t dropped =
@@ -345,20 +349,12 @@ void ConvolutionWorkerPool::pollPerfPeriodic()
         cw.slotEvictionsTotal.load(std::memory_order_relaxed);
 
     AUDIO_LOG(
-        "[PERF refl_worker] queue_p50=%.1f p95=%.1f p99=%.1f"
-        " applyMs_p50=%.3f p95=%.3f p99=%.3f dropped=%llu evictions=%llu\n",
+        "[PERF refl_worker] queue_n=%llu queue_p50=%.1f p95=%.1f p99=%.1f"
+        " dropped=%llu evictions=%llu\n",
+        static_cast<unsigned long long>(queueP.n),
         queueP.p50, queueP.p95, queueP.p99,
-        applyP.p50, applyP.p95, applyP.p99,
         static_cast<unsigned long long>(dropped),
         static_cast<unsigned long long>(evictions));
-
-    // NOTE: perfApplyMs has been read-and-reset here. The pre-existing
-    // [PERF worker] line in AudioService::dumpAudioStatusPeriodic also
-    // reads perfApplyMs via snapshotAndReset, so when both dumps run in
-    // the same 5 s window the [PERF worker] line will see only the
-    // samples accumulated since this dump (and vice versa). Acceptable
-    // — both lines still produce real percentiles; they just split the
-    // sample stream rather than seeing identical totals.
 }
 
 //------------------------------------------------------
