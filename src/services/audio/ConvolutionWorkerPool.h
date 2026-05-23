@@ -155,27 +155,35 @@ struct ConvolutionSubWorker {
     std::atomic<uint32_t> nanCountAmbi{0};
     std::atomic<uint32_t> nanCountDecode{0};
 
-    // ── Slot-eviction tracking (T1.4) ──
+    // ── Voice-eviction tracking (T1.4, fixed 2026-05-22) ──
     //
-    // The IR "slot" the worker writes to each iter is just an index into
-    // staging[readBuf][i]; the IPLReflectionEffect itself is owned by the
-    // voice (slot.effect is rebound by the mix node every callback). When
-    // two different voices reuse the same staging-slot index across
-    // consecutive iterations we treat it as a slot recycle and emit
-    // `[REFL_EVICT]` once per transition. Tracking is per-sub-worker
-    // because each sub-worker iterates its own subset of slot indices.
+    // Earlier this tracked prevSlotVoice[i] indexed by staging-buffer slot
+    // index. That was wrong: the audio thread's per-callback packer re-
+    // assigns active voices to staging indices each frame (voice ordering
+    // shifts as e.g. distance-based ranking jitters), so every voice ends
+    // up at a different staging index than the previous iter and the
+    // sweep counted every permutation as an "eviction." With 16 active
+    // voices we saw ~100 false-positive evictions/sec.
     //
-    // Stored across iterations:
-    //   prevSlotVoice[i]  = handle that occupied slot i last iter, or -1
-    //                       if the slot was unoccupied / fresh.
-    //   prevSlotSchemaBuf — small ring of schema names so the log line
-    //                       can cite the old voice's schema. We can't
-    //                       hold a raw const-char* across iters (the
-    //                       owning ActiveVoice may have been destroyed);
-    //                       copy into a fixed-size buffer per slot.
+    // Correct semantics: track the *set* of voice handles this sub-worker
+    // saw last iter. A handle present last iter but absent this iter is a
+    // true eviction (the voice dropped out of the worker's stripe entirely
+    // — either ended, dropped below the global active cap, or got reassigned
+    // to a different sub-worker). Staging-index permutations of voices
+    // present in BOTH iters are silent.
+    //
+    // Stored across iterations (per-sub-worker, no atomics — single writer):
+    //   prevActiveCount    = number of valid entries in the arrays below.
+    //   prevActiveHandles  = voice handles present last iter (unordered).
+    //   prevActiveSchemaBuf — parallel array of schema-name copies so the
+    //                         log line can cite the dropped voice's schema.
+    //                         We can't hold a raw const-char* across iters
+    //                         (the owning ActiveVoice may have been
+    //                         destroyed); copy into fixed-size buffers.
     static constexpr int kSchemaNameBufLen = 24;
-    int  prevSlotVoice[MAX_ACTIVE_VOICES];
-    char prevSlotSchemaBuf[MAX_ACTIVE_VOICES][kSchemaNameBufLen];
+    int  prevActiveCount = 0;
+    int  prevActiveHandles[MAX_ACTIVE_VOICES];
+    char prevActiveSchemaBuf[MAX_ACTIVE_VOICES][kSchemaNameBufLen];
 
     // ── First-apply tracking (T0.2) ──
     //
