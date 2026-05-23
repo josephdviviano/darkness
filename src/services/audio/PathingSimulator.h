@@ -58,10 +58,13 @@
 /// throttle interval is the only thing controlling staging cadence.
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#include "LatencyHistogram.h"
 
 // Steam Audio opaque handle types (mirror the typedefs from AudioService.h
 // so consumers of this header don't need to include phonon.h).
@@ -140,16 +143,35 @@ public:
     bool removeFromPendingAdds(IPLSource src);
 
     /// Apply queued source-adds to the simulator. Must be called only when
-    /// `isRunning() == false`.
+    /// `isRunning() == false`. Also promotes the sources into the
+    /// tracked-sources list consulted by `[PATH_RAW]` diagnostics.
     void flushPendingAdds();
 
     /// Apply queued source-removals + release each source. Must be called
-    /// only when `isRunning() == false`.
+    /// only when `isRunning() == false`. Also removes the sources from
+    /// the tracked-sources list.
     void flushPendingRemovals();
 
     /// During scene destruction, release any pending-add sources (they
     /// were never added to the simulator).
     void releasePendingAdds();
+
+    /// Notify the simulator that a source was added directly (i.e. the
+    /// caller already invoked `iplSourceAdd` because the worker was
+    /// idle, bypassing the pending queue). Adds the source to the
+    /// tracked-sources list so `[PATH_RAW]` diagnostics can sample it.
+    /// Must be called only when `isRunning() == false`.
+    void trackSourceAdded(IPLSource src);
+
+    /// Mirror of `trackSourceAdded` for the direct-remove path. Drops the
+    /// source from the tracked-sources list. Must be called only when
+    /// `isRunning() == false`.
+    void trackSourceRemoved(IPLSource src);
+
+    /// Read-only access to the number of sources currently committed in
+    /// the simulator (only the ones the caller has notified us about via
+    /// flushPendingAdds / trackSourceAdded). Used by tests + diagnostics.
+    size_t trackedSourceCount() const { return mTrackedSources.size(); }
 
     /// Sets the "commit needed" flag — read+cleared by `commitIfDirty()`.
     void setSimulatorDirty() { mSimulatorDirty = true; }
@@ -188,8 +210,40 @@ private:
     std::vector<IPLSource> mPendingAdds;
     std::vector<IPLSource> mPendingRemovals;
 
+    // ── Tracked committed sources ──
+    //
+    // Mirrors the source set inside the IPL simulator that we know about.
+    // Steam Audio offers no enumeration API on IPLSimulator, so we mirror
+    // adds/removes ourselves to let the worker thread sample one source
+    // per iteration for the [PATH_RAW] diagnostic. Mutated only from the
+    // main thread under the same `isRunning()==false` guard as the
+    // pending vectors; read by the worker mid-iteration (safe because
+    // the main thread cannot mutate while the worker is running).
+    std::vector<IPLSource> mTrackedSources;
+
     // ── Simulator commit state ──
     bool mSimulatorDirty = false;
+
+    // ── [PERF pathing] histogram + signal-cadence tracking ──
+    //
+    // mPathingHist receives one record() per worker iteration with the
+    // wall-clock duration of iplSimulatorRunPathing. mLastSignalNs holds
+    // the steady_clock timestamp of the previous signal() so the worker
+    // can estimate the effective throttle interval (driven by the
+    // caller's signal cadence) without piping a config value across.
+    // mLastSignalIntervalMs is the most recent interval; updated under
+    // mMutex inside signal().
+    LatencyHistogram mPathingHist;
+    int64_t mLastSignalNs = 0;
+    float   mLastSignalIntervalMs = 0.0f;
+
+    // ── [PATH_RAW] sampling state (worker-thread-only) ──
+    //
+    // Round-robin index into mTrackedSources picking which source's raw
+    // pathing output to log this iteration. mLastRawLogTime throttles
+    // [PATH_RAW] to ~1 Hz so verbose-audio runs aren't flooded.
+    size_t mRawSampleIdx = 0;
+    std::chrono::steady_clock::time_point mLastRawLogTime{};
 };
 
 } // namespace Darkness

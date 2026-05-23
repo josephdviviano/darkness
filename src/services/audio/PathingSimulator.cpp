@@ -25,7 +25,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 #if defined(__APPLE__)
 #  include <pthread.h>
@@ -83,8 +85,24 @@ void PathingSimulator::signal()
     // main thread's next isRunning() read sees the busy state without
     // racing the worker waking up.
     mRunning.store(true, std::memory_order_release);
+    // Self-measure the effective throttle interval from successive signal()
+    // timestamps. The caller (AudioService::loopStep) owns the actual
+    // pathing-throttle config, but rather than couple PathingSimulator to
+    // that knob we infer the cadence from how often the worker is woken.
+    // First signal seeds mLastSignalNs without producing an interval.
     {
+        const auto now = std::chrono::steady_clock::now();
+        const int64_t nowNs =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch()).count();
         std::lock_guard<std::mutex> lock(mMutex);
+        if (mLastSignalNs != 0) {
+            const int64_t dn = nowNs - mLastSignalNs;
+            if (dn > 0) {
+                mLastSignalIntervalMs = static_cast<float>(dn) / 1.0e6f;
+            }
+        }
+        mLastSignalNs = nowNs;
         mWant = true;
     }
     mCV.notify_one();
@@ -132,6 +150,10 @@ void PathingSimulator::flushPendingAdds()
                 "[PATH_REG] flush_add src=%p\n", static_cast<void *>(src));
         }
         iplSourceAdd(src, mSimulator);
+        // Mirror into tracked-sources so [PATH_RAW] can find this source.
+        // Both vectors are main-thread-only with the same `isRunning()==
+        // false` guard, so no extra synchronisation is needed.
+        mTrackedSources.push_back(src);
     }
     mPendingAdds.clear();
     mSimulatorDirty = true;
@@ -143,6 +165,10 @@ void PathingSimulator::flushPendingRemovals()
     if (mPendingRemovals.empty() || !mSimulator) return;
     for (auto &src : mPendingRemovals) {
         iplSourceRemove(src, mSimulator);
+        // Drop from tracked sources before releasing the handle so we
+        // don't leave a dangling pointer in the diagnostic-sample list.
+        auto it = std::find(mTrackedSources.begin(), mTrackedSources.end(), src);
+        if (it != mTrackedSources.end()) mTrackedSources.erase(it);
         iplSourceRelease(&src);
     }
     mPendingRemovals.clear();
@@ -157,6 +183,26 @@ void PathingSimulator::releasePendingAdds()
     for (auto &src : mPendingAdds)
         iplSourceRelease(&src);
     mPendingAdds.clear();
+}
+
+//------------------------------------------------------
+void PathingSimulator::trackSourceAdded(IPLSource src)
+{
+    // Direct-add path (caller already invoked iplSourceAdd because the
+    // worker was idle). Mirror into the tracked-sources list so
+    // diagnostics can find this source. Skip if already present —
+    // defensive against double-notify.
+    if (std::find(mTrackedSources.begin(), mTrackedSources.end(), src)
+        == mTrackedSources.end()) {
+        mTrackedSources.push_back(src);
+    }
+}
+
+//------------------------------------------------------
+void PathingSimulator::trackSourceRemoved(IPLSource src)
+{
+    auto it = std::find(mTrackedSources.begin(), mTrackedSources.end(), src);
+    if (it != mTrackedSources.end()) mTrackedSources.erase(it);
 }
 
 //------------------------------------------------------
@@ -191,6 +237,11 @@ void PathingSimulator::workerMain()
     }
 #endif
 
+    // [PERF pathing] dump cadence: emit at most once per second to keep
+    // the log readable. Reset window after each dump so percentiles
+    // describe the last ~1 s of solver behaviour.
+    auto lastPerfDump = std::chrono::steady_clock::now();
+
     while (true) {
         {
             std::unique_lock<std::mutex> lock(mMutex);
@@ -204,10 +255,15 @@ void PathingSimulator::workerMain()
         }
 
         if (mSimulator) {
-            auto t0 = std::chrono::steady_clock::now();
+            // T2.5 — wall-clock-time each iplSimulatorRunPathing call and
+            // record into the latency histogram. Timed region is the bare
+            // solver call: no allocation, no logging.
+            const auto t0 = std::chrono::steady_clock::now();
             iplSimulatorRunPathing(mSimulator);
-            auto t1 = std::chrono::steady_clock::now();
-            const float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+            const auto t1 = std::chrono::steady_clock::now();
+            const float ms =
+                std::chrono::duration<float, std::milli>(t1 - t0).count();
+            mPathingHist.record(static_cast<double>(ms));
             // Same threshold as the previous synchronous main-thread timing
             // harness. Rate-limited (first 32 + every 64th thereafter) to
             // keep the log readable. Now logged from the worker thread, so
@@ -222,8 +278,149 @@ void PathingSimulator::workerMain()
                         ms, sc + 1);
                 }
             }
+
+            // T0.1 — [PATH_RAW] log. Sample one source per iteration
+            // (round-robin across mTrackedSources) and throttle to ~1 Hz.
+            // The point of this log is to observe the RAW pathing output
+            // BEFORE any consumer in AudioService applies sentinel
+            // detection / door-LPF / gain-scale, so we can distinguish
+            // "the solver returned a zero" from "AudioService transformed
+            // a non-zero into a zero". See memory:
+            // feedback_audio_distinguishing_diagnostics.
+            //
+            // mTrackedSources mirrors the simulator's source set (mutated
+            // by the main thread only while the worker is idle, read
+            // here while the worker is "running" — safe because the
+            // main thread cannot mutate during this read). If the list
+            // is empty (e.g. AudioService hasn't notified us yet via
+            // trackSourceAdded), the log is silently skipped this iter.
+            if (!mTrackedSources.empty()) {
+                const auto now = t1;
+                const auto sinceLast =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - mLastRawLogTime).count();
+                if (sinceLast >= 1000) {
+                    if (mRawSampleIdx >= mTrackedSources.size())
+                        mRawSampleIdx = 0;
+                    IPLSource samp = mTrackedSources[mRawSampleIdx];
+                    mRawSampleIdx++;
+
+                    // Read the raw pathing output from the just-completed
+                    // iteration. iplSourceGetOutputs is documented safe
+                    // from any thread; here we're the only writer
+                    // (iplSimulatorRunPathing just returned) so the read
+                    // sees this iteration's freshly committed values.
+                    IPLSimulationOutputs out{};
+                    iplSourceGetOutputs(samp,
+                        IPL_SIMULATIONFLAGS_PATHING, &out);
+
+                    // Steam Audio's pathing output is just a 3-band EQ
+                    // (low/mid/high band attenuation) plus an Ambisonic
+                    // SH direction field. There is no public "reached"
+                    // boolean, no path-count, no per-portal blocking
+                    // breakdown — the solver collapses all of that into
+                    // the eqCoeffs. We synthesise the diagnostic fields
+                    // requested in PLAN.AUDIO_PIPELINE_CLEANUP from
+                    // what's actually available:
+                    //   reached      — 1 if any band > 0 (path solved
+                    //                  to a non-zero attenuation),
+                    //                  else 0.
+                    //   eqL/M/H      — raw 3-band attenuation (these
+                    //                  are the only knobs the solver
+                    //                  exposes to engine DSP).
+                    //   totalBlock   — 1 - mean(eqCoeffs), an aggregate
+                    //                  blocking estimate.
+                    //   directBlock  — 1 - eqCoeffs[mid], the band
+                    //                  AudioService uses for the
+                    //                  scalar gain weighting.
+                    //   portalBlock  — 1 - eqCoeffs[high], matches the
+                    //                  blocking output of
+                    //                  eqCoeffsToDspMapping().
+                    //   sentinel     — true when all three bands are
+                    //                  bit-identical to the 0.1f
+                    //                  pathing-untouched-by-solver
+                    //                  sentinel from Steam Audio (see
+                    //                  memory:
+                    //                  project_steam_audio_gotchas).
+                    const float eqL = out.pathing.eqCoeffs[0];
+                    const float eqM = out.pathing.eqCoeffs[1];
+                    const float eqH = out.pathing.eqCoeffs[2];
+                    const float meanEq = (eqL + eqM + eqH) / 3.0f;
+                    const bool reached = (eqL > 0.0f || eqM > 0.0f || eqH > 0.0f);
+                    const float totalBlock  = 1.0f - meanEq;
+                    const float directBlock = 1.0f - eqM;
+                    const float portalBlock = 1.0f - eqH;
+                    uint32_t b0, b1, b2;
+                    std::memcpy(&b0, &eqL, 4);
+                    std::memcpy(&b1, &eqM, 4);
+                    std::memcpy(&b2, &eqH, 4);
+                    constexpr uint32_t kSentinel = 0x3DCCCCCD; // bits of 0.1f
+                    const bool sentinel =
+                        (b0 == kSentinel && b1 == kSentinel
+                         && b2 == kSentinel);
+
+                    std::fprintf(stderr,
+                        "[PATH_RAW] src=%p reached=%d eqL=%.3f eqM=%.3f "
+                        "eqH=%.3f totalBlock=%.3f directBlock=%.3f "
+                        "portalBlock=%.3f sentinel=%d trackedN=%zu\n",
+                        static_cast<void*>(samp),
+                        reached ? 1 : 0,
+                        eqL, eqM, eqH,
+                        totalBlock, directBlock, portalBlock,
+                        sentinel ? 1 : 0,
+                        mTrackedSources.size());
+
+                    mLastRawLogTime = now;
+                }
+            }
         }
         mRunning.store(false, std::memory_order_release);
+
+        // T2.5 — [PERF pathing] periodic dump. Snapshot the histogram
+        // every ~1 s and log p50/p95/p99 + the most recent signal
+        // interval (which is effectively the caller's throttle setting).
+        // Done AFTER mRunning is released so we don't keep the busy flag
+        // up across a logging branch.
+        {
+            const auto now = std::chrono::steady_clock::now();
+            const auto sinceDump =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - lastPerfDump).count();
+            if (sinceDump >= 1000) {
+                LatencyHistogram::Percentiles p =
+                    mPathingHist.snapshotAndReset(true);
+                if (p.n > 0) {
+                    // Capture the effective throttle interval under the
+                    // mutex so we don't tear the float read on a 32-bit
+                    // ABI. Most platforms make this redundant, but the
+                    // cost is negligible vs the iplSimulatorRunPathing
+                    // we just performed.
+                    float throttleMs = 0.0f;
+                    {
+                        std::lock_guard<std::mutex> lock(mMutex);
+                        throttleMs = mLastSignalIntervalMs;
+                    }
+                    std::fprintf(stderr,
+                        "[PERF pathing] p50=%.2fms p95=%.2fms p99=%.2fms "
+                        "throttleMs=%.2f n=%llu\n",
+                        p.p50, p.p95, p.p99, throttleMs,
+                        static_cast<unsigned long long>(p.n));
+                    // Budget warning: p95 ≥ 80% of throttle interval
+                    // means we're nearly missing the cadence on most
+                    // iterations. Only emit if we have a measured
+                    // throttle (skip the first window where the caller
+                    // has only signaled once).
+                    if (throttleMs > 0.0f
+                        && p.p95 >= 0.8 * static_cast<double>(throttleMs)) {
+                        std::fprintf(stderr,
+                            "[PERF pathing] BUDGET_WARN p95=%.2fms "
+                            ">= 0.8 * throttleMs=%.2f\n",
+                            p.p95, throttleMs);
+                    }
+                }
+                lastPerfDump = now;
+            }
+        }
     }
 }
 
