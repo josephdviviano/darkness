@@ -306,6 +306,9 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
         cw.prevPoolActiveHandles[i] = -1;
         cw.prevPoolActiveSchemas[i][0] = '\0';
     }
+    // perWorkerSlotCap defaults to kMaxSlots (effectively unbounded). The
+    // owner (AudioService) calls setPerWorkerSlotCap after init to tighten
+    // it to ceil(mReverbVoices / numWorkers).
 
     // Polyphase upsample FIR for rateDivisor > 1. 16 taps × β=8 → ~75 dB
     // stopband. Cutoff 0.45/div on the output axis leaves a clean
