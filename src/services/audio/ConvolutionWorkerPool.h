@@ -155,35 +155,15 @@ struct ConvolutionSubWorker {
     std::atomic<uint32_t> nanCountAmbi{0};
     std::atomic<uint32_t> nanCountDecode{0};
 
-    // ── Voice-eviction tracking (T1.4, fixed 2026-05-22) ──
+    // ── Voice-eviction schema buffer length ──
     //
-    // Earlier this tracked prevSlotVoice[i] indexed by staging-buffer slot
-    // index. That was wrong: the audio thread's per-callback packer re-
-    // assigns active voices to staging indices each frame (voice ordering
-    // shifts as e.g. distance-based ranking jitters), so every voice ends
-    // up at a different staging index than the previous iter and the
-    // sweep counted every permutation as an "eviction." With 16 active
-    // voices we saw ~100 false-positive evictions/sec.
-    //
-    // Correct semantics: track the *set* of voice handles this sub-worker
-    // saw last iter. A handle present last iter but absent this iter is a
-    // true eviction (the voice dropped out of the worker's stripe entirely
-    // — either ended, dropped below the global active cap, or got reassigned
-    // to a different sub-worker). Staging-index permutations of voices
-    // present in BOTH iters are silent.
-    //
-    // Stored across iterations (per-sub-worker, no atomics — single writer):
-    //   prevActiveCount    = number of valid entries in the arrays below.
-    //   prevActiveHandles  = voice handles present last iter (unordered).
-    //   prevActiveSchemaBuf — parallel array of schema-name copies so the
-    //                         log line can cite the dropped voice's schema.
-    //                         We can't hold a raw const-char* across iters
-    //                         (the owning ActiveVoice may have been
-    //                         destroyed); copy into fixed-size buffers.
+    // Per-sub-worker prevActive* arrays were promoted to the pool level
+    // (ConvolutionWorker::prevPoolActive*) in 2026-05-24 so worker-boundary
+    // migrations stop firing false-positive [REFL_EVICT] events. Only the
+    // schema-name buffer length constant remains here because both the
+    // pool-level arrays AND the per-voice DSP staging slot (for forwarding
+    // the schema string to the audio thread) reference it.
     static constexpr int kSchemaNameBufLen = 24;
-    int  prevActiveCount = 0;
-    int  prevActiveHandles[MAX_ACTIVE_VOICES];
-    char prevActiveSchemaBuf[MAX_ACTIVE_VOICES][kSchemaNameBufLen];
 
     // ── First-apply tracking (T0.2) ──
     //
@@ -313,6 +293,56 @@ struct ConvolutionWorker {
     //                          changes across iters (see T1.4).
     std::atomic<uint64_t> droppedFramesTotal{0};
     std::atomic<uint64_t> slotEvictionsTotal{0};
+
+    // ── Pool-level voice-eviction tracking (Fix A, 2026-05-24) ──
+    //
+    // Previously each ConvolutionSubWorker maintained its own prevActive*
+    // set and diff. That fired false [REFL_EVICT] events whenever a voice
+    // legitimately migrated across worker stripes (load-balancing /
+    // priority reorder): the voice left worker A's stripe (counted as an
+    // eviction by A) and joined worker B's (silent there but the A→B
+    // crossing produced a log line). A 15k-line MISS06 run showed 883
+    // events with only ~57 actual pinned voices — same handles citing
+    // 50+ "evictions" each.
+    //
+    // The correct definition: a voice is evicted only when its handle
+    // disappears from the UNION of all sub-workers' assigned-slot sets.
+    // That union equals the current iter's stagingCount[currentReadBuf]
+    // slots (since the round-robin distribution covers every staging
+    // slot). The sweep is run ONCE per audio-callback iter on the audio
+    // thread, AFTER round-robin slot assignment and BEFORE the frameSeq
+    // bump that signals sub-workers (so any cross-thread state updates
+    // we make here — e.g. clearing firstAppliedHandles on sub-workers —
+    // are visible to the workers through the frameSeq acquire barrier).
+    //
+    // Storage requirements (audio thread is the single writer; sub-workers
+    // never touch these arrays):
+    //   prevPoolActiveCount    — valid entries in the arrays below.
+    //   prevPoolActiveHandles  — voice handles present in the union last
+    //                            iter (unordered).
+    //   prevPoolActiveSchemas  — parallel array of schema-name copies for
+    //                            the eviction log line; the owning
+    //                            ActiveVoice may be destroyed between
+    //                            iters so we cannot keep raw const-char*.
+    int  prevPoolActiveCount = 0;
+    int  prevPoolActiveHandles[MAX_ACTIVE_VOICES];
+    char prevPoolActiveSchemas[MAX_ACTIVE_VOICES]
+                              [ConvolutionSubWorker::kSchemaNameBufLen];
+
+    /// Pool-wide voice-eviction sweep (Fix A, 2026-05-24). Called by the
+    /// audio thread once per callback AFTER round-robin slot assignment
+    /// and BEFORE bumping per-sub-worker frameSeq. Compares the union of
+    /// active voice handles across `staging[writeBuf][0..count-1]` to the
+    /// previous iter's pool-wide set and emits one `[REFL_EVICT]` line
+    /// per genuinely-departed voice. Worker-boundary moves are silent
+    /// because the union view ignores which worker holds which slot.
+    ///
+    /// RT-safety: no malloc, stack-only scratch (bounded by kMaxSlots),
+    /// O(N²) diff over N≤64. Updates this->prevPoolActive* + bumps
+    /// slotEvictionsTotal + clears firstAppliedHandles on all sub-workers
+    /// for evicted handles (safe because workers are sleeping on wakeCv
+    /// at this point in the callback).
+    void sweepEvictionsRT(int writeBuf, int count);
 };
 
 /// Drain all sub-workers' pending frames. Called from ~ActiveVoice before
