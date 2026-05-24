@@ -264,7 +264,7 @@ struct ConvolutionWorker {
     // Per the memory rule (no silent fallbacks): if the round-robin loop
     // would assign a slot to a worker that has hit this cap, the slot is
     // dropped and a [FALLBACK] line is emitted identifying the full
-    // worker. The dropped slot is effectively a [CONV_DROP] of one voice
+    // worker. The dropped slot is effectively a [REFL_DROP] of one voice
     // for one callback — same outcome as the existing catastrophic-
     // backlog branch, but caused by per-worker rather than total
     // overflow.
@@ -287,7 +287,7 @@ struct ConvolutionWorker {
     std::vector<float> upsampleCoeffs;
     int upsampleSubLen = 0;
     // Audio callback period (ms) = frameSize/sampleRate * 1000. Used to
-    // size the [CONV_LAG] threshold + report in the log.
+    // size the [REFL_LAG] threshold + report in the log.
     float callbackPeriodMs = 21.333f;
 
     // Listener orientation snapshot (mix node writes, all workers read).

@@ -2931,18 +2931,7 @@ static void registerConsoleSettings(
         },
         "Realtime reverb tail length in seconds (must exceed hybrid_transition_time)");
 
-    dbgConsole.addFloat("refl_runtime_ir_clamp_ms", 0.0f, 4000.0f,
-        []() {
-            auto svc = GET_SERVICE(Darkness::AudioService);
-            return svc ? svc->getRuntimeIrClampMs() : 0.0f;
-        },
-        [](float v) {
-            auto svc = GET_SERVICE(Darkness::AudioService);
-            if (svc) svc->setRuntimeIrClampMs(v);
-        },
-        "Cap per-voice convolution length (ms). 0 = use baked length. Live CPU knob.");
-
-    dbgConsole.addFloat("refl_throttle", 1.0f, 32.0f,
+dbgConsole.addFloat("refl_throttle", 1.0f, 32.0f,
         []() {
             auto svc = GET_SERVICE(Darkness::AudioService);
             return svc ? static_cast<float>(svc->getReflectionThrottle()) : 4.0f;
@@ -4419,25 +4408,9 @@ int main(int argc, char *argv[]) {
         // -- audio.reflections --
         audioSvc->setReflectionsEnabled(cfg.realtimeReflections);
         audioSvc->setAmbisonicsOrder(cfg.ambisonicsOrder);
-        // Reflection algorithm: hybrid migration in progress
-        // (see PLAN.HYBRID_REVERB.md). Type set here forwards to all three
-        // Steam Audio call sites (simulator settings, per-voice effect
-        // creation, per-frame params.type).
-        {
-            AudioService::ReflectionType t = AudioService::ReflectionType::Convolution;
-            switch (cfg.reflectionType) {
-                case RenderConfig::ReflectionType::Convolution:
-                    t = AudioService::ReflectionType::Convolution;
-                    break;
-                case RenderConfig::ReflectionType::Hybrid:
-                    t = AudioService::ReflectionType::Hybrid;
-                    break;
-                case RenderConfig::ReflectionType::Parametric:
-                    t = AudioService::ReflectionType::Parametric;
-                    break;
-            }
-            audioSvc->setReflectionType(t);
-        }
+        // Reflection algorithm: HYBRID-only (Steam Audio's
+        // `IPL_REFLECTIONEFFECTTYPE_HYBRID`). The legacy `type:` YAML key is
+        // accepted but ignored with a [FALLBACK] warning — see RenderConfig.
         audioSvc->setHybridTransitionTime(cfg.hybridTransitionTime);
         audioSvc->setHybridOverlapPercent(cfg.hybridOverlapPercent);
         audioSvc->setRealtimeNumRays(cfg.realtimeNumRays);
@@ -4449,7 +4422,6 @@ int main(int argc, char *argv[]) {
         audioSvc->setBakeDuration(cfg.bakeDuration);
         audioSvc->setBakeDiffuseSamples(cfg.bakeDiffuseSamples);
         audioSvc->setBakeAmbisonicsOrder(cfg.bakeAmbisonicsOrder);
-        audioSvc->setRuntimeIrClampMs(cfg.runtimeIrClampMs);
 
         // -- audio.probes --
         // Bake-time grid parameters. Applied before the auto-bake on first

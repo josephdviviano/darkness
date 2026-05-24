@@ -667,12 +667,10 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
             int i = sub.assignedSlots[j];
             if (i < 0 || i >= ConvolutionWorker::kMaxSlots) continue;
             auto &slot = cw.staging[readBuf][i];
-            // PARAMETRIC has irSize=0 (no IR exists) — gating on irSize would
-            // silently drop every parametric voice. Match AudioService split.
-            const bool slotParamsValid =
-                (slot.params.type == IPL_REFLECTIONEFFECTTYPE_PARAMETRIC)
-                    ? true
-                    : (slot.params.irSize > 0);
+            // HYBRID: convolution head always needs a real IR (irSize > 0).
+            // The parametric tail is driven by pinned reverbTimes alongside
+            // that same IR — no separate gate needed.
+            const bool slotParamsValid = (slot.params.irSize > 0);
             if (!slot.active || !slot.effect || !slotParamsValid)
                 continue;
             if (slot.validityToken && !slot.validityToken->load(std::memory_order_acquire))
@@ -706,7 +704,7 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
             sub.saMeterReflIn.measureMono(monoPtr, slot.reflFrameSize);
 
             // Apply: mixer=nullptr is the only overload that supports
-            // HYBRID/PARAMETRIC. Explicit timing feeds per-iter sum/max.
+            // HYBRID. Explicit timing feeds per-iter sum/max.
             {
                 auto applyT0 = std::chrono::steady_clock::now();
                 iplReflectionEffectApply(slot.effect, &slot.params,
@@ -1099,7 +1097,7 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
             int idx = workerIdx & 0xF;
             uint32_t n = sLagLogCount[idx].fetch_add(1, std::memory_order_relaxed);
             if ((n & 0x3F) == 0) {
-                AUDIO_LOG("[CONV_LAG] w=%d ms=%.2f assignCount=%d "
+                AUDIO_LOG("[REFL_LAG] w=%d ms=%.2f assignCount=%d "
                           "(overrun #%u, cb=%.2fms thr=%.2fms)\n",
                           workerIdx, ms, assignCount, n + 1,
                           cbMs, lagThresholdMs);
