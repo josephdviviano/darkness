@@ -545,7 +545,10 @@ public:
     // so this is the worker-pool CPU governor. 0 disables all reverb
     // convolution entirely (fully dry). To run baked-only, keep this
     // positive and set reverb_voices_realtime = 0.
-    void setReverbVoices(int n) { mReverbVoices = std::max(0, std::min(n, MAX_ACTIVE_VOICES)); }
+    // Out-of-line because we propagate the new value to the convolution
+    // pool's per-worker cap (Fix B, 2026-05-24), and the pool is only
+    // forward-declared here.
+    void setReverbVoices(int n);
     int  getReverbVoices() const { return mReverbVoices; }
 
     // [REALTIME] Of the reverb voices above, how many may run with
