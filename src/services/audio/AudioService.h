@@ -484,17 +484,20 @@ public:
     // drive the offline `iplReflectionsBakerBake` pass and are persisted into
     // the .probes cache file — bake changes require a re-bake.
 
-    /// Reflection effect algorithm. Hybrid mode uses Steam Audio's existing
-    /// reflection-effect API with `type=HYBRID`: an early convolution portion
-    /// (length = `hybridTransitionTime`) and a parametric tail thereafter.
-    /// Parametric tails cannot beat from per-frame IR crossfade stacking,
-    /// which is the failure mode targeted by PLAN.HYBRID_REVERB.md.
-    enum class ReflectionType { Convolution, Hybrid, Parametric };
-    void setReflectionType(ReflectionType t) { mReflectionType = t; }
-    ReflectionType getReflectionType() const { return mReflectionType; }
+    /// Reflection effect algorithm: HYBRID-only. The pipeline always runs
+    /// Steam Audio's `IPL_REFLECTIONEFFECTTYPE_HYBRID`: an early convolution
+    /// head (length = `hybridTransitionTime`) followed by a parametric tail
+    /// driven by `reverbTimes[3]` (RT60) baked into the probe data — these
+    /// correspond to the game's EAX-style reverb presets. Parametric tails
+    /// cannot beat from per-frame IR crossfade stacking, which is the failure
+    /// mode targeted by PLAN.HYBRID_REVERB.md. CONVOLUTION and PARAMETRIC
+    /// modes were removed once HYBRID had matched both perceptually with
+    /// strictly less CPU. (Matches Steam Audio's Unity/Unreal integrations,
+    /// which also ship HYBRID-only at a 1.0 s default head length.)
 
-    /// Length (seconds) of the convolution portion of the IR when running
-    /// hybrid. Must be < the IR duration — Steam Audio crashes otherwise.
+    /// Length (seconds) of the convolution portion of the IR. Must be < the
+    /// IR duration — Steam Audio's `HybridReverbEstimator` crashes otherwise.
+    /// Default 1.0 s matches the Unity/Unreal reference integrations.
     void  setHybridTransitionTime(float s) { mHybridTransitionTime = std::max(0.1f, std::min(s, 8.0f)); }
     float getHybridTransitionTime() const  { return mHybridTransitionTime; }
 
@@ -529,16 +532,6 @@ public:
 
     void setReflectionThrottle(int n);
     int  getReflectionThrottle() const;
-
-    // Runtime IR-length clamp (milliseconds). 0 = disabled. >0 = cap the
-    // per-voice `params.irSize` handed to iplReflectionEffectApply to this
-    // value (converted to samples at the reflection rate). Steam Audio
-    // convolves the first irSize samples of the effect's IR, so this
-    // directly reduces convolution CPU at apply time without re-baking.
-    // Useful for A/B-testing the perceptual cost of shorter IRs before
-    // committing to a re-bake at a smaller bake.duration.
-    void  setRuntimeIrClampMs(float ms);
-    float getRuntimeIrClampMs() const { return mRuntimeIrClampMs; }
 
     // [REFLECTIONS] Cap on total reverb voices (realtime + baked combined).
     // Every reverb voice runs a per-source convolution regardless of mode,
@@ -1440,13 +1433,15 @@ private:
 
     // ── Reflection pipeline (per-voice reflection effect → ambisonics → binaural) ──
     //
-    // The pre-Phase-3 design held a shared IPLReflectionMixer here and
-    // routed per-voice convolution into it. PLAN.HYBRID_REVERB.md Phase 3
-    // dropped the mixer entirely: Steam Audio's mixer overload only handles
-    // CONVOLUTION/TAN and rejects HYBRID/PARAMETRIC, so we now sum per-voice
-    // ambisonics manually inside each ConvolutionSubWorker. The ambisonics
-    // decoder below is still needed (one global decode of the summed
-    // ambisonics to binaural stereo).
+    // The pre-Phase-3 design held a shared IPLReflectionMixer here and routed
+    // per-voice convolution into it. PLAN.HYBRID_REVERB.md Phase 3 dropped
+    // the mixer entirely: Steam Audio's mixer overload only handles
+    // CONVOLUTION/TAN and rejects HYBRID, so we sum per-voice ambisonics
+    // manually inside each ConvolutionSubWorker. (Now that we ship HYBRID-
+    // only, the mixer overload is permanently out of reach — the per-worker
+    // manual summation is the only architecture.) The ambisonics decoder
+    // below is still needed (one global decode of the summed ambisonics to
+    // binaural stereo).
 
     /// Ambisonics decode effect — converts the per-worker-summed reflection
     /// ambisonics to binaural stereo via HRTF.
@@ -1474,17 +1469,13 @@ private:
     // .probes cache file. Changes to bake params require a re-bake to take
     // effect; changes to realtime params take effect on the next callback.
 
-    /// Reflection effect algorithm. Hybrid splits the IR into an early
-    /// convolution portion (length = `mHybridTransitionTime`) and a late
-    /// parametric portion. Parametric tails cannot beat from per-frame IR
-    /// crossfade stacking — the failure mode targeted by PLAN.HYBRID_REVERB.md.
-    ReflectionType mReflectionType = ReflectionType::Convolution;
-
-    /// Length (seconds) of the convolution portion of the IR for hybrid.
-    /// Steam Audio crashes if this exceeds the IR duration, so we enforce
-    /// mRealtimeDuration > mHybridTransitionTime with a small margin in
-    /// initReflectionPipeline.
-    float mHybridTransitionTime = 2.0f;
+    /// Length (seconds) of the convolution head of the HYBRID IR. The
+    /// parametric tail thereafter is driven by `reverbTimes[3]` (RT60) from
+    /// the baked probe data. Steam Audio crashes if this exceeds the IR
+    /// duration, so we enforce mRealtimeDuration > mHybridTransitionTime with
+    /// a small margin in initReflectionPipeline. Default 1.0 s matches Steam
+    /// Audio's Unity / Unreal reference integrations.
+    float mHybridTransitionTime = 1.0f;
 
     /// Fraction of `mHybridTransitionTime` used for the convolution↔
     /// parametric crossfade, anchored at the END of the transition.
@@ -1502,12 +1493,6 @@ private:
     float mBakeDuration            = 4.0f;  ///< Bake IR duration in seconds (>= realtime)
     int   mBakeDiffuseSamples      = 256;   ///< Bake diffuse samples (32–4096)
     int   mBakeAmbisonicsOrder     = 1;     ///< Bake ambisonic order (0–3)
-
-    /// Runtime IR-length clamp in milliseconds (0 = disabled). Live-tunable
-    /// CPU knob — applied to `slot.params.irSize` per-voice before
-    /// iplReflectionEffectApply. Cheaper than re-baking when sweeping for
-    /// the shortest acceptable IR.
-    float mRuntimeIrClampMs        = 0.0f;
 
     int mReverbVoices         = DEFAULT_REVERB_VOICES;
     // Subset of mReverbVoices that runs realtime ray-traced IRs. 0 =
