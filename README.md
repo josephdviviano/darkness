@@ -158,17 +158,17 @@ Press **\` (backtick)** to open the in-game settings console. All runtime settin
 
 | Setting | Type | Description |
 |---------|------|-------------|
-| `refl_enabled` | on / off | Real-time convolution reverb |
+| `refl_enabled` | on / off | Real-time hybrid reflection reverb (convolution head + parametric tail) |
 | `portal_routing` | on / off | Sound routing through doorways via portal graph |
 | `probe_pathing` | on / off | Baked probe diffraction (when .probes file available) |
 | `refl_rays` | 128 - 8192 | Rays per reflection sim step |
 | `refl_bounces` | 1 - 8 | Bounces per ray |
-| `refl_duration` | 0.5 - 4.0 | Max reverb tail in seconds |
+| `refl_duration` | 0.5 - 4.0 | Convolution-head IR length in seconds (tail length is RT60-driven, derived from baked probe data) |
 | `refl_throttle` | 1 - 32 | Run reflection sim every Nth frame |
-| `refl_max_voices` | 1 - 32 | Max active convolution voices |
+| `refl_max_voices` | 1 - 32 | Max active reflection voices |
 | `transmission_scale` | 0.1 - 100.0 | Material transmission multiplier (read-only at runtime) |
 | `refl_tri_count` | *(read-only)* | Acoustic scene triangle count |
-| `refl_sample_rate` | *(read-only)* | Convolution sample rate |
+| `refl_sample_rate` | *(read-only)* | Reflection-effect sample rate |
 | `refl_ambi_order` | *(read-only)* | Ambisonics order (0=omni, 1=directional) |
 
 ##### Audio — Probes & Recording
