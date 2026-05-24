@@ -2237,6 +2237,18 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             // through the frameSeq acquire barrier.
             cw->currentReadBuf = w;
 
+            // ── Pool-level voice-eviction sweep (Fix A, 2026-05-24) ──
+            //
+            // Run the diff ONCE per audio-callback iter on the audio
+            // thread, with whole-pool visibility. Definition: a voice is
+            // evicted only when its handle disappears from the union of
+            // all sub-workers' assigned-slot sets. Implementation lives
+            // on ConvolutionWorker so the audio-thread code here only
+            // sees a single function call. Must run BEFORE the frameSeq
+            // bump below — the bump's release barrier publishes any
+            // firstAppliedHandles cleanup the sweep makes on sub-workers.
+            cw->sweepEvictionsRT(w, count);
+
             cw->workersReading.store(numW, std::memory_order_release);
 
             // Stamp the signal time on each worker BEFORE bumping frameSeq.
