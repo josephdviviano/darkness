@@ -774,16 +774,6 @@ std::atomic<int> sReflSilentSkipFrames{192};
 /// at the slot-assignment call site.
 static std::atomic<uint32_t> sMaxSubSources{4};
 
-/// Runtime IR-length clamp (samples at the reflection rate). 0 = disabled
-/// (use whatever irSize the simulator / baked probe produced). >0 = cap
-/// per-voice `slot.params.irSize` to this value before handing it to
-/// iplReflectionEffectApply. Steam Audio convolves with the first N
-/// samples of the IR, so a smaller value means cheaper convolution per
-/// voice — useful for A/B-testing the perceptual cost of shorter IRs
-/// without re-baking. Set from AudioService::setRuntimeIrClampMs (which
-/// converts ms → samples using the reflection sample rate).
-static std::atomic<int> sRuntimeIrClampSamples{0};
-
 // ── Steam Audio per-voice gain-staging meters ──
 //
 // Aggregated across ALL active per-voice DSP nodes (so a single hot voice
@@ -1635,16 +1625,10 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         // Snapshot mono for the off-thread convolution worker.
         // The worker processes all voice convolutions in parallel with the
         // next audio callback, writing to a double-buffered stereo output.
-        // Reflection apply gate.
-        //   • CONVOLUTION / HYBRID: need a real IR (irSize > 0). HYBRID
-        //     additionally consults reverbTimes for the parametric tail,
-        //     but the convolution front still requires irSize.
-        //   • PARAMETRIC: no IR ever exists — the apply call uses only
-        //     reverbTimes. Gate solely on the type field.
-        const bool reflParamsValid =
-            (node->reflectionParams.type == IPL_REFLECTIONEFFECTTYPE_PARAMETRIC)
-                ? true
-                : (node->reflectionParams.irSize > 0);
+        // Reflection apply gate. HYBRID always needs a real IR (irSize > 0)
+        // for the convolution head; reverbTimes for the parametric tail are
+        // pinned alongside the IR.
+        const bool reflParamsValid = (node->reflectionParams.irSize > 0);
         if (node->reflectionsActive && node->reflectionEffect
             && reflParamsValid && node->convWorker) {
             auto &cw = *node->convWorker;
@@ -1779,33 +1763,6 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 if (slot.validityToken.get() != node->validityToken.get())
                     slot.validityToken = node->validityToken;
                 slot.params = node->reflectionParams;
-                // Runtime IR clamp: cap the convolution length to a
-                // configurable maximum (in reflection-rate samples). 0 =
-                // disabled. Steam Audio convolves the first irSize samples
-                // of the effect's IR, so reducing irSize directly reduces
-                // per-voice CPU at iplReflectionEffectApply time. Both
-                // baked-probe and realtime-simulated voices flow through
-                // here, so a single knob covers both. Live-tunable from
-                // setRuntimeIrClampMs (sampled atomically every frame).
-                {
-                    int clampSamples = sRuntimeIrClampSamples.load(
-                        std::memory_order_relaxed);
-                    if (clampSamples > 0 && slot.params.irSize > clampSamples) {
-                        // One-shot log per clamp engagement: prints first
-                        // ~8 times to confirm the knob is reaching the apply
-                        // path. Throttled hard so it doesn't flood under
-                        // many active voices.
-                        static std::atomic<int> sClampLogCount{0};
-                        int n = sClampLogCount.fetch_add(1, std::memory_order_relaxed);
-                        if (n < 8) {
-                            AUDIO_LOG("[IR_CLAMP] before=%d after=%d "
-                                      "(clamp=%d samples) #%d\n",
-                                      slot.params.irSize, clampSamples,
-                                      clampSamples, n + 1);
-                        }
-                        slot.params.irSize = clampSamples;
-                    }
-                }
                 slot.reflFrameSize = node->reflectionFrameSize;
 
                 // ── Silent-voice apply elision ───────────────────────────────
@@ -1831,11 +1788,11 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 // ConvolutionWorkerPool.cpp already short-circuits on that.
                 //
                 // The skip restores per-callback worker iter time to the
-                // pre-CONV_LAG envelope: ~N_audible_voices × apply_cost
+                // pre-REFL_LAG envelope: ~N_audible_voices × apply_cost
                 // rather than N_total_voices × apply_cost. Each IR-update
                 // crossfade roughly doubles apply_cost, so the savings are
                 // most pronounced exactly at the sim-cycle boundaries where
-                // the [CONV_LAG] overruns previously fired.
+                // the [REFL_LAG] overruns previously fired.
                 //
                 // Threshold derives from the live `realtime.duration` knob
                 // via reflSilentSkipFrames() in AudioUnits.h: we feed zeros
@@ -2203,7 +2160,7 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             int dc = sFrameDropCount.load(std::memory_order_relaxed);
             if ((dc & 0xF) == 0) {
                 int vd = sVoicesDroppedTotal.load(std::memory_order_relaxed);
-                AUDIO_LOG("[CONV_DROP] frames=%d voices_lost=%d (workers ≥2 frames behind)\n",
+                AUDIO_LOG("[REFL_DROP] frames=%d voices_lost=%d (workers ≥2 frames behind)\n",
                           dc, vd);
             }
             cw->stagingCount[w] = 0;
@@ -2391,7 +2348,7 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         // as low-frequency amplitude modulation ("beating").
         // Note: workersReading is decremented as soon as the worker
         // finishes reading staging, well before frontIdx is flipped,
-        // so the existing [CONV_DROP] log doesn't catch this case.
+        // so the existing [REFL_DROP] log doesn't catch this case.
         static uint64_t sLastConsumedSeq[ConvolutionWorker::kMaxSlots] = {};
         for (auto &subPtr : cw->workers) {
             auto &sub = *subPtr;
@@ -2550,7 +2507,7 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
         // is reading a `front` that hasn't been flipped since last callback,
         // so the same wet stereo content is being summed twice in a row.
         // That is the structural cause of audible LF amplitude modulation
-        // ("beating") that the existing [CONV_DROP] check does NOT detect
+        // ("beating") that the existing [REFL_DROP] check does NOT detect
         // (workersReading is dropped after the staging read, well before
         // the worker finishes its output write).
         static std::atomic<int> sStaleAccum{0};
@@ -3280,28 +3237,6 @@ void AudioService::setHalfRateReflections(bool enabled)
 {
     if (mReflectionSim) mReflectionSim->setRateDivisor(enabled ? 2 : 1);
 }
-void AudioService::setRuntimeIrClampMs(float ms)
-{
-    // Clamp to [0, 4000] — 4 s is the longest IR Steam Audio supports in
-    // any of our paths, so values beyond that are a typo. 0 disables.
-    mRuntimeIrClampMs = std::max(0.0f, std::min(ms, 4000.0f));
-    // Convert ms → reflection-rate samples and publish to the atomic the
-    // audio thread reads at staging-slot setup. If the reflection sample
-    // rate isn't known yet (call before initReflectionPipeline), the
-    // conversion uses 0 → clamp disabled until the pipeline init re-runs
-    // this conversion via a second setRuntimeIrClampMs from the config
-    // pump on subsequent loop steps.
-    int samples = 0;
-    if (mReflectionSampleRate > 0 && mRuntimeIrClampMs > 0.0f) {
-        samples = static_cast<int>(0.001f * mRuntimeIrClampMs
-            * static_cast<float>(mReflectionSampleRate));
-        if (samples < 1) samples = 1;
-    }
-    sRuntimeIrClampSamples.store(samples, std::memory_order_relaxed);
-    LOG_INFO("AudioService: runtime IR clamp set to %.1f ms = %d samples "
-             "(refl rate=%u Hz)", mRuntimeIrClampMs, samples,
-             mReflectionSampleRate);
-}
 bool AudioService::getHalfRateReflections() const
 {
     return mReflectionSim ? mReflectionSim->getRateDivisor() >= 2 : true;
@@ -3754,15 +3689,9 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         int rateDivisor = mReflectionSim ? mReflectionSim->getRateDivisor() : 2;
         mReflectionSampleRate = mDeviceSampleRate / static_cast<uint32_t>(rateDivisor);
         mReflectionFrameSize = mFrameSize / static_cast<uint32_t>(rateDivisor);
-        // Re-publish the runtime IR clamp now that mReflectionSampleRate
-        // is known. The setter call from RenderConfig wiring at startup
-        // ran before this, when sample rate was still 0 → the atomic
-        // would have been left at 0 (clamp disabled) even if a non-zero
-        // ms value was configured. Re-running with the same ms now
-        // converts to a real sample count.
-        setRuntimeIrClampMs(mRuntimeIrClampMs);
 
-        // Re-publish the silent-voice-skip threshold for the same reason.
+        // Re-publish the silent-voice-skip threshold now that the rates
+        // above are known.
         // It is derived from mRealtimeDuration + the rates we just settled
         // above; if it weren't republished here, the audio callback would
         // continue reading the bootstrap default until the next call to
@@ -3830,15 +3759,11 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         simSettings.flags = static_cast<IPLSimulationFlags>(
             IPL_SIMULATIONFLAGS_DIRECT | IPL_SIMULATIONFLAGS_REFLECTIONS);
         simSettings.sceneType = sceneTypeEnum;
-        // Reflection algorithm: convolution / hybrid / parametric. The
-        // simulator-side type must match the per-effect type and the
-        // per-call `params.type` (phonon.h enforces this) — we set all three
-        // from `mReflectionType` and a small translation table.
-        simSettings.reflectionType = (mReflectionType == ReflectionType::Hybrid)
-            ? IPL_REFLECTIONEFFECTTYPE_HYBRID
-            : (mReflectionType == ReflectionType::Parametric)
-                ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
-                : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+        // Reflection algorithm: HYBRID-only. The simulator-side type must
+        // match the per-effect type and the per-call `params.type` (phonon.h
+        // enforces this); we standardized on HYBRID and removed
+        // CONVOLUTION/PARAMETRIC altogether.
+        simSettings.reflectionType = IPL_REFLECTIONEFFECTTYPE_HYBRID;
         // Sim caps. maxNumRays must be >= whichever pipeline branch (realtime
         // or bake) will fire the most rays per cycle; auto-derived rather
         // than a separate knob.
@@ -4092,8 +4017,7 @@ bool AudioService::initReflectionPipeline()
     // few ULP of subtraction error and small enough to not change the real
     // safety contract (still ~99 ms margin vs the IR duration).
     constexpr float kHybridMarginSlack = 1e-3f;
-    if (mReflectionType == ReflectionType::Hybrid
-        && mHybridTransitionTime > mRealtimeDuration - 0.1f + kHybridMarginSlack) {
+    if (mHybridTransitionTime > mRealtimeDuration - 0.1f + kHybridMarginSlack) {
         LOG_ERROR(
             "AudioService: reflections.hybrid_transition_time (%.2fs) >= "
             "reflections.realtime.duration (%.2fs) - 0.1s margin — Steam "
@@ -4138,15 +4062,15 @@ bool AudioService::initReflectionPipeline()
                  irSize, numAmbiChannels,
                  audioSettings.samplingRate, audioSettings.frameSize,
                  rateDivisor,
-                 mReflectionType == ReflectionType::Hybrid     ? "hybrid"     :
-                 mReflectionType == ReflectionType::Parametric ? "parametric" : "convolution");
+                 "hybrid");
 
     // Note: the global IPLReflectionMixer is intentionally NOT created.
     // The pre-Phase-3 design accumulated per-voice convolution into a shared
     // mixer; PLAN.HYBRID_REVERB.md Phase 3 dropped it because Steam Audio's
     // mixer overload of iplReflectionEffectApply is restricted to
-    // CONVOLUTION/TAN and rejects HYBRID/PARAMETRIC. The sub-workers now
-    // sum per-voice ambisonics manually, which works for all three modes.
+    // CONVOLUTION/TAN and rejects HYBRID. Now that we ship HYBRID-only the
+    // mixer overload is permanently out of reach — the sub-workers always
+    // sum per-voice ambisonics manually.
 
     // Create ambisonics decode effect (ambisonics → binaural stereo via HRTF).
     // This also runs at the reflection rate — output is upsampled in the mix node.
@@ -4288,11 +4212,7 @@ bool AudioService::initReflectionPipeline()
     // no longer creates a per-sub-worker mixer, but the field is still in
     // the Config struct in case future modes need it.
     IPLReflectionEffectSettings poolReflSettings{};
-    poolReflSettings.type = (mReflectionType == ReflectionType::Hybrid)
-        ? IPL_REFLECTIONEFFECTTYPE_HYBRID
-        : (mReflectionType == ReflectionType::Parametric)
-            ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
-            : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+    poolReflSettings.type = IPL_REFLECTIONEFFECTTYPE_HYBRID;
     poolReflSettings.irSize = irSize;
     poolReflSettings.numChannels = numAmbiChannels;
     ConvolutionWorkerPool::Config poolCfg;
@@ -4357,12 +4277,12 @@ bool AudioService::initReflectionPipeline()
         // the global budget; subsequent setReverbVoices() calls update it.
         mConvolutionPool->setPerWorkerSlotCap(mReverbVoices);
 
-        AUDIO_LOG( "REFL: convolution started (%d sub-workers, off-thread)\n",
+        AUDIO_LOG( "REFL: reflection pool started (%d sub-workers, off-thread)\n",
                      mConvolutionPool->numWorkers());
     }
 
     AUDIO_LOG( "AudioService: reflection pipeline initialized "
-                 "(convolution, order %d (%dch), IR %d samples, %uHz, 1/%d rate, max %d voices%s)\n",
+                 "(hybrid, order %d (%dch), IR %d samples, %uHz, 1/%d rate, max %d voices%s)\n",
                  mAmbisonicsOrder, mAmbisonicsChannels,
                  irSize, mReflectionSampleRate, rateDivisor,
                  mReverbVoices,
@@ -7635,21 +7555,15 @@ void AudioService::loopStep(float deltaTime)
                 // the pre-count, this prevents overshoot.
                 bool isReflVoice = reflCandidateSet.count(handle) > 0;
                 bool canAffordConvolution = (activeConvolutionCount < mReverbVoices);
-                // Pure parametric mode produces no IR — Steam Audio's
-                // parametric reflection effect uses only reverbTimes[3]
-                // (per phonon.h: ir/irSize/eq/delay are CONVOLUTION/HYBRID
-                // -only fields). For baked sources the simulator never
-                // populates outputs.reflections.ir or irSize when
-                // reflectionType == PARAMETRIC; reverbTimes come from the
-                // probe batch via iplProbeBatchGetReverb in the pin block
-                // below. So the "has reflection data available" gate
-                // splits by mode: parametric needs only probe data;
-                // convolution / hybrid still need a real IR.
-                const bool isParametricMode =
-                    (mReflectionType == ReflectionType::Parametric);
+                // HYBRID-only: the early convolution head needs a real IR
+                // (irSize > 0); the parametric tail is driven by reverbTimes
+                // sourced from iplProbeBatchGetReverb in the pin block below.
+                // Gate on irSize for the same reason CONVOLUTION used to —
+                // HYBRID's apply uses the IR identically to CONVOLUTION in
+                // the [0, hybrid_transition_time] window.
                 bool hasBakedData = voice->dspNode.reflectionEffect
                     && mProbeManager->hasReflections()
-                    && (isParametricMode || outputs.reflections.irSize > 0);
+                    && outputs.reflections.irSize > 0;
                 // Pending reflection sources have no valid sim outputs yet
                 // (we never called iplSourceGetOutputs on them above), so
                 // outputs.reflections.irSize is zero for them — but
@@ -7672,14 +7586,16 @@ void AudioService::loopStep(float deltaTime)
                     // eliminates the Steam-Audio-internal IR crossfade that
                     // produces the ~5 Hz amplitude pulse ("beating") in the
                     // wet bus. See VoicePool.h "Pinned per-voice IR" docs.
-                    // Pin-eligibility split by reflection algorithm:
-                    //   • CONVOLUTION / HYBRID: need a valid IR handle from
-                    //     the simulator (irSize > 0 && ir != nullptr) AND
-                    //     at least one full reflection-sim cycle must have
-                    //     completed since this voice's source was added.
-                    //   • PARAMETRIC: no IR is ever produced — pin as soon
-                    //     as a probe batch with parametric data is loaded,
-                    //     since the apply call needs only reverbTimes.
+                    //
+                    // HYBRID-only pin gate: need a valid IR handle from the
+                    // simulator (irSize > 0 && ir != nullptr) AND at least
+                    // one full reflection-sim cycle must have completed
+                    // since this voice's source was added. HYBRID's
+                    // convolution head uses the IR identically to how
+                    // (removed) CONVOLUTION mode did, so the same gate
+                    // applies. The parametric tail piggy-backs on the same
+                    // pin event — once reverbTimes are written from the
+                    // probe batch below they stay pinned for life.
                     //
                     // The simCycleAfterAdd gate fixes the all-zero-IR pin
                     // bug. Prior to this gate, `hasConvIR` could be true
@@ -7689,16 +7605,9 @@ void AudioService::loopStep(float deltaTime)
                     // pointed at the simulator's "no output yet" sentinel
                     // (non-null handle, all zeros inside). Pinning that
                     // permanent-silence IR stuck the voice's wet bus at zero
-                    // for its entire lifetime. The smoking gun was
-                    // `[REFL_FIRST_APPLY] irNorm=0` for voices with valid
-                    // irNumSamples and reflStatePtr — i.e. the IR slot was
-                    // attached but the buffer was all zeros.
-                    //
-                    // NOTE: `outputs.reflections.eq[]` is HYBRID-only per
-                    // phonon.h:2502-2504; in CONVOLUTION mode it is never
-                    // written by the simulator. Don't use eq as a freshness
-                    // signal — it will read as 0 in CONVOLUTION regardless
-                    // of whether the sim has run.
+                    // for its entire lifetime. The smoking gun for sentinel-
+                    // IR pinning was `[REFL_FIRST_APPLY] irNorm=0`; now
+                    // both pin and pass-through gate on simCycleAfterAdd.
                     //
                     // The cycle counter is bumped at the end of every
                     // reflection-sim iteration; each voice captured the
@@ -7713,10 +7622,8 @@ void AudioService::loopStep(float deltaTime)
                         ? mReflectionSim->completedCycles() : 0;
                     const bool simCycleAfterAdd =
                         simCyclesCompleted > voice->reflectionSimCycleAtAdd;
-                    const bool canPinParametric = isParametricMode
-                        && mProbeManager && mProbeManager->hasReflections();
                     if (!voice->reflectionIRPinned
-                        && ((hasConvIR && simCycleAfterAdd) || canPinParametric)) {
+                        && hasConvIR && simCycleAfterAdd) {
                         // outputs.reflections.ir is an opaque
                         // IPLReflectionEffectIR handle owned by Steam
                         // Audio; we hold the handle as-is and never
@@ -7729,15 +7636,9 @@ void AudioService::loopStep(float deltaTime)
                         // the voice's lifetime.
                         //
                         voice->pinnedParams = outputs.reflections;
-                        voice->pinnedParams.type =
-                            (mReflectionType == ReflectionType::Hybrid)
-                                ? IPL_REFLECTIONEFFECTTYPE_HYBRID
-                                : (mReflectionType == ReflectionType::Parametric)
-                                    ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
-                                    : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+                        voice->pinnedParams.type = IPL_REFLECTIONEFFECTTYPE_HYBRID;
                         voice->pinnedParams.numChannels = mAmbisonicsChannels;
-                        // delay = 0: parametric FDN runs from t=0,
-                        // co-decaying with the convolution.
+                        // REQUIRED INVARIANT (HYBRID-only): delay = 0.
                         //
                         // Steam Audio's hybrid design (per phonon.h
                         // docs + hybrid_reverb_estimator.cpp) is that
@@ -7785,6 +7686,12 @@ void AudioService::loopStep(float deltaTime)
                         // best when the user A/B'd it against
                         // delay=rampStart and delay=rampEnd.
                         //
+                        // Now that CONVOLUTION/PARAMETRIC modes are gone
+                        // this override is load-bearing: every voice
+                        // routes through HYBRID, so removing this would
+                        // re-expose every voice to the ambisonic
+                        // channel-1..N spatial jump described above.
+                        //
                         // Requires reverbTimes to be populated below
                         // (via iplProbeBatchGetReverb) — with
                         // RT60=0 Steam Audio's parametric default-
@@ -7793,28 +7700,6 @@ void AudioService::loopStep(float deltaTime)
                         // symptom.
                         voice->pinnedParams.delay = 0;
 
-                        // Per-call processing length. `irSize` in the params
-                        // struct is the per-call "samples to process" knob
-                        // (≤ effect's create-time irSize). For CONVOLUTION/
-                        // HYBRID this controls how much of the pinned IR is
-                        // convolved each call. For PARAMETRIC there is no
-                        // IR — but Steam Audio still consults this field as
-                        // the per-call processing length for the FDN: pass
-                        // 0 and apply() returns silence regardless of how
-                        // well-populated reverbTimes are (verified
-                        // empirically: pinned reverbTimes correct, footstep
-                        // mono peak ~0.3 reaching the worker, wet output
-                        // peak exactly 0.0). For baked CONVOLUTION/HYBRID
-                        // the outputs.reflections copy already carries a
-                        // valid irSize so we leave it alone; for PARAMETRIC
-                        // we force the create-time effect length so apply
-                        // produces full-length output.
-                        if (isParametricMode) {
-                            voice->pinnedParams.irSize = static_cast<IPLint32>(
-                                mRealtimeDuration
-                                * static_cast<float>(mReflectionSampleRate));
-                        }
-
                         // Fetch baked reverbTimes from the nearest probe
                         // to the listener. Steam Audio does NOT populate
                         // outputs.reflections.reverbTimes for baked
@@ -7822,8 +7707,8 @@ void AudioService::loopStep(float deltaTime)
                         // directly via iplProbeBatchGetReverbTimes.
                         // Without this, reverbTimes stays at the
                         // outputs default (observed: all zeros), which
-                        // makes the parametric reverb in hybrid mode
-                        // run with undefined / default-fallback decay,
+                        // makes HYBRID's parametric tail run with
+                        // undefined / default-fallback decay,
                         // producing the audible "second reverb" the
                         // user heard after IR pinning landed.
                         //
@@ -7865,13 +7750,13 @@ void AudioService::loopStep(float deltaTime)
                         // require tracking voices that ended without ever
                         // pinning — deferred (TODO: add at voice cleanup).
                         if (mProbeManager) mProbeManager->recordCacheHit();
-                        // eq=[...] omitted: HYBRID-only field per phonon.h:2502-2504;
-                        // in CONVOLUTION mode it's never written by the
-                        // simulator and would always read 0 — including it
-                        // misled a prior bug investigation. If we ever
-                        // switch to HYBRID mode, re-add the field then.
+                        // eq=[...] is HYBRID-only per phonon.h:2502-2504 and
+                        // IS populated by the simulator for our pipeline;
+                        // log it as a freshness check (non-zero eq = sim
+                        // wrote outputs for this source).
                         AUDIO_LOG("[PINNED_IR] h=%u '%s' irSize=%d numChannels=%d "
                                   "delay=%d reverbTimes=[%.3f,%.3f,%.3f] "
+                                  "eq=[%.3f,%.3f,%.3f] "
                                   "probeLookupIdx=%d "
                                   "hasReflections=%d probeCount=%zu "
                                   "simCyclesCompleted=%llu cycleAtAdd=%llu\n",
@@ -7882,6 +7767,9 @@ void AudioService::loopStep(float deltaTime)
                                   voice->pinnedParams.reverbTimes[0],
                                   voice->pinnedParams.reverbTimes[1],
                                   voice->pinnedParams.reverbTimes[2],
+                                  voice->pinnedParams.eq[0],
+                                  voice->pinnedParams.eq[1],
+                                  voice->pinnedParams.eq[2],
                                   probeLookupIdx,
                                   mProbeManager ? mProbeManager->hasReflections() : -1,
                                   mProbeManager ? mProbeManager->getProbePositions().size() : 0,
@@ -7908,12 +7796,7 @@ void AudioService::loopStep(float deltaTime)
                         // residual 13% irNorm=0 in [REFL_FIRST_APPLY] traced
                         // here, not to the pin block.
                         voice->dspNode.reflectionParams = outputs.reflections;
-                        voice->dspNode.reflectionParams.type =
-                            (mReflectionType == ReflectionType::Hybrid)
-                                ? IPL_REFLECTIONEFFECTTYPE_HYBRID
-                                : (mReflectionType == ReflectionType::Parametric)
-                                    ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
-                                    : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+                        voice->dspNode.reflectionParams.type = IPL_REFLECTIONEFFECTTYPE_HYBRID;
                         voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
                     }
                     // else: source is added but no sim cycle has completed
@@ -8018,19 +7901,14 @@ void AudioService::loopStep(float deltaTime)
                 float rtLow = 0.0f, rtMid = 0.0f, rtHigh = 0.0f;
                 bool found = false;
                 for (auto &[h, v] : mVoicePool->voices()) {
-                    // Accept any active reflection voice whose reverbTimes
-                    // are populated. CONVOLUTION/HYBRID populate irSize too;
-                    // PARAMETRIC has irSize == 0 by design but still carries
-                    // valid reverbTimes — gate on the type field, not irSize.
+                    // Accept any active reflection voice whose IR is
+                    // populated. HYBRID always carries irSize > 0 once
+                    // the simulator has produced output for the source —
+                    // reverbTimes are already pinned alongside the IR.
                     if (!v->dspNode.reflectionsActive.load(std::memory_order_relaxed))
                         continue;
                     const auto &rp = v->dspNode.reflectionParams;
-                    const bool hasData =
-                        (rp.type == IPL_REFLECTIONEFFECTTYPE_PARAMETRIC)
-                            ? (rp.reverbTimes[0] > 0.0f
-                               || rp.reverbTimes[1] > 0.0f
-                               || rp.reverbTimes[2] > 0.0f)
-                            : (rp.irSize > 0);
+                    const bool hasData = (rp.irSize > 0);
                     if (hasData) {
                         rtLow  = rp.reverbTimes[0];
                         rtMid  = rp.reverbTimes[1];
@@ -8963,11 +8841,7 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
         reflAudioSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
 
         IPLReflectionEffectSettings reflSettings{};
-        reflSettings.type = (mReflectionType == ReflectionType::Hybrid)
-            ? IPL_REFLECTIONEFFECTTYPE_HYBRID
-            : (mReflectionType == ReflectionType::Parametric)
-                ? IPL_REFLECTIONEFFECTTYPE_PARAMETRIC
-                : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
+        reflSettings.type = IPL_REFLECTIONEFFECTTYPE_HYBRID;
         reflSettings.irSize = irSize;
         reflSettings.numChannels = static_cast<IPLint32>(mAmbisonicsChannels);
 
@@ -10629,7 +10503,7 @@ void AudioService::dumpAudioStatusPeriodic()
     // computing percentiles — that gives the worker-pool aggregate
     // (apples-to-apples with "is the pool keeping up?"). Sub-worker
     // imbalance is observable via the existing scalar peakMs +
-    // [CONV_LAG] log.
+    // [REFL_LAG] log.
     //
     // Empty windows (n=0) emit n=0 and dashes — useful sentinel for
     // "this stage never ran" (e.g. no convolution voices = no apply/sum).

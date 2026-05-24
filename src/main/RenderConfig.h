@@ -81,16 +81,15 @@ struct RenderConfig {
     // a higher order in `bakeAmbisonicsOrder` since the runtime decoder
     // downmixes higher-order baked IRs to the requested realtime order.
 
-    /// Reflection effect algorithm. Hybrid splits the IR into an early
-    /// convolution portion (length = `hybridTransitionTime`) and a late
-    /// parametric portion; parametric tails cannot beat from
-    /// per-frame IR crossfade stacking (the failure mode that prompted
-    /// the migration).
-    enum class ReflectionType { Convolution, Hybrid, Parametric };
+    /// Reflection pipeline is HYBRID-only (Steam Audio's
+    /// `IPL_REFLECTIONEFFECTTYPE_HYBRID`): early convolution head
+    /// (length = `hybridTransitionTime`) plus a parametric tail driven by
+    /// RT60 baked into the probe data. CONVOLUTION and PARAMETRIC modes
+    /// were removed — the `reflections.type` YAML key is now deprecated
+    /// and emits a [FALLBACK] warning if present.
 
-    bool  realtimeReflections = true;  // master enable for convolution reverb
-    ReflectionType reflectionType = ReflectionType::Convolution;
-    float hybridTransitionTime = 2.0f;  // seconds — convolution portion of IR
+    bool  realtimeReflections = true;  // master enable for HYBRID reflection pipeline
+    float hybridTransitionTime = 1.0f;  // seconds — convolution head length (Steam Audio Unity/Unreal default)
     float hybridOverlapPercent = 0.25f; // fraction of transition_time for crossfade
 
     int   ambisonicsOrder     = 0;      // realtime ambisonic order (0–3)
@@ -98,22 +97,15 @@ struct RenderConfig {
     // Realtime simulation params (running every reflection_throttle frames)
     int   realtimeNumRays         = 1024;  // rays per realtime sim step (128–8192)
     int   realtimeNumBounces      = 4;     // bounces per ray (1–8)
-    float realtimeDuration        = 2.0f;  // IR duration in seconds (0.5–4.0)
+    float realtimeDuration        = 1.1f;  // IR duration in seconds (>hybridTransitionTime + 0.1 s margin)
     int   realtimeDiffuseSamples  = 32;    // diffuse scattering samples per bounce (16–256)
 
     // Offline bake params (run once per mission; cached as .probes files).
     int   bakeNumRays             = 4096;  // rays per bake step (1024–65536)
     int   bakeNumBounces          = 8;     // bake bounces (1–64)
-    float bakeDuration            = 4.0f;  // bake IR duration in seconds
+    float bakeDuration            = 1.1f;  // bake IR duration in seconds (>= realtime.duration)
     int   bakeDiffuseSamples      = 256;   // bake diffuse samples (32–4096)
     int   bakeAmbisonicsOrder     = 1;     // bake ambisonic order (0–3)
-
-    // Runtime IR-length clamp (0 = disabled). Live A/B knob for the cost
-    // of per-voice convolution: capped irSize directly reduces
-    // iplReflectionEffectApply CPU. Independent of bake.duration —
-    // useful for finding the shortest acceptable IR before committing
-    // to a re-bake.
-    float runtimeIrClampMs        = 0.0f;
 
     // -- audio.probes: baked-probe grid generation --
     // Spacing/height feed bakeProbes(); a denser grid produces smoother reverb
@@ -495,18 +487,7 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.ambisonicsOrder > 3) cfg.ambisonicsOrder = 3;
                 }
 
-                if (refl["type"]) {
-                    std::string val = refl["type"].as<std::string>();
-                    if      (val == "hybrid")     cfg.reflectionType = RenderConfig::ReflectionType::Hybrid;
-                    else if (val == "parametric") cfg.reflectionType = RenderConfig::ReflectionType::Parametric;
-                    else if (val == "convolution") cfg.reflectionType = RenderConfig::ReflectionType::Convolution;
-                    else {
-                        std::fprintf(stderr,
-                            "WARN: unknown reflections.type '%s' — falling back to 'convolution'\n",
-                            val.c_str());
-                        cfg.reflectionType = RenderConfig::ReflectionType::Convolution;
-                    }
-                }
+                if (refl["type"]) std::fprintf(stderr, "[FALLBACK] darknessRender.yaml: 'reflections.type' is deprecated and ignored — HYBRID mode is now the only supported reflection algorithm\n");
                 if (refl["hybrid_transition_time"]) {
                     cfg.hybridTransitionTime = refl["hybrid_transition_time"].as<float>();
                     if (cfg.hybridTransitionTime < 0.1f) cfg.hybridTransitionTime = 0.1f;
@@ -570,15 +551,7 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     }
                 }
 
-                // [REFLECTIONS] Runtime IR-length clamp (ms). 0 = disabled.
-                // >0 = cap per-voice convolution length to this value at
-                // iplReflectionEffectApply time. A/B knob for CPU cost vs
-                // perceptual quality before committing to a re-bake.
-                if (refl["runtime_ir_clamp_ms"]) {
-                    cfg.runtimeIrClampMs = refl["runtime_ir_clamp_ms"].as<float>();
-                    if (cfg.runtimeIrClampMs < 0.0f)    cfg.runtimeIrClampMs = 0.0f;
-                    if (cfg.runtimeIrClampMs > 4000.0f) cfg.runtimeIrClampMs = 4000.0f;
-                }
+                if (refl["runtime_ir_clamp_ms"]) std::fprintf(stderr, "[FALLBACK] darknessRender.yaml: 'reflections.runtime_ir_clamp_ms' is deprecated and ignored — the HYBRID convolution head is already bounded by hybrid_transition_time\n");
             }
 
             // -- audio.probes --
