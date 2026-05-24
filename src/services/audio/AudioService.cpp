@@ -2223,13 +2223,49 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
             cw->stagingCount[newW] = 0;
             cw->writeIdx.store(newW, std::memory_order_release);
 
-            // Distribute voice slots to sub-workers (round-robin)
+            // Distribute voice slots to sub-workers (round-robin), bounded
+            // by the per-worker slot cap (Fix B, 2026-05-24). Round-robin
+            // alone already produces an even split — ceil(count/numW) per
+            // worker — but we enforce the cap explicitly so that:
+            //   (a) the limit is auditable (changing mReverbVoices
+            //       immediately propagates),
+            //   (b) any future per-worker assignment heuristic (e.g.
+            //       affinity by IR or by voice) cannot accidentally
+            //       overload one worker past its compute budget,
+            //   (c) per memory rule (no silent fallbacks), overflow is
+            //       reported via a [FALLBACK] log line and the slot is
+            //       dropped — same outcome as the existing
+            //       catastrophic-backlog path but caused by per-worker
+            //       rather than total overflow.
             int numW = cw->numWorkers;
             for (int wk = 0; wk < numW; ++wk)
                 cw->workers[wk]->assignedCount = 0;
+            const int perWorkerCap = cw->perWorkerSlotCap;
             for (int i = 0; i < count && i < ConvolutionWorker::kMaxSlots; ++i) {
                 int wk = i % numW;
                 auto &sub = *cw->workers[wk];
+                if (sub.assignedCount >= perWorkerCap) {
+                    // Per-worker cap reached. Skip the slot (its mono input
+                    // has already been written but no worker will consume
+                    // it this iter) and surface the spill loudly.
+                    static std::atomic<int> sPerWorkerCapLogCount{0};
+                    int n = sPerWorkerCapLogCount.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (n < 16) {
+                        AUDIO_LOG("[FALLBACK] convolution worker w=%d at "
+                                  "perWorkerCap=%d, dropping staging slot "
+                                  "i=%d (count=%d, numW=%d). Raise "
+                                  "reverb_voices or lower it to match the "
+                                  "load.\n",
+                                  wk, perWorkerCap, i, count, numW);
+                    }
+                    // Count it against droppedFramesTotal so the existing
+                    // [PERF refl_worker] dropped= field captures the spill
+                    // (same units as the catastrophic-backlog drops).
+                    cw->droppedFramesTotal.fetch_add(
+                        1, std::memory_order_relaxed);
+                    continue;
+                }
                 sub.assignedSlots[sub.assignedCount++] = i;
             }
 
@@ -4315,6 +4351,12 @@ bool AudioService::initReflectionPipeline()
         // pointer so the audio-thread fast path stays unchanged).
         rmn.convWorker = mConvolutionPool->worker();
 
+        // Propagate the per-worker slot cap (Fix B, 2026-05-24) now that
+        // numWorkers is known. ceil(mReverbVoices / numWorkers) keeps the
+        // union of caps >= mReverbVoices so the cap never under-allocates
+        // the global budget; subsequent setReverbVoices() calls update it.
+        mConvolutionPool->setPerWorkerSlotCap(mReverbVoices);
+
         AUDIO_LOG( "REFL: convolution started (%d sub-workers, off-thread)\n",
                      mConvolutionPool->numWorkers());
     }
@@ -4326,6 +4368,21 @@ bool AudioService::initReflectionPipeline()
                  mReverbVoices,
                  mConvolutionPool ? ", off-thread" : ", on-thread fallback");
     return true;
+}
+
+//------------------------------------------------------
+// ── setReverbVoices (Fix B, 2026-05-24) ──
+//
+// Out-of-line so we can push the new cap into the convolution pool's
+// per-worker slot ceiling. setReverbVoices may be called at any time:
+// from initial config load (before initReflectionPipeline → mConvolutionPool
+// is null, the cap propagates at init time instead) or from the runtime
+// debug console / YAML reload (after init → push immediately).
+void AudioService::setReverbVoices(int n)
+{
+    mReverbVoices = std::max(0, std::min(n, MAX_ACTIVE_VOICES));
+    if (mConvolutionPool)
+        mConvolutionPool->setPerWorkerSlotCap(mReverbVoices);
 }
 
 //------------------------------------------------------

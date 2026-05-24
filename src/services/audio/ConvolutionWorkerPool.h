@@ -248,6 +248,28 @@ struct ConvolutionWorker {
     std::vector<std::unique_ptr<ConvolutionSubWorker>> workers;
     int numWorkers = 1;
 
+    // ── Per-worker slot cap (Fix B, 2026-05-24) ──
+    //
+    // Hard ceiling on assignedCount for any single sub-worker per audio
+    // callback. Derived from `mReverbVoices` (the runtime convolution
+    // budget) divided by `numWorkers` with ceiling rounding, so the union
+    // of per-worker caps still covers the full budget. Enforced in the
+    // round-robin distribution loop in
+    // AudioService::reflectionMixNodeProcess.
+    //
+    // Default kMaxSlots (= MAX_ACTIVE_VOICES) effectively disables the
+    // cap until AudioService::setPerWorkerSlotCap is called from
+    // initReflectionPipeline / setReverbVoices.
+    //
+    // Per the memory rule (no silent fallbacks): if the round-robin loop
+    // would assign a slot to a worker that has hit this cap, the slot is
+    // dropped and a [FALLBACK] line is emitted identifying the full
+    // worker. The dropped slot is effectively a [CONV_DROP] of one voice
+    // for one callback — same outcome as the existing catastrophic-
+    // backlog branch, but caused by per-worker rather than total
+    // overflow.
+    int perWorkerSlotCap = kMaxSlots;
+
     // Shared read-only state (set at init, immutable during processing).
     IPLHRTF hrtf = nullptr;
     IPLContext context = nullptr;
@@ -415,6 +437,20 @@ public:
 
     bool isActive() const { return mWorker != nullptr; }
     int numWorkers() const { return mWorker ? mWorker->numWorkers : 0; }
+
+    /// Set the per-worker slot cap (Fix B, 2026-05-24). `reverbVoices` is
+    /// the global runtime convolution budget; the per-worker ceiling is
+    /// ceil(reverbVoices / numWorkers). Safe to call from any thread; the
+    /// audio callback reads the value with relaxed ordering each frame.
+    /// Idempotent if called before `init()`.
+    void setPerWorkerSlotCap(int reverbVoices) {
+        if (!mWorker) return;
+        const int n = mWorker->numWorkers > 0 ? mWorker->numWorkers : 1;
+        int cap = (reverbVoices + n - 1) / n;
+        if (cap < 1) cap = 1;
+        if (cap > ConvolutionWorker::kMaxSlots) cap = ConvolutionWorker::kMaxSlots;
+        mWorker->perWorkerSlotCap = cap;
+    }
 
 private:
     /// Per-thread main — wakes on frameSeq, processes assigned slots, runs
