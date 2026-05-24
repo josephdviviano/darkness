@@ -7689,10 +7689,16 @@ void AudioService::loopStep(float deltaTime)
                     // pointed at the simulator's "no output yet" sentinel
                     // (non-null handle, all zeros inside). Pinning that
                     // permanent-silence IR stuck the voice's wet bus at zero
-                    // for its entire lifetime. The smoking gun: [PINNED_IR]
-                    // entries with eq=[0,0,0] — `eq` is populated by the sim
-                    // output, so all-zero eq proves the sim hadn't written
-                    // for this source.
+                    // for its entire lifetime. The smoking gun was
+                    // `[REFL_FIRST_APPLY] irNorm=0` for voices with valid
+                    // irNumSamples and reflStatePtr — i.e. the IR slot was
+                    // attached but the buffer was all zeros.
+                    //
+                    // NOTE: `outputs.reflections.eq[]` is HYBRID-only per
+                    // phonon.h:2502-2504; in CONVOLUTION mode it is never
+                    // written by the simulator. Don't use eq as a freshness
+                    // signal — it will read as 0 in CONVOLUTION regardless
+                    // of whether the sim has run.
                     //
                     // The cycle counter is bumped at the end of every
                     // reflection-sim iteration; each voice captured the
@@ -7859,9 +7865,14 @@ void AudioService::loopStep(float deltaTime)
                         // require tracking voices that ended without ever
                         // pinning — deferred (TODO: add at voice cleanup).
                         if (mProbeManager) mProbeManager->recordCacheHit();
+                        // eq=[...] omitted: HYBRID-only field per phonon.h:2502-2504;
+                        // in CONVOLUTION mode it's never written by the
+                        // simulator and would always read 0 — including it
+                        // misled a prior bug investigation. If we ever
+                        // switch to HYBRID mode, re-add the field then.
                         AUDIO_LOG("[PINNED_IR] h=%u '%s' irSize=%d numChannels=%d "
                                   "delay=%d reverbTimes=[%.3f,%.3f,%.3f] "
-                                  "eq=[%.3f,%.3f,%.3f] probeLookupIdx=%d "
+                                  "probeLookupIdx=%d "
                                   "hasReflections=%d probeCount=%zu "
                                   "simCyclesCompleted=%llu cycleAtAdd=%llu\n",
                                   handle, voice->schemaName.c_str(),
@@ -7871,9 +7882,6 @@ void AudioService::loopStep(float deltaTime)
                                   voice->pinnedParams.reverbTimes[0],
                                   voice->pinnedParams.reverbTimes[1],
                                   voice->pinnedParams.reverbTimes[2],
-                                  voice->pinnedParams.eq[0],
-                                  voice->pinnedParams.eq[1],
-                                  voice->pinnedParams.eq[2],
                                   probeLookupIdx,
                                   mProbeManager ? mProbeManager->hasReflections() : -1,
                                   mProbeManager ? mProbeManager->getProbePositions().size() : 0,
@@ -7887,11 +7895,18 @@ void AudioService::loopStep(float deltaTime)
                         // voice. This is the architectural invariant that
                         // suppresses the per-sim-cycle beating artefact.
                         voice->dspNode.reflectionParams = voice->pinnedParams;
-                    } else {
-                        // Pre-pin (first ever loopStep for this voice with
-                        // outputs.reflections still pending): copy through
-                        // current outputs unchanged. The next cycle should
-                        // pin proper data.
+                    } else if (simCycleAfterAdd) {
+                        // Pre-pin pass-through: a sim cycle HAS completed for
+                        // this source (so outputs.reflections holds real
+                        // sim-written data). Copy through unchanged until the
+                        // pin block above takes effect on a later loopStep.
+                        //
+                        // The simCycleAfterAdd gate mirrors the pin gate
+                        // above. Without it, this branch shipped the
+                        // simulator's "no output yet" sentinel IR to the
+                        // audio thread for ~1 callback per new voice — the
+                        // residual 13% irNorm=0 in [REFL_FIRST_APPLY] traced
+                        // here, not to the pin block.
                         voice->dspNode.reflectionParams = outputs.reflections;
                         voice->dspNode.reflectionParams.type =
                             (mReflectionType == ReflectionType::Hybrid)
@@ -7901,6 +7916,12 @@ void AudioService::loopStep(float deltaTime)
                                     : IPL_REFLECTIONEFFECTTYPE_CONVOLUTION;
                         voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
                     }
+                    // else: source is added but no sim cycle has completed
+                    // for it yet. Leave reflectionParams at its previous
+                    // value (default-zero on first frame, irSize=0); the
+                    // audio callback's reflParamsValid gate keeps the slot
+                    // out of the worker until the pin or pass-through fires
+                    // on a later loopStep.
 
                     voice->dspNode.reflectionsActive.store(true, std::memory_order_release);
                     ++activeConvolutionCount;
