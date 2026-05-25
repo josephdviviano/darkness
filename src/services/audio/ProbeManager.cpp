@@ -355,7 +355,30 @@ bool ProbeManager::computeReflectionPlacements(IPLScene scene,
               "(spacing=%.1f, height=%.1f)\n",
               numCandidates, spacing, height);
 
+    // Diagnostic: dump the IPL-space scene to OBJ whenever
+    // DARKNESS_DUMP_ACOUSTIC_OBJ=<path> is set. Used to compare a working
+    // mission's mesh against one where UNIFORMFLOOR returns 0.
+    if (const char *objEnv = std::getenv("DARKNESS_DUMP_ACOUSTIC_OBJ")) {
+        iplSceneSaveOBJ(scene, const_cast<IPLstring>(objEnv));
+        std::fprintf(stderr,
+            "[PROBE_PLAN] DARKNESS_DUMP_ACOUSTIC_OBJ — wrote scene to %s\n",
+            objEnv);
+    }
+
     if (numCandidates == 0) {
+        // UNIFORMFLOOR finding zero candidates almost always means the
+        // raycast-down-to-floor step is mis-detecting surfaces — either
+        // the scene is empty when committed, normals are inverted so
+        // floors look like ceilings, or the OBB top is BELOW all geometry.
+        // Dump the IPL-space scene to OBJ so the developer can inspect the
+        // mesh that was actually handed to Steam Audio.
+        std::string objPath = "/tmp/probe_plan_failed_scene.obj";
+        iplSceneSaveOBJ(scene, const_cast<IPLstring>(objPath.c_str()));
+        std::fprintf(stderr,
+            "[PROBE_PLAN] UNIFORMFLOOR generated 0 candidates — dumped "
+            "IPL scene to %s (engine→IPL: x=-y, y=z, z=-x; units=meters; "
+            "Y-up). Inspect there for missing floors / flipped normals / "
+            "empty scene.\n", objPath.c_str());
         LOG_ERROR("ProbeManager: no probes generated — check scene geometry");
         iplProbeArrayRelease(&probeArray);
         return false;
