@@ -395,6 +395,10 @@ static void printHelp() {
         "                                [--set <yaml.path>=<value>]\n"
         "                                [--perf-label <name>]\n"
         "                                [--exit-after-seconds <N>]\n"
+        "                                [--auto-fly] [--auto-fly-speed <N>]\n"
+        "                                [--auto-fly-waypoints <N>]\n"
+        "                                [--auto-fly-seed <N>]\n"
+        "                                [--auto-fly-pause-sec <N>]\n"
         "                                [-h | --help]\n"
         "\n"
         "  All other tunables live in the YAML config (default: ./darknessRender.yaml).\n"
@@ -427,6 +431,18 @@ static void printHelp() {
         "                    Exit cleanly after N seconds of wall-clock from main()\n"
         "                    start. Lets `tools/perf_sweep.sh` run unattended. The\n"
         "                    JSONL sink flushes + closes on shutdown.\n"
+        "  --auto-fly        Drive the camera through a deterministic random tour\n"
+        "                    of the N-nearest pathing probes (forces fly mode).\n"
+        "                    Companion to --exit-after-seconds so every sweep\n"
+        "                    iteration captures the same flythrough load profile.\n"
+        "                    Emits [AUTO_FLY] stderr lines per waypoint reached.\n"
+        "                    Falls back to standard fly mode (with [FALLBACK] log)\n"
+        "                    when no .probes file is loaded for the mission.\n"
+        "  --auto-fly-speed N        Travel speed in world units/sec (default 10).\n"
+        "  --auto-fly-waypoints N    N-nearest probes to include (default 50).\n"
+        "  --auto-fly-seed N         PRNG seed for visit-order shuffle (default\n"
+        "                            0xC0FFEE). Accepts decimal or 0xHEX.\n"
+        "  --auto-fly-pause-sec N    Dwell time per waypoint (default 0).\n"
         "  -h, --help        Show this message and exit.\n"
         "\n"
         "YAML CONFIG REFERENCE (defaults shown; see darknessRender.example.yaml)\n"
@@ -490,6 +506,7 @@ static void printHelp() {
         "  refl_enabled        Toggle audio reflections (convolution reverb)\n"
         "  head_log            Write per-frame head/viewport CSV to ./head_log.csv\n"
         "  physics_log         Write physics diagnostics to ./physics_log.csv\n"
+        "  auto_fly            Deterministic probe-tour flythrough (forces fly mode)\n"
         "  show_raycast        Toggle raycast debug visualization\n"
         "  isolate_model       Cycle model isolation (debug)\n"
         "\n"
@@ -3105,6 +3122,24 @@ static void registerConsoleSettings(
         },
         "Write per-render-frame head/viewport state to head_log.csv");
 
+    // Auto-fly probe-tour toggle. Flipping on snapshots N-nearest probes
+    // from current camera position and starts the deterministic shuffle.
+    // Flipping off releases the camera back to manual fly control.
+    dbgConsole.addBool("auto_fly",
+        [&state]() { return state.autoFly.enabled; },
+        [&state](bool v) { state.autoFly.enabled = v; },
+        "Deterministic probe-tour flythrough (forces fly mode)");
+
+    dbgConsole.addFloat("auto_fly_speed", 0.5f, 50.0f,
+        [&state]() { return state.autoFly.speed; },
+        [&state](float v) { state.autoFly.speed = v; },
+        "Auto-fly travel speed (world units/sec, ft/s)");
+
+    dbgConsole.addFloat("auto_fly_pause_sec", 0.0f, 30.0f,
+        [&state]() { return state.autoFly.pauseAtWaypointSec; },
+        [&state](float v) { state.autoFly.pauseAtWaypointSec = v; },
+        "Auto-fly dwell time per waypoint (seconds; 0 = continuous)");
+
     // ── Water ──
 
     dbgConsole.setGroup("Water");
@@ -3775,6 +3810,42 @@ static void updateMovement(
     const Darkness::MissionData &mission,
     const Darkness::DebugConsole &dbgConsole)
 {
+    // ── Auto-fly probe-tour ──
+    // Runs unconditionally when enabled (even with the debug console open
+    // — the whole point is unattended sweep iterations). Forces fly mode
+    // because the physics integrator owns camera position otherwise.
+    // Lazy activation: defer snapshotting probes until the first tick so
+    // we read the live spawn camera position as the N-nearest "from" point.
+    if (state.autoFly.enabled) {
+        if (state.physicsMode) {
+            state.physicsMode = false;
+            std::fprintf(stderr,
+                "[AUTO_FLY] forcing physics_mode off (auto-fly drives "
+                "camera directly)\n");
+        }
+        if (!state.autoFly.active) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            const std::vector<Darkness::Vector3> empty;
+            const auto &probes = svc
+                ? svc->getPathingProbePositions() : empty;
+            Darkness::Vector3 from(state.cam.pos[0], state.cam.pos[1],
+                                    state.cam.pos[2]);
+            state.autoFly.activate(from, probes);
+            // activate() emits [FALLBACK] and clears `enabled` if no
+            // probes are loaded — fall through to manual fly mode in
+            // that case.
+        }
+        if (state.autoFly.active) {
+            state.cam.roll = 0.0f;
+            state.autoFly.tick(dt, state.cam.pos,
+                                state.cam.yaw, state.cam.pitch);
+            return;
+        }
+    } else if (state.autoFly.active) {
+        // Toggled off via console — return camera to user control.
+        state.autoFly.deactivate();
+    }
+
     if (dbgConsole.isOpen()) return;
 
     const Uint8 *keys = SDL_GetKeyboardState(nullptr);
@@ -6238,6 +6309,25 @@ int main(int argc, char *argv[]) {
         for (int32_t id : ids)
             movingTerrainSystem.activate(id);
         std::fprintf(stderr, "--toggle-platforms: activated %zu platforms\n", ids.size());
+    }
+
+    // Seed auto-fly probe-tour from CLI flags. Lazy activation happens on
+    // the first updateMovement() tick (needs a live camera position to do
+    // N-nearest probe selection, and the probe set may not be loaded yet
+    // here when --skip-reflection-bake is off and the bake is still in
+    // progress). Tick the auto_fly console toggle to interactively start
+    // / stop without restarting.
+    state.autoFly.speed             = cfg.autoFlySpeed;
+    state.autoFly.waypointCount     = cfg.autoFlyWaypoints;
+    state.autoFly.seed              = cfg.autoFlySeed;
+    state.autoFly.pauseAtWaypointSec = cfg.autoFlyPauseSec;
+    state.autoFly.enabled           = cfg.autoFly;
+    if (cfg.autoFly) {
+        std::fprintf(stderr,
+            "--auto-fly: enabled (waypoints=%d, speed=%.1f ft/s, "
+            "seed=0x%08x, pause=%.2f s) — activates on first input tick\n",
+            cfg.autoFlyWaypoints, cfg.autoFlySpeed,
+            cfg.autoFlySeed, cfg.autoFlyPauseSec);
     }
 
     // ── Main loop — LoopService drives frame dispatch ──

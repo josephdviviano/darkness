@@ -313,6 +313,21 @@ struct RenderConfig {
     // until SDL quit). Set via --exit-after-seconds N to let scripted sweeps
     // (tools/perf_sweep.sh) run unattended.
     float       exitAfterSeconds = 0.0f;
+
+    // -- auto-fly probe-tour (companion to --exit-after-seconds) --
+    // Drives the fly-mode camera through a deterministic random tour of the
+    // N nearest pathing probes. Without movement, the listener position is
+    // stationary and the JSONL perf artifact reflects only one geometric
+    // configuration; with auto-fly enabled every sweep iteration captures
+    // the same flythrough trajectory. See src/main/AutoFlyTour.h.
+    //
+    // Activation forces fly mode (physics off) on first frame after init
+    // because the physics integrator owns camera position when on.
+    bool        autoFly             = false;     // --auto-fly
+    float       autoFlySpeed        = 10.0f;     // --auto-fly-speed (ft/s)
+    int         autoFlyWaypoints    = 50;        // --auto-fly-waypoints
+    uint32_t    autoFlySeed         = 0xC0FFEEu; // --auto-fly-seed
+    float       autoFlyPauseSec     = 0.0f;      // --auto-fly-pause-sec
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -1338,6 +1353,11 @@ inline bool isPerfLabelValid(const std::string& s) {
 //   --set <p>=<v>      generic YAML-path override; repeatable
 //   --perf-label <s>   tag the per-run audio_perf.jsonl directory
 //   --exit-after-seconds N  exit cleanly after N seconds of wall-clock
+//   --auto-fly         enable deterministic probe-tour flythrough
+//   --auto-fly-speed N        ft/s (default 10)
+//   --auto-fly-waypoints N    N-nearest probes to visit (default 50)
+//   --auto-fly-seed N         shuffle seed (default 0xC0FFEE)
+//   --auto-fly-pause-sec N    dwell per waypoint (default 0)
 //   --help / -h        print usage
 //
 // Unknown flags are reported but otherwise ignored — when a removed flag
@@ -1396,6 +1416,47 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                 std::fprintf(stderr,
                     "[FALLBACK] --exit-after-seconds: non-numeric value "
                     "'%s' — ignored (run remains open-ended)\n", argv[i]);
+            }
+        } else if (std::strcmp(argv[i], "--auto-fly") == 0) {
+            cfg.autoFly = true;
+        } else if (std::strcmp(argv[i], "--auto-fly-speed") == 0 && i + 1 < argc) {
+            try {
+                cfg.autoFlySpeed = std::stof(argv[++i]);
+                if (cfg.autoFlySpeed < 0.0f) cfg.autoFlySpeed = 0.0f;
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --auto-fly-speed: non-numeric value '%s'"
+                    " — keeping default %.1f\n", argv[i], cfg.autoFlySpeed);
+            }
+        } else if (std::strcmp(argv[i], "--auto-fly-waypoints") == 0 && i + 1 < argc) {
+            try {
+                cfg.autoFlyWaypoints = std::stoi(argv[++i]);
+                if (cfg.autoFlyWaypoints < 1) cfg.autoFlyWaypoints = 1;
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --auto-fly-waypoints: non-integer value "
+                    "'%s' — keeping default %d\n",
+                    argv[i], cfg.autoFlyWaypoints);
+            }
+        } else if (std::strcmp(argv[i], "--auto-fly-seed") == 0 && i + 1 < argc) {
+            try {
+                // Accept decimal or 0xHEX; std::stoul base=0 auto-detects.
+                cfg.autoFlySeed = static_cast<uint32_t>(
+                    std::stoul(argv[++i], nullptr, 0));
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --auto-fly-seed: invalid '%s' — keeping "
+                    "default 0x%08x\n", argv[i], cfg.autoFlySeed);
+            }
+        } else if (std::strcmp(argv[i], "--auto-fly-pause-sec") == 0 && i + 1 < argc) {
+            try {
+                cfg.autoFlyPauseSec = std::stof(argv[++i]);
+                if (cfg.autoFlyPauseSec < 0.0f) cfg.autoFlyPauseSec = 0.0f;
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --auto-fly-pause-sec: non-numeric value "
+                    "'%s' — keeping default %.2f\n",
+                    argv[i], cfg.autoFlyPauseSec);
             }
         } else if (argv[i][0] != '-' && !cli.misPath) {
             // First non-flag argument is the mission file

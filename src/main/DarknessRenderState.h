@@ -55,6 +55,7 @@
 #include "RenderParamsParser.h"
 #include "ObjectIllumination.h"
 #include "DynamicLightList.h"
+#include "AutoFlyTour.h"
 #include "physics/DarkPhysics.h"
 
 namespace Darkness {
@@ -494,6 +495,16 @@ struct RuntimeState {
     // an uncapped overlay unreadable. Exposed via `debug_room_max_count`
     // in the debug console.
     int debugRoomMaxCount = 20;
+
+    // ── Auto-fly probe-tour state ──
+    // Drives the fly-mode camera through a deterministic random tour of
+    // the N nearest pathing probes (see AutoFlyTour.h). User-tunable knobs
+    // (speed / waypointCount / seed / pauseAtWaypointSec / enabled) are
+    // seeded from RenderConfig at startup and can be flipped at runtime
+    // via the `auto_fly` console toggle. The tour is built lazily on the
+    // first tick after `enabled` becomes true so we can read the live
+    // camera position as the "from" point for N-nearest probe selection.
+    AutoFlyTour autoFly;
 };
 
 // ── FrameContext — Per-frame computed values ──
