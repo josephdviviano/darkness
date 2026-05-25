@@ -923,6 +923,16 @@ public:
     }
     float getPathingDedupRadiusFt() const { return mProbePathingDedupRadiusFt; }
 
+    /** Reflection-bake skip. When true, the next bakeProbes() call carries
+     *  the existing `.probes` file's reflection section forward verbatim
+     *  and only re-bakes the pathing batch. Speeds iteration on pathing-
+     *  only placement tweaks (reflection bake is multi-minute; pathing
+     *  bake is seconds). Hard-fails the bake if the existing file has no
+     *  reflection section. Set from `--skip-reflection-bake` CLI flag /
+     *  `audio.reflections.bake_skip` YAML key. Default false. */
+    void setReflectionBakeSkip(bool skip) { mReflectionBakeSkip = skip; }
+    bool getReflectionBakeSkip() const { return mReflectionBakeSkip; }
+
     /** Snapshot of probe positions in feet (engine units). Populated by
      *  bakeProbes() and loadProbes(); empty if no probes are loaded. Used
      *  by the renderer to draw a debug overlay. The vector is rebuilt on
@@ -949,6 +959,60 @@ public:
         int32_t roomID   = -1;
     };
     std::vector<PathingProbeViz> getPathingProbeViz() const;
+
+    /** One edge in the pathing-probe visibility graph, with neighborhood
+     *  activity payload (Capability C, PLAN.PROBE_DEBUG_TOOLING.md).
+     *
+     *  HONESTY NOTE: `edgeBlock` is NOT a per-edge result from Steam
+     *  Audio's solver — the public C API does not expose that. It is
+     *  a neighborhood-activity heatmap: across all active voices whose
+     *  source position is within `visRadius` of either endpoint A or B
+     *  of this edge, we report `max(1 - V.eqCoeffs.mid)`. Reads the
+     *  same `lastGoodPathParams` snapshot the per-voice path effect
+     *  already caches each frame — no extra Steam Audio API calls.
+     *
+     *  hasNeighbor=false means no active voice is in either endpoint's
+     *  influence radius → renderer draws this edge as dim gray
+     *  (background topology) instead of color-coding it. */
+    struct PathingEdgeViz {
+        Vector3 posA{0.0f, 0.0f, 0.0f};
+        Vector3 posB{0.0f, 0.0f, 0.0f};
+        float   edgeBlock  = 0.0f;
+        bool    hasNeighbor = false;
+    };
+
+    /** Per-voice source→listener arrow for Layer-3 of the pathing-graph
+     *  overlay. One entry per spatial voice with a successful pathing
+     *  solve; `eqMid` is the mid-band coefficient straight off
+     *  `lastGoodPathParams.eqCoeffs[1]`. Renderer colors the arrow by
+     *  this value. */
+    struct VoiceArrowViz {
+        Vector3 source{0.0f, 0.0f, 0.0f};
+        Vector3 listener{0.0f, 0.0f, 0.0f};
+        float   eqMid     = 1.0f;
+        bool    everSolved = false;
+        bool    isAmbient = false;
+    };
+
+    /** Aggregate the pathing adjacency (static, from ProbeManager) with
+     *  per-frame voice EQ outputs into one renderable list. Called once
+     *  per frame from the main loop (NOT the audio callback — per
+     *  feedback_threading_architecture). Returns empty when no pathing
+     *  batch is loaded or the adjacency hasn't been built yet; the HUD
+     *  reports that state to the user. */
+    std::vector<PathingEdgeViz> getPathingEdgeViz() const;
+
+    /** Per-voice arrow snapshot for Layer-3. Called once per frame from
+     *  the main loop. Same threading rules as getPathingEdgeViz. */
+    std::vector<VoiceArrowViz> getVoiceArrowViz() const;
+
+    /** Trigger the one-shot O(N²) pathing-adjacency build on the
+     *  ProbeManager. Idempotent — calls clearPathingAdjacency first.
+     *  Safe to call before the raycaster is wired (the inner method
+     *  emits [VIZ_FALLBACK] in that case). Invoked automatically after
+     *  loadProbes / bakeProbes; callers can also trigger from a debug
+     *  console binding if they re-injected the raycaster mid-session. */
+    void rebuildPathingAdjacency();
 
     /** Per-probe reachability classification, parallel to
      *  getProbePositions(). Populated by classifyProbeReachability();
@@ -1595,6 +1659,15 @@ private:
     /// collapsing legitimately distinct rooms. Set from yaml
     /// (`audio.pathing_probes.dedup_radius_ft`).
     float              mProbePathingDedupRadiusFt = 10.0f;
+
+    /// Reflection-bake skip flag. When true, the next bakeProbes() call
+    /// carries the existing `.probes` reflection section forward verbatim
+    /// and only re-bakes the pathing batch. See setReflectionBakeSkip()
+    /// for the full rationale. Default false. Set from yaml
+    /// (`audio.reflections.bake_skip`) and `--skip-reflection-bake` CLI.
+    /// Also drives the once-per-30s [REFL_SKIP] staleness reminder in
+    /// dumpAudioStatusPeriodic.
+    bool               mReflectionBakeSkip = false;
 
     // Volumetric occlusion sphere radius + sample count moved to
     // AudioOcclusion (mAudioOcclusion). The setters/getters above are

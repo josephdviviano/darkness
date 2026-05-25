@@ -435,6 +435,31 @@ struct RuntimeState {
     // and correlate it with audible volume/direction changes.
     bool showVPos = false;
 
+    // Debug: pathing-probe visibility graph + per-edge EQ-activity
+    // heatmap (Capability C, PLAN.PROBE_DEBUG_TOOLING.md). Off by
+    // default; toggle via `show_pathing_graph`. Three layers visible
+    // together:
+    //   Layer 1 — every edge in the static adjacency graph drawn dim
+    //             gray (background topology).
+    //   Layer 2 — edges whose endpoints are within visRadius of an
+    //             active voice are tinted by that voice's mid-band
+    //             eqCoeffs (green=clear, red=blocked, yellow=partial).
+    // Layer 3 (per-voice source→listener arrow) is gated separately
+    // by `showVoiceArrows` below so users can see one without the
+    // other.
+    //
+    // HONESTY NOTE: NOT a per-edge query against Steam Audio's solver.
+    // The adjacency replicates Steam Audio's bake-time visibility test
+    // (same visRange + numVisSamples); the per-edge coloring is a
+    // neighborhood-activity heatmap that aggregates each voice's
+    // observed eqCoeffs onto the edges nearest its source position.
+    bool showPathingGraph = false;
+    // Companion Layer 3 toggle — separate from showPathingGraph so a
+    // user can watch arrows alone (unambiguous per-voice attribution)
+    // or arrows on top of the graph (graph context + per-voice
+    // breakdown).
+    bool showVoiceArrows = false;
+
     // One entry per labelled point per room. We push the room's center
     // (used to flag the listener's current room with a "*" suffix) plus
     // every polytope corner (so wherever you look at a wireframe, a

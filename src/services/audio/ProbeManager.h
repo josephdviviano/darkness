@@ -264,6 +264,22 @@ struct ProbeBakeParams {
     /// enforces; logged for traceability. Does NOT derive the filter.
     float minWallClearanceFt = 0.0f;
 
+    /// True to bake the dense reflection batch. When false, ProbeManager
+    /// loads the existing `.probes` file at `outputPath`, carries the
+    /// reflection section forward verbatim (raw serialized bytes), and
+    /// runs only the pathing bake (if `bakePathingBatch` is also true).
+    /// Symmetric with `bakePathingBatch` below — same plumbing, opposite
+    /// batch. Hard-fails (no silent fallback) if the existing file has no
+    /// reflection section, so the user can't accidentally end up with a
+    /// pathing-only output when they expected the reflection data to
+    /// carry over.
+    ///
+    /// Drives the `--skip-reflection-bake` CLI flag /
+    /// `audio.reflections.bake_skip` YAML key — both motivated by the
+    /// multi-minute reflection bake dominating iteration on pathing-only
+    /// placement tweaks.
+    bool   bakeReflectionBatch = true;
+
     // ── Pathing batch (sparse, ROOM_PORTAL-derived) ──────────────────────
 
     /// True to bake a second probe batch tagged Pathing. When false, no
@@ -284,6 +300,40 @@ struct ProbeBakeParams {
     /// bake reflections off it. Empty = keep everything that landed inside
     /// the candidate list.
     ProbeFilterFn pathingProbeFilter;
+};
+
+/// One edge in the pathing-probe visibility graph (Capability C —
+/// PLAN.PROBE_DEBUG_TOOLING.md). Endpoints are indices into
+/// `ProbeBatchEntry::positions` for the pathing batch.
+///
+/// NOT a claim that Steam Audio visited this specific edge for any
+/// specific voice. The adjacency is computed by Darkness using the
+/// same raycast algorithm Steam Audio's pathing baker uses (visRange,
+/// numVisSamples) — same algorithm, same inputs, same edges. Layer-2
+/// edge coloring (done in the renderer) is a neighborhood-activity
+/// heatmap: "voices near this edge's endpoints are perceiving the
+/// listener with this EQ quality." It does NOT enumerate Steam Audio's
+/// actual visited-probe set per voice — the public C API does not
+/// expose that data.
+struct PathingEdge {
+    int a = -1;
+    int b = -1;
+};
+
+/// Output of buildPathingAdjacency. Cached on ProbeManager; rebuilt on
+/// load/bake. `built` distinguishes "no batch / nothing to test" from
+/// "built but empty graph".
+struct PathingAdjacency {
+    std::vector<PathingEdge> edges;
+    /// True once a build pass has completed (success or empty graph).
+    /// False on init, after release, or if the build aborted partway.
+    bool   built       = false;
+    /// Parameters used to build the cached graph. Stored so callers can
+    /// surface them in diagnostics and so a rebuild can detect drift.
+    float  visRangeFt   = 0.0f;
+    int    numVisSamples = 0;
+    /// Wall-clock build time (ms) — surfaced in [ADJACENCY_BUILD].
+    double buildMs      = 0.0;
 };
 
 /// Construction-time wiring.
@@ -432,6 +482,51 @@ public:
         return mPathingBatch ? mPathingBatch->radiiFt : kEmpty;
     }
 
+    // ── Pathing adjacency (Capability C debug viz) ────────────────────
+    //
+    // Static visibility graph over the pathing-batch probes, computed by
+    // a Darkness-side replication of Steam Audio's bake-time visibility
+    // test (`IPLPathBakeParams.visRange` + `numSamples`). Used ONLY by
+    // the show_pathing_graph debug overlay.
+    //
+    // Honesty note (also above PathingEdge): this is NOT a query against
+    // Steam Audio's serialized graph (the public C API doesn't expose
+    // that). It's the same algorithm with the same inputs, so the edges
+    // SHOULD agree modulo raycast-precision noise.
+
+    /// Raycaster signature used by buildPathingAdjacency. Returns true
+    /// if the segment `from`→`to` hits the acoustic scene. AudioService
+    /// supplies the engine's mRaycaster bound against the acoustic mesh.
+    using PathingAdjacencyRaycaster =
+        std::function<bool(const Vector3 &from, const Vector3 &to)>;
+
+    /// Build (or rebuild) the pathing adjacency. O(N²) probe-pair pass
+    /// at level-load. `visRangeFt` is the max probe-to-probe distance
+    /// to consider (matches Steam Audio's `IPLPathBakeParams.visRange`
+    /// guard `areProbesTooFar`); `numVisSamples` is the per-pair ray
+    /// count (Steam Audio scatters numSamples² rays in a visRadius
+    /// sphere — we currently cast one center-to-center ray as a faithful
+    /// reproduction with reduced sample count, sufficient for the
+    /// neighborhood-activity heatmap purpose; if visRange or numSamples
+    /// drift, callers should rebuild). Emits [ADJACENCY_BUILD].
+    /// Safe to call repeatedly; subsequent calls overwrite the cache.
+    /// `raycast` must be non-null — without an acoustic-scene raycaster
+    /// every pair would be treated as visible and the graph would be
+    /// useless; we emit a [VIZ_FALLBACK] line and leave `built=false`.
+    void buildPathingAdjacency(float visRangeFt,
+                                int   numVisSamples,
+                                const PathingAdjacencyRaycaster &raycast);
+
+    /// Clear the cached adjacency. Called from releaseBatches so a
+    /// stale graph doesn't survive a level swap.
+    void clearPathingAdjacency() { mPathingAdjacency = {}; }
+
+    /// Read-only access. `built` flag tells the caller whether to draw
+    /// edges or surface the "NO PATHING BATCH" HUD message.
+    const PathingAdjacency &getPathingAdjacency() const {
+        return mPathingAdjacency;
+    }
+
     // Bake-time grid config — takes effect on next bake. Does NOT relocate.
     void  setProbeSpacingFt(float ft) { mProbeSpacingFt = std::max(1.0f, std::min(ft, 20.0f)); }
     float getProbeSpacingFt() const { return mProbeSpacingFt; }
@@ -537,6 +632,11 @@ private:
     // ── T2.4 IR cache stats (see public recordCacheHit/Miss) ──
     std::atomic<uint64_t> mCacheHits{0};
     std::atomic<uint64_t> mCacheMisses{0};
+
+    /// Cached pathing-probe visibility graph (Capability C). Populated
+    /// by buildPathingAdjacency; cleared by releaseBatches. Empty +
+    /// built=false on init.
+    PathingAdjacency mPathingAdjacency;
 };
 
 } // namespace Darkness
