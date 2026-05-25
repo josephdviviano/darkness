@@ -175,21 +175,21 @@ ITER=0
 for VAL in "${VALUES[@]}"; do
     ITER=$((ITER + 1))
     LABEL="${KNOB_SHORT}_${VAL}"
-    # UTC timestamp: 2026-05-24T12-34-56Z (colons stripped for filesystem
-    # friendliness, esp. on macOS where some tools choke on ':' in paths).
-    TS="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
-    RUN_DIR="${OUT_BASE}/${TS}__${LABEL}"
-    mkdir -p "$RUN_DIR"
 
-    # AudioService writes audio_perf.jsonl to a per-run dir derived from
-    # --perf-label and the system's perf root. We pass --perf-label here; the
-    # binary (Agent A's side) is expected to land the file at
-    # ./perf/<mission>/<timestamp>__<label>/audio_perf.jsonl
-    # to match PLAN §1.2.
+    # The binary creates its own per-run dir at openPerfJsonl time using
+    # utcIsoCompact() (format YYYYMMDDTHHMMSSZ). We DON'T pre-create one
+    # here — the script's date format and the binary's would diverge by
+    # both shape (dashes vs none) and instant (script captures before
+    # exec; binary captures after init), leaving an orphaned empty dir.
+    # Instead, capture the binary's stderr, parse the [PERF_SINK] opened
+    # line that AudioService emits, and report the actual path.
 
     echo "[SWEEP] iter ${ITER}/${#VALUES[@]}: ${KNOB}=${VAL}" >&2
     echo "[SWEEP] launching: $BIN $MISSION ... --set ${KNOB}=${VAL}" >&2
 
+    # Tee stderr to a temp file so we can both stream it live AND grep
+    # the [PERF_SINK] line out of it after the binary exits.
+    STDERR_TMP="$(mktemp -t perf_sweep_stderr.XXXXXX)"
     "$BIN" \
         "$MISSION" \
         --res "$RES" \
@@ -198,10 +198,17 @@ for VAL in "${VALUES[@]}"; do
         --skip-reflection-bake \
         --set "${KNOB}=${VAL}" \
         --perf-label "$LABEL" \
-        --exit-after-seconds "$DURATION"
+        --exit-after-seconds "$DURATION" \
+        2> >(tee "$STDERR_TMP" >&2)
     RC=$?
 
-    JSONL_PATH="${RUN_DIR}/audio_perf.jsonl"
+    JSONL_PATH="$(grep -E '^\[PERF_SINK\] audio_perf\.jsonl opened: ' "$STDERR_TMP" \
+                  | head -1 | sed -E 's/^\[PERF_SINK\] audio_perf\.jsonl opened: //')"
+    rm -f "$STDERR_TMP"
+
+    if [ -z "$JSONL_PATH" ]; then
+        JSONL_PATH="(no [PERF_SINK] line found — JSONL may not have opened; check stderr above)"
+    fi
     echo "[SWEEP] ${KNOB}=${VAL} → ${JSONL_PATH} (exit ${RC})"
 
     if [ "$RC" -ne 0 ]; then
