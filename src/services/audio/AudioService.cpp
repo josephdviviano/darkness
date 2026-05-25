@@ -3737,6 +3737,14 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         iplStaticMeshAdd(mIplStaticMesh, mIplScene);
         iplSceneCommit(mIplScene);
 
+        // Store floor-poly probe candidates for the reflection bake.
+        // Replaces Steam Audio's UNIFORMFLOOR (which raycasts down from
+        // a single OBB top and silently mis-covers multi-level missions
+        // — see PLAN.AUDIO_PROFILING.md scheme comparison).
+        mFloorProbeCandidates = data.floorProbeCandidates;
+        AUDIO_LOG("AudioService: %zu floor-poly probe candidates received\n",
+                  mFloorProbeCandidates.size());
+
         // Compute reflection pipeline rate — reduced rate lowers per-voice FFT
         // cost while keeping HRTF at full device rate (48kHz).
         // Divisor 1=full rate, 2=half (24kHz), 4=quarter (12kHz). Rate divisor
@@ -12104,6 +12112,17 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     params = ProbeBakeParams{};
     params.sceneMin              = mSceneMin;
     params.sceneMax              = mSceneMax;
+    params.floorProbeCandidates  = mFloorProbeCandidates;
+    // Room-aware dedup: makes the global dedup pass preserve probes that
+    // sit close to each other but live in different rooms (e.g. across a
+    // thin wall).  Without this, FLOOR_POLY's per-cell placement can lose
+    // small rooms entirely to dedup collisions with their neighbours.
+    if (mRoomService) {
+        params.probeRoomLookup = [this](const Vector3 &p) -> int {
+            Room *r = mRoomService->roomFromPoint(p);
+            return r ? r->getRoomID() : -1;
+        };
+    }
     params.propagationMaxDist    = mPropagationMaxDist;
     params.bakeNumRays           = mBakeNumRays;
     params.bakeNumBounces        = mBakeNumBounces;
@@ -12685,40 +12704,38 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             const float kDoorPairDedupRadiusSq =
                 kDoorPairDedupRadiusFt * kDoorPairDedupRadiusFt;
             int droppedDoorPairs = 0;
+            // Per-purpose dedup: every PathingProbePurpose only collides
+            // against probes of its OWN purpose.  Each purpose encodes a
+            // distinct topology (Portal=boundary, DoorPair=door anchor,
+            // Centroid=room interior, Emitter=ambient source); cross-
+            // purpose dedup destroys real coverage.  The playtest showed
+            // 320 room Centroids deduped against neighboring DoorPair
+            // probes in MISS6 alone — entire closets lost their interior
+            // anchor and their listeners pulled in a Portal probe from
+            // outside the room (the source of the eq=[0.1,0.1,0.1]
+            // pathing-solver sentinel in same-room paths).
             for (const auto &cand : params.pathingCandidates) {
-                // DoorPair candidates are exempt from dedup against
-                // OTHER PURPOSES (Portal/Centroid/Emitter), but still
-                // dedup against other DoorPair candidates within a
-                // tighter threshold (kDoorPairDedupRadiusFt). Without
-                // the per-purpose split, a closet's centroid emitted
-                // 5 ft from a DoorPair would dedup against the pair-
-                // probe and collapse the door-pair topology back into
-                // the single-probe-per-portal pathology. With the
-                // split, compound-portal doorways collapse cleanly
-                // while non-DoorPair purposes stay independent.
-                if (cand.purpose == PathingProbePurpose::DoorPair) {
-                    bool tooClose = false;
-                    for (const auto &k : kept) {
-                        if (k.purpose != PathingProbePurpose::DoorPair) continue;
-                        Vector3 d = cand.position - k.position;
-                        if (glm::dot(d, d) < kDoorPairDedupRadiusSq) {
-                            tooClose = true;
-                            break;
-                        }
-                    }
-                    if (tooClose) { ++droppedDoorPairs; continue; }
-                    kept.push_back(cand);
-                    continue;
-                }
+                const float radiusSq =
+                    (cand.purpose == PathingProbePurpose::DoorPair)
+                        ? kDoorPairDedupRadiusSq
+                        : dedupRadiusSq;
                 bool tooClose = false;
                 for (const auto &k : kept) {
+                    if (k.purpose != cand.purpose) continue;
                     Vector3 d = cand.position - k.position;
-                    if (glm::dot(d, d) < dedupRadiusSq) { tooClose = true; break; }
+                    if (glm::dot(d, d) < radiusSq) {
+                        tooClose = true;
+                        break;
+                    }
                 }
                 if (tooClose) {
-                    ++dropped;
-                    if (cand.purpose == PathingProbePurpose::Centroid) {
-                        ++droppedCentroids;
+                    if (cand.purpose == PathingProbePurpose::DoorPair) {
+                        ++droppedDoorPairs;
+                    } else {
+                        ++dropped;
+                        if (cand.purpose == PathingProbePurpose::Centroid) {
+                            ++droppedCentroids;
+                        }
                     }
                     continue;
                 }
