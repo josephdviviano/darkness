@@ -1391,7 +1391,8 @@ static bool buildAcousticSceneFromMissionFile(
 static int runProbePlanVerb(const std::string &misPath,
                              const std::string &resPath,
                              const std::string &schemasPath,
-                             const std::string &scriptsDir)
+                             const std::string &scriptsDir,
+                             const std::vector<std::pair<std::string,std::string>> &setOverrides)
 {
     (void)resPath;       // currently unused — TXLIST lives in the .mis itself,
                          // not in fam.crf. Kept for forward-compat / consistency
@@ -1430,6 +1431,56 @@ static int runProbePlanVerb(const std::string &misPath,
     if (!audioSvc) {
         std::fprintf(stderr, "[PROBE_PLAN] AudioService not available\n");
         return 1;
+    }
+
+    // Apply --set overrides BEFORE acoustic-scene build + computeProbePlan
+    // so swept knobs take effect. The dispatch table is intentionally
+    // narrow — only knobs that affect probe placement. Unknown paths
+    // get a [FALLBACK] (per feedback_no_silent_fallbacks) rather than
+    // a silent no-op, so the sweep harness can't get away with reporting
+    // identical counts for every iteration if it typos the path.
+    for (const auto &kv : setOverrides) {
+        const std::string &p = kv.first;
+        const std::string &v = kv.second;
+        try {
+            if (p == "audio.pathing_probes.dedup_radius_ft") {
+                audioSvc->setPathingDedupRadiusFt(std::stof(v));
+                std::fprintf(stderr,
+                    "[PROBE_PLAN] --set %s=%.3f applied\n",
+                    p.c_str(), audioSvc->getPathingDedupRadiusFt());
+            } else if (p == "audio.pathing_probes.enabled") {
+                bool b = (v == "1" || v == "true" || v == "yes");
+                audioSvc->setProbePathingEnabled(b);
+                std::fprintf(stderr,
+                    "[PROBE_PLAN] --set %s=%s applied\n",
+                    p.c_str(), b ? "true" : "false");
+            } else if (p == "audio.probes.spacing") {
+                audioSvc->setProbeSpacingFt(std::stof(v));
+                std::fprintf(stderr, "[PROBE_PLAN] --set %s=%s applied\n", p.c_str(), v.c_str());
+            } else if (p == "audio.probes.height") {
+                audioSvc->setProbeHeightFt(std::stof(v));
+                std::fprintf(stderr, "[PROBE_PLAN] --set %s=%s applied\n", p.c_str(), v.c_str());
+            } else if (p == "audio.probes.min_wall_clearance_ft") {
+                audioSvc->setProbeMinWallClearanceFt(std::stof(v));
+                std::fprintf(stderr, "[PROBE_PLAN] --set %s=%s applied\n", p.c_str(), v.c_str());
+            } else if (p == "audio.probes.elevation_sparsity_mul") {
+                audioSvc->setProbeElevationSparsityMul(std::stof(v));
+                std::fprintf(stderr, "[PROBE_PLAN] --set %s=%s applied\n", p.c_str(), v.c_str());
+            } else if (p == "audio.probes.global_dedup_radius_ft") {
+                audioSvc->setProbeGlobalDedupRadiusFt(std::stof(v));
+                std::fprintf(stderr, "[PROBE_PLAN] --set %s=%s applied\n", p.c_str(), v.c_str());
+            } else {
+                std::fprintf(stderr,
+                    "[FALLBACK] --set: unknown or probe_plan-irrelevant path "
+                    "'%s' — ignored (only audio.pathing_probes.* and "
+                    "audio.probes.* knobs affect probe placement)\n",
+                    p.c_str());
+            }
+        } catch (const std::exception &e) {
+            std::fprintf(stderr,
+                "[FALLBACK] --set: failed to parse value '%s' for %s: %s\n",
+                v.c_str(), p.c_str(), e.what());
+        }
     }
 
     if (!buildAcousticSceneFromMissionFile(audioSvc, misPath)) {
@@ -1586,6 +1637,12 @@ int main(int argc, char *argv[]) {
     std::string scriptsDir = "scripts/thief2";
     std::string resPath;
     std::string schemasPath;
+    // --set <yaml.path>=<value> overrides applied after AudioService init,
+    // before any verb that consumes the relevant config. Currently only
+    // probe_plan reads them; the dispatch table below lists supported
+    // paths explicitly so unknown paths emit [FALLBACK] per
+    // feedback_no_silent_fallbacks.
+    std::vector<std::pair<std::string, std::string>> setOverrides;
     std::vector<std::string> positionalArgs;
 
     for (int i = 1; i < argc; ++i) {
@@ -1596,6 +1653,16 @@ int main(int argc, char *argv[]) {
             resPath = argv[++i];
         } else if (a == "--schemas" && i + 1 < argc) {
             schemasPath = argv[++i];
+        } else if (a == "--set" && i + 1 < argc) {
+            std::string kv = argv[++i];
+            auto eq = kv.find('=');
+            if (eq == std::string::npos) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --set: missing '=' in '%s' — expected --set "
+                    "<yaml.path>=<value>; ignored\n", kv.c_str());
+            } else {
+                setOverrides.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+            }
         } else {
             positionalArgs.push_back(a);
         }
@@ -1707,10 +1774,12 @@ int main(int argc, char *argv[]) {
             }
         } else if (command == "probe_plan") {
             // probe_plan handles its own initServices / loadSchema /
+            // ── --set overrides flow here (only probe_plan reads them today)
             // loadDatabase since it needs to interleave them with
             // acoustic-scene construction before the dry-run plan
             // computation. Returns 0 on success, 1 on failure.
-            return runProbePlanVerb(dbFile, resPath, schemasPath, scriptsDir);
+            return runProbePlanVerb(dbFile, resPath, schemasPath, scriptsDir,
+                                     setOverrides);
         } else if (command == "trace-path") {
             if (positionalArgs.size() < 4) {
                 std::cerr << "trace-path: need <srcRoomID> <dstRoomID> [maxDist]\n";
