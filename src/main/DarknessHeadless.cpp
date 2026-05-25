@@ -70,6 +70,7 @@
 // today) so the headless build doesn't pull src/main into DarknessServices.
 #include "audio/AudioService.h"
 #include "audio/AcousticMaterials.h"
+#include "audio/AudioLog.h"
 #include "audio/ProbeManager.h"
 #include "WRChunkParser.h"
 #include "TXListParser.h"
@@ -1405,6 +1406,12 @@ static int runProbePlanVerb(const std::string &misPath,
     // commitment up-front. Repeated at end per feedback_no_silent_fallbacks.
     std::fprintf(stdout, "[PROBE_PLAN] DRY-RUN — no .probes file written\n");
 
+    // probe_plan is a diagnostic verb — surface the audio-log lines that
+    // narrate scene bounds, OBB derivation, dedup decisions, etc. so the
+    // user can debug failures (e.g. "no probes generated" on weird-shaped
+    // missions) without rebuilding with a different log gate.
+    ::Darkness::gAudioLogVerbose = true;
+
     // Refuse to overwrite an existing .probes from this verb. The verb
     // never writes one (DRY-RUN banner), but if the user expected to
     // see a file, the banner below tells them where the existing one
@@ -1574,6 +1581,69 @@ static int runProbePlanVerb(const std::string &misPath,
             "[PROBE_PLAN] distance histogram (probe-to-nearest, ft): "
             "<2:%d  <5:%d  <10:%d  <20:%d  >=20:%d\n",
             b2, b5, b10, b20, bMax);
+    }
+
+    // ── Pathing-probe local-density metric ─────────────────────────────
+    // The Steam Audio pathing solver runs Dijkstra-ish search through
+    // the probe-to-probe visibility graph at runtime. Cost scales with
+    // edges visited per query, which scales with each probe's local
+    // degree (how many other probes it can connect to). Probe COUNT
+    // alone is a weak proxy — a 500-probe level spread evenly is far
+    // cheaper than a 200-probe level packed into one corner.
+    //
+    // We compute distance-only degree at a FIXED local radius (no
+    // raycast / no Steam-Audio-derived visRange). Two reasons for the
+    // fixed radius:
+    //   1. Steam Audio's pathing-bake `visRange` is scene-AABB×1.5
+    //      (`AudioService.cpp:11424`), which for most missions exceeds
+    //      the mission's own extents — degree would saturate at N-1
+    //      and lose discriminating power.
+    //   2. headless doesn't currently set up the BSP raycaster (that's
+    //      renderer-side), so we can't apply Steam Audio's
+    //      visibility-graph occlusion here. A distance-only count is an
+    //      UPPER BOUND on the real visibility degree, which is exactly
+    //      what we want for "is this placement too clustered?" — if
+    //      probes are bunched in 3D space, no occlusion check will save
+    //      the solver from candidate-edge sprawl.
+    //
+    // 30 ft = ~9 m = room-scale. Smaller than typical inter-room
+    // distances, larger than typical compound-doorway clusters. Picks
+    // up over-packing without trivially saturating.
+    {
+        constexpr float kLocalDensityRadiusFt = 30.0f;
+        const float r2 = kLocalDensityRadiusFt * kLocalDensityRadiusFt;
+        const size_t N = plan.pathingKept.size();
+        std::vector<int> degree(N, 0);
+        // O(N²) — at N≤1500 this is ~2M ops, sub-millisecond.
+        for (size_t i = 0; i < N; ++i) {
+            const auto &pi = plan.pathingKept[i].position;
+            for (size_t j = i + 1; j < N; ++j) {
+                Darkness::Vector3 d = pi - plan.pathingKept[j].position;
+                if (d.x*d.x + d.y*d.y + d.z*d.z < r2) {
+                    ++degree[i];
+                    ++degree[j];
+                }
+            }
+        }
+        long long sumDeg = 0, maxDeg = 0;
+        long long edges = 0;
+        std::vector<int> sortedDeg = degree;
+        std::sort(sortedDeg.begin(), sortedDeg.end());
+        for (int d : degree) { sumDeg += d; if (d > maxDeg) maxDeg = d; }
+        edges = sumDeg / 2;
+        auto pct = [&](double p) -> int {
+            if (sortedDeg.empty()) return 0;
+            size_t idx = std::min<size_t>(
+                sortedDeg.size() - 1,
+                static_cast<size_t>(p * sortedDeg.size()));
+            return sortedDeg[idx];
+        };
+        double avg = N > 0 ? static_cast<double>(sumDeg) / static_cast<double>(N) : 0.0;
+        std::fprintf(stdout,
+            "[PROBE_PLAN] pathing density (within %.0f ft): "
+            "avg=%.1f p50=%d p95=%d max=%lld edges=%lld\n",
+            kLocalDensityRadiusFt, avg, pct(0.50), pct(0.95),
+            maxDeg, edges);
     }
 
     std::fprintf(stdout, "[PROBE_PLAN] DRY-RUN — no .probes file written\n");
