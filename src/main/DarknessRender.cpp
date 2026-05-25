@@ -251,6 +251,137 @@ static void writeHeadLogRow(Darkness::RuntimeState &state) {
     }
 }
 
+// Serialize the audio.* subset of RenderConfig into a single JSON object
+// literal. Consumed by AudioService::openPerfJsonl which embeds it
+// verbatim under the run.meta "audio" key — that snapshot is the answer
+// to "which knob value produced these percentiles?" (PLAN.AUDIO_PROFILING.md
+// §1.2). Keep this list in sync with every audio.* knob in RenderConfig
+// AND with the --set dispatch table in RenderConfig.h.
+static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
+    char buf[8192];
+    int n = std::snprintf(buf, sizeof(buf),
+        "{"
+        "\"performance\":{"
+            "\"sample_rate\":%d,\"frame_size\":%d,\"sound_cache_mb\":%d,"
+            "\"rate_divisor\":%d,\"max_active_voices\":%d,"
+            "\"reverb_voices\":%d,\"reverb_voices_realtime\":%d,"
+            "\"reflection_throttle\":%d,\"sim_max_occlusion_samples\":%d,"
+            "\"reverb_threads\":%d,\"reverb_threads_conv_share\":%.4f,"
+            "\"scene_type\":\"%s\""
+        "},"
+        "\"reflections\":{"
+            "\"enabled\":%s,\"ambisonics_order\":%d,\"bake_skip\":%s,"
+            "\"hybrid_transition_time\":%.4f,\"hybrid_overlap_percent\":%.4f,"
+            "\"realtime\":{\"rays\":%d,\"bounces\":%d,\"duration\":%.4f,\"diffuse_samples\":%d},"
+            "\"bake\":{\"rays\":%d,\"bounces\":%d,\"duration\":%.4f,\"diffuse_samples\":%d,\"ambisonics_order\":%d}"
+        "},"
+        "\"probes\":{"
+            "\"spacing\":%.4f,\"height\":%.4f,"
+            "\"min_wall_clearance_ft\":%.4f,\"elevation_sparsity_mul\":%.4f,"
+            "\"global_dedup_radius_ft\":%.4f"
+        "},"
+        "\"pathing_probes\":{\"enabled\":%s,\"dedup_radius_ft\":%.4f},"
+        "\"occlusion\":{"
+            "\"radius\":%.4f,\"samples\":%d,"
+            "\"transmission_scale\":%.4f,\"absorption_scale\":%.4f"
+        "},"
+        "\"propagation\":{"
+            "\"portal_routing\":%s,\"probe_pathing\":%s,"
+            "\"max_distance\":%.2f,\"door_lpf_open_hz\":%.2f,\"door_lpf_blocked_hz\":%.2f,"
+            "\"min_attenuation\":%.5f,\"max_paths\":%u,\"max_path_diff\":%.4f,"
+            "\"pathing_gain_scale\":%.4f,\"pathing_blocking_scale\":%.4f,"
+            "\"pathing_update_interval\":%.4f,"
+            "\"pathing_gain_band_weights\":[%.4f,%.4f,%.4f]"
+        "},"
+        "\"spatialization\":{"
+            "\"hrtf_volume\":%.4f,\"hrtf_interpolation\":\"%s\",\"spatial_blend\":%.4f"
+        "},"
+        "\"ambient\":{"
+            "\"hysteresis_start_mul\":%.4f,\"hysteresis_stop_mul\":%.4f,"
+            "\"default_priority\":%d,\"environmental_spatial_blend\":%.4f,"
+            "\"global_volume_scale\":%.4f"
+        "},"
+        "\"mixer\":{"
+            "\"master_gain\":%.4f,\"direct_gain\":%.4f,\"reflection_gain\":%.4f,"
+            "\"reflection_ramp_ms\":%.4f"
+        "},"
+        "\"dsp\":{"
+            "\"limiter_enabled\":%s,\"limiter_knee\":%.4f,"
+            "\"compressor_enabled\":%s,\"compressor_threshold_db\":%.4f,"
+            "\"compressor_ratio\":%.4f,\"compressor_attack_ms\":%.4f,"
+            "\"compressor_release_ms\":%.4f,"
+            "\"eq_enabled\":%s,\"eq_freq_hz\":%.4f,\"eq_gain_db\":%.4f,\"eq_q\":%.4f,"
+            "\"ducking_enabled\":%s,\"ducking_amount\":%.4f,"
+            "\"ducking_attack_ms\":%.4f,\"ducking_release_ms\":%.4f,"
+            "\"wet_saturation_enabled\":%s,\"wet_saturation_drive\":%.4f"
+        "}"
+        "}",
+        c.audioSampleRate, c.audioFrameSize, c.audioSoundCacheMB,
+        c.reflectionRateDivisor, c.maxActiveVoices,
+        c.reverbVoices, c.reverbVoicesRealtime,
+        c.reflectionThrottle, c.simMaxOcclusionSamples,
+        c.reverbThreads, c.reverbThreadsConvShare,
+        c.sceneType.c_str(),
+        c.realtimeReflections ? "true" : "false", c.ambisonicsOrder,
+        c.reflectionBakeSkip ? "true" : "false",
+        c.hybridTransitionTime, c.hybridOverlapPercent,
+        c.realtimeNumRays, c.realtimeNumBounces, c.realtimeDuration, c.realtimeDiffuseSamples,
+        c.bakeNumRays, c.bakeNumBounces, c.bakeDuration, c.bakeDiffuseSamples, c.bakeAmbisonicsOrder,
+        c.audioProbeSpacingFt, c.audioProbeHeightFt,
+        c.audioProbeMinWallClearanceFt, c.audioProbeElevationSparsityMul,
+        c.audioProbeGlobalDedupRadiusFt,
+        c.audioPathingProbesEnabled ? "true" : "false", c.audioPathingDedupRadiusFt,
+        c.occlusionRadius, c.occlusionSamples,
+        c.transmissionScale, c.absorptionScale,
+        c.portalRouting ? "true" : "false", c.probePathing ? "true" : "false",
+        c.propagationMaxDist, c.doorLpfOpenHz, c.doorLpfBlockedHz,
+        c.propMinAttenuation, c.propMaxPaths, c.propMaxPathDiff,
+        c.pathingGainScale, c.pathingBlockingScale,
+        c.pathingUpdateInterval,
+        c.pathingGainWeightLow, c.pathingGainWeightMid, c.pathingGainWeightHigh,
+        c.hrtfVolume, c.hrtfInterpolation.c_str(), c.spatialBlend,
+        c.ambHysteresisStartMul, c.ambHysteresisStopMul,
+        c.ambDefaultPriority, c.ambEnvironmentalSpatialBlend,
+        c.ambGlobalVolumeScale,
+        c.mixerMasterGain, c.mixerDirectGain, c.mixerReflectionGain,
+        c.reflectionRampMs,
+        c.dspLimiter ? "true" : "false", c.dspLimiterKnee,
+        c.dspCompressor ? "true" : "false", c.dspCompThreshold,
+        c.dspCompRatio, c.dspCompAttackMs, c.dspCompReleaseMs,
+        c.dspEQ ? "true" : "false", c.dspEQFreq, c.dspEQGain, c.dspEQQ,
+        c.dspDucking ? "true" : "false", c.dspDuckAmount,
+        c.dspDuckAttackMs, c.dspDuckReleaseMs,
+        c.dspWetSaturation ? "true" : "false", c.dspWetSaturationDrive);
+    if (n < 0 || static_cast<size_t>(n) >= sizeof(buf)) {
+        // Truncation would corrupt the JSONL stream. Fail loud per
+        // feedback_no_silent_fallbacks rather than emit half-baked JSON.
+        std::fprintf(stderr,
+            "[FALLBACK] serializeAudioConfigJson: buffer too small "
+            "(needed %d bytes, have %zu) — emitting empty object\n",
+            n, sizeof(buf));
+        return std::string("{}");
+    }
+    return std::string(buf);
+}
+
+// Extract the mission filename (no extension, lowercase) for the perf
+// artifact directory. e.g. "../levels/MISS6.mis" -> "miss6".
+static std::string deriveMissionName(const char* misPath) {
+    if (!misPath) return std::string("unknown");
+    std::string s(misPath);
+    // strip directory
+    size_t slash = s.find_last_of("/\\");
+    if (slash != std::string::npos) s = s.substr(slash + 1);
+    // strip extension
+    size_t dot = s.find_last_of('.');
+    if (dot != std::string::npos) s = s.substr(0, dot);
+    // lowercase for FS portability
+    for (auto& ch : s) {
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    return s;
+}
+
 static void printHelp() {
     // Help text is the canonical reference for every YAML key — it lists every
     // field whether or not the user's local config mentions it. When you add
@@ -261,6 +392,9 @@ static void printHelp() {
         "USAGE\n"
         "  darknessRender <mission.mis> [--res <path>] [--schemas <path>]\n"
         "                                [--config <path>] [--skip-reflection-bake]\n"
+        "                                [--set <yaml.path>=<value>]\n"
+        "                                [--perf-label <name>]\n"
+        "                                [--exit-after-seconds <N>]\n"
         "                                [-h | --help]\n"
         "\n"
         "  All other tunables live in the YAML config (default: ./darknessRender.yaml).\n"
@@ -278,6 +412,21 @@ static void printHelp() {
         "                    (skip the multi-minute reflection bake; only re-bake\n"
         "                    pathing). Hard-fails if no reflection section exists.\n"
         "                    Overrides YAML audio.reflections.bake_skip.\n"
+        "  --set <p>=<v>     Generic YAML-path override (repeatable). Applied AFTER\n"
+        "                    the YAML load and BEFORE audio init. Supports any\n"
+        "                    audio.* leaf — see PLAN.AUDIO_PROFILING.md §1.4.\n"
+        "                    Example:\n"
+        "                      --set audio.reflections.hybrid_transition_time=0.5\n"
+        "                      --set audio.performance.reverb_voices=24\n"
+        "                    Unknown paths emit a [FALLBACK] line and are ignored.\n"
+        "  --perf-label <name>\n"
+        "                    Tag for the per-run audio_perf.jsonl directory:\n"
+        "                      ./perf/<mission>/<utc_iso>__<label>/audio_perf.jsonl\n"
+        "                    Default: 'default'. Must match [A-Za-z0-9_.-]{1,64}.\n"
+        "  --exit-after-seconds <N>\n"
+        "                    Exit cleanly after N seconds of wall-clock from main()\n"
+        "                    start. Lets `tools/perf_sweep.sh` run unattended. The\n"
+        "                    JSONL sink flushes + closes on shutdown.\n"
         "  -h, --help        Show this message and exit.\n"
         "\n"
         "YAML CONFIG REFERENCE (defaults shown; see darknessRender.example.yaml)\n"
@@ -4725,6 +4874,24 @@ int main(int argc, char *argv[]) {
         // file-scope atomics so the next audio callback observes them.
         audioSvc->publishAudioThreadParams();
 
+        // ── Open audio_perf.jsonl per-run artifact ──
+        // PLAN.AUDIO_PROFILING.md §1.1/§1.2 — single emitter
+        // (dumpAudioStatusPeriodic) fans every 5s window snapshot out to
+        // BOTH stderr (live tail) AND this JSONL file. Open AFTER all
+        // setters have run so the run.meta config snapshot matches what
+        // the engine is actually using.
+        {
+            std::string cliArgvJoined;
+            for (int i = 0; i < argc; ++i) {
+                if (i) cliArgvJoined += ' ';
+                cliArgvJoined += argv[i];
+            }
+            std::string audioCfgJson = serializeAudioConfigJson(cfg);
+            std::string missionName  = deriveMissionName(misPath);
+            audioSvc->openPerfJsonl(missionName, misPath ? misPath : "",
+                                    cfg.perfLabel, cliArgvJoined, audioCfgJson);
+        }
+
         if (!audioSvc->buildAcousticScene(fullScene)) {
             std::fprintf(stderr, "WARNING: failed to build acoustic scene\n"
                                  "         Steam Audio spatialization disabled.\n");
@@ -6074,8 +6241,27 @@ int main(int argc, char *argv[]) {
     }
 
     // ── Main loop — LoopService drives frame dispatch ──
+    //
+    // --exit-after-seconds N (PLAN.AUDIO_PROFILING.md §1.4): if set, exit
+    // the loop after N seconds of wall-clock from main() start. Lets
+    // tools/perf_sweep.sh run unattended. The JSONL sink closes cleanly
+    // through AudioService::shutdown() at program exit.
+    auto mainLoopStart = std::chrono::steady_clock::now();
+    bool exitAfterFired = false;
     while (state.running && !loopSvc->isTerminationRequested()) {
         loopSvc->step();
+        if (cfg.exitAfterSeconds > 0.0f && !exitAfterFired) {
+            float elapsed = std::chrono::duration<float>(
+                std::chrono::steady_clock::now() - mainLoopStart).count();
+            if (elapsed >= cfg.exitAfterSeconds) {
+                std::fprintf(stderr,
+                    "--exit-after-seconds: %.1f s elapsed (limit %.1f s) "
+                    "— requesting clean exit\n",
+                    elapsed, cfg.exitAfterSeconds);
+                state.running = false;
+                exitAfterFired = true;
+            }
+        }
     }
 
     // Clean up LoopClients and SimListeners before state is destroyed

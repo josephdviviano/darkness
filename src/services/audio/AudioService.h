@@ -39,8 +39,10 @@
 #include "worldquery/WorldQueryTypes.h"  // RayHit (for diagnostic raycaster setter)
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -1130,6 +1132,44 @@ public:
      *  whatever code site published the event; keep callbacks cheap. */
     void registerSoundEmissionListener(SoundEmissionListener cb);
 
+    // ── Audio perf-capture JSONL sink (PLAN.AUDIO_PROFILING.md §1.1 §1.2) ──
+
+    /** Open the per-run audio_perf.jsonl artifact file. Idempotent — the
+     *  second call is a no-op (the first wins). Path is built as
+     *      ./perf/<mission>/<utc_iso>__<perfLabel>/audio_perf.jsonl
+     *  Directories are created as needed. On success, immediately writes
+     *  the `event:"run.meta"` first line (git SHA, build timestamp,
+     *  start time, full audio.* config snapshot, device params, cli_argv).
+     *
+     *  RT-safety: ALL writes happen on the main thread inside
+     *  dumpAudioStatusPeriodic / openPerfJsonl / closePerfJsonl. The audio
+     *  callback never touches the file (per feedback_threading_architecture).
+     *
+     *  The caller is responsible for serializing the audio config snapshot
+     *  into JSON (we don't pull RenderConfig.h into the services layer to
+     *  avoid yaml-cpp leakage). `audioConfigJson` is dropped into the
+     *  run.meta record verbatim under key `"audio"`; it MUST be a valid
+     *  JSON object literal beginning with `{` and ending with `}`.
+     *
+     *  @param missionName  filename without extension (e.g. "miss6")
+     *  @param missionPath  full path passed on CLI, recorded as `mis_path`
+     *  @param perfLabel    --perf-label value, must be FS-safe
+     *  @param cliArgv      space-joined argv for the `cli_argv` record
+     *  @param audioConfigJson  pre-serialized `{...}` object of audio.* keys
+     *  @return true if the file opened successfully */
+    bool openPerfJsonl(const std::string& missionName,
+                       const std::string& missionPath,
+                       const std::string& perfLabel,
+                       const std::string& cliArgv,
+                       const std::string& audioConfigJson);
+
+    /** Flush and close the JSONL sink. Safe to call even if never opened.
+     *  Called from shutdown() and from main() on `--exit-after-seconds`. */
+    void closePerfJsonl();
+
+    /** True if openPerfJsonl succeeded and the file is still open. */
+    bool isPerfJsonlOpen() const;
+
 protected:
     // ── Service lifecycle ──
 
@@ -1859,6 +1899,24 @@ private:
     /// Dispatch a sound emission event to all registered listeners.
     /// Called from audio code whenever a new voice/ambient/footstep starts.
     void publishSoundEmission(const SoundEmissionEvent &ev);
+
+    // ── Audio perf-capture JSONL sink state (PLAN.AUDIO_PROFILING.md §1.1) ──
+    //
+    // Per-run audio_perf.jsonl artifact file. Owned by AudioService so that
+    // the once-per-window snapshot inside dumpAudioStatusPeriodic can fan
+    // out to both stderr (AUDIO_LOG) AND the file with NO extra
+    // snapshotAndReset(true) call — see PLAN.AUDIO_PROFILING.md §1.7 #1
+    // (histogram-ownership pitfall guard, lesson from commit bdeb98b).
+    //
+    // mPerfJsonlFile is the canonical write target; nullptr = never opened
+    // or already closed. mPerfJsonlPath is kept for one-shot init logging.
+    // mPerfJsonlStartedAt is the UTC time captured at open; embedded into
+    // the run.meta header AND used to compute relative `ts_ms` on every
+    // perf.window record (so timelines align with the actual run start,
+    // not the program's hardcoded steady_clock epoch).
+    std::FILE*                                  mPerfJsonlFile = nullptr;
+    std::string                                 mPerfJsonlPath;
+    std::chrono::steady_clock::time_point       mPerfJsonlStartedAt;
 
     // Private helpers
     bool initMiniaudio();

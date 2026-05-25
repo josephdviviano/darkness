@@ -301,6 +301,18 @@ struct RenderConfig {
     bool togglePlatforms  = false;  // auto-activate all moving terrain at startup
     bool noProbes         = false;  // skip probe baking (no spatial audio)
     bool audioLog         = false;  // enable audio/sound/schema log output
+
+    // -- audio perf-capture (PLAN.AUDIO_PROFILING.md §1.2, §1.4) --
+    // Label used to tag the per-run JSONL artifact directory.
+    //   ./perf/<mission>/<utc_iso>__<perf_label>/audio_perf.jsonl
+    // Defaults to "default" so an un-labelled invocation still produces an
+    // artifact. Must be filesystem-safe (alphanumeric + '_-.') — the binary
+    // validates and rejects on launch.
+    std::string perfLabel = "default";
+    // Walltime budget (seconds) from main() start. 0 = disabled (run forever
+    // until SDL quit). Set via --exit-after-seconds N to let scripted sweeps
+    // (tools/perf_sweep.sh) run unattended.
+    float       exitAfterSeconds = 0.0f;
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -939,6 +951,382 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
     }
 }
 
+// ── --set dispatch table (PLAN.AUDIO_PROFILING.md §1.4) ──
+//
+// Generic CLI override: `--set audio.dotted.path=value`. Applied AFTER YAML
+// load (so it wins over file values) and BEFORE the AudioService init pass
+// reads `cfg`. The supported leaves cover every audio-tunable knob enumerated
+// in PLAN.AUDIO_PROFILING.md §3 (the per-tunable metric map). Each entry
+// here maps yaml-key -> RenderConfig field; clamping is performed inline,
+// matching the YAML loader's clamps so a --set override and a YAML value
+// behave identically.
+//
+// Leaf types supported:
+//   - float  (numeric leaves; std::stof)
+//   - int    (integer leaves; std::stoi)
+//   - bool   (true/false/1/0/yes/no)
+//   - string (verbatim, with light validation for enum-like keys)
+//
+// Per feedback_no_silent_fallbacks: unknown paths emit a [FALLBACK] stderr
+// line listing the path that was rejected so a typo is impossible to miss.
+//
+// Implementation note: a hardcoded if/else dispatch is fine — the set is
+// small, additive over the project lifetime, and avoids pulling in a
+// YAML/JSON-path mini-parser. When a new YAML knob lands, also add it
+// here (and to the help text further down).
+inline bool applySetOverride(const std::string& path, const std::string& valueStr,
+                             RenderConfig& cfg) {
+    auto toBool = [&](bool& out) -> bool {
+        if (valueStr == "true"  || valueStr == "1" || valueStr == "yes") { out = true;  return true; }
+        if (valueStr == "false" || valueStr == "0" || valueStr == "no")  { out = false; return true; }
+        return false;
+    };
+    auto toFloat = [&](float& out) -> bool {
+        try { out = std::stof(valueStr); return true; } catch (...) { return false; }
+    };
+    auto toInt = [&](int& out) -> bool {
+        try { out = std::stoi(valueStr); return true; } catch (...) { return false; }
+    };
+
+    // Helpers wrap field assignment + clamp into one line each. Each lambda
+    // returns the new clamped value for traceability; the discard is fine.
+    auto clampF = [](float v, float lo, float hi) {
+        return (v < lo) ? lo : (v > hi ? hi : v);
+    };
+    auto clampI = [](int v, int lo, int hi) {
+        return (v < lo) ? lo : (v > hi ? hi : v);
+    };
+
+    // -- audio.performance --
+    if (path == "audio.performance.sample_rate") {
+        int v; if (!toInt(v)) return false;
+        if      (v <= 22050) cfg.audioSampleRate = 22050;
+        else if (v <= 32000) cfg.audioSampleRate = 32000;
+        else if (v <= 44100) cfg.audioSampleRate = 44100;
+        else if (v <= 48000) cfg.audioSampleRate = 48000;
+        else                 cfg.audioSampleRate = 96000;
+        return true;
+    }
+    if (path == "audio.performance.frame_size") {
+        int v; if (!toInt(v)) return false;
+        cfg.audioFrameSize = clampI(v, 256, 4096); return true;
+    }
+    if (path == "audio.performance.sound_cache_mb") {
+        int v; if (!toInt(v)) return false;
+        cfg.audioSoundCacheMB = clampI(v, 4, 1024); return true;
+    }
+    if (path == "audio.performance.rate_divisor") {
+        int v; if (!toInt(v)) return false;
+        cfg.reflectionRateDivisor = (v >= 4) ? 4 : (v >= 2) ? 2 : 1; return true;
+    }
+    if (path == "audio.performance.max_active_voices") {
+        int v; if (!toInt(v)) return false;
+        cfg.maxActiveVoices = clampI(v, 8, 256); return true;
+    }
+    if (path == "audio.performance.reverb_voices") {
+        int v; if (!toInt(v)) return false;
+        cfg.reverbVoices = clampI(v, 0, 64); return true;
+    }
+    if (path == "audio.performance.reverb_voices_realtime") {
+        int v; if (!toInt(v)) return false;
+        cfg.reverbVoicesRealtime = clampI(v, 0, 64); return true;
+    }
+    if (path == "audio.performance.reflection_throttle") {
+        int v; if (!toInt(v)) return false;
+        cfg.reflectionThrottle = clampI(v, 1, 32); return true;
+    }
+    if (path == "audio.performance.sim_max_occlusion_samples") {
+        int v; if (!toInt(v)) return false;
+        cfg.simMaxOcclusionSamples = clampI(v, 4, 256); return true;
+    }
+    if (path == "audio.performance.reverb_threads") {
+        int v; if (!toInt(v)) return false;
+        cfg.reverbThreads = clampI(v, 0, 64); return true;
+    }
+    if (path == "audio.performance.reverb_threads_conv_share") {
+        float v; if (!toFloat(v)) return false;
+        if (v < 0.0f) cfg.reverbThreadsConvShare = -1.0f;
+        else          cfg.reverbThreadsConvShare = clampF(v, 0.0f, 1.0f);
+        return true;
+    }
+    if (path == "audio.performance.scene_type") {
+        cfg.sceneType = (valueStr == "embree" ? "embree" : "default");
+        return true;
+    }
+
+    // -- audio.reflections --
+    if (path == "audio.reflections.enabled") {
+        return toBool(cfg.realtimeReflections);
+    }
+    if (path == "audio.reflections.ambisonics_order") {
+        int v; if (!toInt(v)) return false;
+        cfg.ambisonicsOrder = clampI(v, 0, 3); return true;
+    }
+    if (path == "audio.reflections.bake_skip") {
+        return toBool(cfg.reflectionBakeSkip);
+    }
+    if (path == "audio.reflections.hybrid_transition_time") {
+        float v; if (!toFloat(v)) return false;
+        cfg.hybridTransitionTime = clampF(v, 0.1f, 8.0f); return true;
+    }
+    if (path == "audio.reflections.hybrid_overlap_percent") {
+        float v; if (!toFloat(v)) return false;
+        cfg.hybridOverlapPercent = clampF(v, 0.0f, 1.0f); return true;
+    }
+    if (path == "audio.reflections.realtime.rays") {
+        int v; if (!toInt(v)) return false;
+        cfg.realtimeNumRays = clampI(v, 128, 8192); return true;
+    }
+    if (path == "audio.reflections.realtime.bounces") {
+        int v; if (!toInt(v)) return false;
+        cfg.realtimeNumBounces = clampI(v, 1, 8); return true;
+    }
+    if (path == "audio.reflections.realtime.duration") {
+        float v; if (!toFloat(v)) return false;
+        cfg.realtimeDuration = clampF(v, 0.5f, 4.0f); return true;
+    }
+    if (path == "audio.reflections.realtime.diffuse_samples") {
+        int v; if (!toInt(v)) return false;
+        cfg.realtimeDiffuseSamples = clampI(v, 16, 256); return true;
+    }
+    if (path == "audio.reflections.bake.rays") {
+        int v; if (!toInt(v)) return false;
+        cfg.bakeNumRays = clampI(v, 1024, 65536); return true;
+    }
+    if (path == "audio.reflections.bake.bounces") {
+        int v; if (!toInt(v)) return false;
+        cfg.bakeNumBounces = clampI(v, 1, 64); return true;
+    }
+    if (path == "audio.reflections.bake.duration") {
+        float v; if (!toFloat(v)) return false;
+        cfg.bakeDuration = clampF(v, 0.5f, 8.0f); return true;
+    }
+    if (path == "audio.reflections.bake.diffuse_samples") {
+        int v; if (!toInt(v)) return false;
+        cfg.bakeDiffuseSamples = clampI(v, 32, 4096); return true;
+    }
+    if (path == "audio.reflections.bake.ambisonics_order") {
+        int v; if (!toInt(v)) return false;
+        cfg.bakeAmbisonicsOrder = clampI(v, 0, 3); return true;
+    }
+
+    // -- audio.probes --
+    if (path == "audio.probes.spacing") {
+        float v; if (!toFloat(v)) return false;
+        cfg.audioProbeSpacingFt = clampF(v, 1.0f, 20.0f); return true;
+    }
+    if (path == "audio.probes.height") {
+        float v; if (!toFloat(v)) return false;
+        cfg.audioProbeHeightFt = clampF(v, 0.5f, 20.0f); return true;
+    }
+    if (path == "audio.probes.min_wall_clearance_ft") {
+        float v; if (!toFloat(v)) return false;
+        cfg.audioProbeMinWallClearanceFt = clampF(v, 0.0f, 50.0f); return true;
+    }
+    if (path == "audio.probes.elevation_sparsity_mul") {
+        float v; if (!toFloat(v)) return false;
+        cfg.audioProbeElevationSparsityMul = clampF(v, 1.0f, 8.0f); return true;
+    }
+    if (path == "audio.probes.global_dedup_radius_ft") {
+        float v; if (!toFloat(v)) return false;
+        cfg.audioProbeGlobalDedupRadiusFt = clampF(v, 0.0f, 10.0f); return true;
+    }
+
+    // -- audio.pathing_probes --
+    if (path == "audio.pathing_probes.enabled") {
+        return toBool(cfg.audioPathingProbesEnabled);
+    }
+    if (path == "audio.pathing_probes.dedup_radius_ft") {
+        float v; if (!toFloat(v)) return false;
+        cfg.audioPathingDedupRadiusFt = clampF(v, 0.0f, 30.0f); return true;
+    }
+
+    // -- audio.occlusion --
+    if (path == "audio.occlusion.radius") {
+        float v; if (!toFloat(v)) return false;
+        cfg.occlusionRadius = clampF(v, 0.3f, 30.0f); return true;
+    }
+    if (path == "audio.occlusion.samples") {
+        int v; if (!toInt(v)) return false;
+        cfg.occlusionSamples = clampI(v, 4, 64); return true;
+    }
+    if (path == "audio.occlusion.transmission_scale") {
+        float v; if (!toFloat(v)) return false;
+        cfg.transmissionScale = clampF(v, 0.1f, 100.0f); return true;
+    }
+    if (path == "audio.occlusion.absorption_scale") {
+        float v; if (!toFloat(v)) return false;
+        cfg.absorptionScale = clampF(v, 0.01f, 10.0f); return true;
+    }
+
+    // -- audio.propagation --
+    if (path == "audio.propagation.portal_routing") {
+        return toBool(cfg.portalRouting);
+    }
+    if (path == "audio.propagation.probe_pathing") {
+        return toBool(cfg.probePathing);
+    }
+    if (path == "audio.propagation.max_distance") {
+        float v; if (!toFloat(v)) return false;
+        cfg.propagationMaxDist = clampF(v, 10.0f, 5000.0f); return true;
+    }
+    if (path == "audio.propagation.door_lpf_open_hz") {
+        float v; if (!toFloat(v)) return false;
+        cfg.doorLpfOpenHz = clampF(v, 1000.0f, 24000.0f); return true;
+    }
+    if (path == "audio.propagation.door_lpf_blocked_hz") {
+        float v; if (!toFloat(v)) return false;
+        cfg.doorLpfBlockedHz = clampF(v, 100.0f, 10000.0f); return true;
+    }
+    if (path == "audio.propagation.min_attenuation") {
+        float v; if (!toFloat(v)) return false;
+        cfg.propMinAttenuation = clampF(v, 0.0f, 0.1f); return true;
+    }
+    if (path == "audio.propagation.max_paths") {
+        int v; if (!toInt(v)) return false;
+        cfg.propMaxPaths = static_cast<uint32_t>(clampI(v, 1, 4)); return true;
+    }
+    if (path == "audio.propagation.max_path_diff") {
+        float v; if (!toFloat(v)) return false;
+        cfg.propMaxPathDiff = clampF(v, 0.0f, 50.0f); return true;
+    }
+    if (path == "audio.propagation.pathing_gain_scale") {
+        float v; if (!toFloat(v)) return false;
+        cfg.pathingGainScale = clampF(v, 0.1f, 10.0f); return true;
+    }
+    if (path == "audio.propagation.pathing_blocking_scale") {
+        float v; if (!toFloat(v)) return false;
+        cfg.pathingBlockingScale = clampF(v, 0.0f, 1.0f); return true;
+    }
+    if (path == "audio.propagation.pathing_update_interval") {
+        float v; if (!toFloat(v)) return false;
+        cfg.pathingUpdateInterval = clampF(v, 0.0f, 1.0f); return true;
+    }
+
+    // -- audio.spatialization --
+    if (path == "audio.spatialization.hrtf_volume") {
+        float v; if (!toFloat(v)) return false;
+        cfg.hrtfVolume = clampF(v, 0.0f, 4.0f); return true;
+    }
+    if (path == "audio.spatialization.hrtf_interpolation") {
+        cfg.hrtfInterpolation = (valueStr == "nearest") ? "nearest" : "bilinear";
+        return true;
+    }
+    if (path == "audio.spatialization.spatial_blend") {
+        float v; if (!toFloat(v)) return false;
+        cfg.spatialBlend = clampF(v, 0.0f, 1.0f); return true;
+    }
+
+    // -- audio.ambient --
+    if (path == "audio.ambient.hysteresis_start_mul") {
+        float v; if (!toFloat(v)) return false;
+        cfg.ambHysteresisStartMul = clampF(v, 1.0f, 5.0f); return true;
+    }
+    if (path == "audio.ambient.hysteresis_stop_mul") {
+        float v; if (!toFloat(v)) return false;
+        cfg.ambHysteresisStopMul = clampF(v, 1.0f, 5.0f); return true;
+    }
+    if (path == "audio.ambient.default_priority") {
+        int v; if (!toInt(v)) return false;
+        cfg.ambDefaultPriority = clampI(v, 0, 255); return true;
+    }
+    if (path == "audio.ambient.environmental_spatial_blend") {
+        float v; if (!toFloat(v)) return false;
+        cfg.ambEnvironmentalSpatialBlend = clampF(v, 0.0f, 1.0f); return true;
+    }
+    if (path == "audio.ambient.global_volume_scale") {
+        float v; if (!toFloat(v)) return false;
+        cfg.ambGlobalVolumeScale = clampF(v, 0.0f, 4.0f); return true;
+    }
+
+    // -- audio.mixer --
+    if (path == "audio.mixer.master_gain") {
+        float v; if (!toFloat(v)) return false;
+        cfg.mixerMasterGain = clampF(v, 0.0f, 4.0f); return true;
+    }
+    if (path == "audio.mixer.direct_gain") {
+        float v; if (!toFloat(v)) return false;
+        cfg.mixerDirectGain = clampF(v, 0.0f, 4.0f); return true;
+    }
+    if (path == "audio.mixer.reflection_gain") {
+        float v; if (!toFloat(v)) return false;
+        cfg.mixerReflectionGain = clampF(v, 0.0f, 4.0f); return true;
+    }
+    if (path == "audio.mixer.reflection_ramp_ms") {
+        float v; if (!toFloat(v)) return false;
+        cfg.reflectionRampMs = clampF(v, 1.0f, 1000.0f); return true;
+    }
+
+    // -- audio.dsp --
+    if (path == "audio.dsp.limiter_enabled")   { return toBool(cfg.dspLimiter); }
+    if (path == "audio.dsp.limiter_knee") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspLimiterKnee = clampF(v, 0.5f, 0.95f); return true;
+    }
+    if (path == "audio.dsp.compressor_enabled") { return toBool(cfg.dspCompressor); }
+    if (path == "audio.dsp.compressor_threshold_db") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspCompThreshold = clampF(v, -30.0f, 0.0f); return true;
+    }
+    if (path == "audio.dsp.compressor_ratio") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspCompRatio = clampF(v, 1.5f, 10.0f); return true;
+    }
+    if (path == "audio.dsp.compressor_attack_ms") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspCompAttackMs = clampF(v, 1.0f, 100.0f); return true;
+    }
+    if (path == "audio.dsp.compressor_release_ms") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspCompReleaseMs = clampF(v, 50.0f, 2000.0f); return true;
+    }
+    if (path == "audio.dsp.eq_enabled") { return toBool(cfg.dspEQ); }
+    if (path == "audio.dsp.eq_freq_hz") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspEQFreq = clampF(v, 60.0f, 500.0f); return true;
+    }
+    if (path == "audio.dsp.eq_gain_db") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspEQGain = clampF(v, -6.0f, 6.0f); return true;
+    }
+    if (path == "audio.dsp.eq_q") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspEQQ = clampF(v, 0.3f, 2.0f); return true;
+    }
+    if (path == "audio.dsp.ducking_enabled") { return toBool(cfg.dspDucking); }
+    if (path == "audio.dsp.ducking_amount") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspDuckAmount = clampF(v, 0.1f, 1.0f); return true;
+    }
+    if (path == "audio.dsp.ducking_attack_ms") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspDuckAttackMs = clampF(v, 10.0f, 500.0f); return true;
+    }
+    if (path == "audio.dsp.ducking_release_ms") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspDuckReleaseMs = clampF(v, 50.0f, 5000.0f); return true;
+    }
+    if (path == "audio.dsp.wet_saturation_enabled") { return toBool(cfg.dspWetSaturation); }
+    if (path == "audio.dsp.wet_saturation_drive") {
+        float v; if (!toFloat(v)) return false;
+        cfg.dspWetSaturationDrive = clampF(v, 1.0f, 10.0f); return true;
+    }
+
+    return false; // unknown path
+}
+
+// Validate --perf-label string: only [A-Za-z0-9_.-] allowed so the resulting
+// directory name is safe across macOS / Linux / Windows + shell-quote-free.
+inline bool isPerfLabelValid(const std::string& s) {
+    if (s.empty() || s.size() > 64) return false;
+    for (char c : s) {
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 // Parse CLI arguments. The CLI surface is intentionally minimal — every
 // other tunable lives in the YAML config. The flags below are the things
 // that genuinely need per-invocation override:
@@ -946,6 +1334,10 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
 //   --res <path>       runtime asset directory (overrides paths.res)
 //   --schemas <path>   schema directory (overrides paths.schemas)
 //   --config <path>    YAML path (defaults to ./darknessRender.yaml)
+//   --skip-reflection-bake  carry forward existing reflection IRs
+//   --set <p>=<v>      generic YAML-path override; repeatable
+//   --perf-label <s>   tag the per-run audio_perf.jsonl directory
+//   --exit-after-seconds N  exit cleanly after N seconds of wall-clock
 //   --help / -h        print usage
 //
 // Unknown flags are reported but otherwise ignored — when a removed flag
@@ -953,7 +1345,6 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
 // of a silent parse miss.
 inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
     CliResult cli;
-    (void)cfg; // currently nothing is set on cfg via CLI
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
@@ -966,6 +1357,46 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cli.configPath = argv[++i];
         } else if (std::strcmp(argv[i], "--skip-reflection-bake") == 0) {
             cfg.reflectionBakeSkip = true;
+        } else if (std::strcmp(argv[i], "--set") == 0 && i + 1 < argc) {
+            // --set audio.foo.bar=value  (yaml-dotted-path=leaf)
+            std::string arg = argv[++i];
+            auto eq = arg.find('=');
+            if (eq == std::string::npos) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --set: missing '=' in '%s' — expected "
+                    "audio.dotted.path=value (ignored)\n", arg.c_str());
+                continue;
+            }
+            std::string path  = arg.substr(0, eq);
+            std::string value = arg.substr(eq + 1);
+            if (!applySetOverride(path, value, cfg)) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --set: unknown YAML path '%s' — ignored "
+                    "(value was '%s')\n", path.c_str(), value.c_str());
+            } else {
+                std::fprintf(stderr,
+                    "--set: '%s' = '%s' applied (clamped to legal range)\n",
+                    path.c_str(), value.c_str());
+            }
+        } else if (std::strcmp(argv[i], "--perf-label") == 0 && i + 1 < argc) {
+            std::string label = argv[++i];
+            if (!isPerfLabelValid(label)) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --perf-label: '%s' rejected — must be "
+                    "1-64 chars of [A-Za-z0-9_.-]. Keeping default '%s'.\n",
+                    label.c_str(), cfg.perfLabel.c_str());
+            } else {
+                cfg.perfLabel = label;
+            }
+        } else if (std::strcmp(argv[i], "--exit-after-seconds") == 0 && i + 1 < argc) {
+            try {
+                cfg.exitAfterSeconds = std::stof(argv[++i]);
+                if (cfg.exitAfterSeconds < 0.0f) cfg.exitAfterSeconds = 0.0f;
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --exit-after-seconds: non-numeric value "
+                    "'%s' — ignored (run remains open-ended)\n", argv[i]);
+            }
         } else if (argv[i][0] != '-' && !cli.misPath) {
             // First non-flag argument is the mission file
             cli.misPath = argv[i];
