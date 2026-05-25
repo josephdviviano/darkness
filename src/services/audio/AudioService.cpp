@@ -10744,6 +10744,34 @@ void AudioService::dumpAudioStatusPeriodic()
                 reflVoices, MAX_ACTIVE_VOICES, evictionsSinceLast);
         }
     }
+
+    // ── [REFL_SKIP] runtime staleness reminder ──
+    //
+    // When the user launched with --skip-reflection-bake (or
+    // audio.reflections.bake_skip: true), the reflection section in the
+    // currently-loaded .probes file is whatever was on disk from a
+    // previous bake. If geometry has moved since then, reflection IRs
+    // are STALE — sound will play but won't match the room. We log a
+    // single-line reminder every 30s so the user can't lose track that
+    // they're listening to stale reflections.
+    //
+    // 30s is a separate throttle from the 5s dump cadence above; we use
+    // a function-local steady_clock baseline so the cadence is wall-clock
+    // (not coupled to frame-rate-dependent debugTimer drift). Matches the
+    // throttle pattern used by ProbeManager::pollPerfPeriodic.
+    if (mReflectionBakeSkip) {
+        static std::chrono::steady_clock::time_point sLastReflSkipDump{};
+        auto now = std::chrono::steady_clock::now();
+        bool firstFire = (sLastReflSkipDump.time_since_epoch().count() == 0);
+        if (firstFire ||
+            std::chrono::duration<double>(now - sLastReflSkipDump).count() >= 30.0)
+        {
+            sLastReflSkipDump = now;
+            AUDIO_LOG(
+                "[REFL_SKIP] reflections section is stale "
+                "(carried over from prior bake)\n");
+        }
+    }
 }
 
 //------------------------------------------------------
@@ -11340,6 +11368,176 @@ AudioService::getPathingProbeViz() const
     return out;
 }
 
+//------------------------------------------------------
+// Capability C — pathing-graph EQ-activity visualization.
+//
+// Three layers, all driven by data we already collect:
+//   1. Static probe graph (background) — ProbeManager::PathingAdjacency,
+//      built once at level-load by replicating Steam Audio's visibility
+//      test against our acoustic-mesh raycaster.
+//   2. EQ-tinted edges in active-voice neighborhoods — per-frame
+//      aggregation of `(1 - eqCoeffs.mid)` across voices within
+//      `kPathingVisRadiusFt` of either endpoint. Reads each voice's
+//      cached `lastGoodPathParams` (no extra Steam Audio API calls).
+//   3. Per-voice source→listener arrow — `lastGoodPathParams.eqCoeffs[1]`
+//      colored.
+//
+// NOT a claim that Steam Audio used any particular edge for any
+// particular voice — the public C API does not expose that data.
+// This is honestly framed as a neighborhood-activity heatmap.
+
+void AudioService::rebuildPathingAdjacency()
+{
+    if (!mProbeManager) return;
+
+    // Bind the engine's BSP raycaster against the acoustic mesh so the
+    // adjacency replicates Steam Audio's `scene.isOccluded` decision.
+    // mRaycaster is the same hook AudioService uses for runtime
+    // probe-blocking diagnostics. It is intentionally renderer-supplied:
+    // when AudioService is running headless (no scene), the renderer
+    // injects nothing and the adjacency build emits one [VIZ_FALLBACK]
+    // line and leaves the graph empty (per feedback_no_silent_fallbacks).
+    ProbeManager::PathingAdjacencyRaycaster ray;
+    if (mRaycaster) {
+        // Copy mRaycaster into the lambda so any later reassignment
+        // doesn't invalidate the adjacency build's view of it.
+        AudioRaycastFn rc = mRaycaster;
+        ray = [rc](const Vector3 &from, const Vector3 &to) {
+            RayHit hit{};
+            return rc(from, to, hit);
+        };
+    }
+
+    // visRange/numVisSamples MUST match the bake parameters in
+    // ProbeManager::bakePathingBatch — we are reproducing the same
+    // algorithm with the same inputs so the edge set agrees.
+    // ProbeManager's bake uses scene-derived visRange (×1.5 of the
+    // AABB diagonal, capped at 5000 ft) and `numSamples=4`. We use the
+    // current scene AABB the same way; if the user changed propagation
+    // tuning since the bake, the adjacency may drift slightly from the
+    // serialized graph, which is acceptable for a debug heatmap.
+    const Vector3 span = mSceneMax - mSceneMin;
+    const float diag = std::sqrt(span.x*span.x + span.y*span.y + span.z*span.z);
+    constexpr float kMargin   = 1.5f;
+    constexpr float kCeilFt   = 5000.0f;
+    const float visRangeFt = std::min(
+        std::max(diag * kMargin, mPropagationMaxDist * kMargin),
+        kCeilFt);
+    constexpr int kNumVisSamples = 4;
+
+    mProbeManager->buildPathingAdjacency(visRangeFt, kNumVisSamples, ray);
+}
+
+std::vector<AudioService::PathingEdgeViz>
+AudioService::getPathingEdgeViz() const
+{
+    std::vector<PathingEdgeViz> out;
+    if (!mProbeManager) return out;
+
+    const PathingAdjacency &adj =
+        mProbeManager->getPathingAdjacency();
+    if (!adj.built || adj.edges.empty()) return out;
+
+    const auto &positions = mProbeManager->getPathingProbePositions();
+    if (positions.empty()) return out;
+
+    // visRadius is the same "what probes can this source bind to" radius
+    // Steam Audio uses at runtime (kPathingVisRadiusFt). Past sessions
+    // sometimes confused this with `influence.radius` (per-probe sphere
+    // for source/listener containment) — these are intentionally
+    // distinct knobs. See SteamAudioPathing.h for the full reasoning;
+    // here we want the algorithmic-Steam-Audio-equivalent threshold so
+    // the heatmap correlates with what the solver was looking at.
+    const float visRadiusFt = kPathingVisRadiusFt;
+    const float visRadiusSq = visRadiusFt * visRadiusFt;
+
+    // Snapshot active voices first so we don't pay the inner
+    // edge-iteration cost when no voices are active (HUD still shows
+    // edges-with-neighbors = 0).
+    struct Neighbor {
+        Vector3 pos;
+        float   block;   // 1 - eqCoeffs[1] (mid band)
+    };
+    std::vector<Neighbor> neighbors;
+    neighbors.reserve(mVoicePool->size());
+    for (const auto &kv : mVoicePool->voices()) {
+        const ActiveVoice *v = kv.second.get();
+        if (!v || !v->initialized) continue;
+        // Only voices that have actually solved at least once carry
+        // meaningful EQ data; the rest would contribute the bypass
+        // baseline (block=0) and falsely paint "clear" tints across
+        // the graph.
+        if (!v->pathingEverSolved) continue;
+        const float eqMid = v->lastGoodPathParams.eqCoeffs[1];
+        // Clamp + invert. eqMid==1 → clear → block=0; eqMid==0 →
+        // fully blocked → block=1. NaN/inf fall back to block=0 so a
+        // pathological voice doesn't paint the whole graph red.
+        float block = 0.0f;
+        if (std::isfinite(eqMid)) {
+            float clamped = eqMid;
+            if (clamped < 0.0f) clamped = 0.0f;
+            if (clamped > 1.0f) clamped = 1.0f;
+            block = 1.0f - clamped;
+        }
+        neighbors.push_back({v->worldPos, block});
+    }
+
+    out.reserve(adj.edges.size());
+
+    // For each edge, aggregate max(block) across voices within visRadius
+    // of either endpoint. O(E × V); at E ≈ 4·N (=~1000 edges) and V ≈ 16
+    // voices that's ~16000 ops/frame — well under any frame budget.
+    for (const auto &e : adj.edges) {
+        if (e.a < 0 || e.b < 0
+            || e.a >= static_cast<int>(positions.size())
+            || e.b >= static_cast<int>(positions.size()))
+            continue;
+        PathingEdgeViz ev;
+        ev.posA = positions[e.a];
+        ev.posB = positions[e.b];
+        ev.edgeBlock = 0.0f;
+        ev.hasNeighbor = false;
+        for (const Neighbor &n : neighbors) {
+            Vector3 dA = n.pos - ev.posA;
+            Vector3 dB = n.pos - ev.posB;
+            float dAsq = dA.x*dA.x + dA.y*dA.y + dA.z*dA.z;
+            float dBsq = dB.x*dB.x + dB.y*dB.y + dB.z*dB.z;
+            if (dAsq <= visRadiusSq || dBsq <= visRadiusSq) {
+                ev.hasNeighbor = true;
+                if (n.block > ev.edgeBlock) ev.edgeBlock = n.block;
+            }
+        }
+        out.push_back(ev);
+    }
+    return out;
+}
+
+std::vector<AudioService::VoiceArrowViz>
+AudioService::getVoiceArrowViz() const
+{
+    std::vector<VoiceArrowViz> out;
+    if (!mVoicePool) return out;
+    out.reserve(mVoicePool->size());
+    for (const auto &kv : mVoicePool->voices()) {
+        const ActiveVoice *v = kv.second.get();
+        if (!v || !v->initialized) continue;
+        // Skip player-emitted voices (footsteps/landings) — they share
+        // the listener's position; the arrow degenerates to a point.
+        if (v->playerEmitted) continue;
+        VoiceArrowViz a;
+        a.source     = v->worldPos;
+        a.listener   = mListenerPos;
+        a.everSolved = v->pathingEverSolved;
+        a.isAmbient  = v->isAmbient;
+        a.eqMid = a.everSolved
+            ? v->lastGoodPathParams.eqCoeffs[1]
+            : 1.0f;
+        if (!std::isfinite(a.eqMid)) a.eqMid = 1.0f;
+        out.push_back(a);
+    }
+    return out;
+}
+
 void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                                           ProbeBakePlan *planCounters,
                                           float spacing, float height)
@@ -11374,6 +11572,11 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     params.additionalElevations  = mProbeElevations;
     params.elevationSparsityMul  = mProbeElevationSparsityMul;
     params.globalDedupRadiusFt   = mProbeGlobalDedupRadiusFt;
+    // Reflection-bake skip: when true, ProbeManager carries the existing
+    // .probes reflection section forward verbatim instead of re-baking it.
+    // ProbeManager hard-fails (with [FALLBACK] log) if there is no
+    // reflection section to carry forward — see ProbeManager.cpp.
+    params.bakeReflectionBatch   = !mReflectionBakeSkip;
 
     // (Per-portal probe densification for the reflection batch was
     // removed when pathing moved to its own sparse ROOM_PORTAL batch
@@ -12397,6 +12600,11 @@ bool AudioService::bakeProbes(const std::string &outputPath,
         // active on a fresh bake this should be a small minority; if it
         // isn't, the filter or seed-room logic needs another look.
         classifyProbeReachability();
+        // Rebuild the show_pathing_graph adjacency against the fresh
+        // pathing batch (Capability C). No-op if no pathing batch was
+        // baked; cheap if the raycaster isn't wired (emits one
+        // [VIZ_FALLBACK]).
+        rebuildPathingAdjacency();
     }
     return ok;
 }
@@ -12494,6 +12702,11 @@ bool AudioService::loadProbes(const std::string &probePath)
                 100.0f * badFrac);
         }
     }
+    // Build the pathing adjacency for show_pathing_graph (Capability C).
+    // Cheap no-op if no pathing batch loaded; logs [VIZ_FALLBACK] when
+    // the raycaster isn't wired yet — that case is recoverable by
+    // calling rebuildPathingAdjacency() after setRaycaster.
+    rebuildPathingAdjacency();
     return true;
 }
 
