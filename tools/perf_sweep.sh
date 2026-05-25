@@ -33,11 +33,19 @@
 #       0.5 0.75 1.0 1.5
 #
 # Environment overrides:
-#   DARKNESS_BIN       (default: ./build/default/src/main/darknessRender)
-#   DARKNESS_RES       (default: /Volumes/THIEF2_INSTALL_C/THIEF2/RES)
-#   DARKNESS_SCHEMAS   (default: /Volumes/THIEF2_CD2/EDITOR/SCHEMA)
-#   DARKNESS_CONFIG    (default: ./darknessRender.yaml)
-#   DARKNESS_DURATION  (default: 60 — passed to --exit-after-seconds)
+#   DARKNESS_BIN         (default: ./build/default/src/main/darknessRender)
+#   DARKNESS_RES         (default: /Volumes/THIEF2_INSTALL_C/THIEF2/RES)
+#   DARKNESS_SCHEMAS     (default: /Volumes/THIEF2_CD2/EDITOR/SCHEMA)
+#   DARKNESS_CONFIG      (default: ./darknessRender.yaml)
+#   DARKNESS_DURATION    (default: 60 — passed to --exit-after-seconds)
+#
+#   AUTO_FLY             (default: 1 — auto-fly probe tour ON; set to 0 to
+#                         disable; needed because without movement every
+#                         iteration captures a stationary listener)
+#   AUTO_FLY_SPEED       (override --auto-fly-speed; unset → binary default 10 ft/s)
+#   AUTO_FLY_WAYPOINTS   (override --auto-fly-waypoints; unset → binary default 50)
+#   AUTO_FLY_SEED        (override --auto-fly-seed; unset → binary default 0xC0FFEE)
+#   AUTO_FLY_PAUSE_SEC   (override --auto-fly-pause-sec; unset → binary default 0)
 #
 # Flags:
 #   --continue-on-error   keep going after a failing iteration (default: stop on
@@ -105,6 +113,20 @@ RES="${DARKNESS_RES:-/Volumes/THIEF2_INSTALL_C/THIEF2/RES}"
 SCHEMAS="${DARKNESS_SCHEMAS:-/Volumes/THIEF2_CD2/EDITOR/SCHEMA}"
 CONFIG="${DARKNESS_CONFIG:-./darknessRender.yaml}"
 DURATION="${DARKNESS_DURATION:-60}"
+
+# Auto-fly probe tour is ON by default for sweep runs — without it, every
+# iteration captures a stationary listener and the perf-window data isn't
+# representative of real gameplay load. The auto-fly module itself uses
+# fixed defaults (speed=10ft/s, waypoints=50, seed=0xC0FFEE, pause=0) so
+# the visit sequence is deterministic across iterations of the same
+# mission. Override individual knobs via the env vars below; set
+# AUTO_FLY=0 to disable entirely (use only for debugging startup-only
+# knobs that don't need movement).
+AUTO_FLY="${AUTO_FLY:-1}"
+AUTO_FLY_SPEED="${AUTO_FLY_SPEED:-}"
+AUTO_FLY_WAYPOINTS="${AUTO_FLY_WAYPOINTS:-}"
+AUTO_FLY_SEED="${AUTO_FLY_SEED:-}"
+AUTO_FLY_PAUSE_SEC="${AUTO_FLY_PAUSE_SEC:-}"
 
 # --- validation (fail loud, no silent fallback) -------------------------------
 
@@ -189,6 +211,17 @@ for VAL in "${VALUES[@]}"; do
 
     # Tee stderr to a temp file so we can both stream it live AND grep
     # the [PERF_SINK] line out of it after the binary exits.
+    # Build auto-fly arg list dynamically so unset overrides fall back to
+    # the binary's compiled-in defaults.
+    AUTO_FLY_ARGS=()
+    if [ "$AUTO_FLY" = "1" ] || [ "$AUTO_FLY" = "true" ]; then
+        AUTO_FLY_ARGS+=(--auto-fly)
+        [ -n "$AUTO_FLY_SPEED" ]      && AUTO_FLY_ARGS+=(--auto-fly-speed     "$AUTO_FLY_SPEED")
+        [ -n "$AUTO_FLY_WAYPOINTS" ]  && AUTO_FLY_ARGS+=(--auto-fly-waypoints "$AUTO_FLY_WAYPOINTS")
+        [ -n "$AUTO_FLY_SEED" ]       && AUTO_FLY_ARGS+=(--auto-fly-seed      "$AUTO_FLY_SEED")
+        [ -n "$AUTO_FLY_PAUSE_SEC" ]  && AUTO_FLY_ARGS+=(--auto-fly-pause-sec "$AUTO_FLY_PAUSE_SEC")
+    fi
+
     STDERR_TMP="$(mktemp -t perf_sweep_stderr.XXXXXX)"
     "$BIN" \
         "$MISSION" \
@@ -199,6 +232,7 @@ for VAL in "${VALUES[@]}"; do
         --set "${KNOB}=${VAL}" \
         --perf-label "$LABEL" \
         --exit-after-seconds "$DURATION" \
+        "${AUTO_FLY_ARGS[@]}" \
         2> >(tee "$STDERR_TMP" >&2)
     RC=$?
 
