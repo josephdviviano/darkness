@@ -89,6 +89,13 @@ namespace Darkness {
 class Room;
 class RoomPortal;
 
+// Probe-bake plumbing structs (defined in ProbeManager.h). Forward-
+// declared here so prepareProbeBakeParams / computeProbePlan can name
+// them in their signatures without dragging ProbeManager.h's IPL
+// forward decls into this header. Full include lives in AudioService.cpp.
+struct ProbeBakeParams;
+struct ProbeBakePlan;
+
 // Owned subsystem types — full definitions live in their own headers.
 class ReflectionSimulator;
 class PathingSimulator;
@@ -397,6 +404,7 @@ public:
      *  @param data  World geometry — vertices, triangle indices, per-triangle texture names
      *  @return true if scene built successfully */
     bool buildAcousticScene(const AcousticSceneData &data);
+
 
     /** Update the listener (player camera) position and orientation.
      *  Called each frame from the render binary after camera/physics update.
@@ -822,6 +830,26 @@ public:
                     std::atomic<float> *progress = nullptr,
                     float spacing = -1.0f, float height = -1.0f);
 
+    /** Dry-run the Darkness-side probe placement passes and report
+     *  predicted per-purpose probe counts WITHOUT invoking Steam
+     *  Audio's bake. Used by `darknessHeadless probe_plan` (Capability
+     *  A in PLAN.PROBE_DEBUG_TOOLING).
+     *
+     *  Does the same params-setup as `bakeProbes` (snapshot tuning
+     *  state → ProbeBakeParams) plus the pathing-batch dedup that
+     *  lives in this class, then delegates the geometry-aware
+     *  placement work to `ProbeManager::computeBakePlan`. The
+     *  per-pass / per-purpose counters in `out` are filled byte-for-
+     *  byte the same as a live bake would produce — no rounding
+     *  divergence, since the bake and the dry-run share the
+     *  `computeReflectionPlacements` / `computePathingPlacements`
+     *  helpers.
+     *
+     *  Returns false if the acoustic scene is not built or if the
+     *  reflection placement pass produced zero probes (same as
+     *  bakeProbes' failure modes). */
+    bool computeProbePlan(ProbeBakePlan &out);
+
     /** Load baked probe data from disk and register with simulator.
      *  @param probePath  Path to .probes file
      *  @return true if loaded successfully */
@@ -1056,6 +1084,28 @@ protected:
     void loopStep(float deltaTime) override;
 
 private:
+    /// Build the `ProbeBakeParams` that the next bake (or dry-run plan)
+    /// would consume. Snapshots all bake-time tuning state into
+    /// `outParams`, builds the pathing-batch candidate list (rooms +
+    /// portals + emitter anchors), and runs the AudioService-side
+    /// proximity dedup on those candidates. If `planCounters` is
+    /// non-null, the dedup pass populates its dedup counters
+    /// (used by the `darknessHeadless probe_plan` verb to report what
+    /// the dedup pass dropped).
+    ///
+    /// `spacingOverride` / `heightOverride` mirror `bakeProbes`' optional
+    /// args — passed through to `outParams.spacingFtOverride` /
+    /// `heightFtOverride`. -1.0f = use the ProbeManager's configured
+    /// values.
+    ///
+    /// Called by both `bakeProbes` (planCounters=null) and
+    /// `computeProbePlan` (planCounters=&plan), so the two share an
+    /// identical params-building code path.
+    void prepareProbeBakeParams(ProbeBakeParams &outParams,
+                                ProbeBakePlan *planCounters,
+                                float spacingOverride,
+                                float heightOverride);
+
     // ── Service dependencies ──
 
     DatabaseServicePtr mDbService;
