@@ -926,6 +926,12 @@ static LatencyHistogram sPerfCallbackMs;
 // per-call latency, not per-callback summed cost.
 static LatencyHistogram sPerfDirectEffectMs;
 static LatencyHistogram sPerfPathEffectMs;
+// PLAN.AUDIO_PROFILING.md §2.1 — per-iplBinauralEffectApply latency.
+// One record per active sub-source slot per audio callback (≤4 per voice,
+// can fire several times per callback). Writer: audio thread inside
+// steamAudioNodeProcess; gated by gAudioLogVerbose (same gate as
+// sPerfDirectEffectMs). Drained by dumpAudioStatusPeriodic only.
+static LatencyHistogram sPerfBinauralEffectMs;
 static LatencyHistogram sPerfReflMixMs;       // ReflectionMixNode callback (audio thread)
 // Sync-in-callback: time the audio thread spends blocked at the top of the
 // reflection mix node waiting for convolution workers to finish processing
@@ -973,6 +979,42 @@ static std::atomic<float> sLoopStepPeakMs{0.0f};      // peak loopStep total tim
 // under normal load — this is the diagnostic that lets us verify it.
 // Writer: main thread (loopStep). Reader: main-thread periodic dump.
 static LatencyHistogram sPerfLoopStepMs;
+
+// PLAN.AUDIO_PROFILING.md §2.2 — loopStep phase breakdown.
+// The total sPerfLoopStepMs is blind to which phase dominates; these
+// four scope timers attribute the wall-clock to its biggest internal
+// sections. All four are recorded once per loopStep call on the main
+// thread (so n per window ≈ loopStep call count ≈ frame rate × 5 s).
+// Writer: main thread (AudioService::loopStep, one each). Drained by
+// dumpAudioStatusPeriodic only.
+static LatencyHistogram sPerfLoopStickySlotMs;   // sticky-slot decision pass
+static LatencyHistogram sPerfLoopVoiceUpdateMs;  // per-voice update loop body
+static LatencyHistogram sPerfLoopPinBlockMs;     // IR pin block aggregate
+static LatencyHistogram sPerfLoopReflTailMs;     // reverb-tail tick loop
+
+// PLAN.AUDIO_PROFILING.md §2.3 — iplProbeBatchGetReverb + nearest-probe
+// scan aggregate. Wraps the nearest-probe O(probeCount) scan AND the
+// iplProbeBatchGetReverb call inside the pin block — one record per
+// voice that enters the pin block. Bursty (clusters on voice-spawn
+// storms: footsteps, ambient flushes). Writer: main thread (loopStep
+// pin block, one site). Drained by dumpAudioStatusPeriodic only.
+static LatencyHistogram sPerfProbeReverbLookupMs;
+
+// PLAN.AUDIO_PROFILING.md §2.4 — full iplSimulatorRunDirect distribution.
+// Companion to sDirectSimPeakMs (kept as scalar for the existing
+// `[Audio] ... direct=...ms` summary line). Writer: main thread
+// (loopStep, one call per frame). Drained by dumpAudioStatusPeriodic only.
+static LatencyHistogram sPerfDirectSimMs;
+
+// PLAN.AUDIO_PROFILING.md §2.5 — per-spawn initVoiceDSP cost.
+// Times the full create-chain (iplDirectEffectCreate × slots +
+// iplBinauralEffectCreate × slots + iplReflectionEffectCreate +
+// iplPathEffectCreate + per-slot binaural warm-up). Footstep clusters
+// and ambient flushes hit this many times per second. Writer: main
+// thread (initVoiceDSP, one record per spawn). Drained by
+// dumpAudioStatusPeriodic only.
+static LatencyHistogram sPerfVoiceDspInitMs;
+
 static std::atomic<float> sDirectSimPeakMs{0.0f};     // peak iplSimulatorRunDirect time (ms)
 // sReflSimPeakMs and sReflFramesRun moved to ReflectionSimulator.cpp (the
 // only thread that writes them). Declared extern here so the periodic dump
@@ -1329,8 +1371,19 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             binParams.hrtf = node->hrtf;
             binParams.peakDelays = nullptr;
 
+            // PLAN.AUDIO_PROFILING.md §2.1 — time each iplBinauralEffectApply
+            // call (per active sub-source slot, can fire multiple times per
+            // callback). profOn-gated like sPerfDirectEffectMs so production
+            // cost is one branch + atomic-load.
+            auto beT0 = profOn ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
             iplBinauralEffectApply(slot.binauralEffect, &binParams,
                                    &binauralIn, &slotOut);
+            if (profOn) {
+                auto beT1 = std::chrono::steady_clock::now();
+                double beMs = std::chrono::duration<double, std::milli>(beT1 - beT0).count();
+                sPerfBinauralEffectMs.record(beMs);
+            }
 
             bool badL = audioSanitizeBuffer(slotL, frameCount);
             bool badR = audioSanitizeBuffer(slotR, frameCount);
@@ -5071,6 +5124,13 @@ void AudioService::loopStep(float deltaTime)
     const bool profOn = ::Darkness::gAudioLogVerbose;
     auto loopStepStart = profOn ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
+    // PLAN.AUDIO_PROFILING.md §2.2 — phase-breakdown timestamps declared at
+    // function scope so they survive the deeply-nested anonymous blocks of
+    // loopStep. Each pair is sampled at the open/close of its phase; the
+    // matching histogram record() fires once per loopStep (so per-window n
+    // ≈ frame rate × 5 s for each phase). Only meaningful when profOn.
+    std::chrono::steady_clock::time_point voiceUpdT0{}, voiceUpdT1{};
+    std::chrono::steady_clock::time_point reflTailT0{}, reflTailT1{};
 
     // Update ambient volumes early so newly created ambient voices exist before
     // the simulation runs. This ensures same-frame occlusion for new ambients —
@@ -5362,6 +5422,9 @@ void AudioService::loopStep(float deltaTime)
             //
             // PlayerEmitted + Ambient voices fall through to the baked-probe
             // path below (inputs.baked = IPL_TRUE).
+            // PLAN.AUDIO_PROFILING.md §2.2 — sticky-slot phase timer.
+            auto stickyT0 = profOn ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
             if (mReflectionsEnabled && reflectionSimHandle && mReflectionSim) {
                 // Step 1: count currently-owned slots, including tail voices.
                 int slotsHeld = 0;
@@ -5436,6 +5499,11 @@ void AudioService::loopStep(float deltaTime)
                     if (v->reflSlotOwned) reflCandidateSet.insert(h);
                 }
             }
+            if (profOn) {
+                auto stickyT1 = std::chrono::steady_clock::now();
+                double stickyMs = std::chrono::duration<double, std::milli>(stickyT1 - stickyT0).count();
+                sPerfLoopStickySlotMs.record(stickyMs);
+            }
 
             // Baked reflection identifier (for non-top-N voices using probe reverb)
             IPLBakedDataIdentifier bakedReflId{};
@@ -5466,6 +5534,8 @@ void AudioService::loopStep(float deltaTime)
             }
             Room *listenerRoom = mListenerRoom;
 
+            // PLAN.AUDIO_PROFILING.md §2.2 — voice-update phase starts here.
+            if (profOn) voiceUpdT0 = std::chrono::steady_clock::now();
             for (auto &[handle, voice] : mVoicePool->voices()) {
                 // createVoiceSource always sets both sources together (or
                 // neither, on init failure), so checking directSource here
@@ -6251,6 +6321,9 @@ void AudioService::loopStep(float deltaTime)
                     float dMs = std::chrono::duration<float, std::milli>(dt1 - dt0).count();
                     float prevD = sDirectSimPeakMs.load(std::memory_order_relaxed);
                     if (dMs > prevD) sDirectSimPeakMs.store(dMs, std::memory_order_relaxed);
+                    // PLAN.AUDIO_PROFILING.md §2.4 — also record the full
+                    // distribution alongside the existing peak.
+                    sPerfDirectSimMs.record(static_cast<double>(dMs));
                 } else {
                     iplSimulatorRunDirect(mDirectSimulator);
                 }
@@ -7583,6 +7656,15 @@ void AudioService::loopStep(float deltaTime)
                                   && (isReflVoice || hasBakedData);
 
                 if (enableRefl) {
+                    // PLAN.AUDIO_PROFILING.md §2.2 — per-voice pin-block
+                    // timer. profOn-gated; one record per voice per frame
+                    // that enters this branch (steady-state: ≈ active
+                    // convolution-voice count × frame rate × 5 s per
+                    // window). Counter sanity: window n ≤ activeConv ×
+                    // frame_count; if it exceeds that, the for-loop is
+                    // looping more than once per frame.
+                    auto pinT0 = profOn ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
                     // ── Per-voice IR pinning (2026-05-20) ──
                     //
                     // First time a voice has valid IR data, COPY the full IR
@@ -7726,38 +7808,59 @@ void AudioService::loopStep(float deltaTime)
                         // in space" — that's the LISTENER's experience
                         // of the room's RT60.
                         int probeLookupIdx = -1;
-                        if (mProbeManager && mProbeManager->hasReflections()) {
-                            IPLProbeBatch pb = mProbeManager->getProbeBatch();
-                            const auto &probePos = mProbeManager->getProbePositions();
-                            if (pb && !probePos.empty()) {
-                                int nearestIdx = 0;
-                                float nearestDistSq = std::numeric_limits<float>::max();
-                                for (size_t i = 0; i < probePos.size(); ++i) {
-                                    Vector3 d = probePos[i] - mListenerPos;
-                                    float dsq = glm::dot(d, d);
-                                    if (dsq < nearestDistSq) {
-                                        nearestDistSq = dsq;
-                                        nearestIdx = static_cast<int>(i);
+                        // PLAN.AUDIO_PROFILING.md §2.3 — wrap the full
+                        // nearest-probe scan + iplProbeBatchGetReverb call.
+                        // profOn-gated to avoid touching steady_clock on the
+                        // hot loopStep path when --audio-log is off.
+                        {
+                            auto plT0 = profOn ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+                            if (mProbeManager && mProbeManager->hasReflections()) {
+                                IPLProbeBatch pb = mProbeManager->getProbeBatch();
+                                const auto &probePos = mProbeManager->getProbePositions();
+                                if (pb && !probePos.empty()) {
+                                    int nearestIdx = 0;
+                                    float nearestDistSq = std::numeric_limits<float>::max();
+                                    for (size_t i = 0; i < probePos.size(); ++i) {
+                                        Vector3 d = probePos[i] - mListenerPos;
+                                        float dsq = glm::dot(d, d);
+                                        if (dsq < nearestDistSq) {
+                                            nearestDistSq = dsq;
+                                            nearestIdx = static_cast<int>(i);
+                                        }
                                     }
+                                    IPLBakedDataIdentifier reflId{};
+                                    reflId.type = IPL_BAKEDDATATYPE_REFLECTIONS;
+                                    reflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
+                                    iplProbeBatchGetReverb(pb, &reflId, nearestIdx,
+                                        voice->pinnedParams.reverbTimes);
+                                    probeLookupIdx = nearestIdx;
                                 }
-                                IPLBakedDataIdentifier reflId{};
-                                reflId.type = IPL_BAKEDDATATYPE_REFLECTIONS;
-                                reflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
-                                iplProbeBatchGetReverb(pb, &reflId, nearestIdx,
-                                    voice->pinnedParams.reverbTimes);
-                                probeLookupIdx = nearestIdx;
+                            }
+                            if (profOn) {
+                                auto plT1 = std::chrono::steady_clock::now();
+                                double plMs = std::chrono::duration<double, std::milli>(plT1 - plT0).count();
+                                sPerfProbeReverbLookupMs.record(plMs);
                             }
                         }
 
                         voice->reflectionIRPinned = true;
-                        // Once-per-voice cache-hit increment: voice has
-                        // successfully obtained reflection IR data from the
-                        // baked probe cache (or had it generated by the
-                        // realtime simulator). Feeds the per-second
-                        // [PERF refl_cache] hitRate. Miss counting would
-                        // require tracking voices that ended without ever
-                        // pinning — deferred (TODO: add at voice cleanup).
-                        if (mProbeManager) mProbeManager->recordCacheHit();
+                        // PLAN.AUDIO_PROFILING.md §2.6 — record hit / miss
+                        // for the [PERF refl_cache] hitRate line. A pin with
+                        // a valid probeLookupIdx got real baked reverbTimes
+                        // and is the canonical "hit"; pin without a probe
+                        // (no probe batch, empty positions, or hasReflections=false)
+                        // ships a zero-init reverbTimes and is a miss —
+                        // perceptually a silent reverb tail until pinned
+                        // baked data lands. Counter sanity: misses per
+                        // window ≤ voice spawns per window (one per pin),
+                        // and misses + hits ≤ total spawns. If misses ≫
+                        // hits the bake pipeline isn't producing usable
+                        // probe data for this scene.
+                        if (mProbeManager) {
+                            if (probeLookupIdx >= 0) mProbeManager->recordCacheHit();
+                            else                     mProbeManager->recordCacheMiss();
+                        }
                         // eq=[...] is HYBRID-only per phonon.h:2502-2504 and
                         // IS populated by the simulator for our pipeline;
                         // log it as a freshness check (non-zero eq = sim
@@ -7836,6 +7939,11 @@ void AudioService::loopStep(float deltaTime)
                                   isReflVoice ? "topN" : "baked",
                                   static_cast<int>(mAmbisonicsChannels));
                     }
+                    if (profOn) {
+                        auto pinT1 = std::chrono::steady_clock::now();
+                        double pinMs = std::chrono::duration<double, std::milli>(pinT1 - pinT0).count();
+                        sPerfLoopPinBlockMs.record(pinMs);
+                    }
                 } else {
                     voice->dspNode.reflectionsActive.store(false, std::memory_order_relaxed);
 
@@ -7877,6 +7985,16 @@ void AudioService::loopStep(float deltaTime)
                 ma_sound_set_volume(&voice->sound, volume);
             }
         }
+    }
+    // PLAN.AUDIO_PROFILING.md §2.2 — voice-update phase ends. Only records
+    // when voiceUpdT0 was actually set above (i.e. we entered the
+    // !reflBusy && mReflectionSim branch this frame). Frames where the sim
+    // was busy are excluded from the histogram entirely — they're a separate
+    // signal already surfaced by sPerfReflSimMs.
+    if (profOn && voiceUpdT0.time_since_epoch().count() != 0) {
+        voiceUpdT1 = std::chrono::steady_clock::now();
+        double voiceUpdMs = std::chrono::duration<double, std::milli>(voiceUpdT1 - voiceUpdT0).count();
+        sPerfLoopVoiceUpdateMs.record(voiceUpdMs);
     }
 
     // ── [ROOM_ACOUSTICS] diagnostic ──
@@ -7941,6 +8059,8 @@ void AudioService::loopStep(float deltaTime)
         }
     }
 
+    // PLAN.AUDIO_PROFILING.md §2.2 — reflection-tail tick phase timer.
+    if (profOn) reflTailT0 = std::chrono::steady_clock::now();
     // Tick reverb tail timers for voices whose source audio has ended.
     // The voice stays alive during the tail so the per-voice convolution
     // continues feeding its IR tail.
@@ -7992,6 +8112,11 @@ void AudioService::loopStep(float deltaTime)
                 }
             }
         }
+    }
+    if (profOn) {
+        reflTailT1 = std::chrono::steady_clock::now();
+        double reflTailMs = std::chrono::duration<double, std::milli>(reflTailT1 - reflTailT0).count();
+        sPerfLoopReflTailMs.record(reflTailMs);
     }
 
     // (ambient volumes updated at top of loopStep, before simulation)
@@ -8663,6 +8788,17 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
 {
     if (!mIplContext || !mIplHrtf || !mMaEngine)
         return;
+
+    // PLAN.AUDIO_PROFILING.md §2.5 — per-spawn DSP-init cost timer.
+    // Times the full create-chain: iplDirectEffectCreate × slots,
+    // iplBinauralEffectCreate × slots + warm-up, iplReflectionEffectCreate,
+    // iplPathEffectCreate, ma_node_init. Footstep clusters and ambient
+    // flushes hit this many times per second; the histogram surfaces the
+    // worst spawn-storm cost. RAII close runs on every return path —
+    // including the partial-allocation rollback below. Always records
+    // (not profOn-gated) because spawn rate is bounded (≪ audio-callback
+    // rate) so the ~50 ns ScopedLatencyTimer cost is negligible.
+    ScopedLatencyTimer initTimer(sPerfVoiceDspInitMs);
 
     auto &dsp = voice.dspNode;
     const int rateDivisor = mReflectionSim ? mReflectionSim->getRateDivisor() : 2;
@@ -10779,6 +10915,61 @@ void AudioService::dumpAudioStatusPeriodic()
         "[PERF loopStep] n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
         (unsigned long long)loopP.n, fmtMs(loopP.p50), fmtMs(loopP.p95), fmtMs(loopP.p99));
 
+    // PLAN.AUDIO_PROFILING.md §2.2 — loopStep phase breakdown. p99-only
+    // per phase (the line gets unreadable with full p50/p95/p99 × 4 phases);
+    // n is included per-phase so you can see which phases actually ran in
+    // the window (e.g. pinBlock n=0 = no voices entered the enableRefl
+    // branch this window — refl might be disabled or no eligible voices).
+    {
+        auto stkP = sPerfLoopStickySlotMs.snapshotAndReset();
+        auto vupP = sPerfLoopVoiceUpdateMs.snapshotAndReset();
+        auto pinP = sPerfLoopPinBlockMs.snapshotAndReset();
+        auto tlP  = sPerfLoopReflTailMs.snapshotAndReset();
+        AUDIO_LOG(
+            "[PERF loopStep_phases] sticky n=%llu p99=%.3f"
+            " | voiceUpdate n=%llu p99=%.3f"
+            " | pinBlock n=%llu p99=%.3f"
+            " | reflTail n=%llu p99=%.3f ms\n",
+            (unsigned long long)stkP.n, fmtMs(stkP.p99),
+            (unsigned long long)vupP.n, fmtMs(vupP.p99),
+            (unsigned long long)pinP.n, fmtMs(pinP.p99),
+            (unsigned long long)tlP.n,  fmtMs(tlP.p99));
+    }
+
+    // PLAN.AUDIO_PROFILING.md §2.4 — iplSimulatorRunDirect distribution.
+    // Companion to the existing scalar `direct=...ms` field on the
+    // [Audio] summary line above (sDirectSimPeakMs); this fills in p50/p95/p99.
+    {
+        auto dsP = sPerfDirectSimMs.snapshotAndReset();
+        AUDIO_LOG(
+            "[PERF audio] direct_sim n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+            (unsigned long long)dsP.n, fmtMs(dsP.p50), fmtMs(dsP.p95), fmtMs(dsP.p99));
+    }
+
+    // PLAN.AUDIO_PROFILING.md §2.3 — pin-block probe-reverb lookup latency.
+    // Covers the O(probeCount) nearest-probe scan AND the
+    // iplProbeBatchGetReverb call. Bursty on voice-spawn storms (footsteps,
+    // ambient flushes). Emitted alongside [PERF refl_cache]'s hits/misses
+    // line so cache-effectiveness and lookup-cost live next to each other.
+    {
+        auto rlP = sPerfProbeReverbLookupMs.snapshotAndReset();
+        AUDIO_LOG(
+            "[PERF refl_cache] reverbLookup n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+            (unsigned long long)rlP.n, fmtMs(rlP.p50), fmtMs(rlP.p95), fmtMs(rlP.p99));
+    }
+
+    // PLAN.AUDIO_PROFILING.md §2.5 — per-spawn initVoiceDSP cost.
+    // Surfaces worst-case voice-creation cost (Steam Audio effect-create
+    // chain + miniaudio node init). Spikes here correlate with footstep
+    // clusters and ambient flushes; if p99 approaches the audio-callback
+    // budget, spawn storms can starve the audio thread.
+    {
+        auto viP = sPerfVoiceDspInitMs.snapshotAndReset();
+        AUDIO_LOG(
+            "[PERF voice_init] n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+            (unsigned long long)viP.n, fmtMs(viP.p50), fmtMs(viP.p95), fmtMs(viP.p99));
+    }
+
     // T2.1 — [PERF callback] audio-callback wall-clock vs RT deadline.
     // Deadline is the CoreAudio / miniaudio device period:
     //   frames / sampleRate × 1000 ms
@@ -10827,14 +11018,18 @@ void AudioService::dumpAudioStatusPeriodic()
     // stages.
     //
     // PITFALL GUARD (see cbP comment above): one snapshot per histogram,
-    // reused by both stderr + JSONL sinks.
+    // reused by both stderr + JSONL sinks. PLAN.AUDIO_PROFILING.md §2.1
+    // adds binaural-apply alongside direct + path on the same line.
     auto deP = sPerfDirectEffectMs.snapshotAndReset();
     auto peP = sPerfPathEffectMs.snapshotAndReset();
+    auto beP = sPerfBinauralEffectMs.snapshotAndReset();
     AUDIO_LOG(
         "[PERF dsp_apply] direct n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
-        " | path n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+        " | path n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | binaural n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
         (unsigned long long)deP.n, fmtMs(deP.p50), fmtMs(deP.p95), fmtMs(deP.p99),
-        (unsigned long long)peP.n, fmtMs(peP.p50), fmtMs(peP.p95), fmtMs(peP.p99));
+        (unsigned long long)peP.n, fmtMs(peP.p50), fmtMs(peP.p95), fmtMs(peP.p99),
+        (unsigned long long)beP.n, fmtMs(beP.p50), fmtMs(beP.p95), fmtMs(beP.p99));
     AUDIO_LOG(
         "[PERF worker] apply n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
         " | sum n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
