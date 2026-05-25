@@ -1012,11 +1012,65 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     float spacing = (params.spacingFtOverride > 0.0f) ? params.spacingFtOverride : mProbeSpacingFt;
     float height  = (params.heightFtOverride  > 0.0f) ? params.heightFtOverride  : mProbeHeightFt;
 
-    // Bake the reflection batch.
+    // ── Optional reflection-batch carry-forward ─────────────────────────
+    //
+    // When `bakeReflectionBatch == false` we skip the multi-minute
+    // reflection bake entirely and reuse the reflection section from the
+    // existing `.probes` file at `outputPath`. The file format already
+    // supports either-batch-only files (writeProbeFile accepts any
+    // ProbeBatchRecord list, loadProbeFile accepts files with one batch
+    // missing) so the carry-forward path is just "lift the reflection
+    // record verbatim, run the pathing bake, write both records."
+    //
+    // Hard-fail (no silent fallback, per feedback_no_silent_fallbacks)
+    // when the existing file is missing or has no reflection section —
+    // silently producing a pathing-only file would erase the user's
+    // baked reflection data without warning.
+    ProbeBatchRecord carriedReflRecord;
+    bool haveCarriedRefl = false;
+    if (!params.bakeReflectionBatch) {
+        ProbeFileHeader hdr;
+        std::vector<ProbeBatchRecord> existing;
+        ProbeFileStatus st = loadProbeFile(outputPath, hdr, existing);
+        if (st != ProbeFileStatus::Ok) {
+            AUDIO_LOG(
+                "[FALLBACK] bakeProbes: bakeReflectionBatch=false but existing "
+                "probe file '%s' could not be loaded (%s) — refusing to "
+                "produce a pathing-only file without prior reflection data. "
+                "Re-bake with reflection baking enabled first.\n",
+                outputPath.c_str(), probeFileStatusString(st));
+            return false;
+        }
+        for (auto &rec : existing) {
+            if (rec.purpose == static_cast<uint32_t>(ProbePurpose::Reflections)) {
+                carriedReflRecord = std::move(rec);
+                haveCarriedRefl = true;
+                break;
+            }
+        }
+        if (!haveCarriedRefl) {
+            AUDIO_LOG(
+                "[FALLBACK] bakeProbes: bakeReflectionBatch=false but existing "
+                "probe file '%s' has no reflection section — refusing to "
+                "produce a pathing-only file. Re-bake with reflection baking "
+                "enabled first.\n",
+                outputPath.c_str());
+            return false;
+        }
+        AUDIO_LOG("Carrying forward reflection section from '%s' "
+                  "(%u probes, %zu payload bytes)\n",
+                  outputPath.c_str(),
+                  carriedReflRecord.probeCount,
+                  carriedReflRecord.payload.size());
+    }
+
+    // Bake the reflection batch (only when not carrying it forward).
     ProbeBatchEntry reflEntry;
-    if (!bakeReflectionBatch(scene, params, spacing, height,
-                             progress, outputPath, reflEntry)) {
-        return false;
+    if (params.bakeReflectionBatch) {
+        if (!bakeReflectionBatch(scene, params, spacing, height,
+                                 progress, outputPath, reflEntry)) {
+            return false;
+        }
     }
 
     // Bake the pathing batch (optional). Failure to bake pathing is not
@@ -1052,14 +1106,21 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         return true;
     };
 
-    if (!appendRecord(reflEntry, "reflections")) {
-        iplProbeBatchRelease(&reflEntry.iplBatch);
-        if (havePathing) iplProbeBatchRelease(&pathEntry.iplBatch);
-        return false;
+    if (params.bakeReflectionBatch) {
+        if (!appendRecord(reflEntry, "reflections")) {
+            iplProbeBatchRelease(&reflEntry.iplBatch);
+            if (havePathing) iplProbeBatchRelease(&pathEntry.iplBatch);
+            return false;
+        }
+    } else {
+        // Carried-forward record — bytes already validated by loadProbeFile
+        // (CRC check); push it through verbatim so the existing batch is
+        // preserved bit-for-bit.
+        records.push_back(std::move(carriedReflRecord));
     }
     if (havePathing) {
         if (!appendRecord(pathEntry, "pathing")) {
-            iplProbeBatchRelease(&reflEntry.iplBatch);
+            if (reflEntry.iplBatch) iplProbeBatchRelease(&reflEntry.iplBatch);
             iplProbeBatchRelease(&pathEntry.iplBatch);
             return false;
         }
@@ -1071,9 +1132,15 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     // just lacks positions until the next bake. Reflection batch carries
     // no per-probe radii (uniform spacing radius), so we pass an empty
     // vector and the writer omits the radius column.
-    writePositionsSidecar(outputPath, ".reflections",
-                          reflEntry.positions, reflEntry.radiiFt,
-                          spacing, height);
+    //
+    // Carry-forward case: leave the existing `.reflections.positions.csv`
+    // sidecar untouched (positions are not in the .probes payload, only
+    // in the sidecar) so the overlay still works on next load.
+    if (params.bakeReflectionBatch) {
+        writePositionsSidecar(outputPath, ".reflections",
+                              reflEntry.positions, reflEntry.radiiFt,
+                              spacing, height);
+    }
     if (havePathing) {
         writePositionsSidecar(outputPath, ".pathing",
                               pathEntry.positions, pathEntry.radiiFt,
@@ -1084,7 +1151,7 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     // from here — the loader builds fresh batches from the file. (We
     // could keep these and skip the reload, but that would diverge the
     // bake-time and load-time code paths and bypass the disk validation.)
-    iplProbeBatchRelease(&reflEntry.iplBatch);
+    if (reflEntry.iplBatch) iplProbeBatchRelease(&reflEntry.iplBatch);
     if (havePathing) iplProbeBatchRelease(&pathEntry.iplBatch);
 
     if (!writeOk) {
@@ -1093,10 +1160,14 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         return false;
     }
 
-    AUDIO_LOG("Saved %d probes (refl=%d, pathing=%d) to '%s'\n",
-              static_cast<int>(reflEntry.probeCount
+    const int reflProbeCount = params.bakeReflectionBatch
+        ? reflEntry.probeCount
+        : static_cast<int>(records.front().probeCount);
+    AUDIO_LOG("Saved %d probes (refl=%d%s, pathing=%d) to '%s'\n",
+              static_cast<int>(reflProbeCount
                                + (havePathing ? pathEntry.probeCount : 0)),
-              reflEntry.probeCount,
+              reflProbeCount,
+              params.bakeReflectionBatch ? "" : " carried-forward",
               havePathing ? pathEntry.probeCount : 0,
               outputPath.c_str());
 
@@ -1304,6 +1375,112 @@ void ProbeManager::releaseBatches(IPLSimulator reflectionSimulator,
     mReflectionsBatch = nullptr;
     mPathingBatch = nullptr;
     mTotalProbeCount = 0;
+
+    // The adjacency was built against the now-released pathing batch.
+    // Leaving it in place would surface stale edges over a new mission's
+    // probe set, so drop it. AudioService rebuilds after the next
+    // loadProbes / bakeProbes.
+    clearPathingAdjacency();
+}
+
+// ── Pathing adjacency build (Capability C debug viz) ─────────────────────
+//
+// NOT a claim that Steam Audio visited this specific edge for any
+// specific voice. The adjacency is computed by Darkness using the
+// same raycast algorithm Steam Audio's pathing baker uses
+// (IPLPathBakeParams::visRange + IPLPathBakeParams::numSamples,
+// `phonon.h` ~lines 3563-3584). Same algorithm, same inputs, same
+// edges, modulo raycast-precision noise. Layer-2 coloring (done in
+// the renderer / AudioService::getPathingEdgeViz) is a
+// neighborhood-activity heatmap: "voices near this edge's endpoints
+// are perceiving the listener with this EQ quality." It does NOT
+// enumerate Steam Audio's actual visited-probe set per voice — the
+// public C API does not expose that data, and inferring it via BFS
+// was rejected (PLAN.PROBE_DEBUG_TOOLING.md, Capability C) due to
+// divergence risk.
+//
+// Reproduction fidelity: Steam Audio scatters `numSamples`² rays
+// inside a `visRadius` sphere around each probe (path_visibility.cpp
+// in the steam-audio submodule) and counts a pair visible if the
+// fraction of unblocked rays meets `visThreshold`. We cast a single
+// center-to-center ray per pair — sufficient for the
+// neighborhood-activity heatmap; if any future overlay needs
+// bit-exact agreement with Steam Audio's bake, refactor this to
+// drive `numVisSamples`² rays per pair.
+void ProbeManager::buildPathingAdjacency(
+    float visRangeFt,
+    int   numVisSamples,
+    const PathingAdjacencyRaycaster &raycast)
+{
+    // Reset cache up front so a partial / failed build doesn't leave
+    // stale edges visible from a prior run.
+    mPathingAdjacency = {};
+    mPathingAdjacency.visRangeFt    = visRangeFt;
+    mPathingAdjacency.numVisSamples = numVisSamples;
+
+    if (!mPathingBatch || mPathingBatch->positions.empty()) {
+        // Nothing to test — leave built=false; the renderer's HUD path
+        // surfaces "NO PATHING BATCH". No log: this is the normal state
+        // for missions without a pathing bake.
+        return;
+    }
+    if (!raycast) {
+        // Hard fallback — every pair would default to visible without a
+        // raycaster, which would produce a meaningless fully-connected
+        // graph. Loud per feedback_no_silent_fallbacks: tell the user
+        // why the overlay is dark.
+        std::fprintf(stderr,
+            "[VIZ_FALLBACK] ProbeManager::buildPathingAdjacency: no "
+            "raycaster supplied — adjacency cannot be computed; "
+            "show_pathing_graph will be empty\n");
+        return;
+    }
+
+    const auto &positions = mPathingBatch->positions;
+    const int N = static_cast<int>(positions.size());
+    const float visRangeSqFt = visRangeFt * visRangeFt;
+
+    auto t0 = std::chrono::steady_clock::now();
+    int edges = 0;
+    int rangeRejects = 0;
+    mPathingAdjacency.edges.reserve(static_cast<size_t>(N) * 4);
+
+    // O(N²) probe-pair pass. At N=250 this is ~31000 unique pairs;
+    // even with one raycast per pair this completes in a few hundred
+    // ms on a debug build. Single-shot at level-load; never per-frame.
+    for (int i = 0; i < N; ++i) {
+        const Vector3 &a = positions[i];
+        for (int j = i + 1; j < N; ++j) {
+            const Vector3 &b = positions[j];
+            Vector3 d = b - a;
+            float distSq = d.x*d.x + d.y*d.y + d.z*d.z;
+            if (distSq > visRangeSqFt) {
+                ++rangeRejects;
+                continue;
+            }
+            // Center-to-center ray test against the acoustic mesh.
+            // `raycast` returns true on a hit (segment blocked).
+            // Mirrors Steam Audio's `scene.isOccluded` semantic.
+            if (raycast(a, b)) {
+                continue;  // blocked → no edge
+            }
+            mPathingAdjacency.edges.push_back({i, j});
+            ++edges;
+        }
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    mPathingAdjacency.built   = true;
+    mPathingAdjacency.buildMs = ms;
+
+    // Single-line diagnostic that lets future debugging cross-check
+    // edge count against Steam Audio's reported bake count (if a future
+    // patch exposes it). Edge count is the principal cross-check.
+    std::fprintf(stderr,
+        "[ADJACENCY_BUILD] %d probes, %d edges, %d range-rejects, "
+        "%.1f ms (visRange=%.1f ft, numVisSamples=%d)\n",
+        N, edges, rangeRejects, ms, visRangeFt, numVisSamples);
 }
 
 // ── T2.4 IR cache stats dump ─────────────────────────────────────────────

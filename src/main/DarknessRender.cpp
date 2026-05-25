@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -84,6 +85,8 @@
 #include "audio/AudioLog.h"
 #include "audio/AudioService.h"
 #include "audio/AcousticMaterials.h"
+#include "audio/ProbeFile.h"
+#include "audio/ProbeManager.h"
 #include "motion/MotionService.h"
 #include "RawDataStorage.h"
 #include "PLDefParser.h"
@@ -257,7 +260,8 @@ static void printHelp() {
         "\n"
         "USAGE\n"
         "  darknessRender <mission.mis> [--res <path>] [--schemas <path>]\n"
-        "                                [--config <path>] [-h | --help]\n"
+        "                                [--config <path>] [--skip-reflection-bake]\n"
+        "                                [-h | --help]\n"
         "\n"
         "  All other tunables live in the YAML config (default: ./darknessRender.yaml).\n"
         "  Run with --help to see every supported config key.\n"
@@ -269,6 +273,11 @@ static void printHelp() {
         "  --schemas <path>  Schema directory (.sch / .spc / .arc). Overrides\n"
         "                    paths.schemas; default: search next to RES.\n"
         "  --config <path>   YAML config path. Default: ./darknessRender.yaml.\n"
+        "  --skip-reflection-bake\n"
+        "                    Carry forward the existing .probes reflection section\n"
+        "                    (skip the multi-minute reflection bake; only re-bake\n"
+        "                    pathing). Hard-fails if no reflection section exists.\n"
+        "                    Overrides YAML audio.reflections.bake_skip.\n"
         "  -h, --help        Show this message and exit.\n"
         "\n"
         "YAML CONFIG REFERENCE (defaults shown; see darknessRender.example.yaml)\n"
@@ -2069,6 +2078,192 @@ static void renderDebugOverlay(
             }
         }
     }
+
+    // ── Pathing-graph EQ-activity overlay (Capability C) ──
+    //
+    // Layers 1 + 2: static probe-visibility graph (dim gray topology)
+    // tinted in active-voice neighborhoods by per-voice eqCoeffs.mid.
+    // Layer 3: per-voice source→listener arrow (separate toggle).
+    //
+    // HONESTY NOTE: this is NOT a claim that Steam Audio used edge
+    // (A,B) for voice X. The adjacency was computed by Darkness using
+    // the same raycast algorithm Steam Audio's pathing baker uses
+    // (visRange + numVisSamples). Layer-2 edge coloring is a
+    // neighborhood-activity heatmap: across active voices within
+    // visRadius of either endpoint, edge_block = max(1 - eqCoeffs.mid).
+    // The public Steam Audio C API does not expose per-voice
+    // visited-probe sets, and the BFS-inference approach was
+    // explicitly rejected (PLAN.PROBE_DEBUG_TOOLING.md Capability C)
+    // due to divergence risk. Per feedback_no_hacks.
+    if (state.showPathingGraph || state.showVoiceArrows) {
+        auto audioSvc = GET_SERVICE(Darkness::AudioService);
+        if (audioSvc) {
+            // Smoothing state — keep the previous frame's edge_block
+            // array keyed by edge index. Linear interp toward the new
+            // value at a fixed rate so colour changes are smooth
+            // (per feedback_smooth_transitions; ~120 ms time constant
+            // at 60 fps). Static so it persists across frames.
+            static std::vector<float> sEdgeBlockPrev;
+
+            std::vector<Darkness::AudioService::PathingEdgeViz> edges;
+            int nGreen = 0, nRed = 0, nNeighbor = 0;
+            int activeVoices = 0;
+            if (state.showPathingGraph) {
+                edges = audioSvc->getPathingEdgeViz();
+
+                // Resize smoothing buffer if edge count changed (level
+                // reload, fresh bake). Resets to 0 (background).
+                if (sEdgeBlockPrev.size() != edges.size()) {
+                    sEdgeBlockPrev.assign(edges.size(), 0.0f);
+                }
+                constexpr float kBlend = 0.20f;  // ~5-frame ease-in
+                for (size_t i = 0; i < edges.size(); ++i) {
+                    float target = edges[i].hasNeighbor
+                        ? edges[i].edgeBlock : 0.0f;
+                    sEdgeBlockPrev[i] += (target - sEdgeBlockPrev[i]) * kBlend;
+                    edges[i].edgeBlock = sEdgeBlockPrev[i];
+                    // Reclassify after smoothing — an edge tagged
+                    // hasNeighbor=true at target=0 stays as a yellow
+                    // sliver until the EWMA decays, which is the
+                    // desired smooth-fade behaviour.
+                    if (edges[i].hasNeighbor) {
+                        if (edges[i].edgeBlock > 0.05f) {
+                            ++nNeighbor;
+                            if (edges[i].edgeBlock > 0.66f) ++nRed;
+                            else if (edges[i].edgeBlock < 0.20f) ++nGreen;
+                        }
+                    }
+                }
+            }
+            std::vector<Darkness::AudioService::VoiceArrowViz> arrows;
+            if (state.showVoiceArrows) {
+                arrows = audioSvc->getVoiceArrowViz();
+            }
+            // For HUD: count audio voices with any pathing data. Mirrors
+            // the per-frame iteration getPathingEdgeViz already does.
+            if (state.showPathingGraph) {
+                for (const auto &a : audioSvc->getVoiceArrowViz()) {
+                    if (a.everSolved) ++activeVoices;
+                }
+            }
+
+            // Worst-case verts: 2 per edge + 2 per arrow.
+            uint32_t needVerts = static_cast<uint32_t>(edges.size()) * 2u
+                              + static_cast<uint32_t>(arrows.size()) * 2u;
+            if (needVerts > 0
+                && bgfx::getAvailTransientVertexBuffer(
+                       needVerts, Darkness::PosColorVertex::layout) >= needVerts)
+            {
+                bgfx::TransientVertexBuffer tvb;
+                bgfx::allocTransientVertexBuffer(
+                    &tvb, needVerts, Darkness::PosColorVertex::layout);
+                auto *verts = reinterpret_cast<Darkness::PosColorVertex *>(tvb.data);
+                uint32_t n = 0;
+
+                // Color helpers. ABGR (bgfx native order for the
+                // PosColorVertex layout used elsewhere in this file).
+                //   Dim gray   = 0x80808080  background topology
+                //   Green      = 0xFF22FF22  clear path
+                //   Yellow     = 0xFF22EEFFu  partial
+                //   Red        = 0xFF2222FF  fully blocked (sentinel)
+                // Layer-3 arrow uses the same green→yellow→red ramp
+                // applied to the raw eqMid coefficient (1=clear→green).
+                auto eqColor = [](float block) -> uint32_t {
+                    // block ∈ [0,1] — invert to clarity for the ramp
+                    if (block <= 0.0f) return 0xFF22FF22u;        // green
+                    if (block >= 0.95f) return 0xFF2222FFu;       // red
+                    if (block < 0.33f) {
+                        // green → yellow
+                        return 0xFF22EEFFu;
+                    }
+                    if (block < 0.66f) return 0xFF22DDEEu;        // amber
+                    return 0xFF2244FFu;                            // orange-red
+                };
+
+                // Layer 1 — every edge in the adjacency (dim gray when
+                // no neighbor voice). Layer 2 overrides the tint when
+                // an active voice is in the endpoint neighborhood.
+                if (state.showPathingGraph) {
+                    for (const auto &e : edges) {
+                        uint32_t c = 0x80808080u;  // dim gray default
+                        if (e.hasNeighbor) c = eqColor(e.edgeBlock);
+                        verts[n++] = { e.posA.x, e.posA.y, e.posA.z, c };
+                        verts[n++] = { e.posB.x, e.posB.y, e.posB.z, c };
+                    }
+                }
+
+                // Layer 3 — per-voice arrows. Color by eqMid directly
+                // (no smoothing pass — voices come and go and a smooth
+                // fade on a brand-new voice would lag perceptibly).
+                if (state.showVoiceArrows) {
+                    for (const auto &a : arrows) {
+                        float block = a.everSolved
+                            ? (1.0f - std::max(0.0f, std::min(a.eqMid, 1.0f)))
+                            : 0.0f;
+                        // Unsolved voices get a faded cyan so they read
+                        // as "still resolving" rather than green-clear.
+                        uint32_t c = a.everSolved ? eqColor(block)
+                                                  : 0x88FFFF00u;  // semi-transp cyan
+                        verts[n++] = { a.source.x,   a.source.y,   a.source.z,   c };
+                        verts[n++] = { a.listener.x, a.listener.y, a.listener.z, c };
+                    }
+                }
+
+                if (n > 0) {
+                    float identity[16];
+                    bx::mtxIdentity(identity);
+                    bgfx::setTransform(identity);
+                    bgfx::setVertexBuffer(0, &tvb, 0, n);
+                    uint64_t lineState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                                       | BGFX_STATE_PT_LINES
+                                       | BGFX_STATE_BLEND_ALPHA
+                                       | BGFX_STATE_DEPTH_TEST_ALWAYS;
+                    bgfx::setState(lineState);
+                    float noFog[4]      = {0, 0, 0, 0};
+                    float opaqueParams[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+                    float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
+                    bgfx::setUniform(gpu.u_fogColor,    noFog);
+                    bgfx::setUniform(gpu.u_fogParams,   noFog);
+                    bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+                    bgfx::setUniform(gpu.u_objectLight,  whiteLight);
+                    bgfx::submit(2, gpu.flatProgram);
+                }
+            }
+
+            // HUD line. Anchored at row 19 so it doesn't collide with
+            // the show_probes (rows 14-15) or show_probe_radius
+            // (rows 16-17) blocks. Surfaces the no-pathing-batch state
+            // explicitly (per feedback_no_silent_fallbacks).
+            bgfx::setDebug(BGFX_DEBUG_TEXT);
+            const uint8_t labelAttr = 0x0F;  // white on black
+            const uint8_t valAttr   = 0x0A;  // green
+            const uint8_t warnAttr  = 0x0C;  // red
+            const auto &pp = audioSvc->getPathingProbePositions();
+            if (pp.empty()) {
+                bgfx::dbgTextPrintf(2, 19, warnAttr,
+                    "Pathing graph: NO PATHING BATCH (run bake_probes)");
+            } else if (edges.empty() && state.showPathingGraph) {
+                // Adjacency hasn't been built yet (raycaster wasn't
+                // wired at load time and rebuild never fired) — direct
+                // the user to the [VIZ_FALLBACK] stderr line.
+                bgfx::dbgTextPrintf(2, 19, warnAttr,
+                    "Pathing graph: %zu probes loaded, adjacency NOT BUILT "
+                    "(see [VIZ_FALLBACK] in stderr)", pp.size());
+            } else {
+                bgfx::dbgTextPrintf(2, 19, valAttr,
+                    "Pathing graph: %zu probes / %zu edges | %d edges "
+                    "carrying sound (green) / %d blocked (red) | "
+                    "neighborhood-tinted=%d | active voices = %d",
+                    pp.size(), edges.size(),
+                    nGreen, nRed, nNeighbor, activeVoices);
+            }
+            if (state.showVoiceArrows) {
+                bgfx::dbgTextPrintf(2, 20, labelAttr,
+                    "Voice arrows: %zu (green=clear, red=blocked, "
+                    "cyan=unresolved)", arrows.size());
+            }
+        }
+    }
 }
 
 // ── Object rendering ──
@@ -3188,6 +3383,36 @@ dbgConsole.addFloat("refl_throttle", 1.0f, 32.0f,
         "and spheres appear in sync; both also share the layer-2 "
         "occlusion coloring (red=ray-blocked, green=LOS, gray=out-of-"
         "range), so a pathing probe's cube and sphere always agree.");
+
+    // Capability C — pathing-graph EQ-activity visualization.
+    // Layer 1 (static adjacency, dim gray) + Layer 2 (per-edge EQ tint
+    // in active-voice neighborhoods). Honesty note in the help text:
+    // we are NOT querying Steam Audio's per-voice visited-probe set
+    // (the public C API doesn't expose that); we replicate the
+    // bake-time adjacency and aggregate neighborhood EQ activity.
+    dbgConsole.addBool("show_pathing_graph",
+        [&state]() { return state.showPathingGraph; },
+        [&state](bool v) { state.showPathingGraph = v; },
+        "Pathing-probe visibility graph + per-edge EQ-activity heatmap. "
+        "Edges drawn from a Darkness-side replication of Steam Audio's "
+        "bake-time visibility test (same visRange / numVisSamples). "
+        "Edge tint = max(1 - eqCoeffs.mid) across active voices within "
+        "visRadius of either endpoint (green=clear, red=blocked, "
+        "yellow=partial; dim gray = no voice nearby). NOT a per-voice "
+        "edge-visitation query — public Steam Audio API does not "
+        "expose that. Companion: show_voice_arrows.");
+
+    // Layer 3 — per-voice source→listener arrow colored by that
+    // voice's mid-band EQ. Toggleable independently so a user can
+    // disambiguate per-voice contribution from the neighborhood
+    // heatmap.
+    dbgConsole.addBool("show_voice_arrows",
+        [&state]() { return state.showVoiceArrows; },
+        [&state](bool v) { state.showVoiceArrows = v; },
+        "Per-voice arrow from source to listener, colored by the "
+        "voice's mid-band eqCoeffs (Layer 3 of show_pathing_graph). "
+        "Useful when the graph heatmap is ambiguous about which "
+        "voice is contributing to a hot edge.");
 
     dbgConsole.addFloat("probe_marker_size", 0.1f, 10.0f,
         [&state]() { return state.probeMarkerSize; },
@@ -4422,6 +4647,7 @@ int main(int argc, char *argv[]) {
         audioSvc->setBakeDuration(cfg.bakeDuration);
         audioSvc->setBakeDiffuseSamples(cfg.bakeDiffuseSamples);
         audioSvc->setBakeAmbisonicsOrder(cfg.bakeAmbisonicsOrder);
+        audioSvc->setReflectionBakeSkip(cfg.reflectionBakeSkip);
 
         // -- audio.probes --
         // Bake-time grid parameters. Applied before the auto-bake on first
@@ -4509,6 +4735,72 @@ int main(int argc, char *argv[]) {
         // --no-probes skips baking entirely (no spatial audio, faster startup).
         if (!cfg.noProbes) {
             std::string probePath = Darkness::AudioService::getProbeFilePath(misPath);
+
+            // ── [REFL_SKIP] startup banner ──
+            //
+            // When the user passed --skip-reflection-bake (or set
+            // audio.reflections.bake_skip in YAML), the next bakeProbes()
+            // call will carry the existing reflection section forward
+            // verbatim instead of re-baking it. Emit a loud banner now so
+            // the user sees what's about to happen — silently going from
+            // "bake takes 5 minutes" to "bake takes 5 seconds" without
+            // explanation would be a foot-gun (and per
+            // feedback_no_silent_fallbacks every fallback must announce
+            // itself). We inspect the existing file directly so we can
+            // report probe count + file mtime (as a proxy for the
+            // original bake time — the .probes format does not record a
+            // bake timestamp).
+            if (cfg.reflectionBakeSkip) {
+                Darkness::ProbeFileHeader phdr;
+                std::vector<Darkness::ProbeBatchRecord> precs;
+                Darkness::ProbeFileStatus pst = Darkness::loadProbeFile(probePath, phdr, precs);
+                int reflProbes = 0;
+                bool haveRefl = false;
+                for (const auto &rec : precs) {
+                    if (rec.purpose == static_cast<uint32_t>(
+                            Darkness::ProbePurpose::Reflections)) {
+                        reflProbes = static_cast<int>(rec.probeCount);
+                        haveRefl = true;
+                        break;
+                    }
+                }
+                if (pst == Darkness::ProbeFileStatus::Ok && haveRefl) {
+                    // File mtime as best-effort bake-time proxy.
+                    char timeBuf[64] = "unknown";
+                    struct stat sb;
+                    if (stat(probePath.c_str(), &sb) == 0) {
+                        struct tm tmv;
+                    #ifdef _WIN32
+                        localtime_s(&tmv, &sb.st_mtime);
+                    #else
+                        localtime_r(&sb.st_mtime, &tmv);
+                    #endif
+                        std::strftime(timeBuf, sizeof(timeBuf),
+                                      "%Y-%m-%d %H:%M", &tmv);
+                    }
+                    std::fprintf(stderr,
+                        "[REFL_SKIP] reflection bake disabled — carrying forward existing reflection section\n"
+                        "            from %s (%d probes, baked %s)\n"
+                        "[REFL_SKIP] If you've moved geometry, audible reflections will be STALE until you\n"
+                        "            rebuild with --skip-reflection-bake removed.\n",
+                        probePath.c_str(), reflProbes, timeBuf);
+                } else {
+                    // No existing file (or no reflection section). The
+                    // bake itself will hard-fail later with the same
+                    // [FALLBACK] verbiage from ProbeManager; this early
+                    // warning gives the user a chance to ^C before the
+                    // bake even starts.
+                    std::fprintf(stderr,
+                        "[REFL_SKIP] reflection bake disabled but existing .probes file '%s' is missing\n"
+                        "            or lacks a reflection section (status=%s, refl_section=%s).\n"
+                        "[REFL_SKIP] bakeProbes() will REFUSE to produce a pathing-only file — re-bake\n"
+                        "            with --skip-reflection-bake removed first.\n",
+                        probePath.c_str(),
+                        Darkness::probeFileStatusString(pst),
+                        haveRefl ? "yes" : "no");
+                }
+            }
+
             if (!audioSvc->loadProbes(probePath)) {
                 // No baked probes — need to bake.
                 // This is done BEFORE the render loop starts, so we can use
@@ -4555,6 +4847,11 @@ int main(int argc, char *argv[]) {
                            Darkness::RayHit &hit) {
                     return Darkness::raycastWorld(mission.wrData, from, to, hit);
                 });
+            // loadProbes ran BEFORE setRaycaster (above), so the first
+            // pathing-adjacency build attempt was a no-op fallback. Now
+            // that the raycaster is wired, rebuild so show_pathing_graph
+            // has real edges. Cheap no-op when no pathing batch loaded.
+            audioSvcForRay->rebuildPathingAdjacency();
         }
     }
 
