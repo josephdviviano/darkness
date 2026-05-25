@@ -175,6 +175,33 @@ struct RenderConfig {
     // Capability B.
     bool reflectionBakeSkip = false;
 
+    // Force a fresh pathing bake even when the existing .probes file
+    // already contains a valid pathing section. Symmetric with
+    // `reflectionBakeSkip`: where that one CARRIES FORWARD the existing
+    // reflection bytes to skip the expensive bake, this one DROPS the
+    // existing pathing bytes to force a fresh bake.
+    //
+    // The intended composition is:
+    //   --skip-reflection-bake --force-pathing-bake
+    // which loads the existing .probes file, carries the reflection
+    // section forward verbatim, and runs only the pathing bake fresh.
+    // This is the canonical Sweep 2 Phase B invocation
+    // (PLAN.AUDIO_PROFILING.md §4.3) — iterating across
+    // `pathing_probes.dedup_radius_ft` values without paying the
+    // multi-minute reflection cost on every iteration.
+    //
+    // Without `--skip-reflection-bake`, this flag still re-bakes pathing
+    // BUT will also re-bake reflections (since bakeReflectionBatch
+    // defaults to true). That's the "rebake everything but force re-do
+    // pathing even if .probes already had pathing" case — useful for
+    // baking from scratch with the pathing-bake portion's caches/state
+    // explicitly invalidated.
+    //
+    // No YAML key by design — this is a per-invocation override,
+    // matching the per-invocation nature of a sweep iteration. Default
+    // false. See PLAN.AUDIO_PROFILING.md §4.3 (Sweep 2 Phase B).
+    bool forcePathingBake = false;
+
     // -- audio.occlusion: occlusion + material scaling --
     // (diffuseSamples / bakeDiffuseSamples moved to realtimeDiffuseSamples /
     //  bakeDiffuseSamples under reflections — legacy occlusion.diffuse_samples
@@ -1350,6 +1377,7 @@ inline bool isPerfLabelValid(const std::string& s) {
 //   --schemas <path>   schema directory (overrides paths.schemas)
 //   --config <path>    YAML path (defaults to ./darknessRender.yaml)
 //   --skip-reflection-bake  carry forward existing reflection IRs
+//   --force-pathing-bake    drop existing pathing section + re-bake it
 //   --set <p>=<v>      generic YAML-path override; repeatable
 //   --perf-label <s>   tag the per-run audio_perf.jsonl directory
 //   --exit-after-seconds N  exit cleanly after N seconds of wall-clock
@@ -1377,6 +1405,12 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cli.configPath = argv[++i];
         } else if (std::strcmp(argv[i], "--skip-reflection-bake") == 0) {
             cfg.reflectionBakeSkip = true;
+        } else if (std::strcmp(argv[i], "--force-pathing-bake") == 0) {
+            // Symmetric escape hatch to --skip-reflection-bake. Composes
+            // with it: --skip-reflection-bake --force-pathing-bake means
+            // carry reflection bytes forward, re-bake only the pathing
+            // section. See PLAN.AUDIO_PROFILING.md §4.3 (Sweep 2 Phase B).
+            cfg.forcePathingBake = true;
         } else if (std::strcmp(argv[i], "--set") == 0 && i + 1 < argc) {
             // --set audio.foo.bar=value  (yaml-dotted-path=leaf)
             std::string arg = argv[++i];

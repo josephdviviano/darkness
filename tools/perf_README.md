@@ -1,7 +1,11 @@
 # Audio profiling tools
 
 Companion tooling for the audio-pipeline tuning workflow described in
-`.claude/PLAN.AUDIO_PROFILING.md` (sections 1.1-1.4 and 4.2-4.5).
+`.claude/PLAN.AUDIO_PROFILING.md` (sections 1.1-1.4 and Part 4). The
+sweep-ordering rationale below mirrors PLAN §4.0 (strategic ordering)
+and PLAN §4.P1.* / §4.P2.* (per-sweep detail) — the git-tracked
+companion here is the operator-facing summary, while the gitignored
+PLAN holds the deeper design notes.
 
 These scripts operate against the per-run JSONL artifact emitted by
 `AudioService::dumpAudioStatusPeriodic` into
@@ -84,6 +88,7 @@ tools/perf_sweep.sh \
 | `AUTO_FLY_WAYPOINTS`  | unset → binary default 50 (N-nearest probes)                                    |
 | `AUTO_FLY_SEED`       | unset → binary default `0xC0FFEE` (decimal or `0xHEX` accepted)                 |
 | `AUTO_FLY_PAUSE_SEC`  | unset → binary default 0 (continuous motion; nonzero pauses N s at each WP)     |
+| `FORCE_PATHING_BAKE`  | `0` — set to `1` to append `--force-pathing-bake` (Sweep 2 Phase B; see below)  |
 
 Auto-fly defaults to ON so every sweep iteration captures a comparable
 moving-listener load profile rather than a stationary scene. Set
@@ -165,18 +170,36 @@ pair probes the mission has (~roughly equal to door count). Cap A's
 `[PROBE_PLAN] WARN: no door OBBs registered ... DoorPair classification
 absent` line surfaces this on every run.
 
-### Phase B (deferred)
+### Phase B — live p99 acceptance check (use `FORCE_PATHING_BAKE=1`)
 
-If Phase A picks a `dedup_radius_ft` that needs the `[PERF pathing] p99`
-runtime acceptance check, that's Phase B — a live playtest per (mission,
-radius) pair with the corresponding rebake. Currently `perf_sweep.sh`
-caches the existing `.probes` file via `--skip-reflection-bake`, so it
-won't force a pathing rebake between iterations. Phase B will need
-either:
-- A `--skip-pathing-bake=false` (force-rebake) CLI flag, OR
-- An explicit `rm <mission>.probes` between sweep iterations
+Once Phase A picks a candidate `dedup_radius_ft` per most-divergent
+mission, Phase B runs the live `darknessRender` per (mission, radius)
+pair and checks `[PERF pathing] p99` etc. Each iteration must re-bake
+the pathing section against that iteration's radius value while keeping
+the reflection bake bytes from a prior good bake.
 
-Not implemented yet — defer until Phase A picks a candidate radius.
+Tooling for this composition is the `--force-pathing-bake` CLI flag
+(symmetric to `--skip-reflection-bake`) plus the `FORCE_PATHING_BAKE=1`
+env var on `perf_sweep.sh`. The composition in the sweep harness is:
+
+- Always: `--skip-reflection-bake` (carry reflection bytes forward).
+- When `FORCE_PATHING_BAKE=1`: also `--force-pathing-bake` (drop the
+  cached pathing section, re-bake pathing fresh).
+
+Net effect per iteration: load `.probes` → carry reflection forward →
+re-bake pathing (seconds) → run for `DURATION` s → next iteration.
+
+```bash
+FORCE_PATHING_BAKE=1 tools/perf_sweep.sh \
+    ../path/MISS6.MIS audio.pathing_probes.dedup_radius_ft \
+    <radii from Phase A>
+```
+
+`perf_sweep.sh` emits a `[SWEEP_PHASE_B]` startup banner whenever
+`FORCE_PATHING_BAKE=1` is paired with an `audio.pathing_probes.*`
+knob (the correct mode), and a `[SWEEP_PHASE_B] WARN` when paired
+with any other knob (likely a typo — per-iter bake cost with no
+benefit).
 
 ## How to compare two runs
 
@@ -209,22 +232,59 @@ python3 tools/perf_diff_test.py
 `/perf/` is gitignored — the artifacts are large and bound to the
 specific build (`git_commit` in `run.meta` is the link back to source).
 
-## The five tuning runs to do
+## Sweeps to run — Phase 1 first, Phase 2 deferred
 
-From `.claude/PLAN.AUDIO_PROFILING.md` §4.2 - §4.5 (§4.1 was removed
-out-of-band — `hybrid_transition_time = 1.0s` is now a fixed design
-point per the Steam Audio Unity/Unreal reference integrations).
+The sweep set is reorganized into two phases. Phase 1 (pathing) is
+tractable today and unblocks Phase 2; Phase 2 (reflection) is held
+until Phase 1 finishes. See `.claude/PLAN.AUDIO_PROFILING.md` §4.0
+for the full strategic-ordering rationale (reflection bakes are
+multi-minute per mission, so reflection sweeps must amortize ONE good
+bake per level via `--skip-reflection-bake`; that bake's input probe
+set comes from Phase 1, so Phase 1 must settle first).
 
-| # | Knob(s) swept                                                              | Sweep values                                            | Acceptance criterion                                                                                                |
-|---|----------------------------------------------------------------------------|---------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
-| 1 | `reverb_voices` (hold `reverb_threads=8`, `conv_share=0.5`)                | {16, 24, 32}                                            | `[PERF refl_cache] evictions/sec` flat or lower; `[PERF worker_iter] max_apply p99` not disproportionate             |
-| 2 | `pathing_probes.dedup_radius_ft` (per mission, via `darknessHeadless probe_plan`) | {5, 10, 15, 20}                                  | probe count in `[150, 180]` for most missions; per-mission acceptance: `[PERF pathing] p99 < 2 ms`                  |
-| 3 | `reflection_throttle` × `reverb_voices_realtime` (joint sweep, ambisonics order 1) | throttle ∈ {4, 8, 16} × realtime ∈ {0, 4, 8} | `[PERF audio] refl_sim p99 < 8 ms`; no `BUDGET_WARN`; `[BEAT] ac_freq` does NOT correlate with `simRate/throttle`    |
-| 4 | `pathing_update_interval`                                                  | {0.0, 0.05, 0.1, 0.2, 0.3}                              | `[PERF loopStep] p99` drop ≥ 2 ms at 0.3 vs 0.0; no `[PERF pathing] BUDGET_WARN`; subjective portal-traversal smoothness |
+### Phase 1 — Pathing tuning (do now)
 
-(Sweep 2 currently calls into `darknessHeadless probe_plan` for the
-matrix step before live-runs on the divergent missions. See PLAN §4.3
-for the full method.)
+| # | Knob(s) swept                                                              | Sweep values                                            | Phase | Per-iter bake cost                                | Acceptance criterion                                                                                                |
+|---|----------------------------------------------------------------------------|---------------------------------------------------------|-------|----------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
+| 1 | `pathing_probes.dedup_radius_ft` (matrix step — `darknessHeadless probe_plan`) | {5, 10, 15, 20}                                | A     | none (dry-run only)                               | probe count in `[150, 180]` for most missions; surfaces per-mission divergence                                       |
+| 2 | `pathing_probes.dedup_radius_ft` (live p99 check on most-divergent missions) | radii from Phase A                              | B     | seconds (pathing-only re-bake; reflection carried forward) | per-mission `[PERF pathing] p99 < 2 ms`                                                                              |
+| 3 | `pathing_update_interval`                                                  | {0.0, 0.05, 0.1, 0.2, 0.3}                              | runtime | none (knob doesn't affect probes — reflection carried forward, no bake) | `[PERF loopStep] p99` drop ≥ 2 ms at 0.3 vs 0.0; no `[PERF pathing] BUDGET_WARN`; subjective portal-traversal smoothness |
+
+Phase 1 invocations:
+
+```bash
+# Phase 1.A — probe-count matrix (no bake, no playtest)
+tools/perf_probe_plan_sweep.sh
+
+# Phase 1.B — live p99 check at chosen radii (per-iter pathing re-bake)
+FORCE_PATHING_BAKE=1 tools/perf_sweep.sh \
+    ../path/MISS6.MIS audio.pathing_probes.dedup_radius_ft \
+    <radii from Phase A>
+
+# Phase 1 runtime — pathing-update-interval ablation (no bake at all)
+tools/perf_sweep.sh \
+    ../path/MISS6.MIS audio.propagation.pathing_update_interval \
+    0.0 0.05 0.1 0.2 0.3
+```
+
+### Phase 2 — Reflection tuning (deferred — blocked on reflection-bake budget)
+
+Both sweeps below are held until: (a) Phase 1 settles the pathing-probe
+placement, and (b) one fresh reflection bake per shipping mission has
+been executed at that placement. After (b), every Phase 2 iteration
+carries those reflection bytes forward via `--skip-reflection-bake`
+(no per-iter bake cost). See PLAN §4.0 for why pathing must settle
+first.
+
+| # | Knob(s) swept                                                              | Sweep values                                            | Per-iter bake cost                              | Acceptance criterion                                                                                                |
+|---|----------------------------------------------------------------------------|---------------------------------------------------------|--------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
+| 4 | `reverb_voices` (hold `reverb_threads=8`, `conv_share=0.5`)                | {16, 24, 32}                                            | none (reflection carried forward; pathing stable) | `[PERF refl_cache] evictions/sec` flat or lower; `[PERF worker_iter] max_apply p99` not disproportionate             |
+| 5 | `reflection_throttle` × `reverb_voices_realtime` (joint sweep, ambisonics order 1) | throttle ∈ {4, 8, 16} × realtime ∈ {0, 4, 8} | none (reflection carried forward; pathing stable) | `[PERF audio] refl_sim p99 < 8 ms`; no `BUDGET_WARN`; `[BEAT] ac_freq` does NOT correlate with `simRate/throttle`    |
+
+When Phase 2 is unblocked, every iteration uses `tools/perf_sweep.sh`
+with default settings — `--skip-reflection-bake` is always passed by
+the script, and `FORCE_PATHING_BAKE` stays at its default `0` (no
+pathing re-bake — the cached pathing is the Phase 1 winner).
 
 ## Repeatable flythroughs — auto-fly probe tour
 

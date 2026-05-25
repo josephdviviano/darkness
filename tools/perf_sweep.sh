@@ -47,6 +47,17 @@
 #   AUTO_FLY_SEED        (override --auto-fly-seed; unset → binary default 0xC0FFEE)
 #   AUTO_FLY_PAUSE_SEC   (override --auto-fly-pause-sec; unset → binary default 0)
 #
+#   FORCE_PATHING_BAKE   (default: 0 — when 1, appends --force-pathing-bake so
+#                         the pathing section is re-baked every iteration. This
+#                         is the canonical "Sweep 2 Phase B mode" — slower per
+#                         iter (a fresh pathing bake costs seconds) but correct
+#                         for sweeps over pathing_probes.* knobs whose effect
+#                         only shows up in a fresh bake. Composes with
+#                         --skip-reflection-bake (always on here), so the
+#                         iteration is: load .probes → carry reflection bytes
+#                         forward → re-bake pathing → run for DURATION s.
+#                         See PLAN.AUDIO_PROFILING.md §4.3 (Sweep 2 Phase B).)
+#
 # Flags:
 #   --continue-on-error   keep going after a failing iteration (default: stop on
 #                         first non-zero exit)
@@ -127,6 +138,40 @@ AUTO_FLY_SPEED="${AUTO_FLY_SPEED:-}"
 AUTO_FLY_WAYPOINTS="${AUTO_FLY_WAYPOINTS:-}"
 AUTO_FLY_SEED="${AUTO_FLY_SEED:-}"
 AUTO_FLY_PAUSE_SEC="${AUTO_FLY_PAUSE_SEC:-}"
+
+# Force-pathing-bake (Sweep 2 Phase B). When 1, every iteration drops the
+# cached pathing section and re-bakes it fresh. Reflection bytes carry
+# forward via --skip-reflection-bake (always passed below). Only switch
+# this on for sweeps over pathing_probes.* knobs — for other sweeps
+# (e.g. reflection_throttle), the cached pathing is stable across
+# iterations and forcing a rebake just wastes time. See
+# PLAN.AUDIO_PROFILING.md §4.3.
+FORCE_PATHING_BAKE="${FORCE_PATHING_BAKE:-0}"
+
+# Phase B startup warning — alert when force-rebake is on but the knob
+# being swept isn't a pathing-probe knob. Force-rebake + non-pathing knob
+# is wasteful (every iteration pays the pathing-bake cost for zero
+# benefit) and almost always a typo / misconfiguration. Loud warning per
+# feedback_no_silent_fallbacks.
+if [ "$FORCE_PATHING_BAKE" = "1" ]; then
+    case "$KNOB" in
+        audio.pathing_probes.*)
+            echo "[SWEEP_PHASE_B] FORCE_PATHING_BAKE=1 + ${KNOB} sweep" >&2
+            echo "[SWEEP_PHASE_B] Each iteration will re-bake pathing fresh" \
+                 "(seconds) and carry reflection bytes forward." >&2
+            echo "[SWEEP_PHASE_B] This is the correct mode for pathing-probe" \
+                 "sweeps. See PLAN.AUDIO_PROFILING.md §4.3 (Sweep 2 Phase B)." >&2
+            ;;
+        *)
+            echo "[SWEEP_PHASE_B] WARN: FORCE_PATHING_BAKE=1 but sweeping" \
+                 "'${KNOB}' (not a pathing-probe knob)." >&2
+            echo "[SWEEP_PHASE_B] WARN: every iteration will pay a pathing-bake" \
+                 "cost for no benefit." >&2
+            echo "[SWEEP_PHASE_B] WARN: set FORCE_PATHING_BAKE=0 unless the knob" \
+                 "you're sweeping actually changes pathing-probe placement." >&2
+            ;;
+    esac
+fi
 
 # --- validation (fail loud, no silent fallback) -------------------------------
 
@@ -222,6 +267,15 @@ for VAL in "${VALUES[@]}"; do
         [ -n "$AUTO_FLY_PAUSE_SEC" ]  && AUTO_FLY_ARGS+=(--auto-fly-pause-sec "$AUTO_FLY_PAUSE_SEC")
     fi
 
+    # Sweep 2 Phase B: append --force-pathing-bake when FORCE_PATHING_BAKE=1.
+    # The flag composes with --skip-reflection-bake (always passed) — the
+    # iteration loads the existing .probes, carries reflection bytes
+    # forward, and re-bakes only pathing. See PLAN.AUDIO_PROFILING.md §4.3.
+    FORCE_PATHING_BAKE_ARGS=()
+    if [ "$FORCE_PATHING_BAKE" = "1" ] || [ "$FORCE_PATHING_BAKE" = "true" ]; then
+        FORCE_PATHING_BAKE_ARGS+=(--force-pathing-bake)
+    fi
+
     STDERR_TMP="$(mktemp -t perf_sweep_stderr.XXXXXX)"
     "$BIN" \
         "$MISSION" \
@@ -229,6 +283,7 @@ for VAL in "${VALUES[@]}"; do
         --schemas "$SCHEMAS" \
         --config "$CONFIG" \
         --skip-reflection-bake \
+        "${FORCE_PATHING_BAKE_ARGS[@]}" \
         --set "${KNOB}=${VAL}" \
         --perf-label "$LABEL" \
         --exit-after-seconds "$DURATION" \
