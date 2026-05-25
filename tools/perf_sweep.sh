@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# ******************************************************************************
+#
+#    This file is part of the darkness project
+#    Copyright (C) 2026 darkness project contributors
+#
+#    This program is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program; if not, see <http://www.gnu.org/licenses/>.
+#
+# ******************************************************************************
+#
+# tools/perf_sweep.sh — unattended audio-knob sweep harness.
+#
+# Loops over a list of knob values, launches `darknessRender` for each, and
+# captures the per-run JSONL artifact under ./perf/<mission>/. See
+# .claude/PLAN.AUDIO_PROFILING.md §1.4.
+#
+# Usage:
+#   tools/perf_sweep.sh <mission.mis> <knob> <val1> <val2> ...
+#
+# Example:
+#   tools/perf_sweep.sh .../MISS6.MIS audio.reflections.hybrid_transition_time \
+#       0.5 0.75 1.0 1.5
+#
+# Environment overrides:
+#   DARKNESS_BIN       (default: ./build/default/src/main/darknessRender)
+#   DARKNESS_RES       (default: /Volumes/THIEF2_INSTALL_C/THIEF2/RES)
+#   DARKNESS_SCHEMAS   (default: /Volumes/THIEF2_CD2/EDITOR/SCHEMA)
+#   DARKNESS_CONFIG    (default: ./darknessRender.yaml)
+#   DARKNESS_DURATION  (default: 60 — passed to --exit-after-seconds)
+#
+# Flags:
+#   --continue-on-error   keep going after a failing iteration (default: stop on
+#                         first non-zero exit)
+
+set -u  # error on unset vars; intentionally NOT `-e` so we can react per-run
+
+# bash, not zsh — works on macOS + Linux.
+
+print_usage() {
+    cat <<'EOF'
+Usage: tools/perf_sweep.sh [--continue-on-error] <mission.mis> <knob> <val1> [<val2> ...]
+
+Loops over knob values, launches darknessRender for each, captures
+audio_perf.jsonl under ./perf/<mission_basename>/<timestamp>__<label>/.
+
+Each iteration runs:
+  darknessRender <mission> --res <RES> --schemas <SCHEMAS>            \
+      --config <CONFIG> --skip-reflection-bake                         \
+      --set <knob>=<val> --perf-label <knob_short>_<val>               \
+      --exit-after-seconds <DURATION>
+
+Environment overrides:
+  DARKNESS_BIN       (default: ./build/default/src/main/darknessRender)
+  DARKNESS_RES       (default: /Volumes/THIEF2_INSTALL_C/THIEF2/RES)
+  DARKNESS_SCHEMAS   (default: /Volumes/THIEF2_CD2/EDITOR/SCHEMA)
+  DARKNESS_CONFIG    (default: ./darknessRender.yaml)
+  DARKNESS_DURATION  (default: 60)
+EOF
+}
+
+# --- arg parsing -------------------------------------------------------------
+
+CONTINUE_ON_ERROR=0
+POSITIONAL=()
+for arg in "$@"; do
+    case "$arg" in
+        --continue-on-error)
+            CONTINUE_ON_ERROR=1
+            ;;
+        --help|-h)
+            print_usage
+            exit 0
+            ;;
+        *)
+            POSITIONAL+=("$arg")
+            ;;
+    esac
+done
+
+if [ "${#POSITIONAL[@]}" -lt 3 ]; then
+    print_usage
+    exit 1
+fi
+
+MISSION="${POSITIONAL[0]}"
+KNOB="${POSITIONAL[1]}"
+# Remaining positionals are the values to sweep.
+VALUES=("${POSITIONAL[@]:2}")
+
+# --- env overrides + defaults -------------------------------------------------
+
+BIN="${DARKNESS_BIN:-./build/default/src/main/darknessRender}"
+RES="${DARKNESS_RES:-/Volumes/THIEF2_INSTALL_C/THIEF2/RES}"
+SCHEMAS="${DARKNESS_SCHEMAS:-/Volumes/THIEF2_CD2/EDITOR/SCHEMA}"
+CONFIG="${DARKNESS_CONFIG:-./darknessRender.yaml}"
+DURATION="${DARKNESS_DURATION:-60}"
+
+# --- validation (fail loud, no silent fallback) -------------------------------
+
+if [ ! -x "$BIN" ]; then
+    echo "[ERROR] darknessRender binary not found or not executable: $BIN" >&2
+    echo "        set DARKNESS_BIN=/abs/path or build the default preset first." >&2
+    exit 2
+fi
+if [ ! -f "$MISSION" ]; then
+    echo "[ERROR] mission file not found: $MISSION" >&2
+    exit 2
+fi
+if [ ! -d "$RES" ]; then
+    echo "[ERROR] resource dir not found: $RES" >&2
+    echo "        mount the install ISO or set DARKNESS_RES." >&2
+    exit 2
+fi
+if [ ! -d "$SCHEMAS" ]; then
+    echo "[WARN] schema dir not found: $SCHEMAS — continuing (schemas optional for some runs)" >&2
+fi
+if [ ! -f "$CONFIG" ]; then
+    echo "[WARN] config yaml not found: $CONFIG — darknessRender will fall back to defaults" >&2
+fi
+
+# --- stale-probes warning -----------------------------------------------------
+#
+# We're passing --skip-reflection-bake to avoid the ~minutes-long probe-bake
+# step every iteration. That re-uses whatever `.probes` file already exists on
+# disk. If the user has changed any pathing-probe knob since the last bake, the
+# results will be stale. Mirrors the [REFL_SKIP] semantics in commit fd61ebc.
+#
+# We don't have a robust way to detect "is the .probes file consistent with the
+# YAML we're about to load" from a shell script, so we warn unconditionally on
+# first iteration. This is intentional — the warning must be impossible to miss.
+
+MISSION_BASENAME="$(basename "$MISSION")"
+MISSION_DIR="$(dirname "$MISSION")"
+PROBES_FILE="${MISSION_DIR}/${MISSION_BASENAME%.*}.probes"
+if [ -f "$PROBES_FILE" ]; then
+    echo "[REFL_SKIP-warn] --skip-reflection-bake will reuse: $PROBES_FILE" >&2
+    echo "[REFL_SKIP-warn] if you changed pathing-probe knobs since the last bake," >&2
+    echo "[REFL_SKIP-warn] delete this file to force a re-bake on the first iteration." >&2
+else
+    echo "[REFL_SKIP-warn] no .probes file at $PROBES_FILE" >&2
+    echo "[REFL_SKIP-warn] first iteration will likely fail or take a long time;" >&2
+    echo "[REFL_SKIP-warn] run once WITHOUT --skip-reflection-bake to seed it." >&2
+fi
+
+# --- per-iteration helpers ----------------------------------------------------
+
+# Compose a short knob label for the per-run dir name.
+# Strips a leading "audio." prefix and replaces "." with "_" so paths stay sane.
+shorten_knob() {
+    local k="$1"
+    k="${k#audio.}"
+    k="${k//./_}"
+    echo "$k"
+}
+
+KNOB_SHORT="$(shorten_knob "$KNOB")"
+OUT_BASE="./perf/${MISSION_BASENAME%.*}"
+mkdir -p "$OUT_BASE"
+
+# --- main sweep loop ----------------------------------------------------------
+
+FAIL=0
+ITER=0
+for VAL in "${VALUES[@]}"; do
+    ITER=$((ITER + 1))
+    LABEL="${KNOB_SHORT}_${VAL}"
+    # UTC timestamp: 2026-05-24T12-34-56Z (colons stripped for filesystem
+    # friendliness, esp. on macOS where some tools choke on ':' in paths).
+    TS="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+    RUN_DIR="${OUT_BASE}/${TS}__${LABEL}"
+    mkdir -p "$RUN_DIR"
+
+    # AudioService writes audio_perf.jsonl to a per-run dir derived from
+    # --perf-label and the system's perf root. We pass --perf-label here; the
+    # binary (Agent A's side) is expected to land the file at
+    # ./perf/<mission>/<timestamp>__<label>/audio_perf.jsonl
+    # to match PLAN §1.2.
+
+    echo "[SWEEP] iter ${ITER}/${#VALUES[@]}: ${KNOB}=${VAL}" >&2
+    echo "[SWEEP] launching: $BIN $MISSION ... --set ${KNOB}=${VAL}" >&2
+
+    "$BIN" \
+        "$MISSION" \
+        --res "$RES" \
+        --schemas "$SCHEMAS" \
+        --config "$CONFIG" \
+        --skip-reflection-bake \
+        --set "${KNOB}=${VAL}" \
+        --perf-label "$LABEL" \
+        --exit-after-seconds "$DURATION"
+    RC=$?
+
+    JSONL_PATH="${RUN_DIR}/audio_perf.jsonl"
+    echo "[SWEEP] ${KNOB}=${VAL} → ${JSONL_PATH} (exit ${RC})"
+
+    if [ "$RC" -ne 0 ]; then
+        FAIL=1
+        if [ "$CONTINUE_ON_ERROR" -eq 0 ]; then
+            echo "[ERROR] iteration ${ITER} failed (exit ${RC}); aborting." >&2
+            echo "        pass --continue-on-error to keep going past failures." >&2
+            exit "$RC"
+        else
+            echo "[WARN] iteration ${ITER} failed (exit ${RC}); continuing." >&2
+        fi
+    fi
+done
+
+if [ "$FAIL" -ne 0 ]; then
+    echo "[SWEEP] completed with at least one failed iteration." >&2
+    exit 1
+fi
+
+echo "[SWEEP] all ${#VALUES[@]} iterations completed successfully."
+echo "[SWEEP] results under: ${OUT_BASE}/"
