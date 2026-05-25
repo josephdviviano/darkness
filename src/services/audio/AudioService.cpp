@@ -10760,6 +10760,7 @@ void AudioService::dumpAudioStatusPeriodic()
     // (not coupled to frame-rate-dependent debugTimer drift). Matches the
     // throttle pattern used by ProbeManager::pollPerfPeriodic.
     if (mReflectionBakeSkip) {
+        // NOTE: function-local static — does not reset across in-process mission reloads, so the first-fire-immediately path only triggers once per program run, not per mission.
         static std::chrono::steady_clock::time_point sLastReflSkipDump{};
         auto now = std::chrono::steady_clock::now();
         bool firstFire = (sLastReflSkipDump.time_since_epoch().count() == 0);
@@ -11562,6 +11563,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     // filled plan doesn't accumulate stale values. The reflection-pass
     // counters (floorKept etc.) are owned by ProbeManager and will be
     // filled there.
+    // NOTE: this reset assumes flow reaches the dedup-write block at line ~12206; a future early-return before that block would leave callers reading zeros silently.
     if (planCounters) {
         planCounters->dedupDroppedTotal     = 0;
         planCounters->dedupDroppedCentroids = 0;
@@ -12207,6 +12209,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 planCounters->dedupDroppedTotal      = dropped + droppedDoorPairs;
                 planCounters->dedupDroppedCentroids  = droppedCentroids;
                 planCounters->dedupDroppedDoorPairs  = droppedDoorPairs;
+                // INVARIANT: every droppedCentroids++ above sits inside an ++dropped block, so dropped >= droppedCentroids. If a future centroid-dedup path bumps droppedCentroids without ++dropped, this subtraction goes negative.
                 planCounters->dedupDroppedOther      = dropped - droppedCentroids;
             }
             params.pathingCandidates = std::move(kept);
