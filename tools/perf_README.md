@@ -86,6 +86,88 @@ By default the sweep stops on the first non-zero exit. Pass
 `--continue-on-error` to power through (handy when one knob value is
 known to crash and you want the rest of the data anyway).
 
+## How to run the pathing-probe count matrix (Sweep 2, Phase A)
+
+Sweep 2 in the table below ("`pathing_probes.dedup_radius_ft`") needs to
+be evaluated **across all levels** because Thief 2 mission geometries
+vary wildly — a dedup radius that hits the target 150-180 probe band on
+MISS6 (dense townhouses) may over-cluster MISS1 (cathedral) or
+under-cluster MISS15 (caverns). Phase A produces the
+`mission × radius → probe_count` matrix needed to pick a per-mission
+override scheme or a defensible single default.
+
+Phase A runs entirely against the headless `probe_plan` verb (Cap A from
+PLAN.PROBE_DEBUG_TOOLING.md). **No bake. No playtest.** It just runs the
+placement logic dry on every mission for every radius value and emits
+the counts.
+
+```bash
+tools/perf_probe_plan_sweep.sh
+```
+
+Default: all `*.mis` / `*.MIS` files under
+`../thief_2_service_release/rdrive/prj/thief2/levels/shipping/` ×
+radii `{5, 10, 15, 20}`. ~seconds per (mission, radius) pair.
+
+### Output
+
+```
+./perf/probe_plan/<utc_iso>/probe_count_matrix.csv
+```
+
+with columns `mission,dedup_radius_ft,pathing_probes,reflection_probes,dedup_dropped`.
+Plus a live stdout table.
+
+Quick query — which (mission, radius) combos hit the target band?
+
+```bash
+awk -F, 'NR>1 && $3+0 >= 150 && $3+0 <= 180' ./perf/probe_plan/<TS>/probe_count_matrix.csv
+```
+
+### Environment-variable overrides
+
+| Variable             | Default                                                                |
+|----------------------|------------------------------------------------------------------------|
+| `DARKNESS_HEADLESS`  | `./build/default/src/main/darknessHeadless`                            |
+| `DARKNESS_RES`       | `/Volumes/THIEF2_INSTALL_C/THIEF2/RES`                                 |
+| `DARKNESS_SCHEMAS`   | `/Volumes/THIEF2_CD2/EDITOR/SCHEMA`                                    |
+| `LEVELS_DIR`         | `../thief_2_service_release/rdrive/prj/thief2/levels/shipping`         |
+| `RADII`              | `"5 10 15 20"`                                                         |
+| `MISSIONS`           | (empty — all missions in `LEVELS_DIR`)                                 |
+
+Override examples:
+
+```bash
+# Different radii granularity
+RADII="8 10 12 14 16" tools/perf_probe_plan_sweep.sh
+
+# Just one mission
+MISSIONS="MISS6.mis" tools/perf_probe_plan_sweep.sh
+```
+
+### Phase A caveat: no door OBBs
+
+`darknessHeadless` cannot register door OBBs (renderer-only code path),
+so `DoorPair` probes are absent from the Phase A count. `darknessRender`
+(live mode) emits `DoorPair` probes for every door. The Phase A matrix
+is **a lower bound** on real pathing-probe count by however many door-
+pair probes the mission has (~roughly equal to door count). Cap A's
+`[PROBE_PLAN] WARN: no door OBBs registered ... DoorPair classification
+absent` line surfaces this on every run.
+
+### Phase B (deferred)
+
+If Phase A picks a `dedup_radius_ft` that needs the `[PERF pathing] p99`
+runtime acceptance check, that's Phase B — a live playtest per (mission,
+radius) pair with the corresponding rebake. Currently `perf_sweep.sh`
+caches the existing `.probes` file via `--skip-reflection-bake`, so it
+won't force a pathing rebake between iterations. Phase B will need
+either:
+- A `--skip-pathing-bake=false` (force-rebake) CLI flag, OR
+- An explicit `rm <mission>.probes` between sweep iterations
+
+Not implemented yet — defer until Phase A picks a candidate radius.
+
 ## How to compare two runs
 
 ```bash
