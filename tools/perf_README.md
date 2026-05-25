@@ -216,6 +216,67 @@ point per the Steam Audio Unity/Unreal reference integrations).
 matrix step before live-runs on the divergent missions. See PLAN §4.3
 for the full method.)
 
+## Repeatable flythroughs — auto-fly probe tour
+
+Without movement, the listener position is stationary and every sweep
+iteration captures the same fixed scene. Auto-fly drives the camera
+through a deterministic random tour of the N nearest pathing probes so
+load-profile-over-time is comparable across sweeps.
+
+Activates **only in fly mode** (physics off) so it doesn't fight the
+physics integrator — when `--auto-fly` is passed, `physics_mode` is
+forced false.
+
+### CLI (composes with `perf_sweep.sh`)
+
+```bash
+./build/default/src/main/darknessRender <mission.mis> \
+    --res ... --schemas ... \
+    --skip-reflection-bake \
+    --auto-fly \
+    --auto-fly-speed 10        # ft/s (default 10)         \
+    --auto-fly-waypoints 50    # N-nearest probes (default 50)  \
+    --auto-fly-seed 0xC0FFEE   # PRNG seed (default 0xC0FFEE)   \
+    --auto-fly-pause-sec 0     # seconds at each waypoint       \
+    --perf-label baseline      \
+    --exit-after-seconds 60
+```
+
+### Debug-console toggles
+
+`auto_fly` (bool), `auto_fly_speed` (0.5-50), `auto_fly_pause_sec` (0-30).
+Live-tunable during interactive testing; CLI flags are the right path
+for sweep harnesses.
+
+### Determinism
+
+The same seed + same probe set + same mission produces the same
+sequence of waypoints. So as long as you keep `--auto-fly-seed`,
+`--auto-fly-waypoints`, and the `.probes` file fixed across sweep
+iterations, perf-window N of run A and perf-window N of run B are
+sampling the same listener position to within a few feet.
+
+### Activation log
+
+On first activation:
+```
+[AUTO_FLY] activated: 50 waypoints seed=0xc0ffee speed=10.0 pause=0.0s
+```
+Per waypoint reached:
+```
+[AUTO_FLY] reached waypoint 12/50 -> next 31 at (123.4, -88.1, 5.2)
+```
+
+### Fallback
+
+If `--auto-fly` is set but the mission has no pathing probes (no
+`.probes` file or pathing batch empty):
+```
+[FALLBACK] auto-fly requested but no pathing probes loaded — disabling
+```
+Camera reverts to standard fly mode; the binary stays alive so the
+sweep iteration still captures *something* (perf data sans movement).
+
 ## Pitfall: stale `.probes`
 
 `perf_sweep.sh` passes `--skip-reflection-bake`. If you changed any
