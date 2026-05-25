@@ -64,6 +64,16 @@
 #include "audio/SchemaSamplesChunk.h"
 #include "audio/SpeechDatabase.h"
 
+// Probe-plan verb dependencies — Capability A in PLAN.PROBE_DEBUG_TOOLING.
+// The verb builds a real acoustic scene + queries AudioService for the
+// dry-run probe plan; WR + TXLIST parsing lives here (in the renderer
+// today) so the headless build doesn't pull src/main into DarknessServices.
+#include "audio/AudioService.h"
+#include "audio/AcousticMaterials.h"
+#include "audio/ProbeManager.h"
+#include "WRChunkParser.h"
+#include "TXListParser.h"
+
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -181,6 +191,10 @@ static void initServices() {
     svcMgr->registerFactory<RoomServiceFactory>();
     svcMgr->registerFactory<SimServiceFactory>();
     svcMgr->registerFactory<PhysicsServiceFactory>();
+    // AudioServiceFactory is lazy — registering it here costs nothing
+    // for verbs that don't query AudioService, and `probe_plan` needs
+    // it to be available via GET_SERVICE.
+    svcMgr->registerFactory<AudioServiceFactory>();
 
     svcMgr->bootstrapFinished();
 }
@@ -1225,6 +1239,296 @@ static void printAllLinks() {
     std::cout << count << " relation types" << std::endl;
 }
 
+// ---------- probe_plan verb (Capability A in PLAN.PROBE_DEBUG_TOOLING) ----------
+//
+// Dry-run AudioService::bakeProbes' Darkness-side placement passes and
+// print exact per-purpose probe counts WITHOUT invoking Steam Audio's
+// multi-minute reflection/pathing bake. Used to iterate on probe
+// placement reductions safely — see the .probes file check below for
+// the CI-friendly diff-then-bake workflow.
+//
+// Acoustic-scene construction (WR / TXLIST parsing + buildAcousticScene)
+// happens here in the headless side because adding WRChunkParser to
+// DarknessServices would cross src/main → src/services include
+// boundaries; the renderer (DarknessRender) is the only other caller
+// and uses an inline copy for the same reason. Door OBB registration
+// requires DoorSystem, which lives in the renderer init flow and is
+// not replicated here — the [PROBE_PLAN] WARN banner emitted by
+// AudioService::computeProbePlan surfaces this gap.
+
+static bool buildAcousticSceneFromMissionFile(
+    Darkness::AudioServicePtr audioSvc,
+    const std::string &misPath)
+{
+    Darkness::WRParsedData wr;
+    try {
+        wr = Darkness::parseWRChunk(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr,
+            "[PROBE_PLAN] failed to parse WR chunk in '%s': %s\n",
+            misPath.c_str(), e.what());
+        return false;
+    }
+
+    Darkness::TXList txList;
+    try {
+        txList = Darkness::parseTXList(misPath);
+    } catch (const std::exception &e) {
+        // TXList parse failure is non-fatal — material lookup falls back
+        // to "generic" everywhere. Probe counts are unaffected because
+        // material keywords drive IR coloration, not placement.
+        std::fprintf(stderr,
+            "[PROBE_PLAN] TXLIST parse failed (%s) — proceeding with "
+            "'generic' materials\n", e.what());
+        txList = Darkness::TXList{};
+    }
+
+    Darkness::AcousticSceneData fullScene;
+
+    // Vertex dedup hash — same quantization as DarknessRender.cpp's
+    // acoustic-scene assembly to keep the IPLScene byte-identical.
+    struct VertKey {
+        int32_t x, y, z;
+        bool operator==(const VertKey &o) const {
+            return x == o.x && y == o.y && z == o.z;
+        }
+    };
+    struct VertKeyHash {
+        size_t operator()(const VertKey &k) const {
+            size_t h = 0x811c9dc5u;
+            h ^= static_cast<size_t>(k.x); h *= 0x01000193u;
+            h ^= static_cast<size_t>(k.y); h *= 0x01000193u;
+            h ^= static_cast<size_t>(k.z); h *= 0x01000193u;
+            return h;
+        }
+    };
+    std::unordered_map<VertKey, uint32_t, VertKeyHash> vertexMap;
+    vertexMap.reserve(wr.numCells * 20);
+
+    auto getVertexIndex = [&](float x, float y, float z) -> uint32_t {
+        VertKey key{static_cast<int32_t>(std::round(x * 100.0f)),
+                    static_cast<int32_t>(std::round(y * 100.0f)),
+                    static_cast<int32_t>(std::round(z * 100.0f))};
+        auto it = vertexMap.find(key);
+        if (it != vertexMap.end()) return it->second;
+        uint32_t idx = static_cast<uint32_t>(fullScene.vertices.size() / 3);
+        fullScene.vertices.push_back(x);
+        fullScene.vertices.push_back(y);
+        fullScene.vertices.push_back(z);
+        vertexMap[key] = idx;
+        return idx;
+    };
+
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        const auto &cell = wr.cells[ci];
+        int numSolid = cell.numPolygons - cell.numPortals;
+        for (int pi = 0; pi < cell.numPolygons; ++pi) {
+            const auto &poly = cell.polygons[pi];
+            bool isPortal = (pi >= numSolid);
+            // Skip BSP-split phantom portals (see DarknessRender.cpp
+            // comment for the full rationale; they'd otherwise produce
+            // phantom reflections / blocked probe-to-probe visibility
+            // rays).
+            bool isNonRenderedPortal = isPortal && (pi >= cell.numTextured);
+            if (isNonRenderedPortal) continue;
+            if (!isPortal && pi < cell.numTextured && cell.texturing[pi].txt == 249)
+                continue;
+            if (!isPortal && pi < cell.numTextured) {
+                uint8_t txtIdx = cell.texturing[pi].txt;
+                if (txtIdx >= 247) continue;  // WATERIN / WATEROUT / BACKHACK
+            }
+            std::string texName = "generic";
+            if (isPortal) {
+                texName = "_portal";
+            } else if (pi < cell.numTextured) {
+                uint8_t txtIdx = cell.texturing[pi].txt;
+                if (txtIdx < txList.textures.size()) {
+                    const auto &entry = txList.textures[txtIdx];
+                    if (!entry.fullPath.empty()) texName = entry.fullPath;
+                }
+            }
+            if (poly.count < 3) continue;
+            std::vector<uint32_t> polyVerts(poly.count);
+            for (int vi = 0; vi < poly.count; ++vi) {
+                uint8_t idx = cell.polyIndices[pi][vi];
+                const auto &v = cell.vertices[idx];
+                polyVerts[vi] = getVertexIndex(v.x, v.y, v.z);
+            }
+            for (int t = 1; t < poly.count - 1; ++t) {
+                fullScene.indices.push_back(static_cast<int32_t>(polyVerts[0]));
+                fullScene.indices.push_back(static_cast<int32_t>(polyVerts[t + 1]));
+                fullScene.indices.push_back(static_cast<int32_t>(polyVerts[t]));
+                fullScene.texNames.push_back(texName);
+            }
+        }
+    }
+
+    size_t numTris = fullScene.indices.size() / 3;
+    std::fprintf(stderr,
+                 "[PROBE_PLAN] Acoustic mesh: %zu vertices, %zu triangles (%u cells)\n",
+                 fullScene.vertices.size() / 3, numTris, wr.numCells);
+
+    // Push the per-texture material keyword table (TXLIST → keyword)
+    // BEFORE buildAcousticScene so the AudioService materials lookup
+    // sees them at scene assembly time.
+    {
+        size_t numTex = txList.textures.size();
+        std::vector<std::string> materials(numTex);
+        for (size_t i = 0; i < numTex; ++i) {
+            const auto &entry = txList.textures[i];
+            if (!entry.fullPath.empty()) {
+                materials[i] = Darkness::lookupAcousticMaterialKeyword(entry.fullPath);
+            } else {
+                materials[i] = "generic";
+            }
+        }
+        audioSvc->setTextureMaterials(std::move(materials));
+    }
+
+    return audioSvc->buildAcousticScene(fullScene);
+}
+
+static int runProbePlanVerb(const std::string &misPath,
+                             const std::string &resPath,
+                             const std::string &schemasPath,
+                             const std::string &scriptsDir)
+{
+    (void)resPath;       // currently unused — TXLIST lives in the .mis itself,
+                         // not in fam.crf. Kept for forward-compat / consistency
+                         // with darknessRender's flag set.
+    (void)schemasPath;   // sound schemas not consulted by probe placement;
+                         // accept the flag so users can paste the
+                         // darknessRender invocation verbatim.
+
+    // Banner — emit BEFORE any heavy work so the user sees the
+    // commitment up-front. Repeated at end per feedback_no_silent_fallbacks.
+    std::fprintf(stdout, "[PROBE_PLAN] DRY-RUN — no .probes file written\n");
+
+    // Refuse to overwrite an existing .probes from this verb. The verb
+    // never writes one (DRY-RUN banner), but if the user expected to
+    // see a file, the banner below tells them where the existing one
+    // lives so CI scripts can `diff` against the existing bake.
+    {
+        std::string existingProbe =
+            Darkness::AudioService::getProbeFilePath(misPath);
+        FILE *f = std::fopen(existingProbe.c_str(), "rb");
+        if (f) {
+            std::fclose(f);
+            std::fprintf(stdout,
+                "[PROBE_PLAN] existing .probes at '%s' (left untouched — "
+                "this verb never writes)\n",
+                existingProbe.c_str());
+        }
+    }
+
+    initServices();
+    loadSchema(scriptsDir);
+    (void)GET_SERVICE(RoomService);
+    loadDatabase(misPath);
+
+    Darkness::AudioServicePtr audioSvc = GET_SERVICE(Darkness::AudioService);
+    if (!audioSvc) {
+        std::fprintf(stderr, "[PROBE_PLAN] AudioService not available\n");
+        return 1;
+    }
+
+    if (!buildAcousticSceneFromMissionFile(audioSvc, misPath)) {
+        std::fprintf(stderr,
+            "[PROBE_PLAN] failed to build acoustic scene from '%s'\n",
+            misPath.c_str());
+        return 1;
+    }
+
+    Darkness::ProbeBakePlan plan;
+    if (!audioSvc->computeProbePlan(plan)) {
+        std::fprintf(stderr,
+            "[PROBE_PLAN] computeProbePlan failed\n");
+        return 1;
+    }
+
+    // ── Output (machine-greppable, order locked by PLAN.PROBE_DEBUG_TOOLING) ──
+
+    // Mission name (basename only — keeps the line stable across cwd
+    // changes and disk-image mounts).
+    std::string missionName = misPath;
+    {
+        size_t slash = missionName.find_last_of("/\\");
+        if (slash != std::string::npos) missionName = missionName.substr(slash + 1);
+    }
+    std::fprintf(stdout, "[PROBE_PLAN] mission=%s\n", missionName.c_str());
+
+    // Reflection counts. `globalDeduped` is the dropped count; the
+    // total is the survivors (`reflectionPositions.size()`).
+    int reflTotal = static_cast<int>(plan.reflectionPositions.size());
+    // emitterKept is the count actually added by the emitter pass
+    // (after the pass's own dedup against earlier passes). We can't
+    // recover the floor/elev/emitter split from positions.size() alone
+    // because the global dedup mixes them — report the per-pass
+    // counts (pre-globalDedup) and the final globalDeduped drop.
+    std::fprintf(stdout,
+        "[PROBE_PLAN] reflections: floor=%d elevation=%d emitter=%d "
+        "globalDeduped=%d total=%d\n",
+        plan.floorKept, plan.elevationKept, plan.emitterKept,
+        plan.globalDeduped, reflTotal);
+
+    // Pathing per-purpose counts (post-dedup, pre-adaptive-radius).
+    auto getPurpose = [&](Darkness::PathingProbePurpose p) -> int {
+        auto it = plan.pathingPerPurpose.find(p);
+        return (it != plan.pathingPerPurpose.end()) ? it->second : 0;
+    };
+    int postDedup = static_cast<int>(plan.pathingKept.size());
+    std::fprintf(stdout,
+        "[PROBE_PLAN] pathing: Portal=%d DoorPair=%d Centroid=%d "
+        "Emitter=%d  postDedup=%d\n",
+        getPurpose(Darkness::PathingProbePurpose::Portal),
+        getPurpose(Darkness::PathingProbePurpose::DoorPair),
+        getPurpose(Darkness::PathingProbePurpose::Centroid),
+        getPurpose(Darkness::PathingProbePurpose::Emitter),
+        postDedup);
+
+    std::fprintf(stdout,
+        "[PROBE_PLAN] pathing dedup_dropped: %d (centroids=%d "
+        "doorPairs=%d other=%d)\n",
+        plan.dedupDroppedTotal, plan.dedupDroppedCentroids,
+        plan.dedupDroppedDoorPairs, plan.dedupDroppedOther);
+
+    // Distance histogram: for each probe (across both batches) compute
+    // distance to nearest OTHER probe, bucket. Lets the user spot
+    // coverage holes (lots of >=20 ft probes) or wasteful clustering
+    // (lots of <2 ft probes). O(N²) but only ~2000 probes × 2000 ≈ 4M
+    // ops — milliseconds.
+    {
+        std::vector<Darkness::Vector3> all;
+        all.reserve(plan.reflectionPositions.size() + plan.pathingKept.size());
+        for (const auto &p : plan.reflectionPositions) all.push_back(p);
+        for (const auto &k : plan.pathingKept)         all.push_back(k.position);
+
+        int b2 = 0, b5 = 0, b10 = 0, b20 = 0, bMax = 0;
+        for (size_t i = 0; i < all.size(); ++i) {
+            float bestSq = std::numeric_limits<float>::max();
+            for (size_t j = 0; j < all.size(); ++j) {
+                if (i == j) continue;
+                Darkness::Vector3 d = all[i] - all[j];
+                float dsq = d.x*d.x + d.y*d.y + d.z*d.z;
+                if (dsq < bestSq) bestSq = dsq;
+            }
+            float dist = std::sqrt(bestSq);
+            if      (dist <  2.0f) ++b2;
+            else if (dist <  5.0f) ++b5;
+            else if (dist < 10.0f) ++b10;
+            else if (dist < 20.0f) ++b20;
+            else                    ++bMax;
+        }
+        std::fprintf(stdout,
+            "[PROBE_PLAN] distance histogram (probe-to-nearest, ft): "
+            "<2:%d  <5:%d  <10:%d  <20:%d  >=20:%d\n",
+            b2, b5, b10, b20, bMax);
+    }
+
+    std::fprintf(stdout, "[PROBE_PLAN] DRY-RUN — no .probes file written\n");
+    return 0;
+}
+
 // ---------- Usage ----------
 
 static void printUsage(const char *prog) {
@@ -1253,9 +1557,18 @@ static void printUsage(const char *prog) {
     std::cerr << "  prop-dump <name>  Dump every record of a named property (e.g. SchPlayPa," << std::endl;
     std::cerr << "                    SpotAmb, PrjSound, AmbientHa)." << std::endl;
     std::cerr << "  ambients          List every P$AmbientHa emitter with schema + position." << std::endl;
+    std::cerr << "  probe_plan        Dry-run the audio probe placement passes for this mission" << std::endl;
+    std::cerr << "                    and print per-purpose probe counts WITHOUT invoking the" << std::endl;
+    std::cerr << "                    Steam Audio bake. Useful for iterating on probe placement" << std::endl;
+    std::cerr << "                    reductions. Accepts --res / --schemas (same as darknessRender);" << std::endl;
+    std::cerr << "                    no .probes file is ever written." << std::endl;
     std::cerr << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --scripts <path>  Path to schema scripts directory (default: scripts/thief2)" << std::endl;
+    std::cerr << "  --res <path>      Thief 2 RES directory (snd.crf, fam.crf, obj.crf)." << std::endl;
+    std::cerr << "                    Currently unused by probe_plan but accepted for compatibility" << std::endl;
+    std::cerr << "                    with darknessRender invocations." << std::endl;
+    std::cerr << "  --schemas <path>  Sound schemas directory. Same compat note as --res." << std::endl;
 }
 
 // ---------- Main ----------
@@ -1266,15 +1579,25 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Parse --scripts option from anywhere in argv
+    // Parse --scripts / --res / --schemas options from anywhere in argv.
+    // --res and --schemas are accepted (and currently ignored by every
+    // verb except probe_plan) so users can paste a darknessRender
+    // invocation verbatim without arg surgery.
     std::string scriptsDir = "scripts/thief2";
+    std::string resPath;
+    std::string schemasPath;
     std::vector<std::string> positionalArgs;
 
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--scripts" && i + 1 < argc) {
+        std::string a = argv[i];
+        if (a == "--scripts" && i + 1 < argc) {
             scriptsDir = argv[++i];
+        } else if (a == "--res" && i + 1 < argc) {
+            resPath = argv[++i];
+        } else if (a == "--schemas" && i + 1 < argc) {
+            schemasPath = argv[++i];
         } else {
-            positionalArgs.push_back(argv[i]);
+            positionalArgs.push_back(a);
         }
     }
 
@@ -1297,7 +1620,8 @@ int main(int argc, char *argv[]) {
                           command == "room-info" ||
                           command == "ambients" ||
                           command == "prop-dump" ||
-                          command == "sound-desc");
+                          command == "sound-desc" ||
+                          command == "probe_plan");
 
     if (needsServices) {
         logger.registerLogListener(&stdlog);
@@ -1381,6 +1705,12 @@ int main(int argc, char *argv[]) {
                 printRoomInfo(std::stoi(positionalArgs[i]));
                 if (i + 1 < positionalArgs.size()) std::cout << std::endl;
             }
+        } else if (command == "probe_plan") {
+            // probe_plan handles its own initServices / loadSchema /
+            // loadDatabase since it needs to interleave them with
+            // acoustic-scene construction before the dry-run plan
+            // computation. Returns 0 on success, 1 on failure.
+            return runProbePlanVerb(dbFile, resPath, schemasPath, scriptsDir);
         } else if (command == "trace-path") {
             if (positionalArgs.size() < 4) {
                 std::cerr << "trace-path: need <srcRoomID> <dstRoomID> [maxDist]\n";

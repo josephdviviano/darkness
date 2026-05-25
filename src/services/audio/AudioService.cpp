@@ -11340,19 +11340,25 @@ AudioService::getPathingProbeViz() const
     return out;
 }
 
-bool AudioService::bakeProbes(const std::string &outputPath,
-                               std::atomic<float> *progress,
-                               float spacing, float height)
+void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
+                                          ProbeBakePlan *planCounters,
+                                          float spacing, float height)
 {
-    if (!mProbeManager || !mIplScene) {
-        LOG_ERROR("AudioService: cannot bake probes — no acoustic scene");
-        return false;
+    // Reset the dedup counters up-front so a caller passing a partially-
+    // filled plan doesn't accumulate stale values. The reflection-pass
+    // counters (floorKept etc.) are owned by ProbeManager and will be
+    // filled there.
+    if (planCounters) {
+        planCounters->dedupDroppedTotal     = 0;
+        planCounters->dedupDroppedCentroids = 0;
+        planCounters->dedupDroppedDoorPairs = 0;
+        planCounters->dedupDroppedOther     = 0;
     }
 
     // Snapshot the bake-time tuning into ProbeBakeParams. The override
     // sentinels (negative) are forwarded so ProbeManager falls back to its
     // own configured spacing/height.
-    ProbeBakeParams params;
+    params = ProbeBakeParams{};
     params.sceneMin              = mSceneMin;
     params.sceneMax              = mSceneMax;
     params.propagationMaxDist    = mPropagationMaxDist;
@@ -11975,6 +11981,15 @@ bool AudioService::bakeProbes(const std::string &outputPath,
                     "dedup_radius_ft or add an explicit centroid probe.\n",
                     droppedCentroids);
             }
+            // Surface dedup counters to the dry-run probe_plan verb.
+            // "Other" = total non-DoorPair drops minus the centroid
+            // subset, so the three buckets sum to (total - DoorPair).
+            if (planCounters) {
+                planCounters->dedupDroppedTotal      = dropped + droppedDoorPairs;
+                planCounters->dedupDroppedCentroids  = droppedCentroids;
+                planCounters->dedupDroppedDoorPairs  = droppedDoorPairs;
+                planCounters->dedupDroppedOther      = dropped - droppedCentroids;
+            }
             params.pathingCandidates = std::move(kept);
         }
 
@@ -12354,6 +12369,25 @@ bool AudioService::bakeProbes(const std::string &outputPath,
             };
     }
 
+    // prepareProbeBakeParams ends here. The IPL bake invocation lives
+    // in `bakeProbes` (live bake) and `computeProbePlan` (dry-run plan)
+    // below — both call this helper first so they share an identical
+    // params-building code path.
+}
+
+//------------------------------------------------------
+bool AudioService::bakeProbes(const std::string &outputPath,
+                              std::atomic<float> *progress,
+                              float spacing, float height)
+{
+    if (!mProbeManager || !mIplScene) {
+        LOG_ERROR("AudioService: cannot bake probes — no acoustic scene");
+        return false;
+    }
+
+    ProbeBakeParams params;
+    prepareProbeBakeParams(params, /*planCounters*/ nullptr, spacing, height);
+
     bool ok = mProbeManager->bakeProbes(mIplScene, outputPath, params, progress);
     if (ok) {
         // Classify the freshly-baked probes so the overlay can show
@@ -12365,6 +12399,42 @@ bool AudioService::bakeProbes(const std::string &outputPath,
         classifyProbeReachability();
     }
     return ok;
+}
+
+//------------------------------------------------------
+bool AudioService::computeProbePlan(ProbeBakePlan &out)
+{
+    if (!mProbeManager || !mIplScene) {
+        LOG_ERROR("AudioService::computeProbePlan: no acoustic scene");
+        return false;
+    }
+
+    // Reset before the run — prepareProbeBakeParams' dedup counters
+    // and ProbeManager::computeBakePlan's placement counters both
+    // write into the same struct, so a clean slate avoids stale
+    // values from a prior dry-run on the same plan instance.
+    out = ProbeBakePlan{};
+
+    if (mDoorAudioInstances.empty()) {
+        // Headless probe_plan typically can't register door OBBs
+        // (DoorSystem lives in the renderer init flow). Without door
+        // OBBs registered the AudioService door-portal classifier
+        // emits every portal as a single Portal probe instead of
+        // splitting it into a DoorPair, so per-purpose counts here
+        // will be skewed toward Portal and away from DoorPair.
+        // Surface this loudly so a user reading the verb output
+        // doesn't conclude a real bake will produce these counts.
+        std::fprintf(stderr,
+            "[PROBE_PLAN] WARN: no door OBBs registered — DoorPair "
+            "classification absent, every door portal will be counted "
+            "as Portal. Run from a context that calls "
+            "registerDoorGeometry to get accurate door splits.\n");
+    }
+
+    ProbeBakeParams params;
+    prepareProbeBakeParams(params, &out, /*spacing*/ -1.0f, /*height*/ -1.0f);
+
+    return mProbeManager->computeBakePlan(mIplScene, params, out);
 }
 
 
