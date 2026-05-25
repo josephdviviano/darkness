@@ -1033,7 +1033,9 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         std::vector<ProbeBatchRecord> existing;
         ProbeFileStatus st = loadProbeFile(outputPath, hdr, existing);
         if (st != ProbeFileStatus::Ok) {
-            AUDIO_LOG(
+            // Direct stderr, NOT AUDIO_LOG — per feedback_no_silent_fallbacks
+            // a hard-fail must always be visible, not gated on --audio-log.
+            std::fprintf(stderr,
                 "[FALLBACK] bakeProbes: bakeReflectionBatch=false but existing "
                 "probe file '%s' could not be loaded (%s) — refusing to "
                 "produce a pathing-only file without prior reflection data. "
@@ -1049,7 +1051,9 @@ bool ProbeManager::bakeProbes(IPLScene scene,
             }
         }
         if (!haveCarriedRefl) {
-            AUDIO_LOG(
+            // Direct stderr, NOT AUDIO_LOG — per feedback_no_silent_fallbacks
+            // a hard-fail must always be visible, not gated on --audio-log.
+            std::fprintf(stderr,
                 "[FALLBACK] bakeProbes: bakeReflectionBatch=false but existing "
                 "probe file '%s' has no reflection section — refusing to "
                 "produce a pathing-only file. Re-bake with reflection baking "
@@ -1389,24 +1393,28 @@ void ProbeManager::releaseBatches(IPLSimulator reflectionSimulator,
 // specific voice. The adjacency is computed by Darkness using the
 // same raycast algorithm Steam Audio's pathing baker uses
 // (IPLPathBakeParams::visRange + IPLPathBakeParams::numSamples,
-// `phonon.h` ~lines 3563-3584). Same algorithm, same inputs, same
-// edges, modulo raycast-precision noise. Layer-2 coloring (done in
-// the renderer / AudioService::getPathingEdgeViz) is a
-// neighborhood-activity heatmap: "voices near this edge's endpoints
-// are perceiving the listener with this EQ quality." It does NOT
-// enumerate Steam Audio's actual visited-probe set per voice — the
-// public C API does not expose that data, and inferring it via BFS
-// was rejected (PLAN.PROBE_DEBUG_TOOLING.md, Capability C) due to
-// divergence risk.
+// `phonon.h` ~lines 3563-3584). PARTIAL match — the visRange distance
+// gate matches exactly, but the visibility test itself does NOT.
 //
-// Reproduction fidelity: Steam Audio scatters `numSamples`² rays
-// inside a `visRadius` sphere around each probe (path_visibility.cpp
-// in the steam-audio submodule) and counts a pair visible if the
-// fraction of unblocked rays meets `visThreshold`. We cast a single
-// center-to-center ray per pair — sufficient for the
-// neighborhood-activity heatmap; if any future overlay needs
-// bit-exact agreement with Steam Audio's bake, refactor this to
-// drive `numVisSamples`² rays per pair.
+// Steam Audio scatters `numSamples`² rays inside a `visRadius` sphere
+// around each probe (path_visibility.cpp) and counts a pair visible
+// if the fraction of unblocked rays meets `visThreshold`. Darkness's
+// adjacency runs ONE center-to-center ray per pair — Steam Audio's
+// degenerate `numSamples=1, radius=0` fast path (path_visibility.cpp:
+// ~88-90). Expect occasional false-positive edges (thin walls between
+// probe centers that Steam Audio would catch with sphere sampling)
+// and false-negative edges (tight clearances around centers that
+// Steam Audio averages out). Acceptable for a neighborhood-activity
+// heatmap; would need to be promoted to numSamples² raycasts (~16× the
+// O(N²) cost) for bit-exact agreement with the bake.
+//
+// Layer-2 coloring (done in the renderer / AudioService::
+// getPathingEdgeViz) is a neighborhood-activity heatmap: "voices near
+// this edge's endpoints are perceiving the listener with this EQ
+// quality." It does NOT enumerate Steam Audio's actual visited-probe
+// set per voice — the public C API does not expose that data, and
+// inferring it via BFS was rejected (PLAN.PROBE_DEBUG_TOOLING.md,
+// Capability C) due to divergence risk.
 void ProbeManager::buildPathingAdjacency(
     float visRangeFt,
     int   numVisSamples,
@@ -1477,9 +1485,13 @@ void ProbeManager::buildPathingAdjacency(
     // Single-line diagnostic that lets future debugging cross-check
     // edge count against Steam Audio's reported bake count (if a future
     // patch exposes it). Edge count is the principal cross-check.
+    // numVisSamples reported as `requested=N (actually 1 center ray)`
+    // so the log doesn't pretend we used Steam Audio's full
+    // sphere-sample protocol. See comment block above.
     std::fprintf(stderr,
         "[ADJACENCY_BUILD] %d probes, %d edges, %d range-rejects, "
-        "%.1f ms (visRange=%.1f ft, numVisSamples=%d)\n",
+        "%.1f ms (visRange=%.1f ft, numVisSamples=requested=%d "
+        "actually=1 center ray)\n",
         N, edges, rangeRejects, ms, visRangeFt, numVisSamples);
 }
 

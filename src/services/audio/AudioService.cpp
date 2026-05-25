@@ -10767,7 +10767,11 @@ void AudioService::dumpAudioStatusPeriodic()
             std::chrono::duration<double>(now - sLastReflSkipDump).count() >= 30.0)
         {
             sLastReflSkipDump = now;
-            AUDIO_LOG(
+            // Direct stderr, NOT AUDIO_LOG — per feedback_no_silent_fallbacks
+            // a stale-reflection reminder must always be visible, not gated
+            // on --audio-log. The whole point is that the user can't lose
+            // track of the carry-forward state.
+            std::fprintf(stderr,
                 "[REFL_SKIP] reflections section is stale "
                 "(carried over from prior bake)\n");
         }
@@ -11408,14 +11412,26 @@ void AudioService::rebuildPathingAdjacency()
         };
     }
 
-    // visRange/numVisSamples MUST match the bake parameters in
-    // ProbeManager::bakePathingBatch — we are reproducing the same
-    // algorithm with the same inputs so the edge set agrees.
-    // ProbeManager's bake uses scene-derived visRange (×1.5 of the
-    // AABB diagonal, capped at 5000 ft) and `numSamples=4`. We use the
-    // current scene AABB the same way; if the user changed propagation
-    // tuning since the bake, the adjacency may drift slightly from the
-    // serialized graph, which is acceptable for a debug heatmap.
+    // PARTIAL match with bake-time visibility test. The `visRange`
+    // distance gate matches `ProbeManager::bakePathingBatch` exactly
+    // (scene-derived ×1.5 of the AABB diagonal, capped at 5000 ft).
+    //
+    // The visibility test itself does NOT match: Steam Audio's
+    // `iplPathBakerBake` runs `numSamples²` rays per probe pair through
+    // spheres of `kPathingVisRadiusFt` with a threshold fraction
+    // (see vcpkg/.../path_visibility.cpp). Darkness's adjacency build
+    // runs ONE center-to-center ray per pair — Steam Audio's degenerate
+    // `numSamples=1, radius=0` fast path. This is intentional: the
+    // visualization is a neighborhood-activity heatmap, not a perfect
+    // reproduction. Expect occasional false-positive edges (thin walls
+    // between probe centers that Steam Audio would have caught with
+    // sphere sampling) and false-negative edges (tight clearances
+    // around centers that Steam Audio averages out).
+    //
+    // `kNumVisSamples` is passed for documentation only — the adjacency
+    // builder currently ignores it. Increasing it to do real
+    // sphere-sample raycasts would multiply the O(N²) cost by ~16×
+    // (numSamples²) — feasible for debug if needed later.
     const Vector3 span = mSceneMax - mSceneMin;
     const float diag = std::sqrt(span.x*span.x + span.y*span.y + span.z*span.z);
     constexpr float kMargin   = 1.5f;
@@ -11423,7 +11439,7 @@ void AudioService::rebuildPathingAdjacency()
     const float visRangeFt = std::min(
         std::max(diag * kMargin, mPropagationMaxDist * kMargin),
         kCeilFt);
-    constexpr int kNumVisSamples = 4;
+    constexpr int kNumVisSamples = 4;  // doc only — see comment above
 
     mProbeManager->buildPathingAdjacency(visRangeFt, kNumVisSamples, ray);
 }
