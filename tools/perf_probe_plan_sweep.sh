@@ -89,7 +89,7 @@ OUT_DIR="./perf/probe_plan/${TS}"
 mkdir -p "$OUT_DIR"
 CSV="${OUT_DIR}/probe_count_matrix.csv"
 
-echo "mission,dedup_radius_ft,pathing_probes,reflection_probes,dedup_dropped" > "$CSV"
+echo "mission,dedup_radius_ft,pathing_probes,reflection_probes,dedup_dropped,density_avg_30ft,density_p95_30ft,density_max_30ft,edges_30ft" > "$CSV"
 
 echo "[SWEEP] missions: ${#MISSION_FILES[@]}, radii: $RADII"
 echo "[SWEEP] output:   $CSV"
@@ -107,19 +107,27 @@ echo
 #   [PROBE_PLAN] pathing dedup_dropped: N (centroids=N doorPairs=N other=N)
 parse_probe_plan() {
     local input="$1"
-    local refl pathing dropped
+    local refl pathing dropped dline davg dp95 dmax dedges
     refl="$(echo "$input" | grep -E '^\[PROBE_PLAN\] reflections:' | sed -E 's/.*total=([0-9]+).*/\1/')"
     pathing="$(echo "$input" | grep -E '^\[PROBE_PLAN\] pathing:' | sed -E 's/.*postDedup=([0-9]+).*/\1/')"
     dropped="$(echo "$input" | grep -E '^\[PROBE_PLAN\] pathing dedup_dropped:' | sed -E 's/.*dedup_dropped: ([0-9]+).*/\1/')"
-    echo "${refl:-NA},${pathing:-NA},${dropped:-NA}"
+    # Density line: [PROBE_PLAN] pathing density (within 30 ft): avg=X.X p50=N p95=N max=N edges=N
+    dline="$(echo "$input" | grep -E '^\[PROBE_PLAN\] pathing density')"
+    davg="$(echo "$dline"   | sed -E 's/.*avg=([0-9.]+).*/\1/')"
+    dp95="$(echo "$dline"   | sed -E 's/.*p95=([0-9]+).*/\1/')"
+    dmax="$(echo "$dline"   | sed -E 's/.*max=([0-9]+).*/\1/')"
+    dedges="$(echo "$dline" | sed -E 's/.*edges=([0-9]+).*/\1/')"
+    echo "${refl:-NA},${pathing:-NA},${dropped:-NA},${davg:-NA},${dp95:-NA},${dmax:-NA},${dedges:-NA}"
 }
 
 TOTAL_RUNS=$((${#MISSION_FILES[@]} * $(echo "$RADII" | wc -w)))
 RUN=0
 
 # Stdout summary header
-printf "%-20s %-8s  %10s  %10s  %10s\n" "mission" "radius" "pathing" "reflection" "dedup_drop"
-printf "%-20s %-8s  %10s  %10s  %10s\n" "-------" "------" "-------" "----------" "----------"
+printf "%-20s %-7s %8s %8s %8s | %8s %6s %6s %8s\n" \
+    "mission" "radius" "pathing" "refl" "dedupDrp" "avgDeg" "p95" "max" "edges"
+printf "%-20s %-7s %8s %8s %8s | %8s %6s %6s %8s\n" \
+    "-------" "------" "-------" "----" "--------" "------" "---" "---" "-----"
 
 for MISSION_PATH in "${MISSION_FILES[@]}"; do
     MISSION_BASENAME="$(basename "$MISSION_PATH")"
@@ -138,14 +146,17 @@ for MISSION_PATH in "${MISSION_FILES[@]}"; do
         RC=$?
         if [ "$RC" -ne 0 ]; then
             echo "[WARN] iter ${RUN}/${TOTAL_RUNS} ${MISSION_BASENAME} r=${R}: exit ${RC}" >&2
-            echo "${MISSION_BASENAME},${R},ERROR,ERROR,ERROR" >> "$CSV"
-            printf "%-20s %-8s  %10s  %10s  %10s\n" "$MISSION_BASENAME" "$R" "ERR" "ERR" "ERR"
+            echo "${MISSION_BASENAME},${R},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR" >> "$CSV"
+            printf "%-20s %-7s %8s %8s %8s | %8s %6s %6s %8s\n" \
+                "$MISSION_BASENAME" "$R" "ERR" "ERR" "ERR" "ERR" "ERR" "ERR" "ERR"
             continue
         fi
         PARSED="$(parse_probe_plan "$OUTPUT")"
-        IFS=',' read -r REFL PATHING DROPPED <<< "$PARSED"
-        echo "${MISSION_BASENAME},${R},${PATHING},${REFL},${DROPPED}" >> "$CSV"
-        printf "%-20s %-8s  %10s  %10s  %10s\n" "$MISSION_BASENAME" "$R" "$PATHING" "$REFL" "$DROPPED"
+        IFS=',' read -r REFL PATHING DROPPED DAVG DP95 DMAX DEDGES <<< "$PARSED"
+        echo "${MISSION_BASENAME},${R},${PATHING},${REFL},${DROPPED},${DAVG},${DP95},${DMAX},${DEDGES}" >> "$CSV"
+        printf "%-20s %-7s %8s %8s %8s | %8s %6s %6s %8s\n" \
+            "$MISSION_BASENAME" "$R" "$PATHING" "$REFL" "$DROPPED" \
+            "$DAVG" "$DP95" "$DMAX" "$DEDGES"
     done
 done
 
