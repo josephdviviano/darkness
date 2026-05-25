@@ -74,11 +74,21 @@ tools/perf_sweep.sh \
 
 | Variable             | Default                                          |
 |----------------------|--------------------------------------------------|
-| `DARKNESS_BIN`       | `./build/default/src/main/darknessRender`        |
-| `DARKNESS_RES`       | `/Volumes/THIEF2_INSTALL_C/THIEF2/RES`           |
-| `DARKNESS_SCHEMAS`   | `/Volumes/THIEF2_CD2/EDITOR/SCHEMA`              |
-| `DARKNESS_CONFIG`    | `./darknessRender.yaml`                          |
-| `DARKNESS_DURATION`  | `60` (seconds; passed to `--exit-after-seconds`) |
+| `DARKNESS_BIN`        | `./build/default/src/main/darknessRender`                                       |
+| `DARKNESS_RES`        | `/Volumes/THIEF2_INSTALL_C/THIEF2/RES`                                          |
+| `DARKNESS_SCHEMAS`    | `/Volumes/THIEF2_CD2/EDITOR/SCHEMA`                                             |
+| `DARKNESS_CONFIG`     | `./darknessRender.yaml`                                                         |
+| `DARKNESS_DURATION`   | `60` (seconds; passed to `--exit-after-seconds`)                                |
+| `AUTO_FLY`            | `1` (auto-fly probe tour ON by default; set to `0` to disable)                  |
+| `AUTO_FLY_SPEED`      | unset → binary default 10 ft/s; override e.g. `AUTO_FLY_SPEED=15`               |
+| `AUTO_FLY_WAYPOINTS`  | unset → binary default 50 (N-nearest probes)                                    |
+| `AUTO_FLY_SEED`       | unset → binary default `0xC0FFEE` (decimal or `0xHEX` accepted)                 |
+| `AUTO_FLY_PAUSE_SEC`  | unset → binary default 0 (continuous motion; nonzero pauses N s at each WP)     |
+
+Auto-fly defaults to ON so every sweep iteration captures a comparable
+moving-listener load profile rather than a stationary scene. Set
+`AUTO_FLY=0` only when debugging startup-only knobs that don't need
+movement (e.g. memory-budget allocation paths).
 
 ### `--continue-on-error`
 
