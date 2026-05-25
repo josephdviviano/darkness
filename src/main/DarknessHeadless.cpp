@@ -1369,6 +1369,31 @@ static bool buildAcousticSceneFromMissionFile(
                  "[PROBE_PLAN] Acoustic mesh: %zu vertices, %zu triangles (%u cells)\n",
                  fullScene.vertices.size() / 3, numTris, wr.numCells);
 
+    // Cell-centroid Z distribution. UNIFORMFLOOR raycasts down from the
+    // OBB top to find floor surfaces; if the cell centroids cluster far
+    // below the OBB top (e.g. a few outlier-high cells stretch the OBB),
+    // the raycasts must traverse a lot of empty space to reach real
+    // floors.  Surface the per-decile spread so an operator can spot
+    // outlier rooms that pull the OBB top way above the playable mass.
+    if (wr.numCells > 0) {
+        std::vector<float> cz;
+        cz.reserve(wr.numCells);
+        for (uint32_t ci = 0; ci < wr.numCells; ++ci)
+            cz.push_back(wr.cells[ci].center.z);
+        std::sort(cz.begin(), cz.end());
+        auto pct = [&](float p) -> float {
+            size_t idx = std::min(cz.size() - 1,
+                                  static_cast<size_t>(p * cz.size()));
+            return cz[idx];
+        };
+        std::fprintf(stderr,
+            "[PROBE_PLAN] Cell-centroid Z (ft): min=%.0f p05=%.0f p25=%.0f "
+            "med=%.0f p75=%.0f p95=%.0f max=%.0f  (mesh-bound range affects "
+            "UNIFORMFLOOR ray length)\n",
+            cz.front(), pct(0.05f), pct(0.25f), pct(0.50f), pct(0.75f),
+            pct(0.95f), cz.back());
+    }
+
     // Push the per-texture material keyword table (TXLIST → keyword)
     // BEFORE buildAcousticScene so the AudioService materials lookup
     // sees them at scene assembly time.
