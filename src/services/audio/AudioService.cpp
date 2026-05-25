@@ -10920,55 +10920,49 @@ void AudioService::dumpAudioStatusPeriodic()
     // n is included per-phase so you can see which phases actually ran in
     // the window (e.g. pinBlock n=0 = no voices entered the enableRefl
     // branch this window — refl might be disabled or no eligible voices).
-    {
-        auto stkP = sPerfLoopStickySlotMs.snapshotAndReset();
-        auto vupP = sPerfLoopVoiceUpdateMs.snapshotAndReset();
-        auto pinP = sPerfLoopPinBlockMs.snapshotAndReset();
-        auto tlP  = sPerfLoopReflTailMs.snapshotAndReset();
-        AUDIO_LOG(
-            "[PERF loopStep_phases] sticky n=%llu p99=%.3f"
-            " | voiceUpdate n=%llu p99=%.3f"
-            " | pinBlock n=%llu p99=%.3f"
-            " | reflTail n=%llu p99=%.3f ms\n",
-            (unsigned long long)stkP.n, fmtMs(stkP.p99),
-            (unsigned long long)vupP.n, fmtMs(vupP.p99),
-            (unsigned long long)pinP.n, fmtMs(pinP.p99),
-            (unsigned long long)tlP.n,  fmtMs(tlP.p99));
-    }
+    // PITFALL GUARD: scope removed so JSONL emit below can reuse these
+    // snapshots (one drainer per histogram, fed to both stderr + JSONL).
+    auto stkP = sPerfLoopStickySlotMs.snapshotAndReset();
+    auto vupP = sPerfLoopVoiceUpdateMs.snapshotAndReset();
+    auto pinP = sPerfLoopPinBlockMs.snapshotAndReset();
+    auto tlP  = sPerfLoopReflTailMs.snapshotAndReset();
+    AUDIO_LOG(
+        "[PERF loopStep_phases] sticky n=%llu p99=%.3f"
+        " | voiceUpdate n=%llu p99=%.3f"
+        " | pinBlock n=%llu p99=%.3f"
+        " | reflTail n=%llu p99=%.3f ms\n",
+        (unsigned long long)stkP.n, fmtMs(stkP.p99),
+        (unsigned long long)vupP.n, fmtMs(vupP.p99),
+        (unsigned long long)pinP.n, fmtMs(pinP.p99),
+        (unsigned long long)tlP.n,  fmtMs(tlP.p99));
 
     // PLAN.AUDIO_PROFILING.md §2.4 — iplSimulatorRunDirect distribution.
     // Companion to the existing scalar `direct=...ms` field on the
     // [Audio] summary line above (sDirectSimPeakMs); this fills in p50/p95/p99.
-    {
-        auto dsP = sPerfDirectSimMs.snapshotAndReset();
-        AUDIO_LOG(
-            "[PERF audio] direct_sim n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
-            (unsigned long long)dsP.n, fmtMs(dsP.p50), fmtMs(dsP.p95), fmtMs(dsP.p99));
-    }
+    auto dsP = sPerfDirectSimMs.snapshotAndReset();
+    AUDIO_LOG(
+        "[PERF audio] direct_sim n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+        (unsigned long long)dsP.n, fmtMs(dsP.p50), fmtMs(dsP.p95), fmtMs(dsP.p99));
 
     // PLAN.AUDIO_PROFILING.md §2.3 — pin-block probe-reverb lookup latency.
     // Covers the O(probeCount) nearest-probe scan AND the
     // iplProbeBatchGetReverb call. Bursty on voice-spawn storms (footsteps,
     // ambient flushes). Emitted alongside [PERF refl_cache]'s hits/misses
     // line so cache-effectiveness and lookup-cost live next to each other.
-    {
-        auto rlP = sPerfProbeReverbLookupMs.snapshotAndReset();
-        AUDIO_LOG(
-            "[PERF refl_cache] reverbLookup n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
-            (unsigned long long)rlP.n, fmtMs(rlP.p50), fmtMs(rlP.p95), fmtMs(rlP.p99));
-    }
+    auto rlP = sPerfProbeReverbLookupMs.snapshotAndReset();
+    AUDIO_LOG(
+        "[PERF refl_cache] reverbLookup n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+        (unsigned long long)rlP.n, fmtMs(rlP.p50), fmtMs(rlP.p95), fmtMs(rlP.p99));
 
     // PLAN.AUDIO_PROFILING.md §2.5 — per-spawn initVoiceDSP cost.
     // Surfaces worst-case voice-creation cost (Steam Audio effect-create
     // chain + miniaudio node init). Spikes here correlate with footstep
     // clusters and ambient flushes; if p99 approaches the audio-callback
     // budget, spawn storms can starve the audio thread.
-    {
-        auto viP = sPerfVoiceDspInitMs.snapshotAndReset();
-        AUDIO_LOG(
-            "[PERF voice_init] n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
-            (unsigned long long)viP.n, fmtMs(viP.p50), fmtMs(viP.p95), fmtMs(viP.p99));
-    }
+    auto viP = sPerfVoiceDspInitMs.snapshotAndReset();
+    AUDIO_LOG(
+        "[PERF voice_init] n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+        (unsigned long long)viP.n, fmtMs(viP.p50), fmtMs(viP.p95), fmtMs(viP.p99));
 
     // T2.1 — [PERF callback] audio-callback wall-clock vs RT deadline.
     // Deadline is the CoreAudio / miniaudio device period:
@@ -11206,17 +11200,30 @@ void AudioService::dumpAudioStatusPeriodic()
         double tsMs = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - mPerfJsonlStartedAt)
                           .count();
+        // Schema: stage percentiles live under "stages":{...} per
+        // perf_README.md §1.1 + tools/perf_diff.py's expected layout.
+        // `wall_clock_s` is the canonical timing field perf_diff consumes
+        // (ts_ms retained for back-compat with hand-written grep tools).
         std::fprintf(mPerfJsonlFile,
             "{\"event\":\"perf.window\","
-            "\"ts_ms\":%.1f,"
+            "\"wall_clock_s\":%.3f,\"ts_ms\":%.1f,"
+            "\"stages\":{"
             "\"callback\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
                 "\"deadline_ms\":%.4f,\"warn\":%s},"
             "\"loop_step\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"loop_sticky_slot\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"loop_voice_update\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"loop_pin_block\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"loop_refl_tail\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"refl_sim\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"refl_mix\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"direct_sim\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"dsp_node\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"dsp_apply_direct\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"dsp_apply_path\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"dsp_apply_binaural\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"probe_reverb_lookup\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"voice_dsp_init\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"worker_apply\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"worker_sum\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"worker_decode\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
@@ -11228,7 +11235,8 @@ void AudioService::dumpAudioStatusPeriodic()
             "\"inter_cb\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"signal_pickup\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"sync_wait\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
-                "\"timeouts\":%d,\"deadline_ms\":%.4f},"
+                "\"timeouts\":%d,\"deadline_ms\":%.4f}"
+            "},"
             "\"voices\":{\"total\":%zu,\"refl\":%d,\"tail\":%d,"
                 "\"ambients_playing\":%d,\"ambients_total\":%zu,"
                 "\"created\":%d,\"destroyed\":%d},"
@@ -11238,16 +11246,24 @@ void AudioService::dumpAudioStatusPeriodic()
                 "\"ac_lag_s\":%.4f,\"ac_freq_hz\":%.4f,\"n\":%d,\"beating\":%s},"
             "\"refl_sim_steps\":%d,\"rays_per_sec\":%.1f"
             "}\n",
-            tsMs,
+            tsMs / 1000.0, tsMs,
             (unsigned long long)cbP.n, cbP.p50, cbP.p95, cbP.p99,
                 static_cast<double>(callbackDeadlineMs),
                 callbackBudgetWarn ? "true" : "false",
             (unsigned long long)loopP.n, loopP.p50, loopP.p95, loopP.p99,
+            (unsigned long long)stkP.n,  stkP.p50,  stkP.p95,  stkP.p99,
+            (unsigned long long)vupP.n,  vupP.p50,  vupP.p95,  vupP.p99,
+            (unsigned long long)pinP.n,  pinP.p50,  pinP.p95,  pinP.p99,
+            (unsigned long long)tlP.n,   tlP.p50,   tlP.p95,   tlP.p99,
             (unsigned long long)simP.n,  simP.p50,  simP.p95,  simP.p99,
             (unsigned long long)mixP.n,  mixP.p50,  mixP.p95,  mixP.p99,
+            (unsigned long long)dsP.n,   dsP.p50,   dsP.p95,   dsP.p99,
             (unsigned long long)dspP.n,  dspP.p50,  dspP.p95,  dspP.p99,
             (unsigned long long)deP.n,   deP.p50,   deP.p95,   deP.p99,
             (unsigned long long)peP.n,   peP.p50,   peP.p95,   peP.p99,
+            (unsigned long long)beP.n,   beP.p50,   beP.p95,   beP.p99,
+            (unsigned long long)rlP.n,   rlP.p50,   rlP.p95,   rlP.p99,
+            (unsigned long long)viP.n,   viP.p50,   viP.p95,   viP.p99,
             (unsigned long long)applyP.n, applyP.p50, applyP.p95, applyP.p99,
             (unsigned long long)sumP.n,   sumP.p50,   sumP.p95,   sumP.p99,
             (unsigned long long)decP.n,   decP.p50,   decP.p95,   decP.p99,
