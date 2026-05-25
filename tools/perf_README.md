@@ -242,6 +242,13 @@ multi-minute per mission, so reflection sweeps must amortize ONE good
 bake per level via `--skip-reflection-bake`; that bake's input probe
 set comes from Phase 1, so Phase 1 must settle first).
 
+**Current iteration: MISS6 only.** All Phase 1 sweeps below target
+MISS6 first so the inner loop is fast and the audible reference is
+calibrated (the user has been driving MISS6 interactively for
+diagnostics since the session started). Scale-out to all 15 shipping
+missions happens AFTER MISS6's pathing is settled — same commands,
+just dropped MISS6-scoping. See PLAN §4.P1.0 for the rationale.
+
 ### Phase 1 — Pathing tuning (do now)
 
 | # | Knob(s) swept                                                              | Sweep values                                            | Phase | Per-iter bake cost                                | Acceptance criterion                                                                                                |
@@ -250,21 +257,38 @@ set comes from Phase 1, so Phase 1 must settle first).
 | 2 | `pathing_probes.dedup_radius_ft` (live p99 check on most-divergent missions) | radii from Phase A                              | B     | seconds (pathing-only re-bake; reflection carried forward) | per-mission `[PERF pathing] p99 < 2 ms`                                                                              |
 | 3 | `pathing_update_interval`                                                  | {0.0, 0.05, 0.1, 0.2, 0.3}                              | runtime | none (knob doesn't affect probes — reflection carried forward, no bake) | `[PERF loopStep] p99` drop ≥ 2 ms at 0.3 vs 0.0; no `[PERF pathing] BUDGET_WARN`; subjective portal-traversal smoothness |
 
-Phase 1 invocations:
+Phase 1 invocations — **MISS6 only (current iteration target)**:
 
 ```bash
-# Phase 1.A — probe-count matrix (no bake, no playtest)
+# Phase 1.A — probe-count matrix on MISS6 only (no bake, no playtest)
+MISSIONS="miss6.mis" tools/perf_probe_plan_sweep.sh
+
+# Phase 1.B — live p99 check on MISS6 at chosen radii
+# (per-iter pathing re-bake; reflection IRs carried forward via
+# --skip-reflection-bake; MISS6's miss6.probes must already exist with
+# a reflection section — bake it once without --skip-reflection-bake if not)
+FORCE_PATHING_BAKE=1 tools/perf_sweep.sh \
+    ../thief_2_service_release/rdrive/prj/thief2/levels/shipping/miss6.mis \
+    audio.pathing_probes.dedup_radius_ft <radii from Phase A>
+
+# Phase 1 runtime — pathing-update-interval ablation on MISS6 (no bake)
+tools/perf_sweep.sh \
+    ../thief_2_service_release/rdrive/prj/thief2/levels/shipping/miss6.mis \
+    audio.propagation.pathing_update_interval 0.0 0.05 0.1 0.2 0.3
+```
+
+Scale-out (after MISS6 is settled):
+
+```bash
+# Phase 1.A across all missions
 tools/perf_probe_plan_sweep.sh
 
-# Phase 1.B — live p99 check at chosen radii (per-iter pathing re-bake)
-FORCE_PATHING_BAKE=1 tools/perf_sweep.sh \
-    ../path/MISS6.MIS audio.pathing_probes.dedup_radius_ft \
-    <radii from Phase A>
-
-# Phase 1 runtime — pathing-update-interval ablation (no bake at all)
-tools/perf_sweep.sh \
-    ../path/MISS6.MIS audio.propagation.pathing_update_interval \
-    0.0 0.05 0.1 0.2 0.3
+# Phase 1.B for each mission at the MISS6-chosen radius
+for MISSION in \
+    ../thief_2_service_release/rdrive/prj/thief2/levels/shipping/{miss,MISS}*.{mis,MIS}; do
+  FORCE_PATHING_BAKE=1 tools/perf_sweep.sh "$MISSION" \
+      audio.pathing_probes.dedup_radius_ft <chosen radius>
+done
 ```
 
 ### Phase 2 — Reflection tuning (deferred — blocked on reflection-bake budget)
