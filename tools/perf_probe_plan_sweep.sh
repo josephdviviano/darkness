@@ -127,8 +127,10 @@ for MISSION_PATH in "${MISSION_FILES[@]}"; do
         RUN=$((RUN + 1))
         # darknessHeadless probe_plan honors --set; the headless main
         # passes argv through to RenderConfig::applyCliOverrides.
+        # darknessHeadless expects: <database> [verb] [args].
+        # The <database> is positional[0], verb is positional[1].
         OUTPUT="$("$DARKNESS_HEADLESS" \
-            probe_plan "$MISSION_PATH" \
+            "$MISSION_PATH" probe_plan \
             --res "$DARKNESS_RES" \
             --schemas "$DARKNESS_SCHEMAS" \
             --set "audio.pathing_probes.dedup_radius_ft=${R}" \
