@@ -164,6 +164,17 @@ struct RenderConfig {
     // which only affects the dense reflection batch.
     float audioPathingDedupRadiusFt = 10.0f;
 
+    // Skip the multi-minute reflection bake on next bakeProbes(); load
+    // the existing .probes batch (preserving reflection IRs verbatim)
+    // and re-run only iplPathBakerBake on top of it. Reflection IRs go
+    // stale by definition — startup + per-30s [REFL_SKIP] reminders
+    // surface this loudly. Hard-fails (no silent fallback) when the
+    // existing file is missing / corrupt / has no reflection data.
+    // YAML key: audio.reflections.bake_skip. CLI: --skip-reflection-bake
+    // (overrides YAML). Default false. See PLAN.PROBE_DEBUG_TOOLING.md
+    // Capability B.
+    bool reflectionBakeSkip = false;
+
     // -- audio.occlusion: occlusion + material scaling --
     // (diffuseSamples / bakeDiffuseSamples moved to realtimeDiffuseSamples /
     //  bakeDiffuseSamples under reflections — legacy occlusion.diffuse_samples
@@ -488,6 +499,9 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 }
 
                 if (refl["type"]) std::fprintf(stderr, "[FALLBACK] darknessRender.yaml: 'reflections.type' is deprecated and ignored — HYBRID mode is now the only supported reflection algorithm\n");
+                if (refl["bake_skip"]) {
+                    cfg.reflectionBakeSkip = refl["bake_skip"].as<bool>();
+                }
                 if (refl["hybrid_transition_time"]) {
                     cfg.hybridTransitionTime = refl["hybrid_transition_time"].as<float>();
                     if (cfg.hybridTransitionTime < 0.1f) cfg.hybridTransitionTime = 0.1f;
@@ -950,6 +964,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cli.schemasPath = argv[++i];
         } else if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             cli.configPath = argv[++i];
+        } else if (std::strcmp(argv[i], "--skip-reflection-bake") == 0) {
+            cfg.reflectionBakeSkip = true;
         } else if (argv[i][0] != '-' && !cli.misPath) {
             // First non-flag argument is the mission file
             cli.misPath = argv[i];
