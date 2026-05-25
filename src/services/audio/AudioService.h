@@ -122,6 +122,13 @@ struct AcousticSceneData {
     std::vector<int32_t> indices;
     /// Per-triangle texture name from TXLIST (family/name path, for material lookup)
     std::vector<std::string> texNames;
+    /// Floor-polygon centroids (engine ft, Z-up).  One entry per
+    /// upward-facing BSP cell polygon (plane.normal.z > 0.5); each becomes
+    /// a reflection-probe candidate after AudioService applies the
+    /// configured height offset.  Replaces Steam Audio's UNIFORMFLOOR
+    /// raycast (which fails on multi-level missions like miss14 — see
+    /// PROBE_PLAN scheme comparison for context).
+    std::vector<Vector3> floorProbeCandidates;
 };
 
 // Forward declarations for AI hearing data structs (defined in audio/AIHearingData.h)
@@ -1873,6 +1880,14 @@ private:
     /// Scene bounding box (computed during buildAcousticScene)
     Vector3 mSceneMin{0, 0, 0};
     Vector3 mSceneMax{0, 0, 0};
+
+    /// Floor-poly probe candidates (engine ft, Z-up).  Captured at scene
+    /// build time from AcousticSceneData; replaces Steam Audio's
+    /// UNIFORMFLOOR raycast as the reflection-batch floor pass.  Each
+    /// entry is the centroid of an upward-facing BSP cell polygon;
+    /// ProbeManager adds the height offset and runs them through the
+    /// existing min-wall-clearance / room-membership filter.
+    std::vector<Vector3> mFloorProbeCandidates;
 
     /// Derived counts populated at initReflectionPipeline time from
     /// mReverbThreadsCfg + mReverbThreadsConvShareCfg. Sum == budget.

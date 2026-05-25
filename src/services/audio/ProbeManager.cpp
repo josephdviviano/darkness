@@ -295,69 +295,26 @@ bool ProbeManager::computeReflectionPlacements(IPLScene scene,
                                                ProbeBakePlan &plan)
 {
     AUDIO_LOG("Reflection placements: spacing=%.1f height=%.1f "
-              "(min_wall_clearance=%.1fft, filter=%s)\n",
+              "(min_wall_clearance=%.1fft, filter=%s, scheme=FLOOR_POLY+UNIFORMFLOOR)\n",
               spacing, height, params.minWallClearanceFt,
               params.probeFilter ? "enabled" : "disabled");
 
-    IPLProbeArray probeArray = nullptr;
-    IPLerror err = iplProbeArrayCreate(mDeps.context, &probeArray);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("ProbeManager: iplProbeArrayCreate failed (%d)", err);
-        return false;
-    }
-
-    // UNIFORMFLOOR transform maps the UNIT CUBE [0,1]³ into world space (NOT
-    // [-0.5,0.5]³ — using `center` as translation shifts the volume by
-    // extent/2 and silently misplaces probes). OBB must be in IPL Y-up
-    // space — raycasts go along IPL -Y to find floors. Expanded by one
-    // spacing margin so probes cover near-edge areas.
-    const Vector3 marginFt(spacing);
-    Vector3 origMin = params.sceneMin - marginFt;
-    Vector3 origMax = params.sceneMax + marginFt;
-    IPLVector3 iplCornerA = engineToIplPos(origMin);
-    IPLVector3 iplCornerB = engineToIplPos(origMax);
-    IPLVector3 iplMin{ std::min(iplCornerA.x, iplCornerB.x),
-                       std::min(iplCornerA.y, iplCornerB.y),
-                       std::min(iplCornerA.z, iplCornerB.z) };
-    IPLVector3 iplMax{ std::max(iplCornerA.x, iplCornerB.x),
-                       std::max(iplCornerA.y, iplCornerB.y),
-                       std::max(iplCornerA.z, iplCornerB.z) };
-
-    IPLMatrix4x4 transform{};
-    transform.elements[0][0] = iplMax.x - iplMin.x;
-    transform.elements[1][1] = iplMax.y - iplMin.y;
-    transform.elements[2][2] = iplMax.z - iplMin.z;
-    transform.elements[3][0] = iplMin.x;
-    transform.elements[3][1] = iplMin.y;
-    transform.elements[3][2] = iplMin.z;
-    transform.elements[3][3] = 1.0f;
-
-    AUDIO_LOG("Reflection scene bounds engine-ft: (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)\n"
-              "Probe OBB engine-ft:     (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)\n"
-              "Probe OBB IPL-m:         (%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f)\n",
-              params.sceneMin.x, params.sceneMin.y, params.sceneMin.z,
-              params.sceneMax.x, params.sceneMax.y, params.sceneMax.z,
-              origMin.x, origMin.y, origMin.z,
-              origMax.x, origMax.y, origMax.z,
-              iplMin.x, iplMin.y, iplMin.z,
-              iplMax.x, iplMax.y, iplMax.z);
-
-    IPLProbeGenerationParams genParams{};
-    genParams.type = IPL_PROBEGENERATIONTYPE_UNIFORMFLOOR;
-    genParams.spacing = spacing * kFeetToMeters;
-    genParams.height  = height  * kFeetToMeters;
-    genParams.transform = transform;
-
-    iplProbeArrayGenerateProbes(probeArray, scene, &genParams);
-
-    int numCandidates = iplProbeArrayGetNumProbes(probeArray);
-    AUDIO_LOG("Reflection batch: generated %d floor candidates "
-              "(spacing=%.1f, height=%.1f)\n",
-              numCandidates, spacing, height);
-
-    // Diagnostic: dump the IPL-space scene to OBJ whenever
-    // DARKNESS_DUMP_ACOUSTIC_OBJ=<path> is set. Used to compare a working
-    // mission's mesh against one where UNIFORMFLOOR returns 0.
+    // Two-pass floor placement: FLOOR_POLY first (semantically meaningful,
+    // wins dedup), UNIFORMFLOOR second (fills in big open cells where
+    // FLOOR_POLY emits a single centroid for a 200x200ft courtyard).
+    //
+    // FLOOR_POLY: AcousticSceneData ships one candidate per upward-facing
+    // BSP cell polygon (plane.normal.z > 0.5); AudioService stashes them
+    // at scene-build time and forwards them in params.floorProbeCandidates.
+    // Guarantees ground coverage in every BSP cell that has a floor poly
+    // — fixes miss14, where UNIFORMFLOOR's single-OBB raycasts returned
+    // zero (its OBB top sat in solid rock above the deep tunnels). See
+    // PLAN.AUDIO_PROFILING.md scheme comparison.
+    //
+    // UNIFORMFLOOR: Steam Audio's OBB-grid raycaster. Cheap on flat
+    // single-level layouts, undersamples big rooms only if FLOOR_POLY
+    // didn't pre-cover them. Runs second so dedup collapses redundant
+    // overlaps in FLOOR_POLY's favor.
     if (const char *objEnv = std::getenv("DARKNESS_DUMP_ACOUSTIC_OBJ")) {
         iplSceneSaveOBJ(scene, const_cast<IPLstring>(objEnv));
         std::fprintf(stderr,
@@ -365,28 +322,30 @@ bool ProbeManager::computeReflectionPlacements(IPLScene scene,
             objEnv);
     }
 
-    if (numCandidates == 0) {
-        // UNIFORMFLOOR finding zero candidates almost always means the
-        // raycast-down-to-floor step is mis-detecting surfaces — either
-        // the scene is empty when committed, normals are inverted so
-        // floors look like ceilings, or the OBB top is BELOW all geometry.
-        // Dump the IPL-space scene to OBJ so the developer can inspect the
-        // mesh that was actually handed to Steam Audio.
-        std::string objPath = "/tmp/probe_plan_failed_scene.obj";
-        iplSceneSaveOBJ(scene, const_cast<IPLstring>(objPath.c_str()));
+    const auto &candidates = params.floorProbeCandidates;
+    AUDIO_LOG("Reflection scene bounds engine-ft: (%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)\n"
+              "FLOOR_POLY candidates: %zu (one per upward-facing BSP poly)\n",
+              params.sceneMin.x, params.sceneMin.y, params.sceneMin.z,
+              params.sceneMax.x, params.sceneMax.y, params.sceneMax.z,
+              candidates.size());
+
+    if (candidates.empty()) {
+        // Empty list means the WR walker never populated floor candidates
+        // (likely an older code path bypassed buildAcousticScene's data
+        // ingestion, or the mission has zero BSP cells).  Loud failure
+        // — silently producing a probe-less reflection batch would mask
+        // a real bug.
         std::fprintf(stderr,
-            "[PROBE_PLAN] UNIFORMFLOOR generated 0 candidates — dumped "
-            "IPL scene to %s (engine→IPL: x=-y, y=z, z=-x; units=meters; "
-            "Y-up). Inspect there for missing floors / flipped normals / "
-            "empty scene.\n", objPath.c_str());
-        LOG_ERROR("ProbeManager: no probes generated — check scene geometry");
-        iplProbeArrayRelease(&probeArray);
+            "[FALLBACK] ProbeManager: no floor-poly candidates supplied "
+            "by AcousticSceneData. Reflection batch will be empty. "
+            "Check that the WR-walk loop in DarknessRender/DarknessHeadless "
+            "populates AcousticSceneData::floorProbeCandidates.\n");
         return false;
     }
 
     std::vector<Vector3> &positions = plan.reflectionPositions;
     positions.clear();
-    positions.reserve(static_cast<size_t>(numCandidates));
+    positions.reserve(candidates.size());
 
     // Per-probe filtered add — drops in-wall / wall-adjacent / unreachable
     // candidates BEFORE baking, so the .probes file never contains bad
@@ -395,30 +354,108 @@ bool ProbeManager::computeReflectionPlacements(IPLScene scene,
     // cross-pass overlaps.
     int rejectedFloor = 0;
     int nudgedFloor   = 0;
-    for (int i = 0; i < numCandidates; ++i) {
-        IPLSphere s = iplProbeArrayGetProbe(probeArray, i);
-        Vector3 enginePos = iplToEnginePos(s.center);
-        PlaceResult pr = tryPlaceProbe(enginePos, params.probeFilter);
+    const Vector3 heightOffset(0.0f, 0.0f, height);
+    for (const Vector3 &floorPos : candidates) {
+        // The candidate is the centroid of the floor polygon at floor
+        // level; place the probe `height` ft above it along world Z+.
+        // Matches the original UNIFORMFLOOR convention (probes placed
+        // along IPL +Y above the hit point = engine +Z above the floor).
+        PlaceResult pr = tryPlaceProbe(floorPos + heightOffset, params.probeFilter);
         if (!pr.ok) { ++rejectedFloor; continue; }
         if (pr.iters > 0) ++nudgedFloor;
         positions.push_back(pr.pos);
     }
-    iplProbeArrayRelease(&probeArray);
+
+    const int polyKept     = static_cast<int>(positions.size());
+    const int numCandidates = static_cast<int>(candidates.size());
+    AUDIO_LOG("FLOOR_POLY probes: %d kept (%d nudged), %d rejected by filter "
+              "(%d candidates)\n",
+              polyKept, nudgedFloor, rejectedFloor, numCandidates);
+
+    // ── UNIFORMFLOOR pass (OBB-grid fill) ──────────────────────────────
+    // Runs second so the global dedup at the end of this function favors
+    // FLOOR_POLY centroids over UNIFORMFLOOR grid samples that overlap.
+    // The pass is best-effort: a 0-candidate return (miss14-style scene)
+    // is non-fatal because FLOOR_POLY already provided per-cell coverage.
+    int unifloorKept = 0;
+    {
+        IPLProbeArray probeArray = nullptr;
+        IPLerror err = iplProbeArrayCreate(mDeps.context, &probeArray);
+        if (err != IPL_STATUS_SUCCESS) {
+            // Non-fatal; FLOOR_POLY pass above already populated positions.
+            std::fprintf(stderr,
+                "[FALLBACK] ProbeManager: iplProbeArrayCreate failed (%d) — "
+                "UNIFORMFLOOR fill skipped, relying on FLOOR_POLY pass\n", err);
+        } else {
+            // UNIFORMFLOOR transform maps the UNIT CUBE [0,1]³ into world
+            // space.  OBB must be in IPL Y-up space — raycasts go along
+            // IPL -Y to find floors. Expanded by one spacing margin so
+            // probes cover near-edge areas.
+            const Vector3 marginFt(spacing);
+            Vector3 origMin = params.sceneMin - marginFt;
+            Vector3 origMax = params.sceneMax + marginFt;
+            IPLVector3 iplCornerA = engineToIplPos(origMin);
+            IPLVector3 iplCornerB = engineToIplPos(origMax);
+            IPLVector3 iplMin{ std::min(iplCornerA.x, iplCornerB.x),
+                               std::min(iplCornerA.y, iplCornerB.y),
+                               std::min(iplCornerA.z, iplCornerB.z) };
+            IPLVector3 iplMax{ std::max(iplCornerA.x, iplCornerB.x),
+                               std::max(iplCornerA.y, iplCornerB.y),
+                               std::max(iplCornerA.z, iplCornerB.z) };
+
+            IPLMatrix4x4 transform{};
+            transform.elements[0][0] = iplMax.x - iplMin.x;
+            transform.elements[1][1] = iplMax.y - iplMin.y;
+            transform.elements[2][2] = iplMax.z - iplMin.z;
+            transform.elements[3][0] = iplMin.x;
+            transform.elements[3][1] = iplMin.y;
+            transform.elements[3][2] = iplMin.z;
+            transform.elements[3][3] = 1.0f;
+
+            IPLProbeGenerationParams genParams{};
+            genParams.type = IPL_PROBEGENERATIONTYPE_UNIFORMFLOOR;
+            genParams.spacing = spacing * kFeetToMeters;
+            genParams.height  = height  * kFeetToMeters;
+            genParams.transform = transform;
+
+            iplProbeArrayGenerateProbes(probeArray, scene, &genParams);
+            const int numUniCands = iplProbeArrayGetNumProbes(probeArray);
+
+            int unifloorRejected = 0;
+            int unifloorNudged   = 0;
+            for (int i = 0; i < numUniCands; ++i) {
+                IPLSphere s = iplProbeArrayGetProbe(probeArray, i);
+                Vector3 enginePos = iplToEnginePos(s.center);
+                PlaceResult pr = tryPlaceProbe(enginePos, params.probeFilter);
+                if (!pr.ok) { ++unifloorRejected; continue; }
+                if (pr.iters > 0) ++unifloorNudged;
+                positions.push_back(pr.pos);
+                ++unifloorKept;
+            }
+            iplProbeArrayRelease(&probeArray);
+
+            AUDIO_LOG("UNIFORMFLOOR probes: %d kept (%d nudged), %d rejected "
+                      "by filter (%d candidates, spacing=%.1f ft)\n",
+                      unifloorKept, unifloorNudged, unifloorRejected,
+                      numUniCands, spacing);
+        }
+    }
 
     const int floorKept = static_cast<int>(positions.size());
-    AUDIO_LOG("Floor probes: %d kept (%d nudged), %d rejected by filter "
-              "(%d candidates)\n",
-              floorKept, nudgedFloor, rejectedFloor, numCandidates);
-
     plan.floorKept = floorKept;
 
     if (floorKept == 0) {
-        // Misconfigured filter (clearance too aggressive); fail loudly
-        // rather than write an empty .probes file that breaks reverb.
-        LOG_ERROR("ProbeManager: filter rejected every floor probe "
-                  "(%d candidates) — refusing to bake an empty batch. "
-                  "Check audio.probes.min_wall_clearance_ft.",
-                  numCandidates);
+        // BOTH passes produced zero usable probes. FLOOR_POLY can only
+        // fail this way if the WR walker didn't populate candidates AND
+        // UNIFORMFLOOR also misfired (miss14 + zero floor polys = no
+        // mission can survive this). Fail loudly rather than writing an
+        // empty .probes file that breaks reverb.
+        LOG_ERROR("ProbeManager: both FLOOR_POLY (%d candidates, %d "
+                  "filter-rejected) and UNIFORMFLOOR (%d kept) produced "
+                  "zero probes — refusing to bake an empty batch. Check "
+                  "audio.probes.min_wall_clearance_ft and "
+                  "AcousticSceneData::floorProbeCandidates population.",
+                  numCandidates, rejectedFloor, unifloorKept);
         return false;
     }
 
@@ -564,26 +601,50 @@ bool ProbeManager::computeReflectionPlacements(IPLScene scene,
 
     // Global dedup: walk in placement order; drop probes within
     // globalDedupRadiusFt of an earlier-kept probe.
+    //
+    // ROOM-AWARE when params.probeRoomLookup is set: probes only collapse
+    // against other probes in the SAME room. This protects per-room
+    // coverage when adjacent rooms have floor-poly centroids less than
+    // dedupRadius apart across a thin wall — the room-agnostic legacy
+    // path silently stripped entire small rooms on FLOOR_POLY missions
+    // (the playtest showed lstRoom=13 with 30% same-room sentinels
+    // because adjacent rooms ate its probes via cross-room dedup).
     if (params.globalDedupRadiusFt > 0.0f && positions.size() > 1) {
         const float dedupRadiusSq = params.globalDedupRadiusFt
                                   * params.globalDedupRadiusFt;
+        const bool roomAware = static_cast<bool>(params.probeRoomLookup);
         std::vector<Vector3> kept;
+        std::vector<int>     keptRoom;  // parallel; -1 in non-room-aware mode
         kept.reserve(positions.size());
-        int globalDeduped = 0;
+        keptRoom.reserve(positions.size());
+        int globalDeduped       = 0;
+        int crossRoomPreserved  = 0;
         for (const Vector3 &p : positions) {
+            const int probeRoom = roomAware ? params.probeRoomLookup(p) : -1;
             bool tooClose = false;
-            for (const Vector3 &k : kept) {
-                Vector3 d = k - p;
-                if (glm::dot(d, d) < dedupRadiusSq) { tooClose = true; break; }
+            for (size_t i = 0; i < kept.size(); ++i) {
+                Vector3 d = kept[i] - p;
+                if (glm::dot(d, d) >= dedupRadiusSq) continue;
+                if (roomAware && keptRoom[i] != probeRoom) {
+                    // Same distance but different room — these cover
+                    // distinct acoustic spaces. Preserve both.
+                    ++crossRoomPreserved;
+                    continue;
+                }
+                tooClose = true;
+                break;
             }
             if (tooClose) { ++globalDeduped; continue; }
             kept.push_back(p);
+            keptRoom.push_back(probeRoom);
         }
-        if (globalDeduped > 0) {
+        if (globalDeduped > 0 || crossRoomPreserved > 0) {
             AUDIO_LOG("Global dedup: kept %zu / %zu probes "
-                      "(%d deduped at %.1f ft)\n",
+                      "(%d deduped at %.1f ft, %d cross-room preserved%s)\n",
                       kept.size(), positions.size(),
-                      globalDeduped, params.globalDedupRadiusFt);
+                      globalDeduped, params.globalDedupRadiusFt,
+                      crossRoomPreserved,
+                      roomAware ? "" : " — room lookup DISABLED");
         }
         plan.globalDeduped = globalDeduped;
         positions = std::move(kept);

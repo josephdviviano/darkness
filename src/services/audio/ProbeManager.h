@@ -209,9 +209,19 @@ struct ProbeBakeParams {
     std::string sceneType        = "default";  ///< "default" or "embree"
 
     /// Override grid spacing/height in engine feet. Use -1.0f to fall back
-    /// to ProbeManager's configured spacing/height.
+    /// to ProbeManager's configured spacing/height.  `spacingFtOverride`
+    /// controls UNIFORMFLOOR grid density (smaller = denser fill of big
+    /// open cells that FLOOR_POLY single-centroids); `heightFtOverride`
+    /// controls how far above the floor each probe sits.
     float   spacingFtOverride    = -1.0f;
     float   heightFtOverride     = -1.0f;
+
+    /// Floor-poly probe candidates (engine ft, Z-up).  One per
+    /// upward-facing BSP cell polygon, captured at acoustic-scene build
+    /// time.  ProbeManager adds `heightFtOverride`/configured height and
+    /// runs each through `probeFilter` (min-wall-clearance + room
+    /// membership); survivors become the reflection batch's floor pass.
+    std::vector<Vector3> floorProbeCandidates;
 
     /// Extra elevations (feet, above floor) for replicated probes. Empty
     /// = floor-grid only. Without elevated probes an elevated emitter
@@ -238,7 +248,21 @@ struct ProbeBakeParams {
 
     /// Global dedup radius (feet) applied AFTER all placement passes.
     /// Earlier passes have priority (floor always wins). 0 = disabled.
+    /// With `probeRoomLookup` set, dedup is room-aware: probes only
+    /// collapse against other probes in the SAME room. Without it the
+    /// pass falls back to room-agnostic distance dedup, which can
+    /// silently strip entire rooms when adjacent rooms have floor-poly
+    /// centroids closer than this radius across a thin wall.
     float globalDedupRadiusFt = 2.0f;
+
+    /// Room-membership lookup for the global dedup pass.  Returns the
+    /// `RoomService` integer room ID for a probe position, or -1 if the
+    /// point is in solid / BSP void. When non-null, the dedup pass only
+    /// collapses probes that share a room ID — preserving per-room
+    /// coverage across thin walls / adjacent rooms.  When null, dedup
+    /// is room-agnostic (legacy behaviour, suitable for UNIFORMFLOOR-
+    /// style grid placement where collisions were always real overlap).
+    std::function<int(const Vector3 &)> probeRoomLookup;
 
     /// Pre-bake validity filter applied to every REFLECTIONS-batch candidate.
     /// Returns Accept / Reject / Nudge. Pre-filtering avoids near-zero IRs

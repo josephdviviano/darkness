@@ -1361,6 +1361,20 @@ static bool buildAcousticSceneFromMissionFile(
                 fullScene.indices.push_back(static_cast<int32_t>(polyVerts[t]));
                 fullScene.texNames.push_back(texName);
             }
+            // Floor-poly probe candidate.  Dark Engine BSP plane normals
+            // face inward (see CellGeometry.h); for a floor polygon (cell
+            // bottom) the inward normal points +Z.  One candidate per
+            // qualifying polygon; AudioService applies the height offset
+            // and downstream filters.
+            if (!isPortal && poly.plane < cell.planes.size()
+                && cell.planes[poly.plane].normal.z > 0.5f)
+            {
+                Vector3 c(0.0f);
+                for (int vi = 0; vi < poly.count; ++vi)
+                    c += cell.vertices[cell.polyIndices[pi][vi]];
+                c /= static_cast<float>(poly.count);
+                fullScene.floorProbeCandidates.push_back(c);
+            }
         }
     }
 
@@ -1392,6 +1406,78 @@ static bool buildAcousticSceneFromMissionFile(
             "UNIFORMFLOOR ray length)\n",
             cz.front(), pct(0.05f), pct(0.25f), pct(0.50f), pct(0.75f),
             pct(0.95f), cz.back());
+    }
+
+    // Reflection-probe placement-scheme comparison.  UNIFORMFLOOR assumes
+    // a mostly-flat world (rays cast down from one OBB) and fails on
+    // multi-level missions like miss14 where rooms span 350 ft of Z.
+    // Emit counts for the alternative schemes so an operator can pick
+    // the right primitive across all 15 missions before committing to a
+    // rewrite.  Per-scheme probe-count estimates, with the dry-run grid
+    // spacing fixed at 5 ft (the current reflection default):
+    //   ROOM_CENTROID   — one probe at the center of each ROOM_DB room
+    //                     (coarsest; matches per-zone EAX-style reverb)
+    //   CELL_CENTROID   — one probe at each WR-cell center (one per BSP
+    //                     convex polyhedron)
+    //   FLOOR_POLY      — one probe per upward-facing cell polygon
+    //                     (normal_z > 0.5); handles multi-floor cells
+    //   FLOOR_GRID5ft   — area-driven grid sample at 5 ft spacing
+    //                     within each floor polygon's XY extent
+    //                     (≈ UNIFORMFLOOR density, per-cell-aware)
+    {
+        RoomServicePtr roomSvc = GET_SERVICE(RoomService);
+        size_t roomCount = 0;
+        if (roomSvc && roomSvc->isLoaded()) {
+            // RoomService doesn't expose a count getter; iterate over ID range.
+            // Cheap: room IDs are dense small ints starting at 0.
+            for (int rid = 0; rid < 4096; ++rid) {
+                if (roomSvc->getRoomByID(rid) != nullptr) ++roomCount;
+            }
+        }
+
+        size_t cellCount      = wr.numCells;
+        size_t floorPolyCount = 0;
+        double floorAreaTotal = 0.0;
+        for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+            const auto &cell = wr.cells[ci];
+            // Solid (non-portal) polygons are pi < numSolid.
+            int numSolid = cell.numPolygons - cell.numPortals;
+            for (int pi = 0; pi < numSolid; ++pi) {
+                const auto &poly = cell.polygons[pi];
+                if (poly.count < 3) continue;
+                if (poly.plane >= cell.planes.size()) continue;
+                // BSP plane normal: convention is normal points INTO the
+                // cell's free space.  Upward-facing floors in engine Z-up
+                // have plane.normal.z > 0.
+                const Vector3 &n = cell.planes[poly.plane].normal;
+                if (n.z <= 0.5f) continue;
+                ++floorPolyCount;
+                // Horizontal area = shoelace formula on (x,y) projection.
+                // Negligible cost; sums fan-triangles for accuracy.
+                double area = 0.0;
+                const auto &idxs = cell.polyIndices[pi];
+                const auto &v0 = cell.vertices[idxs[0]];
+                for (int t = 1; t < poly.count - 1; ++t) {
+                    const auto &va = cell.vertices[idxs[t]];
+                    const auto &vb = cell.vertices[idxs[t + 1]];
+                    double ex1 = va.x - v0.x, ey1 = va.y - v0.y;
+                    double ex2 = vb.x - v0.x, ey2 = vb.y - v0.y;
+                    area += 0.5 * std::fabs(ex1 * ey2 - ex2 * ey1);
+                }
+                floorAreaTotal += area;
+            }
+        }
+        const double gridSpacing = 5.0;  // ft, matches default
+        size_t gridProbeEst =
+            static_cast<size_t>(floorAreaTotal / (gridSpacing * gridSpacing));
+        std::fprintf(stderr,
+            "[PROBE_PLAN] Scheme comparison (estimates):\n"
+            "  ROOM_CENTROID     %6zu probes  (ROOM_DB rooms)\n"
+            "  CELL_CENTROID     %6zu probes  (WR cells)\n"
+            "  FLOOR_POLY        %6zu probes  (cell polys with normal.z > 0.5)\n"
+            "  FLOOR_GRID5ft     %6zu probes  (floor area %.0f ft² / 25 ft²)\n",
+            roomCount, cellCount, floorPolyCount, gridProbeEst,
+            floorAreaTotal);
     }
 
     // Push the per-texture material keyword table (TXLIST → keyword)

@@ -4832,6 +4832,19 @@ int main(int argc, char *argv[]) {
                         static_cast<int32_t>(polyVerts[t]));
                     fullScene.texNames.push_back(texName);
                 }
+                // Floor-poly probe candidate.  BSP plane normals face
+                // inward (see CellGeometry.h); inward .z > 0.5 = floor.
+                // One probe per qualifying poly; replaces Steam Audio's
+                // UNIFORMFLOOR raycast (broken on multi-level missions).
+                if (!isPortal && poly.plane < cell.planes.size()
+                    && cell.planes[poly.plane].normal.z > 0.5f)
+                {
+                    Vector3 c(0.0f);
+                    for (int vi = 0; vi < poly.count; ++vi)
+                        c += cell.vertices[cell.polyIndices[pi][vi]];
+                    c /= static_cast<float>(poly.count);
+                    fullScene.floorProbeCandidates.push_back(c);
+                }
             }
         }
 
