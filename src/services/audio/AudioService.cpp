@@ -49,9 +49,12 @@
 #include "ServiceCommon.h"
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <ctime>
 #include <queue>
 #include <random>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include "DarknessServiceManager.h"
 #include "database/DatabaseService.h"
 #include "link/LinkService.h"
@@ -4898,6 +4901,11 @@ void AudioService::shutdown()
     mPropertyService.reset();
     mObjectService.reset();
     mSchemaParser.reset();
+
+    // Close the perf JSONL sink last — emits the final [PERF_SINK]
+    // line and flushes any in-flight buffered writes. Safe to call
+    // whether the sink was ever opened or not.
+    closePerfJsonl();
 
     LOG_INFO("AudioService: shut down");
 }
@@ -10349,12 +10357,210 @@ void AudioService::loadMissionSoundData(const FileGroupPtr &db)
     }
 }
 
+//============================================================
+// ── Audio perf-capture JSONL sink (PLAN.AUDIO_PROFILING.md §1.1/§1.2) ──
+//
+// One emitter (dumpAudioStatusPeriodic) fans out to BOTH stderr (today's
+// AUDIO_LOG path) AND this file. The JSONL stream is the machine-readable
+// artifact tools/perf_diff.py and friends will consume; stderr stays
+// human-readable for live tail.
+//
+// File path convention:
+//   ./perf/<mission>/<utc_iso>__<perf_label>/audio_perf.jsonl
+//
+// All writes happen on the main thread. The audio callback never touches
+// mPerfJsonlFile — per feedback_threading_architecture, file I/O is a
+// services-layer / main-thread concern, not an RT concern. Open is
+// idempotent (only the first call wins); close is safe to call repeatedly.
+//============================================================
+
+namespace {
+
+// Minimal JSON-string escape. Handles the required JSONL hazards:
+//   "  → \"
+//   \  → \\
+//   newline → \n   tab → \t   carriage return → \r   backspace → \b   ff → \f
+//   any other 0x00-0x1F control → \u00XX
+// No surrogate-pair encoding; callers should feed UTF-8 (which is the
+// macOS / Linux default) or ASCII. Used for every untrusted string
+// field that lands in the JSONL stream (cli_argv, schema names, paths).
+std::string jsonEscape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (unsigned char c : in) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\t': out += "\\t";  break;
+            case '\r': out += "\\r";  break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+// "YYYYMMDDTHHMMSSZ" UTC stamp used in the run-dir name + run.meta.started_at_utc.
+std::string utcIsoCompact(std::chrono::system_clock::time_point tp) {
+    std::time_t t = std::chrono::system_clock::to_time_t(tp);
+    std::tm tmv{};
+#ifdef _WIN32
+    gmtime_s(&tmv, &t);
+#else
+    gmtime_r(&t, &tmv);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%dT%H%M%SZ", &tmv);
+    return std::string(buf);
+}
+
+// mkdir -p — recursively create every directory component below `path`.
+// Returns true on success or "already exists". Used by openPerfJsonl so the
+// caller doesn't have to wire shell scripts. Tolerant of trailing slash.
+bool mkdirsP(const std::string& path) {
+    if (path.empty()) return true;
+    for (size_t i = 1; i <= path.size(); ++i) {
+        if (i == path.size() || path[i] == '/') {
+            std::string sub = path.substr(0, i);
+            if (sub.empty()) continue;
+            struct stat st{};
+            if (stat(sub.c_str(), &st) == 0) {
+                if (!S_ISDIR(st.st_mode)) return false;
+            } else if (mkdir(sub.c_str(), 0755) != 0 && errno != EEXIST) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+#ifndef DARKNESS_GIT_SHA
+#  define DARKNESS_GIT_SHA "unknown"
+#endif
+#ifndef DARKNESS_GIT_DIRTY
+#  define DARKNESS_GIT_DIRTY 0
+#endif
+
+} // anonymous namespace
+
+bool AudioService::openPerfJsonl(const std::string& missionName,
+                                 const std::string& missionPath,
+                                 const std::string& perfLabel,
+                                 const std::string& cliArgv,
+                                 const std::string& audioConfigJson)
+{
+    if (mPerfJsonlFile != nullptr) return true; // idempotent — first call wins
+
+    auto nowSys = std::chrono::system_clock::now();
+    mPerfJsonlStartedAt = std::chrono::steady_clock::now();
+    std::string utcStamp = utcIsoCompact(nowSys);
+
+    // Build the artifact directory tree.
+    std::string dir = "./perf/" + missionName + "/" + utcStamp +
+                      "__" + perfLabel;
+    if (!mkdirsP(dir)) {
+        std::fprintf(stderr,
+            "[FALLBACK] openPerfJsonl: failed to create '%s' (errno=%d) "
+            "— perf JSONL disabled for this run\n",
+            dir.c_str(), errno);
+        return false;
+    }
+    std::string filePath = dir + "/audio_perf.jsonl";
+
+    mPerfJsonlFile = std::fopen(filePath.c_str(), "w");
+    if (!mPerfJsonlFile) {
+        std::fprintf(stderr,
+            "[FALLBACK] openPerfJsonl: failed to open '%s' (errno=%d) "
+            "— perf JSONL disabled for this run\n",
+            filePath.c_str(), errno);
+        return false;
+    }
+    mPerfJsonlPath = filePath;
+
+    // Line buffering: every fwrite is followed by fflush below, but
+    // setvbuf(_IOLBF) lets any concurrent reader (e.g. `tail -f` from a
+    // sweep script) see partial output without needing per-event flushes
+    // in pathological cases.
+    std::setvbuf(mPerfJsonlFile, nullptr, _IOLBF, 0);
+
+    float deadlineMs = (mDeviceSampleRate > 0)
+        ? (static_cast<float>(mFrameSize)
+            / static_cast<float>(mDeviceSampleRate)) * 1000.0f
+        : 0.0f;
+
+    // First line: run.meta. Records EVERYTHING needed to reproduce: source
+    // SHA + dirty bit, build timestamp, run start, mission, full audio.*
+    // config snapshot, device params.
+    std::fprintf(mPerfJsonlFile,
+        "{\"event\":\"run.meta\","
+        "\"git_commit\":\"%s\","
+        "\"git_dirty\":%s,"
+        "\"built_at\":\"%s %s\","
+        "\"started_at_utc\":\"%s\","
+        "\"mission\":\"%s\","
+        "\"mis_path\":\"%s\","
+        "\"perf_label\":\"%s\","
+        "\"cli_argv\":\"%s\","
+        "\"audio\":%s,"
+        "\"device\":{\"sample_rate\":%u,\"frame_size\":%u,\"deadline_ms\":%.4f}}\n",
+        DARKNESS_GIT_SHA,
+        DARKNESS_GIT_DIRTY ? "true" : "false",
+        __DATE__, __TIME__,
+        utcStamp.c_str(),
+        jsonEscape(missionName).c_str(),
+        jsonEscape(missionPath).c_str(),
+        jsonEscape(perfLabel).c_str(),
+        jsonEscape(cliArgv).c_str(),
+        audioConfigJson.c_str(),  // already JSON-escaped object literal
+        mDeviceSampleRate,
+        mFrameSize,
+        static_cast<double>(deadlineMs));
+    std::fflush(mPerfJsonlFile);
+
+    std::fprintf(stderr,
+        "[PERF_SINK] audio_perf.jsonl opened: %s\n", filePath.c_str());
+    return true;
+}
+
+void AudioService::closePerfJsonl() {
+    if (!mPerfJsonlFile) return;
+    std::fflush(mPerfJsonlFile);
+    std::fclose(mPerfJsonlFile);
+    mPerfJsonlFile = nullptr;
+    std::fprintf(stderr, "[PERF_SINK] audio_perf.jsonl closed: %s\n",
+                 mPerfJsonlPath.c_str());
+}
+
+bool AudioService::isPerfJsonlOpen() const {
+    return mPerfJsonlFile != nullptr;
+}
+
 //------------------------------------------------------
 // Periodic (~5 s) audio status dump. Used to live at the top of
 // updateAmbientVolumes() before the AmbientSoundManager extraction; now
 // it's a standalone method called from loopStep() so it can read ambient
 // state through mAmbientManager. Behaviour preserved bit-for-bit: same
 // 5-second timer, same counter resets, same line format.
+//
+// PLAN.AUDIO_PROFILING.md §1.1: this is the ONE emitter that fans out to
+// BOTH stderr (today's [PERF *] / [BEAT] / [REFL_SKIP] AUDIO_LOG lines)
+// AND audio_perf.jsonl (the per-run machine-readable artifact opened by
+// openPerfJsonl). To avoid the histogram double-drain pitfall caught in
+// commit bdeb98b (PLAN §1.7 #1), each LatencyHistogram::snapshotAndReset
+// is called exactly ONCE per window and the resulting Percentiles struct
+// is consumed by both sinks. The pitfall guard is: never add a second
+// `snapshotAndReset(true)` call for the same histogram — always reuse
+// the local variable computed below.
 void AudioService::dumpAudioStatusPeriodic()
 {
     // No ambients = no work and no log row. Matches the original
@@ -10583,25 +10789,31 @@ void AudioService::dumpAudioStatusPeriodic()
     // the existing steamAudioNodeProcess t0/t1 span (one record
     // per per-voice callback invocation; see sPerfCallbackMs's
     // call site in steamAudioNodeProcess).
-    {
-        auto cbP = sPerfCallbackMs.snapshotAndReset();
-        float deadlineMs = (mDeviceSampleRate > 0)
-            ? (static_cast<float>(mFrameSize)
-                / static_cast<float>(mDeviceSampleRate)) * 1000.0f
-            : 0.0f;
+    //
+    // PITFALL GUARD (PLAN.AUDIO_PROFILING.md §1.7 #1, bdeb98b lesson):
+    // cbP is snapshotted ONCE here. Both the stderr log below and the
+    // perf.window JSONL emit at the end of this function read from this
+    // same struct. Never call sPerfCallbackMs.snapshotAndReset() a second
+    // time inside this dump cycle — doing so would zero half the bucket
+    // counts for the second drainer.
+    auto cbP = sPerfCallbackMs.snapshotAndReset();
+    float callbackDeadlineMs = (mDeviceSampleRate > 0)
+        ? (static_cast<float>(mFrameSize)
+            / static_cast<float>(mDeviceSampleRate)) * 1000.0f
+        : 0.0f;
+    bool callbackBudgetWarn = (callbackDeadlineMs > 0.0f
+        && cbP.p99 >= 0.80 * static_cast<double>(callbackDeadlineMs));
+    AUDIO_LOG(
+        "[PERF callback] n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " deadline=%.3f ms\n",
+        (unsigned long long)cbP.n,
+        fmtMs(cbP.p50), fmtMs(cbP.p95), fmtMs(cbP.p99),
+        static_cast<double>(callbackDeadlineMs));
+    if (callbackBudgetWarn) {
         AUDIO_LOG(
-            "[PERF callback] n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
-            " deadline=%.3f ms\n",
-            (unsigned long long)cbP.n,
-            fmtMs(cbP.p50), fmtMs(cbP.p95), fmtMs(cbP.p99),
-            static_cast<double>(deadlineMs));
-        if (deadlineMs > 0.0f
-            && cbP.p99 >= 0.80 * static_cast<double>(deadlineMs)) {
-            AUDIO_LOG(
-                "[PERF callback] BUDGET_WARN p99=%.3f ms (>= 80%% of "
-                "%.3f ms)\n",
-                fmtMs(cbP.p99), static_cast<double>(deadlineMs));
-        }
+            "[PERF callback] BUDGET_WARN p99=%.3f ms (>= 80%% of "
+            "%.3f ms)\n",
+            fmtMs(cbP.p99), static_cast<double>(callbackDeadlineMs));
     }
 
     // T2.2 — [PERF dsp_apply] iplDirectEffectApply / iplPathEffectApply
@@ -10613,15 +10825,16 @@ void AudioService::dumpAudioStatusPeriodic()
     // direct + path apply costs lets the perf review attribute
     // [PERF callback] budget consumption to specific Steam Audio
     // stages.
-    {
-        auto deP = sPerfDirectEffectMs.snapshotAndReset();
-        auto peP = sPerfPathEffectMs.snapshotAndReset();
-        AUDIO_LOG(
-            "[PERF dsp_apply] direct n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
-            " | path n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
-            (unsigned long long)deP.n, fmtMs(deP.p50), fmtMs(deP.p95), fmtMs(deP.p99),
-            (unsigned long long)peP.n, fmtMs(peP.p50), fmtMs(peP.p95), fmtMs(peP.p99));
-    }
+    //
+    // PITFALL GUARD (see cbP comment above): one snapshot per histogram,
+    // reused by both stderr + JSONL sinks.
+    auto deP = sPerfDirectEffectMs.snapshotAndReset();
+    auto peP = sPerfPathEffectMs.snapshotAndReset();
+    AUDIO_LOG(
+        "[PERF dsp_apply] direct n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | path n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
+        (unsigned long long)deP.n, fmtMs(deP.p50), fmtMs(deP.p95), fmtMs(deP.p99),
+        (unsigned long long)peP.n, fmtMs(peP.p50), fmtMs(peP.p95), fmtMs(peP.p99));
     AUDIO_LOG(
         "[PERF worker] apply n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
         " | sum n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
@@ -10688,18 +10901,19 @@ void AudioService::dumpAudioStatusPeriodic()
     // to last-frame's wet, which would reintroduce the 1-callback gap.
     // timeouts: number of callbacks in the window where the wait expired
     // without all workers reaching their target.
-    {
-        auto syncP = sPerfSyncWaitMs.snapshotAndReset();
-        int timeouts = sSyncTimeoutCount.exchange(0, std::memory_order_relaxed);
-        float deadlineMs = (mReflectionMixNode)
-            ? mReflectionMixNode->syncDeadlineMs : 0.0f;
-        AUDIO_LOG(
-            "[PERF sync_wait] n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
-            " | timeouts=%d (deadline=%.2f ms)\n",
-            (unsigned long long)syncP.n,
-            fmtMs(syncP.p50), fmtMs(syncP.p95), fmtMs(syncP.p99),
-            timeouts, static_cast<double>(deadlineMs));
-    }
+    //
+    // PITFALL GUARD: syncP / syncTimeouts / syncDeadlineMs are shared with
+    // the JSONL perf.window emit at the end of this function.
+    auto syncP = sPerfSyncWaitMs.snapshotAndReset();
+    int syncTimeouts = sSyncTimeoutCount.exchange(0, std::memory_order_relaxed);
+    float syncDeadlineMs = (mReflectionMixNode)
+        ? mReflectionMixNode->syncDeadlineMs : 0.0f;
+    AUDIO_LOG(
+        "[PERF sync_wait] n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | timeouts=%d (deadline=%.2f ms)\n",
+        (unsigned long long)syncP.n,
+        fmtMs(syncP.p50), fmtMs(syncP.p95), fmtMs(syncP.p99),
+        syncTimeouts, static_cast<double>(syncDeadlineMs));
 
     // ── [BEAT] wet-bus autocorrelation ──
     //
@@ -10716,29 +10930,35 @@ void AudioService::dumpAudioStatusPeriodic()
     //   • If acFreqHz lands at 1/footstep_cadence    → expected, ignore
     //   • If acFreqHz lands at simRate/throttle      → sim cycle leakage
     // NO: no audible amplitude rhythm; either silent or random.
-    {
-        const float envFrameRateHz =
-            (mFrameSize > 0)
-                ? static_cast<float>(mDeviceSampleRate) / static_cast<float>(mFrameSize)
-                : 46.875f;
-        auto beat = sWetBeat.analyze(envFrameRateHz);
-        AUDIO_LOG(
-            "[BEAT] env_mean=%.5f env_rms=%.5f ac_peak=%.3f ac_lag=%.3fs ac_freq=%.2fHz "
-            "n=%d beating=%s\n",
-            beat.envMean, beat.envRMS, beat.acPeak, beat.acLagSec, beat.acFreqHz,
-            beat.samples, beat.beating ? "YES" : "no");
-    }
+    //
+    // PITFALL GUARD: `beat` is reused by the JSONL perf.window emit
+    // below — sWetBeat.analyze() is the sole drainer for this window.
+    const float envFrameRateHz =
+        (mFrameSize > 0)
+            ? static_cast<float>(mDeviceSampleRate) / static_cast<float>(mFrameSize)
+            : 46.875f;
+    auto beat = sWetBeat.analyze(envFrameRateHz);
+    AUDIO_LOG(
+        "[BEAT] env_mean=%.5f env_rms=%.5f ac_peak=%.3f ac_lag=%.3fs ac_freq=%.2fHz "
+        "n=%d beating=%s\n",
+        beat.envMean, beat.envRMS, beat.acPeak, beat.acLagSec, beat.acFreqHz,
+        beat.samples, beat.beating ? "YES" : "no");
 
     // T2.3 / T2.4 — per-second dump of convolution-worker pool stats and
     // reflection-IR cache stats. Both methods are self-throttled to ~1 Hz
     // so it's safe to call them every time this function fires (which is
     // already 5s-throttled). They must run on the main thread because the
     // workers themselves can't safely emit logs.
+    //
+    // PITFALL GUARD: `evictionsSinceLast` is the sole drainer for
+    // cw->slotEvictionsTotal in this window; the JSONL perf.window emit
+    // below references it from the lifted scope rather than re-draining.
+    uint64_t evictionsSinceLast = 0;
     if (mConvolutionPool) {
         mConvolutionPool->pollPerfPeriodic();
         ConvolutionWorker *cw = mConvolutionPool->worker();
         if (mProbeManager && cw) {
-            const uint64_t evictionsSinceLast =
+            evictionsSinceLast =
                 cw->slotEvictionsTotal.exchange(0, std::memory_order_relaxed);
             mProbeManager->pollPerfPeriodic(
                 reflVoices, MAX_ACTIVE_VOICES, evictionsSinceLast);
@@ -10759,6 +10979,7 @@ void AudioService::dumpAudioStatusPeriodic()
     // a function-local steady_clock baseline so the cadence is wall-clock
     // (not coupled to frame-rate-dependent debugTimer drift). Matches the
     // throttle pattern used by ProbeManager::pollPerfPeriodic.
+    bool reflSkipReminderFired = false;
     if (mReflectionBakeSkip) {
         // NOTE: function-local static — does not reset across in-process mission reloads, so the first-fire-immediately path only triggers once per program run, not per mission.
         static std::chrono::steady_clock::time_point sLastReflSkipDump{};
@@ -10768,6 +10989,7 @@ void AudioService::dumpAudioStatusPeriodic()
             std::chrono::duration<double>(now - sLastReflSkipDump).count() >= 30.0)
         {
             sLastReflSkipDump = now;
+            reflSkipReminderFired = true;
             // Direct stderr, NOT AUDIO_LOG — per feedback_no_silent_fallbacks
             // a stale-reflection reminder must always be visible, not gated
             // on --audio-log. The whole point is that the user can't lose
@@ -10776,6 +10998,100 @@ void AudioService::dumpAudioStatusPeriodic()
                 "[REFL_SKIP] reflections section is stale "
                 "(carried over from prior bake)\n");
         }
+    }
+
+    // ── PLAN.AUDIO_PROFILING.md §1.1 §1.2 — JSONL fan-out ──
+    //
+    // Emit a single perf.window record per 5 s dump window, plus any
+    // per-event records for state changes (refl_skip reminder fires,
+    // evict batch). Reads from the local snapshot variables above; does
+    // NOT call snapshotAndReset(true) — that would zero counts for the
+    // stderr line that already consumed them.
+    if (mPerfJsonlFile) {
+        double tsMs = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - mPerfJsonlStartedAt)
+                          .count();
+        std::fprintf(mPerfJsonlFile,
+            "{\"event\":\"perf.window\","
+            "\"ts_ms\":%.1f,"
+            "\"callback\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
+                "\"deadline_ms\":%.4f,\"warn\":%s},"
+            "\"loop_step\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"refl_sim\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"refl_mix\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"dsp_node\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"dsp_apply_direct\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"dsp_apply_path\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"worker_apply\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"worker_sum\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"worker_decode\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"worker_upsample\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"worker_iter\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"worker_sum_apply\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"worker_max_apply\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"worker_residual\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"inter_cb\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"signal_pickup\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"sync_wait\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
+                "\"timeouts\":%d,\"deadline_ms\":%.4f},"
+            "\"voices\":{\"total\":%zu,\"refl\":%d,\"tail\":%d,"
+                "\"ambients_playing\":%d,\"ambients_total\":%zu,"
+                "\"created\":%d,\"destroyed\":%d},"
+            "\"refl_cache\":{\"slot_evictions\":%llu,\"refl_voices\":%d,"
+                "\"max_active_voices\":%d},"
+            "\"beat\":{\"env_mean\":%.6f,\"env_rms\":%.6f,\"ac_peak\":%.4f,"
+                "\"ac_lag_s\":%.4f,\"ac_freq_hz\":%.4f,\"n\":%d,\"beating\":%s},"
+            "\"refl_sim_steps\":%d,\"rays_per_sec\":%.1f"
+            "}\n",
+            tsMs,
+            (unsigned long long)cbP.n, cbP.p50, cbP.p95, cbP.p99,
+                static_cast<double>(callbackDeadlineMs),
+                callbackBudgetWarn ? "true" : "false",
+            (unsigned long long)loopP.n, loopP.p50, loopP.p95, loopP.p99,
+            (unsigned long long)simP.n,  simP.p50,  simP.p95,  simP.p99,
+            (unsigned long long)mixP.n,  mixP.p50,  mixP.p95,  mixP.p99,
+            (unsigned long long)dspP.n,  dspP.p50,  dspP.p95,  dspP.p99,
+            (unsigned long long)deP.n,   deP.p50,   deP.p95,   deP.p99,
+            (unsigned long long)peP.n,   peP.p50,   peP.p95,   peP.p99,
+            (unsigned long long)applyP.n, applyP.p50, applyP.p95, applyP.p99,
+            (unsigned long long)sumP.n,   sumP.p50,   sumP.p95,   sumP.p99,
+            (unsigned long long)decP.n,   decP.p50,   decP.p95,   decP.p99,
+            (unsigned long long)upP.n,    upP.p50,    upP.p95,    upP.p99,
+            (unsigned long long)iterP.n,  iterP.p50,  iterP.p95,  iterP.p99,
+            (unsigned long long)sumApplyP.n, sumApplyP.p50, sumApplyP.p95, sumApplyP.p99,
+            (unsigned long long)maxApplyP.n, maxApplyP.p50, maxApplyP.p95, maxApplyP.p99,
+            (unsigned long long)residualP.n, residualP.p50, residualP.p95, residualP.p99,
+            (unsigned long long)interCbP.n, interCbP.p50, interCbP.p95, interCbP.p99,
+            (unsigned long long)pickupP.n, pickupP.p50, pickupP.p95, pickupP.p99,
+            (unsigned long long)syncP.n,  syncP.p50,  syncP.p95,  syncP.p99,
+                syncTimeouts, static_cast<double>(syncDeadlineMs),
+            mVoicePool->size(), reflVoices, tailVoices,
+                playing, ambients.size(), created, destroyed,
+            (unsigned long long)evictionsSinceLast, reflVoices, MAX_ACTIVE_VOICES,
+            beat.envMean, beat.envRMS, beat.acPeak, beat.acLagSec, beat.acFreqHz,
+                beat.samples, beat.beating ? "true" : "false",
+            reflFrames, raysPerSec);
+
+        // Companion event lines (PLAN §1.1): one record per
+        // per-event log line that fires during this window. Keeps the
+        // JSONL stream timeline-complete without needing the consumer to
+        // re-parse stderr.
+        if (reflSkipReminderFired) {
+            std::fprintf(mPerfJsonlFile,
+                "{\"event\":\"refl_skip\",\"ts_ms\":%.1f}\n", tsMs);
+        }
+        if (evictionsSinceLast > 0) {
+            // We don't have per-handle eviction details on the main
+            // thread (the [REFL_EVICT] stderr line is emitted from the
+            // convolution worker, which can't safely write to this
+            // file). The aggregate count + window timestamp is what the
+            // consumer needs for "how often does the eviction policy
+            // trigger?" — per-handle breakdown stays in stderr.
+            std::fprintf(mPerfJsonlFile,
+                "{\"event\":\"refl_evict_batch\",\"ts_ms\":%.1f,\"count\":%llu}\n",
+                tsMs, (unsigned long long)evictionsSinceLast);
+        }
+        std::fflush(mPerfJsonlFile);
     }
 }
 
