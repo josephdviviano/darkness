@@ -272,17 +272,29 @@ ProbeManager::~ProbeManager()
     mTotalProbeCount = 0;
 }
 
-// ── Reflection batch bake ─────────────────────────────────────────────────
+// ── Shared placement passes (dry-run / live bake) ────────────────────────
+//
+// The reflection-batch placement pipeline (floor grid → elevation tier →
+// emitter anchors → global dedup) used to live inline in
+// `bakeReflectionBatch`. It now lives here so the dry-run probe-count
+// tool (`darknessHeadless probe_plan`, Capability A in
+// PLAN.PROBE_DEBUG_TOOLING) can call the same code path and get
+// byte-identical probe counts to the live bake — no rounding divergence.
+//
+// Same for `computePathingPlacements` below: it was the candidate-filter
+// loop at the top of `bakePathingBatch` (pre-IPL-commit). The dedup pass
+// that AudioService runs on `pathingCandidates` BEFORE handing them to
+// ProbeManager is intentionally not part of this seam — it lives in
+// `AudioService::prepareProbeBakeParams` (which both `bakeProbes` and
+// `computeProbePlan` invoke).
 
-bool ProbeManager::bakeReflectionBatch(IPLScene scene,
-                                       const ProbeBakeParams &params,
-                                       float spacing,
-                                       float height,
-                                       std::atomic<float> *progress,
-                                       const std::string &outputPath,
-                                       ProbeBatchEntry &outEntry)
+bool ProbeManager::computeReflectionPlacements(IPLScene scene,
+                                               const ProbeBakeParams &params,
+                                               float spacing,
+                                               float height,
+                                               ProbeBakePlan &plan)
 {
-    AUDIO_LOG("Baking reflection batch: spacing=%.1f height=%.1f "
+    AUDIO_LOG("Reflection placements: spacing=%.1f height=%.1f "
               "(min_wall_clearance=%.1fft, filter=%s)\n",
               spacing, height, params.minWallClearanceFt,
               params.probeFilter ? "enabled" : "disabled");
@@ -349,15 +361,7 @@ bool ProbeManager::bakeReflectionBatch(IPLScene scene,
         return false;
     }
 
-    IPLProbeBatch probeBatch = nullptr;
-    err = iplProbeBatchCreate(mDeps.context, &probeBatch);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("ProbeManager: iplProbeBatchCreate failed (%d)", err);
-        iplProbeArrayRelease(&probeArray);
-        return false;
-    }
-
-    std::vector<Vector3> &positions = outEntry.positions;
+    std::vector<Vector3> &positions = plan.reflectionPositions;
     positions.clear();
     positions.reserve(static_cast<size_t>(numCandidates));
 
@@ -383,6 +387,8 @@ bool ProbeManager::bakeReflectionBatch(IPLScene scene,
               "(%d candidates)\n",
               floorKept, nudgedFloor, rejectedFloor, numCandidates);
 
+    plan.floorKept = floorKept;
+
     if (floorKept == 0) {
         // Misconfigured filter (clearance too aggressive); fail loudly
         // rather than write an empty .probes file that breaks reverb.
@@ -390,7 +396,6 @@ bool ProbeManager::bakeReflectionBatch(IPLScene scene,
                   "(%d candidates) — refusing to bake an empty batch. "
                   "Check audio.probes.min_wall_clearance_ft.",
                   numCandidates);
-        iplProbeBatchRelease(&probeBatch);
         return false;
     }
 
@@ -448,6 +453,7 @@ bool ProbeManager::bakeReflectionBatch(IPLScene scene,
                   params.additionalElevations.size(),
                   bins.size(), params.elevationSparsityMul,
                   nudgedElev, rejectedElev);
+        plan.elevationKept = addedElev;
     }
 
     // (The per-portal probe-ring pass that lived here has been removed.
@@ -496,6 +502,7 @@ bool ProbeManager::bakeReflectionBatch(IPLScene scene,
                   emitterAdded,
                   params.emitterPositions.size(),
                   emitterDeduped, emitterNudged, emitterRejected);
+        plan.emitterKept = emitterAdded;
 
         // Per-emitter diagnostic
         const size_t totalSoFar = positions.size();
@@ -555,7 +562,105 @@ bool ProbeManager::bakeReflectionBatch(IPLScene scene,
                       kept.size(), positions.size(),
                       globalDeduped, params.globalDedupRadiusFt);
         }
+        plan.globalDeduped = globalDeduped;
         positions = std::move(kept);
+    }
+
+    return true;
+}
+
+// ── Pathing placement (filter only — dedup lives in AudioService) ────────
+
+void ProbeManager::computePathingPlacements(const ProbeBakeParams &params,
+                                            ProbeBakePlan &plan)
+{
+    plan.pathingKept.clear();
+    plan.pathingPerPurpose.clear();
+
+    if (params.pathingCandidates.empty()) {
+        AUDIO_LOG("Pathing placements: no candidates supplied\n");
+        return;
+    }
+
+    plan.pathingKept.reserve(params.pathingCandidates.size());
+
+    int rejected = 0;
+    int nudged   = 0;
+    for (const auto &cand : params.pathingCandidates) {
+        PlaceResult pr = tryPlaceProbe(cand.position, params.pathingProbeFilter);
+        if (!pr.ok) { ++rejected; continue; }
+        if (pr.iters > 0) ++nudged;
+        PathingProbeCandidate kept = cand;
+        kept.position = pr.pos;
+        plan.pathingKept.push_back(kept);
+        plan.pathingPerPurpose[kept.purpose] += 1;
+    }
+    AUDIO_LOG("Pathing placements: kept %zu probes (%d nudged, %d rejected) "
+              "from %zu candidates\n",
+              plan.pathingKept.size(), nudged, rejected,
+              params.pathingCandidates.size());
+}
+
+// ── Dry-run plan ──────────────────────────────────────────────────────────
+
+bool ProbeManager::computeBakePlan(IPLScene scene,
+                                   const ProbeBakeParams &params,
+                                   ProbeBakePlan &out)
+{
+    if (!mDeps.context || !scene) {
+        LOG_ERROR("ProbeManager::computeBakePlan: no acoustic scene");
+        return false;
+    }
+
+    // NOTE: we intentionally do NOT zero `out` here. The caller
+    // (AudioService::computeProbePlan) may have already populated
+    // dedup counters via prepareProbeBakeParams before invoking
+    // this function. The reflection / pathing placement passes below
+    // only write to the fields they own (reflectionPositions, floor/
+    // elevation/emitter/globalDeduped, pathingKept, pathingPerPurpose)
+    // so the dedup counters survive intact.
+
+    float spacing = (params.spacingFtOverride > 0.0f) ? params.spacingFtOverride : mProbeSpacingFt;
+    float height  = (params.heightFtOverride  > 0.0f) ? params.heightFtOverride  : mProbeHeightFt;
+
+    if (!computeReflectionPlacements(scene, params, spacing, height, out)) {
+        return false;
+    }
+
+    if (params.bakePathingBatch) {
+        computePathingPlacements(params, out);
+    }
+
+    return true;
+}
+
+// ── Reflection batch bake (IPL commit + bake — wraps placement pass) ─────
+
+bool ProbeManager::bakeReflectionBatch(IPLScene scene,
+                                       const ProbeBakeParams &params,
+                                       float spacing,
+                                       float height,
+                                       std::atomic<float> *progress,
+                                       const std::string &outputPath,
+                                       ProbeBatchEntry &outEntry)
+{
+    // Run the shared placement pass into a temporary plan, then commit
+    // the surviving positions into the IPL batch and bake IRs. Same
+    // code path as the dry-run (`computeBakePlan`) so the bake's probe
+    // count exactly matches the dry-run's predicted count.
+    ProbeBakePlan plan;
+    if (!computeReflectionPlacements(scene, params, spacing, height, plan)) {
+        return false;
+    }
+
+    outEntry.positions = std::move(plan.reflectionPositions);
+    std::vector<Vector3> &positions = outEntry.positions;
+
+    IPLProbeBatch probeBatch = nullptr;
+    IPLerror err = iplProbeBatchCreate(mDeps.context, &probeBatch);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("ProbeManager: iplProbeBatchCreate failed (%d)", err);
+        return false;
     }
 
     // Commit survivors to the IPL batch. Uniform radius (one floor
@@ -752,39 +857,34 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     AUDIO_LOG("Baking pathing batch: %zu candidate nodes\n",
               params.pathingCandidates.size());
 
-    IPLProbeBatch probeBatch = nullptr;
-    IPLerror err = iplProbeBatchCreate(mDeps.context, &probeBatch);
-    if (err != IPL_STATUS_SUCCESS) {
-        LOG_ERROR("ProbeManager: pathing batch iplProbeBatchCreate failed (%d)",
-                  err);
-        return false;
-    }
+    // Run the shared filter pass (same code as the dry-run
+    // `computeBakePlan`) so bake and dry-run produce identical
+    // post-filter survivor counts.
+    ProbeBakePlan plan;
+    computePathingPlacements(params, plan);
 
     std::vector<Vector3> &positions = outEntry.positions;
     std::vector<float>   &radii     = outEntry.radiiFt;
     positions.clear();
     radii.clear();
-    positions.reserve(params.pathingCandidates.size());
-    radii.reserve(params.pathingCandidates.size());
-
-    int rejected = 0;
-    int nudged   = 0;
-    for (const auto &cand : params.pathingCandidates) {
-        PlaceResult pr = tryPlaceProbe(cand.position, params.pathingProbeFilter);
-        if (!pr.ok) { ++rejected; continue; }
-        if (pr.iters > 0) ++nudged;
-        positions.push_back(pr.pos);
-        radii.push_back(cand.radiusFt);
+    positions.reserve(plan.pathingKept.size());
+    radii.reserve(plan.pathingKept.size());
+    for (const auto &k : plan.pathingKept) {
+        positions.push_back(k.position);
+        radii.push_back(k.radiusFt);
     }
-    AUDIO_LOG("Pathing batch: kept %zu probes (%d nudged, %d rejected) "
-              "from %zu candidates\n",
-              positions.size(), nudged, rejected,
-              params.pathingCandidates.size());
 
     if (positions.empty()) {
         LOG_ERROR("ProbeManager: filter rejected every pathing candidate — "
                   "refusing to bake an empty pathing batch");
-        iplProbeBatchRelease(&probeBatch);
+        return false;
+    }
+
+    IPLProbeBatch probeBatch = nullptr;
+    IPLerror err = iplProbeBatchCreate(mDeps.context, &probeBatch);
+    if (err != IPL_STATUS_SUCCESS) {
+        LOG_ERROR("ProbeManager: pathing batch iplProbeBatchCreate failed (%d)",
+                  err);
         return false;
     }
 

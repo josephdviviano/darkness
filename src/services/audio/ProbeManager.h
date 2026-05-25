@@ -67,6 +67,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -139,6 +140,51 @@ struct PathingProbeCandidate {
     Vector3 position{0.0f, 0.0f, 0.0f};
     float   radiusFt = 5.0f;   ///< Influence radius — sized adaptively post-dedup.
     PathingProbePurpose purpose = PathingProbePurpose::Portal;
+};
+
+/// Output of `ProbeManager::computeBakePlan` — the exact probe layout a
+/// real bake will commit to Steam Audio, EXCEPT no IPL handles are
+/// allocated and no IRs / pathing data are baked. Used by the
+/// `darknessHeadless probe_plan` verb (Capability A in
+/// PLAN.PROBE_DEBUG_TOOLING) to predict per-purpose probe counts
+/// without paying the multi-minute bake cost.
+///
+/// Same code path as a live bake — bakeReflectionBatch and
+/// bakePathingBatch both build their candidate lists via
+/// `computeBakePlan`. Counts here will match the next live bake
+/// byte-for-byte modulo any door-OBB classification that depends on
+/// runtime state (in headless mode, door OBBs may be absent — see
+/// AudioService::computeProbePlan for the [PROBE_PLAN] WARN banner).
+struct ProbeBakePlan {
+    /// Engine-feet positions of every reflection-batch probe that would
+    /// be committed to the IPL batch (post all placement passes + global
+    /// dedup). One entry per probe — `reflectionPositions.size()` is the
+    /// total reflection probe count that the next bake will produce.
+    std::vector<Vector3> reflectionPositions;
+    /// Pathing-batch candidates that would be committed to the IPL
+    /// batch (post placement + dedup, post adaptive-radius pass — every
+    /// candidate carries its final radiusFt).
+    std::vector<PathingProbeCandidate> pathingKept;
+
+    /// Per-pass reflection-batch counters (placement order: floor →
+    /// elevation → emitter → global dedup). `globalDeduped` is the
+    /// number of probes the final dedup pass dropped.
+    int floorKept     = 0;
+    int elevationKept = 0;
+    int emitterKept   = 0;
+    int globalDeduped = 0;
+
+    /// Per-purpose pathing-batch counts (post-dedup, pre-adaptive-radius).
+    /// Sum across this map equals `pathingKept.size()`.
+    std::map<PathingProbePurpose, int> pathingPerPurpose;
+
+    /// Pathing-batch dedup breakdown — how many candidates the dedup
+    /// pass dropped, split by purpose. `dedupDroppedTotal` is the
+    /// inclusive total.
+    int dedupDroppedTotal      = 0;
+    int dedupDroppedCentroids  = 0;
+    int dedupDroppedDoorPairs  = 0;
+    int dedupDroppedOther      = 0;
 };
 
 /// Per-bake parameters supplied by AudioService (read from its tuning state).
@@ -297,6 +343,27 @@ public:
                     const ProbeBakeParams &params,
                     std::atomic<float> *progress);
 
+    /// Dry-run the Darkness-side probe placement passes WITHOUT touching
+    /// Steam Audio's bake (no IRs / no pathing graph). Runs the exact
+    /// same code as `bakeReflectionBatch` (lines that produce the
+    /// positions vector) and the candidate-filter portion of
+    /// `bakePathingBatch`, stopping just before
+    /// `iplReflectionsBakerBake` / `iplPathBakerBake`. Used by the
+    /// `darknessHeadless probe_plan` verb (Capability A).
+    ///
+    /// `scene` must be a fully-built IPLScene — the floor-grid
+    /// generator raycasts down to find floor positions, so a real
+    /// (or stub) scene is required.
+    ///
+    /// Pre-AudioService-side pathing dedup must already have been
+    /// applied to `params.pathingCandidates` (`AudioService::computeProbePlan`
+    /// handles this and records the dedup counters separately).
+    ///
+    /// Returns false if the IPL probe array could not be generated.
+    bool computeBakePlan(IPLScene scene,
+                         const ProbeBakeParams &params,
+                         ProbeBakePlan &out);
+
     /// Load probes from disk + register every batch with both simulators.
     /// Reflection sim silently ignores batches without reflections data;
     /// pathing sim creates per-batch PathSimulators which are then named
@@ -419,6 +486,31 @@ private:
                           float spacing,
                           std::atomic<float> *progress,
                           ProbeBatchEntry &outEntry);
+
+    /// Shared placement pass for the reflection batch. Runs floor-grid
+    /// generation + elevation tier + emitter-anchored pass + global
+    /// dedup, in exactly the same order and with exactly the same logs
+    /// as the historical inline code in `bakeReflectionBatch`. Fills
+    /// `plan.reflectionPositions` and the per-pass counters. Returns
+    /// false if the floor pass produced no probes (caller treats this
+    /// as a hard error — same as historical behavior).
+    ///
+    /// Called by both `bakeReflectionBatch` (which then commits to an
+    /// IPL batch and bakes IRs) and `computeBakePlan` (dry-run, stops
+    /// here).
+    bool computeReflectionPlacements(IPLScene scene,
+                                     const ProbeBakeParams &params,
+                                     float spacing,
+                                     float height,
+                                     ProbeBakePlan &plan);
+
+    /// Shared filter pass for the pathing batch. Walks
+    /// `params.pathingCandidates`, runs each through
+    /// `params.pathingProbeFilter`, and emits accepted candidates into
+    /// `plan.pathingKept` with per-purpose counters. Same code path as
+    /// the historical inline filter at the top of `bakePathingBatch`.
+    void computePathingPlacements(const ProbeBakeParams &params,
+                                  ProbeBakePlan &plan);
 
     /// Release a single batch from the simulators it is attached to.
     /// Internal use only — releaseBatches walks the vector.
