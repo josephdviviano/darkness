@@ -24,6 +24,47 @@ project(Darkness LANGUAGES C CXX)
 set(DARKNESS_SOURCE_DIR "${Darkness_SOURCE_DIR}")
 set(DARKNESS_BINARY_DIR "${Darkness_BINARY_DIR}")
 
+# ── Git provenance (audio perf-capture JSONL run.meta header) ──
+# Stamp the short SHA + dirty bit into every translation unit so the audio
+# perf sink can record exactly which source produced a given JSONL artifact.
+# The audio_perf.jsonl `run.meta` event is the ONLY link back from a captured
+# perf trace to the source tree — without `git_commit` + `git_dirty` the
+# trace is unreproducible. See PLAN.AUDIO_PROFILING.md §1.2.
+#
+# Configured at configure-time (not regenerated per build); a re-run of
+# `cmake --preset default` after a commit picks up the new SHA. This avoids
+# the cost of running `git` from every compile.
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE DARKNESS_GIT_SHA_VAL
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT DARKNESS_GIT_SHA_VAL)
+    set(DARKNESS_GIT_SHA_VAL "unknown")
+endif()
+execute_process(
+    COMMAND git diff --quiet HEAD --
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    RESULT_VARIABLE DARKNESS_GIT_DIRTY_VAL
+    OUTPUT_QUIET
+    ERROR_QUIET
+)
+# git diff --quiet returns 0 = clean, 1 = dirty, anything else = git unavailable
+if(NOT DARKNESS_GIT_DIRTY_VAL EQUAL 0 AND NOT DARKNESS_GIT_DIRTY_VAL EQUAL 1)
+    set(DARKNESS_GIT_DIRTY_VAL 0)
+endif()
+add_compile_definitions(
+    DARKNESS_GIT_SHA="${DARKNESS_GIT_SHA_VAL}"
+    DARKNESS_GIT_DIRTY=${DARKNESS_GIT_DIRTY_VAL}
+)
+# DARKNESS_BUILT_AT uses __DATE__ " " __TIME__ at the call site (built into
+# every C/C++ compiler). No CMake variable needed — keeps the timestamp
+# per-TU, but the only TU that emits it is the one in AudioService.cpp's
+# JSONL sink.
+message(STATUS "Git SHA: ${DARKNESS_GIT_SHA_VAL} (dirty=${DARKNESS_GIT_DIRTY_VAL})")
+
 set(DARKNESS_VER_MAJOR "0")
 set(DARKNESS_VER_MINOR "3")
 set(DARKNESS_VER_PATCH "0")
