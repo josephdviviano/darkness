@@ -935,6 +935,25 @@ public:
     void setReflectionBakeSkip(bool skip) { mReflectionBakeSkip = skip; }
     bool getReflectionBakeSkip() const { return mReflectionBakeSkip; }
 
+    /** Force a fresh pathing bake on the next bakeProbes() call even when
+     *  the existing `.probes` file already has a valid pathing section.
+     *  Symmetric with `setReflectionBakeSkip` — that one CARRIES FORWARD
+     *  the existing reflection bytes to skip the expensive bake, this one
+     *  DROPS the existing pathing bytes to force a fresh bake.
+     *
+     *  Used for Sweep 2 Phase B (PLAN.AUDIO_PROFILING.md §4.3) — per-
+     *  iteration `pathing_probes.dedup_radius_ft` sweep where the cached
+     *  pathing data must be regenerated against the new radius but the
+     *  reflection bake should not run.
+     *
+     *  This is a flag-only — the actual "force the bake to happen even
+     *  when loadProbes succeeded" decision lives in DarknessRender.cpp's
+     *  probeBakeNeeded gate. The flag is queryable here so the bake
+     *  decision site can read it from a single source of truth. Set from
+     *  `--force-pathing-bake` CLI flag; no YAML key (per-invocation). */
+    void setForcePathingBake(bool force) { mForcePathingBake = force; }
+    bool getForcePathingBake() const { return mForcePathingBake; }
+
     /** Snapshot of probe positions in feet (engine units). Populated by
      *  bakeProbes() and loadProbes(); empty if no probes are loaded. Used
      *  by the renderer to draw a debug overlay. The vector is rebuilt on
@@ -1708,6 +1727,19 @@ private:
     /// Also drives the once-per-30s [REFL_SKIP] staleness reminder in
     /// dumpAudioStatusPeriodic.
     bool               mReflectionBakeSkip = false;
+
+    /// Force-pathing-bake flag. When true, the renderer's bake-decision
+    /// site (DarknessRender.cpp probeBakeNeeded gate) schedules a
+    /// bakeProbes() call even when loadProbes already succeeded against
+    /// an existing .probes file with a valid pathing section. The bake
+    /// itself uses the standard ProbeBakeParams plumbing — bakePathingBatch
+    /// stays true (default) and bakeReflectionBatch follows
+    /// mReflectionBakeSkip (so the composition
+    /// `--skip-reflection-bake --force-pathing-bake` carries reflection
+    /// bytes forward + re-bakes pathing fresh). See setForcePathingBake()
+    /// for the full rationale. Default false. Set from `--force-pathing-bake`
+    /// CLI only — no YAML key, per-invocation flag.
+    bool               mForcePathingBake = false;
 
     // Volumetric occlusion sphere radius + sample count moved to
     // AudioOcclusion (mAudioOcclusion). The setters/getters above are

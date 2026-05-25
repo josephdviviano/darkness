@@ -280,7 +280,7 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
             "\"min_wall_clearance_ft\":%.4f,\"elevation_sparsity_mul\":%.4f,"
             "\"global_dedup_radius_ft\":%.4f"
         "},"
-        "\"pathing_probes\":{\"enabled\":%s,\"dedup_radius_ft\":%.4f},"
+        "\"pathing_probes\":{\"enabled\":%s,\"dedup_radius_ft\":%.4f,\"force_bake\":%s},"
         "\"occlusion\":{"
             "\"radius\":%.4f,\"samples\":%d,"
             "\"transmission_scale\":%.4f,\"absorption_scale\":%.4f"
@@ -331,6 +331,7 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
         c.audioProbeMinWallClearanceFt, c.audioProbeElevationSparsityMul,
         c.audioProbeGlobalDedupRadiusFt,
         c.audioPathingProbesEnabled ? "true" : "false", c.audioPathingDedupRadiusFt,
+        c.forcePathingBake ? "true" : "false",
         c.occlusionRadius, c.occlusionSamples,
         c.transmissionScale, c.absorptionScale,
         c.portalRouting ? "true" : "false", c.probePathing ? "true" : "false",
@@ -392,6 +393,7 @@ static void printHelp() {
         "USAGE\n"
         "  darknessRender <mission.mis> [--res <path>] [--schemas <path>]\n"
         "                                [--config <path>] [--skip-reflection-bake]\n"
+        "                                [--force-pathing-bake]\n"
         "                                [--set <yaml.path>=<value>]\n"
         "                                [--perf-label <name>]\n"
         "                                [--exit-after-seconds <N>]\n"
@@ -416,6 +418,16 @@ static void printHelp() {
         "                    (skip the multi-minute reflection bake; only re-bake\n"
         "                    pathing). Hard-fails if no reflection section exists.\n"
         "                    Overrides YAML audio.reflections.bake_skip.\n"
+        "  --force-pathing-bake\n"
+        "                    Drop the existing .probes pathing section and re-bake\n"
+        "                    it fresh even when a valid pathing section is on disk.\n"
+        "                    Symmetric to --skip-reflection-bake; the intended\n"
+        "                    composition is:\n"
+        "                      --skip-reflection-bake --force-pathing-bake\n"
+        "                    which carries reflections forward (skip multi-minute\n"
+        "                    bake) but always re-bakes pathing (seconds). This is\n"
+        "                    the canonical Sweep 2 Phase B invocation —\n"
+        "                    PLAN.AUDIO_PROFILING.md §4.3.\n"
         "  --set <p>=<v>     Generic YAML-path override (repeatable). Applied AFTER\n"
         "                    the YAML load and BEFORE audio init. Supports any\n"
         "                    audio.* leaf — see PLAN.AUDIO_PROFILING.md §1.4.\n"
@@ -4868,6 +4880,7 @@ int main(int argc, char *argv[]) {
         audioSvc->setBakeDiffuseSamples(cfg.bakeDiffuseSamples);
         audioSvc->setBakeAmbisonicsOrder(cfg.bakeAmbisonicsOrder);
         audioSvc->setReflectionBakeSkip(cfg.reflectionBakeSkip);
+        audioSvc->setForcePathingBake(cfg.forcePathingBake);
 
         // -- audio.probes --
         // Bake-time grid parameters. Applied before the auto-bake on first
@@ -5043,6 +5056,36 @@ int main(int argc, char *argv[]) {
                 // No baked probes — need to bake.
                 // This is done BEFORE the render loop starts, so we can use
                 // a simple bgfx debug text progress bar during baking.
+                state.probeBakePath = probePath;
+                state.probeBakeNeeded = true;
+            } else if (cfg.forcePathingBake) {
+                // ── [PATHING_BAKE_FORCE] startup banner ──
+                //
+                // loadProbes() succeeded against the existing .probes file
+                // BUT the user passed --force-pathing-bake — schedule a
+                // bake anyway so the pathing section is regenerated fresh.
+                // The bake invocation respects --skip-reflection-bake (via
+                // mReflectionBakeSkip → ProbeBakeParams::bakeReflectionBatch),
+                // so the canonical Sweep 2 Phase B composition
+                //   --skip-reflection-bake --force-pathing-bake
+                // carries reflection bytes forward and re-bakes pathing
+                // fresh in seconds. See PLAN.AUDIO_PROFILING.md §4.3.
+                //
+                // Loud banner per feedback_no_silent_fallbacks — going
+                // from "load probes (instant)" to "load probes then bake
+                // for ~minutes (or ~seconds if --skip-reflection-bake)"
+                // is a surprise without warning. The banner makes the
+                // mode shift unmissable.
+                std::fprintf(stderr,
+                    "[PATHING_BAKE_FORCE] --force-pathing-bake: existing .probes "
+                    "file '%s' loaded successfully, but the pathing section\n"
+                    "                     will be re-baked anyway. Reflection "
+                    "section will be %s.\n",
+                    probePath.c_str(),
+                    cfg.reflectionBakeSkip
+                        ? "CARRIED FORWARD (--skip-reflection-bake)"
+                        : "RE-BAKED (multi-minute; pass --skip-reflection-bake "
+                          "to carry forward)");
                 state.probeBakePath = probePath;
                 state.probeBakeNeeded = true;
             }

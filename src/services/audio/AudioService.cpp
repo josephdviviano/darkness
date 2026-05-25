@@ -12459,6 +12459,21 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                   "(enabled=%d, RoomService=%s)\n",
                   mProbePathingBatchEnabled ? 1 : 0,
                   mRoomService ? "yes" : "no");
+        // [FALLBACK]: --force-pathing-bake requested a fresh pathing bake
+        // but the pathing batch is disabled by config / missing
+        // RoomService. The bake will proceed with bakePathingBatch=false
+        // and produce a reflection-only (or carried-forward) file —
+        // silently swallowing the user's intent. Loud stderr per
+        // feedback_no_silent_fallbacks.
+        if (mForcePathingBake) {
+            std::fprintf(stderr,
+                "[FALLBACK] --force-pathing-bake requested but pathing batch "
+                "is disabled (audio.pathing_probes.enabled=%d, RoomService=%s) "
+                "— pathing section will NOT be re-baked. Enable "
+                "audio.pathing_probes in YAML to take effect.\n",
+                mProbePathingBatchEnabled ? 1 : 0,
+                mRoomService ? "yes" : "no");
+        }
     }
 
     // Validity filter applied to every probe candidate. Two rejection
