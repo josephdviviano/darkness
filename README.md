@@ -170,6 +170,8 @@ Press **\` (backtick)** to open the in-game settings console. All runtime settin
 | `refl_tri_count` | *(read-only)* | Acoustic scene triangle count |
 | `refl_sample_rate` | *(read-only)* | Reflection-effect sample rate |
 | `refl_ambi_order` | *(read-only)* | Ambisonics order (0=omni, 1=directional) |
+| `show_pathing_graph` | on / off | Overlay the pathing-probe visibility graph; edges in the neighborhood of active voices tinted by perceived EQ quality (green=clear, yellow=partial, red=blocked). |
+| `show_voice_arrows` | on / off | Per-voice source→listener arrow colored by `eqCoeffs.mid` — unambiguous per-voice quality without spatial attribution. |
 
 ##### Audio — Probes & Recording
 
@@ -189,6 +191,7 @@ The CLI is intentionally minimal — all runtime tunables live in the YAML confi
 | `--res <path>` | *(required)* | Thief 2 RES directory containing `fam.crf` and `obj.crf` |
 | `--schemas <path>` | *(none)* | Path to schemas directory (enables spatial audio) |
 | `--config <path>` | `./darknessRender.yaml` | Path to YAML config file |
+| `--skip-reflection-bake` | off | Skip the multi-minute reflection bake and carry the existing `.probes` reflection section forward — re-bakes only the pathing batch. Fast iteration on pathing-only changes. Emits a startup banner + once-per-30s `[REFL_SKIP]` reminder so the stale-reflection state can't be lost. Hard-fails if no prior reflection bake exists. |
 | `--help` / `-h` | | Show help message |
 
 Unknown flags are ignored with a warning.
@@ -208,6 +211,7 @@ Loads a `.mis`, `.gam`, or `.sav` database and inspects its contents.
 | `objects` | List all objects with ID, name, position |
 | `properties [id]` | List all property types, or dump properties for a specific object |
 | `links [id]` | List all relation types, or dump links for a specific object |
+| `probe_plan <mission.mis> --res <path> --schemas <path>` | Dry-run probe placement: emits per-purpose probe counts (reflections / Portal / DoorPair / Centroid / Emitter) + dedup-dropped counts + probe-to-nearest distance histogram, without invoking Steam Audio's bake. Same placement code path as a live bake, so counts match what `darknessRender` would commit. No `.probes` file written. Headless can't register door OBBs (renderer-only), so DoorPair classification is absent — a `[PROBE_PLAN] WARN` line surfaces this. |
 
 Use `--scripts <path>` to specify the schema directory (default: `scripts/thief2`).
 
