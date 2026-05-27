@@ -62,6 +62,8 @@
 #include "audio/AIHearingData.h"
 #include "audio/EnvSoundDatabase.h"
 #include "audio/SchemaSamplesChunk.h"
+#include "audio/SchemaParser.h"
+#include "audio/SchemaTypes.h"
 #include "audio/SpeechDatabase.h"
 
 // Probe-plan verb dependencies — Capability A in PLAN.PROBE_DEBUG_TOOLING.
@@ -78,7 +80,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1500,6 +1505,195 @@ static bool buildAcousticSceneFromMissionFile(
     return audioSvc->buildAcousticScene(fullScene);
 }
 
+// ---------- sound_db verb ----------
+//
+// Walks the schema directory and emits one CSV row per schema with the
+// fields needed to make data-driven decisions about pathing/audible
+// range without re-loading every mission. Schema-level only — per-mission
+// P$SchPlayPa overrides are intentionally ignored so the table reflects
+// the global archetype defaults.
+//
+// Output: perf/sound_db/sound_metadata.csv (or path passed as positional[2])
+//
+// Per-schema max audible distance follows the Dark Engine formula from
+// `AmbientSoundManager.cpp`:
+//   maxDist_ft = max(1, (5000 + volume_cb) / 55) * attenuation_factor
+// where `volume_cb` is the schema's `volume` field (centibels) and
+// `attenuation_factor` is its P$SchAttFac (default 1.0, ~20 for bells).
+static const char *audioClassStr(::Darkness::SchemaAudioClass c) {
+    using AC = ::Darkness::SchemaAudioClass;
+    switch (c) {
+        case AC::Noise:      return "noise";
+        case AC::Speech:     return "speech";
+        case AC::Ambient:    return "ambient";
+        case AC::Music:      return "music";
+        case AC::MetaUI:     return "metaui";
+        case AC::PlayerFeet: return "player_feet";
+        case AC::OtherFeet:  return "other_feet";
+        case AC::Collisions: return "collisions";
+        case AC::Weapons:    return "weapons";
+        case AC::Monsters:   return "monsters";
+    }
+    return "noise";
+}
+
+static int runSoundDbVerb(const std::string &schemasPath,
+                          const std::string &outPathArg,
+                          const std::string &dbFile,
+                          const std::string &scriptsDir)
+{
+    if (schemasPath.empty()) {
+        std::fprintf(stderr,
+            "[SOUND_DB] --schemas <DIR> required\n");
+        return 1;
+    }
+
+    ::Darkness::SchemaParser parser;
+    if (!parser.loadDirectory(schemasPath)) {
+        std::fprintf(stderr,
+            "[SOUND_DB] failed to load schemas from %s\n",
+            schemasPath.c_str());
+        return 1;
+    }
+    std::fprintf(stderr,
+        "[SOUND_DB] loaded %zu schemas from %s\n",
+        parser.schemaCount(), schemasPath.c_str());
+
+    // OPTIONAL overlay pass.  Schema .sch text files set attenuation
+    // factor = 1.0 by default; the per-archetype P$SchAttFac override
+    // lives in dark.gam (and per-mission .mis files).  Without these
+    // overrides every schema looks like a 91 ft sound, missing the
+    // ~20× boost authored for bells / long-carry SFX.  When the user
+    // passes a database file (mission .mis or dark.gam), spin up the
+    // service stack, load the DB, and overlay P$SchAttFac onto the
+    // local SchemaParser instance so the CSV reflects real audible
+    // distances.
+    int attFacOverrides = 0;
+    if (!dbFile.empty()) {
+        initServices();
+        loadSchema(scriptsDir);
+        loadDatabase(dbFile);
+        ::Darkness::PropertyServicePtr propSvc =
+            GET_SERVICE(::Darkness::PropertyService);
+        ::Darkness::ObjectServicePtr objSvc =
+            GET_SERVICE(::Darkness::ObjectService);
+        if (propSvc && objSvc) {
+            ::Darkness::Property *attFacProp = propSvc->getProperty("SchAttFac");
+            if (attFacProp && attFacProp->getStorage()) {
+                auto *storage = attFacProp->getStorage();
+                auto it = storage->getAllStoredObjects();
+                while (!it->end()) {
+                    int objID = it->next();
+                    size_t sz = 0;
+                    const uint8_t *bytes = storage->getRawData(objID, sz);
+                    if (!bytes || sz < sizeof(float)) continue;
+                    float factor;
+                    std::memcpy(&factor, bytes, sizeof(float));
+                    if (factor <= 0.0f) continue;
+                    std::string schemaName = objSvc->getName(objID);
+                    if (schemaName.empty()) continue;
+                    auto *sch = parser.findSchemaMutable(schemaName);
+                    if (!sch) continue;
+                    sch->playParams.attenuationFactor = factor;
+                    ++attFacOverrides;
+                }
+            }
+        }
+        std::fprintf(stderr,
+            "[SOUND_DB] applied %d P$SchAttFac overrides from %s\n",
+            attFacOverrides, dbFile.c_str());
+    } else {
+        std::fprintf(stderr,
+            "[SOUND_DB] no database file — schema-text defaults only "
+            "(all atten_factor=1.0). Pass a .mis or dark.gam as first "
+            "positional to apply P$SchAttFac overrides.\n");
+    }
+
+    // Resolve output path; default into the existing perf/ tree.
+    std::string outPath = outPathArg.empty()
+        ? std::string("perf/sound_db/sound_metadata.csv")
+        : outPathArg;
+    // Create parent dirs (mkdir -p semantics). The existing `perf/`
+    // siblings are gitignored already; this just makes the verb usable
+    // out-of-the-box.
+    {
+        std::string dir = outPath;
+        size_t slash = dir.find_last_of("/\\");
+        if (slash != std::string::npos) {
+            dir = dir.substr(0, slash);
+            // Use mkdir -p via shell; portable enough for darwin/linux
+            // and keeps the verb code free of POSIX directory APIs.
+            std::string cmd = "mkdir -p '" + dir + "'";
+            std::system(cmd.c_str());
+        }
+    }
+
+    std::ofstream out(outPath);
+    if (!out.is_open()) {
+        std::fprintf(stderr,
+            "[SOUND_DB] cannot open %s for writing\n", outPath.c_str());
+        return 1;
+    }
+
+    out << "# Generated by darknessHeadless sound_db. Schema-level "
+        << "defaults; per-mission P$SchPlayPa overrides not applied.\n";
+    out << "schema,archetype,gain_cb,atten_factor,max_audible_ft,"
+        << "audio_class,priority,is_looping,is_poly_loop,max_samples_loop,"
+        << "n_samples,fade_ms,initial_delay_ms,schema_flags_hex,"
+        << "has_env_tag,has_voice,sample_names\n";
+
+    size_t emitted = 0;
+    for (const auto &kv : parser.schemas()) {
+        const auto &s = kv.second;
+        const auto &pp = s.playParams;
+        const auto &lp = s.loopParams;
+
+        const float gainCb = static_cast<float>(pp.volume);
+        float atten = pp.attenuationFactor;
+        if (atten <= 0.01f) atten = 1.0f;
+        float maxDist = (5000.0f + gainCb) / 55.0f;
+        if (maxDist < 1.0f) maxDist = 1.0f;
+        maxDist *= atten;
+
+        // Sample names pipe-joined so the CSV stays single-row per schema.
+        std::ostringstream samples;
+        for (size_t i = 0; i < s.samples.size(); ++i) {
+            if (i > 0) samples << "|";
+            samples << s.samples[i].name;
+        }
+
+        char flagsHex[16];
+        std::snprintf(flagsHex, sizeof(flagsHex), "0x%X",
+                      static_cast<unsigned>(pp.flags));
+
+        out << s.name << ","
+            << s.archetypeName << ","
+            << pp.volume << ","
+            << std::fixed << std::setprecision(2) << atten << ","
+            << std::fixed << std::setprecision(1) << maxDist << ","
+            << audioClassStr(pp.audioClass) << ","
+            << pp.priority << ","
+            << (lp.isLooping ? 1 : 0) << ","
+            << (lp.isPoly ? 1 : 0) << ","
+            << static_cast<int>(lp.maxSamples) << ","
+            << s.samples.size() << ","
+            << pp.fade << ","
+            << pp.initialDelay << ","
+            << flagsHex << ","
+            << (s.hasEnvTags() ? 1 : 0) << ","
+            << (s.hasVoice() ? 1 : 0) << ","
+            << samples.str()
+            << "\n";
+        ++emitted;
+    }
+    out.close();
+
+    std::fprintf(stdout,
+        "[SOUND_DB] wrote %zu schema rows to %s\n",
+        emitted, outPath.c_str());
+    return 0;
+}
+
 static int runProbePlanVerb(const std::string &misPath,
                              const std::string &resPath,
                              const std::string &schemasPath,
@@ -1661,6 +1855,60 @@ static int runProbePlanVerb(const std::string &misPath,
         plan.dedupDroppedTotal, plan.dedupDroppedCentroids,
         plan.dedupDroppedDoorPairs, plan.dedupDroppedOther);
 
+    // Per-room pathing-probe distribution.  Pathing runtime cost scales
+    // with edges-visited per query; edge count scales with local probe
+    // density.  Rooms with many probes (hub rooms with N portals + door
+    // pairs) drive worst-case `[PATHING_SLOW]` cost; rooms with zero
+    // probes (small closets that lost their centroid to dedup) drive
+    // `eq=[0.1,0.1,0.1]` solver sentinels for in-room voices.
+    {
+        RoomServicePtr roomSvc = GET_SERVICE(RoomService);
+        if (roomSvc && roomSvc->isLoaded()) {
+            std::map<int, int> perRoomCount;  // roomID -> probe count
+            int orphanProbes = 0;             // probes outside any room
+            for (const auto &cand : plan.pathingKept) {
+                ::Darkness::Room *r = roomSvc->roomFromPoint(cand.position);
+                if (r) perRoomCount[r->getRoomID()]++;
+                else   ++orphanProbes;
+            }
+            // Count rooms with zero probes (loaded via getRoomByID scan,
+            // matches the ROOM_CENTROID estimate from earlier scheme cmp).
+            int totalRooms      = 0;
+            int roomsWithZero   = 0;
+            for (int rid = 0; rid < 4096; ++rid) {
+                if (!roomSvc->getRoomByID(rid)) continue;
+                ++totalRooms;
+                if (perRoomCount.find(rid) == perRoomCount.end()) {
+                    ++roomsWithZero;
+                }
+            }
+            // Histogram of probes-per-room (only over rooms with ≥1).
+            std::vector<int> counts;
+            counts.reserve(perRoomCount.size());
+            for (auto &kv : perRoomCount) counts.push_back(kv.second);
+            std::sort(counts.begin(), counts.end());
+            auto pct = [&](float p) -> int {
+                if (counts.empty()) return 0;
+                size_t idx = std::min(counts.size() - 1,
+                                      static_cast<size_t>(p * counts.size()));
+                return counts[idx];
+            };
+            double mean = 0.0;
+            for (int c : counts) mean += c;
+            if (!counts.empty()) mean /= counts.size();
+            std::fprintf(stdout,
+                "[PROBE_PLAN] pathing per-room: total_rooms=%d "
+                "rooms_with_probes=%zu rooms_with_zero=%d orphan_probes=%d  "
+                "per-room counts: mean=%.1f min=%d p25=%d med=%d p75=%d "
+                "p95=%d max=%d\n",
+                totalRooms, perRoomCount.size(), roomsWithZero, orphanProbes,
+                mean,
+                counts.empty() ? 0 : counts.front(),
+                pct(0.25f), pct(0.50f), pct(0.75f), pct(0.95f),
+                counts.empty() ? 0 : counts.back());
+        }
+    }
+
     // Distance histogram: for each probe (across both batches) compute
     // distance to nearest OTHER probe, bucket. Lets the user spot
     // coverage holes (lots of >=20 ft probes) or wasteful clustering
@@ -1788,6 +2036,11 @@ static void printUsage(const char *prog) {
     std::cerr << "                    attached to objects)." << std::endl;
     std::cerr << "  prop-dump <name>  Dump every record of a named property (e.g. SchPlayPa," << std::endl;
     std::cerr << "                    SpotAmb, PrjSound, AmbientHa)." << std::endl;
+    std::cerr << "  sound_db [outpath] Walk --schemas dir and emit a CSV of every schema's" << std::endl;
+    std::cerr << "                    name, gain, attenuation factor, max audible distance," << std::endl;
+    std::cerr << "                    audio class, loop state, sample count, etc." << std::endl;
+    std::cerr << "                    Mission-less verb — invoke as: darknessHeadless sound_db" << std::endl;
+    std::cerr << "                    [outpath] --schemas <DIR>" << std::endl;
     std::cerr << "  ambients          List every P$AmbientHa emitter with schema + position." << std::endl;
     std::cerr << "  probe_plan        Dry-run the audio probe placement passes for this mission" << std::endl;
     std::cerr << "                    and print per-purpose probe counts WITHOUT invoking the" << std::endl;
@@ -1854,8 +2107,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    std::string dbFile = positionalArgs[0];
-    std::string command = (positionalArgs.size() >= 2) ? positionalArgs[1] : "info";
+    // sound_db can run mission-less (text-only) or with a mission/dark.gam
+    // to apply P$SchAttFac + P$SchPlayPa overrides:
+    //   darknessHeadless sound_db [outpath] --schemas DIR     → text-only
+    //   darknessHeadless <mission|gam> sound_db [outpath]     → with overlays
+    std::string dbFile;
+    std::string command;
+    if (positionalArgs[0] == "sound_db") {
+        command = positionalArgs[0];
+        // dbFile stays empty — text-only dump.
+    } else {
+        dbFile  = positionalArgs[0];
+        command = (positionalArgs.size() >= 2) ? positionalArgs[1] : "info";
+    }
 
     // Set up logging - suppress for Level 1, allow for Level 2
     Logger logger;
@@ -1953,6 +2217,18 @@ int main(int argc, char *argv[]) {
                 printRoomInfo(std::stoi(positionalArgs[i]));
                 if (i + 1 < positionalArgs.size()) std::cout << std::endl;
             }
+        } else if (command == "sound_db") {
+            // sound_db: walks the schema directory; optionally applies
+            // P$SchAttFac/SchPlayPa overrides from dbFile when present.
+            //   • text-only invocation:  positionalArgs = [sound_db, outpath?]
+            //   • with overlays:         positionalArgs = [dbFile, sound_db, outpath?]
+            std::string outPath;
+            if (dbFile.empty()) {
+                if (positionalArgs.size() >= 2) outPath = positionalArgs[1];
+            } else {
+                if (positionalArgs.size() >= 3) outPath = positionalArgs[2];
+            }
+            return runSoundDbVerb(schemasPath, outPath, dbFile, scriptsDir);
         } else if (command == "probe_plan") {
             // probe_plan handles its own initServices / loadSchema /
             // ── --set overrides flow here (only probe_plan reads them today)

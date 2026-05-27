@@ -145,19 +145,20 @@ audio:
     sim_max_occlusion_samples: 32  # [DIRECT+REFLECTIONS] (4–256)
 
     # ── thread budget ──
-    # Total threads dedicated to reverb work (convolution workers + the
-    # ray-trace simulator combined). The invariant
-    # `conv_workers + sim_threads == reverb_threads` is enforced at init,
-    # so over-allocation is impossible regardless of how the share is set.
-    # 0 = auto: hwconc - 2 (reserves 2 cores for main + audio threads).
-    reverb_threads: 0
-    # Fraction of the budget above assigned to convolution workers (rest
-    # goes to the simulator). -1 = auto: 0.35 in baked-only mode, 0.45
-    # with realtime voices. The sim is the bottleneck in both modes
-    # (hundreds of ms per cycle); convolution has plenty of headroom for
-    # typical voice counts, so we give the sim the majority of threads
-    # by default. Override with an explicit 0.0–1.0 value.
-    reverb_threads_conv_share: -1
+    # Two explicit integer counts for reverb work.
+    #   conv_threads — per-voice convolution workers (USER_INTERACTIVE QoS)
+    #   sim_threads  — Steam Audio ray-trace simulator threads (UTILITY QoS)
+    # Both 0  = auto: total = max(4, hwconc - 2), split ~35% conv /
+    #           ~65% sim in baked-only mode (~45% / ~55% with realtime
+    #           voices). The sim is the bottleneck in both modes
+    #           (hundreds of ms per cycle); convolution has plenty of
+    #           headroom for typical voice counts.
+    # Both > 0 = use the literal values (no invariant against hwconc).
+    # Mixed (one 0, one > 0) emits a [REVERB_THREADS][FALLBACK] warning
+    # and falls back to auto for both — the contract is "set both or
+    # neither."
+    conv_threads: 0
+    sim_threads:  0
 
     # ── scene backend ──
     # "default" = Steam Audio's built-in CPU raytracer.
@@ -329,7 +330,7 @@ audio:
     max_distance: 200.0          # max propagation distance (world units, 10–5000)
     door_lpf_open_hz: 20000      # LPF cutoff for fully open door (Hz, 1k–24k)
     door_lpf_blocked_hz: 800     # LPF cutoff for fully blocked door (Hz, 100–10k)
-    min_attenuation: 0.001       # propagation floor (0–0.1; prevents FP-noise dropouts)
+    min_attenuation: 0.0         # propagation floor (0–0.1; floor disabled by default; was 0.001; FP-noise reasoning was speculative — left in place as a config knob in case it needs to be re-enabled)
     # N-path BFS: keep multiple portal-graph routes when a sound can reach
     # the listener through more than one doorway. 1 = single shortest path
     # (single-source behavior); 2 = original Dark Engine (dual-predecessor
@@ -392,8 +393,20 @@ audio:
 
   ambient:
     # P$AmbientHack-driven looping sounds (mission ambients).
-    hysteresis_start_mul: 1.5    # multiplier on radius for activation (1–5)
-    hysteresis_stop_mul: 2.0     # multiplier on radius for deactivation (1–5; > start)
+    #
+    # Voice lifecycle (Group D, 2026-05):
+    #   * Spawn: dist < amb.radius (original-engine spawn boundary, no
+    #     multiplier).
+    #   * Halt:  perceived audibility (mapping.gain ×
+    #            directParams.distanceAttenuation × schema_gain_linear)
+    #            drops below `halt_audibility_threshold_db` for
+    #            `halt_below_threshold_frames` consecutive ticks.
+    # `spawn_fade_in_ms` / `halt_fade_out_ms` straight-line ramps hide
+    # the discrete state-change pops on either end.
+    spawn_fade_in_ms: 150        # volume ramp 0→full on voice spawn (0–2000 ms)
+    halt_fade_out_ms: 250        # volume ramp full→0 before halt-stop (0–2000 ms)
+    halt_audibility_threshold_db: -50  # dB level below which voice is "inaudible" (-80 to -20)
+    halt_below_threshold_frames: 30    # consecutive sub-threshold frames before halt (5–600)
     default_priority: 64         # priority for ambients without explicit value (0–255)
     # Per-voice HRTF spatial-blend override for room-attached ambients
     # (AMB_ENVIRONMENTAL: wind, church reverberance, generic room tone).

@@ -767,8 +767,17 @@ public:
     float getPathingUpdateInterval() const { return mPathingUpdateInterval; }
 
     // ── Ambient tuning (facades — forwarded to AmbientSoundManager) ──
-    void setAmbHysteresisStartMul(float m);
-    void setAmbHysteresisStopMul(float m);
+    //
+    // Group D (2026-05) — Euclidean radius × hysteresis_*_mul gate
+    // retired in favour of dB-based halt audibility. Spawn fires when
+    // `dist < amb.radius` (no multiplier); halt fires when audibility
+    // (mapping.gain × directParams.distanceAttenuation × schema_cb)
+    // stays below threshold for N consecutive ticks. Fade-in / fade-out
+    // ramps hide the discrete state changes.
+    void setAmbientSpawnFadeInMs(int ms);
+    void setAmbientHaltFadeOutMs(int ms);
+    void setAmbientHaltAudibilityThresholdDb(float db);
+    void setAmbientHaltBelowThresholdFrames(int frames);
     void setAmbDefaultPriority(int p);
     // Per-voice spatialBlend override applied to AMB_ENVIRONMENTAL ambients
     // at activation time. 1.0 = full HRTF point-source pan; 0.0 = mono
@@ -787,28 +796,27 @@ public:
     int  getMaxActiveVoices() const { return mMaxActiveVoicesCfg; }
     void setSimMaxOcclusionSamples(int n) { mSimMaxOcclusionSamplesCfg = std::max(4, std::min(n, 256)); }
 
-    // ── Thread budget (merged convolution + sim) ──
-    // Total threads dedicated to reverb work, split between the per-voice
-    // convolution worker pool and Steam Audio's ray-trace simulator. The
-    // invariant `conv_workers + sim_threads == reverb_threads` is enforced
-    // at init time — guarantees no over-allocation regardless of how the
-    // user sets the share.
-    //
-    // 0 = auto: total = max(2, hwconc - 2). Reserves 2 cores for main +
-    // audio threads.
-    void  setReverbThreads(int n) { mReverbThreadsCfg = std::max(0, std::min(n, 64)); }
-    int   getReverbThreads() const { return mReverbThreadsCfg; }
-    // Fraction of the reverb-thread budget assigned to convolution
-    // workers (vs the ray-trace simulator). -1 = auto: chosen at init
-    // based on whether realtime is enabled (baked-only configs bias
-    // toward convolution since the sim is largely idle work in that
-    // mode; realtime configs bias toward sim since the cycle is the
-    // expensive one). Any value in [0.0, 1.0] is honored literally.
-    void  setReverbThreadsConvShare(float share) {
-        mReverbThreadsConvShareCfg = (share < 0.0f) ? -1.0f
-                                                    : std::max(0.0f, std::min(share, 1.0f));
+    // ── Thread counts (per-voice convolution workers + Steam Audio sim) ──
+    // Two explicit integer counts. Both 0 = auto: total = max(2, hwconc -
+    // 2), split ~35% conv / ~65% sim in baked-only mode (~45% / ~55%
+    // with realtime voices). Both > 0 = use literal values. Mixed (one
+    // 0, one > 0) emits a [REVERB_THREADS] warning and falls back to
+    // auto for both.
+    void  setConvThreads(int n) { mConvThreadsCfg = std::max(0, std::min(n, 64)); }
+    int   getConvThreads() const { return mConvThreadsCfg; }
+    void  setSimThreads(int n)  { mSimThreadsCfg  = std::max(0, std::min(n, 64)); }
+    int   getSimThreads() const  { return mSimThreadsCfg; }
+
+    /// True iff `sampleName` has previously failed to load (recorded by
+    /// startVoice when the sound loader returns an invalid SoundData).
+    /// Used by AmbientSoundManager to distinguish a genuine asset miss
+    /// — which is permanent and should latch resolutionFailed — from a
+    /// transient startVoice failure (pool saturation, distance cull)
+    /// that may recover next frame. CRF resources are immutable at
+    /// runtime, so once a sample is in this set it will never resolve.
+    bool isSampleKnownBad(const std::string& sampleName) const {
+        return mFailedSamples.count(sampleName) > 0;
     }
-    float getReverbThreadsConvShare() const { return mReverbThreadsConvShareCfg; }
 
     /// "default" or "embree". Embree requires a Steam Audio build with
     /// Embree linked; AudioService falls back to "default" with a loud
@@ -1114,11 +1122,11 @@ public:
     void setHalfRateReflections(bool enabled);
     bool getHalfRateReflections() const;
 
-    // Convolution worker count / simulator thread count are no longer
-    // independent knobs — they are derived at init time from
-    // mReverbThreadsCfg + mReverbThreadsConvShareCfg (see setReverbThreads
-    // / setReverbThreadsConvShare above). Getters expose the derived
-    // values for diagnostics.
+    // Convolution worker count / simulator thread count are derived at
+    // init time from mConvThreadsCfg + mSimThreadsCfg (see setConvThreads
+    // / setSimThreads above): literal if both > 0, else auto-derived
+    // from hwconc - 2 with a realtime-biased split. Getters expose the
+    // derived values for diagnostics.
     int  getConvolutionWorkerCount() const { return mConvolutionWorkerCount; }
     int  getSimulatorThreadCount() const { return mSimulatorThreadCount; }
 
@@ -1402,6 +1410,34 @@ private:
     // computes the linear gain and applies the duck multiplier; this
     // helper crosses the ActiveVoice/miniaudio boundary in one shot.
     void voiceSetLinearVolume(SoundHandle handle, float linearVol);
+    // Apply a straight-line volume ramp via ma_sound_set_fade_in_milliseconds.
+    // Used by AmbientSoundManager for spawn fade-in (0 → 1) and halt fade-out
+    // (current volume → 0). volumeBeg < 0 means "use the sound's current
+    // volume" (miniaudio convention). Safe to call any time after startVoice
+    // has succeeded.
+    void voiceSetFadeMilliseconds(SoundHandle handle, float volumeBeg,
+                                  float volumeEnd, int fadeMs);
+    // Read back the current effective audibility shaping for an ambient
+    // voice: `max(directParams.distanceAttenuation, portalAttenuation)`.
+    // The first term is the dry/HRTF direct path's distance falloff; the
+    // second is the routed wet-bus gain (already encodes mapping.gain ×
+    // occlSmooth per Group A). Taking the max means a voice is reported
+    // audible if EITHER path is audible — fixing the pre-Bug-1 formula
+    // (`portalAttenuation × distanceAttenuation`) which only measured the
+    // wet bus and falsely marked pre-solve voices (eq=[0,0,0] init,
+    // portalAttenuation=0) inaudible despite a clearly audible direct
+    // path. The caller multiplies in the per-schema centibel linear
+    // amplitude. Returns 0.0 if the voice doesn't exist. See
+    // AmbientSoundManager::updateAmbientVolumes for the use site.
+    float voiceCurrentAudibility(SoundHandle handle) const;
+    /// True iff the pathing solver has produced at least one non-sentinel
+    /// result for this voice (i.e. lastGoodPathParams has been populated
+    /// from a real routed solve). New voices return false until their
+    /// first solve arrives via the pathing simulator's async worker.
+    /// Used by AmbientSoundManager to gate the dB-based halt counter —
+    /// voices in the pre-solve window have wet bus silent by design and
+    /// shouldn't be halted on that account.
+    bool voicePathingEverSolved(SoundHandle handle) const;
     // Current global ducking multiplier (1.0 = no duck). Returns 1.0 if
     // ducking is disabled or the mix node isn't ready.
     float currentDuckGain() const;
@@ -1844,15 +1880,13 @@ private:
     // ── Performance/infrastructure (must be set BEFORE init/buildAcousticScene) ──
     int         mMaxActiveVoicesCfg        = MAX_ACTIVE_VOICES;
     int         mSimMaxOcclusionSamplesCfg = 32;
-    // Thread budget for reverb work (convolution + sim combined). The
-    // share knob divides it; the actual derived counts land in
-    // mConvolutionWorkerCount / mSimulatorThreadCount at init time.
-    // 0 = auto: hwconc - 2 (reserve 2 cores for main + audio).
-    int         mReverbThreadsCfg          = 0;
-    // -1 = auto split (depends on whether realtime is enabled). Else
-    // literal fraction in [0.0, 1.0] of the budget assigned to
-    // convolution workers; remainder goes to simulator threads.
-    float       mReverbThreadsConvShareCfg = -1.0f;
+    // Explicit thread counts. Both 0 = auto: total hwconc-2 split by
+    // baked/realtime-biased ratio. Both > 0 = use literally. Mixed
+    // values fall back to auto with a [REVERB_THREADS] warning. The
+    // derived counts land in mConvolutionWorkerCount /
+    // mSimulatorThreadCount at init time.
+    int         mConvThreadsCfg            = 0;
+    int         mSimThreadsCfg             = 0;
     std::string mSceneTypeCfg              = "default"; // "default" or "embree"
     int         mAudioSampleRateCfg        = static_cast<int>(kDefaultDeviceSampleRate);
     int         mAudioFrameSizeCfg         = 512;
@@ -1890,7 +1924,8 @@ private:
     std::vector<Vector3> mFloorProbeCandidates;
 
     /// Derived counts populated at initReflectionPipeline time from
-    /// mReverbThreadsCfg + mReverbThreadsConvShareCfg. Sum == budget.
+    /// mConvThreadsCfg + mSimThreadsCfg (literal if both > 0, else
+    /// auto-derived from hwconc - 2 with realtime-biased split).
     /// Rate divisor lives on mReflectionSim now.
     int mConvolutionWorkerCount = 0;
     int mSimulatorThreadCount   = 0;

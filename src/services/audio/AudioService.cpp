@@ -724,7 +724,11 @@ std::atomic<int>   sHrtfInterpolation{1};
 std::atomic<float> sSpatialBlend{1.0f};
 std::atomic<float> sDoorLpfOpenHz{20000.0f};
 std::atomic<float> sDoorLpfBlockedHz{800.0f};
-std::atomic<float> sPropMinAttenuation{0.001f};
+// Default 0.0 disables the floor (was 0.001). The FP-noise reasoning was
+// speculative and was never proven; with smooth occlusion ramps, the
+// product naturally reaches 0 without dropout artifacts. The YAML knob
+// is retained so the floor can be re-enabled if needed.
+std::atomic<float> sPropMinAttenuation{0.0f};
 /// Engine sample rate published for audio-thread DSP that needs it (door LPF, etc.)
 static std::atomic<uint32_t> sEngineSampleRate{kDefaultDeviceSampleRate};
 
@@ -960,6 +964,24 @@ extern LatencyHistogram sPerfReflSimMs;
 // Writer: audio thread (one). Reader: main-thread periodic dump.
 static LatencyHistogram sPerfInterCallbackMs;
 static std::atomic<long long> sLastCallbackNs{0};
+
+// ── Device-callback inter-call period (miniaudio's dataCallback) ──
+//
+// Companion to sPerfInterCallbackMs above. inter_cb measures the gap
+// between consecutive entries to reflectionMixNodeProcess, which is a
+// downstream node in the miniaudio node graph and is drained at
+// multiples of the node's internal cache size — NOT at the device
+// clock period. device_cb here measures the gap between consecutive
+// entries to engineDeviceDataCallback, which IS the device clock.
+//
+// If device_cb p50 ≈ frames/sampleRate × 1000 ms while inter_cb p50
+// diverges, the inter_cb gap is a node-graph drain pattern artifact,
+// not a CoreAudio device-clock slip. If both diverge, the device
+// itself is firing late (e.g. periods=2 underrunning under load) and
+// the audio stream is at risk of underflow.
+// Writer: audio device thread. Reader: main-thread periodic dump.
+static LatencyHistogram sPerfDeviceCbMs;
+static std::atomic<long long> sLastDeviceCbNs{0};
 
 // ── Wet-bus beat detector ──
 //
@@ -1493,6 +1515,8 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             float atten = node->directParams.distanceAttenuation
                         * node->directParams.occlusion
                         * node->portalAttenuation;
+            // Default min-atten is 0.0 (no-op for non-negative `atten`); the
+            // YAML key is retained as a knob so the floor can be re-enabled.
             float minAtten = sPropMinAttenuation.load(std::memory_order_relaxed);
             if (atten < minAtten) atten = minAtten;
             node->lastAtten.store(atten, std::memory_order_relaxed);
@@ -1630,6 +1654,8 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         // centroid is the right summary).
         if (runAtten && !node->skipAttenuation) {
             float portalTarget = audioSanitizeScalar(node->portalAttenuation, 1.0f);
+            // Default min-atten is 0.0 (no-op for non-negative `portalTarget`);
+            // the YAML key is retained as a knob so the floor can be re-enabled.
             float minAtten = sPropMinAttenuation.load(std::memory_order_relaxed);
             if (portalTarget < minAtten) portalTarget = minAtten;
 
@@ -3140,6 +3166,17 @@ static void engineDeviceDataCallback(ma_device *pDevice, void *pFramesOut,
                                      const void *pFramesIn, ma_uint32 frameCount)
 {
     (void)pFramesIn;
+    // Capture inter-call period at the device boundary. See sPerfDeviceCbMs
+    // commentary above for why this is distinct from sPerfInterCallbackMs.
+    {
+        const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const long long lastNs = sLastDeviceCbNs.exchange(
+            nowNs, std::memory_order_acq_rel);
+        if (lastNs != 0) {
+            sPerfDeviceCbMs.record(static_cast<double>(nowNs - lastNs) / 1e6);
+        }
+    }
     auto *pEngine = static_cast<ma_engine*>(pDevice->pUserData);
     if (pEngine)
         ma_engine_read_pcm_frames(pEngine, pFramesOut, frameCount, nullptr);
@@ -3313,16 +3350,33 @@ void AudioService::publishAudioThreadParams()
 // clamps the previous inline setters applied. Manager is constructed in
 // the AudioService constructor and lives for the service's lifetime, so
 // these are always safe to call.
-void AudioService::setAmbHysteresisStartMul(float m)
+//
+// Group D (2026-05): radius × hysteresis_*_mul setters retired; the
+// quartet below configures the new dB-based halt + fade machinery.
+void AudioService::setAmbientSpawnFadeInMs(int ms)
 {
     if (mAmbientManager)
-        mAmbientManager->setHysteresisStartMul(std::max(1.0f, std::min(m, 5.0f)));
+        mAmbientManager->setSpawnFadeInMs(std::max(0, std::min(ms, 2000)));
 }
 
-void AudioService::setAmbHysteresisStopMul(float m)
+void AudioService::setAmbientHaltFadeOutMs(int ms)
 {
     if (mAmbientManager)
-        mAmbientManager->setHysteresisStopMul(std::max(1.0f, std::min(m, 5.0f)));
+        mAmbientManager->setHaltFadeOutMs(std::max(0, std::min(ms, 2000)));
+}
+
+void AudioService::setAmbientHaltAudibilityThresholdDb(float db)
+{
+    if (mAmbientManager)
+        mAmbientManager->setHaltAudibilityThresholdDb(
+            std::max(-80.0f, std::min(db, -20.0f)));
+}
+
+void AudioService::setAmbientHaltBelowThresholdFrames(int frames)
+{
+    if (mAmbientManager)
+        mAmbientManager->setHaltBelowThresholdFrames(
+            std::max(5, std::min(frames, 600)));
 }
 
 void AudioService::setAmbDefaultPriority(int p)
@@ -3387,6 +3441,61 @@ void AudioService::voiceSetLinearVolume(SoundHandle handle, float linearVol)
     ActiveVoice *v = mVoicePool->find(handle);
     if (!v) return;
     ma_sound_set_volume(&v->sound, linearVol);
+}
+
+void AudioService::voiceSetFadeMilliseconds(SoundHandle handle, float volumeBeg,
+                                            float volumeEnd, int fadeMs)
+{
+    if (!mVoicePool) return;
+    ActiveVoice *v = mVoicePool->find(handle);
+    if (!v || !v->initialized) return;
+    if (fadeMs < 0) fadeMs = 0;
+    // Per miniaudio convention, volumeBeg < 0 means "start from the
+    // sound's current effective volume". The fade is multiplicative
+    // with whatever ma_sound_set_volume() last applied, so AmbientSoundManager
+    // can safely continue updating volume per-frame during the fade window.
+    ma_sound_set_fade_in_milliseconds(&v->sound, volumeBeg, volumeEnd,
+                                      static_cast<ma_uint64>(fadeMs));
+}
+
+float AudioService::voiceCurrentAudibility(SoundHandle handle) const
+{
+    if (!mVoicePool) return 0.0f;
+    ActiveVoice *v = mVoicePool->find(handle);
+    if (!v) return 0.0f;
+    // Bug 1 fix: the prior formula `portalAttenuation × distanceAttenuation`
+    // only measured the WET BUS routing gain (portalAttenuation encodes
+    // `mapping.gain × occlSmooth` per Group A; multiplied by the direct
+    // path's distance attenuation it modelled the routed-pathing signal
+    // shaping). It IGNORED the DIRECT-path contribution — the dry HRTF-
+    // spatialized signal a listener hears even when the wet bus is silent
+    // (eq=[0,0,0]) during the pre-solve window. The result: voices in the
+    // pre-solve window with `portalAttenuation=0` were marked inaudible
+    // despite their direct path being clearly above threshold, which let
+    // the AmbientSoundManager halt counter tick (Bug 2) and produced a
+    // square-wave tremolo at ~1 Hz on distant stationary mono_loop voices
+    // (m06wingedM / m06wingedF in MISS6) as halt → respawn cycled.
+    //
+    // New formula: max(direct shaping, wet shaping). The caller multiplies
+    // the result by the per-schema centibel linear amplitude (linearVol),
+    // so what comes out of this function is the larger of the two voice-
+    // routing shaping factors. Equivalent to the spec's
+    //   max(distanceAttenuation × linearVol, portalAttenuation × linearVol)
+    // — factoring linearVol out keeps the per-schema lookup at the call
+    // site (AmbientSoundManager already computes it).
+    const float portal = v->dspNode.portalAttenuation;
+    const float dist   = v->dspNode.directParams.distanceAttenuation;
+    float direct = std::isfinite(dist)   && dist   > 0.0f ? dist   : 0.0f;
+    float wet    = std::isfinite(portal) && portal > 0.0f ? portal : 0.0f;
+    return std::max(direct, wet);
+}
+
+bool AudioService::voicePathingEverSolved(SoundHandle handle) const
+{
+    if (!mVoicePool) return false;
+    const ActiveVoice *v = mVoicePool->find(handle);
+    if (!v) return false;
+    return v->pathingEverSolved;
 }
 
 float AudioService::currentDuckGain() const
@@ -3766,54 +3875,64 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
                                  static_cast<int>(mReflectionFrameSize)),
             std::memory_order_relaxed);
 
-        // ── Reverb-thread budget split ──
+        // ── Reverb-thread allocation ──
         //
-        // Total budget: mReverbThreadsCfg (0 = auto: hwconc - 2, reserving
-        // 2 cores for main + audio). Split between convolution workers and
-        // ray-trace simulator threads using mReverbThreadsConvShareCfg.
+        // Two explicit integer counts:
+        //   mConvThreadsCfg — per-voice convolution workers
+        //   mSimThreadsCfg  — Steam Audio ray-trace simulator threads
         //
-        // Auto-split policy (-1): bias toward sim in both modes. Empirically
-        // (see SESSION_LOGS 2026-05-20) the sim is the bottleneck regardless
-        // of whether realtime voices consume its output: per-cycle cost is
-        // hundreds of ms and scales with maxNumRays + numDiffuseSamples,
-        // both of which are paid up front at simulator-create time.
-        // Convolution has plenty of headroom — for the typical 12-16 voice
-        // load each apply is ~2-3 ms and parallelizes trivially across
-        // workers, so 3-4 workers is enough to stay well under the 21 ms
-        // callback budget. Realtime configs bias slightly more toward
-        // convolution because realtime voices add per-voice apply work.
+        // Both 0  = auto: total = max(4, hwconc - 2), split with a
+        //           realtime-biased ratio (~35% conv / ~65% sim in
+        //           baked-only mode; ~45% / ~55% with realtime voices).
+        //           Empirically (SESSION_LOGS 2026-05-20) the sim is the
+        //           bottleneck regardless of mode: per-cycle cost is
+        //           hundreds of ms and scales with maxNumRays +
+        //           numDiffuseSamples. Convolution has headroom — for the
+        //           typical 12-16 voice load each apply is ~2-3 ms and
+        //           parallelizes across workers, so 3-4 workers is enough
+        //           to stay well under the 21 ms callback budget.
         //
-        // The invariant `conv + sim == total` is enforced here so the user
-        // cannot over-allocate regardless of how the share is set.
+        // Both > 0 = use literal values. No invariant against hwconc — if
+        //            the user asks for 20+20 on a 12-core box, that's
+        //            their call.
+        //
+        // Mixed    = one 0, one > 0. Falls back to auto with a loud
+        //            [REVERB_THREADS] warning — the contract is "set both
+        //            or neither."
         {
-            int totalThreads;
-            if (mReverbThreadsCfg > 0) {
-                totalThreads = mReverbThreadsCfg;
+            const bool bothExplicit = (mConvThreadsCfg > 0 && mSimThreadsCfg > 0);
+            const bool bothAuto     = (mConvThreadsCfg == 0 && mSimThreadsCfg == 0);
+
+            if (!bothExplicit && !bothAuto) {
+                AUDIO_LOG("[REVERB_THREADS][FALLBACK] conv_threads=%d sim_threads=%d — "
+                          "only one is explicit; set BOTH > 0 to use literal values, "
+                          "or BOTH = 0 for auto. Falling back to auto.\n",
+                          mConvThreadsCfg, mSimThreadsCfg);
+            }
+
+            if (bothExplicit) {
+                mConvolutionWorkerCount = mConvThreadsCfg;
+                mSimulatorThreadCount   = mSimThreadsCfg;
+                AUDIO_LOG("[REVERB_THREADS] conv=%d sim=%d (explicit, realtime=%d)\n",
+                          mConvolutionWorkerCount, mSimulatorThreadCount,
+                          mReverbVoicesRealtime);
             } else {
                 unsigned int hwThreads = std::thread::hardware_concurrency();
-                totalThreads = static_cast<int>(std::max(4u,
+                int totalThreads = static_cast<int>(std::max(4u,
                     hwThreads > 2 ? hwThreads - 2 : 2u));
-            }
-            // Each side needs at least 1; clamp to a sensible floor.
-            if (totalThreads < 2) totalThreads = 2;
+                if (totalThreads < 2) totalThreads = 2;
 
-            float convShare;
-            if (mReverbThreadsConvShareCfg < 0.0f) {
-                convShare = (mReverbVoicesRealtime == 0) ? 0.35f : 0.45f;
-            } else {
-                convShare = mReverbThreadsConvShareCfg;
+                const float convShare = (mReverbVoicesRealtime == 0) ? 0.35f : 0.45f;
+                mConvolutionWorkerCount = std::max(1,
+                    static_cast<int>(static_cast<float>(totalThreads) * convShare + 0.5f));
+                mSimulatorThreadCount   = std::max(1, totalThreads - mConvolutionWorkerCount);
+                if (mConvolutionWorkerCount + mSimulatorThreadCount > totalThreads) {
+                    mConvolutionWorkerCount = totalThreads - mSimulatorThreadCount;
+                }
+                AUDIO_LOG("[REVERB_THREADS] conv=%d sim=%d (auto, budget=%d, share=%.2f, realtime=%d)\n",
+                          mConvolutionWorkerCount, mSimulatorThreadCount,
+                          totalThreads, convShare, mReverbVoicesRealtime);
             }
-            mConvolutionWorkerCount = std::max(1,
-                static_cast<int>(static_cast<float>(totalThreads) * convShare + 0.5f));
-            mSimulatorThreadCount   = std::max(1, totalThreads - mConvolutionWorkerCount);
-            // Re-adjust if rounding pushed convolution above total - 1.
-            if (mConvolutionWorkerCount + mSimulatorThreadCount > totalThreads) {
-                mConvolutionWorkerCount = totalThreads - mSimulatorThreadCount;
-            }
-            AUDIO_LOG("[REVERB_THREADS] budget=%d conv=%d sim=%d (share=%.2f%s, realtime=%d)\n",
-                      totalThreads, mConvolutionWorkerCount, mSimulatorThreadCount,
-                      convShare, mReverbThreadsConvShareCfg < 0.0f ? " auto" : "",
-                      mReverbVoicesRealtime);
         }
 
         // Step 6: Create the simulator for direct occlusion + reflections + reverb.
@@ -3971,14 +4090,17 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             // ambisonics_order>0.
             pathingSettings.maxOrder = mAmbisonicsOrder;
             // Probe-to-probe visibility sampling count for pathing edge
-            // validation. Steam Audio's Unity integration defaults to 4
-            // for the BAKE equivalent (`bakingVisibilitySamples`); the
-            // runtime is conventionally aligned with the bake — 4 here
-            // matches the shipping convention. Higher values (16 = 256
-            // rays per edge via the N² rule) are 16× more expensive per
-            // edge for no perceptible quality gain on static-geometry-
-            // dominant scenes with a handful of dynamic doors.
-            pathingSettings.numVisSamples = 4;
+            // validation. Was 4 (Unity convention, 16 rays per edge);
+            // raised to 16 (256 rays per edge) on 2026-05-26 as part
+            // of the pathing-stabilization experiment. The wet-bus
+            // tremolo on long-lived ambients (m06winged*) is consistent
+            // with stochastic visibility decisions flipping edges
+            // valid/invalid between solver cycles; quadrupling the
+            // sample count averages each decision over 16× more rays.
+            // MUST match the bake-side ProbeManager.cpp:bakePathingBatch
+            // numSamples — runtime/bake mismatch silently rejects bake-
+            // accepted edges and collapses pathing to sentinel.
+            pathingSettings.numVisSamples = 16;
             // Worker thread already runs at UTILITY QoS; internal Steam
             // Audio worker threads spawned for ray-traces will inherit
             // that QoS. Match the reflection-sim choice for now.
@@ -4265,8 +4387,8 @@ bool AudioService::initReflectionPipeline()
     // NOTE: rmn.convWorker is set AFTER the worker pool is created (below).
 
     // Sub-worker count was computed earlier in buildAcousticScene from the
-    // unified reverb-thread budget split (mReverbThreadsCfg /
-    // mReverbThreadsConvShareCfg). See [REVERB_THREADS] log line.
+    // explicit-or-auto reverb-thread allocation (mConvThreadsCfg /
+    // mSimThreadsCfg). See [REVERB_THREADS] log line.
     int numWorkers = mConvolutionWorkerCount;
 
     // Hand off to the ConvolutionWorkerPool — it creates the pool's
@@ -6178,7 +6300,50 @@ void AudioService::loopStep(float deltaTime)
                     // pathing for any source-listener pair farther than
                     // that even when a shorter multi-hop probe route
                     // existed.
-                    inputs.visRange = mPropagationMaxDist * kFeetToMeters;
+                    //
+                    // Per-voice pathing-solver scope, derived from the
+                    // original Dark Engine's SFX_MaxDist formula:
+                    //   max_pathing_dist_ft =
+                    //       (5000 + gain_cB) / 55 × attenuationFactor
+                    // This was the BFS-termination distance for portal
+                    // routing in the original engine — sets the per-voice
+                    // horizon for routed pathing. Sources beyond this
+                    // distance fall back to direct-only audio via the
+                    // existing cached-replay mechanism in the readback
+                    // site. 55 cB/ft matches the original engine's
+                    // attenuation_factor constant (APPSFX default). Steam
+                    // Audio's INVERSEDISTANCE curve still handles per-voice
+                    // volume continuously; this knob only limits the
+                    // pathing-solver's search scope per source (matches
+                    // Steam Audio's per-source visRange API).
+                    //
+                    // gain_cB lives on the schema's playParams.volume
+                    // (centibels, -10000..-1; -1 ≈ 0 dB). Look it up via
+                    // mSchemaParser->findSchema(voice->schemaName). If the
+                    // schema is missing, fall back to gain_cB=0 so the
+                    // formula reduces to the nominal ~90.9 ft × atten.
+                    // We clamp the result to ≥ 1 ft so very quiet sources
+                    // (gain_cB ≈ -5000, the original engine's near-silent
+                    // threshold) still leave Steam Audio a non-degenerate
+                    // visRange to work with rather than zero.
+                    constexpr float kOriginalEngineAttenCBPerFt = 55.0f;
+                    float gainCB = 0.0f;
+                    if (mSchemaParser) {
+                        const SchemaEntry *visSch =
+                            mSchemaParser->findSchema(voice->schemaName);
+                        if (visSch) {
+                            gainCB = static_cast<float>(
+                                visSch->playParams.volume);
+                        }
+                    }
+                    float maxPathingDistFt =
+                        (5000.0f + gainCB)
+                        / kOriginalEngineAttenCBPerFt
+                        * voice->attenuationFactor;
+                    if (maxPathingDistFt < 1.0f) {
+                        maxPathingDistFt = 1.0f;
+                    }
+                    inputs.visRange = maxPathingDistFt * kFeetToMeters;
                     // pathingOrder MUST equal the path effect's create-time
                     // maxOrder (= mAmbisonicsOrder). The solver writes
                     // pathingOut.pathing.shCoeffs sized to (pathingOrder+1)^2
@@ -7135,98 +7300,43 @@ void AudioService::loopStep(float deltaTime)
                     // wet pathing bus then plays the source at near-
                     // full volume from the actual direction.
                     //
-                    // Bug A fix: override the single-ray test with
-                    // the volumetric occlusion already computed by
-                    // iplSimulatorRunDirect for this same source
-                    // (`outputs.direct.occlusion`, copied into
-                    // `voice->dspNode.directParams.occlusion` above
-                    // — N samples per
-                    // `mAudioOcclusion->getSamples()`, default 16).
-                    // When single-ray says "clear" but volumetric
-                    // says "mostly blocked", trust the volumetric
-                    // answer and treat the direct-path solve as
-                    // sentinel (no wet bus this frame, no cache
-                    // update).
-                    //
-                    // Threshold 0.5: at least half the volumetric
-                    // rays must be unoccluded for the direct path
-                    // to count as genuine. Below that, the single
-                    // ray that produced the direct-path solve is
-                    // almost certainly a doorway/seam slip.
-                    //
-                    // Bug B fix: even when the direct path IS
-                    // genuine this frame, do NOT update
-                    // lastGoodPathParams with it. Direct paths are
-                    // valid only while LOS is current; caching
-                    // them creates a phantom passthrough that
-                    // persists after the listener moves out of LOS
-                    // or a door closes (the "loud m06bubbles from
-                    // spawn" pattern). Cache replay on subsequent
-                    // sentinels uses the last ROUTED solve only.
-                    constexpr float kDirectPathOcclThreshold = 0.5f;
+                    // The directVolumetricBlocked override (removed
+                    // 2026-05-26) used a hard 0.5 threshold on
+                    // outputs.direct.occlusion to flip pathTargetValid
+                    // false when the single-ray solver said "direct
+                    // LOS" but volumetric disagreed. That threshold
+                    // flapped audibly on long-lived ambient voices
+                    // (e.g. m06winged*) whose volumetric occl
+                    // oscillates around 0.5. The smooth equivalent is
+                    // applied in the readback below: portalAttenuation
+                    // = mapping.gain * occlScalar. Every reference
+                    // integration (Godot, HPL2, DarkEngine, Steam
+                    // Audio's own Unity plugin) applies occlusion as
+                    // a continuous multiplicative gain, NOT a
+                    // threshold flip — see phonon.h:3727 and 3886 for
+                    // Valve's own warning against introducing
+                    // thresholds. With the override gone, the only
+                    // remaining writeback cases are sentinel + cache
+                    // and non-sentinel + fresh data.
                     const auto &solveEq = pathingOut.pathing.eqCoeffs;
                     const bool isDirectPath = !pathingSentinel
                                            && solveEq[0] == 1.0f
                                            && solveEq[1] == 1.0f
                                            && solveEq[2] == 1.0f;
-                    // Read THIS frame's volumetric occlusion from the
-                    // freshly-staged `outputs.direct` (populated by
-                    // iplSourceGetOutputs(...DIRECT) earlier in this
-                    // iteration). `voice->dspNode.directParams` is
-                    // updated farther down (the
-                    // `voice->dspNode.directParams = outputs.direct;`
-                    // line), so reading from dspNode here would give
-                    // the PREVIOUS frame's value — stale enough that
-                    // the override would fire intermittently based on
-                    // last-frame state, defeating the purpose.
-                    const float occlScalar = outputs.direct.occlusion;
-                    const bool directVolumetricBlocked = isDirectPath
-                        && std::isfinite(occlScalar)
-                        && occlScalar < kDirectPathOcclThreshold;
 
-                    if (directVolumetricBlocked) {
-                        // Bug A: single-ray LOS test punched through
-                        // geometry the volumetric test correctly
-                        // identifies as blocked. Skip the wet bus
-                        // this frame. No cache update — future
-                        // sentinels fall back to the previous routed
-                        // solve (if any) or to synthetic passthrough.
-                        //
-                        // ALSO silence the reverb-send by setting
-                        // portalAttenuation = occlScalar. The
-                        // portalAttenuation derivation block farther
-                        // down would otherwise reset it to 1.0
-                        // (passthrough), causing the reverb tail to
-                        // play at full distance-attenuated volume —
-                        // which is what the user heard as "loud
-                        // bubbles" even after the wet bus was
-                        // silenced. Using occlScalar (the volumetric
-                        // unoccluded fraction) gives the reverb-send
-                        // a proportional attenuation: 0 when fully
-                        // occluded, partial when partially occluded.
-                        // The derivation block is guarded against
-                        // re-writing this with the `directBlockingActive`
-                        // flag below.
-                        voice->dspNode.pathTargetValid.store(
-                            false, std::memory_order_release);
-                        // see T0.3 invariant (override site b/3) —
-                        // Bug-A direct-LOS volumetric occlusion override.
-                        voice->dspNode.portalAttenuation = occlScalar;
-                        voice->dspNode.portalBlocking    = 0.0f;
-                        static std::atomic<int> sDirectOverrideLogCount{0};
-                        int n = sDirectOverrideLogCount.fetch_add(1, std::memory_order_relaxed);
-                        if (n < 32 || (n % 256) == 0) {
-                            std::fprintf(stderr,
-                                "[PATH_DIRECT_OVERRIDE] h=%u '%s' "
-                                "single-ray says LOS, volumetric occl=%.3f "
-                                "< %.2f — overriding direct-path solve as "
-                                "sentinel, portalAtt=%.3f (silences reverb-"
-                                "send proportionally) [#%d]\n",
-                                handle, voice->schemaName.c_str(),
-                                occlScalar, kDirectPathOcclThreshold,
-                                occlScalar, n + 1);
-                        }
-                    } else if (pathingSentinel) {
+                    if (pathingSentinel) {
+                        // Sentinel solve. Two cases:
+                        //   • Have a cached lastGoodPathParams from a
+                        //     prior routed solve → replay it
+                        //     (pathTargetValid = true).
+                        //   • No cache yet (fresh voice that hasn't
+                        //     reached the solver) → leave
+                        //     pathTargetParams at its initial value
+                        //     and set pathTargetValid = false. With
+                        //     the eq=[0,0,0] init (Group B), the
+                        //     readback below produces mapping.gain=0
+                        //     and the wet bus is silent until the
+                        //     first real solve arrives.
                         if (voice->pathingEverSolved) {
                             voice->dspNode.pathTargetParams =
                                 voice->lastGoodPathParams;
@@ -7238,11 +7348,12 @@ void AudioService::loopStep(float deltaTime)
                         }
                     } else {
                         // Non-sentinel solve — either a genuine
-                        // direct path (volumetric agreed) or a
-                        // routed path. Both update the per-voice
-                        // target. Only the routed case updates
-                        // lastGoodPathParams (Bug B: direct paths
-                        // are transient).
+                        // direct path or a routed path. Both update
+                        // pathTargetParams. Only the routed case
+                        // updates lastGoodPathParams (Bug B: direct
+                        // paths are transient and shouldn't persist
+                        // through sentinel replay after the listener
+                        // moves out of LOS).
                         voice->dspNode.pathTargetParams = pathingOut.pathing;
                         voice->dspNode.pathTargetValid.store(
                             true, std::memory_order_release);
@@ -7377,35 +7488,56 @@ void AudioService::loopStep(float deltaTime)
                     // before reaching here, so portalAtt=0 from the
                     // out-of-range gate at line 5524 is not
                     // overwritten.
-                    if (voice->dspNode.pathTargetValid.load(std::memory_order_relaxed)) {
-                        const auto &eq = voice->dspNode.pathTargetParams.eqCoeffs;
-                        PathingDspMapping mapping = eqCoeffsToDspMapping(
-                            eq[0], eq[1], eq[2],
-                            /*doorBlocking=*/0.0f,
-                            mPathingGainScale,
-                            mPathingBlockingScale,
-                            mPathingGainWeightLow,
-                            mPathingGainWeightMid,
-                            mPathingGainWeightHigh);
-                        // see T0.3 invariant (override site c/3) —
-                        // pathing solver successfully reached the
-                        // source and produced fresh eqCoeffs; map
-                        // to scalar attenuation + blocking.
-                        voice->dspNode.portalAttenuation = mapping.gain;
+                    // Smooth occlusion application — multiplicative on
+                    // the eq-derived gain. Replaces the prior
+                    // threshold-based directVolumetricBlocked override
+                    // (which flipped pathTargetValid on volumetric
+                    // occlusion < 0.5, producing audible flap at the
+                    // threshold boundary on m06winged* and similar).
+                    //
+                    // Behavior across the continuum:
+                    //   • Solver says direct (eq≈1) + volumetric open
+                    //     (occl≈1) → gain ≈ 1 (full passthrough)
+                    //   • Solver says direct + volumetric blocked
+                    //     (occl<<1) → gain ≈ occl (proportional
+                    //     silencing, the override's old job, now
+                    //     smooth)
+                    //   • Solver says routed (eq<1) + volumetric open
+                    //     → gain ≈ mapping.gain (solver dominates)
+                    //   • Solver says routed + volumetric blocked
+                    //     → gain ≈ mapping.gain × occl (both signals
+                    //     attenuate, correct)
+                    //
+                    // No threshold, no flag flip. Matches Godot /
+                    // HPL2 / DarkEngine / Steam Audio's reference
+                    // Unity integration — all apply occlusion as a
+                    // continuous multiplicative gain, never a
+                    // threshold flip (phonon.h:3727, 3886 explicitly
+                    // warn against thresholding).
+                    //
+                    // pathTargetValid stays in the data model for
+                    // sentinel-vs-real distinction (used elsewhere
+                    // for whether the path effect runs), but is no
+                    // longer consulted here. With the Group B init
+                    // (eq=[0,0,0] on spawn), the pre-first-solve case
+                    // naturally produces mapping.gain=0 → silent wet
+                    // bus until the solver runs.
+                    const auto &eq = voice->dspNode.pathTargetParams.eqCoeffs;
+                    PathingDspMapping mapping = eqCoeffsToDspMapping(
+                        eq[0], eq[1], eq[2],
+                        /*doorBlocking=*/0.0f,
+                        mPathingGainScale,
+                        mPathingBlockingScale,
+                        mPathingGainWeightLow,
+                        mPathingGainWeightMid,
+                        mPathingGainWeightHigh);
+                    {
+                        float occlSmooth = outputs.direct.occlusion;
+                        if (!std::isfinite(occlSmooth)) occlSmooth = 1.0f;
+                        if (occlSmooth < 0.0f) occlSmooth = 0.0f;
+                        else if (occlSmooth > 1.0f) occlSmooth = 1.0f;
+                        voice->dspNode.portalAttenuation = mapping.gain * occlSmooth;
                         voice->dspNode.portalBlocking    = mapping.blocking;
-                    } else {
-                        // see T0.3 invariant (override site d/4) —
-                        // pathTargetValid is false (sentinel, no
-                        // ever-solved cache hit, or directVolumetric-
-                        // Blocked). Use occlusion as a proxy so the
-                        // wet-bus reverb-send tracks direct LOS even
-                        // when the path effect is bypassed.
-                        float occlProxy = outputs.direct.occlusion;
-                        if (!std::isfinite(occlProxy)) occlProxy = 1.0f;
-                        if (occlProxy < 0.0f) occlProxy = 0.0f;
-                        else if (occlProxy > 1.0f) occlProxy = 1.0f;
-                        voice->dspNode.portalAttenuation = occlProxy;
-                        voice->dspNode.portalBlocking    = 0.0f;
                     }
 
                     // ── Diagnostic: catch per-pathing-tick eq-jitter ──
@@ -7414,42 +7546,125 @@ void AudioService::loopStep(float deltaTime)
                     // (portalAttenuation, portalBlocking) collapse the
                     // eqCoeffsToDspMapping produced. Phase 4 removed
                     // that collapse; we now track the underlying
-                    // eqCoeffs vector itself, with the same "first 16
-                    // + every 32nd" rate limit. Cache replay still
-                    // engages (pathTargetParams freezes), so jumps
-                    // here correspond to non-sentinel reads with
-                    // genuinely different solver outputs — the audible
-                    // signature of a moving listener crossing a path-
-                    // diffraction discontinuity.
+                    // eqCoeffs vector AND the actual emitted gain
+                    // (mapping.gain * occlSmooth — the same scalar
+                    // written to portalAttenuation above). Both
+                    // factors are continuous; there is no flag-gating
+                    // here, so a CLIFF/RECOVERY reflects a real
+                    // perceptual step in the wet bus rather than a
+                    // flap of pathTargetValid. Cache replay still
+                    // engages for the SENTINEL case (pathTargetParams
+                    // freezes at 0.1/0.1/0.1), but a SOLVED-with-no-
+                    // path case (findAlternatePaths exhausted all
+                    // alternates → legitimate eq≈0) is accepted as
+                    // fresh data and overwrites the prior gain.
+                    //
+                    // Categories emitted:
+                    //   [PATH_JUMP]      — any eq band moved > 0.05
+                    //                      (legacy, ≈ −0.4 dB step)
+                    //   [PATH_CLIFF]     — emitted gain DROPPED by
+                    //                      >0.3 in one cycle (loud→
+                    //                      silent transition; the
+                    //                      perceptual wet-bus AM source)
+                    //   [PATH_RECOVERY]  — emitted gain ROSE by >0.3
+                    //                      in one cycle (silent→loud;
+                    //                      the matching uptick)
+                    //
+                    // Rate limit loosened to "first 64 + every 8th"
+                    // per voice so flap-prone voices (m06winged*,
+                    // ambients on shifting OBB edges) surface enough
+                    // events to compute a per-voice flap-rate.
                     {
-                        static std::unordered_map<SoundHandle,
-                            std::array<float, 3>> sPrevEq;
-                        static std::unordered_map<SoundHandle, int> sJumpCount;
+                        struct PrevPathState {
+                            std::array<float, 3> eq;
+                            float gain;
+                            int   jumpCount;
+                            int   cliffCount;
+                            int   recoveryCount;
+                        };
+                        static std::unordered_map<SoundHandle, PrevPathState> sPrev;
                         const auto &cur = voice->dspNode.pathTargetParams;
-                        auto it = sPrevEq.find(handle);
-                        if (it != sPrevEq.end()) {
-                            float d0 = std::fabs(cur.eqCoeffs[0] - it->second[0]);
-                            float d1 = std::fabs(cur.eqCoeffs[1] - it->second[1]);
-                            float d2 = std::fabs(cur.eqCoeffs[2] - it->second[2]);
+                        // curGain MUST match what the readback above writes to
+                        // portalAttenuation:
+                        //   portalAttenuation = mapping.gain * occlSmooth
+                        // Re-derive locally; this diagnostic must NOT mutate
+                        // shared state. Both factors are continuous; no
+                        // flag-gating.
+                        const float gainFromEq = 0.25f * cur.eqCoeffs[0]
+                                               + 0.50f * cur.eqCoeffs[1]
+                                               + 0.25f * cur.eqCoeffs[2];
+                        float occlForDiag = outputs.direct.occlusion;
+                        if (!std::isfinite(occlForDiag)) occlForDiag = 1.0f;
+                        if (occlForDiag < 0.0f) occlForDiag = 0.0f;
+                        else if (occlForDiag > 1.0f) occlForDiag = 1.0f;
+                        float curGain = gainFromEq * occlForDiag;
+                        auto it = sPrev.find(handle);
+                        if (it != sPrev.end()) {
+                            float d0 = std::fabs(cur.eqCoeffs[0] - it->second.eq[0]);
+                            float d1 = std::fabs(cur.eqCoeffs[1] - it->second.eq[1]);
+                            float d2 = std::fabs(cur.eqCoeffs[2] - it->second.eq[2]);
                             float maxD = std::max({d0, d1, d2});
-                            // 0.05 ≈ −0.4 dB step on any one band.
+                            float gainDelta = curGain - it->second.gain;
+                            const float kCliffThreshold = 0.30f;
+
+                            auto shouldLog = [](int n) {
+                                return (n <= 64) || ((n % 8) == 0);
+                            };
+
                             if (maxD > 0.05f) {
-                                int n = ++sJumpCount[handle];
-                                if (n <= 16 || (n % 32) == 0) {
+                                int n = ++it->second.jumpCount;
+                                if (shouldLog(n)) {
                                     std::fprintf(stderr,
                                         "[PATH_JUMP] h=%u '%s' "
                                         "eq [%.3f,%.3f,%.3f]→[%.3f,%.3f,%.3f] "
-                                        "(maxΔ=%.3f) sentinel=%d [#%d]\n",
+                                        "gain %.3f→%.3f (maxΔ=%.3f) sentinel=%d [#%d]\n",
                                         handle, voice->schemaName.c_str(),
-                                        it->second[0], it->second[1], it->second[2],
+                                        it->second.eq[0], it->second.eq[1], it->second.eq[2],
                                         cur.eqCoeffs[0], cur.eqCoeffs[1], cur.eqCoeffs[2],
+                                        it->second.gain, curGain,
                                         maxD, pathingSentinel ? 1 : 0, n);
                                 }
                             }
+                            if (gainDelta < -kCliffThreshold) {
+                                int n = ++it->second.cliffCount;
+                                if (shouldLog(n)) {
+                                    std::fprintf(stderr,
+                                        "[PATH_CLIFF] h=%u '%s' "
+                                        "gain %.3f→%.3f (Δ=%.3f) "
+                                        "eq [%.3f,%.3f,%.3f]→[%.3f,%.3f,%.3f] "
+                                        "sentinel=%d everSolved=%d [#%d]\n",
+                                        handle, voice->schemaName.c_str(),
+                                        it->second.gain, curGain, gainDelta,
+                                        it->second.eq[0], it->second.eq[1], it->second.eq[2],
+                                        cur.eqCoeffs[0], cur.eqCoeffs[1], cur.eqCoeffs[2],
+                                        pathingSentinel ? 1 : 0,
+                                        voice->pathingEverSolved ? 1 : 0, n);
+                                }
+                            }
+                            if (gainDelta > kCliffThreshold) {
+                                int n = ++it->second.recoveryCount;
+                                if (shouldLog(n)) {
+                                    std::fprintf(stderr,
+                                        "[PATH_RECOVERY] h=%u '%s' "
+                                        "gain %.3f→%.3f (Δ=+%.3f) "
+                                        "eq [%.3f,%.3f,%.3f]→[%.3f,%.3f,%.3f] "
+                                        "sentinel=%d everSolved=%d [#%d]\n",
+                                        handle, voice->schemaName.c_str(),
+                                        it->second.gain, curGain, gainDelta,
+                                        it->second.eq[0], it->second.eq[1], it->second.eq[2],
+                                        cur.eqCoeffs[0], cur.eqCoeffs[1], cur.eqCoeffs[2],
+                                        pathingSentinel ? 1 : 0,
+                                        voice->pathingEverSolved ? 1 : 0, n);
+                                }
+                            }
                         }
-                        sPrevEq[handle] = {cur.eqCoeffs[0],
-                                           cur.eqCoeffs[1],
-                                           cur.eqCoeffs[2]};
+                        sPrev[handle] = PrevPathState{
+                            {cur.eqCoeffs[0], cur.eqCoeffs[1], cur.eqCoeffs[2]},
+                            curGain,
+                            it != sPrev.end() ? it->second.jumpCount     : 0,
+                            it != sPrev.end() ? it->second.cliffCount    : 0,
+                            it != sPrev.end() ? it->second.recoveryCount : 0,
+                        };
                     }
                 }
             }
@@ -10906,6 +11121,10 @@ void AudioService::dumpAudioStatusPeriodic()
     }
     // H1' inter-callback period (one writer = audio thread).
     auto interCbP = sPerfInterCallbackMs.snapshotAndReset();
+    // Device-callback inter-call period (one writer = audio device thread,
+    // engineDeviceDataCallback). See sPerfDeviceCbMs commentary at its
+    // definition for the inter_cb vs device_cb distinction.
+    auto deviceCbP = sPerfDeviceCbMs.snapshotAndReset();
     auto fmtMs = [](double v) -> double { return v; };  // identity, leave for future tuning
     AUDIO_LOG(
         "[PERF audio] dsp_node n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
@@ -11085,9 +11304,11 @@ void AudioService::dumpAudioStatusPeriodic()
     //               replacing it with a condvar / semaphore.
     AUDIO_LOG(
         "[PERF timing] inter_cb n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " | device_cb n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms"
         " | signal_pickup n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
-        (unsigned long long)interCbP.n, fmtMs(interCbP.p50), fmtMs(interCbP.p95), fmtMs(interCbP.p99),
-        (unsigned long long)pickupP.n,  fmtMs(pickupP.p50),  fmtMs(pickupP.p95),  fmtMs(pickupP.p99));
+        (unsigned long long)interCbP.n,  fmtMs(interCbP.p50),  fmtMs(interCbP.p95),  fmtMs(interCbP.p99),
+        (unsigned long long)deviceCbP.n, fmtMs(deviceCbP.p50), fmtMs(deviceCbP.p95), fmtMs(deviceCbP.p99),
+        (unsigned long long)pickupP.n,   fmtMs(pickupP.p50),   fmtMs(pickupP.p95),   fmtMs(pickupP.p99));
 
     // sync_wait — wall-clock time the audio thread spent at the top of
     // the reflection mix node waiting for sub-workers to finish processing
@@ -11241,6 +11462,7 @@ void AudioService::dumpAudioStatusPeriodic()
             "\"worker_max_apply\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"worker_residual\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"inter_cb\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"device_cb\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"signal_pickup\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"sync_wait\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
                 "\"timeouts\":%d,\"deadline_ms\":%.4f}"
@@ -11280,8 +11502,9 @@ void AudioService::dumpAudioStatusPeriodic()
             (unsigned long long)sumApplyP.n, sumApplyP.p50, sumApplyP.p95, sumApplyP.p99,
             (unsigned long long)maxApplyP.n, maxApplyP.p50, maxApplyP.p95, maxApplyP.p99,
             (unsigned long long)residualP.n, residualP.p50, residualP.p95, residualP.p99,
-            (unsigned long long)interCbP.n, interCbP.p50, interCbP.p95, interCbP.p99,
-            (unsigned long long)pickupP.n, pickupP.p50, pickupP.p95, pickupP.p99,
+            (unsigned long long)interCbP.n,  interCbP.p50,  interCbP.p95,  interCbP.p99,
+            (unsigned long long)deviceCbP.n, deviceCbP.p50, deviceCbP.p95, deviceCbP.p99,
+            (unsigned long long)pickupP.n,   pickupP.p50,   pickupP.p95,   pickupP.p99,
             (unsigned long long)syncP.n,  syncP.p50,  syncP.p95,  syncP.p99,
                 syncTimeouts, static_cast<double>(syncDeadlineMs),
             mVoicePool->size(), reflVoices, tailVoices,
@@ -12704,29 +12927,62 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             const float kDoorPairDedupRadiusSq =
                 kDoorPairDedupRadiusFt * kDoorPairDedupRadiusFt;
             int droppedDoorPairs = 0;
-            // Per-purpose dedup: every PathingProbePurpose only collides
-            // against probes of its OWN purpose.  Each purpose encodes a
-            // distinct topology (Portal=boundary, DoorPair=door anchor,
-            // Centroid=room interior, Emitter=ambient source); cross-
-            // purpose dedup destroys real coverage.  The playtest showed
-            // 320 room Centroids deduped against neighboring DoorPair
-            // probes in MISS6 alone — entire closets lost their interior
-            // anchor and their listeners pulled in a Portal probe from
-            // outside the room (the source of the eq=[0.1,0.1,0.1]
+            // Per-purpose + room-aware dedup.
+            //
+            // Per-purpose: every PathingProbePurpose only collides against
+            // probes of its OWN purpose.  Each purpose encodes a distinct
+            // topology (Portal=boundary, DoorPair=door anchor,
+            // Centroid=room interior, Emitter=ambient source);
+            // cross-purpose dedup destroys real coverage.  The playtest
+            // showed 320 room Centroids deduped against neighboring
+            // DoorPair probes in MISS6 alone — entire closets lost their
+            // interior anchor and their listeners pulled in a Portal probe
+            // from outside the room (the source of the eq=[0.1,0.1,0.1]
             // pathing-solver sentinel in same-room paths).
+            //
+            // Room-aware: even within a single purpose, two candidates
+            // only collide if they share a RoomService room ID.  Two
+            // small adjacent rooms (e.g. closet vs. neighbouring corridor)
+            // can have Centroids less than dedupRadius apart across a
+            // thin wall — the room-agnostic legacy strip silently emptied
+            // those rooms entirely (rooms_with_zero was 20-30% of total
+            // rooms before this change).  Probes in DIFFERENT rooms
+            // cover distinct acoustic zones; preserve both.
+            //
+            // Portal / DoorPair probes straddle a room boundary (they
+            // sit at a portal centroid or just inside one of the two
+            // rooms the portal joins).  `roomFromPoint` returns whichever
+            // room contains the probe at its final position — that's the
+            // room the probe most "belongs to" for routing purposes, and
+            // it's a stable enough oracle for the dedup check (portals
+            // strictly in solid would return -1 and dedup against -1
+            // peers, which is fine — they're real compound-portal
+            // collisions).
+            auto roomOf = [&](const Vector3 &p) -> int {
+                if (!mRoomService) return -1;
+                Room *r = mRoomService->roomFromPoint(p);
+                return r ? r->getRoomID() : -1;
+            };
+            std::vector<int> keptRoom;
+            keptRoom.reserve(params.pathingCandidates.size());
+            int crossRoomPreserved = 0;
             for (const auto &cand : params.pathingCandidates) {
                 const float radiusSq =
                     (cand.purpose == PathingProbePurpose::DoorPair)
                         ? kDoorPairDedupRadiusSq
                         : dedupRadiusSq;
+                const int candRoom = roomOf(cand.position);
                 bool tooClose = false;
-                for (const auto &k : kept) {
-                    if (k.purpose != cand.purpose) continue;
-                    Vector3 d = cand.position - k.position;
-                    if (glm::dot(d, d) < radiusSq) {
-                        tooClose = true;
-                        break;
+                for (size_t i = 0; i < kept.size(); ++i) {
+                    if (kept[i].purpose != cand.purpose) continue;
+                    Vector3 d = cand.position - kept[i].position;
+                    if (glm::dot(d, d) >= radiusSq) continue;
+                    if (keptRoom[i] != candRoom) {
+                        ++crossRoomPreserved;
+                        continue;
                     }
+                    tooClose = true;
+                    break;
                 }
                 if (tooClose) {
                     if (cand.purpose == PathingProbePurpose::DoorPair) {
@@ -12740,6 +12996,12 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     continue;
                 }
                 kept.push_back(cand);
+                keptRoom.push_back(candRoom);
+            }
+            if (crossRoomPreserved > 0) {
+                AUDIO_LOG("Pathing dedup: %d same-purpose probes preserved "
+                          "(different rooms — room-aware dedup)\n",
+                          crossRoomPreserved);
             }
             if (droppedDoorPairs > 0) {
                 AUDIO_LOG("Pathing dedup: %d DoorPair probes collapsed "

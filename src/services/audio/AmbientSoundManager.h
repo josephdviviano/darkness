@@ -26,6 +26,7 @@
 #include "DarknessMath.h"
 #include "AudioService.h"  // for SoundHandle, SOUND_HANDLE_INVALID, AmbientHackFlags
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -61,6 +62,27 @@ struct AmbientSound {
     /// the missing-sample condition does not change at runtime (CRF
     /// resources are immutable), so we transition once and stay.
     bool resolutionFailed = false;
+
+    // ── Group D (2026-05): dB-based halt + fade-in/out state ──
+    //
+    // Audibility tracking: incremented each tick the voice's perceived
+    // gain (mapping.gain × directParams.distanceAttenuation ×
+    // schema_gain_linear) falls below the configured linear threshold,
+    // reset to 0 on any tick above. When the counter reaches
+    // mHaltBelowThresholdFrames, the halt fade-out kicks off.
+    int framesBelowAudibilityThreshold = 0;
+    // True while the voice is in its halt fade-out window. During the
+    // fade-out the voice keeps running normally (volume continues to be
+    // updated per-frame) and the audibility counter still ticks — if
+    // the source recovers above threshold mid-fade, the fade is cancelled
+    // and the voice ramps back up. When haltFadeRemainingFrames reaches
+    // 0, stopVoice fires and the handle is cleared.
+    bool haltFadeActive = false;
+    /// Loop ticks remaining before stopVoice fires (decremented in
+    /// updateAmbientVolumes). The actual audio fade is driven by
+    /// ma_sound_set_fade_in_milliseconds; this counter is just the
+    /// scheduler that decides when the discrete stop runs.
+    int haltFadeRemainingFrames = 0;
 };
 
 // NOTE: there was previously a `SpotAmbient` struct here, plus a parallel
@@ -72,11 +94,14 @@ struct AmbientSound {
 // See TASKS.TODO.md "SpotlightAndAmbient lighting".
 
 /// Manages ambient sound lifecycle: parses P$AmbientHack from mission data,
-/// starts/stops voices based on listener distance with hysteresis, and
-/// applies a per-voice linear volume each frame. Loudness shaping (distance
-/// / portal / occlusion) is delegated to Steam Audio's per-voice DSP chain.
-/// Owned by AudioService; constructed in the service's constructor and torn
-/// down with it.
+/// starts voices when the listener crosses inside the authored radius, halts
+/// voices when their perceived audibility (mapping.gain ×
+/// directParams.distanceAttenuation × schema_gain_linear) drops below a dB
+/// threshold for N consecutive ticks, and applies a per-voice linear volume
+/// each frame. spawn_fade_in_ms / halt_fade_out_ms ramps hide the discrete
+/// state changes. Loudness shaping (distance / portal / occlusion) is
+/// delegated to Steam Audio's per-voice DSP chain. Owned by AudioService;
+/// constructed in the service's constructor and torn down with it.
 class AmbientSoundManager {
 public:
     explicit AmbientSoundManager(AudioService *host);
@@ -90,8 +115,10 @@ public:
     /// parser, and the property/object services are ready first.
     void loadAmbientSounds();
 
-    /// Per-frame update for P$AmbientHack ambients: starts/stops voices
-    /// based on hysteresis around the authored radius and applies the
+    /// Per-frame update for P$AmbientHack ambients: starts voices on
+    /// `dist < radius` (kicking off a `spawn_fade_in_ms` ramp), tracks
+    /// per-voice audibility and arms a `halt_fade_out_ms` ramp + delayed
+    /// stopVoice when audibility stays below threshold, and applies the
     /// authored (centibel) volume + duck + global scale once per frame.
     void updateAmbientVolumes();
 
@@ -100,12 +127,27 @@ public:
     /// already called haltAll() before clearing the bookkeeping.
     void clear();
 
-    /// Asymmetric hysteresis multipliers — start >= 1.0, stop > start.
-    /// Prevents start/stop oscillation near the radius boundary.
-    void setHysteresisStartMul(float m) { mHysteresisStartMul = m; }
-    void setHysteresisStopMul(float m)  { mHysteresisStopMul  = m; }
-    float getHysteresisStartMul() const { return mHysteresisStartMul; }
-    float getHysteresisStopMul() const  { return mHysteresisStopMul; }
+    /// Group D (2026-05) — dB-based halt + fade ramps.
+    /// Spawn fade-in length (0–2000 ms). 0 = no ramp (legacy hard-on).
+    void setSpawnFadeInMs(int ms)   { mSpawnFadeInMs = ms; }
+    int  getSpawnFadeInMs() const   { return mSpawnFadeInMs; }
+    /// Halt fade-out length (0–2000 ms). 0 = stop immediately (legacy
+    /// hard-cut). The actual ma_sound_set_fade_in_milliseconds runs over
+    /// this duration; updateAmbientVolumes keeps the voice alive for the
+    /// same number of loop ticks so the audio fade can complete.
+    void setHaltFadeOutMs(int ms)   { mHaltFadeOutMs = ms; }
+    int  getHaltFadeOutMs() const   { return mHaltFadeOutMs; }
+    /// Audibility threshold in dB (-80 to -20). Voices whose audibility
+    /// stays below this for `mHaltBelowThresholdFrames` consecutive
+    /// ticks enter the halt fade-out.
+    void setHaltAudibilityThresholdDb(float db) {
+        mHaltAudibilityThresholdDb = db;
+        mHaltAudibilityThresholdLinear = std::pow(10.0f, db / 20.0f);
+    }
+    float getHaltAudibilityThresholdDb() const { return mHaltAudibilityThresholdDb; }
+    /// Consecutive sub-threshold frames required to trigger halt (5–600).
+    void setHaltBelowThresholdFrames(int f) { mHaltBelowThresholdFrames = f; }
+    int  getHaltBelowThresholdFrames() const { return mHaltBelowThresholdFrames; }
 
     void setDefaultPriority(int p) { mDefaultPriority = p; }
     int  getDefaultPriority() const { return mDefaultPriority; }
@@ -137,10 +179,28 @@ private:
 
     // ── Tuning (mirrors of the previous AudioService fields) ──
     float       mEnvironmentalSpatialBlend = 0.3f;
-    float       mHysteresisStartMul        = 1.5f;
-    float       mHysteresisStopMul         = 2.0f;
     int         mDefaultPriority           = 64;
     float       mGlobalVolumeScale         = 1.0f;
+
+    // Group D (2026-05) — dB-based halt + fade ramps. See RenderConfig.h
+    // and the YAML annotations for tuning rationale.
+    // TODO(tuning): 150 ms spawn fade-in; tune to hide voice spawn pop
+    //               without making sounds feel laggy.
+    int         mSpawnFadeInMs             = 150;
+    // TODO(tuning): 250 ms halt fade-out; tune to hide voice halt pop
+    //               without leaving distant ghosts.
+    int         mHaltFadeOutMs             = 250;
+    // TODO(tuning): -50 dB is a first guess; listen-tune against
+    //               MISS6/MISS9/MISS11 to confirm voices halt only when
+    //               truly inaudible.
+    float       mHaltAudibilityThresholdDb     = -50.0f;
+    /// Pre-computed linear amplitude form of mHaltAudibilityThresholdDb
+    /// so the per-tick audibility test avoids a pow() call. Kept in sync
+    /// by setHaltAudibilityThresholdDb().
+    float       mHaltAudibilityThresholdLinear = 0.00316227766f; // pow(10, -50/20)
+    // TODO(tuning): 30 frames ≈ 0.5 s at 60 Hz; may want longer for slow
+    //               walkers, shorter for fast.
+    int         mHaltBelowThresholdFrames  = 30;
 };
 
 } // namespace Darkness
