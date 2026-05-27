@@ -1001,7 +1001,12 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     bakeParams.scene = scene;
     bakeParams.probeBatch = probeBatch;
     bakeParams.identifier = pathId;
-    bakeParams.numSamples = 4;                                          // rays = numSamples²
+    // numSamples raised 4 → 16 on 2026-05-26 (pathing-stabilization
+    // experiment). Rays per probe-pair test = numSamples² = 256.
+    // Runtime numVisSamples in AudioService.cpp MUST match this; the
+    // pair is the single source of truth for the visibility test
+    // density. Re-bake required when changed.
+    bakeParams.numSamples = 16;                                         // rays = numSamples²
     // kPathingVisRadiusFt is shared with the runtime call in
     // AudioService.cpp loopStep — they MUST agree. (void)spacing here
     // because the visibility-sphere radius is intentionally decoupled

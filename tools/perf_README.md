@@ -302,7 +302,7 @@ first.
 
 | # | Knob(s) swept                                                              | Sweep values                                            | Per-iter bake cost                              | Acceptance criterion                                                                                                |
 |---|----------------------------------------------------------------------------|---------------------------------------------------------|--------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
-| 4 | `reverb_voices` (hold `reverb_threads=8`, `conv_share=0.5`)                | {16, 24, 32}                                            | none (reflection carried forward; pathing stable) | `[PERF refl_cache] evictions/sec` flat or lower; `[PERF worker_iter] max_apply p99` not disproportionate             |
+| 4 | `reverb_voices` (hold `conv_threads=3`, `sim_threads=5`)                   | {16, 24, 32}                                            | none (reflection carried forward; pathing stable) | `[PERF refl_cache] evictions/sec` flat or lower; `[PERF worker_iter] max_apply p99` not disproportionate             |
 | 5 | `reflection_throttle` × `reverb_voices_realtime` (joint sweep, ambisonics order 1) | throttle ∈ {4, 8, 16} × realtime ∈ {0, 4, 8} | none (reflection carried forward; pathing stable) | `[PERF audio] refl_sim p99 < 8 ms`; no `BUDGET_WARN`; `[BEAT] ac_freq` does NOT correlate with `simRate/throttle`    |
 
 When Phase 2 is unblocked, every iteration uses `tools/perf_sweep.sh`

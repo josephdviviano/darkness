@@ -78,10 +78,21 @@ constexpr float kPathingVisThreshold = 0.1f;
 /// to find a clear line of sight through doorways and around corners,
 /// improving graph robustness against mesh seams and small artifacts.
 ///
-/// Matches Steam Audio's Unity default of `bakingVisibilityRadius =
-/// 1.0 m` (~3.28 ft). At numSamples=4 that's 16 rays per probe-pair
-/// test, spread across a 1 m sphere — robust without being expensive.
-constexpr float kPathingVisRadiusFt = 3.28f;
+/// Was Steam Audio's Unity default `bakingVisibilityRadius = 1.0 m`
+/// (~3.28 ft). Raised to 5.0 ft (≈ 1.52 m) on 2026-05-26 as part of
+/// the pathing-stabilization experiment alongside numVisSamples
+/// 4 → 16: the wet-bus tremolo on long-lived ambients (m06winged*
+/// gain swinging 0.0 ↔ 0.6 across cycles) is consistent with
+/// stochastic visibility decisions flipping edges valid/invalid
+/// between solver cycles. A larger sampling sphere gives the bake
+/// more chances to find a clear LOS through doorways and around
+/// corners, reducing the borderline-visibility region.
+///
+/// Must remain identical at bake and runtime. Changing this value
+/// requires deleting the cached .probes file and re-baking — at
+/// numSamples=16 that's 256 rays per probe-pair test, so bake time
+/// scales up materially (rays = numSamples² × probe_pairs).
+constexpr float kPathingVisRadiusFt = 5.0f;
 
 /// Legacy helper: returns the fixed `kPathingVisRadiusFt × kFeetToMeters`
 /// regardless of its `spacingFt` argument. The argument is preserved

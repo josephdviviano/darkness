@@ -374,48 +374,39 @@ audio:
     }
 }
 
-// Reverb thread budget (merged convolution_workers + simulator_threads
-// in 2026-05 config cleanup). reverb_threads is the total; the share
-// knob splits it between conv workers and the simulator. -1 = auto.
-TEST_CASE("audio reverb thread budget YAML keys", "[config][yaml][audio]") {
-    SECTION("defaults: reverb_threads=0 (auto), conv_share=-1 (auto)") {
+// Reverb thread allocation: two explicit integer counts. Both 0 =
+// auto (hwconc-2 split). Both > 0 = literal values. Mixed handled in
+// AudioService init with a [REVERB_THREADS][FALLBACK] warning.
+TEST_CASE("audio reverb thread count YAML keys", "[config][yaml][audio]") {
+    SECTION("defaults: conv_threads=0 (auto), sim_threads=0 (auto)") {
         Darkness::RenderConfig cfg;
-        CHECK(cfg.reverbThreads          == 0);
-        CHECK(cfg.reverbThreadsConvShare == -1.0f);
+        CHECK(cfg.convThreads == 0);
+        CHECK(cfg.simThreads  == 0);
     }
     SECTION("explicit values override defaults") {
         TmpFile tmp(R"(
 audio:
   performance:
-    reverb_threads: 6
-    reverb_threads_conv_share: 0.4
+    conv_threads: 3
+    sim_threads:  5
 )");
         Darkness::RenderConfig cfg;
         REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
-        CHECK(cfg.reverbThreads          == 6);
-        CHECK(cfg.reverbThreadsConvShare == Catch::Approx(0.4f));
+        CHECK(cfg.convThreads == 3);
+        CHECK(cfg.simThreads  == 5);
     }
-    SECTION("clamping: reverb_threads < 0 → 0, > 64 → 64") {
-        TmpFile lo("audio:\n  performance:\n    reverb_threads: -1\n");
+    SECTION("clamping: conv_threads/sim_threads < 0 → 0, > 64 → 64") {
+        TmpFile lo("audio:\n  performance:\n    conv_threads: -1\n    sim_threads: -5\n");
         Darkness::RenderConfig cfg1;
         Darkness::loadConfigFromYAML(lo.path.string(), cfg1);
-        CHECK(cfg1.reverbThreads == 0);
+        CHECK(cfg1.convThreads == 0);
+        CHECK(cfg1.simThreads  == 0);
 
-        TmpFile hi("audio:\n  performance:\n    reverb_threads: 999\n");
+        TmpFile hi("audio:\n  performance:\n    conv_threads: 999\n    sim_threads: 200\n");
         Darkness::RenderConfig cfg2;
         Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
-        CHECK(cfg2.reverbThreads == 64);
-    }
-    SECTION("conv_share: negative collapses to -1 (auto); > 1.0 clamps to 1.0") {
-        TmpFile neg("audio:\n  performance:\n    reverb_threads_conv_share: -0.5\n");
-        Darkness::RenderConfig cfg1;
-        Darkness::loadConfigFromYAML(neg.path.string(), cfg1);
-        CHECK(cfg1.reverbThreadsConvShare == -1.0f);
-
-        TmpFile hi("audio:\n  performance:\n    reverb_threads_conv_share: 5.0\n");
-        Darkness::RenderConfig cfg2;
-        Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
-        CHECK(cfg2.reverbThreadsConvShare == Catch::Approx(1.0f));
+        CHECK(cfg2.convThreads == 64);
+        CHECK(cfg2.simThreads  == 64);
     }
 }
 
@@ -436,13 +427,16 @@ audio:
     reflection_max_sources: 32
     sim_max_sources: 16
     reflection_demote_hysteresis_frames: 600
+    reverb_threads: 8
+    reverb_threads_conv_share: 0.5
 )");
     Darkness::RenderConfig cfg;
     REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
     // Deprecated keys ignored — fields fall back to RenderConfig defaults.
     CHECK(cfg.reverbVoices         == 16);
     CHECK(cfg.reverbVoicesRealtime == 0);
-    CHECK(cfg.reverbThreads        == 0);
+    CHECK(cfg.convThreads          == 0);
+    CHECK(cfg.simThreads           == 0);
 }
 
 // Q3 — per-voice spatialBlend override for AMB_ENVIRONMENTAL ambients.
@@ -475,4 +469,100 @@ audio:
         Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
         CHECK(cfg2.ambEnvironmentalSpatialBlend == Catch::Approx(1.0f));
     }
+}
+
+// Group D (2026-05) — dB-based ambient halt + spawn/halt fade ramps.
+// Replaces the legacy Euclidean radius × hysteresis_*_mul gate. New keys
+// live alongside the existing audio.ambient.* block.
+TEST_CASE("audio ambient Group D halt + fade YAML keys", "[config][yaml][audio]") {
+    SECTION("defaults match the spec") {
+        Darkness::RenderConfig cfg;
+        CHECK(cfg.ambientSpawnFadeInMs               == 150);
+        CHECK(cfg.ambientHaltFadeOutMs               == 250);
+        CHECK(cfg.ambientHaltAudibilityThresholdDb   == Catch::Approx(-50.0f));
+        CHECK(cfg.ambientHaltBelowThresholdFrames    == 30);
+    }
+    SECTION("explicit YAML values override defaults") {
+        TmpFile tmp(R"(
+audio:
+  ambient:
+    spawn_fade_in_ms: 300
+    halt_fade_out_ms: 400
+    halt_audibility_threshold_db: -45
+    halt_below_threshold_frames: 120
+)");
+        Darkness::RenderConfig cfg;
+        REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
+        CHECK(cfg.ambientSpawnFadeInMs             == 300);
+        CHECK(cfg.ambientHaltFadeOutMs             == 400);
+        CHECK(cfg.ambientHaltAudibilityThresholdDb == Catch::Approx(-45.0f));
+        CHECK(cfg.ambientHaltBelowThresholdFrames  == 120);
+    }
+    SECTION("clamping enforces documented ranges") {
+        TmpFile lo(R"(
+audio:
+  ambient:
+    spawn_fade_in_ms: -100
+    halt_fade_out_ms: -50
+    halt_audibility_threshold_db: -200
+    halt_below_threshold_frames: 1
+)");
+        Darkness::RenderConfig cfg1;
+        Darkness::loadConfigFromYAML(lo.path.string(), cfg1);
+        CHECK(cfg1.ambientSpawnFadeInMs             == 0);
+        CHECK(cfg1.ambientHaltFadeOutMs             == 0);
+        CHECK(cfg1.ambientHaltAudibilityThresholdDb == Catch::Approx(-80.0f));
+        CHECK(cfg1.ambientHaltBelowThresholdFrames  == 5);
+
+        TmpFile hi(R"(
+audio:
+  ambient:
+    spawn_fade_in_ms: 9999
+    halt_fade_out_ms: 9999
+    halt_audibility_threshold_db: 0
+    halt_below_threshold_frames: 9999
+)");
+        Darkness::RenderConfig cfg2;
+        Darkness::loadConfigFromYAML(hi.path.string(), cfg2);
+        CHECK(cfg2.ambientSpawnFadeInMs             == 2000);
+        CHECK(cfg2.ambientHaltFadeOutMs             == 2000);
+        CHECK(cfg2.ambientHaltAudibilityThresholdDb == Catch::Approx(-20.0f));
+        CHECK(cfg2.ambientHaltBelowThresholdFrames  == 600);
+    }
+    SECTION("--set CLI overrides for the same keys") {
+        Darkness::RenderConfig cfg;
+        CHECK(Darkness::applySetOverride("audio.ambient.spawn_fade_in_ms",
+                                         "500", cfg));
+        CHECK(cfg.ambientSpawnFadeInMs == 500);
+        CHECK(Darkness::applySetOverride("audio.ambient.halt_fade_out_ms",
+                                         "600", cfg));
+        CHECK(cfg.ambientHaltFadeOutMs == 600);
+        CHECK(Darkness::applySetOverride(
+            "audio.ambient.halt_audibility_threshold_db", "-30", cfg));
+        CHECK(cfg.ambientHaltAudibilityThresholdDb == Catch::Approx(-30.0f));
+        CHECK(Darkness::applySetOverride(
+            "audio.ambient.halt_below_threshold_frames", "200", cfg));
+        CHECK(cfg.ambientHaltBelowThresholdFrames == 200);
+    }
+}
+
+// Group D — the radius × hysteresis_*_mul gate retired in 2026-05. The
+// loader still accepts the old keys (emits a one-shot WARN to stderr) so
+// existing yamls don't fail to parse; everything else falls through to
+// defaults. Mirrors the audio.performance deprecation test above.
+TEST_CASE("audio ambient deprecated hysteresis keys parse without error",
+          "[config][yaml][audio]") {
+    TmpFile tmp(R"(
+audio:
+  ambient:
+    hysteresis_start_mul: 1.5
+    hysteresis_stop_mul: 2.0
+)");
+    Darkness::RenderConfig cfg;
+    REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
+    // Deprecated keys are ignored — Group D defaults remain in place.
+    CHECK(cfg.ambientSpawnFadeInMs             == 150);
+    CHECK(cfg.ambientHaltFadeOutMs             == 250);
+    CHECK(cfg.ambientHaltAudibilityThresholdDb == Catch::Approx(-50.0f));
+    CHECK(cfg.ambientHaltBelowThresholdFrames  == 30);
 }

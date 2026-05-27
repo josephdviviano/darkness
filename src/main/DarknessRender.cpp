@@ -266,7 +266,7 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
             "\"rate_divisor\":%d,\"max_active_voices\":%d,"
             "\"reverb_voices\":%d,\"reverb_voices_realtime\":%d,"
             "\"reflection_throttle\":%d,\"sim_max_occlusion_samples\":%d,"
-            "\"reverb_threads\":%d,\"reverb_threads_conv_share\":%.4f,"
+            "\"conv_threads\":%d,\"sim_threads\":%d,"
             "\"scene_type\":\"%s\""
         "},"
         "\"reflections\":{"
@@ -297,7 +297,9 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
             "\"hrtf_volume\":%.4f,\"hrtf_interpolation\":\"%s\",\"spatial_blend\":%.4f"
         "},"
         "\"ambient\":{"
-            "\"hysteresis_start_mul\":%.4f,\"hysteresis_stop_mul\":%.4f,"
+            "\"spawn_fade_in_ms\":%d,\"halt_fade_out_ms\":%d,"
+            "\"halt_audibility_threshold_db\":%.4f,"
+            "\"halt_below_threshold_frames\":%d,"
             "\"default_priority\":%d,\"environmental_spatial_blend\":%.4f,"
             "\"global_volume_scale\":%.4f"
         "},"
@@ -320,7 +322,7 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
         c.reflectionRateDivisor, c.maxActiveVoices,
         c.reverbVoices, c.reverbVoicesRealtime,
         c.reflectionThrottle, c.simMaxOcclusionSamples,
-        c.reverbThreads, c.reverbThreadsConvShare,
+        c.convThreads, c.simThreads,
         c.sceneType.c_str(),
         c.realtimeReflections ? "true" : "false", c.ambisonicsOrder,
         c.reflectionBakeSkip ? "true" : "false",
@@ -341,7 +343,9 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
         c.pathingUpdateInterval,
         c.pathingGainWeightLow, c.pathingGainWeightMid, c.pathingGainWeightHigh,
         c.hrtfVolume, c.hrtfInterpolation.c_str(), c.spatialBlend,
-        c.ambHysteresisStartMul, c.ambHysteresisStopMul,
+        c.ambientSpawnFadeInMs, c.ambientHaltFadeOutMs,
+        c.ambientHaltAudibilityThresholdDb,
+        c.ambientHaltBelowThresholdFrames,
         c.ambDefaultPriority, c.ambEnvironmentalSpatialBlend,
         c.ambGlobalVolumeScale,
         c.mixerMasterGain, c.mixerDirectGain, c.mixerReflectionGain,
@@ -3462,7 +3466,7 @@ dbgConsole.addFloat("refl_throttle", 1.0f, 32.0f,
     dbgConsole.addFloat("prop_min_attenuation", 0.0f, 0.1f,
         []() {
             auto svc = GET_SERVICE(Darkness::AudioService);
-            return svc ? svc->getPropMinAttenuation() : 0.001f;
+            return svc ? svc->getPropMinAttenuation() : 0.0f;
         },
         [](float v) {
             auto svc = GET_SERVICE(Darkness::AudioService);
@@ -4869,8 +4873,8 @@ int main(int argc, char *argv[]) {
         audioSvc->setMaxActiveVoices(cfg.maxActiveVoices);
         audioSvc->setReverbVoices(cfg.reverbVoices);
         audioSvc->setReverbVoicesRealtime(cfg.reverbVoicesRealtime);
-        audioSvc->setReverbThreads(cfg.reverbThreads);
-        audioSvc->setReverbThreadsConvShare(cfg.reverbThreadsConvShare);
+        audioSvc->setConvThreads(cfg.convThreads);
+        audioSvc->setSimThreads(cfg.simThreads);
         audioSvc->setReflectionThrottle(cfg.reflectionThrottle);
         audioSvc->setSimMaxOcclusionSamples(cfg.simMaxOcclusionSamples);
         audioSvc->setSceneType(cfg.sceneType);
@@ -4936,11 +4940,17 @@ int main(int argc, char *argv[]) {
         audioSvc->setSpatialBlend(cfg.spatialBlend);
 
         // -- audio.ambient --
-        audioSvc->setAmbHysteresisStartMul(cfg.ambHysteresisStartMul);
-        audioSvc->setAmbHysteresisStopMul(cfg.ambHysteresisStopMul);
         audioSvc->setAmbDefaultPriority(cfg.ambDefaultPriority);
         audioSvc->setAmbEnvironmentalSpatialBlend(cfg.ambEnvironmentalSpatialBlend);
         audioSvc->setAmbGlobalVolumeScale(cfg.ambGlobalVolumeScale);
+        // Group D — dB-based halt + spawn/halt fade ramps (replaces the
+        // legacy Euclidean radius × hysteresis_*_mul gate).
+        audioSvc->setAmbientSpawnFadeInMs(cfg.ambientSpawnFadeInMs);
+        audioSvc->setAmbientHaltFadeOutMs(cfg.ambientHaltFadeOutMs);
+        audioSvc->setAmbientHaltAudibilityThresholdDb(
+            cfg.ambientHaltAudibilityThresholdDb);
+        audioSvc->setAmbientHaltBelowThresholdFrames(
+            cfg.ambientHaltBelowThresholdFrames);
 
         // -- audio.mixer --
         audioSvc->setMasterGain(cfg.mixerMasterGain);

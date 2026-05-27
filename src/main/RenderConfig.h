@@ -58,16 +58,15 @@ struct RenderConfig {
     int  reverbVoicesRealtime    = 0;
     int  reflectionThrottle      = 4;     // [REALTIME] run sim every Nth frame (1–32)
     int  simMaxOcclusionSamples  = 32;    // [DIRECT+REFLECTIONS] per-source occlusion sample cap (Steam Audio sim) (4–256)
-    // Thread budget for reverb work (convolution workers + ray-trace
-    // simulator threads combined). 0 = auto: hwconc - 2. The share knob
-    // splits this between the two consumers; the invariant
-    // `conv + sim == total` guarantees no over-allocation regardless of
-    // how the share is set.
-    int   reverbThreads          = 0;
-    // -1 = auto split (baked-only configs bias toward convolution; realtime
-    // configs bias toward sim). Else literal fraction in [0.0, 1.0] of
-    // the budget assigned to convolution workers.
-    float reverbThreadsConvShare = -1.0f;
+    // Explicit thread counts for reverb work. `convThreads` are the
+    // per-voice convolution workers; `simThreads` are the Steam Audio
+    // ray-trace simulator threads. Both default to 0 = auto: total =
+    // max(2, hwconc - 2), split into ~35% conv / ~65% sim in baked-only
+    // mode (~45% / ~55% with realtime voices) — the sim is the bottleneck
+    // in both modes. Set BOTH > 0 to use literal values. If only one is
+    // > 0, AudioService emits a warning and falls back to auto for both.
+    int   convThreads            = 0;
+    int   simThreads             = 0;
     std::string sceneType        = "default"; // [REFLECTIONS] IPL scene backend ("default" or "embree" — embree falls back to default if Steam Audio wasn't built with embree)
 
     // -- audio.reflections: convolution reverb feel --
@@ -217,7 +216,11 @@ struct RenderConfig {
     float propagationMaxDist  = 200.0f; // max sound propagation distance through portal graph (world units)
     float doorLpfOpenHz       = 20000.0f; // LPF cutoff for fully open door (Hz)
     float doorLpfBlockedHz    = 800.0f;   // LPF cutoff for fully blocked door (Hz)
-    float propMinAttenuation  = 0.001f;   // floor on propagation/portal scale (prevents total silence from FP noise)
+    // Floor on propagation/portal scale. Default 0.0 disables the floor
+    // (was 0.001; the FP-noise reasoning was speculative — left in place
+    // as a config knob in case it needs to be re-enabled). With smooth
+    // occlusion ramps, attenuation naturally reaches 0 without dropouts.
+    float propMinAttenuation  = 0.0f;
     // N-path BFS: how many simultaneous portal-graph paths to keep per
     // listener room. 1 = single shortest path; 2 = original Dark Engine
     // (cBFRoomInfo::previous_room_2); 3+ = modernized. Clamped to [1, 4].
@@ -271,9 +274,33 @@ struct RenderConfig {
     float spatialBlend        = 1.0f;   // binaural blend (0=mono, 1=full HRTF)
 
     // -- audio.ambient: P$AmbientHack tuning --
-    float ambHysteresisStartMul = 1.5f; // multiplier on radius for ambient activation distance
-    float ambHysteresisStopMul  = 2.0f; // multiplier on radius for ambient deactivation distance
+    //
+    // Voice lifecycle (Group D — 2026-05): spawn fires on `dist < amb.radius`
+    // (no hysteresis multiplier; the original-engine spawn boundary), halt
+    // fires on a dB-based audibility threshold rather than the Euclidean
+    // stop boundary. Halt is preceded by a `halt_fade_out_ms` ramp so the
+    // discrete stopVoice event is perceptually hidden; spawn is followed by
+    // a `spawn_fade_in_ms` ramp so the first audio callback's silent
+    // initVoiceDSP defaults don't pop. See AmbientSoundManager.cpp for the
+    // audibility derivation (mapping.gain × distanceAttenuation × schema_cb).
     int   ambDefaultPriority    = 64;   // priority for ambients without explicit value
+    // [AMBIENT] volume ramp 0→full on voice spawn (0–2000 ms). 150 ms hides
+    // the spawn pop without making the appearance feel laggy.
+    int   ambientSpawnFadeInMs  = 150;
+    // [AMBIENT] volume ramp full→0 before halt-stop (0–2000 ms). 250 ms
+    // hides the halt pop; the voice keeps running through the fade so a
+    // late audibility recovery can cancel and ramp back up.
+    int   ambientHaltFadeOutMs  = 250;
+    // [AMBIENT] dB level below which voice is considered "inaudible" and
+    // halt is triggered (-80 to -20). −50 dB ≈ 0.00316 linear; well below
+    // the perceptual floor of a stationary listener in a typical Thief
+    // mission ambient mix.
+    float ambientHaltAudibilityThresholdDb = -50.0f;
+    // [AMBIENT] consecutive frames below threshold required to trigger
+    // halt (5–600). At 60 Hz, 30 frames ≈ 0.5 s — long enough to ignore
+    // single-frame eq-flicker dips, short enough that a player walking
+    // away from a source halts the voice within a beat.
+    int   ambientHaltBelowThresholdFrames = 30;
     // Per-voice spatialBlend override for AMB_ENVIRONMENTAL ambients (room
     // tone, wind, church reverberance). 1.0 = full HRTF point-source pan;
     // 0.0 = mono passthrough (no directional cue). Object-attached ambients
@@ -484,16 +511,18 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.simMaxOcclusionSamples < 4)   cfg.simMaxOcclusionSamples = 4;
                     if (cfg.simMaxOcclusionSamples > 256) cfg.simMaxOcclusionSamples = 256;
                 }
-                // Thread budget for reverb work (convolution + sim combined).
-                if (perf["reverb_threads"]) {
-                    cfg.reverbThreads = perf["reverb_threads"].as<int>();
-                    if (cfg.reverbThreads < 0)  cfg.reverbThreads = 0;
-                    if (cfg.reverbThreads > 64) cfg.reverbThreads = 64;
+                // Explicit thread counts for reverb work. Both 0 = auto.
+                // Both > 0 = use literal values. Mixed = auto + warn (see
+                // AudioService init).
+                if (perf["conv_threads"]) {
+                    cfg.convThreads = perf["conv_threads"].as<int>();
+                    if (cfg.convThreads < 0)  cfg.convThreads = 0;
+                    if (cfg.convThreads > 64) cfg.convThreads = 64;
                 }
-                if (perf["reverb_threads_conv_share"]) {
-                    cfg.reverbThreadsConvShare = perf["reverb_threads_conv_share"].as<float>();
-                    if (cfg.reverbThreadsConvShare < 0.0f) cfg.reverbThreadsConvShare = -1.0f;
-                    if (cfg.reverbThreadsConvShare > 1.0f) cfg.reverbThreadsConvShare = 1.0f;
+                if (perf["sim_threads"]) {
+                    cfg.simThreads = perf["sim_threads"].as<int>();
+                    if (cfg.simThreads < 0)  cfg.simThreads = 0;
+                    if (cfg.simThreads > 64) cfg.simThreads = 64;
                 }
                 if (perf["scene_type"]) {
                     cfg.sceneType = perf["scene_type"].as<std::string>();
@@ -509,14 +538,16 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     "sim_max_rays", "direct_max_sources",
                     "reflection_max_sources", "sim_max_sources",
                     "reflection_demote_hysteresis_frames",
+                    "reverb_threads", "reverb_threads_conv_share",
                 };
                 for (const char* key : kDeprecated) {
                     if (perf[key]) {
                         std::fprintf(stderr,
                             "WARN: audio.performance.%s is no longer used "
-                            "(replaced by reverb_voices/reverb_voices_realtime/"
-                            "reverb_threads or auto-derived). Safe to remove "
-                            "from darknessRender.yaml.\n", key);
+                            "(replaced by conv_threads/sim_threads/"
+                            "reverb_voices/reverb_voices_realtime or "
+                            "auto-derived). Safe to remove from "
+                            "darknessRender.yaml.\n", key);
                     }
                 }
             }
@@ -810,15 +841,24 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
 
             // -- audio.ambient --
             if (YAML::Node amb = audio["ambient"]) {
-                if (amb["hysteresis_start_mul"]) {
-                    cfg.ambHysteresisStartMul = amb["hysteresis_start_mul"].as<float>();
-                    if (cfg.ambHysteresisStartMul < 1.0f) cfg.ambHysteresisStartMul = 1.0f;
-                    if (cfg.ambHysteresisStartMul > 5.0f) cfg.ambHysteresisStartMul = 5.0f;
-                }
-                if (amb["hysteresis_stop_mul"]) {
-                    cfg.ambHysteresisStopMul = amb["hysteresis_stop_mul"].as<float>();
-                    if (cfg.ambHysteresisStopMul < 1.0f) cfg.ambHysteresisStopMul = 1.0f;
-                    if (cfg.ambHysteresisStopMul > 5.0f) cfg.ambHysteresisStopMul = 5.0f;
+                // Group D (2026-05): the radius-multiplier gate was replaced
+                // by a dB-based audibility halt. Old keys are still parsed
+                // but ignored; emit a one-shot WARN so existing yamls get a
+                // pointer to the replacement knobs.
+                static const char* kDeprecatedAmbient[] = {
+                    "hysteresis_start_mul",
+                    "hysteresis_stop_mul",
+                };
+                for (const char* key : kDeprecatedAmbient) {
+                    if (amb[key]) {
+                        std::fprintf(stderr,
+                            "WARN: audio.ambient.%s is no longer used "
+                            "(replaced by halt_audibility_threshold_db / "
+                            "halt_below_threshold_frames + spawn_fade_in_ms"
+                            " / halt_fade_out_ms — see darknessRender."
+                            "example.yaml). Safe to remove from "
+                            "darknessRender.yaml.\n", key);
+                    }
                 }
                 if (amb["falloff_curve"]) {
                     std::fprintf(stderr,
@@ -829,6 +869,32 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                         "handles all attenuation now. Tune audio.ambient."
                         "global_volume_scale to compensate for the loudness "
                         "re-baseline. Remove the key from your YAML.\n");
+                }
+                if (amb["spawn_fade_in_ms"]) {
+                    cfg.ambientSpawnFadeInMs = amb["spawn_fade_in_ms"].as<int>();
+                    if (cfg.ambientSpawnFadeInMs < 0)    cfg.ambientSpawnFadeInMs = 0;
+                    if (cfg.ambientSpawnFadeInMs > 2000) cfg.ambientSpawnFadeInMs = 2000;
+                }
+                if (amb["halt_fade_out_ms"]) {
+                    cfg.ambientHaltFadeOutMs = amb["halt_fade_out_ms"].as<int>();
+                    if (cfg.ambientHaltFadeOutMs < 0)    cfg.ambientHaltFadeOutMs = 0;
+                    if (cfg.ambientHaltFadeOutMs > 2000) cfg.ambientHaltFadeOutMs = 2000;
+                }
+                if (amb["halt_audibility_threshold_db"]) {
+                    cfg.ambientHaltAudibilityThresholdDb =
+                        amb["halt_audibility_threshold_db"].as<float>();
+                    if (cfg.ambientHaltAudibilityThresholdDb < -80.0f)
+                        cfg.ambientHaltAudibilityThresholdDb = -80.0f;
+                    if (cfg.ambientHaltAudibilityThresholdDb > -20.0f)
+                        cfg.ambientHaltAudibilityThresholdDb = -20.0f;
+                }
+                if (amb["halt_below_threshold_frames"]) {
+                    cfg.ambientHaltBelowThresholdFrames =
+                        amb["halt_below_threshold_frames"].as<int>();
+                    if (cfg.ambientHaltBelowThresholdFrames < 5)
+                        cfg.ambientHaltBelowThresholdFrames = 5;
+                    if (cfg.ambientHaltBelowThresholdFrames > 600)
+                        cfg.ambientHaltBelowThresholdFrames = 600;
                 }
                 if (amb["default_priority"]) {
                     cfg.ambDefaultPriority = amb["default_priority"].as<int>();
@@ -1081,15 +1147,13 @@ inline bool applySetOverride(const std::string& path, const std::string& valueSt
         int v; if (!toInt(v)) return false;
         cfg.simMaxOcclusionSamples = clampI(v, 4, 256); return true;
     }
-    if (path == "audio.performance.reverb_threads") {
+    if (path == "audio.performance.conv_threads") {
         int v; if (!toInt(v)) return false;
-        cfg.reverbThreads = clampI(v, 0, 64); return true;
+        cfg.convThreads = clampI(v, 0, 64); return true;
     }
-    if (path == "audio.performance.reverb_threads_conv_share") {
-        float v; if (!toFloat(v)) return false;
-        if (v < 0.0f) cfg.reverbThreadsConvShare = -1.0f;
-        else          cfg.reverbThreadsConvShare = clampF(v, 0.0f, 1.0f);
-        return true;
+    if (path == "audio.performance.sim_threads") {
+        int v; if (!toInt(v)) return false;
+        cfg.simThreads = clampI(v, 0, 64); return true;
     }
     if (path == "audio.performance.scene_type") {
         cfg.sceneType = (valueStr == "embree" ? "embree" : "default");
@@ -1260,13 +1324,21 @@ inline bool applySetOverride(const std::string& path, const std::string& valueSt
     }
 
     // -- audio.ambient --
-    if (path == "audio.ambient.hysteresis_start_mul") {
-        float v; if (!toFloat(v)) return false;
-        cfg.ambHysteresisStartMul = clampF(v, 1.0f, 5.0f); return true;
+    if (path == "audio.ambient.spawn_fade_in_ms") {
+        int v; if (!toInt(v)) return false;
+        cfg.ambientSpawnFadeInMs = clampI(v, 0, 2000); return true;
     }
-    if (path == "audio.ambient.hysteresis_stop_mul") {
+    if (path == "audio.ambient.halt_fade_out_ms") {
+        int v; if (!toInt(v)) return false;
+        cfg.ambientHaltFadeOutMs = clampI(v, 0, 2000); return true;
+    }
+    if (path == "audio.ambient.halt_audibility_threshold_db") {
         float v; if (!toFloat(v)) return false;
-        cfg.ambHysteresisStopMul = clampF(v, 1.0f, 5.0f); return true;
+        cfg.ambientHaltAudibilityThresholdDb = clampF(v, -80.0f, -20.0f); return true;
+    }
+    if (path == "audio.ambient.halt_below_threshold_frames") {
+        int v; if (!toInt(v)) return false;
+        cfg.ambientHaltBelowThresholdFrames = clampI(v, 5, 600); return true;
     }
     if (path == "audio.ambient.default_priority") {
         int v; if (!toInt(v)) return false;

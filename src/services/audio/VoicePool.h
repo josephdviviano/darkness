@@ -201,6 +201,14 @@ struct SteamAudioDSPNode {
     // and parametric FDN have decayed to zero. Threshold must be ≥ the IR
     // length in callbacks so the delay line fully drains before skipping —
     // skipping earlier would freeze stale content in the delay line.
+    //
+    // INITIALISED AT 0: voices start in the active path. Voices born
+    // genuinely silent (out-of-range / pathing-isolated) will count up
+    // to kReflSilentSkipFrames+1 and elide naturally. Initializing high
+    // (INT_MAX/2) was tried briefly (2026-05-26) to skip the wasted-apply
+    // window on never-audible spawns; reverted because the CPU savings
+    // were small with the post-hysteresis ambient-population reduction,
+    // and the symmetric init makes the lifecycle easier to reason about.
     int framesSinceNonzeroReflInput = 0;
 
     // Per-voice ramp state for portal-routing scalars (audio thread only).
@@ -240,7 +248,22 @@ struct SteamAudioDSPNode {
     // is owned by Steam Audio's internal staging buffer — we copy the
     // params struct verbatim so the pointer is stable across the per-
     // callback read window.
-    IPLPathEffectParams pathTargetParams{};
+    //
+    // Initial pathing state: eq=[0,0,0], pathTargetValid=false. This
+    // produces mapping.gain=0 in the readback, so the wet bus is
+    // silent until the first real solve arrives via either the
+    // non-sentinel write path or the cache replay (pathingEverSolved
+    // gate). Was [1,1,1] (synthetic passthrough) — caused a sudden
+    // wet-bus spike on voice spawn before pathing converged.
+    IPLPathEffectParams pathTargetParams{
+        /*eqCoeffs[3]=*/{0.0f, 0.0f, 0.0f},
+        /*shCoeffs=*/nullptr,
+        /*order=*/0,
+        /*binaural=*/IPL_FALSE,
+        /*hrtf=*/nullptr,
+        /*listener=*/{},
+        /*normalizeEQ=*/IPL_FALSE,
+    };
     // True iff pathTargetParams currently holds a non-sentinel,
     // non-default snapshot the audio thread is allowed to feed into
     // iplPathEffectApply this callback. Set on every non-sentinel
