@@ -173,39 +173,48 @@ void AmbientSoundManager::updateAmbientVolumes()
         return;
 
     for (auto &amb : mAmbients) {
-        // Ambient spawn/halt gate (CPU-side voice lifecycle): Euclidean
-        // distance against schema radius with asymmetric hysteresis.
-        // `amb.radius` is the authored CPU spawn boundary only — loudness
-        // shaping is delegated to Steam Audio (distance, portal, occlusion,
-        // air absorption), so the per-radius falloff curve is no longer
-        // applied below.
+        // Group D (2026-05) voice lifecycle. CPU-side gate uses the
+        // authored radius for the SPAWN side only — voices wake when
+        // `dist < amb.radius`, matching the original engine's spawn
+        // boundary. The HALT side is driven by perceived audibility
+        // (mapping.gain × directParams.distanceAttenuation × schema_cb),
+        // because the Euclidean stop boundary halted voices at
+        // ~radius × stop_mul even though Steam Audio's 1/r curve still
+        // had the source at ~-20 dB (clearly audible → pop on cut).
+        // Loudness shaping is delegated to Steam Audio (distance,
+        // portal, occlusion, air absorption); the per-radius falloff
+        // curve does not apply at the miniaudio source-volume layer.
         const float dist = glm::length(mHost->mListenerPos - amb.position);
-        const float startRadius = amb.radius * mHysteresisStartMul;
-        const float stopRadius  = amb.radius * mHysteresisStopMul;
-
         const bool alreadyPlaying = (amb.handle != SOUND_HANDLE_INVALID);
-        const bool inRange = (amb.radius > 0.0f &&
-                              (alreadyPlaying ? dist < stopRadius : dist < startRadius));
 
-        if (!inRange) {
-            // Out of range — fade out (mirror the smooth ramp-up at start).
-            if (amb.handle != SOUND_HANDLE_INVALID) {
-                mHost->haltSound(amb.handle, /*fadeMs=*/200);
-                amb.handle = SOUND_HANDLE_INVALID;
-            }
-            continue;
+        // Spawn gate. Original-engine boundary: `dist < radius` (no
+        // hysteresis multiplier — the historical anti-thrash safety net
+        // is replaced by the dB-audibility halt + halt-fade window).
+        if (!alreadyPlaying) {
+            if (amb.radius <= 0.0f || dist >= amb.radius)
+                continue;  // out of spawn range, nothing to do
         }
 
         const bool isEnvironmental = (amb.flags & AMB_ENVIRONMENTAL) != 0;
         bool justCreated = false;
 
         if (amb.handle == SOUND_HANDLE_INVALID && !amb.resolutionFailed) {
-            // Memo invariant: once both startVoice attempts below fail in
-            // one frame, amb.resolutionFailed latches true and this block
-            // is skipped forever. CRF resources are immutable at runtime
-            // so a sample that's missing now will be missing every frame
-            // — without the memo, the [FALLBACK] log fires every host
-            // tick (5000+ lines per 10 broken schemas in a single run).
+            // Memo invariant: once startVoice returns INVALID for a
+            // *genuinely missing* sample (every attempted sample name is
+            // in AudioService::mFailedSamples), amb.resolutionFailed
+            // latches true and this block is skipped forever. CRF
+            // resources are immutable at runtime so a sample that's
+            // missing now will be missing every frame — without the
+            // memo, the [FALLBACK] log fires every host tick (5000+
+            // lines per 10 broken schemas in a single run).
+            //
+            // The latch MUST NOT fire on transient startVoice failures
+            // (pool saturation, distance cull) — those recover when the
+            // pool drains or the listener approaches, and latching them
+            // permanently kills ambients the player will eventually hear.
+            // Distinguishing the two requires consulting
+            // AudioService::isSampleKnownBad on the specific sample
+            // names we attempted.
             const bool isLooping = !(amb.flags & AMB_ONCE_ONLY);
             // Decide VoiceClass BEFORE startVoice so createVoiceSource applies
             // the per-class default directParams on the first audio callback
@@ -234,21 +243,33 @@ void AmbientSoundManager::updateAmbientVolumes()
                                                isLooping, amb.objID, 0.0f, cls);
             }
             if (amb.handle == SOUND_HANDLE_INVALID) {
-                // Both attempts failed — latch the memo and emit ONE
-                // self-contained [FALLBACK] line. Per
-                // feedback_no_silent_fallbacks the message must be loud
-                // and identify (a) schema, (b) object, (c) what samples
-                // were attempted, and (d) the permanent-disable
-                // transition. After this frame, the retry block is gated
-                // off so this ambient stays silent without further logs.
-                amb.resolutionFailed = true;
-                std::fprintf(stderr,
-                    "[FALLBACK] AmbientSoundManager: schema '%s' on obj %d "
-                    "has no resolvable samples — disabling permanently "
-                    "(tried schema sample '%s' and raw '%s', "
-                    "disabled_permanently=1)\n",
-                    amb.schemaName.c_str(), amb.objID,
-                    schemaSampleAttempted.c_str(), amb.schemaName.c_str());
+                // Both startVoice attempts failed — but startVoice
+                // returns INVALID for several distinct reasons. Only
+                // latch resolutionFailed if EVERY sample we attempted
+                // is in AudioService::mFailedSamples (i.e. the sound
+                // loader has actually rejected them). Otherwise the
+                // failure is transient (pool saturation / distance
+                // cull) and we silently retry next frame.
+                const bool firstWasTried = !schemaSampleAttempted.empty();
+                const bool firstBad = firstWasTried
+                    && mHost->isSampleKnownBad(schemaSampleAttempted);
+                const bool secondBad = mHost->isSampleKnownBad(amb.schemaName);
+                const bool everyAttemptKnownBad =
+                    (!firstWasTried || firstBad) && secondBad;
+                if (everyAttemptKnownBad) {
+                    amb.resolutionFailed = true;
+                    std::fprintf(stderr,
+                        "[FALLBACK] AmbientSoundManager: schema '%s' on obj %d "
+                        "has no resolvable samples — disabling permanently "
+                        "(tried schema sample '%s' and raw '%s', "
+                        "disabled_permanently=1)\n",
+                        amb.schemaName.c_str(), amb.objID,
+                        schemaSampleAttempted.c_str(), amb.schemaName.c_str());
+                }
+                // Transient failure (pool full / distance cull) — no
+                // latch, no [FALLBACK] log. The ambient will retry on
+                // the next updateAmbientVolumes tick when pool pressure
+                // eases.
                 continue;
             }
             justCreated = mHost->voiceExists(amb.handle);
@@ -304,6 +325,23 @@ void AmbientSoundManager::updateAmbientVolumes()
                 ev.baseRange    = amb.radius;
                 ev.gainDb       = static_cast<float>(amb.volume + gainCb);
                 mHost->publishSoundEmission(ev);
+
+                // Reset per-voice halt state on (re)spawn so a previously-
+                // halted ambient that's back in range starts fresh.
+                amb.framesBelowAudibilityThreshold = 0;
+                amb.haltFadeActive = false;
+                amb.haltFadeRemainingFrames = 0;
+
+                // Kick off the spawn fade-in: 0 → 1 over mSpawnFadeInMs.
+                // The fade is multiplicative with the per-frame
+                // ma_sound_set_volume() update below, so the voice's
+                // effective output ramps from silence to its authored
+                // linear gain. 0 ms = no ramp (legacy hard-on).
+                if (mSpawnFadeInMs > 0) {
+                    mHost->voiceSetFadeMilliseconds(amb.handle,
+                        /*volumeBeg=*/0.0f, /*volumeEnd=*/1.0f,
+                        mSpawnFadeInMs);
+                }
             }
         }
 
@@ -314,6 +352,11 @@ void AmbientSoundManager::updateAmbientVolumes()
             continue;
         if (!mHost->voiceExists(amb.handle)) {
             amb.handle = SOUND_HANDLE_INVALID;
+            // Voice vanished out from under us (e.g. pool eviction).
+            // Reset halt state so a future respawn starts fresh.
+            amb.framesBelowAudibilityThreshold = 0;
+            amb.haltFadeActive = false;
+            amb.haltFadeRemainingFrames = 0;
             continue;
         }
 
@@ -366,6 +409,122 @@ void AmbientSoundManager::updateAmbientVolumes()
         // propagation authority — one knob in YAML rather than per-schema.
         mHost->voiceSetLinearVolume(amb.handle,
             linearVol * mHost->currentDuckGain() * mGlobalVolumeScale);
+
+        // ── dB-based halt audibility + fade-out scheduler ──
+        //
+        // TODO(tuning): the halt criterion is dB-based audibility; consider
+        //   whether the formula (mapping.gain × distanceAttenuation ×
+        //   schema_gain_linear) is the right perceptual proxy, or if it
+        //   should include other factors (HRTF panning, dynamic occlusion
+        //   smoothing, etc.).
+        //
+        // voiceCurrentAudibility returns `portalAttenuation ×
+        // directParams.distanceAttenuation` for the voice. Multiplying
+        // by `linearVol` (schema centibel → linear) gives the steady-state
+        // perceptual loudness the listener would hear if no further DSP
+        // (HRTF binaural, master EQ/comp/limiter) modified the signal.
+        // This is a deliberate underestimate — the master chain can add
+        // a few dB — but matches the original engine's "audible loudness"
+        // accounting closely enough for halt scheduling.
+        const float audibility =
+            mHost->voiceCurrentAudibility(amb.handle) * linearVol;
+        const bool belowThreshold = (audibility < mHaltAudibilityThresholdLinear);
+
+        // Bug 2 fix: halt counter only ticks AFTER the voice has been
+        // solved at least once by the pathing simulator. Voices in the
+        // pre-solve window have wet bus silent by design (Group B init
+        // sets pathTargetParams.eqCoeffs = [0,0,0] until the first real
+        // solve arrives), so incrementing the counter then would halt
+        // them before they have any chance to become audible via routed
+        // pathing. Bug 1 (voiceCurrentAudibility now includes the direct
+        // path) catches most cases — but a voice that's ALSO out of HRTF
+        // audibility range (very distant + blocked LOS) would still tick
+        // the counter with the corrected formula. This grace gate
+        // catches that case explicitly. The original square-wave tremolo
+        // on m06wingedM / m06wingedF in MISS6 required BOTH fixes.
+        const bool pathingReady = mHost->voicePathingEverSolved(amb.handle);
+        if (belowThreshold && pathingReady) {
+            amb.framesBelowAudibilityThreshold++;
+        } else if (belowThreshold) {
+            // Pre-solve window — hold the counter at 0; don't penalize
+            // the voice for a silent wet bus that hasn't had a chance to
+            // come online yet.
+            amb.framesBelowAudibilityThreshold = 0;
+        } else {
+            // Above threshold — reset the counter. If a halt fade was
+            // armed but not yet completed, cancel it and ramp the voice
+            // back up to full over the remaining fade window. Snapping
+            // would re-introduce the discrete event the fade was hiding,
+            // and a fresh fade-in over `remaining` frames matches the
+            // spec's "ramp back up" guidance.
+            amb.framesBelowAudibilityThreshold = 0;
+            if (amb.haltFadeActive) {
+                amb.haltFadeActive = false;
+                // Ramp the multiplicative fader from its current value
+                // back to 1.0. miniaudio's volumeBeg = -1 sentinel reads
+                // the current effective volume, giving a smooth pickup
+                // regardless of where in the fade-out we are.
+                if (mSpawnFadeInMs > 0) {
+                    mHost->voiceSetFadeMilliseconds(amb.handle,
+                        /*volumeBeg=*/-1.0f, /*volumeEnd=*/1.0f,
+                        mSpawnFadeInMs);
+                } else {
+                    // No fade configured — snap by feeding a 0 ms ramp
+                    // that lands at 1.0 next callback.
+                    mHost->voiceSetFadeMilliseconds(amb.handle,
+                        /*volumeBeg=*/-1.0f, /*volumeEnd=*/1.0f, 0);
+                }
+                amb.haltFadeRemainingFrames = 0;
+            }
+        }
+
+        if (amb.haltFadeActive) {
+            // Fade in progress — decrement scheduler counter. When the
+            // counter hits 0 (or the voice handle vanishes mid-fade),
+            // commit the stopVoice. haltSound's own fade is fadeMs=1
+            // because the perceptual fade-out already ran during the
+            // pre-armed ma_sound_set_fade_in_milliseconds window.
+            if (amb.haltFadeRemainingFrames > 0)
+                amb.haltFadeRemainingFrames--;
+            if (amb.haltFadeRemainingFrames == 0) {
+                mHost->haltSound(amb.handle, /*fadeMs=*/1);
+                amb.handle = SOUND_HANDLE_INVALID;
+                amb.haltFadeActive = false;
+                amb.framesBelowAudibilityThreshold = 0;
+                continue;
+            }
+        } else if (amb.framesBelowAudibilityThreshold >= mHaltBelowThresholdFrames) {
+            // Threshold met — arm the halt fade-out. The voice keeps
+            // running for `mHaltFadeOutMs` worth of loop ticks so the
+            // perceptual fade-out can complete; the audibility check
+            // above still runs each tick so a late recovery cancels
+            // gracefully.
+            //
+            // Edge case: when mHaltFadeOutMs == 0 (legacy hard-cut),
+            // skip the fade and stop immediately.
+            if (mHaltFadeOutMs <= 0) {
+                mHost->haltSound(amb.handle, /*fadeMs=*/1);
+                amb.handle = SOUND_HANDLE_INVALID;
+                amb.framesBelowAudibilityThreshold = 0;
+                continue;
+            }
+            mHost->voiceSetFadeMilliseconds(amb.handle,
+                /*volumeBeg=*/-1.0f, /*volumeEnd=*/0.0f,
+                mHaltFadeOutMs);
+            amb.haltFadeActive = true;
+            // Convert ms → loop-tick budget. updateAmbientVolumes runs
+            // at the loop rate (typically 60 Hz from the render frame);
+            // there is no fractional loop-rate accessor on AudioService
+            // here, so we approximate via a 60 Hz floor. The audio fade
+            // itself is in real time, so a coarser ms→ticks rounding is
+            // safe — the worst case is the stopVoice firing 1–2 ticks
+            // early/late, well below the 250 ms fade window.
+            constexpr float kAssumedLoopHz = 60.0f;
+            int budget = static_cast<int>(
+                (mHaltFadeOutMs * kAssumedLoopHz) / 1000.0f);
+            if (budget < 1) budget = 1;
+            amb.haltFadeRemainingFrames = budget;
+        }
     }
 }
 
