@@ -760,7 +760,10 @@ static std::atomic<IPLHRTF> sPathHrtf{nullptr};
 /// Published once at init alongside sPathHrtf; the audio thread reads it
 /// when staging the per-call IPLPathEffectParams::order so the path
 /// effect carries a valid order even on the first frame before the
-/// solver has written into pathTargetParams.
+/// pathing solver has produced any output for this voice (the audio
+/// thread reads pathingOutputs fresh via iplSourceGetOutputs against
+/// the per-voice pathingSource mirror — Valve reference-plugin
+/// pattern; no application-layer staged-copy field).
 static std::atomic<int> sPathAmbisonicsOrder{0};
 
 /// Silent-voice convolution skip threshold (in audio callbacks). Derived
@@ -1546,13 +1549,15 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         //   • runAtten is off (debug bypass level 2),
         //   • the main thread has marked the path target invalid
         //     (pre-first-loopStep, out-of-range, or pending-source race).
-        // No sentinel-flicker cache: pathTargetParams holds whatever
-        // Steam Audio's iplSourceGetOutputs returned on the last
-        // loopStep. Startup-window reads carry the init sentinel
-        // (eq=[0.1,…], sh=zero) which produces silence via the path
-        // effect's SH × EQ math — no main-thread special-casing
-        // required. Same pattern as the Unity / Unreal / FMOD / Wwise
-        // reference plugins.
+        // No sentinel-flicker cache and no application-layer staged
+        // IPLPathEffectParams copy: the audio thread reads pathingOutputs
+        // fresh from node->pathingSource via iplSourceGetOutputs each
+        // callback (see the Valve reference-plugin block below).
+        // Startup-window reads carry Steam Audio's per-source one-time
+        // init value (eq=[0.1,…], sh=zero) which produces silence via
+        // the path effect's SH × EQ math — no main-thread special-
+        // casing required. Same pattern as the Unity / Unreal / FMOD /
+        // Wwise reference plugins.
         if (runAtten && !node->skipAttenuation
             && node->pathEffect
             && node->pathingSource
@@ -1732,7 +1737,9 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
         // next audio callback, writing to a double-buffered stereo output.
         // Reflection apply gate. HYBRID always needs a real IR (irSize > 0)
         // for the convolution head; reverbTimes for the parametric tail are
-        // pinned alongside the IR.
+        // refreshed every loopStep from the listener-nearest probe (the
+        // hoisted block at the top of the per-voice loop) so RT60 tracks
+        // the listener's current room rather than freezing at voice spawn.
         const bool reflParamsValid = (node->reflectionParams.irSize > 0);
         if (node->reflectionsActive && node->reflectionEffect
             && reflParamsValid && node->convWorker) {
@@ -4855,8 +4862,11 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
         inst.localVertices = g.localVertices;
         inst.indices       = g.indices;
         inst.worldTransform = g.worldTransform;
-        // Seed the world-AABB cache used by [PATH_PROBE_DOOR]. Refreshed on
-        // every setDoorTransform so it tracks the live pose.
+        // Seed the cached world-AABB. Consumed by the [PROBE_DOOR_AUDIT]
+        // post-registration scan, the door-portal classification pass in
+        // probe-bake plumbing, and the [PROBE_BAKE] probe-inside-door
+        // rejection. Refreshed on every setDoorTransform so it tracks
+        // the live pose.
         recomputeDoorWorldAABB(inst);
         mDoorAudioInstances[g.objID] = inst;
         ++created;
@@ -4965,8 +4975,9 @@ void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTrans
     // semantics as the IPL update, so the show_door_geometry wireframe
     // tracks the live door pose without an extra plumbing path.
     it->second.worldTransform = worldTransform;
-    // Keep the world-AABB cache in lockstep with the live pose so
-    // [PATH_PROBE_DOOR] reads the current door footprint.
+    // Keep the world-AABB cache in lockstep with the live pose so the
+    // [PROBE_DOOR_AUDIT] / door-portal-classification / [PROBE_BAKE]
+    // consumers read the current door footprint.
     recomputeDoorWorldAABB(it->second);
     // Coalesce into one iplSceneCommit per loopStep (see loopStep header).
     mSceneNeedsCommit.store(true, std::memory_order_release);
@@ -4992,12 +5003,14 @@ void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTrans
 //------------------------------------------------------
 void AudioService::recomputeDoorWorldAABB(DoorAudioInstance &inst) const
 {
-    // Compute world-space AABB of a door mesh in engine coordinates (Z-up
-    // feet). Used by [PATH_PROBE_DOOR] to test "does this baked probe sit
-    // inside / near a door's footprint?" — the failure mode the user
-    // hypothesized for door-blocking transparency. Same transform math as
-    // getDoorGeometryForDebug; the door transform is pure-rigid so direct
-    // matmul on a homogeneous point suffices.
+    // Compute world-space AABB of a door mesh in engine coordinates
+    // (Z-up feet). Used by [PROBE_DOOR_AUDIT] (post-registration scan
+    // for probes sitting inside a door footprint), the door-portal
+    // classification pass that maps doors to BSP portals at bake time,
+    // and the [PROBE_BAKE] rejection that drops non-DoorPair candidates
+    // falling inside a door's AABB. Same transform math as
+    // getDoorGeometryForDebug; the door transform is pure-rigid so a
+    // direct matmul on a homogeneous point suffices.
     inst.worldAABBmin = Vector3( std::numeric_limits<float>::max());
     inst.worldAABBmax = Vector3(-std::numeric_limits<float>::max());
     if (inst.localVertices.size() < 3) return;
@@ -6243,11 +6256,21 @@ void AudioService::loopStep(float deltaTime)
                 // listener. Fraction of unblocked rays = unoccluded
                 // fraction.
                 //
-                // Sphere radius is controlled entirely by the YAML knob
-                // `audio.occlusion.radius` (clamped 0.3–30 at config
-                // load). No runtime floor — the value you set in the
-                // config is exactly the value used.
-                inputs.occlusionRadius = mAudioOcclusion->getRadiusMeters();
+                // Sphere radius is PER-VOICE — computed once at voice
+                // creation in createVoiceSource via the BSP raycaster
+                // so the sphere never extends past the nearest wall in
+                // any direction (eliminates the prior cross-wall leak
+                // where global-radius spheres reached from the source
+                // into the listener's room and produced false-positive
+                // direct-LOS rays). Falls back to the YAML
+                // `audio.occlusion.radius` global if the helper
+                // returned a negative sentinel (headless tools that
+                // never wire mRaycaster).
+                const float perVoiceFt = voice->occlusionRadiusFt;
+                const float effectiveFt = (perVoiceFt > 0.0f)
+                    ? perVoiceFt
+                    : (mAudioOcclusion ? mAudioOcclusion->getRadius() : 10.0f);
+                inputs.occlusionRadius = effectiveFt * kFeetToMeters;
                 inputs.numOcclusionSamples = mAudioOcclusion->getSamples();
                 inputs.numTransmissionRays = 8;
 
@@ -6684,6 +6707,57 @@ void AudioService::loopStep(float deltaTime)
             }
         }
         int activeConvolutionCount = tailConvolutionCount;
+
+        // ── Once-per-frame: listener-nearest probe reverbTimes ──
+        //
+        // Steam Audio does NOT populate `outputs.reflections.reverbTimes` for
+        // baked sources — we query the probe batch directly via
+        // iplProbeBatchGetReverb. Listener-nearest (not source-nearest)
+        // because reverbTimes describe how long the room rings at a point in
+        // space — that's the LISTENER's experience of the room's RT60. As the
+        // listener walks between rooms with different acoustics, the
+        // parametric tail's decay times must track.
+        //
+        // Hoisted out of the per-voice pin block (where it was M× redundant
+        // per frame — listener pos is the same for every voice) AND off the
+        // "pin once for life" gate (where it froze the RT60 at whichever
+        // room the voice happened to spawn in).
+        //
+        // The audio thread reads `reflectionParams.reverbTimes` per callback;
+        // the per-voice loop below copies `listenerReverbTimes` into each
+        // active voice's reflectionParams after the IR copy.
+        float listenerReverbTimes[3]   = {0.0f, 0.0f, 0.0f};
+        bool  listenerReverbTimesValid = false;
+        {
+            auto rlT0 = profOn ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+            if (mProbeManager && mProbeManager->hasReflections()) {
+                IPLProbeBatch pb = mProbeManager->getProbeBatch();
+                const auto &probePos = mProbeManager->getProbePositions();
+                if (pb && !probePos.empty()) {
+                    int nearestIdx = 0;
+                    float nearestDistSq = std::numeric_limits<float>::max();
+                    for (size_t i = 0; i < probePos.size(); ++i) {
+                        Vector3 d = probePos[i] - mListenerPos;
+                        float dsq = glm::dot(d, d);
+                        if (dsq < nearestDistSq) {
+                            nearestDistSq = dsq;
+                            nearestIdx = static_cast<int>(i);
+                        }
+                    }
+                    IPLBakedDataIdentifier reflId{};
+                    reflId.type      = IPL_BAKEDDATATYPE_REFLECTIONS;
+                    reflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
+                    iplProbeBatchGetReverb(pb, &reflId, nearestIdx, listenerReverbTimes);
+                    listenerReverbTimesValid = true;
+                }
+            }
+            if (profOn) {
+                auto rlT1 = std::chrono::steady_clock::now();
+                double rlMs = std::chrono::duration<double, std::milli>(rlT1 - rlT0).count();
+                sPerfProbeReverbLookupMs.record(rlMs);
+            }
+        }
 
         for (auto &[handle, voice] : mVoicePool->voices()) {
             if (!voice->directSource)
@@ -7150,8 +7224,10 @@ void AudioService::loopStep(float deltaTime)
                 bool canAffordConvolution = (activeConvolutionCount < mReverbVoices);
                 // HYBRID-only: the early convolution head needs a real IR
                 // (irSize > 0); the parametric tail is driven by reverbTimes
-                // sourced from iplProbeBatchGetReverb in the pin block below.
-                // Gate on irSize for the same reason CONVOLUTION used to —
+                // sourced from the once-per-frame listener-nearest probe
+                // lookup hoisted above this loop (applied to each active
+                // voice's reflectionParams after the IR copy below). Gate
+                // on irSize for the same reason CONVOLUTION used to —
                 // HYBRID's apply uses the IR identically to CONVOLUTION in
                 // the [0, hybrid_transition_time] window.
                 bool hasBakedData = voice->dspNode.reflectionEffect
@@ -7196,8 +7272,10 @@ void AudioService::loopStep(float deltaTime)
                     // convolution head uses the IR identically to how
                     // (removed) CONVOLUTION mode did, so the same gate
                     // applies. The parametric tail piggy-backs on the same
-                    // pin event — once reverbTimes are written from the
-                    // probe batch below they stay pinned for life.
+                    // pin event — reverbTimes are written once at pin time
+                    // for the [PINNED_IR] log snapshot, then refreshed every
+                    // loopStep below this branch from the hoisted listener-
+                    // nearest lookup so RT60 tracks the listener's room.
                     //
                     // The simCycleAfterAdd gate fixes the all-zero-IR pin
                     // bug. Prior to this gate, `hasConvIR` could be true
@@ -7302,59 +7380,25 @@ void AudioService::loopStep(float deltaTime)
                         // symptom.
                         voice->pinnedParams.delay = 0;
 
-                        // Fetch baked reverbTimes from the nearest probe
-                        // to the listener. Steam Audio does NOT populate
-                        // outputs.reflections.reverbTimes for baked
-                        // sources — we have to query the probe batch
-                        // directly via iplProbeBatchGetReverbTimes.
-                        // Without this, reverbTimes stays at the
-                        // outputs default (observed: all zeros), which
-                        // makes HYBRID's parametric tail run with
-                        // undefined / default-fallback decay,
-                        // producing the audible "second reverb" the
-                        // user heard after IR pinning landed.
-                        //
-                        // We use the listener-nearest probe (not the
-                        // source-nearest) because reverbTimes describe
-                        // "how long does the room ring at this point
-                        // in space" — that's the LISTENER's experience
-                        // of the room's RT60.
-                        int probeLookupIdx = -1;
-                        // PLAN.AUDIO_PROFILING.md §2.3 — wrap the full
-                        // nearest-probe scan + iplProbeBatchGetReverb call.
-                        // profOn-gated to avoid touching steady_clock on the
-                        // hot loopStep path when --audio-log is off.
-                        {
-                            auto plT0 = profOn ? std::chrono::steady_clock::now()
-                                               : std::chrono::steady_clock::time_point{};
-                            if (mProbeManager && mProbeManager->hasReflections()) {
-                                IPLProbeBatch pb = mProbeManager->getProbeBatch();
-                                const auto &probePos = mProbeManager->getProbePositions();
-                                if (pb && !probePos.empty()) {
-                                    int nearestIdx = 0;
-                                    float nearestDistSq = std::numeric_limits<float>::max();
-                                    for (size_t i = 0; i < probePos.size(); ++i) {
-                                        Vector3 d = probePos[i] - mListenerPos;
-                                        float dsq = glm::dot(d, d);
-                                        if (dsq < nearestDistSq) {
-                                            nearestDistSq = dsq;
-                                            nearestIdx = static_cast<int>(i);
-                                        }
-                                    }
-                                    IPLBakedDataIdentifier reflId{};
-                                    reflId.type = IPL_BAKEDDATATYPE_REFLECTIONS;
-                                    reflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
-                                    iplProbeBatchGetReverb(pb, &reflId, nearestIdx,
-                                        voice->pinnedParams.reverbTimes);
-                                    probeLookupIdx = nearestIdx;
-                                }
-                            }
-                            if (profOn) {
-                                auto plT1 = std::chrono::steady_clock::now();
-                                double plMs = std::chrono::duration<double, std::milli>(plT1 - plT0).count();
-                                sPerfProbeReverbLookupMs.record(plMs);
-                            }
+                        // reverbTimes are sourced from the once-per-frame
+                        // listener-nearest probe lookup hoisted above the
+                        // per-voice loop (see "Once-per-frame: listener-
+                        // nearest probe reverbTimes" above). The per-voice
+                        // scan that lived here was M× redundant (listener
+                        // pos is the same for every voice) and pinned RT60
+                        // to whichever room the voice happened to spawn in
+                        // — wrong for listener-tracking parametric tails.
+                        // The per-frame refresh below this branch keeps
+                        // reflectionParams.reverbTimes current; we still
+                        // copy the hoisted value into pinnedParams here so
+                        // a single PINNED_IR diagnostic log captures a
+                        // representative RT60 at pin time.
+                        if (listenerReverbTimesValid) {
+                            voice->pinnedParams.reverbTimes[0] = listenerReverbTimes[0];
+                            voice->pinnedParams.reverbTimes[1] = listenerReverbTimes[1];
+                            voice->pinnedParams.reverbTimes[2] = listenerReverbTimes[2];
                         }
+                        int probeLookupIdx = listenerReverbTimesValid ? 0 : -1;
 
                         voice->reflectionIRPinned = true;
                         // PLAN.AUDIO_PROFILING.md §2.6 — record hit / miss
@@ -7428,6 +7472,23 @@ void AudioService::loopStep(float deltaTime)
                     // audio callback's reflParamsValid gate keeps the slot
                     // out of the worker until the pin or pass-through fires
                     // on a later loopStep.
+
+                    // ── Per-frame reverbTimes refresh ──
+                    // RT60 is the LISTENER's experience of how long the
+                    // current room rings — as the listener walks between
+                    // rooms with different acoustics, the parametric tail's
+                    // decay times must track. Overwrite the value the audio
+                    // thread will see this frame with the once-per-frame
+                    // listener-nearest probe lookup hoisted above the loop.
+                    // Skips if no probe batch is loaded (listenerReverbTimes
+                    // remains 0,0,0 — Steam Audio's parametric-tail
+                    // default-fallback applies, same as the no-probe-batch
+                    // case the pin-time lookup also fell through to).
+                    if (listenerReverbTimesValid) {
+                        voice->dspNode.reflectionParams.reverbTimes[0] = listenerReverbTimes[0];
+                        voice->dspNode.reflectionParams.reverbTimes[1] = listenerReverbTimes[1];
+                        voice->dspNode.reflectionParams.reverbTimes[2] = listenerReverbTimes[2];
+                    }
 
                     voice->dspNode.reflectionsActive.store(true, std::memory_order_release);
                     ++activeConvolutionCount;
@@ -7541,8 +7602,10 @@ void AudioService::loopStep(float deltaTime)
                 for (auto &[h, v] : mVoicePool->voices()) {
                     // Accept any active reflection voice whose IR is
                     // populated. HYBRID always carries irSize > 0 once
-                    // the simulator has produced output for the source —
-                    // reverbTimes are already pinned alongside the IR.
+                    // the simulator has produced output for the source;
+                    // reverbTimes are refreshed every loopStep from the
+                    // listener-nearest probe, so any voice's snapshot is
+                    // representative of the listener's current room.
                     if (!v->dspNode.reflectionsActive.load(std::memory_order_relaxed))
                         continue;
                     const auto &rp = v->dspNode.reflectionParams;
@@ -7906,11 +7969,103 @@ void AudioService::cleanupFinishedVoices()
 }
 
 //------------------------------------------------------
+// Per-voice volumetric-occlusion sphere radius (engine feet).
+//
+// Steam Audio's volumetric occlusion samples N points within a sphere
+// of `inputs.occlusionRadius` around the source and casts a ray from
+// each to the listener; the unoccluded fraction becomes
+// `outputs.direct.occlusion`. The old code fed every voice the same
+// global radius. For a source close to a wall, the sphere extended
+// past the wall into the LISTENER's room: those sample rays then had
+// clear LOS and reported the source as "partially unoccluded" — the
+// cross-wall leak observed for `strlight_lp` in room 12 audible in
+// room 64.
+//
+// Per-source adaptive sizing: cast N rays uniformly distributed from
+// the source position, take the minimum hit distance, cap at the
+// global `audio.occlusion.radius` setting (acts as the upper bound),
+// floor at a small absolute value so the sphere doesn't collapse to a
+// point inside thin volumes. The resulting sphere is always
+// inscribed in the source's local geometry, eliminating the
+// sphere-pokes-through-wall pathology entirely.
+//
+// Cost: ~N raycasts at voice creation only (sources are static for
+// ambients, which dominate the count; moving sources keep their
+// initial radius — acceptable trade-off for now, since the wall
+// distance from an NPC's position changes only when the NPC enters
+// a different room, which is rare per-frame).
+//
+// Returns a negative sentinel when the BSP raycaster is not wired
+// (headless tools that never play audio); caller falls back to the
+// global radius in that case.
+float AudioService::computeVoiceOcclusionRadiusFt(const Vector3 &sourcePos) const
+{
+    constexpr float kFloorFt = 0.5f;
+    constexpr int   kNumRays = 26;
+
+    if (!mRaycaster) return -1.0f;
+
+    const float maxFt = mAudioOcclusion ? mAudioOcclusion->getRadius() : 10.0f;
+    if (maxFt <= kFloorFt) return std::max(kFloorFt, maxFt);
+
+    // Fibonacci-sphere direction set — computed once, reused across
+    // every call. 26 rays gives good angular coverage without
+    // dominating voice-spawn cost.
+    static const std::array<Vector3, kNumRays> kDirs = [] {
+        std::array<Vector3, kNumRays> arr{};
+        constexpr float kGoldenAngle = 3.14159265358979323846f * (3.0f - 2.2360679774997896964f);
+        for (int i = 0; i < kNumRays; ++i) {
+            float y = 1.0f - (static_cast<float>(i) / static_cast<float>(kNumRays - 1)) * 2.0f;
+            float r = std::sqrt(std::max(0.0f, 1.0f - y * y));
+            float theta = kGoldenAngle * static_cast<float>(i);
+            arr[i] = Vector3(std::cos(theta) * r, y, std::sin(theta) * r);
+        }
+        return arr;
+    }();
+
+    float minDist = maxFt;
+    for (const auto &dir : kDirs) {
+        Vector3 endPoint = sourcePos + dir * maxFt;
+        RayHit hit{};
+        if (mRaycaster(sourcePos, endPoint, hit)) {
+            if (hit.distance < minDist) minDist = hit.distance;
+        }
+    }
+    return std::max(kFloorFt, std::min(maxFt, minDist));
+}
+
+//------------------------------------------------------
 void AudioService::createVoiceSource(ActiveVoice &voice)
 {
     IPLSimulator reflectionSimHandle = mReflectionSim ? mReflectionSim->simulator() : nullptr;
     if (!mDirectSimulator || !reflectionSimHandle || !mSceneReady)
         return;
+
+    // Per-voice volumetric-occlusion sphere radius. Computed ONCE at
+    // voice creation by raycasting from the source position; the radius
+    // is sized so the sphere doesn't extend past the nearest wall in
+    // any direction (cap at the global config, floor at 0.5 ft). Feeds
+    // IPLSimulationInputs::occlusionRadius in the per-voice setInputs
+    // block in loopStep — replacing the prior single global value. If
+    // the BSP raycaster isn't wired (headless tools), helper returns a
+    // negative sentinel and the setInputs block falls back to the
+    // global config value.
+    voice.occlusionRadiusFt = computeVoiceOcclusionRadiusFt(voice.worldPos);
+    {
+        static std::atomic<int> sOcclRadiusLogCount{0};
+        const int n = sOcclRadiusLogCount.fetch_add(
+            1, std::memory_order_relaxed);
+        if (n < 64 || (n % 64) == 0) {
+            const float globalFt = mAudioOcclusion
+                ? mAudioOcclusion->getRadius() : 10.0f;
+            std::fprintf(stderr,
+                "[OCCL_RADIUS] h=%u '%s' pos=(%.1f,%.1f,%.1f) "
+                "radius=%.2fft (global cap=%.2f) [#%d]\n",
+                voice.handle, voice.schemaName.c_str(),
+                voice.worldPos.x, voice.worldPos.y, voice.worldPos.z,
+                voice.occlusionRadiusFt, globalFt, n + 1);
+        }
+    }
 
     // ── Direct source ──
     // Created against mDirectSimulator. Direct sim runs synchronously on the
@@ -11515,11 +11670,12 @@ AudioService::getPathingProbeViz() const
 //      test against our acoustic-mesh raycaster.
 //   2. EQ-tinted edges in active-voice neighborhoods — per-frame
 //      aggregation of `(1 - eqCoeffs.mid)` across voices within
-//      `kPathingVisRadiusFt` of either endpoint. Reads each voice's
-//      current `pathTargetParams.eqCoeffs[1]` (no extra Steam Audio
-//      API calls).
-//   3. Per-voice source→listener arrow — `pathTargetParams.eqCoeffs[1]`
-//      colored.
+//      `kPathingVisRadiusFt` of either endpoint. Calls
+//      iplSourceGetOutputs against each voice's pathingSource mirror
+//      on the main thread (the same handle the audio thread reads
+//      per callback) — fresh values, no application-layer cache.
+//   3. Per-voice source→listener arrow — colored by the mid-band
+//      coefficient of that same fresh iplSourceGetOutputs read.
 //
 // NOT a claim that Steam Audio used any particular edge for any
 // particular voice — the public C API does not expose that data.

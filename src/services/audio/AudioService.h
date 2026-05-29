@@ -1003,10 +1003,11 @@ public:
      *  Audio's solver — the public C API does not expose that. It is
      *  a neighborhood-activity heatmap: across all active voices whose
      *  source position is within `visRadius` of either endpoint A or B
-     *  of this edge, we report `max(1 - V.eqCoeffs.mid)`. Reads the
-     *  voice's current `dspNode.pathTargetParams.eqCoeffs[1]` — the
-     *  same value the per-voice path effect consumes each frame, no
-     *  extra Steam Audio API calls.
+     *  of this edge, we report `max(1 - V.eqCoeffs.mid)`. Calls
+     *  iplSourceGetOutputs against the voice's pathingSource mirror
+     *  on the main thread (the same handle the audio thread reads per
+     *  callback inside iplPathEffectApply) — fresh values, no
+     *  application-layer cache.
      *
      *  hasNeighbor=false means no active voice is in either endpoint's
      *  influence radius → renderer draws this edge as dim gray
@@ -1020,9 +1021,9 @@ public:
 
     /** Per-voice source→listener arrow for Layer-3 of the pathing-graph
      *  overlay. One entry per spatial voice; `eqMid` is the mid-band
-     *  coefficient straight off the voice's current
-     *  `dspNode.pathTargetParams.eqCoeffs[1]`. Renderer colors the
-     *  arrow by this value. */
+     *  coefficient read live via iplSourceGetOutputs on the voice's
+     *  pathingSource mirror (same fresh-read pattern as PathingEdgeViz
+     *  above). Renderer colors the arrow by this value. */
     struct VoiceArrowViz {
         Vector3 source{0.0f, 0.0f, 0.0f};
         Vector3 listener{0.0f, 0.0f, 0.0f};
@@ -1579,10 +1580,11 @@ private:
         Matrix4               worldTransform{1.0f};
         /// Cached world-space AABB of the door mesh in ENGINE coordinates
         /// (Z-up feet). Recomputed from localVertices × worldTransform by
-        /// registerDoorGeometry and setDoorTransform. Used by the
-        /// [PATH_PROBE_DOOR] diagnostic to check whether a baked probe sits
-        /// inside or near a door's footprint (the "probe-as-sound-transport
-        /// over a closed door" failure mode).
+        /// registerDoorGeometry and setDoorTransform. Consumed by
+        /// [PROBE_DOOR_AUDIT] (post-registration probe-inside-door scan),
+        /// the door-portal classification pass at bake time, and the
+        /// [PROBE_BAKE] rejection that drops non-DoorPair probe
+        /// candidates falling inside a door footprint.
         Vector3 worldAABBmin{0.0f, 0.0f, 0.0f};
         Vector3 worldAABBmax{0.0f, 0.0f, 0.0f};
     };
@@ -1592,8 +1594,10 @@ private:
     /// localVertices × worldTransform. Called by registerDoorGeometry on
     /// initial registration and by setDoorTransform on every transform push.
     /// Engine coordinates (Z-up feet) — same frame as voice->worldPos and
-    /// ProbeManager::getProbePositions, so the [PATH_PROBE_DOOR] diagnostic
-    /// can compare directly without engine↔IPL conversion.
+    /// ProbeManager::getProbePositions, so [PROBE_DOOR_AUDIT], the door-
+    /// portal classification pass, and the [PROBE_BAKE] candidate-
+    /// rejection step can all compare directly without engine↔IPL
+    /// conversion.
     void recomputeDoorWorldAABB(DoorAudioInstance &inst) const;
 
     /// Set by setDoorTransform; consumed (and cleared) at the top of the
@@ -2001,6 +2005,14 @@ private:
     void destroyReflectionPipeline();
     void createVoiceSource(ActiveVoice &voice);
     void removeVoiceSource(ActiveVoice &voice);
+
+    /// Compute per-voice volumetric-occlusion sphere radius (engine feet).
+    /// Casts N rays from `sourcePos` and returns
+    /// `clamp(min(global_max, nearest_wall_distance), floor, max)`. Returns
+    /// a negative sentinel if no BSP raycaster is wired (headless tools);
+    /// callers fall back to the global radius in that case. See the
+    /// implementation in AudioService.cpp for the full reasoning.
+    float computeVoiceOcclusionRadiusFt(const Vector3 &sourcePos) const;
 
     /// Reflection-source demote fallback (stage 2.2):
     /// Stage 2.2 demote fallback now lives on ReflectionSimulator

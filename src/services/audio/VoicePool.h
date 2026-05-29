@@ -400,6 +400,19 @@ struct ActiveVoice {
     // permanently-silent wet bus for the voice's entire lifetime.
     uint64_t reflectionSimCycleAtAdd = 0;
 
+    // Per-voice volumetric-occlusion sphere radius (engine feet).
+    // Computed in createVoiceSource by raycasting from the source
+    // position in N uniformly-distributed directions; the radius is
+    // capped so the sphere doesn't extend past the nearest wall
+    // surface in any direction, with a small absolute floor and an
+    // upper cap from the global AudioOcclusion::getRadius() value.
+    // Feeds IPLSimulationInputs::occlusionRadius in the per-voice
+    // setInputs block in loopStep (replacing the prior single global
+    // value). Negative sentinel means "not yet computed" — the
+    // setInputs block falls back to the global radius in that case
+    // (covers the headless-no-raycaster path).
+    float occlusionRadiusFt = -1.0f;
+
     // ── Sticky reflection-slot ownership ──
     // Each voice's realtime-vs-baked decision is made ONCE on its first
     // eligible loopStep and retained for the entire lifetime including
