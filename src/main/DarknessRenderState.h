@@ -329,6 +329,16 @@ struct RuntimeState {
     uint32_t cullVisibleCells = 0;
     uint32_t cullTotalCells = 0;
 
+    // Last cell the camera was inside, cached across frames. Used as the
+    // BFS start cell when the current frame's findCameraCell returns -1
+    // (camera transiently outside all cells — head bob near a ceiling,
+    // physics settling during spawn, mantle apex, etc.). Without this
+    // fallback, portalBFS yields an empty visibleCells set and all world
+    // geometry vanishes for the frame.
+    int32_t lastValidCameraCell = -1;
+    // Rate-limit the [FALLBACK] log so a stuck eye doesn't spam stderr.
+    uint64_t lastCameraCellFallbackLogMs = 0;
+
     // Probe baking state (auto-bake on first run)
     bool probeBakeNeeded = false;
     std::string probeBakePath;

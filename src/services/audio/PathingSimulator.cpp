@@ -131,8 +131,8 @@ void PathingSimulator::flushPendingAdds()
     // [PATH_REG] flush-side trace — mirrors the create-side [PATH_REG] logs
     // in AudioService.cpp. Records every source whose iplSourceAdd was
     // deferred (worker was running at create time) and is now actually
-    // entering the simulator's source list. A SPIKE voice whose source
-    // appears here AFTER its first [PATHING_FIRST_SOLVE] would prove the
+    // entering the simulator's source list. A voice whose source appears
+    // here AFTER its first [PATH] non-sentinel log would prove the
     // "voice created but solver never saw it" pending-source race.
     //
     // Rate-limited to first 64 + every 64th to bound bursty load-time spam.

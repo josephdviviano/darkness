@@ -412,44 +412,37 @@ void AmbientSoundManager::updateAmbientVolumes()
 
         // ── dB-based halt audibility + fade-out scheduler ──
         //
-        // TODO(tuning): the halt criterion is dB-based audibility; consider
-        //   whether the formula (mapping.gain × distanceAttenuation ×
-        //   schema_gain_linear) is the right perceptual proxy, or if it
-        //   should include other factors (HRTF panning, dynamic occlusion
-        //   smoothing, etc.).
+        // TODO(tuning): the halt criterion is dB-based audibility;
+        //   consider whether the formula
+        //   (max(portalAttenuation, distanceAttenuation) × schema_gain_linear)
+        //   is the right perceptual proxy, or if it should include
+        //   other factors (HRTF panning, occlusion smoothing,
+        //   transmission, etc.).
         //
-        // voiceCurrentAudibility returns `portalAttenuation ×
-        // directParams.distanceAttenuation` for the voice. Multiplying
-        // by `linearVol` (schema centibel → linear) gives the steady-state
-        // perceptual loudness the listener would hear if no further DSP
-        // (HRTF binaural, master EQ/comp/limiter) modified the signal.
-        // This is a deliberate underestimate — the master chain can add
-        // a few dB — but matches the original engine's "audible loudness"
-        // accounting closely enough for halt scheduling.
+        // voiceCurrentAudibility returns max(portalAttenuation,
+        // directParams.distanceAttenuation) for the voice. Multiplying
+        // by `linearVol` (schema centibel → linear) gives the
+        // steady-state perceptual loudness the listener would hear if
+        // no further DSP (HRTF binaural, master EQ/comp/limiter)
+        // modified the signal. This is a deliberate underestimate —
+        // the master chain can add a few dB — but matches the original
+        // engine's "audible loudness" accounting closely enough for
+        // halt scheduling.
         const float audibility =
             mHost->voiceCurrentAudibility(amb.handle) * linearVol;
         const bool belowThreshold = (audibility < mHaltAudibilityThresholdLinear);
 
-        // Bug 2 fix: halt counter only ticks AFTER the voice has been
-        // solved at least once by the pathing simulator. Voices in the
-        // pre-solve window have wet bus silent by design (Group B init
-        // sets pathTargetParams.eqCoeffs = [0,0,0] until the first real
-        // solve arrives), so incrementing the counter then would halt
-        // them before they have any chance to become audible via routed
-        // pathing. Bug 1 (voiceCurrentAudibility now includes the direct
-        // path) catches most cases — but a voice that's ALSO out of HRTF
-        // audibility range (very distant + blocked LOS) would still tick
-        // the counter with the corrected formula. This grace gate
-        // catches that case explicitly. The original square-wave tremolo
-        // on m06wingedM / m06wingedF in MISS6 required BOTH fixes.
-        const bool pathingReady = mHost->voicePathingEverSolved(amb.handle);
-        if (belowThreshold && pathingReady) {
+        // Halt counter ticks whenever audibility drops below threshold.
+        // No pre-solve grace gate: under the Valve-pattern pathing read
+        // (no synthetic [0,0,0] init holding the wet bus silent), the
+        // first frame's pathing eqCoeffs settles to the source's init
+        // sentinel ≈ 0.1, producing a non-zero portalAttenuation in
+        // voiceCurrentAudibility. Combined with direct.distanceAttenuation
+        // for in-range voices, that keeps audibility above threshold
+        // through the startup window without needing a pathing-readiness
+        // gate.
+        if (belowThreshold) {
             amb.framesBelowAudibilityThreshold++;
-        } else if (belowThreshold) {
-            // Pre-solve window — hold the counter at 0; don't penalize
-            // the voice for a silent wet bus that hasn't had a chance to
-            // come online yet.
-            amb.framesBelowAudibilityThreshold = 0;
         } else {
             // Above threshold — reset the counter. If a halt fade was
             // armed but not yet completed, cancel it and ramp the voice

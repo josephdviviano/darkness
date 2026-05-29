@@ -242,36 +242,30 @@ struct SteamAudioDSPNode {
     // route).
     IPLPathEffect pathEffect = nullptr;
 
-    // Audio-thread targets for iplPathEffectApply. Written by the main
-    // thread each frame from iplSourceGetOutputs(...PATHING).pathing; read
-    // by the audio thread inside iplPathEffectApply. The shCoeffs pointer
-    // is owned by Steam Audio's internal staging buffer — we copy the
-    // params struct verbatim so the pointer is stable across the per-
-    // callback read window.
+    // Audio-thread mirror of ActiveVoice::pathingSource. The audio
+    // thread calls iplSourceGetOutputs on this directly inside its
+    // path-effect block — same pattern as Valve's Unity / Unreal /
+    // FMOD / Wwise reference plugins. Reading on the audio thread
+    // (rather than staging a copy from the main thread) avoids the
+    // cross-thread tear on IPLPathEffectParams that the staged-copy
+    // pattern had.
     //
-    // Initial pathing state: eq=[0,0,0], pathTargetValid=false. This
-    // produces mapping.gain=0 in the readback, so the wet bus is
-    // silent until the first real solve arrives via either the
-    // non-sentinel write path or the cache replay (pathingEverSolved
-    // gate). Was [1,1,1] (synthetic passthrough) — caused a sudden
-    // wet-bus spike on voice spawn before pathing converged.
-    IPLPathEffectParams pathTargetParams{
-        /*eqCoeffs[3]=*/{0.0f, 0.0f, 0.0f},
-        /*shCoeffs=*/nullptr,
-        /*order=*/0,
-        /*binaural=*/IPL_FALSE,
-        /*hrtf=*/nullptr,
-        /*listener=*/{},
-        /*normalizeEQ=*/IPL_FALSE,
-    };
-    // True iff pathTargetParams currently holds a non-sentinel,
-    // non-default snapshot the audio thread is allowed to feed into
-    // iplPathEffectApply this callback. Set on every non-sentinel
-    // main-thread read; cleared on sentinel reads when the voice has
-    // never solved (synthetic-passthrough — path effect bypassed). When
-    // false, the audio thread skips iplPathEffectApply and the dry bus
-    // is the only output (the original engine's "fully unobstructed"
-    // baseline).
+    // Lifetime: set by createVoiceSource right after iplSourceCreate
+    // succeeds; never modified after that. The release of this handle
+    // is deferred to ~ActiveVoice (AFTER ma_node_uninit drains the
+    // audio thread), so the audio thread can safely dereference
+    // without racing the main thread's removeVoiceSource call. The
+    // simulator's source-list membership is still toggled by
+    // removeVoiceSource via iplSourceRemove / queueSourceRemove —
+    // only the iplSourceRelease (which frees the IPL object) is
+    // deferred.
+    IPLSource pathingSource = nullptr;
+
+    // Gates iplPathEffectApply on the audio thread. Starts false; the
+    // main thread sets it true once the pathing source is live (after
+    // the first non-skipped loopStep) and false in the out-of-range
+    // and pending-source-add branches. When false, the audio thread
+    // skips the path effect and only the dry binaural reaches output.
     std::atomic<bool> pathTargetValid{false};
 
     // Stereo scratch for iplPathEffectApply output. Allocated once in
@@ -405,40 +399,6 @@ struct ActiveVoice {
     // content (simulator "no output yet" state); pinning that produced
     // permanently-silent wet bus for the voice's entire lifetime.
     uint64_t reflectionSimCycleAtAdd = 0;
-
-    // True once iplSourceGetOutputs(PATHING) ever returned a non-sentinel
-    // triple. Set on first real read in the per-voice output-staging
-    // block; never cleared. Drives a one-shot [PATHING_FIRST_SOLVE] log
-    // so we can distinguish startup-window sentinels from voices that
-    // never solve (bake/probe coverage problem).
-    bool pathingEverSolved = false;
-
-    // Last good (non-sentinel) IPLPathEffectParams snapshot for this voice
-    // (Phase 4 — moved from the eqCoeffs → scalar mapping level to the raw
-    // pathing-output level). Captured on every successful pathing read;
-    // replayed on subsequent sentinel reads so the path effect's spatial
-    // routing + eq stay frozen at their last computed values instead of
-    // snapping to a synthetic bypass. Eliminates the audible level/pan
-    // pop when pathing flickers between real-eq and sentinel (the
-    // "ambient stutter" pattern). Valid only when `pathingEverSolved ==
-    // true`; before first solve, the audio thread skips iplPathEffectApply
-    // entirely (synthetic passthrough — dry binaural is the only output).
-    IPLPathEffectParams lastGoodPathParams{};
-
-    // Frame counters for sentinel-cause diagnostics. `loopStepsSinceSpawn`
-    // counts every loopStep iteration since the voice entered the pool;
-    // `loopStepsSinceLastSolve` resets to 0 on every non-sentinel
-    // pathing read and increments on every sentinel one. The two
-    // together let us distinguish startup-window sentinels from
-    // persistent-no-solve voices from solved-then-flickered voices.
-    uint32_t loopStepsSinceSpawn      = 0;
-    uint32_t loopStepsSinceLastSolve  = 0;
-
-    // One-shot latch: once the persistent-sentinel branch has marked this
-    // voice's nearest probe as ProbeFate::Isolated, skip the O(N_probes)
-    // re-walk on subsequent sentinel hits. Reset implicitly when the voice
-    // is recycled into the pool (the slot returns to defaults at startVoice).
-    bool isolationProbeMarked = false;
 
     // ── Sticky reflection-slot ownership ──
     // Each voice's realtime-vs-baked decision is made ONCE on its first
