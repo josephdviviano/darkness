@@ -6871,6 +6871,10 @@ void AudioService::loopStep(float deltaTime)
                     //     convolution input by routing attenuation, every
                     //     distant voice would paint full reverb on the
                     //     listener's room.
+                    //   - per-voice door LPF on the reflection-send
+                    //     (reflSendAlpha at :1767, derived from
+                    //     node->currentDoorAlpha which is the smoothed
+                    //     portalBlocking).
                     //   - voiceCurrentAudibility (AudioService.cpp:3724)
                     //     takes max(direct, wet) for AmbientSoundManager
                     //     halt decisions. A voice audible only via the
@@ -6882,18 +6886,75 @@ void AudioService::loopStep(float deltaTime)
                     // in the acoustic scene cause path rejection plus
                     // routing-around. Adding a door multiplier here would
                     // double-count.
-                    PathingDspMapping mapping = eqCoeffsToDspMapping(
-                        pathingOut.pathing.eqCoeffs[0],
-                        pathingOut.pathing.eqCoeffs[1],
-                        pathingOut.pathing.eqCoeffs[2],
-                        /*doorBlocking=*/0.0f,
-                        mPathingGainScale,
-                        mPathingBlockingScale,
-                        mPathingGainWeightLow,
-                        mPathingGainWeightMid,
-                        mPathingGainWeightHigh);
-                    voice->dspNode.portalAttenuation = mapping.gain;
-                    voice->dspNode.portalBlocking    = mapping.blocking;
+                    //
+                    // ── SH-zero short-circuit ──
+                    //
+                    // iplPathEffectApply produces silence when shCoeffs
+                    // is all-zero (SH × anything = 0). That covers two
+                    // cases the eq-only mapping below cannot
+                    // distinguish:
+                    //   • Init sentinel — solver hasn't written for this
+                    //     source yet (startup window, off-probe,
+                    //     pathing-disabled). eq stays at the
+                    //     SimulationData ctor's [0.1, 0.1, 0.1]; sh
+                    //     stays zero.
+                    //   • Solver "no path found" — calcEQForPaths
+                    //     writes eq=[1, 1, 1] when numValidPaths==0
+                    //     (path_simulator.cpp:467-473), and
+                    //     calcAmbisonicsCoeffsForPaths memsets
+                    //     shCoeffs to zero before the empty path loop.
+                    //
+                    // The eq-only mapping would interpret the sentinel
+                    // [0.1, 0.1, 0.1] as portalAttenuation = 0.1 with
+                    // portalBlocking = 0.9 (≈ 2.7 kHz LPF) — producing
+                    // a faint muffled reverb-tail ghost via the
+                    // listener-room baked IR (observed: starlight in
+                    // room 12 audible in room 64 through a wall after
+                    // the 2026-05-29 Valve-pattern migration). The
+                    // no-path-found case would interpret [1, 1, 1] as
+                    // portalAttenuation = 1.0, producing a full-volume
+                    // reverb ghost — even worse.
+                    //
+                    // SH-zero short-circuit silences both by setting
+                    // portalAttenuation = 0 (silences reflection-send
+                    // input) and portalBlocking = 0 (parks the LPF wide
+                    // open so the next non-sentinel solve has a clean
+                    // ramp starting point). The wet bus from
+                    // iplPathEffectApply itself is already silent in
+                    // these cases via Steam Audio's own SH math; this
+                    // just mirrors that into the scalar consumers.
+                    //
+                    // The check costs (mAmbisonicsOrder+1)² float
+                    // comparisons per voice per loopStep (≤ 16 for
+                    // order ≤ 3). Negligible.
+                    bool shAllZero = true;
+                    if (pathingOut.pathing.shCoeffs) {
+                        const int numShCoeffs =
+                            (mAmbisonicsOrder + 1) * (mAmbisonicsOrder + 1);
+                        for (int i = 0; i < numShCoeffs; ++i) {
+                            if (pathingOut.pathing.shCoeffs[i] != 0.0f) {
+                                shAllZero = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (shAllZero) {
+                        voice->dspNode.portalAttenuation = 0.0f;
+                        voice->dspNode.portalBlocking    = 0.0f;
+                    } else {
+                        PathingDspMapping mapping = eqCoeffsToDspMapping(
+                            pathingOut.pathing.eqCoeffs[0],
+                            pathingOut.pathing.eqCoeffs[1],
+                            pathingOut.pathing.eqCoeffs[2],
+                            /*doorBlocking=*/0.0f,
+                            mPathingGainScale,
+                            mPathingBlockingScale,
+                            mPathingGainWeightLow,
+                            mPathingGainWeightMid,
+                            mPathingGainWeightHigh);
+                        voice->dspNode.portalAttenuation = mapping.gain;
+                        voice->dspNode.portalBlocking    = mapping.blocking;
+                    }
                 }
             }
 
