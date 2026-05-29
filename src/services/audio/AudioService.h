@@ -1004,8 +1004,9 @@ public:
      *  a neighborhood-activity heatmap: across all active voices whose
      *  source position is within `visRadius` of either endpoint A or B
      *  of this edge, we report `max(1 - V.eqCoeffs.mid)`. Reads the
-     *  same `lastGoodPathParams` snapshot the per-voice path effect
-     *  already caches each frame — no extra Steam Audio API calls.
+     *  voice's current `dspNode.pathTargetParams.eqCoeffs[1]` — the
+     *  same value the per-voice path effect consumes each frame, no
+     *  extra Steam Audio API calls.
      *
      *  hasNeighbor=false means no active voice is in either endpoint's
      *  influence radius → renderer draws this edge as dim gray
@@ -1018,15 +1019,14 @@ public:
     };
 
     /** Per-voice source→listener arrow for Layer-3 of the pathing-graph
-     *  overlay. One entry per spatial voice with a successful pathing
-     *  solve; `eqMid` is the mid-band coefficient straight off
-     *  `lastGoodPathParams.eqCoeffs[1]`. Renderer colors the arrow by
-     *  this value. */
+     *  overlay. One entry per spatial voice; `eqMid` is the mid-band
+     *  coefficient straight off the voice's current
+     *  `dspNode.pathTargetParams.eqCoeffs[1]`. Renderer colors the
+     *  arrow by this value. */
     struct VoiceArrowViz {
         Vector3 source{0.0f, 0.0f, 0.0f};
         Vector3 listener{0.0f, 0.0f, 0.0f};
         float   eqMid     = 1.0f;
-        bool    everSolved = false;
         bool    isAmbient = false;
     };
 
@@ -1420,24 +1420,15 @@ private:
     // Read back the current effective audibility shaping for an ambient
     // voice: `max(directParams.distanceAttenuation, portalAttenuation)`.
     // The first term is the dry/HRTF direct path's distance falloff; the
-    // second is the routed wet-bus gain (already encodes mapping.gain ×
-    // occlSmooth per Group A). Taking the max means a voice is reported
-    // audible if EITHER path is audible — fixing the pre-Bug-1 formula
-    // (`portalAttenuation × distanceAttenuation`) which only measured the
-    // wet bus and falsely marked pre-solve voices (eq=[0,0,0] init,
-    // portalAttenuation=0) inaudible despite a clearly audible direct
-    // path. The caller multiplies in the per-schema centibel linear
-    // amplitude. Returns 0.0 if the voice doesn't exist. See
+    // second is the routed wet-bus gain derived per-frame from the
+    // pathing solver's eqCoeffs via eqCoeffsToDspMapping. Taking the max
+    // means a voice is reported audible if either path is audible —
+    // important for cross-room voices whose direct path is heavily
+    // distance-attenuated but the routed wet-bus carries them above the
+    // halt threshold. The caller multiplies in the per-schema centibel
+    // linear amplitude. Returns 0.0 if the voice doesn't exist. See
     // AmbientSoundManager::updateAmbientVolumes for the use site.
     float voiceCurrentAudibility(SoundHandle handle) const;
-    /// True iff the pathing solver has produced at least one non-sentinel
-    /// result for this voice (i.e. lastGoodPathParams has been populated
-    /// from a real routed solve). New voices return false until their
-    /// first solve arrives via the pathing simulator's async worker.
-    /// Used by AmbientSoundManager to gate the dB-based halt counter —
-    /// voices in the pre-solve window have wet bus silent by design and
-    /// shouldn't be halted on that account.
-    bool voicePathingEverSolved(SoundHandle handle) const;
     // Current global ducking multiplier (1.0 = no duck). Returns 1.0 if
     // ducking is disabled or the mix node isn't ready.
     float currentDuckGain() const;

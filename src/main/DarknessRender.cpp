@@ -2321,11 +2321,13 @@ static void renderDebugOverlay(
             if (state.showVoiceArrows) {
                 arrows = audioSvc->getVoiceArrowViz();
             }
-            // For HUD: count audio voices with any pathing data. Mirrors
-            // the per-frame iteration getPathingEdgeViz already does.
+            // For HUD: count audio voices that contribute non-trivial
+            // pathing data this frame. eqMid < 1.0 means the solver has
+            // written attenuated values (routed or partial); 1.0 is the
+            // bypass default for voices whose target hasn't been written.
             if (state.showPathingGraph) {
                 for (const auto &a : audioSvc->getVoiceArrowViz()) {
-                    if (a.everSolved) ++activeVoices;
+                    if (a.eqMid < 0.999f) ++activeVoices;
                 }
             }
 
@@ -2379,13 +2381,8 @@ static void renderDebugOverlay(
                 // fade on a brand-new voice would lag perceptibly).
                 if (state.showVoiceArrows) {
                     for (const auto &a : arrows) {
-                        float block = a.everSolved
-                            ? (1.0f - std::max(0.0f, std::min(a.eqMid, 1.0f)))
-                            : 0.0f;
-                        // Unsolved voices get a faded cyan so they read
-                        // as "still resolving" rather than green-clear.
-                        uint32_t c = a.everSolved ? eqColor(block)
-                                                  : 0x88FFFF00u;  // semi-transp cyan
+                        float block = 1.0f - std::max(0.0f, std::min(a.eqMid, 1.0f));
+                        uint32_t c = eqColor(block);
                         verts[n++] = { a.source.x,   a.source.y,   a.source.z,   c };
                         verts[n++] = { a.listener.x, a.listener.y, a.listener.z, c };
                     }
@@ -4390,6 +4387,33 @@ static Darkness::FrameContext prepareFrame(
         frustum.extractFromVP(vp);
 
         int32_t camCell = findCameraCell(mission.wrData, state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+
+        // Camera-outside-all-cells fallback: reuse the last cell the camera
+        // was validly inside. Without this, portalBFS yields an empty
+        // visibleCells set and ALL world geometry vanishes for the frame —
+        // observed at spawn (eye starts ~2.6u above body before gravity
+        // settles) and during head-bob near low ceilings. Objects + sky
+        // still render (objects have an AABB-vs-frustum fallback, sky is
+        // view 0), so the symptom is "world disappears, props remain".
+        // We update lastValidCameraCell only when findCameraCell succeeds,
+        // so the cache stays a known-good anchor for portal traversal.
+        if (camCell < 0 && state.lastValidCameraCell >= 0 &&
+            state.lastValidCameraCell < static_cast<int32_t>(mission.wrData.numCells)) {
+            // Rate-limit to 1 Hz so a stuck eye doesn't flood stderr.
+            uint64_t nowMs = SDL_GetTicks64();
+            if (nowMs - state.lastCameraCellFallbackLogMs > 1000) {
+                std::fprintf(stderr,
+                    "[FALLBACK] findCameraCell: eye (%.2f, %.2f, %.2f) outside all cells; "
+                    "reusing last valid cell %d for portal traversal\n",
+                    state.cam.pos[0], state.cam.pos[1], state.cam.pos[2],
+                    state.lastValidCameraCell);
+                state.lastCameraCellFallbackLogMs = nowMs;
+            }
+            camCell = state.lastValidCameraCell;
+        } else if (camCell >= 0) {
+            state.lastValidCameraCell = camCell;
+        }
+
         // Build door-blocking callback: when a portal connects cells in different
         // rooms with a closed vision-blocking door, skip the portal traversal.
         PortalBlockedCallback doorBlocking = nullptr;
