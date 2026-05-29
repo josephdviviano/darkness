@@ -390,14 +390,16 @@ struct ActiveVoice {
     // Reflection-simulator completed-cycle counter at the moment THIS
     // voice's reflectionSource was actually added to the simulator
     // (immediate path: createVoiceSource right after iplSourceAdd;
-    // deferred path: flushPendingAdds callback). The pin gate in
-    // AudioService::loopStep refuses to snapshot outputs.reflections into
-    // pinnedParams until ReflectionSimulator::completedCycles() exceeds
-    // this value — guaranteeing the simulator has run at least one full
-    // iteration containing this source. Before that point,
-    // outputs.reflections.ir may carry a non-null handle with all-zero
-    // content (simulator "no output yet" state); pinning that produced
-    // permanently-silent wet bus for the voice's entire lifetime.
+    // deferred path: flushPendingAdds callback). The simCycleAfterAdd
+    // gate in AudioService::loopStep refuses to copy outputs.reflections
+    // into dspNode.reflectionParams until
+    // ReflectionSimulator::completedCycles() exceeds this value —
+    // guaranteeing the simulator has run at least one full iteration
+    // containing this source. Before that point, outputs.reflections.ir
+    // may carry a non-null handle with all-zero content (simulator "no
+    // output yet" state); shipping that produced ~1 callback of
+    // permanently-silent wet bus on voice spawn — [REFL_FIRST_APPLY]
+    // irNorm=0 was the smoking gun.
     uint64_t reflectionSimCycleAtAdd = 0;
 
     // Per-voice volumetric-occlusion sphere radius (engine feet).
@@ -412,27 +414,6 @@ struct ActiveVoice {
     // setInputs block falls back to the global radius in that case
     // (covers the headless-no-raycaster path).
     float occlusionRadiusFt = -1.0f;
-
-    // ── Sticky reflection-slot ownership ──
-    // Each voice's realtime-vs-baked decision is made ONCE on its first
-    // eligible loopStep and retained for the entire lifetime including
-    // reverb tail. Released only when sourceEnded + tail expired. If all
-    // slots full when a new eligible voice spawns, the new voice goes
-    // baked-only for life — accepted trade-off vs the per-frame mode-flip
-    // wet-bus wobble that per-frame top-N churn produced.
-    bool reflSlotDecided = false;
-    bool reflSlotOwned   = false;
-
-    // ── Pinned per-voice IR (one-shot, never updated) ──
-    // Each voice captures its IR EXACTLY ONCE — on its first loopStep
-    // with valid IR data — and reuses for its lifetime. The handle is
-    // opaque (IPLReflectionEffectIR owned by Steam Audio); we hold as-is
-    // and never refresh. Trade-off: long-lived sources have stale reverb
-    // spatialisation as listener+source move. For Thief content (static
-    // ambients + short footsteps) the trade favours stability — beating
-    // is audible, sub-probe IR drift is not.
-    bool                       reflectionIRPinned = false;
-    IPLReflectionEffectParams  pinnedParams{};
 
     // World-space position (updated for moving objects).
     Vector3 worldPos{0.0f, 0.0f, 0.0f};
