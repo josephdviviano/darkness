@@ -5609,109 +5609,72 @@ void AudioService::loopStep(float deltaTime)
             // Requires probes to be loaded (`mProbeManager->hasReflections()`); if not,
             // player-emitted voices fall through to the same path as everything
             // else and the timing race may reappear.
-            // ── Sticky reflection-slot allocation ──
+            // ── Per-frame top-N realtime selection (Valve pattern) ──
             //
-            // Replaces the pre-2026-05 per-frame top-N partial_sort + demote
-            // hysteresis pass. The old design re-ranked every voice by distSq
-            // every frame and let voices flip in/out of top-N as small
-            // distance changes shuffled the ranking; each flip changed a
-            // voice's IR mode (baked-probe lookup ↔ real-time ray-traced),
-            // producing the low-frequency wet-bus wobble that the hybrid-
-            // reverb migration was supposed to kill.
+            // Reverted (2026-05-29) from the 2026-05 sticky-slot one-shot
+            // policy that locked a voice's realtime-vs-baked decision at
+            // spawn for its entire lifetime including reverb tail. The
+            // sticky policy was added to mask a per-frame mode-flip
+            // wobble whose root cause is HYBRID's IR-crossfade machinery
+            // — that's what the hybrid-reverb migration was supposed to
+            // mask, and if it doesn't we should fix at root, not paper
+            // over with a stale-slot lock.
             //
-            // The new contract:
-            //   1. Each eligible voice's realtime-vs-baked decision is
-            //      made ONCE, on its first loopStep with valid reflection
-            //      outputs (isReflectionPending=false), and retained for
-            //      the voice's entire lifetime including the reverb tail.
-            //   2. Slots are released only when sourceEnded + tailTimer
-            //      expired. No mid-playback eviction.
-            //   3. If all slots are full when a new eligible voice spawns,
-            //      the new voice goes baked-only for life. Accepted trade-
-            //      off vs the per-frame mode-flip artefact.
+            // Each frame: rank eligible voices by distance² to listener,
+            // take the closest `mReverbVoicesRealtime` for realtime,
+            // others fall through to baked. PlayerEmitted + ambient
+            // voices are excluded from realtime (player ≈ listener →
+            // baked is correct; ambients are long-lived and would
+            // otherwise tend to dominate the realtime budget).
             //
-            // Eligibility for realtime:
-            //   - !playerEmitted        (player ≈ listener, baked is correct)
-            //   - !isAmbient            (long-lived, would hog slots forever)
-            //   - has a reflectionSource AND effectsReady AND reflectionEffect
+            // Sources whose voice has fully ended (sourceEnded +
+            // tailTimer ≤ 0) are demoted out of the simulator entirely
+            // — that's a lifecycle decision, independent of per-frame
+            // realtime ranking, so it lives in its own pass below.
             //
-            // PlayerEmitted + Ambient voices fall through to the baked-probe
-            // path below (inputs.baked = IPL_TRUE).
-            // PLAN.AUDIO_PROFILING.md §2.2 — sticky-slot phase timer.
+            // PLAN.AUDIO_PROFILING.md §2.2 — phase timer (kept the
+            // sPerfLoopStickySlotMs name for histogram continuity).
             auto stickyT0 = profOn ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point{};
             if (mReflectionsEnabled && reflectionSimHandle && mReflectionSim) {
-                // Step 1: count currently-owned slots, including tail voices.
-                int slotsHeld = 0;
+                // Lifecycle demotion: any voice whose source has ended
+                // and whose reverb tail has rung out — release its
+                // reflection source from the simulator so the slot frees
+                // up. demoteVoice is idempotent + null-safe (no-op on
+                // voices without a reflectionSource).
                 for (auto &[h, v] : mVoicePool->voices()) {
-                    if (v->reflSlotOwned) ++slotsHeld;
-                }
-                // Realtime sticky-slot pool size = `mReverbVoicesRealtime`, which
-                // defaults to mReverbVoices but can be set lower (or 0)
-                // to reserve total-convolution budget for baked voices only.
-                int slotsAvailable = std::max(0, mReverbVoicesRealtime - slotsHeld);
-
-                // Step 2: collect undecided candidates eligible for promotion.
-                std::vector<VoiceDist> newCandidates;
-                newCandidates.reserve(mVoicePool->size());
-                for (auto &[h, v] : mVoicePool->voices()) {
-                    if (v->reflSlotDecided) continue;             // already decided
-                    if (v->sourceEnded)     continue;             // ended before decision
-                    if (v->playerEmitted)   continue;             // always baked
-                    if (v->isAmbient)       continue;             // always baked
-                    if (!v->reflectionSource)                continue;
-                    if (!v->dspNode.effectsReady)            continue;
-                    if (!v->dspNode.reflectionEffect)        continue;
-                    // Pending sim-add → wait until the sim has the source
-                    // before committing. Avoids deciding before the voice
-                    // has any IR to render.
-                    if (mReflectionSim->isAddPending(v->reflectionSource)) continue;
-                    Vector3 delta = v->worldPos - mListenerPos;
-                    newCandidates.push_back({h, glm::dot(delta, delta)});
-                }
-
-                // Step 3: when multiple voices are eligible in the same
-                // frame and slots are scarce, the closest get priority.
-                // After this, the decision sticks regardless of later
-                // distance changes — by design.
-                if (!newCandidates.empty()) {
-                    std::sort(newCandidates.begin(), newCandidates.end(),
-                              [](const VoiceDist &a, const VoiceDist &b) {
-                                  return a.distSq < b.distSq;
-                              });
-                    for (auto &cand : newCandidates) {
-                        ActiveVoice *v = mVoicePool->find(cand.handle);
-                        if (!v) continue;
-                        if (slotsAvailable > 0) {
-                            v->reflSlotOwned   = true;
-                            v->reflSlotDecided = true;
-                            --slotsAvailable;
-                        } else {
-                            v->reflSlotOwned   = false;
-                            v->reflSlotDecided = true;
-                        }
-                    }
-                }
-
-                // Step 4: release slots from voices whose source has ended
-                // AND whose reverb tail has expired. tailTimer is ticked
-                // down in a later loop further below in loopStep; we look
-                // at sourceEnded + (tailTimer <= 0) which is exactly the
-                // "audibly silent, safe to demote" condition. demoteVoice
-                // releases the IPLSource (frees a slot in the sim too).
-                for (auto &[h, v] : mVoicePool->voices()) {
-                    if (!v->reflSlotOwned) continue;
-                    if (!v->sourceEnded)   continue;          // still playing
-                    if (v->tailTimer > 0.0f) continue;        // tail still ringing
-                    v->reflSlotOwned = false;
+                    if (!v->sourceEnded) continue;
+                    if (v->tailTimer > 0.0f) continue;
                     if (v->reflectionSource) mReflectionSim->demoteVoice(*v);
                 }
 
-                // Step 5: build the set used downstream for inputs.baked /
-                // enableRefl decisions. Membership == "owns a realtime
-                // slot right now."
+                // Per-frame top-N realtime ranking.
+                std::vector<VoiceDist> candidates;
+                candidates.reserve(mVoicePool->size());
                 for (auto &[h, v] : mVoicePool->voices()) {
-                    if (v->reflSlotOwned) reflCandidateSet.insert(h);
+                    if (v->sourceEnded) continue;
+                    if (v->playerEmitted) continue;       // always baked
+                    if (v->isAmbient)     continue;       // always baked
+                    if (!v->reflectionSource)         continue;
+                    if (!v->dspNode.effectsReady)     continue;
+                    if (!v->dspNode.reflectionEffect) continue;
+                    if (mReflectionSim->isAddPending(v->reflectionSource)) continue;
+                    Vector3 delta = v->worldPos - mListenerPos;
+                    candidates.push_back({h, glm::dot(delta, delta)});
+                }
+                const int realtimeBudget = std::max(0, mReverbVoicesRealtime);
+                const int N = std::min(static_cast<int>(candidates.size()),
+                                       realtimeBudget);
+                if (N > 0 && static_cast<int>(candidates.size()) > N) {
+                    std::partial_sort(
+                        candidates.begin(), candidates.begin() + N,
+                        candidates.end(),
+                        [](const VoiceDist &a, const VoiceDist &b) {
+                            return a.distSq < b.distSq;
+                        });
+                }
+                for (int i = 0; i < N; ++i) {
+                    reflCandidateSet.insert(candidates[i].handle);
                 }
             }
             if (profOn) {
@@ -6718,14 +6681,19 @@ void AudioService::loopStep(float deltaTime)
         // listener walks between rooms with different acoustics, the
         // parametric tail's decay times must track.
         //
-        // Hoisted out of the per-voice pin block (where it was M× redundant
-        // per frame — listener pos is the same for every voice) AND off the
-        // "pin once for life" gate (where it froze the RT60 at whichever
-        // room the voice happened to spawn in).
+        // Hoisted out of the per-voice loop (where it was M× redundant —
+        // listener pos is the same for every voice). The per-voice loop
+        // below applies `listenerReverbTimes` to each active voice's
+        // reflectionParams.reverbTimes after the IR copy.
         //
-        // The audio thread reads `reflectionParams.reverbTimes` per callback;
-        // the per-voice loop below copies `listenerReverbTimes` into each
-        // active voice's reflectionParams after the IR copy.
+        // PLAN.AUDIO_PROFILING.md §2.6 — `[PERF refl_cache]` hit/miss
+        // semantics shifted with the 2026-05-29 unpin: previously
+        // counted one-shot per voice-spawn ("did this voice's pin
+        // find baked reverbTimes?"); now counts once per loopStep
+        // ("is the listener inside a baked-reverb region?"). HitRate
+        // is still the right "bake pipeline producing usable data"
+        // signal but the counter scale is much larger (per-frame vs
+        // per-voice-spawn).
         float listenerReverbTimes[3]   = {0.0f, 0.0f, 0.0f};
         bool  listenerReverbTimesValid = false;
         {
@@ -6751,6 +6719,10 @@ void AudioService::loopStep(float deltaTime)
                     iplProbeBatchGetReverb(pb, &reflId, nearestIdx, listenerReverbTimes);
                     listenerReverbTimesValid = true;
                 }
+            }
+            if (mProbeManager) {
+                if (listenerReverbTimesValid) mProbeManager->recordCacheHit();
+                else                          mProbeManager->recordCacheMiss();
             }
             if (profOn) {
                 auto rlT1 = std::chrono::steady_clock::now();
@@ -7244,80 +7216,51 @@ void AudioService::loopStep(float deltaTime)
                                   && (isReflVoice || hasBakedData);
 
                 if (enableRefl) {
-                    // PLAN.AUDIO_PROFILING.md §2.2 — per-voice pin-block
-                    // timer. profOn-gated; one record per voice per frame
-                    // that enters this branch (steady-state: ≈ active
-                    // convolution-voice count × frame rate × 5 s per
-                    // window). Counter sanity: window n ≤ activeConv ×
-                    // frame_count; if it exceeds that, the for-loop is
-                    // looping more than once per frame.
+                    // PLAN.AUDIO_PROFILING.md §2.2 — per-voice reflection-
+                    // apply timer. profOn-gated; one record per voice per
+                    // frame that enters this branch (steady-state: ≈ active
+                    // convolution-voice count × frame rate × 5 s per window).
+                    // Counter sanity: window n ≤ activeConv × frame_count;
+                    // if it exceeds that, the for-loop is looping more than
+                    // once per frame.
                     auto pinT0 = profOn ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
-                    // ── Per-voice IR pinning (2026-05-20) ──
+
+                    // ── Per-frame reflection params refresh (Valve pattern) ──
                     //
-                    // First time a voice has valid IR data, COPY the full IR
-                    // payload into voice->pinnedIRData and pin the params
-                    // struct (with .ir pointing at our copy) for the voice's
-                    // entire lifetime. Subsequent sim cycles produce updated
-                    // IRs in outputs.reflections, but we ignore them — keeping
-                    // the convolution effect's params.ir pointer stable
-                    // eliminates the Steam-Audio-internal IR crossfade that
-                    // produces the ~5 Hz amplitude pulse ("beating") in the
-                    // wet bus. See VoicePool.h "Pinned per-voice IR" docs.
+                    // Copy outputs.reflections (the simulator's most recent
+                    // write for this source) into the voice's dspNode every
+                    // loopStep, plus override the small set of HYBRID-only
+                    // fields below. Matches the Unity / Unreal / FMOD / Wwise
+                    // reference plugins, none of which pin a per-voice IR
+                    // snapshot. Steam Audio's HYBRID effect handles per-cycle
+                    // IR refresh internally via its parametric crossfade in
+                    // the [rampStart, rampEnd] window — that machinery is
+                    // what we trust to mask IR-swap transitions, instead of
+                    // the prior "pin once for life" workaround.
                     //
-                    // HYBRID-only pin gate: need a valid IR handle from the
-                    // simulator (irSize > 0 && ir != nullptr) AND at least
-                    // one full reflection-sim cycle must have completed
-                    // since this voice's source was added. HYBRID's
-                    // convolution head uses the IR identically to how
-                    // (removed) CONVOLUTION mode did, so the same gate
-                    // applies. The parametric tail piggy-backs on the same
-                    // pin event — reverbTimes are written once at pin time
-                    // for the [PINNED_IR] log snapshot, then refreshed every
-                    // loopStep below this branch from the hoisted listener-
-                    // nearest lookup so RT60 tracks the listener's room.
-                    //
-                    // The simCycleAfterAdd gate fixes the all-zero-IR pin
-                    // bug. Prior to this gate, `hasConvIR` could be true
-                    // the FIRST frame after a source left mPendingSourceAdds
-                    // — but iplSimulatorRunReflections hadn't yet run a
-                    // cycle containing this new source, so `outputs.reflections.ir`
-                    // pointed at the simulator's "no output yet" sentinel
-                    // (non-null handle, all zeros inside). Pinning that
-                    // permanent-silence IR stuck the voice's wet bus at zero
-                    // for its entire lifetime. The smoking gun for sentinel-
-                    // IR pinning was `[REFL_FIRST_APPLY] irNorm=0`; now
-                    // both pin and pass-through gate on simCycleAfterAdd.
-                    //
-                    // The cycle counter is bumped at the end of every
-                    // reflection-sim iteration; each voice captured the
-                    // counter value at the moment its source entered the
-                    // simulator (createVoiceSource immediate path) or at
-                    // the FLUSH (flushPendingAdds callback for the
-                    // deferred path). Strict greater-than ensures at least
-                    // one cycle has fully run since the source was added.
+                    // simCycleAfterAdd gate: prior to this gate, the FIRST
+                    // frame after a source left mPendingSourceAdds could
+                    // have hasConvIR=true with `outputs.reflections.ir`
+                    // pointing at the simulator's "no output yet" sentinel
+                    // (non-null handle, all zeros inside) — shipping that
+                    // produced ~1 callback of permanently-silent wet output
+                    // until the simulator's first real write landed.
+                    // [REFL_FIRST_APPLY] irNorm=0 was the smoking gun. The
+                    // gate ensures at least one full reflection-sim cycle
+                    // has completed since this voice's source was added
+                    // (counter captured at iplSourceAdd / flushPendingAdds).
                     const bool hasConvIR = outputs.reflections.irSize > 0
                         && outputs.reflections.ir != nullptr;
                     const uint64_t simCyclesCompleted = mReflectionSim
                         ? mReflectionSim->completedCycles() : 0;
                     const bool simCycleAfterAdd =
                         simCyclesCompleted > voice->reflectionSimCycleAtAdd;
-                    if (!voice->reflectionIRPinned
-                        && hasConvIR && simCycleAfterAdd) {
-                        // outputs.reflections.ir is an opaque
-                        // IPLReflectionEffectIR handle owned by Steam
-                        // Audio; we hold the handle as-is and never
-                        // refresh it. We override several fields from
-                        // our known-good config values rather than
-                        // trusting whatever Steam Audio happened to
-                        // leave in outputs.reflections — those output
-                        // fields may not be populated on the first
-                        // cycle, and pinning a wrong value sticks for
-                        // the voice's lifetime.
-                        //
-                        voice->pinnedParams = outputs.reflections;
-                        voice->pinnedParams.type = IPL_REFLECTIONEFFECTTYPE_HYBRID;
-                        voice->pinnedParams.numChannels = mAmbisonicsChannels;
+
+                    if (hasConvIR && simCycleAfterAdd) {
+                        voice->dspNode.reflectionParams = outputs.reflections;
+                        voice->dspNode.reflectionParams.type        = IPL_REFLECTIONEFFECTTYPE_HYBRID;
+                        voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
                         // REQUIRED INVARIANT (HYBRID-only): delay = 0.
                         //
                         // Steam Audio's hybrid design (per phonon.h
@@ -7373,105 +7316,19 @@ void AudioService::loopStep(float deltaTime)
                         // channel-1..N spatial jump described above.
                         //
                         // Requires reverbTimes to be populated below
-                        // (via iplProbeBatchGetReverb) — with
-                        // RT60=0 Steam Audio's parametric default-
-                        // fallback rings at full amplitude and
-                        // produces a very different "doubled reverb"
-                        // symptom.
-                        voice->pinnedParams.delay = 0;
-
-                        // reverbTimes are sourced from the once-per-frame
-                        // listener-nearest probe lookup hoisted above the
-                        // per-voice loop (see "Once-per-frame: listener-
-                        // nearest probe reverbTimes" above). The per-voice
-                        // scan that lived here was M× redundant (listener
-                        // pos is the same for every voice) and pinned RT60
-                        // to whichever room the voice happened to spawn in
-                        // — wrong for listener-tracking parametric tails.
-                        // The per-frame refresh below this branch keeps
-                        // reflectionParams.reverbTimes current; we still
-                        // copy the hoisted value into pinnedParams here so
-                        // a single PINNED_IR diagnostic log captures a
-                        // representative RT60 at pin time.
-                        if (listenerReverbTimesValid) {
-                            voice->pinnedParams.reverbTimes[0] = listenerReverbTimes[0];
-                            voice->pinnedParams.reverbTimes[1] = listenerReverbTimes[1];
-                            voice->pinnedParams.reverbTimes[2] = listenerReverbTimes[2];
-                        }
-                        int probeLookupIdx = listenerReverbTimesValid ? 0 : -1;
-
-                        voice->reflectionIRPinned = true;
-                        // PLAN.AUDIO_PROFILING.md §2.6 — record hit / miss
-                        // for the [PERF refl_cache] hitRate line. A pin with
-                        // a valid probeLookupIdx got real baked reverbTimes
-                        // and is the canonical "hit"; pin without a probe
-                        // (no probe batch, empty positions, or hasReflections=false)
-                        // ships a zero-init reverbTimes and is a miss —
-                        // perceptually a silent reverb tail until pinned
-                        // baked data lands. Counter sanity: misses per
-                        // window ≤ voice spawns per window (one per pin),
-                        // and misses + hits ≤ total spawns. If misses ≫
-                        // hits the bake pipeline isn't producing usable
-                        // probe data for this scene.
-                        if (mProbeManager) {
-                            if (probeLookupIdx >= 0) mProbeManager->recordCacheHit();
-                            else                     mProbeManager->recordCacheMiss();
-                        }
-                        // eq=[...] is HYBRID-only per phonon.h:2502-2504 and
-                        // IS populated by the simulator for our pipeline;
-                        // log it as a freshness check (non-zero eq = sim
-                        // wrote outputs for this source).
-                        AUDIO_LOG("[PINNED_IR] h=%u '%s' irSize=%d numChannels=%d "
-                                  "delay=%d reverbTimes=[%.3f,%.3f,%.3f] "
-                                  "eq=[%.3f,%.3f,%.3f] "
-                                  "probeLookupIdx=%d "
-                                  "hasReflections=%d probeCount=%zu "
-                                  "simCyclesCompleted=%llu cycleAtAdd=%llu\n",
-                                  handle, voice->schemaName.c_str(),
-                                  outputs.reflections.irSize,
-                                  outputs.reflections.numChannels,
-                                  voice->pinnedParams.delay,
-                                  voice->pinnedParams.reverbTimes[0],
-                                  voice->pinnedParams.reverbTimes[1],
-                                  voice->pinnedParams.reverbTimes[2],
-                                  voice->pinnedParams.eq[0],
-                                  voice->pinnedParams.eq[1],
-                                  voice->pinnedParams.eq[2],
-                                  probeLookupIdx,
-                                  mProbeManager ? mProbeManager->hasReflections() : -1,
-                                  mProbeManager ? mProbeManager->getProbePositions().size() : 0,
-                                  static_cast<unsigned long long>(simCyclesCompleted),
-                                  static_cast<unsigned long long>(voice->reflectionSimCycleAtAdd));
-                    }
-
-                    if (voice->reflectionIRPinned) {
-                        // Use the pinned params unconditionally — no further
-                        // ir-pointer or sample updates ever happen for this
-                        // voice. This is the architectural invariant that
-                        // suppresses the per-sim-cycle beating artefact.
-                        voice->dspNode.reflectionParams = voice->pinnedParams;
-                    } else if (simCycleAfterAdd) {
-                        // Pre-pin pass-through: a sim cycle HAS completed for
-                        // this source (so outputs.reflections holds real
-                        // sim-written data). Copy through unchanged until the
-                        // pin block above takes effect on a later loopStep.
-                        //
-                        // The simCycleAfterAdd gate mirrors the pin gate
-                        // above. Without it, this branch shipped the
-                        // simulator's "no output yet" sentinel IR to the
-                        // audio thread for ~1 callback per new voice — the
-                        // residual 13% irNorm=0 in [REFL_FIRST_APPLY] traced
-                        // here, not to the pin block.
-                        voice->dspNode.reflectionParams = outputs.reflections;
-                        voice->dspNode.reflectionParams.type = IPL_REFLECTIONEFFECTTYPE_HYBRID;
-                        voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
+                        // (per-frame refresh from the hoisted listener-
+                        // nearest lookup) — with RT60=0 Steam Audio's
+                        // parametric default-fallback rings at full
+                        // amplitude and produces a very different
+                        // "doubled reverb" symptom.
+                        voice->dspNode.reflectionParams.delay = 0;
                     }
                     // else: source is added but no sim cycle has completed
                     // for it yet. Leave reflectionParams at its previous
                     // value (default-zero on first frame, irSize=0); the
                     // audio callback's reflParamsValid gate keeps the slot
-                    // out of the worker until the pin or pass-through fires
-                    // on a later loopStep.
+                    // out of the worker until the next loopStep with a
+                    // completed cycle.
 
                     // ── Per-frame reverbTimes refresh ──
                     // RT60 is the LISTENER's experience of how long the
@@ -7678,8 +7535,9 @@ void AudioService::loopStep(float deltaTime)
                     // reverb_voices config cap. With this clear the
                     // staging guard rejects the voice on the very next
                     // callback after the tail finishes — same callback
-                    // the slot-release loop at line ~4419 frees
-                    // reflSlotOwned, in lockstep.
+                    // the demote pass in the per-frame top-N block
+                    // releases the reflection source from the simulator,
+                    // in lockstep.
                     voice->dspNode.reflectionsActive.store(
                         false, std::memory_order_release);
                     AUDIO_LOG( "[VOICE] TAIL_DONE h=%d '%s'\n",
