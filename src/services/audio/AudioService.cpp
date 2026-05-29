@@ -1561,14 +1561,25 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             && !node->pathOutR.empty()) {
             // Valve reference-plugin pattern: read pathingOutputs fresh
             // from the source ON THE AUDIO THREAD. No main-thread-staged
-            // IPLPathEffectParams copy → no cross-thread tear on the
-            // ~88-byte struct (eqCoeffs[3] + shCoeffs pointer + the
-            // audio-thread-owned listener/hrtf/order/binaural/normalizeEQ
-            // fields). iplSourceGetOutputs is documented thread-safe and
-            // just reads SimulationData fields the worker writes
-            // atomically per band; per-band reads of aligned floats and
-            // an aligned pointer are atomic on x86 and arm64, eliminating
-            // the (eqCoeffs[i], shCoeffs) cross-field tear window.
+            // IPLPathEffectParams copy → the cross-thread tear window on
+            // the application-layer staged struct (eqCoeffs[3] + shCoeffs
+            // pointer + the audio-thread-owned listener/hrtf/order/
+            // binaural/normalizeEQ fields) is closed entirely.
+            //
+            // The remaining tear is at the worker→audio-thread layer:
+            // the pathing worker writes pathingOutputs.eq[] and
+            // pathingOutputs.sh via memcpy, with no synchronization. A
+            // worst-case torn read pairs eqCoeffs bands from adjacent
+            // solver iterations (each band itself is an aligned 4-byte
+            // float, atomic at the hardware level on x86 and arm64).
+            // shCoeffs is an aligned 8-byte pointer into the source's
+            // own SH buffer — allocated once at source creation, never
+            // reallocated — so the pointer value is stable for the
+            // source's lifetime and only its referent changes. Worst-
+            // case audible artefact: one callback (~5 ms) of slightly
+            // mismatched band attenuation, well below human detection
+            // threshold for transient EQ-shape changes. This matches
+            // what Valve's own reference plugins live with.
             //
             // dspNode.pathingSource lifetime is managed by removeVoiceSource
             // (defers iplSourceRelease) + ~ActiveVoice (releases AFTER
@@ -3204,8 +3215,24 @@ AudioService::AudioService(ServiceManager *manager, const std::string &name)
 //------------------------------------------------------
 AudioService::~AudioService()
 {
-    // Voices must be destroyed before the engine (they reference it internally)
-    if (mVoicePool) mVoicePool->clear();
+    // Voices must be destroyed before the engine (they reference it
+    // internally). Run removeVoiceSource for each voice via the hook so
+    // sources are unregistered from the pathing/reflection simulators'
+    // pendingAdds/pendingRemovals lists BEFORE ~ActiveVoice releases
+    // them via the dspNode.pathingSource mirror — destroyAcousticScene
+    // below calls releasePendingAdds + flushPendingRemovals and would
+    // otherwise double-release a handle the destructor just freed.
+    //
+    // shutdown() (called by ServiceManager in the normal flow) routes
+    // through haltAll() which already does this; this is the safety
+    // net for the abnormal-destruction paths (exceptions, test
+    // teardown) where shutdown() may not have run.
+    if (mVoicePool) {
+        mVoicePool->clear([this](ActiveVoice &v) {
+            if (v.initialized) ma_sound_stop(&v.sound);
+            removeVoiceSource(v);
+        });
+    }
     // Release acoustic scene before the Steam Audio context
     destroyAcousticScene();
     // Ensure backends are shut down even if shutdown() wasn't called
