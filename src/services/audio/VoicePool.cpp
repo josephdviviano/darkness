@@ -129,6 +129,20 @@ ActiveVoice::~ActiveVoice()
         dspNode.pathEffect = nullptr;
     }
 
+    // Release the audio-thread mirror of the pathing IPLSource. The
+    // audio thread reads dspNode.pathingSource inside its path-effect
+    // block via iplSourceGetOutputs; releasing it here AFTER the
+    // ma_node_uninit drain above is the linchpin of the deferred-
+    // release safety pattern set up by AudioService::removeVoiceSource
+    // — that function nulls voice.pathingSource without iplSourceRelease
+    // and leaves dspNode.pathingSource as the sole live reference. The
+    // queue-source-remove branch nulls dspNode.pathingSource so this is
+    // a no-op for the deferred-flush case (flushPendingRemovals does
+    // the release on its own copy after the audio thread is drained).
+    if (dspNode.pathingSource) {
+        iplSourceRelease(&dspNode.pathingSource);
+    }
+
     // Destroy sound and decoder
     if (initialized) {
         ma_sound_uninit(&sound);
