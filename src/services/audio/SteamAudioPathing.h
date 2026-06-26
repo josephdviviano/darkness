@@ -39,11 +39,36 @@ namespace Darkness {
 /// Pathing-solver ray-visibility threshold. Used by BOTH bake
 /// (IPLPathBakeParams::threshold) and runtime
 /// (IPLSimulationInputs::visThreshold) — they must agree or marginal
-/// paths the bake accepted get rejected at runtime. Matches Steam
-/// Audio's Unity default. Lower values (e.g. 0.01) admit single stray
-/// rays through mesh seams, producing the "audio passes through walls"
-/// pathology.
-constexpr float kPathingVisThreshold = 0.1f;
+/// paths the bake accepted get rejected at runtime. This is the
+/// fraction of the numVisSamples² inter-probe rays that must clear the
+/// acoustic scene for a probe-pair to count as mutually visible (and
+/// thus form a graph edge the path solver can route through).
+///
+/// Was 0.1 (Steam Audio's Unity default). RAISED to 0.25 on 2026-06-26
+/// to HARDEN against cross-wall edges. With the 5 ft visibility sphere
+/// (kPathingVisRadiusFt) a probe near a thin wall scatters sample
+/// points onto BOTH sides of the wall; a handful of those sample-pairs
+/// have unobstructed LOS *around* the wall geometry and, at threshold
+/// 0.1, the resulting 10%-visible pair was enough to forge a spurious
+/// edge between two acoustically-separate rooms. That edge let the
+/// path solver "find" a route through the wall → the reflection send
+/// (gated by pathing) painted that source's reverb into the listener's
+/// room. Requiring 25% of the 256 rays to clear rejects these thin
+/// "around-the-seam" slivers while keeping genuine doorways (where the
+/// large majority of sample-pairs see each other).
+///
+/// Lower values (e.g. 0.01) admit single stray rays through mesh seams
+/// — the classic "audio passes through walls" pathology. Higher values
+/// risk dropping legitimate grazing-angle doorway edges (and can
+/// reintroduce the wet-bus tremolo the radius/sample bump fought), so
+/// this is a tuning knob: validate by playtest, back off toward 0.15 if
+/// real doorways go silent.
+///
+/// CHANGING THIS REQUIRES A RE-BAKE: delete the cached .probes file
+/// under ~/darkness/thief2/baked_probes/ so the pathing graph is
+/// rebuilt at the new threshold. Bake and runtime read the same
+/// constant, so they stay in agreement automatically.
+constexpr float kPathingVisThreshold = 0.25f;
 
 /// Sampling-sphere radius (engine feet) used by Steam Audio's pathing
 /// visibility test (`path_visibility.cpp:50-91` — to determine

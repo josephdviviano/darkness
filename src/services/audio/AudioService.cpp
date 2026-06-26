@@ -71,6 +71,7 @@
 #include "logger.h"
 
 #include <unordered_set>
+#include <cinttypes>
 #include <cmath>
 #include <thread>
 
@@ -196,15 +197,58 @@ static const std::unordered_map<std::string, IPLMaterial> kKeywordToIPLMaterial 
     {"mud",      {{ 0.60f, 0.70f, 0.80f }, 0.50f, { 0.031f, 0.012f, 0.008f }}},  // → wet irregular surface
 };
 
-// Default material for unmatched textures — moderate scattering as recommended
-// by Treble Technologies (minimum 0.10 to prevent ray trapping).
-static const IPLMaterial kGenericMaterial =
-    {{ 0.10f, 0.20f, 0.30f }, 0.20f, { 0.100f, 0.050f, 0.030f }};
+// Fallback material for unmatched textures.
+//
+// IPLMaterial layout (per phonon.h:779-790):
+//   { absorption[3], scattering, transmission[3] }
+//
+// Values are deliberately OBVIOUS rather than plausible: fully opaque,
+// fully reflective, zero scattering. The previous "moderate scattering"
+// fallback silently passed close to acoustically-correct, so unmatched
+// textures could leak as gentle attenuation + slight reverb tail — easy
+// to miss in playtesting. With these values, any room whose floor/walls
+// are mostly unmatched textures will sound noticeably too reverberant
+// (no absorption to damp the bounce), making the gap audible. Per-miss
+// stderr [FALLBACK] line below names the texture so the keyword table
+// can be extended.
+//
+// See feedback_no_silent_fallbacks.md.
+static const IPLMaterial kUnmatchedTextureMaterial =
+    {{ 0.0f, 0.0f, 0.0f }, 0.0f, { 0.0f, 0.0f, 0.0f }};
+
+// ── streetlamp/wall-leak occlusion-diagnostic filter ──
+// Several rate-limited diagnostics ([OCCL_SPAWN_DIAG], [OCCL_TICK],
+// [PATH_DIAG_DUMP], [REFL_IR_TICK]) are scoped to a single schema so the
+// developer can correlate spawn-time geometry, per-frame direct-effect
+// outputs, pathing readback, and the reflection IR identity for the same
+// voice. Used while hunting the "streetlamp ambient audible through solid
+// wall via reflection wet bus" artefact (irNorm 0.09-0.38 with SA direct
+// occlusion correctly at 0). Set to empty string to disable.
+static constexpr const char* kOcclusionDebugSchemaFilter = "strlight_lp";
+static bool shouldDiagOcclusion(const std::string& schema) {
+    return schema == kOcclusionDebugSchemaFilter;
+}
+
+// ── door-transform / loopStep correlator ──
+// setDoorTransform queues IPL instanced-mesh updates and flips
+// mSceneNeedsCommit; the [OCCL_TICK] diagnostic wants to know how many
+// door transforms landed during the prior frame so audible-occlusion
+// changes that coincide with a moving door are obvious in the log. The
+// counter is process-wide (atomic) and the snapshot/delta is taken at the
+// top of each loopStep so the per-voice [OCCL_TICK] sees the same value
+// for all voices in a given frame.
+static std::atomic<int> sDoorXformCallCount{0};
+static std::atomic<int> sDoorXformDeltaForTick{0};
 
 /// Look up an IPLMaterial by texture name via keyword substring matching.
 /// Uses the shared keyword table from AcousticMaterials.h for matching,
 /// then maps the keyword to IPLMaterial properties.
-/// Logs unmatched textures once per name for development diagnostics.
+///
+/// Unmatched textures fall through to kUnmatchedTextureMaterial — fully
+/// opaque, fully reflective — and emit a [FALLBACK] stderr line on EVERY
+/// miss (not rate-limited). The artefact is intentionally audible: an
+/// affected room will sound far too reverberant, making it impossible to
+/// miss during playtesting. See feedback_no_silent_fallbacks.md.
 static IPLMaterial lookupAcousticMaterial(const std::string &texName)
 {
     // Check for exact texture name match first (e.g., "_portal" sentinel).
@@ -216,17 +260,25 @@ static IPLMaterial lookupAcousticMaterial(const std::string &texName)
     std::string keyword = lookupAcousticMaterialKeyword(texName);
 
     if (keyword == "generic") {
-        // Log each unmatched texture name once to help identify keyword gaps
-        static std::unordered_set<std::string> sLoggedUnmatched;
-        if (sLoggedUnmatched.insert(texName).second) {
-            LOG_INFO("AudioService: no acoustic keyword match for texture '%s' "
-                     "— using generic material", texName.c_str());
-        }
-        return kGenericMaterial;
+        std::fprintf(stderr,
+            "[FALLBACK] AudioService::lookupAcousticMaterial: texture '%s' "
+            "had no keyword match, using opaque-reflective fallback. "
+            "Add it to the material keyword table.\n",
+            texName.c_str());
+        return kUnmatchedTextureMaterial;
     }
 
     auto it = kKeywordToIPLMaterial.find(keyword);
-    return (it != kKeywordToIPLMaterial.end()) ? it->second : kGenericMaterial;
+    if (it != kKeywordToIPLMaterial.end())
+        return it->second;
+
+    std::fprintf(stderr,
+        "[FALLBACK] AudioService::lookupAcousticMaterial: texture '%s' "
+        "matched keyword '%s' but the keyword had no IPLMaterial entry, "
+        "using opaque-reflective fallback. Add it to the material "
+        "keyword table.\n",
+        texName.c_str(), keyword.c_str());
+    return kUnmatchedTextureMaterial;
 }
 
 /*----------------------------------------------------*/
@@ -3862,9 +3914,11 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             }
         }
 
-        // Ensure at least one material (generic fallback)
+        // Ensure at least one material (opaque-reflective fallback).
+        // IPLStaticMeshSettings requires materials.size() >= 1 even when
+        // no per-triangle indices reference it.
         if (materials.empty()) {
-            materials.push_back(kGenericMaterial);
+            materials.push_back(kUnmatchedTextureMaterial);
         }
 
         // Build per-triangle material index array
@@ -4982,6 +5036,12 @@ void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTrans
     // Coalesce into one iplSceneCommit per loopStep (see loopStep header).
     mSceneNeedsCommit.store(true, std::memory_order_release);
 
+    // Correlator counter for [DOOR_XFORM_TICK] / [OCCL_TICK]. Bumped on
+    // every push so the per-frame snapshot at the top of loopStep can tell
+    // a diagnostic line how many door updates landed during the prior
+    // frame — useful when audible occlusion changes while a door swings.
+    sDoorXformCallCount.fetch_add(1, std::memory_order_relaxed);
+
     // Diagnostic: log the first few transform pushes per door so we can
     // verify the animation callback is firing. Rate-limited to keep the
     // log readable while doors animate over many frames.
@@ -5332,6 +5392,35 @@ void AudioService::loopStep(float deltaTime)
         mPathingDueThisStep = (mPathingAccumSec >= mPathingUpdateInterval);
         if (mPathingDueThisStep) mPathingAccumSec = 0.0f;
     }
+
+    // ── [DOOR_XFORM_TICK] snapshot + publish for [OCCL_TICK] ──
+    // Snapshot the global setDoorTransform counter and compute the delta
+    // vs. the last loopStep, then publish that delta to a static the
+    // per-voice [OCCL_TICK] block reads. The atomic store of the delta is
+    // relaxed-relaxed: only one writer (this loopStep entry) per frame and
+    // the value is for log correlation, not for behavioural sync. The
+    // snapshot counter is per-loopStep and shared across all log sites.
+    {
+        static int sLastDoorXformCount = 0;
+        const int cur = sDoorXformCallCount.load(std::memory_order_relaxed);
+        const int delta = cur - sLastDoorXformCount;
+        sLastDoorXformCount = cur;
+        sDoorXformDeltaForTick.store(delta, std::memory_order_relaxed);
+        if (delta > 0) {
+            static std::atomic<uint64_t> sFrame{0};
+            const uint64_t f = sFrame.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                "[DOOR_XFORM_TICK] frame=%llu count=%d\n",
+                static_cast<unsigned long long>(f), delta);
+        }
+    }
+
+    // Monotonic frame counter shared by the per-voice [OCCL_TICK] /
+    // [PATH_DIAG_DUMP] / [REFL_IR_TICK] diagnostics. Atomic so the static
+    // is safe even though loopStep only ever runs on the main thread.
+    static std::atomic<uint64_t> sLoopStepFrameCounter{0};
+    const uint64_t kFrameForDiag = sLoopStepFrameCounter.fetch_add(
+        1, std::memory_order_relaxed);
 
     // Read profiling flag once per loopStep. When off, all the perf-counter
     // writes scattered through this function and its callees become no-ops.
@@ -6974,32 +7063,146 @@ void AudioService::loopStep(float deltaTime)
                     // comparisons per voice per loopStep (≤ 16 for
                     // order ≤ 3). Negligible.
                     bool shAllZero = true;
+                    float shSumAbs = 0.0f;
+                    float shW      = 0.0f;  // 0th-order (omnidirectional) coeff
                     if (pathingOut.pathing.shCoeffs) {
                         const int numShCoeffs =
                             (mAmbisonicsOrder + 1) * (mAmbisonicsOrder + 1);
                         for (int i = 0; i < numShCoeffs; ++i) {
-                            if (pathingOut.pathing.shCoeffs[i] != 0.0f) {
+                            const float c = pathingOut.pathing.shCoeffs[i];
+                            shSumAbs += std::fabs(c);
+                            if (c != 0.0f) {
                                 shAllZero = false;
-                                break;
                             }
                         }
+                        // The W (index-0) channel carries the path's TOTAL
+                        // arriving energy: calcAmbisonicsCoeffsForPaths
+                        // (path_simulator.cpp:405-409) projects each path with
+                        // gain = pathWeight · distanceAttenuation(pathDistance)
+                        // onto the SH basis, and Y_0^0 is the only
+                        // direction-independent basis function. So
+                        //   shW = Y00 · Σ(pathWeight · distAtten(pathDistance))
+                        // i.e. shW/Y00 == the distance attenuation evaluated
+                        // along the REAL routed path length — the quantity
+                        // eqCoeffs structurally lack (see distance gate below).
+                        shW = pathingOut.pathing.shCoeffs[0];
                     }
+                    // Compute the eq→DSP mapping unconditionally so the
+                    // [PATH_DIAG_DUMP] diagnostic can read it in both the
+                    // SH-zero and SH-non-zero cases. Behaviour is
+                    // preserved: the shAllZero branch still hard-writes
+                    // portalAttenuation = 0 below, so the mapping value
+                    // is observed only by the diagnostic in that case.
+                    PathingDspMapping mapping = eqCoeffsToDspMapping(
+                        pathingOut.pathing.eqCoeffs[0],
+                        pathingOut.pathing.eqCoeffs[1],
+                        pathingOut.pathing.eqCoeffs[2],
+                        /*doorBlocking=*/0.0f,
+                        mPathingGainScale,
+                        mPathingBlockingScale,
+                        mPathingGainWeightLow,
+                        mPathingGainWeightMid,
+                        mPathingGainWeightHigh);
+                    // ── Path-distance gate (fixes eqCoeffs-lacks-distance) ──
+                    //
+                    // The reflection send is
+                    //   reflAtten = directParams.distanceAttenuation × currentPortalAtten
+                    // (AudioService.cpp reflection-send block). `currentPortalAtten`
+                    // smooths toward `portalAttenuation`, which historically came
+                    // from eqCoeffs alone (eqCoeffsToDspMapping). But eqCoeffs
+                    // carry ONLY the path's diffraction/deviation spectral
+                    // coloration — calcEQForPaths (path_simulator.cpp:414) takes
+                    // no distance argument at all. Meanwhile
+                    // directParams.distanceAttenuation is the STRAIGHT-LINE
+                    // distance (through the wall — short, so it under-attenuates).
+                    // Net: a source sealed in another room but reachable via a
+                    // long routed path got near-full reverb send, even though the
+                    // dry pathing bus (driven by shCoeffs magnitude, which DOES
+                    // include path distance) correctly rendered it quiet. That is
+                    // the "reflections carry sound through walls, dry bus silent"
+                    // pathology.
+                    //
+                    // Fix: scale portalAttenuation by the ratio of the true
+                    // routed-path distance attenuation (shW/Y00) to the
+                    // straight-line distance attenuation the send already
+                    // multiplies in. The straight-line factor then CANCELS:
+                    //   reflAtten = directDistAtten × (mapping.gain × pathDistAtten/directDistAtten)
+                    //             = mapping.gain × pathDistAtten
+                    // i.e. spectral coloration × true-path-distance energy.
+                    //
+                    // No same-room regression: a direct-LOS (unoccluded) source
+                    // produces a single direct path with pathWeight = 1.0 and
+                    // distance = straight-line (path_simulator.cpp:194-203, 399-403),
+                    // so shW/Y00 == directDistAtten exactly → distanceFactor == 1.0.
+                    // Only genuinely routed (longer-than-LOS) paths attenuate.
+                    //
+                    // Y00 = 0.5·sqrt(1/π) = 0.282095 (HardcodedSH00 in the vendored
+                    // sh lib — spherical_harmonics.cc). shW ≥ 0 (W basis is positive,
+                    // gains are positive), so no abs() needed.
+                    float distanceFactor = 1.0f;
+                    {
+                        constexpr float kY00 = 0.282095f;
+                        const float pathDistAtten   = shW / kY00;
+                        const float directDistAtten = outputs.direct.distanceAttenuation;
+                        // directDistAtten is in (0,1] here (inverse-distance model,
+                        // out-of-range voices were handled by the maxAudibleDist
+                        // branch above and never reach this code). Guard the divide
+                        // anyway and clamp: a routed path can never be SHORTER than
+                        // the straight line, so the physical range is [0,1].
+                        if (directDistAtten > 1.0e-6f) {
+                            distanceFactor = pathDistAtten / directDistAtten;
+                            if      (distanceFactor < 0.0f) distanceFactor = 0.0f;
+                            else if (distanceFactor > 1.0f) distanceFactor = 1.0f;
+                        }
+                    }
+
                     if (shAllZero) {
                         voice->dspNode.portalAttenuation = 0.0f;
                         voice->dspNode.portalBlocking    = 0.0f;
                     } else {
-                        PathingDspMapping mapping = eqCoeffsToDspMapping(
-                            pathingOut.pathing.eqCoeffs[0],
-                            pathingOut.pathing.eqCoeffs[1],
-                            pathingOut.pathing.eqCoeffs[2],
-                            /*doorBlocking=*/0.0f,
-                            mPathingGainScale,
-                            mPathingBlockingScale,
-                            mPathingGainWeightLow,
-                            mPathingGainWeightMid,
-                            mPathingGainWeightHigh);
-                        voice->dspNode.portalAttenuation = mapping.gain;
+                        voice->dspNode.portalAttenuation = mapping.gain * distanceFactor;
                         voice->dspNode.portalBlocking    = mapping.blocking;
+                    }
+
+                    // ── [PATH_DIAG_DUMP] per-frame pathing readback ──
+                    // Filtered to one schema. Rate-limited to every 10th
+                    // frame OR whenever any eq coefficient moves > 0.05
+                    // from the prior emit. `lastGoodEq` and
+                    // `pathingEverSolved` fields don't exist on
+                    // ActiveVoice / SteamAudioDSPNode — emitted as the
+                    // literal "n/a" so downstream log parsers keep
+                    // column alignment.
+                    if (shouldDiagOcclusion(voice->schemaName)) {
+                        static std::unordered_map<SoundHandle,
+                            std::array<float, 3>> sPrevEq;
+                        const float eq0 = pathingOut.pathing.eqCoeffs[0];
+                        const float eq1 = pathingOut.pathing.eqCoeffs[1];
+                        const float eq2 = pathingOut.pathing.eqCoeffs[2];
+                        auto itPrev = sPrevEq.find(voice->handle);
+                        const bool eqJumped = (itPrev == sPrevEq.end())
+                            || (std::fabs(eq0 - itPrev->second[0]) > 0.05f)
+                            || (std::fabs(eq1 - itPrev->second[1]) > 0.05f)
+                            || (std::fabs(eq2 - itPrev->second[2]) > 0.05f);
+                        const bool periodic = (kFrameForDiag % 10ULL) == 0ULL;
+                        if (eqJumped || periodic) {
+                            sPrevEq[voice->handle] = {eq0, eq1, eq2};
+                            std::fprintf(stderr,
+                                "[PATH_DIAG_DUMP] h=%u '%s' frame=%llu "
+                                "eq=[%.4f,%.4f,%.4f] shAllZero=%d "
+                                "shSumAbs=%.4e shW=%.4e distFactor=%.4f "
+                                "mapping.gain=%.4f "
+                                "mapping.blocking=%.4f "
+                                "portalAttenuation_post=%.4f "
+                                "lastGoodEq=[n/a,n/a,n/a] "
+                                "pathingEverSolved=n/a\n",
+                                voice->handle, voice->schemaName.c_str(),
+                                static_cast<unsigned long long>(kFrameForDiag),
+                                eq0, eq1, eq2,
+                                shAllZero ? 1 : 0, shSumAbs, shW,
+                                distanceFactor,
+                                mapping.gain, mapping.blocking,
+                                voice->dspNode.portalAttenuation);
+                        }
                     }
                 }
             }
@@ -7029,6 +7232,51 @@ void AudioService::loopStep(float deltaTime)
                 // a deferred reflection add silently broke the direct read
                 // too. With split simulators that coupling is gone.
                 voice->dspNode.directParams = outputs.direct;
+
+                // ── [OCCL_TICK] per-frame direct-effect snapshot ──
+                // Filtered to one schema (kOcclusionDebugSchemaFilter) so
+                // we can watch occlusion + transmission + listener
+                // geometry change frame-by-frame for one voice. Rate-
+                // limited to every 10th frame OR whenever occlusion
+                // moves > 0.1 from the prior emit. Door-xform delta
+                // comes from sDoorXformDeltaForTick (published at top
+                // of loopStep).
+                if (shouldDiagOcclusion(voice->schemaName)) {
+                    static std::unordered_map<SoundHandle, float> sPrevOcclusion;
+                    const float curOccl = outputs.direct.occlusion;
+                    auto itPrev = sPrevOcclusion.find(voice->handle);
+                    const bool occlJumped = (itPrev == sPrevOcclusion.end())
+                        || (std::fabs(curOccl - itPrev->second) > 0.1f);
+                    const bool periodic = (kFrameForDiag % 10ULL) == 0ULL;
+                    if (occlJumped || periodic) {
+                        sPrevOcclusion[voice->handle] = curOccl;
+                        const Vector3 src = voice->worldPos;
+                        const Vector3 lst = mListenerPos;
+                        const float euclideanFt = glm::length(src - lst);
+                        const int doorDelta = sDoorXformDeltaForTick.load(
+                            std::memory_order_relaxed);
+                        const bool needsCommit = mSceneNeedsCommit.load(
+                            std::memory_order_relaxed);
+                        std::fprintf(stderr,
+                            "[OCCL_TICK] h=%u '%s' frame=%llu "
+                            "occl=%.3f trans=[%.3f,%.3f,%.3f] "
+                            "srcPos=(%.1f,%.1f,%.1f) lstPos=(%.1f,%.1f,%.1f) "
+                            "euclidean=%.1f occlRadius=%.2f "
+                            "sceneNeedsCommit=%s doorXformDelta=%d\n",
+                            voice->handle, voice->schemaName.c_str(),
+                            static_cast<unsigned long long>(kFrameForDiag),
+                            curOccl,
+                            outputs.direct.transmission[0],
+                            outputs.direct.transmission[1],
+                            outputs.direct.transmission[2],
+                            src.x, src.y, src.z,
+                            lst.x, lst.y, lst.z,
+                            euclideanFt,
+                            voice->occlusionRadiusFt,
+                            needsCommit ? "true" : "false",
+                            doorDelta);
+                    }
+                }
 
                 // For environmental ambient voices: enable the full
                 // direct-path attenuation stack (distance + air
@@ -7261,6 +7509,43 @@ void AudioService::loopStep(float deltaTime)
                         voice->dspNode.reflectionParams = outputs.reflections;
                         voice->dspNode.reflectionParams.type        = IPL_REFLECTIONEFFECTTYPE_HYBRID;
                         voice->dspNode.reflectionParams.numChannels = mAmbisonicsChannels;
+
+                        // ── [REFL_IR_TICK] reflection-IR identity diag ──
+                        // For matching voices: fires once per change in
+                        // (irPtr, irSize) pair. irNorm itself is computed
+                        // in ConvolutionWorkerPool.cpp:754 (worker
+                        // thread) and is not plumbed back to the main
+                        // thread; the identity log here lets us tell
+                        // "same IR for many frames" from "Steam Audio
+                        // swapped to a new IR slot" — the latter is the
+                        // expected signal during a probe transition.
+                        // The slot field is hard-coded to 0 because
+                        // reflection IR storage is per-voice (one source
+                        // owns one IR), not multi-slot like the dry
+                        // sub-source pipeline.
+                        if (shouldDiagOcclusion(voice->schemaName)) {
+                            static std::unordered_map<SoundHandle,
+                                std::pair<std::uintptr_t, int>> sPrevIR;
+                            const std::uintptr_t curPtr =
+                                reinterpret_cast<std::uintptr_t>(
+                                    outputs.reflections.ir);
+                            const int curSize = outputs.reflections.irSize;
+                            auto itPrev = sPrevIR.find(voice->handle);
+                            const bool changed =
+                                (itPrev == sPrevIR.end())
+                                || (itPrev->second.first  != curPtr)
+                                || (itPrev->second.second != curSize);
+                            if (changed) {
+                                sPrevIR[voice->handle] = {curPtr, curSize};
+                                std::fprintf(stderr,
+                                    "[REFL_IR_TICK] h=%u '%s' frame=%llu "
+                                    "slot=0 irPtr=0x%" PRIxPTR " irSize=%d\n",
+                                    voice->handle,
+                                    voice->schemaName.c_str(),
+                                    static_cast<unsigned long long>(kFrameForDiag),
+                                    curPtr, curSize);
+                            }
+                        }
                         // REQUIRED INVARIANT (HYBRID-only): delay = 0.
                         //
                         // Steam Audio's hybrid design (per phonon.h
@@ -7923,6 +8208,38 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
                 voice.worldPos.x, voice.worldPos.y, voice.worldPos.z,
                 voice.occlusionRadiusFt, globalFt, n + 1);
         }
+    }
+
+    // ── [OCCL_SPAWN_DIAG] (one-shot per matching voice) ──
+    // For wall-leak debugging: record source→listener geometry the moment
+    // the voice is created so spawn-time conditions can be correlated with
+    // the per-frame [OCCL_TICK] line. The BSP raycaster is the same hook
+    // the runtime occlusion-radius helper uses; reporting -1 when unwired
+    // matches the convention in computeVoiceOcclusionRadiusFt. Not rate-
+    // limited because filtered to one schema.
+    if (shouldDiagOcclusion(voice.schemaName)) {
+        const Vector3 src = voice.worldPos;
+        const Vector3 lst = mListenerPos;
+        const float euclideanFt = glm::length(src - lst);
+        bool blocked = false;
+        float hitDistFt = -1.0f;
+        if (mRaycaster) {
+            RayHit hit{};
+            blocked = mRaycaster(src, lst, hit);
+            if (blocked) hitDistFt = hit.distance;
+        }
+        std::fprintf(stderr,
+            "[OCCL_SPAWN_DIAG] h=%u '%s' srcPos=(%.1f,%.1f,%.1f) "
+            "lstPos=(%.1f,%.1f,%.1f) euclidean_ft=%.1f "
+            "sa_ray_blocked=%s sa_hit_dist_ft=%.2f "
+            "voice_occlusion_radius_ft=%.2f\n",
+            voice.handle, voice.schemaName.c_str(),
+            src.x, src.y, src.z,
+            lst.x, lst.y, lst.z,
+            euclideanFt,
+            blocked ? "true" : "false",
+            hitDistFt,
+            voice.occlusionRadiusFt);
     }
 
     // ── Direct source ──
@@ -10771,48 +11088,17 @@ void AudioService::dumpAudioStatusPeriodic()
         }
     }
 
-    // ── [REFL_SKIP] runtime staleness reminder ──
-    //
-    // When the user launched with --skip-reflection-bake (or
-    // audio.reflections.bake_skip: true), the reflection section in the
-    // currently-loaded .probes file is whatever was on disk from a
-    // previous bake. If geometry has moved since then, reflection IRs
-    // are STALE — sound will play but won't match the room. We log a
-    // single-line reminder every 30s so the user can't lose track that
-    // they're listening to stale reflections.
-    //
-    // 30s is a separate throttle from the 5s dump cadence above; we use
-    // a function-local steady_clock baseline so the cadence is wall-clock
-    // (not coupled to frame-rate-dependent debugTimer drift). Matches the
-    // throttle pattern used by ProbeManager::pollPerfPeriodic.
-    bool reflSkipReminderFired = false;
-    if (mReflectionBakeSkip) {
-        // NOTE: function-local static — does not reset across in-process mission reloads, so the first-fire-immediately path only triggers once per program run, not per mission.
-        static std::chrono::steady_clock::time_point sLastReflSkipDump{};
-        auto now = std::chrono::steady_clock::now();
-        bool firstFire = (sLastReflSkipDump.time_since_epoch().count() == 0);
-        if (firstFire ||
-            std::chrono::duration<double>(now - sLastReflSkipDump).count() >= 30.0)
-        {
-            sLastReflSkipDump = now;
-            reflSkipReminderFired = true;
-            // Direct stderr, NOT AUDIO_LOG — per feedback_no_silent_fallbacks
-            // a stale-reflection reminder must always be visible, not gated
-            // on --audio-log. The whole point is that the user can't lose
-            // track of the carry-forward state.
-            std::fprintf(stderr,
-                "[REFL_SKIP] reflections section is stale "
-                "(carried over from prior bake)\n");
-        }
-    }
+    // Reflection-bake skipping has been removed; every bake now runs the
+    // full pathing + reflections pipeline. The 30-s [REFL_SKIP] staleness
+    // reminder that used to live here is gone with it.
 
     // ── PLAN.AUDIO_PROFILING.md §1.1 §1.2 — JSONL fan-out ──
     //
     // Emit a single perf.window record per 5 s dump window, plus any
-    // per-event records for state changes (refl_skip reminder fires,
-    // evict batch). Reads from the local snapshot variables above; does
-    // NOT call snapshotAndReset(true) — that would zero counts for the
-    // stderr line that already consumed them.
+    // per-event records for state changes (evict batch). Reads from the
+    // local snapshot variables above; does NOT call snapshotAndReset(true)
+    // — that would zero counts for the stderr line that already consumed
+    // them.
     if (mPerfJsonlFile) {
         double tsMs = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - mPerfJsonlStartedAt)
@@ -10905,11 +11191,8 @@ void AudioService::dumpAudioStatusPeriodic()
         // Companion event lines (PLAN §1.1): one record per
         // per-event log line that fires during this window. Keeps the
         // JSONL stream timeline-complete without needing the consumer to
-        // re-parse stderr.
-        if (reflSkipReminderFired) {
-            std::fprintf(mPerfJsonlFile,
-                "{\"event\":\"refl_skip\",\"ts_ms\":%.1f}\n", tsMs);
-        }
+        // re-parse stderr. The `refl_skip` event is gone with the
+        // reflection-bake-skip flag itself.
         if (evictionsSinceLast > 0) {
             // We don't have per-handle eviction details on the main
             // thread (the [REFL_EVICT] stderr line is emitted from the
@@ -11766,11 +12049,9 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     params.additionalElevations  = mProbeElevations;
     params.elevationSparsityMul  = mProbeElevationSparsityMul;
     params.globalDedupRadiusFt   = mProbeGlobalDedupRadiusFt;
-    // Reflection-bake skip: when true, ProbeManager carries the existing
-    // .probes reflection section forward verbatim instead of re-baking it.
-    // ProbeManager hard-fails (with [FALLBACK] log) if there is no
-    // reflection section to carry forward — see ProbeManager.cpp.
-    params.bakeReflectionBatch   = !mReflectionBakeSkip;
+    // Reflection-bake skipping has been removed; every bake runs the
+    // full pathing + reflection pipeline. ProbeBakeParams no longer
+    // carries a `bakeReflectionBatch` field.
 
     // (Per-portal probe densification for the reflection batch was
     // removed when pathing moved to its own sparse ROOM_PORTAL batch
