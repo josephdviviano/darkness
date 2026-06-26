@@ -1694,6 +1694,351 @@ static int runSoundDbVerb(const std::string &schemasPath,
     return 0;
 }
 
+// ---------- mesh_validate verb ----------
+//
+// Constructs the same AcousticSceneData that darknessRender hands to
+// AudioService::buildAcousticScene, then runs a half-edge boundary
+// count over its triangle list. Outputs:
+//
+//   <mis>.acoustic.obj           — Wavefront OBJ of the static mesh.
+//   <mis>.acoustic.boundary.txt  — every boundary edge (midpoint +
+//                                  endpoints + endpoint-vertex index
+//                                  pair). One line per edge.
+//
+// A "boundary edge" is one used by exactly one triangle (no opposing
+// triangle on the other side). For a watertight room mesh this should
+// be zero. Non-zero boundary count means the mesh has holes — exactly
+// the seam Steam Audio's single-ray `scene.isOccluded` can slip
+// through while the multi-sample volumetric occlusion (rays at small
+// angular offset) correctly hits the surrounding closed geometry.
+//
+// Edges shared by 3+ triangles ("non-manifold edges") are also
+// reported because they indicate winding / portal-pair-coincidence
+// artefacts that can degrade BVH precision for grazing rays.
+//
+// Optional positional filter args: `--at X Y Z R` reports only edges
+// whose midpoint is within R feet of `(X,Y,Z)`. Useful for zooming in
+// on a known cross-wall leak — e.g.
+//   darknessHeadless mesh_validate MISS6.mis --at 79.9 -45.4 -47.0 30
+// to look only at the corridor around the strlight_lp source.
+//
+// Independent of any Steam Audio runtime state — no IPLContext / no
+// IPLScene created. Pure WR-input analysis.
+static int runMeshValidateVerb(const std::string &misPath,
+                                const Darkness::Vector3 *filterPos,
+                                float filterRadiusFt)
+{
+    namespace D = Darkness;
+
+    std::fprintf(stdout, "[MESH_VALIDATE] mission=%s\n", misPath.c_str());
+    if (filterPos) {
+        std::fprintf(stdout,
+            "[MESH_VALIDATE] filter pos=(%.2f, %.2f, %.2f) radius=%.2fft\n",
+            filterPos->x, filterPos->y, filterPos->z, filterRadiusFt);
+    }
+
+    D::WRParsedData wr;
+    try {
+        wr = D::parseWRChunk(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr,
+            "[MESH_VALIDATE] failed to parse WR chunk in '%s': %s\n",
+            misPath.c_str(), e.what());
+        return 1;
+    }
+
+    D::TXList txList;
+    try {
+        txList = D::parseTXList(misPath);
+    } catch (const std::exception &) {
+        // TXList parse failure is non-fatal — mesh geometry is independent
+        // of material lookup.
+        txList = D::TXList{};
+    }
+
+    // ── Build AcousticSceneData (same logic as
+    //    buildAcousticSceneFromMissionFile above and DarknessRender.cpp's
+    //    in-engine assembly). Kept inline rather than refactored so a
+    //    drift in the production path is detectable by diffing this verb
+    //    against the runtime mesh — the whole point of this verb is to
+    //    cross-check the production mesh-build assumptions. If the
+    //    production path changes, this verb's output diverges, which is
+    //    the alarm we want. Future refactor: extract a single helper.
+    D::AcousticSceneData fullScene;
+
+    struct VertKey {
+        int32_t x, y, z;
+        bool operator==(const VertKey &o) const {
+            return x == o.x && y == o.y && z == o.z;
+        }
+    };
+    struct VertKeyHash {
+        size_t operator()(const VertKey &k) const {
+            size_t h = 0x811c9dc5u;
+            h ^= static_cast<size_t>(k.x); h *= 0x01000193u;
+            h ^= static_cast<size_t>(k.y); h *= 0x01000193u;
+            h ^= static_cast<size_t>(k.z); h *= 0x01000193u;
+            return h;
+        }
+    };
+    std::unordered_map<VertKey, uint32_t, VertKeyHash> vertexMap;
+    vertexMap.reserve(wr.numCells * 20);
+
+    auto getVertexIndex = [&](float x, float y, float z) -> uint32_t {
+        VertKey key{static_cast<int32_t>(std::round(x * 100.0f)),
+                    static_cast<int32_t>(std::round(y * 100.0f)),
+                    static_cast<int32_t>(std::round(z * 100.0f))};
+        auto it = vertexMap.find(key);
+        if (it != vertexMap.end()) return it->second;
+        uint32_t idx = static_cast<uint32_t>(fullScene.vertices.size() / 3);
+        fullScene.vertices.push_back(x);
+        fullScene.vertices.push_back(y);
+        fullScene.vertices.push_back(z);
+        vertexMap[key] = idx;
+        return idx;
+    };
+
+    // Tally why polygons are skipped so the boundary-edge count can be
+    // interpreted in context: a high boundary count with lots of
+    // txt>=247 skips means the holes are intentional skybox/water
+    // openings (the suspect #1 identified in the cross-wall-leak
+    // audit). A high boundary count without skips means real
+    // T-junctions or missing tessellation in the WR data.
+    size_t skipBspPhantom   = 0;
+    size_t skipBackhack249  = 0;
+    size_t skipTxt247Plus   = 0;
+    size_t emittedSolid     = 0;
+    size_t emittedPortal    = 0;
+
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        const auto &cell = wr.cells[ci];
+        int numSolid = cell.numPolygons - cell.numPortals;
+        for (int pi = 0; pi < cell.numPolygons; ++pi) {
+            const auto &poly = cell.polygons[pi];
+            bool isPortal = (pi >= numSolid);
+            bool isNonRenderedPortal = isPortal && (pi >= cell.numTextured);
+            if (isNonRenderedPortal) { skipBspPhantom++; continue; }
+            if (!isPortal && pi < cell.numTextured && cell.texturing[pi].txt == 249) {
+                skipBackhack249++;
+                continue;
+            }
+            if (!isPortal && pi < cell.numTextured) {
+                uint8_t txtIdx = cell.texturing[pi].txt;
+                if (txtIdx >= 247) { skipTxt247Plus++; continue; }
+            }
+            if (poly.count < 3) continue;
+            std::vector<uint32_t> polyVerts(poly.count);
+            for (int vi = 0; vi < poly.count; ++vi) {
+                uint8_t idx = cell.polyIndices[pi][vi];
+                const auto &v = cell.vertices[idx];
+                polyVerts[vi] = getVertexIndex(v.x, v.y, v.z);
+            }
+            for (int t = 1; t < poly.count - 1; ++t) {
+                fullScene.indices.push_back(static_cast<int32_t>(polyVerts[0]));
+                fullScene.indices.push_back(static_cast<int32_t>(polyVerts[t + 1]));
+                fullScene.indices.push_back(static_cast<int32_t>(polyVerts[t]));
+            }
+            if (isPortal) emittedPortal++;
+            else emittedSolid++;
+        }
+    }
+
+    const size_t numTris = fullScene.indices.size() / 3;
+    const size_t numVerts = fullScene.vertices.size() / 3;
+    std::fprintf(stdout,
+        "[MESH_VALIDATE] mesh: verts=%zu tris=%zu cells=%u\n"
+        "[MESH_VALIDATE] emitted: solid=%zu portal=%zu\n"
+        "[MESH_VALIDATE] skipped: bsp_phantom=%zu backhack(txt=249)=%zu "
+        "water_etc(txt>=247)=%zu\n",
+        numVerts, numTris, wr.numCells,
+        emittedSolid, emittedPortal,
+        skipBspPhantom, skipBackhack249, skipTxt247Plus);
+
+    // ── Half-edge boundary counter ──
+    //
+    // Key = (min(u,v), max(u,v)) — undirected edge identity. Value =
+    // number of triangles that contain this edge.
+    //   count == 1 → boundary edge (mesh hole — single ray slips here)
+    //   count == 2 → manifold interior (the desired state for solid walls)
+    //   count >= 3 → non-manifold (3+ triangles sharing one edge — usually
+    //                a winding artefact or duplicate polygon)
+    using EdgeKey = std::pair<uint32_t, uint32_t>;
+    struct EdgeKeyHash {
+        size_t operator()(const EdgeKey &e) const {
+            uint64_t k = (static_cast<uint64_t>(e.first) << 32)
+                       | static_cast<uint64_t>(e.second);
+            return std::hash<uint64_t>{}(k);
+        }
+    };
+    std::unordered_map<EdgeKey, int, EdgeKeyHash> edgeCount;
+    edgeCount.reserve(numTris * 3);
+
+    auto addEdge = [&](uint32_t u, uint32_t v) {
+        if (u > v) std::swap(u, v);
+        edgeCount[EdgeKey{u, v}]++;
+    };
+    for (size_t t = 0; t < numTris; ++t) {
+        uint32_t a = static_cast<uint32_t>(fullScene.indices[3*t + 0]);
+        uint32_t b = static_cast<uint32_t>(fullScene.indices[3*t + 1]);
+        uint32_t c = static_cast<uint32_t>(fullScene.indices[3*t + 2]);
+        addEdge(a, b);
+        addEdge(b, c);
+        addEdge(c, a);
+    }
+
+    auto getVert = [&](uint32_t idx) -> D::Vector3 {
+        return D::Vector3{
+            fullScene.vertices[3*idx + 0],
+            fullScene.vertices[3*idx + 1],
+            fullScene.vertices[3*idx + 2]};
+    };
+
+    size_t boundaryCount   = 0;
+    size_t nonManifoldCount = 0;
+    size_t boundaryInFilter = 0;
+
+    // Collect boundary + non-manifold for output. Filter applies only to
+    // the report file, not the summary count.
+    std::vector<EdgeKey> boundaryEdges;
+    std::vector<EdgeKey> nonManifoldEdges;
+    boundaryEdges.reserve(edgeCount.size() / 32);
+    for (const auto &kv : edgeCount) {
+        if (kv.second == 1) {
+            boundaryCount++;
+            boundaryEdges.push_back(kv.first);
+        } else if (kv.second >= 3) {
+            nonManifoldCount++;
+            nonManifoldEdges.push_back(kv.first);
+        }
+    }
+
+    std::fprintf(stdout,
+        "[MESH_VALIDATE] edges: total=%zu boundary=%zu non_manifold=%zu\n",
+        edgeCount.size(), boundaryCount, nonManifoldCount);
+
+    const float filterR2 = filterRadiusFt * filterRadiusFt;
+    if (filterPos) {
+        for (const auto &e : boundaryEdges) {
+            D::Vector3 p0 = getVert(e.first);
+            D::Vector3 p1 = getVert(e.second);
+            D::Vector3 mid{0.5f * (p0.x + p1.x),
+                           0.5f * (p0.y + p1.y),
+                           0.5f * (p0.z + p1.z)};
+            D::Vector3 d{mid.x - filterPos->x,
+                         mid.y - filterPos->y,
+                         mid.z - filterPos->z};
+            if (d.x*d.x + d.y*d.y + d.z*d.z <= filterR2) boundaryInFilter++;
+        }
+        std::fprintf(stdout,
+            "[MESH_VALIDATE] boundary edges within filter: %zu\n",
+            boundaryInFilter);
+    }
+
+    // ── OBJ dump (CWD, basename of mission) ──
+    // Mission directories are often read-only (mounted ISO / disk image),
+    // so anchor at the working directory instead of misPath's dir.
+    auto basenameOf = [](const std::string &p) {
+        auto slash = p.find_last_of("/\\");
+        return slash == std::string::npos ? p : p.substr(slash + 1);
+    };
+    const std::string base = basenameOf(misPath);
+    std::string objPath = base + ".acoustic.obj";
+    std::FILE *obj = std::fopen(objPath.c_str(), "w");
+    if (!obj) {
+        std::fprintf(stderr,
+            "[MESH_VALIDATE] failed to open %s for writing\n",
+            objPath.c_str());
+        return 1;
+    }
+    std::fprintf(obj,
+        "# darknessHeadless mesh_validate\n"
+        "# mission: %s\n"
+        "# verts=%zu tris=%zu\n",
+        misPath.c_str(), numVerts, numTris);
+    for (size_t v = 0; v < numVerts; ++v) {
+        std::fprintf(obj, "v %.4f %.4f %.4f\n",
+            fullScene.vertices[3*v + 0],
+            fullScene.vertices[3*v + 1],
+            fullScene.vertices[3*v + 2]);
+    }
+    for (size_t t = 0; t < numTris; ++t) {
+        std::fprintf(obj, "f %d %d %d\n",
+            fullScene.indices[3*t + 0] + 1,
+            fullScene.indices[3*t + 1] + 1,
+            fullScene.indices[3*t + 2] + 1);
+    }
+    std::fclose(obj);
+    std::fprintf(stdout, "[MESH_VALIDATE] wrote %s\n", objPath.c_str());
+
+    // ── Boundary report ──
+    std::string boundPath = base + ".acoustic.boundary.txt";
+    std::FILE *bf = std::fopen(boundPath.c_str(), "w");
+    if (!bf) {
+        std::fprintf(stderr,
+            "[MESH_VALIDATE] failed to open %s for writing\n",
+            boundPath.c_str());
+        return 1;
+    }
+    std::fprintf(bf, "# darknessHeadless mesh_validate boundary edges\n");
+    std::fprintf(bf, "# mission: %s\n", misPath.c_str());
+    std::fprintf(bf, "# boundary edges (count==1): %zu\n", boundaryCount);
+    std::fprintf(bf, "# non-manifold edges (count>=3): %zu\n", nonManifoldCount);
+    if (filterPos) {
+        std::fprintf(bf,
+            "# filter pos=(%.2f, %.2f, %.2f) radius=%.2fft\n"
+            "# boundary edges within filter: %zu\n",
+            filterPos->x, filterPos->y, filterPos->z,
+            filterRadiusFt, boundaryInFilter);
+    }
+    std::fprintf(bf,
+        "# format: <kind> mid=(x,y,z) p0=(x,y,z) p1=(x,y,z) v=<a,b>\n");
+    for (const auto &e : boundaryEdges) {
+        D::Vector3 p0 = getVert(e.first);
+        D::Vector3 p1 = getVert(e.second);
+        D::Vector3 mid{0.5f * (p0.x + p1.x),
+                       0.5f * (p0.y + p1.y),
+                       0.5f * (p0.z + p1.z)};
+        if (filterPos) {
+            D::Vector3 d{mid.x - filterPos->x,
+                         mid.y - filterPos->y,
+                         mid.z - filterPos->z};
+            if (d.x*d.x + d.y*d.y + d.z*d.z > filterR2) continue;
+        }
+        std::fprintf(bf,
+            "BOUNDARY mid=(%.3f,%.3f,%.3f) p0=(%.3f,%.3f,%.3f) "
+            "p1=(%.3f,%.3f,%.3f) v=<%u,%u>\n",
+            mid.x, mid.y, mid.z,
+            p0.x, p0.y, p0.z,
+            p1.x, p1.y, p1.z,
+            e.first, e.second);
+    }
+    for (const auto &e : nonManifoldEdges) {
+        D::Vector3 p0 = getVert(e.first);
+        D::Vector3 p1 = getVert(e.second);
+        D::Vector3 mid{0.5f * (p0.x + p1.x),
+                       0.5f * (p0.y + p1.y),
+                       0.5f * (p0.z + p1.z)};
+        if (filterPos) {
+            D::Vector3 d{mid.x - filterPos->x,
+                         mid.y - filterPos->y,
+                         mid.z - filterPos->z};
+            if (d.x*d.x + d.y*d.y + d.z*d.z > filterR2) continue;
+        }
+        std::fprintf(bf,
+            "NONMANIFOLD count=%d mid=(%.3f,%.3f,%.3f) "
+            "p0=(%.3f,%.3f,%.3f) p1=(%.3f,%.3f,%.3f) v=<%u,%u>\n",
+            edgeCount[e],
+            mid.x, mid.y, mid.z,
+            p0.x, p0.y, p0.z,
+            p1.x, p1.y, p1.z,
+            e.first, e.second);
+    }
+    std::fclose(bf);
+    std::fprintf(stdout, "[MESH_VALIDATE] wrote %s\n", boundPath.c_str());
+    std::fprintf(stdout, "[MESH_VALIDATE] done\n");
+    return 0;
+}
+
 static int runProbePlanVerb(const std::string &misPath,
                              const std::string &resPath,
                              const std::string &schemasPath,
@@ -2047,6 +2392,11 @@ static void printUsage(const char *prog) {
     std::cerr << "                    Steam Audio bake. Useful for iterating on probe placement" << std::endl;
     std::cerr << "                    reductions. Accepts --res / --schemas (same as darknessRender);" << std::endl;
     std::cerr << "                    no .probes file is ever written." << std::endl;
+    std::cerr << "  mesh_validate     Validate watertightness of the acoustic mesh built from this" << std::endl;
+    std::cerr << "                    mission. Writes <mis>.acoustic.obj and" << std::endl;
+    std::cerr << "                    <mis>.acoustic.boundary.txt. Optional `--at X Y Z R` filter" << std::endl;
+    std::cerr << "                    reports only boundary/non-manifold edges within R feet of" << std::endl;
+    std::cerr << "                    (X, Y, Z). No services or Steam Audio runtime required." << std::endl;
     std::cerr << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --scripts <path>  Path to schema scripts directory (default: scripts/thief2)" << std::endl;
@@ -2237,6 +2587,37 @@ int main(int argc, char *argv[]) {
             // computation. Returns 0 on success, 1 on failure.
             return runProbePlanVerb(dbFile, resPath, schemasPath, scriptsDir,
                                      setOverrides);
+        } else if (command == "mesh_validate") {
+            // mesh_validate: WR-only static-mesh watertightness check.
+            // Optional `--at X Y Z R` positional filter for zooming in
+            // on a known leak. No services / no database / no IPL
+            // required — purely structural.
+            //
+            // Filter parsing: scan positionalArgs for "--at"; the next
+            // four entries are X, Y, Z, R as floats. Tolerate the flag
+            // appearing anywhere after the mission path.
+            const Darkness::Vector3 *filterPosPtr = nullptr;
+            Darkness::Vector3 filterPos{0.0f, 0.0f, 0.0f};
+            float filterRadiusFt = 0.0f;
+            for (size_t i = 2; i < positionalArgs.size(); ++i) {
+                if (positionalArgs[i] == "--at"
+                    && i + 4 < positionalArgs.size()) {
+                    try {
+                        filterPos.x = std::stof(positionalArgs[i + 1]);
+                        filterPos.y = std::stof(positionalArgs[i + 2]);
+                        filterPos.z = std::stof(positionalArgs[i + 3]);
+                        filterRadiusFt = std::stof(positionalArgs[i + 4]);
+                        if (filterRadiusFt > 0.0f) filterPosPtr = &filterPos;
+                    } catch (const std::exception &e) {
+                        std::fprintf(stderr,
+                            "mesh_validate: --at parse failed: %s\n",
+                            e.what());
+                        return 1;
+                    }
+                    break;
+                }
+            }
+            return runMeshValidateVerb(dbFile, filterPosPtr, filterRadiusFt);
         } else if (command == "trace-path") {
             if (positionalArgs.size() < 4) {
                 std::cerr << "trace-path: need <srcRoomID> <dstRoomID> [maxDist]\n";
