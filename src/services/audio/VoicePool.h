@@ -231,6 +231,34 @@ struct SteamAudioDSPNode {
     IPLReflectionEffectParams reflectionParams{};
     std::atomic<bool> reflectionsActive{false};
 
+    // ── IR-energy elision groundwork (measurement only) ──
+    //
+    // Mean-square energy of this voice's wet W (omnidirectional, channel-0)
+    // convolution OUTPUT, measured by the convolution sub-worker right after
+    // iplReflectionEffectApply and written back here (worker writes via the
+    // raw pointer VoiceSlot::outEnergyW, guarded by the same validityToken
+    // drain that protects the rest of the slot's voice-derived data). Read on
+    // the main thread for the [REFL_IR_TICK] diagnostic.
+    //
+    // Why OUTPUT energy, not IR energy: Steam Audio's reflection IR
+    // (outputs.reflections.ir) is an OPAQUE handle (IPLReflectionEffectIR) —
+    // its samples are not exposed (see ConvolutionWorkerPool.cpp comment at the
+    // [REFL_FIRST_APPLY] block). The convolution output W channel is the only
+    // available ground truth for "how much reverb energy this voice produces."
+    //
+    // This is the foundation for eliding the convolution of voices whose reverb
+    // is inaudible — specifically the STATICSOURCE occluded-emitter case where
+    // the input mono is non-zero (no pathing gate) but the self-occluding baked
+    // IR yields silent output, which the existing input-silence counter cannot
+    // detect. It is OBSERVATIONAL ONLY today: it does NOT yet gate elision,
+    // because gating on output energy requires a periodic re-probe (an elided
+    // voice stops being measured, so it could never un-elide when its IR
+    // becomes audible again). That re-probe loop is specified in
+    // HANDOFF.STATICSOURCE.md §4.4 and lands with the STATICSOURCE work.
+    //
+    // Default 0.0 (never measured yet). Relaxed atomic.
+    std::atomic<float> reflectionOutEnergyW{0.0f};
+
     // Per-voice IPLPathEffect (Phase 4 — Steam Audio sole authority for
     // player routing + attenuation). Created in initVoiceDSP for non-
     // player-emitted voices, released in removeVoiceSource/~ActiveVoice

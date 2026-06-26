@@ -717,6 +717,27 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
                 if (applyMs > iterApplyMaxMs) iterApplyMaxMs = applyMs;
             }
 
+            // ── IR-energy elision groundwork (measurement only) ──
+            // Report the mean-square energy of the wet W (channel-0) output
+            // back to the owning node so the main thread can observe how much
+            // reverb this voice actually produces. This is the only available
+            // ground truth for reflection energy — the IR itself is an opaque
+            // IPLReflectionEffectIR handle. OBSERVATIONAL ONLY: nothing gates
+            // elision on it yet (that needs a periodic re-probe so an elided
+            // voice can be re-measured — see HANDOFF.STATICSOURCE.md §4.4).
+            // validityToken was checked at the top of this slot's processing
+            // and the worker-drain guarantees the node outlives this iteration.
+            if (slot.outEnergyW) {
+                const float *w = sub.voiceAmbi0.data();
+                double e = 0.0;
+                for (int s = 0; s < slot.reflFrameSize; ++s)
+                    e += static_cast<double>(w[s]) * w[s];
+                const float meanSq = slot.reflFrameSize > 0
+                    ? static_cast<float>(e / slot.reflFrameSize)
+                    : 0.0f;
+                slot.outEnergyW->store(meanSq, std::memory_order_relaxed);
+            }
+
             // ── T0.2 [REFL_FIRST_APPLY] — first apply per (voice, slot) ──
             //
             // Emit once per (this sub-worker, voice handle). The log line
