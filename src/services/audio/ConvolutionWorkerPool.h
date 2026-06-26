@@ -219,6 +219,14 @@ struct ConvolutionWorker {
         // destroying the voice (validityToken pattern).
         int voiceHandle = -1;
         const char *schemaCStr = nullptr;
+        // IR-energy elision groundwork (measurement only): points at the
+        // owning node's reflectionOutEnergyW atomic. After applying the
+        // reflection effect, the sub-worker writes the mean-square energy of
+        // the wet W (channel-0) output here so the main thread can observe how
+        // much reverb each voice actually produces. Lifetime is guarded by the
+        // same validityToken drain as schemaCStr — removeVoiceSource drains
+        // the worker before destroying the voice/node. Null = don't write.
+        std::atomic<float> *outEnergyW = nullptr;
     };
     static constexpr int kMaxSlots = MAX_ACTIVE_VOICES;
 
