@@ -1994,6 +1994,12 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 // removeVoiceSource drains the worker first.
                 slot.voiceHandle = node->voiceHandle;
                 slot.schemaCStr  = node->voiceSchemaCStr;
+                // IR-energy elision groundwork (measurement only): hand the
+                // worker a pointer to this voice's output-energy atomic so it
+                // can report wet W-channel energy after apply. Safe for the
+                // worker's iteration via the validityToken drain (same as
+                // schemaCStr above).
+                slot.outEnergyW  = &node->reflectionOutEnergyW;
 
                 // Per-voice reverb-send peak. Measures the mono buffer
                 // *after* reflAtten scaling — i.e. exactly the signal
@@ -7539,11 +7545,14 @@ void AudioService::loopStep(float deltaTime)
                                 sPrevIR[voice->handle] = {curPtr, curSize};
                                 std::fprintf(stderr,
                                     "[REFL_IR_TICK] h=%u '%s' frame=%llu "
-                                    "slot=0 irPtr=0x%" PRIxPTR " irSize=%d\n",
+                                    "slot=0 irPtr=0x%" PRIxPTR " irSize=%d "
+                                    "outEnergyW=%.4e\n",
                                     voice->handle,
                                     voice->schemaName.c_str(),
                                     static_cast<unsigned long long>(kFrameForDiag),
-                                    curPtr, curSize);
+                                    curPtr, curSize,
+                                    voice->dspNode.reflectionOutEnergyW.load(
+                                        std::memory_order_relaxed));
                             }
                         }
                         // REQUIRED INVARIANT (HYBRID-only): delay = 0.
