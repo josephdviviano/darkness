@@ -68,6 +68,21 @@ struct PropSelfIllum {
     float brightness;
 };
 
+// P$SelfLit — dtype: SelfLit, inheritor: always, 4 bytes.
+// Schema label "DynamicLight". Flags an object as a true per-frame dynamic
+// light source: its contribution is NOT baked into the lightmap, instead
+// added to the DynamicLightList every render frame. Brightness is in the
+// same raw light units as static-light brightness (0..1023 range
+// historically; reference engine treats the int32 as the radiance scalar
+// passed straight into add_dynamic_light). The light position is the
+// object's current world position; if P$LightColor is also set on the
+// object the dynamic light is tinted with that hue/sat, otherwise white.
+// Radius is a fixed engine constant (hardware-render value 10.0), NOT
+// stored in the property.
+struct PropSelfLit {
+    int32_t brightness;
+};
+
 // P$ExtraLigh — dtype: ExtraLigh, inheritor: always, 8 bytes
 // Per-object lighting modifier. `factor` is in [-1, 1]; when `isAdditive` is
 // nonzero, factor is added to the ambient term (clamped so factor + frob
