@@ -288,22 +288,6 @@ struct ProbeBakeParams {
     /// enforces; logged for traceability. Does NOT derive the filter.
     float minWallClearanceFt = 0.0f;
 
-    /// True to bake the dense reflection batch. When false, ProbeManager
-    /// loads the existing `.probes` file at `outputPath`, carries the
-    /// reflection section forward verbatim (raw serialized bytes), and
-    /// runs only the pathing bake (if `bakePathingBatch` is also true).
-    /// Symmetric with `bakePathingBatch` below — same plumbing, opposite
-    /// batch. Hard-fails (no silent fallback) if the existing file has no
-    /// reflection section, so the user can't accidentally end up with a
-    /// pathing-only output when they expected the reflection data to
-    /// carry over.
-    ///
-    /// Drives the `--skip-reflection-bake` CLI flag /
-    /// `audio.reflections.bake_skip` YAML key — both motivated by the
-    /// multi-minute reflection bake dominating iteration on pathing-only
-    /// placement tweaks.
-    bool   bakeReflectionBatch = true;
-
     // ── Pathing batch (sparse, ROOM_PORTAL-derived) ──────────────────────
 
     /// True to bake a second probe batch tagged Pathing. When false, no

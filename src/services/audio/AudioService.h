@@ -940,26 +940,11 @@ public:
     }
     float getPathingDedupRadiusFt() const { return mProbePathingDedupRadiusFt; }
 
-    /** Reflection-bake skip. When true, the next bakeProbes() call carries
-     *  the existing `.probes` file's reflection section forward verbatim
-     *  and only re-bakes the pathing batch. Speeds iteration on pathing-
-     *  only placement tweaks (reflection bake is multi-minute; pathing
-     *  bake is seconds). Hard-fails the bake if the existing file has no
-     *  reflection section. Set from `--skip-reflection-bake` CLI flag /
-     *  `audio.reflections.bake_skip` YAML key. Default false. */
-    void setReflectionBakeSkip(bool skip) { mReflectionBakeSkip = skip; }
-    bool getReflectionBakeSkip() const { return mReflectionBakeSkip; }
-
     /** Force a fresh pathing bake on the next bakeProbes() call even when
      *  the existing `.probes` file already has a valid pathing section.
-     *  Symmetric with `setReflectionBakeSkip` — that one CARRIES FORWARD
-     *  the existing reflection bytes to skip the expensive bake, this one
-     *  DROPS the existing pathing bytes to force a fresh bake.
-     *
-     *  Used for Sweep 2 Phase B (PLAN.AUDIO_PROFILING.md §4.3) — per-
-     *  iteration `pathing_probes.dedup_radius_ft` sweep where the cached
-     *  pathing data must be regenerated against the new radius but the
-     *  reflection bake should not run.
+     *  Useful for iterating on pathing-bake parameters (e.g.
+     *  `pathing_probes.dedup_radius_ft`) without invalidating other
+     *  cached data.
      *
      *  This is a flag-only — the actual "force the bake to happen even
      *  when loadProbes succeeded" decision lives in DarknessRender.cpp's
@@ -1757,24 +1742,13 @@ private:
     /// (`audio.pathing_probes.dedup_radius_ft`).
     float              mProbePathingDedupRadiusFt = 10.0f;
 
-    /// Reflection-bake skip flag. When true, the next bakeProbes() call
-    /// carries the existing `.probes` reflection section forward verbatim
-    /// and only re-bakes the pathing batch. See setReflectionBakeSkip()
-    /// for the full rationale. Default false. Set from yaml
-    /// (`audio.reflections.bake_skip`) and `--skip-reflection-bake` CLI.
-    /// Also drives the once-per-30s [REFL_SKIP] staleness reminder in
-    /// dumpAudioStatusPeriodic.
-    bool               mReflectionBakeSkip = false;
-
     /// Force-pathing-bake flag. When true, the renderer's bake-decision
     /// site (DarknessRender.cpp probeBakeNeeded gate) schedules a
     /// bakeProbes() call even when loadProbes already succeeded against
     /// an existing .probes file with a valid pathing section. The bake
-    /// itself uses the standard ProbeBakeParams plumbing — bakePathingBatch
-    /// stays true (default) and bakeReflectionBatch follows
-    /// mReflectionBakeSkip (so the composition
-    /// `--skip-reflection-bake --force-pathing-bake` carries reflection
-    /// bytes forward + re-bakes pathing fresh). See setForcePathingBake()
+    /// itself uses the standard ProbeBakeParams plumbing — both
+    /// bakePathingBatch and bakeReflectionBatch are always true now that
+    /// reflection-bake skipping has been removed. See setForcePathingBake()
     /// for the full rationale. Default false. Set from `--force-pathing-bake`
     /// CLI only — no YAML key, per-invocation flag.
     bool               mForcePathingBake = false;

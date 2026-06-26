@@ -1101,69 +1101,13 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     float spacing = (params.spacingFtOverride > 0.0f) ? params.spacingFtOverride : mProbeSpacingFt;
     float height  = (params.heightFtOverride  > 0.0f) ? params.heightFtOverride  : mProbeHeightFt;
 
-    // ── Optional reflection-batch carry-forward ─────────────────────────
-    //
-    // When `bakeReflectionBatch == false` we skip the multi-minute
-    // reflection bake entirely and reuse the reflection section from the
-    // existing `.probes` file at `outputPath`. The file format already
-    // supports either-batch-only files (writeProbeFile accepts any
-    // ProbeBatchRecord list, loadProbeFile accepts files with one batch
-    // missing) so the carry-forward path is just "lift the reflection
-    // record verbatim, run the pathing bake, write both records."
-    //
-    // Hard-fail (no silent fallback, per feedback_no_silent_fallbacks)
-    // when the existing file is missing or has no reflection section —
-    // silently producing a pathing-only file would erase the user's
-    // baked reflection data without warning.
-    ProbeBatchRecord carriedReflRecord;
-    bool haveCarriedRefl = false;
-    if (!params.bakeReflectionBatch) {
-        ProbeFileHeader hdr;
-        std::vector<ProbeBatchRecord> existing;
-        ProbeFileStatus st = loadProbeFile(outputPath, hdr, existing);
-        if (st != ProbeFileStatus::Ok) {
-            // Direct stderr, NOT AUDIO_LOG — per feedback_no_silent_fallbacks
-            // a hard-fail must always be visible, not gated on --audio-log.
-            std::fprintf(stderr,
-                "[FALLBACK] bakeProbes: bakeReflectionBatch=false but existing "
-                "probe file '%s' could not be loaded (%s) — refusing to "
-                "produce a pathing-only file without prior reflection data. "
-                "Re-bake with reflection baking enabled first.\n",
-                outputPath.c_str(), probeFileStatusString(st));
-            return false;
-        }
-        for (auto &rec : existing) {
-            if (rec.purpose == static_cast<uint32_t>(ProbePurpose::Reflections)) {
-                carriedReflRecord = std::move(rec);
-                haveCarriedRefl = true;
-                break;
-            }
-        }
-        if (!haveCarriedRefl) {
-            // Direct stderr, NOT AUDIO_LOG — per feedback_no_silent_fallbacks
-            // a hard-fail must always be visible, not gated on --audio-log.
-            std::fprintf(stderr,
-                "[FALLBACK] bakeProbes: bakeReflectionBatch=false but existing "
-                "probe file '%s' has no reflection section — refusing to "
-                "produce a pathing-only file. Re-bake with reflection baking "
-                "enabled first.\n",
-                outputPath.c_str());
-            return false;
-        }
-        AUDIO_LOG("Carrying forward reflection section from '%s' "
-                  "(%u probes, %zu payload bytes)\n",
-                  outputPath.c_str(),
-                  carriedReflRecord.probeCount,
-                  carriedReflRecord.payload.size());
-    }
-
-    // Bake the reflection batch (only when not carrying it forward).
+    // Bake the reflection batch. Every bake now runs the full pipeline —
+    // the prior "carry-forward existing reflection record" branch has
+    // been removed along with the --skip-reflection-bake CLI flag.
     ProbeBatchEntry reflEntry;
-    if (params.bakeReflectionBatch) {
-        if (!bakeReflectionBatch(scene, params, spacing, height,
-                                 progress, outputPath, reflEntry)) {
-            return false;
-        }
+    if (!bakeReflectionBatch(scene, params, spacing, height,
+                             progress, outputPath, reflEntry)) {
+        return false;
     }
 
     // Bake the pathing batch (optional). Failure to bake pathing is not
@@ -1199,17 +1143,10 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         return true;
     };
 
-    if (params.bakeReflectionBatch) {
-        if (!appendRecord(reflEntry, "reflections")) {
-            iplProbeBatchRelease(&reflEntry.iplBatch);
-            if (havePathing) iplProbeBatchRelease(&pathEntry.iplBatch);
-            return false;
-        }
-    } else {
-        // Carried-forward record — bytes already validated by loadProbeFile
-        // (CRC check); push it through verbatim so the existing batch is
-        // preserved bit-for-bit.
-        records.push_back(std::move(carriedReflRecord));
+    if (!appendRecord(reflEntry, "reflections")) {
+        iplProbeBatchRelease(&reflEntry.iplBatch);
+        if (havePathing) iplProbeBatchRelease(&pathEntry.iplBatch);
+        return false;
     }
     if (havePathing) {
         if (!appendRecord(pathEntry, "pathing")) {
@@ -1225,15 +1162,9 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     // just lacks positions until the next bake. Reflection batch carries
     // no per-probe radii (uniform spacing radius), so we pass an empty
     // vector and the writer omits the radius column.
-    //
-    // Carry-forward case: leave the existing `.reflections.positions.csv`
-    // sidecar untouched (positions are not in the .probes payload, only
-    // in the sidecar) so the overlay still works on next load.
-    if (params.bakeReflectionBatch) {
-        writePositionsSidecar(outputPath, ".reflections",
-                              reflEntry.positions, reflEntry.radiiFt,
-                              spacing, height);
-    }
+    writePositionsSidecar(outputPath, ".reflections",
+                          reflEntry.positions, reflEntry.radiiFt,
+                          spacing, height);
     if (havePathing) {
         writePositionsSidecar(outputPath, ".pathing",
                               pathEntry.positions, pathEntry.radiiFt,
@@ -1253,14 +1184,11 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         return false;
     }
 
-    const int reflProbeCount = params.bakeReflectionBatch
-        ? reflEntry.probeCount
-        : static_cast<int>(records.front().probeCount);
-    AUDIO_LOG("Saved %d probes (refl=%d%s, pathing=%d) to '%s'\n",
+    const int reflProbeCount = reflEntry.probeCount;
+    AUDIO_LOG("Saved %d probes (refl=%d, pathing=%d) to '%s'\n",
               static_cast<int>(reflProbeCount
                                + (havePathing ? pathEntry.probeCount : 0)),
               reflProbeCount,
-              params.bakeReflectionBatch ? "" : " carried-forward",
               havePathing ? pathEntry.probeCount : 0,
               outputPath.c_str());
 
