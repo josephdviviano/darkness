@@ -270,7 +270,7 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
             "\"scene_type\":\"%s\""
         "},"
         "\"reflections\":{"
-            "\"enabled\":%s,\"ambisonics_order\":%d,\"bake_skip\":%s,"
+            "\"enabled\":%s,\"ambisonics_order\":%d,"
             "\"hybrid_transition_time\":%.4f,\"hybrid_overlap_percent\":%.4f,"
             "\"realtime\":{\"rays\":%d,\"bounces\":%d,\"duration\":%.4f,\"diffuse_samples\":%d},"
             "\"bake\":{\"rays\":%d,\"bounces\":%d,\"duration\":%.4f,\"diffuse_samples\":%d,\"ambisonics_order\":%d}"
@@ -325,7 +325,6 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
         c.convThreads, c.simThreads,
         c.sceneType.c_str(),
         c.realtimeReflections ? "true" : "false", c.ambisonicsOrder,
-        c.reflectionBakeSkip ? "true" : "false",
         c.hybridTransitionTime, c.hybridOverlapPercent,
         c.realtimeNumRays, c.realtimeNumBounces, c.realtimeDuration, c.realtimeDiffuseSamples,
         c.bakeNumRays, c.bakeNumBounces, c.bakeDuration, c.bakeDiffuseSamples, c.bakeAmbisonicsOrder,
@@ -396,7 +395,7 @@ static void printHelp() {
         "\n"
         "USAGE\n"
         "  darknessRender <mission.mis> [--res <path>] [--schemas <path>]\n"
-        "                                [--config <path>] [--skip-reflection-bake]\n"
+        "                                [--config <path>]\n"
         "                                [--force-pathing-bake]\n"
         "                                [--set <yaml.path>=<value>]\n"
         "                                [--perf-label <name>]\n"
@@ -417,21 +416,11 @@ static void printHelp() {
         "  --schemas <path>  Schema directory (.sch / .spc / .arc). Overrides\n"
         "                    paths.schemas; default: search next to RES.\n"
         "  --config <path>   YAML config path. Default: ./darknessRender.yaml.\n"
-        "  --skip-reflection-bake\n"
-        "                    Carry forward the existing .probes reflection section\n"
-        "                    (skip the multi-minute reflection bake; only re-bake\n"
-        "                    pathing). Hard-fails if no reflection section exists.\n"
-        "                    Overrides YAML audio.reflections.bake_skip.\n"
         "  --force-pathing-bake\n"
         "                    Drop the existing .probes pathing section and re-bake\n"
         "                    it fresh even when a valid pathing section is on disk.\n"
-        "                    Symmetric to --skip-reflection-bake; the intended\n"
-        "                    composition is:\n"
-        "                      --skip-reflection-bake --force-pathing-bake\n"
-        "                    which carries reflections forward (skip multi-minute\n"
-        "                    bake) but always re-bakes pathing (seconds). This is\n"
-        "                    the canonical Sweep 2 Phase B invocation —\n"
-        "                    PLAN.AUDIO_PROFILING.md §4.3.\n"
+        "                    Useful when iterating on pathing-bake parameters.\n"
+        "                    See PLAN.AUDIO_PROFILING.md §4.3.\n"
         "  --set <p>=<v>     Generic YAML-path override (repeatable). Applied AFTER\n"
         "                    the YAML load and BEFORE audio init. Supports any\n"
         "                    audio.* leaf — see PLAN.AUDIO_PROFILING.md §1.4.\n"
@@ -4920,7 +4909,6 @@ int main(int argc, char *argv[]) {
         audioSvc->setBakeDuration(cfg.bakeDuration);
         audioSvc->setBakeDiffuseSamples(cfg.bakeDiffuseSamples);
         audioSvc->setBakeAmbisonicsOrder(cfg.bakeAmbisonicsOrder);
-        audioSvc->setReflectionBakeSkip(cfg.reflectionBakeSkip);
         audioSvc->setForcePathingBake(cfg.forcePathingBake);
 
         // -- audio.probes --
@@ -5034,71 +5022,6 @@ int main(int argc, char *argv[]) {
         if (!cfg.noProbes) {
             std::string probePath = Darkness::AudioService::getProbeFilePath(misPath);
 
-            // ── [REFL_SKIP] startup banner ──
-            //
-            // When the user passed --skip-reflection-bake (or set
-            // audio.reflections.bake_skip in YAML), the next bakeProbes()
-            // call will carry the existing reflection section forward
-            // verbatim instead of re-baking it. Emit a loud banner now so
-            // the user sees what's about to happen — silently going from
-            // "bake takes 5 minutes" to "bake takes 5 seconds" without
-            // explanation would be a foot-gun (and per
-            // feedback_no_silent_fallbacks every fallback must announce
-            // itself). We inspect the existing file directly so we can
-            // report probe count + file mtime (as a proxy for the
-            // original bake time — the .probes format does not record a
-            // bake timestamp).
-            if (cfg.reflectionBakeSkip) {
-                Darkness::ProbeFileHeader phdr;
-                std::vector<Darkness::ProbeBatchRecord> precs;
-                Darkness::ProbeFileStatus pst = Darkness::loadProbeFile(probePath, phdr, precs);
-                int reflProbes = 0;
-                bool haveRefl = false;
-                for (const auto &rec : precs) {
-                    if (rec.purpose == static_cast<uint32_t>(
-                            Darkness::ProbePurpose::Reflections)) {
-                        reflProbes = static_cast<int>(rec.probeCount);
-                        haveRefl = true;
-                        break;
-                    }
-                }
-                if (pst == Darkness::ProbeFileStatus::Ok && haveRefl) {
-                    // File mtime as best-effort bake-time proxy.
-                    char timeBuf[64] = "unknown";
-                    struct stat sb;
-                    if (stat(probePath.c_str(), &sb) == 0) {
-                        struct tm tmv;
-                    #ifdef _WIN32
-                        localtime_s(&tmv, &sb.st_mtime);
-                    #else
-                        localtime_r(&sb.st_mtime, &tmv);
-                    #endif
-                        std::strftime(timeBuf, sizeof(timeBuf),
-                                      "%Y-%m-%d %H:%M", &tmv);
-                    }
-                    std::fprintf(stderr,
-                        "[REFL_SKIP] reflection bake disabled — carrying forward existing reflection section\n"
-                        "            from %s (%d probes, baked %s)\n"
-                        "[REFL_SKIP] If you've moved geometry, audible reflections will be STALE until you\n"
-                        "            rebuild with --skip-reflection-bake removed.\n",
-                        probePath.c_str(), reflProbes, timeBuf);
-                } else {
-                    // No existing file (or no reflection section). The
-                    // bake itself will hard-fail later with the same
-                    // [FALLBACK] verbiage from ProbeManager; this early
-                    // warning gives the user a chance to ^C before the
-                    // bake even starts.
-                    std::fprintf(stderr,
-                        "[REFL_SKIP] reflection bake disabled but existing .probes file '%s' is missing\n"
-                        "            or lacks a reflection section (status=%s, refl_section=%s).\n"
-                        "[REFL_SKIP] bakeProbes() will REFUSE to produce a pathing-only file — re-bake\n"
-                        "            with --skip-reflection-bake removed first.\n",
-                        probePath.c_str(),
-                        Darkness::probeFileStatusString(pst),
-                        haveRefl ? "yes" : "no");
-                }
-            }
-
             if (!audioSvc->loadProbes(probePath)) {
                 // No baked probes — need to bake.
                 // This is done BEFORE the render loop starts, so we can use
@@ -5111,28 +5034,18 @@ int main(int argc, char *argv[]) {
                 // loadProbes() succeeded against the existing .probes file
                 // BUT the user passed --force-pathing-bake — schedule a
                 // bake anyway so the pathing section is regenerated fresh.
-                // The bake invocation respects --skip-reflection-bake (via
-                // mReflectionBakeSkip → ProbeBakeParams::bakeReflectionBatch),
-                // so the canonical Sweep 2 Phase B composition
-                //   --skip-reflection-bake --force-pathing-bake
-                // carries reflection bytes forward and re-bakes pathing
-                // fresh in seconds. See PLAN.AUDIO_PROFILING.md §4.3.
+                // Every bake runs both pathing and reflections now; the
+                // prior --skip-reflection-bake escape hatch is gone.
                 //
                 // Loud banner per feedback_no_silent_fallbacks — going
                 // from "load probes (instant)" to "load probes then bake
-                // for ~minutes (or ~seconds if --skip-reflection-bake)"
-                // is a surprise without warning. The banner makes the
-                // mode shift unmissable.
+                // for ~minutes" is a surprise without warning.
                 std::fprintf(stderr,
                     "[PATHING_BAKE_FORCE] --force-pathing-bake: existing .probes "
-                    "file '%s' loaded successfully, but the pathing section\n"
-                    "                     will be re-baked anyway. Reflection "
-                    "section will be %s.\n",
-                    probePath.c_str(),
-                    cfg.reflectionBakeSkip
-                        ? "CARRIED FORWARD (--skip-reflection-bake)"
-                        : "RE-BAKED (multi-minute; pass --skip-reflection-bake "
-                          "to carry forward)");
+                    "file '%s' loaded successfully, but the pathing AND\n"
+                    "                     reflection sections will be re-baked "
+                    "(multi-minute).\n",
+                    probePath.c_str());
                 state.probeBakePath = probePath;
                 state.probeBakeNeeded = true;
             }
@@ -6404,9 +6317,8 @@ int main(int argc, char *argv[]) {
     // Seed auto-fly probe-tour from CLI flags. Lazy activation happens on
     // the first updateMovement() tick (needs a live camera position to do
     // N-nearest probe selection, and the probe set may not be loaded yet
-    // here when --skip-reflection-bake is off and the bake is still in
-    // progress). Tick the auto_fly console toggle to interactively start
-    // / stop without restarting.
+    // here while the bake is still in progress). Tick the auto_fly
+    // console toggle to interactively start / stop without restarting.
     state.autoFly.speed             = cfg.autoFlySpeed;
     state.autoFly.waypointCount     = cfg.autoFlyWaypoints;
     state.autoFly.seed              = cfg.autoFlySeed;

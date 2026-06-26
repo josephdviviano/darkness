@@ -406,10 +406,14 @@ private:
             // quaternion round-trip that can produce mirrored Euler angles.
             initDoorBaseTransform(door, propSvc, id);
 
-            // Compute hinge pivot offset from model bounding box.
-            if (doorType == kDoorRotating) {
-                computePivotOffset(door, propSvc, id);
-            }
+            // Populate door.edgeLengths (always needed for the audio
+            // occlusion OBB — registerDoorGeometry skips doors with
+            // zero edgeLengths) and, for rotating doors only, compute
+            // the hinge pivot offset. Previously this call was gated
+            // on `doorType == kDoorRotating`, which silently denied
+            // every TransDoor (portcullises, sliding gates, secret
+            // slabs) an audio OBB — see MISS6 doors 34, 35, 705, 895.
+            populateOBBAndPivot(door, propSvc, id);
 
             // Check if this door is in the render array (= has a .bin model).
             // Dark Engine doors are typically TERRAIN BRUSHES — part of the
@@ -574,15 +578,21 @@ private:
         }
     }
 
-    /// Compute the COG (pivot) offset for a rotating door.
-    /// Matches the Dark Engine algorithm in doorphys.cpp UpdateDoorPhysics:
-    ///   If COG is zero, compute from OBB edge lengths:
-    ///     axis 0 or 1 (X/Y rotation): cog.z = edgeLengths.z / 2
-    ///     axis 2      (Z rotation):   cog.x = edgeLengths.x / 2
-    /// This places the COG at the center of the door slab, so that rotation
-    /// around the model origin (hinge) correctly arcs the visual center.
-    void computePivotOffset(DoorState &door, PropertyService *propSvc,
-                             int32_t objID) {
+    /// Populate `door.edgeLengths` from P$PhysDims (or fall back to the
+    /// model bbox) and, for rotating doors only, derive the hinge
+    /// pivot offset from those edges. Called for EVERY door regardless
+    /// of type — translating doors need the edges for the audio
+    /// occlusion OBB (registerDoorGeometry skips zero-edge doors), even
+    /// though they ignore the pivot.
+    ///
+    /// Pivot computation matches the Dark Engine algorithm in
+    /// doorphys.cpp UpdateDoorPhysics: if COG is zero, derive from OBB
+    /// edge lengths so the rotating slab arcs around the hinge edge
+    /// rather than the model center:
+    ///   axis 0 or 1 (X/Y rotation): cog.z = edgeLengths.z / 2
+    ///   axis 2      (Z rotation):   cog.x = edgeLengths.x / 2
+    void populateOBBAndPivot(DoorState &door, PropertyService *propSvc,
+                              int32_t objID) {
         // Try P$PhysDims for explicit OBB dimensions
         PropPhysDims dims;
         Vector3 edgeLengths(0.0f);
@@ -594,7 +604,7 @@ private:
         // Apply door.baseScale since PhysDims.size already includes scale
         // but raw model bbox dimensions do not.
         if (glm::length(edgeLengths) < 0.01f) {
-            std::fprintf(stderr, "[FALLBACK] DoorSystem::computePivotOffset: door %d has no P$PhysDims size, trying model bbox\n", objID);
+            std::fprintf(stderr, "[FALLBACK] DoorSystem::populateOBBAndPivot: door %d has no P$PhysDims size, trying model bbox\n", objID);
         }
         if (glm::length(edgeLengths) < 0.01f && mParsedModels) {
             // Look up model name
@@ -613,23 +623,28 @@ private:
         }
 
         if (glm::length(edgeLengths) < 0.01f) {
-            std::fprintf(stderr, "[DEFAULT] DoorSystem::computePivotOffset: door %d has no PhysDims AND no model bbox — pivotOffset will be zero!\n", objID);
+            std::fprintf(stderr, "[DEFAULT] DoorSystem::populateOBBAndPivot: door %d has no PhysDims AND no model bbox — edgeLengths will be zero (audio OBB skipped, pivot at origin)!\n", objID);
         }
 
         // Cache the OBB dimensions for downstream consumers (e.g. audio
         // geometry registration). Already in final post-scale world size.
         door.edgeLengths = edgeLengths;
 
-        // Compute COG offset matching the Dark Engine convention
+        // Pivot offset is only meaningful for rotating doors — translating
+        // doors slide along an axis from the model origin and never
+        // consult pivotOffset (see applyDoorTransform's translating
+        // branch, which uses door.currentValue directly).
         door.pivotOffset = Vector3(0.0f);
-        switch (door.axis) {
-        case 0:  // X rotation
-        case 1:  // Y rotation
-            door.pivotOffset.z = -edgeLengths.z / 2.0f;
-            break;
-        case 2:  // Z rotation (most common for doors)
-            door.pivotOffset.x = -edgeLengths.x / 2.0f;
-            break;
+        if (door.type == kDoorRotating) {
+            switch (door.axis) {
+            case 0:  // X rotation
+            case 1:  // Y rotation
+                door.pivotOffset.z = -edgeLengths.z / 2.0f;
+                break;
+            case 2:  // Z rotation (most common for doors)
+                door.pivotOffset.x = -edgeLengths.x / 2.0f;
+                break;
+            }
         }
 
         // Log bbox using model name from ObjectPlacement data
