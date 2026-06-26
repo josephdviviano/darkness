@@ -417,10 +417,11 @@ static bool loadMissionData(const char *misPath,
 // Parses TXLIST, loads world textures from fam.crf, water flow textures,
 // and skybox face textures. All images stored in mission for later GPU upload.
 static void loadWorldTextures(const char *misPath, const std::string &resPath,
-                              Darkness::MissionData &mission)
+                              Darkness::MissionData &mission,
+                              Darkness::BuiltMeshes &meshes)
 {
     // Parse TXLIST if in textured mode (skip if already parsed early for acoustics)
-    if (mission.texturedMode && mission.txList.textures.empty()) {
+    if (meshes.texturedMode && mission.txList.textures.empty()) {
         try {
             mission.txList = Darkness::parseTXList(misPath);
             std::fprintf(stderr, "TXLIST: %zu textures, %zu families\n",
@@ -428,13 +429,13 @@ static void loadWorldTextures(const char *misPath, const std::string &resPath,
         } catch (const std::exception &e) {
             std::fprintf(stderr, "Failed to parse TXLIST: %s (falling back to flat)\n",
                          e.what());
-            mission.texturedMode = false;
+            meshes.texturedMode = false;
         }
     }
 
     // Collect unique texture indices used by world geometry
     std::unordered_set<uint8_t> usedTextures;
-    if (mission.texturedMode) {
+    if (meshes.texturedMode) {
         for (const auto &cell : mission.wrData.cells) {
             for (int pi = 0; pi < cell.numTextured; ++pi) {
                 uint8_t txt = cell.texturing[pi].txt;
@@ -448,11 +449,11 @@ static void loadWorldTextures(const char *misPath, const std::string &resPath,
     }
 
     // Load world textures from fam.crf (indexed by TXLIST)
-    if (mission.texturedMode) {
+    if (meshes.texturedMode) {
         Darkness::CRFTextureLoader loader(resPath);
         if (!loader.isOpen()) {
             std::fprintf(stderr, "CRF not available, falling back to flat shading\n");
-            mission.texturedMode = false;
+            meshes.texturedMode = false;
         } else {
             int loaded = 0;
             for (uint8_t idx : usedTextures) {
@@ -472,7 +473,7 @@ static void loadWorldTextures(const char *misPath, const std::string &resPath,
     // FLOW_TEX name field (e.g. "gr") maps to "water/<name>in.PCX" for the
     // air-side texture and "water/<name>out.PCX" for the underwater side.
     // Keyed by flow group index (1-255).
-    if (mission.texturedMode && mission.flowData.hasFlowTex) {
+    if (meshes.texturedMode && mission.flowData.hasFlowTex) {
         Darkness::CRFTextureLoader loader(resPath);
         if (loader.isOpen()) {
             // Collect unique flow groups used by cells
@@ -530,7 +531,7 @@ static void loadWorldTextures(const char *misPath, const std::string &resPath,
     // Load skybox face textures (old sky system).
     // Missions without SKYOBJVAR use a textured skybox with per-mission PCX
     // textures in fam.crf under skyhw/ (e.g. skyhw/miss6n.PCX for north face).
-    if (mission.texturedMode) {
+    if (meshes.texturedMode) {
         Darkness::CRFTextureLoader skyLoader(resPath);
         if (skyLoader.isOpen()) {
             // 5 faces: n=north(+Y), s=south(-Y), e=east(+X), w=west(-X), t=top(+Z)
@@ -546,9 +547,9 @@ static void loadWorldTextures(const char *misPath, const std::string &resPath,
                 }
             }
             // Skybox available if at least the 4 side faces loaded (top optional)
-            mission.hasSkybox = mission.skyboxImages.count("n") && mission.skyboxImages.count("s")
+            meshes.hasSkybox = mission.skyboxImages.count("n") && mission.skyboxImages.count("s")
                      && mission.skyboxImages.count("e") && mission.skyboxImages.count("w");
-            if (mission.hasSkybox) {
+            if (meshes.hasSkybox) {
                 std::fprintf(stderr, "Skybox: loaded %d/5 faces for %s (textured skybox active)\n",
                              loaded, mission.missionName.c_str());
                 for (auto &kv : mission.skyboxImages) {
@@ -910,7 +911,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
 
     // ── Build lightmap atlas (if textured mode) ──
 
-    if (mission.texturedMode) {
+    if (meshes.texturedMode) {
         gpu.lmAtlasSet = Darkness::buildLightmapAtlases(mission.wrData);
         if (!gpu.lmAtlasSet.atlases.empty()) {
             meshes.lightmappedMode = true;
@@ -1026,7 +1027,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
         if (!gpu.flowTextureHandles.empty()) {
             std::fprintf(stderr, "Created %zu flow water GPU textures\n", gpu.flowTextureHandles.size());
         }
-    } else if (mission.texturedMode) {
+    } else if (meshes.texturedMode) {
         meshes.worldMesh = buildTexturedMesh(mission.wrData, mission.texDims);
         centroidX = meshes.worldMesh.cx; centroidY = meshes.worldMesh.cy; centroidZ = meshes.worldMesh.cz;
 
@@ -1292,7 +1293,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
 
     // ── Create textured skybox GPU buffers (old sky system) ──
 
-    if (mission.hasSkybox) {
+    if (meshes.hasSkybox) {
         meshes.skyboxCube = buildSkyboxCube();
 
         gpu.skyboxVBH = bgfx::createVertexBuffer(
@@ -1331,7 +1332,7 @@ static void initRuntimeState(
 {
     // Render mode description for title bar
     state.modeStr = meshes.lightmappedMode ? "lightmapped" :
-                    mission.texturedMode ? "textured" : "flat-shaded";
+                    meshes.texturedMode ? "textured" : "flat-shaded";
     std::fprintf(stderr, "Render window opened (%dx%d, %s, %s)\n",
                  WINDOW_WIDTH, WINDOW_HEIGHT,
                  bgfx::getRendererName(bgfx::getRendererType()), state.modeStr);

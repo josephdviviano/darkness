@@ -99,6 +99,17 @@ struct GPULightArray {
 // 1 = visible (contributes), 0 = occluded by world geometry. Cleared and
 // rebuilt when the object's cell changes or it moves more than the polling
 // epsilon.
+//
+// INVARIANT: this cache is correct only because `locationSeesLight` calls
+// `raycastWorld(WRParsedData, ...)` — which only consults static WR (BSP)
+// geometry, never dynamic objects (doors, moving platforms, props). WR is
+// immutable for the lifetime of a mission, so once the cache reflects a
+// given (cell, pos) pair it stays valid until either changes. If a future
+// change extends visibility raycasts to consider dynamic occluders (e.g.
+// "doors should occlude static lights"), the producer of that change MUST
+// invalidate every affected entry — otherwise an open door's shadow will
+// persist on nearby objects until they happen to move >0.05u or cross a
+// cell boundary. Add an explicit `invalidate(objId)` API at that time.
 struct ShadowCache {
     int32_t  cellId    = -1;            // last known cell, -1 = invalid
     Vector3  pos       = Vector3(0.0f); // last evaluated position
@@ -166,12 +177,6 @@ public:
     }
 
     void clear() { mCache.clear(); }
-
-    // Drop the cache entry for one object; safe to call even if the object
-    // has never been evaluated. Future invalidation hooks (Phase 5) call this
-    // when an object's position is mutated by gameplay (door open, tweq,
-    // platform move, frob grab/release).
-    void invalidate(int32_t objId) { mCache.erase(objId); }
 
     // Compute the per-object RGB tint at `pos` for object `objId`. `radius`
     // is half the largest extent of the object's bounding box (only used to

@@ -163,42 +163,13 @@ struct RenderConfig {
     // which only affects the dense reflection batch.
     float audioPathingDedupRadiusFt = 10.0f;
 
-    // Skip the multi-minute reflection bake on next bakeProbes(); load
-    // the existing .probes batch (preserving reflection IRs verbatim)
-    // and re-run only iplPathBakerBake on top of it. Reflection IRs go
-    // stale by definition — startup + per-30s [REFL_SKIP] reminders
-    // surface this loudly. Hard-fails (no silent fallback) when the
-    // existing file is missing / corrupt / has no reflection data.
-    // YAML key: audio.reflections.bake_skip. CLI: --skip-reflection-bake
-    // (overrides YAML). Default false. See PLAN.PROBE_DEBUG_TOOLING.md
-    // Capability B.
-    bool reflectionBakeSkip = false;
-
     // Force a fresh pathing bake even when the existing .probes file
-    // already contains a valid pathing section. Symmetric with
-    // `reflectionBakeSkip`: where that one CARRIES FORWARD the existing
-    // reflection bytes to skip the expensive bake, this one DROPS the
-    // existing pathing bytes to force a fresh bake.
+    // already contains a valid pathing section. Useful for iterating on
+    // pathing-bake parameters (e.g. dedup radius) without invalidating
+    // the rest of the .probes file's parametric data.
     //
-    // The intended composition is:
-    //   --skip-reflection-bake --force-pathing-bake
-    // which loads the existing .probes file, carries the reflection
-    // section forward verbatim, and runs only the pathing bake fresh.
-    // This is the canonical Sweep 2 Phase B invocation
-    // (PLAN.AUDIO_PROFILING.md §4.3) — iterating across
-    // `pathing_probes.dedup_radius_ft` values without paying the
-    // multi-minute reflection cost on every iteration.
-    //
-    // Without `--skip-reflection-bake`, this flag still re-bakes pathing
-    // BUT will also re-bake reflections (since bakeReflectionBatch
-    // defaults to true). That's the "rebake everything but force re-do
-    // pathing even if .probes already had pathing" case — useful for
-    // baking from scratch with the pathing-bake portion's caches/state
-    // explicitly invalidated.
-    //
-    // No YAML key by design — this is a per-invocation override,
-    // matching the per-invocation nature of a sweep iteration. Default
-    // false. See PLAN.AUDIO_PROFILING.md §4.3 (Sweep 2 Phase B).
+    // Default false. No YAML key by design — this is a per-invocation
+    // override. See PLAN.AUDIO_PROFILING.md §4.3.
     bool forcePathingBake = false;
 
     // -- audio.occlusion: occlusion + material scaling --
@@ -585,7 +556,12 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
 
                 if (refl["type"]) std::fprintf(stderr, "[FALLBACK] darknessRender.yaml: 'reflections.type' is deprecated and ignored — HYBRID mode is now the only supported reflection algorithm\n");
                 if (refl["bake_skip"]) {
-                    cfg.reflectionBakeSkip = refl["bake_skip"].as<bool>();
+                    std::fprintf(stderr,
+                        "[FALLBACK] darknessRender.yaml: "
+                        "'audio.reflections.bake_skip' is deprecated and "
+                        "ignored — reflection bake is no longer skippable; "
+                        "every bake runs both pathing and reflection sections. "
+                        "Remove the key from your YAML.\n");
                 }
                 if (refl["hybrid_transition_time"]) {
                     cfg.hybridTransitionTime = refl["hybrid_transition_time"].as<float>();
@@ -1169,7 +1145,11 @@ inline bool applySetOverride(const std::string& path, const std::string& valueSt
         cfg.ambisonicsOrder = clampI(v, 0, 3); return true;
     }
     if (path == "audio.reflections.bake_skip") {
-        return toBool(cfg.reflectionBakeSkip);
+        std::fprintf(stderr,
+            "[FALLBACK] applySetOverride: 'audio.reflections.bake_skip' "
+            "is deprecated and ignored — reflection bake is no longer "
+            "skippable.\n");
+        return true;
     }
     if (path == "audio.reflections.hybrid_transition_time") {
         float v; if (!toFloat(v)) return false;
@@ -1448,7 +1428,6 @@ inline bool isPerfLabelValid(const std::string& s) {
 //   --res <path>       runtime asset directory (overrides paths.res)
 //   --schemas <path>   schema directory (overrides paths.schemas)
 //   --config <path>    YAML path (defaults to ./darknessRender.yaml)
-//   --skip-reflection-bake  carry forward existing reflection IRs
 //   --force-pathing-bake    drop existing pathing section + re-bake it
 //   --set <p>=<v>      generic YAML-path override; repeatable
 //   --perf-label <s>   tag the per-run audio_perf.jsonl directory
@@ -1476,12 +1455,17 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
         } else if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             cli.configPath = argv[++i];
         } else if (std::strcmp(argv[i], "--skip-reflection-bake") == 0) {
-            cfg.reflectionBakeSkip = true;
+            // Deprecated CLI flag — reflection bake is no longer
+            // skippable; every probe-bake-needed path runs the full bake
+            // (pathing + reflections).
+            std::fprintf(stderr,
+                "[FALLBACK] --skip-reflection-bake is deprecated and "
+                "ignored — reflection bake is no longer skippable. "
+                "Remove the flag from your invocation.\n");
         } else if (std::strcmp(argv[i], "--force-pathing-bake") == 0) {
-            // Symmetric escape hatch to --skip-reflection-bake. Composes
-            // with it: --skip-reflection-bake --force-pathing-bake means
-            // carry reflection bytes forward, re-bake only the pathing
-            // section. See PLAN.AUDIO_PROFILING.md §4.3 (Sweep 2 Phase B).
+            // Force a fresh pathing bake even when the existing .probes
+            // file already has a valid pathing section. See
+            // PLAN.AUDIO_PROFILING.md §4.3.
             cfg.forcePathingBake = true;
         } else if (std::strcmp(argv[i], "--set") == 0 && i + 1 < argc) {
             // --set audio.foo.bar=value  (yaml-dotted-path=leaf)

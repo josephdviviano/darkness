@@ -92,7 +92,6 @@ struct MissionData {
     SkyParams                                         skyParams;
     SkyDome                                           skyDome;
     std::unordered_map<std::string, DecodedImage>     skyboxImages;
-    bool                                              hasSkybox = false;
 
     // Fog
     FogParams                                         fogParams;
@@ -130,7 +129,6 @@ struct MissionData {
     // Mission metadata
     SpawnInfo                                         spawnInfo;
     std::string                                       missionName;
-    bool                                              texturedMode = false;
 };
 
 // ── BuiltMeshes — CPU mesh data between parsing and GPU upload ──
@@ -144,8 +142,15 @@ struct BuiltMeshes {
     FlatMesh          flatMesh;
     WorldMesh         waterMesh;
     SkyboxCube        skyboxCube;
+    // Sole owners of "which mesh path do we draw" flags. Set during init
+    // as data and resources resolve (texturedMode and hasSkybox flip from
+    // their defaults when textures / skybox faces successfully load).
+    // Previously mirrored across MissionData + RuntimeState; consolidated
+    // so a flag flip can't go out of sync between the three structs.
     bool              lightmappedMode = false;
-    bool              hasWater = false;
+    bool              texturedMode    = false;
+    bool              hasWater        = false;
+    bool              hasSkybox       = false;
 };
 
 // ── GPUResources — All bgfx handles ──
@@ -249,12 +254,6 @@ struct RuntimeState {
     float uvDistortion = 1.0f;
     float waterRotation = 1.0f;
     float waterScrollSpeed = 1.0f;
-
-    // Render mode flags (set during init, read in loop)
-    bool lightmappedMode = false;
-    bool texturedMode = false;
-    bool hasWater = false;
-    bool hasSkybox = false;
 
     // Per-object lighting (Dark Engine convention: ambient + cell-light-list
     // sum + sun + P$ExtraLight). When disabled, objects render at their
@@ -515,6 +514,28 @@ struct RuntimeState {
     // first tick after `enabled` becomes true so we can read the live
     // camera position as the "from" point for N-nearest probe selection.
     AutoFlyTour autoFly;
+
+    // ── Debug overlay gate ──
+    // Used by renderDebugOverlay() to short-circuit the per-frame view-2
+    // setup when no overlay is enabled. MUST list every `show*` boolean
+    // that drives a top-level `if (state.show...)` branch inside
+    // renderDebugOverlay — omitting one silently requires another overlay
+    // to be on first (the wireframe appears only when paired with whatever
+    // other show flag did make the gate). showPos lives outside the gate
+    // because it renders via the outer dbgTextPrintf path, not view 2.
+    bool anyDebugOverlayActive() const {
+        return showRaycast
+            || showAcousticMesh
+            || showDoorGeometry
+            || showAcousticHit
+            || showRooms
+            || showPortals
+            || showVPos
+            || showProbes
+            || showProbeRadius
+            || showPathingGraph
+            || showVoiceArrows;
+    }
 };
 
 // ── FrameContext — Per-frame computed values ──
@@ -524,7 +545,6 @@ struct RuntimeState {
 struct FrameContext {
     float proj[16];
     float view[16];
-    float skyView[16];
     float fogColorArr[4];
     float fogOnArr[4];
     float fogOffArr[4];

@@ -429,6 +429,8 @@ audio:
     reflection_demote_hysteresis_frames: 600
     reverb_threads: 8
     reverb_threads_conv_share: 0.5
+  reflections:
+    bake_skip: true
 )");
     Darkness::RenderConfig cfg;
     REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
@@ -437,6 +439,8 @@ audio:
     CHECK(cfg.reverbVoicesRealtime == 0);
     CHECK(cfg.convThreads          == 0);
     CHECK(cfg.simThreads           == 0);
+    // bake_skip is gone — yaml load is a no-op (no field to assert against).
+    // The stderr [FALLBACK] warn is the user-visible signal.
 }
 
 // Q3 — per-voice spatialBlend override for AMB_ENVIRONMENTAL ambients.
