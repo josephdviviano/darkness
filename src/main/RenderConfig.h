@@ -353,6 +353,21 @@ struct RenderConfig {
     int         autoFlyWaypoints    = 50;        // --auto-fly-waypoints
     uint32_t    autoFlySeed         = 0xC0FFEEu; // --auto-fly-seed
     float       autoFlyPauseSec     = 0.0f;      // --auto-fly-pause-sec
+
+    // -- audio capture point (spin-in-place acoustic probe) --
+    // --audio-capture x,y,z pins the listener at a fixed world point
+    // (Dark Engine feet, Z-up), forces physics off, enables audio_log, and
+    // spins the camera in place for `audioCaptureSeconds` completing
+    // `audioCaptureRotations` full turns before exiting cleanly. Lets us do a
+    // full-azimuth Steam Audio capture at a chosen point with no manual
+    // navigation. See src/main/AudioCaptureSpin.h. Mutually exclusive with
+    // --auto-fly (capture wins if both are given).
+    bool        audioCapture          = false;   // --audio-capture x,y,z
+    float       audioCaptureX         = 0.0f;     // target X
+    float       audioCaptureY         = 0.0f;     // target Y
+    float       audioCaptureZ         = 0.0f;     // target Z
+    float       audioCaptureSeconds   = 15.0f;    // --audio-capture-seconds
+    float       audioCaptureRotations = 3.0f;     // --audio-capture-rotations
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -1437,6 +1452,9 @@ inline bool isPerfLabelValid(const std::string& s) {
 //   --auto-fly-waypoints N    N-nearest probes to visit (default 50)
 //   --auto-fly-seed N         shuffle seed (default 0xC0FFEE)
 //   --auto-fly-pause-sec N    dwell per waypoint (default 0)
+//   --audio-capture x,y,z     pin listener at a point, spin in place, exit
+//   --audio-capture-seconds N capture window length (default 15)
+//   --audio-capture-rotations N full yaw turns over the window (default 3)
 //   --help / -h        print usage
 //
 // Unknown flags are reported but otherwise ignored — when a removed flag
@@ -1547,6 +1565,42 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                     "[FALLBACK] --auto-fly-pause-sec: non-numeric value "
                     "'%s' — keeping default %.2f\n",
                     argv[i], cfg.autoFlyPauseSec);
+            }
+        } else if (std::strcmp(argv[i], "--audio-capture") == 0 && i + 1 < argc) {
+            // --audio-capture x,y,z — pin the listener at a world point and
+            // spin in place for a hands-free acoustic capture. Parsed as a
+            // single comma-separated arg so the position is one shell token.
+            float x = 0.0f, y = 0.0f, z = 0.0f;
+            if (std::sscanf(argv[++i], "%f,%f,%f", &x, &y, &z) == 3) {
+                cfg.audioCapture  = true;
+                cfg.audioCaptureX = x;
+                cfg.audioCaptureY = y;
+                cfg.audioCaptureZ = z;
+            } else {
+                std::fprintf(stderr,
+                    "[FALLBACK] --audio-capture: could not parse '%s' as "
+                    "x,y,z (e.g. --audio-capture 12.5,-45,-47) — capture "
+                    "disabled\n", argv[i]);
+            }
+        } else if (std::strcmp(argv[i], "--audio-capture-seconds") == 0 && i + 1 < argc) {
+            try {
+                cfg.audioCaptureSeconds = std::stof(argv[++i]);
+                if (cfg.audioCaptureSeconds < 0.1f) cfg.audioCaptureSeconds = 0.1f;
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --audio-capture-seconds: non-numeric value "
+                    "'%s' — keeping default %.1f\n",
+                    argv[i], cfg.audioCaptureSeconds);
+            }
+        } else if (std::strcmp(argv[i], "--audio-capture-rotations") == 0 && i + 1 < argc) {
+            try {
+                cfg.audioCaptureRotations = std::stof(argv[++i]);
+                if (cfg.audioCaptureRotations < 0.0f) cfg.audioCaptureRotations = 0.0f;
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --audio-capture-rotations: non-numeric value "
+                    "'%s' — keeping default %.1f\n",
+                    argv[i], cfg.audioCaptureRotations);
             }
         } else if (argv[i][0] != '-' && !cli.misPath) {
             // First non-flag argument is the mission file
