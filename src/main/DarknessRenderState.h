@@ -56,6 +56,7 @@
 #include "ObjectIllumination.h"
 #include "DynamicLightList.h"
 #include "AutoFlyTour.h"
+#include "AudioCaptureSpin.h"
 #include "physics/DarkPhysics.h"
 
 namespace Darkness {
@@ -514,6 +515,15 @@ struct RuntimeState {
     // first tick after `enabled` becomes true so we can read the live
     // camera position as the "from" point for N-nearest probe selection.
     AutoFlyTour autoFly;
+
+    // ── Audio capture-point spin state ──
+    // Pins the listener at a fixed world point and rotates the camera in
+    // place for a hands-free, full-azimuth Steam Audio capture (see
+    // AudioCaptureSpin.h). Seeded from RenderConfig's --audio-capture flags
+    // at startup; teleports + arms on the first updateMovement tick and
+    // requests a clean program exit when the spin completes. Takes
+    // precedence over autoFly when both are requested.
+    AudioCaptureSpin audioCapture;
 
     // ── Debug overlay gate ──
     // Used by renderDebugOverlay() to short-circuit the per-frame view-2

@@ -404,6 +404,9 @@ static void printHelp() {
         "                                [--auto-fly-waypoints <N>]\n"
         "                                [--auto-fly-seed <N>]\n"
         "                                [--auto-fly-pause-sec <N>]\n"
+        "                                [--audio-capture <x,y,z>]\n"
+        "                                [--audio-capture-seconds <N>]\n"
+        "                                [--audio-capture-rotations <N>]\n"
         "                                [-h | --help]\n"
         "\n"
         "  All other tunables live in the YAML config (default: ./darknessRender.yaml).\n"
@@ -448,6 +451,16 @@ static void printHelp() {
         "  --auto-fly-seed N         PRNG seed for visit-order shuffle (default\n"
         "                            0xC0FFEE). Accepts decimal or 0xHEX.\n"
         "  --auto-fly-pause-sec N    Dwell time per waypoint (default 0).\n"
+        "  --audio-capture x,y,z\n"
+        "                    Pin the listener at a fixed world point (Dark Engine\n"
+        "                    feet, Z-up), force fly mode, enable audio_log, spin the\n"
+        "                    camera in place, then exit cleanly. Hands-free,\n"
+        "                    full-azimuth Steam Audio analysis at one point — no\n"
+        "                    manual navigation. Emits [AUDIO_CAPTURE] stderr lines.\n"
+        "                    Takes precedence over --auto-fly.\n"
+        "                    Example: --audio-capture 12.5,-45,-47\n"
+        "  --audio-capture-seconds N   Capture window length in seconds (default 15).\n"
+        "  --audio-capture-rotations N Full yaw turns over the window (default 3).\n"
         "  -h, --help        Show this message and exit.\n"
         "\n"
         "YAML CONFIG REFERENCE (defaults shown; see darknessRender.example.yaml)\n"
@@ -572,7 +585,7 @@ static void renderSky(
         bgfx::setUniform(gpu.u_objectLight, whiteLight);
     };
 
-    if (mission.hasSkybox && bgfx::isValid(gpu.skyboxVBH)) {
+    if (meshes.hasSkybox && bgfx::isValid(gpu.skyboxVBH)) {
         // Textured skybox (old sky system) — render each face with its texture
         for (const auto &face : meshes.skyboxCube.faces) {
             auto texIt = gpu.skyboxTexHandles.find(face.key);
@@ -657,7 +670,7 @@ static void renderWorld(
                 }
             }
         }
-    } else if (mission.texturedMode) {
+    } else if (meshes.texturedMode) {
         for (const auto &grp : meshes.worldMesh.groups) {
             if (!isCellVisible(grp.cellID)) continue;
 
@@ -3812,6 +3825,31 @@ static void updateMovement(
     const Darkness::MissionData &mission,
     const Darkness::DebugConsole &dbgConsole)
 {
+    // ── Audio capture-point spin ──
+    // Pins the listener at a fixed world point and rotates the camera in
+    // place for a hands-free, full-azimuth Steam Audio capture. Forces fly
+    // mode (the physics integrator owns camera position otherwise), teleports
+    // on the first tick (so the spawn has settled first), and requests a clean
+    // exit when the spin completes. Checked before auto-fly so --audio-capture
+    // wins if both are somehow requested.
+    if (state.audioCapture.enabled) {
+        if (state.physicsMode) {
+            state.physicsMode = false;
+            std::fprintf(stderr,
+                "[AUDIO_CAPTURE] forcing physics_mode off (capture pins the "
+                "listener and drives the camera directly)\n");
+        }
+        if (!state.audioCapture.active) {
+            state.audioCapture.begin(state.cam.pos, state.cam.yaw,
+                                     state.cam.pitch, state.cam.roll);
+        }
+        const bool done = state.audioCapture.tick(
+            dt, state.cam.pos, state.cam.yaw,
+            state.cam.pitch, state.cam.roll);
+        if (done) state.running = false;
+        return;
+    }
+
     // ── Auto-fly probe-tour ──
     // Runs unconditionally when enabled (even with the debug console open
     // — the whole point is unattended sweep iterations). Forces fly mode
@@ -4506,6 +4544,13 @@ int main(int argc, char *argv[]) {
     // All CPU-side parsed mission content and mutable runtime state.
     Darkness::MissionData mission;
     Darkness::RuntimeState state;
+    // CPU-side mesh data + the sole owner of the render-mode flags
+    // (texturedMode / hasSkybox / hasWater / lightmappedMode). Declared here
+    // — beside `mission` — rather than just before SDL init because those
+    // flags are set during early mission load (texturedMode below) and read
+    // throughout init; the GPU upload that consumes the meshes still happens
+    // later, after the world data is parsed.
+    Darkness::BuiltMeshes meshes;
 
     // Unpack mutable config into state structs.
     // Resource paths: CLI flag overrides paths.* in YAML if both are present.
@@ -4549,7 +4594,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
-    mission.texturedMode = true;
+    meshes.texturedMode = true;
 
     // ── Initialize logging (required before ServiceManager) ──
     // Register a stderr listener and run at INFO level so audio + service
@@ -4719,7 +4764,7 @@ int main(int argc, char *argv[]) {
     // Parse TXLIST early — needed by the acoustic mesh builder for material
     // keyword matching. The full texture loading (CRF I/O, GPU upload) happens
     // later in loadWorldTextures(), but we need the texture name strings now.
-    if (mission.texturedMode && mission.txList.textures.empty()) {
+    if (meshes.texturedMode && mission.txList.textures.empty()) {
         try {
             mission.txList = Darkness::parseTXList(misPath);
             std::fprintf(stderr, "TXLIST (early parse for acoustics): %zu textures\n",
@@ -5368,7 +5413,7 @@ int main(int argc, char *argv[]) {
     state.scriptManager = &scriptManager;
 
     // ── Load world textures: TXLIST, fam.crf textures, flow textures, skybox ──
-    loadWorldTextures(misPath, resPath, mission);
+    loadWorldTextures(misPath, resPath, mission, meshes);
 
     // ── Build per-texture friction table from P$Friction on texture archetypes ──
     // The original engine maps each TXLIST texture index to a "t_fam/<family>/<name>"
@@ -5690,8 +5735,9 @@ int main(int argc, char *argv[]) {
     }
 
     // ── SDL2 + bgfx init ──
+    // (BuiltMeshes `meshes` is declared earlier, beside `mission`, so the
+    // render-mode flags it owns are available during mission load.)
     Darkness::GPUResources gpu;
-    Darkness::BuiltMeshes meshes;
 
     // state.skyClearColor set by initWindow
     SDL_Window *window = initWindow(mission.fogParams, state.skyClearColor);
@@ -6330,6 +6376,25 @@ int main(int argc, char *argv[]) {
             "seed=0x%08x, pause=%.2f s) — activates on first input tick\n",
             cfg.autoFlyWaypoints, cfg.autoFlySpeed,
             cfg.autoFlySeed, cfg.autoFlyPauseSec);
+    }
+
+    // Seed the audio capture-point spin from --audio-capture flags. Like
+    // auto-fly, the listener teleport + spin arm lazily on the first
+    // updateMovement tick (so the spawn has fully settled first). audio_log
+    // is enabled HERE rather than at init so the probe-bake phase stays out
+    // of the log — the captured stream is just the spin window.
+    state.audioCapture.enabled     = cfg.audioCapture;
+    state.audioCapture.target      = Darkness::Vector3(
+        cfg.audioCaptureX, cfg.audioCaptureY, cfg.audioCaptureZ);
+    state.audioCapture.durationSec = cfg.audioCaptureSeconds;
+    state.audioCapture.rotations   = cfg.audioCaptureRotations;
+    if (cfg.audioCapture) {
+        Darkness::gAudioLogVerbose = true;  // step 4: turn on audio_log
+        std::fprintf(stderr,
+            "--audio-capture: enabled at (%.2f, %.2f, %.2f) — %.1f s, "
+            "%.1f rotation(s); audio_log on, exits when the spin completes\n",
+            cfg.audioCaptureX, cfg.audioCaptureY, cfg.audioCaptureZ,
+            cfg.audioCaptureSeconds, cfg.audioCaptureRotations);
     }
 
     // ── Main loop — LoopService drives frame dispatch ──
