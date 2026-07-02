@@ -383,6 +383,18 @@ struct RuntimeState {
     bgfx::IndexBufferHandle  acousticIBH = BGFX_INVALID_HANDLE;
     uint32_t acousticLineCount = 0;
 
+    // Debug: acoustic-MATERIAL overlay — the static acoustic mesh rendered as
+    // SOLID triangles flat-coloured by material class (acousticMaterialClass()
+    // in AcousticMaterials.h). Textures with no keyword match render bright
+    // MAGENTA so surfaces missing an acoustic material — or mapped to the wrong
+    // class — are obvious while walking the level. Drawn with DEPTH_TEST_LEQUAL
+    // on the shared depth buffer so it repaints exactly the visible world
+    // surfaces. Portal polygons are omitted (not real material surfaces).
+    // Toggle via `show_acoustic_materials`.
+    bool showAcousticMaterials = false;
+    bgfx::VertexBufferHandle acousticMatVBH = BGFX_INVALID_HANDLE;
+    uint32_t acousticMatVertCount = 0;
+
     // Debug: acoustic-mesh raycast highlighter. Casts a ray from the
     // camera along the forward direction against the acoustic mesh
     // triangles and renders the closest hit triangle as a solid red
@@ -536,6 +548,7 @@ struct RuntimeState {
     bool anyDebugOverlayActive() const {
         return showRaycast
             || showAcousticMesh
+            || showAcousticMaterials
             || showDoorGeometry
             || showAcousticHit
             || showRooms
