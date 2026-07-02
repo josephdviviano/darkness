@@ -1980,6 +1980,93 @@ static int runMeshValidateVerb(const std::string &misPath,
         "[MESH_VALIDATE] edges: total=%zu boundary=%zu non_manifold=%zu\n",
         edgeCount.size(), boundaryCount, nonManifoldCount);
 
+    // ── Duplicate-triangle counter ──
+    //
+    // Key = sorted (v0, v1, v2) — the same vertex triple regardless of
+    // winding order. Value = number of triangles using this triple.
+    // Coincident-coplanar triangle pairs (a rendered portal emitted by
+    // BOTH adjacent cells with opposite winding) show up as count=2
+    // here. Higher counts indicate a more severe pile-up (e.g. a portal
+    // polygon EMITTED plus an adjacent wall that got tessellated the
+    // same way from both sides — count=4).
+    //
+    // Perf relevance: Steam Audio's reflection sim casts thousands of
+    // rays per source per iteration and each ray-triangle intersection
+    // test inside a BVH leaf is O(numTrisInLeaf). Coincident triangles
+    // all fall into the same spatial cell → same leaf → each ray
+    // through that leaf pays the intersection-test cost for every
+    // duplicate. A mesh with 30% duplicate triangles wastes ~30% of the
+    // narrow-phase work in the leaves those triangles occupy.
+    struct TriKey {
+        uint32_t a, b, c;  // ascending: a < b < c
+        bool operator==(const TriKey &o) const {
+            return a == o.a && b == o.b && c == o.c;
+        }
+    };
+    struct TriKeyHash {
+        size_t operator()(const TriKey &k) const {
+            uint64_t h = k.a;
+            h = h * 0x100000001b3ull + k.b;
+            h = h * 0x100000001b3ull + k.c;
+            return std::hash<uint64_t>{}(h);
+        }
+    };
+    std::unordered_map<TriKey, int, TriKeyHash> triCount;
+    triCount.reserve(numTris);
+    for (size_t t = 0; t < numTris; ++t) {
+        uint32_t v[3] = {
+            static_cast<uint32_t>(fullScene.indices[3*t + 0]),
+            static_cast<uint32_t>(fullScene.indices[3*t + 1]),
+            static_cast<uint32_t>(fullScene.indices[3*t + 2]),
+        };
+        // Sort ascending.
+        if (v[0] > v[1]) std::swap(v[0], v[1]);
+        if (v[1] > v[2]) std::swap(v[1], v[2]);
+        if (v[0] > v[1]) std::swap(v[0], v[1]);
+        triCount[TriKey{v[0], v[1], v[2]}]++;
+    }
+
+    // Histogram: how many triples appear 1×, 2×, 3+×.
+    size_t uniqueTris  = 0;  // total distinct vertex triples
+    size_t dupPair     = 0;  // triples used by exactly 2 triangles
+    size_t dupTriPlus  = 0;  // triples used by 3+ triangles
+    size_t dupOverhead = 0;  // sum of (count-1) across dup entries = wasted tris
+    int    maxCount    = 0;
+    TriKey maxCountKey{0,0,0};
+    for (const auto &kv : triCount) {
+        uniqueTris++;
+        if (kv.second == 2) {
+            dupPair++;
+            dupOverhead += 1;
+        } else if (kv.second >= 3) {
+            dupTriPlus++;
+            dupOverhead += (kv.second - 1);
+        }
+        if (kv.second > maxCount) {
+            maxCount = kv.second;
+            maxCountKey = kv.first;
+        }
+    }
+    const double dupPct = numTris > 0
+        ? 100.0 * static_cast<double>(dupOverhead) / static_cast<double>(numTris)
+        : 0.0;
+    std::fprintf(stdout,
+        "[MESH_VALIDATE] tris: unique=%zu dup_pairs=%zu dup_triple+=%zu "
+        "wasted=%zu (%.1f%% of total) max_count=%d\n",
+        uniqueTris, dupPair, dupTriPlus, dupOverhead, dupPct, maxCount);
+    if (maxCount > 1) {
+        D::Vector3 a = getVert(maxCountKey.a);
+        D::Vector3 b = getVert(maxCountKey.b);
+        D::Vector3 c = getVert(maxCountKey.c);
+        D::Vector3 centroid{
+            (a.x + b.x + c.x) / 3.0f,
+            (a.y + b.y + c.y) / 3.0f,
+            (a.z + b.z + c.z) / 3.0f};
+        std::fprintf(stdout,
+            "[MESH_VALIDATE] worst duplicate: count=%d at centroid=(%.2f,%.2f,%.2f)\n",
+            maxCount, centroid.x, centroid.y, centroid.z);
+    }
+
     const float filterR2 = filterRadiusFt * filterRadiusFt;
     if (filterPos) {
         for (const auto &e : boundaryEdges) {
