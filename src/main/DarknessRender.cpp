@@ -1092,6 +1092,59 @@ static void renderRoomLabelsOverlay(
 // Render debug raycast visualization + HUD text into View 2.
 // Casts a ray from camera forward, draws cross at hit point, normal line,
 // and HUD text overlay with hit details.
+// Map an acoustic material CLASS (from acousticMaterialClass()) to a distinct
+// debug ABGR colour for the show_acoustic_materials overlay. Unmapped surfaces
+// ("generic") are deliberately bright MAGENTA so they stand out; every real
+// class gets a hue roughly evoking the material so wrong assignments (e.g. a
+// stone wall showing wood-brown) are easy to spot.
+static uint32_t acousticClassColor(const std::string &cls)
+{
+    using Darkness::packABGR;
+    if (cls == "stone")    return packABGR(0.50f, 0.50f, 0.55f);  // grey
+    if (cls == "rock")     return packABGR(0.40f, 0.42f, 0.46f);  // dark grey
+    if (cls == "wood")     return packABGR(0.60f, 0.38f, 0.16f);  // brown
+    if (cls == "bark")     return packABGR(0.38f, 0.24f, 0.10f);  // dark brown
+    if (cls == "leaf")     return packABGR(0.20f, 0.62f, 0.20f);  // green
+    if (cls == "metal")    return packABGR(0.50f, 0.62f, 0.78f);  // steel blue
+    if (cls == "glass")    return packABGR(0.30f, 0.80f, 0.92f);  // cyan
+    if (cls == "brick")    return packABGR(0.78f, 0.32f, 0.20f);  // orange-red
+    if (cls == "concrete") return packABGR(0.66f, 0.66f, 0.60f);  // light grey
+    if (cls == "plaster")  return packABGR(0.88f, 0.82f, 0.66f);  // cream
+    if (cls == "tile")     return packABGR(0.20f, 0.72f, 0.62f);  // teal
+    if (cls == "ceramic")  return packABGR(0.92f, 0.92f, 0.92f);  // white
+    if (cls == "carpet")   return packABGR(0.55f, 0.26f, 0.62f);  // purple
+    if (cls == "dirt")     return packABGR(0.62f, 0.50f, 0.30f);  // tan
+    if (cls == "gravel")   return packABGR(0.52f, 0.52f, 0.36f);  // olive
+    if (cls == "hay")      return packABGR(0.82f, 0.76f, 0.30f);  // yellow
+    if (cls == "ice")      return packABGR(0.72f, 0.86f, 1.00f);  // pale blue
+    return packABGR(1.00f, 0.00f, 1.00f);                         // MAGENTA = unmapped
+}
+
+// bgfx dbgText VGA 16-colour attribute roughly matching each class's overlay
+// hue, for the show_acoustic_materials on-screen legend + crosshair readout.
+// Low nibble = foreground colour (black background).
+static uint8_t acousticClassTextAttr(const std::string &cls)
+{
+    if (cls == "stone")    return 0x07; // light grey
+    if (cls == "rock")     return 0x08; // dark grey
+    if (cls == "wood")     return 0x06; // brown
+    if (cls == "bark")     return 0x06; // brown
+    if (cls == "leaf")     return 0x02; // green
+    if (cls == "metal")    return 0x09; // light blue
+    if (cls == "glass")    return 0x0B; // light cyan
+    if (cls == "brick")    return 0x0C; // light red
+    if (cls == "concrete") return 0x07; // light grey
+    if (cls == "plaster")  return 0x0E; // yellow (cream)
+    if (cls == "tile")     return 0x03; // cyan
+    if (cls == "ceramic")  return 0x0F; // white
+    if (cls == "carpet")   return 0x0D; // light magenta (purple)
+    if (cls == "dirt")     return 0x06; // brown
+    if (cls == "gravel")   return 0x06; // brown
+    if (cls == "hay")      return 0x0E; // yellow
+    if (cls == "ice")      return 0x0B; // light cyan
+    return 0x0D;                        // light magenta = UNMAPPED
+}
+
 static void renderDebugOverlay(
     const Darkness::FrameContext &fc,
     const Darkness::GPUResources &gpu,
@@ -1108,6 +1161,7 @@ static void renderDebugOverlay(
     // prevent. show_portals and show_vpos were added later and missed
     // the list.
     if (!state.showRaycast && !state.showAcousticMesh
+        && !state.showAcousticMaterials
         && !state.showAcousticHit
         && !state.showProbes && !state.showRooms
         && !state.showPortals && !state.showVPos
@@ -1284,6 +1338,84 @@ static void renderDebugOverlay(
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
         bgfx::setUniform(gpu.u_objectLight, whiteLight);
         bgfx::submit(2, gpu.flatProgram);
+    }
+
+    // ── Acoustic-material solid overlay ──
+    // Solid triangles of the acoustic mesh, flat-coloured by material class
+    // (magenta = texture with no acoustic-material keyword). DEPTH_TEST_LEQUAL
+    // against the shared depth buffer (view 1 already wrote world depth) means
+    // each acoustic triangle repaints only where it coincides with a visible
+    // world surface; anything behind is culled. No back-face culling — the
+    // acoustic mesh has mixed winding, and coincident faces share a colour.
+    if (state.showAcousticMaterials && bgfx::isValid(state.acousticMatVBH)) {
+        float identity[16];
+        bx::mtxIdentity(identity);
+        bgfx::setTransform(identity);
+        bgfx::setVertexBuffer(0, state.acousticMatVBH, 0, state.acousticMatVertCount);
+        uint64_t solidState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                            | BGFX_STATE_DEPTH_TEST_LEQUAL;
+        bgfx::setState(solidState);
+        float noFog[4] = {0, 0, 0, 0};
+        bgfx::setUniform(gpu.u_fogColor, noFog);
+        bgfx::setUniform(gpu.u_fogParams, noFog);
+        float opaqueParams[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
+        bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+        bgfx::setUniform(gpu.u_objectLight, whiteLight);
+        bgfx::submit(2, gpu.flatProgram);
+    }
+
+    // ── Acoustic-material on-screen legend + crosshair readout ──
+    // Right-side legend decodes the overlay colours; a ray from screen centre
+    // against the world mesh reports the exact texture the viewer is looking at
+    // with its matched keyword + material class (UNMAPPED highlighted). Lets you
+    // point at a magenta surface and read the offending TXLIST name directly.
+    if (state.showAcousticMaterials) {
+        const uint8_t hud = 0x0F, dim = 0x08;
+        const int lc = 116;  // legend column (right side)
+        bgfx::dbgTextPrintf(lc, 1, hud, "ACOUSTIC MATERIALS");
+        bgfx::dbgTextPrintf(lc, 2, dim, "` show_acoustic_materials");
+        static const char *kLegend[] = {
+            "stone","rock","wood","bark","leaf","metal","glass","brick",
+            "concrete","plaster","tile","ceramic","carpet","dirt","gravel",
+            "hay","ice","generic",
+        };
+        int row = 4;
+        for (const char *c : kLegend) {
+            bool unmapped = (std::strcmp(c, "generic") == 0);
+            bgfx::dbgTextPrintf(lc, row++, acousticClassTextAttr(c),
+                                "  %s", unmapped ? "UNMAPPED (magenta)" : c);
+        }
+
+        // Crosshair readout — ray from camera forward against the world mesh.
+        float cosPitch = std::cos(state.cam.pitch);
+        float fwdX = std::cos(state.cam.yaw) * cosPitch;
+        float fwdY = std::sin(state.cam.yaw) * cosPitch;
+        float fwdZ = std::sin(state.cam.pitch);
+        constexpr float RAY_DIST = 500.0f;
+        Darkness::Vector3 rf(state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+        Darkness::Vector3 rt(rf.x + fwdX * RAY_DIST, rf.y + fwdY * RAY_DIST,
+                             rf.z + fwdZ * RAY_DIST);
+        Darkness::RayHit hit;
+        if (Darkness::raycastWorld(mission.wrData, rf, rt, hit)
+            && hit.textureIndex >= 0
+            && static_cast<size_t>(hit.textureIndex) < mission.txList.textures.size()) {
+            const auto &tex = mission.txList.textures[hit.textureIndex];
+            std::string full = tex.fullPath.empty() ? std::string("generic")
+                                                    : tex.fullPath;
+            std::string kw  = Darkness::lookupAcousticMaterialKeyword(full);
+            std::string cls = Darkness::acousticMaterialClass(kw);
+            bgfx::dbgTextPrintf(2, 24, hud, "Look: %s", full.c_str());
+            if (cls == "generic") {
+                bgfx::dbgTextPrintf(2, 25, 0x0D,
+                    "  UNMAPPED - no acoustic keyword (add to AcousticMaterials.h)");
+            } else {
+                bgfx::dbgTextPrintf(2, 25, acousticClassTextAttr(cls),
+                    "  keyword=%s  class=%s", kw.c_str(), cls.c_str());
+            }
+        } else {
+            bgfx::dbgTextPrintf(2, 24, dim, "Look: (no surface at crosshair)");
+        }
     }
 
     // ── Door geometry wireframe overlay ──
@@ -2951,6 +3083,15 @@ static void registerConsoleSettings(
         [&state]() { return state.showAcousticMesh; },
         [&state](bool v) { state.showAcousticMesh = v; },
         "Cyan wireframe overlay of the acoustic scene geometry");
+
+    dbgConsole.addBool("show_acoustic_materials",
+        [&state]() { return state.showAcousticMaterials; },
+        [&state](bool v) { state.showAcousticMaterials = v; },
+        "Solid overlay painting each visible surface by its acoustic material "
+        "class (stone=grey, wood=brown, metal=blue, glass=cyan, plaster=cream, "
+        "brick=orange, etc.). MAGENTA = texture with no acoustic-material "
+        "keyword (unmapped, or mapped to the wrong class). Walk the level to "
+        "find surfaces the keyword table is missing.");
 
     dbgConsole.addBool("show_door_geometry",
         [&state]() { return state.showDoorGeometry; },
@@ -5785,6 +5926,45 @@ int main(int argc, char *argv[]) {
         // tools; safe to remove in a follow-up.)
     }
 
+    // ── Create acoustic-MATERIAL solid overlay buffer (show_acoustic_materials) ──
+    // Same source triangles as the wireframe above, but built as SOLID tris
+    // flat-coloured per-triangle by the material class the texture resolves to
+    // (see acousticClassColor / acousticMaterialClass). Vertices are expanded
+    // 3-per-triangle (no index buffer) so each triangle carries one flat
+    // colour. Portal polygons are skipped — they are not material surfaces.
+    if (!state.acousticIndices.empty()) {
+        size_t numTris = state.acousticIndices.size() / 3;
+        std::vector<Darkness::PosColorVertex> triVerts;
+        triVerts.reserve(numTris * 3);
+        size_t unmappedTris = 0, portalTris = 0;
+        for (size_t t = 0; t < numTris; ++t) {
+            const std::string texName =
+                (t < state.acousticTexNames.size()) ? state.acousticTexNames[t]
+                                                    : std::string("generic");
+            if (texName == "_portal") { ++portalTris; continue; }
+            std::string cls = Darkness::acousticMaterialClass(
+                Darkness::lookupAcousticMaterialKeyword(texName));
+            if (cls == "generic") ++unmappedTris;
+            uint32_t color = acousticClassColor(cls);
+            int32_t i0 = state.acousticIndices[t*3+0];
+            int32_t i1 = state.acousticIndices[t*3+1];
+            int32_t i2 = state.acousticIndices[t*3+2];
+            triVerts.push_back({state.acousticVerts[i0*3], state.acousticVerts[i0*3+1], state.acousticVerts[i0*3+2], color});
+            triVerts.push_back({state.acousticVerts[i1*3], state.acousticVerts[i1*3+1], state.acousticVerts[i1*3+2], color});
+            triVerts.push_back({state.acousticVerts[i2*3], state.acousticVerts[i2*3+1], state.acousticVerts[i2*3+2], color});
+        }
+        if (!triVerts.empty()) {
+            state.acousticMatVertCount = static_cast<uint32_t>(triVerts.size());
+            const bgfx::Memory *mem = bgfx::copy(triVerts.data(),
+                static_cast<uint32_t>(triVerts.size() * sizeof(Darkness::PosColorVertex)));
+            state.acousticMatVBH = bgfx::createVertexBuffer(mem, Darkness::PosColorVertex::layout);
+            std::fprintf(stderr,
+                "Acoustic material overlay: %zu material tris (%zu portal "
+                "skipped), %zu UNMAPPED (magenta). Toggle: show_acoustic_materials\n",
+                numTris - portalTris, portalTris, unmappedTris);
+        }
+    }
+
     // ── Build per-room debug geometry (room/portal wireframe overlay) ──
     //
     // For each Room we compute the corners of its bounding polytope (the
@@ -6434,6 +6614,8 @@ int main(int argc, char *argv[]) {
     // Destroy runtime GPU resources not in GPUResources struct
     if (bgfx::isValid(state.acousticVBH))
         bgfx::destroy(state.acousticVBH);
+    if (bgfx::isValid(state.acousticMatVBH))
+        bgfx::destroy(state.acousticMatVBH);
     if (bgfx::isValid(state.acousticHitVBH))
         bgfx::destroy(state.acousticHitVBH);
 

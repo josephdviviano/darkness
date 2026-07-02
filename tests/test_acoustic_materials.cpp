@@ -96,7 +96,10 @@ TEST_CASE("Thief 2 wood textures match wood-like keywords", "[acoustic][thief2]"
     // "wood/floor01" contains both "floor" (5 chars) and "wood" (4 chars) —
     // "floor" wins because it's longer. Both map to hard surface materials.
     CHECK(lookupAcousticMaterialKeyword("wood/floor01") == "floor");
-    CHECK(lookupAcousticMaterialKeyword("wood/panel03") == "wood");
+    // "wood/panel03" contains "panel" (5 chars) and "wood" (4 chars) — "panel"
+    // wins (longer) and also maps to the wood preset, so the acoustic result is
+    // identical. ("panel" was added to cover artdeco/Panel* wood panelling.)
+    CHECK(lookupAcousticMaterialKeyword("wood/panel03") == "panel");
     CHECK(lookupAcousticMaterialKeyword("wdoor/oak01") == "door");
     // "wfloor" is a distinct 6-char keyword (wood floor) — matched before
     // generic "floor" because it's longer. Maps to wood acoustics.
@@ -230,4 +233,114 @@ TEST_CASE("Common Thief 2 families do not fall back to generic", "[acoustic][thi
 
     // None of the common families should fall back to generic
     CHECK(genericCount == 0);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Dark-Engine-abbreviation regression set. These are REAL family/name strings
+// pulled from the TXLIST chunks of all shipping Thief 2 missions (via the
+// `darknessHeadless txlist_audit` verb). They use Thief's truncated spellings
+// (no plain English word as a substring) and previously fell through to the
+// opaque-reflective fallback. Every one must now resolve to a keyword.
+// ════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Thief 2 abbreviated spellings resolve (not generic)", "[acoustic][thief2]") {
+    const char *names[] = {
+        // wood: planks / panels / frames / crates / boards
+        "core_2/Wdplnk", "core_2/Wdplanks", "core_2/Parkay64", "core_2/Planks1",
+        "artdeco/Panel07", "core_3/wd1128", "core_2/CRATE1", "core_3/creat6",
+        "ancient/BRD_LADL", "ruined/RPLAN04", "vicm09/wdtrim", "vicm01/Frame1",
+        "city/Winwd64", "vmaw2/paghut", "rescor_1/wgrain01",
+        // stone / masonry / marble / columns
+        "core_1/Granit2", "core_1/Cobls1", "core_1/Blustn", "core_1/BIGBL2",
+        "core_1/Hewn3", "core_1/Rufgry", "core_2/Bstnwal1", "core_2/Marble",
+        "core_2/Slab64", "core_3/grst164", "core_3/mstn1128", "artdout/BlackMB",
+        "civicb2/abaswal4", "civicb2/balcon02", "civicb2/Mold07", "civicbui/col01",
+        "civicbui/vicn92", "lostcty/LC07", "lostcty/WAL01", "NewKeep/nkroc03",
+        "Ramirez/bigblock", "vmaw/forwall1", "vmaw/terston2", "ruined/RWALL04",
+        "rescor_2/mcobb01", "rescor_1/firepl01", "ancient/SNDSTN01", "ancient/decor02a",
+        // brick
+        "core_1/Clnbrik1", "core_1/Blubrik1", "core_2/Tanbrck",
+        // concrete
+        "core_1/ASFALT", "core_1/Cement",
+        // plaster / stucco / ceilings / deco walls
+        "core_1/Stuc2", "core_2/Stucco", "ancient/STUCHORZ", "ancient/WALFRESA",
+        "artdeco/Dewal03b", "artdeco/Dceil04", "ceilpain/Pceil01", "vicm09/wall03",
+        "vicm09/VIC01M", "vicm09/m09ceil1", "mine/stucco",
+        // tile / mosaic
+        "core_2/Mosaic1",
+        // metal: mech / mine / fixtures
+        "mech/DWAL2", "mech/GEAR2S", "mech/GRATMOLD", "newmech/plpanel",
+        "mine/mtrack01", "mine/elev2btn", "core_3/locker1", "Tower2/gird",
+        "rescor_1/oven2",
+        // rock / cave
+        "cave/CAVELRG1", "core_1/Cavrgh5",
+        // bark / trees
+        "vmaw/sequo1", "vmawtb/Blacktre",
+        // dirt / sand / clay / snow / grass
+        "core_1/Sandy", "core_2/Sand", "vmaw2/clayflo", "vmaw/grassj1",
+        "vmawwin/snowcrun", "vmawwin/wintmaw1",
+        // organic foliage
+        "rescor_1/plant04", "rescor_2/flower04", "vmaw/foraut1", "vmaw2/thatch",
+        // glass / windows
+        "rescor_1/hothou1", "rescor_2/stain04", "artdmisc/ADWin01", "civicb2/Awin08",
+        "civicbui/owin02", "civicb2/Dwin13", "city/win1", "city/Cfwinf01",
+        "ruined/RWIND06",
+        // ceramic (roof shingle / water)
+        "city/Blushngl", "waterhw/blin",
+        // fabric / banner / books / mats
+        "rescor_1/banner03", "rescor_1/books01a", "city/rubermat",
+    };
+
+    int genericCount = 0;
+    for (const char *n : names) {
+        std::string result = lookupAcousticMaterialKeyword(n);
+        INFO("name: " << n << " -> " << result);
+        if (result == "generic") genericCount++;
+        CHECK(result != "generic");
+    }
+    CHECK(genericCount == 0);
+}
+
+TEST_CASE("Every acoustic keyword has a material class", "[acoustic][materials]") {
+    // The renderer's show_acoustic_materials debug overlay colours surfaces by
+    // material class. Every keyword in the matcher table must have a class
+    // entry, or a mapped surface would render as "generic" (magenta) in the
+    // overlay despite actually being mapped — a false alarm.
+    for (size_t i = 0; i < kAcousticKeywordCount; ++i) {
+        std::string cls = acousticMaterialClass(kAcousticKeywords[i]);
+        INFO("keyword: " << kAcousticKeywords[i] << " -> class " << cls);
+        CHECK(cls != "generic");
+    }
+    // Spot-check a few class resolutions.
+    CHECK(acousticMaterialClass("stn")  == "stone");
+    CHECK(acousticMaterialClass("wdpl") == "wood");
+    CHECK(acousticMaterialClass("mech") == "metal");
+    CHECK(acousticMaterialClass("vicm") == "plaster");
+    CHECK(acousticMaterialClass("nope_no_such_keyword") == "generic");
+}
+
+TEST_CASE("Thief 2 abbreviation keyword resolution (pins tricky cases)",
+          "[acoustic][thief2]") {
+    // Wood-plank family: the 4-char "wdpl" alias covers every Wdplnk* variant.
+    CHECK(lookupAcousticMaterialKeyword("core_2/Wdplnk")   == "wdpl");
+    CHECK(lookupAcousticMaterialKeyword("core_2/Wdplkbnd") == "wdpl");
+    // Brick: full "clnbrik" beats the generic "brik" (both → brick preset).
+    CHECK(lookupAcousticMaterialKeyword("core_1/Clnbrik1") == "clnbrik");
+    CHECK(lookupAcousticMaterialKeyword("core_1/Blubrik1") == "brik");
+    // Masonry / stone abbreviations.
+    CHECK(lookupAcousticMaterialKeyword("core_1/Granit2")  == "gran");
+    CHECK(lookupAcousticMaterialKeyword("core_1/ASFALT")   == "asfalt");
+    CHECK(lookupAcousticMaterialKeyword("core_1/Stuc2")    == "stuc");
+    CHECK(lookupAcousticMaterialKeyword("core_1/Sandy")    == "sandy");
+    CHECK(lookupAcousticMaterialKeyword("core_2/Sand")     == "sand");
+    // Mech grating molding must stay metal (NOT the stone "mold" alias).
+    CHECK(lookupAcousticMaterialKeyword("mech/GRATMOLD")   == "gratmold");
+    // New-mech panels must stay metal (NOT the wood "panel" alias).
+    CHECK(lookupAcousticMaterialKeyword("newmech/plpanel") == "newmech");
+    // Window-wood shutters are wood, not glass (city/Winwd*).
+    CHECK(lookupAcousticMaterialKeyword("city/Winwd64")    == "winwd");
+    // Victorian-mansion family default → plaster; civic vicn → stone. Both
+    // contain "vic" but only the mansion names contain "vicm".
+    CHECK(lookupAcousticMaterialKeyword("vicm09/VIC01M")   == "vicm");
+    CHECK(lookupAcousticMaterialKeyword("civicbui/vicn92") == "vicn");
 }
