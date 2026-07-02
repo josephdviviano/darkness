@@ -83,6 +83,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1694,6 +1695,69 @@ static int runSoundDbVerb(const std::string &schemasPath,
     return 0;
 }
 
+// ---------- txlist_audit verb ----------
+//
+// Enumerates every texture name in the mission's TXLIST chunk and runs
+// each through lookupAcousticMaterialKeyword() — the SAME function the
+// audio engine uses to map a world surface to an IPLMaterial preset.
+// Any name that resolves to "generic" has no acoustic-material keyword
+// and will fall through to the opaque-reflective fallback at runtime
+// (corrupting reverb + occlusion for every surface using it).
+//
+// Output (one line per texture, deduped by name):
+//   [TXLIST_AUDIT][UNMAPPED] <family/name>          ← no keyword match
+//   [TXLIST_AUDIT][MAP]      <family/name> -> <kw>   ← matched keyword
+//   [TXLIST_AUDIT] summary: <unmapped>/<total> unmapped
+//
+// Aggregate the complete cross-mission gap set with, e.g.:
+//   for m in MISS*.mis; do darknessHeadless "$m" txlist_audit; done \
+//     | grep UNMAPPED | awk '{print $2}' | sort -u
+//
+// The name passed to lookupAcousticMaterialKeyword is TXEntry.fullPath
+// ("family/name", or bare "name" when the texture has no family) — the
+// IDENTICAL string the runtime acoustic-mesh build feeds the lookup
+// (see buildAcousticSceneFromMissionFile above). No services / no Steam
+// Audio runtime required — pure TXLIST analysis.
+static int runTxlistAuditVerb(const std::string &misPath)
+{
+    namespace D = Darkness;
+
+    std::fprintf(stdout, "[TXLIST_AUDIT] mission=%s\n", misPath.c_str());
+
+    D::TXList txList;
+    try {
+        txList = D::parseTXList(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr,
+            "[TXLIST_AUDIT] failed to parse TXLIST chunk in '%s': %s\n",
+            misPath.c_str(), e.what());
+        return 1;
+    }
+
+    // Dedupe by fullPath — TXLIST can list the same texture under
+    // multiple indices, and we only care about distinct names.
+    std::set<std::string> seen;
+    size_t unmapped = 0;
+    for (const auto &entry : txList.textures) {
+        if (entry.fullPath.empty()) continue;        // unnamed slot
+        if (!seen.insert(entry.fullPath).second) continue; // already reported
+
+        std::string kw = D::lookupAcousticMaterialKeyword(entry.fullPath);
+        if (kw == "generic") {
+            ++unmapped;
+            std::fprintf(stdout, "[TXLIST_AUDIT][UNMAPPED] %s\n",
+                         entry.fullPath.c_str());
+        } else {
+            std::fprintf(stdout, "[TXLIST_AUDIT][MAP] %s -> %s\n",
+                         entry.fullPath.c_str(), kw.c_str());
+        }
+    }
+
+    std::fprintf(stdout, "[TXLIST_AUDIT] summary: %zu/%zu unmapped\n",
+                 unmapped, seen.size());
+    return 0;
+}
+
 // ---------- mesh_validate verb ----------
 //
 // Constructs the same AcousticSceneData that darknessRender hands to
@@ -2392,6 +2456,11 @@ static void printUsage(const char *prog) {
     std::cerr << "                    Steam Audio bake. Useful for iterating on probe placement" << std::endl;
     std::cerr << "                    reductions. Accepts --res / --schemas (same as darknessRender);" << std::endl;
     std::cerr << "                    no .probes file is ever written." << std::endl;
+    std::cerr << "  txlist_audit      Enumerate every TXLIST texture name and report which ones" << std::endl;
+    std::cerr << "                    have no acoustic-material keyword (resolve to 'generic' and" << std::endl;
+    std::cerr << "                    fall through to the opaque-reflective fallback at runtime)." << std::endl;
+    std::cerr << "                    Aggregate across missions: grep the [UNMAPPED] lines. No" << std::endl;
+    std::cerr << "                    services or Steam Audio runtime required." << std::endl;
     std::cerr << "  mesh_validate     Validate watertightness of the acoustic mesh built from this" << std::endl;
     std::cerr << "                    mission. Writes <mis>.acoustic.obj and" << std::endl;
     std::cerr << "                    <mis>.acoustic.boundary.txt. Optional `--at X Y Z R` filter" << std::endl;
@@ -2587,6 +2656,10 @@ int main(int argc, char *argv[]) {
             // computation. Returns 0 on success, 1 on failure.
             return runProbePlanVerb(dbFile, resPath, schemasPath, scriptsDir,
                                      setOverrides);
+        } else if (command == "txlist_audit") {
+            // txlist_audit: enumerate TXLIST texture names and report which
+            // ones have no acoustic-material keyword. No services / no IPL.
+            return runTxlistAuditVerb(dbFile);
         } else if (command == "mesh_validate") {
             // mesh_validate: WR-only static-mesh watertightness check.
             // Optional `--at X Y Z R` positional filter for zooming in
