@@ -6954,21 +6954,91 @@ void AudioService::loopStep(float deltaTime)
                 IPLProbeBatch pb = mProbeManager->getProbeBatch();
                 const auto &probePos = mProbeManager->getProbePositions();
                 if (pb && !probePos.empty()) {
-                    int nearestIdx = 0;
-                    float nearestDistSq = std::numeric_limits<float>::max();
+                    // ── Inverse-distance-weighted blend across the
+                    //    kMaxProbes nearest probes ─────────────────
+                    //
+                    // Matches Steam Audio's own probe-neighborhood
+                    // weighting (`probe_manager.cpp:119-141` in
+                    // v4.7.0):
+                    //   weight_i     = 1 / (distance_i + 1e-4)
+                    //   normalized_i = weight_i / sum(weight_i)
+                    // …applied over up to `kMaxProbesPerBatch = 8`
+                    // (`probe_batch.h:36`) nearest probes.
+                    //
+                    // WAS argmin (single nearest probe) which produced
+                    // a step-change in the parametric-tail RT60 the
+                    // moment the listener crossed the Voronoi boundary
+                    // between two probes. With `portal_rings: true`,
+                    // doorway-adjacent probes create Voronoi boundaries
+                    // in doorways — the RT60 swap coincided with
+                    // doorway crossings, audible as a sharp reverb
+                    // jump. IDW is spatially continuous everywhere and
+                    // matches how Steam Audio blends its own internal
+                    // probe-driven scalars.
+                    constexpr int   kMaxProbes      = 8;
+                    constexpr float kZeroDistOffset = 1e-4f;
+
+                    struct ProbePick {
+                        int   idx;
+                        float distSq;
+                    };
+                    std::array<ProbePick, kMaxProbes> nearest{};
+                    int nNearest = 0;
+
+                    // Partial insertion-sort: maintain the kMaxProbes
+                    // closest probes in ascending-distance order.
                     for (size_t i = 0; i < probePos.size(); ++i) {
                         Vector3 d = probePos[i] - mListenerPos;
                         float dsq = glm::dot(d, d);
-                        if (dsq < nearestDistSq) {
-                            nearestDistSq = dsq;
-                            nearestIdx = static_cast<int>(i);
+                        if (nNearest < kMaxProbes) {
+                            int k = nNearest;
+                            while (k > 0 && nearest[k - 1].distSq > dsq) {
+                                nearest[k] = nearest[k - 1];
+                                --k;
+                            }
+                            nearest[k] = {static_cast<int>(i), dsq};
+                            ++nNearest;
+                        } else if (dsq < nearest[kMaxProbes - 1].distSq) {
+                            int k = kMaxProbes - 1;
+                            while (k > 0 && nearest[k - 1].distSq > dsq) {
+                                nearest[k] = nearest[k - 1];
+                                --k;
+                            }
+                            nearest[k] = {static_cast<int>(i), dsq};
                         }
                     }
+
                     IPLBakedDataIdentifier reflId{};
                     reflId.type      = IPL_BAKEDDATATYPE_REFLECTIONS;
                     reflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
-                    iplProbeBatchGetReverb(pb, &reflId, nearestIdx, listenerReverbTimes);
-                    listenerReverbTimesValid = true;
+
+                    float acc[3] = {0.0f, 0.0f, 0.0f};
+                    float totalW = 0.0f;
+                    for (int n = 0; n < nNearest; ++n) {
+                        // iplProbeBatchGetReverb early-returns without
+                        // touching the output if this probe has no
+                        // baked reverb data (`api_probes.cpp:302-318`).
+                        // Sentinel-init to -1 so we can detect
+                        // "not populated" and exclude the probe from
+                        // the blend without dragging the average
+                        // toward zero.
+                        float rt[3] = {-1.0f, -1.0f, -1.0f};
+                        iplProbeBatchGetReverb(pb, &reflId,
+                            nearest[n].idx, rt);
+                        if (rt[0] < 0.0f) continue;
+                        float dist = std::sqrt(nearest[n].distSq);
+                        float w = 1.0f / (dist + kZeroDistOffset);
+                        acc[0] += w * rt[0];
+                        acc[1] += w * rt[1];
+                        acc[2] += w * rt[2];
+                        totalW += w;
+                    }
+                    if (totalW > 0.0f) {
+                        listenerReverbTimes[0] = acc[0] / totalW;
+                        listenerReverbTimes[1] = acc[1] / totalW;
+                        listenerReverbTimes[2] = acc[2] / totalW;
+                        listenerReverbTimesValid = true;
+                    }
                 }
             }
             if (mProbeManager) {
