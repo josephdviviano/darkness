@@ -981,6 +981,19 @@ public:
     };
     std::vector<PathingProbeViz> getPathingProbeViz() const;
 
+    /** Seed the schema-sample-selection RNG (--audio-rng-seed). Two A/B
+     *  stress runs then pick the SAME wav per schema event — without
+     *  this, sample choice varies clip length → voice lifetime → the
+     *  voice-count profile differs between otherwise identical runs.
+     *  Default behavior (never called) keeps the random_device seed.
+     *  Main thread only (same thread as selectSample consumers). */
+    void seedSampleRng(uint32_t seed) {
+        mRng.seed(seed);
+        std::fprintf(stderr,
+            "[AUDIO] sample-selection RNG seeded (0x%08x) — A/B "
+            "deterministic sample picks\n", seed);
+    }
+
     /** One edge in the pathing-probe visibility graph, with neighborhood
      *  activity payload (Capability C, PLAN.PROBE_DEBUG_TOOLING.md).
      *

@@ -368,6 +368,26 @@ struct RenderConfig {
     float       audioCaptureZ         = 0.0f;     // target Z
     float       audioCaptureSeconds   = 15.0f;    // --audio-capture-seconds
     float       audioCaptureRotations = 3.0f;     // --audio-capture-rotations
+
+    // -- auto-run probe-tour (on-foot stress harness) --
+    // Physics-mode sibling of --auto-fly: the player RUNS a deterministic
+    // waypoint tour of nearby pathing probes via the real movement-intent
+    // API, generating footstep voices (~2.5 spawns/s at run speed), BSP
+    // collision, and portal crossings — the audio stress profile a flying
+    // camera cannot produce. See src/main/AutoRunTour.h. Mutually
+    // exclusive with --auto-fly (auto-run wins with a warning) and
+    // --audio-capture (capture wins).
+    bool        autoRun             = false;      // --auto-run
+    int         autoRunWaypoints    = 50;         // --auto-run-waypoints
+    uint32_t    autoRunSeed         = 0xC0FFEEu;  // --auto-run-seed
+    std::string autoRunSpeedMode    = "run";      // --auto-run-speed-mode run|walk|creep
+
+    // -- audio sample-selection RNG seed --
+    // Seeds AudioService's schema-sample-selection PRNG so two A/B stress
+    // runs pick the SAME wav per schema event (sample choice varies clip
+    // length → voice lifetime → voice-count profile). -1 = unseeded
+    // (std::random_device, the default shipping behavior).
+    int64_t     audioRngSeed        = -1;         // --audio-rng-seed
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -1602,6 +1622,55 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                     "'%s' — keeping default %.1f\n",
                     argv[i], cfg.audioCaptureRotations);
             }
+        } else if (std::strcmp(argv[i], "--auto-run") == 0) {
+            cfg.autoRun = true;
+        } else if (std::strcmp(argv[i], "--auto-run-waypoints") == 0 && i + 1 < argc) {
+            try {
+                cfg.autoRunWaypoints = std::stoi(argv[++i]);
+                if (cfg.autoRunWaypoints < 1) cfg.autoRunWaypoints = 1;
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --auto-run-waypoints: non-integer value "
+                    "'%s' — keeping default %d\n",
+                    argv[i], cfg.autoRunWaypoints);
+            }
+        } else if (std::strcmp(argv[i], "--auto-run-seed") == 0 && i + 1 < argc) {
+            try {
+                // Accept decimal or 0xHEX; std::stoul base=0 auto-detects.
+                cfg.autoRunSeed = static_cast<uint32_t>(
+                    std::stoul(argv[++i], nullptr, 0));
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --auto-run-seed: invalid '%s' — keeping "
+                    "default 0x%08x\n", argv[i], cfg.autoRunSeed);
+            }
+        } else if (std::strcmp(argv[i], "--auto-run-speed-mode") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (std::strcmp(mode, "run") == 0 || std::strcmp(mode, "walk") == 0
+                || std::strcmp(mode, "creep") == 0) {
+                cfg.autoRunSpeedMode = mode;
+            } else {
+                std::fprintf(stderr,
+                    "[FALLBACK] --auto-run-speed-mode: unknown mode '%s' "
+                    "(expected run|walk|creep) — keeping default '%s'\n",
+                    mode, cfg.autoRunSpeedMode.c_str());
+            }
+        } else if (std::strcmp(argv[i], "--audio-rng-seed") == 0 && i + 1 < argc) {
+            try {
+                // Accept decimal or 0xHEX. Negative = leave unseeded.
+                cfg.audioRngSeed = static_cast<int64_t>(
+                    std::stoll(argv[++i], nullptr, 0));
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --audio-rng-seed: invalid '%s' — keeping "
+                    "unseeded (random_device)\n", argv[i]);
+            }
+        } else if (std::strcmp(argv[i], "--audio-log") == 0) {
+            // CLI mirror of the YAML `developer.audio_log` key. Perf runs
+            // need it: nearly all [PERF *] histogram recording is gated on
+            // the audio_log verbosity flag, and the generic --set resolver
+            // only covers audio.* leaves — developer.* is out of its reach.
+            cfg.audioLog = true;
         } else if (argv[i][0] != '-' && !cli.misPath) {
             // First non-flag argument is the mission file
             cli.misPath = argv[i];
