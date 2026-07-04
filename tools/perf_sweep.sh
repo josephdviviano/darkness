@@ -47,6 +47,16 @@
 #   AUTO_FLY_SEED        (override --auto-fly-seed; unset → binary default 0xC0FFEE)
 #   AUTO_FLY_PAUSE_SEC   (override --auto-fly-pause-sec; unset → binary default 0)
 #
+#   AUTO_RUN             (default: 0 — ON-FOOT probe tour via --auto-run;
+#                         the player RUNS between rooms generating footstep
+#                         voices. Supersedes AUTO_FLY when 1 — the two are
+#                         mutually exclusive in the binary and auto-run wins)
+#   AUTO_RUN_WAYPOINTS   (override --auto-run-waypoints; unset → binary default 50)
+#   AUTO_RUN_SEED        (override --auto-run-seed; unset → binary default 0xC0FFEE)
+#   AUTO_RUN_SPEED_MODE  (override --auto-run-speed-mode run|walk|creep; unset → run)
+#   AUDIO_RNG_SEED       (override --audio-rng-seed; unset → unseeded/random_device.
+#                         Set for strict A/B so both runs pick identical wavs)
+#
 #   FORCE_PATHING_BAKE   (default: 0 — when 1, appends --force-pathing-bake so
 #                         the pathing section is re-baked every iteration. This
 #                         is the canonical "Sweep 2 Phase B mode" — slower per
@@ -138,6 +148,15 @@ AUTO_FLY_SPEED="${AUTO_FLY_SPEED:-}"
 AUTO_FLY_WAYPOINTS="${AUTO_FLY_WAYPOINTS:-}"
 AUTO_FLY_SEED="${AUTO_FLY_SEED:-}"
 AUTO_FLY_PAUSE_SEC="${AUTO_FLY_PAUSE_SEC:-}"
+
+# On-foot auto-run tour (AutoRunTour.h). Off by default to preserve the
+# established fly-tour sweep baseline; set AUTO_RUN=1 for footstep-churn
+# stress runs (PLAN.AUDIO_PERF.md Phase 0). Supersedes AUTO_FLY when on.
+AUTO_RUN="${AUTO_RUN:-0}"
+AUTO_RUN_WAYPOINTS="${AUTO_RUN_WAYPOINTS:-}"
+AUTO_RUN_SEED="${AUTO_RUN_SEED:-}"
+AUTO_RUN_SPEED_MODE="${AUTO_RUN_SPEED_MODE:-}"
+AUDIO_RNG_SEED="${AUDIO_RNG_SEED:-}"
 
 # Force-pathing-bake (Sweep 2 Phase B). When 1, every iteration drops the
 # cached pathing section and re-bakes it fresh. Reflection bytes carry
@@ -259,13 +278,21 @@ for VAL in "${VALUES[@]}"; do
     # Build auto-fly arg list dynamically so unset overrides fall back to
     # the binary's compiled-in defaults.
     AUTO_FLY_ARGS=()
-    if [ "$AUTO_FLY" = "1" ] || [ "$AUTO_FLY" = "true" ]; then
+    if [ "$AUTO_RUN" = "1" ] || [ "$AUTO_RUN" = "true" ]; then
+        # On-foot tour supersedes the fly tour (mutually exclusive in the
+        # binary — physics ON vs OFF; auto-run wins there too).
+        AUTO_FLY_ARGS+=(--auto-run)
+        [ -n "$AUTO_RUN_WAYPOINTS" ]  && AUTO_FLY_ARGS+=(--auto-run-waypoints  "$AUTO_RUN_WAYPOINTS")
+        [ -n "$AUTO_RUN_SEED" ]       && AUTO_FLY_ARGS+=(--auto-run-seed       "$AUTO_RUN_SEED")
+        [ -n "$AUTO_RUN_SPEED_MODE" ] && AUTO_FLY_ARGS+=(--auto-run-speed-mode "$AUTO_RUN_SPEED_MODE")
+    elif [ "$AUTO_FLY" = "1" ] || [ "$AUTO_FLY" = "true" ]; then
         AUTO_FLY_ARGS+=(--auto-fly)
         [ -n "$AUTO_FLY_SPEED" ]      && AUTO_FLY_ARGS+=(--auto-fly-speed     "$AUTO_FLY_SPEED")
         [ -n "$AUTO_FLY_WAYPOINTS" ]  && AUTO_FLY_ARGS+=(--auto-fly-waypoints "$AUTO_FLY_WAYPOINTS")
         [ -n "$AUTO_FLY_SEED" ]       && AUTO_FLY_ARGS+=(--auto-fly-seed      "$AUTO_FLY_SEED")
         [ -n "$AUTO_FLY_PAUSE_SEC" ]  && AUTO_FLY_ARGS+=(--auto-fly-pause-sec "$AUTO_FLY_PAUSE_SEC")
     fi
+    [ -n "$AUDIO_RNG_SEED" ] && AUTO_FLY_ARGS+=(--audio-rng-seed "$AUDIO_RNG_SEED")
 
     # Sweep 2 Phase B: append --force-pathing-bake when FORCE_PATHING_BAKE=1.
     # The flag composes with --skip-reflection-bake (always passed) — the

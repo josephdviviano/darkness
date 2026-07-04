@@ -404,6 +404,10 @@ static void printHelp() {
         "                                [--auto-fly-waypoints <N>]\n"
         "                                [--auto-fly-seed <N>]\n"
         "                                [--auto-fly-pause-sec <N>]\n"
+        "                                [--auto-run] [--auto-run-waypoints <N>]\n"
+        "                                [--auto-run-seed <N>]\n"
+        "                                [--auto-run-speed-mode <run|walk|creep>]\n"
+        "                                [--audio-rng-seed <N>]\n"
         "                                [--audio-capture <x,y,z>]\n"
         "                                [--audio-capture-seconds <N>]\n"
         "                                [--audio-capture-rotations <N>]\n"
@@ -451,6 +455,25 @@ static void printHelp() {
         "  --auto-fly-seed N         PRNG seed for visit-order shuffle (default\n"
         "                            0xC0FFEE). Accepts decimal or 0xHEX.\n"
         "  --auto-fly-pause-sec N    Dwell time per waypoint (default 0).\n"
+        "  --auto-run        Deterministic ON-FOOT waypoint tour (forces physics\n"
+        "                    mode). The player runs between nearby pathing probes\n"
+        "                    spanning >= 2 rooms, generating real footsteps and\n"
+        "                    portal crossings — the audio stress profile for\n"
+        "                    tools/perf_sweep.sh A/B runs. Skips unreachable\n"
+        "                    waypoints loudly ([AUTO_RUN] stuck/timeout lines).\n"
+        "                    Mutually exclusive with --auto-fly (auto-run wins).\n"
+        "  --auto-run-waypoints N    N-nearest walkable probes (default 50).\n"
+        "  --auto-run-seed N         PRNG seed for visit-order shuffle (default\n"
+        "                            0xC0FFEE). Accepts decimal or 0xHEX.\n"
+        "  --auto-run-speed-mode M   run|walk|creep (default run — loudest\n"
+        "                            footsteps, fastest room coverage).\n"
+        "  --audio-rng-seed N\n"
+        "                    Seed the schema-sample-selection RNG so A/B runs\n"
+        "                    pick identical wavs per event. Default: unseeded\n"
+        "                    (random_device). Accepts decimal or 0xHEX.\n"
+        "  --audio-log       Enable audio log verbosity (= developer.audio_log\n"
+        "                    in YAML). Required for [PERF *] histogram capture —\n"
+        "                    perf runs are dark without it.\n"
         "  --audio-capture x,y,z\n"
         "                    Pin the listener at a fixed world point (Dark Engine\n"
         "                    feet, Z-up), force fly mode, enable audio_log, spin the\n"
@@ -3286,6 +3309,11 @@ static void registerConsoleSettings(
         [&state](bool v) { state.autoFly.enabled = v; },
         "Deterministic probe-tour flythrough (forces fly mode)");
 
+    dbgConsole.addBool("auto_run",
+        [&state]() { return state.autoRun.enabled; },
+        [&state](bool v) { state.autoRun.enabled = v; },
+        "Deterministic on-foot probe tour (forces physics mode; footsteps)");
+
     dbgConsole.addFloat("auto_fly_speed", 0.5f, 50.0f,
         [&state]() { return state.autoFly.speed; },
         [&state](float v) { state.autoFly.speed = v; },
@@ -3991,13 +4019,79 @@ static void updateMovement(
         return;
     }
 
+    // ── Auto-run probe-tour (on-foot) ──
+    // Physics-mode sibling of auto-fly: forces physics ON, then the
+    // ordinary physics-mode branch below runs with tour-driven intents in
+    // place of keyboard state — so footsteps, stride, collision, and the
+    // listener transform all flow from the real player integrator (per
+    // feedback_simulation_over_hacks, nothing downstream is faked). Lazy
+    // activation mirrors auto-fly: waypoints need the live spawn position
+    // and the probe set may still be baking at seed time. Takes
+    // precedence over auto-fly (the seed site warns when both are set).
+    if (state.autoRun.enabled) {
+        if (!state.physics) {
+            std::fprintf(stderr,
+                "[FALLBACK] auto-run requested but no physics world is "
+                "available — disabling\n");
+            state.autoRun.enabled = false;
+        } else {
+            if (!state.autoRun.active) {
+                auto svc = GET_SERVICE(Darkness::AudioService);
+                std::vector<Darkness::AutoRunTour::Waypoint> probes;
+                if (svc) {
+                    const auto viz = svc->getPathingProbeViz();
+                    probes.reserve(viz.size());
+                    for (const auto &v : viz)
+                        probes.push_back({v.position, v.roomID});
+                }
+                Darkness::Vector3 from(state.cam.pos[0], state.cam.pos[1],
+                                       state.cam.pos[2]);
+                state.autoRun.activate(from, probes);
+                // activate() emits [FALLBACK] and clears `enabled` when
+                // no walkable probes exist — keyboard control resumes.
+            }
+            // ── Fly-assist: glide owns the camera (physics off) ──
+            // Hybrid locomotion: waypoints unreachable on foot (wedged,
+            // z-offset, closed door, disconnected) are reached by a brief
+            // noclip glide, then the body is handed back to the
+            // integrator — same position/yaw sync as the physics_mode
+            // console toggle.
+            if (state.autoRun.active && state.autoRun.flyAssist) {
+                state.physicsMode = false;
+                state.cam.roll = 0.0f;
+                const bool landed = state.autoRun.tickAssist(
+                    dt, state.cam.pos, state.cam.yaw, state.cam.pitch);
+                if (landed) {
+                    state.physicsMode = true;
+                    state.crouchToggled = false;
+                    Darkness::Vector3 bodyPos(
+                        state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+                    state.physics->setPlayerPosition(bodyPos);
+                    state.physics->setPlayerYaw(state.cam.yaw);
+                }
+                return;  // glide frame complete; walking resumes next tick
+            }
+            if (state.autoRun.active && !state.physicsMode) {
+                state.physicsMode = true;
+                std::fprintf(stderr,
+                    "[AUTO_RUN] forcing physics_mode on (auto-run drives "
+                    "the player integrator)\n");
+            }
+        }
+    } else if (state.autoRun.active) {
+        // Toggled off via console — return the player to user control.
+        state.autoRun.deactivate();
+    }
+
     // ── Auto-fly probe-tour ──
     // Runs unconditionally when enabled (even with the debug console open
     // — the whole point is unattended sweep iterations). Forces fly mode
     // because the physics integrator owns camera position otherwise.
     // Lazy activation: defer snapshotting probes until the first tick so
     // we read the live spawn camera position as the N-nearest "from" point.
-    if (state.autoFly.enabled) {
+    // Skipped while auto-run is active: the two are mutually exclusive
+    // (fly forces physics OFF, run forces it ON) and auto-run wins.
+    if (state.autoFly.enabled && !state.autoRun.active) {
         if (state.physicsMode) {
             state.physicsMode = false;
             std::fprintf(stderr,
@@ -4027,27 +4121,52 @@ static void updateMovement(
         state.autoFly.deactivate();
     }
 
-    if (dbgConsole.isOpen()) return;
+    // Auto-run keeps driving with the console open (unattended sweeps),
+    // same rationale as auto-fly above.
+    if (dbgConsole.isOpen() && !state.autoRun.active) return;
 
     const Uint8 *keys = SDL_GetKeyboardState(nullptr);
 
     // ── Physics mode: player walks with gravity and collision ──
     if (state.physicsMode && state.physics) {
-        // Normalized movement input [-1, 1] for forward/strafe
-        float forward = 0.0f, right = 0.0f;
-        if (keys[SDL_SCANCODE_W]) forward += 1.0f;
-        if (keys[SDL_SCANCODE_S]) forward -= 1.0f;
-        if (keys[SDL_SCANCODE_D]) right   += 1.0f;
-        if (keys[SDL_SCANCODE_A]) right   -= 1.0f;
+        // Movement intents: either from the auto-run tour or the keyboard.
+        // Everything downstream of these five setters is identical in both
+        // cases — the integrator cannot tell a tour from a human.
+        float forward = 0.0f, right = 0.0f;   // normalized [-1, 1]
+        bool  runHeld = false, sneakHeld = false;
+        int   leanDir = 0;
+        if (state.autoRun.active) {
+            // Tour steers cam.yaw toward the waypoint bearing and gates
+            // forward intent on heading alignment (turn in place first).
+            forward = state.autoRun.tick(dt, state.cam.pos,
+                                         state.cam.yaw, state.cam.pitch);
+            // Speed modes: run (Ctrl, 2x) and sneak (LShift, 0.5x).
+            // Sneak takes priority — can't run and sneak simultaneously.
+            runHeld   = state.autoRun.speedMode
+                        == Darkness::AutoRunTour::SpeedMode::Run;
+            sneakHeld = state.autoRun.speedMode
+                        == Darkness::AutoRunTour::SpeedMode::Creep;
+        } else {
+            if (keys[SDL_SCANCODE_W]) forward += 1.0f;
+            if (keys[SDL_SCANCODE_S]) forward -= 1.0f;
+            if (keys[SDL_SCANCODE_D]) right   += 1.0f;
+            if (keys[SDL_SCANCODE_A]) right   -= 1.0f;
+
+            // Speed modes: run (Ctrl, 2x) and sneak (LShift, 0.5x).
+            // Sneak takes priority — can't run and sneak simultaneously.
+            runHeld   = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL];
+            sneakHeld = keys[SDL_SCANCODE_LSHIFT] != 0;
+
+            // Lean with Q/E — lateral camera offset, physics body stays in
+            // place. In physics mode Q/E lean instead of moving vertically.
+            if (keys[SDL_SCANCODE_Q]) leanDir -= 1;
+            if (keys[SDL_SCANCODE_E]) leanDir += 1;
+        }
 
         state.physics->setPlayerMovement(forward, right);
         state.physics->setPlayerYaw(state.cam.yaw);
-
-        // Speed modes: run (Ctrl, 2x) and sneak (LShift, 0.5x).
-        // Sneak takes priority — can't run and sneak simultaneously.
-        state.physics->setPlayerRunning(
-            keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]);
-        state.physics->setPlayerSneaking(keys[SDL_SCANCODE_LSHIFT] != 0);
+        state.physics->setPlayerRunning(runHeld);
+        state.physics->setPlayerSneaking(sneakHeld);
 
         // Jump: handled by SDL_KEYDOWN event (edge-triggered, not held).
         // The original Dark Engine fires jump on key-press events, not per-frame
@@ -4057,11 +4176,6 @@ static void updateMovement(
         // Crouch with C key (toggle on/off, handled in event loop)
         state.physics->setPlayerCrouching(state.crouchToggled);
 
-        // Lean with Q/E — lateral camera offset, physics body stays in place.
-        // In physics mode Q/E lean instead of moving vertically.
-        int leanDir = 0;
-        if (keys[SDL_SCANCODE_Q]) leanDir -= 1;
-        if (keys[SDL_SCANCODE_E]) leanDir += 1;
         state.physics->getPlayerPhysics().setLeanDirection(leanDir);
 
         // Feed camera pitch to physics for diagnostic logging
@@ -6387,7 +6501,13 @@ int main(int argc, char *argv[]) {
 
             // When unfocused, skip movement but still process events
             // (so we detect refocus). Render client handles the idle case.
-            if (!state.windowFocused)
+            // EXCEPT while an unattended harness is driving (auto-run /
+            // auto-fly / audio-capture): those runs are routinely started
+            // and backgrounded — halting movement on focus loss silently
+            // froze the listener and poisoned the perf capture.
+            const bool unattendedHarness = state.autoRun.enabled
+                || state.autoFly.enabled || state.audioCapture.enabled;
+            if (!state.windowFocused && !unattendedHarness)
                 return;
 
             updateMovement(dt, state, mission, dbgConsole);
@@ -6575,6 +6695,100 @@ int main(int argc, char *argv[]) {
             "%.1f rotation(s); audio_log on, exits when the spin completes\n",
             cfg.audioCaptureX, cfg.audioCaptureY, cfg.audioCaptureZ,
             cfg.audioCaptureSeconds, cfg.audioCaptureRotations);
+    }
+
+    // Seed the auto-run probe-tour from --auto-run flags. Lazy activation
+    // on the first updateMovement tick, same as auto-fly. Mutually
+    // exclusive with --auto-fly: run forces physics ON, fly forces it OFF,
+    // so both at once would fight every frame — auto-run wins with a
+    // warning. audio_log is NOT forced here (unlike --audio-capture):
+    // stress runs opt in explicitly via --set developer.audio_log=true so
+    // the flag stays orthogonal to capture verbosity.
+    // Portal-anchor pathfinder for the tour legs: a straight line between
+    // two audio probes routinely crosses walls (probes are acoustic sample
+    // points, not nav nodes), so each waypoint leg is routed through the
+    // room graph's BSP-validated portal-anchor chain. Topology-only trace
+    // (no door-blocking / LoudRoom cost callbacks): a closed door on the
+    // route stops the walker at the door and the loud stuck-skip takes
+    // over — acceptable for an unattended stress run. Falls back to a
+    // direct leg on any resolution failure (void endpoints, no path).
+    state.autoRun.pathfinder =
+        [](const Darkness::Vector3 &from, const Darkness::Vector3 &to,
+           std::vector<Darkness::Vector3> &chainOut) -> bool {
+        chainOut.clear();
+        Darkness::RoomServicePtr roomSvc = GET_SERVICE(Darkness::RoomService);
+        if (!roomSvc) return true;  // no room graph — direct leg
+        Darkness::Room *fromRoom = roomSvc->roomFromPoint(from);
+        Darkness::Room *toRoom   = roomSvc->roomFromPoint(to);
+        if (!fromRoom || !toRoom) return true;  // void endpoint — direct leg
+        Darkness::SoundPropParams params;
+        params.maxDist  = 10000.0f;  // topology trace, not audibility —
+                                     // never range-reject a walkable route
+        params.maxPaths = 1;         // shortest path only
+        // Live door state: without it the BFS treats every portal as open
+        // and routes the walker into shut doors it cannot frob (smoke
+        // run 4 ground against one closed door across three consecutive
+        // waypoint routes).
+        Darkness::AudioServicePtr audioSvc =
+            GET_SERVICE(Darkness::AudioService);
+        if (audioSvc) {
+            params.doorBlocking = [audioSvc](int32_t a, int32_t b) {
+                return audioSvc->getBlockingFactor(a, b);
+            };
+        }
+        // Use the per-hop PORTAL CENTERS (pathOut), NOT paths[0].chain:
+        // chain's bend anchors are acoustic shortest-path points that hug
+        // portal CORNERS, which steered the walker straight into door
+        // frames (smoke run 3: 13 stuck-skips vs 3 arrivals). The center
+        // of each entered portal is the middle of the aperture — the
+        // natural walking target.
+        std::vector<Darkness::SoundPathHop> hops;
+        params.pathOut = &hops;
+        const Darkness::SoundPropInfo info = roomSvc->propagateSoundPath(
+            from, to, fromRoom, toRoom, params);
+        if (!info.reached) return false;         // disconnected — skip
+        if (hops.size() < 2) return true;        // same room — direct leg
+        for (size_t h = 1; h < hops.size(); ++h) {
+            // A hop through a near-fully-blocked portal is a door the
+            // walker cannot open — the route is acoustically traversable
+            // (sound leaks) but not walkable. Skip the waypoint.
+            if (hops[h].doorBlocking >= 0.95f) return false;
+            chainOut.push_back(hops[h].enterPortalCenter);
+        }
+        return true;
+    };
+    state.autoRun.waypointCount = cfg.autoRunWaypoints;
+    state.autoRun.seed          = cfg.autoRunSeed;
+    state.autoRun.speedMode     =
+        cfg.autoRunSpeedMode == "walk"  ? Darkness::AutoRunTour::SpeedMode::Walk
+      : cfg.autoRunSpeedMode == "creep" ? Darkness::AutoRunTour::SpeedMode::Creep
+      :                                   Darkness::AutoRunTour::SpeedMode::Run;
+    state.autoRun.enabled       = cfg.autoRun;
+    if (cfg.autoRun) {
+        if (cfg.autoFly) {
+            std::fprintf(stderr,
+                "--auto-run: --auto-fly also requested — auto-run wins "
+                "(fly forces physics OFF, run forces it ON); auto-fly "
+                "disabled\n");
+            state.autoFly.enabled = false;
+        }
+        std::fprintf(stderr,
+            "--auto-run: enabled (waypoints=%d, seed=0x%08x, mode=%s) — "
+            "activates on first input tick\n",
+            cfg.autoRunWaypoints, cfg.autoRunSeed,
+            cfg.autoRunSpeedMode.c_str());
+    }
+
+    // Seed the audio sample-selection RNG when requested (--audio-rng-seed).
+    // Makes two A/B stress runs pick the same wav per schema event; without
+    // it, sample choice varies clip length → voice lifetime → voice-count
+    // profile between runs.
+    if (cfg.audioRngSeed >= 0) {
+        auto audioSvcForSeed = GET_SERVICE(Darkness::AudioService);
+        if (audioSvcForSeed) {
+            audioSvcForSeed->seedSampleRng(
+                static_cast<uint32_t>(cfg.audioRngSeed));
+        }
     }
 
     // ── Main loop — LoopService drives frame dispatch ──

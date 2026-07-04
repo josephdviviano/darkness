@@ -56,6 +56,7 @@
 #include "ObjectIllumination.h"
 #include "DynamicLightList.h"
 #include "AutoFlyTour.h"
+#include "AutoRunTour.h"
 #include "AudioCaptureSpin.h"
 #include "physics/DarkPhysics.h"
 
@@ -527,6 +528,17 @@ struct RuntimeState {
     // first tick after `enabled` becomes true so we can read the live
     // camera position as the "from" point for N-nearest probe selection.
     AutoFlyTour autoFly;
+
+    // ── Auto-run probe-tour state ──
+    // Physics-mode sibling of autoFly: emits movement INTENTS (forward /
+    // yaw / speed mode) into the player integrator instead of driving the
+    // camera directly, so the tour produces real footsteps, collision, and
+    // stride-driven voice churn (see AutoRunTour.h). Seeded from
+    // RenderConfig's --auto-run flags at startup; toggleable at runtime
+    // via the `auto_run` console bool. Mutually exclusive with autoFly
+    // (which forces physics OFF) — the seed site warns and prefers
+    // auto-run when both are requested.
+    AutoRunTour autoRun;
 
     // ── Audio capture-point spin state ──
     // Pins the listener at a fixed world point and rotates the camera in
