@@ -1723,8 +1723,16 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             if (monoOutPeak > node->monoOutPeak.load(std::memory_order_relaxed))
                 node->monoOutPeak.store(monoOutPeak, std::memory_order_relaxed);
 
+            // PR 1a: occlusion comes from slot 0 — the dry path's actual
+            // params (voice-level directParams no longer carry occlusion;
+            // its fields are neutralized to 1.0 at the loopStep readback).
+            // Slot 0 in Free state = no path yet → treat as unobstructed.
+            const auto &meterSlot0 = node->subSources[0];
+            const float meterOccl =
+                (meterSlot0.state != SubSourceState::Free)
+                    ? meterSlot0.targetDirectParams.occlusion : 1.0f;
             float atten = node->directParams.distanceAttenuation
-                        * node->directParams.occlusion
+                        * meterOccl
                         * node->portalAttenuation;
             // Default min-atten is 0.0 (no-op for non-negative `atten`); the
             // YAML key is retained as a knob so the floor can be re-enabled.
@@ -6436,16 +6444,30 @@ void AudioService::loopStep(float deltaTime)
                 // the Steam Audio API level. Distance attenuation, air
                 // absorption, and reflections still run normally so footsteps
                 // produce reverb the same way as any other voice.
-                IPLDirectSimulationFlags directFlags = static_cast<IPLDirectSimulationFlags>(
+                //
+                // PR 1a (PLAN.AUDIO_PERF T1): the ray-casting flags
+                // (OCCLUSION volumetric + freq-dependent TRANSMISSION,
+                // ~16 serial rays/source/frame) run on the PER-SLOT
+                // sources only — the dry path consumes slot params
+                // exclusively (see the per-slot direct effect comment in
+                // steamAudioNodeProcess). The voice-level source computed
+                // the same rays at nearly the same position, but its
+                // occlusion fed only metering + diagnostics (now re-pointed
+                // at slot 0): pure duplication, measured as ~half of the
+                // 9.6 ms p50 main-thread direct_sim on MISS6. Voice-level
+                // keeps the analytic zero-ray terms only.
+                IPLDirectSimulationFlags slotDirectFlags = static_cast<IPLDirectSimulationFlags>(
                     IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
                     IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION);
                 if (!voice->playerEmitted) {
-                    directFlags = static_cast<IPLDirectSimulationFlags>(
-                        directFlags
+                    slotDirectFlags = static_cast<IPLDirectSimulationFlags>(
+                        slotDirectFlags
                         | IPL_DIRECTSIMULATIONFLAGS_OCCLUSION
                         | IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
                 }
-                inputs.directFlags = directFlags;
+                inputs.directFlags = static_cast<IPLDirectSimulationFlags>(
+                    IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
+                    IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION);
                 inputs.source = sourceCoord;
                 // Steam Audio distance model: always INVERSEDISTANCE with
                 // minDistance scaled by the schema's P$SchAttFac
@@ -6752,9 +6774,11 @@ void AudioService::loopStep(float deltaTime)
                 // type/radius/samples, transmission rays) are inherited
                 // from the voice-level `inputs` above so per-slot
                 // sampling uses the same configuration knobs. The flags
-                // word is copied verbatim — including playerEmitted's
-                // OCCL/TRANS skip — because those are per-voice
-                // characteristics that apply to every path.
+                // word is REPLACED with slotDirectFlags: slots carry the
+                // full ray-casting set (OCCL|TRANS for non-player voices)
+                // because the dry path consumes slot params exclusively,
+                // while the voice-level source stays analytic (PR 1a —
+                // see the flags comment above).
                 //
                 // Draining slots intentionally retain their last-set
                 // inputs: their gain is ramping down, the audio thread
@@ -6772,6 +6796,7 @@ void AudioService::loopStep(float deltaTime)
                     }
                     IPLSimulationInputs slotInputs = inputs;
                     slotInputs.source.origin = engineToIplPos(slotWorldPos);
+                    slotInputs.directFlags = slotDirectFlags;
                     iplSourceSetInputs(slot.directSource,
                         IPL_SIMULATIONFLAGS_DIRECT, &slotInputs);
                 }
@@ -6790,7 +6815,15 @@ void AudioService::loopStep(float deltaTime)
                 && !reflBusy && mReflectionSim
                 && mReflectionSim->throttleTickAndConsume();
 
-            // Run direct sim synchronously on the main thread (2-5ms).
+            // Run direct sim synchronously on the main thread. Measured
+            // (2026-07-04 baseline, MISS6, M2 Max): ~0.3 ms per
+            // ray-casting source, SERIAL — Steam Audio's simulateDirect
+            // is a plain loop over sources; `sim_threads` does NOT
+            // parallelize it (phonon.h documents numThreads as
+            // reflections-only). PR 1a halved the source set by making
+            // the voice-level sources analytic-only (slots own the
+            // rays); PR 1b (PLAN.AUDIO_PERF T1) moves this call to a
+            // DirectSimulator worker.
             // Same-frame results: every voice (including newly created ones)
             // gets real occlusion/distance/air absorption before the audio
             // callback sees them. Uses mDirectSimulator so the run never
@@ -7464,6 +7497,19 @@ void AudioService::loopStep(float deltaTime)
                 // a deferred reflection add silently broke the direct read
                 // too. With split simulators that coupling is gone.
                 voice->dspNode.directParams = outputs.direct;
+                // PR 1a: the voice-level source no longer computes
+                // occlusion/transmission (slot sources own the rays — see
+                // the directFlags comment at the setInputs site). Steam
+                // Audio leaves un-simulated output fields at their init
+                // value (0.0 = "fully blocked"), which would read as
+                // silence to any stray consumer. Overwrite with NEUTRAL
+                // (1.0 = unobstructed) so voice-level params are always
+                // well-defined; real occlusion lives in
+                // subSources[i].targetDirectParams.
+                voice->dspNode.directParams.occlusion = 1.0f;
+                voice->dspNode.directParams.transmission[0] = 1.0f;
+                voice->dspNode.directParams.transmission[1] = 1.0f;
+                voice->dspNode.directParams.transmission[2] = 1.0f;
 
                 // ── [OCCL_TICK] per-frame direct-effect snapshot ──
                 // Filtered to one schema (kOcclusionDebugSchemaFilter) so
@@ -7473,9 +7519,17 @@ void AudioService::loopStep(float deltaTime)
                 // moves > 0.1 from the prior emit. Door-xform delta
                 // comes from sDoorXformDeltaForTick (published at top
                 // of loopStep).
+                // PR 1a: reads slot 0 (the dry path's actual params).
+                // Slot outputs are harvested LATER this loopStep, so the
+                // values here are one frame stale — fine for a diagnostic.
                 if (shouldDiagOcclusion(voice->schemaName)) {
                     static std::unordered_map<SoundHandle, float> sPrevOcclusion;
-                    const float curOccl = outputs.direct.occlusion;
+                    const auto &diagSlot0 = voice->dspNode.subSources[0];
+                    const IPLDirectEffectParams &slot0Params =
+                        diagSlot0.targetDirectParams;
+                    const float curOccl =
+                        (diagSlot0.state != SubSourceState::Free)
+                            ? slot0Params.occlusion : 1.0f;
                     auto itPrev = sPrevOcclusion.find(voice->handle);
                     const bool occlJumped = (itPrev == sPrevOcclusion.end())
                         || (std::fabs(curOccl - itPrev->second) > 0.1f);
@@ -7498,9 +7552,9 @@ void AudioService::loopStep(float deltaTime)
                             voice->handle, voice->schemaName.c_str(),
                             static_cast<unsigned long long>(kFrameForDiag),
                             curOccl,
-                            outputs.direct.transmission[0],
-                            outputs.direct.transmission[1],
-                            outputs.direct.transmission[2],
+                            slot0Params.transmission[0],
+                            slot0Params.transmission[1],
+                            slot0Params.transmission[2],
                             src.x, src.y, src.z,
                             lst.x, lst.y, lst.z,
                             euclideanFt,
@@ -7547,11 +7601,15 @@ void AudioService::loopStep(float deltaTime)
                 // convolution input, so distance now also attenuates
                 // the reverb tail (previously it was full volume too).
                 if (voice->isAmbient) {
+                    // PR 1a: APPLYOCCLUSION/APPLYTRANSMISSION dropped from
+                    // the VOICE-LEVEL flags — the voice source no longer
+                    // simulates them (slot sources own the rays, and their
+                    // own flag fixups happen at the slot readback below).
+                    // Claiming APPLY* here on neutralized fields would
+                    // misreport in [DPARAM_READ].
                     voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
                         IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
-                        IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
-                        IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
-                        IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+                        IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
                     // No distanceAttenuation override — the value
                     // copied from outputs.direct (set by Steam Audio's
                     // INVERSEDISTANCE evaluator) is correct.
@@ -7569,11 +7627,11 @@ void AudioService::loopStep(float deltaTime)
                         IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
                     voice->dspNode.directParams.distanceAttenuation = 1.0f;
                 } else {
+                    // PR 1a: same as the isAmbient branch — voice-level
+                    // params are analytic-only now; slots carry occlusion.
                     voice->dspNode.directParams.flags = static_cast<IPLDirectEffectFlags>(
                         IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
-                        IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
-                        IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
-                        IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+                        IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
                 }
                 voice->dspNode.directParams.transmissionType =
                     IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
@@ -7646,15 +7704,18 @@ void AudioService::loopStep(float deltaTime)
                         IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
                 }
 
-                // Diagnostic: log Steam Audio direct params for door sounds
+                // Diagnostic: log Steam Audio direct params for door sounds.
+                // PR 1a: occlusion/transmission come from slot 0 (the dry
+                // path's actual params — voice-level fields are neutral now).
                 if (voice->skipPortalRouting) {
-                    const auto &dp = voice->dspNode.directParams;
+                    const auto &dp  = voice->dspNode.directParams;
+                    const auto &sp0 = voice->dspNode.subSources[0].targetDirectParams;
                     AUDIO_LOG( "[DOOR_SND] h=%u '%s' distAtten=%.3f "
                                  "occl=%.3f trans=(%.2f,%.2f,%.2f) "
                                  "portalRoute=%d portalAtten=%.3f blocking=%.3f\n",
                                  handle, voice->schemaName.c_str(),
-                                 dp.distanceAttenuation, dp.occlusion,
-                                 dp.transmission[0], dp.transmission[1], dp.transmission[2],
+                                 dp.distanceAttenuation, sp0.occlusion,
+                                 sp0.transmission[0], sp0.transmission[1], sp0.transmission[2],
                                  (int)voice->dspNode.usePortalRouting,
                                  voice->dspNode.portalAttenuation,
                                  voice->dspNode.portalBlocking);
@@ -8135,9 +8196,9 @@ void AudioService::loopStep(float deltaTime)
                 // infer "baked likely" if the voice is excluded from the
                 // top-N candidate pool (playerEmitted with probes) or
                 // simply not in the top-N this frame.
-                // occlScalar is the directParams.occlusion fraction (0
-                // = fully blocked, 1 = unobstructed). transmission[3] is
-                // the per-band passthrough fraction Steam Audio computes
+                // occlScalar is the occlusion fraction (0 = fully
+                // blocked, 1 = unobstructed). transmission[3] is the
+                // per-band passthrough fraction Steam Audio computes
                 // alongside occlusion when both flags are set. Both feed
                 // iplDirectEffectApply on the audio thread — they are
                 // the only attenuation the DRY direct-path bus gets for
@@ -8146,10 +8207,16 @@ void AudioService::loopStep(float deltaTime)
                 // direct-sim leakage (eg. a closed door registering as
                 // unoccluded would print "active" exactly like a clear
                 // line-of-sight voice).
-                const float occlScalar    = dp.occlusion;
-                const float occlTransLow  = dp.transmission[0];
-                const float occlTransMid  = dp.transmission[1];
-                const float occlTransHigh = dp.transmission[2];
+                // PR 1a: read from slot 0 — the dry path's actual params
+                // (voice-level directParams are analytic-only + neutral).
+                const auto &dumpSlot0 =
+                    voice->dspNode.subSources[0].targetDirectParams;
+                const bool  slot0Live =
+                    voice->dspNode.subSources[0].state != SubSourceState::Free;
+                const float occlScalar    = slot0Live ? dumpSlot0.occlusion : 1.0f;
+                const float occlTransLow  = slot0Live ? dumpSlot0.transmission[0] : 1.0f;
+                const float occlTransMid  = slot0Live ? dumpSlot0.transmission[1] : 1.0f;
+                const float occlTransHigh = slot0Live ? dumpSlot0.transmission[2] : 1.0f;
                 const char *occlStr =
                     voice->playerEmitted ? "skip" : "active";
                 // Calibration diagnostic: compute what the original
@@ -9300,25 +9367,29 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
             IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
         dsp.directParams.distanceAttenuation = 1.0f;
     } else if (voice.isAmbient) {
+        // PR 1a: voice-level flags are analytic-only in every branch —
+        // occlusion/transmission run on the slot sources (their silent
+        // seeding below is what gates "no sound until first sim").
         dsp.directParams.flags = static_cast<IPLDirectEffectFlags>(
             IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
-            IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION |
-            IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION |
-            IPL_DIRECTEFFECTFLAGS_APPLYTRANSMISSION);
+            IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
         dsp.directParams.distanceAttenuation = 0.0f;
     } else {
         dsp.directParams.flags = static_cast<IPLDirectEffectFlags>(
             IPL_DIRECTEFFECTFLAGS_APPLYDISTANCEATTENUATION |
-            IPL_DIRECTEFFECTFLAGS_APPLYOCCLUSION);
+            IPL_DIRECTEFFECTFLAGS_APPLYAIRABSORPTION);
         dsp.directParams.distanceAttenuation = 0.0f;
     }
     dsp.directParams.airAbsorption[0] = 1.0f;
     dsp.directParams.airAbsorption[1] = 1.0f;
     dsp.directParams.airAbsorption[2] = 1.0f;
-    dsp.directParams.occlusion = 0.0f;
-    dsp.directParams.transmission[0] = 0.0f;
-    dsp.directParams.transmission[1] = 0.0f;
-    dsp.directParams.transmission[2] = 0.0f;
+    // PR 1a: neutral (1.0), matching the per-frame readback — the
+    // voice-level source never computes these anymore. Slot
+    // targetDirectParams keep the silent-until-sim seeding.
+    dsp.directParams.occlusion = 1.0f;
+    dsp.directParams.transmission[0] = 1.0f;
+    dsp.directParams.transmission[1] = 1.0f;
+    dsp.directParams.transmission[2] = 1.0f;
 
     // Connect the node graph BEFORE setting effectsReady — prevents the audio
     // thread from trying to process through an unconnected node.
