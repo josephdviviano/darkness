@@ -134,7 +134,8 @@ struct AutoRunTour {
     // waypoint is UNROUTABLE on foot (disconnected, or every route
     // crosses a closed door) — the tour then fly-assists instead of
     // grinding against a door. true + empty chainOut = same-room direct
-    // leg. Unset ⇒ direct legs everywhere (escapes still guard them).
+    // leg. Unset ⇒ direct legs everywhere (the stuck/timeout triggers
+    // still arm fly-assist when a direct leg fails).
     using Pathfinder =
         std::function<bool(const Vector3 &from, const Vector3 &to,
                            std::vector<Vector3> &chainOut)>;

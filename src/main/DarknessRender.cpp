@@ -407,7 +407,7 @@ static void printHelp() {
         "                                [--auto-run] [--auto-run-waypoints <N>]\n"
         "                                [--auto-run-seed <N>]\n"
         "                                [--auto-run-speed-mode <run|walk|creep>]\n"
-        "                                [--audio-rng-seed <N>]\n"
+        "                                [--audio-rng-seed <N>] [--audio-log]\n"
         "                                [--audio-capture <x,y,z>]\n"
         "                                [--audio-capture-seconds <N>]\n"
         "                                [--audio-capture-rotations <N>]\n"
@@ -459,8 +459,9 @@ static void printHelp() {
         "                    mode). The player runs between nearby pathing probes\n"
         "                    spanning >= 2 rooms, generating real footsteps and\n"
         "                    portal crossings — the audio stress profile for\n"
-        "                    tools/perf_sweep.sh A/B runs. Skips unreachable\n"
-        "                    waypoints loudly ([AUTO_RUN] stuck/timeout lines).\n"
+        "                    tools/perf_sweep.sh A/B runs. Waypoints unreachable\n"
+        "                    on foot are reached by a loud fly-assist glide\n"
+        "                    ([AUTO_RUN] stuck/timeout/fly-assist lines).\n"
         "                    Mutually exclusive with --auto-fly (auto-run wins).\n"
         "  --auto-run-waypoints N    N-nearest walkable probes (default 50).\n"
         "  --auto-run-seed N         PRNG seed for visit-order shuffle (default\n"
@@ -4072,7 +4073,15 @@ static void updateMovement(
                 return;  // glide frame complete; walking resumes next tick
             }
             if (state.autoRun.active && !state.physicsMode) {
+                // Same body sync as the physics_mode console toggle:
+                // without it, enabling auto_run from fly mode snaps the
+                // camera back to the stale body position (review B1).
                 state.physicsMode = true;
+                state.crouchToggled = false;
+                Darkness::Vector3 bodyPos(
+                    state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+                state.physics->setPlayerPosition(bodyPos);
+                state.physics->setPlayerYaw(state.cam.yaw);
                 std::fprintf(stderr,
                     "[AUTO_RUN] forcing physics_mode on (auto-run drives "
                     "the player integrator)\n");
@@ -4080,6 +4089,20 @@ static void updateMovement(
         }
     } else if (state.autoRun.active) {
         // Toggled off via console — return the player to user control.
+        // If we were mid-glide, physics is OFF; restore it loudly (with
+        // the standard body sync) rather than leaving the player in
+        // noclip with no announcement.
+        if (state.autoRun.flyAssist && state.physics && !state.physicsMode) {
+            state.physicsMode = true;
+            state.crouchToggled = false;
+            Darkness::Vector3 bodyPos(
+                state.cam.pos[0], state.cam.pos[1], state.cam.pos[2]);
+            state.physics->setPlayerPosition(bodyPos);
+            state.physics->setPlayerYaw(state.cam.yaw);
+            std::fprintf(stderr,
+                "[AUTO_RUN] deactivated mid-glide — physics restored at "
+                "current position\n");
+        }
         state.autoRun.deactivate();
     }
 
@@ -6702,16 +6725,17 @@ int main(int argc, char *argv[]) {
     // exclusive with --auto-fly: run forces physics ON, fly forces it OFF,
     // so both at once would fight every frame — auto-run wins with a
     // warning. audio_log is NOT forced here (unlike --audio-capture):
-    // stress runs opt in explicitly via --set developer.audio_log=true so
-    // the flag stays orthogonal to capture verbosity.
-    // Portal-anchor pathfinder for the tour legs: a straight line between
+    // stress runs opt in explicitly via --audio-log so the flag stays
+    // orthogonal to capture verbosity.
+    // Portal-center pathfinder for the tour legs: a straight line between
     // two audio probes routinely crosses walls (probes are acoustic sample
-    // points, not nav nodes), so each waypoint leg is routed through the
-    // room graph's BSP-validated portal-anchor chain. Topology-only trace
-    // (no door-blocking / LoudRoom cost callbacks): a closed door on the
-    // route stops the walker at the door and the loud stuck-skip takes
-    // over — acceptable for an unattended stress run. Falls back to a
-    // direct leg on any resolution failure (void endpoints, no path).
+    // points, not nav nodes), so each walking leg is routed through the
+    // room graph's portal-center chain, with LIVE DOOR BLOCKING wired in
+    // below — a route through a shut door (or a disconnected room)
+    // returns false and the tour fly-assists to the waypoint instead of
+    // grinding against the door. Void endpoints / missing services fall
+    // back to a direct leg (true + empty chain); the stuck/timeout
+    // triggers still guard those.
     state.autoRun.pathfinder =
         [](const Darkness::Vector3 &from, const Darkness::Vector3 &to,
            std::vector<Darkness::Vector3> &chainOut) -> bool {

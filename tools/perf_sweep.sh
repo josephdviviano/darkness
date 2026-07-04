@@ -158,6 +158,12 @@ AUTO_RUN_SEED="${AUTO_RUN_SEED:-}"
 AUTO_RUN_SPEED_MODE="${AUTO_RUN_SPEED_MODE:-}"
 AUDIO_RNG_SEED="${AUDIO_RNG_SEED:-}"
 
+# Audio-log verbosity gates ALL [PERF *] histogram recording — a sweep
+# without it yields zeroed histograms discovered only after the fact.
+# Default ON for sweeps; AUDIO_LOG=0 only if the YAML already sets
+# developer.audio_log and you want the sweep to inherit it.
+AUDIO_LOG="${AUDIO_LOG:-1}"
+
 # Force-pathing-bake (Sweep 2 Phase B). When 1, every iteration drops the
 # cached pathing section and re-bakes it fresh. Reflection bytes carry
 # forward via --skip-reflection-bake (always passed below). Only switch
@@ -293,6 +299,9 @@ for VAL in "${VALUES[@]}"; do
         [ -n "$AUTO_FLY_PAUSE_SEC" ]  && AUTO_FLY_ARGS+=(--auto-fly-pause-sec "$AUTO_FLY_PAUSE_SEC")
     fi
     [ -n "$AUDIO_RNG_SEED" ] && AUTO_FLY_ARGS+=(--audio-rng-seed "$AUDIO_RNG_SEED")
+    if [ "$AUDIO_LOG" = "1" ] || [ "$AUDIO_LOG" = "true" ]; then
+        AUTO_FLY_ARGS+=(--audio-log)
+    fi
 
     # Sweep 2 Phase B: append --force-pathing-bake when FORCE_PATHING_BAKE=1.
     # The flag composes with --skip-reflection-bake (always passed) — the
