@@ -2273,10 +2273,22 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
             directOut.data = &directOutPtr;
             // T2.2 — time this iplDirectEffectApply call too
             // (the mono-output fallback path).
+            //
+            // PR #3 review S2: apply slot 0's OWN params — voice-level
+            // directParams are analytic-only + neutral since PR 1a, so
+            // using them here silently dropped occlusion on this
+            // degraded/bypass path (reachable at bypassLevel 1 and when
+            // binaural creation fails). A Free slot (no path yet) falls
+            // back to the neutral voice params — matching the main
+            // path's silent-until-sim behavior.
+            IPLDirectEffectParams fbParams =
+                (node->subSources[0].state != SubSourceState::Free)
+                    ? node->subSources[0].targetDirectParams
+                    : node->directParams;
             auto deT0b = profOn ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
             iplDirectEffectApply(node->subSources[0].directEffect,
-                                 &node->directParams,
+                                 &fbParams,
                                  &directIn, &directOut);
             if (profOn) {
                 auto deT1b = std::chrono::steady_clock::now();
@@ -7500,11 +7512,13 @@ void AudioService::loopStep(float deltaTime)
                 // PR 1a: the voice-level source no longer computes
                 // occlusion/transmission (slot sources own the rays — see
                 // the directFlags comment at the setInputs site). Steam
-                // Audio leaves un-simulated output fields at their init
-                // value (0.0 = "fully blocked"), which would read as
-                // silence to any stray consumer. Overwrite with NEUTRAL
-                // (1.0 = unobstructed) so voice-level params are always
-                // well-defined; real occlusion lives in
+                // Audio itself already returns NEUTRAL 1.0 for
+                // un-simulated fields (simulation_data.cpp seeds 1.0;
+                // direct_simulator writes 1.0 when a flag is absent —
+                // verified v4.7.0, PR #3 review S1), so this overwrite is
+                // defense-in-depth against an upstream default change,
+                // not a behavioral necessity. Voice-level params are
+                // therefore always well-defined; real occlusion lives in
                 // subSources[i].targetDirectParams.
                 voice->dspNode.directParams.occlusion = 1.0f;
                 voice->dspNode.directParams.transmission[0] = 1.0f;
@@ -7709,13 +7723,19 @@ void AudioService::loopStep(float deltaTime)
                 // path's actual params — voice-level fields are neutral now).
                 if (voice->skipPortalRouting) {
                     const auto &dp  = voice->dspNode.directParams;
-                    const auto &sp0 = voice->dspNode.subSources[0].targetDirectParams;
+                    const auto &doorSlot0 = voice->dspNode.subSources[0];
+                    const bool  doorSlot0Live =
+                        doorSlot0.state != SubSourceState::Free;
+                    const auto &sp0 = doorSlot0.targetDirectParams;
                     AUDIO_LOG( "[DOOR_SND] h=%u '%s' distAtten=%.3f "
                                  "occl=%.3f trans=(%.2f,%.2f,%.2f) "
                                  "portalRoute=%d portalAtten=%.3f blocking=%.3f\n",
                                  handle, voice->schemaName.c_str(),
-                                 dp.distanceAttenuation, sp0.occlusion,
-                                 sp0.transmission[0], sp0.transmission[1], sp0.transmission[2],
+                                 dp.distanceAttenuation,
+                                 doorSlot0Live ? sp0.occlusion : 1.0f,
+                                 doorSlot0Live ? sp0.transmission[0] : 1.0f,
+                                 doorSlot0Live ? sp0.transmission[1] : 1.0f,
+                                 doorSlot0Live ? sp0.transmission[2] : 1.0f,
                                  (int)voice->dspNode.usePortalRouting,
                                  voice->dspNode.portalAttenuation,
                                  voice->dspNode.portalBlocking);
@@ -7938,15 +7958,20 @@ void AudioService::loopStep(float deltaTime)
                     if (voice->dspNode.isFootstepDiag && !voice->loggedReflActivationMain) {
                         voice->loggedReflActivationMain = true;
                         float voiceDist = glm::length(voice->worldPos - mListenerPos);
+                        // PR #3 review S3: occl/trans from slot 0 (the dry
+                        // path's actual params — voice-level are neutral).
+                        const auto &footSlot0 = voice->dspNode.subSources[0];
+                        const bool footSlot0Live =
+                            footSlot0.state != SubSourceState::Free;
                         AUDIO_LOG("[FOOT_REFL_ON] h=%u '%s' dist=%.1f irSize=%d distAtten=%.3f "
                                   "occl=%.3f trans=(%.2f,%.2f,%.2f) src=%s ambiCh=%d\n",
                                   handle, voice->schemaName.c_str(), voiceDist,
                                   voice->dspNode.reflectionParams.irSize,
                                   voice->dspNode.directParams.distanceAttenuation,
-                                  voice->dspNode.directParams.occlusion,
-                                  voice->dspNode.directParams.transmission[0],
-                                  voice->dspNode.directParams.transmission[1],
-                                  voice->dspNode.directParams.transmission[2],
+                                  footSlot0Live ? footSlot0.targetDirectParams.occlusion : 1.0f,
+                                  footSlot0Live ? footSlot0.targetDirectParams.transmission[0] : 1.0f,
+                                  footSlot0Live ? footSlot0.targetDirectParams.transmission[1] : 1.0f,
+                                  footSlot0Live ? footSlot0.targetDirectParams.transmission[2] : 1.0f,
                                   isReflVoice ? "topN" : "baked",
                                   static_cast<int>(mAmbisonicsChannels));
                     }
@@ -7990,9 +8015,16 @@ void AudioService::loopStep(float deltaTime)
                 // the DSP node. Cross-room voices also have their IPLSource
                 // position overridden to the virtual position.
             } else {
-                // Fallback: simple volume scaling (no DSP pipeline available)
-                float volume = outputs.direct.distanceAttenuation *
-                               outputs.direct.occlusion;
+                // Fallback: simple volume scaling (no DSP pipeline available).
+                // PR #3 review S4: occlusion from slot 0 — voice-level
+                // outputs.direct.occlusion is neutral 1.0 since PR 1a, which
+                // silently made these fallback voices play through walls at
+                // distance-only volume. Free slot → neutral (no path data).
+                const auto &fbSlot0 = voice->dspNode.subSources[0];
+                const float fbOccl =
+                    (fbSlot0.state != SubSourceState::Free)
+                        ? fbSlot0.targetDirectParams.occlusion : 1.0f;
+                float volume = outputs.direct.distanceAttenuation * fbOccl;
                 ma_sound_set_volume(&voice->sound, volume);
             }
         }
