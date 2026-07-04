@@ -411,6 +411,7 @@ static void printHelp() {
         "                                [--audio-capture <x,y,z>]\n"
         "                                [--audio-capture-seconds <N>]\n"
         "                                [--audio-capture-rotations <N>]\n"
+        "                                [--capture-wav]\n"
         "                                [-h | --help]\n"
         "\n"
         "  All other tunables live in the YAML config (default: ./darknessRender.yaml).\n"
@@ -485,6 +486,12 @@ static void printHelp() {
         "                    Example: --audio-capture 12.5,-45,-47\n"
         "  --audio-capture-seconds N   Capture window length in seconds (default 15).\n"
         "  --audio-capture-rotations N Full yaw turns over the window (default 3).\n"
+        "  --capture-wav     Record the engine's final stereo output (f32 WAV,\n"
+        "                    post master DSP chain) to output.wav next to the\n"
+        "                    per-run audio_perf.jsonl. Listenable evidence for\n"
+        "                    A/B runs; analyze offline with tools/wav_artifacts.py.\n"
+        "                    Emits [WAV_CAPTURE] opened/closed stderr lines\n"
+        "                    (= developer.capture_wav in YAML).\n"
         "  -h, --help        Show this message and exit.\n"
         "\n"
         "YAML CONFIG REFERENCE (defaults shown; see darknessRender.example.yaml)\n"
@@ -518,6 +525,7 @@ static void printHelp() {
         "    toggle_platforms: false         auto-activate moving terrain at startup\n"
         "    no_probes: false                skip Steam Audio probe baking\n"
         "    audio_log: false                audio/sound/schema log output\n"
+        "    capture_wav: false              record final output to per-run output.wav\n"
         "\n"
         "  audio: (eight subsections — see darknessRender.example.yaml for the full set)\n"
         "    audio.performance.*    sample rate, frame size, voice/thread caps, scene type\n"
@@ -5334,6 +5342,33 @@ int main(int argc, char *argv[]) {
                                     cfg.perfLabel, cliArgvJoined, audioCfgJson);
         }
 
+        // ── --capture-wav: record the final engine output ──
+        // PLAN.AUDIO_PERF.md PR 0.2 — output.wav lives NEXT TO the
+        // audio_perf.jsonl in the same per-run directory, so every capture
+        // is paired with the perf record of the run that produced it.
+        // Analyzed offline by tools/wav_artifacts.py. Finalized by the
+        // explicit stopWavCapture() call after the main loop below (emits
+        // [WAV_CAPTURE] closed: ...).
+        if (cfg.captureWav) {
+            const std::string &jsonlPath = audioSvc->getPerfJsonlPath();
+            if (audioSvc->isPerfJsonlOpen() && !jsonlPath.empty()) {
+                std::string wavPath = jsonlPath;
+                auto slash = wavPath.find_last_of('/');
+                wavPath = (slash == std::string::npos)
+                              ? std::string("output.wav")
+                              : wavPath.substr(0, slash + 1) + "output.wav";
+                audioSvc->startWavCapture(wavPath);
+            } else {
+                // No run directory to put the WAV in — announce loudly
+                // rather than silently skipping the capture the user
+                // explicitly asked for.
+                std::fprintf(stderr,
+                    "[FALLBACK] --capture-wav: perf JSONL sink failed to "
+                    "open (no per-run directory) — WAV capture disabled "
+                    "for this run\n");
+            }
+        }
+
         if (!audioSvc->buildAcousticScene(fullScene)) {
             std::fprintf(stderr, "WARNING: failed to build acoustic scene\n"
                                  "         Steam Audio spatialization disabled.\n");
@@ -6837,6 +6872,20 @@ int main(int argc, char *argv[]) {
                 exitAfterFired = true;
             }
         }
+    }
+
+    // Finalize the WAV capture on the normal exit path, while the audio
+    // device is still alive. AudioService::shutdown() also stops capture,
+    // but the ServiceManager teardown does not reliably run before process
+    // exit (observable: [PERF_SINK] closed has never appeared in run logs —
+    // the JSONL survives only because every write is fflushed). A WAV is
+    // different: ma_encoder_uninit MUST run to back-patch the RIFF header
+    // sizes, or the capture reads as 0 data bytes. No-op when --capture-wav
+    // was not passed.
+    {
+        auto audioSvcForWav = GET_SERVICE(Darkness::AudioService);
+        if (audioSvcForWav)
+            audioSvcForWav->stopWavCapture();
     }
 
     // Clean up LoopClients and SimListeners before state is destroyed

@@ -1203,6 +1203,45 @@ public:
     /** True if openPerfJsonl succeeded and the file is still open. */
     bool isPerfJsonlOpen() const;
 
+    /** Full path of the open audio_perf.jsonl (empty if never opened).
+     *  Used by the renderer to co-locate other per-run artifacts (e.g.
+     *  the --capture-wav output.wav) in the same run directory. */
+    const std::string& getPerfJsonlPath() const { return mPerfJsonlPath; }
+
+    // ── WAV capture of the final engine output (PLAN.AUDIO_PERF.md PR 0.2) ──
+
+    /** Start capturing the engine's final stereo f32 output to a WAV file.
+     *
+     *  RT-safety: the device data callback NEVER does I/O — when capture is
+     *  active it memcpys the just-rendered frames into a lock-free SPSC
+     *  ring (miniaudio ma_pcm_rb); a dedicated writer thread drains the
+     *  ring every ~50 ms into a ma_encoder (WAV, f32, 2ch, engine sample
+     *  rate). Ring-full never blocks the audio thread — overflowed frames
+     *  are counted and reported loudly at stop time. When capture is off
+     *  the callback pays a single relaxed atomic load.
+     *
+     *  Call AFTER initMiniaudio() (needs the device alive) and before
+     *  gameplay you want captured. Encoder-init failure is announced
+     *  loudly ([WAV_CAPTURE] + [FALLBACK]) and capture stays off — the
+     *  run continues without it, never crashes.
+     *
+     *  @param path  output .wav path (directories must already exist)
+     *  @return true if the encoder opened and the writer thread started */
+    bool startWavCapture(const std::string &path);
+
+    /** Stop capture, drain the ring, finalize the WAV, join the writer
+     *  thread. Emits the `[WAV_CAPTURE] closed: <path> frames=<n>
+     *  dropped=<n>` line; dropped>0 additionally emits a [FALLBACK]-style
+     *  warning (per feedback_no_silent_fallbacks — a gappy capture must
+     *  be impossible to mistake for a clean one). Safe to call when
+     *  capture was never started (no-op), and idempotent. Called from
+     *  main() right after the render loop exits (the ServiceManager
+     *  teardown does not reliably run before process exit, and the WAV
+     *  header MUST be back-patched by ma_encoder_uninit), and again from
+     *  shutdown() / the destructor as safety nets BEFORE engine/device
+     *  teardown. */
+    void stopWavCapture();
+
 protected:
     // ── Service lifecycle ──
 
@@ -1981,6 +2020,24 @@ private:
     std::FILE*                                  mPerfJsonlFile = nullptr;
     std::string                                 mPerfJsonlPath;
     std::chrono::steady_clock::time_point       mPerfJsonlStartedAt;
+
+    // ── WAV capture state (PLAN.AUDIO_PERF.md PR 0.2) ──
+    //
+    // The ring buffer, encoder, and capture-active flag live as file-scope
+    // state in AudioService.cpp (same pattern as sEngineSampleRate /
+    // sLastDeviceCbNs) because the device data callback is a static
+    // function with no path back to `this`, and ma_pcm_rb / ma_encoder
+    // must stay out of this header. AudioService is a singleton, so the
+    // file-scope state is effectively per-instance. The members below are
+    // the main-thread-owned lifecycle handles.
+    std::thread        mWavWriterThread;          ///< drains ring → encoder
+    std::atomic<bool>  mWavWriterRun{false};      ///< writer-thread run flag
+    bool               mWavCaptureStarted = false;///< encoder+ring+thread alive
+    std::string        mWavCapturePath;           ///< for the closed: report
+
+    /// Writer-thread body: drain the capture ring into the WAV encoder
+    /// every ~50 ms; final drain happens in stopWavCapture after join.
+    void wavWriterThreadMain();
 
     // Private helpers
     bool initMiniaudio();
