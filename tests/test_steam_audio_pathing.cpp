@@ -41,11 +41,13 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 
+#include "audio/DirectSimulator.h"
 #include "audio/PathingSimulator.h"
 #include "audio/ProbeManager.h"
 #include "audio/SteamAudioPathing.h"
 
 using Catch::Approx;
+using Darkness::DirectSimulator;
 using Darkness::PathingDspMapping;
 using Darkness::PathingSimulator;
 using Darkness::ProbeBakeParams;
@@ -403,4 +405,93 @@ TEST_CASE("PathingSimulator: live pending-source race repro "
     //      assert it lands without [PENDING_SKIP].
     SUCCEED("Skipped: full repro requires live IPL simulator + "
             "AudioService [PENDING_SKIP] log (Agent 1)");
+}
+
+// ── DirectSimulator (PLAN.AUDIO_PERF PR 1b) pending-source + cycle-gate ────
+//
+// The direct sim moved onto its own worker thread in PR 1b, inheriting the
+// same pending-add/remove queue contract as PathingSimulator (the 4th
+// potential recurrence of project_audio_pending_source_race). These tests
+// pin the queue mechanics plus the two pieces that are NEW relative to the
+// pathing clone: the completed-cycle counter that gates loopStep's harvest
+// pass, and the synchronous-fallback path used when the worker thread
+// fails to start. Same fake-pointer convention as above: handles are never
+// dereferenced because the simulator handle stays null.
+
+TEST_CASE("DirectSimulator: queued source is observably pending",
+          "[steam_audio][direct][pending_race]") {
+    DirectSimulator sim;
+    sim.setSimulator(nullptr);
+
+    auto fakeSrc = reinterpret_cast<IPLSource>(uintptr_t{0xC0FFEE11});
+
+    CHECK_FALSE(sim.isAddPending(fakeSrc));
+
+    sim.queueSourceAdd(fakeSrc);
+    CHECK(sim.isAddPending(fakeSrc));
+
+    // Trying to remove a source that isn't pending returns false.
+    auto otherSrc = reinterpret_cast<IPLSource>(uintptr_t{0xDEADBEE1});
+    CHECK_FALSE(sim.removeFromPendingAdds(otherSrc));
+
+    // The real removal succeeds once, then becomes a no-op.
+    CHECK(sim.removeFromPendingAdds(fakeSrc));
+    CHECK_FALSE(sim.removeFromPendingAdds(fakeSrc));
+    CHECK_FALSE(sim.isAddPending(fakeSrc));
+}
+
+TEST_CASE("DirectSimulator: cycle counter + dirty flag contracts with no "
+          "simulator wired",
+          "[steam_audio][direct][pending_race]") {
+    DirectSimulator sim;
+    sim.setSimulator(nullptr);
+
+    // Fresh instance: zero completed cycles. loopStep's harvest gate is
+    // strictly greater-than (completedCycles() > directSimCycleAtAdd),
+    // so a source stamped at cycle 0 stays unharvested until the first
+    // real iteration completes.
+    CHECK(sim.completedCycles() == 0);
+
+    // runSynchronous with a null simulator is a no-op — the counter
+    // must NOT advance, or the harvest gate would open for a source no
+    // solver iteration has ever contained.
+    sim.runSynchronous();
+    CHECK(sim.completedCycles() == 0);
+
+    // Dirty-flag contract: commitIfDirty early-returns without a
+    // simulator, leaving the flag set for the next flush point that has
+    // one (matches Pathing/ReflectionSimulator semantics).
+    CHECK_FALSE(sim.isSimulatorDirty());
+    sim.setSimulatorDirty();
+    CHECK(sim.isSimulatorDirty());
+    sim.commitIfDirty();
+    CHECK(sim.isSimulatorDirty());
+}
+
+TEST_CASE("DirectSimulator: worker lifecycle — start, idle signal, stop",
+          "[steam_audio][direct]") {
+    DirectSimulator sim;
+    sim.setSimulator(nullptr);
+
+    CHECK_FALSE(sim.started());
+    // start() reports success (the [FALLBACK]-to-synchronous decision in
+    // AudioService::bootstrapFinished keys off this).
+    REQUIRE(sim.start());
+    CHECK(sim.started());
+    // Idempotent start.
+    CHECK(sim.start());
+
+    // Worker parks idle until signaled.
+    CHECK_FALSE(sim.isRunning());
+
+    // Signal with no simulator: the worker wakes, skips the iteration,
+    // and releases mRunning. waitForCompletion must observe the idle
+    // state; the cycle counter must not advance (no iteration ran).
+    sim.signal();
+    sim.waitForCompletion();
+    CHECK_FALSE(sim.isRunning());
+    CHECK(sim.completedCycles() == 0);
+
+    sim.stop();
+    CHECK_FALSE(sim.started());
 }
