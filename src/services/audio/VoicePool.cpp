@@ -151,9 +151,11 @@ ActiveVoice::~ActiveVoice()
 
     // Release IPLSources (removeVoiceSource should have been called, but be safe).
     // Per-slot direct sources mirror the voice-level directSource handling —
-    // they're added to the same mDirectSimulator and removed in
-    // removeVoiceSource, but if that hook wasn't run we at least release
-    // the handles here so the IPL refcount drops to zero.
+    // they're added to the same direct simulator and removed in
+    // removeVoiceSource (which nulls these fields on its queued-remove
+    // path, so this safety net can't double-release with
+    // DirectSimulator::flushPendingRemovals). If the hook wasn't run we
+    // at least release the handles here so the IPL refcount drops to zero.
     if (directSource) {
         iplSourceRelease(&directSource);
     }
