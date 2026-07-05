@@ -101,6 +101,7 @@ struct ProbeBakePlan;
 // Owned subsystem types — full definitions live in their own headers.
 class ReflectionSimulator;
 class PathingSimulator;
+class DirectSimulator;
 class ConvolutionWorkerPool;
 struct ConvolutionWorker;
 
@@ -913,9 +914,15 @@ public:
     /** Global dedup pass radius in engine feet (see ProbeBakeParams).
      *  Probes within this distance of an earlier-kept probe (in
      *  placement order: floor → elevation → portal → emitter) get
-     *  dropped. 0 = disabled. Clamped to [0.0, 10.0]. Requires re-bake. */
+     *  dropped. 0 = disabled. Clamped to [0.0, 30.0]. Requires re-bake.
+     *  The cap was 10.0 until the --bake-quality dev profile needed
+     *  sparser sets (PR #5 era): FLOOR_POLY emits per BSP floor polygon,
+     *  so this radius is the only density control for dev bakes —
+     *  10 ft left MISS2 at 1,247 probes (~25 min dev bake) vs the
+     *  <10 min target. Ship-quality density is yaml-driven and far
+     *  below the cap either way. */
     void setProbeGlobalDedupRadiusFt(float ft) {
-        mProbeGlobalDedupRadiusFt = std::max(0.0f, std::min(ft, 10.0f));
+        mProbeGlobalDedupRadiusFt = std::max(0.0f, std::min(ft, 30.0f));
     }
     float getProbeGlobalDedupRadiusFt() const { return mProbeGlobalDedupRadiusFt; }
 
@@ -1649,13 +1656,25 @@ private:
     /// ReflectionSimulator.h for the full threading contract.
     std::unique_ptr<ReflectionSimulator> mReflectionSim;
 
-    /// Simulator for direct path (distance attenuation, occlusion, air
-    /// absorption, transmission). Runs synchronously on the main thread in
-    /// `loopStep`, so its source list is never iterated concurrently —
-    /// `iplSourceAdd` / `iplSourceRemove` are always safe to call inline.
-    /// Shares `mIplScene` with the reflection simulator (refcounted via
-    /// `iplSceneRetain`); world geometry is not duplicated.
-    IPLSimulator mDirectSimulator = nullptr;
+    /// Direct-path simulation owner (distance attenuation, occlusion, air
+    /// absorption, transmission) — wraps the Steam Audio direct
+    /// IPLSimulator handle and a dedicated background worker thread that
+    /// pumps iplSimulatorRunDirect (PLAN.AUDIO_PERF PR 1b; previously ran
+    /// synchronously on the main thread and dominated loopStep at ~5 ms
+    /// p50). Source add/remove goes through its pending queues whenever
+    /// the worker is mid-iteration — see DirectSimulator.h for the full
+    /// threading contract. Shares `mIplScene` with the other simulators
+    /// (refcounted via `iplSceneRetain`); world geometry is not
+    /// duplicated.
+    std::unique_ptr<DirectSimulator> mDirectSim;
+
+    /// True when the DirectSimulator worker thread started successfully
+    /// (bootstrapFinished). False = degraded [FALLBACK] mode: loopStep
+    /// calls DirectSimulator::runSynchronous() on the main thread instead
+    /// of signal()ing the worker — the pre-PR-1b behaviour, kept
+    /// selectable so a thread-creation failure degrades loudly instead of
+    /// silencing the direct path.
+    bool mDirectWorkerActive = false;
 
     /// Pathing simulator owner — wraps the Steam Audio pathing IPLSimulator
     /// handle and its dedicated background worker thread that pumps

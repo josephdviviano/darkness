@@ -1674,6 +1674,45 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                     "[FALLBACK] --audio-rng-seed: invalid '%s' — keeping "
                     "unseeded (random_device)\n", argv[i]);
             }
+        } else if (std::strcmp(argv[i], "--bake-quality") == 0 && i + 1 < argc) {
+            // Bake-quality profile. "dev" forces the fast iteration bake
+            // (the code defaults: rays=4096 bounces=8 diffuse=256, ~32×
+            // cheaper per probe than the ship-quality yaml settings —
+            // MISS2's 2590-probe ship bake projected ~25 HOURS, dev ~45
+            // min). "ship" is a documented no-op: respect the yaml.
+            // Applied here because CLI parsing runs after the yaml load,
+            // so this deliberately overrides reflections.bake.* values.
+            const char *q = argv[++i];
+            if (std::strcmp(q, "dev") == 0) {
+                cfg.bakeNumRays        = 4096;
+                cfg.bakeNumBounces     = 8;
+                cfg.bakeDiffuseSamples = 256;
+                // Density reduction (user directive 2026-07-05: dev bakes
+                // must be < 10 min). FLOOR_POLY emits one candidate per
+                // BSP floor polygon regardless of spacing, so the GLOBAL
+                // DEDUP radius is the density control: 12 ft collapses
+                // MISS2's 3,304 candidates ~4-6x harder than the yaml's
+                // 5 ft. Spacing raised alongside because committed probes
+                // get influence radius = spacing — the sparser set must
+                // still cover the level or [PERF refl_cache] hitRate
+                // drops and reverb regions go dark (watch that metric on
+                // every dev-bake validation).
+                cfg.audioProbeGlobalDedupRadiusFt = 18.0f;
+                cfg.audioProbeSpacingFt           = 20.0f;
+                std::fprintf(stderr,
+                    "--bake-quality dev: bake rays=4096 bounces=8 "
+                    "diffuse=256 (~32x cheaper/probe than ship yaml) + "
+                    "probe density reduced (global_dedup 18 ft, spacing "
+                    "20 ft; measured on MISS2: 12 ft -> 1,247 probes "
+                    "~25 min, 18 ft targets ~400-500 probes < 10 min). "
+                    "Cached .probes from this bake are DEV QUALITY/"
+                    "DENSITY — re-bake without this flag for milestone/"
+                    "ship reverb fidelity.\n");
+            } else if (std::strcmp(q, "ship") != 0) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --bake-quality: unknown profile '%s' "
+                    "(expected dev|ship) — keeping yaml bake settings\n", q);
+            }
         } else if (std::strcmp(argv[i], "--audio-log") == 0) {
             // CLI mirror of the YAML `developer.audio_log` key. Perf runs
             // need it: nearly all [PERF *] histogram recording is gated on
