@@ -56,6 +56,9 @@
 #   AUTO_RUN_SPEED_MODE  (override --auto-run-speed-mode run|walk|creep; unset → run)
 #   AUDIO_RNG_SEED       (override --audio-rng-seed; unset → unseeded/random_device.
 #                         Set for strict A/B so both runs pick identical wavs)
+#   CAPTURE_WAV          (default: 0 — when 1, appends --capture-wav so each
+#                         iteration records output.wav next to its
+#                         audio_perf.jsonl; analyze with tools/wav_artifacts.py)
 #
 #   FORCE_PATHING_BAKE   (default: 0 — when 1, appends --force-pathing-bake so
 #                         the pathing section is re-baked every iteration. This
@@ -163,6 +166,12 @@ AUDIO_RNG_SEED="${AUDIO_RNG_SEED:-}"
 # Default ON for sweeps; AUDIO_LOG=0 only if the YAML already sets
 # developer.audio_log and you want the sweep to inherit it.
 AUDIO_LOG="${AUDIO_LOG:-1}"
+
+# WAV capture of the final engine output (PLAN.AUDIO_PERF.md PR 0.2).
+# CAPTURE_WAV=1 records output.wav next to each run's audio_perf.jsonl —
+# listenable per-run evidence, analyzed offline via tools/wav_artifacts.py.
+# Default OFF: ~23 MB per 60 s run adds up across sweep iterations.
+CAPTURE_WAV="${CAPTURE_WAV:-0}"
 
 # Force-pathing-bake (Sweep 2 Phase B). When 1, every iteration drops the
 # cached pathing section and re-bakes it fresh. Reflection bytes carry
@@ -301,6 +310,9 @@ for VAL in "${VALUES[@]}"; do
     [ -n "$AUDIO_RNG_SEED" ] && AUTO_FLY_ARGS+=(--audio-rng-seed "$AUDIO_RNG_SEED")
     if [ "$AUDIO_LOG" = "1" ] || [ "$AUDIO_LOG" = "true" ]; then
         AUTO_FLY_ARGS+=(--audio-log)
+    fi
+    if [ "$CAPTURE_WAV" = "1" ] || [ "$CAPTURE_WAV" = "true" ]; then
+        AUTO_FLY_ARGS+=(--capture-wav)
     fi
 
     # Sweep 2 Phase B: append --force-pathing-bake when FORCE_PATHING_BAKE=1.

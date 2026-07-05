@@ -73,6 +73,7 @@
 #include <unordered_set>
 #include <cinttypes>
 #include <cmath>
+#include <cstring>  // memcpy (WAV-capture device-callback tap)
 #include <thread>
 
 #if defined(__APPLE__)
@@ -1193,6 +1194,33 @@ static std::atomic<long long> sLastCallbackNs{0};
 // Writer: audio device thread. Reader: main-thread periodic dump.
 static LatencyHistogram sPerfDeviceCbMs;
 static std::atomic<long long> sLastDeviceCbNs{0};
+
+// ── WAV capture of the final engine output (PLAN.AUDIO_PERF.md PR 0.2) ──
+//
+// engineDeviceDataCallback taps the just-rendered f32-stereo frames into
+// sWavCaptureRb (miniaudio's lock-free SPSC ring: audio thread = producer,
+// AudioService::wavWriterThreadMain = consumer). File-scope (not members)
+// because the device callback is a static function with no route back to
+// `this`, matching the sEngineSampleRate / sLastDeviceCbNs pattern above;
+// AudioService is a singleton so this is effectively per-instance state.
+//
+// RT rules: the callback NEVER blocks and NEVER does I/O. Ring-full frames
+// are dropped and counted in sWavCaptureDropped (reported loudly at close,
+// per feedback_no_silent_fallbacks). When capture is inactive the tap costs
+// one relaxed atomic load. All non-audio-thread access (init/uninit of ring
+// + encoder, the encoder writes) is confined to the main thread and the
+// writer thread with the active flag OFF or the ring as the only shared
+// structure, so no additional locking is needed.
+static std::atomic<bool>     sWavCaptureActive{false}; // audio-thread gate
+// In-flight tap guard (PR #4 review S2): stopWavCapture() spins on this
+// reaching zero before freeing the ring, so a callback preempted mid-memcpy
+// (system sleep, debugger) can never write into freed memory. Entered only
+// when the active gate reads true — zero cost when capture is off.
+static std::atomic<int>      sWavTapInFlight{0};
+static ma_pcm_rb             sWavCaptureRb;            // f32 stereo SPSC ring
+static ma_encoder            sWavCaptureEncoder;       // writer-thread only
+static std::atomic<uint64_t> sWavCaptureDropped{0};    // ring-full frames lost
+static std::atomic<uint64_t> sWavCaptureWritten{0};    // frames encoded to disk
 
 // ── Wet-bus beat detector ──
 //
@@ -3476,6 +3504,9 @@ AudioService::~AudioService()
     }
     // Release acoustic scene before the Steam Audio context
     destroyAcousticScene();
+    // Safety net for abnormal destruction: finalize any open WAV capture
+    // before the device it taps goes away (no-op when already stopped).
+    stopWavCapture();
     // Ensure backends are shut down even if shutdown() wasn't called
     shutdownSteamAudio();
     shutdownMiniaudio();
@@ -3508,6 +3539,46 @@ static void engineDeviceDataCallback(ma_device *pDevice, void *pFramesOut,
     auto *pEngine = static_cast<ma_engine*>(pDevice->pUserData);
     if (pEngine)
         ma_engine_read_pcm_frames(pEngine, pFramesOut, frameCount, nullptr);
+
+    // ── WAV capture tap (PLAN.AUDIO_PERF.md PR 0.2) ──
+    // Copy the final mixed output into the lock-free capture ring. This
+    // runs AFTER ma_engine_read_pcm_frames so the capture is exactly what
+    // the device receives (post master DSP chain / limiter). One relaxed
+    // load when capture is off; never blocks, never does I/O — ring-full
+    // frames are counted and reported at stop time.
+    // PR #4 review S1: acquire (not relaxed) so the ring initialization
+    // published by startWavCapture()'s release store is happens-before any
+    // tap that observes the gate true — control dependencies alone do not
+    // order the ring-field loads on arm64.
+    if (sWavCaptureActive.load(std::memory_order_acquire)) {
+        // PR #4 review S2: enter the in-flight guard, then RE-CHECK the
+        // gate — stopWavCapture() may have cleared it between the load
+        // above and the fetch_add. The stop path spins until this count
+        // returns to zero before freeing the ring, making the no-UAF
+        // property provable instead of resting on a 50 ms sleep.
+        sWavTapInFlight.fetch_add(1, std::memory_order_acquire);
+        if (sWavCaptureActive.load(std::memory_order_acquire)) {
+            const float *src = static_cast<const float*>(pFramesOut);
+            ma_uint32 remaining = frameCount;
+            // acquire_write can return fewer frames than requested when the
+            // write region wraps the ring end — loop until done or full.
+            while (remaining > 0) {
+                ma_uint32 grab = remaining;
+                void *dst = nullptr;
+                if (ma_pcm_rb_acquire_write(&sWavCaptureRb, &grab, &dst) != MA_SUCCESS
+                    || grab == 0) {
+                    // Ring full (writer thread stalled) — drop, count, move on.
+                    sWavCaptureDropped.fetch_add(remaining, std::memory_order_relaxed);
+                    break;
+                }
+                std::memcpy(dst, src, static_cast<size_t>(grab) * 2 * sizeof(float));
+                ma_pcm_rb_commit_write(&sWavCaptureRb, grab);
+                src += static_cast<size_t>(grab) * 2;
+                remaining -= grab;
+            }
+        }
+        sWavTapInFlight.fetch_sub(1, std::memory_order_release);
+    }
 }
 
 //------------------------------------------------------
@@ -5391,6 +5462,12 @@ void AudioService::shutdown()
 
     // Release acoustic scene before the Steam Audio context it depends on
     destroyAcousticScene();
+
+    // Finalize the WAV capture (if --capture-wav opened one) BEFORE the
+    // engine/device teardown below — the tap lives inside the device data
+    // callback, so the encoder must be flushed + closed while the device
+    // object is still valid. Emits the [WAV_CAPTURE] closed: line.
+    stopWavCapture();
 
     // Shut down audio backends
     shutdownSteamAudio();
@@ -10945,6 +11022,159 @@ void AudioService::closePerfJsonl() {
 
 bool AudioService::isPerfJsonlOpen() const {
     return mPerfJsonlFile != nullptr;
+}
+
+//------------------------------------------------------
+// ── WAV capture of the final engine output (PLAN.AUDIO_PERF.md PR 0.2) ──
+//
+// State lives at file scope next to the device-callback statics (see the
+// sWavCapture* block near sLastDeviceCbNs). Threading model:
+//   audio thread   → produces into sWavCaptureRb (lock-free, no I/O)
+//   writer thread  → wavWriterThreadMain drains ring → ma_encoder (disk)
+//   main thread    → start/stopWavCapture lifecycle; only touches the
+//                    ring/encoder while the tap + writer are stopped.
+
+// Drain everything currently readable in the capture ring into the WAV
+// encoder. Called from the writer thread, plus one final call from
+// stopWavCapture AFTER the tap is off and the writer has joined (so no
+// frames race in behind it).
+static void drainWavCaptureRing()
+{
+    for (;;) {
+        ma_uint32 grab = ma_pcm_rb_available_read(&sWavCaptureRb);
+        if (grab == 0)
+            break;
+        void *src = nullptr;
+        if (ma_pcm_rb_acquire_read(&sWavCaptureRb, &grab, &src) != MA_SUCCESS
+            || grab == 0)
+            break;
+        ma_uint64 written = 0;
+        ma_encoder_write_pcm_frames(&sWavCaptureEncoder, src, grab, &written);
+        ma_pcm_rb_commit_read(&sWavCaptureRb, grab);
+        sWavCaptureWritten.fetch_add(written, std::memory_order_relaxed);
+        if (written < grab) {
+            // Disk-level short write (full disk, revoked handle). Count
+            // the shortfall as dropped so the closed: line exposes it —
+            // a gappy capture must never look clean.
+            sWavCaptureDropped.fetch_add(grab - written,
+                                         std::memory_order_relaxed);
+        }
+    }
+}
+
+void AudioService::wavWriterThreadMain()
+{
+    // ~50 ms drain cadence. The ring holds 1 s of audio, so a missed
+    // wakeup (OS scheduling hiccup, slow fwrite) has ~20× slack before
+    // the audio thread starts dropping frames.
+    while (mWavWriterRun.load(std::memory_order_acquire)) {
+        drainWavCaptureRing();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+bool AudioService::startWavCapture(const std::string &path)
+{
+    if (mWavCaptureStarted) {
+        std::fprintf(stderr,
+            "[WAV_CAPTURE] already capturing to '%s' — second start ignored\n",
+            mWavCapturePath.c_str());
+        return false;
+    }
+    if (!mMaDevice) {
+        std::fprintf(stderr,
+            "[FALLBACK] startWavCapture: audio device not initialized — "
+            "WAV capture disabled for this run\n");
+        return false;
+    }
+
+    // The device data callback receives frames in the REQUESTED device
+    // format (f32 / 2ch / mAudioSampleRateCfg — the deviceConfig values in
+    // initMiniaudio); miniaudio converts to the backend-native format
+    // downstream of the callback. Encoding at the same rate keeps the WAV
+    // timeline 1:1 with wall clock.
+    const ma_uint32 rate = static_cast<ma_uint32>(mAudioSampleRateCfg);
+
+    // 1 s of ring (≈ 375 KB at 48 kHz f32-stereo) — ~20× the writer's
+    // 50 ms drain cadence before the audio thread has to drop.
+    ma_result rr = ma_pcm_rb_init(ma_format_f32, 2, rate, nullptr, nullptr,
+                                  &sWavCaptureRb);
+    if (rr != MA_SUCCESS) {
+        std::fprintf(stderr,
+            "[FALLBACK] startWavCapture: ma_pcm_rb_init failed (error %d) — "
+            "WAV capture disabled for this run\n", rr);
+        return false;
+    }
+
+    ma_encoder_config ec = ma_encoder_config_init(
+        ma_encoding_format_wav, ma_format_f32, 2, rate);
+    ma_result er = ma_encoder_init_file(path.c_str(), &ec, &sWavCaptureEncoder);
+    if (er != MA_SUCCESS) {
+        std::fprintf(stderr,
+            "[FALLBACK] startWavCapture: ma_encoder_init_file('%s') failed "
+            "(error %d) — WAV capture disabled for this run\n",
+            path.c_str(), er);
+        ma_pcm_rb_uninit(&sWavCaptureRb);
+        return false;
+    }
+
+    sWavCaptureDropped.store(0, std::memory_order_relaxed);
+    sWavCaptureWritten.store(0, std::memory_order_relaxed);
+    mWavCapturePath = path;
+    mWavWriterRun.store(true, std::memory_order_release);
+    mWavWriterThread = std::thread(&AudioService::wavWriterThreadMain, this);
+    // Publish the tap LAST — the audio thread must only see an active
+    // capture once ring + encoder + writer are all alive.
+    sWavCaptureActive.store(true, std::memory_order_release);
+    mWavCaptureStarted = true;
+
+    std::fprintf(stderr, "[WAV_CAPTURE] opened: %s (f32, 2ch, %u Hz)\n",
+                 path.c_str(), rate);
+    return true;
+}
+
+void AudioService::stopWavCapture()
+{
+    if (!mWavCaptureStarted)
+        return;
+
+    // Order matters: silence the audio-thread tap FIRST so no new frames
+    // enter the ring, then stop + join the writer, then one final drain
+    // flushes whatever the writer hadn't reached yet.
+    sWavCaptureActive.store(false, std::memory_order_release);
+    // PR #4 review S2: wait for any in-flight tap to retire — provable,
+    // unlike the previous 50 ms sleep heuristic (a callback preempted
+    // mid-memcpy by system sleep or a debugger could outlive any fixed
+    // grace period and write into the freed ring). The tap re-checks the
+    // gate after entering the guard, so this spin terminates in at most
+    // one callback's execution (~µs); main thread at capture stop, so
+    // the 1 ms poll is invisible.
+    while (sWavTapInFlight.load(std::memory_order_acquire) != 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    mWavWriterRun.store(false, std::memory_order_release);
+    if (mWavWriterThread.joinable())
+        mWavWriterThread.join();
+    drainWavCaptureRing();
+
+    ma_encoder_uninit(&sWavCaptureEncoder); // finalizes the WAV header
+    ma_pcm_rb_uninit(&sWavCaptureRb);
+    mWavCaptureStarted = false;
+
+    const uint64_t frames  = sWavCaptureWritten.load(std::memory_order_relaxed);
+    const uint64_t dropped = sWavCaptureDropped.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[WAV_CAPTURE] closed: %s frames=%llu dropped=%llu\n",
+                 mWavCapturePath.c_str(),
+                 static_cast<unsigned long long>(frames),
+                 static_cast<unsigned long long>(dropped));
+    if (dropped > 0) {
+        std::fprintf(stderr,
+            "[FALLBACK] WAV capture dropped %llu frames (ring overflow or "
+            "encoder short-write) — '%s' has gaps; do NOT use it for "
+            "artifact analysis\n",
+            static_cast<unsigned long long>(dropped),
+            mWavCapturePath.c_str());
+    }
 }
 
 //------------------------------------------------------
