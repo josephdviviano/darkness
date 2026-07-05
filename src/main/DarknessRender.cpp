@@ -6854,8 +6854,15 @@ int main(int argc, char *argv[]) {
     //
     // --exit-after-seconds N (PLAN.AUDIO_PROFILING.md §1.4): if set, exit
     // the loop after N seconds of wall-clock from main() start. Lets
-    // tools/perf_sweep.sh run unattended. The JSONL sink closes cleanly
-    // through AudioService::shutdown() at program exit.
+    // tools/perf_sweep.sh run unattended.
+    //
+    // NOTE (PR #4): AudioService::shutdown() does NOT run on this exit
+    // path — the ServiceManager is new'd at init and never deleted, so
+    // the JSONL sink is never formally closed (it survives because every
+    // write is fflushed). Anything that NEEDS finalization must be
+    // invoked explicitly after the loop, like finalizeWavCapture() below.
+    // Tracked in TASKS.TODO ("shutdown() never runs on the normal exit
+    // path").
     auto mainLoopStart = std::chrono::steady_clock::now();
     bool exitAfterFired = false;
     while (state.running && !loopSvc->isTerminationRequested()) {

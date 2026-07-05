@@ -66,6 +66,10 @@ DC_OFFSET_LIMIT     = 0.01    # |mean| above this flags a DC problem
 MOD_BAND_HZ         = (0.5, 8.0)   # LF amplitude-modulation search band
 MOD_PROMINENCE_DB   = 12.0    # envelope-spectrum peak must exceed the band
                               # median by this much to count as beating
+MOD_DEPTH_FLOOR     = 0.05    # ...AND the modulation must move the envelope
+                              # by at least this fraction of its mean level —
+                              # spectral prominence alone flags inaudible
+                              # bookkeeping (PR #4 review S4)
 FIRST_AUDIO_LEVEL   = 1e-4    # onset threshold for alignment / dropout gating
 # Octave-ish analysis bands (Hz): lows / low-mids / highs / air. FFT-integrated
 # (no scipy filters). Upper edge is clamped to Nyquist at runtime.
@@ -293,9 +297,21 @@ def analyze(path):
     # mean-removed envelope; peak in MOD_BAND_HZ with prominence measured
     # against the band's median bin. Cross-check hits against the
     # in-engine [BEAT] tap before blaming the capture.
-    env, env_rate = envelope(np.abs(mono), rate)
+    #
+    # PR #4 review S4: restrict to the ACTIVE region [first_audio,
+    # last_audio] — every real capture starts with a silent lead-in
+    # (probe bake / level load), and including it turns the envelope into
+    # a step function whose spectrum flags clean content. Additionally
+    # gate on modulation DEPTH: prominence alone (peak vs band median)
+    # fires on inaudible wiggle when the band is otherwise flat.
+    if fa is not None and la is not None and la > fa:
+        mod_src = mono[fa:la]
+    else:
+        mod_src = mono
+    env, env_rate = envelope(np.abs(mod_src), rate)
     r["mod_freq_hz"] = None
     r["mod_prominence_db"] = None
+    r["mod_depth"] = None
     r["mod_flag"] = False
     if len(env) >= int(env_rate * 4):  # need >= 4 s for 0.5 Hz resolution
         w = env - env.mean()
@@ -310,9 +326,16 @@ def analyze(path):
             med_p = float(np.median(band))
             if band[pk] > 0 and med_p > 0:
                 prom = 10.0 * np.log10(band[pk] / med_p)
+                # Sine-amplitude estimate from the Hann-windowed |rfft|²
+                # bin: A ≈ 4·sqrt(P)/N (Hann coherent gain 0.5). Depth =
+                # that amplitude relative to the mean envelope level.
+                amp = 4.0 * float(np.sqrt(band[pk])) / max(len(w), 1)
+                depth = amp / max(float(env.mean()), 1e-9)
                 r["mod_freq_hz"] = float(bfreqs[pk])
                 r["mod_prominence_db"] = float(prom)
-                r["mod_flag"] = prom > MOD_PROMINENCE_DB
+                r["mod_depth"] = float(depth)
+                r["mod_flag"] = (prom > MOD_PROMINENCE_DB
+                                 and depth > MOD_DEPTH_FLOOR)
     r["_env"] = env          # kept for compare mode (not printed)
     r["_env_rate"] = env_rate
 

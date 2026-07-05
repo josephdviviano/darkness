@@ -1212,6 +1212,11 @@ static std::atomic<long long> sLastDeviceCbNs{0};
 // writer thread with the active flag OFF or the ring as the only shared
 // structure, so no additional locking is needed.
 static std::atomic<bool>     sWavCaptureActive{false}; // audio-thread gate
+// In-flight tap guard (PR #4 review S2): stopWavCapture() spins on this
+// reaching zero before freeing the ring, so a callback preempted mid-memcpy
+// (system sleep, debugger) can never write into freed memory. Entered only
+// when the active gate reads true — zero cost when capture is off.
+static std::atomic<int>      sWavTapInFlight{0};
 static ma_pcm_rb             sWavCaptureRb;            // f32 stereo SPSC ring
 static ma_encoder            sWavCaptureEncoder;       // writer-thread only
 static std::atomic<uint64_t> sWavCaptureDropped{0};    // ring-full frames lost
@@ -3541,25 +3546,38 @@ static void engineDeviceDataCallback(ma_device *pDevice, void *pFramesOut,
     // the device receives (post master DSP chain / limiter). One relaxed
     // load when capture is off; never blocks, never does I/O — ring-full
     // frames are counted and reported at stop time.
-    if (sWavCaptureActive.load(std::memory_order_relaxed)) {
-        const float *src = static_cast<const float*>(pFramesOut);
-        ma_uint32 remaining = frameCount;
-        // acquire_write can return fewer frames than requested when the
-        // write region wraps the ring end — loop until done or full.
-        while (remaining > 0) {
-            ma_uint32 grab = remaining;
-            void *dst = nullptr;
-            if (ma_pcm_rb_acquire_write(&sWavCaptureRb, &grab, &dst) != MA_SUCCESS
-                || grab == 0) {
-                // Ring full (writer thread stalled) — drop, count, move on.
-                sWavCaptureDropped.fetch_add(remaining, std::memory_order_relaxed);
-                break;
+    // PR #4 review S1: acquire (not relaxed) so the ring initialization
+    // published by startWavCapture()'s release store is happens-before any
+    // tap that observes the gate true — control dependencies alone do not
+    // order the ring-field loads on arm64.
+    if (sWavCaptureActive.load(std::memory_order_acquire)) {
+        // PR #4 review S2: enter the in-flight guard, then RE-CHECK the
+        // gate — stopWavCapture() may have cleared it between the load
+        // above and the fetch_add. The stop path spins until this count
+        // returns to zero before freeing the ring, making the no-UAF
+        // property provable instead of resting on a 50 ms sleep.
+        sWavTapInFlight.fetch_add(1, std::memory_order_acquire);
+        if (sWavCaptureActive.load(std::memory_order_acquire)) {
+            const float *src = static_cast<const float*>(pFramesOut);
+            ma_uint32 remaining = frameCount;
+            // acquire_write can return fewer frames than requested when the
+            // write region wraps the ring end — loop until done or full.
+            while (remaining > 0) {
+                ma_uint32 grab = remaining;
+                void *dst = nullptr;
+                if (ma_pcm_rb_acquire_write(&sWavCaptureRb, &grab, &dst) != MA_SUCCESS
+                    || grab == 0) {
+                    // Ring full (writer thread stalled) — drop, count, move on.
+                    sWavCaptureDropped.fetch_add(remaining, std::memory_order_relaxed);
+                    break;
+                }
+                std::memcpy(dst, src, static_cast<size_t>(grab) * 2 * sizeof(float));
+                ma_pcm_rb_commit_write(&sWavCaptureRb, grab);
+                src += static_cast<size_t>(grab) * 2;
+                remaining -= grab;
             }
-            std::memcpy(dst, src, static_cast<size_t>(grab) * 2 * sizeof(float));
-            ma_pcm_rb_commit_write(&sWavCaptureRb, grab);
-            src += static_cast<size_t>(grab) * 2;
-            remaining -= grab;
         }
+        sWavTapInFlight.fetch_sub(1, std::memory_order_release);
     }
 }
 
@@ -11124,12 +11142,16 @@ void AudioService::stopWavCapture()
     // enter the ring, then stop + join the writer, then one final drain
     // flushes whatever the writer hadn't reached yet.
     sWavCaptureActive.store(false, std::memory_order_release);
-    // A device callback that loaded the active flag as true JUST before
-    // that store can still be inside the tap (a sub-millisecond memcpy).
-    // Give it a beat to retire before ma_pcm_rb_uninit frees the ring it
-    // is writing into. 50 ms ≫ any callback's execution time; this is the
-    // main thread at capture-stop, so the pause is invisible.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // PR #4 review S2: wait for any in-flight tap to retire — provable,
+    // unlike the previous 50 ms sleep heuristic (a callback preempted
+    // mid-memcpy by system sleep or a debugger could outlive any fixed
+    // grace period and write into the freed ring). The tap re-checks the
+    // gate after entering the guard, so this spin terminates in at most
+    // one callback's execution (~µs); main thread at capture stop, so
+    // the 1 ms poll is invisible.
+    while (sWavTapInFlight.load(std::memory_order_acquire) != 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     mWavWriterRun.store(false, std::memory_order_release);
     if (mWavWriterThread.joinable())
         mWavWriterThread.join();
