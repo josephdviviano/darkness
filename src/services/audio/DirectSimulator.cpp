@@ -100,7 +100,7 @@ void DirectSimulator::signal()
     // Self-measure the effective signal cadence from successive signal()
     // timestamps. The caller (AudioService::loopStep) signals once per
     // idle frame, so this is effectively the frame period — the budget
-    // the [PERF direct] BUDGET_WARN below compares against. First signal
+    // the [PERF direct] CADENCE_WARN below compares against. First signal
     // seeds mLastSignalNs without producing an interval.
     {
         const auto now = std::chrono::steady_clock::now();
@@ -257,16 +257,25 @@ void DirectSimulator::maybeDumpPerf()
             "signalMs=%.2f n=%llu\n",
             p.p50, p.p95, p.p99, cadenceMs,
             static_cast<unsigned long long>(p.n));
-        // Budget warning: p95 ≥ 80% of the signal interval means the
+        // Cadence warning: p95 ≥ 80% of the signal interval means the
         // worker is nearly missing the per-frame cadence on most
         // iterations — loopStep will start skipping frames with
         // [DIRECT_LAG]. Only emit once a cadence has been measured
         // (skip the first window where the caller has only signaled
         // once, and the synchronous fallback where signal() never runs).
+        //
+        // Deliberately NOT named BUDGET_WARN (PR #5 review S1): that
+        // token is the T4 merge gate ("BUDGET_WARN = 0 at default
+        // cadences", PLAN.AUDIO_PERF) and means "audio callback nearly
+        // overran the DEVICE deadline" — a hard real-time budget. This
+        // warning compares against the render frame period, which is
+        // display-refresh-coupled (8.3 ms at 120 Hz ProMotion vs 16.7 ms
+        // at 60 Hz), so the same worker cost warns on one monitor and
+        // not another. Informational cadence telemetry, not a gate.
         if (cadenceMs > 0.0f
             && p.p95 >= 0.8 * static_cast<double>(cadenceMs)) {
             std::fprintf(stderr,
-                "[PERF direct] BUDGET_WARN p95=%.2fms "
+                "[PERF direct] CADENCE_WARN p95=%.2fms "
                 ">= 0.8 * signalMs=%.2f\n",
                 p.p95, cadenceMs);
         }
