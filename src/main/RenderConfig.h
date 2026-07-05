@@ -1697,16 +1697,17 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                 // still cover the level or [PERF refl_cache] hitRate
                 // drops and reverb regions go dark (watch that metric on
                 // every dev-bake validation).
-                cfg.audioProbeGlobalDedupRadiusFt = 12.0f;
-                cfg.audioProbeSpacingFt           = 15.0f;
+                cfg.audioProbeGlobalDedupRadiusFt = 18.0f;
+                cfg.audioProbeSpacingFt           = 20.0f;
                 std::fprintf(stderr,
                     "--bake-quality dev: bake rays=4096 bounces=8 "
                     "diffuse=256 (~32x cheaper/probe than ship yaml) + "
-                    "probe density reduced (global_dedup 12 ft, spacing "
-                    "15 ft; ~4-6x fewer reflection probes). Cached "
-                    ".probes from this bake are DEV QUALITY/DENSITY — "
-                    "re-bake without this flag for milestone/ship "
-                    "reverb fidelity.\n");
+                    "probe density reduced (global_dedup 18 ft, spacing "
+                    "20 ft; measured on MISS2: 12 ft -> 1,247 probes "
+                    "~25 min, 18 ft targets ~400-500 probes < 10 min). "
+                    "Cached .probes from this bake are DEV QUALITY/"
+                    "DENSITY — re-bake without this flag for milestone/"
+                    "ship reverb fidelity.\n");
             } else if (std::strcmp(q, "ship") != 0) {
                 std::fprintf(stderr,
                     "[FALLBACK] --bake-quality: unknown profile '%s' "

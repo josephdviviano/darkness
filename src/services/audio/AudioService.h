@@ -914,9 +914,15 @@ public:
     /** Global dedup pass radius in engine feet (see ProbeBakeParams).
      *  Probes within this distance of an earlier-kept probe (in
      *  placement order: floor → elevation → portal → emitter) get
-     *  dropped. 0 = disabled. Clamped to [0.0, 10.0]. Requires re-bake. */
+     *  dropped. 0 = disabled. Clamped to [0.0, 30.0]. Requires re-bake.
+     *  The cap was 10.0 until the --bake-quality dev profile needed
+     *  sparser sets (PR #5 era): FLOOR_POLY emits per BSP floor polygon,
+     *  so this radius is the only density control for dev bakes —
+     *  10 ft left MISS2 at 1,247 probes (~25 min dev bake) vs the
+     *  <10 min target. Ship-quality density is yaml-driven and far
+     *  below the cap either way. */
     void setProbeGlobalDedupRadiusFt(float ft) {
-        mProbeGlobalDedupRadiusFt = std::max(0.0f, std::min(ft, 10.0f));
+        mProbeGlobalDedupRadiusFt = std::max(0.0f, std::min(ft, 30.0f));
     }
     float getProbeGlobalDedupRadiusFt() const { return mProbeGlobalDedupRadiusFt; }
 
