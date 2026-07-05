@@ -98,6 +98,11 @@ developer:
   # Enable audio/sound/schema log output (default: false)
   audio_log: false
 
+  # Record the engine's final stereo output (f32 WAV, post master DSP) to
+  # output.wav next to the per-run audio_perf.jsonl (default: false).
+  # CLI mirror: --capture-wav. Analyze offline with tools/wav_artifacts.py.
+  capture_wav: false
+
 
 audio:
   # Audio is organized into eight subsections. Skip any subsection to use

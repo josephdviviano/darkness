@@ -338,6 +338,12 @@ struct RenderConfig {
     // until SDL quit). Set via --exit-after-seconds N to let scripted sweeps
     // (tools/perf_sweep.sh) run unattended.
     float       exitAfterSeconds = 0.0f;
+    // Capture the engine's final stereo f32 output to output.wav in the
+    // per-run perf directory (next to audio_perf.jsonl). Listenable per-run
+    // evidence for A/B comparisons; analyzed offline by
+    // tools/wav_artifacts.py (PLAN.AUDIO_PERF.md PR 0.2). Set via
+    // --capture-wav or YAML developer.capture_wav.
+    bool        captureWav = false;
 
     // -- auto-fly probe-tour (companion to --exit-after-seconds) --
     // Drives the fly-mode camera through a deterministic random tour of the
@@ -1050,6 +1056,7 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             if (dev["toggle_platforms"])    cfg.togglePlatforms   = dev["toggle_platforms"].as<bool>();
             if (dev["no_probes"])           cfg.noProbes          = dev["no_probes"].as<bool>();
             if (dev["audio_log"])           cfg.audioLog          = dev["audio_log"].as<bool>();
+            if (dev["capture_wav"])         cfg.captureWav        = dev["capture_wav"].as<bool>();
         }
 
         std::fprintf(stderr, "Loaded config from %s\n", path.c_str());
@@ -1475,6 +1482,8 @@ inline bool isPerfLabelValid(const std::string& s) {
 //   --audio-capture x,y,z     pin listener at a point, spin in place, exit
 //   --audio-capture-seconds N capture window length (default 15)
 //   --audio-capture-rotations N full yaw turns over the window (default 3)
+//   --capture-wav      record final engine output to output.wav in the
+//                      per-run perf directory (= developer.capture_wav)
 //   --help / -h        print usage
 //
 // Unknown flags are reported but otherwise ignored — when a removed flag
@@ -1671,6 +1680,13 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             // the audio_log verbosity flag, and the generic --set resolver
             // only covers audio.* leaves — developer.* is out of its reach.
             cfg.audioLog = true;
+        } else if (std::strcmp(argv[i], "--capture-wav") == 0) {
+            // CLI mirror of the YAML `developer.capture_wav` key. Records
+            // the engine's final stereo output to output.wav next to the
+            // per-run audio_perf.jsonl — listenable evidence for A/B runs,
+            // analyzed offline by tools/wav_artifacts.py
+            // (PLAN.AUDIO_PERF.md PR 0.2).
+            cfg.captureWav = true;
         } else if (argv[i][0] != '-' && !cli.misPath) {
             // First non-flag argument is the mission file
             cli.misPath = argv[i];
