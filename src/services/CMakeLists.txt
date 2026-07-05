@@ -42,6 +42,8 @@ set(HEADLESS_SERVICES_SOURCES
     audio/ConvolutionWorkerPool.cpp
     audio/ConvolutionWorkerPool.h
     audio/CRFSoundLoader.h
+    audio/DirectSimulator.cpp
+    audio/DirectSimulator.h
     audio/EnvSoundDatabase.cpp
     audio/EnvSoundDatabase.h
     audio/ProbeFile.h

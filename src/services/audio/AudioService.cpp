@@ -29,6 +29,7 @@
 #include "AcousticMaterials.h"
 #include "ConvolutionWorkerPool.h"
 #include "CRFSoundLoader.h"
+#include "DirectSimulator.h"
 #include "EnvSoundDatabase.h"
 #include "LatencyHistogram.h"
 #include "PathingSimulator.h"
@@ -1263,8 +1264,13 @@ static LatencyHistogram sPerfProbeReverbLookupMs;
 
 // PLAN.AUDIO_PROFILING.md §2.4 — full iplSimulatorRunDirect distribution.
 // Companion to sDirectSimPeakMs (kept as scalar for the existing
-// `[Audio] ... direct=...ms` summary line). Writer: main thread
-// (loopStep, one call per frame). Drained by dumpAudioStatusPeriodic only.
+// `[Audio] ... direct=...ms` summary line). Writer since PR 1b: the
+// DirectSimulator worker thread, via the iteration hook installed in the
+// AudioService constructor (one record per RunDirect iteration — the
+// worker's solver wall-clock, NOT main-thread time; loop_step no longer
+// contains it). Histogram bins are atomic, so the cross-thread write is
+// safe. Name/semantics kept identical so perf_diff A/B stays comparable
+// across the PR-1b threshold. Drained by dumpAudioStatusPeriodic only.
 static LatencyHistogram sPerfDirectSimMs;
 
 // PLAN.AUDIO_PROFILING.md §2.5 — per-spawn initVoiceDSP cost.
@@ -3477,6 +3483,26 @@ AudioService::AudioService(ServiceManager *manager, const std::string &name)
     // MISS6 with dynamic door geometry invalidating baked edges.
     mPathingSim = std::make_unique<PathingSimulator>();
 
+    // Construct the direct-sim subsystem (PLAN.AUDIO_PERF PR 1b). Same
+    // lifecycle pattern again: thread starts in bootstrapFinished,
+    // simulator handle plugged in by buildAcousticScene. Moves
+    // iplSimulatorRunDirect off the main loop — it was ~5.25 ms p50 per
+    // frame after PR 1a, essentially the whole audio loopStep.
+    //
+    // The iteration hook keeps the pre-existing `direct_sim` histogram +
+    // peak scalar fed from the worker thread so [PERF audio] direct_sim /
+    // the JSONL `direct_sim` stage / the [Audio] summary's direct= field
+    // remain A/B-comparable across the PR-1b threshold (both sinks are
+    // atomic — safe from the worker). Gated on gAudioLogVerbose to match
+    // the old synchronous call site's profOn gate.
+    mDirectSim = std::make_unique<DirectSimulator>();
+    mDirectSim->setIterationHook([](float ms) {
+        if (!::Darkness::gAudioLogVerbose) return;
+        float prevD = sDirectSimPeakMs.load(std::memory_order_relaxed);
+        if (ms > prevD) sDirectSimPeakMs.store(ms, std::memory_order_relaxed);
+        sPerfDirectSimMs.record(static_cast<double>(ms));
+    });
+
     // SoundPropagation requires RoomService, which is acquired in
     // bootstrapFinished() — construct there.
 }
@@ -4402,13 +4428,16 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         iplSimulatorSetScene(reflectionSimHandle, mIplScene);
         iplSimulatorCommit(reflectionSimHandle);
 
-        // Step 6b: Create the direct-only simulator. Runs synchronously on
-        // the main thread in loopStep, so it has no background source-list
-        // iteration — iplSourceAdd is always immediately safe and a newly
-        // created voice gets correct directParams from the next loopStep
-        // (≈one frame), instead of after a full reflection cycle (200-800
-        // ms) when racing the reflection sim. See HANDOFF.AUDIO_VOICE_INIT.md
-        // for the underlying race this addresses.
+        // Step 6b: Create the direct-only simulator. Iterated by
+        // DirectSimulator's background worker thread (PLAN.AUDIO_PERF
+        // PR 1b) — iplSimulatorRunDirect's serial per-source occlusion +
+        // transmission ray casts measured 5.25 ms p50 on MISS6 after
+        // PR 1a, essentially the entire audio main-thread loopStep.
+        // Splitting it from the reflection simulator remains load-bearing
+        // for voice-spawn latency: a fresh source's first direct result
+        // arrives at the next worker iteration (≈one frame) instead of
+        // after a full reflection cycle (200-800 ms). See
+        // HANDOFF.AUDIO_VOICE_INIT.md for the underlying race.
         //
         // Reflection-only fields (maxNumRays, numDiffuseSamples, maxDuration,
         // maxOrder, samplingRate, frameSize, reflectionType) are left at
@@ -4418,7 +4447,7 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         //
         // Pathing was previously bundled onto this simulator (DIRECT|PATHING)
         // but its iplSimulatorRunPathing iteration was observed to stall
-        // 50–11000 ms on MISS6. It now lives on a separate mPathingSimulator
+        // 50–11000 ms on MISS6. It now lives on a separate simulator
         // pumped by PathingSimulator's background worker — see below.
         IPLSimulationSettings directSettings{};
         directSettings.flags = IPL_SIMULATIONFLAGS_DIRECT;
@@ -4428,12 +4457,13 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         // status) registers a direct source. Cost is ~constant per
         // source so we size to the voice cap with a 64 floor.
         directSettings.maxNumSources = std::max(64, mMaxActiveVoicesCfg);
-        // Direct sim runs on the main thread so internal worker threads
-        // here are mostly for parallel occlusion ray-traces. Match the
-        // reflection sim's choice for now.
+        // The worker thread runs at UTILITY QoS; internal Steam Audio
+        // worker threads here are mostly for parallel occlusion
+        // ray-traces. Match the reflection sim's choice for now.
         directSettings.numThreads = simSettings.numThreads;
 
-        err = iplSimulatorCreate(mIplContext, &directSettings, &mDirectSimulator);
+        IPLSimulator directSimHandle = nullptr;
+        err = iplSimulatorCreate(mIplContext, &directSettings, &directSimHandle);
         if (err != IPL_STATUS_SUCCESS) {
             LOG_ERROR("AudioService: direct iplSimulatorCreate failed (error %d)", err);
             destroyAcousticScene();
@@ -4445,8 +4475,12 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         // brings it down to zero (one retain per simulator + the original
         // create reference).
         iplSceneRetain(mIplScene);
-        iplSimulatorSetScene(mDirectSimulator, mIplScene);
-        iplSimulatorCommit(mDirectSimulator);
+        iplSimulatorSetScene(directSimHandle, mIplScene);
+        iplSimulatorCommit(directSimHandle);
+
+        // Install the freshly-created simulator handle onto the
+        // DirectSimulator subsystem so its worker thread can pump it.
+        if (mDirectSim) mDirectSim->setSimulator(directSimHandle);
 
         // Step 6c: Create the pathing-only simulator. Iterated by
         // PathingSimulator's background worker thread so the 50–11000 ms
@@ -4931,6 +4965,14 @@ void AudioService::destroyAcousticScene()
         // iplSourceRelease balances its iplSourceCreate.
         mPathingSim->flushPendingRemovals();
     }
+    // Same drain + queue-flush for the direct-sim worker (PR 1b — the
+    // direct sim is no longer synchronous, so its worker may be
+    // mid-iteration over sources we're about to release).
+    if (mDirectSim) {
+        mDirectSim->waitForCompletion();
+        mDirectSim->releasePendingAdds();
+        mDirectSim->flushPendingRemovals();
+    }
 
     // Release probe batches before simulators (every batch is registered
     // with at least one simulator). ProbeManager now owns the entire
@@ -4956,15 +4998,14 @@ void AudioService::destroyAcousticScene()
         iplSimulatorRelease(&handle);
         mPathingSim->setSimulator(nullptr);
     }
-    // Direct simulator runs synchronously on the main thread, so it has
-    // no in-flight worker to wait for. Release after the other sims
-    // (order is irrelevant; this just keeps the parallel structure
-    // visible). The scene we attached to it was retained at create time;
-    // iplSceneRelease below drops both the original create-time reference
-    // and the retain — refcount reaches zero and the scene is destroyed.
-    if (mDirectSimulator) {
-        iplSimulatorRelease(&mDirectSimulator);
-        mDirectSimulator = nullptr;
+    // Direct simulator — worker already drained above (PR 1b). The scene
+    // we attached to it was retained at create time; the iplSceneRelease
+    // below drops both the original create-time reference and the retain
+    // — refcount reaches zero and the scene is destroyed.
+    if (mDirectSim && mDirectSim->simulator()) {
+        IPLSimulator handle = mDirectSim->simulator();
+        iplSimulatorRelease(&handle);
+        mDirectSim->setSimulator(nullptr);
     }
 
     // Tear down per-door dynamic meshes before the scene. Each instanced mesh
@@ -5046,12 +5087,13 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
     // Steam Audio's docs warn that iplSceneCommit cannot run concurrently with
     // any simulation function. Static/instanced-mesh adds defer their effect
     // until commit, so the add calls themselves are safe, but the commit at
-    // the end is not. Drain BOTH simulation workers before touching scene
-    // state — pathing and reflection each iterate the same shared scene.
-    // At boot this is a no-op (no voices yet → both sims idle), but cheap
-    // insurance.
+    // the end is not. Drain ALL THREE simulation workers before touching
+    // scene state — pathing, reflection, and (since PR 1b) direct each
+    // iterate the same shared scene. At boot this is a no-op (no voices
+    // yet → all sims idle), but cheap insurance.
     if (mReflectionSim) mReflectionSim->waitForCompletion();
     if (mPathingSim)    mPathingSim->waitForCompletion();
+    if (mDirectSim)     mDirectSim->waitForCompletion();
 
     // Cache the "door" material once. Falls back to generic if the keyword
     // table is missing the entry (kept defensive — table is in this TU).
@@ -5420,7 +5462,6 @@ void AudioService::bootstrapFinished()
     mAudioReady = maOk && saOk;
 
     // Start the reflection simulation worker thread (background, latency-tolerant).
-    // Direct sim runs synchronously on the main thread for same-frame occlusion.
     if (mAudioReady && mReflectionSim) {
         mReflectionSim->start();
     }
@@ -5430,6 +5471,24 @@ void AudioService::bootstrapFinished()
     // search space — keeping it on the main thread froze the render loop.
     if (mAudioReady && mPathingSim) {
         mPathingSim->start();
+    }
+    // Start the direct simulation worker thread (PLAN.AUDIO_PERF PR 1b).
+    // iplSimulatorRunDirect's serial per-source ray casts were ~5.25 ms
+    // p50 per frame on the main thread — the whole audio loopStep budget.
+    // If the thread fails to start, fall back LOUDLY to the synchronous
+    // main-thread path (DirectSimulator::runSynchronous keeps the old
+    // behaviour selectable); mDirectWorkerActive steers loopStep's
+    // signal-vs-synchronous choice.
+    mDirectWorkerActive = false;
+    if (mAudioReady && mDirectSim) {
+        mDirectWorkerActive = mDirectSim->start();
+        if (!mDirectWorkerActive) {
+            std::fprintf(stderr,
+                "[FALLBACK] AudioService: direct-sim worker failed to "
+                "start — iplSimulatorRunDirect runs SYNCHRONOUSLY on the "
+                "main thread this session (expect ~5 ms extra loopStep "
+                "cost; PLAN.AUDIO_PERF PR 1b degraded mode)\n");
+        }
     }
 
     if (mAudioReady) {
@@ -5453,12 +5512,13 @@ void AudioService::shutdown()
     mSoundCache.reset();
     mSoundLoader.reset();
 
-    // Shut down both simulation worker threads before destroying the scene.
-    // Order between them doesn't matter (they don't share state); the only
-    // requirement is that both stop BEFORE destroyAcousticScene tears down
-    // the simulator handles + scene.
+    // Shut down all three simulation worker threads before destroying the
+    // scene. Order between them doesn't matter (they don't share state);
+    // the only requirement is that they stop BEFORE destroyAcousticScene
+    // tears down the simulator handles + scene.
     if (mReflectionSim) mReflectionSim->stop();
     if (mPathingSim)    mPathingSim->stop();
+    if (mDirectSim)     mDirectSim->stop();
 
     // Release acoustic scene before the Steam Audio context it depends on
     destroyAcousticScene();
@@ -5711,22 +5771,36 @@ void AudioService::loopStep(float deltaTime)
     // Source mutations (add/remove/commit) can race with the background
     // sim thread that owns each simulator, so we defer them per-simulator
     // until that simulator's worker is idle. Steam Audio doesn't require
-    // the two simulators to be synchronised — each owns its own
+    // the three simulators to be synchronised — each owns its own
     // scene-reference and source list, so reflection mutations are safe
-    // while pathing is running and vice versa. Direct sim runs
-    // synchronously on the main thread, so it's never concurrent with
-    // mutations. Steam Audio uses double-buffering: setInputs writes to
+    // while pathing is running and vice versa. Since PR 1b the direct sim
+    // ALSO runs on its own worker (DirectSimulator), so direct-source
+    // mutations get the same defer-flush treatment; its flush point lives
+    // inside the sim block below (harvest → flush → stage → signal) so a
+    // freshly flushed source is never harvested before the solver has
+    // seen it. Steam Audio uses double-buffering: setInputs writes to
     // the staging buffer, while runReflections / runPathing read from the
     // committed (active) buffer. Only commit() copies staging → active,
-    // so each commit must wait for its own worker (not the other one).
-    bool reflBusy  = mReflectionSim && mReflectionSim->isRunning();
-    bool pathBusy  = mPathingSim    && mPathingSim->isRunning();
+    // so each commit must wait for its own worker (not the other ones).
+    //
+    // directBusy is sampled ONCE here (top-of-frame convention, same as
+    // reflBusy/pathBusy). The worker can only flip busy→idle between here
+    // and the sim block — never idle→busy, because signal() is issued
+    // exclusively at the end of this function's idle-only branch — so the
+    // cached value is conservative and every gate below stays safe.
+    bool reflBusy   = mReflectionSim && mReflectionSim->isRunning();
+    bool pathBusy   = mPathingSim    && mPathingSim->isRunning();
+    bool directBusy = mDirectSim     && mDirectSim->isRunning();
     // Scene-commit gate: iplSceneCommit (BVH refit) cannot run concurrently
     // with ANY simulator per Steam Audio's API contract, so the door-scene
-    // commit below still needs the conjunctive gate.
-    bool canMutate = !reflBusy && !pathBusy;
+    // commit below still needs the conjunctive gate. PR 1b extended it
+    // with !directBusy — the old comment's safety argument ("direct runs
+    // synchronously later this frame, so it always observes a committed
+    // scene") died when the direct sim moved to its own worker.
+    bool canMutate = !reflBusy && !pathBusy && !directBusy;
     IPLSimulator reflectionSimHandle = mReflectionSim ? mReflectionSim->simulator() : nullptr;
     IPLSimulator pathingSimHandle    = mPathingSim    ? mPathingSim->simulator()    : nullptr;
+    IPLSimulator directSimHandle     = mDirectSim     ? mDirectSim->simulator()     : nullptr;
 
     if (!reflBusy && mReflectionSim) {
 
@@ -5792,13 +5866,16 @@ void AudioService::loopStep(float deltaTime)
     // setDoorTransform queues iplInstancedMeshUpdateTransform calls and flips
     // mSceneNeedsCommit. iplSceneCommit (BVH refit) cannot run concurrently
     // with any simulation function per Steam Audio's API contract — so we
-    // gate on `canMutate` (same flag the reflection-sim source-mutation
-    // commit above uses): if the reflection sim is currently running we
-    // skip and try next frame, rather than block on waitForCompletion().
-    // Door transforms are sticky in mSceneNeedsCommit, so postponing a
-    // frame just delays validation by ~16 ms — imperceptible. Pathing and
-    // direct sims run synchronously later in this same loopStep, so they
-    // always observe a committed scene.
+    // gate on `canMutate`, which requires ALL THREE workers (reflection,
+    // pathing, direct) to be idle. All three simulators reference the same
+    // shared mIplScene; since PR 1b none of them runs synchronously on
+    // this thread, so idle-gating is the only thing standing between the
+    // BVH refit and a concurrent solver iteration. If any worker is
+    // running we skip and try next frame, rather than block on
+    // waitForCompletion(). Door transforms are sticky in
+    // mSceneNeedsCommit, so postponing a frame just delays validation by
+    // ~16 ms — imperceptible. The workers observe the refreshed BVH on
+    // their next signaled iteration.
     if (mIplScene && mSceneNeedsCommit.load(std::memory_order_acquire)) {
         if (canMutate) {
             auto c0 = std::chrono::steady_clock::now();
@@ -5815,16 +5892,18 @@ void AudioService::loopStep(float deltaTime)
                     "%.2f ms (call #%d)\n", ms, n + 1);
             }
         } else {
-            // Refl-sim busy. Track how long the door commit has been
-            // deferred so we can spot the pathological case where it
-            // never commits (refl-sim always running). Logs every 64
+            // A sim worker is busy. Track how long the door commit has
+            // been deferred so we can spot the pathological case where it
+            // never commits (some worker always running). Logs every 64
             // deferred frames.
             static std::atomic<int> sCommitDeferred{0};
             int d = sCommitDeferred.fetch_add(1, std::memory_order_relaxed);
             if ((d % 64) == 0) {
                 std::fprintf(stderr,
-                    "[DOOR_AUDIO] scene commit deferred — reflection sim "
-                    "busy (deferred #%d times so far)\n", d + 1);
+                    "[DOOR_AUDIO] scene commit deferred — sim busy "
+                    "(refl=%d path=%d direct=%d, deferred #%d times so "
+                    "far)\n", reflBusy ? 1 : 0, pathBusy ? 1 : 0,
+                    directBusy ? 1 : 0, d + 1);
             }
         }
     }
@@ -5852,8 +5931,46 @@ void AudioService::loopStep(float deltaTime)
         mPlayerEmittedActive.store(anyActive, std::memory_order_relaxed);
     }
 
+    // Direct-sim deferred mutations normally flush inside the sim block
+    // below (PR 1b frame shape: harvest → flush → stage → signal). If the
+    // voice pool has emptied or the scene is gone, that block never runs,
+    // so drain queued removals here to keep iplSourceRelease from
+    // stalling indefinitely. Adds can't be pending in this state — a
+    // pending add implies a live owning voice (removeVoiceSource pulls a
+    // voice's handles out of the add queue before the voice leaves the
+    // pool), and a live voice keeps the sim block running.
+    if (mDirectSim && !directBusy
+        && (!mSceneReady || !reflectionSimHandle || mVoicePool->empty())) {
+        mDirectSim->flushPendingRemovals();
+        mDirectSim->commitIfDirty();
+    }
+
     // Run Steam Audio simulation for all active sources
-    if (mSceneReady && reflectionSimHandle && !mVoicePool->empty()) {
+    if (mSceneReady && reflectionSimHandle && !mVoicePool->empty()
+        && directBusy) {
+        // ── [DIRECT_LAG] — direct-sim worker still mid-iteration ──
+        //
+        // PR 1b frame shape: harvest → flush → stage → signal all require
+        // the worker to be idle (mutation safety for flush; deterministic
+        // previous-iteration data age for harvest). When the previous
+        // frame's iteration is still running, skip ALL FOUR this frame —
+        // every voice's direct/pathing/reflection DSP params simply stay
+        // one extra frame stale (≈16 ms at 60 fps; still under the
+        // 21.3 ms audio-callback period). At the measured ~4-5 ms
+        // iteration cost vs a 16.7 ms frame period this should be rare —
+        // a sustained stream of these lines means the direct sim no
+        // longer fits in a frame and the worker cadence has effectively
+        // halved. Rate-limited (first 16 + every 64th); the occurrence
+        // counter makes the total countable from the last line.
+        static std::atomic<int> sDirectLagCount{0};
+        int lc = sDirectLagCount.fetch_add(1, std::memory_order_relaxed);
+        if (lc < 16 || (lc % 64) == 0) {
+            std::fprintf(stderr,
+                "[DIRECT_LAG] direct-sim worker still running at loopStep "
+                "(occurrence #%d) — harvest/flush/stage/signal skipped, "
+                "sim params stay one extra frame\n", lc + 1);
+        }
+    } else if (mSceneReady && reflectionSimHandle && !mVoicePool->empty()) {
         float cosY = std::cos(mListenerYaw), sinY = std::sin(mListenerYaw);
         float cosP = std::cos(mListenerPitch), sinP = std::sin(mListenerPitch);
 
@@ -5892,12 +6009,18 @@ void AudioService::loopStep(float deltaTime)
             mReflectionMixNode->listenerPosZ = mListenerPos.z;
         }
 
-        // Set simulation inputs and launch direct sim.
-        // setInputs/setSharedInputs write to the staging buffer (safe while
-        // reflection sim reads from the committed buffer). Only need direct
-        // sim thread to be idle — reflection sim can run concurrently.
-        // Reflection voice ranking — declared here so it's visible to both
-        // the setInputs block (Step 2) and the output reading block (Step 4).
+        // PR 1b idle-frame shape (the directBusy branch above skipped
+        // everything when the worker was mid-iteration):
+        //   1. RANK    — position-only top-N reflection ranking
+        //   2. HARVEST — read the previous iteration's outputs into DSP
+        //   3. FLUSH   — direct-sim pending source adds/removes + commit
+        //   4. STAGE   — shared inputs + per-voice/per-slot setInputs
+        //   5. SIGNAL  — wake the direct worker (+ pathing/reflection)
+        // setInputs/setSharedInputs write to Steam Audio's staging buffer
+        // (safe while the reflection sim reads from the committed
+        // buffer); the direct worker is idle across this whole branch by
+        // construction. Reflection voice ranking — declared here so it's
+        // visible to both the harvest pass and the staging pass.
         struct VoiceDist {
             SoundHandle handle;
             float distSq;
@@ -5905,39 +6028,11 @@ void AudioService::loopStep(float deltaTime)
         std::vector<VoiceDist> reflCandidates;
         std::unordered_set<SoundHandle> reflCandidateSet;
 
+        // Reflection top-N ranking runs FIRST: both the harvest pass
+        // below (convolution-slot grants) and the staging pass after it
+        // (inputs.baked routing) consume reflCandidateSet, and the
+        // ranking itself is position-only — it reads no sim outputs.
         {
-            // Step 1: Set listener position for the simulator
-            IPLSimulationSharedInputs sharedInputs{};
-            sharedInputs.listener = listenerCoord;
-            sharedInputs.numRays = mRealtimeNumRays;
-            sharedInputs.numBounces = mRealtimeNumBounces;
-            sharedInputs.duration = mRealtimeDuration;
-            sharedInputs.order = mAmbisonicsOrder;
-            sharedInputs.irradianceMinDistance = kIrradianceMinDistanceMeters;
-            // Listener pose goes to both simulators; reflection params
-            // (numRays/numBounces/duration/order/irradianceMinDistance) are
-            // only consumed when the REFLECTIONS flag is set, so passing the
-            // populated struct to the direct sim with only the DIRECT flag
-            // is safe — Steam Audio ignores the unused fields. Per phonon.h,
-            // these calls require no synchronisation between them.
-            iplSimulatorSetSharedInputs(mDirectSimulator,
-                IPL_SIMULATIONFLAGS_DIRECT, &sharedInputs);
-            iplSimulatorSetSharedInputs(reflectionSimHandle,
-                IPL_SIMULATIONFLAGS_REFLECTIONS, &sharedInputs);
-            // Pathing also needs the listener pose per-frame. Without
-            // this call, iplSimulatorRunPathing has no listener position,
-            // silently skips all sources, and iplSourceGetOutputs returns
-            // the source's SimulationData::pathingOutputs.eq init value
-            // of [0.1, 0.1, 0.1] (see Steam Audio simulation_data.cpp).
-            // Now lives on the separate pathing simulator handle owned
-            // by mPathingSim — both flags-on-this-simulator (here:
-            // PATHING) require their per-frame SetSharedInputs call
-            // even though only one is set.
-            if (pathingSimHandle) {
-                iplSimulatorSetSharedInputs(pathingSimHandle,
-                    IPL_SIMULATIONFLAGS_PATHING, &sharedInputs);
-            }
-
             // Step 2a: Pre-compute reflection voice ranking (top-N closest).
             // Done before setInputs so we can set inputs.baked for non-top-N voices.
             //
@@ -6031,1004 +6126,28 @@ void AudioService::loopStep(float deltaTime)
                 sPerfLoopStickySlotMs.record(stickyMs);
             }
 
-            // Baked reflection identifier (for non-top-N voices using probe reverb)
-            IPLBakedDataIdentifier bakedReflId{};
-            bakedReflId.type = IPL_BAKEDDATATYPE_REFLECTIONS;
-            bakedReflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
-
-            // Step 2b: Run portal propagation and set source positions.
-            // Architecture B: for cross-room voices, set the IPLSource position
-            // to the virtual position (last portal anchor) so Steam Audio traces
-            // rays from the doorway, not from behind a wall. Same-room voices
-            // use their real position. Unreachable voices skip simulation.
-            //
-            // Listener-room update: canonical RoomService::updatedRoom
-            // query — always disambiguates overlapping room OBBs via
-            // portal planes (the disambiguator polarity fix from the
-            // 2026-05 cleanup made this deterministic). Previous
-            // implementation also gated on a portal-blend state to
-            // sustain the room assignment near boundaries; that blend
-            // has been removed because its hysteresis produced
-            // asymmetric "louder walking away" volume artifacts —
-            // matches the original engine which has no propagation
-            // hysteresis. See NOTES.PROJECT.md "Sound Propagation
-            // Model".
-            if (mRoomService) {
-                mListenerRoom = mRoomService->updatedRoom(mListenerRoom, mListenerPos);
-            } else {
-                mListenerRoom = nullptr;
-            }
-            Room *listenerRoom = mListenerRoom;
-
-            // PLAN.AUDIO_PROFILING.md §2.2 — voice-update phase starts here.
-            if (profOn) voiceUpdT0 = std::chrono::steady_clock::now();
-            for (auto &[handle, voice] : mVoicePool->voices()) {
-                // createVoiceSource always sets both sources together (or
-                // neither, on init failure), so checking directSource here
-                // covers both. The reflectionSource may be in mPendingSourceAdds
-                // — that's handled separately below at the per-voice
-                // outputs read.
-                if (!voice->directSource)
-                    continue;
-
-                // T1.2 — outbound-cross smooth ramp. Voices that
-                // spawned in-range but then drifted past the
-                // distance × priority cull threshold get a 100 ms
-                // fade-out via haltSound (which sets sourceEnded
-                // and schedules ma_sound_stop_with_fade) rather
-                // than a hard stop. PlayerEmitted skip; looping
-                // ambients skip (AmbientSoundManager owns their
-                // lifecycle). sourceEnded gate prevents re-fading
-                // every frame after the first cross.
-                if (!voice->playerEmitted
-                    && !ma_sound_is_looping(&voice->sound)
-                    && !voice->sourceEnded.load(std::memory_order_relaxed)) {
-                    float dCullCur = glm::length(voice->worldPos - mListenerPos);
-                    int   pri      = voice->priority;
-                    float cullR =
-                          (pri >= 200) ? 500.0f
-                        : (pri >= 100) ? 150.0f
-                                       : 80.0f;
-                    if (dCullCur > cullR) {
-                        std::fprintf(stderr,
-                            "[VOICE_CULL_RAMP] h=%u schema='%s' "
-                            "d=%.1f pri=%d cullR=%.0f fadeMs=100\n",
-                            handle, voice->schemaName.c_str(),
-                            dCullCur, pri, cullR);
-                        haltSound(handle, /*fadeMs=*/100);
-                        // Loop continues — voice still alive this
-                        // frame, finishes after the fade.
-                    }
-                }
-
-                // Defensive per-frame reset of skipAttenuation. No voice
-                // class currently sets this to true — the prior workaround
-                // for player-emitted voices was needed when the unified
-                // simulator's defer-flush race silently broke the surgical
-                // direct-flag overrides; with the split simulator the
-                // overrides are read by the audio thread on the very first
-                // callback after createVoiceSource.
-                voice->dspNode.skipAttenuation = false;
-
-                // Player-audio portal-eq backend toggle. When true, Steam
-                // Audio's pathing simulator drives portalAttenuation /
-                // portalBlocking via 3-band eqCoeffs. When false (legacy
-                // mode), the room-BFS branch below fills the same fields
-                // from effectiveDistance/realDistance. The non-pathing
-                // Steam Audio DSP chain (direct effect, HRTF, reflections,
-                // air absorption, occlusion/transmission) runs in both
-                // modes — this gate is only the portal-eq source. AI
-                // hearing is unaffected: AIHearingService calls
-                // RoomService::propagateSoundPath directly, independent
-                // of this gate. Player-emitted voices (footsteps, landings)
-                // sit in the same room as the listener by definition, so
-                // both backends short-circuit on the playerEmitted flag.
-                bool useSteamAudioPathing = mPathingProbeBatchAdded
-                                          && mProbePathingEnabled
-                                          && !voice->playerEmitted
-                                          && !voice->skipPortalRouting;
-
-                // Legacy BFS path — only reachable when probe_pathing: false.
-                // Steam Audio is the shipping default routing authority for
-                // player audio; this branch exists for A/B comparison and
-                // may be removed in a future revision. The room-BFS fills
-                // portalAttenuation / portalBlocking via the prop.reached
-                // branches below; gated off when Steam Audio pathing owns
-                // those fields so the two backends don't compete to write
-                // the same dspNode fields.
-                SoundPropInfo prop{};
-                bool isCrossRoom = false;
-                if (!useSteamAudioPathing && mPortalRoutingEnabled
-                    && !voice->sourceEnded
-                    && !voice->skipPortalRouting && !voice->playerEmitted) {
-                    // BFS every frame (~3 µs/voice). The cap is decoupled
-                    // from per-voice audibility radius: maxDist inside
-                    // propagateSoundPath is both the BFS depth bound AND
-                    // the door-blocking saturation target, so tying them
-                    // together made small-radius voices unreachable after
-                    // one or two portal hops.
-                    auto prT0 = profOn ? std::chrono::steady_clock::now()
-                                       : std::chrono::steady_clock::time_point{};
-                    if (mRoomService && mSoundPropagation) {
-                        Room *srcRoomP = mRoomService->roomFromPoint(voice->worldPos);
-                        Room *lstRoomP = mRoomService->roomFromPoint(mListenerPos);
-                        int32_t srcID = srcRoomP ? srcRoomP->getRoomID() : -1;
-                        int32_t lstID = lstRoomP ? lstRoomP->getRoomID() : -1;
-                        // Inline params so we can plug chainOut in (used
-                        // by the show_vpos debug overlay; the
-                        // propagateSound wrapper doesn't expose it).
-                        SoundPropParams pp;
-                        pp.maxDist     = std::max(voice->maxAudibleDist, mPropagationMaxDist);
-                        pp.maxPaths    = mPropMaxPaths;
-                        pp.maxPathDiff = mPropMaxPathDiff;
-                        pp.chainOut    = &voice->cachedChain;
-                        prop = mSoundPropagation->propagateSoundWithParams(
-                            voice->worldPos, mListenerPos, srcID, lstID, pp);
-                    } else {
-                        prop = propagateSound(voice->worldPos, mListenerPos,
-                                              std::max(voice->maxAudibleDist, mPropagationMaxDist));
-                    }
-                    if (profOn) {
-                        auto prT1 = std::chrono::steady_clock::now();
-                        float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
-                        sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
-                        sPortalRoutingCount.fetch_add(1, std::memory_order_relaxed);
-                    }
-
-                    voice->cachedProp = prop;
-
-                    // Cross-room flag tracks actual room assignment — no
-                    // distance gate. The playerEmitted skip above handles
-                    // head/feet straddling for player-sourced voices.
-                    Room *srcRoom = mRoomService ? mRoomService->roomFromPoint(voice->worldPos) : nullptr;
-                    isCrossRoom = (srcRoom && listenerRoom && srcRoom != listenerRoom);
-                }
-
-                // Store propagation result on DSP node for the audio callback.
-                //
-                // portalAttenuation is a *continuous* excess-path
-                // attenuation. The previous formula (1/(1+effDist²·0.001))
-                // was gated by isCrossRoom, so it switched on at the portal
-                // boundary, producing an audible pop. The new formula uses
-                // the ratio of straight-line distance to portal-graph path,
-                // which is:
-                //   • 1.0 for same-room voices (real == effective)
-                //   • < 1.0 only when the BFS path detours through portals,
-                //   • continuous in the limit at the room boundary because
-                //     a chain that's geometrically clean enough to threadle
-                //     end-to-end produces real ≈ effective, yielding a
-                //     ratio close to 1.0 just like the same-room case.
-                //     Real/effective and door blocking themselves change
-                //     discretely at the regime switch though — that
-                //     residual step is one of the symptoms tracked in
-                //     HANDOFF.SOUND_PROPAGATION_REALISM.
-                // Phase 4 — Steam Audio sole authority for player audio
-                // routing + attenuation. The legacy BFS-driven
-                // branches (prop.reached / cross-room failure) no
-                // longer feed the player DSP. Routing/diffraction
-                // for the direct signal comes from Steam Audio's
-                // path effect (iplPathEffectApply, additive wet bus
-                // on top of the binaural dry path); distance falloff
-                // comes from iplDirectEffect's INVERSEDISTANCE model;
-                // door + wall blocking on the DRY path comes from
-                // OCCLUSION + TRANSMISSION (volumetric ray test on
-                // door OBBs in the acoustic mesh).
-                //
-                // portalAttenuation / portalBlocking are seeded here at
-                // neutral 1.0 / 0.0 as a default for voices that won't
-                // be path-solved this iteration: player-emitted,
-                // skipPortalRouting, and the pending-source-add window
-                // before iplSourceAdd is flushed. For voices that ARE
-                // path-solved, the post-`iplSourceGetOutputs` block
-                // downstream (search "Standard Valve pattern") derives
-                // these from the live `pathingOutputs.eqCoeffs`, so the
-                // reflection-send (:1531) and AmbientSoundManager halt
-                // metric see the routing attenuation the solver
-                // computed.
-                //
-                // HRTF direction is driven by the standard
-                // !usePortalRouting branch downstream
-                // (toSource = voice->worldPos − mListenerPos),
-                // pointing at the real source position.
-                //
-                // Override sites (single per-frame reset is this seed,
-                // single set of writers downstream):
-                //   (a) out-of-range gate (~immediately below) → 0.0
-                //   (b) Valve-pattern pathing read → mapping.gain /
-                //       mapping.blocking
-                // The pending-source branch deliberately does NOT touch
-                // the scalars — pending voices keep the 1.0 seed, which
-                // means a one-throttle-interval (~100 ms) window of
-                // full reverb-send on spawn. The trade-off matches the
-                // Valve reference plugins, which add sources
-                // synchronously and don't have this race at all.
-                //
-                // usePortalRouting itself stays false unconditionally —
-                // Steam Audio is sole authority (Phase 4); the flag is
-                // vestigial and only steers the standard HRTF direction
-                // branch downstream to read the real source position.
-                voice->dspNode.usePortalRouting  = false;
-                voice->dspNode.portalAttenuation = 1.0f;
-                voice->dspNode.portalBlocking    = 0.0f;
-
-                // maxAudibleDist hard cutoff — same authored value that
-                // gates AI hearing's BFS, so a wind ambient with
-                // radius=25 still goes silent at 25 ft of straight-line
-                // distance. Steam Audio's distance attenuation would
-                // taper to ~0 at this range anyway, but the schema-
-                // authored radius is treated as an absolute boundary in
-                // the original engine. Implementation: invalidate the
-                // path-effect target (audio thread skips the path
-                // effect) AND silence the dry bus via portalAttenuation
-                // = 0.0. The wet-bus reflection-send tracks
-                // portalAttenuation, so reverb also silences past the
-                // boundary.
-                {
-                    float lineDistTo = glm::length(voice->worldPos - mListenerPos);
-                    if (lineDistTo > voice->maxAudibleDist) {
-                        // Override site (a) — out-of-range hard
-                        // cutoff silences the reverb-send too. The
-                        // wet bus from iplPathEffectApply is also
-                        // silenced via pathTargetValid=false set in
-                        // the matching branch of the pathing read
-                        // chain downstream.
-                        voice->dspNode.portalAttenuation = 0.0f;
-                    }
-                }
-                // The BFS `prop` and `isCrossRoom` are still populated
-                // above (when probe_pathing is off) — they drive the
-                // show_vpos diagnostic overlay (cachedProp), the [VOICE]
-                // periodic log, and the legacy sub-source slot fan-out
-                // below. They have zero effect on the player DSP signal
-                // path. AI hearing reads
-                // RoomService::propagateSoundPath directly
-                // (AIHearingService::onSoundEmitted), unaffected by this
-                // branch.
-
-                // ── Sub-source slot fan-out ──
-                //
-                // Steam Audio mode (`probe_pathing: true`, shipping default):
-                // Steam Audio's pathing solver folds multi-path propagation
-                // into a single eqCoeffs[3] + combined ambisonic SH field,
-                // not into N independent (direction, gain) tuples. The
-                // multi-path-multi-portal data model the original Phase-2
-                // design assumed cannot be reconstructed from SA's output.
-                // We force slot-0-only: a synthesised single path at
-                // voice->worldPos, with slots 1-3 drained. Steam Audio's
-                // eqCoeffs (via portalAttenuation / portalBlocking) carries
-                // the cross-room attenuation work upstream of this slot;
-                // same-room voices end up at eqCoeffs ≈ 1.
-                //
-                // Legacy BFS mode (`probe_pathing: false`): the BFS branch
-                // above populated prop.paths with up to maxPaths discrete
-                // routes; multi-portal scenes get true multi-direction
-                // HRTF fan-out via updateSubSourceSlots.
-                //
-                // Player-emitted + skipPortalRouting voices stay slot-0-only
-                // in both modes — source ≈ listener, portal routing N/A.
-                //
-                // See PLAN.MULTI_PATH_SA_MIGRATION.md for the rationale.
-                // PLAN.MULTI_PATH_AMBISONICS.md (the original Phase-1..4
-                // design) is superseded by this for the SA-mode regime;
-                // Phases 2-4 remain valid for the legacy BFS mode.
-                auto computeDirForPath = [&](const SoundPathRecord& p) -> IPLVector3 {
-                    Vector3 toPath = p.virtualPosition - mListenerPos;
-                    float   dist   = glm::length(toPath);
-                    if (dist < kDistanceEpsilonFt) {
-                        return IPLVector3{0.0f, 0.0f, -1.0f};  // ahead fallback
-                    }
-                    toPath /= dist;
-                    return IPLVector3{
-                        glm::dot(toPath, right),
-                        glm::dot(toPath, up),
-                        -glm::dot(toPath, ahead)
-                    };
-                };
-
-                // Synthesised single-path record at the source's actual
-                // world position. Used for the slot-0-only path
-                // (SA-mode, player-emitted, skipPortalRouting, and the
-                // legacy "no room data" fallback). Reuse here to avoid
-                // duplicating the construction across branches.
-                auto makeSyntheticSinglePath = [&]() -> SoundPropInfo {
-                    SoundPropInfo synth;
-                    synth.reached = true;
-                    SoundPathRecord rec;
-                    rec.predecessorRoomID = -1;   // same-room sentinel
-                    rec.virtualPosition   = voice->worldPos;
-                    Vector3 vd            = voice->worldPos - mListenerPos;
-                    float   dist          = glm::length(vd);
-                    rec.realDistance      = dist;
-                    rec.effectiveDistance = dist;
-                    rec.doorBlocking      = 0.0f;
-                    rec.totalBlocking     = 0.0f;
-                    synth.paths.push_back(rec);
-                    synth.virtualPosition   = rec.virtualPosition;
-                    synth.realDistance      = rec.realDistance;
-                    synth.effectiveDistance = rec.effectiveDistance;
-                    return synth;
-                };
-
-                // [PATH_CONSUME] diagnostic — placed ABOVE the routing
-                // branch split (sa / synth / bfs) so it fires for every
-                // voice every frame regardless of which backend handles
-                // it. The previous placement inside the legacy BFS `else`
-                // branch was dead code under the shipping default
-                // (probe_pathing: true), which routes every voice through
-                // the SA branch and never enters the BFS branch — yielding
-                // 0 emissions even in 31k-line logs.
-                //
-                // The `mode=` field is the whole point: it lets a future
-                // reader distinguish "SA reached but data lost downstream"
-                // from "SA didn't reach" from "BFS path used and reached".
-                //   • mode=sa    — Steam Audio pathing owns the
-                //                  per-voice portal eq + sub-source slot
-                //                  (slot-0-only synthesised path; SA
-                //                  fills eqCoeffs via IPLPathEffect).
-                //   • mode=synth — slot-0-only synthesised path with no
-                //                  routing solve at all (playerEmitted
-                //                  or skipPortalRouting voices: source
-                //                  ≈ listener, portal routing N/A).
-                //   • mode=bfs   — legacy room-BFS branch
-                //                  (probe_pathing: false). prop.reached,
-                //                  prop.effectiveDistance, prop.paths
-                //                  are the routing source of truth.
-                //
-                // `effD`, `block`, and `paths` are taken verbatim from
-                // the in-scope `prop` struct. For mode=sa/synth the BFS
-                // never ran, so prop is default-initialised
-                // (reached=false, effD=0, block=0, paths empty) — values
-                // logged are honest about that. For mode=bfs they
-                // reflect the BFS result for that frame.
-                //
-                // Throttled to one emission per second per voice via a
-                // static per-handle timestamp map.
-                {
-                    using clk = std::chrono::steady_clock;
-                    static std::unordered_map<SoundHandle, clk::time_point>
-                        sLastPathConsumeLog;
-                    auto now = clk::now();
-                    auto it = sLastPathConsumeLog.find(handle);
-                    bool due = (it == sLastPathConsumeLog.end())
-                        || std::chrono::duration<float>(
-                               now - it->second).count() >= 1.0f;
-                    if (due && Darkness::gAudioLogVerbose) {
-                        sLastPathConsumeLog[handle] = now;
-                        const char *modeStr = useSteamAudioPathing ? "sa"
-                            : (voice->playerEmitted || voice->skipPortalRouting)
-                              ? "synth" : "bfs";
-                        AUDIO_LOG("[PATH_CONSUME] h=%u schema='%s' mode=%s "
-                                  "reached=%d effD=%.1f block=%.2f paths=%zu\n",
-                                  handle, voice->schemaName.c_str(),
-                                  modeStr,
-                                  prop.reached ? 1 : 0,
-                                  prop.effectiveDistance,
-                                  prop.totalBlocking,
-                                  prop.paths.size());
-                    }
-                }
-
-                if (useSteamAudioPathing
-                    || voice->playerEmitted
-                    || voice->skipPortalRouting) {
-                    // Slot-0-only. maxN=1 causes updateSubSourceSlots to
-                    // drain slots 1-3 (if any are ACTIVE from a prior
-                    // BFS-mode session, or from a runtime toggle) and
-                    // keep slot 0 ACTIVE with the synthesised path.
-                    SoundPropInfo synth = makeSyntheticSinglePath();
-                    updateSubSourceSlots(voice->dspNode.subSources, synth,
-                                         /*maxN=*/1, computeDirForPath);
-                } else {
-                    // Legacy BFS mode: BFS produced prop.paths (or it
-                    // didn't reach). Use the configured sMaxSubSources
-                    // clamp.
-                    const int maxN = static_cast<int>(std::min<uint32_t>(
-                        sMaxSubSources.load(std::memory_order_relaxed),
-                        static_cast<uint32_t>(kMaxSubSources)));
-                    // T0.1 — PATH_CONSUME diagnostic at the
-                    // prop.reached gate. Throttled to once-per-second
-                    // per voice (per-handle steady-clock map). Pure
-                    // diagnostic — does NOT change behaviour. Surfaces
-                    // the BFS-mode propagation result that drives the
-                    // sub-source slot fan-out; pair with PATH_RAW
-                    // (PathingSimulator.cpp:208, owned by Agent 2) for
-                    // the Steam Audio-mode counterpart.
-                    {
-                        static std::unordered_map<SoundHandle,
-                            std::chrono::steady_clock::time_point>
-                            sLastPathConsumeLog;
-                        auto now = std::chrono::steady_clock::now();
-                        auto it = sLastPathConsumeLog.find(handle);
-                        bool emit = (it == sLastPathConsumeLog.end())
-                            || (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    now - it->second).count() >= 1000);
-                        if (emit) {
-                            sLastPathConsumeLog[handle] = now;
-                            std::fprintf(stderr,
-                                "[PATH_CONSUME] h=%u schema='%s' "
-                                "reached=%d effD=%.1f block=%.2f paths=%zu\n",
-                                handle, voice->schemaName.c_str(),
-                                prop.reached ? 1 : 0,
-                                prop.effectiveDistance,
-                                prop.totalBlocking,
-                                prop.paths.size());
-                        }
-                    }
-                    if (prop.reached && !prop.paths.empty()) {
-                        updateSubSourceSlots(voice->dspNode.subSources, prop,
-                                             maxN, computeDirForPath);
-                    } else if (isCrossRoom) {
-                        // BFS-failed cross-room: legitimately silenced.
-                        drainAllSubSourceSlots(voice->dspNode.subSources);
-                    } else {
-                        // BFS didn't run (no room data, etc.) — same
-                        // synthesised single-path fallback as SA mode.
-                        SoundPropInfo synth = makeSyntheticSinglePath();
-                        updateSubSourceSlots(voice->dspNode.subSources, synth,
-                                             maxN, computeDirForPath);
-                    }
-                }
-
-                // Phase 4 — Steam Audio sole authority: pin the IPL source
-                // position to the REAL source position for EVERY voice. The
-                // legacy cross-room branch that pinned to
-                // `prop.virtualPosition` (the last portal anchor along the
-                // BFS chain) is gone. With IPLPathEffect now driving
-                // cross-room routing (occlusion through walls via
-                // enableValidation + findAlternatePaths against the door
-                // OBBs), the direct simulator wants the real geometry
-                // between source and listener — anchoring at a doorway
-                // turned an occluded source into an unoccluded one (the
-                // pathing solver did the diffraction; the direct sim
-                // independently saw clean line-of-sight from the anchor
-                // and skipped the wall transmission).
-                //
-                // Engine→IPL conversion (feet→meters AND Z-up→Y-up) happens
-                // via engineToIplPos so the source sits in the same frame
-                // as the listener and mesh.
-                IPLCoordinateSpace3 sourceCoord{};
-                sourceCoord.origin = engineToIplPos(voice->worldPos);
-                // Voices have no inherent orientation in this engine; pick an
-                // arbitrary right-handed IPL-space basis (X right, Y up,
-                // -Z ahead per phonon.h convention).  Steam Audio uses this
-                // only for directional sources, which we don't drive.
-                sourceCoord.ahead = { 0.0f,  0.0f, -1.0f };
-                sourceCoord.right = { 1.0f,  0.0f,  0.0f };
-                sourceCoord.up    = { 0.0f,  1.0f,  0.0f };
-
-                IPLSimulationInputs inputs{};
-                // DIRECT + PATHING share the same direct simulator handle;
-                // REFLECTIONS lives on its own simulator. Pathing fields
-                // below (pathingProbes, visRadius, visThreshold, visRange,
-                // pathingOrder, enableValidation, findAlternatePaths) are
-                // only read when the PATHING flag is set on the
-                // iplSourceSetInputs call below, so the same struct can be
-                // pushed to the reflection simulator with REFLECTIONS only
-                // — Steam Audio ignores fields not selected by the flag
-                // argument.
-                //
-                // PATHING bit is set unconditionally (not gated on the
-                // per-voice populate block) so iplSourceSetInputs(PATHING)
-                // — when issued — always leaves pathingInputs.enabled=true.
-                // An earlier "drive enabled from the live gate" attempt
-                // caused a stale-eq window on out-of-range → in-range
-                // transitions: simulatePathing only writes
-                // pathingOutputs.eq while enabled=true, so flipping it
-                // false stranded the last in-range eq values in the
-                // output buffer, audible as "sound through walls" for
-                // ~one throttle interval when the listener moved past
-                // maxAudibleDist and back through changed geometry
-                // (typical case: through a doorway and back). Keeping
-                // the worker running findPaths for currently-out-of-range
-                // voices is the price of fresh eq across distance
-                // transients; output is already gated by maxAudibleDist
-                // so the unread writes don't reach the audio thread.
-                inputs.flags = static_cast<IPLSimulationFlags>(
-                    IPL_SIMULATIONFLAGS_DIRECT
-                    | IPL_SIMULATIONFLAGS_REFLECTIONS
-                    | IPL_SIMULATIONFLAGS_PATHING);
-                // Player-emitted voices (footsteps, landings) emit from the
-                // player's own body — there is no "wall" between the player's
-                // feet and ears, so occlusion + transmission are skipped at
-                // the Steam Audio API level. Distance attenuation, air
-                // absorption, and reflections still run normally so footsteps
-                // produce reverb the same way as any other voice.
-                //
-                // PR 1a (PLAN.AUDIO_PERF T1): the ray-casting flags
-                // (OCCLUSION volumetric + freq-dependent TRANSMISSION,
-                // ~16 serial rays/source/frame) run on the PER-SLOT
-                // sources only — the dry path consumes slot params
-                // exclusively (see the per-slot direct effect comment in
-                // steamAudioNodeProcess). The voice-level source computed
-                // the same rays at nearly the same position, but its
-                // occlusion fed only metering + diagnostics (now re-pointed
-                // at slot 0): pure duplication, measured as ~half of the
-                // 9.6 ms p50 main-thread direct_sim on MISS6. Voice-level
-                // keeps the analytic zero-ray terms only.
-                IPLDirectSimulationFlags slotDirectFlags = static_cast<IPLDirectSimulationFlags>(
-                    IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
-                    IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION);
-                if (!voice->playerEmitted) {
-                    slotDirectFlags = static_cast<IPLDirectSimulationFlags>(
-                        slotDirectFlags
-                        | IPL_DIRECTSIMULATIONFLAGS_OCCLUSION
-                        | IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
-                }
-                inputs.directFlags = static_cast<IPLDirectSimulationFlags>(
-                    IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
-                    IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION);
-                inputs.source = sourceCoord;
-                // Steam Audio distance model: always INVERSEDISTANCE with
-                // minDistance scaled by the schema's P$SchAttFac
-                // (attenuationFactor). attenuationFactor=1 → minDistance=1m
-                // (matches DEFAULT model behaviour); attenuationFactor=20
-                // → minDistance=20m, keeping a sound at full volume out to
-                // 20m before 1/d falloff. Per-voice; default factor 1.0 set
-                // at voice creation in VoicePool, schemas with non-default
-                // P$SchAttFac override via AmbientSoundManager → voiceSetAttenuationFactor.
-                inputs.distanceAttenuationModel.type =
-                    IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
-                inputs.distanceAttenuationModel.minDistance =
-                    1.0f * voice->attenuationFactor;
-                inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
-                // Volumetric occlusion models the source as a sphere — as the
-                // sphere partially disappears behind a corner, occlusion ramps
-                // smoothly from 0 to 1 instead of snapping instantly (RAYCAST).
-                // The 16 samples are points within the sphere used for ray tests.
-                inputs.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;
-                // Volumetric occlusion samples N points from a sphere
-                // CENTERED ON THE SOURCE and casts rays from each to the
-                // listener. Fraction of unblocked rays = unoccluded
-                // fraction.
-                //
-                // Sphere radius is PER-VOICE — computed once at voice
-                // creation in createVoiceSource via the BSP raycaster
-                // so the sphere never extends past the nearest wall in
-                // any direction (eliminates the prior cross-wall leak
-                // where global-radius spheres reached from the source
-                // into the listener's room and produced false-positive
-                // direct-LOS rays). Falls back to the YAML
-                // `audio.occlusion.radius` global if the helper
-                // returned a negative sentinel (headless tools that
-                // never wire mRaycaster).
-                const float perVoiceFt = voice->occlusionRadiusFt;
-                const float effectiveFt = (perVoiceFt > 0.0f)
-                    ? perVoiceFt
-                    : (mAudioOcclusion ? mAudioOcclusion->getRadius() : 10.0f);
-                inputs.occlusionRadius = effectiveFt * kFeetToMeters;
-                inputs.numOcclusionSamples = mAudioOcclusion->getSamples();
-                inputs.numTransmissionRays = 8;
-
-                // Hybrid/parametric tuning, always populated. reverbScale[]
-                // defaults to {0,0,0} on zero-init — which silences the
-                // parametric tail entirely. Set to {1,1,1} so Steam Audio
-                // uses the simulated RT60 unmodified across all three bands.
-                // The two hybrid fields are only consulted when the effect
-                // type is HYBRID (Steam Audio ignores them otherwise), so
-                // it's safe to set unconditionally. Plan target:
-                // transitionTime=2.0 s, overlap=0.25 → 0..1.5 s pure
-                // convolution, 1.5..2.0 s blend, 2.0+ s pure parametric.
-                inputs.reverbScale[0] = 1.0f;
-                inputs.reverbScale[1] = 1.0f;
-                inputs.reverbScale[2] = 1.0f;
-                inputs.hybridReverbTransitionTime = mHybridTransitionTime;
-                inputs.hybridReverbOverlapPercent = mHybridOverlapPercent;
-
-                // Voices route to baked-probe reflections when:
-                //   • They are not in the top-N closest (real-time budget
-                //     reserved for the most audible source-position-sensitive
-                //     voices), OR
-                //   • They are player-emitted (footsteps, landings) — see the
-                //     candidate-selection comment above for rationale: source
-                //     ≈ listener so listener-position baked IR is correct, and
-                //     it sidesteps the real-time sim's 200-400 ms latency
-                //     which is longer than a footstep.
-                bool isTopN = reflCandidateSet.count(handle) > 0;
-                bool useBaked = (!isTopN || voice->playerEmitted)
-                                && mProbeManager->hasReflections();
-                if (useBaked) {
-                    inputs.baked = IPL_TRUE;
-                    inputs.bakedDataIdentifier = bakedReflId;
-                }
-
-                // Steam Audio pathing inputs — used only when the probe
-                // batch has been attached to mDirectSimulator and the
-                // voice is not player-emitted (player-emitted voices
-                // emit from the listener, so the pathing graph collapses
-                // to a self-loop with eqCoeffs ≡ 1.0; running it is wasted
-                // work). visRange is the per-voice maximum audible
-                // distance (the schema-authored radius), so Steam Audio
-                // stops exploring long detours through the probe graph
-                // beyond what the schema considers audible. pathingOrder
-                // = 0 keeps the path effect mono — we drive the gain +
-                // LPF through portalAttenuation / portalBlocking on the
-                // existing DSP chain rather than as a spatialized
-                // ambisonic field.
-                // Throttled: pathing input staging is skipped on frames
-                // when mPathingDueThisStep is false. The matching
-                // iplSourceSetInputs(...PATHING) call and the
-                // iplSimulatorRunPathing call below are gated on the
-                // same flag, so skipping the stamping here costs
-                // nothing (Steam Audio reads pathing fields only on
-                // the PATHING setInputs path).
-                // Per-voice audibility gate. Voices outside their
-                // schema-authored maxAudibleDist are inaudible regardless
-                // of pathing — skip the per-source staging (and the
-                // corresponding cost in iplSimulatorRunPathing) for them.
-                //
-                // We do NOT short-circuit on "same room" here. The room
-                // graph is too coarse-grained for that to be a reliable
-                // proxy for "no portal between source and listener" —
-                // many open spaces (halls, courtyards, outdoor areas)
-                // span multiple Room cells but should sonically behave
-                // as a single space, and the previous same-room hack
-                // would incorrectly skip pathing for voices across those
-                // cells. Let Steam Audio's solver decide; for true
-                // unobstructed paths it returns eqCoeffs ≈ 1.0 and the
-                // mapping naturally produces full passthrough.
-                float voicePathingDist = glm::length(voice->worldPos - mListenerPos);
-                bool  pathingWanted    = (voicePathingDist <= voice->maxAudibleDist);
-                if (mPathingProbeBatchAdded && mProbePathingEnabled
-                    && mPathingDueThisStep
-                    && !voice->playerEmitted
-                    && pathingWanted) {
-                    // Multi-batch architecture: pathing sim has both the
-                    // reflection batch (silently skipped — no pathing data)
-                    // and the sparse pathing batch attached. The source
-                    // MUST name the pathing batch explicitly via
-                    // IPLSimulationInputs::pathingProbes; otherwise the
-                    // PathSimulator lookup at SimulationManager::simulatePathing
-                    // (vcpkg/.../simulation_manager.cpp:618) misses entirely.
-                    inputs.pathingProbes      = mProbeManager->getPathingProbeBatch();
-                    // visRadius and visThreshold are derived from the
-                    // shared pathing constants in SteamAudioPathing.h so
-                    // they stay locked to the bake-time parameters
-                    // (ProbeManager.cpp). A runtime value below the bake
-                    // radius causes iplSimulatorRunPathing to fail
-                    // finding an entry probe for sources placed
-                    // off-probe, returning eqCoeffs=[0,0,0] — audible as
-                    // per-callback choppy gaps in the reflection wet bus.
-                    //
-                    // kPathingVisRadiusFt is identical at bake-time
-                    // (ProbeManager.cpp::bakePathingBatch) and runtime
-                    // here. If you change either, change both.
-                    inputs.visRadius          = kPathingVisRadiusFt
-                                              * kFeetToMeters;
-                    inputs.visThreshold       = kPathingVisThreshold;
-                    // visRange = maximum probe-to-probe distance the
-                    // runtime solver will consider for a single edge.
-                    // MUST be ≤ the bake-time value (bake's visRange is
-                    // an upper bound on what edges exist in the graph).
-                    // ≤ bake is safe — runtime just early-culls farther
-                    // pairs from consideration. > bake would consider
-                    // edges that were never baked, returning false-
-                    // negatives that look like graph holes.
-                    //
-                    // Runtime uses `mPropagationMaxDist` (the per-voice
-                    // audible cap from YAML `propagation.max_distance`,
-                    // default 200 ft). Bake-time uses the scene
-                    // diagonal × 1.5 (ProbeManager.cpp::bakePathingBatch)
-                    // so the graph spans the whole level regardless of
-                    // any voice's audible range. With the typical
-                    // mission this means runtime visRange ≪ bake
-                    // visRange — exactly the relationship Steam Audio
-                    // expects (bake = upper bound, runtime = per-source
-                    // budget).
-                    //
-                    // Past sessions thought bake and runtime had to
-                    // match exactly. They don't — bake just needs to be
-                    // ≥ runtime. Tying both to mPropagationMaxDist
-                    // silently truncated the graph at 200 ft, breaking
-                    // pathing for any source-listener pair farther than
-                    // that even when a shorter multi-hop probe route
-                    // existed.
-                    //
-                    // Per-voice pathing-solver scope, derived from the
-                    // original Dark Engine's SFX_MaxDist formula:
-                    //   max_pathing_dist_ft =
-                    //       (5000 + gain_cB) / 55 × attenuationFactor
-                    // This was the BFS-termination distance for portal
-                    // routing in the original engine — sets the per-voice
-                    // horizon for routed pathing. Sources beyond this
-                    // distance fall back to direct-only audio via the
-                    // existing cached-replay mechanism in the readback
-                    // site. 55 cB/ft matches the original engine's
-                    // attenuation_factor constant (APPSFX default). Steam
-                    // Audio's INVERSEDISTANCE curve still handles per-voice
-                    // volume continuously; this knob only limits the
-                    // pathing-solver's search scope per source (matches
-                    // Steam Audio's per-source visRange API).
-                    //
-                    // gain_cB lives on the schema's playParams.volume
-                    // (centibels, -10000..-1; -1 ≈ 0 dB). Look it up via
-                    // mSchemaParser->findSchema(voice->schemaName). If the
-                    // schema is missing, fall back to gain_cB=0 so the
-                    // formula reduces to the nominal ~90.9 ft × atten.
-                    // We clamp the result to ≥ 1 ft so very quiet sources
-                    // (gain_cB ≈ -5000, the original engine's near-silent
-                    // threshold) still leave Steam Audio a non-degenerate
-                    // visRange to work with rather than zero.
-                    constexpr float kOriginalEngineAttenCBPerFt = 55.0f;
-                    float gainCB = 0.0f;
-                    if (mSchemaParser) {
-                        const SchemaEntry *visSch =
-                            mSchemaParser->findSchema(voice->schemaName);
-                        if (visSch) {
-                            gainCB = static_cast<float>(
-                                visSch->playParams.volume);
-                        }
-                    }
-                    float maxPathingDistFt =
-                        (5000.0f + gainCB)
-                        / kOriginalEngineAttenCBPerFt
-                        * voice->attenuationFactor;
-                    if (maxPathingDistFt < 1.0f) {
-                        maxPathingDistFt = 1.0f;
-                    }
-                    inputs.visRange = maxPathingDistFt * kFeetToMeters;
-                    // pathingOrder MUST equal the path effect's create-time
-                    // maxOrder (= mAmbisonicsOrder). The solver writes
-                    // pathingOut.pathing.shCoeffs sized to (pathingOrder+1)^2
-                    // and pathingOut.pathing.order = pathingOrder. The path
-                    // effect's internal ambisonics-rotate stage asserts
-                    // `in.numChannels() == numCoeffsForOrder(params.order)`,
-                    // so the per-call params.order must match the channel
-                    // count of the encoded SH buffer. Phase 4 inherited a
-                    // legacy pathingOrder=0 from the pre-path-effect
-                    // implementation (where pathing only drove eqCoeffs +
-                    // scalar collapse) — at runtime ambisonics_order > 0
-                    // that mismatch crashed inside iplPathEffectApply.
-                    inputs.pathingOrder       = mAmbisonicsOrder;
-                    inputs.enableValidation   = IPL_TRUE;
-                    // findAlternatePaths ON.
-                    //
-                    // Required for correctness with dynamic door OBBs in
-                    // the acoustic scene. enableValidation alone discards
-                    // any baked path whose edge ray hits a door OBB; with
-                    // findAlternatePaths off, no replacement is sought and
-                    // the source's pathingState.eq stays at the 0.1f
-                    // sentinel — observed in practice as nearby sources
-                    // (24–37 ft, sProbe/lProbe well inside visRadius)
-                    // returning persistent sentinels because their
-                    // shortest baked path happens to skirt a door OBB
-                    // somewhere along the way.
-                    //
-                    // Cost was the reason this was OFF earlier (boot-time
-                    // main-thread freeze). Two changes reduce it to
-                    // acceptable now:
-                    //   • numVisSamples dropped from 16 to 4 in the
-                    //     direct-sim settings — 16× fewer rays per
-                    //     candidate edge during alternate-path search.
-                    //   • numVisSamples = 4 matches Steam Audio's
-                    //     Unity bake convention, so runtime and bake
-                    //     stay aligned.
-                    //
-                    // If [PATHING_SLOW] returns and blocks the main
-                    // thread, the next move is PLAN.PATHING_WORKER.md —
-                    // run the solver on a background thread so any
-                    // per-call cost becomes acceptable.
-                    inputs.findAlternatePaths = IPL_TRUE;
-                }
-
-                // Push inputs to each simulator. Every voice has a
-                // directSource (in mDirectSimulator); non-player-emitted
-                // voices also have a pathingSource (in the pathing sim)
-                // and reflection-eligible voices have a reflectionSource
-                // (in the reflection sim). Per phonon.h, no
-                // synchronisation is required between these calls — Steam
-                // Audio internally separates per-source staging buffers,
-                // and the staging-vs-active double buffer is safe to
-                // write from the main thread even while a worker is
-                // iterating (validated against Unity + Unreal reference
-                // integrations).
-                iplSourceSetInputs(voice->directSource,
-                    IPL_SIMULATIONFLAGS_DIRECT, &inputs);
-                // Pathing inputs go to the per-voice pathingSource (in
-                // the pathing simulator). Throttled by mPathingDueThisStep
-                // — we only stamp fresh inputs when the throttle has
-                // elapsed and the worker is about to be signalled. No
-                // !isRunning() gate: per N2 (RM.PLAN.PATHING_WORKER.md),
-                // iplSourceSetInputs is per-frame-safe via Steam Audio's
-                // internal double buffering, and both reference
-                // integrations call it every frame while the sim thread
-                // is mid-iteration.
-                //
-                // The gate here must match the populate block above
-                // EXACTLY. Letting a voice through here without going
-                // through the populate path means Steam Audio reads
-                // `inputs.pathingProbes` as the default-initialised null
-                // pointer and segfaults inside the next runPathing.
-                if (mPathingProbeBatchAdded && mProbePathingEnabled
-                    && mPathingDueThisStep
-                    && !voice->playerEmitted
-                    && pathingWanted
-                    && voice->pathingSource) {
-                    iplSourceSetInputs(voice->pathingSource,
-                        IPL_SIMULATIONFLAGS_PATHING, &inputs);
-                }
-                // Stage 2.2: Normal voices without a reflectionSource
-                // (not yet promoted, or recently demoted) have nothing on
-                // the reflection side to update. Skip the call to avoid
-                // dereferencing a null IPLSource inside Steam Audio.
-                if (voice->reflectionSource) {
-                    iplSourceSetInputs(voice->reflectionSource,
-                        IPL_SIMULATIONFLAGS_REFLECTIONS, &inputs);
-                }
-
-                // Per-slot direct-source inputs (Phase 4 multi-path).
-                // Each ACTIVE slot's source is positioned at its path's
-                // virtualPosition — the doorway anchor for cross-room
-                // paths, sourcePos for same-room. All other simulation
-                // parameters (distance model, air absorption, occlusion
-                // type/radius/samples, transmission rays) are inherited
-                // from the voice-level `inputs` above so per-slot
-                // sampling uses the same configuration knobs. The flags
-                // word is REPLACED with slotDirectFlags: slots carry the
-                // full ray-casting set (OCCL|TRANS for non-player voices)
-                // because the dry path consumes slot params exclusively,
-                // while the voice-level source stays analytic (PR 1a —
-                // see the flags comment above).
-                //
-                // Draining slots intentionally retain their last-set
-                // inputs: their gain is ramping down, the audio thread
-                // skips reading their outputs, so refreshing inputs
-                // would be wasted work.
-                for (auto &slot : voice->dspNode.subSources) {
-                    if (slot.state != SubSourceState::Active) continue;
-                    if (!slot.directSource) continue;
-                    Vector3 slotWorldPos = voice->worldPos;
-                    for (const auto &p : prop.paths) {
-                        if (p.predecessorRoomID == slot.predecessorRoomID) {
-                            slotWorldPos = p.virtualPosition;
-                            break;
-                        }
-                    }
-                    IPLSimulationInputs slotInputs = inputs;
-                    slotInputs.source.origin = engineToIplPos(slotWorldPos);
-                    slotInputs.directFlags = slotDirectFlags;
-                    iplSourceSetInputs(slot.directSource,
-                        IPL_SIMULATIONFLAGS_DIRECT, &slotInputs);
-                }
-            }
-
-            // Step 3: Run direct sim and signal reflection thread.
-            // Direct sim runs synchronously every frame.
-            // Reflection sim runs on background thread, throttled.
-            // The throttle counter / divisor live on ReflectionSimulator now.
-            // The reflection pipeline is considered ready when both the
-            // ambisonics decoder and the convolution worker pool are alive
-            // (post-Phase-3 the global IPLReflectionMixer is gone — the
-            // worker pool sums ambisonics manually).
-            bool wantReflections = mReflectionsEnabled
-                && mIplAmbiDecodeEffect && mConvolutionPool && mConvolutionPool->isActive()
-                && !reflBusy && mReflectionSim
-                && mReflectionSim->throttleTickAndConsume();
-
-            // Run direct sim synchronously on the main thread. Measured
-            // (2026-07-04 baseline, MISS6, M2 Max): ~0.3 ms per
-            // ray-casting source, SERIAL — Steam Audio's simulateDirect
-            // is a plain loop over sources; `sim_threads` does NOT
-            // parallelize it (phonon.h documents numThreads as
-            // reflections-only). PR 1a halved the source set by making
-            // the voice-level sources analytic-only (slots own the
-            // rays); PR 1b (PLAN.AUDIO_PERF T1) moves this call to a
-            // DirectSimulator worker.
-            // Same-frame results: every voice (including newly created ones)
-            // gets real occlusion/distance/air absorption before the audio
-            // callback sees them. Uses mDirectSimulator so the run never
-            // contends with the reflection sim's background thread, and so
-            // newly added direct sources are processed from frame 1 (no
-            // defer-flush race for the direct path).
-            {
-                if (profOn) {
-                    auto dt0 = std::chrono::steady_clock::now();
-                    iplSimulatorRunDirect(mDirectSimulator);
-                    auto dt1 = std::chrono::steady_clock::now();
-                    float dMs = std::chrono::duration<float, std::milli>(dt1 - dt0).count();
-                    float prevD = sDirectSimPeakMs.load(std::memory_order_relaxed);
-                    if (dMs > prevD) sDirectSimPeakMs.store(dMs, std::memory_order_relaxed);
-                    // PLAN.AUDIO_PROFILING.md §2.4 — also record the full
-                    // distribution alongside the existing peak.
-                    sPerfDirectSimMs.record(static_cast<double>(dMs));
-                } else {
-                    iplSimulatorRunDirect(mDirectSimulator);
-                }
-            }
-
-            // Signal the pathing-sim worker thread to run one
-            // iplSimulatorRunPathing iteration. Cheap when no probe batch
-            // is attached (mPathingProbeBatchAdded = false) — Steam Audio
-            // skips per-source pathing work since pathingProbes is null
-            // for every source. Bypassed entirely when mProbePathingEnabled
-            // is off (audio.propagation.probe_pathing: false).
-            //
-            // Throttled by mPathingDueThisStep (audio.propagation.
-            // pathing_update_interval, default 0.1 s / 10 Hz). On skipped
-            // frames the previous run's eqCoeffs remain cached on each
-            // source, so the output read further down still produces
-            // stable portalAttenuation/portalBlocking values.
-            //
-            // The actual iplSimulatorRunPathing call (and its
-            // [PATHING_SLOW] timing log) now lives in
-            // PathingSimulator::workerMain — keeping it off the main
-            // thread eliminates the 50–11000 ms loop-stall hitches
-            // observed on MISS6 with dynamic door geometry.
-            {
-                const bool gateProbeBatch = mPathingProbeBatchAdded;
-                const bool gateEnable     = mProbePathingEnabled;
-                const bool gateDue        = mPathingDueThisStep;
-                // Mirror the reflection-sim gate: never signal while the
-                // worker is mid-iteration. Without this, a throttle elapse
-                // during a long pathing run (560 ms+ on MISS5) queued
-                // mWant=true and caused the worker to immediately re-enter
-                // iplSimulatorRunPathing the moment its current iteration
-                // returned. That re-entry raced the main thread's
-                // top-of-frame source mutation flush — flushPendingAdds /
-                // flushPendingRemovals / iplSimulatorCommit — and crashed
-                // inside ipl::SimulationManager::simulatePathing iterating
-                // a list whose entries had just been freed.
-                const bool gateNotBusy    = !pathBusy;
-                const bool wantPathing    = gateProbeBatch && gateEnable
-                                         && gateDue && gateNotBusy;
-
-                // [PATHING_LAG] diagnostic: throttle elapsed but the worker
-                // is still running the previous iteration. We skip signal()
-                // entirely in this branch (see gateNotBusy above for the
-                // race we're avoiding); eqCoeffs hold one extra interval
-                // until the worker idles and the next due frame signals
-                // it. Rate-limited (first 16 + every 64th thereafter).
-                if (gateProbeBatch && gateEnable && gateDue && pathBusy) {
-                    static std::atomic<int> sPathingLagCount{0};
-                    int lc = sPathingLagCount.fetch_add(1, std::memory_order_relaxed);
-                    if (lc < 16 || (lc % 64) == 0) {
-                        std::fprintf(stderr,
-                            "[PATHING_LAG] worker still running when "
-                            "throttle elapsed (interval=%.3fs, "
-                            "occurrence #%d) — signal skipped, eqCoeffs "
-                            "will be one interval stale this cycle\n",
-                            mPathingUpdateInterval, lc + 1);
-                    }
-                }
-
-                if (wantPathing && mPathingSim) {
-                    mPathingSim->signal();
-                }
-                // DIAG: confirm iplSimulatorRunPathing is actually
-                // firing. eqCoeffs reading back as the Steam Audio
-                // default 0.1f (per simulation_data.cpp:120-124, source
-                // pathingState.eq[i] is initialized to 0.1f at source
-                // create time) means the solver never wrote new values
-                // — either runPathing isn't being called, or it's
-                // being called but the source isn't in its solve set.
-                static std::atomic<int> sRunPathingLogCount{0};
-                int n = sRunPathingLogCount.fetch_add(1, std::memory_order_relaxed);
-                if (n < 8) {
-                    AUDIO_LOG("[RUN_PATHING] called=%d probeBatchAdded=%d "
-                              "enabled=%d due=%d notBusy=%d updateInterval=%.3f "
-                              "accumSec=%.3f (occurrence #%d)\n",
-                              wantPathing ? 1 : 0,
-                              gateProbeBatch ? 1 : 0,
-                              gateEnable ? 1 : 0,
-                              gateDue ? 1 : 0,
-                              gateNotBusy ? 1 : 0,
-                              mPathingUpdateInterval, mPathingAccumSec,
-                              n + 1);
-                }
-            }
-
-            // Signal reflection sim (throttled, latency-tolerant, background thread)
-            if (wantReflections && mReflectionSim) {
-                mReflectionSim->signal();
-            }
         }
 
-        // Step 4: Read back simulation results and feed to DSP nodes.
-        // Direct sim results are same-frame (ran synchronously above).
-        // Reflection results are from the previous frame (background thread),
+        // PLAN.AUDIO_PROFILING.md §2.2 — voice-update phase starts here.
+        // Since PR 1b it covers harvest (below) THEN staging — the same
+        // per-voice work the phase always measured, reordered.
+        if (profOn) voiceUpdT0 = std::chrono::steady_clock::now();
+
+        // Step 2 — HARVEST: read back simulation results and feed the DSP
+        // nodes. PR 1b frame shape: this pass runs FIRST in the idle
+        // branch, before the direct-source flush and the staging pass —
+        // so every read here observes the PREVIOUS worker iteration's
+        // committed outputs with a deterministic one-frame age (never a
+        // mid-write mixture; the worker is idle for this whole branch).
+        // Direct results therefore lag one loopStep (~16 ms at 60 fps —
+        // under the 21.3 ms audio-callback period; DirectEffect's gain
+        // ramps smooth the step). Reflection results were already
+        // previous-cycle before PR 1b (background thread, throttled),
         // which is imperceptible since reverb tails change slowly.
 
-        // reflCandidates and reflCandidateSet were already computed in Step 2a
-        // (before iplSourceSetInputs) so non-top-N voices could be set to baked mode.
+        // reflCandidates and reflCandidateSet were computed in the
+        // ranking block above so both this pass and the staging pass see
+        // the same top-N decision.
 
         // Track total convolution voices against the audio callback budget.
         // Tail voices (sourceEnded, still ringing out reverb) are counted first
@@ -7178,10 +6297,69 @@ void AudioService::loopStep(float deltaTime)
             if (!voice->directSource)
                 continue;
 
-            // Read direct outputs unconditionally — direct sim has no
-            // background iteration, so directSource is always in the
-            // simulator and outputs.direct is populated from this frame's
-            // iplSimulatorRunDirect call above.
+            // ── Direct-source readiness gate (PR 1b) ──
+            //
+            // Two-part guard against the pending-source race (this would
+            // be the 4th recurrence — project_audio_pending_source_race):
+            //   • isAddPending — the source was queued while the worker
+            //     was busy; iplSourceAdd hasn't run yet (the flush point
+            //     is later this frame, AFTER this harvest pass, by
+            //     design — see the flush block below this loop).
+            //   • cycle gate — the source is committed, but no RunDirect
+            //     iteration has completed since it entered the simulator.
+            //     Its outputs still carry the SimulationData create-time
+            //     seeds (neutral distanceAttenuation = 1.0), which would
+            //     pop a distant spawn at full volume for a frame. Same
+            //     pattern as the reflection pin gate
+            //     (reflectionSimCycleAtAdd).
+            // In both cases skip this voice's whole readback: dspNode
+            // keeps the per-class defaults from initVoiceDSP — exactly
+            // the spawn-gap behaviour that machinery has always covered.
+            // HRTF direction is still updated below the skip (position-
+            // only, no sim outputs) so pending voices spatialize
+            // correctly from their first callback. Loud [PENDING_SKIP]
+            // per the no-silent-fallbacks convention.
+            {
+                const bool directPending = mDirectSim
+                    && mDirectSim->isAddPending(voice->directSource);
+                const bool directCycleReady = mDirectSim
+                    && mDirectSim->completedCycles()
+                           > voice->directSimCycleAtAdd;
+                if (directPending || !directCycleReady) {
+                    static std::atomic<int> sDirectPendingSkipCount{0};
+                    int n = sDirectPendingSkipCount.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (n < 32 || (n % 256) == 0) {
+                        std::fprintf(stderr,
+                            "[PENDING_SKIP] h=%u field=directGetOutputs "
+                            "schema='%s' pending=%d cycleReady=%d [#%d]\n",
+                            handle, voice->schemaName.c_str(),
+                            directPending ? 1 : 0,
+                            directCycleReady ? 1 : 0, n + 1);
+                    }
+                    if (voice->dspNode.effectsReady
+                        && !voice->dspNode.usePortalRouting) {
+                        // Same projection as the standard HRTF-direction
+                        // update further down this loop.
+                        Vector3 toSource = voice->worldPos - mListenerPos;
+                        float dist = glm::length(toSource);
+                        if (dist > kDistanceEpsilonFt) {
+                            toSource /= dist;
+                            float dirX = glm::dot(toSource, right);
+                            float dirY = glm::dot(toSource, up);
+                            float dirZ = -glm::dot(toSource, ahead);
+                            voice->dspNode.direction = { dirX, dirY, dirZ };
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // Read direct outputs — the previous worker iteration's
+            // committed values (the readiness gate above guarantees the
+            // solver has produced at least one full iteration containing
+            // this source, and the worker is idle for this entire
+            // branch, so the read is never torn).
             IPLSimulationOutputs outputs{};
             iplSourceGetOutputs(voice->directSource,
                 IPL_SIMULATIONFLAGS_DIRECT, &outputs);
@@ -7199,11 +6377,66 @@ void AudioService::loopStep(float deltaTime)
                     IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
             }
 
+            // ── Per-frame portal-eq scalar seed ──
+            //
+            // Moved here from the staging pass in PR 1b: the neutral seed
+            // and the solver-derived overwrite (the Valve-pattern pathing
+            // read just below) must live in the SAME pass in this order —
+            // staging now runs AFTER harvest, and a seed left there would
+            // clobber the freshly harvested solver values every frame,
+            // leaving the audio thread reading permanent 1.0 (full reverb
+            // send through walls).
+            //
+            // portalAttenuation / portalBlocking are seeded at neutral
+            // 1.0 / 0.0 as the default for voices that won't be
+            // path-solved this frame: player-emitted, skipPortalRouting,
+            // and sourceEnded (tail ringing). For voices that ARE
+            // path-solved, the eqCoeffs branch below derives them from
+            // the live pathing outputs so the reflection-send and the
+            // AmbientSoundManager halt metric see the routing attenuation
+            // the solver computed.
+            //
+            // Override sites (single per-frame reset is this seed,
+            // single set of writers below):
+            //   (a) out-of-range hard cutoff (~immediately below) → 0.0
+            //   (b) Valve-pattern pathing read → mapping.gain /
+            //       mapping.blocking
+            //
+            // usePortalRouting stays false unconditionally — Steam Audio
+            // is sole routing authority (Phase 4); the flag is vestigial
+            // and only steers the standard HRTF direction branch below to
+            // read the real source position.
+            voice->dspNode.usePortalRouting  = false;
+            voice->dspNode.portalAttenuation = 1.0f;
+            voice->dspNode.portalBlocking    = 0.0f;
+
+            // maxAudibleDist hard cutoff — same authored value that
+            // gates AI hearing's BFS, so a wind ambient with
+            // radius=25 still goes silent at 25 ft of straight-line
+            // distance. Steam Audio's distance attenuation would
+            // taper to ~0 at this range anyway, but the schema-
+            // authored radius is treated as an absolute boundary in
+            // the original engine. Implementation: silence the dry bus
+            // via portalAttenuation = 0.0 here; the pathing branch below
+            // additionally invalidates the path-effect target so the
+            // audio thread bypasses the path effect. The wet-bus
+            // reflection-send tracks portalAttenuation, so reverb also
+            // silences past the boundary.
+            {
+                float lineDistTo = glm::length(voice->worldPos - mListenerPos);
+                if (lineDistTo > voice->maxAudibleDist) {
+                    // Override site (a) — out-of-range hard cutoff
+                    // silences the reverb-send too.
+                    voice->dspNode.portalAttenuation = 0.0f;
+                }
+            }
+
             // Steam Audio pathing → portalAttenuation + portalBlocking.
             //
-            // Same gating as the setInputs block in Step 2a: voice must
-            // not be player-emitted, must not be skipPortalRouting'd, and
-            // the probe batch must be attached to the direct simulator.
+            // Same gating as the pathing setInputs in the staging pass
+            // (which runs after this pass since PR 1b): voice must not
+            // be player-emitted, must not be skipPortalRouting'd, and
+            // the probe batch must be attached to the pathing simulator.
             // When all three hold, eqCoeffs[3] is a smooth 3-band
             // attenuation envelope along the resolved probe-graph path —
             // 1.0 unobstructed, trending toward 0.0 as the path is
@@ -7215,10 +6448,10 @@ void AudioService::loopStep(float deltaTime)
             //   t      = 1 − high                          → portalBlocking
             //
             // Skip when the voice's listener-source distance exceeds
-            // maxAudibleDist (the schema-authored hard cutoff applied in
-            // the Step 2a setInputs block above zeroed portalAttenuation
-            // already). Skip when sourceEnded (no fresh source content;
-            // the convolution tail is still ringing out the previous
+            // maxAudibleDist (the schema-authored hard cutoff in the
+            // seed block just above zeroed portalAttenuation already).
+            // Skip when sourceEnded (no fresh source content; the
+            // convolution tail is still ringing out the previous
             // pathing state).
             bool useSteamAudioPathing = mPathingProbeBatchAdded
                                       && mProbePathingEnabled
@@ -7228,8 +6461,8 @@ void AudioService::loopStep(float deltaTime)
             if (useSteamAudioPathing && !voice->sourceEnded) {
                 float lineDist = glm::length(voice->worldPos - mListenerPos);
 
-                // Mirror the setInputs gate from earlier in this loopStep.
-                // Voices we skipped staging for (out-of-range) must NOT
+                // Mirror the staging pass's pathing gate.
+                // Voices we skip staging for (out-of-range) must NOT
                 // read back eqCoeffs from the source — the solver never
                 // wrote new values, so getOutputs returns the source's
                 // pristine create-time pathingState.eq[i] = 0.1f sentinel.
@@ -7579,12 +6812,12 @@ void AudioService::loopStep(float deltaTime)
                     }
                 }
 
-                // Direct path is always written — direct sim ran this frame
-                // for this source unconditionally. The old `if (isPending)
-                // continue;` guard is gone: it was only needed because the
-                // unified simulator coupled direct and reflection adds, so
-                // a deferred reflection add silently broke the direct read
-                // too. With split simulators that coupling is gone.
+                // Direct path is always written for voices that reached
+                // this point — the PR 1b readiness gate at the top of
+                // this loop already skipped sources the solver hasn't
+                // produced an iteration for (pending adds + the first
+                // post-add cycle), so outputs.direct here is a real
+                // previous-iteration result, never a create-time seed.
                 voice->dspNode.directParams = outputs.direct;
                 // PR 1a: the voice-level source no longer computes
                 // occlusion/transmission (slot sources own the rays — see
@@ -8105,6 +7338,1007 @@ void AudioService::loopStep(float deltaTime)
                 ma_sound_set_volume(&voice->sound, volume);
             }
         }
+
+        // ── Direct-sim deferred source mutations (PR 1b frame shape:
+        //    harvest → FLUSH → stage → signal) ──
+        //
+        // Flushing AFTER harvest and BEFORE staging is load-bearing on
+        // both sides: sources flushed here were skipped by the harvest
+        // pass above (isAddPending → [PENDING_SKIP]), so outputs the
+        // solver has never written are never read; and they are flushed
+        // before the staging pass below, so every committed source gets
+        // fresh inputs before the worker is signaled. The worker is idle
+        // across this entire branch (directBusy gate above; the only
+        // signal() is the last step below), so the mutations are safe.
+        //
+        // The flush callback captures the completed-cycle counter at
+        // FLUSH time into the owning voice — same rationale as the
+        // reflection flush at the top of loopStep (see
+        // project_audio_pending_source_race: queue-time snapshots have
+        // bitten three times). Slot sources map back to their owning
+        // voice's counter; voice-level and slot sources are always
+        // queued together by createVoiceSource, so the per-voice field
+        // is written idempotently.
+        if (mDirectSim) {
+            const uint64_t directCycleAtFlush = mDirectSim->completedCycles();
+            mDirectSim->flushPendingAdds([&](IPLSource src) {
+                if (!mVoicePool || !src) return;
+                for (auto &[h, v] : mVoicePool->voices()) {
+                    if (!v) continue;
+                    bool owns = (v->directSource == src);
+                    if (!owns) {
+                        for (auto &slot : v->dspNode.subSources) {
+                            if (slot.directSource == src) { owns = true; break; }
+                        }
+                    }
+                    if (owns) {
+                        v->directSimCycleAtAdd = directCycleAtFlush;
+                        break;
+                    }
+                }
+            });
+            mDirectSim->flushPendingRemovals();
+            mDirectSim->commitIfDirty();
+        }
+
+        {
+            // Step 1: Set listener position for the simulator
+            IPLSimulationSharedInputs sharedInputs{};
+            sharedInputs.listener = listenerCoord;
+            sharedInputs.numRays = mRealtimeNumRays;
+            sharedInputs.numBounces = mRealtimeNumBounces;
+            sharedInputs.duration = mRealtimeDuration;
+            sharedInputs.order = mAmbisonicsOrder;
+            sharedInputs.irradianceMinDistance = kIrradianceMinDistanceMeters;
+            // Listener pose goes to both simulators; reflection params
+            // (numRays/numBounces/duration/order/irradianceMinDistance) are
+            // only consumed when the REFLECTIONS flag is set, so passing the
+            // populated struct to the direct sim with only the DIRECT flag
+            // is safe — Steam Audio ignores the unused fields. Per phonon.h,
+            // these calls require no synchronisation between them.
+            if (directSimHandle) {
+                iplSimulatorSetSharedInputs(directSimHandle,
+                    IPL_SIMULATIONFLAGS_DIRECT, &sharedInputs);
+            }
+            iplSimulatorSetSharedInputs(reflectionSimHandle,
+                IPL_SIMULATIONFLAGS_REFLECTIONS, &sharedInputs);
+            // Pathing also needs the listener pose per-frame. Without
+            // this call, iplSimulatorRunPathing has no listener position,
+            // silently skips all sources, and iplSourceGetOutputs returns
+            // the source's SimulationData::pathingOutputs.eq init value
+            // of [0.1, 0.1, 0.1] (see Steam Audio simulation_data.cpp).
+            // Now lives on the separate pathing simulator handle owned
+            // by mPathingSim — both flags-on-this-simulator (here:
+            // PATHING) require their per-frame SetSharedInputs call
+            // even though only one is set.
+            if (pathingSimHandle) {
+                iplSimulatorSetSharedInputs(pathingSimHandle,
+                    IPL_SIMULATIONFLAGS_PATHING, &sharedInputs);
+            }
+
+            // Baked reflection identifier (for non-top-N voices using probe reverb)
+            IPLBakedDataIdentifier bakedReflId{};
+            bakedReflId.type = IPL_BAKEDDATATYPE_REFLECTIONS;
+            bakedReflId.variation = IPL_BAKEDDATAVARIATION_REVERB;
+
+            // Step 2b: Run portal propagation and set source positions.
+            // Architecture B: for cross-room voices, set the IPLSource position
+            // to the virtual position (last portal anchor) so Steam Audio traces
+            // rays from the doorway, not from behind a wall. Same-room voices
+            // use their real position. Unreachable voices skip simulation.
+            //
+            // Listener-room update: canonical RoomService::updatedRoom
+            // query — always disambiguates overlapping room OBBs via
+            // portal planes (the disambiguator polarity fix from the
+            // 2026-05 cleanup made this deterministic). Previous
+            // implementation also gated on a portal-blend state to
+            // sustain the room assignment near boundaries; that blend
+            // has been removed because its hysteresis produced
+            // asymmetric "louder walking away" volume artifacts —
+            // matches the original engine which has no propagation
+            // hysteresis. See NOTES.PROJECT.md "Sound Propagation
+            // Model".
+            if (mRoomService) {
+                mListenerRoom = mRoomService->updatedRoom(mListenerRoom, mListenerPos);
+            } else {
+                mListenerRoom = nullptr;
+            }
+            Room *listenerRoom = mListenerRoom;
+
+            // (voiceUpdT0 is set before the HARVEST pass now — PR 1b
+            // reordered the per-voice work but the phase timer still
+            // covers all of it.)
+            for (auto &[handle, voice] : mVoicePool->voices()) {
+                // createVoiceSource always sets both sources together (or
+                // neither, on init failure), so checking directSource here
+                // covers both. The reflectionSource may be in
+                // mPendingSourceAdds — that's handled by the pending
+                // guard in the harvest pass (which ran before this one).
+                if (!voice->directSource)
+                    continue;
+
+                // T1.2 — outbound-cross smooth ramp. Voices that
+                // spawned in-range but then drifted past the
+                // distance × priority cull threshold get a 100 ms
+                // fade-out via haltSound (which sets sourceEnded
+                // and schedules ma_sound_stop_with_fade) rather
+                // than a hard stop. PlayerEmitted skip; looping
+                // ambients skip (AmbientSoundManager owns their
+                // lifecycle). sourceEnded gate prevents re-fading
+                // every frame after the first cross.
+                if (!voice->playerEmitted
+                    && !ma_sound_is_looping(&voice->sound)
+                    && !voice->sourceEnded.load(std::memory_order_relaxed)) {
+                    float dCullCur = glm::length(voice->worldPos - mListenerPos);
+                    int   pri      = voice->priority;
+                    float cullR =
+                          (pri >= 200) ? 500.0f
+                        : (pri >= 100) ? 150.0f
+                                       : 80.0f;
+                    if (dCullCur > cullR) {
+                        std::fprintf(stderr,
+                            "[VOICE_CULL_RAMP] h=%u schema='%s' "
+                            "d=%.1f pri=%d cullR=%.0f fadeMs=100\n",
+                            handle, voice->schemaName.c_str(),
+                            dCullCur, pri, cullR);
+                        haltSound(handle, /*fadeMs=*/100);
+                        // Loop continues — voice still alive this
+                        // frame, finishes after the fade.
+                    }
+                }
+
+                // Defensive per-frame reset of skipAttenuation. No voice
+                // class currently sets this to true — the prior workaround
+                // for player-emitted voices was needed when the unified
+                // simulator's defer-flush race silently broke the surgical
+                // direct-flag overrides; with the split simulator the
+                // overrides are read by the audio thread on the very first
+                // callback after createVoiceSource.
+                voice->dspNode.skipAttenuation = false;
+
+                // Player-audio portal-eq backend toggle. When true, Steam
+                // Audio's pathing simulator drives portalAttenuation /
+                // portalBlocking via 3-band eqCoeffs. When false (legacy
+                // mode), the room-BFS branch below fills the same fields
+                // from effectiveDistance/realDistance. The non-pathing
+                // Steam Audio DSP chain (direct effect, HRTF, reflections,
+                // air absorption, occlusion/transmission) runs in both
+                // modes — this gate is only the portal-eq source. AI
+                // hearing is unaffected: AIHearingService calls
+                // RoomService::propagateSoundPath directly, independent
+                // of this gate. Player-emitted voices (footsteps, landings)
+                // sit in the same room as the listener by definition, so
+                // both backends short-circuit on the playerEmitted flag.
+                bool useSteamAudioPathing = mPathingProbeBatchAdded
+                                          && mProbePathingEnabled
+                                          && !voice->playerEmitted
+                                          && !voice->skipPortalRouting;
+
+                // Legacy BFS path — only reachable when probe_pathing: false.
+                // Steam Audio is the shipping default routing authority for
+                // player audio; this branch exists for A/B comparison and
+                // may be removed in a future revision. The room-BFS fills
+                // portalAttenuation / portalBlocking via the prop.reached
+                // branches below; gated off when Steam Audio pathing owns
+                // those fields so the two backends don't compete to write
+                // the same dspNode fields.
+                SoundPropInfo prop{};
+                bool isCrossRoom = false;
+                if (!useSteamAudioPathing && mPortalRoutingEnabled
+                    && !voice->sourceEnded
+                    && !voice->skipPortalRouting && !voice->playerEmitted) {
+                    // BFS every frame (~3 µs/voice). The cap is decoupled
+                    // from per-voice audibility radius: maxDist inside
+                    // propagateSoundPath is both the BFS depth bound AND
+                    // the door-blocking saturation target, so tying them
+                    // together made small-radius voices unreachable after
+                    // one or two portal hops.
+                    auto prT0 = profOn ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+                    if (mRoomService && mSoundPropagation) {
+                        Room *srcRoomP = mRoomService->roomFromPoint(voice->worldPos);
+                        Room *lstRoomP = mRoomService->roomFromPoint(mListenerPos);
+                        int32_t srcID = srcRoomP ? srcRoomP->getRoomID() : -1;
+                        int32_t lstID = lstRoomP ? lstRoomP->getRoomID() : -1;
+                        // Inline params so we can plug chainOut in (used
+                        // by the show_vpos debug overlay; the
+                        // propagateSound wrapper doesn't expose it).
+                        SoundPropParams pp;
+                        pp.maxDist     = std::max(voice->maxAudibleDist, mPropagationMaxDist);
+                        pp.maxPaths    = mPropMaxPaths;
+                        pp.maxPathDiff = mPropMaxPathDiff;
+                        pp.chainOut    = &voice->cachedChain;
+                        prop = mSoundPropagation->propagateSoundWithParams(
+                            voice->worldPos, mListenerPos, srcID, lstID, pp);
+                    } else {
+                        prop = propagateSound(voice->worldPos, mListenerPos,
+                                              std::max(voice->maxAudibleDist, mPropagationMaxDist));
+                    }
+                    if (profOn) {
+                        auto prT1 = std::chrono::steady_clock::now();
+                        float prUs = std::chrono::duration<float, std::micro>(prT1 - prT0).count();
+                        sPortalRoutingTotalUs.fetch_add(static_cast<int>(prUs), std::memory_order_relaxed);
+                        sPortalRoutingCount.fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    voice->cachedProp = prop;
+
+                    // Cross-room flag tracks actual room assignment — no
+                    // distance gate. The playerEmitted skip above handles
+                    // head/feet straddling for player-sourced voices.
+                    Room *srcRoom = mRoomService ? mRoomService->roomFromPoint(voice->worldPos) : nullptr;
+                    isCrossRoom = (srcRoom && listenerRoom && srcRoom != listenerRoom);
+                }
+
+                // Phase 4 — Steam Audio sole authority for player audio
+                // routing + attenuation. The legacy BFS-driven
+                // branches (prop.reached / cross-room failure) no
+                // longer feed the player DSP. Routing/diffraction
+                // for the direct signal comes from Steam Audio's
+                // path effect (iplPathEffectApply, additive wet bus
+                // on top of the binaural dry path); distance falloff
+                // comes from iplDirectEffect's INVERSEDISTANCE model;
+                // door + wall blocking on the DRY path comes from
+                // OCCLUSION + TRANSMISSION (volumetric ray test on
+                // door OBBs in the acoustic mesh).
+                //
+                // PR 1b: the per-frame portalAttenuation /
+                // portalBlocking neutral seed + maxAudibleDist hard
+                // cutoff moved to the HARVEST pass (which now runs
+                // before this staging pass — search "Per-frame
+                // portal-eq scalar seed"). Seeding here would clobber
+                // the solver-derived values harvest just wrote.
+                //
+                // The BFS `prop` and `isCrossRoom` are still populated
+                // above (when probe_pathing is off) — they drive the
+                // show_vpos diagnostic overlay (cachedProp), the [VOICE]
+                // periodic log, and the legacy sub-source slot fan-out
+                // below. They have zero effect on the player DSP signal
+                // path. AI hearing reads
+                // RoomService::propagateSoundPath directly
+                // (AIHearingService::onSoundEmitted), unaffected by this
+                // branch.
+
+                // ── Sub-source slot fan-out ──
+                //
+                // Steam Audio mode (`probe_pathing: true`, shipping default):
+                // Steam Audio's pathing solver folds multi-path propagation
+                // into a single eqCoeffs[3] + combined ambisonic SH field,
+                // not into N independent (direction, gain) tuples. The
+                // multi-path-multi-portal data model the original Phase-2
+                // design assumed cannot be reconstructed from SA's output.
+                // We force slot-0-only: a synthesised single path at
+                // voice->worldPos, with slots 1-3 drained. Steam Audio's
+                // eqCoeffs (via portalAttenuation / portalBlocking) carries
+                // the cross-room attenuation work upstream of this slot;
+                // same-room voices end up at eqCoeffs ≈ 1.
+                //
+                // Legacy BFS mode (`probe_pathing: false`): the BFS branch
+                // above populated prop.paths with up to maxPaths discrete
+                // routes; multi-portal scenes get true multi-direction
+                // HRTF fan-out via updateSubSourceSlots.
+                //
+                // Player-emitted + skipPortalRouting voices stay slot-0-only
+                // in both modes — source ≈ listener, portal routing N/A.
+                //
+                // See PLAN.MULTI_PATH_SA_MIGRATION.md for the rationale.
+                // PLAN.MULTI_PATH_AMBISONICS.md (the original Phase-1..4
+                // design) is superseded by this for the SA-mode regime;
+                // Phases 2-4 remain valid for the legacy BFS mode.
+                auto computeDirForPath = [&](const SoundPathRecord& p) -> IPLVector3 {
+                    Vector3 toPath = p.virtualPosition - mListenerPos;
+                    float   dist   = glm::length(toPath);
+                    if (dist < kDistanceEpsilonFt) {
+                        return IPLVector3{0.0f, 0.0f, -1.0f};  // ahead fallback
+                    }
+                    toPath /= dist;
+                    return IPLVector3{
+                        glm::dot(toPath, right),
+                        glm::dot(toPath, up),
+                        -glm::dot(toPath, ahead)
+                    };
+                };
+
+                // Synthesised single-path record at the source's actual
+                // world position. Used for the slot-0-only path
+                // (SA-mode, player-emitted, skipPortalRouting, and the
+                // legacy "no room data" fallback). Reuse here to avoid
+                // duplicating the construction across branches.
+                auto makeSyntheticSinglePath = [&]() -> SoundPropInfo {
+                    SoundPropInfo synth;
+                    synth.reached = true;
+                    SoundPathRecord rec;
+                    rec.predecessorRoomID = -1;   // same-room sentinel
+                    rec.virtualPosition   = voice->worldPos;
+                    Vector3 vd            = voice->worldPos - mListenerPos;
+                    float   dist          = glm::length(vd);
+                    rec.realDistance      = dist;
+                    rec.effectiveDistance = dist;
+                    rec.doorBlocking      = 0.0f;
+                    rec.totalBlocking     = 0.0f;
+                    synth.paths.push_back(rec);
+                    synth.virtualPosition   = rec.virtualPosition;
+                    synth.realDistance      = rec.realDistance;
+                    synth.effectiveDistance = rec.effectiveDistance;
+                    return synth;
+                };
+
+                // [PATH_CONSUME] diagnostic — placed ABOVE the routing
+                // branch split (sa / synth / bfs) so it fires for every
+                // voice every frame regardless of which backend handles
+                // it. The previous placement inside the legacy BFS `else`
+                // branch was dead code under the shipping default
+                // (probe_pathing: true), which routes every voice through
+                // the SA branch and never enters the BFS branch — yielding
+                // 0 emissions even in 31k-line logs.
+                //
+                // The `mode=` field is the whole point: it lets a future
+                // reader distinguish "SA reached but data lost downstream"
+                // from "SA didn't reach" from "BFS path used and reached".
+                //   • mode=sa    — Steam Audio pathing owns the
+                //                  per-voice portal eq + sub-source slot
+                //                  (slot-0-only synthesised path; SA
+                //                  fills eqCoeffs via IPLPathEffect).
+                //   • mode=synth — slot-0-only synthesised path with no
+                //                  routing solve at all (playerEmitted
+                //                  or skipPortalRouting voices: source
+                //                  ≈ listener, portal routing N/A).
+                //   • mode=bfs   — legacy room-BFS branch
+                //                  (probe_pathing: false). prop.reached,
+                //                  prop.effectiveDistance, prop.paths
+                //                  are the routing source of truth.
+                //
+                // `effD`, `block`, and `paths` are taken verbatim from
+                // the in-scope `prop` struct. For mode=sa/synth the BFS
+                // never ran, so prop is default-initialised
+                // (reached=false, effD=0, block=0, paths empty) — values
+                // logged are honest about that. For mode=bfs they
+                // reflect the BFS result for that frame.
+                //
+                // Throttled to one emission per second per voice via a
+                // static per-handle timestamp map.
+                {
+                    using clk = std::chrono::steady_clock;
+                    static std::unordered_map<SoundHandle, clk::time_point>
+                        sLastPathConsumeLog;
+                    auto now = clk::now();
+                    auto it = sLastPathConsumeLog.find(handle);
+                    bool due = (it == sLastPathConsumeLog.end())
+                        || std::chrono::duration<float>(
+                               now - it->second).count() >= 1.0f;
+                    if (due && Darkness::gAudioLogVerbose) {
+                        sLastPathConsumeLog[handle] = now;
+                        const char *modeStr = useSteamAudioPathing ? "sa"
+                            : (voice->playerEmitted || voice->skipPortalRouting)
+                              ? "synth" : "bfs";
+                        AUDIO_LOG("[PATH_CONSUME] h=%u schema='%s' mode=%s "
+                                  "reached=%d effD=%.1f block=%.2f paths=%zu\n",
+                                  handle, voice->schemaName.c_str(),
+                                  modeStr,
+                                  prop.reached ? 1 : 0,
+                                  prop.effectiveDistance,
+                                  prop.totalBlocking,
+                                  prop.paths.size());
+                    }
+                }
+
+                if (useSteamAudioPathing
+                    || voice->playerEmitted
+                    || voice->skipPortalRouting) {
+                    // Slot-0-only. maxN=1 causes updateSubSourceSlots to
+                    // drain slots 1-3 (if any are ACTIVE from a prior
+                    // BFS-mode session, or from a runtime toggle) and
+                    // keep slot 0 ACTIVE with the synthesised path.
+                    SoundPropInfo synth = makeSyntheticSinglePath();
+                    updateSubSourceSlots(voice->dspNode.subSources, synth,
+                                         /*maxN=*/1, computeDirForPath);
+                } else {
+                    // Legacy BFS mode: BFS produced prop.paths (or it
+                    // didn't reach). Use the configured sMaxSubSources
+                    // clamp.
+                    const int maxN = static_cast<int>(std::min<uint32_t>(
+                        sMaxSubSources.load(std::memory_order_relaxed),
+                        static_cast<uint32_t>(kMaxSubSources)));
+                    // T0.1 — PATH_CONSUME diagnostic at the
+                    // prop.reached gate. Throttled to once-per-second
+                    // per voice (per-handle steady-clock map). Pure
+                    // diagnostic — does NOT change behaviour. Surfaces
+                    // the BFS-mode propagation result that drives the
+                    // sub-source slot fan-out; pair with PATH_RAW
+                    // (PathingSimulator.cpp:208, owned by Agent 2) for
+                    // the Steam Audio-mode counterpart.
+                    {
+                        static std::unordered_map<SoundHandle,
+                            std::chrono::steady_clock::time_point>
+                            sLastPathConsumeLog;
+                        auto now = std::chrono::steady_clock::now();
+                        auto it = sLastPathConsumeLog.find(handle);
+                        bool emit = (it == sLastPathConsumeLog.end())
+                            || (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    now - it->second).count() >= 1000);
+                        if (emit) {
+                            sLastPathConsumeLog[handle] = now;
+                            std::fprintf(stderr,
+                                "[PATH_CONSUME] h=%u schema='%s' "
+                                "reached=%d effD=%.1f block=%.2f paths=%zu\n",
+                                handle, voice->schemaName.c_str(),
+                                prop.reached ? 1 : 0,
+                                prop.effectiveDistance,
+                                prop.totalBlocking,
+                                prop.paths.size());
+                        }
+                    }
+                    if (prop.reached && !prop.paths.empty()) {
+                        updateSubSourceSlots(voice->dspNode.subSources, prop,
+                                             maxN, computeDirForPath);
+                    } else if (isCrossRoom) {
+                        // BFS-failed cross-room: legitimately silenced.
+                        drainAllSubSourceSlots(voice->dspNode.subSources);
+                    } else {
+                        // BFS didn't run (no room data, etc.) — same
+                        // synthesised single-path fallback as SA mode.
+                        SoundPropInfo synth = makeSyntheticSinglePath();
+                        updateSubSourceSlots(voice->dspNode.subSources, synth,
+                                             maxN, computeDirForPath);
+                    }
+                }
+
+                // Phase 4 — Steam Audio sole authority: pin the IPL source
+                // position to the REAL source position for EVERY voice. The
+                // legacy cross-room branch that pinned to
+                // `prop.virtualPosition` (the last portal anchor along the
+                // BFS chain) is gone. With IPLPathEffect now driving
+                // cross-room routing (occlusion through walls via
+                // enableValidation + findAlternatePaths against the door
+                // OBBs), the direct simulator wants the real geometry
+                // between source and listener — anchoring at a doorway
+                // turned an occluded source into an unoccluded one (the
+                // pathing solver did the diffraction; the direct sim
+                // independently saw clean line-of-sight from the anchor
+                // and skipped the wall transmission).
+                //
+                // Engine→IPL conversion (feet→meters AND Z-up→Y-up) happens
+                // via engineToIplPos so the source sits in the same frame
+                // as the listener and mesh.
+                IPLCoordinateSpace3 sourceCoord{};
+                sourceCoord.origin = engineToIplPos(voice->worldPos);
+                // Voices have no inherent orientation in this engine; pick an
+                // arbitrary right-handed IPL-space basis (X right, Y up,
+                // -Z ahead per phonon.h convention).  Steam Audio uses this
+                // only for directional sources, which we don't drive.
+                sourceCoord.ahead = { 0.0f,  0.0f, -1.0f };
+                sourceCoord.right = { 1.0f,  0.0f,  0.0f };
+                sourceCoord.up    = { 0.0f,  1.0f,  0.0f };
+
+                IPLSimulationInputs inputs{};
+                // DIRECT + PATHING share the same direct simulator handle;
+                // REFLECTIONS lives on its own simulator. Pathing fields
+                // below (pathingProbes, visRadius, visThreshold, visRange,
+                // pathingOrder, enableValidation, findAlternatePaths) are
+                // only read when the PATHING flag is set on the
+                // iplSourceSetInputs call below, so the same struct can be
+                // pushed to the reflection simulator with REFLECTIONS only
+                // — Steam Audio ignores fields not selected by the flag
+                // argument.
+                //
+                // PATHING bit is set unconditionally (not gated on the
+                // per-voice populate block) so iplSourceSetInputs(PATHING)
+                // — when issued — always leaves pathingInputs.enabled=true.
+                // An earlier "drive enabled from the live gate" attempt
+                // caused a stale-eq window on out-of-range → in-range
+                // transitions: simulatePathing only writes
+                // pathingOutputs.eq while enabled=true, so flipping it
+                // false stranded the last in-range eq values in the
+                // output buffer, audible as "sound through walls" for
+                // ~one throttle interval when the listener moved past
+                // maxAudibleDist and back through changed geometry
+                // (typical case: through a doorway and back). Keeping
+                // the worker running findPaths for currently-out-of-range
+                // voices is the price of fresh eq across distance
+                // transients; output is already gated by maxAudibleDist
+                // so the unread writes don't reach the audio thread.
+                inputs.flags = static_cast<IPLSimulationFlags>(
+                    IPL_SIMULATIONFLAGS_DIRECT
+                    | IPL_SIMULATIONFLAGS_REFLECTIONS
+                    | IPL_SIMULATIONFLAGS_PATHING);
+                // Player-emitted voices (footsteps, landings) emit from the
+                // player's own body — there is no "wall" between the player's
+                // feet and ears, so occlusion + transmission are skipped at
+                // the Steam Audio API level. Distance attenuation, air
+                // absorption, and reflections still run normally so footsteps
+                // produce reverb the same way as any other voice.
+                //
+                // PR 1a (PLAN.AUDIO_PERF T1): the ray-casting flags
+                // (OCCLUSION volumetric + freq-dependent TRANSMISSION,
+                // ~16 serial rays/source/frame) run on the PER-SLOT
+                // sources only — the dry path consumes slot params
+                // exclusively (see the per-slot direct effect comment in
+                // steamAudioNodeProcess). The voice-level source computed
+                // the same rays at nearly the same position, but its
+                // occlusion fed only metering + diagnostics (now re-pointed
+                // at slot 0): pure duplication, measured as ~half of the
+                // 9.6 ms p50 main-thread direct_sim on MISS6. Voice-level
+                // keeps the analytic zero-ray terms only.
+                IPLDirectSimulationFlags slotDirectFlags = static_cast<IPLDirectSimulationFlags>(
+                    IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
+                    IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION);
+                if (!voice->playerEmitted) {
+                    slotDirectFlags = static_cast<IPLDirectSimulationFlags>(
+                        slotDirectFlags
+                        | IPL_DIRECTSIMULATIONFLAGS_OCCLUSION
+                        | IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION);
+                }
+                inputs.directFlags = static_cast<IPLDirectSimulationFlags>(
+                    IPL_DIRECTSIMULATIONFLAGS_DISTANCEATTENUATION |
+                    IPL_DIRECTSIMULATIONFLAGS_AIRABSORPTION);
+                inputs.source = sourceCoord;
+                // Steam Audio distance model: always INVERSEDISTANCE with
+                // minDistance scaled by the schema's P$SchAttFac
+                // (attenuationFactor). attenuationFactor=1 → minDistance=1m
+                // (matches DEFAULT model behaviour); attenuationFactor=20
+                // → minDistance=20m, keeping a sound at full volume out to
+                // 20m before 1/d falloff. Per-voice; default factor 1.0 set
+                // at voice creation in VoicePool, schemas with non-default
+                // P$SchAttFac override via AmbientSoundManager → voiceSetAttenuationFactor.
+                inputs.distanceAttenuationModel.type =
+                    IPL_DISTANCEATTENUATIONTYPE_INVERSEDISTANCE;
+                inputs.distanceAttenuationModel.minDistance =
+                    1.0f * voice->attenuationFactor;
+                inputs.airAbsorptionModel.type = IPL_AIRABSORPTIONTYPE_DEFAULT;
+                // Volumetric occlusion models the source as a sphere — as the
+                // sphere partially disappears behind a corner, occlusion ramps
+                // smoothly from 0 to 1 instead of snapping instantly (RAYCAST).
+                // The 16 samples are points within the sphere used for ray tests.
+                inputs.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;
+                // Volumetric occlusion samples N points from a sphere
+                // CENTERED ON THE SOURCE and casts rays from each to the
+                // listener. Fraction of unblocked rays = unoccluded
+                // fraction.
+                //
+                // Sphere radius is PER-VOICE — computed once at voice
+                // creation in createVoiceSource via the BSP raycaster
+                // so the sphere never extends past the nearest wall in
+                // any direction (eliminates the prior cross-wall leak
+                // where global-radius spheres reached from the source
+                // into the listener's room and produced false-positive
+                // direct-LOS rays). Falls back to the YAML
+                // `audio.occlusion.radius` global if the helper
+                // returned a negative sentinel (headless tools that
+                // never wire mRaycaster).
+                const float perVoiceFt = voice->occlusionRadiusFt;
+                const float effectiveFt = (perVoiceFt > 0.0f)
+                    ? perVoiceFt
+                    : (mAudioOcclusion ? mAudioOcclusion->getRadius() : 10.0f);
+                inputs.occlusionRadius = effectiveFt * kFeetToMeters;
+                inputs.numOcclusionSamples = mAudioOcclusion->getSamples();
+                inputs.numTransmissionRays = 8;
+
+                // Hybrid/parametric tuning, always populated. reverbScale[]
+                // defaults to {0,0,0} on zero-init — which silences the
+                // parametric tail entirely. Set to {1,1,1} so Steam Audio
+                // uses the simulated RT60 unmodified across all three bands.
+                // The two hybrid fields are only consulted when the effect
+                // type is HYBRID (Steam Audio ignores them otherwise), so
+                // it's safe to set unconditionally. Plan target:
+                // transitionTime=2.0 s, overlap=0.25 → 0..1.5 s pure
+                // convolution, 1.5..2.0 s blend, 2.0+ s pure parametric.
+                inputs.reverbScale[0] = 1.0f;
+                inputs.reverbScale[1] = 1.0f;
+                inputs.reverbScale[2] = 1.0f;
+                inputs.hybridReverbTransitionTime = mHybridTransitionTime;
+                inputs.hybridReverbOverlapPercent = mHybridOverlapPercent;
+
+                // Voices route to baked-probe reflections when:
+                //   • They are not in the top-N closest (real-time budget
+                //     reserved for the most audible source-position-sensitive
+                //     voices), OR
+                //   • They are player-emitted (footsteps, landings) — see the
+                //     candidate-selection comment above for rationale: source
+                //     ≈ listener so listener-position baked IR is correct, and
+                //     it sidesteps the real-time sim's 200-400 ms latency
+                //     which is longer than a footstep.
+                bool isTopN = reflCandidateSet.count(handle) > 0;
+                bool useBaked = (!isTopN || voice->playerEmitted)
+                                && mProbeManager->hasReflections();
+                if (useBaked) {
+                    inputs.baked = IPL_TRUE;
+                    inputs.bakedDataIdentifier = bakedReflId;
+                }
+
+                // Steam Audio pathing inputs — used only when the probe
+                // batch has been attached to the pathing simulator and the
+                // voice is not player-emitted (player-emitted voices
+                // emit from the listener, so the pathing graph collapses
+                // to a self-loop with eqCoeffs ≡ 1.0; running it is wasted
+                // work). visRange is the per-voice maximum audible
+                // distance (the schema-authored radius), so Steam Audio
+                // stops exploring long detours through the probe graph
+                // beyond what the schema considers audible. pathingOrder
+                // = 0 keeps the path effect mono — we drive the gain +
+                // LPF through portalAttenuation / portalBlocking on the
+                // existing DSP chain rather than as a spatialized
+                // ambisonic field.
+                // Throttled: pathing input staging is skipped on frames
+                // when mPathingDueThisStep is false. The matching
+                // iplSourceSetInputs(...PATHING) call and the
+                // iplSimulatorRunPathing call below are gated on the
+                // same flag, so skipping the stamping here costs
+                // nothing (Steam Audio reads pathing fields only on
+                // the PATHING setInputs path).
+                // Per-voice audibility gate. Voices outside their
+                // schema-authored maxAudibleDist are inaudible regardless
+                // of pathing — skip the per-source staging (and the
+                // corresponding cost in iplSimulatorRunPathing) for them.
+                //
+                // We do NOT short-circuit on "same room" here. The room
+                // graph is too coarse-grained for that to be a reliable
+                // proxy for "no portal between source and listener" —
+                // many open spaces (halls, courtyards, outdoor areas)
+                // span multiple Room cells but should sonically behave
+                // as a single space, and the previous same-room hack
+                // would incorrectly skip pathing for voices across those
+                // cells. Let Steam Audio's solver decide; for true
+                // unobstructed paths it returns eqCoeffs ≈ 1.0 and the
+                // mapping naturally produces full passthrough.
+                float voicePathingDist = glm::length(voice->worldPos - mListenerPos);
+                bool  pathingWanted    = (voicePathingDist <= voice->maxAudibleDist);
+                if (mPathingProbeBatchAdded && mProbePathingEnabled
+                    && mPathingDueThisStep
+                    && !voice->playerEmitted
+                    && pathingWanted) {
+                    // Multi-batch architecture: pathing sim has both the
+                    // reflection batch (silently skipped — no pathing data)
+                    // and the sparse pathing batch attached. The source
+                    // MUST name the pathing batch explicitly via
+                    // IPLSimulationInputs::pathingProbes; otherwise the
+                    // PathSimulator lookup at SimulationManager::simulatePathing
+                    // (vcpkg/.../simulation_manager.cpp:618) misses entirely.
+                    inputs.pathingProbes      = mProbeManager->getPathingProbeBatch();
+                    // visRadius and visThreshold are derived from the
+                    // shared pathing constants in SteamAudioPathing.h so
+                    // they stay locked to the bake-time parameters
+                    // (ProbeManager.cpp). A runtime value below the bake
+                    // radius causes iplSimulatorRunPathing to fail
+                    // finding an entry probe for sources placed
+                    // off-probe, returning eqCoeffs=[0,0,0] — audible as
+                    // per-callback choppy gaps in the reflection wet bus.
+                    //
+                    // kPathingVisRadiusFt is identical at bake-time
+                    // (ProbeManager.cpp::bakePathingBatch) and runtime
+                    // here. If you change either, change both.
+                    inputs.visRadius          = kPathingVisRadiusFt
+                                              * kFeetToMeters;
+                    inputs.visThreshold       = kPathingVisThreshold;
+                    // visRange = maximum probe-to-probe distance the
+                    // runtime solver will consider for a single edge.
+                    // MUST be ≤ the bake-time value (bake's visRange is
+                    // an upper bound on what edges exist in the graph).
+                    // ≤ bake is safe — runtime just early-culls farther
+                    // pairs from consideration. > bake would consider
+                    // edges that were never baked, returning false-
+                    // negatives that look like graph holes.
+                    //
+                    // Runtime uses `mPropagationMaxDist` (the per-voice
+                    // audible cap from YAML `propagation.max_distance`,
+                    // default 200 ft). Bake-time uses the scene
+                    // diagonal × 1.5 (ProbeManager.cpp::bakePathingBatch)
+                    // so the graph spans the whole level regardless of
+                    // any voice's audible range. With the typical
+                    // mission this means runtime visRange ≪ bake
+                    // visRange — exactly the relationship Steam Audio
+                    // expects (bake = upper bound, runtime = per-source
+                    // budget).
+                    //
+                    // Past sessions thought bake and runtime had to
+                    // match exactly. They don't — bake just needs to be
+                    // ≥ runtime. Tying both to mPropagationMaxDist
+                    // silently truncated the graph at 200 ft, breaking
+                    // pathing for any source-listener pair farther than
+                    // that even when a shorter multi-hop probe route
+                    // existed.
+                    //
+                    // Per-voice pathing-solver scope, derived from the
+                    // original Dark Engine's SFX_MaxDist formula:
+                    //   max_pathing_dist_ft =
+                    //       (5000 + gain_cB) / 55 × attenuationFactor
+                    // This was the BFS-termination distance for portal
+                    // routing in the original engine — sets the per-voice
+                    // horizon for routed pathing. Sources beyond this
+                    // distance fall back to direct-only audio via the
+                    // existing cached-replay mechanism in the readback
+                    // site. 55 cB/ft matches the original engine's
+                    // attenuation_factor constant (APPSFX default). Steam
+                    // Audio's INVERSEDISTANCE curve still handles per-voice
+                    // volume continuously; this knob only limits the
+                    // pathing-solver's search scope per source (matches
+                    // Steam Audio's per-source visRange API).
+                    //
+                    // gain_cB lives on the schema's playParams.volume
+                    // (centibels, -10000..-1; -1 ≈ 0 dB). Look it up via
+                    // mSchemaParser->findSchema(voice->schemaName). If the
+                    // schema is missing, fall back to gain_cB=0 so the
+                    // formula reduces to the nominal ~90.9 ft × atten.
+                    // We clamp the result to ≥ 1 ft so very quiet sources
+                    // (gain_cB ≈ -5000, the original engine's near-silent
+                    // threshold) still leave Steam Audio a non-degenerate
+                    // visRange to work with rather than zero.
+                    constexpr float kOriginalEngineAttenCBPerFt = 55.0f;
+                    float gainCB = 0.0f;
+                    if (mSchemaParser) {
+                        const SchemaEntry *visSch =
+                            mSchemaParser->findSchema(voice->schemaName);
+                        if (visSch) {
+                            gainCB = static_cast<float>(
+                                visSch->playParams.volume);
+                        }
+                    }
+                    float maxPathingDistFt =
+                        (5000.0f + gainCB)
+                        / kOriginalEngineAttenCBPerFt
+                        * voice->attenuationFactor;
+                    if (maxPathingDistFt < 1.0f) {
+                        maxPathingDistFt = 1.0f;
+                    }
+                    inputs.visRange = maxPathingDistFt * kFeetToMeters;
+                    // pathingOrder MUST equal the path effect's create-time
+                    // maxOrder (= mAmbisonicsOrder). The solver writes
+                    // pathingOut.pathing.shCoeffs sized to (pathingOrder+1)^2
+                    // and pathingOut.pathing.order = pathingOrder. The path
+                    // effect's internal ambisonics-rotate stage asserts
+                    // `in.numChannels() == numCoeffsForOrder(params.order)`,
+                    // so the per-call params.order must match the channel
+                    // count of the encoded SH buffer. Phase 4 inherited a
+                    // legacy pathingOrder=0 from the pre-path-effect
+                    // implementation (where pathing only drove eqCoeffs +
+                    // scalar collapse) — at runtime ambisonics_order > 0
+                    // that mismatch crashed inside iplPathEffectApply.
+                    inputs.pathingOrder       = mAmbisonicsOrder;
+                    inputs.enableValidation   = IPL_TRUE;
+                    // findAlternatePaths ON.
+                    //
+                    // Required for correctness with dynamic door OBBs in
+                    // the acoustic scene. enableValidation alone discards
+                    // any baked path whose edge ray hits a door OBB; with
+                    // findAlternatePaths off, no replacement is sought and
+                    // the source's pathingState.eq stays at the 0.1f
+                    // sentinel — observed in practice as nearby sources
+                    // (24–37 ft, sProbe/lProbe well inside visRadius)
+                    // returning persistent sentinels because their
+                    // shortest baked path happens to skirt a door OBB
+                    // somewhere along the way.
+                    //
+                    // Cost was the reason this was OFF earlier (boot-time
+                    // main-thread freeze). Two changes reduce it to
+                    // acceptable now:
+                    //   • numVisSamples dropped from 16 to 4 in the
+                    //     direct-sim settings — 16× fewer rays per
+                    //     candidate edge during alternate-path search.
+                    //   • numVisSamples = 4 matches Steam Audio's
+                    //     Unity bake convention, so runtime and bake
+                    //     stay aligned.
+                    //
+                    // If [PATHING_SLOW] returns and blocks the main
+                    // thread, the next move is PLAN.PATHING_WORKER.md —
+                    // run the solver on a background thread so any
+                    // per-call cost becomes acceptable.
+                    inputs.findAlternatePaths = IPL_TRUE;
+                }
+
+                // Push inputs to each simulator. Every voice has a
+                // directSource (in the direct sim); non-player-emitted
+                // voices also have a pathingSource (in the pathing sim)
+                // and reflection-eligible voices have a reflectionSource
+                // (in the reflection sim). Per phonon.h, no
+                // synchronisation is required between these calls — Steam
+                // Audio internally separates per-source staging buffers,
+                // and the staging-vs-active double buffer is safe to
+                // write from the main thread even while a worker is
+                // iterating (validated against Unity + Unreal reference
+                // integrations).
+                iplSourceSetInputs(voice->directSource,
+                    IPL_SIMULATIONFLAGS_DIRECT, &inputs);
+                // Pathing inputs go to the per-voice pathingSource (in
+                // the pathing simulator). Throttled by mPathingDueThisStep
+                // — we only stamp fresh inputs when the throttle has
+                // elapsed and the worker is about to be signalled. No
+                // !isRunning() gate: per N2 (RM.PLAN.PATHING_WORKER.md),
+                // iplSourceSetInputs is per-frame-safe via Steam Audio's
+                // internal double buffering, and both reference
+                // integrations call it every frame while the sim thread
+                // is mid-iteration.
+                //
+                // The gate here must match the populate block above
+                // EXACTLY. Letting a voice through here without going
+                // through the populate path means Steam Audio reads
+                // `inputs.pathingProbes` as the default-initialised null
+                // pointer and segfaults inside the next runPathing.
+                if (mPathingProbeBatchAdded && mProbePathingEnabled
+                    && mPathingDueThisStep
+                    && !voice->playerEmitted
+                    && pathingWanted
+                    && voice->pathingSource) {
+                    iplSourceSetInputs(voice->pathingSource,
+                        IPL_SIMULATIONFLAGS_PATHING, &inputs);
+                }
+                // Stage 2.2: Normal voices without a reflectionSource
+                // (not yet promoted, or recently demoted) have nothing on
+                // the reflection side to update. Skip the call to avoid
+                // dereferencing a null IPLSource inside Steam Audio.
+                if (voice->reflectionSource) {
+                    iplSourceSetInputs(voice->reflectionSource,
+                        IPL_SIMULATIONFLAGS_REFLECTIONS, &inputs);
+                }
+
+                // Per-slot direct-source inputs (Phase 4 multi-path).
+                // Each ACTIVE slot's source is positioned at its path's
+                // virtualPosition — the doorway anchor for cross-room
+                // paths, sourcePos for same-room. All other simulation
+                // parameters (distance model, air absorption, occlusion
+                // type/radius/samples, transmission rays) are inherited
+                // from the voice-level `inputs` above so per-slot
+                // sampling uses the same configuration knobs. The flags
+                // word is REPLACED with slotDirectFlags: slots carry the
+                // full ray-casting set (OCCL|TRANS for non-player voices)
+                // because the dry path consumes slot params exclusively,
+                // while the voice-level source stays analytic (PR 1a —
+                // see the flags comment above).
+                //
+                // Draining slots intentionally retain their last-set
+                // inputs: their gain is ramping down, the audio thread
+                // skips reading their outputs, so refreshing inputs
+                // would be wasted work.
+                for (auto &slot : voice->dspNode.subSources) {
+                    if (slot.state != SubSourceState::Active) continue;
+                    if (!slot.directSource) continue;
+                    Vector3 slotWorldPos = voice->worldPos;
+                    for (const auto &p : prop.paths) {
+                        if (p.predecessorRoomID == slot.predecessorRoomID) {
+                            slotWorldPos = p.virtualPosition;
+                            break;
+                        }
+                    }
+                    IPLSimulationInputs slotInputs = inputs;
+                    slotInputs.source.origin = engineToIplPos(slotWorldPos);
+                    slotInputs.directFlags = slotDirectFlags;
+                    iplSourceSetInputs(slot.directSource,
+                        IPL_SIMULATIONFLAGS_DIRECT, &slotInputs);
+                }
+            }
+
+            // Step 3: Signal the sim workers now that staging is done.
+            // Reflection sim runs on background thread, throttled.
+            // The throttle counter / divisor live on ReflectionSimulator now.
+            // The reflection pipeline is considered ready when both the
+            // ambisonics decoder and the convolution worker pool are alive
+            // (post-Phase-3 the global IPLReflectionMixer is gone — the
+            // worker pool sums ambisonics manually).
+            bool wantReflections = mReflectionsEnabled
+                && mIplAmbiDecodeEffect && mConvolutionPool && mConvolutionPool->isActive()
+                && !reflBusy && mReflectionSim
+                && mReflectionSim->throttleTickAndConsume();
+
+            // Signal the direct-sim worker (PLAN.AUDIO_PERF PR 1b —
+            // previously a synchronous iplSimulatorRunDirect here,
+            // ~5.25 ms p50 on MISS6 after PR 1a: essentially the whole
+            // audio loopStep). One iteration per idle loopStep; results
+            // are harvested at the TOP of the next idle loopStep, so
+            // every voice's directParams lag exactly one frame (~16 ms
+            // at 60 fps — under the 21.3 ms audio-callback period;
+            // DirectEffect's internal gain ramps smooth the step).
+            // Steam Audio's simulateDirect is a plain SERIAL loop over
+            // sources (`sim_threads` does not parallelize it; phonon.h
+            // documents numThreads as reflections-only) — hence a
+            // dedicated worker instead of scoping tweaks.
+            //
+            // Signal-gate invariant (project_steam_audio_simulator_
+            // signal_gate): the worker has been verifiably idle since
+            // the directBusy gate at the top of this branch, and this
+            // signal is the frame's last direct-sim interaction — so
+            // signal() can never re-enter a running iteration or race
+            // the source-mutation flush that ran earlier this frame.
+            //
+            // [FALLBACK] mode (worker thread failed to start,
+            // mDirectWorkerActive=false): run the identical iteration
+            // synchronously on this thread — DirectSimulator::
+            // runSynchronous shares the worker's bookkeeping (histogram,
+            // completed-cycle counter, iteration hook), so the frame
+            // shape and the pending-source gates behave the same, just
+            // slower.
+            if (mDirectSim && directSimHandle) {
+                if (mDirectWorkerActive) {
+                    mDirectSim->signal();
+                } else {
+                    mDirectSim->runSynchronous();
+                }
+            }
+
+            // Signal the pathing-sim worker thread to run one
+            // iplSimulatorRunPathing iteration. Cheap when no probe batch
+            // is attached (mPathingProbeBatchAdded = false) — Steam Audio
+            // skips per-source pathing work since pathingProbes is null
+            // for every source. Bypassed entirely when mProbePathingEnabled
+            // is off (audio.propagation.probe_pathing: false).
+            //
+            // Throttled by mPathingDueThisStep (audio.propagation.
+            // pathing_update_interval, default 0.1 s / 10 Hz). On skipped
+            // frames the previous run's eqCoeffs remain cached on each
+            // source, so the output read further down still produces
+            // stable portalAttenuation/portalBlocking values.
+            //
+            // The actual iplSimulatorRunPathing call (and its
+            // [PATHING_SLOW] timing log) now lives in
+            // PathingSimulator::workerMain — keeping it off the main
+            // thread eliminates the 50–11000 ms loop-stall hitches
+            // observed on MISS6 with dynamic door geometry.
+            {
+                const bool gateProbeBatch = mPathingProbeBatchAdded;
+                const bool gateEnable     = mProbePathingEnabled;
+                const bool gateDue        = mPathingDueThisStep;
+                // Mirror the reflection-sim gate: never signal while the
+                // worker is mid-iteration. Without this, a throttle elapse
+                // during a long pathing run (560 ms+ on MISS5) queued
+                // mWant=true and caused the worker to immediately re-enter
+                // iplSimulatorRunPathing the moment its current iteration
+                // returned. That re-entry raced the main thread's
+                // top-of-frame source mutation flush — flushPendingAdds /
+                // flushPendingRemovals / iplSimulatorCommit — and crashed
+                // inside ipl::SimulationManager::simulatePathing iterating
+                // a list whose entries had just been freed.
+                const bool gateNotBusy    = !pathBusy;
+                const bool wantPathing    = gateProbeBatch && gateEnable
+                                         && gateDue && gateNotBusy;
+
+                // [PATHING_LAG] diagnostic: throttle elapsed but the worker
+                // is still running the previous iteration. We skip signal()
+                // entirely in this branch (see gateNotBusy above for the
+                // race we're avoiding); eqCoeffs hold one extra interval
+                // until the worker idles and the next due frame signals
+                // it. Rate-limited (first 16 + every 64th thereafter).
+                if (gateProbeBatch && gateEnable && gateDue && pathBusy) {
+                    static std::atomic<int> sPathingLagCount{0};
+                    int lc = sPathingLagCount.fetch_add(1, std::memory_order_relaxed);
+                    if (lc < 16 || (lc % 64) == 0) {
+                        std::fprintf(stderr,
+                            "[PATHING_LAG] worker still running when "
+                            "throttle elapsed (interval=%.3fs, "
+                            "occurrence #%d) — signal skipped, eqCoeffs "
+                            "will be one interval stale this cycle\n",
+                            mPathingUpdateInterval, lc + 1);
+                    }
+                }
+
+                if (wantPathing && mPathingSim) {
+                    mPathingSim->signal();
+                }
+                // DIAG: confirm iplSimulatorRunPathing is actually
+                // firing. eqCoeffs reading back as the Steam Audio
+                // default 0.1f (per simulation_data.cpp:120-124, source
+                // pathingState.eq[i] is initialized to 0.1f at source
+                // create time) means the solver never wrote new values
+                // — either runPathing isn't being called, or it's
+                // being called but the source isn't in its solve set.
+                static std::atomic<int> sRunPathingLogCount{0};
+                int n = sRunPathingLogCount.fetch_add(1, std::memory_order_relaxed);
+                if (n < 8) {
+                    AUDIO_LOG("[RUN_PATHING] called=%d probeBatchAdded=%d "
+                              "enabled=%d due=%d notBusy=%d updateInterval=%.3f "
+                              "accumSec=%.3f (occurrence #%d)\n",
+                              wantPathing ? 1 : 0,
+                              gateProbeBatch ? 1 : 0,
+                              gateEnable ? 1 : 0,
+                              gateDue ? 1 : 0,
+                              gateNotBusy ? 1 : 0,
+                              mPathingUpdateInterval, mPathingAccumSec,
+                              n + 1);
+                }
+            }
+
+            // Signal reflection sim (throttled, latency-tolerant, background thread)
+            if (wantReflections && mReflectionSim) {
+                mReflectionSim->signal();
+            }
+        }
+
     }
     // PLAN.AUDIO_PROFILING.md §2.2 — voice-update phase ends. Only records
     // when voiceUpdT0 was actually set above (i.e. we entered the
@@ -8592,8 +8826,17 @@ float AudioService::computeVoiceOcclusionRadiusFt(const Vector3 &sourcePos) cons
 void AudioService::createVoiceSource(ActiveVoice &voice)
 {
     IPLSimulator reflectionSimHandle = mReflectionSim ? mReflectionSim->simulator() : nullptr;
-    if (!mDirectSimulator || !reflectionSimHandle || !mSceneReady)
+    IPLSimulator directSimHandle     = mDirectSim     ? mDirectSim->simulator()     : nullptr;
+    if (!directSimHandle || !reflectionSimHandle || !mSceneReady)
         return;
+
+    // Direct-worker busy state, sampled ONCE so the voice-level source,
+    // its slot sources, and any rollback in this function all take one
+    // consistent path (immediate vs queued). The worker can only flip
+    // busy→idle while we're in here (signal() is issued exclusively from
+    // loopStep, on this same thread), so a stale "busy" is conservative:
+    // handles land in the pending queues and flush next idle loopStep.
+    const bool directSimBusy = mDirectSim && mDirectSim->isRunning();
 
     // Per-voice volumetric-occlusion sphere radius. Computed ONCE at
     // voice creation by raycasting from the source position; the radius
@@ -8654,33 +8897,44 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
     }
 
     // ── Direct source ──
-    // Created against mDirectSimulator. Direct sim runs synchronously on the
-    // main thread so its source list is never iterated concurrently —
-    // iplSourceAdd is always immediately safe. The voice's directParams are
-    // populated by the next iplSimulatorRunDirect (≈one frame after creation),
-    // so newly spawned voices are audible at the right level from their first
-    // (or at worst second) audio callback.
+    // Created against the direct simulator. PR 1b: the direct sim runs
+    // on the DirectSimulator worker now, so the old rationale here
+    // ("runs synchronously on the main thread so iplSourceAdd is always
+    // immediately safe") no longer holds — the worker may be
+    // mid-iplSimulatorRunDirect. Mirror the pathing pattern exactly:
+    // add immediately when the worker is idle, queue the add for
+    // loopStep's post-harvest flush point when it's busy. Either way
+    // the voice's directParams keep their initVoiceDSP per-class
+    // defaults until the harvest cycle gate opens (completedCycles >
+    // directSimCycleAtAdd), ≈1-2 frames after creation. Commit is
+    // deferred to loopStep's idle flush via the dirty flag.
     //
     // Source flags must include every simulation type the source will
     // ever participate in — Steam Audio uses these to decide which
-    // per-source state slots to allocate. The direct simulator now
-    // carries DIRECT only (pathing moved to a separate simulator
-    // iterated by a background worker — see PathingSimulator.h); the
-    // pathing-side source is created below as `voice.pathingSource`.
+    // per-source state slots to allocate. The direct simulator carries
+    // DIRECT only (pathing lives on its own worker-pumped simulator —
+    // see PathingSimulator.h); the pathing-side source is created below
+    // as `voice.pathingSource`.
     {
         IPLSourceSettings srcSettings{};
         srcSettings.flags = IPL_SIMULATIONFLAGS_DIRECT;
 
-        IPLerror err = iplSourceCreate(mDirectSimulator, &srcSettings, &voice.directSource);
+        IPLerror err = iplSourceCreate(directSimHandle, &srcSettings, &voice.directSource);
         if (err != IPL_STATUS_SUCCESS) {
             LOG_ERROR("AudioService: direct iplSourceCreate failed (error %d)", err);
             voice.directSource = nullptr;
             return;
         }
-        iplSourceAdd(voice.directSource, mDirectSimulator);
-        // No mSimulatorDirty for the direct sim — its commit happens inline
-        // immediately below (no concurrency concern).
-        iplSimulatorCommit(mDirectSimulator);
+        if (directSimBusy) {
+            // Worker mid-iteration — defer. Flushed (and cycle-stamped
+            // via the flush callback) at loopStep's post-harvest flush.
+            mDirectSim->queueSourceAdd(voice.directSource);
+            mDirectSim->setSimulatorDirty();
+        } else {
+            iplSourceAdd(voice.directSource, directSimHandle);
+            voice.directSimCycleAtAdd = mDirectSim->completedCycles();
+            mDirectSim->setSimulatorDirty();
+        }
     }
 
     // ── Pathing source ──
@@ -8794,10 +9048,27 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
             LOG_ERROR("AudioService: reflection iplSourceCreate failed (error %d)", err);
             // Direct + pathing sources already created above; don't leak
             // them. Caller will treat the voice as having no spatial
-            // audio.
-            iplSourceRemove(voice.directSource, mDirectSimulator);
-            iplSimulatorCommit(mDirectSimulator);
-            iplSourceRelease(&voice.directSource);
+            // audio. Direct rollback follows the same defer-flush dance
+            // as the create path (PR 1b): a queued add is pulled back
+            // out of the pending queue and released; an immediate add is
+            // removed + released inline (worker idle — busy state can't
+            // flip idle→busy mid-function, see directSimBusy above).
+            if (voice.directSource && mDirectSim) {
+                if (mDirectSim->removeFromPendingAdds(voice.directSource)) {
+                    iplSourceRelease(&voice.directSource);
+                } else if (directSimBusy) {
+                    // Defensive: committed source with a busy worker
+                    // (shouldn't happen — a busy worker means the add
+                    // was queued). Queue the remove; the flush releases.
+                    mDirectSim->queueSourceRemove(voice.directSource);
+                    voice.directSource = nullptr;
+                    mDirectSim->setSimulatorDirty();
+                } else {
+                    iplSourceRemove(voice.directSource, directSimHandle);
+                    iplSourceRelease(&voice.directSource);
+                    mDirectSim->setSimulatorDirty();
+                }
+            }
             if (voice.pathingSource && mPathingSim) {
                 // Symmetric defer-flush dance with the create path above.
                 // Release synchronously here (rollback runs mid-createVoiceSource,
@@ -8927,7 +9198,7 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
         int builtSlotSources = 0;
         for (int slotIdx = 0; slotIdx < slotsToAlloc; ++slotIdx) {
             auto &slot = voice.dspNode.subSources[slotIdx];
-            IPLerror err = iplSourceCreate(mDirectSimulator, &srcSettings,
+            IPLerror err = iplSourceCreate(directSimHandle, &srcSettings,
                                            &slot.directSource);
             if (err != IPL_STATUS_SUCCESS) {
                 LOG_ERROR("AudioService: per-slot iplSourceCreate failed "
@@ -8936,16 +9207,37 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
                 // slot sources, plus the voice-level direct + reflection
                 // handles, so the voice ends up with no Steam Audio state
                 // (matches the legacy create-all-or-create-none policy).
+                // PR 1b: previously-built slot sources were either all
+                // queued (directSimBusy — removeFromPendingAdds pulls
+                // them back, never having entered the simulator) or all
+                // added immediately (worker idle — remove inline; the
+                // busy state can't flip idle→busy mid-function).
                 slot.directSource = nullptr;
                 for (auto &s2 : voice.dspNode.subSources) {
-                    if (s2.directSource) {
-                        iplSourceRemove(s2.directSource, mDirectSimulator);
+                    if (!s2.directSource) continue;
+                    if (mDirectSim->removeFromPendingAdds(s2.directSource)) {
                         iplSourceRelease(&s2.directSource);
+                    } else {
+                        iplSourceRemove(s2.directSource, directSimHandle);
+                        iplSourceRelease(&s2.directSource);
+                        mDirectSim->setSimulatorDirty();
                     }
                 }
-                iplSimulatorCommit(mDirectSimulator);
-                iplSourceRemove(voice.directSource, mDirectSimulator);
-                iplSourceRelease(&voice.directSource);
+                // Voice-level direct source — same dance as the
+                // reflection-create-fail rollback above.
+                if (voice.directSource) {
+                    if (mDirectSim->removeFromPendingAdds(voice.directSource)) {
+                        iplSourceRelease(&voice.directSource);
+                    } else if (directSimBusy) {
+                        mDirectSim->queueSourceRemove(voice.directSource);
+                        voice.directSource = nullptr;
+                        mDirectSim->setSimulatorDirty();
+                    } else {
+                        iplSourceRemove(voice.directSource, directSimHandle);
+                        iplSourceRelease(&voice.directSource);
+                        mDirectSim->setSimulatorDirty();
+                    }
+                }
                 if (voice.reflectionSource) {
                     if (mReflectionSim && mReflectionSim->isRunning()) {
                         mReflectionSim->queueSourceRemove(voice.reflectionSource);
@@ -8983,15 +9275,22 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
                     }
                     voice.dspNode.pathingSource = nullptr;
                 }
-                iplSimulatorCommit(mDirectSimulator);
                 return;
             }
-            iplSourceAdd(slot.directSource, mDirectSimulator);
+            if (directSimBusy) {
+                // Worker mid-iteration — defer, same as the voice-level
+                // add. Cycle-stamping happens in the flush callback
+                // (slot sources map to the owning voice's counter).
+                mDirectSim->queueSourceAdd(slot.directSource);
+            } else {
+                iplSourceAdd(slot.directSource, directSimHandle);
+            }
             ++builtSlotSources;
         }
-        // One commit after batching all kMaxSubSources adds, same as the
-        // voice-level direct source's single commit above.
-        iplSimulatorCommit(mDirectSimulator);
+        // One dirty-mark after batching all the slot adds; the actual
+        // iplSimulatorCommit is deferred to loopStep's idle flush point
+        // (commitIfDirty), same as every other simulator since PR 1b.
+        mDirectSim->setSimulatorDirty();
     }
 
     // Per-class default directParams are set in initVoiceDSP — see the
@@ -9017,27 +9316,48 @@ void AudioService::removeVoiceSource(ActiveVoice &voice)
     if (mConvolutionPool) mConvolutionPool->waitForCompletion();
 
     // ── Direct source + per-slot direct sources ──
-    // No background thread iterates the direct simulator, so removal is
-    // always immediately safe. Batch the per-slot removes with the
-    // voice-level remove and commit once at the end.
-    if (mDirectSimulator) {
-        if (voice.directSource) {
-            iplSourceRemove(voice.directSource, mDirectSimulator);
-        }
-        for (auto &slot : voice.dspNode.subSources) {
-            if (slot.directSource) {
-                iplSourceRemove(slot.directSource, mDirectSimulator);
+    // PR 1b: the DirectSimulator worker may be mid-iplSimulatorRunDirect,
+    // so removal follows the same defer-flush dance as the pathing
+    // source below:
+    //   • still in the pending-add queue → pull it back out and release
+    //     (it never entered the simulator; calling iplSourceRemove on it
+    //     would crash inside Steam Audio — same hazard as the reflection
+    //     path documents).
+    //   • worker busy → queue the remove; DirectSimulator::
+    //     flushPendingRemovals releases the handle at the next idle
+    //     flush. The field is nulled here so ~ActiveVoice's safety-net
+    //     release can't double-free.
+    //   • worker idle → remove + release inline; the commit is deferred
+    //     to loopStep's idle flush point via the dirty flag (Steam Audio
+    //     keeps its own retained reference until the removal commits, so
+    //     releasing our handle first is safe — same order the
+    //     reflection/pathing flushes use).
+    // Unlike pathingSource, the audio thread never dereferences these
+    // handles, so the idle path needs no release deferral to
+    // ~ActiveVoice.
+    if (mDirectSim && mDirectSim->simulator()) {
+        IPLSimulator dHandle = mDirectSim->simulator();
+        const bool dBusy = mDirectSim->isRunning();
+        bool committedListChanged = false;
+        auto removeDirectSrc = [&](IPLSource &src) {
+            if (!src) return;
+            if (mDirectSim->removeFromPendingAdds(src)) {
+                iplSourceRelease(&src);
+            } else if (dBusy) {
+                mDirectSim->queueSourceRemove(src);
+                src = nullptr;   // queue owns the release now
+                committedListChanged = true;
+            } else {
+                iplSourceRemove(src, dHandle);
+                iplSourceRelease(&src);
+                committedListChanged = true;
             }
-        }
-        iplSimulatorCommit(mDirectSimulator);
-        if (voice.directSource) {
-            iplSourceRelease(&voice.directSource);
-        }
+        };
+        removeDirectSrc(voice.directSource);
         for (auto &slot : voice.dspNode.subSources) {
-            if (slot.directSource) {
-                iplSourceRelease(&slot.directSource);
-            }
+            removeDirectSrc(slot.directSource);
         }
+        if (committedListChanged) mDirectSim->setSimulatorDirty();
     }
 
     // ── Pathing source ──
@@ -10037,10 +10357,14 @@ void AudioService::haltSound(SoundHandle handle, int fadeMs)
 //------------------------------------------------------
 void AudioService::haltAll()
 {
-    // Wait for both sim threads to finish — they hold pointers to committed
+    // Wait for the sim workers to finish — they hold pointers to committed
     // sources that we're about to destroy. Without this, ~ActiveVoice can
-    // release IPL sources while iplSimulatorRunDirect/Reflections still uses them.
+    // release IPL sources while iplSimulatorRunDirect/Reflections still
+    // uses them. (The pathing worker is handled per-voice by
+    // removeVoiceSource's queue dance; direct + reflection get the
+    // immediate path below thanks to these drains.)
     if (mReflectionSim) mReflectionSim->waitForCompletion();
+    if (mDirectSim)     mDirectSim->waitForCompletion();
 
     // Remove all Steam Audio sources before destroying voices.
     // Since we just joined both threads, removeVoiceSource will take the
@@ -10061,6 +10385,11 @@ void AudioService::haltAll()
     if (mReflectionSim) {
         mReflectionSim->releasePendingAdds();
         mReflectionSim->flushPendingRemovals();
+    }
+    if (mDirectSim) {
+        mDirectSim->releasePendingAdds();
+        mDirectSim->flushPendingRemovals();
+        mDirectSim->commitIfDirty();
     }
 
     if (mVoicePool) mVoicePool->resetAllocator();
@@ -11439,6 +11768,8 @@ void AudioService::dumpAudioStatusPeriodic()
     // PLAN.AUDIO_PROFILING.md §2.4 — iplSimulatorRunDirect distribution.
     // Companion to the existing scalar `direct=...ms` field on the
     // [Audio] summary line above (sDirectSimPeakMs); this fills in p50/p95/p99.
+    // Since PR 1b these are WORKER-thread iteration times (fed via the
+    // DirectSimulator iteration hook) — no longer a loop_step component.
     auto dsP = sPerfDirectSimMs.snapshotAndReset();
     AUDIO_LOG(
         "[PERF audio] direct_sim n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",

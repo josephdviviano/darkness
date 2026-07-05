@@ -77,12 +77,12 @@ enum class SubSourceState : uint8_t {
 };
 
 struct SubSource {
-    // Per-slot IPL handles. directSource is registered with
-    // mDirectSimulator so iplSimulatorRunDirect computes per-path
-    // distance attenuation, air absorption, occlusion, transmission
-    // from THIS path's virtual position (doorway anchor for cross-room,
-    // real source for same-room). Pre-allocated in initVoiceDSP,
-    // released in ~ActiveVoice.
+    // Per-slot IPL handles. directSource is registered with the direct
+    // simulator (DirectSimulator worker) so iplSimulatorRunDirect
+    // computes per-path distance attenuation, air absorption, occlusion,
+    // transmission from THIS path's virtual position (doorway anchor for
+    // cross-room, real source for same-room). Pre-allocated in
+    // initVoiceDSP, released in ~ActiveVoice.
     IPLSource             directSource       = nullptr;
     IPLDirectEffect       directEffect       = nullptr;
     IPLBinauralEffect     binauralEffect     = nullptr;
@@ -411,7 +411,7 @@ struct ActiveVoice {
     // pathing source is also nullptr for `playerEmitted` voices (the
     // player IS the listener, so the pathing graph collapses to a
     // self-loop and the iteration cost is wasted).
-    IPLSource directSource     = nullptr;  // owned by mDirectSimulator
+    IPLSource directSource     = nullptr;  // owned by mDirectSim
     IPLSource reflectionSource = nullptr;  // owned by mReflectionSim
     IPLSource pathingSource    = nullptr;  // owned by mPathingSim
 
@@ -429,6 +429,19 @@ struct ActiveVoice {
     // permanently-silent wet bus on voice spawn — [REFL_FIRST_APPLY]
     // irNorm=0 was the smoking gun.
     uint64_t reflectionSimCycleAtAdd = 0;
+
+    // Direct-simulator counterpart of reflectionSimCycleAtAdd (PR 1b —
+    // the direct sim now also runs on a background worker, so the same
+    // "outputs unwritten until one full iteration has contained this
+    // source" race exists). Captured at iplSourceAdd time (immediate
+    // path) or DirectSimulator::flushPendingAdds callback (deferred
+    // path). The harvest pass in loopStep keeps the initVoiceDSP
+    // per-class default directParams (and the slots' silent defaults)
+    // until DirectSimulator::completedCycles() exceeds this value —
+    // without the gate, the first harvest after an add read back the
+    // SimulationData create-time seeds (neutral distanceAttenuation =
+    // 1.0), audibly popping distant spawns at full volume for a frame.
+    uint64_t directSimCycleAtAdd = 0;
 
     // Per-voice volumetric-occlusion sphere radius (engine feet).
     // Computed in createVoiceSource by raycasting from the source
