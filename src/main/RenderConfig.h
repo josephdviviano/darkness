@@ -1687,12 +1687,26 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                 cfg.bakeNumRays        = 4096;
                 cfg.bakeNumBounces     = 8;
                 cfg.bakeDiffuseSamples = 256;
+                // Density reduction (user directive 2026-07-05: dev bakes
+                // must be < 10 min). FLOOR_POLY emits one candidate per
+                // BSP floor polygon regardless of spacing, so the GLOBAL
+                // DEDUP radius is the density control: 12 ft collapses
+                // MISS2's 3,304 candidates ~4-6x harder than the yaml's
+                // 5 ft. Spacing raised alongside because committed probes
+                // get influence radius = spacing — the sparser set must
+                // still cover the level or [PERF refl_cache] hitRate
+                // drops and reverb regions go dark (watch that metric on
+                // every dev-bake validation).
+                cfg.audioProbeGlobalDedupRadiusFt = 12.0f;
+                cfg.audioProbeSpacingFt           = 15.0f;
                 std::fprintf(stderr,
-                    "--bake-quality dev: bake overridden to rays=4096 "
-                    "bounces=8 diffuse=256 (~32x cheaper than ship "
-                    "yaml settings). Cached .probes from this bake are "
-                    "DEV QUALITY — re-bake without this flag for "
-                    "milestone/ship reverb fidelity.\n");
+                    "--bake-quality dev: bake rays=4096 bounces=8 "
+                    "diffuse=256 (~32x cheaper/probe than ship yaml) + "
+                    "probe density reduced (global_dedup 12 ft, spacing "
+                    "15 ft; ~4-6x fewer reflection probes). Cached "
+                    ".probes from this bake are DEV QUALITY/DENSITY — "
+                    "re-bake without this flag for milestone/ship "
+                    "reverb fidelity.\n");
             } else if (std::strcmp(q, "ship") != 0) {
                 std::fprintf(stderr,
                     "[FALLBACK] --bake-quality: unknown profile '%s' "
