@@ -1674,6 +1674,30 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                     "[FALLBACK] --audio-rng-seed: invalid '%s' — keeping "
                     "unseeded (random_device)\n", argv[i]);
             }
+        } else if (std::strcmp(argv[i], "--bake-quality") == 0 && i + 1 < argc) {
+            // Bake-quality profile. "dev" forces the fast iteration bake
+            // (the code defaults: rays=4096 bounces=8 diffuse=256, ~32×
+            // cheaper per probe than the ship-quality yaml settings —
+            // MISS2's 2590-probe ship bake projected ~25 HOURS, dev ~45
+            // min). "ship" is a documented no-op: respect the yaml.
+            // Applied here because CLI parsing runs after the yaml load,
+            // so this deliberately overrides reflections.bake.* values.
+            const char *q = argv[++i];
+            if (std::strcmp(q, "dev") == 0) {
+                cfg.bakeNumRays        = 4096;
+                cfg.bakeNumBounces     = 8;
+                cfg.bakeDiffuseSamples = 256;
+                std::fprintf(stderr,
+                    "--bake-quality dev: bake overridden to rays=4096 "
+                    "bounces=8 diffuse=256 (~32x cheaper than ship "
+                    "yaml settings). Cached .probes from this bake are "
+                    "DEV QUALITY — re-bake without this flag for "
+                    "milestone/ship reverb fidelity.\n");
+            } else if (std::strcmp(q, "ship") != 0) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --bake-quality: unknown profile '%s' "
+                    "(expected dev|ship) — keeping yaml bake settings\n", q);
+            }
         } else if (std::strcmp(argv[i], "--audio-log") == 0) {
             // CLI mirror of the YAML `developer.audio_log` key. Perf runs
             // need it: nearly all [PERF *] histogram recording is gated on
