@@ -246,12 +246,18 @@ struct GPUResources {
 // macOS GPUs, so the cost model uses 256 as the worst case. On GPUs
 // with finer alignment this overestimates per-draw cost by ~10% and the
 // clamp may drop draws a little before the physical limit — accepted:
-// dropping distant objects loudly beats corrupting the heap silently,
-// and the [FALLBACK] report makes it visible. Costs must be revisited
+// dropping draws loudly beats corrupting the heap silently, and the
+// [FALLBACK] report makes it visible. NOTE (PR #6 review S4): draws are
+// dropped in ITERATION order (object-list order), not farthest-first —
+// on a saturated frame the dropped set is arbitrary and can include
+// near objects (MISS2 peak frames drop ~100-260 draws). Distance-sorted
+// dropping is a filed follow-up (TASKS.TODO). Costs must be revisited
 // when shader uniforms change. The budget leaves 0.5 MB of the 8 MB
 // backend buffer for passes that are bounded by design and not
-// accounted (sky ≤ 6 draws, clear quads, debug overlays, dbgText
-// blitter).
+// accounted (sky ≤ 6 draws, clear quads, dbgText blitter) — EXCEPT the
+// view-2 debug overlays, which are content-scaling (MISS2 probe viz
+// ≈ 0.49 MB alone) and can breach the reserve when overlays are enabled
+// on a saturated frame (PR #6 review S3, debug-gated; filed follow-up).
 //
 // The object pass is the only unbounded consumer (draw count scales with
 // visible objects × submodels); it CLAMPS at the budget and reports

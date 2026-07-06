@@ -51,11 +51,16 @@
 ///     paths at runtime — sparse-graph pathing reduces a multi-second hang
 ///     to microseconds.
 ///
-/// Both batches are attached to both simulators (reflection sim + pathing
-/// sim). The reflection sim only consumes batches with reflections bake
-/// data; the pathing sim only consumes the one batch named on each
+/// Batch attachment is ASYMMETRIC (PR #6): the REFLECTION simulator gets
+/// ONLY batches carrying reflections bake data — Steam Audio v4.7.0's
+/// baked-reflections lookup has NO bounds check and indexes across ALL
+/// attached batches (baked_reflection_data.cpp), so attaching a data-less
+/// pathing batch reads out of bounds whenever pathing probes outnumber
+/// reflection probes (crashed MISS2: 949 > 626) and silently blends
+/// unrelated probes' reverb otherwise (MISS6: 630 < 833). The PATHING
+/// simulator gets both batches, but only consumes the one named on each
 /// source's `IPLSimulationInputs::pathingProbes` field (caller must point
-/// at `getPathingProbeBatch()`).
+/// at `getPathingProbeBatch()`). Do NOT "simplify" back to attach-all.
 ///
 /// Threading: main-thread only. `bakeProbes` is blocking (~10-60s) and
 /// reports via an atomic float so a UI thread can poll. Probe batches are
@@ -422,10 +427,12 @@ public:
                          const ProbeBakeParams &params,
                          ProbeBakePlan &out);
 
-    /// Load probes from disk + register every batch with both simulators.
-    /// Reflection sim silently ignores batches without reflections data;
-    /// pathing sim creates per-batch PathSimulators which are then named
-    /// per-source via IPLSimulationInputs::pathingProbes.
+    /// Load probes from disk + register batches ASYMMETRICALLY: the
+    /// reflection simulator receives only reflections-data batches (the
+    /// old "silently ignores" assumption was DISPROVEN — see the
+    /// class-level attachment comment: unbounded lookup, PR #6); the
+    /// pathing sim receives both and consumes the batch named per-source
+    /// via IPLSimulationInputs::pathingProbes.
     bool loadProbes(const std::string &probePath,
                     IPLSimulator reflectionSimulator,
                     IPLSimulator pathingSimulator);
