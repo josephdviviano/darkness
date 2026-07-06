@@ -1320,29 +1320,57 @@ bool ProbeManager::loadProbes(const std::string &probePath,
         }
     }
 
-    // Attach every batch to both simulators. The reflection simulator
-    // silently skips batches whose hasData(REFLECTIONS) is false (verified
-    // in baked_reflection_simulator.cpp); the pathing simulator builds a
-    // per-batch PathSimulator (simulation_manager.cpp:135) that is only
-    // consumed when a source names that batch via
-    // IPLSimulationInputs::pathingProbes.
-    auto attachAll = [this](IPLSimulator sim, const char *label) {
+    // Attach batches to the simulators that can actually consume them.
+    //
+    // The reflection simulator must ONLY see batches carrying baked
+    // reflections data. An earlier version attached every batch on the
+    // belief that Steam Audio "silently skips batches whose
+    // hasData(REFLECTIONS) is false" — that skip exists at the batch
+    // level (baked_reflection_simulator.cpp, lookupEnergyField), but the
+    // probe NEIGHBORHOOD passed into each batch's evaluateEnergyField
+    // still spans every attached batch, and its per-probe guard
+    // (`batches[i]->hasData(id) && &batch[id] != this`) falls through
+    // for batches with NO reflections data. Their probe indices are then
+    // applied to the reflections batch's own arrays
+    // (BakedReflectionsData::lookupEnergyField has no bounds check):
+    // wrong probes' energy fields where the index happens to be in
+    // range, and an out-of-bounds read → garbage EnergyField pointer →
+    // EXC_BAD_ACCESS on the reflection worker where it isn't. MISS2 was
+    // the first mission whose pathing batch (949 probes) outnumbered its
+    // reflections batch (626) and crashed within seconds of touring;
+    // missions with pathing < reflections (MISS6: 630 < 833) never
+    // crashed but silently blended unrelated probes' reverb.
+    //
+    // The pathing simulator keeps every batch: it builds a per-batch
+    // PathSimulator (simulation_manager.cpp:135) that is only consumed
+    // when a source names that batch via
+    // IPLSimulationInputs::pathingProbes, so foreign batches are inert
+    // there.
+    auto attachMatching = [this](IPLSimulator sim, const char *label,
+                                  auto &&wants) {
         if (!sim) return;
         if (label == nullptr) label = "?";
+        size_t attached = 0;
         for (auto &entry : mBatches) {
             if (!entry.iplBatch) continue;
+            if (!wants(entry)) continue;
             iplSimulatorAddProbeBatch(sim, entry.iplBatch);
+            ++attached;
         }
         iplSimulatorCommit(sim);
-        AUDIO_LOG("ProbeManager: attached %zu batch(es) to %s simulator\n",
-                  mBatches.size(), label);
+        AUDIO_LOG("ProbeManager: attached %zu of %zu batch(es) to %s "
+                  "simulator\n", attached, mBatches.size(), label);
     };
 
     if (mDeps.waitForReflectionThread) mDeps.waitForReflectionThread();
     if (mDeps.waitForPathingThread)    mDeps.waitForPathingThread();
 
-    attachAll(reflectionSimulator, "reflection");
-    attachAll(pathingSimulator,    "pathing");
+    attachMatching(reflectionSimulator, "reflection",
+                   [](const ProbeBatchEntry &e) {
+                       return e.hasReflectionsData;
+                   });
+    attachMatching(pathingSimulator, "pathing",
+                   [](const ProbeBatchEntry &) { return true; });
 
     AUDIO_LOG("ProbeManager: loaded %d probes from '%s' "
               "(refl_batch=%d w/refl=%s, pathing_batch=%d w/pathing=%s)\n",
