@@ -680,6 +680,7 @@ static void renderWorld(
         for (const auto &grp : meshes.lmMesh.groups) {
             if (!isCellVisible(grp.cellID)) continue;
 
+            state.frameUniformBytes += Darkness::kUniformCostWorldDraw;
             setFogOn();
             bgfx::setTransform(model);
             bgfx::setVertexBuffer(0, gpu.vbh);
@@ -714,6 +715,7 @@ static void renderWorld(
         for (const auto &grp : meshes.worldMesh.groups) {
             if (!isCellVisible(grp.cellID)) continue;
 
+            state.frameUniformBytes += Darkness::kUniformCostWorldDraw;
             setFogOn();
             bgfx::setTransform(model);
             bgfx::setVertexBuffer(0, gpu.vbh);
@@ -736,6 +738,7 @@ static void renderWorld(
         for (const auto &grp : meshes.flatMesh.groups) {
             if (!isCellVisible(grp.cellID)) continue;
 
+            state.frameUniformBytes += Darkness::kUniformCostWorldDraw;
             setFogOn();
             bgfx::setTransform(model);
             bgfx::setVertexBuffer(0, gpu.vbh);
@@ -776,6 +779,7 @@ static void renderWater(
     };
 
     for (const auto &grp : meshes.waterMesh.groups) {
+        state.frameUniformBytes += Darkness::kUniformCostWaterDraw;
         setFogOn();
         bgfx::setTransform(identity);
         bgfx::setVertexBuffer(0, gpu.waterVBH);
@@ -2841,6 +2845,21 @@ static void renderObjects(
 
                 uint64_t drawState = opaquePass ? fc.renderState : translucentState;
 
+                // Per-frame uniform budget clamp (kFrameUniformBudgetBytes,
+                // DarknessRenderState.h). Submitting past the backend's
+                // fixed per-frame uniform buffer silently corrupts the
+                // heap, so drop the draw instead; the render loop reports
+                // the drop count loudly ([FALLBACK] + on-screen banner).
+                const uint32_t drawCost = useScalarPath
+                    ? Darkness::kUniformCostObjectScalarDraw
+                    : Darkness::kUniformCostObjectPerVertexDraw;
+                if (state.frameUniformBytes + drawCost >
+                        Darkness::kFrameUniformBudgetBytes) {
+                    ++state.frameUniformDrawsDropped;
+                    continue;
+                }
+                state.frameUniformBytes += drawCost;
+
                 bgfx::setUniform(gpu.u_fogColor, fc.fogColorArr);
                 bgfx::setUniform(gpu.u_fogParams, fc.fogOnArr);
                 bgfx::setUniform(gpu.u_objectParams, objAlpha);
@@ -2891,7 +2910,15 @@ static void renderObjects(
                 }
             }
         } else if (state.showFallbackCubes && opaquePass) {
-            // Fallback cubes are always opaque
+            // Fallback cubes are always opaque. Same per-frame uniform
+            // budget clamp as the submodel loop above — cube count scales
+            // with (model-less) object count.
+            if (state.frameUniformBytes + Darkness::kUniformCostObjectScalarDraw >
+                    Darkness::kFrameUniformBudgetBytes) {
+                ++state.frameUniformDrawsDropped;
+                return;
+            }
+            state.frameUniformBytes += Darkness::kUniformCostObjectScalarDraw;
             setFogOn();
             bgfx::setTransform(objMtx);
             bgfx::setVertexBuffer(0, gpu.fallbackCubeVBH);
@@ -4591,6 +4618,12 @@ static Darkness::FrameContext prepareFrame(
 {
     using namespace Darkness;
     FrameContext fc{};
+
+    // Reset the per-frame uniform-buffer budget accounting (see
+    // kFrameUniformBudgetBytes in DarknessRenderState.h). World/water/
+    // object passes accumulate into these; the object pass clamps.
+    state.frameUniformBytes = 0;
+    state.frameUniformDrawsDropped = 0;
 
     // Projection matrix (shared by sky and world views)
     bx::mtxProj(fc.proj, 60.0f,
@@ -6689,6 +6722,30 @@ int main(int argc, char *argv[]) {
                 int col = 80 - static_cast<int>(target.name.size()) / 2 - 2;
                 if (col < 0) col = 0;
                 bgfx::dbgTextPrintf(col, 24, 0x0f, "[ %s ]", target.name.c_str());
+            }
+
+            // Uniform-budget clamp report. A non-zero drop count means the
+            // scene demanded more per-frame uniform-buffer space than the
+            // backend owns (kFrameUniformBudgetBytes) and object draws were
+            // skipped — visible as missing objects. Announce loudly on both
+            // channels per the no-silent-fallbacks rule: stderr (rate-
+            // limited to once per second) and an on-screen banner.
+            if (state.frameUniformDrawsDropped > 0) {
+                static uint64_t lastReportUs = 0;
+                uint64_t nowUs = monotonicMicros();
+                if (nowUs - lastReportUs >= 1000000) {
+                    lastReportUs = nowUs;
+                    std::fprintf(stderr,
+                        "[FALLBACK] frame uniform budget exhausted: "
+                        "%u object draws dropped (used %u of %u bytes) — "
+                        "objects will be missing this frame\n",
+                        state.frameUniformDrawsDropped,
+                        state.frameUniformBytes,
+                        Darkness::kFrameUniformBudgetBytes);
+                }
+                bgfx::dbgTextPrintf(2, 2, 0x4f,
+                    "UNIFORM BUDGET EXCEEDED — %u object draws dropped",
+                    state.frameUniformDrawsDropped);
             }
 
             // Camera position HUD (only when show_pos is on). Row 0 so

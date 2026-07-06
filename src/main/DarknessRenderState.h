@@ -224,6 +224,75 @@ struct GPUResources {
     std::unordered_map<std::string, bgfx::TextureHandle>   skyboxTexHandles;
 };
 
+// ── Per-frame uniform-buffer budget ──
+//
+// bgfx's Metal backend allocates a FIXED per-frame uniform buffer
+// (UNIFORM_BUFFER_SIZE = 8 MB in renderer_mtl.mm) and advances a write
+// offset by each draw call's reflected constant-buffer size — with no
+// bounds check anywhere. A frame whose cumulative per-draw uniform
+// demand exceeds the buffer silently memcpy's past the end of the
+// MTLBuffer allocation: heap corruption, surfacing as SIGBUS inside
+// RendererContextMtl::setShaderUniform or an AGX driver crash at
+// command-buffer commit (MISS2 tour crashes, 2026-07). Other backends
+// have analogous per-frame scratch limits, so the renderer enforces its
+// own budget on every pass that scales with scene content.
+//
+// Costs below are the Metal argument-buffer struct sizes observed in the
+// bgfx reflection trace (vertex + fragment uniform blocks), with each
+// block rounded up to the backend's constant-buffer offset alignment.
+// That alignment is a GPU property bgfx does not expose (it feeds
+// bx::alignUp from the pipeline reflection's bufferAlignment); Metal
+// constant-buffer offsets require up to 256-byte alignment on some
+// macOS GPUs, so the cost model uses 256 as the worst case. On GPUs
+// with finer alignment this overestimates per-draw cost by ~10% and the
+// clamp may drop draws a little before the physical limit — accepted:
+// dropping distant objects loudly beats corrupting the heap silently,
+// and the [FALLBACK] report makes it visible. Costs must be revisited
+// when shader uniforms change. The budget leaves 0.5 MB of the 8 MB
+// backend buffer for passes that are bounded by design and not
+// accounted (sky ≤ 6 draws, clear quads, debug overlays, dbgText
+// blitter).
+//
+// The object pass is the only unbounded consumer (draw count scales with
+// visible objects × submodels); it CLAMPS at the budget and reports
+// loudly — see renderObjects() and the [FALLBACK] plumbing in the render
+// loop. World/water passes are accounted but never clamped: their draw
+// counts are bounded by mission cell/texture-group counts (≾ 8 k groups
+// × 512 B ≈ 4 MB absolute worst case with every cell visible; ~1.9 MB
+// in practice on MISS2, the group-heaviest mission).
+constexpr uint32_t kFrameUniformBudgetBytes =
+    8u * 1024u * 1024u - 512u * 1024u;
+
+// Worst-case Metal constant-buffer offset alignment (per-block rounding).
+constexpr uint32_t kUniformBlockAlign = 256u;
+constexpr uint32_t uniformAlignUp(uint32_t bytes) {
+    return (bytes + kUniformBlockAlign - 1u) & ~(kUniformBlockAlign - 1u);
+}
+
+// Per-vertex object draw: vs = u_model[1] (64) + u_modelView (64) +
+// u_modelViewProj (64) + u_objectLightCount/u_objectAmbient/u_objectParams
+// (3×16) + 3 light arrays (3 × kObjectLightCap × 16) = 1776; fs =
+// u_fogColor + u_fogParams + u_objectParams (48).
+constexpr uint32_t kUniformCostObjectPerVertexDraw =
+    uniformAlignUp(64u * 3u + 16u * 3u
+                   + 3u * static_cast<uint32_t>(kObjectLightCap) * 16u)
+    + uniformAlignUp(48u);
+
+// Scalar object draw: vs = u_modelView + u_modelViewProj (128);
+// fs = u_fogColor + u_fogParams + u_objectParams + u_objectLight (64).
+constexpr uint32_t kUniformCostObjectScalarDraw =
+    uniformAlignUp(128u) + uniformAlignUp(64u);
+
+// World draw (lightmapped / textured / flat): vs = u_modelView +
+// u_modelViewProj (128); fs ≤ u_fogColor + u_fogParams + u_lmAtlasSize (48).
+constexpr uint32_t kUniformCostWorldDraw =
+    uniformAlignUp(128u) + uniformAlignUp(48u);
+
+// Water draw: vs = u_modelView + u_modelViewProj + u_waterParams +
+// u_waterFlow (160); fs = u_waterParams + u_fogColor + u_fogParams (48).
+constexpr uint32_t kUniformCostWaterDraw =
+    uniformAlignUp(160u) + uniformAlignUp(48u);
+
 // ── RuntimeState — Mutable per-frame state ──
 // Camera, debug toggles, runtime config, and anything that changes
 // frame-to-frame during the render loop.
@@ -281,6 +350,18 @@ struct RuntimeState {
     // avoid reallocating ~96 vec4s every per-object draw call. Not
     // thread-safe; the renderer is single-threaded.
     mutable GPULightArray gpuLightScratch;
+
+    // Per-frame uniform-buffer budget accounting (see the
+    // kFrameUniformBudgetBytes block above for why this exists). Reset
+    // in prepareFrame(); world/water/object passes accumulate their
+    // estimated backend uniform-buffer consumption here, and the object
+    // pass stops submitting when the budget is reached. `mutable` for
+    // the same reason as gpuLightScratch: passes receive RuntimeState by
+    // const ref, and this is transparent per-frame bookkeeping.
+    mutable uint32_t frameUniformBytes = 0;
+    // Object submodel draws dropped by the budget clamp this frame.
+    // Non-zero triggers the loud [FALLBACK] report in the render loop.
+    mutable uint32_t frameUniformDrawsDropped = 0;
 
     // Per-frame dynamic light registry. Reset at the start of each render
     // frame; gameplay systems push transient lights (player flashlight,

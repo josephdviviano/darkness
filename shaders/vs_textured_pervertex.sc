@@ -1,6 +1,17 @@
 $input a_position, a_color0, a_texcoord0, a_normal
 $output v_color0, v_texcoord0, v_fogDist
 
+// Shrink bgfx's predefined u_model[BGFX_CONFIG_MAX_BONES] array (default 32)
+// to a single matrix. This shader only reads u_model[0] — Dark Engine object
+// meshes are rigid, never GPU-skinned — but the full declared array is
+// reflected into the Metal argument buffer, so every object draw call would
+// reserve 32×64 = 2048 bytes of the backend's fixed per-frame uniform buffer
+// for 31 matrices of dead weight. With thousands of visible objects per frame
+// (MISS2 tours peak >3000 draws) that waste alone overflowed the 8 MB Metal
+// frame budget and corrupted the heap. See kFrameUniformBudgetBytes in
+// DarknessRenderState.h for the renderer-side accounting.
+#define BGFX_CONFIG_MAX_BONES 1
+
 #include <bgfx_shader.sh>
 #include "object_lighting_constants.h"
 

@@ -14082,8 +14082,11 @@ bool AudioService::loadProbes(const std::string &probePath)
     }
     // Multi-batch ProbeManager owns the lifecycle on both simulators
     // (reflection + pathing). It drains both workers internally before
-    // any batch mutation, attaches every loaded batch to both sims, and
-    // releases through the same path on next load / scene teardown.
+    // any batch mutation, attaches each loaded batch to the simulators
+    // that can consume it (reflection sim: reflections-data batches
+    // only — see the attach comment in ProbeManager::loadProbes for the
+    // out-of-bounds hazard; pathing sim: every batch), and releases
+    // through the same path on next load / scene teardown.
     bool ok = mProbeManager->loadProbes(probePath,
         mReflectionSim ? mReflectionSim->simulator() : nullptr,
         mPathingSim    ? mPathingSim->simulator()    : nullptr);
@@ -14100,7 +14103,7 @@ bool AudioService::loadProbes(const std::string &probePath)
     mPathingProbeBatchAdded = (mProbeManager->getPathingProbeBatch() != nullptr);
     if (mPathingProbeBatchAdded) {
         AUDIO_LOG("AudioService: pathing batch active (%zu probes); "
-                  "reflection batch (%zu probes) attached to both sims\n",
+                  "reflection batch (%zu probes) on reflection+pathing sims\n",
                   mProbeManager->getPathingProbePositions().size(),
                   mProbeManager->getProbePositions().size());
     }
