@@ -25,14 +25,28 @@
 /// @file ProbeFile.h
 /// Probe file format with integrity checking for baked acoustic probe data.
 ///
-/// === Version 2 (current) — multi-batch container ===
+/// === Version 3 (current) — multi-batch container + pathing bake profile ===
 ///
 /// File layout (all fields little-endian):
 ///   [0..3]   magic       "DKPr" (0x72504B44)
-///   [4..7]   version     format version (currently 2)
+///   [4..7]   version     format version (currently 3)
 ///   [8..11]  batchCount  number of probe batches that follow
 ///   [12..15] totalProbes total probe count across all batches (sanity)
-///   [16..19] reserved    zero
+///   [16..19] bakedPathingVisRangeFt   float — the IPLPathBakeParams::visRange
+///            (single-edge distance cap, engine feet) the pathing section was
+///            baked with. 0 when the file carries no pathing batch. The
+///            runtime clamps per-voice `inputs.visRange` to this value —
+///            longer single edges do not exist in the baked graph, so
+///            requesting more silently buys nothing (multi-hop pathRange
+///            covers long routes instead).
+///   [20..23] bakedPathingNumSamples   uint32 — IPLPathBakeParams::numSamples
+///            the pathing section was baked with. 0 when no pathing batch.
+///            Runtime `IPLSimulationSettings::numVisSamples` MUST equal this
+///            or bake-accepted edges are re-rejected at runtime (pathing
+///            collapses to the 0.1f sentinel). Loaders compare against the
+///            active profile constant (SteamAudioPathing.h
+///            kPathingVisSamplesShip/Dev) and trigger a loud pathing re-bake
+///            on mismatch instead of running with a torn edge set.
 ///
 /// Followed by `batchCount` batch records, each:
 ///   [0..3]   purpose     ProbePurpose enum (0=Reflections, 1=Pathing)
@@ -40,6 +54,15 @@
 ///   [8..11]  payloadSize size of the Steam Audio serialized blob in bytes
 ///   [12..15] crc32       CRC-32 of the payload bytes
 ///   [16..15+payloadSize] payload (opaque Steam Audio probe batch data)
+///
+/// === Version 2 (legacy) — multi-batch, no bake profile, not accepted ===
+///
+/// Same batch records but a 20-byte header with a zero `reserved` word where
+/// v3 stores the pathing bake profile. Rejected (UnsupportedVersion) rather
+/// than migrated: without the recorded visRange/numSamples we cannot verify
+/// the cache matches the active runtime profile — the exact silent mismatch
+/// v3 exists to prevent. The caller's version-check flow surfaces a loud
+/// "re-bake" message; the re-bake is fast under the v3 bake-range cap.
 ///
 /// === Version 1 (legacy) — single batch, no longer accepted ===
 ///
@@ -85,22 +108,26 @@ inline uint32_t crc32(const uint8_t *data, size_t length) {
 // ── Probe file header ─────────────────────────────────────────────────────
 
 static constexpr uint32_t kProbeFileMagic   = 0x72504B44u; // "DKPr" little-endian
-static constexpr uint32_t kProbeFileVersion = 2u;
-static constexpr size_t   kProbeFileHeaderSize = 20u;       // 5 x uint32_t
+static constexpr uint32_t kProbeFileVersion = 3u;
+static constexpr size_t   kProbeFileHeaderSize = 24u;       // 5 x uint32_t + 1 x float
 static constexpr size_t   kProbeBatchRecordHeaderSize = 16u; // 4 x uint32_t
 
-/// On-disk multi-batch file header (v2). All fields are little-endian uint32_t.
+/// On-disk multi-batch file header (v3). All fields little-endian; the
+/// bake-profile fields are 0 when the file has no pathing batch (see the
+/// format doc at the top of this file for their must-match semantics).
 struct ProbeFileHeader {
     uint32_t magic       = kProbeFileMagic;
     uint32_t version     = kProbeFileVersion;
     uint32_t batchCount  = 0;
     uint32_t totalProbes = 0;
-    uint32_t reserved    = 0;
+    float    bakedPathingVisRangeFt = 0.0f; // v3: replaces the v2 reserved word
+    uint32_t bakedPathingNumSamples = 0;    // v3: appended
 };
 static_assert(sizeof(ProbeFileHeader) == kProbeFileHeaderSize,
-              "ProbeFileHeader must be exactly 20 bytes");
+              "ProbeFileHeader must be exactly 24 bytes");
 
-/// On-disk per-batch record header (v2). One precedes each batch payload.
+/// On-disk per-batch record header (unchanged since v2). One precedes each
+/// batch payload.
 struct ProbeBatchRecordHeader {
     uint32_t purpose     = 0;   // ProbePurpose (0=Reflections, 1=Pathing)
     uint32_t probeCount  = 0;
@@ -153,15 +180,25 @@ inline const char *probeFileStatusString(ProbeFileStatus s) {
 ///
 /// @param outputPath   Final destination path (e.g. "mission.probes")
 /// @param batches      Vector of per-batch records; CRC is computed per batch.
+/// @param bakedPathingVisRangeFt v3 bake-profile record: the pathing bake's
+///                     single-edge visRange cap in engine feet. Pass 0 when
+///                     no pathing batch is written.
+/// @param bakedPathingNumSamples v3 bake-profile record: the pathing bake's
+///                     IPLPathBakeParams::numSamples. Pass 0 when no pathing
+///                     batch is written.
 /// @return true on success
 inline bool writeProbeFile(const std::string &outputPath,
-                           const std::vector<ProbeBatchRecord> &batches)
+                           const std::vector<ProbeBatchRecord> &batches,
+                           float bakedPathingVisRangeFt = 0.0f,
+                           uint32_t bakedPathingNumSamples = 0)
 {
     // Build outer header
     ProbeFileHeader hdr;
     hdr.batchCount = static_cast<uint32_t>(batches.size());
     hdr.totalProbes = 0;
     for (const auto &b : batches) hdr.totalProbes += b.probeCount;
+    hdr.bakedPathingVisRangeFt = bakedPathingVisRangeFt;
+    hdr.bakedPathingNumSamples = bakedPathingNumSamples;
 
     std::string tmpPath = outputPath + ".tmp";
     FILE *f = std::fopen(tmpPath.c_str(), "wb");

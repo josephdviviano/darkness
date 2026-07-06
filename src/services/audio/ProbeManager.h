@@ -68,6 +68,7 @@
 /// `waitForReflectionThread` callback before any batch mutation.
 
 #include "DarknessMath.h"
+#include "SteamAudioPathing.h"  // kPathingVisSamplesShip (ProbeBakeParams default)
 
 #include <atomic>
 #include <cstdint>
@@ -313,6 +314,36 @@ struct ProbeBakeParams {
     /// bake reflections off it. Empty = keep everything that landed inside
     /// the candidate list.
     ProbeFilterFn pathingProbeFilter;
+
+    /// Bake-time single-edge distance cap (engine feet) for the pathing
+    /// visibility graph (`IPLPathBakeParams::visRange`). Derived by
+    /// AudioService::prepareProbeBakeParams from the mission's ROOM_DB
+    /// (max intra-room portal-to-portal span / room diameter × margin,
+    /// clamped) — ProbeManager deliberately does not depend on
+    /// RoomService, so the derivation travels here. <= 0 means the
+    /// caller could not derive a cap; bakePathingBatch falls back LOUDLY
+    /// to the whole-level range (the pre-cap behaviour). Does NOT bound
+    /// multi-hop route length — that is pathRange, which stays
+    /// whole-level (see the visRange/pathRange comment in
+    /// bakePathingBatch).
+    float pathingVisRangeFt = -1.0f;
+
+    /// Pathing visibility sampling count (`IPLPathBakeParams::numSamples`).
+    /// MUST be the active profile constant from SteamAudioPathing.h
+    /// (kPathingVisSamplesShip / kPathingVisSamplesDev) — AudioService
+    /// fills it via activePathingVisSamples() so bake and runtime read
+    /// the same selection. Recorded in the .probes v3 header.
+    int pathingNumSamples = kPathingVisSamplesShip;
+
+    /// True = pathing-only re-bake: skip the (expensive) reflection IR
+    /// bake and carry the CURRENTLY LOADED reflection batch forward into
+    /// the output file unchanged. Requires a loaded .probes file whose
+    /// reflection batch carries IR data; when that precondition fails the
+    /// bake falls back LOUDLY to a full reflection re-bake. Set by
+    /// AudioService when a forced pathing re-bake is requested
+    /// (--force-pathing-bake, or the automatic v3 header numSamples-
+    /// mismatch re-bake).
+    bool reuseLoadedReflectionsBatch = false;
 };
 
 /// One edge in the pathing-probe visibility graph (Capability C —
@@ -371,6 +402,12 @@ struct ProbeBatchEntry {
     int                   probeCount = 0;
     bool                  hasReflectionsData = false;
     bool                  hasPathingData = false;
+    /// Pathing bake profile actually used (pathing entries only; 0 on
+    /// reflections entries). Filled by bakePathingBatch with the
+    /// EFFECTIVE values (post any fallback), then recorded into the
+    /// .probes v3 header by bakeProbes.
+    float                 bakedVisRangeFt = 0.0f;
+    int                   bakedNumSamples = 0;
     /// Engine-space positions in placement order (sidecar mirror).
     std::vector<Vector3>  positions;
     /// Per-probe influence radii in engine feet (sidecar mirror). Parallel
@@ -458,6 +495,16 @@ public:
     /// Pathing batch present + baked?
     bool hasPathing() const { return mPathingBatch
                                      && mPathingBatch->hasPathingData; }
+
+    /// Pathing bake profile of the CURRENT in-memory data — from the
+    /// .probes v3 header on load, or from the just-used bake params after
+    /// a bake. 0 = unknown / no pathing batch. AudioService uses the
+    /// visRange as the runtime per-voice `inputs.visRange` clamp (edges
+    /// longer than the baked cap don't exist in the graph) and compares
+    /// the sample count against the active profile constant to trigger
+    /// the automatic mismatch re-bake.
+    float getBakedPathingVisRangeFt() const { return mBakedPathingVisRangeFt; }
+    int   getBakedPathingNumSamples() const { return mBakedPathingNumSamples; }
 
     /// The single batch carrying reflection IRs (or nullptr if none).
     /// Callers use this for `iplProbeBatchGetReverb` / per-probe lookups.
@@ -639,6 +686,13 @@ private:
     ProbeBatchEntry *mPathingBatch = nullptr;
     /// Sum of probeCount across batches; convenience for accessors.
     int  mTotalProbeCount = 0;
+
+    /// Pathing bake profile of the current in-memory data (see the
+    /// public getBakedPathing* accessors). Set from the .probes v3
+    /// header on load and from the bake params after a successful bake;
+    /// zeroed on releaseBatches.
+    float mBakedPathingVisRangeFt = 0.0f;
+    int   mBakedPathingNumSamples = 0;
 
     /// Negative override → use these values at bake time.
     float mProbeSpacingFt = 5.0f;
