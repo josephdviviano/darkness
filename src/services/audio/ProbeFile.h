@@ -25,7 +25,7 @@
 /// @file ProbeFile.h
 /// Probe file format with integrity checking for baked acoustic probe data.
 ///
-/// === Version 3 (current) — multi-batch container + pathing bake profile ===
+/// === Version 3 (current) — multi-batch container + bake-profile record ===
 ///
 /// File layout (all fields little-endian):
 ///   [0..3]   magic       "DKPr" (0x72504B44)
@@ -45,8 +45,26 @@
 ///            or bake-accepted edges are re-rejected at runtime (pathing
 ///            collapses to the 0.1f sentinel). Loaders compare against the
 ///            active profile constant (SteamAudioPathing.h
-///            kPathingVisSamplesShip/Dev) and trigger a loud pathing re-bake
-///            on mismatch instead of running with a torn edge set.
+///            kPathingVisSamplesShip/Dev) and trigger a loud pathing-only
+///            re-bake on mismatch instead of running with a torn edge set.
+///   [24..27] bakedReflectionRays      uint32 — the reflection IR bake's ray
+///            count (IPLReflectionsBakeParams::numRays). Together with the
+///            dedup radius below this identifies the REFLECTION half of the
+///            bake-quality profile (--bake-quality dev = rays 2048 + 18 ft
+///            dedup; ship = the yaml values). 0 = unknown (never written by
+///            current code — every file carries a reflection section).
+///   [28..31] bakedProbeDedupRadiusFt  float — the reflection batch's global
+///            dedup radius (engine feet) at bake time; the probe-DENSITY
+///            half of the profile.
+///
+/// Reflection-profile mismatch policy (differs from the pathing fields):
+/// a mismatch against the active profile does NOT auto-re-bake — the
+/// reflection bake is the expensive half — it emits an UNCONDITIONAL loud
+/// [FALLBACK] on EVERY load (AudioService::loadProbes) so dev-tier reverb
+/// is never consumed silently in a ship run. A pathing-only re-bake
+/// carries the reflection blob forward unchanged and PRESERVES these two
+/// fields: the header describes the blob actually in the file, never the
+/// profile that happened to be active during the re-bake.
 ///
 /// Followed by `batchCount` batch records, each:
 ///   [0..3]   purpose     ProbePurpose enum (0=Reflections, 1=Pathing)
@@ -71,6 +89,12 @@
 /// UnsupportedVersion for these; the user must delete the .probes file and
 /// re-bake. The format is unrecoverable because we cannot determine whether
 /// the single batch held reflections-only, pathing-only, or both.
+///
+/// Corner case for both legacy formats: the loader reads a full v3 header
+/// (32 bytes) before the version check, so a legacy file SHORTER than that
+/// (possible only for synthetic zero-batch/empty-payload files — real bakes
+/// always carry multi-KB payloads) reports FileTooSmall instead of
+/// UnsupportedVersion. Both statuses are loud delete-and-re-bake rejections.
 
 #include <array>
 #include <cstdint>
@@ -109,12 +133,15 @@ inline uint32_t crc32(const uint8_t *data, size_t length) {
 
 static constexpr uint32_t kProbeFileMagic   = 0x72504B44u; // "DKPr" little-endian
 static constexpr uint32_t kProbeFileVersion = 3u;
-static constexpr size_t   kProbeFileHeaderSize = 24u;       // 5 x uint32_t + 1 x float
+static constexpr size_t   kProbeFileHeaderSize = 32u;       // 8 x 4-byte fields
 static constexpr size_t   kProbeBatchRecordHeaderSize = 16u; // 4 x uint32_t
 
-/// On-disk multi-batch file header (v3). All fields little-endian; the
-/// bake-profile fields are 0 when the file has no pathing batch (see the
-/// format doc at the top of this file for their must-match semantics).
+/// On-disk multi-batch file header (v3). All fields little-endian, 4-byte,
+/// so the struct is packing-free on every supported ABI (static_assert
+/// below). Pathing fields are 0 when the file has no pathing batch; the
+/// reflection fields describe the reflection blob actually in the file
+/// (preserved across pathing-only re-bakes). Full semantics in the format
+/// doc at the top of this file.
 struct ProbeFileHeader {
     uint32_t magic       = kProbeFileMagic;
     uint32_t version     = kProbeFileVersion;
@@ -122,9 +149,11 @@ struct ProbeFileHeader {
     uint32_t totalProbes = 0;
     float    bakedPathingVisRangeFt = 0.0f; // v3: replaces the v2 reserved word
     uint32_t bakedPathingNumSamples = 0;    // v3: appended
+    uint32_t bakedReflectionRays    = 0;    // v3: reflection-profile half
+    float    bakedProbeDedupRadiusFt = 0.0f; // v3: probe-density half
 };
 static_assert(sizeof(ProbeFileHeader) == kProbeFileHeaderSize,
-              "ProbeFileHeader must be exactly 24 bytes");
+              "ProbeFileHeader must be exactly 32 bytes");
 
 /// On-disk per-batch record header (unchanged since v2). One precedes each
 /// batch payload.
@@ -186,11 +215,20 @@ inline const char *probeFileStatusString(ProbeFileStatus s) {
 /// @param bakedPathingNumSamples v3 bake-profile record: the pathing bake's
 ///                     IPLPathBakeParams::numSamples. Pass 0 when no pathing
 ///                     batch is written.
+/// @param bakedReflectionRays v3 bake-profile record: the reflection bake's
+///                     ray count. On a pathing-only re-bake pass the LOADED
+///                     file's value, not the active profile's — the header
+///                     must describe the carried-forward blob.
+/// @param bakedProbeDedupRadiusFt v3 bake-profile record: the reflection
+///                     batch's global dedup radius (ft). Same carry-forward
+///                     rule as bakedReflectionRays.
 /// @return true on success
 inline bool writeProbeFile(const std::string &outputPath,
                            const std::vector<ProbeBatchRecord> &batches,
                            float bakedPathingVisRangeFt = 0.0f,
-                           uint32_t bakedPathingNumSamples = 0)
+                           uint32_t bakedPathingNumSamples = 0,
+                           uint32_t bakedReflectionRays = 0,
+                           float bakedProbeDedupRadiusFt = 0.0f)
 {
     // Build outer header
     ProbeFileHeader hdr;
@@ -199,6 +237,8 @@ inline bool writeProbeFile(const std::string &outputPath,
     for (const auto &b : batches) hdr.totalProbes += b.probeCount;
     hdr.bakedPathingVisRangeFt = bakedPathingVisRangeFt;
     hdr.bakedPathingNumSamples = bakedPathingNumSamples;
+    hdr.bakedReflectionRays    = bakedReflectionRays;
+    hdr.bakedProbeDedupRadiusFt = bakedProbeDedupRadiusFt;
 
     std::string tmpPath = outputPath + ".tmp";
     FILE *f = std::fopen(tmpPath.c_str(), "wb");

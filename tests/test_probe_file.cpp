@@ -90,15 +90,17 @@ TEST_CASE("CRC-32 single byte", "[probe][crc]") {
 // ProbeFileHeader layout
 // ════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("ProbeFileHeader is 24 bytes with correct defaults", "[probe][header]") {
+TEST_CASE("ProbeFileHeader is 32 bytes with correct defaults", "[probe][header]") {
     ProbeFileHeader hdr;
-    CHECK(sizeof(hdr) == 24);
+    CHECK(sizeof(hdr) == 32);
     CHECK(hdr.magic == kProbeFileMagic);
     CHECK(hdr.version == kProbeFileVersion);
     CHECK(hdr.batchCount == 0);
     CHECK(hdr.totalProbes == 0);
     CHECK(hdr.bakedPathingVisRangeFt == 0.0f);
     CHECK(hdr.bakedPathingNumSamples == 0);
+    CHECK(hdr.bakedReflectionRays == 0);
+    CHECK(hdr.bakedProbeDedupRadiusFt == 0.0f);
 }
 
 TEST_CASE("ProbeBatchRecordHeader is 16 bytes", "[probe][header]") {
@@ -162,7 +164,7 @@ TEST_CASE("Write + load round-trips two batches", "[probe][file]") {
     std::remove(path.c_str());
 }
 
-TEST_CASE("Write + load round-trips v3 pathing bake profile", "[probe][file]") {
+TEST_CASE("Write + load round-trips v3 bake profile", "[probe][file]") {
     std::string path = tempPath("roundtrip_profile");
 
     auto batches = makeRecords(
@@ -170,19 +172,31 @@ TEST_CASE("Write + load round-trips v3 pathing bake profile", "[probe][file]") {
         { 7u });
 
     REQUIRE(writeProbeFile(path, batches, /*visRangeFt*/ 300.0f,
-                           /*numSamples*/ 16u));
+                           /*numSamples*/ 16u,
+                           /*reflRays*/ 16384u, /*dedupFt*/ 5.0f));
 
     ProbeFileHeader hdr;
     std::vector<ProbeBatchRecord> loaded;
     CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::Ok);
     CHECK(hdr.bakedPathingVisRangeFt == 300.0f);
     CHECK(hdr.bakedPathingNumSamples == 16u);
+    CHECK(hdr.bakedReflectionRays == 16384u);
+    CHECK(hdr.bakedProbeDedupRadiusFt == 5.0f);
 
-    // Default (no pathing batch) writes zeros.
+    // Dev-profile values round-trip too (the reflection half is what
+    // the every-load fidelity warning keys on).
+    REQUIRE(writeProbeFile(path, batches, 245.0f, 8u, 2048u, 18.0f));
+    CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::Ok);
+    CHECK(hdr.bakedReflectionRays == 2048u);
+    CHECK(hdr.bakedProbeDedupRadiusFt == 18.0f);
+
+    // Defaults write zeros.
     REQUIRE(writeProbeFile(path, batches));
     CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::Ok);
     CHECK(hdr.bakedPathingVisRangeFt == 0.0f);
     CHECK(hdr.bakedPathingNumSamples == 0u);
+    CHECK(hdr.bakedReflectionRays == 0u);
+    CHECK(hdr.bakedProbeDedupRadiusFt == 0.0f);
 
     std::remove(path.c_str());
 }
@@ -310,21 +324,27 @@ TEST_CASE("UnsupportedVersion for legacy v2 file", "[probe][corrupt]") {
     std::string path = tempPath("legacy_v2");
 
     // 20-byte v2 header followed by the first bytes of a batch record
-    // header (real v2 files always have batch records after the header;
-    // the v3 loader reads 24 bytes before checking the version, so the
-    // file must be at least that long to exercise the version check).
+    // header + payload (real v2 files always have batch records after
+    // the header; the v3 loader reads a full 32-byte header before
+    // checking the version, so the file must be at least that long to
+    // exercise the version check — shorter synthetic files report
+    // FileTooSmall, see the doc note in ProbeFile.h).
     struct LegacyV2FilePrefix {
         uint32_t magic;
         uint32_t version;
         uint32_t batchCount;
         uint32_t totalProbes;
         uint32_t reserved;
-        uint32_t firstRecordPurpose;
+        uint32_t firstRecordPurpose;   // batch record header begins here
+        uint32_t firstRecordProbeCount;
+        uint32_t firstRecordPayloadSize;
     } legacy{};
-    legacy.magic              = kProbeFileMagic;
-    legacy.version            = 2;
-    legacy.batchCount         = 1;
-    legacy.firstRecordPurpose = 0;
+    legacy.magic                  = kProbeFileMagic;
+    legacy.version                = 2;
+    legacy.batchCount             = 1;
+    legacy.firstRecordPurpose     = 0;
+    legacy.firstRecordProbeCount  = 10;
+    legacy.firstRecordPayloadSize = 64;
     REQUIRE(writeRaw(path, &legacy, sizeof(legacy)));
 
     ProbeFileHeader hdr;
@@ -335,8 +355,8 @@ TEST_CASE("UnsupportedVersion for legacy v2 file", "[probe][corrupt]") {
 
 TEST_CASE("UnsupportedVersion for legacy v1 file", "[probe][corrupt]") {
     // Legacy v1 had { magic, version=1, probeCount, payloadSize, crc32 }
-    // followed by the serialized payload (never empty in real files —
-    // the v3 loader reads a 24-byte header before the version check, so
+    // followed by the serialized payload (multi-KB in real files — the
+    // v3 loader reads a full 32-byte header before the version check, so
     // the payload bytes are what get it past the size check). The new
     // loader must reject without trying to migrate.
     std::string path = tempPath("legacy_v1");
@@ -347,14 +367,16 @@ TEST_CASE("UnsupportedVersion for legacy v1 file", "[probe][corrupt]") {
         uint32_t probeCount;
         uint32_t payloadSize;
         uint32_t crc32;
-        uint32_t payloadStart;
+        uint32_t payloadStart[3];
     } legacy{};
-    legacy.magic        = kProbeFileMagic;
-    legacy.version      = 1;
-    legacy.probeCount   = 100;
-    legacy.payloadSize  = 4;
-    legacy.crc32        = 0;
-    legacy.payloadStart = 0xDEADBEEF;
+    legacy.magic           = kProbeFileMagic;
+    legacy.version         = 1;
+    legacy.probeCount      = 100;
+    legacy.payloadSize     = 12;
+    legacy.crc32           = 0;
+    legacy.payloadStart[0] = 0xDEADBEEF;
+    legacy.payloadStart[1] = 0xCAFEF00D;
+    legacy.payloadStart[2] = 0x0BADF00D;
     REQUIRE(writeRaw(path, &legacy, sizeof(legacy)));
 
     ProbeFileHeader hdr;

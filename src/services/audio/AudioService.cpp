@@ -8022,24 +8022,28 @@ void AudioService::loopStep(float deltaTime)
                     // edges that were never baked, returning false-
                     // negatives that look like graph holes.
                     //
-                    // Runtime uses `mPropagationMaxDist` (the per-voice
-                    // audible cap from YAML `propagation.max_distance`,
-                    // default 200 ft). Bake-time uses the scene
-                    // diagonal × 1.5 (ProbeManager.cpp::bakePathingBatch)
-                    // so the graph spans the whole level regardless of
-                    // any voice's audible range. With the typical
-                    // mission this means runtime visRange ≪ bake
-                    // visRange — exactly the relationship Steam Audio
-                    // expects (bake = upper bound, runtime = per-source
-                    // budget).
+                    // The runtime value is per-voice: the original
+                    // engine's SFX_MaxDist formula below (~91 ft default,
+                    // 200-300 ft for the loudest schemas). The bake-time
+                    // value is the ROOM_DB-derived single-edge cap
+                    // (max room span × 1.5, clamped [150, 400] ft —
+                    // ProbeManager.cpp::bakePathingBatch; recorded in the
+                    // .probes v3 header). Because loud schemas can
+                    // legitimately request MORE than the baked cap, the
+                    // "runtime ≤ bake" invariant is enforced by the
+                    // explicit clamp a few lines down — with a loud,
+                    // rate-limited [FALLBACK] naming the schema — rather
+                    // than assumed from magnitudes. Multi-hop routes
+                    // longer than a single edge remain available via the
+                    // bake's whole-level pathRange.
                     //
                     // Past sessions thought bake and runtime had to
                     // match exactly. They don't — bake just needs to be
-                    // ≥ runtime. Tying both to mPropagationMaxDist
-                    // silently truncated the graph at 200 ft, breaking
-                    // pathing for any source-listener pair farther than
-                    // that even when a shorter multi-hop probe route
-                    // existed.
+                    // ≥ runtime (hence the clamp). Tying the BAKE range
+                    // to mPropagationMaxDist silently truncated the graph
+                    // at 200 ft, breaking pathing for any source-listener
+                    // pair farther than that even when a shorter
+                    // multi-hop probe route existed.
                     //
                     // Per-voice pathing-solver scope, derived from the
                     // original Dark Engine's SFX_MaxDist formula:
@@ -14201,6 +14205,17 @@ bool AudioService::bakeProbes(const std::string &outputPath,
     ProbeBakeParams params;
     prepareProbeBakeParams(params, /*planCounters*/ nullptr, spacing, height);
 
+    // mForcePathingBake is ONE-SHOT: it has now been consumed into
+    // params.reuseLoadedReflectionsBatch for THIS bake, so clear it
+    // before baking. Leaving it sticky would silently convert every
+    // later bake — e.g. a console `bake_probes` after tuning
+    // probe_spacing, whose whole point is regenerating the reflection
+    // grid — into a pathing-only re-bake that carries the old
+    // reflection grid forward. (computeProbePlan's dry-run calls
+    // prepareProbeBakeParams without consuming the flag, so a plan
+    // preview between scheduling and baking doesn't eat it.)
+    mForcePathingBake = false;
+
     bool ok = mProbeManager->bakeProbes(mIplScene, outputPath, params, progress);
     if (ok) {
         // Classify the freshly-baked probes so the overlay can show
@@ -14289,6 +14304,34 @@ bool AudioService::loadProbes(const std::string &probePath)
                   "reflection batch (%zu probes) on reflection+pathing sims\n",
                   mProbeManager->getPathingProbePositions().size(),
                   mProbeManager->getProbePositions().size());
+    }
+    // ── Reflection bake-profile check (every load, UNCONDITIONAL) ──
+    //
+    // The .probes v3 header records the reflection section's rays +
+    // probe-density dedup radius. Unlike the pathing numSamples mismatch
+    // (which breaks correctness and auto-re-bakes pathing-only), a
+    // reflection-profile mismatch only degrades reverb FIDELITY — and a
+    // full reflection re-bake is the expensive half — so the policy is
+    // warn-don't-rebake. The warning is plain stderr, NOT AUDIO_LOG:
+    // per no-silent-fallbacks it must fire on every load, including the
+    // pathing-only re-bake reload that would otherwise launder a
+    // dev-tier reflection bake into a silently-consumed ship cache.
+    {
+        const int   bakedRays    = mProbeManager->getBakedReflectionRays();
+        const float bakedDedupFt = mProbeManager->getBakedProbeDedupRadiusFt();
+        const bool raysMismatch  = (bakedRays > 0 && bakedRays != mBakeNumRays);
+        const bool dedupMismatch = (bakedRays > 0
+            && bakedDedupFt != mProbeGlobalDedupRadiusFt);
+        if (raysMismatch || dedupMismatch) {
+            std::fprintf(stderr,
+                "[FALLBACK] .probes reflection data was baked with a "
+                "different quality profile (baked rays=%d, active rays=%d; "
+                "baked dedup=%.1f ft, active dedup=%.1f ft) — reverb "
+                "fidelity may be dev-tier; re-bake without "
+                "--bake-quality dev for ship quality\n",
+                bakedRays, mBakeNumRays,
+                bakedDedupFt, mProbeGlobalDedupRadiusFt);
+        }
     }
     // Classify reachability so the debug overlay can preview which
     // probes the bake-time filter would now reject. With the filter

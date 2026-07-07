@@ -957,7 +957,9 @@ public:
      *  when loadProbes succeeded" decision lives in DarknessRender.cpp's
      *  probeBakeNeeded gate. The flag is queryable here so the bake
      *  decision site can read it from a single source of truth. Set from
-     *  `--force-pathing-bake` CLI flag; no YAML key (per-invocation). */
+     *  `--force-pathing-bake` CLI flag; no YAML key (per-invocation).
+     *  ONE-SHOT: consumed (and cleared) by the next bakeProbes() call —
+     *  see the mForcePathingBake member comment. */
     void setForcePathingBake(bool force) { mForcePathingBake = force; }
     bool getForcePathingBake() const { return mForcePathingBake; }
 
@@ -1856,6 +1858,12 @@ private:
     /// for the rationale. Default false. Set from the
     /// `--force-pathing-bake` CLI flag or by the automatic .probes v3
     /// header numSamples-mismatch re-bake — no YAML key, per-invocation.
+    ///
+    /// ONE-SHOT: bakeProbes() clears it after consuming it into the
+    /// ProbeBakeParams, so only the bake it was armed for is
+    /// pathing-only — a later console `bake_probes` (e.g. after tuning
+    /// probe_spacing, which exists to regenerate the reflection grid)
+    /// runs the full pipeline as the user expects.
     bool               mForcePathingBake = false;
 
     /// Bake-quality profile (see setDevBakeProfile). Selects the pathing

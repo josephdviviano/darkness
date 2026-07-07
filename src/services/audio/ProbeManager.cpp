@@ -1208,14 +1208,21 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         if (bakePathingBatch(scene, params, spacing, progress, pathEntry)) {
             havePathing = true;
         } else {
-            AUDIO_LOG("[FALLBACK] pathing batch bake failed — file will "
-                      "contain reflection batch only; Steam Audio pathing "
-                      "disabled until re-bake\n");
+            // Unconditional stderr (not AUDIO_LOG): a reflection-only
+            // file also records pathing header fields = 0, so the
+            // numSamples mismatch re-bake never re-triggers for it —
+            // this line is the ONLY signal that pathing is permanently
+            // off until a manual re-bake. Per no-silent-fallbacks.
+            std::fprintf(stderr,
+                "[FALLBACK] pathing batch bake failed — file will "
+                "contain reflection batch only; Steam Audio pathing "
+                "disabled until a manual re-bake (debug console: "
+                "`bake_probes`)\n");
         }
     }
 
     // Serialize each batch with round-trip validation, build the
-    // ProbeBatchRecord list, write the v2 file.
+    // ProbeBatchRecord list, write the v3 file.
     std::vector<ProbeBatchRecord> records;
     records.reserve(2);
 
@@ -1253,14 +1260,26 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         }
     }
 
-    // v3 header records the pathing bake profile (0s when no pathing
-    // section) so future loads can verify the cache against the active
-    // runtime profile.
+    // v3 header records the bake profile (pathing fields 0 when no
+    // pathing section) so future loads can verify the cache against the
+    // active profile. Reflection fields: on carry-forward the blob in
+    // the file is the LOADED one, so its recorded profile is preserved
+    // verbatim (mBakedReflection* still hold the loaded header's values
+    // here) — stamping the ACTIVE profile instead would launder a
+    // dev-tier reflection bake into ship credentials, which is exactly
+    // the silent-mismatch the header exists to prevent.
     const float    hdrVisRangeFt = havePathing ? pathEntry.bakedVisRangeFt : 0.0f;
     const uint32_t hdrNumSamples = havePathing
         ? static_cast<uint32_t>(pathEntry.bakedNumSamples) : 0u;
+    const uint32_t hdrReflRays = carryForwardRefl
+        ? static_cast<uint32_t>(mBakedReflectionRays)
+        : static_cast<uint32_t>(params.bakeNumRays);
+    const float hdrReflDedupFt = carryForwardRefl
+        ? mBakedProbeDedupRadiusFt
+        : params.globalDedupRadiusFt;
     bool writeOk = writeProbeFile(outputPath, records,
-                                  hdrVisRangeFt, hdrNumSamples);
+                                  hdrVisRangeFt, hdrNumSamples,
+                                  hdrReflRays, hdrReflDedupFt);
 
     // Position sidecars (one per batch). Failure is non-fatal — overlay
     // just lacks positions until the next bake. Reflection batch carries
@@ -1294,10 +1313,13 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     }
 
     // Mirror the just-written bake profile so the runtime guard /
-    // mismatch check work immediately after a bake, before (or without)
-    // the post-bake reload.
+    // mismatch checks work immediately after a bake, before (or without)
+    // the post-bake reload. (For carry-forward the reflection values are
+    // unchanged by construction.)
     mBakedPathingVisRangeFt = hdrVisRangeFt;
     mBakedPathingNumSamples = static_cast<int>(hdrNumSamples);
+    mBakedReflectionRays    = static_cast<int>(hdrReflRays);
+    mBakedProbeDedupRadiusFt = hdrReflDedupFt;
 
     const int reflProbeCount = reflEntry.probeCount;
     AUDIO_LOG("Saved %d probes (refl=%d, pathing=%d) to '%s'\n",
@@ -1437,12 +1459,14 @@ bool ProbeManager::loadProbes(const std::string &probePath,
         }
     }
 
-    // Record the pathing bake profile from the v3 header. Consumers:
-    // the runtime per-voice visRange clamp and the AudioService-side
-    // numSamples mismatch check (both read the getBakedPathing*
-    // accessors).
+    // Record the bake profile from the v3 header. Consumers: the runtime
+    // per-voice visRange clamp, the AudioService-side numSamples mismatch
+    // check (getBakedPathing*), and the every-load reflection-profile
+    // warning (getBakedReflection*).
     mBakedPathingVisRangeFt = hdr.bakedPathingVisRangeFt;
     mBakedPathingNumSamples = static_cast<int>(hdr.bakedPathingNumSamples);
+    mBakedReflectionRays    = static_cast<int>(hdr.bakedReflectionRays);
+    mBakedProbeDedupRadiusFt = hdr.bakedProbeDedupRadiusFt;
 
     // Attach batches to the simulators that can actually consume them.
     //
@@ -1550,6 +1574,8 @@ void ProbeManager::releaseBatches(IPLSimulator reflectionSimulator,
     mTotalProbeCount = 0;
     mBakedPathingVisRangeFt = 0.0f;
     mBakedPathingNumSamples = 0;
+    mBakedReflectionRays = 0;
+    mBakedProbeDedupRadiusFt = 0.0f;
 
     // The adjacency was built against the now-released pathing batch.
     // Leaving it in place would surface stale edges over a new mission's

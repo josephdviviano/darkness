@@ -506,6 +506,18 @@ public:
     float getBakedPathingVisRangeFt() const { return mBakedPathingVisRangeFt; }
     int   getBakedPathingNumSamples() const { return mBakedPathingNumSamples; }
 
+    /// Reflection bake profile of the CURRENT in-memory data (.probes v3
+    /// header fields bakedReflectionRays / bakedProbeDedupRadiusFt).
+    /// 0 = unknown. AudioService compares these against the active
+    /// profile on every load and emits an UNCONDITIONAL loud [FALLBACK]
+    /// on mismatch — no auto-re-bake (the reflection bake is the
+    /// expensive half), but dev-tier reverb can never be consumed
+    /// silently by a ship run. Pathing-only re-bakes preserve these
+    /// values (the header describes the carried-forward blob, not the
+    /// active profile).
+    int   getBakedReflectionRays() const { return mBakedReflectionRays; }
+    float getBakedProbeDedupRadiusFt() const { return mBakedProbeDedupRadiusFt; }
+
     /// The single batch carrying reflection IRs (or nullptr if none).
     /// Callers use this for `iplProbeBatchGetReverb` / per-probe lookups.
     IPLProbeBatch getReflectionProbeBatch() const {
@@ -687,12 +699,15 @@ private:
     /// Sum of probeCount across batches; convenience for accessors.
     int  mTotalProbeCount = 0;
 
-    /// Pathing bake profile of the current in-memory data (see the
-    /// public getBakedPathing* accessors). Set from the .probes v3
-    /// header on load and from the bake params after a successful bake;
+    /// Bake profile of the current in-memory data (see the public
+    /// getBakedPathing* / getBakedReflection* accessors). Set from the
+    /// .probes v3 header on load and after a successful bake (a
+    /// pathing-only re-bake preserves the loaded reflection values);
     /// zeroed on releaseBatches.
     float mBakedPathingVisRangeFt = 0.0f;
     int   mBakedPathingNumSamples = 0;
+    int   mBakedReflectionRays = 0;
+    float mBakedProbeDedupRadiusFt = 0.0f;
 
     /// Negative override → use these values at bake time.
     float mProbeSpacingFt = 5.0f;
