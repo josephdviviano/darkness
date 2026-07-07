@@ -119,6 +119,35 @@ constexpr float kPathingVisThreshold = 0.25f;
 /// scales up materially (rays = numSamples² × probe_pairs).
 constexpr float kPathingVisRadiusFt = 5.0f;
 
+/// Pathing visibility sampling count — the single source of truth for
+/// BOTH the bake (`IPLPathBakeParams::numSamples`, ProbeManager.cpp
+/// bakePathingBatch) and the runtime
+/// (`IPLSimulationSettings::numVisSamples`, AudioService.cpp pathing-
+/// simulator create). Steam Audio scatters numSamples points in each
+/// probe's kPathingVisRadiusFt sphere and traces numSamples² rays per
+/// probe pair, so this is a QUADRATIC bake-cost knob (16 → 256 rays/pair;
+/// 8 → 64). Bake and runtime MUST match: a runtime value differing from
+/// the bake silently re-rejects bake-accepted edges and pathing collapses
+/// to the 0.1f untouched-by-solver sentinel.
+///
+/// Two profiles, selected by the `--bake-quality dev` CLI flag
+/// (RenderConfig devBakeProfile → AudioService::setDevBakeProfile —
+/// one flag feeds both the bake and the runtime simulator so they can
+/// never diverge within a run):
+///   • Ship = 16 — the 2026-05-26 pathing-stabilization value (raised
+///     from 4 to damp stochastic edge flapping / wet-bus tremolo before
+///     the kPathingVisThreshold 0.1 → 0.25 hardening landed; the V1
+///     experiment re-examines whether the threshold alone suffices).
+///   • Dev  = 8  — 4× fewer rays per pair for iteration bakes.
+///
+/// CROSS-RUN mismatches (cache baked under one profile, run under the
+/// other) are caught by the .probes v3 header, which records the bake's
+/// numSamples (ProbeFile.h bakedPathingNumSamples). The loader compares
+/// it against the active profile constant and triggers a loud automatic
+/// pathing re-bake instead of running with a torn edge set.
+constexpr int kPathingVisSamplesShip = 16;
+constexpr int kPathingVisSamplesDev  = 8;
+
 /// Legacy helper: returns the fixed `kPathingVisRadiusFt × kFeetToMeters`
 /// regardless of its `spacingFt` argument. The argument is preserved
 /// only to minimize call-site churn; new code should reference

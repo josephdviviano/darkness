@@ -280,7 +280,7 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
             "\"min_wall_clearance_ft\":%.4f,\"elevation_sparsity_mul\":%.4f,"
             "\"global_dedup_radius_ft\":%.4f"
         "},"
-        "\"pathing_probes\":{\"enabled\":%s,\"dedup_radius_ft\":%.4f,\"force_bake\":%s},"
+        "\"pathing_probes\":{\"enabled\":%s,\"dedup_radius_ft\":%.4f,\"force_bake\":%s,\"dev_bake_profile\":%s},"
         "\"occlusion\":{"
             "\"radius\":%.4f,\"samples\":%d,"
             "\"transmission_scale\":%.4f,\"absorption_scale\":%.4f"
@@ -333,6 +333,7 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
         c.audioProbeGlobalDedupRadiusFt,
         c.audioPathingProbesEnabled ? "true" : "false", c.audioPathingDedupRadiusFt,
         c.forcePathingBake ? "true" : "false",
+        c.devBakeProfile ? "true" : "false",
         c.occlusionRadius, c.occlusionSamples,
         c.transmissionScale, c.absorptionScale,
         c.portalRouting ? "true" : "false", c.probePathing ? "true" : "false",
@@ -425,9 +426,10 @@ static void printHelp() {
         "                    paths.schemas; default: search next to RES.\n"
         "  --config <path>   YAML config path. Default: ./darknessRender.yaml.\n"
         "  --force-pathing-bake\n"
-        "                    Drop the existing .probes pathing section and re-bake\n"
-        "                    it fresh even when a valid pathing section is on disk.\n"
-        "                    Useful when iterating on pathing-bake parameters.\n"
+        "                    Re-bake the .probes pathing section even when a valid\n"
+        "                    one is on disk; the reflection IR section is carried\n"
+        "                    forward unchanged (pathing-only, fast). Useful when\n"
+        "                    iterating on pathing-bake parameters.\n"
         "                    See PLAN.AUDIO_PROFILING.md §4.3.\n"
         "  --set <p>=<v>     Generic YAML-path override (repeatable). Applied AFTER\n"
         "                    the YAML load and BEFORE audio init. Supports any\n"
@@ -478,11 +480,14 @@ static void printHelp() {
         "                    perf runs are dark without it.\n"
         "  --bake-quality dev|ship\n"
         "                    'dev' forces the fast iteration bake profile:\n"
-        "                    rays=4096 bounces=8 diffuse=256 (~32x cheaper per\n"
-        "                    probe) AND reduced probe density (global_dedup\n"
-        "                    12 ft, spacing 15 ft; ~4-6x fewer probes). Cached\n"
-        "                    .probes are DEV QUALITY/DENSITY — re-bake without\n"
-        "                    it for milestone reverb fidelity.\n"
+        "                    rays=2048 bounces=8 diffuse=256 (~64x cheaper per\n"
+        "                    probe), reduced probe density (global_dedup 18 ft,\n"
+        "                    spacing 20 ft), AND pathing visibility numSamples\n"
+        "                    16 -> 8 for both bake and runtime (recorded in the\n"
+        "                    .probes header; a profile/cache mismatch triggers\n"
+        "                    an automatic pathing-only re-bake). Cached .probes\n"
+        "                    are DEV QUALITY/DENSITY — re-bake without it for\n"
+        "                    milestone reverb fidelity.\n"
         "                    'ship' = respect yaml (no-op).\n"
         "  --audio-capture x,y,z\n"
         "                    Pin the listener at a fixed world point (Dark Engine\n"
@@ -5282,6 +5287,11 @@ int main(int argc, char *argv[]) {
         audioSvc->setBakeDiffuseSamples(cfg.bakeDiffuseSamples);
         audioSvc->setBakeAmbisonicsOrder(cfg.bakeAmbisonicsOrder);
         audioSvc->setForcePathingBake(cfg.forcePathingBake);
+        // Bake-quality profile — selects the pathing visibility sampling
+        // constant for BOTH bake and runtime (SteamAudioPathing.h). Must
+        // land before buildAcousticScene below: the runtime pathing
+        // simulator is created there with numVisSamples from this flag.
+        audioSvc->setDevBakeProfile(cfg.devBakeProfile);
 
         // -- audio.probes --
         // Bake-time grid parameters. Applied before the auto-bake on first
@@ -5433,18 +5443,42 @@ int main(int argc, char *argv[]) {
                 // loadProbes() succeeded against the existing .probes file
                 // BUT the user passed --force-pathing-bake — schedule a
                 // bake anyway so the pathing section is regenerated fresh.
-                // Every bake runs both pathing and reflections now; the
-                // prior --skip-reflection-bake escape hatch is gone.
+                // The loaded reflection IR section is carried forward
+                // unchanged (pathing-only re-bake; see ProbeBakeParams::
+                // reuseLoadedReflectionsBatch).
                 //
                 // Loud banner per feedback_no_silent_fallbacks — going
-                // from "load probes (instant)" to "load probes then bake
-                // for ~minutes" is a surprise without warning.
+                // from "load probes (instant)" to "load probes then bake"
+                // is a surprise without warning.
                 std::fprintf(stderr,
                     "[PATHING_BAKE_FORCE] --force-pathing-bake: existing .probes "
-                    "file '%s' loaded successfully, but the pathing AND\n"
-                    "                     reflection sections will be re-baked "
-                    "(multi-minute).\n",
+                    "file '%s' loaded successfully; the pathing section\n"
+                    "                     will be re-baked (reflection IRs "
+                    "carried forward unchanged).\n",
                     probePath.c_str());
+                state.probeBakePath = probePath;
+                state.probeBakeNeeded = true;
+            } else if (audioSvc->pathingBakeSamplesMismatch()) {
+                // ── [PATHING_BAKE_MISMATCH] automatic pathing re-bake ──
+                //
+                // The .probes v3 header records the numSamples the pathing
+                // section was baked with; it differs from the active
+                // profile's constant (e.g. a dev-profile cache loaded in a
+                // ship-profile run, or vice versa). Running like this
+                // silently re-rejects bake-accepted edges — pathing
+                // collapses toward the 0.1f sentinel — so re-bake the
+                // pathing section now, loudly, carrying the reflection IRs
+                // forward unchanged.
+                std::fprintf(stderr,
+                    "[PATHING_BAKE_MISMATCH] .probes '%s' pathing section "
+                    "was baked with numSamples=%d but the active profile "
+                    "uses %d (%s) — scheduling an automatic pathing-only "
+                    "re-bake (reflection IRs carried forward).\n",
+                    probePath.c_str(),
+                    audioSvc->getBakedPathingNumSamples(),
+                    audioSvc->activePathingVisSamples(),
+                    cfg.devBakeProfile ? "--bake-quality dev" : "ship");
+                audioSvc->setForcePathingBake(true);
                 state.probeBakePath = probePath;
                 state.probeBakeNeeded = true;
             }

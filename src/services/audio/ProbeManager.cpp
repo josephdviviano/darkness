@@ -1001,12 +1001,16 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     bakeParams.scene = scene;
     bakeParams.probeBatch = probeBatch;
     bakeParams.identifier = pathId;
-    // numSamples raised 4 → 16 on 2026-05-26 (pathing-stabilization
-    // experiment). Rays per probe-pair test = numSamples² = 256.
-    // Runtime numVisSamples in AudioService.cpp MUST match this; the
-    // pair is the single source of truth for the visibility test
-    // density. Re-bake required when changed.
-    bakeParams.numSamples = 16;                                         // rays = numSamples²
+    // Visibility sampling count. Single source of truth is the
+    // SteamAudioPathing.h profile constants (kPathingVisSamplesShip /
+    // kPathingVisSamplesDev, selected by --bake-quality dev);
+    // AudioService fills params.pathingNumSamples from the SAME
+    // selection that configures the runtime simulator's numVisSamples,
+    // so bake and runtime cannot diverge within a run. Cross-run
+    // divergence (cache baked under the other profile) is caught by
+    // the .probes v3 header record + the loader's mismatch re-bake.
+    // Rays per probe-pair test = numSamples².
+    bakeParams.numSamples = params.pathingNumSamples;
     // kPathingVisRadiusFt is shared with the runtime call in
     // AudioService.cpp loopStep — they MUST agree. (void)spacing here
     // because the visibility-sphere radius is intentionally decoupled
@@ -1018,8 +1022,11 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     // ── visRange / pathRange — bake-time graph budget ──────────────────
     //
     // visRange caps the maximum probe-to-probe distance at which the
-    // bake will even consider building a visibility edge
-    // (`ProbeVisibilityTester::areProbesTooFar`, path_visibility.cpp:95).
+    // bake will even consider building a visibility edge — pairs beyond
+    // it are culled BEFORE the numSamples² ray test
+    // (`ProbeVisibilityTester::areProbesTooFar`, path_visibility.cpp:95,
+    // called at the top of the pair loop, path_visibility.cpp:157), so
+    // this is the dominant bake-cost lever on sprawling missions.
     // pathRange caps the total length of multi-hop shortest paths
     // stored in the BakedPathData. Both are PROBE-TO-PROBE distances
     // across the visibility GRAPH, NOT per-voice audible distances.
@@ -1031,36 +1038,78 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     // apart had no edge in the baked graph at all, so a source and
     // listener separated by that distance got the 0.1f sentinel
     // forever even if a multi-hop path through nearer probes would
-    // have reached them. The per-voice cap belongs at runtime
-    // (`inputs.visRange` in AudioService.cpp) — at BAKE the graph
-    // should span the whole level.
+    // have reached them.
     //
-    // We derive the bake-time range from the scene AABB diagonal so
-    // the graph covers the entire level. Scaled by 1.5× to absorb
-    // probes that landed slightly outside the floor-grid AABB
-    // (portal probes flanking doors etc.) and clamped to a
-    // generous-but-finite ceiling so a stray sceneMax doesn't
-    // produce a meaningless multi-kilometer range. Matches Valve's
-    // Unity convention (`bakingVisibilityRange = 1000 m` default) of
-    // letting the solver walk the full graph; per-frame cost is
-    // controlled via `numVisSamples` and the per-source runtime
-    // `visRange`, NOT by truncating the bake graph.
+    // The lesson from that bug is about pathRange and about SILENCE,
+    // not about capping visRange: the two knobs are independent
+    // (verified in Steam Audio's source — visRange gates single EDGES,
+    // pathRange gates total ROUTE length), and the ray cost lives
+    // entirely on visRange. So they are now split:
+    //
+    //   • visRange = the SINGLE-EDGE cap, derived from the mission's
+    //     own ROOM_DB (params.pathingVisRangeFt: max intra-room
+    //     portal-to-portal span / room diameter × 1.5 margin, clamped
+    //     to [150, 400] ft — see AudioService::prepareProbeBakeParams).
+    //     The longest meaningful single hop is a room-scale distance:
+    //     any two probes further apart than the largest room either
+    //     have geometry between them (edge would fail the ray test
+    //     anyway — we're paying 256 rays to discover "no") or are
+    //     connected through intermediate room/portal probes (multi-hop
+    //     covers them). Runtime per-voice `inputs.visRange` is clamped
+    //     to this cap with a loud [FALLBACK] (AudioService loopStep),
+    //     so nothing exceeds the baked graph silently.
+    //
+    //     NOTE (upstream behaviour): the bake's range cull is
+    //     HORIZONTAL-ONLY. api_baking.cpp:110 forces
+    //     asymmetricVisRange=true with down=(0,-1,0) (IPL Y-up), and
+    //     areProbesTooFar then projects out the vertical component
+    //     before comparing against visRange. Fine for Thief footprints
+    //     (vertical spans ≪ room spans), but a cap derived from
+    //     horizontal room sizes must not be "optimized" down to
+    //     exclude tall shafts — it doesn't bound vertical distance at
+    //     all.
+    //
+    //   • pathRange = the MULTI-HOP total-route cap. Keeps the
+    //     generous whole-level value (scene AABB diagonal × 1.5,
+    //     ceiling 5000 ft ≈ 1500 m — Valve's Unity convention of a
+    //     route budget that never truncates) so long cross-mission
+    //     routes still exist as chains of room-scale edges. This is
+    //     the knob the documented truncation bug was really about;
+    //     it stays uncapped-by-room-size on purpose.
     const Vector3 sceneSpan = params.sceneMax - params.sceneMin;
     const float sceneDiagonalFt = std::sqrt(sceneSpan.x * sceneSpan.x
                                           + sceneSpan.y * sceneSpan.y
                                           + sceneSpan.z * sceneSpan.z);
     constexpr float kBakeRangeMarginMul = 1.5f;
     constexpr float kBakeRangeCeilingFt = 5000.0f;  // ~1500 m — Valve-ish ceiling
-    const float bakeRangeFt = std::min(
+    const float pathRangeFt = std::min(
         std::max(sceneDiagonalFt * kBakeRangeMarginMul,
                  params.propagationMaxDist * kBakeRangeMarginMul),
         kBakeRangeCeilingFt);
-    bakeParams.visRange  = bakeRangeFt * kFeetToMeters;
-    bakeParams.pathRange = bakeRangeFt * kFeetToMeters;
-    AUDIO_LOG("Pathing bake range: %.0f ft (sceneDiag=%.0f ft × %.1fx, "
-              "ceiling=%.0f ft) → visRange=pathRange=%.1f m\n",
-              bakeRangeFt, sceneDiagonalFt, kBakeRangeMarginMul,
-              kBakeRangeCeilingFt, bakeRangeFt * kFeetToMeters);
+    float visRangeFt = params.pathingVisRangeFt;
+    if (visRangeFt <= 0.0f) {
+        // No derived cap supplied (caller had no RoomService-derived
+        // span). Whole-level visRange is the safe-but-slow pre-cap
+        // behaviour; announce loudly because the bake is about to pay
+        // the full O(pairs) ray bill the cap exists to avoid.
+        std::fprintf(stderr,
+            "[FALLBACK] bakePathingBatch: no derived pathing visRange "
+            "cap supplied (pathingVisRangeFt=%.1f) — falling back to "
+            "whole-level range %.0f ft; bake will be SLOW\n",
+            params.pathingVisRangeFt, pathRangeFt);
+        visRangeFt = pathRangeFt;
+    }
+    bakeParams.visRange  = visRangeFt * kFeetToMeters;
+    bakeParams.pathRange = pathRangeFt * kFeetToMeters;
+    AUDIO_LOG("Pathing bake range: visRange=%.0f ft (%s) | pathRange="
+              "%.0f ft (sceneDiag=%.0f ft × %.1fx, ceiling=%.0f ft) | "
+              "numSamples=%d (%d rays/pair)\n",
+              visRangeFt,
+              (params.pathingVisRangeFt > 0.0f) ? "ROOM_DB-derived cap"
+                                                : "whole-level fallback",
+              pathRangeFt, sceneDiagonalFt, kBakeRangeMarginMul,
+              kBakeRangeCeilingFt, bakeParams.numSamples,
+              bakeParams.numSamples * bakeParams.numSamples);
     bakeParams.numThreads = 4;
 
     auto bakeStart = std::chrono::steady_clock::now();
@@ -1082,6 +1131,11 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     outEntry.probeCount         = numProbes;
     outEntry.hasReflectionsData = false;
     outEntry.hasPathingData     = true;
+    // Effective bake profile (post-fallback) — recorded into the .probes
+    // v3 header by bakeProbes so future loads can verify runtime/bake
+    // agreement.
+    outEntry.bakedVisRangeFt    = visRangeFt;
+    outEntry.bakedNumSamples    = bakeParams.numSamples;
     return true;
 }
 
@@ -1101,12 +1155,47 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     float spacing = (params.spacingFtOverride > 0.0f) ? params.spacingFtOverride : mProbeSpacingFt;
     float height  = (params.heightFtOverride  > 0.0f) ? params.heightFtOverride  : mProbeHeightFt;
 
-    // Bake the reflection batch. Every bake now runs the full pipeline —
-    // the prior "carry-forward existing reflection record" branch has
-    // been removed along with the --skip-reflection-bake CLI flag.
+    // Reflection section: fresh IR bake, or — for a pathing-only re-bake
+    // (params.reuseLoadedReflectionsBatch: --force-pathing-bake / the
+    // automatic v3 header-mismatch re-bake) — carry the CURRENTLY LOADED
+    // reflection batch forward into the output file unchanged. The
+    // reflection IR bake is the expensive half and nothing about it
+    // depends on the pathing profile, so re-serializing the loaded batch
+    // is exact. Precondition: a loaded batch with IR data; when absent
+    // we announce and fall back to the full bake rather than silently
+    // writing a reflection-less file.
+    bool carryForwardRefl = false;
+    if (params.reuseLoadedReflectionsBatch) {
+        if (mReflectionsBatch && mReflectionsBatch->iplBatch
+            && mReflectionsBatch->hasReflectionsData) {
+            carryForwardRefl = true;
+        } else {
+            std::fprintf(stderr,
+                "[FALLBACK] bakeProbes: pathing-only re-bake requested "
+                "but no loaded reflection batch with IR data is available "
+                "— running the FULL (multi-minute) reflection bake "
+                "instead\n");
+        }
+    }
+
     ProbeBatchEntry reflEntry;
-    if (!bakeReflectionBatch(scene, params, spacing, height,
-                             progress, outputPath, reflEntry)) {
+    if (carryForwardRefl) {
+        // Serialization is a read-only walk of the batch, but keep the
+        // same drain-the-workers discipline as every other access to a
+        // live (simulator-attached) batch.
+        if (mDeps.waitForReflectionThread) mDeps.waitForReflectionThread();
+        if (mDeps.waitForPathingThread)    mDeps.waitForPathingThread();
+        reflEntry.purpose            = ProbePurpose::Reflections;
+        reflEntry.iplBatch           = mReflectionsBatch->iplBatch; // BORROWED — released via mBatches, not here
+        reflEntry.probeCount         = mReflectionsBatch->probeCount;
+        reflEntry.hasReflectionsData = true;
+        reflEntry.positions          = mReflectionsBatch->positions;
+        reflEntry.radiiFt            = mReflectionsBatch->radiiFt;
+        AUDIO_LOG("bakeProbes: pathing-only re-bake — carrying forward "
+                  "the loaded reflection batch (%d probes) unchanged\n",
+                  reflEntry.probeCount);
+    } else if (!bakeReflectionBatch(scene, params, spacing, height,
+                                    progress, outputPath, reflEntry)) {
         return false;
     }
 
@@ -1119,14 +1208,21 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         if (bakePathingBatch(scene, params, spacing, progress, pathEntry)) {
             havePathing = true;
         } else {
-            AUDIO_LOG("[FALLBACK] pathing batch bake failed — file will "
-                      "contain reflection batch only; Steam Audio pathing "
-                      "disabled until re-bake\n");
+            // Unconditional stderr (not AUDIO_LOG): a reflection-only
+            // file also records pathing header fields = 0, so the
+            // numSamples mismatch re-bake never re-triggers for it —
+            // this line is the ONLY signal that pathing is permanently
+            // off until a manual re-bake. Per no-silent-fallbacks.
+            std::fprintf(stderr,
+                "[FALLBACK] pathing batch bake failed — file will "
+                "contain reflection batch only; Steam Audio pathing "
+                "disabled until a manual re-bake (debug console: "
+                "`bake_probes`)\n");
         }
     }
 
     // Serialize each batch with round-trip validation, build the
-    // ProbeBatchRecord list, write the v2 file.
+    // ProbeBatchRecord list, write the v3 file.
     std::vector<ProbeBatchRecord> records;
     records.reserve(2);
 
@@ -1143,46 +1239,87 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         return true;
     };
 
+    // Release helper that respects carry-forward: a borrowed reflection
+    // handle belongs to mBatches (released by the loader's
+    // releaseBatches on the post-bake reload), never here.
+    auto releaseOwned = [&]() {
+        if (reflEntry.iplBatch && !carryForwardRefl)
+            iplProbeBatchRelease(&reflEntry.iplBatch);
+        if (havePathing && pathEntry.iplBatch)
+            iplProbeBatchRelease(&pathEntry.iplBatch);
+    };
+
     if (!appendRecord(reflEntry, "reflections")) {
-        iplProbeBatchRelease(&reflEntry.iplBatch);
-        if (havePathing) iplProbeBatchRelease(&pathEntry.iplBatch);
+        releaseOwned();
         return false;
     }
     if (havePathing) {
         if (!appendRecord(pathEntry, "pathing")) {
-            if (reflEntry.iplBatch) iplProbeBatchRelease(&reflEntry.iplBatch);
-            iplProbeBatchRelease(&pathEntry.iplBatch);
+            releaseOwned();
             return false;
         }
     }
 
-    bool writeOk = writeProbeFile(outputPath, records);
+    // v3 header records the bake profile (pathing fields 0 when no
+    // pathing section) so future loads can verify the cache against the
+    // active profile. Reflection fields: on carry-forward the blob in
+    // the file is the LOADED one, so its recorded profile is preserved
+    // verbatim (mBakedReflection* still hold the loaded header's values
+    // here) — stamping the ACTIVE profile instead would launder a
+    // dev-tier reflection bake into ship credentials, which is exactly
+    // the silent-mismatch the header exists to prevent.
+    const float    hdrVisRangeFt = havePathing ? pathEntry.bakedVisRangeFt : 0.0f;
+    const uint32_t hdrNumSamples = havePathing
+        ? static_cast<uint32_t>(pathEntry.bakedNumSamples) : 0u;
+    const uint32_t hdrReflRays = carryForwardRefl
+        ? static_cast<uint32_t>(mBakedReflectionRays)
+        : static_cast<uint32_t>(params.bakeNumRays);
+    const float hdrReflDedupFt = carryForwardRefl
+        ? mBakedProbeDedupRadiusFt
+        : params.globalDedupRadiusFt;
+    bool writeOk = writeProbeFile(outputPath, records,
+                                  hdrVisRangeFt, hdrNumSamples,
+                                  hdrReflRays, hdrReflDedupFt);
 
     // Position sidecars (one per batch). Failure is non-fatal — overlay
     // just lacks positions until the next bake. Reflection batch carries
     // no per-probe radii (uniform spacing radius), so we pass an empty
-    // vector and the writer omits the radius column.
-    writePositionsSidecar(outputPath, ".reflections",
-                          reflEntry.positions, reflEntry.radiiFt,
-                          spacing, height);
+    // vector and the writer omits the radius column. On carry-forward
+    // the reflection sidecar on disk is already correct (and the loaded
+    // positions mirror may be empty if that sidecar was missing), so we
+    // leave it untouched.
+    if (!carryForwardRefl) {
+        writePositionsSidecar(outputPath, ".reflections",
+                              reflEntry.positions, reflEntry.radiiFt,
+                              spacing, height);
+    }
     if (havePathing) {
         writePositionsSidecar(outputPath, ".pathing",
                               pathEntry.positions, pathEntry.radiiFt,
                               spacing, height);
     }
 
-    // Bake done; release the batch handles. Disk is the source of truth
-    // from here — the loader builds fresh batches from the file. (We
-    // could keep these and skip the reload, but that would diverge the
-    // bake-time and load-time code paths and bypass the disk validation.)
-    if (reflEntry.iplBatch) iplProbeBatchRelease(&reflEntry.iplBatch);
-    if (havePathing) iplProbeBatchRelease(&pathEntry.iplBatch);
+    // Bake done; release the batch handles we own. Disk is the source of
+    // truth from here — the loader builds fresh batches from the file.
+    // (We could keep these and skip the reload, but that would diverge
+    // the bake-time and load-time code paths and bypass the disk
+    // validation.)
+    releaseOwned();
 
     if (!writeOk) {
         LOG_ERROR("ProbeManager: failed to write probe file '%s'",
                   outputPath.c_str());
         return false;
     }
+
+    // Mirror the just-written bake profile so the runtime guard /
+    // mismatch checks work immediately after a bake, before (or without)
+    // the post-bake reload. (For carry-forward the reflection values are
+    // unchanged by construction.)
+    mBakedPathingVisRangeFt = hdrVisRangeFt;
+    mBakedPathingNumSamples = static_cast<int>(hdrNumSamples);
+    mBakedReflectionRays    = static_cast<int>(hdrReflRays);
+    mBakedProbeDedupRadiusFt = hdrReflDedupFt;
 
     const int reflProbeCount = reflEntry.probeCount;
     AUDIO_LOG("Saved %d probes (refl=%d, pathing=%d) to '%s'\n",
@@ -1222,8 +1359,10 @@ bool ProbeManager::loadProbes(const std::string &probePath,
 
     if (status == ProbeFileStatus::UnsupportedVersion) {
         LOG_ERROR("ProbeManager: probe file '%s' is from a previous format "
-                  "version and cannot be migrated automatically. Delete it "
-                  "and re-bake (debug console: `bake_probes`).",
+                  "version (v3 added the pathing bake-profile record) and "
+                  "cannot be migrated automatically. Delete it and re-bake "
+                  "(debug console: `bake_probes`) — the startup flow will "
+                  "also auto-re-bake when no loadable file is present.",
                   probePath.c_str());
         return false;
     }
@@ -1319,6 +1458,15 @@ bool ProbeManager::loadProbes(const std::string &probePath,
             mPathingBatch = &entry;
         }
     }
+
+    // Record the bake profile from the v3 header. Consumers: the runtime
+    // per-voice visRange clamp, the AudioService-side numSamples mismatch
+    // check (getBakedPathing*), and the every-load reflection-profile
+    // warning (getBakedReflection*).
+    mBakedPathingVisRangeFt = hdr.bakedPathingVisRangeFt;
+    mBakedPathingNumSamples = static_cast<int>(hdr.bakedPathingNumSamples);
+    mBakedReflectionRays    = static_cast<int>(hdr.bakedReflectionRays);
+    mBakedProbeDedupRadiusFt = hdr.bakedProbeDedupRadiusFt;
 
     // Attach batches to the simulators that can actually consume them.
     //
@@ -1424,6 +1572,10 @@ void ProbeManager::releaseBatches(IPLSimulator reflectionSimulator,
     mReflectionsBatch = nullptr;
     mPathingBatch = nullptr;
     mTotalProbeCount = 0;
+    mBakedPathingVisRangeFt = 0.0f;
+    mBakedPathingNumSamples = 0;
+    mBakedReflectionRays = 0;
+    mBakedProbeDedupRadiusFt = 0.0f;
 
     // The adjacency was built against the now-released pathing batch.
     // Leaving it in place would surface stale edges over a new mission's

@@ -164,13 +164,24 @@ struct RenderConfig {
     float audioPathingDedupRadiusFt = 10.0f;
 
     // Force a fresh pathing bake even when the existing .probes file
-    // already contains a valid pathing section. Useful for iterating on
-    // pathing-bake parameters (e.g. dedup radius) without invalidating
-    // the rest of the .probes file's parametric data.
+    // already contains a valid pathing section. The loaded reflection IR
+    // section is carried forward unchanged (pathing-only re-bake), so
+    // this is fast — useful for iterating on pathing-bake parameters
+    // (e.g. dedup radius) without paying the reflection bake.
     //
     // Default false. No YAML key by design — this is a per-invocation
     // override. See PLAN.AUDIO_PROFILING.md §4.3.
     bool forcePathingBake = false;
+
+    // Bake-quality profile: true = `--bake-quality dev`. Besides the
+    // reflection-bake overrides applied directly in the CLI parser, this
+    // flag selects the pathing visibility sampling constant
+    // (SteamAudioPathing.h kPathingVisSamplesDev=8 vs Ship=16) for BOTH
+    // the bake and the runtime pathing simulator — one flag, both sides,
+    // so they cannot diverge within a run. Cross-run cache mismatches
+    // are caught against the .probes v3 header (automatic pathing-only
+    // re-bake). No YAML key by design — per-invocation profile.
+    bool devBakeProfile = false;
 
     // -- audio.occlusion: occlusion + material scaling --
     // (diffuseSamples / bakeDiffuseSamples moved to realtimeDiffuseSamples /
@@ -1676,17 +1687,26 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             }
         } else if (std::strcmp(argv[i], "--bake-quality") == 0 && i + 1 < argc) {
             // Bake-quality profile. "dev" forces the fast iteration bake
-            // (the code defaults: rays=4096 bounces=8 diffuse=256, ~32×
-            // cheaper per probe than the ship-quality yaml settings —
-            // MISS2's 2590-probe ship bake projected ~25 HOURS, dev ~45
-            // min). "ship" is a documented no-op: respect the yaml.
-            // Applied here because CLI parsing runs after the yaml load,
-            // so this deliberately overrides reflections.bake.* values.
+            // (rays=2048 bounces=8 diffuse=256, ~64× cheaper per probe
+            // than the ship-quality yaml settings — MISS2's 2590-probe
+            // ship bake projected ~25 HOURS). "ship" is a documented
+            // no-op: respect the yaml. Applied here because CLI parsing
+            // runs after the yaml load, so this deliberately overrides
+            // reflections.bake.* values.
             const char *q = argv[++i];
             if (std::strcmp(q, "dev") == 0) {
-                cfg.bakeNumRays        = 4096;
+                // Reflection rays halved 4096 → 2048 (2026-07: dev bakes
+                // must total < 10 min; reflection phase measured ~10 min
+                // at 4096 on MISS2's 626 dev probes, cost is linear in
+                // rays → ~5 min). Dev-tier IR fidelity is acceptable for
+                // iteration; ship bakes are untouched.
+                cfg.bakeNumRays        = 2048;
                 cfg.bakeNumBounces     = 8;
                 cfg.bakeDiffuseSamples = 256;
+                // Pathing visibility sampling drops to
+                // kPathingVisSamplesDev (8 → 64 rays/pair instead of
+                // 256) for BOTH bake and runtime — see devBakeProfile.
+                cfg.devBakeProfile     = true;
                 // Density reduction (user directive 2026-07-05: dev bakes
                 // must be < 10 min). FLOOR_POLY emits one candidate per
                 // BSP floor polygon regardless of spacing, so the GLOBAL
@@ -1700,14 +1720,15 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                 cfg.audioProbeGlobalDedupRadiusFt = 18.0f;
                 cfg.audioProbeSpacingFt           = 20.0f;
                 std::fprintf(stderr,
-                    "--bake-quality dev: bake rays=4096 bounces=8 "
-                    "diffuse=256 (~32x cheaper/probe than ship yaml) + "
+                    "--bake-quality dev: bake rays=2048 bounces=8 "
+                    "diffuse=256 (~64x cheaper/probe than ship yaml) + "
                     "probe density reduced (global_dedup 18 ft, spacing "
-                    "20 ft; measured on MISS2: 12 ft -> 1,247 probes "
-                    "~25 min, 18 ft targets ~400-500 probes < 10 min). "
-                    "Cached .probes from this bake are DEV QUALITY/"
-                    "DENSITY — re-bake without this flag for milestone/"
-                    "ship reverb fidelity.\n");
+                    "20 ft) + pathing numSamples 16 -> 8 (bake AND "
+                    "runtime; recorded in the .probes header). Cached "
+                    ".probes from this bake are DEV QUALITY/DENSITY — "
+                    "re-bake without this flag for milestone/ship "
+                    "fidelity (the header mismatch check will do it "
+                    "automatically, pathing-only).\n");
             } else if (std::strcmp(q, "ship") != 0) {
                 std::fprintf(stderr,
                     "[FALLBACK] --bake-quality: unknown profile '%s' "
