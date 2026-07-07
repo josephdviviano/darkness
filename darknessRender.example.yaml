@@ -281,6 +281,19 @@ audio:
     # invalidate baked paths at runtime; the dense reflection probe
     # grid above is still used for IR sampling.
     #
+    # CODE-OWNED (deliberately NOT yaml keys — do not re-add knobs for
+    # these; a yaml value could silently disagree with what the cache
+    # was baked with):
+    #   - pathing bake/runtime visibility test parameters
+    #     (SteamAudioPathing.h: kPathingVisThreshold, kPathingVisRadiusFt,
+    #     kPathingVisSamplesShip/Dev — ship/dev selected by the
+    #     --bake-quality CLI flag, recorded in the .probes v3 header,
+    #     mismatches trigger an automatic pathing-only re-bake);
+    #   - the bake's single-edge visRange cap (derived per mission from
+    #     ROOM_DB room/portal spans — see [PATHING_BAKE_RANGE] in the
+    #     bake log; runtime per-voice visRange is clamped to it with a
+    #     loud [FALLBACK]).
+    #
     # Set to false to skip baking the pathing batch entirely. The
     # .probes file then contains only the reflection batch and Steam
     # Audio pathing falls back to the synthetic-bypass branch (no

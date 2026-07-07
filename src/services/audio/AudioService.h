@@ -957,9 +957,42 @@ public:
      *  when loadProbes succeeded" decision lives in DarknessRender.cpp's
      *  probeBakeNeeded gate. The flag is queryable here so the bake
      *  decision site can read it from a single source of truth. Set from
-     *  `--force-pathing-bake` CLI flag; no YAML key (per-invocation). */
+     *  `--force-pathing-bake` CLI flag; no YAML key (per-invocation).
+     *  ONE-SHOT: consumed (and cleared) by the next bakeProbes() call —
+     *  see the mForcePathingBake member comment. */
     void setForcePathingBake(bool force) { mForcePathingBake = force; }
     bool getForcePathingBake() const { return mForcePathingBake; }
+
+    /** Bake-quality profile selector. True = the `--bake-quality dev`
+     *  iteration profile: pathing visibility sampling drops from
+     *  kPathingVisSamplesShip (16) to kPathingVisSamplesDev (8) — see
+     *  SteamAudioPathing.h. ONE flag feeds BOTH the bake
+     *  (ProbeBakeParams::pathingNumSamples) and the runtime pathing
+     *  simulator (IPLSimulationSettings::numVisSamples), so the two
+     *  can never diverge within a run. Must be set BEFORE
+     *  buildAcousticScene (the runtime simulator is created there).
+     *  No YAML key by design — per-invocation CLI profile. */
+    void setDevBakeProfile(bool dev) { mDevBakeProfile = dev; }
+    bool getDevBakeProfile() const { return mDevBakeProfile; }
+
+    /** The pathing visibility sampling count selected by the active
+     *  bake-quality profile (the single choice point both the bake and
+     *  the runtime simulator read). */
+    int activePathingVisSamples() const;
+
+    /** True when the loaded .probes pathing section was baked with a
+     *  numSamples that differs from the active profile's constant —
+     *  running like this silently re-rejects bake-accepted edges
+     *  (pathing collapses toward the 0.1f sentinel). The bake-decision
+     *  site (DarknessRender.cpp) checks this after loadProbes and
+     *  schedules an automatic pathing-only re-bake. False when no
+     *  pathing batch is loaded. */
+    bool pathingBakeSamplesMismatch() const;
+
+    /** Facade over ProbeManager::getBakedPathingNumSamples — the
+     *  numSamples recorded in the loaded/just-baked .probes v3 header
+     *  (0 = none). For mismatch diagnostics at the bake-decision site. */
+    int getBakedPathingNumSamples() const;
 
     /** Snapshot of probe positions in feet (engine units). Populated by
      *  bakeProbes() and loadProbes(); empty if no probes are loaded. Used
@@ -1816,13 +1849,40 @@ private:
     /// Force-pathing-bake flag. When true, the renderer's bake-decision
     /// site (DarknessRender.cpp probeBakeNeeded gate) schedules a
     /// bakeProbes() call even when loadProbes already succeeded against
-    /// an existing .probes file with a valid pathing section. The bake
-    /// itself uses the standard ProbeBakeParams plumbing — both
-    /// bakePathingBatch and bakeReflectionBatch are always true now that
-    /// reflection-bake skipping has been removed. See setForcePathingBake()
-    /// for the full rationale. Default false. Set from `--force-pathing-bake`
-    /// CLI only — no YAML key, per-invocation flag.
+    /// an existing .probes file with a valid pathing section, and
+    /// prepareProbeBakeParams marks the bake as PATHING-ONLY
+    /// (ProbeBakeParams::reuseLoadedReflectionsBatch — the loaded
+    /// reflection IR section is carried forward unchanged instead of
+    /// re-baked; ProbeManager falls back loudly to a full bake when no
+    /// loaded reflection batch is available). See setForcePathingBake()
+    /// for the rationale. Default false. Set from the
+    /// `--force-pathing-bake` CLI flag or by the automatic .probes v3
+    /// header numSamples-mismatch re-bake — no YAML key, per-invocation.
+    ///
+    /// ONE-SHOT: bakeProbes() clears it after consuming it into the
+    /// ProbeBakeParams, so only the bake it was armed for is
+    /// pathing-only — a later console `bake_probes` (e.g. after tuning
+    /// probe_spacing, which exists to regenerate the reflection grid)
+    /// runs the full pipeline as the user expects.
     bool               mForcePathingBake = false;
+
+    /// Bake-quality profile (see setDevBakeProfile). Selects the pathing
+    /// visibility sampling constant for BOTH bake and runtime via
+    /// activePathingVisSamples(). Default false = ship profile.
+    bool               mDevBakeProfile = false;
+
+    /// ROOM_DB-derived pathing bake visRange cap (engine feet), stored
+    /// by prepareProbeBakeParams when it derives the cap. Used as the
+    /// runtime guard's fallback when no baked header value is available
+    /// yet (fresh bake before the post-bake reload). 0 = not derived.
+    float              mDerivedPathingVisRangeFt = 0.0f;
+
+    /// Rate limiter for the runtime visRange-clamp [FALLBACK] log
+    /// (loopStep can trip it for many voices per frame). Seconds of
+    /// accumulated loop time since the last emitted line + count of
+    /// suppressed clamps in between.
+    float              mVisRangeClampLogCooldown = 0.0f;
+    int                mVisRangeClampSuppressed  = 0;
 
     // Volumetric occlusion sphere radius + sample count moved to
     // AudioOcclusion (mAudioOcclusion). The setters/getters above are

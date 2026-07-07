@@ -4489,10 +4489,13 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         // PATHING owns the probe-graph baked path lookup that feeds the
         // per-voice eqCoeffs gain + LPF for cross-room audio. The probe
         // batch attaches to this simulator (not the direct one) — see
-        // loadProbes. numVisSamples = 4 matches Steam Audio's Unity bake
-        // convention (16 rays per validation test); the runtime stays
-        // symmetric with the bake to avoid sentinel reads from edge-set
-        // mismatches.
+        // loadProbes. numVisSamples comes from the active bake-quality
+        // profile (SteamAudioPathing.h kPathingVisSamplesShip/Dev via
+        // activePathingVisSamples()) — the SAME selection the bake
+        // reads, so runtime and bake stay symmetric and edge-set
+        // mismatches (which collapse pathing to the 0.1f sentinel)
+        // cannot happen within a run. Cross-run cache mismatches are
+        // caught against the .probes v3 header at load.
         {
             IPLSimulationSettings pathingSettings{};
             pathingSettings.flags = IPL_SIMULATIONFLAGS_PATHING;
@@ -4510,17 +4513,13 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             // ambisonics_order>0.
             pathingSettings.maxOrder = mAmbisonicsOrder;
             // Probe-to-probe visibility sampling count for pathing edge
-            // validation. Was 4 (Unity convention, 16 rays per edge);
-            // raised to 16 (256 rays per edge) on 2026-05-26 as part
-            // of the pathing-stabilization experiment. The wet-bus
-            // tremolo on long-lived ambients (m06winged*) is consistent
-            // with stochastic visibility decisions flipping edges
-            // valid/invalid between solver cycles; quadrupling the
-            // sample count averages each decision over 16× more rays.
-            // MUST match the bake-side ProbeManager.cpp:bakePathingBatch
-            // numSamples — runtime/bake mismatch silently rejects bake-
-            // accepted edges and collapses pathing to sentinel.
-            pathingSettings.numVisSamples = 16;
+            // validation. MUST match the bake-side numSamples
+            // (ProbeManager.cpp bakePathingBatch) — runtime/bake mismatch
+            // silently rejects bake-accepted edges and collapses pathing
+            // to the sentinel. Both sides read the same profile
+            // selection; the constants + history (4 → 16 stabilization
+            // experiment, dev=8 profile) live in SteamAudioPathing.h.
+            pathingSettings.numVisSamples = activePathingVisSamples();
             // Worker thread already runs at UTILITY QoS; internal Steam
             // Audio worker threads spawned for ray-traces will inherit
             // that QoS. Match the reflection-sim choice for now.
@@ -5711,6 +5710,11 @@ void AudioService::loopStep(float deltaTime)
         mPathingDueThisStep = (mPathingAccumSec >= mPathingUpdateInterval);
         if (mPathingDueThisStep) mPathingAccumSec = 0.0f;
     }
+
+    // Cool down the per-voice visRange-clamp [FALLBACK] rate limiter
+    // (see the pathing-input staging loop below).
+    if (mVisRangeClampLogCooldown > 0.0f)
+        mVisRangeClampLogCooldown -= deltaTime;
 
     // ── [DOOR_XFORM_TICK] snapshot + publish for [OCCL_TICK] ──
     // Snapshot the global setDoorTransform counter and compute the delta
@@ -8018,24 +8022,28 @@ void AudioService::loopStep(float deltaTime)
                     // edges that were never baked, returning false-
                     // negatives that look like graph holes.
                     //
-                    // Runtime uses `mPropagationMaxDist` (the per-voice
-                    // audible cap from YAML `propagation.max_distance`,
-                    // default 200 ft). Bake-time uses the scene
-                    // diagonal × 1.5 (ProbeManager.cpp::bakePathingBatch)
-                    // so the graph spans the whole level regardless of
-                    // any voice's audible range. With the typical
-                    // mission this means runtime visRange ≪ bake
-                    // visRange — exactly the relationship Steam Audio
-                    // expects (bake = upper bound, runtime = per-source
-                    // budget).
+                    // The runtime value is per-voice: the original
+                    // engine's SFX_MaxDist formula below (~91 ft default,
+                    // 200-300 ft for the loudest schemas). The bake-time
+                    // value is the ROOM_DB-derived single-edge cap
+                    // (max room span × 1.5, clamped [150, 400] ft —
+                    // ProbeManager.cpp::bakePathingBatch; recorded in the
+                    // .probes v3 header). Because loud schemas can
+                    // legitimately request MORE than the baked cap, the
+                    // "runtime ≤ bake" invariant is enforced by the
+                    // explicit clamp a few lines down — with a loud,
+                    // rate-limited [FALLBACK] naming the schema — rather
+                    // than assumed from magnitudes. Multi-hop routes
+                    // longer than a single edge remain available via the
+                    // bake's whole-level pathRange.
                     //
                     // Past sessions thought bake and runtime had to
                     // match exactly. They don't — bake just needs to be
-                    // ≥ runtime. Tying both to mPropagationMaxDist
-                    // silently truncated the graph at 200 ft, breaking
-                    // pathing for any source-listener pair farther than
-                    // that even when a shorter multi-hop probe route
-                    // existed.
+                    // ≥ runtime (hence the clamp). Tying the BAKE range
+                    // to mPropagationMaxDist silently truncated the graph
+                    // at 200 ft, breaking pathing for any source-listener
+                    // pair farther than that even when a shorter
+                    // multi-hop probe route existed.
                     //
                     // Per-voice pathing-solver scope, derived from the
                     // original Dark Engine's SFX_MaxDist formula:
@@ -8079,6 +8087,42 @@ void AudioService::loopStep(float deltaTime)
                     if (maxPathingDistFt < 1.0f) {
                         maxPathingDistFt = 1.0f;
                     }
+                    // Clamp to the baked graph's single-edge visRange cap
+                    // (.probes v3 header; derivation-formula fallback for
+                    // a fresh bake that hasn't reloaded yet). Edges longer
+                    // than the cap were never baked, so a larger per-voice
+                    // visRange buys nothing — multi-hop routing through
+                    // room/portal probes covers long routes (pathRange is
+                    // whole-level). Loud [FALLBACK] naming the schema,
+                    // rate-limited: loud-schema voices (high gainCB) can
+                    // legitimately request more every frame.
+                    {
+                        float bakedCapFt = mProbeManager
+                            ? mProbeManager->getBakedPathingVisRangeFt()
+                            : 0.0f;
+                        if (bakedCapFt <= 0.0f)
+                            bakedCapFt = mDerivedPathingVisRangeFt;
+                        if (bakedCapFt > 0.0f
+                            && maxPathingDistFt > bakedCapFt) {
+                            if (mVisRangeClampLogCooldown <= 0.0f) {
+                                std::fprintf(stderr,
+                                    "[FALLBACK] pathing visRange clamp: "
+                                    "schema '%s' requests %.0f ft > baked "
+                                    "single-edge cap %.0f ft — clamped "
+                                    "(multi-hop covers longer routes; %d "
+                                    "similar clamps suppressed since last "
+                                    "report)\n",
+                                    voice->schemaName.c_str(),
+                                    maxPathingDistFt, bakedCapFt,
+                                    mVisRangeClampSuppressed);
+                                mVisRangeClampLogCooldown = 5.0f;
+                                mVisRangeClampSuppressed  = 0;
+                            } else {
+                                ++mVisRangeClampSuppressed;
+                            }
+                            maxPathingDistFt = bakedCapFt;
+                        }
+                    }
                     inputs.visRange = maxPathingDistFt * kFeetToMeters;
                     // pathingOrder MUST equal the path effect's create-time
                     // maxOrder (= mAmbisonicsOrder). The solver writes
@@ -8108,19 +8152,17 @@ void AudioService::loopStep(float deltaTime)
                     // somewhere along the way.
                     //
                     // Cost was the reason this was OFF earlier (boot-time
-                    // main-thread freeze). Two changes reduce it to
-                    // acceptable now:
-                    //   • numVisSamples dropped from 16 to 4 in the
-                    //     direct-sim settings — 16× fewer rays per
-                    //     candidate edge during alternate-path search.
-                    //   • numVisSamples = 4 matches Steam Audio's
-                    //     Unity bake convention, so runtime and bake
-                    //     stay aligned.
-                    //
-                    // If [PATHING_SLOW] returns and blocks the main
-                    // thread, the next move is PLAN.PATHING_WORKER.md —
-                    // run the solver on a background thread so any
-                    // per-call cost becomes acceptable.
+                    // main-thread freeze). It is acceptable now because:
+                    //   • the solver runs on PathingSimulator's worker
+                    //     thread, off the main loop;
+                    //   • numVisSamples comes from the shared profile
+                    //     constants (SteamAudioPathing.h — ship 16 /
+                    //     dev 8), identical at bake and runtime, so the
+                    //     alternate-path search never re-tests edges
+                    //     against a different density than they were
+                    //     baked with;
+                    //   • the visRange clamp above keeps the candidate
+                    //     edge set room-scale.
                     inputs.findAlternatePaths = IPL_TRUE;
                 }
 
@@ -12744,8 +12786,13 @@ void AudioService::rebuildPathingAdjacency()
     }
 
     // PARTIAL match with bake-time visibility test. The `visRange`
-    // distance gate matches `ProbeManager::bakePathingBatch` exactly
-    // (scene-derived ×1.5 of the AABB diagonal, capped at 5000 ft).
+    // distance gate mirrors what the loaded/just-baked pathing section
+    // was actually built with (the ROOM_DB-derived single-edge cap
+    // recorded in the .probes v3 header — see
+    // ProbeManager::bakePathingBatch) so [ADJACENCY_BUILD] edge counts
+    // track the real graph. Fallbacks: the derivation value when the
+    // header hasn't been (re)loaded yet, then the legacy whole-level
+    // range for pre-cap data.
     //
     // The visibility test itself does NOT match: Steam Audio's
     // `iplPathBakerBake` runs `numSamples²` rays per probe pair through
@@ -12757,22 +12804,34 @@ void AudioService::rebuildPathingAdjacency()
     // reproduction. Expect occasional false-positive edges (thin walls
     // between probe centers that Steam Audio would have caught with
     // sphere sampling) and false-negative edges (tight clearances
-    // around centers that Steam Audio averages out).
+    // around centers that Steam Audio averages out). A second, smaller
+    // divergence: the bake's range cull is horizontal-only (upstream
+    // forces asymmetricVisRange — see the bakePathingBatch comment)
+    // while this build compares full 3D distance; at room-scale caps
+    // the difference only shows on tall-shaft pairs.
     //
-    // `kNumVisSamples` is passed for documentation only — the adjacency
-    // builder currently ignores it. Increasing it to do real
-    // sphere-sample raycasts would multiply the O(N²) cost by ~16×
-    // (numSamples²) — feasible for debug if needed later.
-    const Vector3 span = mSceneMax - mSceneMin;
-    const float diag = std::sqrt(span.x*span.x + span.y*span.y + span.z*span.z);
-    constexpr float kMargin   = 1.5f;
-    constexpr float kCeilFt   = 5000.0f;
-    const float visRangeFt = std::min(
-        std::max(diag * kMargin, mPropagationMaxDist * kMargin),
-        kCeilFt);
-    constexpr int kNumVisSamples = 4;  // doc only — see comment above
+    // numVisSamples is passed for documentation only — the adjacency
+    // builder currently ignores it (one center ray regardless). We pass
+    // the ACTIVE profile constant rather than a literal so diagnostics
+    // reading PathingAdjacency::numVisSamples see the real bake density
+    // (a stale hardcoded 4 here previously suggested the bake used 4).
+    float visRangeFt = mProbeManager->getBakedPathingVisRangeFt();
+    if (visRangeFt <= 0.0f) visRangeFt = mDerivedPathingVisRangeFt;
+    if (visRangeFt <= 0.0f) {
+        // Pre-v3 in-memory data (no recorded cap). Legacy whole-level
+        // range keeps the overlay usable.
+        const Vector3 span = mSceneMax - mSceneMin;
+        const float diag = std::sqrt(span.x*span.x + span.y*span.y
+                                     + span.z*span.z);
+        constexpr float kMargin = 1.5f;
+        constexpr float kCeilFt = 5000.0f;
+        visRangeFt = std::min(
+            std::max(diag * kMargin, mPropagationMaxDist * kMargin),
+            kCeilFt);
+    }
 
-    mProbeManager->buildPathingAdjacency(visRangeFt, kNumVisSamples, ray);
+    mProbeManager->buildPathingAdjacency(visRangeFt,
+                                         activePathingVisSamples(), ray);
 }
 
 std::vector<AudioService::PathingEdgeViz>
@@ -12948,9 +13007,20 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     params.additionalElevations  = mProbeElevations;
     params.elevationSparsityMul  = mProbeElevationSparsityMul;
     params.globalDedupRadiusFt   = mProbeGlobalDedupRadiusFt;
+    // Pathing bake profile: sampling density from the active
+    // bake-quality profile — the SAME selection the runtime pathing
+    // simulator was created with, so bake and runtime cannot diverge
+    // within a run (SteamAudioPathing.h owns the constants).
+    params.pathingNumSamples     = activePathingVisSamples();
+    // Forced pathing re-bake (--force-pathing-bake / the automatic v3
+    // header-mismatch re-bake) carries the loaded reflection IR section
+    // forward unchanged — only the pathing section is re-baked.
+    // ProbeManager falls back loudly to a full bake when no loaded
+    // reflection batch is available.
+    params.reuseLoadedReflectionsBatch = mForcePathingBake;
     // Reflection-bake skipping has been removed; every bake runs the
-    // full pathing + reflection pipeline. ProbeBakeParams no longer
-    // carries a `bakeReflectionBatch` field.
+    // full pathing + reflection pipeline unless a forced pathing-only
+    // re-bake carries the reflection section forward (above).
 
     // (Per-portal probe densification for the reflection batch was
     // removed when pathing moved to its own sparse ROOM_PORTAL batch
@@ -12987,6 +13057,99 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     //     gets dropped rather than the other way around.
     if (mProbePathingBatchEnabled && mRoomService) {
         const auto &rooms = mRoomService->getAllRooms();
+
+        // ── Bake-time single-edge visRange cap, derived from ROOM_DB ──
+        //
+        // The pathing bake's visRange caps how far apart two probes may
+        // be and still get a visibility edge; pairs beyond it are culled
+        // BEFORE the numSamples² ray test, making this the dominant
+        // bake-cost lever on sprawling missions (see the
+        // visRange/pathRange comment in ProbeManager::bakePathingBatch
+        // for the full split rationale + the horizontal-only-cull
+        // upstream note). The longest meaningful single hop is a
+        // room-scale distance: probes live at room centroids, portals,
+        // doors and emitters, so any pair further apart than the
+        // mission's largest room either has geometry between it (the
+        // ray test would reject the edge anyway — pure wasted rays) or
+        // is served by multi-hop routes through intermediate probes
+        // (pathRange stays whole-level).
+        //
+        // maxRoomSpanFt = max over rooms of:
+        //   • the largest intra-room portal-to-portal distance — the
+        //     original engine's own precomputed hop tables
+        //     (Room::getPortalDist), its hand-authored answer to "how
+        //     far apart can two openings of one room be";
+        //   • the room's OBB diagonal from its bounding planes (covers
+        //     rooms with 0–1 portals, whose portal table contributes
+        //     nothing).
+        // × 1.5 margin (probes sit off the graph anchors: door pairs
+        // ±5 ft along the normal, ear-height offsets, emitter jitter),
+        // clamped to [150, 400] ft — the floor keeps small missions
+        // from starving the graph, the ceiling keeps one cathedral-
+        // sized outlier room from re-inflating the whole bake.
+        // Derived HERE (not in ProbeManager) because rooms + portals
+        // are already iterated in this function and ProbeManager must
+        // not depend on RoomService.
+        {
+            float maxPortalSpanFt = 0.0f;
+            float maxRoomDiagFt   = 0.0f;
+            for (const auto &roomPtr : rooms) {
+                if (!roomPtr) continue;
+                const uint32_t pc = roomPtr->getPortalCount();
+                for (uint32_t i = 0; i < pc; ++i)
+                    for (uint32_t j = i + 1; j < pc; ++j)
+                        maxPortalSpanFt = std::max(
+                            maxPortalSpanFt, roomPtr->getPortalDist(i, j));
+                // OBB diagonal: pair antiparallel bounding planes and
+                // accumulate each axis extent (plane normals face
+                // inward, so center-to-plane distances are positive and
+                // opposite planes' distances sum to the extent).
+                const Plane  *planes = roomPtr->getBoundingPlanes();
+                const Vector3 rc     = roomPtr->getCenter();
+                float sumSq = 0.0f;
+                bool paired[6] = {};
+                for (int a = 0; a < 6; ++a) {
+                    if (paired[a]) continue;
+                    for (int b = a + 1; b < 6; ++b) {
+                        if (paired[b]) continue;
+                        if (glm::dot(planes[a].normal, planes[b].normal)
+                            < -0.9f) {
+                            const float extent = planes[a].getDistance(rc)
+                                               + planes[b].getDistance(rc);
+                            if (extent > 0.0f) sumSq += extent * extent;
+                            paired[a] = paired[b] = true;
+                            break;
+                        }
+                    }
+                }
+                if (sumSq > 0.0f)
+                    maxRoomDiagFt = std::max(maxRoomDiagFt,
+                                             std::sqrt(sumSq));
+            }
+            const float maxRoomSpanFt = std::max(maxPortalSpanFt,
+                                                 maxRoomDiagFt);
+            constexpr float kVisRangeMarginMul = 1.5f;
+            constexpr float kVisRangeMinFt     = 150.0f;
+            constexpr float kVisRangeMaxFt     = 400.0f;
+            const float visRangeFt = std::min(
+                std::max(maxRoomSpanFt * kVisRangeMarginMul,
+                         kVisRangeMinFt),
+                kVisRangeMaxFt);
+            params.pathingVisRangeFt  = visRangeFt;
+            mDerivedPathingVisRangeFt = visRangeFt;
+            // Loud + unconditional: the entire pathing bake-cost story
+            // hangs off this one number, and a surprising derivation
+            // (cathedral room, empty portal tables) must be visible in
+            // every bake log.
+            std::fprintf(stderr,
+                "[PATHING_BAKE_RANGE] derived single-edge visRange cap "
+                "%.0f ft (maxRoomSpan=%.0f ft [portal-to-portal %.0f, "
+                "room-diag %.0f] x %.1f margin, clamp [%.0f, %.0f]); "
+                "pathRange stays whole-level\n",
+                visRangeFt, maxRoomSpanFt, maxPortalSpanFt, maxRoomDiagFt,
+                kVisRangeMarginMul, kVisRangeMinFt, kVisRangeMaxFt);
+        }
+
         int roomCount      = 0;
         int roomSnapped    = 0;
         int portalCount    = 0;
@@ -14006,6 +14169,30 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
 }
 
 //------------------------------------------------------
+int AudioService::activePathingVisSamples() const
+{
+    // Single choice point for the pathing visibility sampling density —
+    // consumed by the runtime simulator create (numVisSamples), the bake
+    // (ProbeBakeParams::pathingNumSamples) and the loaded-cache mismatch
+    // check below. Constants + rationale live in SteamAudioPathing.h.
+    return mDevBakeProfile ? kPathingVisSamplesDev : kPathingVisSamplesShip;
+}
+
+//------------------------------------------------------
+bool AudioService::pathingBakeSamplesMismatch() const
+{
+    if (!mProbeManager || !mProbeManager->hasPathing()) return false;
+    return mProbeManager->getBakedPathingNumSamples()
+        != activePathingVisSamples();
+}
+
+//------------------------------------------------------
+int AudioService::getBakedPathingNumSamples() const
+{
+    return mProbeManager ? mProbeManager->getBakedPathingNumSamples() : 0;
+}
+
+//------------------------------------------------------
 bool AudioService::bakeProbes(const std::string &outputPath,
                               std::atomic<float> *progress,
                               float spacing, float height)
@@ -14017,6 +14204,17 @@ bool AudioService::bakeProbes(const std::string &outputPath,
 
     ProbeBakeParams params;
     prepareProbeBakeParams(params, /*planCounters*/ nullptr, spacing, height);
+
+    // mForcePathingBake is ONE-SHOT: it has now been consumed into
+    // params.reuseLoadedReflectionsBatch for THIS bake, so clear it
+    // before baking. Leaving it sticky would silently convert every
+    // later bake — e.g. a console `bake_probes` after tuning
+    // probe_spacing, whose whole point is regenerating the reflection
+    // grid — into a pathing-only re-bake that carries the old
+    // reflection grid forward. (computeProbePlan's dry-run calls
+    // prepareProbeBakeParams without consuming the flag, so a plan
+    // preview between scheduling and baking doesn't eat it.)
+    mForcePathingBake = false;
 
     bool ok = mProbeManager->bakeProbes(mIplScene, outputPath, params, progress);
     if (ok) {
@@ -14106,6 +14304,34 @@ bool AudioService::loadProbes(const std::string &probePath)
                   "reflection batch (%zu probes) on reflection+pathing sims\n",
                   mProbeManager->getPathingProbePositions().size(),
                   mProbeManager->getProbePositions().size());
+    }
+    // ── Reflection bake-profile check (every load, UNCONDITIONAL) ──
+    //
+    // The .probes v3 header records the reflection section's rays +
+    // probe-density dedup radius. Unlike the pathing numSamples mismatch
+    // (which breaks correctness and auto-re-bakes pathing-only), a
+    // reflection-profile mismatch only degrades reverb FIDELITY — and a
+    // full reflection re-bake is the expensive half — so the policy is
+    // warn-don't-rebake. The warning is plain stderr, NOT AUDIO_LOG:
+    // per no-silent-fallbacks it must fire on every load, including the
+    // pathing-only re-bake reload that would otherwise launder a
+    // dev-tier reflection bake into a silently-consumed ship cache.
+    {
+        const int   bakedRays    = mProbeManager->getBakedReflectionRays();
+        const float bakedDedupFt = mProbeManager->getBakedProbeDedupRadiusFt();
+        const bool raysMismatch  = (bakedRays > 0 && bakedRays != mBakeNumRays);
+        const bool dedupMismatch = (bakedRays > 0
+            && bakedDedupFt != mProbeGlobalDedupRadiusFt);
+        if (raysMismatch || dedupMismatch) {
+            std::fprintf(stderr,
+                "[FALLBACK] .probes reflection data was baked with a "
+                "different quality profile (baked rays=%d, active rays=%d; "
+                "baked dedup=%.1f ft, active dedup=%.1f ft) — reverb "
+                "fidelity may be dev-tier; re-bake without "
+                "--bake-quality dev for ship quality\n",
+                bakedRays, mBakeNumRays,
+                bakedDedupFt, mProbeGlobalDedupRadiusFt);
+        }
     }
     // Classify reachability so the debug overlay can preview which
     // probes the bake-time filter would now reject. With the filter
