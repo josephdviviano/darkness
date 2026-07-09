@@ -6824,11 +6824,23 @@ void AudioService::loopStep(float deltaTime)
                     iplSourceGetOutputs(voice->reflectionSource,
                         IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
                 }
-            } else {
+            } else if (!voice->dspNode.reflectionEffect) {
                 isReflectionPending = !sharedReverbReady;
                 if (mReflectionsEnabled && sharedReverbReady) {
                     outputs.reflections = sharedReverbOutputs.reflections;
                 }
+            } else {
+                // Null source but the voice OWNS a per-voice reflection
+                // effect: a realtime-mode voice whose source was demoted
+                // (demoteVoice nulls reflectionSource). Routing it to the
+                // shared outputs would make its per-voice effect a SECOND
+                // consumer of the shared IR — the single-consumer contract
+                // violation this change exists to prevent — and would
+                // re-activate a phantom tail the demote just silenced.
+                // Old pending semantics instead: no outputs → enableRefl
+                // stays false → the voice deactivates (END_NOTAIL),
+                // matching pre-bus behavior.
+                isReflectionPending = true;
             }
 
             // ── Per-frame portal-eq scalar seed ──
