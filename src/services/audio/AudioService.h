@@ -79,6 +79,8 @@ struct _IPLProbeBatch_t;
 typedef _IPLProbeBatch_t* IPLProbeBatch;
 struct _IPLPathEffect_t;
 typedef _IPLPathEffect_t* IPLPathEffect;
+struct _IPLReflectionEffect_t;
+typedef _IPLReflectionEffect_t* IPLReflectionEffect;
 
 // Forward declarations for the reflection-sim / convolution-pool subsystems
 // (defined in ReflectionSimulator.h / ConvolutionWorkerPool.h respectively —
@@ -1688,6 +1690,46 @@ private:
     /// demote hysteresis and the Stage 2.2 demote fallback. See
     /// ReflectionSimulator.h for the full threading contract.
     std::unique_ptr<ReflectionSimulator> mReflectionSim;
+
+    /// Shared baked-reverb source (PLAN.AUDIO_PERF PR C / T2). With
+    /// `reverb_voices_realtime: 0` every voice's reflection result is the
+    /// LISTENER-centric baked REVERB lookup — byte-identical inputs and
+    /// outputs across voices (per-voice wet level lives in our DSP chain;
+    /// SA reverbScale is 1.0). Steam Audio 4.7.0 has no internal dedup of
+    /// identical baked identifiers, so per-voice sources paid one full IR
+    /// reconstruction EACH per sim iteration (~30 ms × active voices ≈
+    /// 411 ms p50 on the MISS6 tour). This single scene-lifetime source
+    /// carries the REFLECTIONS simulation instead; baked voices read its
+    /// outputs in loopStep. Created in buildAcousticScene (worker idle —
+    /// immediate add), removed+released in destroyAcousticScene after the
+    /// destroyReflectionPipeline drain. NOT owned by any voice.
+    IPLSource mSharedReverbSource = nullptr;
+
+    /// mReflectionSim->completedCycles() captured when the shared source
+    /// was added — same pin-gate contract as per-voice
+    /// ActiveVoice::reflectionSimCycleAtAdd (outputs are the zero-IR
+    /// sentinel until one full sim cycle has completed after the add).
+    uint64_t mSharedReverbCycleAtAdd = 0;
+
+    /// Loud-fallback flag: shared-source creation failed at scene build
+    /// ([FALLBACK] on stderr), so createVoiceSource reverts to the
+    /// legacy eager per-voice reflection sources (correct but slow) for
+    /// this scene rather than silently losing all reverb.
+    bool mSharedReverbSourceFailed = false;
+
+    /// Reverb wet-bus reflection effect (PR C part 2). In baked-only mode
+    /// the shared source's IR must have exactly ONE consuming effect —
+    /// Steam Audio's IR handoff supports a single consuming effect, so
+    /// per-voice effects reading the shared IR corrupted each other. This
+    /// single HYBRID effect convolves the SUMMED reflection sends of all
+    /// bus voices (accumulated in ConvolutionWorker::busAccumMono; see
+    /// that struct's bus-field doc for the full design). Created in
+    /// initReflectionPipeline right after the convolution pool spins up;
+    /// released in destroyReflectionPipeline AFTER the pool shutdown
+    /// joins the sub-worker threads (a worker could otherwise be inside
+    /// the apply on this handle) and BEFORE destroyAcousticScene removes
+    /// the shared source whose IR this effect consumes.
+    IPLReflectionEffect mBusReflectionEffect = nullptr;
 
     /// Direct-path simulation owner (distance attenuation, occlusion, air
     /// absorption, transmission) — wraps the Steam Audio direct
