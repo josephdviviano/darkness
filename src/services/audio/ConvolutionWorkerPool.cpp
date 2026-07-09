@@ -338,6 +338,13 @@ bool ConvolutionWorkerPool::init(const Config &cfg)
         for (int i = 0; i < ConvolutionWorker::kMaxSlots; ++i) {
             cw.staging[b][i].mono.resize(cfg.reflectionFrameSize, 0.0f);
         }
+        // Reverb wet-bus accumulation buffer (PR C part 2) — voices
+        // without a per-voice reflection effect sum their sends here;
+        // triple-buffered in lockstep with the staging slots (same
+        // writeIdx). Allocated unconditionally: 3 × reflectionFrameSize
+        // floats is trivial, and the bus must exist for runtime flips of
+        // reverb_voices_realtime → 0.
+        cw.busAccumMono[b].assign(cfg.reflectionFrameSize, 0.0f);
     }
 
     // Build ambisonics decode settings: stereo binaural via the shared HRTF.
