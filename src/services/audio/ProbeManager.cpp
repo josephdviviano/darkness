@@ -1103,13 +1103,14 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     bakeParams.pathRange = pathRangeFt * kFeetToMeters;
     AUDIO_LOG("Pathing bake range: visRange=%.0f ft (%s) | pathRange="
               "%.0f ft (sceneDiag=%.0f ft × %.1fx, ceiling=%.0f ft) | "
-              "numSamples=%d (%d rays/pair)\n",
+              "numSamples=%d (%d rays/pair) | density=%s\n",
               visRangeFt,
               (params.pathingVisRangeFt > 0.0f) ? "ROOM_DB-derived cap"
                                                 : "whole-level fallback",
               pathRangeFt, sceneDiagonalFt, kBakeRangeMarginMul,
               kBakeRangeCeilingFt, bakeParams.numSamples,
-              bakeParams.numSamples * bakeParams.numSamples);
+              bakeParams.numSamples * bakeParams.numSamples,
+              pathingProbeDensityName(params.pathingDensity));
     bakeParams.numThreads = 4;
 
     auto bakeStart = std::chrono::steady_clock::now();
@@ -1132,10 +1133,12 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     outEntry.hasReflectionsData = false;
     outEntry.hasPathingData     = true;
     // Effective bake profile (post-fallback) — recorded into the .probes
-    // v3 header by bakeProbes so future loads can verify runtime/bake
-    // agreement.
+    // header by bakeProbes so future loads can verify runtime/bake
+    // agreement. Density describes the candidate LAYOUT the caller
+    // emitted (AudioService prepareProbeBakeParams) — recorded verbatim.
     outEntry.bakedVisRangeFt    = visRangeFt;
     outEntry.bakedNumSamples    = bakeParams.numSamples;
+    outEntry.bakedDensity       = params.pathingDensity;
     return true;
 }
 
@@ -1271,6 +1274,8 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     const float    hdrVisRangeFt = havePathing ? pathEntry.bakedVisRangeFt : 0.0f;
     const uint32_t hdrNumSamples = havePathing
         ? static_cast<uint32_t>(pathEntry.bakedNumSamples) : 0u;
+    const uint32_t hdrDensity = havePathing
+        ? static_cast<uint32_t>(pathEntry.bakedDensity) : 0u;
     const uint32_t hdrReflRays = carryForwardRefl
         ? static_cast<uint32_t>(mBakedReflectionRays)
         : static_cast<uint32_t>(params.bakeNumRays);
@@ -1279,7 +1284,8 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         : params.globalDedupRadiusFt;
     bool writeOk = writeProbeFile(outputPath, records,
                                   hdrVisRangeFt, hdrNumSamples,
-                                  hdrReflRays, hdrReflDedupFt);
+                                  hdrReflRays, hdrReflDedupFt,
+                                  hdrDensity);
 
     // Position sidecars (one per batch). Failure is non-fatal — overlay
     // just lacks positions until the next bake. Reflection batch carries
@@ -1318,6 +1324,7 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     // unchanged by construction.)
     mBakedPathingVisRangeFt = hdrVisRangeFt;
     mBakedPathingNumSamples = static_cast<int>(hdrNumSamples);
+    mBakedPathingDensity    = static_cast<PathingProbeDensity>(hdrDensity);
     mBakedReflectionRays    = static_cast<int>(hdrReflRays);
     mBakedProbeDedupRadiusFt = hdrReflDedupFt;
 
@@ -1359,8 +1366,9 @@ bool ProbeManager::loadProbes(const std::string &probePath,
 
     if (status == ProbeFileStatus::UnsupportedVersion) {
         LOG_ERROR("ProbeManager: probe file '%s' is from a previous format "
-                  "version (v3 added the pathing bake-profile record) and "
-                  "cannot be migrated automatically. Delete it and re-bake "
+                  "version (v4 added the pathing layout-density record; v3 "
+                  "added the bake-profile record) and cannot be migrated "
+                  "automatically. Delete it and re-bake "
                   "(debug console: `bake_probes`) — the startup flow will "
                   "also auto-re-bake when no loadable file is present.",
                   probePath.c_str());
@@ -1459,12 +1467,14 @@ bool ProbeManager::loadProbes(const std::string &probePath,
         }
     }
 
-    // Record the bake profile from the v3 header. Consumers: the runtime
-    // per-voice visRange clamp, the AudioService-side numSamples mismatch
-    // check (getBakedPathing*), and the every-load reflection-profile
-    // warning (getBakedReflection*).
+    // Record the bake profile from the v4 header. Consumers: the runtime
+    // per-voice visRange clamp, the AudioService-side numSamples +
+    // layout-density mismatch checks (getBakedPathing*), and the
+    // every-load reflection-profile warning (getBakedReflection*).
     mBakedPathingVisRangeFt = hdr.bakedPathingVisRangeFt;
     mBakedPathingNumSamples = static_cast<int>(hdr.bakedPathingNumSamples);
+    mBakedPathingDensity    =
+        static_cast<PathingProbeDensity>(hdr.bakedPathingDensity);
     mBakedReflectionRays    = static_cast<int>(hdr.bakedReflectionRays);
     mBakedProbeDedupRadiusFt = hdr.bakedProbeDedupRadiusFt;
 
@@ -1574,6 +1584,7 @@ void ProbeManager::releaseBatches(IPLSimulator reflectionSimulator,
     mTotalProbeCount = 0;
     mBakedPathingVisRangeFt = 0.0f;
     mBakedPathingNumSamples = 0;
+    mBakedPathingDensity = PathingProbeDensity::Unknown;
     mBakedReflectionRays = 0;
     mBakedProbeDedupRadiusFt = 0.0f;
 

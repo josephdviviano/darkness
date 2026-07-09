@@ -25,11 +25,11 @@
 /// @file ProbeFile.h
 /// Probe file format with integrity checking for baked acoustic probe data.
 ///
-/// === Version 3 (current) — multi-batch container + bake-profile record ===
+/// === Version 4 (current) — v3 + pathing layout-density record ===
 ///
 /// File layout (all fields little-endian):
 ///   [0..3]   magic       "DKPr" (0x72504B44)
-///   [4..7]   version     format version (currently 3)
+///   [4..7]   version     format version (currently 4)
 ///   [8..11]  batchCount  number of probe batches that follow
 ///   [12..15] totalProbes total probe count across all batches (sanity)
 ///   [16..19] bakedPathingVisRangeFt   float — the IPLPathBakeParams::visRange
@@ -56,6 +56,14 @@
 ///   [28..31] bakedProbeDedupRadiusFt  float — the reflection batch's global
 ///            dedup radius (engine feet) at bake time; the probe-DENSITY
 ///            half of the profile.
+///   [32..35] bakedPathingDensity      uint32 — PathingProbeDensity tier the
+///            pathing section's probe LAYOUT was emitted at
+///            (audio.pathing_probes.density: 1=baseline, 2=bends; see
+///            ProbeManager.h). 0 when no pathing batch. Mismatch against the
+///            active config = same policy as bakedPathingNumSamples: loud
+///            message + automatic pathing-only re-bake — a baseline cache
+///            consumed at bends density silently lacks the per-portal bend
+///            pairs the runtime layout expects (and vice versa).
 ///
 /// Reflection-profile mismatch policy (differs from the pathing fields):
 /// a mismatch against the active profile does NOT auto-re-bake — the
@@ -72,6 +80,20 @@
 ///   [8..11]  payloadSize size of the Steam Audio serialized blob in bytes
 ///   [12..15] crc32       CRC-32 of the payload bytes
 ///   [16..15+payloadSize] payload (opaque Steam Audio probe batch data)
+///
+/// === Version 3 (legacy) — bake profile without density, not accepted ===
+///
+/// Same batch records but a 32-byte header ending at
+/// bakedProbeDedupRadiusFt — no record of the pathing LAYOUT density.
+/// Rejected (UnsupportedVersion) rather than migrated: v3 predates the
+/// density tiers, so its pathing section was baked from the pre-tier
+/// layout (upper centroids for every non-flat room, single center probes
+/// on all non-door portals) — a layout no current density setting
+/// reproduces, and one the density-mismatch check exists to keep out.
+/// The version bump costs each mission ONE loud full re-bake (reflection
+/// IRs cannot carry forward across the version reject — loadProbes fails,
+/// so the startup flow runs the normal no-cache full bake; minutes at the
+/// dev profile under the PR-A range cap).
 ///
 /// === Version 2 (legacy) — multi-batch, no bake profile, not accepted ===
 ///
@@ -90,8 +112,8 @@
 /// re-bake. The format is unrecoverable because we cannot determine whether
 /// the single batch held reflections-only, pathing-only, or both.
 ///
-/// Corner case for both legacy formats: the loader reads a full v3 header
-/// (32 bytes) before the version check, so a legacy file SHORTER than that
+/// Corner case for all legacy formats: the loader reads a full v4 header
+/// (36 bytes) before the version check, so a legacy file SHORTER than that
 /// (possible only for synthetic zero-batch/empty-payload files — real bakes
 /// always carry multi-KB payloads) reports FileTooSmall instead of
 /// UnsupportedVersion. Both statuses are loud delete-and-re-bake rejections.
@@ -132,11 +154,11 @@ inline uint32_t crc32(const uint8_t *data, size_t length) {
 // ── Probe file header ─────────────────────────────────────────────────────
 
 static constexpr uint32_t kProbeFileMagic   = 0x72504B44u; // "DKPr" little-endian
-static constexpr uint32_t kProbeFileVersion = 3u;
-static constexpr size_t   kProbeFileHeaderSize = 32u;       // 8 x 4-byte fields
+static constexpr uint32_t kProbeFileVersion = 4u;
+static constexpr size_t   kProbeFileHeaderSize = 36u;       // 9 x 4-byte fields
 static constexpr size_t   kProbeBatchRecordHeaderSize = 16u; // 4 x uint32_t
 
-/// On-disk multi-batch file header (v3). All fields little-endian, 4-byte,
+/// On-disk multi-batch file header (v4). All fields little-endian, 4-byte,
 /// so the struct is packing-free on every supported ABI (static_assert
 /// below). Pathing fields are 0 when the file has no pathing batch; the
 /// reflection fields describe the reflection blob actually in the file
@@ -151,9 +173,10 @@ struct ProbeFileHeader {
     uint32_t bakedPathingNumSamples = 0;    // v3: appended
     uint32_t bakedReflectionRays    = 0;    // v3: reflection-profile half
     float    bakedProbeDedupRadiusFt = 0.0f; // v3: probe-density half
+    uint32_t bakedPathingDensity    = 0;    // v4: PathingProbeDensity tier
 };
 static_assert(sizeof(ProbeFileHeader) == kProbeFileHeaderSize,
-              "ProbeFileHeader must be exactly 32 bytes");
+              "ProbeFileHeader must be exactly 36 bytes");
 
 /// On-disk per-batch record header (unchanged since v2). One precedes each
 /// batch payload.
@@ -222,13 +245,18 @@ inline const char *probeFileStatusString(ProbeFileStatus s) {
 /// @param bakedProbeDedupRadiusFt v3 bake-profile record: the reflection
 ///                     batch's global dedup radius (ft). Same carry-forward
 ///                     rule as bakedReflectionRays.
+/// @param bakedPathingDensity v4 bake-profile record: PathingProbeDensity
+///                     tier of the pathing section's probe layout
+///                     (1=baseline, 2=bends). Pass 0 when no pathing batch
+///                     is written.
 /// @return true on success
 inline bool writeProbeFile(const std::string &outputPath,
                            const std::vector<ProbeBatchRecord> &batches,
                            float bakedPathingVisRangeFt = 0.0f,
                            uint32_t bakedPathingNumSamples = 0,
                            uint32_t bakedReflectionRays = 0,
-                           float bakedProbeDedupRadiusFt = 0.0f)
+                           float bakedProbeDedupRadiusFt = 0.0f,
+                           uint32_t bakedPathingDensity = 0)
 {
     // Build outer header
     ProbeFileHeader hdr;
@@ -239,6 +267,7 @@ inline bool writeProbeFile(const std::string &outputPath,
     hdr.bakedPathingNumSamples = bakedPathingNumSamples;
     hdr.bakedReflectionRays    = bakedReflectionRays;
     hdr.bakedProbeDedupRadiusFt = bakedProbeDedupRadiusFt;
+    hdr.bakedPathingDensity    = bakedPathingDensity;
 
     std::string tmpPath = outputPath + ".tmp";
     FILE *f = std::fopen(tmpPath.c_str(), "wb");

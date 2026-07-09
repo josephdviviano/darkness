@@ -2262,6 +2262,25 @@ static int runProbePlanVerb(const std::string &misPath,
                 std::fprintf(stderr,
                     "[PROBE_PLAN] --set %s=%s applied\n",
                     p.c_str(), b ? "true" : "false");
+            } else if (p == "audio.pathing_probes.density") {
+                // Single string→enum mapping (pathingProbeDensityFromName;
+                // "high" reserved for a future Tier 2). Reject-at-parse,
+                // loudly, keeping the default (bends).
+                const auto density = Darkness::pathingProbeDensityFromName(v);
+                if (density != Darkness::PathingProbeDensity::Unknown) {
+                    audioSvc->setPathingProbeDensity(density);
+                    std::fprintf(stderr,
+                        "[PROBE_PLAN] --set %s=%s applied\n", p.c_str(),
+                        Darkness::pathingProbeDensityName(density));
+                } else {
+                    std::fprintf(stderr,
+                        "[FALLBACK] --set %s: invalid value '%s' — valid: "
+                        "'baseline' | 'bends' ('high' reserved, not yet "
+                        "implemented). Keeping default '%s'.\n",
+                        p.c_str(), v.c_str(),
+                        Darkness::pathingProbeDensityName(
+                            audioSvc->getPathingProbeDensity()));
+                }
             } else if (p == "audio.probes.spacing") {
                 audioSvc->setProbeSpacingFt(std::stof(v));
                 std::fprintf(stderr, "[PROBE_PLAN] --set %s=%s applied\n", p.c_str(), v.c_str());
@@ -2337,9 +2356,12 @@ static int runProbePlanVerb(const std::string &misPath,
     };
     int postDedup = static_cast<int>(plan.pathingKept.size());
     std::fprintf(stdout,
-        "[PROBE_PLAN] pathing: Portal=%d DoorPair=%d Centroid=%d "
-        "Emitter=%d  postDedup=%d\n",
+        "[PROBE_PLAN] pathing [density=%s]: Portal=%d PortalPair=%d "
+        "DoorPair=%d Centroid=%d Emitter=%d  postDedup=%d\n",
+        Darkness::pathingProbeDensityName(
+            audioSvc->getPathingProbeDensity()),
         getPurpose(Darkness::PathingProbePurpose::Portal),
+        getPurpose(Darkness::PathingProbePurpose::PortalPair),
         getPurpose(Darkness::PathingProbePurpose::DoorPair),
         getPurpose(Darkness::PathingProbePurpose::Centroid),
         getPurpose(Darkness::PathingProbePurpose::Emitter),
@@ -2347,9 +2369,10 @@ static int runProbePlanVerb(const std::string &misPath,
 
     std::fprintf(stdout,
         "[PROBE_PLAN] pathing dedup_dropped: %d (centroids=%d "
-        "doorPairs=%d other=%d)\n",
+        "doorPairs=%d portalPairs=%d other=%d)\n",
         plan.dedupDroppedTotal, plan.dedupDroppedCentroids,
-        plan.dedupDroppedDoorPairs, plan.dedupDroppedOther);
+        plan.dedupDroppedDoorPairs, plan.dedupDroppedPortalPairs,
+        plan.dedupDroppedOther);
 
     // Per-room pathing-probe distribution.  Pathing runtime cost scales
     // with edges-visited per query; edge count scales with local probe
