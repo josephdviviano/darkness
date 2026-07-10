@@ -53,6 +53,8 @@ set(HEADLESS_SERVICES_SOURCES
     audio/ProbeManager.h
     audio/ReflectionSimulator.cpp
     audio/ReflectionSimulator.h
+    audio/RingOutputMixer.cpp
+    audio/RingOutputMixer.h
     audio/SchemaPropertyOverrides.h
     audio/SchemaSamplesChunk.cpp
     audio/SchemaSamplesChunk.h
@@ -153,6 +155,15 @@ find_package(zziplib CONFIG REQUIRED)
 target_link_libraries(DarknessServices PUBLIC DarknessBase glm::glm
     unofficial::steam-audio::phonon
     zziplib::libzzip)
+
+# CoreAudio for the kAudioDeviceProcessorOverload xrun listener in
+# AudioService.cpp (PLAN.AUDIO_PERF.md PR D). miniaudio itself runtime-links
+# CoreAudio, but the listener calls AudioObjectAdd/RemovePropertyListener
+# directly and needs the framework at link time. macOS only; other platforms
+# compile the listener out (#ifdef __APPLE__).
+if(APPLE)
+    target_link_libraries(DarknessServices PUBLIC "-framework CoreAudio")
+endif()
 
 target_include_directories(DarknessServices PUBLIC
     ${ODE_INCLUDE_DIR}

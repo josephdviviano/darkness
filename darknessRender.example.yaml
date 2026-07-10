@@ -105,8 +105,29 @@ developer:
 
 
 audio:
-  # Audio is organized into eight subsections. Skip any subsection to use
+  # Audio is organized into named subsections. Skip any subsection to use
   # defaults; each setting is independent. Bracketed numbers are valid ranges.
+
+  engine:
+    # Device-callback / mixer-thread topology (immutable after boot).
+    #
+    # ring_mixer: true (default) renders the whole mix graph on a dedicated
+    # high-priority mixer thread that keeps a lock-free ring buffer topped
+    # up; the device callback only copies from the ring (bounded time, so
+    # the render can never starve the audio device — the crackle fix).
+    # false = legacy pre-ring behavior: the mix graph renders synchronously
+    # inside the device callback and competes with the hardware deadline
+    # (kept selectable for A/B comparison; expect crackling under load).
+    ring_mixer: true
+    # Ring fill target in milliseconds. The mixer thread tops the ring up
+    # to this much buffered audio each wake; larger = more scheduling slack
+    # for the render, but also more output latency (the buffered audio sits
+    # between the mix graph and the DAC). <= 0 (default) = auto: two engine
+    # blocks (2 x frame_size / sample_rate), floored at 21.4 ms so total
+    # output slack stays at or above the pre-ring-mixer device-buffer
+    # slack. Watch `[PERF device_cb] ring low_wm=` before trimming: the low
+    # watermark is how close the device came to draining the ring. (0=auto-500)
+    ring_margin_ms: -1
 
   performance:
     # Engine + reverb throughput. Touch these to trade CPU for fidelity.
