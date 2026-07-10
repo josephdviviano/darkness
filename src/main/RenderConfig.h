@@ -45,6 +45,17 @@ struct RenderConfig {
     int  audioSampleRate         = 48000; // [GLOBAL] device output sample rate (22050|32000|44100|48000|96000)
     int  audioFrameSize          = 1024;  // [GLOBAL] audio engine frame size in samples (256–4096)
     int  audioSoundCacheMB       = 64;    // [GLOBAL] decoded-audio LRU cache budget (MB)
+
+    // -- audio.engine: device-callback / mixer-thread topology (PR D) --
+    // ring_mixer: true = mix graph renders on a dedicated mixer thread into
+    // a lock-free ring; the device callback only drains the ring (crackle
+    // fix — the render no longer competes with the HAL deadline). false =
+    // legacy in-callback rendering (pre-PR-D behavior, kept for A/B).
+    bool  audioRingMixer         = true;  // [GLOBAL]
+    // ring_margin_ms: ring fill target the mixer thread maintains. <= 0 =
+    // auto (two engine blocks, min 21.4 ms). Larger = more scheduling
+    // slack, more output latency. (0=auto–500)
+    float audioRingMarginMs      = -1.0f; // [GLOBAL]
     int  reflectionRateDivisor   = 2;     // [REFLECTIONS] reflection pipeline rate: 1=full 48kHz, 2=half 24kHz, 4=quarter 12kHz
     int  maxActiveVoices         = 64;    // [GLOBAL] hard cap on simultaneous voices (Dark Engine baseline)
     // [REFLECTIONS] Cap on total reverb voices (realtime + baked combined).
@@ -572,6 +583,20 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                             "auto-derived). Safe to remove from "
                             "darknessRender.yaml.\n", key);
                     }
+                }
+            }
+
+            // -- audio.engine (device-callback / mixer-thread topology, PR D) --
+            if (YAML::Node eng = audio["engine"]) {
+                if (eng["ring_mixer"]) {
+                    cfg.audioRingMixer = eng["ring_mixer"].as<bool>();
+                }
+                if (eng["ring_margin_ms"]) {
+                    cfg.audioRingMarginMs = eng["ring_margin_ms"].as<float>();
+                    // <= 0 = auto; clamp the ceiling so a typo can't
+                    // request a multi-second ring.
+                    if (cfg.audioRingMarginMs > 500.0f)
+                        cfg.audioRingMarginMs = 500.0f;
                 }
             }
 
@@ -1186,6 +1211,18 @@ inline bool applySetOverride(const std::string& path, const std::string& valueSt
     }
     if (path == "audio.performance.scene_type") {
         cfg.sceneType = (valueStr == "embree" ? "embree" : "default");
+        return true;
+    }
+
+    // -- audio.engine (PR D ring mixer) --
+    if (path == "audio.engine.ring_mixer") {
+        return toBool(cfg.audioRingMixer);
+    }
+    if (path == "audio.engine.ring_margin_ms") {
+        float v; if (!toFloat(v)) return false;
+        // <= 0 = auto (two engine blocks, min 21.4 ms); cap mirrors the
+        // YAML loader's anti-typo ceiling.
+        cfg.audioRingMarginMs = (v > 500.0f) ? 500.0f : v;
         return true;
     }
 

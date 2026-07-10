@@ -72,12 +72,21 @@ public:
         if (!std::isfinite(ms) || ms < 0.0) return;
         int idx = binFor(ms);
         mBuckets[idx].fetch_add(1, std::memory_order_relaxed);
+        // Exact max alongside the bucketed percentiles (PR D: a p99 alone
+        // hides the single worst spike, which is exactly what matters for
+        // "did one render blow through the ring margin"). CAS-max, relaxed —
+        // diagnostics-grade like the buckets.
+        double prevMax = mMaxMs.load(std::memory_order_relaxed);
+        while (ms > prevMax
+               && !mMaxMs.compare_exchange_weak(prevMax, ms,
+                                                std::memory_order_relaxed)) {}
     }
 
     struct Percentiles {
         double   p50  = 0.0;
         double   p95  = 0.0;
         double   p99  = 0.0;
+        double   maxMs = 0.0;  ///< exact worst observation in the window
         uint64_t n    = 0;
     };
 
@@ -93,6 +102,8 @@ public:
             total += snap[i];
         }
         Percentiles r{};
+        r.maxMs = reset ? mMaxMs.exchange(0.0, std::memory_order_relaxed)
+                        : mMaxMs.load(std::memory_order_relaxed);
         r.n = total;
         if (total == 0) return r;
 
@@ -135,6 +146,7 @@ private:
     }
 
     std::array<std::atomic<uint64_t>, kNumBins> mBuckets;
+    std::atomic<double> mMaxMs{0.0};
 };
 
 /// RAII timer. Records elapsed wall-clock ms into the histogram on dtor.

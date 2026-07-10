@@ -70,6 +70,11 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
             audioSvc->setAudioSampleRate(cfg.audioSampleRate);
             audioSvc->setAudioFrameSize(cfg.audioFrameSize);
             audioSvc->setSoundCacheMB(cfg.audioSoundCacheMB);
+            // Ring-fed mixer thread (PR D) — consumed inside initMiniaudio,
+            // so it must land before bootstrapFinished like the rest of
+            // this block.
+            audioSvc->setRingMixerEnabled(cfg.audioRingMixer);
+            audioSvc->setRingMarginMs(cfg.audioRingMarginMs);
             audioSvc->setHRTFVolume(cfg.hrtfVolume);
             // HRTF interp / spatial blend live in audio-thread atomics;
             // publish them now so the first audio callback sees them.

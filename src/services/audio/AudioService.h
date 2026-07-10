@@ -831,6 +831,16 @@ public:
     void setAudioSampleRate(int r) { mAudioSampleRateCfg = r; }
     void setAudioFrameSize(int n)  { mAudioFrameSizeCfg = std::max(256, std::min(n, 4096)); }
     void setSoundCacheMB(int mb)   { mSoundCacheMBCfg = std::max(4, std::min(mb, 1024)); }
+    // Ring-fed mixer thread (PLAN.AUDIO_PERF.md PR D). Immutable after
+    // bootstrapFinished, like sample rate / frame size above.
+    void setRingMixerEnabled(bool on) { mRingMixerEnabledCfg = on; }
+    bool getRingMixerEnabled() const  { return mRingMixerEnabledCfg; }
+    // <= 0 = auto (two engine blocks, min 21.4 ms); clamped to a sane
+    // ceiling so a typo can't allocate a multi-second ring.
+    void setRingMarginMs(float ms) {
+        mRingMarginMsCfg = (ms > 0.0f) ? std::min(ms, 500.0f) : -1.0f;
+    }
+    float getRingMarginMs() const { return mRingMarginMsCfg; }
 
     /// Publish settings used on the audio thread (HRTF interp, spatial blend,
     /// door LPF, propagation min, distance model) into thread-safe storage.
@@ -2033,6 +2043,27 @@ private:
     int         mAudioSampleRateCfg        = static_cast<int>(kDefaultDeviceSampleRate);
     int         mAudioFrameSizeCfg         = 512;
     int         mSoundCacheMBCfg           = 64;
+
+    // ── Ring-fed mixer thread (PLAN.AUDIO_PERF.md PR D) ──
+    // audio.engine.ring_mixer — true (default): the mix graph renders on a
+    // dedicated mixer thread into a lock-free ring; the device callback
+    // only drains the ring. false: legacy in-callback rendering (the
+    // pre-PR-D path, kept compiled + selectable for A/B and as the loud
+    // fallback if the mixer thread fails to start).
+    bool        mRingMixerEnabledCfg       = true;
+    // audio.engine.ring_margin_ms — ring fill target. <= 0 (default) =
+    // auto: two engine blocks (2 × frame_size / sample_rate), floored at
+    // 21.4 ms so total output slack stays >= the pre-PR-D ~21.3 ms device
+    // second-period slack regardless of frame_size.
+    float       mRingMarginMsCfg           = -1.0f;
+    std::unique_ptr<class RingOutputMixer> mRingMixer;
+
+    // CoreAudio kAudioDeviceProcessorOverload listener registration state
+    // (macOS only; harmless inert members elsewhere). The AudioObjectID is
+    // stored so shutdownMiniaudio can unregister the exact device it
+    // registered on even if miniaudio reroutes internally.
+    bool        mOverloadListenerInstalled = false;
+    uint32_t    mOverloadDeviceObjectID    = 0;
 
     // ── Baked probe pathing ──
     //
