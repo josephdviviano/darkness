@@ -1196,6 +1196,22 @@ static std::atomic<long long> sLastCallbackNs{0};
 static LatencyHistogram sPerfDeviceCbMs;
 static std::atomic<long long> sLastDeviceCbNs{0};
 
+// ── Device-callback frame accounting (2026-07-09 crackle diagnostic) ──
+//
+// The dev_cb gap histogram alone cannot distinguish "device thread woken
+// late / starved" (real underrun risk) from "backend aggregated several
+// periods into one bigger frameCount request" (benign — deadline scales
+// with the request). Per-window frame totals + min/max frameCount resolve
+// the ambiguity: frames/window ≈ sampleRate × windowSeconds with fcMax >
+// 1024 means aggregation; frames/window materially below real-time with
+// fcMax == 1024 means the device genuinely starved. Always-on (three
+// relaxed atomics per callback — same cost class as the dev_cb histogram
+// above). Writer: device thread. Reader: main-thread periodic dump
+// (exchange-to-zero per window).
+static std::atomic<uint64_t> sDeviceCbFrames{0};    // Σ frameCount this window
+static std::atomic<uint32_t> sDeviceCbFcMin{0xFFFFFFFFu}; // min frameCount
+static std::atomic<uint32_t> sDeviceCbFcMax{0};     // max frameCount
+
 // ── WAV capture of the final engine output (PLAN.AUDIO_PERF.md PR 0.2) ──
 //
 // engineDeviceDataCallback taps the just-rendered f32-stereo frames into
@@ -3784,6 +3800,17 @@ static void engineDeviceDataCallback(ma_device *pDevice, void *pFramesOut,
         if (lastNs != 0) {
             sPerfDeviceCbMs.record(static_cast<double>(nowNs - lastNs) / 1e6);
         }
+        // Frame accounting (see sDeviceCbFrames commentary): resolves the
+        // late-wake vs aggregated-request ambiguity in the gap histogram.
+        sDeviceCbFrames.fetch_add(frameCount, std::memory_order_relaxed);
+        uint32_t prevMin = sDeviceCbFcMin.load(std::memory_order_relaxed);
+        while (frameCount < prevMin
+               && !sDeviceCbFcMin.compare_exchange_weak(
+                      prevMin, frameCount, std::memory_order_relaxed)) {}
+        uint32_t prevMax = sDeviceCbFcMax.load(std::memory_order_relaxed);
+        while (frameCount > prevMax
+               && !sDeviceCbFcMax.compare_exchange_weak(
+                      prevMax, frameCount, std::memory_order_relaxed)) {}
     }
     auto *pEngine = static_cast<ma_engine*>(pDevice->pUserData);
     if (pEngine)
@@ -3918,6 +3945,17 @@ bool AudioService::initMiniaudio()
                  mDeviceSampleRate, device->playback.name,
                  device->sampleRate, device->playback.channels,
                  mFrameSize, periodCount, bufferMs);
+        // HAL-side geometry (2026-07-09 crackle diagnostic): the line above
+        // reports the negotiated (post-conversion) rate; internalSampleRate
+        // is what the OS device actually runs at. A mismatch means miniaudio
+        // resamples between the data callback and the wire, and the device
+        // clock cadence follows the INTERNAL rate — needed to interpret the
+        // [PERF device_cb] gap histogram.
+        LOG_INFO("AudioService: device internal: %u Hz, %u ch, "
+                 "internalPeriod=%u frames",
+                 device->playback.internalSampleRate,
+                 device->playback.internalChannels,
+                 device->playback.internalPeriodSizeInFrames);
     }
 
     // Publish engine sample rate to audio-thread DSP that needs it (door LPF).
@@ -12430,6 +12468,23 @@ void AudioService::dumpAudioStatusPeriodic()
         (unsigned long long)cbP.n,
         fmtMs(cbP.p50), fmtMs(cbP.p95), fmtMs(cbP.p99),
         static_cast<double>(callbackDeadlineMs));
+    // Device-boundary frame accounting (see sDeviceCbFrames): frames should
+    // track mDeviceSampleRate × window-seconds; fc_max > frame_size means
+    // the backend aggregates periods (gap-histogram outliers are benign);
+    // a frame deficit at fc_max == frame_size means real device starvation.
+    // Drained here (exchange) so each window is independent; shared by the
+    // JSONL emit below — do not exchange twice.
+    uint64_t devCbFrames = sDeviceCbFrames.exchange(0, std::memory_order_relaxed);
+    uint32_t devCbFcMin = sDeviceCbFcMin.exchange(0xFFFFFFFFu,
+                                                  std::memory_order_relaxed);
+    uint32_t devCbFcMax = sDeviceCbFcMax.exchange(0, std::memory_order_relaxed);
+    if (devCbFcMin == 0xFFFFFFFFu) devCbFcMin = 0;  // no callbacks this window
+    AUDIO_LOG(
+        "[PERF device_cb] n=%llu gap p50/p95/p99=%.3f/%.3f/%.3f ms"
+        " frames=%llu fc_min/max=%u/%u\n",
+        (unsigned long long)deviceCbP.n,
+        fmtMs(deviceCbP.p50), fmtMs(deviceCbP.p95), fmtMs(deviceCbP.p99),
+        (unsigned long long)devCbFrames, devCbFcMin, devCbFcMax);
     if (callbackBudgetWarn) {
         AUDIO_LOG(
             "[PERF callback] BUDGET_WARN p99=%.3f ms (>= 80%% of "
@@ -12640,7 +12695,8 @@ void AudioService::dumpAudioStatusPeriodic()
             "\"worker_max_apply\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"worker_residual\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"inter_cb\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
-            "\"device_cb\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"device_cb\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
+                "\"frames\":%llu,\"fc_min\":%u,\"fc_max\":%u},"
             "\"signal_pickup\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"sync_wait\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
                 "\"timeouts\":%d,\"deadline_ms\":%.4f}"
@@ -12682,6 +12738,7 @@ void AudioService::dumpAudioStatusPeriodic()
             (unsigned long long)residualP.n, residualP.p50, residualP.p95, residualP.p99,
             (unsigned long long)interCbP.n,  interCbP.p50,  interCbP.p95,  interCbP.p99,
             (unsigned long long)deviceCbP.n, deviceCbP.p50, deviceCbP.p95, deviceCbP.p99,
+                (unsigned long long)devCbFrames, devCbFcMin, devCbFcMax,
             (unsigned long long)pickupP.n,   pickupP.p50,   pickupP.p95,   pickupP.p99,
             (unsigned long long)syncP.n,  syncP.p50,  syncP.p95,  syncP.p99,
                 syncTimeouts, static_cast<double>(syncDeadlineMs),
