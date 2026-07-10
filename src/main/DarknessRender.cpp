@@ -261,6 +261,9 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
     char buf[8192];
     int n = std::snprintf(buf, sizeof(buf),
         "{"
+        "\"engine\":{"
+            "\"ring_mixer\":%s,\"ring_margin_ms\":%.4f"
+        "},"
         "\"performance\":{"
             "\"sample_rate\":%d,\"frame_size\":%d,\"sound_cache_mb\":%d,"
             "\"rate_divisor\":%d,\"max_active_voices\":%d,"
@@ -318,6 +321,8 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
             "\"wet_saturation_enabled\":%s,\"wet_saturation_drive\":%.4f"
         "}"
         "}",
+        c.audioRingMixer ? "true" : "false",
+        static_cast<double>(c.audioRingMarginMs),
         c.audioSampleRate, c.audioFrameSize, c.audioSoundCacheMB,
         c.reflectionRateDivisor, c.maxActiveVoices,
         c.reverbVoices, c.reverbVoicesRealtime,
@@ -5259,6 +5264,11 @@ int main(int argc, char *argv[]) {
         audioSvc->setAudioSampleRate(cfg.audioSampleRate);
         audioSvc->setAudioFrameSize(cfg.audioFrameSize);
         audioSvc->setSoundCacheMB(cfg.audioSoundCacheMB);
+        // Ring mixer (PR D): like sample_rate/frame_size these are consumed
+        // at engine init (bootstrapFinished) — re-applied here only so the
+        // stored config reflects the YAML for a future engine restart.
+        audioSvc->setRingMixerEnabled(cfg.audioRingMixer);
+        audioSvc->setRingMarginMs(cfg.audioRingMarginMs);
         audioSvc->setReflectionRateDivisor(cfg.reflectionRateDivisor);
         audioSvc->setMaxActiveVoices(cfg.maxActiveVoices);
         audioSvc->setReverbVoices(cfg.reverbVoices);
