@@ -67,7 +67,7 @@ struct RenderConfig {
     // realtime ray-traced IRs. 0 = baked-only (recommended; all eligible
     // voices route through baked-probe reverb). Range [0, reverbVoices].
     int  reverbVoicesRealtime    = 0;
-    int  reflectionThrottle      = 4;     // [REALTIME] run sim every Nth frame (1–32)
+    int  reflectionThrottle      = 4;     // [REFLECTIONS] signal the reflection-sim worker every Nth audio loop step (1–32); paces the shared baked-reverb IR refresh in baked-only mode too
     int  simMaxOcclusionSamples  = 32;    // [DIRECT+REFLECTIONS] per-source occlusion sample cap (Steam Audio sim) (4–256)
     // Explicit thread counts for reverb work. `convThreads` are the
     // per-voice convolution workers; `simThreads` are the Steam Audio
@@ -236,13 +236,13 @@ struct RenderConfig {
     float    pathingBlockingScale = 1.0f;
     // Minimum interval (seconds) between successive Steam Audio
     // pathing-simulation updates. iplSimulatorRunPathing is CPU-heavy
-    // and runs synchronously on the main loop thread; throttling to
-    // 10 Hz (the Unity/Unreal integration default) cuts per-frame cost
-    // without perceptible loss in diffraction responsiveness — the
-    // listener moves < 1 ft per update at walking speed, well below
-    // the threshold for hearing portalAttenuation/blocking changes.
-    // 0.0 = run every frame (legacy / A-B diagnostic). Clamped to
-    // [0.0, 1.0] seconds.
+    // and runs on the PathingSimulator worker thread; this interval
+    // sets how often the worker is signalled. 10 Hz (the Unity/Unreal
+    // integration default) loses no perceptible diffraction
+    // responsiveness — the listener moves < 1 ft per update at walking
+    // speed, well below the threshold for hearing portalAttenuation/
+    // blocking changes. 0.0 = run every frame (legacy / A-B
+    // diagnostic). Clamped to [0.0, 1.0] seconds.
     float    pathingUpdateInterval = 0.1f;
 
     // Per-band weights for collapsing Steam Audio's 3-band eqCoeffs into
