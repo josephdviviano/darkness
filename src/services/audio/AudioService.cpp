@@ -36,6 +36,7 @@
 #include "ProbeFile.h"
 #include "ProbeManager.h"
 #include "ReflectionSimulator.h"
+#include "RingOutputMixer.h"
 #include "WetBusBeatDetector.h"
 #include "SchemaParser.h"
 #include "SchemaPropertyOverrides.h"
@@ -81,6 +82,11 @@
 #if defined(__APPLE__)
 #  include <pthread.h>
 #  include <sys/qos.h>
+// CoreAudio HAL property listener for kAudioDeviceProcessorOverload — the
+// OS-level xrun ground truth the ring-mixer verification gate reads
+// (PLAN.AUDIO_PERF.md PR D). Registered on the miniaudio playback device's
+// AudioObjectID in initMiniaudio.
+#  include <CoreAudio/AudioHardware.h>
 #endif
 
 // miniaudio — single-header C library, implementation compiled here
@@ -1197,11 +1203,103 @@ static std::atomic<long long> sLastCallbackNs{0};
 static LatencyHistogram sPerfDeviceCbMs;
 static std::atomic<long long> sLastDeviceCbNs{0};
 
+// ── Device-callback frame accounting (2026-07-09 crackle diagnostic) ──
+//
+// The dev_cb gap histogram alone cannot distinguish "device thread woken
+// late / starved" (real underrun risk) from "backend aggregated several
+// periods into one bigger frameCount request" (benign — deadline scales
+// with the request). Per-window frame totals + min/max frameCount resolve
+// the ambiguity: frames/window ≈ sampleRate × windowSeconds with fcMax >
+// 1024 means aggregation; frames/window materially below real-time with
+// fcMax == 1024 means the device genuinely starved. Always-on (three
+// relaxed atomics per callback — same cost class as the dev_cb histogram
+// above). Writer: device thread. Reader: main-thread periodic dump
+// (exchange-to-zero per window).
+//
+// PR D note: with the ring mixer active the callback is a bounded-time
+// ring drain, so a frame deficit here would mean the OS starved the device
+// thread itself (not the render) — engine-side render lag shows up as ring
+// underruns ([XRUN] + ring_underrun_* fields) instead.
+static std::atomic<uint64_t> sDeviceCbFrames{0};    // Σ frameCount this window
+static std::atomic<uint32_t> sDeviceCbFcMin{0xFFFFFFFFu}; // min frameCount
+static std::atomic<uint32_t> sDeviceCbFcMax{0};     // max frameCount
+
+// ── Ring-fed mixer thread (PLAN.AUDIO_PERF.md PR D) ──
+//
+// When active, engineDeviceDataCallback no longer renders the mix graph —
+// it drains the RingOutputMixer's lock-free SPSC ring (memcpy + counted,
+// silence-filled shortfall) and the dedicated mixer thread becomes the sole
+// caller of ma_engine_read_pcm_frames. See RingOutputMixer.h for the full
+// threading contract.
+//
+// File-scope (not members) for the same reason as the WAV-capture block
+// above: the device callback is a static function with no route back to
+// `this`.
+//
+//   sRingMixerMode  — selected ONCE in initMiniaudio before the device
+//                     starts (config audio.engine.ring_mixer AND the mixer
+//                     actually started); never changes while the device is
+//                     running. false = legacy in-callback rendering.
+//   sRingMixer      — the mixer instance the callback drains. Published
+//                     with release AFTER the ring is prefilled + thread
+//                     running; cleared (with the in-flight guard below)
+//                     before the instance is destroyed. When mode is ring
+//                     but the pointer is null (shutdown window), the
+//                     callback outputs silence — it must NEVER fall back to
+//                     rendering the graph itself, because the mixer thread
+//                     may still be pumping it (single-reader contract).
+//   sRingReadInFlight — same provable-no-UAF guard as sWavTapInFlight (PR
+//                     #4 review S2): shutdown clears the pointer then spins
+//                     until no callback is inside deviceRead.
+static std::atomic<bool> sRingMixerMode{false};
+static std::atomic<RingOutputMixer*> sRingMixer{nullptr};
+static std::atomic<int> sRingReadInFlight{0};
+
+// ── CoreAudio processor-overload counter (PR D xrun ground truth) ──
+//
+// kAudioDeviceProcessorOverload fires when the HAL's IO thread misses its
+// deadline — the OS-level confirmation that audible glitching occurred (the
+// engine-side ring/underrun counters can't see starvation INSIDE the OS
+// mixer). Writer: CoreAudio HAL listener thread (increment + rate-limited
+// stderr). Reader: main-thread periodic dump (window exchange). On
+// non-Apple platforms no listener exists and the counters stay zero — no
+// equivalent portable HAL signal is exposed by miniaudio's other backends.
+static std::atomic<uint32_t> sDeviceOverloadWindow{0};  // per-dump-window
+static std::atomic<uint32_t> sDeviceOverloadTotal{0};   // lifetime (for "#k")
+#if defined(__APPLE__)
+static std::atomic<long long> sDeviceOverloadLastLogNs{0};
+static OSStatus deviceProcessorOverloadListener(
+    AudioObjectID /*objectID*/, UInt32 /*numAddresses*/,
+    const AudioObjectPropertyAddress* /*addresses*/, void* /*clientData*/)
+{
+    sDeviceOverloadWindow.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t total =
+        sDeviceOverloadTotal.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Rate-limited (1/s) loud line, mirroring the ring [XRUN] pattern —
+    // this runs on a HAL notification thread, not the RT IO thread, but
+    // sustained overload storms shouldn't flood stderr either way.
+    const long long nowNs =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    long long last = sDeviceOverloadLastLogNs.load(std::memory_order_relaxed);
+    if (nowNs - last > 1000000000LL
+        && sDeviceOverloadLastLogNs.compare_exchange_strong(
+               last, nowNs, std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[XRUN] device processor overload (#%u)\n",
+                     total);
+    }
+    return noErr;
+}
+#endif // __APPLE__
+
 // ── WAV capture of the final engine output (PLAN.AUDIO_PERF.md PR 0.2) ──
 //
-// engineDeviceDataCallback taps the just-rendered f32-stereo frames into
-// sWavCaptureRb (miniaudio's lock-free SPSC ring: audio thread = producer,
-// AudioService::wavWriterThreadMain = consumer). File-scope (not members)
+// engineDeviceDataCallback taps the f32-stereo frames it is about to hand
+// the device into sWavCaptureRb (miniaudio's lock-free SPSC ring: DEVICE
+// thread = producer, AudioService::wavWriterThreadMain = consumer). Since
+// PR D the device thread no longer renders — in ring-mixer mode the tap
+// captures the ring drain (including any silence-filled underrun gaps),
+// which is still exactly what the device receives. File-scope (not members)
 // because the device callback is a static function with no route back to
 // `this`, matching the sEngineSampleRate / sLastDeviceCbNs pattern above;
 // AudioService is a singleton so this is effectively per-instance state.
@@ -2217,6 +2315,120 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                         node->reflSendPeak.store(sPeak, std::memory_order_relaxed);
                 }
             }
+        } else if (node->reflectionsActive && !node->reflectionEffect
+                   && node->convWorker && node->convWorker->busEffect
+                   && node->convWorker->busParamsValid.load(
+                          std::memory_order_acquire)) {
+            // ── Reverb wet-bus send (PR C part 2) ──
+            //
+            // Baked-only voice: no per-voice reflection effect exists —
+            // Steam Audio's IR handoff supports a single consuming
+            // effect, so the shared baked-reverb IR is convolved ONCE by
+            // the bus effect over the SUM of all voices' sends (see
+            // ConvolutionWorker's bus-field doc). This branch computes
+            // exactly the same per-voice send signal the per-voice slot
+            // staging above produces (distance attenuation × portal
+            // attenuation, door LPF, decimation to the reflection rate)
+            // and ACCUMULATES it into busAccumMono[writeIdx]; the
+            // reflection mix node stages the sum as one slot after every
+            // voice node has run. Only the convolution moved from
+            // per-voice to bus — the send-gain logic is untouched.
+            auto &cw = *node->convWorker;
+            int w = cw.writeIdx.load(std::memory_order_relaxed);
+            std::vector<float> &bus = cw.busAccumMono[w];
+            if (!bus.empty()) {
+                // Same send-gain derivation as the per-voice branch above:
+                // distance attenuation matches the direct output volume
+                // (the IR encodes paths, not source distance); portal
+                // attenuation + door LPF make a closed door quiet AND
+                // muffle the reverb tail, tracking the dry bus exactly
+                // through transitions.
+                float reflAtten = node->directParams.distanceAttenuation;
+                float reflSendAlpha = 1.0f;  // 1.0 = passthrough LPF
+                if (runAtten && !node->skipAttenuation) {
+                    reflAtten     *= node->currentPortalAtten;
+                    reflSendAlpha  = node->currentDoorAlpha;
+                }
+
+                // Footstep diagnostic — bus-branch variant of
+                // [FOOT_REFL_IN]. irSize comes from the bus params (torn
+                // read at worst garbles a log integer).
+                if (node->isFootstepDiag) {
+                    int n = node->reflInputLogCount.fetch_add(1, std::memory_order_relaxed);
+                    if (n < 3) {
+                        float monoPeak = 0.0f;
+                        for (ma_uint32 i = 0; i < frameCount; ++i)
+                            monoPeak = std::max(monoPeak, std::fabs(mono[i]));
+                        AUDIO_LOG("[FOOT_REFL_IN] frame=%d monoPeak=%.4f distAtten=%.3f "
+                                  "reflAtten=%.4f scaledPeak=%.4f irSize=%d (bus)\n",
+                                  n, monoPeak,
+                                  node->directParams.distanceAttenuation,
+                                  reflAtten, monoPeak * reflAtten,
+                                  cw.busParams.irSize);
+                    }
+                }
+
+                ma_uint32 reflFrames = static_cast<ma_uint32>(node->reflectionFrameSize);
+                if (reflFrames > static_cast<ma_uint32>(bus.size()))
+                    reflFrames = static_cast<ma_uint32>(bus.size());
+
+                // 1-pole IIR LPF — identical formula and per-voice state
+                // as the per-voice branch (each sender keeps its own door
+                // coloration even though the convolution is shared).
+                float reflLpf = node->reflSendLpfState;
+                float sendPeak = 0.0f;
+                if (node->rateDivisor > 1) {
+                    // Decimate device rate → reflection rate (averaging
+                    // groups), then accumulate.
+                    int div = node->rateDivisor;
+                    float invDiv = 1.0f / static_cast<float>(div);
+                    ma_uint32 outFrames = std::min(
+                        frameCount / static_cast<ma_uint32>(div), reflFrames);
+                    for (ma_uint32 i = 0; i < outFrames; ++i) {
+                        float sum = 0.0f;
+                        for (int d = 0; d < div; ++d)
+                            sum += mono[i * div + d];
+                        float in = sum * invDiv * reflAtten;
+                        reflLpf += reflSendAlpha * (in - reflLpf);
+                        bus[i] += reflLpf;
+                        float a = std::fabs(reflLpf);
+                        if (a > sendPeak) sendPeak = a;
+                    }
+                } else {
+                    for (ma_uint32 i = 0; i < std::min(frameCount, reflFrames); ++i) {
+                        float in = mono[i] * reflAtten;
+                        reflLpf += reflSendAlpha * (in - reflLpf);
+                        bus[i] += reflLpf;
+                        float a = std::fabs(reflLpf);
+                        if (a > sendPeak) sendPeak = a;
+                    }
+                }
+                node->reflSendLpfState = reflLpf;
+
+                // A non-finite LPF state would re-poison every subsequent
+                // callback's bus contribution — reset it so corruption
+                // can't persist (the accumulated buffer itself is
+                // sanitized once at the mix node before staging, which
+                // contains the blast radius to one bus frame).
+                if (!std::isfinite(node->reflSendLpfState)) {
+                    uint32_t n = node->nanCountReflInput.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (n < 4) {
+                        AUDIO_LOG("[NAN_GUARD] node=%p bus reflection-send LPF "
+                                  "state went non-finite (occurrence %u) "
+                                  "reflAtten=%.4f reflSendAlpha=%.4f\n",
+                                  static_cast<void*>(node), n + 1,
+                                  reflAtten, reflSendAlpha);
+                    }
+                    node->reflSendLpfState = 0.0f;
+                }
+
+                // Per-voice reverb-send peak — same [AMB]-dump attribution
+                // as the per-voice branch; measures this voice's own
+                // contribution (post reflAtten + LPF), not the bus sum.
+                if (sendPeak > node->reflSendPeak.load(std::memory_order_relaxed))
+                    node->reflSendPeak.store(sendPeak, std::memory_order_relaxed);
+            }
         }
 
         // Interleave deinterleaved stereo → miniaudio interleaved output.
@@ -2545,7 +2757,109 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
                           dc, vd);
             }
             cw->stagingCount[w] = 0;
+            // Drop the reverb wet-bus accumulation with everything else —
+            // writeIdx stays on `w` in this branch, so next callback's
+            // voice sends re-accumulate into the same buffer and must
+            // start from zero (otherwise this frame's sends double in).
+            if (!cw->busAccumMono[w].empty()) {
+                std::memset(cw->busAccumMono[w].data(), 0,
+                            cw->busAccumMono[w].size() * sizeof(float));
+            }
         } else {
+            // ── Reverb wet-bus slot staging (PR C part 2) ──
+            //
+            // Voices without a per-voice reflection effect accumulated
+            // their sends into busAccumMono[w] during this callback's
+            // per-voice DSP passes (the node graph pulls every voice node
+            // before this mix node). Stage the sum as ONE ordinary
+            // staging slot so the sub-worker pipeline (apply → ambi sum →
+            // decode → upsample) treats it exactly like a voice — the
+            // single consumer is the point: Steam Audio's IR handoff
+            // supports a single consuming effect, so the shared
+            // baked-reverb IR must be convolved by exactly one effect.
+            //
+            // Silent-skip mirrors the per-voice elision: after the last
+            // nonzero send, keep applying zero input for the drain window
+            // (IR delay line + parametric tail length) so the reverb
+            // rings out fully, then stop staging so the worker idles.
+            if (cw->busEffect && !cw->busAccumMono[w].empty()) {
+                std::vector<float> &bus = cw->busAccumMono[w];
+                const int kBusSilentSkipFrames =
+                    sReflSilentSkipFrames.load(std::memory_order_relaxed);
+                constexpr float kBusSilenceEpsilon = 1.0e-6f;
+                float busPeak = 0.0f;
+                for (size_t i = 0; i < bus.size(); ++i) {
+                    const float a = std::fabs(bus[i]);
+                    if (a > busPeak) busPeak = a;
+                }
+                if (busPeak > kBusSilenceEpsilon) {
+                    cw->busFramesSinceNonzeroInput = 0;
+                } else if (cw->busFramesSinceNonzeroInput
+                           < kBusSilentSkipFrames + 1) {
+                    ++cw->busFramesSinceNonzeroInput;
+                }
+                const bool busLive = cw->busFramesSinceNonzeroInput
+                                     <= kBusSilentSkipFrames;
+                if (busLive && cw->busParamsValid.load(
+                        std::memory_order_acquire)) {
+                    int slotIdx = cw->stagingCount[w];
+                    if (slotIdx < ConvolutionWorker::kMaxSlots) {
+                        cw->stagingCount[w] = slotIdx + 1;
+                        auto &slot = cw->staging[w][slotIdx];
+                        // Sanitize the summed sends once, here — one bus
+                        // frame is the blast radius for any NaN a voice
+                        // contributed (per-voice LPF-state resets happen
+                        // at the contributing node; see the bus-send
+                        // branch in steamAudioNodeProcess).
+                        if (audioSanitizeBuffer(bus.data(), bus.size())) {
+                            static std::atomic<uint32_t> sBusNanCount{0};
+                            uint32_t n = sBusNanCount.fetch_add(
+                                1, std::memory_order_relaxed);
+                            if (n < 4) {
+                                AUDIO_LOG("[NAN_GUARD] reverb wet-bus accum "
+                                          "had non-finite samples before "
+                                          "staging (occurrence %u)\n", n + 1);
+                            }
+                        }
+                        const size_t nCopy = std::min(
+                            bus.size(), slot.mono.size());
+                        std::memcpy(slot.mono.data(), bus.data(),
+                                    nCopy * sizeof(float));
+                        slot.effect = cw->busEffect;
+                        // Audio-thread copy of the main-thread-staged bus
+                        // params — same accepted tear model as the
+                        // per-voice dspNode.reflectionParams copy.
+                        slot.params = cw->busParams;
+                        // Scene-lifetime effect: no validity token needed
+                        // (pool shutdown joins workers before the effect
+                        // is released), and voiceHandle=-1 keeps the bus
+                        // out of the eviction sweep + first-apply
+                        // tracking (both skip negative handles).
+                        slot.validityToken.reset();
+                        slot.reflFrameSize = cw->reflectionFrameSize;
+                        slot.active = true;
+                        slot.isFootstepDiag = false;
+                        slot.voiceHandle = -1;
+                        slot.schemaCStr = "reverb-bus";
+                        slot.outEnergyW = nullptr;
+                    } else {
+                        // Staging table full (MAX_ACTIVE_VOICES per-voice
+                        // slots already claimed) — the bus loses this
+                        // callback. Loud per the no-silent-fallbacks rule.
+                        static std::atomic<uint32_t> sBusSlotFullCount{0};
+                        uint32_t n = sBusSlotFullCount.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (n < 16) {
+                            std::fprintf(stderr,
+                                "[FALLBACK] reverb wet-bus staging slot "
+                                "unavailable (table full at %d) — bus "
+                                "convolution skipped this callback\n",
+                                ConvolutionWorker::kMaxSlots);
+                        }
+                    }
+                }
+            }
+
             int count = cw->stagingCount[w];
             cw->readyCount.store(count, std::memory_order_relaxed);
 
@@ -2559,6 +2873,13 @@ static void reflectionMixNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 newW = (0 + 1 + 2) - w - prevRead;  // the remaining index
             }
             cw->stagingCount[newW] = 0;
+            // Zero the wet-bus accumulator for the next write buffer —
+            // its content is 2 callbacks stale (from when newW was last
+            // the write target) and voices only ever ADD into it.
+            if (!cw->busAccumMono[newW].empty()) {
+                std::memset(cw->busAccumMono[newW].data(), 0,
+                            cw->busAccumMono[newW].size() * sizeof(float));
+            }
             cw->writeIdx.store(newW, std::memory_order_release);
 
             // Distribute voice slots to sub-workers (round-robin), bounded
@@ -3570,10 +3891,57 @@ static void engineDeviceDataCallback(ma_device *pDevice, void *pFramesOut,
         if (lastNs != 0) {
             sPerfDeviceCbMs.record(static_cast<double>(nowNs - lastNs) / 1e6);
         }
+        // Frame accounting (see sDeviceCbFrames commentary): resolves the
+        // late-wake vs aggregated-request ambiguity in the gap histogram.
+        sDeviceCbFrames.fetch_add(frameCount, std::memory_order_relaxed);
+        uint32_t prevMin = sDeviceCbFcMin.load(std::memory_order_relaxed);
+        while (frameCount < prevMin
+               && !sDeviceCbFcMin.compare_exchange_weak(
+                      prevMin, frameCount, std::memory_order_relaxed)) {}
+        uint32_t prevMax = sDeviceCbFcMax.load(std::memory_order_relaxed);
+        while (frameCount > prevMax
+               && !sDeviceCbFcMax.compare_exchange_weak(
+                      prevMax, frameCount, std::memory_order_relaxed)) {}
     }
-    auto *pEngine = static_cast<ma_engine*>(pDevice->pUserData);
-    if (pEngine)
-        ma_engine_read_pcm_frames(pEngine, pFramesOut, frameCount, nullptr);
+    // ── Output render: ring drain (PR D) or legacy in-graph render ──
+    //
+    // Ring mode (default): the mixer thread rendered ahead into the SPSC
+    // ring; this callback memcpy-drains it and NEVER touches the engine.
+    // frameCount is honored as-is (backends may aggregate periods); any
+    // shortfall is silence-filled and counted loudly inside deviceRead.
+    //
+    // Legacy mode (audio.engine.ring_mixer=false, or the mixer thread
+    // failed to start): render the whole mix graph synchronously right
+    // here — the pre-PR-D behavior.
+    //
+    // The mode flag is fixed before the device starts, so the branch is
+    // stable for the device's whole lifetime. In ring mode with the mixer
+    // pointer already retired (shutdown window) we must output SILENCE,
+    // never render: the mixer thread might still be inside the node graph
+    // and ma_engine_read_pcm_frames is strictly single-reader.
+    if (sRingMixerMode.load(std::memory_order_acquire)) {
+        bool drained = false;
+        if (sRingMixer.load(std::memory_order_acquire) != nullptr) {
+            // Same provable in-flight guard as the WAV tap below: enter,
+            // RE-CHECK, use; shutdown spins on the count after clearing
+            // the pointer, so no callback can outlive the mixer object.
+            sRingReadInFlight.fetch_add(1, std::memory_order_acquire);
+            RingOutputMixer *ring = sRingMixer.load(std::memory_order_acquire);
+            if (ring) {
+                ring->deviceRead(static_cast<float*>(pFramesOut), frameCount);
+                drained = true;
+            }
+            sRingReadInFlight.fetch_sub(1, std::memory_order_release);
+        }
+        if (!drained) {
+            std::memset(pFramesOut, 0,
+                        static_cast<size_t>(frameCount) * 2 * sizeof(float));
+        }
+    } else {
+        auto *pEngine = static_cast<ma_engine*>(pDevice->pUserData);
+        if (pEngine)
+            ma_engine_read_pcm_frames(pEngine, pFramesOut, frameCount, nullptr);
+    }
 
     // ── WAV capture tap (PLAN.AUDIO_PERF.md PR 0.2) ──
     // Copy the final mixed output into the lock-free capture ring. This
@@ -3662,6 +4030,11 @@ bool AudioService::initMiniaudio()
     // Pre-built device: engine skips its own device creation and uses ours.
     // The data callback we installed above forwards into ma_engine_read_pcm_frames.
     config.pDevice = mMaDevice;
+    // Defer the device start (PR D): the callback's render mode (ring vs
+    // legacy) must be decided — and in ring mode the ring prefilled + the
+    // mixer thread running — BEFORE the first data callback fires. We call
+    // ma_engine_start explicitly below in both modes.
+    config.noAutoStart = MA_TRUE;
 
     result = ma_engine_init(&config, mMaEngine);
     if (result != MA_SUCCESS) {
@@ -3682,6 +4055,8 @@ bool AudioService::initMiniaudio()
 
     // Detect the actual audio processing frame size from the device.
     // Must match Steam Audio's frameSize for correct buffer processing.
+    float deviceBufferMs = 0.0f;   // total device-buffer depth, for the
+                                   // latency-accounting log below
     ma_device *device = ma_engine_get_device(mMaEngine);
     if (device) {
         ma_uint32 periodSize = device->playback.internalPeriodSizeInFrames;
@@ -3699,15 +4074,156 @@ bool AudioService::initMiniaudio()
         if (device->sampleRate > 0)
             bufferMs = 1000.0f * static_cast<float>(periodSize * periodCount)
                      / static_cast<float>(device->sampleRate);
+        deviceBufferMs = bufferMs;
         LOG_INFO("AudioService: miniaudio engine %u Hz \xe2\x86\x92 device '%s' @ %u Hz, "
                  "%u ch, period=%u frames, periods=%u (buffer=%.1f ms)",
                  mDeviceSampleRate, device->playback.name,
                  device->sampleRate, device->playback.channels,
                  mFrameSize, periodCount, bufferMs);
+        // HAL-side geometry (2026-07-09 crackle diagnostic): the line above
+        // reports the negotiated (post-conversion) rate; internalSampleRate
+        // is what the OS device actually runs at. A mismatch means miniaudio
+        // resamples between the data callback and the wire, and the device
+        // clock cadence follows the INTERNAL rate — needed to interpret the
+        // [PERF device_cb] gap histogram.
+        LOG_INFO("AudioService: device internal: %u Hz, %u ch, "
+                 "internalPeriod=%u frames",
+                 device->playback.internalSampleRate,
+                 device->playback.internalChannels,
+                 device->playback.internalPeriodSizeInFrames);
     }
 
     // Publish engine sample rate to audio-thread DSP that needs it (door LPF).
     sEngineSampleRate.store(mDeviceSampleRate, std::memory_order_relaxed);
+
+    // ── Ring-fed mixer thread (PLAN.AUDIO_PERF.md PR D) ──
+    //
+    // Pick the callback's render mode BEFORE the device starts, and in ring
+    // mode prefill + publish the mixer first, so the very first data
+    // callback already finds a full ring. Mode is immutable for the
+    // device's lifetime (see the sRingMixerMode commentary).
+    sRingMixerMode.store(false, std::memory_order_release);
+    sRingMixer.store(nullptr, std::memory_order_release);
+    if (mRingMixerEnabledCfg) {
+        const float blockMs = (mDeviceSampleRate > 0)
+            ? 1000.0f * static_cast<float>(mFrameSize)
+                  / static_cast<float>(mDeviceSampleRate)
+            : 0.0f;
+        // Auto margin: two engine blocks, floored at 21.4 ms — one block
+        // covers the render in flight, the second absorbs a render peak +
+        // scheduler jitter, and the floor keeps total output slack >= the
+        // pre-PR-D ~21.3 ms second-device-period slack at any frame_size.
+        const float marginMs = (mRingMarginMsCfg > 0.0f)
+            ? mRingMarginMsCfg
+            : std::max(2.0f * blockMs, 21.4f);
+        mRingMixer = std::make_unique<RingOutputMixer>();
+        if (mRingMixer->start(mMaEngine, mFrameSize, 2, mDeviceSampleRate,
+                              marginMs)) {
+            sRingMixer.store(mRingMixer.get(), std::memory_order_release);
+            sRingMixerMode.store(true, std::memory_order_release);
+            // Latency accounting (PR D metric 5): worst-case buffered audio
+            // between the mix graph and the DAC. The ring fill oscillates
+            // in [margin, margin+block); the device buffer adds its full
+            // depth on top. Compare against the pre-PR-D signal stack
+            // (~40-65 ms trigger-to-DAC, device buffer only).
+            LOG_INFO("AudioService: ring mixer active: block=%u frames, "
+                     "margin=%u frames (%.1f ms), fill range %.1f-%.1f ms; "
+                     "total output slack = device buffer %.1f ms + ring "
+                     "margin %.1f ms = %.1f ms",
+                     mFrameSize, mRingMixer->marginFrames(),
+                     mRingMixer->marginMs(), mRingMixer->marginMs(),
+                     mRingMixer->marginMs() + blockMs, deviceBufferMs,
+                     mRingMixer->marginMs(),
+                     deviceBufferMs + mRingMixer->marginMs());
+        } else {
+            // start() already printed the specific [FALLBACK] cause; this
+            // line states the consequence. Legacy path = pre-PR-D behavior:
+            // correct audio, but the render competes with the device
+            // deadline again (starvation under load possible).
+            std::fprintf(stderr,
+                "[FALLBACK] AudioService: ring mixer unavailable — mix graph "
+                "renders inside the device callback this session (legacy "
+                "pre-PR-D path)\n");
+            mRingMixer.reset();
+        }
+    } else {
+        // Explicit config choice, not a failure — but say it loudly enough
+        // that a perf log from this session can't be mistaken for a
+        // ring-mixer run.
+        LOG_INFO("AudioService: ring mixer disabled by config "
+                 "(audio.engine.ring_mixer=false) — legacy in-callback "
+                 "rendering");
+    }
+
+    // Start the device (deferred via noAutoStart above). Both modes start
+    // here so ring-vs-legacy runs share identical startup ordering.
+    result = ma_engine_start(mMaEngine);
+    if (result != MA_SUCCESS) {
+        LOG_ERROR("AudioService: ma_engine_start failed (error %d)", result);
+        AUDIO_LOG("AudioService: ma_engine_start FAILED (error %d)\n", result);
+        // Retire the mixer before tearing the engine down (it pumps the
+        // engine's node graph). No device callback ever ran, but keep the
+        // same guarded ordering as shutdownMiniaudio for uniformity.
+        sRingMixerMode.store(false, std::memory_order_release);
+        sRingMixer.store(nullptr, std::memory_order_release);
+        if (mRingMixer) {
+            mRingMixer->stop();
+            mRingMixer.reset();
+        }
+        ma_engine_uninit(mMaEngine);
+        delete mMaEngine;
+        mMaEngine = nullptr;
+        ma_device_uninit(mMaDevice);
+        delete mMaDevice;
+        mMaDevice = nullptr;
+        return false;
+    }
+
+#if defined(__APPLE__)
+    // ── CoreAudio processor-overload listener (PR D xrun ground truth) ──
+    // Registered on the playback device's HAL AudioObjectID (exposed by
+    // miniaudio's coreaudio backend state). Fires when the HAL IO thread
+    // misses its deadline — the OS-side confirmation of an audible glitch
+    // that no engine-side counter can observe. Unregistered in
+    // shutdownMiniaudio before the device is uninitialized.
+    {
+        const AudioObjectID overloadDevId = static_cast<AudioObjectID>(
+            mMaDevice->coreaudio.deviceObjectIDPlayback);
+        if (overloadDevId != kAudioObjectUnknown) {
+            AudioObjectPropertyAddress addr{};
+            addr.mSelector = kAudioDeviceProcessorOverload;
+            addr.mScope    = kAudioObjectPropertyScopeGlobal;
+            addr.mElement  = kAudioObjectPropertyElementMain;
+            OSStatus st = AudioObjectAddPropertyListener(
+                overloadDevId, &addr, deviceProcessorOverloadListener,
+                nullptr);
+            if (st == noErr) {
+                mOverloadListenerInstalled = true;
+                mOverloadDeviceObjectID =
+                    static_cast<uint32_t>(overloadDevId);
+                LOG_INFO("AudioService: CoreAudio processor-overload "
+                         "listener registered (AudioObjectID %u)",
+                         mOverloadDeviceObjectID);
+            } else {
+                std::fprintf(stderr,
+                    "[FALLBACK] AudioService: AudioObjectAddPropertyListener"
+                    "(kAudioDeviceProcessorOverload) failed (OSStatus %d) — "
+                    "device-side xrun ground truth unavailable this "
+                    "session\n", static_cast<int>(st));
+            }
+        } else {
+            std::fprintf(stderr,
+                "[FALLBACK] AudioService: playback AudioObjectID unknown — "
+                "processor-overload listener not registered (device-side "
+                "xrun ground truth unavailable this session)\n");
+        }
+    }
+#else
+    // Non-Apple platforms: no-op. Neither ALSA/PulseAudio/WASAPI expose a
+    // processor-overload notification through miniaudio, so device-side
+    // xrun ground truth is a CoreAudio-only diagnostic; the ring underrun
+    // counters above remain the cross-platform signal.
+#endif
 
     LOG_INFO("AudioService: miniaudio initialized");
     return true;
@@ -3927,9 +4443,54 @@ float AudioService::currentDuckGain() const
 //------------------------------------------------------
 void AudioService::shutdownMiniaudio()
 {
-    // Engine before device: ma_engine_uninit only tears down node graph and
-    // listeners — it does NOT uninit pDevice when one was supplied
-    // externally (see ma_engine_init source). We own the device's lifetime.
+    // Teardown order (PR D):
+    //   1. stop the device — no more data callbacks;
+    //   2. unregister the CoreAudio overload listener while the device
+    //      object is still valid;
+    //   3. retire + join the mixer thread (it pumps the engine's node
+    //      graph, so it must be gone before ma_engine_uninit);
+    //   4. engine, then device — ma_engine_uninit only tears down node
+    //      graph and listeners; it does NOT uninit an externally supplied
+    //      pDevice (see ma_engine_init source). We own the device lifetime.
+    if (mMaDevice && ma_device_is_started(mMaDevice)) {
+        ma_device_stop(mMaDevice);
+    }
+
+#if defined(__APPLE__)
+    if (mOverloadListenerInstalled) {
+        AudioObjectPropertyAddress addr{};
+        addr.mSelector = kAudioDeviceProcessorOverload;
+        addr.mScope    = kAudioObjectPropertyScopeGlobal;
+        addr.mElement  = kAudioObjectPropertyElementMain;
+        OSStatus st = AudioObjectRemovePropertyListener(
+            static_cast<AudioObjectID>(mOverloadDeviceObjectID), &addr,
+            deviceProcessorOverloadListener, nullptr);
+        if (st != noErr) {
+            // Non-fatal (we're tearing down anyway) but must not be silent.
+            std::fprintf(stderr,
+                "[FALLBACK] AudioService: AudioObjectRemovePropertyListener"
+                "(kAudioDeviceProcessorOverload) failed (OSStatus %d)\n",
+                static_cast<int>(st));
+        }
+        mOverloadListenerInstalled = false;
+        mOverloadDeviceObjectID = 0;
+    }
+#endif
+
+    // Retire the ring mixer. Pointer first, then spin the in-flight guard
+    // (same provable-no-UAF pattern as stopWavCapture): a device callback
+    // preempted mid-deviceRead can never touch a freed mixer. After the
+    // pointer is cleared any straggler callback outputs silence.
+    if (mRingMixer) {
+        sRingMixer.store(nullptr, std::memory_order_release);
+        while (sRingReadInFlight.load(std::memory_order_acquire) != 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        mRingMixer->stop();
+        mRingMixer.reset();
+    }
+    sRingMixerMode.store(false, std::memory_order_release);
+
     if (mMaEngine) {
         ma_engine_uninit(mMaEngine);
         delete mMaEngine;
@@ -4437,6 +4998,63 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         iplSimulatorSetScene(reflectionSimHandle, mIplScene);
         iplSimulatorCommit(reflectionSimHandle);
 
+        // ── Shared baked-reverb source (PR C / T2) ──
+        //
+        // One scene-lifetime source carries the listener-centric baked
+        // REVERB simulation for ALL baked voices (see the member doc in
+        // AudioService.h for the cost analysis). Created here because the
+        // reflection worker is guaranteed idle during scene build, so the
+        // add is immediate — no pending-queue dance, no cycle-at-add race
+        // (the counter is captured after the add, before any signal()).
+        // Voices read this source's outputs in loopStep; per-voice
+        // reflection sources are only created when realtime top-N is
+        // enabled (reverb_voices_realtime > 0) or as the loud fallback.
+        mSharedReverbSourceFailed = false;
+        {
+            IPLSourceSettings srcSettings{};
+            srcSettings.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
+            IPLerror srcErr = iplSourceCreate(reflectionSimHandle,
+                                              &srcSettings,
+                                              &mSharedReverbSource);
+            if (srcErr == IPL_STATUS_SUCCESS && mSharedReverbSource) {
+                iplSourceAdd(mSharedReverbSource, reflectionSimHandle);
+                iplSimulatorCommit(reflectionSimHandle);
+                mSharedReverbCycleAtAdd = mReflectionSim
+                    ? mReflectionSim->completedCycles() : 0;
+                // Create-time input staging so the first sim iteration
+                // already has valid inputs (source position is irrelevant
+                // for the REVERB variation — the lookup keys on the
+                // listener; per-frame staging in loopStep refreshes the
+                // hybrid params + listener pose anyway).
+                IPLSimulationInputs createInputs{};
+                createInputs.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
+                createInputs.baked = IPL_TRUE;
+                createInputs.bakedDataIdentifier.type =
+                    IPL_BAKEDDATATYPE_REFLECTIONS;
+                createInputs.bakedDataIdentifier.variation =
+                    IPL_BAKEDDATAVARIATION_REVERB;
+                createInputs.reverbScale[0] = 1.0f;
+                createInputs.reverbScale[1] = 1.0f;
+                createInputs.reverbScale[2] = 1.0f;
+                createInputs.hybridReverbTransitionTime = mHybridTransitionTime;
+                createInputs.hybridReverbOverlapPercent = mHybridOverlapPercent;
+                iplSourceSetInputs(mSharedReverbSource,
+                    IPL_SIMULATIONFLAGS_REFLECTIONS, &createInputs);
+                AUDIO_LOG("AudioService: shared baked-reverb source added "
+                          "(cycleAtAdd=%llu)\n",
+                          static_cast<unsigned long long>(
+                              mSharedReverbCycleAtAdd));
+            } else {
+                mSharedReverbSource = nullptr;
+                mSharedReverbSourceFailed = true;
+                std::fprintf(stderr,
+                    "[FALLBACK] shared baked-reverb source creation failed "
+                    "(error %d) — reverting to per-voice reflection "
+                    "sources for this scene (correct but ~N× reflection-"
+                    "sim cost)\n", static_cast<int>(srcErr));
+            }
+        }
+
         // Step 6b: Create the direct-only simulator. Iterated by
         // DirectSimulator's background worker thread (PLAN.AUDIO_PERF
         // PR 1b) — iplSimulatorRunDirect's serial per-source occlusion +
@@ -4893,6 +5511,62 @@ bool AudioService::initReflectionPipeline()
 
         AUDIO_LOG( "REFL: reflection pool started (%d sub-workers, off-thread)\n",
                      mConvolutionPool->numWorkers());
+
+        // ── Reverb wet-bus reflection effect (PR C part 2) ──
+        //
+        // The single consumer of the shared baked-reverb source's IR:
+        // Steam Audio's IR handoff supports a single consuming effect, so
+        // in baked-only mode the N per-voice convolutions are replaced by
+        // this ONE bus convolution over the summed reflection sends (see
+        // ConvolutionWorker's bus-field doc for the full design). Same
+        // settings as the per-voice effects (HYBRID, same IR size and
+        // ambisonics channel count) so the wet output is spectrally
+        // identical to what a per-voice effect produced. Created
+        // unconditionally — in realtime mode it idles at zero cost (the
+        // bus-level silent-skip keeps it out of the worker), but it must
+        // exist for runtime flips of reverb_voices_realtime → 0.
+        IPLAudioSettings busAudioSettings{};
+        busAudioSettings.samplingRate =
+            static_cast<IPLint32>(mReflectionSampleRate);
+        busAudioSettings.frameSize =
+            static_cast<IPLint32>(mReflectionFrameSize);
+        IPLerror busErr = iplReflectionEffectCreate(
+            mIplContext, &busAudioSettings, &poolReflSettings,
+            &mBusReflectionEffect);
+        if (busErr == IPL_STATUS_SUCCESS && mBusReflectionEffect) {
+            mConvolutionPool->worker()->busEffect = mBusReflectionEffect;
+            AUDIO_LOG("REFL: reverb wet-bus effect created "
+                      "(hybrid, irSize=%d, ch=%d)\n",
+                      static_cast<int>(irSize),
+                      static_cast<int>(numAmbiChannels));
+        } else {
+            mBusReflectionEffect = nullptr;
+            std::fprintf(stderr,
+                "[FALLBACK] reverb wet-bus reflection effect creation "
+                "failed (error %d) — tearing down the shared baked-reverb "
+                "source and reverting to per-voice reflection sources + "
+                "effects for this scene (correct but ~N× reflection-sim "
+                "cost)\n", static_cast<int>(busErr));
+            // Degrade to the tested legacy path: without the bus effect,
+            // baked voices would have NO reverb route at all. Removing the
+            // shared source flips createVoiceSource/initVoiceDSP back to
+            // eager per-voice sources + effects — each per-voice effect
+            // then reads its OWN source's IR (single consumer each, safe).
+            // The reflection worker is still idle at this point in scene
+            // build (same guarantee the shared-source add relied on), so
+            // the immediate remove + commit is race-free.
+            if (mSharedReverbSource) {
+                IPLSimulator reflSimForRemove =
+                    mReflectionSim ? mReflectionSim->simulator() : nullptr;
+                if (reflSimForRemove) {
+                    iplSourceRemove(mSharedReverbSource, reflSimForRemove);
+                    iplSimulatorCommit(reflSimForRemove);
+                }
+                iplSourceRelease(&mSharedReverbSource);
+                mSharedReverbSource = nullptr;
+            }
+            mSharedReverbSourceFailed = true;
+        }
     }
 
     AUDIO_LOG( "AudioService: reflection pipeline initialized "
@@ -4928,6 +5602,18 @@ void AudioService::destroyReflectionPipeline()
         mConvolutionPool.reset();
     }
 
+    // Reverb wet-bus effect (PR C part 2) — released AFTER the pool
+    // shutdown above joined the sub-worker threads (a worker could
+    // otherwise be mid-apply on this handle) and BEFORE the shared
+    // baked-reverb source teardown in destroyAcousticScene (which runs
+    // right after this function): the effect consumes that source's IR,
+    // and Steam Audio's IR handoff supports a single consuming effect
+    // whose release must precede the IR owner's.
+    if (mBusReflectionEffect) {
+        iplReflectionEffectRelease(&mBusReflectionEffect);
+        mBusReflectionEffect = nullptr;
+    }
+
     // Wait for any in-flight simulation tasks to finish on the worker thread
     if (mReflectionSim) {
         mReflectionSim->waitForCompletion();
@@ -4959,6 +5645,20 @@ void AudioService::destroyAcousticScene()
 
     // Destroy reflection pipeline before simulator (it references simulator sources)
     destroyReflectionPipeline();
+
+    // Shared baked-reverb source (PR C) — the pipeline teardown above has
+    // drained the reflection worker and shut the convolution pool down, so
+    // nothing can still be reading this source's outputs or IR. Remove +
+    // release before the reflection simulator handle goes away below.
+    if (mSharedReverbSource) {
+        if (mReflectionSim && mReflectionSim->simulator()) {
+            iplSourceRemove(mSharedReverbSource,
+                            mReflectionSim->simulator());
+        }
+        iplSourceRelease(&mSharedReverbSource);
+        mSharedReverbSource = nullptr;
+    }
+    mSharedReverbSourceFailed = false;
 
     // Drain the pathing-sim worker so we can mutate its state safely. The
     // pathing sim is the one that holds our probe batch (post-PT-13), so
@@ -6306,6 +7006,82 @@ void AudioService::loopStep(float deltaTime)
             }
         }
 
+        // ── Shared baked-reverb outputs (PR C) — hoisted, once per frame ──
+        //
+        // Every baked voice's reflection result is the same listener-
+        // centric REVERB lookup, computed once per sim iteration by
+        // mSharedReverbSource. Fetch its outputs once here; voices without
+        // a per-voice reflectionSource copy `outputs.reflections` from
+        // this instead of calling iplSourceGetOutputs themselves inside
+        // the loop. Validity follows the same pin-gate contract as
+        // per-voice sources: until one full sim cycle has completed after
+        // the shared source's add, its outputs are the zero-IR sentinel
+        // and voices keep their spawn defaults (dry-only), exactly like a
+        // pending per-voice source.
+        IPLSimulationOutputs sharedReverbOutputs{};
+        bool sharedReverbReady = false;
+        if (mReflectionsEnabled && mSharedReverbSource && mReflectionSim
+            && mReflectionSim->completedCycles() > mSharedReverbCycleAtAdd) {
+            iplSourceGetOutputs(mSharedReverbSource,
+                IPL_SIMULATIONFLAGS_REFLECTIONS, &sharedReverbOutputs);
+            sharedReverbReady = true;
+        }
+
+        // ── Reverb wet-bus params staging (PR C part 2) ──
+        //
+        // The bus effect is the SINGLE consumer of the shared source's IR
+        // (Steam Audio's IR handoff supports a single consuming effect).
+        // Stage its params once per frame from the shared outputs — the
+        // same field set the per-voice refresh below writes into each
+        // voice's dspNode.reflectionParams, so the bus convolution is
+        // parameter-identical to what every per-voice effect received:
+        //   • type HYBRID + numChannels (runtime ambisonics order),
+        //   • delay = 0 (see the load-bearing HYBRID-delay comment in the
+        //     per-voice refresh below for the full rationale),
+        //   • reverbTimes = the IDW-blended listener-nearest probe RT60
+        //     (identical for all voices — listener-centric by design).
+        // busParamsValid gates the audio thread's bus branch; release/
+        // acquire pairing makes the first valid observation see fully
+        // written params (steady-state re-writes share the per-voice
+        // params' accepted tear model).
+        {
+            ConvolutionWorker *busCw =
+                (mConvolutionPool && mConvolutionPool->isActive())
+                    ? mConvolutionPool->worker() : nullptr;
+            if (busCw && busCw->busEffect) {
+                if (sharedReverbReady
+                    && sharedReverbOutputs.reflections.irSize > 0
+                    && sharedReverbOutputs.reflections.ir != nullptr) {
+                    IPLReflectionEffectParams busParams =
+                        sharedReverbOutputs.reflections;
+                    busParams.type        = IPL_REFLECTIONEFFECTTYPE_HYBRID;
+                    busParams.numChannels = mAmbisonicsChannels;
+                    busParams.delay       = 0;
+                    if (listenerReverbTimesValid) {
+                        busParams.reverbTimes[0] = listenerReverbTimes[0];
+                        busParams.reverbTimes[1] = listenerReverbTimes[1];
+                        busParams.reverbTimes[2] = listenerReverbTimes[2];
+                    }
+                    busCw->busParams = busParams;
+                    busCw->busParamsValid.store(true,
+                                                std::memory_order_release);
+                } else {
+                    // No usable IR this frame (shared source pending its
+                    // first sim cycle, or reflections disabled). Keep the
+                    // audio thread out of the bus branch entirely.
+                    busCw->busParamsValid.store(false,
+                                                std::memory_order_release);
+                }
+            }
+        }
+
+        // Whether voices without a per-voice reflection source can route
+        // reverb through the shared wet bus this frame — feeds the
+        // per-voice hasBakedData gate below.
+        const bool busConvAvailable =
+            mConvolutionPool && mConvolutionPool->isActive()
+            && mConvolutionPool->worker()->busEffect != nullptr;
+
         for (auto &[handle, voice] : mVoicePool->voices()) {
             if (!voice->directSource)
                 continue;
@@ -6377,17 +7153,41 @@ void AudioService::loopStep(float deltaTime)
             iplSourceGetOutputs(voice->directSource,
                 IPL_SIMULATIONFLAGS_DIRECT, &outputs);
 
-            // Reflection outputs are only meaningful for sources that have
-            // actually been added to the reflection simulator. If the source
-            // is still pending an add (because the reflection sim was busy
-            // at createVoiceSource time), iplSourceGetOutputs would return
-            // uninitialized values. Keep the existing dspNode.reflectionParams
-            // until the source is flushed and the sim processes it.
-            bool isReflectionPending = !voice->reflectionSource
-                || (mReflectionSim && mReflectionSim->isAddPending(voice->reflectionSource));
-            if (mReflectionsEnabled && !isReflectionPending) {
-                iplSourceGetOutputs(voice->reflectionSource,
-                    IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+            // Reflection outputs. Two shapes (PR C):
+            //   • Voice owns a reflection source (realtime top-N mode, or
+            //     the shared-source-failed fallback): read that source's
+            //     outputs, guarded by the pending-add gate — a source
+            //     still in the pending queue has no valid outputs yet.
+            //   • Baked-only mode (no per-voice source): copy the shared
+            //     baked-reverb outputs fetched once above the loop —
+            //     byte-identical to what a per-voice source would have
+            //     produced. "Pending" maps to the shared source not yet
+            //     having a completed cycle.
+            bool isReflectionPending;
+            if (voice->reflectionSource) {
+                isReflectionPending = mReflectionSim
+                    && mReflectionSim->isAddPending(voice->reflectionSource);
+                if (mReflectionsEnabled && !isReflectionPending) {
+                    iplSourceGetOutputs(voice->reflectionSource,
+                        IPL_SIMULATIONFLAGS_REFLECTIONS, &outputs);
+                }
+            } else if (!voice->dspNode.reflectionEffect) {
+                isReflectionPending = !sharedReverbReady;
+                if (mReflectionsEnabled && sharedReverbReady) {
+                    outputs.reflections = sharedReverbOutputs.reflections;
+                }
+            } else {
+                // Null source but the voice OWNS a per-voice reflection
+                // effect: a realtime-mode voice whose source was demoted
+                // (demoteVoice nulls reflectionSource). Routing it to the
+                // shared outputs would make its per-voice effect a SECOND
+                // consumer of the shared IR — the single-consumer contract
+                // violation this change exists to prevent — and would
+                // re-activate a phantom tail the demote just silenced.
+                // Old pending semantics instead: no outputs → enableRefl
+                // stays false → the voice deactivates (END_NOTAIL),
+                // matching pre-bus behavior.
+                isReflectionPending = true;
             }
 
             // ── Per-frame portal-eq scalar seed ──
@@ -7070,6 +7870,15 @@ void AudioService::loopStep(float deltaTime)
                 // capped at mReverbVoices to stay within the audio
                 // callback budget (~1.5ms per convolution voice).
                 //
+                // PR C part 2: with the shared reverb wet bus, this cap
+                // governs how many voices SEND into the bus (the audio-
+                // budget governor for per-voice send DSP + staging), not
+                // how many convolution instances run — in baked-only mode
+                // there is exactly ONE bus convolution regardless of the
+                // sender count. On the legacy paths (realtime top-N, or
+                // shared-source fallback) the cap still bounds per-voice
+                // convolution instances as before.
+                //
                 // Note: reflCandidates was already shrunk to
                 // (mReverbVoices − tailCount) above, so in normal flow
                 // an isReflVoice voice always has slot budget here.  We still
@@ -7086,7 +7895,15 @@ void AudioService::loopStep(float deltaTime)
                 // on irSize for the same reason CONVOLUTION used to —
                 // HYBRID's apply uses the IR identically to CONVOLUTION in
                 // the [0, hybrid_transition_time] window.
-                bool hasBakedData = voice->dspNode.reflectionEffect
+                // A voice can route baked reverb through either shape
+                // (PR C part 2): its own per-voice effect (legacy paths:
+                // realtime top-N, or shared-source fallback) or the
+                // shared reverb wet bus (baked-only mode — no per-voice
+                // source, no per-voice effect; reflectionsActive then
+                // gates the voice's SEND into the bus accumulator).
+                bool hasBakedData = (voice->dspNode.reflectionEffect
+                                     || (busConvAvailable
+                                         && !voice->reflectionSource))
                     && mProbeManager->hasReflections()
                     && outputs.reflections.irSize > 0;
                 // Pending reflection sources have no valid sim outputs yet
@@ -7415,6 +8232,32 @@ void AudioService::loopStep(float deltaTime)
             }
             iplSimulatorSetSharedInputs(reflectionSimHandle,
                 IPL_SIMULATIONFLAGS_REFLECTIONS, &sharedInputs);
+            // Shared baked-reverb source (PR C): refresh its per-source
+            // inputs once per frame — same call the per-voice staging
+            // pass makes for realtime sources, collapsed to one. The
+            // REVERB-variation lookup keys on the listener (staged via
+            // SetSharedInputs above); source position is stamped to the
+            // listener for coherence. Hybrid params are re-staged because
+            // both are runtime-tunable via the debug console.
+            if (mSharedReverbSource) {
+                IPLSimulationInputs reverbInputs{};
+                reverbInputs.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
+                reverbInputs.baked = IPL_TRUE;
+                reverbInputs.bakedDataIdentifier.type =
+                    IPL_BAKEDDATATYPE_REFLECTIONS;
+                reverbInputs.bakedDataIdentifier.variation =
+                    IPL_BAKEDDATAVARIATION_REVERB;
+                reverbInputs.source = listenerCoord;
+                reverbInputs.reverbScale[0] = 1.0f;
+                reverbInputs.reverbScale[1] = 1.0f;
+                reverbInputs.reverbScale[2] = 1.0f;
+                reverbInputs.hybridReverbTransitionTime =
+                    mHybridTransitionTime;
+                reverbInputs.hybridReverbOverlapPercent =
+                    mHybridOverlapPercent;
+                iplSourceSetInputs(mSharedReverbSource,
+                    IPL_SIMULATIONFLAGS_REFLECTIONS, &reverbInputs);
+            }
             // Pathing also needs the listener pose per-frame. Without
             // this call, iplSimulatorRunPathing has no listener position,
             // silently skips all sources, and iplSourceGetOutputs returns
@@ -8478,6 +9321,13 @@ void AudioService::loopStep(float deltaTime)
                 // Check reflectionEffect (was it created with one?) not
                 // reflectionsActive (is it in the top N right now?) — a voice
                 // may have been active earlier and accumulated convolution state.
+                //
+                // Bus voices (PR C part 2, reflectionEffect == null) take
+                // the END_NOTAIL branch by design: their reverb tail lives
+                // in the SHARED bus effect, which the mix node keeps
+                // draining for the silent-skip window after the last
+                // nonzero send — independent of any voice's lifetime — so
+                // there is no per-voice convolution state to ring out.
                 if (voice->dspNode.reflectionEffect &&
                     voice->dspNode.reflectionsActive.load(std::memory_order_relaxed)) {
                     // Only start a reverb tail if this voice was actually running
@@ -9070,14 +9920,21 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
     voice.dspNode.pathingSource = voice.pathingSource;
 
     // ── Reflection source ──
-    // Created eagerly for every voice so it can route through baked-probe
-    // reverb (inputs.baked = true) by default. The per-frame top-N pass in
-    // loopStep flips the baked flag off to upgrade the closest N voices to
-    // ray-traced realtime reflections (see the inputs.baked logic later in
-    // loopStep). Steam Audio's baked path iterates mSourceData[0] internally,
-    // so a voice without a source-in-simulator would get neither realtime
-    // NOR baked reverb — every voice starts with one so the baseline is
-    // "voice has reverb."
+    // PR C (PLAN.AUDIO_PERF T2): in baked-only mode (reverb_voices_realtime
+    // == 0) NO per-voice reflection source is created — every voice's
+    // reflection result is the listener-centric baked REVERB lookup, which
+    // the single scene-lifetime mSharedReverbSource computes ONCE per sim
+    // iteration for everyone (Steam Audio has no internal dedup, so the
+    // previous eager per-voice sources each paid a full IR reconstruction:
+    // ~30 ms × active voices ≈ 411 ms p50 per iteration on the MISS6 tour).
+    //
+    // A per-voice source is still created when:
+    //   • realtime top-N is enabled (reverb_voices_realtime > 0) — the
+    //     per-frame top-N pass flips inputs.baked off per voice to upgrade
+    //     the closest N to ray-traced realtime reflections, which is
+    //     inherently per-source; or
+    //   • the shared source failed to create (loud [FALLBACK] at scene
+    //     build) — legacy path keeps reverb correct at the old cost.
     //
     // iplSourceAdd modifies the simulator's source list, which the
     // reflection sim thread iterates every cycle (200-800 ms). When that
@@ -9090,7 +9947,7 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
     // means the demote is reserved for genuinely long-lived "stuck-distant"
     // voices; short-lived voices keep their baked reverb for their full
     // lifetime.
-    {
+    if (mReverbVoicesRealtime > 0 || !mSharedReverbSource) {
         IPLSourceSettings srcSettings{};
         srcSettings.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
 
@@ -9212,6 +10069,24 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
         }
         mReflectionSim->setSimulatorDirty();
         mReflectionSim->incrementActiveSources();
+    } else {
+        // Baked-only mode with a live shared source: this voice routes
+        // reverb through the shared wet bus (PR C part 2) — its
+        // reflection SEND accumulates into the bus buffer on the audio
+        // thread and ONE bus effect convolves the sum against
+        // mSharedReverbSource's IR (Steam Audio's IR handoff supports a
+        // single consuming effect, so per-voice effects on the shared IR
+        // are structurally unsafe). loopStep still copies the shared
+        // outputs into this voice's dspNode.reflectionParams for the
+        // reflection diagnostics. The pin gate reuses the SHARED source's
+        // add-cycle: once the shared source has one completed sim cycle,
+        // a freshly spawned voice consumes the current IR on its first
+        // eligible frame instead of waiting out a 200-800 ms sim cycle of
+        // its own — removes most of the "first half-second of dry-only
+        // audio" spawn artifact for baked voices
+        // (project_reflection_deferral_artifact).
+        voice.reflectionSource = nullptr;
+        voice.reflectionSimCycleAtAdd = mSharedReverbCycleAtAdd;
     }
 
     // ── Per-slot direct sources (multi-path ambisonics, Phase 4) ──
@@ -9687,26 +10562,45 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
     // pool being alive (post-Phase-3 the global mixer is gone — readiness is
     // signalled by mConvolutionPool->isActive() instead). The reflection
     // sample rate (24kHz or 48kHz) must match the simulator's.
+    //
+    // PR C part 2: a per-voice effect is only created on the legacy paths
+    // (realtime top-N enabled, or the shared baked-reverb source failed) —
+    // the same condition createVoiceSource uses for per-voice reflection
+    // SOURCES, so effect and source always come as a pair and each effect
+    // reads its OWN source's IR (single consumer each, safe). In
+    // baked-only mode with a live shared source the voice instead sends
+    // into the shared reverb wet bus (one bus effect consumes the shared
+    // IR — Steam Audio's IR handoff supports a single consuming effect),
+    // so it needs the worker pointer for the accumulation but no
+    // convolution instance of its own.
     if (mConvolutionPool && mConvolutionPool->isActive()) {
-        IPLint32 irSize = static_cast<IPLint32>(mRealtimeDuration * mReflectionSampleRate);
+        if (mReverbVoicesRealtime > 0 || !mSharedReverbSource) {
+            IPLint32 irSize = static_cast<IPLint32>(mRealtimeDuration * mReflectionSampleRate);
 
-        IPLAudioSettings reflAudioSettings{};
-        reflAudioSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
-        reflAudioSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
+            IPLAudioSettings reflAudioSettings{};
+            reflAudioSettings.samplingRate = static_cast<IPLint32>(mReflectionSampleRate);
+            reflAudioSettings.frameSize = static_cast<IPLint32>(mReflectionFrameSize);
 
-        IPLReflectionEffectSettings reflSettings{};
-        reflSettings.type = IPL_REFLECTIONEFFECTTYPE_HYBRID;
-        reflSettings.irSize = irSize;
-        reflSettings.numChannels = static_cast<IPLint32>(mAmbisonicsChannels);
+            IPLReflectionEffectSettings reflSettings{};
+            reflSettings.type = IPL_REFLECTIONEFFECTTYPE_HYBRID;
+            reflSettings.irSize = irSize;
+            reflSettings.numChannels = static_cast<IPLint32>(mAmbisonicsChannels);
 
-        err = iplReflectionEffectCreate(mIplContext, &reflAudioSettings,
-                                         &reflSettings, &dsp.reflectionEffect);
-        if (err == IPL_STATUS_SUCCESS) {
-            dsp.convWorker = mConvolutionPool->worker();
+            err = iplReflectionEffectCreate(mIplContext, &reflAudioSettings,
+                                             &reflSettings, &dsp.reflectionEffect);
+            if (err == IPL_STATUS_SUCCESS) {
+                dsp.convWorker = mConvolutionPool->worker();
+            } else {
+                LOG_ERROR("AudioService: iplReflectionEffectCreate failed (error %d) "
+                          "— direct effects only for this voice", err);
+                // Continue without reflections for this voice
+            }
         } else {
-            LOG_ERROR("AudioService: iplReflectionEffectCreate failed (error %d) "
-                      "— direct effects only for this voice", err);
-            // Continue without reflections for this voice
+            // Bus voice: reflection send accumulates into
+            // ConvolutionWorker::busAccumMono on the audio thread;
+            // dsp.reflectionEffect stays null, which is what routes the
+            // audio thread's staging gate to the bus branch.
+            dsp.convWorker = mConvolutionPool->worker();
         }
     }
 
@@ -11409,7 +12303,9 @@ bool AudioService::isPerfJsonlOpen() const {
 //
 // State lives at file scope next to the device-callback statics (see the
 // sWavCapture* block near sLastDeviceCbNs). Threading model:
-//   audio thread   → produces into sWavCaptureRb (lock-free, no I/O)
+//   device thread  → produces into sWavCaptureRb (lock-free, no I/O);
+//                    this is the data-callback thread, NOT the PR-D mixer
+//                    thread — the tap records what the device receives
 //   writer thread  → wavWriterThreadMain drains ring → ma_encoder (disk)
 //   main thread    → start/stopWavCapture lifecycle; only touches the
 //                    ring/encoder while the tap + writer are stopped.
@@ -11618,8 +12514,15 @@ void AudioService::dumpAudioStatusPeriodic()
         if (v->sourceEnded && !v->finished.load(std::memory_order_relaxed)) ++tailVoices;
     }
 
-    // Effective rays/sec (rays * reflection sim steps run in this dump period)
-    float raysPerSec = (reflFrames * mRealtimeNumRays) / 5.0f;  // 5s dump interval
+    // Effective rays/sec (rays × reflection sim steps run in this dump
+    // period). DERIVED from the configured ray count, not measured — and
+    // rays are only traced for REALTIME (non-baked) sources, so in
+    // baked-only mode (reverb_voices_realtime == 0) the truthful value is
+    // zero. Reporting the configured product unconditionally once sent a
+    // whole investigation chasing phantom ray tracing (T2, 2026-07-09).
+    float raysPerSec = (mReverbVoicesRealtime > 0)
+        ? (reflFrames * mRealtimeNumRays) / 5.0f  // 5s dump interval
+        : 0.0f;
 
     // Compute listener's nearest probe once for the whole dump — every
     // ambient row references the same value (their reverb send convolves
@@ -11876,6 +12779,77 @@ void AudioService::dumpAudioStatusPeriodic()
         (unsigned long long)cbP.n,
         fmtMs(cbP.p50), fmtMs(cbP.p95), fmtMs(cbP.p99),
         static_cast<double>(callbackDeadlineMs));
+    // Device-boundary frame accounting (see sDeviceCbFrames): frames should
+    // track mDeviceSampleRate × window-seconds; fc_max > frame_size means
+    // the backend aggregates periods (gap-histogram outliers are benign);
+    // a frame deficit at fc_max == frame_size means real device starvation.
+    // Drained here (exchange) so each window is independent; shared by the
+    // JSONL emit below — do not exchange twice.
+    uint64_t devCbFrames = sDeviceCbFrames.exchange(0, std::memory_order_relaxed);
+    uint32_t devCbFcMin = sDeviceCbFcMin.exchange(0xFFFFFFFFu,
+                                                  std::memory_order_relaxed);
+    uint32_t devCbFcMax = sDeviceCbFcMax.exchange(0, std::memory_order_relaxed);
+    if (devCbFcMin == 0xFFFFFFFFu) devCbFcMin = 0;  // no callbacks this window
+    // PR D — ring / mixer-thread / device-overload window metrics.
+    //
+    // PITFALL GUARD: drained ONCE here; the JSONL perf.window emit below
+    // reuses these locals (same single-drainer rule as cbP above).
+    //   ring low_wm    — min ring fill seen at deviceRead entry this window
+    //                    (frames; -1 = no device reads landed this window).
+    //                    Approaching 0 = the margin is nearly exhausted; the
+    //                    justification data for any future margin/period
+    //                    trim lives here.
+    //   underruns      — deviceRead shortfalls (events / silence frames).
+    //                    Every event also fired a rate-limited [XRUN] line.
+    //   overloads      — CoreAudio kAudioDeviceProcessorOverload count
+    //                    (macOS; always 0 elsewhere). OS-side xrun truth.
+    //   mixer          — per-engine-block ma_engine_read_pcm_frames cost on
+    //                    the mixer thread, incl. exact window max (a single
+    //                    render spike is what eats the ring margin).
+    const bool ringActive = (mRingMixer && mRingMixer->active());
+    RingOutputMixer::WindowStats ringStats;
+    LatencyHistogram::Percentiles mxrP{};
+    if (ringActive) {
+        ringStats = mRingMixer->drainWindowStats();
+        mxrP = mRingMixer->renderHistogram().snapshotAndReset();
+    }
+    const uint32_t overloadsWindow =
+        sDeviceOverloadWindow.exchange(0, std::memory_order_relaxed);
+    const long long ringLowWm =
+        (!ringActive || ringStats.lowWatermarkFrames == RingOutputMixer::kNoReads)
+            ? -1
+            : static_cast<long long>(ringStats.lowWatermarkFrames);
+    const double ringLowWmMs =
+        (ringLowWm >= 0 && mDeviceSampleRate > 0)
+            ? 1000.0 * static_cast<double>(ringLowWm)
+                  / static_cast<double>(mDeviceSampleRate)
+            : 0.0;
+    if (ringActive) {
+        AUDIO_LOG(
+            "[PERF device_cb] n=%llu gap p50/p95/p99=%.3f/%.3f/%.3f ms"
+            " frames=%llu fc_min/max=%u/%u"
+            " | ring low_wm=%lld fr (%.2f ms) underruns=%u ev/%llu fr"
+            " overloads=%u"
+            " | mixer n=%llu p50/p95/p99/max=%.3f/%.3f/%.3f/%.3f ms\n",
+            (unsigned long long)deviceCbP.n,
+            fmtMs(deviceCbP.p50), fmtMs(deviceCbP.p95), fmtMs(deviceCbP.p99),
+            (unsigned long long)devCbFrames, devCbFcMin, devCbFcMax,
+            ringLowWm, ringLowWmMs,
+            ringStats.underrunEvents,
+            (unsigned long long)ringStats.underrunFrames,
+            overloadsWindow,
+            (unsigned long long)mxrP.n,
+            fmtMs(mxrP.p50), fmtMs(mxrP.p95), fmtMs(mxrP.p99),
+            fmtMs(mxrP.maxMs));
+    } else {
+        AUDIO_LOG(
+            "[PERF device_cb] n=%llu gap p50/p95/p99=%.3f/%.3f/%.3f ms"
+            " frames=%llu fc_min/max=%u/%u | ring=off overloads=%u\n",
+            (unsigned long long)deviceCbP.n,
+            fmtMs(deviceCbP.p50), fmtMs(deviceCbP.p95), fmtMs(deviceCbP.p99),
+            (unsigned long long)devCbFrames, devCbFcMin, devCbFcMax,
+            overloadsWindow);
+    }
     if (callbackBudgetWarn) {
         AUDIO_LOG(
             "[PERF callback] BUDGET_WARN p99=%.3f ms (>= 80%% of "
@@ -12086,7 +13060,13 @@ void AudioService::dumpAudioStatusPeriodic()
             "\"worker_max_apply\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"worker_residual\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"inter_cb\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
-            "\"device_cb\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
+            "\"device_cb\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
+                "\"frames\":%llu,\"fc_min\":%u,\"fc_max\":%u,"
+                "\"ring_active\":%s,\"ring_low_wm\":%lld,"
+                "\"ring_low_wm_ms\":%.4f,\"ring_underrun_events\":%u,"
+                "\"ring_underrun_frames\":%llu,\"overloads\":%u},"
+            "\"mixer_render\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,"
+                "\"p99\":%.4f,\"max\":%.4f},"
             "\"signal_pickup\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"sync_wait\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
                 "\"timeouts\":%d,\"deadline_ms\":%.4f}"
@@ -12128,6 +13108,12 @@ void AudioService::dumpAudioStatusPeriodic()
             (unsigned long long)residualP.n, residualP.p50, residualP.p95, residualP.p99,
             (unsigned long long)interCbP.n,  interCbP.p50,  interCbP.p95,  interCbP.p99,
             (unsigned long long)deviceCbP.n, deviceCbP.p50, deviceCbP.p95, deviceCbP.p99,
+                (unsigned long long)devCbFrames, devCbFcMin, devCbFcMax,
+                ringActive ? "true" : "false", ringLowWm, ringLowWmMs,
+                ringStats.underrunEvents,
+                (unsigned long long)ringStats.underrunFrames, overloadsWindow,
+            (unsigned long long)mxrP.n, mxrP.p50, mxrP.p95, mxrP.p99,
+                mxrP.maxMs,
             (unsigned long long)pickupP.n,   pickupP.p50,   pickupP.p95,   pickupP.p99,
             (unsigned long long)syncP.n,  syncP.p50,  syncP.p95,  syncP.p99,
                 syncTimeouts, static_cast<double>(syncDeadlineMs),

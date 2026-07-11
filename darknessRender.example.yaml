@@ -105,8 +105,29 @@ developer:
 
 
 audio:
-  # Audio is organized into eight subsections. Skip any subsection to use
+  # Audio is organized into named subsections. Skip any subsection to use
   # defaults; each setting is independent. Bracketed numbers are valid ranges.
+
+  engine:
+    # Device-callback / mixer-thread topology (immutable after boot).
+    #
+    # ring_mixer: true (default) renders the whole mix graph on a dedicated
+    # high-priority mixer thread that keeps a lock-free ring buffer topped
+    # up; the device callback only copies from the ring (bounded time, so
+    # the render can never starve the audio device — the crackle fix).
+    # false = legacy pre-ring behavior: the mix graph renders synchronously
+    # inside the device callback and competes with the hardware deadline
+    # (kept selectable for A/B comparison; expect crackling under load).
+    ring_mixer: true
+    # Ring fill target in milliseconds. The mixer thread tops the ring up
+    # to this much buffered audio each wake; larger = more scheduling slack
+    # for the render, but also more output latency (the buffered audio sits
+    # between the mix graph and the DAC). <= 0 (default) = auto: two engine
+    # blocks (2 x frame_size / sample_rate), floored at 21.4 ms so total
+    # output slack stays at or above the pre-ring-mixer device-buffer
+    # slack. Watch `[PERF device_cb] ring low_wm=` before trimming: the low
+    # watermark is how close the device came to draining the ring. (0=auto-500)
+    ring_margin_ms: -1
 
   performance:
     # Engine + reverb throughput. Touch these to trade CPU for fidelity.
@@ -142,9 +163,11 @@ audio:
     # 24 kHz is transparent for most material; 12 kHz dulls the highest
     # harmonics. Reverb tails are dominated by frequencies below 4 kHz.
     rate_divisor: 2              # [REFLECTIONS] 1=48k, 2=24k, 4=12k
-    # reflection_throttle = run the realtime ray-trace sim every Nth audio
-    # callback. Higher = less CPU, longer reverb-update latency.
-    reflection_throttle: 4       # [REALTIME] (1–32)
+    # reflection_throttle = signal the reflection-sim worker every Nth
+    # audio loop step. Applies to baked-only mode too — it paces how
+    # often the shared baked-reverb source's IR refreshes against the
+    # listener position. Higher = less CPU, longer reverb-update latency.
+    reflection_throttle: 4       # [REFLECTIONS] (1–32)
     # Steam Audio per-source occlusion sample cap. Used by BOTH the direct
     # and reflection simulators' occlusion solvers.
     sim_max_occlusion_samples: 32  # [DIRECT+REFLECTIONS] (4–256)
@@ -397,12 +420,11 @@ audio:
     # lower visibility threshold / denser probes) is too expensive. Does
     # NOT affect the LPF blocking factor — only amplitude.
     pathing_gain_scale: 1.0      # multiplier on pathing gain (0.1–10.0)
-    # Steam Audio pathing-simulation throttle. iplSimulatorRunPathing runs
-    # synchronously on the main loop thread; running it every frame can
-    # stall the audio callback and produce reverb-path dropouts on busy
-    # scenes. 0.1 s (10 Hz) matches the Unity/Unreal Steam Audio
-    # integration defaults — the listener moves <1 ft per update at
-    # walking speed, well below the threshold for hearing
+    # Steam Audio pathing-simulation throttle. The sim runs on the
+    # PathingSimulator worker thread; this interval sets how often the
+    # worker is signalled. 0.1 s (10 Hz) matches the Unity/Unreal Steam
+    # Audio integration defaults — the listener moves <1 ft per update
+    # at walking speed, well below the threshold for hearing
     # portalAttenuation/portalBlocking changes. Output reads (eqCoeffs →
     # portal gain/LPF) still happen every frame and use Steam Audio's
     # last-cached values, so audio stays smooth between sim runs. Set

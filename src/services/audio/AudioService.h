@@ -79,6 +79,8 @@ struct _IPLProbeBatch_t;
 typedef _IPLProbeBatch_t* IPLProbeBatch;
 struct _IPLPathEffect_t;
 typedef _IPLPathEffect_t* IPLPathEffect;
+struct _IPLReflectionEffect_t;
+typedef _IPLReflectionEffect_t* IPLReflectionEffect;
 
 // Forward declarations for the reflection-sim / convolution-pool subsystems
 // (defined in ReflectionSimulator.h / ConvolutionWorkerPool.h respectively —
@@ -833,6 +835,16 @@ public:
     void setAudioSampleRate(int r) { mAudioSampleRateCfg = r; }
     void setAudioFrameSize(int n)  { mAudioFrameSizeCfg = std::max(256, std::min(n, 4096)); }
     void setSoundCacheMB(int mb)   { mSoundCacheMBCfg = std::max(4, std::min(mb, 1024)); }
+    // Ring-fed mixer thread (PLAN.AUDIO_PERF.md PR D). Immutable after
+    // bootstrapFinished, like sample rate / frame size above.
+    void setRingMixerEnabled(bool on) { mRingMixerEnabledCfg = on; }
+    bool getRingMixerEnabled() const  { return mRingMixerEnabledCfg; }
+    // <= 0 = auto (two engine blocks, min 21.4 ms); clamped to a sane
+    // ceiling so a typo can't allocate a multi-second ring.
+    void setRingMarginMs(float ms) {
+        mRingMarginMsCfg = (ms > 0.0f) ? std::min(ms, 500.0f) : -1.0f;
+    }
+    float getRingMarginMs() const { return mRingMarginMsCfg; }
 
     /// Publish settings used on the audio thread (HRTF interp, spatial blend,
     /// door LPF, propagation min, distance model) into thread-safe storage.
@@ -1754,6 +1766,46 @@ private:
     /// ReflectionSimulator.h for the full threading contract.
     std::unique_ptr<ReflectionSimulator> mReflectionSim;
 
+    /// Shared baked-reverb source (PLAN.AUDIO_PERF PR C / T2). With
+    /// `reverb_voices_realtime: 0` every voice's reflection result is the
+    /// LISTENER-centric baked REVERB lookup — byte-identical inputs and
+    /// outputs across voices (per-voice wet level lives in our DSP chain;
+    /// SA reverbScale is 1.0). Steam Audio 4.7.0 has no internal dedup of
+    /// identical baked identifiers, so per-voice sources paid one full IR
+    /// reconstruction EACH per sim iteration (~30 ms × active voices ≈
+    /// 411 ms p50 on the MISS6 tour). This single scene-lifetime source
+    /// carries the REFLECTIONS simulation instead; baked voices read its
+    /// outputs in loopStep. Created in buildAcousticScene (worker idle —
+    /// immediate add), removed+released in destroyAcousticScene after the
+    /// destroyReflectionPipeline drain. NOT owned by any voice.
+    IPLSource mSharedReverbSource = nullptr;
+
+    /// mReflectionSim->completedCycles() captured when the shared source
+    /// was added — same pin-gate contract as per-voice
+    /// ActiveVoice::reflectionSimCycleAtAdd (outputs are the zero-IR
+    /// sentinel until one full sim cycle has completed after the add).
+    uint64_t mSharedReverbCycleAtAdd = 0;
+
+    /// Loud-fallback flag: shared-source creation failed at scene build
+    /// ([FALLBACK] on stderr), so createVoiceSource reverts to the
+    /// legacy eager per-voice reflection sources (correct but slow) for
+    /// this scene rather than silently losing all reverb.
+    bool mSharedReverbSourceFailed = false;
+
+    /// Reverb wet-bus reflection effect (PR C part 2). In baked-only mode
+    /// the shared source's IR must have exactly ONE consuming effect —
+    /// Steam Audio's IR handoff supports a single consuming effect, so
+    /// per-voice effects reading the shared IR corrupted each other. This
+    /// single HYBRID effect convolves the SUMMED reflection sends of all
+    /// bus voices (accumulated in ConvolutionWorker::busAccumMono; see
+    /// that struct's bus-field doc for the full design). Created in
+    /// initReflectionPipeline right after the convolution pool spins up;
+    /// released in destroyReflectionPipeline AFTER the pool shutdown
+    /// joins the sub-worker threads (a worker could otherwise be inside
+    /// the apply on this handle) and BEFORE destroyAcousticScene removes
+    /// the shared source whose IR this effect consumes.
+    IPLReflectionEffect mBusReflectionEffect = nullptr;
+
     /// Direct-path simulation owner (distance attenuation, occlusion, air
     /// absorption, transmission) — wraps the Steam Audio direct
     /// IPLSimulator handle and a dedicated background worker thread that
@@ -2070,6 +2122,27 @@ private:
     int         mAudioSampleRateCfg        = static_cast<int>(kDefaultDeviceSampleRate);
     int         mAudioFrameSizeCfg         = 512;
     int         mSoundCacheMBCfg           = 64;
+
+    // ── Ring-fed mixer thread (PLAN.AUDIO_PERF.md PR D) ──
+    // audio.engine.ring_mixer — true (default): the mix graph renders on a
+    // dedicated mixer thread into a lock-free ring; the device callback
+    // only drains the ring. false: legacy in-callback rendering (the
+    // pre-PR-D path, kept compiled + selectable for A/B and as the loud
+    // fallback if the mixer thread fails to start).
+    bool        mRingMixerEnabledCfg       = true;
+    // audio.engine.ring_margin_ms — ring fill target. <= 0 (default) =
+    // auto: two engine blocks (2 × frame_size / sample_rate), floored at
+    // 21.4 ms so total output slack stays >= the pre-PR-D ~21.3 ms device
+    // second-period slack regardless of frame_size.
+    float       mRingMarginMsCfg           = -1.0f;
+    std::unique_ptr<class RingOutputMixer> mRingMixer;
+
+    // CoreAudio kAudioDeviceProcessorOverload listener registration state
+    // (macOS only; harmless inert members elsewhere). The AudioObjectID is
+    // stored so shutdownMiniaudio can unregister the exact device it
+    // registered on even if miniaudio reroutes internally.
+    bool        mOverloadListenerInstalled = false;
+    uint32_t    mOverloadDeviceObjectID    = 0;
 
     // ── Baked probe pathing ──
     //

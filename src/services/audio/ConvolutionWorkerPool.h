@@ -278,6 +278,45 @@ struct ConvolutionWorker {
     // overflow.
     int perWorkerSlotCap = kMaxSlots;
 
+    // ── Shared reverb wet bus (baked-only mode, PR C part 2) ──
+    //
+    // WHY one bus: Steam Audio's IR handoff supports a single consuming
+    // effect — applying the effect advances the IR's internal read state,
+    // so N per-voice reflection effects all fed the ONE shared
+    // baked-reverb source's IR corrupt each other's buffers (observed as
+    // a sub-worker crash inside the convolution apply). In baked-only
+    // mode (`reverb_voices_realtime: 0`) every voice's reflection params
+    // are identical anyway (same listener-centric baked-REVERB IR, same
+    // reverbTimes/eq/delay/channel count) — only the input signal and the
+    // per-voice send gain differ. So voices without a per-voice
+    // reflection effect ACCUMULATE their reflection sends into
+    // `busAccumMono[writeIdx]` (audio thread, per callback, per-voice
+    // send gain applied — see steamAudioNodeProcess), and the mix node
+    // stages the sum as ONE ordinary staging slot whose effect is
+    // `busEffect`: a single consumer for the shared IR, and the
+    // sub-worker pipeline (apply → ambi sum → decode → upsample) treats
+    // it exactly like a voice. The `reverb_voices` cap still governs how
+    // many voices SEND (audio-budget governor); it no longer counts
+    // convolution instances.
+    //
+    // busEffect is owned by AudioService (created in
+    // initReflectionPipeline, released in destroyReflectionPipeline AFTER
+    // the pool shutdown joins the sub-worker threads). busParams is
+    // staged by the main thread once per loopStep from the shared
+    // source's outputs — same accepted tear model as the per-voice
+    // dspNode.reflectionParams writes; busParamsValid's release/acquire
+    // pair guarantees the FIRST valid observation sees fully-written
+    // params. busFramesSinceNonzeroInput is mix-node-thread-only state
+    // for the bus-level silent-skip (keep applying zero input for the
+    // drain window after the last nonzero send so the convolution delay
+    // line + parametric tail ring out; sentinel-init so a bus that never
+    // received input never applies).
+    IPLReflectionEffect busEffect = nullptr;
+    IPLReflectionEffectParams busParams{};
+    std::atomic<bool> busParamsValid{false};
+    std::vector<float> busAccumMono[kStagingBuffers];
+    int busFramesSinceNonzeroInput = 1 << 30;
+
     // Shared read-only state (set at init, immutable during processing).
     IPLHRTF hrtf = nullptr;
     IPLContext context = nullptr;
