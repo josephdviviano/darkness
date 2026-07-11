@@ -163,9 +163,11 @@ audio:
     # 24 kHz is transparent for most material; 12 kHz dulls the highest
     # harmonics. Reverb tails are dominated by frequencies below 4 kHz.
     rate_divisor: 2              # [REFLECTIONS] 1=48k, 2=24k, 4=12k
-    # reflection_throttle = run the realtime ray-trace sim every Nth audio
-    # callback. Higher = less CPU, longer reverb-update latency.
-    reflection_throttle: 4       # [REALTIME] (1–32)
+    # reflection_throttle = signal the reflection-sim worker every Nth
+    # audio loop step. Applies to baked-only mode too — it paces how
+    # often the shared baked-reverb source's IR refreshes against the
+    # listener position. Higher = less CPU, longer reverb-update latency.
+    reflection_throttle: 4       # [REFLECTIONS] (1–32)
     # Steam Audio per-source occlusion sample cap. Used by BOTH the direct
     # and reflection simulators' occlusion solvers.
     sim_max_occlusion_samples: 32  # [DIRECT+REFLECTIONS] (4–256)
@@ -400,12 +402,11 @@ audio:
     # lower visibility threshold / denser probes) is too expensive. Does
     # NOT affect the LPF blocking factor — only amplitude.
     pathing_gain_scale: 1.0      # multiplier on pathing gain (0.1–10.0)
-    # Steam Audio pathing-simulation throttle. iplSimulatorRunPathing runs
-    # synchronously on the main loop thread; running it every frame can
-    # stall the audio callback and produce reverb-path dropouts on busy
-    # scenes. 0.1 s (10 Hz) matches the Unity/Unreal Steam Audio
-    # integration defaults — the listener moves <1 ft per update at
-    # walking speed, well below the threshold for hearing
+    # Steam Audio pathing-simulation throttle. The sim runs on the
+    # PathingSimulator worker thread; this interval sets how often the
+    # worker is signalled. 0.1 s (10 Hz) matches the Unity/Unreal Steam
+    # Audio integration defaults — the listener moves <1 ft per update
+    # at walking speed, well below the threshold for hearing
     # portalAttenuation/portalBlocking changes. Output reads (eqCoeffs →
     # portal gain/LPF) still happen every frame and use Steam Audio's
     # last-cached values, so audio stays smooth between sim runs. Set
