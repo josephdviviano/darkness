@@ -967,8 +967,9 @@ public:
      *  yaml key — see PathingProbeDensity in ProbeManager.h). Selects the
      *  per-portal emission in prepareProbeBakeParams: Baseline = single
      *  center probe per non-door portal (Tier 0, the original room/portal
-     *  graph's nodes); Bends = flanking pair per non-door portal (Tier 1,
-     *  default — explicit solver bend points at every opening). Takes
+     *  graph's nodes — the default); Bends = flanking pair per non-door
+     *  portal (Tier 1 — explicit solver bend points at every opening,
+     *  at measurably higher runtime path-solve cost). Takes
      *  effect on the next bake; recorded in the .probes v4 header so a
      *  cache baked at another density triggers the loud automatic
      *  pathing-only re-bake (same policy as the numSamples mismatch).
@@ -998,9 +999,9 @@ public:
     bool getForcePathingBake() const { return mForcePathingBake; }
 
     /** Bake-quality profile selector. True = the `--bake-quality dev`
-     *  iteration profile: pathing visibility sampling drops from
-     *  kPathingVisSamplesShip (16) to kPathingVisSamplesDev (8) — see
-     *  SteamAudioPathing.h. ONE flag feeds BOTH the bake
+     *  iteration profile: pathing visibility sampling selects
+     *  kPathingVisSamplesDev instead of kPathingVisSamplesShip (both 4
+     *  since 2026-07-11) — see SteamAudioPathing.h. ONE flag feeds BOTH the bake
      *  (ProbeBakeParams::pathingNumSamples) and the runtime pathing
      *  simulator (IPLSimulationSettings::numVisSamples), so the two
      *  can never diverge within a run. Must be set BEFORE
@@ -1964,7 +1965,7 @@ private:
     float              mProbePathingDedupRadiusFt = 10.0f;
 
     /// Pathing probe layout density tier. Set from yaml
-    /// (`audio.pathing_probes.density`, default "bends"); consumed by
+    /// (`audio.pathing_probes.density`, default "baseline"); consumed by
     /// prepareProbeBakeParams' portal pass and recorded into the
     /// .probes v4 header. Initialized in the constructor (the enum is
     /// only forward-declared here, so its enumerators are not visible

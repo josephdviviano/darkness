@@ -152,19 +152,25 @@ enum class PathingProbePurpose {
 /// mismatch. Underlying type is fixed (uint32_t) so the value round-trips
 /// through the on-disk header verbatim and the enum can be forward-declared.
 ///
-///   • Baseline — Tier 0: the original Dark Engine room/portal graph's
-///     nodes. 1 probe per room centroid (+ upper centroid for genuinely
-///     tall rooms) + 1 per non-door portal center + door flanking pairs
-///     + emitter mirrors.
-///   • Bends    — Tier 1 (default): baseline, with every NON-door portal's
+///   • Baseline — Tier 0 (default since 2026-07-11 — matrix2 measured it
+///     beating bends on BOTH bake time and runtime solve cost; see
+///     RenderConfig.h audioPathingDensity): the original Dark Engine
+///     room/portal graph's nodes. 1 probe per room centroid (+ upper
+///     centroid for genuinely tall rooms) + 1 per non-door portal center
+///     + door flanking pairs + emitter mirrors.
+///   • Bends    — Tier 1 (implemented and selectable, no longer the
+///     default): baseline, with every NON-door portal's
 ///     single center probe replaced by a flanking pair
 ///     (center ± normal × kPairProbeOffsetFt, purpose PortalPair) — the
 ///     solver's bend points for sound turning corners at every opening.
-///     Cost: +1 probe per non-door portal over baseline. (Exception: when
-///     neither flank resolves to the portal center's room — rooms thinner
-///     than the flank offset — the center probe is kept IN ADDITION so
-///     the thin room keeps its only anchor; see the thin-room coverage
-///     guard in AudioService::prepareProbeBakeParams.)
+///     Cost: +1 probe per non-door portal over baseline.
+///
+/// At EVERY density a thin-room coverage repair runs after the dedup and
+/// inside-door-AABB passes: any room adjacent to a non-door portal that
+/// no surviving candidate resolves to gets one interior repair probe
+/// (see AudioService::prepareProbeBakeParams "Thin-room coverage
+/// repair" — rooms thinner than the flank offset lose their organic
+/// candidates at both tiers).
 ///   • ("high" is reserved for a future Tier 2 — room-span subdivision for
 ///     long halls. Named in config docs but REJECTED at parse until the
 ///     tier exists; see RenderConfig.h.)
@@ -402,8 +408,10 @@ struct ProbeBakeParams {
     /// prepareProbeBakeParams — it travels here solely so the bake can
     /// record it into the .probes v4 header for the loader's
     /// density-mismatch check (same policy as pathingNumSamples: loud +
-    /// automatic pathing-only re-bake).
-    PathingProbeDensity pathingDensity = PathingProbeDensity::Bends;
+    /// automatic pathing-only re-bake). Default mirrors the config
+    /// default (baseline since 2026-07-11); AudioService always
+    /// overwrites it from the active config.
+    PathingProbeDensity pathingDensity = PathingProbeDensity::Baseline;
 
     /// True = pathing-only re-bake: skip the (expensive) reflection IR
     /// bake and carry the CURRENTLY LOADED reflection batch forward into

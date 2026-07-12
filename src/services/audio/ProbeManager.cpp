@@ -1053,7 +1053,7 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     //     The longest meaningful single hop is a room-scale distance:
     //     any two probes further apart than the largest room either
     //     have geometry between them (edge would fail the ray test
-    //     anyway — we're paying 256 rays to discover "no") or are
+    //     anyway — we're paying numSamples² rays to discover "no") or are
     //     connected through intermediate room/portal probes (multi-hop
     //     covers them). Runtime per-voice `inputs.visRange` is clamped
     //     to this cap with a loud [FALLBACK] (AudioService loopStep),

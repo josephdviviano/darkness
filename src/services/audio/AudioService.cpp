@@ -3759,13 +3759,15 @@ const size_t ServiceImpl<AudioService>::SID = __SERVICE_ID_AUDIO;
 AudioService::AudioService(ServiceManager *manager, const std::string &name)
     : ServiceImpl<AudioService>(manager, name)
 {
-    // Pathing probe layout density default (Tier 1, per the probe-
-    // refactoring plan: dev AND ship default to "bends" until Tier 2
-    // content earns its cost). Initialized here rather than as a default
+    // Pathing probe layout density default (Tier 0 "baseline" since
+    // 2026-07-11: matrix2 measured baseline beating bends on BOTH bake
+    // time and runtime path-solve cost — findAlternatePaths is
+    // ~quadratic in probe count; see RenderConfig.h audioPathingDensity).
+    // Initialized here rather than as a default
     // member initializer because AudioService.h only forward-declares
     // the enum. Overridden from yaml (`audio.pathing_probes.density`)
     // before the first bake.
-    mPathingProbeDensity = PathingProbeDensity::Bends;
+    mPathingProbeDensity = PathingProbeDensity::Baseline;
 
     // LoopClient definition — runs after input, before renderer
     mLoopClientDef.id = LOOPCLIENT_ID_AUDIO;
@@ -9008,9 +9010,9 @@ void AudioService::loopStep(float deltaTime)
                     //   • the solver runs on PathingSimulator's worker
                     //     thread, off the main loop;
                     //   • numVisSamples comes from the shared profile
-                    //     constants (SteamAudioPathing.h — ship 16 /
-                    //     dev 8), identical at bake and runtime, so the
-                    //     alternate-path search never re-tests edges
+                    //     constants (SteamAudioPathing.h — 4 for both
+                    //     profiles), identical at bake and runtime, so
+                    //     the alternate-path search never re-tests edges
                     //     against a different density than they were
                     //     baked with;
                     //   • the visRange clamp above keeps the candidate
@@ -14346,7 +14348,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     //         influence radius (~5 ft) so the probe is reached from
     //         either adjoining room and the path-finder can wrap
     //         through short corners on its own.
-    //       - bends (default): TWO probes flanking the portal along
+    //       - bends: TWO probes flanking the portal along
     //         ±normal × kPairProbeOffsetFt (purpose PortalPair) — the
     //         same geometry as door pairs, generalized to every
     //         opening. These are the solver's bend points: with a node
@@ -14368,6 +14370,25 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     //     here — portals first (architectural anchors), then centroids
     //     (room coverage), so a centroid coincident with a nearby portal
     //     gets dropped rather than the other way around.
+    //
+    // One record per non-door portal — input to the thin-room
+    // coverage-repair pass, which runs AFTER the dedup and the
+    // inside-door-AABB rejection (near the end of this function) so its
+    // coverage check sees the candidates that actually SURVIVE. Room IDs
+    // come from ROOM_DB (authoritative), NOT roomFromPoint(center): a
+    // point exactly on the portal plane resolves to whichever neighbor
+    // wins the tie, so keying repairs on it filed thin connector rooms
+    // under their big neighbors and left them unrepairable (MISS2 room
+    // 194, a 0.6-ft slab between two aligned portals, kept two loud
+    // [BAKE_PARITY] MISSING pairs). Declared at function scope: filled
+    // by the portal-emission block, consumed by the repair block.
+    struct NonDoorPortalRecord {
+        int roomAID = -1;      ///< ROOM_DB IDs; -1 when absent
+        int roomBID = -1;
+        Vector3 center;        ///< portal center (on the plane)
+        Vector3 unitNormal;    ///< normalized portal plane normal
+    };
+    std::vector<NonDoorPortalRecord> nonDoorPortals;
     if (mProbePathingBatchEnabled && mRoomService) {
         const auto &rooms = mRoomService->getAllRooms();
 
@@ -14520,7 +14541,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         //     adaptive-radius pass overrides it with a Voronoi-overlap
         //     value. The path-finder reaches it from either adjoining
         //     room and can wrap around short corners.
-        //   • Non-door portals, bends density (default) → two PortalPair
+        //   • Non-door portals, bends density → two PortalPair
         //     probes flanking the opening along ±portal-normal ×
         //     kPairProbeOffsetFt (the door-pair geometry generalized to
         //     every portal). A node on each side of the aperture gives
@@ -14551,22 +14572,6 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
 
         int portalDoorPairCount = 0;
         int portalBendPairCount = 0;
-        int portalThinRoomKept  = 0;
-        // One record per non-door portal — input to the thin-room
-        // coverage-repair pass after centroid emission. Room IDs come
-        // from ROOM_DB (authoritative), NOT roomFromPoint(center): a
-        // point exactly on the portal plane resolves to whichever
-        // neighbor wins the tie, so keying repairs on it filed thin
-        // connector rooms under their big neighbors and left them
-        // unrepairable (MISS2 room 194, a 0.6-ft slab between two
-        // aligned portals, kept two loud [BAKE_PARITY] MISSING pairs).
-        struct BendPortalRecord {
-            int roomAID = -1;      ///< ROOM_DB IDs; -1 when absent
-            int roomBID = -1;
-            Vector3 center;        ///< portal center (on the plane)
-            Vector3 unitNormal;    ///< normalized portal plane normal
-        };
-        std::vector<BendPortalRecord> bendPortals;
         for (const auto &roomPtr : rooms) {
             if (!roomPtr) continue;
             const uint32_t pc = roomPtr->getPortalCount();
@@ -14610,6 +14615,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     }
                 }
 
+                const Vector3 nrm = glm::normalize(normal);
                 if (isDoorPortal || bendsDensity) {
                     // Flanking pair: DoorPair when a door OBB sits in
                     // the opening (closed-door edge invalidation),
@@ -14623,7 +14629,6 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     const PathingProbePurpose pairPurpose = isDoorPortal
                         ? PathingProbePurpose::DoorPair
                         : PathingProbePurpose::PortalPair;
-                    Vector3 nrm = glm::normalize(normal);
                     PathingProbeCandidate inside;
                     inside.position = center - nrm * kPairProbeOffsetFt;
                     inside.radiusFt = 3.0f;
@@ -14636,21 +14641,6 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     params.pathingCandidates.push_back(outside);
                     if (isDoorPortal) portalDoorPairCount += 2;
                     else              portalBendPairCount += 2;
-
-                    // Remember this portal for the thin-room
-                    // coverage-repair pass below (non-door only —
-                    // a door portal's center probe would sit inside
-                    // the door OBB and be rejected as a sound-bypass
-                    // anchor by the inside-door pass anyway).
-                    if (!isDoorPortal) {
-                        BendPortalRecord rec;
-                        rec.roomAID = static_cast<int>(roomA->getRoomID());
-                        rec.roomBID = roomB
-                            ? static_cast<int>(roomB->getRoomID()) : -1;
-                        rec.center     = center;
-                        rec.unitNormal = nrm;
-                        bendPortals.push_back(rec);
-                    }
                 } else {
                     PathingProbeCandidate cand;
                     cand.position = center;
@@ -14658,6 +14648,29 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     cand.purpose  = PathingProbePurpose::Portal;
                     params.pathingCandidates.push_back(cand);
                     ++portalCount;
+                }
+
+                // Remember this portal for the thin-room coverage-repair
+                // pass (runs at ALL densities, after dedup + the
+                // inside-door rejection — see below). Recorded at every
+                // density because baseline's single portal-center probe
+                // is NOT a coverage guarantee either: it sits exactly on
+                // the portal plane (roomFromPoint tie → often resolves
+                // to a neighbor) and can itself be rejected by the
+                // inside-door pass (MISS2 portal 416's center sits
+                // inside door 1019's AABB). Door portals stay excluded:
+                // zero-probe rooms whose every portal carries a door are
+                // inter-door connector volumes owned by the runtime
+                // door-validation path, graded missing_door_adjacent by
+                // [BAKE_PARITY] by design.
+                if (!isDoorPortal) {
+                    NonDoorPortalRecord rec;
+                    rec.roomAID = static_cast<int>(roomA->getRoomID());
+                    rec.roomBID = roomB
+                        ? static_cast<int>(roomB->getRoomID()) : -1;
+                    rec.center     = center;
+                    rec.unitNormal = nrm;
+                    nonDoorPortals.push_back(rec);
                 }
             }
         }
@@ -14787,100 +14800,25 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                   "cells)\n",
                   roomCount, upperCentroidCount, kMinUpperRoomHeightFt);
 
-        // ── Thin-room coverage repair (bends density only) ──────────────
-        //
-        // At bends, the flanking pair REPLACES baseline's portal-center
-        // probe — but for rooms thinner than kPairProbeOffsetFt along
-        // the portal normal (compound-doorway connector volumes, shallow
-        // alcoves) BOTH flanks overshoot into the neighbor rooms, and if
-        // the room's own centroid also resolves elsewhere (overlapping
-        // sub-rooms, flat rooms shorter than the ear-height anchor) the
-        // room ends up with ZERO probes resolving to it. First measured
-        // on MISS6: 27 of 324 ROOM_DB portal pairs went
-        // [BAKE_PARITY]-MISSING at bends, every one a zero-probe room
-        // that baseline had covered via its portal-center probe.
-        //
-        // Repair GLOBALLY rather than per-portal: compute the set of
-        // rooms some candidate already resolves to, then place ONE
-        // repair probe per room that is in nobody's coverage. (A
-        // per-portal "did my own flanks cover my center's room" test
-        // over-fired 10× on MISS2 — flanks nudged out of solid later,
-        // rooms already covered by centroids or by OTHER portals'
-        // flanks.)
-        //
-        // The repair probe is REQUIRED to resolve to the room it
-        // repairs: candidates walk outward from the portal center along
-        // ± the portal normal (small offsets first — a 0.6-ft
-        // connector's only interior is 0.3 ft off the plane) until
-        // roomFromPoint confirms interior placement. Placing it AT the
-        // center (on the plane) looked equivalent but was not: the
-        // plane point resolves to whichever neighbor wins the tie, i.e.
-        // it fails for exactly the thin rooms this pass exists to cover
-        // (MISS2 room 194). Room-aware dedup preserves the repair probe
-        // against the nearby flanks (different room).
-        if (bendsDensity && mRoomService && !bendPortals.empty()) {
-            std::set<int> covered;
-            for (const auto &cand : params.pathingCandidates) {
-                Room *r = mRoomService->roomFromPoint(cand.position);
-                if (r) covered.insert(static_cast<int>(r->getRoomID()));
-            }
-            std::set<int> repaired, unrepairable;
-            static constexpr float kRepairOffsetsFt[] = {
-                0.25f, 0.5f, 1.0f, 2.0f, 3.5f, 5.0f};
-            for (const auto &bp : bendPortals) {
-                for (int side = 0; side < 2; ++side) {
-                    const int roomID = (side == 0) ? bp.roomAID
-                                                   : bp.roomBID;
-                    if (roomID < 0) continue;
-                    if (covered.count(roomID) || repaired.count(roomID))
-                        continue;
-                    bool placed = false;
-                    for (float off : kRepairOffsetsFt) {
-                        for (float sign : {1.0f, -1.0f}) {
-                            const Vector3 p = bp.center
-                                + bp.unitNormal * (off * sign);
-                            Room *r = mRoomService->roomFromPoint(p);
-                            if (!r || static_cast<int>(r->getRoomID())
-                                          != roomID)
-                                continue;
-                            PathingProbeCandidate cand;
-                            cand.position = p;
-                            cand.radiusFt = kPortalRadiusFt;
-                            cand.purpose  = PathingProbePurpose::Portal;
-                            params.pathingCandidates.push_back(cand);
-                            ++portalThinRoomKept;
-                            repaired.insert(roomID);
-                            placed = true;
-                            break;
-                        }
-                        if (placed) break;
-                    }
-                    if (!placed) unrepairable.insert(roomID);
-                }
-            }
-            // A room every portal failed to anchor stays loud here AND
-            // in [BAKE_PARITY] — do not soften: this is exactly the
-            // zero-probe class the parity check exists to catch.
-            for (int roomID : unrepairable) {
-                if (repaired.count(roomID)) continue;  // later portal won
-                std::fprintf(stderr,
-                    "[FALLBACK] pathing thin-room repair: room %d has no "
-                    "portal-adjacent interior point roomFromPoint "
-                    "resolves to it — the room will have zero pathing "
-                    "probes and [BAKE_PARITY] will report its pairs\n",
-                    roomID);
-            }
-            AUDIO_LOG("Pathing thin-room repair: %d interior probes added "
-                      "for rooms no pair/centroid candidate resolves to "
-                      "(bends density)\n", portalThinRoomKept);
-        }
+        // NOTE: the thin-room coverage repair used to run HERE (right
+        // after centroid emission) and only at bends density. That was
+        // the room-194 parity bug: its "is the room covered?" snapshot
+        // was taken BEFORE the proximity dedup and the inside-door-AABB
+        // rejection, both of which can delete the very candidate the
+        // snapshot counted (MISS2 room 194 — a 0.6-ft door-threshold
+        // slab — was "covered" by its own centroid, which the
+        // inside-door pass then rejected as a sound-bypass anchor,
+        // leaving the room with zero probes at EVERY density). The
+        // repair now runs near the end of this function, after every
+        // candidate-deleting pass — see "Thin-room coverage repair"
+        // below.
 
         AUDIO_LOG("Pathing candidates: %d portal probes + %d room centroids "
                   "(%d room centroids sky-snapped, %d portal back-dups "
-                  "skipped, %d sky portals skipped, %d thin-room repairs) "
+                  "skipped, %d sky portals skipped) "
                   "= %zu pre-dedup\n",
                   portalCount, roomCount, roomSnapped, portalDup, portalSky,
-                  portalThinRoomKept, params.pathingCandidates.size());
+                  params.pathingCandidates.size());
 
         // Pathing filter: accept any candidate that resolves to a real
         // Room. Portal probes sit ~1ft off the doorway plane by design,
@@ -15385,34 +15323,52 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         // diagnostic surfaces after every bake (e.g. probe #22 inside
         // door 424 on MISS5).
         if (mRoomService && !params.pathingCandidates.empty()) {
+            // Shared predicate: is this point inside any registered
+            // door's world-AABB? Used by the rejection loop below AND by
+            // the thin-room coverage repair after it (the repair runs
+            // after this pass, so it must apply the same test itself or
+            // it would place exactly the sound-bypass anchors this pass
+            // exists to delete). Returns the door ID for the log, -1 if
+            // outside all doors.
+            auto insideDoorAABB = [this](const Vector3 &p) -> int {
+                for (const auto &kv : mDoorAudioInstances) {
+                    const DoorAudioInstance &di = kv.second;
+                    const Vector3 &mn = di.worldAABBmin;
+                    const Vector3 &mx = di.worldAABBmax;
+                    if (mn.x > mx.x) continue;  // degenerate AABB
+                    if (p.x >= mn.x && p.x <= mx.x
+                     && p.y >= mn.y && p.y <= mx.y
+                     && p.z >= mn.z && p.z <= mx.z) {
+                        return kv.first;
+                    }
+                }
+                return -1;
+            };
+
             std::vector<PathingProbeCandidate> kept;
             kept.reserve(params.pathingCandidates.size());
             int rejectedInDoor = 0;
             for (size_t ci = 0; ci < params.pathingCandidates.size(); ++ci) {
                 const auto &cand = params.pathingCandidates[ci];
                 if (cand.purpose != PathingProbePurpose::DoorPair) {
-                    bool insideDoor = false;
-                    for (const auto &kv : mDoorAudioInstances) {
-                        const DoorAudioInstance &di = kv.second;
-                        const Vector3 &mn = di.worldAABBmin;
-                        const Vector3 &mx = di.worldAABBmax;
-                        if (mn.x > mx.x) continue;  // degenerate AABB
-                        if (cand.position.x >= mn.x && cand.position.x <= mx.x
-                         && cand.position.y >= mn.y && cand.position.y <= mx.y
-                         && cand.position.z >= mn.z && cand.position.z <= mx.z) {
-                            insideDoor = true;
-                            std::fprintf(stderr,
-                                "[PROBE_BAKE] rejecting probe #%zu at "
-                                "(%.1f,%.1f,%.1f) — inside door %d AABB "
-                                "min=(%.1f,%.1f,%.1f) max=(%.1f,%.1f,%.1f)\n",
-                                ci,
-                                cand.position.x, cand.position.y, cand.position.z,
-                                kv.first,
-                                mn.x, mn.y, mn.z, mx.x, mx.y, mx.z);
-                            break;
-                        }
+                    const int doorID = insideDoorAABB(cand.position);
+                    if (doorID >= 0) {
+                        auto it = mDoorAudioInstances.find(doorID);
+                        const Vector3 mn = (it != mDoorAudioInstances.end())
+                            ? it->second.worldAABBmin : Vector3{};
+                        const Vector3 mx = (it != mDoorAudioInstances.end())
+                            ? it->second.worldAABBmax : Vector3{};
+                        std::fprintf(stderr,
+                            "[PROBE_BAKE] rejecting probe #%zu at "
+                            "(%.1f,%.1f,%.1f) — inside door %d AABB "
+                            "min=(%.1f,%.1f,%.1f) max=(%.1f,%.1f,%.1f)\n",
+                            ci,
+                            cand.position.x, cand.position.y, cand.position.z,
+                            doorID,
+                            mn.x, mn.y, mn.z, mx.x, mx.y, mx.z);
+                        ++rejectedInDoor;
+                        continue;
                     }
-                    if (insideDoor) { ++rejectedInDoor; continue; }
                 }
                 kept.push_back(cand);
             }
@@ -15423,6 +15379,119 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     "anchors)\n", rejectedInDoor);
             }
             params.pathingCandidates = std::move(kept);
+
+            // ── Thin-room coverage repair (ALL densities) ───────────────
+            //
+            // Guarantee: every ROOM_DB room adjacent to a NON-door portal
+            // ends up with at least one candidate that roomFromPoint
+            // resolves to it. Rooms thinner than kPairProbeOffsetFt along
+            // the portal normal (door-threshold slabs, compound-doorway
+            // connector volumes, shallow alcoves) lose every organic
+            // candidate: bends flanks overshoot into the neighbors,
+            // baseline's portal-center probe sits exactly on the plane
+            // (roomFromPoint tie → neighbor) or inside a door AABB, and
+            // the room's own centroid can resolve elsewhere or get
+            // rejected by the inside-door pass above. First measured on
+            // MISS6 (27 of 324 pairs [BAKE_PARITY]-MISSING at bends);
+            // MISS2 room 194 then proved the class exists at baseline
+            // too, so the pass runs at every density.
+            //
+            // WHY it runs HERE — after the proximity dedup and the
+            // inside-door-AABB rejection, immediately before the adaptive
+            // radius pass: the coverage snapshot must be taken against
+            // the candidates that actually SURVIVE. The previous version
+            // ran right after centroid emission and marked MISS2 room 194
+            // "covered" by its own centroid — which the inside-door pass
+            // then deleted (the 0.6-ft slab is door 1019's threshold;
+            // the centroid sat inside the door AABB), leaving the room
+            // zero-probe with no repair and no [FALLBACK]. Nothing after
+            // this point deletes or moves candidates: the adaptive pass
+            // only assigns radii, and ProbeManager's placement filter
+            // accepts any point that resolves to a room (its nudge fires
+            // only for in-solid points, which never provided coverage in
+            // the first place — roomFromPoint had already failed there).
+            //
+            // Repair GLOBALLY rather than per-portal: compute the set of
+            // rooms some surviving candidate resolves to, then place ONE
+            // repair probe per room that is in nobody's coverage. (A
+            // per-portal "did my own flanks cover my center's room" test
+            // over-fired 10× on MISS2 — rooms were already covered by
+            // centroids or by OTHER portals' flanks.)
+            //
+            // The repair probe is REQUIRED to resolve to the room it
+            // repairs AND to sit outside every door AABB: candidates walk
+            // outward from the portal center along ± the portal normal
+            // (small offsets first — a 0.6-ft connector's interior may be
+            // a 0.1-ft sliver between a door AABB face and the far portal
+            // plane, hence the 0.05-ft first rung) until both tests pass.
+            // Placing it AT the center (on the plane) looked equivalent
+            // but was not: the plane point resolves to whichever neighbor
+            // wins the tie, i.e. it fails for exactly the thin rooms this
+            // pass exists to cover. Running after the dedup also means
+            // nothing can drop the repair probe afterwards.
+            int thinRoomRepairs = 0;
+            if (!nonDoorPortals.empty()) {
+                std::set<int> covered;
+                for (const auto &cand : params.pathingCandidates) {
+                    Room *r = mRoomService->roomFromPoint(cand.position);
+                    if (r) covered.insert(static_cast<int>(r->getRoomID()));
+                }
+                std::set<int> repaired, unrepairable;
+                static constexpr float kRepairOffsetsFt[] = {
+                    0.05f, 0.1f, 0.25f, 0.5f, 1.0f, 2.0f, 3.5f, 5.0f};
+                for (const auto &bp : nonDoorPortals) {
+                    for (int side = 0; side < 2; ++side) {
+                        const int roomID = (side == 0) ? bp.roomAID
+                                                       : bp.roomBID;
+                        if (roomID < 0) continue;
+                        if (covered.count(roomID) || repaired.count(roomID))
+                            continue;
+                        bool placed = false;
+                        for (float off : kRepairOffsetsFt) {
+                            for (float sign : {1.0f, -1.0f}) {
+                                const Vector3 p = bp.center
+                                    + bp.unitNormal * (off * sign);
+                                Room *r = mRoomService->roomFromPoint(p);
+                                if (!r || static_cast<int>(r->getRoomID())
+                                              != roomID)
+                                    continue;
+                                if (insideDoorAABB(p) >= 0) continue;
+                                PathingProbeCandidate cand;
+                                cand.position = p;
+                                // Placeholder — the adaptive radius pass
+                                // below assigns the real value.
+                                cand.radiusFt = 5.0f;
+                                cand.purpose  = PathingProbePurpose::Portal;
+                                params.pathingCandidates.push_back(cand);
+                                ++thinRoomRepairs;
+                                repaired.insert(roomID);
+                                placed = true;
+                                break;
+                            }
+                            if (placed) break;
+                        }
+                        if (!placed) unrepairable.insert(roomID);
+                    }
+                }
+                // A room every portal failed to anchor stays loud here
+                // AND in [BAKE_PARITY] — do not soften: this is exactly
+                // the zero-probe class the parity check exists to catch.
+                for (int roomID : unrepairable) {
+                    if (repaired.count(roomID)) continue;  // later portal won
+                    std::fprintf(stderr,
+                        "[FALLBACK] pathing thin-room repair: room %d has "
+                        "no portal-adjacent interior point that "
+                        "roomFromPoint resolves to it outside every door "
+                        "AABB — the room will have zero pathing probes "
+                        "and [BAKE_PARITY] will report its pairs\n",
+                        roomID);
+                }
+                AUDIO_LOG("Pathing thin-room repair: %d interior probes "
+                          "added post-dedup/post-door-rejection for rooms "
+                          "no surviving candidate resolves to "
+                          "(density=%s)\n", thinRoomRepairs,
+                          pathingProbeDensityName(mPathingProbeDensity));
+            }
 
             // Adaptive radius — overlap-favoring, room-radius-floored:
             //   target     = kOverlapFactor × halfDistanceToNearest

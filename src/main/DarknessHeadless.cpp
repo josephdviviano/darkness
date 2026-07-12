@@ -2265,7 +2265,7 @@ static int runProbePlanVerb(const std::string &misPath,
             } else if (p == "audio.pathing_probes.density") {
                 // Single string→enum mapping (pathingProbeDensityFromName;
                 // "high" reserved for a future Tier 2). Reject-at-parse,
-                // loudly, keeping the default (bends).
+                // loudly, keeping the current value (default baseline).
                 const auto density = Darkness::pathingProbeDensityFromName(v);
                 if (density != Darkness::PathingProbeDensity::Unknown) {
                     audioSvc->setPathingProbeDensity(density);

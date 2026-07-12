@@ -379,9 +379,11 @@ audio:
 // reserved-for-Tier-2 "high" — is rejected at parse with a loud stderr
 // message and the default kept.
 TEST_CASE("audio pathing_probes density YAML key", "[config][yaml][audio]") {
-    SECTION("default is bends") {
+    SECTION("default is baseline") {
+        // Baseline became the default 2026-07-11 (matrix2: beats bends
+        // on both bake time and runtime path-solve cost).
         Darkness::RenderConfig cfg;
-        CHECK(cfg.audioPathingDensity == "bends");
+        CHECK(cfg.audioPathingDensity == "baseline");
     }
     SECTION("baseline accepted") {
         TmpFile tmp("audio:\n  pathing_probes:\n    density: baseline\n");
@@ -399,13 +401,13 @@ TEST_CASE("audio pathing_probes density YAML key", "[config][yaml][audio]") {
         TmpFile tmp("audio:\n  pathing_probes:\n    density: high\n");
         Darkness::RenderConfig cfg;
         REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
-        CHECK(cfg.audioPathingDensity == "bends");
+        CHECK(cfg.audioPathingDensity == "baseline");
     }
     SECTION("garbage rejected, default kept") {
         TmpFile tmp("audio:\n  pathing_probes:\n    density: ultra\n");
         Darkness::RenderConfig cfg;
         REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
-        CHECK(cfg.audioPathingDensity == "bends");
+        CHECK(cfg.audioPathingDensity == "baseline");
     }
     SECTION("--set override: valid values apply, invalid rejected") {
         Darkness::RenderConfig cfg;
