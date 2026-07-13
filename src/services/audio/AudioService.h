@@ -1749,13 +1749,29 @@ private:
     /// conversion.
     void recomputeDoorWorldAABB(DoorAudioInstance &inst) const;
 
-    /// Midpoint of every non-degenerate registered door OBB (world AABB
-    /// center, engine feet). The SINGLE door-position source shared by the
-    /// bake's door-portal classifier and [BAKE_PARITY]'s door-adjacent
-    /// grader — both match portals against these within
-    /// kPathingDoorPortalMatchDistFt, so the two passes can never drift
-    /// on what counts as a door.
-    std::vector<Vector3> doorAudioMidpoints() const;
+    /// World AABB (engine feet) of every non-degenerate registered door.
+    /// The SINGLE door-geometry source shared by the bake's door-portal
+    /// classifier and [BAKE_PARITY]'s door-adjacent grader — both match
+    /// portals against these boxes within kPathingDoorPortalMatchDistFt
+    /// of point-to-AABB distance (NOT distance to the box midpoint; see
+    /// the WHY comment on sPointAABBDistSq in AudioService.cpp), so the
+    /// two passes can never drift on what counts as a door.
+    struct DoorWorldAABB {
+        Vector3 mn{0.0f, 0.0f, 0.0f};
+        Vector3 mx{0.0f, 0.0f, 0.0f};
+    };
+    std::vector<DoorWorldAABB> doorAudioAABBs() const;
+
+    /// [DOOR_PORTAL_MAP] — DEV diagnostic emitted once at the end of
+    /// registerDoorGeometry: one stderr line per registered door mapping
+    /// the door's audio OBB (point-to-AABB distance) to the nearest
+    /// ROOM_DB portal, using the SAME match rule as the bake's DoorPair
+    /// classifier (kPathingDoorPortalMatchDistFt). Read offline by
+    /// analysis/door_detour_class.py to attach alternate-route detour
+    /// classes (NONE/LONG/SHORT) to concrete door IDs while testing the
+    /// door-event pathing-latency hypothesis. Purely observational —
+    /// mutates nothing.
+    void logDoorPortalMap() const;
 
     /// Set by setDoorTransform; consumed (and cleared) at the top of the
     /// next loopStep. Coalesces multiple per-frame door transform updates

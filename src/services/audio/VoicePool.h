@@ -472,6 +472,25 @@ struct ActiveVoice {
     bool     pathWantedLastTick = false;    // pathingWanted at last due tick
     bool     pathStagedEnabled = false;     // mirrors SA-side pathingInputs.enabled
 
+    // ── O2a review F3 — out-of-range re-entry staleness gate ──
+    //
+    // (Main-thread only, like the memo above.) While a voice sits beyond
+    // maxAudibleDist it is dropped from the solve set, so Steam Audio
+    // retains outputs FROZEN at exit time — possibly minutes old, with
+    // door states that no longer exist. On re-entry those outputs must
+    // not reach the audio thread (pre-O2a "sound through walls" artifact
+    // class). The harvest pass sets pathOutputsStale on every
+    // out-of-range frame (and latches pathSolvePending so a covering
+    // solve is guaranteed even when the excursion falls entirely between
+    // due ticks); the staging pass arms pathStaleCoverCycle =
+    // PathingSimulator::completedCycles()+1 at the next signaled SOLVE
+    // (UINT64_MAX = not yet armed); the harvest pass's re-entry hold
+    // keeps dspNode.pathTargetValid=false and the scalar portal mapping
+    // parked silent until completedCycles() reaches the target — the
+    // same completed-cycles pattern as reflectionSimCycleAtAdd.
+    bool     pathOutputsStale = false;
+    uint64_t pathStaleCoverCycle = UINT64_MAX;
+
     // Per-voice volumetric-occlusion sphere radius (engine feet).
     // Computed in createVoiceSource by raycasting from the source
     // position in N uniformly-distributed directions; the radius is

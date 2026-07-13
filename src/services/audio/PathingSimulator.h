@@ -212,8 +212,11 @@ public:
 
     /// O2a staging counters — how many eligible voices the main thread
     /// staged for a SOLVE (PATHING flag set: validation + alternate-path
-    /// search runs) vs SKIPPED (memo said nothing changed; Steam Audio
-    /// retains the cached outputs) on each signaled staging pass.
+    /// search runs) vs SKIPPED (IN-RANGE voices whose memo said nothing
+    /// changed; Steam Audio retains the cached outputs) on each signaled
+    /// staging pass. Out-of-range eligible voices count in NEITHER bucket
+    /// (review F6: they were never solved pre-O2a either, so counting
+    /// them as "skipped" overstated the dirty-gating win).
     /// Accumulated across the [PERF pathing] dump window and drained
     /// (exchange 0) by the worker's periodic dump, which appends
     /// `solved=`/`skipped=` to the [PERF pathing] line.

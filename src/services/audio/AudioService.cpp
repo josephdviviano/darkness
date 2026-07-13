@@ -6029,6 +6029,11 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
                 pp.size(), mDoorAudioInstances.size());
         }
     }
+
+    // [DOOR_PORTAL_MAP] — one line per registered door with its matched
+    // ROOM_DB portal (room pair), for the offline detour classifier. See
+    // the declaration comment in AudioService.h.
+    logDoorPortalMap();
 }
 
 //------------------------------------------------------
@@ -6570,6 +6575,15 @@ void AudioService::loopStep(float deltaTime)
     // (lastIterationEndNs — no main-thread detection lag inflates the
     // number). Runs every loopStep, before any signal this frame, so a
     // completion and a fresh signal in the same frame resolve in order.
+    //
+    // Soundness of "covering" (review F2 follow-up): a counted solve can
+    // no longer lose staged voices mid-iteration. Every pathing
+    // iplSourceSetInputs — SOLVE staging and the solve→skip transition
+    // alike — is gated on pathingWillSignal, whose gates include
+    // !pathBusy; therefore the SA-side enabled flag (written live by
+    // setInputs, read live by the solve loop) can only change while the
+    // worker is idle, and the iteration this detector credits ran with
+    // exactly the voice set staged at its signal.
     if (mDoorSolveInFlight && mPathingSim
         && mPathingSim->completedCycles() >= mDoorSolveInFlightCycle) {
         const int64_t doneNs = mPathingSim->lastIterationEndNs();
@@ -6712,6 +6726,61 @@ void AudioService::loopStep(float deltaTime)
         }
     }
 
+    // ── O2a commit-vs-solve priority: hold sim signals while a commit waits ──
+    //
+    // Review finding F1 (BLOCKER): the canMutate gate above requires a
+    // COINCIDENTAL all-three-idle top-of-frame. With the due-override
+    // below keeping the pathing worker grinding back-to-back solves
+    // during swings — and refl/direct iterations tiling the frame
+    // boundaries ([DIRECT_LAG] fires on ~1/3 of stress frames) — that
+    // coincidence can fail for hundreds of ms at a stretch, starving the
+    // 0.05 ms door BVH commit and flooring [DOOR_ROUTE_LATENCY] at
+    // p95 181-257 ms with worst windows near 2 s (user hard gate
+    // ≤ 150 ms). The commit is the prerequisite for every covering solve,
+    // so it must win: while a door scene-commit is still pending after
+    // the block above (i.e. a worker was busy this frame), HOLD the sim
+    // signals this frame — pathing (Step 3 + the staging pass's
+    // pathingWillSignal) unconditionally, and reflection
+    // (wantReflections) + the direct worker once pathing is already idle
+    // (doorCommitHoldAux below). No new iterations start, every
+    // in-flight iteration finishes within its own duration, the commit
+    // lands on the first all-idle top-of-frame (≤ longest in-flight
+    // iteration + a frame), the committed gen advances, and the
+    // due-override + staging pass fire a covering solve in that same
+    // loopStep. During a continuous swing this alternates commit/solve
+    // at the solve's own granularity instead of solve-solve-solve
+    // against stale geometry; refl/direct pause for at most an
+    // iteration + a frame or two around each commit (params hold a
+    // frame or two longer — the same staleness class the existing
+    // DIRECT_LAG skip already tolerates, smoothed by the per-voice DSP
+    // ramps).
+    //
+    // Read AFTER the commit block deliberately: on the frame the commit
+    // lands, mSceneNeedsCommit was just cleared → no hold → all workers
+    // signal immediately, pathing against the fresh BVH. setDoorTransform
+    // (the only setter) runs on this same thread via DoorSystem::simStep,
+    // so the value cannot change between here and the Step 3 signal gate.
+    //
+    // The pathing consumers (staging pathingWillSignal, Step 3
+    // wantPathing) must stay in lockstep — memo updates key on actually
+    // signaling. Other canMutate consumers: none (the door commit above
+    // is the only one), and the refl/direct flush+commit paths gate on
+    // their own worker only — this hold cannot regress them. Idle worlds
+    // (no door movement) never set mSceneNeedsCommit, so none of this
+    // path runs there.
+    const bool doorCommitHold =
+        mIplScene && mSceneNeedsCommit.load(std::memory_order_acquire);
+    // Refl/direct variant of the hold: only once the pathing worker is
+    // ALREADY idle. While pathing itself is the commit blocker (worst
+    // case the multi-second findAlternatePaths explosion a swinging door
+    // can trigger), pausing refl/direct buys nothing — the commit can't
+    // land anyway — and would freeze every voice's direct
+    // occlusion/distance params for the whole solve. With pathBusy false
+    // the pause is bounded by one refl/direct iteration (+ a frame): the
+    // commit lands on the first all-idle top-of-frame and everything
+    // resumes that same loopStep.
+    const bool doorCommitHoldAux = doorCommitHold && !pathBusy;
+
     // ── O2a pathing due-override: re-solve continuously during swings ──
     //
     // PLAN.PATHING_DESIGN.md §6 decision 1: door-event route updates must
@@ -6727,7 +6796,18 @@ void AudioService::loopStep(float deltaTime)
     // the natural throttle resumes its own rhythm, and the one extra due
     // tick it may produce right after is a no-op (all memos fresh, all
     // voices staged as skip).
+    //
+    // Review finding F5: the override is a no-op while pathing is
+    // inoperative (disabled, no probe batch, or no simulator) —
+    // mDoorGenLastSignalGen can never advance in that state, so without
+    // this gate a single door bump latched the override permanently and
+    // forced every subsequent loopStep due. The gate mirrors the
+    // operative subset of pathingWillSignal / wantPathing; if pathing
+    // comes online later, committed-vs-signaled gen still differ and the
+    // override resumes naturally.
     if (!mPathingDueThisStep
+        && mPathingProbeBatchAdded && mProbePathingEnabled
+        && mPathingSim != nullptr
         && mDoorGenCommitted != mDoorGenLastSignalGen) {
         mPathingDueThisStep = true;
     }
@@ -7432,6 +7512,25 @@ void AudioService::loopStep(float deltaTime)
                         slot.targetDirectParams.transmissionType =
                             IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
                     }
+                    // O2a review F3: out-of-range voices are dropped from
+                    // the solve set (staging memo → skip), so Steam Audio
+                    // retains outputs FROZEN at exit time — possibly
+                    // minutes old, encoding door states that no longer
+                    // exist. Mark them stale (the re-entry hold branch
+                    // below keeps the audio thread off them) and latch a
+                    // solve request so re-entry ALWAYS gets a covering
+                    // re-solve, even when the whole excursion falls
+                    // between two due ticks (the staging pass's
+                    // rising-edge trigger samples range only on due
+                    // ticks, so a sub-interval boundary dip would
+                    // otherwise never re-solve and the hold would never
+                    // release). Resetting the cover cycle each frame out
+                    // of range means a NEW covering solve is required
+                    // after every excursion, not one that was armed
+                    // before the voice left range.
+                    voice->pathOutputsStale    = true;
+                    voice->pathStaleCoverCycle = UINT64_MAX;
+                    voice->pathSolvePending    = true;
                 } else if (mPathingSim
                            && mPathingSim->isAddPending(voice->pathingSource)) {
                     // T0.4 — pending-source race guard. The voice's
@@ -7465,7 +7564,69 @@ void AudioService::loopStep(float deltaTime)
                             "schema='%s' [#%d]\n",
                             handle, voice->schemaName.c_str(), n + 1);
                     }
+                } else if (voice->pathOutputsStale
+                           && (voice->pathStaleCoverCycle == UINT64_MAX
+                               || !mPathingSim
+                               || mPathingSim->completedCycles()
+                                      < voice->pathStaleCoverCycle)) {
+                    // O2a review F3 — out-of-range → in-range re-entry
+                    // hold. The retained outputs on this source predate
+                    // the out-of-range window (frozen at exit time), so
+                    // consuming them now would resurrect the pre-O2a
+                    // "sound through walls" artifact class: a route
+                    // solved while a door stood open, served minutes
+                    // later with the door closed. Treat re-entry exactly
+                    // like a pending source: bypass the path effect
+                    // (pathTargetValid=false) and park the scalar portal
+                    // mapping at silent-reflection-send / LPF-open (the
+                    // SH-zero convention — currentPortalAtten smooths
+                    // toward these, no snap) until the memo-triggered
+                    // re-solve completes. Completion detection reuses the
+                    // completed-cycles gate pattern (see
+                    // reflectionSimCycleAtAdd): the staging pass armed
+                    // pathStaleCoverCycle at the signaled covering solve;
+                    // UINT64_MAX means that solve hasn't even been staged
+                    // yet. Typical hold: one solve iteration + signal
+                    // latency; the out-of-range branch latched
+                    // pathSolvePending, so the covering solve is
+                    // guaranteed to be requested.
+                    voice->dspNode.pathTargetValid.store(
+                        false, std::memory_order_release);
+                    voice->dspNode.portalAttenuation = 0.0f;
+                    voice->dspNode.portalBlocking    = 0.0f;
+                    static std::atomic<int> sReentryHoldLogCount{0};
+                    int hn = sReentryHoldLogCount.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (hn < 16 || (hn % 256) == 0) {
+                        std::fprintf(stderr,
+                            "[PATH_REENTRY_HOLD] h=%u schema='%s' "
+                            "coverCycle=%llu completed=%llu [#%d]\n",
+                            handle, voice->schemaName.c_str(),
+                            static_cast<unsigned long long>(
+                                voice->pathStaleCoverCycle),
+                            static_cast<unsigned long long>(
+                                mPathingSim ? mPathingSim->completedCycles()
+                                            : 0),
+                            hn + 1);
+                    }
                 } else {
+                    // Covering re-solve landed — retained outputs are
+                    // fresh again; release the F3 re-entry hold (loud,
+                    // rate-limited, so hold→release pairing is greppable
+                    // in staleness spot-checks).
+                    if (voice->pathOutputsStale) {
+                        voice->pathOutputsStale    = false;
+                        voice->pathStaleCoverCycle = UINT64_MAX;
+                        static std::atomic<int> sReentryResolveLogCount{0};
+                        int rn = sReentryResolveLogCount.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (rn < 16 || (rn % 256) == 0) {
+                            std::fprintf(stderr,
+                                "[PATH_REENTRY_RESOLVE] h=%u schema='%s' "
+                                "[#%d]\n",
+                                handle, voice->schemaName.c_str(), rn + 1);
+                        }
+                    }
                     // Standard Valve pattern (Unity / Unreal / FMOD / Wwise
                     // all use this verbatim): read latest pathing outputs
                     // each frame and pass through to iplPathEffectApply
@@ -8416,12 +8577,22 @@ void AudioService::loopStep(float deltaTime)
             //
             // pathingWillSignal mirrors Step 3's wantPathing gate EXACTLY
             // (same inputs, none of which change between here and there:
-            // pathBusy was sampled once at top-of-frame, the due flag and
-            // batch/enable state are main-thread members). Per-voice solve
-            // memos are updated ONLY on frames that actually signal the
-            // worker — a due-but-busy frame latches pathSolvePending
-            // instead, so no solve request is ever silently dropped
-            // (worker-busy skips keep the latch).
+            // pathBusy was sampled once at top-of-frame, the due flag,
+            // doorCommitHold, and batch/enable state are main-thread
+            // members/locals). Per-voice solve memos are updated ONLY on
+            // frames that actually signal the worker — a due-but-can't-
+            // signal frame (worker busy, or a door commit is pending and
+            // holding the signal per review F1) latches pathSolvePending
+            // instead, so no solve request is ever silently dropped.
+            // Review F2: the solve→skip staging transition is gated on
+            // this same flag — iplSourceSetInputs writes the SA-side
+            // enabled flag live and iplSimulatorRunPathing's solve loop
+            // reads it live, so a skip staged mid-iteration would strip
+            // the voice from the very solve its memo already recorded as
+            // covering it (permanently stale route until the next memo
+            // trigger). With BOTH solve and skip staging behind
+            // pathingWillSignal (whose gates include !pathBusy), pathing
+            // setInputs can only ever land while the worker is idle.
             //
             // stagingListenerRoomId feeds the memo's "listener changed
             // room" trigger; INT32_MIN = no room resolved (treated as its
@@ -8436,6 +8607,7 @@ void AudioService::loopStep(float deltaTime)
                                         && mProbePathingEnabled
                                         && mPathingDueThisStep
                                         && !pathBusy
+                                        && !doorCommitHold
                                         && (mPathingSim != nullptr);
             const int32_t stagingListenerRoomId = listenerRoom
                 ? static_cast<int32_t>(listenerRoom->getRoomID())
@@ -9008,11 +9180,14 @@ void AudioService::loopStep(float deltaTime)
                 //     the PATHING flag cleared: Steam Audio drops the
                 //     source from the solve loop and serves its retained
                 //     outputs (the cache). Not staged again until the
-                //     next solve.
+                //     next solve. Like SOLVE, only staged on frames that
+                //     actually signal (review F2 — a mid-iteration skip
+                //     write would strip the voice from the running solve
+                //     its memo already recorded as covering it).
                 //   (neither) — needs a solve but this frame can't signal
-                //     (worker busy): latch pathSolvePending and stage
-                //     nothing; the latch forces SOLVE on the next
-                //     signaling due tick.
+                //     (worker busy, or door-commit hold — review F1):
+                //     latch pathSolvePending and stage nothing; the latch
+                //     forces SOLVE on the next signaling due tick.
                 float voicePathingDist = glm::length(voice->worldPos - mListenerPos);
                 bool  pathingWanted    = (voicePathingDist <= voice->maxAudibleDist);
                 const bool voicePathingEligible = mPathingProbeBatchAdded
@@ -9048,23 +9223,56 @@ void AudioService::loopStep(float deltaTime)
                             voice->pathEverSolved            = true;
                             voice->pathSolvePending          = false;
                             voice->pathStagedEnabled         = true;
+                            // O2a review F3: if this voice's retained
+                            // outputs are stale from an out-of-range
+                            // window, THIS signaled solve is the one that
+                            // refreshes them — arm the completed-cycles
+                            // target the harvest pass's re-entry hold
+                            // keys on. The worker is idle here
+                            // (pathingWillSignal ⊇ !pathBusy) and only
+                            // Step 3's signal() can start it, so
+                            // completedCycles()+1 is exactly the cycle
+                            // that will contain this staging.
+                            if (voice->pathOutputsStale
+                                && voice->pathStaleCoverCycle == UINT64_MAX
+                                && mPathingSim) {
+                                voice->pathStaleCoverCycle =
+                                    mPathingSim->completedCycles() + 1;
+                            }
                         } else {
-                            // Due tick that can't signal (worker busy) —
-                            // keep the request alive; do NOT touch the
-                            // memo (memo updates only on signaled solves).
+                            // Due tick that can't signal (worker busy or
+                            // door-commit hold) — keep the request alive;
+                            // do NOT touch the memo (memo updates only on
+                            // signaled solves).
                             voice->pathSolvePending = true;
                         }
-                    } else if (voice->pathStagedEnabled) {
+                    } else if (voice->pathStagedEnabled && pathingWillSignal) {
                         // Transition solve→skip: one staging call with the
                         // PATHING flag cleared, then silence until the
-                        // next solve.
+                        // next solve. Gated on pathingWillSignal (review
+                        // F2): iplSourceSetInputs flips the SA-side
+                        // enabled flag LIVE and the mid-flight solve loop
+                        // reads it LIVE — staging this on a due-but-busy
+                        // frame stripped the voice from the covering solve
+                        // its memo already recorded, leaving a permanently
+                        // stale route (door closed, route open) until the
+                        // next memo trigger. Deferring the transition to
+                        // the next signaling frame is free: the voice is
+                        // simply solved once more before entering skip.
                         stagePathingSkip = true;
                         voice->pathStagedEnabled = false;
                     }
                     voice->pathWantedLastTick = pathingWanted;
+                    // [PERF pathing] staging mix. `skipped` counts only
+                    // IN-RANGE eligible voices served from Steam Audio's
+                    // retained outputs (the dirty-gating win); out-of-range
+                    // voices are counted in neither bucket — they were
+                    // never solved under the pre-O2a staging either, so
+                    // counting them as "skipped" overstated the win
+                    // (review F6).
                     if (pathingWillSignal) {
-                        if (stagePathingSolve) ++pathingStagedSolved;
-                        else                   ++pathingStagedSkipped;
+                        if (stagePathingSolve)  ++pathingStagedSolved;
+                        else if (pathingWanted) ++pathingStagedSkipped;
                     }
                 }
                 // LOCKSTEP INVARIANT (segfault class — see the matching
@@ -9354,7 +9562,12 @@ void AudioService::loopStep(float deltaTime)
             // ambisonics decoder and the convolution worker pool are alive
             // (post-Phase-3 the global IPLReflectionMixer is gone — the
             // worker pool sums ambisonics manually).
-            bool wantReflections = mReflectionsEnabled
+            // Review F1: !doorCommitHoldAux sits BEFORE
+            // throttleTickAndConsume so a hold frame short-circuits
+            // without consuming the throttle tick — the counter stays
+            // >= threshold and the reflection iteration fires on the
+            // first non-hold frame.
+            bool wantReflections = mReflectionsEnabled && !doorCommitHoldAux
                 && mIplAmbiDecodeEffect && mConvolutionPool && mConvolutionPool->isActive()
                 && !reflBusy && mReflectionSim
                 && mReflectionSim->throttleTickAndConsume();
@@ -9388,8 +9601,21 @@ void AudioService::loopStep(float deltaTime)
             // slower.
             if (mDirectSim && directSimHandle) {
                 if (mDirectWorkerActive) {
-                    mDirectSim->signal();
+                    // Review F1: hold the direct signal while a door
+                    // scene-commit is pending AND the pathing worker is
+                    // idle (doorCommitHoldAux), so the commit's canMutate
+                    // gate isn't perpetually re-blocked by fresh direct
+                    // iterations (the worker only needs to stay idle for
+                    // ONE top-of-frame). Direct params hold one extra
+                    // frame — the exact staleness the DIRECT_LAG skip
+                    // path already produces when the worker overruns.
+                    if (!doorCommitHoldAux) {
+                        mDirectSim->signal();
+                    }
                 } else {
+                    // Synchronous fallback runs on THIS thread, strictly
+                    // ordered with the commit block — it can never block
+                    // canMutate at top-of-frame, so no hold needed.
                     mDirectSim->runSynchronous();
                 }
             }
@@ -9427,15 +9653,26 @@ void AudioService::loopStep(float deltaTime)
                 // inside ipl::SimulationManager::simulatePathing iterating
                 // a list whose entries had just been freed.
                 const bool gateNotBusy    = !pathBusy;
+                // Review F1: never signal while a door scene-commit is
+                // pending — the commit needs ALL workers idle, and a
+                // signaled solve would (a) hog the worker for the whole
+                // iteration, starving the commit, and (b) solve against
+                // the STALE BVH anyway. Holding lets the worker idle, the
+                // commit land, and the covering solve fire the very next
+                // frame against fresh geometry (see the doorCommitHold
+                // definition after the commit block).
+                const bool gateNoCommitHold = !doorCommitHold;
                 // O2a: must agree with the pathingWillSignal the staging
                 // pass keyed its memo updates on — same inputs, none of
                 // which changed since (pathBusy is the top-of-frame
-                // sample; the members are main-thread-owned). The
-                // mPathingSim null-check difference is immaterial: a null
-                // sim fails the `wantPathing && mPathingSim` signal
-                // condition below just the same.
+                // sample; doorCommitHold is a post-commit-block local;
+                // the members are main-thread-owned). The mPathingSim
+                // null-check difference is immaterial: a null sim fails
+                // the `wantPathing && mPathingSim` signal condition below
+                // just the same.
                 const bool wantPathing    = gateProbeBatch && gateEnable
-                                         && gateDue && gateNotBusy;
+                                         && gateDue && gateNotBusy
+                                         && gateNoCommitHold;
 
                 // [PATHING_LAG] diagnostic: the CONFIGURED throttle
                 // elapsed but the worker is still running the previous
@@ -9505,13 +9742,15 @@ void AudioService::loopStep(float deltaTime)
                 int n = sRunPathingLogCount.fetch_add(1, std::memory_order_relaxed);
                 if (n < 8) {
                     AUDIO_LOG("[RUN_PATHING] called=%d probeBatchAdded=%d "
-                              "enabled=%d due=%d notBusy=%d updateInterval=%.3f "
+                              "enabled=%d due=%d notBusy=%d noCommitHold=%d "
+                              "updateInterval=%.3f "
                               "accumSec=%.3f (occurrence #%d)\n",
                               wantPathing ? 1 : 0,
                               gateProbeBatch ? 1 : 0,
                               gateEnable ? 1 : 0,
                               gateDue ? 1 : 0,
                               gateNotBusy ? 1 : 0,
+                              gateNoCommitHold ? 1 : 0,
                               mPathingUpdateInterval, mPathingAccumSec,
                               n + 1);
                 }
@@ -14177,26 +14416,149 @@ static constexpr float kPathingSkyThresholdFt = 30.0f;
 // Door-portal classification distance, shared by the emission pass
 // (DoorPair vs Portal/PortalPair split) and verifyPathingBakeParity
 // (door-adjacent grading). A portal whose center lies within this
-// distance of a registered door's AABB midpoint carries that door's
-// OBB. Same drift rule as the sky threshold: emission and parity MUST
-// classify identically or parity mislabels door gaps as regressions.
+// distance of a registered door's world AABB (point-to-box distance,
+// sPointAABBDistSq below) carries that door's OBB. Same drift rule as
+// the sky threshold: emission and parity MUST classify identically or
+// parity mislabels door gaps as regressions.
 static constexpr float kPathingDoorPortalMatchDistFt = 3.0f;
 
-// Shared door-position source for the bake's door-portal classifier and
-// [BAKE_PARITY]'s door-adjacent grader — see the declaration comment.
-std::vector<Vector3> AudioService::doorAudioMidpoints() const
+// Squared distance from a point to an axis-aligned box (0 inside).
+//
+// WHY point-to-AABB and not point-to-midpoint: a door's acoustic
+// footprint is its whole slab, not its center. ROOM_DB portal polygons
+// sit in the cell-boundary opening the door fills, so the portal center
+// always lies inside or within modeling slop of the door's world AABB —
+// but it can be ARBITRARILY far from the AABB *midpoint* for tall/wide
+// doors (67/147 MISS2 doors failed the old 3 ft midpoint rule, 15 of
+// them at exactly 5.00 ft of pure vertical offset; their portals were
+// never classified as door portals and got no DoorPair flanking
+// probes). Measuring to the box makes the 3 ft budget absorb only
+// portal-polygon vs door-mesh slop instead of half the door's extent.
+static float sPointAABBDistSq(const Vector3 &p, const Vector3 &mn,
+                              const Vector3 &mx)
 {
-    std::vector<Vector3> mids;
-    mids.reserve(mDoorAudioInstances.size());
+    const float dx = std::max(std::max(mn.x - p.x, p.x - mx.x), 0.0f);
+    const float dy = std::max(std::max(mn.y - p.y, p.y - mx.y), 0.0f);
+    const float dz = std::max(std::max(mn.z - p.z, p.z - mx.z), 0.0f);
+    return dx * dx + dy * dy + dz * dz;
+}
+
+// Shared door-geometry source for the bake's door-portal classifier and
+// [BAKE_PARITY]'s door-adjacent grader — see the declaration comment.
+std::vector<AudioService::DoorWorldAABB> AudioService::doorAudioAABBs() const
+{
+    std::vector<DoorWorldAABB> boxes;
+    boxes.reserve(mDoorAudioInstances.size());
     for (const auto &kv : mDoorAudioInstances) {
         const DoorAudioInstance &di = kv.second;
         if (di.worldAABBmin.x > di.worldAABBmax.x) continue;  // degenerate
-        mids.push_back(Vector3(
+        boxes.push_back(DoorWorldAABB{di.worldAABBmin, di.worldAABBmax});
+    }
+    return boxes;
+}
+
+//------------------------------------------------------
+// [DOOR_PORTAL_MAP] — DEV diagnostic (see AudioService.h declaration).
+// Inverse view of the DoorPair emission classifier: instead of asking
+// "does this portal center sit within kPathingDoorPortalMatchDistFt of
+// any door's world AABB?", it reports per DOOR which physical portal
+// that is, so offline analysis can join door IDs against room-graph
+// rows. The printed midpoint is display-only (stable join key for
+// analysis/door_detour_class.py); the DISTANCE is point-to-AABB, the
+// same rule emission and parity use.
+// One record per physical portal via the same myID>destID dedup the
+// emission pass uses. Runs once per registerDoorGeometry batch; O(doors
+// × portals) scan, boot-time only, no state mutated.
+void AudioService::logDoorPortalMap() const
+{
+    if (!mRoomService || !mRoomService->isLoaded()) {
+        std::fprintf(stderr,
+            "[DOOR_PORTAL_MAP] RoomService not loaded — cannot map %zu "
+            "registered doors to portals\n", mDoorAudioInstances.size());
+        return;
+    }
+    const auto &rooms = mRoomService->getAllRooms();
+    for (const auto &kv : mDoorAudioInstances) {
+        const DoorAudioInstance &di = kv.second;
+        if (di.worldAABBmin.x > di.worldAABBmax.x) continue;  // degenerate
+        // Midpoint is printed for the offline join only; matching uses
+        // point-to-AABB distance (see sPointAABBDistSq's WHY comment).
+        const Vector3 mid(
             (di.worldAABBmin.x + di.worldAABBmax.x) * 0.5f,
             (di.worldAABBmin.y + di.worldAABBmax.y) * 0.5f,
-            (di.worldAABBmin.z + di.worldAABBmax.z) * 0.5f));
+            (di.worldAABBmin.z + di.worldAABBmax.z) * 0.5f);
+        float   bestD = 1e30f;
+        int     bestA = -1, bestB = -1;
+        Vector3 bestC(0.0f, 0.0f, 0.0f);
+        // Polygon-distance audit (diagnostic-only, NOT the match rule):
+        // ROOM_DB portals are room-brush intersection faces, frequently
+        // much larger than the physical doorway, so a portal's CENTER
+        // can sit far from a door whose opening its polygon nonetheless
+        // spans. Reporting the door-box-to-POLYGON distance alongside
+        // the center-based rule separates "genuine interior door
+        // (closet / cabinet / shutter)" from "boundary door under an
+        // oversized portal" when auditing unmatched doors.
+        float   polyD = 1e30f;
+        int     polyA = -1, polyB = -1;
+        for (const auto &roomPtr : rooms) {
+            if (!roomPtr) continue;
+            const uint32_t pc = roomPtr->getPortalCount();
+            for (uint32_t i = 0; i < pc; ++i) {
+                ::Darkness::RoomPortal *portal = roomPtr->getPortal(i);
+                if (!portal) continue;
+                // one record per physical portal (same dedup as emission)
+                if (portal->getPortalID() > portal->getDestPortalID())
+                    continue;
+                ::Darkness::Room *farRoom = portal->getFarRoom();
+                const Vector3 c = portal->getCenter();
+                const float d = std::sqrt(sPointAABBDistSq(
+                    c, di.worldAABBmin, di.worldAABBmax));
+                if (d < bestD) {
+                    bestD = d;
+                    bestA = roomPtr->getRoomID();
+                    bestB = farRoom ? farRoom->getRoomID() : -1;
+                    bestC = c;
+                }
+                // Min door-box<->portal-polygon distance by alternating
+                // projection between the two convex sets (a few rounds
+                // reach diagnostic precision).
+                Vector3 q = portal->closestPointOnPolygon(mid);
+                float dPoly = 0.0f;
+                for (int it = 0; it < 3; ++it) {
+                    const Vector3 boxPt(
+                        std::min(std::max(q.x, di.worldAABBmin.x),
+                                 di.worldAABBmax.x),
+                        std::min(std::max(q.y, di.worldAABBmin.y),
+                                 di.worldAABBmax.y),
+                        std::min(std::max(q.z, di.worldAABBmin.z),
+                                 di.worldAABBmax.z));
+                    q = portal->closestPointOnPolygon(boxPt);
+                    dPoly = glm::length(q - boxPt);
+                }
+                if (dPoly < polyD) {
+                    polyD = dPoly;
+                    polyA = roomPtr->getRoomID();
+                    polyB = farRoom ? farRoom->getRoomID() : -1;
+                }
+            }
+        }
+        if (bestA >= 0 && bestD <= kPathingDoorPortalMatchDistFt) {
+            std::fprintf(stderr,
+                "[DOOR_PORTAL_MAP] door=%d mid=(%.1f,%.1f,%.1f) portal "
+                "rooms %d<->%d center=(%.1f,%.1f,%.1f) d=%.2fft "
+                "polyNearest rooms %d<->%d dPoly=%.2fft\n",
+                kv.first, mid.x, mid.y, mid.z, bestA, bestB,
+                bestC.x, bestC.y, bestC.z, bestD, polyA, polyB, polyD);
+        } else {
+            std::fprintf(stderr,
+                "[DOOR_PORTAL_MAP] door=%d mid=(%.1f,%.1f,%.1f) NO portal "
+                "within %.1fft (nearest rooms %d<->%d d=%.2fft) "
+                "polyNearest rooms %d<->%d dPoly=%.2fft\n",
+                kv.first, mid.x, mid.y, mid.z,
+                kPathingDoorPortalMatchDistFt, bestA, bestB, bestD,
+                polyA, polyB, polyD);
+        }
     }
-    return mids;
 }
 
 //------------------------------------------------------
@@ -14292,8 +14654,8 @@ void AudioService::verifyPathingBakeParity()
         return false;
     };
 
-    // Door-centroid list for door-adjacent grading — same source and
-    // same match distance as the emission pass's DoorPair classifier.
+    // Door-AABB list for door-adjacent grading — same source and same
+    // point-to-box match rule as the emission pass's DoorPair classifier.
     // A door portal's baked edge is INTENTIONALLY absent when the door
     // was closed at bake time (the door OBB sits in the acoustic scene
     // and rejects the pair's visibility rays — that is the DoorPair
@@ -14303,13 +14665,13 @@ void AudioService::verifyPathingBakeParity()
     // MISSING count that gates probe-layout regressions: the runtime
     // door-validation path, not the baked graph, owns sound across
     // doors.
-    const std::vector<Vector3> doorMids = doorAudioMidpoints();
+    const std::vector<DoorWorldAABB> doorBoxes = doorAudioAABBs();
     const float doorMatchSq = kPathingDoorPortalMatchDistFt
                             * kPathingDoorPortalMatchDistFt;
     auto isDoorAdjacentPortal = [&](const Vector3 &center) -> bool {
-        for (const Vector3 &dm : doorMids) {
-            Vector3 dv = dm - center;
-            if (glm::dot(dv, dv) < doorMatchSq) return true;
+        for (const DoorWorldAABB &b : doorBoxes) {
+            if (sPointAABBDistSq(center, b.mn, b.mx) < doorMatchSq)
+                return true;
         }
         return false;
     };
@@ -14826,9 +15188,13 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         constexpr float kPairProbeOffsetFt = 5.0f;
         // Distance below which a portal centroid is classified as
         // "belonging to a door" (door pair-probes emitted instead of a
-        // single centroid probe). Doors and non-door portals are not
-        // typically placed coincident in Thief levels, so a 3 ft test
-        // separates them unambiguously. File-static constant so
+        // single centroid probe). Measured point-to-door-AABB, NOT to
+        // the door midpoint — see sPointAABBDistSq's WHY comment (the
+        // midpoint rule missed 67/147 MISS2 doors whose portal centers
+        // sit vertically offset from tall doors' box centers). Doors
+        // and non-door portals are not typically placed coincident in
+        // Thief levels, so a 3 ft box-clearance test separates them
+        // unambiguously. File-static constant so
         // verifyPathingBakeParity classifies identically.
         constexpr float kDoorPortalMatchDistFt = kPathingDoorPortalMatchDistFt;
         const float kDoorPortalMatchDistSq =
@@ -14864,15 +15230,15 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         //     built from acoustic-mesh ray tests, not from
         //     `influence.radius` overlap.
         //
-        // Door classification: door midpoints come from the shared
-        // doorAudioMidpoints() helper (cached `mDoorAudioInstances` map,
+        // Door classification: door world AABBs come from the shared
+        // doorAudioAABBs() helper (cached `mDoorAudioInstances` map,
         // populated by registerDoorGeometry in the renderer BEFORE this
         // bake — see the deferred auto-bake block in DarknessRender.cpp);
-        // portals match within kDoorPortalMatchDistFt.
+        // portals match within kDoorPortalMatchDistFt of the box.
         constexpr float kPortalRadiusFt = 5.0f;
-        const std::vector<Vector3> doorPositions = doorAudioMidpoints();
+        const std::vector<DoorWorldAABB> doorBoxes = doorAudioAABBs();
         AUDIO_LOG("Pathing portal pass: %zu doors registered for "
-                  "door-portal classification\n", doorPositions.size());
+                  "door-portal classification\n", doorBoxes.size());
 
         int portalDoorPairCount = 0;
         int portalBendPairCount = 0;
@@ -14911,9 +15277,9 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 // pre-adaptive-pass sees a sane value; the post-dedup
                 // pass overrides every candidate's radiusFt.
                 bool isDoorPortal = false;
-                for (const Vector3 &dp : doorPositions) {
-                    Vector3 dv = dp - center;
-                    if (glm::dot(dv, dv) < kDoorPortalMatchDistSq) {
+                for (const DoorWorldAABB &b : doorBoxes) {
+                    if (sPointAABBDistSq(center, b.mn, b.mx)
+                            < kDoorPortalMatchDistSq) {
                         isDoorPortal = true;
                         break;
                     }

@@ -457,6 +457,17 @@ struct RenderConfig {
     // OTHER voices, not door sounds. 0 = disabled (the default; never
     // ship-enabled).
     int         stressDoors         = 0;          // --stress-doors N
+
+    // --stress-door-ids "a,b,..." (DEV-ONLY, diagnostic companion to
+    // --stress-doors): toggle EXACTLY these door object IDs every cycle
+    // instead of the N nearest the camera. Exists for the door-event
+    // pathing-latency hypothesis runs: single-door runs pinned to a door
+    // of a known alternate-route detour class (NONE/LONG/SHORT — see
+    // analysis/door_detour_class.py) need the same door swinging all run,
+    // which the distance-ranked selection can't guarantee on a moving
+    // tour. Empty = disabled; when set it overrides the nearest-N pick
+    // (a nonzero --stress-doors is still required to arm the harness).
+    std::vector<int32_t> stressDoorIDs;           // --stress-door-ids "a,b"
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -1622,6 +1633,8 @@ inline bool isPerfLabelValid(const std::string& s) {
 //                      per-run perf directory (= developer.capture_wav)
 //   --stress-doors N   DEV-ONLY: toggle the N nearest doors every ~2 s
 //                      (O2a door-route-latency stress harness)
+//   --stress-door-ids "a,b"  DEV-ONLY: with --stress-doors armed, toggle
+//                      exactly these door object IDs instead of nearest-N
 //   --help / -h        print usage
 //
 // Unknown flags are reported but otherwise ignored — when a removed flag
@@ -1822,6 +1835,31 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                     "[FALLBACK] --stress-doors: non-integer value '%s' — "
                     "harness stays disabled\n", argv[i]);
                 cfg.stressDoors = 0;
+            }
+        } else if (std::strcmp(argv[i], "--stress-door-ids") == 0 && i + 1 < argc) {
+            // DEV-ONLY explicit-door companion to --stress-doors (see
+            // AppConfig comment). Comma-separated object IDs; a malformed
+            // token discards the whole list LOUDLY rather than silently
+            // stressing a partial set.
+            const char* arg = argv[++i];
+            std::vector<int32_t> ids;
+            bool ok = true;
+            const char* p = arg;
+            while (*p != '\0') {
+                char* end = nullptr;
+                long v = std::strtol(p, &end, 10);
+                if (end == p) { ok = false; break; }
+                ids.push_back(static_cast<int32_t>(v));
+                p = end;
+                if (*p == ',') ++p;
+                else if (*p != '\0') { ok = false; break; }
+            }
+            if (ok && !ids.empty()) {
+                cfg.stressDoorIDs = ids;
+            } else {
+                std::fprintf(stderr,
+                    "[FALLBACK] --stress-door-ids: malformed list '%s' — "
+                    "explicit-door override stays disabled\n", arg);
             }
         } else if (std::strcmp(argv[i], "--bake-quality") == 0 && i + 1 < argc) {
             // Bake-quality profile. "dev" forces the fast iteration bake

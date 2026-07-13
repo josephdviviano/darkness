@@ -412,10 +412,11 @@ void PathingSimulator::workerMain()
                     }
                     // O2a staging mix for this window: solved = voices
                     // staged with the PATHING flag set (full validation +
-                    // alternate-path search), skipped = eligible voices
-                    // whose memo said nothing changed (Steam Audio serves
-                    // the cached outputs). skipped >> solved on idle
-                    // windows is the dirty-gating working as designed.
+                    // alternate-path search), skipped = IN-RANGE eligible
+                    // voices whose memo said nothing changed (Steam Audio
+                    // serves the cached outputs; out-of-range voices count
+                    // in neither bucket — review F6). skipped >> solved on
+                    // idle windows is the dirty-gating working as designed.
                     const uint64_t solvedW =
                         mStagedSolved.exchange(0, std::memory_order_relaxed);
                     const uint64_t skippedW =

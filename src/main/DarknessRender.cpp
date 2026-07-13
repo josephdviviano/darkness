@@ -488,6 +488,10 @@ static void printHelp() {
         "                    [DOOR_ROUTE_LATENCY] staleness metric. Bypasses\n"
         "                    frob/scripts, so no door foley fires. Emits\n"
         "                    [STRESS_DOORS] stderr lines per cycle.\n"
+        "  --stress-door-ids \"a,b\"\n"
+        "                    DEV-ONLY: with --stress-doors armed, toggle exactly\n"
+        "                    these door object IDs each cycle instead of the\n"
+        "                    nearest-N pick (detour-class hypothesis runs).\n"
         "  --audio-log       Enable audio log verbosity (= developer.audio_log\n"
         "                    in YAML). Required for [PERF *] histogram capture —\n"
         "                    perf runs are dark without it.\n"
@@ -7069,28 +7073,54 @@ int main(int argc, char *argv[]) {
                 Darkness::Vector3 camPos(state.cam.pos[0],
                                          state.cam.pos[1],
                                          state.cam.pos[2]);
-                std::vector<std::pair<float, int32_t>> candidates;
-                for (int32_t id : doorSystem.getAllDoorIDs()) {
-                    const Darkness::DoorState *d = doorSystem.getDoor(id);
-                    if (!d) continue;
-                    if (glm::length(d->edgeLengths) < 0.01f) continue;
-                    candidates.emplace_back(
-                        glm::length(d->basePosition - camPos), id);
+                // --stress-door-ids override: pin the toggle set to the
+                // explicit list (detour-class hypothesis runs need the
+                // SAME door swinging all run regardless of camera
+                // position). Unknown / OBB-less IDs are reported loudly
+                // per cycle instead of silently shrinking the set.
+                std::vector<int32_t> picks;
+                if (!cfg.stressDoorIDs.empty()) {
+                    for (int32_t id : cfg.stressDoorIDs) {
+                        const Darkness::DoorState *d = doorSystem.getDoor(id);
+                        if (!d || glm::length(d->edgeLengths) < 0.01f) {
+                            std::fprintf(stderr,
+                                "[STRESS_DOORS] requested door %d is %s "
+                                "— skipped this cycle\n", id,
+                                d ? "missing a usable audio OBB"
+                                  : "not a known door");
+                            continue;
+                        }
+                        picks.push_back(id);
+                    }
+                } else {
+                    std::vector<std::pair<float, int32_t>> candidates;
+                    for (int32_t id : doorSystem.getAllDoorIDs()) {
+                        const Darkness::DoorState *d = doorSystem.getDoor(id);
+                        if (!d) continue;
+                        if (glm::length(d->edgeLengths) < 0.01f) continue;
+                        candidates.emplace_back(
+                            glm::length(d->basePosition - camPos), id);
+                    }
+                    std::sort(candidates.begin(), candidates.end());
+                    const int n = std::min<int>(
+                        cfg.stressDoors, static_cast<int>(candidates.size()));
+                    for (int i = 0; i < n; ++i)
+                        picks.push_back(candidates[i].second);
                 }
-                std::sort(candidates.begin(), candidates.end());
-                const int n = std::min<int>(cfg.stressDoors,
-                                            static_cast<int>(candidates.size()));
                 std::string toggled;
-                for (int i = 0; i < n; ++i) {
-                    doorSystem.activate(candidates[i].second,
-                                        Darkness::kDoorToggle);
+                for (int32_t id : picks) {
+                    doorSystem.activate(id, Darkness::kDoorToggle);
                     if (!toggled.empty()) toggled += ",";
-                    toggled += std::to_string(candidates[i].second);
+                    toggled += std::to_string(id);
                 }
+                const int requested = cfg.stressDoorIDs.empty()
+                    ? cfg.stressDoors
+                    : static_cast<int>(cfg.stressDoorIDs.size());
                 std::fprintf(stderr,
                     "[STRESS_DOORS] cycle #%d t=%.1fs toggled %d/%d "
                     "requested doors (ids: %s) cam=(%.0f,%.0f,%.0f)\n",
-                    stressDoorsCycle, elapsed, n, cfg.stressDoors,
+                    stressDoorsCycle, elapsed,
+                    static_cast<int>(picks.size()), requested,
                     toggled.empty() ? "none" : toggled.c_str(),
                     camPos.x, camPos.y, camPos.z);
             }

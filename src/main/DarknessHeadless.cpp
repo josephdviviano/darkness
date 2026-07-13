@@ -345,6 +345,82 @@ static void printRoomInfo(int roomID) {
     }
 }
 
+// ---------- Room graph dump ----------
+//
+// `room_graph` prints the entire ROOM_DB portal graph in machine-readable
+// line records, for offline distribution analysis (analysis/room_graph_stats.py).
+// This is the data the probe-graph edge-range lever is derived from: the
+// original engine's precomputed intra-room portal-to-portal hop tables
+// (Room::getPortalDist — same access pattern as the maxRoomSpanFt
+// derivation in AudioService::prepareProbeBakeParams) plus room centers
+// and adjacency.
+//
+// Output records (space-separated, one per line):
+//   ROOM <roomID> <cx> <cy> <cz> <portalCount>
+//   PORTAL <nearRoomID> <farRoomID> <px> <py> <pz>
+//       one per directed portal; every physical portal appears twice
+//       (once per side) — consumers de-duplicate back-links.
+//   PDIST <roomID> <i> <j> <dist>
+//       intra-room portal-to-portal distance for portal indices i<j,
+//       straight from the level compiler's precomputed matrix.
+//   ROOMGRAPH_SUMMARY rooms=<n> portals_directed=<m> zero_portal_rooms=<k>
+//       null_portals=<x> null_far_rooms=<y> zero_pdist_pairs=<z>
+static void printRoomGraph() {
+    RoomServicePtr roomSvc = GET_SERVICE(RoomService);
+    if (!roomSvc || !roomSvc->isLoaded()) {
+        std::cerr << "room_graph: RoomService not loaded — does this database "
+                     "have ROOM_DB?\n";
+        return;
+    }
+
+    const auto &rooms = roomSvc->getAllRooms();
+    int roomCount = 0;
+    int portalDirected = 0;
+    int zeroPortalRooms = 0;
+    int nullPortals = 0;
+    int nullFarRooms = 0;
+    // dist == 0 for i != j means the precomputed table entry is missing
+    // or degenerate — counted so the offline stats can flag it.
+    int zeroPDistPairs = 0;
+
+    for (const auto &roomPtr : rooms) {
+        if (!roomPtr) continue;
+        ++roomCount;
+        const int roomID = roomPtr->getRoomID();
+        const Vector3 c = roomPtr->getCenter();
+        const uint32_t pc = roomPtr->getPortalCount();
+        std::printf("ROOM %d %.3f %.3f %.3f %u\n",
+                    roomID, c.x, c.y, c.z, pc);
+        if (pc == 0) ++zeroPortalRooms;
+
+        for (uint32_t i = 0; i < pc; ++i) {
+            ::Darkness::RoomPortal *p = roomPtr->getPortal(i);
+            if (!p) { ++nullPortals; continue; }
+            ::Darkness::Room *far = p->getFarRoom();
+            if (!far) ++nullFarRooms;
+            const Vector3 pcen = p->getCenter();
+            std::printf("PORTAL %d %d %.3f %.3f %.3f\n",
+                        roomID, far ? far->getRoomID() : -1,
+                        pcen.x, pcen.y, pcen.z);
+            ++portalDirected;
+        }
+
+        for (uint32_t i = 0; i < pc; ++i) {
+            for (uint32_t j = i + 1; j < pc; ++j) {
+                const float d = roomPtr->getPortalDist(i, j);
+                if (d <= 0.0f) ++zeroPDistPairs;
+                std::printf("PDIST %d %u %u %.3f\n", roomID, i, j, d);
+            }
+        }
+    }
+
+    std::printf("ROOMGRAPH_SUMMARY rooms=%d portals_directed=%d "
+                "zero_portal_rooms=%d null_portals=%d null_far_rooms=%d "
+                "zero_pdist_pairs=%d\n",
+                roomCount, portalDirected, zeroPortalRooms, nullPortals,
+                nullFarRooms, zeroPDistPairs);
+}
+
 // ---------- Ambient sound dump ----------
 //
 // `ambients` lists every object with a P$AmbientHa property: schema name,
@@ -2544,6 +2620,10 @@ static void printUsage(const char *prog) {
     std::cerr << "  room-info <id> [<id> ...]" << std::endl;
     std::cerr << "                    Dump OBB planes, portal list, and portal-to-portal" << std::endl;
     std::cerr << "                    distance matrix for each given room ID." << std::endl;
+    std::cerr << "  room_graph        Dump the whole ROOM_DB portal graph as machine-readable" << std::endl;
+    std::cerr << "                    ROOM / PORTAL / PDIST lines (room centers, portal centers," << std::endl;
+    std::cerr << "                    degrees, intra-room portal-to-portal distances). Consumed" << std::endl;
+    std::cerr << "                    by analysis/room_graph_stats.py." << std::endl;
     std::cerr << "  trace-path <src> <dst> [maxDist]" << std::endl;
     std::cerr << "                    Trace BFS through the portal graph from src room to dst" << std::endl;
     std::cerr << "                    room. Per-hop detail (segmentDist, cumEff, doorBlocking)." << std::endl;
@@ -2659,6 +2739,7 @@ int main(int argc, char *argv[]) {
                           command == "links" ||
                           command == "trace-path" ||
                           command == "room-info" ||
+                          command == "room_graph" ||
                           command == "ambients" ||
                           command == "prop-dump" ||
                           command == "sound-desc" ||
@@ -2746,6 +2827,15 @@ int main(int argc, char *argv[]) {
                 printRoomInfo(std::stoi(positionalArgs[i]));
                 if (i + 1 < positionalArgs.size()) std::cout << std::endl;
             }
+        } else if (command == "room_graph") {
+            initServices();
+            loadSchema(scriptsDir);
+            // Same rationale as trace-path: force RoomService instantiation
+            // BEFORE loadDatabase so it registers as a DatabaseListener and
+            // actually parses ROOM_DB.
+            (void)GET_SERVICE(RoomService);
+            loadDatabase(dbFile);
+            printRoomGraph();
         } else if (command == "sound_db") {
             // sound_db: walks the schema directory; optionally applies
             // P$SchAttFac/SchPlayPa overrides from dbFile when present.
