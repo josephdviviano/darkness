@@ -283,7 +283,7 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
             "\"min_wall_clearance_ft\":%.4f,\"elevation_sparsity_mul\":%.4f,"
             "\"global_dedup_radius_ft\":%.4f"
         "},"
-        "\"pathing_probes\":{\"enabled\":%s,\"dedup_radius_ft\":%.4f,\"force_bake\":%s,\"dev_bake_profile\":%s},"
+        "\"pathing_probes\":{\"enabled\":%s,\"dedup_radius_ft\":%.4f,\"density\":\"%s\",\"force_bake\":%s,\"dev_bake_profile\":%s},"
         "\"occlusion\":{"
             "\"radius\":%.4f,\"samples\":%d,"
             "\"transmission_scale\":%.4f,\"absorption_scale\":%.4f"
@@ -337,6 +337,7 @@ static std::string serializeAudioConfigJson(const Darkness::RenderConfig& c) {
         c.audioProbeMinWallClearanceFt, c.audioProbeElevationSparsityMul,
         c.audioProbeGlobalDedupRadiusFt,
         c.audioPathingProbesEnabled ? "true" : "false", c.audioPathingDedupRadiusFt,
+        c.audioPathingDensity.c_str(),
         c.forcePathingBake ? "true" : "false",
         c.devBakeProfile ? "true" : "false",
         c.occlusionRadius, c.occlusionSamples,
@@ -487,8 +488,8 @@ static void printHelp() {
         "                    'dev' forces the fast iteration bake profile:\n"
         "                    rays=2048 bounces=8 diffuse=256 (~64x cheaper per\n"
         "                    probe), reduced probe density (global_dedup 18 ft,\n"
-        "                    spacing 20 ft), AND pathing visibility numSamples\n"
-        "                    16 -> 8 for both bake and runtime (recorded in the\n"
+        "                    spacing 20 ft). Pathing visibility numSamples is 4\n"
+        "                    for both profiles, bake and runtime (recorded in the\n"
         "                    .probes header; a profile/cache mismatch triggers\n"
         "                    an automatic pathing-only re-bake). Cached .probes\n"
         "                    are DEV QUALITY/DENSITY — re-bake without it for\n"
@@ -5315,6 +5316,30 @@ int main(int argc, char *argv[]) {
         audioSvc->setProbeGlobalDedupRadiusFt(cfg.audioProbeGlobalDedupRadiusFt);
         audioSvc->setPathingProbeBatchEnabled(cfg.audioPathingProbesEnabled);
         audioSvc->setPathingDedupRadiusFt(cfg.audioPathingDedupRadiusFt);
+        // Layout density: string (validated at parse — RenderConfig
+        // accepts only "baseline"/"bends") → enum at this boundary via
+        // the single string→enum mapping (pathingProbeDensityFromName).
+        // Consumed by the bake's portal-emission pass and by the
+        // density-mismatch check against the loaded .probes v4 header.
+        {
+            const auto density = Darkness::pathingProbeDensityFromName(
+                cfg.audioPathingDensity);
+            if (density == Darkness::PathingProbeDensity::Unknown) {
+                // Unreachable while RenderConfig validates at parse; if
+                // a future config path skips validation, refuse loudly
+                // rather than silently baking at a density the user
+                // didn't pick.
+                std::fprintf(stderr,
+                    "[FALLBACK] audio.pathing_probes.density '%s' not "
+                    "recognized here (parse validation bypassed?) — "
+                    "keeping the default '%s'\n",
+                    cfg.audioPathingDensity.c_str(),
+                    Darkness::pathingProbeDensityName(
+                        audioSvc->getPathingProbeDensity()));
+            } else {
+                audioSvc->setPathingProbeDensity(density);
+            }
+        }
 
         // -- audio.occlusion --
         audioSvc->setOcclusionRadius(cfg.occlusionRadius);
@@ -5471,7 +5496,7 @@ int main(int argc, char *argv[]) {
             } else if (audioSvc->pathingBakeSamplesMismatch()) {
                 // ── [PATHING_BAKE_MISMATCH] automatic pathing re-bake ──
                 //
-                // The .probes v3 header records the numSamples the pathing
+                // The .probes header records the numSamples the pathing
                 // section was baked with; it differs from the active
                 // profile's constant (e.g. a dev-profile cache loaded in a
                 // ship-profile run, or vice versa). Running like this
@@ -5488,6 +5513,31 @@ int main(int argc, char *argv[]) {
                     audioSvc->getBakedPathingNumSamples(),
                     audioSvc->activePathingVisSamples(),
                     cfg.devBakeProfile ? "--bake-quality dev" : "ship");
+                audioSvc->setForcePathingBake(true);
+                state.probeBakePath = probePath;
+                state.probeBakeNeeded = true;
+            } else if (audioSvc->pathingBakeDensityMismatch()) {
+                // ── [PATHING_BAKE_MISMATCH] layout-density mismatch ──
+                //
+                // Same policy as the numSamples mismatch above: the
+                // .probes v4 header records the probe LAYOUT density the
+                // pathing section was baked at; it differs from the
+                // active `audio.pathing_probes.density` config. A
+                // baseline cache consumed at bends density silently
+                // lacks the per-portal bend pairs (and vice versa), so
+                // re-bake the pathing section now, loudly, carrying the
+                // reflection IRs forward unchanged.
+                std::fprintf(stderr,
+                    "[PATHING_BAKE_MISMATCH] .probes '%s' pathing section "
+                    "was baked at layout density '%s' but "
+                    "audio.pathing_probes.density is '%s' — scheduling an "
+                    "automatic pathing-only re-bake (reflection IRs "
+                    "carried forward).\n",
+                    probePath.c_str(),
+                    Darkness::pathingProbeDensityName(
+                        audioSvc->getBakedPathingDensity()),
+                    Darkness::pathingProbeDensityName(
+                        audioSvc->getPathingProbeDensity()));
                 audioSvc->setForcePathingBake(true);
                 state.probeBakePath = probePath;
                 state.probeBakeNeeded = true;

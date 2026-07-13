@@ -332,6 +332,33 @@ audio:
     # global_dedup_radius_ft above. 0 disables the pass. Re-bake
     # required.
     dedup_radius_ft: 10.0  # (0.0–30.0)
+    # Probe layout density tier. The layout is the original Dark
+    # Engine room/portal graph's nodes; density dials realism UP from
+    # that baseline at stated cost (bake pairs AND the runtime path
+    # solver are ~quadratic in probe count):
+    #   baseline — Tier 0: 1 probe per room centroid (+ upper
+    #              centroid for rooms taller than 40 ft) + 1 per
+    #              non-door portal center + door flanking pairs +
+    #              emitter mirrors. Selectable for fast dev bakes /
+    #              low-end: wins the medians (MISS2 pathing p50 66 vs
+    #              85 ms; dev bake 17.7 vs 28.4 min at ns8) but has
+    #              the worse worst case (below).
+    #   bends    — Tier 1 (default): baseline, with every non-door
+    #              portal's center probe replaced by a flanking pair
+    #              (center ± 5 ft along the portal normal) — explicit
+    #              solver bend points so sound turning a corner takes
+    #              an audible detour around the opening. Costs +1 probe
+    #              per non-door portal. Default per user decision
+    #              2026-07-12 (fidelity first): measured BETTER
+    #              worst-case door spikes — at ns8, worst window
+    #              316.8 ms vs baseline's 535-696 ms (baseline's
+    #              spikes were hidden by log rate-limiting when the
+    #              default briefly flipped on 2026-07-11).
+    #   ("high" is RESERVED for a future Tier 2 — room-span subdivision
+    #    for long halls — and is rejected until it exists.)
+    # Recorded in the .probes header; changing it triggers a loud
+    # automatic pathing-only re-bake on the next run.
+    density: bends  # (baseline | bends; re-bake on change)
 
   occlusion:
     # Source occlusion + global material multipliers.
