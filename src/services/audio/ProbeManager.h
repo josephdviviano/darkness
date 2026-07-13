@@ -130,11 +130,81 @@ using ProbeFilterFn = std::function<ProbeFilterDecision(const Vector3 &)>;
 /// flanked by two non-overlapping probes that the runtime door
 /// validation can reject paths through).
 enum class PathingProbePurpose {
-    Portal,    ///< Non-door architectural portal — single probe at the centroid.
-    DoorPair,  ///< One of a pair of probes flanking a door OBB (±portal normal).
-    Centroid,  ///< Room geometric centroid (or sky-snapped floor+5ft fallback).
-    Emitter,   ///< Mirror of an ambient-emitter anchor.
+    Portal,     ///< Non-door architectural portal — single probe at the centroid.
+    DoorPair,   ///< One of a pair of probes flanking a door OBB (±portal normal).
+    Centroid,   ///< Room geometric centroid (or sky-snapped floor+5ft fallback).
+    Emitter,    ///< Mirror of an ambient-emitter anchor.
+    PortalPair, ///< One of a pair of bend probes flanking a NON-door portal
+                ///< (±portal normal — Tier 1 "bends" density). Gives the
+                ///< path solver an explicit bend point on each side of the
+                ///< opening so sound turning a corner takes an audible
+                ///< detour around the aperture instead of a straight-through
+                ///< approximation. Same geometry as DoorPair but no door OBB
+                ///< between the pair.
 };
+
+/// Pathing probe layout density tier — the `audio.pathing_probes.density`
+/// config knob. Selects how many graph nodes prepareProbeBakeParams emits
+/// per architectural feature. Recorded in the .probes v4 header
+/// (ProbeFile.h bakedPathingDensity) so a cache baked at one density is
+/// never silently consumed by a run configured for another — mismatch
+/// triggers the same loud automatic pathing-only re-bake as a numSamples
+/// mismatch. Underlying type is fixed (uint32_t) so the value round-trips
+/// through the on-disk header verbatim and the enum can be forward-declared.
+///
+///   • Baseline — Tier 0 (selectable — fast dev bakes / low-end): the
+///     original Dark Engine room/portal graph's nodes. 1 probe per room
+///     centroid (+ upper centroid for genuinely tall rooms) + 1 per
+///     non-door portal center + door flanking pairs + emitter mirrors.
+///     Wins the medians (pathing p50 66 vs 85 ms; dev bake 17.7 vs
+///     28.4 min at ns8) but has the WORSE worst case (below).
+///   • Bends    — Tier 1 (default — user decision 2026-07-12, fidelity
+///     first; supersedes the 2026-07-11 baseline flip, whose worst-case
+///     numbers were misattributed: at ns8 bends' worst door-spike window
+///     measured 316.8 ms vs baseline's 535-696 ms, hidden then by log
+///     rate-limiting; see RenderConfig.h audioPathingDensity): baseline,
+///     with every NON-door portal's single center probe replaced by a
+///     flanking pair (center ± normal × kPairProbeOffsetFt, purpose
+///     PortalPair) — the solver's explicit bend points for sound turning
+///     corners at every opening/aperture.
+///     Cost: +1 probe per non-door portal over baseline.
+///
+/// At EVERY density a thin-room coverage repair runs after the dedup and
+/// inside-door-AABB passes: any room adjacent to a non-door portal that
+/// no surviving candidate resolves to gets one interior repair probe
+/// (see AudioService::prepareProbeBakeParams "Thin-room coverage
+/// repair" — rooms thinner than the flank offset lose their organic
+/// candidates at both tiers).
+///   • ("high" is reserved for a future Tier 2 — room-span subdivision for
+///     long halls. Named in config docs but REJECTED at parse until the
+///     tier exists; see RenderConfig.h.)
+enum class PathingProbeDensity : uint32_t {
+    Unknown  = 0, ///< No pathing batch / pre-v4 data. Never a valid config.
+    Baseline = 1,
+    Bends    = 2,
+};
+
+/// Human-readable density name for logs / headers.
+inline const char *pathingProbeDensityName(PathingProbeDensity d) {
+    switch (d) {
+    case PathingProbeDensity::Unknown:  return "unknown";
+    case PathingProbeDensity::Baseline: return "baseline";
+    case PathingProbeDensity::Bends:    return "bends";
+    }
+    return "invalid";
+}
+
+/// Inverse of pathingProbeDensityName — the ONLY config-string → enum
+/// mapping (single source of truth; the YAML/CLI parsers validate against
+/// the same names but store strings). Returns Unknown for anything
+/// unrecognized — including the reserved "high" — and callers MUST treat
+/// Unknown as a loud config error, never silently default it: a silent
+/// default here once mapped every typo to Bends.
+inline PathingProbeDensity pathingProbeDensityFromName(const std::string &s) {
+    if (s == "baseline") return PathingProbeDensity::Baseline;
+    if (s == "bends")    return PathingProbeDensity::Bends;
+    return PathingProbeDensity::Unknown;
+}
 
 /// One pathing-graph node candidate, supplied by AudioService. Each Room
 /// contributes one centroid candidate; each non-door portal contributes
@@ -190,6 +260,7 @@ struct ProbeBakePlan {
     int dedupDroppedTotal      = 0;
     int dedupDroppedCentroids  = 0;
     int dedupDroppedDoorPairs  = 0;
+    int dedupDroppedPortalPairs = 0;
     int dedupDroppedOther      = 0;
 };
 
@@ -332,8 +403,19 @@ struct ProbeBakeParams {
     /// MUST be the active profile constant from SteamAudioPathing.h
     /// (kPathingVisSamplesShip / kPathingVisSamplesDev) — AudioService
     /// fills it via activePathingVisSamples() so bake and runtime read
-    /// the same selection. Recorded in the .probes v3 header.
+    /// the same selection. Recorded in the .probes header.
     int pathingNumSamples = kPathingVisSamplesShip;
+
+    /// Probe layout density tier the pathing candidates were emitted at
+    /// (the `audio.pathing_probes.density` knob). ProbeManager does not
+    /// consume it for placement — emission happens in AudioService's
+    /// prepareProbeBakeParams — it travels here solely so the bake can
+    /// record it into the .probes v4 header for the loader's
+    /// density-mismatch check (same policy as pathingNumSamples: loud +
+    /// automatic pathing-only re-bake). Default mirrors the config
+    /// default (bends — user decision 2026-07-12, fidelity first);
+    /// AudioService always overwrites it from the active config.
+    PathingProbeDensity pathingDensity = PathingProbeDensity::Bends;
 
     /// True = pathing-only re-bake: skip the (expensive) reflection IR
     /// bake and carry the CURRENTLY LOADED reflection batch forward into
@@ -405,9 +487,10 @@ struct ProbeBatchEntry {
     /// Pathing bake profile actually used (pathing entries only; 0 on
     /// reflections entries). Filled by bakePathingBatch with the
     /// EFFECTIVE values (post any fallback), then recorded into the
-    /// .probes v3 header by bakeProbes.
+    /// .probes header by bakeProbes.
     float                 bakedVisRangeFt = 0.0f;
     int                   bakedNumSamples = 0;
+    PathingProbeDensity   bakedDensity = PathingProbeDensity::Unknown;
     /// Engine-space positions in placement order (sidecar mirror).
     std::vector<Vector3>  positions;
     /// Per-probe influence radii in engine feet (sidecar mirror). Parallel
@@ -505,6 +588,15 @@ public:
     /// the automatic mismatch re-bake.
     float getBakedPathingVisRangeFt() const { return mBakedPathingVisRangeFt; }
     int   getBakedPathingNumSamples() const { return mBakedPathingNumSamples; }
+    /// Probe layout density tier the pathing section was baked at
+    /// (.probes v4 header). Unknown = no pathing batch. AudioService
+    /// compares this against the active `audio.pathing_probes.density`
+    /// config and triggers the loud automatic pathing-only re-bake on
+    /// mismatch — a baseline-density cache consumed at bends density
+    /// would silently lack the per-portal bend pairs (and vice versa).
+    PathingProbeDensity getBakedPathingDensity() const {
+        return mBakedPathingDensity;
+    }
 
     /// Reflection bake profile of the CURRENT in-memory data (.probes v3
     /// header fields bakedReflectionRays / bakedProbeDedupRadiusFt).
@@ -706,6 +798,7 @@ private:
     /// zeroed on releaseBatches.
     float mBakedPathingVisRangeFt = 0.0f;
     int   mBakedPathingNumSamples = 0;
+    PathingProbeDensity mBakedPathingDensity = PathingProbeDensity::Unknown;
     int   mBakedReflectionRays = 0;
     float mBakedProbeDedupRadiusFt = 0.0f;
 

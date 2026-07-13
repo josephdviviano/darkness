@@ -99,6 +99,10 @@ class RoomPortal;
 // forward decls into this header. Full include lives in AudioService.cpp.
 struct ProbeBakeParams;
 struct ProbeBakePlan;
+// Pathing probe layout density tier (audio.pathing_probes.density knob).
+// Fixed underlying type so it can be forward-declared here; definition +
+// semantics in ProbeManager.h.
+enum class PathingProbeDensity : uint32_t;
 
 // Owned subsystem types — full definitions live in their own headers.
 class ReflectionSimulator;
@@ -959,6 +963,25 @@ public:
     }
     float getPathingDedupRadiusFt() const { return mProbePathingDedupRadiusFt; }
 
+    /** Pathing probe layout density tier (`audio.pathing_probes.density`
+     *  yaml key — see PathingProbeDensity in ProbeManager.h). Selects the
+     *  per-portal emission in prepareProbeBakeParams: Baseline = single
+     *  center probe per non-door portal (Tier 0, the original room/portal
+     *  graph's nodes — the default); Bends = flanking pair per non-door
+     *  portal (Tier 1 — explicit solver bend points at every opening,
+     *  at measurably higher runtime path-solve cost). Takes
+     *  effect on the next bake; recorded in the .probes v4 header so a
+     *  cache baked at another density triggers the loud automatic
+     *  pathing-only re-bake (same policy as the numSamples mismatch).
+     *  Validation happens at the parse boundary (RenderConfig /
+     *  darknessHeadless --set) — this setter stores the value verbatim. */
+    void setPathingProbeDensity(PathingProbeDensity d) {
+        mPathingProbeDensity = d;
+    }
+    PathingProbeDensity getPathingProbeDensity() const {
+        return mPathingProbeDensity;
+    }
+
     /** Force a fresh pathing bake on the next bakeProbes() call even when
      *  the existing `.probes` file already has a valid pathing section.
      *  Useful for iterating on pathing-bake parameters (e.g.
@@ -976,9 +999,9 @@ public:
     bool getForcePathingBake() const { return mForcePathingBake; }
 
     /** Bake-quality profile selector. True = the `--bake-quality dev`
-     *  iteration profile: pathing visibility sampling drops from
-     *  kPathingVisSamplesShip (16) to kPathingVisSamplesDev (8) — see
-     *  SteamAudioPathing.h. ONE flag feeds BOTH the bake
+     *  iteration profile: pathing visibility sampling selects
+     *  kPathingVisSamplesDev instead of kPathingVisSamplesShip (both 4
+     *  since 2026-07-11) — see SteamAudioPathing.h. ONE flag feeds BOTH the bake
      *  (ProbeBakeParams::pathingNumSamples) and the runtime pathing
      *  simulator (IPLSimulationSettings::numVisSamples), so the two
      *  can never diverge within a run. Must be set BEFORE
@@ -1002,9 +1025,24 @@ public:
     bool pathingBakeSamplesMismatch() const;
 
     /** Facade over ProbeManager::getBakedPathingNumSamples — the
-     *  numSamples recorded in the loaded/just-baked .probes v3 header
+     *  numSamples recorded in the loaded/just-baked .probes header
      *  (0 = none). For mismatch diagnostics at the bake-decision site. */
     int getBakedPathingNumSamples() const;
+
+    /** True when the loaded .probes pathing section's probe LAYOUT was
+     *  emitted at a density tier that differs from the active
+     *  `audio.pathing_probes.density` config — e.g. a baseline cache in
+     *  a bends-configured run silently lacks the per-portal bend pairs.
+     *  Same handling as pathingBakeSamplesMismatch: the bake-decision
+     *  site (DarknessRender.cpp) schedules a loud automatic pathing-only
+     *  re-bake. False when no pathing batch is loaded. */
+    bool pathingBakeDensityMismatch() const;
+
+    /** Facade over ProbeManager::getBakedPathingDensity — the layout
+     *  density recorded in the loaded/just-baked .probes v4 header
+     *  (Unknown = none). For mismatch diagnostics at the bake-decision
+     *  site. */
+    PathingProbeDensity getBakedPathingDensity() const;
 
     /** Snapshot of probe positions in feet (engine units). Populated by
      *  bakeProbes() and loadProbes(); empty if no probes are loaded. Used
@@ -1100,6 +1138,26 @@ public:
      *  loadProbes / bakeProbes; callers can also trigger from a debug
      *  console binding if they re-injected the raycaster mid-session. */
     void rebuildPathingAdjacency();
+
+    /** [BAKE_PARITY] — ground-truth check of the freshly-baked pathing
+     *  graph against the original engine's ROOM_DB adjacency. Walks
+     *  every portal-connected room pair (RoomService rooms → portals →
+     *  destination rooms) and verifies the pair's probes are connected
+     *  in the baked graph: directly (a graph edge between a probe in
+     *  each room) or indirectly (same connected component). Any fully
+     *  disconnected pair gets a loud per-pair stderr report + a summary
+     *  line (pairs checked / connected / missing).
+     *
+     *  PROXY, documented as such: Steam Audio's public C API exposes no
+     *  adjacency for the baked graph, so this checks the debug
+     *  adjacency built by rebuildPathingAdjacency — same probe set,
+     *  same visRange as the bake (the .probes header value), but ONE
+     *  center-to-center ray per pair instead of the bake's numSamples²
+     *  sphere-sampled rays (see the PARTIAL-match comment in
+     *  rebuildPathingAdjacency). Expect occasional divergence on
+     *  grazing-angle pairs; a MISSING report is a strong signal, not a
+     *  perfect one. Called automatically after every pathing bake. */
+    void verifyPathingBakeParity();
 
     /** Per-probe reachability classification, parallel to
      *  getProbePositions(). Populated by classifyProbeReachability();
@@ -1689,6 +1747,14 @@ private:
     /// conversion.
     void recomputeDoorWorldAABB(DoorAudioInstance &inst) const;
 
+    /// Midpoint of every non-degenerate registered door OBB (world AABB
+    /// center, engine feet). The SINGLE door-position source shared by the
+    /// bake's door-portal classifier and [BAKE_PARITY]'s door-adjacent
+    /// grader — both match portals against these within
+    /// kPathingDoorPortalMatchDistFt, so the two passes can never drift
+    /// on what counts as a door.
+    std::vector<Vector3> doorAudioMidpoints() const;
+
     /// Set by setDoorTransform; consumed (and cleared) at the top of the
     /// next loopStep. Coalesces multiple per-frame door transform updates
     /// into one BVH refit.
@@ -1897,6 +1963,20 @@ private:
     /// collapsing legitimately distinct rooms. Set from yaml
     /// (`audio.pathing_probes.dedup_radius_ft`).
     float              mProbePathingDedupRadiusFt = 10.0f;
+
+    /// Pathing probe layout density tier. Set from yaml
+    /// (`audio.pathing_probes.density`, default "bends"); consumed by
+    /// prepareProbeBakeParams' portal pass and recorded into the
+    /// .probes v4 header. Initialized in the constructor (the enum is
+    /// only forward-declared here, so its enumerators are not visible
+    /// for a default member initializer).
+    PathingProbeDensity mPathingProbeDensity;
+
+    /// [BAKE_PARITY] deferral flag: set by bakeProbes on a successful
+    /// bake, consumed by the next loadProbes (the post-bake reload) —
+    /// the point where the freshly-baked batch and its adjacency proxy
+    /// actually exist in memory. See the comment in bakeProbes.
+    bool mBakeParityPending = false;
 
     /// Force-pathing-bake flag. When true, the renderer's bake-decision
     /// site (DarknessRender.cpp probeBakeNeeded gate) schedules a
