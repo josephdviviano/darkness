@@ -481,6 +481,13 @@ static void printHelp() {
         "                    Seed the schema-sample-selection RNG so A/B runs\n"
         "                    pick identical wavs per event. Default: unseeded\n"
         "                    (random_device). Accepts decimal or 0xHEX.\n"
+        "  --stress-doors N  DEV-ONLY door-swing stress harness: toggle the N\n"
+        "                    doors nearest the camera open/closed every ~2 s\n"
+        "                    (first toggle after a 5 s warmup). Exercises the\n"
+        "                    O2a door-dirty-gated pathing re-solve path and its\n"
+        "                    [DOOR_ROUTE_LATENCY] staleness metric. Bypasses\n"
+        "                    frob/scripts, so no door foley fires. Emits\n"
+        "                    [STRESS_DOORS] stderr lines per cycle.\n"
         "  --audio-log       Enable audio log verbosity (= developer.audio_log\n"
         "                    in YAML). Required for [PERF *] histogram capture —\n"
         "                    perf runs are dark without it.\n"
@@ -7024,6 +7031,12 @@ int main(int argc, char *argv[]) {
     // path").
     auto mainLoopStart = std::chrono::steady_clock::now();
     bool exitAfterFired = false;
+    // DEV-ONLY --stress-doors state (see RenderConfig.h AppConfig comment):
+    // first toggle after a 5 s warmup (level + audio pipeline settled),
+    // then every ~2 s. 2 s vs typical 1-2 s swing times keeps several
+    // doors continuously animating — the O2a [DOOR_ROUTE_LATENCY] load.
+    float stressDoorsNextToggleSec = 5.0f;
+    int   stressDoorsCycle = 0;
     while (state.running && !loopSvc->isTerminationRequested()) {
         loopSvc->step();
         if (cfg.exitAfterSeconds > 0.0f && !exitAfterFired) {
@@ -7036,6 +7049,50 @@ int main(int argc, char *argv[]) {
                     elapsed, cfg.exitAfterSeconds);
                 state.running = false;
                 exitAfterFired = true;
+            }
+        }
+        // DEV-ONLY door-swing stress harness. Runs on the main thread
+        // (same thread as SimService/DoorSystem), toggling doors via
+        // DoorSystem::activate — the exact per-tick path a frobbed door
+        // takes (simStep animation → collision + audio-mesh callbacks →
+        // AudioService::setDoorTransform → door-gen bump), minus the
+        // script layer. Candidate set = doors with a usable audio OBB
+        // (nonzero edgeLengths — the same filter registerDoorGeometry
+        // applies), ranked by distance to the current camera each cycle
+        // so a touring player keeps stressing NEARBY doors.
+        if (cfg.stressDoors > 0) {
+            float elapsed = std::chrono::duration<float>(
+                std::chrono::steady_clock::now() - mainLoopStart).count();
+            if (elapsed >= stressDoorsNextToggleSec) {
+                stressDoorsNextToggleSec += 2.0f;
+                ++stressDoorsCycle;
+                Darkness::Vector3 camPos(state.cam.pos[0],
+                                         state.cam.pos[1],
+                                         state.cam.pos[2]);
+                std::vector<std::pair<float, int32_t>> candidates;
+                for (int32_t id : doorSystem.getAllDoorIDs()) {
+                    const Darkness::DoorState *d = doorSystem.getDoor(id);
+                    if (!d) continue;
+                    if (glm::length(d->edgeLengths) < 0.01f) continue;
+                    candidates.emplace_back(
+                        glm::length(d->basePosition - camPos), id);
+                }
+                std::sort(candidates.begin(), candidates.end());
+                const int n = std::min<int>(cfg.stressDoors,
+                                            static_cast<int>(candidates.size()));
+                std::string toggled;
+                for (int i = 0; i < n; ++i) {
+                    doorSystem.activate(candidates[i].second,
+                                        Darkness::kDoorToggle);
+                    if (!toggled.empty()) toggled += ",";
+                    toggled += std::to_string(candidates[i].second);
+                }
+                std::fprintf(stderr,
+                    "[STRESS_DOORS] cycle #%d t=%.1fs toggled %d/%d "
+                    "requested doors (ids: %s) cam=(%.0f,%.0f,%.0f)\n",
+                    stressDoorsCycle, elapsed, n, cfg.stressDoors,
+                    toggled.empty() ? "none" : toggled.c_str(),
+                    camPos.x, camPos.y, camPos.z);
             }
         }
     }

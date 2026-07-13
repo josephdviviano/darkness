@@ -443,6 +443,35 @@ struct ActiveVoice {
     // 1.0), audibly popping distant spawns at full volume for a frame.
     uint64_t directSimCycleAtAdd = 0;
 
+    // ── O2a door-dirty-gated pathing solve memo (main-thread only) ──
+    //
+    // PLAN.PATHING_DESIGN.md §4 O2a: the pathing staging pass in
+    // AudioService::loopStep only stages this voice's pathingSource with
+    // the PATHING simulation flag SET (i.e. "solve me") when something
+    // that could change the route answer has changed since the last
+    // solve that covered this voice:
+    //   • the door acoustic generation counter advanced (a door moved),
+    //   • the listener moved > kPathingSolveMemoMoveFt or changed room,
+    //   • the source moved > kPathingSolveMemoMoveFt,
+    //   • the voice just became pathing-eligible (pathingWanted rising
+    //     edge — replaces the old "keep out-of-range voices enabled"
+    //     freshness insurance),
+    //   • the voice has never been solved, or a solve request is
+    //     latched from a tick that couldn't signal the worker.
+    // Otherwise the source is staged ONCE with the PATHING flag CLEARED
+    // (Steam Audio then skips it inside iplSimulatorRunPathing and
+    // retains its last pathingOutputs — the cache) and not staged again
+    // until the next solve. All fields are read/written exclusively by
+    // the main-thread staging pass.
+    uint64_t pathLastSolveDoorGen = 0;      // door gen covered by last solve
+    Vector3  pathLastSolveListenerPos{0.0f, 0.0f, 0.0f};
+    int32_t  pathLastSolveListenerRoom = INT32_MIN;
+    Vector3  pathLastSolveSourcePos{0.0f, 0.0f, 0.0f};
+    bool     pathEverSolved = false;        // false until first solve staged
+    bool     pathSolvePending = false;      // latch: needed solve, tick didn't signal
+    bool     pathWantedLastTick = false;    // pathingWanted at last due tick
+    bool     pathStagedEnabled = false;     // mirrors SA-side pathingInputs.enabled
+
     // Per-voice volumetric-occlusion sphere radius (engine feet).
     // Computed in createVoiceSource by raycasting from the source
     // position in N uniformly-distributed directions; the radius is

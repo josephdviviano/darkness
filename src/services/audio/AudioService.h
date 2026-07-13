@@ -37,12 +37,14 @@
 #include "audio/SchemaTypes.h"
 #include "room/RoomService.h"  // SoundPropInfo / SoundPropParams / SoundPathHop
 #include "worldquery/WorldQueryTypes.h"  // RayHit (for diagnostic raycaster setter)
+#include "LatencyHistogram.h"  // mDoorRouteLatencyHist ([DOOR_ROUTE_LATENCY])
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -1759,6 +1761,72 @@ private:
     /// next loopStep. Coalesces multiple per-frame door transform updates
     /// into one BVH refit.
     std::atomic<bool> mSceneNeedsCommit{false};
+
+    // ── O2a: door acoustic generation counter + route-staleness metric ──
+    //
+    // PLAN.PATHING_DESIGN.md §4 O2a / §6 decision 1. All members in this
+    // block are MAIN-THREAD ONLY (setDoorTransform, registerDoorGeometry
+    // and loopStep all run on the main thread); the only cross-thread
+    // traffic is reading PathingSimulator::completedCycles() /
+    // lastIterationEndNs(), which are atomics owned by the worker.
+
+    /// Monotonic generation counter for door acoustic state. Bumped once
+    /// per setDoorTransform push on a REGISTERED door (a swinging door
+    /// bumps every sim tick — we WANT continuous re-solves during swings,
+    /// smoother than the original engine's on-event step function) and
+    /// once per registerDoorGeometry batch.
+    uint64_t mDoorAcousticGen = 0;
+
+    /// The generation whose door poses are actually IN the committed
+    /// acoustic-scene BVH. Advanced to mDoorAcousticGen right after each
+    /// iplSceneCommit (loopStep's coalesced door commit +
+    /// registerDoorGeometry's registration commit). The per-voice solve
+    /// memo compares against THIS value, not the raw counter: solving
+    /// against a BVH that doesn't yet contain the new pose would record
+    /// the route as fresh while it still reflects the old geometry
+    /// (stale-route-stuck if the door then goes idle). Commit deferral
+    /// windows (a sim worker busy) therefore correctly extend
+    /// [DOOR_ROUTE_LATENCY] instead of being silently excluded.
+    uint64_t mDoorGenCommitted = 0;
+
+    /// Committed-gen snapshot taken at the most recent pathing-worker
+    /// signal(). Two consumers: (a) the door-event epoch FIFO below only
+    /// opens a NEW epoch when the latest recorded epoch has already been
+    /// snapshot into some signaled solve; (b) the pathing throttle's
+    /// door-override (re-solve continuously while doors move) fires while
+    /// mDoorGenCommitted != this.
+    uint64_t mDoorGenLastSignalGen = 0;
+
+    /// [DOOR_ROUTE_LATENCY] epoch FIFO. One entry per "uncovered door
+    /// event epoch": the FIRST door-gen bump after the previous pathing
+    /// signal snapshot opens an epoch (records its timestamp); subsequent
+    /// bumps are absorbed into it (staleness is measured from the
+    /// earliest uncovered change). Entries are popped — and a latency
+    /// sample recorded — when a completed solve's covered gen reaches
+    /// them. Bounded at ~2 entries by construction (one open epoch +
+    /// one in flight).
+    struct DoorGenEvent {
+        uint64_t gen;      ///< mDoorAcousticGen value that opened the epoch
+        int64_t  timeNs;   ///< steady_clock ns of that bump
+    };
+    std::deque<DoorGenEvent> mDoorGenEvents;
+
+    /// In-flight solve tracking for [DOOR_ROUTE_LATENCY]: set at signal()
+    /// time when an uncovered epoch exists; resolved at the top of a later
+    /// loopStep once PathingSimulator::completedCycles() reaches the
+    /// target. Signals never overlap (the !isRunning() gate), so a single
+    /// in-flight record suffices.
+    bool     mDoorSolveInFlight = false;
+    uint64_t mDoorSolveInFlightGen = 0;    ///< covers epochs with gen <= this
+    uint64_t mDoorSolveInFlightCycle = 0;  ///< completedCycles target
+
+    /// Door-event route staleness histogram (ms): doorGen bump → end of
+    /// the first completed pathing solve whose staged inputs + committed
+    /// BVH covered it. Drained by dumpAudioStatusPeriodic into the
+    /// [PERF door_route] stderr line + the perf.window JSONL `door_route`
+    /// stage. USER HARD GATE (PLAN.PATHING_DESIGN.md §6): p95 must stay
+    /// ≤ ~150 ms under door-swing stress.
+    LatencyHistogram mDoorRouteLatencyHist;
 
     /// Reflection simulation owner — wraps the Steam Audio reflection
     /// IPLSimulator handle, its dedicated background worker thread, the

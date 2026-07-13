@@ -5940,6 +5940,17 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
         "(created=%d, skipped=%d)...\n", created, skipped);
     iplSceneCommit(mIplScene);
 
+    // O2a: registration changes door acoustic state (doors just appeared
+    // in the scene) — bump the generation counter so every voice's next
+    // due tick re-solves against the door-populated BVH. The commit above
+    // already ran, so the committed gen advances in the same breath.
+    // Deliberately NO [DOOR_ROUTE_LATENCY] epoch here: registration is a
+    // boot-time scene-build step, not a door-movement event, and a boot
+    // sample would pollute the swing-staleness percentiles the user gate
+    // is set on.
+    ++mDoorAcousticGen;
+    mDoorGenCommitted = mDoorAcousticGen;
+
     std::fprintf(stderr,
         "[DOOR_AUDIO] registerDoorGeometry: done — %d instanced meshes "
         "(of %zu doors)\n", created, doors.size());
@@ -6042,6 +6053,29 @@ void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTrans
     recomputeDoorWorldAABB(it->second);
     // Coalesce into one iplSceneCommit per loopStep (see loopStep header).
     mSceneNeedsCommit.store(true, std::memory_order_release);
+
+    // O2a door acoustic generation counter (PLAN.PATHING_DESIGN.md §4).
+    // One bump per transform push on a registered door — a swinging door
+    // bumps every sim tick, which is what forces per-tick route re-solves
+    // during swings (user requirement: smoother than the original's
+    // on-event step function). The per-voice solve memo compares against
+    // the COMMITTED gen (advanced after the coalesced iplSceneCommit in
+    // loopStep), so a solve is only considered to cover this bump once
+    // the BVH actually contains the new pose.
+    //
+    // Epoch FIFO for [DOOR_ROUTE_LATENCY]: open a new epoch only when the
+    // latest recorded one has already been snapshot into a signaled solve
+    // (mDoorGenLastSignalGen); otherwise this bump is absorbed into the
+    // open epoch — staleness is measured from the EARLIEST uncovered
+    // change. Main-thread only (DoorSystem::simStep callback).
+    ++mDoorAcousticGen;
+    if (mDoorGenEvents.empty()
+        || mDoorGenEvents.back().gen <= mDoorGenLastSignalGen) {
+        const int64_t nowNs =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        mDoorGenEvents.push_back({mDoorAcousticGen, nowNs});
+    }
 
     // Correlator counter for [DOOR_XFORM_TICK] / [OCCL_TICK]. Bumped on
     // every push so the per-frame snapshot at the top of loopStep can tell
@@ -6423,6 +6457,14 @@ void AudioService::loopStep(float deltaTime)
         mPathingDueThisStep = (mPathingAccumSec >= mPathingUpdateInterval);
         if (mPathingDueThisStep) mPathingAccumSec = 0.0f;
     }
+    // O2a: remember whether the NATURAL throttle elapsed this step. The
+    // door-swing due-override below (after the door scene commit, where
+    // mDoorGenCommitted is fresh) may force mPathingDueThisStep on
+    // non-throttle frames so swings re-solve continuously; the
+    // [PATHING_LAG] diagnostic keeps its original meaning ("the
+    // configured cadence elapsed while the worker was busy") by gating
+    // on this local instead of the possibly-overridden member.
+    const bool pathingDueNaturalThisStep = mPathingDueThisStep;
 
     // Cool down the per-voice visRange-clamp [FALLBACK] rate limiter
     // (see the pathing-input staging loop below).
@@ -6519,6 +6561,45 @@ void AudioService::loopStep(float deltaTime)
     IPLSimulator pathingSimHandle    = mPathingSim    ? mPathingSim->simulator()    : nullptr;
     IPLSimulator directSimHandle     = mDirectSim     ? mDirectSim->simulator()     : nullptr;
 
+    // ── O2a [DOOR_ROUTE_LATENCY] completion detection ──
+    //
+    // Resolve the in-flight door-covering solve (armed at signal time in
+    // Step 3 below) once the pathing worker's completed-cycle counter
+    // reaches the target. The latency sample runs from the epoch's FIRST
+    // door-gen bump to the worker-stamped END of the covering iteration
+    // (lastIterationEndNs — no main-thread detection lag inflates the
+    // number). Runs every loopStep, before any signal this frame, so a
+    // completion and a fresh signal in the same frame resolve in order.
+    if (mDoorSolveInFlight && mPathingSim
+        && mPathingSim->completedCycles() >= mDoorSolveInFlightCycle) {
+        const int64_t doneNs = mPathingSim->lastIterationEndNs();
+        while (!mDoorGenEvents.empty()
+               && mDoorGenEvents.front().gen <= mDoorSolveInFlightGen) {
+            const double latencyMs = static_cast<double>(
+                doneNs - mDoorGenEvents.front().timeNs) / 1.0e6;
+            mDoorRouteLatencyHist.record(latencyMs);
+            // Loud per-event line (no-silent-fallbacks): first 16 + every
+            // 16th thereafter. During a continuous swing this fires about
+            // once per solve; the histogram in [PERF door_route] carries
+            // the full distribution regardless of the rate limit.
+            static std::atomic<int> sDoorRouteLogCount{0};
+            const int dc = sDoorRouteLogCount.fetch_add(
+                1, std::memory_order_relaxed);
+            if (dc < 16 || (dc % 16) == 0) {
+                std::fprintf(stderr,
+                    "[DOOR_ROUTE_LATENCY] %.1f ms (doorGen %llu covered "
+                    "by solve gen<=%llu, event #%d)\n",
+                    latencyMs,
+                    static_cast<unsigned long long>(
+                        mDoorGenEvents.front().gen),
+                    static_cast<unsigned long long>(mDoorSolveInFlightGen),
+                    dc + 1);
+            }
+            mDoorGenEvents.pop_front();
+        }
+        mDoorSolveInFlight = false;
+    }
+
     if (!reflBusy && mReflectionSim) {
 
         // Flush deferred IPL source adds / removals via ReflectionSimulator.
@@ -6599,6 +6680,12 @@ void AudioService::loopStep(float deltaTime)
             iplSceneCommit(mIplScene);
             auto c1 = std::chrono::steady_clock::now();
             mSceneNeedsCommit.store(false, std::memory_order_release);
+            // O2a: every door-gen bump so far is now in the committed
+            // BVH — advance the committed gen the per-voice solve memo
+            // and the door due-override key on. setDoorTransform (the
+            // only other bump site besides registration) always pairs a
+            // bump with mSceneNeedsCommit, so no bump can be left behind.
+            mDoorGenCommitted = mDoorAcousticGen;
 
             static std::atomic<int> sCommitCount{0};
             int n = sCommitCount.fetch_add(1, std::memory_order_relaxed);
@@ -6623,6 +6710,26 @@ void AudioService::loopStep(float deltaTime)
                     directBusy ? 1 : 0, d + 1);
             }
         }
+    }
+
+    // ── O2a pathing due-override: re-solve continuously during swings ──
+    //
+    // PLAN.PATHING_DESIGN.md §6 decision 1: door-event route updates must
+    // land near audio-pipeline latency, and swings should re-solve every
+    // tick (smoother than the original's step function). While committed
+    // door geometry is ahead of the last signaled solve, treat pathing as
+    // due EVERY frame — the Step 3 signal still waits for the worker to
+    // go idle, so during a swing the worker runs back-to-back solves at
+    // whatever rate it can sustain, and [DOOR_ROUTE_LATENCY] collapses to
+    // ~one solve duration instead of throttle-interval + solve. Idle
+    // worlds and plain listener movement keep the configured cadence.
+    // The accumulator is deliberately NOT reset here: once the swing ends
+    // the natural throttle resumes its own rhythm, and the one extra due
+    // tick it may produce right after is a no-op (all memos fresh, all
+    // voices staged as skip).
+    if (!mPathingDueThisStep
+        && mDoorGenCommitted != mDoorGenLastSignalGen) {
+        mPathingDueThisStep = true;
     }
 
     // Always clean up finished voices (defers IPL removal if sim busy)
@@ -8305,6 +8412,46 @@ void AudioService::loopStep(float deltaTime)
             }
             Room *listenerRoom = mListenerRoom;
 
+            // ── O2a per-frame pathing-staging context ──
+            //
+            // pathingWillSignal mirrors Step 3's wantPathing gate EXACTLY
+            // (same inputs, none of which change between here and there:
+            // pathBusy was sampled once at top-of-frame, the due flag and
+            // batch/enable state are main-thread members). Per-voice solve
+            // memos are updated ONLY on frames that actually signal the
+            // worker — a due-but-busy frame latches pathSolvePending
+            // instead, so no solve request is ever silently dropped
+            // (worker-busy skips keep the latch).
+            //
+            // stagingListenerRoomId feeds the memo's "listener changed
+            // room" trigger; INT32_MIN = no room resolved (treated as its
+            // own 'room' so entering/leaving resolvable space re-solves).
+            //
+            // stagingDoorGen is the COMMITTED door generation (see
+            // mDoorGenCommitted): solves are keyed to geometry the BVH
+            // actually contains. It cannot change mid-loopStep (door
+            // transforms arrive via DoorSystem::simStep on this same
+            // thread).
+            const bool pathingWillSignal = mPathingProbeBatchAdded
+                                        && mProbePathingEnabled
+                                        && mPathingDueThisStep
+                                        && !pathBusy
+                                        && (mPathingSim != nullptr);
+            const int32_t stagingListenerRoomId = listenerRoom
+                ? static_cast<int32_t>(listenerRoom->getRoomID())
+                : INT32_MIN;
+            const uint64_t stagingDoorGen = mDoorGenCommitted;
+            // Memo movement threshold (feet): listener or source drift
+            // beyond this since a voice's last solve forces a re-solve.
+            // 5 ft (locked in PLAN.PATHING_DESIGN.md §4 O2a) keeps routes
+            // fresh at walking speed while skipping micro-jitter.
+            constexpr float kPathingSolveMemoMoveFt = 5.0f;
+            // [PERF pathing] staging-mix counters for this pass (only
+            // meaningful on signaling frames; pushed to PathingSimulator
+            // after the loop).
+            uint32_t pathingStagedSolved  = 0;
+            uint32_t pathingStagedSkipped = 0;
+
             // (voiceUpdT0 is set before the HARVEST pass now — PR 1b
             // reordered the per-voice work but the phase timer still
             // covers all of it.)
@@ -8681,22 +8828,25 @@ void AudioService::loopStep(float deltaTime)
                 // — Steam Audio ignores fields not selected by the flag
                 // argument.
                 //
-                // PATHING bit is set unconditionally (not gated on the
-                // per-voice populate block) so iplSourceSetInputs(PATHING)
-                // — when issued — always leaves pathingInputs.enabled=true.
-                // An earlier "drive enabled from the live gate" attempt
-                // caused a stale-eq window on out-of-range → in-range
-                // transitions: simulatePathing only writes
-                // pathingOutputs.eq while enabled=true, so flipping it
-                // false stranded the last in-range eq values in the
-                // output buffer, audible as "sound through walls" for
-                // ~one throttle interval when the listener moved past
-                // maxAudibleDist and back through changed geometry
-                // (typical case: through a doorway and back). Keeping
-                // the worker running findPaths for currently-out-of-range
-                // voices is the price of fresh eq across distance
-                // transients; output is already gated by maxAudibleDist
-                // so the unread writes don't reach the audio thread.
+                // PATHING bit starts set; the O2a skip-staging path below
+                // clears it (stagePathingSkip) so Steam Audio's
+                // simulatePathing excludes the source from the solve loop
+                // while RETAINING its last pathingOutputs — that retained
+                // buffer is the route cache the dirty-gating design leans
+                // on (api_simulator.cpp:393 maps inputs.flags → pathing
+                // Inputs.enabled; simulation_manager.cpp simulatePathing
+                // skips disabled sources without touching their outputs).
+                //
+                // History: an earlier pre-O2a attempt drove this bit from
+                // the live pathingWanted gate and caused a stale-eq window
+                // on out-of-range → in-range transitions ("sound through
+                // walls" for ~one throttle interval), which is why the
+                // old code kept out-of-range voices permanently enabled
+                // as freshness insurance. O2a replaces that insurance
+                // with the per-voice solve memo: the pathingWanted
+                // RISING EDGE is an explicit needs-solve trigger, so the
+                // first due tick after re-entering range re-solves with
+                // current geometry instead of serving the stranded eq.
                 inputs.flags = static_cast<IPLSimulationFlags>(
                     IPL_SIMULATIONFLAGS_DIRECT
                     | IPL_SIMULATIONFLAGS_REFLECTIONS
@@ -8819,16 +8969,8 @@ void AudioService::loopStep(float deltaTime)
                 // existing DSP chain rather than as a spatialized
                 // ambisonic field.
                 // Throttled: pathing input staging is skipped on frames
-                // when mPathingDueThisStep is false. The matching
-                // iplSourceSetInputs(...PATHING) call and the
-                // iplSimulatorRunPathing call below are gated on the
-                // same flag, so skipping the stamping here costs
-                // nothing (Steam Audio reads pathing fields only on
-                // the PATHING setInputs path).
-                // Per-voice audibility gate. Voices outside their
-                // schema-authored maxAudibleDist are inaudible regardless
-                // of pathing — skip the per-source staging (and the
-                // corresponding cost in iplSimulatorRunPathing) for them.
+                // when mPathingDueThisStep is false (or, O2a, when the
+                // frame won't signal — solve requests latch instead).
                 //
                 // We do NOT short-circuit on "same room" here. The room
                 // graph is too coarse-grained for that to be a reliable
@@ -8840,12 +8982,106 @@ void AudioService::loopStep(float deltaTime)
                 // cells. Let Steam Audio's solver decide; for true
                 // unobstructed paths it returns eqCoeffs ≈ 1.0 and the
                 // mapping naturally produces full passthrough.
+                //
+                // ── O2a door-dirty-gated solve decision ──
+                //
+                // Eligibility (voicePathingEligible): probe batch attached,
+                // pathing enabled, this frame is a due tick, the voice has
+                // a pathingSource, is not player-emitted (source ≈
+                // listener; the graph collapses to a self-loop), and is
+                // not skipPortalRouting (door foley etc. — the readback
+                // gate never consumes those outputs, so staging+solving
+                // them was measured pure waste and is now excluded
+                // entirely; their SA-side pathingInputs.enabled stays at
+                // its create-time false).
+                //
+                // Eligible voices then split three ways:
+                //   SOLVE — something that could change the route answer
+                //     changed since this voice's last covered solve (see
+                //     the ActiveVoice pathLastSolve* memo doc). Staged
+                //     exactly as before O2a: PATHING flag set,
+                //     enableValidation + findAlternatePaths TRUE (never
+                //     enableValidation=FALSE — that would ignore closed
+                //     doors). Memo is updated ONLY here, and only on
+                //     frames that actually signal the worker.
+                //   SKIP — memo says nothing changed. Staged ONCE with
+                //     the PATHING flag cleared: Steam Audio drops the
+                //     source from the solve loop and serves its retained
+                //     outputs (the cache). Not staged again until the
+                //     next solve.
+                //   (neither) — needs a solve but this frame can't signal
+                //     (worker busy): latch pathSolvePending and stage
+                //     nothing; the latch forces SOLVE on the next
+                //     signaling due tick.
                 float voicePathingDist = glm::length(voice->worldPos - mListenerPos);
                 bool  pathingWanted    = (voicePathingDist <= voice->maxAudibleDist);
-                if (mPathingProbeBatchAdded && mProbePathingEnabled
+                const bool voicePathingEligible = mPathingProbeBatchAdded
+                    && mProbePathingEnabled
                     && mPathingDueThisStep
                     && !voice->playerEmitted
-                    && pathingWanted) {
+                    && !voice->skipPortalRouting
+                    && voice->pathingSource != nullptr;
+                bool stagePathingSolve = false;
+                bool stagePathingSkip  = false;
+                if (voicePathingEligible) {
+                    const bool needsSolve = pathingWanted
+                        && (voice->pathSolvePending
+                            || !voice->pathEverSolved
+                            || voice->pathLastSolveDoorGen != stagingDoorGen
+                            || !voice->pathWantedLastTick  // rising edge
+                            || voice->pathLastSolveListenerRoom
+                                   != stagingListenerRoomId
+                            || glm::length(mListenerPos
+                                   - voice->pathLastSolveListenerPos)
+                                   > kPathingSolveMemoMoveFt
+                            || glm::length(voice->worldPos
+                                   - voice->pathLastSolveSourcePos)
+                                   > kPathingSolveMemoMoveFt);
+                    if (needsSolve) {
+                        if (pathingWillSignal) {
+                            stagePathingSolve = true;
+                            voice->pathLastSolveDoorGen      = stagingDoorGen;
+                            voice->pathLastSolveListenerPos  = mListenerPos;
+                            voice->pathLastSolveListenerRoom =
+                                stagingListenerRoomId;
+                            voice->pathLastSolveSourcePos    = voice->worldPos;
+                            voice->pathEverSolved            = true;
+                            voice->pathSolvePending          = false;
+                            voice->pathStagedEnabled         = true;
+                        } else {
+                            // Due tick that can't signal (worker busy) —
+                            // keep the request alive; do NOT touch the
+                            // memo (memo updates only on signaled solves).
+                            voice->pathSolvePending = true;
+                        }
+                    } else if (voice->pathStagedEnabled) {
+                        // Transition solve→skip: one staging call with the
+                        // PATHING flag cleared, then silence until the
+                        // next solve.
+                        stagePathingSkip = true;
+                        voice->pathStagedEnabled = false;
+                    }
+                    voice->pathWantedLastTick = pathingWanted;
+                    if (pathingWillSignal) {
+                        if (stagePathingSolve) ++pathingStagedSolved;
+                        else                   ++pathingStagedSkipped;
+                    }
+                }
+                // LOCKSTEP INVARIANT (segfault class — see the matching
+                // iplSourceSetInputs(...PATHING) gate below): this single
+                // boolean gates BOTH the pathing-field populate block AND
+                // the setInputs call. A voice must never reach the
+                // setInputs call without having gone through the populate
+                // path — Steam Audio would read inputs.pathingProbes as
+                // the default-initialised null pointer and segfault
+                // inside the next runPathing. SOLVE and SKIP staging
+                // populate identically (probes, radii, ranges, validation
+                // flags); the ONLY difference is the PATHING bit in
+                // inputs.flags, cleared at the end of the populate block
+                // for SKIP.
+                const bool stagePathingInputs =
+                    stagePathingSolve || stagePathingSkip;
+                if (stagePathingInputs) {
                     // Multi-batch architecture: pathing sim has both the
                     // reflection batch (silently skipped — no pathing data)
                     // and the sparse pathing batch attached. The source
@@ -9020,6 +9256,19 @@ void AudioService::loopStep(float deltaTime)
                     //   • the visRange clamp above keeps the candidate
                     //     edge set room-scale.
                     inputs.findAlternatePaths = IPL_TRUE;
+
+                    // O2a SKIP staging: identical populate (fields above
+                    // stay valid on the SA side for whenever the source
+                    // is re-enabled), but clear the PATHING bit so
+                    // pathingInputs.enabled goes false and the solver
+                    // serves the retained outputs. Cleared BEFORE any of
+                    // the setInputs calls below; the DIRECT / REFLECTIONS
+                    // enables read their own bits, so this is invisible
+                    // to them.
+                    if (stagePathingSkip) {
+                        inputs.flags = static_cast<IPLSimulationFlags>(
+                            inputs.flags & ~IPL_SIMULATIONFLAGS_PATHING);
+                    }
                 }
 
                 // Push inputs to each simulator. Every voice has a
@@ -9036,25 +9285,20 @@ void AudioService::loopStep(float deltaTime)
                 iplSourceSetInputs(voice->directSource,
                     IPL_SIMULATIONFLAGS_DIRECT, &inputs);
                 // Pathing inputs go to the per-voice pathingSource (in
-                // the pathing simulator). Throttled by mPathingDueThisStep
-                // — we only stamp fresh inputs when the throttle has
-                // elapsed and the worker is about to be signalled. No
-                // !isRunning() gate: per N2 (RM.PLAN.PATHING_WORKER.md),
-                // iplSourceSetInputs is per-frame-safe via Steam Audio's
-                // internal double buffering, and both reference
-                // integrations call it every frame while the sim thread
-                // is mid-iteration.
+                // the pathing simulator). No !isRunning() gate: per N2
+                // (RM.PLAN.PATHING_WORKER.md), iplSourceSetInputs is
+                // per-frame-safe via Steam Audio's internal double
+                // buffering, and both reference integrations call it
+                // every frame while the sim thread is mid-iteration.
                 //
-                // The gate here must match the populate block above
-                // EXACTLY. Letting a voice through here without going
-                // through the populate path means Steam Audio reads
-                // `inputs.pathingProbes` as the default-initialised null
-                // pointer and segfaults inside the next runPathing.
-                if (mPathingProbeBatchAdded && mProbePathingEnabled
-                    && mPathingDueThisStep
-                    && !voice->playerEmitted
-                    && pathingWanted
-                    && voice->pathingSource) {
+                // LOCKSTEP: stagePathingInputs is the SAME boolean that
+                // gated the populate block above — by construction a
+                // voice cannot reach this call without populated pathing
+                // fields (null pathingProbes here segfaults inside the
+                // next runPathing; see the invariant comment at the
+                // boolean's definition). voicePathingEligible already
+                // required a non-null pathingSource.
+                if (stagePathingInputs) {
                     iplSourceSetInputs(voice->pathingSource,
                         IPL_SIMULATIONFLAGS_PATHING, &inputs);
                 }
@@ -9183,16 +9427,29 @@ void AudioService::loopStep(float deltaTime)
                 // inside ipl::SimulationManager::simulatePathing iterating
                 // a list whose entries had just been freed.
                 const bool gateNotBusy    = !pathBusy;
+                // O2a: must agree with the pathingWillSignal the staging
+                // pass keyed its memo updates on — same inputs, none of
+                // which changed since (pathBusy is the top-of-frame
+                // sample; the members are main-thread-owned). The
+                // mPathingSim null-check difference is immaterial: a null
+                // sim fails the `wantPathing && mPathingSim` signal
+                // condition below just the same.
                 const bool wantPathing    = gateProbeBatch && gateEnable
                                          && gateDue && gateNotBusy;
 
-                // [PATHING_LAG] diagnostic: throttle elapsed but the worker
-                // is still running the previous iteration. We skip signal()
-                // entirely in this branch (see gateNotBusy above for the
-                // race we're avoiding); eqCoeffs hold one extra interval
-                // until the worker idles and the next due frame signals
-                // it. Rate-limited (first 16 + every 64th thereafter).
-                if (gateProbeBatch && gateEnable && gateDue && pathBusy) {
+                // [PATHING_LAG] diagnostic: the CONFIGURED throttle
+                // elapsed but the worker is still running the previous
+                // iteration. We skip signal() entirely in this branch
+                // (see gateNotBusy above for the race we're avoiding);
+                // eqCoeffs hold one extra interval until the worker idles
+                // and the next due frame signals it. Gated on the NATURAL
+                // due flag — the O2a door due-override intentionally
+                // latches due on every frame of a swing while the worker
+                // grinds back-to-back solves, and counting those as lag
+                // would flood the diagnostic with by-design occurrences.
+                // Rate-limited (first 16 + every 64th thereafter).
+                if (gateProbeBatch && gateEnable
+                    && pathingDueNaturalThisStep && pathBusy) {
                     static std::atomic<int> sPathingLagCount{0};
                     int lc = sPathingLagCount.fetch_add(1, std::memory_order_relaxed);
                     if (lc < 16 || (lc % 64) == 0) {
@@ -9206,6 +9463,35 @@ void AudioService::loopStep(float deltaTime)
                 }
 
                 if (wantPathing && mPathingSim) {
+                    // O2a signal-time bookkeeping, BEFORE signal() so the
+                    // arming below can still read the pre-iteration
+                    // completedCycles value race-free (the worker only
+                    // starts once signal() flips mRunning/mWant).
+                    //
+                    // (a) Push this pass's staging mix to the worker's
+                    //     [PERF pathing] window counters.
+                    mPathingSim->addStagingCounts(pathingStagedSolved,
+                                                  pathingStagedSkipped);
+                    // (b) Record the committed door gen this signaled
+                    //     solve covers (staging keyed its memos to the
+                    //     same stagingDoorGen snapshot). Consumed by the
+                    //     epoch FIFO push in setDoorTransform and the
+                    //     door due-override at the top of loopStep.
+                    mDoorGenLastSignalGen = stagingDoorGen;
+                    // (c) Arm [DOOR_ROUTE_LATENCY] completion tracking if
+                    //     an uncovered door epoch exists and this solve's
+                    //     covered gen reaches it. Signals never overlap
+                    //     (gateNotBusy) and the completion detector at
+                    //     the top of loopStep runs before any signal, so
+                    //     a single in-flight record is sufficient — the
+                    //     !mDoorSolveInFlight check is pure defense.
+                    if (!mDoorSolveInFlight && !mDoorGenEvents.empty()
+                        && mDoorGenEvents.front().gen <= stagingDoorGen) {
+                        mDoorSolveInFlight      = true;
+                        mDoorSolveInFlightGen   = stagingDoorGen;
+                        mDoorSolveInFlightCycle =
+                            mPathingSim->completedCycles() + 1;
+                    }
                     mPathingSim->signal();
                 }
                 // DIAG: confirm iplSimulatorRunPathing is actually
@@ -12733,6 +13019,20 @@ void AudioService::dumpAudioStatusPeriodic()
         "[PERF audio] direct_sim n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
         (unsigned long long)dsP.n, fmtMs(dsP.p50), fmtMs(dsP.p95), fmtMs(dsP.p99));
 
+    // O2a — [DOOR_ROUTE_LATENCY] distribution: doorGen bump → end of the
+    // first completed pathing solve covering it (committed BVH + staged
+    // inputs). n=0 on windows with no door movement. USER HARD GATE
+    // (PLAN.PATHING_DESIGN.md §6 decision 1): p95 ≤ ~150 ms under door
+    // stress — sounds popping in behind an opened door after a
+    // noticeable lag is disqualifying.
+    //
+    // PITFALL GUARD: drained ONCE here; the JSONL perf.window emit below
+    // reuses this snapshot (same single-drainer rule as cbP).
+    auto drP = mDoorRouteLatencyHist.snapshotAndReset();
+    AUDIO_LOG(
+        "[PERF door_route] n=%llu p50/p95/max=%.1f/%.1f/%.1f ms\n",
+        (unsigned long long)drP.n, drP.p50, drP.p95, drP.maxMs);
+
     // PLAN.AUDIO_PROFILING.md §2.3 — pin-block probe-reverb lookup latency.
     // Covers the O(probeCount) nearest-probe scan AND the
     // iplProbeBatchGetReverb call. Bursty on voice-spawn storms (footsteps,
@@ -13073,7 +13373,8 @@ void AudioService::dumpAudioStatusPeriodic()
                 "\"p99\":%.4f,\"max\":%.4f},"
             "\"signal_pickup\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"sync_wait\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
-                "\"timeouts\":%d,\"deadline_ms\":%.4f}"
+                "\"timeouts\":%d,\"deadline_ms\":%.4f},"
+            "\"door_route\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"max\":%.4f}"
             "},"
             "\"voices\":{\"total\":%zu,\"refl\":%d,\"tail\":%d,"
                 "\"ambients_playing\":%d,\"ambients_total\":%zu,"
@@ -13121,6 +13422,7 @@ void AudioService::dumpAudioStatusPeriodic()
             (unsigned long long)pickupP.n,   pickupP.p50,   pickupP.p95,   pickupP.p99,
             (unsigned long long)syncP.n,  syncP.p50,  syncP.p95,  syncP.p99,
                 syncTimeouts, static_cast<double>(syncDeadlineMs),
+            (unsigned long long)drP.n, drP.p50, drP.p95, drP.maxMs,
             mVoicePool->size(), reflVoices, tailVoices,
                 playing, ambients.size(), created, destroyed,
             (unsigned long long)evictionsSinceLast, reflVoices, MAX_ACTIVE_VOICES,

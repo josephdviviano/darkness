@@ -189,6 +189,39 @@ public:
     /// waking up.
     void signal();
 
+    /// Number of completed iplSimulatorRunPathing iterations. Incremented
+    /// by the worker (release) at the end of each iteration; read by the
+    /// main thread (acquire) to detect that a signaled solve has finished
+    /// — the [DOOR_ROUTE_LATENCY] staleness metric correlates
+    /// "door-gen bump" → "first completed solve covering it" through this
+    /// counter (see AudioService::loopStep O2a blocks).
+    uint64_t completedCycles() const {
+        return mCompletedCycles.load(std::memory_order_acquire);
+    }
+
+    /// steady_clock nanoseconds-since-epoch timestamp of the END of the
+    /// most recently completed iteration. Stored by the worker BEFORE the
+    /// mCompletedCycles release-increment, so a main-thread reader that
+    /// observed a new cycle count (acquire) is guaranteed to see the
+    /// matching (or a newer) end timestamp. Used as the completion time
+    /// for [DOOR_ROUTE_LATENCY] so the sample doesn't inflate by up to a
+    /// render frame of main-thread detection lag.
+    int64_t lastIterationEndNs() const {
+        return mLastIterEndNs.load(std::memory_order_acquire);
+    }
+
+    /// O2a staging counters — how many eligible voices the main thread
+    /// staged for a SOLVE (PATHING flag set: validation + alternate-path
+    /// search runs) vs SKIPPED (memo said nothing changed; Steam Audio
+    /// retains the cached outputs) on each signaled staging pass.
+    /// Accumulated across the [PERF pathing] dump window and drained
+    /// (exchange 0) by the worker's periodic dump, which appends
+    /// `solved=`/`skipped=` to the [PERF pathing] line.
+    void addStagingCounts(uint32_t solved, uint32_t skipped) {
+        mStagedSolved.fetch_add(solved, std::memory_order_relaxed);
+        mStagedSkipped.fetch_add(skipped, std::memory_order_relaxed);
+    }
+
 private:
     /// Worker thread main — wakes on CV signal, runs one
     /// `iplSimulatorRunPathing`, logs `[PATHING_SLOW]` if elapsed > 15 ms,
@@ -236,6 +269,16 @@ private:
     LatencyHistogram mPathingHist;
     int64_t mLastSignalNs = 0;
     float   mLastSignalIntervalMs = 0.0f;
+
+    // ── O2a completion + staging-mix tracking ──
+    // mCompletedCycles / mLastIterEndNs: see the public accessors above.
+    // mStagedSolved / mStagedSkipped: per-window counters fed by
+    // addStagingCounts (main thread), drained by the worker's
+    // [PERF pathing] dump.
+    std::atomic<uint64_t> mCompletedCycles{0};
+    std::atomic<int64_t>  mLastIterEndNs{0};
+    std::atomic<uint64_t> mStagedSolved{0};
+    std::atomic<uint64_t> mStagedSkipped{0};
 
     // ── [PATH_RAW] sampling state (worker-thread-only) ──
     //

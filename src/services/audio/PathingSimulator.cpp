@@ -264,6 +264,16 @@ void PathingSimulator::workerMain()
             const float ms =
                 std::chrono::duration<float, std::milli>(t1 - t0).count();
             mPathingHist.record(static_cast<double>(ms));
+            // O2a completion bookkeeping for [DOOR_ROUTE_LATENCY]: stamp
+            // the iteration-end time FIRST (relaxed), then publish the
+            // cycle count with release — a main-thread reader that
+            // acquires the new count is guaranteed to see this (or a
+            // newer) end timestamp.
+            mLastIterEndNs.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    t1.time_since_epoch()).count(),
+                std::memory_order_relaxed);
+            mCompletedCycles.fetch_add(1, std::memory_order_release);
             // Same threshold as the previous synchronous main-thread timing
             // harness. Rate-limited (first 32 + every 64th thereafter) to
             // keep the log readable. Now logged from the worker thread, so
@@ -400,11 +410,23 @@ void PathingSimulator::workerMain()
                         std::lock_guard<std::mutex> lock(mMutex);
                         throttleMs = mLastSignalIntervalMs;
                     }
+                    // O2a staging mix for this window: solved = voices
+                    // staged with the PATHING flag set (full validation +
+                    // alternate-path search), skipped = eligible voices
+                    // whose memo said nothing changed (Steam Audio serves
+                    // the cached outputs). skipped >> solved on idle
+                    // windows is the dirty-gating working as designed.
+                    const uint64_t solvedW =
+                        mStagedSolved.exchange(0, std::memory_order_relaxed);
+                    const uint64_t skippedW =
+                        mStagedSkipped.exchange(0, std::memory_order_relaxed);
                     std::fprintf(stderr,
                         "[PERF pathing] p50=%.2fms p95=%.2fms p99=%.2fms "
-                        "throttleMs=%.2f n=%llu\n",
+                        "throttleMs=%.2f n=%llu solved=%llu skipped=%llu\n",
                         p.p50, p.p95, p.p99, throttleMs,
-                        static_cast<unsigned long long>(p.n));
+                        static_cast<unsigned long long>(p.n),
+                        static_cast<unsigned long long>(solvedW),
+                        static_cast<unsigned long long>(skippedW));
                     // Budget warning: p95 ≥ 80% of throttle interval
                     // means we're nearly missing the cadence on most
                     // iterations. Only emit if we have a measured

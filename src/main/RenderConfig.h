@@ -444,6 +444,19 @@ struct RenderConfig {
     // length → voice lifetime → voice-count profile). -1 = unseeded
     // (std::random_device, the default shipping behavior).
     int64_t     audioRngSeed        = -1;         // --audio-rng-seed
+
+    // -- door-swing stress harness (DEV-ONLY) --
+    // --stress-doors N toggles the N doors nearest the camera (of the
+    // doors with a usable audio OBB) open/closed every ~2 s during a run.
+    // Exists solely to exercise the O2a door-dirty-gated pathing
+    // re-solve path and its [DOOR_ROUTE_LATENCY] staleness metric
+    // (PLAN.PATHING_DESIGN.md §6 decision 1) under a scripted swing load
+    // that a hands-off tour can't produce. Bypasses the frob/script
+    // layer (DoorSystem::activate directly), so no door foley schemas
+    // fire — intentional: the metric under test is route updates of
+    // OTHER voices, not door sounds. 0 = disabled (the default; never
+    // ship-enabled).
+    int         stressDoors         = 0;          // --stress-doors N
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -1607,6 +1620,8 @@ inline bool isPerfLabelValid(const std::string& s) {
 //   --audio-capture-rotations N full yaw turns over the window (default 3)
 //   --capture-wav      record final engine output to output.wav in the
 //                      per-run perf directory (= developer.capture_wav)
+//   --stress-doors N   DEV-ONLY: toggle the N nearest doors every ~2 s
+//                      (O2a door-route-latency stress harness)
 //   --help / -h        print usage
 //
 // Unknown flags are reported but otherwise ignored — when a removed flag
@@ -1796,6 +1811,17 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                 std::fprintf(stderr,
                     "[FALLBACK] --audio-rng-seed: invalid '%s' — keeping "
                     "unseeded (random_device)\n", argv[i]);
+            }
+        } else if (std::strcmp(argv[i], "--stress-doors") == 0 && i + 1 < argc) {
+            // DEV-ONLY door-swing stress harness (see AppConfig comment).
+            try {
+                cfg.stressDoors = std::stoi(argv[++i]);
+                if (cfg.stressDoors < 0) cfg.stressDoors = 0;
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --stress-doors: non-integer value '%s' — "
+                    "harness stays disabled\n", argv[i]);
+                cfg.stressDoors = 0;
             }
         } else if (std::strcmp(argv[i], "--bake-quality") == 0 && i + 1 < argc) {
             // Bake-quality profile. "dev" forces the fast iteration bake
