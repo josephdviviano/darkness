@@ -53,7 +53,7 @@ namespace Darkness {
 /// edge between two acoustically-separate rooms. That edge let the
 /// path solver "find" a route through the wall → the reflection send
 /// (gated by pathing) painted that source's reverb into the listener's
-/// room. Requiring 25% of the 256 rays to clear rejects these thin
+/// room. Requiring 25% of the numVisSamples² rays to clear rejects these thin
 /// "around-the-seam" slivers while keeping genuine doorways (where the
 /// large majority of sample-pairs see each other).
 ///
@@ -114,9 +114,9 @@ constexpr float kPathingVisThreshold = 0.25f;
 /// corners, reducing the borderline-visibility region.
 ///
 /// Must remain identical at bake and runtime. Changing this value
-/// requires deleting the cached .probes file and re-baking — at
-/// numSamples=16 that's 256 rays per probe-pair test, so bake time
-/// scales up materially (rays = numSamples² × probe_pairs).
+/// requires deleting the cached .probes file and re-baking
+/// (rays = numSamples² × probe_pairs, so bake cost scales with the
+/// sample count squared).
 constexpr float kPathingVisRadiusFt = 5.0f;
 
 /// Pathing visibility sampling count — the single source of truth for
@@ -125,28 +125,36 @@ constexpr float kPathingVisRadiusFt = 5.0f;
 /// (`IPLSimulationSettings::numVisSamples`, AudioService.cpp pathing-
 /// simulator create). Steam Audio scatters numSamples points in each
 /// probe's kPathingVisRadiusFt sphere and traces numSamples² rays per
-/// probe pair, so this is a QUADRATIC bake-cost knob (16 → 256 rays/pair;
-/// 8 → 64). Bake and runtime MUST match: a runtime value differing from
+/// probe pair, so this is a QUADRATIC bake-cost knob (4 → 16 rays/pair;
+/// 16 → 256). Bake and runtime MUST match: a runtime value differing from
 /// the bake silently re-rejects bake-accepted edges and pathing collapses
 /// to the 0.1f untouched-by-solver sentinel.
 ///
 /// Two profiles, selected by the `--bake-quality dev` CLI flag
 /// (RenderConfig devBakeProfile → AudioService::setDevBakeProfile —
 /// one flag feeds both the bake and the runtime simulator so they can
-/// never diverge within a run):
-///   • Ship = 16 — the 2026-05-26 pathing-stabilization value (raised
-///     from 4 to damp stochastic edge flapping / wet-bus tremolo before
-///     the kPathingVisThreshold 0.1 → 0.25 hardening landed; the V1
-///     experiment re-examines whether the threshold alone suffices).
-///   • Dev  = 8  — 4× fewer rays per pair for iteration bakes.
+/// never diverge within a run).
+///
+/// WHY both are 4 (user decision 2026-07-11, PLAN.PATHING_DESIGN.md §6):
+/// 4 is Valve's shipping value (Steam Audio Unity/Unreal plugin default).
+/// The 2026-05-26 raise to 16 was fighting stochastic edge flapping /
+/// wet-bus tremolo, but the later kPathingVisThreshold 0.1 → 0.25
+/// hardening addresses that borderline-visibility flicker directly —
+/// at 16 we were paying 16× Valve's ray budget (256 vs 16 rays/pair,
+/// quadratic) at bake AND at every runtime findPaths/findAlternatePaths
+/// re-validation, for insurance the threshold now provides. Regression
+/// guard for edge stability is the [PATH_DIAG_DUMP] eq-flap diagnostics,
+/// not a bigger sample count. The Ship/Dev split is retained structurally
+/// (profile plumbing, .probes header, mismatch re-bake) in case the
+/// values ever need to diverge again.
 ///
 /// CROSS-RUN mismatches (cache baked under one profile, run under the
 /// other) are caught by the .probes v3 header, which records the bake's
 /// numSamples (ProbeFile.h bakedPathingNumSamples). The loader compares
 /// it against the active profile constant and triggers a loud automatic
 /// pathing re-bake instead of running with a torn edge set.
-constexpr int kPathingVisSamplesShip = 16;
-constexpr int kPathingVisSamplesDev  = 8;
+constexpr int kPathingVisSamplesShip = 4;
+constexpr int kPathingVisSamplesDev  = 4;
 
 /// Legacy helper: returns the fixed `kPathingVisRadiusFt × kFeetToMeters`
 /// regardless of its `spacingFt` argument. The argument is preserved

@@ -174,6 +174,33 @@ struct RenderConfig {
     // which only affects the dense reflection batch.
     float audioPathingDedupRadiusFt = 10.0f;
 
+    // Pathing probe layout density tier (`audio.pathing_probes.density`).
+    // Valid values:
+    //   "baseline" — Tier 0: the original Dark Engine room/portal
+    //                graph's nodes (1 per room centroid + 1 per non-door
+    //                portal center + door flanking pairs + emitter
+    //                mirrors). Selectable — fast dev bakes / low-end.
+    //   "bends"    — Tier 1 (default): baseline, with every non-door
+    //                portal's center probe replaced by a flanking pair —
+    //                explicit solver bend points at each opening.
+    //   ("high" is RESERVED for a future Tier 2 — room-span subdivision
+    //    for long halls — and is rejected at parse until it exists.)
+    // WHY bends is the default (user decision 2026-07-12, supersedes the
+    // 2026-07-11 baseline flip): fidelity first — flanking pairs at every
+    // aperture give the solver explicit bend points, and they measured
+    // BETTER worst-case door spikes. The baseline flip rested on
+    // misattributed numbers: re-review at ns8 found bends' worst
+    // door-spike window = 316.8 ms vs baseline's 535-696 ms (baseline's
+    // spikes were hidden by log rate-limiting; the "387-700 ms" figure
+    // pinned on bends was old scatter). Baseline still wins median
+    // pathing (p50 66 vs 85 ms) and bake time (17.7 vs 28.4 min at ns8),
+    // which is why it remains selectable rather than removed.
+    // Kept as the validated string; mapped to the PathingProbeDensity
+    // enum at the AudioService boundary (DarknessRender.cpp). Recorded
+    // in the .probes v4 header — changing it triggers a loud automatic
+    // pathing-only re-bake on next run.
+    std::string audioPathingDensity = "bends";
+
     // Force a fresh pathing bake even when the existing .probes file
     // already contains a valid pathing section. The loaded reflection IR
     // section is carried forward unchanged (pathing-only re-bake), so
@@ -187,7 +214,8 @@ struct RenderConfig {
     // Bake-quality profile: true = `--bake-quality dev`. Besides the
     // reflection-bake overrides applied directly in the CLI parser, this
     // flag selects the pathing visibility sampling constant
-    // (SteamAudioPathing.h kPathingVisSamplesDev=8 vs Ship=16) for BOTH
+    // (SteamAudioPathing.h kPathingVisSamplesDev vs Ship — both 4 since
+    // 2026-07-11, split retained structurally) for BOTH
     // the bake and the runtime pathing simulator — one flag, both sides,
     // so they cannot diverge within a run. Cross-run cache mismatches
     // are caught against the .probes v3 header (automatic pathing-only
@@ -770,6 +798,37 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.audioPathingDedupRadiusFt > 30.0f)
                         cfg.audioPathingDedupRadiusFt = 30.0f;
                 }
+                if (pp["density"]) {
+                    // Name list mirrors pathingProbeDensityFromName
+                    // (ProbeManager.h, the canonical string→enum map;
+                    // not included here to keep RenderConfig free of
+                    // audio-stack headers). A name accepted here but
+                    // unknown there is caught loudly at the setter
+                    // boundary in DarknessRender.cpp.
+                    const std::string d = pp["density"].as<std::string>();
+                    if (d == "baseline" || d == "bends") {
+                        cfg.audioPathingDensity = d;
+                    } else {
+                        // Reject-at-parse, loudly. "high" is reserved for
+                        // a future Tier 2 (room-span subdivision) and is
+                        // deliberately NOT accepted until that tier
+                        // exists — accepting it now would be a silently-
+                        // ignored knob (per the single-source-of-truth
+                        // rule from the PR-A config audit). Keep the
+                        // default rather than aborting the whole config
+                        // load, but say exactly what happened.
+                        std::fprintf(stderr,
+                            "[FALLBACK] audio.pathing_probes.density: "
+                            "invalid value '%s' — valid values are "
+                            "'baseline' (Tier 0: original room/portal "
+                            "graph nodes) and 'bends' (Tier 1, "
+                            "default: + flanking pairs at every "
+                            "portal). 'high' is reserved for a future "
+                            "Tier 2 and not yet implemented. Using "
+                            "default '%s'.\n",
+                            d.c_str(), cfg.audioPathingDensity.c_str());
+                    }
+                }
             }
 
             // -- audio.occlusion --
@@ -1316,6 +1375,22 @@ inline bool applySetOverride(const std::string& path, const std::string& valueSt
         float v; if (!toFloat(v)) return false;
         cfg.audioPathingDedupRadiusFt = clampF(v, 0.0f, 30.0f); return true;
     }
+    if (path == "audio.pathing_probes.density") {
+        // Same validation as the YAML parser: baseline | bends only
+        // ("high" reserved for a future Tier 2); name list mirrors
+        // pathingProbeDensityFromName (ProbeManager.h) — see the YAML
+        // parser comment. Returning false routes through the caller's
+        // loud invalid-value report.
+        if (valueStr == "baseline" || valueStr == "bends") {
+            cfg.audioPathingDensity = valueStr;
+            return true;
+        }
+        std::fprintf(stderr,
+            "[FALLBACK] audio.pathing_probes.density: invalid value "
+            "'%s' — valid: 'baseline' | 'bends' ('high' reserved, not "
+            "yet implemented)\n", valueStr.c_str());
+        return false;
+    }
 
     // -- audio.occlusion --
     if (path == "audio.occlusion.radius") {
@@ -1740,9 +1815,11 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                 cfg.bakeNumRays        = 2048;
                 cfg.bakeNumBounces     = 8;
                 cfg.bakeDiffuseSamples = 256;
-                // Pathing visibility sampling drops to
-                // kPathingVisSamplesDev (8 → 64 rays/pair instead of
-                // 256) for BOTH bake and runtime — see devBakeProfile.
+                // Pathing visibility sampling selects
+                // kPathingVisSamplesDev for BOTH bake and runtime — see
+                // devBakeProfile. (Ship and Dev are both 4 since
+                // 2026-07-11, so this no longer changes ray count; the
+                // profile plumbing is kept for the .probes header record.)
                 cfg.devBakeProfile     = true;
                 // Density reduction (user directive 2026-07-05: dev bakes
                 // must be < 10 min). FLOOR_POLY emits one candidate per
@@ -1760,8 +1837,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                     "--bake-quality dev: bake rays=2048 bounces=8 "
                     "diffuse=256 (~64x cheaper/probe than ship yaml) + "
                     "probe density reduced (global_dedup 18 ft, spacing "
-                    "20 ft) + pathing numSamples 16 -> 8 (bake AND "
-                    "runtime; recorded in the .probes header). Cached "
+                    "20 ft); pathing numSamples 4 (same as ship; "
+                    "recorded in the .probes header). Cached "
                     ".probes from this bake are DEV QUALITY/DENSITY — "
                     "re-bake without this flag for milestone/ship "
                     "fidelity (the header mismatch check will do it "
