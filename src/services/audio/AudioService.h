@@ -46,10 +46,12 @@
 #include <cstdio>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
 #include <string>
+#include <utility>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -1793,6 +1795,18 @@ private:
     /// once per registerDoorGeometry batch.
     uint64_t mDoorAcousticGen = 0;
 
+    /// steady_clock ns timestamp of the most recent setDoorTransform bump
+    /// on a REGISTERED door. Consumed by the staging pass's
+    /// unreachable-route cache: a known no-route voice defers its
+    /// doorGen-triggered discovery re-solve (an exhaustive
+    /// findAlternatePaths) until doors have been QUIET for
+    /// kDoorQuietForNoRouteRetryMs — during a continuous swing the
+    /// per-tick doorGen trigger would otherwise re-run the exhaustive
+    /// search on every solve for a voice that is silent either way.
+    /// Registration deliberately does NOT stamp this (boot-time scene
+    /// build, not a swing).
+    int64_t mDoorLastBumpNs = 0;
+
     /// The generation whose door poses are actually IN the committed
     /// acoustic-scene BVH. Advanced to mDoorAcousticGen right after each
     /// iplSceneCommit (loopStep's coalesced door commit +
@@ -1806,23 +1820,24 @@ private:
     uint64_t mDoorGenCommitted = 0;
 
     /// Committed-gen snapshot taken at the most recent pathing-worker
-    /// signal(). Two consumers: (a) the door-event epoch FIFO below only
-    /// opens a NEW epoch when the latest recorded epoch has already been
-    /// snapshot into some signaled solve; (b) the pathing throttle's
-    /// door-override (re-solve continuously while doors move) fires while
-    /// mDoorGenCommitted != this.
+    /// signal(). Consumer: the pathing throttle's door-override
+    /// (re-solve continuously while doors move) fires while
+    /// mDoorGenCommitted != this. (The epoch FIFO below no longer keys
+    /// on it — latest-gen-wins pushes one epoch per bump.)
     uint64_t mDoorGenLastSignalGen = 0;
 
-    /// [DOOR_ROUTE_LATENCY] epoch FIFO. One entry per "uncovered door
-    /// event epoch": the FIRST door-gen bump after the previous pathing
-    /// signal snapshot opens an epoch (records its timestamp); subsequent
-    /// bumps are absorbed into it (staleness is measured from the
-    /// earliest uncovered change). Entries are popped — and a latency
-    /// sample recorded — when a completed solve's covered gen reaches
-    /// them. Bounded at ~2 entries by construction (one open epoch +
-    /// one in flight).
+    /// [DOOR_ROUTE_LATENCY] epoch FIFO — latest-gen-wins (stacking fix,
+    /// PLAN.PATHING_DESIGN.md §11). One entry PER door-gen bump while
+    /// pathing is operative. A completed covering solve retires ALL
+    /// entries ≤ its covered gen in one batch, recording each entry's
+    /// latency from its OWN bump time (per-door-state staleness — the
+    /// perceptual gate quantity; the batch's oldest sample preserves the
+    /// old absorb-into-earliest worst-case envelope). Bounded by the
+    /// retirement rate (steady-state ≈ bump rate × pipeline latency,
+    /// tens of entries) with a hard cap + loud drop in setDoorTransform;
+    /// cleared on probe-batch teardown/reload.
     struct DoorGenEvent {
-        uint64_t gen;      ///< mDoorAcousticGen value that opened the epoch
+        uint64_t gen;      ///< mDoorAcousticGen value of this bump
         int64_t  timeNs;   ///< steady_clock ns of that bump
     };
     std::deque<DoorGenEvent> mDoorGenEvents;
@@ -1836,13 +1851,138 @@ private:
     uint64_t mDoorSolveInFlightGen = 0;    ///< covers epochs with gen <= this
     uint64_t mDoorSolveInFlightCycle = 0;  ///< completedCycles target
 
-    /// Door-event route staleness histogram (ms): doorGen bump → end of
-    /// the first completed pathing solve whose staged inputs + committed
-    /// BVH covered it. Drained by dumpAudioStatusPeriodic into the
+    /// Door-event route staleness histogram (ms): each door-gen bump →
+    /// end of the first completed pathing solve whose staged inputs +
+    /// committed BVH covered it (per-bump samples since the latest-gen-
+    /// wins fix; a covering solve contributes one sample per retired
+    /// epoch). Drained by dumpAudioStatusPeriodic into the
     /// [PERF door_route] stderr line + the perf.window JSONL `door_route`
     /// stage. USER HARD GATE (PLAN.PATHING_DESIGN.md §6): p95 must stay
     /// ≤ ~150 ms under door-swing stress.
     LatencyHistogram mDoorRouteLatencyHist;
+
+    // ── O3-lite scoped door-event invalidation (PLAN.PATHING_DESIGN.md §8) ──
+    //
+    // A shadow room-graph router (radius-bounded portal Dijkstra over
+    // ROOM_DB, the same graph analysis/door_detour_class.py proxies)
+    // computes, per voice at each SOLVE, the SET of room-pairs on any
+    // route within a slack window of the shortest. The voice is then
+    // registered against every DOOR whose room-pair lies on a route in
+    // that set (plus an ellipse geometric fallback). On a door commit
+    // only the registered voices are invalidated — shrinking the
+    // door-swing "affected voices" from all-in-range (~11 on MISS2) to
+    // the 1-2 actually routed through the moving door. All members below
+    // are MAIN-THREAD ONLY (registration, commit-marking and teardown all
+    // run on the main thread). No acoustic parameters are produced here —
+    // scheduling/invalidation only.
+
+    /// Slack window (feet) added to the shortest route length: a portal
+    /// (room-pair) is "on a route" if distFromSource + distToListener
+    /// through it is within this of the shortest S→T route. Also the
+    /// ellipse-fallback margin. Deliberately generous (conservative
+    /// superset) — the [SCOPE_MISS] watchdog is the correctness guard.
+    /// 20 ft = top of the sanctioned +10-20 ft window (§8 step 1); raised
+    /// from 15 ft after the first stress runs showed a handful of
+    /// regDoors≥1 ambients whose alternate-route door sat just beyond a
+    /// tighter window (small [SCOPE_MISS] deltas).
+    static constexpr float kRouteSlackFt = 20.0f;
+
+    /// Per-registered-door canonical (min,max) room-pair, built at
+    /// registerDoorGeometry with the SAME point-to-AABB matcher as
+    /// logDoorPortalMap / the DoorPair bake classifier. Doors that match
+    /// no portal within kPathingDoorPortalMatchDistFt get NO entry (the
+    /// 43 genuine non-boundary doors) — those fall to the ellipse
+    /// fallback / fail-open-all on bump.
+    std::unordered_map<int32_t, std::pair<int32_t, int32_t>> mDoorRoomPair;
+
+    /// Inverse of mDoorRoomPair: canonical room-pair → door IDs mapped to
+    /// it. Lets the router turn a route's room-pair set into door IDs.
+    std::map<std::pair<int32_t, int32_t>, std::vector<int32_t>> mRoomPairDoors;
+
+    /// Shadow-router portal graph (physical portals, deduped via the
+    /// portalID<=destPortalID convention). Built from ROOM_DB whenever the
+    /// door maps are (re)built; independent of the probe graph. Empty ⇒
+    /// mRouterReady false ⇒ every voice fails open (global door trigger).
+    struct RouterPortal {
+        int32_t a;        ///< lower room ID
+        int32_t b;        ///< higher room ID
+        Vector3 center;   ///< portal polygon center (engine feet)
+    };
+    std::vector<RouterPortal> mRouterPortals;
+    /// roomID → indices into mRouterPortals of the portals bounding it
+    /// (a portal appears under BOTH its rooms). The router's adjacency:
+    /// portal P's neighbors are the portals sharing either of P's rooms.
+    std::unordered_map<int32_t, std::vector<uint32_t>> mRouterRoomPortals;
+    bool mRouterReady = false;
+
+    /// Reverse index door → voices registered against it (scope step 2).
+    /// Rebuilt incrementally: a voice's registration is refreshed at every
+    /// SOLVE and torn down in removeVoiceSource. On a door commit the
+    /// registered voices (and only those) are marked pathScopedDoorDirty.
+    std::unordered_map<int32_t, std::unordered_set<SoundHandle>> mDoorVoices;
+    /// Per-voice current door registration (the door IDs a voice sits in
+    /// mDoorVoices under) so a re-solve / teardown can remove the old
+    /// edges before adding the new ones.
+    std::unordered_map<SoundHandle, std::vector<int32_t>> mVoiceRegisteredDoors;
+
+    /// Door IDs whose transform bumped since the last committed BVH refit.
+    /// Populated by setDoorTransform, drained at the coalesced iplSceneCommit
+    /// in loopStep to mark exactly the registered voices dirty (the door
+    /// poses are only IN the BVH after the commit, so marking at commit —
+    /// not bump — preserves the "solve sees the new geometry" invariant).
+    std::unordered_set<int32_t> mDoorsBumpedSinceCommit;
+
+    /// [SCOPE_MISS] watchdog cadence (steady_clock ns of last tick + the
+    /// pending latch consumed by the next signaling staging pass). The
+    /// watchdog force-solves eligible in-range voices ignoring scoping and
+    /// checks whether any voice that scoping WOULD have skipped shows a
+    /// material eq change (a scope miss). Cumulative miss count is loud +
+    /// reported on [PERF scope].
+    ///
+    /// STAGGERED (not one full-scope solve): a full 11-voice audit solve
+    /// every 2 s re-introduces exactly the expensive validation+alternate
+    /// iteration scoping removed (~150-255 ms), blocking the door commit
+    /// and spiking the [DOOR_ROUTE_LATENCY] gate it is meant to guard.
+    /// Instead each tick (every kScopeWatchdogIntervalMs) arms a rotating
+    /// window of kScopeWatchdogBatch voices via mScopeWatchdogCursor, so
+    /// every eligible voice is audited within ~2 s while each tick adds
+    /// only a couple of forced solves to the scoped set. (As-built
+    /// refinement of the §8 "one background full-scope solve" — same audit
+    /// coverage + cadence, kept genuinely background.)
+    int64_t  mScopeWatchdogLastNs = 0;
+    bool     mScopeWatchdogPending = false;
+    uint32_t mScopeWatchdogCursor = 0;
+    static constexpr double   kScopeWatchdogIntervalMs = 250.0;
+    static constexpr uint32_t kScopeWatchdogBatch = 2;
+    /// A pathing eqCoeffs band delta beyond this between a scope-skipped
+    /// voice's cached eq and its forced full-solve eq is a scope miss.
+    static constexpr float kScopeMissEqEpsilon = 0.05f;
+    std::atomic<uint64_t> mScopeMissCount{0};
+
+    /// (Re)build mDoorRoomPair / mRoomPairDoors from the registered doors
+    /// and the shadow-router portal graph from ROOM_DB. Called at the end
+    /// of registerDoorGeometry (RoomService loaded by then). Clears + sets
+    /// mRouterReady.
+    void rebuildDoorScopeMaps();
+
+    /// Shadow router: radius-bounded portal Dijkstra + ellipse fallback.
+    /// Returns the sorted, deduped set of door IDs relevant to a voice at
+    /// (sourcePos, listenerPos). `outScopeValid` is set true iff the
+    /// router produced usable route data (built, both rooms resolved, a
+    /// finite route exists) — false ⇒ the caller fails the voice open.
+    std::vector<int32_t> computeRouteScope(const Vector3 &sourcePos,
+                                           const Vector3 &listenerPos,
+                                           Room *sourceRoom,
+                                           Room *listenerRoom,
+                                           float maxAudibleDist,
+                                           bool &outScopeValid) const;
+
+    /// Refresh a voice's door registration in mDoorVoices /
+    /// mVoiceRegisteredDoors to `doors` (removing stale edges first).
+    void registerVoiceRouteDoors(SoundHandle h,
+                                 const std::vector<int32_t> &doors);
+    /// Drop a voice from the reverse index entirely (teardown / reload).
+    void unregisterVoiceRouteScope(SoundHandle h);
 
     /// Reflection simulation owner — wraps the Steam Audio reflection
     /// IPLSimulator handle, its dedicated background worker thread, the

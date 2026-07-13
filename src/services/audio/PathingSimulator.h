@@ -220,9 +220,25 @@ public:
     /// Accumulated across the [PERF pathing] dump window and drained
     /// (exchange 0) by the worker's periodic dump, which appends
     /// `solved=`/`skipped=` to the [PERF pathing] line.
-    void addStagingCounts(uint32_t solved, uint32_t skipped) {
+    /// unreachableCached counts staged-SKIP decisions made by the
+    /// unreachable-route cache: voices whose last covering solve was a
+    /// definitive no-route verdict and whose re-solve (an exhaustive
+    /// findAlternatePaths) was suppressed because no trigger that could
+    /// change reachability fired. Printed loud on [PERF pathing].
+    /// scopedSolves counts staged solves on a scope-valid voice (route set
+    /// active); scopeSkipped counts in-range voices whose GLOBAL door gen
+    /// advanced but whose scoped route set excluded the moved door(s), so
+    /// the re-solve was suppressed (the O3-lite scoped-invalidation win,
+    /// PLAN.PATHING_DESIGN.md §8). Both printed on [PERF pathing].
+    void addStagingCounts(uint32_t solved, uint32_t skipped,
+                          uint32_t unreachableCached,
+                          uint32_t scopedSolves, uint32_t scopeSkipped) {
         mStagedSolved.fetch_add(solved, std::memory_order_relaxed);
         mStagedSkipped.fetch_add(skipped, std::memory_order_relaxed);
+        mUnreachableCached.fetch_add(unreachableCached,
+                                     std::memory_order_relaxed);
+        mScopedSolves.fetch_add(scopedSolves, std::memory_order_relaxed);
+        mScopeSkipped.fetch_add(scopeSkipped, std::memory_order_relaxed);
     }
 
 private:
@@ -282,6 +298,9 @@ private:
     std::atomic<int64_t>  mLastIterEndNs{0};
     std::atomic<uint64_t> mStagedSolved{0};
     std::atomic<uint64_t> mStagedSkipped{0};
+    std::atomic<uint64_t> mUnreachableCached{0};
+    std::atomic<uint64_t> mScopedSolves{0};
+    std::atomic<uint64_t> mScopeSkipped{0};
 
     // ── [PATH_RAW] sampling state (worker-thread-only) ──
     //

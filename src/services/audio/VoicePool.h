@@ -491,6 +491,70 @@ struct ActiveVoice {
     bool     pathOutputsStale = false;
     uint64_t pathStaleCoverCycle = UINT64_MAX;
 
+    // ── Unreachable-route verdict (main-thread only) ──
+    //
+    // Written by the harvest pass's output-read branch each frame from
+    // the RAW pathing outputs (before any DSP mapping):
+    //   pathLastOutputsNoRoute  — solver ran for this source and found
+    //     NO route: shCoeffs all-zero with eqCoeffs=[1,1,1]
+    //     (calcEQForPaths writes eq=1 when numValidPaths==0 and the SH
+    //     buffer stays memset-zero). This is the expensive verdict —
+    //     the solve that produced it exhausted findAlternatePaths.
+    //   pathLastOutputsSentinel — outputs still bit-identical to the
+    //     SimulationData create-time seed (eq=[0.1,0.1,0.1], sh=0):
+    //     the solver has NEVER written this source. NOT a verdict.
+    //   pathVerdictCoverCycle — PathingSimulator::completedCycles()+1
+    //     armed at each staged SOLVE; a verdict read from the outputs
+    //     is only attributable to the memo'd solve once
+    //     completedCycles() reaches this (before that the outputs may
+    //     predate the staged solve). UINT64_MAX = no solve staged yet.
+    //
+    // Consumed by the staging pass's unreachable-route cache (skip the
+    // exhaustive re-solve while nothing changed) and by the
+    // [PERF path_trig] diagnostic counters.
+    bool     pathLastOutputsNoRoute  = false;
+    bool     pathLastOutputsSentinel = true;   // pre-first-solve = seed
+    uint64_t pathVerdictCoverCycle   = UINT64_MAX;
+
+    // ── Scoped door-event invalidation (main-thread only) ──
+    //
+    // PLAN.PATHING_DESIGN.md §8 (O3-lite shadow router). The pre-scope
+    // door trigger fired for EVERY in-range voice on any door commit
+    // (pathLastSolveDoorGen != committedGen); the shadow router shrinks
+    // that to the 1-2 voices actually routed through the moving door.
+    //
+    //   pathScopedDoorDirty  — set at door COMMIT time (loopStep) for
+    //     voices registered against a door whose pose just entered the
+    //     BVH (via AudioService::mDoorVoices reverse index), OR for all
+    //     scope-valid voices on a fail-open commit (unmapped door with
+    //     no ellipse cover). Consumed (and cleared) at the voice's next
+    //     signaled SOLVE — the scoped replacement for the global doorGen
+    //     trigger. Init true so a voice with no prior solve still solves
+    //     (trigNever covers the same case; belt-and-suspenders).
+    //   pathRouteScopeValid  — true iff the voice's last covering solve
+    //     produced usable route data (router built, source+listener
+    //     rooms resolved, a finite route exists). When FALSE the voice
+    //     FAILS OPEN: it uses the global committed-gen door trigger, not
+    //     the scoped dirty flag (router miss / unmapped room / no-route
+    //     verdict → conservative). Init false = fail-open until solved.
+    bool     pathScopedDoorDirty = true;
+    bool     pathRouteScopeValid = false;
+
+    // ── [SCOPE_MISS] watchdog (main-thread only) ──
+    //
+    // pathLastEq caches the most recent RAW pathing eqCoeffs read by the
+    // harvest pass (once attributable via the completed-cycles gate). The
+    // watchdog (~2 s) force-solves EVERY eligible in-range voice ignoring
+    // scoping; for a voice that scoping WOULD have skipped this tick it
+    // snapshots pathLastEq into pathScopeWatchdogEqSnapshot and arms
+    // pathScopeWatchdogCoverCycle. When the forced solve completes the
+    // harvest compares the fresh eq to the snapshot; a band delta beyond
+    // kScopeMissEqEpsilon means scoping wrongly excluded this voice from a
+    // door change → loud [SCOPE_MISS]. UINT64_MAX = not armed.
+    float    pathLastEq[3]                = {0.0f, 0.0f, 0.0f};
+    float    pathScopeWatchdogEqSnapshot[3] = {0.0f, 0.0f, 0.0f};
+    uint64_t pathScopeWatchdogCoverCycle  = UINT64_MAX;
+
     // Per-voice volumetric-occlusion sphere radius (engine feet).
     // Computed in createVoiceSource by raycasting from the source
     // position in N uniformly-distributed directions; the radius is

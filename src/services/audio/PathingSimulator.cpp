@@ -421,13 +421,32 @@ void PathingSimulator::workerMain()
                         mStagedSolved.exchange(0, std::memory_order_relaxed);
                     const uint64_t skippedW =
                         mStagedSkipped.exchange(0, std::memory_order_relaxed);
+                    // unreachableCached: staged-SKIPs the unreachable-route
+                    // cache produced (suppressed exhaustive re-solves of
+                    // known no-route voices). Loud by user directive.
+                    const uint64_t unreachW =
+                        mUnreachableCached.exchange(0, std::memory_order_relaxed);
+                    // O3-lite scoped-invalidation counters (§8): scopedSolves
+                    // = solves on scope-valid voices; scopeSkipped = in-range
+                    // voices whose global door gen advanced but whose route
+                    // set excluded the moved door(s) — the re-solves scoping
+                    // suppressed (the win).
+                    const uint64_t scopedW =
+                        mScopedSolves.exchange(0, std::memory_order_relaxed);
+                    const uint64_t scopeSkipW =
+                        mScopeSkipped.exchange(0, std::memory_order_relaxed);
                     std::fprintf(stderr,
                         "[PERF pathing] p50=%.2fms p95=%.2fms p99=%.2fms "
-                        "throttleMs=%.2f n=%llu solved=%llu skipped=%llu\n",
-                        p.p50, p.p95, p.p99, throttleMs,
+                        "max=%.2fms throttleMs=%.2f n=%llu solved=%llu "
+                        "skipped=%llu unreachableCached=%llu "
+                        "scopedSolves=%llu scopeSkipped=%llu\n",
+                        p.p50, p.p95, p.p99, p.maxMs, throttleMs,
                         static_cast<unsigned long long>(p.n),
                         static_cast<unsigned long long>(solvedW),
-                        static_cast<unsigned long long>(skippedW));
+                        static_cast<unsigned long long>(skippedW),
+                        static_cast<unsigned long long>(unreachW),
+                        static_cast<unsigned long long>(scopedW),
+                        static_cast<unsigned long long>(scopeSkipW));
                     // Budget warning: p95 ≥ 80% of throttle interval
                     // means we're nearly missing the cadence on most
                     // iterations. Only emit if we have a measured
