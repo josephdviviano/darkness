@@ -176,26 +176,30 @@ struct RenderConfig {
 
     // Pathing probe layout density tier (`audio.pathing_probes.density`).
     // Valid values:
-    //   "baseline" — Tier 0 (default): the original Dark Engine room/portal
+    //   "baseline" — Tier 0: the original Dark Engine room/portal
     //                graph's nodes (1 per room centroid + 1 per non-door
-    //                portal center + door flanking pairs + emitter mirrors).
-    //   "bends"    — Tier 1: baseline, with every non-door portal's center
-    //                probe replaced by a flanking pair — explicit solver
-    //                bend points at each opening. Still selectable; no
-    //                longer the default.
+    //                portal center + door flanking pairs + emitter
+    //                mirrors). Selectable — fast dev bakes / low-end.
+    //   "bends"    — Tier 1 (default): baseline, with every non-door
+    //                portal's center probe replaced by a flanking pair —
+    //                explicit solver bend points at each opening.
     //   ("high" is RESERVED for a future Tier 2 — room-span subdivision
     //    for long halls — and is rejected at parse until it exists.)
-    // WHY baseline is the default (user decision 2026-07-11, matrix2):
-    // SA's findAlternatePaths is ~quadratic in probe count, so bends'
-    // extra probes cost at RUNTIME, not just bake — MISS2 0.1 s tours
-    // measured pathing p50 66 ms (baseline) vs 86 ms (bends), worst-case
-    // door spikes 77-213 ms vs 387-700 ms, dev bake 17.7 vs 28.4 min
-    // (at ns8). Baseline wins on both axes.
+    // WHY bends is the default (user decision 2026-07-12, supersedes the
+    // 2026-07-11 baseline flip): fidelity first — flanking pairs at every
+    // aperture give the solver explicit bend points, and they measured
+    // BETTER worst-case door spikes. The baseline flip rested on
+    // misattributed numbers: re-review at ns8 found bends' worst
+    // door-spike window = 316.8 ms vs baseline's 535-696 ms (baseline's
+    // spikes were hidden by log rate-limiting; the "387-700 ms" figure
+    // pinned on bends was old scatter). Baseline still wins median
+    // pathing (p50 66 vs 85 ms) and bake time (17.7 vs 28.4 min at ns8),
+    // which is why it remains selectable rather than removed.
     // Kept as the validated string; mapped to the PathingProbeDensity
     // enum at the AudioService boundary (DarknessRender.cpp). Recorded
     // in the .probes v4 header — changing it triggers a loud automatic
     // pathing-only re-bake on next run.
-    std::string audioPathingDensity = "baseline";
+    std::string audioPathingDensity = "bends";
 
     // Force a fresh pathing bake even when the existing .probes file
     // already contains a valid pathing section. The loaded reflection IR
@@ -816,9 +820,9 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                         std::fprintf(stderr,
                             "[FALLBACK] audio.pathing_probes.density: "
                             "invalid value '%s' — valid values are "
-                            "'baseline' (Tier 0, default: original "
-                            "room/portal graph nodes) and 'bends' "
-                            "(Tier 1: + flanking pairs at every "
+                            "'baseline' (Tier 0: original room/portal "
+                            "graph nodes) and 'bends' (Tier 1, "
+                            "default: + flanking pairs at every "
                             "portal). 'high' is reserved for a future "
                             "Tier 2 and not yet implemented. Using "
                             "default '%s'.\n",

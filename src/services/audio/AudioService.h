@@ -1965,7 +1965,7 @@ private:
     float              mProbePathingDedupRadiusFt = 10.0f;
 
     /// Pathing probe layout density tier. Set from yaml
-    /// (`audio.pathing_probes.density`, default "baseline"); consumed by
+    /// (`audio.pathing_probes.density`, default "bends"); consumed by
     /// prepareProbeBakeParams' portal pass and recorded into the
     /// .probes v4 header. Initialized in the constructor (the enum is
     /// only forward-declared here, so its enumerators are not visible

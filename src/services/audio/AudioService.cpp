@@ -3759,15 +3759,17 @@ const size_t ServiceImpl<AudioService>::SID = __SERVICE_ID_AUDIO;
 AudioService::AudioService(ServiceManager *manager, const std::string &name)
     : ServiceImpl<AudioService>(manager, name)
 {
-    // Pathing probe layout density default (Tier 0 "baseline" since
-    // 2026-07-11: matrix2 measured baseline beating bends on BOTH bake
-    // time and runtime path-solve cost — findAlternatePaths is
-    // ~quadratic in probe count; see RenderConfig.h audioPathingDensity).
+    // Pathing probe layout density default (Tier 1 "bends" — user
+    // decision 2026-07-12, fidelity first, superseding the 2026-07-11
+    // baseline flip whose worst-case numbers were misattributed: at ns8
+    // bends' worst door-spike window is 316.8 ms vs baseline's
+    // 535-696 ms, though baseline keeps the better median (66 vs 85 ms)
+    // and bake time; see RenderConfig.h audioPathingDensity).
     // Initialized here rather than as a default
     // member initializer because AudioService.h only forward-declares
     // the enum. Overridden from yaml (`audio.pathing_probes.density`)
     // before the first bake.
-    mPathingProbeDensity = PathingProbeDensity::Baseline;
+    mPathingProbeDensity = PathingProbeDensity::Bends;
 
     // LoopClient definition — runs after input, before renderer
     mLoopClientDef.id = LOOPCLIENT_ID_AUDIO;

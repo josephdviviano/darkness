@@ -152,17 +152,21 @@ enum class PathingProbePurpose {
 /// mismatch. Underlying type is fixed (uint32_t) so the value round-trips
 /// through the on-disk header verbatim and the enum can be forward-declared.
 ///
-///   • Baseline — Tier 0 (default since 2026-07-11 — matrix2 measured it
-///     beating bends on BOTH bake time and runtime solve cost; see
-///     RenderConfig.h audioPathingDensity): the original Dark Engine
-///     room/portal graph's nodes. 1 probe per room centroid (+ upper
-///     centroid for genuinely tall rooms) + 1 per non-door portal center
-///     + door flanking pairs + emitter mirrors.
-///   • Bends    — Tier 1 (implemented and selectable, no longer the
-///     default): baseline, with every NON-door portal's
-///     single center probe replaced by a flanking pair
-///     (center ± normal × kPairProbeOffsetFt, purpose PortalPair) — the
-///     solver's bend points for sound turning corners at every opening.
+///   • Baseline — Tier 0 (selectable — fast dev bakes / low-end): the
+///     original Dark Engine room/portal graph's nodes. 1 probe per room
+///     centroid (+ upper centroid for genuinely tall rooms) + 1 per
+///     non-door portal center + door flanking pairs + emitter mirrors.
+///     Wins the medians (pathing p50 66 vs 85 ms; dev bake 17.7 vs
+///     28.4 min at ns8) but has the WORSE worst case (below).
+///   • Bends    — Tier 1 (default — user decision 2026-07-12, fidelity
+///     first; supersedes the 2026-07-11 baseline flip, whose worst-case
+///     numbers were misattributed: at ns8 bends' worst door-spike window
+///     measured 316.8 ms vs baseline's 535-696 ms, hidden then by log
+///     rate-limiting; see RenderConfig.h audioPathingDensity): baseline,
+///     with every NON-door portal's single center probe replaced by a
+///     flanking pair (center ± normal × kPairProbeOffsetFt, purpose
+///     PortalPair) — the solver's explicit bend points for sound turning
+///     corners at every opening/aperture.
 ///     Cost: +1 probe per non-door portal over baseline.
 ///
 /// At EVERY density a thin-room coverage repair runs after the dedup and
@@ -409,9 +413,9 @@ struct ProbeBakeParams {
     /// record it into the .probes v4 header for the loader's
     /// density-mismatch check (same policy as pathingNumSamples: loud +
     /// automatic pathing-only re-bake). Default mirrors the config
-    /// default (baseline since 2026-07-11); AudioService always
-    /// overwrites it from the active config.
-    PathingProbeDensity pathingDensity = PathingProbeDensity::Baseline;
+    /// default (bends — user decision 2026-07-12, fidelity first);
+    /// AudioService always overwrites it from the active config.
+    PathingProbeDensity pathingDensity = PathingProbeDensity::Bends;
 
     /// True = pathing-only re-bake: skip the (expensive) reflection IR
     /// bake and carry the CURRENTLY LOADED reflection batch forward into

@@ -379,11 +379,17 @@ audio:
 // reserved-for-Tier-2 "high" — is rejected at parse with a loud stderr
 // message and the default kept.
 TEST_CASE("audio pathing_probes density YAML key", "[config][yaml][audio]") {
-    SECTION("default is baseline") {
-        // Baseline became the default 2026-07-11 (matrix2: beats bends
-        // on both bake time and runtime path-solve cost).
+    SECTION("default is bends") {
+        // Bends is the default (user decision 2026-07-12, fidelity
+        // first — flanking pairs at every aperture are explicit solver
+        // bend points, and at ns8 bends measured the BETTER worst-case
+        // door-spike window: 316.8 ms vs baseline's 535-696 ms, which
+        // log rate-limiting hid during the brief 2026-07-11 baseline
+        // flip). Baseline stays selectable: better medians (p50 66 vs
+        // 85 ms; dev bake 17.7 vs 28.4 min at ns8) for fast dev bakes
+        // / low-end.
         Darkness::RenderConfig cfg;
-        CHECK(cfg.audioPathingDensity == "baseline");
+        CHECK(cfg.audioPathingDensity == "bends");
     }
     SECTION("baseline accepted") {
         TmpFile tmp("audio:\n  pathing_probes:\n    density: baseline\n");
@@ -401,13 +407,13 @@ TEST_CASE("audio pathing_probes density YAML key", "[config][yaml][audio]") {
         TmpFile tmp("audio:\n  pathing_probes:\n    density: high\n");
         Darkness::RenderConfig cfg;
         REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
-        CHECK(cfg.audioPathingDensity == "baseline");
+        CHECK(cfg.audioPathingDensity == "bends");
     }
     SECTION("garbage rejected, default kept") {
         TmpFile tmp("audio:\n  pathing_probes:\n    density: ultra\n");
         Darkness::RenderConfig cfg;
         REQUIRE(Darkness::loadConfigFromYAML(tmp.path.string(), cfg));
-        CHECK(cfg.audioPathingDensity == "baseline");
+        CHECK(cfg.audioPathingDensity == "bends");
     }
     SECTION("--set override: valid values apply, invalid rejected") {
         Darkness::RenderConfig cfg;
