@@ -17239,6 +17239,90 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 return r ? r->getRoomID() : -1;
             };
 
+            // ── Same-acoustic-space merge (door-aware dedup) ─────────────
+            //
+            // The per-purpose and room-aware guards above are correct about
+            // WHY they exist but too blunt about WHEN: taken literally they
+            // keep provably redundant probes. Every door carries four probes
+            // in a line — its flanks at +-5 ft, plus the centroids of the two
+            // thin threshold-slab rooms at +-1 ft:
+            //     104.85        108.80    [DOOR 110.0]   110.90      114.85
+            //     flank(room A)  slab1                    slab2   flank(room B)
+            // The slab centroids survive only because they differ in PURPOSE
+            // and ROOM — not because they contribute: SA attaches by
+            // influence radius (>=10 ft floor), so the flank 4 ft away
+            // already serves that space, on the same side of the door.
+            //
+            // Both guards protect real failures and must not simply be
+            // dropped: naive cross-purpose dedup once swallowed 320 MISS6
+            // closet centroids (listeners then attached to a probe ACROSS a
+            // door => no path => the eq=[0.1,0.1,0.1] sentinel), and
+            // room-agnostic dedup emptied 20-30% of rooms across thin walls.
+            //
+            // What made those wrong is that the SURVIVOR was in a different
+            // acoustic space — behind a wall, or behind a door. So relax the
+            // guards exactly when the two probes provably share one space:
+            //   1. Neither is a door anchor. DoorPair flanks are the geometry
+            //      the runtime invalidates when a door shuts; never merge one
+            //      away, and never merge anything INTO the door's own role.
+            //   2. The segment does not CROSS a door leaf (endpoints on the
+            //      same side), so a closed door always keeps a probe on each
+            //      side to block between. This is what defuses the closet
+            //      failure: its centroid may merge with its own inner flank
+            //      (same side, inside the room), never with something beyond
+            //      the door.
+            //   3. The segment is PROVEN visible (RayStatus::Clear — never a
+            //      bare false, see RayStatus). A thin wall blocks the ray, so
+            //      a small room keeps its own anchor.
+            // [BAKE_PARITY] is the referee and now asks SA's question
+            // (coverage, not containment), so a merge that actually strands a
+            // room shows up as a real MISSING rather than a phantom one.
+            const std::vector<DoorWorldAABB> dedupDoorBoxes = doorAudioAABBs();
+            // Do the endpoints straddle a door leaf? Deliberately NOT an
+            // AABB-overlap test: the probes we most want to merge sit ~0.5 ft
+            // from the door, so any padded box contains them and every merge
+            // would be blocked (measured: that version merged almost
+            // nothing). A door leaf is a thin slab, so its thinnest AABB axis
+            // is its facing; endpoints straddle it when their offsets along
+            // that axis have opposite signs AND the crossing lands within the
+            // leaf's own footprint (otherwise a segment sliding past the door
+            // frame reads as crossing).
+            auto segmentCrossesAnyDoor = [&](const Vector3 &a,
+                                             const Vector3 &b) -> bool {
+                for (const DoorWorldAABB &box : dedupDoorBoxes) {
+                    const Vector3 ext = box.mx - box.mn;
+                    int thin = 0;
+                    if (ext.y < ext.x && ext.y < ext.z)      thin = 1;
+                    else if (ext.z < ext.x && ext.z < ext.y) thin = 2;
+                    const float c  = (box.mn[thin] + box.mx[thin]) * 0.5f;
+                    const float da = a[thin] - c;
+                    const float db = b[thin] - c;
+                    if (da * db > 0.0f) continue;      // same side of the leaf
+                    const float denom = da - db;
+                    if (std::fabs(denom) < 1e-6f) continue;
+                    const float t = da / denom;
+                    if (t < 0.0f || t > 1.0f) continue;
+                    const Vector3 x = a + (b - a) * t;
+                    bool within = true;
+                    for (int ax = 0; ax < 3; ++ax) {
+                        if (ax == thin) continue;
+                        if (x[ax] < box.mn[ax] - 1.0f ||
+                            x[ax] > box.mx[ax] + 1.0f) { within = false; break; }
+                    }
+                    if (within) return true;
+                }
+                return false;
+            };
+            int mergedSameSpace = 0;
+            auto sameAcousticSpace = [&](const Vector3 &a,
+                                         const Vector3 &b) -> bool {
+                if (!mRaycaster) return false;     // cannot prove it => don't
+                if (segmentCrossesAnyDoor(a, b)) return false;
+                RayHit hit{};
+                if (mRaycaster(a, b, hit)) return false;
+                return hit.status == RayStatus::Clear;   // whitelist the proof
+            };
+
             std::vector<int> keptRoom;
             keptRoom.reserve(params.pathingCandidates.size());
             int crossRoomPreserved = 0;
@@ -17249,17 +17333,36 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 const float radiusSq =
                     isPair ? kDoorPairDedupRadiusSq : dedupRadiusSq;
                 const int candRoom = roomOf(cand.position);
+                const bool candIsDoorAnchor =
+                    (cand.purpose == PathingProbePurpose::DoorPair);
                 bool tooClose = false;
                 for (size_t i = 0; i < kept.size(); ++i) {
-                    if (kept[i].purpose != cand.purpose) continue;
                     Vector3 d = cand.position - kept[i].position;
                     if (glm::dot(d, d) >= radiusSq) continue;
-                    if (keptRoom[i] != candRoom) {
-                        ++crossRoomPreserved;
-                        continue;
+                    const bool samePurpose = (kept[i].purpose == cand.purpose);
+                    const bool sameRoom    = (keptRoom[i] == candRoom);
+                    if (samePurpose && sameRoom) {
+                        tooClose = true;              // the original collision
+                        break;
                     }
-                    tooClose = true;
-                    break;
+                    // Differing purpose and/or room: merge only when the two
+                    // probes provably share one acoustic space.
+                    //
+                    // Only the probe being DROPPED needs the door exemption:
+                    // a DoorPair flank must always survive, because it is the
+                    // geometry a closed door blocks between. A probe merging
+                    // INTO a kept flank is fine — the flank stays, so the
+                    // door's role is untouched, and that is precisely the
+                    // merge we want (the threshold-slab centroid 4 ft from
+                    // its own flank, on the same side of the door, adds
+                    // nothing SA cannot already reach via influence radius).
+                    if (!candIsDoorAnchor &&
+                        sameAcousticSpace(cand.position, kept[i].position)) {
+                        ++mergedSameSpace;
+                        tooClose = true;
+                        break;
+                    }
+                    if (!sameRoom) ++crossRoomPreserved;
                 }
                 if (tooClose) {
                     if (cand.purpose == PathingProbePurpose::DoorPair) {
@@ -17279,6 +17382,10 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 keptRoom.push_back(candRoom);
             }
             if (crossRoomPreserved > 0) {
+                AUDIO_LOG("Pathing dedup: %d probes merged into a probe "
+                          "sharing their acoustic space (no door crossed + "
+                          "segment proven visible; door anchors exempt)\n",
+                          mergedSameSpace);
                 AUDIO_LOG("Pathing dedup: %d same-purpose probes preserved "
                           "(different rooms — room-aware dedup)\n",
                           crossRoomPreserved);
