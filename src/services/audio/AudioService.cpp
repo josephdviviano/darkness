@@ -16168,6 +16168,16 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         Vector3 center;        ///< portal center (on the plane)
         Vector3 unitNormal;    ///< normalized portal plane normal
         bool isDoor = false;   ///< carries a registered door OBB
+        /// Index into doorBoxes of the door this portal matched (-1 = none),
+        /// and how far the portal center sits from that door's AABB.
+        /// ONE APERTURE, ONE PAIR: a single doorway routinely matches
+        /// several ROOM_DB portals (the threshold slab's two faces, frame
+        /// boundaries — MISS2 measured ~2.7 portals per door), and each
+        /// match used to emit its own dedup-EXEMPT DoorPair, stacking ~5.5
+        /// probes in a line through one doorway. Recording the door lets the
+        /// emit pass keep only the closest portal per door.
+        int   doorIdx    = -1;
+        float doorDistSq = 0.0f;
     };
     std::vector<PathingPortalRecord> pathingPortals;
     if (mProbePathingBatchEnabled && mRoomService) {
@@ -16331,14 +16341,19 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     continue;
                 }
 
-                // Door classification — is this portal coincident with
-                // a registered door?
-                bool isDoorPortal = false;
-                for (const DoorWorldAABB &b : doorBoxes) {
-                    if (sPointAABBDistSq(center, b.mn, b.mx)
-                            < kDoorPortalMatchDistSq) {
-                        isDoorPortal = true;
-                        break;
+                // Door classification — which registered door (if any) is
+                // this portal coincident with? Take the NEAREST match, not
+                // the first: a portal in a compound doorway can be within
+                // range of more than one door, and the emit pass keys
+                // "one aperture, one pair" off this identity.
+                int   bestDoor   = -1;
+                float bestDoorSq = kDoorPortalMatchDistSq;
+                for (size_t bi = 0; bi < doorBoxes.size(); ++bi) {
+                    const DoorWorldAABB &b = doorBoxes[bi];
+                    const float dsq = sPointAABBDistSq(center, b.mn, b.mx);
+                    if (dsq < bestDoorSq) {
+                        bestDoorSq = dsq;
+                        bestDoor   = static_cast<int>(bi);
                     }
                 }
 
@@ -16348,7 +16363,9 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     ? static_cast<int>(roomB->getRoomID()) : -1;
                 rec.center     = center;
                 rec.unitNormal = glm::normalize(normal);
-                rec.isDoor     = isDoorPortal;
+                rec.isDoor     = (bestDoor >= 0);
+                rec.doorIdx    = bestDoor;
+                rec.doorDistSq = bestDoorSq;
                 pathingPortals.push_back(rec);
             }
         }
@@ -16371,6 +16388,40 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         constexpr float kSameOpeningSuppressFt = 12.0f;
         const float kSameOpeningSuppressSq =
             kSameOpeningSuppressFt * kSameOpeningSuppressFt;
+        // |dot| of the two portal normals required to call them the same
+        // aperture (~25 deg). Parallel-or-antiparallel because RoomPortal
+        // normals face their owning room, so the two sides of one doorway
+        // point opposite ways. This is the guard that keeps a genuinely
+        // different nearby opening (which faces elsewhere) from being
+        // suppressed — distinct routes keep their own bend anchors.
+        constexpr float kSameOpeningParallelDot = 0.9f;
+
+        // ONE APERTURE, ONE PAIR — pick the single representative portal
+        // for each door before emitting.
+        //
+        // A doorway is ONE acoustic aperture, but ROOM_DB routinely models
+        // it with several portal records: the door's threshold slab is its
+        // own thin room (cf. room 194, a 0.6 ft connector), so its two faces
+        // are two portals, and frame/sidelight boundaries add more. Measured
+        // on MISS2: 147 doors -> 284 DoorPairs = ~2.7 portals per door, and
+        // DoorPair is dedup-EXEMPT (deliberately — each door needs flanks the
+        // runtime can invalidate), so nothing collapsed them: ~5.5 probes
+        // stacked in a line through a single doorway. That is pure local
+        // density, and findAlternatePaths is quadratic in local density.
+        //
+        // The door's flanks only need to straddle the door ONCE, so keep the
+        // portal whose center sits closest to that door's AABB and drop the
+        // rest. Portals matching DIFFERENT doors are untouched — two doorways
+        // off one junction are distinct routes and each keeps its anchors.
+        std::vector<int> bestPortalForDoor(doorBoxes.size(), -1);
+        for (size_t i = 0; i < pathingPortals.size(); ++i) {
+            const PathingPortalRecord &r = pathingPortals[i];
+            if (r.doorIdx < 0) continue;
+            int &best = bestPortalForDoor[static_cast<size_t>(r.doorIdx)];
+            if (best < 0 ||
+                r.doorDistSq < pathingPortals[static_cast<size_t>(best)].doorDistSq)
+                best = static_cast<int>(i);
+        }
 
         // Pass 2 — EMIT probes from the classified records. Pair-probes
         // carry a placeholder 3 ft radius so any code reading it
@@ -16379,7 +16430,17 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         int portalDoorPairCount = 0;
         int portalBendPairCount = 0;
         int portalPairSuppressed = 0;
-        for (const PathingPortalRecord &rec : pathingPortals) {
+        int doorPairSuppressed = 0;
+        for (size_t recIdx = 0; recIdx < pathingPortals.size(); ++recIdx) {
+            const PathingPortalRecord &rec = pathingPortals[recIdx];
+            // One aperture, one pair: this door already has a nearer portal
+            // carrying its flanks.
+            if (rec.isDoor &&
+                bestPortalForDoor[static_cast<size_t>(rec.doorIdx)]
+                    != static_cast<int>(recIdx)) {
+                doorPairSuppressed += 2;
+                continue;
+            }
             if (rec.isDoor || bendsDensity) {
                 // Flanking pair: DoorPair when a door OBB sits in
                 // the opening (closed-door edge invalidation),
@@ -16391,28 +16452,35 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 // radius, and only DoorPair is exempt from the
                 // inside-door-AABB rejection pass below.
                 if (!rec.isDoor) {
-                    // De-densification: suppress this PortalPair when an
-                    // adjacent DOOR portal within kSameOpeningSuppressFt
-                    // serves the SAME (unordered) room pair — a true
-                    // compound opening. Requires both room IDs valid on
-                    // both records; unknown far-rooms never suppress
-                    // (conservative: keep the anchors).
+                    // De-densification: suppress this PortalPair when it is
+                    // part of the SAME PHYSICAL APERTURE as a nearby door.
+                    //
+                    // This used to require the door portal to join the SAME
+                    // room pair — and it NEVER FIRED ONCE (measured: "0
+                    // PortalPair probes suppressed" on MISS2). Thief doorways
+                    // put a thin THRESHOLD room between the two real rooms
+                    // (room 194 is a 0.6 ft slab), so the door portal joins
+                    // A<->T while the slab's far face joins T<->B: DIFFERENT
+                    // room pairs, SAME doorway. Room identity is the wrong
+                    // discriminator; the door's flanks already straddle that
+                    // opening, so the extra pair is pure local density and
+                    // findAlternatePaths is quadratic in local density.
+                    //
+                    // Geometry is the right discriminator: same aperture =>
+                    // close to the door AND facing the same way. The parallel
+                    // test is what preserves the user's rule that a nearby
+                    // DIFFERENT opening keeps its anchors — two doorways off
+                    // one junction face different directions and are distinct
+                    // routes, so neither suppresses the other.
                     bool suppressed = false;
-                    if (rec.roomAID >= 0 && rec.roomBID >= 0) {
-                        const int lo = std::min(rec.roomAID, rec.roomBID);
-                        const int hi = std::max(rec.roomAID, rec.roomBID);
-                        for (const PathingPortalRecord &dr : pathingPortals) {
-                            if (!dr.isDoor) continue;
-                            if (dr.roomAID < 0 || dr.roomBID < 0) continue;
-                            if (std::min(dr.roomAID, dr.roomBID) != lo
-                                || std::max(dr.roomAID, dr.roomBID) != hi)
-                                continue;
-                            const Vector3 d = dr.center - rec.center;
-                            if (glm::dot(d, d) < kSameOpeningSuppressSq) {
-                                suppressed = true;
-                                break;
-                            }
-                        }
+                    for (const PathingPortalRecord &dr : pathingPortals) {
+                        if (!dr.isDoor) continue;
+                        const Vector3 d = dr.center - rec.center;
+                        if (glm::dot(d, d) >= kSameOpeningSuppressSq) continue;
+                        if (std::fabs(glm::dot(dr.unitNormal, rec.unitNormal))
+                                < kSameOpeningParallelDot) continue;
+                        suppressed = true;
+                        break;
                     }
                     if (suppressed) {
                         portalPairSuppressed += 2;
@@ -16447,12 +16515,15 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                   "probes + %d bend pair-probes (%d pairs) + %d door "
                   "pair-probes (%d pairs); %d PortalPair probes (%d pairs) "
                   "suppressed (same-room-pair DoorPair within %.0f ft — "
-                  "compound openings)\n",
+                  "compound openings); %d DoorPair probes (%d pairs) "
+                  "suppressed (one aperture, one pair — extra ROOM_DB "
+                  "portals on the same door)\n",
                   pathingProbeDensityName(mPathingProbeDensity),
                   portalCount, portalBendPairCount, portalBendPairCount / 2,
                   portalDoorPairCount, portalDoorPairCount / 2,
                   portalPairSuppressed, portalPairSuppressed / 2,
-                  kSameOpeningSuppressFt);
+                  kSameOpeningSuppressFt,
+                  doorPairSuppressed, doorPairSuppressed / 2);
 
         // ── Room centroid probes (emitted second; floor-anchored) ───────
         // Pathing probes are anchored at player ear height
