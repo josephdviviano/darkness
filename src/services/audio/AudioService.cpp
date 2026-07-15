@@ -15718,12 +15718,113 @@ void AudioService::verifyPathingBakeParity()
     // opening typically resolve to the two rooms the portal joins —
     // exactly what makes the direct-edge test meaningful.
     std::vector<int> probeRoom(positions.size(), -1);
-    std::map<int, std::vector<int>> roomProbes;  // roomID → probe indices
     for (size_t i = 0; i < positions.size(); ++i) {
         Room *r = mRoomService->roomFromPoint(positions[i]);
         if (!r) continue;
         probeRoom[i] = static_cast<int>(r->getRoomID());
-        roomProbes[probeRoom[i]].push_back(static_cast<int>(i));
+    }
+
+    // ── roomID → COVERING probes (not merely CONTAINED ones) ───────────
+    //
+    // This must ask the question STEAM AUDIO asks, not a geometric proxy of
+    // our own. SA attaches a listener/source to probes by pure influence
+    // containment: `ProbeBatch::getInfluencingProbes` (probe_tree.cpp:158)
+    // walks the probe BVH and collects every probe whose
+    // `influence.contains(point)` is true, then `checkOcclusion`
+    // (probe_manager.cpp:51-82) casts one ray point→probe-center and drops
+    // the occluded ones. If the resulting set is empty, `findPaths` returns
+    // false (path_simulator.cpp:189-192). **Room membership never enters
+    // it.**
+    //
+    // The old model — "a room's probes are the probes geometrically inside
+    // it" — therefore measured something SA does not care about, and it
+    // reported damage that does not exist. A room whose own probe was
+    // deduped away, but which sits well inside a neighbouring probe's
+    // influence sphere with clear line of sight, is FULLY SERVED by that
+    // probe; the old model called it a zero-probe room and failed every
+    // pair through it. That mis-scoring is what made a door-aware dedup
+    // look catastrophic (274 pairs of phantom damage) when the actual
+    // damage was ~11 pairs.
+    //
+    // Concretely: door flanks sit ±5 ft from the door, and every probe's
+    // influence radius has a 10 ft floor (kAbsoluteFloorFt), so a listener
+    // standing IN a doorway is inside BOTH flanks' spheres at half their
+    // minimum radius. A probe-less threshold slab is a non-issue in SA's
+    // model — and the thin-room repair already skips door portals for
+    // exactly this reason.
+    //
+    // Representative point per room: the same ear-height anchor the
+    // centroid pass uses (floor + ear height, clamped into the
+    // room), i.e. where a listener actually stands. Falls back to the room
+    // center for degenerate rooms.
+    const std::vector<float> &probeRadii =
+        mProbeManager->getPathingProbeRadii();
+    const bool radiiValid = (probeRadii.size() == positions.size());
+    if (!radiiValid) {
+        // No-silent-fallbacks: without radii we cannot evaluate SA's
+        // containment test and would silently regress to the old,
+        // wrong-question model.
+        std::fprintf(stderr,
+            "[BAKE_PARITY] per-probe influence radii unavailable "
+            "(%zu radii vs %zu probes) — falling back to CONTAINMENT "
+            "(probe geometrically inside the room). That is NOT the test "
+            "Steam Audio applies (it attaches by influence radius), so "
+            "zero-probe-room results below may be false alarms.\n",
+            probeRadii.size(), positions.size());
+    }
+    std::map<int, std::vector<int>> roomProbes;  // roomID → covering probes
+    // Player ear height — the same anchor prepareProbeBakeParams' centroid
+    // pass uses (its own local kRoomFloorOffsetFt). Kept in step by value;
+    // if one moves, move both.
+    constexpr float kParityEarHeightFt = 5.0f;
+    int coverageBeyondRoom = 0;
+    for (const auto &roomPtr : mRoomService->getAllRooms()) {
+        if (!roomPtr) continue;
+        const int rid = static_cast<int>(roomPtr->getRoomID());
+        const Vector3 c = roomPtr->getCenter();
+        const float floorZ = sRoomFloorZ(roomPtr.get());
+        const float ceilZ  = sRoomCeilZ(roomPtr.get());
+        float earZ = floorZ + kParityEarHeightFt;
+        if (ceilZ > floorZ && earZ > ceilZ - 0.5f) earZ = (floorZ + ceilZ) * 0.5f;
+        const Vector3 ear(c.x, c.y, earZ);
+        auto &cover = roomProbes[rid];
+        for (size_t i = 0; i < positions.size(); ++i) {
+            // (1) Containment — a probe INSIDE the room always serves it.
+            // Kept as the floor: coverage ADDS to containment, it does not
+            // replace it. Replacing it was a real bug — the representative
+            // point below is the room's geometric CENTER, and ROOM_DB boxes
+            // overlap solid geometry (§25), so a room's own center can sit
+            // inside a wall with line of sight to nothing. That made 26
+            // rooms with a perfectly good probe inside them report as
+            // uncovered. Union of the two tests is monotone: it can only
+            // ever find MORE coverage than the old model, never less.
+            if (probeRoom[i] == rid) {
+                cover.push_back(static_cast<int>(i));
+                continue;
+            }
+            if (!radiiValid) continue;          // degraded containment mode
+            // (2) Influence coverage — SA's actual test. A probe OUTSIDE the
+            // room still serves it when the listener anchor sits inside that
+            // probe's influence sphere with proven line of sight (e.g. a
+            // doorway slab served by the flanks 5 ft either side).
+            const Vector3 d = positions[i] - ear;
+            if (glm::dot(d, d) > probeRadii[i] * probeRadii[i]) continue;
+            if (mRaycaster) {
+                RayHit hit{};
+                if (mRaycaster(ear, positions[i], hit)) continue;
+                if (hit.status != RayStatus::Clear &&
+                    hit.status != RayStatus::ZeroLength) continue;
+            }
+            cover.push_back(static_cast<int>(i));
+            ++coverageBeyondRoom;
+        }
+        if (cover.empty()) roomProbes.erase(rid);
+    }
+    if (radiiValid) {
+        AUDIO_LOG("[BAKE_PARITY] coverage model: %d room/probe pairs served "
+                  "by a probe OUTSIDE the room (influence radius + proven "
+                  "LOS) — these are invisible to the old containment test\n",
+                  coverageBeyondRoom);
     }
 
     // Union-find over adjacency edges → connected components, plus the
