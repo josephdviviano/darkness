@@ -620,6 +620,147 @@ static void printProbeCellAudit(const std::string &misPath,
                 roomTotal, roomOutside, portalTotal, portalOutside);
 }
 
+// ---------- WR cell-portal aperture survey ----------
+//
+// `wr_portals` dumps every WR CELL PORTAL polygon with an aperture size, so
+// the WR portal graph can be compared line-for-line against the ROOM_DB
+// portal graph that `room_graph` dumps.
+//
+// WHY THIS EXISTS: ROOM_DB "portals" are boundaries between designer-drawn
+// boxes. A box boundary need not correspond to any architectural opening —
+// it frequently stands in mid-air, splitting one open volume in two. WR cell
+// portals are the opposite: the level compiler produces them from the ACTUAL
+// world geometry as the shared faces of a convex decomposition, and they are
+// what raycastWorld traverses cell-to-cell. So a doorway's WR portal polygon
+// IS the doorway, at its true dimensions.
+//
+// The convex decomposition still splits open volumes (a courtyard becomes
+// many cells whose mutual portals are splitting planes, not apertures), so a
+// size metric is still needed to tell a real aperture from a splitting plane.
+//
+// APERTURE SIZE METRIC — deliberately the same IDEA as room_graph's
+// RoomPortal inradius (half the narrow dimension), so the two histograms are
+// directly comparable, but computed honestly from real geometry:
+//   inradiusFt = min over EDGE SEGMENTS of the distance from the polygon
+//                centroid to that segment.
+// RoomPortal stores only bounding PLANES, so room_graph had to use
+// point-to-plane distance (an infinite plane over-estimates nothing but
+// ignores the polygon's actual extent). A WR portal is a real polygon with
+// VERTICES, so the distance is taken to the finite edge SEGMENT instead —
+// for a convex polygon containing its centroid the two agree, and for a
+// non-convex or skewed polygon the segment distance is the truthful one.
+// Both answer "how far can you get from the middle of this opening before
+// you hit its rim, in the tightest direction" = HALF THE NARROW DIMENSION:
+//   a 3 ft doorway            -> ~1.5 ft
+//   a courtyard splitting plane -> 10 ft+
+// circumradiusFt (max vertex distance from the centroid) is emitted
+// alongside it: inradius/circumradius separates a square aperture from a
+// long thin slit, which a single number cannot.
+//
+// Records (space-separated, one per line):
+//   WRPORTAL <cellIdx> <tgtCell> <cx> <cy> <cz> <inradiusFt> <circumradiusFt>
+//            <numVerts> <areaSqFt>
+//       one per portal POLYGON; every physical portal appears twice (once
+//       from each side) — consumers de-duplicate by (min,max) cell pair.
+//       tgtCell = -1 when the polygon names a cell outside the network.
+//   WRPORTAL_SUMMARY cells=<n> portals=<m> degenerate=<k> bad_tgt=<x>
+//
+// Service-less: parseWRChunk reads the .mis directly, and cells carry their
+// own geometry, so no ROOM_DB / service stack is involved.
+static void printWRPortals(const std::string &misPath) {
+    Darkness::WRParsedData wr;
+    try {
+        wr = Darkness::parseWRChunk(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr,
+            "wr_portals: failed to parse WR chunk in '%s': %s\n",
+            misPath.c_str(), e.what());
+        return;
+    }
+    if (wr.numCells == 0) {
+        std::fprintf(stderr,
+            "wr_portals: '%s' has 0 WR cells — nothing to survey\n",
+            misPath.c_str());
+        return;
+    }
+
+    int portalCount = 0, degenerate = 0, badTgt = 0;
+
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        const auto &cell = wr.cells[ci];
+        // Portal polygons are the LAST numPortals entries of the polygon
+        // list — the same slicing raycastWorld uses (`numSolid =
+        // numPolygons - numPortals`, RayCaster.h).
+        const int numSolid = static_cast<int>(cell.numPolygons)
+                           - static_cast<int>(cell.numPortals);
+        for (int pi = numSolid; pi < static_cast<int>(cell.numPolygons); ++pi) {
+            if (pi < 0 || pi >= static_cast<int>(cell.polyIndices.size())) {
+                ++degenerate;
+                continue;
+            }
+            const auto &idx = cell.polyIndices[pi];
+            const size_t nv = idx.size();
+            if (nv < 3) { ++degenerate; continue; }
+
+            // Centroid: plain vertex average. For the convex portal polygons
+            // the compiler emits, this is interior, which is what makes the
+            // "distance to the rim" reading meaningful.
+            Vector3 cen(0.0f, 0.0f, 0.0f);
+            bool badIdx = false;
+            for (size_t v = 0; v < nv; ++v) {
+                if (idx[v] >= cell.vertices.size()) { badIdx = true; break; }
+                cen += cell.vertices[idx[v]];
+            }
+            if (badIdx) { ++degenerate; continue; }
+            cen /= static_cast<float>(nv);
+
+            float inradius = -1.0f;
+            float circumradius = 0.0f;
+            double area2 = 0.0;   // twice the fan-triangulated area
+            for (size_t v = 0; v < nv; ++v) {
+                const Vector3 &a = cell.vertices[idx[v]];
+                const Vector3 &b = cell.vertices[idx[(v + 1) % nv]];
+
+                const float cr = glm::length(a - cen);
+                if (cr > circumradius) circumradius = cr;
+
+                // Distance from the centroid to the finite edge segment ab.
+                const Vector3 ab = b - a;
+                const float ab2 = glm::dot(ab, ab);
+                float d;
+                if (ab2 < 1e-8f) {
+                    d = glm::length(cen - a);   // degenerate (coincident) edge
+                } else {
+                    float t = glm::dot(cen - a, ab) / ab2;
+                    t = glm::clamp(t, 0.0f, 1.0f);
+                    d = glm::length(cen - (a + t * ab));
+                }
+                if (inradius < 0.0f || d < inradius) inradius = d;
+
+                // Fan triangulation about the centroid. Portal polygons are
+                // planar, so summing the triangle-cross magnitudes is exact.
+                area2 += glm::length(glm::cross(a - cen, b - cen));
+            }
+
+            int32_t tgt = static_cast<int32_t>(cell.polygons[pi].tgtCell);
+            if (tgt < 0 || tgt >= static_cast<int32_t>(wr.numCells)) {
+                ++badTgt;
+                tgt = -1;
+            }
+
+            std::printf("WRPORTAL %u %d %.3f %.3f %.3f %.3f %.3f %zu %.3f\n",
+                        ci, tgt, cen.x, cen.y, cen.z,
+                        inradius, circumradius, nv,
+                        static_cast<float>(area2 * 0.5));
+            ++portalCount;
+        }
+    }
+
+    std::printf("WRPORTAL_SUMMARY cells=%u portals=%d degenerate=%d "
+                "bad_tgt=%d\n",
+                wr.numCells, portalCount, degenerate, badTgt);
+}
+
 // ---------- Ambient sound dump ----------
 //
 // `ambients` lists every object with a P$AmbientHa property: schema name,
@@ -2832,6 +2973,12 @@ static void printUsage(const char *prog) {
     std::cerr << "                    ROOM / PORTAL / PDIST lines (room centers, portal centers," << std::endl;
     std::cerr << "                    degrees, intra-room portal-to-portal distances). Consumed" << std::endl;
     std::cerr << "                    by analysis/room_graph_stats.py." << std::endl;
+    std::cerr << "  wr_portals        Dump every WR CELL portal polygon as machine-readable" << std::endl;
+    std::cerr << "                    WRPORTAL lines (cell, target cell, centroid, inradius," << std::endl;
+    std::cerr << "                    circumradius, vertex count, area). Unlike room_graph's" << std::endl;
+    std::cerr << "                    ROOM_DB portals — designer box boundaries — these are" << std::endl;
+    std::cerr << "                    compiled from the real geometry, so an aperture's size" << std::endl;
+    std::cerr << "                    is the opening's true size. Needs no services." << std::endl;
     std::cerr << "  trace-path <src> <dst> [maxDist]" << std::endl;
     std::cerr << "                    Trace BFS through the portal graph from src room to dst" << std::endl;
     std::cerr << "                    room. Per-hop detail (segmentDist, cumEff, doorBlocking)." << std::endl;
@@ -3055,6 +3202,11 @@ int main(int argc, char *argv[]) {
             loadDatabase(dbFile);
             printProbeCellAudit(dbFile,
                 positionalArgs.size() > 2 ? positionalArgs[2] : std::string());
+        } else if (command == "wr_portals") {
+            // Service-less by design: parseWRChunk reads the .mis directly and
+            // WR cells carry their own geometry — no ROOM_DB involved. That is
+            // the whole point of the verb (see printWRPortals).
+            printWRPortals(dbFile);
         } else if (command == "sound_db") {
             // sound_db: walks the schema directory; optionally applies
             // P$SchAttFac/SchPlayPa overrides from dbFile when present.
