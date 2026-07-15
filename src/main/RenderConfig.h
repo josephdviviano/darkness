@@ -468,6 +468,20 @@ struct RenderConfig {
     // tour. Empty = disabled; when set it overrides the nearest-N pick
     // (a nonzero --stress-doors is still required to arm the harness).
     std::vector<int32_t> stressDoorIDs;           // --stress-door-ids "a,b"
+
+    // --spawn-override "x,y,z[,yaw]" (DEV-ONLY, diagnostic companion to
+    // --stress-doors / --auto-run): force the camera/player start to an
+    // explicit engine-feet position instead of the mission's spawn
+    // marker. Positioned runtime measurements (e.g. the door-stress-
+    // while-standing-in-a-hub-room cell from PLAN.PATHING_DESIGN.md §10)
+    // need the listener parked in a SPECIFIC room; nothing ships a
+    // teleport. Applied loudly ([SPAWN_OVERRIDE] banner) right after
+    // initRuntimeState in DarknessRender.cpp. Never ship-enabled.
+    bool        spawnOverride       = false;      // --spawn-override "x,y,z[,yaw]"
+    float       spawnOverrideX      = 0.0f;
+    float       spawnOverrideY      = 0.0f;
+    float       spawnOverrideZ      = 0.0f;
+    float       spawnOverrideYaw    = 0.0f;
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -1635,6 +1649,8 @@ inline bool isPerfLabelValid(const std::string& s) {
 //                      (O2a door-route-latency stress harness)
 //   --stress-door-ids "a,b"  DEV-ONLY: with --stress-doors armed, toggle
 //                      exactly these door object IDs instead of nearest-N
+//   --spawn-override "x,y,z[,yaw]"  DEV-ONLY: force the camera/player start
+//                      position (positioned diagnostic runs)
 //   --help / -h        print usage
 //
 // Unknown flags are reported but otherwise ignored — when a removed flag
@@ -1860,6 +1876,36 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                 std::fprintf(stderr,
                     "[FALLBACK] --stress-door-ids: malformed list '%s' — "
                     "explicit-door override stays disabled\n", arg);
+            }
+        } else if (std::strcmp(argv[i], "--spawn-override") == 0 && i + 1 < argc) {
+            // DEV-ONLY positioned-start override (see AppConfig comment).
+            // "x,y,z" or "x,y,z,yaw"; a malformed token discards the
+            // whole override LOUDLY rather than silently starting
+            // somewhere unintended.
+            const char* arg = argv[++i];
+            float vals[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            int   count = 0;
+            bool  ok = true;
+            const char* p = arg;
+            while (*p != '\0' && count < 4) {
+                char* end = nullptr;
+                float v = std::strtof(p, &end);
+                if (end == p) { ok = false; break; }
+                vals[count++] = v;
+                p = end;
+                if (*p == ',') ++p;
+                else if (*p != '\0') { ok = false; break; }
+            }
+            if (ok && *p == '\0' && (count == 3 || count == 4)) {
+                cfg.spawnOverride    = true;
+                cfg.spawnOverrideX   = vals[0];
+                cfg.spawnOverrideY   = vals[1];
+                cfg.spawnOverrideZ   = vals[2];
+                cfg.spawnOverrideYaw = (count == 4) ? vals[3] : 0.0f;
+            } else {
+                std::fprintf(stderr,
+                    "[FALLBACK] --spawn-override: malformed \"x,y,z[,yaw]\" "
+                    "value '%s' — using the mission spawn\n", arg);
             }
         } else if (std::strcmp(argv[i], "--bake-quality") == 0 && i + 1 < argc) {
             // Bake-quality profile. "dev" forces the fast iteration bake

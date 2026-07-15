@@ -80,6 +80,7 @@ inline bool raycastWorld(const WRParsedData &wr,
     float rayLength = glm::length(delta);
     if (rayLength < 1e-7f) {
         if (outTerminalCell) *outTerminalCell = -1;
+        hit.status = RayStatus::ZeroLength;
         return false;
     }
 
@@ -88,7 +89,11 @@ inline bool raycastWorld(const WRParsedData &wr,
                     ? startCellHint
                     : findCameraCell(wr, from.x, from.y, from.z);
     if (curCell < 0) {
+        // The origin is not inside any cell (cells are AIR; solid is their
+        // absence) — so nothing is traced and `false` here means "could not
+        // evaluate", NOT "clear". See RayStatus.
         if (outTerminalCell) *outTerminalCell = -1;
+        hit.status = RayStatus::NoStartCell;
         return false;
     }
 
@@ -151,12 +156,19 @@ inline bool raycastWorld(const WRParsedData &wr,
 
     // ── Sequential cell traversal ──
     int cellsProcessed = 0;
+    // Why we fell out of the loop. The fall-through `return false` below is
+    // reached by several distinct failures and cannot distinguish them
+    // after the fact, so each `break` records its own reason. Default =
+    // the loop condition failing (budget exhausted).
+    RayStatus exitStatus = RayStatus::CellBudget;
 
     while (cellsProcessed < MAX_RAY_CELLS) {
         ++cellsProcessed;
 
-        if (curCell < 0 || curCell >= static_cast<int32_t>(wr.numCells))
+        if (curCell < 0 || curCell >= static_cast<int32_t>(wr.numCells)) {
+            exitStatus = RayStatus::InvalidCell;
             break;
+        }
 
         const auto &cell = wr.cells[curCell];
 
@@ -202,12 +214,14 @@ inline bool raycastWorld(const WRParsedData &wr,
         // this cell without hitting anything.
         if (bestTime > endTime) {
             if (outTerminalCell) *outTerminalCell = curCell;
+            hit.status = RayStatus::Clear;   // the ONLY path that proves clear
             return false;
         }
 
         // No valid exit plane found (degenerate geometry).
         if (bestPlaneIdx < 0) {
             if (outTerminalCell) *outTerminalCell = curCell;
+            hit.status = RayStatus::DegenerateGeom;
             return false;
         }
 
@@ -266,6 +280,7 @@ inline bool raycastWorld(const WRParsedData &wr,
             // steps are triggered by false-positive solid hits.
             if (hitPolyIdx < 0) {
                 if (outTerminalCell) *outTerminalCell = curCell;
+                hit.status = RayStatus::DiscardNoPolygon;
                 return false;  // no valid polygon hit — discard like original
             }
 
@@ -282,6 +297,7 @@ inline bool raycastWorld(const WRParsedData &wr,
                 hit.textureIndex = -1;
 
             if (outTerminalCell) *outTerminalCell = curCell;
+            hit.status = RayStatus::Hit;
             return true;
         }
 
@@ -293,6 +309,7 @@ inline bool raycastWorld(const WRParsedData &wr,
                 continue;
             }
             // Invalid target — treat as solid
+            exitStatus = RayStatus::InvalidPortalTarget;
             break;
         }
 
@@ -326,6 +343,8 @@ inline bool raycastWorld(const WRParsedData &wr,
                 curCell = nextCell;
                 continue;
             }
+            // Invalid target — treat as solid (same as the single-portal case)
+            exitStatus = RayStatus::InvalidPortalTarget;
             break;
         }
 
@@ -345,6 +364,7 @@ inline bool raycastWorld(const WRParsedData &wr,
         // Same hitPolyIdx == -1 check as the no-portal path above.
         if (hitPolyIdx < 0) {
             if (outTerminalCell) *outTerminalCell = curCell;
+            hit.status = RayStatus::DiscardNoPolygon;
             return false;
         }
 
@@ -361,11 +381,16 @@ inline bool raycastWorld(const WRParsedData &wr,
             hit.textureIndex = -1;
 
         if (outTerminalCell) *outTerminalCell = curCell;
+        hit.status = RayStatus::Hit;
         return true;
     }
 
-    // Max cells exceeded or invalid cell — no hit
+    // Fell out of the traversal loop: budget exhausted, an invalid cell, or an
+    // invalid portal target. NONE of these proved the segment clear — `false`
+    // here means "could not evaluate". `exitStatus` records which. See
+    // RayStatus; visibility consumers must whitelist RayStatus::Clear.
     if (outTerminalCell) *outTerminalCell = curCell;
+    hit.status = exitStatus;
     return false;
 }
 

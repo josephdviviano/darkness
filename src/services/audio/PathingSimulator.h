@@ -241,6 +241,21 @@ public:
         mScopeSkipped.fetch_add(scopeSkipped, std::memory_order_relaxed);
     }
 
+    /// Lever D warmup first-solve stagger (PLAN.PATHING_DESIGN.md §16).
+    /// `deferred` = never-solved voices this staging pass held back because
+    /// the iteration's first-solve budget (kPathingFirstSolvesPerIteration)
+    /// was full; ACCUMULATED across the dump window and drained by it.
+    /// `backlog` = never-solved in-range eligible voices the pass saw at
+    /// all — a GAUGE (last writer wins, not accumulated), so the dump shows
+    /// the current depth. Both printed on [PERF pathing]: a backlog that
+    /// stays > 0 long after warmup means first solves are not draining
+    /// (starvation / a voice wedged out of the admit list) and is the
+    /// signal to look at, per the no-silent-fallbacks rule.
+    void setFirstSolveStagger(uint32_t deferred, uint32_t backlog) {
+        mFirstSolveDeferred.fetch_add(deferred, std::memory_order_relaxed);
+        mFirstSolveBacklog.store(backlog, std::memory_order_relaxed);
+    }
+
 private:
     /// Worker thread main — wakes on CV signal, runs one
     /// `iplSimulatorRunPathing`, logs `[PATHING_SLOW]` if elapsed > 15 ms,
@@ -301,6 +316,10 @@ private:
     std::atomic<uint64_t> mUnreachableCached{0};
     std::atomic<uint64_t> mScopedSolves{0};
     std::atomic<uint64_t> mScopeSkipped{0};
+    // Lever D stagger: mFirstSolveDeferred accumulates per window (drained
+    // by the dump); mFirstSolveBacklog is a gauge (overwritten each pass).
+    std::atomic<uint64_t> mFirstSolveDeferred{0};
+    std::atomic<uint32_t> mFirstSolveBacklog{0};
 
     // ── [PATH_RAW] sampling state (worker-thread-only) ──
     //

@@ -435,18 +435,32 @@ void PathingSimulator::workerMain()
                         mScopedSolves.exchange(0, std::memory_order_relaxed);
                     const uint64_t scopeSkipW =
                         mScopeSkipped.exchange(0, std::memory_order_relaxed);
+                    // Lever D warmup stagger (§16): firstSolveDeferred =
+                    // never-solved voices held out of an iteration this
+                    // window (drained); firstSolveBacklog = the current
+                    // never-solved in-range depth (gauge). Expect a short
+                    // burst of both at warmup decaying to 0/0; a backlog
+                    // pinned > 0 with deferrals still accruing means first
+                    // solves are not draining — see setFirstSolveStagger.
+                    const uint64_t firstDeferW =
+                        mFirstSolveDeferred.exchange(0, std::memory_order_relaxed);
+                    const uint32_t firstBacklogW =
+                        mFirstSolveBacklog.load(std::memory_order_relaxed);
                     std::fprintf(stderr,
                         "[PERF pathing] p50=%.2fms p95=%.2fms p99=%.2fms "
                         "max=%.2fms throttleMs=%.2f n=%llu solved=%llu "
                         "skipped=%llu unreachableCached=%llu "
-                        "scopedSolves=%llu scopeSkipped=%llu\n",
+                        "scopedSolves=%llu scopeSkipped=%llu "
+                        "firstSolveDeferred=%llu firstSolveBacklog=%u\n",
                         p.p50, p.p95, p.p99, p.maxMs, throttleMs,
                         static_cast<unsigned long long>(p.n),
                         static_cast<unsigned long long>(solvedW),
                         static_cast<unsigned long long>(skippedW),
                         static_cast<unsigned long long>(unreachW),
                         static_cast<unsigned long long>(scopedW),
-                        static_cast<unsigned long long>(scopeSkipW));
+                        static_cast<unsigned long long>(scopeSkipW),
+                        static_cast<unsigned long long>(firstDeferW),
+                        firstBacklogW);
                     // Budget warning: p95 ≥ 80% of throttle interval
                     // means we're nearly missing the cadence on most
                     // iterations. Only emit if we have a measured

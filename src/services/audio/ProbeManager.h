@@ -141,6 +141,16 @@ enum class PathingProbePurpose {
                 ///< detour around the aperture instead of a straight-through
                 ///< approximation. Same geometry as DoorPair but no door OBB
                 ///< between the pair.
+    HubFill,    ///< Interior coverage probe added by the per-room
+                ///< visibility-aware greedy k-center fill (Gonzalez
+                ///< farthest-point) in AudioService::prepareProbeBakeParams.
+                ///< Emitted only in rooms whose portal/floor demand sits
+                ///< further than kPathingCoverageRadiusFt from every
+                ///< same-room anchor probe (hub rooms — MISS2 room 18
+                ///< class). Sites come from the FLOOR_POLY candidate set.
+                ///< These probes bound the coverage governing value the
+                ///< bake visRange cap is derived from (SteamAudioPathing.h
+                ///< coverage constants; PLAN.PATHING_DESIGN.md §10).
 };
 
 /// Pathing probe layout density tier — the `audio.pathing_probes.density`
@@ -399,6 +409,18 @@ struct ProbeBakeParams {
     /// bakePathingBatch).
     float pathingVisRangeFt = -1.0f;
 
+    /// Coverage derivation inputs behind pathingVisRangeFt (engine feet;
+    /// PLAN.PATHING_DESIGN.md §10). `pathingCoverageFt` is the governing
+    /// value (max over rooms of max portal → nearest same-room probe,
+    /// POST hub fill); `pathingRCovFt` is the hub-fill coverage radius
+    /// (kPathingCoverageRadiusFt) the fill targeted. ProbeManager does
+    /// not consume them for the bake — they travel here solely to be
+    /// recorded into the .probes v5 header so the loader's coverage-
+    /// mismatch check stays loud. <= 0 = derivation did not run (pathing
+    /// candidates empty / RoomService absent); recorded as 0.
+    float pathingCoverageFt = -1.0f;
+    float pathingRCovFt     = -1.0f;
+
     /// Pathing visibility sampling count (`IPLPathBakeParams::numSamples`).
     /// MUST be the active profile constant from SteamAudioPathing.h
     /// (kPathingVisSamplesShip / kPathingVisSamplesDev) — AudioService
@@ -491,6 +513,10 @@ struct ProbeBatchEntry {
     float                 bakedVisRangeFt = 0.0f;
     int                   bakedNumSamples = 0;
     PathingProbeDensity   bakedDensity = PathingProbeDensity::Unknown;
+    /// v5 coverage derivation record (pathing entries only; 0 on
+    /// reflections entries) — see ProbeBakeParams::pathingCoverageFt.
+    float                 bakedCoverageFt = 0.0f;
+    float                 bakedRCovFt = 0.0f;
     /// Engine-space positions in placement order (sidecar mirror).
     std::vector<Vector3>  positions;
     /// Per-probe influence radii in engine feet (sidecar mirror). Parallel
@@ -597,6 +623,15 @@ public:
     PathingProbeDensity getBakedPathingDensity() const {
         return mBakedPathingDensity;
     }
+    /// Coverage derivation record of the pathing section (.probes v5
+    /// header). 0 = unknown / no pathing batch / v4 file. AudioService
+    /// compares the RCov value against the active
+    /// kPathingCoverageRadiusFt and triggers the loud automatic
+    /// pathing-only re-bake on mismatch (pathingBakeCoverageMismatch) —
+    /// a pre-coverage layout (no HubFill probes, max-span-derived
+    /// visRange) must never be consumed silently by a coverage-era run.
+    float getBakedPathingCoverageFt() const { return mBakedPathingCoverageFt; }
+    float getBakedPathingRCovFt() const { return mBakedPathingRCovFt; }
 
     /// Reflection bake profile of the CURRENT in-memory data (.probes v3
     /// header fields bakedReflectionRays / bakedProbeDedupRadiusFt).
@@ -799,6 +834,8 @@ private:
     float mBakedPathingVisRangeFt = 0.0f;
     int   mBakedPathingNumSamples = 0;
     PathingProbeDensity mBakedPathingDensity = PathingProbeDensity::Unknown;
+    float mBakedPathingCoverageFt = 0.0f;
+    float mBakedPathingRCovFt = 0.0f;
     int   mBakedReflectionRays = 0;
     float mBakedProbeDedupRadiusFt = 0.0f;
 

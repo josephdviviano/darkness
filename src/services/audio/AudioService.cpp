@@ -50,10 +50,12 @@
 #include "VoicePool.h"
 #include "ServiceCommon.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <ctime>
 #include <queue>
+#include <tuple>
 #include <random>
 #include <set>
 #include <sys/stat.h>
@@ -8980,6 +8982,100 @@ void AudioService::loopStep(float deltaTime)
             const uint32_t wdLo = mScopeWatchdogCursor;
             const uint32_t wdHi = mScopeWatchdogCursor + kScopeWatchdogBatch;
 
+            // ── Lever D: warmup first-solve stagger — selection pre-pass ──
+            //
+            // PLAN.PATHING_DESIGN.md §15/§16. SA's runtime alternate search
+            // is an unbounded A* that DRAINS the reachable component on a
+            // failing/occluded search (~170 ms a piece here); at warmup ~10
+            // voices go pathing-eligible together and their FIRST solves all
+            // land in ONE iteration → the measured ~1.7 s stall. We cannot
+            // bound an individual drain (no runtime search budget in SA's C
+            // API — §15 stage B), but we CAN bound how many share an
+            // iteration: admit at most kPathingFirstSolvesPerIteration
+            // never-solved voices per signaled iteration and let the rest
+            // ride their existing pathSolvePending latch to the next tick.
+            //
+            // ONLY the never-solved class is deferrable. A never-solved
+            // voice already holds pathTargetValid=false and is parked silent
+            // by the F3 pending/hold machinery, so deferral EXTENDS an
+            // existing correct state rather than creating staleness. Door-
+            // invalidated (pathScopedDoorDirty / doorGen) and movement/room
+            // re-solves are deliberately NOT staggered: they carry the
+            // <=150 ms door-route gate over an audible route that is already
+            // wrong, so staggering them would trade compute against the very
+            // gate this work exists to meet. Those classes cannot even reach
+            // this pre-pass — they all imply a prior solve, and this list is
+            // built exclusively from !pathEverSolved voices.
+            //
+            // Ordering (see ActiveVoice::pathFirstSolveDeferrals):
+            //   1. deferral count DESC — aging. This is the anti-starvation
+            //      guarantee: a waiting voice's count only rises, newcomers
+            //      enter at 0 below it, so the cohort ahead of it is fixed
+            //      and drains at the cap per tick → every voice solves
+            //      within ceil(ahead / cap) + 1 signaled ticks.
+            //   2. normalized distance ASC — audibility. dist/maxAudibleDist
+            //      (both already computed by staging) ranks a voice by how
+            //      close it is to its own audible edge, so the sounds a
+            //      player would actually notice get routes first. Ties only
+            //      break WITHIN an age cohort, so this can reorder but never
+            //      starve.
+            //   3. handle ASC — deterministic tiebreak (repeatable runs).
+            //
+            // We do NOT consult the shadow router for an "unreachable ⇒ solve
+            // last" hint (PLAN §16 lists it as optional). It would cost a
+            // Dijkstra pair + roomFromPoint per candidate per signaled tick
+            // on the main thread and cannot help the metric it would be paid
+            // for: deprioritizing likely-drainers only REORDERS them, it does
+            // not stop the cap-many drains per iteration that set the window
+            // max. (And a hard skip is forbidden regardless — the router
+            // under-approximates SA's multi-path reach, §12 SCOPE_MISS.)
+            uint32_t firstSolveDeferred = 0;   // this tick (→ [PERF pathing])
+            uint32_t firstSolveBacklog  = 0;   // never-solved in-range gauge
+            std::array<SoundHandle, kPathingFirstSolvesPerIteration>
+                firstSolveAdmitted{};
+            uint32_t firstSolveAdmittedN = 0;
+            if (pathingWillSignal) {
+                // (deferrals, normDist, handle) — sorted by the key above.
+                // Empty (no allocation) in steady state: every voice has
+                // solved at least once, so nothing is a candidate.
+                std::vector<std::tuple<uint32_t, float, SoundHandle>> cands;
+                for (auto &[handle, voice] : mVoicePool->voices()) {
+                    // Mirror the main loop's gates exactly: its
+                    // !directSource skip, and voicePathingEligible with the
+                    // three frame-level terms already implied by
+                    // pathingWillSignal (batch added, pathing enabled, due
+                    // tick). A candidate is any in-range eligible voice that
+                    // has never solved — for those, trigNever alone makes
+                    // needsSolve true below, so this set is exactly the
+                    // first-solve demand for this iteration.
+                    if (!voice->directSource) continue;
+                    if (voice->playerEmitted) continue;
+                    if (voice->skipPortalRouting) continue;
+                    if (voice->pathingSource == nullptr) continue;
+                    if (voice->pathEverSolved) continue;
+                    const float d =
+                        glm::length(voice->worldPos - mListenerPos);
+                    if (d > voice->maxAudibleDist) continue;
+                    // Rank by inverted deferral count so a plain ascending
+                    // sort puts the oldest waiter first without a custom
+                    // comparator.
+                    cands.emplace_back(
+                        UINT32_MAX - voice->pathFirstSolveDeferrals,
+                        voice->maxAudibleDist > 0.0f
+                            ? d / voice->maxAudibleDist
+                            : 0.0f,
+                        handle);
+                }
+                firstSolveBacklog = static_cast<uint32_t>(cands.size());
+                const size_t admit = std::min<size_t>(
+                    cands.size(), kPathingFirstSolvesPerIteration);
+                std::partial_sort(cands.begin(), cands.begin() + admit,
+                                  cands.end());
+                for (size_t i = 0; i < admit; ++i)
+                    firstSolveAdmitted[firstSolveAdmittedN++] =
+                        std::get<2>(cands[i]);
+            }
+
             // (voiceUpdT0 is set before the HARVEST pass now — PR 1b
             // reordered the per-voice work but the phase timer still
             // covers all of it.)
@@ -9623,8 +9719,40 @@ void AudioService::loopStep(float deltaTime)
                         ++wdEligIdx;
                     }
                     const bool needsSolve = scopedNeedsSolve || watchdogForce;
+                    // ── Lever D: first-solve stagger decision ──
+                    //
+                    // This voice has never solved and the pre-pass did not
+                    // admit it to this iteration's first-solve budget: hold
+                    // it for a later tick. Only trigNever voices can be
+                    // deferred — a voice with a prior solve carries a live
+                    // route (door/movement re-solves, the <=150 ms gate) and
+                    // is never staggered. Falls through to the SAME latch
+                    // branch as a due-but-can't-signal tick below: stage
+                    // NOTHING (so the lockstep populate/setInputs pair stays
+                    // driven by one boolean and SA keeps this source out of
+                    // the iteration entirely), touch NO memo field, and set
+                    // pathSolvePending so the next admitting tick solves it.
+                    // The voice stays pathTargetValid=false and parked silent
+                    // meanwhile — the state it was already in.
+                    bool firstSolveHeld = false;
+                    if (needsSolve && pathingWillSignal && trigNever) {
+                        firstSolveHeld = true;
+                        for (uint32_t i = 0; i < firstSolveAdmittedN; ++i) {
+                            if (firstSolveAdmitted[i] == handle) {
+                                firstSolveHeld = false;
+                                break;
+                            }
+                        }
+                        // Not admitted (or out-of-range this tick, so the
+                        // pre-pass never considered it — it will be a
+                        // candidate on the tick it comes back in range).
+                        if (firstSolveHeld) {
+                            ++voice->pathFirstSolveDeferrals;  // aging key
+                            ++firstSolveDeferred;
+                        }
+                    }
                     if (needsSolve) {
-                        if (pathingWillSignal) {
+                        if (pathingWillSignal && !firstSolveHeld) {
                             stagePathingSolve = true;
                             // [PERF path_trig] census — count every
                             // trigger that held on this staged solve,
@@ -9726,9 +9854,12 @@ void AudioService::loopStep(float deltaTime)
                             }
                         } else {
                             // Due tick that can't signal (worker busy or
-                            // door-commit hold) — keep the request alive;
-                            // do NOT touch the memo (memo updates only on
-                            // signaled solves).
+                            // door-commit hold), or a first solve held back
+                            // by the lever-D stagger — keep the request
+                            // alive; do NOT touch the memo (memo updates
+                            // only on signaled solves). Either way nothing
+                            // is staged, so this voice is absent from the
+                            // iteration and SA leaves its outputs alone.
                             voice->pathSolvePending = true;
                         }
                     } else if (voice->pathStagedEnabled && pathingWillSignal) {
@@ -9757,6 +9888,19 @@ void AudioService::loopStep(float deltaTime)
                     // (review F6).
                     if (pathingWillSignal) {
                         if (stagePathingSolve)  ++pathingStagedSolved;
+                        // Lever D: a held first solve was staged as NEITHER
+                        // solve nor skip. It must not land in `skipped=`,
+                        // which means "in-range voice served from Steam
+                        // Audio's retained outputs" — this voice has no
+                        // retained outputs to serve (it has never solved)
+                        // and is silent, not cached. Counting it there would
+                        // overstate the dirty-gating win exactly the way
+                        // review F6 called out for out-of-range voices; it
+                        // gets its own firstSolveDeferred= bucket instead.
+                        // (already counted into firstSolveDeferred at the
+                        // decision site above — this branch exists purely to
+                        // keep it out of `skipped`.)
+                        else if (firstSolveHeld) { }
                         else if (pathingWanted) ++pathingStagedSkipped;
                         // A GLOBAL door change happened since this voice's
                         // last solve (trigDoorGenRaw) but it was NOT
@@ -10241,6 +10385,13 @@ void AudioService::loopStep(float deltaTime)
                         pathingStagedSolved, pathingStagedSkipped,
                         pathingStagedUnreachableCached,
                         pathingScopedSolves, pathingScopeSkipped);
+                    //     Lever D (§16): first solves this pass held out of
+                    //     the iteration + the remaining never-solved depth.
+                    //     Pushed on the same wantPathing/signal path as the
+                    //     staging mix — these counters are only meaningful
+                    //     for a pass that actually staged into an iteration.
+                    mPathingSim->setFirstSolveStagger(firstSolveDeferred,
+                                                      firstSolveBacklog);
                     // (b) Record the committed door gen this signaled
                     //     solve covers (staging keyed its memos to the
                     //     same stagingDoorGen snapshot). Consumed by the
@@ -14934,13 +15085,35 @@ void AudioService::rebuildPathingAdjacency()
     // injects nothing and the adjacency build emits one [VIZ_FALLBACK]
     // line and leaves the graph empty (per feedback_no_silent_fallbacks).
     ProbeManager::PathingAdjacencyRaycaster ray;
+    // Per-status census of every adjacency ray. Proves WHICH failure classes
+    // are culling edges (and that the whitelist below is not over-culling
+    // legitimate clear rays). Indexed by RayStatus; lives on the stack and is
+    // only touched by the synchronous buildPathingAdjacency call below.
+    std::array<int, 10> rayCensus{};
     if (mRaycaster) {
         // Copy mRaycaster into the lambda so any later reassignment
         // doesn't invalidate the adjacency build's view of it.
         AudioRaycastFn rc = mRaycaster;
-        ray = [rc](const Vector3 &from, const Vector3 &to) {
+        ray = [rc, &rayCensus](const Vector3 &from, const Vector3 &to) {
             RayHit hit{};
-            return rc(from, to, hit);
+            const bool blocked = rc(from, to, hit);
+            const size_t si = static_cast<size_t>(hit.status);
+            if (si < rayCensus.size()) ++rayCensus[si];
+            // WHITELIST RayStatus::Clear — do NOT read a bare `false` as
+            // visibility. raycastWorld returns false both when it PROVED the
+            // segment clear and when it could not evaluate it at all (origin
+            // outside every cell — e.g. a probe baked inside solid; cell
+            // budget exhausted; degenerate geometry; invalid portal target).
+            // Reading those as "clear" drew edges straight through solid
+            // world geometry, which is what this visualization/parity proxy
+            // is for catching. Exactly one status proves clear, so whitelist
+            // it rather than blacklisting failures we may not have enumerated.
+            //
+            // This raycaster's contract: true => DO NOT create an edge
+            // (proven blocked, or unproven — never claim unproven visibility).
+            if (blocked) return true;
+            return hit.status != RayStatus::Clear &&
+                   hit.status != RayStatus::ZeroLength;
         };
     }
 
@@ -14991,6 +15164,27 @@ void AudioService::rebuildPathingAdjacency()
 
     mProbeManager->buildPathingAdjacency(visRangeFt,
                                          activePathingVisSamples(), ray);
+
+    // [ADJACENCY_RAYS] — why each in-range pair did or did not become an edge.
+    // `clear` is the ONLY status that proves visibility; every other non-hit
+    // status means raycastWorld could not evaluate the segment (and used to be
+    // silently read as "clear", drawing edges through solid geometry).
+    // no_start_cell in particular counts rays fired FROM a probe baked inside
+    // solid — those are placement bugs, visible here as a loud number.
+    if (mRaycaster) {
+        auto n = [&](RayStatus s) {
+            return rayCensus[static_cast<size_t>(s)];
+        };
+        std::fprintf(stderr,
+            "[ADJACENCY_RAYS] hit=%d clear=%d | UNPROVEN: no_start_cell=%d "
+            "cell_budget=%d degenerate=%d discard_no_poly=%d "
+            "invalid_portal=%d invalid_cell=%d zero_len=%d unset=%d\n",
+            n(RayStatus::Hit), n(RayStatus::Clear),
+            n(RayStatus::NoStartCell), n(RayStatus::CellBudget),
+            n(RayStatus::DegenerateGeom), n(RayStatus::DiscardNoPolygon),
+            n(RayStatus::InvalidPortalTarget), n(RayStatus::InvalidCell),
+            n(RayStatus::ZeroLength), n(RayStatus::Unset));
+    }
 }
 
 //------------------------------------------------------
@@ -15948,118 +16142,59 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     //     (room coverage), so a centroid coincident with a nearby portal
     //     gets dropped rather than the other way around.
     //
-    // One record per non-door portal — input to the thin-room
-    // coverage-repair pass, which runs AFTER the dedup and the
-    // inside-door-AABB rejection (near the end of this function) so its
-    // coverage check sees the candidates that actually SURVIVE. Room IDs
-    // come from ROOM_DB (authoritative), NOT roomFromPoint(center): a
-    // point exactly on the portal plane resolves to whichever neighbor
-    // wins the tie, so keying repairs on it filed thin connector rooms
-    // under their big neighbors and left them unrepairable (MISS2 room
-    // 194, a 0.6-ft slab between two aligned portals, kept two loud
-    // [BAKE_PARITY] MISSING pairs). Declared at function scope: filled
-    // by the portal-emission block, consumed by the repair block.
-    struct NonDoorPortalRecord {
+    // One record per surviving (non-sky, non-degenerate, dup-skipped)
+    // portal — input to THREE later passes:
+    //   • thin-room coverage repair (non-door records only), which runs
+    //     AFTER the dedup and the inside-door-AABB rejection (near the
+    //     end of this function) so its coverage check sees the
+    //     candidates that actually SURVIVE;
+    //   • same-room-pair PortalPair de-densification (door records —
+    //     the suppression rule needs each door portal's ROOM PAIR, not
+    //     just its box);
+    //   • the hub-room coverage fill + coverage-based bake-range
+    //     derivation (all records — portals are the coverage demand
+    //     set; PLAN.PATHING_DESIGN.md §10).
+    // Room IDs come from ROOM_DB (authoritative), NOT
+    // roomFromPoint(center): a point exactly on the portal plane
+    // resolves to whichever neighbor wins the tie, so keying repairs on
+    // it filed thin connector rooms under their big neighbors and left
+    // them unrepairable (MISS2 room 194, a 0.6-ft slab between two
+    // aligned portals, kept two loud [BAKE_PARITY] MISSING pairs).
+    // Declared at function scope: filled by the portal-emission block,
+    // consumed by the repair / fill / derivation blocks.
+    struct PathingPortalRecord {
         int roomAID = -1;      ///< ROOM_DB IDs; -1 when absent
         int roomBID = -1;
         Vector3 center;        ///< portal center (on the plane)
         Vector3 unitNormal;    ///< normalized portal plane normal
+        bool isDoor = false;   ///< carries a registered door OBB
     };
-    std::vector<NonDoorPortalRecord> nonDoorPortals;
+    std::vector<PathingPortalRecord> pathingPortals;
     if (mProbePathingBatchEnabled && mRoomService) {
         const auto &rooms = mRoomService->getAllRooms();
 
-        // ── Bake-time single-edge visRange cap, derived from ROOM_DB ──
+        // ── Bake-time single-edge visRange cap ────────────────────────
         //
         // The pathing bake's visRange caps how far apart two probes may
         // be and still get a visibility edge; pairs beyond it are culled
         // BEFORE the numSamples² ray test, making this the dominant
-        // bake-cost lever on sprawling missions (see the
-        // visRange/pathRange comment in ProbeManager::bakePathingBatch
-        // for the full split rationale + the horizontal-only-cull
-        // upstream note). The longest meaningful single hop is a
-        // room-scale distance: probes live at room centroids, portals,
-        // doors and emitters, so any pair further apart than the
-        // mission's largest room either has geometry between it (the
-        // ray test would reject the edge anyway — pure wasted rays) or
-        // is served by multi-hop routes through intermediate probes
-        // (pathRange stays whole-level).
+        // bake-cost AND runtime-search-space lever on sprawling missions
+        // (see the visRange/pathRange comment in
+        // ProbeManager::bakePathingBatch for the full split rationale +
+        // the horizontal-only-cull upstream note).
         //
-        // maxRoomSpanFt = max over rooms of:
-        //   • the largest intra-room portal-to-portal distance — the
-        //     original engine's own precomputed hop tables
-        //     (Room::getPortalDist), its hand-authored answer to "how
-        //     far apart can two openings of one room be";
-        //   • the room's OBB diagonal from its bounding planes (covers
-        //     rooms with 0–1 portals, whose portal table contributes
-        //     nothing).
-        // × 1.5 margin (probes sit off the graph anchors: door pairs
-        // ±5 ft along the normal, ear-height offsets, emitter jitter),
-        // clamped to [150, 400] ft — the floor keeps small missions
-        // from starving the graph, the ceiling keeps one cathedral-
-        // sized outlier room from re-inflating the whole bake.
-        // Derived HERE (not in ProbeManager) because rooms + portals
-        // are already iterated in this function and ProbeManager must
-        // not depend on RoomService.
-        {
-            float maxPortalSpanFt = 0.0f;
-            float maxRoomDiagFt   = 0.0f;
-            for (const auto &roomPtr : rooms) {
-                if (!roomPtr) continue;
-                const uint32_t pc = roomPtr->getPortalCount();
-                for (uint32_t i = 0; i < pc; ++i)
-                    for (uint32_t j = i + 1; j < pc; ++j)
-                        maxPortalSpanFt = std::max(
-                            maxPortalSpanFt, roomPtr->getPortalDist(i, j));
-                // OBB diagonal: pair antiparallel bounding planes and
-                // accumulate each axis extent (plane normals face
-                // inward, so center-to-plane distances are positive and
-                // opposite planes' distances sum to the extent).
-                const Plane  *planes = roomPtr->getBoundingPlanes();
-                const Vector3 rc     = roomPtr->getCenter();
-                float sumSq = 0.0f;
-                bool paired[6] = {};
-                for (int a = 0; a < 6; ++a) {
-                    if (paired[a]) continue;
-                    for (int b = a + 1; b < 6; ++b) {
-                        if (paired[b]) continue;
-                        if (glm::dot(planes[a].normal, planes[b].normal)
-                            < -0.9f) {
-                            const float extent = planes[a].getDistance(rc)
-                                               + planes[b].getDistance(rc);
-                            if (extent > 0.0f) sumSq += extent * extent;
-                            paired[a] = paired[b] = true;
-                            break;
-                        }
-                    }
-                }
-                if (sumSq > 0.0f)
-                    maxRoomDiagFt = std::max(maxRoomDiagFt,
-                                             std::sqrt(sumSq));
-            }
-            const float maxRoomSpanFt = std::max(maxPortalSpanFt,
-                                                 maxRoomDiagFt);
-            constexpr float kVisRangeMarginMul = 1.5f;
-            constexpr float kVisRangeMinFt     = 150.0f;
-            constexpr float kVisRangeMaxFt     = 400.0f;
-            const float visRangeFt = std::min(
-                std::max(maxRoomSpanFt * kVisRangeMarginMul,
-                         kVisRangeMinFt),
-                kVisRangeMaxFt);
-            params.pathingVisRangeFt  = visRangeFt;
-            mDerivedPathingVisRangeFt = visRangeFt;
-            // Loud + unconditional: the entire pathing bake-cost story
-            // hangs off this one number, and a surprising derivation
-            // (cathedral room, empty portal tables) must be visible in
-            // every bake log.
-            std::fprintf(stderr,
-                "[PATHING_BAKE_RANGE] derived single-edge visRange cap "
-                "%.0f ft (maxRoomSpan=%.0f ft [portal-to-portal %.0f, "
-                "room-diag %.0f] x %.1f margin, clamp [%.0f, %.0f]); "
-                "pathRange stays whole-level\n",
-                visRangeFt, maxRoomSpanFt, maxPortalSpanFt, maxRoomDiagFt,
-                kVisRangeMarginMul, kVisRangeMinFt, kVisRangeMaxFt);
-        }
+        // The derivation is COVERAGE-based and lives near the END of
+        // this function (after the hub-room coverage fill, which it
+        // depends on): governing = max over rooms of (max portal →
+        // nearest same-room probe distance POST-fill), visRange =
+        // clamp(2 × governing). It REPLACES the previous max-room-SPAN
+        // derivation ([150, 400] ft clamp), which let one hub room
+        // (MISS2 room 18 — 331 ft intra-room hops) inflate the whole
+        // mission's bake to the 400 ft ceiling even though the fill
+        // bounds every hop far lower (PLAN.PATHING_DESIGN.md §10).
+        // Until that block runs, params.pathingVisRangeFt stays at the
+        // -1 sentinel; if candidate emission dies before reaching it,
+        // bakePathingBatch falls back LOUDLY to the whole-level range.
 
         int roomCount      = 0;
         int roomSnapped    = 0;
@@ -16151,8 +16286,25 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         AUDIO_LOG("Pathing portal pass: %zu doors registered for "
                   "door-portal classification\n", doorBoxes.size());
 
-        int portalDoorPairCount = 0;
-        int portalBendPairCount = 0;
+        // Pass 1 — CLASSIFY every portal (dup-skip, degenerate-normal
+        // skip, sky filter, door-OBB match) into pathingPortals. Split
+        // from emission because two consumers need the full classified
+        // set before any probe is emitted:
+        //   • the same-room-pair de-densification below needs every DOOR
+        //     portal's room pair to decide which PortalPairs to suppress;
+        //   • the hub-room coverage fill + coverage-based bake-range
+        //     derivation (near the end of this function) use the records
+        //     as the coverage demand set.
+        // Every record is remembered at every density — the thin-room
+        // coverage-repair pass consumes the non-door ones (baseline's
+        // single portal-center probe is NOT a coverage guarantee either:
+        // it sits exactly on the portal plane — roomFromPoint tie often
+        // resolves to a neighbor — and can itself be rejected by the
+        // inside-door pass; MISS2 portal 416's center sits inside door
+        // 1019's AABB). Door portals stay excluded from repair: zero-
+        // probe rooms whose every portal carries a door are inter-door
+        // connector volumes owned by the runtime door-validation path,
+        // graded missing_door_adjacent by [BAKE_PARITY] by design.
         for (const auto &roomPtr : rooms) {
             if (!roomPtr) continue;
             const uint32_t pc = roomPtr->getPortalCount();
@@ -16180,13 +16332,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 }
 
                 // Door classification — is this portal coincident with
-                // a registered door? If yes, emit DoorPair probes
-                // ±offset along the portal normal; if no, emit per the
-                // density knob (bends: PortalPair flanking pair;
-                // baseline: single centroid probe). Pair-probes carry a
-                // placeholder 3 ft radius so any code reading it
-                // pre-adaptive-pass sees a sane value; the post-dedup
-                // pass overrides every candidate's radiusFt.
+                // a registered door?
                 bool isDoorPortal = false;
                 for (const DoorWorldAABB &b : doorBoxes) {
                     if (sPointAABBDistSq(center, b.mn, b.mx)
@@ -16196,71 +16342,117 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     }
                 }
 
-                const Vector3 nrm = glm::normalize(normal);
-                if (isDoorPortal || bendsDensity) {
-                    // Flanking pair: DoorPair when a door OBB sits in
-                    // the opening (closed-door edge invalidation),
-                    // PortalPair otherwise (Tier 1 bend points — same
-                    // geometry, no OBB between the pair). The two
-                    // purposes stay distinct because dedup policy
-                    // differs: DoorPair/PortalPair collapse against
-                    // their own kind at the tight compound-portal
-                    // radius, and only DoorPair is exempt from the
-                    // inside-door-AABB rejection pass below.
-                    const PathingProbePurpose pairPurpose = isDoorPortal
-                        ? PathingProbePurpose::DoorPair
-                        : PathingProbePurpose::PortalPair;
-                    PathingProbeCandidate inside;
-                    inside.position = center - nrm * kPairProbeOffsetFt;
-                    inside.radiusFt = 3.0f;
-                    inside.purpose  = pairPurpose;
-                    PathingProbeCandidate outside;
-                    outside.position = center + nrm * kPairProbeOffsetFt;
-                    outside.radiusFt = 3.0f;
-                    outside.purpose  = pairPurpose;
-                    params.pathingCandidates.push_back(inside);
-                    params.pathingCandidates.push_back(outside);
-                    if (isDoorPortal) portalDoorPairCount += 2;
-                    else              portalBendPairCount += 2;
-                } else {
-                    PathingProbeCandidate cand;
-                    cand.position = center;
-                    cand.radiusFt = kPortalRadiusFt;
-                    cand.purpose  = PathingProbePurpose::Portal;
-                    params.pathingCandidates.push_back(cand);
-                    ++portalCount;
-                }
+                PathingPortalRecord rec;
+                rec.roomAID = static_cast<int>(roomA->getRoomID());
+                rec.roomBID = roomB
+                    ? static_cast<int>(roomB->getRoomID()) : -1;
+                rec.center     = center;
+                rec.unitNormal = glm::normalize(normal);
+                rec.isDoor     = isDoorPortal;
+                pathingPortals.push_back(rec);
+            }
+        }
 
-                // Remember this portal for the thin-room coverage-repair
-                // pass (runs at ALL densities, after dedup + the
-                // inside-door rejection — see below). Recorded at every
-                // density because baseline's single portal-center probe
-                // is NOT a coverage guarantee either: it sits exactly on
-                // the portal plane (roomFromPoint tie → often resolves
-                // to a neighbor) and can itself be rejected by the
-                // inside-door pass (MISS2 portal 416's center sits
-                // inside door 1019's AABB). Door portals stay excluded:
-                // zero-probe rooms whose every portal carries a door are
-                // inter-door connector volumes owned by the runtime
-                // door-validation path, graded missing_door_adjacent by
-                // [BAKE_PARITY] by design.
-                if (!isDoorPortal) {
-                    NonDoorPortalRecord rec;
-                    rec.roomAID = static_cast<int>(roomA->getRoomID());
-                    rec.roomBID = roomB
-                        ? static_cast<int>(roomB->getRoomID()) : -1;
-                    rec.center     = center;
-                    rec.unitNormal = nrm;
-                    nonDoorPortals.push_back(rec);
+        // Same-room-pair PortalPair de-densification threshold
+        // (PLAN.PATHING_DESIGN.md §10 lever 3). A non-door portal within
+        // this distance of a DOOR portal joining the SAME two rooms is
+        // part of the same compound opening (door leaf + sidelight /
+        // arch segments modelled as separate RoomPortal records); the
+        // DoorPair flanks a few feet away already give the solver its
+        // bend anchors for that aperture, so an additional PortalPair
+        // is pure local-density cost — and findAlternatePaths is
+        // quadratic in local density. NEVER applied across DIFFERENT
+        // room pairs (user rule, §10 Q1 discussion): a door and a
+        // nearby genuine other opening (two doorways off one junction)
+        // are distinct routes and both keep their anchors. 12 ft sits
+        // inside the ~10-15 ft window the door-flank geometry implies
+        // (flanks at ±5 ft mean a 12-ft-away portal's pair would land
+        // within ~2-7 ft of the door flanks).
+        constexpr float kSameOpeningSuppressFt = 12.0f;
+        const float kSameOpeningSuppressSq =
+            kSameOpeningSuppressFt * kSameOpeningSuppressFt;
+
+        // Pass 2 — EMIT probes from the classified records. Pair-probes
+        // carry a placeholder 3 ft radius so any code reading it
+        // pre-adaptive-pass sees a sane value; the post-dedup pass
+        // overrides every candidate's radiusFt.
+        int portalDoorPairCount = 0;
+        int portalBendPairCount = 0;
+        int portalPairSuppressed = 0;
+        for (const PathingPortalRecord &rec : pathingPortals) {
+            if (rec.isDoor || bendsDensity) {
+                // Flanking pair: DoorPair when a door OBB sits in
+                // the opening (closed-door edge invalidation),
+                // PortalPair otherwise (Tier 1 bend points — same
+                // geometry, no OBB between the pair). The two
+                // purposes stay distinct because dedup policy
+                // differs: DoorPair/PortalPair collapse against
+                // their own kind at the tight compound-portal
+                // radius, and only DoorPair is exempt from the
+                // inside-door-AABB rejection pass below.
+                if (!rec.isDoor) {
+                    // De-densification: suppress this PortalPair when an
+                    // adjacent DOOR portal within kSameOpeningSuppressFt
+                    // serves the SAME (unordered) room pair — a true
+                    // compound opening. Requires both room IDs valid on
+                    // both records; unknown far-rooms never suppress
+                    // (conservative: keep the anchors).
+                    bool suppressed = false;
+                    if (rec.roomAID >= 0 && rec.roomBID >= 0) {
+                        const int lo = std::min(rec.roomAID, rec.roomBID);
+                        const int hi = std::max(rec.roomAID, rec.roomBID);
+                        for (const PathingPortalRecord &dr : pathingPortals) {
+                            if (!dr.isDoor) continue;
+                            if (dr.roomAID < 0 || dr.roomBID < 0) continue;
+                            if (std::min(dr.roomAID, dr.roomBID) != lo
+                                || std::max(dr.roomAID, dr.roomBID) != hi)
+                                continue;
+                            const Vector3 d = dr.center - rec.center;
+                            if (glm::dot(d, d) < kSameOpeningSuppressSq) {
+                                suppressed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (suppressed) {
+                        portalPairSuppressed += 2;
+                        continue;
+                    }
                 }
+                const PathingProbePurpose pairPurpose = rec.isDoor
+                    ? PathingProbePurpose::DoorPair
+                    : PathingProbePurpose::PortalPair;
+                PathingProbeCandidate inside;
+                inside.position = rec.center - rec.unitNormal * kPairProbeOffsetFt;
+                inside.radiusFt = 3.0f;
+                inside.purpose  = pairPurpose;
+                PathingProbeCandidate outside;
+                outside.position = rec.center + rec.unitNormal * kPairProbeOffsetFt;
+                outside.radiusFt = 3.0f;
+                outside.purpose  = pairPurpose;
+                params.pathingCandidates.push_back(inside);
+                params.pathingCandidates.push_back(outside);
+                if (rec.isDoor) portalDoorPairCount += 2;
+                else            portalBendPairCount += 2;
+            } else {
+                PathingProbeCandidate cand;
+                cand.position = rec.center;
+                cand.radiusFt = kPortalRadiusFt;
+                cand.purpose  = PathingProbePurpose::Portal;
+                params.pathingCandidates.push_back(cand);
+                ++portalCount;
             }
         }
         AUDIO_LOG("Pathing portal pass [density=%s]: %d single portal "
                   "probes + %d bend pair-probes (%d pairs) + %d door "
-                  "pair-probes (%d pairs)\n",
+                  "pair-probes (%d pairs); %d PortalPair probes (%d pairs) "
+                  "suppressed (same-room-pair DoorPair within %.0f ft — "
+                  "compound openings)\n",
                   pathingProbeDensityName(mPathingProbeDensity),
                   portalCount, portalBendPairCount, portalBendPairCount / 2,
-                  portalDoorPairCount, portalDoorPairCount / 2);
+                  portalDoorPairCount, portalDoorPairCount / 2,
+                  portalPairSuppressed, portalPairSuppressed / 2,
+                  kSameOpeningSuppressFt);
 
         // ── Room centroid probes (emitted second; floor-anchored) ───────
         // Pathing probes are anchored at player ear height
@@ -16411,6 +16603,18 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         // nudge, wall-mounted-emitter pathing anchors would all be
         // rejected and the room-centroid fallback would re-introduce
         // the SPIKE pattern for those emitters in non-convex rooms.
+        // No-silent-fallbacks: without the renderer's point-in-air test we
+        // are back to the ROOM_DB box test that bakes probes inside walls.
+        // Say so — never let a degraded bake look like a good one.
+        if (!mPointInAirFn) {
+            std::fprintf(stderr,
+                "[FALLBACK] probe placement has no point-in-air test "
+                "(renderer did not call setPointInAirFn — headless bake?): "
+                "solidity falls back to RoomService::roomFromPoint, which "
+                "only tests designer ROOM_DB boxes and CANNOT see solid "
+                "geometry. Probes may be baked inside walls; rays cast from "
+                "them are never traced and report false 'clear' visibility.\n");
+        }
         const float pathingSearchRadiusFt = std::max(
             (mProbeManager ? mProbeManager->getProbeSpacingFt() : 5.0f) * 2.0f,
             16.0f);
@@ -16418,11 +16622,24 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         params.pathingProbeFilter =
             [this, pathingSearchRadiusSq](const Vector3 &p) -> ProbeFilterDecision {
                 ProbeFilterDecision d;
-                if (mRoomService->roomFromPoint(p)) {
+                // "In open space" is decided by the WORLD (WR cells are air;
+                // solid is their absence), NOT by roomFromPoint(). ROOM_DB
+                // rooms are coarse designer boxes that overlap solid freely,
+                // so a point can be inside a room box AND inside a wall —
+                // which is exactly how 46 MISS2 probes (3.6%) got baked into
+                // walls. Rays from a cell-less point are never traced and
+                // silently report "clear", which produced ~11.6k phantom
+                // edges (~37% of the graph). roomFromPoint keeps only its
+                // real job below: which room does this point belong to.
+                const bool inAir = !mPointInAirFn || mPointInAirFn(p);
+                if (inAir && mRoomService->roomFromPoint(p)) {
                     d.result = ProbeFilterResult::Accept;
                     return d;
                 }
-                // In-solid: walk the room set for the nearest center.
+                // In solid (or outside every room): walk the room set for the
+                // nearest center and nudge toward it. The re-evaluation after
+                // the nudge re-runs this same in-air test, so a nudge that
+                // lands in another wall does not sneak through.
                 Room *nearest    = nullptr;
                 float nearestSq  = pathingSearchRadiusSq;
                 const auto &rooms = mRoomService->getAllRooms();
@@ -17011,7 +17228,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             // pass exists to cover. Running after the dedup also means
             // nothing can drop the repair probe afterwards.
             int thinRoomRepairs = 0;
-            if (!nonDoorPortals.empty()) {
+            if (!pathingPortals.empty()) {
                 std::set<int> covered;
                 for (const auto &cand : params.pathingCandidates) {
                     Room *r = mRoomService->roomFromPoint(cand.position);
@@ -17020,7 +17237,12 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 std::set<int> repaired, unrepairable;
                 static constexpr float kRepairOffsetsFt[] = {
                     0.05f, 0.1f, 0.25f, 0.5f, 1.0f, 2.0f, 3.5f, 5.0f};
-                for (const auto &bp : nonDoorPortals) {
+                for (const auto &bp : pathingPortals) {
+                    // Door portals excluded from repair by design — see
+                    // the pass-1 classification comment (inter-door
+                    // connector volumes are owned by the runtime door-
+                    // validation path).
+                    if (bp.isDoor) continue;
                     for (int side = 0; side < 2; ++side) {
                         const int roomID = (side == 0) ? bp.roomAID
                                                        : bp.roomBID;
@@ -17072,6 +17294,411 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                           "no surviving candidate resolves to "
                           "(density=%s)\n", thinRoomRepairs,
                           pathingProbeDensityName(mPathingProbeDensity));
+            }
+
+            // ── Hub-room coverage fill + coverage-based bake-range ──────
+            //    derivation (PLAN.PATHING_DESIGN.md §10 — graph-reduction
+            //    lever, user-approved 2026-07-13 direction).
+            //
+            // Problem: the bake's single-edge visRange cap must cover the
+            // longest hop a route needs, and that hop is set by the WORST
+            // room's coverage — a portal whose nearest same-room graph
+            // anchor is far away forces long edges for every probe pair
+            // in the mission. Under the previous max-room-SPAN derivation
+            // one hub room (MISS2 room 18: deg 53, intra-room hops to
+            // 331 ft) pushed the whole mission to the 400 ft clamp
+            // ceiling; the runtime alternate-search frontier scales with
+            // that range.
+            //
+            // Fix, per the §10 research (k-center / disk-cover
+            // decomposition): fill the few outlier rooms with interior
+            // probes until every portal has a nearby in-room hop anchor,
+            // THEN derive the cap from the achieved coverage.
+            //
+            //   demand   = the room's (non-sky) portal centers — the
+            //              points routes must attach through — plus the
+            //              room's floor extent (FLOOR_POLY candidates:
+            //              one per upward-facing BSP cell polygon, the
+            //              same machinery the reflection batch's floor
+            //              pass placement uses) so big open floors keep
+            //              listener/source attachment locality;
+            //   anchors  = every surviving pathing candidate that
+            //              roomFromPoint resolves to the room (semantic
+            //              probes seed the fill — centroids, pairs,
+            //              repairs, emitters — plus fill probes as they
+            //              are added);
+            //   sites    = the room's FLOOR_POLY candidates at player
+            //              ear height, outside every door AABB;
+            //   coverage = distance from a demand point to the nearest
+            //              VISIBLE anchor — one occlusion ray per
+            //              (demand, anchor) evaluation, blocked ⇒ the
+            //              anchor doesn't count (visibility-aware
+            //              k-center; a wall between them means the graph
+            //              can't hop that way either). Portal demand
+            //              excludes anchors within kOwnFlankExclusionFt
+            //              of itself: a route entering via a portal
+            //              lands ON its flank probes, so the flanks
+            //              cannot be their own onward hop — the metric
+            //              is "how far to the next anchor", which is
+            //              what visRange has to cover (this is why a
+            //              centroid probe halves a room's span instead
+            //              of zeroing it, §9).
+            //
+            // Greedy Gonzalez farthest-point: repeatedly take the
+            // farthest-uncovered demand point and place a probe at the
+            // nearest usable site until everything is within
+            // kPathingCoverageRadiusFt (R_cov) or the room's site pool /
+            // per-room cap runs out (both loud). Expected to fire in ~3
+            // hub rooms game-wide at R_cov=75 (§10) — every added probe
+            // RAISES local density where findAlternatePaths is quadratic
+            // in it, so the fill must stay surgical; the door-stress-
+            // in-room-18 runtime cell is the regression gate.
+            {
+                const float rCovFt = kPathingCoverageRadiusFt;
+                // Same player-ear anchor as kRoomFloorOffsetFt in the
+                // emission pass above (that constant is scoped to the
+                // portal/centroid block).
+                constexpr float kEarHeightFt = 5.0f;
+                // Own-flank exclusion for portal demand: pair probes sit
+                // kPairProbeOffsetFt (5 ft) from the portal center;
+                // +1.5 ft slop covers dedup nudges. Portal-center probes
+                // (baseline density) at 0 ft are excluded too, by the
+                // same radius.
+                constexpr float kOwnFlankExclusionFt = 6.5f;
+                const float kOwnFlankExclusionSq =
+                    kOwnFlankExclusionFt * kOwnFlankExclusionFt;
+                // A new site closer than this to an existing anchor
+                // duplicates it (and would inherit its blockage) —
+                // skip it.
+                constexpr float kSiteMinSeparationFt = 5.0f;
+                const float kSiteMinSeparationSq =
+                    kSiteMinSeparationFt * kSiteMinSeparationFt;
+                const float kInf = std::numeric_limits<float>::max();
+
+                // Visibility oracle. mRaycaster is the renderer-supplied
+                // BSP raycaster (the same hook the debug adjacency build
+                // uses); headless computeProbePlan runs have none —
+                // announce loudly and degrade to distance-only coverage
+                // (the plan verb already carries the analogous door-OBB
+                // caveat in its WARN banner).
+                AudioRaycastFn rcFill = mRaycaster;
+                if (!rcFill) {
+                    std::fprintf(stderr,
+                        "[FALLBACK] pathing hub fill: no raycaster wired "
+                        "— coverage fill + bake-range derivation are "
+                        "DISTANCE-ONLY this pass (no visibility rays); "
+                        "renderer bakes are visibility-aware, so a plan "
+                        "computed here can differ from the live bake\n");
+                }
+                auto blockedRay = [&rcFill](const Vector3 &a,
+                                            const Vector3 &b) -> bool {
+                    if (!rcFill) return false;
+                    RayHit hit{};
+                    return rcFill(a, b, hit);
+                };
+
+                auto roomIDOf = [this](const Vector3 &p) -> int {
+                    Room *r = mRoomService->roomFromPoint(p);
+                    return r ? static_cast<int>(r->getRoomID()) : -1;
+                };
+
+                // Anchor positions per room (surviving candidates only —
+                // this block runs after every candidate-deleting pass).
+                std::map<int, std::vector<Vector3>> roomAnchors;
+                for (const auto &cand : params.pathingCandidates) {
+                    const int rid = roomIDOf(cand.position);
+                    if (rid >= 0) roomAnchors[rid].push_back(cand.position);
+                }
+
+                // Demand + site pools per room.
+                struct DemandPoint {
+                    Vector3 pos;
+                    bool    isPortal = false;
+                    bool    stuck    = false;  ///< fill can't improve it
+                    float   bestFt   = std::numeric_limits<float>::max();
+                };
+                std::map<int, std::vector<DemandPoint>> roomDemand;
+                for (const auto &pr : pathingPortals) {
+                    for (int side = 0; side < 2; ++side) {
+                        const int rid = (side == 0) ? pr.roomAID
+                                                    : pr.roomBID;
+                        if (rid < 0) continue;
+                        DemandPoint d;
+                        d.pos      = pr.center;
+                        d.isPortal = true;
+                        roomDemand[rid].push_back(d);
+                    }
+                }
+                std::map<int, std::vector<Vector3>> roomSites;
+                for (const Vector3 &f : mFloorProbeCandidates) {
+                    const Vector3 p{f.x, f.y, f.z + kEarHeightFt};
+                    const int rid = roomIDOf(p);
+                    if (rid < 0) continue;
+                    roomSites[rid].push_back(p);
+                    DemandPoint d;
+                    d.pos      = p;
+                    d.isPortal = false;
+                    roomDemand[rid].push_back(d);
+                }
+
+                // Coverage of one demand point against an anchor list:
+                // nearest VISIBLE anchor (rays cast nearest-first, so the
+                // common covered case costs one ray).
+                auto coverageOf = [&](const DemandPoint &d,
+                                      const std::vector<Vector3> &anchors)
+                        -> float {
+                    std::vector<std::pair<float, size_t>> order;
+                    order.reserve(anchors.size());
+                    for (size_t i = 0; i < anchors.size(); ++i) {
+                        const Vector3 dv = anchors[i] - d.pos;
+                        const float distSq = glm::dot(dv, dv);
+                        if (d.isPortal && distSq < kOwnFlankExclusionSq)
+                            continue;
+                        order.emplace_back(distSq, i);
+                    }
+                    std::sort(order.begin(), order.end());
+                    for (const auto &o : order) {
+                        if (!blockedRay(d.pos, anchors[o.second]))
+                            return std::sqrt(o.first);
+                    }
+                    return kInf;
+                };
+
+                int   fillProbesTotal = 0;
+                int   fillRoomsTotal  = 0;
+                int   stuckDemandTotal = 0;
+                for (auto &kv : roomDemand) {
+                    const int rid = kv.first;
+                    auto anchIt = roomAnchors.find(rid);
+                    if (anchIt == roomAnchors.end()
+                        || anchIt->second.empty()) {
+                        // Zero-probe room: an inter-door connector volume
+                        // (by-design zero-probe — runtime door validation
+                        // owns it, [BAKE_PARITY] grades it door-adjacent)
+                        // or a room the thin-room repair just reported
+                        // unrepairable, loudly. The fill does not adopt
+                        // either class.
+                        continue;
+                    }
+                    std::vector<Vector3> &anchors = anchIt->second;
+                    for (auto &d : kv.second)
+                        d.bestFt = coverageOf(d, anchors);
+
+                    auto sitesIt = roomSites.find(rid);
+                    std::vector<Vector3> noSites;
+                    std::vector<Vector3> &sites =
+                        (sitesIt != roomSites.end()) ? sitesIt->second
+                                                     : noSites;
+                    std::vector<char> siteUsed(sites.size(), 0);
+
+                    // Worst REACHABLE PORTAL demand — the routing-coverage
+                    // metric the fill targets (§14: portal->nearest-anchor is
+                    // the governing metric AND the only distance visRange has
+                    // to cover; floor samples are passive beneficiaries, never
+                    // drivers). kInf (occlusion-unreachable) demand is excluded
+                    // from the headline: no probe can cover a point every
+                    // anchor is walled off from, so it must not read as
+                    // "uncovered demand the fill left behind".
+                    float worstBeforeFt = 0.0f;
+                    for (const auto &d : kv.second)
+                        if (d.isPortal && d.bestFt != kInf)
+                            worstBeforeFt = std::max(worstBeforeFt, d.bestFt);
+
+                    int added = 0;
+                    while (added < kPathingHubFillMaxPerRoom) {
+                        // Farthest uncovered, non-stuck PORTAL demand point.
+                        // §14 over-fire fix (PLAN.PATHING_DESIGN.md §13): the
+                        // two guards below are the whole correction —
+                        //   • isPortal — routing coverage (portal->nearest-
+                        //     anchor) governs the fill AND is exactly what
+                        //     visRange must cover; floor samples get improved
+                        //     passively by the update loop below but never
+                        //     TRIGGER a probe. Floor-chasing was the +152
+                        //     probes / 72-room over-fire on MISS2 (vs the 3
+                        //     genuine hub rooms 18/22/380).
+                        //   • bestFt != kInf — an occlusion-unreachable point
+                        //     (every anchor walled off from it) cannot be
+                        //     covered by ANY probe, so it must not drive an
+                        //     addition. kInf is always > rCovFt, so before this
+                        //     guard it was selected as `far` in 69/72 MISS2
+                        //     rooms whose worst REACHABLE demand was already
+                        //     under R_cov — a probe added, then marked stuck.
+                        //     Such demand is left to the clamp ceiling and
+                        //     graded by [BAKE_PARITY] (governingUnreachable).
+                        DemandPoint *far = nullptr;
+                        for (auto &d : kv.second) {
+                            if (d.stuck) continue;
+                            if (!d.isPortal) continue;
+                            if (d.bestFt == kInf) continue;
+                            if (d.bestFt <= rCovFt) continue;
+                            if (!far || d.bestFt > far->bestFt) far = &d;
+                        }
+                        if (!far) break;  // all portals covered (or stuck)
+
+                        // Nearest usable site to it. "Usable" = unused,
+                        // outside every door AABB, not stacked on an
+                        // existing anchor, and strictly closer than the
+                        // demand's current best (otherwise it cannot
+                        // improve the point that selected it).
+                        int   bestSite   = -1;
+                        float bestSiteSq = (far->bestFt == kInf)
+                            ? std::numeric_limits<float>::max()
+                            : far->bestFt * far->bestFt;
+                        for (size_t si = 0; si < sites.size(); ++si) {
+                            if (siteUsed[si]) continue;
+                            const Vector3 dv = sites[si] - far->pos;
+                            const float distSq = glm::dot(dv, dv);
+                            if (distSq >= bestSiteSq) continue;
+                            if (far->isPortal
+                                && distSq < kOwnFlankExclusionSq) continue;
+                            bool stacked = false;
+                            for (const Vector3 &a : anchors) {
+                                const Vector3 av = sites[si] - a;
+                                if (glm::dot(av, av) < kSiteMinSeparationSq) {
+                                    stacked = true;
+                                    break;
+                                }
+                            }
+                            if (stacked) continue;
+                            if (insideDoorAABB(sites[si]) >= 0) continue;
+                            bestSite   = static_cast<int>(si);
+                            bestSiteSq = distSq;
+                        }
+                        if (bestSite < 0) {
+                            far->stuck = true;
+                            ++stuckDemandTotal;
+                            continue;
+                        }
+
+                        siteUsed[bestSite] = 1;
+                        const Vector3 sitePos = sites[bestSite];
+                        PathingProbeCandidate cand;
+                        cand.position = sitePos;
+                        // Placeholder — the adaptive radius pass below
+                        // assigns the real value.
+                        cand.radiusFt = 5.0f;
+                        cand.purpose  = PathingProbePurpose::HubFill;
+                        params.pathingCandidates.push_back(cand);
+                        anchors.push_back(sitePos);
+                        ++added;
+
+                        // Update every demand point the new anchor could
+                        // improve (one ray each, only when closer than
+                        // the current best).
+                        const float farBeforeFt = far->bestFt;
+                        for (auto &d : kv.second) {
+                            const Vector3 dv = sitePos - d.pos;
+                            const float distSq = glm::dot(dv, dv);
+                            if (d.isPortal && distSq < kOwnFlankExclusionSq)
+                                continue;
+                            const float dist = std::sqrt(distSq);
+                            if (dist >= d.bestFt) continue;
+                            if (!blockedRay(d.pos, sitePos))
+                                d.bestFt = dist;
+                        }
+                        // The probe was placed FOR `far`; if it didn't
+                        // move that point's coverage (occlusion), don't
+                        // keep chasing it — mark it stuck, loudly counted.
+                        if (far->bestFt >= farBeforeFt - 1.0f
+                            && far->bestFt > rCovFt) {
+                            far->stuck = true;
+                            ++stuckDemandTotal;
+                        }
+                    }
+                    if (added >= kPathingHubFillMaxPerRoom) {
+                        std::fprintf(stderr,
+                            "[FALLBACK] pathing hub fill: room %d hit the "
+                            "per-room cap (%d probes) with demand still "
+                            "uncovered — residual coverage feeds the "
+                            "[PATHING_BAKE_RANGE] derivation below\n",
+                            rid, kPathingHubFillMaxPerRoom);
+                    }
+                    if (added > 0) {
+                        // Portal-only worst/residual — the fill now targets
+                        // portal coverage exclusively, so the headline before/
+                        // after and the residual-unreachable count report that
+                        // same governing quantity (a floor sample can be
+                        // arbitrarily far or walled off without meaning the
+                        // fill failed).
+                        float worstAfterFt = 0.0f;
+                        int   residualInf  = 0;
+                        for (const auto &d : kv.second) {
+                            if (!d.isPortal) continue;
+                            if (d.bestFt == kInf) { ++residualInf; continue; }
+                            worstAfterFt = std::max(worstAfterFt, d.bestFt);
+                        }
+                        fillProbesTotal += added;
+                        ++fillRoomsTotal;
+                        // Loud + unconditional: the §10 expectation is
+                        // ~3 rooms game-wide — every room the fill fires
+                        // in must be visible in the bake log.
+                        std::fprintf(stderr,
+                            "[PATHING_HUB_FILL] room %d: +%d interior "
+                            "probes (worst PORTAL demand %.0f -> %.0f ft, "
+                            "R_cov=%.0f ft, demand=%zu [portals+floor], "
+                            "sites=%zu, portal-unreachable=%d)\n",
+                            rid, added, worstBeforeFt, worstAfterFt,
+                            rCovFt, kv.second.size(), sites.size(),
+                            residualInf);
+                    }
+                }
+
+                // ── Coverage-based visRange derivation (post-fill) ──────
+                // governing = max over rooms of (max PORTAL demand →
+                // nearest same-room anchor). Floor demand shaped the fill
+                // but does not govern the cap — §10's governing metric is
+                // portal attachment (routes enter rooms through portals;
+                // floor coverage matters for listener containment, which
+                // influence radii — not edge length — provide).
+                float governingFt   = 0.0f;
+                int   governingRoom = -1;
+                int   governingUnreachable = 0;
+                for (const auto &kv : roomDemand) {
+                    auto anchIt = roomAnchors.find(kv.first);
+                    if (anchIt == roomAnchors.end()
+                        || anchIt->second.empty()) continue;
+                    for (const auto &d : kv.second) {
+                        if (!d.isPortal) continue;
+                        if (d.bestFt == kInf) {
+                            // No visible in-room anchor at all — the
+                            // clamp ceiling is this demand's only cover;
+                            // counted loudly below, judged by
+                            // [BAKE_PARITY].
+                            ++governingUnreachable;
+                            continue;
+                        }
+                        if (d.bestFt > governingFt) {
+                            governingFt   = d.bestFt;
+                            governingRoom = kv.first;
+                        }
+                    }
+                }
+
+                const float visRangeFt = std::min(
+                    std::max(governingFt * kPathingCoverageMarginMul,
+                             kPathingCoverageVisRangeMinFt),
+                    kPathingCoverageVisRangeMaxFt);
+                params.pathingVisRangeFt  = visRangeFt;
+                mDerivedPathingVisRangeFt = visRangeFt;
+                params.pathingCoverageFt  = governingFt;
+                params.pathingRCovFt      = rCovFt;
+                // Loud + unconditional: the entire pathing bake-cost and
+                // runtime-search-space story hangs off this one number,
+                // and a surprising derivation (fill capped out, blocked
+                // demand) must be visible in every bake log.
+                std::fprintf(stderr,
+                    "[PATHING_BAKE_RANGE] coverage-derived single-edge "
+                    "visRange cap %.0f ft (governing=%.0f ft = max "
+                    "portal->nearest-same-room-anchor POST-fill, room %d; "
+                    "R_cov=%.0f ft, hub fill +%d probes in %d rooms, "
+                    "stuck-demand=%d, no-visible-anchor-portal-demand=%d, "
+                    "margin x%.1f, clamp [%.0f, %.0f]); pathRange stays "
+                    "whole-level\n",
+                    visRangeFt, governingFt, governingRoom, rCovFt,
+                    fillProbesTotal, fillRoomsTotal, stuckDemandTotal,
+                    governingUnreachable, kPathingCoverageMarginMul,
+                    kPathingCoverageVisRangeMinFt,
+                    kPathingCoverageVisRangeMaxFt);
             }
 
             // Adaptive radius — overlap-favoring, room-radius-floored:
@@ -17210,18 +17837,19 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     std::vector<float> r;
                     const char *name;
                 };
-                Acc accs[5] = {
+                Acc accs[6] = {
                     { {}, "Portal"     },
                     { {}, "DoorPair"   },
                     { {}, "Centroid"   },
                     { {}, "Emitter"    },
                     { {}, "PortalPair" },
+                    { {}, "HubFill"    },
                 };
                 for (const auto &c : params.pathingCandidates) {
                     int idx = static_cast<int>(c.purpose);
-                    if (idx >= 0 && idx < 5) accs[idx].r.push_back(c.radiusFt);
+                    if (idx >= 0 && idx < 6) accs[idx].r.push_back(c.radiusFt);
                 }
-                for (int i = 0; i < 5; ++i) {
+                for (int i = 0; i < 6; ++i) {
                     auto &a = accs[i];
                     if (a.r.empty()) {
                         AUDIO_LOG("[PROBE_BAKE] %s: 0 probes\n", a.name);
@@ -17363,6 +17991,25 @@ bool AudioService::pathingBakeDensityMismatch() const
 {
     if (!mProbeManager || !mProbeManager->hasPathing()) return false;
     return mProbeManager->getBakedPathingDensity() != mPathingProbeDensity;
+}
+
+//------------------------------------------------------
+bool AudioService::pathingBakeCoverageMismatch() const
+{
+    if (!mProbeManager || !mProbeManager->hasPathing()) return false;
+    // Exact-representation compare is fine: both sides are the same
+    // compile-time constant round-tripped verbatim through the v5
+    // header. A v4 file (or a pre-coverage layout re-recorded with 0)
+    // reads back 0.0f and always mismatches — that is the intended
+    // loud upgrade path (see ProbeFile.h's v4 section).
+    return mProbeManager->getBakedPathingRCovFt()
+        != kPathingCoverageRadiusFt;
+}
+
+//------------------------------------------------------
+float AudioService::getBakedPathingRCovFt() const
+{
+    return mProbeManager ? mProbeManager->getBakedPathingRCovFt() : 0.0f;
 }
 
 //------------------------------------------------------

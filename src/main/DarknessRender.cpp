@@ -84,6 +84,7 @@
 #include "physics/PhysicsService.h"
 #include "audio/AudioLog.h"
 #include "audio/AudioService.h"
+#include "audio/SteamAudioPathing.h" // kPathingCoverageRadiusFt (bake-decision mismatch banner)
 #include "audio/AcousticMaterials.h"
 #include "audio/ProbeFile.h"
 #include "audio/ProbeManager.h"
@@ -492,6 +493,12 @@ static void printHelp() {
         "                    DEV-ONLY: with --stress-doors armed, toggle exactly\n"
         "                    these door object IDs each cycle instead of the\n"
         "                    nearest-N pick (detour-class hypothesis runs).\n"
+        "  --spawn-override \"x,y,z[,yaw]\"\n"
+        "                    DEV-ONLY: force the camera/player start to this\n"
+        "                    engine-feet position instead of the mission spawn\n"
+        "                    (positioned diagnostic runs, e.g. door-stress while\n"
+        "                    standing in a specific room). Loud [SPAWN_OVERRIDE]\n"
+        "                    banner.\n"
         "  --audio-log       Enable audio log verbosity (= developer.audio_log\n"
         "                    in YAML). Required for [PERF *] histogram capture —\n"
         "                    perf runs are dark without it.\n"
@@ -5552,6 +5559,32 @@ int main(int argc, char *argv[]) {
                 audioSvc->setForcePathingBake(true);
                 state.probeBakePath = probePath;
                 state.probeBakeNeeded = true;
+            } else if (audioSvc->pathingBakeCoverageMismatch()) {
+                // ── [PATHING_BAKE_MISMATCH] coverage-radius mismatch ──
+                //
+                // Same policy as the numSamples/density mismatches: the
+                // .probes v5 header records the hub-fill coverage radius
+                // (R_cov) the pathing layout + coverage-derived visRange
+                // were baked under; it differs from the active
+                // kPathingCoverageRadiusFt. v4 files land here too (they
+                // read back R_cov=0): their pre-coverage layout has no
+                // HubFill probes and a max-span-derived visRange, so
+                // re-bake the pathing section now, loudly, carrying the
+                // reflection IRs forward unchanged (the payload format
+                // did not change across v4→v5).
+                std::fprintf(stderr,
+                    "[PATHING_BAKE_MISMATCH] .probes '%s' pathing section "
+                    "was baked under coverage radius R_cov=%.0f ft but the "
+                    "active kPathingCoverageRadiusFt is %.0f ft (0 = "
+                    "pre-coverage v4 layout) — scheduling an automatic "
+                    "pathing-only re-bake (reflection IRs carried "
+                    "forward).\n",
+                    probePath.c_str(),
+                    audioSvc->getBakedPathingRCovFt(),
+                    Darkness::kPathingCoverageRadiusFt);
+                audioSvc->setForcePathingBake(true);
+                state.probeBakePath = probePath;
+                state.probeBakeNeeded = true;
             }
         } else {
             std::fprintf(stderr, "Probe baking skipped (--no-probes)\n");
@@ -5591,6 +5624,15 @@ int main(int argc, char *argv[]) {
                            const Darkness::Vector3 &to,
                            Darkness::RayHit &hit) {
                     return Darkness::raycastWorld(mission.wrData, from, to, hit);
+                });
+            // The world's own definition of "in open space": is the point
+            // inside a WR cell? Cells are air; solid is their absence. Probe
+            // placement needs this because ROOM_DB boxes overlap solid and
+            // cannot answer it (see AudioService::setPointInAirFn).
+            audioSvcForRay->setPointInAirFn(
+                [&mission](const Darkness::Vector3 &p) {
+                    return Darkness::findCameraCell(mission.wrData,
+                                                    p.x, p.y, p.z) >= 0;
                 });
             // loadProbes ran BEFORE setRaycaster (above), so the first
             // pathing-adjacency build attempt was a no-op fallback. Now
@@ -6394,6 +6436,30 @@ int main(int argc, char *argv[]) {
 
     // ── Initialize runtime state: mode string, model isolation, spawn/camera ──
     initRuntimeState(mission, meshes, gpu, camX, camY, camZ, state);
+
+    // DEV-ONLY --spawn-override "x,y,z[,yaw]": place the camera/player at
+    // an explicit position instead of the mission's PlayerFactory marker.
+    // Diagnostic companion to --stress-doors / --auto-run — positioned
+    // runtime measurements (e.g. the PLAN.PATHING_DESIGN.md §10
+    // door-stress-while-standing-in-a-hub-room cell) need the listener
+    // parked in a SPECIFIC room, and nothing ships a teleport. Loud
+    // banner per feedback_no_silent_fallbacks: a run that silently
+    // starts somewhere other than the mission spawn would corrupt any
+    // comparison against a normal run.
+    if (cfg.spawnOverride) {
+        std::fprintf(stderr,
+            "[SPAWN_OVERRIDE] DEV: camera/player start forced to "
+            "(%.1f, %.1f, %.1f) yaw=%.1f (mission spawn was "
+            "%.1f, %.1f, %.1f)\n",
+            cfg.spawnOverrideX, cfg.spawnOverrideY, cfg.spawnOverrideZ,
+            cfg.spawnOverrideYaw, state.spawnX, state.spawnY, state.spawnZ);
+        state.spawnX  = cfg.spawnOverrideX;
+        state.spawnY  = cfg.spawnOverrideY;
+        state.spawnZ  = cfg.spawnOverrideZ;
+        state.spawnYaw = cfg.spawnOverrideYaw;
+        state.cam.init(state.spawnX, state.spawnY, state.spawnZ);
+        state.cam.yaw = state.spawnYaw;
+    }
 
     // Initialize physics player at spawn position.
     // Use the camera position (eye level) directly as initial body center.

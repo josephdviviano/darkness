@@ -76,6 +76,9 @@
 #include "audio/ProbeManager.h"
 #include "WRChunkParser.h"
 #include "TXListParser.h"
+// findCameraCell — the WR cell lookup raycastWorld does before tracing.
+// bgfx-free (see RayCaster.h), so it is safe in the headless binary.
+#include "CellGeometry.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -419,6 +422,176 @@ static void printRoomGraph() {
                 "zero_pdist_pairs=%d\n",
                 roomCount, portalDirected, zeroPortalRooms, nullPortals,
                 nullFarRooms, zeroPDistPairs);
+}
+
+// ---------- Probe / WR-cell containment audit ----------
+//
+// `probe_cell_audit` answers exactly one question: do probe positions land
+// INSIDE the WR cell network that raycastWorld traverses?
+//
+// WHY THIS EXISTS: probes are placed from ROOM_DB (room centroids, portal
+// centers) — a DIFFERENT spatial partition than the WR cells the raycaster
+// walks. raycastWorld's first step is to locate the cell containing the ray
+// ORIGIN; when that lookup fails it bails immediately (`if (curCell < 0)
+// return false;`) WITHOUT TESTING ANY GEOMETRY, and callers read that false
+// as "no hit" == clear line of sight. A probe outside the cell network
+// therefore reports a clear path to every other probe in range — straight
+// through solid world geometry. This audit counts that condition; it is the
+// prime suspect for the pathing-graph edges observed passing through giant
+// world geometry.
+//
+// Records (space-separated, one per line):
+//   PROBE <index> <x> <y> <z> <cell>
+//       real baked probe positions, read from a `.probes.*.positions.csv`
+//       sidecar (index,x,y,z,radiusFt). Ground truth — needs a bake.
+//   CAND room <roomID> <x> <y> <z> <cell>
+//       ROOM_DB room center. NOTE: a PROXY — the real centroid probe sits at
+//       floor+5 ft (or the vertical midpoint in short rooms), not the raw
+//       geometric center. Indicative, not exact.
+//   CAND portal <nearRoomID> <farRoomID> <x> <y> <z> <cell>
+//       ROOM_DB portal center — EXACT: portal/door probes are placed at this
+//       point (baseline) or flanking it along the normal (bends).
+//   cell == -1 => findCameraCell found no containing cell => a ray cast FROM
+//       this point is never actually traced.
+//   CELLAUDIT_SUMMARY ...
+//
+// The CAND records need no bake, so this runs across every shipping level.
+// Gap from a point to the nearest cell's bounding sphere, in engine feet.
+// Distinguishes WHY a point failed findCameraCell:
+//   gap <= 0  => the point is inside some cell's bounding sphere but outside
+//               every cell's convex hull => it is IN SOLID, wedged in/behind
+//               a wall between air cells. A bad probe: Steam Audio would also
+//               trace its rays from inside geometry.
+//   gap >  0  => outside every bounding sphere => deep solid, or off-map.
+// (Cells are AIR volumes; solid is the absence of cells — so "outside all
+// cells" always means "not in open space".)
+static float nearestCellGapFt(const Darkness::WRParsedData &wr,
+                              float x, float y, float z) {
+    float best = 1e30f;
+    for (uint32_t i = 0; i < wr.numCells; ++i) {
+        const auto &c = wr.cells[i];
+        const float dx = x - c.center.x;
+        const float dy = y - c.center.y;
+        const float dz = z - c.center.z;
+        const float gap = std::sqrt(dx * dx + dy * dy + dz * dz) - c.radius;
+        if (gap < best) best = gap;
+    }
+    return best;
+}
+
+static void printProbeCellAudit(const std::string &misPath,
+                                const std::string &positionsCsv) {
+    Darkness::WRParsedData wr;
+    try {
+        wr = Darkness::parseWRChunk(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr,
+            "probe_cell_audit: failed to parse WR chunk in '%s': %s\n",
+            misPath.c_str(), e.what());
+        return;
+    }
+    if (wr.numCells == 0) {
+        std::fprintf(stderr,
+            "probe_cell_audit: '%s' has 0 WR cells — nothing to test against\n",
+            misPath.c_str());
+        return;
+    }
+
+    int total = 0, outside = 0;
+    int outsideInSolid = 0, outsideOffMap = 0;
+    int roomTotal = 0, roomOutside = 0;
+    int portalTotal = 0, portalOutside = 0;
+
+    if (!positionsCsv.empty()) {
+        // Ground-truth mode: audit the REAL baked probe positions.
+        std::ifstream in(positionsCsv);
+        if (!in) {
+            std::fprintf(stderr,
+                "probe_cell_audit: cannot open positions CSV '%s'\n",
+                positionsCsv.c_str());
+            return;
+        }
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            if (line.compare(0, 6, "index,") == 0) continue;   // header row
+            // index,x,y,z,radiusFt
+            int idx = 0; float x = 0, y = 0, z = 0, r = 0;
+            if (std::sscanf(line.c_str(), "%d,%f,%f,%f,%f",
+                            &idx, &x, &y, &z, &r) < 4) continue;
+            const int32_t cell = Darkness::findCameraCell(wr, x, y, z);
+            ++total;
+            if (cell < 0) {
+                ++outside;
+                const float gap = nearestCellGapFt(wr, x, y, z);
+                if (gap <= 0.0f) ++outsideInSolid; else ++outsideOffMap;
+                std::printf("PROBE %d %.3f %.3f %.3f %d gap=%.2f %s\n",
+                            idx, x, y, z, cell, gap,
+                            gap <= 0.0f ? "IN_SOLID" : "OFF_MAP");
+            } else {
+                std::printf("PROBE %d %.3f %.3f %.3f %d\n", idx, x, y, z, cell);
+            }
+        }
+    } else {
+        // No-bake mode: audit ROOM_DB-derived candidate positions.
+        RoomServicePtr roomSvc = GET_SERVICE(RoomService);
+        if (!roomSvc || !roomSvc->isLoaded()) {
+            std::cerr << "probe_cell_audit: RoomService not loaded — does this "
+                         "database have ROOM_DB?\n";
+            return;
+        }
+        const auto &rooms = roomSvc->getAllRooms();
+        for (const auto &roomPtr : rooms) {
+            if (!roomPtr) continue;
+            const int roomID = roomPtr->getRoomID();
+            const Vector3 c = roomPtr->getCenter();
+            int32_t cell = Darkness::findCameraCell(wr, c.x, c.y, c.z);
+            ++total; ++roomTotal;
+            if (cell < 0) {
+                ++outside; ++roomOutside;
+                const float gap = nearestCellGapFt(wr, c.x, c.y, c.z);
+                if (gap <= 0.0f) ++outsideInSolid; else ++outsideOffMap;
+                std::printf("CAND room %d %.3f %.3f %.3f %d gap=%.2f %s\n",
+                            roomID, c.x, c.y, c.z, cell, gap,
+                            gap <= 0.0f ? "IN_SOLID" : "OFF_MAP");
+            } else {
+                std::printf("CAND room %d %.3f %.3f %.3f %d\n",
+                            roomID, c.x, c.y, c.z, cell);
+            }
+
+            const uint32_t pc = roomPtr->getPortalCount();
+            for (uint32_t i = 0; i < pc; ++i) {
+                ::Darkness::RoomPortal *p = roomPtr->getPortal(i);
+                if (!p) continue;
+                ::Darkness::Room *far = p->getFarRoom();
+                const Vector3 pcen = p->getCenter();
+                cell = Darkness::findCameraCell(wr, pcen.x, pcen.y, pcen.z);
+                ++total; ++portalTotal;
+                if (cell < 0) {
+                    ++outside; ++portalOutside;
+                    const float gap = nearestCellGapFt(wr, pcen.x, pcen.y, pcen.z);
+                    if (gap <= 0.0f) ++outsideInSolid; else ++outsideOffMap;
+                    std::printf("CAND portal %d %d %.3f %.3f %.3f %d gap=%.2f %s\n",
+                                roomID, far ? far->getRoomID() : -1,
+                                pcen.x, pcen.y, pcen.z, cell, gap,
+                                gap <= 0.0f ? "IN_SOLID" : "OFF_MAP");
+                } else {
+                    std::printf("CAND portal %d %d %.3f %.3f %.3f %d\n",
+                                roomID, far ? far->getRoomID() : -1,
+                                pcen.x, pcen.y, pcen.z, cell);
+                }
+            }
+        }
+    }
+
+    const double pct = total ? (100.0 * outside / total) : 0.0;
+    std::printf("CELLAUDIT_SUMMARY cells=%u tested=%d outside=%d pct=%.2f "
+                "in_solid=%d off_map=%d "
+                "room_tested=%d room_outside=%d portal_tested=%d "
+                "portal_outside=%d\n",
+                wr.numCells, total, outside, pct,
+                outsideInSolid, outsideOffMap,
+                roomTotal, roomOutside, portalTotal, portalOutside);
 }
 
 // ---------- Ambient sound dump ----------
@@ -2433,7 +2606,7 @@ static int runProbePlanVerb(const std::string &misPath,
     int postDedup = static_cast<int>(plan.pathingKept.size());
     std::fprintf(stdout,
         "[PROBE_PLAN] pathing [density=%s]: Portal=%d PortalPair=%d "
-        "DoorPair=%d Centroid=%d Emitter=%d  postDedup=%d\n",
+        "DoorPair=%d Centroid=%d Emitter=%d HubFill=%d  postDedup=%d\n",
         Darkness::pathingProbeDensityName(
             audioSvc->getPathingProbeDensity()),
         getPurpose(Darkness::PathingProbePurpose::Portal),
@@ -2441,6 +2614,7 @@ static int runProbePlanVerb(const std::string &misPath,
         getPurpose(Darkness::PathingProbePurpose::DoorPair),
         getPurpose(Darkness::PathingProbePurpose::Centroid),
         getPurpose(Darkness::PathingProbePurpose::Emitter),
+        getPurpose(Darkness::PathingProbePurpose::HubFill),
         postDedup);
 
     std::fprintf(stdout,
@@ -2620,6 +2794,14 @@ static void printUsage(const char *prog) {
     std::cerr << "  room-info <id> [<id> ...]" << std::endl;
     std::cerr << "                    Dump OBB planes, portal list, and portal-to-portal" << std::endl;
     std::cerr << "                    distance matrix for each given room ID." << std::endl;
+    std::cerr << "  probe_cell_audit [positions.csv]" << std::endl;
+    std::cerr << "                    Do probe positions land inside the WR cell network that" << std::endl;
+    std::cerr << "                    raycastWorld traverses? A position outside every cell makes" << std::endl;
+    std::cerr << "                    raycastWorld bail before tracing any geometry and report" << std::endl;
+    std::cerr << "                    'no hit' — i.e. a clear line of sight through solid walls." << std::endl;
+    std::cerr << "                    With a .probes.*.positions.csv sidecar: audits the REAL baked" << std::endl;
+    std::cerr << "                    probes. Without: audits ROOM_DB room/portal centers (no bake" << std::endl;
+    std::cerr << "                    needed, so it runs on any level)." << std::endl;
     std::cerr << "  room_graph        Dump the whole ROOM_DB portal graph as machine-readable" << std::endl;
     std::cerr << "                    ROOM / PORTAL / PDIST lines (room centers, portal centers," << std::endl;
     std::cerr << "                    degrees, intra-room portal-to-portal distances). Consumed" << std::endl;
@@ -2740,6 +2922,7 @@ int main(int argc, char *argv[]) {
                           command == "trace-path" ||
                           command == "room-info" ||
                           command == "room_graph" ||
+                          command == "probe_cell_audit" ||
                           command == "ambients" ||
                           command == "prop-dump" ||
                           command == "sound-desc" ||
@@ -2836,6 +3019,16 @@ int main(int argc, char *argv[]) {
             (void)GET_SERVICE(RoomService);
             loadDatabase(dbFile);
             printRoomGraph();
+        } else if (command == "probe_cell_audit") {
+            initServices();
+            loadSchema(scriptsDir);
+            // Same rationale as room_graph: force RoomService instantiation
+            // BEFORE loadDatabase so ROOM_DB is actually parsed. (Only the
+            // no-CSV candidate mode needs it, but the cost is trivial.)
+            (void)GET_SERVICE(RoomService);
+            loadDatabase(dbFile);
+            printProbeCellAudit(dbFile,
+                positionalArgs.size() > 2 ? positionalArgs[2] : std::string());
         } else if (command == "sound_db") {
             // sound_db: walks the schema directory; optionally applies
             // P$SchAttFac/SchPlayPa overrides from dbFile when present.

@@ -478,6 +478,28 @@ public:
                                               RayHit &hit)>;
     void setRaycaster(AudioRaycastFn fn) { mRaycaster = std::move(fn); }
 
+    /** Is this point inside the world's open space (a WR cell)?
+     *
+     *  WR cells are AIR volumes carved by the level compiler; SOLID is
+     *  simply their absence. The original engine treats a point's cell as
+     *  part of its identity (a Location is a position PLUS the cell it is
+     *  in), so "is there a cell here?" IS the engine's own definition of
+     *  being in the world.
+     *
+     *  This exists because `RoomService::roomFromPoint()` cannot answer that
+     *  question: ROOM_DB rooms are coarse designer-drawn boxes that overlap
+     *  solid geometry freely, and nothing aligns them to the compiled cells.
+     *  Using roomFromPoint as a solidity test baked 3.6% of pathing probes
+     *  (46 on MISS2, 28 on MISS6) INSIDE walls; rays cast from a point with
+     *  no cell are never traced and silently report "clear", which produced
+     *  ~11.6k phantom graph edges (~37% of MISS2's graph).
+     *
+     *  Renderer-supplied (WR data lives in the renderer), mirroring
+     *  setRaycaster. When unset (headless), probe placement announces the
+     *  degradation loudly rather than silently trusting the box test. */
+    using AudioPointInAirFn = std::function<bool(const Vector3 &p)>;
+    void setPointInAirFn(AudioPointInAirFn fn) { mPointInAirFn = std::move(fn); }
+
     /** Play a footstep sound for a specific material and speed.
      *  Selects a schema via env_tag matching: (Event Footstep) + (Material <keyword>).
      *  When in water, overrides material with water-specific schema tags.
@@ -1048,6 +1070,23 @@ public:
      *  site. */
     PathingProbeDensity getBakedPathingDensity() const;
 
+    /** True when the loaded .probes pathing section was baked under a
+     *  hub-fill coverage radius (v5 header bakedPathingRCovFt) that
+     *  differs from the active kPathingCoverageRadiusFt — including v4
+     *  files, which read back 0: their pre-coverage layout has no
+     *  HubFill probes and a max-span-derived visRange. Same handling as
+     *  pathingBakeSamplesMismatch: the bake-decision site
+     *  (DarknessRender.cpp) schedules a loud automatic pathing-only
+     *  re-bake (reflection IRs carried forward — the v4 payload format
+     *  is unchanged). False when no pathing batch is loaded. */
+    bool pathingBakeCoverageMismatch() const;
+
+    /** Facade over ProbeManager::getBakedPathingRCovFt — the hub-fill
+     *  coverage radius recorded in the loaded/just-baked .probes v5
+     *  header (0 = none / v4 file). For mismatch diagnostics at the
+     *  bake-decision site. */
+    float getBakedPathingRCovFt() const;
+
     /** Snapshot of probe positions in feet (engine units). Populated by
      *  bakeProbes() and loadProbes(); empty if no probes are loaded. Used
      *  by the renderer to draw a debug overlay. The vector is rebuilt on
@@ -1418,6 +1457,11 @@ private:
     // voice's nearest-probe LOS is actually blocked by world geometry.
     // Not on any hot path; only fires inside the gated diagnostic block.
     AudioRaycastFn mRaycaster;
+
+    // Renderer-injected "is this point in a WR cell (open space)?" test.
+    // The REAL solidity test for probe placement — see setPointInAirFn.
+    // Bake-time only; null in headless (announced loudly at bake).
+    AudioPointInAirFn mPointInAirFn;
 
     // ── Volumetric occlusion configuration ──
     //

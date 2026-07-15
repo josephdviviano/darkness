@@ -472,6 +472,23 @@ struct ActiveVoice {
     bool     pathWantedLastTick = false;    // pathingWanted at last due tick
     bool     pathStagedEnabled = false;     // mirrors SA-side pathingInputs.enabled
 
+    // ── Lever D: warmup first-solve stagger (main-thread only) ──
+    //
+    // PLAN.PATHING_DESIGN.md §16. While pathEverSolved is false this voice
+    // belongs to the deferrable first-solve class: the staging pass admits
+    // at most kPathingFirstSolvesPerIteration of them per signaled
+    // iteration (SA's unbounded alternate-search drains cost ~170 ms each
+    // and warmup stages ~10 at once — §15). This counts how many signaled
+    // ticks have deferred THIS voice, and is the PRIMARY selection key
+    // (highest first = aging), which is what bounds the wait: a voice's
+    // count only rises while it waits, newly-spawned voices enter at 0 and
+    // therefore rank BELOW it, and the fixed cohort ahead of it drains at
+    // the cap per tick. Audibility only breaks ties WITHIN an age cohort,
+    // so it can reorder but never starve. Dead once the voice solves
+    // (pathEverSolved latches true and never clears), so it is never
+    // reset.
+    uint32_t pathFirstSolveDeferrals = 0;
+
     // ── O2a review F3 — out-of-range re-entry staleness gate ──
     //
     // (Main-thread only, like the memo above.) While a voice sits beyond
