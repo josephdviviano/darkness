@@ -360,9 +360,13 @@ static void printRoomInfo(int roomID) {
 //
 // Output records (space-separated, one per line):
 //   ROOM <roomID> <cx> <cy> <cz> <portalCount>
-//   PORTAL <nearRoomID> <farRoomID> <px> <py> <pz>
+//   PORTAL <nearRoomID> <farRoomID> <px> <py> <pz> <inradiusFt> <edgeCount>
 //       one per directed portal; every physical portal appears twice
 //       (once per side) — consumers de-duplicate back-links.
+//       inradiusFt = distance from the portal center to its nearest bounding
+//       edge plane = HALF the portal's narrow dimension. Separates real
+//       architectural apertures (a 3 ft doorway ~= 1.5 ft) from ROOM_DB box
+//       boundaries standing in open space (10 ft+). -1 = no edge planes.
 //   PDIST <roomID> <i> <j> <dist>
 //       intra-room portal-to-portal distance for portal indices i<j,
 //       straight from the level compiler's precomputed matrix.
@@ -402,9 +406,31 @@ static void printRoomGraph() {
             ::Darkness::Room *far = p->getFarRoom();
             if (!far) ++nullFarRooms;
             const Vector3 pcen = p->getCenter();
-            std::printf("PORTAL %d %d %.3f %.3f %.3f\n",
+            // Aperture size = INRADIUS: the distance from the portal center
+            // to its nearest bounding edge plane, i.e. HALF the portal's
+            // NARROW dimension. RoomPortal stores no vertices — it is a
+            // plane plus a set of bounding edge planes — so this is the
+            // cheapest honest size metric available from the public API.
+            //   a 3 ft doorway      -> ~1.5 ft
+            //   a wide open boundary between two halves of one open volume
+            //                       -> 10 ft+
+            // This is what separates a REAL architectural aperture (where
+            // sound diffracts around a jamb, so bend pairs earn their cost)
+            // from a designer's ROOM_DB box boundary standing in mid-air
+            // (where a bend pair buys nothing and just densifies the graph).
+            float inradius = -1.0f;
+            const uint32_t ec = p->getEdgeCount();
+            for (uint32_t e = 0; e < ec; ++e) {
+                const Plane &ep = p->getEdgePlane(e);
+                const float n2 = glm::dot(ep.normal, ep.normal);
+                if (n2 < 1e-8f) continue;   // degenerate edge plane
+                const float dist = std::fabs(glm::dot(ep.normal, pcen) + ep.d)
+                                 / std::sqrt(n2);
+                if (inradius < 0.0f || dist < inradius) inradius = dist;
+            }
+            std::printf("PORTAL %d %d %.3f %.3f %.3f %.3f %u\n",
                         roomID, far ? far->getRoomID() : -1,
-                        pcen.x, pcen.y, pcen.z);
+                        pcen.x, pcen.y, pcen.z, inradius, ec);
             ++portalDirected;
         }
 
