@@ -3224,10 +3224,13 @@ static void registerConsoleSettings(
         // Stored as int on RuntimeState; categorical maps an option
         // index in [0..options.size()) onto our cap value. "all" → 0
         // (the sentinel selectClosestRooms reads as "no limit").
+        // 80 is the default (see RuntimeState::debugRoomMaxCount) — it MUST
+        // appear here or the getter below would fall back to reporting "20"
+        // while the cull actually ran at 80, i.e. the console would lie.
         static const std::vector<std::string> kCountOptions = {
-            "5", "10", "20", "50", "100", "all"
+            "5", "10", "20", "50", "80", "100", "all"
         };
-        static const std::vector<int> kCountValues = {5, 10, 20, 50, 100, 0};
+        static const std::vector<int> kCountValues = {5, 10, 20, 50, 80, 100, 0};
 
         dbgConsole.addCategorical("debug_room_max_count", kCountOptions,
             [&state]() -> int {
@@ -3235,13 +3238,13 @@ static void registerConsoleSettings(
                     if (kCountValues[i] == state.debugRoomMaxCount)
                         return static_cast<int>(i);
                 }
-                return 2;  // fall back to "20" (the default)
+                return 4;  // fall back to "80" (the default)
             },
             [&state](int idx) {
                 if (idx >= 0 && idx < static_cast<int>(kCountValues.size()))
                     state.debugRoomMaxCount = kCountValues[idx];
             },
-            "Cap rooms drawn by show_rooms / show_portals overlays to the camera-nearest N. 'all' disables the cull. Reduces visual clutter in dense levels.");
+            "Cap rooms drawn by show_rooms / show_portals / show_probes / show_probe_radius overlays to the camera-nearest N. 'all' disables the cull. Default 80: judging probe density by eye needs a whole open space and its neighbours visible at once. Lower it if the room/portal boxes get unreadable.");
     }
 
     dbgConsole.addBool("show_vpos",

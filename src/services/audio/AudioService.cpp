@@ -16178,6 +16178,17 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         /// emit pass keep only the closest portal per door.
         int   doorIdx    = -1;
         float doorDistSq = 0.0f;
+        /// Aperture size: distance from the portal center to its nearest
+        /// bounding edge plane = HALF the portal's narrow dimension.
+        /// (RoomPortal stores a plane + bounding edge planes, no vertices.)
+        /// Separates a REAL architectural aperture — a 4-6 ft doorway gives
+        /// ~2-3 ft, and the game-wide distribution spikes there (41% of all
+        /// portals) — from a ROOM_DB box boundary standing in open space
+        /// (10 ft+, up to 100 ft on MISS2). Sound diffracts around a real
+        /// jamb, so bend pairs earn their cost there; a box boundary in mid
+        /// air is a fictional aperture and its pair is pure density.
+        /// -1 = no usable edge planes.
+        float inradiusFt = -1.0f;
     };
     std::vector<PathingPortalRecord> pathingPortals;
     if (mProbePathingBatchEnabled && mRoomService) {
@@ -16357,6 +16368,19 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     }
                 }
 
+                // Aperture size (see PathingPortalRecord::inradiusFt).
+                float inradius = -1.0f;
+                const uint32_t ec = portal->getEdgeCount();
+                for (uint32_t e = 0; e < ec; ++e) {
+                    const Plane &ep = portal->getEdgePlane(e);
+                    const float n2 = glm::dot(ep.normal, ep.normal);
+                    if (n2 < 1e-8f) continue;   // degenerate edge plane
+                    const float dist =
+                        std::fabs(glm::dot(ep.normal, center) + ep.d)
+                        / std::sqrt(n2);
+                    if (inradius < 0.0f || dist < inradius) inradius = dist;
+                }
+
                 PathingPortalRecord rec;
                 rec.roomAID = static_cast<int>(roomA->getRoomID());
                 rec.roomBID = roomB
@@ -16366,6 +16390,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 rec.isDoor     = (bestDoor >= 0);
                 rec.doorIdx    = bestDoor;
                 rec.doorDistSq = bestDoorSq;
+                rec.inradiusFt = inradius;
                 pathingPortals.push_back(rec);
             }
         }
@@ -16423,6 +16448,52 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 best = static_cast<int>(i);
         }
 
+        // ...and the same rule for DOORLESS apertures, which the per-door
+        // grouping above cannot see.
+        //
+        // Most doorways/archways are modelled with a THRESHOLD SLAB: a ~1 ft
+        // connector room (cf. room 194) whose two faces are two separate
+        // ROOM_DB portals. Measured on MISS2: 47 clusters of emitting portals
+        // within 8 ft of each other, and EVERY one is non-door + non-door in
+        // the A<->T / T<->B pattern (e.g. 37<->341 and 341<->84, 1.0 ft apart,
+        // both 3.67 ft inradius). Both emitted a pair => 4 probes in a
+        // straight line through ONE opening. Doorless, so nothing grouped
+        // them; the door rule above only fires when a door is registered.
+        //
+        // Same-aperture test (geometry, since room identity provably fails —
+        // A<->T and T<->B are different room pairs): close, PARALLEL, and
+        // separated ALONG the normal, i.e. the front and back faces of one
+        // opening. The along-the-normal requirement is what distinguishes
+        // that from two genuinely different openings sitting side by side in
+        // the same wall (parallel and close, but displaced LATERALLY) —
+        // those are distinct routes and each keeps its own anchors.
+        constexpr float kSameApertureFt      = 4.0f;
+        constexpr float kSameApertureAlongMin = 0.7f;  // |cos| of offset vs normal
+        const float kSameApertureSq = kSameApertureFt * kSameApertureFt;
+        std::vector<int> apertureRep(pathingPortals.size(), -1);
+        for (size_t i = 0; i < pathingPortals.size(); ++i) {
+            if (pathingPortals[i].isDoor) continue;      // door rule owns these
+            if (apertureRep[i] >= 0) continue;           // already grouped
+            apertureRep[i] = static_cast<int>(i);        // representative
+            const PathingPortalRecord &a = pathingPortals[i];
+            for (size_t j = i + 1; j < pathingPortals.size(); ++j) {
+                if (pathingPortals[j].isDoor || apertureRep[j] >= 0) continue;
+                const PathingPortalRecord &b = pathingPortals[j];
+                const Vector3 d = b.center - a.center;
+                const float dist2 = glm::dot(d, d);
+                if (dist2 >= kSameApertureSq) continue;
+                if (std::fabs(glm::dot(a.unitNormal, b.unitNormal))
+                        < kSameOpeningParallelDot) continue;
+                const float dist = std::sqrt(dist2);
+                if (dist > 1e-4f) {
+                    const float alongFrac =
+                        std::fabs(glm::dot(d / dist, a.unitNormal));
+                    if (alongFrac < kSameApertureAlongMin) continue;
+                }
+                apertureRep[j] = static_cast<int>(i);    // same opening as i
+            }
+        }
+
         // Pass 2 — EMIT probes from the classified records. Pair-probes
         // carry a placeholder 3 ft radius so any code reading it
         // pre-adaptive-pass sees a sane value; the post-dedup pass
@@ -16431,6 +16502,8 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         int portalBendPairCount = 0;
         int portalPairSuppressed = 0;
         int doorPairSuppressed = 0;
+        int portalPairApertureDropped = 0;
+        int portalPairSlabSuppressed = 0;
         for (size_t recIdx = 0; recIdx < pathingPortals.size(); ++recIdx) {
             const PathingPortalRecord &rec = pathingPortals[recIdx];
             // One aperture, one pair: this door already has a nearer portal
@@ -16472,6 +16545,24 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     // DIFFERENT opening keeps its anchors — two doorways off
                     // one junction face different directions and are distinct
                     // routes, so neither suppresses the other.
+                    // Aperture-size rule: a wide ROOM_DB boundary is not an
+                    // architectural opening, it is a designer box edge —
+                    // frequently standing in open space, modelling nothing.
+                    // Sound only bends measurably around apertures near the
+                    // wavelength scale, so an elbow on a >12 ft "portal"
+                    // buys no fidelity and just densifies the graph.
+                    // Centroids still carry routing through it (user rule).
+                    // inradius -1 (unmeasurable) KEEPS its pair.
+                    if (rec.inradiusFt >= kPathingApertureBendThresholdFt) {
+                        portalPairApertureDropped += 2;
+                        continue;
+                    }
+                    // One aperture, one pair — doorless case: another face of
+                    // this same opening already carries its bend anchors.
+                    if (apertureRep[recIdx] != static_cast<int>(recIdx)) {
+                        portalPairSlabSuppressed += 2;
+                        continue;
+                    }
                     bool suppressed = false;
                     for (const PathingPortalRecord &dr : pathingPortals) {
                         if (!dr.isDoor) continue;
@@ -16487,6 +16578,20 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                         continue;
                     }
                 }
+                // [PORTAL_CLASS] — one line per portal that ACTUALLY emits a
+                // pair (post door/aperture suppression), with its aperture
+                // size. This is the ground truth for the bend-pair threshold
+                // sweep: which portals are real apertures (isDoor=1, or a
+                // small non-door opening) versus ROOM_DB box boundaries
+                // standing in open space. isDoor portals always keep their
+                // pair regardless of size — a door IS an aperture by
+                // definition (user rule, 2026-07-15).
+                AUDIO_LOG("[PORTAL_CLASS] rooms %d<->%d center=(%.1f,%.1f,%.1f) "
+                          "inradius=%.2f isDoor=%d\n",
+                          rec.roomAID, rec.roomBID,
+                          rec.center.x, rec.center.y, rec.center.z,
+                          rec.inradiusFt, rec.isDoor ? 1 : 0);
+
                 const PathingProbePurpose pairPurpose = rec.isDoor
                     ? PathingProbePurpose::DoorPair
                     : PathingProbePurpose::PortalPair;
@@ -16517,13 +16622,22 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                   "suppressed (same-room-pair DoorPair within %.0f ft — "
                   "compound openings); %d DoorPair probes (%d pairs) "
                   "suppressed (one aperture, one pair — extra ROOM_DB "
-                  "portals on the same door)\n",
+                  "portals on the same door); %d PortalPair probes (%d pairs) "
+                  "dropped (aperture >= %.0f ft inradius = wider than %.0f ft "
+                  "— ROOM_DB box boundary, not an architectural opening; "
+                  "centroids carry routing); %d PortalPair probes (%d pairs) "
+                  "suppressed (one aperture, one pair — extra face of a "
+                  "doorless threshold-slab opening)\n",
                   pathingProbeDensityName(mPathingProbeDensity),
                   portalCount, portalBendPairCount, portalBendPairCount / 2,
                   portalDoorPairCount, portalDoorPairCount / 2,
                   portalPairSuppressed, portalPairSuppressed / 2,
                   kSameOpeningSuppressFt,
-                  doorPairSuppressed, doorPairSuppressed / 2);
+                  doorPairSuppressed, doorPairSuppressed / 2,
+                  portalPairApertureDropped, portalPairApertureDropped / 2,
+                  kPathingApertureBendThresholdFt,
+                  kPathingApertureBendThresholdFt * 2.0f,
+                  portalPairSlabSuppressed, portalPairSlabSuppressed / 2);
 
         // ── Room centroid probes (emitted second; floor-anchored) ───────
         // Pathing probes are anchored at player ear height
@@ -17023,6 +17137,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 Room *r = mRoomService->roomFromPoint(p);
                 return r ? r->getRoomID() : -1;
             };
+
             std::vector<int> keptRoom;
             keptRoom.reserve(params.pathingCandidates.size());
             int crossRoomPreserved = 0;

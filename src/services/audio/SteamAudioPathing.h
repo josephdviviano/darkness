@@ -197,6 +197,42 @@ constexpr float kPathingCoverageVisRangeMaxFt = 200.0f;
 /// [BAKE_PARITY]).
 constexpr int kPathingHubFillMaxPerRoom = 24;
 
+/// ── Bend-pair aperture threshold ────────────────────────────────────────
+///
+/// A NON-DOOR portal whose aperture is at least this big gets NO flanking
+/// bend pair; the room centroids carry routing through it instead. Door
+/// portals ALWAYS keep their pair regardless of size — a door IS an
+/// aperture by definition, and its flanks are what the runtime invalidates
+/// when it closes (measured: 18 of 102 MISS2 door portals are >= 3 ft, the
+/// largest 10.5 ft, so a size rule without this exemption would strip real
+/// doors).
+///
+/// UNITS: this is an INRADIUS — the distance from the portal center to its
+/// nearest bounding edge plane, i.e. HALF the narrow dimension. 6 ft means
+/// "wider than 12 ft". A 4 ft doorway measures 2 ft; MISS2's largest portal
+/// measures 100 ft (a 200 ft-wide "opening").
+///
+/// WHY A SIZE RULE AT ALL: ROOM_DB is the original engine's DAMPENING
+/// partition, not an aperture graph. Its rooms are coarse designer boxes
+/// drawn over the compiled geometry, so a "portal" is just a box boundary —
+/// frequently standing in the middle of open space, modelling nothing. Room
+/// 18 (the sole degree-53 outlier in the game) has ZERO door portals and 42
+/// non-door ones with a median 5 ft inradius; each was emitting a bend pair,
+/// putting ~94 probes in open courtyard air and building the clique that
+/// makes findAlternatePaths (quadratic in local density) expensive. This is
+/// also why MISS2 (max inradius 100 ft, 4 portals >= 25 ft) costs 74x MISS6
+/// (max 22.7 ft, none >= 25 ft) despite similar size and topology.
+///
+/// WHY 6 FT: diffraction only matters when the aperture is comparable to the
+/// wavelength (roughly 1-11 ft across the band that carries Thief's
+/// gameplay audio). A doorway bends sound audibly; a >12 ft opening barely
+/// does, so an explicit elbow there models nothing and only adds density.
+/// 6 ft is the conservative end of that physical range — it keeps every door
+/// and every narrow aperture, and only strips courtyard-scale boundaries.
+/// A portal with no usable edge planes reports inradius -1 and therefore
+/// KEEPS its pair (never drop an aperture we could not measure).
+constexpr float kPathingApertureBendThresholdFt = 6.0f;
+
 /// ── Warmup first-solve stagger (PLAN.PATHING_DESIGN.md §15/§16) ─────────
 ///
 /// Max never-solved-yet voices the staging pass may hand to any single
