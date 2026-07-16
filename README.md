@@ -5,7 +5,52 @@
 ![don't be so sure](doc/orly.png)
 ![but actually tho](doc/physics.png)
 
-### Prerequisites
+---
+
+## Project status
+
+**`darkness` is an engine under construction, not a playable game.** You cannot play Thief 2 with it, and won't be able to for some time. This section exists so you can tell at a glance what is and isn't expected to work.
+
+What you can do today: load a shipping Thief 2 mission, walk it with full player physics, open doors, ride elevators, throw levers, trip pressure plates, pick up and throw objects, and hear all of it through an acoustic simulation that goes well beyond what the original engine did.
+
+What you cannot do: encounter another living thing. There are no guards. There is no inventory, no weapons, no objectives, no loot totals, no light gem, no HUD, no save/load, and no way to complete a mission.
+
+### Subsystem status
+
+| Area | Status |
+|------|--------|
+| Mission / resource loading (`.mis`, `.gam`, `.crf`) | **Working** |
+| World rendering — geometry, textures, lightmaps, water, sky, fog, portal culling | **Working** |
+| Object rendering (static models) | **Working** |
+| Player physics — walk, crouch, jump, mantle, lean, stairs, slopes | **Working** |
+| Object interaction — doors, elevators, levers, tweqs, pressure plates, triggers, pushable objects | **Working** |
+| Frob / grab / throw | **Working** — see caveat below |
+| Spatial audio — HRTF, occlusion, reflections, portal pathing, schemas, speech | **Working** — active focus |
+| Built-in object scripts | **Partial** — 31 scripts; see caveat below |
+| Game logic — inventory, objectives, loot, keys, mission completion | **Absent** |
+| NPCs / creatures — rendering, animation, behaviour | **Absent** |
+| AI — senses, alertness, patrol, pathfinding, combat | **Absent** |
+| Save / load | **Absent** |
+| Modern rendering — shadows, SSAO, PBR, volumetrics | **Absent** |
+
+### Caveats worth stating plainly
+
+- **NPCs are not merely inert — they are invisible.** The renderer's mesh parser accepts only the `LGMD` static-model format and returns an empty mesh for anything else. `LGMM`, the Dark Engine's creature/AI mesh format, is not handled at all, so creature models load as nothing and draw as nothing. `MotionService` parses `motions.crf` and reports its clip count, then goes unused.
+- **"AI" today means one logger.** `AIHearingService` walks objects carrying the AI hearing property and emits a diagnostic line. It is observation-only by design and describes itself that way. There is no brain, no senses, no scheduler, no pathfinding — nothing decides anything.
+- **"Scripts" does not mean a VM.** There is no Squirrel, no Lua, and no `.osm` module loading. The script system is 31 hardcoded C++ classes in a static registry, matched by name against the mission's script property. Missions referencing anything outside that set have those names counted and dropped. Real Thief 2 ships 100+ scripts.
+- **Game-logic scripts are facades.** Loot frobs and logs; the object is never destroyed and nothing is credited. Books log their text. Any key opens any lock — the key source/destination properties are ignored. Mission completion prints a line and returns.
+- **Frob has no line-of-sight check.** Most small frobbables have no collision body and fall back to a proximity cone, so you can frob through walls. The code flags this as a placeholder.
+- **Tested on Thief 2 only.** The engine shares a lineage with Thief 1 and System Shock 2 and there is some scaffolding for their schemas, but neither is exercised or supported today.
+
+### Where this sits on the roadmap
+
+Development runs roughly: foundation → object/property system → player physics → audio → object interaction → **AI** → game logic → rendering upgrades.
+
+Everything through object interaction is in place. Audio is where the bulk of current effort goes. **AI is the next major phase and has not begun** — it is the single biggest gap between what this is (a simulated, audible world) and a game. Game logic and rendering upgrades follow it.
+
+---
+
+## Prerequisites
 
 - CMake 3.21+
 - C++17 compiler (Clang, GCC, or MSVC)
@@ -14,7 +59,7 @@
 Dependencies are managed automatically via [vcpkg](https://vcpkg.io/) manifest mode:
 bgfx, GLM, SDL2, zziplib, ODE, yaml-cpp, Catch2, miniaudio, steam-audio.
 
-### Building
+## Building
 
 ```bash
 # Clone the darkness repo
@@ -34,16 +79,16 @@ cmake --preset release
 cmake --build build/release
 ```
 
-The `default` preset wires vcpkg in via `vcpkg/scripts/buildsystems/vcpkg.cmake`; no extra toolchain flag is needed.
+The `default` preset wires vcpkg in via `vcpkg/scripts/buildsystems/vcpkg.cmake`; no extra toolchain flag is needed. The first configure builds every dependency from source and takes a while.
 
 This produces two binaries:
 
 | Binary | Path | Description |
 |--------|------|-------------|
-| `darknessHeadless` | `build/default/src/main/darknessHeadless` | Mission inspector (dumps chunks, objects, properties) |
-| `darknessRender` | `build/default/src/main/darknessRender` | World geometry viewer (SDL2 + bgfx) |
+| `darknessRender` | `build/default/src/main/darknessRender` | World viewer (SDL2 + bgfx) |
+| `darknessHeadless` | `build/default/src/main/darknessHeadless` | Mission inspector, no rendering deps |
 
-#### Platform presets
+### Platform presets
 
 | Preset | Platform | Notes |
 |--------|----------|-------|
@@ -52,54 +97,86 @@ This produces two binaries:
 | `linux-x64` | Linux | Debug build |
 | `windows-x64` | Windows | Debug build |
 
-### Usage
+Day-to-day development happens on macOS. Linux and Windows are supported targets but are exercised far less often.
 
-Users must supply their own legally obtained game files. `darkness` does not include any game assets.
-
-#### World viewer (`darknessRender`)
-
-`--res` is required; it must point to a directory containing `fam.crf` and `obj.crf` (the Dark Engine textures and object models).
+### Tests
 
 ```bash
-# Textured + lightmapped
-darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES
-
-# With sound schemas (enables spatial audio)
-darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES --schemas /path/to/EDITOR/SCHEMA
+cmake --build build/default --target darkness_tests
+build/default/tests/darkness_tests            # all tests
+build/default/tests/darkness_tests "[audio]"  # or a test name / [tag]
 ```
 
-All other tunables (lightmap filtering, water parameters, physics rate, debug overlays, etc.) live in the YAML config — see `darknessRender.example.yaml`.
+19 Catch2 files, ~450 cases, concentrated on world query, schema parsing, the sim/script infrastructure, and audio. Most of the shipped interaction systems (doors, moving terrain, frob, grab) have no direct coverage yet.
 
-The `--schemas` path enables spatial audio by loading sound schemas. Resources and schemas can come from:
+## Game data
 
-1. **Mounted ISOs (macOS):** `hdiutil mount ../disk_images/thief_2_disk_1.iso` then `--res /Volumes/THIEF2_INSTALL_C/THIEF2/RES` and `--schemas /Volumes/THIEF2_CD2/EDITOR/SCHEMA`
-2. **GOG/Steam install directory:** `--res /path/to/Thief2/RES`
-3. **Any directory containing fam.crf and obj.crf**
+Users must supply their own legally obtained game files. **`darkness` does not include any game assets.**
 
-#### Configuration
+You need two directories:
 
-Settings can be specified in a YAML config file, via CLI flags, or changed at runtime via the debug console. Precedence is: **YAML defaults < CLI flags < runtime changes**.
+| What | Contains | Needed for |
+|------|----------|------------|
+| `RES` | `fam.crf`, `obj.crf`, `snd.crf` | Required — textures, models, sounds |
+| `SCHEMA` | `.sch` / `.spc` / `.arc` | Optional — sound schemas. Without it, audio is much reduced |
 
-Copy `darknessRender.example.yaml` to `darknessRender.yaml` in your working directory, or use `--config <path>` to point to a custom config file. The YAML file has sections for `graphics`, `water`, `physics`, `audio`, and `developer` settings. See the example file for full documentation of all options, including spatial audio reflection parameters and the master bus DSP chain (limiter, compressor, EQ, ducking).
+They can come from a GOG/Steam install directory, a mounted disc, or any directory containing those archives. On macOS, mounting the discs gives you `/Volumes/THIEF2_INSTALL_C/THIEF2/RES` and `/Volumes/THIEF2_CD2/EDITOR/SCHEMA`.
 
-#### Controls — Physics mode (default)
+If `--schemas` is omitted, the audio service looks for `<res>/../EDITOR/SCHEMA`.
 
-Walk-on-ground mode with gravity, collision, jumping, crouching, and leaning. Toggle to fly mode via the debug console (`physics_mode` = off).
+## Running
+
+```bash
+# Point at the data explicitly
+darknessRender path/to/miss6.mis --res /path/to/THIEF2/RES --schemas /path/to/EDITOR/SCHEMA
+
+# Or set paths.res / paths.schemas in the YAML once, then just:
+darknessRender path/to/miss6.mis
+```
+
+The mission file is the only required argument. A `RES` directory must resolve from either `--res` or `paths.res` in the config — the program exits if it resolves to nothing or to a non-directory.
+
+**First run on a mission bakes acoustic probes**, which takes minutes. The result is cached in a `.probes` file next to the mission and reused on subsequent runs.
+
+## Configuration
+
+Settings come from three places. Precedence is **YAML < CLI flags < runtime debug console**.
+
+Copy `darknessRender.example.yaml` to `darknessRender.yaml` in your working directory, or pass `--config <path>`. The default path is relative to the current directory. A missing config is fine — defaults apply silently. A config that exists but fails to parse is fatal.
+
+The file has six sections: `paths`, `graphics`, `water`, `physics`, `developer`, and `audio`. `audio` dominates — roughly 95 of the ~116 keys.
+
+**`darknessRender --help` is the canonical config reference.** It lists every YAML key with its default, whether or not your local config mentions it, and is kept authoritative by convention. Prefer it over the example file if the two ever disagree. Note it prints to stderr, so redirect accordingly:
+
+```bash
+darknessRender --help 2>&1 | less
+```
+
+## Controls
+
+Movement is suppressed while the console is open.
+
+### Physics mode (default)
+
+Walk-on-ground with gravity, collision, jumping, crouching, and leaning.
 
 | Key | Action |
 |-----|--------|
 | WASD | Walk / strafe |
 | Mouse | Look around |
 | Space | Jump (when on ground) |
-| LShift | Creep (0.5x speed, hold) |
-| LCtrl | Run (2x speed, hold) |
+| LShift | Sneak (0.5x speed, hold) |
+| LCtrl / RCtrl | Run (2x speed, hold) — sneak wins if both held |
 | C | Toggle crouch |
-| Q / E | Lean left / right |
+| Q / E | **Lean** left / right |
+| F | Throw held object, else grab, else frob |
+| R | Drop held object |
+| P | Toggle simulation pause |
 | Home | Teleport to player spawn point |
 | ` (backtick) | Open debug console |
 | Esc | Quit |
 
-#### Controls — Fly mode
+### Fly mode
 
 Noclip free-look camera. Enable via the debug console (`physics_mode` = off).
 
@@ -107,115 +184,128 @@ Noclip free-look camera. Enable via the debug console (`physics_mode` = off).
 |-----|--------|
 | WASD | Move forward / left / back / right |
 | Mouse | Look around |
-| Space, Q | Move up |
-| LShift, E | Move down |
-| LCtrl | Sprint (3x speed) |
-| Scroll wheel | Adjust movement speed (shown in title bar) |
-| Home | Teleport to player spawn point |
+| Space, Q | Move **up** |
+| LShift, E | Move **down** |
+| LCtrl / RCtrl | Sprint (3x speed) |
+| Scroll wheel | Adjust movement speed |
+| F / R / P / Home | As above |
 | ` (backtick) | Open debug console |
 | Esc | Quit |
 
-#### Debug console
+Note that **Q/E lean in physics mode but move vertically in fly mode**, and the Ctrl multiplier differs between the two (2x vs 3x).
 
-Press **\` (backtick)** to open the in-game settings console. All runtime settings are managed here — there are no separate keyboard shortcuts for toggling features.
+## Debug console
 
-**Interaction:** Type to filter settings by name, Tab to auto-complete, Up/Down arrows to navigate the list, Enter to select and edit. For bool/categorical settings, use Left/Right arrows to cycle values. For float settings, type a new value. Enter applies, backtick or Esc cancels.
+Press **\` (backtick)** to open the in-game settings console. All runtime settings live here — there are no separate keyboard shortcuts for toggling features.
 
-##### Rendering
+**73 settings** are registered across five groups: `Rendering` (20), `Movement` (12), `Water` (4), `Audio` (35), and `Interaction` (2). The console is self-documenting, so the authoritative list is the console itself rather than this file.
 
-| Setting | Type | Description |
-|---------|------|-------------|
-| `filter_mode` | point / bilinear / trilinear / anisotropic | Texture filtering mode |
-| `lightmap_filtering` | bilinear / bicubic | Lightmap filter quality |
-| `portal_culling` | on / off | Portal/frustum culling |
-| `show_objects` | on / off | Render object meshes |
-| `show_fallback_cubes` | on / off | Show colored cubes for missing models |
-| `show_raycast` | on / off | Debug raycast visualization |
-| `show_acoustic_mesh` | on / off | Cyan wireframe overlay of acoustic scene geometry |
-| `isolate_model` | all / (model names) | Isolate a single object model for inspection |
+**Interaction:** type to filter by setting name *or* group name (typing `audio` surfaces the whole Audio group). Up/Down navigate, Enter selects and edits. Tab jumps straight to editing when exactly one setting matches. For bool/categorical settings, Left/Right cycle values. For float settings, type a value — the field is pre-filled with the current one. Enter applies and closes; an invalid or out-of-range value flashes red and stays open. Backtick or Esc cancels.
 
-##### Camera & Physics
+**Careful:** Esc only cancels while the console is open. With it closed, Esc quits the application.
 
-| Setting | Type | Description |
-|---------|------|-------------|
-| `physics_mode` | on / off | Physics (walk) vs fly (noclip) |
-| `physics_rate` | vintage / modern / ultra | Physics timestep (12.5 / 60 / 120 Hz) |
-| `physics_log` | on / off | Write per-timestep diagnostics to `physics_log.csv` |
-| `camera_collision` | on / off | Camera clips to world geometry (fly mode only) |
-| `move_speed` | 1.0 - 500.0 | Camera movement speed (fly mode) |
-| `step_log` | on / off | Stair step diagnostics to stderr |
+A few settings are *actions* rather than state — set them to `on` to fire once (`bake_probes`, `classify_probes`, `dump_nearest_door`, `toggle_platforms`). Several are read-only reporters (`probe_count`, `refl_tri_count`, `refl_sample_rate`, `refl_ambi_order`).
 
-##### Water
+Commonly used settings:
 
-| Setting | Type | Description |
-|---------|------|-------------|
-| `wave_amplitude` | 0.0 - 5.0 | Water vertex wave height |
-| `uv_distortion` | 0.0 - 0.5 | Water UV wobble strength |
-| `water_rotation` | 0.0 - 0.5 | Water UV rotation speed (rad/s) |
-| `water_scroll` | 0.0 - 1.0 | Water UV scroll speed |
+| Setting | Group | Type | Description |
+|---------|-------|------|-------------|
+| `texture_filter` | Rendering | point / bilinear / trilinear / anisotropic | Texture filtering mode |
+| `lightmap_filter` | Rendering | bilinear / bicubic | Lightmap filter quality |
+| `portal_culling` | Rendering | on / off | Portal/frustum culling |
+| `show_objects` | Rendering | on / off | Render object meshes |
+| `show_rooms` / `show_portals` | Rendering | on / off | Room / portal debug overlays |
+| `isolate_model` | Rendering | all / (model names) | Isolate one object model for inspection |
+| `physics_mode` | Movement | on / off | Physics (walk) vs fly (noclip) |
+| `physics_rate` | Movement | 12.5Hz / 60Hz / 120Hz | Physics timestep |
+| `move_speed` | Movement | 1.0 – 500.0 | Camera movement speed (fly mode) |
+| `refl_enabled` | Audio | on / off | Real-time reflection reverb |
+| `reverb_voices` | Audio | 1 – 32 | Max concurrent realtime reverb voices |
+| `refl_rays` | Audio | 128 – 8192 | Rays per reflection sim step |
+| `master_gain` | Audio | 0.0 – 4.0 | Master output gain |
+| `show_pathing_graph` | Audio | on / off | Overlay the pathing-probe visibility graph |
+| `bake_probes` | Audio | *(action)* | Re-bake acoustic probes |
+| `record_audio` | Audio | on / off | Start/stop audio recording to file |
+| `frob_distance` | Interaction | 1.0 – 30.0 | Frob reach |
 
-##### Audio — Spatial Reflections
+## CLI reference
 
-| Setting | Type | Description |
-|---------|------|-------------|
-| `refl_enabled` | on / off | Real-time hybrid reflection reverb (convolution head + parametric tail) |
-| `portal_routing` | on / off | Sound routing through doorways via portal graph |
-| `probe_pathing` | on / off | Baked probe diffraction (when .probes file available) |
-| `refl_rays` | 128 - 8192 | Rays per reflection sim step |
-| `refl_bounces` | 1 - 8 | Bounces per ray |
-| `refl_duration` | 0.5 - 4.0 | Convolution-head IR length in seconds (tail length is RT60-driven, derived from baked probe data) |
-| `refl_throttle` | 1 - 32 | Run reflection sim every Nth frame |
-| `refl_max_voices` | 1 - 32 | Max active reflection voices |
-| `transmission_scale` | 0.1 - 100.0 | Material transmission multiplier (read-only at runtime) |
-| `refl_tri_count` | *(read-only)* | Acoustic scene triangle count |
-| `refl_sample_rate` | *(read-only)* | Reflection-effect sample rate |
-| `refl_ambi_order` | *(read-only)* | Ambisonics order (0=omni, 1=directional) |
-| `show_pathing_graph` | on / off | Overlay the pathing-probe visibility graph; edges in the neighborhood of active voices tinted by perceived EQ quality (green=clear, yellow=partial, red=blocked). |
-| `show_voice_arrows` | on / off | Per-voice source→listener arrow colored by `eqCoeffs.mid` — unambiguous per-voice quality without spatial attribution. |
-
-##### Audio — Probes & Recording
-
-| Setting | Type | Description |
-|---------|------|-------------|
-| `bake_probes` | *(action)* | Set to "on" to re-bake acoustic probes |
-| `probe_count` | *(read-only)* | Current probe count |
-| `record_audio` | on / off | Start/stop audio recording to file |
-
-#### CLI reference
-
-The CLI is intentionally minimal — all runtime tunables live in the YAML config (see `darknessRender.example.yaml`) and can be changed live via the debug console.
+The CLI is deliberately narrow for normal use — tunables live in the YAML config and the debug console. The rest of the flags exist for automated performance runs.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `<mission.mis>` | *(required)* | Path to mission file |
-| `--res <path>` | *(required)* | Thief 2 RES directory containing `fam.crf` and `obj.crf` |
-| `--schemas <path>` | *(none)* | Path to schemas directory (enables spatial audio) |
-| `--config <path>` | `./darknessRender.yaml` | Path to YAML config file |
-| `--skip-reflection-bake` | off | Skip the multi-minute reflection bake and carry the existing `.probes` reflection section forward — re-bakes only the pathing batch. Fast iteration on pathing-only changes. Emits a startup banner + once-per-30s `[REFL_SKIP]` reminder so the stale-reflection state can't be lost. Hard-fails if no prior reflection bake exists. |
-| `--help` / `-h` | | Show help message |
+| `<mission.mis>` | *(required)* | Path to mission file, positional |
+| `--res <path>` | `paths.res` | RES directory. Must resolve from here or YAML |
+| `--schemas <path>` | `paths.schemas` | Schema directory. Falls back to `<res>/../EDITOR/SCHEMA` |
+| `--config <path>` | `./darknessRender.yaml` | YAML config path |
+| `--set <yaml.path>=<value>` | | Override any `audio.*` key. Repeatable |
+| `--force-pathing-bake` | off | Re-bake the pathing probes even when a valid `.probes` exists; reflections carry forward |
+| `--bake-quality <dev\|ship>` | *(YAML)* | Probe bake quality preset |
+| `--audio-log` | off | Enable audio diagnostics |
+| `--help` / `-h` | | Full help, including every YAML key. **Prints to stderr** |
 
-Unknown flags are ignored with a warning.
+Automation / profiling flags, documented in `--help`: `--perf-label`, `--exit-after-seconds`, `--audio-rng-seed`, `--capture-wav`, the `--auto-fly*` family (5 flags), the `--auto-run*` family (4), and the `--audio-capture*` family (3). `--stress-doors`, `--stress-door-ids`, and `--spawn-override` are dev-only.
 
-#### Mission inspector (`darknessHeadless`)
+Unknown flags print a warning and are ignored — they do not fail the run.
+
+## Mission inspector (`darknessHeadless`)
 
 ```bash
 darknessHeadless <database> [command] [args] [--scripts <path>]
 ```
 
-Loads a `.mis`, `.gam`, or `.sav` database and inspects its contents.
+Loads a `.mis`, `.gam`, or `.sav` database and inspects its contents. The command defaults to `info`. There is **no `--help`** — run it bare, or with an unknown command, to get usage. All diagnostics go to stderr so stdout stays pipeable.
+
+**Database inspection**
 
 | Command | Description |
 |---------|-------------|
-| `info` | File type, parent DB chain, chunk count (default) |
+| `info` | File type, parent DB chain, chunk count *(default)* |
 | `chunks` | List all chunks with name, version, size |
 | `objects` | List all objects with ID, name, position |
-| `properties [id]` | List all property types, or dump properties for a specific object |
-| `links [id]` | List all relation types, or dump links for a specific object |
-| `probe_plan <mission.mis> --res <path> --schemas <path>` | Dry-run probe placement: emits per-purpose probe counts (reflections / Portal / DoorPair / Centroid / Emitter) + dedup-dropped counts + probe-to-nearest distance histogram, without invoking Steam Audio's bake. Same placement code path as a live bake, so counts match what `darknessRender` would commit. No `.probes` file written. Headless can't register door OBBs (renderer-only), so DoorPair classification is absent — a `[PROBE_PLAN] WARN` line surfaces this. |
+| `properties [id]` | All property types, or a dump for one object |
+| `links [id]` | All relation types, or a dump for one object |
+| `prop-dump <name>` | Dump one named property across the mission |
 
-Use `--scripts <path>` to specify the schema directory (default: `scripts/thief2`).
+**Geometry & rooms**
 
-### Thanks
+| Command | Description |
+|---------|-------------|
+| `room-info <id> [<id> ...]` | Detail for specific rooms |
+| `room_graph` | Room/portal graph as `ROOM` / `PORTAL` / `PDIST` lines |
+| `wr_cells` | Cell geometry as `WRCELL` / `WRVERT` / `WRPOLY` lines |
+| `wr_portals` | Portal geometry as `WRPORTAL` lines |
+| `trace-path <src> <dst> [maxDist]` | Per-hop sound-propagation BFS trace. `maxDist` defaults to 200 |
+| `mesh_validate [--at X Y Z R]` | Validate acoustic geometry; writes `<mis>.acoustic.obj` |
+
+**Audio data**
+
+| Command | Description |
+|---------|-------------|
+| `sound-chunks` / `sound-desc` | Sound chunk listings |
+| `ambients` | Ambient sound records |
+| `sound_db [outpath]` | CSV of schema gain / attenuation / class. Needs no mission |
+| `txlist_audit` | Texture-name → acoustic-material coverage audit |
+| `probe_plan` | Dry-run probe placement; counts and histograms, no `.probes` written |
+| `probe_cell_audit [positions.csv]` | Probe-vs-cell audit |
+
+**Flags:** `--scripts <path>` (default `scripts/thief2`) selects the property/link schema directory; `scripts/thief1` and `scripts/shock2` also exist. `--res` / `--schemas` are used by `probe_plan` and `sound_db`. `--set` is accepted but resolves a much narrower key set than the renderer's.
+
+## Development
+
+Layout:
+
+- `src/base/` — foundation: math, file I/O, logging, service manager, threading
+- `src/services/` — the service stack and every game subsystem
+- `src/main/` — the two binaries plus header-only renderer modules and data parsers
+- `src/scripts/` — reimplemented object scripts
+- `shaders/` — shader sources, compiled into `src/shaders/embedded_shaders.h`
+- `tests/` — Catch2 suite
+- `tools/` — performance sweep and audio-artifact analysis scripts
+
+The engine is a service stack (`ServiceManager` singletons: database, property, link, object, inherit, physics, room, audio, sim, loop) driven by a frame loop, with the renderer built as header-only modules on top. Subsystems talk through interfaces — `IWorldQuery` for read-only world access, `IPhysicsWorld` for collision — rather than reaching into each other, so they can be replaced independently. That boundary discipline is the point of the design: it's what makes a pluggable AI stack possible later.
+
+## Thanks
 
 * The openDarkEngine team.
 * TomNHarris (telliamed) - for the all the work he has done understanding the Dark Engine and its data formats. Also for the irreplaceable help in the past.
