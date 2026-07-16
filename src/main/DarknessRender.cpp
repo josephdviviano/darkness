@@ -5338,6 +5338,8 @@ int main(int argc, char *argv[]) {
         audioSvc->setProbeGlobalDedupRadiusFt(cfg.audioProbeGlobalDedupRadiusFt);
         audioSvc->setPathingProbeBatchEnabled(cfg.audioPathingProbesEnabled);
         audioSvc->setPathingDedupRadiusFt(cfg.audioPathingDedupRadiusFt);
+        audioSvc->setPathingVisRangeOverrideFt(
+            cfg.audioPathingVisRangeOverrideFt);
         // Layout density: string (validated at parse — RenderConfig
         // accepts only "baseline"/"bends") → enum at this boundary via
         // the single string→enum mapping (pathingProbeDensityFromName).
