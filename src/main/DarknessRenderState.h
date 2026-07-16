@@ -598,13 +598,20 @@ struct RuntimeState {
     };
     std::vector<PerRoomDebug> roomDebug;
 
-    // Cap on number of rooms drawn into the show_rooms / show_portals
-    // overlays. The camera-nearest N rooms (by center distance) are kept;
-    // the rest are culled. 0 means "no limit, draw everything". Default
-    // 20 is tuned against typical Thief 2 missions where ~200 rooms make
-    // an uncapped overlay unreadable. Exposed via `debug_room_max_count`
-    // in the debug console.
-    int debugRoomMaxCount = 20;
+    // Cap on number of rooms drawn into the show_rooms / show_portals /
+    // show_probes / show_probe_radius overlays. The camera-nearest N rooms
+    // (by center distance) are kept; the rest are culled. 0 means "no
+    // limit, draw everything". Exposed via `debug_room_max_count` in the
+    // debug console.
+    //
+    // Raised 20 -> 80 (2026-07-15) for probe-placement work: judging probe
+    // DENSITY by eye needs to see a whole open space and its neighbours at
+    // once, and 20 rooms culls most of a courtyard's surroundings away.
+    // The original 20 was tuned for show_rooms/show_portals legibility
+    // (~200 rooms per mission makes an uncapped box overlay unreadable) —
+    // but probe cubes are small and read fine at higher counts. Turn it
+    // back down (or to 0 for everything) from the console as needed.
+    int debugRoomMaxCount = 80;
 
     // ── Auto-fly probe-tour state ──
     // Drives the fly-mode camera through a deterministic random tour of

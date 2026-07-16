@@ -34,20 +34,25 @@
 #include "loop/LoopCommon.h"
 #include "audio/AudioDSPChain.h"
 #include "audio/AudioUnits.h"
+#include "audio/WorldApertureData.h"
 #include "audio/SchemaTypes.h"
 #include "room/RoomService.h"  // SoundPropInfo / SoundPropParams / SoundPathHop
 #include "worldquery/WorldQueryTypes.h"  // RayHit (for diagnostic raycaster setter)
+#include "LatencyHistogram.h"  // mDoorRouteLatencyHist ([DOOR_ROUTE_LATENCY])
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
 #include <string>
+#include <utility>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -317,7 +322,7 @@ public:
     AudioService(ServiceManager *manager, const std::string &name);
     ~AudioService() override;
 
-    // ── Public API (stubs — wired up in later tasks) ──
+    // ── Public API (schema playback + control) ──
 
     /** Play a schema by name at a world position (one-shot or looping).
      *  @param schemaName  Schema name (as defined in .sch files)
@@ -473,6 +478,48 @@ public:
                                               const Vector3 &to,
                                               RayHit &hit)>;
     void setRaycaster(AudioRaycastFn fn) { mRaycaster = std::move(fn); }
+
+    /** Is this point inside the world's open space (a WR cell)?
+     *
+     *  WR cells are AIR volumes carved by the level compiler; SOLID is
+     *  simply their absence. The original engine treats a point's cell as
+     *  part of its identity (a Location is a position PLUS the cell it is
+     *  in), so "is there a cell here?" IS the engine's own definition of
+     *  being in the world.
+     *
+     *  This exists because `RoomService::roomFromPoint()` cannot answer that
+     *  question: ROOM_DB rooms are coarse designer-drawn boxes that overlap
+     *  solid geometry freely, and nothing aligns them to the compiled cells.
+     *  Using roomFromPoint as a solidity test baked 3.6% of pathing probes
+     *  (46 on MISS2, 28 on MISS6) INSIDE walls; rays cast from a point with
+     *  no cell are never traced and silently report "clear", which produced
+     *  ~11.6k phantom graph edges (~37% of MISS2's graph).
+     *
+     *  Renderer-supplied (WR data lives in the renderer), mirroring
+     *  setRaycaster. When unset (headless), probe placement announces the
+     *  degradation loudly rather than silently trusting the box test. */
+    using AudioPointInAirFn = std::function<bool(const Vector3 &p)>;
+    void setPointInAirFn(AudioPointInAirFn fn) { mPointInAirFn = std::move(fn); }
+
+    /** Which air REGION does this point belong to? (-1 = in solid / off-map.)
+     *
+     *  A region is a connected air volume bounded by REAL apertures —
+     *  computed renderer-side by WRAcousticTopology.h (WR data lives there,
+     *  mirroring setRaycaster / setPointInAirFn). Regions replace ROOM_DB
+     *  rooms as the pathing bake's coverage partition: ROOM_DB carves one
+     *  real space into dozens of boxes (a single MISS2 region holds 74 room
+     *  centers), so per-room coverage machinery over-produced probes ~8x.
+     *  See WorldApertureData.h and PLAN.PATHING_DESIGN.md §36. */
+    using AudioRegionOfPointFn = std::function<int(const Vector3 &p)>;
+
+    /** Renderer-computed aperture/region ground truth for the pathing bake
+     *  (see WorldApertureData.h for the full WHY). The pathing placement
+     *  refuses to run portal-first without it — LOUDLY, never silently
+     *  rebuilding the room-centroid layout this replaces. */
+    void setWorldApertureData(WorldApertureData data, AudioRegionOfPointFn fn) {
+        mWorldApertureData = std::move(data);
+        mRegionOfPointFn   = std::move(fn);
+    }
 
     /** Play a footstep sound for a specific material and speed.
      *  Selects a schema via env_tag matching: (Event Footstep) + (Material <keyword>).
@@ -1044,6 +1091,35 @@ public:
      *  site. */
     PathingProbeDensity getBakedPathingDensity() const;
 
+    /** True when the loaded .probes pathing section was baked under a
+     *  hub-fill coverage radius (v5 header bakedPathingRCovFt) that
+     *  differs from the active kPathingCoverageRadiusFt — including v4
+     *  files, which read back 0: their pre-coverage layout has no
+     *  HubFill probes and a max-span-derived visRange. Same handling as
+     *  pathingBakeSamplesMismatch: the bake-decision site
+     *  (DarknessRender.cpp) schedules a loud automatic pathing-only
+     *  re-bake (reflection IRs carried forward — the v4 payload format
+     *  is unchanged). False when no pathing batch is loaded. */
+    bool pathingBakeCoverageMismatch() const;
+
+    /** True when the loaded .probes pathing section was baked under a
+     *  DIFFERENT probe-layout generation than the running code
+     *  (kPathingLayoutVersion vs the v6 header field; v4/v5 files read
+     *  back 0). Same handling as the other mismatches: the bake-decision
+     *  site schedules a loud automatic pathing-only re-bake. This is the
+     *  staleness signal for layout rewrites that change none of the other
+     *  recorded bake parameters — without it a pre-rewrite cache loads
+     *  silently and the run keeps the old layout with zero signal. */
+    bool pathingBakeLayoutMismatch() const;
+    /** Facade over ProbeManager::getBakedPathingLayoutVersion. */
+    uint32_t getBakedPathingLayoutVersion() const;
+
+    /** Facade over ProbeManager::getBakedPathingRCovFt — the hub-fill
+     *  coverage radius recorded in the loaded/just-baked .probes v5
+     *  header (0 = none / v4 file). For mismatch diagnostics at the
+     *  bake-decision site. */
+    float getBakedPathingRCovFt() const;
+
     /** Snapshot of probe positions in feet (engine units). Populated by
      *  bakeProbes() and loadProbes(); empty if no probes are loaded. Used
      *  by the renderer to draw a debug overlay. The vector is rebuilt on
@@ -1415,6 +1491,19 @@ private:
     // Not on any hot path; only fires inside the gated diagnostic block.
     AudioRaycastFn mRaycaster;
 
+    // Renderer-injected "is this point in a WR cell (open space)?" test.
+    // The REAL solidity test for probe placement — see setPointInAirFn.
+    // Bake-time only; null in headless (announced loudly at bake).
+    AudioPointInAirFn mPointInAirFn;
+
+    // Renderer-computed aperture/region ground truth for the pathing bake
+    // — see setWorldApertureData and WorldApertureData.h. Bake-time only;
+    // invalid in headless (the placement pass announces loudly and refuses
+    // portal-first placement rather than rebuilding the room-centroid
+    // fiction it replaces).
+    WorldApertureData mWorldApertureData;
+    AudioRegionOfPointFn mRegionOfPointFn;
+
     // ── Volumetric occlusion configuration ──
     //
     // Radius (engine feet) + sample count for Steam Audio's volumetric
@@ -1701,6 +1790,15 @@ private:
 
     /// Acoustic scene built from WR world geometry
     IPLScene mIplScene = nullptr;
+    /// How many references WE hold on mIplScene (1 from iplSceneCreate +
+    /// 1 per iplSceneRetain handed to a simulator). destroyAcousticScene
+    /// releases exactly this many. A hardcoded release count was measured
+    /// wrong in BOTH directions: the pathing simulator's retain was added
+    /// without a third release (leaked the whole scene — static mesh +
+    /// BVH — on every mission reload), and early init-failure paths
+    /// reach destroy with only the create reference (releasing two was a
+    /// use-after-free inside Steam Audio).
+    int mIplSceneRefCount = 0;
 
     /// Static mesh within the scene (world geometry + material assignments)
     IPLStaticMesh mIplStaticMesh = nullptr;
@@ -1747,18 +1845,238 @@ private:
     /// conversion.
     void recomputeDoorWorldAABB(DoorAudioInstance &inst) const;
 
-    /// Midpoint of every non-degenerate registered door OBB (world AABB
-    /// center, engine feet). The SINGLE door-position source shared by the
-    /// bake's door-portal classifier and [BAKE_PARITY]'s door-adjacent
-    /// grader — both match portals against these within
-    /// kPathingDoorPortalMatchDistFt, so the two passes can never drift
-    /// on what counts as a door.
-    std::vector<Vector3> doorAudioMidpoints() const;
+    /// World AABB (engine feet) of every non-degenerate registered door.
+    /// The SINGLE door-geometry source shared by the bake's door-portal
+    /// classifier and [BAKE_PARITY]'s door-adjacent grader — both match
+    /// portals against these boxes within kPathingDoorPortalMatchDistFt
+    /// of point-to-AABB distance (NOT distance to the box midpoint; see
+    /// the WHY comment on sPointAABBDistSq in AudioService.cpp), so the
+    /// two passes can never drift on what counts as a door.
+    struct DoorWorldAABB {
+        Vector3 mn{0.0f, 0.0f, 0.0f};
+        Vector3 mx{0.0f, 0.0f, 0.0f};
+    };
+    std::vector<DoorWorldAABB> doorAudioAABBs() const;
+
+    /// [DOOR_PORTAL_MAP] — DEV diagnostic emitted once at the end of
+    /// registerDoorGeometry: one stderr line per registered door mapping
+    /// the door's audio OBB (point-to-AABB distance) to the nearest
+    /// ROOM_DB portal, using the SAME match rule as the bake's DoorPair
+    /// classifier (kPathingDoorPortalMatchDistFt). Read offline by
+    /// analysis/door_detour_class.py to attach alternate-route detour
+    /// classes (NONE/LONG/SHORT) to concrete door IDs while testing the
+    /// door-event pathing-latency hypothesis. Purely observational —
+    /// mutates nothing.
+    void logDoorPortalMap() const;
 
     /// Set by setDoorTransform; consumed (and cleared) at the top of the
     /// next loopStep. Coalesces multiple per-frame door transform updates
     /// into one BVH refit.
     std::atomic<bool> mSceneNeedsCommit{false};
+
+    // ── O2a: door acoustic generation counter + route-staleness metric ──
+    //
+    // PLAN.PATHING_DESIGN.md §4 O2a / §6 decision 1. All members in this
+    // block are MAIN-THREAD ONLY (setDoorTransform, registerDoorGeometry
+    // and loopStep all run on the main thread); the only cross-thread
+    // traffic is reading PathingSimulator::completedCycles() /
+    // lastIterationEndNs(), which are atomics owned by the worker.
+
+    /// Monotonic generation counter for door acoustic state. Bumped once
+    /// per setDoorTransform push on a REGISTERED door (a swinging door
+    /// bumps every sim tick — we WANT continuous re-solves during swings,
+    /// smoother than the original engine's on-event step function) and
+    /// once per registerDoorGeometry batch.
+    uint64_t mDoorAcousticGen = 0;
+
+    /// steady_clock ns timestamp of the most recent setDoorTransform bump
+    /// on a REGISTERED door. Consumed by the staging pass's
+    /// unreachable-route cache: a known no-route voice defers its
+    /// doorGen-triggered discovery re-solve (an exhaustive
+    /// findAlternatePaths) until doors have been QUIET for
+    /// kDoorQuietForNoRouteRetryMs — during a continuous swing the
+    /// per-tick doorGen trigger would otherwise re-run the exhaustive
+    /// search on every solve for a voice that is silent either way.
+    /// Registration deliberately does NOT stamp this (boot-time scene
+    /// build, not a swing).
+    int64_t mDoorLastBumpNs = 0;
+
+    /// The generation whose door poses are actually IN the committed
+    /// acoustic-scene BVH. Advanced to mDoorAcousticGen right after each
+    /// iplSceneCommit (loopStep's coalesced door commit +
+    /// registerDoorGeometry's registration commit). The per-voice solve
+    /// memo compares against THIS value, not the raw counter: solving
+    /// against a BVH that doesn't yet contain the new pose would record
+    /// the route as fresh while it still reflects the old geometry
+    /// (stale-route-stuck if the door then goes idle). Commit deferral
+    /// windows (a sim worker busy) therefore correctly extend
+    /// [DOOR_ROUTE_LATENCY] instead of being silently excluded.
+    uint64_t mDoorGenCommitted = 0;
+
+    /// Committed-gen snapshot taken at the most recent pathing-worker
+    /// signal(). Consumer: the pathing throttle's door-override
+    /// (re-solve continuously while doors move) fires while
+    /// mDoorGenCommitted != this. (The epoch FIFO below no longer keys
+    /// on it — latest-gen-wins pushes one epoch per bump.)
+    uint64_t mDoorGenLastSignalGen = 0;
+
+    /// [DOOR_ROUTE_LATENCY] epoch FIFO — latest-gen-wins (stacking fix,
+    /// PLAN.PATHING_DESIGN.md §11). One entry PER door-gen bump while
+    /// pathing is operative. A completed covering solve retires ALL
+    /// entries ≤ its covered gen in one batch, recording each entry's
+    /// latency from its OWN bump time (per-door-state staleness — the
+    /// perceptual gate quantity; the batch's oldest sample preserves the
+    /// old absorb-into-earliest worst-case envelope). Bounded by the
+    /// retirement rate (steady-state ≈ bump rate × pipeline latency,
+    /// tens of entries) with a hard cap + loud drop in setDoorTransform;
+    /// cleared on probe-batch teardown/reload.
+    struct DoorGenEvent {
+        uint64_t gen;      ///< mDoorAcousticGen value of this bump
+        int64_t  timeNs;   ///< steady_clock ns of that bump
+    };
+    std::deque<DoorGenEvent> mDoorGenEvents;
+
+    /// In-flight solve tracking for [DOOR_ROUTE_LATENCY]: set at signal()
+    /// time when an uncovered epoch exists; resolved at the top of a later
+    /// loopStep once PathingSimulator::completedCycles() reaches the
+    /// target. Signals never overlap (the !isRunning() gate), so a single
+    /// in-flight record suffices.
+    bool     mDoorSolveInFlight = false;
+    uint64_t mDoorSolveInFlightGen = 0;    ///< covers epochs with gen <= this
+    uint64_t mDoorSolveInFlightCycle = 0;  ///< completedCycles target
+
+    /// Door-event route staleness histogram (ms): each door-gen bump →
+    /// end of the first completed pathing solve whose staged inputs +
+    /// committed BVH covered it (per-bump samples since the latest-gen-
+    /// wins fix; a covering solve contributes one sample per retired
+    /// epoch). Drained by dumpAudioStatusPeriodic into the
+    /// [PERF door_route] stderr line + the perf.window JSONL `door_route`
+    /// stage. USER HARD GATE (PLAN.PATHING_DESIGN.md §6): p95 must stay
+    /// ≤ ~150 ms under door-swing stress.
+    LatencyHistogram mDoorRouteLatencyHist;
+
+    // ── O3-lite scoped door-event invalidation (PLAN.PATHING_DESIGN.md §8) ──
+    //
+    // A shadow room-graph router (radius-bounded portal Dijkstra over
+    // ROOM_DB, the same graph analysis/door_detour_class.py proxies)
+    // computes, per voice at each SOLVE, the SET of room-pairs on any
+    // route within a slack window of the shortest. The voice is then
+    // registered against every DOOR whose room-pair lies on a route in
+    // that set (plus an ellipse geometric fallback). On a door commit
+    // only the registered voices are invalidated — shrinking the
+    // door-swing "affected voices" from all-in-range (~11 on MISS2) to
+    // the 1-2 actually routed through the moving door. All members below
+    // are MAIN-THREAD ONLY (registration, commit-marking and teardown all
+    // run on the main thread). No acoustic parameters are produced here —
+    // scheduling/invalidation only.
+
+    /// Slack window (feet) added to the shortest route length: a portal
+    /// (room-pair) is "on a route" if distFromSource + distToListener
+    /// through it is within this of the shortest S→T route. Also the
+    /// ellipse-fallback margin. Deliberately generous (conservative
+    /// superset) — the [SCOPE_MISS] watchdog is the correctness guard.
+    /// 20 ft = top of the sanctioned +10-20 ft window (§8 step 1); raised
+    /// from 15 ft after the first stress runs showed a handful of
+    /// regDoors≥1 ambients whose alternate-route door sat just beyond a
+    /// tighter window (small [SCOPE_MISS] deltas).
+    static constexpr float kRouteSlackFt = 20.0f;
+
+    /// Per-registered-door canonical (min,max) room-pair, built at
+    /// registerDoorGeometry with the SAME point-to-AABB matcher as
+    /// logDoorPortalMap / the DoorPair bake classifier. Doors that match
+    /// no portal within kPathingDoorPortalMatchDistFt get NO entry (the
+    /// 43 genuine non-boundary doors) — those fall to the ellipse
+    /// fallback / fail-open-all on bump.
+    std::unordered_map<int32_t, std::pair<int32_t, int32_t>> mDoorRoomPair;
+
+    /// Inverse of mDoorRoomPair: canonical room-pair → door IDs mapped to
+    /// it. Lets the router turn a route's room-pair set into door IDs.
+    std::map<std::pair<int32_t, int32_t>, std::vector<int32_t>> mRoomPairDoors;
+
+    /// Shadow-router portal graph (physical portals, deduped via the
+    /// portalID<=destPortalID convention). Built from ROOM_DB whenever the
+    /// door maps are (re)built; independent of the probe graph. Empty ⇒
+    /// mRouterReady false ⇒ every voice fails open (global door trigger).
+    struct RouterPortal {
+        int32_t a;        ///< lower room ID
+        int32_t b;        ///< higher room ID
+        Vector3 center;   ///< portal polygon center (engine feet)
+    };
+    std::vector<RouterPortal> mRouterPortals;
+    /// roomID → indices into mRouterPortals of the portals bounding it
+    /// (a portal appears under BOTH its rooms). The router's adjacency:
+    /// portal P's neighbors are the portals sharing either of P's rooms.
+    std::unordered_map<int32_t, std::vector<uint32_t>> mRouterRoomPortals;
+    bool mRouterReady = false;
+
+    /// Reverse index door → voices registered against it (scope step 2).
+    /// Rebuilt incrementally: a voice's registration is refreshed at every
+    /// SOLVE and torn down in removeVoiceSource. On a door commit the
+    /// registered voices (and only those) are marked pathScopedDoorDirty.
+    std::unordered_map<int32_t, std::unordered_set<SoundHandle>> mDoorVoices;
+    /// Per-voice current door registration (the door IDs a voice sits in
+    /// mDoorVoices under) so a re-solve / teardown can remove the old
+    /// edges before adding the new ones.
+    std::unordered_map<SoundHandle, std::vector<int32_t>> mVoiceRegisteredDoors;
+
+    /// Door IDs whose transform bumped since the last committed BVH refit.
+    /// Populated by setDoorTransform, drained at the coalesced iplSceneCommit
+    /// in loopStep to mark exactly the registered voices dirty (the door
+    /// poses are only IN the BVH after the commit, so marking at commit —
+    /// not bump — preserves the "solve sees the new geometry" invariant).
+    std::unordered_set<int32_t> mDoorsBumpedSinceCommit;
+
+    /// [SCOPE_MISS] watchdog cadence (steady_clock ns of last tick + the
+    /// pending latch consumed by the next signaling staging pass). The
+    /// watchdog force-solves eligible in-range voices ignoring scoping and
+    /// checks whether any voice that scoping WOULD have skipped shows a
+    /// material eq change (a scope miss). Cumulative miss count is loud +
+    /// reported on [PERF scope].
+    ///
+    /// STAGGERED (not one full-scope solve): a full 11-voice audit solve
+    /// every 2 s re-introduces exactly the expensive validation+alternate
+    /// iteration scoping removed (~150-255 ms), blocking the door commit
+    /// and spiking the [DOOR_ROUTE_LATENCY] gate it is meant to guard.
+    /// Instead each tick (every kScopeWatchdogIntervalMs) arms a rotating
+    /// window of kScopeWatchdogBatch voices via mScopeWatchdogCursor, so
+    /// every eligible voice is audited within ~2 s while each tick adds
+    /// only a couple of forced solves to the scoped set. (As-built
+    /// refinement of the §8 "one background full-scope solve" — same audit
+    /// coverage + cadence, kept genuinely background.)
+    int64_t  mScopeWatchdogLastNs = 0;
+    bool     mScopeWatchdogPending = false;
+    uint32_t mScopeWatchdogCursor = 0;
+    static constexpr double   kScopeWatchdogIntervalMs = 250.0;
+    static constexpr uint32_t kScopeWatchdogBatch = 2;
+    /// A pathing eqCoeffs band delta beyond this between a scope-skipped
+    /// voice's cached eq and its forced full-solve eq is a scope miss.
+    static constexpr float kScopeMissEqEpsilon = 0.05f;
+    std::atomic<uint64_t> mScopeMissCount{0};
+
+    /// (Re)build mDoorRoomPair / mRoomPairDoors from the registered doors
+    /// and the shadow-router portal graph from ROOM_DB. Called at the end
+    /// of registerDoorGeometry (RoomService loaded by then). Clears + sets
+    /// mRouterReady.
+    void rebuildDoorScopeMaps();
+
+    /// Shadow router: radius-bounded portal Dijkstra + ellipse fallback.
+    /// Returns the sorted, deduped set of door IDs relevant to a voice at
+    /// (sourcePos, listenerPos). `outScopeValid` is set true iff the
+    /// router produced usable route data (built, both rooms resolved, a
+    /// finite route exists) — false ⇒ the caller fails the voice open.
+    std::vector<int32_t> computeRouteScope(const Vector3 &sourcePos,
+                                           const Vector3 &listenerPos,
+                                           Room *sourceRoom,
+                                           Room *listenerRoom,
+                                           float maxAudibleDist,
+                                           bool &outScopeValid) const;
+
+    /// Refresh a voice's door registration in mDoorVoices /
+    /// mVoiceRegisteredDoors to `doors` (removing stale edges first).
+    void registerVoiceRouteDoors(SoundHandle h,
+                                 const std::vector<int32_t> &doors);
+    /// Drop a voice from the reverse index entirely (teardown / reload).
+    void unregisterVoiceRouteScope(SoundHandle h);
 
     /// Reflection simulation owner — wraps the Steam Audio reflection
     /// IPLSimulator handle, its dedicated background worker thread, the
@@ -2069,7 +2387,8 @@ private:
     // because the pruning runs mid-BFS (at intermediate rooms, not
     // only at the listener room), alternates die early and never get
     // a chance to reach the listener. The legacy default of 10 came
-    // from the original engine's kMaxDistDiff and was tuned for a
+    // from the original engine's alternate-path distance-difference
+    // cap and was tuned for a
     // single-source renderer where alternates only modulated a
     // centroid by a few percent. For the multi-path renderer a tight
     // window discards physically-meaningful alternates whose

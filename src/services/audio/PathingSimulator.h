@@ -189,6 +189,73 @@ public:
     /// waking up.
     void signal();
 
+    /// Number of completed iplSimulatorRunPathing iterations. Incremented
+    /// by the worker (release) at the end of each iteration; read by the
+    /// main thread (acquire) to detect that a signaled solve has finished
+    /// — the [DOOR_ROUTE_LATENCY] staleness metric correlates
+    /// "door-gen bump" → "first completed solve covering it" through this
+    /// counter (see AudioService::loopStep O2a blocks).
+    uint64_t completedCycles() const {
+        return mCompletedCycles.load(std::memory_order_acquire);
+    }
+
+    /// steady_clock nanoseconds-since-epoch timestamp of the END of the
+    /// most recently completed iteration. Stored by the worker BEFORE the
+    /// mCompletedCycles release-increment, so a main-thread reader that
+    /// observed a new cycle count (acquire) is guaranteed to see the
+    /// matching (or a newer) end timestamp. Used as the completion time
+    /// for [DOOR_ROUTE_LATENCY] so the sample doesn't inflate by up to a
+    /// render frame of main-thread detection lag.
+    int64_t lastIterationEndNs() const {
+        return mLastIterEndNs.load(std::memory_order_acquire);
+    }
+
+    /// O2a staging counters — how many eligible voices the main thread
+    /// staged for a SOLVE (PATHING flag set: validation + alternate-path
+    /// search runs) vs SKIPPED (IN-RANGE voices whose memo said nothing
+    /// changed; Steam Audio retains the cached outputs) on each signaled
+    /// staging pass. Out-of-range eligible voices count in NEITHER bucket
+    /// (review F6: they were never solved pre-O2a either, so counting
+    /// them as "skipped" overstated the dirty-gating win).
+    /// Accumulated across the [PERF pathing] dump window and drained
+    /// (exchange 0) by the worker's periodic dump, which appends
+    /// `solved=`/`skipped=` to the [PERF pathing] line.
+    /// unreachableCached counts staged-SKIP decisions made by the
+    /// unreachable-route cache: voices whose last covering solve was a
+    /// definitive no-route verdict and whose re-solve (an exhaustive
+    /// findAlternatePaths) was suppressed because no trigger that could
+    /// change reachability fired. Printed loud on [PERF pathing].
+    /// scopedSolves counts staged solves on a scope-valid voice (route set
+    /// active); scopeSkipped counts in-range voices whose GLOBAL door gen
+    /// advanced but whose scoped route set excluded the moved door(s), so
+    /// the re-solve was suppressed (the O3-lite scoped-invalidation win,
+    /// PLAN.PATHING_DESIGN.md §8). Both printed on [PERF pathing].
+    void addStagingCounts(uint32_t solved, uint32_t skipped,
+                          uint32_t unreachableCached,
+                          uint32_t scopedSolves, uint32_t scopeSkipped) {
+        mStagedSolved.fetch_add(solved, std::memory_order_relaxed);
+        mStagedSkipped.fetch_add(skipped, std::memory_order_relaxed);
+        mUnreachableCached.fetch_add(unreachableCached,
+                                     std::memory_order_relaxed);
+        mScopedSolves.fetch_add(scopedSolves, std::memory_order_relaxed);
+        mScopeSkipped.fetch_add(scopeSkipped, std::memory_order_relaxed);
+    }
+
+    /// Lever D warmup first-solve stagger (PLAN.PATHING_DESIGN.md §16).
+    /// `deferred` = never-solved voices this staging pass held back because
+    /// the iteration's first-solve budget (kPathingFirstSolvesPerIteration)
+    /// was full; ACCUMULATED across the dump window and drained by it.
+    /// `backlog` = never-solved in-range eligible voices the pass saw at
+    /// all — a GAUGE (last writer wins, not accumulated), so the dump shows
+    /// the current depth. Both printed on [PERF pathing]: a backlog that
+    /// stays > 0 long after warmup means first solves are not draining
+    /// (starvation / a voice wedged out of the admit list) and is the
+    /// signal to look at, per the no-silent-fallbacks rule.
+    void setFirstSolveStagger(uint32_t deferred, uint32_t backlog) {
+        mFirstSolveDeferred.fetch_add(deferred, std::memory_order_relaxed);
+        mFirstSolveBacklog.store(backlog, std::memory_order_relaxed);
+    }
+
 private:
     /// Worker thread main — wakes on CV signal, runs one
     /// `iplSimulatorRunPathing`, logs `[PATHING_SLOW]` if elapsed > 15 ms,
@@ -236,6 +303,23 @@ private:
     LatencyHistogram mPathingHist;
     int64_t mLastSignalNs = 0;
     float   mLastSignalIntervalMs = 0.0f;
+
+    // ── O2a completion + staging-mix tracking ──
+    // mCompletedCycles / mLastIterEndNs: see the public accessors above.
+    // mStagedSolved / mStagedSkipped: per-window counters fed by
+    // addStagingCounts (main thread), drained by the worker's
+    // [PERF pathing] dump.
+    std::atomic<uint64_t> mCompletedCycles{0};
+    std::atomic<int64_t>  mLastIterEndNs{0};
+    std::atomic<uint64_t> mStagedSolved{0};
+    std::atomic<uint64_t> mStagedSkipped{0};
+    std::atomic<uint64_t> mUnreachableCached{0};
+    std::atomic<uint64_t> mScopedSolves{0};
+    std::atomic<uint64_t> mScopeSkipped{0};
+    // Lever D stagger: mFirstSolveDeferred accumulates per window (drained
+    // by the dump); mFirstSolveBacklog is a gauge (overwritten each pass).
+    std::atomic<uint64_t> mFirstSolveDeferred{0};
+    std::atomic<uint32_t> mFirstSolveBacklog{0};
 
     // ── [PATH_RAW] sampling state (worker-thread-only) ──
     //

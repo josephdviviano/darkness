@@ -64,6 +64,38 @@ static inline void ringMixerEnableDenormalFlush()
 static inline void ringMixerEnableDenormalFlush() {}
 #endif
 
+// Save/restore variant for the start() prefill: topUp() renders the whole
+// node graph on the CALLING thread (before the mixer thread exists), and
+// FTZ/DAZ is per-thread state — enable it for the prefill, then put the
+// caller's FP environment back exactly as found (the main thread must not
+// silently inherit flush-to-zero for the rest of the session).
+#if defined(__aarch64__) || defined(_M_ARM64)
+static inline uint64_t ringMixerSaveFpEnv()
+{
+    uint64_t fpcr;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    return fpcr;
+}
+static inline void ringMixerRestoreFpEnv(uint64_t fpcr)
+{
+    __asm__ __volatile__("msr fpcr, %0" :: "r"(fpcr));
+}
+#elif defined(__SSE__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 1)
+static inline uint64_t ringMixerSaveFpEnv()
+{
+    return (static_cast<uint64_t>(_MM_GET_FLUSH_ZERO_MODE()) << 32)
+         | static_cast<uint64_t>(_MM_GET_DENORMALS_ZERO_MODE());
+}
+static inline void ringMixerRestoreFpEnv(uint64_t env)
+{
+    _MM_SET_FLUSH_ZERO_MODE(static_cast<unsigned>(env >> 32));
+    _MM_SET_DENORMALS_ZERO_MODE(static_cast<unsigned>(env & 0xFFFFFFFFu));
+}
+#else
+static inline uint64_t ringMixerSaveFpEnv() { return 0; }
+static inline void ringMixerRestoreFpEnv(uint64_t) {}
+#endif
+
 namespace Darkness {
 
 RingOutputMixer::~RingOutputMixer()
@@ -137,7 +169,19 @@ bool RingOutputMixer::start(ma_engine* engine, ma_uint32 blockFrames,
     // (briefly) the single producer and the engine's only reader. The first
     // device callback then finds a full ring even if the OS is slow to
     // schedule the new thread.
-    topUp();
+    //
+    // FTZ around the prefill: only threadMain() enables denormal flushing
+    // and it is per-thread state, so without this the prefill blocks render
+    // with denormals enabled — on a restart path with decaying IIR/
+    // convolution tails that is the 10-100x microcode penalty landing on
+    // the main thread at the exact moment we are racing to fill the ring.
+    // The caller's FP environment is restored afterwards.
+    {
+        const uint64_t savedFpEnv = ringMixerSaveFpEnv();
+        ringMixerEnableDenormalFlush();
+        topUp();
+        ringMixerRestoreFpEnv(savedFpEnv);
+    }
 
     try {
         mThread = std::thread(&RingOutputMixer::threadMain, this);

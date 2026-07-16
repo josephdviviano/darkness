@@ -973,9 +973,9 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     }
 
     // Commit candidates to the IPL batch. Per-candidate radius lets
-    // room-centroid probes have a large influence sphere (covers the
-    // whole room) while portal probes have a small one (so a closed-door
-    // OBB between two portal probes invalidates only one edge instead of
+    // interior fill probes carry a large influence sphere (covering
+    // their surroundings) while aperture probes keep a small one (so a
+    // closed-door OBB between two flanks invalidates only one edge instead of
     // the whole graph segment).
     for (size_t i = 0; i < positions.size(); ++i) {
         IPLSphere s{};
@@ -1046,12 +1046,12 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     // pathRange gates total ROUTE length), and the ray cost lives
     // entirely on visRange. So they are now split:
     //
-    //   • visRange = the SINGLE-EDGE cap, derived from the mission's
-    //     own ROOM_DB (params.pathingVisRangeFt: max intra-room
-    //     portal-to-portal span / room diameter × 1.5 margin, clamped
-    //     to [150, 400] ft — see AudioService::prepareProbeBakeParams).
-    //     The longest meaningful single hop is a room-scale distance:
-    //     any two probes further apart than the largest room either
+    //   • visRange = the SINGLE-EDGE cap, derived from achieved
+    //     coverage (params.pathingVisRangeFt: max aperture ->
+    //     nearest-same-REGION-anchor post-fill x 2.0 margin, clamped
+    //     to [100, 200] ft — see AudioService::prepareProbeBakeParams).
+    //     The longest meaningful single hop is a coverage-scale distance:
+    //     any two probes further apart than the worst covered gap either
     //     have geometry between them (edge would fail the ray test
     //     anyway — we're paying numSamples² rays to discover "no") or are
     //     connected through intermediate room/portal probes (multi-hop
@@ -1105,7 +1105,7 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
               "%.0f ft (sceneDiag=%.0f ft × %.1fx, ceiling=%.0f ft) | "
               "numSamples=%d (%d rays/pair) | density=%s\n",
               visRangeFt,
-              (params.pathingVisRangeFt > 0.0f) ? "ROOM_DB-derived cap"
+              (params.pathingVisRangeFt > 0.0f) ? "coverage-derived cap"
                                                 : "whole-level fallback",
               pathRangeFt, sceneDiagonalFt, kBakeRangeMarginMul,
               kBakeRangeCeilingFt, bakeParams.numSamples,
@@ -1139,6 +1139,12 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     outEntry.bakedVisRangeFt    = visRangeFt;
     outEntry.bakedNumSamples    = bakeParams.numSamples;
     outEntry.bakedDensity       = params.pathingDensity;
+    // Coverage derivation record (v5 header). <= 0 = the caller's
+    // derivation did not run — record 0 ("unknown"), which keeps the
+    // loader-side coverage-mismatch check firing until a real
+    // coverage-derived bake lands.
+    outEntry.bakedCoverageFt    = std::max(params.pathingCoverageFt, 0.0f);
+    outEntry.bakedRCovFt        = std::max(params.pathingRCovFt, 0.0f);
     return true;
 }
 
@@ -1276,6 +1282,8 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         ? static_cast<uint32_t>(pathEntry.bakedNumSamples) : 0u;
     const uint32_t hdrDensity = havePathing
         ? static_cast<uint32_t>(pathEntry.bakedDensity) : 0u;
+    const float hdrCoverageFt = havePathing ? pathEntry.bakedCoverageFt : 0.0f;
+    const float hdrRCovFt     = havePathing ? pathEntry.bakedRCovFt : 0.0f;
     const uint32_t hdrReflRays = carryForwardRefl
         ? static_cast<uint32_t>(mBakedReflectionRays)
         : static_cast<uint32_t>(params.bakeNumRays);
@@ -1285,7 +1293,11 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     bool writeOk = writeProbeFile(outputPath, records,
                                   hdrVisRangeFt, hdrNumSamples,
                                   hdrReflRays, hdrReflDedupFt,
-                                  hdrDensity);
+                                  hdrDensity, hdrCoverageFt, hdrRCovFt,
+                                  // 0-when-no-pathing like every other
+                                  // pathing header field — a reflection-
+                                  // only file must not claim a layout.
+                                  havePathing ? kPathingLayoutVersion : 0u);
 
     // Position sidecars (one per batch). Failure is non-fatal — overlay
     // just lacks positions until the next bake. Reflection batch carries
@@ -1325,6 +1337,9 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     mBakedPathingVisRangeFt = hdrVisRangeFt;
     mBakedPathingNumSamples = static_cast<int>(hdrNumSamples);
     mBakedPathingDensity    = static_cast<PathingProbeDensity>(hdrDensity);
+    mBakedPathingCoverageFt = hdrCoverageFt;
+    mBakedPathingRCovFt     = hdrRCovFt;
+    mBakedPathingLayoutVersion = havePathing ? kPathingLayoutVersion : 0u;
     mBakedReflectionRays    = static_cast<int>(hdrReflRays);
     mBakedProbeDedupRadiusFt = hdrReflDedupFt;
 
@@ -1475,6 +1490,12 @@ bool ProbeManager::loadProbes(const std::string &probePath,
     mBakedPathingNumSamples = static_cast<int>(hdr.bakedPathingNumSamples);
     mBakedPathingDensity    =
         static_cast<PathingProbeDensity>(hdr.bakedPathingDensity);
+    // v5 coverage fields — zero on an accepted v4 file, which is exactly
+    // what makes AudioService::pathingBakeCoverageMismatch fire the loud
+    // automatic pathing-only re-bake for pre-coverage layouts.
+    mBakedPathingCoverageFt = hdr.bakedPathingCoverageFt;
+    mBakedPathingRCovFt     = hdr.bakedPathingRCovFt;
+    mBakedPathingLayoutVersion = hdr.bakedPathingLayoutVersion;
     mBakedReflectionRays    = static_cast<int>(hdr.bakedReflectionRays);
     mBakedProbeDedupRadiusFt = hdr.bakedProbeDedupRadiusFt;
 
@@ -1585,6 +1606,9 @@ void ProbeManager::releaseBatches(IPLSimulator reflectionSimulator,
     mBakedPathingVisRangeFt = 0.0f;
     mBakedPathingNumSamples = 0;
     mBakedPathingDensity = PathingProbeDensity::Unknown;
+    mBakedPathingCoverageFt = 0.0f;
+    mBakedPathingRCovFt = 0.0f;
+    mBakedPathingLayoutVersion = 0;
     mBakedReflectionRays = 0;
     mBakedProbeDedupRadiusFt = 0.0f;
 
