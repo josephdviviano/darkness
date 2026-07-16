@@ -25,11 +25,12 @@
 /// @file ProbeFile.h
 /// Probe file format with integrity checking for baked acoustic probe data.
 ///
-/// === Version 4 (current) — v3 + pathing layout-density record ===
+/// === Version 6 (current) — v5 + probe-layout generation record ===
 ///
 /// File layout (all fields little-endian):
 ///   [0..3]   magic       "DKPr" (0x72504B44)
-///   [4..7]   version     format version (currently 4)
+///   [4..7]   version     format version (currently 6; v4/v5 still ACCEPTED —
+///            see the v4 note below)
 ///   [8..11]  batchCount  number of probe batches that follow
 ///   [12..15] totalProbes total probe count across all batches (sanity)
 ///   [16..19] bakedPathingVisRangeFt   float — the IPLPathBakeParams::visRange
@@ -56,14 +57,51 @@
 ///   [28..31] bakedProbeDedupRadiusFt  float — the reflection batch's global
 ///            dedup radius (engine feet) at bake time; the probe-DENSITY
 ///            half of the profile.
-///   [32..35] bakedPathingDensity      uint32 — PathingProbeDensity tier the
-///            pathing section's probe LAYOUT was emitted at
-///            (audio.pathing_probes.density: 1=baseline, 2=bends; see
-///            ProbeManager.h). 0 when no pathing batch. Mismatch against the
-///            active config = same policy as bakedPathingNumSamples: loud
-///            message + automatic pathing-only re-bake — a baseline cache
-///            consumed at bends density silently lacks the per-portal bend
-///            pairs the runtime layout expects (and vice versa).
+///   [32..35] bakedPathingDensity      uint32 — the density knob value
+///            (audio.pathing_probes.density: 1=baseline, 2=bends) recorded
+///            at bake time. 0 when no pathing batch. Under the portal-first
+///            layout the knob no longer changes placement (retirement is a
+///            flagged review decision); the mismatch check remains so the
+///            header always reflects the active config.
+///   [36..39] bakedPathingCoverageFt   float (v5) — the coverage governing
+///            value the visRange cap was derived from: max over REGIONS of
+///            (max aperture → nearest same-region probe distance, POST
+///            fill). Diagnostic record of the derivation input; 0 when no
+///            pathing batch (or a v4 file).
+///   [40..43] bakedPathingRCovFt       float (v5) — the coverage radius
+///            (kPathingCoverageRadiusFt, SteamAudioPathing.h) the hub-fill
+///            pass targeted at bake time. 0 when no pathing batch (or a v4
+///            file). Mismatch against the active constant = same policy as
+///            bakedPathingNumSamples: loud message + automatic pathing-only
+///            re-bake — the fill probes and the coverage-derived visRange
+///            both depend on it.
+///   [44..47] bakedPathingLayoutVersion uint32 (v6) — the probe LAYOUT
+///            generation (kPathingLayoutVersion, SteamAudioPathing.h;
+///            0 = pre-portal-first, 1 = portal-first). A layout rewrite
+///            changes none of the other recorded parameters, so without
+///            this field a pre-rewrite cache loads silently with the old
+///            layout. 0 when no pathing batch (or a v4/v5 file); mismatch
+///            = loud automatic pathing-only re-bake.
+///
+/// === Version 5 (legacy, still ACCEPTED) — v4 + coverage records ===
+///
+/// 44-byte header ending at bakedPathingRCovFt; no layout-version field.
+/// v5 files load normally with bakedPathingLayoutVersion = 0, which fails
+/// AudioService::pathingBakeLayoutMismatch and triggers the loud automatic
+/// pathing-only re-bake (reflections carried forward) — a v5 pathing
+/// section predates the portal-first layout by definition.
+///
+/// === Version 4 (legacy, still ACCEPTED) — v3 + layout-density record ===
+///
+/// 36-byte header ending at bakedPathingDensity; no coverage fields. v4
+/// files load normally with bakedPathingCoverageFt/bakedPathingRCovFt = 0.
+/// Unlike v1-v3 this is NOT rejected: the batch payloads and every other
+/// header field are bit-identical to v5, so the reflection IR blob (the
+/// expensive half) is fully reusable. The zeroed bakedPathingRCovFt then
+/// fails AudioService::pathingBakeCoverageMismatch, which triggers the
+/// loud automatic PATHING-ONLY re-bake (reflections carried forward) and
+/// rewrites the file as v6 — the pre-coverage probe layout is exactly what
+/// that mismatch check exists to keep out of a coverage-era run.
 ///
 /// Reflection-profile mismatch policy (differs from the pathing fields):
 /// a mismatch against the active profile does NOT auto-re-bake — the
@@ -112,13 +150,15 @@
 /// re-bake. The format is unrecoverable because we cannot determine whether
 /// the single batch held reflections-only, pathing-only, or both.
 ///
-/// Corner case for all legacy formats: the loader reads a full v4 header
-/// (36 bytes) before the version check, so a legacy file SHORTER than that
-/// (possible only for synthetic zero-batch/empty-payload files — real bakes
-/// always carry multi-KB payloads) reports FileTooSmall instead of
-/// UnsupportedVersion. Both statuses are loud delete-and-re-bake rejections.
+/// Corner case for all legacy formats: the loader reads a v4-sized header
+/// prefix (36 bytes) before the version check, so a legacy file SHORTER
+/// than that (possible only for synthetic zero-batch/empty-payload files —
+/// real bakes always carry multi-KB payloads) reports FileTooSmall instead
+/// of UnsupportedVersion. Both statuses are loud delete-and-re-bake
+/// rejections.
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -154,16 +194,26 @@ inline uint32_t crc32(const uint8_t *data, size_t length) {
 // ── Probe file header ─────────────────────────────────────────────────────
 
 static constexpr uint32_t kProbeFileMagic   = 0x72504B44u; // "DKPr" little-endian
-static constexpr uint32_t kProbeFileVersion = 4u;
-static constexpr size_t   kProbeFileHeaderSize = 36u;       // 9 x 4-byte fields
+static constexpr uint32_t kProbeFileVersion = 6u;
+/// v4 (36-byte header) and v5 (44-byte) files are still accepted — the
+/// loader zero-fills the missing tail fields and AudioService's mismatch
+/// checks schedule the loud pathing-only re-bake: zero coverage (v4) trips
+/// the coverage check, zero layout version (v4 AND v5) trips the
+/// layout-version check. See the format doc.
+static constexpr uint32_t kProbeFileVersionV5 = 5u;
+static constexpr uint32_t kProbeFileVersionV4 = 4u;
+static constexpr size_t   kProbeFileHeaderSize = 48u;        // 12 x 4-byte fields
+static constexpr size_t   kProbeFileHeaderSizeV5 = 44u;      // v5 prefix
+static constexpr size_t   kProbeFileHeaderSizeV4 = 36u;      // v4 prefix
 static constexpr size_t   kProbeBatchRecordHeaderSize = 16u; // 4 x uint32_t
 
-/// On-disk multi-batch file header (v4). All fields little-endian, 4-byte,
-/// so the struct is packing-free on every supported ABI (static_assert
-/// below). Pathing fields are 0 when the file has no pathing batch; the
-/// reflection fields describe the reflection blob actually in the file
-/// (preserved across pathing-only re-bakes). Full semantics in the format
-/// doc at the top of this file.
+/// On-disk multi-batch file header (v5; the first 36 bytes are the v4
+/// layout verbatim). All fields little-endian, 4-byte, so the struct is
+/// packing-free on every supported ABI (static_assert below). Pathing
+/// fields are 0 when the file has no pathing batch; the reflection fields
+/// describe the reflection blob actually in the file (preserved across
+/// pathing-only re-bakes). Full semantics in the format doc at the top of
+/// this file.
 struct ProbeFileHeader {
     uint32_t magic       = kProbeFileMagic;
     uint32_t version     = kProbeFileVersion;
@@ -174,9 +224,25 @@ struct ProbeFileHeader {
     uint32_t bakedReflectionRays    = 0;    // v3: reflection-profile half
     float    bakedProbeDedupRadiusFt = 0.0f; // v3: probe-density half
     uint32_t bakedPathingDensity    = 0;    // v4: PathingProbeDensity tier
+    float    bakedPathingCoverageFt = 0.0f; // v5: coverage governing (ft)
+    float    bakedPathingRCovFt     = 0.0f; // v5: hub-fill coverage radius (ft)
+    /// v6: pathing probe LAYOUT generation (kPathingLayoutVersion,
+    /// SteamAudioPathing.h). 0 = pre-portal-first layout (v4/v5 files,
+    /// room centroids + bend pairs); 1 = portal-first (WR-aperture nodes
+    /// + region coverage fill). None of the OTHER header fields change
+    /// across a layout rewrite, so without this a pre-rewrite cache loads
+    /// silently and the run keeps the old layout with zero signal — the
+    /// silent-stale-cache class the mismatch machinery exists to prevent.
+    uint32_t bakedPathingLayoutVersion = 0;
 };
 static_assert(sizeof(ProbeFileHeader) == kProbeFileHeaderSize,
-              "ProbeFileHeader must be exactly 36 bytes");
+              "ProbeFileHeader must be exactly 48 bytes");
+static_assert(offsetof(ProbeFileHeader, bakedPathingCoverageFt)
+                  == kProbeFileHeaderSizeV4,
+              "v5 tail must start exactly where the v4 header ended");
+static_assert(offsetof(ProbeFileHeader, bakedPathingLayoutVersion)
+                  == kProbeFileHeaderSizeV5,
+              "v6 tail must start exactly where the v5 header ended");
 
 /// On-disk per-batch record header (unchanged since v2). One precedes each
 /// batch payload.
@@ -249,6 +315,17 @@ inline const char *probeFileStatusString(ProbeFileStatus s) {
 ///                     tier of the pathing section's probe layout
 ///                     (1=baseline, 2=bends). Pass 0 when no pathing batch
 ///                     is written.
+/// @param bakedPathingCoverageFt v5 bake-profile record: the coverage
+///                     governing value (max room-wise portal → nearest
+///                     same-room probe, post hub fill) the visRange cap
+///                     was derived from. Pass 0 when no pathing batch.
+/// @param bakedPathingRCovFt v5 bake-profile record: the hub-fill coverage
+///                     radius (kPathingCoverageRadiusFt) active at bake
+///                     time. Pass 0 when no pathing batch.
+/// @param bakedPathingLayoutVersion v6 bake-profile record: the probe
+///                     LAYOUT generation (kPathingLayoutVersion) the
+///                     pathing section was emitted by. Pass 0 when no
+///                     pathing batch.
 /// @return true on success
 inline bool writeProbeFile(const std::string &outputPath,
                            const std::vector<ProbeBatchRecord> &batches,
@@ -256,7 +333,10 @@ inline bool writeProbeFile(const std::string &outputPath,
                            uint32_t bakedPathingNumSamples = 0,
                            uint32_t bakedReflectionRays = 0,
                            float bakedProbeDedupRadiusFt = 0.0f,
-                           uint32_t bakedPathingDensity = 0)
+                           uint32_t bakedPathingDensity = 0,
+                           float bakedPathingCoverageFt = 0.0f,
+                           float bakedPathingRCovFt = 0.0f,
+                           uint32_t bakedPathingLayoutVersion = 0)
 {
     // Build outer header
     ProbeFileHeader hdr;
@@ -268,6 +348,9 @@ inline bool writeProbeFile(const std::string &outputPath,
     hdr.bakedReflectionRays    = bakedReflectionRays;
     hdr.bakedProbeDedupRadiusFt = bakedProbeDedupRadiusFt;
     hdr.bakedPathingDensity    = bakedPathingDensity;
+    hdr.bakedPathingCoverageFt = bakedPathingCoverageFt;
+    hdr.bakedPathingRCovFt     = bakedPathingRCovFt;
+    hdr.bakedPathingLayoutVersion = bakedPathingLayoutVersion;
 
     std::string tmpPath = outputPath + ".tmp";
     FILE *f = std::fopen(tmpPath.c_str(), "wb");
@@ -325,7 +408,11 @@ inline ProbeFileStatus loadProbeFile(const std::string &path,
     FILE *f = std::fopen(path.c_str(), "rb");
     if (!f) return ProbeFileStatus::FileNotFound;
 
-    if (std::fread(&outHeader, sizeof(outHeader), 1, f) != 1) {
+    // Read the v4-sized prefix first — magic/version live there, and a v4
+    // file's header ENDS there. The v5 tail is read conditionally below so
+    // batch records are parsed from the correct offset for both versions.
+    outHeader = ProbeFileHeader{};
+    if (std::fread(&outHeader, kProbeFileHeaderSizeV4, 1, f) != 1) {
         std::fclose(f);
         return ProbeFileStatus::FileTooSmall;
     }
@@ -335,7 +422,32 @@ inline ProbeFileStatus loadProbeFile(const std::string &path,
         return ProbeFileStatus::BadMagic;
     }
 
-    if (outHeader.version != kProbeFileVersion) {
+    if (outHeader.version == kProbeFileVersion) {
+        // v6: read the full tail (coverage floats + layout version).
+        if (std::fread(&outHeader.bakedPathingCoverageFt,
+                       kProbeFileHeaderSize - kProbeFileHeaderSizeV4,
+                       1, f) != 1) {
+            std::fclose(f);
+            return ProbeFileStatus::FileTooSmall;
+        }
+    } else if (outHeader.version == kProbeFileVersionV5) {
+        // v5: coverage tail only; layout version stays zero-initialized,
+        // which fails the layout-mismatch check in AudioService and
+        // triggers the loud automatic pathing-only re-bake (the v5 layout
+        // predates portal-first placement). Reflection IRs carry forward.
+        if (std::fread(&outHeader.bakedPathingCoverageFt,
+                       kProbeFileHeaderSizeV5 - kProbeFileHeaderSizeV4,
+                       1, f) != 1) {
+            std::fclose(f);
+            return ProbeFileStatus::FileTooSmall;
+        }
+    } else if (outHeader.version == kProbeFileVersionV4) {
+        // v4: accepted with zeroed coverage AND layout fields (the struct
+        // init above already zeroed them); both mismatch checks fire, one
+        // loud pathing-only re-bake rewrites the file as v6. The
+        // reflection IR blob (the expensive half) carries forward
+        // unchanged. See the format doc's v4 section.
+    } else {
         std::fclose(f);
         return ProbeFileStatus::UnsupportedVersion;
     }

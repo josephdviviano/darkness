@@ -156,6 +156,113 @@ constexpr float kPathingVisRadiusFt = 5.0f;
 constexpr int kPathingVisSamplesShip = 4;
 constexpr int kPathingVisSamplesDev  = 4;
 
+/// ── Coverage-based probe-layout / bake-range constants ──────────────────
+///
+/// Graph-reduction lever (§10 machinery, re-scoped to WR REGIONS by the
+/// portal-first overhaul — PLAN.PATHING_DESIGN.md §36-40): air regions
+/// whose apertures sit further than kPathingCoverageRadiusFt from any
+/// same-region graph anchor receive interior HubFill probes
+/// (visibility-aware greedy k-center, Gonzalez farthest-point); the fill
+/// also SEEDS zero-anchor regions carrying real aperture demand and
+/// STITCHES disconnected anchor components with stepping stones (§40b).
+/// So on a typical mission the fill fires in MANY regions (MISS2: ~100
+/// seeds + fill; MISS15: 155) — that spread is normal, not over-fire.
+/// The bake cap is then derived from the POST-fill coverage:
+///
+///   visRange = clamp(kPathingCoverageMarginMul × max_region(governing),
+///              [kPathingCoverageVisRangeMinFt, kPathingCoverageVisRangeMaxFt])
+///
+/// where governing(region) = max over the region's aperture demand of the
+/// distance to the nearest same-region probe, excluding the aperture's
+/// own probe (a route entering via an aperture lands on it and must HOP
+/// onward — the hop length is what visRange has to cover; the ×2 margin
+/// bounds anchor-to-anchor hops via the demand point between them).
+/// kPathingCoverageRadiusFt is 75 ft per the §10 research (k-center /
+/// disk-cover decomposition).
+///
+/// Recorded in the .probes header (bakedPathingRCovFt /
+/// bakedPathingCoverageFt) so a cache baked under a different coverage
+/// radius (or the pre-coverage max-span derivation — v4 files, which
+/// read back 0) is caught by AudioService::pathingBakeCoverageMismatch
+/// and triggers the same loud automatic pathing-only re-bake as a
+/// numSamples/density mismatch.
+constexpr float kPathingCoverageRadiusFt      = 75.0f;
+constexpr float kPathingCoverageMarginMul     = 2.0f;
+constexpr float kPathingCoverageVisRangeMinFt = 100.0f;
+constexpr float kPathingCoverageVisRangeMaxFt = 200.0f;
+/// Per-REGION ceiling on fill + seed + stitch probes. Purely a runaway
+/// guard; hitting it is announced loudly and the region's residual
+/// coverage/connectivity then shows up in the [PATHING_BAKE_RANGE]
+/// derivation and [REGION_PARITY]. NOTE: tuned when the fill was
+/// room-scoped; regions are ~8x larger units (review item — it did not
+/// bind on MISS2/6/7/15).
+constexpr int kPathingFillMaxPerRegion = 24;
+
+/// ── Pathing probe LAYOUT generation ─────────────────────────────────────
+///
+/// Bumped whenever the probe LAYOUT algorithm changes in a way none of the
+/// other .probes header fields capture (numSamples / density / R_cov all
+/// unchanged), so cached bakes from the previous layout trigger the loud
+/// automatic pathing-only re-bake instead of loading silently.
+///   0 = pre-portal-first (room centroids + portal/bend pairs; v4/v5 files
+///       read back 0)
+///   1 = portal-first (WR-aperture nodes, region coverage fill —
+///       PLAN.PATHING_DESIGN.md §36-38)
+constexpr uint32_t kPathingLayoutVersion = 1u;
+
+/// (The bend-pair aperture size threshold that lived here —
+/// kPathingApertureBendThresholdFt = 6 ft on the ROOM_DB portal inradius —
+/// is REMOVED, and deliberately not re-tunable: the number it thresholded
+/// was a ROOM_DB box reading, and ROOM_DB size is fiction. Measured: three
+/// physically-adjacent real arches read 6.300 ft there (real openings
+/// 1.9-2.8 ft, overstated ~2.5x) and were silenced by a 5% margin, while
+/// genuine mid-air box boundaries read 5.00 ft and were kept. The aperture
+/// test is now the WR oracle — a portal is real iff world-geometry portal
+/// area exists at it — with no size rule at all.
+/// PLAN.PATHING_DESIGN.md §34/§36; WorldApertureData.h.)
+
+/// ── Warmup first-solve stagger (PLAN.PATHING_DESIGN.md §15/§16) ─────────
+///
+/// Max never-solved-yet voices the staging pass may hand to any single
+/// signaled `iplSimulatorRunPathing` iteration.
+///
+/// WHY: Steam Audio's runtime alternate-path search (`findShortestPath`,
+/// path_finder.cpp) is an A* with NO range/hop/cost bound — on a FAILING
+/// (occluded / unreachable) search it terminates only by DRAINING the
+/// whole reachable component, so its cost is edge-count-bound, not
+/// distance-bound. §15 measured this directly: Stage A's -11% edges moved
+/// the worst iteration 1959 -> 1744 ms, exactly proportional. There is no
+/// runtime search budget in the C API to cap an individual drain (capping
+/// it needs an SA fork — lever C).
+///
+/// What IS ours to control is how many drains land in the SAME iteration.
+/// At warmup ~10 voices become pathing-eligible together and their FIRST
+/// solves all stage into one iteration; several drain, and the iteration
+/// costs ~1.7 s. The step-2 unreachable-route cache already stops these
+/// from RE-solving (warmup re-solves 56 -> 4), but each voice's first
+/// solve still has to happen once. Spreading those first solves over
+/// consecutive iterations converts one ~1.7 s stall into a short series
+/// of bounded ones — the same total work, none of it in a single spike.
+///
+/// SAFE because a never-solved voice is ALREADY silent: it holds
+/// pathTargetValid=false and is parked by the F3 pending/hold machinery
+/// until its first covering solve lands. Deferring its first solve by a
+/// few ticks EXTENDS an existing correct state; it cannot create
+/// staleness (there is no prior route to go stale). This is precisely why
+/// only the never-solved class is deferrable: door-invalidated and
+/// movement/room re-solves carry the <=150 ms door-route gate and a
+/// stale-but-audible route, so they are NEVER staggered.
+///
+/// 2 = the starting value (PLAN §16). Lower flattens the warmup further
+/// (each iteration can host at most this many drains) at the cost of more
+/// ticks before every voice owns a route; raise it if warmup routes are
+/// perceptibly late. Voices over the cap keep their pathSolvePending
+/// latch and are ordered by aging-then-audibility, so the backlog drains
+/// in a bounded number of ticks (see the selection pre-pass in
+/// AudioService::loopStep) — [PERF pathing] firstSolveDeferred= /
+/// firstSolveBacklog= make it visible.
+constexpr uint32_t kPathingFirstSolvesPerIteration = 2;
+
 /// Legacy helper: returns the fixed `kPathingVisRadiusFt × kFeetToMeters`
 /// regardless of its `spacingFt` argument. The argument is preserved
 /// only to minimize call-site churn; new code should reference

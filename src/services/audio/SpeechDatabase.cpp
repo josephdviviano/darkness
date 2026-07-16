@@ -94,9 +94,9 @@ bool decodeNameMap(LeReader &r, std::vector<std::string> &out) {
             char buf[16] = {0};
             r.read(buf, 16);
             if (!r.ok) return false;
-            // Names are NUL-padded fixed 16-byte fields. The leaked
-            // engine uses `Label::text[16]`, so anything past the first
-            // NUL is padding garbage we should drop.
+            // Names are NUL-padded fixed 16-byte fields (the engine's
+            // label convention), so anything past the first NUL is
+            // padding garbage we should drop.
             const size_t len = ::strnlen(buf, 16);
             out.emplace_back(buf, len);
         } else if (tag == '-') {
@@ -111,7 +111,8 @@ bool decodeNameMap(LeReader &r, std::vector<std::string> &out) {
     return true;
 }
 
-// Walk one tag database (`cTagDBDatabase::Save`). Identical layout to
+// Walk one tag database node (the same serialized layout the original
+// engine writes). Identical layout to
 // EnvSoundDatabase's decodeNode, but the leaves get tagged with voice +
 // concept indices supplied by the caller. Returns false on parse failure.
 bool decodeNode(LeReader &r,

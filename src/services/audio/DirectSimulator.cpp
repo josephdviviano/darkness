@@ -74,6 +74,13 @@ void DirectSimulator::stop()
     if (!mThread.joinable())
         return;
     mShutdown.store(true, std::memory_order_release);
+    {
+        // Empty critical section: the standard CV shutdown handshake (see
+        // RingOutputMixer::stop) — without it the store can land between
+        // the worker's predicate check and its wait, the notify is missed,
+        // and join() hangs forever.
+        std::lock_guard<std::mutex> lk(mMutex);
+    }
     mCV.notify_one();
     mThread.join();
 }

@@ -27,14 +27,14 @@
 //   uint8[nLocalTagRequired]             // packed bitarray flagging "required" tags
 //   TagDB root                           // recursive — see below
 //
-// Each TagDB is the original engine's `cTagDBDatabase`:
+// Each TagDB node is serialized as:
 //
 //   int32  nData
-//   {int32 schemaObjID, float weight}[nData]    // sTagDBData record, 8 bytes each
+//   {int32 schemaObjID, float weight}[nData]    // data record, 8 bytes each
 //   int32  nBranch
 //   TagBranch[nBranch]
 //
-// And each TagBranch is `cBranch` followed by a child TagDB:
+// And each TagBranch is a branch key followed by a child TagDB:
 //
 //   uint32 keyType                       // a tag-type index (interpretation
 //                                        //   lives in the speech-domain name
@@ -43,7 +43,7 @@
 //                                        //   does not embed its own name maps)
 //   uint8[8]                             // a 64-bit union: either {int32 min, int32 max}
 //                                        //   for integer keys, or 8 enum bytes
-//                                        //   terminated by 0xFF (kTagDBKeyEnumUnused).
+//                                        //   terminated by the 0xFF 'unused' sentinel.
 //                                        //   We surface both interpretations.
 //   TagDB                                // recursive child
 //
@@ -83,7 +83,7 @@ public:
     };
 
     // A decoded entry: the chain of keys from root to this node, plus all
-    // sTagDBData records stored at the node. Interior nodes with no data
+    // (schemaObjID, weight) data records stored at the node. Interior nodes with no data
     // are skipped — only nodes carrying at least one data record become
     // entries (mirrors how the engine queries the tree).
     struct EnvSoundEntry {

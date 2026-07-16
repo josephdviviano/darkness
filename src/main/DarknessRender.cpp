@@ -57,6 +57,7 @@
 #include "BinMeshParser.h"
 #include "RenderConfig.h"
 #include "RayCaster.h"
+#include "WRAcousticTopology.h"
 #include "DebugConsole.h"
 #include "RoomDebugViz.h"
 
@@ -84,6 +85,7 @@
 #include "physics/PhysicsService.h"
 #include "audio/AudioLog.h"
 #include "audio/AudioService.h"
+#include "audio/SteamAudioPathing.h" // kPathingCoverageRadiusFt (bake-decision mismatch banner)
 #include "audio/AcousticMaterials.h"
 #include "audio/ProbeFile.h"
 #include "audio/ProbeManager.h"
@@ -481,6 +483,23 @@ static void printHelp() {
         "                    Seed the schema-sample-selection RNG so A/B runs\n"
         "                    pick identical wavs per event. Default: unseeded\n"
         "                    (random_device). Accepts decimal or 0xHEX.\n"
+        "  --stress-doors N  DEV-ONLY door-swing stress harness: toggle the N\n"
+        "                    doors nearest the camera open/closed every ~2 s\n"
+        "                    (first toggle after a 5 s warmup). Exercises the\n"
+        "                    O2a door-dirty-gated pathing re-solve path and its\n"
+        "                    [DOOR_ROUTE_LATENCY] staleness metric. Bypasses\n"
+        "                    frob/scripts, so no door foley fires. Emits\n"
+        "                    [STRESS_DOORS] stderr lines per cycle.\n"
+        "  --stress-door-ids \"a,b\"\n"
+        "                    DEV-ONLY: with --stress-doors armed, toggle exactly\n"
+        "                    these door object IDs each cycle instead of the\n"
+        "                    nearest-N pick (detour-class hypothesis runs).\n"
+        "  --spawn-override \"x,y,z[,yaw]\"\n"
+        "                    DEV-ONLY: force the camera/player start to this\n"
+        "                    engine-feet position instead of the mission spawn\n"
+        "                    (positioned diagnostic runs, e.g. door-stress while\n"
+        "                    standing in a specific room). Loud [SPAWN_OVERRIDE]\n"
+        "                    banner.\n"
         "  --audio-log       Enable audio log verbosity (= developer.audio_log\n"
         "                    in YAML). Required for [PERF *] histogram capture —\n"
         "                    perf runs are dark without it.\n"
@@ -3206,10 +3225,13 @@ static void registerConsoleSettings(
         // Stored as int on RuntimeState; categorical maps an option
         // index in [0..options.size()) onto our cap value. "all" → 0
         // (the sentinel selectClosestRooms reads as "no limit").
+        // 80 is the default (see RuntimeState::debugRoomMaxCount) — it MUST
+        // appear here or the getter below would fall back to reporting "20"
+        // while the cull actually ran at 80, i.e. the console would lie.
         static const std::vector<std::string> kCountOptions = {
-            "5", "10", "20", "50", "100", "all"
+            "5", "10", "20", "50", "80", "100", "all"
         };
-        static const std::vector<int> kCountValues = {5, 10, 20, 50, 100, 0};
+        static const std::vector<int> kCountValues = {5, 10, 20, 50, 80, 100, 0};
 
         dbgConsole.addCategorical("debug_room_max_count", kCountOptions,
             [&state]() -> int {
@@ -3217,13 +3239,13 @@ static void registerConsoleSettings(
                     if (kCountValues[i] == state.debugRoomMaxCount)
                         return static_cast<int>(i);
                 }
-                return 2;  // fall back to "20" (the default)
+                return 4;  // fall back to "80" (the default)
             },
             [&state](int idx) {
                 if (idx >= 0 && idx < static_cast<int>(kCountValues.size()))
                     state.debugRoomMaxCount = kCountValues[idx];
             },
-            "Cap rooms drawn by show_rooms / show_portals overlays to the camera-nearest N. 'all' disables the cull. Reduces visual clutter in dense levels.");
+            "Cap rooms drawn by show_rooms / show_portals / show_probes / show_probe_radius overlays to the camera-nearest N. 'all' disables the cull. Default 80: judging probe density by eye needs a whole open space and its neighbours visible at once. Lower it if the room/portal boxes get unreadable.");
     }
 
     dbgConsole.addBool("show_vpos",
@@ -5516,17 +5538,39 @@ int main(int argc, char *argv[]) {
                 audioSvc->setForcePathingBake(true);
                 state.probeBakePath = probePath;
                 state.probeBakeNeeded = true;
+            } else if (audioSvc->pathingBakeLayoutMismatch()) {
+                // ── [PATHING_BAKE_MISMATCH] probe-LAYOUT generation ──
+                //
+                // The .probes v6 header records which layout algorithm
+                // baked the pathing section. A layout rewrite (e.g. the
+                // portal-first overhaul) changes none of the other
+                // recorded parameters, so without this check a
+                // pre-rewrite cache loads silently and the run keeps the
+                // old probe layout with zero signal. v4/v5 files read
+                // back generation 0 and land here once.
+                std::fprintf(stderr,
+                    "[PATHING_BAKE_MISMATCH] .probes '%s' pathing section "
+                    "was baked by probe-layout generation %u but the "
+                    "running code is generation %u (portal-first) — "
+                    "scheduling an automatic pathing-only re-bake "
+                    "(reflection IRs carried forward).\n",
+                    probePath.c_str(),
+                    audioSvc->getBakedPathingLayoutVersion(),
+                    Darkness::kPathingLayoutVersion);
+                audioSvc->setForcePathingBake(true);
+                state.probeBakePath = probePath;
+                state.probeBakeNeeded = true;
             } else if (audioSvc->pathingBakeDensityMismatch()) {
                 // ── [PATHING_BAKE_MISMATCH] layout-density mismatch ──
                 //
                 // Same policy as the numSamples mismatch above: the
-                // .probes v4 header records the probe LAYOUT density the
-                // pathing section was baked at; it differs from the
-                // active `audio.pathing_probes.density` config. A
-                // baseline cache consumed at bends density silently
-                // lacks the per-portal bend pairs (and vice versa), so
-                // re-bake the pathing section now, loudly, carrying the
-                // reflection IRs forward unchanged.
+                // .probes v4 header records the density knob value the
+                // pathing section was baked at. Under portal-first
+                // placement the knob NO LONGER changes the layout
+                // (retire-or-repurpose is a flagged review decision,
+                // PLAN.PATHING_DESIGN.md §39c), so this re-bake produces
+                // an identical layout — kept only so the header always
+                // reflects the active config.
                 std::fprintf(stderr,
                     "[PATHING_BAKE_MISMATCH] .probes '%s' pathing section "
                     "was baked at layout density '%s' but "
@@ -5538,6 +5582,32 @@ int main(int argc, char *argv[]) {
                         audioSvc->getBakedPathingDensity()),
                     Darkness::pathingProbeDensityName(
                         audioSvc->getPathingProbeDensity()));
+                audioSvc->setForcePathingBake(true);
+                state.probeBakePath = probePath;
+                state.probeBakeNeeded = true;
+            } else if (audioSvc->pathingBakeCoverageMismatch()) {
+                // ── [PATHING_BAKE_MISMATCH] coverage-radius mismatch ──
+                //
+                // Same policy as the numSamples/density mismatches: the
+                // .probes v5 header records the hub-fill coverage radius
+                // (R_cov) the pathing layout + coverage-derived visRange
+                // were baked under; it differs from the active
+                // kPathingCoverageRadiusFt. v4 files land here too (they
+                // read back R_cov=0): their pre-coverage layout has no
+                // HubFill probes and a max-span-derived visRange, so
+                // re-bake the pathing section now, loudly, carrying the
+                // reflection IRs forward unchanged (the payload format
+                // did not change across v4→v5).
+                std::fprintf(stderr,
+                    "[PATHING_BAKE_MISMATCH] .probes '%s' pathing section "
+                    "was baked under coverage radius R_cov=%.0f ft but the "
+                    "active kPathingCoverageRadiusFt is %.0f ft (0 = "
+                    "pre-coverage v4 layout) — scheduling an automatic "
+                    "pathing-only re-bake (reflection IRs carried "
+                    "forward).\n",
+                    probePath.c_str(),
+                    audioSvc->getBakedPathingRCovFt(),
+                    Darkness::kPathingCoverageRadiusFt);
                 audioSvc->setForcePathingBake(true);
                 state.probeBakePath = probePath;
                 state.probeBakeNeeded = true;
@@ -5581,6 +5651,66 @@ int main(int argc, char *argv[]) {
                            Darkness::RayHit &hit) {
                     return Darkness::raycastWorld(mission.wrData, from, to, hit);
                 });
+            // The world's own definition of "in open space": is the point
+            // inside a WR cell? Cells are air; solid is their absence. Probe
+            // placement needs this because ROOM_DB boxes overlap solid and
+            // cannot answer it (see AudioService::setPointInAirFn).
+            audioSvcForRay->setPointInAirFn(
+                [&mission](const Darkness::Vector3 &p) {
+                    return Darkness::findCameraCell(mission.wrData,
+                                                    p.x, p.y, p.z) >= 0;
+                });
+            // Portal-first pathing placement ground truth: which ROOM_DB
+            // portals correspond to a REAL world-geometry opening, where
+            // that opening actually is, and the air-region decomposition.
+            // Built here because the WR data lives renderer-side (same
+            // rationale as the two injections above); consumed by
+            // prepareProbeBakeParams, which runs from the deferred bake
+            // block LATER in startup — so this wiring precedes every bake.
+            {
+                Darkness::RoomServicePtr roomSvcTopo =
+                    GET_SERVICE(Darkness::RoomService);
+                if (roomSvcTopo && roomSvcTopo->isLoaded()) {
+                    Darkness::WRAcousticTopologyResult topo =
+                        Darkness::buildWRAcousticTopology(mission.wrData,
+                                                          *roomSvcTopo);
+                    std::fprintf(stderr,
+                        "[APERTURE_TOPOLOGY] ROOM_DB portals=%d -> real "
+                        "apertures=%zu, fictional=%d, unplaceable=%d; air "
+                        "regions=%d\n",
+                        topo.rdbPortalsTotal, topo.data.apertures.size(),
+                        topo.fictionalPortals, topo.unplaceableCount,
+                        topo.data.numRegions);
+                    // cellRegion + the gridded cell locator are moved
+                    // into the closure — the lambda owns both for the
+                    // mission's lifetime. The locator replaces the
+                    // O(numCells) findCameraCell scan: the bake calls
+                    // this thousands of times (per floor candidate, per
+                    // surviving candidate, per probe in parity), which
+                    // measured out at hundreds of ms of rescanning.
+                    auto cellRegion = std::make_shared<
+                        std::vector<int32_t>>(std::move(topo.cellRegion));
+                    auto locator = std::make_shared<
+                        Darkness::WRCellLocator>(mission.wrData);
+                    audioSvcForRay->setWorldApertureData(
+                        std::move(topo.data),
+                        [locator, cellRegion](const Darkness::Vector3 &p) {
+                            const int32_t cell =
+                                locator->locate(p.x, p.y, p.z);
+                            if (cell < 0 || static_cast<size_t>(cell)
+                                                >= cellRegion->size())
+                                return -1;
+                            return static_cast<int>((*cellRegion)[
+                                static_cast<size_t>(cell)]);
+                        });
+                } else {
+                    std::fprintf(stderr,
+                        "[FALLBACK] aperture topology not built: RoomService "
+                        "%s — the pathing bake cannot run portal-first "
+                        "placement and will refuse loudly\n",
+                        roomSvcTopo ? "not loaded" : "missing");
+                }
+            }
             // loadProbes ran BEFORE setRaycaster (above), so the first
             // pathing-adjacency build attempt was a no-op fallback. Now
             // that the raycaster is wired, rebuild so show_pathing_graph
@@ -6384,6 +6514,30 @@ int main(int argc, char *argv[]) {
     // ── Initialize runtime state: mode string, model isolation, spawn/camera ──
     initRuntimeState(mission, meshes, gpu, camX, camY, camZ, state);
 
+    // DEV-ONLY --spawn-override "x,y,z[,yaw]": place the camera/player at
+    // an explicit position instead of the mission's PlayerFactory marker.
+    // Diagnostic companion to --stress-doors / --auto-run — positioned
+    // runtime measurements (e.g. the PLAN.PATHING_DESIGN.md §10
+    // door-stress-while-standing-in-a-hub-room cell) need the listener
+    // parked in a SPECIFIC room, and nothing ships a teleport. Loud
+    // banner per feedback_no_silent_fallbacks: a run that silently
+    // starts somewhere other than the mission spawn would corrupt any
+    // comparison against a normal run.
+    if (cfg.spawnOverride) {
+        std::fprintf(stderr,
+            "[SPAWN_OVERRIDE] DEV: camera/player start forced to "
+            "(%.1f, %.1f, %.1f) yaw=%.1f (mission spawn was "
+            "%.1f, %.1f, %.1f)\n",
+            cfg.spawnOverrideX, cfg.spawnOverrideY, cfg.spawnOverrideZ,
+            cfg.spawnOverrideYaw, state.spawnX, state.spawnY, state.spawnZ);
+        state.spawnX  = cfg.spawnOverrideX;
+        state.spawnY  = cfg.spawnOverrideY;
+        state.spawnZ  = cfg.spawnOverrideZ;
+        state.spawnYaw = cfg.spawnOverrideYaw;
+        state.cam.init(state.spawnX, state.spawnY, state.spawnZ);
+        state.cam.yaw = state.spawnYaw;
+    }
+
     // Initialize physics player at spawn position.
     // Use the camera position (eye level) directly as initial body center.
     // Gravity will pull the player down to the floor within a fraction of a
@@ -7024,6 +7178,12 @@ int main(int argc, char *argv[]) {
     // path").
     auto mainLoopStart = std::chrono::steady_clock::now();
     bool exitAfterFired = false;
+    // DEV-ONLY --stress-doors state (see RenderConfig.h AppConfig comment):
+    // first toggle after a 5 s warmup (level + audio pipeline settled),
+    // then every ~2 s. 2 s vs typical 1-2 s swing times keeps several
+    // doors continuously animating — the O2a [DOOR_ROUTE_LATENCY] load.
+    float stressDoorsNextToggleSec = 5.0f;
+    int   stressDoorsCycle = 0;
     while (state.running && !loopSvc->isTerminationRequested()) {
         loopSvc->step();
         if (cfg.exitAfterSeconds > 0.0f && !exitAfterFired) {
@@ -7036,6 +7196,76 @@ int main(int argc, char *argv[]) {
                     elapsed, cfg.exitAfterSeconds);
                 state.running = false;
                 exitAfterFired = true;
+            }
+        }
+        // DEV-ONLY door-swing stress harness. Runs on the main thread
+        // (same thread as SimService/DoorSystem), toggling doors via
+        // DoorSystem::activate — the exact per-tick path a frobbed door
+        // takes (simStep animation → collision + audio-mesh callbacks →
+        // AudioService::setDoorTransform → door-gen bump), minus the
+        // script layer. Candidate set = doors with a usable audio OBB
+        // (nonzero edgeLengths — the same filter registerDoorGeometry
+        // applies), ranked by distance to the current camera each cycle
+        // so a touring player keeps stressing NEARBY doors.
+        if (cfg.stressDoors > 0) {
+            float elapsed = std::chrono::duration<float>(
+                std::chrono::steady_clock::now() - mainLoopStart).count();
+            if (elapsed >= stressDoorsNextToggleSec) {
+                stressDoorsNextToggleSec += 2.0f;
+                ++stressDoorsCycle;
+                Darkness::Vector3 camPos(state.cam.pos[0],
+                                         state.cam.pos[1],
+                                         state.cam.pos[2]);
+                // --stress-door-ids override: pin the toggle set to the
+                // explicit list (detour-class hypothesis runs need the
+                // SAME door swinging all run regardless of camera
+                // position). Unknown / OBB-less IDs are reported loudly
+                // per cycle instead of silently shrinking the set.
+                std::vector<int32_t> picks;
+                if (!cfg.stressDoorIDs.empty()) {
+                    for (int32_t id : cfg.stressDoorIDs) {
+                        const Darkness::DoorState *d = doorSystem.getDoor(id);
+                        if (!d || glm::length(d->edgeLengths) < 0.01f) {
+                            std::fprintf(stderr,
+                                "[STRESS_DOORS] requested door %d is %s "
+                                "— skipped this cycle\n", id,
+                                d ? "missing a usable audio OBB"
+                                  : "not a known door");
+                            continue;
+                        }
+                        picks.push_back(id);
+                    }
+                } else {
+                    std::vector<std::pair<float, int32_t>> candidates;
+                    for (int32_t id : doorSystem.getAllDoorIDs()) {
+                        const Darkness::DoorState *d = doorSystem.getDoor(id);
+                        if (!d) continue;
+                        if (glm::length(d->edgeLengths) < 0.01f) continue;
+                        candidates.emplace_back(
+                            glm::length(d->basePosition - camPos), id);
+                    }
+                    std::sort(candidates.begin(), candidates.end());
+                    const int n = std::min<int>(
+                        cfg.stressDoors, static_cast<int>(candidates.size()));
+                    for (int i = 0; i < n; ++i)
+                        picks.push_back(candidates[i].second);
+                }
+                std::string toggled;
+                for (int32_t id : picks) {
+                    doorSystem.activate(id, Darkness::kDoorToggle);
+                    if (!toggled.empty()) toggled += ",";
+                    toggled += std::to_string(id);
+                }
+                const int requested = cfg.stressDoorIDs.empty()
+                    ? cfg.stressDoors
+                    : static_cast<int>(cfg.stressDoorIDs.size());
+                std::fprintf(stderr,
+                    "[STRESS_DOORS] cycle #%d t=%.1fs toggled %d/%d "
+                    "requested doors (ids: %s) cam=(%.0f,%.0f,%.0f)\n",
+                    stressDoorsCycle, elapsed,
+                    static_cast<int>(picks.size()), requested,
+                    toggled.empty() ? "none" : toggled.c_str(),
+                    camPos.x, camPos.y, camPos.z);
             }
         }
     }

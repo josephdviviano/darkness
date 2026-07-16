@@ -99,7 +99,7 @@ struct SoundPathRecord {
 /// RoomService::propagateSoundPath); single-path callers can ignore the
 /// vector and consume the merged scalars unchanged. The original Dark
 /// Engine kept up to two predecessor paths per room (cBFRoomInfo's
-/// previous_room_2 + MergeSounds); SP-1 generalizes to N configurable
+/// a hardcoded two-path merge); SP-1 generalizes to N configurable
 /// paths.
 struct SoundPropInfo {
     /// Merged effective distance (min over paths). Drives volume.
@@ -185,7 +185,8 @@ struct SoundPropParams {
     /// An alternate path is kept only if its effective distance is
     /// within this many world units of the primary (best) path. Beyond
     /// this, alternates contribute too little to the merge to matter.
-    /// Default 10.0 matches the original engine's kMaxDistDiff.
+    /// Default 10.0 matches the original engine's alternate-path
+    /// distance-difference cap.
     float maxPathDiff = 10.0f;
     /// Max number of probe candidates per endpoint (source + listener)
     /// for the multi-probe weighted-blend pass. Each query runs K_src ×

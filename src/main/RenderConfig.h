@@ -248,7 +248,7 @@ struct RenderConfig {
     uint32_t propMaxPaths     = 2;
     // Alternates kept only if their effective distance is within this
     // many world units of the primary. Matches the original engine's
-    // kMaxDistDiff = 10. Clamped to [0, 50].
+    // distance-difference cap default = 10. Clamped to [0, 50].
     float    propMaxPathDiff  = 10.0f;
     // Multiplier on the scalar gain produced by Steam Audio's baked
     // pathing eqCoeffs. 1.0 = identity. Use > 1 to make through-portal
@@ -444,6 +444,44 @@ struct RenderConfig {
     // length → voice lifetime → voice-count profile). -1 = unseeded
     // (std::random_device, the default shipping behavior).
     int64_t     audioRngSeed        = -1;         // --audio-rng-seed
+
+    // -- door-swing stress harness (DEV-ONLY) --
+    // --stress-doors N toggles the N doors nearest the camera (of the
+    // doors with a usable audio OBB) open/closed every ~2 s during a run.
+    // Exists solely to exercise the O2a door-dirty-gated pathing
+    // re-solve path and its [DOOR_ROUTE_LATENCY] staleness metric
+    // (PLAN.PATHING_DESIGN.md §6 decision 1) under a scripted swing load
+    // that a hands-off tour can't produce. Bypasses the frob/script
+    // layer (DoorSystem::activate directly), so no door foley schemas
+    // fire — intentional: the metric under test is route updates of
+    // OTHER voices, not door sounds. 0 = disabled (the default; never
+    // ship-enabled).
+    int         stressDoors         = 0;          // --stress-doors N
+
+    // --stress-door-ids "a,b,..." (DEV-ONLY, diagnostic companion to
+    // --stress-doors): toggle EXACTLY these door object IDs every cycle
+    // instead of the N nearest the camera. Exists for the door-event
+    // pathing-latency hypothesis runs: single-door runs pinned to a door
+    // of a known alternate-route detour class (NONE/LONG/SHORT — see
+    // analysis/door_detour_class.py) need the same door swinging all run,
+    // which the distance-ranked selection can't guarantee on a moving
+    // tour. Empty = disabled; when set it overrides the nearest-N pick
+    // (a nonzero --stress-doors is still required to arm the harness).
+    std::vector<int32_t> stressDoorIDs;           // --stress-door-ids "a,b"
+
+    // --spawn-override "x,y,z[,yaw]" (DEV-ONLY, diagnostic companion to
+    // --stress-doors / --auto-run): force the camera/player start to an
+    // explicit engine-feet position instead of the mission's spawn
+    // marker. Positioned runtime measurements (e.g. the door-stress-
+    // while-standing-in-a-hub-room cell from PLAN.PATHING_DESIGN.md §10)
+    // need the listener parked in a SPECIFIC room; nothing ships a
+    // teleport. Applied loudly ([SPAWN_OVERRIDE] banner) right after
+    // initRuntimeState in DarknessRender.cpp. Never ship-enabled.
+    bool        spawnOverride       = false;      // --spawn-override "x,y,z[,yaw]"
+    float       spawnOverrideX      = 0.0f;
+    float       spawnOverrideY      = 0.0f;
+    float       spawnOverrideZ      = 0.0f;
+    float       spawnOverrideYaw    = 0.0f;
 };
 
 // Result of CLI parsing — values that are CLI-only (not in YAML).
@@ -1607,6 +1645,12 @@ inline bool isPerfLabelValid(const std::string& s) {
 //   --audio-capture-rotations N full yaw turns over the window (default 3)
 //   --capture-wav      record final engine output to output.wav in the
 //                      per-run perf directory (= developer.capture_wav)
+//   --stress-doors N   DEV-ONLY: toggle the N nearest doors every ~2 s
+//                      (O2a door-route-latency stress harness)
+//   --stress-door-ids "a,b"  DEV-ONLY: with --stress-doors armed, toggle
+//                      exactly these door object IDs instead of nearest-N
+//   --spawn-override "x,y,z[,yaw]"  DEV-ONLY: force the camera/player start
+//                      position (positioned diagnostic runs)
 //   --help / -h        print usage
 //
 // Unknown flags are reported but otherwise ignored — when a removed flag
@@ -1796,6 +1840,72 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                 std::fprintf(stderr,
                     "[FALLBACK] --audio-rng-seed: invalid '%s' — keeping "
                     "unseeded (random_device)\n", argv[i]);
+            }
+        } else if (std::strcmp(argv[i], "--stress-doors") == 0 && i + 1 < argc) {
+            // DEV-ONLY door-swing stress harness (see AppConfig comment).
+            try {
+                cfg.stressDoors = std::stoi(argv[++i]);
+                if (cfg.stressDoors < 0) cfg.stressDoors = 0;
+            } catch (...) {
+                std::fprintf(stderr,
+                    "[FALLBACK] --stress-doors: non-integer value '%s' — "
+                    "harness stays disabled\n", argv[i]);
+                cfg.stressDoors = 0;
+            }
+        } else if (std::strcmp(argv[i], "--stress-door-ids") == 0 && i + 1 < argc) {
+            // DEV-ONLY explicit-door companion to --stress-doors (see
+            // AppConfig comment). Comma-separated object IDs; a malformed
+            // token discards the whole list LOUDLY rather than silently
+            // stressing a partial set.
+            const char* arg = argv[++i];
+            std::vector<int32_t> ids;
+            bool ok = true;
+            const char* p = arg;
+            while (*p != '\0') {
+                char* end = nullptr;
+                long v = std::strtol(p, &end, 10);
+                if (end == p) { ok = false; break; }
+                ids.push_back(static_cast<int32_t>(v));
+                p = end;
+                if (*p == ',') ++p;
+                else if (*p != '\0') { ok = false; break; }
+            }
+            if (ok && !ids.empty()) {
+                cfg.stressDoorIDs = ids;
+            } else {
+                std::fprintf(stderr,
+                    "[FALLBACK] --stress-door-ids: malformed list '%s' — "
+                    "explicit-door override stays disabled\n", arg);
+            }
+        } else if (std::strcmp(argv[i], "--spawn-override") == 0 && i + 1 < argc) {
+            // DEV-ONLY positioned-start override (see AppConfig comment).
+            // "x,y,z" or "x,y,z,yaw"; a malformed token discards the
+            // whole override LOUDLY rather than silently starting
+            // somewhere unintended.
+            const char* arg = argv[++i];
+            float vals[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            int   count = 0;
+            bool  ok = true;
+            const char* p = arg;
+            while (*p != '\0' && count < 4) {
+                char* end = nullptr;
+                float v = std::strtof(p, &end);
+                if (end == p) { ok = false; break; }
+                vals[count++] = v;
+                p = end;
+                if (*p == ',') ++p;
+                else if (*p != '\0') { ok = false; break; }
+            }
+            if (ok && *p == '\0' && (count == 3 || count == 4)) {
+                cfg.spawnOverride    = true;
+                cfg.spawnOverrideX   = vals[0];
+                cfg.spawnOverrideY   = vals[1];
+                cfg.spawnOverrideZ   = vals[2];
+                cfg.spawnOverrideYaw = (count == 4) ? vals[3] : 0.0f;
+            } else {
+                std::fprintf(stderr,
+                    "[FALLBACK] --spawn-override: malformed \"x,y,z[,yaw]\" "
+                    "value '%s' — using the mission spawn\n", arg);
             }
         } else if (std::strcmp(argv[i], "--bake-quality") == 0 && i + 1 < argc) {
             // Bake-quality profile. "dev" forces the fast iteration bake

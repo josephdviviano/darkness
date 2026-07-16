@@ -48,7 +48,7 @@ struct Bw {
 
     // Writes a name-map entry: '+' tag followed by a fixed 16-byte
     // NUL-padded field. Names longer than 15 chars are truncated to
-    // match the engine's Label::text[16] convention.
+    // match the engine's fixed 16-byte NUL-padded name convention.
     void nameEntry(const std::string &s) {
         u8('+');
         char buf[16] = {0};
@@ -237,7 +237,7 @@ TEST_CASE("SpeechDatabase decodes a voice with one tagged concept entry",
 
 TEST_CASE("SpeechDatabase clamps long names to 15 chars",
           "[speech][parser][decode]") {
-    // Engine's Label::text is 16 bytes incl. NUL terminator, so anything
+    // Engine name fields are 16 bytes incl. NUL terminator, so anything
     // longer than 15 chars on disk gets truncated by `strnlen(buf, 16)`.
     Bw w;
     w.nameMap({std::string(20, 'A')});  // builder itself clips to 15

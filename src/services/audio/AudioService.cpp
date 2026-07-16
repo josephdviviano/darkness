@@ -50,10 +50,12 @@
 #include "VoicePool.h"
 #include "ServiceCommon.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <ctime>
 #include <queue>
+#include <tuple>
 #include <random>
 #include <set>
 #include <sys/stat.h>
@@ -503,8 +505,11 @@ static inline float audioSanitizeScalar(float v, float fallback = 0.0f) {
 /// dropouts that look indistinguishable from NaN-silenced channels.  Worth
 /// enabling on every thread that runs DSP code.
 ///
-/// macOS arm64: set FPCR bits FZ (24) and the per-input flush bit (FZ16,
-/// bit 19).  x86 (Intel macOS, Linux, Windows): use the SSE MXCSR macros.
+/// macOS arm64: set FPCR bit FZ (24) — flush denormal RESULTS to zero.
+/// (FZ16, bit 19, is deliberately NOT set: no half-precision DSP runs
+/// here, and the code below matches this comment — an earlier version of
+/// this doc claimed both bits while only 24 was set.)
+/// x86 (Intel macOS, Linux, Windows): use the SSE MXCSR macros.
 /// Both calls are idempotent; safe to invoke at the top of every audio
 /// callback (cost is a single register read/write).
 static inline void audioEnableDenormalFlush() {
@@ -1130,11 +1135,13 @@ static std::atomic<float> sCommitPeakMs{0.0f};         // peak iplSimulatorCommi
 // dump consumes them via snapshotAndReset(). Gated by gAudioLogVerbose
 // at every call site so production cost is zero.
 static LatencyHistogram sPerfDspNodeMs;       // SteamAudioDSPNode per-voice callback
-// T2.1 — per-callback wall-clock for the audio callback body. Same
-// signal as sPerfDspNodeMs's per-voice record but captured at the
-// callback boundary (start-to-end of steamAudioNodeProcess for one
-// voice's contribution), so we can compare p50/p95/p99 against the
-// hard CoreAudio deadline `frames / sampleRate × 1000 ms`. Writer:
+// T2.1 — PER-VOICE wall-clock of one steamAudioNodeProcess invocation.
+// CAUTION: this is NOT the whole-callback cost — a callback runs one
+// node process per active voice, so the true callback load is roughly
+// the SUM over voices. Comparing this histogram's p99 against the
+// CoreAudio deadline therefore UNDERSTATES load by ~Nvoices — with 10
+// voices at 15% each, no deadline warning fires at ~150% real load.
+// (True per-callback accounting = flagged review item.) Writer:
 // audio thread (one, via the same gAudioLogVerbose gate that
 // already guards sPerfDspNodeMs). Reader: main-thread periodic
 // dump. Budget-breach warning logged from the main thread when
@@ -1380,6 +1387,57 @@ static LatencyHistogram sPerfDirectSimMs;
 // thread (initVoiceDSP, one record per spawn). Drained by
 // dumpAudioStatusPeriodic only.
 static LatencyHistogram sPerfVoiceDspInitMs;
+
+// ── [PERF path_trig] — staged-SOLVE trigger census (stacking diagnosis) ──
+//
+// One increment per trigger condition that held on each staged pathing
+// SOLVE (a solve can carry several triggers). Writers: main-thread staging
+// pass in loopStep. Drained (exchange 0) by dumpAudioStatusPeriodic into
+// the [PERF path_trig] line. Purpose: distinguish which memo trigger
+// drives re-solves during the warmup cluster / door swings, and count how
+// many staged solves target voices whose CURRENT outputs are the
+// expensive no-route verdict (each such solve re-runs an exhaustive
+// findAlternatePaths) vs the init sentinel (first solve not landed yet).
+static std::atomic<uint64_t> sPathTrigSolves{0};      // solves staged total
+static std::atomic<uint64_t> sPathTrigPending{0};     // pathSolvePending latch
+static std::atomic<uint64_t> sPathTrigNever{0};       // !pathEverSolved
+static std::atomic<uint64_t> sPathTrigDoorGen{0};     // door gen advanced
+static std::atomic<uint64_t> sPathTrigRising{0};      // pathingWanted rising edge
+static std::atomic<uint64_t> sPathTrigRoom{0};        // listener room changed
+static std::atomic<uint64_t> sPathTrigLMove{0};       // listener moved > memo ft
+static std::atomic<uint64_t> sPathTrigSMove{0};       // source moved > memo ft
+static std::atomic<uint64_t> sPathTrigNoRoute{0};     // solve of a no-route-verdict voice
+static std::atomic<uint64_t> sPathTrigSentinel{0};    // solve of a sentinel-outputs voice
+// Unreachable-route cache hits: staged-SKIP decisions that the pre-cache
+// memo would have staged as SOLVE (doorGen unchanged; suppressed
+// re-solve of a known no-route voice). [PERF pathing] unreachableCached=N.
+static std::atomic<uint64_t> sPathUnreachableCached{0};
+
+// ── [PERF door_route] cadence fields — commit/solve alternation check ──
+//
+// Per-dump-window counters for the O2a door-commit path: how many door
+// transform bumps arrived, how many coalesced iplSceneCommit calls
+// landed, how many top-of-frame commit attempts were deferred (a sim
+// worker busy), and how many pathing signals fired. During a continuous
+// swing the design target is commit→solve alternation every ~2 frames:
+// commits ≈ signals, deferred ≈ small multiple of commits. Writers: main
+// thread only. Drained by dumpAudioStatusPeriodic.
+static std::atomic<uint64_t> sDoorBumpsWindow{0};
+static std::atomic<uint64_t> sDoorCommitsWindow{0};
+static std::atomic<uint64_t> sDoorCommitDeferredWindow{0};
+static std::atomic<uint64_t> sPathSignalsWindow{0};
+
+// ── [PERF scope] — O3-lite scoped-invalidation census (per-dump-window) ──
+//
+// The scope solve-set size during door swings is the headline metric
+// (target: shrink all-in-range ~11 to the 1-2 actually routed through the
+// moving door). dirtyMarked = total voice-dirty marks across commits that
+// touched a registered voice; commitsWithMark = number of such commits;
+// dirtyMax = the largest single-commit solve set. All written main-thread
+// (loopStep commit block); drained by dumpAudioStatusPeriodic.
+static std::atomic<uint64_t> sScopeDirtyMarkedWindow{0};
+static std::atomic<uint64_t> sScopeCommitCountWindow{0};
+static std::atomic<uint64_t> sScopeDirtyMaxWindow{0};
 
 static std::atomic<float> sDirectSimPeakMs{0.0f};     // peak iplSimulatorRunDirect time (ms)
 // sReflSimPeakMs and sReflFramesRun moved to ReflectionSimulator.cpp (the
@@ -4052,7 +4110,11 @@ bool AudioService::initMiniaudio()
         return false;
     }
 
-    // Store the engine sample rate (48kHz) for Steam Audio to match.
+    // Store the ENGINE sample rate for Steam Audio to match. NAME WARNING:
+    // the member is called mDeviceSampleRate but holds the engine/mixer
+    // rate (ma_engine_get_sample_rate), which may differ from the device
+    // hardware clock — renaming it is a review item; do not read it as
+    // the device rate.
     // The device may run at a different native rate (e.g. 96kHz);
     // miniaudio resamples internally.
     mDeviceSampleRate = ma_engine_get_sample_rate(mMaEngine);
@@ -4718,6 +4780,7 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         sceneSettings.type = sceneTypeEnum;
 
         IPLerror err = iplSceneCreate(mIplContext, &sceneSettings, &mIplScene);
+        if (err == IPL_STATUS_SUCCESS) mIplSceneRefCount = 1;
         if (err != IPL_STATUS_SUCCESS && sceneTypeEnum == IPL_SCENETYPE_EMBREE) {
             std::fprintf(stderr,
                 "[FALLBACK] iplSceneCreate(embree) failed (error %d) — Steam Audio "
@@ -4729,6 +4792,7 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             mSceneTypeCfg = "default";
             sceneSettings.type = sceneTypeEnum;
             err = iplSceneCreate(mIplContext, &sceneSettings, &mIplScene);
+            if (err == IPL_STATUS_SUCCESS) mIplSceneRefCount = 1;
         }
         if (err != IPL_STATUS_SUCCESS) {
             LOG_ERROR("AudioService: iplSceneCreate failed (error %d)", err);
@@ -5106,6 +5170,7 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         // brings it down to zero (one retain per simulator + the original
         // create reference).
         iplSceneRetain(mIplScene);
+        ++mIplSceneRefCount;
         iplSimulatorSetScene(directSimHandle, mIplScene);
         iplSimulatorCommit(directSimHandle);
 
@@ -5168,6 +5233,7 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             // the direct sim above — refcount balances against the
             // iplSceneRelease in destroyAcousticScene).
             iplSceneRetain(mIplScene);
+            ++mIplSceneRefCount;
             iplSimulatorSetScene(pathingSimHandle, mIplScene);
             iplSimulatorCommit(pathingSimHandle);
 
@@ -5694,6 +5760,12 @@ void AudioService::destroyAcousticScene()
         IPLSimulator pathHandle = mPathingSim    ? mPathingSim->simulator()    : nullptr;
         mProbeManager->releaseBatches(reflHandle, pathHandle);
         mPathingProbeBatchAdded = false;
+        // Drop any un-retired [DOOR_ROUTE_LATENCY] epochs + in-flight
+        // solve record: with the batch gone no covering solve can ever
+        // retire them, and a later re-attach would record their (now
+        // teardown-spanning) staleness as fake monster samples.
+        mDoorGenEvents.clear();
+        mDoorSolveInFlight = false;
     }
 
     if (mReflectionSim && mReflectionSim->simulator()) {
@@ -5745,19 +5817,36 @@ void AudioService::destroyAcousticScene()
     }
     mSceneNeedsCommit.store(false, std::memory_order_relaxed);
 
+    // O3-lite scoped-invalidation state is scene-scoped (door maps + router
+    // graph + reverse index). Drop it all on teardown so a reload rebuilds
+    // from scratch (rebuildDoorScopeMaps runs at the next registerDoorGeometry).
+    mDoorRoomPair.clear();
+    mRoomPairDoors.clear();
+    mRouterPortals.clear();
+    mRouterRoomPortals.clear();
+    mRouterReady = false;
+    mDoorVoices.clear();
+    mVoiceRegisteredDoors.clear();
+    mDoorsBumpedSinceCommit.clear();
+
     if (mIplStaticMesh) {
         iplStaticMeshRelease(&mIplStaticMesh);
         mIplStaticMesh = nullptr;
     }
     if (mIplScene) {
-        // We hold two references on the scene: one from iplSceneCreate, one
-        // from iplSceneRetain in initAcousticScene (the second simulator's
-        // reference). Release both so the refcount reaches zero. Pass a
-        // local handle the first time so iplSceneRelease's null-on-deref
-        // doesn't clobber mIplScene before the second call.
-        IPLScene aliased = mIplScene;
-        iplSceneRelease(&aliased);            // drops the retain
-        iplSceneRelease(&mIplScene);          // drops the original create-ref
+        // Release exactly as many references as we actually acquired
+        // (create + one per simulator retain — mIplSceneRefCount). Early
+        // init-failure paths reach here holding ONLY the create reference,
+        // and the fully-built pipeline holds three; a hardcoded count was
+        // wrong in both directions (leak on reload / UAF on init failure).
+        // Aliased handles for all but the last release so iplSceneRelease's
+        // null-on-deref doesn't clobber mIplScene early.
+        for (int i = 0; i + 1 < mIplSceneRefCount; ++i) {
+            IPLScene aliased = mIplScene;
+            iplSceneRelease(&aliased);
+        }
+        iplSceneRelease(&mIplScene);          // final: nulls mIplScene
+        mIplSceneRefCount = 0;
     }
 
     // Drop the dangling-pointer aliased scene handle that AudioOcclusion
@@ -5940,6 +6029,17 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
         "(created=%d, skipped=%d)...\n", created, skipped);
     iplSceneCommit(mIplScene);
 
+    // O2a: registration changes door acoustic state (doors just appeared
+    // in the scene) — bump the generation counter so every voice's next
+    // due tick re-solves against the door-populated BVH. The commit above
+    // already ran, so the committed gen advances in the same breath.
+    // Deliberately NO [DOOR_ROUTE_LATENCY] epoch here: registration is a
+    // boot-time scene-build step, not a door-movement event, and a boot
+    // sample would pollute the swing-staleness percentiles the user gate
+    // is set on.
+    ++mDoorAcousticGen;
+    mDoorGenCommitted = mDoorAcousticGen;
+
     std::fprintf(stderr,
         "[DOOR_AUDIO] registerDoorGeometry: done — %d instanced meshes "
         "(of %zu doors)\n", created, doors.size());
@@ -6018,6 +6118,20 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
                 pp.size(), mDoorAudioInstances.size());
         }
     }
+
+    // [DOOR_PORTAL_MAP] — one line per registered door with its matched
+    // ROOM_DB portal (room pair), for the offline detour classifier. See
+    // the declaration comment in AudioService.h.
+    logDoorPortalMap();
+
+    // O3-lite scoped invalidation: build door→room-pair maps + the shadow-
+    // router portal graph from this door batch + ROOM_DB. Registration
+    // edges (mDoorVoices) are per-voice and refreshed at solve time; the
+    // door set changed, so any stale reverse-index edges are meaningless.
+    mDoorVoices.clear();
+    mVoiceRegisteredDoors.clear();
+    mDoorsBumpedSinceCommit.clear();
+    rebuildDoorScopeMaps();
 }
 
 //------------------------------------------------------
@@ -6043,11 +6157,77 @@ void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTrans
     // Coalesce into one iplSceneCommit per loopStep (see loopStep header).
     mSceneNeedsCommit.store(true, std::memory_order_release);
 
+    // O2a door acoustic generation counter (PLAN.PATHING_DESIGN.md §4).
+    // One bump per transform push on a registered door — a swinging door
+    // bumps every sim tick, which is what forces per-tick route re-solves
+    // during swings (user requirement: smoother than the original's
+    // on-event step function). The per-voice solve memo compares against
+    // the COMMITTED gen (advanced after the coalesced iplSceneCommit in
+    // loopStep), so a solve is only considered to cover this bump once
+    // the BVH actually contains the new pose.
+    //
+    // Epoch FIFO for [DOOR_ROUTE_LATENCY] — latest-gen-wins semantics
+    // (stacking fix, PLAN.PATHING_DESIGN.md §11): push one epoch PER BUMP.
+    // A completed covering solve retires ALL epochs ≤ its covered gen at
+    // once, recording each epoch's latency from its OWN bump time — so a
+    // solve covering gen 40 closes epochs 31..40 in one batch instead of
+    // the old absorb-into-earliest scheme, whose one-sample-per-solve
+    // reporting made every sample carry the FULL accumulated pipeline
+    // wait (in-flight solve remainder + commit deferral + covering solve)
+    // even though only the OLDEST uncovered state was ever that stale.
+    // Perceptually only the newest door state matters; per-state staleness
+    // is the honest gate quantity, and the batch's oldest sample still
+    // carries the old worst-case envelope.
+    //
+    // Gated on pathing-operative (mirrors review F5's due-override gate):
+    // with pathing disabled / no probe batch / no simulator, no solve can
+    // ever retire epochs, and per-bump pushes would grow the deque
+    // unboundedly (the old back()<=lastSignal scheme was self-bounding).
+    // Cap as a backstop for a stuck pipeline — dropping the NEWEST bump
+    // is safe for the metric (retirement covers it via gen ≤ G; it just
+    // records no sample) but must be LOUD (no-silent-fallbacks).
+    // Main-thread only (DoorSystem::simStep callback).
+    ++mDoorAcousticGen;
+    // Doors-active stamp for the unreachable-route cache (see
+    // mDoorLastBumpNs doc). Unconditional — the cache's quiet test must
+    // see swings even when the epoch push below is gated off.
+    const int64_t bumpNowNs =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    mDoorLastBumpNs = bumpNowNs;
+    // O3-lite scoped invalidation: record which door bumped so the
+    // coalesced commit (loopStep) can mark exactly the voices registered
+    // against it dirty. Marking at commit — not here — is required: the
+    // new door pose is only IN the BVH after iplSceneCommit, so a solve
+    // triggered before the commit would route against the OLD geometry.
+    mDoorsBumpedSinceCommit.insert(doorObjID);
+    if (mPathingProbeBatchAdded && mProbePathingEnabled
+        && mPathingSim != nullptr) {
+        constexpr size_t kDoorGenEventCap = 1024;
+        if (mDoorGenEvents.size() < kDoorGenEventCap) {
+            mDoorGenEvents.push_back({mDoorAcousticGen, bumpNowNs});
+        } else {
+            static std::atomic<int> sEpochDropCount{0};
+            int dn = sEpochDropCount.fetch_add(1, std::memory_order_relaxed);
+            if (dn < 4 || (dn % 256) == 0) {
+                std::fprintf(stderr,
+                    "[FALLBACK] [DOOR_ROUTE_LATENCY] epoch FIFO at cap "
+                    "(%zu) — dropping newest bump gen=%llu (drop #%d); "
+                    "pathing pipeline is not retiring epochs\n",
+                    kDoorGenEventCap,
+                    static_cast<unsigned long long>(mDoorAcousticGen),
+                    dn + 1);
+            }
+        }
+    }
+
     // Correlator counter for [DOOR_XFORM_TICK] / [OCCL_TICK]. Bumped on
     // every push so the per-frame snapshot at the top of loopStep can tell
     // a diagnostic line how many door updates landed during the prior
     // frame — useful when audible occlusion changes while a door swings.
     sDoorXformCallCount.fetch_add(1, std::memory_order_relaxed);
+    // [PERF door_route] cadence field (bumps= per window).
+    sDoorBumpsWindow.fetch_add(1, std::memory_order_relaxed);
 
     // Diagnostic: log the first few transform pushes per door so we can
     // verify the animation callback is firing. Rate-limited to keep the
@@ -6423,6 +6603,14 @@ void AudioService::loopStep(float deltaTime)
         mPathingDueThisStep = (mPathingAccumSec >= mPathingUpdateInterval);
         if (mPathingDueThisStep) mPathingAccumSec = 0.0f;
     }
+    // O2a: remember whether the NATURAL throttle elapsed this step. The
+    // door-swing due-override below (after the door scene commit, where
+    // mDoorGenCommitted is fresh) may force mPathingDueThisStep on
+    // non-throttle frames so swings re-solve continuously; the
+    // [PATHING_LAG] diagnostic keeps its original meaning ("the
+    // configured cadence elapsed while the worker was busy") by gating
+    // on this local instead of the possibly-overridden member.
+    const bool pathingDueNaturalThisStep = mPathingDueThisStep;
 
     // Cool down the per-voice visRange-clamp [FALLBACK] rate limiter
     // (see the pathing-input staging loop below).
@@ -6442,7 +6630,10 @@ void AudioService::loopStep(float deltaTime)
         const int delta = cur - sLastDoorXformCount;
         sLastDoorXformCount = cur;
         sDoorXformDeltaForTick.store(delta, std::memory_order_relaxed);
-        if (delta > 0) {
+        if (delta > 0 && gAudioLogVerbose) {
+            // Verbose-gated: during a continuous door swing this fires
+            // every loopStep (~60 lines/s) — exactly the door-stress
+            // workload whose logs the perf scripts parse.
             static std::atomic<uint64_t> sFrame{0};
             const uint64_t f = sFrame.fetch_add(1, std::memory_order_relaxed);
             std::fprintf(stderr,
@@ -6518,6 +6709,83 @@ void AudioService::loopStep(float deltaTime)
     IPLSimulator reflectionSimHandle = mReflectionSim ? mReflectionSim->simulator() : nullptr;
     IPLSimulator pathingSimHandle    = mPathingSim    ? mPathingSim->simulator()    : nullptr;
     IPLSimulator directSimHandle     = mDirectSim     ? mDirectSim->simulator()     : nullptr;
+
+    // ── O2a [DOOR_ROUTE_LATENCY] completion detection ──
+    //
+    // Resolve the in-flight door-covering solve (armed at signal time in
+    // Step 3 below) once the pathing worker's completed-cycle counter
+    // reaches the target. The latency sample runs from the epoch's FIRST
+    // door-gen bump to the worker-stamped END of the covering iteration
+    // (lastIterationEndNs — no main-thread detection lag inflates the
+    // number). Runs every loopStep, before any signal this frame, so a
+    // completion and a fresh signal in the same frame resolve in order.
+    //
+    // Soundness of "covering" (review F2 follow-up): a counted solve can
+    // no longer lose staged voices mid-iteration. Every pathing
+    // iplSourceSetInputs — SOLVE staging and the solve→skip transition
+    // alike — is gated on pathingWillSignal, whose gates include
+    // !pathBusy; therefore the SA-side enabled flag (written live by
+    // setInputs, read live by the solve loop) can only change while the
+    // worker is idle, and the iteration this detector credits ran with
+    // exactly the voice set staged at its signal.
+    if (mDoorSolveInFlight && mPathingSim
+        && mPathingSim->completedCycles() >= mDoorSolveInFlightCycle) {
+        const int64_t doneNs = mPathingSim->lastIterationEndNs();
+        // Latest-gen-wins batch retirement: ONE covering solve retires
+        // EVERY epoch ≤ its covered gen (superseded door states collapse
+        // into the same completion — epochs must never serialize
+        // one-solve-each). Each retired epoch records its OWN
+        // bump→completion latency; the batch's oldest sample equals the
+        // pre-fix absorb-into-earliest semantics, so the old worst-case
+        // envelope stays visible in the same histogram.
+        uint32_t retired = 0;
+        double oldestMs = 0.0, newestMs = 0.0;
+        while (!mDoorGenEvents.empty()
+               && mDoorGenEvents.front().gen <= mDoorSolveInFlightGen) {
+            const double latencyMs = static_cast<double>(
+                doneNs - mDoorGenEvents.front().timeNs) / 1.0e6;
+            mDoorRouteLatencyHist.record(latencyMs);
+            if (retired == 0) oldestMs = latencyMs;
+            newestMs = latencyMs;
+            ++retired;
+            // Loud per-event line (no-silent-fallbacks): first 16 + every
+            // 64th thereafter (per-bump epochs raise the event rate ~10×
+            // vs the absorb-era 16th). The histogram in [PERF door_route]
+            // carries the full distribution regardless of the rate limit.
+            static std::atomic<int> sDoorRouteLogCount{0};
+            const int dc = sDoorRouteLogCount.fetch_add(
+                1, std::memory_order_relaxed);
+            if (dc < 16 || (dc % 64) == 0) {
+                std::fprintf(stderr,
+                    "[DOOR_ROUTE_LATENCY] %.1f ms (doorGen %llu covered "
+                    "by solve gen<=%llu, event #%d)\n",
+                    latencyMs,
+                    static_cast<unsigned long long>(
+                        mDoorGenEvents.front().gen),
+                    static_cast<unsigned long long>(mDoorSolveInFlightGen),
+                    dc + 1);
+            }
+            mDoorGenEvents.pop_front();
+        }
+        // Per-completion batch summary: oldest = pre-fix semantics
+        // (earliest uncovered bump → completion), newest = freshest
+        // covered state. Rate-limited; primary consumer is the
+        // before/after semantics comparison + staleness spot-checks.
+        if (retired > 0) {
+            static std::atomic<int> sDoorCoverLogCount{0};
+            const int cc = sDoorCoverLogCount.fetch_add(
+                1, std::memory_order_relaxed);
+            if (cc < 32 || (cc % 16) == 0) {
+                std::fprintf(stderr,
+                    "[DOOR_ROUTE_COVER] retired=%u oldest=%.1f ms "
+                    "newest=%.1f ms (gen<=%llu, cover #%d)\n",
+                    retired, oldestMs, newestMs,
+                    static_cast<unsigned long long>(mDoorSolveInFlightGen),
+                    cc + 1);
+            }
+        }
+        mDoorSolveInFlight = false;
+    }
 
     if (!reflBusy && mReflectionSim) {
 
@@ -6599,6 +6867,53 @@ void AudioService::loopStep(float deltaTime)
             iplSceneCommit(mIplScene);
             auto c1 = std::chrono::steady_clock::now();
             mSceneNeedsCommit.store(false, std::memory_order_release);
+            // O2a: every door-gen bump so far is now in the committed
+            // BVH — advance the committed gen the per-voice solve memo
+            // and the door due-override key on. setDoorTransform (the
+            // only other bump site besides registration) always pairs a
+            // bump with mSceneNeedsCommit, so no bump can be left behind.
+            mDoorGenCommitted = mDoorAcousticGen;
+            // [PERF door_route] cadence field (commits= per window).
+            sDoorCommitsWindow.fetch_add(1, std::memory_order_relaxed);
+
+            // ── O3-lite scoped invalidation: mark affected voices dirty ──
+            //
+            // The door poses that bumped since the last commit are now IN
+            // the committed BVH. Mark ONLY the voices registered against
+            // one of them (mDoorVoices reverse index) — the scoped
+            // replacement for the old "every in-range voice re-solves on
+            // any door commit". A bumped door with no room-pair AND no
+            // ellipse registrant reaches no voice here; that is correct
+            // (it is on nobody's route), and the [SCOPE_MISS] watchdog
+            // guards the case where the router wrongly excluded a voice.
+            // Fail-open voices (pathRouteScopeValid == false) are NOT
+            // marked — they key on the global committed-gen trigger and
+            // re-solve regardless.
+            if (!mDoorsBumpedSinceCommit.empty()) {
+                uint64_t markedThisCommit = 0;
+                for (int32_t d : mDoorsBumpedSinceCommit) {
+                    auto it = mDoorVoices.find(d);
+                    if (it == mDoorVoices.end()) continue;
+                    for (SoundHandle h : it->second) {
+                        ActiveVoice *v = mVoicePool ? mVoicePool->find(h)
+                                                    : nullptr;
+                        if (v && !v->pathScopedDoorDirty) {
+                            v->pathScopedDoorDirty = true;
+                            ++markedThisCommit;
+                        }
+                    }
+                }
+                sScopeDirtyMarkedWindow.fetch_add(markedThisCommit,
+                                                  std::memory_order_relaxed);
+                sScopeCommitCountWindow.fetch_add(1, std::memory_order_relaxed);
+                uint64_t prevMax = sScopeDirtyMaxWindow.load(
+                    std::memory_order_relaxed);
+                while (markedThisCommit > prevMax
+                       && !sScopeDirtyMaxWindow.compare_exchange_weak(
+                              prevMax, markedThisCommit,
+                              std::memory_order_relaxed)) {}
+                mDoorsBumpedSinceCommit.clear();
+            }
 
             static std::atomic<int> sCommitCount{0};
             int n = sCommitCount.fetch_add(1, std::memory_order_relaxed);
@@ -6613,6 +6928,8 @@ void AudioService::loopStep(float deltaTime)
             // been deferred so we can spot the pathological case where it
             // never commits (some worker always running). Logs every 64
             // deferred frames.
+            // [PERF door_route] cadence field (defer= per window).
+            sDoorCommitDeferredWindow.fetch_add(1, std::memory_order_relaxed);
             static std::atomic<int> sCommitDeferred{0};
             int d = sCommitDeferred.fetch_add(1, std::memory_order_relaxed);
             if ((d % 64) == 0) {
@@ -6623,6 +6940,115 @@ void AudioService::loopStep(float deltaTime)
                     directBusy ? 1 : 0, d + 1);
             }
         }
+    }
+
+    // ── O3-lite [SCOPE_MISS] watchdog cadence ──
+    // Every ~kScopeWatchdogIntervalMs latch a pending force so the next
+    // signaling staging pass re-solves EVERY eligible in-range voice
+    // ignoring scoping and audits for scope misses. Cheap: one extra
+    // full-scope pathing iteration every 2 s. Main thread.
+    if (mProbePathingEnabled && mPathingProbeBatchAdded) {
+        const int64_t nowW =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (mScopeWatchdogLastNs == 0) {
+            mScopeWatchdogLastNs = nowW;
+        } else if (!mScopeWatchdogPending
+                   && (static_cast<double>(nowW - mScopeWatchdogLastNs)
+                       / 1.0e6) >= kScopeWatchdogIntervalMs) {
+            mScopeWatchdogPending = true;
+            mScopeWatchdogLastNs = nowW;
+        }
+    }
+
+    // ── O2a commit-vs-solve priority: hold sim signals while a commit waits ──
+    //
+    // Review finding F1 (BLOCKER): the canMutate gate above requires a
+    // COINCIDENTAL all-three-idle top-of-frame. With the due-override
+    // below keeping the pathing worker grinding back-to-back solves
+    // during swings — and refl/direct iterations tiling the frame
+    // boundaries ([DIRECT_LAG] fires on ~1/3 of stress frames) — that
+    // coincidence can fail for hundreds of ms at a stretch, starving the
+    // 0.05 ms door BVH commit and flooring [DOOR_ROUTE_LATENCY] at
+    // p95 181-257 ms with worst windows near 2 s (user hard gate
+    // ≤ 150 ms). The commit is the prerequisite for every covering solve,
+    // so it must win: while a door scene-commit is still pending after
+    // the block above (i.e. a worker was busy this frame), HOLD the sim
+    // signals this frame — pathing (Step 3 + the staging pass's
+    // pathingWillSignal) and reflection (wantReflections)
+    // unconditionally, and the direct worker once pathing is already
+    // idle (doorCommitHoldAux below). No new iterations start, every
+    // in-flight iteration finishes within its own duration, the commit
+    // lands on the first all-idle top-of-frame (≤ longest in-flight
+    // iteration + a frame), the committed gen advances, and the
+    // due-override + staging pass fire a covering solve in that same
+    // loopStep. During a continuous swing this alternates commit/solve
+    // at the solve's own granularity instead of solve-solve-solve
+    // against stale geometry; refl/direct pause for at most an
+    // iteration + a frame or two around each commit (params hold a
+    // frame or two longer — the same staleness class the existing
+    // DIRECT_LAG skip already tolerates, smoothed by the per-voice DSP
+    // ramps).
+    //
+    // Read AFTER the commit block deliberately: on the frame the commit
+    // lands, mSceneNeedsCommit was just cleared → no hold → all workers
+    // signal immediately, pathing against the fresh BVH. setDoorTransform
+    // (the only setter) runs on this same thread via DoorSystem::simStep,
+    // so the value cannot change between here and the Step 3 signal gate.
+    //
+    // The pathing consumers (staging pathingWillSignal, Step 3
+    // wantPathing) must stay in lockstep — memo updates key on actually
+    // signaling. Other canMutate consumers: none (the door commit above
+    // is the only one), and the refl/direct flush+commit paths gate on
+    // their own worker only — this hold cannot regress them. Idle worlds
+    // (no door movement) never set mSceneNeedsCommit, so none of this
+    // path runs there.
+    const bool doorCommitHold =
+        mIplScene && mSceneNeedsCommit.load(std::memory_order_acquire);
+    // DIRECT-worker variant of the hold: only once the pathing worker is
+    // ALREADY idle. While pathing itself is the commit blocker (worst
+    // case the multi-second findAlternatePaths explosion a swinging door
+    // can trigger), pausing direct buys nothing — the commit can't land
+    // anyway — and would freeze every voice's direct occlusion/distance
+    // params for the whole solve. With pathBusy false the pause is
+    // bounded by one direct iteration (+ a frame): the commit lands on
+    // the first all-idle top-of-frame and everything resumes that same
+    // loopStep. (Reflection signals hold on the UNCONDITIONAL
+    // doorCommitHold instead — see the wantReflections comment in
+    // Step 3: a refl iteration signaled during the in-flight solve was
+    // the dominant post-pathing commit blocker on the stress tours, and
+    // reflections tolerate a held tick far better than direct params.)
+    const bool doorCommitHoldAux = doorCommitHold && !pathBusy;
+
+    // ── O2a pathing due-override: re-solve continuously during swings ──
+    //
+    // PLAN.PATHING_DESIGN.md §6 decision 1: door-event route updates must
+    // land near audio-pipeline latency, and swings should re-solve every
+    // tick (smoother than the original's step function). While committed
+    // door geometry is ahead of the last signaled solve, treat pathing as
+    // due EVERY frame — the Step 3 signal still waits for the worker to
+    // go idle, so during a swing the worker runs back-to-back solves at
+    // whatever rate it can sustain, and [DOOR_ROUTE_LATENCY] collapses to
+    // ~one solve duration instead of throttle-interval + solve. Idle
+    // worlds and plain listener movement keep the configured cadence.
+    // The accumulator is deliberately NOT reset here: once the swing ends
+    // the natural throttle resumes its own rhythm, and the one extra due
+    // tick it may produce right after is a no-op (all memos fresh, all
+    // voices staged as skip).
+    //
+    // Review finding F5: the override is a no-op while pathing is
+    // inoperative (disabled, no probe batch, or no simulator) —
+    // mDoorGenLastSignalGen can never advance in that state, so without
+    // this gate a single door bump latched the override permanently and
+    // forced every subsequent loopStep due. The gate mirrors the
+    // operative subset of pathingWillSignal / wantPathing; if pathing
+    // comes online later, committed-vs-signaled gen still differ and the
+    // override resumes naturally.
+    if (!mPathingDueThisStep
+        && mPathingProbeBatchAdded && mProbePathingEnabled
+        && mPathingSim != nullptr
+        && mDoorGenCommitted != mDoorGenLastSignalGen) {
+        mPathingDueThisStep = true;
     }
 
     // Always clean up finished voices (defers IPL removal if sim busy)
@@ -6742,7 +7168,6 @@ void AudioService::loopStep(float deltaTime)
             SoundHandle handle;
             float distSq;
         };
-        std::vector<VoiceDist> reflCandidates;
         std::unordered_set<SoundHandle> reflCandidateSet;
 
         // Reflection top-N ranking runs FIRST: both the harvest pass
@@ -6862,9 +7287,8 @@ void AudioService::loopStep(float deltaTime)
         // previous-cycle before PR 1b (background thread, throttled),
         // which is imperceptible since reverb tails change slowly.
 
-        // reflCandidates and reflCandidateSet were computed in the
-        // ranking block above so both this pass and the staging pass see
-        // the same top-N decision.
+        // reflCandidateSet was computed in the ranking block above so
+        // both this pass and the staging pass see the same top-N decision.
 
         // Track total convolution voices against the audio callback budget.
         // Tail voices (sourceEnded, still ringing out reverb) are counted first
@@ -7325,6 +7749,25 @@ void AudioService::loopStep(float deltaTime)
                         slot.targetDirectParams.transmissionType =
                             IPL_TRANSMISSIONTYPE_FREQDEPENDENT;
                     }
+                    // O2a review F3: out-of-range voices are dropped from
+                    // the solve set (staging memo → skip), so Steam Audio
+                    // retains outputs FROZEN at exit time — possibly
+                    // minutes old, encoding door states that no longer
+                    // exist. Mark them stale (the re-entry hold branch
+                    // below keeps the audio thread off them) and latch a
+                    // solve request so re-entry ALWAYS gets a covering
+                    // re-solve, even when the whole excursion falls
+                    // between two due ticks (the staging pass's
+                    // rising-edge trigger samples range only on due
+                    // ticks, so a sub-interval boundary dip would
+                    // otherwise never re-solve and the hold would never
+                    // release). Resetting the cover cycle each frame out
+                    // of range means a NEW covering solve is required
+                    // after every excursion, not one that was armed
+                    // before the voice left range.
+                    voice->pathOutputsStale    = true;
+                    voice->pathStaleCoverCycle = UINT64_MAX;
+                    voice->pathSolvePending    = true;
                 } else if (mPathingSim
                            && mPathingSim->isAddPending(voice->pathingSource)) {
                     // T0.4 — pending-source race guard. The voice's
@@ -7358,7 +7801,69 @@ void AudioService::loopStep(float deltaTime)
                             "schema='%s' [#%d]\n",
                             handle, voice->schemaName.c_str(), n + 1);
                     }
+                } else if (voice->pathOutputsStale
+                           && (voice->pathStaleCoverCycle == UINT64_MAX
+                               || !mPathingSim
+                               || mPathingSim->completedCycles()
+                                      < voice->pathStaleCoverCycle)) {
+                    // O2a review F3 — out-of-range → in-range re-entry
+                    // hold. The retained outputs on this source predate
+                    // the out-of-range window (frozen at exit time), so
+                    // consuming them now would resurrect the pre-O2a
+                    // "sound through walls" artifact class: a route
+                    // solved while a door stood open, served minutes
+                    // later with the door closed. Treat re-entry exactly
+                    // like a pending source: bypass the path effect
+                    // (pathTargetValid=false) and park the scalar portal
+                    // mapping at silent-reflection-send / LPF-open (the
+                    // SH-zero convention — currentPortalAtten smooths
+                    // toward these, no snap) until the memo-triggered
+                    // re-solve completes. Completion detection reuses the
+                    // completed-cycles gate pattern (see
+                    // reflectionSimCycleAtAdd): the staging pass armed
+                    // pathStaleCoverCycle at the signaled covering solve;
+                    // UINT64_MAX means that solve hasn't even been staged
+                    // yet. Typical hold: one solve iteration + signal
+                    // latency; the out-of-range branch latched
+                    // pathSolvePending, so the covering solve is
+                    // guaranteed to be requested.
+                    voice->dspNode.pathTargetValid.store(
+                        false, std::memory_order_release);
+                    voice->dspNode.portalAttenuation = 0.0f;
+                    voice->dspNode.portalBlocking    = 0.0f;
+                    static std::atomic<int> sReentryHoldLogCount{0};
+                    int hn = sReentryHoldLogCount.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (hn < 16 || (hn % 256) == 0) {
+                        std::fprintf(stderr,
+                            "[PATH_REENTRY_HOLD] h=%u schema='%s' "
+                            "coverCycle=%llu completed=%llu [#%d]\n",
+                            handle, voice->schemaName.c_str(),
+                            static_cast<unsigned long long>(
+                                voice->pathStaleCoverCycle),
+                            static_cast<unsigned long long>(
+                                mPathingSim ? mPathingSim->completedCycles()
+                                            : 0),
+                            hn + 1);
+                    }
                 } else {
+                    // Covering re-solve landed — retained outputs are
+                    // fresh again; release the F3 re-entry hold (loud,
+                    // rate-limited, so hold→release pairing is greppable
+                    // in staleness spot-checks).
+                    if (voice->pathOutputsStale) {
+                        voice->pathOutputsStale    = false;
+                        voice->pathStaleCoverCycle = UINT64_MAX;
+                        static std::atomic<int> sReentryResolveLogCount{0};
+                        int rn = sReentryResolveLogCount.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (rn < 16 || (rn % 256) == 0) {
+                            std::fprintf(stderr,
+                                "[PATH_REENTRY_RESOLVE] h=%u schema='%s' "
+                                "[#%d]\n",
+                                handle, voice->schemaName.c_str(), rn + 1);
+                        }
+                    }
                     // Standard Valve pattern (Unity / Unreal / FMOD / Wwise
                     // all use this verbatim): read latest pathing outputs
                     // each frame and pass through to iplPathEffectApply
@@ -7490,6 +7995,86 @@ void AudioService::loopStep(float deltaTime)
                         // along the REAL routed path length — the quantity
                         // eqCoeffs structurally lack (see distance gate below).
                         shW = pathingOut.pathing.shCoeffs[0];
+                    }
+                    // ── Unreachable-route verdict flags (see VoicePool.h) ──
+                    //
+                    // Distinguish the two shAllZero cases by the eq bits:
+                    // the SimulationData create-time seed is exactly
+                    // 0.1f×3 (pathing-untouched-by-solver sentinel —
+                    // memory: project_steam_audio_gotchas); a solver-run
+                    // "no path found" writes eq=[1,1,1] with sh still
+                    // memset-zero. Only the latter is a VERDICT the
+                    // staging pass may cache on — and only once the
+                    // covering solve's completed-cycle target has been
+                    // reached (before that these outputs predate the
+                    // memo'd solve).
+                    // Only attribute the verdict once the covering solve
+                    // has actually completed (completed-cycles gate, same
+                    // pattern as pathStaleCoverCycle): a read between
+                    // staging and completion still shows the PREVIOUS
+                    // solve's outputs, and caching on those would pin a
+                    // stale verdict against the fresh memo.
+                    if (voice->pathVerdictCoverCycle != UINT64_MAX
+                        && mPathingSim
+                        && mPathingSim->completedCycles()
+                               >= voice->pathVerdictCoverCycle) {
+                        uint32_t vb0, vb1, vb2;
+                        std::memcpy(&vb0, &pathingOut.pathing.eqCoeffs[0], 4);
+                        std::memcpy(&vb1, &pathingOut.pathing.eqCoeffs[1], 4);
+                        std::memcpy(&vb2, &pathingOut.pathing.eqCoeffs[2], 4);
+                        constexpr uint32_t kEqSentinelBits = 0x3DCCCCCD; // 0.1f
+                        const bool eqIsSentinel = (vb0 == kEqSentinelBits
+                            && vb1 == kEqSentinelBits && vb2 == kEqSentinelBits);
+                        voice->pathLastOutputsSentinel = shAllZero && eqIsSentinel;
+                        voice->pathLastOutputsNoRoute  = shAllZero && !eqIsSentinel;
+
+                        // ── O3-lite [SCOPE_MISS] watchdog ──
+                        //
+                        // pathLastEq caches this attributable eq for the
+                        // watchdog's pre/post comparison. If a watchdog
+                        // force-solve is armed and this read is attributable
+                        // to it (completed-cycles gate), compare the fresh
+                        // eq to the snapshot taken when the forced solve was
+                        // staged: a band delta beyond kScopeMissEqEpsilon on
+                        // a voice scoping WOULD have skipped means scoping
+                        // wrongly excluded it from a door change → loud
+                        // [SCOPE_MISS]. Analyze, never suppress.
+                        if (voice->pathScopeWatchdogCoverCycle != UINT64_MAX
+                            && mPathingSim->completedCycles()
+                                   >= voice->pathScopeWatchdogCoverCycle) {
+                            const float d0 = std::fabs(
+                                pathingOut.pathing.eqCoeffs[0]
+                                - voice->pathScopeWatchdogEqSnapshot[0]);
+                            const float d1 = std::fabs(
+                                pathingOut.pathing.eqCoeffs[1]
+                                - voice->pathScopeWatchdogEqSnapshot[1]);
+                            const float d2 = std::fabs(
+                                pathingOut.pathing.eqCoeffs[2]
+                                - voice->pathScopeWatchdogEqSnapshot[2]);
+                            const float dmax = std::max(d0, std::max(d1, d2));
+                            if (dmax > kScopeMissEqEpsilon) {
+                                uint64_t n = mScopeMissCount.fetch_add(
+                                    1, std::memory_order_relaxed) + 1;
+                                auto rit = mVoiceRegisteredDoors.find(
+                                    voice->handle);
+                                size_t regDoors = (rit
+                                    != mVoiceRegisteredDoors.end())
+                                    ? rit->second.size() : 0;
+                                std::fprintf(stderr,
+                                    "[SCOPE_MISS] #%llu voice h=%d '%s' "
+                                    "eq delta=(%.3f,%.3f,%.3f) max=%.3f "
+                                    "(> eps %.3f) regDoors=%zu — scoping "
+                                    "excluded a voice a door change "
+                                    "affected\n",
+                                    (unsigned long long)n, voice->handle,
+                                    voice->schemaName.c_str(), d0, d1, d2,
+                                    dmax, kScopeMissEqEpsilon, regDoors);
+                            }
+                            voice->pathScopeWatchdogCoverCycle = UINT64_MAX;
+                        }
+                        voice->pathLastEq[0] = pathingOut.pathing.eqCoeffs[0];
+                        voice->pathLastEq[1] = pathingOut.pathing.eqCoeffs[1];
+                        voice->pathLastEq[2] = pathingOut.pathing.eqCoeffs[2];
                     }
                     // Compute the eq→DSP mapping unconditionally so the
                     // [PATH_DIAG_DUMP] diagnostic can read it in both the
@@ -7883,12 +8468,13 @@ void AudioService::loopStep(float deltaTime)
                 // shared-source fallback) the cap still bounds per-voice
                 // convolution instances as before.
                 //
-                // Note: reflCandidates was already shrunk to
-                // (mReverbVoices − tailCount) above, so in normal flow
-                // an isReflVoice voice always has slot budget here.  We still
-                // gate by canAffordConvolution as defence-in-depth — if the
-                // cap was lowered at runtime, or a tail voice was missed in
-                // the pre-count, this prevents overshoot.
+                // Note: the top-N ranking caps at mReverbVoicesRealtime
+                // and does NOT subtract tailCount, so a burst of ending
+                // voices CAN leave a top-N voice without slot budget here
+                // — canAffordConvolution is the real gate, not
+                // defence-in-depth. (Whether ranking should become
+                // tail-aware is a flagged review decision: it would trade
+                // realtime-IR continuity for baked-fallback availability.)
                 bool isReflVoice = reflCandidateSet.count(handle) > 0;
                 bool canAffordConvolution = (activeConvolutionCount < mReverbVoices);
                 // HYBRID-only: the early convolution head needs a real IR
@@ -8305,6 +8891,211 @@ void AudioService::loopStep(float deltaTime)
             }
             Room *listenerRoom = mListenerRoom;
 
+            // ── O2a per-frame pathing-staging context ──
+            //
+            // pathingWillSignal mirrors Step 3's wantPathing gate EXACTLY
+            // (same inputs, none of which change between here and there:
+            // pathBusy was sampled once at top-of-frame, the due flag,
+            // doorCommitHold, and batch/enable state are main-thread
+            // members/locals). Per-voice solve memos are updated ONLY on
+            // frames that actually signal the worker — a due-but-can't-
+            // signal frame (worker busy, or a door commit is pending and
+            // holding the signal per review F1) latches pathSolvePending
+            // instead, so no solve request is ever silently dropped.
+            // Review F2: the solve→skip staging transition is gated on
+            // this same flag — iplSourceSetInputs writes the SA-side
+            // enabled flag live and iplSimulatorRunPathing's solve loop
+            // reads it live, so a skip staged mid-iteration would strip
+            // the voice from the very solve its memo already recorded as
+            // covering it (permanently stale route until the next memo
+            // trigger). With BOTH solve and skip staging behind
+            // pathingWillSignal (whose gates include !pathBusy), pathing
+            // setInputs can only ever land while the worker is idle.
+            //
+            // stagingListenerRoomId feeds the memo's "listener changed
+            // room" trigger; INT32_MIN = no room resolved (treated as its
+            // own 'room' so entering/leaving resolvable space re-solves).
+            //
+            // stagingDoorGen is the COMMITTED door generation (see
+            // mDoorGenCommitted): solves are keyed to geometry the BVH
+            // actually contains. It cannot change mid-loopStep (door
+            // transforms arrive via DoorSystem::simStep on this same
+            // thread).
+            const bool pathingWillSignal = mPathingProbeBatchAdded
+                                        && mProbePathingEnabled
+                                        && mPathingDueThisStep
+                                        && !pathBusy
+                                        && !doorCommitHold
+                                        && (mPathingSim != nullptr);
+            const int32_t stagingListenerRoomId = listenerRoom
+                ? static_cast<int32_t>(listenerRoom->getRoomID())
+                : INT32_MIN;
+            const uint64_t stagingDoorGen = mDoorGenCommitted;
+            // Memo movement threshold (feet): listener or source drift
+            // beyond this since a voice's last solve forces a re-solve.
+            // 5 ft (locked in PLAN.PATHING_DESIGN.md §4 O2a) keeps routes
+            // fresh at walking speed while skipping micro-jitter.
+            constexpr float kPathingSolveMemoMoveFt = 5.0f;
+            // ── Unreachable-route cache: doors-quiet test ──
+            //
+            // A voice whose last covering solve returned the definitive
+            // no-route verdict is SILENT (portalAttenuation 0, path
+            // effect SH-zero). Re-running its exhaustive
+            // findAlternatePaths on every per-tick doorGen bump of a
+            // continuous swing is the measured warmup-cluster cost
+            // (PLAN.PATHING_DESIGN.md §11: 100-450 ms iterations) and
+            // buys nothing perceptually — there is no eq transition to
+            // smooth on a silent voice. The doorGen trigger therefore
+            // DEFERS for no-route voices until doors have stopped moving
+            // for kDoorQuietForNoRouteRetryMs: the discovery re-solve
+            // that finds a route through a freshly-opened door fires
+            // once, right after the swing settles (matches the original
+            // engine's on-event step semantics; audible voices keep the
+            // per-tick swing re-solves). All other memo triggers
+            // (movement, room, rising edge, pending, probe reload) still
+            // override the cache unchanged. 250 ms > any per-tick bump
+            // spacing (sim ticks at 12.5-60 Hz) and short enough that
+            // discovery lands within the same perceptual beat as the
+            // door settling.
+            constexpr double kDoorQuietForNoRouteRetryMs = 250.0;
+            bool doorsQuietForNoRouteRetry = true;
+            if (mDoorLastBumpNs != 0) {
+                const int64_t nowQuietNs =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+                doorsQuietForNoRouteRetry =
+                    (static_cast<double>(nowQuietNs - mDoorLastBumpNs)
+                     / 1.0e6) >= kDoorQuietForNoRouteRetryMs;
+            }
+            // [PERF pathing] staging-mix counters for this pass (only
+            // meaningful on signaling frames; pushed to PathingSimulator
+            // after the loop).
+            uint32_t pathingStagedSolved  = 0;
+            uint32_t pathingStagedSkipped = 0;
+            // Staged-SKIPs produced by the unreachable-route cache this
+            // pass (suppressed exhaustive re-solves; subset of skipped).
+            uint32_t pathingStagedUnreachableCached = 0;
+            // O3-lite scope counters (pushed to [PERF pathing]).
+            //   scopedSolves = staged solves on a scope-valid voice (route
+            //     set active — these benefit from scoping);
+            //   scopeSkipped = in-range voices whose GLOBAL door gen
+            //     advanced but scoping suppressed the re-solve (the moved
+            //     doors were not on this voice's routes) — the direct win.
+            uint32_t pathingScopedSolves = 0;
+            uint32_t pathingScopeSkipped = 0;
+
+            // ── [SCOPE_MISS] watchdog: consume the force latch ──
+            // On a signaling due tick after a watchdog interval elapsed,
+            // force a ROTATING WINDOW of kScopeWatchdogBatch eligible
+            // in-range voices to re-solve ignoring scoping; for a voice
+            // scoping WOULD have skipped, snapshot its cached eq so the
+            // harvest can compare the forced-solve result and flag a scope
+            // miss. Staggered so every voice is audited within ~2 s without
+            // a full-scope solve (see mScopeWatchdogCursor doc). Consumed
+            // once (main thread). wdEligIdx runs over eligible in-range
+            // voices this pass; the [wdLo,wdHi) window selects the batch.
+            const bool scopeWatchdogTick =
+                mScopeWatchdogPending && pathingWillSignal;
+            if (scopeWatchdogTick) mScopeWatchdogPending = false;
+            uint32_t wdEligIdx = 0;
+            const uint32_t wdLo = mScopeWatchdogCursor;
+            const uint32_t wdHi = mScopeWatchdogCursor + kScopeWatchdogBatch;
+
+            // ── Lever D: warmup first-solve stagger — selection pre-pass ──
+            //
+            // PLAN.PATHING_DESIGN.md §15/§16. SA's runtime alternate search
+            // is an unbounded A* that DRAINS the reachable component on a
+            // failing/occluded search (~170 ms a piece here); at warmup ~10
+            // voices go pathing-eligible together and their FIRST solves all
+            // land in ONE iteration → the measured ~1.7 s stall. We cannot
+            // bound an individual drain (no runtime search budget in SA's C
+            // API — §15 stage B), but we CAN bound how many share an
+            // iteration: admit at most kPathingFirstSolvesPerIteration
+            // never-solved voices per signaled iteration and let the rest
+            // ride their existing pathSolvePending latch to the next tick.
+            //
+            // ONLY the never-solved class is deferrable. A never-solved
+            // voice already holds pathTargetValid=false and is parked silent
+            // by the F3 pending/hold machinery, so deferral EXTENDS an
+            // existing correct state rather than creating staleness. Door-
+            // invalidated (pathScopedDoorDirty / doorGen) and movement/room
+            // re-solves are deliberately NOT staggered: they carry the
+            // <=150 ms door-route gate over an audible route that is already
+            // wrong, so staggering them would trade compute against the very
+            // gate this work exists to meet. Those classes cannot even reach
+            // this pre-pass — they all imply a prior solve, and this list is
+            // built exclusively from !pathEverSolved voices.
+            //
+            // Ordering (see ActiveVoice::pathFirstSolveDeferrals):
+            //   1. deferral count DESC — aging. This is the anti-starvation
+            //      guarantee: a waiting voice's count only rises, newcomers
+            //      enter at 0 below it, so the cohort ahead of it is fixed
+            //      and drains at the cap per tick → every voice solves
+            //      within ceil(ahead / cap) + 1 signaled ticks.
+            //   2. normalized distance ASC — audibility. dist/maxAudibleDist
+            //      (both already computed by staging) ranks a voice by how
+            //      close it is to its own audible edge, so the sounds a
+            //      player would actually notice get routes first. Ties only
+            //      break WITHIN an age cohort, so this can reorder but never
+            //      starve.
+            //   3. handle ASC — deterministic tiebreak (repeatable runs).
+            //
+            // We do NOT consult the shadow router for an "unreachable ⇒ solve
+            // last" hint (PLAN §16 lists it as optional). It would cost a
+            // Dijkstra pair + roomFromPoint per candidate per signaled tick
+            // on the main thread and cannot help the metric it would be paid
+            // for: deprioritizing likely-drainers only REORDERS them, it does
+            // not stop the cap-many drains per iteration that set the window
+            // max. (And a hard skip is forbidden regardless — the router
+            // under-approximates SA's multi-path reach, §12 SCOPE_MISS.)
+            uint32_t firstSolveDeferred = 0;   // this tick (→ [PERF pathing])
+            uint32_t firstSolveBacklog  = 0;   // never-solved in-range gauge
+            std::array<SoundHandle, kPathingFirstSolvesPerIteration>
+                firstSolveAdmitted{};
+            uint32_t firstSolveAdmittedN = 0;
+            if (pathingWillSignal) {
+                // (deferrals, normDist, handle) — sorted by the key above.
+                // Empty (no allocation) in steady state: every voice has
+                // solved at least once, so nothing is a candidate.
+                std::vector<std::tuple<uint32_t, float, SoundHandle>> cands;
+                for (auto &[handle, voice] : mVoicePool->voices()) {
+                    // Mirror the main loop's gates exactly: its
+                    // !directSource skip, and voicePathingEligible with the
+                    // three frame-level terms already implied by
+                    // pathingWillSignal (batch added, pathing enabled, due
+                    // tick). A candidate is any in-range eligible voice that
+                    // has never solved — for those, trigNever alone makes
+                    // needsSolve true below, so this set is exactly the
+                    // first-solve demand for this iteration.
+                    if (!voice->directSource) continue;
+                    if (voice->playerEmitted) continue;
+                    if (voice->skipPortalRouting) continue;
+                    if (voice->pathingSource == nullptr) continue;
+                    if (voice->pathEverSolved) continue;
+                    const float d =
+                        glm::length(voice->worldPos - mListenerPos);
+                    if (d > voice->maxAudibleDist) continue;
+                    // Rank by inverted deferral count so a plain ascending
+                    // sort puts the oldest waiter first without a custom
+                    // comparator.
+                    cands.emplace_back(
+                        UINT32_MAX - voice->pathFirstSolveDeferrals,
+                        voice->maxAudibleDist > 0.0f
+                            ? d / voice->maxAudibleDist
+                            : 0.0f,
+                        handle);
+                }
+                firstSolveBacklog = static_cast<uint32_t>(cands.size());
+                const size_t admit = std::min<size_t>(
+                    cands.size(), kPathingFirstSolvesPerIteration);
+                std::partial_sort(cands.begin(), cands.begin() + admit,
+                                  cands.end());
+                for (size_t i = 0; i < admit; ++i)
+                    firstSolveAdmitted[firstSolveAdmittedN++] =
+                        std::get<2>(cands[i]);
+            }
+
             // (voiceUpdT0 is set before the HARVEST pass now — PR 1b
             // reordered the per-voice work but the phase timer still
             // covers all of it.)
@@ -8602,32 +9393,11 @@ void AudioService::loopStep(float deltaTime)
                     // T0.1 — PATH_CONSUME diagnostic at the
                     // prop.reached gate. Throttled to once-per-second
                     // per voice (per-handle steady-clock map). Pure
-                    // diagnostic — does NOT change behaviour. Surfaces
-                    // the BFS-mode propagation result that drives the
-                    // sub-source slot fan-out; pair with PATH_RAW
-                    // (PathingSimulator.cpp:208, owned by Agent 2) for
-                    // the Steam Audio-mode counterpart.
-                    {
-                        static std::unordered_map<SoundHandle,
-                            std::chrono::steady_clock::time_point>
-                            sLastPathConsumeLog;
-                        auto now = std::chrono::steady_clock::now();
-                        auto it = sLastPathConsumeLog.find(handle);
-                        bool emit = (it == sLastPathConsumeLog.end())
-                            || (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    now - it->second).count() >= 1000);
-                        if (emit) {
-                            sLastPathConsumeLog[handle] = now;
-                            std::fprintf(stderr,
-                                "[PATH_CONSUME] h=%u schema='%s' "
-                                "reached=%d effD=%.1f block=%.2f paths=%zu\n",
-                                handle, voice->schemaName.c_str(),
-                                prop.reached ? 1 : 0,
-                                prop.effectiveDistance,
-                                prop.totalBlocking,
-                                prop.paths.size());
-                        }
-                    }
+                    // ([PATH_CONSUME] for BFS mode is emitted by the
+                    // mode-tagged block ABOVE the routing branch split —
+                    // one logger covers both modes; a second copy here
+                    // double-logged every BFS voice with mismatched
+                    // fields.)
                     if (prop.reached && !prop.paths.empty()) {
                         updateSubSourceSlots(voice->dspNode.subSources, prop,
                                              maxN, computeDirForPath);
@@ -8681,22 +9451,25 @@ void AudioService::loopStep(float deltaTime)
                 // — Steam Audio ignores fields not selected by the flag
                 // argument.
                 //
-                // PATHING bit is set unconditionally (not gated on the
-                // per-voice populate block) so iplSourceSetInputs(PATHING)
-                // — when issued — always leaves pathingInputs.enabled=true.
-                // An earlier "drive enabled from the live gate" attempt
-                // caused a stale-eq window on out-of-range → in-range
-                // transitions: simulatePathing only writes
-                // pathingOutputs.eq while enabled=true, so flipping it
-                // false stranded the last in-range eq values in the
-                // output buffer, audible as "sound through walls" for
-                // ~one throttle interval when the listener moved past
-                // maxAudibleDist and back through changed geometry
-                // (typical case: through a doorway and back). Keeping
-                // the worker running findPaths for currently-out-of-range
-                // voices is the price of fresh eq across distance
-                // transients; output is already gated by maxAudibleDist
-                // so the unread writes don't reach the audio thread.
+                // PATHING bit starts set; the O2a skip-staging path below
+                // clears it (stagePathingSkip) so Steam Audio's
+                // simulatePathing excludes the source from the solve loop
+                // while RETAINING its last pathingOutputs — that retained
+                // buffer is the route cache the dirty-gating design leans
+                // on (api_simulator.cpp:393 maps inputs.flags → pathing
+                // Inputs.enabled; simulation_manager.cpp simulatePathing
+                // skips disabled sources without touching their outputs).
+                //
+                // History: an earlier pre-O2a attempt drove this bit from
+                // the live pathingWanted gate and caused a stale-eq window
+                // on out-of-range → in-range transitions ("sound through
+                // walls" for ~one throttle interval), which is why the
+                // old code kept out-of-range voices permanently enabled
+                // as freshness insurance. O2a replaces that insurance
+                // with the per-voice solve memo: the pathingWanted
+                // RISING EDGE is an explicit needs-solve trigger, so the
+                // first due tick after re-entering range re-solves with
+                // current geometry instead of serving the stranded eq.
                 inputs.flags = static_cast<IPLSimulationFlags>(
                     IPL_SIMULATIONFLAGS_DIRECT
                     | IPL_SIMULATIONFLAGS_REFLECTIONS
@@ -8819,16 +9592,8 @@ void AudioService::loopStep(float deltaTime)
                 // existing DSP chain rather than as a spatialized
                 // ambisonic field.
                 // Throttled: pathing input staging is skipped on frames
-                // when mPathingDueThisStep is false. The matching
-                // iplSourceSetInputs(...PATHING) call and the
-                // iplSimulatorRunPathing call below are gated on the
-                // same flag, so skipping the stamping here costs
-                // nothing (Steam Audio reads pathing fields only on
-                // the PATHING setInputs path).
-                // Per-voice audibility gate. Voices outside their
-                // schema-authored maxAudibleDist are inaudible regardless
-                // of pathing — skip the per-source staging (and the
-                // corresponding cost in iplSimulatorRunPathing) for them.
+                // when mPathingDueThisStep is false (or, O2a, when the
+                // frame won't signal — solve requests latch instead).
                 //
                 // We do NOT short-circuit on "same room" here. The room
                 // graph is too coarse-grained for that to be a reliable
@@ -8840,12 +9605,336 @@ void AudioService::loopStep(float deltaTime)
                 // cells. Let Steam Audio's solver decide; for true
                 // unobstructed paths it returns eqCoeffs ≈ 1.0 and the
                 // mapping naturally produces full passthrough.
+                //
+                // ── O2a door-dirty-gated solve decision ──
+                //
+                // Eligibility (voicePathingEligible): probe batch attached,
+                // pathing enabled, this frame is a due tick, the voice has
+                // a pathingSource, is not player-emitted (source ≈
+                // listener; the graph collapses to a self-loop), and is
+                // not skipPortalRouting (door foley etc. — the readback
+                // gate never consumes those outputs, so staging+solving
+                // them was measured pure waste and is now excluded
+                // entirely; their SA-side pathingInputs.enabled stays at
+                // its create-time false).
+                //
+                // Eligible voices then split three ways:
+                //   SOLVE — something that could change the route answer
+                //     changed since this voice's last covered solve (see
+                //     the ActiveVoice pathLastSolve* memo doc). Staged
+                //     exactly as before O2a: PATHING flag set,
+                //     enableValidation + findAlternatePaths TRUE (never
+                //     enableValidation=FALSE — that would ignore closed
+                //     doors). Memo is updated ONLY here, and only on
+                //     frames that actually signal the worker.
+                //   SKIP — memo says nothing changed. Staged ONCE with
+                //     the PATHING flag cleared: Steam Audio drops the
+                //     source from the solve loop and serves its retained
+                //     outputs (the cache). Not staged again until the
+                //     next solve. Like SOLVE, only staged on frames that
+                //     actually signal (review F2 — a mid-iteration skip
+                //     write would strip the voice from the running solve
+                //     its memo already recorded as covering it).
+                //   (neither) — needs a solve but this frame can't signal
+                //     (worker busy, or door-commit hold — review F1):
+                //     latch pathSolvePending and stage nothing; the latch
+                //     forces SOLVE on the next signaling due tick.
                 float voicePathingDist = glm::length(voice->worldPos - mListenerPos);
                 bool  pathingWanted    = (voicePathingDist <= voice->maxAudibleDist);
-                if (mPathingProbeBatchAdded && mProbePathingEnabled
+                const bool voicePathingEligible = mPathingProbeBatchAdded
+                    && mProbePathingEnabled
                     && mPathingDueThisStep
                     && !voice->playerEmitted
-                    && pathingWanted) {
+                    && !voice->skipPortalRouting
+                    && voice->pathingSource != nullptr;
+                bool stagePathingSolve = false;
+                bool stagePathingSkip  = false;
+                if (voicePathingEligible) {
+                    // Decomposed memo triggers — named so the
+                    // [PERF path_trig] census can attribute each staged
+                    // solve and so the unreachable-route cache below can
+                    // reason about individual triggers.
+                    const bool trigPending  = voice->pathSolvePending;
+                    const bool trigNever    = !voice->pathEverSolved;
+                    // GLOBAL committed-gen change (some door somewhere
+                    // moved since this voice's last solve). Unchanged; the
+                    // fail-open trigger and the [PERF path_trig] census.
+                    const bool trigDoorGenRaw =
+                        voice->pathLastSolveDoorGen != stagingDoorGen;
+                    // ── O3-lite scoped door trigger ──
+                    //
+                    // A voice with a valid route set (pathRouteScopeValid,
+                    // set at its last solve, and NOT a no-route verdict)
+                    // re-solves for a door event ONLY when a door on one of
+                    // ITS routes committed — pathScopedDoorDirty, set at the
+                    // commit via the mDoorVoices reverse index. Every other
+                    // voice FAILS OPEN to the global committed-gen trigger:
+                    // router miss / unmapped rooms (pathRouteScopeValid
+                    // false) and no-route voices (a door opening ANYWHERE
+                    // may create their first route — keep that conservative,
+                    // PLAN.PATHING_DESIGN.md §8 step 3).
+                    const bool scopeValid = voice->pathRouteScopeValid
+                        && !voice->pathLastOutputsNoRoute;
+                    const bool trigDoorGenScoped = scopeValid
+                        ? voice->pathScopedDoorDirty
+                        : trigDoorGenRaw;
+                    // Unreachable-route cache: defer the doorGen-triggered
+                    // discovery re-solve of a known no-route voice until
+                    // doors settle (see kDoorQuietForNoRouteRetryMs doc).
+                    // The memo's pathLastSolveDoorGen stays at the
+                    // verdict's gen while deferred, so the trigger
+                    // re-fires on the first quiet due tick — the
+                    // discovery solve is deferred, never dropped. (For a
+                    // scopeValid voice noRoute is false, so this gate
+                    // passes trivially and only the scoped dirty flag
+                    // governs.)
+                    const bool trigDoorGen = trigDoorGenScoped
+                        && (!voice->pathLastOutputsNoRoute
+                            || doorsQuietForNoRouteRetry);
+                    const bool trigRising   = !voice->pathWantedLastTick;
+                    const bool trigRoom     =
+                        voice->pathLastSolveListenerRoom
+                            != stagingListenerRoomId;
+                    const bool trigLMove    = glm::length(mListenerPos
+                            - voice->pathLastSolveListenerPos)
+                            > kPathingSolveMemoMoveFt;
+                    const bool trigSMove    = glm::length(voice->worldPos
+                            - voice->pathLastSolveSourcePos)
+                            > kPathingSolveMemoMoveFt;
+                    // What scoping alone decides (before the watchdog).
+                    const bool scopedNeedsSolve = pathingWanted
+                        && (trigPending || trigNever || trigDoorGen
+                            || trigRising || trigRoom || trigLMove
+                            || trigSMove);
+                    // [SCOPE_MISS] watchdog: on a watchdog tick, force a
+                    // re-solve of the rotating batch of in-range eligible
+                    // voices (window [wdLo,wdHi) over the eligible index)
+                    // regardless of scoping so the harvest can audit
+                    // whether scoping wrongly excluded any of them.
+                    bool watchdogForce = false;
+                    if (scopeWatchdogTick && pathingWanted) {
+                        if (wdEligIdx >= wdLo && wdEligIdx < wdHi)
+                            watchdogForce = true;
+                        ++wdEligIdx;
+                    }
+                    const bool needsSolve = scopedNeedsSolve || watchdogForce;
+                    // ── Lever D: first-solve stagger decision ──
+                    //
+                    // This voice has never solved and the pre-pass did not
+                    // admit it to this iteration's first-solve budget: hold
+                    // it for a later tick. Only trigNever voices can be
+                    // deferred — a voice with a prior solve carries a live
+                    // route (door/movement re-solves, the <=150 ms gate) and
+                    // is never staggered. Falls through to the SAME latch
+                    // branch as a due-but-can't-signal tick below: stage
+                    // NOTHING (so the lockstep populate/setInputs pair stays
+                    // driven by one boolean and SA keeps this source out of
+                    // the iteration entirely), touch NO memo field, and set
+                    // pathSolvePending so the next admitting tick solves it.
+                    // The voice stays pathTargetValid=false and parked silent
+                    // meanwhile — the state it was already in.
+                    bool firstSolveHeld = false;
+                    if (needsSolve && pathingWillSignal && trigNever) {
+                        firstSolveHeld = true;
+                        for (uint32_t i = 0; i < firstSolveAdmittedN; ++i) {
+                            if (firstSolveAdmitted[i] == handle) {
+                                firstSolveHeld = false;
+                                break;
+                            }
+                        }
+                        // Not admitted (or out-of-range this tick, so the
+                        // pre-pass never considered it — it will be a
+                        // candidate on the tick it comes back in range).
+                        if (firstSolveHeld) {
+                            ++voice->pathFirstSolveDeferrals;  // aging key
+                            ++firstSolveDeferred;
+                        }
+                    }
+                    if (needsSolve) {
+                        if (pathingWillSignal && !firstSolveHeld) {
+                            stagePathingSolve = true;
+                            // [PERF path_trig] census — count every
+                            // trigger that held on this staged solve,
+                            // and whether the voice's current outputs
+                            // carry the expensive no-route verdict (the
+                            // solve re-runs an exhaustive
+                            // findAlternatePaths) or the init sentinel.
+                            sPathTrigSolves.fetch_add(1, std::memory_order_relaxed);
+                            if (trigPending) sPathTrigPending.fetch_add(1, std::memory_order_relaxed);
+                            if (trigNever)   sPathTrigNever.fetch_add(1, std::memory_order_relaxed);
+                            if (trigDoorGen) sPathTrigDoorGen.fetch_add(1, std::memory_order_relaxed);
+                            if (trigRising)  sPathTrigRising.fetch_add(1, std::memory_order_relaxed);
+                            if (trigRoom)    sPathTrigRoom.fetch_add(1, std::memory_order_relaxed);
+                            if (trigLMove)   sPathTrigLMove.fetch_add(1, std::memory_order_relaxed);
+                            if (trigSMove)   sPathTrigSMove.fetch_add(1, std::memory_order_relaxed);
+                            if (voice->pathLastOutputsNoRoute)
+                                sPathTrigNoRoute.fetch_add(1, std::memory_order_relaxed);
+                            if (voice->pathLastOutputsSentinel)
+                                sPathTrigSentinel.fetch_add(1, std::memory_order_relaxed);
+                            // Arm the verdict cover cycle: outputs read
+                            // by the harvest pass are attributable to
+                            // THIS solve once completedCycles reaches
+                            // it (worker idle here, Step 3's signal is
+                            // what starts cycle completedCycles()+1).
+                            if (mPathingSim) {
+                                voice->pathVerdictCoverCycle =
+                                    mPathingSim->completedCycles() + 1;
+                            }
+                            voice->pathLastSolveDoorGen      = stagingDoorGen;
+                            voice->pathLastSolveListenerPos  = mListenerPos;
+                            voice->pathLastSolveListenerRoom =
+                                stagingListenerRoomId;
+                            voice->pathLastSolveSourcePos    = voice->worldPos;
+                            voice->pathEverSolved            = true;
+                            voice->pathSolvePending          = false;
+                            voice->pathStagedEnabled         = true;
+                            // O2a review F3: if this voice's retained
+                            // outputs are stale from an out-of-range
+                            // window, THIS signaled solve is the one that
+                            // refreshes them — arm the completed-cycles
+                            // target the harvest pass's re-entry hold
+                            // keys on. The worker is idle here
+                            // (pathingWillSignal ⊇ !pathBusy) and only
+                            // Step 3's signal() can start it, so
+                            // completedCycles()+1 is exactly the cycle
+                            // that will contain this staging.
+                            if (voice->pathOutputsStale
+                                && voice->pathStaleCoverCycle == UINT64_MAX
+                                && mPathingSim) {
+                                voice->pathStaleCoverCycle =
+                                    mPathingSim->completedCycles() + 1;
+                            }
+                            // ── O3-lite: refresh route scope + door
+                            //    registration for this solve ──
+                            // Microseconds (two portal Dijkstras + ellipse).
+                            // roomFromPoint for the source is O(rooms) but
+                            // only paid on actual solves (throttled). Clears
+                            // the scoped dirty flag — this signaled solve
+                            // covers the current committed door state.
+                            {
+                                Room *srcRoom = mRoomService
+                                    ? mRoomService->roomFromPoint(
+                                          voice->worldPos)
+                                    : nullptr;
+                                bool scopeOk = false;
+                                std::vector<int32_t> routeDoors =
+                                    computeRouteScope(
+                                        voice->worldPos, mListenerPos,
+                                        srcRoom, listenerRoom,
+                                        voice->maxAudibleDist, scopeOk);
+                                registerVoiceRouteDoors(handle, routeDoors);
+                                voice->pathRouteScopeValid = scopeOk;
+                                voice->pathScopedDoorDirty = false;
+                                if (scopeValid) ++pathingScopedSolves;
+                                // Watchdog arm: this solve was FORCED (scoping
+                                // alone wouldn't have re-solved) on a
+                                // scope-valid voice AND a door changed
+                                // globally since its last solve
+                                // (trigDoorGenRaw). Snapshot the cached eq
+                                // so the harvest can compare the fresh
+                                // forced-solve result (scope-miss check).
+                                // The trigDoorGenRaw guard isolates the
+                                // scoping question from pre-existing
+                                // sub-5 ft movement-memo staleness: without
+                                // a door change an eq delta is movement, not
+                                // a scope miss.
+                                if (scopeWatchdogTick && !scopedNeedsSolve
+                                    && scopeValid && trigDoorGenRaw
+                                    && mPathingSim) {
+                                    voice->pathScopeWatchdogEqSnapshot[0] =
+                                        voice->pathLastEq[0];
+                                    voice->pathScopeWatchdogEqSnapshot[1] =
+                                        voice->pathLastEq[1];
+                                    voice->pathScopeWatchdogEqSnapshot[2] =
+                                        voice->pathLastEq[2];
+                                    voice->pathScopeWatchdogCoverCycle =
+                                        mPathingSim->completedCycles() + 1;
+                                }
+                            }
+                        } else {
+                            // Due tick that can't signal (worker busy or
+                            // door-commit hold), or a first solve held back
+                            // by the lever-D stagger — keep the request
+                            // alive; do NOT touch the memo (memo updates
+                            // only on signaled solves). Either way nothing
+                            // is staged, so this voice is absent from the
+                            // iteration and SA leaves its outputs alone.
+                            voice->pathSolvePending = true;
+                        }
+                    } else if (voice->pathStagedEnabled && pathingWillSignal) {
+                        // Transition solve→skip: one staging call with the
+                        // PATHING flag cleared, then silence until the
+                        // next solve. Gated on pathingWillSignal (review
+                        // F2): iplSourceSetInputs flips the SA-side
+                        // enabled flag LIVE and the mid-flight solve loop
+                        // reads it LIVE — staging this on a due-but-busy
+                        // frame stripped the voice from the covering solve
+                        // its memo already recorded, leaving a permanently
+                        // stale route (door closed, route open) until the
+                        // next memo trigger. Deferring the transition to
+                        // the next signaling frame is free: the voice is
+                        // simply solved once more before entering skip.
+                        stagePathingSkip = true;
+                        voice->pathStagedEnabled = false;
+                    }
+                    voice->pathWantedLastTick = pathingWanted;
+                    // [PERF pathing] staging mix. `skipped` counts only
+                    // IN-RANGE eligible voices served from Steam Audio's
+                    // retained outputs (the dirty-gating win); out-of-range
+                    // voices are counted in neither bucket — they were
+                    // never solved under the pre-O2a staging either, so
+                    // counting them as "skipped" overstated the win
+                    // (review F6).
+                    if (pathingWillSignal) {
+                        if (stagePathingSolve)  ++pathingStagedSolved;
+                        // Lever D: a held first solve was staged as NEITHER
+                        // solve nor skip. It must not land in `skipped=`,
+                        // which means "in-range voice served from Steam
+                        // Audio's retained outputs" — this voice has no
+                        // retained outputs to serve (it has never solved)
+                        // and is silent, not cached. Counting it there would
+                        // overstate the dirty-gating win exactly the way
+                        // review F6 called out for out-of-range voices; it
+                        // gets its own firstSolveDeferred= bucket instead.
+                        // (already counted into firstSolveDeferred at the
+                        // decision site above — this branch exists purely to
+                        // keep it out of `skipped`.)
+                        else if (firstSolveHeld) { }
+                        else if (pathingWanted) ++pathingStagedSkipped;
+                        // A GLOBAL door change happened since this voice's
+                        // last solve (trigDoorGenRaw) but it was NOT
+                        // re-solved (trigDoorGen false). Two disjoint
+                        // reasons, separated by scopeValid:
+                        //   • scopeValid && !dirty → SCOPE SKIP: the moved
+                        //     door(s) were not on this voice's routes —
+                        //     the O3-lite win. [PERF pathing] scopeSkipped=.
+                        //   • fail-open no-route voice, doors not quiet →
+                        //     the pre-existing unreachable-route cache
+                        //     defer. [PERF pathing] unreachableCached=.
+                        if (!stagePathingSolve && pathingWanted
+                            && trigDoorGenRaw && !trigDoorGen) {
+                            if (scopeValid && !voice->pathScopedDoorDirty)
+                                ++pathingScopeSkipped;
+                            else
+                                ++pathingStagedUnreachableCached;
+                        }
+                    }
+                }
+                // LOCKSTEP INVARIANT (segfault class — see the matching
+                // iplSourceSetInputs(...PATHING) gate below): this single
+                // boolean gates BOTH the pathing-field populate block AND
+                // the setInputs call. A voice must never reach the
+                // setInputs call without having gone through the populate
+                // path — Steam Audio would read inputs.pathingProbes as
+                // the default-initialised null pointer and segfault
+                // inside the next runPathing. SOLVE and SKIP staging
+                // populate identically (probes, radii, ranges, validation
+                // flags); the ONLY difference is the PATHING bit in
+                // inputs.flags, cleared at the end of the populate block
+                // for SKIP.
+                const bool stagePathingInputs =
+                    stagePathingSolve || stagePathingSkip;
+                if (stagePathingInputs) {
                     // Multi-batch architecture: pathing sim has both the
                     // reflection batch (silently skipped — no pathing data)
                     // and the sparse pathing batch attached. The source
@@ -8879,7 +9968,7 @@ void AudioService::loopStep(float deltaTime)
                     // negatives that look like graph holes.
                     //
                     // The runtime value is per-voice: the original
-                    // engine's SFX_MaxDist formula below (~91 ft default,
+                    // engine's max-audible-distance formula below (~91 ft default,
                     // 200-300 ft for the loudest schemas). The bake-time
                     // value is the ROOM_DB-derived single-edge cap
                     // (max room span × 1.5, clamped [150, 400] ft —
@@ -8902,7 +9991,7 @@ void AudioService::loopStep(float deltaTime)
                     // multi-hop probe route existed.
                     //
                     // Per-voice pathing-solver scope, derived from the
-                    // original Dark Engine's SFX_MaxDist formula:
+                    // original Dark Engine's max-audible-distance formula:
                     //   max_pathing_dist_ft =
                     //       (5000 + gain_cB) / 55 × attenuationFactor
                     // This was the BFS-termination distance for portal
@@ -8911,7 +10000,7 @@ void AudioService::loopStep(float deltaTime)
                     // distance fall back to direct-only audio via the
                     // existing cached-replay mechanism in the readback
                     // site. 55 cB/ft matches the original engine's
-                    // attenuation_factor constant (APPSFX default). Steam
+                    // per-foot attenuation default. Steam
                     // Audio's INVERSEDISTANCE curve still handles per-voice
                     // volume continuously; this knob only limits the
                     // pathing-solver's search scope per source (matches
@@ -9020,6 +10109,19 @@ void AudioService::loopStep(float deltaTime)
                     //   • the visRange clamp above keeps the candidate
                     //     edge set room-scale.
                     inputs.findAlternatePaths = IPL_TRUE;
+
+                    // O2a SKIP staging: identical populate (fields above
+                    // stay valid on the SA side for whenever the source
+                    // is re-enabled), but clear the PATHING bit so
+                    // pathingInputs.enabled goes false and the solver
+                    // serves the retained outputs. Cleared BEFORE any of
+                    // the setInputs calls below; the DIRECT / REFLECTIONS
+                    // enables read their own bits, so this is invisible
+                    // to them.
+                    if (stagePathingSkip) {
+                        inputs.flags = static_cast<IPLSimulationFlags>(
+                            inputs.flags & ~IPL_SIMULATIONFLAGS_PATHING);
+                    }
                 }
 
                 // Push inputs to each simulator. Every voice has a
@@ -9036,25 +10138,20 @@ void AudioService::loopStep(float deltaTime)
                 iplSourceSetInputs(voice->directSource,
                     IPL_SIMULATIONFLAGS_DIRECT, &inputs);
                 // Pathing inputs go to the per-voice pathingSource (in
-                // the pathing simulator). Throttled by mPathingDueThisStep
-                // — we only stamp fresh inputs when the throttle has
-                // elapsed and the worker is about to be signalled. No
-                // !isRunning() gate: per N2 (RM.PLAN.PATHING_WORKER.md),
-                // iplSourceSetInputs is per-frame-safe via Steam Audio's
-                // internal double buffering, and both reference
-                // integrations call it every frame while the sim thread
-                // is mid-iteration.
+                // the pathing simulator). No !isRunning() gate: per N2
+                // (RM.PLAN.PATHING_WORKER.md), iplSourceSetInputs is
+                // per-frame-safe via Steam Audio's internal double
+                // buffering, and both reference integrations call it
+                // every frame while the sim thread is mid-iteration.
                 //
-                // The gate here must match the populate block above
-                // EXACTLY. Letting a voice through here without going
-                // through the populate path means Steam Audio reads
-                // `inputs.pathingProbes` as the default-initialised null
-                // pointer and segfaults inside the next runPathing.
-                if (mPathingProbeBatchAdded && mProbePathingEnabled
-                    && mPathingDueThisStep
-                    && !voice->playerEmitted
-                    && pathingWanted
-                    && voice->pathingSource) {
+                // LOCKSTEP: stagePathingInputs is the SAME boolean that
+                // gated the populate block above — by construction a
+                // voice cannot reach this call without populated pathing
+                // fields (null pathingProbes here segfaults inside the
+                // next runPathing; see the invariant comment at the
+                // boolean's definition). voicePathingEligible already
+                // required a non-null pathingSource.
+                if (stagePathingInputs) {
                     iplSourceSetInputs(voice->pathingSource,
                         IPL_SIMULATIONFLAGS_PATHING, &inputs);
                 }
@@ -9103,6 +10200,17 @@ void AudioService::loopStep(float deltaTime)
                 }
             }
 
+            // [SCOPE_MISS] watchdog: advance the rotating batch cursor once
+            // per consumed tick, wrapping at this pass's eligible-in-range
+            // count (wdEligIdx). Over ceil(N/kScopeWatchdogBatch) ticks
+            // every voice is audited.
+            if (scopeWatchdogTick) {
+                mScopeWatchdogCursor += kScopeWatchdogBatch;
+                if (wdEligIdx == 0
+                    || mScopeWatchdogCursor >= wdEligIdx)
+                    mScopeWatchdogCursor = 0;
+            }
+
             // Step 3: Signal the sim workers now that staging is done.
             // Reflection sim runs on background thread, throttled.
             // The throttle counter / divisor live on ReflectionSimulator now.
@@ -9110,7 +10218,29 @@ void AudioService::loopStep(float deltaTime)
             // ambisonics decoder and the convolution worker pool are alive
             // (post-Phase-3 the global IPLReflectionMixer is gone — the
             // worker pool sums ambisonics manually).
-            bool wantReflections = mReflectionsEnabled
+            // Review F1: the hold sits BEFORE throttleTickAndConsume so a
+            // hold frame short-circuits without consuming the throttle
+            // tick — the counter stays >= threshold and the reflection
+            // iteration fires on the first non-hold frame.
+            //
+            // Stacking fix (PLAN.PATHING_DESIGN.md §11): the reflection
+            // hold is now the UNCONDITIONAL doorCommitHold, not the
+            // pathing-idle-qualified aux. Deferral-blocker sampling on the
+            // stress tours showed that once pathing idles, a reflection
+            // iteration signaled during the preceding solve blocks the
+            // door commit for up to a full ~30 ms iteration on most
+            // alternation cycles (refl was the sole blocker in 13% of
+            // sampled deferrals, a participant in 40%), stretching the
+            // commit→solve period well past the ~2-frame target. Not
+            // starting a NEW reflection iteration while a door commit is
+            // pending costs at most one 100 ms-cadence tick of reflection
+            // staleness during swings — reflections are the most
+            // latency-tolerant output in the pipeline (they change with
+            // room geometry, not door pose). The DIRECT worker keeps the
+            // aux hold (below): freezing per-voice occlusion/distance for
+            // a whole multi-hundred-ms solve is audible, and its ~5 ms
+            // iterations clear within the frame anyway.
+            bool wantReflections = mReflectionsEnabled && !doorCommitHold
                 && mIplAmbiDecodeEffect && mConvolutionPool && mConvolutionPool->isActive()
                 && !reflBusy && mReflectionSim
                 && mReflectionSim->throttleTickAndConsume();
@@ -9144,8 +10274,21 @@ void AudioService::loopStep(float deltaTime)
             // slower.
             if (mDirectSim && directSimHandle) {
                 if (mDirectWorkerActive) {
-                    mDirectSim->signal();
+                    // Review F1: hold the direct signal while a door
+                    // scene-commit is pending AND the pathing worker is
+                    // idle (doorCommitHoldAux), so the commit's canMutate
+                    // gate isn't perpetually re-blocked by fresh direct
+                    // iterations (the worker only needs to stay idle for
+                    // ONE top-of-frame). Direct params hold one extra
+                    // frame — the exact staleness the DIRECT_LAG skip
+                    // path already produces when the worker overruns.
+                    if (!doorCommitHoldAux) {
+                        mDirectSim->signal();
+                    }
                 } else {
+                    // Synchronous fallback runs on THIS thread, strictly
+                    // ordered with the commit block — it can never block
+                    // canMutate at top-of-frame, so no hold needed.
                     mDirectSim->runSynchronous();
                 }
             }
@@ -9183,16 +10326,40 @@ void AudioService::loopStep(float deltaTime)
                 // inside ipl::SimulationManager::simulatePathing iterating
                 // a list whose entries had just been freed.
                 const bool gateNotBusy    = !pathBusy;
+                // Review F1: never signal while a door scene-commit is
+                // pending — the commit needs ALL workers idle, and a
+                // signaled solve would (a) hog the worker for the whole
+                // iteration, starving the commit, and (b) solve against
+                // the STALE BVH anyway. Holding lets the worker idle, the
+                // commit land, and the covering solve fire the very next
+                // frame against fresh geometry (see the doorCommitHold
+                // definition after the commit block).
+                const bool gateNoCommitHold = !doorCommitHold;
+                // O2a: must agree with the pathingWillSignal the staging
+                // pass keyed its memo updates on — same inputs, none of
+                // which changed since (pathBusy is the top-of-frame
+                // sample; doorCommitHold is a post-commit-block local;
+                // the members are main-thread-owned). The mPathingSim
+                // null-check difference is immaterial: a null sim fails
+                // the `wantPathing && mPathingSim` signal condition below
+                // just the same.
                 const bool wantPathing    = gateProbeBatch && gateEnable
-                                         && gateDue && gateNotBusy;
+                                         && gateDue && gateNotBusy
+                                         && gateNoCommitHold;
 
-                // [PATHING_LAG] diagnostic: throttle elapsed but the worker
-                // is still running the previous iteration. We skip signal()
-                // entirely in this branch (see gateNotBusy above for the
-                // race we're avoiding); eqCoeffs hold one extra interval
-                // until the worker idles and the next due frame signals
-                // it. Rate-limited (first 16 + every 64th thereafter).
-                if (gateProbeBatch && gateEnable && gateDue && pathBusy) {
+                // [PATHING_LAG] diagnostic: the CONFIGURED throttle
+                // elapsed but the worker is still running the previous
+                // iteration. We skip signal() entirely in this branch
+                // (see gateNotBusy above for the race we're avoiding);
+                // eqCoeffs hold one extra interval until the worker idles
+                // and the next due frame signals it. Gated on the NATURAL
+                // due flag — the O2a door due-override intentionally
+                // latches due on every frame of a swing while the worker
+                // grinds back-to-back solves, and counting those as lag
+                // would flood the diagnostic with by-design occurrences.
+                // Rate-limited (first 16 + every 64th thereafter).
+                if (gateProbeBatch && gateEnable
+                    && pathingDueNaturalThisStep && pathBusy) {
                     static std::atomic<int> sPathingLagCount{0};
                     int lc = sPathingLagCount.fetch_add(1, std::memory_order_relaxed);
                     if (lc < 16 || (lc % 64) == 0) {
@@ -9206,6 +10373,46 @@ void AudioService::loopStep(float deltaTime)
                 }
 
                 if (wantPathing && mPathingSim) {
+                    // O2a signal-time bookkeeping, BEFORE signal() so the
+                    // arming below can still read the pre-iteration
+                    // completedCycles value race-free (the worker only
+                    // starts once signal() flips mRunning/mWant).
+                    //
+                    // (a) Push this pass's staging mix to the worker's
+                    //     [PERF pathing] window counters.
+                    mPathingSim->addStagingCounts(
+                        pathingStagedSolved, pathingStagedSkipped,
+                        pathingStagedUnreachableCached,
+                        pathingScopedSolves, pathingScopeSkipped);
+                    //     Lever D (§16): first solves this pass held out of
+                    //     the iteration + the remaining never-solved depth.
+                    //     Pushed on the same wantPathing/signal path as the
+                    //     staging mix — these counters are only meaningful
+                    //     for a pass that actually staged into an iteration.
+                    mPathingSim->setFirstSolveStagger(firstSolveDeferred,
+                                                      firstSolveBacklog);
+                    // (b) Record the committed door gen this signaled
+                    //     solve covers (staging keyed its memos to the
+                    //     same stagingDoorGen snapshot). Consumed by the
+                    //     epoch FIFO push in setDoorTransform and the
+                    //     door due-override at the top of loopStep.
+                    mDoorGenLastSignalGen = stagingDoorGen;
+                    // (c) Arm [DOOR_ROUTE_LATENCY] completion tracking if
+                    //     an uncovered door epoch exists and this solve's
+                    //     covered gen reaches it. Signals never overlap
+                    //     (gateNotBusy) and the completion detector at
+                    //     the top of loopStep runs before any signal, so
+                    //     a single in-flight record is sufficient — the
+                    //     !mDoorSolveInFlight check is pure defense.
+                    if (!mDoorSolveInFlight && !mDoorGenEvents.empty()
+                        && mDoorGenEvents.front().gen <= stagingDoorGen) {
+                        mDoorSolveInFlight      = true;
+                        mDoorSolveInFlightGen   = stagingDoorGen;
+                        mDoorSolveInFlightCycle =
+                            mPathingSim->completedCycles() + 1;
+                    }
+                    // [PERF door_route] cadence field (sigs= per window).
+                    sPathSignalsWindow.fetch_add(1, std::memory_order_relaxed);
                     mPathingSim->signal();
                 }
                 // DIAG: confirm iplSimulatorRunPathing is actually
@@ -9219,13 +10426,15 @@ void AudioService::loopStep(float deltaTime)
                 int n = sRunPathingLogCount.fetch_add(1, std::memory_order_relaxed);
                 if (n < 8) {
                     AUDIO_LOG("[RUN_PATHING] called=%d probeBatchAdded=%d "
-                              "enabled=%d due=%d notBusy=%d updateInterval=%.3f "
+                              "enabled=%d due=%d notBusy=%d noCommitHold=%d "
+                              "updateInterval=%.3f "
                               "accumSec=%.3f (occurrence #%d)\n",
                               wantPathing ? 1 : 0,
                               gateProbeBatch ? 1 : 0,
                               gateEnable ? 1 : 0,
                               gateDue ? 1 : 0,
                               gateNotBusy ? 1 : 0,
+                              gateNoCommitHold ? 1 : 0,
                               mPathingUpdateInterval, mPathingAccumSec,
                               n + 1);
                 }
@@ -9474,7 +10683,8 @@ void AudioService::loopStep(float deltaTime)
                 // voice is over-attenuated (Steam Audio distAtt +
                 // engine portalAtt stacking past the original's single-
                 // centibel-curve attenuation). If much higher, under-
-                // attenuated. See APPSFX.CPP:964 + PSNDINST.CPP:1844.
+                // attenuated. (Formula matches the original engine's
+                // per-voice attenuation; derivation in NOTES.SOURCE.md.)
                 float origLin = 0.0f;
                 float oursLin = 0.0f;
                 if (mSchemaParser) {
@@ -9484,7 +10694,7 @@ void AudioService::loopStep(float deltaTime)
                         int gainCb = sch->playParams.volume;
                         float attenFactor = sch->playParams.attenuationFactor;
                         if (attenFactor < 0.01f) attenFactor = 1.0f;
-                        bool isSharp = (sch->playParams.flags & 0x1000) != 0;  // SFXFLG_SHARP
+                        bool isSharp = (sch->playParams.flags & 0x1000) != 0;  // 'sharp' falloff, bit 12
                         constexpr float kAtnFactor = 55.0f;
                         float mScaleDist = (5000.0f + gainCb) / kAtnFactor;
                         float mMaxDist   = mScaleDist * attenFactor;
@@ -10231,6 +11441,13 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
 //------------------------------------------------------
 void AudioService::removeVoiceSource(ActiveVoice &voice)
 {
+    // O3-lite: drop this voice from the scoped-invalidation reverse index
+    // so a recycled handle can't inherit a dead voice's door edges. No-op
+    // for a voice that never solved (never registered). Main-thread only,
+    // like all scope state. Placed before the no-source early return so a
+    // registered handle is always cleaned.
+    unregisterVoiceRouteScope(voice.handle);
+
     if (!voice.directSource && !voice.reflectionSource && !voice.pathingSource)
         return;
 
@@ -11544,7 +12761,7 @@ void AudioService::loadSchemaPropertyOverrides()
     };
 
     // P$SchPlayPa (20 bytes) — schema play parameters. The on-disk dtype
-    // default for `flags` is 0x7F00 (includes SFXFLG_SHARP at bit 12), so
+    // default for `flags` is 0x7F00 (includes the 'sharp' falloff bit 12), so
     // this overlay normally confirms the SHARP-falloff default; schemas
     // with an explicit override (e.g. cleared SHARP) end up using that.
     applyOverlay("SchPlayPa", sizeof(PropSchemaPlayParams),
@@ -12733,6 +13950,98 @@ void AudioService::dumpAudioStatusPeriodic()
         "[PERF audio] direct_sim n=%llu p50/p95/p99=%.3f/%.3f/%.3f ms\n",
         (unsigned long long)dsP.n, fmtMs(dsP.p50), fmtMs(dsP.p95), fmtMs(dsP.p99));
 
+    // O2a — [DOOR_ROUTE_LATENCY] distribution: doorGen bump → end of the
+    // first completed pathing solve covering it (committed BVH + staged
+    // inputs). n=0 on windows with no door movement. USER HARD GATE
+    // (PLAN.PATHING_DESIGN.md §6 decision 1): p95 ≤ ~150 ms under door
+    // stress — sounds popping in behind an opened door after a
+    // noticeable lag is disqualifying.
+    //
+    // PITFALL GUARD: drained ONCE here; the JSONL perf.window emit below
+    // reuses this snapshot (same single-drainer rule as cbP).
+    auto drP = mDoorRouteLatencyHist.snapshotAndReset();
+    // Cadence fields (stacking-fix verification): bumps = setDoorTransform
+    // pushes on registered doors; commits = coalesced door iplSceneCommit
+    // calls that landed; defer = top-of-frame commit attempts skipped (a
+    // sim worker busy); sigs = pathing worker signals. During a continuous
+    // swing the alternation target is commits ≈ sigs with defer staying a
+    // small multiple of commits.
+    const uint64_t drBumps   = sDoorBumpsWindow.exchange(0, std::memory_order_relaxed);
+    const uint64_t drCommits = sDoorCommitsWindow.exchange(0, std::memory_order_relaxed);
+    const uint64_t drDefer   = sDoorCommitDeferredWindow.exchange(0, std::memory_order_relaxed);
+    const uint64_t drSigs    = sPathSignalsWindow.exchange(0, std::memory_order_relaxed);
+    AUDIO_LOG(
+        "[PERF door_route] n=%llu p50/p95/max=%.1f/%.1f/%.1f ms "
+        "bumps=%llu commits=%llu defer=%llu sigs=%llu\n",
+        (unsigned long long)drP.n, drP.p50, drP.p95, drP.maxMs,
+        (unsigned long long)drBumps, (unsigned long long)drCommits,
+        (unsigned long long)drDefer, (unsigned long long)drSigs);
+
+    // [PERF path_trig] — staged-SOLVE trigger census for the window (see
+    // counter block at file scope). noRoute = staged solves whose voice
+    // currently carries the expensive no-route verdict (each one re-ran
+    // an exhaustive findAlternatePaths); sentinel = first solve not yet
+    // landed. A solve can hold several triggers so the per-trigger
+    // columns can sum past solves=.
+    {
+        const uint64_t tSolves   = sPathTrigSolves.exchange(0, std::memory_order_relaxed);
+        const uint64_t tPending  = sPathTrigPending.exchange(0, std::memory_order_relaxed);
+        const uint64_t tNever    = sPathTrigNever.exchange(0, std::memory_order_relaxed);
+        const uint64_t tDoorGen  = sPathTrigDoorGen.exchange(0, std::memory_order_relaxed);
+        const uint64_t tRising   = sPathTrigRising.exchange(0, std::memory_order_relaxed);
+        const uint64_t tRoom     = sPathTrigRoom.exchange(0, std::memory_order_relaxed);
+        const uint64_t tLMove    = sPathTrigLMove.exchange(0, std::memory_order_relaxed);
+        const uint64_t tSMove    = sPathTrigSMove.exchange(0, std::memory_order_relaxed);
+        const uint64_t tNoRoute  = sPathTrigNoRoute.exchange(0, std::memory_order_relaxed);
+        const uint64_t tSentinel = sPathTrigSentinel.exchange(0, std::memory_order_relaxed);
+        AUDIO_LOG(
+            "[PERF path_trig] solves=%llu pending=%llu never=%llu "
+            "doorGen=%llu rising=%llu room=%llu lmove=%llu smove=%llu "
+            "noRoute=%llu sentinel=%llu\n",
+            (unsigned long long)tSolves, (unsigned long long)tPending,
+            (unsigned long long)tNever, (unsigned long long)tDoorGen,
+            (unsigned long long)tRising, (unsigned long long)tRoom,
+            (unsigned long long)tLMove, (unsigned long long)tSMove,
+            (unsigned long long)tNoRoute, (unsigned long long)tSentinel);
+    }
+
+    // [PERF scope] — O3-lite scoped-invalidation census (PLAN.PATHING_DESIGN
+    // §8). The headline is the door-swing solve-set size: dirtyMarked /
+    // commitsWithMark = average voices invalidated per door commit (target:
+    // shrink all-in-range ~11 to 1-3), dirtyMax = the worst single commit.
+    // regVoices/failOpen/avgDoors are an instantaneous snapshot of the
+    // reverse index; scopeMiss is the cumulative [SCOPE_MISS] watchdog count
+    // (must stay 0). routerPortals/mappedDoors describe the built graph.
+    {
+        const uint64_t scDirty   = sScopeDirtyMarkedWindow.exchange(0, std::memory_order_relaxed);
+        const uint64_t scCommits = sScopeCommitCountWindow.exchange(0, std::memory_order_relaxed);
+        const uint64_t scMax     = sScopeDirtyMaxWindow.exchange(0, std::memory_order_relaxed);
+        int    regVoices = 0;
+        size_t totDoors  = 0;
+        int    failOpen  = 0;
+        for (const auto &kv : mVoiceRegisteredDoors) {
+            if (kv.second.empty()) continue;
+            ++regVoices;
+            totDoors += kv.second.size();
+        }
+        if (mVoicePool) {
+            for (const auto &[h, v] : mVoicePool->voices()) {
+                if (v && v->pathEverSolved && !v->pathRouteScopeValid)
+                    ++failOpen;
+            }
+        }
+        const double avgMarked = scCommits ? (double)scDirty / (double)scCommits : 0.0;
+        const double avgDoors  = regVoices ? (double)totDoors / (double)regVoices : 0.0;
+        AUDIO_LOG(
+            "[PERF scope] commitsWithMark=%llu dirtyMarked=%llu "
+            "(avg %.2f/commit, max %llu) regVoices=%d avgDoors=%.1f "
+            "failOpen=%d routerPortals=%zu mappedDoors=%zu scopeMiss=%llu\n",
+            (unsigned long long)scCommits, (unsigned long long)scDirty,
+            avgMarked, (unsigned long long)scMax, regVoices, avgDoors,
+            failOpen, mRouterPortals.size(), mDoorRoomPair.size(),
+            (unsigned long long)mScopeMissCount.load(std::memory_order_relaxed));
+    }
+
     // PLAN.AUDIO_PROFILING.md §2.3 — pin-block probe-reverb lookup latency.
     // Covers the O(probeCount) nearest-probe scan AND the
     // iplProbeBatchGetReverb call. Bursty on voice-spawn storms (footsteps,
@@ -13073,7 +14382,8 @@ void AudioService::dumpAudioStatusPeriodic()
                 "\"p99\":%.4f,\"max\":%.4f},"
             "\"signal_pickup\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"sync_wait\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
-                "\"timeouts\":%d,\"deadline_ms\":%.4f}"
+                "\"timeouts\":%d,\"deadline_ms\":%.4f},"
+            "\"door_route\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"max\":%.4f}"
             "},"
             "\"voices\":{\"total\":%zu,\"refl\":%d,\"tail\":%d,"
                 "\"ambients_playing\":%d,\"ambients_total\":%zu,"
@@ -13121,6 +14431,7 @@ void AudioService::dumpAudioStatusPeriodic()
             (unsigned long long)pickupP.n,   pickupP.p50,   pickupP.p95,   pickupP.p99,
             (unsigned long long)syncP.n,  syncP.p50,  syncP.p95,  syncP.p99,
                 syncTimeouts, static_cast<double>(syncDeadlineMs),
+            (unsigned long long)drP.n, drP.p50, drP.p95, drP.maxMs,
             mVoicePool->size(), reflVoices, tailVoices,
                 playing, ambients.size(), created, destroyed,
             (unsigned long long)evictionsSinceLast, reflVoices, MAX_ACTIVE_VOICES,
@@ -13296,8 +14607,10 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
     //   run   (~15 u/s)   → loud (1.0)
     float speedFactor = std::clamp(speed / 15.0f, 0.1f, 1.0f);
     float baseVol = schemaVolumeToLinear(schema->playParams.volume);
-    // Player-emitted sounds have skipAttenuation=true, so no Steam Audio
-    // distance/occlusion is applied. Volume is purely speed-dependent.
+    // NOTE: skipAttenuation is currently never set true by any voice
+    // class (the per-frame reset clears it) — player footsteps DO go
+    // through Steam Audio distance/occlusion like everything else.
+    // Volume here is speed-dependent on top of that.
     float finalVol = baseVol * speedFactor;
 
     // Select sample and play
@@ -13774,13 +15087,35 @@ void AudioService::rebuildPathingAdjacency()
     // injects nothing and the adjacency build emits one [VIZ_FALLBACK]
     // line and leaves the graph empty (per feedback_no_silent_fallbacks).
     ProbeManager::PathingAdjacencyRaycaster ray;
+    // Per-status census of every adjacency ray. Proves WHICH failure classes
+    // are culling edges (and that the whitelist below is not over-culling
+    // legitimate clear rays). Indexed by RayStatus; lives on the stack and is
+    // only touched by the synchronous buildPathingAdjacency call below.
+    std::array<int, 10> rayCensus{};
     if (mRaycaster) {
         // Copy mRaycaster into the lambda so any later reassignment
         // doesn't invalidate the adjacency build's view of it.
         AudioRaycastFn rc = mRaycaster;
-        ray = [rc](const Vector3 &from, const Vector3 &to) {
+        ray = [rc, &rayCensus](const Vector3 &from, const Vector3 &to) {
             RayHit hit{};
-            return rc(from, to, hit);
+            const bool blocked = rc(from, to, hit);
+            const size_t si = static_cast<size_t>(hit.status);
+            if (si < rayCensus.size()) ++rayCensus[si];
+            // WHITELIST RayStatus::Clear — do NOT read a bare `false` as
+            // visibility. raycastWorld returns false both when it PROVED the
+            // segment clear and when it could not evaluate it at all (origin
+            // outside every cell — e.g. a probe baked inside solid; cell
+            // budget exhausted; degenerate geometry; invalid portal target).
+            // Reading those as "clear" drew edges straight through solid
+            // world geometry, which is what this visualization/parity proxy
+            // is for catching. Exactly one status proves clear, so whitelist
+            // it rather than blacklisting failures we may not have enumerated.
+            //
+            // This raycaster's contract: true => DO NOT create an edge
+            // (proven blocked, or unproven — never claim unproven visibility).
+            if (blocked) return true;
+            return hit.status != RayStatus::Clear &&
+                   hit.status != RayStatus::ZeroLength;
         };
     }
 
@@ -13831,6 +15166,27 @@ void AudioService::rebuildPathingAdjacency()
 
     mProbeManager->buildPathingAdjacency(visRangeFt,
                                          activePathingVisSamples(), ray);
+
+    // [ADJACENCY_RAYS] — why each in-range pair did or did not become an edge.
+    // `clear` is the ONLY status that proves visibility; every other non-hit
+    // status means raycastWorld could not evaluate the segment (and used to be
+    // silently read as "clear", drawing edges through solid geometry).
+    // no_start_cell in particular counts rays fired FROM a probe baked inside
+    // solid — those are placement bugs, visible here as a loud number.
+    if (mRaycaster) {
+        auto n = [&](RayStatus s) {
+            return rayCensus[static_cast<size_t>(s)];
+        };
+        std::fprintf(stderr,
+            "[ADJACENCY_RAYS] hit=%d clear=%d | UNPROVEN: no_start_cell=%d "
+            "cell_budget=%d degenerate=%d discard_no_poly=%d "
+            "invalid_portal=%d invalid_cell=%d zero_len=%d unset=%d\n",
+            n(RayStatus::Hit), n(RayStatus::Clear),
+            n(RayStatus::NoStartCell), n(RayStatus::CellBudget),
+            n(RayStatus::DegenerateGeom), n(RayStatus::DiscardNoPolygon),
+            n(RayStatus::InvalidPortalTarget), n(RayStatus::InvalidCell),
+            n(RayStatus::ZeroLength), n(RayStatus::Unset));
+    }
 }
 
 //------------------------------------------------------
@@ -13871,30 +15227,454 @@ static float sRoomCeilZ(Room *r)  { return sRoomPlaneZ(r, /*ceiling*/ true);  }
 // is emitted for it, and parity legitimately excludes it. One constant so
 // the two passes cannot drift (drift = phantom MISSING pairs).
 static constexpr float kPathingSkyThresholdFt = 30.0f;
+// Door pair-probe offset along the portal normal — file-static because
+// the emission pass AND [REGION_PARITY]'s virtual door edges must agree
+// on the flank distance (a drift would silently mis-grade doors).
+static constexpr float kPathingPairProbeOffsetFt = 5.0f;
+// Player ear height above the floor — file-static because the coverage
+// fill's site anchoring and the parity check's per-room listener anchor
+// must agree (their old locals were "kept in step by value" via a comment
+// pointing at a constant the portal-first overhaul deleted).
+static constexpr float kPathingEarHeightFt = 5.0f;
 
 // Door-portal classification distance, shared by the emission pass
 // (DoorPair vs Portal/PortalPair split) and verifyPathingBakeParity
 // (door-adjacent grading). A portal whose center lies within this
-// distance of a registered door's AABB midpoint carries that door's
-// OBB. Same drift rule as the sky threshold: emission and parity MUST
-// classify identically or parity mislabels door gaps as regressions.
+// distance of a registered door's world AABB (point-to-box distance,
+// sPointAABBDistSq below) carries that door's OBB. Same drift rule as
+// the sky threshold: emission and parity MUST classify identically or
+// parity mislabels door gaps as regressions.
 static constexpr float kPathingDoorPortalMatchDistFt = 3.0f;
 
-// Shared door-position source for the bake's door-portal classifier and
-// [BAKE_PARITY]'s door-adjacent grader — see the declaration comment.
-std::vector<Vector3> AudioService::doorAudioMidpoints() const
+// Squared distance from a point to an axis-aligned box (0 inside).
+//
+// WHY point-to-AABB and not point-to-midpoint: a door's acoustic
+// footprint is its whole slab, not its center. ROOM_DB portal polygons
+// sit in the cell-boundary opening the door fills, so the portal center
+// always lies inside or within modeling slop of the door's world AABB —
+// but it can be ARBITRARILY far from the AABB *midpoint* for tall/wide
+// doors (67/147 MISS2 doors failed the old 3 ft midpoint rule, 15 of
+// them at exactly 5.00 ft of pure vertical offset; their portals were
+// never classified as door portals and got no DoorPair flanking
+// probes). Measuring to the box makes the 3 ft budget absorb only
+// portal-polygon vs door-mesh slop instead of half the door's extent.
+static float sPointAABBDistSq(const Vector3 &p, const Vector3 &mn,
+                              const Vector3 &mx)
 {
-    std::vector<Vector3> mids;
-    mids.reserve(mDoorAudioInstances.size());
+    const float dx = std::max(std::max(mn.x - p.x, p.x - mx.x), 0.0f);
+    const float dy = std::max(std::max(mn.y - p.y, p.y - mx.y), 0.0f);
+    const float dz = std::max(std::max(mn.z - p.z, p.z - mx.z), 0.0f);
+    return dx * dx + dy * dy + dz * dz;
+}
+
+// Shared door-geometry source for the bake's door-portal classifier and
+// [BAKE_PARITY]'s door-adjacent grader — see the declaration comment.
+std::vector<AudioService::DoorWorldAABB> AudioService::doorAudioAABBs() const
+{
+    std::vector<DoorWorldAABB> boxes;
+    boxes.reserve(mDoorAudioInstances.size());
     for (const auto &kv : mDoorAudioInstances) {
         const DoorAudioInstance &di = kv.second;
         if (di.worldAABBmin.x > di.worldAABBmax.x) continue;  // degenerate
-        mids.push_back(Vector3(
+        boxes.push_back(DoorWorldAABB{di.worldAABBmin, di.worldAABBmax});
+    }
+    return boxes;
+}
+
+//------------------------------------------------------
+// O3-lite scoped invalidation — door→room-pair maps + shadow-router graph.
+//
+// Built once per registerDoorGeometry batch (RoomService loaded by then).
+// mDoorRoomPair / mRoomPairDoors use the SAME point-to-AABB matcher as
+// logDoorPortalMap and the DoorPair bake classifier, so the three passes
+// can never drift on what portal a door belongs to. The router portal
+// graph is the physical-portal set (deduped via portalID<=destPortalID),
+// which is exactly the graph analysis/door_detour_class.py rebuilds
+// offline from the room_graph verb.
+void AudioService::rebuildDoorScopeMaps()
+{
+    mDoorRoomPair.clear();
+    mRoomPairDoors.clear();
+    mRouterPortals.clear();
+    mRouterRoomPortals.clear();
+    mRouterReady = false;
+
+    if (!mRoomService || !mRoomService->isLoaded()) {
+        std::fprintf(stderr,
+            "[SCOPE_ROUTER] RoomService not loaded — %zu doors unmapped, "
+            "all voices will fail open (global door trigger)\n",
+            mDoorAudioInstances.size());
+        return;
+    }
+
+    const auto &rooms = mRoomService->getAllRooms();
+
+    // ── Physical-portal graph (router adjacency) ──
+    for (const auto &roomPtr : rooms) {
+        if (!roomPtr) continue;
+        const int32_t rid = roomPtr->getRoomID();
+        const uint32_t pc = roomPtr->getPortalCount();
+        for (uint32_t i = 0; i < pc; ++i) {
+            ::Darkness::RoomPortal *portal = roomPtr->getPortal(i);
+            if (!portal) continue;
+            // One node per physical portal (same dedup as emission).
+            if (portal->getPortalID() > portal->getDestPortalID())
+                continue;
+            ::Darkness::Room *farRoom = portal->getFarRoom();
+            if (!farRoom) continue;
+            const int32_t fid = farRoom->getRoomID();
+            const int32_t a = std::min(rid, fid);
+            const int32_t b = std::max(rid, fid);
+            const uint32_t idx = static_cast<uint32_t>(mRouterPortals.size());
+            mRouterPortals.push_back({a, b, portal->getCenter()});
+            mRouterRoomPortals[a].push_back(idx);
+            mRouterRoomPortals[b].push_back(idx);
+        }
+    }
+    mRouterReady = !mRouterPortals.empty();
+
+    // ── door → room-pair (point-to-AABB matcher, same rule as bake) ──
+    int mapped = 0, unmapped = 0;
+    for (const auto &kv : mDoorAudioInstances) {
+        const DoorAudioInstance &di = kv.second;
+        if (di.worldAABBmin.x > di.worldAABBmax.x) continue;  // degenerate
+        float bestD = 1e30f;
+        int   bestA = -1, bestB = -1;
+        for (const auto &roomPtr : rooms) {
+            if (!roomPtr) continue;
+            const uint32_t pc = roomPtr->getPortalCount();
+            for (uint32_t i = 0; i < pc; ++i) {
+                ::Darkness::RoomPortal *portal = roomPtr->getPortal(i);
+                if (!portal) continue;
+                if (portal->getPortalID() > portal->getDestPortalID())
+                    continue;
+                ::Darkness::Room *farRoom = portal->getFarRoom();
+                const float d = std::sqrt(sPointAABBDistSq(
+                    portal->getCenter(), di.worldAABBmin, di.worldAABBmax));
+                if (d < bestD) {
+                    bestD = d;
+                    bestA = roomPtr->getRoomID();
+                    bestB = farRoom ? farRoom->getRoomID() : -1;
+                }
+            }
+        }
+        if (bestA >= 0 && bestB >= 0 && bestD <= kPathingDoorPortalMatchDistFt) {
+            const std::pair<int32_t, int32_t> rp(std::min(bestA, bestB),
+                                                 std::max(bestA, bestB));
+            mDoorRoomPair[kv.first] = rp;
+            mRoomPairDoors[rp].push_back(kv.first);
+            ++mapped;
+        } else {
+            // Genuine non-boundary door (closet/cabinet/shutter/out-of-
+            // coverage). No room-pair → covered only by the ellipse
+            // fallback / fail-open-all on bump.
+            ++unmapped;
+        }
+    }
+
+    std::fprintf(stderr,
+        "[SCOPE_ROUTER] built: %zu router portals, %d doors mapped to "
+        "room-pairs, %d unmapped (ellipse/fail-open), routerReady=%d\n",
+        mRouterPortals.size(), mapped, unmapped, mRouterReady ? 1 : 0);
+}
+
+//------------------------------------------------------
+// Shadow router: radius-bounded portal Dijkstra + ellipse fallback.
+// Returns the sorted, deduped door IDs a voice at (sourcePos,listenerPos)
+// is "routed through" — every door whose room-pair lies on a route within
+// kRouteSlackFt of the shortest S→T route, unioned with every door whose
+// world-AABB midpoint satisfies the path-length ellipse. Microseconds:
+// two Dijkstras over the physical-portal graph, bounded by maxAudibleDist.
+std::vector<int32_t> AudioService::computeRouteScope(
+    const Vector3 &sourcePos, const Vector3 &listenerPos,
+    Room *sourceRoom, Room *listenerRoom, float maxAudibleDist,
+    bool &outScopeValid) const
+{
+    outScopeValid = false;
+    std::vector<int32_t> doors;
+    if (!mRouterReady || !sourceRoom || !listenerRoom)
+        return doors;  // fail open
+
+    const int32_t srcRid = sourceRoom->getRoomID();
+    const int32_t lstRid = listenerRoom->getRoomID();
+    const size_t nP = mRouterPortals.size();
+    const float kInf = std::numeric_limits<float>::max();
+
+    // pathLen = shortest source→listener route length. Same-room = straight
+    // line (no portal crossed); cross-room = the portal-graph Dijkstra min.
+    float pathLen = kInf;
+
+    if (srcRid == lstRid) {
+        pathLen = glm::length(listenerPos - sourcePos);
+        // Same room: no portal on the direct route → route-portal set
+        // empty. Ellipse fallback below still catches an in-room door.
+        outScopeValid = true;
+    } else {
+        // Forward Dijkstra from the source (through portals bounding srcRoom).
+        std::vector<float> distF(nP, kInf);
+        std::vector<float> distB(nP, kInf);
+        using QE = std::pair<float, uint32_t>;   // (dist, portalIdx)
+
+        auto seed = [&](std::vector<float> &dist, int32_t roomID,
+                        const Vector3 &anchor) {
+            auto it = mRouterRoomPortals.find(roomID);
+            if (it == mRouterRoomPortals.end()) return;
+            for (uint32_t pi : it->second) {
+                const float d = glm::length(mRouterPortals[pi].center - anchor);
+                if (d < dist[pi]) dist[pi] = d;
+            }
+        };
+        auto relax = [&](std::vector<float> &dist) {
+            // Reset the PQ from the seeded distances.
+            std::priority_queue<QE, std::vector<QE>, std::greater<QE>> q;
+            for (uint32_t i = 0; i < nP; ++i)
+                if (dist[i] < kInf) q.push({dist[i], i});
+            while (!q.empty()) {
+                auto [d, u] = q.top(); q.pop();
+                if (d > dist[u]) continue;
+                if (d > maxAudibleDist) continue;  // radius bound
+                const RouterPortal &pu = mRouterPortals[u];
+                // Neighbors: portals sharing either of u's two rooms.
+                for (int side = 0; side < 2; ++side) {
+                    const int32_t room = side == 0 ? pu.a : pu.b;
+                    auto it = mRouterRoomPortals.find(room);
+                    if (it == mRouterRoomPortals.end()) continue;
+                    for (uint32_t v : it->second) {
+                        if (v == u) continue;
+                        const float w = glm::length(
+                            mRouterPortals[v].center - pu.center);
+                        const float nd = d + w;
+                        if (nd < dist[v] && nd <= maxAudibleDist) {
+                            dist[v] = nd;
+                            q.push({nd, v});
+                        }
+                    }
+                }
+            }
+        };
+
+        seed(distF, srcRid, sourcePos);
+        relax(distF);
+        seed(distB, lstRid, listenerPos);
+        relax(distB);
+
+        // Shortest route = min over portals of (distToPortal + portalToListener).
+        for (uint32_t i = 0; i < nP; ++i) {
+            if (distF[i] >= kInf) continue;
+            const float toLst = glm::length(
+                mRouterPortals[i].center - listenerPos);
+            const float total = distF[i] + toLst;
+            if (total < pathLen) pathLen = total;
+            // distB symmetric check (source-adjacent-to-listener portals).
+            if (distB[i] < kInf) {
+                const float t2 = distF[i] + distB[i];
+                if (t2 < pathLen) pathLen = t2;
+            }
+        }
+
+        if (pathLen >= kInf || pathLen > maxAudibleDist) {
+            // No finite route within audible range → no-route voice.
+            // Fail open (global door trigger, conservative): a door
+            // opening anywhere may create this voice's first route.
+            outScopeValid = false;
+            return doors;
+        }
+        outScopeValid = true;
+
+        // Route-portal set: every portal on a route within slack, via the
+        // vertex-on-ε-shortest-path test distF[p] + distB[p] ≤ pathLen+slack.
+        const float budget = pathLen + kRouteSlackFt;
+        for (uint32_t i = 0; i < nP; ++i) {
+            if (distF[i] >= kInf || distB[i] >= kInf) continue;
+            if (distF[i] + distB[i] <= budget) {
+                const std::pair<int32_t, int32_t> rp(
+                    mRouterPortals[i].a, mRouterPortals[i].b);
+                auto dit = mRoomPairDoors.find(rp);
+                if (dit != mRoomPairDoors.end())
+                    doors.insert(doors.end(), dit->second.begin(),
+                                 dit->second.end());
+            }
+        }
+    }
+
+    // ── Ellipse fallback (catches unmapped doors + router gaps) ──
+    // A door is plausibly on a route if going source→door→listener costs
+    // no more than the shortest route + slack (the classic focal-sum
+    // ellipse with foci at source/listener). Runs over ALL registered
+    // doors, so the 43 unmapped non-boundary doors near a path invalidate
+    // correctly even without a room-pair.
+    const float ellipseBudget = pathLen + kRouteSlackFt;
+    for (const auto &kv : mDoorAudioInstances) {
+        const DoorAudioInstance &di = kv.second;
+        if (di.worldAABBmin.x > di.worldAABBmax.x) continue;  // degenerate
+        const Vector3 mid(
             (di.worldAABBmin.x + di.worldAABBmax.x) * 0.5f,
             (di.worldAABBmin.y + di.worldAABBmax.y) * 0.5f,
-            (di.worldAABBmin.z + di.worldAABBmax.z) * 0.5f));
+            (di.worldAABBmin.z + di.worldAABBmax.z) * 0.5f);
+        const float sum = glm::length(mid - sourcePos)
+                        + glm::length(mid - listenerPos);
+        if (sum <= ellipseBudget)
+            doors.push_back(kv.first);
     }
-    return mids;
+
+    std::sort(doors.begin(), doors.end());
+    doors.erase(std::unique(doors.begin(), doors.end()), doors.end());
+
+    // Empty door set → FAIL OPEN. A reachable voice for which neither the
+    // route-portal set nor the ellipse found ANY door has no actionable
+    // scope data: claiming "no door can ever affect me" is exactly the
+    // assertion the first stress runs caught being wrong (regDoors=0
+    // ambients whose SA multi-path diffraction reached a door the
+    // room-graph shortest-path proxy never traversed). Treat it as the
+    // fail-open case (global door trigger) — a natural extension of §8
+    // step 3's fail-open list. Costs a handful of isolated ambients their
+    // scoping benefit; the majority (doors in their ellipse) keep it.
+    if (doors.empty())
+        outScopeValid = false;
+    return doors;
+}
+
+//------------------------------------------------------
+// Refresh a voice's door registration (mDoorVoices / mVoiceRegisteredDoors).
+// Removes the voice from any door it was previously registered under that
+// is not in `doors`, then adds the new edges. Main-thread only.
+void AudioService::registerVoiceRouteDoors(SoundHandle h,
+                                           const std::vector<int32_t> &doors)
+{
+    auto &prev = mVoiceRegisteredDoors[h];  // creates empty on first solve
+    // Remove stale edges.
+    for (int32_t d : prev) {
+        if (std::find(doors.begin(), doors.end(), d) == doors.end()) {
+            auto it = mDoorVoices.find(d);
+            if (it != mDoorVoices.end()) {
+                it->second.erase(h);
+                if (it->second.empty()) mDoorVoices.erase(it);
+            }
+        }
+    }
+    // Add new edges.
+    for (int32_t d : doors)
+        mDoorVoices[d].insert(h);
+    prev = doors;
+}
+
+//------------------------------------------------------
+void AudioService::unregisterVoiceRouteScope(SoundHandle h)
+{
+    auto it = mVoiceRegisteredDoors.find(h);
+    if (it == mVoiceRegisteredDoors.end()) return;
+    for (int32_t d : it->second) {
+        auto dit = mDoorVoices.find(d);
+        if (dit != mDoorVoices.end()) {
+            dit->second.erase(h);
+            if (dit->second.empty()) mDoorVoices.erase(dit);
+        }
+    }
+    mVoiceRegisteredDoors.erase(it);
+}
+
+//------------------------------------------------------
+// [DOOR_PORTAL_MAP] — DEV diagnostic (see AudioService.h declaration).
+// Inverse view of the DoorPair emission classifier: instead of asking
+// "does this portal center sit within kPathingDoorPortalMatchDistFt of
+// any door's world AABB?", it reports per DOOR which physical portal
+// that is, so offline analysis can join door IDs against room-graph
+// rows. The printed midpoint is display-only (stable join key for
+// analysis/door_detour_class.py); the DISTANCE is point-to-AABB, the
+// same rule emission and parity use.
+// One record per physical portal via the same myID>destID dedup the
+// emission pass uses. Runs once per registerDoorGeometry batch; O(doors
+// × portals) scan, boot-time only, no state mutated.
+void AudioService::logDoorPortalMap() const
+{
+    if (!mRoomService || !mRoomService->isLoaded()) {
+        std::fprintf(stderr,
+            "[DOOR_PORTAL_MAP] RoomService not loaded — cannot map %zu "
+            "registered doors to portals\n", mDoorAudioInstances.size());
+        return;
+    }
+    const auto &rooms = mRoomService->getAllRooms();
+    for (const auto &kv : mDoorAudioInstances) {
+        const DoorAudioInstance &di = kv.second;
+        if (di.worldAABBmin.x > di.worldAABBmax.x) continue;  // degenerate
+        // Midpoint is printed for the offline join only; matching uses
+        // point-to-AABB distance (see sPointAABBDistSq's WHY comment).
+        const Vector3 mid(
+            (di.worldAABBmin.x + di.worldAABBmax.x) * 0.5f,
+            (di.worldAABBmin.y + di.worldAABBmax.y) * 0.5f,
+            (di.worldAABBmin.z + di.worldAABBmax.z) * 0.5f);
+        float   bestD = 1e30f;
+        int     bestA = -1, bestB = -1;
+        Vector3 bestC(0.0f, 0.0f, 0.0f);
+        // Polygon-distance audit (diagnostic-only, NOT the match rule):
+        // ROOM_DB portals are room-brush intersection faces, frequently
+        // much larger than the physical doorway, so a portal's CENTER
+        // can sit far from a door whose opening its polygon nonetheless
+        // spans. Reporting the door-box-to-POLYGON distance alongside
+        // the center-based rule separates "genuine interior door
+        // (closet / cabinet / shutter)" from "boundary door under an
+        // oversized portal" when auditing unmatched doors.
+        float   polyD = 1e30f;
+        int     polyA = -1, polyB = -1;
+        for (const auto &roomPtr : rooms) {
+            if (!roomPtr) continue;
+            const uint32_t pc = roomPtr->getPortalCount();
+            for (uint32_t i = 0; i < pc; ++i) {
+                ::Darkness::RoomPortal *portal = roomPtr->getPortal(i);
+                if (!portal) continue;
+                // one record per physical portal (same dedup as emission)
+                if (portal->getPortalID() > portal->getDestPortalID())
+                    continue;
+                ::Darkness::Room *farRoom = portal->getFarRoom();
+                const Vector3 c = portal->getCenter();
+                const float d = std::sqrt(sPointAABBDistSq(
+                    c, di.worldAABBmin, di.worldAABBmax));
+                if (d < bestD) {
+                    bestD = d;
+                    bestA = roomPtr->getRoomID();
+                    bestB = farRoom ? farRoom->getRoomID() : -1;
+                    bestC = c;
+                }
+                // Min door-box<->portal-polygon distance by alternating
+                // projection between the two convex sets (a few rounds
+                // reach diagnostic precision).
+                Vector3 q = portal->closestPointOnPolygon(mid);
+                float dPoly = 0.0f;
+                for (int it = 0; it < 3; ++it) {
+                    const Vector3 boxPt(
+                        std::min(std::max(q.x, di.worldAABBmin.x),
+                                 di.worldAABBmax.x),
+                        std::min(std::max(q.y, di.worldAABBmin.y),
+                                 di.worldAABBmax.y),
+                        std::min(std::max(q.z, di.worldAABBmin.z),
+                                 di.worldAABBmax.z));
+                    q = portal->closestPointOnPolygon(boxPt);
+                    dPoly = glm::length(q - boxPt);
+                }
+                if (dPoly < polyD) {
+                    polyD = dPoly;
+                    polyA = roomPtr->getRoomID();
+                    polyB = farRoom ? farRoom->getRoomID() : -1;
+                }
+            }
+        }
+        if (bestA >= 0 && bestD <= kPathingDoorPortalMatchDistFt) {
+            std::fprintf(stderr,
+                "[DOOR_PORTAL_MAP] door=%d mid=(%.1f,%.1f,%.1f) portal "
+                "rooms %d<->%d center=(%.1f,%.1f,%.1f) d=%.2fft "
+                "polyNearest rooms %d<->%d dPoly=%.2fft\n",
+                kv.first, mid.x, mid.y, mid.z, bestA, bestB,
+                bestC.x, bestC.y, bestC.z, bestD, polyA, polyB, polyD);
+        } else {
+            std::fprintf(stderr,
+                "[DOOR_PORTAL_MAP] door=%d mid=(%.1f,%.1f,%.1f) NO portal "
+                "within %.1fft (nearest rooms %d<->%d d=%.2fft) "
+                "polyNearest rooms %d<->%d dPoly=%.2fft\n",
+                kv.first, mid.x, mid.y, mid.z,
+                kPathingDoorPortalMatchDistFt, bestA, bestB, bestD,
+                polyA, polyB, polyD);
+        }
+    }
 }
 
 //------------------------------------------------------
@@ -13949,12 +15729,110 @@ void AudioService::verifyPathingBakeParity()
     // opening typically resolve to the two rooms the portal joins —
     // exactly what makes the direct-edge test meaningful.
     std::vector<int> probeRoom(positions.size(), -1);
-    std::map<int, std::vector<int>> roomProbes;  // roomID → probe indices
     for (size_t i = 0; i < positions.size(); ++i) {
         Room *r = mRoomService->roomFromPoint(positions[i]);
         if (!r) continue;
         probeRoom[i] = static_cast<int>(r->getRoomID());
-        roomProbes[probeRoom[i]].push_back(static_cast<int>(i));
+    }
+
+    // ── roomID → COVERING probes (not merely CONTAINED ones) ───────────
+    //
+    // This must ask the question STEAM AUDIO asks, not a geometric proxy of
+    // our own. SA attaches a listener/source to probes by pure influence
+    // containment: `ProbeBatch::getInfluencingProbes` (probe_tree.cpp:158)
+    // walks the probe BVH and collects every probe whose
+    // `influence.contains(point)` is true, then `checkOcclusion`
+    // (probe_manager.cpp:51-82) casts one ray point→probe-center and drops
+    // the occluded ones. If the resulting set is empty, `findPaths` returns
+    // false (path_simulator.cpp:189-192). **Room membership never enters
+    // it.**
+    //
+    // The old model — "a room's probes are the probes geometrically inside
+    // it" — therefore measured something SA does not care about, and it
+    // reported damage that does not exist. A room whose own probe was
+    // deduped away, but which sits well inside a neighbouring probe's
+    // influence sphere with clear line of sight, is FULLY SERVED by that
+    // probe; the old model called it a zero-probe room and failed every
+    // pair through it. That mis-scoring is what made a door-aware dedup
+    // look catastrophic (274 pairs of phantom damage) when the actual
+    // damage was ~11 pairs.
+    //
+    // Concretely: door flanks sit ±5 ft from the door, and every probe's
+    // influence radius has a 10 ft floor (kAbsoluteFloorFt), so a listener
+    // standing IN a doorway is inside BOTH flanks' spheres at half their
+    // minimum radius. A probe-less threshold slab is a non-issue in SA's
+    // model — and the thin-room repair already skips door portals for
+    // exactly this reason.
+    //
+    // Representative point per room: the same ear-height anchor the
+    // centroid pass uses (floor + ear height, clamped into the
+    // room), i.e. where a listener actually stands. Falls back to the room
+    // center for degenerate rooms.
+    const std::vector<float> &probeRadii =
+        mProbeManager->getPathingProbeRadii();
+    const bool radiiValid = (probeRadii.size() == positions.size());
+    if (!radiiValid) {
+        // No-silent-fallbacks: without radii we cannot evaluate SA's
+        // containment test and would silently regress to the old,
+        // wrong-question model.
+        std::fprintf(stderr,
+            "[BAKE_PARITY] per-probe influence radii unavailable "
+            "(%zu radii vs %zu probes) — falling back to CONTAINMENT "
+            "(probe geometrically inside the room). That is NOT the test "
+            "Steam Audio applies (it attaches by influence radius), so "
+            "zero-probe-room results below may be false alarms.\n",
+            probeRadii.size(), positions.size());
+    }
+    std::map<int, std::vector<int>> roomProbes;  // roomID → covering probes
+    constexpr float kParityEarHeightFt = kPathingEarHeightFt;
+    int coverageBeyondRoom = 0;
+    for (const auto &roomPtr : mRoomService->getAllRooms()) {
+        if (!roomPtr) continue;
+        const int rid = static_cast<int>(roomPtr->getRoomID());
+        const Vector3 c = roomPtr->getCenter();
+        const float floorZ = sRoomFloorZ(roomPtr.get());
+        const float ceilZ  = sRoomCeilZ(roomPtr.get());
+        float earZ = floorZ + kParityEarHeightFt;
+        if (ceilZ > floorZ && earZ > ceilZ - 0.5f) earZ = (floorZ + ceilZ) * 0.5f;
+        const Vector3 ear(c.x, c.y, earZ);
+        auto &cover = roomProbes[rid];
+        for (size_t i = 0; i < positions.size(); ++i) {
+            // (1) Containment — a probe INSIDE the room always serves it.
+            // Kept as the floor: coverage ADDS to containment, it does not
+            // replace it. Replacing it was a real bug — the representative
+            // point below is the room's geometric CENTER, and ROOM_DB boxes
+            // overlap solid geometry (§25), so a room's own center can sit
+            // inside a wall with line of sight to nothing. That made 26
+            // rooms with a perfectly good probe inside them report as
+            // uncovered. Union of the two tests is monotone: it can only
+            // ever find MORE coverage than the old model, never less.
+            if (probeRoom[i] == rid) {
+                cover.push_back(static_cast<int>(i));
+                continue;
+            }
+            if (!radiiValid) continue;          // degraded containment mode
+            // (2) Influence coverage — SA's actual test. A probe OUTSIDE the
+            // room still serves it when the listener anchor sits inside that
+            // probe's influence sphere with proven line of sight (e.g. a
+            // doorway slab served by the flanks 5 ft either side).
+            const Vector3 d = positions[i] - ear;
+            if (glm::dot(d, d) > probeRadii[i] * probeRadii[i]) continue;
+            if (mRaycaster) {
+                RayHit hit{};
+                if (mRaycaster(ear, positions[i], hit)) continue;
+                if (hit.status != RayStatus::Clear &&
+                    hit.status != RayStatus::ZeroLength) continue;
+            }
+            cover.push_back(static_cast<int>(i));
+            ++coverageBeyondRoom;
+        }
+        if (cover.empty()) roomProbes.erase(rid);
+    }
+    if (radiiValid) {
+        AUDIO_LOG("[BAKE_PARITY] coverage model: %d room/probe pairs served "
+                  "by a probe OUTSIDE the room (influence radius + proven "
+                  "LOS) — these are invisible to the old containment test\n",
+                  coverageBeyondRoom);
     }
 
     // Union-find over adjacency edges → connected components, plus the
@@ -13990,8 +15868,8 @@ void AudioService::verifyPathingBakeParity()
         return false;
     };
 
-    // Door-centroid list for door-adjacent grading — same source and
-    // same match distance as the emission pass's DoorPair classifier.
+    // Door-AABB list for door-adjacent grading — same source and same
+    // point-to-box match rule as the emission pass's DoorPair classifier.
     // A door portal's baked edge is INTENTIONALLY absent when the door
     // was closed at bake time (the door OBB sits in the acoustic scene
     // and rejects the pair's visibility rays — that is the DoorPair
@@ -14001,13 +15879,13 @@ void AudioService::verifyPathingBakeParity()
     // MISSING count that gates probe-layout regressions: the runtime
     // door-validation path, not the baked graph, owns sound across
     // doors.
-    const std::vector<Vector3> doorMids = doorAudioMidpoints();
+    const std::vector<DoorWorldAABB> doorBoxes = doorAudioAABBs();
     const float doorMatchSq = kPathingDoorPortalMatchDistFt
                             * kPathingDoorPortalMatchDistFt;
     auto isDoorAdjacentPortal = [&](const Vector3 &center) -> bool {
-        for (const Vector3 &dm : doorMids) {
-            Vector3 dv = dm - center;
-            if (glm::dot(dv, dv) < doorMatchSq) return true;
+        for (const DoorWorldAABB &b : doorBoxes) {
+            if (sPointAABBDistSq(center, b.mn, b.mx) < doorMatchSq)
+                return true;
         }
         return false;
     };
@@ -14122,8 +16000,15 @@ void AudioService::verifyPathingBakeParity()
     }
 
     // Summary — unconditional, stderr, machine-greppable.
+    // NOTE the basis: ROOM_DB adjacency. Under the portal-first layout this
+    // grading is INFORMATIONAL, not authoritative — ROOM_DB is the original
+    // engine's dampening partition and is wrong in BOTH directions as a
+    // propagation scoreboard (it demands sound cross fictional boundaries,
+    // and it is silent where it blocked sound that physically carries —
+    // PLAN.PATHING_DESIGN.md §34a). [REGION_PARITY] below is authoritative.
     std::fprintf(stderr,
-        "[BAKE_PARITY] ROOM_DB pairs checked=%d connected=%d (direct=%d "
+        "[BAKE_PARITY] (informational — ROOM_DB basis) pairs checked=%d "
+        "connected=%d (direct=%d "
         "indirect=%d) missing=%d (zero-probe-room=%d) "
         "missing_door_adjacent=%d sky_excluded=%d "
         "| proxy: debug adjacency (1 center ray/pair, visRange=%.0f ft, "
@@ -14131,6 +16016,203 @@ void AudioService::verifyPathingBakeParity()
         pairsChecked, direct + indirect, direct, indirect, missing,
         zeroProbePairs, missingDoorAdjacent, skyExcluded,
         adj.visRangeFt, adj.edges.size());
+
+    // ── [REGION_PARITY] — the AUTHORITATIVE scoreboard ──────────────────
+    //
+    // Grades against PHYSICAL connectivity (user north star, §34a): every
+    // real aperture joins two air regions, and the probe graph must let
+    // sound cross it. Asked per unique physical opening (apertureKey),
+    // on the same debug-adjacency proxy as above, PLUS virtual door edges:
+    // the baked graph is the all-doors-CLOSED graph (door OBBs block bake
+    // rays by design), so the two flanks of a door pair are joined here the
+    // way the runtime joins them when the door opens — probes on opposite
+    // sides within flank distance of the same door AABB.
+    if (mWorldApertureData.valid && mRegionOfPointFn) {
+        // Probe -> region (exact cell lookup; -1 = off-network).
+        std::vector<int> probeRegion(positions.size(), -1);
+        std::map<int, std::vector<size_t>> regionProbes;
+        for (size_t i = 0; i < positions.size(); ++i) {
+            probeRegion[i] = mRegionOfPointFn(positions[i]);
+            if (probeRegion[i] >= 0)
+                regionProbes[probeRegion[i]].push_back(i);
+        }
+
+        // Union-find over probes: adjacency edges + virtual door edges.
+        std::vector<int> parent(positions.size());
+        for (size_t i = 0; i < positions.size(); ++i)
+            parent[i] = static_cast<int>(i);
+        std::function<int(int)> find = [&](int x) {
+            while (parent[static_cast<size_t>(x)] != x) {
+                parent[static_cast<size_t>(x)] =
+                    parent[static_cast<size_t>(
+                        parent[static_cast<size_t>(x)])];
+                x = parent[static_cast<size_t>(x)];
+            }
+            return x;
+        };
+        auto unite = [&](int a, int b) {
+            // Same bounds guard as the ROOM_DB parity loop above: a
+            // default-constructed PathingEdge is {-1,-1}, and find(-1)
+            // would index parent[] ~2^64 elements out of range.
+            if (a < 0 || b < 0
+                || a >= static_cast<int>(positions.size())
+                || b >= static_cast<int>(positions.size())) return;
+            a = find(a); b = find(b);
+            if (a != b) parent[static_cast<size_t>(a)] = b;
+        };
+        for (const auto &e : adj.edges)
+            unite(e.a, e.b);
+        // Virtual door edges: pair flanks sit kPairProbeOffsetFt (5 ft)
+        // from the door; the +3 ft slop covers dedup nudges and non-slab
+        // door boxes. SIDE-AWARE: only probes on OPPOSITE sides of the
+        // door leaf are joined (thin-axis sign test, the same idea as the
+        // dedup pass's segmentCrossesAnyDoor) — chaining every nearby
+        // probe regardless of side would let two probes separated by the
+        // WALL beside the door read as connected, and the authoritative
+        // scoreboard would certify apertures the graph cannot actually
+        // cross. Same-side flank redundancy is left to the real adjacency
+        // edges. (doorBoxes: the vector this function already built for
+        // the door-adjacent grading above.)
+        {
+            const float rr = (kPathingPairProbeOffsetFt + 3.0f)
+                           * (kPathingPairProbeOffsetFt + 3.0f);
+            std::vector<int> nearDoor;
+            for (const DoorWorldAABB &b : doorBoxes) {
+                nearDoor.clear();
+                for (size_t i = 0; i < positions.size(); ++i) {
+                    if (sPointAABBDistSq(positions[i], b.mn, b.mx) <= rr)
+                        nearDoor.push_back(static_cast<int>(i));
+                }
+                if (nearDoor.size() < 2) continue;
+                const Vector3 ext = b.mx - b.mn;
+                int thin = 0;
+                if (ext.y < ext.x && ext.y < ext.z)      thin = 1;
+                else if (ext.z < ext.x && ext.z < ext.y) thin = 2;
+                const float c = (b.mn[thin] + b.mx[thin]) * 0.5f;
+                for (size_t x = 0; x < nearDoor.size(); ++x) {
+                    for (size_t y = x + 1; y < nearDoor.size(); ++y) {
+                        const float da =
+                            positions[static_cast<size_t>(nearDoor[x])][thin]
+                            - c;
+                        const float db =
+                            positions[static_cast<size_t>(nearDoor[y])][thin]
+                            - c;
+                        if (da * db < 0.0f)      // opposite sides of the leaf
+                            unite(nearDoor[x], nearDoor[y]);
+                    }
+                }
+            }
+        }
+
+        // One check per unique physical opening that joins two regions.
+        // Sky-filtered portals are excluded the same way placement excluded
+        // them (their records exist — the topology builder has no sky
+        // filter — but placement deliberately emitted nothing there, so
+        // grading them would demand probes the sky filter exists to
+        // prevent). Same test as pass 1: portal center above both rooms'
+        // floors by more than the threshold.
+        auto skyExcludedAperture = [&](const WorldApertureRecord &ap) {
+            Room *ra = mRoomService->getRoomByID(ap.roomAID);
+            Room *rb = mRoomService->getRoomByID(ap.roomBID);
+            if (!ra && !rb) return false;
+            float minBottom = std::numeric_limits<float>::max();
+            if (ra) minBottom = std::min(minBottom, sRoomFloorZ(ra));
+            if (rb) minBottom = std::min(minBottom, sRoomFloorZ(rb));
+            return ap.rdbCenter.z > minBottom + kPathingSkyThresholdFt;
+        };
+        std::set<uint64_t> seenKeys;
+        int apChecked = 0, apConnected = 0, apMissing = 0;
+        int apEmptySide = 0, apSkyExcluded = 0;
+        for (const WorldApertureRecord &ap : mWorldApertureData.apertures) {
+            if (ap.regionA < 0 || ap.regionB < 0
+                || ap.regionA == ap.regionB) continue;
+            if (!seenKeys.insert(ap.apertureKey).second) continue;
+            if (skyExcludedAperture(ap)) {
+                ++apSkyExcluded;
+                continue;
+            }
+            ++apChecked;
+            auto itA = regionProbes.find(ap.regionA);
+            auto itB = regionProbes.find(ap.regionB);
+            if (itA == regionProbes.end() || itB == regionProbes.end()) {
+                // A side with no probe AT ALL is not automatically a
+                // failure — SA attaches by influence containment, and a
+                // door-frame singleton region is covered by the flanks'
+                // spheres. Counted separately; a LARGE empty region is
+                // the coverage fill's zero-site fallback, already loud.
+                ++apEmptySide;
+                continue;
+            }
+            bool connected = false;
+            for (size_t pa : itA->second) {
+                for (size_t pb : itB->second) {
+                    if (find(static_cast<int>(pa))
+                            == find(static_cast<int>(pb))) {
+                        connected = true;
+                        break;
+                    }
+                }
+                if (connected) break;
+            }
+            if (connected) {
+                ++apConnected;
+            } else {
+                ++apMissing;
+                std::fprintf(stderr,
+                    "[REGION_PARITY] MISSING aperture at (%.1f,%.1f,%.1f) "
+                    "(inradius %.2f ft, rooms %d<->%d): regions %d (%zu "
+                    "probes) and %d (%zu probes) share no component even "
+                    "with doors open — a REAL opening the graph cannot "
+                    "cross\n",
+                    ap.wrCentroid.x, ap.wrCentroid.y, ap.wrCentroid.z,
+                    ap.apertureInradiusFt, ap.roomAID, ap.roomBID,
+                    ap.regionA, itA->second.size(),
+                    ap.regionB, itB->second.size());
+            }
+        }
+        // Component census over probes (doors-open view).
+        std::map<int, int> compSize;
+        for (size_t i = 0; i < positions.size(); ++i)
+            ++compSize[find(static_cast<int>(i))];
+        int comps = 0, biggest = 0, singletons = 0;
+        std::vector<int> sizes;
+        for (const auto &kv : compSize) {
+            ++comps;
+            biggest = std::max(biggest, kv.second);
+            if (kv.second == 1) ++singletons;
+            sizes.push_back(kv.second);
+        }
+        // Size histogram of the non-giant components: a 1-probe island is
+        // a containment-only probe (serves influence attachment, carries
+        // no route — usually benign); a multi-probe island is a cluster
+        // routes genuinely cannot leave — the fragmentation that matters.
+        std::sort(sizes.rbegin(), sizes.rend());
+        {
+            std::string tail;
+            char buf[16];
+            for (size_t i = 1; i < sizes.size() && i <= 8; ++i) {
+                std::snprintf(buf, sizeof(buf), "%s%d",
+                              i > 1 ? "," : "", sizes[i]);
+                tail += buf;
+            }
+            std::fprintf(stderr,
+                "[REGION_PARITY] component sizes: biggest=%d, next=[%s], "
+                "singletons=%d of %d components\n",
+                biggest, tail.c_str(), singletons, comps);
+        }
+        std::fprintf(stderr,
+            "[REGION_PARITY] apertures checked=%d connected=%d MISSING=%d "
+            "empty-side=%d sky_excluded=%d | probes=%zu "
+            "components(doors-open)=%d "
+            "biggest=%d | basis: physical connectivity (WR regions), the "
+            "authoritative scoreboard\n",
+            apChecked, apConnected, apMissing, apEmptySide, apSkyExcluded,
+            positions.size(), comps, biggest);
+    } else {
+        std::fprintf(stderr,
+            "[REGION_PARITY] SKIPPED — no WorldApertureData/region fn "
+            "(headless?); only the informational ROOM_DB parity above ran\n");
+    }
 }
 
 std::vector<AudioService::PathingEdgeViz>
@@ -14312,10 +16394,12 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     // simulator was created with, so bake and runtime cannot diverge
     // within a run (SteamAudioPathing.h owns the constants).
     params.pathingNumSamples     = activePathingVisSamples();
-    // Probe layout density tier (audio.pathing_probes.density). Consumed
-    // by the portal pass below (baseline: single center probe per
-    // non-door portal; bends: flanking PortalPair) and recorded into the
-    // .probes v4 header for the loader's density-mismatch check.
+    // Probe layout density tier (audio.pathing_probes.density). VESTIGIAL
+    // under portal-first placement — the knob no longer changes the layout
+    // (apertures emit one probe, doors one pair, at every density) — but it
+    // is still recorded into the .probes v4 header field, and the loader's
+    // density-mismatch check still fires on a flip. Retire-or-repurpose is
+    // a flagged review decision (PLAN.PATHING_DESIGN.md §39c).
     params.pathingDensity        = mPathingProbeDensity;
     // Forced pathing re-bake (--force-pathing-bake / the automatic v3
     // header-mismatch re-bake) carries the loaded reflection IR section
@@ -14334,180 +16418,149 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     // ring pass have been re-inlined into the pathing-batch block —
     // search for `sRoomFloorZ` above if you need to share or compare.)
 
-    // ── Pathing-batch candidates (sparse ROOM_PORTAL graph) ───────────
+    // ── Pathing-batch candidates (PORTAL-FIRST layout) ─────────────────
     //
     // Pathing density is decoupled from reflection density. Steam Audio's
     // `findAlternatePaths` cost grows fast in probe count when door OBBs
     // invalidate baked edges at runtime; we want this batch as sparse as
-    // we can make it while still covering every room with at least one
-    // graph node and connecting every architectural portal.
+    // we can make it while still giving every REAL opening a graph node
+    // and every air region interior attachment coverage.
     //
-    // Topology (= the original Dark Engine room/portal graph's nodes,
-    // with density tiers — see PathingProbeDensity in ProbeManager.h):
-    //   • Non-door portals, per the density knob
-    //     (audio.pathing_probes.density):
-    //       - baseline: ONE probe AT the centroid, with a generous
-    //         influence radius (~5 ft) so the probe is reached from
-    //         either adjoining room and the path-finder can wrap
-    //         through short corners on its own.
-    //       - bends: TWO probes flanking the portal along
-    //         ±normal × kPairProbeOffsetFt (purpose PortalPair) — the
-    //         same geometry as door pairs, generalized to every
-    //         opening. These are the solver's bend points: with a node
-    //         on each side of the aperture, sound turning a corner
-    //         routes around the opening (probe → aperture → probe)
-    //         instead of being approximated by a single boundary node.
-    //   • Door portals: TWO probes flanking the door OBB (DoorPair) at
-    //     every density — the closed-door OBB must sit between two
-    //     graph nodes so closing the door invalidates the edge.
-    //   • ONE probe per Room centroid, snapped down to (roomFloorZ +
-    //     5 ft) when the centroid sits high in the sky (outdoor cells
-    //     whose geometric center is above the playable ground). Tall
-    //     rooms (> kMaxUpperProbeHeightFt) additionally get one upper
-    //     centroid for vertical propagation.
+    // Topology (PLAN.PATHING_DESIGN.md §36-38 — nodes come from the
+    // world geometry, not from ROOM_DB boxes):
+    //   • REAL apertures (ROOM_DB portals the renderer's WR oracle
+    //     matched to actual world-geometry openings): non-door → ONE
+    //     probe at the aperture's in-air anchor; door → TWO DoorPair
+    //     probes flanking the opening along ±normal, so the closed-door
+    //     OBB sits between two graph nodes and closing the door
+    //     invalidates the edge.
+    //   • FICTIONAL ROOM_DB portals (no aperture): emit NOTHING.
+    //   • Interior coverage: the region-scoped fill near the end of this
+    //     function (Gonzalez k-center over air regions + zero-anchor
+    //     seeding). Room centroids and PortalPair bends are GONE.
     //   • Emitter anchors are appended later — see "Mirror the emitter
     //     positions into the pathing batch" below.
     //   • A 10-ft dedup runs at the end and drops candidates that fall
-    //     within 10 ft of an earlier-emitted one. Emission order matters
-    //     here — portals first (architectural anchors), then centroids
-    //     (room coverage), so a centroid coincident with a nearby portal
-    //     gets dropped rather than the other way around.
+    //     within 10 ft of an earlier-emitted one (portals first, so an
+    //     emitter anchor coincident with an aperture probe loses).
     //
-    // One record per non-door portal — input to the thin-room
-    // coverage-repair pass, which runs AFTER the dedup and the
-    // inside-door-AABB rejection (near the end of this function) so its
-    // coverage check sees the candidates that actually SURVIVE. Room IDs
-    // come from ROOM_DB (authoritative), NOT roomFromPoint(center): a
-    // point exactly on the portal plane resolves to whichever neighbor
-    // wins the tie, so keying repairs on it filed thin connector rooms
-    // under their big neighbors and left them unrepairable (MISS2 room
-    // 194, a 0.6-ft slab between two aligned portals, kept two loud
-    // [BAKE_PARITY] MISSING pairs). Declared at function scope: filled
-    // by the portal-emission block, consumed by the repair block.
-    struct NonDoorPortalRecord {
+    // One record per surviving (non-sky, non-degenerate, dup-skipped)
+    // ROOM_DB portal — input to TWO later passes:
+    //   • the emission pass (aperture lookup by portalID, door pairing);
+    //   • the region coverage fill + coverage-based bake-range
+    //     derivation (aperture-carrying records are the routing demand
+    //     set; PLAN.PATHING_DESIGN.md §10/§38c).
+    // Room IDs come from ROOM_DB (authoritative for the informational
+    // room parity), NOT roomFromPoint(center): a point exactly on the
+    // portal plane resolves to whichever neighbor wins the tie.
+    // Declared at function scope: filled by the classification block,
+    // consumed by the emission / fill / derivation blocks.
+    struct PathingPortalRecord {
         int roomAID = -1;      ///< ROOM_DB IDs; -1 when absent
         int roomBID = -1;
         Vector3 center;        ///< portal center (on the plane)
         Vector3 unitNormal;    ///< normalized portal plane normal
+        bool isDoor = false;   ///< carries a registered door OBB
+        /// Index into doorBoxes of the door this portal matched (-1 = none),
+        /// and how far the portal center sits from that door's AABB.
+        /// ONE APERTURE, ONE PAIR: a single doorway routinely matches
+        /// several ROOM_DB portals (the threshold slab's two faces, frame
+        /// boundaries — MISS2 measured ~2.7 portals per door), and each
+        /// match used to emit its own dedup-EXEMPT DoorPair, stacking ~5.5
+        /// probes in a line through one doorway. Recording the door lets the
+        /// emit pass keep one representative record per door
+        /// (aperture-carrying preferred, then nearest to the AABB).
+        int   doorIdx    = -1;
+        float doorDistSq = 0.0f;
+        /// Aperture size: distance from the portal center to its nearest
+        /// bounding edge plane = HALF the portal's narrow dimension.
+        /// (RoomPortal stores a plane + bounding edge planes, no vertices.)
+        /// CAUTION — this number is a ROOM_DB reading and ROOM_DB size is
+        /// FICTION: portals reading 6.3 ft here were measured over real
+        /// 1.9-2.8 ft arches (overstated ~2.5x), which is how the old
+        /// >=6 ft "not an aperture" rule silenced three real openings
+        /// (PLAN.PATHING_DESIGN.md §34). Kept for diagnostics only; no
+        /// placement decision may threshold on it.
+        float inradiusFt = -1.0f;
+        /// Half-open span [begin, end) into mWorldApertureData.apertures of
+        /// the REAL world-geometry opening(s) this ROOM_DB portal
+        /// corresponds to (one record per true region pair — a match ball
+        /// can span two distinct openings). begin < 0 means the oracle
+        /// found no aperture anywhere near the portal center: this
+        /// "portal" is a designer box boundary standing in open air (or
+        /// buried in solid) and models nothing. That IS the fiction
+        /// verdict; emission skips such records.
+        int apertureBegin = -1;
+        int apertureEnd   = -1;
+        bool hasAperture() const { return apertureBegin >= 0; }
     };
-    std::vector<NonDoorPortalRecord> nonDoorPortals;
-    if (mProbePathingBatchEnabled && mRoomService) {
+    std::vector<PathingPortalRecord> pathingPortals;
+    // Portal-first placement REQUIRES the renderer's aperture/region ground
+    // truth (see WorldApertureData.h). Refuse without it — loudly, and with
+    // no placement fallback: silently reverting to the room-centroid layout
+    // would rebuild exactly the fiction the portal-first design replaces
+    // (probes in mid-air at box boundaries, probes inside solid, per-room
+    // over-production). Headless probe_plan runs land here by design.
+    if (mProbePathingBatchEnabled && !mWorldApertureData.valid) {
+        std::fprintf(stderr,
+            "[FALLBACK] pathing bake: no WorldApertureData (renderer did not "
+            "call setWorldApertureData — headless run?). Portal-first probe "
+            "placement CANNOT run and there is deliberately no room-centroid "
+            "fallback; the pathing batch is skipped for this bake.\n");
+    }
+    if (mProbePathingBatchEnabled && mRoomService
+        && mWorldApertureData.valid) {
         const auto &rooms = mRoomService->getAllRooms();
 
-        // ── Bake-time single-edge visRange cap, derived from ROOM_DB ──
+        // portalID -> aperture-record span. Exact identity (both sides
+        // enumerate RoomService portals through the same back-link dedup),
+        // no geometric assumptions. One portalID can carry SEVERAL records
+        // — a match ball spanning two distinct physical openings emits one
+        // record per true region pair (see WorldApertureRecord) — and the
+        // builder emits a portal's records contiguously, so a span suffices.
+        std::unordered_map<int32_t, std::pair<int, int>> aperturesByPortalID;
+        aperturesByPortalID.reserve(mWorldApertureData.apertures.size());
+        for (size_t ai = 0; ai < mWorldApertureData.apertures.size(); ++ai) {
+            const int32_t pid = mWorldApertureData.apertures[ai].portalID;
+            auto it = aperturesByPortalID.find(pid);
+            if (it == aperturesByPortalID.end()) {
+                aperturesByPortalID[pid] =
+                    {static_cast<int>(ai), static_cast<int>(ai) + 1};
+            } else {
+                it->second.second = static_cast<int>(ai) + 1;
+            }
+        }
+
+        // ── Bake-time single-edge visRange cap ────────────────────────
         //
         // The pathing bake's visRange caps how far apart two probes may
         // be and still get a visibility edge; pairs beyond it are culled
         // BEFORE the numSamples² ray test, making this the dominant
-        // bake-cost lever on sprawling missions (see the
-        // visRange/pathRange comment in ProbeManager::bakePathingBatch
-        // for the full split rationale + the horizontal-only-cull
-        // upstream note). The longest meaningful single hop is a
-        // room-scale distance: probes live at room centroids, portals,
-        // doors and emitters, so any pair further apart than the
-        // mission's largest room either has geometry between it (the
-        // ray test would reject the edge anyway — pure wasted rays) or
-        // is served by multi-hop routes through intermediate probes
-        // (pathRange stays whole-level).
+        // bake-cost AND runtime-search-space lever on sprawling missions
+        // (see the visRange/pathRange comment in
+        // ProbeManager::bakePathingBatch for the full split rationale +
+        // the horizontal-only-cull upstream note).
         //
-        // maxRoomSpanFt = max over rooms of:
-        //   • the largest intra-room portal-to-portal distance — the
-        //     original engine's own precomputed hop tables
-        //     (Room::getPortalDist), its hand-authored answer to "how
-        //     far apart can two openings of one room be";
-        //   • the room's OBB diagonal from its bounding planes (covers
-        //     rooms with 0–1 portals, whose portal table contributes
-        //     nothing).
-        // × 1.5 margin (probes sit off the graph anchors: door pairs
-        // ±5 ft along the normal, ear-height offsets, emitter jitter),
-        // clamped to [150, 400] ft — the floor keeps small missions
-        // from starving the graph, the ceiling keeps one cathedral-
-        // sized outlier room from re-inflating the whole bake.
-        // Derived HERE (not in ProbeManager) because rooms + portals
-        // are already iterated in this function and ProbeManager must
-        // not depend on RoomService.
-        {
-            float maxPortalSpanFt = 0.0f;
-            float maxRoomDiagFt   = 0.0f;
-            for (const auto &roomPtr : rooms) {
-                if (!roomPtr) continue;
-                const uint32_t pc = roomPtr->getPortalCount();
-                for (uint32_t i = 0; i < pc; ++i)
-                    for (uint32_t j = i + 1; j < pc; ++j)
-                        maxPortalSpanFt = std::max(
-                            maxPortalSpanFt, roomPtr->getPortalDist(i, j));
-                // OBB diagonal: pair antiparallel bounding planes and
-                // accumulate each axis extent (plane normals face
-                // inward, so center-to-plane distances are positive and
-                // opposite planes' distances sum to the extent).
-                const Plane  *planes = roomPtr->getBoundingPlanes();
-                const Vector3 rc     = roomPtr->getCenter();
-                float sumSq = 0.0f;
-                bool paired[6] = {};
-                for (int a = 0; a < 6; ++a) {
-                    if (paired[a]) continue;
-                    for (int b = a + 1; b < 6; ++b) {
-                        if (paired[b]) continue;
-                        if (glm::dot(planes[a].normal, planes[b].normal)
-                            < -0.9f) {
-                            const float extent = planes[a].getDistance(rc)
-                                               + planes[b].getDistance(rc);
-                            if (extent > 0.0f) sumSq += extent * extent;
-                            paired[a] = paired[b] = true;
-                            break;
-                        }
-                    }
-                }
-                if (sumSq > 0.0f)
-                    maxRoomDiagFt = std::max(maxRoomDiagFt,
-                                             std::sqrt(sumSq));
-            }
-            const float maxRoomSpanFt = std::max(maxPortalSpanFt,
-                                                 maxRoomDiagFt);
-            constexpr float kVisRangeMarginMul = 1.5f;
-            constexpr float kVisRangeMinFt     = 150.0f;
-            constexpr float kVisRangeMaxFt     = 400.0f;
-            const float visRangeFt = std::min(
-                std::max(maxRoomSpanFt * kVisRangeMarginMul,
-                         kVisRangeMinFt),
-                kVisRangeMaxFt);
-            params.pathingVisRangeFt  = visRangeFt;
-            mDerivedPathingVisRangeFt = visRangeFt;
-            // Loud + unconditional: the entire pathing bake-cost story
-            // hangs off this one number, and a surprising derivation
-            // (cathedral room, empty portal tables) must be visible in
-            // every bake log.
-            std::fprintf(stderr,
-                "[PATHING_BAKE_RANGE] derived single-edge visRange cap "
-                "%.0f ft (maxRoomSpan=%.0f ft [portal-to-portal %.0f, "
-                "room-diag %.0f] x %.1f margin, clamp [%.0f, %.0f]); "
-                "pathRange stays whole-level\n",
-                visRangeFt, maxRoomSpanFt, maxPortalSpanFt, maxRoomDiagFt,
-                kVisRangeMarginMul, kVisRangeMinFt, kVisRangeMaxFt);
-        }
+        // The derivation is COVERAGE-based and lives near the END of
+        // this function (after the hub-room coverage fill, which it
+        // depends on): governing = max over rooms of (max portal →
+        // nearest same-room probe distance POST-fill), visRange =
+        // clamp(2 × governing). It REPLACES the previous max-room-SPAN
+        // derivation ([150, 400] ft clamp), which let one hub room
+        // (MISS2 room 18 — 331 ft intra-room hops) inflate the whole
+        // mission's bake to the 400 ft ceiling even though the fill
+        // bounds every hop far lower (PLAN.PATHING_DESIGN.md §10).
+        // Until that block runs, params.pathingVisRangeFt stays at the
+        // -1 sentinel; if candidate emission dies before reaching it,
+        // bakePathingBatch falls back LOUDLY to the whole-level range.
 
-        int roomCount      = 0;
-        int roomSnapped    = 0;
         int portalCount    = 0;
         int portalDup      = 0;
         int portalSky      = 0;
 
-        // Tier 1 ("bends") emits a flanking PortalPair at every NON-door
-        // portal instead of a single center probe; baseline keeps the
-        // single center probe. Doors get their DoorPair at every density.
-        const bool bendsDensity =
-            (mPathingProbeDensity == PathingProbeDensity::Bends);
-
         // Sky filter threshold — file-static kPathingSkyThresholdFt
         // (shared with verifyPathingBakeParity; see its comment).
         constexpr float kSkyThresholdFt = kPathingSkyThresholdFt;
-        // Outdoor-cell skybox snap height: centroid is replaced by
-        // (floorZ + kRoomFloorOffsetFt). 5 ft = player ear height, the
-        // same anchor we use for in-room centroids below so a probe in
-        // an outdoor cell behaves the same as one in any other room
-        // (line-of-sight through doorways at ~7 ft Thief corridor
-        // height).
-        constexpr float kRoomFloorOffsetFt = 5.0f;
         // Door pair-probe offset along the portal normal. Each door
         // contributes one probe `kPairProbeOffsetFt` inside the
         // doorway and one `kPairProbeOffsetFt` outside, so the closed
@@ -14521,12 +16574,16 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         // probes) is built from acoustic-mesh ray tests, not from
         // sphere overlap. See the long comment in the adaptive
         // radius pass for the full rationale.
-        constexpr float kPairProbeOffsetFt = 5.0f;
+        constexpr float kPairProbeOffsetFt = kPathingPairProbeOffsetFt;
         // Distance below which a portal centroid is classified as
         // "belonging to a door" (door pair-probes emitted instead of a
-        // single centroid probe). Doors and non-door portals are not
-        // typically placed coincident in Thief levels, so a 3 ft test
-        // separates them unambiguously. File-static constant so
+        // single centroid probe). Measured point-to-door-AABB, NOT to
+        // the door midpoint — see sPointAABBDistSq's WHY comment (the
+        // midpoint rule missed 67/147 MISS2 doors whose portal centers
+        // sit vertically offset from tall doors' box centers). Doors
+        // and non-door portals are not typically placed coincident in
+        // Thief levels, so a 3 ft box-clearance test separates them
+        // unambiguously. File-static constant so
         // verifyPathingBakeParity classifies identically.
         constexpr float kDoorPortalMatchDistFt = kPathingDoorPortalMatchDistFt;
         const float kDoorPortalMatchDistSq =
@@ -14535,45 +16592,44 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         // verifyPathingBakeParity's sky filter replicates this pass's
         // filter from the same code.
 
-        // ── Portal probes (emitted first; sky-filtered, canonical-orient) ─
+        // ── Portal probes (emitted first; sky-filtered) ──────────────────
         //
-        // Three flavors:
-        //   • Non-door portals, baseline density → single probe at the
-        //     centroid. Initial radius is a placeholder; the post-dedup
-        //     adaptive-radius pass overrides it with a Voronoi-overlap
-        //     value. The path-finder reaches it from either adjoining
-        //     room and can wrap around short corners.
-        //   • Non-door portals, bends density → two PortalPair
-        //     probes flanking the opening along ±portal-normal ×
-        //     kPairProbeOffsetFt (the door-pair geometry generalized to
-        //     every portal). A node on each side of the aperture gives
-        //     the path solver an explicit bend point, so sound turning
-        //     a corner takes the audible detour around the opening.
-        //   • Door portals     → two probes flanking the door OBB along
-        //     ±portal-normal × kPairProbeOffsetFt (every density). The
-        //     door OBB lives in the acoustic scene, so every bake-time
-        //     visibility ray scattered between the two probes'
-        //     kPathingVisRadiusFt sampling spheres hits the OBB and the
-        //     visibility test rejects the edge — closing the door
-        //     always invalidates edges that cross it. NOTE: the
-        //     per-probe `influence.radius` (set by the adaptive pass
-        //     below) may overlap across the door; that does not let
-        //     sound bypass the door, because the visibility GRAPH is
-        //     built from acoustic-mesh ray tests, not from
-        //     `influence.radius` overlap.
+        // Two flavors (portal-first — see the emission pass below):
+        //   • Non-door REAL apertures → single probe at the opening's
+        //     in-air anchor. Initial radius is a placeholder; the
+        //     post-dedup adaptive-radius pass overrides it with a
+        //     Voronoi-overlap value.
+        //   • Door apertures → two probes flanking the opening along
+        //     ±portal-normal × kPairProbeOffsetFt. The door OBB lives in
+        //     the acoustic scene, so every bake-time visibility ray
+        //     scattered between the two probes' kPathingVisRadiusFt
+        //     sampling spheres hits the OBB and the visibility test
+        //     rejects the edge — closing the door always invalidates
+        //     edges that cross it. NOTE: the per-probe `influence.radius`
+        //     (set by the adaptive pass below) may overlap across the
+        //     door; that does not let sound bypass the door, because the
+        //     visibility GRAPH is built from acoustic-mesh ray tests, not
+        //     from `influence.radius` overlap.
         //
-        // Door classification: door midpoints come from the shared
-        // doorAudioMidpoints() helper (cached `mDoorAudioInstances` map,
+        // Door classification: door world AABBs come from the shared
+        // doorAudioAABBs() helper (cached `mDoorAudioInstances` map,
         // populated by registerDoorGeometry in the renderer BEFORE this
         // bake — see the deferred auto-bake block in DarknessRender.cpp);
-        // portals match within kDoorPortalMatchDistFt.
+        // portals match within kDoorPortalMatchDistFt of the box.
         constexpr float kPortalRadiusFt = 5.0f;
-        const std::vector<Vector3> doorPositions = doorAudioMidpoints();
+        const std::vector<DoorWorldAABB> doorBoxes = doorAudioAABBs();
         AUDIO_LOG("Pathing portal pass: %zu doors registered for "
-                  "door-portal classification\n", doorPositions.size());
+                  "door-portal classification\n", doorBoxes.size());
 
-        int portalDoorPairCount = 0;
-        int portalBendPairCount = 0;
+        // Pass 1 — CLASSIFY every portal (dup-skip, degenerate-normal
+        // skip, sky filter, door-OBB match, aperture lookup) into
+        // pathingPortals. Split from emission because consumers need the
+        // full classified set before any probe is emitted:
+        //   • bestPortalForDoor needs every door record to pick each
+        //     door's representative (aperture-carrying, then nearest);
+        //   • the region coverage fill + coverage-based bake-range
+        //     derivation (near the end of this function) use the
+        //     aperture-carrying records as the routing demand set.
         for (const auto &roomPtr : rooms) {
             if (!roomPtr) continue;
             const uint32_t pc = roomPtr->getPortalCount();
@@ -14600,226 +16656,320 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     continue;
                 }
 
-                // Door classification — is this portal coincident with
-                // a registered door? If yes, emit DoorPair probes
-                // ±offset along the portal normal; if no, emit per the
-                // density knob (bends: PortalPair flanking pair;
-                // baseline: single centroid probe). Pair-probes carry a
-                // placeholder 3 ft radius so any code reading it
-                // pre-adaptive-pass sees a sane value; the post-dedup
-                // pass overrides every candidate's radiusFt.
-                bool isDoorPortal = false;
-                for (const Vector3 &dp : doorPositions) {
-                    Vector3 dv = dp - center;
-                    if (glm::dot(dv, dv) < kDoorPortalMatchDistSq) {
-                        isDoorPortal = true;
-                        break;
+                // Door classification — which registered door (if any) is
+                // this portal coincident with? Take the NEAREST match, not
+                // the first: a portal in a compound doorway can be within
+                // range of more than one door, and the emit pass keys
+                // "one aperture, one pair" off this identity.
+                int   bestDoor   = -1;
+                float bestDoorSq = kDoorPortalMatchDistSq;
+                for (size_t bi = 0; bi < doorBoxes.size(); ++bi) {
+                    const DoorWorldAABB &b = doorBoxes[bi];
+                    const float dsq = sPointAABBDistSq(center, b.mn, b.mx);
+                    if (dsq < bestDoorSq) {
+                        bestDoorSq = dsq;
+                        bestDoor   = static_cast<int>(bi);
                     }
                 }
 
-                const Vector3 nrm = glm::normalize(normal);
-                if (isDoorPortal || bendsDensity) {
-                    // Flanking pair: DoorPair when a door OBB sits in
-                    // the opening (closed-door edge invalidation),
-                    // PortalPair otherwise (Tier 1 bend points — same
-                    // geometry, no OBB between the pair). The two
-                    // purposes stay distinct because dedup policy
-                    // differs: DoorPair/PortalPair collapse against
-                    // their own kind at the tight compound-portal
-                    // radius, and only DoorPair is exempt from the
-                    // inside-door-AABB rejection pass below.
-                    const PathingProbePurpose pairPurpose = isDoorPortal
-                        ? PathingProbePurpose::DoorPair
-                        : PathingProbePurpose::PortalPair;
-                    PathingProbeCandidate inside;
-                    inside.position = center - nrm * kPairProbeOffsetFt;
-                    inside.radiusFt = 3.0f;
-                    inside.purpose  = pairPurpose;
-                    PathingProbeCandidate outside;
-                    outside.position = center + nrm * kPairProbeOffsetFt;
-                    outside.radiusFt = 3.0f;
-                    outside.purpose  = pairPurpose;
-                    params.pathingCandidates.push_back(inside);
-                    params.pathingCandidates.push_back(outside);
-                    if (isDoorPortal) portalDoorPairCount += 2;
-                    else              portalBendPairCount += 2;
-                } else {
-                    PathingProbeCandidate cand;
-                    cand.position = center;
-                    cand.radiusFt = kPortalRadiusFt;
-                    cand.purpose  = PathingProbePurpose::Portal;
-                    params.pathingCandidates.push_back(cand);
-                    ++portalCount;
+                // Aperture size (see PathingPortalRecord::inradiusFt).
+                float inradius = -1.0f;
+                const uint32_t ec = portal->getEdgeCount();
+                for (uint32_t e = 0; e < ec; ++e) {
+                    const Plane &ep = portal->getEdgePlane(e);
+                    const float n2 = glm::dot(ep.normal, ep.normal);
+                    if (n2 < 1e-8f) continue;   // degenerate edge plane
+                    const float dist =
+                        std::fabs(glm::dot(ep.normal, center) + ep.d)
+                        / std::sqrt(n2);
+                    if (inradius < 0.0f || dist < inradius) inradius = dist;
                 }
 
-                // Remember this portal for the thin-room coverage-repair
-                // pass (runs at ALL densities, after dedup + the
-                // inside-door rejection — see below). Recorded at every
-                // density because baseline's single portal-center probe
-                // is NOT a coverage guarantee either: it sits exactly on
-                // the portal plane (roomFromPoint tie → often resolves
-                // to a neighbor) and can itself be rejected by the
-                // inside-door pass (MISS2 portal 416's center sits
-                // inside door 1019's AABB). Door portals stay excluded:
-                // zero-probe rooms whose every portal carries a door are
-                // inter-door connector volumes owned by the runtime
-                // door-validation path, graded missing_door_adjacent by
-                // [BAKE_PARITY] by design.
-                if (!isDoorPortal) {
-                    NonDoorPortalRecord rec;
-                    rec.roomAID = static_cast<int>(roomA->getRoomID());
-                    rec.roomBID = roomB
-                        ? static_cast<int>(roomB->getRoomID()) : -1;
-                    rec.center     = center;
-                    rec.unitNormal = nrm;
-                    nonDoorPortals.push_back(rec);
+                PathingPortalRecord rec;
+                rec.roomAID = static_cast<int>(roomA->getRoomID());
+                rec.roomBID = roomB
+                    ? static_cast<int>(roomB->getRoomID()) : -1;
+                rec.center     = center;
+                rec.unitNormal = glm::normalize(normal);
+                rec.isDoor     = (bestDoor >= 0);
+                rec.doorIdx    = bestDoor;
+                rec.doorDistSq = bestDoorSq;
+                rec.inradiusFt = inradius;
+                {
+                    auto it = aperturesByPortalID.find(portal->getPortalID());
+                    if (it != aperturesByPortalID.end()) {
+                        rec.apertureBegin = it->second.first;
+                        rec.apertureEnd   = it->second.second;
+                    }
+                }
+                pathingPortals.push_back(rec);
+            }
+        }
+
+        // (The old geometric same-opening heuristics — the 12 ft same-
+        // room-pair suppression and the parallel-normal threshold-slab
+        // grouping — are gone: aperture IDENTITY from the WR oracle
+        // (apertureKey) answers "same physical opening?" as a fact, not a
+        // distance-and-angle guess. See the claimed-aperture dedup in the
+        // emission pass below.)
+
+        // ONE APERTURE, ONE PAIR — pick the single representative portal
+        // for each door before emitting.
+        //
+        // A doorway is ONE acoustic aperture, but ROOM_DB routinely models
+        // it with several portal records: the door's threshold slab is its
+        // own thin room (cf. room 194, a 0.6 ft connector), so its two faces
+        // are two portals, and frame/sidelight boundaries add more. Measured
+        // on MISS2: 147 doors -> 284 DoorPairs = ~2.7 portals per door, and
+        // DoorPair is dedup-EXEMPT (deliberately — each door needs flanks the
+        // runtime can invalidate), so nothing collapsed them: ~5.5 probes
+        // stacked in a line through a single doorway. That is pure local
+        // density, and findAlternatePaths is quadratic in local density.
+        //
+        // The door's flanks only need to straddle the door ONCE, so keep the
+        // portal whose center sits closest to that door's AABB and drop the
+        // rest. Portals matching DIFFERENT doors are untouched — two doorways
+        // off one junction are distinct routes and each keeps its anchors.
+        //
+        // APERTURE-CARRYING records outrank distance: a record whose ROOM_DB
+        // center the oracle matched knows where the REAL opening is, and the
+        // flanks are placed at that opening. Preferring a (nearer) record
+        // with NO aperture would force the ROOM_DB-center fallback even
+        // though a sibling record of the same door carries the true
+        // position — the exact fiction-position class this design removes.
+        std::vector<int> bestPortalForDoor(doorBoxes.size(), -1);
+        for (size_t i = 0; i < pathingPortals.size(); ++i) {
+            const PathingPortalRecord &r = pathingPortals[i];
+            if (r.doorIdx < 0) continue;
+            int &best = bestPortalForDoor[static_cast<size_t>(r.doorIdx)];
+            if (best < 0) {
+                best = static_cast<int>(i);
+                continue;
+            }
+            const PathingPortalRecord &b =
+                pathingPortals[static_cast<size_t>(best)];
+            if (r.hasAperture() != b.hasAperture()) {
+                if (r.hasAperture()) best = static_cast<int>(i);
+                continue;
+            }
+            if (r.doorDistSq < b.doorDistSq) best = static_cast<int>(i);
+        }
+
+        // Pass 2 — EMIT probes from the classified records, PORTAL-FIRST
+        // (PLAN.PATHING_DESIGN.md §36-38):
+        //   EXISTENCE comes from the WR oracle — a record with no real
+        //     aperture (apertureIdx < 0) is a designer box boundary standing
+        //     in open air (or buried in solid), models nothing, and emits
+        //     NOTHING. MISS2: 164 of 668 portals are this fiction, including
+        //     49 of the worst room's 53 (the degree-53 clique driver).
+        //   POSITION comes from the real opening — the WR aperture centroid
+        //     (its in-air anchor for singles), NOT the ROOM_DB portal
+        //     center: a ROOM_DB center was measured 42.66 ft inside solid
+        //     rock (§34e), where a probe can never exist.
+        //   IDENTITY dedup replaces the old distance-and-angle same-opening
+        //     heuristics: one physical opening (apertureKey) emits ONE probe
+        //     set no matter how many ROOM_DB portals map onto it (threshold
+        //     slab faces, frame boundaries, door + sidelight). Only records
+        //     that ACTUALLY EMIT claim keys — a suppressed extra door record
+        //     must not lock an opening it never probes (an adjacent arch's
+        //     record would then be dropped as "shared" and the arch would
+        //     end up with nothing). Two distinct doors on one wide aperture
+        //     (double doors) DO each emit a pair — each leaf's OBB needs its
+        //     own straddling flanks for closed-door edge invalidation.
+        //   NO SIZE RULE: the old >= kPathingApertureBendThresholdFt drop
+        //     thresholded a ROOM_DB reading that is fiction (portals reading
+        //     6.3 ft over real 1.9-2.8 ft arches) and silenced three REAL
+        //     physically-adjacent openings (§34c). Oracle presence is the
+        //     aperture test now; no threshold remains.
+        //
+        // Pair-probes carry a placeholder 3 ft radius so any code reading it
+        // pre-adaptive-pass sees a sane value; the post-dedup pass overrides
+        // every candidate's radiusFt.
+        int doorPairCount      = 0;  ///< DoorPair probes emitted (2 per door)
+        int doorPairSuppressed = 0;  ///< extra ROOM_DB portals on one door
+        int doorNoAperture     = 0;  ///< door records the oracle rejected
+        int apertureFiction    = 0;  ///< non-door records with no aperture
+        int apertureShared     = 0;  ///< non-door records on a claimed opening
+        std::set<uint64_t> claimedApertures;
+
+        // Doors first: EMITTING door records claim their opening(s) so a
+        // doorless slab-face record of the same opening cannot double-emit;
+        // then non-door records emit one probe per still-unclaimed opening.
+        for (size_t recIdx = 0; recIdx < pathingPortals.size(); ++recIdx) {
+            const PathingPortalRecord &rec = pathingPortals[recIdx];
+            if (!rec.isDoor) continue;
+            // One aperture, one pair: only the door's representative record
+            // (aperture-carrying preferred, then nearest) carries flanks.
+            if (bestPortalForDoor[static_cast<size_t>(rec.doorIdx)]
+                    != static_cast<int>(recIdx)) {
+                doorPairSuppressed += 2;
+                continue;
+            }
+            const WorldApertureRecord *ap = nullptr;
+            if (rec.hasAperture()) {
+                // Flanks straddle the REAL opening: the widest of the
+                // record's openings is the doorway (a sidelight in the same
+                // ball is narrower). Pick the widest FIRST, then claim only
+                // the openings joining the SAME region pair as it — a
+                // distinct-pair opening caught in the same match ball (a
+                // window beside the door) is a different route and must
+                // stay unclaimed so the non-door pass (or the post-door
+                // sweep below) gives it its own probe. Claiming everything
+                // here was measured leaving such openings with NO probe at
+                // all (the non-door records saw them as already-claimed).
+                for (int ai = rec.apertureBegin; ai < rec.apertureEnd; ++ai) {
+                    const WorldApertureRecord &c = mWorldApertureData
+                        .apertures[static_cast<size_t>(ai)];
+                    if (!ap || c.apertureInradiusFt > ap->apertureInradiusFt)
+                        ap = &c;
+                }
+                for (int ai = rec.apertureBegin; ai < rec.apertureEnd; ++ai) {
+                    const WorldApertureRecord &c = mWorldApertureData
+                        .apertures[static_cast<size_t>(ai)];
+                    if (c.regionA == ap->regionA && c.regionB == ap->regionB)
+                        claimedApertures.insert(c.apertureKey);
                 }
             }
-        }
-        AUDIO_LOG("Pathing portal pass [density=%s]: %d single portal "
-                  "probes + %d bend pair-probes (%d pairs) + %d door "
-                  "pair-probes (%d pairs)\n",
-                  pathingProbeDensityName(mPathingProbeDensity),
-                  portalCount, portalBendPairCount, portalBendPairCount / 2,
-                  portalDoorPairCount, portalDoorPairCount / 2);
-
-        // ── Room centroid probes (emitted second; floor-anchored) ───────
-        // Pathing probes are anchored at player ear height
-        // (floor + 5 ft) to maintain line-of-sight through doorways and
-        // ~7 ft Thief corridors. Two cases for the height:
-        //   • Outdoor cells whose Room::getCenter().z sits in the
-        //     skybox (centroid > floor + kSkyThresholdFt) — snap down
-        //     to floor + kRoomFloorOffsetFt (5 ft). The xy position is
-        //     preserved (the room's center under the player).
-        //   • Indoor cells — Room::getCenter().z is the geometric
-        //     midpoint of the room's vertical extent, which can be
-        //     several feet above the floor in tall rooms. Explicitly
-        //     re-anchor to floor + 5 ft so every pathing probe sits at
-        //     a consistent listener-height regardless of room shape.
-        //
-        // The radiusFt set here is a placeholder; the post-dedup
-        // adaptive-radius pass below replaces it with a per-probe
-        // value derived from room walls and neighbor distance.
-        //
-        // kMaxUpperProbeHeightFt is the upper probe's height CLAMP for
-        // skybox-extended rooms, so the probe lands at "high gallery /
-        // upper balcony" altitude where a player can plausibly be.
-        constexpr float kMaxUpperProbeHeightFt = 40.0f;
-        // kMinUpperRoomHeightFt is the "genuinely tall room" GATE —
-        // rooms shorter than this get no upper probe at all. 30 ft is
-        // NOT arbitrary: it reproduces the pre-tier layout's effective
-        // behavior, where an upper candidate was emitted for nearly
-        // every room and the 10-ft centroid dedup collapsed it into the
-        // floor probe unless it survived at
-        //   upperZ − floorProbeZ > 10 ft  ⇒  roomCenter.z > floor + 15
-        // — i.e. box-ish rooms taller than ~30 ft kept a distinct
-        // mid-height node (balconies in two-story halls, 30-40 ft
-        // galleries). Gating at the 40-ft CLAMP instead was measured to
-        // silently drop that node for the whole 30-40 ft band, and
-        // [BAKE_PARITY] cannot catch it: the room stays connected via
-        // its floor probe, just routed at the wrong altitude.
-        constexpr float kMinUpperRoomHeightFt = 30.0f;
-        const float roomRadiusFt = std::max(
-            mProbeManager->getProbeSpacingFt() * 3.0f, 8.0f);
-        int upperCentroidCount = 0;
-        for (const auto &roomPtr : rooms) {
-            if (!roomPtr) continue;
-            Vector3 roomCenter = roomPtr->getCenter();
-            float floorZ = sRoomFloorZ(roomPtr.get());
-            const float ceilZ = sRoomCeilZ(roomPtr.get());
-
-            // (1) Floor probe — at floor + 5 ft, player ear height,
-            //     CLAMPED inside the room's vertical extent. Rooms
-            //     shorter than the ear-height anchor exist (crawl
-            //     spaces, 1-2 ft connector slabs between vertically
-            //     stacked portals — MISS6 rooms 188/190): un-clamped,
-            //     the "room center" probe lands above the room's own
-            //     ceiling, roomFromPoint resolves it to the room ABOVE,
-            //     and the flat room ends up with ZERO probes
-            //     ([BAKE_PARITY] zero-probe-room MISSING pairs). The
-            //     rule is CONTINUOUS: probe height = min(ear height,
-            //     vertical midpoint), so rooms shorter than 2× ear
-            //     height slide smoothly toward maximum clearance from
-            //     both planes instead of snapping at some threshold
-            //     (an earlier ceiling-margin test flipped behavior
-            //     discontinuously for rooms right at the margin).
-            //     Emitted FIRST so the dedup pass (which keeps the
-            //     earlier-emitted candidate on collision) preserves the
-            //     floor probe when the room is too short for the upper
-            //     probe to be meaningful.
-            {
-                float floorProbeZ = floorZ + kRoomFloorOffsetFt;
-                if (ceilZ > floorZ)
-                    floorProbeZ = std::min(floorProbeZ,
-                                           (floorZ + ceilZ) * 0.5f);
-                PathingProbeCandidate floorCand;
-                floorCand.position = Vector3(roomCenter.x, roomCenter.y,
-                                              floorProbeZ);
-                floorCand.radiusFt = roomRadiusFt;
-                floorCand.purpose  = PathingProbePurpose::Centroid;
-                params.pathingCandidates.push_back(floorCand);
-                ++roomCount;
-                if (roomCenter.z > floorZ + kSkyThresholdFt) ++roomSnapped;
+            // A registered door with NO aperture is unexpected (doors sit
+            // in doorways) — loud, and the flanks anchor to the door OBB
+            // CENTER: the door's world box is physical truth for where the
+            // opening is, unlike the ROOM_DB portal center (measured up to
+            // 42.66 ft inside solid, §34e). A door OBB must ALWAYS keep its
+            // pair — closing it must invalidate the edge between the flanks.
+            Vector3 flankCenter;
+            if (ap) {
+                flankCenter = ap->wrCentroid;
+            } else {
+                const DoorWorldAABB &b =
+                    doorBoxes[static_cast<size_t>(rec.doorIdx)];
+                flankCenter = (b.mn + b.mx) * 0.5f;
+                ++doorNoAperture;
+                std::fprintf(stderr,
+                    "[FALLBACK] [APERTURE_FICTION_DOOR] rooms %d<->%d "
+                    "portal center=(%.1f,%.1f,%.1f): registered door with "
+                    "NO WR aperture within the oracle radius — flanks "
+                    "anchor to the door OBB center (%.1f,%.1f,%.1f)\n",
+                    rec.roomAID, rec.roomBID,
+                    rec.center.x, rec.center.y, rec.center.z,
+                    flankCenter.x, flankCenter.y, flankCenter.z);
             }
-
-            // (2) Upper centroid probe — ONLY for genuinely tall rooms
-            //     (taller than kMinUpperRoomHeightFt: atria, shafts,
-            //     multi-story halls, outdoor cells whose audio room
-            //     extends into the skybox). Supports vertical sound
-            //     propagation where a player/emitter can plausibly be
-            //     far above the floor probe.
-            //
-            //     Tier-0 justify-or-remove result (PR B): the previous
-            //     rule emitted an upper probe for EVERY room whose
-            //     geometric center sat > 0.1 ft above floor + 5 and
-            //     leaned on the 10-ft dedup to collapse the ordinary
-            //     ones — on MISS2 that still left 215 upper centroids,
-            //     most in rooms a player can never be more than a
-            //     body-height above the floor of. The explicit gate
-            //     keeps only the survivors the old dedup interplay
-            //     kept (see the kMinUpperRoomHeightFt derivation
-            //     above), without paying candidate emission + dedup
-            //     for every ordinary room.
-            //
-            //     Skybox-extended rooms (geometric center hundreds of
-            //     feet up) still get clamped to floor +
-            //     kMaxUpperProbeHeightFt so the probe lands where a
-            //     player could stand, not in the skybox.
-            if (ceilZ - floorZ > kMinUpperRoomHeightFt) {
-                float upperZ = std::min(roomCenter.z,
-                                        floorZ + kMaxUpperProbeHeightFt);
-                PathingProbeCandidate upperCand;
-                upperCand.position = Vector3(roomCenter.x, roomCenter.y, upperZ);
-                upperCand.radiusFt = roomRadiusFt;
-                upperCand.purpose  = PathingProbePurpose::Centroid;
-                params.pathingCandidates.push_back(upperCand);
-                ++upperCentroidCount;
+            // [PORTAL_CLASS] — one line per record that ACTUALLY emits,
+            // carrying BOTH size readings so fiction stays visible:
+            // apertureInr is measured on world geometry (a door reads
+            // 2.00); rdbInr is the ROOM_DB reading kept for contrast.
+            AUDIO_LOG("[PORTAL_CLASS] rooms %d<->%d "
+                      "center=(%.1f,%.1f,%.1f) apertureInr=%.2f "
+                      "rdbInr=%.2f isDoor=1\n",
+                      rec.roomAID, rec.roomBID,
+                      flankCenter.x, flankCenter.y, flankCenter.z,
+                      ap ? ap->apertureInradiusFt : -1.0f,
+                      rec.inradiusFt);
+            PathingProbeCandidate inside;
+            inside.position =
+                flankCenter - rec.unitNormal * kPairProbeOffsetFt;
+            inside.radiusFt = 3.0f;
+            inside.purpose  = PathingProbePurpose::DoorPair;
+            PathingProbeCandidate outside;
+            outside.position =
+                flankCenter + rec.unitNormal * kPairProbeOffsetFt;
+            outside.radiusFt = 3.0f;
+            outside.purpose  = PathingProbePurpose::DoorPair;
+            params.pathingCandidates.push_back(inside);
+            params.pathingCandidates.push_back(outside);
+            doorPairCount += 2;
+        }
+        // Post-door sweep: a suppressed or emitting door record can carry
+        // openings of a DIFFERENT region pair than its doorway (window in
+        // the match ball). Those are real routes with no non-door record of
+        // their own, so give each unclaimed one its single probe here —
+        // otherwise the opening is silently unprobed and only [REGION_PARITY]
+        // notices, after the bake.
+        for (const PathingPortalRecord &rec : pathingPortals) {
+            if (!rec.isDoor || !rec.hasAperture()) continue;
+            for (int ai = rec.apertureBegin; ai < rec.apertureEnd; ++ai) {
+                const WorldApertureRecord &ap2 = mWorldApertureData
+                    .apertures[static_cast<size_t>(ai)];
+                if (!claimedApertures.insert(ap2.apertureKey).second)
+                    continue;
+                AUDIO_LOG("[PORTAL_CLASS] rooms %d<->%d "
+                          "center=(%.1f,%.1f,%.1f) apertureInr=%.2f "
+                          "rdbInr=%.2f isDoor=0 (door-ball sidelight)\n",
+                          rec.roomAID, rec.roomBID,
+                          ap2.wrCentroid.x, ap2.wrCentroid.y,
+                          ap2.wrCentroid.z,
+                          ap2.apertureInradiusFt, rec.inradiusFt);
+                PathingProbeCandidate cand;
+                cand.position = ap2.probePos;
+                cand.radiusFt = kPortalRadiusFt;
+                cand.purpose  = PathingProbePurpose::Portal;
+                params.pathingCandidates.push_back(cand);
+                ++portalCount;
             }
         }
-        AUDIO_LOG("Pathing candidates: %d floor centroids + %d upper "
-                  "centroids emitted (upper probes only for rooms taller "
-                  "than %.0f ft — multi-story halls / shafts / outdoor "
-                  "cells)\n",
-                  roomCount, upperCentroidCount, kMinUpperRoomHeightFt);
+        for (const PathingPortalRecord &rec : pathingPortals) {
+            if (rec.isDoor) continue;
+            if (!rec.hasAperture()) {
+                // Fiction: no real opening anywhere near this boundary.
+                // Counted, and the [APERTURE_TOPOLOGY] startup line
+                // carries the per-level total; per-record logging would
+                // be ~164 lines of the same fact on MISS2.
+                ++apertureFiction;
+                continue;
+            }
+            // One probe per DISTINCT unclaimed opening — a match ball can
+            // span two (doorway + window to a different region pair), and
+            // each needs its own node.
+            for (int ai = rec.apertureBegin; ai < rec.apertureEnd; ++ai) {
+                const WorldApertureRecord &ap = mWorldApertureData
+                    .apertures[static_cast<size_t>(ai)];
+                if (!claimedApertures.insert(ap.apertureKey).second) {
+                    ++apertureShared;   // opening already carries probes
+                    continue;
+                }
+                AUDIO_LOG("[PORTAL_CLASS] rooms %d<->%d "
+                          "center=(%.1f,%.1f,%.1f) apertureInr=%.2f "
+                          "rdbInr=%.2f isDoor=0\n",
+                          rec.roomAID, rec.roomBID,
+                          ap.wrCentroid.x, ap.wrCentroid.y, ap.wrCentroid.z,
+                          ap.apertureInradiusFt, rec.inradiusFt);
+                PathingProbeCandidate cand;
+                cand.position = ap.probePos;   // in-air by construction
+                cand.radiusFt = kPortalRadiusFt;
+                cand.purpose  = PathingProbePurpose::Portal;
+                params.pathingCandidates.push_back(cand);
+                ++portalCount;
+            }
+        }
+        AUDIO_LOG("Pathing portal pass [portal-first]: %d single aperture "
+                  "probes + %d door pair-probes (%d pairs); FICTION dropped="
+                  "%d (ROOM_DB portals with no real aperture — emit "
+                  "nothing); shared-aperture suppressed=%d (extra ROOM_DB "
+                  "portals on one physical opening); extra door portals "
+                  "suppressed=%d (%d pairs); doors without aperture=%d "
+                  "(flanks at ROOM_DB center, loud above). Density knob "
+                  "'%s' no longer changes placement — apertures emit one "
+                  "probe, doors one pair, at every density.\n",
+                  portalCount, doorPairCount, doorPairCount / 2,
+                  apertureFiction, apertureShared,
+                  doorPairSuppressed, doorPairSuppressed / 2,
+                  doorNoAperture,
+                  pathingProbeDensityName(mPathingProbeDensity));
 
-        // NOTE: the thin-room coverage repair used to run HERE (right
-        // after centroid emission) and only at bends density. That was
-        // the room-194 parity bug: its "is the room covered?" snapshot
-        // was taken BEFORE the proximity dedup and the inside-door-AABB
-        // rejection, both of which can delete the very candidate the
-        // snapshot counted (MISS2 room 194 — a 0.6-ft door-threshold
-        // slab — was "covered" by its own centroid, which the
-        // inside-door pass then rejected as a sound-bypass anchor,
-        // leaving the room with zero probes at EVERY density). The
-        // repair now runs near the end of this function, after every
-        // candidate-deleting pass — see "Thin-room coverage repair"
-        // below.
+        // (Room centroid probes — one per ROOM_DB room at floor+5 ft, plus
+        // an upper centroid for tall rooms — are GONE under portal-first
+        // placement. ROOM_DB rooms are not acoustic spaces: MISS2 has ~47
+        // real air regions, not 404 rooms, so per-room centroids were ~8x
+        // over-production placed by fiction (PLAN.PATHING_DESIGN.md §36).
+        // Interior coverage is now the region-scoped fill below. The upper
+        // ring is REMOVED deliberately (user, 2026-07-16): an elevated
+        // opening's aperture probe already sits at its own height, which
+        // serves the balcony case; re-evaluate for vertical realism once
+        // the system is complete — memory project_pathing_upper_ring_removed.)
 
-        AUDIO_LOG("Pathing candidates: %d portal probes + %d room centroids "
-                  "(%d room centroids sky-snapped, %d portal back-dups "
-                  "skipped, %d sky portals skipped) "
-                  "= %zu pre-dedup\n",
-                  portalCount, roomCount, roomSnapped, portalDup, portalSky,
+        AUDIO_LOG("Pathing candidates: %d aperture probes + %d door "
+                  "pair-probes (%d portal back-dups skipped, %d sky portals "
+                  "skipped) = %zu pre-dedup\n",
+                  portalCount, doorPairCount, portalDup, portalSky,
                   params.pathingCandidates.size());
 
         // Pathing filter: accept any candidate that resolves to a real
@@ -14832,6 +16982,18 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         // nudge, wall-mounted-emitter pathing anchors would all be
         // rejected and the room-centroid fallback would re-introduce
         // the SPIKE pattern for those emitters in non-convex rooms.
+        // No-silent-fallbacks: without the renderer's point-in-air test we
+        // are back to the ROOM_DB box test that bakes probes inside walls.
+        // Say so — never let a degraded bake look like a good one.
+        if (!mPointInAirFn) {
+            std::fprintf(stderr,
+                "[FALLBACK] probe placement has no point-in-air test "
+                "(renderer did not call setPointInAirFn — headless bake?): "
+                "solidity falls back to RoomService::roomFromPoint, which "
+                "only tests designer ROOM_DB boxes and CANNOT see solid "
+                "geometry. Probes may be baked inside walls; rays cast from "
+                "them are never traced and report false 'clear' visibility.\n");
+        }
         const float pathingSearchRadiusFt = std::max(
             (mProbeManager ? mProbeManager->getProbeSpacingFt() : 5.0f) * 2.0f,
             16.0f);
@@ -14839,11 +17001,24 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         params.pathingProbeFilter =
             [this, pathingSearchRadiusSq](const Vector3 &p) -> ProbeFilterDecision {
                 ProbeFilterDecision d;
-                if (mRoomService->roomFromPoint(p)) {
+                // "In open space" is decided by the WORLD (WR cells are air;
+                // solid is their absence), NOT by roomFromPoint(). ROOM_DB
+                // rooms are coarse designer boxes that overlap solid freely,
+                // so a point can be inside a room box AND inside a wall —
+                // which is exactly how 46 MISS2 probes (3.6%) got baked into
+                // walls. Rays from a cell-less point are never traced and
+                // silently report "clear", which produced ~11.6k phantom
+                // edges (~37% of the graph). roomFromPoint keeps only its
+                // real job below: which room does this point belong to.
+                const bool inAir = !mPointInAirFn || mPointInAirFn(p);
+                if (inAir && mRoomService->roomFromPoint(p)) {
                     d.result = ProbeFilterResult::Accept;
                     return d;
                 }
-                // In-solid: walk the room set for the nearest center.
+                // In solid (or outside every room): walk the room set for the
+                // nearest center and nudge toward it. The re-evaluation after
+                // the nudge re-runs this same in-air test, so a nudge that
+                // lands in another wall does not sneak through.
                 Room *nearest    = nullptr;
                 float nearestSq  = pathingSearchRadiusSq;
                 const auto &rooms = mRoomService->getAllRooms();
@@ -15097,7 +17272,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             std::vector<PathingProbeCandidate> kept;
             kept.reserve(params.pathingCandidates.size());
             int dropped = 0;
-            int droppedCentroids = 0;
+
             // Pair-vs-pair dedup threshold (DoorPair AND PortalPair).
             // Compound doorways (one physical opening represented by
             // multiple RoomPortal records, common in Thief) generate a
@@ -15119,7 +17294,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             const float kDoorPairDedupRadiusSq =
                 kDoorPairDedupRadiusFt * kDoorPairDedupRadiusFt;
             int droppedDoorPairs   = 0;
-            int droppedPortalPairs = 0;
+
             // Per-purpose + room-aware dedup.
             //
             // Per-purpose: every PathingProbePurpose only collides against
@@ -15156,6 +17331,91 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 Room *r = mRoomService->roomFromPoint(p);
                 return r ? r->getRoomID() : -1;
             };
+
+            // ── Same-acoustic-space merge (door-aware dedup) ─────────────
+            //
+            // The per-purpose and room-aware guards above are correct about
+            // WHY they exist but too blunt about WHEN: taken literally they
+            // keep provably redundant probes. Every door carries four probes
+            // in a line — its flanks at +-5 ft, plus the centroids of the two
+            // thin threshold-slab rooms at +-1 ft:
+            //     104.85        108.80    [DOOR 110.0]   110.90      114.85
+            //     flank(room A)  slab1                    slab2   flank(room B)
+            // The slab centroids survive only because they differ in PURPOSE
+            // and ROOM — not because they contribute: SA attaches by
+            // influence radius (>=10 ft floor), so the flank 4 ft away
+            // already serves that space, on the same side of the door.
+            //
+            // Both guards protect real failures and must not simply be
+            // dropped: naive cross-purpose dedup once swallowed 320 MISS6
+            // closet centroids (listeners then attached to a probe ACROSS a
+            // door => no path => the eq=[0.1,0.1,0.1] sentinel), and
+            // room-agnostic dedup emptied 20-30% of rooms across thin walls.
+            //
+            // What made those wrong is that the SURVIVOR was in a different
+            // acoustic space — behind a wall, or behind a door. So relax the
+            // guards exactly when the two probes provably share one space:
+            //   1. Neither is a door anchor. DoorPair flanks are the geometry
+            //      the runtime invalidates when a door shuts; never merge one
+            //      away, and never merge anything INTO the door's own role.
+            //   2. The segment does not CROSS a door leaf (endpoints on the
+            //      same side), so a closed door always keeps a probe on each
+            //      side to block between. This is what defuses the closet
+            //      failure: its centroid may merge with its own inner flank
+            //      (same side, inside the room), never with something beyond
+            //      the door.
+            //   3. The segment is PROVEN visible (RayStatus::Clear — never a
+            //      bare false, see RayStatus). A thin wall blocks the ray, so
+            //      a small room keeps its own anchor.
+            // [BAKE_PARITY] is the referee and now asks SA's question
+            // (coverage, not containment), so a merge that actually strands a
+            // room shows up as a real MISSING rather than a phantom one.
+            const std::vector<DoorWorldAABB> dedupDoorBoxes = doorAudioAABBs();
+            // Do the endpoints straddle a door leaf? Deliberately NOT an
+            // AABB-overlap test: the probes we most want to merge sit ~0.5 ft
+            // from the door, so any padded box contains them and every merge
+            // would be blocked (measured: that version merged almost
+            // nothing). A door leaf is a thin slab, so its thinnest AABB axis
+            // is its facing; endpoints straddle it when their offsets along
+            // that axis have opposite signs AND the crossing lands within the
+            // leaf's own footprint (otherwise a segment sliding past the door
+            // frame reads as crossing).
+            auto segmentCrossesAnyDoor = [&](const Vector3 &a,
+                                             const Vector3 &b) -> bool {
+                for (const DoorWorldAABB &box : dedupDoorBoxes) {
+                    const Vector3 ext = box.mx - box.mn;
+                    int thin = 0;
+                    if (ext.y < ext.x && ext.y < ext.z)      thin = 1;
+                    else if (ext.z < ext.x && ext.z < ext.y) thin = 2;
+                    const float c  = (box.mn[thin] + box.mx[thin]) * 0.5f;
+                    const float da = a[thin] - c;
+                    const float db = b[thin] - c;
+                    if (da * db > 0.0f) continue;      // same side of the leaf
+                    const float denom = da - db;
+                    if (std::fabs(denom) < 1e-6f) continue;
+                    const float t = da / denom;
+                    if (t < 0.0f || t > 1.0f) continue;
+                    const Vector3 x = a + (b - a) * t;
+                    bool within = true;
+                    for (int ax = 0; ax < 3; ++ax) {
+                        if (ax == thin) continue;
+                        if (x[ax] < box.mn[ax] - 1.0f ||
+                            x[ax] > box.mx[ax] + 1.0f) { within = false; break; }
+                    }
+                    if (within) return true;
+                }
+                return false;
+            };
+            int mergedSameSpace = 0;
+            auto sameAcousticSpace = [&](const Vector3 &a,
+                                         const Vector3 &b) -> bool {
+                if (!mRaycaster) return false;     // cannot prove it => don't
+                if (segmentCrossesAnyDoor(a, b)) return false;
+                RayHit hit{};
+                if (mRaycaster(a, b, hit)) return false;
+                return hit.status == RayStatus::Clear;   // whitelist the proof
+            };
+
             std::vector<int> keptRoom;
             keptRoom.reserve(params.pathingCandidates.size());
             int crossRoomPreserved = 0;
@@ -15166,29 +17426,46 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 const float radiusSq =
                     isPair ? kDoorPairDedupRadiusSq : dedupRadiusSq;
                 const int candRoom = roomOf(cand.position);
+                const bool candIsDoorAnchor =
+                    (cand.purpose == PathingProbePurpose::DoorPair);
                 bool tooClose = false;
                 for (size_t i = 0; i < kept.size(); ++i) {
-                    if (kept[i].purpose != cand.purpose) continue;
                     Vector3 d = cand.position - kept[i].position;
                     if (glm::dot(d, d) >= radiusSq) continue;
-                    if (keptRoom[i] != candRoom) {
-                        ++crossRoomPreserved;
-                        continue;
+                    const bool samePurpose = (kept[i].purpose == cand.purpose);
+                    const bool sameRoom    = (keptRoom[i] == candRoom);
+                    if (samePurpose && sameRoom) {
+                        tooClose = true;              // the original collision
+                        break;
                     }
-                    tooClose = true;
-                    break;
+                    // Differing purpose and/or room: merge only when the two
+                    // probes provably share one acoustic space.
+                    //
+                    // Only the probe being DROPPED needs the door exemption:
+                    // a DoorPair flank must always survive, because it is the
+                    // geometry a closed door blocks between. A probe merging
+                    // INTO a kept flank is fine — the flank stays, so the
+                    // door's role is untouched, and that is precisely the
+                    // merge we want (the threshold-slab centroid 4 ft from
+                    // its own flank, on the same side of the door, adds
+                    // nothing SA cannot already reach via influence radius).
+                    if (!candIsDoorAnchor &&
+                        sameAcousticSpace(cand.position, kept[i].position)) {
+                        ++mergedSameSpace;
+                        tooClose = true;
+                        break;
+                    }
+                    if (!sameRoom) ++crossRoomPreserved;
                 }
                 if (tooClose) {
+                    // (Centroid and PortalPair purposes are no longer
+                    // emitted under portal-first placement; their counters
+                    // remain wired to planCounters for the probe_plan verb's
+                    // field layout but stay zero.)
                     if (cand.purpose == PathingProbePurpose::DoorPair) {
                         ++droppedDoorPairs;
-                    } else if (cand.purpose
-                               == PathingProbePurpose::PortalPair) {
-                        ++droppedPortalPairs;
                     } else {
                         ++dropped;
-                        if (cand.purpose == PathingProbePurpose::Centroid) {
-                            ++droppedCentroids;
-                        }
                     }
                     continue;
                 }
@@ -15196,6 +17473,10 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 keptRoom.push_back(candRoom);
             }
             if (crossRoomPreserved > 0) {
+                AUDIO_LOG("Pathing dedup: %d probes merged into a probe "
+                          "sharing their acoustic space (no door crossed + "
+                          "segment proven visible; door anchors exempt)\n",
+                          mergedSameSpace);
                 AUDIO_LOG("Pathing dedup: %d same-purpose probes preserved "
                           "(different rooms — room-aware dedup)\n",
                           crossRoomPreserved);
@@ -15205,38 +17486,25 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                           "(compound-portal doorways) at %.1f ft radius\n",
                           droppedDoorPairs, kDoorPairDedupRadiusFt);
             }
-            if (droppedPortalPairs > 0) {
-                AUDIO_LOG("Pathing dedup: %d PortalPair probes collapsed "
-                          "(compound-portal openings) at %.1f ft radius\n",
-                          droppedPortalPairs, kDoorPairDedupRadiusFt);
-            }
-            AUDIO_LOG("Pathing dedup (%.1f ft radius): %d dropped "
-                      "(%d centroids), %zu kept (Door/PortalPair at the "
-                      "tight pair radius)\n",
-                      pathingDedupRadiusFt, dropped, droppedCentroids,
-                      kept.size());
-            if (droppedCentroids > 0) {
-                std::fprintf(stderr,
-                    "[PROBE_BAKE] WARNING: %d room centroid(s) deduped "
-                    "against an earlier-kept probe (typically a DoorPair "
-                    "in a tight closet). Those rooms now have only pair-"
-                    "probes as anchors; back corners > 2.5 ft from the "
-                    "inside-pair-probe fall outside pathing-wet coverage. "
-                    "If a closet sounds dry, increase audio.pathing_probes."
-                    "dedup_radius_ft or add an explicit centroid probe.\n",
-                    droppedCentroids);
-            }
+            AUDIO_LOG("Pathing dedup (%.1f ft radius): %d dropped, "
+                      "%zu kept (DoorPair at the tight pair radius)\n",
+                      pathingDedupRadiusFt, dropped, kept.size());
+            // (The room-centroid dedup WARNING that lived here is gone
+            // with the centroid probes themselves; closet coverage is the
+            // region fill's job and region parity grades it.)
             // Surface dedup counters to the dry-run probe_plan verb.
             // "Other" = total non-pair drops minus the centroid subset,
             // so the buckets sum to the total.
             if (planCounters) {
-                planCounters->dedupDroppedTotal      = dropped + droppedDoorPairs
-                                                     + droppedPortalPairs;
-                planCounters->dedupDroppedCentroids  = droppedCentroids;
+                planCounters->dedupDroppedTotal      = dropped
+                                                     + droppedDoorPairs;
+                // Centroid/PortalPair purposes are no longer emitted, so
+                // their buckets are structurally zero (field layout kept
+                // for the probe_plan verb's readers).
+                planCounters->dedupDroppedCentroids  = 0;
                 planCounters->dedupDroppedDoorPairs  = droppedDoorPairs;
-                planCounters->dedupDroppedPortalPairs = droppedPortalPairs;
-                // INVARIANT: every droppedCentroids++ above sits inside an ++dropped block, so dropped >= droppedCentroids. If a future centroid-dedup path bumps droppedCentroids without ++dropped, this subtraction goes negative.
-                planCounters->dedupDroppedOther      = dropped - droppedCentroids;
+                planCounters->dedupDroppedPortalPairs = 0;
+                planCounters->dedupDroppedOther      = dropped;
             }
             params.pathingCandidates = std::move(kept);
         }
@@ -15382,117 +17650,738 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             }
             params.pathingCandidates = std::move(kept);
 
-            // ── Thin-room coverage repair (ALL densities) ───────────────
+            // (The thin-room coverage repair — one probe per ROOM_DB room
+            // that no surviving candidate resolved to — is GONE. Its
+            // guarantee was per-ROOM, and rooms are not acoustic spaces
+            // (PLAN.PATHING_DESIGN.md §36): a 0.6-ft threshold slab is
+            // part of its doorway's air, covered by the aperture probe's
+            // influence sphere, not a space needing its own node. The
+            // region-scoped coverage fill below owns interior coverage;
+            // region-based parity grades it.)
+
+            // ── REGION coverage fill + coverage-based bake-range ────────
+            //    derivation (§10 machinery re-scoped from ROOM_DB rooms to
+            //    air REGIONS — PLAN.PATHING_DESIGN.md §36/§38c).
             //
-            // Guarantee: every ROOM_DB room adjacent to a NON-door portal
-            // ends up with at least one candidate that roomFromPoint
-            // resolves to it. Rooms thinner than kPairProbeOffsetFt along
-            // the portal normal (door-threshold slabs, compound-doorway
-            // connector volumes, shallow alcoves) lose every organic
-            // candidate: bends flanks overshoot into the neighbors,
-            // baseline's portal-center probe sits exactly on the plane
-            // (roomFromPoint tie → neighbor) or inside a door AABB, and
-            // the room's own centroid can resolve elsewhere or get
-            // rejected by the inside-door pass above. First measured on
-            // MISS6 (27 of 324 pairs [BAKE_PARITY]-MISSING at bends);
-            // MISS2 room 194 then proved the class exists at baseline
-            // too, so the pass runs at every density.
+            // Problem (unchanged): the bake's single-edge visRange cap must
+            // cover the longest hop a route needs, and that hop is set by
+            // the WORST space's coverage. And runtime attachment REQUIRES
+            // interior coverage: Steam Audio associates a source/listener
+            // with probes by influence containment, so a voice standing in
+            // a big open interior with no probe whose sphere contains it
+            // never enters the graph at all (the 0.1f pathing sentinel).
             //
-            // WHY it runs HERE — after the proximity dedup and the
-            // inside-door-AABB rejection, immediately before the adaptive
-            // radius pass: the coverage snapshot must be taken against
-            // the candidates that actually SURVIVE. The previous version
-            // ran right after centroid emission and marked MISS2 room 194
-            // "covered" by its own centroid — which the inside-door pass
-            // then deleted (the 0.6-ft slab is door 1019's threshold;
-            // the centroid sat inside the door AABB), leaving the room
-            // zero-probe with no repair and no [FALLBACK]. Nothing after
-            // this point deletes or moves candidates: the adaptive pass
-            // only assigns radii, and ProbeManager's placement filter
-            // accepts any point that resolves to a room (its nudge fires
-            // only for in-solid points, which never provided coverage in
-            // the first place — roomFromPoint had already failed there).
+            // What changed: the PARTITION. This fill used to run per
+            // ROOM_DB room — but rooms are not acoustic spaces (MISS2:
+            // ~47 real air regions vs 404 rooms; one region holds 74 room
+            // centers), so per-room grouping both over-produced (fill
+            // probes for boxes that are slices of one hall) and mis-grouped
+            // (roomFromPoint ties on portal planes). Regions — air volumes
+            // bounded by real apertures, computed from the compiled cell
+            // geometry — are the honest unit, and region-of-point (cell
+            // lookup) replaces roomFromPoint's box guess.
             //
-            // Repair GLOBALLY rather than per-portal: compute the set of
-            // rooms some surviving candidate resolves to, then place ONE
-            // repair probe per room that is in nobody's coverage. (A
-            // per-portal "did my own flanks cover my center's room" test
-            // over-fired 10× on MISS2 — rooms were already covered by
-            // centroids or by OTHER portals' flanks.)
+            //   demand   = the region's aperture centroids (the points
+            //              routes must attach through — oracle-validated
+            //              REAL openings only; fictional ROOM_DB portals
+            //              are not routes) plus the region's floor extent
+            //              (FLOOR_POLY candidates) so big open floors keep
+            //              listener/source attachment locality;
+            //   anchors  = every surviving pathing candidate in the region
+            //              (aperture probes, door flanks, emitters, plus
+            //              fill probes as they are added);
+            //   sites    = the region's FLOOR_POLY candidates at player
+            //              ear height, outside every door AABB;
+            //   coverage = distance from a demand point to the nearest
+            //              VISIBLE anchor — one occlusion ray per
+            //              (demand, anchor) evaluation, blocked ⇒ the
+            //              anchor doesn't count (visibility-aware
+            //              k-center; a wall between them means the graph
+            //              can't hop that way either). Aperture demand
+            //              excludes anchors within kOwnFlankExclusionFt
+            //              of itself: a route entering via an aperture
+            //              lands ON its own probe, so that probe cannot
+            //              be its own onward hop — the metric is "how far
+            //              to the NEXT anchor", which is what visRange
+            //              has to cover (§9).
             //
-            // The repair probe is REQUIRED to resolve to the room it
-            // repairs AND to sit outside every door AABB: candidates walk
-            // outward from the portal center along ± the portal normal
-            // (small offsets first — a 0.6-ft connector's interior may be
-            // a 0.1-ft sliver between a door AABB face and the far portal
-            // plane, hence the 0.05-ft first rung) until both tests pass.
-            // Placing it AT the center (on the plane) looked equivalent
-            // but was not: the plane point resolves to whichever neighbor
-            // wins the tie, i.e. it fails for exactly the thin rooms this
-            // pass exists to cover. Running after the dedup also means
-            // nothing can drop the repair probe afterwards.
-            int thinRoomRepairs = 0;
-            if (!nonDoorPortals.empty()) {
-                std::set<int> covered;
-                for (const auto &cand : params.pathingCandidates) {
-                    Room *r = mRoomService->roomFromPoint(cand.position);
-                    if (r) covered.insert(static_cast<int>(r->getRoomID()));
+            // Greedy Gonzalez farthest-point (unchanged): repeatedly take
+            // the farthest-uncovered demand point and place a probe at the
+            // nearest usable site until everything is within
+            // kPathingCoverageRadiusFt (R_cov) or the region's site pool /
+            // per-region cap runs out (both loud). Offline prediction for
+            // the CONNECTIVITY component: ~15 broken aperture pairs across
+            // all of MISS2 (§37b Q3); the big outdoor region is the one
+            // expected large consumer.
+            {
+                const float rCovFt = kPathingCoverageRadiusFt;
+                constexpr float kEarHeightFt = kPathingEarHeightFt;
+                // Own-flank exclusion for portal demand: pair probes sit
+                // kPairProbeOffsetFt (5 ft) from the portal center;
+                // +1.5 ft slop covers dedup nudges. Portal-center probes
+                // (baseline density) at 0 ft are excluded too, by the
+                // same radius.
+                constexpr float kOwnFlankExclusionFt = 6.5f;
+                const float kOwnFlankExclusionSq =
+                    kOwnFlankExclusionFt * kOwnFlankExclusionFt;
+                // A new site closer than this to an existing anchor
+                // duplicates it (and would inherit its blockage) —
+                // skip it.
+                constexpr float kSiteMinSeparationFt = 5.0f;
+                const float kSiteMinSeparationSq =
+                    kSiteMinSeparationFt * kSiteMinSeparationFt;
+                const float kInf = std::numeric_limits<float>::max();
+
+                // Visibility oracle. mRaycaster is the renderer-supplied
+                // BSP raycaster (the same hook the debug adjacency build
+                // uses); headless computeProbePlan runs have none —
+                // announce loudly and degrade to distance-only coverage
+                // (the plan verb already carries the analogous door-OBB
+                // caveat in its WARN banner).
+                AudioRaycastFn rcFill = mRaycaster;
+                if (!rcFill) {
+                    std::fprintf(stderr,
+                        "[FALLBACK] pathing coverage fill: no raycaster wired "
+                        "— coverage fill + bake-range derivation are "
+                        "DISTANCE-ONLY this pass (no visibility rays); "
+                        "renderer bakes are visibility-aware, so a plan "
+                        "computed here can differ from the live bake\n");
                 }
-                std::set<int> repaired, unrepairable;
-                static constexpr float kRepairOffsetsFt[] = {
-                    0.05f, 0.1f, 0.25f, 0.5f, 1.0f, 2.0f, 3.5f, 5.0f};
-                for (const auto &bp : nonDoorPortals) {
-                    for (int side = 0; side < 2; ++side) {
-                        const int roomID = (side == 0) ? bp.roomAID
-                                                       : bp.roomBID;
-                        if (roomID < 0) continue;
-                        if (covered.count(roomID) || repaired.count(roomID))
-                            continue;
-                        bool placed = false;
-                        for (float off : kRepairOffsetsFt) {
-                            for (float sign : {1.0f, -1.0f}) {
-                                const Vector3 p = bp.center
-                                    + bp.unitNormal * (off * sign);
-                                Room *r = mRoomService->roomFromPoint(p);
-                                if (!r || static_cast<int>(r->getRoomID())
-                                              != roomID)
-                                    continue;
-                                if (insideDoorAABB(p) >= 0) continue;
-                                PathingProbeCandidate cand;
-                                cand.position = p;
-                                // Placeholder — the adaptive radius pass
-                                // below assigns the real value.
-                                cand.radiusFt = 5.0f;
-                                cand.purpose  = PathingProbePurpose::Portal;
-                                params.pathingCandidates.push_back(cand);
-                                ++thinRoomRepairs;
-                                repaired.insert(roomID);
-                                placed = true;
-                                break;
-                            }
-                            if (placed) break;
+                auto blockedRay = [&rcFill](const Vector3 &a,
+                                            const Vector3 &b) -> bool {
+                    if (!rcFill) return false;
+                    RayHit hit{};
+                    return rcFill(a, b, hit);
+                };
+
+                // The coverage partition: region-of-point (exact — a cell
+                // lookup in the compiled geometry). The roomFromPoint
+                // fallback exists ONLY for headless computeProbePlan runs
+                // that have no renderer; it degrades to the box guess this
+                // pass used before regions, announced loudly.
+                if (!mRegionOfPointFn) {
+                    std::fprintf(stderr,
+                        "[FALLBACK] pathing coverage fill: no region-of-"
+                        "point fn wired (headless?) — coverage grouping "
+                        "degrades to roomFromPoint ROOM_DB boxes, which "
+                        "both over-groups (one hall = dozens of boxes) and "
+                        "mis-groups (portal-plane ties). Renderer bakes "
+                        "use exact regions; plans computed here differ.\n");
+                }
+                auto partitionOf = [this](const Vector3 &p) -> int {
+                    if (mRegionOfPointFn) return mRegionOfPointFn(p);
+                    Room *r = mRoomService->roomFromPoint(p);
+                    return r ? static_cast<int>(r->getRoomID()) : -1;
+                };
+
+                // Anchor positions per region (surviving candidates only —
+                // this block runs after every candidate-deleting pass).
+                std::map<int, std::vector<Vector3>> regionAnchors;
+                for (const auto &cand : params.pathingCandidates) {
+                    const int rid = partitionOf(cand.position);
+                    if (rid >= 0)
+                        regionAnchors[rid].push_back(cand.position);
+                }
+
+                // Demand + site pools per region.
+                struct DemandPoint {
+                    Vector3 pos;
+                    bool    isPortal = false;
+                    bool    stuck    = false;  ///< fill can't improve it
+                    float   bestFt   = std::numeric_limits<float>::max();
+                };
+                std::map<int, std::vector<DemandPoint>> regionDemand;
+                for (const auto &pr : pathingPortals) {
+                    // Only REAL openings are routing demand — a fictional
+                    // ROOM_DB portal is not a point routes pass through.
+                    if (!pr.hasAperture()) continue;
+                    for (int ai = pr.apertureBegin; ai < pr.apertureEnd;
+                         ++ai) {
+                        const WorldApertureRecord &ap = mWorldApertureData
+                            .apertures[static_cast<size_t>(ai)];
+                        // The opening joins two TRUE side regions (frame
+                        // singletons already resolved away by the builder);
+                        // it is demand in BOTH — a route through it needs an
+                        // onward hop on each side. In room-fallback mode the
+                        // record's ROOM_DB pair stands in.
+                        const int sideA = mRegionOfPointFn ? ap.regionA
+                                                           : pr.roomAID;
+                        const int sideB = mRegionOfPointFn ? ap.regionB
+                                                           : pr.roomBID;
+                        for (const int rid : {sideA, sideB}) {
+                            if (rid < 0) continue;
+                            DemandPoint d;
+                            d.pos      = ap.wrCentroid;
+                            d.isPortal = true;
+                            regionDemand[rid].push_back(d);
+                            if (sideA == sideB) break;  // internal aperture
                         }
-                        if (!placed) unrepairable.insert(roomID);
                     }
                 }
-                // A room every portal failed to anchor stays loud here
-                // AND in [BAKE_PARITY] — do not soften: this is exactly
-                // the zero-probe class the parity check exists to catch.
-                for (int roomID : unrepairable) {
-                    if (repaired.count(roomID)) continue;  // later portal won
-                    std::fprintf(stderr,
-                        "[FALLBACK] pathing thin-room repair: room %d has "
-                        "no portal-adjacent interior point that "
-                        "roomFromPoint resolves to it outside every door "
-                        "AABB — the room will have zero pathing probes "
-                        "and [BAKE_PARITY] will report its pairs\n",
-                        roomID);
+                std::map<int, std::vector<Vector3>> regionSites;
+                for (const Vector3 &f : mFloorProbeCandidates) {
+                    const Vector3 p{f.x, f.y, f.z + kEarHeightFt};
+                    const int rid = partitionOf(p);
+                    if (rid < 0) continue;
+                    regionSites[rid].push_back(p);
+                    DemandPoint d;
+                    d.pos      = p;
+                    d.isPortal = false;
+                    regionDemand[rid].push_back(d);
                 }
-                AUDIO_LOG("Pathing thin-room repair: %d interior probes "
-                          "added post-dedup/post-door-rejection for rooms "
-                          "no surviving candidate resolves to "
-                          "(density=%s)\n", thinRoomRepairs,
-                          pathingProbeDensityName(mPathingProbeDensity));
+
+                // Coverage of one demand point against an anchor list:
+                // nearest VISIBLE anchor (rays cast nearest-first, so the
+                // common covered case costs one ray).
+                auto coverageOf = [&](const DemandPoint &d,
+                                      const std::vector<Vector3> &anchors)
+                        -> float {
+                    std::vector<std::pair<float, size_t>> order;
+                    order.reserve(anchors.size());
+                    // Anchors beyond the visRange clamp ceiling cannot
+                    // change the derived range (it clamps there anyway), so
+                    // ray-testing them is pure waste — the big open region
+                    // would otherwise pay |anchors| rays per walled-off
+                    // demand point before concluding kInf.
+                    const float kCovCapSq = kPathingCoverageVisRangeMaxFt
+                                          * kPathingCoverageVisRangeMaxFt;
+                    for (size_t i = 0; i < anchors.size(); ++i) {
+                        const Vector3 dv = anchors[i] - d.pos;
+                        const float distSq = glm::dot(dv, dv);
+                        if (d.isPortal && distSq < kOwnFlankExclusionSq)
+                            continue;
+                        if (distSq > kCovCapSq) continue;
+                        order.emplace_back(distSq, i);
+                    }
+                    std::sort(order.begin(), order.end());
+                    for (const auto &o : order) {
+                        if (!blockedRay(d.pos, anchors[o.second]))
+                            return std::sqrt(o.first);
+                    }
+                    return kInf;
+                };
+
+                int   fillProbesTotal = 0;
+                int   fillRoomsTotal  = 0;
+                int   stuckDemandTotal = 0;
+                for (auto &kv : regionDemand) {
+                    const int rid = kv.first;
+                    bool seededRegion = false;
+                    auto anchIt = regionAnchors.find(rid);
+                    if (anchIt == regionAnchors.end()
+                        || anchIt->second.empty()) {
+                        // Zero-anchor region. Under portal-first placement
+                        // this is a region NONE of whose apertures placed a
+                        // probe inside it (aperture probes sit ON the
+                        // boundary and get nudged to ONE side) — common and
+                        // benign for door-frame singleton regions (thin
+                        // cell chains through a doorway, covered by the
+                        // pair's influence spheres), but a LARGE region
+                        // here would be a real coverage hole. SEED it:
+                        // place one probe at the region's site nearest its
+                        // demand centroid, then let the ordinary Gonzalez
+                        // loop take over. (The room-scoped ancestor of this
+                        // pass skipped empty rooms — zero-probe rooms were
+                        // the repair pass's and parity's domain. Under
+                        // regions, seeding IS this fill's job: an aperture
+                        // single gets nudged to one arbitrary side, so a
+                        // region can lose every coin flip and start empty —
+                        // MISS2 measured 14 such regions on the first
+                        // portal-first bake.)
+                        //
+                        // ONLY for regions with APERTURE demand: a region
+                        // whose demand is floor-only has no real opening,
+                        // i.e. it is acoustically SEALED — sound neither
+                        // enters nor leaves, so a probe there serves no
+                        // path and just adds an isolated graph node
+                        // (measured: 2-3 stray single-probe components in
+                        // far sealed pockets on the first seeded bake).
+                        bool hasApertureDemand = false;
+                        for (const auto &d : kv.second) {
+                            if (d.isPortal) { hasApertureDemand = true; break; }
+                        }
+                        if (!hasApertureDemand) continue;
+                        auto seedSitesIt = regionSites.find(rid);
+                        if (seedSitesIt == regionSites.end()
+                            || seedSitesIt->second.empty()) {
+                            // No floor sites either (thin frame chains,
+                            // vertical shafts): nothing to place on.
+                            // UNCONDITIONALLY loud — this branch is only
+                            // reachable with real APERTURE demand, so a
+                            // silent skip here is a real opening whose
+                            // region gets no probe.
+                            std::fprintf(stderr,
+                                "[FALLBACK] pathing coverage fill: "
+                                "region %d has %zu demand points (>=1 real "
+                                "aperture) but ZERO anchors and ZERO floor "
+                                "sites — cannot seed; region parity will "
+                                "grade it\n", rid, kv.second.size());
+                            continue;
+                        }
+                        Vector3 dc(0.0f, 0.0f, 0.0f);
+                        for (const auto &d : kv.second) dc += d.pos;
+                        dc /= static_cast<float>(kv.second.size());
+                        int   seedSite = -1;
+                        float seedSq   = std::numeric_limits<float>::max();
+                        for (size_t si = 0; si < seedSitesIt->second.size();
+                             ++si) {
+                            const Vector3 &s = seedSitesIt->second[si];
+                            if (insideDoorAABB(s) >= 0) continue;
+                            const Vector3 dv = s - dc;
+                            const float dsq = glm::dot(dv, dv);
+                            if (dsq < seedSq) {
+                                seedSq   = dsq;
+                                seedSite = static_cast<int>(si);
+                            }
+                        }
+                        if (seedSite < 0) continue;
+                        const Vector3 seedPos =
+                            seedSitesIt->second[static_cast<size_t>(seedSite)];
+                        PathingProbeCandidate seed;
+                        seed.position = seedPos;
+                        seed.radiusFt = 5.0f;   // adaptive pass overrides
+                        seed.purpose  = PathingProbePurpose::HubFill;
+                        params.pathingCandidates.push_back(seed);
+                        anchIt = regionAnchors
+                                     .emplace(rid, std::vector<Vector3>{})
+                                     .first;
+                        anchIt->second.push_back(seedPos);
+                        ++fillProbesTotal;
+                        ++fillRoomsTotal;
+                        seededRegion = true;
+                        AUDIO_LOG("[PATHING_HUB_FILL] region %d: SEEDED "
+                                  "(zero anchors, %zu demand points) at "
+                                  "(%.1f,%.1f,%.1f)\n",
+                                  rid, kv.second.size(),
+                                  seedPos.x, seedPos.y, seedPos.z);
+                    }
+                    std::vector<Vector3> &anchors = anchIt->second;
+                    for (auto &d : kv.second)
+                        d.bestFt = coverageOf(d, anchors);
+
+                    auto sitesIt = regionSites.find(rid);
+                    std::vector<Vector3> noSites;
+                    std::vector<Vector3> &sites =
+                        (sitesIt != regionSites.end()) ? sitesIt->second
+                                                     : noSites;
+                    std::vector<char> siteUsed(sites.size(), 0);
+
+                    // Worst REACHABLE PORTAL demand — the routing-coverage
+                    // metric the fill targets (§14: portal->nearest-anchor is
+                    // the governing metric AND the only distance visRange has
+                    // to cover; floor samples are passive beneficiaries, never
+                    // drivers). kInf (occlusion-unreachable) demand is excluded
+                    // from the headline: no probe can cover a point every
+                    // anchor is walled off from, so it must not read as
+                    // "uncovered demand the fill left behind".
+                    float worstBeforeFt = 0.0f;
+                    for (const auto &d : kv.second)
+                        if (d.isPortal && d.bestFt != kInf)
+                            worstBeforeFt = std::max(worstBeforeFt, d.bestFt);
+
+                    int added = 0;
+                    while (added < kPathingFillMaxPerRegion) {
+                        // Farthest uncovered, non-stuck PORTAL demand point.
+                        // §14 over-fire fix (PLAN.PATHING_DESIGN.md §13): the
+                        // two guards below are the whole correction —
+                        //   • isPortal — routing coverage (portal->nearest-
+                        //     anchor) governs the fill AND is exactly what
+                        //     visRange must cover; floor samples get improved
+                        //     passively by the update loop below but never
+                        //     TRIGGER a probe. Floor-chasing was the +152
+                        //     probes / 72-room over-fire on MISS2 (vs the 3
+                        //     genuine hub rooms 18/22/380).
+                        //   • kInf handling is SPLIT by demand kind. Floor
+                        //     demand at kInf never drives (the §14 over-fire:
+                        //     69/72 rooms chased walled-off floor points).
+                        //     PORTAL demand at kInf DOES drive one placement
+                        //     attempt: an aperture no anchor can see is a
+                        //     real opening routes cannot attach through —
+                        //     measured on MISS15 (enormous open level), 652
+                        //     such demand points left the graph in 37
+                        //     disconnected components. A new site NEAR the
+                        //     aperture can be visible where distant anchors
+                        //     are not; the stuck logic terminates the chase
+                        //     when no site improves it.
+                        //     Reachable-but-far demand still outranks kInf
+                        //     demand so the §14 behavior is unchanged where
+                        //     coverage is achievable.
+                        DemandPoint *far = nullptr;
+                        bool farIsInf = false;
+                        for (auto &d : kv.second) {
+                            if (d.stuck) continue;
+                            if (!d.isPortal) continue;
+                            if (d.bestFt <= rCovFt) continue;
+                            const bool dInf = (d.bestFt == kInf);
+                            if (!far) {
+                                far = &d; farIsInf = dInf;
+                                continue;
+                            }
+                            // finite demand outranks kInf demand; within a
+                            // class, farther first (Gonzalez order).
+                            if (farIsInf != dInf) {
+                                if (farIsInf && !dInf) {
+                                    far = &d; farIsInf = false;
+                                }
+                                continue;
+                            }
+                            if (!dInf && d.bestFt > far->bestFt) far = &d;
+                        }
+                        if (!far) break;  // all portals covered (or stuck)
+
+                        // Nearest usable site to it. "Usable" = unused,
+                        // outside every door AABB, not stacked on an
+                        // existing anchor, and strictly closer than the
+                        // demand's current best (otherwise it cannot
+                        // improve the point that selected it).
+                        int   bestSite   = -1;
+                        float bestSiteSq = (far->bestFt == kInf)
+                            ? std::numeric_limits<float>::max()
+                            : far->bestFt * far->bestFt;
+                        for (size_t si = 0; si < sites.size(); ++si) {
+                            if (siteUsed[si]) continue;
+                            const Vector3 dv = sites[si] - far->pos;
+                            const float distSq = glm::dot(dv, dv);
+                            if (distSq >= bestSiteSq) continue;
+                            if (far->isPortal
+                                && distSq < kOwnFlankExclusionSq) continue;
+                            bool stacked = false;
+                            for (const Vector3 &a : anchors) {
+                                const Vector3 av = sites[si] - a;
+                                if (glm::dot(av, av) < kSiteMinSeparationSq) {
+                                    stacked = true;
+                                    break;
+                                }
+                            }
+                            if (stacked) continue;
+                            if (insideDoorAABB(sites[si]) >= 0) continue;
+                            bestSite   = static_cast<int>(si);
+                            bestSiteSq = distSq;
+                        }
+                        if (bestSite < 0) {
+                            far->stuck = true;
+                            ++stuckDemandTotal;
+                            continue;
+                        }
+
+                        siteUsed[bestSite] = 1;
+                        const Vector3 sitePos = sites[bestSite];
+                        PathingProbeCandidate cand;
+                        cand.position = sitePos;
+                        // Placeholder — the adaptive radius pass below
+                        // assigns the real value.
+                        cand.radiusFt = 5.0f;
+                        cand.purpose  = PathingProbePurpose::HubFill;
+                        params.pathingCandidates.push_back(cand);
+                        anchors.push_back(sitePos);
+                        ++added;
+
+                        // Update every demand point the new anchor could
+                        // improve (one ray each, only when closer than
+                        // the current best).
+                        const float farBeforeFt = far->bestFt;
+                        for (auto &d : kv.second) {
+                            const Vector3 dv = sitePos - d.pos;
+                            const float distSq = glm::dot(dv, dv);
+                            if (d.isPortal && distSq < kOwnFlankExclusionSq)
+                                continue;
+                            // Same cap as coverageOf: an anchor beyond the
+                            // visRange clamp ceiling can never form the
+                            // edge "covered" implies, so it must not mark
+                            // demand as reachable.
+                            if (distSq > kPathingCoverageVisRangeMaxFt
+                                             * kPathingCoverageVisRangeMaxFt)
+                                continue;
+                            const float dist = std::sqrt(distSq);
+                            if (dist >= d.bestFt) continue;
+                            if (!blockedRay(d.pos, sitePos))
+                                d.bestFt = dist;
+                        }
+                        // The probe was placed FOR `far`; if it didn't
+                        // move that point's coverage (occlusion), don't
+                        // keep chasing it — mark it stuck, loudly counted.
+                        if (far->bestFt >= farBeforeFt - 1.0f
+                            && far->bestFt > rCovFt) {
+                            far->stuck = true;
+                            ++stuckDemandTotal;
+                        }
+                    }
+                    if (added >= kPathingFillMaxPerRegion) {
+                        std::fprintf(stderr,
+                            "[FALLBACK] pathing coverage fill: region %d hit the "
+                            "per-region cap (%d probes) with demand still "
+                            "uncovered — residual coverage feeds the "
+                            "[PATHING_BAKE_RANGE] derivation below\n",
+                            rid, kPathingFillMaxPerRegion);
+                    }
+                    if (added > 0) {
+                        // Portal-only worst/residual — the fill now targets
+                        // portal coverage exclusively, so the headline before/
+                        // after and the residual-unreachable count report that
+                        // same governing quantity (a floor sample can be
+                        // arbitrarily far or walled off without meaning the
+                        // fill failed).
+                        float worstAfterFt = 0.0f;
+                        int   residualInf  = 0;
+                        for (const auto &d : kv.second) {
+                            if (!d.isPortal) continue;
+                            if (d.bestFt == kInf) { ++residualInf; continue; }
+                            worstAfterFt = std::max(worstAfterFt, d.bestFt);
+                        }
+                        fillProbesTotal += added;
+                        if (!seededRegion) ++fillRoomsTotal;
+                        // Loud + unconditional: the §10 expectation is
+                        // ~3 rooms game-wide — every room the fill fires
+                        // in must be visible in the bake log.
+                        std::fprintf(stderr,
+                            "[PATHING_HUB_FILL] region %d: +%d interior "
+                            "probes (worst PORTAL demand %.0f -> %.0f ft, "
+                            "R_cov=%.0f ft, demand=%zu [portals+floor], "
+                            "sites=%zu, portal-unreachable=%d)\n",
+                            rid, added, worstBeforeFt, worstAfterFt,
+                            rCovFt, kv.second.size(), sites.size(),
+                            residualInf);
+                    }
+
+                    // ── Intra-region connectivity stitching ─────────────
+                    // §38c's second half: coverage puts an anchor within
+                    // R_cov of every reachable demand point, but nothing
+                    // above guarantees the region's anchors can SEE each
+                    // other — in a large open interior (MISS15's halls)
+                    // probe clusters form islands and routes die between
+                    // them (measured: 37 graph components on MISS15 where
+                    // the level is one connected volume). Union the
+                    // region's anchors by proven-clear rays, then bridge
+                    // components with stepping-stone probes at floor sites
+                    // near the closest cross-component gap, re-raying as
+                    // each stone lands. Budget shares the per-region cap;
+                    // exhaustion is loud and region parity grades the rest.
+                    if (anchors.size() >= 2 && rcFill) {
+                        const float stitchCapSq =
+                            kPathingCoverageVisRangeMaxFt
+                            * kPathingCoverageVisRangeMaxFt;
+                        std::vector<int> aParent(anchors.size());
+                        // Ray memo: anchor positions never move, so a
+                        // (i,j) visibility verdict is permanent. Without
+                        // this every stone re-cast EVERY still-cross-
+                        // component pair's ray — measured as the dominant
+                        // stitch cost on MISS15-class regions (hundreds of
+                        // anchors, dozens of stones).
+                        std::map<std::pair<int, int>, bool> rayMemo;
+                        auto blockedMemo = [&](int i, int j) {
+                            const auto key = std::make_pair(std::min(i, j),
+                                                            std::max(i, j));
+                            auto it = rayMemo.find(key);
+                            if (it != rayMemo.end()) return it->second;
+                            const bool blocked = blockedRay(
+                                anchors[static_cast<size_t>(i)],
+                                anchors[static_cast<size_t>(j)]);
+                            rayMemo[key] = blocked;
+                            return blocked;
+                        };
+                        auto aFind = [&](int x) {
+                            while (aParent[static_cast<size_t>(x)] != x) {
+                                aParent[static_cast<size_t>(x)] =
+                                    aParent[static_cast<size_t>(
+                                        aParent[static_cast<size_t>(x)])];
+                                x = aParent[static_cast<size_t>(x)];
+                            }
+                            return x;
+                        };
+                        auto aUnite = [&](int a, int b) {
+                            a = aFind(a); b = aFind(b);
+                            if (a != b) aParent[static_cast<size_t>(a)] = b;
+                        };
+                        auto rebuildUF = [&]() {
+                            aParent.resize(anchors.size());
+                            for (size_t i = 0; i < anchors.size(); ++i)
+                                aParent[i] = static_cast<int>(i);
+                            for (size_t i = 0; i < anchors.size(); ++i) {
+                                for (size_t j = i + 1; j < anchors.size();
+                                     ++j) {
+                                    const Vector3 dv = anchors[j]
+                                                     - anchors[i];
+                                    if (glm::dot(dv, dv) > stitchCapSq)
+                                        continue;
+                                    if (aFind(static_cast<int>(i))
+                                            == aFind(static_cast<int>(j)))
+                                        continue;
+                                    if (!blockedMemo(static_cast<int>(i),
+                                                     static_cast<int>(j)))
+                                        aUnite(static_cast<int>(i),
+                                               static_cast<int>(j));
+                                }
+                            }
+                            std::set<int> roots;
+                            for (size_t i = 0; i < anchors.size(); ++i)
+                                roots.insert(aFind(static_cast<int>(i)));
+                            return static_cast<int>(roots.size());
+                        };
+                        int comps = rebuildUF();
+                        int stitched = 0;
+                        while (comps > 1
+                               && added < kPathingFillMaxPerRegion) {
+                            // Closest cross-component anchor pair.
+                            int   bi = -1, bj = -1;
+                            float bSq = std::numeric_limits<float>::max();
+                            for (size_t i = 0; i < anchors.size(); ++i) {
+                                for (size_t j = i + 1; j < anchors.size();
+                                     ++j) {
+                                    if (aFind(static_cast<int>(i))
+                                            == aFind(static_cast<int>(j)))
+                                        continue;
+                                    const Vector3 dv = anchors[j]
+                                                     - anchors[i];
+                                    const float dsq = glm::dot(dv, dv);
+                                    if (dsq < bSq) {
+                                        bSq = dsq;
+                                        bi = static_cast<int>(i);
+                                        bj = static_cast<int>(j);
+                                    }
+                                }
+                            }
+                            if (bi < 0) break;
+                            const Vector3 mid =
+                                (anchors[static_cast<size_t>(bi)]
+                                 + anchors[static_cast<size_t>(bj)]) * 0.5f;
+                            // Nearest usable site to the gap midpoint.
+                            int   sSite = -1;
+                            float sSq   = std::numeric_limits<float>::max();
+                            for (size_t si = 0; si < sites.size(); ++si) {
+                                if (siteUsed[si]) continue;
+                                if (insideDoorAABB(sites[si]) >= 0) continue;
+                                bool stacked = false;
+                                for (const Vector3 &a : anchors) {
+                                    const Vector3 av = sites[si] - a;
+                                    if (glm::dot(av, av)
+                                            < kSiteMinSeparationSq) {
+                                        stacked = true;
+                                        break;
+                                    }
+                                }
+                                if (stacked) continue;
+                                const Vector3 dv = sites[si] - mid;
+                                const float dsq = glm::dot(dv, dv);
+                                if (dsq < sSq) {
+                                    sSq = dsq;
+                                    sSite = static_cast<int>(si);
+                                }
+                            }
+                            if (sSite < 0) {
+                                std::fprintf(stderr,
+                                    "[FALLBACK] pathing connectivity "
+                                    "stitch: region %d still has %d anchor "
+                                    "components but no usable site remains "
+                                    "near the closest gap (%.0f ft) — "
+                                    "region parity grades the rest\n",
+                                    rid, comps, std::sqrt(bSq));
+                                break;
+                            }
+                            siteUsed[static_cast<size_t>(sSite)] = 1;
+                            const Vector3 stonePos =
+                                sites[static_cast<size_t>(sSite)];
+                            PathingProbeCandidate stone;
+                            stone.position = stonePos;
+                            stone.radiusFt = 5.0f;  // adaptive pass overrides
+                            stone.purpose  = PathingProbePurpose::HubFill;
+                            params.pathingCandidates.push_back(stone);
+                            anchors.push_back(stonePos);
+                            ++added;
+                            ++fillProbesTotal;
+                            ++stitched;
+                            const int prevComps = comps;
+                            // comps stays truthful even on the give-up
+                            // path — the [PATHING_STITCH] line prints it.
+                            comps = rebuildUF();
+                            if (comps >= prevComps) {
+                                // The stone did not merge anything (blocked
+                                // from both sides). Keep it — it may serve
+                                // containment — but stop chasing this gap
+                                // to avoid stone-spam along one wall.
+                                std::fprintf(stderr,
+                                    "[FALLBACK] pathing connectivity "
+                                    "stitch: region %d stone at "
+                                    "(%.1f,%.1f,%.1f) merged nothing "
+                                    "(components %d); stopping — region "
+                                    "parity grades the rest\n",
+                                    rid, stonePos.x, stonePos.y, stonePos.z,
+                                    comps);
+                                break;
+                            }
+                        }
+                        if (stitched > 0) {
+                            std::fprintf(stderr,
+                                "[PATHING_STITCH] region %d: +%d stepping-"
+                                "stone probes, anchor components -> %d\n",
+                                rid, stitched, comps);
+                        }
+                        if (comps > 1
+                            && added >= kPathingFillMaxPerRegion) {
+                            std::fprintf(stderr,
+                                "[FALLBACK] pathing connectivity stitch: "
+                                "region %d hit the per-region cap with %d "
+                                "anchor components remaining\n",
+                                rid, comps);
+                        }
+                    }
+                }
+
+                // ── Coverage-based visRange derivation (post-fill) ──────
+                // governing = max over rooms of (max PORTAL demand →
+                // nearest same-room anchor). Floor demand shaped the fill
+                // but does not govern the cap — §10's governing metric is
+                // portal attachment (routes enter rooms through portals;
+                // floor coverage matters for listener containment, which
+                // influence radii — not edge length — provide).
+                float governingFt   = 0.0f;
+                int   governingRegion = -1;
+                int   governingUnreachable = 0;
+                for (const auto &kv : regionDemand) {
+                    auto anchIt = regionAnchors.find(kv.first);
+                    if (anchIt == regionAnchors.end()
+                        || anchIt->second.empty()) continue;
+                    for (const auto &d : kv.second) {
+                        if (!d.isPortal) continue;
+                        if (d.bestFt == kInf) {
+                            // No visible in-room anchor at all — the
+                            // clamp ceiling is this demand's only cover;
+                            // counted loudly below, judged by
+                            // [BAKE_PARITY].
+                            ++governingUnreachable;
+                            continue;
+                        }
+                        if (d.bestFt > governingFt) {
+                            governingFt   = d.bestFt;
+                            governingRegion = kv.first;
+                        }
+                    }
+                }
+
+                const float visRangeFt = std::min(
+                    std::max(governingFt * kPathingCoverageMarginMul,
+                             kPathingCoverageVisRangeMinFt),
+                    kPathingCoverageVisRangeMaxFt);
+                params.pathingVisRangeFt  = visRangeFt;
+                mDerivedPathingVisRangeFt = visRangeFt;
+                params.pathingCoverageFt  = governingFt;
+                params.pathingRCovFt      = rCovFt;
+                // Loud + unconditional: the entire pathing bake-cost and
+                // runtime-search-space story hangs off this one number,
+                // and a surprising derivation (fill capped out, blocked
+                // demand) must be visible in every bake log.
+                std::fprintf(stderr,
+                    "[PATHING_BAKE_RANGE] coverage-derived single-edge "
+                    "visRange cap %.0f ft (governing=%.0f ft = max "
+                    "aperture->nearest-same-REGION-anchor POST-fill, region %d; "
+                    "R_cov=%.0f ft, coverage fill +%d probes in %d regions, "
+                    "stuck-demand=%d, no-visible-anchor-portal-demand=%d, "
+                    "margin x%.1f, clamp [%.0f, %.0f]); pathRange stays "
+                    "whole-level\n",
+                    visRangeFt, governingFt, governingRegion, rCovFt,
+                    fillProbesTotal, fillRoomsTotal, stuckDemandTotal,
+                    governingUnreachable, kPathingCoverageMarginMul,
+                    kPathingCoverageVisRangeMinFt,
+                    kPathingCoverageVisRangeMaxFt);
             }
 
             // Adaptive radius — overlap-favoring, room-radius-floored:
@@ -15631,18 +18520,19 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     std::vector<float> r;
                     const char *name;
                 };
-                Acc accs[5] = {
+                Acc accs[6] = {
                     { {}, "Portal"     },
                     { {}, "DoorPair"   },
                     { {}, "Centroid"   },
                     { {}, "Emitter"    },
                     { {}, "PortalPair" },
+                    { {}, "HubFill"    },
                 };
                 for (const auto &c : params.pathingCandidates) {
                     int idx = static_cast<int>(c.purpose);
-                    if (idx >= 0 && idx < 5) accs[idx].r.push_back(c.radiusFt);
+                    if (idx >= 0 && idx < 6) accs[idx].r.push_back(c.radiusFt);
                 }
-                for (int i = 0; i < 5; ++i) {
+                for (int i = 0; i < 6; ++i) {
                     auto &a = accs[i];
                     if (a.r.empty()) {
                         AUDIO_LOG("[PROBE_BAKE] %s: 0 probes\n", a.name);
@@ -15787,6 +18677,39 @@ bool AudioService::pathingBakeDensityMismatch() const
 }
 
 //------------------------------------------------------
+bool AudioService::pathingBakeLayoutMismatch() const
+{
+    if (!mProbeManager || !mProbeManager->hasPathing()) return false;
+    return mProbeManager->getBakedPathingLayoutVersion()
+        != kPathingLayoutVersion;
+}
+
+//------------------------------------------------------
+uint32_t AudioService::getBakedPathingLayoutVersion() const
+{
+    return mProbeManager ? mProbeManager->getBakedPathingLayoutVersion() : 0u;
+}
+
+//------------------------------------------------------
+bool AudioService::pathingBakeCoverageMismatch() const
+{
+    if (!mProbeManager || !mProbeManager->hasPathing()) return false;
+    // Exact-representation compare is fine: both sides are the same
+    // compile-time constant round-tripped verbatim through the v5
+    // header. A v4 file (or a pre-coverage layout re-recorded with 0)
+    // reads back 0.0f and always mismatches — that is the intended
+    // loud upgrade path (see ProbeFile.h's v4 section).
+    return mProbeManager->getBakedPathingRCovFt()
+        != kPathingCoverageRadiusFt;
+}
+
+//------------------------------------------------------
+float AudioService::getBakedPathingRCovFt() const
+{
+    return mProbeManager ? mProbeManager->getBakedPathingRCovFt() : 0.0f;
+}
+
+//------------------------------------------------------
 PathingProbeDensity AudioService::getBakedPathingDensity() const
 {
     return mProbeManager ? mProbeManager->getBakedPathingDensity()
@@ -15912,6 +18835,38 @@ bool AudioService::loadProbes(const std::string &probePath)
                   mProbeManager->getPathingProbePositions().size(),
                   mProbeManager->getProbePositions().size());
     }
+    // Probe batch (re)load invalidates every voice's pathing memo AND its
+    // unreachable-route verdict: routes solved against the old graph are
+    // meaningless on the new one, and a cached no-route verdict could
+    // otherwise suppress the discovery re-solve on a graph where the
+    // route now exists. pathSolvePending forces a covering re-solve on
+    // the next signaling due tick; clearing the verdict flags returns
+    // the voice to the pre-verdict state (sentinel until the covering
+    // solve lands, completed-cycles-gated).
+    if (mVoicePool) {
+        for (auto &[h, v] : mVoicePool->voices()) {
+            if (!v) continue;
+            v->pathSolvePending        = true;
+            v->pathLastOutputsNoRoute  = false;
+            v->pathLastOutputsSentinel = true;
+            v->pathVerdictCoverCycle   = UINT64_MAX;
+            // O3-lite: a route set solved against the old graph is
+            // meaningless — fail the voice open (global door trigger)
+            // until its covering re-solve rebuilds the scope, force a
+            // dirty solve, and drop any armed watchdog.
+            v->pathRouteScopeValid       = false;
+            v->pathScopedDoorDirty       = true;
+            v->pathScopeWatchdogCoverCycle = UINT64_MAX;
+        }
+    }
+    // Reverse index is per-voice route data against the old graph — drop it.
+    mDoorVoices.clear();
+    mVoiceRegisteredDoors.clear();
+    mDoorsBumpedSinceCommit.clear();
+    // Stale door epochs from before the reload measure against a dead
+    // graph — drop them (same rationale as scene teardown).
+    mDoorGenEvents.clear();
+    mDoorSolveInFlight = false;
     // ── Reflection bake-profile check (every load, UNCONDITIONAL) ──
     //
     // The .probes v3 header records the reflection section's rays +

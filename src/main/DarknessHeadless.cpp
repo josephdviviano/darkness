@@ -76,6 +76,9 @@
 #include "audio/ProbeManager.h"
 #include "WRChunkParser.h"
 #include "TXListParser.h"
+// findCameraCell — the WR cell lookup raycastWorld does before tracing.
+// bgfx-free (see RayCaster.h), so it is safe in the headless binary.
+#include "CellGeometry.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -345,6 +348,547 @@ static void printRoomInfo(int roomID) {
     }
 }
 
+// ---------- Room graph dump ----------
+//
+// `room_graph` prints the entire ROOM_DB portal graph in machine-readable
+// line records, for offline distribution analysis (analysis/room_graph_stats.py).
+// This is the data the probe-graph edge-range lever is derived from: the
+// original engine's precomputed intra-room portal-to-portal hop tables
+// (Room::getPortalDist — same access pattern as the maxRoomSpanFt
+// derivation in AudioService::prepareProbeBakeParams) plus room centers
+// and adjacency.
+//
+// Output records (space-separated, one per line):
+//   ROOM <roomID> <cx> <cy> <cz> <portalCount>
+//   PORTAL <nearRoomID> <farRoomID> <px> <py> <pz> <inradiusFt> <edgeCount>
+//       one per directed portal; every physical portal appears twice
+//       (once per side) — consumers de-duplicate back-links.
+//       inradiusFt = distance from the portal center to its nearest bounding
+//       edge plane = HALF the portal's narrow dimension. Separates real
+//       architectural apertures (a 3 ft doorway ~= 1.5 ft) from ROOM_DB box
+//       boundaries standing in open space (10 ft+). -1 = no edge planes.
+//   PDIST <roomID> <i> <j> <dist>
+//       intra-room portal-to-portal distance for portal indices i<j,
+//       straight from the level compiler's precomputed matrix.
+//   ROOMGRAPH_SUMMARY rooms=<n> portals_directed=<m> zero_portal_rooms=<k>
+//       null_portals=<x> null_far_rooms=<y> zero_pdist_pairs=<z>
+static void printRoomGraph() {
+    RoomServicePtr roomSvc = GET_SERVICE(RoomService);
+    if (!roomSvc || !roomSvc->isLoaded()) {
+        std::cerr << "room_graph: RoomService not loaded — does this database "
+                     "have ROOM_DB?\n";
+        return;
+    }
+
+    const auto &rooms = roomSvc->getAllRooms();
+    int roomCount = 0;
+    int portalDirected = 0;
+    int zeroPortalRooms = 0;
+    int nullPortals = 0;
+    int nullFarRooms = 0;
+    // dist == 0 for i != j means the precomputed table entry is missing
+    // or degenerate — counted so the offline stats can flag it.
+    int zeroPDistPairs = 0;
+
+    for (const auto &roomPtr : rooms) {
+        if (!roomPtr) continue;
+        ++roomCount;
+        const int roomID = roomPtr->getRoomID();
+        const Vector3 c = roomPtr->getCenter();
+        const uint32_t pc = roomPtr->getPortalCount();
+        std::printf("ROOM %d %.3f %.3f %.3f %u\n",
+                    roomID, c.x, c.y, c.z, pc);
+        if (pc == 0) ++zeroPortalRooms;
+
+        for (uint32_t i = 0; i < pc; ++i) {
+            ::Darkness::RoomPortal *p = roomPtr->getPortal(i);
+            if (!p) { ++nullPortals; continue; }
+            ::Darkness::Room *far = p->getFarRoom();
+            if (!far) ++nullFarRooms;
+            const Vector3 pcen = p->getCenter();
+            // Aperture size = INRADIUS: the distance from the portal center
+            // to its nearest bounding edge plane, i.e. HALF the portal's
+            // NARROW dimension. RoomPortal stores no vertices — it is a
+            // plane plus a set of bounding edge planes — so this is the
+            // cheapest honest size metric available from the public API.
+            //   a 3 ft doorway      -> ~1.5 ft
+            //   a wide open boundary between two halves of one open volume
+            //                       -> 10 ft+
+            // This is what separates a REAL architectural aperture (where
+            // sound diffracts around a jamb, so bend pairs earn their cost)
+            // from a designer's ROOM_DB box boundary standing in mid-air
+            // (where a bend pair buys nothing and just densifies the graph).
+            float inradius = -1.0f;
+            const uint32_t ec = p->getEdgeCount();
+            for (uint32_t e = 0; e < ec; ++e) {
+                const Plane &ep = p->getEdgePlane(e);
+                const float n2 = glm::dot(ep.normal, ep.normal);
+                if (n2 < 1e-8f) continue;   // degenerate edge plane
+                const float dist = std::fabs(glm::dot(ep.normal, pcen) + ep.d)
+                                 / std::sqrt(n2);
+                if (inradius < 0.0f || dist < inradius) inradius = dist;
+            }
+            std::printf("PORTAL %d %d %.3f %.3f %.3f %.3f %u\n",
+                        roomID, far ? far->getRoomID() : -1,
+                        pcen.x, pcen.y, pcen.z, inradius, ec);
+            ++portalDirected;
+        }
+
+        for (uint32_t i = 0; i < pc; ++i) {
+            for (uint32_t j = i + 1; j < pc; ++j) {
+                const float d = roomPtr->getPortalDist(i, j);
+                if (d <= 0.0f) ++zeroPDistPairs;
+                std::printf("PDIST %d %u %u %.3f\n", roomID, i, j, d);
+            }
+        }
+    }
+
+    std::printf("ROOMGRAPH_SUMMARY rooms=%d portals_directed=%d "
+                "zero_portal_rooms=%d null_portals=%d null_far_rooms=%d "
+                "zero_pdist_pairs=%d\n",
+                roomCount, portalDirected, zeroPortalRooms, nullPortals,
+                nullFarRooms, zeroPDistPairs);
+}
+
+// ---------- Probe / WR-cell containment audit ----------
+//
+// `probe_cell_audit` answers exactly one question: do probe positions land
+// INSIDE the WR cell network that raycastWorld traverses?
+//
+// WHY THIS EXISTS: probes are placed from ROOM_DB (room centroids, portal
+// centers) — a DIFFERENT spatial partition than the WR cells the raycaster
+// walks. raycastWorld's first step is to locate the cell containing the ray
+// ORIGIN; when that lookup fails it bails immediately (`if (curCell < 0)
+// return false;`) WITHOUT TESTING ANY GEOMETRY, and callers read that false
+// as "no hit" == clear line of sight. A probe outside the cell network
+// therefore reports a clear path to every other probe in range — straight
+// through solid world geometry. This audit counts that condition; it is the
+// prime suspect for the pathing-graph edges observed passing through giant
+// world geometry.
+//
+// Records (space-separated, one per line):
+//   PROBE <index> <x> <y> <z> <cell>
+//       real baked probe positions, read from a `.probes.*.positions.csv`
+//       sidecar (index,x,y,z,radiusFt). Ground truth — needs a bake.
+//   CAND room <roomID> <x> <y> <z> <cell>
+//       ROOM_DB room center. NOTE: a PROXY — the real centroid probe sits at
+//       floor+5 ft (or the vertical midpoint in short rooms), not the raw
+//       geometric center. Indicative, not exact.
+//   CAND portal <nearRoomID> <farRoomID> <x> <y> <z> <cell>
+//       ROOM_DB portal center — EXACT: portal/door probes are placed at this
+//       point (baseline) or flanking it along the normal (bends).
+//   cell == -1 => findCameraCell found no containing cell => a ray cast FROM
+//       this point is never actually traced.
+//   CELLAUDIT_SUMMARY ...
+//
+// The CAND records need no bake, so this runs across every shipping level.
+// Gap from a point to the nearest cell's bounding sphere, in engine feet.
+// Distinguishes WHY a point failed findCameraCell:
+//   gap <= 0  => the point is inside some cell's bounding sphere but outside
+//               every cell's convex hull => it is IN SOLID, wedged in/behind
+//               a wall between air cells. A bad probe: Steam Audio would also
+//               trace its rays from inside geometry.
+//   gap >  0  => outside every bounding sphere => deep solid, or off-map.
+// (Cells are AIR volumes; solid is the absence of cells — so "outside all
+// cells" always means "not in open space".)
+static float nearestCellGapFt(const Darkness::WRParsedData &wr,
+                              float x, float y, float z) {
+    float best = 1e30f;
+    for (uint32_t i = 0; i < wr.numCells; ++i) {
+        const auto &c = wr.cells[i];
+        const float dx = x - c.center.x;
+        const float dy = y - c.center.y;
+        const float dz = z - c.center.z;
+        const float gap = std::sqrt(dx * dx + dy * dy + dz * dz) - c.radius;
+        if (gap < best) best = gap;
+    }
+    return best;
+}
+
+static void printProbeCellAudit(const std::string &misPath,
+                                const std::string &positionsCsv) {
+    Darkness::WRParsedData wr;
+    try {
+        wr = Darkness::parseWRChunk(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr,
+            "probe_cell_audit: failed to parse WR chunk in '%s': %s\n",
+            misPath.c_str(), e.what());
+        return;
+    }
+    if (wr.numCells == 0) {
+        std::fprintf(stderr,
+            "probe_cell_audit: '%s' has 0 WR cells — nothing to test against\n",
+            misPath.c_str());
+        return;
+    }
+
+    int total = 0, outside = 0;
+    int outsideInSolid = 0, outsideOffMap = 0;
+    int roomTotal = 0, roomOutside = 0;
+    int portalTotal = 0, portalOutside = 0;
+
+    if (!positionsCsv.empty()) {
+        // Ground-truth mode: audit the REAL baked probe positions.
+        std::ifstream in(positionsCsv);
+        if (!in) {
+            std::fprintf(stderr,
+                "probe_cell_audit: cannot open positions CSV '%s'\n",
+                positionsCsv.c_str());
+            return;
+        }
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            if (line.compare(0, 6, "index,") == 0) continue;   // header row
+            // index,x,y,z,radiusFt
+            int idx = 0; float x = 0, y = 0, z = 0, r = 0;
+            if (std::sscanf(line.c_str(), "%d,%f,%f,%f,%f",
+                            &idx, &x, &y, &z, &r) < 4) continue;
+            const int32_t cell = Darkness::findCameraCell(wr, x, y, z);
+            ++total;
+            if (cell < 0) {
+                ++outside;
+                const float gap = nearestCellGapFt(wr, x, y, z);
+                if (gap <= 0.0f) ++outsideInSolid; else ++outsideOffMap;
+                std::printf("PROBE %d %.3f %.3f %.3f %d gap=%.2f %s\n",
+                            idx, x, y, z, cell, gap,
+                            gap <= 0.0f ? "IN_SOLID" : "OFF_MAP");
+            } else {
+                std::printf("PROBE %d %.3f %.3f %.3f %d\n", idx, x, y, z, cell);
+            }
+        }
+    } else {
+        // No-bake mode: audit ROOM_DB-derived candidate positions.
+        RoomServicePtr roomSvc = GET_SERVICE(RoomService);
+        if (!roomSvc || !roomSvc->isLoaded()) {
+            std::cerr << "probe_cell_audit: RoomService not loaded — does this "
+                         "database have ROOM_DB?\n";
+            return;
+        }
+        const auto &rooms = roomSvc->getAllRooms();
+        for (const auto &roomPtr : rooms) {
+            if (!roomPtr) continue;
+            const int roomID = roomPtr->getRoomID();
+            const Vector3 c = roomPtr->getCenter();
+            int32_t cell = Darkness::findCameraCell(wr, c.x, c.y, c.z);
+            ++total; ++roomTotal;
+            if (cell < 0) {
+                ++outside; ++roomOutside;
+                const float gap = nearestCellGapFt(wr, c.x, c.y, c.z);
+                if (gap <= 0.0f) ++outsideInSolid; else ++outsideOffMap;
+                std::printf("CAND room %d %.3f %.3f %.3f %d gap=%.2f %s\n",
+                            roomID, c.x, c.y, c.z, cell, gap,
+                            gap <= 0.0f ? "IN_SOLID" : "OFF_MAP");
+            } else {
+                std::printf("CAND room %d %.3f %.3f %.3f %d\n",
+                            roomID, c.x, c.y, c.z, cell);
+            }
+
+            const uint32_t pc = roomPtr->getPortalCount();
+            for (uint32_t i = 0; i < pc; ++i) {
+                ::Darkness::RoomPortal *p = roomPtr->getPortal(i);
+                if (!p) continue;
+                ::Darkness::Room *far = p->getFarRoom();
+                const Vector3 pcen = p->getCenter();
+                cell = Darkness::findCameraCell(wr, pcen.x, pcen.y, pcen.z);
+                ++total; ++portalTotal;
+                if (cell < 0) {
+                    ++outside; ++portalOutside;
+                    const float gap = nearestCellGapFt(wr, pcen.x, pcen.y, pcen.z);
+                    if (gap <= 0.0f) ++outsideInSolid; else ++outsideOffMap;
+                    std::printf("CAND portal %d %d %.3f %.3f %.3f %d gap=%.2f %s\n",
+                                roomID, far ? far->getRoomID() : -1,
+                                pcen.x, pcen.y, pcen.z, cell, gap,
+                                gap <= 0.0f ? "IN_SOLID" : "OFF_MAP");
+                } else {
+                    std::printf("CAND portal %d %d %.3f %.3f %.3f %d\n",
+                                roomID, far ? far->getRoomID() : -1,
+                                pcen.x, pcen.y, pcen.z, cell);
+                }
+            }
+        }
+    }
+
+    const double pct = total ? (100.0 * outside / total) : 0.0;
+    std::printf("CELLAUDIT_SUMMARY cells=%u tested=%d outside=%d pct=%.2f "
+                "in_solid=%d off_map=%d "
+                "room_tested=%d room_outside=%d portal_tested=%d "
+                "portal_outside=%d\n",
+                wr.numCells, total, outside, pct,
+                outsideInSolid, outsideOffMap,
+                roomTotal, roomOutside, portalTotal, portalOutside);
+}
+
+// ---------- WR cell-portal aperture survey ----------
+//
+// `wr_portals` dumps every WR CELL PORTAL polygon with an aperture size, so
+// the WR portal graph can be compared line-for-line against the ROOM_DB
+// portal graph that `room_graph` dumps.
+//
+// WHY THIS EXISTS: ROOM_DB "portals" are boundaries between designer-drawn
+// boxes. A box boundary need not correspond to any architectural opening —
+// it frequently stands in mid-air, splitting one open volume in two. WR cell
+// portals are the opposite: the level compiler produces them from the ACTUAL
+// world geometry as the shared faces of a convex decomposition, and they are
+// what raycastWorld traverses cell-to-cell. So a doorway's WR portal polygon
+// IS the doorway, at its true dimensions.
+//
+// The convex decomposition still splits open volumes (a courtyard becomes
+// many cells whose mutual portals are splitting planes, not apertures), so a
+// size metric is still needed to tell a real aperture from a splitting plane.
+//
+// APERTURE SIZE METRIC — deliberately the same IDEA as room_graph's
+// RoomPortal inradius (half the narrow dimension), so the two histograms are
+// directly comparable, but computed honestly from real geometry:
+//   inradiusFt = min over EDGE SEGMENTS of the distance from the polygon
+//                centroid to that segment.
+// RoomPortal stores only bounding PLANES, so room_graph had to use
+// point-to-plane distance (an infinite plane over-estimates nothing but
+// ignores the polygon's actual extent). A WR portal is a real polygon with
+// VERTICES, so the distance is taken to the finite edge SEGMENT instead —
+// for a convex polygon containing its centroid the two agree, and for a
+// non-convex or skewed polygon the segment distance is the truthful one.
+// Both answer "how far can you get from the middle of this opening before
+// you hit its rim, in the tightest direction" = HALF THE NARROW DIMENSION:
+//   a 3 ft doorway            -> ~1.5 ft
+//   a courtyard splitting plane -> 10 ft+
+// circumradiusFt (max vertex distance from the centroid) is emitted
+// alongside it: inradius/circumradius separates a square aperture from a
+// long thin slit, which a single number cannot.
+//
+// Records (space-separated, one per line):
+//   WRPORTAL <cellIdx> <tgtCell> <cx> <cy> <cz> <inradiusFt> <circumradiusFt>
+//            <numVerts> <areaSqFt>
+//       one per portal POLYGON; every physical portal appears twice (once
+//       from each side) — consumers de-duplicate by (min,max) cell pair.
+//       tgtCell = -1 when the polygon names a cell outside the network.
+//   WRPORTAL_SUMMARY cells=<n> portals=<m> degenerate=<k> bad_tgt=<x>
+//
+// Service-less: parseWRChunk reads the .mis directly, and cells carry their
+// own geometry, so no ROOM_DB / service stack is involved.
+static void printWRPortals(const std::string &misPath) {
+    Darkness::WRParsedData wr;
+    try {
+        wr = Darkness::parseWRChunk(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr,
+            "wr_portals: failed to parse WR chunk in '%s': %s\n",
+            misPath.c_str(), e.what());
+        return;
+    }
+    if (wr.numCells == 0) {
+        std::fprintf(stderr,
+            "wr_portals: '%s' has 0 WR cells — nothing to survey\n",
+            misPath.c_str());
+        return;
+    }
+
+    int portalCount = 0, degenerate = 0, badTgt = 0;
+
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        const auto &cell = wr.cells[ci];
+        // Portal polygons are the LAST numPortals entries of the polygon
+        // list — the same slicing raycastWorld uses (`numSolid =
+        // numPolygons - numPortals`, RayCaster.h).
+        const int numSolid = static_cast<int>(cell.numPolygons)
+                           - static_cast<int>(cell.numPortals);
+        for (int pi = numSolid; pi < static_cast<int>(cell.numPolygons); ++pi) {
+            if (pi < 0 || pi >= static_cast<int>(cell.polyIndices.size())) {
+                ++degenerate;
+                continue;
+            }
+            const auto &idx = cell.polyIndices[pi];
+            const size_t nv = idx.size();
+            if (nv < 3) { ++degenerate; continue; }
+
+            // Centroid: plain vertex average. For the convex portal polygons
+            // the compiler emits, this is interior, which is what makes the
+            // "distance to the rim" reading meaningful.
+            Vector3 cen(0.0f, 0.0f, 0.0f);
+            bool badIdx = false;
+            for (size_t v = 0; v < nv; ++v) {
+                if (idx[v] >= cell.vertices.size()) { badIdx = true; break; }
+                cen += cell.vertices[idx[v]];
+            }
+            if (badIdx) { ++degenerate; continue; }
+            cen /= static_cast<float>(nv);
+
+            float inradius = -1.0f;
+            float circumradius = 0.0f;
+            double area2 = 0.0;   // twice the fan-triangulated area
+            for (size_t v = 0; v < nv; ++v) {
+                const Vector3 &a = cell.vertices[idx[v]];
+                const Vector3 &b = cell.vertices[idx[(v + 1) % nv]];
+
+                const float cr = glm::length(a - cen);
+                if (cr > circumradius) circumradius = cr;
+
+                // Distance from the centroid to the finite edge segment ab.
+                const Vector3 ab = b - a;
+                const float ab2 = glm::dot(ab, ab);
+                float d;
+                if (ab2 < 1e-8f) {
+                    d = glm::length(cen - a);   // degenerate (coincident) edge
+                } else {
+                    float t = glm::dot(cen - a, ab) / ab2;
+                    t = glm::clamp(t, 0.0f, 1.0f);
+                    d = glm::length(cen - (a + t * ab));
+                }
+                if (inradius < 0.0f || d < inradius) inradius = d;
+
+                // Fan triangulation about the centroid. Portal polygons are
+                // planar, so summing the triangle-cross magnitudes is exact.
+                area2 += glm::length(glm::cross(a - cen, b - cen));
+            }
+
+            int32_t tgt = static_cast<int32_t>(cell.polygons[pi].tgtCell);
+            if (tgt < 0 || tgt >= static_cast<int32_t>(wr.numCells)) {
+                ++badTgt;
+                tgt = -1;
+            }
+
+            std::printf("WRPORTAL %u %d %.3f %.3f %.3f %.3f %.3f %zu %.3f\n",
+                        ci, tgt, cen.x, cen.y, cen.z,
+                        inradius, circumradius, nv,
+                        static_cast<float>(area2 * 0.5));
+            ++portalCount;
+        }
+    }
+
+    std::printf("WRPORTAL_SUMMARY cells=%u portals=%d degenerate=%d "
+                "bad_tgt=%d\n",
+                wr.numCells, portalCount, degenerate, badTgt);
+}
+
+// `wr_cells` dumps raw WR cell geometry — vertices, every polygon (SOLID and
+// PORTAL alike) with its plane — so aperture discriminators can be prototyped
+// OFFLINE against real geometry instead of guessed in C++.
+//
+// WHY THIS EXISTS, and why it dumps geometry rather than a verdict: the survey
+// in `wr_portals` established that a WR portal measures a real aperture
+// exactly (a Thief doorway reads inradius 2.00 ft), but that portal SIZE
+// cannot tell an aperture from a convex-decomposition splitting plane — the
+// size distribution is a dense monotone continuum, not bimodal, and 45.7% of
+// all portals are sub-1-ft splitting slivers. So a size threshold is not a
+// discriminator, and the honest test is instead about what RIMS the portal:
+//
+//   a DOORWAY's portal is a hole cut in a SOLID surface — the wall around the
+//   opening lies (roughly) COPLANAR with the portal and continues past its rim.
+//   a SPLITTING PLANE's portal spans the full cross-section of an open volume —
+//   its plane continues into MORE AIR, never into a coplanar solid surface.
+//
+// NOTE the naive form of that test does NOT work, which is exactly why this
+// dumps geometry: "are the portal's edges shared with SOLID faces of the same
+// cell" reads TRUE for a courtyard splitting plane too, because its edges are
+// shared with the courtyard's own floor, ceiling and side walls. The
+// discriminating question is about COPLANAR solid beyond the rim, not about
+// the rim's neighbours within the cell. Settling that needs experimentation
+// over real geometry, so the instrument emits facts and takes no position.
+//
+// Records (space-separated, one per line):
+//   WRCELL <cellIdx> <numPolys> <numPortals> <numVerts> <cx> <cy> <cz> <radius>
+//       numPortals = the count of TRAILING polygons that are portals; the
+//       first (numPolys - numPortals) are solid. Same slicing raycastWorld
+//       uses (RayCaster.h).
+//   WRVERT <cellIdx> <vertIdx> <x> <y> <z>
+//   WRPOLY <cellIdx> <polyIdx> <isPortal> <tgtCell> <nx> <ny> <nz> <planeD>
+//          <numIdx> <i0> <i1> ...
+//       isPortal: 1 for the trailing portal polygons, 0 for solid.
+//       tgtCell: neighbour cell for portals, -1 for solid / out-of-network.
+//       (nx,ny,nz,planeD) = the polygon's plane straight from the cell's plane
+//       table (WRPolygon.plane indexes it), so coplanarity tests are EXACT
+//       rather than re-derived from vertices. planeIdx is cell-local, so
+//       CROSS-CELL comparison must use the plane equation, not the index.
+//       <i0..> index this cell's WRVERT list.
+//   WRCELLS_SUMMARY cells=<n> polys=<m> portals=<k> solid=<s> bad_plane=<x>
+//       bad_idx=<y>
+//
+// Service-less, like wr_portals: parseWRChunk reads the .mis directly.
+static void printWRCells(const std::string &misPath) {
+    Darkness::WRParsedData wr;
+    try {
+        wr = Darkness::parseWRChunk(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr,
+            "wr_cells: failed to parse WR chunk in '%s': %s\n",
+            misPath.c_str(), e.what());
+        return;
+    }
+    if (wr.numCells == 0) {
+        std::fprintf(stderr,
+            "wr_cells: '%s' has 0 WR cells — nothing to dump\n",
+            misPath.c_str());
+        return;
+    }
+
+    int polyCount = 0, portalCount = 0, solidCount = 0;
+    int badPlane = 0, badIdx = 0;
+
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        const auto &cell = wr.cells[ci];
+        std::printf("WRCELL %u %u %u %zu %.3f %.3f %.3f %.3f\n",
+                    ci, static_cast<uint32_t>(cell.numPolygons),
+                    static_cast<uint32_t>(cell.numPortals),
+                    cell.vertices.size(),
+                    cell.center.x, cell.center.y, cell.center.z, cell.radius);
+
+        for (size_t v = 0; v < cell.vertices.size(); ++v) {
+            std::printf("WRVERT %u %zu %.3f %.3f %.3f\n",
+                        ci, v, cell.vertices[v].x, cell.vertices[v].y,
+                        cell.vertices[v].z);
+        }
+
+        // Portals are the LAST numPortals polygons (RayCaster.h's slicing).
+        const int numSolid = static_cast<int>(cell.numPolygons)
+                           - static_cast<int>(cell.numPortals);
+        for (size_t pi = 0; pi < cell.polyIndices.size(); ++pi) {
+            const bool isPortal = static_cast<int>(pi) >= numSolid;
+            if (isPortal) ++portalCount; else ++solidCount;
+            ++polyCount;
+
+            // Plane straight from the cell's table. A bad index is reported
+            // as a zero plane rather than skipped, so the record count still
+            // matches numPolygons and the summary stays reconcilable.
+            Vector3 n(0.0f, 0.0f, 0.0f);
+            float pd = 0.0f;
+            if (pi < cell.polygons.size()) {
+                const uint8_t plIdx = cell.polygons[pi].plane;
+                if (plIdx < cell.planes.size()) {
+                    n = cell.planes[plIdx].normal;
+                    pd = cell.planes[plIdx].d;
+                } else {
+                    ++badPlane;
+                }
+            } else {
+                ++badPlane;
+            }
+
+            int32_t tgt = -1;
+            if (isPortal && pi < cell.polygons.size()) {
+                tgt = static_cast<int32_t>(cell.polygons[pi].tgtCell);
+                if (tgt < 0 || tgt >= static_cast<int32_t>(wr.numCells))
+                    tgt = -1;
+            }
+
+            const auto &idx = cell.polyIndices[pi];
+            std::printf("WRPOLY %u %zu %d %d %.6f %.6f %.6f %.6f %zu",
+                        ci, pi, isPortal ? 1 : 0, tgt, n.x, n.y, n.z, pd,
+                        idx.size());
+            for (size_t k = 0; k < idx.size(); ++k) {
+                if (idx[k] >= cell.vertices.size()) ++badIdx;
+                std::printf(" %u", static_cast<uint32_t>(idx[k]));
+            }
+            std::printf("\n");
+        }
+    }
+
+    std::printf("WRCELLS_SUMMARY cells=%u polys=%d portals=%d solid=%d "
+                "bad_plane=%d bad_idx=%d\n",
+                wr.numCells, polyCount, portalCount, solidCount,
+                badPlane, badIdx);
+}
+
 // ---------- Ambient sound dump ----------
 //
 // `ambients` lists every object with a P$AmbientHa property: schema name,
@@ -454,7 +998,7 @@ static void printSoundChunks(const FileGroupPtr &db) {
         speechLoaded = speechDB.loadFromChunk(bytes.data(), bytes.size());
     }
 
-    // ENV_SOUND — decoded as a cTagDBDatabase tag tree. Each surfaced
+    // ENV_SOUND — decoded as a TagDB tag tree. Each surfaced
     // entry corresponds to a key-path that resolves to one or more
     // schema ObjIDs (with matching weight). The chunk preamble carries
     // a "required tag" bitarray that gates which tag-types must appear
@@ -2357,7 +2901,7 @@ static int runProbePlanVerb(const std::string &misPath,
     int postDedup = static_cast<int>(plan.pathingKept.size());
     std::fprintf(stdout,
         "[PROBE_PLAN] pathing [density=%s]: Portal=%d PortalPair=%d "
-        "DoorPair=%d Centroid=%d Emitter=%d  postDedup=%d\n",
+        "DoorPair=%d Centroid=%d Emitter=%d HubFill=%d  postDedup=%d\n",
         Darkness::pathingProbeDensityName(
             audioSvc->getPathingProbeDensity()),
         getPurpose(Darkness::PathingProbePurpose::Portal),
@@ -2365,6 +2909,7 @@ static int runProbePlanVerb(const std::string &misPath,
         getPurpose(Darkness::PathingProbePurpose::DoorPair),
         getPurpose(Darkness::PathingProbePurpose::Centroid),
         getPurpose(Darkness::PathingProbePurpose::Emitter),
+        getPurpose(Darkness::PathingProbePurpose::HubFill),
         postDedup);
 
     std::fprintf(stdout,
@@ -2544,6 +3089,30 @@ static void printUsage(const char *prog) {
     std::cerr << "  room-info <id> [<id> ...]" << std::endl;
     std::cerr << "                    Dump OBB planes, portal list, and portal-to-portal" << std::endl;
     std::cerr << "                    distance matrix for each given room ID." << std::endl;
+    std::cerr << "  probe_cell_audit [positions.csv]" << std::endl;
+    std::cerr << "                    Do probe positions land inside the WR cell network that" << std::endl;
+    std::cerr << "                    raycastWorld traverses? A position outside every cell makes" << std::endl;
+    std::cerr << "                    raycastWorld bail before tracing any geometry and report" << std::endl;
+    std::cerr << "                    'no hit' — i.e. a clear line of sight through solid walls." << std::endl;
+    std::cerr << "                    With a .probes.*.positions.csv sidecar: audits the REAL baked" << std::endl;
+    std::cerr << "                    probes. Without: audits ROOM_DB room/portal centers (no bake" << std::endl;
+    std::cerr << "                    needed, so it runs on any level)." << std::endl;
+    std::cerr << "  room_graph        Dump the whole ROOM_DB portal graph as machine-readable" << std::endl;
+    std::cerr << "                    ROOM / PORTAL / PDIST lines (room centers, portal centers," << std::endl;
+    std::cerr << "                    degrees, intra-room portal-to-portal distances). Consumed" << std::endl;
+    std::cerr << "                    by analysis/room_graph_stats.py." << std::endl;
+    std::cerr << "  wr_portals        Dump every WR CELL portal polygon as machine-readable" << std::endl;
+    std::cerr << "                    WRPORTAL lines (cell, target cell, centroid, inradius," << std::endl;
+    std::cerr << "                    circumradius, vertex count, area). Unlike room_graph's" << std::endl;
+    std::cerr << "                    ROOM_DB portals — designer box boundaries — these are" << std::endl;
+    std::cerr << "                    compiled from the real geometry, so an aperture's size" << std::endl;
+    std::cerr << "                    is the opening's true size. Needs no services." << std::endl;
+    std::cerr << "  wr_cells          Dump raw WR cell geometry as machine-readable WRCELL /" << std::endl;
+    std::cerr << "                    WRVERT / WRPOLY lines (vertices, and EVERY polygon —" << std::endl;
+    std::cerr << "                    solid and portal — with its exact plane). For prototyping" << std::endl;
+    std::cerr << "                    aperture discriminators offline: portal SIZE cannot tell a" << std::endl;
+    std::cerr << "                    real opening from a convex-decomposition splitting plane," << std::endl;
+    std::cerr << "                    so the test must look at what rims it. Needs no services." << std::endl;
     std::cerr << "  trace-path <src> <dst> [maxDist]" << std::endl;
     std::cerr << "                    Trace BFS through the portal graph from src room to dst" << std::endl;
     std::cerr << "                    room. Per-hop detail (segmentDist, cumEff, doorBlocking)." << std::endl;
@@ -2659,6 +3228,8 @@ int main(int argc, char *argv[]) {
                           command == "links" ||
                           command == "trace-path" ||
                           command == "room-info" ||
+                          command == "room_graph" ||
+                          command == "probe_cell_audit" ||
                           command == "ambients" ||
                           command == "prop-dump" ||
                           command == "sound-desc" ||
@@ -2746,6 +3317,34 @@ int main(int argc, char *argv[]) {
                 printRoomInfo(std::stoi(positionalArgs[i]));
                 if (i + 1 < positionalArgs.size()) std::cout << std::endl;
             }
+        } else if (command == "room_graph") {
+            initServices();
+            loadSchema(scriptsDir);
+            // Same rationale as trace-path: force RoomService instantiation
+            // BEFORE loadDatabase so it registers as a DatabaseListener and
+            // actually parses ROOM_DB.
+            (void)GET_SERVICE(RoomService);
+            loadDatabase(dbFile);
+            printRoomGraph();
+        } else if (command == "probe_cell_audit") {
+            initServices();
+            loadSchema(scriptsDir);
+            // Same rationale as room_graph: force RoomService instantiation
+            // BEFORE loadDatabase so ROOM_DB is actually parsed. (Only the
+            // no-CSV candidate mode needs it, but the cost is trivial.)
+            (void)GET_SERVICE(RoomService);
+            loadDatabase(dbFile);
+            printProbeCellAudit(dbFile,
+                positionalArgs.size() > 2 ? positionalArgs[2] : std::string());
+        } else if (command == "wr_portals") {
+            // Service-less by design: parseWRChunk reads the .mis directly and
+            // WR cells carry their own geometry — no ROOM_DB involved. That is
+            // the whole point of the verb (see printWRPortals).
+            printWRPortals(dbFile);
+        } else if (command == "wr_cells") {
+            // Service-less for the same reason as wr_portals: raw cell
+            // geometry comes straight out of the WR chunk.
+            printWRCells(dbFile);
         } else if (command == "sound_db") {
             // sound_db: walks the schema directory; optionally applies
             // P$SchAttFac/SchPlayPa overrides from dbFile when present.

@@ -136,7 +136,8 @@ struct SteamAudioDSPNode {
     // callback, with portalAttenuation=1.0 + portalBlocking=0.0
     // collapsing to no-op for same-room voices.
     bool usePortalRouting = false;
-    bool skipAttenuation = false;        // true for player-emitted sounds (footsteps within 5 units)
+    bool skipAttenuation = false;        // bypass hook for SA distance/occlusion — currently NEVER set true
+                                         // (reset each frame); rip out or wire up at next review
 
     // Per-voice override for IPLBinauralEffectParams::spatialBlend.
     // 1.0 = full HRTF; 0.0 = mono passthrough. Used by AMB_ENVIRONMENTAL
@@ -442,6 +443,135 @@ struct ActiveVoice {
     // SimulationData create-time seeds (neutral distanceAttenuation =
     // 1.0), audibly popping distant spawns at full volume for a frame.
     uint64_t directSimCycleAtAdd = 0;
+
+    // ── O2a door-dirty-gated pathing solve memo (main-thread only) ──
+    //
+    // PLAN.PATHING_DESIGN.md §4 O2a: the pathing staging pass in
+    // AudioService::loopStep only stages this voice's pathingSource with
+    // the PATHING simulation flag SET (i.e. "solve me") when something
+    // that could change the route answer has changed since the last
+    // solve that covered this voice:
+    //   • the door acoustic generation counter advanced (a door moved),
+    //   • the listener moved > kPathingSolveMemoMoveFt or changed room,
+    //   • the source moved > kPathingSolveMemoMoveFt,
+    //   • the voice just became pathing-eligible (pathingWanted rising
+    //     edge — replaces the old "keep out-of-range voices enabled"
+    //     freshness insurance),
+    //   • the voice has never been solved, or a solve request is
+    //     latched from a tick that couldn't signal the worker.
+    // Otherwise the source is staged ONCE with the PATHING flag CLEARED
+    // (Steam Audio then skips it inside iplSimulatorRunPathing and
+    // retains its last pathingOutputs — the cache) and not staged again
+    // until the next solve. All fields are read/written exclusively by
+    // the main-thread staging pass.
+    uint64_t pathLastSolveDoorGen = 0;      // door gen covered by last solve
+    Vector3  pathLastSolveListenerPos{0.0f, 0.0f, 0.0f};
+    int32_t  pathLastSolveListenerRoom = INT32_MIN;
+    Vector3  pathLastSolveSourcePos{0.0f, 0.0f, 0.0f};
+    bool     pathEverSolved = false;        // false until first solve staged
+    bool     pathSolvePending = false;      // latch: needed solve, tick didn't signal
+    bool     pathWantedLastTick = false;    // pathingWanted at last due tick
+    bool     pathStagedEnabled = false;     // mirrors SA-side pathingInputs.enabled
+
+    // ── Lever D: warmup first-solve stagger (main-thread only) ──
+    //
+    // PLAN.PATHING_DESIGN.md §16. While pathEverSolved is false this voice
+    // belongs to the deferrable first-solve class: the staging pass admits
+    // at most kPathingFirstSolvesPerIteration of them per signaled
+    // iteration (SA's unbounded alternate-search drains cost ~170 ms each
+    // and warmup stages ~10 at once — §15). This counts how many signaled
+    // ticks have deferred THIS voice, and is the PRIMARY selection key
+    // (highest first = aging), which is what bounds the wait: a voice's
+    // count only rises while it waits, newly-spawned voices enter at 0 and
+    // therefore rank BELOW it, and the fixed cohort ahead of it drains at
+    // the cap per tick. Audibility only breaks ties WITHIN an age cohort,
+    // so it can reorder but never starve. Dead once the voice solves
+    // (pathEverSolved latches true and never clears), so it is never
+    // reset.
+    uint32_t pathFirstSolveDeferrals = 0;
+
+    // ── O2a review F3 — out-of-range re-entry staleness gate ──
+    //
+    // (Main-thread only, like the memo above.) While a voice sits beyond
+    // maxAudibleDist it is dropped from the solve set, so Steam Audio
+    // retains outputs FROZEN at exit time — possibly minutes old, with
+    // door states that no longer exist. On re-entry those outputs must
+    // not reach the audio thread (pre-O2a "sound through walls" artifact
+    // class). The harvest pass sets pathOutputsStale on every
+    // out-of-range frame (and latches pathSolvePending so a covering
+    // solve is guaranteed even when the excursion falls entirely between
+    // due ticks); the staging pass arms pathStaleCoverCycle =
+    // PathingSimulator::completedCycles()+1 at the next signaled SOLVE
+    // (UINT64_MAX = not yet armed); the harvest pass's re-entry hold
+    // keeps dspNode.pathTargetValid=false and the scalar portal mapping
+    // parked silent until completedCycles() reaches the target — the
+    // same completed-cycles pattern as reflectionSimCycleAtAdd.
+    bool     pathOutputsStale = false;
+    uint64_t pathStaleCoverCycle = UINT64_MAX;
+
+    // ── Unreachable-route verdict (main-thread only) ──
+    //
+    // Written by the harvest pass's output-read branch each frame from
+    // the RAW pathing outputs (before any DSP mapping):
+    //   pathLastOutputsNoRoute  — solver ran for this source and found
+    //     NO route: shCoeffs all-zero with eqCoeffs=[1,1,1]
+    //     (calcEQForPaths writes eq=1 when numValidPaths==0 and the SH
+    //     buffer stays memset-zero). This is the expensive verdict —
+    //     the solve that produced it exhausted findAlternatePaths.
+    //   pathLastOutputsSentinel — outputs still bit-identical to the
+    //     SimulationData create-time seed (eq=[0.1,0.1,0.1], sh=0):
+    //     the solver has NEVER written this source. NOT a verdict.
+    //   pathVerdictCoverCycle — PathingSimulator::completedCycles()+1
+    //     armed at each staged SOLVE; a verdict read from the outputs
+    //     is only attributable to the memo'd solve once
+    //     completedCycles() reaches this (before that the outputs may
+    //     predate the staged solve). UINT64_MAX = no solve staged yet.
+    //
+    // Consumed by the staging pass's unreachable-route cache (skip the
+    // exhaustive re-solve while nothing changed) and by the
+    // [PERF path_trig] diagnostic counters.
+    bool     pathLastOutputsNoRoute  = false;
+    bool     pathLastOutputsSentinel = true;   // pre-first-solve = seed
+    uint64_t pathVerdictCoverCycle   = UINT64_MAX;
+
+    // ── Scoped door-event invalidation (main-thread only) ──
+    //
+    // PLAN.PATHING_DESIGN.md §8 (O3-lite shadow router). The pre-scope
+    // door trigger fired for EVERY in-range voice on any door commit
+    // (pathLastSolveDoorGen != committedGen); the shadow router shrinks
+    // that to the 1-2 voices actually routed through the moving door.
+    //
+    //   pathScopedDoorDirty  — set at door COMMIT time (loopStep) for
+    //     voices registered against a door whose pose just entered the
+    //     BVH (via AudioService::mDoorVoices reverse index), OR for all
+    //     scope-valid voices on a fail-open commit (unmapped door with
+    //     no ellipse cover). Consumed (and cleared) at the voice's next
+    //     signaled SOLVE — the scoped replacement for the global doorGen
+    //     trigger. Init true so a voice with no prior solve still solves
+    //     (trigNever covers the same case; belt-and-suspenders).
+    //   pathRouteScopeValid  — true iff the voice's last covering solve
+    //     produced usable route data (router built, source+listener
+    //     rooms resolved, a finite route exists). When FALSE the voice
+    //     FAILS OPEN: it uses the global committed-gen door trigger, not
+    //     the scoped dirty flag (router miss / unmapped room / no-route
+    //     verdict → conservative). Init false = fail-open until solved.
+    bool     pathScopedDoorDirty = true;
+    bool     pathRouteScopeValid = false;
+
+    // ── [SCOPE_MISS] watchdog (main-thread only) ──
+    //
+    // pathLastEq caches the most recent RAW pathing eqCoeffs read by the
+    // harvest pass (once attributable via the completed-cycles gate). The
+    // watchdog (~2 s) force-solves EVERY eligible in-range voice ignoring
+    // scoping; for a voice that scoping WOULD have skipped this tick it
+    // snapshots pathLastEq into pathScopeWatchdogEqSnapshot and arms
+    // pathScopeWatchdogCoverCycle. When the forced solve completes the
+    // harvest compares the fresh eq to the snapshot; a band delta beyond
+    // kScopeMissEqEpsilon means scoping wrongly excluded this voice from a
+    // door change → loud [SCOPE_MISS]. UINT64_MAX = not armed.
+    float    pathLastEq[3]                = {0.0f, 0.0f, 0.0f};
+    float    pathScopeWatchdogEqSnapshot[3] = {0.0f, 0.0f, 0.0f};
+    uint64_t pathScopeWatchdogCoverCycle  = UINT64_MAX;
 
     // Per-voice volumetric-occlusion sphere radius (engine feet).
     // Computed in createVoiceSource by raycasting from the source

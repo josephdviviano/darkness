@@ -54,7 +54,8 @@
 #include <vector>
 
 // Re-use the leaf record types from EnvSoundDatabase to keep the API surface
-// uniform — the underlying engine type (`sTagDBData`/`cTagDBKey`) is shared.
+// uniform — the original engine shares one record/key type between the
+// speech and env-sound tag databases.
 #include "EnvSoundDatabase.h"
 
 namespace Darkness {
@@ -135,7 +136,7 @@ public:
     // enum-typed (interpret as up to 8 value-indices terminated by 0xFF).
     static constexpr int32_t kTagFlagInt  = 0x1;
     static constexpr int32_t kTagFlagEnum = 0x2;
-    // Enum-list terminator; matches kTagDBKeyEnumUnused on disk.
+    // Enum-list terminator; matches the 0xFF 'unused' sentinel on disk.
     static constexpr uint8_t kEnumTerminator = 0xFF;
 
     bool isIntTag(uint32_t keyType) const;

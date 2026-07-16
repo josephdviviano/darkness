@@ -447,13 +447,15 @@ void ConvolutionWorkerPool::pollPerfPeriodic()
     if (!mWorker) return;
     auto &cw = *mWorker;
 
-    static std::chrono::steady_clock::time_point sLast{};
+    // Instance member, NOT a function-local static: the pool is destroyed
+    // and recreated across scene rebuilds, and a per-process throttle
+    // timestamp silently carries over between incarnations.
     auto now = std::chrono::steady_clock::now();
-    if (sLast.time_since_epoch().count() != 0) {
-        auto ms = std::chrono::duration<double, std::milli>(now - sLast).count();
+    if (mPerfPollLast.time_since_epoch().count() != 0) {
+        auto ms = std::chrono::duration<double, std::milli>(now - mPerfPollLast).count();
         if (ms < 1000.0) return;
     }
-    sLast = now;
+    mPerfPollLast = now;
 
     LatencyHistogram::Percentiles queueP{};
     for (auto &subPtr : cw.workers) {
@@ -482,6 +484,14 @@ void ConvolutionWorkerPool::shutdown()
     for (auto &subPtr : mWorker->workers) {
         subPtr->shutdown.store(true, std::memory_order_release);
         subPtr->frameSeq.fetch_add(1, std::memory_order_release);  // wake it
+        {
+            // Lock held (empty) so the store cannot slip into the window
+            // between the worker's predicate check and its wait — the
+            // standard CV shutdown handshake (see RingOutputMixer::stop).
+            // Without it a worker entering wait right now misses the only
+            // notify it will ever get and join() below hangs forever.
+            std::lock_guard<std::mutex> lk(subPtr->wakeMtx);
+        }
         subPtr->wakeCv.notify_one();  // condvar wake (yield-poll → cv since 2026-05)
     }
     for (auto &subPtr : mWorker->workers) {
@@ -764,8 +774,9 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
             //
             // Limited to ~MAX_ACTIVE_VOICES*2 distinct handles per sub-
             // worker over the lifetime of the run. When the set fills,
-            // new voices are still logged but old entries are not pruned
-            // — the log goes quiet on the next eviction, which is fine.
+            // NEW handles are no longer logged at all (they cannot be
+            // inserted, so logging them would repeat at ~50 Hz forever) —
+            // the diagnostic goes quiet for the rest of the run.
             {
                 int handle = slot.voiceHandle;
                 bool already = false;
@@ -775,9 +786,10 @@ void ConvolutionWorkerPool::subWorkerMain(int workerIdx)
                         break;
                     }
                 }
-                if (!already && handle >= 0) {
-                    if (sub.firstAppliedCount < ConvolutionSubWorker::kFirstApplyTrackCap)
-                        sub.firstAppliedHandles[sub.firstAppliedCount++] = handle;
+                const bool trackable = sub.firstAppliedCount
+                    < ConvolutionSubWorker::kFirstApplyTrackCap;
+                if (!already && handle >= 0 && trackable) {
+                    sub.firstAppliedHandles[sub.firstAppliedCount++] = handle;
 
                     double irNorm = 0.0;
                     const float *ch0 = sub.voiceAmbi0.data();

@@ -264,6 +264,16 @@ void PathingSimulator::workerMain()
             const float ms =
                 std::chrono::duration<float, std::milli>(t1 - t0).count();
             mPathingHist.record(static_cast<double>(ms));
+            // O2a completion bookkeeping for [DOOR_ROUTE_LATENCY]: stamp
+            // the iteration-end time FIRST (relaxed), then publish the
+            // cycle count with release — a main-thread reader that
+            // acquires the new count is guaranteed to see this (or a
+            // newer) end timestamp.
+            mLastIterEndNs.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    t1.time_since_epoch()).count(),
+                std::memory_order_relaxed);
+            mCompletedCycles.fetch_add(1, std::memory_order_release);
             // Same threshold as the previous synchronous main-thread timing
             // harness. Rate-limited (first 32 + every 64th thereafter) to
             // keep the log readable. Now logged from the worker thread, so
@@ -400,11 +410,57 @@ void PathingSimulator::workerMain()
                         std::lock_guard<std::mutex> lock(mMutex);
                         throttleMs = mLastSignalIntervalMs;
                     }
+                    // O2a staging mix for this window: solved = voices
+                    // staged with the PATHING flag set (full validation +
+                    // alternate-path search), skipped = IN-RANGE eligible
+                    // voices whose memo said nothing changed (Steam Audio
+                    // serves the cached outputs; out-of-range voices count
+                    // in neither bucket — review F6). skipped >> solved on
+                    // idle windows is the dirty-gating working as designed.
+                    const uint64_t solvedW =
+                        mStagedSolved.exchange(0, std::memory_order_relaxed);
+                    const uint64_t skippedW =
+                        mStagedSkipped.exchange(0, std::memory_order_relaxed);
+                    // unreachableCached: staged-SKIPs the unreachable-route
+                    // cache produced (suppressed exhaustive re-solves of
+                    // known no-route voices). Loud by user directive.
+                    const uint64_t unreachW =
+                        mUnreachableCached.exchange(0, std::memory_order_relaxed);
+                    // O3-lite scoped-invalidation counters (§8): scopedSolves
+                    // = solves on scope-valid voices; scopeSkipped = in-range
+                    // voices whose global door gen advanced but whose route
+                    // set excluded the moved door(s) — the re-solves scoping
+                    // suppressed (the win).
+                    const uint64_t scopedW =
+                        mScopedSolves.exchange(0, std::memory_order_relaxed);
+                    const uint64_t scopeSkipW =
+                        mScopeSkipped.exchange(0, std::memory_order_relaxed);
+                    // Lever D warmup stagger (§16): firstSolveDeferred =
+                    // never-solved voices held out of an iteration this
+                    // window (drained); firstSolveBacklog = the current
+                    // never-solved in-range depth (gauge). Expect a short
+                    // burst of both at warmup decaying to 0/0; a backlog
+                    // pinned > 0 with deferrals still accruing means first
+                    // solves are not draining — see setFirstSolveStagger.
+                    const uint64_t firstDeferW =
+                        mFirstSolveDeferred.exchange(0, std::memory_order_relaxed);
+                    const uint32_t firstBacklogW =
+                        mFirstSolveBacklog.load(std::memory_order_relaxed);
                     std::fprintf(stderr,
                         "[PERF pathing] p50=%.2fms p95=%.2fms p99=%.2fms "
-                        "throttleMs=%.2f n=%llu\n",
-                        p.p50, p.p95, p.p99, throttleMs,
-                        static_cast<unsigned long long>(p.n));
+                        "max=%.2fms throttleMs=%.2f n=%llu solved=%llu "
+                        "skipped=%llu unreachableCached=%llu "
+                        "scopedSolves=%llu scopeSkipped=%llu "
+                        "firstSolveDeferred=%llu firstSolveBacklog=%u\n",
+                        p.p50, p.p95, p.p99, p.maxMs, throttleMs,
+                        static_cast<unsigned long long>(p.n),
+                        static_cast<unsigned long long>(solvedW),
+                        static_cast<unsigned long long>(skippedW),
+                        static_cast<unsigned long long>(unreachW),
+                        static_cast<unsigned long long>(scopedW),
+                        static_cast<unsigned long long>(scopeSkipW),
+                        static_cast<unsigned long long>(firstDeferW),
+                        firstBacklogW);
                     // Budget warning: p95 ≥ 80% of throttle interval
                     // means we're nearly missing the cadence on most
                     // iterations. Only emit if we have a measured

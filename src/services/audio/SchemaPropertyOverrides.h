@@ -50,7 +50,7 @@ inline bool mapDiskAudioClass(uint16_t diskClass, SchemaAudioClass &out)
 
 // Apply a 20-byte P$SchPlayPa record to `sch`. Overwrites flags,
 // audio-class (when non-zero on disk), volume, pan, delay, fade. The
-// on-disk `flags` field's bit 12 = SFXFLG_SHARP — same bit as our
+// on-disk `flags` field's bit 12 = the 'sharp' falloff flag — same bit as our
 // SCH_SHARP_FALLOFF so the value carries through verbatim.
 inline void applySchPlayParams(SchemaEntry &sch, const uint8_t *bytes)
 {

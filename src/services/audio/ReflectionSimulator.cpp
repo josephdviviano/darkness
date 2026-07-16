@@ -82,6 +82,13 @@ void ReflectionSimulator::stop()
     if (!mThread.joinable())
         return;
     mShutdown.store(true, std::memory_order_release);
+    {
+        // Empty critical section: the standard CV shutdown handshake (see
+        // RingOutputMixer::stop) — without it the store can land between
+        // the worker's predicate check and its wait, the notify is missed,
+        // and join() hangs forever.
+        std::lock_guard<std::mutex> lk(mMutex);
+    }
     mCV.notify_one();
     mThread.join();
 }
@@ -91,8 +98,8 @@ void ReflectionSimulator::waitForCompletion()
 {
     // Spin-wait for the reflection sim to complete on its background
     // thread. Called infrequently (voice removal, shutdown, probe-batch
-    // mutation). Direct sim runs inline on the main thread so it is
-    // never concurrent here.
+    // mutation). Covers ONLY this worker — the direct sim runs on its own
+    // DirectSimulator thread (PR 1b) and is gated separately.
     while (mRunning.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }

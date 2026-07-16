@@ -71,14 +71,14 @@ struct LeReader {
     }
 };
 
-// Sanity bounds taken from the original engine's DBG_ON asserts in
-// cTagDBDatabase::Load (Assert_(iSize < 10000)). Anything outside this
+// Sanity bounds match the original engine's debug-build assertion that
+// a node holds fewer than 10000 records. Anything outside this
 // range almost certainly means we lost sync with the stream.
 constexpr int32_t kMaxRecordsPerNode = 10000;
 constexpr size_t  kMaxTraversalDepth = 64;
 constexpr size_t  kMaxEntries        = 65536; // hard cap as a runaway guard
 
-// Walk one cTagDBDatabase node. Pushes any data records onto `out` along
+// Walk one TagDB node. Pushes any data records onto `out` along
 // with a copy of the current key path. Recurses into all branches. The
 // engine recursion depth is bounded by tag-type count, which is small.
 // Returns false on parse failure (reader overflow or bad counts).
@@ -166,7 +166,7 @@ bool EnvSoundDatabase::loadFromChunk(const uint8_t *data, size_t size) {
         }
     }
 
-    // Root cTagDBDatabase. Parse what we can; on failure preserve the
+    // Root TagDB node. Parse what we can; on failure preserve the
     // unparsed tail so callers can investigate.
     std::vector<KeySegment> path;
     const size_t parseStart = r.pos;

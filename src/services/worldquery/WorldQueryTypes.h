@@ -77,6 +77,46 @@ struct LinkInfo {
 };
 
 /// Result of a raycast query.
+/// Why `raycastWorld` returned what it returned.
+///
+/// WHY THIS EXISTS: raycastWorld's `bool` conflates two very different
+/// answers — "I proved the segment is clear" and "I could not evaluate the
+/// segment". It returns false when the ray ORIGIN is outside every WR cell,
+/// when the cell budget is exhausted, on degenerate geometry, and on invalid
+/// portal targets. A caller that reads false as "clear line of sight" will
+/// see through walls in exactly those cases.
+///
+/// Exactly ONE path proves clear (`Clear`): the ray ending inside a cell
+/// without crossing an exit plane. Two prove blocked (`Hit`). Everything
+/// else is UNPROVEN — so visibility consumers should WHITELIST `Clear`
+/// rather than blacklist known failures.
+///
+/// Only `raycastWorld` sets this; other RayHit producers (object/physics
+/// raycasts) leave it `Unset`.
+enum class RayStatus : uint8_t {
+    Unset = 0,
+    Hit,                 ///< proven blocked; hit point/normal are valid
+    Clear,               ///< PROVEN clear — ray ended inside a cell
+    ZeroLength,          ///< from ~= to; nothing between by definition
+    // ── everything below is UNPROVEN: false does NOT mean "clear" ──
+    NoStartCell,         ///< origin outside every cell — ray never traced
+    DegenerateGeom,      ///< no valid exit plane found
+    DiscardNoPolygon,    ///< exit plane crossed but no polygon contained the
+                         ///< hit point; discarded to match the original
+                         ///< engine — traversal STOPS here
+    InvalidPortalTarget, ///< portal's target cell out of range ("treat as
+                         ///< solid" per the traversal's own comment)
+    CellBudget,          ///< MAX_RAY_CELLS exceeded before resolving
+    InvalidCell,         ///< current cell went out of range mid-traversal
+};
+
+/// True only when the raycast actually resolved the segment. `!proven()`
+/// means the bool answer is a guess and must not be read as visibility.
+inline bool rayStatusProven(RayStatus s) {
+    return s == RayStatus::Hit || s == RayStatus::Clear ||
+           s == RayStatus::ZeroLength;
+}
+
 struct RayHit {
     Vector3 point;
     Vector3 normal;
@@ -85,6 +125,8 @@ struct RayHit {
     int32_t textureIndex = -1; // WR polygon texture index (-1 = unknown/no texture)
     int32_t cellIdx = -1;      // WR cell where hit occurred (-1 = unknown)
     int32_t polyIdx = -1;      // WR polygon index within cell (-1 = unknown)
+    /// Set by raycastWorld only (see RayStatus). Unset from other producers.
+    RayStatus status = RayStatus::Unset;
 };
 
 /// Axis-aligned bounding box.
