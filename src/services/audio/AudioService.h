@@ -1008,6 +1008,16 @@ public:
     void setPathingDedupRadiusFt(float ft) {
         mProbePathingDedupRadiusFt = std::max(0.0f, std::min(ft, 30.0f));
     }
+
+    /** EXPERIMENTAL: force the pathing bake's single-edge visRange to
+     *  exactly this value (0 = coverage-derived, the default). A/B lever
+     *  for the range sweep — offline §37 analysis says ~80 ft keeps the
+     *  aperture graph healthy at a fraction of the edges. Recorded in
+     *  the .probes header like the derived value, so runtime clamping
+     *  follows automatically. */
+    void setPathingVisRangeOverrideFt(float ft) {
+        mPathingVisRangeOverrideFt = std::max(0.0f, std::min(ft, 400.0f));
+    }
     float getPathingDedupRadiusFt() const { return mProbePathingDedupRadiusFt; }
 
     /** Pathing probe layout density tier (`audio.pathing_probes.density`
@@ -2281,6 +2291,8 @@ private:
     /// collapsing legitimately distinct rooms. Set from yaml
     /// (`audio.pathing_probes.dedup_radius_ft`).
     float              mProbePathingDedupRadiusFt = 10.0f;
+    /// Experimental bake visRange override (0 = derived). See setter.
+    float              mPathingVisRangeOverrideFt = 0.0f;
 
     /// Pathing probe layout density tier. Set from yaml
     /// (`audio.pathing_probes.density`, default "bends"); consumed by
