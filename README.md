@@ -9,11 +9,7 @@
 
 ## Project status
 
-**`darkness` is an engine under construction, not a playable game.** You cannot play Thief 2 with it, and won't be able to for some time. This section exists so you can tell at a glance what is and isn't expected to work.
-
-What you can do today: load a shipping Thief 2 mission, walk it with full player physics, open doors, ride elevators, throw levers, trip pressure plates, pick up and throw objects, and hear all of it through an acoustic simulation that goes well beyond what the original engine did.
-
-What you cannot do: encounter another living thing. There are no guards. There is no inventory, no weapons, no objectives, no loot totals, no light gem, no HUD, no save/load, and no way to complete a mission.
+**`darkness` is an engine under construction, not a playable game.** You cannot play Thief 1 or 2 with it yet. What you can do today: load a shipping Thief 2 mission, walk it with full player physics, open doors, ride elevators, throw levers, trip pressure plates, pick up and throw objects, and hear all of it through an modernized acoustic simulation. I still have to implement NPCs, inventory,  weapons, no objectives, no loot totals, dynamic lighting, no light gem, no HUD, save/load, game logic, AI.
 
 ### Subsystem status
 
@@ -25,7 +21,7 @@ What you cannot do: encounter another living thing. There are no guards. There i
 | Player physics — walk, crouch, jump, mantle, lean, stairs, slopes | **Working** |
 | Object interaction — doors, elevators, levers, tweqs, pressure plates, triggers, pushable objects | **Working** |
 | Frob / grab / throw | **Working** — see caveat below |
-| Spatial audio — HRTF, occlusion, reflections, portal pathing, schemas, speech | **Working** — active focus |
+| Spatial audio — HRTF, occlusion, reflections, portal pathing, schemas, speech | **Under Construction** — active focus |
 | Built-in object scripts | **Partial** — 31 scripts; see caveat below |
 | Game logic — inventory, objectives, loot, keys, mission completion | **Absent** |
 | NPCs / creatures — rendering, animation, behaviour | **Absent** |
@@ -33,22 +29,7 @@ What you cannot do: encounter another living thing. There are no guards. There i
 | Save / load | **Absent** |
 | Modern rendering — shadows, SSAO, PBR, volumetrics | **Absent** |
 
-### Caveats worth stating plainly
-
-- **NPCs are not merely inert — they are invisible.** The renderer's mesh parser accepts only the `LGMD` static-model format and returns an empty mesh for anything else. `LGMM`, the Dark Engine's creature/AI mesh format, is not handled at all, so creature models load as nothing and draw as nothing. `MotionService` parses `motions.crf` and reports its clip count, then goes unused.
-- **"AI" today means one logger.** `AIHearingService` walks objects carrying the AI hearing property and emits a diagnostic line. It is observation-only by design and describes itself that way. There is no brain, no senses, no scheduler, no pathfinding — nothing decides anything.
-- **"Scripts" does not mean a VM.** There is no Squirrel, no Lua, and no `.osm` module loading. The script system is 31 hardcoded C++ classes in a static registry, matched by name against the mission's script property. Missions referencing anything outside that set have those names counted and dropped. Real Thief 2 ships 100+ scripts.
-- **Game-logic scripts are facades.** Loot frobs and logs; the object is never destroyed and nothing is credited. Books log their text. Any key opens any lock — the key source/destination properties are ignored. Mission completion prints a line and returns.
-- **Frob has no line-of-sight check.** Most small frobbables have no collision body and fall back to a proximity cone, so you can frob through walls. The code flags this as a placeholder.
-- **Tested on Thief 2 only.** The engine shares a lineage with Thief 1 and System Shock 2 and there is some scaffolding for their schemas, but neither is exercised or supported today.
-
-### Where this sits on the roadmap
-
-Development runs roughly: foundation → object/property system → player physics → audio → object interaction → **AI** → game logic → rendering upgrades.
-
-Everything through object interaction is in place. Audio is where the bulk of current effort goes. **AI is the next major phase and has not begun** — it is the single biggest gap between what this is (a simulated, audible world) and a game. Game logic and rendering upgrades follow it.
-
----
+Testing is currently being done with Thief 2. I will back port this to Thief 1. I am currently unsure if I will be able to easily adopt SS2.
 
 ## Prerequisites
 
@@ -97,7 +78,7 @@ This produces two binaries:
 | `linux-x64` | Linux | Debug build |
 | `windows-x64` | Windows | Debug build |
 
-Day-to-day development happens on macOS. Linux and Windows are supported targets but are exercised far less often.
+Day-to-day development happens on macOS. Linux and Windows are supported targets but currently not tested at all.
 
 ### Tests
 
@@ -303,7 +284,7 @@ Layout:
 - `tests/` — Catch2 suite
 - `tools/` — performance sweep and audio-artifact analysis scripts
 
-The engine is a service stack (`ServiceManager` singletons: database, property, link, object, inherit, physics, room, audio, sim, loop) driven by a frame loop, with the renderer built as header-only modules on top. Subsystems talk through interfaces — `IWorldQuery` for read-only world access, `IPhysicsWorld` for collision — rather than reaching into each other, so they can be replaced independently. That boundary discipline is the point of the design: it's what makes a pluggable AI stack possible later.
+The engine is a service stack (`ServiceManager` singletons: database, property, link, object, inherit, physics, room, audio, sim, loop) driven by a frame loop, with the renderer built as header-only modules on top. Subsystems talk through interfaces — `IWorldQuery` for read-only world access, `IPhysicsWorld` for collision — rather than reaching into each other, so they can be replaced independently. As much as possible, boundary discipline motivates the design.
 
 ## Thanks
 
