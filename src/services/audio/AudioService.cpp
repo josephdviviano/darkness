@@ -16170,10 +16170,31 @@ void AudioService::verifyPathingBakeParity()
         std::map<int, int> compSize;
         for (size_t i = 0; i < positions.size(); ++i)
             ++compSize[find(static_cast<int>(i))];
-        int comps = 0, biggest = 0;
+        int comps = 0, biggest = 0, singletons = 0;
+        std::vector<int> sizes;
         for (const auto &kv : compSize) {
             ++comps;
             biggest = std::max(biggest, kv.second);
+            if (kv.second == 1) ++singletons;
+            sizes.push_back(kv.second);
+        }
+        // Size histogram of the non-giant components: a 1-probe island is
+        // a containment-only probe (serves influence attachment, carries
+        // no route — usually benign); a multi-probe island is a cluster
+        // routes genuinely cannot leave — the fragmentation that matters.
+        std::sort(sizes.rbegin(), sizes.rend());
+        {
+            std::string tail;
+            char buf[16];
+            for (size_t i = 1; i < sizes.size() && i <= 8; ++i) {
+                std::snprintf(buf, sizeof(buf), "%s%d",
+                              i > 1 ? "," : "", sizes[i]);
+                tail += buf;
+            }
+            std::fprintf(stderr,
+                "[REGION_PARITY] component sizes: biggest=%d, next=[%s], "
+                "singletons=%d of %d components\n",
+                biggest, tail.c_str(), singletons, comps);
         }
         std::fprintf(stderr,
             "[REGION_PARITY] apertures checked=%d connected=%d MISSING=%d "
@@ -17931,22 +17952,41 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                         //     TRIGGER a probe. Floor-chasing was the +152
                         //     probes / 72-room over-fire on MISS2 (vs the 3
                         //     genuine hub rooms 18/22/380).
-                        //   • bestFt != kInf — an occlusion-unreachable point
-                        //     (every anchor walled off from it) cannot be
-                        //     covered by ANY probe, so it must not drive an
-                        //     addition. kInf is always > rCovFt, so before this
-                        //     guard it was selected as `far` in 69/72 MISS2
-                        //     rooms whose worst REACHABLE demand was already
-                        //     under R_cov — a probe added, then marked stuck.
-                        //     Such demand is left to the clamp ceiling and
-                        //     graded by [BAKE_PARITY] (governingUnreachable).
+                        //   • kInf handling is SPLIT by demand kind. Floor
+                        //     demand at kInf never drives (the §14 over-fire:
+                        //     69/72 rooms chased walled-off floor points).
+                        //     PORTAL demand at kInf DOES drive one placement
+                        //     attempt: an aperture no anchor can see is a
+                        //     real opening routes cannot attach through —
+                        //     measured on MISS15 (enormous open level), 652
+                        //     such demand points left the graph in 37
+                        //     disconnected components. A new site NEAR the
+                        //     aperture can be visible where distant anchors
+                        //     are not; the stuck logic terminates the chase
+                        //     when no site improves it.
+                        //     Reachable-but-far demand still outranks kInf
+                        //     demand so the §14 behavior is unchanged where
+                        //     coverage is achievable.
                         DemandPoint *far = nullptr;
+                        bool farIsInf = false;
                         for (auto &d : kv.second) {
                             if (d.stuck) continue;
                             if (!d.isPortal) continue;
-                            if (d.bestFt == kInf) continue;
                             if (d.bestFt <= rCovFt) continue;
-                            if (!far || d.bestFt > far->bestFt) far = &d;
+                            const bool dInf = (d.bestFt == kInf);
+                            if (!far) {
+                                far = &d; farIsInf = dInf;
+                                continue;
+                            }
+                            // finite demand outranks kInf demand; within a
+                            // class, farther first (Gonzalez order).
+                            if (farIsInf != dInf) {
+                                if (farIsInf && !dInf) {
+                                    far = &d; farIsInf = false;
+                                }
+                                continue;
+                            }
+                            if (!dInf && d.bestFt > far->bestFt) far = &d;
                         }
                         if (!far) break;  // all portals covered (or stuck)
 
@@ -18055,6 +18095,167 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                             rid, added, worstBeforeFt, worstAfterFt,
                             rCovFt, kv.second.size(), sites.size(),
                             residualInf);
+                    }
+
+                    // ── Intra-region connectivity stitching ─────────────
+                    // §38c's second half: coverage puts an anchor within
+                    // R_cov of every reachable demand point, but nothing
+                    // above guarantees the region's anchors can SEE each
+                    // other — in a large open interior (MISS15's halls)
+                    // probe clusters form islands and routes die between
+                    // them (measured: 37 graph components on MISS15 where
+                    // the level is one connected volume). Union the
+                    // region's anchors by proven-clear rays, then bridge
+                    // components with stepping-stone probes at floor sites
+                    // near the closest cross-component gap, re-raying as
+                    // each stone lands. Budget shares the per-region cap;
+                    // exhaustion is loud and region parity grades the rest.
+                    if (anchors.size() >= 2 && rcFill) {
+                        const float stitchCapSq =
+                            kPathingCoverageVisRangeMaxFt
+                            * kPathingCoverageVisRangeMaxFt;
+                        std::vector<int> aParent(anchors.size());
+                        auto aFind = [&](int x) {
+                            while (aParent[static_cast<size_t>(x)] != x) {
+                                aParent[static_cast<size_t>(x)] =
+                                    aParent[static_cast<size_t>(
+                                        aParent[static_cast<size_t>(x)])];
+                                x = aParent[static_cast<size_t>(x)];
+                            }
+                            return x;
+                        };
+                        auto aUnite = [&](int a, int b) {
+                            a = aFind(a); b = aFind(b);
+                            if (a != b) aParent[static_cast<size_t>(a)] = b;
+                        };
+                        auto rebuildUF = [&]() {
+                            aParent.resize(anchors.size());
+                            for (size_t i = 0; i < anchors.size(); ++i)
+                                aParent[i] = static_cast<int>(i);
+                            for (size_t i = 0; i < anchors.size(); ++i) {
+                                for (size_t j = i + 1; j < anchors.size();
+                                     ++j) {
+                                    const Vector3 dv = anchors[j]
+                                                     - anchors[i];
+                                    if (glm::dot(dv, dv) > stitchCapSq)
+                                        continue;
+                                    if (aFind(static_cast<int>(i))
+                                            == aFind(static_cast<int>(j)))
+                                        continue;
+                                    if (!blockedRay(anchors[i], anchors[j]))
+                                        aUnite(static_cast<int>(i),
+                                               static_cast<int>(j));
+                                }
+                            }
+                            std::set<int> roots;
+                            for (size_t i = 0; i < anchors.size(); ++i)
+                                roots.insert(aFind(static_cast<int>(i)));
+                            return static_cast<int>(roots.size());
+                        };
+                        int comps = rebuildUF();
+                        int stitched = 0;
+                        while (comps > 1
+                               && added < kPathingHubFillMaxPerRoom) {
+                            // Closest cross-component anchor pair.
+                            int   bi = -1, bj = -1;
+                            float bSq = std::numeric_limits<float>::max();
+                            for (size_t i = 0; i < anchors.size(); ++i) {
+                                for (size_t j = i + 1; j < anchors.size();
+                                     ++j) {
+                                    if (aFind(static_cast<int>(i))
+                                            == aFind(static_cast<int>(j)))
+                                        continue;
+                                    const Vector3 dv = anchors[j]
+                                                     - anchors[i];
+                                    const float dsq = glm::dot(dv, dv);
+                                    if (dsq < bSq) {
+                                        bSq = dsq;
+                                        bi = static_cast<int>(i);
+                                        bj = static_cast<int>(j);
+                                    }
+                                }
+                            }
+                            if (bi < 0) break;
+                            const Vector3 mid =
+                                (anchors[static_cast<size_t>(bi)]
+                                 + anchors[static_cast<size_t>(bj)]) * 0.5f;
+                            // Nearest usable site to the gap midpoint.
+                            int   sSite = -1;
+                            float sSq   = std::numeric_limits<float>::max();
+                            for (size_t si = 0; si < sites.size(); ++si) {
+                                if (siteUsed[si]) continue;
+                                if (insideDoorAABB(sites[si]) >= 0) continue;
+                                bool stacked = false;
+                                for (const Vector3 &a : anchors) {
+                                    const Vector3 av = sites[si] - a;
+                                    if (glm::dot(av, av)
+                                            < kSiteMinSeparationSq) {
+                                        stacked = true;
+                                        break;
+                                    }
+                                }
+                                if (stacked) continue;
+                                const Vector3 dv = sites[si] - mid;
+                                const float dsq = glm::dot(dv, dv);
+                                if (dsq < sSq) {
+                                    sSq = dsq;
+                                    sSite = static_cast<int>(si);
+                                }
+                            }
+                            if (sSite < 0) {
+                                std::fprintf(stderr,
+                                    "[FALLBACK] pathing connectivity "
+                                    "stitch: region %d still has %d anchor "
+                                    "components but no usable site remains "
+                                    "near the closest gap (%.0f ft) — "
+                                    "region parity grades the rest\n",
+                                    rid, comps, std::sqrt(bSq));
+                                break;
+                            }
+                            siteUsed[static_cast<size_t>(sSite)] = 1;
+                            const Vector3 stonePos =
+                                sites[static_cast<size_t>(sSite)];
+                            PathingProbeCandidate stone;
+                            stone.position = stonePos;
+                            stone.radiusFt = 5.0f;  // adaptive pass overrides
+                            stone.purpose  = PathingProbePurpose::HubFill;
+                            params.pathingCandidates.push_back(stone);
+                            anchors.push_back(stonePos);
+                            ++added;
+                            ++fillProbesTotal;
+                            ++stitched;
+                            const int newComps = rebuildUF();
+                            if (newComps >= comps) {
+                                // The stone did not merge anything (blocked
+                                // from both sides). Keep it — it may serve
+                                // containment — but stop chasing this gap
+                                // to avoid stone-spam along one wall.
+                                std::fprintf(stderr,
+                                    "[FALLBACK] pathing connectivity "
+                                    "stitch: region %d stone at "
+                                    "(%.1f,%.1f,%.1f) merged nothing "
+                                    "(components %d); stopping — region "
+                                    "parity grades the rest\n",
+                                    rid, stonePos.x, stonePos.y, stonePos.z,
+                                    newComps);
+                                break;
+                            }
+                            comps = newComps;
+                        }
+                        if (stitched > 0) {
+                            std::fprintf(stderr,
+                                "[PATHING_STITCH] region %d: +%d stepping-"
+                                "stone probes, anchor components -> %d\n",
+                                rid, stitched, comps);
+                        }
+                        if (comps > 1
+                            && added >= kPathingHubFillMaxPerRoom) {
+                            std::fprintf(stderr,
+                                "[FALLBACK] pathing connectivity stitch: "
+                                "region %d hit the per-region cap with %d "
+                                "anchor components remaining\n",
+                                rid, comps);
+                        }
                     }
                 }
 
