@@ -60,7 +60,7 @@ enum SchemaFlags : uint32_t {
     SCH_NET_AMBIENT    = 1 << 8,   // Broadcast ambient over network
     SCH_LOC_SPATIAL    = 1 << 9,   // Local-only spatial sound
     SCH_SHARP_FALLOFF  = 1 << 12,  // Steeper (4th-power) distance attenuation curve.
-                                   // Matches original engine's SFXFLG_SHARP — sounds
+                                   // Matches the original engine's 'sharp' falloff flag — sounds
                                    // tagged with this stay near full volume for most
                                    // of their radius and drop quickly near the edge,
                                    // versus the default linear-in-centibels falloff.
@@ -84,7 +84,7 @@ struct SchemaPlayParams {
     //
     // Why: the original Dark Engine stores schema play params in
     // P$SchPlayPa, whose dtype defaults the `flags` field to 0x7F00.
-    // 0x7F00 sets bits 8–14, including bit 12 (SFXFLG_SHARP). So a
+    // 0x7F00 sets bits 8–14, including bit 12 (the 'sharp' falloff flag). So a
     // schema with no explicit P$SchPlayPa record — or with no `flags`
     // directive in its .sch source — gets SHARP falloff by default.
     //

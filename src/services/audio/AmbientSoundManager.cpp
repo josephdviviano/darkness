@@ -125,7 +125,7 @@ void AmbientSoundManager::loadAmbientSounds()
         amb.position = mHost->mObjectService->position(objID);
 
         // Per-schema falloff params. SHARP is the engine's default for ambients
-        // (P$SchPlayPa dtype default 0x7F00 includes bit 12 = SFXFLG_SHARP);
+        // (P$SchPlayPa dtype default 0x7F00 includes bit 12, 'sharp' falloff);
         // schemas opt out via an explicit `flags` directive that clears it.
         if (mHost->mSchemaParser) {
             if (const SchemaEntry *sch = mHost->mSchemaParser->findSchema(amb.schemaName)) {
@@ -277,8 +277,8 @@ void AmbientSoundManager::updateAmbientVolumes()
             if (justCreated) {
                 // Per-source BFS-termination distance, matching the original
                 // Dark Engine's per-source attenuation:
-                //   SFX_MaxDist(gain) = (5000 + gain) / 55
-                //   m_MaxDistance     = SFX_MaxDist(gain) * atten_factor
+                //   max_dist(gain)   = (5000 + gain) / 55
+                //   effective maxDist = max_dist(gain) * atten_factor
                 // The implicit phantom-portal filter: a -3000cB ambient with
                 // atten_factor=1.0 gets ~36 ft, so BFS exhausts before
                 // reaching distant listeners through phantom chains.

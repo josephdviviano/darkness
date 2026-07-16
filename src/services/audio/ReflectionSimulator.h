@@ -101,8 +101,10 @@ public:
 
     /// Block until the in-flight iteration (if any) completes. Spin-wait —
     /// the worker thread releases `mRunning` with release ordering at the
-    /// end of each iteration. Direct sim runs inline on the main thread so
-    /// it is never concurrent with this call.
+    /// end of each iteration. NOTE: the DIRECT sim has its own worker
+    /// thread (PR 1b, DirectSimulator) — this call covers ONLY the
+    /// reflection worker; callers mutating shared simulator state must
+    /// also gate on DirectSimulator::waitForCompletion.
     void waitForCompletion();
 
     /// True while `iplSimulatorRunReflections` is iterating.

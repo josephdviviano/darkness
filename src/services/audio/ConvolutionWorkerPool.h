@@ -472,6 +472,10 @@ public:
     /// and produce 0.000-ms percentiles in whichever line runs second.
     void pollPerfPeriodic();
 
+    /// pollPerfPeriodic's 1 Hz throttle anchor (instance state so a
+    /// recreated pool starts fresh).
+    std::chrono::steady_clock::time_point mPerfPollLast{};
+
     /// Bumped by the mix node (AudioService.cpp catastrophic-backlog
     /// branch) when N voice slots were thrown away because workers were
     /// >=2 frames behind. Plain counter; pollPerfPeriodic exchanges to 0
@@ -489,7 +493,9 @@ public:
     /// the global runtime convolution budget; the per-worker ceiling is
     /// ceil(reverbVoices / numWorkers). Safe to call from any thread; the
     /// audio callback reads the value with relaxed ordering each frame.
-    /// Idempotent if called before `init()`.
+    /// SILENT NO-OP if called before `init()` — the cap value is
+    /// DISCARDED, not deferred; initReflectionPipeline must re-apply
+    /// it after init (and does).
     void setPerWorkerSlotCap(int reverbVoices) {
         if (!mWorker) return;
         const int n = mWorker->numWorkers > 0 ? mWorker->numWorkers : 1;
