@@ -761,6 +761,134 @@ static void printWRPortals(const std::string &misPath) {
                 wr.numCells, portalCount, degenerate, badTgt);
 }
 
+// `wr_cells` dumps raw WR cell geometry — vertices, every polygon (SOLID and
+// PORTAL alike) with its plane — so aperture discriminators can be prototyped
+// OFFLINE against real geometry instead of guessed in C++.
+//
+// WHY THIS EXISTS, and why it dumps geometry rather than a verdict: the survey
+// in `wr_portals` established that a WR portal measures a real aperture
+// exactly (a Thief doorway reads inradius 2.00 ft), but that portal SIZE
+// cannot tell an aperture from a convex-decomposition splitting plane — the
+// size distribution is a dense monotone continuum, not bimodal, and 45.7% of
+// all portals are sub-1-ft splitting slivers. So a size threshold is not a
+// discriminator, and the honest test is instead about what RIMS the portal:
+//
+//   a DOORWAY's portal is a hole cut in a SOLID surface — the wall around the
+//   opening lies (roughly) COPLANAR with the portal and continues past its rim.
+//   a SPLITTING PLANE's portal spans the full cross-section of an open volume —
+//   its plane continues into MORE AIR, never into a coplanar solid surface.
+//
+// NOTE the naive form of that test does NOT work, which is exactly why this
+// dumps geometry: "are the portal's edges shared with SOLID faces of the same
+// cell" reads TRUE for a courtyard splitting plane too, because its edges are
+// shared with the courtyard's own floor, ceiling and side walls. The
+// discriminating question is about COPLANAR solid beyond the rim, not about
+// the rim's neighbours within the cell. Settling that needs experimentation
+// over real geometry, so the instrument emits facts and takes no position.
+//
+// Records (space-separated, one per line):
+//   WRCELL <cellIdx> <numPolys> <numPortals> <numVerts> <cx> <cy> <cz> <radius>
+//       numPortals = the count of TRAILING polygons that are portals; the
+//       first (numPolys - numPortals) are solid. Same slicing raycastWorld
+//       uses (RayCaster.h).
+//   WRVERT <cellIdx> <vertIdx> <x> <y> <z>
+//   WRPOLY <cellIdx> <polyIdx> <isPortal> <tgtCell> <nx> <ny> <nz> <planeD>
+//          <numIdx> <i0> <i1> ...
+//       isPortal: 1 for the trailing portal polygons, 0 for solid.
+//       tgtCell: neighbour cell for portals, -1 for solid / out-of-network.
+//       (nx,ny,nz,planeD) = the polygon's plane straight from the cell's plane
+//       table (WRPolygon.plane indexes it), so coplanarity tests are EXACT
+//       rather than re-derived from vertices. planeIdx is cell-local, so
+//       CROSS-CELL comparison must use the plane equation, not the index.
+//       <i0..> index this cell's WRVERT list.
+//   WRCELLS_SUMMARY cells=<n> polys=<m> portals=<k> solid=<s> bad_plane=<x>
+//       bad_idx=<y>
+//
+// Service-less, like wr_portals: parseWRChunk reads the .mis directly.
+static void printWRCells(const std::string &misPath) {
+    Darkness::WRParsedData wr;
+    try {
+        wr = Darkness::parseWRChunk(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr,
+            "wr_cells: failed to parse WR chunk in '%s': %s\n",
+            misPath.c_str(), e.what());
+        return;
+    }
+    if (wr.numCells == 0) {
+        std::fprintf(stderr,
+            "wr_cells: '%s' has 0 WR cells — nothing to dump\n",
+            misPath.c_str());
+        return;
+    }
+
+    int polyCount = 0, portalCount = 0, solidCount = 0;
+    int badPlane = 0, badIdx = 0;
+
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        const auto &cell = wr.cells[ci];
+        std::printf("WRCELL %u %u %u %zu %.3f %.3f %.3f %.3f\n",
+                    ci, static_cast<uint32_t>(cell.numPolygons),
+                    static_cast<uint32_t>(cell.numPortals),
+                    cell.vertices.size(),
+                    cell.center.x, cell.center.y, cell.center.z, cell.radius);
+
+        for (size_t v = 0; v < cell.vertices.size(); ++v) {
+            std::printf("WRVERT %u %zu %.3f %.3f %.3f\n",
+                        ci, v, cell.vertices[v].x, cell.vertices[v].y,
+                        cell.vertices[v].z);
+        }
+
+        // Portals are the LAST numPortals polygons (RayCaster.h's slicing).
+        const int numSolid = static_cast<int>(cell.numPolygons)
+                           - static_cast<int>(cell.numPortals);
+        for (size_t pi = 0; pi < cell.polyIndices.size(); ++pi) {
+            const bool isPortal = static_cast<int>(pi) >= numSolid;
+            if (isPortal) ++portalCount; else ++solidCount;
+            ++polyCount;
+
+            // Plane straight from the cell's table. A bad index is reported
+            // as a zero plane rather than skipped, so the record count still
+            // matches numPolygons and the summary stays reconcilable.
+            Vector3 n(0.0f, 0.0f, 0.0f);
+            float pd = 0.0f;
+            if (pi < cell.polygons.size()) {
+                const uint8_t plIdx = cell.polygons[pi].plane;
+                if (plIdx < cell.planes.size()) {
+                    n = cell.planes[plIdx].normal;
+                    pd = cell.planes[plIdx].d;
+                } else {
+                    ++badPlane;
+                }
+            } else {
+                ++badPlane;
+            }
+
+            int32_t tgt = -1;
+            if (isPortal && pi < cell.polygons.size()) {
+                tgt = static_cast<int32_t>(cell.polygons[pi].tgtCell);
+                if (tgt < 0 || tgt >= static_cast<int32_t>(wr.numCells))
+                    tgt = -1;
+            }
+
+            const auto &idx = cell.polyIndices[pi];
+            std::printf("WRPOLY %u %zu %d %d %.6f %.6f %.6f %.6f %zu",
+                        ci, pi, isPortal ? 1 : 0, tgt, n.x, n.y, n.z, pd,
+                        idx.size());
+            for (size_t k = 0; k < idx.size(); ++k) {
+                if (idx[k] >= cell.vertices.size()) ++badIdx;
+                std::printf(" %u", static_cast<uint32_t>(idx[k]));
+            }
+            std::printf("\n");
+        }
+    }
+
+    std::printf("WRCELLS_SUMMARY cells=%u polys=%d portals=%d solid=%d "
+                "bad_plane=%d bad_idx=%d\n",
+                wr.numCells, polyCount, portalCount, solidCount,
+                badPlane, badIdx);
+}
+
 // ---------- Ambient sound dump ----------
 //
 // `ambients` lists every object with a P$AmbientHa property: schema name,
@@ -2979,6 +3107,12 @@ static void printUsage(const char *prog) {
     std::cerr << "                    ROOM_DB portals — designer box boundaries — these are" << std::endl;
     std::cerr << "                    compiled from the real geometry, so an aperture's size" << std::endl;
     std::cerr << "                    is the opening's true size. Needs no services." << std::endl;
+    std::cerr << "  wr_cells          Dump raw WR cell geometry as machine-readable WRCELL /" << std::endl;
+    std::cerr << "                    WRVERT / WRPOLY lines (vertices, and EVERY polygon —" << std::endl;
+    std::cerr << "                    solid and portal — with its exact plane). For prototyping" << std::endl;
+    std::cerr << "                    aperture discriminators offline: portal SIZE cannot tell a" << std::endl;
+    std::cerr << "                    real opening from a convex-decomposition splitting plane," << std::endl;
+    std::cerr << "                    so the test must look at what rims it. Needs no services." << std::endl;
     std::cerr << "  trace-path <src> <dst> [maxDist]" << std::endl;
     std::cerr << "                    Trace BFS through the portal graph from src room to dst" << std::endl;
     std::cerr << "                    room. Per-hop detail (segmentDist, cumEff, doorBlocking)." << std::endl;
@@ -3207,6 +3341,10 @@ int main(int argc, char *argv[]) {
             // WR cells carry their own geometry — no ROOM_DB involved. That is
             // the whole point of the verb (see printWRPortals).
             printWRPortals(dbFile);
+        } else if (command == "wr_cells") {
+            // Service-less for the same reason as wr_portals: raw cell
+            // geometry comes straight out of the WR chunk.
+            printWRCells(dbFile);
         } else if (command == "sound_db") {
             // sound_db: walks the schema directory; optionally applies
             // P$SchAttFac/SchPlayPa overrides from dbFile when present.
