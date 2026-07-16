@@ -100,14 +100,13 @@ struct WorldApertureRecord {
     int regionA = -1;
     int regionB = -1;
 
-    /// Identity of the PHYSICAL opening. A doorway's frame is its own chain
-    /// of thin WR cells, so one opening appears as several same-size portal
-    /// polygons (measured: median 2 per door); all of them — and every
-    /// ROOM_DB portal matching any of them — share one key. "One aperture,
-    /// one probe (or door pair)" dedups on this, replacing the old geometric
-    /// same-opening heuristics with an identity. Composed from the match
-    /// union root AND the region pair, so two distinct openings caught in
-    /// one match ball (different region pairs) keep distinct keys.
+    /// COARSE identity of the physical opening — resolved region pair +
+    /// 8-ft-quantized centroid cell. Suitable for DIAGNOSTIC dedup only
+    /// (e.g. [REGION_PARITY]'s per-opening count); grid-boundary
+    /// imprecision means two emissions of one opening could straddle a
+    /// cell edge, so EMISSION dedups with an exact distance test on
+    /// (regionA, regionB, wrCentroid) instead — see the claim map in
+    /// prepareProbeBakeParams.
     uint64_t apertureKey = 0;
 };
 

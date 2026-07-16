@@ -316,7 +316,6 @@ buildWRAcousticTopology(const WRParsedData &wr, RoomService &roomSvc)
         std::vector<int> matched;
     };
     std::vector<RdbMatch> matches;
-    UnionFind apertureUF(portals.size());
     std::vector<char> isCut(portals.size(), 0);
     {
         std::vector<int> hits;
@@ -350,10 +349,7 @@ buildWRAcousticTopology(const WRParsedData &wr, RoomService &roomSvc)
                 Room *far = portal->getFarRoom();
                 m.roomB = far ? static_cast<int>(far->getRoomID()) : -1;
                 m.matched = hits;
-                for (int h : hits) {
-                    isCut[static_cast<size_t>(h)] = 1;
-                    apertureUF.unite(hits[0], h);
-                }
+                for (int h : hits) isCut[static_cast<size_t>(h)] = 1;
                 matches.push_back(std::move(m));
             }
         }
@@ -408,52 +404,50 @@ buildWRAcousticTopology(const WRParsedData &wr, RoomService &roomSvc)
     // record is dropped LOUDLY below.
     const WRCellLocator locator(wr);
     constexpr float kNudgeFt = 0.25f;
-    // Region size census (once): the side-resolution test below asks "does
-    // this region own cells beyond the frame", which needs totals.
-    std::vector<int> regionSize(static_cast<size_t>(out.data.numRegions), 0);
-    for (uint32_t c = 0; c < wr.numCells; ++c)
-        ++regionSize[static_cast<size_t>(out.cellRegion[c])];
+    // GLOBAL cut-portal adjacency + per-cell incident-cut count, for side
+    // resolution. Built from ALL matches' cuts, not per-match: a door's
+    // 5-ft ball routinely misses members of its own frame chain (they were
+    // cut by NEIGHBORING matches), and a per-match walk then stopped inside
+    // the frame and reported a slab region as a "side" — which is how the
+    // same doorway re-emitted as several spurious openings (measured on
+    // MISS7 door 36: three probes stacked in one doorway).
+    std::map<uint32_t, std::vector<uint32_t>> cutAdj;
+    std::map<uint32_t, int> cutCount;   // incident cut portals per cell
+    for (size_t pi = 0; pi < portals.size(); ++pi) {
+        if (!isCut[pi]) continue;
+        const WRPortalPoly &p = portals[pi];
+        cutAdj[p.cellA].push_back(p.cellB);
+        cutAdj[p.cellB].push_back(p.cellA);
+        ++cutCount[p.cellA];
+        ++cutCount[p.cellB];
+    }
+    // Resolve a starting cell to its TRUE side region: keep crossing cut
+    // portals while the current cell is a PASS-THROUGH (>= 2 incident cut
+    // portals — a frame slab has a cut face front AND back); stop at the
+    // first cell that is not (a 1-cut-portal cell is a genuine terminus:
+    // a room whose only cut is its own door). Threshold-free and local.
+    // KNOWN APPROXIMATION: a 1-cell room whose single cell touches two
+    // doorways reads as pass-through and resolves through — acoustically
+    // it IS mostly a pass-through, and both doors' flank influence covers
+    // it. Walk budget 64 cells (frame chains are a handful).
+    auto resolveSide = [&](uint32_t start) -> int32_t {
+        std::set<uint32_t> seen{start};
+        std::vector<uint32_t> q{start};
+        int budget = 64;
+        while (!q.empty() && budget-- > 0) {
+            const uint32_t c = q.back();
+            q.pop_back();
+            auto cc = cutCount.find(c);
+            if (cc == cutCount.end() || cc->second < 2)
+                return out.cellRegion[c];       // terminus: a true side
+            auto it = cutAdj.find(c);
+            if (it == cutAdj.end()) continue;
+            for (uint32_t n : it->second)
+                if (seen.insert(n).second) q.push_back(n);
+        }
+        return out.cellRegion[start];   // fully-framed pocket: keep raw
+    };
     for (const RdbMatch &m : matches) {
-        // Frame cell set = every cell any matched portal touches.
-        std::set<uint32_t> frameCells;
-        for (int h : m.matched) {
-            frameCells.insert(portals[static_cast<size_t>(h)].cellA);
-            frameCells.insert(portals[static_cast<size_t>(h)].cellB);
-        }
-        // Cut adjacency restricted to this match, for the frame walk.
-        std::map<uint32_t, std::vector<uint32_t>> frameAdj;
-        for (int h : m.matched) {
-            const WRPortalPoly &p = portals[static_cast<size_t>(h)];
-            frameAdj[p.cellA].push_back(p.cellB);
-            frameAdj[p.cellB].push_back(p.cellA);
-        }
-        // Does this region own any cell OUTSIDE the frame set? Frame
-        // singleton regions do not; true side regions do.
-        std::map<int32_t, int> frameCellsInRegion;
-        for (uint32_t c : frameCells) ++frameCellsInRegion[out.cellRegion[c]];
-        auto isTrueSide = [&](int32_t r) {
-            return regionSize[static_cast<size_t>(r)]
-                 > frameCellsInRegion[r];
-        };
-        // Resolve a starting cell to its TRUE side region: BFS through the
-        // frame (crossing only this match's cut portals) until a cell whose
-        // region owns cells beyond the frame. Frame chains are a handful of
-        // cells, so this is tiny.
-        auto resolveSide = [&](uint32_t start) -> int32_t {
-            std::set<uint32_t> seen{start};
-            std::vector<uint32_t> q{start};
-            while (!q.empty()) {
-                const uint32_t c = q.back();
-                q.pop_back();
-                const int32_t r = out.cellRegion[c];
-                if (isTrueSide(r)) return r;
-                auto it = frameAdj.find(c);
-                if (it == frameAdj.end()) continue;
-                for (uint32_t n : it->second)
-                    if (seen.insert(n).second) q.push_back(n);
-            }
-            return out.cellRegion[start];   // fully-framed pocket: keep raw
-        };
 
         std::map<std::pair<int32_t, int32_t>, int> repByPair;
         for (int h : m.matched) {
@@ -480,16 +474,26 @@ buildWRAcousticTopology(const WRParsedData &wr, RoomService &roomSvc)
             rec.roomBID = std::max(m.roomA, m.roomB);
             rec.regionA = out.cellRegion[rep.cellA];
             rec.regionB = out.cellRegion[rep.cellB];
-            // Identity = match-union root x region pair: the union fuses
-            // everything one ball caught, the pair splits genuinely
-            // different openings back apart (see WorldApertureRecord doc).
+            // Identity = resolved region pair + COARSE (8 ft) centroid
+            // cell. Cross-record safe: the same doorway matched through
+            // two different ROOM_DB portals now hashes identically (the
+            // old per-match union root gave it two keys and the claim
+            // dedup missed it). Coarse-grid boundary imprecision is
+            // acceptable here because this key only backs DIAGNOSTIC
+            // dedup ([REGION_PARITY]'s per-opening count) — EMISSION
+            // dedups with an exact distance test on (pair, centroid).
+            const auto q8 = [](float v) -> uint64_t {
+                return static_cast<uint64_t>(
+                    static_cast<int64_t>(std::floor(v / 8.0f)) & 0xFFFF);
+            };
             rec.apertureKey =
                 (static_cast<uint64_t>(
-                     apertureUF.find(kv.second)) << 32)
+                     static_cast<uint32_t>(kv.first.first)) << 48)
                 ^ (static_cast<uint64_t>(
-                       static_cast<uint32_t>(kv.first.first)) << 16)
-                ^ static_cast<uint64_t>(
-                      static_cast<uint32_t>(kv.first.second));
+                       static_cast<uint32_t>(kv.first.second)) << 33)
+                ^ (q8(rep.centroid.x) << 22)
+                ^ (q8(rep.centroid.y) << 11)
+                ^ q8(rep.centroid.z);
 
             bool placed = false;
             for (uint32_t side : {rep.cellA, rep.cellB}) {
