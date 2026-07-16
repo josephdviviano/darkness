@@ -1293,7 +1293,8 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     bool writeOk = writeProbeFile(outputPath, records,
                                   hdrVisRangeFt, hdrNumSamples,
                                   hdrReflRays, hdrReflDedupFt,
-                                  hdrDensity, hdrCoverageFt, hdrRCovFt);
+                                  hdrDensity, hdrCoverageFt, hdrRCovFt,
+                                  kPathingLayoutVersion);
 
     // Position sidecars (one per batch). Failure is non-fatal — overlay
     // just lacks positions until the next bake. Reflection batch carries
@@ -1335,6 +1336,7 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     mBakedPathingDensity    = static_cast<PathingProbeDensity>(hdrDensity);
     mBakedPathingCoverageFt = hdrCoverageFt;
     mBakedPathingRCovFt     = hdrRCovFt;
+    mBakedPathingLayoutVersion = kPathingLayoutVersion;
     mBakedReflectionRays    = static_cast<int>(hdrReflRays);
     mBakedProbeDedupRadiusFt = hdrReflDedupFt;
 
@@ -1490,6 +1492,7 @@ bool ProbeManager::loadProbes(const std::string &probePath,
     // automatic pathing-only re-bake for pre-coverage layouts.
     mBakedPathingCoverageFt = hdr.bakedPathingCoverageFt;
     mBakedPathingRCovFt     = hdr.bakedPathingRCovFt;
+    mBakedPathingLayoutVersion = hdr.bakedPathingLayoutVersion;
     mBakedReflectionRays    = static_cast<int>(hdr.bakedReflectionRays);
     mBakedProbeDedupRadiusFt = hdr.bakedProbeDedupRadiusFt;
 
@@ -1602,6 +1605,7 @@ void ProbeManager::releaseBatches(IPLSimulator reflectionSimulator,
     mBakedPathingDensity = PathingProbeDensity::Unknown;
     mBakedPathingCoverageFt = 0.0f;
     mBakedPathingRCovFt = 0.0f;
+    mBakedPathingLayoutVersion = 0;
     mBakedReflectionRays = 0;
     mBakedProbeDedupRadiusFt = 0.0f;
 

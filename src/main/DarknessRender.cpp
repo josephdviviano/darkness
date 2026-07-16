@@ -57,6 +57,7 @@
 #include "BinMeshParser.h"
 #include "RenderConfig.h"
 #include "RayCaster.h"
+#include "WRAcousticTopology.h"
 #include "DebugConsole.h"
 #include "RoomDebugViz.h"
 
@@ -5537,17 +5538,39 @@ int main(int argc, char *argv[]) {
                 audioSvc->setForcePathingBake(true);
                 state.probeBakePath = probePath;
                 state.probeBakeNeeded = true;
+            } else if (audioSvc->pathingBakeLayoutMismatch()) {
+                // ── [PATHING_BAKE_MISMATCH] probe-LAYOUT generation ──
+                //
+                // The .probes v6 header records which layout algorithm
+                // baked the pathing section. A layout rewrite (e.g. the
+                // portal-first overhaul) changes none of the other
+                // recorded parameters, so without this check a
+                // pre-rewrite cache loads silently and the run keeps the
+                // old probe layout with zero signal. v4/v5 files read
+                // back generation 0 and land here once.
+                std::fprintf(stderr,
+                    "[PATHING_BAKE_MISMATCH] .probes '%s' pathing section "
+                    "was baked by probe-layout generation %u but the "
+                    "running code is generation %u (portal-first) — "
+                    "scheduling an automatic pathing-only re-bake "
+                    "(reflection IRs carried forward).\n",
+                    probePath.c_str(),
+                    audioSvc->getBakedPathingLayoutVersion(),
+                    Darkness::kPathingLayoutVersion);
+                audioSvc->setForcePathingBake(true);
+                state.probeBakePath = probePath;
+                state.probeBakeNeeded = true;
             } else if (audioSvc->pathingBakeDensityMismatch()) {
                 // ── [PATHING_BAKE_MISMATCH] layout-density mismatch ──
                 //
                 // Same policy as the numSamples mismatch above: the
-                // .probes v4 header records the probe LAYOUT density the
-                // pathing section was baked at; it differs from the
-                // active `audio.pathing_probes.density` config. A
-                // baseline cache consumed at bends density silently
-                // lacks the per-portal bend pairs (and vice versa), so
-                // re-bake the pathing section now, loudly, carrying the
-                // reflection IRs forward unchanged.
+                // .probes v4 header records the density knob value the
+                // pathing section was baked at. Under portal-first
+                // placement the knob NO LONGER changes the layout
+                // (retire-or-repurpose is a flagged review decision,
+                // PLAN.PATHING_DESIGN.md §39c), so this re-bake produces
+                // an identical layout — kept only so the header always
+                // reflects the active config.
                 std::fprintf(stderr,
                     "[PATHING_BAKE_MISMATCH] .probes '%s' pathing section "
                     "was baked at layout density '%s' but "
@@ -5637,6 +5660,57 @@ int main(int argc, char *argv[]) {
                     return Darkness::findCameraCell(mission.wrData,
                                                     p.x, p.y, p.z) >= 0;
                 });
+            // Portal-first pathing placement ground truth: which ROOM_DB
+            // portals correspond to a REAL world-geometry opening, where
+            // that opening actually is, and the air-region decomposition.
+            // Built here because the WR data lives renderer-side (same
+            // rationale as the two injections above); consumed by
+            // prepareProbeBakeParams, which runs from the deferred bake
+            // block LATER in startup — so this wiring precedes every bake.
+            {
+                Darkness::RoomServicePtr roomSvcTopo =
+                    GET_SERVICE(Darkness::RoomService);
+                if (roomSvcTopo && roomSvcTopo->isLoaded()) {
+                    Darkness::WRAcousticTopologyResult topo =
+                        Darkness::buildWRAcousticTopology(mission.wrData,
+                                                          *roomSvcTopo);
+                    std::fprintf(stderr,
+                        "[APERTURE_TOPOLOGY] ROOM_DB portals=%d -> real "
+                        "apertures=%zu, fictional=%d, unplaceable=%d; air "
+                        "regions=%d\n",
+                        topo.rdbPortalsTotal, topo.data.apertures.size(),
+                        topo.fictionalPortals, topo.unplaceableCount,
+                        topo.data.numRegions);
+                    // cellRegion + the gridded cell locator are moved
+                    // into the closure — the lambda owns both for the
+                    // mission's lifetime. The locator replaces the
+                    // O(numCells) findCameraCell scan: the bake calls
+                    // this thousands of times (per floor candidate, per
+                    // surviving candidate, per probe in parity), which
+                    // measured out at hundreds of ms of rescanning.
+                    auto cellRegion = std::make_shared<
+                        std::vector<int32_t>>(std::move(topo.cellRegion));
+                    auto locator = std::make_shared<
+                        Darkness::WRCellLocator>(mission.wrData);
+                    audioSvcForRay->setWorldApertureData(
+                        std::move(topo.data),
+                        [locator, cellRegion](const Darkness::Vector3 &p) {
+                            const int32_t cell =
+                                locator->locate(p.x, p.y, p.z);
+                            if (cell < 0 || static_cast<size_t>(cell)
+                                                >= cellRegion->size())
+                                return -1;
+                            return static_cast<int>((*cellRegion)[
+                                static_cast<size_t>(cell)]);
+                        });
+                } else {
+                    std::fprintf(stderr,
+                        "[FALLBACK] aperture topology not built: RoomService "
+                        "%s — the pathing bake cannot run portal-first "
+                        "placement and will refuse loudly\n",
+                        roomSvcTopo ? "not loaded" : "missing");
+                }
+            }
             // loadProbes ran BEFORE setRaycaster (above), so the first
             // pathing-adjacency build attempt was a no-op fallback. Now
             // that the raycaster is wired, rebuild so show_pathing_graph

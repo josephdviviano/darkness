@@ -90,12 +90,14 @@ TEST_CASE("CRC-32 single byte", "[probe][crc]") {
 // ProbeFileHeader layout
 // ════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("ProbeFileHeader is 44 bytes with correct defaults", "[probe][header]") {
+TEST_CASE("ProbeFileHeader is 48 bytes with correct defaults", "[probe][header]") {
     ProbeFileHeader hdr;
-    CHECK(sizeof(hdr) == 44);
+    CHECK(sizeof(hdr) == 48);
     CHECK(hdr.magic == kProbeFileMagic);
     CHECK(hdr.version == kProbeFileVersion);
-    CHECK(hdr.version == 5u);
+    // v6: + bakedPathingLayoutVersion (portal-first layout staleness
+    // signal — a layout rewrite changes none of the other fields).
+    CHECK(hdr.version == 6u);
     CHECK(hdr.batchCount == 0);
     CHECK(hdr.totalProbes == 0);
     CHECK(hdr.bakedPathingVisRangeFt == 0.0f);
@@ -105,6 +107,7 @@ TEST_CASE("ProbeFileHeader is 44 bytes with correct defaults", "[probe][header]"
     CHECK(hdr.bakedPathingDensity == 0);
     CHECK(hdr.bakedPathingCoverageFt == 0.0f);
     CHECK(hdr.bakedPathingRCovFt == 0.0f);
+    CHECK(hdr.bakedPathingLayoutVersion == 0u);
 }
 
 TEST_CASE("ProbeBatchRecordHeader is 16 bytes", "[probe][header]") {
@@ -212,7 +215,72 @@ TEST_CASE("Write + load round-trips v5 bake profile", "[probe][file]") {
     CHECK(hdr.bakedPathingDensity == 0u);
     CHECK(hdr.bakedPathingCoverageFt == 0.0f);
     CHECK(hdr.bakedPathingRCovFt == 0.0f);
+    CHECK(hdr.bakedPathingLayoutVersion == 0u);
 
+    // v6 layout-version round-trip — the staleness signal for probe-layout
+    // rewrites that change none of the other recorded parameters.
+    REQUIRE(writeProbeFile(path, batches, 245.0f, 4u, 2048u, 18.0f,
+                           /*density*/ 2u, /*coverageFt*/ 61.0f,
+                           /*rCovFt*/ 75.0f, /*layoutVersion*/ 1u));
+    CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::Ok);
+    CHECK(hdr.bakedPathingLayoutVersion == 1u);
+
+    std::remove(path.c_str());
+}
+
+TEST_CASE("Legacy v5 file is ACCEPTED with zeroed layout version",
+          "[probe][file]") {
+    // A v5 file is a v6 file minus the 4-byte layout-version tail. The
+    // loader must accept it (batch payloads are format-identical — the
+    // reflection IR blob carries forward across the pathing-only re-bake)
+    // and zero-fill the layout version, which is what makes
+    // AudioService::pathingBakeLayoutMismatch fire the loud automatic
+    // pathing-only re-bake: a v5 layout predates portal-first placement.
+    std::string path = tempPath("legacy_v5");
+
+    auto batches = makeRecords(
+        { { kPurposePathing, {0x0A, 0x0B} } },
+        { 9u });
+
+    // Hand-write the v5 layout: the v6 header's first 44 bytes with
+    // version=5, followed by the standard batch records.
+    {
+        ProbeFileHeader hdr;
+        hdr.version     = kProbeFileVersionV5;
+        hdr.batchCount  = static_cast<uint32_t>(batches.size());
+        hdr.totalProbes = 9;
+        hdr.bakedPathingVisRangeFt  = 123.0f;
+        hdr.bakedPathingNumSamples  = 4u;
+        hdr.bakedPathingDensity     = 2u;
+        hdr.bakedPathingCoverageFt  = 61.0f;
+        hdr.bakedPathingRCovFt      = 75.0f;
+        FILE *f = std::fopen(path.c_str(), "wb");
+        REQUIRE(f != nullptr);
+        REQUIRE(std::fwrite(&hdr, kProbeFileHeaderSizeV5, 1, f) == 1);
+        for (const auto &b : batches) {
+            ProbeBatchRecordHeader rh;
+            rh.purpose     = b.purpose;
+            rh.probeCount  = b.probeCount;
+            rh.payloadSize = static_cast<uint32_t>(b.payload.size());
+            rh.crc32       = crc32(b.payload.data(), b.payload.size());
+            REQUIRE(std::fwrite(&rh, sizeof(rh), 1, f) == 1);
+            REQUIRE(std::fwrite(b.payload.data(), 1, b.payload.size(), f)
+                    == b.payload.size());
+        }
+        std::fclose(f);
+    }
+
+    ProbeFileHeader hdr;
+    std::vector<ProbeBatchRecord> loaded;
+    CHECK(loadProbeFile(path, hdr, loaded) == ProbeFileStatus::Ok);
+    CHECK(hdr.version == kProbeFileVersionV5);
+    CHECK(hdr.bakedPathingVisRangeFt == 123.0f);
+    CHECK(hdr.bakedPathingCoverageFt == 61.0f);
+    CHECK(hdr.bakedPathingRCovFt == 75.0f);
+    // The v6 tail reads back as zero — the layout-mismatch trigger.
+    CHECK(hdr.bakedPathingLayoutVersion == 0u);
+    REQUIRE(loaded.size() == 1);
+    CHECK(loaded[0].payload == batches[0].payload);
     std::remove(path.c_str());
 }
 

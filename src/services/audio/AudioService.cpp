@@ -15225,6 +15225,10 @@ static float sRoomCeilZ(Room *r)  { return sRoomPlaneZ(r, /*ceiling*/ true);  }
 // is emitted for it, and parity legitimately excludes it. One constant so
 // the two passes cannot drift (drift = phantom MISSING pairs).
 static constexpr float kPathingSkyThresholdFt = 30.0f;
+// Door pair-probe offset along the portal normal — file-static because
+// the emission pass AND [REGION_PARITY]'s virtual door edges must agree
+// on the flank distance (a drift would silently mis-grade doors).
+static constexpr float kPathingPairProbeOffsetFt = 5.0f;
 
 // Door-portal classification distance, shared by the emission pass
 // (DoorPair vs Portal/PortalPair split) and verifyPathingBakeParity
@@ -15992,8 +15996,15 @@ void AudioService::verifyPathingBakeParity()
     }
 
     // Summary — unconditional, stderr, machine-greppable.
+    // NOTE the basis: ROOM_DB adjacency. Under the portal-first layout this
+    // grading is INFORMATIONAL, not authoritative — ROOM_DB is the original
+    // engine's dampening partition and is wrong in BOTH directions as a
+    // propagation scoreboard (it demands sound cross fictional boundaries,
+    // and it is silent where it blocked sound that physically carries —
+    // PLAN.PATHING_DESIGN.md §34a). [REGION_PARITY] below is authoritative.
     std::fprintf(stderr,
-        "[BAKE_PARITY] ROOM_DB pairs checked=%d connected=%d (direct=%d "
+        "[BAKE_PARITY] (informational — ROOM_DB basis) pairs checked=%d "
+        "connected=%d (direct=%d "
         "indirect=%d) missing=%d (zero-probe-room=%d) "
         "missing_door_adjacent=%d sky_excluded=%d "
         "| proxy: debug adjacency (1 center ray/pair, visRange=%.0f ft, "
@@ -16001,6 +16012,182 @@ void AudioService::verifyPathingBakeParity()
         pairsChecked, direct + indirect, direct, indirect, missing,
         zeroProbePairs, missingDoorAdjacent, skyExcluded,
         adj.visRangeFt, adj.edges.size());
+
+    // ── [REGION_PARITY] — the AUTHORITATIVE scoreboard ──────────────────
+    //
+    // Grades against PHYSICAL connectivity (user north star, §34a): every
+    // real aperture joins two air regions, and the probe graph must let
+    // sound cross it. Asked per unique physical opening (apertureKey),
+    // on the same debug-adjacency proxy as above, PLUS virtual door edges:
+    // the baked graph is the all-doors-CLOSED graph (door OBBs block bake
+    // rays by design), so the two flanks of a door pair are joined here the
+    // way the runtime joins them when the door opens — probes on opposite
+    // sides within flank distance of the same door AABB.
+    if (mWorldApertureData.valid && mRegionOfPointFn) {
+        // Probe -> region (exact cell lookup; -1 = off-network).
+        std::vector<int> probeRegion(positions.size(), -1);
+        std::map<int, std::vector<size_t>> regionProbes;
+        for (size_t i = 0; i < positions.size(); ++i) {
+            probeRegion[i] = mRegionOfPointFn(positions[i]);
+            if (probeRegion[i] >= 0)
+                regionProbes[probeRegion[i]].push_back(i);
+        }
+
+        // Union-find over probes: adjacency edges + virtual door edges.
+        std::vector<int> parent(positions.size());
+        for (size_t i = 0; i < positions.size(); ++i)
+            parent[i] = static_cast<int>(i);
+        std::function<int(int)> find = [&](int x) {
+            while (parent[static_cast<size_t>(x)] != x) {
+                parent[static_cast<size_t>(x)] =
+                    parent[static_cast<size_t>(
+                        parent[static_cast<size_t>(x)])];
+                x = parent[static_cast<size_t>(x)];
+            }
+            return x;
+        };
+        auto unite = [&](int a, int b) {
+            // Same bounds guard as the ROOM_DB parity loop above: a
+            // default-constructed PathingEdge is {-1,-1}, and find(-1)
+            // would index parent[] ~2^64 elements out of range.
+            if (a < 0 || b < 0
+                || a >= static_cast<int>(positions.size())
+                || b >= static_cast<int>(positions.size())) return;
+            a = find(a); b = find(b);
+            if (a != b) parent[static_cast<size_t>(a)] = b;
+        };
+        for (const auto &e : adj.edges)
+            unite(e.a, e.b);
+        // Virtual door edges: pair flanks sit kPairProbeOffsetFt (5 ft)
+        // from the door; the +3 ft slop covers dedup nudges and non-slab
+        // door boxes. SIDE-AWARE: only probes on OPPOSITE sides of the
+        // door leaf are joined (thin-axis sign test, the same idea as the
+        // dedup pass's segmentCrossesAnyDoor) — chaining every nearby
+        // probe regardless of side would let two probes separated by the
+        // WALL beside the door read as connected, and the authoritative
+        // scoreboard would certify apertures the graph cannot actually
+        // cross. Same-side flank redundancy is left to the real adjacency
+        // edges. (doorBoxes: the vector this function already built for
+        // the door-adjacent grading above.)
+        {
+            const float rr = (kPathingPairProbeOffsetFt + 3.0f)
+                           * (kPathingPairProbeOffsetFt + 3.0f);
+            std::vector<int> nearDoor;
+            for (const DoorWorldAABB &b : doorBoxes) {
+                nearDoor.clear();
+                for (size_t i = 0; i < positions.size(); ++i) {
+                    if (sPointAABBDistSq(positions[i], b.mn, b.mx) <= rr)
+                        nearDoor.push_back(static_cast<int>(i));
+                }
+                if (nearDoor.size() < 2) continue;
+                const Vector3 ext = b.mx - b.mn;
+                int thin = 0;
+                if (ext.y < ext.x && ext.y < ext.z)      thin = 1;
+                else if (ext.z < ext.x && ext.z < ext.y) thin = 2;
+                const float c = (b.mn[thin] + b.mx[thin]) * 0.5f;
+                for (size_t x = 0; x < nearDoor.size(); ++x) {
+                    for (size_t y = x + 1; y < nearDoor.size(); ++y) {
+                        const float da =
+                            positions[static_cast<size_t>(nearDoor[x])][thin]
+                            - c;
+                        const float db =
+                            positions[static_cast<size_t>(nearDoor[y])][thin]
+                            - c;
+                        if (da * db < 0.0f)      // opposite sides of the leaf
+                            unite(nearDoor[x], nearDoor[y]);
+                    }
+                }
+            }
+        }
+
+        // One check per unique physical opening that joins two regions.
+        // Sky-filtered portals are excluded the same way placement excluded
+        // them (their records exist — the topology builder has no sky
+        // filter — but placement deliberately emitted nothing there, so
+        // grading them would demand probes the sky filter exists to
+        // prevent). Same test as pass 1: portal center above both rooms'
+        // floors by more than the threshold.
+        auto skyExcludedAperture = [&](const WorldApertureRecord &ap) {
+            Room *ra = mRoomService->getRoomByID(ap.roomAID);
+            Room *rb = mRoomService->getRoomByID(ap.roomBID);
+            if (!ra && !rb) return false;
+            float minBottom = std::numeric_limits<float>::max();
+            if (ra) minBottom = std::min(minBottom, sRoomFloorZ(ra));
+            if (rb) minBottom = std::min(minBottom, sRoomFloorZ(rb));
+            return ap.rdbCenter.z > minBottom + kPathingSkyThresholdFt;
+        };
+        std::set<uint64_t> seenKeys;
+        int apChecked = 0, apConnected = 0, apMissing = 0;
+        int apEmptySide = 0, apSkyExcluded = 0;
+        for (const WorldApertureRecord &ap : mWorldApertureData.apertures) {
+            if (ap.regionA < 0 || ap.regionB < 0
+                || ap.regionA == ap.regionB) continue;
+            if (!seenKeys.insert(ap.apertureKey).second) continue;
+            if (skyExcludedAperture(ap)) {
+                ++apSkyExcluded;
+                continue;
+            }
+            ++apChecked;
+            auto itA = regionProbes.find(ap.regionA);
+            auto itB = regionProbes.find(ap.regionB);
+            if (itA == regionProbes.end() || itB == regionProbes.end()) {
+                // A side with no probe AT ALL is not automatically a
+                // failure — SA attaches by influence containment, and a
+                // door-frame singleton region is covered by the flanks'
+                // spheres. Counted separately; a LARGE empty region is
+                // the coverage fill's zero-site fallback, already loud.
+                ++apEmptySide;
+                continue;
+            }
+            bool connected = false;
+            for (size_t pa : itA->second) {
+                for (size_t pb : itB->second) {
+                    if (find(static_cast<int>(pa))
+                            == find(static_cast<int>(pb))) {
+                        connected = true;
+                        break;
+                    }
+                }
+                if (connected) break;
+            }
+            if (connected) {
+                ++apConnected;
+            } else {
+                ++apMissing;
+                std::fprintf(stderr,
+                    "[REGION_PARITY] MISSING aperture at (%.1f,%.1f,%.1f) "
+                    "(inradius %.2f ft, rooms %d<->%d): regions %d (%zu "
+                    "probes) and %d (%zu probes) share no component even "
+                    "with doors open — a REAL opening the graph cannot "
+                    "cross\n",
+                    ap.wrCentroid.x, ap.wrCentroid.y, ap.wrCentroid.z,
+                    ap.apertureInradiusFt, ap.roomAID, ap.roomBID,
+                    ap.regionA, itA->second.size(),
+                    ap.regionB, itB->second.size());
+            }
+        }
+        // Component census over probes (doors-open view).
+        std::map<int, int> compSize;
+        for (size_t i = 0; i < positions.size(); ++i)
+            ++compSize[find(static_cast<int>(i))];
+        int comps = 0, biggest = 0;
+        for (const auto &kv : compSize) {
+            ++comps;
+            biggest = std::max(biggest, kv.second);
+        }
+        std::fprintf(stderr,
+            "[REGION_PARITY] apertures checked=%d connected=%d MISSING=%d "
+            "empty-side=%d sky_excluded=%d | probes=%zu "
+            "components(doors-open)=%d "
+            "biggest=%d | basis: physical connectivity (WR regions), the "
+            "authoritative scoreboard\n",
+            apChecked, apConnected, apMissing, apEmptySide, apSkyExcluded,
+            positions.size(), comps, biggest);
+    } else {
+        std::fprintf(stderr,
+            "[REGION_PARITY] SKIPPED — no WorldApertureData/region fn "
+            "(headless?); only the informational ROOM_DB parity above ran\n");
+    }
 }
 
 std::vector<AudioService::PathingEdgeViz>
@@ -16182,10 +16369,12 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     // simulator was created with, so bake and runtime cannot diverge
     // within a run (SteamAudioPathing.h owns the constants).
     params.pathingNumSamples     = activePathingVisSamples();
-    // Probe layout density tier (audio.pathing_probes.density). Consumed
-    // by the portal pass below (baseline: single center probe per
-    // non-door portal; bends: flanking PortalPair) and recorded into the
-    // .probes v4 header for the loader's density-mismatch check.
+    // Probe layout density tier (audio.pathing_probes.density). VESTIGIAL
+    // under portal-first placement — the knob no longer changes the layout
+    // (apertures emit one probe, doors one pair, at every density) — but it
+    // is still recorded into the .probes v4 header field, and the loader's
+    // density-mismatch check still fires on a flip. Retire-or-repurpose is
+    // a flagged review decision (PLAN.PATHING_DESIGN.md §39c).
     params.pathingDensity        = mPathingProbeDensity;
     // Forced pathing re-bake (--force-pathing-bake / the automatic v3
     // header-mismatch re-bake) carries the loaded reflection IR section
@@ -16204,65 +16393,43 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     // ring pass have been re-inlined into the pathing-batch block —
     // search for `sRoomFloorZ` above if you need to share or compare.)
 
-    // ── Pathing-batch candidates (sparse ROOM_PORTAL graph) ───────────
+    // ── Pathing-batch candidates (PORTAL-FIRST layout) ─────────────────
     //
     // Pathing density is decoupled from reflection density. Steam Audio's
     // `findAlternatePaths` cost grows fast in probe count when door OBBs
     // invalidate baked edges at runtime; we want this batch as sparse as
-    // we can make it while still covering every room with at least one
-    // graph node and connecting every architectural portal.
+    // we can make it while still giving every REAL opening a graph node
+    // and every air region interior attachment coverage.
     //
-    // Topology (= the original Dark Engine room/portal graph's nodes,
-    // with density tiers — see PathingProbeDensity in ProbeManager.h):
-    //   • Non-door portals, per the density knob
-    //     (audio.pathing_probes.density):
-    //       - baseline: ONE probe AT the centroid, with a generous
-    //         influence radius (~5 ft) so the probe is reached from
-    //         either adjoining room and the path-finder can wrap
-    //         through short corners on its own.
-    //       - bends: TWO probes flanking the portal along
-    //         ±normal × kPairProbeOffsetFt (purpose PortalPair) — the
-    //         same geometry as door pairs, generalized to every
-    //         opening. These are the solver's bend points: with a node
-    //         on each side of the aperture, sound turning a corner
-    //         routes around the opening (probe → aperture → probe)
-    //         instead of being approximated by a single boundary node.
-    //   • Door portals: TWO probes flanking the door OBB (DoorPair) at
-    //     every density — the closed-door OBB must sit between two
-    //     graph nodes so closing the door invalidates the edge.
-    //   • ONE probe per Room centroid, snapped down to (roomFloorZ +
-    //     5 ft) when the centroid sits high in the sky (outdoor cells
-    //     whose geometric center is above the playable ground). Tall
-    //     rooms (> kMaxUpperProbeHeightFt) additionally get one upper
-    //     centroid for vertical propagation.
+    // Topology (PLAN.PATHING_DESIGN.md §36-38 — nodes come from the
+    // world geometry, not from ROOM_DB boxes):
+    //   • REAL apertures (ROOM_DB portals the renderer's WR oracle
+    //     matched to actual world-geometry openings): non-door → ONE
+    //     probe at the aperture's in-air anchor; door → TWO DoorPair
+    //     probes flanking the opening along ±normal, so the closed-door
+    //     OBB sits between two graph nodes and closing the door
+    //     invalidates the edge.
+    //   • FICTIONAL ROOM_DB portals (no aperture): emit NOTHING.
+    //   • Interior coverage: the region-scoped fill near the end of this
+    //     function (Gonzalez k-center over air regions + zero-anchor
+    //     seeding). Room centroids and PortalPair bends are GONE.
     //   • Emitter anchors are appended later — see "Mirror the emitter
     //     positions into the pathing batch" below.
     //   • A 10-ft dedup runs at the end and drops candidates that fall
-    //     within 10 ft of an earlier-emitted one. Emission order matters
-    //     here — portals first (architectural anchors), then centroids
-    //     (room coverage), so a centroid coincident with a nearby portal
-    //     gets dropped rather than the other way around.
+    //     within 10 ft of an earlier-emitted one (portals first, so an
+    //     emitter anchor coincident with an aperture probe loses).
     //
     // One record per surviving (non-sky, non-degenerate, dup-skipped)
-    // portal — input to THREE later passes:
-    //   • thin-room coverage repair (non-door records only), which runs
-    //     AFTER the dedup and the inside-door-AABB rejection (near the
-    //     end of this function) so its coverage check sees the
-    //     candidates that actually SURVIVE;
-    //   • same-room-pair PortalPair de-densification (door records —
-    //     the suppression rule needs each door portal's ROOM PAIR, not
-    //     just its box);
-    //   • the hub-room coverage fill + coverage-based bake-range
-    //     derivation (all records — portals are the coverage demand
-    //     set; PLAN.PATHING_DESIGN.md §10).
-    // Room IDs come from ROOM_DB (authoritative), NOT
-    // roomFromPoint(center): a point exactly on the portal plane
-    // resolves to whichever neighbor wins the tie, so keying repairs on
-    // it filed thin connector rooms under their big neighbors and left
-    // them unrepairable (MISS2 room 194, a 0.6-ft slab between two
-    // aligned portals, kept two loud [BAKE_PARITY] MISSING pairs).
-    // Declared at function scope: filled by the portal-emission block,
-    // consumed by the repair / fill / derivation blocks.
+    // ROOM_DB portal — input to TWO later passes:
+    //   • the emission pass (aperture lookup by portalID, door pairing);
+    //   • the region coverage fill + coverage-based bake-range
+    //     derivation (aperture-carrying records are the routing demand
+    //     set; PLAN.PATHING_DESIGN.md §10/§38c).
+    // Room IDs come from ROOM_DB (authoritative for the informational
+    // room parity), NOT roomFromPoint(center): a point exactly on the
+    // portal plane resolves to whichever neighbor wins the tie.
+    // Declared at function scope: filled by the classification block,
+    // consumed by the emission / fill / derivation blocks.
     struct PathingPortalRecord {
         int roomAID = -1;      ///< ROOM_DB IDs; -1 when absent
         int roomBID = -1;
@@ -16276,24 +16443,68 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         /// boundaries — MISS2 measured ~2.7 portals per door), and each
         /// match used to emit its own dedup-EXEMPT DoorPair, stacking ~5.5
         /// probes in a line through one doorway. Recording the door lets the
-        /// emit pass keep only the closest portal per door.
+        /// emit pass keep one representative record per door
+        /// (aperture-carrying preferred, then nearest to the AABB).
         int   doorIdx    = -1;
         float doorDistSq = 0.0f;
         /// Aperture size: distance from the portal center to its nearest
         /// bounding edge plane = HALF the portal's narrow dimension.
         /// (RoomPortal stores a plane + bounding edge planes, no vertices.)
-        /// Separates a REAL architectural aperture — a 4-6 ft doorway gives
-        /// ~2-3 ft, and the game-wide distribution spikes there (41% of all
-        /// portals) — from a ROOM_DB box boundary standing in open space
-        /// (10 ft+, up to 100 ft on MISS2). Sound diffracts around a real
-        /// jamb, so bend pairs earn their cost there; a box boundary in mid
-        /// air is a fictional aperture and its pair is pure density.
-        /// -1 = no usable edge planes.
+        /// CAUTION — this number is a ROOM_DB reading and ROOM_DB size is
+        /// FICTION: portals reading 6.3 ft here were measured over real
+        /// 1.9-2.8 ft arches (overstated ~2.5x), which is how the old
+        /// >=6 ft "not an aperture" rule silenced three real openings
+        /// (PLAN.PATHING_DESIGN.md §34). Kept for diagnostics only; no
+        /// placement decision may threshold on it.
         float inradiusFt = -1.0f;
+        /// Half-open span [begin, end) into mWorldApertureData.apertures of
+        /// the REAL world-geometry opening(s) this ROOM_DB portal
+        /// corresponds to (one record per true region pair — a match ball
+        /// can span two distinct openings). begin < 0 means the oracle
+        /// found no aperture anywhere near the portal center: this
+        /// "portal" is a designer box boundary standing in open air (or
+        /// buried in solid) and models nothing. That IS the fiction
+        /// verdict; emission skips such records.
+        int apertureBegin = -1;
+        int apertureEnd   = -1;
+        bool hasAperture() const { return apertureBegin >= 0; }
     };
     std::vector<PathingPortalRecord> pathingPortals;
-    if (mProbePathingBatchEnabled && mRoomService) {
+    // Portal-first placement REQUIRES the renderer's aperture/region ground
+    // truth (see WorldApertureData.h). Refuse without it — loudly, and with
+    // no placement fallback: silently reverting to the room-centroid layout
+    // would rebuild exactly the fiction the portal-first design replaces
+    // (probes in mid-air at box boundaries, probes inside solid, per-room
+    // over-production). Headless probe_plan runs land here by design.
+    if (mProbePathingBatchEnabled && !mWorldApertureData.valid) {
+        std::fprintf(stderr,
+            "[FALLBACK] pathing bake: no WorldApertureData (renderer did not "
+            "call setWorldApertureData — headless run?). Portal-first probe "
+            "placement CANNOT run and there is deliberately no room-centroid "
+            "fallback; the pathing batch is skipped for this bake.\n");
+    }
+    if (mProbePathingBatchEnabled && mRoomService
+        && mWorldApertureData.valid) {
         const auto &rooms = mRoomService->getAllRooms();
+
+        // portalID -> aperture-record span. Exact identity (both sides
+        // enumerate RoomService portals through the same back-link dedup),
+        // no geometric assumptions. One portalID can carry SEVERAL records
+        // — a match ball spanning two distinct physical openings emits one
+        // record per true region pair (see WorldApertureRecord) — and the
+        // builder emits a portal's records contiguously, so a span suffices.
+        std::unordered_map<int32_t, std::pair<int, int>> aperturesByPortalID;
+        aperturesByPortalID.reserve(mWorldApertureData.apertures.size());
+        for (size_t ai = 0; ai < mWorldApertureData.apertures.size(); ++ai) {
+            const int32_t pid = mWorldApertureData.apertures[ai].portalID;
+            auto it = aperturesByPortalID.find(pid);
+            if (it == aperturesByPortalID.end()) {
+                aperturesByPortalID[pid] =
+                    {static_cast<int>(ai), static_cast<int>(ai) + 1};
+            } else {
+                it->second.second = static_cast<int>(ai) + 1;
+            }
+        }
 
         // ── Bake-time single-edge visRange cap ────────────────────────
         //
@@ -16318,28 +16529,13 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         // -1 sentinel; if candidate emission dies before reaching it,
         // bakePathingBatch falls back LOUDLY to the whole-level range.
 
-        int roomCount      = 0;
-        int roomSnapped    = 0;
         int portalCount    = 0;
         int portalDup      = 0;
         int portalSky      = 0;
 
-        // Tier 1 ("bends") emits a flanking PortalPair at every NON-door
-        // portal instead of a single center probe; baseline keeps the
-        // single center probe. Doors get their DoorPair at every density.
-        const bool bendsDensity =
-            (mPathingProbeDensity == PathingProbeDensity::Bends);
-
         // Sky filter threshold — file-static kPathingSkyThresholdFt
         // (shared with verifyPathingBakeParity; see its comment).
         constexpr float kSkyThresholdFt = kPathingSkyThresholdFt;
-        // Outdoor-cell skybox snap height: centroid is replaced by
-        // (floorZ + kRoomFloorOffsetFt). 5 ft = player ear height, the
-        // same anchor we use for in-room centroids below so a probe in
-        // an outdoor cell behaves the same as one in any other room
-        // (line-of-sight through doorways at ~7 ft Thief corridor
-        // height).
-        constexpr float kRoomFloorOffsetFt = 5.0f;
         // Door pair-probe offset along the portal normal. Each door
         // contributes one probe `kPairProbeOffsetFt` inside the
         // doorway and one `kPairProbeOffsetFt` outside, so the closed
@@ -16353,7 +16549,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         // probes) is built from acoustic-mesh ray tests, not from
         // sphere overlap. See the long comment in the adaptive
         // radius pass for the full rationale.
-        constexpr float kPairProbeOffsetFt = 5.0f;
+        constexpr float kPairProbeOffsetFt = kPathingPairProbeOffsetFt;
         // Distance below which a portal centroid is classified as
         // "belonging to a door" (door pair-probes emitted instead of a
         // single centroid probe). Measured point-to-door-AABB, NOT to
@@ -16371,32 +16567,24 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         // verifyPathingBakeParity's sky filter replicates this pass's
         // filter from the same code.
 
-        // ── Portal probes (emitted first; sky-filtered, canonical-orient) ─
+        // ── Portal probes (emitted first; sky-filtered) ──────────────────
         //
-        // Three flavors:
-        //   • Non-door portals, baseline density → single probe at the
-        //     centroid. Initial radius is a placeholder; the post-dedup
-        //     adaptive-radius pass overrides it with a Voronoi-overlap
-        //     value. The path-finder reaches it from either adjoining
-        //     room and can wrap around short corners.
-        //   • Non-door portals, bends density → two PortalPair
-        //     probes flanking the opening along ±portal-normal ×
-        //     kPairProbeOffsetFt (the door-pair geometry generalized to
-        //     every portal). A node on each side of the aperture gives
-        //     the path solver an explicit bend point, so sound turning
-        //     a corner takes the audible detour around the opening.
-        //   • Door portals     → two probes flanking the door OBB along
-        //     ±portal-normal × kPairProbeOffsetFt (every density). The
-        //     door OBB lives in the acoustic scene, so every bake-time
-        //     visibility ray scattered between the two probes'
-        //     kPathingVisRadiusFt sampling spheres hits the OBB and the
-        //     visibility test rejects the edge — closing the door
-        //     always invalidates edges that cross it. NOTE: the
-        //     per-probe `influence.radius` (set by the adaptive pass
-        //     below) may overlap across the door; that does not let
-        //     sound bypass the door, because the visibility GRAPH is
-        //     built from acoustic-mesh ray tests, not from
-        //     `influence.radius` overlap.
+        // Two flavors (portal-first — see the emission pass below):
+        //   • Non-door REAL apertures → single probe at the opening's
+        //     in-air anchor. Initial radius is a placeholder; the
+        //     post-dedup adaptive-radius pass overrides it with a
+        //     Voronoi-overlap value.
+        //   • Door apertures → two probes flanking the opening along
+        //     ±portal-normal × kPairProbeOffsetFt. The door OBB lives in
+        //     the acoustic scene, so every bake-time visibility ray
+        //     scattered between the two probes' kPathingVisRadiusFt
+        //     sampling spheres hits the OBB and the visibility test
+        //     rejects the edge — closing the door always invalidates
+        //     edges that cross it. NOTE: the per-probe `influence.radius`
+        //     (set by the adaptive pass below) may overlap across the
+        //     door; that does not let sound bypass the door, because the
+        //     visibility GRAPH is built from acoustic-mesh ray tests, not
+        //     from `influence.radius` overlap.
         //
         // Door classification: door world AABBs come from the shared
         // doorAudioAABBs() helper (cached `mDoorAudioInstances` map,
@@ -16409,24 +16597,14 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                   "door-portal classification\n", doorBoxes.size());
 
         // Pass 1 — CLASSIFY every portal (dup-skip, degenerate-normal
-        // skip, sky filter, door-OBB match) into pathingPortals. Split
-        // from emission because two consumers need the full classified
-        // set before any probe is emitted:
-        //   • the same-room-pair de-densification below needs every DOOR
-        //     portal's room pair to decide which PortalPairs to suppress;
-        //   • the hub-room coverage fill + coverage-based bake-range
-        //     derivation (near the end of this function) use the records
-        //     as the coverage demand set.
-        // Every record is remembered at every density — the thin-room
-        // coverage-repair pass consumes the non-door ones (baseline's
-        // single portal-center probe is NOT a coverage guarantee either:
-        // it sits exactly on the portal plane — roomFromPoint tie often
-        // resolves to a neighbor — and can itself be rejected by the
-        // inside-door pass; MISS2 portal 416's center sits inside door
-        // 1019's AABB). Door portals stay excluded from repair: zero-
-        // probe rooms whose every portal carries a door are inter-door
-        // connector volumes owned by the runtime door-validation path,
-        // graded missing_door_adjacent by [BAKE_PARITY] by design.
+        // skip, sky filter, door-OBB match, aperture lookup) into
+        // pathingPortals. Split from emission because consumers need the
+        // full classified set before any probe is emitted:
+        //   • bestPortalForDoor needs every door record to pick each
+        //     door's representative (aperture-carrying, then nearest);
+        //   • the region coverage fill + coverage-based bake-range
+        //     derivation (near the end of this function) use the
+        //     aperture-carrying records as the routing demand set.
         for (const auto &roomPtr : rooms) {
             if (!roomPtr) continue;
             const uint32_t pc = roomPtr->getPortalCount();
@@ -16492,35 +16670,23 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 rec.doorIdx    = bestDoor;
                 rec.doorDistSq = bestDoorSq;
                 rec.inradiusFt = inradius;
+                {
+                    auto it = aperturesByPortalID.find(portal->getPortalID());
+                    if (it != aperturesByPortalID.end()) {
+                        rec.apertureBegin = it->second.first;
+                        rec.apertureEnd   = it->second.second;
+                    }
+                }
                 pathingPortals.push_back(rec);
             }
         }
 
-        // Same-room-pair PortalPair de-densification threshold
-        // (PLAN.PATHING_DESIGN.md §10 lever 3). A non-door portal within
-        // this distance of a DOOR portal joining the SAME two rooms is
-        // part of the same compound opening (door leaf + sidelight /
-        // arch segments modelled as separate RoomPortal records); the
-        // DoorPair flanks a few feet away already give the solver its
-        // bend anchors for that aperture, so an additional PortalPair
-        // is pure local-density cost — and findAlternatePaths is
-        // quadratic in local density. NEVER applied across DIFFERENT
-        // room pairs (user rule, §10 Q1 discussion): a door and a
-        // nearby genuine other opening (two doorways off one junction)
-        // are distinct routes and both keep their anchors. 12 ft sits
-        // inside the ~10-15 ft window the door-flank geometry implies
-        // (flanks at ±5 ft mean a 12-ft-away portal's pair would land
-        // within ~2-7 ft of the door flanks).
-        constexpr float kSameOpeningSuppressFt = 12.0f;
-        const float kSameOpeningSuppressSq =
-            kSameOpeningSuppressFt * kSameOpeningSuppressFt;
-        // |dot| of the two portal normals required to call them the same
-        // aperture (~25 deg). Parallel-or-antiparallel because RoomPortal
-        // normals face their owning room, so the two sides of one doorway
-        // point opposite ways. This is the guard that keeps a genuinely
-        // different nearby opening (which faces elsewhere) from being
-        // suppressed — distinct routes keep their own bend anchors.
-        constexpr float kSameOpeningParallelDot = 0.9f;
+        // (The old geometric same-opening heuristics — the 12 ft same-
+        // room-pair suppression and the parallel-normal threshold-slab
+        // grouping — are gone: aperture IDENTITY from the WR oracle
+        // (apertureKey) answers "same physical opening?" as a fact, not a
+        // distance-and-angle guess. See the claimed-aperture dedup in the
+        // emission pass below.)
 
         // ONE APERTURE, ONE PAIR — pick the single representative portal
         // for each door before emitting.
@@ -16539,344 +16705,208 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         // portal whose center sits closest to that door's AABB and drop the
         // rest. Portals matching DIFFERENT doors are untouched — two doorways
         // off one junction are distinct routes and each keeps its anchors.
+        //
+        // APERTURE-CARRYING records outrank distance: a record whose ROOM_DB
+        // center the oracle matched knows where the REAL opening is, and the
+        // flanks are placed at that opening. Preferring a (nearer) record
+        // with NO aperture would force the ROOM_DB-center fallback even
+        // though a sibling record of the same door carries the true
+        // position — the exact fiction-position class this design removes.
         std::vector<int> bestPortalForDoor(doorBoxes.size(), -1);
         for (size_t i = 0; i < pathingPortals.size(); ++i) {
             const PathingPortalRecord &r = pathingPortals[i];
             if (r.doorIdx < 0) continue;
             int &best = bestPortalForDoor[static_cast<size_t>(r.doorIdx)];
-            if (best < 0 ||
-                r.doorDistSq < pathingPortals[static_cast<size_t>(best)].doorDistSq)
+            if (best < 0) {
                 best = static_cast<int>(i);
-        }
-
-        // ...and the same rule for DOORLESS apertures, which the per-door
-        // grouping above cannot see.
-        //
-        // Most doorways/archways are modelled with a THRESHOLD SLAB: a ~1 ft
-        // connector room (cf. room 194) whose two faces are two separate
-        // ROOM_DB portals. Measured on MISS2: 47 clusters of emitting portals
-        // within 8 ft of each other, and EVERY one is non-door + non-door in
-        // the A<->T / T<->B pattern (e.g. 37<->341 and 341<->84, 1.0 ft apart,
-        // both 3.67 ft inradius). Both emitted a pair => 4 probes in a
-        // straight line through ONE opening. Doorless, so nothing grouped
-        // them; the door rule above only fires when a door is registered.
-        //
-        // Same-aperture test (geometry, since room identity provably fails —
-        // A<->T and T<->B are different room pairs): close, PARALLEL, and
-        // separated ALONG the normal, i.e. the front and back faces of one
-        // opening. The along-the-normal requirement is what distinguishes
-        // that from two genuinely different openings sitting side by side in
-        // the same wall (parallel and close, but displaced LATERALLY) —
-        // those are distinct routes and each keeps its own anchors.
-        constexpr float kSameApertureFt      = 4.0f;
-        constexpr float kSameApertureAlongMin = 0.7f;  // |cos| of offset vs normal
-        const float kSameApertureSq = kSameApertureFt * kSameApertureFt;
-        std::vector<int> apertureRep(pathingPortals.size(), -1);
-        for (size_t i = 0; i < pathingPortals.size(); ++i) {
-            if (pathingPortals[i].isDoor) continue;      // door rule owns these
-            if (apertureRep[i] >= 0) continue;           // already grouped
-            apertureRep[i] = static_cast<int>(i);        // representative
-            const PathingPortalRecord &a = pathingPortals[i];
-            for (size_t j = i + 1; j < pathingPortals.size(); ++j) {
-                if (pathingPortals[j].isDoor || apertureRep[j] >= 0) continue;
-                const PathingPortalRecord &b = pathingPortals[j];
-                const Vector3 d = b.center - a.center;
-                const float dist2 = glm::dot(d, d);
-                if (dist2 >= kSameApertureSq) continue;
-                if (std::fabs(glm::dot(a.unitNormal, b.unitNormal))
-                        < kSameOpeningParallelDot) continue;
-                const float dist = std::sqrt(dist2);
-                if (dist > 1e-4f) {
-                    const float alongFrac =
-                        std::fabs(glm::dot(d / dist, a.unitNormal));
-                    if (alongFrac < kSameApertureAlongMin) continue;
-                }
-                apertureRep[j] = static_cast<int>(i);    // same opening as i
+                continue;
             }
+            const PathingPortalRecord &b =
+                pathingPortals[static_cast<size_t>(best)];
+            if (r.hasAperture() != b.hasAperture()) {
+                if (r.hasAperture()) best = static_cast<int>(i);
+                continue;
+            }
+            if (r.doorDistSq < b.doorDistSq) best = static_cast<int>(i);
         }
 
-        // Pass 2 — EMIT probes from the classified records. Pair-probes
-        // carry a placeholder 3 ft radius so any code reading it
-        // pre-adaptive-pass sees a sane value; the post-dedup pass
-        // overrides every candidate's radiusFt.
-        int portalDoorPairCount = 0;
-        int portalBendPairCount = 0;
-        int portalPairSuppressed = 0;
-        int doorPairSuppressed = 0;
-        int portalPairApertureDropped = 0;
-        int portalPairSlabSuppressed = 0;
+        // Pass 2 — EMIT probes from the classified records, PORTAL-FIRST
+        // (PLAN.PATHING_DESIGN.md §36-38):
+        //   EXISTENCE comes from the WR oracle — a record with no real
+        //     aperture (apertureIdx < 0) is a designer box boundary standing
+        //     in open air (or buried in solid), models nothing, and emits
+        //     NOTHING. MISS2: 164 of 668 portals are this fiction, including
+        //     49 of the worst room's 53 (the degree-53 clique driver).
+        //   POSITION comes from the real opening — the WR aperture centroid
+        //     (its in-air anchor for singles), NOT the ROOM_DB portal
+        //     center: a ROOM_DB center was measured 42.66 ft inside solid
+        //     rock (§34e), where a probe can never exist.
+        //   IDENTITY dedup replaces the old distance-and-angle same-opening
+        //     heuristics: one physical opening (apertureKey) emits ONE probe
+        //     set no matter how many ROOM_DB portals map onto it (threshold
+        //     slab faces, frame boundaries, door + sidelight). Only records
+        //     that ACTUALLY EMIT claim keys — a suppressed extra door record
+        //     must not lock an opening it never probes (an adjacent arch's
+        //     record would then be dropped as "shared" and the arch would
+        //     end up with nothing). Two distinct doors on one wide aperture
+        //     (double doors) DO each emit a pair — each leaf's OBB needs its
+        //     own straddling flanks for closed-door edge invalidation.
+        //   NO SIZE RULE: the old >= kPathingApertureBendThresholdFt drop
+        //     thresholded a ROOM_DB reading that is fiction (portals reading
+        //     6.3 ft over real 1.9-2.8 ft arches) and silenced three REAL
+        //     physically-adjacent openings (§34c). Oracle presence is the
+        //     aperture test now; no threshold remains.
+        //
+        // Pair-probes carry a placeholder 3 ft radius so any code reading it
+        // pre-adaptive-pass sees a sane value; the post-dedup pass overrides
+        // every candidate's radiusFt.
+        int doorPairCount      = 0;  ///< DoorPair probes emitted (2 per door)
+        int doorPairSuppressed = 0;  ///< extra ROOM_DB portals on one door
+        int doorNoAperture     = 0;  ///< door records the oracle rejected
+        int apertureFiction    = 0;  ///< non-door records with no aperture
+        int apertureShared     = 0;  ///< non-door records on a claimed opening
+        std::set<uint64_t> claimedApertures;
+
+        // Doors first: EMITTING door records claim their opening(s) so a
+        // doorless slab-face record of the same opening cannot double-emit;
+        // then non-door records emit one probe per still-unclaimed opening.
         for (size_t recIdx = 0; recIdx < pathingPortals.size(); ++recIdx) {
             const PathingPortalRecord &rec = pathingPortals[recIdx];
-            // One aperture, one pair: this door already has a nearer portal
-            // carrying its flanks.
-            if (rec.isDoor &&
-                bestPortalForDoor[static_cast<size_t>(rec.doorIdx)]
+            if (!rec.isDoor) continue;
+            // One aperture, one pair: only the door's representative record
+            // (aperture-carrying preferred, then nearest) carries flanks.
+            if (bestPortalForDoor[static_cast<size_t>(rec.doorIdx)]
                     != static_cast<int>(recIdx)) {
                 doorPairSuppressed += 2;
                 continue;
             }
-            if (rec.isDoor || bendsDensity) {
-                // Flanking pair: DoorPair when a door OBB sits in
-                // the opening (closed-door edge invalidation),
-                // PortalPair otherwise (Tier 1 bend points — same
-                // geometry, no OBB between the pair). The two
-                // purposes stay distinct because dedup policy
-                // differs: DoorPair/PortalPair collapse against
-                // their own kind at the tight compound-portal
-                // radius, and only DoorPair is exempt from the
-                // inside-door-AABB rejection pass below.
-                if (!rec.isDoor) {
-                    // De-densification: suppress this PortalPair when it is
-                    // part of the SAME PHYSICAL APERTURE as a nearby door.
-                    //
-                    // This used to require the door portal to join the SAME
-                    // room pair — and it NEVER FIRED ONCE (measured: "0
-                    // PortalPair probes suppressed" on MISS2). Thief doorways
-                    // put a thin THRESHOLD room between the two real rooms
-                    // (room 194 is a 0.6 ft slab), so the door portal joins
-                    // A<->T while the slab's far face joins T<->B: DIFFERENT
-                    // room pairs, SAME doorway. Room identity is the wrong
-                    // discriminator; the door's flanks already straddle that
-                    // opening, so the extra pair is pure local density and
-                    // findAlternatePaths is quadratic in local density.
-                    //
-                    // Geometry is the right discriminator: same aperture =>
-                    // close to the door AND facing the same way. The parallel
-                    // test is what preserves the user's rule that a nearby
-                    // DIFFERENT opening keeps its anchors — two doorways off
-                    // one junction face different directions and are distinct
-                    // routes, so neither suppresses the other.
-                    // Aperture-size rule: a wide ROOM_DB boundary is not an
-                    // architectural opening, it is a designer box edge —
-                    // frequently standing in open space, modelling nothing.
-                    // Sound only bends measurably around apertures near the
-                    // wavelength scale, so an elbow on a >12 ft "portal"
-                    // buys no fidelity and just densifies the graph.
-                    // Centroids still carry routing through it (user rule).
-                    // inradius -1 (unmeasurable) KEEPS its pair.
-                    if (rec.inradiusFt >= kPathingApertureBendThresholdFt) {
-                        portalPairApertureDropped += 2;
-                        continue;
-                    }
-                    // One aperture, one pair — doorless case: another face of
-                    // this same opening already carries its bend anchors.
-                    if (apertureRep[recIdx] != static_cast<int>(recIdx)) {
-                        portalPairSlabSuppressed += 2;
-                        continue;
-                    }
-                    bool suppressed = false;
-                    for (const PathingPortalRecord &dr : pathingPortals) {
-                        if (!dr.isDoor) continue;
-                        const Vector3 d = dr.center - rec.center;
-                        if (glm::dot(d, d) >= kSameOpeningSuppressSq) continue;
-                        if (std::fabs(glm::dot(dr.unitNormal, rec.unitNormal))
-                                < kSameOpeningParallelDot) continue;
-                        suppressed = true;
-                        break;
-                    }
-                    if (suppressed) {
-                        portalPairSuppressed += 2;
-                        continue;
-                    }
+            const WorldApertureRecord *ap = nullptr;
+            if (rec.hasAperture()) {
+                // Flanks straddle the REAL opening: the widest of the
+                // record's openings is the doorway (a sidelight in the same
+                // ball is narrower). Claim ALL of the record's openings —
+                // the door's flanks are the probe set for that compound
+                // doorway.
+                for (int ai = rec.apertureBegin; ai < rec.apertureEnd; ++ai) {
+                    const WorldApertureRecord &c = mWorldApertureData
+                        .apertures[static_cast<size_t>(ai)];
+                    claimedApertures.insert(c.apertureKey);
+                    if (!ap || c.apertureInradiusFt > ap->apertureInradiusFt)
+                        ap = &c;
                 }
-                // [PORTAL_CLASS] — one line per portal that ACTUALLY emits a
-                // pair (post door/aperture suppression), with its aperture
-                // size. This is the ground truth for the bend-pair threshold
-                // sweep: which portals are real apertures (isDoor=1, or a
-                // small non-door opening) versus ROOM_DB box boundaries
-                // standing in open space. isDoor portals always keep their
-                // pair regardless of size — a door IS an aperture by
-                // definition (user rule, 2026-07-15).
-                AUDIO_LOG("[PORTAL_CLASS] rooms %d<->%d center=(%.1f,%.1f,%.1f) "
-                          "inradius=%.2f isDoor=%d\n",
-                          rec.roomAID, rec.roomBID,
-                          rec.center.x, rec.center.y, rec.center.z,
-                          rec.inradiusFt, rec.isDoor ? 1 : 0);
-
-                const PathingProbePurpose pairPurpose = rec.isDoor
-                    ? PathingProbePurpose::DoorPair
-                    : PathingProbePurpose::PortalPair;
-                PathingProbeCandidate inside;
-                inside.position = rec.center - rec.unitNormal * kPairProbeOffsetFt;
-                inside.radiusFt = 3.0f;
-                inside.purpose  = pairPurpose;
-                PathingProbeCandidate outside;
-                outside.position = rec.center + rec.unitNormal * kPairProbeOffsetFt;
-                outside.radiusFt = 3.0f;
-                outside.purpose  = pairPurpose;
-                params.pathingCandidates.push_back(inside);
-                params.pathingCandidates.push_back(outside);
-                if (rec.isDoor) portalDoorPairCount += 2;
-                else            portalBendPairCount += 2;
+            }
+            // A registered door with NO aperture is unexpected (doors sit
+            // in doorways) — loud, and the flanks anchor to the door OBB
+            // CENTER: the door's world box is physical truth for where the
+            // opening is, unlike the ROOM_DB portal center (measured up to
+            // 42.66 ft inside solid, §34e). A door OBB must ALWAYS keep its
+            // pair — closing it must invalidate the edge between the flanks.
+            Vector3 flankCenter;
+            if (ap) {
+                flankCenter = ap->wrCentroid;
             } else {
+                const DoorWorldAABB &b =
+                    doorBoxes[static_cast<size_t>(rec.doorIdx)];
+                flankCenter = (b.mn + b.mx) * 0.5f;
+                ++doorNoAperture;
+                std::fprintf(stderr,
+                    "[FALLBACK] [APERTURE_FICTION_DOOR] rooms %d<->%d "
+                    "portal center=(%.1f,%.1f,%.1f): registered door with "
+                    "NO WR aperture within the oracle radius — flanks "
+                    "anchor to the door OBB center (%.1f,%.1f,%.1f)\n",
+                    rec.roomAID, rec.roomBID,
+                    rec.center.x, rec.center.y, rec.center.z,
+                    flankCenter.x, flankCenter.y, flankCenter.z);
+            }
+            // [PORTAL_CLASS] — one line per record that ACTUALLY emits,
+            // carrying BOTH size readings so fiction stays visible:
+            // apertureInr is measured on world geometry (a door reads
+            // 2.00); rdbInr is the ROOM_DB reading kept for contrast.
+            AUDIO_LOG("[PORTAL_CLASS] rooms %d<->%d "
+                      "center=(%.1f,%.1f,%.1f) apertureInr=%.2f "
+                      "rdbInr=%.2f isDoor=1\n",
+                      rec.roomAID, rec.roomBID,
+                      flankCenter.x, flankCenter.y, flankCenter.z,
+                      ap ? ap->apertureInradiusFt : -1.0f,
+                      rec.inradiusFt);
+            PathingProbeCandidate inside;
+            inside.position =
+                flankCenter - rec.unitNormal * kPairProbeOffsetFt;
+            inside.radiusFt = 3.0f;
+            inside.purpose  = PathingProbePurpose::DoorPair;
+            PathingProbeCandidate outside;
+            outside.position =
+                flankCenter + rec.unitNormal * kPairProbeOffsetFt;
+            outside.radiusFt = 3.0f;
+            outside.purpose  = PathingProbePurpose::DoorPair;
+            params.pathingCandidates.push_back(inside);
+            params.pathingCandidates.push_back(outside);
+            doorPairCount += 2;
+        }
+        for (const PathingPortalRecord &rec : pathingPortals) {
+            if (rec.isDoor) continue;
+            if (!rec.hasAperture()) {
+                // Fiction: no real opening anywhere near this boundary.
+                // Counted, and the [APERTURE_TOPOLOGY] startup line
+                // carries the per-level total; per-record logging would
+                // be ~164 lines of the same fact on MISS2.
+                ++apertureFiction;
+                continue;
+            }
+            // One probe per DISTINCT unclaimed opening — a match ball can
+            // span two (doorway + window to a different region pair), and
+            // each needs its own node.
+            for (int ai = rec.apertureBegin; ai < rec.apertureEnd; ++ai) {
+                const WorldApertureRecord &ap = mWorldApertureData
+                    .apertures[static_cast<size_t>(ai)];
+                if (!claimedApertures.insert(ap.apertureKey).second) {
+                    ++apertureShared;   // opening already carries probes
+                    continue;
+                }
+                AUDIO_LOG("[PORTAL_CLASS] rooms %d<->%d "
+                          "center=(%.1f,%.1f,%.1f) apertureInr=%.2f "
+                          "rdbInr=%.2f isDoor=0\n",
+                          rec.roomAID, rec.roomBID,
+                          ap.wrCentroid.x, ap.wrCentroid.y, ap.wrCentroid.z,
+                          ap.apertureInradiusFt, rec.inradiusFt);
                 PathingProbeCandidate cand;
-                cand.position = rec.center;
+                cand.position = ap.probePos;   // in-air by construction
                 cand.radiusFt = kPortalRadiusFt;
                 cand.purpose  = PathingProbePurpose::Portal;
                 params.pathingCandidates.push_back(cand);
                 ++portalCount;
             }
         }
-        AUDIO_LOG("Pathing portal pass [density=%s]: %d single portal "
-                  "probes + %d bend pair-probes (%d pairs) + %d door "
-                  "pair-probes (%d pairs); %d PortalPair probes (%d pairs) "
-                  "suppressed (same-room-pair DoorPair within %.0f ft — "
-                  "compound openings); %d DoorPair probes (%d pairs) "
-                  "suppressed (one aperture, one pair — extra ROOM_DB "
-                  "portals on the same door); %d PortalPair probes (%d pairs) "
-                  "dropped (aperture >= %.0f ft inradius = wider than %.0f ft "
-                  "— ROOM_DB box boundary, not an architectural opening; "
-                  "centroids carry routing); %d PortalPair probes (%d pairs) "
-                  "suppressed (one aperture, one pair — extra face of a "
-                  "doorless threshold-slab opening)\n",
-                  pathingProbeDensityName(mPathingProbeDensity),
-                  portalCount, portalBendPairCount, portalBendPairCount / 2,
-                  portalDoorPairCount, portalDoorPairCount / 2,
-                  portalPairSuppressed, portalPairSuppressed / 2,
-                  kSameOpeningSuppressFt,
+        AUDIO_LOG("Pathing portal pass [portal-first]: %d single aperture "
+                  "probes + %d door pair-probes (%d pairs); FICTION dropped="
+                  "%d (ROOM_DB portals with no real aperture — emit "
+                  "nothing); shared-aperture suppressed=%d (extra ROOM_DB "
+                  "portals on one physical opening); extra door portals "
+                  "suppressed=%d (%d pairs); doors without aperture=%d "
+                  "(flanks at ROOM_DB center, loud above). Density knob "
+                  "'%s' no longer changes placement — apertures emit one "
+                  "probe, doors one pair, at every density.\n",
+                  portalCount, doorPairCount, doorPairCount / 2,
+                  apertureFiction, apertureShared,
                   doorPairSuppressed, doorPairSuppressed / 2,
-                  portalPairApertureDropped, portalPairApertureDropped / 2,
-                  kPathingApertureBendThresholdFt,
-                  kPathingApertureBendThresholdFt * 2.0f,
-                  portalPairSlabSuppressed, portalPairSlabSuppressed / 2);
+                  doorNoAperture,
+                  pathingProbeDensityName(mPathingProbeDensity));
 
-        // ── Room centroid probes (emitted second; floor-anchored) ───────
-        // Pathing probes are anchored at player ear height
-        // (floor + 5 ft) to maintain line-of-sight through doorways and
-        // ~7 ft Thief corridors. Two cases for the height:
-        //   • Outdoor cells whose Room::getCenter().z sits in the
-        //     skybox (centroid > floor + kSkyThresholdFt) — snap down
-        //     to floor + kRoomFloorOffsetFt (5 ft). The xy position is
-        //     preserved (the room's center under the player).
-        //   • Indoor cells — Room::getCenter().z is the geometric
-        //     midpoint of the room's vertical extent, which can be
-        //     several feet above the floor in tall rooms. Explicitly
-        //     re-anchor to floor + 5 ft so every pathing probe sits at
-        //     a consistent listener-height regardless of room shape.
-        //
-        // The radiusFt set here is a placeholder; the post-dedup
-        // adaptive-radius pass below replaces it with a per-probe
-        // value derived from room walls and neighbor distance.
-        //
-        // kMaxUpperProbeHeightFt is the upper probe's height CLAMP for
-        // skybox-extended rooms, so the probe lands at "high gallery /
-        // upper balcony" altitude where a player can plausibly be.
-        constexpr float kMaxUpperProbeHeightFt = 40.0f;
-        // kMinUpperRoomHeightFt is the "genuinely tall room" GATE —
-        // rooms shorter than this get no upper probe at all. 30 ft is
-        // NOT arbitrary: it reproduces the pre-tier layout's effective
-        // behavior, where an upper candidate was emitted for nearly
-        // every room and the 10-ft centroid dedup collapsed it into the
-        // floor probe unless it survived at
-        //   upperZ − floorProbeZ > 10 ft  ⇒  roomCenter.z > floor + 15
-        // — i.e. box-ish rooms taller than ~30 ft kept a distinct
-        // mid-height node (balconies in two-story halls, 30-40 ft
-        // galleries). Gating at the 40-ft CLAMP instead was measured to
-        // silently drop that node for the whole 30-40 ft band, and
-        // [BAKE_PARITY] cannot catch it: the room stays connected via
-        // its floor probe, just routed at the wrong altitude.
-        constexpr float kMinUpperRoomHeightFt = 30.0f;
-        const float roomRadiusFt = std::max(
-            mProbeManager->getProbeSpacingFt() * 3.0f, 8.0f);
-        int upperCentroidCount = 0;
-        for (const auto &roomPtr : rooms) {
-            if (!roomPtr) continue;
-            Vector3 roomCenter = roomPtr->getCenter();
-            float floorZ = sRoomFloorZ(roomPtr.get());
-            const float ceilZ = sRoomCeilZ(roomPtr.get());
+        // (Room centroid probes — one per ROOM_DB room at floor+5 ft, plus
+        // an upper centroid for tall rooms — are GONE under portal-first
+        // placement. ROOM_DB rooms are not acoustic spaces: MISS2 has ~47
+        // real air regions, not 404 rooms, so per-room centroids were ~8x
+        // over-production placed by fiction (PLAN.PATHING_DESIGN.md §36).
+        // Interior coverage is now the region-scoped fill below. The upper
+        // ring is REMOVED deliberately (user, 2026-07-16): an elevated
+        // opening's aperture probe already sits at its own height, which
+        // serves the balcony case; re-evaluate for vertical realism once
+        // the system is complete — memory project_pathing_upper_ring_removed.)
 
-            // (1) Floor probe — at floor + 5 ft, player ear height,
-            //     CLAMPED inside the room's vertical extent. Rooms
-            //     shorter than the ear-height anchor exist (crawl
-            //     spaces, 1-2 ft connector slabs between vertically
-            //     stacked portals — MISS6 rooms 188/190): un-clamped,
-            //     the "room center" probe lands above the room's own
-            //     ceiling, roomFromPoint resolves it to the room ABOVE,
-            //     and the flat room ends up with ZERO probes
-            //     ([BAKE_PARITY] zero-probe-room MISSING pairs). The
-            //     rule is CONTINUOUS: probe height = min(ear height,
-            //     vertical midpoint), so rooms shorter than 2× ear
-            //     height slide smoothly toward maximum clearance from
-            //     both planes instead of snapping at some threshold
-            //     (an earlier ceiling-margin test flipped behavior
-            //     discontinuously for rooms right at the margin).
-            //     Emitted FIRST so the dedup pass (which keeps the
-            //     earlier-emitted candidate on collision) preserves the
-            //     floor probe when the room is too short for the upper
-            //     probe to be meaningful.
-            {
-                float floorProbeZ = floorZ + kRoomFloorOffsetFt;
-                if (ceilZ > floorZ)
-                    floorProbeZ = std::min(floorProbeZ,
-                                           (floorZ + ceilZ) * 0.5f);
-                PathingProbeCandidate floorCand;
-                floorCand.position = Vector3(roomCenter.x, roomCenter.y,
-                                              floorProbeZ);
-                floorCand.radiusFt = roomRadiusFt;
-                floorCand.purpose  = PathingProbePurpose::Centroid;
-                params.pathingCandidates.push_back(floorCand);
-                ++roomCount;
-                if (roomCenter.z > floorZ + kSkyThresholdFt) ++roomSnapped;
-            }
-
-            // (2) Upper centroid probe — ONLY for genuinely tall rooms
-            //     (taller than kMinUpperRoomHeightFt: atria, shafts,
-            //     multi-story halls, outdoor cells whose audio room
-            //     extends into the skybox). Supports vertical sound
-            //     propagation where a player/emitter can plausibly be
-            //     far above the floor probe.
-            //
-            //     Tier-0 justify-or-remove result (PR B): the previous
-            //     rule emitted an upper probe for EVERY room whose
-            //     geometric center sat > 0.1 ft above floor + 5 and
-            //     leaned on the 10-ft dedup to collapse the ordinary
-            //     ones — on MISS2 that still left 215 upper centroids,
-            //     most in rooms a player can never be more than a
-            //     body-height above the floor of. The explicit gate
-            //     keeps only the survivors the old dedup interplay
-            //     kept (see the kMinUpperRoomHeightFt derivation
-            //     above), without paying candidate emission + dedup
-            //     for every ordinary room.
-            //
-            //     Skybox-extended rooms (geometric center hundreds of
-            //     feet up) still get clamped to floor +
-            //     kMaxUpperProbeHeightFt so the probe lands where a
-            //     player could stand, not in the skybox.
-            if (ceilZ - floorZ > kMinUpperRoomHeightFt) {
-                float upperZ = std::min(roomCenter.z,
-                                        floorZ + kMaxUpperProbeHeightFt);
-                PathingProbeCandidate upperCand;
-                upperCand.position = Vector3(roomCenter.x, roomCenter.y, upperZ);
-                upperCand.radiusFt = roomRadiusFt;
-                upperCand.purpose  = PathingProbePurpose::Centroid;
-                params.pathingCandidates.push_back(upperCand);
-                ++upperCentroidCount;
-            }
-        }
-        AUDIO_LOG("Pathing candidates: %d floor centroids + %d upper "
-                  "centroids emitted (upper probes only for rooms taller "
-                  "than %.0f ft — multi-story halls / shafts / outdoor "
-                  "cells)\n",
-                  roomCount, upperCentroidCount, kMinUpperRoomHeightFt);
-
-        // NOTE: the thin-room coverage repair used to run HERE (right
-        // after centroid emission) and only at bends density. That was
-        // the room-194 parity bug: its "is the room covered?" snapshot
-        // was taken BEFORE the proximity dedup and the inside-door-AABB
-        // rejection, both of which can delete the very candidate the
-        // snapshot counted (MISS2 room 194 — a 0.6-ft door-threshold
-        // slab — was "covered" by its own centroid, which the
-        // inside-door pass then rejected as a sound-bypass anchor,
-        // leaving the room with zero probes at EVERY density). The
-        // repair now runs near the end of this function, after every
-        // candidate-deleting pass — see "Thin-room coverage repair"
-        // below.
-
-        AUDIO_LOG("Pathing candidates: %d portal probes + %d room centroids "
-                  "(%d room centroids sky-snapped, %d portal back-dups "
-                  "skipped, %d sky portals skipped) "
-                  "= %zu pre-dedup\n",
-                  portalCount, roomCount, roomSnapped, portalDup, portalSky,
+        AUDIO_LOG("Pathing candidates: %d aperture probes + %d door "
+                  "pair-probes (%d portal back-dups skipped, %d sky portals "
+                  "skipped) = %zu pre-dedup\n",
+                  portalCount, doorPairCount, portalDup, portalSky,
                   params.pathingCandidates.size());
 
         // Pathing filter: accept any candidate that resolves to a real
@@ -17179,7 +17209,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             std::vector<PathingProbeCandidate> kept;
             kept.reserve(params.pathingCandidates.size());
             int dropped = 0;
-            int droppedCentroids = 0;
+
             // Pair-vs-pair dedup threshold (DoorPair AND PortalPair).
             // Compound doorways (one physical opening represented by
             // multiple RoomPortal records, common in Thief) generate a
@@ -17201,7 +17231,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             const float kDoorPairDedupRadiusSq =
                 kDoorPairDedupRadiusFt * kDoorPairDedupRadiusFt;
             int droppedDoorPairs   = 0;
-            int droppedPortalPairs = 0;
+
             // Per-purpose + room-aware dedup.
             //
             // Per-purpose: every PathingProbePurpose only collides against
@@ -17365,16 +17395,14 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     if (!sameRoom) ++crossRoomPreserved;
                 }
                 if (tooClose) {
+                    // (Centroid and PortalPair purposes are no longer
+                    // emitted under portal-first placement; their counters
+                    // remain wired to planCounters for the probe_plan verb's
+                    // field layout but stay zero.)
                     if (cand.purpose == PathingProbePurpose::DoorPair) {
                         ++droppedDoorPairs;
-                    } else if (cand.purpose
-                               == PathingProbePurpose::PortalPair) {
-                        ++droppedPortalPairs;
                     } else {
                         ++dropped;
-                        if (cand.purpose == PathingProbePurpose::Centroid) {
-                            ++droppedCentroids;
-                        }
                     }
                     continue;
                 }
@@ -17395,38 +17423,25 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                           "(compound-portal doorways) at %.1f ft radius\n",
                           droppedDoorPairs, kDoorPairDedupRadiusFt);
             }
-            if (droppedPortalPairs > 0) {
-                AUDIO_LOG("Pathing dedup: %d PortalPair probes collapsed "
-                          "(compound-portal openings) at %.1f ft radius\n",
-                          droppedPortalPairs, kDoorPairDedupRadiusFt);
-            }
-            AUDIO_LOG("Pathing dedup (%.1f ft radius): %d dropped "
-                      "(%d centroids), %zu kept (Door/PortalPair at the "
-                      "tight pair radius)\n",
-                      pathingDedupRadiusFt, dropped, droppedCentroids,
-                      kept.size());
-            if (droppedCentroids > 0) {
-                std::fprintf(stderr,
-                    "[PROBE_BAKE] WARNING: %d room centroid(s) deduped "
-                    "against an earlier-kept probe (typically a DoorPair "
-                    "in a tight closet). Those rooms now have only pair-"
-                    "probes as anchors; back corners > 2.5 ft from the "
-                    "inside-pair-probe fall outside pathing-wet coverage. "
-                    "If a closet sounds dry, increase audio.pathing_probes."
-                    "dedup_radius_ft or add an explicit centroid probe.\n",
-                    droppedCentroids);
-            }
+            AUDIO_LOG("Pathing dedup (%.1f ft radius): %d dropped, "
+                      "%zu kept (DoorPair at the tight pair radius)\n",
+                      pathingDedupRadiusFt, dropped, kept.size());
+            // (The room-centroid dedup WARNING that lived here is gone
+            // with the centroid probes themselves; closet coverage is the
+            // region fill's job and region parity grades it.)
             // Surface dedup counters to the dry-run probe_plan verb.
             // "Other" = total non-pair drops minus the centroid subset,
             // so the buckets sum to the total.
             if (planCounters) {
-                planCounters->dedupDroppedTotal      = dropped + droppedDoorPairs
-                                                     + droppedPortalPairs;
-                planCounters->dedupDroppedCentroids  = droppedCentroids;
+                planCounters->dedupDroppedTotal      = dropped
+                                                     + droppedDoorPairs;
+                // Centroid/PortalPair purposes are no longer emitted, so
+                // their buckets are structurally zero (field layout kept
+                // for the probe_plan verb's readers).
+                planCounters->dedupDroppedCentroids  = 0;
                 planCounters->dedupDroppedDoorPairs  = droppedDoorPairs;
-                planCounters->dedupDroppedPortalPairs = droppedPortalPairs;
-                // INVARIANT: every droppedCentroids++ above sits inside an ++dropped block, so dropped >= droppedCentroids. If a future centroid-dedup path bumps droppedCentroids without ++dropped, this subtraction goes negative.
-                planCounters->dedupDroppedOther      = dropped - droppedCentroids;
+                planCounters->dedupDroppedPortalPairs = 0;
+                planCounters->dedupDroppedOther      = dropped;
             }
             params.pathingCandidates = std::move(kept);
         }
@@ -17572,181 +17587,69 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             }
             params.pathingCandidates = std::move(kept);
 
-            // ── Thin-room coverage repair (ALL densities) ───────────────
-            //
-            // Guarantee: every ROOM_DB room adjacent to a NON-door portal
-            // ends up with at least one candidate that roomFromPoint
-            // resolves to it. Rooms thinner than kPairProbeOffsetFt along
-            // the portal normal (door-threshold slabs, compound-doorway
-            // connector volumes, shallow alcoves) lose every organic
-            // candidate: bends flanks overshoot into the neighbors,
-            // baseline's portal-center probe sits exactly on the plane
-            // (roomFromPoint tie → neighbor) or inside a door AABB, and
-            // the room's own centroid can resolve elsewhere or get
-            // rejected by the inside-door pass above. First measured on
-            // MISS6 (27 of 324 pairs [BAKE_PARITY]-MISSING at bends);
-            // MISS2 room 194 then proved the class exists at baseline
-            // too, so the pass runs at every density.
-            //
-            // WHY it runs HERE — after the proximity dedup and the
-            // inside-door-AABB rejection, immediately before the adaptive
-            // radius pass: the coverage snapshot must be taken against
-            // the candidates that actually SURVIVE. The previous version
-            // ran right after centroid emission and marked MISS2 room 194
-            // "covered" by its own centroid — which the inside-door pass
-            // then deleted (the 0.6-ft slab is door 1019's threshold;
-            // the centroid sat inside the door AABB), leaving the room
-            // zero-probe with no repair and no [FALLBACK]. Nothing after
-            // this point deletes or moves candidates: the adaptive pass
-            // only assigns radii, and ProbeManager's placement filter
-            // accepts any point that resolves to a room (its nudge fires
-            // only for in-solid points, which never provided coverage in
-            // the first place — roomFromPoint had already failed there).
-            //
-            // Repair GLOBALLY rather than per-portal: compute the set of
-            // rooms some surviving candidate resolves to, then place ONE
-            // repair probe per room that is in nobody's coverage. (A
-            // per-portal "did my own flanks cover my center's room" test
-            // over-fired 10× on MISS2 — rooms were already covered by
-            // centroids or by OTHER portals' flanks.)
-            //
-            // The repair probe is REQUIRED to resolve to the room it
-            // repairs AND to sit outside every door AABB: candidates walk
-            // outward from the portal center along ± the portal normal
-            // (small offsets first — a 0.6-ft connector's interior may be
-            // a 0.1-ft sliver between a door AABB face and the far portal
-            // plane, hence the 0.05-ft first rung) until both tests pass.
-            // Placing it AT the center (on the plane) looked equivalent
-            // but was not: the plane point resolves to whichever neighbor
-            // wins the tie, i.e. it fails for exactly the thin rooms this
-            // pass exists to cover. Running after the dedup also means
-            // nothing can drop the repair probe afterwards.
-            int thinRoomRepairs = 0;
-            if (!pathingPortals.empty()) {
-                std::set<int> covered;
-                for (const auto &cand : params.pathingCandidates) {
-                    Room *r = mRoomService->roomFromPoint(cand.position);
-                    if (r) covered.insert(static_cast<int>(r->getRoomID()));
-                }
-                std::set<int> repaired, unrepairable;
-                static constexpr float kRepairOffsetsFt[] = {
-                    0.05f, 0.1f, 0.25f, 0.5f, 1.0f, 2.0f, 3.5f, 5.0f};
-                for (const auto &bp : pathingPortals) {
-                    // Door portals excluded from repair by design — see
-                    // the pass-1 classification comment (inter-door
-                    // connector volumes are owned by the runtime door-
-                    // validation path).
-                    if (bp.isDoor) continue;
-                    for (int side = 0; side < 2; ++side) {
-                        const int roomID = (side == 0) ? bp.roomAID
-                                                       : bp.roomBID;
-                        if (roomID < 0) continue;
-                        if (covered.count(roomID) || repaired.count(roomID))
-                            continue;
-                        bool placed = false;
-                        for (float off : kRepairOffsetsFt) {
-                            for (float sign : {1.0f, -1.0f}) {
-                                const Vector3 p = bp.center
-                                    + bp.unitNormal * (off * sign);
-                                Room *r = mRoomService->roomFromPoint(p);
-                                if (!r || static_cast<int>(r->getRoomID())
-                                              != roomID)
-                                    continue;
-                                if (insideDoorAABB(p) >= 0) continue;
-                                PathingProbeCandidate cand;
-                                cand.position = p;
-                                // Placeholder — the adaptive radius pass
-                                // below assigns the real value.
-                                cand.radiusFt = 5.0f;
-                                cand.purpose  = PathingProbePurpose::Portal;
-                                params.pathingCandidates.push_back(cand);
-                                ++thinRoomRepairs;
-                                repaired.insert(roomID);
-                                placed = true;
-                                break;
-                            }
-                            if (placed) break;
-                        }
-                        if (!placed) unrepairable.insert(roomID);
-                    }
-                }
-                // A room every portal failed to anchor stays loud here
-                // AND in [BAKE_PARITY] — do not soften: this is exactly
-                // the zero-probe class the parity check exists to catch.
-                for (int roomID : unrepairable) {
-                    if (repaired.count(roomID)) continue;  // later portal won
-                    std::fprintf(stderr,
-                        "[FALLBACK] pathing thin-room repair: room %d has "
-                        "no portal-adjacent interior point that "
-                        "roomFromPoint resolves to it outside every door "
-                        "AABB — the room will have zero pathing probes "
-                        "and [BAKE_PARITY] will report its pairs\n",
-                        roomID);
-                }
-                AUDIO_LOG("Pathing thin-room repair: %d interior probes "
-                          "added post-dedup/post-door-rejection for rooms "
-                          "no surviving candidate resolves to "
-                          "(density=%s)\n", thinRoomRepairs,
-                          pathingProbeDensityName(mPathingProbeDensity));
-            }
+            // (The thin-room coverage repair — one probe per ROOM_DB room
+            // that no surviving candidate resolved to — is GONE. Its
+            // guarantee was per-ROOM, and rooms are not acoustic spaces
+            // (PLAN.PATHING_DESIGN.md §36): a 0.6-ft threshold slab is
+            // part of its doorway's air, covered by the aperture probe's
+            // influence sphere, not a space needing its own node. The
+            // region-scoped coverage fill below owns interior coverage;
+            // region-based parity grades it.)
 
-            // ── Hub-room coverage fill + coverage-based bake-range ──────
-            //    derivation (PLAN.PATHING_DESIGN.md §10 — graph-reduction
-            //    lever, user-approved 2026-07-13 direction).
+            // ── REGION coverage fill + coverage-based bake-range ────────
+            //    derivation (§10 machinery re-scoped from ROOM_DB rooms to
+            //    air REGIONS — PLAN.PATHING_DESIGN.md §36/§38c).
             //
-            // Problem: the bake's single-edge visRange cap must cover the
-            // longest hop a route needs, and that hop is set by the WORST
-            // room's coverage — a portal whose nearest same-room graph
-            // anchor is far away forces long edges for every probe pair
-            // in the mission. Under the previous max-room-SPAN derivation
-            // one hub room (MISS2 room 18: deg 53, intra-room hops to
-            // 331 ft) pushed the whole mission to the 400 ft clamp
-            // ceiling; the runtime alternate-search frontier scales with
-            // that range.
+            // Problem (unchanged): the bake's single-edge visRange cap must
+            // cover the longest hop a route needs, and that hop is set by
+            // the WORST space's coverage. And runtime attachment REQUIRES
+            // interior coverage: Steam Audio associates a source/listener
+            // with probes by influence containment, so a voice standing in
+            // a big open interior with no probe whose sphere contains it
+            // never enters the graph at all (the 0.1f pathing sentinel).
             //
-            // Fix, per the §10 research (k-center / disk-cover
-            // decomposition): fill the few outlier rooms with interior
-            // probes until every portal has a nearby in-room hop anchor,
-            // THEN derive the cap from the achieved coverage.
+            // What changed: the PARTITION. This fill used to run per
+            // ROOM_DB room — but rooms are not acoustic spaces (MISS2:
+            // ~47 real air regions vs 404 rooms; one region holds 74 room
+            // centers), so per-room grouping both over-produced (fill
+            // probes for boxes that are slices of one hall) and mis-grouped
+            // (roomFromPoint ties on portal planes). Regions — air volumes
+            // bounded by real apertures, computed from the compiled cell
+            // geometry — are the honest unit, and region-of-point (cell
+            // lookup) replaces roomFromPoint's box guess.
             //
-            //   demand   = the room's (non-sky) portal centers — the
-            //              points routes must attach through — plus the
-            //              room's floor extent (FLOOR_POLY candidates:
-            //              one per upward-facing BSP cell polygon, the
-            //              same machinery the reflection batch's floor
-            //              pass placement uses) so big open floors keep
+            //   demand   = the region's aperture centroids (the points
+            //              routes must attach through — oracle-validated
+            //              REAL openings only; fictional ROOM_DB portals
+            //              are not routes) plus the region's floor extent
+            //              (FLOOR_POLY candidates) so big open floors keep
             //              listener/source attachment locality;
-            //   anchors  = every surviving pathing candidate that
-            //              roomFromPoint resolves to the room (semantic
-            //              probes seed the fill — centroids, pairs,
-            //              repairs, emitters — plus fill probes as they
-            //              are added);
-            //   sites    = the room's FLOOR_POLY candidates at player
+            //   anchors  = every surviving pathing candidate in the region
+            //              (aperture probes, door flanks, emitters, plus
+            //              fill probes as they are added);
+            //   sites    = the region's FLOOR_POLY candidates at player
             //              ear height, outside every door AABB;
             //   coverage = distance from a demand point to the nearest
             //              VISIBLE anchor — one occlusion ray per
             //              (demand, anchor) evaluation, blocked ⇒ the
             //              anchor doesn't count (visibility-aware
             //              k-center; a wall between them means the graph
-            //              can't hop that way either). Portal demand
+            //              can't hop that way either). Aperture demand
             //              excludes anchors within kOwnFlankExclusionFt
-            //              of itself: a route entering via a portal
-            //              lands ON its flank probes, so the flanks
-            //              cannot be their own onward hop — the metric
-            //              is "how far to the next anchor", which is
-            //              what visRange has to cover (this is why a
-            //              centroid probe halves a room's span instead
-            //              of zeroing it, §9).
+            //              of itself: a route entering via an aperture
+            //              lands ON its own probe, so that probe cannot
+            //              be its own onward hop — the metric is "how far
+            //              to the NEXT anchor", which is what visRange
+            //              has to cover (§9).
             //
-            // Greedy Gonzalez farthest-point: repeatedly take the
-            // farthest-uncovered demand point and place a probe at the
+            // Greedy Gonzalez farthest-point (unchanged): repeatedly take
+            // the farthest-uncovered demand point and place a probe at the
             // nearest usable site until everything is within
-            // kPathingCoverageRadiusFt (R_cov) or the room's site pool /
-            // per-room cap runs out (both loud). Expected to fire in ~3
-            // hub rooms game-wide at R_cov=75 (§10) — every added probe
-            // RAISES local density where findAlternatePaths is quadratic
-            // in it, so the fill must stay surgical; the door-stress-
-            // in-room-18 runtime cell is the regression gate.
+            // kPathingCoverageRadiusFt (R_cov) or the region's site pool /
+            // per-region cap runs out (both loud). Offline prediction for
+            // the CONNECTIVITY component: ~15 broken aperture pairs across
+            // all of MISS2 (§37b Q3); the big outdoor region is the one
+            // expected large consumer.
             {
                 const float rCovFt = kPathingCoverageRadiusFt;
                 // Same player-ear anchor as kRoomFloorOffsetFt in the
@@ -17778,7 +17681,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 AudioRaycastFn rcFill = mRaycaster;
                 if (!rcFill) {
                     std::fprintf(stderr,
-                        "[FALLBACK] pathing hub fill: no raycaster wired "
+                        "[FALLBACK] pathing coverage fill: no raycaster wired "
                         "— coverage fill + bake-range derivation are "
                         "DISTANCE-ONLY this pass (no visibility rays); "
                         "renderer bakes are visibility-aware, so a plan "
@@ -17791,48 +17694,80 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     return rcFill(a, b, hit);
                 };
 
-                auto roomIDOf = [this](const Vector3 &p) -> int {
+                // The coverage partition: region-of-point (exact — a cell
+                // lookup in the compiled geometry). The roomFromPoint
+                // fallback exists ONLY for headless computeProbePlan runs
+                // that have no renderer; it degrades to the box guess this
+                // pass used before regions, announced loudly.
+                if (!mRegionOfPointFn) {
+                    std::fprintf(stderr,
+                        "[FALLBACK] pathing coverage fill: no region-of-"
+                        "point fn wired (headless?) — coverage grouping "
+                        "degrades to roomFromPoint ROOM_DB boxes, which "
+                        "both over-groups (one hall = dozens of boxes) and "
+                        "mis-groups (portal-plane ties). Renderer bakes "
+                        "use exact regions; plans computed here differ.\n");
+                }
+                auto partitionOf = [this](const Vector3 &p) -> int {
+                    if (mRegionOfPointFn) return mRegionOfPointFn(p);
                     Room *r = mRoomService->roomFromPoint(p);
                     return r ? static_cast<int>(r->getRoomID()) : -1;
                 };
 
-                // Anchor positions per room (surviving candidates only —
+                // Anchor positions per region (surviving candidates only —
                 // this block runs after every candidate-deleting pass).
-                std::map<int, std::vector<Vector3>> roomAnchors;
+                std::map<int, std::vector<Vector3>> regionAnchors;
                 for (const auto &cand : params.pathingCandidates) {
-                    const int rid = roomIDOf(cand.position);
-                    if (rid >= 0) roomAnchors[rid].push_back(cand.position);
+                    const int rid = partitionOf(cand.position);
+                    if (rid >= 0)
+                        regionAnchors[rid].push_back(cand.position);
                 }
 
-                // Demand + site pools per room.
+                // Demand + site pools per region.
                 struct DemandPoint {
                     Vector3 pos;
                     bool    isPortal = false;
                     bool    stuck    = false;  ///< fill can't improve it
                     float   bestFt   = std::numeric_limits<float>::max();
                 };
-                std::map<int, std::vector<DemandPoint>> roomDemand;
+                std::map<int, std::vector<DemandPoint>> regionDemand;
                 for (const auto &pr : pathingPortals) {
-                    for (int side = 0; side < 2; ++side) {
-                        const int rid = (side == 0) ? pr.roomAID
-                                                    : pr.roomBID;
-                        if (rid < 0) continue;
-                        DemandPoint d;
-                        d.pos      = pr.center;
-                        d.isPortal = true;
-                        roomDemand[rid].push_back(d);
+                    // Only REAL openings are routing demand — a fictional
+                    // ROOM_DB portal is not a point routes pass through.
+                    if (!pr.hasAperture()) continue;
+                    for (int ai = pr.apertureBegin; ai < pr.apertureEnd;
+                         ++ai) {
+                        const WorldApertureRecord &ap = mWorldApertureData
+                            .apertures[static_cast<size_t>(ai)];
+                        // The opening joins two TRUE side regions (frame
+                        // singletons already resolved away by the builder);
+                        // it is demand in BOTH — a route through it needs an
+                        // onward hop on each side. In room-fallback mode the
+                        // record's ROOM_DB pair stands in.
+                        const int sideA = mRegionOfPointFn ? ap.regionA
+                                                           : pr.roomAID;
+                        const int sideB = mRegionOfPointFn ? ap.regionB
+                                                           : pr.roomBID;
+                        for (const int rid : {sideA, sideB}) {
+                            if (rid < 0) continue;
+                            DemandPoint d;
+                            d.pos      = ap.wrCentroid;
+                            d.isPortal = true;
+                            regionDemand[rid].push_back(d);
+                            if (sideA == sideB) break;  // internal aperture
+                        }
                     }
                 }
-                std::map<int, std::vector<Vector3>> roomSites;
+                std::map<int, std::vector<Vector3>> regionSites;
                 for (const Vector3 &f : mFloorProbeCandidates) {
                     const Vector3 p{f.x, f.y, f.z + kEarHeightFt};
-                    const int rid = roomIDOf(p);
+                    const int rid = partitionOf(p);
                     if (rid < 0) continue;
-                    roomSites[rid].push_back(p);
+                    regionSites[rid].push_back(p);
                     DemandPoint d;
                     d.pos      = p;
                     d.isPortal = false;
-                    roomDemand[rid].push_back(d);
+                    regionDemand[rid].push_back(d);
                 }
 
                 // Coverage of one demand point against an anchor list:
@@ -17843,11 +17778,19 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                         -> float {
                     std::vector<std::pair<float, size_t>> order;
                     order.reserve(anchors.size());
+                    // Anchors beyond the visRange clamp ceiling cannot
+                    // change the derived range (it clamps there anyway), so
+                    // ray-testing them is pure waste — the big open region
+                    // would otherwise pay |anchors| rays per walled-off
+                    // demand point before concluding kInf.
+                    const float kCovCapSq = kPathingCoverageVisRangeMaxFt
+                                          * kPathingCoverageVisRangeMaxFt;
                     for (size_t i = 0; i < anchors.size(); ++i) {
                         const Vector3 dv = anchors[i] - d.pos;
                         const float distSq = glm::dot(dv, dv);
                         if (d.isPortal && distSq < kOwnFlankExclusionSq)
                             continue;
+                        if (distSq > kCovCapSq) continue;
                         order.emplace_back(distSq, i);
                     }
                     std::sort(order.begin(), order.end());
@@ -17861,27 +17804,105 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 int   fillProbesTotal = 0;
                 int   fillRoomsTotal  = 0;
                 int   stuckDemandTotal = 0;
-                for (auto &kv : roomDemand) {
+                for (auto &kv : regionDemand) {
                     const int rid = kv.first;
-                    auto anchIt = roomAnchors.find(rid);
-                    if (anchIt == roomAnchors.end()
+                    bool seededRegion = false;
+                    auto anchIt = regionAnchors.find(rid);
+                    if (anchIt == regionAnchors.end()
                         || anchIt->second.empty()) {
-                        // Zero-probe room: an inter-door connector volume
-                        // (by-design zero-probe — runtime door validation
-                        // owns it, [BAKE_PARITY] grades it door-adjacent)
-                        // or a room the thin-room repair just reported
-                        // unrepairable, loudly. The fill does not adopt
-                        // either class.
-                        continue;
+                        // Zero-anchor region. Under portal-first placement
+                        // this is a region NONE of whose apertures placed a
+                        // probe inside it (aperture probes sit ON the
+                        // boundary and get nudged to ONE side) — common and
+                        // benign for door-frame singleton regions (thin
+                        // cell chains through a doorway, covered by the
+                        // pair's influence spheres), but a LARGE region
+                        // here would be a real coverage hole. SEED it:
+                        // place one probe at the region's site nearest its
+                        // demand centroid, then let the ordinary Gonzalez
+                        // loop take over. (The room-scoped ancestor of this
+                        // pass skipped empty rooms — zero-probe rooms were
+                        // the repair pass's and parity's domain. Under
+                        // regions, seeding IS this fill's job: an aperture
+                        // single gets nudged to one arbitrary side, so a
+                        // region can lose every coin flip and start empty —
+                        // MISS2 measured 14 such regions on the first
+                        // portal-first bake.)
+                        //
+                        // ONLY for regions with APERTURE demand: a region
+                        // whose demand is floor-only has no real opening,
+                        // i.e. it is acoustically SEALED — sound neither
+                        // enters nor leaves, so a probe there serves no
+                        // path and just adds an isolated graph node
+                        // (measured: 2-3 stray single-probe components in
+                        // far sealed pockets on the first seeded bake).
+                        bool hasApertureDemand = false;
+                        for (const auto &d : kv.second) {
+                            if (d.isPortal) { hasApertureDemand = true; break; }
+                        }
+                        if (!hasApertureDemand) continue;
+                        auto seedSitesIt = regionSites.find(rid);
+                        if (seedSitesIt == regionSites.end()
+                            || seedSitesIt->second.empty()) {
+                            // No floor sites either (thin frame chains,
+                            // vertical shafts): nothing to place on.
+                            // UNCONDITIONALLY loud — this branch is only
+                            // reachable with real APERTURE demand, so a
+                            // silent skip here is a real opening whose
+                            // region gets no probe.
+                            std::fprintf(stderr,
+                                "[FALLBACK] pathing coverage fill: "
+                                "region %d has %zu demand points (>=1 real "
+                                "aperture) but ZERO anchors and ZERO floor "
+                                "sites — cannot seed; region parity will "
+                                "grade it\n", rid, kv.second.size());
+                            continue;
+                        }
+                        Vector3 dc(0.0f, 0.0f, 0.0f);
+                        for (const auto &d : kv.second) dc += d.pos;
+                        dc /= static_cast<float>(kv.second.size());
+                        int   seedSite = -1;
+                        float seedSq   = std::numeric_limits<float>::max();
+                        for (size_t si = 0; si < seedSitesIt->second.size();
+                             ++si) {
+                            const Vector3 &s = seedSitesIt->second[si];
+                            if (insideDoorAABB(s) >= 0) continue;
+                            const Vector3 dv = s - dc;
+                            const float dsq = glm::dot(dv, dv);
+                            if (dsq < seedSq) {
+                                seedSq   = dsq;
+                                seedSite = static_cast<int>(si);
+                            }
+                        }
+                        if (seedSite < 0) continue;
+                        const Vector3 seedPos =
+                            seedSitesIt->second[static_cast<size_t>(seedSite)];
+                        PathingProbeCandidate seed;
+                        seed.position = seedPos;
+                        seed.radiusFt = 5.0f;   // adaptive pass overrides
+                        seed.purpose  = PathingProbePurpose::HubFill;
+                        params.pathingCandidates.push_back(seed);
+                        anchIt = regionAnchors
+                                     .emplace(rid, std::vector<Vector3>{})
+                                     .first;
+                        anchIt->second.push_back(seedPos);
+                        ++fillProbesTotal;
+                        ++fillRoomsTotal;
+                        seededRegion = true;
+                        AUDIO_LOG("[PATHING_HUB_FILL] region %d: SEEDED "
+                                  "(zero anchors, %zu demand points) at "
+                                  "(%.1f,%.1f,%.1f)\n",
+                                  rid, kv.second.size(),
+                                  seedPos.x, seedPos.y, seedPos.z);
                     }
                     std::vector<Vector3> &anchors = anchIt->second;
                     for (auto &d : kv.second)
                         d.bestFt = coverageOf(d, anchors);
 
-                    auto sitesIt = roomSites.find(rid);
+                    auto sitesIt = regionSites.find(rid);
                     std::vector<Vector3> noSites;
                     std::vector<Vector3> &sites =
-                        (sitesIt != roomSites.end()) ? sitesIt->second
+                        (sitesIt != regionSites.end()) ? sitesIt->second
                                                      : noSites;
                     std::vector<char> siteUsed(sites.size(), 0);
 
@@ -18001,8 +18022,8 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     }
                     if (added >= kPathingHubFillMaxPerRoom) {
                         std::fprintf(stderr,
-                            "[FALLBACK] pathing hub fill: room %d hit the "
-                            "per-room cap (%d probes) with demand still "
+                            "[FALLBACK] pathing coverage fill: region %d hit the "
+                            "per-region cap (%d probes) with demand still "
                             "uncovered — residual coverage feeds the "
                             "[PATHING_BAKE_RANGE] derivation below\n",
                             rid, kPathingHubFillMaxPerRoom);
@@ -18022,12 +18043,12 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                             worstAfterFt = std::max(worstAfterFt, d.bestFt);
                         }
                         fillProbesTotal += added;
-                        ++fillRoomsTotal;
+                        if (!seededRegion) ++fillRoomsTotal;
                         // Loud + unconditional: the §10 expectation is
                         // ~3 rooms game-wide — every room the fill fires
                         // in must be visible in the bake log.
                         std::fprintf(stderr,
-                            "[PATHING_HUB_FILL] room %d: +%d interior "
+                            "[PATHING_HUB_FILL] region %d: +%d interior "
                             "probes (worst PORTAL demand %.0f -> %.0f ft, "
                             "R_cov=%.0f ft, demand=%zu [portals+floor], "
                             "sites=%zu, portal-unreachable=%d)\n",
@@ -18045,11 +18066,11 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 // floor coverage matters for listener containment, which
                 // influence radii — not edge length — provide).
                 float governingFt   = 0.0f;
-                int   governingRoom = -1;
+                int   governingRegion = -1;
                 int   governingUnreachable = 0;
-                for (const auto &kv : roomDemand) {
-                    auto anchIt = roomAnchors.find(kv.first);
-                    if (anchIt == roomAnchors.end()
+                for (const auto &kv : regionDemand) {
+                    auto anchIt = regionAnchors.find(kv.first);
+                    if (anchIt == regionAnchors.end()
                         || anchIt->second.empty()) continue;
                     for (const auto &d : kv.second) {
                         if (!d.isPortal) continue;
@@ -18063,7 +18084,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                         }
                         if (d.bestFt > governingFt) {
                             governingFt   = d.bestFt;
-                            governingRoom = kv.first;
+                            governingRegion = kv.first;
                         }
                     }
                 }
@@ -18083,12 +18104,12 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 std::fprintf(stderr,
                     "[PATHING_BAKE_RANGE] coverage-derived single-edge "
                     "visRange cap %.0f ft (governing=%.0f ft = max "
-                    "portal->nearest-same-room-anchor POST-fill, room %d; "
-                    "R_cov=%.0f ft, hub fill +%d probes in %d rooms, "
+                    "aperture->nearest-same-REGION-anchor POST-fill, region %d; "
+                    "R_cov=%.0f ft, coverage fill +%d probes in %d regions, "
                     "stuck-demand=%d, no-visible-anchor-portal-demand=%d, "
                     "margin x%.1f, clamp [%.0f, %.0f]); pathRange stays "
                     "whole-level\n",
-                    visRangeFt, governingFt, governingRoom, rCovFt,
+                    visRangeFt, governingFt, governingRegion, rCovFt,
                     fillProbesTotal, fillRoomsTotal, stuckDemandTotal,
                     governingUnreachable, kPathingCoverageMarginMul,
                     kPathingCoverageVisRangeMinFt,
@@ -18385,6 +18406,20 @@ bool AudioService::pathingBakeDensityMismatch() const
 {
     if (!mProbeManager || !mProbeManager->hasPathing()) return false;
     return mProbeManager->getBakedPathingDensity() != mPathingProbeDensity;
+}
+
+//------------------------------------------------------
+bool AudioService::pathingBakeLayoutMismatch() const
+{
+    if (!mProbeManager || !mProbeManager->hasPathing()) return false;
+    return mProbeManager->getBakedPathingLayoutVersion()
+        != kPathingLayoutVersion;
+}
+
+//------------------------------------------------------
+uint32_t AudioService::getBakedPathingLayoutVersion() const
+{
+    return mProbeManager ? mProbeManager->getBakedPathingLayoutVersion() : 0u;
 }
 
 //------------------------------------------------------

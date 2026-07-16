@@ -34,6 +34,7 @@
 #include "loop/LoopCommon.h"
 #include "audio/AudioDSPChain.h"
 #include "audio/AudioUnits.h"
+#include "audio/WorldApertureData.h"
 #include "audio/SchemaTypes.h"
 #include "room/RoomService.h"  // SoundPropInfo / SoundPropParams / SoundPathHop
 #include "worldquery/WorldQueryTypes.h"  // RayHit (for diagnostic raycaster setter)
@@ -499,6 +500,26 @@ public:
      *  degradation loudly rather than silently trusting the box test. */
     using AudioPointInAirFn = std::function<bool(const Vector3 &p)>;
     void setPointInAirFn(AudioPointInAirFn fn) { mPointInAirFn = std::move(fn); }
+
+    /** Which air REGION does this point belong to? (-1 = in solid / off-map.)
+     *
+     *  A region is a connected air volume bounded by REAL apertures —
+     *  computed renderer-side by WRAcousticTopology.h (WR data lives there,
+     *  mirroring setRaycaster / setPointInAirFn). Regions replace ROOM_DB
+     *  rooms as the pathing bake's coverage partition: ROOM_DB carves one
+     *  real space into dozens of boxes (a single MISS2 region holds 74 room
+     *  centers), so per-room coverage machinery over-produced probes ~8x.
+     *  See WorldApertureData.h and PLAN.PATHING_DESIGN.md §36. */
+    using AudioRegionOfPointFn = std::function<int(const Vector3 &p)>;
+
+    /** Renderer-computed aperture/region ground truth for the pathing bake
+     *  (see WorldApertureData.h for the full WHY). The pathing placement
+     *  refuses to run portal-first without it — LOUDLY, never silently
+     *  rebuilding the room-centroid layout this replaces. */
+    void setWorldApertureData(WorldApertureData data, AudioRegionOfPointFn fn) {
+        mWorldApertureData = std::move(data);
+        mRegionOfPointFn   = std::move(fn);
+    }
 
     /** Play a footstep sound for a specific material and speed.
      *  Selects a schema via env_tag matching: (Event Footstep) + (Material <keyword>).
@@ -1081,6 +1102,18 @@ public:
      *  is unchanged). False when no pathing batch is loaded. */
     bool pathingBakeCoverageMismatch() const;
 
+    /** True when the loaded .probes pathing section was baked under a
+     *  DIFFERENT probe-layout generation than the running code
+     *  (kPathingLayoutVersion vs the v6 header field; v4/v5 files read
+     *  back 0). Same handling as the other mismatches: the bake-decision
+     *  site schedules a loud automatic pathing-only re-bake. This is the
+     *  staleness signal for layout rewrites that change none of the other
+     *  recorded bake parameters — without it a pre-rewrite cache loads
+     *  silently and the run keeps the old layout with zero signal. */
+    bool pathingBakeLayoutMismatch() const;
+    /** Facade over ProbeManager::getBakedPathingLayoutVersion. */
+    uint32_t getBakedPathingLayoutVersion() const;
+
     /** Facade over ProbeManager::getBakedPathingRCovFt — the hub-fill
      *  coverage radius recorded in the loaded/just-baked .probes v5
      *  header (0 = none / v4 file). For mismatch diagnostics at the
@@ -1462,6 +1495,14 @@ private:
     // The REAL solidity test for probe placement — see setPointInAirFn.
     // Bake-time only; null in headless (announced loudly at bake).
     AudioPointInAirFn mPointInAirFn;
+
+    // Renderer-computed aperture/region ground truth for the pathing bake
+    // — see setWorldApertureData and WorldApertureData.h. Bake-time only;
+    // invalid in headless (the placement pass announces loudly and refuses
+    // portal-first placement rather than rebuilding the room-centroid
+    // fiction it replaces).
+    WorldApertureData mWorldApertureData;
+    AudioRegionOfPointFn mRegionOfPointFn;
 
     // ── Volumetric occlusion configuration ──
     //

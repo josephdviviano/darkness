@@ -632,6 +632,14 @@ public:
     /// visRange) must never be consumed silently by a coverage-era run.
     float getBakedPathingCoverageFt() const { return mBakedPathingCoverageFt; }
     float getBakedPathingRCovFt() const { return mBakedPathingRCovFt; }
+    /// Pathing probe LAYOUT generation recorded in the loaded/just-baked
+    /// .probes header (0 = pre-portal-first v4/v5 file). Compared against
+    /// kPathingLayoutVersion by AudioService::pathingBakeLayoutMismatch —
+    /// the staleness signal for layout rewrites that change none of the
+    /// other recorded bake parameters.
+    uint32_t getBakedPathingLayoutVersion() const {
+        return mBakedPathingLayoutVersion;
+    }
 
     /// Reflection bake profile of the CURRENT in-memory data (.probes v3
     /// header fields bakedReflectionRays / bakedProbeDedupRadiusFt).
@@ -836,6 +844,7 @@ private:
     PathingProbeDensity mBakedPathingDensity = PathingProbeDensity::Unknown;
     float mBakedPathingCoverageFt = 0.0f;
     float mBakedPathingRCovFt = 0.0f;
+    uint32_t mBakedPathingLayoutVersion = 0;
     int   mBakedReflectionRays = 0;
     float mBakedProbeDedupRadiusFt = 0.0f;
 

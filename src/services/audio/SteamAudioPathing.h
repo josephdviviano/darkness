@@ -197,41 +197,28 @@ constexpr float kPathingCoverageVisRangeMaxFt = 200.0f;
 /// [BAKE_PARITY]).
 constexpr int kPathingHubFillMaxPerRoom = 24;
 
-/// ── Bend-pair aperture threshold ────────────────────────────────────────
+/// ── Pathing probe LAYOUT generation ─────────────────────────────────────
 ///
-/// A NON-DOOR portal whose aperture is at least this big gets NO flanking
-/// bend pair; the room centroids carry routing through it instead. Door
-/// portals ALWAYS keep their pair regardless of size — a door IS an
-/// aperture by definition, and its flanks are what the runtime invalidates
-/// when it closes (measured: 18 of 102 MISS2 door portals are >= 3 ft, the
-/// largest 10.5 ft, so a size rule without this exemption would strip real
-/// doors).
-///
-/// UNITS: this is an INRADIUS — the distance from the portal center to its
-/// nearest bounding edge plane, i.e. HALF the narrow dimension. 6 ft means
-/// "wider than 12 ft". A 4 ft doorway measures 2 ft; MISS2's largest portal
-/// measures 100 ft (a 200 ft-wide "opening").
-///
-/// WHY A SIZE RULE AT ALL: ROOM_DB is the original engine's DAMPENING
-/// partition, not an aperture graph. Its rooms are coarse designer boxes
-/// drawn over the compiled geometry, so a "portal" is just a box boundary —
-/// frequently standing in the middle of open space, modelling nothing. Room
-/// 18 (the sole degree-53 outlier in the game) has ZERO door portals and 42
-/// non-door ones with a median 5 ft inradius; each was emitting a bend pair,
-/// putting ~94 probes in open courtyard air and building the clique that
-/// makes findAlternatePaths (quadratic in local density) expensive. This is
-/// also why MISS2 (max inradius 100 ft, 4 portals >= 25 ft) costs 74x MISS6
-/// (max 22.7 ft, none >= 25 ft) despite similar size and topology.
-///
-/// WHY 6 FT: diffraction only matters when the aperture is comparable to the
-/// wavelength (roughly 1-11 ft across the band that carries Thief's
-/// gameplay audio). A doorway bends sound audibly; a >12 ft opening barely
-/// does, so an explicit elbow there models nothing and only adds density.
-/// 6 ft is the conservative end of that physical range — it keeps every door
-/// and every narrow aperture, and only strips courtyard-scale boundaries.
-/// A portal with no usable edge planes reports inradius -1 and therefore
-/// KEEPS its pair (never drop an aperture we could not measure).
-constexpr float kPathingApertureBendThresholdFt = 6.0f;
+/// Bumped whenever the probe LAYOUT algorithm changes in a way none of the
+/// other .probes header fields capture (numSamples / density / R_cov all
+/// unchanged), so cached bakes from the previous layout trigger the loud
+/// automatic pathing-only re-bake instead of loading silently.
+///   0 = pre-portal-first (room centroids + portal/bend pairs; v4/v5 files
+///       read back 0)
+///   1 = portal-first (WR-aperture nodes, region coverage fill —
+///       PLAN.PATHING_DESIGN.md §36-38)
+constexpr uint32_t kPathingLayoutVersion = 1u;
+
+/// (The bend-pair aperture size threshold that lived here —
+/// kPathingApertureBendThresholdFt = 6 ft on the ROOM_DB portal inradius —
+/// is REMOVED, and deliberately not re-tunable: the number it thresholded
+/// was a ROOM_DB box reading, and ROOM_DB size is fiction. Measured: three
+/// physically-adjacent real arches read 6.300 ft there (real openings
+/// 1.9-2.8 ft, overstated ~2.5x) and were silenced by a 5% margin, while
+/// genuine mid-air box boundaries read 5.00 ft and were kept. The aperture
+/// test is now the WR oracle — a portal is real iff world-geometry portal
+/// area exists at it — with no size rule at all.
+/// PLAN.PATHING_DESIGN.md §34/§36; WorldApertureData.h.)
 
 /// ── Warmup first-solve stagger (PLAN.PATHING_DESIGN.md §15/§16) ─────────
 ///

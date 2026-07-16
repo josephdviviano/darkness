@@ -182,12 +182,16 @@ inline uint32_t crc32(const uint8_t *data, size_t length) {
 // ── Probe file header ─────────────────────────────────────────────────────
 
 static constexpr uint32_t kProbeFileMagic   = 0x72504B44u; // "DKPr" little-endian
-static constexpr uint32_t kProbeFileVersion = 5u;
-/// v4 files (36-byte header, no coverage fields) are still accepted — the
-/// loader zero-fills the v5 tail and AudioService's coverage-mismatch
-/// check schedules the loud pathing-only re-bake. See the format doc.
+static constexpr uint32_t kProbeFileVersion = 6u;
+/// v4 (36-byte header) and v5 (44-byte) files are still accepted — the
+/// loader zero-fills the missing tail fields and AudioService's mismatch
+/// checks schedule the loud pathing-only re-bake: zero coverage (v4) trips
+/// the coverage check, zero layout version (v4 AND v5) trips the
+/// layout-version check. See the format doc.
+static constexpr uint32_t kProbeFileVersionV5 = 5u;
 static constexpr uint32_t kProbeFileVersionV4 = 4u;
-static constexpr size_t   kProbeFileHeaderSize = 44u;        // 11 x 4-byte fields
+static constexpr size_t   kProbeFileHeaderSize = 48u;        // 12 x 4-byte fields
+static constexpr size_t   kProbeFileHeaderSizeV5 = 44u;      // v5 prefix
 static constexpr size_t   kProbeFileHeaderSizeV4 = 36u;      // v4 prefix
 static constexpr size_t   kProbeBatchRecordHeaderSize = 16u; // 4 x uint32_t
 
@@ -210,12 +214,23 @@ struct ProbeFileHeader {
     uint32_t bakedPathingDensity    = 0;    // v4: PathingProbeDensity tier
     float    bakedPathingCoverageFt = 0.0f; // v5: coverage governing (ft)
     float    bakedPathingRCovFt     = 0.0f; // v5: hub-fill coverage radius (ft)
+    /// v6: pathing probe LAYOUT generation (kPathingLayoutVersion,
+    /// SteamAudioPathing.h). 0 = pre-portal-first layout (v4/v5 files,
+    /// room centroids + bend pairs); 1 = portal-first (WR-aperture nodes
+    /// + region coverage fill). None of the OTHER header fields change
+    /// across a layout rewrite, so without this a pre-rewrite cache loads
+    /// silently and the run keeps the old layout with zero signal — the
+    /// silent-stale-cache class the mismatch machinery exists to prevent.
+    uint32_t bakedPathingLayoutVersion = 0;
 };
 static_assert(sizeof(ProbeFileHeader) == kProbeFileHeaderSize,
-              "ProbeFileHeader must be exactly 44 bytes");
+              "ProbeFileHeader must be exactly 48 bytes");
 static_assert(offsetof(ProbeFileHeader, bakedPathingCoverageFt)
                   == kProbeFileHeaderSizeV4,
               "v5 tail must start exactly where the v4 header ended");
+static_assert(offsetof(ProbeFileHeader, bakedPathingLayoutVersion)
+                  == kProbeFileHeaderSizeV5,
+              "v6 tail must start exactly where the v5 header ended");
 
 /// On-disk per-batch record header (unchanged since v2). One precedes each
 /// batch payload.
@@ -304,7 +319,8 @@ inline bool writeProbeFile(const std::string &outputPath,
                            float bakedProbeDedupRadiusFt = 0.0f,
                            uint32_t bakedPathingDensity = 0,
                            float bakedPathingCoverageFt = 0.0f,
-                           float bakedPathingRCovFt = 0.0f)
+                           float bakedPathingRCovFt = 0.0f,
+                           uint32_t bakedPathingLayoutVersion = 0)
 {
     // Build outer header
     ProbeFileHeader hdr;
@@ -318,6 +334,7 @@ inline bool writeProbeFile(const std::string &outputPath,
     hdr.bakedPathingDensity    = bakedPathingDensity;
     hdr.bakedPathingCoverageFt = bakedPathingCoverageFt;
     hdr.bakedPathingRCovFt     = bakedPathingRCovFt;
+    hdr.bakedPathingLayoutVersion = bakedPathingLayoutVersion;
 
     std::string tmpPath = outputPath + ".tmp";
     FILE *f = std::fopen(tmpPath.c_str(), "wb");
@@ -390,20 +407,29 @@ inline ProbeFileStatus loadProbeFile(const std::string &path,
     }
 
     if (outHeader.version == kProbeFileVersion) {
-        // v5: read the coverage tail (two floats appended after the v4
-        // prefix — see the static_assert on the field offset).
+        // v6: read the full tail (coverage floats + layout version).
         if (std::fread(&outHeader.bakedPathingCoverageFt,
                        kProbeFileHeaderSize - kProbeFileHeaderSizeV4,
                        1, f) != 1) {
             std::fclose(f);
             return ProbeFileStatus::FileTooSmall;
         }
+    } else if (outHeader.version == kProbeFileVersionV5) {
+        // v5: coverage tail only; layout version stays zero-initialized,
+        // which fails the layout-mismatch check in AudioService and
+        // triggers the loud automatic pathing-only re-bake (the v5 layout
+        // predates portal-first placement). Reflection IRs carry forward.
+        if (std::fread(&outHeader.bakedPathingCoverageFt,
+                       kProbeFileHeaderSizeV5 - kProbeFileHeaderSizeV4,
+                       1, f) != 1) {
+            std::fclose(f);
+            return ProbeFileStatus::FileTooSmall;
+        }
     } else if (outHeader.version == kProbeFileVersionV4) {
-        // v4: accepted with zeroed coverage fields (the struct init above
-        // already zeroed them). The zero bakedPathingRCovFt fails the
-        // coverage-mismatch check in AudioService and triggers the loud
-        // automatic pathing-only re-bake, which rewrites the file as v5 —
-        // the reflection IR blob (the expensive half) carries forward
+        // v4: accepted with zeroed coverage AND layout fields (the struct
+        // init above already zeroed them); both mismatch checks fire, one
+        // loud pathing-only re-bake rewrites the file as v6. The
+        // reflection IR blob (the expensive half) carries forward
         // unchanged. See the format doc's v4 section.
     } else {
         std::fclose(f);
