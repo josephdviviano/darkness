@@ -248,7 +248,7 @@ struct RenderConfig {
     uint32_t propMaxPaths     = 2;
     // Alternates kept only if their effective distance is within this
     // many world units of the primary. Matches the original engine's
-    // kMaxDistDiff = 10. Clamped to [0, 50].
+    // distance-difference cap default = 10. Clamped to [0, 50].
     float    propMaxPathDiff  = 10.0f;
     // Multiplier on the scalar gain produced by Steam Audio's baked
     // pathing eqCoeffs. 1.0 = identity. Use > 1 to make through-portal

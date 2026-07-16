@@ -44,12 +44,16 @@
 ///     coverage in the corners of the visibility graph that the floor grid
 ///     misses.
 ///
-///   * Pathing batch — sparse ROOM_PORTAL graph (typically 100-300 probes
-///     on a Thief mission). One probe at each room centroid, two probes
-///     ±offset across each portal plane. Steam Audio's `findAlternatePaths`
-///     cost is ~quadratic in probe count when door OBBs invalidate baked
-///     paths at runtime — sparse-graph pathing reduces a multi-second hang
-///     to microseconds.
+///   * Pathing batch — sparse PORTAL-FIRST graph (typically 300-1000
+///     probes on a Thief mission). Nodes come from the world geometry,
+///     not ROOM_DB boxes: one probe at each REAL aperture's in-air
+///     anchor (WR-oracle-validated; fictional ROOM_DB portals emit
+///     nothing), two probes flanking each door, plus region-scoped
+///     interior coverage/seed/stitch probes and emitter anchors
+///     (PLAN.PATHING_DESIGN.md §36-40). Steam Audio's
+///     `findAlternatePaths` cost is ~quadratic in probe count when door
+///     OBBs invalidate baked paths at runtime — sparse-graph pathing
+///     reduces a multi-second hang to microseconds.
 ///
 /// Batch attachment is ASYMMETRIC (PR #6): the REFLECTION simulator gets
 /// ONLY batches carrying reflections bake data — Steam Audio v4.7.0's
@@ -216,12 +220,13 @@ inline PathingProbeDensity pathingProbeDensityFromName(const std::string &s) {
     return PathingProbeDensity::Unknown;
 }
 
-/// One pathing-graph node candidate, supplied by AudioService. Each Room
-/// contributes one centroid candidate; each non-door portal contributes
-/// one (at the centroid); each door portal contributes two (flanking
-/// the door OBB along the portal normal); each persistent ambient
-/// emitter contributes one (mirror anchor). ProbeManager runs them
-/// through the supplied filter the same way it does floor probes.
+/// One pathing-graph node candidate, supplied by AudioService under the
+/// portal-first layout: each REAL aperture contributes one probe (at its
+/// in-air anchor) or a flanking pair when a door OBB sits in it; the
+/// region coverage fill contributes interior/seed/stitch probes; each
+/// persistent ambient emitter contributes one mirror anchor. ProbeManager
+/// runs them through the supplied filter the same way it does floor
+/// probes.
 struct PathingProbeCandidate {
     Vector3 position{0.0f, 0.0f, 0.0f};
     float   radiusFt = 5.0f;   ///< Influence radius — sized adaptively post-dedup.
@@ -382,8 +387,9 @@ struct ProbeBakeParams {
     /// return null routing (synthetic-bypass branch in AudioService).
     bool   bakePathingBatch = true;
 
-    /// Caller-supplied pathing graph node candidates. One per room
-    /// centroid + two per portal (±offset). Order does not matter;
+    /// Caller-supplied pathing graph node candidates (portal-first:
+    /// aperture probes, door pairs, region fill, emitter anchors —
+    /// see PathingProbeCandidate). Order does not matter;
     /// ProbeManager runs them through `pathingProbeFilter` and dedups
     /// internally. Influence radius travels per-candidate so room-scale
     /// and portal-scale probes can co-exist without false overlap.
@@ -398,9 +404,9 @@ struct ProbeBakeParams {
 
     /// Bake-time single-edge distance cap (engine feet) for the pathing
     /// visibility graph (`IPLPathBakeParams::visRange`). Derived by
-    /// AudioService::prepareProbeBakeParams from the mission's ROOM_DB
-    /// (max intra-room portal-to-portal span / room diameter × margin,
-    /// clamped) — ProbeManager deliberately does not depend on
+    /// AudioService::prepareProbeBakeParams from achieved coverage
+    /// (max aperture -> nearest same-REGION anchor post-fill, x margin,
+    /// clamped [100, 200] ft) — ProbeManager deliberately does not depend on
     /// RoomService, so the derivation travels here. <= 0 means the
     /// caller could not derive a cap; bakePathingBatch falls back LOUDLY
     /// to the whole-level range (the pre-cap behaviour). Does NOT bound

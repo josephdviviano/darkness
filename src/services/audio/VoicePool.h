@@ -136,7 +136,8 @@ struct SteamAudioDSPNode {
     // callback, with portalAttenuation=1.0 + portalBlocking=0.0
     // collapsing to no-op for same-room voices.
     bool usePortalRouting = false;
-    bool skipAttenuation = false;        // true for player-emitted sounds (footsteps within 5 units)
+    bool skipAttenuation = false;        // bypass hook for SA distance/occlusion — currently NEVER set true
+                                         // (reset each frame); rip out or wire up at next review
 
     // Per-voice override for IPLBinauralEffectParams::spatialBlend.
     // 1.0 = full HRTF; 0.0 = mono passthrough. Used by AMB_ENVIRONMENTAL

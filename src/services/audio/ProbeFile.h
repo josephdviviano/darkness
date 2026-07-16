@@ -25,11 +25,11 @@
 /// @file ProbeFile.h
 /// Probe file format with integrity checking for baked acoustic probe data.
 ///
-/// === Version 5 (current) — v4 + coverage-based bake-range derivation ===
+/// === Version 6 (current) — v5 + probe-layout generation record ===
 ///
 /// File layout (all fields little-endian):
 ///   [0..3]   magic       "DKPr" (0x72504B44)
-///   [4..7]   version     format version (currently 5; v4 still ACCEPTED —
+///   [4..7]   version     format version (currently 6; v4/v5 still ACCEPTED —
 ///            see the v4 note below)
 ///   [8..11]  batchCount  number of probe batches that follow
 ///   [12..15] totalProbes total probe count across all batches (sanity)
@@ -57,17 +57,15 @@
 ///   [28..31] bakedProbeDedupRadiusFt  float — the reflection batch's global
 ///            dedup radius (engine feet) at bake time; the probe-DENSITY
 ///            half of the profile.
-///   [32..35] bakedPathingDensity      uint32 — PathingProbeDensity tier the
-///            pathing section's probe LAYOUT was emitted at
-///            (audio.pathing_probes.density: 1=baseline, 2=bends; see
-///            ProbeManager.h). 0 when no pathing batch. Mismatch against the
-///            active config = same policy as bakedPathingNumSamples: loud
-///            message + automatic pathing-only re-bake — a baseline cache
-///            consumed at bends density silently lacks the per-portal bend
-///            pairs the runtime layout expects (and vice versa).
+///   [32..35] bakedPathingDensity      uint32 — the density knob value
+///            (audio.pathing_probes.density: 1=baseline, 2=bends) recorded
+///            at bake time. 0 when no pathing batch. Under the portal-first
+///            layout the knob no longer changes placement (retirement is a
+///            flagged review decision); the mismatch check remains so the
+///            header always reflects the active config.
 ///   [36..39] bakedPathingCoverageFt   float (v5) — the coverage governing
-///            value the visRange cap was derived from: max over rooms of
-///            (max portal → nearest same-room probe distance, POST hub
+///            value the visRange cap was derived from: max over REGIONS of
+///            (max aperture → nearest same-region probe distance, POST
 ///            fill). Diagnostic record of the derivation input; 0 when no
 ///            pathing batch (or a v4 file).
 ///   [40..43] bakedPathingRCovFt       float (v5) — the coverage radius
@@ -77,6 +75,21 @@
 ///            bakedPathingNumSamples: loud message + automatic pathing-only
 ///            re-bake — the fill probes and the coverage-derived visRange
 ///            both depend on it.
+///   [44..47] bakedPathingLayoutVersion uint32 (v6) — the probe LAYOUT
+///            generation (kPathingLayoutVersion, SteamAudioPathing.h;
+///            0 = pre-portal-first, 1 = portal-first). A layout rewrite
+///            changes none of the other recorded parameters, so without
+///            this field a pre-rewrite cache loads silently with the old
+///            layout. 0 when no pathing batch (or a v4/v5 file); mismatch
+///            = loud automatic pathing-only re-bake.
+///
+/// === Version 5 (legacy, still ACCEPTED) — v4 + coverage records ===
+///
+/// 44-byte header ending at bakedPathingRCovFt; no layout-version field.
+/// v5 files load normally with bakedPathingLayoutVersion = 0, which fails
+/// AudioService::pathingBakeLayoutMismatch and triggers the loud automatic
+/// pathing-only re-bake (reflections carried forward) — a v5 pathing
+/// section predates the portal-first layout by definition.
 ///
 /// === Version 4 (legacy, still ACCEPTED) — v3 + layout-density record ===
 ///
@@ -87,9 +100,8 @@
 /// expensive half) is fully reusable. The zeroed bakedPathingRCovFt then
 /// fails AudioService::pathingBakeCoverageMismatch, which triggers the
 /// loud automatic PATHING-ONLY re-bake (reflections carried forward) and
-/// rewrites the file as v5 — the pre-coverage probe layout (no HubFill
-/// probes, max-span-derived visRange) is exactly what that mismatch check
-/// exists to keep out of a coverage-era run.
+/// rewrites the file as v6 — the pre-coverage probe layout is exactly what
+/// that mismatch check exists to keep out of a coverage-era run.
 ///
 /// Reflection-profile mismatch policy (differs from the pathing fields):
 /// a mismatch against the active profile does NOT auto-re-bake — the
@@ -310,6 +322,10 @@ inline const char *probeFileStatusString(ProbeFileStatus s) {
 /// @param bakedPathingRCovFt v5 bake-profile record: the hub-fill coverage
 ///                     radius (kPathingCoverageRadiusFt) active at bake
 ///                     time. Pass 0 when no pathing batch.
+/// @param bakedPathingLayoutVersion v6 bake-profile record: the probe
+///                     LAYOUT generation (kPathingLayoutVersion) the
+///                     pathing section was emitted by. Pass 0 when no
+///                     pathing batch.
 /// @return true on success
 inline bool writeProbeFile(const std::string &outputPath,
                            const std::vector<ProbeBatchRecord> &batches,

@@ -998,7 +998,7 @@ static void printSoundChunks(const FileGroupPtr &db) {
         speechLoaded = speechDB.loadFromChunk(bytes.data(), bytes.size());
     }
 
-    // ENV_SOUND — decoded as a cTagDBDatabase tag tree. Each surfaced
+    // ENV_SOUND — decoded as a TagDB tag tree. Each surfaced
     // entry corresponds to a key-path that resolves to one or more
     // schema ObjIDs (with matching weight). The chunk preamble carries
     // a "required tag" bitarray that gates which tag-types must appear

@@ -539,7 +539,7 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
     // wrong chain.
     //
     // Generalizes the Dark Engine's dual-predecessor scheme
-    // (cBFRoomInfo::previous_room_2 + MergeSounds) to N configurable
+    // (a hardcoded two-path merge) to N configurable
     // paths; N=1 single-shortest, N=2 reproduces the original engine.
     struct BFSEntry {
         Room    *room;
@@ -569,7 +569,7 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
     thread_local std::unordered_map<int32_t, std::vector<BFSEntry>> reachedFrom;
     reachedFrom.clear();
     // Mirrors paths.front().effectiveDist for the cutoff comparison; kept
-    // separately so the kMaxDistDiff filter is a single map lookup.
+    // separately so the distance-difference filter is a single map lookup.
     thread_local std::unordered_map<int32_t, float> bestDist;
     bestDist.clear();
 
@@ -1103,7 +1103,7 @@ SoundPropInfo RoomService::propagateSoundPath(const Vector3 &sourcePos,
     }
 
     // ── Merge: min effDist drives scalar fields; inv-d² weighted vPos. ──
-    // Matches the original engine's MergeSounds (PSNDINST.CPP) policy of
+    // Matches the original engine's sound-merge policy of
     // taking the loudest contribution for volume + LPF, while letting the
     // virtual position blend so panning reflects multi-opening geometry.
     const SoundPathRecord &best = pathRecords.front();

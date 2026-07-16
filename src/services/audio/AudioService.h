@@ -322,7 +322,7 @@ public:
     AudioService(ServiceManager *manager, const std::string &name);
     ~AudioService() override;
 
-    // ── Public API (stubs — wired up in later tasks) ──
+    // ── Public API (schema playback + control) ──
 
     /** Play a schema by name at a world position (one-shot or looping).
      *  @param schemaName  Schema name (as defined in .sch files)
@@ -1790,6 +1790,15 @@ private:
 
     /// Acoustic scene built from WR world geometry
     IPLScene mIplScene = nullptr;
+    /// How many references WE hold on mIplScene (1 from iplSceneCreate +
+    /// 1 per iplSceneRetain handed to a simulator). destroyAcousticScene
+    /// releases exactly this many. A hardcoded release count was measured
+    /// wrong in BOTH directions: the pathing simulator's retain was added
+    /// without a third release (leaked the whole scene — static mesh +
+    /// BVH — on every mission reload), and early init-failure paths
+    /// reach destroy with only the create reference (releasing two was a
+    /// use-after-free inside Steam Audio).
+    int mIplSceneRefCount = 0;
 
     /// Static mesh within the scene (world geometry + material assignments)
     IPLStaticMesh mIplStaticMesh = nullptr;
@@ -2378,7 +2387,8 @@ private:
     // because the pruning runs mid-BFS (at intermediate rooms, not
     // only at the listener room), alternates die early and never get
     // a chance to reach the listener. The legacy default of 10 came
-    // from the original engine's kMaxDistDiff and was tuned for a
+    // from the original engine's alternate-path distance-difference
+    // cap and was tuned for a
     // single-source renderer where alternates only modulated a
     // centroid by a few percent. For the multi-path renderer a tight
     // window discards physically-meaningful alternates whose

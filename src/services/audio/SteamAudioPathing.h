@@ -158,29 +158,29 @@ constexpr int kPathingVisSamplesDev  = 4;
 
 /// ── Coverage-based probe-layout / bake-range constants ──────────────────
 ///
-/// Graph-reduction lever (PLAN.PATHING_DESIGN.md §10, user-approved
-/// direction 2026-07-13): instead of deriving the bake's single-edge
-/// visRange cap from the mission's largest ROOM SPAN (one hub room like
-/// MISS2 room 18 — 331 ft intra-room hops — used to inflate the whole
-/// bake to the 400 ft clamp ceiling), hub rooms whose portals sit further
-/// than kPathingCoverageRadiusFt from any same-room graph anchor receive
-/// interior HubFill probes (visibility-aware greedy k-center, Gonzalez
-/// farthest-point) until every portal has a nearby in-room hop anchor.
+/// Graph-reduction lever (§10 machinery, re-scoped to WR REGIONS by the
+/// portal-first overhaul — PLAN.PATHING_DESIGN.md §36-40): air regions
+/// whose apertures sit further than kPathingCoverageRadiusFt from any
+/// same-region graph anchor receive interior HubFill probes
+/// (visibility-aware greedy k-center, Gonzalez farthest-point); the fill
+/// also SEEDS zero-anchor regions carrying real aperture demand and
+/// STITCHES disconnected anchor components with stepping stones (§40b).
+/// So on a typical mission the fill fires in MANY regions (MISS2: ~100
+/// seeds + fill; MISS15: 155) — that spread is normal, not over-fire.
 /// The bake cap is then derived from the POST-fill coverage:
 ///
-///   visRange = clamp(kPathingCoverageMarginMul × max_room(governing),
+///   visRange = clamp(kPathingCoverageMarginMul × max_region(governing),
 ///              [kPathingCoverageVisRangeMinFt, kPathingCoverageVisRangeMaxFt])
 ///
-/// where governing(room) = max over the room's (non-sky) portals of the
-/// distance to the nearest same-room probe, excluding the portal's own
-/// flank probes (a route entering via a portal lands on its flanks and
-/// must HOP onward — the hop length is what visRange has to cover; the
-/// ×2 margin bounds anchor-to-anchor hops via the demand point between
-/// them). kPathingCoverageRadiusFt starts at 75 ft per the §10 research
-/// (k-center / disk-cover decomposition; fill expected to fire in ~3 hub
-/// rooms game-wide at this radius).
+/// where governing(region) = max over the region's aperture demand of the
+/// distance to the nearest same-region probe, excluding the aperture's
+/// own probe (a route entering via an aperture lands on it and must HOP
+/// onward — the hop length is what visRange has to cover; the ×2 margin
+/// bounds anchor-to-anchor hops via the demand point between them).
+/// kPathingCoverageRadiusFt is 75 ft per the §10 research (k-center /
+/// disk-cover decomposition).
 ///
-/// Recorded in the .probes v5 header (bakedPathingRCovFt /
+/// Recorded in the .probes header (bakedPathingRCovFt /
 /// bakedPathingCoverageFt) so a cache baked under a different coverage
 /// radius (or the pre-coverage max-span derivation — v4 files, which
 /// read back 0) is caught by AudioService::pathingBakeCoverageMismatch
@@ -190,12 +190,13 @@ constexpr float kPathingCoverageRadiusFt      = 75.0f;
 constexpr float kPathingCoverageMarginMul     = 2.0f;
 constexpr float kPathingCoverageVisRangeMinFt = 100.0f;
 constexpr float kPathingCoverageVisRangeMaxFt = 200.0f;
-/// Per-room ceiling on HubFill probes. Purely a runaway guard — the
-/// §10 estimate is 6-14 probes for the worst hub room; hitting this cap
-/// is announced loudly and the room's residual coverage then shows up in
-/// the [PATHING_BAKE_RANGE] derivation (and, if edges go missing,
-/// [BAKE_PARITY]).
-constexpr int kPathingHubFillMaxPerRoom = 24;
+/// Per-REGION ceiling on fill + seed + stitch probes. Purely a runaway
+/// guard; hitting it is announced loudly and the region's residual
+/// coverage/connectivity then shows up in the [PATHING_BAKE_RANGE]
+/// derivation and [REGION_PARITY]. NOTE: tuned when the fill was
+/// room-scoped; regions are ~8x larger units (review item — it did not
+/// bind on MISS2/6/7/15).
+constexpr int kPathingFillMaxPerRegion = 24;
 
 /// ── Pathing probe LAYOUT generation ─────────────────────────────────────
 ///

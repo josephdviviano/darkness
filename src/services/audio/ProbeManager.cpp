@@ -973,9 +973,9 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     }
 
     // Commit candidates to the IPL batch. Per-candidate radius lets
-    // room-centroid probes have a large influence sphere (covers the
-    // whole room) while portal probes have a small one (so a closed-door
-    // OBB between two portal probes invalidates only one edge instead of
+    // interior fill probes carry a large influence sphere (covering
+    // their surroundings) while aperture probes keep a small one (so a
+    // closed-door OBB between two flanks invalidates only one edge instead of
     // the whole graph segment).
     for (size_t i = 0; i < positions.size(); ++i) {
         IPLSphere s{};
@@ -1046,12 +1046,12 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
     // pathRange gates total ROUTE length), and the ray cost lives
     // entirely on visRange. So they are now split:
     //
-    //   • visRange = the SINGLE-EDGE cap, derived from the mission's
-    //     own ROOM_DB (params.pathingVisRangeFt: max intra-room
-    //     portal-to-portal span / room diameter × 1.5 margin, clamped
-    //     to [150, 400] ft — see AudioService::prepareProbeBakeParams).
-    //     The longest meaningful single hop is a room-scale distance:
-    //     any two probes further apart than the largest room either
+    //   • visRange = the SINGLE-EDGE cap, derived from achieved
+    //     coverage (params.pathingVisRangeFt: max aperture ->
+    //     nearest-same-REGION-anchor post-fill x 2.0 margin, clamped
+    //     to [100, 200] ft — see AudioService::prepareProbeBakeParams).
+    //     The longest meaningful single hop is a coverage-scale distance:
+    //     any two probes further apart than the worst covered gap either
     //     have geometry between them (edge would fail the ray test
     //     anyway — we're paying numSamples² rays to discover "no") or are
     //     connected through intermediate room/portal probes (multi-hop
@@ -1294,7 +1294,10 @@ bool ProbeManager::bakeProbes(IPLScene scene,
                                   hdrVisRangeFt, hdrNumSamples,
                                   hdrReflRays, hdrReflDedupFt,
                                   hdrDensity, hdrCoverageFt, hdrRCovFt,
-                                  kPathingLayoutVersion);
+                                  // 0-when-no-pathing like every other
+                                  // pathing header field — a reflection-
+                                  // only file must not claim a layout.
+                                  havePathing ? kPathingLayoutVersion : 0u);
 
     // Position sidecars (one per batch). Failure is non-fatal — overlay
     // just lacks positions until the next bake. Reflection batch carries
@@ -1336,7 +1339,7 @@ bool ProbeManager::bakeProbes(IPLScene scene,
     mBakedPathingDensity    = static_cast<PathingProbeDensity>(hdrDensity);
     mBakedPathingCoverageFt = hdrCoverageFt;
     mBakedPathingRCovFt     = hdrRCovFt;
-    mBakedPathingLayoutVersion = kPathingLayoutVersion;
+    mBakedPathingLayoutVersion = havePathing ? kPathingLayoutVersion : 0u;
     mBakedReflectionRays    = static_cast<int>(hdrReflRays);
     mBakedProbeDedupRadiusFt = hdrReflDedupFt;
 

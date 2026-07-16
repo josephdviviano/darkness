@@ -152,7 +152,21 @@ SchemaParser::Token SchemaParser::Tokenizer::readToken()
         num += mSource[mPos++];
         while (mPos < mSource.size() && std::isdigit(mSource[mPos]))
             num += mSource[mPos++];
-        return {TokenType::Integer, num, std::stoi(num), tokenLine};
+        // Guarded: an out-of-int-range literal in a (possibly fan-made)
+        // .sch must surface as a parser error, not an uncaught
+        // std::out_of_range terminating the whole load. Same defensive
+        // pattern as the env-tag matcher's stoi.
+        int value = 0;
+        try {
+            value = std::stoi(num);
+        } catch (const std::exception &) {
+            if (mParserErrors) {
+                mParserErrors->push_back(
+                    "line " + std::to_string(tokenLine) +
+                    ": integer literal out of range: " + num);
+            }
+        }
+        return {TokenType::Integer, num, value, tokenLine};
     }
 
     // Identifier or keyword

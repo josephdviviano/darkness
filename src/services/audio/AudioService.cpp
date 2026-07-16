@@ -505,8 +505,11 @@ static inline float audioSanitizeScalar(float v, float fallback = 0.0f) {
 /// dropouts that look indistinguishable from NaN-silenced channels.  Worth
 /// enabling on every thread that runs DSP code.
 ///
-/// macOS arm64: set FPCR bits FZ (24) and the per-input flush bit (FZ16,
-/// bit 19).  x86 (Intel macOS, Linux, Windows): use the SSE MXCSR macros.
+/// macOS arm64: set FPCR bit FZ (24) — flush denormal RESULTS to zero.
+/// (FZ16, bit 19, is deliberately NOT set: no half-precision DSP runs
+/// here, and the code below matches this comment — an earlier version of
+/// this doc claimed both bits while only 24 was set.)
+/// x86 (Intel macOS, Linux, Windows): use the SSE MXCSR macros.
 /// Both calls are idempotent; safe to invoke at the top of every audio
 /// callback (cost is a single register read/write).
 static inline void audioEnableDenormalFlush() {
@@ -1132,11 +1135,13 @@ static std::atomic<float> sCommitPeakMs{0.0f};         // peak iplSimulatorCommi
 // dump consumes them via snapshotAndReset(). Gated by gAudioLogVerbose
 // at every call site so production cost is zero.
 static LatencyHistogram sPerfDspNodeMs;       // SteamAudioDSPNode per-voice callback
-// T2.1 — per-callback wall-clock for the audio callback body. Same
-// signal as sPerfDspNodeMs's per-voice record but captured at the
-// callback boundary (start-to-end of steamAudioNodeProcess for one
-// voice's contribution), so we can compare p50/p95/p99 against the
-// hard CoreAudio deadline `frames / sampleRate × 1000 ms`. Writer:
+// T2.1 — PER-VOICE wall-clock of one steamAudioNodeProcess invocation.
+// CAUTION: this is NOT the whole-callback cost — a callback runs one
+// node process per active voice, so the true callback load is roughly
+// the SUM over voices. Comparing this histogram's p99 against the
+// CoreAudio deadline therefore UNDERSTATES load by ~Nvoices — with 10
+// voices at 15% each, no deadline warning fires at ~150% real load.
+// (True per-callback accounting = flagged review item.) Writer:
 // audio thread (one, via the same gAudioLogVerbose gate that
 // already guards sPerfDspNodeMs). Reader: main-thread periodic
 // dump. Budget-breach warning logged from the main thread when
@@ -4105,7 +4110,11 @@ bool AudioService::initMiniaudio()
         return false;
     }
 
-    // Store the engine sample rate (48kHz) for Steam Audio to match.
+    // Store the ENGINE sample rate for Steam Audio to match. NAME WARNING:
+    // the member is called mDeviceSampleRate but holds the engine/mixer
+    // rate (ma_engine_get_sample_rate), which may differ from the device
+    // hardware clock — renaming it is a review item; do not read it as
+    // the device rate.
     // The device may run at a different native rate (e.g. 96kHz);
     // miniaudio resamples internally.
     mDeviceSampleRate = ma_engine_get_sample_rate(mMaEngine);
@@ -4771,6 +4780,7 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         sceneSettings.type = sceneTypeEnum;
 
         IPLerror err = iplSceneCreate(mIplContext, &sceneSettings, &mIplScene);
+        if (err == IPL_STATUS_SUCCESS) mIplSceneRefCount = 1;
         if (err != IPL_STATUS_SUCCESS && sceneTypeEnum == IPL_SCENETYPE_EMBREE) {
             std::fprintf(stderr,
                 "[FALLBACK] iplSceneCreate(embree) failed (error %d) — Steam Audio "
@@ -4782,6 +4792,7 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             mSceneTypeCfg = "default";
             sceneSettings.type = sceneTypeEnum;
             err = iplSceneCreate(mIplContext, &sceneSettings, &mIplScene);
+            if (err == IPL_STATUS_SUCCESS) mIplSceneRefCount = 1;
         }
         if (err != IPL_STATUS_SUCCESS) {
             LOG_ERROR("AudioService: iplSceneCreate failed (error %d)", err);
@@ -5159,6 +5170,7 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
         // brings it down to zero (one retain per simulator + the original
         // create reference).
         iplSceneRetain(mIplScene);
+        ++mIplSceneRefCount;
         iplSimulatorSetScene(directSimHandle, mIplScene);
         iplSimulatorCommit(directSimHandle);
 
@@ -5221,6 +5233,7 @@ bool AudioService::buildAcousticScene(const AcousticSceneData &data)
             // the direct sim above — refcount balances against the
             // iplSceneRelease in destroyAcousticScene).
             iplSceneRetain(mIplScene);
+            ++mIplSceneRefCount;
             iplSimulatorSetScene(pathingSimHandle, mIplScene);
             iplSimulatorCommit(pathingSimHandle);
 
@@ -5821,14 +5834,19 @@ void AudioService::destroyAcousticScene()
         mIplStaticMesh = nullptr;
     }
     if (mIplScene) {
-        // We hold two references on the scene: one from iplSceneCreate, one
-        // from iplSceneRetain in initAcousticScene (the second simulator's
-        // reference). Release both so the refcount reaches zero. Pass a
-        // local handle the first time so iplSceneRelease's null-on-deref
-        // doesn't clobber mIplScene before the second call.
-        IPLScene aliased = mIplScene;
-        iplSceneRelease(&aliased);            // drops the retain
-        iplSceneRelease(&mIplScene);          // drops the original create-ref
+        // Release exactly as many references as we actually acquired
+        // (create + one per simulator retain — mIplSceneRefCount). Early
+        // init-failure paths reach here holding ONLY the create reference,
+        // and the fully-built pipeline holds three; a hardcoded count was
+        // wrong in both directions (leak on reload / UAF on init failure).
+        // Aliased handles for all but the last release so iplSceneRelease's
+        // null-on-deref doesn't clobber mIplScene early.
+        for (int i = 0; i + 1 < mIplSceneRefCount; ++i) {
+            IPLScene aliased = mIplScene;
+            iplSceneRelease(&aliased);
+        }
+        iplSceneRelease(&mIplScene);          // final: nulls mIplScene
+        mIplSceneRefCount = 0;
     }
 
     // Drop the dangling-pointer aliased scene handle that AudioOcclusion
@@ -6612,7 +6630,10 @@ void AudioService::loopStep(float deltaTime)
         const int delta = cur - sLastDoorXformCount;
         sLastDoorXformCount = cur;
         sDoorXformDeltaForTick.store(delta, std::memory_order_relaxed);
-        if (delta > 0) {
+        if (delta > 0 && gAudioLogVerbose) {
+            // Verbose-gated: during a continuous door swing this fires
+            // every loopStep (~60 lines/s) — exactly the door-stress
+            // workload whose logs the perf scripts parse.
             static std::atomic<uint64_t> sFrame{0};
             const uint64_t f = sFrame.fetch_add(1, std::memory_order_relaxed);
             std::fprintf(stderr,
@@ -7147,7 +7168,6 @@ void AudioService::loopStep(float deltaTime)
             SoundHandle handle;
             float distSq;
         };
-        std::vector<VoiceDist> reflCandidates;
         std::unordered_set<SoundHandle> reflCandidateSet;
 
         // Reflection top-N ranking runs FIRST: both the harvest pass
@@ -7267,9 +7287,8 @@ void AudioService::loopStep(float deltaTime)
         // previous-cycle before PR 1b (background thread, throttled),
         // which is imperceptible since reverb tails change slowly.
 
-        // reflCandidates and reflCandidateSet were computed in the
-        // ranking block above so both this pass and the staging pass see
-        // the same top-N decision.
+        // reflCandidateSet was computed in the ranking block above so
+        // both this pass and the staging pass see the same top-N decision.
 
         // Track total convolution voices against the audio callback budget.
         // Tail voices (sourceEnded, still ringing out reverb) are counted first
@@ -8449,12 +8468,13 @@ void AudioService::loopStep(float deltaTime)
                 // shared-source fallback) the cap still bounds per-voice
                 // convolution instances as before.
                 //
-                // Note: reflCandidates was already shrunk to
-                // (mReverbVoices − tailCount) above, so in normal flow
-                // an isReflVoice voice always has slot budget here.  We still
-                // gate by canAffordConvolution as defence-in-depth — if the
-                // cap was lowered at runtime, or a tail voice was missed in
-                // the pre-count, this prevents overshoot.
+                // Note: the top-N ranking caps at mReverbVoicesRealtime
+                // and does NOT subtract tailCount, so a burst of ending
+                // voices CAN leave a top-N voice without slot budget here
+                // — canAffordConvolution is the real gate, not
+                // defence-in-depth. (Whether ranking should become
+                // tail-aware is a flagged review decision: it would trade
+                // realtime-IR continuity for baked-fallback availability.)
                 bool isReflVoice = reflCandidateSet.count(handle) > 0;
                 bool canAffordConvolution = (activeConvolutionCount < mReverbVoices);
                 // HYBRID-only: the early convolution head needs a real IR
@@ -9373,32 +9393,11 @@ void AudioService::loopStep(float deltaTime)
                     // T0.1 — PATH_CONSUME diagnostic at the
                     // prop.reached gate. Throttled to once-per-second
                     // per voice (per-handle steady-clock map). Pure
-                    // diagnostic — does NOT change behaviour. Surfaces
-                    // the BFS-mode propagation result that drives the
-                    // sub-source slot fan-out; pair with PATH_RAW
-                    // (PathingSimulator.cpp:208, owned by Agent 2) for
-                    // the Steam Audio-mode counterpart.
-                    {
-                        static std::unordered_map<SoundHandle,
-                            std::chrono::steady_clock::time_point>
-                            sLastPathConsumeLog;
-                        auto now = std::chrono::steady_clock::now();
-                        auto it = sLastPathConsumeLog.find(handle);
-                        bool emit = (it == sLastPathConsumeLog.end())
-                            || (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    now - it->second).count() >= 1000);
-                        if (emit) {
-                            sLastPathConsumeLog[handle] = now;
-                            std::fprintf(stderr,
-                                "[PATH_CONSUME] h=%u schema='%s' "
-                                "reached=%d effD=%.1f block=%.2f paths=%zu\n",
-                                handle, voice->schemaName.c_str(),
-                                prop.reached ? 1 : 0,
-                                prop.effectiveDistance,
-                                prop.totalBlocking,
-                                prop.paths.size());
-                        }
-                    }
+                    // ([PATH_CONSUME] for BFS mode is emitted by the
+                    // mode-tagged block ABOVE the routing branch split —
+                    // one logger covers both modes; a second copy here
+                    // double-logged every BFS voice with mismatched
+                    // fields.)
                     if (prop.reached && !prop.paths.empty()) {
                         updateSubSourceSlots(voice->dspNode.subSources, prop,
                                              maxN, computeDirForPath);
@@ -9969,7 +9968,7 @@ void AudioService::loopStep(float deltaTime)
                     // negatives that look like graph holes.
                     //
                     // The runtime value is per-voice: the original
-                    // engine's SFX_MaxDist formula below (~91 ft default,
+                    // engine's max-audible-distance formula below (~91 ft default,
                     // 200-300 ft for the loudest schemas). The bake-time
                     // value is the ROOM_DB-derived single-edge cap
                     // (max room span × 1.5, clamped [150, 400] ft —
@@ -9992,7 +9991,7 @@ void AudioService::loopStep(float deltaTime)
                     // multi-hop probe route existed.
                     //
                     // Per-voice pathing-solver scope, derived from the
-                    // original Dark Engine's SFX_MaxDist formula:
+                    // original Dark Engine's max-audible-distance formula:
                     //   max_pathing_dist_ft =
                     //       (5000 + gain_cB) / 55 × attenuationFactor
                     // This was the BFS-termination distance for portal
@@ -10001,7 +10000,7 @@ void AudioService::loopStep(float deltaTime)
                     // distance fall back to direct-only audio via the
                     // existing cached-replay mechanism in the readback
                     // site. 55 cB/ft matches the original engine's
-                    // attenuation_factor constant (APPSFX default). Steam
+                    // per-foot attenuation default. Steam
                     // Audio's INVERSEDISTANCE curve still handles per-voice
                     // volume continuously; this knob only limits the
                     // pathing-solver's search scope per source (matches
@@ -10684,7 +10683,8 @@ void AudioService::loopStep(float deltaTime)
                 // voice is over-attenuated (Steam Audio distAtt +
                 // engine portalAtt stacking past the original's single-
                 // centibel-curve attenuation). If much higher, under-
-                // attenuated. See APPSFX.CPP:964 + PSNDINST.CPP:1844.
+                // attenuated. (Formula matches the original engine's
+                // per-voice attenuation; derivation in NOTES.SOURCE.md.)
                 float origLin = 0.0f;
                 float oursLin = 0.0f;
                 if (mSchemaParser) {
@@ -10694,7 +10694,7 @@ void AudioService::loopStep(float deltaTime)
                         int gainCb = sch->playParams.volume;
                         float attenFactor = sch->playParams.attenuationFactor;
                         if (attenFactor < 0.01f) attenFactor = 1.0f;
-                        bool isSharp = (sch->playParams.flags & 0x1000) != 0;  // SFXFLG_SHARP
+                        bool isSharp = (sch->playParams.flags & 0x1000) != 0;  // 'sharp' falloff, bit 12
                         constexpr float kAtnFactor = 55.0f;
                         float mScaleDist = (5000.0f + gainCb) / kAtnFactor;
                         float mMaxDist   = mScaleDist * attenFactor;
@@ -12761,7 +12761,7 @@ void AudioService::loadSchemaPropertyOverrides()
     };
 
     // P$SchPlayPa (20 bytes) — schema play parameters. The on-disk dtype
-    // default for `flags` is 0x7F00 (includes SFXFLG_SHARP at bit 12), so
+    // default for `flags` is 0x7F00 (includes the 'sharp' falloff bit 12), so
     // this overlay normally confirms the SHARP-falloff default; schemas
     // with an explicit override (e.g. cleared SHARP) end up using that.
     applyOverlay("SchPlayPa", sizeof(PropSchemaPlayParams),
@@ -14607,8 +14607,10 @@ void AudioService::playFootstep(const Vector3 &pos, float speed, int textureIdx)
     //   run   (~15 u/s)   → loud (1.0)
     float speedFactor = std::clamp(speed / 15.0f, 0.1f, 1.0f);
     float baseVol = schemaVolumeToLinear(schema->playParams.volume);
-    // Player-emitted sounds have skipAttenuation=true, so no Steam Audio
-    // distance/occlusion is applied. Volume is purely speed-dependent.
+    // NOTE: skipAttenuation is currently never set true by any voice
+    // class (the per-frame reset clears it) — player footsteps DO go
+    // through Steam Audio distance/occlusion like everything else.
+    // Volume here is speed-dependent on top of that.
     float finalVol = baseVol * speedFactor;
 
     // Select sample and play
@@ -15229,6 +15231,11 @@ static constexpr float kPathingSkyThresholdFt = 30.0f;
 // the emission pass AND [REGION_PARITY]'s virtual door edges must agree
 // on the flank distance (a drift would silently mis-grade doors).
 static constexpr float kPathingPairProbeOffsetFt = 5.0f;
+// Player ear height above the floor — file-static because the coverage
+// fill's site anchoring and the parity check's per-room listener anchor
+// must agree (their old locals were "kept in step by value" via a comment
+// pointing at a constant the portal-first overhaul deleted).
+static constexpr float kPathingEarHeightFt = 5.0f;
 
 // Door-portal classification distance, shared by the emission pass
 // (DoorPair vs Portal/PortalPair split) and verifyPathingBakeParity
@@ -15777,10 +15784,7 @@ void AudioService::verifyPathingBakeParity()
             probeRadii.size(), positions.size());
     }
     std::map<int, std::vector<int>> roomProbes;  // roomID → covering probes
-    // Player ear height — the same anchor prepareProbeBakeParams' centroid
-    // pass uses (its own local kRoomFloorOffsetFt). Kept in step by value;
-    // if one moves, move both.
-    constexpr float kParityEarHeightFt = 5.0f;
+    constexpr float kParityEarHeightFt = kPathingEarHeightFt;
     int coverageBeyondRoom = 0;
     for (const auto &roomPtr : mRoomService->getAllRooms()) {
         if (!roomPtr) continue;
@@ -16805,15 +16809,25 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             if (rec.hasAperture()) {
                 // Flanks straddle the REAL opening: the widest of the
                 // record's openings is the doorway (a sidelight in the same
-                // ball is narrower). Claim ALL of the record's openings —
-                // the door's flanks are the probe set for that compound
-                // doorway.
+                // ball is narrower). Pick the widest FIRST, then claim only
+                // the openings joining the SAME region pair as it — a
+                // distinct-pair opening caught in the same match ball (a
+                // window beside the door) is a different route and must
+                // stay unclaimed so the non-door pass (or the post-door
+                // sweep below) gives it its own probe. Claiming everything
+                // here was measured leaving such openings with NO probe at
+                // all (the non-door records saw them as already-claimed).
                 for (int ai = rec.apertureBegin; ai < rec.apertureEnd; ++ai) {
                     const WorldApertureRecord &c = mWorldApertureData
                         .apertures[static_cast<size_t>(ai)];
-                    claimedApertures.insert(c.apertureKey);
                     if (!ap || c.apertureInradiusFt > ap->apertureInradiusFt)
                         ap = &c;
+                }
+                for (int ai = rec.apertureBegin; ai < rec.apertureEnd; ++ai) {
+                    const WorldApertureRecord &c = mWorldApertureData
+                        .apertures[static_cast<size_t>(ai)];
+                    if (c.regionA == ap->regionA && c.regionB == ap->regionB)
+                        claimedApertures.insert(c.apertureKey);
                 }
             }
             // A registered door with NO aperture is unexpected (doors sit
@@ -16863,6 +16877,34 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             params.pathingCandidates.push_back(inside);
             params.pathingCandidates.push_back(outside);
             doorPairCount += 2;
+        }
+        // Post-door sweep: a suppressed or emitting door record can carry
+        // openings of a DIFFERENT region pair than its doorway (window in
+        // the match ball). Those are real routes with no non-door record of
+        // their own, so give each unclaimed one its single probe here —
+        // otherwise the opening is silently unprobed and only [REGION_PARITY]
+        // notices, after the bake.
+        for (const PathingPortalRecord &rec : pathingPortals) {
+            if (!rec.isDoor || !rec.hasAperture()) continue;
+            for (int ai = rec.apertureBegin; ai < rec.apertureEnd; ++ai) {
+                const WorldApertureRecord &ap2 = mWorldApertureData
+                    .apertures[static_cast<size_t>(ai)];
+                if (!claimedApertures.insert(ap2.apertureKey).second)
+                    continue;
+                AUDIO_LOG("[PORTAL_CLASS] rooms %d<->%d "
+                          "center=(%.1f,%.1f,%.1f) apertureInr=%.2f "
+                          "rdbInr=%.2f isDoor=0 (door-ball sidelight)\n",
+                          rec.roomAID, rec.roomBID,
+                          ap2.wrCentroid.x, ap2.wrCentroid.y,
+                          ap2.wrCentroid.z,
+                          ap2.apertureInradiusFt, rec.inradiusFt);
+                PathingProbeCandidate cand;
+                cand.position = ap2.probePos;
+                cand.radiusFt = kPortalRadiusFt;
+                cand.purpose  = PathingProbePurpose::Portal;
+                params.pathingCandidates.push_back(cand);
+                ++portalCount;
+            }
         }
         for (const PathingPortalRecord &rec : pathingPortals) {
             if (rec.isDoor) continue;
@@ -17673,10 +17715,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             // expected large consumer.
             {
                 const float rCovFt = kPathingCoverageRadiusFt;
-                // Same player-ear anchor as kRoomFloorOffsetFt in the
-                // emission pass above (that constant is scoped to the
-                // portal/centroid block).
-                constexpr float kEarHeightFt = 5.0f;
+                constexpr float kEarHeightFt = kPathingEarHeightFt;
                 // Own-flank exclusion for portal demand: pair probes sit
                 // kPairProbeOffsetFt (5 ft) from the portal center;
                 // +1.5 ft slop covers dedup nudges. Portal-center probes
@@ -17941,7 +17980,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                             worstBeforeFt = std::max(worstBeforeFt, d.bestFt);
 
                     int added = 0;
-                    while (added < kPathingHubFillMaxPerRoom) {
+                    while (added < kPathingFillMaxPerRegion) {
                         // Farthest uncovered, non-stuck PORTAL demand point.
                         // §14 over-fire fix (PLAN.PATHING_DESIGN.md §13): the
                         // two guards below are the whole correction —
@@ -18046,6 +18085,13 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                             const float distSq = glm::dot(dv, dv);
                             if (d.isPortal && distSq < kOwnFlankExclusionSq)
                                 continue;
+                            // Same cap as coverageOf: an anchor beyond the
+                            // visRange clamp ceiling can never form the
+                            // edge "covered" implies, so it must not mark
+                            // demand as reachable.
+                            if (distSq > kPathingCoverageVisRangeMaxFt
+                                             * kPathingCoverageVisRangeMaxFt)
+                                continue;
                             const float dist = std::sqrt(distSq);
                             if (dist >= d.bestFt) continue;
                             if (!blockedRay(d.pos, sitePos))
@@ -18060,13 +18106,13 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                             ++stuckDemandTotal;
                         }
                     }
-                    if (added >= kPathingHubFillMaxPerRoom) {
+                    if (added >= kPathingFillMaxPerRegion) {
                         std::fprintf(stderr,
                             "[FALLBACK] pathing coverage fill: region %d hit the "
                             "per-region cap (%d probes) with demand still "
                             "uncovered — residual coverage feeds the "
                             "[PATHING_BAKE_RANGE] derivation below\n",
-                            rid, kPathingHubFillMaxPerRoom);
+                            rid, kPathingFillMaxPerRegion);
                     }
                     if (added > 0) {
                         // Portal-only worst/residual — the fill now targets
@@ -18115,6 +18161,24 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                             kPathingCoverageVisRangeMaxFt
                             * kPathingCoverageVisRangeMaxFt;
                         std::vector<int> aParent(anchors.size());
+                        // Ray memo: anchor positions never move, so a
+                        // (i,j) visibility verdict is permanent. Without
+                        // this every stone re-cast EVERY still-cross-
+                        // component pair's ray — measured as the dominant
+                        // stitch cost on MISS15-class regions (hundreds of
+                        // anchors, dozens of stones).
+                        std::map<std::pair<int, int>, bool> rayMemo;
+                        auto blockedMemo = [&](int i, int j) {
+                            const auto key = std::make_pair(std::min(i, j),
+                                                            std::max(i, j));
+                            auto it = rayMemo.find(key);
+                            if (it != rayMemo.end()) return it->second;
+                            const bool blocked = blockedRay(
+                                anchors[static_cast<size_t>(i)],
+                                anchors[static_cast<size_t>(j)]);
+                            rayMemo[key] = blocked;
+                            return blocked;
+                        };
                         auto aFind = [&](int x) {
                             while (aParent[static_cast<size_t>(x)] != x) {
                                 aParent[static_cast<size_t>(x)] =
@@ -18142,7 +18206,8 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                                     if (aFind(static_cast<int>(i))
                                             == aFind(static_cast<int>(j)))
                                         continue;
-                                    if (!blockedRay(anchors[i], anchors[j]))
+                                    if (!blockedMemo(static_cast<int>(i),
+                                                     static_cast<int>(j)))
                                         aUnite(static_cast<int>(i),
                                                static_cast<int>(j));
                                 }
@@ -18155,7 +18220,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                         int comps = rebuildUF();
                         int stitched = 0;
                         while (comps > 1
-                               && added < kPathingHubFillMaxPerRoom) {
+                               && added < kPathingFillMaxPerRegion) {
                             // Closest cross-component anchor pair.
                             int   bi = -1, bj = -1;
                             float bSq = std::numeric_limits<float>::max();
@@ -18224,8 +18289,11 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                             ++added;
                             ++fillProbesTotal;
                             ++stitched;
-                            const int newComps = rebuildUF();
-                            if (newComps >= comps) {
+                            const int prevComps = comps;
+                            // comps stays truthful even on the give-up
+                            // path — the [PATHING_STITCH] line prints it.
+                            comps = rebuildUF();
+                            if (comps >= prevComps) {
                                 // The stone did not merge anything (blocked
                                 // from both sides). Keep it — it may serve
                                 // containment — but stop chasing this gap
@@ -18237,10 +18305,9 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                                     "(components %d); stopping — region "
                                     "parity grades the rest\n",
                                     rid, stonePos.x, stonePos.y, stonePos.z,
-                                    newComps);
+                                    comps);
                                 break;
                             }
-                            comps = newComps;
                         }
                         if (stitched > 0) {
                             std::fprintf(stderr,
@@ -18249,7 +18316,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                                 rid, stitched, comps);
                         }
                         if (comps > 1
-                            && added >= kPathingHubFillMaxPerRoom) {
+                            && added >= kPathingFillMaxPerRegion) {
                             std::fprintf(stderr,
                                 "[FALLBACK] pathing connectivity stitch: "
                                 "region %d hit the per-region cap with %d "
