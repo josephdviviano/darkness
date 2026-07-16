@@ -174,6 +174,19 @@ struct RenderConfig {
     // which only affects the dense reflection batch.
     float audioPathingDedupRadiusFt = 10.0f;
 
+    // EXPERIMENTAL single-edge visRange override for the pathing bake
+    // (`audio.pathing_probes.vis_range_override_ft`). 0 (default) = use
+    // the coverage-derived cap (governing x margin, clamped — see
+    // AudioService::prepareProbeBakeParams). Nonzero = force the bake's
+    // IPLPathBakeParams::visRange to EXACTLY this value, bypassing the
+    // derivation and its clamps. A/B lever for the range sweep the
+    // offline §37 analysis motivates (~80 ft keeps the aperture graph
+    // healthy at a fraction of the edges); recorded in the .probes
+    // header like the derived value, so runtime follows automatically.
+    // Requires --force-pathing-bake to take effect on an existing cache
+    // (deliberately no auto-rebake: experimental knob).
+    float audioPathingVisRangeOverrideFt = 0.0f;
+
     // Pathing probe layout density tier (`audio.pathing_probes.density`).
     // Valid values:
     //   "baseline" — Tier 0: the original Dark Engine room/portal
@@ -836,6 +849,14 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.audioPathingDedupRadiusFt > 30.0f)
                         cfg.audioPathingDedupRadiusFt = 30.0f;
                 }
+                if (pp["vis_range_override_ft"]) {
+                    cfg.audioPathingVisRangeOverrideFt =
+                        pp["vis_range_override_ft"].as<float>();
+                    if (cfg.audioPathingVisRangeOverrideFt < 0.0f)
+                        cfg.audioPathingVisRangeOverrideFt = 0.0f;
+                    if (cfg.audioPathingVisRangeOverrideFt > 400.0f)
+                        cfg.audioPathingVisRangeOverrideFt = 400.0f;
+                }
                 if (pp["density"]) {
                     // Name list mirrors pathingProbeDensityFromName
                     // (ProbeManager.h, the canonical string→enum map;
@@ -1412,6 +1433,11 @@ inline bool applySetOverride(const std::string& path, const std::string& valueSt
     if (path == "audio.pathing_probes.dedup_radius_ft") {
         float v; if (!toFloat(v)) return false;
         cfg.audioPathingDedupRadiusFt = clampF(v, 0.0f, 30.0f); return true;
+    }
+    if (path == "audio.pathing_probes.vis_range_override_ft") {
+        float v; if (!toFloat(v)) return false;
+        cfg.audioPathingVisRangeOverrideFt = clampF(v, 0.0f, 400.0f);
+        return true;
     }
     if (path == "audio.pathing_probes.density") {
         // Same validation as the YAML parser: baseline | bends only

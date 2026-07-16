@@ -18357,10 +18357,21 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     }
                 }
 
-                const float visRangeFt = std::min(
+                float visRangeFt = std::min(
                     std::max(governingFt * kPathingCoverageMarginMul,
                              kPathingCoverageVisRangeMinFt),
                     kPathingCoverageVisRangeMaxFt);
+                if (mPathingVisRangeOverrideFt > 0.0f) {
+                    // Experimental A/B override — bypasses the derivation
+                    // AND its clamps, loudly. The derived value still
+                    // prints below for comparison.
+                    std::fprintf(stderr,
+                        "[PATHING_BAKE_RANGE] EXPERIMENTAL OVERRIDE: "
+                        "visRange forced to %.0f ft "
+                        "(coverage-derived would be %.0f ft)\n",
+                        mPathingVisRangeOverrideFt, visRangeFt);
+                    visRangeFt = mPathingVisRangeOverrideFt;
+                }
                 params.pathingVisRangeFt  = visRangeFt;
                 mDerivedPathingVisRangeFt = visRangeFt;
                 params.pathingCoverageFt  = governingFt;
