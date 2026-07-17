@@ -1413,6 +1413,14 @@ TEST_CASE("IWorldQuery: raycast without injected raycaster returns false and "
     hit.normal = Vector3(1.0f, 1.0f, 1.0f);
     hit.distance = 4242.0f;
     hit.hitEntity = 99;
+    hit.textureIndex = 7;
+    hit.cellIdx = 8;
+    hit.polyIdx = 9;
+    // The dangerous one: a PROVEN status left over from an earlier real trace.
+    // If the stub does not reset it, rayStatusProven() vouches for a ray that
+    // was never traced — "false" then reads as "proven clear", which is the
+    // exact x-ray-vision failure RayStatus exists to prevent.
+    hit.status = RayStatus::Clear;
 
     bool didHit = freshQuery->raycast(
         {0.0f, 0.0f, 0.0f}, {100.0f, 0.0f, 0.0f}, hit);
@@ -1422,6 +1430,12 @@ TEST_CASE("IWorldQuery: raycast without injected raycaster returns false and "
     CHECK(hit.normal == Vector3(0.0f));
     CHECK(hit.distance == 0.0f);
     CHECK(hit.hitEntity == 0);
+    CHECK(hit.textureIndex == -1);
+    CHECK(hit.cellIdx == -1);
+    CHECK(hit.polyIdx == -1);
+
+    CHECK(hit.status == RayStatus::Unset);
+    CHECK_FALSE(rayStatusProven(hit.status));
 }
 
 // ============================================================================
