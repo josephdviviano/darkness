@@ -86,6 +86,11 @@ struct WRAcousticTopologyResult {
     /// zone. High counts on a level mean the centroid-distance calibration
     /// (measured on MISS2/MISS6) deserves an offline re-check there.
     int nearMissCount     = 0;
+    /// Matched openings SKIPPED as sub-wavelength cracks (rep inradius
+    /// below kMinAcousticApertureInradiusFt): no record, no probe, no
+    /// parity demand — sound crosses them by diffraction/transmission
+    /// (Steam Audio's transmission path), not geometric pathing.
+    int subWavelengthCount = 0;
 };
 
 /// Point -> containing WR cell, gridded. findCameraCell is a full
@@ -155,10 +160,23 @@ namespace detail {
 
 /// One deduped WR portal polygon (each physical face appears in both cells'
 /// polygon lists; deduped by cell pair + quantized centroid).
+/// Minimum rep-polygon inradius for an opening to count as a pathing
+/// aperture. Below ~0.5 ft the opening is smaller than the wavelength
+/// across most of the audible band (0.5 ft ~ 2.2 kHz), so sound crosses
+/// by diffraction/transmission — which Steam Audio models per-material —
+/// not by geometric rays a probe graph could carry. Without this floor,
+/// hairline slivers (measured 0.01-0.04 ft on MISS9) demanded parity that
+/// no probe pair can physically deliver, and each emitted a wasted probe.
+constexpr float kMinAcousticApertureInradiusFt = 0.5f;
+
 struct WRPortalPoly {
     uint32_t cellA = 0, cellB = 0;     ///< cellA < cellB
     Vector3  centroid{0.0f, 0.0f, 0.0f};
     float    inradiusFt = -1.0f;
+    /// Vertical extent of the polygon (gravity-aligned openings — the
+    /// Thief norm). Drives the low-opening pair rule: an ear-height
+    /// anchor cannot see through an opening shorter than ear height.
+    float    zMinFt = 0.0f, zMaxFt = 0.0f;
 };
 
 struct UnionFind {
@@ -224,9 +242,12 @@ buildWRAcousticTopology(const WRParsedData &wr, RoomService &roomSvc)
 
                 Vector3 cen(0, 0, 0);
                 bool badIdx = false;
+                float zMin = 1e30f, zMax = -1e30f;
                 for (uint8_t vi : idx) {
                     if (vi >= cell.vertices.size()) { badIdx = true; break; }
                     cen += cell.vertices[vi];
+                    zMin = std::min(zMin, cell.vertices[vi].z);
+                    zMax = std::max(zMax, cell.vertices[vi].z);
                 }
                 if (badIdx) continue;
                 cen /= static_cast<float>(idx.size());
@@ -264,6 +285,8 @@ buildWRAcousticTopology(const WRParsedData &wr, RoomService &roomSvc)
                 p.cellB = hi;
                 p.centroid = cen;
                 p.inradiusFt = inradius;
+                p.zMinFt = zMin;
+                p.zMaxFt = zMax;
                 portals.push_back(p);
             }
         }
@@ -377,6 +400,13 @@ buildWRAcousticTopology(const WRParsedData &wr, RoomService &roomSvc)
             out.cellRegion[c] = it->second;
         }
         out.data.numRegions = static_cast<int>(compact.size());
+        out.data.regionCellCounts.assign(
+            static_cast<size_t>(out.data.numRegions), 0);
+        for (uint32_t c = 0; c < wr.numCells; ++c) {
+            const int32_t r = out.cellRegion[c];
+            if (r >= 0)
+                ++out.data.regionCellCounts[static_cast<size_t>(r)];
+        }
     }
 
     // ── 5. Emit records: one per (matched ROOM_DB portal, TRUE region pair) ─
@@ -465,9 +495,16 @@ buildWRAcousticTopology(const WRParsedData &wr, RoomService &roomSvc)
         }
         for (const auto &kv : repByPair) {
             const WRPortalPoly &rep = portals[static_cast<size_t>(kv.second)];
+            if (rep.inradiusFt < detail::kMinAcousticApertureInradiusFt) {
+                // The WIDEST polygon joining this region pair through this
+                // portal is a sub-wavelength crack — not a pathing route.
+                ++out.subWavelengthCount;
+                continue;
+            }
             WorldApertureRecord rec;
             rec.wrCentroid = rep.centroid;
             rec.apertureInradiusFt = rep.inradiusFt;
+            rec.apertureZSpanFt = rep.zMaxFt - rep.zMinFt;
             rec.portalID = m.portalID;
             rec.rdbCenter = m.center;
             rec.roomAID = std::min(m.roomA, m.roomB);
@@ -495,16 +532,39 @@ buildWRAcousticTopology(const WRParsedData &wr, RoomService &roomSvc)
                 ^ (q8(rep.centroid.y) << 11)
                 ^ q8(rep.centroid.z);
 
-            bool placed = false;
-            for (uint32_t side : {rep.cellA, rep.cellB}) {
-                Vector3 dir = cellInterior[side] - rep.centroid;
+            // Nudge chain, PER SIDE: an in-air anchor on EACH side of
+            // the face, independently, SHALLOW-first. A deep-first order
+            // (1.5 ft) was tried to clear door-frame throats and measured
+            // as a net LOSS: slit and vent anchors 1.5 ft off the plane
+            // lose the through-opening sight-line that 0.25 ft keeps
+            // (miss6/MISS9 MISSING regressions, §47) — while the frame-
+            // throat MISSING that motivated deep-first was actually the
+            // placement filter's ROOM_DB gate evicting the shallow anchor
+            // (frame throats are un-boxed air), fixed at the filter.
+            // probePos is the first side that places; probePosB the
+            // opposite side, kept for pair-capable consumers.
+            Vector3 sidePos[2];
+            bool sidePlaced[2] = {false, false};
+            const uint32_t sideCells[2] = {rep.cellA, rep.cellB};
+            for (int s = 0; s < 2; ++s) {
+                Vector3 dir = cellInterior[sideCells[s]] - rep.centroid;
                 const float len = glm::length(dir);
                 if (len < 1e-4f) continue;
-                const Vector3 cand = rep.centroid + dir * (kNudgeFt / len);
-                if (locator.locate(cand.x, cand.y, cand.z) >= 0) {
-                    rec.probePos = cand;
-                    placed = true;
-                    break;
+                for (float nudge : {kNudgeFt, 0.75f, 1.5f}) {
+                    const Vector3 cand = rep.centroid + dir * (nudge / len);
+                    if (locator.locate(cand.x, cand.y, cand.z) >= 0) {
+                        sidePos[s] = cand;
+                        sidePlaced[s] = true;
+                        break;
+                    }
+                }
+            }
+            bool placed = sidePlaced[0] || sidePlaced[1];
+            if (placed) {
+                rec.probePos = sidePlaced[0] ? sidePos[0] : sidePos[1];
+                if (sidePlaced[0] && sidePlaced[1]) {
+                    rec.probePosB   = sidePos[1];
+                    rec.hasProbePosB = true;
                 }
             }
             if (!placed) {

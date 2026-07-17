@@ -16902,6 +16902,100 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             params.pathingCandidates.push_back(outside);
             doorPairCount += 2;
         }
+        // Single-aperture emission shared by the door-ball sidelight
+        // sweep and the non-door pass. LOW openings — vertical span under
+        // ear height (+1 ft slack) — emit a probe on EACH side of the face
+        // (the record's two locator-verified nudge anchors) instead of the
+        // one in-air single: a standing-height anchor cannot see through a
+        // crouch portal or squat window, so the one-sided single strands
+        // the far side (three of six broken MISS15 seams read this way in
+        // field inspection). The two anchors straddle the open polygon by
+        // construction, so their cross-opening edge survives regardless of
+        // anchor height. The rule is keyed to the ear-height constant, not
+        // a free threshold. When the record could only place one side,
+        // fall back to the single and let [REGION_PARITY] grade the
+        // outcome. (Do NOT flank along the ROOM_DB portal normal — it is
+        // designer fiction; that variant regressed miss6/MISS9.)
+        int lowOpeningPairs = 0;
+        auto emitApertureNode = [&](const WorldApertureRecord &apRec) {
+            // Small in EITHER dimension: the vertical span (crouch
+            // portals, squat windows) or the narrow dimension (2x
+            // inradius — tall slits, vents). Both gate sight-lines the
+            // same way: a standing anchor cannot reliably see through an
+            // opening you cannot walk through upright. zSpan alone missed
+            // MISS6's 2-ft-wide 8-ft-tall basement slit (§47).
+            const bool smallOpening =
+                (apRec.apertureZSpanFt > 0.0f
+                 && apRec.apertureZSpanFt < kPathingEarHeightFt + 1.0f)
+                || (apRec.apertureInradiusFt > 0.0f
+                    && apRec.apertureInradiusFt * 2.0f
+                           <= kPathingEarHeightFt + 1.0f);
+            // One line per emitted aperture: which emission shape fired and
+            // why — [REGION_PARITY] regressions at vent/slit apertures are
+            // undiagnosable from probe positions alone (a one-sided single
+            // and a collapsed pair look identical in the CSV).
+            const auto regionCells = [&](int r) -> int32_t {
+                const auto &counts = mWorldApertureData.regionCellCounts;
+                return (r >= 0 && static_cast<size_t>(r) < counts.size())
+                           ? counts[static_cast<size_t>(r)] : -1;
+            };
+            const int32_t cellsA = regionCells(apRec.regionA);
+            const int32_t cellsB = regionCells(apRec.regionB);
+            AUDIO_LOG("[APERTURE_EMIT] center=(%.1f,%.1f,%.1f) zSpan=%.2f "
+                      "inr=%.2f small=%d hasB=%d cellsA=%d cellsB=%d\n",
+                      apRec.wrCentroid.x, apRec.wrCentroid.y,
+                      apRec.wrCentroid.z, apRec.apertureZSpanFt,
+                      apRec.apertureInradiusFt,
+                      smallOpening ? 1 : 0, apRec.hasProbePosB ? 1 : 0,
+                      cellsA, cellsB);
+            // Two-side pair, NARROWLY targeted: small opening whose BOTH
+            // immediate side cells are single-cell fragments. That
+            // signature is a compound frame/throat assembly (door frames,
+            // stacked slab cuts) — the one aperture class field-measured
+            // to defeat a correctly-placed single (MISS15 rooms 12<->404,
+            // MISS7 rooms 673<->674): the single serves one fragment and
+            // the assembly stays invisible to standing anchors. Population
+            // is bounded (10-63 per level measured). UNCONDITIONAL
+            // small-opening pairs were tried and measured at +30% probes /
+            // 2x edges (453 pairs on MISS7) with 542 ms stress windows —
+            // singles already serve ~95% of apertures (§47).
+            const bool frameThroat =
+                smallOpening && apRec.hasProbePosB
+                && regionCells(apRec.regionA) == 1
+                && regionCells(apRec.regionB) == 1;
+            // HORIZONTAL small openings (floor/ceiling hatches; zSpan ~0)
+            // into a 1-cell pocket are the same failure with a different
+            // orientation: no standing anchor ever has a sight-line
+            // through a floor. Also bounded (21-46/level measured).
+            // MISS7 rooms 673<->674 (hatch into a 1-cell shaft) was the
+            // last residual MISSING after the frame-throat rule.
+            const bool pocketHatch =
+                smallOpening && apRec.hasProbePosB
+                && apRec.apertureZSpanFt < 0.5f
+                && std::min(regionCells(apRec.regionA),
+                            regionCells(apRec.regionB)) == 1;
+            if (frameThroat || pocketHatch) {
+                PathingProbeCandidate sideA;
+                sideA.position = apRec.probePos;
+                sideA.radiusFt = 3.0f;
+                sideA.purpose  = PathingProbePurpose::PortalPair;
+                PathingProbeCandidate sideB;
+                sideB.position = apRec.probePosB;
+                sideB.radiusFt = 3.0f;
+                sideB.purpose  = PathingProbePurpose::PortalPair;
+                params.pathingCandidates.push_back(sideA);
+                params.pathingCandidates.push_back(sideB);
+                portalCount += 2;
+                ++lowOpeningPairs;
+                return;
+            }
+            PathingProbeCandidate cand;
+            cand.position = apRec.probePos;  // in-air by construction
+            cand.radiusFt = kPortalRadiusFt;
+            cand.purpose  = PathingProbePurpose::Portal;
+            params.pathingCandidates.push_back(cand);
+            ++portalCount;
+        };
         // Post-door sweep: a suppressed or emitting door record can carry
         // openings of a DIFFERENT region pair than its doorway (window in
         // the match ball). Those are real routes with no non-door record of
@@ -16937,12 +17031,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                           ap2.wrCentroid.x, ap2.wrCentroid.y,
                           ap2.wrCentroid.z,
                           ap2.apertureInradiusFt, rec.inradiusFt);
-                PathingProbeCandidate cand;
-                cand.position = ap2.probePos;
-                cand.radiusFt = kPortalRadiusFt;
-                cand.purpose  = PathingProbePurpose::Portal;
-                params.pathingCandidates.push_back(cand);
-                ++portalCount;
+                emitApertureNode(ap2);
             }
         }
         for (const PathingPortalRecord &rec : pathingPortals) {
@@ -16992,12 +17081,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                           rec.roomAID, rec.roomBID,
                           ap.wrCentroid.x, ap.wrCentroid.y, ap.wrCentroid.z,
                           ap.apertureInradiusFt, rec.inradiusFt);
-                PathingProbeCandidate cand;
-                cand.position = ap.probePos;   // in-air by construction
-                cand.radiusFt = kPortalRadiusFt;
-                cand.purpose  = PathingProbePurpose::Portal;
-                params.pathingCandidates.push_back(cand);
-                ++portalCount;
+                emitApertureNode(ap);
             }
         }
         AUDIO_LOG("Pathing portal pass [portal-first]: %d single aperture "
@@ -17010,13 +17094,15 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                   "aperture=%d "
                   "(flanks at ROOM_DB center, loud above). Density knob "
                   "'%s' no longer changes placement — apertures emit one "
-                  "probe, doors one pair, at every density.\n",
+                  "probe, doors one pair, at every density. "
+                  "Frame-throat two-side pairs: %d.\n",
                   portalCount, doorPairCount, doorPairCount / 2,
                   apertureFiction, apertureShared,
                   doorPairSuppressed, doorPairSuppressed / 2,
                   doorFootprintSuppressed,
                   doorNoAperture,
-                  pathingProbeDensityName(mPathingProbeDensity));
+                  pathingProbeDensityName(mPathingProbeDensity),
+                  lowOpeningPairs);
 
         // (Room centroid probes — one per ROOM_DB room at floor+5 ft, plus
         // an upper centroid for tall rooms — are GONE under portal-first
@@ -17073,8 +17159,22 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 // silently report "clear", which produced ~11.6k phantom
                 // edges (~37% of the graph). roomFromPoint keeps only its
                 // real job below: which room does this point belong to.
-                const bool inAir = !mPointInAirFn || mPointInAirFn(p);
-                if (inAir && mRoomService->roomFromPoint(p)) {
+                // ACCEPT on WR air alone. Requiring roomFromPoint(p)
+                // as well silently evicted every anchor in air the
+                // designers never boxed — vents, crawl-pockets, shafts —
+                // nudging them toward the nearest room CENTER (out of the
+                // pocket) or rejecting them outright. Measured on miss6:
+                // 8 of 292 candidates rejected, and the two [REGION_PARITY]
+                // MISSING apertures were exactly pocket openings whose
+                // anchors this gate had displaced (§47). Un-boxed air is
+                // real acoustic space; sound must path through it.
+                // Without the WR oracle, fall back to the ROOM_DB box test
+                // (the loud [FALLBACK] above already announced the
+                // degraded mode).
+                const bool inAir = mPointInAirFn
+                    ? mPointInAirFn(p)
+                    : (mRoomService->roomFromPoint(p) != nullptr);
+                if (inAir) {
                     d.result = ProbeFilterResult::Accept;
                     return d;
                 }
@@ -17499,6 +17599,20 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             auto sameAcousticSpace = [&](const Vector3 &a,
                                          const Vector3 &b) -> bool {
                 if (!mRaycaster) return false;     // cannot prove it => don't
+                // Different air REGIONS are different acoustic spaces by
+                // definition — regions are the partition this function's
+                // name promises. The ray proof below is fooled by exactly
+                // the case that matters most: a segment between probes on
+                // opposite sides of a small aperture threads the very
+                // opening those probes exist to bridge, reads Clear, and
+                // the merge then severs the only cross-opening edge
+                // (measured: vent/slit MISSING regressions on miss6/MISS9,
+                // §47). The ray remains as the SAME-region proof.
+                if (mRegionOfPointFn) {
+                    const int ra = mRegionOfPointFn(a);
+                    const int rb = mRegionOfPointFn(b);
+                    if (ra >= 0 && rb >= 0 && ra != rb) return false;
+                }
                 if (segmentCrossesAnyDoor(a, b)) return false;
                 RayHit hit{};
                 if (mRaycaster(a, b, hit)) return false;
@@ -17507,6 +17621,13 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
 
             std::vector<int> keptRoom;
             keptRoom.reserve(params.pathingCandidates.size());
+            // Region of every kept probe, tracked alongside keptRoom: the
+            // same-purpose fast path below must not collapse two probes
+            // straddling a region boundary (a two-side aperture pair IS
+            // same-purpose, same-ROOM_DB-room, and within the pair radius
+            // — the fast path ate them before this check, §47).
+            std::vector<int> keptRegion;
+            keptRegion.reserve(params.pathingCandidates.size());
             int crossRoomPreserved = 0;
             // Region-emptying guard: a merge may never take a region's
             // LAST probe. Unbounded merging measured two costs: parity
@@ -17545,6 +17666,8 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 const float radiusSq =
                     isPair ? kDoorPairDedupRadiusSq : dedupRadiusSq;
                 const int candRoom = roomOf(cand.position);
+                const int candRegion = mRegionOfPointFn
+                    ? mRegionOfPointFn(cand.position) : -1;
                 const bool candIsDoorAnchor =
                     (cand.purpose == PathingProbePurpose::DoorPair);
                 // Outer scan gate = the widest radius ANY rule below
@@ -17564,7 +17687,13 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     if (dsq >= scanSq) continue;
                     const bool samePurpose = (kept[i].purpose == cand.purpose);
                     const bool sameRoom    = (keptRoom[i] == candRoom);
-                    if (samePurpose && sameRoom && dsq < radiusSq) {
+                    // Unknown region (-1) on either side keeps the old
+                    // behavior; a KNOWN region mismatch blocks collapse.
+                    const bool regionSplit = (candRegion >= 0
+                                              && keptRegion[i] >= 0
+                                              && keptRegion[i] != candRegion);
+                    if (samePurpose && sameRoom && !regionSplit
+                        && dsq < radiusSq) {
                         tooClose = true;              // the original collision
                         break;
                     }
@@ -17623,6 +17752,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 }
                 kept.push_back(cand);
                 keptRoom.push_back(candRoom);
+                keptRegion.push_back(candRegion);
             }
             if (regionEmptyPreserved > 0) {
                 AUDIO_LOG("Pathing dedup: %d merges SKIPPED (would have "
@@ -18677,7 +18807,12 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 // (proof or nothing).
                 if (rcFill && params.pathingCandidates.size() >= 2) {
                     constexpr float kJoinMaxGapFt = 300.0f;
-                    constexpr int   kJoinStoneBudget = 32;
+                    // 128: MISS15 spent a 32-stone budget with live
+                    // joinable seams remaining (17 components left). The
+                    // per-seam dead-list bounds wasted stones, kJoinMaxGapFt
+                    // bounds legitimacy, and this runs at BAKE time with
+                    // memoized rays — generosity is cheap here.
+                    constexpr int   kJoinStoneBudget = 128;
                     const size_t nJoin0 = params.pathingCandidates.size();
                     auto &cands = params.pathingCandidates;
                     std::vector<int> jParent;
@@ -18748,16 +18883,38 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     }
                     std::vector<char> jSiteUsed(jSites.size(), 0);
                     int comps = jRebuild();
-                    int stones = 0, duds = 0, farGaps = 0;
-                    while (comps > 1 && stones < kJoinStoneBudget
-                           && duds < 3) {
-                        // Closest cross-component candidate pair.
+                    // (A demand-driven aperture-pair pass lived here
+                    // briefly and was removed: its cross-component test
+                    // used the same rays jRebuild had already unioned
+                    // with, so it could never fire — see PLAN §47. The
+                    // one-sided-single failure class it targeted was
+                    // actually caused by the placement filter's ROOM_DB
+                    // gate, fixed at the filter.)
+                    int stones = 0, farGaps = 0;
+                    // Seams that resist joining are EXCLUDED by their
+                    // component-root pair and the joiner moves to the
+                    // NEXT seam — the old GLOBAL 3-dud give-up quit on
+                    // the first stubborn gap and left every later seam
+                    // unserved (measured on MISS15: 25 components with
+                    // 27 stones of budget unspent). Root pairs are
+                    // rebuild-stable while the component set is
+                    // unchanged, and a stale entry after an unrelated
+                    // union is harmless (that seam merged anyway).
+                    std::set<std::pair<int, int>> deadSeams;
+                    std::map<std::pair<int, int>, int> seamDuds;
+                    while (comps > 1 && stones < kJoinStoneBudget) {
+                        // Closest cross-component candidate pair on a
+                        // LIVE seam.
                         int bi = -1, bj = -1;
                         float bSq = std::numeric_limits<float>::max();
                         for (size_t i = 0; i < cands.size(); ++i) {
                             for (size_t j = i + 1; j < cands.size(); ++j) {
-                                if (jFind(static_cast<int>(i))
-                                        == jFind(static_cast<int>(j)))
+                                const int ra = jFind(static_cast<int>(i));
+                                const int rb = jFind(static_cast<int>(j));
+                                if (ra == rb) continue;
+                                if (deadSeams.count(
+                                        std::make_pair(std::min(ra, rb),
+                                                       std::max(ra, rb))))
                                     continue;
                                 const Vector3 d = cands[j].position
                                                 - cands[i].position;
@@ -18783,37 +18940,60 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                                 comps, std::sqrt(bSq), kJoinMaxGapFt);
                             break;
                         }
-                        const Vector3 mid =
-                            (cands[static_cast<size_t>(bi)].position
-                             + cands[static_cast<size_t>(bj)].position)
-                            * 0.5f;
+                        const auto seamKey = std::make_pair(
+                            std::min(jFind(bi), jFind(bj)),
+                            std::max(jFind(bi), jFind(bj)));
+                        // Stone site ALONG the seam SEGMENT, midpoint
+                        // first: a gap midpoint routinely lands inside
+                        // the very wall separating the components (two
+                        // of six MISS15 field-inspected seam midpoints
+                        // were in solid), while a quarter-point sits in
+                        // open space on one side. Also serves the
+                        // clear-LOS-but-beyond-visRange corridor: for a
+                        // proven-clear over-length segment, any on-
+                        // segment stone sees both ends.
+                        const Vector3 segA =
+                            cands[static_cast<size_t>(bi)].position;
+                        const Vector3 segB =
+                            cands[static_cast<size_t>(bj)].position;
                         int sBest = -1;
-                        float sBestSq = std::numeric_limits<float>::max();
-                        for (size_t si = 0; si < jSites.size(); ++si) {
-                            if (jSiteUsed[si]) continue;
-                            bool stacked = false;
-                            for (const auto &c : cands) {
-                                const Vector3 av = jSites[si] - c.position;
-                                if (glm::dot(av, av) < 25.0f) {
-                                    stacked = true;
-                                    break;
+                        for (float t : {0.5f, 0.35f, 0.65f, 0.2f, 0.8f}) {
+                            const Vector3 target = segA + (segB - segA) * t;
+                            float sBestSq =
+                                std::numeric_limits<float>::max();
+                            for (size_t si = 0; si < jSites.size(); ++si) {
+                                if (jSiteUsed[si]) continue;
+                                bool stacked = false;
+                                for (const auto &c : cands) {
+                                    const Vector3 av =
+                                        jSites[si] - c.position;
+                                    if (glm::dot(av, av) < 25.0f) {
+                                        stacked = true;
+                                        break;
+                                    }
+                                }
+                                if (stacked) continue;
+                                const Vector3 dv = jSites[si] - target;
+                                const float dsq = glm::dot(dv, dv);
+                                if (dsq < sBestSq) {
+                                    sBestSq = dsq;
+                                    sBest = static_cast<int>(si);
                                 }
                             }
-                            if (stacked) continue;
-                            const Vector3 dv = jSites[si] - mid;
-                            const float dsq = glm::dot(dv, dv);
-                            if (dsq < sBestSq) {
-                                sBestSq = dsq;
-                                sBest = static_cast<int>(si);
-                            }
+                            // A site FARTHER from its sample point than
+                            // the whole gap is off-seam noise; try the
+                            // next sample point instead.
+                            if (sBest >= 0 && sBestSq <= bSq) break;
+                            sBest = -1;
                         }
                         if (sBest < 0) {
+                            deadSeams.insert(seamKey);
                             std::fprintf(stderr,
-                                "[FALLBACK] pathing join: %d components, "
-                                "closest gap %.0f ft, but no usable site "
-                                "remains near the midpoint\n",
-                                comps, std::sqrt(bSq));
-                            break;
+                                "[FALLBACK] pathing join: seam gap %.0f "
+                                "ft has no usable site along it — seam "
+                                "excluded, trying the next\n",
+                                std::sqrt(bSq));
+                            continue;
                         }
                         jSiteUsed[static_cast<size_t>(sBest)] = 1;
                         PathingProbeCandidate stone;
@@ -18824,8 +19004,15 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                         ++stones;
                         const int prevComps = comps;
                         comps = jRebuild();
-                        if (comps >= prevComps) ++duds;
-                        else duds = 0;
+                        if (comps >= prevComps
+                            && ++seamDuds[seamKey] >= 3) {
+                            deadSeams.insert(seamKey);
+                            std::fprintf(stderr,
+                                "[FALLBACK] pathing join: seam (gap %.0f "
+                                "ft) resisted 3 stones — excluded, "
+                                "trying the next seam\n",
+                                std::sqrt(bSq));
+                        }
                     }
                     if (stones > 0 || comps > 1) {
                         std::fprintf(stderr,
