@@ -187,6 +187,17 @@ constexpr int kPathingVisSamplesDev  = 4;
 /// and triggers the same loud automatic pathing-only re-bake as a
 /// numSamples/density mismatch.
 constexpr float kPathingCoverageRadiusFt      = 75.0f;
+/// Interior (listener/source containment) coverage radius for BIG open
+/// regions: floor demand may DRIVE probe placement only when its nearest
+/// visible anchor is farther than this. Deliberately 2x the aperture
+/// coverage radius: the measured §14 over-fire was floor-chasing at 75 ft
+/// in hundreds of room-sized units; at 150 ft an ordinary room can never
+/// trigger (any aperture probe is closer), while a 300-400 ft warehouse
+/// hall gets the handful of interior probes that stop torch placement
+/// from being the de-facto coverage plan (MISS9 field observation,
+/// 2026-07-16: open regions got far too few probes and kept emitter
+/// anchors were carrying interior coverage).
+constexpr float kPathingInteriorCoverageRadiusFt = 150.0f;
 constexpr float kPathingCoverageMarginMul     = 2.0f;
 constexpr float kPathingCoverageVisRangeMinFt = 100.0f;
 constexpr float kPathingCoverageVisRangeMaxFt = 200.0f;

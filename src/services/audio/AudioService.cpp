@@ -17374,6 +17374,12 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             // usually saves it, but not when both flanks resolve to the
             // same room through an open archway).
             constexpr float kDoorPairDedupRadiusFt = 3.0f;
+            // Cross-door same-side flank merge radius. 6 ft spans the
+            // flank offset (kPathingPairProbeOffsetFt = 5): two doors off
+            // one hallway junction place their hallway-side flanks within
+            // this range. Deliberately tight — beyond it, distinct flanks
+            // are genuine bend anchors for routes turning between doors.
+            constexpr float kCrossDoorMergeRadiusFt = 6.0f;
             const float kDoorPairDedupRadiusSq =
                 kDoorPairDedupRadiusFt * kDoorPairDedupRadiusFt;
             int droppedDoorPairs   = 0;
@@ -17511,28 +17517,56 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 const int candRoom = roomOf(cand.position);
                 const bool candIsDoorAnchor =
                     (cand.purpose == PathingProbePurpose::DoorPair);
+                // Outer scan gate = the widest radius ANY rule below
+                // needs for this candidate; each rule re-checks its own
+                // tighter radius. (A single gate at the pair radius was
+                // silently preventing the 6 ft cross-door merge from ever
+                // being evaluated.)
+                const float scanSq = std::max(
+                    radiusSq, candIsDoorAnchor
+                                  ? kCrossDoorMergeRadiusFt
+                                        * kCrossDoorMergeRadiusFt
+                                  : 0.0f);
                 bool tooClose = false;
                 for (size_t i = 0; i < kept.size(); ++i) {
                     Vector3 d = cand.position - kept[i].position;
-                    if (glm::dot(d, d) >= radiusSq) continue;
+                    const float dsq = glm::dot(d, d);
+                    if (dsq >= scanSq) continue;
                     const bool samePurpose = (kept[i].purpose == cand.purpose);
                     const bool sameRoom    = (keptRoom[i] == candRoom);
-                    if (samePurpose && sameRoom) {
+                    if (samePurpose && sameRoom && dsq < radiusSq) {
                         tooClose = true;              // the original collision
                         break;
                     }
                     // Differing purpose and/or room: merge only when the two
                     // probes provably share one acoustic space.
                     //
-                    // Only the probe being DROPPED needs the door exemption:
-                    // a DoorPair flank must always survive, because it is the
-                    // geometry a closed door blocks between. A probe merging
-                    // INTO a kept flank is fine — the flank stays, so the
-                    // door's role is untouched, and that is precisely the
-                    // merge we want (the threshold-slab centroid 4 ft from
-                    // its own flank, on the same side of the door, adds
-                    // nothing SA cannot already reach via influence radius).
-                    if (!candIsDoorAnchor &&
+                    // Non-door candidates merge into any kept probe under
+                    // the same-space proof (no door leaf crossed + ray
+                    // PROVEN clear). DoorPair candidates may ALSO merge —
+                    // but only CROSS-DOOR, same side, at a tight radius:
+                    // in a cramped multi-door house every doorway placed
+                    // its own hallway-side flank, stacking probes 3-6 ft
+                    // apart that all do the same job (MISS9 field
+                    // observation, 2026-07-16). A shared same-side node
+                    // still gives EACH door its distinct crossing edge
+                    // through its own OBB, because edges are geometric;
+                    // and a door's OWN pair can never merge together —
+                    // the segment between its flanks crosses its leaf, so
+                    // sameAcousticSpace rejects it by construction. The
+                    // kept member's position is used as-is (snap, not
+                    // average: an averaged position can land inside a
+                    // wall in non-convex houses).
+                    const bool crossDoorFlankMerge =
+                        candIsDoorAnchor
+                        && (kept[i].purpose == PathingProbePurpose::DoorPair
+                            || kept[i].purpose == PathingProbePurpose::Portal
+                            || kept[i].purpose == PathingProbePurpose::HubFill)
+                        && dsq <= kCrossDoorMergeRadiusFt
+                                * kCrossDoorMergeRadiusFt;
+                    const bool nonDoorMerge =
+                        !candIsDoorAnchor && dsq < radiusSq;
+                    if ((nonDoorMerge || crossDoorFlankMerge) &&
                         sameAcousticSpace(cand.position, kept[i].position)) {
                         ++mergedSameSpace;
                         tooClose = true;
@@ -17984,6 +18018,38 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                             if (d.isPortal) { hasApertureDemand = true; break; }
                         }
                         if (!hasApertureDemand) continue;
+                        // The emitter-anchor rule, generalized (user rule
+                        // 2026-07-16): if an existing candidate within the
+                        // influence floor has a PROVEN-clear ray to every
+                        // aperture demand point of this fragment, the
+                        // fragment is already served — influence spheres
+                        // ignore region boundaries. One physical chokepoint
+                        // shattered into micro-fragments must not collect
+                        // one seed per fragment.
+                        {
+                            bool allServed = true;
+                            for (const auto &d : kv.second) {
+                                if (!d.isPortal) continue;
+                                bool served = false;
+                                if (rcFill) {
+                                    for (const auto &cand :
+                                             params.pathingCandidates) {
+                                        const Vector3 dv =
+                                            cand.position - d.pos;
+                                        if (glm::dot(dv, dv)
+                                                > 10.0f * 10.0f)
+                                            continue;
+                                        if (!blockedRay(d.pos,
+                                                        cand.position)) {
+                                            served = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (!served) { allServed = false; break; }
+                            }
+                            if (allServed && rcFill) continue;
+                        }
                         auto seedSitesIt = regionSites.find(rid);
                         if (seedSitesIt == regionSites.end()
                             || seedSitesIt->second.empty()) {
@@ -18032,6 +18098,22 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                             const Vector3 &s = seedSitesIt->second[si];
                             if (insideDoorAABB(s) >= 0) continue;
                             if (nearDoorFootprint(s)) continue;
+                            // Cross-region stacking guard: the fill's own
+                            // separation check only sees this region's
+                            // anchors (empty here by definition), so
+                            // without this, seeds of adjacent fragments
+                            // stacked within feet of each other.
+                            bool stacked = false;
+                            for (const auto &cand :
+                                     params.pathingCandidates) {
+                                const Vector3 av = cand.position - s;
+                                if (glm::dot(av, av)
+                                        < kSiteMinSeparationSq) {
+                                    stacked = true;
+                                    break;
+                                }
+                            }
+                            if (stacked) continue;
                             const Vector3 dv = s - dc;
                             const float dsq = glm::dot(dv, dv);
                             if (dsq < seedSq) {
@@ -18132,7 +18214,30 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                             }
                             if (!dInf && d.bestFt > far->bestFt) far = &d;
                         }
-                        if (!far) break;  // all portals covered (or stuck)
+                        if (!far) {
+                            // All aperture demand covered (or stuck):
+                            // INTERIOR pass — floor demand may drive, but
+                            // only past kPathingInteriorCoverageRadiusFt
+                            // (2x R_cov). This is NOT the §14 over-fire
+                            // re-opened: that chased floor points at 75 ft
+                            // across hundreds of room-sized units; at
+                            // 150 ft only genuinely OPEN interiors qualify
+                            // (an ordinary room always has a nearer
+                            // aperture probe), and the per-region cap
+                            // still bounds it. Without this, big-hall
+                            // coverage was whatever emitter anchors
+                            // happened to survive — torch placement as
+                            // the coverage plan.
+                            for (auto &d : kv.second) {
+                                if (d.stuck || d.isPortal) continue;
+                                if (d.bestFt == kInf) continue;
+                                if (d.bestFt
+                                        <= kPathingInteriorCoverageRadiusFt)
+                                    continue;
+                                if (!far || d.bestFt > far->bestFt) far = &d;
+                            }
+                        }
+                        if (!far) break;  // everything covered (or stuck)
 
                         // Nearest usable site to it. "Usable" = unused,
                         // outside every door AABB, not stacked on an
