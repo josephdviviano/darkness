@@ -286,6 +286,15 @@ struct RenderConfig {
     // diagnostic). Clamped to [0.0, 1.0] seconds.
     float    pathingUpdateInterval = 0.1f;
 
+    // Time constant (ms) for the audio-thread smoother on pathing EQ/SH
+    // parameters. Steam Audio's built-in PathEffect ramps are frame-
+    // count based and collapse to ~20-60 ms at our small buffers, so a
+    // fresh solve with a large level change (door between loud/quiet
+    // spaces) steps audibly; this smoother is time-based and frame-size
+    // independent. 0 disables (verbatim application, Valve-plugin
+    // behavior). Clamped to [0, 1000].
+    float    pathingSmoothingMs = 100.0f;
+
     // Per-band weights for collapsing Steam Audio's 3-band eqCoeffs into
     // the scalar portalAttenuation gain. Applied as
     //   gain = wL·eqLow + wM·eqMid + wH·eqHigh
@@ -967,6 +976,11 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.pathingUpdateInterval < 0.0f) cfg.pathingUpdateInterval = 0.0f;
                     if (cfg.pathingUpdateInterval > 1.0f) cfg.pathingUpdateInterval = 1.0f;
                 }
+                if (prop["pathing_smoothing_ms"]) {
+                    cfg.pathingSmoothingMs = prop["pathing_smoothing_ms"].as<float>();
+                    if (cfg.pathingSmoothingMs < 0.0f) cfg.pathingSmoothingMs = 0.0f;
+                    if (cfg.pathingSmoothingMs > 1000.0f) cfg.pathingSmoothingMs = 1000.0f;
+                }
                 if (prop["pathing_gain_band_weights"]) {
                     YAML::Node w = prop["pathing_gain_band_weights"];
                     if (w.IsSequence() && w.size() == 3) {
@@ -1516,6 +1530,10 @@ inline bool applySetOverride(const std::string& path, const std::string& valueSt
     if (path == "audio.propagation.pathing_update_interval") {
         float v; if (!toFloat(v)) return false;
         cfg.pathingUpdateInterval = clampF(v, 0.0f, 1.0f); return true;
+    }
+    if (path == "audio.propagation.pathing_smoothing_ms") {
+        float v; if (!toFloat(v)) return false;
+        cfg.pathingSmoothingMs = clampF(v, 0.0f, 1000.0f); return true;
     }
 
     // -- audio.spatialization --

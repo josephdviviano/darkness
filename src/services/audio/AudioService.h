@@ -391,7 +391,8 @@ public:
      *  in its vertex coordinates (see DoorAudioGeometry). Setting a
      *  transform marks the scene as needing a commit; the commit is
      *  coalesced once per loopStep after reflection-sim is drained. */
-    void setDoorTransform(int32_t doorObjID, const Matrix4 &worldTransform);
+    void setDoorTransform(int32_t doorObjID, const Matrix4 &worldTransform,
+                          float openFraction = 1.0f);
 
     /** Debug overlay accessor — returns world-space triangle data for all
      *  registered doors. Used by the renderer's `show_door_geometry`
@@ -815,6 +816,12 @@ public:
      *  Default 0.1 s (10 Hz) matches the Unity/Unreal integration
      *  defaults. 0.0 = update every frame (legacy / A-B diagnostic).
      *  Range: [0.0, 1.0]. */
+    /** Pathing parameter smoothing time constant (ms). 0 disables the
+     *  smoother (solver outputs applied verbatim, Valve-plugin style).
+     *  See SteamAudioDSPNode::pathSmoothEq for why this exists. */
+    void setPathingSmoothingMs(float ms);
+    float getPathingSmoothingMs() const;
+
     void  setPathingUpdateInterval(float s) {
         mPathingUpdateInterval = std::max(0.0f, std::min(s, 1.0f));
     }
@@ -1842,8 +1849,19 @@ private:
         /// candidates falling inside a door footprint.
         Vector3 worldAABBmin{0.0f, 0.0f, 0.0f};
         Vector3 worldAABBmax{0.0f, 0.0f, 0.0f};
+        /// Door open fraction (0 closed .. 1 open) as of the latest
+        /// setDoorTransform push. Drives the fraction-indexed pathing
+        /// transition on voices scoped to this door.
+        float openFraction = 1.0f;
     };
     std::unordered_map<int32_t, DoorAudioInstance> mDoorAudioInstances;
+
+    /// Doors currently mid-swing: objID -> steady-clock seconds of the
+    /// most recent transform bump. Populated in the loopStep commit
+    /// drain; entries older than kDoorSwingQuietSec age out, at which
+    /// point the door's scoped voices get pathDoorFraction = -1 (no
+    /// governing door). MAIN THREAD ONLY.
+    std::unordered_map<int32_t, double> mSwingingDoorLastBump;
 
     /// Recompute worldAABBmin/max for a single door instance from its cached
     /// localVertices × worldTransform. Called by registerDoorGeometry on

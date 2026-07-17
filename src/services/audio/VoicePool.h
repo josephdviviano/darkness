@@ -303,6 +303,45 @@ struct SteamAudioDSPNode {
     std::vector<float> pathOutL;
     std::vector<float> pathOutR;
 
+    // ── Pathing parameter smoother (audio thread only) ──
+    //
+    // Steam Audio's own PathEffect ramps are FRAME-COUNT based
+    // (GainEffect kNumInterpolationFrames=4, EQEffect one-frame
+    // crossfade): tuned for Unity's ~21 ms buffers they give a
+    // 75-200 ms glide, but at our ~5 ms buffers the same constants
+    // collapse to ~20-60 ms — an audible step when a pathing solve
+    // lands with a large level change (door opening between loud and
+    // quiet spaces). This smoother is TIME-based: eq band gains and
+    // SH coefficients (both plain linear gains — safe to lerp, unlike
+    // IIR coefficients) approach the solver's latest values with a
+    // configurable time constant before being handed to
+    // iplPathEffectApply. All fields audio-thread-owned.
+    bool  pathSmoothInit = false;
+    float pathSmoothEq[3] = {1.0f, 1.0f, 1.0f};
+    std::vector<float> pathSmoothSh;   // (order+1)^2, sized in initVoiceDSP
+
+    // Fraction-indexed solve anchors: the last two DISTINCT solver
+    // outputs (A older, B newer) with the governing door's open
+    // fraction at the moment each landed. While a door swings, the
+    // audible target is extrapolated along the fraction axis
+    // (t = (curFrac - fracA)/(fracB - fracA), clamped to [0, 1.6]) so
+    // the transition tracks the PHYSICAL door instead of the ~10 Hz
+    // solver cadence. Both anchors lag the door, so pure interpolation
+    // would always clamp at B — bounded extrapolation is the point.
+    // The time smoother above remains the safety net for overshoot.
+    float pathFracA = -1.0f;
+    float pathFracB = -1.0f;
+    float pathEqA[3] = {1.0f, 1.0f, 1.0f};
+    float pathEqB[3] = {1.0f, 1.0f, 1.0f};
+    std::vector<float> pathShA;
+    std::vector<float> pathShB;
+
+    // Governing door open fraction, written by the MAIN thread each
+    // loopStep while a door on this voice's route scope is swinging
+    // (same drain that sets pathScopedDoorDirty); -1 when no door
+    // governs. Audio thread reads relaxed once per callback.
+    std::atomic<float> pathDoorFraction{-1.0f};
+
     // Scratch buffers (allocated once at init, never reallocated — safe
     // for audio thread).
     std::vector<float> monoScratch;        // raw downmix, preserved for convolution
