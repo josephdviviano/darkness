@@ -18,6 +18,7 @@
 #ifndef __OBJSYSWORLDSTATE_H
 #define __OBJSYSWORLDSTATE_H
 
+#include <cstdio>
 #include <functional>
 
 #include "IWorldQuery.h"
@@ -36,6 +37,30 @@
 #include "room/RoomService.h"
 
 namespace Darkness {
+
+/// One-shot `[FALLBACK]` announcement for an un-wired capability stub.
+///
+/// IWorldQuery hands out *permissive* defaults when a capability has not been
+/// injected: fully lit, fully open, nothing hit, unit cube. Individually each
+/// looks harmless, and today nothing consumes them — but they are one family,
+/// not four coincidences, and they converge on a single future consumer: AI
+/// senses. A guard asking "can I see the player?" against un-wired stubs gets
+/// lit + clear line of sight + doors open + every prop a 1x1x1 box. That does
+/// not read as a bug; it reads as a guard with x-ray vision, and nothing
+/// prints. Hence: never crash, but never be quiet either.
+///
+/// One-shot per call site — these sit on per-frame query paths, so an
+/// unbounded log would itself be the bug. Not thread-safe by construction, and
+/// deliberately so: a benign duplicate line beats an atomic on a hot path, and
+/// the service stack is single-threaded anyway.
+#define WQ_FALLBACK_ONCE(...)                                                  \
+    do {                                                                       \
+        static bool _wqFallbackAnnounced = false;                              \
+        if (!_wqFallbackAnnounced) {                                           \
+            _wqFallbackAnnounced = true;                                       \
+            std::fprintf(stderr, __VA_ARGS__);                                 \
+        }                                                                      \
+    } while (0)
 
 class ObjSysWorldState : public IWorldQuery {
 public:
@@ -84,7 +109,13 @@ public:
     }
 
     BBox getBounds(EntityID id) const override {
-        // Stub: unit box at entity position until .bin bounds available
+        // Stub: unit box at entity position until .bin bounds available.
+        WQ_FALLBACK_ONCE(
+            "[FALLBACK] IWorldQuery::getBounds(%d): no .bin mesh bounds wired "
+            "— returning a 1x1x1 unit cube for EVERY entity. queryAABB, "
+            "frustum culling and collision cannot tell a crate from a "
+            "cathedral. (first call only)\n",
+            static_cast<int>(id));
         Vector3 pos = mObjSvc->position(id);
         return {{pos.x - 0.5f, pos.y - 0.5f, pos.z - 0.5f},
                 {pos.x + 0.5f, pos.y + 0.5f, pos.z + 0.5f}};
@@ -235,7 +266,16 @@ public:
     }
 
     float getPortalOpenFraction(PortalID portal) const override {
-        if (!mPortalOpenFractionFn) return 1.0f;
+        if (!mPortalOpenFractionFn) {
+            WQ_FALLBACK_ONCE(
+                "[FALLBACK] IWorldQuery::getPortalOpenFraction(%d): no "
+                "door-state callback injected — returning 1.0 (FULLY OPEN) for "
+                "every portal. Sound and AI propagation will pass through "
+                "closed doors. Wire setPortalOpenFractionFn() after DoorSystem "
+                "init. (first call only)\n",
+                static_cast<int>(portal));
+            return 1.0f;
+        }
         return mPortalOpenFractionFn(portal);
     }
 
@@ -350,14 +390,35 @@ public:
     // ========================================================================
 
     float getLightLevel(const Vector3 & /*pos*/) const override {
-        return 1.0f; // Stub — will query lightmap/dynamic light in Phase 6
+        // Stub — will query lightmap/dynamic light in a later phase.
+        WQ_FALLBACK_ONCE(
+            "[FALLBACK] IWorldQuery::getLightLevel: lighting system not wired "
+            "— returning 1.0 (FULLY LIT) for EVERY position. Any AI vision "
+            "built on this sees the player in total darkness. (first call "
+            "only)\n");
+        return 1.0f;
     }
 
     bool raycast(const Vector3 &from, const Vector3 &to,
                  RayHit &hit) const override {
         if (mRaycaster)
             return mRaycaster(from, to, hit);
-        return false; // No raycaster injected — fallback
+
+        WQ_FALLBACK_ONCE(
+            "[FALLBACK] IWorldQuery::raycast: no raycaster injected — "
+            "returning false (NOTHING HIT) for every ray, i.e. clear line of "
+            "sight everywhere. Wire setRaycaster(). (first call only)\n");
+
+        // Zero the out-param. RayHit leaves point/normal/distance/hitEntity
+        // without default initializers, so a caller that ignores the return
+        // value reads uninitialized stack. Explicit per-field rather than
+        // `hit = RayHit{}` because Vector3's default ctor does not zero unless
+        // GLM_FORCE_CTOR_INIT is set, which we do not rely on here.
+        hit.point = Vector3(0.0f);
+        hit.normal = Vector3(0.0f);
+        hit.distance = 0.0f;
+        hit.hitEntity = 0;
+        return false;
     }
 
     // ========================================================================
