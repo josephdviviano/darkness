@@ -3741,6 +3741,17 @@ dbgConsole.addFloat("refl_throttle", 1.0f, 32.0f,
         },
         "Min seconds between Steam Audio pathing-sim updates (0=every frame, 0.1=10 Hz default)");
 
+    dbgConsole.addFloat("pathing_smoothing_ms", 0.0f, 1000.0f,
+        []() {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            return svc ? svc->getPathingSmoothingMs() : 100.0f;
+        },
+        [](float v) {
+            auto svc = GET_SERVICE(Darkness::AudioService);
+            if (svc) svc->setPathingSmoothingMs(v);
+        },
+        "Time constant (ms) smoothing pathing EQ/SH between solves (0=verbatim)");
+
     // Bake probes: set to "on" to trigger re-baking.
     // The action runs on a background thread with a progress-bar overlay
     // (same helper as the first-run auto-bake) so the window stays
@@ -5383,6 +5394,7 @@ int main(int argc, char *argv[]) {
         audioSvc->setPathingGainScale(cfg.pathingGainScale);
         audioSvc->setPathingBlockingScale(cfg.pathingBlockingScale);
         audioSvc->setPathingUpdateInterval(cfg.pathingUpdateInterval);
+        audioSvc->setPathingSmoothingMs(cfg.pathingSmoothingMs);
         audioSvc->setPathingGainBandWeights(cfg.pathingGainWeightLow,
                                             cfg.pathingGainWeightMid,
                                             cfg.pathingGainWeightHigh);
@@ -6618,8 +6630,10 @@ int main(int argc, char *argv[]) {
             auto doorAudioGeom = doorSystem.getAudioGeometryInventory();
             audioForBlocking->registerDoorGeometry(doorAudioGeom);
             doorSystem.setAudioMeshUpdateCallback(
-                [audioForBlocking](int32_t objID, const Darkness::Matrix4 &xform) {
-                    audioForBlocking->setDoorTransform(objID, xform);
+                [audioForBlocking](int32_t objID, const Darkness::Matrix4 &xform,
+                                   float openFraction) {
+                    audioForBlocking->setDoorTransform(objID, xform,
+                                                       openFraction);
                 });
         }
     }
