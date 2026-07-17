@@ -17508,6 +17508,36 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             std::vector<int> keptRoom;
             keptRoom.reserve(params.pathingCandidates.size());
             int crossRoomPreserved = 0;
+            // Region-emptying guard: a merge may never take a region's
+            // LAST probe. Unbounded merging measured two costs: parity
+            // blindness (a probe-less side region moves its apertures
+            // into the ungraded empty-side bucket — 80-90% of apertures
+            // on merge-heavy levels) and severed connectivity (the
+            // region's anchor was carrying edges). Track candidates per
+            // region; a drop that would zero a region is skipped.
+            std::map<int, int> regionCandCount;
+            if (mRegionOfPointFn) {
+                for (const auto &c : params.pathingCandidates) {
+                    const int r = mRegionOfPointFn(c.position);
+                    if (r >= 0) ++regionCandCount[r];
+                }
+            }
+            int regionEmptyPreserved = 0;
+            auto wouldEmptyRegion = [&](const Vector3 &p) -> bool {
+                if (!mRegionOfPointFn) return false;
+                const int r = mRegionOfPointFn(p);
+                if (r < 0) return false;
+                auto it = regionCandCount.find(r);
+                return it != regionCandCount.end() && it->second <= 1;
+            };
+            auto noteDrop = [&](const Vector3 &p) {
+                if (!mRegionOfPointFn) return;
+                const int r = mRegionOfPointFn(p);
+                if (r < 0) return;
+                auto it = regionCandCount.find(r);
+                if (it != regionCandCount.end() && it->second > 0)
+                    --it->second;
+            };
             for (const auto &cand : params.pathingCandidates) {
                 const bool isPair =
                     (cand.purpose == PathingProbePurpose::DoorPair
@@ -17567,11 +17597,15 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     const bool nonDoorMerge =
                         !candIsDoorAnchor && dsq < radiusSq;
                     if ((nonDoorMerge || crossDoorFlankMerge) &&
+                        !wouldEmptyRegion(cand.position) &&
                         sameAcousticSpace(cand.position, kept[i].position)) {
                         ++mergedSameSpace;
                         tooClose = true;
                         break;
                     }
+                    if ((nonDoorMerge || crossDoorFlankMerge)
+                        && wouldEmptyRegion(cand.position))
+                        ++regionEmptyPreserved;
                     if (!sameRoom) ++crossRoomPreserved;
                 }
                 if (tooClose) {
@@ -17579,6 +17613,7 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     // emitted under portal-first placement; their counters
                     // remain wired to planCounters for the probe_plan verb's
                     // field layout but stay zero.)
+                    noteDrop(cand.position);
                     if (cand.purpose == PathingProbePurpose::DoorPair) {
                         ++droppedDoorPairs;
                     } else {
@@ -17589,10 +17624,16 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 kept.push_back(cand);
                 keptRoom.push_back(candRoom);
             }
+            if (regionEmptyPreserved > 0) {
+                AUDIO_LOG("Pathing dedup: %d merges SKIPPED (would have "
+                          "taken a region's last probe)\n",
+                          regionEmptyPreserved);
+            }
             if (crossRoomPreserved > 0) {
                 AUDIO_LOG("Pathing dedup: %d probes merged into a probe "
                           "sharing their acoustic space (no door crossed + "
-                          "segment proven visible; door anchors exempt)\n",
+                          "segment proven visible; region-emptying merges "
+                          "skipped)\n",
                           mergedSameSpace);
                 AUDIO_LOG("Pathing dedup: %d same-purpose probes preserved "
                           "(different rooms — room-aware dedup)\n",
@@ -18615,6 +18656,187 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     governingUnreachable, kPathingCoverageMarginMul,
                     kPathingCoverageVisRangeMinFt,
                     kPathingCoverageVisRangeMaxFt);
+
+                // ── GLOBAL fragment joiner (user direction, 2026-07-16:
+                //    "join the fragments — legitimate ones are geometry
+                //    that is totally disconnected and typically far
+                //    apart") ──
+                //
+                // The per-region stitch cannot bridge probe islands that
+                // span REGION boundaries, and the probe-economy merges
+                // measurably fragmented open levels (MISS15: biggest
+                // component 354 -> 132). This pass unions ALL candidates
+                // by proven-clear rays capped at the JUST-DERIVED
+                // visRange (an edge longer than that cannot exist in the
+                // baked graph, so a looser cap would union fictional
+                // connectivity), then bridges the closest cross-
+                // component gaps with stepping stones from the global
+                // floor-site pool. Component pairs farther apart than
+                // kJoinMaxGapFt are presumed GENUINELY separate geometry
+                // and left alone, loudly. Runs only with a raycaster
+                // (proof or nothing).
+                if (rcFill && params.pathingCandidates.size() >= 2) {
+                    constexpr float kJoinMaxGapFt = 300.0f;
+                    constexpr int   kJoinStoneBudget = 32;
+                    const size_t nJoin0 = params.pathingCandidates.size();
+                    auto &cands = params.pathingCandidates;
+                    std::vector<int> jParent;
+                    std::map<std::pair<int, int>, bool> jMemo;
+                    auto jBlocked = [&](int i, int j) {
+                        const auto key = std::make_pair(std::min(i, j),
+                                                        std::max(i, j));
+                        auto it = jMemo.find(key);
+                        if (it != jMemo.end()) return it->second;
+                        const bool blocked = blockedRay(
+                            cands[static_cast<size_t>(i)].position,
+                            cands[static_cast<size_t>(j)].position);
+                        jMemo[key] = blocked;
+                        return blocked;
+                    };
+                    auto jFind = [&](int x) {
+                        while (jParent[static_cast<size_t>(x)] != x) {
+                            jParent[static_cast<size_t>(x)] =
+                                jParent[static_cast<size_t>(
+                                    jParent[static_cast<size_t>(x)])];
+                            x = jParent[static_cast<size_t>(x)];
+                        }
+                        return x;
+                    };
+                    auto jRebuild = [&]() {
+                        jParent.resize(cands.size());
+                        for (size_t i = 0; i < cands.size(); ++i)
+                            jParent[i] = static_cast<int>(i);
+                        const float capSq = visRangeFt * visRangeFt;
+                        for (size_t i = 0; i < cands.size(); ++i) {
+                            for (size_t j = i + 1; j < cands.size(); ++j) {
+                                if (jFind(static_cast<int>(i))
+                                        == jFind(static_cast<int>(j)))
+                                    continue;
+                                const Vector3 d = cands[j].position
+                                                - cands[i].position;
+                                if (glm::dot(d, d) > capSq) continue;
+                                if (!jBlocked(static_cast<int>(i),
+                                              static_cast<int>(j))) {
+                                    int a = jFind(static_cast<int>(i));
+                                    int b = jFind(static_cast<int>(j));
+                                    if (a != b)
+                                        jParent[static_cast<size_t>(a)] = b;
+                                }
+                            }
+                        }
+                        std::set<int> roots;
+                        for (size_t i = 0; i < cands.size(); ++i)
+                            roots.insert(jFind(static_cast<int>(i)));
+                        return static_cast<int>(roots.size());
+                    };
+                    // Global site pool (ear height, outside door boxes).
+                    const std::vector<DoorWorldAABB> joinDoorBoxes =
+                        doorAudioAABBs();
+                    std::vector<Vector3> jSites;
+                    for (const Vector3 &f : mFloorProbeCandidates) {
+                        const Vector3 p{f.x, f.y, f.z + kEarHeightFt};
+                        bool nearDoor = false;
+                        for (const DoorWorldAABB &b : joinDoorBoxes) {
+                            if (sPointAABBDistSq(p, b.mn, b.mx)
+                                    <= kPathingDoorPortalMatchDistFt
+                                     * kPathingDoorPortalMatchDistFt) {
+                                nearDoor = true;
+                                break;
+                            }
+                        }
+                        if (!nearDoor) jSites.push_back(p);
+                    }
+                    std::vector<char> jSiteUsed(jSites.size(), 0);
+                    int comps = jRebuild();
+                    int stones = 0, duds = 0, farGaps = 0;
+                    while (comps > 1 && stones < kJoinStoneBudget
+                           && duds < 3) {
+                        // Closest cross-component candidate pair.
+                        int bi = -1, bj = -1;
+                        float bSq = std::numeric_limits<float>::max();
+                        for (size_t i = 0; i < cands.size(); ++i) {
+                            for (size_t j = i + 1; j < cands.size(); ++j) {
+                                if (jFind(static_cast<int>(i))
+                                        == jFind(static_cast<int>(j)))
+                                    continue;
+                                const Vector3 d = cands[j].position
+                                                - cands[i].position;
+                                const float dsq = glm::dot(d, d);
+                                if (dsq < bSq) {
+                                    bSq = dsq;
+                                    bi = static_cast<int>(i);
+                                    bj = static_cast<int>(j);
+                                }
+                            }
+                        }
+                        if (bi < 0) break;
+                        if (bSq > kJoinMaxGapFt * kJoinMaxGapFt) {
+                            // The user's legitimacy criterion: fragments
+                            // this far apart are genuinely separate
+                            // geometry (separate map zones). Loud, then
+                            // done — every remaining gap is >= this one.
+                            ++farGaps;
+                            std::fprintf(stderr,
+                                "[PATHING_JOIN] %d components remain; "
+                                "closest gap %.0f ft > %.0f ft — presumed "
+                                "genuinely separate geometry\n",
+                                comps, std::sqrt(bSq), kJoinMaxGapFt);
+                            break;
+                        }
+                        const Vector3 mid =
+                            (cands[static_cast<size_t>(bi)].position
+                             + cands[static_cast<size_t>(bj)].position)
+                            * 0.5f;
+                        int sBest = -1;
+                        float sBestSq = std::numeric_limits<float>::max();
+                        for (size_t si = 0; si < jSites.size(); ++si) {
+                            if (jSiteUsed[si]) continue;
+                            bool stacked = false;
+                            for (const auto &c : cands) {
+                                const Vector3 av = jSites[si] - c.position;
+                                if (glm::dot(av, av) < 25.0f) {
+                                    stacked = true;
+                                    break;
+                                }
+                            }
+                            if (stacked) continue;
+                            const Vector3 dv = jSites[si] - mid;
+                            const float dsq = glm::dot(dv, dv);
+                            if (dsq < sBestSq) {
+                                sBestSq = dsq;
+                                sBest = static_cast<int>(si);
+                            }
+                        }
+                        if (sBest < 0) {
+                            std::fprintf(stderr,
+                                "[FALLBACK] pathing join: %d components, "
+                                "closest gap %.0f ft, but no usable site "
+                                "remains near the midpoint\n",
+                                comps, std::sqrt(bSq));
+                            break;
+                        }
+                        jSiteUsed[static_cast<size_t>(sBest)] = 1;
+                        PathingProbeCandidate stone;
+                        stone.position = jSites[static_cast<size_t>(sBest)];
+                        stone.radiusFt = 5.0f;  // adaptive pass overrides
+                        stone.purpose  = PathingProbePurpose::HubFill;
+                        cands.push_back(stone);
+                        ++stones;
+                        const int prevComps = comps;
+                        comps = jRebuild();
+                        if (comps >= prevComps) ++duds;
+                        else duds = 0;
+                    }
+                    if (stones > 0 || comps > 1) {
+                        std::fprintf(stderr,
+                            "[PATHING_JOIN] global fragment joiner: +%d "
+                            "stepping stones (%zu -> %zu candidates), "
+                            "components -> %d (edge cap %.0f ft, gap "
+                            "limit %.0f ft)\n",
+                            stones, nJoin0, cands.size(), comps,
+                            visRangeFt, kJoinMaxGapFt);
+                    }
+                }
             }
 
             // Adaptive radius — overlap-favoring, room-radius-floored:
