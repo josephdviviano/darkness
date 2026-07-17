@@ -987,6 +987,10 @@ static std::atomic<IPLHRTF> sPathHrtf{nullptr};
 /// the per-voice pathingSource mirror — Valve reference-plugin
 /// pattern; no application-layer staged-copy field).
 static std::atomic<int> sPathAmbisonicsOrder{0};
+// Pathing parameter smoother time constant, seconds. Written by
+// setPathingSmoothingMs (main thread), read per-callback (audio thread).
+// <= 0 disables smoothing (verbatim application, Valve-plugin behavior).
+static std::atomic<float> sPathSmoothTauSec{0.1f};
 
 /// Silent-voice convolution skip threshold (in audio callbacks). Derived
 /// via `reflSilentSkipFrames()` (AudioUnits.h) from the live
@@ -2002,10 +2006,124 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                                 IPL_SIMULATIONFLAGS_PATHING, &outputs);
 
             IPLPathEffectParams pp{};
-            pp.eqCoeffs[0] = outputs.pathing.eqCoeffs[0];
-            pp.eqCoeffs[1] = outputs.pathing.eqCoeffs[1];
-            pp.eqCoeffs[2] = outputs.pathing.eqCoeffs[2];
-            pp.shCoeffs    = outputs.pathing.shCoeffs;
+            // Raw solver outputs, floored per Valve's Unity reference
+            // plugin (SteamAudioSource.UpdateOutputs clamps each pathing
+            // EQ band to >= 0.1): a band collapsing to 0 is an abrupt
+            // spectral hole no smoother should chase.
+            float rawEq[3];
+            for (int b = 0; b < 3; ++b) {
+                float e = outputs.pathing.eqCoeffs[b];
+                if (!std::isfinite(e)) e = 1.0f;
+                rawEq[b] = std::max(0.1f, e);
+            }
+            const int ppOrder =
+                sPathAmbisonicsOrder.load(std::memory_order_acquire);
+            const int numSh = (ppOrder + 1) * (ppOrder + 1);
+            const float tauSec =
+                sPathSmoothTauSec.load(std::memory_order_relaxed);
+            const bool canSmooth =
+                tauSec > 0.0f
+                && outputs.pathing.shCoeffs != nullptr
+                && static_cast<size_t>(numSh) <= node->pathSmoothSh.size();
+            if (canSmooth) {
+                const float *rawSh = outputs.pathing.shCoeffs;
+                if (!node->pathSmoothInit) {
+                    // First frame snaps (Steam Audio's own mFirstFrame
+                    // pattern) — no fade-in from the init sentinel.
+                    for (int b = 0; b < 3; ++b) {
+                        node->pathSmoothEq[b] = rawEq[b];
+                        node->pathEqA[b] = node->pathEqB[b] = rawEq[b];
+                    }
+                    for (int i = 0; i < numSh; ++i) {
+                        const float s =
+                            std::isfinite(rawSh[i]) ? rawSh[i] : 0.0f;
+                        node->pathSmoothSh[i] = s;
+                        node->pathShA[i] = node->pathShB[i] = s;
+                    }
+                    node->pathFracA = node->pathFracB =
+                        node->pathDoorFraction.load(
+                            std::memory_order_relaxed);
+                    node->pathSmoothInit = true;
+                }
+                // New-solve detection: the worker rewrites the source's
+                // pathingOutputs in place; any byte difference from
+                // anchor B means a fresh solve landed. Shift B->A and
+                // stamp B with the governing door's CURRENT fraction.
+                bool changed = false;
+                for (int b = 0; b < 3 && !changed; ++b)
+                    changed = (rawEq[b] != node->pathEqB[b]);
+                for (int i = 0; i < numSh && !changed; ++i) {
+                    const float s =
+                        std::isfinite(rawSh[i]) ? rawSh[i] : 0.0f;
+                    changed = (s != node->pathShB[i]);
+                }
+                const float curFrac = node->pathDoorFraction.load(
+                    std::memory_order_relaxed);
+                if (changed) {
+                    for (int b = 0; b < 3; ++b) {
+                        node->pathEqA[b] = node->pathEqB[b];
+                        node->pathEqB[b] = rawEq[b];
+                    }
+                    for (int i = 0; i < numSh; ++i) {
+                        node->pathShA[i] = node->pathShB[i];
+                        node->pathShB[i] =
+                            std::isfinite(rawSh[i]) ? rawSh[i] : 0.0f;
+                    }
+                    node->pathFracA = node->pathFracB;
+                    node->pathFracB = curFrac;
+                }
+                // Target: while a door swings and the two anchors span a
+                // real fraction interval, extrapolate along the fraction
+                // axis (both anchors LAG the door, so t routinely lands
+                // past 1; the 1.6 bound caps overshoot). Otherwise the
+                // target is simply the latest solve.
+                float t = 1.0f;
+                bool fracDrive = false;
+                if (curFrac >= 0.0f && node->pathFracA >= 0.0f
+                    && node->pathFracB >= 0.0f) {
+                    const float span =
+                        node->pathFracB - node->pathFracA;
+                    if (std::fabs(span) > 0.02f) {
+                        t = (curFrac - node->pathFracA) / span;
+                        t = std::min(1.6f, std::max(0.0f, t));
+                        fracDrive = true;
+                    }
+                }
+                // Time-based approach to the target. Fraction-driven
+                // targets already move continuously with the door, so
+                // they use a tight constant to track it; solver-step
+                // targets use the configured constant to hide the
+                // ~10 Hz cadence.
+                const float effTau =
+                    fracDrive ? std::min(tauSec, 0.03f) : tauSec;
+                const float frameDur =
+                    static_cast<float>(frameCount)
+                    / std::max(1.0f, static_cast<float>(
+                           sEngineSampleRate.load(
+                               std::memory_order_relaxed)));
+                const float alpha =
+                    1.0f - std::exp(-frameDur / std::max(1e-4f, effTau));
+                for (int b = 0; b < 3; ++b) {
+                    const float target = node->pathEqA[b]
+                        + (node->pathEqB[b] - node->pathEqA[b]) * t;
+                    node->pathSmoothEq[b] +=
+                        alpha * (std::max(0.1f, target)
+                                 - node->pathSmoothEq[b]);
+                    pp.eqCoeffs[b] = node->pathSmoothEq[b];
+                }
+                for (int i = 0; i < numSh; ++i) {
+                    const float target = node->pathShA[i]
+                        + (node->pathShB[i] - node->pathShA[i]) * t;
+                    node->pathSmoothSh[i] +=
+                        alpha * (target - node->pathSmoothSh[i]);
+                }
+                pp.shCoeffs = node->pathSmoothSh.data();
+            } else {
+                pp.eqCoeffs[0] = rawEq[0];
+                pp.eqCoeffs[1] = rawEq[1];
+                pp.eqCoeffs[2] = rawEq[2];
+                pp.shCoeffs    = outputs.pathing.shCoeffs;
+            }
             // Listener pose + HRTF + binaural flag are per-callback
             // state owned by the audio thread; populate from the audio-
             // thread-visible globals (sPathListenerCoord and sPathHrtf).
@@ -6135,7 +6253,21 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
 }
 
 //------------------------------------------------------
-void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTransform)
+void AudioService::setPathingSmoothingMs(float ms)
+{
+    const float tau = std::max(0.0f, ms) * 0.001f;
+    sPathSmoothTauSec.store(tau, std::memory_order_relaxed);
+    AUDIO_LOG("[PATH_SMOOTH] pathing parameter smoothing tau = %.0f ms%s\n",
+              ms, ms <= 0.0f ? " (disabled — verbatim application)" : "");
+}
+
+float AudioService::getPathingSmoothingMs() const
+{
+    return sPathSmoothTauSec.load(std::memory_order_relaxed) * 1000.0f;
+}
+
+void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTransform,
+                                    float openFraction)
 {
     auto it = mDoorAudioInstances.find(doorObjID);
     if (it == mDoorAudioInstances.end() || !it->second.instancedMesh || !mIplScene) {
@@ -6150,6 +6282,7 @@ void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTrans
     // semantics as the IPL update, so the show_door_geometry wireframe
     // tracks the live door pose without an extra plumbing path.
     it->second.worldTransform = worldTransform;
+    it->second.openFraction   = openFraction;
     // Keep the world-AABB cache in lockstep with the live pose so the
     // [PROBE_DOOR_AUDIT] / door-portal-classification / [PROBE_BAKE]
     // consumers read the current door footprint.
@@ -6889,15 +7022,32 @@ void AudioService::loopStep(float deltaTime)
             // Fail-open voices (pathRouteScopeValid == false) are NOT
             // marked — they key on the global committed-gen trigger and
             // re-solve regardless.
+            const double nowSecSwing =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
             if (!mDoorsBumpedSinceCommit.empty()) {
                 uint64_t markedThisCommit = 0;
                 for (int32_t d : mDoorsBumpedSinceCommit) {
+                    // Swing bookkeeping + per-voice governing-door
+                    // fraction: pushed EVERY commit while the door
+                    // swings (a swinging door bumps every sim tick), so
+                    // the audio thread's fraction-indexed transition
+                    // tracks the physical door.
+                    mSwingingDoorLastBump[d] = nowSecSwing;
+                    float frac = 1.0f;
+                    auto di = mDoorAudioInstances.find(d);
+                    if (di != mDoorAudioInstances.end())
+                        frac = di->second.openFraction;
                     auto it = mDoorVoices.find(d);
                     if (it == mDoorVoices.end()) continue;
                     for (SoundHandle h : it->second) {
                         ActiveVoice *v = mVoicePool ? mVoicePool->find(h)
                                                     : nullptr;
-                        if (v && !v->pathScopedDoorDirty) {
+                        if (!v) continue;
+                        v->dspNode.pathDoorFraction.store(
+                            frac, std::memory_order_relaxed);
+                        if (!v->pathScopedDoorDirty) {
                             v->pathScopedDoorDirty = true;
                             ++markedThisCommit;
                         }
@@ -6913,6 +7063,32 @@ void AudioService::loopStep(float deltaTime)
                               prevMax, markedThisCommit,
                               std::memory_order_relaxed)) {}
                 mDoorsBumpedSinceCommit.clear();
+            }
+            // Swing age-out: a door quiet for kDoorSwingQuietSec stopped
+            // moving — release its voices from fraction governance so
+            // the smoother returns to plain time-based behavior (and a
+            // later solve for OTHER reasons isn't mis-anchored to a
+            // stale fraction interval).
+            if (!mSwingingDoorLastBump.empty()) {
+                constexpr double kDoorSwingQuietSec = 0.3;
+                for (auto sit = mSwingingDoorLastBump.begin();
+                     sit != mSwingingDoorLastBump.end();) {
+                    if (nowSecSwing - sit->second <= kDoorSwingQuietSec) {
+                        ++sit;
+                        continue;
+                    }
+                    auto vit = mDoorVoices.find(sit->first);
+                    if (vit != mDoorVoices.end()) {
+                        for (SoundHandle h : vit->second) {
+                            ActiveVoice *v = mVoicePool
+                                ? mVoicePool->find(h) : nullptr;
+                            if (v)
+                                v->dspNode.pathDoorFraction.store(
+                                    -1.0f, std::memory_order_relaxed);
+                        }
+                    }
+                    sit = mSwingingDoorLastBump.erase(sit);
+                }
             }
 
             static std::atomic<int> sCommitCount{0};
@@ -11866,6 +12042,13 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
             // to mFrameSize × 2 channels — one allocation, never realloc'd.
             dsp.pathOutL.assign(mFrameSize, 0.0f);
             dsp.pathOutR.assign(mFrameSize, 0.0f);
+            // Smoother + fraction-anchor SH buffers: (order+1)^2 floats,
+            // one allocation here, never realloc'd (audio-thread safe).
+            const size_t numSh = static_cast<size_t>(
+                (mAmbisonicsOrder + 1) * (mAmbisonicsOrder + 1));
+            dsp.pathSmoothSh.assign(numSh, 0.0f);
+            dsp.pathShA.assign(numSh, 0.0f);
+            dsp.pathShB.assign(numSh, 0.0f);
         }
     }
 
