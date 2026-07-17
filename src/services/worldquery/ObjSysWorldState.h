@@ -409,28 +409,13 @@ public:
             "returning false (NOTHING HIT) for every ray, i.e. clear line of "
             "sight everywhere. Wire setRaycaster(). (first call only)\n");
 
-        // Reset the out-param. Two distinct hazards:
-        //
-        // 1. RayHit leaves point/normal/distance/hitEntity without default
-        //    initializers, so a caller that ignores the return value reads
-        //    uninitialized stack. Explicit per-field rather than
-        //    `hit = RayHit{}` because Vector3's default ctor does not zero
-        //    unless GLM_FORCE_CTOR_INIT is set, which we do not rely on.
-        //
-        // 2. `status` MUST be reset to Unset. It is the mechanism that stops
-        //    `false` being read as "clear" (see RayStatus / rayStatusProven —
-        //    "!proven() means the bool answer is a guess"). A caller reusing
-        //    one RayHit across calls would otherwise keep a stale
-        //    RayStatus::Clear from an earlier real trace, and rayStatusProven()
-        //    would vouch for a ray that was never traced at all.
-        hit.point = Vector3(0.0f);
-        hit.normal = Vector3(0.0f);
-        hit.distance = 0.0f;
-        hit.hitEntity = 0;
-        hit.textureIndex = -1;
-        hit.cellIdx = -1;
-        hit.polyIdx = -1;
-        hit.status = RayStatus::Unset;
+        // Reset the WHOLE out-param, not just the fields we would have set.
+        // `status` is the load-bearing one: it is what stops `false` being read
+        // as "clear" (see RayStatus / rayStatusProven — "!proven() means the
+        // bool answer is a guess"). A caller reusing one RayHit across calls
+        // would otherwise keep a stale RayStatus::Clear from an earlier real
+        // trace, and rayStatusProven() would vouch for a ray never traced.
+        hit = RayHit{};
         return false;
     }
 

@@ -118,10 +118,20 @@ inline bool rayStatusProven(RayStatus s) {
 }
 
 struct RayHit {
-    Vector3 point;
-    Vector3 normal;
-    float distance;
-    EntityID hitEntity; // 0 if world geometry hit
+    // Every member carries an initializer on purpose. Vector3 is glm::vec3 and
+    // GLM_FORCE_CTOR_INIT is deliberately NOT defined in this build, so a bare
+    // `Vector3 point;` is garbage — and `RayHit hit;` would hand a producer's
+    // early-return path straight to a consumer as uninitialized stack.
+    //
+    // This matters because RayHit is an out-param with many early returns:
+    // raycastWorld alone has seven `return false` paths, and each sets only
+    // `status`. Callers today all gate on the bool, so nothing reads the
+    // garbage — but the next one to forget is reading a stack address. Fix the
+    // struct rather than each producer; there is no default worth omitting.
+    Vector3 point{0.0f};
+    Vector3 normal{0.0f};
+    float distance = 0.0f;
+    EntityID hitEntity = 0; // 0 if world geometry hit
     int32_t textureIndex = -1; // WR polygon texture index (-1 = unknown/no texture)
     int32_t cellIdx = -1;      // WR cell where hit occurred (-1 = unknown)
     int32_t polyIdx = -1;      // WR polygon index within cell (-1 = unknown)
