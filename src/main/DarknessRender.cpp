@@ -5678,10 +5678,12 @@ int main(int argc, char *argv[]) {
                                                           *roomSvcTopo);
                     std::fprintf(stderr,
                         "[APERTURE_TOPOLOGY] ROOM_DB portals=%d -> real "
-                        "apertures=%zu, fictional=%d, unplaceable=%d; air "
+                        "apertures=%zu, fictional=%d, unplaceable=%d, "
+                        "sub-wavelength cracks skipped=%d; air "
                         "regions=%d\n",
                         topo.rdbPortalsTotal, topo.data.apertures.size(),
                         topo.fictionalPortals, topo.unplaceableCount,
+                        topo.subWavelengthCount,
                         topo.data.numRegions);
                     // cellRegion + the gridded cell locator are moved
                     // into the closure — the lambda owns both for the
