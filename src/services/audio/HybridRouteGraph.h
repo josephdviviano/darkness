@@ -56,19 +56,25 @@ namespace Darkness {
 
 class HybridRouteGraph {
 public:
-    /// One door as a doorway sphere: an edge is "on" this door if its
-    /// segment passes within `radius` of `center`. Pose-tolerant (a swinging
-    /// door's center stays in the doorway region); a later refinement can
-    /// use the door OBB or the door's flank-probe pair instead.
+    /// One door as its CLOSED-pose oriented box (the doorway footprint). An
+    /// edge is "on" this door if its segment intersects the box. This
+    /// generalises across door sizes and orientations where a doorway sphere
+    /// did not: the thin slab catches the flank-to-flank edge that threads
+    /// the opening (perpendicular, through the slab) and rejects edges that
+    /// merely pass NEAR the doorway in an adjacent room. Pose-independent —
+    /// the CLOSED pose is the doorway, regardless of the door's swing.
+    /// `worldToLocal` is the inverse of the closed-pose world transform;
+    /// `halfExtents` (margin already folded in) is the local box half-size,
+    /// centred at the local origin (the box mesh is authored so).
     struct DoorBox {
-        int32_t id     = -1;
-        Vector3 center{0.0f, 0.0f, 0.0f};
-        float   radius = 0.0f;
+        int32_t id = -1;
+        Matrix4 worldToLocal{1.0f};
+        Vector3 halfExtents{0.0f, 0.0f, 0.0f};
     };
 
     /// Build the routing graph. `edges` are undirected (a,b) index pairs into
     /// `probePos` (self-loops and out-of-range indices are skipped). Each
-    /// edge is annotated with the doors whose doorway sphere it crosses.
+    /// edge is annotated with the doors whose doorway box it crosses.
     /// Rebuild whenever the probe graph is (re)baked.
     void build(const std::vector<Vector3> &probePos,
                const std::vector<std::pair<int, int>> &edges,
@@ -91,12 +97,13 @@ public:
             const float len = glm::length(mProbePos[b] - mProbePos[a]);
             mAdj[a].push_back({b, edgeIdx, len});
             mAdj[b].push_back({a, edgeIdx, len});
-            // Doors whose doorway sphere this edge crosses. Cheap AABB
-            // reject first, then true segment-point distance.
+            // Doors whose doorway box this edge's segment intersects. The
+            // box is the door's closed-pose slab, so only an edge that
+            // actually threads the opening (crossing the slab) is annotated.
             std::vector<int32_t> onEdge;
             for (const DoorBox &d : doors) {
-                if (segmentSphereHit(mProbePos[a], mProbePos[b],
-                                     d.center, d.radius))
+                if (segmentObbHit(mProbePos[a], mProbePos[b],
+                                  d.worldToLocal, d.halfExtents))
                     onEdge.push_back(d.id);
             }
             mEdgeDoors.push_back(std::move(onEdge));
@@ -111,6 +118,17 @@ public:
         size_t n = 0;
         for (const auto &v : mEdgeDoors) n += v.size();
         return n;
+    }
+    /// Count of DISTINCT door IDs that annotate at least one edge. Paired with
+    /// the door count passed to build(), the difference is the number of doors
+    /// mapped to NO edge — a door that would gate nothing (a route leak past a
+    /// closed door). Surfaced loudly so an over-tight door box does not fail
+    /// silently.
+    size_t doorsWithEdges() const {
+        std::unordered_map<int32_t, char> seen;
+        for (const auto &v : mEdgeDoors)
+            for (int32_t id : v) seen[id] = 1;
+        return seen.size();
     }
 
     /// Nearest probe index to `p` (grid-accelerated), or -1 if empty.
@@ -153,7 +171,7 @@ public:
     }
 
     /// Shortest door-aware route from the probe nearest `src` to the probe
-    /// nearest `lst`. An edge whose sphere-crossed door has fraction(id) <
+    /// nearest `lst`. An edge whose box-crossed door has fraction(id) <
     /// `closedThreshold` is removed (fully-closed door blocks the route,
     /// forcing the search around it). Fills `outDoors` with the sorted unique
     /// door IDs on the surviving shortest path and RETURNS whether a route
@@ -256,15 +274,38 @@ private:
         mGridMaxRadius = std::max(1, 2 * maxAbs + 2);
     }
 
-    /// True if segment [a,b] passes within `radius` of `c`.
-    static bool segmentSphereHit(const Vector3 &a, const Vector3 &b,
-                                 const Vector3 &c, float radius) {
-        const Vector3 ab = b - a;
-        const float abLenSq = glm::dot(ab, ab);
-        float t = abLenSq > 1e-9f ? glm::dot(c - a, ab) / abLenSq : 0.0f;
-        t = std::max(0.0f, std::min(1.0f, t));
-        const Vector3 closest = a + ab * t;
-        return glm::dot(c - closest, c - closest) <= radius * radius;
+    /// True if segment [a,b] (world) intersects the door's oriented box.
+    /// Transforms both endpoints into the door's local frame — where the box
+    /// is axis-aligned, centred at the origin, spanning [-halfExtents,
+    /// +halfExtents] — then runs a segment-vs-AABB slab test there.
+    static bool segmentObbHit(const Vector3 &a, const Vector3 &b,
+                              const Matrix4 &worldToLocal,
+                              const Vector3 &halfExtents) {
+        const Vector3 la = Vector3(worldToLocal * glm::vec4(a, 1.0f));
+        const Vector3 lb = Vector3(worldToLocal * glm::vec4(b, 1.0f));
+        return segmentAabbHit(la, lb, -halfExtents, halfExtents);
+    }
+
+    /// Segment [p0,p1] vs axis-aligned box [mn,mx] via the slab method,
+    /// parameterising the segment as p0 + t*(p1-p0), t in [0,1].
+    static bool segmentAabbHit(const Vector3 &p0, const Vector3 &p1,
+                               const Vector3 &mn, const Vector3 &mx) {
+        const Vector3 d = p1 - p0;
+        float tmin = 0.0f, tmax = 1.0f;
+        for (int i = 0; i < 3; ++i) {
+            if (std::abs(d[i]) < 1e-9f) {
+                // Segment parallel to this slab: outside it => no hit.
+                if (p0[i] < mn[i] || p0[i] > mx[i]) return false;
+            } else {
+                float t1 = (mn[i] - p0[i]) / d[i];
+                float t2 = (mx[i] - p0[i]) / d[i];
+                if (t1 > t2) std::swap(t1, t2);
+                tmin = std::max(tmin, t1);
+                tmax = std::min(tmax, t2);
+                if (tmin > tmax) return false;
+            }
+        }
+        return true;
     }
 };
 

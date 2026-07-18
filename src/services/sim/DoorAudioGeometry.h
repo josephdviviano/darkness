@@ -48,6 +48,11 @@ struct DoorAudioGeometry {
     std::vector<float>   localVertices;   ///< 3 floats per vertex
     std::vector<int32_t> indices;         ///< 3 per triangle
     Matrix4 worldTransform = Matrix4(1.0f);
+    /// The door's CLOSED-pose world transform (door slab filling its
+    /// doorway). Used by the hybrid route graph's door→edge mapping, which
+    /// must be pose-independent — an edge threads the DOORWAY, not the
+    /// current swing pose. Same local box (localVertices) applies.
+    Matrix4 closedWorldTransform = Matrix4(1.0f);
     /// Dominant surface material name of the door's .bin model (e.g.
     /// "PORTC.GIF"). AudioService maps this through its acoustic-material
     /// keyword lookup for the door OBB's transmission/reflection. Empty =>

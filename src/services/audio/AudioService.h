@@ -1867,6 +1867,14 @@ private:
         /// setDoorTransform push. Drives the fraction-indexed pathing
         /// transition on voices scoped to this door.
         float openFraction = 1.0f;
+        /// CLOSED-pose oriented-box for the hybrid route graph's door→edge
+        /// mapping. `obbWorldToLocal` is the inverse of the door's closed
+        /// world transform; `obbHalfExtents` is the local half-size of the
+        /// door slab (from localVertices, margin folded in). Pose-independent
+        /// — the box IS the doorway, so a swinging door still maps to the
+        /// same edges. Computed once at registerDoorGeometry.
+        Matrix4 obbWorldToLocal{1.0f};
+        Vector3 obbHalfExtents{0.0f, 0.0f, 0.0f};
     };
     std::unordered_map<int32_t, DoorAudioInstance> mDoorAudioInstances;
 
