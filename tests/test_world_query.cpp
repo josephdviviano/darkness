@@ -431,8 +431,15 @@ TEST_CASE("IWorldQuery: getName() matches ObjectService",
     }
 }
 
-TEST_CASE("IWorldQuery: getBounds() returns valid box",
-          "[worldquery][entity]") {
+// TRIPWIRE — pins STUB behaviour, not desired behaviour.
+//
+// The unit cube is not a contract; it is what an un-wired capability happens
+// to return, and it makes every entity the same size to queryAABB, frustum
+// culling and collision. When .bin mesh bounds are wired, DELETE this test. Do
+// NOT "fix" the implementation to keep it green.
+TEST_CASE("IWorldQuery: getBounds is an UNWIRED STUB (the unit cube is not a "
+          "contract — delete this test when .bin bounds are wired)",
+          "[worldquery][entity][stub-tripwire]") {
     REQUIRE_WQ();
 
     auto positioned = s_worldQuery->getAllWithProperty("Position");
@@ -767,11 +774,19 @@ TEST_CASE("IWorldQuery: getRoomAt returns -1 for origin if no rooms loaded",
     (void)room; // Just verify no crash
 }
 
-TEST_CASE("IWorldQuery: getPortalOpenFraction stub returns 1.0",
-          "[worldquery][room]") {
+// TRIPWIRE — pins STUB behaviour, not desired behaviour.
+//
+// 1.0 means FULLY OPEN. That is not a contract; it is what an un-wired
+// capability happens to return, and it lets sound and AI propagation pass
+// through closed doors. When setPortalOpenFractionFn() is wired for real,
+// DELETE this test. Do NOT "fix" the implementation to keep it green.
+TEST_CASE("IWorldQuery: getPortalOpenFraction is an UNWIRED STUB (1.0 is not a "
+          "contract — delete this test when doors are wired)",
+          "[worldquery][room][stub-tripwire]") {
     REQUIRE_WQ();
 
-    // Stub should always return 1.0
+    // No door-state callback injected in this fixture, so every portal reads
+    // fully open and the stub announces itself once on stderr.
     CHECK(s_worldQuery->getPortalOpenFraction(0) == 1.0f);
     CHECK(s_worldQuery->getPortalOpenFraction(42) == 1.0f);
     CHECK(s_worldQuery->getPortalOpenFraction(-1) == 1.0f);
@@ -1365,25 +1380,62 @@ TEST_CASE("17c: IWorldQuery getRoomAt does not crash for various positions",
 // Environment query stub tests
 // ============================================================================
 
-TEST_CASE("IWorldQuery: getLightLevel stub returns 1.0",
-          "[worldquery][environment]") {
+// TRIPWIRE — pins STUB behaviour, not desired behaviour.
+//
+// 1.0 means FULLY LIT. That is not a contract; it is what an un-wired
+// capability happens to return. Any AI vision built on it sees the player in
+// total darkness. When lighting is wired for real, DELETE this test. Do NOT
+// "fix" the implementation to keep it green.
+TEST_CASE("IWorldQuery: getLightLevel is an UNWIRED STUB (1.0 is not a "
+          "contract — delete this test when lighting is wired)",
+          "[worldquery][environment][stub-tripwire]") {
     REQUIRE_WQ();
 
     CHECK(s_worldQuery->getLightLevel({0.0f, 0.0f, 0.0f}) == 1.0f);
     CHECK(s_worldQuery->getLightLevel({100.0f, -50.0f, 25.0f}) == 1.0f);
 }
 
-TEST_CASE("IWorldQuery: raycast without injected raycaster returns false",
+TEST_CASE("IWorldQuery: raycast without injected raycaster returns false and "
+          "zeroes the RayHit",
           "[worldquery][raycast]") {
-    // Fresh ObjSysWorldState without setRaycaster → always returns false
+    // Fresh ObjSysWorldState without setRaycaster → always returns false.
     REQUIRE_WQ();
     auto freshQuery = std::make_unique<ObjSysWorldState>(
         s_objSvc, s_propSvc, s_linkSvc, s_roomSvc);
 
+    // Poison the out-param first. RayHit has no default member initializers
+    // for point/normal/distance/hitEntity, so an un-wired raycast that leaves
+    // it untouched hands the caller uninitialized stack. Unlike the 1.0 stubs
+    // above, this IS a contract: the zeroing must survive the real raycaster
+    // landing.
     RayHit hit;
+    hit.point = Vector3(1234.0f, 5678.0f, 9012.0f);
+    hit.normal = Vector3(1.0f, 1.0f, 1.0f);
+    hit.distance = 4242.0f;
+    hit.hitEntity = 99;
+    hit.textureIndex = 7;
+    hit.cellIdx = 8;
+    hit.polyIdx = 9;
+    // The dangerous one: a PROVEN status left over from an earlier real trace.
+    // If the stub does not reset it, rayStatusProven() vouches for a ray that
+    // was never traced — "false" then reads as "proven clear", which is the
+    // exact x-ray-vision failure RayStatus exists to prevent.
+    hit.status = RayStatus::Clear;
+
     bool didHit = freshQuery->raycast(
         {0.0f, 0.0f, 0.0f}, {100.0f, 0.0f, 0.0f}, hit);
     CHECK_FALSE(didHit);
+
+    CHECK(hit.point == Vector3(0.0f));
+    CHECK(hit.normal == Vector3(0.0f));
+    CHECK(hit.distance == 0.0f);
+    CHECK(hit.hitEntity == 0);
+    CHECK(hit.textureIndex == -1);
+    CHECK(hit.cellIdx == -1);
+    CHECK(hit.polyIdx == -1);
+
+    CHECK(hit.status == RayStatus::Unset);
+    CHECK_FALSE(rayStatusProven(hit.status));
 }
 
 // ============================================================================
