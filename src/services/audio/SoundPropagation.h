@@ -110,6 +110,19 @@ private:
     RoomService *mRoomService = nullptr;
     LineOfSightFn mLineOfSightFn;
 
+    /// Core blocking set/erase for one room pair (both key directions), with
+    /// NO adjacent-room propagation. `setBlockingFactor` wraps this and adds
+    /// the multi-room-doorway spread; the spread itself calls only the core
+    /// so it cannot recurse.
+    void setBlockingCore(int room1, int room2, float factor);
+
+    /// Multi-room doorway spread: a door on the (room1,room2) boundary also
+    /// blocks any room R that is portal-adjacent to BOTH room1 and room2
+    /// (the pairs (room1,R) and (room2,R)). Matches the original engine's
+    /// per-room-pair blocking so a wide doorway whose opening spans more
+    /// than two room subdivisions is not under-blocked. factor <= 0 erases.
+    void blockAdjacentRooms(int room1, int room2, float factor);
+
     /// Key: (room1 << 16) | room2 — stored both ways (bidirectional).
     std::unordered_map<uint32_t, float> mBlockingFactors;
     /// Per-room transmission factor (default 1.0).

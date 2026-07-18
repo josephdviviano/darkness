@@ -2184,11 +2184,25 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                     iplPathEffectReset(node->pathEffect);
                 }
 
-                // Additive mix into the voice's dry stereo bus.
+                // Additive mix into the voice's dry stereo bus, scaled by
+                // the fresh door-openness gate (SteamAudioDSPNode::
+                // pathRouteGate — zero-lag volume vs door position). The
+                // gate is ramped at the shared maxStep (~10 ms) to avoid
+                // zipper noise while still tracking a door swing (which
+                // takes hundreds of ms). This fades the routed
+                // (around-the-door) signal out WITH the closing door,
+                // independent of the lagged solve; the solve's own eq/SH
+                // (Track A, §48) still colors the tone underneath.
+                const float pathGateTarget =
+                    node->pathRouteGate.load(std::memory_order_relaxed);
+                float pathGate = node->pathRouteGateSmoothed;
                 for (ma_uint32 i = 0; i < frameCount; ++i) {
-                    chL[i] += node->pathOutL[i];
-                    chR[i] += node->pathOutR[i];
+                    pathGate += std::max(-maxStep, std::min(maxStep,
+                                         pathGateTarget - pathGate));
+                    chL[i] += node->pathOutL[i] * pathGate;
+                    chR[i] += node->pathOutR[i] * pathGate;
                 }
+                node->pathRouteGateSmoothed = pathGate;
             }
         }
 
@@ -6014,9 +6028,39 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
     if (mPathingSim)    mPathingSim->waitForCompletion();
     if (mDirectSim)     mDirectSim->waitForCompletion();
 
-    // Cache the "door" material once. Falls back to generic if the keyword
-    // table is missing the entry (kept defensive — table is in this TU).
-    IPLMaterial doorMaterial = lookupAcousticMaterial("door");
+    // Per-door acoustic material, keyed on the door model's dominant surface
+    // material name (DoorAudioGeometry::materialName) through the SAME
+    // texture→material keyword lookup the world geometry uses — so an iron
+    // gate transmits/reflects unlike an oak door instead of every door being
+    // hardcoded to wood. Cached by name (many doors share a model). Empty
+    // name (no model / no material) falls back to the generic "door"→wood.
+    const IPLMaterial doorDefaultMaterial = lookupAcousticMaterial("door");
+    std::unordered_map<std::string, IPLMaterial> doorMatCache;
+    std::map<std::string, int> doorMatCensus;   // resolved name -> door count
+    auto resolveDoorMaterial = [&](const std::string &name) -> IPLMaterial {
+        if (name.empty()) {
+            ++doorMatCensus["(no model) -> door/wood"];
+            return doorDefaultMaterial;
+        }
+        // A door material that matches NO acoustic keyword defaults to
+        // wood (the door default) — NOT the generic opaque-reflective
+        // world fallback. A door is far likelier wood than a fully-
+        // reflective slab, this keeps parity with the old all-wood
+        // behaviour for unrecognised doors, and it avoids a [FALLBACK]
+        // per door. The census still records the raw name so the
+        // door-material keyword gaps stay visible for the acoustic-
+        // keyword audit (e.g. VAULT/PORTICUL wanting a metal keyword).
+        if (lookupAcousticMaterialKeyword(name) == "generic") {
+            ++doorMatCensus[name + " (no keyword -> wood)"];
+            return doorDefaultMaterial;
+        }
+        auto it = doorMatCache.find(name);
+        if (it != doorMatCache.end()) { ++doorMatCensus[name]; return it->second; }
+        IPLMaterial m = lookupAcousticMaterial(name);
+        doorMatCache[name] = m;
+        ++doorMatCensus[name];
+        return m;
+    };
 
     int created = 0;
     int skipped = 0;
@@ -6053,10 +6097,10 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
             iplTris[i].indices[2] = g.indices[i * 3 + 2];
         }
 
-        // One material per door mesh ("door" → wood). Single-material mesh,
-        // so materialIndices is all-zero (initialized by IPLint32 default).
+        // One material per door mesh, resolved from the door model's surface
+        // material. Single-material mesh, so materialIndices is all-zero.
         std::vector<IPLint32> matIdx(numTris, 0);
-        IPLMaterial mats[1] = { doorMaterial };
+        IPLMaterial mats[1] = { resolveDoorMaterial(g.materialName) };
 
         // Local-frame static mesh held by a 1-shot single-mesh subScene.
         // Steam Audio's IPLInstancedMesh references an entire IPLScene, not
@@ -6161,6 +6205,17 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
     std::fprintf(stderr,
         "[DOOR_AUDIO] registerDoorGeometry: done — %d instanced meshes "
         "(of %zu doors)\n", created, doors.size());
+
+    // [DOOR_MATERIAL] census — which door surface materials resolved, and
+    // how many doors each. A door material name that is NOT a keyword the
+    // acoustic table knows falls through to the generic unmatched material;
+    // this line is the audit hook (same role as txlist_audit for the world)
+    // for finding door materials worth adding a keyword for. Loud, one line.
+    for (const auto &kv : doorMatCensus) {
+        std::fprintf(stderr,
+            "[DOOR_MATERIAL] '%s' -> %d door(s)\n",
+            kv.first.c_str(), kv.second);
+    }
 
     // [PROBE_DOOR_AUDIT] — one-shot scan that directly tests "a pathing
     // probe sits inside / next to door X" (user's hypothesis 2 for door-
@@ -6320,39 +6375,20 @@ void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTrans
     // is safe for the metric (retirement covers it via gen ≤ G; it just
     // records no sample) but must be LOUD (no-silent-fallbacks).
     // Main-thread only (DoorSystem::simStep callback).
-    ++mDoorAcousticGen;
-    // Doors-active stamp for the unreachable-route cache (see
-    // mDoorLastBumpNs doc). Unconditional — the cache's quiet test must
-    // see swings even when the epoch push below is gated off.
+    //
+    // Stage 2 (2026-07-18): the PATHING re-solve trigger no longer fires
+    // here (per sim tick). A swinging door needs no per-tick re-solve —
+    // the fresh door-gate (loopStep prologue) carries the routed volume,
+    // zero-lag. The gen bump / scoped-dirty insert / epoch push moved to
+    // notifyDoorAcousticEvent (one re-solve per door OPEN/CLOSE event).
+    // What STAYS per-tick here: the OBB transform + scene commit (above,
+    // for the per-frame DIRECT occlusion/transmission ray test) and the
+    // doors-active quiet stamp below (the unreachable-route cache's
+    // motion test must still see the continuous swing).
     const int64_t bumpNowNs =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     mDoorLastBumpNs = bumpNowNs;
-    // O3-lite scoped invalidation: record which door bumped so the
-    // coalesced commit (loopStep) can mark exactly the voices registered
-    // against it dirty. Marking at commit — not here — is required: the
-    // new door pose is only IN the BVH after iplSceneCommit, so a solve
-    // triggered before the commit would route against the OLD geometry.
-    mDoorsBumpedSinceCommit.insert(doorObjID);
-    if (mPathingProbeBatchAdded && mProbePathingEnabled
-        && mPathingSim != nullptr) {
-        constexpr size_t kDoorGenEventCap = 1024;
-        if (mDoorGenEvents.size() < kDoorGenEventCap) {
-            mDoorGenEvents.push_back({mDoorAcousticGen, bumpNowNs});
-        } else {
-            static std::atomic<int> sEpochDropCount{0};
-            int dn = sEpochDropCount.fetch_add(1, std::memory_order_relaxed);
-            if (dn < 4 || (dn % 256) == 0) {
-                std::fprintf(stderr,
-                    "[FALLBACK] [DOOR_ROUTE_LATENCY] epoch FIFO at cap "
-                    "(%zu) — dropping newest bump gen=%llu (drop #%d); "
-                    "pathing pipeline is not retiring epochs\n",
-                    kDoorGenEventCap,
-                    static_cast<unsigned long long>(mDoorAcousticGen),
-                    dn + 1);
-            }
-        }
-    }
 
     // Correlator counter for [DOOR_XFORM_TICK] / [OCCL_TICK]. Bumped on
     // every push so the per-frame snapshot at the top of loopStep can tell
@@ -6377,6 +6413,54 @@ void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTrans
                 c + 1);
         }
         ++c;
+    }
+}
+
+//------------------------------------------------------
+// A door OPEN/CLOSE status change (from DoorSystem's event callback):
+// kick off ONE pathing re-solve to pick up the route-set change. Stage 2
+// (2026-07-18) moved this OFF the per-tick setDoorTransform path — a swing
+// no longer re-solves continuously (the fresh door-gate carries the
+// volume); we re-solve only at the transitions that change WHICH route is
+// available (a door finishing closing hands the sound to the long way
+// around; opening restores the short route). For a patrolling NPC cycling
+// a door that is ~2-4 events, versus dozens of per-tick solves before.
+// Same bookkeeping the per-tick bump used to do: advance the acoustic
+// gen, record the door in the scoped-dirty set (drained at the next
+// loopStep commit — the mark must land AFTER iplSceneCommit so the solve
+// routes against the door's committed pose), and push a latency epoch.
+// Main-thread only (DoorSystem::simStep event callback).
+void AudioService::notifyDoorAcousticEvent(int32_t doorObjID)
+{
+    // Only registered doors participate in pathing (zero-edge doors are
+    // filtered at registration and never enter mDoorAudioInstances).
+    if (mDoorAudioInstances.find(doorObjID) == mDoorAudioInstances.end())
+        return;
+
+    ++mDoorAcousticGen;
+    const int64_t eventNs =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    mDoorLastBumpNs = eventNs;
+    mDoorsBumpedSinceCommit.insert(doorObjID);
+    if (mPathingProbeBatchAdded && mProbePathingEnabled
+        && mPathingSim != nullptr) {
+        constexpr size_t kDoorGenEventCap = 1024;
+        if (mDoorGenEvents.size() < kDoorGenEventCap) {
+            mDoorGenEvents.push_back({mDoorAcousticGen, eventNs});
+        } else {
+            static std::atomic<int> sEpochDropCount{0};
+            int dn = sEpochDropCount.fetch_add(1, std::memory_order_relaxed);
+            if (dn < 4 || (dn % 256) == 0) {
+                std::fprintf(stderr,
+                    "[FALLBACK] [DOOR_ROUTE_LATENCY] epoch FIFO at cap "
+                    "(%zu) — dropping newest event gen=%llu (drop #%d); "
+                    "pathing pipeline is not retiring epochs\n",
+                    kDoorGenEventCap,
+                    static_cast<unsigned long long>(mDoorAcousticGen),
+                    dn + 1);
+            }
+        }
     }
 }
 
@@ -6745,6 +6829,48 @@ void AudioService::loopStep(float deltaTime)
     // on this local instead of the possibly-overridden member.
     const bool pathingDueNaturalThisStep = mPathingDueThisStep;
 
+    // ── Fresh pathing door-gate publish (zero-lag volume vs door) ──
+    //
+    // For every voice, the tightest open-fraction over the doors on its
+    // current route scope, republished EVERY loopStep from live door
+    // state (mDoorAudioInstances.openFraction, updated per sim tick by
+    // setDoorTransform). The audio thread multiplies the routed pathing
+    // output by a ramped version, so routed volume tracks the physical
+    // door without waiting for a re-solve (SteamAudioDSPNode::
+    // pathRouteGate). Deliberately UNCONDITIONAL — outside the worker-
+    // idle harvest branch below — so the gate keeps tracking the door
+    // even while a slow solve occupies the worker (exactly the window
+    // where a lagged gate would be most audible). Cheap: a few dozen
+    // voices × 1-3 route doors each. Route-door SET is stable between
+    // solves (only openness changes as a door swings), so reading the
+    // last solve's mVoiceRegisteredDoors is correct here.
+    // Also refreshes pathDoorFraction (Track A's §48 fraction-indexed
+    // eq/SH extrapolation) from the SAME fresh signal, so it too tracks
+    // the door every frame rather than only on door commits — which lets
+    // the door dirty-mark drain below move to per-EVENT (Stage 2) without
+    // starving Track A of per-frame fractions. -1 = no door on the route.
+    if (mVoicePool) {
+        for (auto &[h, v] : mVoicePool->voices()) {
+            float minFrac = 1.0f;
+            bool  hasDoor = false;
+            auto rit = mVoiceRegisteredDoors.find(h);
+            if (rit != mVoiceRegisteredDoors.end()) {
+                for (int32_t d : rit->second) {
+                    auto dit = mDoorAudioInstances.find(d);
+                    if (dit != mDoorAudioInstances.end()) {
+                        minFrac = std::min(minFrac, dit->second.openFraction);
+                        hasDoor = true;
+                    }
+                }
+            }
+            minFrac = std::max(0.0f, std::min(1.0f, minFrac));
+            v->dspNode.pathRouteGate.store(minFrac,
+                                           std::memory_order_relaxed);
+            v->dspNode.pathDoorFraction.store(
+                hasDoor ? minFrac : -1.0f, std::memory_order_relaxed);
+        }
+    }
+
     // Cool down the per-voice visRange-clamp [FALLBACK] rate limiter
     // (see the pathing-input staging loop below).
     if (mVisRangeClampLogCooldown > 0.0f)
@@ -7022,31 +7148,22 @@ void AudioService::loopStep(float deltaTime)
             // Fail-open voices (pathRouteScopeValid == false) are NOT
             // marked — they key on the global committed-gen trigger and
             // re-solve regardless.
-            const double nowSecSwing =
-                std::chrono::duration<double>(
-                    std::chrono::steady_clock::now().time_since_epoch())
-                    .count();
+            // mDoorsBumpedSinceCommit is now populated per door OPEN/CLOSE
+            // EVENT (notifyDoorAcousticEvent), not per sim tick (Stage 2):
+            // a swing no longer needs continuous re-solves because the
+            // fresh door-gate above carries the volume, so we re-solve
+            // once per event to pick up the route-set change (which door
+            // is now open/closed). pathDoorFraction is refreshed every
+            // frame in the gate loop above, independent of this drain.
             if (!mDoorsBumpedSinceCommit.empty()) {
                 uint64_t markedThisCommit = 0;
                 for (int32_t d : mDoorsBumpedSinceCommit) {
-                    // Swing bookkeeping + per-voice governing-door
-                    // fraction: pushed EVERY commit while the door
-                    // swings (a swinging door bumps every sim tick), so
-                    // the audio thread's fraction-indexed transition
-                    // tracks the physical door.
-                    mSwingingDoorLastBump[d] = nowSecSwing;
-                    float frac = 1.0f;
-                    auto di = mDoorAudioInstances.find(d);
-                    if (di != mDoorAudioInstances.end())
-                        frac = di->second.openFraction;
                     auto it = mDoorVoices.find(d);
                     if (it == mDoorVoices.end()) continue;
                     for (SoundHandle h : it->second) {
                         ActiveVoice *v = mVoicePool ? mVoicePool->find(h)
                                                     : nullptr;
                         if (!v) continue;
-                        v->dspNode.pathDoorFraction.store(
-                            frac, std::memory_order_relaxed);
                         if (!v->pathScopedDoorDirty) {
                             v->pathScopedDoorDirty = true;
                             ++markedThisCommit;
@@ -7063,32 +7180,6 @@ void AudioService::loopStep(float deltaTime)
                               prevMax, markedThisCommit,
                               std::memory_order_relaxed)) {}
                 mDoorsBumpedSinceCommit.clear();
-            }
-            // Swing age-out: a door quiet for kDoorSwingQuietSec stopped
-            // moving — release its voices from fraction governance so
-            // the smoother returns to plain time-based behavior (and a
-            // later solve for OTHER reasons isn't mis-anchored to a
-            // stale fraction interval).
-            if (!mSwingingDoorLastBump.empty()) {
-                constexpr double kDoorSwingQuietSec = 0.3;
-                for (auto sit = mSwingingDoorLastBump.begin();
-                     sit != mSwingingDoorLastBump.end();) {
-                    if (nowSecSwing - sit->second <= kDoorSwingQuietSec) {
-                        ++sit;
-                        continue;
-                    }
-                    auto vit = mDoorVoices.find(sit->first);
-                    if (vit != mDoorVoices.end()) {
-                        for (SoundHandle h : vit->second) {
-                            ActiveVoice *v = mVoicePool
-                                ? mVoicePool->find(h) : nullptr;
-                            if (v)
-                                v->dspNode.pathDoorFraction.store(
-                                    -1.0f, std::memory_order_relaxed);
-                        }
-                    }
-                    sit = mSwingingDoorLastBump.erase(sit);
-                }
             }
 
             static std::atomic<int> sCommitCount{0};

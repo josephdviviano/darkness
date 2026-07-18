@@ -23,6 +23,7 @@
 
 #include "AudioLog.h"
 #include "room/Room.h"
+#include "room/RoomPortal.h"
 #include "room/RoomService.h"
 
 namespace Darkness {
@@ -37,9 +38,9 @@ SoundPropagation::SoundPropagation(RoomService *roomService)
 SoundPropagation::~SoundPropagation() = default;
 
 //------------------------------------------------------
-void SoundPropagation::setBlockingFactor(int room1, int room2, float factor)
+void SoundPropagation::setBlockingCore(int room1, int room2, float factor)
 {
-    // Bidirectional — store both keys.
+    // Bidirectional — store both keys. No adjacent-room spread (see header).
     const uint32_t key1 = (static_cast<uint32_t>(room1) << 16) |
                           static_cast<uint32_t>(room2 & 0xFFFF);
     const uint32_t key2 = (static_cast<uint32_t>(room2) << 16) |
@@ -52,6 +53,48 @@ void SoundPropagation::setBlockingFactor(int room1, int room2, float factor)
         mBlockingFactors[key1] = factor;
         mBlockingFactors[key2] = factor;
     }
+}
+
+//------------------------------------------------------
+void SoundPropagation::blockAdjacentRooms(int room1, int room2, float factor)
+{
+    if (!mRoomService) return;
+    Room *r1 = mRoomService->getRoomByID(room1);
+    Room *r2 = mRoomService->getRoomByID(room2);
+    if (!r1 || !r2) return;
+
+    // Any room R portal-adjacent to BOTH room1 and room2 sits in the shared
+    // doorway footprint; the door blocks (room1,R) and (room2,R) too, so a
+    // wide opening spanning >2 room subdivisions is not under-blocked. O(P1
+    // x P2) over the two rooms' portal lists — a handful each. The spread
+    // calls only the core setter, so it never re-enters this function.
+    for (uint32_t i = 0; i < r1->getPortalCount(); ++i) {
+        RoomPortal *p1 = r1->getPortal(i);
+        Room *far1 = p1 ? p1->getFarRoom() : nullptr;
+        if (!far1) continue;
+        const int32_t rr = far1->getRoomID();
+        if (rr == room2) continue;   // the door's own pair, set below
+        for (uint32_t j = 0; j < r2->getPortalCount(); ++j) {
+            RoomPortal *p2 = r2->getPortal(j);
+            Room *far2 = p2 ? p2->getFarRoom() : nullptr;
+            if (!far2) continue;
+            if (far2->getRoomID() == rr) {
+                setBlockingCore(room1, rr, factor);
+                setBlockingCore(room2, rr, factor);
+                break;   // R found for this p1; move to r1's next portal
+            }
+        }
+    }
+}
+
+//------------------------------------------------------
+void SoundPropagation::setBlockingFactor(int room1, int room2, float factor)
+{
+    setBlockingCore(room1, room2, factor);
+    // Multi-room doorway spread (original-engine parity): also block the
+    // pairs to any room adjacent to both of the door's rooms. factor <= 0
+    // erases those too.
+    blockAdjacentRooms(room1, room2, factor);
     // BFS reads the map fresh on each query — no cache invalidation needed.
     AUDIO_LOG("[DOOR_BLOCK] setBlockingFactor room(%d,%d) factor=%.3f mapSize=%zu\n",
               room1, room2, factor, mBlockingFactors.size());

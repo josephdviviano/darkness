@@ -394,6 +394,13 @@ public:
     void setDoorTransform(int32_t doorObjID, const Matrix4 &worldTransform,
                           float openFraction = 1.0f);
 
+    /** Notify the acoustic pipeline that a door changed OPEN/CLOSE status
+     *  (from DoorSystem's event callback). Kicks off exactly ONE pathing
+     *  re-solve to pick up the route-set change; the continuous swing
+     *  volume is carried lag-free by the per-frame door-gate, so no
+     *  per-tick re-solve is needed. Main-thread only. */
+    void notifyDoorAcousticEvent(int32_t doorObjID);
+
     /** Debug overlay accessor — returns world-space triangle data for all
      *  registered doors. Used by the renderer's `show_door_geometry`
      *  wireframe overlay to visualize geometry the acoustic scene sees
@@ -1855,13 +1862,6 @@ private:
         float openFraction = 1.0f;
     };
     std::unordered_map<int32_t, DoorAudioInstance> mDoorAudioInstances;
-
-    /// Doors currently mid-swing: objID -> steady-clock seconds of the
-    /// most recent transform bump. Populated in the loopStep commit
-    /// drain; entries older than kDoorSwingQuietSec age out, at which
-    /// point the door's scoped voices get pathDoorFraction = -1 (no
-    /// governing door). MAIN THREAD ONLY.
-    std::unordered_map<int32_t, double> mSwingingDoorLastBump;
 
     /// Recompute worldAABBmin/max for a single door instance from its cached
     /// localVertices × worldTransform. Called by registerDoorGeometry on
