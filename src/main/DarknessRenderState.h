@@ -327,10 +327,16 @@ struct RuntimeState {
     int   lightmapFiltering = 0;  // 0=bilinear (default), 1=bicubic
     bool  debugAnimLightmaps = false; // tint animated lightmap polys magenta
     bool  forceFlicker = false;       // override all animated lights to flicker mode
-    float waveAmplitude = 1.0f;
-    float uvDistortion = 1.0f;
-    float waterRotation = 1.0f;
-    float waterScrollSpeed = 1.0f;
+    // Mirror RenderConfig's defaults. main() overwrites all four from the
+    // resolved config before the first frame, so these are only ever seen by
+    // something constructing RuntimeState directly (a test or tool). They used
+    // to read 1.0 across the board — outside the console's own registered range
+    // for uv_distortion and water_rotation, which meant such a caller booted at
+    // a value the console would refuse to set back.
+    float waveAmplitude = 0.3f;
+    float uvDistortion = 0.015f;
+    float waterRotation = 0.015f;
+    float waterScrollSpeed = 0.05f;
 
     // Per-object lighting (Dark Engine convention: ambient + cell-light-list
     // sum + sun + P$ExtraLight). When disabled, objects render at their
