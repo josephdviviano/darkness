@@ -439,6 +439,7 @@ audio:
     # last-cached values, so audio stays smooth between sim runs. Set
     # to 0.0 to update every frame (legacy / A-B diagnostic).
     pathing_update_interval: 0.1 # min seconds between pathing-sim updates (0.0–1.0)
+    pathing_smoothing_ms: 100    # smoothing time constant for pathing EQ/SH between solves, ms (0 = verbatim)
     # Per-band weights for collapsing Steam Audio's 3-band eqCoeffs into
     # the scalar portalAttenuation gain. Applied as
     #   gain = wL·eqLow + wM·eqMid + wH·eqHigh

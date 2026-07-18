@@ -311,7 +311,8 @@ public:
     /// callback should push the new transform into Steam Audio's acoustic
     /// scene via iplInstancedMeshUpdateTransform so geometry-aware path
     /// validation sees doors at their current position.
-    using AudioMeshUpdateCallback = std::function<void(int32_t objID, const Matrix4 &worldMatrix)>;
+    using AudioMeshUpdateCallback = std::function<void(
+        int32_t objID, const Matrix4 &worldMatrix, float openFraction)>;
     void setAudioMeshUpdateCallback(AudioMeshUpdateCallback cb) { mAudioMeshUpdateCb = std::move(cb); }
 
     /// Snapshot every door's audio geometry — local-space OBB mesh + initial
@@ -985,7 +986,10 @@ private:
         // pose. Skipped silently when no door audio mesh is registered for
         // this object (zero-edgeLengths doors are filtered at registration).
         if (mAudioMeshUpdateCb) {
-            mAudioMeshUpdateCb(door.objID, audioGlm);
+            // Open fraction rides along so the audio side can phase-align
+            // its pathing transition to the physical door state.
+            mAudioMeshUpdateCb(door.objID, audioGlm,
+                               getOpenFraction(door.objID));
         }
     }
 
