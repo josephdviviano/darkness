@@ -35,6 +35,7 @@
 #include "audio/AudioDSPChain.h"
 #include "audio/AudioUnits.h"
 #include "audio/WorldApertureData.h"
+#include "audio/HybridRouteGraph.h"
 #include "audio/SchemaTypes.h"
 #include "room/RoomService.h"  // SoundPropInfo / SoundPropParams / SoundPathHop
 #include "worldquery/WorldQueryTypes.h"  // RayHit (for diagnostic raycaster setter)
@@ -1238,6 +1239,12 @@ public:
      *  loadProbes / bakeProbes; callers can also trigger from a debug
      *  console binding if they re-injected the raycaster mid-session. */
     void rebuildPathingAdjacency();
+
+    /** Rebuild the hybrid door-aware route graph (HybridRouteGraph) from the
+     *  current probe positions + pathing adjacency + door OBBs. Drives the
+     *  door-fraction volume gate. Called after the pathing adjacency or the
+     *  door set changes (rebuildPathingAdjacency / registerDoorGeometry). */
+    void buildHybridRouteGraph();
 
     /** [BAKE_PARITY] — ground-truth check of the freshly-baked pathing
      *  graph against the original engine's ROOM_DB adjacency. Walks
@@ -2501,6 +2508,11 @@ private:
     // for bakeProbes/loadProbes and the spacing/height/positions accessors.
 
     std::unique_ptr<class ProbeManager> mProbeManager;
+
+    /// Our own routing over the probe graph (PLAN.SELF_ROUTED_HYBRID.md).
+    /// Built by buildHybridRouteGraph; queried per voice in loopStep for the
+    /// door-fraction gate (product of the doors on the voice's routed path).
+    HybridRouteGraph mHybridGraph;
 
     /// Per-probe reachability classification, parallel to
     /// mProbeManager->getProbePositions(). Cleared on every load/bake and

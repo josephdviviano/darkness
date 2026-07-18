@@ -6217,6 +6217,12 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
             kv.first.c_str(), kv.second);
     }
 
+    // Refresh the hybrid door-gate route graph now that the door set is
+    // live. No-op until the pathing adjacency exists (bake runs after this
+    // at startup, so rebuildPathingAdjacency does the real first build);
+    // this covers any later door (re)registration.
+    buildHybridRouteGraph();
+
     // [PROBE_DOOR_AUDIT] — one-shot scan that directly tests "a pathing
     // probe sits inside / next to door X" (user's hypothesis 2 for door-
     // blocking transparency). For every probe in the PATHING batch (the
@@ -6831,43 +6837,85 @@ void AudioService::loopStep(float deltaTime)
 
     // ── Fresh pathing door-gate publish (zero-lag volume vs door) ──
     //
-    // For every voice, the tightest open-fraction over the doors on its
-    // current route scope, republished EVERY loopStep from live door
-    // state (mDoorAudioInstances.openFraction, updated per sim tick by
-    // setDoorTransform). The audio thread multiplies the routed pathing
-    // output by a ramped version, so routed volume tracks the physical
-    // door without waiting for a re-solve (SteamAudioDSPNode::
-    // pathRouteGate). Deliberately UNCONDITIONAL — outside the worker-
-    // idle harvest branch below — so the gate keeps tracking the door
-    // even while a slow solve occupies the worker (exactly the window
-    // where a lagged gate would be most audible). Cheap: a few dozen
-    // voices × 1-3 route doors each. Route-door SET is stable between
-    // solves (only openness changes as a door swings), so reading the
-    // last solve's mVoiceRegisteredDoors is correct here.
-    // Also refreshes pathDoorFraction (Track A's §48 fraction-indexed
-    // eq/SH extrapolation) from the SAME fresh signal, so it too tracks
-    // the door every frame rather than only on door commits — which lets
-    // the door dirty-mark drain below move to per-EVENT (Stage 2) without
-    // starving Track A of per-frame fractions. -1 = no door on the route.
-    if (mVoicePool) {
+    // For every voice, the door-fraction gate = the PRODUCT of the open-
+    // fractions of the doors on the voice's ROUTED PATH (from our own
+    // HybridRouteGraph Dijkstra), republished EVERY loopStep from live
+    // door state. The audio thread multiplies the routed pathing output by
+    // a ramped version, so routed volume tracks the physical door without
+    // waiting for a Steam Audio re-solve (SteamAudioDSPNode::pathRouteGate).
+    //
+    // This REPLACES the old min-over-route-SCOPE gate, which was wrong two
+    // ways: the scope is a conservative superset (it included doors on
+    // ALTERNATE paths and near the source-listener line that the sound does
+    // not pass through, so an off-path door closing wrongly dragged the
+    // volume down), and `min` under-attenuated genuine series doors. The
+    // route graph gives the doors the sound ACTUALLY crosses; their product
+    // is the physically-correct series transmission.
+    //
+    // Deliberately UNCONDITIONAL — outside the worker-idle harvest branch —
+    // so the gate keeps tracking the door even while a slow solve occupies
+    // the worker (exactly when a lagged gate would be most audible). The
+    // expensive part (the Dijkstra) is CACHED per voice: re-pathed only on
+    // a door event, listener/source movement past the memo distance, or
+    // when a cached path door fully closes (forcing a reroute). The product
+    // over the cached path doors is recomputed from live fractions every
+    // step — cheap. pathDoorFraction (Track A §48) is the min path-door
+    // fraction (the governing door), or -1 when the path is door-free.
+    if (mVoicePool && mHybridGraph.built()) {
+        auto doorFrac = [&](int32_t id) -> float {
+            auto it = mDoorAudioInstances.find(id);
+            return it != mDoorAudioInstances.end()
+                       ? it->second.openFraction : 1.0f;
+        };
+        constexpr float kGateClosedThreshold = 0.05f;
+        constexpr float kGateRepathMoveFt    = 5.0f;
         for (auto &[h, v] : mVoicePool->voices()) {
-            float minFrac = 1.0f;
+            // A cached path door that has since fully closed means the
+            // cached route is dead — reroute NOW (do not wait for the door
+            // event) so the gate switches to the alternate as the door
+            // shuts.
+            bool cachedRouteDead = false;
+            for (int32_t id : v->pathGateDoors)
+                if (doorFrac(id) < kGateClosedThreshold) {
+                    cachedRouteDead = true; break;
+                }
+            const bool moved =
+                glm::length(v->worldPos - v->pathGateSrc) > kGateRepathMoveFt
+                || glm::length(mListenerPos - v->pathGateLst)
+                       > kGateRepathMoveFt;
+            if (!v->pathGateValid || cachedRouteDead || moved
+                || v->pathGateDoorGen != mDoorGenCommitted) {
+                v->pathGateReachable = mHybridGraph.route(
+                    v->worldPos, mListenerPos, doorFrac,
+                    kGateClosedThreshold, v->pathGateDoors);
+                v->pathGateDoorGen = mDoorGenCommitted;
+                v->pathGateSrc     = v->worldPos;
+                v->pathGateLst     = mListenerPos;
+                v->pathGateValid   = true;
+            }
+            float gate = 1.0f, minFrac = 1.0f;
             bool  hasDoor = false;
-            auto rit = mVoiceRegisteredDoors.find(h);
-            if (rit != mVoiceRegisteredDoors.end()) {
-                for (int32_t d : rit->second) {
-                    auto dit = mDoorAudioInstances.find(d);
-                    if (dit != mDoorAudioInstances.end()) {
-                        minFrac = std::min(minFrac, dit->second.openFraction);
-                        hasDoor = true;
-                    }
+            if (!v->pathGateReachable) {
+                gate = 0.0f;   // no route survives — silence, not a 0->1 jump
+            } else {
+                for (int32_t id : v->pathGateDoors) {
+                    const float f = doorFrac(id);
+                    gate *= f;
+                    minFrac = std::min(minFrac, f);
+                    hasDoor = true;
                 }
             }
-            minFrac = std::max(0.0f, std::min(1.0f, minFrac));
-            v->dspNode.pathRouteGate.store(minFrac,
-                                           std::memory_order_relaxed);
+            gate = std::max(0.0f, std::min(1.0f, gate));
+            v->dspNode.pathRouteGate.store(gate, std::memory_order_relaxed);
             v->dspNode.pathDoorFraction.store(
                 hasDoor ? minFrac : -1.0f, std::memory_order_relaxed);
+        }
+    } else if (mVoicePool) {
+        // No route graph (headless / no probe batch): no gating.
+        for (auto &[h, v] : mVoicePool->voices()) {
+            v->dspNode.pathRouteGate.store(1.0f, std::memory_order_relaxed);
+            v->dspNode.pathDoorFraction.store(-1.0f,
+                                              std::memory_order_relaxed);
         }
     }
 
@@ -15461,6 +15509,11 @@ void AudioService::rebuildPathingAdjacency()
             n(RayStatus::InvalidPortalTarget), n(RayStatus::InvalidCell),
             n(RayStatus::ZeroLength), n(RayStatus::Unset));
     }
+
+    // Rebuild the hybrid door-aware route graph on the fresh adjacency
+    // (doors are registered before the bake, so mDoorAudioInstances is
+    // populated by the time this runs).
+    buildHybridRouteGraph();
 }
 
 //------------------------------------------------------
@@ -15553,6 +15606,44 @@ std::vector<AudioService::DoorWorldAABB> AudioService::doorAudioAABBs() const
         boxes.push_back(DoorWorldAABB{di.worldAABBmin, di.worldAABBmax});
     }
     return boxes;
+}
+
+//------------------------------------------------------
+void AudioService::buildHybridRouteGraph()
+{
+    if (!mProbeManager) return;
+    const std::vector<Vector3> &pos = mProbeManager->getProbePositions();
+    const PathingAdjacency &adj = mProbeManager->getPathingAdjacency();
+    if (pos.empty() || !adj.built) {
+        mHybridGraph = HybridRouteGraph{};   // clear — no graph to gate with
+        return;
+    }
+    std::vector<std::pair<int, int>> edges;
+    edges.reserve(adj.edges.size());
+    for (const PathingEdge &e : adj.edges)
+        edges.push_back({e.a, e.b});
+
+    // Each door as a doorway sphere at its OBB center. Radius = half the OBB
+    // diagonal + 1 ft margin, so an edge threading the opening is caught even
+    // as the door swings (the center stays in the doorway). A tighter OBB /
+    // flank-probe association is a later refinement (PLAN.SELF_ROUTED_HYBRID).
+    std::vector<HybridRouteGraph::DoorBox> doors;
+    doors.reserve(mDoorAudioInstances.size());
+    for (const auto &kv : mDoorAudioInstances) {
+        const DoorAudioInstance &di = kv.second;
+        if (di.worldAABBmin.x > di.worldAABBmax.x) continue;  // degenerate
+        const Vector3 center = (di.worldAABBmin + di.worldAABBmax) * 0.5f;
+        const Vector3 ext    = di.worldAABBmax - di.worldAABBmin;
+        const float   radius = 0.5f * glm::length(ext) + 1.0f;
+        doors.push_back({kv.first, center, radius});
+    }
+
+    mHybridGraph.build(pos, edges, doors);
+    std::fprintf(stderr,
+        "[HYBRID_GRAPH] built: %zu probes, %zu edges, %zu doors, "
+        "%zu door-edge links (gate routing)\n",
+        mHybridGraph.numProbes(), edges.size(), doors.size(),
+        mHybridGraph.doorEdgeCount());
 }
 
 //------------------------------------------------------

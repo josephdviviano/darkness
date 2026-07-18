@@ -616,6 +616,24 @@ struct ActiveVoice {
     bool     pathScopedDoorDirty = true;
     bool     pathRouteScopeValid = false;
 
+    // ── Hybrid door-gate route cache (main-thread only) ──
+    //
+    // The doors on this voice's own routed path, from HybridRouteGraph
+    // (our probe-graph Dijkstra). Drives the door-fraction volume gate as
+    // the PRODUCT of these doors' fresh fractions (replaces the buggy
+    // min-over-route-SCOPE gate). Re-pathed only on a door event, listener/
+    // source movement past the memo distance, or when a cached path door
+    // fully closes (forcing a reroute) — the product itself is recomputed
+    // from live fractions every loopStep. pathGateReachable=false means no
+    // route survives the closed doors → gate 0 (silence, not the 0->1 jump
+    // an empty door list would give). See PLAN.SELF_ROUTED_HYBRID.md.
+    std::vector<int32_t> pathGateDoors;
+    uint64_t pathGateDoorGen = 0;
+    Vector3  pathGateSrc{0.0f, 0.0f, 0.0f};
+    Vector3  pathGateLst{0.0f, 0.0f, 0.0f};
+    bool     pathGateReachable = true;
+    bool     pathGateValid = false;
+
     // ── [SCOPE_MISS] watchdog (main-thread only) ──
     //
     // pathLastEq caches the most recent RAW pathing eqCoeffs read by the
