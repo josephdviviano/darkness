@@ -78,6 +78,23 @@ struct WorldApertureRecord {
     /// the WR polygon (centroid-to-edge-segment minimum). A standard Thief
     /// doorway reads 2.00.
     float apertureInradiusFt = -1.0f;
+    /// Vertical extent of the opening (max vertex z - min vertex z of the
+    /// representative polygon). Below ear height, a standing-height anchor
+    /// cannot see through it — such openings need a probe on EACH side, not
+    /// a one-sided single (crouch portals, squat windows, low vents).
+    float apertureZSpanFt = 0.0f;
+    /// Second in-air anchor on the OPPOSITE side of the face from probePos,
+    /// built by the same nudge chain and locator verification. Set (with
+    /// hasProbePosB) only when BOTH sides placed. Emission uses the two as
+    /// a tight pair for LOW openings: the segment between them crosses the
+    /// open polygon by construction, so the cross-opening edge survives
+    /// even when standing-height anchors cannot see through the opening.
+    /// (An earlier attempt flanked ±5 ft along the ROOM_DB portal normal —
+    /// wrong at the source: that normal is designer fiction, and for vents
+    /// and slits the flanks landed unaligned with the real opening,
+    /// regressing miss6/MISS9 MISSING counts.)
+    Vector3 probePosB{0.0f, 0.0f, 0.0f};
+    bool hasProbePosB = false;
 
     /// The ROOM_DB portal this record answers for. portalID is the lookup
     /// key (RoomPortal::getPortalID(), unique per mission) — an exact
@@ -100,14 +117,13 @@ struct WorldApertureRecord {
     int regionA = -1;
     int regionB = -1;
 
-    /// Identity of the PHYSICAL opening. A doorway's frame is its own chain
-    /// of thin WR cells, so one opening appears as several same-size portal
-    /// polygons (measured: median 2 per door); all of them — and every
-    /// ROOM_DB portal matching any of them — share one key. "One aperture,
-    /// one probe (or door pair)" dedups on this, replacing the old geometric
-    /// same-opening heuristics with an identity. Composed from the match
-    /// union root AND the region pair, so two distinct openings caught in
-    /// one match ball (different region pairs) keep distinct keys.
+    /// COARSE identity of the physical opening — resolved region pair +
+    /// 8-ft-quantized centroid cell. Suitable for DIAGNOSTIC dedup only
+    /// (e.g. [REGION_PARITY]'s per-opening count); grid-boundary
+    /// imprecision means two emissions of one opening could straddle a
+    /// cell edge, so EMISSION dedups with an exact distance test on
+    /// (regionA, regionB, wrCentroid) instead — see the claim map in
+    /// prepareProbeBakeParams.
     uint64_t apertureKey = 0;
 };
 
@@ -120,6 +136,12 @@ struct WorldApertureData {
     /// after cutting every matched aperture). Region IDs in the records and
     /// from the region-of-point callback index this range.
     int numRegions = 0;
+    /// Cells per region (indexed by region ID). A region's cell count is
+    /// its size in the compiled world — the objective pocket-vs-hall
+    /// signal: a vent pocket is a handful of cells with no room for
+    /// alternate routes or fill anchors; a hall is dozens to hundreds.
+    /// Drives the small-opening pair gate in probe emission.
+    std::vector<int32_t> regionCellCounts;
     bool valid = false;
 };
 

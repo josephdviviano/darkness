@@ -225,6 +225,19 @@ struct RenderConfig {
     // which only affects the dense reflection batch.
     float audioPathingDedupRadiusFt = 10.0f;
 
+    // EXPERIMENTAL single-edge visRange override for the pathing bake
+    // (`audio.pathing_probes.vis_range_override_ft`). 0 (default) = use
+    // the coverage-derived cap (governing x margin, clamped — see
+    // AudioService::prepareProbeBakeParams). Nonzero = force the bake's
+    // IPLPathBakeParams::visRange to EXACTLY this value, bypassing the
+    // derivation and its clamps. A/B lever for the range sweep the
+    // offline §37 analysis motivates (~80 ft keeps the aperture graph
+    // healthy at a fraction of the edges); recorded in the .probes
+    // header like the derived value, so runtime follows automatically.
+    // Requires --force-pathing-bake to take effect on an existing cache
+    // (deliberately no auto-rebake: experimental knob).
+    float audioPathingVisRangeOverrideFt = 0.0f;
+
     // Pathing probe layout density tier (`audio.pathing_probes.density`).
     // Valid values:
     //   "baseline" — Tier 0: the original Dark Engine room/portal
@@ -323,6 +336,15 @@ struct RenderConfig {
     // blocking changes. 0.0 = run every frame (legacy / A-B
     // diagnostic). Clamped to [0.0, 1.0] seconds.
     float    pathingUpdateInterval = 0.1f;
+
+    // Time constant (ms) for the audio-thread smoother on pathing EQ/SH
+    // parameters. Steam Audio's built-in PathEffect ramps are frame-
+    // count based and collapse to ~20-60 ms at our small buffers, so a
+    // fresh solve with a large level change (door between loud/quiet
+    // spaces) steps audibly; this smoother is time-based and frame-size
+    // independent. 0 disables (verbatim application, Valve-plugin
+    // behavior). Clamped to [0, 1000].
+    float    pathingSmoothingMs = 100.0f;
 
     // Per-band weights for collapsing Steam Audio's 3-band eqCoeffs into
     // the scalar portalAttenuation gain. Applied as
@@ -891,6 +913,14 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.audioPathingDedupRadiusFt > 30.0f)
                         cfg.audioPathingDedupRadiusFt = 30.0f;
                 }
+                if (pp["vis_range_override_ft"]) {
+                    cfg.audioPathingVisRangeOverrideFt =
+                        pp["vis_range_override_ft"].as<float>();
+                    if (cfg.audioPathingVisRangeOverrideFt < 0.0f)
+                        cfg.audioPathingVisRangeOverrideFt = 0.0f;
+                    if (cfg.audioPathingVisRangeOverrideFt > 400.0f)
+                        cfg.audioPathingVisRangeOverrideFt = 400.0f;
+                }
                 if (pp["density"]) {
                     // Name list mirrors pathingProbeDensityFromName
                     // (ProbeManager.h, the canonical string→enum map;
@@ -1000,6 +1030,11 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     cfg.pathingUpdateInterval = prop["pathing_update_interval"].as<float>();
                     if (cfg.pathingUpdateInterval < 0.0f) cfg.pathingUpdateInterval = 0.0f;
                     if (cfg.pathingUpdateInterval > 1.0f) cfg.pathingUpdateInterval = 1.0f;
+                }
+                if (prop["pathing_smoothing_ms"]) {
+                    cfg.pathingSmoothingMs = prop["pathing_smoothing_ms"].as<float>();
+                    if (cfg.pathingSmoothingMs < 0.0f) cfg.pathingSmoothingMs = 0.0f;
+                    if (cfg.pathingSmoothingMs > 1000.0f) cfg.pathingSmoothingMs = 1000.0f;
                 }
                 if (prop["pathing_gain_band_weights"]) {
                     YAML::Node w = prop["pathing_gain_band_weights"];
@@ -1468,6 +1503,11 @@ inline bool applySetOverride(const std::string& path, const std::string& valueSt
         float v; if (!toFloat(v)) return false;
         cfg.audioPathingDedupRadiusFt = clampF(v, 0.0f, 30.0f); return true;
     }
+    if (path == "audio.pathing_probes.vis_range_override_ft") {
+        float v; if (!toFloat(v)) return false;
+        cfg.audioPathingVisRangeOverrideFt = clampF(v, 0.0f, 400.0f);
+        return true;
+    }
     if (path == "audio.pathing_probes.density") {
         // Same validation as the YAML parser: baseline | bends only
         // ("high" reserved for a future Tier 2); name list mirrors
@@ -1545,6 +1585,10 @@ inline bool applySetOverride(const std::string& path, const std::string& valueSt
     if (path == "audio.propagation.pathing_update_interval") {
         float v; if (!toFloat(v)) return false;
         cfg.pathingUpdateInterval = clampF(v, 0.0f, 1.0f); return true;
+    }
+    if (path == "audio.propagation.pathing_smoothing_ms") {
+        float v; if (!toFloat(v)) return false;
+        cfg.pathingSmoothingMs = clampF(v, 0.0f, 1000.0f); return true;
     }
 
     // -- audio.spatialization --
