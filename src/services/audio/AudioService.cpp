@@ -6180,6 +6180,50 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
         // rejection. Refreshed on every setDoorTransform so it tracks
         // the live pose.
         recomputeDoorWorldAABB(inst);
+
+        // Closed-pose oriented box for the hybrid route graph's door→edge
+        // mapping. The box is authored in the door's local frame (slab
+        // centred at the local origin), so its half-extents come straight
+        // from the largest abs local coordinate per axis; a small margin
+        // folds in so an edge threading the opening at the door plane still
+        // registers. worldToLocal is the inverse of the CLOSED world pose —
+        // pose-independent, so a swinging door keeps mapping to the same
+        // doorway edges. All engine coordinates (Z-up feet), the same frame
+        // as the probe positions the graph routes over — no IPL conversion.
+        {
+            Vector3 he(0.0f, 0.0f, 0.0f);
+            for (size_t i = 0; i < numVerts; ++i) {
+                he.x = std::max(he.x, std::fabs(g.localVertices[i * 3 + 0]));
+                he.y = std::max(he.y, std::fabs(g.localVertices[i * 3 + 1]));
+                he.z = std::max(he.z, std::fabs(g.localVertices[i * 3 + 2]));
+            }
+            // Anisotropic margin, keyed to the slab's own geometry so it
+            // generalises across door sizes. The slab is thin along its
+            // NORMAL (its smallest local half-extent) and wide in the OPENING
+            // plane (the other two):
+            //  - Normal axis: a TIGHT margin. A route edge threads the door by
+            //    crossing the slab (in one face, out the other), so it is
+            //    caught regardless of normal margin — the margin here only
+            //    admits near-PARALLEL edges running alongside the face in an
+            //    adjacent room, which must NOT gate this door. Keep it small.
+            //  - Opening-plane axes: a GENEROUS margin. A threading edge's
+            //    crossing point can sit off-centre toward the doorframe (the
+            //    leaf is often narrower than the opening, and flank probes are
+            //    not perfectly centred), so widen these to catch it.
+            // Measured on a 200-door level: an isotropic 1.5 ft margin nearly
+            // doubled the door-edge links (re-admitting parallel edges) to
+            // shave the gate-nothing count; the anisotropic split recovers the
+            // same laterally-offset threading edges while keeping the normal
+            // axis tight, so parallel edges stay rejected.
+            constexpr float kNormalMarginFt  = 0.5f;
+            constexpr float kOpeningMarginFt = 1.5f;
+            const int thin = (he.x <= he.y && he.x <= he.z) ? 0
+                           : (he.y <= he.z ? 1 : 2);
+            Vector3 margin(kOpeningMarginFt);
+            margin[thin] = kNormalMarginFt;
+            inst.obbHalfExtents = he + margin;
+            inst.obbWorldToLocal = glm::inverse(g.closedWorldTransform);
+        }
         mDoorAudioInstances[g.objID] = inst;
         ++created;
     }
@@ -15623,27 +15667,40 @@ void AudioService::buildHybridRouteGraph()
     for (const PathingEdge &e : adj.edges)
         edges.push_back({e.a, e.b});
 
-    // Each door as a doorway sphere at its OBB center. Radius = half the OBB
-    // diagonal + 1 ft margin, so an edge threading the opening is caught even
-    // as the door swings (the center stays in the doorway). A tighter OBB /
-    // flank-probe association is a later refinement (PLAN.SELF_ROUTED_HYBRID).
+    // Each door as its CLOSED-pose oriented box (the doorway footprint), so
+    // only an edge that actually threads the opening is annotated — a doorway
+    // sphere also caught edges merely passing NEAR the doorway in an adjacent
+    // room. The OBB is pose-independent (the closed slab IS the doorway), so a
+    // swinging door still maps to the same edges. worldToLocal + halfExtents
+    // are precomputed at registerDoorGeometry (engine feet, same frame as the
+    // probe positions).
     std::vector<HybridRouteGraph::DoorBox> doors;
     doors.reserve(mDoorAudioInstances.size());
     for (const auto &kv : mDoorAudioInstances) {
         const DoorAudioInstance &di = kv.second;
         if (di.worldAABBmin.x > di.worldAABBmax.x) continue;  // degenerate
-        const Vector3 center = (di.worldAABBmin + di.worldAABBmax) * 0.5f;
-        const Vector3 ext    = di.worldAABBmax - di.worldAABBmin;
-        const float   radius = 0.5f * glm::length(ext) + 1.0f;
-        doors.push_back({kv.first, center, radius});
+        if (di.obbHalfExtents.x <= 0.0f) continue;  // OBB not computed
+        doors.push_back({kv.first, di.obbWorldToLocal, di.obbHalfExtents});
     }
 
     mHybridGraph.build(pos, edges, doors);
+    const size_t withEdges = mHybridGraph.doorsWithEdges();
+    const size_t noEdges = doors.size() >= withEdges ? doors.size() - withEdges : 0;
     std::fprintf(stderr,
         "[HYBRID_GRAPH] built: %zu probes, %zu edges, %zu doors, "
-        "%zu door-edge links (gate routing)\n",
+        "%zu door-edge links, %zu doors gate nothing (gate routing)\n",
         mHybridGraph.numProbes(), edges.size(), doors.size(),
-        mHybridGraph.doorEdgeCount());
+        mHybridGraph.doorEdgeCount(), noEdges);
+    // A door mapped to NO edge cannot gate the sound routed past it — an
+    // over-tight door box would leak audio through a closed door. Announce it
+    // loudly (no silent fallbacks) so the box margin can be revisited if this
+    // climbs. A handful is expected (doors with no through-probe pair, e.g.
+    // sealed/decorative doors that no route ever threads).
+    if (noEdges > 0)
+        std::fprintf(stderr,
+            "[HYBRID_GRAPH] NOTE: %zu of %zu doors map to no edge — their "
+            "open-fraction will not gate any route (check door box margin if "
+            "this is high)\n", noEdges, doors.size());
 }
 
 //------------------------------------------------------

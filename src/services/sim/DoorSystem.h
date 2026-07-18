@@ -344,6 +344,8 @@ public:
             geom.objID = id;
             buildBoxMesh(door.edgeLengths, geom.localVertices, geom.indices);
             geom.worldTransform = computeAudioWorldMatrix(door);
+            geom.closedWorldTransform =
+                computeAudioWorldMatrixAt(door, door.closedValue);
             geom.materialName = door.acousticMaterial;
             out.push_back(std::move(geom));
         }
@@ -862,6 +864,17 @@ private:
         // Emit events on state change
         if (reachedOpen) emitEvent(door, kDoorOpen, kDoorOpening);
         if (reachedClosed) emitEvent(door, kDoorClosed, kDoorClosing);
+    }
+
+    /// Audio world matrix with the door forced to a specific animation
+    /// value (angle/offset). Used to get the CLOSED-pose transform (the
+    /// doorway footprint) for the acoustic route graph's door→edge mapping,
+    /// which must be pose-independent: an edge threads the DOORWAY, not the
+    /// door's current swing pose.
+    Matrix4 computeAudioWorldMatrixAt(const DoorState &door, float value) const {
+        DoorState tmp = door;
+        tmp.currentValue = value;
+        return computeAudioWorldMatrix(tmp);
     }
 
     // Compute the door's world transform WITHOUT baseScale applied. Used by

@@ -13,6 +13,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include "audio/HybridRouteGraph.h"
 
+#include <glm/gtc/matrix_transform.hpp>  // glm::translate for the toy door OBBs
+
 #include <vector>
 
 using namespace Darkness;
@@ -39,9 +41,16 @@ static HybridRouteGraph makeGraph() {
         {0, 3}, {3, 4}, {4, 5},  // long corridor (door B between 3-4)
         {2, 5},                  // both corridors meet at the listener side
     };
+    // Doors as thin CLOSED-pose slabs: thin in X (the crossing axis the
+    // corridor edge threads), wide in Y/Z (the opening). worldToLocal is
+    // translate(-center) — no rotation for these axis-aligned toy doors, so a
+    // world point maps to local as p - center, and the box spans [-he, +he].
+    const Vector3 heDoor(0.5f, 3.0f, 3.0f);
     std::vector<HybridRouteGraph::DoorBox> doors = {
-        {100, {5.0f, 0.0f, 0.0f}, 2.0f},   // door A on edge 0-1
-        {200, {5.0f, 20.0f, 0.0f}, 2.0f},  // door B on edge 3-4
+        {100, glm::translate(Matrix4(1.0f), Vector3(-5.0f, 0.0f, 0.0f)),
+              heDoor},   // door A centred at (5,0,0), on edge 0-1
+        {200, glm::translate(Matrix4(1.0f), Vector3(-5.0f, -20.0f, 0.0f)),
+              heDoor},   // door B centred at (5,20,0), on edge 3-4
     };
     HybridRouteGraph g;
     g.build(pos, edges, doors);
