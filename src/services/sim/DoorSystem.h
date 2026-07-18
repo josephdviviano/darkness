@@ -128,6 +128,15 @@ struct DoorState {
     // again. Zero means the door has no usable bounds (logged at init time).
     Vector3 edgeLengths = {0.0f, 0.0f, 0.0f};
 
+    // Dominant surface material NAME of the door's .bin model (the texture
+    // name of its largest submesh, e.g. "PORTC.GIF", "DOOR.GIF"). Resolved
+    // once at init from mParsedModels. The audio side maps this through the
+    // same acoustic-material keyword lookup the world geometry uses, so a
+    // metal gate transmits/reflects differently from a wooden door instead
+    // of every door being hardcoded to wood. Empty = unknown (audio falls
+    // back to its default material).
+    std::string acousticMaterial;
+
     // Renderer index — index into mission.objData.objects[] for quick lookup.
     // -1 if not found (archetype-only door, shouldn't happen for concrete objects).
     int renderIndex = -1;
@@ -335,6 +344,7 @@ public:
             geom.objID = id;
             buildBoxMesh(door.edgeLengths, geom.localVertices, geom.indices);
             geom.worldTransform = computeAudioWorldMatrix(door);
+            geom.materialName = door.acousticMaterial;
             out.push_back(std::move(geom));
         }
         return out;
@@ -630,6 +640,57 @@ private:
         // Cache the OBB dimensions for downstream consumers (e.g. audio
         // geometry registration). Already in final post-scale world size.
         door.edgeLengths = edgeLengths;
+
+        // Resolve the door's dominant surface material NAME from its .bin
+        // model (the texture name of the largest-area submesh). Handed to
+        // the audio side so a door's acoustic transmission/reflection tracks
+        // its material (metal gate vs oak) instead of every door being
+        // hardcoded to wood — same texture→material keyword lookup the world
+        // geometry uses. Empty when there is no model or no materials.
+        if (mParsedModels) {
+            char modelName[16] = {};
+            if (getTypedProperty<char[16]>(propSvc, "ModelName", objID,
+                                           modelName)) {
+                auto it = mParsedModels->find(std::string(modelName));
+                if (it != mParsedModels->end()) {
+                    const ParsedBinMesh &mesh = it->second;
+                    // Largest-AREA submesh's material = the door's main
+                    // acoustic surface. NOT triangle count: a door slab is a
+                    // few big quads while the handle is many tiny triangles,
+                    // so a count-based pick wrongly returns the handle's
+                    // material for most doors (measured: DHANDLE on 101/200
+                    // MISS7 doors). Area sums the actual triangle areas.
+                    float bestArea = 0.0f;
+                    int bestMat = -1;
+                    for (const auto &sm : mesh.subMeshes) {
+                        if (sm.matIndex < 0) continue;
+                        float area = 0.0f;
+                        const uint32_t end = sm.firstIndex + sm.indexCount;
+                        for (uint32_t k = sm.firstIndex; k + 2 < end; k += 3) {
+                            if (k + 2 >= mesh.indices.size()) break;
+                            const BinVert &a = mesh.vertices[mesh.indices[k]];
+                            const BinVert &b = mesh.vertices[mesh.indices[k+1]];
+                            const BinVert &c = mesh.vertices[mesh.indices[k+2]];
+                            const float e1x=b.x-a.x, e1y=b.y-a.y, e1z=b.z-a.z;
+                            const float e2x=c.x-a.x, e2y=c.y-a.y, e2z=c.z-a.z;
+                            const float cx=e1y*e2z-e1z*e2y;
+                            const float cy=e1z*e2x-e1x*e2z;
+                            const float cz=e1x*e2y-e1y*e2x;
+                            area += 0.5f*std::sqrt(cx*cx+cy*cy+cz*cz);
+                        }
+                        if (area > bestArea) { bestArea = area; bestMat = sm.matIndex; }
+                    }
+                    if (bestMat < 0 && !mesh.materials.empty())
+                        bestMat = 0;   // no submesh info: first material
+                    if (bestMat >= 0
+                        && bestMat < static_cast<int>(mesh.materials.size())) {
+                        const char *mn = mesh.materials[bestMat].name;
+                        door.acousticMaterial.assign(
+                            mn, strnlen(mn, sizeof(mesh.materials[bestMat].name)));
+                    }
+                }
+            }
+        }
 
         // Pivot offset is only meaningful for rotating doors — translating
         // doors slide along an axis from the model origin and never

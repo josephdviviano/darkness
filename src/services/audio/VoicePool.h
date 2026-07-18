@@ -342,6 +342,25 @@ struct SteamAudioDSPNode {
     // governs. Audio thread reads relaxed once per callback.
     std::atomic<float> pathDoorFraction{-1.0f};
 
+    // ── Fresh door-openness gate on the pathing wet bus (zero-lag) ──
+    //
+    // The tightest open-fraction (0 closed .. 1 open) over the doors on
+    // this voice's CURRENT route, republished by the main thread EVERY
+    // loopStep from live door state — independent of the lagged pathing
+    // solve. The audio thread ramps pathRouteGateSmoothed toward it and
+    // multiplies the path-effect (around-the-door routed) output by it,
+    // so a closing door fades the routed sound out WITH the physical
+    // door instead of on the solver's ~10 Hz cadence. This is the
+    // "volume tracks door position, no lag" requirement — the ~90% of
+    // the door-blocking realism effect, decoupled from the expensive
+    // re-solve. Direct transmission through the closed slab is a
+    // separate DSP path (iplDirectEffect occlusion/transmission), so
+    // gating the routed bus to 0 on a closed door is correct: the
+    // around-route genuinely vanishes, only the muffled through-door
+    // transmission remains. 1.0 = fully open / no door on the route.
+    std::atomic<float> pathRouteGate{1.0f};
+    float pathRouteGateSmoothed = 1.0f;  // audio-thread-owned ramp state
+
     // Scratch buffers (allocated once at init, never reallocated — safe
     // for audio thread).
     std::vector<float> monoScratch;        // raw downmix, preserved for convolution

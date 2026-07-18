@@ -6759,6 +6759,14 @@ int main(int argc, char *argv[]) {
         AUDIO_LOG("Door %d: %s (was %s, room %d<->%d)\n",
                      objID, statusName, oldName, door.room1, door.room2);
 
+        // Stage 2 (2026-07-18): the pathing re-solve fires on the door
+        // STATUS event, not per sim tick — one re-solve per open/close
+        // transition to pick up the route-set change; the fresh door-gate
+        // carries the swing volume lag-free. (Was: setDoorTransform bumped
+        // the acoustic gen every tick, forcing per-tick re-solves.)
+        if (audioForEvents)
+            audioForEvents->notifyDoorAcousticEvent(objID);
+
         // Play door sound via general-purpose env_tag schema matching.
         // Tags follow the Dark Engine's StdDoor script convention:
         //   (Event StateChange) (OpenState <new>) (OldOpenState <old>)
