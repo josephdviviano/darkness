@@ -7281,9 +7281,15 @@ void AudioService::loopStep(float deltaTime)
     // staleness class the existing DIRECT_LAG skip already tolerates,
     // smoothed by the per-voice DSP ramps).
     //
-    // NOTE: with the swing-grinding cause removed, this hold now covers only
-    // the residual refl/direct tiling case; it is a candidate to simplify to
-    // a lighter "skip a busy frame" — pending a door-stress re-measurement.
+    // MEASURED (2026-07-19 door-stress survey, post gate-route re-key +
+    // graph fix): the tiling case the hold covers is ACTIVE — roughly
+    // half of commit frames find a worker busy (defer≈70-85 per 60 s
+    // window against commits≈83-88), so without the hold the commit
+    // would wait on coincidental all-idle frames. The hold stays: it is
+    // what bounds a deferred commit to ~one in-flight iteration, and the
+    // commit bounds every covering solve. (This resolves the earlier
+    // "simplify to a lighter skip-a-busy-frame" note — the hold IS the
+    // lightweight form; only its rationale needed updating.)
     //
     // Read AFTER the commit block deliberately: on the frame the commit
     // lands, mSceneNeedsCommit was just cleared → no hold → all workers
