@@ -6864,7 +6864,17 @@ void AudioService::loopStep(float deltaTime)
                 glm::length(v->worldPos - v->pathGateSrc) > kGateRepathMoveFt
                 || glm::length(mListenerPos - v->pathGateLst)
                        > kGateRepathMoveFt;
+            // An UNREACHABLE voice re-checks EVERY frame. Its reachability is
+            // restored when a door on the would-be route crosses the open
+            // threshold mid-swing — an instant with no door event, so waiting
+            // for the door gen or a >5 ft move would let it pop in at whatever
+            // fraction the eventual re-path happened to land on instead of
+            // fading in from the door crack (frac ~= closedThreshold). route()
+            // here is a pure probe-graph Dijkstra (no ray casts) and
+            // unreachable voices are few, so re-checking is cheap. Symmetric
+            // with cachedRouteDead, which makes closing-to-silence smooth.
             if (!v->pathGateValid || cachedRouteDead || moved
+                || !v->pathGateReachable
                 || v->pathGateDoorGen != mDoorGenCommitted) {
                 v->pathGateReachable = mHybridGraph.route(
                     v->worldPos, mListenerPos, doorFrac,
