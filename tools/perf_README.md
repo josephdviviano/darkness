@@ -69,7 +69,7 @@ Example:
 
 ```bash
 tools/perf_sweep.sh \
-    ../thief_2_service_release/rdrive/prj/thief2/levels/shipping/MISS6.MIS \
+    /path/to/levels/shipping/MISS6.MIS \
     audio.reflections.hybrid_transition_time \
     0.5 0.75 1.0 1.5
 ```
@@ -121,7 +121,7 @@ tools/perf_probe_plan_sweep.sh
 ```
 
 Default: all `*.mis` / `*.MIS` files under
-`../thief_2_service_release/rdrive/prj/thief2/levels/shipping/` ×
+`/path/to/levels/shipping/` ×
 radii `{5, 10, 15, 20}`. ~seconds per (mission, radius) pair.
 
 ### Output
@@ -146,7 +146,7 @@ awk -F, 'NR>1 && $3+0 >= 150 && $3+0 <= 180' ./perf/probe_plan/<TS>/probe_count_
 | `DARKNESS_HEADLESS`  | `./build/default/src/main/darknessHeadless`                            |
 | `DARKNESS_RES`       | `/Volumes/THIEF2_INSTALL_C/THIEF2/RES`                                 |
 | `DARKNESS_SCHEMAS`   | `/Volumes/THIEF2_CD2/EDITOR/SCHEMA`                                    |
-| `LEVELS_DIR`         | `../thief_2_service_release/rdrive/prj/thief2/levels/shipping`         |
+| `LEVELS_DIR`         | `/path/to/levels/shipping`         |
 | `RADII`              | `"5 10 15 20"`                                                         |
 | `MISSIONS`           | (empty — all missions in `LEVELS_DIR`)                                 |
 
@@ -268,12 +268,12 @@ MISSIONS="miss6.mis" tools/perf_probe_plan_sweep.sh
 # --skip-reflection-bake; MISS6's miss6.probes must already exist with
 # a reflection section — bake it once without --skip-reflection-bake if not)
 FORCE_PATHING_BAKE=1 tools/perf_sweep.sh \
-    ../thief_2_service_release/rdrive/prj/thief2/levels/shipping/miss6.mis \
+    /path/to/levels/shipping/miss6.mis \
     audio.pathing_probes.dedup_radius_ft <radii from Phase A>
 
 # Phase 1 runtime — pathing-update-interval ablation on MISS6 (no bake)
 tools/perf_sweep.sh \
-    ../thief_2_service_release/rdrive/prj/thief2/levels/shipping/miss6.mis \
+    /path/to/levels/shipping/miss6.mis \
     audio.propagation.pathing_update_interval 0.0 0.05 0.1 0.2 0.3
 ```
 
@@ -285,7 +285,7 @@ tools/perf_probe_plan_sweep.sh
 
 # Phase 1.B for each mission at the MISS6-chosen radius
 for MISSION in \
-    ../thief_2_service_release/rdrive/prj/thief2/levels/shipping/{miss,MISS}*.{mis,MIS}; do
+    /path/to/levels/shipping/{miss,MISS}*.{mis,MIS}; do
   FORCE_PATHING_BAKE=1 tools/perf_sweep.sh "$MISSION" \
       audio.pathing_probes.dedup_radius_ft <chosen radius>
 done

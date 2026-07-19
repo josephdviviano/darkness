@@ -272,7 +272,7 @@ inline bool raycastWorld(const WRParsedData &wr,
                 }
             }
 
-            // Original engine (PHMODSPH.CPP line 248): if PortalRaycastFindPolygon()
+            // Original engine: if PortalRaycastFindPolygon()
             // returns -1, the collision is discarded (no polygon contains the hit
             // point). This happens when the ray exits through a plane at a point
             // that is geometrically between polygons (e.g., 0.02 above a riser

@@ -189,7 +189,7 @@ public:
                 std::fprintf(stderr, "[DEFAULT] ObjectPushSystem: obj %d not in mass map, using default mass=30.0\n", contact.objectId);
             }
 
-            // ── Dark Engine BounceSphereOBB formula (PHCORE.CPP:4920-4961) ──
+            // ── Dark Engine BounceSphereOBB formula ──
             // Project velocities onto contact normal for 1D elastic collision.
             // Player velocity along normal:
             //   vel1 = normal * dot(playerVel, normal)

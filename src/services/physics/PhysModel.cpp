@@ -169,9 +169,9 @@ void PhysModel::setSleep(bool sleep)
 {
     STUB_WARN();
     /** TODO:
-     * Contact PhysModels - de/reregister from phys updates (originally
-     * cPhysModels::StartMoving(cPhysModel*) /
-     * cPhysModels::StopMoving(cPhysModel*)) Original engine issues a series of
+     * Contact physics models - de/reregister from phys updates (originally
+     * the start-moving / stop-moving transitions on the physics-model list).
+     * Original engine issues a series of
      * vector zeroing operations (velocities both rotational and translational
      * for all submodels) Send an appropriate message mIsAsleep?
      */

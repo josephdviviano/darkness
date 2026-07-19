@@ -122,7 +122,7 @@ static constexpr float SPHERE_RADII[NUM_SPHERES] = {
 // CrawlLeft HEAD=-2.5/BODY=-1.0, CrawlRight HEAD=-2.5/BODY=-1.0.
 
 // Movement speeds (world units/sec).
-// Original Dark Engine speed constants (PLYRSPD.H):
+// Original Dark Engine speed constants:
 //   MOVE_SPEED = 11.0, SLOW_MOVE_SPEED = 5.5 (default walk = SLOW)
 //   FAST_MOVE_SPEED = 22.0, SIDESTEP_SPEED = 7.7, BACK_SPEED = 5.5
 // Default forward state is SLOWSPEED, so walk = SLOW_MOVE_SPEED = 5.5.
