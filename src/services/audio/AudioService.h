@@ -1991,73 +1991,20 @@ private:
     /// ≤ ~150 ms under door-swing stress.
     LatencyHistogram mDoorRouteLatencyHist;
 
-    // ── O3-lite scoped door-event invalidation (PLAN.PATHING_DESIGN.md §8) ──
+    // ── Scoped door-event invalidation (PLAN.PATHING_DESIGN.md §8) ──
     //
-    // A shadow room-graph router (radius-bounded portal Dijkstra over
-    // ROOM_DB, the same graph analysis/door_detour_class.py proxies)
-    // computes, per voice at each SOLVE, the SET of room-pairs on any
-    // route within a slack window of the shortest. The voice is then
-    // registered against every DOOR whose room-pair lies on a route in
-    // that set (plus an ellipse geometric fallback). On a door commit
-    // only the registered voices are invalidated — shrinking the
-    // door-swing "affected voices" from all-in-range (~11 on MISS2) to
-    // the 1-2 actually routed through the moving door. All members below
-    // are MAIN-THREAD ONLY (registration, commit-marking and teardown all
-    // run on the main thread). No acoustic parameters are produced here —
-    // scheduling/invalidation only.
-
-    /// Slack window (feet) added to the shortest route length: a portal
-    /// (room-pair) is "on a route" if distFromSource + distToListener
-    /// through it is within this of the shortest S→T route. Also the
-    /// ellipse-fallback margin. Deliberately generous (conservative
-    /// superset) — the [SCOPE_MISS] watchdog is the correctness guard.
-    /// 20 ft = top of the sanctioned +10-20 ft window (§8 step 1); raised
-    /// from 15 ft after the first stress runs showed a handful of
-    /// regDoors≥1 ambients whose alternate-route door sat just beyond a
-    /// tighter window (small [SCOPE_MISS] deltas).
-    static constexpr float kRouteSlackFt = 20.0f;
-
-    /// Per-registered-door canonical (min,max) room-pair, built at
-    /// registerDoorGeometry with the SAME point-to-AABB matcher as
-    /// logDoorPortalMap / the DoorPair bake classifier. Doors that match
-    /// no portal within kPathingDoorPortalMatchDistFt get NO entry (the
-    /// 43 genuine non-boundary doors) — those fall to the ellipse
-    /// fallback / fail-open-all on bump.
-    std::unordered_map<int32_t, std::pair<int32_t, int32_t>> mDoorRoomPair;
-
-    /// Inverse of mDoorRoomPair: canonical room-pair → door IDs mapped to
-    /// it. Lets the router turn a route's room-pair set into door IDs.
-    std::map<std::pair<int32_t, int32_t>, std::vector<int32_t>> mRoomPairDoors;
-
-    /// Shadow-router portal graph (physical portals, deduped via the
-    /// portalID<=destPortalID convention). Built from ROOM_DB whenever the
-    /// door maps are (re)built; independent of the probe graph. Empty ⇒
-    /// mRouterReady false ⇒ every voice fails open (global door trigger).
-    struct RouterPortal {
-        int32_t a;        ///< lower room ID
-        int32_t b;        ///< higher room ID
-        Vector3 center;   ///< portal polygon center (engine feet)
-    };
-    std::vector<RouterPortal> mRouterPortals;
-    /// roomID → indices into mRouterPortals of the portals bounding it
-    /// (a portal appears under BOTH its rooms). The router's adjacency:
-    /// portal P's neighbors are the portals sharing either of P's rooms.
-    std::unordered_map<int32_t, std::vector<uint32_t>> mRouterRoomPortals;
-    bool mRouterReady = false;
-
-    /// Reverse index door → voices registered against it (scope step 2).
-    /// Rebuilt incrementally: a voice's registration is refreshed at every
-    /// SOLVE and torn down in removeVoiceSource. On a door commit the
-    /// registered voices (and only those) are marked pathScopedDoorDirty.
-    std::unordered_map<int32_t, std::unordered_set<SoundHandle>> mDoorVoices;
-    /// Per-voice current door registration (the door IDs a voice sits in
-    /// mDoorVoices under) so a re-solve / teardown can remove the old
-    /// edges before adding the new ones.
-    std::unordered_map<SoundHandle, std::vector<int32_t>> mVoiceRegisteredDoors;
+    // Re-keyed onto the hybrid gate route (PLAN.SELF_ROUTED_HYBRID.md):
+    // on a door commit, only voices whose pathGateDoors (the
+    // HybridRouteGraph route the gate loop refreshes every loopStep)
+    // cross a bumped door are invalidated — shrinking the door-swing
+    // "affected voices" from all-in-range (~11 on MISS2) to the 1-2
+    // actually routed through the moving door. MAIN-THREAD ONLY. No
+    // acoustic parameters are produced here — scheduling/invalidation
+    // only.
 
     /// Door IDs whose transform bumped since the last committed BVH refit.
     /// Populated by setDoorTransform, drained at the coalesced iplSceneCommit
-    /// in loopStep to mark exactly the registered voices dirty (the door
+    /// in loopStep to mark exactly the affected voices dirty (the door
     /// poses are only IN the BVH after the commit, so marking at commit —
     /// not bump — preserves the "solve sees the new geometry" invariant).
     std::unordered_set<int32_t> mDoorsBumpedSinceCommit;
@@ -2088,31 +2035,6 @@ private:
     /// voice's cached eq and its forced full-solve eq is a scope miss.
     static constexpr float kScopeMissEqEpsilon = 0.05f;
     std::atomic<uint64_t> mScopeMissCount{0};
-
-    /// (Re)build mDoorRoomPair / mRoomPairDoors from the registered doors
-    /// and the shadow-router portal graph from ROOM_DB. Called at the end
-    /// of registerDoorGeometry (RoomService loaded by then). Clears + sets
-    /// mRouterReady.
-    void rebuildDoorScopeMaps();
-
-    /// Shadow router: radius-bounded portal Dijkstra + ellipse fallback.
-    /// Returns the sorted, deduped set of door IDs relevant to a voice at
-    /// (sourcePos, listenerPos). `outScopeValid` is set true iff the
-    /// router produced usable route data (built, both rooms resolved, a
-    /// finite route exists) — false ⇒ the caller fails the voice open.
-    std::vector<int32_t> computeRouteScope(const Vector3 &sourcePos,
-                                           const Vector3 &listenerPos,
-                                           Room *sourceRoom,
-                                           Room *listenerRoom,
-                                           float maxAudibleDist,
-                                           bool &outScopeValid) const;
-
-    /// Refresh a voice's door registration in mDoorVoices /
-    /// mVoiceRegisteredDoors to `doors` (removing stale edges first).
-    void registerVoiceRouteDoors(SoundHandle h,
-                                 const std::vector<int32_t> &doors);
-    /// Drop a voice from the reverse index entirely (teardown / reload).
-    void unregisterVoiceRouteScope(SoundHandle h);
 
     /// Reflection simulation owner — wraps the Steam Audio reflection
     /// IPLSimulator handle, its dedicated background worker thread, the
