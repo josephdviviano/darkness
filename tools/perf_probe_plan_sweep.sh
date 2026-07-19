@@ -18,7 +18,7 @@
 #   DARKNESS_HEADLESS=./build/default/src/main/darknessHeadless
 #   DARKNESS_RES=/Volumes/THIEF2_INSTALL_C/THIEF2/RES
 #   DARKNESS_SCHEMAS=/Volumes/THIEF2_CD2/EDITOR/SCHEMA
-#   LEVELS_DIR=../thief_2_service_release/rdrive/prj/thief2/levels/shipping
+#   LEVELS_DIR=/path/to/levels/shipping
 #   RADII="5 10 15 20"   (space-separated)
 #   MISSIONS=""          (optional: explicit list; defaults to all *.mis/*.MIS)
 #
@@ -34,7 +34,7 @@ set -uo pipefail
 DARKNESS_HEADLESS="${DARKNESS_HEADLESS:-./build/default/src/main/darknessHeadless}"
 DARKNESS_RES="${DARKNESS_RES:-/Volumes/THIEF2_INSTALL_C/THIEF2/RES}"
 DARKNESS_SCHEMAS="${DARKNESS_SCHEMAS:-/Volumes/THIEF2_CD2/EDITOR/SCHEMA}"
-LEVELS_DIR="${LEVELS_DIR:-../thief_2_service_release/rdrive/prj/thief2/levels/shipping}"
+LEVELS_DIR="${LEVELS_DIR:-/path/to/levels/shipping}"
 RADII="${RADII:-5 10 15 20}"
 
 # --- preflight --------------------------------------------------------------
