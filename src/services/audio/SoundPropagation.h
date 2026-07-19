@@ -110,21 +110,44 @@ private:
     RoomService *mRoomService = nullptr;
     LineOfSightFn mLineOfSightFn;
 
-    /// Core blocking set/erase for one room pair (both key directions), with
-    /// NO adjacent-room propagation. `setBlockingFactor` wraps this and adds
-    /// the multi-room-doorway spread; the spread itself calls only the core
-    /// so it cannot recurse.
-    void setBlockingCore(int room1, int room2, float factor);
+    /// Contribute one door's blocking to a room-pair boundary and recompute
+    /// that boundary's EFFECTIVE factor. Contributions are keyed by the
+    /// contributing door's own room pair (`originKey`) so several doors can
+    /// touch the same boundary without clobbering one another: a wide door's
+    /// spread onto (room1,R) and the door actually on (room1,R) coexist, and
+    /// each can be raised / lowered / cleared independently. Effective factor
+    /// = MAX over the boundary's live contributions (the tightest-sealing door
+    /// governs the boundary). NO adjacent-room propagation here — the spread
+    /// is added by `setBlockingFactor` via `blockAdjacentRooms`, which calls
+    /// only this, so it cannot recurse.
+    void contributeBlocking(int room1, int room2, uint32_t originKey,
+                            float factor);
 
     /// Multi-room doorway spread: a door on the (room1,room2) boundary also
     /// blocks any room R that is portal-adjacent to BOTH room1 and room2
-    /// (the pairs (room1,R) and (room2,R)). Matches the original engine's
-    /// per-room-pair blocking so a wide doorway whose opening spans more
-    /// than two room subdivisions is not under-blocked. factor <= 0 erases.
-    void blockAdjacentRooms(int room1, int room2, float factor);
+    /// (the pairs (room1,R) and (room2,R)) so a wide doorway whose opening
+    /// spans more than two room subdivisions is not under-blocked. Every
+    /// spread contribution carries the door's own `originKey`, so opening the
+    /// door clears exactly its own contributions and never another door's.
+    /// factor <= 0 erases this door's contribution.
+    void blockAdjacentRooms(int room1, int room2, uint32_t originKey,
+                            float factor);
 
-    /// Key: (room1 << 16) | room2 — stored both ways (bidirectional).
+    /// Undirected room-pair key: (min<<16)|max, so (a,b) and (b,a) collide.
+    static uint32_t pairKey(int room1, int room2) {
+        const int lo = room1 < room2 ? room1 : room2;
+        const int hi = room1 < room2 ? room2 : room1;
+        return (static_cast<uint32_t>(lo) << 16) |
+               static_cast<uint32_t>(hi & 0xFFFF);
+    }
+
+    /// Effective blocking per boundary: undirected pairKey → MAX contribution.
     std::unordered_map<uint32_t, float> mBlockingFactors;
+    /// Live per-boundary contributions: pairKey(boundary) → ( pairKey(door) →
+    /// factor ). The effective map above is the per-boundary max over these,
+    /// so one door lowering/clearing its contribution never wipes another's.
+    std::unordered_map<uint32_t, std::unordered_map<uint32_t, float>>
+        mBlockingContrib;
     /// Per-room transmission factor (default 1.0).
     std::unordered_map<int32_t, float> mRoomTransmission;
 };
