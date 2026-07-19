@@ -6364,9 +6364,9 @@ void AudioService::setDoorTransform(int32_t doorObjID, const Matrix4 &worldTrans
     // is the honest gate quantity, and the batch's oldest sample still
     // carries the old worst-case envelope.
     //
-    // Gated on pathing-operative (mirrors review F5's due-override gate):
-    // with pathing disabled / no probe batch / no simulator, no solve can
-    // ever retire epochs, and per-bump pushes would grow the deque
+    // Gated on pathing-operative: with pathing disabled / no probe batch /
+    // no simulator, no solve can ever retire epochs, and per-bump pushes
+    // would grow the deque
     // unboundedly (the old back()<=lastSignal scheme was self-bounding).
     // Cap as a backstop for a stuck pipeline — dropping the NEWEST bump
     // is safe for the metric (retirement covers it via gen ≤ G; it just
@@ -6817,15 +6817,6 @@ void AudioService::loopStep(float deltaTime)
         mPathingDueThisStep = (mPathingAccumSec >= mPathingUpdateInterval);
         if (mPathingDueThisStep) mPathingAccumSec = 0.0f;
     }
-    // O2a: remember whether the NATURAL throttle elapsed this step. The
-    // door-swing due-override below (after the door scene commit, where
-    // mDoorGenCommitted is fresh) may force mPathingDueThisStep on
-    // non-throttle frames so swings re-solve continuously; the
-    // [PATHING_LAG] diagnostic keeps its original meaning ("the
-    // configured cadence elapsed while the worker was busy") by gating
-    // on this local instead of the possibly-overridden member.
-    const bool pathingDueNaturalThisStep = mPathingDueThisStep;
-
     // ── Fresh pathing door-gate publish (zero-lag volume vs door) ──
     //
     // For every voice, the door-fraction gate = the PRODUCT of the open-
@@ -7154,11 +7145,11 @@ void AudioService::loopStep(float deltaTime)
             iplSceneCommit(mIplScene);
             auto c1 = std::chrono::steady_clock::now();
             mSceneNeedsCommit.store(false, std::memory_order_release);
-            // O2a: every door-gen bump so far is now in the committed
-            // BVH — advance the committed gen the per-voice solve memo
-            // and the door due-override key on. setDoorTransform (the
-            // only other bump site besides registration) always pairs a
-            // bump with mSceneNeedsCommit, so no bump can be left behind.
+            // Every door-gen bump so far is now in the committed BVH —
+            // advance the committed gen that the per-voice solve memo keys
+            // on. setDoorTransform (the only other bump site besides
+            // registration) always pairs a bump with mSceneNeedsCommit, so
+            // no bump can be left behind.
             mDoorGenCommitted = mDoorAcousticGen;
             // [PERF door_route] cadence field (commits= per window).
             sDoorCommitsWindow.fetch_add(1, std::memory_order_relaxed);
@@ -7256,34 +7247,33 @@ void AudioService::loopStep(float deltaTime)
         }
     }
 
-    // ── O2a commit-vs-solve priority: hold sim signals while a commit waits ──
+    // ── commit-vs-solve priority: hold sim signals while a commit waits ──
     //
-    // Review finding F1 (BLOCKER): the canMutate gate above requires a
-    // COINCIDENTAL all-three-idle top-of-frame. With the due-override
-    // below keeping the pathing worker grinding back-to-back solves
-    // during swings — and refl/direct iterations tiling the frame
-    // boundaries ([DIRECT_LAG] fires on ~1/3 of stress frames) — that
-    // coincidence can fail for hundreds of ms at a stretch, starving the
-    // 0.05 ms door BVH commit and flooring [DOOR_ROUTE_LATENCY] at
-    // p95 181-257 ms with worst windows near 2 s (user hard gate
-    // ≤ 150 ms). The commit is the prerequisite for every covering solve,
-    // so it must win: while a door scene-commit is still pending after
-    // the block above (i.e. a worker was busy this frame), HOLD the sim
-    // signals this frame — pathing (Step 3 + the staging pass's
-    // pathingWillSignal) and reflection (wantReflections)
-    // unconditionally, and the direct worker once pathing is already
-    // idle (doorCommitHoldAux below). No new iterations start, every
-    // in-flight iteration finishes within its own duration, the commit
-    // lands on the first all-idle top-of-frame (≤ longest in-flight
-    // iteration + a frame), the committed gen advances, and the
-    // due-override + staging pass fire a covering solve in that same
-    // loopStep. During a continuous swing this alternates commit/solve
-    // at the solve's own granularity instead of solve-solve-solve
-    // against stale geometry; refl/direct pause for at most an
-    // iteration + a frame or two around each commit (params hold a
-    // frame or two longer — the same staleness class the existing
-    // DIRECT_LAG skip already tolerates, smoothed by the per-voice DSP
-    // ramps).
+    // The canMutate gate above requires a COINCIDENTAL all-three-idle
+    // top-of-frame. The dominant cause of that coincidence failing — the
+    // former due-override grinding the pathing worker through back-to-back
+    // solves for the whole of a door swing — is GONE (door events now ride
+    // the natural throttle, one solve per event). What remains is the
+    // milder case: refl/direct iterations tiling the frame boundaries
+    // ([DIRECT_LAG] fires on ~1/3 of stress frames) can still delay the
+    // 0.05 ms door BVH commit. The commit is the prerequisite for every
+    // covering solve, so it wins: while a door scene-commit is still
+    // pending after the block above (a worker was busy this frame), HOLD
+    // the sim signals this frame — pathing (Step 3 + the staging pass's
+    // pathingWillSignal) and reflection (wantReflections) unconditionally,
+    // and the direct worker once pathing is already idle (doorCommitHoldAux
+    // below). No new iterations start, every in-flight iteration finishes
+    // within its own duration, the commit lands on the first all-idle
+    // top-of-frame (≤ longest in-flight iteration + a frame), the committed
+    // gen advances, and the next due tick's staging pass fires a covering
+    // solve. refl/direct pause for at most an iteration + a frame or two
+    // around each commit (params hold a frame or two longer — the same
+    // staleness class the existing DIRECT_LAG skip already tolerates,
+    // smoothed by the per-voice DSP ramps).
+    //
+    // NOTE: with the swing-grinding cause removed, this hold now covers only
+    // the residual refl/direct tiling case; it is a candidate to simplify to
+    // a lighter "skip a busy frame" — pending a door-stress re-measurement.
     //
     // Read AFTER the commit block deliberately: on the frame the commit
     // lands, mSceneNeedsCommit was just cleared → no hold → all workers
@@ -7315,36 +7305,15 @@ void AudioService::loopStep(float deltaTime)
     // reflections tolerate a held tick far better than direct params.)
     const bool doorCommitHoldAux = doorCommitHold && !pathBusy;
 
-    // ── O2a pathing due-override: re-solve continuously during swings ──
-    //
-    // PLAN.PATHING_DESIGN.md §6 decision 1: door-event route updates must
-    // land near audio-pipeline latency, and swings should re-solve every
-    // tick (smoother than the original's step function). While committed
-    // door geometry is ahead of the last signaled solve, treat pathing as
-    // due EVERY frame — the Step 3 signal still waits for the worker to
-    // go idle, so during a swing the worker runs back-to-back solves at
-    // whatever rate it can sustain, and [DOOR_ROUTE_LATENCY] collapses to
-    // ~one solve duration instead of throttle-interval + solve. Idle
-    // worlds and plain listener movement keep the configured cadence.
-    // The accumulator is deliberately NOT reset here: once the swing ends
-    // the natural throttle resumes its own rhythm, and the one extra due
-    // tick it may produce right after is a no-op (all memos fresh, all
-    // voices staged as skip).
-    //
-    // Review finding F5: the override is a no-op while pathing is
-    // inoperative (disabled, no probe batch, or no simulator) —
-    // mDoorGenLastSignalGen can never advance in that state, so without
-    // this gate a single door bump latched the override permanently and
-    // forced every subsequent loopStep due. The gate mirrors the
-    // operative subset of pathingWillSignal / wantPathing; if pathing
-    // comes online later, committed-vs-signaled gen still differ and the
-    // override resumes naturally.
-    if (!mPathingDueThisStep
-        && mPathingProbeBatchAdded && mProbePathingEnabled
-        && mPathingSim != nullptr
-        && mDoorGenCommitted != mDoorGenLastSignalGen) {
-        mPathingDueThisStep = true;
-    }
+    // Door-event route updates ride the NATURAL pathing throttle: a door
+    // open/close event bumps mDoorAcousticGen (notifyDoorAcousticEvent) and
+    // the next due tick (<= pathing_update_interval) re-solves to pick up the
+    // new route set. No prompt "re-solve this frame" override is needed — the
+    // zero-lag pathRouteGate already carries the audible door transition
+    // (volume + route switch), so a prompt solve would only refresh the routed
+    // eqCoeffs (tone) up to one interval sooner, which the gate makes
+    // imperceptible. Dropping that override also stops back-to-back swing
+    // solves from competing with the BVH scene commit.
 
     // Always clean up finished voices (defers IPL removal if sim busy)
     cleanupFinishedVoices();
@@ -10647,14 +10616,12 @@ void AudioService::loopStep(float deltaTime)
                 // iteration. We skip signal() entirely in this branch
                 // (see gateNotBusy above for the race we're avoiding);
                 // eqCoeffs hold one extra interval until the worker idles
-                // and the next due frame signals it. Gated on the NATURAL
-                // due flag — the O2a door due-override intentionally
-                // latches due on every frame of a swing while the worker
-                // grinds back-to-back solves, and counting those as lag
-                // would flood the diagnostic with by-design occurrences.
+                // and the next due frame signals it. Gated on the throttle's
+                // due flag so it only counts genuine "cadence elapsed while
+                // the worker was busy" cases.
                 // Rate-limited (first 16 + every 64th thereafter).
                 if (gateProbeBatch && gateEnable
-                    && pathingDueNaturalThisStep && pathBusy) {
+                    && mPathingDueThisStep && pathBusy) {
                     static std::atomic<int> sPathingLagCount{0};
                     int lc = sPathingLagCount.fetch_add(1, std::memory_order_relaxed);
                     if (lc < 16 || (lc % 64) == 0) {
@@ -10686,13 +10653,7 @@ void AudioService::loopStep(float deltaTime)
                     //     for a pass that actually staged into an iteration.
                     mPathingSim->setFirstSolveStagger(firstSolveDeferred,
                                                       firstSolveBacklog);
-                    // (b) Record the committed door gen this signaled
-                    //     solve covers (staging keyed its memos to the
-                    //     same stagingDoorGen snapshot). Consumed by the
-                    //     epoch FIFO push in setDoorTransform and the
-                    //     door due-override at the top of loopStep.
-                    mDoorGenLastSignalGen = stagingDoorGen;
-                    // (c) Arm [DOOR_ROUTE_LATENCY] completion tracking if
+                    // (b) Arm [DOOR_ROUTE_LATENCY] completion tracking if
                     //     an uncovered door epoch exists and this solve's
                     //     covered gen reaches it. Signals never overlap
                     //     (gateNotBusy) and the completion detector at

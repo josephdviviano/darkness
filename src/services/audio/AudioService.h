@@ -1956,13 +1956,6 @@ private:
     /// [DOOR_ROUTE_LATENCY] instead of being silently excluded.
     uint64_t mDoorGenCommitted = 0;
 
-    /// Committed-gen snapshot taken at the most recent pathing-worker
-    /// signal(). Consumer: the pathing throttle's door-override
-    /// (re-solve continuously while doors move) fires while
-    /// mDoorGenCommitted != this. (The epoch FIFO below no longer keys
-    /// on it — latest-gen-wins pushes one epoch per bump.)
-    uint64_t mDoorGenLastSignalGen = 0;
-
     /// [DOOR_ROUTE_LATENCY] epoch FIFO — latest-gen-wins (stacking fix,
     /// PLAN.PATHING_DESIGN.md §11). One entry PER door-gen bump while
     /// pathing is operative. A completed covering solve retires ALL
