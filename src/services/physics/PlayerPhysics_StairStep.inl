@@ -1,18 +1,18 @@
 // Included inside PlayerPhysics class body — do not include standalone.
 //
-// Stair stepping — replicates the original Dark Engine's CheckStep + post-collision update
+// Stair stepping — replicates the original Dark Engine's step check + post-collision update
 // pipeline exactly. Called DURING resolveCollisions() when a leg-level wall contact is
 // detected. On success, replaces the normal bounce response (caller does `continue`).
 //
 // Original engine flow:
 //   1. Detect leg wall contact (normal.z < 0.4) during collision resolution
-//   2. CheckStep: 3-phase raycast (UP→FWD→DOWN), validate BODY sphere, apply position
+//   2. The step check: 3-phase raycast (UP→FWD→DOWN), validate BODY sphere, apply position
 //   3. Post-collision update: re-run physics pipeline for remaining frame time
 //      (zero accel → rebuild constraints → controls → dynamics → integrate → re-collide)
 //   4. Return from collision (skip bounce response)
 
     /// Try to step up from contacts in the current collision iteration.
-    /// Matches original Dark Engine CheckStep exactly:
+    /// Matches the original Dark Engine step check exactly:
     /// - Trigger: leg contact with fabs(normal.z) < 0.4 (no directional filter)
     /// - UP ray: 2 units, avatar ignores ceiling
     /// - FWD ray: velocity * 0.01
@@ -27,7 +27,7 @@
     {
         // Movement direction from actual velocity at collision time.
         // Original engine: pModel->GetVelocity(subModId) — the
-        // full 3D velocity vector, scaled by 0.01 for the forward probe (line 5371).
+        // full 3D velocity vector, scaled by 0.01 for the forward probe.
         // The original does NOT zero the Z component — on slopes, the probe tilts.
         // We use mVelocity directly, matching the original. The speed magnitude
         // determines probe distance; the normalized direction determines probe angle.
@@ -172,12 +172,12 @@
         // Original engine loops over each submodel, checking each sphere type.
         // Spring-connected submodels (HEAD, index 0) are validated at their CURRENT
         // position (not the stepped position), because the original sets:
-        //   if (GetSpringTension(i) > 0) SetEndLocationVec(i, GetLocationVec(i));
+        //   if (springTension[i] > 0) endPos[i] = pos[i];
         // This means HEAD trivially passes (it's already at its current position).
         // Only non-spring spheres (BODY) are validated at the stepped position.
         // Point detectors (SHIN/KNEE/FOOT, radius 0.0) are skipped (no volume).
         // Use backupPos as the base for the stepped position, matching the original
-        // engine where CheckStep runs from the backed-up collision point.
+        // engine where the step check runs from the backed-up collision point.
         Vector3 steppedPos = backupPos;
         steppedPos.z += zDelta;
 
@@ -297,7 +297,7 @@
         // ── Post-collision update: re-integrate for remaining frame time ──
         // Original engine re-runs the full physics pipeline after a step:
         //   ZeroAcceleration → ClearConstraints → terrain/object-constraint steps →
-        //   UpdateModelControls → UpdateModelDynamics → UpdateModel → Re-collide
+        //   the model-controls update → the model-dynamics update → the model update → Re-collide
         // This is critical for smooth stepping: the player immediately gets real
         // floor contacts, velocity from gravity+friction, and forward movement.
         if (remainingDt > 0.0001f) {
@@ -333,12 +333,12 @@
         }
 
         // 2. Apply gravity for remaining time.
-        //    Original: UpdateModelDynamics applies gravity (line 4142).
+        //    Original: the model-dynamics update applies gravity.
         //    Use the partial dt, not the full frame timestep.
         mVelocity.z -= mGravityMag * dt;
 
         // 3. Apply movement control for remaining time.
-        //    Original: UpdateModelControls (line 4141) applies player input.
+        //    Original: the model-controls update applies player input.
         //    Override the dt used by applyMovement so it uses the partial
         //    remaining time, not the full frame timestep.
         float savedFixedDt = mTimestep.fixedDt;
@@ -356,9 +356,9 @@
         }
 
         // 5. Compute target position (endLocation) WITHOUT advancing mPosition.
-        //    Matches original: UpdateModel → UpdateTargetLocation computes
-        //    EndLocationVec = LocationVec + velocity * dt.
-        //    Position (LocationVec) does NOT advance until after collision detection.
+        //    Matches original: the model update → the target-location update computes
+        //    the end-position vector = the position vector + velocity * dt.
+        //    Position (the position vector) does NOT advance until after collision detection.
         Vector3 endLocation = mPosition + mVelocity * dt;
 
         if (mStepLog) {
@@ -371,8 +371,8 @@
         if (endCell < 0) endCell = mCellIdx;
 
         // 7. Re-run collision detection: sweep from mPosition → endLocation.
-        //    Original: CheckModelTerrainCollisions sweeps LocationVec → EndLocationVec
-        //    (line 4150). With small remaining dt, this sweep is short — the foot
+        //    Original: the model-terrain collision sweep runs current → end position
+        //. With small remaining dt, this sweep is short — the foot
         //    barely moves, so it doesn't reach the next riser. This naturally
         //    prevents phantom cascade steps.
         mIterContacts.clear();
@@ -456,11 +456,12 @@
         }
 
         // 8. Commit position to endLocation BEFORE cascade processing.
-        //    In the original, UpdateModel already advanced LocationVec to the
+        //    In the original, the model update already advanced the position vector to the
         //    endLocation equivalent. When the integrate-to-collision step runs for a cascade
         //    collision, model_time = frame end → integration_time = 0 → no backup.
-        //    CheckStep uses the current LocationVec (= endLocation). We must
-        //    commit mPosition here so cascade CheckStep sees the advanced position.
+        //    the step check uses the current, already-advanced position
+        //    (= endLocation). We must commit mPosition here so the cascade
+        //    step check sees the advanced position.
         mPosition = endLocation;
         mModelTime += dt;
         {
@@ -469,8 +470,8 @@
         }
 
         // 8b. Cascade collision processing.
-        //     Original: CheckModelTerrainCollisions queues new collisions,
-        //     ResolveCollisions processes them. We check inline for riser contacts.
+        //     Original: the model-terrain collision sweep queues new collisions,
+        //     collision-resolution step processes them. We check inline for riser contacts.
         if (!mIterContacts.empty()) {
             float earliestRiserTime = 2.0f;
             int bestRiserIdx = -1;
@@ -518,8 +519,8 @@
                 if (integrationTime <= 0.0f) {
                     // Model already at or past collision point — use current position.
                     // Matches original: the integrate-to-collision step returns immediately when
-                    // integration_time <= 0 (line 5117). CheckStep uses the current
-                    // LocationVec which is the fully-advanced position.
+                    // integration_time <= 0. The step check uses the current
+                    // the position vector which is the fully-advanced position.
                     cascadeBackup = mPosition;
                 } else if (rc.submodelIdx >= 2) {
                     float footOff = mSphereOffsetsBase[rc.submodelIdx];

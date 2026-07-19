@@ -79,9 +79,9 @@ struct SphereContact {
     bool isEdge = false;   // true = edge/vertex contact, false = face contact.
                            // The original engine classifies contacts as TerrainFace,
                            // TerrainEdge, or TerrainVertex. Only TerrainFace triggers
-                           // stair stepping (CheckStep uses == kPC_TerrainFace).
+                           // stair stepping (the step check uses == the terrain-face contact class).
     float time = -1.0f;   // collision time along the sweep [0,1], or -1 for static contacts.
-                           // Matches original engine's sSphrContact.time.
+                           // Matches original engine's the sphere-contact record.time.
                            // 0 = contact at sweep start, 1 = contact at sweep end.
                            // Used for time-ordered collision processing.
     Vector3 hitPoint{0.0f}; // collision hit location (world space). For point submodels:
@@ -360,7 +360,7 @@ public:
                 continue;
 
             // Generate contact with collision time and end-position penetration.
-            // Original engine stores contact time (sSphrContact.time) and backs up
+            // Original engine stores contact time (the sphere-contact record.time) and backs up
             // to the collision point — no inflated penetration needed.
             SphereContact contact;
             contact.normal = plane.normal;
@@ -452,9 +452,9 @@ private:
                 contact.cellIdx = cellIdx;
                 contact.polyIdx = pi;
                 contact.textureIdx = textureIdx;
-                contact.isEdge = true;  // edge contact (kPC_TerrainEdge equivalent)
+                contact.isEdge = true;  // edge contact (the terrain-edge contact class equivalent)
                 contact.hitPoint = closest; // closest point on edge
-                contact.edgeStart = a;      // store endpoints for GetDist validation
+                contact.edgeStart = a;      // store endpoints for distance test validation
                 contact.edgeEnd = b;
                 outContacts.push_back(contact);
             }
@@ -523,9 +523,9 @@ private:
                 contact.cellIdx = cellIdx;
                 contact.polyIdx = pi;
                 contact.textureIdx = textureIdx;
-                contact.isEdge = true;  // edge contact (kPC_TerrainEdge equivalent)
+                contact.isEdge = true;  // edge contact (the terrain-edge contact class equivalent)
                 contact.hitPoint = closest; // closest point on edge
-                contact.edgeStart = a;      // store endpoints for GetDist validation
+                contact.edgeStart = a;      // store endpoints for distance test validation
                 contact.edgeEnd = b;
                 outContacts.push_back(contact);
             }
