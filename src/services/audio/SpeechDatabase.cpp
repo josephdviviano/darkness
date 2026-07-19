@@ -76,7 +76,7 @@ constexpr int32_t kMaxNameMapSize    = 100000;
 constexpr int32_t kMaxVoices         = 1024;
 constexpr size_t  kMaxTraversalDepth = 64;
 
-// Decode a single cNameMap. The disk shape is documented in the header.
+// Decode a single name map. The disk shape is documented in the header.
 // Length-prefixed array of 17-byte records (tag byte + optional 16-byte
 // fixed name). Empty slots are written as a single '-' byte.
 bool decodeNameMap(LeReader &r, std::vector<std::string> &out) {
@@ -176,7 +176,7 @@ bool SpeechDatabase::loadFromChunk(const uint8_t *data, size_t size) {
 
     LeReader r{data, size, 0, true};
 
-    // ------ cSpeechDomain ------
+    // ------ speech domain ------
     if (!decodeNameMap(r, mConcepts)) {
         mTail.assign(data + r.pos, data + size);
         return false;

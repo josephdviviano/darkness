@@ -114,7 +114,7 @@ constexpr float kOBBEdgeShrink = 0.999f;
 /// Maximum number of constraint normals the solver can handle per frame.
 constexpr int kMaxConstraints = 12;
 
-// ── P$CollisionType bitfield flags (from COLLPROP.H) ──
+// ── P$CollisionType bitfield flags (from the original engine) ──
 // Objects without COLLISION_BOUNCE or COLLISION_NORESULT are completely passable.
 constexpr uint32_t COLLISION_NONE     = 0x00;
 constexpr uint32_t COLLISION_BOUNCE   = 0x01;  // object physically bounces on collision
@@ -610,15 +610,15 @@ public:
             // Defaulting to OBB for objects without it would create
             // collision bodies for visual-only decorations (room pieces, terrain, etc.).
             //
-            // IMPORTANT: P$PhysType stores the ON-DISK property enum (eModelType
-            // from PHPROPS.H / physmodeltype from t2-types.dtype), NOT the internal
-            // physics engine enum (ePhysModelType from PHMOD.H). The engine converts
-            // between them in PHPROP.CPP when saving.
+            // IMPORTANT: P$PhysType stores the ON-DISK property enum (physmodeltype
+            // from t2-types.dtype), NOT the internal physics-engine enum used by
+            // the original engine at runtime. The original converts between the two
+            // when saving.
             //
             // On-disk enum (physmodeltype):
             //   0 = BoundingBox (OBB), 1 = Sphere, 2 = SphereHat, 3 = None
             //
-            // Internal enum (ePhysModelType, NOT stored on disk):
+            // Internal enum (NOT stored on disk):
             //   0 = Sphere, 1 = BSP, 2 = Point, 3 = OBB, 4 = SphereHat
             CollisionShapeType shapeType = CollisionShapeType::OBB;
             bool hasPhysType = false;
@@ -657,7 +657,7 @@ public:
                     //
                     // Static objects with remove_on_sleep=TRUE
                     // go to sleep immediately at level start (zero velocity, no forces),
-                    // which triggers PhysDeregisterModel() — completely destroying the
+                    // which triggers model deregistration — completely destroying the
                     // physics model. The object remains visual but has no collision.
                     //
                     // For Phase 2 (static objects only, no dynamic simulation),
@@ -774,9 +774,9 @@ public:
                 // Check P$PhysDims for explicit size override (OBB only —
                 // SphereHat objects don't carry .size data on disk; we
                 // always use bbox*scale for them).
-                // each concrete object gets its own copy. InitPhysProperty writes the model
-                // bbox * scale into PhysDims.size, and UpdatePhysModel then applies
-                // PhysDims.size as the final edge lengths (overriding the 0.999 shrink).
+                // each concrete object gets its own copy. The original property-init step
+                // writes the model bbox * scale into PhysDims.size, and the model-update
+                // step then applies PhysDims.size as the final edge lengths (overriding the 0.999 shrink).
                 //
                 // PhysDims.size values ALREADY INCLUDE the object's scale — they are
                 // the FINAL edge lengths, not unscaled dimensions. Do NOT multiply by

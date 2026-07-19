@@ -3,7 +3,7 @@
     /// Pre-constrain velocity against per-frame constraints (rebuilt from validated contacts
     /// by validateContacts()). Removes velocity components going into known surfaces,
     /// preventing the body from moving into walls/floor and needing to be pushed back out.
-    /// Matches original Dark Engine's ApplyConstraints (PHMOD.CPP lines 1053-1118).
+    /// Matches original Dark Engine's ApplyConstraints.
     inline void constrainVelocity() {
         if (mConstraints.empty()) return;
 
@@ -24,8 +24,8 @@
         }
 
         // Collect constraint normals from mConstraints (built by validateContacts).
-        // Matches original PhysConstrain (PHUTILS.CPP lines 147-154): extracts
-        // direction vectors from tConstraint list for PhysRemNormComp.
+        // Matches the original constraint solve: extracts
+        // direction vectors from the constraint list for normal-component removal.
         static constexpr int MAX_CONSTRAINTS = 12;
         Vector3 constraintBuf[MAX_CONSTRAINTS];
         int constraintCount = 0;
@@ -41,7 +41,7 @@
                 constraintBuf[constraintCount++] = con.normal;
         }
 
-        // PhysRemNormComp — faithful reimplementation (PHUTILS.CPP lines 26-113).
+        // Normal-component removal — faithful reimplementation.
         // Removes velocity components going into constrained surfaces.
         //
         // The original ALWAYS routes through the N-constraint solver for 2+ constraints.
@@ -94,7 +94,7 @@
             }
 
             // Step 3: Sequential single-constraint pass (lines 84-88).
-            // Each violated constraint is removed individually via PhysRemNormComp.
+            // Each violated constraint is removed individually via normal-component removal.
             for (int i = 0; i < constraintCount; ++i) {
                 float vn = glm::dot(mVelocity, constraintBuf[i]);
                 if (vn < 0.0f)
@@ -116,7 +116,7 @@
     }
 
     /// Two-constraint removal — crease/wedge slide.
-    /// Matches original PhysRemNormComp 2-vector overload (PHUTILS.CPP lines 124-143).
+    /// Matches the original normal-component removal 2-vector overload.
     inline void applyTwoConstraints(const Vector3 &n0, const Vector3 &n1) {
         Vector3 edge = glm::cross(n0, n1);
         float edgeLenSq = glm::dot(edge, edge);
@@ -289,13 +289,13 @@
                 size_t contactsBefore = mIterContacts.size();
 
                 // ── Collision dispatch by submodel type ──
-                // Matches original Dark Engine (PHMODSPH.CPP lines 132-282):
+                // Matches original Dark Engine:
                 // - Sphere submodels (HEAD/BODY, radius > 0): SphrSpherecastStatic
                 //   (swept sphere from old→new + static overlap)
                 // - Point submodels (SHIN/KNEE/FOOT, radius = 0): PortalRaycast
                 //   (line-segment raycast from old→new position)
                 //
-                // The original's point submodel collision (PHMODSPH.CPP line 174-240)
+                // The original's point submodel collision
                 // uses PortalRaycast to detect polygon crossings. On hit, it creates
                 // a kPC_TerrainFace collision event with the crossing time. This is how
                 // stair riser contacts are detected for CheckStep triggering.
@@ -363,7 +363,7 @@
 
                 } else {
                     // ── Point path (SHIN/KNEE/FOOT): PortalRaycast ──
-                    // Matches original PHMODSPH.CPP lines 174-240: point-type submodels
+                    // Matches the original engine: point-type submodels
                     // use PortalRaycast (line-segment old→new) instead of sphere sweep.
                     // On hit, creates a kPC_TerrainFace collision with crossing time.
                     // This is how stair riser contacts are generated for CheckStep.
@@ -386,7 +386,7 @@
                         contact.textureIdx = pointHit.textureIndex;
                         contact.time = hitTime;
                         contact.isEdge = false;  // face contact (kPC_TerrainFace)
-                        contact.hitPoint = pointHit.point;  // store for IntegrateToCollision
+                        contact.hitPoint = pointHit.point;  // store for the integrate-to-collision step
                         mIterContacts.push_back(contact);
                     }
                 }
@@ -427,15 +427,15 @@
                 break; // No contacts — done
 
             // ── Stair stepping via time-ordered collision processing ──
-            // Matches original Dark Engine: ResolveCollisions (phcore.cpp lines 6276-6305)
-            // finds the earliest collision, calls IntegrateToCollision to back up the
+            // Matches original Dark Engine: ResolveCollisions
+            // finds the earliest collision, calls the integrate-to-collision step to back up the
             // model to the collision point (90% along trajectory), then CheckStep.
             //
             // Find the earliest leg-level riser contact with a valid collision time.
             // The swept test stores time ∈ [0,1] for contacts detected during the
             // sweep from mPrevPosition → mPosition.
             {   // No ground-state prerequisite for stair stepping — match original
-                // engine (phcore.cpp line 6134). Original checks ONLY: terrain face,
+                // engine. Original checks ONLY: terrain face,
                 // steep normal (fabs(z) < 0.4), leg submodel (foot/shin/knee).
                 // NO isOnGround() guard. CheckStep's own validation (3-phase raycast
                 // + BODY sphere check) rejects invalid steps.
@@ -491,7 +491,7 @@
                     // Static contacts (time < 0) use fallback timing.
                     float t = c.time;
                     if (t < 0.0f) t = 0.5f;  // static contact: estimate mid-frame
-                    // No startDist filter — matches original engine (PHCORE.CPP line 6134).
+                    // No startDist filter — matches the original engine.
                     // Any swept riser collision triggers CheckStep regardless of whether
                     // the foot starts behind or at the riser plane. CheckStep's own
                     // 3-phase raycast + sphere validation handles rejection.
@@ -503,20 +503,19 @@
 
                 if (bestContactIdx >= 0) {
                     // Compute remaining frame time from collision time.
-                    // Original: PostCollisionUpdate receives dt - pClsn->GetTime()
-                    // (phcore.cpp line 6143).
+                    // Original: the post-collision update receives dt - pClsn->GetTime().
                     float collisionTimeFrac = std::clamp(earliestTime, 0.0f, 1.0f);
                     float collisionTime = mTimestep.fixedDt * collisionTimeFrac;
                     float remainingDt = mTimestep.fixedDt - collisionTime;
                     remainingDt = std::max(remainingDt, 0.0001f);
 
                     // Track model time — matches original's SetCurrentTime(t0 + dt)
-                    // in IntegrateToCollision (PHCORE.CPP line 5170). This prevents
+                    // in the integrate-to-collision step. This prevents
                     // double-integration in cascade collisions.
                     mModelTime = collisionTime;
 
-                    // IntegrateToCollision: compute the collision backup position.
-                    // Original (PHCORE.CPP lines 5087-5201) has TWO paths:
+                    // Integrate-to-collision step: compute the collision backup position.
+                    // Original engine has TWO paths:
                     //   - POINT submodels (line 5145): use hit location directly
                     //       new_pos = currentPos + (hitLoc - currentPos) * 0.9
                     //   - SPHERE submodels (line 5120): use velocity integration
@@ -526,7 +525,7 @@
                     Vector3 backupPos;
                     if (bestContact.submodelIdx >= 2) {
                         // Point submodel (SHIN/KNEE/FOOT): backup toward hit location.
-                        // Original uses double-precision (PHCORE.CPP line 5145-5151):
+                        // Original uses double-precision:
                         //   movement = (hitLoc - GetLocationVec(i)) * integration_backup
                         //   new_pos = GetLocationVec(i) + movement
                         float footOffsetZ = mSphereOffsetsBase[bestContact.submodelIdx];
@@ -543,20 +542,20 @@
                     bool stepped = tryStairStepFromContacts(mIterContacts, remainingDt, backupPos);
                     if (stepped) {
                         // Step succeeded + re-integration done — skip push-out.
-                        // Matches original: PostCollisionUpdate called, collision consumed.
+                        // Matches original: post-collision update called, collision consumed.
                         break;
                     }
 
                     // ResolveBounce: when CheckStep fails, reflect velocity off the riser.
-                    // Matches original Dark Engine flow (phcore.cpp lines 6199-6262):
+                    // Matches original Dark Engine flow:
                     //   1. CheckTerrainContact — if low velocity, create persistent contact
                     //   2. BounceObject — reflect velocity off surface
-                    //   3. PostCollisionUpdate — re-integrate for remaining time
+                    //   3. Post-collision update — re-integrate for remaining time
                     {
                         const auto &riserContact = mIterContacts[bestContactIdx];
                         float dp = glm::dot(mVelocity, riserContact.normal);
 
-                        // CheckTerrainContact (phcore.cpp lines 4305-4378):
+                        // CheckTerrainContact:
                         // Original: dp = dot(vel, normal) * elasticity; if |dp| < 5.0.
                         // This means |dot| * elasticity < 5.0, i.e. |dot| < 5.0 / elasticity.
                         // Higher elasticity → lower threshold → fewer sticking contacts.
@@ -569,7 +568,7 @@
                             mFreshContacts.push_back(stickContact);
                         }
 
-                        // BounceObject (phcore.cpp lines 4211-4248):
+                        // BounceObject:
                         // dp = dot(velocity, normal); if (dp < 0) vel -= normal * dp * (1 + dampen)
                         if (dp < 0.0f) {
                             float dampen = mElasticity * kTerrainBounce;
@@ -582,8 +581,7 @@
                             }
                         }
 
-                        // PostCollisionUpdate: re-run physics pipeline for remaining time
-                        // (phcore.cpp lines 6254-6260).
+                        // Post-collision update: re-run physics pipeline for remaining time.
                         if (remainingDt > 0.0001f) {
                             postStepReIntegrate(remainingDt);
                         }
@@ -717,7 +715,7 @@
         }
 
         // ── move_backup: pull position back along movement direction ──
-        // Matches original UpdatePositions (PHCORE.CPP lines 6437-6455): after all
+        // Matches original UpdatePositions: after all
         // collision resolution is complete, pull the final position back by
         // min(0.01, moveLen) along the movement direction. This keeps the next
         // frame's spherecaster epsilon happy — prevents landing exactly on a polygon
@@ -745,8 +743,8 @@
 
         // ── Merge fresh contacts into mContacts ──
         // Matches original Dark Engine: contacts are created during collision
-        // resolution (CheckTerrainContact, phcore.cpp lines 4305-4378) and
-        // persist until explicitly destroyed by ConstrainFromTerrain validation.
+        // resolution (CheckTerrainContact) and
+        // persist until explicitly destroyed by the terrain-constraint step's validation.
         // No age-based persistence — contacts are validated each frame.
         //
         // Deduplicate by (cellIdx, polyIdx): if a fresh contact matches an
