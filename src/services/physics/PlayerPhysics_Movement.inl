@@ -23,7 +23,7 @@
 
         // Original engine: gravity added to sum_forces.
         // When in water, ALL forces halved first (line 1413: sum_forces *= 0.5).
-        // Then buoyancy added (line 1424-1427).
+        // Then buoyancy added.
         float gravForce = mGravityMag;
         float buoyForce = 0.0f;
         if (isInWater()) {
@@ -160,10 +160,10 @@
         return 0.0f;
     }
 
-    /// Apply movement — matches the original transform-dynamics update + ControlVelocity.
+    /// Apply movement — matches the original transform-dynamics update + velocity-control step.
     ///
     /// Original flow:
-    ///   1. ControlVelocity() computes ctrl_accel = (desired - current) * rate
+    ///   1. The velocity-control step computes ctrl_accel = (desired - current) * rate
     ///   2. ctrl_accel added to sum_forces (acceleration accumulator)
     ///   3. Gravity added to sum_forces
     ///   4. ideal_velocity = velocity + (sum_forces / mass) * dt
@@ -626,7 +626,7 @@
                 float subRadius = mSphereRadii[subIdx];
                 float edgeDist;
                 if (glm::length2(c.edgeStart) > 1e-6f || glm::length2(c.edgeEnd) > 1e-6f) {
-                    // Proper closest-point-on-segment distance (original GetDist formula)
+                    // Proper closest-point-on-segment distance (original distance test formula)
                     Vector3 v1c = subPos - c.edgeStart;
                     Vector3 v2c = subPos - c.edgeEnd;
                     Vector3 edgeVec = c.edgeStart - c.edgeEnd;
@@ -764,7 +764,7 @@
     /// (original engine, "nasty hack to try to avoid epsilon issues").
     /// Used ONLY in the integrate-to-collision step (backing up to collision point) and
     /// the Integrate() collision-context function (lines 5018/5035). NOT used
-    /// in normal position integration — UpdateTargetLocation
+    /// in normal position integration — the target-location update
     /// uses pure position = position + velocity * dt.
     static constexpr float kPartialBackupAmt = 0.9f;
 
@@ -773,7 +773,7 @@
     /// Player default elasticity = 1.0, so dampen = 0.1 (10% energy return on bounce).
     static constexpr float kTerrainBounce = 0.1f;
 
-    /// Integrate position from velocity. Matches original UpdateTargetLocation:
+    /// Integrate position from velocity. Matches original the target-location update:
     /// position = position + velocity * dt.
     /// No backup factor — kPartialBackupAmt is only for collision backup contexts.
     inline void integrate() {

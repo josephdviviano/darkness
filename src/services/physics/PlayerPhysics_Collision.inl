@@ -51,13 +51,13 @@
         // combination where velocity only violates one surface must apply single removal,
         // not crease projection (which would lock movement to the floor/wall edge).
         if (constraintCount == 1) {
-            // Single constraint: remove component along normal (lines 115-122).
+            // Single constraint: remove component along normal.
             float vn = glm::dot(mVelocity, constraintBuf[0]);
             if (vn < 0.0f)
                 mVelocity -= constraintBuf[0] * vn;
 
         } else if (constraintCount >= 2) {
-            // N-constraint solver (lines 26-113): filter, test 2-pairs, sequential fallback.
+            // N-constraint solver: filter, test 2-pairs, sequential fallback.
             Vector3 origVel = mVelocity;
 
             // Step 1: Find which constraints are actually violated (dot <= 0).
@@ -72,7 +72,7 @@
                 }
             }
 
-            // Step 2: If exactly 2 violated, test if one alone suffices (lines 63-81).
+            // Step 2: If exactly 2 violated, test if one alone suffices.
             if (realCount == 2) {
                 Vector3 testVel = mVelocity;
                 // Try removing constraint 1 only
@@ -87,13 +87,13 @@
                     if (glm::dot(testVel, constraintBuf[realIdx1]) <= 0.0f) {
                         // Neither alone suffices — apply both via crease slide
                         applyTwoConstraints(constraintBuf[realIdx1], constraintBuf[realIdx2]);
-                        return; // original returns here (line 78)
+                        return; // original returns here
                     }
                 }
                 // Fall through: one constraint sufficed, apply all individually below
             }
 
-            // Step 3: Sequential single-constraint pass (lines 84-88).
+            // Step 3: Sequential single-constraint pass.
             // Each violated constraint is removed individually via normal-component removal.
             for (int i = 0; i < constraintCount; ++i) {
                 float vn = glm::dot(mVelocity, constraintBuf[i]);
@@ -101,11 +101,11 @@
                     mVelocity -= constraintBuf[i] * vn;
             }
 
-            // Step 4: Backward check (lines 94-101).
+            // Step 4: Backward check.
             if (glm::dot(mVelocity, origVel) < 0.0f)
                 mVelocity = Vector3(0.0f);
 
-            // Step 5: Final validation — ensure no constraint still violated (lines 104-112).
+            // Step 5: Final validation — ensure no constraint still violated.
             for (int i = 0; i < constraintCount; ++i) {
                 if (glm::dot(mVelocity, constraintBuf[i]) < -0.0001f) {
                     mVelocity = Vector3(0.0f);
@@ -124,7 +124,7 @@
             edge /= std::sqrt(edgeLenSq);
             mVelocity = edge * glm::dot(mVelocity, edge);
         } else {
-            // Parallel normals — apply both constraints separately (lines 134-135).
+            // Parallel normals — apply both constraints separately.
             float vn0 = glm::dot(mVelocity, n0);
             if (vn0 < 0.0f) mVelocity -= n0 * vn0;
             float vn1 = glm::dot(mVelocity, n1);
@@ -153,7 +153,7 @@
         // at the wall surface while the body is unaffected.
         mHeadClamp = Vector3(0.0f);
 
-        // ── UpdatePositions: commit end position ──
+        // ── position-integration step: commit end position ──
         // Advance mPosition to the intended end position. The iterative push-out
         // loop will adjust from here if there are penetrations.
         mPosition = mEndPosition;
@@ -292,13 +292,13 @@
                 // Matches original Dark Engine:
                 // - Sphere submodels (HEAD/BODY, radius > 0): SphrSpherecastStatic
                 //   (swept sphere from old→new + static overlap)
-                // - Point submodels (SHIN/KNEE/FOOT, radius = 0): PortalRaycast
+                // - Point submodels (SHIN/KNEE/FOOT, radius = 0): the cell-portal raycast
                 //   (line-segment raycast from old→new position)
                 //
                 // The original's point submodel collision
-                // uses PortalRaycast to detect polygon crossings. On hit, it creates
-                // a kPC_TerrainFace collision event with the crossing time. This is how
-                // stair riser contacts are detected for CheckStep triggering.
+                // uses the cell-portal raycast to detect polygon crossings. On hit, it creates
+                // a the terrain-face contact class collision event with the crossing time. This is how
+                // stair riser contacts are detected for the step check triggering.
 
                 if (sphereR > 0.001f) {
                     // ── Sphere path (HEAD/BODY): static + swept sphere tests ──
@@ -362,11 +362,11 @@
                     }
 
                 } else {
-                    // ── Point path (SHIN/KNEE/FOOT): PortalRaycast ──
+                    // ── Point path (SHIN/KNEE/FOOT): the cell-portal raycast ──
                     // Matches the original engine: point-type submodels
-                    // use PortalRaycast (line-segment old→new) instead of sphere sweep.
-                    // On hit, creates a kPC_TerrainFace collision with crossing time.
-                    // This is how stair riser contacts are generated for CheckStep.
+                    // use the cell-portal raycast (line-segment old→new) instead of sphere sweep.
+                    // On hit, creates a the terrain-face contact class collision with crossing time.
+                    // This is how stair riser contacts are generated for the step check.
                     RayHit pointHit;
                     if (raycastWorld(mCollision.getWR(), oldSphereCenter, sphereCenter, pointHit)) {
                         // Compute parametric collision time [0,1]
@@ -385,7 +385,7 @@
                         contact.polyIdx = pointHit.polyIdx;
                         contact.textureIdx = pointHit.textureIndex;
                         contact.time = hitTime;
-                        contact.isEdge = false;  // face contact (kPC_TerrainFace)
+                        contact.isEdge = false;  // face contact (the terrain-face contact class)
                         contact.hitPoint = pointHit.point;  // store for the integrate-to-collision step
                         mIterContacts.push_back(contact);
                     }
@@ -427,9 +427,9 @@
                 break; // No contacts — done
 
             // ── Stair stepping via time-ordered collision processing ──
-            // Matches original Dark Engine: ResolveCollisions
+            // Matches original Dark Engine: collision-resolution step
             // finds the earliest collision, calls the integrate-to-collision step to back up the
-            // model to the collision point (90% along trajectory), then CheckStep.
+            // model to the collision point (90% along trajectory), then the step check.
             //
             // Find the earliest leg-level riser contact with a valid collision time.
             // The swept test stores time ∈ [0,1] for contacts detected during the
@@ -437,7 +437,7 @@
             {   // No ground-state prerequisite for stair stepping — match original
                 // engine. Original checks ONLY: terrain face,
                 // steep normal (fabs(z) < 0.4), leg submodel (foot/shin/knee).
-                // NO isOnGround() guard. CheckStep's own validation (3-phase raycast
+                // NO isOnGround() guard. The step check's own validation (3-phase raycast
                 // + BODY sphere check) rejects invalid steps.
 
                 // ── Diagnostic: dump all 5 submodel positions, velocity, contacts ──
@@ -486,14 +486,14 @@
                     const auto &c = mIterContacts[ci];
                     if (c.submodelIdx < 2) continue;          // only SHIN/KNEE/FOOT
                     if (std::fabs(c.normal.z) >= STEP_WALL_THRESHOLD) continue;
-                    if (c.isEdge) continue;  // face contacts only (kPC_TerrainFace)
+                    if (c.isEdge) continue;  // face contacts only (the terrain-face contact class)
                     // Prefer swept contacts (time >= 0) — they have accurate timing.
                     // Static contacts (time < 0) use fallback timing.
                     float t = c.time;
                     if (t < 0.0f) t = 0.5f;  // static contact: estimate mid-frame
                     // No startDist filter — matches the original engine.
-                    // Any swept riser collision triggers CheckStep regardless of whether
-                    // the foot starts behind or at the riser plane. CheckStep's own
+                    // Any swept riser collision triggers the step check regardless of whether
+                    // the foot starts behind or at the riser plane. The step check's own
                     // 3-phase raycast + sphere validation handles rejection.
                     if (t < earliestTime) {
                         earliestTime = t;
@@ -516,18 +516,19 @@
 
                     // Integrate-to-collision step: compute the collision backup position.
                     // Original engine has TWO paths:
-                    //   - POINT submodels (line 5145): use hit location directly
+                    //   - POINT submodels: use hit location directly
                     //       new_pos = currentPos + (hitLoc - currentPos) * 0.9
-                    //   - SPHERE submodels (line 5120): use velocity integration
+                    //   - SPHERE submodels: use velocity integration
                     //       new_pos = currentPos + velocity * integration_time * 0.9
-                    // origPos is the LocationVec at frame start (before UpdatePositions).
+                    // origPos is the frame-start position (before the
+                    // position-integration step commits it).
                     const auto &bestContact = mIterContacts[bestContactIdx];
                     Vector3 backupPos;
                     if (bestContact.submodelIdx >= 2) {
                         // Point submodel (SHIN/KNEE/FOOT): backup toward hit location.
                         // Original uses double-precision:
-                        //   movement = (hitLoc - GetLocationVec(i)) * integration_backup
-                        //   new_pos = GetLocationVec(i) + movement
+                        //   movement = (hitLoc - pos[i]) * integration_backup
+                        //   new_pos = pos[i] + movement
                         float footOffsetZ = mSphereOffsetsBase[bestContact.submodelIdx];
                         Vector3 footPos = origPos + Vector3(0.0f, 0.0f, footOffsetZ);
                         Vector3 footBackup = footPos + (bestContact.hitPoint - footPos) * kPartialBackupAmt;
@@ -546,16 +547,16 @@
                         break;
                     }
 
-                    // ResolveBounce: when CheckStep fails, reflect velocity off the riser.
+                    // Bounce resolution: when the step check fails, reflect velocity off the riser.
                     // Matches original Dark Engine flow:
-                    //   1. CheckTerrainContact — if low velocity, create persistent contact
-                    //   2. BounceObject — reflect velocity off surface
+                    //   1. the terrain-contact check — if low velocity, create persistent contact
+                    //   2. the object-bounce step — reflect velocity off surface
                     //   3. Post-collision update — re-integrate for remaining time
                     {
                         const auto &riserContact = mIterContacts[bestContactIdx];
                         float dp = glm::dot(mVelocity, riserContact.normal);
 
-                        // CheckTerrainContact:
+                        // the terrain-contact check:
                         // Original: dp = dot(vel, normal) * elasticity; if |dp| < 5.0.
                         // This means |dot| * elasticity < 5.0, i.e. |dot| < 5.0 / elasticity.
                         // Higher elasticity → lower threshold → fewer sticking contacts.
@@ -568,7 +569,7 @@
                             mFreshContacts.push_back(stickContact);
                         }
 
-                        // BounceObject:
+                        // the object-bounce step:
                         // dp = dot(velocity, normal); if (dp < 0) vel -= normal * dp * (1 + dampen)
                         if (dp < 0.0f) {
                             float dampen = mElasticity * kTerrainBounce;
@@ -714,8 +715,8 @@
             }
         }
 
-        // ── move_backup: pull position back along movement direction ──
-        // Matches original UpdatePositions: after all
+        // ── move backup: pull position back along movement direction ──
+        // Matches the original's position-integration step: after all
         // collision resolution is complete, pull the final position back by
         // min(0.01, moveLen) along the movement direction. This keeps the next
         // frame's spherecaster epsilon happy — prevents landing exactly on a polygon
@@ -731,7 +732,7 @@
         }
 
         // Final validation — body center must still be in a valid cell.
-        // If move_backup pushed us outside, try mEndPosition (before backup).
+        // If the move-backup step pushed us outside, try mEndPosition (before backup).
         // Only reset to origPos as absolute last resort.
         if (mCollision.findCell(mPosition) < 0) {
             mPosition = mEndPosition;
@@ -743,7 +744,7 @@
 
         // ── Merge fresh contacts into mContacts ──
         // Matches original Dark Engine: contacts are created during collision
-        // resolution (CheckTerrainContact) and
+        // resolution (the terrain-contact check) and
         // persist until explicitly destroyed by the terrain-constraint step's validation.
         // No age-based persistence — contacts are validated each frame.
         //

@@ -818,10 +818,11 @@ private:
         updateHeadSpring();
 
         // 8. Compute end position WITHOUT moving mPosition.
-        //    Matches original: UpdateModel → UpdateTargetLocation →
-        //    UpdateEndLocation computes EndLocationVec = LocationVec + velocity*dt.
-        //    Position (LocationVec) does NOT advance until UpdatePositions at
-        //    frame end. Collision detection sweeps from LocationVec to EndLocationVec.
+        //    Matches the original's model-update flow: the target-location /
+        //    end-location updates compute endPos = pos + velocity*dt. The
+        //    position does NOT advance until the position-integration step at
+        //    frame end. Collision detection sweeps from the current to the
+        //    end position.
         mPrevPosition = mPosition;  // save for head spring / mantle reference
         mEndPosition = mPosition + mVelocity * mTimestep.fixedDt;
 
@@ -886,8 +887,9 @@ private:
         }
 
         // 9. Resolve collisions: sweep from mPosition to mEndPosition,
-        //    integrate-to-collision step + CheckStep/Bounce, then commit
-        //    mPosition = mEndPosition (UpdatePositions equivalent).
+        //    integrate-to-collision step + step check / bounce, then commit
+        //    mPosition = mEndPosition (the original's position-integration
+        //    step).
         resolveCollisions(contactCb);
 
         // 10. Update cell after collision resolution committed position
@@ -956,8 +958,8 @@ private:
     const CollisionGeometry &mCollision;  // world collision geometry (not owned)
     PhysicsTimestep mTimestep = MODERN;  // active timestep configuration
 
-    Vector3 mPosition{0.0f};       // body center position (LocationVec equivalent)
-    Vector3 mEndPosition{0.0f};    // projected end position (EndLocationVec equivalent)
+    Vector3 mPosition{0.0f};       // body center position (the original's position vector)
+    Vector3 mEndPosition{0.0f};    // projected end position (the original's end-position vector)
     Vector3 mPrevPosition{0.0f};   // position before frame (for head spring, mantle)
     Vector3 mVelocity{0.0f};       // linear velocity
     // Transient snapshots used by friction and diagnostics to see velocity state

@@ -42,7 +42,7 @@ static constexpr double EXTENDED_RAYCAST_EPSILON   = RAYCAST_EPSILON / 3.0;
 // ── Parametric ray-vs-world traversal ──
 // Traces a ray from 'from' to 'to' through the WR cell graph using
 // parametric plane-exit traversal.  Matches the original Dark Engine's
-// PortalRaycast: extends the ray backward for first-cell backface
+// cell-portal raycast: extends the ray backward for first-cell backface
 // culling, finds the closest exit plane parametrically, then tests
 // whether the exit is through a portal (advance to next cell) or a
 // solid surface (hit).
@@ -272,7 +272,7 @@ inline bool raycastWorld(const WRParsedData &wr,
                 }
             }
 
-            // Original engine: if PortalRaycastFindPolygon()
+            // Original engine: if the raycast's polygon lookup
             // returns -1, the collision is discarded (no polygon contains the hit
             // point). This happens when the ray exits through a plane at a point
             // that is geometrically between polygons (e.g., 0.02 above a riser
