@@ -2278,16 +2278,21 @@ private:
     bool mPortalRoutingEnabled = true;   ///< Portal-graph routing through doorways
     bool mProbePathingEnabled = true;    ///< Baked probe diffraction (when available)
 
-    /// Pathing-simulation throttle. iplSimulatorRunPathing runs on the
-    /// main loop thread; mPathingUpdateInterval bounds its rate so we
-    /// don't pay full CPU cost every frame. mPathingAccumSec accumulates
+    /// Pathing-simulation due-tick throttle. mPathingAccumSec accumulates
     /// deltaTime across loopStep calls; mPathingDueThisStep is set true
     /// for the current loopStep whenever the accumulator crosses the
     /// interval (and the accumulator resets). Per-voice
-    /// iplSourceSetInputs(...PATHING) calls + the iplSimulatorRunPathing
-    /// invocation are gated on this flag. Default 0.1 s (10 Hz) matches
-    /// Unity/Unreal Steam Audio integration defaults. 0.0 = every frame.
-    float mPathingUpdateInterval = 0.1f;
+    /// iplSourceSetInputs(...PATHING) calls + the worker signal are gated
+    /// on this flag. Since staging went event-driven (memo triggers +
+    /// gate-route scoping), a due tick with nothing to solve stages
+    /// NOTHING and does not signal — so this interval no longer paces
+    /// steady-state solve work; it is the QUANTIZATION DELAY between a
+    /// door event (or movement trigger) and the staging pass that serves
+    /// it. Default 0.05 s (20 Hz): half the door-event latency of the
+    /// 0.1 s Unity/Unreal integration default, measured near-free on the
+    /// 2026-07-19 door-stress survey (per-window solve cost p50 0.01 ms
+    /// once scoping landed). 0.0 = every frame (A-B diagnostic).
+    float mPathingUpdateInterval = 0.05f;
     float mPathingAccumSec       = 0.0f;
     bool  mPathingDueThisStep    = false;
 

@@ -10454,7 +10454,7 @@ void AudioService::loopStep(float deltaTime)
             // is off (audio.propagation.probe_pathing: false).
             //
             // Throttled by mPathingDueThisStep (audio.propagation.
-            // pathing_update_interval, default 0.1 s / 10 Hz). On skipped
+            // pathing_update_interval, default 0.05 s / 20 Hz). On skipped
             // frames the previous run's eqCoeffs remain cached on each
             // source, so the output read further down still produces
             // stable portalAttenuation/portalBlocking values.
