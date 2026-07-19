@@ -11,7 +11,14 @@
       "host": true
     },
     "bgfx",
-    "sdl2",
+    {
+      "name": "sdl2",
+      "default-features": false,
+      "features": [
+        { "name": "x11", "platform": "linux" },
+        { "name": "wayland", "platform": "linux" }
+      ]
+    },
     "zziplib",
     "ode",
     "yaml-cpp",

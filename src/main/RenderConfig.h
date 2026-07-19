@@ -12,6 +12,57 @@
 
 namespace Darkness {
 
+/// Water tunable bounds — SINGLE SOURCE OF TRUTH.
+///
+/// Both consumers must read these: the YAML clamp in loadConfig() below, and
+/// the debug-console slider registration in DarknessRender.cpp
+/// (registerConsoleSettings). They used to be written out twice, by hand, and
+/// they disagreed — in both directions:
+///
+///     setting          YAML max   console max
+///     wave_amplitude      10.0        5.0
+///     uv_distortion        0.1        0.5
+///     water_rotation       1.0        0.5
+///
+/// Only the YAML-wider rows were a real bug: `water: { wave_amplitude: 8.0 }`
+/// boots at 8.0 and renders fine, but DebugConsole::addFloat's setter rejects
+/// out-of-range input, so the first console edit strands the value — there is
+/// no way back to what the user's own config file asked for. The console-wider
+/// row (uv_distortion) is not that bug: every YAML-valid value was already
+/// settable. It just offered values that could never be persisted back.
+///
+/// So: **the YAML clamp is authoritative and the console follows it.** The
+/// config file is the persistent contract; the console must not offer a value
+/// you cannot save. Values below are therefore the pre-existing YAML bounds,
+/// unchanged — this fix moves the console, not the config, and no config that
+/// worked before behaves differently now.
+///
+/// These are not physical limits. To retune, change it HERE; both consumers
+/// follow and cannot drift apart again.
+namespace WaterRange {
+constexpr float kWaveAmplitudeMin = 0.0f, kWaveAmplitudeMax = 10.0f; // console was 5.0
+constexpr float kUvDistortionMin  = 0.0f, kUvDistortionMax  = 0.1f;  // console was 0.5
+constexpr float kWaterRotationMin = 0.0f, kWaterRotationMax = 1.0f;  // console was 0.5
+constexpr float kWaterScrollMin   = 0.0f, kWaterScrollMax   = 1.0f;  // already agreed
+} // namespace WaterRange
+
+/// Clamp a YAML-supplied value, announcing when the config file asked for
+/// something we would not honour. Silently rewriting a user's stated intent is
+/// the same class of bug as a silent fallback: the value in the file and the
+/// value in the engine disagree, and nothing says so.
+inline float clampConfigValue(float v, float lo, float hi, const char *key) {
+    if (v < lo || v > hi) {
+        const float clamped = (v < lo) ? lo : hi;
+        std::fprintf(stderr,
+            "[FALLBACK] config: %s = %g is outside [%g, %g] — clamping to %g. "
+            "The engine will not use the value your config file specifies.\n",
+            key, static_cast<double>(v), static_cast<double>(lo),
+            static_cast<double>(hi), static_cast<double>(clamped));
+        return clamped;
+    }
+    return v;
+}
+
 // All configurable settings for the renderer.
 // Defaults match the original hardcoded values.
 struct RenderConfig {
@@ -29,7 +80,7 @@ struct RenderConfig {
     std::string resPath;     // Thief 2 RES directory containing fam.crf / obj.crf / snd.crf
     std::string schemasPath; // schema directory (.sch / .spc / .arc files)
 
-    // -- water --
+    // -- water -- (ranges: see WaterRange below)
     float waveAmplitude   = 0.3f;    // vertex Z displacement in world units (0 = flat)
     float uvDistortion    = 0.015f;  // UV wobble strength (0 = no ripple)
     float waterRotation   = 0.015f;  // UV rotation speed in rad/s (0 = no rotation)
@@ -556,24 +607,28 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
         // water section
         if (YAML::Node water = root["water"]) {
             if (water["wave_amplitude"]) {
-                cfg.waveAmplitude = water["wave_amplitude"].as<float>();
-                if (cfg.waveAmplitude < 0.0f) cfg.waveAmplitude = 0.0f;
-                if (cfg.waveAmplitude > 10.0f) cfg.waveAmplitude = 10.0f;
+                cfg.waveAmplitude = clampConfigValue(
+                    water["wave_amplitude"].as<float>(),
+                    WaterRange::kWaveAmplitudeMin,
+                    WaterRange::kWaveAmplitudeMax, "water.wave_amplitude");
             }
             if (water["uv_distortion"]) {
-                cfg.uvDistortion = water["uv_distortion"].as<float>();
-                if (cfg.uvDistortion < 0.0f) cfg.uvDistortion = 0.0f;
-                if (cfg.uvDistortion > 0.1f) cfg.uvDistortion = 0.1f;
+                cfg.uvDistortion = clampConfigValue(
+                    water["uv_distortion"].as<float>(),
+                    WaterRange::kUvDistortionMin,
+                    WaterRange::kUvDistortionMax, "water.uv_distortion");
             }
             if (water["rotation_speed"]) {
-                cfg.waterRotation = water["rotation_speed"].as<float>();
-                if (cfg.waterRotation < 0.0f) cfg.waterRotation = 0.0f;
-                if (cfg.waterRotation > 1.0f) cfg.waterRotation = 1.0f;
+                cfg.waterRotation = clampConfigValue(
+                    water["rotation_speed"].as<float>(),
+                    WaterRange::kWaterRotationMin,
+                    WaterRange::kWaterRotationMax, "water.rotation_speed");
             }
             if (water["scroll_speed"]) {
-                cfg.waterScrollSpeed = water["scroll_speed"].as<float>();
-                if (cfg.waterScrollSpeed < 0.0f) cfg.waterScrollSpeed = 0.0f;
-                if (cfg.waterScrollSpeed > 1.0f) cfg.waterScrollSpeed = 1.0f;
+                cfg.waterScrollSpeed = clampConfigValue(
+                    water["scroll_speed"].as<float>(),
+                    WaterRange::kWaterScrollMin,
+                    WaterRange::kWaterScrollMax, "water.scroll_speed");
             }
         }
 
