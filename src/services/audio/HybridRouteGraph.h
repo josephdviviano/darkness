@@ -49,6 +49,7 @@
 #include <limits>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -84,6 +85,7 @@ public:
         mAdj.assign(mProbePos.size(), {});
         mEdgeDoors.clear();
         mEdgeDoors.reserve(edges.size());
+        mSkippedEdges = 0;
         buildGrid();
 
         for (const auto &e : edges) {
@@ -91,8 +93,15 @@ public:
             if (a == b) continue;
             if (a < 0 || b < 0 ||
                 a >= static_cast<int>(mProbePos.size()) ||
-                b >= static_cast<int>(mProbePos.size()))
+                b >= static_cast<int>(mProbePos.size())) {
+                // An edge indexing past the probe array means the caller
+                // paired the adjacency with the WRONG probe set (the edges
+                // index the pathing batch). Count it — the caller must
+                // surface a non-zero count loudly; silently thinning the
+                // graph corrupts every route computed on it.
+                ++mSkippedEdges;
                 continue;
+            }
             const int edgeIdx = static_cast<int>(mEdgeDoors.size());
             const float len = glm::length(mProbePos[b] - mProbePos[a]);
             mAdj[a].push_back({b, edgeIdx, len});
@@ -108,27 +117,44 @@ public:
             }
             mEdgeDoors.push_back(std::move(onEdge));
         }
+        // Precompute the distinct door IDs with at least one edge so
+        // doorHasEdges() is O(1) at query time (used by the commit drain's
+        // [SCOPE_DRAIN] diagnostic, per door event).
+        mDoorsWithEdges.clear();
+        for (const auto &v : mEdgeDoors)
+            for (int32_t id : v) mDoorsWithEdges.insert(id);
         mBuilt = true;
     }
 
     bool   built() const { return mBuilt; }
     size_t numProbes() const { return mProbePos.size(); }
+    /// Edges ACCEPTED into the graph (input edges minus self-loops and
+    /// out-of-range skips).
+    size_t numEdges() const { return mEdgeDoors.size(); }
+    /// Input edges skipped because an endpoint indexed past the probe
+    /// array — a probe-set/adjacency pairing bug at the caller. Any
+    /// non-zero value must be surfaced loudly.
+    size_t skippedEdges() const { return mSkippedEdges; }
     /// Total door↔edge associations (diagnostic).
     size_t doorEdgeCount() const {
         size_t n = 0;
         for (const auto &v : mEdgeDoors) n += v.size();
         return n;
     }
-    /// Count of DISTINCT door IDs that annotate at least one edge. Paired with
-    /// the door count passed to build(), the difference is the number of doors
-    /// mapped to NO edge — a door that would gate nothing (a route leak past a
-    /// closed door). Surfaced loudly so an over-tight door box does not fail
+    /// DISTINCT door IDs that annotate at least one edge. Paired with the
+    /// door set passed to build(), the complement is the doors mapped to NO
+    /// edge — a door that would gate nothing (a route leak past a closed
+    /// door). Surfaced loudly so an over-tight door box does not fail
     /// silently.
-    size_t doorsWithEdges() const {
-        std::unordered_map<int32_t, char> seen;
-        for (const auto &v : mEdgeDoors)
-            for (int32_t id : v) seen[id] = 1;
-        return seen.size();
+    const std::unordered_set<int32_t> &doorIdsWithEdges() const {
+        return mDoorsWithEdges;
+    }
+    /// Count of DISTINCT door IDs that annotate at least one edge (see
+    /// doorIdsWithEdges()).
+    size_t doorsWithEdges() const { return mDoorsWithEdges.size(); }
+    /// True iff this door annotates at least one edge (O(1)).
+    bool doorHasEdges(int32_t id) const {
+        return mDoorsWithEdges.count(id) != 0;
     }
 
     /// Nearest probe index to `p` (grid-accelerated), or -1 if empty.
@@ -243,6 +269,10 @@ private:
     std::vector<Vector3> mProbePos;
     std::vector<std::vector<Edge>> mAdj;
     std::vector<std::vector<int32_t>> mEdgeDoors;
+    /// Distinct door IDs annotating at least one edge (see doorHasEdges()).
+    std::unordered_set<int32_t> mDoorsWithEdges;
+    /// Out-of-range input edges dropped by build() (see skippedEdges()).
+    size_t mSkippedEdges = 0;
 
     // ── uniform grid over probe positions for nearestProbe ──
     struct GridKey { int x, y, z; bool operator==(const GridKey&o) const {

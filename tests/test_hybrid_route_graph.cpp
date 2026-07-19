@@ -61,8 +61,35 @@ TEST_CASE("HybridRouteGraph builds and maps doors to edges", "[hybrid]") {
     HybridRouteGraph g = makeGraph();
     REQUIRE(g.built());
     REQUIRE(g.numProbes() == 6);
+    REQUIRE(g.numEdges() == 6);
+    REQUIRE(g.skippedEdges() == 0);
     // Exactly two edges carry a door (0-1 -> A, 3-4 -> B).
     REQUIRE(g.doorEdgeCount() == 2);
+    REQUIRE(g.doorHasEdges(100));
+    REQUIRE(g.doorHasEdges(200));
+    REQUIRE_FALSE(g.doorHasEdges(999));
+}
+
+TEST_CASE("build counts out-of-range edges as skipped (probe-set mismatch "
+          "guard)", "[hybrid]") {
+    // Regression guard for the adjacency/probe-set pairing bug: edges index
+    // the PATHING batch, so pairing them with a smaller (e.g. reflection)
+    // probe array must be loudly countable, not a silent graph thinning.
+    std::vector<Vector3> pos = {
+        {0.0f, 0.0f, 0.0f},
+        {10.0f, 0.0f, 0.0f},
+    };
+    std::vector<std::pair<int, int>> edges = {
+        {0, 1},   // valid
+        {1, 5},   // endpoint past the probe array -> skipped
+        {7, 8},   // both endpoints out of range -> skipped
+        {1, 1},   // self-loop -> dropped but NOT a probe-set mismatch
+    };
+    HybridRouteGraph g;
+    g.build(pos, edges, {});
+    REQUIRE(g.built());
+    REQUIRE(g.numEdges() == 1);
+    REQUIRE(g.skippedEdges() == 2);
 }
 
 TEST_CASE("nearestProbe finds the closest probe", "[hybrid]") {

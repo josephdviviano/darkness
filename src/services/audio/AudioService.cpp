@@ -7189,6 +7189,34 @@ void AudioService::loopStep(float deltaTime)
                             }
                         }
                     }
+                    // [SCOPE_DRAIN] — per bumped door, attribute the mark
+                    // outcome so a zero-mark drain is explainable from the
+                    // log alone: onRoute = voices carrying the door on
+                    // their gate route (dirty = of those, already marked),
+                    // edges=0 flags a door the hybrid graph maps to no
+                    // edge (it can never appear on a route — the fail-open
+                    // class). Drains run once per door OPEN/CLOSE event,
+                    // so this is a handful of lines per event, not per
+                    // frame.
+                    for (int32_t d : mDoorsBumpedSinceCommit) {
+                        int onRoute = 0, dirtyAlready = 0;
+                        for (auto &[h, v] : mVoicePool->voices()) {
+                            if (!v) continue;
+                            if (std::find(v->pathGateDoors.begin(),
+                                          v->pathGateDoors.end(), d)
+                                    == v->pathGateDoors.end())
+                                continue;
+                            ++onRoute;
+                            if (v->pathScopedDoorDirty) ++dirtyAlready;
+                        }
+                        std::fprintf(stderr,
+                            "[SCOPE_DRAIN] door=%d edges=%d onRoute=%d "
+                            "alreadyDirty=%d markedThisCommit=%llu\n",
+                            d,
+                            mHybridGraph.doorHasEdges(d) ? 1 : 0,
+                            onRoute, dirtyAlready,
+                            (unsigned long long)markedThisCommit);
+                    }
                 }
                 sScopeDirtyMarkedWindow.fetch_add(markedThisCommit,
                                                   std::memory_order_relaxed);
@@ -15398,7 +15426,14 @@ std::vector<AudioService::DoorWorldAABB> AudioService::doorAudioAABBs() const
 void AudioService::buildHybridRouteGraph()
 {
     if (!mProbeManager) return;
-    const std::vector<Vector3> &pos = mProbeManager->getProbePositions();
+    // MUST be the PATHING-batch positions: PathingAdjacency's edges index
+    // into that array. This once passed getProbePositions() (the
+    // REFLECTION batch) — a different, smaller probe set — so every edge
+    // endpoint resolved to an unrelated position and edges past the
+    // reflection count were dropped, leaving the gate routing on corrupt
+    // geometry (caught by the [SCOPE_DRAIN] zero-mark audit, 2026-07-19).
+    const std::vector<Vector3> &pos =
+        mProbeManager->getPathingProbePositions();
     const PathingAdjacency &adj = mProbeManager->getPathingAdjacency();
     if (pos.empty() || !adj.built) {
         mHybridGraph = HybridRouteGraph{};   // clear — no graph to gate with
@@ -15429,20 +15464,44 @@ void AudioService::buildHybridRouteGraph()
     const size_t withEdges = mHybridGraph.doorsWithEdges();
     const size_t noEdges = doors.size() >= withEdges ? doors.size() - withEdges : 0;
     std::fprintf(stderr,
-        "[HYBRID_GRAPH] built: %zu probes, %zu edges, %zu doors, "
-        "%zu door-edge links, %zu doors gate nothing (gate routing)\n",
-        mHybridGraph.numProbes(), edges.size(), doors.size(),
-        mHybridGraph.doorEdgeCount(), noEdges);
+        "[HYBRID_GRAPH] built: %zu probes, %zu/%zu edges accepted, "
+        "%zu doors, %zu door-edge links, %zu doors gate nothing "
+        "(gate routing)\n",
+        mHybridGraph.numProbes(), mHybridGraph.numEdges(), edges.size(),
+        doors.size(), mHybridGraph.doorEdgeCount(), noEdges);
+    // A skipped edge means the adjacency's probe indices do not fit the
+    // probe array we passed — the exact cross-batch pairing bug this
+    // build once shipped with. The graph would route on thinned, wrong
+    // geometry, so scream (no silent fallbacks).
+    if (mHybridGraph.skippedEdges() > 0)
+        std::fprintf(stderr,
+            "[FALLBACK] buildHybridRouteGraph: %zu of %zu adjacency edges "
+            "index past the %zu pathing probes — adjacency/probe-set "
+            "mismatch; gate routing is running on corrupt geometry\n",
+            mHybridGraph.skippedEdges(), edges.size(),
+            mHybridGraph.numProbes());
     // A door mapped to NO edge cannot gate the sound routed past it — an
-    // over-tight door box would leak audio through a closed door. Announce it
-    // loudly (no silent fallbacks) so the box margin can be revisited if this
-    // climbs. A handful is expected (doors with no through-probe pair, e.g.
+    // over-tight door box would leak audio through a closed door, and its
+    // open/close events can never mark a voice dirty (the commit drain keys
+    // on pathGateDoors). Announce it loudly (no silent fallbacks), WITH the
+    // door IDs so a stress run's toggled doors can be checked against the
+    // list. A handful is expected (doors with no through-probe pair, e.g.
     // sealed/decorative doors that no route ever threads).
-    if (noEdges > 0)
+    if (noEdges > 0) {
+        const std::unordered_set<int32_t> withEdgeIds =
+            mHybridGraph.doorIdsWithEdges();
+        std::string idList;
+        for (const auto &d : doors) {
+            if (withEdgeIds.count(d.id)) continue;
+            if (!idList.empty()) idList += ",";
+            idList += std::to_string(d.id);
+        }
         std::fprintf(stderr,
             "[HYBRID_GRAPH] NOTE: %zu of %zu doors map to no edge — their "
             "open-fraction will not gate any route (check door box margin if "
-            "this is high)\n", noEdges, doors.size());
+            "this is high). no-edge door ids: %s\n",
+            noEdges, doors.size(), idList.c_str());
+    }
 
     // The graph just changed under any voice that cached a route against the
     // OLD one (probe set, edges, and door→edge map can all differ). Invalidate
