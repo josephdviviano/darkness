@@ -1425,6 +1425,11 @@ static std::atomic<uint64_t> sDoorBumpsWindow{0};
 static std::atomic<uint64_t> sDoorCommitsWindow{0};
 static std::atomic<uint64_t> sDoorCommitDeferredWindow{0};
 static std::atomic<uint64_t> sPathSignalsWindow{0};
+// Door-gen epochs retired at the commit drain because NO in-range voice
+// was routed through (or failing open to) the bumped doors — no solve is
+// scheduled because of the event, so recording the wait for the next
+// unrelated solve would be phantom latency. [PERF door_route] uncontested=.
+static std::atomic<uint64_t> sDoorRouteUncontestedWindow{0};
 
 // ── [PERF scope] — scoped-invalidation census (per-dump-window) ──
 //
@@ -7228,6 +7233,74 @@ void AudioService::loopStep(float deltaTime)
                               prevMax, markedThisCommit,
                               std::memory_order_relaxed)) {}
                 mDoorsBumpedSinceCommit.clear();
+            }
+
+            // ── Uncontested-epoch retirement ([PERF door_route] honesty) ──
+            //
+            // A door-gen epoch normally retires when a signaled solve
+            // covering its gen COMPLETES ([DOOR_ROUTE_LATENCY]). With
+            // gate-route scoping, an event whose doors sit on NO in-range
+            // voice's route schedules no solve — its epoch would sit until
+            // an unrelated trigger (movement/room/rising) happened to
+            // fire, and the histogram would record that wait as phantom
+            // door latency (observed as multi-second "tails" on MISS7
+            // stress runs whose solves all ran <30 ms). If, after this
+            // commit's marking, NO pathing-eligible in-range voice either
+            // carries the scoped dirty flag, fails open to the raw doorGen
+            // trigger, or already has a solve queued (pending latch /
+            // never-solved), then no covering solve is scheduled BECAUSE
+            // of door state: retire every epoch the committed gen covers
+            // as `uncontested=` — counted, not recorded as latency.
+            // Guarded on !mDoorSolveInFlight so an armed in-flight
+            // measurement is never stolen (its completion retires its
+            // epochs with REAL latency). Main thread, same as all epoch
+            // bookkeeping.
+            if (!mDoorGenEvents.empty() && !mDoorSolveInFlight
+                && mVoicePool) {
+                bool contested = false;
+                for (auto &[h, v] : mVoicePool->voices()) {
+                    if (!v) continue;
+                    if (v->playerEmitted || v->skipPortalRouting
+                        || v->pathingSource == nullptr)
+                        continue;   // never pathing-eligible
+                    if (glm::length(v->worldPos - mListenerPos)
+                            > v->maxAudibleDist)
+                        continue;   // out of range — no solve until rising
+                    const bool failOpen = !(mHybridGraph.built()
+                        && v->pathGateReachable
+                        && !v->pathLastOutputsNoRoute);
+                    if (v->pathScopedDoorDirty || failOpen
+                        || v->pathSolvePending || !v->pathEverSolved) {
+                        contested = true;
+                        break;
+                    }
+                }
+                if (!contested) {
+                    uint64_t retired = 0;
+                    while (!mDoorGenEvents.empty()
+                           && mDoorGenEvents.front().gen
+                                  <= mDoorGenCommitted) {
+                        mDoorGenEvents.pop_front();
+                        ++retired;
+                    }
+                    if (retired > 0) {
+                        sDoorRouteUncontestedWindow.fetch_add(
+                            retired, std::memory_order_relaxed);
+                        static std::atomic<int> sUncLogCount{0};
+                        const int uc = sUncLogCount.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (uc < 8 || (uc % 64) == 0) {
+                            std::fprintf(stderr,
+                                "[DOOR_ROUTE_LATENCY] %llu epoch(s) "
+                                "retired uncontested (gen<=%llu): no "
+                                "in-range voice routed through or failing "
+                                "open to the bumped doors (drain #%d)\n",
+                                (unsigned long long)retired,
+                                (unsigned long long)mDoorGenCommitted,
+                                uc + 1);
+                        }
+                    }
+                }
             }
 
             static std::atomic<int> sCommitCount{0};
@@ -14113,12 +14186,17 @@ void AudioService::dumpAudioStatusPeriodic()
     const uint64_t drCommits = sDoorCommitsWindow.exchange(0, std::memory_order_relaxed);
     const uint64_t drDefer   = sDoorCommitDeferredWindow.exchange(0, std::memory_order_relaxed);
     const uint64_t drSigs    = sPathSignalsWindow.exchange(0, std::memory_order_relaxed);
+    // uncontested = epochs retired at the commit drain because no in-range
+    // voice was routed through (or failing open to) the bumped doors — no
+    // covering solve was ever scheduled, so they carry no latency sample.
+    const uint64_t drUnc     = sDoorRouteUncontestedWindow.exchange(0, std::memory_order_relaxed);
     AUDIO_LOG(
         "[PERF door_route] n=%llu p50/p95/max=%.1f/%.1f/%.1f ms "
-        "bumps=%llu commits=%llu defer=%llu sigs=%llu\n",
+        "bumps=%llu commits=%llu defer=%llu sigs=%llu uncontested=%llu\n",
         (unsigned long long)drP.n, drP.p50, drP.p95, drP.maxMs,
         (unsigned long long)drBumps, (unsigned long long)drCommits,
-        (unsigned long long)drDefer, (unsigned long long)drSigs);
+        (unsigned long long)drDefer, (unsigned long long)drSigs,
+        (unsigned long long)drUnc);
 
     // [PERF path_trig] — staged-SOLVE trigger census for the window (see
     // counter block at file scope). noRoute = staged solves whose voice
@@ -14525,7 +14603,8 @@ void AudioService::dumpAudioStatusPeriodic()
             "\"signal_pickup\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f},"
             "\"sync_wait\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"p99\":%.4f,"
                 "\"timeouts\":%d,\"deadline_ms\":%.4f},"
-            "\"door_route\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"max\":%.4f}"
+            "\"door_route\":{\"n\":%llu,\"p50\":%.4f,\"p95\":%.4f,\"max\":%.4f,"
+                "\"uncontested\":%llu}"
             "},"
             "\"voices\":{\"total\":%zu,\"refl\":%d,\"tail\":%d,"
                 "\"ambients_playing\":%d,\"ambients_total\":%zu,"
@@ -14574,6 +14653,7 @@ void AudioService::dumpAudioStatusPeriodic()
             (unsigned long long)syncP.n,  syncP.p50,  syncP.p95,  syncP.p99,
                 syncTimeouts, static_cast<double>(syncDeadlineMs),
             (unsigned long long)drP.n, drP.p50, drP.p95, drP.maxMs,
+                (unsigned long long)drUnc,
             mVoicePool->size(), reflVoices, tailVoices,
                 playing, ambients.size(), created, destroyed,
             (unsigned long long)evictionsSinceLast, reflVoices, MAX_ACTIVE_VOICES,
