@@ -2009,33 +2009,6 @@ private:
     /// not bump — preserves the "solve sees the new geometry" invariant).
     std::unordered_set<int32_t> mDoorsBumpedSinceCommit;
 
-    /// [SCOPE_MISS] watchdog cadence (steady_clock ns of last tick + the
-    /// pending latch consumed by the next signaling staging pass). The
-    /// watchdog force-solves eligible in-range voices ignoring scoping and
-    /// checks whether any voice that scoping WOULD have skipped shows a
-    /// material eq change (a scope miss). Cumulative miss count is loud +
-    /// reported on [PERF scope].
-    ///
-    /// STAGGERED (not one full-scope solve): a full 11-voice audit solve
-    /// every 2 s re-introduces exactly the expensive validation+alternate
-    /// iteration scoping removed (~150-255 ms), blocking the door commit
-    /// and spiking the [DOOR_ROUTE_LATENCY] gate it is meant to guard.
-    /// Instead each tick (every kScopeWatchdogIntervalMs) arms a rotating
-    /// window of kScopeWatchdogBatch voices via mScopeWatchdogCursor, so
-    /// every eligible voice is audited within ~2 s while each tick adds
-    /// only a couple of forced solves to the scoped set. (As-built
-    /// refinement of the §8 "one background full-scope solve" — same audit
-    /// coverage + cadence, kept genuinely background.)
-    int64_t  mScopeWatchdogLastNs = 0;
-    bool     mScopeWatchdogPending = false;
-    uint32_t mScopeWatchdogCursor = 0;
-    static constexpr double   kScopeWatchdogIntervalMs = 250.0;
-    static constexpr uint32_t kScopeWatchdogBatch = 2;
-    /// A pathing eqCoeffs band delta beyond this between a scope-skipped
-    /// voice's cached eq and its forced full-solve eq is a scope miss.
-    static constexpr float kScopeMissEqEpsilon = 0.05f;
-    std::atomic<uint64_t> mScopeMissCount{0};
-
     /// Reflection simulation owner — wraps the Steam Audio reflection
     /// IPLSimulator handle, its dedicated background worker thread, the
     /// deferred source-add/remove queues, throttle counter, rate divisor,

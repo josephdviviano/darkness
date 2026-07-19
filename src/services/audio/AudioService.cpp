@@ -1412,11 +1412,6 @@ static std::atomic<uint64_t> sPathTrigLMove{0};       // listener moved > memo f
 static std::atomic<uint64_t> sPathTrigSMove{0};       // source moved > memo ft
 static std::atomic<uint64_t> sPathTrigNoRoute{0};     // solve of a no-route-verdict voice
 static std::atomic<uint64_t> sPathTrigSentinel{0};    // solve of a sentinel-outputs voice
-// Unreachable-route cache hits: staged-SKIP decisions that the pre-cache
-// memo would have staged as SOLVE (doorGen unchanged; suppressed
-// re-solve of a known no-route voice). [PERF pathing] unreachableCached=N.
-static std::atomic<uint64_t> sPathUnreachableCached{0};
-
 // ── [PERF door_route] cadence fields — commit/solve alternation check ──
 //
 // Per-dump-window counters for the O2a door-commit path: how many door
@@ -7233,25 +7228,6 @@ void AudioService::loopStep(float deltaTime)
         }
     }
 
-    // ── O3-lite [SCOPE_MISS] watchdog cadence ──
-    // Every ~kScopeWatchdogIntervalMs latch a pending force so the next
-    // signaling staging pass re-solves EVERY eligible in-range voice
-    // ignoring scoping and audits for scope misses. Cheap: one extra
-    // full-scope pathing iteration every 2 s. Main thread.
-    if (mProbePathingEnabled && mPathingProbeBatchAdded) {
-        const int64_t nowW =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (mScopeWatchdogLastNs == 0) {
-            mScopeWatchdogLastNs = nowW;
-        } else if (!mScopeWatchdogPending
-                   && (static_cast<double>(nowW - mScopeWatchdogLastNs)
-                       / 1.0e6) >= kScopeWatchdogIntervalMs) {
-            mScopeWatchdogPending = true;
-            mScopeWatchdogLastNs = nowW;
-        }
-    }
-
     // ── commit-vs-solve priority: hold sim signals while a commit waits ──
     //
     // The canMutate gate above requires a COINCIDENTAL all-three-idle
@@ -8297,49 +8273,6 @@ void AudioService::loopStep(float deltaTime)
                         voice->pathLastOutputsSentinel = shAllZero && eqIsSentinel;
                         voice->pathLastOutputsNoRoute  = shAllZero && !eqIsSentinel;
 
-                        // ── O3-lite [SCOPE_MISS] watchdog ──
-                        //
-                        // pathLastEq caches this attributable eq for the
-                        // watchdog's pre/post comparison. If a watchdog
-                        // force-solve is armed and this read is attributable
-                        // to it (completed-cycles gate), compare the fresh
-                        // eq to the snapshot taken when the forced solve was
-                        // staged: a band delta beyond kScopeMissEqEpsilon on
-                        // a voice scoping WOULD have skipped means scoping
-                        // wrongly excluded it from a door change → loud
-                        // [SCOPE_MISS]. Analyze, never suppress.
-                        if (voice->pathScopeWatchdogCoverCycle != UINT64_MAX
-                            && mPathingSim->completedCycles()
-                                   >= voice->pathScopeWatchdogCoverCycle) {
-                            const float d0 = std::fabs(
-                                pathingOut.pathing.eqCoeffs[0]
-                                - voice->pathScopeWatchdogEqSnapshot[0]);
-                            const float d1 = std::fabs(
-                                pathingOut.pathing.eqCoeffs[1]
-                                - voice->pathScopeWatchdogEqSnapshot[1]);
-                            const float d2 = std::fabs(
-                                pathingOut.pathing.eqCoeffs[2]
-                                - voice->pathScopeWatchdogEqSnapshot[2]);
-                            const float dmax = std::max(d0, std::max(d1, d2));
-                            if (dmax > kScopeMissEqEpsilon) {
-                                uint64_t n = mScopeMissCount.fetch_add(
-                                    1, std::memory_order_relaxed) + 1;
-                                std::fprintf(stderr,
-                                    "[SCOPE_MISS] #%llu voice h=%d '%s' "
-                                    "eq delta=(%.3f,%.3f,%.3f) max=%.3f "
-                                    "(> eps %.3f) gateDoors=%zu — scoping "
-                                    "excluded a voice a door change "
-                                    "affected\n",
-                                    (unsigned long long)n, voice->handle,
-                                    voice->schemaName.c_str(), d0, d1, d2,
-                                    dmax, kScopeMissEqEpsilon,
-                                    voice->pathGateDoors.size());
-                            }
-                            voice->pathScopeWatchdogCoverCycle = UINT64_MAX;
-                        }
-                        voice->pathLastEq[0] = pathingOut.pathing.eqCoeffs[0];
-                        voice->pathLastEq[1] = pathingOut.pathing.eqCoeffs[1];
-                        voice->pathLastEq[2] = pathingOut.pathing.eqCoeffs[2];
                     }
                     // Compute the eq→DSP mapping unconditionally so the
                     // [PATH_DIAG_DUMP] diagnostic can read it in both the
@@ -9250,23 +9183,6 @@ void AudioService::loopStep(float deltaTime)
             uint32_t pathingScopedSolves = 0;
             uint32_t pathingScopeSkipped = 0;
 
-            // ── [SCOPE_MISS] watchdog: consume the force latch ──
-            // On a signaling due tick after a watchdog interval elapsed,
-            // force a ROTATING WINDOW of kScopeWatchdogBatch eligible
-            // in-range voices to re-solve ignoring scoping; for a voice
-            // scoping WOULD have skipped, snapshot its cached eq so the
-            // harvest can compare the forced-solve result and flag a scope
-            // miss. Staggered so every voice is audited within ~2 s without
-            // a full-scope solve (see mScopeWatchdogCursor doc). Consumed
-            // once (main thread). wdEligIdx runs over eligible in-range
-            // voices this pass; the [wdLo,wdHi) window selects the batch.
-            const bool scopeWatchdogTick =
-                mScopeWatchdogPending && pathingWillSignal;
-            if (scopeWatchdogTick) mScopeWatchdogPending = false;
-            uint32_t wdEligIdx = 0;
-            const uint32_t wdLo = mScopeWatchdogCursor;
-            const uint32_t wdHi = mScopeWatchdogCursor + kScopeWatchdogBatch;
-
             // ── Lever D: warmup first-solve stagger — selection pre-pass ──
             //
             // PLAN.PATHING_DESIGN.md §15/§16. SA's runtime alternate search
@@ -9306,14 +9222,14 @@ void AudioService::loopStep(float deltaTime)
             //      starve.
             //   3. handle ASC — deterministic tiebreak (repeatable runs).
             //
-            // We do NOT consult the shadow router for an "unreachable ⇒ solve
-            // last" hint (PLAN §16 lists it as optional). It would cost a
-            // Dijkstra pair + roomFromPoint per candidate per signaled tick
-            // on the main thread and cannot help the metric it would be paid
-            // for: deprioritizing likely-drainers only REORDERS them, it does
-            // not stop the cap-many drains per iteration that set the window
-            // max. (And a hard skip is forbidden regardless — the router
-            // under-approximates SA's multi-path reach, §12 SCOPE_MISS.)
+            // We do NOT use an "unreachable ⇒ solve last" hint (PLAN §16
+            // lists it as optional; the hybrid gate's pathGateReachable
+            // would make it cheap). It cannot help the metric it would be
+            // paid for: deprioritizing likely-drainers only REORDERS them,
+            // it does not stop the cap-many drains per iteration that set
+            // the window max. (And a hard skip is forbidden regardless — a
+            // shortest-path proxy under-approximates SA's multi-path
+            // reach, §12.)
             uint32_t firstSolveDeferred = 0;   // this tick (→ [PERF pathing])
             uint32_t firstSolveBacklog  = 0;   // never-solved in-range gauge
             std::array<SoundHandle, kPathingFirstSolvesPerIteration>
@@ -9967,23 +9883,10 @@ void AudioService::loopStep(float deltaTime)
                     const bool trigSMove    = glm::length(voice->worldPos
                             - voice->pathLastSolveSourcePos)
                             > kPathingSolveMemoMoveFt;
-                    // What scoping alone decides (before the watchdog).
-                    const bool scopedNeedsSolve = pathingWanted
+                    const bool needsSolve = pathingWanted
                         && (trigPending || trigNever || trigDoorGen
                             || trigRising || trigRoom || trigLMove
                             || trigSMove);
-                    // [SCOPE_MISS] watchdog: on a watchdog tick, force a
-                    // re-solve of the rotating batch of in-range eligible
-                    // voices (window [wdLo,wdHi) over the eligible index)
-                    // regardless of scoping so the harvest can audit
-                    // whether scoping wrongly excluded any of them.
-                    bool watchdogForce = false;
-                    if (scopeWatchdogTick && pathingWanted) {
-                        if (wdEligIdx >= wdLo && wdEligIdx < wdHi)
-                            watchdogForce = true;
-                        ++wdEligIdx;
-                    }
-                    const bool needsSolve = scopedNeedsSolve || watchdogForce;
                     // ── Lever D: first-solve stagger decision ──
                     //
                     // This voice has never solved and the pre-pass did not
@@ -10077,30 +9980,6 @@ void AudioService::loopStep(float deltaTime)
                             // loop — nothing to refresh here.)
                             voice->pathScopedDoorDirty = false;
                             if (scopeValid) ++pathingScopedSolves;
-                            // Watchdog arm: this solve was FORCED (scoping
-                            // alone wouldn't have re-solved) on a
-                            // scope-valid voice AND a door changed
-                            // globally since its last solve
-                            // (trigDoorGenRaw). Snapshot the cached eq
-                            // so the harvest can compare the fresh
-                            // forced-solve result (scope-miss check).
-                            // The trigDoorGenRaw guard isolates the
-                            // scoping question from pre-existing
-                            // sub-5 ft movement-memo staleness: without
-                            // a door change an eq delta is movement, not
-                            // a scope miss.
-                            if (scopeWatchdogTick && !scopedNeedsSolve
-                                && scopeValid && trigDoorGenRaw
-                                && mPathingSim) {
-                                voice->pathScopeWatchdogEqSnapshot[0] =
-                                    voice->pathLastEq[0];
-                                voice->pathScopeWatchdogEqSnapshot[1] =
-                                    voice->pathLastEq[1];
-                                voice->pathScopeWatchdogEqSnapshot[2] =
-                                    voice->pathLastEq[2];
-                                voice->pathScopeWatchdogCoverCycle =
-                                    mPathingSim->completedCycles() + 1;
-                            }
                         } else {
                             // Due tick that can't signal (worker busy or
                             // door-commit hold), or a first solve held back
@@ -10448,17 +10327,6 @@ void AudioService::loopStep(float deltaTime)
                     iplSourceSetInputs(slot.directSource,
                         IPL_SIMULATIONFLAGS_DIRECT, &slotInputs);
                 }
-            }
-
-            // [SCOPE_MISS] watchdog: advance the rotating batch cursor once
-            // per consumed tick, wrapping at this pass's eligible-in-range
-            // count (wdEligIdx). Over ceil(N/kScopeWatchdogBatch) ticks
-            // every voice is audited.
-            if (scopeWatchdogTick) {
-                mScopeWatchdogCursor += kScopeWatchdogBatch;
-                if (wdEligIdx == 0
-                    || mScopeWatchdogCursor >= wdEligIdx)
-                    mScopeWatchdogCursor = 0;
             }
 
             // Step 3: Signal the sim workers now that staging is done.
@@ -14252,8 +14120,7 @@ void AudioService::dumpAudioStatusPeriodic()
     // shrink all-in-range ~11 to 1-3), dirtyMax = the worst single commit.
     // gateVoices/avgGateDoors snapshot the gate's per-voice route-door sets
     // (the scope key); unreachable = voices whose gate found no surviving
-    // route (fail open to the global door trigger). scopeMiss is the
-    // cumulative [SCOPE_MISS] watchdog count (must stay 0).
+    // route (fail open to the global door trigger).
     {
         const uint64_t scDirty   = sScopeDirtyMarkedWindow.exchange(0, std::memory_order_relaxed);
         const uint64_t scCommits = sScopeCommitCountWindow.exchange(0, std::memory_order_relaxed);
@@ -14276,11 +14143,10 @@ void AudioService::dumpAudioStatusPeriodic()
         AUDIO_LOG(
             "[PERF scope] commitsWithMark=%llu dirtyMarked=%llu "
             "(avg %.2f/commit, max %llu) gateVoices=%d avgGateDoors=%.1f "
-            "unreachable=%d scopeMiss=%llu\n",
+            "unreachable=%d\n",
             (unsigned long long)scCommits, (unsigned long long)scDirty,
             avgMarked, (unsigned long long)scMax, gateVoices, avgDoors,
-            unreachable,
-            (unsigned long long)mScopeMissCount.load(std::memory_order_relaxed));
+            unreachable);
     }
 
     // PLAN.AUDIO_PROFILING.md §2.3 — pin-block probe-reverb lookup latency.
@@ -19510,10 +19376,9 @@ bool AudioService::loadProbes(const std::string &probePath)
             v->pathLastOutputsSentinel = true;
             v->pathVerdictCoverCycle   = UINT64_MAX;
             // A route solved against the old graph is meaningless — force
-            // a dirty solve and drop any armed watchdog. (The gate loop
-            // re-keys pathGateDoors itself via pathGateValid=false below.)
+            // a dirty solve. (The gate loop re-keys pathGateDoors itself
+            // via pathGateValid=false below.)
             v->pathScopedDoorDirty       = true;
-            v->pathScopeWatchdogCoverCycle = UINT64_MAX;
         }
     }
     // Pending bumps measure against the old graph — drop them.
