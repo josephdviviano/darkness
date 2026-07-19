@@ -7164,20 +7164,29 @@ void AudioService::loopStep(float deltaTime)
             // [PERF door_route] cadence field (commits= per window).
             sDoorCommitsWindow.fetch_add(1, std::memory_order_relaxed);
 
-            // ── O3-lite scoped invalidation: mark affected voices dirty ──
+            // ── Scoped invalidation: mark affected voices dirty ──
             //
             // The door poses that bumped since the last commit are now IN
-            // the committed BVH. Mark ONLY the voices registered against
-            // one of them (mDoorVoices reverse index) — the scoped
-            // replacement for the old "every in-range voice re-solves on
-            // any door commit". A bumped door with no room-pair AND no
-            // ellipse registrant reaches no voice here; that is correct
-            // (it is on nobody's route), and the [SCOPE_MISS] watchdog
-            // guards the case where the router wrongly excluded a voice.
-            // Fail-open voices (pathRouteScopeValid == false) are NOT
-            // marked — they key on the global committed-gen trigger and
+            // the committed BVH. Mark ONLY the voices whose CURRENT hybrid
+            // route (pathGateDoors — refreshed every loopStep in the gate
+            // loop above, which runs before this drain) crosses one of the
+            // bumped doors. This re-keys the old room-portal scope-router
+            // onto the route the gate already computes: the doors the
+            // sound ACTUALLY crosses, not a conservative superset. A
+            // bumped door on nobody's route marks nobody; that is correct
+            // (a solve can only change where a route crosses the door).
+            // Voices without a usable route (no built graph /
+            // gate-unreachable) are NOT marked — they fail open to the
+            // global committed-gen trigger in the solve decision and
             // re-solve regardless.
-            // mDoorsBumpedSinceCommit is now populated per door OPEN/CLOSE
+            //
+            // Accepted edge case: a fully-closed door on a reachable
+            // voice's shortest route was rerouted AROUND (dropped from
+            // pathGateDoors), so its OPEN event does not intersect here —
+            // that voice keeps the detour route until its next natural
+            // re-solve trigger (movement/room/rising). Unreachable voices
+            // fail open and catch the opening immediately.
+            // mDoorsBumpedSinceCommit is populated per door OPEN/CLOSE
             // EVENT (notifyDoorAcousticEvent), not per sim tick (Stage 2):
             // a swing no longer needs continuous re-solves because the
             // fresh door-gate above carries the volume, so we re-solve
@@ -7186,16 +7195,15 @@ void AudioService::loopStep(float deltaTime)
             // in the gate loop above, independent of this drain.
             if (!mDoorsBumpedSinceCommit.empty()) {
                 uint64_t markedThisCommit = 0;
-                for (int32_t d : mDoorsBumpedSinceCommit) {
-                    auto it = mDoorVoices.find(d);
-                    if (it == mDoorVoices.end()) continue;
-                    for (SoundHandle h : it->second) {
-                        ActiveVoice *v = mVoicePool ? mVoicePool->find(h)
-                                                    : nullptr;
-                        if (!v) continue;
-                        if (!v->pathScopedDoorDirty) {
-                            v->pathScopedDoorDirty = true;
-                            ++markedThisCommit;
+                if (mVoicePool) {
+                    for (auto &[h, v] : mVoicePool->voices()) {
+                        if (!v || v->pathScopedDoorDirty) continue;
+                        for (int32_t d : v->pathGateDoors) {
+                            if (mDoorsBumpedSinceCommit.count(d)) {
+                                v->pathScopedDoorDirty = true;
+                                ++markedThisCommit;
+                                break;
+                            }
                         }
                     }
                 }
@@ -8329,20 +8337,16 @@ void AudioService::loopStep(float deltaTime)
                             if (dmax > kScopeMissEqEpsilon) {
                                 uint64_t n = mScopeMissCount.fetch_add(
                                     1, std::memory_order_relaxed) + 1;
-                                auto rit = mVoiceRegisteredDoors.find(
-                                    voice->handle);
-                                size_t regDoors = (rit
-                                    != mVoiceRegisteredDoors.end())
-                                    ? rit->second.size() : 0;
                                 std::fprintf(stderr,
                                     "[SCOPE_MISS] #%llu voice h=%d '%s' "
                                     "eq delta=(%.3f,%.3f,%.3f) max=%.3f "
-                                    "(> eps %.3f) regDoors=%zu — scoping "
+                                    "(> eps %.3f) gateDoors=%zu — scoping "
                                     "excluded a voice a door change "
                                     "affected\n",
                                     (unsigned long long)n, voice->handle,
                                     voice->schemaName.c_str(), d0, d1, d2,
-                                    dmax, kScopeMissEqEpsilon, regDoors);
+                                    dmax, kScopeMissEqEpsilon,
+                                    voice->pathGateDoors.size());
                             }
                             voice->pathScopeWatchdogCoverCycle = UINT64_MAX;
                         }
@@ -9935,19 +9939,20 @@ void AudioService::loopStep(float deltaTime)
                     // fail-open trigger and the [PERF path_trig] census.
                     const bool trigDoorGenRaw =
                         voice->pathLastSolveDoorGen != stagingDoorGen;
-                    // ── O3-lite scoped door trigger ──
+                    // ── Scoped door trigger (keyed on the hybrid route) ──
                     //
-                    // A voice with a valid route set (pathRouteScopeValid,
-                    // set at its last solve, and NOT a no-route verdict)
-                    // re-solves for a door event ONLY when a door on one of
-                    // ITS routes committed — pathScopedDoorDirty, set at the
-                    // commit via the mDoorVoices reverse index. Every other
-                    // voice FAILS OPEN to the global committed-gen trigger:
-                    // router miss / unmapped rooms (pathRouteScopeValid
-                    // false) and no-route voices (a door opening ANYWHERE
-                    // may create their first route — keep that conservative,
+                    // A voice whose hybrid gate holds a live reachable
+                    // route (and NOT a no-route solve verdict) re-solves
+                    // for a door event ONLY when a door on ITS route
+                    // committed — pathScopedDoorDirty, set at the commit
+                    // drain via the pathGateDoors intersection. Every
+                    // other voice FAILS OPEN to the global committed-gen
+                    // trigger: no built graph / gate-unreachable and
+                    // no-route voices (a door opening ANYWHERE may create
+                    // their first route — keep that conservative,
                     // PLAN.PATHING_DESIGN.md §8 step 3).
-                    const bool scopeValid = voice->pathRouteScopeValid
+                    const bool scopeValid = mHybridGraph.built()
+                        && voice->pathGateReachable
                         && !voice->pathLastOutputsNoRoute;
                     const bool trigDoorGenScoped = scopeValid
                         ? voice->pathScopedDoorDirty
@@ -10078,52 +10083,36 @@ void AudioService::loopStep(float deltaTime)
                                 voice->pathStaleCoverCycle =
                                     mPathingSim->completedCycles() + 1;
                             }
-                            // ── O3-lite: refresh route scope + door
-                            //    registration for this solve ──
-                            // Microseconds (two portal Dijkstras + ellipse).
-                            // roomFromPoint for the source is O(rooms) but
-                            // only paid on actual solves (throttled). Clears
-                            // the scoped dirty flag — this signaled solve
-                            // covers the current committed door state.
-                            {
-                                Room *srcRoom = mRoomService
-                                    ? mRoomService->roomFromPoint(
-                                          voice->worldPos)
-                                    : nullptr;
-                                bool scopeOk = false;
-                                std::vector<int32_t> routeDoors =
-                                    computeRouteScope(
-                                        voice->worldPos, mListenerPos,
-                                        srcRoom, listenerRoom,
-                                        voice->maxAudibleDist, scopeOk);
-                                registerVoiceRouteDoors(handle, routeDoors);
-                                voice->pathRouteScopeValid = scopeOk;
-                                voice->pathScopedDoorDirty = false;
-                                if (scopeValid) ++pathingScopedSolves;
-                                // Watchdog arm: this solve was FORCED (scoping
-                                // alone wouldn't have re-solved) on a
-                                // scope-valid voice AND a door changed
-                                // globally since its last solve
-                                // (trigDoorGenRaw). Snapshot the cached eq
-                                // so the harvest can compare the fresh
-                                // forced-solve result (scope-miss check).
-                                // The trigDoorGenRaw guard isolates the
-                                // scoping question from pre-existing
-                                // sub-5 ft movement-memo staleness: without
-                                // a door change an eq delta is movement, not
-                                // a scope miss.
-                                if (scopeWatchdogTick && !scopedNeedsSolve
-                                    && scopeValid && trigDoorGenRaw
-                                    && mPathingSim) {
-                                    voice->pathScopeWatchdogEqSnapshot[0] =
-                                        voice->pathLastEq[0];
-                                    voice->pathScopeWatchdogEqSnapshot[1] =
-                                        voice->pathLastEq[1];
-                                    voice->pathScopeWatchdogEqSnapshot[2] =
-                                        voice->pathLastEq[2];
-                                    voice->pathScopeWatchdogCoverCycle =
-                                        mPathingSim->completedCycles() + 1;
-                                }
+                            // Clear the scoped dirty flag — this signaled
+                            // solve covers the current committed door
+                            // state. (The scope key itself is the hybrid
+                            // gate's pathGateDoors, maintained by the gate
+                            // loop — nothing to refresh here.)
+                            voice->pathScopedDoorDirty = false;
+                            if (scopeValid) ++pathingScopedSolves;
+                            // Watchdog arm: this solve was FORCED (scoping
+                            // alone wouldn't have re-solved) on a
+                            // scope-valid voice AND a door changed
+                            // globally since its last solve
+                            // (trigDoorGenRaw). Snapshot the cached eq
+                            // so the harvest can compare the fresh
+                            // forced-solve result (scope-miss check).
+                            // The trigDoorGenRaw guard isolates the
+                            // scoping question from pre-existing
+                            // sub-5 ft movement-memo staleness: without
+                            // a door change an eq delta is movement, not
+                            // a scope miss.
+                            if (scopeWatchdogTick && !scopedNeedsSolve
+                                && scopeValid && trigDoorGenRaw
+                                && mPathingSim) {
+                                voice->pathScopeWatchdogEqSnapshot[0] =
+                                    voice->pathLastEq[0];
+                                voice->pathScopeWatchdogEqSnapshot[1] =
+                                    voice->pathLastEq[1];
+                                voice->pathScopeWatchdogEqSnapshot[2] =
+                                    voice->pathLastEq[2];
+                                voice->pathScopeWatchdogCoverCycle =
+                                    mPathingSim->completedCycles() + 1;
                             }
                         } else {
                             // Due tick that can't signal (worker busy or
@@ -14276,40 +14265,41 @@ void AudioService::dumpAudioStatusPeriodic()
             (unsigned long long)tNoRoute, (unsigned long long)tSentinel);
     }
 
-    // [PERF scope] — O3-lite scoped-invalidation census (PLAN.PATHING_DESIGN
-    // §8). The headline is the door-swing solve-set size: dirtyMarked /
+    // [PERF scope] — scoped-invalidation census, re-keyed onto the hybrid
+    // gate route (PLAN.PATHING_DESIGN §8, PLAN.SELF_ROUTED_HYBRID). The
+    // headline is the door-swing solve-set size: dirtyMarked /
     // commitsWithMark = average voices invalidated per door commit (target:
     // shrink all-in-range ~11 to 1-3), dirtyMax = the worst single commit.
-    // regVoices/failOpen/avgDoors are an instantaneous snapshot of the
-    // reverse index; scopeMiss is the cumulative [SCOPE_MISS] watchdog count
-    // (must stay 0). routerPortals/mappedDoors describe the built graph.
+    // gateVoices/avgGateDoors snapshot the gate's per-voice route-door sets
+    // (the scope key); unreachable = voices whose gate found no surviving
+    // route (fail open to the global door trigger). scopeMiss is the
+    // cumulative [SCOPE_MISS] watchdog count (must stay 0).
     {
         const uint64_t scDirty   = sScopeDirtyMarkedWindow.exchange(0, std::memory_order_relaxed);
         const uint64_t scCommits = sScopeCommitCountWindow.exchange(0, std::memory_order_relaxed);
         const uint64_t scMax     = sScopeDirtyMaxWindow.exchange(0, std::memory_order_relaxed);
-        int    regVoices = 0;
-        size_t totDoors  = 0;
-        int    failOpen  = 0;
-        for (const auto &kv : mVoiceRegisteredDoors) {
-            if (kv.second.empty()) continue;
-            ++regVoices;
-            totDoors += kv.second.size();
-        }
+        int    gateVoices  = 0;
+        size_t totDoors    = 0;
+        int    unreachable = 0;
         if (mVoicePool) {
             for (const auto &[h, v] : mVoicePool->voices()) {
-                if (v && v->pathEverSolved && !v->pathRouteScopeValid)
-                    ++failOpen;
+                if (!v) continue;
+                if (!v->pathGateReachable) ++unreachable;
+                if (!v->pathGateDoors.empty()) {
+                    ++gateVoices;
+                    totDoors += v->pathGateDoors.size();
+                }
             }
         }
         const double avgMarked = scCommits ? (double)scDirty / (double)scCommits : 0.0;
-        const double avgDoors  = regVoices ? (double)totDoors / (double)regVoices : 0.0;
+        const double avgDoors  = gateVoices ? (double)totDoors / (double)gateVoices : 0.0;
         AUDIO_LOG(
             "[PERF scope] commitsWithMark=%llu dirtyMarked=%llu "
-            "(avg %.2f/commit, max %llu) regVoices=%d avgDoors=%.1f "
-            "failOpen=%d routerPortals=%zu mappedDoors=%zu scopeMiss=%llu\n",
+            "(avg %.2f/commit, max %llu) gateVoices=%d avgGateDoors=%.1f "
+            "unreachable=%d scopeMiss=%llu\n",
             (unsigned long long)scCommits, (unsigned long long)scDirty,
-            avgMarked, (unsigned long long)scMax, regVoices, avgDoors,
-            failOpen, mRouterPortals.size(), mDoorRoomPair.size(),
+            avgMarked, (unsigned long long)scMax, gateVoices, avgDoors,
+            unreachable,
             (unsigned long long)mScopeMissCount.load(std::memory_order_relaxed));
     }
 
@@ -19831,11 +19821,9 @@ bool AudioService::loadProbes(const std::string &probePath)
             v->pathLastOutputsNoRoute  = false;
             v->pathLastOutputsSentinel = true;
             v->pathVerdictCoverCycle   = UINT64_MAX;
-            // O3-lite: a route set solved against the old graph is
-            // meaningless — fail the voice open (global door trigger)
-            // until its covering re-solve rebuilds the scope, force a
-            // dirty solve, and drop any armed watchdog.
-            v->pathRouteScopeValid       = false;
+            // A route solved against the old graph is meaningless — force
+            // a dirty solve and drop any armed watchdog. (The gate loop
+            // re-keys pathGateDoors itself via pathGateValid=false below.)
             v->pathScopedDoorDirty       = true;
             v->pathScopeWatchdogCoverCycle = UINT64_MAX;
         }
