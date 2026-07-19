@@ -572,27 +572,22 @@ struct ActiveVoice {
 
     // ── Scoped door-event invalidation (main-thread only) ──
     //
-    // PLAN.PATHING_DESIGN.md §8 (O3-lite shadow router). The pre-scope
-    // door trigger fired for EVERY in-range voice on any door commit
-    // (pathLastSolveDoorGen != committedGen); the shadow router shrinks
-    // that to the 1-2 voices actually routed through the moving door.
+    // PLAN.PATHING_DESIGN.md §8, re-keyed onto the hybrid gate route. The
+    // pre-scope door trigger fired for EVERY in-range voice on any door
+    // commit (pathLastSolveDoorGen != committedGen); scoping shrinks that
+    // to the voices actually routed through the moving door.
     //
     //   pathScopedDoorDirty  — set at door COMMIT time (loopStep) for
-    //     voices registered against a door whose pose just entered the
-    //     BVH (via AudioService::mDoorVoices reverse index), OR for all
-    //     scope-valid voices on a fail-open commit (unmapped door with
-    //     no ellipse cover). Consumed (and cleared) at the voice's next
-    //     signaled SOLVE — the scoped replacement for the global doorGen
-    //     trigger. Init true so a voice with no prior solve still solves
-    //     (trigNever covers the same case; belt-and-suspenders).
-    //   pathRouteScopeValid  — true iff the voice's last covering solve
-    //     produced usable route data (router built, source+listener
-    //     rooms resolved, a finite route exists). When FALSE the voice
-    //     FAILS OPEN: it uses the global committed-gen door trigger, not
-    //     the scoped dirty flag (router miss / unmapped room / no-route
-    //     verdict → conservative). Init false = fail-open until solved.
+    //     voices whose hybrid route (pathGateDoors, below) crosses a door
+    //     whose pose just entered the BVH. Consumed (and cleared) at the
+    //     voice's next signaled SOLVE — the scoped replacement for the
+    //     global doorGen trigger. Voices without a usable route (no built
+    //     graph / gate-unreachable / no-route verdict) FAIL OPEN to the
+    //     global committed-gen trigger instead (conservative: a door
+    //     opening anywhere may create their first route). Init true so a
+    //     voice with no prior solve still solves (trigNever covers the
+    //     same case; belt-and-suspenders).
     bool     pathScopedDoorDirty = true;
-    bool     pathRouteScopeValid = false;
 
     // ── Hybrid door-gate route cache (main-thread only) ──
     //
