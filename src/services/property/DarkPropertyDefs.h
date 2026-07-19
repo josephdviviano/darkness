@@ -343,8 +343,8 @@ struct PropSchLastSa {
 // P$SpotlightAndAmbient — dtype: SpotAmb, 12 bytes. RENDERER property.
 //
 // Despite the audio-sounding "Ambient" name and the field names below, this
-// is a *lighting* property in the original engine — `g_SpotlightAndAmbientProp`
-// in the renderer's light-property table, paired with P$Light + P$Spotlight
+// is a *lighting* property in the original engine — the spotlight-and-ambient
+// entry in the renderer's light-property table, paired with P$Light + P$Spotlight
 // to encode a spotlight that ALSO emits an omnidirectional ambient term.
 // The field names were lifted from an OPDE-era dtype guess that confused
 // this with sound data; semantically it is the same 3-float vector the

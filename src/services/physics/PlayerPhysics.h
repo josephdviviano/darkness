@@ -58,7 +58,7 @@
 namespace Darkness {
 
 /// Per-frame velocity constraint — rebuilt from validated contacts each frame.
-/// Matches the original Dark Engine's tConstraint { ObjID cause; mxs_vector dir; }.
+/// Matches the original Dark Engine's per-frame constraint record (an object-ID cause plus a direction vector).
 /// Constraints are ephemeral (cleared + rebuilt every frame); contacts are persistent.
 struct VelocityConstraint {
     Vector3 normal;      // constraint direction (prevents motion in this direction)
@@ -645,7 +645,7 @@ private:
     }
 
     /// Called on every airborne transition (last floor contact destroyed, grace-timer
-    /// expired, or teleport). Matches original Dark Engine LeaveGround: clears ground
+    /// expired, or teleport). Matches the original Dark Engine leave-ground transition: clears ground
     /// object and snapshots the current FOOT position / sim time into the stride tracker
     /// so cur_dist² starts near zero on the first airborne frame. Without this, a stale
     /// mLastFootLoc (e.g. constructor default or last-stride location from before the
@@ -731,7 +731,7 @@ private:
                     // Match original semantics by destroying the now-stale
                     // FOOT floor contacts here, immediately. leaveGround()
                     // then clears mGroundObjID and resets stride tracking,
-                    // mirroring the original LeaveGround() call site.
+                    // mirroring the original engine's leave-ground call site.
                     for (auto it = mContacts.begin(); it != mContacts.end(); ) {
                         if (it->submodelIdx == 4 &&
                             it->normal.z > GROUND_NORMAL_MIN) {
@@ -778,12 +778,12 @@ private:
         mModelTime = 0.0f;
 
         // 4b. Validate existing contacts — destroys stale/invalid contacts.
-        //     Matches original: ConstrainFromTerrain (phcore.cpp lines 262-368)
-        //     runs in UpdateDynamics BEFORE UpdateModelTransDynamics.
+        //     Matches original: the terrain-constraint step
+        //     runs in UpdateDynamics BEFORE the transform-dynamics update.
         validateContacts();
 
         // 5. Apply forces to velocity: gravity + movement input.
-        //    Original: UpdateModelTransDynamics accumulates all forces (gravity,
+        //    Original: the transform-dynamics update accumulates all forces (gravity,
         //    buoyancy, friction, control) then integrates in one step. We match
         //    by running gravity, then movement (which integrates friction), then
         //    constraint — so pre-constraint vz is typically gravity impulse
@@ -810,7 +810,7 @@ private:
         integrateKnockback();
 
         // 6. Constrain velocity against validated contacts.
-        //    Matches original: ApplyConstraints (phmod.cpp line 1861) removes
+        //    Matches original: ApplyConstraints removes
         //    velocity components going into surfaces AFTER dynamics.
         constrainVelocity();
 
@@ -886,7 +886,7 @@ private:
         }
 
         // 9. Resolve collisions: sweep from mPosition to mEndPosition,
-        //    IntegrateToCollision + CheckStep/Bounce, then commit
+        //    integrate-to-collision step + CheckStep/Bounce, then commit
         //    mPosition = mEndPosition (UpdatePositions equivalent).
         resolveCollisions(contactCb);
 
@@ -1065,7 +1065,7 @@ private:
     bool  mLandingActive = false; // true while landing bump pose is active
 
     // Stride tracking — absolute position-based, matching original Dark Engine
-    // (PLYRMOV.CPP m_LastFootLoc / m_LastFootTime). Distance is computed each
+    // (the original engine's last-footstep position/time). Distance is computed each
     // frame as dist2(mLastFootLoc, currentFootLoc). Strides fire when distance
     // exceeds the velocity-dependent threshold. Refreshed to current foot
     // position on every airborne transition via leaveGround() — without this,
@@ -1077,7 +1077,7 @@ private:
     float   mLastStrideSimTime = 0.0f;  // simTime when last stride was activated
 
     // Ground contact normal, texture, and object from last collision pass.
-    // mGroundObjID matches original Dark Engine's m_GroundObj — tracks which terrain
+    // mGroundObjID matches the original Dark Engine's ground-object field — tracks which terrain
     // or object the player's feet are touching. Updated during validateContacts()
     // on FOOT contact transitions. Used for footstep sound placement and material lookup.
     Vector3 mGroundNormal{0.0f, 0.0f, 1.0f};
@@ -1085,8 +1085,8 @@ private:
     int32_t mGroundObjID = -1;       // object ID of ground surface (-1 = none/terrain cell)
 
     // Model time tracking — how much of the current frame has been consumed by
-    // position integration. Matches original Dark Engine's pDynamics->GetCurrentTime()
-    // (PHCORE.CPP line 5114). Used by IntegrateToCollision to compute remaining
+    // position integration. Matches original Dark Engine's pDynamics->GetCurrentTime().
+    // Used by the integrate-to-collision step to compute remaining
     // integration time: integration_time = collision_time - mModelTime. When
     // mModelTime equals the frame's total dt, integration_time = 0 and the model
     // is already at its end position — cascade collisions use the current position
@@ -1131,7 +1131,7 @@ private:
     // Per-frame velocity constraints — rebuilt from validated contacts each frame
     // by validateContacts(). Constraints are ephemeral velocity normals that prevent
     // penetration. Matches original Dark Engine separation: contacts persist in
-    // g_PhysContactLinks, constraints rebuilt in ConstrainFromTerrain/Objects each frame.
+    // the contact-link list, constraints rebuilt in the terrain- and object-constraint steps each frame.
     std::vector<VelocityConstraint> mConstraints;
 
     // Pre-allocated scratch buffers for resolveCollisions() — avoids per-step heap allocs

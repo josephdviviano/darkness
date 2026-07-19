@@ -73,7 +73,7 @@ public:
 
     /** puts a model to sleep or wakes it up
      * @note Should handle all the intricacies related to the fact object fell
-     * asleep including PhysFellAsleep/PhysWokeUp script messages
+     * asleep including the sleep/wake script messages
      * @note Will stop all the movement of the object
      * @param sleep The desired state of the object physical model (true will
      * put to sleep, false will wake up)

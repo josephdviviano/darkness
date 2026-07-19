@@ -308,7 +308,7 @@ struct RenderConfig {
     float propMinAttenuation  = 0.0f;
     // N-path BFS: how many simultaneous portal-graph paths to keep per
     // listener room. 1 = single shortest path; 2 = original Dark Engine
-    // (cBFRoomInfo::previous_room_2); 3+ = modernized. Clamped to [1, 4].
+    // (the per-room propagation record's second predecessor slot); 3+ = modernized. Clamped to [1, 4].
     uint32_t propMaxPaths     = 2;
     // Alternates kept only if their effective distance is within this
     // many world units of the primary. Matches the original engine's

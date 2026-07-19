@@ -119,7 +119,7 @@ typedef shared_ptr<FileGroup> FileGroupPtr;
 replaced, deleted or added. The new database of chunks can be written to a new
 file. This allows modifications to be done on a database, leaving the chunks in
 an original form if not touched. The order of the chunks is not guaranteed to
-stay equal. This is not a problem for DarkEngine. */
+stay equal. This is not a problem for Dark Engine. */
 class DarkFileGroup : public FileGroup {
 public:
     /** @copydoc FileGroup::FileGroup(FilePtr&) */

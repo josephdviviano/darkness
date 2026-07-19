@@ -402,7 +402,7 @@ audio:
     # N-path BFS: keep multiple portal-graph routes when a sound can reach
     # the listener through more than one doorway. 1 = single shortest path
     # (single-source behavior); 2 = original Dark Engine (dual-predecessor
-    # scheme matching cBFRoomInfo + MergeSounds); 3-4 = modernized. The
+    # scheme matching the per-room propagation record + path-merge step); 3-4 = modernized. The
     # multi-path-ambisonics renderer allocates up to 4 sub-source slots
     # per voice (kMaxSubSources in VoicePool.h), so set this to 4 to
     # keep every reachable doorway continuously active and avoid audible

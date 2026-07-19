@@ -58,7 +58,7 @@ void RoomPortal::read(const FilePtr &sf) {
     // polygon) point OUTWARD from the polygon interior. So the
     // polygon membership test is "every edge plane gives getDistance
     // ≤ 0 = inside the polygon". Matches the original engine's
-    // RPORTAL.CPP convention. RoomPortal::isInside / raycast /
+    // portal convention. RoomPortal::isInside / raycast /
     // getRaycastProjection follow this directly.
     //
     // History: an earlier version of this code negated `d`, which moved
@@ -156,10 +156,9 @@ void RoomPortal::write(const FilePtr &sf) {
 //   • Inside the polygon → getDistance ≤ 0 for every edge plane.
 //   • Outside (past one edge) → that edge gives getDistance > 0.
 //
-// Verified against the original engine (src/SIM/RPORTAL.CPP:146 in
-// cRoomPortal::Raycast):
-//     if (PointPlaneDist(m_EdgePlane[i], int_pt) > ON_PLANE_EPSILON)
-//        return FALSE;  // outside
+// Verified against the original engine's portal raycast, which rejects
+// an intersection point when any edge-plane distance exceeds a small
+// on-plane epsilon (the point lies outside the polygon).
 //
 // Earlier versions of this file had the opposite convention here
 // (treating negative side as outside). With the data we read verbatim
