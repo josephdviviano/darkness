@@ -15701,6 +15701,18 @@ void AudioService::buildHybridRouteGraph()
             "[HYBRID_GRAPH] NOTE: %zu of %zu doors map to no edge — their "
             "open-fraction will not gate any route (check door box margin if "
             "this is high)\n", noEdges, doors.size());
+
+    // The graph just changed under any voice that cached a route against the
+    // OLD one (probe set, edges, and door→edge map can all differ). Invalidate
+    // every voice's gate cache so the next loopStep re-paths against the fresh
+    // graph. Harmless at load (no voices yet); the live path is a mid-session
+    // rebuildPathingAdjacency (console-rebindable), which bumps neither the
+    // door gen nor listener/source position, so without this the per-voice
+    // re-path triggers would never fire and voices would keep stale routes.
+    if (mVoicePool) {
+        for (auto &[h, v] : mVoicePool->voices())
+            v->pathGateValid = false;
+    }
 }
 
 //------------------------------------------------------

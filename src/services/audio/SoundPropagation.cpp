@@ -38,25 +38,36 @@ SoundPropagation::SoundPropagation(RoomService *roomService)
 SoundPropagation::~SoundPropagation() = default;
 
 //------------------------------------------------------
-void SoundPropagation::setBlockingCore(int room1, int room2, float factor)
+void SoundPropagation::contributeBlocking(int room1, int room2,
+                                          uint32_t originKey, float factor)
 {
-    // Bidirectional — store both keys. No adjacent-room spread (see header).
-    const uint32_t key1 = (static_cast<uint32_t>(room1) << 16) |
-                          static_cast<uint32_t>(room2 & 0xFFFF);
-    const uint32_t key2 = (static_cast<uint32_t>(room2) << 16) |
-                          static_cast<uint32_t>(room1 & 0xFFFF);
+    // One undirected boundary key; contributions bucketed by the door that
+    // made them, so a lowering/clearing door touches only its own bucket.
+    const uint32_t tk = pairKey(room1, room2);
+    auto &origins = mBlockingContrib[tk];
+    if (factor <= 0.0f)
+        origins.erase(originKey);
+    else
+        origins[originKey] = factor;
 
-    if (factor <= 0.0f) {
-        mBlockingFactors.erase(key1);
-        mBlockingFactors.erase(key2);
+    // Effective boundary factor = MAX over the surviving contributions (the
+    // tightest-sealing door governs the boundary). Dropping the last
+    // contribution opens the boundary and frees the bucket.
+    float eff = 0.0f;
+    for (const auto &kv : origins)
+        if (kv.second > eff) eff = kv.second;
+
+    if (eff <= 0.0f) {
+        mBlockingFactors.erase(tk);
+        mBlockingContrib.erase(tk);
     } else {
-        mBlockingFactors[key1] = factor;
-        mBlockingFactors[key2] = factor;
+        mBlockingFactors[tk] = eff;
     }
 }
 
 //------------------------------------------------------
-void SoundPropagation::blockAdjacentRooms(int room1, int room2, float factor)
+void SoundPropagation::blockAdjacentRooms(int room1, int room2,
+                                          uint32_t originKey, float factor)
 {
     if (!mRoomService) return;
     Room *r1 = mRoomService->getRoomByID(room1);
@@ -79,8 +90,8 @@ void SoundPropagation::blockAdjacentRooms(int room1, int room2, float factor)
             Room *far2 = p2 ? p2->getFarRoom() : nullptr;
             if (!far2) continue;
             if (far2->getRoomID() == rr) {
-                setBlockingCore(room1, rr, factor);
-                setBlockingCore(room2, rr, factor);
+                contributeBlocking(room1, rr, originKey, factor);
+                contributeBlocking(room2, rr, originKey, factor);
                 break;   // R found for this p1; move to r1's next portal
             }
         }
@@ -90,11 +101,15 @@ void SoundPropagation::blockAdjacentRooms(int room1, int room2, float factor)
 //------------------------------------------------------
 void SoundPropagation::setBlockingFactor(int room1, int room2, float factor)
 {
-    setBlockingCore(room1, room2, factor);
-    // Multi-room doorway spread (original-engine parity): also block the
-    // pairs to any room adjacent to both of the door's rooms. factor <= 0
-    // erases those too.
-    blockAdjacentRooms(room1, room2, factor);
+    // A door IS its room pair — key all of its contributions (primary +
+    // spread) by that origin so opening the door clears exactly its own and
+    // never a different door sharing one of the boundaries.
+    const uint32_t origin = pairKey(room1, room2);
+    contributeBlocking(room1, room2, origin, factor);   // primary boundary
+    // Multi-room doorway spread: also block the pairs to any room adjacent to
+    // both of the door's rooms, so a wide opening is not under-blocked.
+    // factor <= 0 clears this door's spread contributions.
+    blockAdjacentRooms(room1, room2, origin, factor);
     // BFS reads the map fresh on each query — no cache invalidation needed.
     AUDIO_LOG("[DOOR_BLOCK] setBlockingFactor room(%d,%d) factor=%.3f mapSize=%zu\n",
               room1, room2, factor, mBlockingFactors.size());
@@ -103,9 +118,7 @@ void SoundPropagation::setBlockingFactor(int room1, int room2, float factor)
 //------------------------------------------------------
 float SoundPropagation::getBlockingFactor(int room1, int room2) const
 {
-    const uint32_t key = (static_cast<uint32_t>(room1) << 16) |
-                         static_cast<uint32_t>(room2 & 0xFFFF);
-    auto it = mBlockingFactors.find(key);
+    auto it = mBlockingFactors.find(pairKey(room1, room2));
     return (it != mBlockingFactors.end()) ? it->second : 0.0f;
 }
 
@@ -131,6 +144,7 @@ float SoundPropagation::getRoomTransmission(int32_t roomID) const
 void SoundPropagation::clear()
 {
     mBlockingFactors.clear();
+    mBlockingContrib.clear();
     mRoomTransmission.clear();
 }
 
