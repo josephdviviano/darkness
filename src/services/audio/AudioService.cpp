@@ -1426,14 +1426,15 @@ static std::atomic<uint64_t> sDoorCommitsWindow{0};
 static std::atomic<uint64_t> sDoorCommitDeferredWindow{0};
 static std::atomic<uint64_t> sPathSignalsWindow{0};
 
-// ── [PERF scope] — O3-lite scoped-invalidation census (per-dump-window) ──
+// ── [PERF scope] — scoped-invalidation census (per-dump-window) ──
 //
 // The scope solve-set size during door swings is the headline metric
 // (target: shrink all-in-range ~11 to the 1-2 actually routed through the
-// moving door). dirtyMarked = total voice-dirty marks across commits that
-// touched a registered voice; commitsWithMark = number of such commits;
-// dirtyMax = the largest single-commit solve set. All written main-thread
-// (loopStep commit block); drained by dumpAudioStatusPeriodic.
+// moving door, per their hybrid gate route). dirtyMarked = total
+// voice-dirty marks across commits that touched a routed voice;
+// commitsWithMark = number of such commits; dirtyMax = the largest
+// single-commit solve set. All written main-thread (loopStep commit
+// block); drained by dumpAudioStatusPeriodic.
 static std::atomic<uint64_t> sScopeDirtyMarkedWindow{0};
 static std::atomic<uint64_t> sScopeCommitCountWindow{0};
 static std::atomic<uint64_t> sScopeDirtyMaxWindow{0};
@@ -9174,12 +9175,12 @@ void AudioService::loopStep(float deltaTime)
             // Staged-SKIPs produced by the unreachable-route cache this
             // pass (suppressed exhaustive re-solves; subset of skipped).
             uint32_t pathingStagedUnreachableCached = 0;
-            // O3-lite scope counters (pushed to [PERF pathing]).
-            //   scopedSolves = staged solves on a scope-valid voice (route
-            //     set active — these benefit from scoping);
+            // Scope counters (pushed to [PERF pathing]).
+            //   scopedSolves = staged solves on a scope-valid voice (live
+            //     gate route — these benefit from scoping);
             //   scopeSkipped = in-range voices whose GLOBAL door gen
             //     advanced but scoping suppressed the re-solve (the moved
-            //     doors were not on this voice's routes) — the direct win.
+            //     doors were not on this voice's route) — the direct win.
             uint32_t pathingScopedSolves = 0;
             uint32_t pathingScopeSkipped = 0;
 
@@ -10035,8 +10036,8 @@ void AudioService::loopStep(float deltaTime)
                         // re-solved (trigDoorGen false). Two disjoint
                         // reasons, separated by scopeValid:
                         //   • scopeValid && !dirty → SCOPE SKIP: the moved
-                        //     door(s) were not on this voice's routes —
-                        //     the O3-lite win. [PERF pathing] scopeSkipped=.
+                        //     door(s) were not on this voice's gate route —
+                        //     the scoping win. [PERF pathing] scopeSkipped=.
                         //   • fail-open no-route voice, doors not quiet →
                         //     the pre-existing unreachable-route cache
                         //     defer. [PERF pathing] unreachableCached=.
