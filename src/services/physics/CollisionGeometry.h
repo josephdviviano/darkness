@@ -81,17 +81,17 @@ struct SphereContact {
                            // TerrainEdge, or TerrainVertex. Only TerrainFace triggers
                            // stair stepping (CheckStep uses == kPC_TerrainFace).
     float time = -1.0f;   // collision time along the sweep [0,1], or -1 for static contacts.
-                           // Matches original engine's sSphrContact.time (sphrcst.cpp).
+                           // Matches original engine's sSphrContact.time.
                            // 0 = contact at sweep start, 1 = contact at sweep end.
                            // Used for time-ordered collision processing.
     Vector3 hitPoint{0.0f}; // collision hit location (world space). For point submodels:
                            // the raycast intersection on the polygon surface. Used by
-                           // IntegrateToCollision (PHCORE.CPP lines 5145-5151) which
-                           // computes backup from the hit location directly for points.
+                           // the integrate-to-collision step which computes backup
+                           // from the hit location directly for points.
     Vector3 edgeStart{0.0f}; // edge contact start vertex (world space). Stored so
     Vector3 edgeEnd{0.0f};   // validateContacts can recompute closest-point distance
-                           // each frame, matching original's cEdgeContact::GetDist()
-                           // (PHCONTCT.CPP lines 425-452).
+                           // each frame, matching the original's edge-contact
+                           // distance test.
 };
 
 /// Collision geometry wrapper over WR parsed data.
@@ -323,7 +323,7 @@ public:
             float dEnd   = plane.getDistance(newCenter);
 
             // Crossing detection: sphere was outside at start and inside at end.
-            // Original engine's RegisterContact (sphrcst.cpp lines 462-493) has NO
+            // Original engine's RegisterContact has NO
             // filter on end-position penetration depth — ALL plane crossings with
             // valid time [0,1] generate contacts. We match this: generate contacts
             // for any crossing where dStart >= radius (outside) and dEnd < radius

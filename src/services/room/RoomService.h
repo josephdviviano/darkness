@@ -98,9 +98,9 @@ struct SoundPathRecord {
 /// Scalar fields below are merged across all paths in `paths` (see
 /// RoomService::propagateSoundPath); single-path callers can ignore the
 /// vector and consume the merged scalars unchanged. The original Dark
-/// Engine kept up to two predecessor paths per room (cBFRoomInfo's
-/// a hardcoded two-path merge); SP-1 generalizes to N configurable
-/// paths.
+/// Engine kept up to two predecessor paths per room (a hardcoded
+/// two-path merge in its per-room propagation record); SP-1 generalizes
+/// to N configurable paths.
 struct SoundPropInfo {
     /// Merged effective distance (min over paths). Drives volume.
     float effectiveDistance = 0.0f;
@@ -178,7 +178,8 @@ struct SoundPropParams {
     std::function<float(int32_t roomID)> loudRoom;
     /// Maximum number of simultaneous BFS paths kept per listener room.
     /// 1 = today's single-shortest-path behavior; 2 = the original Dark
-    /// Engine's dual-predecessor scheme (cBFRoomInfo::previous_room_2);
+    /// Engine's dual-predecessor scheme (the per-room propagation record's
+    /// second predecessor slot);
     /// up to 4 supported. Clamped to [1, 4] inside propagateSoundPath.
     /// Default 2 reproduces the original engine.
     uint32_t maxPaths = 2;

@@ -1,7 +1,7 @@
 // Included inside PlayerPhysics class body — do not include standalone.
 
-    /// Apply gravity to velocity. Matches original engine's UpdateModelTransDynamics
-    /// (phcore.cpp lines 1417-1421) which applies gravity EVERY frame unconditionally
+    /// Apply gravity to velocity. Matches original engine's transform-dynamics update,
+    /// which applies gravity EVERY frame unconditionally
     /// (except climbing/mantling). Floor contacts remove the downward component via
     /// constrainVelocity() (matching original's ApplyConstraints at line 1861).
     /// The downward velocity component during the frame is essential for swept collision
@@ -21,7 +21,7 @@
         if (mCurrentMode == PlayerMode::Climb || mMantling)
             return;
 
-        // Original (PHCORE.CPP lines 1413-1421): gravity added to sum_forces.
+        // Original engine: gravity added to sum_forces.
         // When in water, ALL forces halved first (line 1413: sum_forces *= 0.5).
         // Then buoyancy added (line 1424-1427).
         float gravForce = mGravityMag;
@@ -160,9 +160,9 @@
         return 0.0f;
     }
 
-    /// Apply movement — matches original UpdateModelTransDynamics + ControlVelocity.
+    /// Apply movement — matches the original transform-dynamics update + ControlVelocity.
     ///
-    /// Original flow (PHCORE.CPP lines 1349-1509, PHCTRL.CPP lines 130-220):
+    /// Original flow:
     ///   1. ControlVelocity() computes ctrl_accel = (desired - current) * rate
     ///   2. ctrl_accel added to sum_forces (acceleration accumulator)
     ///   3. Gravity added to sum_forces
@@ -206,7 +206,7 @@
             Vector3 hVel(mVelocity.x, mVelocity.y, 0.0f);
             Vector3 hDesired(desired.x, desired.y, 0.0f);
 
-            // Control acceleration added to forces (matching original PHCTRL.CPP line 214)
+            // Control acceleration added to forces (matching the original engine)
             Vector3 ctrlAccel = (hDesired - hVel) * rate;
 
             // Integrate forces: ideal_velocity = velocity + (ctrl_accel / mass) * dt
@@ -214,12 +214,12 @@
 
             Vector3 hActual;
             if (velocityControlled) {
-                // Original (PHCORE.CPP line 1465): friction SKIPPED when velocity-controlled.
+                // Original engine: friction SKIPPED when velocity-controlled.
                 // Control acceleration alone regulates speed toward desired.
                 hActual = hIdeal;
             } else {
                 // No input — apply friction to decelerate.
-                // Original PHCORE.CPP: friction is 3D, opposes ideal_velocity direction,
+                // Original engine: friction is 3D, opposes ideal_velocity direction,
                 // magnitude = friction_amt * mass * gravity * drag_scale
                 float frictionMag = friction * mMass * mGravityMag;
 
@@ -238,7 +238,7 @@
                 if (glm::length2(ideal3D) > 1e-8f) {
                     Vector3 frictionForce = -glm::normalize(ideal3D) * frictionMag;
 
-                    // Z-axis friction boost (D4): PHCORE.CPP lines 1474-1477
+                    // Z-axis friction boost (D4): from the original engine
                     bool onPlatform = (mPlatformObjID != 0);
                     if (onPlatform && ideal3D.z < 0.0f)
                         frictionForce.z = 0.0f;
@@ -294,7 +294,7 @@
                 if (glm::length2(ideal3D) > 1e-8f) {
                     Vector3 frictionForce = -glm::normalize(ideal3D) * frictionMag;
 
-                    // Z-axis friction boost (D4): PHCORE.CPP lines 1474-1477
+                    // Z-axis friction boost (D4): from the original engine
                     bool onPlatform = (mPlatformObjID != 0);
                     if (onPlatform && ideal3D.z < 0.0f)
                         frictionForce.z = 0.0f;
@@ -436,8 +436,8 @@
     }
 
     /// Direct contact transition — maintains foot-ground contact when the foot
-    /// slides off one polygon onto an adjacent one. Matches original Dark Engine
-    /// ConstrainFromTerrain (phcore.cpp lines 262-368).
+    /// slides off one polygon onto an adjacent one. Matches the original Dark
+    /// Engine terrain-constraint step.
     ///
     /// When the foot has a floor contact from the previous frame, check if the foot
     /// is still on that polygon. If not, raycast 0.1 units INTO the old surface to
@@ -446,7 +446,7 @@
     /// descent: the foot transitions directly from one tread to the next.
     ///
     /// Validate existing contacts each frame, matching original Dark Engine's
-    /// ConstrainFromTerrain (phcore.cpp lines 262-368). For each contact in
+    /// terrain-constraint step. For each contact in
     /// mContacts, check if the submodel is still on the polygon (distance +
     /// point-in-polygon). Valid contacts are kept for constrainVelocity().
     /// Invalid contacts are destroyed immediately (no age-based persistence).
@@ -461,8 +461,8 @@
 
     inline void validateContacts() {
         // Clear per-frame constraints FIRST — rebuilt from validated contacts below.
-        // Matches original Dark Engine ClearConstraints() (PHMOD.H lines 1276-1282)
-        // called at the start of each frame before ConstrainFromTerrain/Objects.
+        // Matches original Dark Engine ClearConstraints()
+        // called at the start of each frame before the terrain- and object-constraint steps.
         // Must happen before the early return so stale constraints don't persist
         // when player is outside collision geometry.
         mConstraints.clear();
@@ -477,9 +477,9 @@
             // detection if the contact is re-detected this frame.
             c.fresh = false;
 
-            // ── Object contact validation (ConstrainFromObjects, phcore.cpp lines 443-611) ──
-            // Checks surface distance (PhysGetObjsNorm) and geometric containment
-            // (SubModOnPoly with grow_poly=TRUE). Breaks contact if distance exceeds
+            // ── Object contact validation (ConstrainFromObjects) ──
+            // Checks surface distance (the surface-normal query) and geometric containment
+            // (the on-polygon submodel test with grow_poly=TRUE). Breaks contact if distance exceeds
             // kBreakObjectContactDist (0.2) or sphere has slid off the OBB face.
             // Refreshes contact normal from current OBB orientation.
             if (c.cellIdx < 0) {
@@ -527,7 +527,7 @@
                     Vector3 faceCenter = body->worldPos + faceNormal * halfExtent;
 
                     // Surface distance: dot(sphereCenter, faceNormal) - planeConst - radius
-                    // Matches original PhysGetObjsNorm → GetSphereVsOBBNormal (phmodutl.cpp lines 92-107)
+                    // Matches the original surface-normal query (sphere-vs-OBB normal)
                     float centerDist = glm::dot(subPos - faceCenter, faceNormal);
                     float surfaceDist = centerDist - subRadius;
 
@@ -536,7 +536,7 @@
                         continue;
                     }
 
-                    // On-face check: SubModOnPoly with grow_poly=TRUE (phcore.cpp line 488)
+                    // On-face check: the on-polygon submodel test with grow_poly=TRUE
                     // Projects sphere center onto face tangent axes, checks against
                     // halfExtent + expansion. Expansion = sphereRadius for sphere submodels.
                     Vector3 toSub = subPos - body->worldPos;
@@ -555,8 +555,8 @@
                     }
 
                     // Refresh normal from current OBB orientation.
-                    // Original recomputes via PhysGetObjsNorm each frame and uses
-                    // the fresh normal for AddConstraint (phcore.cpp line 543).
+                    // Original recomputes via the surface-normal query each frame and uses
+                    // the fresh normal for the new constraint.
                     c.normal = faceNormal;
 
                 } else if (body->shapeType == CollisionShapeType::Sphere) {
@@ -574,12 +574,11 @@
                 }
 
                 // Contact valid — create constraint from it.
-                // Matches original ConstrainFromObjects (PHCORE.CPP line 543):
-                // pModel->AddConstraint(pModel2->GetObjID(), i, normal)
+                // Matches original ConstrainFromObjects: adds a constraint from
+                // the other model's object ID and the contact normal.
                 mConstraints.push_back({c.normal, c.objectId});
                 // SetGroundObj (D20): track ground surface for FOOT floor contacts on objects.
-                // Matches original (PHCORE.CPP line 5537):
-                // g_pPlayerMovement->SetGroundObj(pOBBModel->GetObjID())
+                // Matches the original engine, which records the OBB model as the ground object.
                 if (c.submodelIdx == 4 && c.normal.z > GROUND_NORMAL_MIN)
                     mGroundObjID = c.objectId;
                 continue;
@@ -619,8 +618,8 @@
 
             if (c.isEdge) {
                 // Edge/vertex contacts: distance-only validation (no point-in-polygon).
-                // Matches original ConstrainFromTerrain (PHCORE.CPP lines 370-438):
-                // TerrainDistance calls cEdgeContact::GetDist (PHCONTCT.CPP lines 425-452)
+                // Matches the original terrain-constraint step:
+                // TerrainDistance calls the edge-contact distance test
                 // which computes the closest-point-on-segment distance each frame.
                 // Algorithm: project subPos onto the edge line. If past either endpoint,
                 // use endpoint distance. Otherwise use perpendicular distance via cross product.
@@ -657,8 +656,8 @@
                 }
             } else {
                 // Face contacts: distance + point-in-polygon validation.
-                // Matches original ConstrainFromTerrain (PHCORE.CPP lines 269-368):
-                // Face contacts require SubModOnPoly() in addition to distance check.
+                // Matches the original terrain-constraint step:
+                // Face contacts require the on-polygon submodel test in addition to distance check.
                 bool insidePoly = false;
                 if (closeToPlane) {
                     Vector3 projected = subPos - plane.normal * distToPlane;
@@ -670,12 +669,11 @@
 
                 if (closeToPlane && insidePoly) {
                     // Contact still valid — create constraint from it.
-                    // Matches original (PHCORE.CPP line 288):
-                    // pModel->AddConstraint(pFaceContact->GetObjID(), i, pFaceContact->GetNormal())
+                    // Matches the original engine, which adds a constraint from the
+                    // face contact's object ID and normal.
                     mConstraints.push_back({c.normal, c.objectId});
                     // SetGroundObj (D20): track ground surface for FOOT floor contacts.
-                    // Matches original (PHCORE.CPP line 329):
-                    // g_pPlayerMovement->SetGroundObj(faceContact.GetObjID())
+                    // Matches the original engine, which records the face contact's object as the ground object.
                     if (c.submodelIdx == 4 && c.normal.z > GROUND_NORMAL_MIN)
                         mGroundObjID = c.objectId;
                     continue;
@@ -739,10 +737,10 @@
                 }
                 mContacts.erase(mContacts.begin() + ci);
 
-                // LeaveGround (D19): when the last FOOT floor contact is destroyed,
-                // immediately transition to Jump. Original (PHCORE.CPP line 360-361):
-                // if (!pModel->GetFaceContacts(PLAYER_FOOT, &pDummy))
-                //     g_pPlayerMovement->LeaveGround();
+                // Leave-ground transition (D19): when the last FOOT floor contact
+                // is destroyed, immediately transition to Jump. The original engine
+                // fires its leave-ground transition once the foot has no remaining
+                // face contacts.
                 if (wasFoot && isOnGround()) {
                     bool hasFootFloor = false;
                     for (const auto &rc : mContacts) {
@@ -763,20 +761,20 @@
     }
 
     /// Collision backup factor — original Dark Engine kPartialBackupAmt = 0.9
-    /// (phcore.cpp line 5010, "nasty hack to try to avoid epsilon issues").
-    /// Used ONLY in IntegrateToCollision (backing up to collision point) and
+    /// (original engine, "nasty hack to try to avoid epsilon issues").
+    /// Used ONLY in the integrate-to-collision step (backing up to collision point) and
     /// the Integrate() collision-context function (lines 5018/5035). NOT used
-    /// in normal position integration — UpdateTargetLocation (PHMOD.CPP line 1871)
+    /// in normal position integration — UpdateTargetLocation
     /// uses pure position = position + velocity * dt.
     static constexpr float kPartialBackupAmt = 0.9f;
 
-    /// Terrain bounce elasticity — original Dark Engine kTerrainBounce (PHCONST.H line 73).
+    /// Terrain bounce elasticity — original Dark Engine kTerrainBounce.
     /// Combined with model elasticity: dampen = model_elasticity * kTerrainBounce.
     /// Player default elasticity = 1.0, so dampen = 0.1 (10% energy return on bounce).
     static constexpr float kTerrainBounce = 0.1f;
 
-    /// Integrate position from velocity. Matches original UpdateTargetLocation
-    /// (PHMOD.CPP line 1871): position = position + velocity * dt.
+    /// Integrate position from velocity. Matches original UpdateTargetLocation:
+    /// position = position + velocity * dt.
     /// No backup factor — kPartialBackupAmt is only for collision backup contexts.
     inline void integrate() {
         mPosition += mVelocity * mTimestep.fixedDt;

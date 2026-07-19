@@ -28,7 +28,7 @@
 //
 // Architecture:
 //   - Messages are {to, name, from, data, data2, data3, time, flags} tuples
-//   - Data fields use OPDE Variant (7-type tagged union matching cMultiParm)
+//   - Data fields use OPDE Variant (7-type tagged union matching a multi-type parameter)
 //   - Handlers register per-object or per-message-name (global)
 //   - ControlDevice link traversal: when an object is activated, follow its
 //     ControlDevice relations and send TurnOn/TurnOff to linked targets
@@ -62,7 +62,7 @@ enum ScriptMessageFlags : uint32_t {
 
 // ── Script message ──
 // Matches the Dark Engine's sScrMsg structure. Data fields use OPDE Variant
-// (equivalent to the original engine's cMultiParm). Three data slots allow
+// (equivalent to the original engine's multi-type parameter). Three data slots allow
 // messages to carry typed payloads (e.g., timer name + delay, damage amount
 // + type, frob source + destination).
 struct ScriptMessage {

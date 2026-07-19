@@ -115,7 +115,7 @@ struct SchemaPlayParams {
     /// volume_centibels = gain - falloffPct * (5000 + gain) / attenuationFactor
     ///
     /// Note: in the original engine this is per-PLAY-INSTANCE (passed
-    /// into cPropSndInst::Init). We treat it as per-schema since that's
+    /// into the sound-instance init). We treat it as per-schema since that's
     /// how it's authored — every play of a given schema uses the same
     /// factor.
     float attenuationFactor = 1.0f;

@@ -48,7 +48,7 @@
             mClimbFaceIdx = faceIdx;
             mCurrentMode = PlayerMode::Climb;
             // SetGroundObj (D20): set ground to climbing object on climb entry.
-            // Matches original PHCLIMB.CPP lines 325, 371, 416.
+            // Matches the original engine.
             mGroundObjID = c.objectId;
 
             // Remove velocity component going into the wall (preserve tangential).
@@ -265,7 +265,7 @@
 
         // Clear climbing state
         mClimbingObjId = -1;
-        // SetGroundObj(OBJ_NULL) on climb exit — matches original PHCLIMB.CPP line 270.
+        // SetGroundObj(OBJ_NULL) on climb exit — matches the original engine.
         mGroundObjID = -1;
         mClimbFaceIdx = -1;
         mClimbFaceNormal = Vector3(0.0f);

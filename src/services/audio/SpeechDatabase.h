@@ -22,17 +22,17 @@
 // SpeechDatabase — decodes the Speech_DB chunk (Dark Engine speech voice
 // database, v1.3). Layout, in order on disk:
 //
-//   cSpeechDomain
-//     NameMap m_Concept    // "sleeping", "atlevelzero", ..., "playerseesfumus"
-//     NameMap m_Tag        // "Event", "Fungus", "Landing", "Damage", ...
-//     NameMap m_Value      // "Acquire", "Launch", "Collision", "Footstep", ...
+//   speech-domain struct:
+//     NameMap concept      // "sleeping", "atlevelzero", ..., "playerseesfumus"
+//     NameMap tag          // "Event", "Fungus", "Landing", "Damage", ...
+//     NameMap value        // "Acquire", "Launch", "Collision", "Footstep", ...
 //     int     nConceptPrio
 //     int32   conceptPrio[nConceptPrio]   // per-concept priority
 //     int     nTagFlags
 //     int32   tagFlags[nTagFlags]         // bit 0 = int-typed tag, bit 1 = enum-typed
 //   int       nVoices
-//   cSpeechVoice voices[nVoices]
-//     // Each voice = m_Concept.size() sequential tag databases (one per concept).
+//   voice records[nVoices]
+//     // Each voice = concept-map size sequential tag databases (one per concept).
 //
 // Where NameMap is:
 //   int32 upperBound
@@ -97,7 +97,7 @@ public:
     // First N raw bytes of the chunk — fingerprint / debug aid.
     std::vector<uint8_t> headerBytes(size_t n = 16) const;
 
-    // Name maps (cSpeechDomain): concept[], tag[], value[]. Indices match
+    // Name maps (speech-domain): concept[], tag[], value[]. Indices match
     // those stored in the decoded entries' keyType / iData fields.
     const std::vector<std::string> &conceptNames() const { return mConcepts; }
     const std::vector<std::string> &tagNames()     const { return mTags; }

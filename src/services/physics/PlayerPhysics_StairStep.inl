@@ -1,13 +1,13 @@
 // Included inside PlayerPhysics class body — do not include standalone.
 //
-// Stair stepping — replicates the original Dark Engine's CheckStep + PostCollisionUpdate
+// Stair stepping — replicates the original Dark Engine's CheckStep + post-collision update
 // pipeline exactly. Called DURING resolveCollisions() when a leg-level wall contact is
 // detected. On success, replaces the normal bounce response (caller does `continue`).
 //
 // Original engine flow:
 //   1. Detect leg wall contact (normal.z < 0.4) during collision resolution
 //   2. CheckStep: 3-phase raycast (UP→FWD→DOWN), validate BODY sphere, apply position
-//   3. PostCollisionUpdate: re-run physics pipeline for remaining frame time
+//   3. Post-collision update: re-run physics pipeline for remaining frame time
 //      (zero accel → rebuild constraints → controls → dynamics → integrate → re-collide)
 //   4. Return from collision (skip bounce response)
 
@@ -26,7 +26,7 @@
         const Vector3 &backupPos)
     {
         // Movement direction from actual velocity at collision time.
-        // Original (PHCORE.CPP line 5338): pModel->GetVelocity(subModId) — the
+        // Original engine: pModel->GetVelocity(subModId) — the
         // full 3D velocity vector, scaled by 0.01 for the forward probe (line 5371).
         // The original does NOT zero the Z component — on slopes, the probe tilts.
         // We use mVelocity directly, matching the original. The speed magnitude
@@ -44,7 +44,7 @@
         // Original: fabs(normal.z) < 0.4, FOOT/SHIN/KNEE, terrain face only.
         // NO directional filter — original steps on any wall regardless of direction.
         // Use backupPos (backed up to ~collision point) matching original engine's
-        // IntegrateToCollision (phcore.cpp lines 5120-5121, kPartialBackupAmt=0.9).
+        // integrate-to-collision step (kPartialBackupAmt=0.9).
         float footOffsetZ = mSphereOffsetsBase[4]; // FOOT = -3.0
         Vector3 footPos = backupPos + Vector3(0.0f, 0.0f, footOffsetZ);
 
@@ -80,7 +80,7 @@
         }
 
         // ── Phase 1: Raycast UP (2 units from foot) ──
-        // Original: avatar IGNORES ceiling collision (phcore.cpp line 5365).
+        // Original: avatar IGNORES ceiling collision.
         // Clamp UP position to ceiling if hit, fail only if no headroom at all.
         Vector3 upStart = footPos + Vector3(0.0f, 0.0f, STEP_UP_EPSILON);
         Vector3 upPos = footPos + Vector3(0.0f, 0.0f, STEP_UP_DIST);
@@ -103,7 +103,7 @@
         }
 
         // ── Phase 2: Raycast FORWARD (velocity * 0.01) ──
-        // Original (PHCORE.CPP line 5371): movement_dir scaled by 0.01.
+        // Original engine: movement_dir scaled by 0.01.
         // movement_dir is the full velocity vector, so fwdDist = |velocity| * 0.01.
         float fwdDist = speed * STEP_FWD_SCALE;
         Vector3 fwdPos = upPos + moveDir * fwdDist;
@@ -169,7 +169,7 @@
         }
 
         // ── Validate: test sphere submodels at stepped position ──
-        // Original engine loops NumSubModels(), checks each sphere type.
+        // Original engine loops over each submodel, checking each sphere type.
         // Spring-connected submodels (HEAD, index 0) are validated at their CURRENT
         // position (not the stepped position), because the original sets:
         //   if (GetSpringTension(i) > 0) SetEndLocationVec(i, GetLocationVec(i));
@@ -217,7 +217,7 @@
                                                  sphereCell, mStepScratchContacts);
 
             // Reject if penetration exceeds STEP_VALIDATE_EPS (0.001, matches
-            // original engine's SPHR_EPSILON from SPHRCST.CPP line 57). The original
+            // original engine's SPHR_EPSILON). The original
             // uses a swept spherecast with implicit time-based tolerance; our static
             // test needs an explicit penetration threshold to filter floating-point
             // noise from exact-touch cases (sphere surface tangent to a polygon).
@@ -274,8 +274,7 @@
             footContact.submodelIdx = 4;
             mContacts.push_back(footContact);
             // SetGroundObj (D20): update ground surface on stair step.
-            // Matches original (PHCORE.CPP line 5511):
-            // g_pPlayerMovement->SetGroundObj(new_contact.GetObjID())
+            // Matches the original engine, which records the new contact's object as the ground object.
             mGroundObjID = footContact.objectId;
         }
 
@@ -295,9 +294,9 @@
             mCurrentMode != PlayerMode::Dead)
             mCurrentMode = PlayerMode::Stand;
 
-        // ── PostCollisionUpdate: re-integrate for remaining frame time ──
+        // ── Post-collision update: re-integrate for remaining frame time ──
         // Original engine re-runs the full physics pipeline after a step:
-        //   ZeroAcceleration → ClearConstraints → ConstrainFromTerrain/Objects →
+        //   ZeroAcceleration → ClearConstraints → terrain/object-constraint steps →
         //   UpdateModelControls → UpdateModelDynamics → UpdateModel → Re-collide
         // This is critical for smooth stepping: the player immediately gets real
         // floor contacts, velocity from gravity+friction, and forward movement.
@@ -309,7 +308,7 @@
     }
 
     /// Re-integration after collision (step or bounce), matching the original
-    /// engine's PostCollisionUpdate (PHCORE.CPP 4122-4152). Re-runs the core
+    /// engine's post-collision update. Re-runs the core
     /// physics pipeline for the remaining frame time: rebuild constraints,
     /// re-apply dynamics (gravity + movement + friction), compute a target
     /// position (endLocation), sweep from current to target for new collisions,
@@ -323,10 +322,10 @@
         }
 
         // 1. Rebuild constraints from current contacts (trust without re-validation).
-        //    Original PostCollisionUpdate calls ClearConstraints + ConstrainFromTerrain
-        //    for each submodel (lines 4131-4136). ConstrainFromTerrain rebuilds
+        //    Original post-collision update calls ClearConstraints + the terrain-
+        //    constraint step for each submodel. The terrain-constraint step rebuilds
         //    constraints from persistent contacts — it does NOT destroy contacts that
-        //    fail geometric checks within PostCollisionUpdate. We match this by
+        //    fail geometric checks within the post-collision update. We match this by
         //    trusting mContacts without running validateContacts().
         mConstraints.clear();
         for (const auto &c : mContacts) {
@@ -358,7 +357,7 @@
 
         // 5. Compute target position (endLocation) WITHOUT advancing mPosition.
         //    Matches original: UpdateModel → UpdateTargetLocation computes
-        //    EndLocationVec = LocationVec + velocity * dt (PHMOD.CPP line 1871).
+        //    EndLocationVec = LocationVec + velocity * dt.
         //    Position (LocationVec) does NOT advance until after collision detection.
         Vector3 endLocation = mPosition + mVelocity * dt;
 
@@ -458,7 +457,7 @@
 
         // 8. Commit position to endLocation BEFORE cascade processing.
         //    In the original, UpdateModel already advanced LocationVec to the
-        //    endLocation equivalent. When IntegrateToCollision runs for a cascade
+        //    endLocation equivalent. When the integrate-to-collision step runs for a cascade
         //    collision, model_time = frame end → integration_time = 0 → no backup.
         //    CheckStep uses the current LocationVec (= endLocation). We must
         //    commit mPosition here so cascade CheckStep sees the advanced position.
@@ -505,8 +504,8 @@
                 float cascadeRemaining = dt - cascadeCollisionTime;
                 cascadeRemaining = std::max(cascadeRemaining, 0.0001f);
 
-                // IntegrateToCollision: compute backup toward collision point.
-                // Original (PHCORE.CPP line 5115): integration_time = t0 + dt - model_time.
+                // Integrate-to-collision step: compute backup toward collision point.
+                // Original engine: integration_time = t0 + dt - model_time.
                 // If model_time >= t0 + dt, integration_time <= 0 → no backup (model
                 // already at or past collision point). This prevents double-integration
                 // in cascade collisions: after postStepReIntegrate committed position
@@ -518,7 +517,7 @@
                 Vector3 cascadeBackup;
                 if (integrationTime <= 0.0f) {
                     // Model already at or past collision point — use current position.
-                    // Matches original: IntegrateToCollision returns immediately when
+                    // Matches original: the integrate-to-collision step returns immediately when
                     // integration_time <= 0 (line 5117). CheckStep uses the current
                     // LocationVec which is the fully-advanced position.
                     cascadeBackup = mPosition;
@@ -550,7 +549,7 @@
                 }
             }
 
-            // Accumulate contacts for next frame (no push-out in PostCollisionUpdate)
+            // Accumulate contacts for next frame (no push-out in the post-collision update)
             mFreshContacts.insert(mFreshContacts.end(),
                                  mIterContacts.begin(), mIterContacts.end());
         }
@@ -682,8 +681,7 @@
             objContact.objectId = stepOBB->objID;
             mContacts.push_back(objContact);
             // SetGroundObj (D20): update ground surface on object stair step.
-            // Matches original (PHCORE.CPP line 5537):
-            // g_pPlayerMovement->SetGroundObj(pOBBModel->GetObjID())
+            // Matches the original engine, which records the OBB model as the ground object.
             mGroundObjID = stepOBB->objID;
         }
 
@@ -695,7 +693,7 @@
         if (mCurrentMode == PlayerMode::Climb)
             mCurrentMode = PlayerMode::Stand;
 
-        // PostCollisionUpdate: re-integrate for remaining frame time.
+        // Post-collision update: re-integrate for remaining frame time.
         // Previously missing — object steps got no physics re-run, causing
         // asymmetric behavior vs terrain steps.
         if (remainingDt > 0.0001f) {

@@ -36,7 +36,7 @@
 //     MessageDispatch global handlers (backward compat during migration)
 //
 // Inspired by the openDarkEngine (OPDE) service architecture (GPLv2).
-// Script system design follows Dark Engine's cScriptMan pattern.
+// Script system design follows the Dark Engine's script-manager pattern.
 
 #pragma once
 

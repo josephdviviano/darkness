@@ -21,7 +21,7 @@
 
 // ScriptBase.h — Per-object script base class
 //
-// Reimplements the Dark Engine's cScript base class pattern. Each object can
+// Reimplements the Dark Engine's script base class pattern. Each object can
 // have up to 4 scripts (from P$Scripts), each instantiated as a ScriptBase
 // subclass. Scripts receive named messages via receiveMessage() which routes
 // to type-specific virtual handlers (onTurnOn, onFrobWorldEnd, etc.).
