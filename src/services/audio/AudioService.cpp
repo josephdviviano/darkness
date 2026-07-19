@@ -5896,16 +5896,8 @@ void AudioService::destroyAcousticScene()
     }
     mSceneNeedsCommit.store(false, std::memory_order_relaxed);
 
-    // O3-lite scoped-invalidation state is scene-scoped (door maps + router
-    // graph + reverse index). Drop it all on teardown so a reload rebuilds
-    // from scratch (rebuildDoorScopeMaps runs at the next registerDoorGeometry).
-    mDoorRoomPair.clear();
-    mRoomPairDoors.clear();
-    mRouterPortals.clear();
-    mRouterRoomPortals.clear();
-    mRouterReady = false;
-    mDoorVoices.clear();
-    mVoiceRegisteredDoors.clear();
+    // Scoped-invalidation state is scene-scoped — drop the pending door
+    // bumps on teardown so a reload starts clean.
     mDoorsBumpedSinceCommit.clear();
 
     if (mIplStaticMesh) {
@@ -6294,14 +6286,9 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
     // the declaration comment in AudioService.h.
     logDoorPortalMap();
 
-    // O3-lite scoped invalidation: build door→room-pair maps + the shadow-
-    // router portal graph from this door batch + ROOM_DB. Registration
-    // edges (mDoorVoices) are per-voice and refreshed at solve time; the
-    // door set changed, so any stale reverse-index edges are meaningless.
-    mDoorVoices.clear();
-    mVoiceRegisteredDoors.clear();
+    // The door set changed under any pending bumps — drop them (the fresh
+    // registrations re-bump via setDoorTransform as poses arrive).
     mDoorsBumpedSinceCommit.clear();
-    rebuildDoorScopeMaps();
 }
 
 //------------------------------------------------------
@@ -11696,13 +11683,6 @@ void AudioService::createVoiceSource(ActiveVoice &voice)
 //------------------------------------------------------
 void AudioService::removeVoiceSource(ActiveVoice &voice)
 {
-    // O3-lite: drop this voice from the scoped-invalidation reverse index
-    // so a recycled handle can't inherit a dead voice's door edges. No-op
-    // for a voice that never solved (never registered). Main-thread only,
-    // like all scope state. Placed before the no-source early return so a
-    // registered handle is always cleaned.
-    unregisterVoiceRouteScope(voice.handle);
-
     if (!voice.directSource && !voice.reflectionSource && !voice.pathingSource)
         return;
 
@@ -15608,298 +15588,6 @@ void AudioService::buildHybridRouteGraph()
         for (auto &[h, v] : mVoicePool->voices())
             v->pathGateValid = false;
     }
-}
-
-//------------------------------------------------------
-// O3-lite scoped invalidation — door→room-pair maps + shadow-router graph.
-//
-// Built once per registerDoorGeometry batch (RoomService loaded by then).
-// mDoorRoomPair / mRoomPairDoors use the SAME point-to-AABB matcher as
-// logDoorPortalMap and the DoorPair bake classifier, so the three passes
-// can never drift on what portal a door belongs to. The router portal
-// graph is the physical-portal set (deduped via portalID<=destPortalID),
-// which is exactly the graph analysis/door_detour_class.py rebuilds
-// offline from the room_graph verb.
-void AudioService::rebuildDoorScopeMaps()
-{
-    mDoorRoomPair.clear();
-    mRoomPairDoors.clear();
-    mRouterPortals.clear();
-    mRouterRoomPortals.clear();
-    mRouterReady = false;
-
-    if (!mRoomService || !mRoomService->isLoaded()) {
-        std::fprintf(stderr,
-            "[SCOPE_ROUTER] RoomService not loaded — %zu doors unmapped, "
-            "all voices will fail open (global door trigger)\n",
-            mDoorAudioInstances.size());
-        return;
-    }
-
-    const auto &rooms = mRoomService->getAllRooms();
-
-    // ── Physical-portal graph (router adjacency) ──
-    for (const auto &roomPtr : rooms) {
-        if (!roomPtr) continue;
-        const int32_t rid = roomPtr->getRoomID();
-        const uint32_t pc = roomPtr->getPortalCount();
-        for (uint32_t i = 0; i < pc; ++i) {
-            ::Darkness::RoomPortal *portal = roomPtr->getPortal(i);
-            if (!portal) continue;
-            // One node per physical portal (same dedup as emission).
-            if (portal->getPortalID() > portal->getDestPortalID())
-                continue;
-            ::Darkness::Room *farRoom = portal->getFarRoom();
-            if (!farRoom) continue;
-            const int32_t fid = farRoom->getRoomID();
-            const int32_t a = std::min(rid, fid);
-            const int32_t b = std::max(rid, fid);
-            const uint32_t idx = static_cast<uint32_t>(mRouterPortals.size());
-            mRouterPortals.push_back({a, b, portal->getCenter()});
-            mRouterRoomPortals[a].push_back(idx);
-            mRouterRoomPortals[b].push_back(idx);
-        }
-    }
-    mRouterReady = !mRouterPortals.empty();
-
-    // ── door → room-pair (point-to-AABB matcher, same rule as bake) ──
-    int mapped = 0, unmapped = 0;
-    for (const auto &kv : mDoorAudioInstances) {
-        const DoorAudioInstance &di = kv.second;
-        if (di.worldAABBmin.x > di.worldAABBmax.x) continue;  // degenerate
-        float bestD = 1e30f;
-        int   bestA = -1, bestB = -1;
-        for (const auto &roomPtr : rooms) {
-            if (!roomPtr) continue;
-            const uint32_t pc = roomPtr->getPortalCount();
-            for (uint32_t i = 0; i < pc; ++i) {
-                ::Darkness::RoomPortal *portal = roomPtr->getPortal(i);
-                if (!portal) continue;
-                if (portal->getPortalID() > portal->getDestPortalID())
-                    continue;
-                ::Darkness::Room *farRoom = portal->getFarRoom();
-                const float d = std::sqrt(sPointAABBDistSq(
-                    portal->getCenter(), di.worldAABBmin, di.worldAABBmax));
-                if (d < bestD) {
-                    bestD = d;
-                    bestA = roomPtr->getRoomID();
-                    bestB = farRoom ? farRoom->getRoomID() : -1;
-                }
-            }
-        }
-        if (bestA >= 0 && bestB >= 0 && bestD <= kPathingDoorPortalMatchDistFt) {
-            const std::pair<int32_t, int32_t> rp(std::min(bestA, bestB),
-                                                 std::max(bestA, bestB));
-            mDoorRoomPair[kv.first] = rp;
-            mRoomPairDoors[rp].push_back(kv.first);
-            ++mapped;
-        } else {
-            // Genuine non-boundary door (closet/cabinet/shutter/out-of-
-            // coverage). No room-pair → covered only by the ellipse
-            // fallback / fail-open-all on bump.
-            ++unmapped;
-        }
-    }
-
-    std::fprintf(stderr,
-        "[SCOPE_ROUTER] built: %zu router portals, %d doors mapped to "
-        "room-pairs, %d unmapped (ellipse/fail-open), routerReady=%d\n",
-        mRouterPortals.size(), mapped, unmapped, mRouterReady ? 1 : 0);
-}
-
-//------------------------------------------------------
-// Shadow router: radius-bounded portal Dijkstra + ellipse fallback.
-// Returns the sorted, deduped door IDs a voice at (sourcePos,listenerPos)
-// is "routed through" — every door whose room-pair lies on a route within
-// kRouteSlackFt of the shortest S→T route, unioned with every door whose
-// world-AABB midpoint satisfies the path-length ellipse. Microseconds:
-// two Dijkstras over the physical-portal graph, bounded by maxAudibleDist.
-std::vector<int32_t> AudioService::computeRouteScope(
-    const Vector3 &sourcePos, const Vector3 &listenerPos,
-    Room *sourceRoom, Room *listenerRoom, float maxAudibleDist,
-    bool &outScopeValid) const
-{
-    outScopeValid = false;
-    std::vector<int32_t> doors;
-    if (!mRouterReady || !sourceRoom || !listenerRoom)
-        return doors;  // fail open
-
-    const int32_t srcRid = sourceRoom->getRoomID();
-    const int32_t lstRid = listenerRoom->getRoomID();
-    const size_t nP = mRouterPortals.size();
-    const float kInf = std::numeric_limits<float>::max();
-
-    // pathLen = shortest source→listener route length. Same-room = straight
-    // line (no portal crossed); cross-room = the portal-graph Dijkstra min.
-    float pathLen = kInf;
-
-    if (srcRid == lstRid) {
-        pathLen = glm::length(listenerPos - sourcePos);
-        // Same room: no portal on the direct route → route-portal set
-        // empty. Ellipse fallback below still catches an in-room door.
-        outScopeValid = true;
-    } else {
-        // Forward Dijkstra from the source (through portals bounding srcRoom).
-        std::vector<float> distF(nP, kInf);
-        std::vector<float> distB(nP, kInf);
-        using QE = std::pair<float, uint32_t>;   // (dist, portalIdx)
-
-        auto seed = [&](std::vector<float> &dist, int32_t roomID,
-                        const Vector3 &anchor) {
-            auto it = mRouterRoomPortals.find(roomID);
-            if (it == mRouterRoomPortals.end()) return;
-            for (uint32_t pi : it->second) {
-                const float d = glm::length(mRouterPortals[pi].center - anchor);
-                if (d < dist[pi]) dist[pi] = d;
-            }
-        };
-        auto relax = [&](std::vector<float> &dist) {
-            // Reset the PQ from the seeded distances.
-            std::priority_queue<QE, std::vector<QE>, std::greater<QE>> q;
-            for (uint32_t i = 0; i < nP; ++i)
-                if (dist[i] < kInf) q.push({dist[i], i});
-            while (!q.empty()) {
-                auto [d, u] = q.top(); q.pop();
-                if (d > dist[u]) continue;
-                if (d > maxAudibleDist) continue;  // radius bound
-                const RouterPortal &pu = mRouterPortals[u];
-                // Neighbors: portals sharing either of u's two rooms.
-                for (int side = 0; side < 2; ++side) {
-                    const int32_t room = side == 0 ? pu.a : pu.b;
-                    auto it = mRouterRoomPortals.find(room);
-                    if (it == mRouterRoomPortals.end()) continue;
-                    for (uint32_t v : it->second) {
-                        if (v == u) continue;
-                        const float w = glm::length(
-                            mRouterPortals[v].center - pu.center);
-                        const float nd = d + w;
-                        if (nd < dist[v] && nd <= maxAudibleDist) {
-                            dist[v] = nd;
-                            q.push({nd, v});
-                        }
-                    }
-                }
-            }
-        };
-
-        seed(distF, srcRid, sourcePos);
-        relax(distF);
-        seed(distB, lstRid, listenerPos);
-        relax(distB);
-
-        // Shortest route = min over portals of (distToPortal + portalToListener).
-        for (uint32_t i = 0; i < nP; ++i) {
-            if (distF[i] >= kInf) continue;
-            const float toLst = glm::length(
-                mRouterPortals[i].center - listenerPos);
-            const float total = distF[i] + toLst;
-            if (total < pathLen) pathLen = total;
-            // distB symmetric check (source-adjacent-to-listener portals).
-            if (distB[i] < kInf) {
-                const float t2 = distF[i] + distB[i];
-                if (t2 < pathLen) pathLen = t2;
-            }
-        }
-
-        if (pathLen >= kInf || pathLen > maxAudibleDist) {
-            // No finite route within audible range → no-route voice.
-            // Fail open (global door trigger, conservative): a door
-            // opening anywhere may create this voice's first route.
-            outScopeValid = false;
-            return doors;
-        }
-        outScopeValid = true;
-
-        // Route-portal set: every portal on a route within slack, via the
-        // vertex-on-ε-shortest-path test distF[p] + distB[p] ≤ pathLen+slack.
-        const float budget = pathLen + kRouteSlackFt;
-        for (uint32_t i = 0; i < nP; ++i) {
-            if (distF[i] >= kInf || distB[i] >= kInf) continue;
-            if (distF[i] + distB[i] <= budget) {
-                const std::pair<int32_t, int32_t> rp(
-                    mRouterPortals[i].a, mRouterPortals[i].b);
-                auto dit = mRoomPairDoors.find(rp);
-                if (dit != mRoomPairDoors.end())
-                    doors.insert(doors.end(), dit->second.begin(),
-                                 dit->second.end());
-            }
-        }
-    }
-
-    // ── Ellipse fallback (catches unmapped doors + router gaps) ──
-    // A door is plausibly on a route if going source→door→listener costs
-    // no more than the shortest route + slack (the classic focal-sum
-    // ellipse with foci at source/listener). Runs over ALL registered
-    // doors, so the 43 unmapped non-boundary doors near a path invalidate
-    // correctly even without a room-pair.
-    const float ellipseBudget = pathLen + kRouteSlackFt;
-    for (const auto &kv : mDoorAudioInstances) {
-        const DoorAudioInstance &di = kv.second;
-        if (di.worldAABBmin.x > di.worldAABBmax.x) continue;  // degenerate
-        const Vector3 mid(
-            (di.worldAABBmin.x + di.worldAABBmax.x) * 0.5f,
-            (di.worldAABBmin.y + di.worldAABBmax.y) * 0.5f,
-            (di.worldAABBmin.z + di.worldAABBmax.z) * 0.5f);
-        const float sum = glm::length(mid - sourcePos)
-                        + glm::length(mid - listenerPos);
-        if (sum <= ellipseBudget)
-            doors.push_back(kv.first);
-    }
-
-    std::sort(doors.begin(), doors.end());
-    doors.erase(std::unique(doors.begin(), doors.end()), doors.end());
-
-    // Empty door set → FAIL OPEN. A reachable voice for which neither the
-    // route-portal set nor the ellipse found ANY door has no actionable
-    // scope data: claiming "no door can ever affect me" is exactly the
-    // assertion the first stress runs caught being wrong (regDoors=0
-    // ambients whose SA multi-path diffraction reached a door the
-    // room-graph shortest-path proxy never traversed). Treat it as the
-    // fail-open case (global door trigger) — a natural extension of §8
-    // step 3's fail-open list. Costs a handful of isolated ambients their
-    // scoping benefit; the majority (doors in their ellipse) keep it.
-    if (doors.empty())
-        outScopeValid = false;
-    return doors;
-}
-
-//------------------------------------------------------
-// Refresh a voice's door registration (mDoorVoices / mVoiceRegisteredDoors).
-// Removes the voice from any door it was previously registered under that
-// is not in `doors`, then adds the new edges. Main-thread only.
-void AudioService::registerVoiceRouteDoors(SoundHandle h,
-                                           const std::vector<int32_t> &doors)
-{
-    auto &prev = mVoiceRegisteredDoors[h];  // creates empty on first solve
-    // Remove stale edges.
-    for (int32_t d : prev) {
-        if (std::find(doors.begin(), doors.end(), d) == doors.end()) {
-            auto it = mDoorVoices.find(d);
-            if (it != mDoorVoices.end()) {
-                it->second.erase(h);
-                if (it->second.empty()) mDoorVoices.erase(it);
-            }
-        }
-    }
-    // Add new edges.
-    for (int32_t d : doors)
-        mDoorVoices[d].insert(h);
-    prev = doors;
-}
-
-//------------------------------------------------------
-void AudioService::unregisterVoiceRouteScope(SoundHandle h)
-{
-    auto it = mVoiceRegisteredDoors.find(h);
-    if (it == mVoiceRegisteredDoors.end()) return;
-    for (int32_t d : it->second) {
-        auto dit = mDoorVoices.find(d);
-        if (dit != mDoorVoices.end()) {
-            dit->second.erase(h);
-            if (dit->second.empty()) mDoorVoices.erase(dit);
-        }
-    }
-    mVoiceRegisteredDoors.erase(it);
 }
 
 //------------------------------------------------------
@@ -19828,9 +19516,7 @@ bool AudioService::loadProbes(const std::string &probePath)
             v->pathScopeWatchdogCoverCycle = UINT64_MAX;
         }
     }
-    // Reverse index is per-voice route data against the old graph — drop it.
-    mDoorVoices.clear();
-    mVoiceRegisteredDoors.clear();
+    // Pending bumps measure against the old graph — drop them.
     mDoorsBumpedSinceCommit.clear();
     // Stale door epochs from before the reload measure against a dead
     // graph — drop them (same rationale as scene teardown).
