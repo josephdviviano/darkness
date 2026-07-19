@@ -607,21 +607,6 @@ struct ActiveVoice {
     bool     pathGateReachable = true;
     bool     pathGateValid = false;
 
-    // ── [SCOPE_MISS] watchdog (main-thread only) ──
-    //
-    // pathLastEq caches the most recent RAW pathing eqCoeffs read by the
-    // harvest pass (once attributable via the completed-cycles gate). The
-    // watchdog (~2 s) force-solves EVERY eligible in-range voice ignoring
-    // scoping; for a voice that scoping WOULD have skipped this tick it
-    // snapshots pathLastEq into pathScopeWatchdogEqSnapshot and arms
-    // pathScopeWatchdogCoverCycle. When the forced solve completes the
-    // harvest compares the fresh eq to the snapshot; a band delta beyond
-    // kScopeMissEqEpsilon means scoping wrongly excluded this voice from a
-    // door change → loud [SCOPE_MISS]. UINT64_MAX = not armed.
-    float    pathLastEq[3]                = {0.0f, 0.0f, 0.0f};
-    float    pathScopeWatchdogEqSnapshot[3] = {0.0f, 0.0f, 0.0f};
-    uint64_t pathScopeWatchdogCoverCycle  = UINT64_MAX;
-
     // Per-voice volumetric-occlusion sphere radius (engine feet).
     // Computed in createVoiceSource by raycasting from the source
     // position in N uniformly-distributed directions; the radius is
