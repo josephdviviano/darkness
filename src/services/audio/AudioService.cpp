@@ -2030,92 +2030,39 @@ static void steamAudioNodeProcess(ma_node* pNode, const float** ppFramesIn,
                 if (!node->pathSmoothInit) {
                     // First frame snaps (Steam Audio's own mFirstFrame
                     // pattern) — no fade-in from the init sentinel.
-                    for (int b = 0; b < 3; ++b) {
+                    for (int b = 0; b < 3; ++b)
                         node->pathSmoothEq[b] = rawEq[b];
-                        node->pathEqA[b] = node->pathEqB[b] = rawEq[b];
-                    }
-                    for (int i = 0; i < numSh; ++i) {
-                        const float s =
+                    for (int i = 0; i < numSh; ++i)
+                        node->pathSmoothSh[i] =
                             std::isfinite(rawSh[i]) ? rawSh[i] : 0.0f;
-                        node->pathSmoothSh[i] = s;
-                        node->pathShA[i] = node->pathShB[i] = s;
-                    }
-                    node->pathFracA = node->pathFracB =
-                        node->pathDoorFraction.load(
-                            std::memory_order_relaxed);
                     node->pathSmoothInit = true;
                 }
-                // New-solve detection: the worker rewrites the source's
-                // pathingOutputs in place; any byte difference from
-                // anchor B means a fresh solve landed. Shift B->A and
-                // stamp B with the governing door's CURRENT fraction.
-                bool changed = false;
-                for (int b = 0; b < 3 && !changed; ++b)
-                    changed = (rawEq[b] != node->pathEqB[b]);
-                for (int i = 0; i < numSh && !changed; ++i) {
-                    const float s =
-                        std::isfinite(rawSh[i]) ? rawSh[i] : 0.0f;
-                    changed = (s != node->pathShB[i]);
-                }
-                const float curFrac = node->pathDoorFraction.load(
-                    std::memory_order_relaxed);
-                if (changed) {
-                    for (int b = 0; b < 3; ++b) {
-                        node->pathEqA[b] = node->pathEqB[b];
-                        node->pathEqB[b] = rawEq[b];
-                    }
-                    for (int i = 0; i < numSh; ++i) {
-                        node->pathShA[i] = node->pathShB[i];
-                        node->pathShB[i] =
-                            std::isfinite(rawSh[i]) ? rawSh[i] : 0.0f;
-                    }
-                    node->pathFracA = node->pathFracB;
-                    node->pathFracB = curFrac;
-                }
-                // Target: while a door swings and the two anchors span a
-                // real fraction interval, extrapolate along the fraction
-                // axis (both anchors LAG the door, so t routinely lands
-                // past 1; the 1.6 bound caps overshoot). Otherwise the
-                // target is simply the latest solve.
-                float t = 1.0f;
-                bool fracDrive = false;
-                if (curFrac >= 0.0f && node->pathFracA >= 0.0f
-                    && node->pathFracB >= 0.0f) {
-                    const float span =
-                        node->pathFracB - node->pathFracA;
-                    if (std::fabs(span) > 0.02f) {
-                        t = (curFrac - node->pathFracA) / span;
-                        t = std::min(1.6f, std::max(0.0f, t));
-                        fracDrive = true;
-                    }
-                }
-                // Time-based approach to the target. Fraction-driven
-                // targets already move continuously with the door, so
-                // they use a tight constant to track it; solver-step
-                // targets use the configured constant to hide the
-                // ~10 Hz cadence.
-                const float effTau =
-                    fracDrive ? std::min(tauSec, 0.03f) : tauSec;
+                // Time-based one-pole toward the solver's latest values,
+                // hiding the ~10 Hz solve cadence in the routed bus's
+                // spectral shape. This smooths TONE only: the door-driven
+                // VOLUME is carried separately and lag-free by pathRouteGate
+                // (applied below), so the smoother must NOT also track the
+                // door fraction — doing so double-counts the door against the
+                // gate. eq band gains and SH coeffs are plain linear gains,
+                // safe to lerp.
                 const float frameDur =
                     static_cast<float>(frameCount)
                     / std::max(1.0f, static_cast<float>(
                            sEngineSampleRate.load(
                                std::memory_order_relaxed)));
                 const float alpha =
-                    1.0f - std::exp(-frameDur / std::max(1e-4f, effTau));
+                    1.0f - std::exp(-frameDur / std::max(1e-4f, tauSec));
                 for (int b = 0; b < 3; ++b) {
-                    const float target = node->pathEqA[b]
-                        + (node->pathEqB[b] - node->pathEqA[b]) * t;
                     node->pathSmoothEq[b] +=
-                        alpha * (std::max(0.1f, target)
+                        alpha * (std::max(0.1f, rawEq[b])
                                  - node->pathSmoothEq[b]);
                     pp.eqCoeffs[b] = node->pathSmoothEq[b];
                 }
                 for (int i = 0; i < numSh; ++i) {
-                    const float target = node->pathShA[i]
-                        + (node->pathShB[i] - node->pathShA[i]) * t;
+                    const float s =
+                        std::isfinite(rawSh[i]) ? rawSh[i] : 0.0f;
                     node->pathSmoothSh[i] +=
-                        alpha * (target - node->pathSmoothSh[i]);
+                        alpha * (s - node->pathSmoothSh[i]);
                 }
                 pp.shCoeffs = node->pathSmoothSh.data();
             } else {
@@ -6903,8 +6850,7 @@ void AudioService::loopStep(float deltaTime)
     // a door event, listener/source movement past the memo distance, or
     // when a cached path door fully closes (forcing a reroute). The product
     // over the cached path doors is recomputed from live fractions every
-    // step — cheap. pathDoorFraction (Track A §48) is the min path-door
-    // fraction (the governing door), or -1 when the path is door-free.
+    // step — cheap.
     if (mVoicePool && mHybridGraph.built()) {
         auto doorFrac = [&](int32_t id) -> float {
             auto it = mDoorAudioInstances.find(id);
@@ -6937,30 +6883,20 @@ void AudioService::loopStep(float deltaTime)
                 v->pathGateLst     = mListenerPos;
                 v->pathGateValid   = true;
             }
-            float gate = 1.0f, minFrac = 1.0f;
-            bool  hasDoor = false;
+            float gate = 1.0f;
             if (!v->pathGateReachable) {
                 gate = 0.0f;   // no route survives — silence, not a 0->1 jump
             } else {
-                for (int32_t id : v->pathGateDoors) {
-                    const float f = doorFrac(id);
-                    gate *= f;
-                    minFrac = std::min(minFrac, f);
-                    hasDoor = true;
-                }
+                for (int32_t id : v->pathGateDoors)
+                    gate *= doorFrac(id);   // series transmission over path doors
             }
             gate = std::max(0.0f, std::min(1.0f, gate));
             v->dspNode.pathRouteGate.store(gate, std::memory_order_relaxed);
-            v->dspNode.pathDoorFraction.store(
-                hasDoor ? minFrac : -1.0f, std::memory_order_relaxed);
         }
     } else if (mVoicePool) {
         // No route graph (headless / no probe batch): no gating.
-        for (auto &[h, v] : mVoicePool->voices()) {
+        for (auto &[h, v] : mVoicePool->voices())
             v->dspNode.pathRouteGate.store(1.0f, std::memory_order_relaxed);
-            v->dspNode.pathDoorFraction.store(-1.0f,
-                                              std::memory_order_relaxed);
-        }
     }
 
     // Cool down the per-voice visRange-clamp [FALLBACK] rate limiter
@@ -7245,8 +7181,8 @@ void AudioService::loopStep(float deltaTime)
             // a swing no longer needs continuous re-solves because the
             // fresh door-gate above carries the volume, so we re-solve
             // once per event to pick up the route-set change (which door
-            // is now open/closed). pathDoorFraction is refreshed every
-            // frame in the gate loop above, independent of this drain.
+            // is now open/closed). The gate itself is refreshed every frame
+            // in the gate loop above, independent of this drain.
             if (!mDoorsBumpedSinceCommit.empty()) {
                 uint64_t markedThisCommit = 0;
                 for (int32_t d : mDoorsBumpedSinceCommit) {
@@ -12225,13 +12161,11 @@ void AudioService::initVoiceDSP(ActiveVoice &voice)
             // to mFrameSize × 2 channels — one allocation, never realloc'd.
             dsp.pathOutL.assign(mFrameSize, 0.0f);
             dsp.pathOutR.assign(mFrameSize, 0.0f);
-            // Smoother + fraction-anchor SH buffers: (order+1)^2 floats,
-            // one allocation here, never realloc'd (audio-thread safe).
+            // Smoother SH buffer: (order+1)^2 floats, one allocation here,
+            // never realloc'd (audio-thread safe).
             const size_t numSh = static_cast<size_t>(
                 (mAmbisonicsOrder + 1) * (mAmbisonicsOrder + 1));
             dsp.pathSmoothSh.assign(numSh, 0.0f);
-            dsp.pathShA.assign(numSh, 0.0f);
-            dsp.pathShB.assign(numSh, 0.0f);
         }
     }
 

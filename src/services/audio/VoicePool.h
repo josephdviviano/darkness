@@ -320,28 +320,6 @@ struct SteamAudioDSPNode {
     float pathSmoothEq[3] = {1.0f, 1.0f, 1.0f};
     std::vector<float> pathSmoothSh;   // (order+1)^2, sized in initVoiceDSP
 
-    // Fraction-indexed solve anchors: the last two DISTINCT solver
-    // outputs (A older, B newer) with the governing door's open
-    // fraction at the moment each landed. While a door swings, the
-    // audible target is extrapolated along the fraction axis
-    // (t = (curFrac - fracA)/(fracB - fracA), clamped to [0, 1.6]) so
-    // the transition tracks the PHYSICAL door instead of the ~10 Hz
-    // solver cadence. Both anchors lag the door, so pure interpolation
-    // would always clamp at B — bounded extrapolation is the point.
-    // The time smoother above remains the safety net for overshoot.
-    float pathFracA = -1.0f;
-    float pathFracB = -1.0f;
-    float pathEqA[3] = {1.0f, 1.0f, 1.0f};
-    float pathEqB[3] = {1.0f, 1.0f, 1.0f};
-    std::vector<float> pathShA;
-    std::vector<float> pathShB;
-
-    // Governing door open fraction, written by the MAIN thread each
-    // loopStep while a door on this voice's route scope is swinging
-    // (same drain that sets pathScopedDoorDirty); -1 when no door
-    // governs. Audio thread reads relaxed once per callback.
-    std::atomic<float> pathDoorFraction{-1.0f};
-
     // ── Fresh door-openness gate on the pathing wet bus (zero-lag) ──
     //
     // The tightest open-fraction (0 closed .. 1 open) over the doors on
