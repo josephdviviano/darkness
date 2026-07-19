@@ -160,8 +160,24 @@ bool AIHearingService::isAudible(const AIHearingStats &stats,
 //------------------------------------------------------
 void AIHearingService::onSoundEmitted(const SoundEmissionEvent &ev)
 {
-    if (!mPropertyService || !mObjectService)
+    // Both of the early returns below make EVERY AI deaf to EVERY sound, so
+    // neither may be silent — same no-silent-fallback policy the chunk-miss
+    // announcements in bootstrapFinished() already follow. One-shot: this runs
+    // per sound emission, so an unbounded line would drown the log it is
+    // trying to be visible in.
+    if (!mPropertyService || !mObjectService) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            std::fprintf(stderr,
+                "[FALLBACK] AIHearingService: %s not available — dropping "
+                "EVERY sound emission. No AI will hear anything, and this is "
+                "indistinguishable from the player being quiet. (first "
+                "emission only)\n",
+                !mPropertyService ? "PropertyService" : "ObjectService");
+        }
         return;
+    }
 
     // Lazy refresh of the global tables. bootstrapFinished runs before
     // AudioService::onDBLoad parses the AIHearStat / AISNDTWK chunks,
@@ -190,8 +206,19 @@ void AIHearingService::onSoundEmitted(const SoundEmissionEvent &ev)
     // mission AIs (positive IDs with P$Position) inherit AI_Hearin through
     // the MetaProp chain, and hasProperty() resolves that chain.
     Property *hearinProp = mPropertyService->getProperty("AI_Hearin");
-    if (!hearinProp)
+    if (!hearinProp) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            std::fprintf(stderr,
+                "[FALLBACK] AIHearingService: P$AI_Hearin is not registered — "
+                "dropping EVERY sound emission. No AI will hear anything. "
+                "Expected from the mission's .pldef/.dtype schema (--scripts); "
+                "a registration regression here looks exactly like a silent "
+                "player. (first emission only)\n");
+        }
         return;
+    }
 
     auto positioned = getAllObjectsWithProperty(mPropertyService.get(), "Position");
 

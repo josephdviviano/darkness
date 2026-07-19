@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace Darkness {
 
@@ -297,7 +298,27 @@ struct PathingDspMapping {
 /// as audible rather than silently muting).
 inline float sanitizeEqCoeff(float v)
 {
-    if (!std::isfinite(v)) return 1.0f;
+    if (!std::isfinite(v)) {
+        // The VALUE choice is deliberate (see the comment above): an ill-formed
+        // bake output should stay audible rather than silently mute a source.
+        // The SILENCE was not. 1.0 is fully transmissive, and downstream
+        // `blocking = 1.0f - eqHigh` makes it 0.0 — LPF wide open. So a single
+        // NaN band renders a source that is sealed behind a wall at full volume,
+        // unfiltered. That is a bake bug worth hearing about, not absorbing.
+        //
+        // One-shot: this is called per band, per voice, per frame.
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            std::fprintf(stderr,
+                "[FALLBACK] SteamAudioPathing: non-finite pathing EQ band from "
+                "the solver — clamping to 1.0 (FULLY TRANSMISSIVE, LPF open) to "
+                "stay audible rather than mute. Affected voices path through "
+                "walls at full volume. Suspect degenerate probe/bake geometry. "
+                "(first occurrence only)\n");
+        }
+        return 1.0f;
+    }
     if (v < 0.0f) return 0.0f;
     if (v > 1.0f) return 1.0f;
     return v;

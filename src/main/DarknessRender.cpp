@@ -3405,22 +3405,29 @@ static void registerConsoleSettings(
 
     dbgConsole.setGroup("Water");
 
-    dbgConsole.addFloat("wave_amplitude", 0.0f, 5.0f,
+    // Bounds come from RenderConfig.h's WaterRange — the same constants the
+    // YAML clamp uses. Do not hardcode them here: when these two disagreed, a
+    // config value the YAML accepted could not be restored from the console.
+    dbgConsole.addFloat("wave_amplitude",
+        WaterRange::kWaveAmplitudeMin, WaterRange::kWaveAmplitudeMax,
         [&state]() { return state.waveAmplitude; },
         [&state](float v) { state.waveAmplitude = v; },
         "Water vertex wave displacement (0=flat)");
 
-    dbgConsole.addFloat("uv_distortion", 0.0f, 0.5f,
+    dbgConsole.addFloat("uv_distortion",
+        WaterRange::kUvDistortionMin, WaterRange::kUvDistortionMax,
         [&state]() { return state.uvDistortion; },
         [&state](float v) { state.uvDistortion = v; },
         "Water UV texture wobble strength");
 
-    dbgConsole.addFloat("water_rotation", 0.0f, 0.5f,
+    dbgConsole.addFloat("water_rotation",
+        WaterRange::kWaterRotationMin, WaterRange::kWaterRotationMax,
         [&state]() { return state.waterRotation; },
         [&state](float v) { state.waterRotation = v; },
         "Water UV rotation speed (rad/s)");
 
-    dbgConsole.addFloat("water_scroll", 0.0f, 1.0f,
+    dbgConsole.addFloat("water_scroll",
+        WaterRange::kWaterScrollMin, WaterRange::kWaterScrollMax,
         [&state]() { return state.waterScrollSpeed; },
         [&state](float v) { state.waterScrollSpeed = v; },
         "Water UV scroll speed (world units/s)");
