@@ -1896,6 +1896,15 @@ private:
         /// same edges. Computed once at registerDoorGeometry.
         Matrix4 obbWorldToLocal{1.0f};
         Vector3 obbHalfExtents{0.0f, 0.0f, 0.0f};
+        /// §54 aperture match: does this door sit ON a room portal
+        /// (point-to-AABB ≤ kPathingDoorPortalMatchDistFt — the same rule
+        /// as the DoorPair emission classifier)? Passage doors get their
+        /// opening-plane obbHalfExtents expanded at registration to cover
+        /// the portal polygon, and the [HYBRID_GRAPH] no-edge NOTE uses
+        /// the flag to separate real gate gaps (passage, loud WARN) from
+        /// the expected non-passage class (deposit boxes / hatches).
+        bool  portalMatched = false;
+        float portalDistFt  = -1.0f;
     };
     std::unordered_map<int32_t, DoorAudioInstance> mDoorAudioInstances;
 
