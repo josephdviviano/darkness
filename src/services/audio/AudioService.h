@@ -845,6 +845,17 @@ public:
     void setPathingRouterGate(bool on) { mPathingRouterGate = on; }
     bool getPathingRouterGate() const { return mPathingRouterGate; }
 
+    /** No-route movement damping (PLAN.PATHING_DESIGN.md §53 lever A):
+     *  multiplier on the 5 ft solve-memo movement threshold applied ONLY to
+     *  voices whose retained Steam Audio verdict is no-route — their
+     *  movement-triggered re-discovery solves are full-component drains, so
+     *  they re-check on a coarser quantum (room-change + quiet-gated door
+     *  triggers unaffected). 1 = off (A/B). Clamped [1, 16]. */
+    void setPathingNoRouteMoveMul(float m) {
+        mPathingNoRouteMoveMul = std::max(1.0f, std::min(m, 16.0f));
+    }
+    float getPathingNoRouteMoveMul() const { return mPathingNoRouteMoveMul; }
+
     // ── Ambient tuning (facades — forwarded to AmbientSoundManager) ──
     //
     // Group D (2026-05) — Euclidean radius × hysteresis_*_mul gate
@@ -2307,6 +2318,9 @@ private:
     bool  mPathingDueThisStep    = false;
     /// Router-gated search (§49 lever 1) — see setPathingRouterGate().
     bool  mPathingRouterGate     = true;
+    /// No-route movement damping (§53 lever A) — see
+    /// setPathingNoRouteMoveMul().
+    float mPathingNoRouteMoveMul = 4.0f;
 
     // ── Master bus DSP chain + mixer + spatialization + door LPF config ──
     //

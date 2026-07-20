@@ -9294,6 +9294,10 @@ void AudioService::loopStep(float deltaTime)
             // because the hybrid gate route says unreachable — SA's search
             // would have drained the reachable component to say the same.
             uint32_t pathingGateSuppressed = 0;
+            // No-route movement damping (§53 lever A): movement-trigger
+            // re-discoveries of no-route voices deferred by the coarser
+            // memo quantum this pass.
+            uint32_t pathingNoRouteMoveDamped = 0;
 
             // ── Lever D: warmup first-solve stagger — selection pre-pass ──
             //
@@ -10001,12 +10005,38 @@ void AudioService::loopStep(float deltaTime)
                     const bool trigRoom     =
                         voice->pathLastSolveListenerRoom
                             != stagingListenerRoomId;
-                    const bool trigLMove    = glm::length(mListenerPos
-                            - voice->pathLastSolveListenerPos)
-                            > kPathingSolveMemoMoveFt;
-                    const bool trigSMove    = glm::length(voice->worldPos
-                            - voice->pathLastSolveSourcePos)
-                            > kPathingSolveMemoMoveFt;
+                    // ── No-route movement damping (§53 lever A) ──
+                    //
+                    // A voice whose retained verdict is no-route
+                    // re-discovers on a COARSER movement quantum: the
+                    // verdict means SA found no probe path from where it
+                    // attached, and attachment/visibility changes on the
+                    // scale of probe spacing, not the 5 ft memo step —
+                    // yet each premature retry is a full-component
+                    // findAlternatePaths drain (measured: 24-45 per 45 s
+                    // MISS7 tour, ~1/s, movement-triggered; only the
+                    // doorGen trigger was cache-gated). trigRoom
+                    // (entering a space) and the quiet-gated doorGen
+                    // trigger keep the genuine discovery paths, and any
+                    // solve that finds a route clears
+                    // pathLastOutputsNoRoute, restoring the 5 ft memo.
+                    // Mul 1 = damping off (A/B kill-switch).
+                    const float memoMoveFt = voice->pathLastOutputsNoRoute
+                        ? kPathingSolveMemoMoveFt * mPathingNoRouteMoveMul
+                        : kPathingSolveMemoMoveFt;
+                    const float lMoveDist   = glm::length(mListenerPos
+                            - voice->pathLastSolveListenerPos);
+                    const float sMoveDist   = glm::length(voice->worldPos
+                            - voice->pathLastSolveSourcePos);
+                    const bool trigLMove    = lMoveDist > memoMoveFt;
+                    const bool trigSMove    = sMoveDist > memoMoveFt;
+                    // Damping actually deferred a would-be movement
+                    // trigger this tick (census: noRouteMoveDamped=).
+                    const bool noRouteMoveDamped =
+                        voice->pathLastOutputsNoRoute
+                        && !trigLMove && !trigSMove
+                        && (lMoveDist > kPathingSolveMemoMoveFt
+                            || sMoveDist > kPathingSolveMemoMoveFt);
                     const bool wouldSolve = pathingWanted
                         && (trigPending || trigNever || trigDoorGen
                             || trigRising || trigRoom || trigLMove
@@ -10204,6 +10234,14 @@ void AudioService::loopStep(float deltaTime)
                         // trigger class, not just door-gen).
                         if (gateRouteUnreachable && wouldSolve) {
                             ++pathingGateSuppressed;
+                        }
+                        // No-route movement damping deferred this voice's
+                        // movement re-discovery this tick (and nothing
+                        // else solved it). [PERF pathing]
+                        // noRouteMoveDamped=.
+                        else if (!stagePathingSolve && pathingWanted
+                                 && noRouteMoveDamped && !wouldSolve) {
+                            ++pathingNoRouteMoveDamped;
                         }
                         // A GLOBAL door change happened since this voice's
                         // last solve (trigDoorGenRaw) but it was NOT
@@ -10675,7 +10713,7 @@ void AudioService::loopStep(float deltaTime)
                         pathingStagedSolved, pathingStagedSkipped,
                         pathingStagedUnreachableCached,
                         pathingScopedSolves, pathingScopeSkipped,
-                        pathingGateSuppressed);
+                        pathingGateSuppressed, pathingNoRouteMoveDamped);
                     //     Lever D (§16): first solves this pass held out of
                     //     the iteration + the remaining never-solved depth.
                     //     Pushed on the same wantPathing/signal path as the

@@ -447,6 +447,12 @@ audio:
     # same no-route verdict the volume gate already silences the voice on.
     # Leave true; false exists for A/B measurement only.
     pathing_router_gate: true
+    # No-route movement damping: a voice whose last Steam Audio verdict was
+    # "no route" re-checks for a route only every (this × 5 ft) of
+    # listener/source travel instead of every 5 ft — each premature retry
+    # is an exhaustive graph search that finds nothing. Room changes and
+    # door openings still trigger discovery immediately. 1 = off (A/B).
+    pathing_noroute_move_mul: 4
     pathing_smoothing_ms: 100    # smoothing time constant for pathing EQ/SH between solves, ms (0 = verbatim)
     # Per-band weights for collapsing Steam Audio's 3-band eqCoeffs into
     # the scalar portalAttenuation gain. Applied as
