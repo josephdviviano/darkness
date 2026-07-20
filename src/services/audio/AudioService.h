@@ -835,6 +835,16 @@ public:
     }
     float getPathingUpdateInterval() const { return mPathingUpdateInterval; }
 
+    /** Router-gated search (PLAN.PATHING_DESIGN.md §49 lever 1): suppress a
+     *  Steam Audio pathing solve when the hybrid gate's route says the voice
+     *  is unreachable — SA's findAlternatePaths would drain the entire
+     *  reachable probe component to return the same no-route verdict, and
+     *  the volume gate already silences the voice on that verdict. Default
+     *  ON; the off switch exists for A/B measurement
+     *  (audio.propagation.pathing_router_gate). */
+    void setPathingRouterGate(bool on) { mPathingRouterGate = on; }
+    bool getPathingRouterGate() const { return mPathingRouterGate; }
+
     // ── Ambient tuning (facades — forwarded to AmbientSoundManager) ──
     //
     // Group D (2026-05) — Euclidean radius × hysteresis_*_mul gate
@@ -2295,6 +2305,8 @@ private:
     float mPathingUpdateInterval = 0.05f;
     float mPathingAccumSec       = 0.0f;
     bool  mPathingDueThisStep    = false;
+    /// Router-gated search (§49 lever 1) — see setPathingRouterGate().
+    bool  mPathingRouterGate     = true;
 
     // ── Master bus DSP chain + mixer + spatialization + door LPF config ──
     //

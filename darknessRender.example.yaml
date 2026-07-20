@@ -439,6 +439,14 @@ audio:
     # last-cached values, so audio stays smooth between sim runs. Set
     # to 0.0 to update every frame (legacy / A-B diagnostic).
     pathing_update_interval: 0.05 # min seconds between pathing due ticks (0.0–1.0); event-driven staging means idle ticks are free — this is door-event quantization delay
+    # Router-gated search: when the door-aware route graph says a voice is
+    # unreachable (no surviving path around fully-closed doors / a
+    # disconnected probe island), skip Steam Audio's alternate-path search
+    # for it — that search would exhaustively drain the reachable probe
+    # graph (the 170-745 ms worst-case pathing solves) only to report the
+    # same no-route verdict the volume gate already silences the voice on.
+    # Leave true; false exists for A/B measurement only.
+    pathing_router_gate: true
     pathing_smoothing_ms: 100    # smoothing time constant for pathing EQ/SH between solves, ms (0 = verbatim)
     # Per-band weights for collapsing Steam Audio's 3-band eqCoeffs into
     # the scalar portalAttenuation gain. Applied as

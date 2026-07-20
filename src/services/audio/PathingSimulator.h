@@ -230,15 +230,21 @@ public:
     /// advanced but whose scoped route set excluded the moved door(s), so
     /// the re-solve was suppressed (the O3-lite scoped-invalidation win,
     /// PLAN.PATHING_DESIGN.md §8). Both printed on [PERF pathing].
+    /// gateSuppressed counts solves the router-gated search (§49 lever 1)
+    /// suppressed outright: a solve trigger held but the hybrid gate's
+    /// route said unreachable — SA's exhaustive no-route search (the
+    /// full-component drain) was skipped. Printed on [PERF pathing].
     void addStagingCounts(uint32_t solved, uint32_t skipped,
                           uint32_t unreachableCached,
-                          uint32_t scopedSolves, uint32_t scopeSkipped) {
+                          uint32_t scopedSolves, uint32_t scopeSkipped,
+                          uint32_t gateSuppressed) {
         mStagedSolved.fetch_add(solved, std::memory_order_relaxed);
         mStagedSkipped.fetch_add(skipped, std::memory_order_relaxed);
         mUnreachableCached.fetch_add(unreachableCached,
                                      std::memory_order_relaxed);
         mScopedSolves.fetch_add(scopedSolves, std::memory_order_relaxed);
         mScopeSkipped.fetch_add(scopeSkipped, std::memory_order_relaxed);
+        mGateSuppressed.fetch_add(gateSuppressed, std::memory_order_relaxed);
     }
 
     /// Lever D warmup first-solve stagger (PLAN.PATHING_DESIGN.md §16).
@@ -316,6 +322,9 @@ private:
     std::atomic<uint64_t> mUnreachableCached{0};
     std::atomic<uint64_t> mScopedSolves{0};
     std::atomic<uint64_t> mScopeSkipped{0};
+    /// Router-gated search (§49 lever 1) suppression count — see
+    /// addStagingCounts().
+    std::atomic<uint64_t> mGateSuppressed{0};
     // Lever D stagger: mFirstSolveDeferred accumulates per window (drained
     // by the dump); mFirstSolveBacklog is a gauge (overwritten each pass).
     std::atomic<uint64_t> mFirstSolveDeferred{0};

@@ -9290,6 +9290,10 @@ void AudioService::loopStep(float deltaTime)
             //     doors were not on this voice's route) — the direct win.
             uint32_t pathingScopedSolves = 0;
             uint32_t pathingScopeSkipped = 0;
+            // Router-gated search (§49 lever 1): solves suppressed outright
+            // because the hybrid gate route says unreachable — SA's search
+            // would have drained the reachable component to say the same.
+            uint32_t pathingGateSuppressed = 0;
 
             // ── Lever D: warmup first-solve stagger — selection pre-pass ──
             //
@@ -9330,14 +9334,19 @@ void AudioService::loopStep(float deltaTime)
             //      starve.
             //   3. handle ASC — deterministic tiebreak (repeatable runs).
             //
-            // We do NOT use an "unreachable ⇒ solve last" hint (PLAN §16
-            // lists it as optional; the hybrid gate's pathGateReachable
-            // would make it cheap). It cannot help the metric it would be
-            // paid for: deprioritizing likely-drainers only REORDERS them,
-            // it does not stop the cap-many drains per iteration that set
-            // the window max. (And a hard skip is forbidden regardless — a
-            // shortest-path proxy under-approximates SA's multi-path
-            // reach, §12.)
+            // Gate-unreachable voices are EXCLUDED from the candidate list
+            // below (not merely deprioritized): the router-gated search
+            // (§49 lever 1, see gateRouteUnreachable in the staging loop)
+            // suppresses their solves outright, so admitting one would
+            // waste an admission slot on a voice that then stages nothing.
+            // The old "§12 forbids a hard skip" note predates the hybrid
+            // gate: back then the proxy was the room-graph router, whose
+            // under-approximation of SA's reach could wrongly silence a
+            // voice. Today the volume gate ITSELF is keyed on the same
+            // probe-level route() verdict — a gate-unreachable voice is
+            // already silent regardless of SA's outputs, so skipping its
+            // solve is audibly equivalent (full argument at the
+            // suppression site).
             uint32_t firstSolveDeferred = 0;   // this tick (→ [PERF pathing])
             uint32_t firstSolveBacklog  = 0;   // never-solved in-range gauge
             std::array<SoundHandle, kPathingFirstSolvesPerIteration>
@@ -9362,6 +9371,13 @@ void AudioService::loopStep(float deltaTime)
                     if (voice->skipPortalRouting) continue;
                     if (voice->pathingSource == nullptr) continue;
                     if (voice->pathEverSolved) continue;
+                    // Router-gated search: mirrors the staging loop's
+                    // gateRouteUnreachable suppression (see the block
+                    // comment above this pre-pass).
+                    if (mPathingRouterGate && mHybridGraph.built()
+                        && mHybridGraph.skippedEdges() == 0
+                        && voice->pathGateValid
+                        && !voice->pathGateReachable) continue;
                     const float d =
                         glm::length(voice->worldPos - mListenerPos);
                     if (d > voice->maxAudibleDist) continue;
@@ -9991,10 +10007,51 @@ void AudioService::loopStep(float deltaTime)
                     const bool trigSMove    = glm::length(voice->worldPos
                             - voice->pathLastSolveSourcePos)
                             > kPathingSolveMemoMoveFt;
-                    const bool needsSolve = pathingWanted
+                    const bool wouldSolve = pathingWanted
                         && (trigPending || trigNever || trigDoorGen
                             || trigRising || trigRoom || trigLMove
                             || trigSMove);
+                    // ── Router-gated search (PLAN.PATHING_DESIGN.md §49
+                    // lever 1) ──
+                    //
+                    // The hybrid gate's route says UNREACHABLE for this
+                    // voice (recomputed EVERY frame for unreachable voices
+                    // by the gate loop above). SA's solve for it would run
+                    // findAlternatePaths' unbounded A* to exhaustion — pop
+                    // the entire reachable probe component, ray-revalidating
+                    // every incident edge (~16-36 BVH rays each) — only to
+                    // return the no-route verdict. That drain IS the
+                    // measured 170-745 ms [PATHING_SLOW] class. Suppress
+                    // the solve instead: stage nothing, leave the memo
+                    // fields and pathSolvePending untouched, so the pending
+                    // trigger re-fires on the first due tick after the gate
+                    // route reopens (a door crossing its open threshold
+                    // flips pathGateReachable the same frame).
+                    //
+                    // AUDIBLY EQUIVALENT BY CONSTRUCTION: the volume gate
+                    // already holds pathRouteGate=0 for exactly this
+                    // condition — a gate-unreachable voice is silent no
+                    // matter what SA's EQ/SH outputs say. (Where the gate's
+                    // single-shortest-path model diverges from SA's
+                    // multi-path reach, the GATE is what the player hears,
+                    // today, with or without this suppression — the
+                    // known multi-path limitation is tracked in
+                    // PLAN.MULTI_PATH_SA_MIGRATION.md and any fix there
+                    // updates route(), which this keys on.)
+                    //
+                    // Guards: config kill-switch for A/B
+                    // (audio.propagation.pathing_router_gate), a built
+                    // graph with ZERO skipped edges (a probe/adjacency
+                    // pairing bug corrupts routes — never trust a graph
+                    // that dropped edges), and a gate verdict computed
+                    // this frame (pathGateValid).
+                    const bool gateRouteUnreachable = mPathingRouterGate
+                        && mHybridGraph.built()
+                        && mHybridGraph.skippedEdges() == 0
+                        && voice->pathGateValid
+                        && !voice->pathGateReachable;
+                    const bool needsSolve = wouldSolve
+                        && !gateRouteUnreachable;
                     // ── Lever D: first-solve stagger decision ──
                     //
                     // This voice has never solved and the pre-pass did not
@@ -10138,6 +10195,16 @@ void AudioService::loopStep(float deltaTime)
                         // keep it out of `skipped`.)
                         else if (firstSolveHeld) { }
                         else if (pathingWanted) ++pathingStagedSkipped;
+                        // Router-gated search: a solve WOULD have staged
+                        // (some trigger held) but the gate route says
+                        // unreachable — SA's exhaustive no-route search was
+                        // suppressed outright. [PERF pathing]
+                        // gateSuppressed=. Counted FIRST and excluded from
+                        // the buckets below (suppression covers every
+                        // trigger class, not just door-gen).
+                        if (gateRouteUnreachable && wouldSolve) {
+                            ++pathingGateSuppressed;
+                        }
                         // A GLOBAL door change happened since this voice's
                         // last solve (trigDoorGenRaw) but it was NOT
                         // re-solved (trigDoorGen false). Two disjoint
@@ -10148,7 +10215,7 @@ void AudioService::loopStep(float deltaTime)
                         //   • fail-open no-route voice, doors not quiet →
                         //     the pre-existing unreachable-route cache
                         //     defer. [PERF pathing] unreachableCached=.
-                        if (!stagePathingSolve && pathingWanted
+                        else if (!stagePathingSolve && pathingWanted
                             && trigDoorGenRaw && !trigDoorGen) {
                             if (scopeValid && !voice->pathScopedDoorDirty)
                                 ++pathingScopeSkipped;
@@ -10607,7 +10674,8 @@ void AudioService::loopStep(float deltaTime)
                     mPathingSim->addStagingCounts(
                         pathingStagedSolved, pathingStagedSkipped,
                         pathingStagedUnreachableCached,
-                        pathingScopedSolves, pathingScopeSkipped);
+                        pathingScopedSolves, pathingScopeSkipped,
+                        pathingGateSuppressed);
                     //     Lever D (§16): first solves this pass held out of
                     //     the iteration + the remaining never-solved depth.
                     //     Pushed on the same wantPathing/signal path as the
@@ -15549,12 +15617,19 @@ void AudioService::buildHybridRouteGraph()
     mHybridGraph.build(pos, edges, doors);
     const size_t withEdges = mHybridGraph.doorsWithEdges();
     const size_t noEdges = doors.size() >= withEdges ? doors.size() - withEdges : 0;
+    // components/largest sizes the router-gated-search win up front: any
+    // probe pair split across components is a guaranteed full-component
+    // drain in SA's search that the gate now suppresses (§49 lever 1).
+    const size_t comps = mHybridGraph.numComponents();
+    const size_t largestComp =
+        comps > 0 ? mHybridGraph.componentSizes()[0] : 0;
     std::fprintf(stderr,
         "[HYBRID_GRAPH] built: %zu probes, %zu/%zu edges accepted, "
-        "%zu doors, %zu door-edge links, %zu doors gate nothing "
-        "(gate routing)\n",
+        "%zu doors, %zu door-edge links, %zu doors gate nothing, "
+        "%zu components (largest %zu/%zu) (gate routing)\n",
         mHybridGraph.numProbes(), mHybridGraph.numEdges(), edges.size(),
-        doors.size(), mHybridGraph.doorEdgeCount(), noEdges);
+        doors.size(), mHybridGraph.doorEdgeCount(), noEdges,
+        comps, largestComp, mHybridGraph.numProbes());
     // A skipped edge means the adjacency's probe indices do not fit the
     // probe array we passed — the exact cross-batch pairing bug this
     // build once shipped with. The graph would route on thinned, wrong
