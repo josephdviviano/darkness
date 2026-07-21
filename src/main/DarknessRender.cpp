@@ -5401,6 +5401,8 @@ int main(int argc, char *argv[]) {
         audioSvc->setPathingGainScale(cfg.pathingGainScale);
         audioSvc->setPathingBlockingScale(cfg.pathingBlockingScale);
         audioSvc->setPathingUpdateInterval(cfg.pathingUpdateInterval);
+        audioSvc->setPathingRouterGate(cfg.pathingRouterGate);
+        audioSvc->setPathingNoRouteMoveMul(cfg.pathingNoRouteMoveMul);
         audioSvc->setPathingSmoothingMs(cfg.pathingSmoothingMs);
         audioSvc->setPathingGainBandWeights(cfg.pathingGainWeightLow,
                                             cfg.pathingGainWeightMid,

@@ -329,13 +329,36 @@ struct RenderConfig {
     // Minimum interval (seconds) between successive Steam Audio
     // pathing-simulation updates. iplSimulatorRunPathing is CPU-heavy
     // and runs on the PathingSimulator worker thread; this interval
-    // sets how often the worker is signalled. 10 Hz (the Unity/Unreal
-    // integration default) loses no perceptible diffraction
-    // responsiveness — the listener moves < 1 ft per update at walking
-    // speed, well below the threshold for hearing portalAttenuation/
-    // blocking changes. 0.0 = run every frame (legacy / A-B
-    // diagnostic). Clamped to [0.0, 1.0] seconds.
-    float    pathingUpdateInterval = 0.1f;
+    // sets how often the worker is signalled. Since staging went
+    // event-driven, an idle due tick stages nothing — the interval is
+    // door-event quantization delay, not a pacing knob; 0.05 s halves
+    // the 0.1 s Unity/Unreal-default door-event latency at measured
+    // near-zero cost (2026-07-19 survey). 0.0 = run every frame
+    // (legacy / A-B diagnostic). Clamped to [0.0, 1.0] seconds.
+    // (Default aligned with AudioService::mPathingUpdateInterval — this
+    // value overwrites the service default at init wiring, so the two
+    // must agree or a config without the key silently reverts.)
+    float    pathingUpdateInterval = 0.05f;
+
+    // Router-gated search (PLAN.PATHING_DESIGN.md §49 lever 1): suppress
+    // a Steam Audio pathing solve whenever the hybrid gate's route says
+    // the voice is unreachable — SA's findAlternatePaths would drain the
+    // entire reachable probe component (~16-36 BVH rays per edge, the
+    // measured 170-745 ms [PATHING_SLOW] class) only to return the same
+    // no-route verdict the volume gate already silences the voice on.
+    // Default ON; the switch exists for A/B measurement only.
+    bool     pathingRouterGate = true;
+
+    // No-route movement damping (PLAN.PATHING_DESIGN.md §53 lever A):
+    // multiplier on the 5 ft solve-memo movement threshold for voices
+    // whose retained Steam Audio verdict is no-route. Their
+    // movement-triggered re-discovery is a full-component drain repeated
+    // every 5 ft of listener travel (measured: 24-45 per 45 s MISS7
+    // tour); attachment/visibility changes on the scale of probe
+    // spacing, so 4x (20 ft) re-checks are enough — room changes and the
+    // quiet-gated door trigger still fire discovery immediately.
+    // 1 = damping off (A/B). Clamped [1, 16].
+    float    pathingNoRouteMoveMul = 4.0f;
 
     // Time constant (ms) for the audio-thread smoother on pathing EQ/SH
     // parameters. Steam Audio's built-in PathEffect ramps are frame-
@@ -1031,6 +1054,14 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     if (cfg.pathingUpdateInterval < 0.0f) cfg.pathingUpdateInterval = 0.0f;
                     if (cfg.pathingUpdateInterval > 1.0f) cfg.pathingUpdateInterval = 1.0f;
                 }
+                if (prop["pathing_router_gate"]) {
+                    cfg.pathingRouterGate = prop["pathing_router_gate"].as<bool>();
+                }
+                if (prop["pathing_noroute_move_mul"]) {
+                    cfg.pathingNoRouteMoveMul = prop["pathing_noroute_move_mul"].as<float>();
+                    if (cfg.pathingNoRouteMoveMul < 1.0f)  cfg.pathingNoRouteMoveMul = 1.0f;
+                    if (cfg.pathingNoRouteMoveMul > 16.0f) cfg.pathingNoRouteMoveMul = 16.0f;
+                }
                 if (prop["pathing_smoothing_ms"]) {
                     cfg.pathingSmoothingMs = prop["pathing_smoothing_ms"].as<float>();
                     if (cfg.pathingSmoothingMs < 0.0f) cfg.pathingSmoothingMs = 0.0f;
@@ -1585,6 +1616,14 @@ inline bool applySetOverride(const std::string& path, const std::string& valueSt
     if (path == "audio.propagation.pathing_update_interval") {
         float v; if (!toFloat(v)) return false;
         cfg.pathingUpdateInterval = clampF(v, 0.0f, 1.0f); return true;
+    }
+    if (path == "audio.propagation.pathing_router_gate") {
+        bool v; if (!toBool(v)) return false;
+        cfg.pathingRouterGate = v; return true;
+    }
+    if (path == "audio.propagation.pathing_noroute_move_mul") {
+        float v; if (!toFloat(v)) return false;
+        cfg.pathingNoRouteMoveMul = clampF(v, 1.0f, 16.0f); return true;
     }
     if (path == "audio.propagation.pathing_smoothing_ms") {
         float v; if (!toFloat(v)) return false;

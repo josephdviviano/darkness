@@ -490,6 +490,10 @@ struct ActiveVoice {
     //   • the door acoustic generation counter advanced (a door moved),
     //   • the listener moved > kPathingSolveMemoMoveFt or changed room,
     //   • the source moved > kPathingSolveMemoMoveFt,
+    //     (for a voice whose retained verdict is no-route, both movement
+    //     thresholds are scaled by the no-route damping multiplier —
+    //     §53 lever A — so its full-component re-discovery searches run
+    //     on a coarser quantum; room/door triggers unaffected),
     //   • the voice just became pathing-eligible (pathingWanted rising
     //     edge — replaces the old "keep out-of-range voices enabled"
     //     freshness insurance),
