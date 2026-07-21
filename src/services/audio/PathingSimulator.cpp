@@ -435,6 +435,18 @@ void PathingSimulator::workerMain()
                         mScopedSolves.exchange(0, std::memory_order_relaxed);
                     const uint64_t scopeSkipW =
                         mScopeSkipped.exchange(0, std::memory_order_relaxed);
+                    // Router-gated search (§49 lever 1): solves suppressed
+                    // because the hybrid gate route said unreachable — each
+                    // one is a full-component findAlternatePaths drain that
+                    // never ran.
+                    const uint64_t gateSupW =
+                        mGateSuppressed.exchange(0, std::memory_order_relaxed);
+                    // No-route movement damping (§53 lever A): movement
+                    // re-discoveries of no-route voices deferred by the
+                    // coarser memo quantum — each was a would-be
+                    // full-component drain.
+                    const uint64_t moveDampW =
+                        mNoRouteMoveDamped.exchange(0, std::memory_order_relaxed);
                     // Lever D warmup stagger (§16): firstSolveDeferred =
                     // never-solved voices held out of an iteration this
                     // window (drained); firstSolveBacklog = the current
@@ -451,6 +463,7 @@ void PathingSimulator::workerMain()
                         "max=%.2fms throttleMs=%.2f n=%llu solved=%llu "
                         "skipped=%llu unreachableCached=%llu "
                         "scopedSolves=%llu scopeSkipped=%llu "
+                        "gateSuppressed=%llu noRouteMoveDamped=%llu "
                         "firstSolveDeferred=%llu firstSolveBacklog=%u\n",
                         p.p50, p.p95, p.p99, p.maxMs, throttleMs,
                         static_cast<unsigned long long>(p.n),
@@ -459,6 +472,8 @@ void PathingSimulator::workerMain()
                         static_cast<unsigned long long>(unreachW),
                         static_cast<unsigned long long>(scopedW),
                         static_cast<unsigned long long>(scopeSkipW),
+                        static_cast<unsigned long long>(gateSupW),
+                        static_cast<unsigned long long>(moveDampW),
                         static_cast<unsigned long long>(firstDeferW),
                         firstBacklogW);
                     // Budget warning: p95 ≥ 80% of throttle interval

@@ -835,6 +835,27 @@ public:
     }
     float getPathingUpdateInterval() const { return mPathingUpdateInterval; }
 
+    /** Router-gated search (PLAN.PATHING_DESIGN.md §49 lever 1): suppress a
+     *  Steam Audio pathing solve when the hybrid gate's route says the voice
+     *  is unreachable — SA's findAlternatePaths would drain the entire
+     *  reachable probe component to return the same no-route verdict, and
+     *  the volume gate already silences the voice on that verdict. Default
+     *  ON; the off switch exists for A/B measurement
+     *  (audio.propagation.pathing_router_gate). */
+    void setPathingRouterGate(bool on) { mPathingRouterGate = on; }
+    bool getPathingRouterGate() const { return mPathingRouterGate; }
+
+    /** No-route movement damping (PLAN.PATHING_DESIGN.md §53 lever A):
+     *  multiplier on the 5 ft solve-memo movement threshold applied ONLY to
+     *  voices whose retained Steam Audio verdict is no-route — their
+     *  movement-triggered re-discovery solves are full-component drains, so
+     *  they re-check on a coarser quantum (room-change + quiet-gated door
+     *  triggers unaffected). 1 = off (A/B). Clamped [1, 16]. */
+    void setPathingNoRouteMoveMul(float m) {
+        mPathingNoRouteMoveMul = std::max(1.0f, std::min(m, 16.0f));
+    }
+    float getPathingNoRouteMoveMul() const { return mPathingNoRouteMoveMul; }
+
     // ── Ambient tuning (facades — forwarded to AmbientSoundManager) ──
     //
     // Group D (2026-05) — Euclidean radius × hysteresis_*_mul gate
@@ -1875,6 +1896,15 @@ private:
         /// same edges. Computed once at registerDoorGeometry.
         Matrix4 obbWorldToLocal{1.0f};
         Vector3 obbHalfExtents{0.0f, 0.0f, 0.0f};
+        /// §54 aperture match: does this door sit ON a room portal
+        /// (point-to-AABB ≤ kPathingDoorPortalMatchDistFt — the same rule
+        /// as the DoorPair emission classifier)? Passage doors get their
+        /// opening-plane obbHalfExtents expanded at registration to cover
+        /// the portal polygon, and the [HYBRID_GRAPH] no-edge NOTE uses
+        /// the flag to separate real gate gaps (passage, loud WARN) from
+        /// the expected non-passage class (deposit boxes / hatches).
+        bool  portalMatched = false;
+        float portalDistFt  = -1.0f;
     };
     std::unordered_map<int32_t, DoorAudioInstance> mDoorAudioInstances;
 
@@ -2295,6 +2325,11 @@ private:
     float mPathingUpdateInterval = 0.05f;
     float mPathingAccumSec       = 0.0f;
     bool  mPathingDueThisStep    = false;
+    /// Router-gated search (§49 lever 1) — see setPathingRouterGate().
+    bool  mPathingRouterGate     = true;
+    /// No-route movement damping (§53 lever A) — see
+    /// setPathingNoRouteMoveMul().
+    float mPathingNoRouteMoveMul = 4.0f;
 
     // ── Master bus DSP chain + mixer + spatialization + door LPF config ──
     //

@@ -123,6 +123,40 @@ public:
         mDoorsWithEdges.clear();
         for (const auto &v : mEdgeDoors)
             for (int32_t id : v) mDoorsWithEdges.insert(id);
+        // ── STATIC connected components (doors ignored) ──
+        // Steam Audio's runtime alternate-path search can only REJECT baked
+        // edges (its per-edge ray revalidation), never add one, so two
+        // probes in different components here can NEVER be connected by a
+        // runtime solve. A cross-component route request is the worst case
+        // of SA's A*: it pops the entire reachable component before
+        // returning no-route (the measured multi-hundred-ms drain). The
+        // census lets callers detect that class before paying for it, and
+        // sizes the [HYBRID_GRAPH] load-time diagnostic. Probes with no
+        // edges are singleton components — same convention as the
+        // [REGION_PARITY] union-find.
+        mComp.assign(mProbePos.size(), -1);
+        mCompSizes.clear();
+        std::vector<int> stack;
+        for (size_t seed = 0; seed < mProbePos.size(); ++seed) {
+            if (mComp[seed] >= 0) continue;
+            const int id = static_cast<int>(mCompSizes.size());
+            size_t sz = 0;
+            stack.assign(1, static_cast<int>(seed));
+            mComp[seed] = id;
+            while (!stack.empty()) {
+                const int u = stack.back(); stack.pop_back();
+                ++sz;
+                for (const Edge &e : mAdj[u]) {
+                    if (mComp[e.to] < 0) {
+                        mComp[e.to] = id;
+                        stack.push_back(e.to);
+                    }
+                }
+            }
+            mCompSizes.push_back(sz);
+        }
+        std::sort(mCompSizes.begin(), mCompSizes.end(),
+                  std::greater<size_t>());
         mBuilt = true;
     }
 
@@ -155,6 +189,19 @@ public:
     /// True iff this door annotates at least one edge (O(1)).
     bool doorHasEdges(int32_t id) const {
         return mDoorsWithEdges.count(id) != 0;
+    }
+
+    /// Number of STATIC connected components (doors ignored; singletons
+    /// included). >1 means some probe pairs are unreachable by ANY runtime
+    /// solve — see the census comment in build().
+    size_t numComponents() const { return mCompSizes.size(); }
+    /// Component sizes, sorted descending (diagnostic — the [HYBRID_GRAPH]
+    /// load log prints largest/total).
+    const std::vector<size_t> &componentSizes() const { return mCompSizes; }
+    /// Static component id of a probe index, or -1 if out of range.
+    int componentOf(int probe) const {
+        return (probe >= 0 && probe < static_cast<int>(mComp.size()))
+                   ? mComp[probe] : -1;
     }
 
     /// Nearest probe index to `p` (grid-accelerated), or -1 if empty.
@@ -273,6 +320,10 @@ private:
     std::unordered_set<int32_t> mDoorsWithEdges;
     /// Out-of-range input edges dropped by build() (see skippedEdges()).
     size_t mSkippedEdges = 0;
+    /// Static component id per probe + component sizes sorted descending
+    /// (see the census comment in build()).
+    std::vector<int> mComp;
+    std::vector<size_t> mCompSizes;
 
     // ── uniform grid over probe positions for nearestProbe ──
     struct GridKey { int x, y, z; bool operator==(const GridKey&o) const {

@@ -153,3 +153,54 @@ TEST_CASE("pathDoors: door-free route returns no doors", "[hybrid]") {
     REQUIRE(g.route({0, 0, 0}, {10, 0, 0}, [](int32_t){ return 1.0f; }, 0.05f, doors));
     REQUIRE(doors.empty());
 }
+
+TEST_CASE("component census: connected graph is one component", "[hybrid]") {
+    HybridRouteGraph g = makeGraph();
+    REQUIRE(g.numComponents() == 1);
+    REQUIRE(g.componentSizes().size() == 1);
+    REQUIRE(g.componentSizes()[0] == 6);
+    // Every probe shares the single component id.
+    const int c0 = g.componentOf(0);
+    for (int i = 1; i < 6; ++i) REQUIRE(g.componentOf(i) == c0);
+    REQUIRE(g.componentOf(-1) == -1);
+    REQUIRE(g.componentOf(6) == -1);
+}
+
+TEST_CASE("component census: disconnected islands + singletons counted "
+          "(static, doors ignored)", "[hybrid]") {
+    // The MISS9 pathology in miniature: a main graph, a 2-probe island the
+    // adjacency never connected, and an isolated probe. Components are
+    // STATIC — a door on a main-graph edge must not split the census (SA's
+    // runtime search can reject baked edges but never add one, so only the
+    // baked adjacency defines what is ever reachable).
+    std::vector<Vector3> pos = {
+        {0, 0, 0}, {10, 0, 0}, {20, 0, 0},     // main chain 0-1-2
+        {100, 100, 0}, {110, 100, 0},          // island 3-4
+        {-100, -100, 0},                       // singleton 5
+    };
+    std::vector<std::pair<int, int>> edges = {
+        {0, 1}, {1, 2},
+        {3, 4},
+    };
+    // A door slab across edge 0-1 (centred at (5,0,0)) — closed or not, the
+    // census must ignore it.
+    std::vector<HybridRouteGraph::DoorBox> doors = {
+        {100, glm::translate(Matrix4(1.0f), Vector3(-5.0f, 0.0f, 0.0f)),
+              Vector3(0.5f, 3.0f, 3.0f)},
+    };
+    HybridRouteGraph g;
+    g.build(pos, edges, doors);
+    REQUIRE(g.numComponents() == 3);
+    // Sizes sorted descending: chain(3), island(2), singleton(1).
+    REQUIRE(g.componentSizes() == std::vector<size_t>{3, 2, 1});
+    REQUIRE(g.componentOf(0) == g.componentOf(2));
+    REQUIRE(g.componentOf(3) == g.componentOf(4));
+    REQUIRE(g.componentOf(0) != g.componentOf(3));
+    REQUIRE(g.componentOf(5) != g.componentOf(0));
+    REQUIRE(g.componentOf(5) != g.componentOf(3));
+    // Cross-component route: unreachable regardless of door state — the
+    // verdict the router-gated search suppresses SA's drain on.
+    std::vector<int32_t> outDoors;
+    REQUIRE_FALSE(g.route({0, 0, 0}, {110, 100, 0},
+                          [](int32_t) { return 1.0f; }, 0.05f, outDoors));
+}

@@ -5941,6 +5941,37 @@ void AudioService::destroyAcousticScene()
 // across all bands) so even transmitted sound is meaningfully attenuated.
 //
 //------------------------------------------------------
+// Door-portal classification distance, shared by the emission pass
+// (DoorPair vs Portal/PortalPair split), verifyPathingBakeParity
+// (door-adjacent grading), and registerDoorGeometry's §54 aperture
+// expansion. A portal whose center lies within this distance of a
+// registered door's world AABB (point-to-box distance, sPointAABBDistSq
+// below) carries that door's OBB. Same drift rule as the sky threshold:
+// emission and parity MUST classify identically or parity mislabels door
+// gaps as regressions.
+static constexpr float kPathingDoorPortalMatchDistFt = 3.0f;
+
+// Squared distance from a point to an axis-aligned box (0 inside).
+//
+// WHY point-to-AABB and not point-to-midpoint: a door's acoustic
+// footprint is its whole slab, not its center. ROOM_DB portal polygons
+// sit in the cell-boundary opening the door fills, so the portal center
+// always lies inside or within modeling slop of the door's world AABB —
+// but it can be ARBITRARILY far from the AABB *midpoint* for tall/wide
+// doors (67/147 MISS2 doors failed the old 3 ft midpoint rule, 15 of
+// them at exactly 5.00 ft of pure vertical offset; their portals were
+// never classified as door portals and got no DoorPair flanking
+// probes). Measuring to the box makes the 3 ft budget absorb only
+// portal-polygon vs door-mesh slop instead of half the door's extent.
+static float sPointAABBDistSq(const Vector3 &p, const Vector3 &mn,
+                              const Vector3 &mx)
+{
+    const float dx = std::max(std::max(mn.x - p.x, p.x - mx.x), 0.0f);
+    const float dy = std::max(std::max(mn.y - p.y, p.y - mx.y), 0.0f);
+    const float dz = std::max(std::max(mn.z - p.z, p.z - mx.z), 0.0f);
+    return dx * dx + dy * dy + dz * dz;
+}
+
 void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &doors)
 {
     if (!mIplScene) {
@@ -6004,6 +6035,10 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
 
     int created = 0;
     int skipped = 0;
+    // §54 aperture-expansion census (summary line after the loop).
+    int apertureMatched  = 0;
+    int apertureExpanded = 0;
+    int apertureCapped   = 0;
     for (const auto &g : doors) {
         if (g.localVertices.size() < 9 || g.indices.size() < 3 ||
             (g.localVertices.size() % 3) != 0 || (g.indices.size() % 3) != 0) {
@@ -6163,6 +6198,83 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
             margin[thin] = kNormalMarginFt;
             inst.obbHalfExtents = he + margin;
             inst.obbWorldToLocal = glm::inverse(g.closedWorldTransform);
+
+            // ── §54: aperture-based door→edge mapping ──
+            //
+            // The leaf slab alone missed real doorways: MISS7 shipped 7
+            // PASSAGE doors (sitting ON a room portal) whose closed state
+            // annotated NO graph edge — flank edges thread the opening
+            // 3.5-5.5 ft off the leaf where doors sit recessed or
+            // split-level (PLAN.PATHING_DESIGN.md §54 has the per-door
+            // dissection). If this door sits on a room portal (SAME
+            // point-to-AABB rule as the DoorPair emission classifier),
+            // widen the box's OPENING-PLANE half-extents to cover the
+            // portal polygon — support points queried per opening axis
+            // via closestPointOnPolygon on a far reference. The NORMAL
+            // axis is untouched: slab thinness there is what rejects
+            // parallel edges in adjacent rooms (the measured reason the
+            // margin above is anisotropic). Expansion is CAPPED — an
+            // oversized ROOM_DB portal (a wall-sized room-brush face)
+            // must not turn the slab into a wall-wide catch-all; capped
+            // doors are counted and the summary line screams if any.
+            if (mRoomService && mRoomService->isLoaded()) {
+                constexpr float kApertureExpandCapFt = 8.0f;
+                ::Darkness::RoomPortal *best = nullptr;
+                float bestD = 1e30f;
+                const auto &apRooms = mRoomService->getAllRooms();
+                for (const auto &roomPtr : apRooms) {
+                    if (!roomPtr) continue;
+                    const uint32_t pc = roomPtr->getPortalCount();
+                    for (uint32_t pi = 0; pi < pc; ++pi) {
+                        ::Darkness::RoomPortal *portal = roomPtr->getPortal(pi);
+                        if (!portal) continue;
+                        // one record per physical portal (emission dedup)
+                        if (portal->getPortalID() > portal->getDestPortalID())
+                            continue;
+                        const float d = std::sqrt(sPointAABBDistSq(
+                            portal->getCenter(), inst.worldAABBmin,
+                            inst.worldAABBmax));
+                        if (d < bestD) { bestD = d; best = portal; }
+                    }
+                }
+                if (best && bestD <= kPathingDoorPortalMatchDistFt) {
+                    inst.portalMatched = true;
+                    inst.portalDistFt  = bestD;
+                    ++apertureMatched;
+                    // Door's closed-pose world center + opening-axis world
+                    // directions (columns of the closed transform).
+                    const Vector3 midW = Vector3(
+                        g.closedWorldTransform * glm::vec4(0, 0, 0, 1));
+                    bool expanded = false, capped = false;
+                    for (int a = 0; a < 3; ++a) {
+                        if (a == thin) continue;
+                        Vector3 axisW = glm::normalize(Vector3(
+                            g.closedWorldTransform
+                            * glm::vec4(a == 0, a == 1, a == 2, 0)));
+                        for (float s : {1.0f, -1.0f}) {
+                            // Support point of the (convex) portal polygon
+                            // toward ±axis: closestPointOnPolygon of a far
+                            // reference clamps to the extreme edge/corner.
+                            const Vector3 sup = best->closestPointOnPolygon(
+                                midW + axisW * (s * 1000.0f));
+                            const Vector3 supL = Vector3(
+                                inst.obbWorldToLocal * glm::vec4(sup, 1.0f));
+                            const float need =
+                                std::fabs(supL[a]) + kOpeningMarginFt;
+                            const float allowed =
+                                he[a] + margin[a] + kApertureExpandCapFt;
+                            const float grant = std::min(need, allowed);
+                            if (need > allowed) capped = true;
+                            if (grant > inst.obbHalfExtents[a]) {
+                                inst.obbHalfExtents[a] = grant;
+                                expanded = true;
+                            }
+                        }
+                    }
+                    if (expanded) ++apertureExpanded;
+                    if (capped)   ++apertureCapped;
+                }
+            }
         }
         mDoorAudioInstances[g.objID] = inst;
         ++created;
@@ -6189,6 +6301,20 @@ void AudioService::registerDoorGeometry(const std::vector<DoorAudioGeometry> &do
     std::fprintf(stderr,
         "[DOOR_AUDIO] registerDoorGeometry: done — %d instanced meshes "
         "(of %zu doors)\n", created, doors.size());
+    // §54 aperture-expansion summary. capped>0 deserves eyes: some door's
+    // matched portal polygon out-spanned the 8 ft expansion budget (a
+    // wall-sized ROOM_DB face?) — its box covers only part of the
+    // aperture, so a threading edge can still slip past un-annotated.
+    std::fprintf(stderr,
+        "[DOOR_AUDIO] aperture mapping: %d/%zu doors portal-matched, "
+        "%d boxes expanded to the portal aperture%s\n",
+        apertureMatched, doors.size(), apertureExpanded,
+        apertureCapped > 0 ? " (SOME CAPPED — check no-edge WARN)" : "");
+    if (apertureCapped > 0)
+        std::fprintf(stderr,
+            "[DOOR_AUDIO] WARN: %d door(s) hit the aperture expansion cap — "
+            "portal polygon wider than the 8 ft budget; their aperture "
+            "coverage is partial\n", apertureCapped);
 
     // [DOOR_MATERIAL] census — which door surface materials resolved, and
     // how many doors each. A door material name that is NOT a keyword the
@@ -9290,6 +9416,14 @@ void AudioService::loopStep(float deltaTime)
             //     doors were not on this voice's route) — the direct win.
             uint32_t pathingScopedSolves = 0;
             uint32_t pathingScopeSkipped = 0;
+            // Router-gated search (§49 lever 1): solves suppressed outright
+            // because the hybrid gate route says unreachable — SA's search
+            // would have drained the reachable component to say the same.
+            uint32_t pathingGateSuppressed = 0;
+            // No-route movement damping (§53 lever A): movement-trigger
+            // re-discoveries of no-route voices deferred by the coarser
+            // memo quantum this pass.
+            uint32_t pathingNoRouteMoveDamped = 0;
 
             // ── Lever D: warmup first-solve stagger — selection pre-pass ──
             //
@@ -9330,14 +9464,19 @@ void AudioService::loopStep(float deltaTime)
             //      starve.
             //   3. handle ASC — deterministic tiebreak (repeatable runs).
             //
-            // We do NOT use an "unreachable ⇒ solve last" hint (PLAN §16
-            // lists it as optional; the hybrid gate's pathGateReachable
-            // would make it cheap). It cannot help the metric it would be
-            // paid for: deprioritizing likely-drainers only REORDERS them,
-            // it does not stop the cap-many drains per iteration that set
-            // the window max. (And a hard skip is forbidden regardless — a
-            // shortest-path proxy under-approximates SA's multi-path
-            // reach, §12.)
+            // Gate-unreachable voices are EXCLUDED from the candidate list
+            // below (not merely deprioritized): the router-gated search
+            // (§49 lever 1, see gateRouteUnreachable in the staging loop)
+            // suppresses their solves outright, so admitting one would
+            // waste an admission slot on a voice that then stages nothing.
+            // The old "§12 forbids a hard skip" note predates the hybrid
+            // gate: back then the proxy was the room-graph router, whose
+            // under-approximation of SA's reach could wrongly silence a
+            // voice. Today the volume gate ITSELF is keyed on the same
+            // probe-level route() verdict — a gate-unreachable voice is
+            // already silent regardless of SA's outputs, so skipping its
+            // solve is audibly equivalent (full argument at the
+            // suppression site).
             uint32_t firstSolveDeferred = 0;   // this tick (→ [PERF pathing])
             uint32_t firstSolveBacklog  = 0;   // never-solved in-range gauge
             std::array<SoundHandle, kPathingFirstSolvesPerIteration>
@@ -9362,6 +9501,13 @@ void AudioService::loopStep(float deltaTime)
                     if (voice->skipPortalRouting) continue;
                     if (voice->pathingSource == nullptr) continue;
                     if (voice->pathEverSolved) continue;
+                    // Router-gated search: mirrors the staging loop's
+                    // gateRouteUnreachable suppression (see the block
+                    // comment above this pre-pass).
+                    if (mPathingRouterGate && mHybridGraph.built()
+                        && mHybridGraph.skippedEdges() == 0
+                        && voice->pathGateValid
+                        && !voice->pathGateReachable) continue;
                     const float d =
                         glm::length(voice->worldPos - mListenerPos);
                     if (d > voice->maxAudibleDist) continue;
@@ -9985,16 +10131,83 @@ void AudioService::loopStep(float deltaTime)
                     const bool trigRoom     =
                         voice->pathLastSolveListenerRoom
                             != stagingListenerRoomId;
-                    const bool trigLMove    = glm::length(mListenerPos
-                            - voice->pathLastSolveListenerPos)
-                            > kPathingSolveMemoMoveFt;
-                    const bool trigSMove    = glm::length(voice->worldPos
-                            - voice->pathLastSolveSourcePos)
-                            > kPathingSolveMemoMoveFt;
-                    const bool needsSolve = pathingWanted
+                    // ── No-route movement damping (§53 lever A) ──
+                    //
+                    // A voice whose retained verdict is no-route
+                    // re-discovers on a COARSER movement quantum: the
+                    // verdict means SA found no probe path from where it
+                    // attached, and attachment/visibility changes on the
+                    // scale of probe spacing, not the 5 ft memo step —
+                    // yet each premature retry is a full-component
+                    // findAlternatePaths drain (measured: 24-45 per 45 s
+                    // MISS7 tour, ~1/s, movement-triggered; only the
+                    // doorGen trigger was cache-gated). trigRoom
+                    // (entering a space) and the quiet-gated doorGen
+                    // trigger keep the genuine discovery paths, and any
+                    // solve that finds a route clears
+                    // pathLastOutputsNoRoute, restoring the 5 ft memo.
+                    // Mul 1 = damping off (A/B kill-switch).
+                    const float memoMoveFt = voice->pathLastOutputsNoRoute
+                        ? kPathingSolveMemoMoveFt * mPathingNoRouteMoveMul
+                        : kPathingSolveMemoMoveFt;
+                    const float lMoveDist   = glm::length(mListenerPos
+                            - voice->pathLastSolveListenerPos);
+                    const float sMoveDist   = glm::length(voice->worldPos
+                            - voice->pathLastSolveSourcePos);
+                    const bool trigLMove    = lMoveDist > memoMoveFt;
+                    const bool trigSMove    = sMoveDist > memoMoveFt;
+                    // Damping actually deferred a would-be movement
+                    // trigger this tick (census: noRouteMoveDamped=).
+                    const bool noRouteMoveDamped =
+                        voice->pathLastOutputsNoRoute
+                        && !trigLMove && !trigSMove
+                        && (lMoveDist > kPathingSolveMemoMoveFt
+                            || sMoveDist > kPathingSolveMemoMoveFt);
+                    const bool wouldSolve = pathingWanted
                         && (trigPending || trigNever || trigDoorGen
                             || trigRising || trigRoom || trigLMove
                             || trigSMove);
+                    // ── Router-gated search (PLAN.PATHING_DESIGN.md §49
+                    // lever 1) ──
+                    //
+                    // The hybrid gate's route says UNREACHABLE for this
+                    // voice (recomputed EVERY frame for unreachable voices
+                    // by the gate loop above). SA's solve for it would run
+                    // findAlternatePaths' unbounded A* to exhaustion — pop
+                    // the entire reachable probe component, ray-revalidating
+                    // every incident edge (~16-36 BVH rays each) — only to
+                    // return the no-route verdict. That drain IS the
+                    // measured 170-745 ms [PATHING_SLOW] class. Suppress
+                    // the solve instead: stage nothing, leave the memo
+                    // fields and pathSolvePending untouched, so the pending
+                    // trigger re-fires on the first due tick after the gate
+                    // route reopens (a door crossing its open threshold
+                    // flips pathGateReachable the same frame).
+                    //
+                    // AUDIBLY EQUIVALENT BY CONSTRUCTION: the volume gate
+                    // already holds pathRouteGate=0 for exactly this
+                    // condition — a gate-unreachable voice is silent no
+                    // matter what SA's EQ/SH outputs say. (Where the gate's
+                    // single-shortest-path model diverges from SA's
+                    // multi-path reach, the GATE is what the player hears,
+                    // today, with or without this suppression — the
+                    // known multi-path limitation is tracked in
+                    // PLAN.MULTI_PATH_SA_MIGRATION.md and any fix there
+                    // updates route(), which this keys on.)
+                    //
+                    // Guards: config kill-switch for A/B
+                    // (audio.propagation.pathing_router_gate), a built
+                    // graph with ZERO skipped edges (a probe/adjacency
+                    // pairing bug corrupts routes — never trust a graph
+                    // that dropped edges), and a gate verdict computed
+                    // this frame (pathGateValid).
+                    const bool gateRouteUnreachable = mPathingRouterGate
+                        && mHybridGraph.built()
+                        && mHybridGraph.skippedEdges() == 0
+                        && voice->pathGateValid
+                        && !voice->pathGateReachable;
+                    const bool needsSolve = wouldSolve
+                        && !gateRouteUnreachable;
                     // ── Lever D: first-solve stagger decision ──
                     //
                     // This voice has never solved and the pre-pass did not
@@ -10138,6 +10351,24 @@ void AudioService::loopStep(float deltaTime)
                         // keep it out of `skipped`.)
                         else if (firstSolveHeld) { }
                         else if (pathingWanted) ++pathingStagedSkipped;
+                        // Router-gated search: a solve WOULD have staged
+                        // (some trigger held) but the gate route says
+                        // unreachable — SA's exhaustive no-route search was
+                        // suppressed outright. [PERF pathing]
+                        // gateSuppressed=. Counted FIRST and excluded from
+                        // the buckets below (suppression covers every
+                        // trigger class, not just door-gen).
+                        if (gateRouteUnreachable && wouldSolve) {
+                            ++pathingGateSuppressed;
+                        }
+                        // No-route movement damping deferred this voice's
+                        // movement re-discovery this tick (and nothing
+                        // else solved it). [PERF pathing]
+                        // noRouteMoveDamped=.
+                        else if (!stagePathingSolve && pathingWanted
+                                 && noRouteMoveDamped && !wouldSolve) {
+                            ++pathingNoRouteMoveDamped;
+                        }
                         // A GLOBAL door change happened since this voice's
                         // last solve (trigDoorGenRaw) but it was NOT
                         // re-solved (trigDoorGen false). Two disjoint
@@ -10148,7 +10379,7 @@ void AudioService::loopStep(float deltaTime)
                         //   • fail-open no-route voice, doors not quiet →
                         //     the pre-existing unreachable-route cache
                         //     defer. [PERF pathing] unreachableCached=.
-                        if (!stagePathingSolve && pathingWanted
+                        else if (!stagePathingSolve && pathingWanted
                             && trigDoorGenRaw && !trigDoorGen) {
                             if (scopeValid && !voice->pathScopedDoorDirty)
                                 ++pathingScopeSkipped;
@@ -10607,7 +10838,8 @@ void AudioService::loopStep(float deltaTime)
                     mPathingSim->addStagingCounts(
                         pathingStagedSolved, pathingStagedSkipped,
                         pathingStagedUnreachableCached,
-                        pathingScopedSolves, pathingScopeSkipped);
+                        pathingScopedSolves, pathingScopeSkipped,
+                        pathingGateSuppressed, pathingNoRouteMoveDamped);
                     //     Lever D (§16): first solves this pass held out of
                     //     the iteration + the remaining never-solved depth.
                     //     Pushed on the same wantPathing/signal path as the
@@ -15464,35 +15696,9 @@ static constexpr float kPathingPairProbeOffsetFt = 5.0f;
 // pointing at a constant the portal-first overhaul deleted).
 static constexpr float kPathingEarHeightFt = 5.0f;
 
-// Door-portal classification distance, shared by the emission pass
-// (DoorPair vs Portal/PortalPair split) and verifyPathingBakeParity
-// (door-adjacent grading). A portal whose center lies within this
-// distance of a registered door's world AABB (point-to-box distance,
-// sPointAABBDistSq below) carries that door's OBB. Same drift rule as
-// the sky threshold: emission and parity MUST classify identically or
-// parity mislabels door gaps as regressions.
-static constexpr float kPathingDoorPortalMatchDistFt = 3.0f;
-
-// Squared distance from a point to an axis-aligned box (0 inside).
-//
-// WHY point-to-AABB and not point-to-midpoint: a door's acoustic
-// footprint is its whole slab, not its center. ROOM_DB portal polygons
-// sit in the cell-boundary opening the door fills, so the portal center
-// always lies inside or within modeling slop of the door's world AABB —
-// but it can be ARBITRARILY far from the AABB *midpoint* for tall/wide
-// doors (67/147 MISS2 doors failed the old 3 ft midpoint rule, 15 of
-// them at exactly 5.00 ft of pure vertical offset; their portals were
-// never classified as door portals and got no DoorPair flanking
-// probes). Measuring to the box makes the 3 ft budget absorb only
-// portal-polygon vs door-mesh slop instead of half the door's extent.
-static float sPointAABBDistSq(const Vector3 &p, const Vector3 &mn,
-                              const Vector3 &mx)
-{
-    const float dx = std::max(std::max(mn.x - p.x, p.x - mx.x), 0.0f);
-    const float dy = std::max(std::max(mn.y - p.y, p.y - mx.y), 0.0f);
-    const float dz = std::max(std::max(mn.z - p.z, p.z - mx.z), 0.0f);
-    return dx * dx + dy * dy + dz * dz;
-}
+// kPathingDoorPortalMatchDistFt + sPointAABBDistSq are defined earlier in
+// this file, beside registerDoorGeometry — its §54 aperture expansion is
+// their first use in file order. The WHY comments live at the definitions.
 
 // Shared door-geometry source for the bake's door-portal classifier and
 // [BAKE_PARITY]'s door-adjacent grader — see the declaration comment.
@@ -15549,12 +15755,19 @@ void AudioService::buildHybridRouteGraph()
     mHybridGraph.build(pos, edges, doors);
     const size_t withEdges = mHybridGraph.doorsWithEdges();
     const size_t noEdges = doors.size() >= withEdges ? doors.size() - withEdges : 0;
+    // components/largest sizes the router-gated-search win up front: any
+    // probe pair split across components is a guaranteed full-component
+    // drain in SA's search that the gate now suppresses (§49 lever 1).
+    const size_t comps = mHybridGraph.numComponents();
+    const size_t largestComp =
+        comps > 0 ? mHybridGraph.componentSizes()[0] : 0;
     std::fprintf(stderr,
         "[HYBRID_GRAPH] built: %zu probes, %zu/%zu edges accepted, "
-        "%zu doors, %zu door-edge links, %zu doors gate nothing "
-        "(gate routing)\n",
+        "%zu doors, %zu door-edge links, %zu doors gate nothing, "
+        "%zu components (largest %zu/%zu) (gate routing)\n",
         mHybridGraph.numProbes(), mHybridGraph.numEdges(), edges.size(),
-        doors.size(), mHybridGraph.doorEdgeCount(), noEdges);
+        doors.size(), mHybridGraph.doorEdgeCount(), noEdges,
+        comps, largestComp, mHybridGraph.numProbes());
     // A skipped edge means the adjacency's probe indices do not fit the
     // probe array we passed — the exact cross-batch pairing bug this
     // build once shipped with. The graph would route on thinned, wrong
@@ -15569,24 +15782,41 @@ void AudioService::buildHybridRouteGraph()
     // A door mapped to NO edge cannot gate the sound routed past it — an
     // over-tight door box would leak audio through a closed door, and its
     // open/close events can never mark a voice dirty (the commit drain keys
-    // on pathGateDoors). Announce it loudly (no silent fallbacks), WITH the
-    // door IDs so a stress run's toggled doors can be checked against the
-    // list. A handful is expected (doors with no through-probe pair, e.g.
-    // sealed/decorative doors that no route ever threads).
+    // on pathGateDoors). Classified by the §54 portal match (no silent
+    // fallbacks, but no crying wolf either):
+    //  - PASSAGE doors (sitting ON a room portal) with no edge are REAL
+    //    gate gaps — loud WARN with ids. Post-aperture-expansion the
+    //    expected residue is doors whose flank EDGE itself is missing
+    //    from the adjacency (§54 door 66) or probe-less vertical
+    //    passages (§54 door 99), not annotation misses.
+    //  - NON-passage doors (deposit boxes, cabinets, hatches off the
+    //    room graph) legitimately thread no route — count-only NOTE.
     if (noEdges > 0) {
         const std::unordered_set<int32_t> withEdgeIds =
             mHybridGraph.doorIdsWithEdges();
-        std::string idList;
+        std::string passageIds, otherIds;
+        size_t passageN = 0, otherN = 0;
         for (const auto &d : doors) {
             if (withEdgeIds.count(d.id)) continue;
-            if (!idList.empty()) idList += ",";
-            idList += std::to_string(d.id);
+            auto it = mDoorAudioInstances.find(d.id);
+            const bool passage =
+                it != mDoorAudioInstances.end() && it->second.portalMatched;
+            std::string &list = passage ? passageIds : otherIds;
+            if (!list.empty()) list += ",";
+            list += std::to_string(d.id);
+            (passage ? passageN : otherN)++;
         }
-        std::fprintf(stderr,
-            "[HYBRID_GRAPH] NOTE: %zu of %zu doors map to no edge — their "
-            "open-fraction will not gate any route (check door box margin if "
-            "this is high). no-edge door ids: %s\n",
-            noEdges, doors.size(), idList.c_str());
+        if (passageN > 0)
+            std::fprintf(stderr,
+                "[HYBRID_GRAPH] WARN: %zu PASSAGE door(s) (on a room portal) "
+                "map to no edge — their open-fraction gates NO route (real "
+                "gap: missing flank edge or probe-less side). ids: %s\n",
+                passageN, passageIds.c_str());
+        if (otherN > 0)
+            std::fprintf(stderr,
+                "[HYBRID_GRAPH] NOTE: %zu non-passage door(s) map to no edge "
+                "(deposit-box/cabinet class — expected). ids: %s\n",
+                otherN, otherIds.c_str());
     }
 
     // The graph just changed under any voice that cached a route against the
