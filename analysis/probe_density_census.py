@@ -264,7 +264,10 @@ def main():
     agg_count = defaultdict(int)
     agg_absorbed = defaultdict(int)
     agg_sub1 = defaultdict(int)
+    agg_deg = defaultdict(int)     # total edge endpoints owned per origin
     grand_total = 0
+    grand_deg = 0                  # 2 * total edges (both endpoints counted)
+    n_with_edges = 0
 
     for path in paths:
         name = os.path.basename(path).split(".")[0]
@@ -275,17 +278,27 @@ def main():
         edge_count, edge_lengths = _load_edges(edge_path, probes)
         nnd = census_mission(name, probes, edge_count, edge_lengths)
         grand_total += len(probes)
+        if edge_count is not None:
+            n_with_edges += 1
         for idx, p in enumerate(probes):
             agg_count[p.origin] += 1
             agg_absorbed[p.origin] += p.absorbed
             if nnd[idx] < 1.0:
                 agg_sub1[p.origin] += 1
+            if edge_count is not None:
+                agg_deg[p.origin] += p.degree
+                grand_deg += p.degree
 
     if grand_total and len(paths) > 1:
+        # Game-wide attribution. `cnt%` = density share (probe COUNT); `edge%`
+        # = pathing-COST share (fraction of all graph edge endpoints owned by
+        # this rule — solve cost scales with reachable edges, so this is the
+        # runtime-cost lever ranking). `absorb` = dedup burden concentrated;
+        # `<1ft` = near-coincident stacking.
         print(f"\n=== ALL MISSIONS ===  {grand_total} probes across "
-              f"{len(paths)} missions")
-        print(f"  {'origin':<20} {'count':>6} {'%':>5} {'absorb':>7} "
-              f"{'<1ft':>6}")
+              f"{len(paths)} missions ({n_with_edges} with edge sidecars)")
+        print(f"  {'origin':<20} {'count':>6} {'cnt%':>5} {'edge%':>6} "
+              f"{'absorb':>7} {'<1ft':>6}")
         ordered = [o for o in ORIGIN_ORDER if o in agg_count] + \
                   [o for o in agg_count if o not in ORIGIN_ORDER]
         seen = set()
@@ -293,8 +306,10 @@ def main():
             if origin in seen:
                 continue
             seen.add(origin)
+            edge_share = (f"{100.0*agg_deg[origin]/grand_deg:>5.0f}%"
+                          if grand_deg else "    -")
             print(f"  {origin:<20} {agg_count[origin]:>6} "
-                  f"{100.0*agg_count[origin]/grand_total:>4.0f}% "
+                  f"{100.0*agg_count[origin]/grand_total:>4.0f}% {edge_share:>6} "
                   f"{agg_absorbed[origin]:>7} {agg_sub1[origin]:>6}")
 
 
