@@ -157,6 +157,19 @@ enum class PathingProbePurpose {
                 ///< coverage constants; PLAN.PATHING_DESIGN.md §10).
 };
 
+/// Human-readable purpose name for logs / positions sidecars (§55 Phase 0).
+inline const char *pathingProbePurposeString(PathingProbePurpose p) {
+    switch (p) {
+        case PathingProbePurpose::Portal:     return "portal";
+        case PathingProbePurpose::DoorPair:   return "door_pair";
+        case PathingProbePurpose::Centroid:   return "centroid";
+        case PathingProbePurpose::Emitter:    return "emitter";
+        case PathingProbePurpose::PortalPair: return "portal_pair";
+        case PathingProbePurpose::HubFill:    return "hub_fill";
+    }
+    return "unknown";
+}
+
 /// Pathing probe layout density tier — the `audio.pathing_probes.density`
 /// config knob. Selects how many graph nodes prepareProbeBakeParams emits
 /// per architectural feature. Recorded in the .probes v4 header
@@ -220,6 +233,44 @@ inline PathingProbeDensity pathingProbeDensityFromName(const std::string &s) {
     return PathingProbeDensity::Unknown;
 }
 
+/// The CREATING RULE of a pathing candidate — one value per emission
+/// site in AudioService::prepareProbeBakeParams. Purpose alone cannot
+/// attribute density (HubFill covers four distinct passes; PortalPair
+/// two), and the density overhaul needs every baked probe to answer
+/// "which placement rule put you here" offline (PLAN.PATHING_DESIGN.md
+/// §55 Phase 0). Recorded per probe in the pathing positions sidecar.
+enum class PathingProbeOrigin : uint8_t {
+    Unknown = 0,
+    ApertureSingle,     ///< non-door aperture single at the in-air anchor
+    DoorFlank,          ///< DoorPair member, aperture-anchored flank
+    DoorFallbackFlank,  ///< DoorPair member, door with NO aperture
+                        ///< ([APERTURE_FICTION_DOOR] — OBB-center anchor)
+    ThroatPair,         ///< PortalPair member — frame-throat small opening
+    HatchPair,          ///< PortalPair member — floor/ceiling pocket hatch
+    EmitterMirror,      ///< ambient-emitter mirror anchor
+    FillSite,           ///< region coverage fill (Gonzalez k-center)
+    RegionSeed,         ///< zero-anchor region seeding
+    StitchStone,        ///< intra-region connectivity stitching stone
+    JoinerStone,        ///< global fragment joiner stepping stone
+};
+
+inline const char *pathingProbeOriginString(PathingProbeOrigin o) {
+    switch (o) {
+        case PathingProbeOrigin::Unknown:           return "unknown";
+        case PathingProbeOrigin::ApertureSingle:    return "aperture_single";
+        case PathingProbeOrigin::DoorFlank:         return "door_flank";
+        case PathingProbeOrigin::DoorFallbackFlank: return "door_fallback_flank";
+        case PathingProbeOrigin::ThroatPair:        return "throat_pair";
+        case PathingProbeOrigin::HatchPair:         return "hatch_pair";
+        case PathingProbeOrigin::EmitterMirror:     return "emitter_mirror";
+        case PathingProbeOrigin::FillSite:          return "fill_site";
+        case PathingProbeOrigin::RegionSeed:        return "region_seed";
+        case PathingProbeOrigin::StitchStone:       return "stitch_stone";
+        case PathingProbeOrigin::JoinerStone:       return "joiner_stone";
+    }
+    return "unknown";
+}
+
 /// One pathing-graph node candidate, supplied by AudioService under the
 /// portal-first layout: each REAL aperture contributes one probe (at its
 /// in-air anchor) or a flanking pair when a door OBB sits in it; the
@@ -231,6 +282,17 @@ struct PathingProbeCandidate {
     Vector3 position{0.0f, 0.0f, 0.0f};
     float   radiusFt = 5.0f;   ///< Influence radius — sized adaptively post-dedup.
     PathingProbePurpose purpose = PathingProbePurpose::Portal;
+    /// Density attribution (§55 Phase 0) — flows through the filter pass
+    /// and dedup into the bake and the positions sidecar unchanged.
+    PathingProbeOrigin origin = PathingProbeOrigin::Unknown;
+    /// Origin-dependent identity: ROOM_DB portalID for aperture-anchored
+    /// origins, air-region id for fill/seed/stitch, emitter index for
+    /// mirrors, -1 for joiner stones / no identity.
+    int32_t provenanceId = -1;
+    /// How many candidates the proximity dedup dropped or merged IN THIS
+    /// PROBE'S FAVOR (this probe was the kept collision partner). High
+    /// values mark probes carrying a whole stack's coverage burden.
+    uint16_t absorbed = 0;
 };
 
 /// Output of `ProbeManager::computeBakePlan` — the exact probe layout a
@@ -533,6 +595,11 @@ struct ProbeBatchEntry {
     /// (DarknessRender::renderPathingProbeOverlay) to draw influence
     /// spheres.
     std::vector<float>    radiiFt;
+    /// Post-filter pathing candidates in placement order (pathing entries
+    /// only) — parallel to `positions`. Carries the density-attribution
+    /// fields (origin / provenanceId / absorbed) into the enriched
+    /// positions sidecar (§55 Phase 0). Left empty on reflection entries.
+    std::vector<PathingProbeCandidate> pathingMeta;
 };
 
 /// Owns one or more Steam Audio probe batches + mirrored probe-position
@@ -866,6 +933,13 @@ private:
     /// by buildPathingAdjacency; cleared by releaseBatches. Empty +
     /// built=false on init.
     PathingAdjacency mPathingAdjacency;
+
+    /// Path of the .probes file the current in-memory data came from —
+    /// set by bakeProbes (outputPath) and loadProbes (probePath). Used to
+    /// derive the edge-list sidecar path in buildPathingAdjacency and to
+    /// let census tooling write sidecars beside an existing cache
+    /// (§55 Phase 0). Empty until the first bake/load.
+    std::string mProbeFilePath;
 };
 
 } // namespace Darkness
