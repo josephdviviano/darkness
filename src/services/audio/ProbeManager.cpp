@@ -106,11 +106,21 @@ inline PlaceResult tryPlaceProbe(Vector3 pos, const ProbeFilterFn &filter,
 /// When `radii` is non-empty (and matches positions.size()) the optional
 /// per-probe influence-radius column is appended. The reader gracefully
 /// handles both 4- and 5-column rows so older sidecars stay loadable.
+///
+/// When `meta` is non-null and matches positions.size() (pathing batch
+/// only), four density-attribution columns follow the radius:
+/// purpose,origin,provenanceId,absorbed (§55 Phase 0). The C++ reader
+/// (`readPositionsSidecar`) scans only the first five fields, so the extra
+/// columns are ignored on load — they exist for offline census tooling
+/// (analysis/probe_density_census.py). Metadata columns REQUIRE the radius
+/// column, so a meta write forces the 5-column form.
 void writePositionsSidecar(const std::string &outputPath,
                            const std::string &suffix,
                            const std::vector<Vector3> &positions,
                            const std::vector<float>   &radii,
-                           float spacing, float height)
+                           float spacing, float height,
+                           const std::vector<PathingProbeCandidate> *meta
+                               = nullptr)
 {
     std::string posPath = outputPath + suffix + ".positions.csv";
     FILE *pf = std::fopen(posPath.c_str(), "w");
@@ -120,18 +130,34 @@ void writePositionsSidecar(const std::string &outputPath,
                  posPath.c_str());
         return;
     }
-    const bool hasRadii = (radii.size() == positions.size());
+    const bool hasMeta  = (meta && meta->size() == positions.size());
+    // Metadata columns are meaningless without the radius column they follow;
+    // a meta write therefore implies radii (the pathing batch always has one
+    // radius per probe, so this holds by construction).
+    const bool hasRadii = hasMeta || (radii.size() == positions.size());
     std::fprintf(pf, "# Probe positions in engine feet — written by "
                       "ProbeManager::bakeProbes. spacing=%.2f height=%.2f\n",
                   spacing, height);
-    if (hasRadii) {
+    if (hasMeta) {
+        std::fprintf(pf,
+                     "index,x,y,z,radiusFt,purpose,origin,provenanceId,"
+                     "absorbed\n");
+    } else if (hasRadii) {
         std::fprintf(pf, "index,x,y,z,radiusFt\n");
     } else {
         std::fprintf(pf, "index,x,y,z\n");
     }
     for (size_t i = 0; i < positions.size(); ++i) {
         const auto &p = positions[i];
-        if (hasRadii) {
+        if (hasMeta) {
+            const PathingProbeCandidate &m = (*meta)[i];
+            std::fprintf(pf, "%zu,%.3f,%.3f,%.3f,%.3f,%s,%s,%d,%u\n",
+                         i, p.x, p.y, p.z, radii[i],
+                         pathingProbePurposeString(m.purpose),
+                         pathingProbeOriginString(m.origin),
+                         m.provenanceId,
+                         static_cast<unsigned>(m.absorbed));
+        } else if (hasRadii) {
             std::fprintf(pf, "%zu,%.3f,%.3f,%.3f,%.3f\n",
                          i, p.x, p.y, p.z, radii[i]);
         } else {
@@ -140,9 +166,10 @@ void writePositionsSidecar(const std::string &outputPath,
         }
     }
     std::fclose(pf);
-    AUDIO_LOG("Wrote probe positions sidecar '%s' (%zu rows, radii=%s)\n",
+    AUDIO_LOG("Wrote probe positions sidecar '%s' (%zu rows, radii=%s, "
+              "meta=%s)\n",
               posPath.c_str(), positions.size(),
-              hasRadii ? "yes" : "no");
+              hasRadii ? "yes" : "no", hasMeta ? "yes" : "no");
 }
 
 /// Read a positions sidecar written by writePositionsSidecar. Returns
@@ -957,6 +984,10 @@ bool ProbeManager::bakePathingBatch(IPLScene scene,
         positions.push_back(k.position);
         radii.push_back(k.radiusFt);
     }
+    // Density-attribution metadata, index-aligned with positions/radii
+    // (§55 Phase 0). pathingKept carries the creating-rule fields verbatim
+    // through the filter and dedup passes, so a direct copy stays aligned.
+    outEntry.pathingMeta = plan.pathingKept;
 
     if (positions.empty()) {
         LOG_ERROR("ProbeManager: filter rejected every pathing candidate — "
@@ -1160,6 +1191,10 @@ bool ProbeManager::bakeProbes(IPLScene scene,
         return false;
     }
 
+    // Remember where this data lives so buildPathingAdjacency can drop the
+    // edge-list sidecar beside the positions sidecar (§55 Phase 0).
+    mProbeFilePath = outputPath;
+
     // Negative override → manager defaults.
     float spacing = (params.spacingFtOverride > 0.0f) ? params.spacingFtOverride : mProbeSpacingFt;
     float height  = (params.heightFtOverride  > 0.0f) ? params.heightFtOverride  : mProbeHeightFt;
@@ -1312,9 +1347,12 @@ bool ProbeManager::bakeProbes(IPLScene scene,
                               spacing, height);
     }
     if (havePathing) {
+        // Pathing sidecar carries the density-attribution columns
+        // (purpose/origin/provenanceId/absorbed) for offline census tooling
+        // (§55 Phase 0). pathingMeta is index-aligned with positions/radii.
         writePositionsSidecar(outputPath, ".pathing",
                               pathEntry.positions, pathEntry.radiiFt,
-                              spacing, height);
+                              spacing, height, &pathEntry.pathingMeta);
     }
 
     // Bake done; release the batch handles we own. Disk is the source of
@@ -1364,6 +1402,10 @@ bool ProbeManager::loadProbes(const std::string &probePath,
         LOG_ERROR("ProbeManager: cannot load probes — no context");
         return false;
     }
+
+    // Remember where this data lives (edge-list sidecar path derivation,
+    // census tooling — §55 Phase 0).
+    mProbeFilePath = probePath;
 
     // Release any previously loaded batches (from both simulators).
     releaseBatches(reflectionSimulator, pathingSimulator);
@@ -1713,6 +1755,39 @@ void ProbeManager::buildPathingAdjacency(
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     mPathingAdjacency.built   = true;
     mPathingAdjacency.buildMs = ms;
+
+    // Edge-list sidecar (§55 Phase 0). This graph — one center ray per pair
+    // under the baked visRange — is the density-COST currency: pathing solve
+    // cost scales with reachable edges, so per-probe degree joined against
+    // the positions sidecar's origin column attributes runtime cost to
+    // placement rules. Written beside the positions sidecar; skipped
+    // (non-fatal) when the probe file path is unknown (e.g. a stub/test
+    // batch loaded without a file). Columns: i,j,lengthFt.
+    if (!mProbeFilePath.empty()) {
+        std::string edgePath = mProbeFilePath + ".pathing.edges.csv";
+        FILE *ef = std::fopen(edgePath.c_str(), "w");
+        if (ef) {
+            std::fprintf(ef,
+                "# Pathing adjacency edges (one center ray/pair) — written by "
+                "ProbeManager::buildPathingAdjacency. visRangeFt=%.2f "
+                "numVisSamples=%d probes=%d edges=%d\n",
+                visRangeFt, numVisSamples, N, edges);
+            std::fprintf(ef, "i,j,lengthFt\n");
+            for (const auto &e : mPathingAdjacency.edges) {
+                const Vector3 d = positions[static_cast<size_t>(e.b)]
+                                - positions[static_cast<size_t>(e.a)];
+                const float len = std::sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
+                std::fprintf(ef, "%d,%d,%.3f\n", e.a, e.b, len);
+            }
+            std::fclose(ef);
+            AUDIO_LOG("Wrote pathing edges sidecar '%s' (%d edges)\n",
+                      edgePath.c_str(), edges);
+        } else {
+            LOG_INFO("ProbeManager: could not write pathing edges sidecar "
+                     "'%s' (census will lack cost attribution)",
+                     edgePath.c_str());
+        }
+    }
 
     // Single-line diagnostic that lets future debugging cross-check
     // edge count against Steam Audio's reported bake count (if a future

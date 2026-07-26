@@ -17147,16 +17147,29 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                       flankCenter.x, flankCenter.y, flankCenter.z,
                       ap ? ap->apertureInradiusFt : -1.0f,
                       rec.inradiusFt);
+            // Density attribution (§55 Phase 0): a door with a real WR
+            // aperture anchors its flanks there (DoorFlank, keyed by the
+            // aperture's portalID); a door with NO aperture takes the OBB
+            // center ([APERTURE_FICTION_DOOR]) and is keyed by door index.
+            // Both flanks share one provenanceId so the pair groups.
+            const PathingProbeOrigin doorOrigin =
+                ap ? PathingProbeOrigin::DoorFlank
+                   : PathingProbeOrigin::DoorFallbackFlank;
+            const int32_t doorProvId = ap ? ap->portalID : rec.doorIdx;
             PathingProbeCandidate inside;
             inside.position =
                 flankCenter - rec.unitNormal * kPairProbeOffsetFt;
             inside.radiusFt = 3.0f;
             inside.purpose  = PathingProbePurpose::DoorPair;
+            inside.origin       = doorOrigin;
+            inside.provenanceId = doorProvId;
             PathingProbeCandidate outside;
             outside.position =
                 flankCenter + rec.unitNormal * kPairProbeOffsetFt;
             outside.radiusFt = 3.0f;
             outside.purpose  = PathingProbePurpose::DoorPair;
+            outside.origin       = doorOrigin;
+            outside.provenanceId = doorProvId;
             params.pathingCandidates.push_back(inside);
             params.pathingCandidates.push_back(outside);
             doorPairCount += 2;
@@ -17234,14 +17247,24 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                 && std::min(regionCells(apRec.regionA),
                             regionCells(apRec.regionB)) == 1;
             if (frameThroat || pocketHatch) {
+                // frameThroat classifies first when both fire (a vertical
+                // frame/throat is the primary signature); both sides share
+                // the aperture's portalID (§55 Phase 0 attribution).
+                const PathingProbeOrigin pairOrigin =
+                    frameThroat ? PathingProbeOrigin::ThroatPair
+                                : PathingProbeOrigin::HatchPair;
                 PathingProbeCandidate sideA;
                 sideA.position = apRec.probePos;
                 sideA.radiusFt = 3.0f;
                 sideA.purpose  = PathingProbePurpose::PortalPair;
+                sideA.origin       = pairOrigin;
+                sideA.provenanceId = apRec.portalID;
                 PathingProbeCandidate sideB;
                 sideB.position = apRec.probePosB;
                 sideB.radiusFt = 3.0f;
                 sideB.purpose  = PathingProbePurpose::PortalPair;
+                sideB.origin       = pairOrigin;
+                sideB.provenanceId = apRec.portalID;
                 params.pathingCandidates.push_back(sideA);
                 params.pathingCandidates.push_back(sideB);
                 portalCount += 2;
@@ -17252,6 +17275,8 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             cand.position = apRec.probePos;  // in-air by construction
             cand.radiusFt = kPortalRadiusFt;
             cand.purpose  = PathingProbePurpose::Portal;
+            cand.origin       = PathingProbeOrigin::ApertureSingle;
+            cand.provenanceId = apRec.portalID;   // §55 Phase 0 attribution
             params.pathingCandidates.push_back(cand);
             ++portalCount;
         };
@@ -17632,6 +17657,22 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
     if (mProbePathingBatchEnabled && mRoomService) {
         constexpr float kEmitterPathRadiusFt = 0.5f;
 
+        // Per-origin density census (§55 Phase 0). By the time this block
+        // runs, the door/portal/aperture candidates from the earlier
+        // aperture block are already in params.pathingCandidates; the
+        // emitter candidates are appended below. censusEmitted is snapshot
+        // just before the proximity dedup (captures every door/portal/
+        // aperture/emitter candidate before any are dropped); the HubFill
+        // family (seed/fill/stitch/joiner) is added AFTER dedup and is never
+        // deduped, so its emitted count equals its survived count. Both are
+        // reported per creating-rule at the end of the block so density can
+        // be attributed to the exact rule that drove it, and dedup burden
+        // (emitted - survived) is visible per rule. Indexed by
+        // PathingProbeOrigin; size covers Unknown + all 10 rules.
+        constexpr size_t kNumPathingOrigins = 11;
+        std::array<int, kNumPathingOrigins> censusEmitted{};
+        std::array<int, kNumPathingOrigins> censusSurvived{};
+
         // Jitter each pathing emitter anchor by up to ±1 ft per axis.
         // Steam Audio's `checkOcclusion` casts a single point-to-point
         // ray from source to probe; when a voice's source position
@@ -17671,7 +17712,10 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
         };
         int added = 0;
         int pruned = 0;
-        for (const Vector3 &p : params.emitterPositions) {
+        // Indexed so each mirror carries its emitter index as provenanceId
+        // (§55 Phase 0 attribution).
+        for (size_t ei = 0; ei < params.emitterPositions.size(); ++ei) {
+            const Vector3 &p = params.emitterPositions[ei];
             if (emitterServed(p)) {
                 ++pruned;
                 continue;
@@ -17681,6 +17725,8 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
             cand.position = p + offset;
             cand.radiusFt = kEmitterPathRadiusFt;
             cand.purpose  = PathingProbePurpose::Emitter;
+            cand.origin       = PathingProbeOrigin::EmitterMirror;
+            cand.provenanceId = static_cast<int32_t>(ei);
             params.pathingCandidates.push_back(cand);
             ++added;
         }
@@ -17691,6 +17737,15 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                   "zero-distance source-probe ray degeneracy)\n",
                   added, pruned, kEmitterServeRadiusFt,
                   params.pathingCandidates.size());
+
+        // §55 Phase 0: snapshot emitted-per-origin BEFORE dedup. Every
+        // door/portal/aperture/emitter candidate is present here; the
+        // HubFill family is added later (post-dedup) and counted at the
+        // survived snapshot instead.
+        for (const auto &c : params.pathingCandidates) {
+            const size_t oi = static_cast<size_t>(c.origin);
+            if (oi < censusEmitted.size()) ++censusEmitted[oi];
+        }
 
         // ── Proximity dedup pass ───────────────────────────────────────
         // Drop any candidate that falls within mProbePathingDedupRadiusFt
@@ -17953,6 +18008,10 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                                               && keptRegion[i] != candRegion);
                     if (samePurpose && sameRoom && !regionSplit
                         && dsq < radiusSq) {
+                        // §55 Phase 0: the kept partner absorbs this drop —
+                        // its count marks how much coverage burden it carries
+                        // (saturate at uint16 max rather than wrap).
+                        if (kept[i].absorbed != 0xFFFFu) ++kept[i].absorbed;
                         tooClose = true;              // the original collision
                         break;
                     }
@@ -17987,6 +18046,9 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                     if ((nonDoorMerge || crossDoorFlankMerge) &&
                         !wouldEmptyRegion(cand.position) &&
                         sameAcousticSpace(cand.position, kept[i].position)) {
+                        // §55 Phase 0: same-space merge — kept partner
+                        // absorbs this candidate's coverage.
+                        if (kept[i].absorbed != 0xFFFFu) ++kept[i].absorbed;
                         ++mergedSameSpace;
                         tooClose = true;
                         break;
@@ -18558,6 +18620,8 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                         seed.position = seedPos;
                         seed.radiusFt = 5.0f;   // adaptive pass overrides
                         seed.purpose  = PathingProbePurpose::HubFill;
+                        seed.origin       = PathingProbeOrigin::RegionSeed;
+                        seed.provenanceId = rid;   // §55 Phase 0 attribution
                         params.pathingCandidates.push_back(seed);
                         anchIt = regionAnchors
                                      .emplace(rid, std::vector<Vector3>{})
@@ -18712,6 +18776,8 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                         // assigns the real value.
                         cand.radiusFt = 5.0f;
                         cand.purpose  = PathingProbePurpose::HubFill;
+                        cand.origin       = PathingProbeOrigin::FillSite;
+                        cand.provenanceId = rid;   // §55 Phase 0 attribution
                         params.pathingCandidates.push_back(cand);
                         anchors.push_back(sitePos);
                         ++added;
@@ -18933,6 +18999,8 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                             stone.position = stonePos;
                             stone.radiusFt = 5.0f;  // adaptive pass overrides
                             stone.purpose  = PathingProbePurpose::HubFill;
+                            stone.origin       = PathingProbeOrigin::StitchStone;
+                            stone.provenanceId = rid;  // §55 Phase 0 attribution
                             params.pathingCandidates.push_back(stone);
                             anchors.push_back(stonePos);
                             ++added;
@@ -19259,6 +19327,10 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                         stone.position = jSites[static_cast<size_t>(sBest)];
                         stone.radiusFt = 5.0f;  // adaptive pass overrides
                         stone.purpose  = PathingProbePurpose::HubFill;
+                        // Global fragment joiner: seam-spanning stones cross
+                        // region boundaries, so there is no single region
+                        // identity — provenanceId stays -1 (§55 Phase 0).
+                        stone.origin = PathingProbeOrigin::JoinerStone;
                         cands.push_back(stone);
                         ++stones;
                         const int prevComps = comps;
@@ -19447,6 +19519,51 @@ void AudioService::prepareProbeBakeParams(ProbeBakeParams &params,
                               "radii min=%.2f med=%.2f max=%.2f ft\n",
                               a.name, a.r.size(), minR, medR, maxR);
                 }
+            }
+
+            // §55 Phase 0: per-origin density census. Snapshot survivors,
+            // then report emitted -> survived (dropped) per creating rule.
+            // This is the attribution the positions sidecar (survivors only)
+            // cannot show alone: it exposes both the probe COUNT each rule
+            // contributes AND the dedup BURDEN it incurs. HubFill-family
+            // origins (seed/fill/stitch/joiner) are emitted AFTER the dedup
+            // snapshot and never deduped, so their emitted count equals
+            // their survived count. A nonzero `unknown` row flags an
+            // emission site that forgot to tag its origin.
+            {
+                for (const auto &c : params.pathingCandidates) {
+                    const size_t oi = static_cast<size_t>(c.origin);
+                    if (oi < censusSurvived.size()) ++censusSurvived[oi];
+                }
+                auto isHubFillOrigin = [](PathingProbeOrigin o) {
+                    return o == PathingProbeOrigin::RegionSeed
+                        || o == PathingProbeOrigin::FillSite
+                        || o == PathingProbeOrigin::StitchStone
+                        || o == PathingProbeOrigin::JoinerStone;
+                };
+                int totalEmitted = 0, totalSurvived = 0;
+                std::fprintf(stderr,
+                    "[DENSITY_CENSUS] per-origin emitted -> survived "
+                    "(dropped), visRange=%.1f ft:\n",
+                    params.pathingVisRangeFt);
+                for (size_t oi = 0; oi < kNumPathingOrigins; ++oi) {
+                    const auto o = static_cast<PathingProbeOrigin>(oi);
+                    const int emitted = isHubFillOrigin(o)
+                                            ? censusSurvived[oi]
+                                            : censusEmitted[oi];
+                    const int survived = censusSurvived[oi];
+                    if (emitted == 0 && survived == 0) continue;
+                    totalEmitted  += emitted;
+                    totalSurvived += survived;
+                    std::fprintf(stderr,
+                        "[DENSITY_CENSUS]   %-20s %5d -> %5d (%d)\n",
+                        pathingProbeOriginString(o), emitted, survived,
+                        emitted - survived);
+                }
+                std::fprintf(stderr,
+                    "[DENSITY_CENSUS]   %-20s %5d -> %5d (%d)\n",
+                    "TOTAL", totalEmitted, totalSurvived,
+                    totalEmitted - totalSurvived);
             }
         }
     }
