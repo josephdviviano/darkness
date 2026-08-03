@@ -300,23 +300,37 @@ File &operator <<(File &f, const MeshMaterialExtra &mext) {
     return f;
 }
 
-/// Transformation structure that describes how the model part is attached to
-/// it's parent (.BIN LGMD uses a transform tree, similar to skeleton for AI
-/// meshes)
+/// Transformation structure describing how a model part moves relative to its
+/// parent. The sub-object TREE is expressed by `child_sub_obj`/`next_sub_obj`
+/// in SubObjectHeader — NOT by anything in here.
 struct SubObjTransform {
-    int32_t parent; /// A numbered parent identification (Parent sub-object
-                    /// index) or -1 if no parent exists.
-    // Comment: I expect this to rather be an SubObject index.
+    /// Joint slot this part is driven by, or -1 when the part is static.
+    ///
+    /// Previously read as a `parent` sub-object index (inherited from OPDE,
+    /// whose own comment hedged "I expect this to rather be an SubObject
+    /// index"). That reading is wrong: -1 is a "no joint" sentinel, which is
+    /// the only reason it ever looked like a parent link.
+    ///
+    /// Verified against every LGMD model in obj.crf (1782 models, 2207
+    /// sub-objects), two independent exact predictions:
+    ///   - `joint_idx == -1` IFF `movement == MOVEMENT_NONE`  — 2207/2207.
+    ///   - The `@sNN` authoring prefix in SubObjectHeader::name (zero-padded
+    ///     2-digit joint number) equals this value — 425/425 jointed parts.
+    /// Values also violate a parent reading directly: 3 sub-objects carry a
+    /// value >= the model's num_objs, which cannot be a sub-object index.
+    ///
+    /// Range: observed 0..13 in stock data (clock and camera models). Do NOT
+    /// assume a 6-joint cap.
+    int32_t joint_idx;
     float min_range; /// minimal angle/translation ?
     float max_range; /// maximal angle/translation ?
-    float rot[9]; /// Transformation matrix. Rotation and translation comparing
-                  /// the parent object (not used for parent imho)
-    Vertex axle_point; /// Position of this sub-object
+    float rot[9];    /// 3x3 basis of this sub-object relative to its parent
+    Vertex axle_point; /// Position of this sub-object (rotation axle origin)
 };
 
 File &operator >>(File &f, SubObjTransform &t) {
     // the transform stuff
-    f >> t.parent
+    f >> t.joint_idx
       >> t.min_range
       >> t.max_range;
 
@@ -329,7 +343,7 @@ File &operator >>(File &f, SubObjTransform &t) {
 
 File &operator <<(File &f, const SubObjTransform &t) {
     // the transform stuff
-    f << t.parent
+    f << t.joint_idx
       << t.min_range
       << t.max_range;
 
