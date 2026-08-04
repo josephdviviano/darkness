@@ -90,7 +90,26 @@ public:
     // Entity queries
     // ========================================================================
 
-    bool exists(EntityID id) const override { return mObjSvc->exists(id); }
+    /// Take a destroyed object out of the live world.
+    ///
+    /// The object stays in the database — its ID is NOT recycled, so nothing
+    /// holding it can start pointing at a different object — but every live
+    /// query stops seeing it: `exists()` is false and it leaves the spatial
+    /// index, so AI, audio and area queries treat it as gone.
+    void notifyDestroyed(int32_t objID) {
+        mObjectStates.get(objID).flags |= kObjStateDestroyed;
+        if (mSpatialPopulated)
+            mSpatialIndex.remove(static_cast<EntityID>(objID));
+    }
+
+    /// A destroyed object no longer exists as far as gameplay is concerned.
+    /// The flag used to be honoured only by the renderer, so a slain or
+    /// deleted object went on being heard, sensed and queried.
+    bool exists(EntityID id) const override {
+        const ObjectState *st = mObjectStates.tryGet(static_cast<int32_t>(id));
+        if (st && (st->flags & kObjStateDestroyed)) return false;
+        return mObjSvc->exists(id);
+    }
 
     Vector3 getPosition(EntityID id) const override {
         const ObjectState *st = mObjectStates.tryGet(static_cast<int32_t>(id));

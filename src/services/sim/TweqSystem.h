@@ -123,6 +123,13 @@ struct TweqInstance {
 using TweqEventCallback = std::function<void(int32_t objID, eTweqType type,
                                               int haltAction)>;
 
+// ── Callback fired when a tweq destroys or slays its object ──
+// Wired to whatever has to take the object out of the live world: physics
+// bodies, the spatial index, world queries. Unlike TweqEventCallback this is
+// NOT gated on the Scripts flag — an object dying is not an optional
+// notification.
+using ObjectDestroyCallback = std::function<void(int32_t objID)>;
+
 // ============================================================================
 // TweqSystem — manages all tweq animations
 // ============================================================================
@@ -271,6 +278,12 @@ public:
 
     /// Set callback for tweq completion events (for TweqComplete messages).
     void setEventCallback(TweqEventCallback cb) { mEventCallback = std::move(cb); }
+
+    /// Set the callback that removes an object from the live world when a tweq
+    /// destroys or slays it.
+    void setDestroyCallback(ObjectDestroyCallback cb) {
+        mDestroyCallback = std::move(cb);
+    }
 
     // ── SimListener interface ──
 
@@ -1211,9 +1224,22 @@ private:
         switch (haltAction) {
         case kTweqHaltDestroy:
         case kTweqHaltSlay:
-            // Mark object as destroyed — renderer will skip it
+            // Mark object as destroyed — the renderer skips it from here on.
             if (mObjectStates) {
                 mObjectStates->get(tw.objID).flags |= kObjStateDestroyed;
+            }
+            // ... and take it out of the rest of the simulation. The flag alone
+            // used to be the whole of it, so a slain object went on colliding,
+            // being heard and answering area queries while invisible.
+            if (mDestroyCallback) {
+                mDestroyCallback(tw.objID);
+            } else {
+                static int warnCount = 0;
+                if (warnCount++ < 3)
+                    std::fprintf(stderr, "[FALLBACK] TweqSystem: obj %d destroyed "
+                                 "with no destroy callback wired — it stops "
+                                 "rendering but stays in physics, audio and world "
+                                 "queries\n", tw.objID);
             }
             tw.active = false;
             break;
@@ -1269,6 +1295,7 @@ private:
     ObjectStateMap *mObjectStates = nullptr;
     const std::unordered_map<int32_t, ObjPlacementInfo> *mPlacements = nullptr;
     TweqEventCallback mEventCallback;
+    ObjectDestroyCallback mDestroyCallback;
     std::mt19937 mRng;
     uint32_t mFrameCount = 0;
     const std::unordered_map<std::string, ParsedBinMesh> *mParsedModels = nullptr;

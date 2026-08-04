@@ -443,6 +443,34 @@ TEST_CASE("TweqSystem: a delete tweq removes its object when the timer expires",
     REQUIRE((states.get(920).flags & Darkness::kObjStateDestroyed) != 0);
 }
 
+TEST_CASE("TweqSystem: destruction is announced, not just flagged", "[Tweq]") {
+    // The flag alone only stops the renderer. Everything else — collision
+    // bodies, the spatial index, exists() — has to be told.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    std::vector<int32_t> destroyed;
+    sys.setDestroyCallback([&destroyed](int32_t id) { destroyed.push_back(id); });
+    sys.injectForTest(makeDeleteTweq(922, 100, Darkness::kTweqHaltDestroy), &states);
+
+    sys.simStep(0.0f, 0.2f);
+
+    REQUIRE(destroyed.size() == 1);
+    REQUIRE(destroyed[0] == 922);
+}
+
+TEST_CASE("TweqSystem: a Stop-halt delete does not announce destruction",
+          "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    std::vector<int32_t> destroyed;
+    sys.setDestroyCallback([&destroyed](int32_t id) { destroyed.push_back(id); });
+    sys.injectForTest(makeDeleteTweq(923, 100, Darkness::kTweqHaltStop), &states);
+
+    sys.simStep(0.0f, 0.2f);
+
+    REQUIRE(destroyed.empty());
+}
+
 TEST_CASE("TweqSystem: a halted delete tweq leaves the object alone", "[Tweq]") {
     // halt action Stop (2) is the stock 'rat01' setting: the countdown ends,
     // the object stays.
