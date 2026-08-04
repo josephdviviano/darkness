@@ -26,6 +26,7 @@
 #include <unordered_set>
 #include "ai/AIHearingService.h"
 #include "sim/TweqSystem.h"
+#include "SubObjectPose.h"
 
 // ── Initialize service stack and load mission database ──
 // Creates the ServiceManager with all 12 services, registers property/relation
@@ -1142,6 +1143,8 @@ static bool createGPUResources(const Darkness::MissionData &mission,
         }
 
         // Create GPU buffers for each parsed .bin model
+        int multiPartModels = 0;
+        int jointedParts = 0;
         for (const auto &kv : mission.parsedModels) {
             const std::string &name = kv.first;
             const Darkness::ParsedBinMesh &mesh = kv.second;
@@ -1236,11 +1239,22 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                     static_cast<uint32_t>(mesh.indices.size() * sizeof(uint32_t))),
                 BGFX_BUFFER_INDEX32);
 
+            // Sub-object rest pose, composed once. Single-part models leave
+            // restMatrices empty and skip the per-submesh transform entirely.
+            if (Darkness::meshHasSubObjectTransforms(mesh)) {
+                Darkness::composeSubObjectMatrices(mesh, nullptr, 0,
+                                                   objGPUEntry.restMatrices);
+                ++multiPartModels;
+                for (const auto &so : mesh.subObjects)
+                    if (so.movement != Darkness::kSubObjStatic) ++jointedParts;
+            }
+
             // Build per-submesh GPU draw info from parsed submeshes
             for (const auto &sm : mesh.subMeshes) {
                 ObjectSubMeshGPU gsm;
                 gsm.firstIndex = sm.firstIndex;
                 gsm.indexCount = sm.indexCount;
+                gsm.subObj = sm.subObj;
                 gsm.textured = false;
                 gsm.matTrans = 0.0f;
                 gsm.matIllum = 0.0f;
@@ -1263,6 +1277,8 @@ static bool createGPUResources(const Darkness::MissionData &mission,
         }
         std::fprintf(stderr, "Object GPU buffers: %zu models + fallback cube\n",
                      gpu.objModelGPU.size());
+        std::fprintf(stderr, "Sub-objects: %d multi-part models, %d jointed parts "
+                     "(rest matrices composed)\n", multiPartModels, jointedParts);
 
         // Count translucent objects/materials for diagnostics
         int translucentObjCount = 0;
