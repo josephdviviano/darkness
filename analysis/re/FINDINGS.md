@@ -1067,24 +1067,53 @@ the current matrix onto a stack (depth 8) and compose. The joint value is fetche
 per-object array indexed by `joint_idx` with **stride 4**.
 [BIN: movement dispatch + joint-array indexing, Thief2.exe NewDark 1.28]
 
-### 8.5 OPEN: the rotation-axis convention
+### 8.5 RESOLVED: the axis is the part's local +X
 
-Each sub-object's `rot` is a frame the artist orients so a **single fixed local axis** lands
-on the intended hinge line. Which local axis is the convention is not yet established.
+**Grade: CONFIRMED** from the shipped data (2026-08-04). Each sub-object's `rot` is a frame
+the artist orients so a single fixed local axis lands on the intended hinge or slide line, and
+that axis is **local +X** — for both `movement == 1` and `movement == 2`.
 
 An earlier revision argued the matrices *contradict* any single convention, citing identical
 `rot` on `DOOR20 @s00bb` and `CHESTLOC @s00ff`. That argument fell with §8.2: `@s00ff` is the
 chest's **lock plate**, not its lid, and a lock plate and a door handle plausibly do turn about
-the same local axis. The chest **lid** is `@s01bb`, whose `rot` is a *different* matrix
-(`diag(-1, 1, -1)`). So there is no counter-example on the table and a single convention
-remains the most likely answer.
+the same local axis.
 
-**Cheapest resolution is still empirical:** implement with the axis as a constant, drive a
-handle joint to `max_range`, and see which of local X/Y/Z turns it about its own shank.
-Cross-check on `CHESTLOC @s01bb` (lid must tilt up on its rear edge) and `DOOR17SW @s00bb`
-(wheel must spin in its own plane) — three parts with three different intents, one test.
+No in-game test was needed: the geometry settles it. Reading `rot` column-major, its first
+column is the image of local X in the parent's space, and in every case that image is the axis
+the part obviously turns or slides on. Four different intents, each of which would be absurd
+under a local-Y or local-Z reading:
 
-### 8.6 Implementation plan
+| model / part | evidence | local X is |
+|---|---|---|
+| `DOOR17SW @s00bb` | radially symmetric about local X (y/z extents 1.12 each, ±0.56), range `[0, 2*pi]` | a valve wheel's spin axis |
+| `MECLOCK2` (14 hands) | every hand planar with local X as the plane **normal** — x extent exactly 0.00 | the clock's arbor |
+| `CHESTLOC @s01bb` | axle lies at y = 0.401 against the chest body's y-max of 0.400, running along the body's long axis | the lid's top-**rear** hinge line |
+| `CAMERA @s00ss` | local X maps to world +Z; range `[0, 3*pi/2]`; its child's axis is then horizontal | a security camera's vertical pan axis, with tilt below it |
+| `TU_F @s00top` | slide joint whose local X maps to world +Z, range `[0, 2.103]`, child gun then yaws a full turn | a turret rising out of its housing |
+
+Three further facts fell out of the same survey and matter to any implementation:
+
+- **The ranges are not a runtime clamp.** 5 parts carry an interval that *excludes zero*
+  (`MECLOCK2 @s12ll` = `[-1.745, -13.352]`, the `CAM*` family = `[-0.314, -1.571]`), so
+  clamping would displace them at rest; and 4 models author `[0, 0]` on a slide joint, which
+  clamping would freeze permanently. The interval is also **not ordered** — `min > max` in
+  exactly those 5.
+- **Units split between mesh and property.** Mesh ranges are radians; `P$JointPos` (24 B =
+  6 floats) and `P$CfgTweqJo`'s rate/low/high store rotate joints in **degrees** (a door handle
+  at full travel = `90.0` against the mesh's `1.571`). Slides are world units in both.
+- **Exactly one static sub-object per model, always index 0, always with an all-zero `rot`.**
+  1782 models / 2207 sub-objects / 1782 `movement == 0`. The root's `rot` is a placeholder, not
+  a basis — treat the root frame as the model frame.
+
+Survey tool: `analysis/lgmd_subobjects.py`.
+
+### 8.6 Implementation plan — LANDED 2026-08-04
+
+Implemented in `src/main/SubObjectPose.h` + `BinMeshParser.h`; see NOTES.PROJECT.md,
+"LGMD sub-object joints". The plan below is what was built, with one addition: the baked path
+was also **wrong at rest** for nested parts — it applied each part's own frame only, never its
+ancestors', mis-placing 29 parts across the 24 deeper-than-one-level models by up to 23 units
+(`CAMERA01 @s02eye` sat 21 units off its camera body).
 
 1. **Stop baking.** Keep sub-objects as separate submesh ranges; tag vertices with their
    sub-object index. Preserve the `child_sub_obj`/`next_sub_obj` tree.

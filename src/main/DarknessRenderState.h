@@ -363,6 +363,12 @@ struct RuntimeState {
     // thread-safe; the renderer is single-threaded.
     mutable GPULightArray gpuLightScratch;
 
+    // Scratch buffer for the per-object sub-object matrix composition. Only
+    // touched by objects whose joints are off their rest values (a lever being
+    // thrown, a clock running); everything else reads the model's shared
+    // rest matrices. `mutable` for the same reason as gpuLightScratch.
+    mutable std::vector<Matrix4> subObjMatrixScratch;
+
     // Per-frame uniform-buffer budget accounting (see the
     // kFrameUniformBudgetBytes block above for why this exists). Reset
     // in prepareFrame(); world/water/object passes accumulate their

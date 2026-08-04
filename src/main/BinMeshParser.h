@@ -61,11 +61,37 @@ struct BinMatInfo {
     float illum;       // self-illumination (0.0=none, 1.0=full)
 };
 
-// Per-material submesh range within the index buffer
+// Per-(material, sub-object) submesh range within the index buffer.
+//
+// The split is on BOTH keys, not material alone: a sub-object is a moving part
+// (door handle, chest lid, clock hand) with its own transform, so every draw
+// range must have exactly one constant sub-object matrix. Splitting costs a few
+// extra draw calls on the 241-of-1782 stock models that have more than one part.
 struct BinSubMesh {
     uint32_t firstIndex;
     uint32_t indexCount;
     int matIndex; // index into ParsedBinMesh::materials, or -1 for palette
+    int subObj;   // index into ParsedBinMesh::subObjects
+};
+
+// One entry of the LGMD sub-object table — a rigid part of the model that the
+// engine can pose independently (the "joints" the JointPos property drives).
+//
+// Vertices are stored in each sub-object's OWN local space; `rot` + `axle` place
+// that space inside the parent's. We keep the record instead of baking the
+// transform into the vertices, because baking freezes every model in its rest
+// pose and makes joint animation impossible by construction.
+struct BinSubObject {
+    char     name[9];     // "@sNN<label>"; NN is the joint number, zero-padded
+    uint8_t  movement;    // 0 = static, 1 = rotate, 2 = slide
+    int32_t  jointIdx;    // joint slot driving this part, or -1 when static
+    float    minRange;    // authored travel limits: radians (rotate),
+    float    maxRange;    //   world units (slide). NOT ordered — see NOTES.
+    float    rot[9];      // 3x3 basis, column-major: cols are the images of
+                          //   the part's local X/Y/Z in the parent's space
+    float    axle[3];     // joint origin, in the parent's space
+    int16_t  child;       // first child sub-object, or -1
+    int16_t  next;        // next sibling sub-object, or -1
 };
 
 // Result of parsing a single .bin model file
@@ -81,6 +107,9 @@ struct ParsedBinMesh {
     float sphereRadius = 1.0f;
     std::vector<BinSubMesh> subMeshes;
     std::vector<BinMatInfo> materials;
+    // The sub-object table, in file order. Entry 0 is the model root. Empty
+    // only when the model has no geometry at all.
+    std::vector<BinSubObject> subObjects;
     bool valid; // false if parsing failed
 };
 
@@ -202,15 +231,19 @@ private:
         // Read sub-object headers
         readSubObjects();
 
-        // Walk BSP tree for each sub-object, collecting polygons per material
-        // Key: material index, Value: list of triangulated indices
+        exportSubObjects(result);
+
+        // Walk BSP tree for each sub-object, collecting polygons per
+        // (sub-object, material) pair.
         mResult = &result;
         loadSubObject(0, -1);
 
-        // Build submesh ranges from per-material triangle lists
+        // Build submesh ranges. The map is ordered by (subObj, matIndex), so
+        // ranges come out grouped by part — draw order follows the model tree.
         for (auto &kv : mMatTriangles) {
             BinSubMesh sm;
-            sm.matIndex = kv.first;
+            sm.subObj = kv.first.first;
+            sm.matIndex = kv.first.second;
             sm.firstIndex = static_cast<uint32_t>(result.indices.size());
             sm.indexCount = static_cast<uint32_t>(kv.second.size());
             result.subMeshes.push_back(sm);
@@ -324,6 +357,28 @@ private:
         mFile->seek(mHdr.offset_objs);
         mSubObjects.resize(mHdr.num_objs);
         *mFile >> mSubObjects;
+    }
+
+    // Copy the sub-object table into the parsed result, so the pose can be
+    // composed at draw time instead of baked into the vertices at load.
+    void exportSubObjects(ParsedBinMesh &result) {
+        result.subObjects.reserve(mSubObjects.size());
+        for (const auto &s : mSubObjects) {
+            BinSubObject bs = {};
+            std::memcpy(bs.name, s.name, 8);
+            bs.name[8] = '\0';
+            bs.movement = s.movement;
+            bs.jointIdx = s.trans.joint_idx;
+            bs.minRange = s.trans.min_range;
+            bs.maxRange = s.trans.max_range;
+            std::memcpy(bs.rot, s.trans.rot, sizeof(bs.rot));
+            bs.axle[0] = s.trans.axle_point.x;
+            bs.axle[1] = s.trans.axle_point.y;
+            bs.axle[2] = s.trans.axle_point.z;
+            bs.child = s.child_sub_obj;
+            bs.next = s.next_sub_obj;
+            result.subObjects.push_back(bs);
+        }
     }
 
     // ── BSP tree walk (mirrors ObjectMeshLoader::loadSubObject/loadSubNode) ──
@@ -442,9 +497,6 @@ private:
                 *mFile >> uvIndices;
             }
 
-            // Get sub-object transform for non-root sub-objects
-            const SubObjectHeader &sob = mSubObjects[mCurrentSubObj];
-
             // Emit vertices and fan-triangulate
             // Use the same winding as ManualBinFileLoader: (last, i, i-1)
             // which is equivalent to fan from last vertex
@@ -453,23 +505,17 @@ private:
             for (int vi = 0; vi < op.num_verts; ++vi) {
                 BinVert bv = {};
 
-                // Position from vertex table
+                // Position from vertex table, in the sub-object's OWN local
+                // space. The sub-object transform used to be applied here, once,
+                // at load — which froze every model in its rest pose and left the
+                // vertex normals (which were never transformed) inconsistent with
+                // the positions. It is now composed per draw call from
+                // ParsedBinMesh::subObjects, so parts can move.
                 if (vertIndices[vi] < mVertices.size()) {
                     const Vertex &v = mVertices[vertIndices[vi]];
-                    if (mCurrentSubObj == 0) {
-                        // Root sub-object — no transform needed
-                        bv.x = v.x;
-                        bv.y = v.y;
-                        bv.z = v.z;
-                    } else {
-                        // Apply sub-object transform: rotate + translate
-                        // rot is a 3x3 matrix stored column-major in the struct
-                        const float *r = sob.trans.rot;
-                        const Vertex &axle = sob.trans.axle_point;
-                        bv.x = r[0]*v.x + r[3]*v.y + r[6]*v.z + axle.x;
-                        bv.y = r[1]*v.x + r[4]*v.y + r[7]*v.z + axle.y;
-                        bv.z = r[2]*v.x + r[5]*v.y + r[8]*v.z + axle.z;
-                    }
+                    bv.x = v.x;
+                    bv.y = v.y;
+                    bv.z = v.z;
                 }
 
                 // Normal from light/ObjLight table (packed normals)
@@ -492,7 +538,7 @@ private:
 
             // Fan-triangulate: same winding as ManualBinFileLoader
             // (last, i, i-1) for i = 1..numverts-2
-            auto &triList = mMatTriangles[matIndex];
+            auto &triList = mMatTriangles[{mCurrentSubObj, matIndex}];
             uint32_t lastVert = baseVert + op.num_verts - 1;
 
             for (int i = 1; i < op.num_verts - 1; ++i) {
@@ -524,8 +570,9 @@ private:
     std::vector<Vertex> mNormals;         // unpacked from ObjLight
     std::vector<SubObjectHeader> mSubObjects;
 
-    // Per-material triangle index lists, built during BSP walk
-    std::map<int, std::vector<uint32_t>> mMatTriangles;
+    // Triangle index lists keyed by (sub-object, material), built during the
+    // BSP walk. std::map keeps the emitted submesh order deterministic.
+    std::map<std::pair<int, int>, std::vector<uint32_t>> mMatTriangles;
 
     // Output pointer (set during parse())
     ParsedBinMesh *mResult = nullptr;

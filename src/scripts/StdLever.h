@@ -174,17 +174,16 @@ protected:
 
 private:
     /// Check if a tweq anim state bit is set on an object.
+    ///
+    /// Reads the LIVE tweq instance, not the StTweq* property. The property
+    /// route (`property->get(objID, "StTweqJoints", "AnimS")`) never worked:
+    /// the names were labels rather than the registered pldef names, and even
+    /// with the right names those properties are raw blobs whose field
+    /// accessor always fails — so this always answered "no bits set" and every
+    /// lever reported the same target state regardless of its real position.
     bool tweqAnimStateHasVal(int32_t objID, int mask) const {
-        // Check StTweqJoints or StTweqRotate AnimS field
-        if (!svc || !svc->property) return false;
-
-        Variant animS = svc->property->get(objID, "StTweqJoints", "AnimS");
-        if (animS.type() == Variant::DV_INVALID)
-            animS = svc->property->get(objID, "StTweqRotate", "AnimS");
-        if (animS.type() == Variant::DV_INVALID)
-            return false;
-
-        return (animS.toInt() & mask) != 0;
+        if (!svc || !svc->tweqSystem) return false;
+        return (svc->tweqSystem->animStateBits(objID) & static_cast<uint32_t>(mask)) != 0;
     }
 
     int targetStateOf(int32_t objID) const {

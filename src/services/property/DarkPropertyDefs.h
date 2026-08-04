@@ -639,6 +639,64 @@ struct PropCfgTweqSimple {
 };
 static_assert(sizeof(PropCfgTweqSimple) == 8);
 
+// ── JointPos — current pose of a model's sub-object joints ──
+// p_ver 2.24 → 24 bytes = 6 floats
+//
+// The values feed LGMD sub-objects through SubObjectHeader::joint_idx.
+// Rotate joints are DEGREES (a stock door handle at full travel stores 90.0,
+// matching the mesh's pi/2 max_range); slide joints are world units.
+//
+// Six slots is the storage limit, not the mesh limit: stock models index joints
+// up to 13 (MECLOCK2), and those parts simply never move in the original.
+static constexpr int kJointSlotCount = 6;
+
+struct PropJointPos {
+    float joint[kJointSlotCount];
+};
+static_assert(sizeof(PropJointPos) == 24);
+
+// ── CfgTweqJo — joints tweq config ──
+// p_ver 2.132 → 132 bytes
+//
+// Same shape as the vector (Rotate/Scale) config, but each of the six joints
+// carries its own flag block on top of rate/low/high instead of sharing the
+// header's — 8 + 6*20 + 4.
+
+struct PropTweqJointConfig {
+    uint8_t  unknown;
+    uint8_t  curve;     // TweqCurveFlags
+    uint8_t  anim;      // TweqAnimFlags
+    uint8_t  halt;      // TweqHaltAction
+    uint16_t misc;      // TweqMiscFlags
+    uint16_t pad;
+    float    rate;      // degrees/sec (rotate joint) or units/sec (slide joint)
+    float    low;
+    float    high;
+};
+static_assert(sizeof(PropTweqJointConfig) == 20);
+
+struct PropCfgTweqJoints {
+    uint8_t  unknown;
+    uint8_t  curve;
+    uint8_t  anim;
+    uint8_t  halt;
+    uint16_t misc;
+    uint16_t zero;
+    PropTweqJointConfig joint[kJointSlotCount];
+    int32_t  primary;   // 0 = all joints gate completion, else 1-indexed joint
+};
+static_assert(sizeof(PropCfgTweqJoints) == 132);
+
+// ── StTweqJoi — joints tweq state ──
+// p_ver 2.28 → 28 bytes
+
+struct PropStTweqJoints {
+    uint16_t anim;      // TweqStateFlags (base: global on/off/reverse)
+    uint16_t misc;      // unused
+    uint32_t joint[kJointSlotCount];  // TweqStateFlags per joint
+};
+static_assert(sizeof(PropStTweqJoints) == 28);
+
 // ── StTweqRot / StTweqSca — vector tweq state ──
 // p_ver 2.16 → 16 bytes
 
