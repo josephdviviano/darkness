@@ -1009,36 +1009,49 @@ Every model therefore renders permanently in its rest pose. **No joint animation
 possible by construction** — the sub-object structure does not survive loading. We also
 have **zero `P$JointPos` support** anywhere in `src/`.
 
-### 8.2 Door panels ARE jointed sub-objects — this is the door bug
+### 8.2 Door LEAVES are the static root — the joints are handles
 
-Surveying `obj.crf`, doors are not single rigid objects:
+An earlier revision of this section claimed door leaves were jointed sub-objects and that
+`DOOR20`-family models were double doors. **Both claims were wrong.** They were inferred from
+sub-object *names and counts* without checking each part's vertex extents. Measuring the
+per-sub-object point ranges (`point_start` / `sub_num_points` at `+0x4D`, indexing the vertex
+table at `offset_verts`) settles it:
 
-| model | structure |
-|---|---|
-| `addoor01..05.bin` | root + `@s00bb` (movement=1 rotate, **joint 0**) — one swinging panel |
-| `DOOR20.BIN`, `DOOR21.BIN`, `DOORKEEP.BIN`, `OPDOOR.BIN` | root + **two** panels `@s00bb` and `@s00cc`, **both on joint 0** — double doors swinging together from one value |
-| `DOOR17SW.BIN` | two panels on **separate** joints 0 and 1 |
-| `CHESTLOC.BIN`, `LCCHEST.BIN` | chest body + jointed lid/lock |
+| model | root sub-object (`movement=0`) | jointed sub-objects |
+|---|---|---|
+| `addoor01..05.bin` | slab `4.01 x 0.26 x 8.00` | one `@s00bb`, `0.71 x 1.19 x 0.34`, centred at x≈1.6 |
+| `DOOR20/21`, `DOORKEEP`, `DOORKEP2`, `OPDOOR`, `DOORTRAN` | slab `3.50 x 0.23 x 7.00` | `@s00bb` **and** `@s00cc`, `0.62 x 0.40 x 0.29`, at x≈1.3, one at −y and one at +y |
+| `DOOR17SW.BIN` | flat panel `8.00 x 0.63 x 8.00` | `@s00bb` joint 0 range `[0, 6.283]`, `@s01hh` joint 1 range `[−2.094, 0]` |
+| `CHESTLOC.BIN` | body `2.95 x 1.60 x 1.36` | `@s01bb` joint 1 = **lid** `2.95 x 1.47 x 0.78`; `@s00ff` joint 0 = lock plate `0.63 x 0.03 x 0.18` |
 
-So the engine opens a door by **setting a joint**, and the panel rotates *within* the model
-while the frame stays put. Our `DoorSystem` instead rotates **the whole object** about an
-axis with a pivot offset (`DoorSystem.h:90-122`, driven by `P$RotDoor`). For any model whose
-panel is a sub-object, that rotates the frame along with the leaf — and for a double door it
-swings the entire assembly instead of parting the two leaves.
+The door **slab is the static root sub-object in every stock model.** The jointed parts are
+the *door handles* — one per face, hence the two on `DOOR20` (it is a single door with a knob
+on each side, not a double door). `DOOR17SW` is a wall switch panel, not a door: joint 0
+turns a full `2π` (a valve wheel) and joint 1 sweeps `−120°` (a lever).
 
-### 8.3 The ranges are RADIANS, and doors are exactly 0–90°
+Consequences:
+
+- **Our whole-object door rotation is the correct construction.** `DoorSystem` rotates the
+  root — which is the leaf — about a hinge-edge pivot. Nothing about door *swing* depends on
+  joints.
+- The only door motion we are missing is the **handle turning**, a cosmetic detail.
+- No stock door model has a jointed leaf, so the joint work carries **no** consequence for
+  door collision, door audio occlusion, or the acoustic route graph (§8.7).
+
+### 8.3 The ranges are RADIANS
 
 `min_range` / `max_range` (`+0x0D`, `+0x11`) read as floats:
 
 ```
-addoor01 @s00bb : range [0.000, 1.571]   = [0, pi/2] = 0..90 deg
-DOOR20   @s00bb : range [0.000, 1.571]   (and @s00cc identical)
-CHESTLOC @s00ff : range [0.000, 1.571]
+addoor01 @s00bb : [ 0.000, 1.571]   = [0, pi/2]  handle quarter-turn
+CHESTLOC @s01bb : [ 0.000, 1.571]   = [0, pi/2]  chest lid
+DOOR17SW @s00bb : [ 0.000, 6.283]   = [0, 2*pi]  valve wheel, full turn
+DOOR17SW @s01hh : [-2.094, 0.000]   = [-120 deg, 0]  lever, negative travel
 ```
 
-**1.571 = π/2.** The limits are radians and a door panel's authored swing is exactly 90°.
-This is strong independent confirmation that `movement == 1` sub-objects are hinged rotations
-driven by the joint value, and it gives us the authored travel per model for free.
+`1.571 = π/2`, `6.283 = 2π`, `2.094 = 2π/3`. The limits are **radians**, the interval is
+signed, and it need not start at zero. This confirms `movement == 1` sub-objects are hinged
+rotations driven by the joint value, and gives us the authored travel per part for free.
 
 ### 8.4 Architecture: sub-objects are a BONE HIERARCHY
 
@@ -1057,14 +1070,19 @@ per-object array indexed by `joint_idx` with **stride 4**.
 ### 8.5 OPEN: the rotation-axis convention
 
 Each sub-object's `rot` is a frame the artist orients so a **single fixed local axis** lands
-on the intended hinge line — but which local axis is the convention is not yet established.
-The matrices alone cannot settle it: `DOOR20 @s00bb` and `CHESTLOC @s00ff` carry *identical*
-rot matrices while a door hinges vertically and a chest lid horizontally, so the hinge
-direction is not recoverable from the matrix without already knowing the intent.
+on the intended hinge line. Which local axis is the convention is not yet established.
 
-**Cheapest resolution is empirical:** implement with the axis as a constant, drive one
-`addoor01`-based door to `max_range`, and see which of local X/Y/Z produces a correctly
-swinging leaf. One in-game test decides it.
+An earlier revision argued the matrices *contradict* any single convention, citing identical
+`rot` on `DOOR20 @s00bb` and `CHESTLOC @s00ff`. That argument fell with §8.2: `@s00ff` is the
+chest's **lock plate**, not its lid, and a lock plate and a door handle plausibly do turn about
+the same local axis. The chest **lid** is `@s01bb`, whose `rot` is a *different* matrix
+(`diag(-1, 1, -1)`). So there is no counter-example on the table and a single convention
+remains the most likely answer.
+
+**Cheapest resolution is still empirical:** implement with the axis as a constant, drive a
+handle joint to `max_range`, and see which of local X/Y/Z turns it about its own shank.
+Cross-check on `CHESTLOC @s01bb` (lid must tilt up on its rear edge) and `DOOR17SW @s00bb`
+(wheel must spin in its own plane) — three parts with three different intents, one test.
 
 ### 8.6 Implementation plan
 
@@ -1079,8 +1097,50 @@ swinging leaf. One in-game test decides it.
 4. **`P$JointPos`** — new property (engine caps at 6 joints per object) feeding the joint
    array; `TweqSystem`'s existing `Joints` type drives it, and `StdLever.h:181` already
    reads `StTweqJoints`/`AnimS`.
-5. **Doors** — for models with jointed panels, `DoorSystem` should drive the **joint**, not
-   the object rotation. Needs a decision on how to detect which mode a given door uses.
+5. **Doors** — unchanged. Per §8.2 the leaf is the static root, so `DoorSystem` keeps driving
+   the object transform. Doors gain only a turning handle, from the same joint plumbing every
+   other prop uses.
+
+### 8.7 Blast radius on the systems already working
+
+Measured against the current tree, not assumed. All three worries turned out smaller than
+they looked.
+
+**Door collision — no impact.** `ObjectCollisionBody` is one OBB. Its `edgeLengths` come from
+`P$PhysDims.size`, falling back to the `.bin` **header** `bbox_max`/`bbox_min`
+(`ObjectCollisionGeometry.h:760-815`), and `bboxCenter` likewise. Those are header fields
+(`BinMeshParser.h:165-166`), never recomputed from the vertex stream, so un-baking sub-object
+transforms cannot move them. The pose comes from `updateBodyTransform(objID, fullGlm)` off the
+door's *object* matrix, which §8.2 leaves alone. Checked all shipping doors carry explicit
+PhysDims (34/34 in MISS6, 113/113 in MISS14), so the header-bbox fallback — which *would*
+include the handles, `y = 1.14` vs the slab's `0.32` — is never hit for doors in stock content.
+
+**Audio — no impact.** `AudioService` never sees a `ParsedBinMesh`; grep for it across
+`src/services/audio/` returns nothing. Object models contribute no geometry to the Steam Audio
+scene. Door occluders are boxes synthesised by `DoorSystem::buildBoxMesh` from
+`door.edgeLengths` (same PhysDims source), posed by `computeAudioWorldMatrix`, with the route
+graph keyed off the pose-independent `closedWorldTransform`. Every one of those inputs is
+untouched.
+
+**Vertex layout — not a real risk.** `BinVert` is a CPU-side intermediate; the GPU struct is
+`PosColorUVNormalVertex`, converted at upload (`DarknessRenderInit.h:1183-1227`). Adding a
+field to `BinVert` does not touch a bgfx vertex layout. And it is not needed: `loadPolygons`
+emits fresh vertices per polygon and never shares them, so every vertex already belongs to
+exactly one sub-object — keying `mMatTriangles` on `(matIndex, subObj)` instead of `matIndex`
+splits the ranges with no per-vertex attribute at all.
+
+**The one real coupling** is `DoorSystem::populateOBBAndPivot`'s acoustic-material pick
+(`DoorSystem.h:665-692`), which scans `mesh.subMeshes` for the largest-*area* submesh. Rigid
+sub-object transforms preserve area, so un-baking alone is inert; but splitting submeshes by
+sub-object repartitions the areas and could flip the winner. Restricting the pick to the root
+sub-object fixes it and is more correct anyway — it is the exact bug the existing comment
+describes (the handle material `DHANDLE` winning on 101/200 MISS7 doors) solved properly
+rather than by area heuristic.
+
+**Draw-call cost.** 241 of 1782 models have >1 sub-object; 1541 are single-part and completely
+unaffected. Worst cases by `num_objs × num_mats` upper bound: `MECLOCK2` (15 × 14),
+`CLOCK` (13 × 11), `MECLOCK` (10 × 11). The true count is far lower — a sub-object only
+produces a range per material it actually uses.
 
 ## The toolkit
 
