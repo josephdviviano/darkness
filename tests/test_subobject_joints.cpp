@@ -356,6 +356,135 @@ TEST_CASE("TweqSystem: joints tweq bounces at the configured limit",
     REQUIRE((result->axisState[0] & Darkness::kTweqStateReverse) != 0);
 }
 
+// ── Lock tweq ──
+
+TEST_CASE("TweqSystem: lock joint selector is 1-indexed, with 0 also meaning slot 0",
+          "[Tweq][SubObject]") {
+    // Stock configs use 0 (lockboxl), 1 (chestloc, footlock, spinny_door) and
+    // 2 (lcchest, smalsafe). chestloc's 1 must land on slot 0 — its lock plate —
+    // and smalsafe's 2 on slot 1, its knob.
+    REQUIRE(Darkness::TweqSystem::lockJointSlotFromConfig(0) == 0);
+    REQUIRE(Darkness::TweqSystem::lockJointSlotFromConfig(1) == 0);
+    REQUIRE(Darkness::TweqSystem::lockJointSlotFromConfig(2) == 1);
+    REQUIRE(Darkness::TweqSystem::lockJointSlotFromConfig(3) == 2);
+}
+
+TEST_CASE("TweqSystem: a lock tweq drives only its own joint slot",
+          "[Tweq][SubObject]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+
+    // Pre-pose the whole object, as JointPos seeding would.
+    Darkness::ObjectState &pre = states.get(910);
+    for (int i = 0; i < Darkness::ObjectState::kJointSlots; ++i)
+        pre.joints[i] = 11.0f;
+    pre.hasJoints = true;
+
+    Darkness::TweqInstance tw;
+    tw.objID = 910;
+    tw.type = Darkness::kTweqTypeLock;
+    tw.cfgHalt = Darkness::kTweqHaltContinue;
+    tw.axisCount = 1;
+    tw.axes[0] = {90.0f, 0.0f, 90.0f};
+    tw.lockJointSlot = 2;
+    tw.active = true;
+    tw.values[0] = 0.0f;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.hasObjectState = true;
+    sys.injectForTest(tw, &states);
+
+    sys.simStep(0.0f, 0.1f);
+
+    const Darkness::ObjectState *os = states.tryGet(910);
+    REQUIRE(os != nullptr);
+    REQUIRE(os->joints[2] == Approx(90.0f).margin(1.0f));
+    REQUIRE(os->joints[0] == Approx(11.0f));   // untouched
+    REQUIRE(os->joints[1] == Approx(11.0f));
+    REQUIRE(os->joints[3] == Approx(11.0f));
+}
+
+// ── Delete tweq ──
+
+namespace {
+
+Darkness::TweqInstance makeDeleteTweq(int32_t objID, uint16_t rateMs,
+                                      uint8_t halt) {
+    Darkness::TweqInstance tw;
+    tw.objID = objID;
+    tw.type = Darkness::kTweqTypeDelete;
+    tw.cfgHalt = halt;
+    tw.cfgRate = rateMs;
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.hasObjectState = true;
+    return tw;
+}
+
+} // namespace
+
+TEST_CASE("TweqSystem: a delete tweq removes its object when the timer expires",
+          "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    states.get(920);   // object exists before the countdown fires
+    sys.injectForTest(makeDeleteTweq(920, 500, Darkness::kTweqHaltSlay), &states);
+
+    sys.simStep(0.0f, 0.2f);   // 200 ms — not yet
+    const Darkness::TweqInstance *mid =
+        sys.getInstanceForTest(920, Darkness::kTweqTypeDelete);
+    REQUIRE(mid->active);
+    REQUIRE((states.get(920).flags & Darkness::kObjStateDestroyed) == 0);
+
+    sys.simStep(0.2f, 0.4f);   // 600 ms total — expired
+
+    const Darkness::TweqInstance *done =
+        sys.getInstanceForTest(920, Darkness::kTweqTypeDelete);
+    REQUIRE_FALSE(done->active);
+    REQUIRE((states.get(920).flags & Darkness::kObjStateDestroyed) != 0);
+}
+
+TEST_CASE("TweqSystem: destruction is announced, not just flagged", "[Tweq]") {
+    // The flag alone only stops the renderer. Everything else — collision
+    // bodies, the spatial index, exists() — has to be told.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    std::vector<int32_t> destroyed;
+    sys.setDestroyCallback([&destroyed](int32_t id) { destroyed.push_back(id); });
+    sys.injectForTest(makeDeleteTweq(922, 100, Darkness::kTweqHaltDestroy), &states);
+
+    sys.simStep(0.0f, 0.2f);
+
+    REQUIRE(destroyed.size() == 1);
+    REQUIRE(destroyed[0] == 922);
+}
+
+TEST_CASE("TweqSystem: a Stop-halt delete does not announce destruction",
+          "[Tweq]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    std::vector<int32_t> destroyed;
+    sys.setDestroyCallback([&destroyed](int32_t id) { destroyed.push_back(id); });
+    sys.injectForTest(makeDeleteTweq(923, 100, Darkness::kTweqHaltStop), &states);
+
+    sys.simStep(0.0f, 0.2f);
+
+    REQUIRE(destroyed.empty());
+}
+
+TEST_CASE("TweqSystem: a halted delete tweq leaves the object alone", "[Tweq]") {
+    // halt action Stop (2) is the stock 'rat01' setting: the countdown ends,
+    // the object stays.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    states.get(921);
+    sys.injectForTest(makeDeleteTweq(921, 100, Darkness::kTweqHaltStop), &states);
+
+    sys.simStep(0.0f, 0.2f);
+
+    REQUIRE_FALSE(sys.getInstanceForTest(921, Darkness::kTweqTypeDelete)->active);
+    REQUIRE((states.get(921).flags & Darkness::kObjStateDestroyed) == 0);
+}
+
 TEST_CASE("TweqSystem: animStateBits reports the live instance state",
           "[Tweq][SubObject]") {
     // Scripts read this instead of the StTweq* property, whose field accessor

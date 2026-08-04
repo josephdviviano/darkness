@@ -190,6 +190,12 @@ struct ObjectCollisionBody {
     // the climbing system handles these objects instead. Default 0 = no climbable sides.
     int32_t climbableSides = 0;
 
+    // removed: the object was destroyed or slain. Its body keeps its slot so
+    // body indices stay stable, but it is out of every portal cell (so the
+    // broad-phase never nominates it) and the narrow phase skips it outright,
+    // which closes any contact that was already live when it died.
+    bool removed = false;
+
     // isEdgeTrigger: if true, this OBB is a volume trigger (pressure plates, trip wires)
     // that generates entry/exit events instead of physical collision. Stair stepping
     // returns immediately when encountering an edge trigger OBB. Default false.
@@ -960,6 +966,11 @@ public:
             // collide with the carrier.
             if (body.skipPlayerCollision) continue;
 
+            // Destroyed objects are out of every cell, so this is unreachable
+            // through the broad-phase — it catches a contact that outlived the
+            // object it was against.
+            if (body.removed) continue;
+
             for (int s = 0; s < numSpheres; ++s) {
                 OBBCollisionResult cr;
 
@@ -1002,7 +1013,32 @@ public:
 
     // ── Diagnostics ──
 
-    /// Number of collision bodies created.
+    /// Take an object out of the collision world (it was destroyed or slain).
+    ///
+    /// The broad-phase gathers candidates purely from the per-cell registry, so
+    /// unregistering the body from every cell is what actually removes it. The
+    /// body itself stays in `mBodies` and keeps its index: persistent contacts
+    /// encode body indices, and `mObjIDToBody` maps by them, so erasing would
+    /// silently repoint both at a different object. `removed` closes the narrow
+    /// phase behind any contact that was already live.
+    ///
+    /// Returns false if the object had no body, or was already removed.
+    bool removeObject(int32_t objID) {
+        auto it = mObjIDToBody.find(objID);
+        if (it == mObjIDToBody.end()) return false;
+
+        const size_t bodyIdx = it->second;
+        ObjectCollisionBody &body = mBodies[bodyIdx];
+        if (body.removed) return false;
+
+        unregisterFromCells(bodyIdx, body);
+        body.cellIDs.clear();
+        body.removed = true;
+        return true;
+    }
+
+    /// Number of collision bodies created (including removed ones — they keep
+    /// their slot so body indices stay stable).
     size_t bodyCount() const { return mBodies.size(); }
 
     /// Number of portal cells with registered objects.

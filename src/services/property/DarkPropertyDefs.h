@@ -515,7 +515,7 @@ static_assert(sizeof(PropTPath) == 16, "PropTPath must match TPath dtype (16 byt
 // objects, cycling models. Config (Cfg) properties hold static parameters set
 // by the level designer; state (St) properties hold per-instance runtime data.
 //
-// Flag values match the Dark Engine's tweqflgs.h definitions exactly.
+// Flag values match the Dark Engine's tweq flag definitions exactly.
 // Struct layouts verified against t2-types.dtype and p_ver size fields.
 
 // ── Tweq flag types ──
@@ -686,6 +686,46 @@ struct PropCfgTweqJoints {
     int32_t  primary;   // 0 = all joints gate completion, else 1-indexed joint
 };
 static_assert(sizeof(PropCfgTweqJoints) == 132);
+
+// ── CfgTweqLo — lock tweq config ──
+// p_ver 2.32 → 32 bytes = the vector header + ONE joint block + the selector
+//
+// A lock tweq binds a lock's state to a single model joint: the chest's lock
+// plate, the safe's dial, the door's handle. The engine's "set all my lock
+// joint positions appropriately" command writes
+// `JointPos[targetJoint] = locked ? low : high` — reading `low` at +20 and
+// `high` at +24 of this struct, which is what pins the layout.
+// [BIN: FUN_00595C40 reads cfg+0x14 / cfg+0x18 and cfg+0x1C, Thief2.exe NewDark 1.28]
+
+struct PropCfgTweqLock {
+    uint8_t  unknown;
+    uint8_t  curve;
+    uint8_t  anim;
+    uint8_t  halt;
+    uint16_t misc;
+    uint16_t zero;
+    PropTweqJointConfig lock;
+    // Which joint slot the lock drives. Read as a byte and decremented when
+    // non-zero, so 0 and 1 both mean slot 0 — stock data uses 0, 1 and 2.
+    // [BIN: `if (sel != 0) sel--` at FUN_00595C40, Thief2.exe NewDark 1.28]
+    int32_t  targetJoint;
+};
+static_assert(sizeof(PropCfgTweqLock) == 32);
+
+// ── StTweqLoc — lock tweq state ──
+// p_ver 2.12 → 12 bytes
+//
+// Unlike the other tweq states this one stores the current position: a lock has
+// no other home for it until the joint is written. Shipped data agrees with the
+// config — every object carrying P$Locked has `value == low`.
+
+struct PropStTweqLock {
+    uint16_t anim;      // TweqStateFlags
+    uint16_t misc;
+    float    value;     // current joint position (degrees / world units)
+    uint32_t axisState; // TweqStateFlags for the single axis
+};
+static_assert(sizeof(PropStTweqLock) == 12);
 
 // ── StTweqJoi — joints tweq state ──
 // p_ver 2.28 → 28 bytes

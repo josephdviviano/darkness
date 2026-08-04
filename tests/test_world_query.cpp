@@ -368,6 +368,28 @@ TEST_CASE("IWorldQuery: exists() matches ObjectService",
     }
 }
 
+TEST_CASE("IWorldQuery: a destroyed object stops existing",
+          "[worldquery][entity]") {
+    // kObjStateDestroyed used to be honoured by the renderer alone, so a slain
+    // object went on being sensed and queried while invisible.
+    REQUIRE_WQ();
+
+    int victim = -1;
+    for (int id = 1; id <= 200 && victim < 0; ++id)
+        if (s_worldQuery->exists(id)) victim = id;
+    REQUIRE(victim > 0);
+
+    // Its own instance: the shared fixture's spatial index is asserted on by
+    // other cases in this file, and destruction removes entries from it.
+    ObjSysWorldState wq(s_objSvc, s_propSvc, s_linkSvc, s_roomSvc);
+    REQUIRE(wq.exists(victim));
+
+    wq.notifyDestroyed(victim);
+    CHECK_FALSE(wq.exists(victim));
+    CHECK(s_objSvc->exists(victim));   // still in the database; ID not recycled
+    CHECK(s_worldQuery->exists(victim));  // and untouched elsewhere
+}
+
 TEST_CASE("IWorldQuery: getPosition() matches ObjectService",
           "[worldquery][entity]") {
     REQUIRE_WQ();

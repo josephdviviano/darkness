@@ -6746,6 +6746,18 @@ int main(int argc, char *argv[]) {
         scriptManager.sendMessage(msg);
     });
 
+    // Hook tweq destruction → take the object out of the live world.
+    // Setting kObjStateDestroyed only stops it being drawn; without this it
+    // keeps its collision body, its spatial-index entry and a truthy exists(),
+    // so a slain object still blocks the player and answers AI and audio
+    // queries while invisible.
+    tweqSystem.setDestroyCallback([&state, wq = worldQuery.get()](int32_t objID) {
+        if (wq) wq->notifyDestroyed(objID);
+        Darkness::ObjectCollisionWorld *ocw =
+            state.physics ? state.physics->getObjectCollisionWorld() : nullptr;
+        if (ocw) ocw->removeObject(objID);
+    });
+
     // Hook MovingTerrainSystem waypoint arrival → ScriptManager MovingTerrainWaypoint.
     // StdElevator listens for this to deactivate at the destination waypoint;
     // without it, platforms loop continuously. The callback also gives us a
