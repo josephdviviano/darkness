@@ -515,7 +515,7 @@ static_assert(sizeof(PropTPath) == 16, "PropTPath must match TPath dtype (16 byt
 // objects, cycling models. Config (Cfg) properties hold static parameters set
 // by the level designer; state (St) properties hold per-instance runtime data.
 //
-// Flag values match the Dark Engine's tweqflgs.h definitions exactly.
+// Flag values match the Dark Engine's tweq flag definitions exactly.
 // Struct layouts verified against t2-types.dtype and p_ver size fields.
 
 // ── Tweq flag types ──

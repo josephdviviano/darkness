@@ -27,7 +27,7 @@
 // Dark Engine's script service interfaces (ILinkSrv, IObjectSrv, etc.).
 //
 // Inspired by the openDarkEngine (OPDE) service architecture (GPLv2).
-// Service API design follows Dark Engine's scrptsrv.h pattern.
+// Service API design follows the Dark Engine's script-service pattern.
 
 #pragma once
 

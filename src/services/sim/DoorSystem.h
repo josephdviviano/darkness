@@ -598,8 +598,8 @@ private:
     /// occlusion OBB (registerDoorGeometry skips zero-edge doors), even
     /// though they ignore the pivot.
     ///
-    /// Pivot computation matches the Dark Engine algorithm in
-    /// doorphys.cpp UpdateDoorPhysics: if COG is zero, derive from OBB
+    /// Pivot computation matches the Dark Engine's door-physics update:
+    /// if COG is zero, derive from OBB
     /// edge lengths so the rotating slab arcs around the hinge edge
     /// rather than the model center:
     ///   axis 0 or 1 (X/Y rotation): cog.z = edgeLengths.z / 2
