@@ -2849,6 +2849,25 @@ static void renderObjects(
             }
             float litArr[4] = { litRGB.x, litRGB.y, litRGB.z, 0.0f };
 
+            // Per-part transforms. Models with one part (1541 of the 1782
+            // stock models) draw straight off objMtx; multi-part models pick
+            // up the composed sub-object matrix per submesh, recomposed only
+            // when a joint is actually off its rest value.
+            const std::vector<Darkness::Matrix4> *subMtx = nullptr;
+            if (!gpuModel.restMatrices.empty()) {
+                subMtx = &gpuModel.restMatrices;
+                if (objState && objState->hasJoints && parsed &&
+                    !Darkness::meshJointsAtRest(*parsed, objState->joints,
+                                                Darkness::ObjectState::kJointSlots)) {
+                    Darkness::composeSubObjectMatrices(
+                        *parsed, objState->joints,
+                        Darkness::ObjectState::kJointSlots,
+                        state.subObjMatrixScratch);
+                    subMtx = &state.subObjMatrixScratch;
+                }
+            }
+            const Darkness::Matrix4 objGlm = glm::make_mat4(objMtx);
+
             for (const auto &sm : gpuModel.subMeshes) {
                 if (sm.indexCount == 0) continue;
 
@@ -2917,7 +2936,14 @@ static void renderObjects(
                     }
                 }
 
-                bgfx::setTransform(objMtx);
+                if (subMtx && sm.subObj >= 0 &&
+                    sm.subObj < static_cast<int>(subMtx->size())) {
+                    const Darkness::Matrix4 partMtx =
+                        objGlm * (*subMtx)[static_cast<size_t>(sm.subObj)];
+                    bgfx::setTransform(glm::value_ptr(partMtx));
+                } else {
+                    bgfx::setTransform(objMtx);
+                }
                 bgfx::setVertexBuffer(0, gpuModel.vbh);
                 bgfx::setIndexBuffer(gpuModel.ibh, sm.firstIndex, sm.indexCount);
                 bgfx::setState(drawState);

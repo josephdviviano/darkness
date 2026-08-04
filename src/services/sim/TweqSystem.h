@@ -84,9 +84,12 @@ struct TweqInstance {
     uint8_t   cfgHalt  = 0;   // TweqHaltAction
     uint16_t  cfgMisc  = 0;   // TweqMiscFlags
 
-    // Per-axis config (Rotate/Scale)
-    PropTweqAxisConfig axes[3] = {};
-    int32_t   primaryAxis = 0;   // 0=all, 1=X, 2=Y, 3=Z (1-indexed!)
+    // Per-axis config. Rotate/Scale use the first 3 slots (X/Y/Z); Joints uses
+    // all 6 (one per model joint slot) — the per-slot algorithm is identical.
+    static constexpr int kMaxAxes = 6;
+    PropTweqAxisConfig axes[kMaxAxes] = {};
+    int       axisCount = 3;
+    int32_t   primaryAxis = 0;   // 0=all, else 1-indexed axis/joint
 
     // Simple config (Flicker/Models/Delete)
     uint16_t  cfgRate = 0;       // ms per step
@@ -98,8 +101,9 @@ struct TweqInstance {
 
     // ── Runtime state ──
     bool      active = false;
-    uint32_t  axisState[3] = {}; // per-axis TweqStateFlags
-    float     values[3] = {};    // accumulated angles (degrees) or scale factors
+    uint32_t  axisState[kMaxAxes] = {}; // per-axis TweqStateFlags
+    float     values[kMaxAxes] = {};    // angles (degrees), scale factors, or
+                                        //   joint positions (degrees / units)
     float     elapsedMs = 0.0f;  // for timed tweqs
     int16_t   curFrame = 0;      // for Models tweq
     bool      flickerHidden = false;  // current flicker visibility state
@@ -174,6 +178,13 @@ public:
             propSvc, "CfgTweqBl", "StTweqBli", kTweqTypeFlicker);
         initTweqsOfType<PropCfgTweqModels, PropStTweqSimple>(
             propSvc, "CfgTweqMo", "StTweqMod", kTweqTypeModels);
+        initTweqsOfType<PropCfgTweqJoints, PropStTweqJoints>(
+            propSvc, "CfgTweqJo", "StTweqJoi", kTweqTypeJoints);
+
+        // Seed the joint pose of objects that carry a JointPos but no joints
+        // tweq — a lever left thrown, a chest authored open. Without this they
+        // would render at rest until something animated them.
+        seedStaticJointPositions(propSvc);
 
         // Count by type for diagnostics
         int counts[8] = {};
@@ -218,6 +229,27 @@ public:
         return false;
     }
 
+    /// Live animation-state bits (kTweqStateOn / kTweqStateReverse) for an
+    /// object's tweqs, OR-ed across matching instances.
+    ///
+    /// Scripts used to read these off the StTweq* properties, but those are
+    /// stored as opaque blobs (RawDataStorage::getField always fails), so the
+    /// query silently returned "nothing set" for every object. The running
+    /// instance is the honest source anyway — the property is only the
+    /// load-time snapshot.
+    uint32_t animStateBits(int32_t objID,
+                           eTweqType typeFilter = kTweqTypeAll) const {
+        uint32_t bits = 0;
+        for (const auto &[key, tw] : mTweqs) {
+            if (tw.objID != objID) continue;
+            if (typeFilter != kTweqTypeAll && tw.type != typeFilter) continue;
+            if (tw.active) bits |= kTweqStateOn;
+            for (int i = 0; i < tw.axisCount; ++i)
+                bits |= (tw.axisState[i] & kTweqStateReverse);
+        }
+        return bits;
+    }
+
     /// Set callback for tweq completion events (for TweqComplete messages).
     void setEventCallback(TweqEventCallback cb) { mEventCallback = std::move(cb); }
 
@@ -257,6 +289,11 @@ public:
             case kTweqTypeModels:
                 typeName = "Models";
                 result = processModelsTweq(tw, dt_ms);
+                break;
+
+            case kTweqTypeJoints:
+                typeName = "Joints";
+                result = processJointsTweq(tw, dt_ms);
                 break;
 
             default:
@@ -415,6 +452,17 @@ private:
                 tw.values[2] = tw.base.scale.z;
             }
 
+            // Joints start wherever JointPos left them (a lever authored
+            // thrown, a chest authored open), not at zero.
+            if (tweqType == kTweqTypeJoints) {
+                PropJointPos jp;
+                if (getTypedProperty<PropJointPos>(propSvc, "JointPos", objID, jp)) {
+                    for (int i = 0; i < kJointSlotCount; ++i)
+                        tw.values[i] = jp.joint[i];
+                }
+                writeJointPose(tw);
+            }
+
             // Initialize current values for Rotate tweqs from base angles
             if (tweqType == kTweqTypeRotate) {
                 // Extract current angles from base rotation matrix (in degrees)
@@ -496,6 +544,26 @@ private:
         tw.primaryAxis = cfg.primary;
     }
 
+    /// Extract config fields (joints config)
+    ///
+    /// Each joint carries its own flag block on top of rate/low/high. The
+    /// per-joint blocks in shipped data repeat the header's curve/anim, so the
+    /// shared per-axis algorithm reads the header flags exactly as the vector
+    /// tweqs do; only rate/low/high are genuinely per-joint.
+    void initFromConfig(TweqInstance &tw, const PropCfgTweqJoints &cfg, eTweqType) {
+        tw.cfgCurve = cfg.curve;
+        tw.cfgAnim  = cfg.anim;
+        tw.cfgHalt  = cfg.halt;
+        tw.cfgMisc  = cfg.misc;
+        tw.axisCount = kJointSlotCount;
+        for (int i = 0; i < kJointSlotCount; ++i) {
+            tw.axes[i].rate = cfg.joint[i].rate;
+            tw.axes[i].low  = cfg.joint[i].low;
+            tw.axes[i].high = cfg.joint[i].high;
+        }
+        tw.primaryAxis = cfg.primary;
+    }
+
     /// Extract config fields (simple config: Flicker)
     void initFromConfig(TweqInstance &tw, const PropCfgTweqSimple &cfg, eTweqType) {
         tw.cfgCurve = cfg.curve;
@@ -547,6 +615,13 @@ private:
         }
     }
 
+    /// Extract state fields (joints state)
+    void initFromState(TweqInstance &tw, const PropStTweqJoints &st, eTweqType) {
+        if (st.anim & kTweqStateOn) tw.active = true;
+        for (int i = 0; i < kJointSlotCount; ++i)
+            tw.axisState[i] = st.joint[i];
+    }
+
     /// Extract state fields (simple state: Flicker/Models)
     void initFromState(TweqInstance &tw, const PropStTweqSimple &st, eTweqType) {
         if (st.anim & kTweqStateOn) tw.active = true;
@@ -595,21 +670,21 @@ private:
             tw.active = false;
             tw.elapsedMs = 0.0f;
             tw.curFrame = 0;
-            for (int i = 0; i < 3; ++i)
+            for (int i = 0; i < tw.axisCount; ++i)
                 tw.axisState[i] &= ~static_cast<uint32_t>(kTweqStateReverse);
             break;
 
         case kTweqDoForward:
             tw.active = true;
             tw.elapsedMs = 0.0f;
-            for (int i = 0; i < 3; ++i)
+            for (int i = 0; i < tw.axisCount; ++i)
                 tw.axisState[i] &= ~static_cast<uint32_t>(kTweqStateReverse);
             break;
 
         case kTweqDoReverse:
             tw.active = true;
             tw.elapsedMs = 0.0f;
-            for (int i = 0; i < 3; ++i)
+            for (int i = 0; i < tw.axisCount; ++i)
                 tw.axisState[i] |= static_cast<uint32_t>(kTweqStateReverse);
             break;
         }
@@ -700,7 +775,7 @@ private:
             // No need to copy here — axisState is already per-axis
         }
 
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < tw.axisCount; ++i) {
             int rv = processAxis(tw, i, dt_ms);
             // Primary axis (or all axes if primary=0) controls completion
             if (tw.primaryAxis == 0 || i == (tw.primaryAxis - 1)) {
@@ -708,6 +783,74 @@ private:
             }
         }
 
+        return result;
+    }
+
+    /// Publish a joints tweq's current values to the object's render pose.
+    ///
+    /// Joints move parts INSIDE the model, never the object itself, so this
+    /// deliberately does not touch the object transform and does not mark the
+    /// object dirty for applyComposedTransform.
+    void writeJointPose(TweqInstance &tw) {
+        if (!mObjectStates) return;
+        static_assert(ObjectState::kJointSlots == kJointSlotCount,
+                      "ObjectState joint array must match P$JointPos slot count");
+
+        ensureObjectState(tw);
+        ObjectState &os = mObjectStates->get(tw.objID);
+        for (int i = 0; i < kJointSlotCount; ++i)
+            os.joints[i] = tw.values[i];
+        os.hasJoints = true;
+    }
+
+    /// Apply P$JointPos to objects that have a stored pose but no joints tweq.
+    /// Objects with a tweq are seeded from the same property in
+    /// initTweqsOfType, so they are skipped here.
+    void seedStaticJointPositions(PropertyService *propSvc) {
+        if (!propSvc || !mObjectStates || !mPlacements) return;
+
+        int seeded = 0;
+        for (const auto &[objID, placement] : *mPlacements) {
+            if (objID <= 0) continue;
+            if (mTweqs.count(tweqKey(objID, kTweqTypeJoints))) continue;
+
+            PropJointPos jp;
+            if (!getTypedProperty<PropJointPos>(propSvc, "JointPos", objID, jp))
+                continue;
+
+            // An all-zero pose is the rest pose the renderer already draws;
+            // creating an ObjectState for it would only cost work per frame.
+            bool anyNonZero = false;
+            for (int i = 0; i < kJointSlotCount; ++i)
+                if (std::fabs(jp.joint[i]) > 1e-6f) anyNonZero = true;
+            if (!anyNonZero) continue;
+
+            // Seed the transform only when we are the ones creating the entry.
+            // Another system may already own this object's pose (a door, a
+            // moving platform) and resetting it to the placement would undo
+            // whatever it did.
+            const bool fresh = (mObjectStates->tryGet(objID) == nullptr);
+            ObjectState &os = mObjectStates->get(objID);
+            if (fresh) {
+                os.initFromBinaryRadians(placement.x, placement.y, placement.z,
+                                         placement.heading, placement.pitch,
+                                         placement.bank,
+                                         placement.sx, placement.sy, placement.sz);
+            }
+            for (int i = 0; i < kJointSlotCount; ++i)
+                os.joints[i] = jp.joint[i];
+            os.hasJoints = true;
+            ++seeded;
+        }
+
+        if (seeded > 0)
+            std::fprintf(stderr, "TweqSystem: %d objects seeded from JointPos "
+                         "(no joints tweq)\n", seeded);
+    }
+
+    int processJointsTweq(TweqInstance &tw, float dt_ms) {
+        int result = processVectorTweq(tw, dt_ms);
+        writeJointPose(tw);
         return result;
     }
 

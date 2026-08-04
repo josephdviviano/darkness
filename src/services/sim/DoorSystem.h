@@ -656,16 +656,18 @@ private:
                 auto it = mParsedModels->find(std::string(modelName));
                 if (it != mParsedModels->end()) {
                     const ParsedBinMesh &mesh = it->second;
-                    // Largest-AREA submesh's material = the door's main
-                    // acoustic surface. NOT triangle count: a door slab is a
-                    // few big quads while the handle is many tiny triangles,
-                    // so a count-based pick wrongly returns the handle's
-                    // material for most doors (measured: DHANDLE on 101/200
-                    // MISS7 doors). Area sums the actual triangle areas.
+                    // The door's acoustic surface is its LEAF, which is the
+                    // model's root sub-object in every stock door — the jointed
+                    // parts are the handles. Restricting the scan to the root
+                    // is what the old area heuristic was approximating: it
+                    // existed only to stop the handle material (DHANDLE, on
+                    // 101/200 MISS7 doors) winning. Area still breaks ties
+                    // between the root's own materials.
                     float bestArea = 0.0f;
                     int bestMat = -1;
                     for (const auto &sm : mesh.subMeshes) {
                         if (sm.matIndex < 0) continue;
+                        if (sm.subObj != 0) continue;
                         float area = 0.0f;
                         const uint32_t end = sm.firstIndex + sm.indexCount;
                         for (uint32_t k = sm.firstIndex; k + 2 < end; k += 3) {
