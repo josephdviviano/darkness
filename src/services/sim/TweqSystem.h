@@ -54,6 +54,7 @@
 #include "property/PropertyService.h"
 #include "property/TypedProperty.h"
 #include "BinMeshParser.h"
+#include "SubObjectPose.h"
 #include "worldquery/ObjectState.h"
 
 namespace Darkness {
@@ -93,6 +94,9 @@ struct TweqInstance {
 
     // Simple config (Flicker/Models/Delete)
     uint16_t  cfgRate = 0;       // ms per step
+
+    // Lock tweq — the single model joint slot this lock drives
+    int       lockJointSlot = 0;
 
     // Models tweq
     char      modelNames[6][16] = {};
@@ -180,6 +184,10 @@ public:
             propSvc, "CfgTweqMo", "StTweqMod", kTweqTypeModels);
         initTweqsOfType<PropCfgTweqJoints, PropStTweqJoints>(
             propSvc, "CfgTweqJo", "StTweqJoi", kTweqTypeJoints);
+        initTweqsOfType<PropCfgTweqSimple, PropStTweqSimple>(
+            propSvc, "CfgTweqDe", "StTweqDel", kTweqTypeDelete);
+        initTweqsOfType<PropCfgTweqLock, PropStTweqLock>(
+            propSvc, "CfgTweqLo", "StTweqLoc", kTweqTypeLock);
 
         // Seed the joint pose of objects that carry a JointPos but no joints
         // tweq — a lever left thrown, a chest authored open. Without this they
@@ -250,6 +258,17 @@ public:
         return bits;
     }
 
+    /// Decode a lock tweq's joint selector.
+    ///
+    /// The engine reads `CfgTweqLock::targetJoint` as a byte and decrements it
+    /// when non-zero, so 0 and 1 both name slot 0. Stock data uses 0, 1 and 2.
+    /// [BIN: `if (sel != 0) sel--` at FUN_00595C40, Thief2.exe NewDark 1.28]
+    static int lockJointSlotFromConfig(int32_t targetJoint) {
+        int slot = static_cast<int>(static_cast<int8_t>(targetJoint & 0xFF));
+        if (slot != 0) --slot;
+        return slot;
+    }
+
     /// Set callback for tweq completion events (for TweqComplete messages).
     void setEventCallback(TweqEventCallback cb) { mEventCallback = std::move(cb); }
 
@@ -257,6 +276,7 @@ public:
 
     void simStep(float simTime, float delta) override {
         if (delta <= 0.0f) return;
+
         float dt_ms = delta * 1000.0f;
         ++mFrameCount;
 
@@ -294,6 +314,16 @@ public:
             case kTweqTypeJoints:
                 typeName = "Joints";
                 result = processJointsTweq(tw, dt_ms);
+                break;
+
+            case kTweqTypeLock:
+                typeName = "Lock";
+                result = processLockTweq(tw, dt_ms);
+                break;
+
+            case kTweqTypeDelete:
+                typeName = "Delete";
+                result = processDeleteTweq(tw, dt_ms);
                 break;
 
             default:
@@ -452,6 +482,29 @@ private:
                 tw.values[2] = tw.base.scale.z;
             }
 
+            // A lock's joint follows the object's lock state: locked sits at
+            // `low`, unlocked at `high`. Confirmed both ways — the engine's
+            // "set all my lock joint positions appropriately" command writes
+            // exactly that, and in shipped data every object carrying P$Locked
+            // has its stored value equal to `low` (10/10 in MISS6).
+            // [BIN: FUN_00595C40, Thief2.exe NewDark 1.28]
+            //
+            // The stored state wins when present: it is the authored pose, and
+            // the engine ships that command precisely because the two can drift.
+            if (tweqType == kTweqTypeLock) {
+                PropStTweqLock st;
+                if (!getTypedProperty<PropStTweqLock>(propSvc, stPropName,
+                                                       objID, st)) {
+                    PropLocked locked{};
+                    const bool isLocked =
+                        getTypedProperty<PropLocked>(propSvc, "Locked", objID,
+                                                     locked) &&
+                        locked.isLocked != 0;
+                    tw.values[0] = isLocked ? tw.axes[0].low : tw.axes[0].high;
+                }
+                writeJointPose(tw);
+            }
+
             // Joints start wherever JointPos left them (a lever authored
             // thrown, a chest authored open), not at zero.
             if (tweqType == kTweqTypeJoints) {
@@ -562,6 +615,39 @@ private:
             tw.axes[i].high = cfg.joint[i].high;
         }
         tw.primaryAxis = cfg.primary;
+    }
+
+    /// Extract config fields (lock config)
+    ///
+    /// One axis: the joint the lock drives, between `low` (locked) and `high`
+    /// (unlocked). `targetJoint` is read as a byte and decremented when
+    /// non-zero, so 0 and 1 both name slot 0.
+    void initFromConfig(TweqInstance &tw, const PropCfgTweqLock &cfg, eTweqType) {
+        tw.cfgCurve = cfg.curve;
+        tw.cfgAnim  = cfg.anim;
+        tw.cfgHalt  = cfg.halt;
+        tw.cfgMisc  = cfg.misc;
+        tw.axisCount = 1;
+        tw.axes[0].rate = cfg.lock.rate;
+        tw.axes[0].low  = cfg.lock.low;
+        tw.axes[0].high = cfg.lock.high;
+
+        int slot = lockJointSlotFromConfig(cfg.targetJoint);
+        if (slot < 0 || slot >= kJointSlotCount) {
+            std::fprintf(stderr, "[FALLBACK] TweqSystem: obj %d lock tweq targets "
+                         "joint slot %d, outside the %d the property stores — "
+                         "clamping to 0, the lock will drive the wrong part\n",
+                         tw.objID, slot, kJointSlotCount);
+            slot = 0;
+        }
+        tw.lockJointSlot = slot;
+    }
+
+    /// Extract state fields (lock state)
+    void initFromState(TweqInstance &tw, const PropStTweqLock &st, eTweqType) {
+        if (st.anim & kTweqStateOn) tw.active = true;
+        tw.axisState[0] = st.axisState;
+        tw.values[0] = st.value;
     }
 
     /// Extract config fields (simple config: Flicker)
@@ -798,8 +884,14 @@ private:
 
         ensureObjectState(tw);
         ObjectState &os = mObjectStates->get(tw.objID);
-        for (int i = 0; i < kJointSlotCount; ++i)
-            os.joints[i] = tw.values[i];
+        if (tw.type == kTweqTypeLock) {
+            // A lock owns exactly one slot; the rest of the pose belongs to
+            // whatever else drives this object.
+            os.joints[tw.lockJointSlot] = tw.values[0];
+        } else {
+            for (int i = 0; i < kJointSlotCount; ++i)
+                os.joints[i] = tw.values[i];
+        }
         os.hasJoints = true;
     }
 
@@ -812,7 +904,10 @@ private:
         int seeded = 0;
         for (const auto &[objID, placement] : *mPlacements) {
             if (objID <= 0) continue;
-            if (mTweqs.count(tweqKey(objID, kTweqTypeJoints))) continue;
+            // A joints or lock tweq has already published this object's pose
+            // from the same property (or, for a lock, from its lock state).
+            const ObjectState *existing = mObjectStates->tryGet(objID);
+            if (existing && existing->hasJoints) continue;
 
             PropJointPos jp;
             if (!getTypedProperty<PropJointPos>(propSvc, "JointPos", objID, jp))
@@ -852,6 +947,36 @@ private:
         int result = processVectorTweq(tw, dt_ms);
         writeJointPose(tw);
         return result;
+    }
+
+    /// A lock tweq animates one model joint — a chest's lock plate, a safe's
+    /// dial, a door's handle — between the locked and unlocked positions.
+    int processLockTweq(TweqInstance &tw, float dt_ms) {
+        int result = processAxis(tw, 0, dt_ms);
+        writeJointPose(tw);
+        return result;
+    }
+
+    /// A delete tweq is a countdown that removes its object when it expires.
+    /// It carries no per-axis config at all: `cfgRate` milliseconds, then the
+    /// halt action (Destroy / Slay / Stop) decides what happens.
+    ///
+    /// This is how one-shot effects clean themselves up — fire and moss arrow
+    /// residue, particle bursts, flares, frost shards, spent waypoints.
+    int processDeleteTweq(TweqInstance &tw, float dt_ms) {
+        tw.elapsedMs += dt_ms;
+        if (tw.elapsedMs < static_cast<float>(tw.cfgRate))
+            return kTweqStatusQuo;
+
+        tw.elapsedMs = 0.0f;
+        tw.active = false;
+        // An object disappearing is worth seeing: if a placed object vanishes
+        // that the original kept, this is where it went.
+        if (mDeleteFired < 20)
+            std::fprintf(stderr, "[TWEQ_DELETE] obj %d expired after %u ms, "
+                         "halt action %u\n", tw.objID, tw.cfgRate, tw.cfgHalt);
+        ++mDeleteFired;
+        return tw.cfgHalt;
     }
 
     /// Ensure an ObjectState entry exists with the correct base transform.
@@ -1128,6 +1253,11 @@ private:
         }
         return it->second.bboxMin[2];  // Z = vertical in Dark Engine
     }
+
+    /// Objects removed by an expired delete tweq this session. Reported so a
+    /// mission that quietly loses placed objects is visible rather than a
+    /// mystery.
+    uint32_t mDeleteFired = 0;
 
     /// Random float in [-1, 1] (matches Dark Engine frand_hack)
     float randFloat() {

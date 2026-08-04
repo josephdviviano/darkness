@@ -825,6 +825,91 @@ static SDL_Window *initWindow(const Darkness::FogParams &fogParams,
     return window;
 }
 
+// ── Audit authored joint poses against the travel their models declare ──
+//
+// The two disagree often, and the disagreement is load-bearing: it is the
+// evidence that the authored `min_range`/`max_range` are NOT a runtime clamp.
+// `dorblack`'s handle declares 64.8 degrees and missions author 90 on it;
+// `12x12pdr` authors +90 against a [-6.283, 0] range; a turret authors 359
+// degrees on a part whose range is [-0.942, 0] — clamping any of those to the
+// declared interval would discard the designer's pose entirely. See
+// NOTES.PROJECT.md, "LGMD sub-object joints".
+//
+// Lives here rather than in TweqSystem because it needs both parsed models and
+// resolved per-object model names, and only the renderer has both.
+static void auditJointRanges(const Darkness::MissionData &mission) {
+    Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+    if (!propSvc) return;
+
+    int inRange = 0, outOfRange = 0, noSuchJoint = 0;
+    int withPose = 0, modelResolved = 0;
+    std::vector<std::string> examples;
+
+    // objData.objects is the rendered set, which is where model names come out
+    // with archetype inheritance already resolved — allPlacements keeps the raw
+    // record and leaves an inherited name empty.
+    for (const auto &placement : mission.objData.objects) {
+        Darkness::PropJointPos jp;
+        if (!Darkness::getTypedProperty<Darkness::PropJointPos>(
+                propSvc.get(), "JointPos", placement.objID, jp))
+            continue;
+        ++withPose;
+
+        std::string model(placement.modelName,
+                          strnlen(placement.modelName, 16));
+        auto mit = mission.parsedModels.find(model);
+        if (mit == mission.parsedModels.end() || !mit->second.valid) continue;
+        ++modelResolved;
+
+        for (int slot = 0; slot < Darkness::kJointSlotCount; ++slot) {
+            const float authored = jp.joint[slot];
+            if (std::fabs(authored) <= 1e-6f) continue;
+
+            bool found = false;
+            for (const auto &so : mit->second.subObjects) {
+                if (so.movement == Darkness::kSubObjStatic || so.jointIdx != slot)
+                    continue;
+                found = true;
+
+                // Mesh ranges are radians for rotate, world units for slide;
+                // JointPos stores rotate joints in degrees.
+                const float v = (so.movement == Darkness::kSubObjRotate)
+                    ? authored * (3.14159265358979f / 180.0f)
+                    : authored;
+                const float lo = std::min(so.minRange, so.maxRange);
+                const float hi = std::max(so.minRange, so.maxRange);
+
+                if (v < lo - 1e-4f || v > hi + 1e-4f) {
+                    ++outOfRange;
+                    if (examples.size() < 8) {
+                        char buf[192];
+                        std::snprintf(buf, sizeof(buf),
+                            "obj %d '%s' %s joint %d '%s': authored %.3f vs "
+                            "declared [%.3f, %.3f]",
+                            placement.objID, model.c_str(),
+                            so.movement == Darkness::kSubObjRotate ? "rot" : "slide",
+                            slot, so.name, v, so.minRange, so.maxRange);
+                        examples.emplace_back(buf);
+                    }
+                } else {
+                    ++inRange;
+                }
+            }
+            if (!found) ++noSuchJoint;
+        }
+    }
+
+    if (withPose == 0) return;
+    std::fprintf(stderr, "[JOINT_AUDIT] %d objects carry a joint pose, %d of them "
+                 "on a parsed model\n", withPose, modelResolved);
+    if (inRange + outOfRange + noSuchJoint == 0) return;
+    std::fprintf(stderr, "[JOINT_AUDIT] %d authored values within the model's "
+                 "declared travel, %d outside it, %d on a slot the model has no "
+                 "part for\n", inRange, outOfRange, noSuchJoint);
+    for (const auto &e : examples)
+        std::fprintf(stderr, "[JOINT_AUDIT]   %s\n", e.c_str());
+}
+
 // ── Create all GPU resources: shaders, lightmap atlas, world/object/sky buffers ──
 // Builds mesh data from MissionData, uploads to bgfx, creates shader programs
 // and uniform handles. Returns false if world geometry is empty (fatal).
@@ -1279,6 +1364,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                      gpu.objModelGPU.size());
         std::fprintf(stderr, "Sub-objects: %d multi-part models, %d jointed parts "
                      "(rest matrices composed)\n", multiPartModels, jointedParts);
+        auditJointRanges(mission);
 
         // Count translucent objects/materials for diagnostics
         int translucentObjCount = 0;
