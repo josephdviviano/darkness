@@ -43,6 +43,7 @@
 #include <bgfx/bgfx.h>
 #include <bx/math.h>
 
+#include "DarknessMath.h"
 #include "WRChunkParser.h"
 #include "room/Room.h"
 #include "CellGeometry.h"
@@ -543,10 +544,13 @@ inline bgfx::TextureHandle createMipmappedTexture(
 
 // ── Object mesh rendering ──
 
-// Per-material submesh draw range within an object model's index buffer
+// Per-(material, sub-object) submesh draw range within an object model's
+// index buffer
 struct ObjectSubMeshGPU {
     uint32_t firstIndex;
     uint32_t indexCount;
+    int subObj = 0;        // model part this range belongs to; indexes
+                           // ObjectModelGPU::restMatrices
     std::string matName;   // lowercase material name, for texture lookup
     bool textured;         // true = Darkness::MD_MAT_TMAP, false = Darkness::MD_MAT_COLOR
     float matTrans;        // per-material translucency from .bin mat_extra (0=opaque)
@@ -562,6 +566,11 @@ struct ObjectModelGPU {
     bgfx::VertexBufferHandle vbh = BGFX_INVALID_HANDLE;
     bgfx::IndexBufferHandle ibh = BGFX_INVALID_HANDLE;
     std::vector<ObjectSubMeshGPU> subMeshes;
+    // Model-space matrix per sub-object with every joint at rest, composed
+    // once at load. Objects whose joints are all zero — nearly all of them —
+    // draw straight from this instead of recomposing per frame. Empty for
+    // single-part models, which need no per-submesh transform at all.
+    std::vector<Matrix4> restMatrices;
     bool valid = false;
 };
 

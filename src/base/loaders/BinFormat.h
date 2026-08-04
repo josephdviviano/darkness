@@ -98,12 +98,12 @@ struct Vertex {
     }
 };
 
-File &operator >>(File &st, Vertex &v) {
+inline File &operator >>(File &st, Vertex &v) {
     st >> v.x >> v.y >> v.z;
     return st;
 }
 
-File &operator <<(File &st, const Vertex &v) {
+inline File &operator <<(File &st, const Vertex &v) {
     st << v.x << v.y << v.z;
     return st;
 }
@@ -114,12 +114,12 @@ struct PolyParts {
     int32_t c;
 };
 
-File &operator >>(File &st, PolyParts &p) {
+inline File &operator >>(File &st, PolyParts &p) {
     st >> p.a >> p.b >> p.c;
     return st;
 }
 
-File &operator <<(File &st, const PolyParts &p) {
+inline File &operator <<(File &st, const PolyParts &p) {
     st << p.a << p.b << p.c;
     return st;
 }
@@ -130,12 +130,12 @@ struct PolyPartsShorts {
     int16_t c;
 };
 
-File &operator >>(File &st, PolyPartsShorts &p) {
+inline File &operator >>(File &st, PolyPartsShorts &p) {
     st >> p.a >> p.b >> p.c;
     return st;
 }
 
-File &operator <<(File &st, const PolyPartsShorts &p) {
+inline File &operator <<(File &st, const PolyPartsShorts &p) {
     st << p.a << p.b << p.c;
     return st;
 }
@@ -145,12 +145,12 @@ struct UVMap {
     float v;
 };
 
-File &operator >>(File &st, UVMap &m) {
+inline File &operator >>(File &st, UVMap &m) {
     st >> m.u >> m.v;
     return st;
 }
 
-File &operator <<(File &st, const UVMap &m) {
+inline File &operator <<(File &st, const UVMap &m) {
     st << m.u << m.v;
     return st;
 }
@@ -253,12 +253,12 @@ struct VHotObj {
     Vertex point;
 };
 
-File &operator >>(File &f, VHotObj &o) {
+inline File &operator >>(File &f, VHotObj &o) {
     f >> o.index >> o.point;
     return f;
 }
 
-File &operator <<(File &f, const VHotObj &o) {
+inline File &operator <<(File &f, const VHotObj &o) {
     f << o.index << o.point;
     return f;
 }
@@ -290,33 +290,47 @@ struct MeshMaterialExtra {
     float illum;
 };
 
-File &operator >>(File &f, MeshMaterialExtra &mext) {
+inline File &operator >>(File &f, MeshMaterialExtra &mext) {
     f >> mext.trans >> mext.illum;
     return f;
 }
 
-File &operator <<(File &f, const MeshMaterialExtra &mext) {
+inline File &operator <<(File &f, const MeshMaterialExtra &mext) {
     f << mext.trans << mext.illum;
     return f;
 }
 
-/// Transformation structure that describes how the model part is attached to
-/// it's parent (.BIN LGMD uses a transform tree, similar to skeleton for AI
-/// meshes)
+/// Transformation structure describing how a model part moves relative to its
+/// parent. The sub-object TREE is expressed by `child_sub_obj`/`next_sub_obj`
+/// in SubObjectHeader — NOT by anything in here.
 struct SubObjTransform {
-    int32_t parent; /// A numbered parent identification (Parent sub-object
-                    /// index) or -1 if no parent exists.
-    // Comment: I expect this to rather be an SubObject index.
+    /// Joint slot this part is driven by, or -1 when the part is static.
+    ///
+    /// Previously read as a `parent` sub-object index (inherited from OPDE,
+    /// whose own comment hedged "I expect this to rather be an SubObject
+    /// index"). That reading is wrong: -1 is a "no joint" sentinel, which is
+    /// the only reason it ever looked like a parent link.
+    ///
+    /// Verified against every LGMD model in obj.crf (1782 models, 2207
+    /// sub-objects), two independent exact predictions:
+    ///   - `joint_idx == -1` IFF `movement == MOVEMENT_NONE`  — 2207/2207.
+    ///   - The `@sNN` authoring prefix in SubObjectHeader::name (zero-padded
+    ///     2-digit joint number) equals this value — 425/425 jointed parts.
+    /// Values also violate a parent reading directly: 3 sub-objects carry a
+    /// value >= the model's num_objs, which cannot be a sub-object index.
+    ///
+    /// Range: observed 0..13 in stock data (clock and camera models). Do NOT
+    /// assume a 6-joint cap.
+    int32_t joint_idx;
     float min_range; /// minimal angle/translation ?
     float max_range; /// maximal angle/translation ?
-    float rot[9]; /// Transformation matrix. Rotation and translation comparing
-                  /// the parent object (not used for parent imho)
-    Vertex axle_point; /// Position of this sub-object
+    float rot[9];    /// 3x3 basis of this sub-object relative to its parent
+    Vertex axle_point; /// Position of this sub-object (rotation axle origin)
 };
 
-File &operator >>(File &f, SubObjTransform &t) {
+inline File &operator >>(File &f, SubObjTransform &t) {
     // the transform stuff
-    f >> t.parent
+    f >> t.joint_idx
       >> t.min_range
       >> t.max_range;
 
@@ -327,9 +341,9 @@ File &operator >>(File &f, SubObjTransform &t) {
     return f;
 }
 
-File &operator <<(File &f, const SubObjTransform &t) {
+inline File &operator <<(File &f, const SubObjTransform &t) {
     // the transform stuff
-    f << t.parent
+    f << t.joint_idx
       << t.min_range
       << t.max_range;
 
@@ -364,7 +378,7 @@ struct SubObjectHeader {
     int16_t sub_num_nodes;
 };
 
-File &operator >>(File &f, SubObjectHeader &h) {
+inline File &operator >>(File &f, SubObjectHeader &h) {
     f.read(h.name, 8);
 
     f >> h.movement
@@ -385,7 +399,7 @@ File &operator >>(File &f, SubObjectHeader &h) {
     return f;
 }
 
-File &operator <<(File &f, const SubObjectHeader &h) {
+inline File &operator <<(File &f, const SubObjectHeader &h) {
     f.write(h.name, 8);
 
     f << h.movement
@@ -419,12 +433,12 @@ struct NodeHeader {
 
 };
 
-File &operator >>(File &f, NodeHeader &h) {
+inline File &operator >>(File &f, NodeHeader &h) {
     f >> h.subObjectID >> h.object_number >> h.c_unk1;
     return f;
 }
 
-File &operator <<(File &f, const NodeHeader &h) {
+inline File &operator <<(File &f, const NodeHeader &h) {
     f << h.subObjectID << h.object_number << h.c_unk1;
     return f;
 }
@@ -444,13 +458,13 @@ struct NodeSplit {
     short pgon_after_count;
 };
 
-File &operator >>(File &f, NodeSplit &s) {
+inline File &operator >>(File &f, NodeSplit &s) {
     f >> s.sphere_center >> s.sphere_radius >> s.pgon_before_count >>
         s.normal >> s.d >> s.behind_node >> s.front_node >> s.pgon_after_count;
     return f;
 }
 
-File &operator <<(File &f, const NodeSplit &s) {
+inline File &operator <<(File &f, const NodeSplit &s) {
     f << s.sphere_center << s.sphere_radius << s.pgon_before_count << s.normal
       << s.d << s.behind_node << s.front_node << s.pgon_after_count;
     return f;
@@ -468,13 +482,13 @@ struct NodeCall {
     short pgon_after_count;
 };
 
-File &operator >>(File &f, NodeCall &c) {
+inline File &operator >>(File &f, NodeCall &c) {
     f >> c.sphere_center >> c.sphere_radius >> c.pgon_before_count >>
         c.call_node >> c.pgon_after_count;
     return f;
 }
 
-File &operator <<(File &f, const NodeCall &c) {
+inline File &operator <<(File &f, const NodeCall &c) {
     f << c.sphere_center << c.sphere_radius << c.pgon_before_count <<
         c.call_node << c.pgon_after_count;
     return f;
@@ -491,12 +505,12 @@ struct NodeRaw // Simple Node. No splitting
     short pgon_count;
 };
 
-File &operator >>(File &f, NodeRaw &n) {
+inline File &operator >>(File &f, NodeRaw &n) {
     f >> n.sphere_center >> n.sphere_radius >> n.pgon_count;
     return f;
 }
 
-File &operator <<(File &f, const NodeRaw &n) {
+inline File &operator <<(File &f, const NodeRaw &n) {
     f << n.sphere_center << n.sphere_radius << n.pgon_count;
     return f;
 }
@@ -519,12 +533,12 @@ struct ObjPolygon {
     float d;           /// d - makes up the plane definition with norm
 };
 
-File &operator>>(File &f, ObjPolygon &p) {
+inline File &operator>>(File &f, ObjPolygon &p) {
     f >> p.index >> p.data >> p.type >> p.num_verts >> p.norm >> p.d;
     return f;
 }
 
-File &operator>>(File &f, const ObjPolygon &p) {
+inline File &operator>>(File &f, const ObjPolygon &p) {
     f << p.index << p.data << p.type << p.num_verts << p.norm << p.d;
     return f;
 }
@@ -543,12 +557,12 @@ struct ObjLight {
     uint32_t packed_normal;
 };
 
-File &operator>>(File &f, ObjLight &l) {
+inline File &operator>>(File &f, ObjLight &l) {
     f >> l.material >> l.point >> l.packed_normal;
     return f;
 }
 
-File &operator>>(File &f, const ObjLight &l) {
+inline File &operator>>(File &f, const ObjLight &l) {
     f << l.material << l.point << l.packed_normal;
     return f;
 }
@@ -562,12 +576,12 @@ struct CalHdr {
     int32_t num_limbs;
 };
 
-File &operator>>(File &f, CalHdr &ch) {
+inline File &operator>>(File &f, CalHdr &ch) {
     f >> ch.version >> ch.num_torsos >> ch.num_limbs;
     return f;
 }
 
-File &operator>>(File &f, const CalHdr &ch) {
+inline File &operator>>(File &f, const CalHdr &ch) {
     f << ch.version << ch.num_torsos << ch.num_limbs;
     return f;
 }
@@ -585,7 +599,7 @@ struct CalTorso {
                                        // joint to the root joint
 };
 
-File &operator>>(File &f, CalTorso &t) {
+inline File &operator>>(File &f, CalTorso &t) {
     f >> t.root >> t.parent >> t.fixed_count;
 
     for (int32_t c = 0; c < 16; ++c) {
@@ -599,7 +613,7 @@ File &operator>>(File &f, CalTorso &t) {
     return f;
 }
 
-File &operator>>(File &f, const CalTorso &t) {
+inline File &operator>>(File &f, const CalTorso &t) {
     f << t.root << t.parent << t.fixed_count;
 
     for (int32_t c = 0; c < 16; ++c) {
@@ -624,7 +638,7 @@ struct CalLimb {
     float lengths[16];             /// Lengths of the segment
 };
 
-File &operator>>(File &f, CalLimb &l) {
+inline File &operator>>(File &f, CalLimb &l) {
     f >> l.torso_index >> l.junk1 >>
         l.num_segments >> l.attachment_joint;
 
@@ -643,7 +657,7 @@ File &operator>>(File &f, CalLimb &l) {
     return f;
 }
 
-File &operator>>(File &f, const CalLimb &l) {
+inline File &operator>>(File &f, const CalLimb &l) {
     f << l.torso_index << l.junk1 <<
         l.num_segments << l.attachment_joint;
 
@@ -736,13 +750,13 @@ struct AIMapper {
     float rotation[3]; /// I just guess this can be rotation for the bone
 };
 
-File &operator >>(File &f, AIMapper &m) {
+inline File &operator >>(File &f, AIMapper &m) {
     f >> m.unk1 >> m.joint >> m.en1 >> m.jother >> m.en2 >> m.rotation[0] >>
         m.rotation[1] >> m.rotation[2];
     return f;
 }
 
-File &operator <<(File &f, const AIMapper &m) {
+inline File &operator <<(File &f, const AIMapper &m) {
     f << m.unk1 << m.joint << m.en1 << m.jother << m.en2 << m.rotation[0] <<
         m.rotation[1] << m.rotation[2];
     return f;
@@ -819,13 +833,13 @@ struct AIJointInfo {
     int16_t mapper_id; /// ID of the mapper struct
 };
 
-File &operator >>(File &f, AIJointInfo &j) {
+inline File &operator >>(File &f, AIJointInfo &j) {
     f >> j.num_polys >> j.start_poly >> j.num_vertices >> j.start_vertex >>
         j.jflt >> j.sh6 >> j.mapper_id;
     return f;
 }
 
-File &operator <<(File &f, const AIJointInfo &j) {
+inline File &operator <<(File &f, const AIJointInfo &j) {
     f << j.num_polys << j.start_poly << j.num_vertices << j.start_vertex <<
         j.jflt << j.sh6 << j.mapper_id;
     return f;
@@ -842,12 +856,12 @@ struct AITriangle {
                      /// to inform about it
 };
 
-File &operator >>(File &f, AITriangle &t) {
+inline File &operator >>(File &f, AITriangle &t) {
     f >> t.vert[0] >> t.vert[1] >> t.vert[2] >> t.mat >> t.d >> t.norm >> t.flags;
     return f;
 }
 
-File &operator <<(File &f, AITriangle &t) {
+inline File &operator <<(File &f, AITriangle &t) {
     f << t.vert[0] << t.vert[1] << t.vert[2] << t.mat << t.d << t.norm << t.flags;
     return f;
 }

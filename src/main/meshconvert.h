@@ -194,11 +194,14 @@ struct MeshMaterialExtra {
 };
 
 struct SubObjTransform {
-    uint32_t JointNumber; // A numbered joint identification
-    float min_range;      // minimal angle/translation ?
-    float max_range;      // maximal angle/translation ?
-    float f[9];           // Transformation matrix
-    Vertex AxlePoint;     // seems to be a Joint position
+    // Joint slot driving this part, or -1 when static. MUST be signed: -1 is
+    // the "no joint" sentinel and read as unsigned it becomes 4294967295.
+    // Verified across obj.crf — see SubObjTransform in base/loaders/BinFormat.h.
+    int32_t joint_idx;
+    float min_range;  // minimal angle/translation ?
+    float max_range;  // maximal angle/translation ?
+    float f[9];       // Transformation matrix
+    Vertex AxlePoint; // Position of this sub-object (rotation axle origin)
 };
 
 struct SubObjectHeader {
@@ -280,7 +283,7 @@ std::ostream &operator<<(std::ostream &os, const Vertex &v) {
 }
 
 std::ostream &operator<<(std::ostream &os, const SubObjTransform &t) {
-    os << "Joint:" << t.JointNumber << std::endl;
+    os << "Joint:" << t.joint_idx << std::endl;
     os << "Min range:" << t.min_range << std::endl;
     os << "Max range:" << t.max_range << std::endl;
     os << "Matrix: ";

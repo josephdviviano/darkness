@@ -79,6 +79,17 @@ struct ObjectState {
     // ── State flags ──
     uint32_t flags = kObjStateActive;
 
+    // ── Sub-object joint pose (model parts: handles, lids, hands, levers) ──
+    // Values indexed by the LGMD sub-object's joint slot. Rotate joints are in
+    // DEGREES, slide joints in world units — the same units P$JointPos stores.
+    // `hasJoints` stays false for the overwhelming majority of objects, and the
+    // renderer skips the whole per-part composition when it is.
+    // Slot count matches PropJointPos (static_assert lives in TweqSystem.h,
+    // which sees both headers).
+    static constexpr int kJointSlots = 6;
+    float    joints[kJointSlots] = {};
+    bool     hasJoints = false;
+
     // ── Model override (tweq model cycling) ──
     // When non-empty, the renderer uses this model name instead of the object's
     // static model from ObjectPlacement. Set by TweqSystem for Models tweqs.
