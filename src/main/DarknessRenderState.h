@@ -126,8 +126,14 @@ struct MissionData {
     // Built from P$Friction on texture archetype objects in dark.gam.
     std::vector<float>                                frictionTable;
 
-    // Cell→room mapping for door visibility blocking (indexed by cellID, -1 if unmapped)
+    // Cell→room mapping (indexed by cellID, -1 if unmapped). Used by the
+    // audio room graph; NOT by door-aware portal culling — see doorPortals.
     std::vector<int32_t>                              cellToRoom;
+
+    // Door visibility blocking: cellPairKey(a,b) → the door leaves physically
+    // filling the opening between those cells. Built by buildDoorPortalMap
+    // once the door system knows every leaf's closed-pose OBB.
+    std::unordered_map<uint64_t, std::vector<int32_t>> doorPortals;
 
     // Per-texture climbability factor (indexed by TXLIST texture index, default 0.0).
     // Built from P$Climbabil on texture archetype objects in dark.gam.

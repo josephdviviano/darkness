@@ -5354,21 +5354,30 @@ static Darkness::FrameContext prepareFrame(
             state.lastValidCameraCell = camCell;
         }
 
-        // Build door-blocking callback: when a portal connects cells in different
-        // rooms with a closed vision-blocking door, skip the portal traversal.
+        // Build door-blocking callback: a portal is blocked while every door
+        // leaf that physically fills it is shut.
+        //
+        // Keyed on the cell pair — the actual opening — not on the ROOM_DB
+        // room pair. A Thief doorway carries its own thin threshold room
+        // brush, so a room-pair key blanks the doorway's own cells and stops
+        // the jamb/head/threshold reveal from being drawn while the door is
+        // shut. It also collapses double doors (one map slot per room pair,
+        // so opening the wrong leaf unblocked nothing) and ignored
+        // P$RotDoor/P$TransDoor BlockVision entirely.
+        //
+        // Multiple leaves on one opening (double doors) block only when ALL
+        // of them are shut: any open leaf is a line of sight through.
         PortalBlockedCallback doorBlocking = nullptr;
-        if (!mission.cellToRoom.empty() && state.doorSystem) {
+        if (!mission.doorPortals.empty() && state.doorSystem) {
             doorBlocking = [&](uint32_t srcCell, uint32_t tgtCell) -> bool {
-                if (srcCell >= mission.cellToRoom.size() ||
-                    tgtCell >= mission.cellToRoom.size())
+                auto it = mission.doorPortals.find(cellPairKey(srcCell, tgtCell));
+                if (it == mission.doorPortals.end())
                     return false;
-                int32_t srcRoom = mission.cellToRoom[srcCell];
-                int32_t tgtRoom = mission.cellToRoom[tgtCell];
-                if (srcRoom < 0 || tgtRoom < 0 || srcRoom == tgtRoom)
-                    return false;
-                // Check if a door between these rooms is closed and vision-blocking
-                float openFrac = state.doorSystem->getOpenFractionForRooms(srcRoom, tgtRoom);
-                return openFrac < 0.01f;  // fully closed = block
+                for (int32_t leaf : it->second) {
+                    if (state.doorSystem->getOpenFraction(leaf) >= 0.01f)
+                        return false;  // this leaf is open — sight passes
+                }
+                return true;
             };
         }
 
@@ -6781,6 +6790,58 @@ int main(int argc, char *argv[]) {
         }
         if (lockedCount > 0) {
             std::fprintf(stderr, "  %d doors locked (P$Locked)\n", lockedCount);
+        }
+
+        // Bind each door to the WR portal polygons it physically fills, so
+        // portal culling closes the opening rather than a whole room
+        // boundary. Runs here because it needs edgeLengths, which init()
+        // resolves from P$PhysDims (or the .bin bbox) only once
+        // mission.parsedModels is available.
+        //
+        // Only BlockVision doors take part. That flag is what the engine
+        // consults for sight through a shut door (NewDark 1.28
+        // new_config_vars.txt, enhanced_aidetect_trace: "closed doors (that
+        // block vision)"), and it fails in the safe direction — a leaf we
+        // decline to register over-renders the space behind it, which costs
+        // frames, where a leaf we register wrongly deletes visible surface.
+        {
+            std::vector<Darkness::DoorAperture> apertures;
+            int skippedNoBounds = 0, skippedSeeThrough = 0;
+            for (int32_t did : doorSystem.getAllDoorIDs()) {
+                const Darkness::DoorState *d = doorSystem.getDoor(did);
+                if (!d) continue;
+                if (!d->visionBlocking) { ++skippedSeeThrough; continue; }
+                if (glm::length(d->edgeLengths) < 0.01f) {
+                    ++skippedNoBounds;
+                    std::fprintf(stderr,
+                        "[FALLBACK] door %d has zero edgeLengths — cannot bind "
+                        "it to a WR portal, so it will never block sight\n", did);
+                    continue;
+                }
+
+                Darkness::Matrix4 m = doorSystem.getClosedWorldMatrix(did);
+                Darkness::DoorAperture ap;
+                ap.objID  = did;
+                ap.center = Darkness::Vector3(m[3]);
+                for (int k = 0; k < 3; ++k) {
+                    Darkness::Vector3 a(m[k]);
+                    float len = glm::length(a);
+                    ap.axis[k] = (len > 1e-6f) ? a / len
+                                               : Darkness::Vector3(k == 0, k == 1, k == 2);
+                    ap.half[k] = d->edgeLengths[k] * 0.5f;
+                }
+                // The leaf's face normal is its thinnest axis: every door
+                // model measured is a slab (e.g. 4.0 x 0.3 x 8.0 ft).
+                ap.thinAxis = (ap.half.x <= ap.half.y && ap.half.x <= ap.half.z) ? 0
+                            : (ap.half.y <= ap.half.z) ? 1 : 2;
+                apertures.push_back(ap);
+            }
+            std::fprintf(stderr,
+                "[DoorPortal] %zu door leaves eligible "
+                "(%d skipped: BlockVision=0, %d skipped: no bounds)\n",
+                apertures.size(), skippedSeeThrough, skippedNoBounds);
+            mission.doorPortals =
+                Darkness::buildDoorPortalMap(mission.wrData, apertures);
         }
     }
 

@@ -262,14 +262,15 @@ public:
         return std::clamp((door.currentValue - signedClosed) / range, 0.0f, 1.0f);
     }
 
-    /// Get the open fraction for a portal between two rooms.
-    /// Returns 1.0 (fully open) if no door exists between those rooms.
-    float getOpenFractionForRooms(int32_t room1, int32_t room2) const {
-        uint64_t key = roomPairKey(room1, room2);
-        auto it = mRoomPairToDoor.find(key);
-        if (it == mRoomPairToDoor.end()) return 1.0f;
-        return getOpenFraction(it->second);
-    }
+    // There is deliberately no getOpenFractionForRooms(). Renderer visibility
+    // must not be keyed on the room pair: mRoomPairToDoor holds one door per
+    // pair (so a double door's second leaf can never unblock anything), and a
+    // Thief doorway carries its own thin threshold room brush, so blocking the
+    // pair drops the doorway's own cells and stops the jamb / head / threshold
+    // reveal from being drawn. Bind to the opening instead — see
+    // DoorPortalBinding.h. The sound path below is a different question: it
+    // wants "how much does the door between these two rooms muffle", which
+    // genuinely is a room-pair property.
 
     /// Get the sound blocking factor (0.0-1.0) for a portal between two rooms.
     /// Returns 0.0 if no door or door is fully open.
@@ -350,6 +351,17 @@ public:
             out.push_back(std::move(geom));
         }
         return out;
+    }
+
+    /// The door's world transform at its CLOSED pose — rigid (rotation +
+    /// translation, no scale), matching the convention of the audio OBB mesh
+    /// whose vertices already carry world dimensions. This is the pose at
+    /// which the leaf fills its opening, so it is what the renderer's
+    /// door→WR-portal binding measures against. Identity if unknown.
+    Matrix4 getClosedWorldMatrix(int32_t objID) const {
+        auto it = mDoors.find(objID);
+        if (it == mDoors.end()) return Matrix4(1.0f);
+        return computeAudioWorldMatrixAt(it->second, it->second.closedValue);
     }
 
     /// Get all door IDs (for debug enumeration).

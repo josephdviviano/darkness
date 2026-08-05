@@ -47,6 +47,7 @@
 #include "WRChunkParser.h"
 #include "room/Room.h"
 #include "CellGeometry.h"
+#include "DoorPortalBinding.h"
 
 namespace Darkness {
 
