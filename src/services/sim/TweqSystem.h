@@ -94,6 +94,10 @@ struct TweqInstance {
 
     // Simple config (Flicker/Models/Delete)
     uint16_t  cfgRate = 0;       // ms per step
+    // Emitter only: how many emissions before halting, from the CONFIG.
+    // Distinct from curFrame, which is the running count and comes from the
+    // STATE — conflating the two made every limited emitter fire exactly once.
+    int32_t   maxFrames = 0;
 
     // Lock tweq — the single model joint slot this lock drives
     int       lockJointSlot = 0;
@@ -915,10 +919,12 @@ private:
                                   cfg.velocity[2]);
         tw.emitAngleRandom = Vector3(cfg.angleRandom[0], cfg.angleRandom[1],
                                      cfg.angleRandom[2]);
-        // curFrame counts emissions down to zero, the way the flicker tweq
-        // counts its toggles.
-        tw.curFrame = static_cast<int16_t>(
-            std::clamp<int32_t>(cfg.maxFrames, 0, 32767));
+        // The budget belongs to the config; the running count belongs to the
+        // state and is read by initFromState. Storing the budget in curFrame
+        // meant initFromState immediately overwrote it with the stored frame
+        // index — and 225 of 226 shipped emitter states store 0, so every
+        // limited emitter emitted once and stopped.
+        tw.maxFrames = cfg.maxFrames;
         if (cfg.rate == 0) {
             std::fprintf(stderr, "[DEFAULT] TweqSystem: obj %d Emitter cfgRate=0 "
                          "with Sim flag — would emit every tick\n", tw.objID);
@@ -1269,15 +1275,16 @@ private:
             return kTweqStatusQuo;
         tw.elapsedMs -= static_cast<float>(tw.cfgRate);
 
-        emitOne(tw);
-
-        if (!(tw.cfgAnim & kTweqAnimNoLimit)) {
-            --tw.curFrame;
-            if (tw.curFrame <= 0) {
-                tw.active = false;
-                return tw.cfgHalt;
-            }
+        // Budget is checked BEFORE emitting and counts up, so a budget of N
+        // yields exactly N objects.
+        if (!(tw.cfgAnim & kTweqAnimNoLimit) &&
+            tw.curFrame >= tw.maxFrames) {
+            tw.active = false;
+            return tw.cfgHalt;
         }
+
+        emitOne(tw);
+        ++tw.curFrame;
         return kTweqFrameEvent;
     }
 
@@ -1443,10 +1450,16 @@ private:
                     os.flags &= ~kObjStateHidden;
             }
 
-            // Check frame limit
+            // Check frame limit. Halting on EXACTLY zero, not on <= 0, is
+            // what makes a stored count of 0 mean "unlimited": it decrements
+            // to -1 and keeps going. 108 of the 190 shipped flicker states
+            // store 0, so a <= 0 test halted every one of them on its first
+            // toggle — and two of those carry a Slay halt action, which killed
+            // their object seconds into the level. A torch that flickers
+            // continuously is the observable proof that 0 cannot mean "stop
+            // immediately".
             if (!(tw.cfgAnim & kTweqAnimNoLimit)) {
-                tw.curFrame--;
-                if (tw.curFrame <= 0) return tw.cfgHalt;
+                if (--tw.curFrame == 0) return tw.cfgHalt;
             }
 
             return kTweqFrameEvent;

@@ -665,7 +665,8 @@ Darkness::TweqInstance makeEmitterTweq(int32_t objID, uint16_t rateMs,
     tw.cfgHalt = Darkness::kTweqHaltStop;
     tw.cfgRate = rateMs;
     tw.cfgMisc = misc;
-    tw.curFrame = static_cast<int16_t>(frames);
+    tw.maxFrames = frames;
+    tw.curFrame = 0;
     tw.emitVelocity = Vector3(0.0f, 0.0f, 4.0f);
     std::strncpy(tw.emitWhat, what, sizeof(tw.emitWhat) - 1);
     tw.active = true;
@@ -698,18 +699,68 @@ TEST_CASE("TweqSystem: an emitter emits its archetype on the configured beat",
     REQUIRE(emitted[0].velocity.z == Approx(4.0f));
 }
 
-TEST_CASE("TweqSystem: an emitter halts once its frame budget runs out",
+TEST_CASE("TweqSystem: an emitter emits exactly its configured budget",
           "[Tweq][Emitter]") {
+    // The budget lives in the CONFIG and the running count in the STATE.
+    // Conflating them let the state's frame index (0 in 225 of 226 shipped
+    // records) overwrite the budget, so every limited emitter fired once.
     Darkness::TweqSystem sys;
     Darkness::ObjectStateMap states;
     int count = 0;
     sys.setEmitCallback([&count](const Darkness::EmitRequest &) { ++count; });
-    sys.injectForTest(makeEmitterTweq(931, 100, 2, "H2OSplash"), &states);
+    sys.injectForTest(makeEmitterTweq(931, 100, 3, "H2OSplash"), &states);
 
-    for (int i = 0; i < 6; ++i) sys.simStep(0.0f, 0.1f);
+    for (int i = 0; i < 8; ++i) sys.simStep(0.0f, 0.1f);
 
-    REQUIRE(count == 2);   // budget of 2, not one per tick
+    REQUIRE(count == 3);   // exactly the budget — not 1, not one per tick
     REQUIRE_FALSE(sys.getInstanceForTest(931, Darkness::kTweqTypeEmitter)->active);
+}
+
+TEST_CASE("TweqSystem: a flicker with a stored count of 0 runs indefinitely",
+          "[Tweq][Flicker]") {
+    // 108 of 190 shipped flicker states store 0. Halting on <= 0 stopped every
+    // one of them on its first toggle, and two carry a Slay halt action that
+    // killed their object. 0 means unlimited: the counter decrements to -1 and
+    // the halt test only fires on exactly zero.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+
+    Darkness::TweqInstance tw;
+    tw.objID = 970;
+    tw.type = Darkness::kTweqTypeFlicker;
+    tw.cfgRate = 50;
+    tw.cfgHalt = Darkness::kTweqHaltSlay;   // the dangerous shipped case
+    tw.curFrame = 0;                        // as shipped
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.hasObjectState = true;
+    sys.injectForTest(tw, &states);
+
+    for (int i = 0; i < 10; ++i) sys.simStep(0.0f, 0.06f);
+
+    REQUIRE(sys.getInstanceForTest(970, Darkness::kTweqTypeFlicker)->active);
+    REQUIRE((states.get(970).flags & Darkness::kObjStateDestroyed) == 0);
+}
+
+TEST_CASE("TweqSystem: a flicker with a real frame count still halts",
+          "[Tweq][Flicker]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+
+    Darkness::TweqInstance tw;
+    tw.objID = 971;
+    tw.type = Darkness::kTweqTypeFlicker;
+    tw.cfgRate = 50;
+    tw.cfgHalt = Darkness::kTweqHaltStop;
+    tw.curFrame = 2;
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.hasObjectState = true;
+    sys.injectForTest(tw, &states);
+
+    for (int i = 0; i < 6; ++i) sys.simStep(0.0f, 0.06f);
+
+    REQUIRE_FALSE(sys.getInstanceForTest(971, Darkness::kTweqTypeFlicker)->active);
 }
 
 TEST_CASE("TweqSystem: ZeroVel emits with no velocity", "[Tweq][Emitter]") {
