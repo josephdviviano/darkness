@@ -865,11 +865,27 @@ TEST_CASE("TweqSystem: ZeroVel emits with no velocity", "[Tweq][Emitter]") {
     });
     sys.injectForTest(makeEmitterTweq(932, 10, 1, "RippleRing",
                                       Darkness::kTweqMiscZeroVel), &states);
+    // Same helper WITHOUT the flag, so the contrast proves the field is
+    // populated at all. Checking only "z == 0" was satisfied by an
+    // EmitRequest that default-constructs its velocity to zero — it could not
+    // distinguish ZeroVel working from the velocity never being set.
+    sys.injectForTest(makeEmitterTweq(934, 10, 1, "RippleRing"), &states);
 
     sys.simStep(0.0f, 0.05f);
 
-    REQUIRE(emitted.size() == 1);
-    REQUIRE(emitted[0].velocity.z == Approx(0.0f));
+    REQUIRE(emitted.size() == 2);
+    const Darkness::EmitRequest *zeroed = nullptr;
+    const Darkness::EmitRequest *normal = nullptr;
+    for (const auto &e : emitted) {
+        if (e.emitterObjID == 932) zeroed = &e;
+        if (e.emitterObjID == 934) normal = &e;
+    }
+    REQUIRE(zeroed != nullptr);
+    REQUIRE(normal != nullptr);
+    REQUIRE(normal->velocity.z == Approx(4.0f));    // the helper's velocity
+    REQUIRE(zeroed->velocity.x == Approx(0.0f));
+    REQUIRE(zeroed->velocity.y == Approx(0.0f));
+    REQUIRE(zeroed->velocity.z == Approx(0.0f));
 }
 
 TEST_CASE("TweqSystem: the five emitter slots are independent instances",

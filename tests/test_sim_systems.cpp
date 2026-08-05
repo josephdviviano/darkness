@@ -794,9 +794,12 @@ TEST_CASE("TweqSystem: wrap mode wraps to opposite edge", "[Tweq]") {
 
     sys.simStep(0.0f, 0.1f);
 
+    // Starting at 95 with rate 90 over 100 ms overshoots 100, so a wrapping
+    // tweq lands on the LOW edge. Asserting only "inside [0, 100]" passed
+    // whether it wrapped (0), bounced (100), or did nothing at all (95) — it
+    // could not tell the behaviour under test from its two likeliest failures.
     auto *result = sys.getInstanceForTest(101, Darkness::kTweqTypeRotate);
-    REQUIRE(result->values[0] >= 0.0f);
-    REQUIRE(result->values[0] <= 100.0f);
+    REQUIRE(result->values[0] == Approx(0.0f));
 }
 
 TEST_CASE("TweqSystem: bounce mode reverses at limit", "[Tweq]") {
@@ -872,8 +875,12 @@ TEST_CASE("TweqSystem: multiply mode scales value", "[Tweq]") {
 
     sys.simStep(0.0f, 0.1f);
 
+    // Multiplicative mode multiplies by the rate outright: 1.0 * 1.1. Note it
+    // ignores the timestep entirely, so this is frame-rate dependent — pinning
+    // the value documents that rather than hiding it behind "changed at all",
+    // which any behaviour would satisfy.
     auto *result = sys.getInstanceForTest(106, Darkness::kTweqTypeScale);
-    REQUIRE(result->values[0] != Approx(1.0f));
+    REQUIRE(result->values[0] == Approx(1.1f));
 }
 
 // ── State Machine Tests ──
@@ -925,10 +932,15 @@ TEST_CASE("TweqSystem: rotate writes model matrix to ObjectState", "[Tweq]") {
 
     sys.simStep(0.0f, 0.1f);
 
+    // 90 degrees of bank about X leaves column 0 as (1, 0, 0) but moves
+    // column 1 to (0, 0, 1). Asserting modelMatrix[0] != 0 was satisfied by
+    // the identity matrix, so it passed even when no rotation was applied —
+    // which is exactly how the halt-frame snap-back went unnoticed.
     const auto *os = states.tryGet(300);
     REQUIRE(os != nullptr);
     REQUIRE(os->hasMatrix == true);
-    REQUIRE(os->modelMatrix[0] != Approx(0.0f));
+    REQUIRE(os->modelMatrix[5] == Approx(0.0f).margin(1e-4));   // cos 90
+    REQUIRE(os->modelMatrix[6] == Approx(1.0f).margin(1e-4));   // sin 90
 }
 
 TEST_CASE("TweqSystem: scale modifies ObjectState", "[Tweq]") {
@@ -940,9 +952,16 @@ TEST_CASE("TweqSystem: scale modifies ObjectState", "[Tweq]") {
 
     sys.simStep(0.0f, 0.1f);
 
+    // hasMatrix is set on EVERY branch of applyComposedTransform, including
+    // the one that ignores the tweq entirely, so asserting it alone proved
+    // nothing. The scale has to actually reach the matrix diagonal.
     const auto *os = states.tryGet(301);
     REQUIRE(os != nullptr);
     REQUIRE(os->hasMatrix == true);
+    const auto *inst = sys.getInstanceForTest(301, Darkness::kTweqTypeScale);
+    REQUIRE(inst->values[0] > 1.0f);
+    REQUIRE(os->modelMatrix[0] == Approx(inst->values[0]));
+    REQUIRE(os->scale.x == Approx(inst->values[0]));
 }
 
 TEST_CASE("TweqSystem: flicker toggles visibility", "[Tweq]") {
