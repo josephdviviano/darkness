@@ -521,9 +521,18 @@ static_assert(sizeof(PropTPath) == 16, "PropTPath must match TPath dtype (16 byt
 // ── Tweq flag types ──
 
 // Animation config flags (uint8 bitfield — CfgTweq*.anim)
+// Bit order is the order NewDark's public scripting API lists these constants
+// in: NOLIMIT, SIM, WRAP, 1BOUNCE, SIMRADSM, SIMRADLG, OFFSCRN for the config
+// word, and ONOFF, REVERSE, RESYNCH, GOEDGE, LAPONE for the state word.
+// (new_dark/doc/squirrel_script/API-reference.txt — public distribution.)
+//
+// NOTE the split that matters: activation lives in the STATE word (ONOFF), not
+// the config word. SIM/SIMRADSM/SIMRADLG/OFFSCRN are a family of update-rate
+// gates — how often to tick a tweq, not whether it is running.
 enum TweqAnimFlags : uint8_t {
     kTweqAnimNoLimit        = 0x01,  // Ignore axis bounds
-    kTweqAnimSim            = 0x02,  // Auto-start with simulation
+    kTweqAnimSim            = 0x02,  // Update continually, rather than only
+                                     //   while the object is on screen
     kTweqAnimWrap           = 0x04,  // Wrap at bounds (vs bounce)
     kTweqAnimOneBounce      = 0x08,  // Stop after one forward+reverse cycle
     kTweqAnimSimSmallRadius = 0x10,  // Only update within 20 units of camera

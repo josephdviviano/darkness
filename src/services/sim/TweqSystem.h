@@ -256,7 +256,7 @@ public:
                 first = false;
             }
         }
-        std::fprintf(stderr, "), %d auto-started (Sim flag)\n", autoStart);
+        std::fprintf(stderr, "), %d running from their stored state\n", autoStart);
     }
 
     // ── Activation API ──
@@ -619,9 +619,31 @@ private:
             // Capture base transform from placement data
             initBaseTransform(tw, placement);
 
-            // Auto-activate if Sim flag is set (always-on tweqs like fans)
-            if (tw.cfgAnim & kTweqAnimSim) {
-                tw.active = true;
+            // NO auto-activation from the config word. Whether a tweq is
+            // running lives in the STATE word's on/off bit, which
+            // initFromState has already applied above; the config word's
+            // SIM bit is an update-rate gate ("tick me continually rather than
+            // only while I am on screen"), sitting in the same family as the
+            // small-radius, large-radius and offscreen gates.
+            //
+            // Treating SIM as auto-start ran tweqs the mission had stored as
+            // OFF: all 7 shipped lock configs carry it, so 424 locks drove
+            // themselves to the unlocked pose within ~0.3 s of mission start,
+            // and MISS13's 80 emitter states are stored off yet every one of
+            // them began emitting at load.
+
+            // The update-rate gates are parsed but not yet honoured: every
+            // tweq ticks every frame regardless. That is more work than the
+            // original did, not less, so nothing stops animating — but an
+            // OFFSCRN tweq counts down in view when it should not.
+            if (tw.cfgAnim & (kTweqAnimSimSmallRadius | kTweqAnimSimLargeRadius |
+                              kTweqAnimOffscreen)) {
+                static int warnCount = 0;
+                if (warnCount++ < 3)
+                    std::fprintf(stderr, "[FALLBACK] TweqSystem: obj %d has an "
+                                 "update-rate gate (anim=0x%02x: radius/offscreen) "
+                                 "that is not honoured — it ticks every frame\n",
+                                 objID, tw.cfgAnim);
             }
 
             // Check if this object has an AnimLight property. Flicker tweqs on
@@ -807,6 +829,7 @@ private:
         if (st.anim & kTweqStateOn) tw.active = true;
         tw.axisState[0] = st.axisState;
         tw.values[0] = st.value;
+        seedReverseFromBase(tw, st.anim);
     }
 
     /// Extract config fields (emitter config)
@@ -827,7 +850,7 @@ private:
         // counts its toggles.
         tw.curFrame = static_cast<int16_t>(
             std::clamp<int32_t>(cfg.maxFrames, 0, 32767));
-        if (cfg.rate == 0 && (cfg.anim & kTweqAnimSim)) {
+        if (cfg.rate == 0) {
             std::fprintf(stderr, "[DEFAULT] TweqSystem: obj %d Emitter cfgRate=0 "
                          "with Sim flag — would emit every tick\n", tw.objID);
         }
@@ -840,7 +863,7 @@ private:
         tw.cfgHalt  = cfg.halt;
         tw.cfgMisc  = cfg.misc;
         tw.cfgRate  = cfg.rate;
-        if (cfg.rate == 0 && (cfg.anim & kTweqAnimSim)) {
+        if (cfg.rate == 0) {
             std::fprintf(stderr, "[DEFAULT] TweqSystem: obj %d Flicker cfgRate=0 with Sim flag — instant cycle, likely parse issue\n", tw.objID);
         }
     }
@@ -852,7 +875,7 @@ private:
         tw.cfgHalt  = cfg.halt;
         tw.cfgMisc  = cfg.misc;
         tw.cfgRate  = cfg.rate;
-        if (cfg.rate == 0 && (cfg.anim & kTweqAnimSim)) {
+        if (cfg.rate == 0) {
             std::fprintf(stderr, "[DEFAULT] TweqSystem: obj %d Models cfgRate=0 with Sim flag — instant cycle, likely parse issue\n", tw.objID);
         }
         // Copy model names. modelCount = index of first empty slot (not last
@@ -870,12 +893,27 @@ private:
         }
     }
 
+    /// Seed per-axis direction from the state word's Reverse bit.
+    ///
+    /// The base `anim` word carries the tweq's direction; the per-axis words
+    /// carry each axis's own. Reading only the per-axis words dropped the
+    /// direction for every tweq that stores it in the base word alone — 565 of
+    /// 1300 shipped lock states do exactly that (typically anim=0x0003 with a
+    /// zero axis word), so those locks, parked at their locked position, ran
+    /// FORWARD to the unlocked pose instead of staying put.
+    static void seedReverseFromBase(TweqInstance &tw, uint16_t animWord) {
+        if (!(animWord & kTweqStateReverse)) return;
+        for (int i = 0; i < tw.axisCount && i < TweqInstance::kMaxAxes; ++i)
+            tw.axisState[i] |= static_cast<uint32_t>(kTweqStateReverse);
+    }
+
     /// Extract state fields (vector state: Rotate/Scale)
     void initFromState(TweqInstance &tw, const PropStTweqVector &st, eTweqType) {
         if (st.anim & kTweqStateOn) tw.active = true;
         tw.axisState[0] = st.x;
         tw.axisState[1] = st.y;
         tw.axisState[2] = st.z;
+        seedReverseFromBase(tw, st.anim);
         // Per-axis reverse flags from state
         for (int i = 0; i < 3; ++i) {
             if (tw.axisState[i] & kTweqStateReverse) {
@@ -889,11 +927,13 @@ private:
         if (st.anim & kTweqStateOn) tw.active = true;
         for (int i = 0; i < kJointSlotCount; ++i)
             tw.axisState[i] = st.joint[i];
+        seedReverseFromBase(tw, st.anim);
     }
 
     /// Extract state fields (simple state: Flicker/Models)
     void initFromState(TweqInstance &tw, const PropStTweqSimple &st, eTweqType) {
         if (st.anim & kTweqStateOn) tw.active = true;
+        seedReverseFromBase(tw, st.anim);
         tw.elapsedMs = static_cast<float>(st.time);
         tw.curFrame  = static_cast<int16_t>(st.frame);
     }
