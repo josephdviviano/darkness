@@ -93,6 +93,7 @@
 #include "motion/MotionService.h"
 #include "RawDataStorage.h"
 #include "PLDefParser.h"
+#include "ObjectVisibility.h"
 #include "SpawnSystem.h"
 #include "DTypeSizeParser.h"
 #include "SingleFieldDataStorage.h"
@@ -2838,6 +2839,11 @@ static void renderObjects(
         if (it != gpu.objModelGPU.end() && it->second.valid) {
             const auto &gpuModel = it->second;
 
+            // On screen this frame: past portal culling and the frustum test,
+            // and about to be submitted.
+            if (state.objectVisibility)
+                state.objectVisibility->markDrawn(obj.objID);
+
             // Live world-space position for object lighting. Moving objects
             // (doors/platforms/tweqs) need their current position, not the
             // P$Position baseline; stationary objects fall through to obj.x/y/z.
@@ -4950,6 +4956,10 @@ static Darkness::FrameContext prepareFrame(
     state.frameUniformBytes = 0;
     state.frameUniformDrawsDropped = 0;
 
+    // Advance the visibility frame counter. Objects stamp themselves as they
+    // are submitted below; the tweq gates read the result on the NEXT sim step.
+    if (state.objectVisibility) state.objectVisibility->beginFrame();
+
     // Projection matrix (shared by sky and world views)
     bx::mtxProj(fc.proj, 60.0f,
                  float(WINDOW_WIDTH) / float(WINDOW_HEIGHT),
@@ -6130,6 +6140,8 @@ int main(int argc, char *argv[]) {
 
     Darkness::TweqSystem tweqSystem;
     Darkness::SpawnSystem spawnSystem;
+    // What the renderer drew last frame, for the tweq update-rate gates.
+    Darkness::ObjectVisibility objectVisibility;
     Darkness::MovingTerrainSystem movingTerrainSystem;
     state.movingTerrainSystem = &movingTerrainSystem;
 
@@ -7108,6 +7120,25 @@ int main(int argc, char *argv[]) {
                          state.objectStates, &doorPlacements,
                          &mission.objData, &mission.objCellIDs, &tweqSystem);
     }
+    // Hook the tweq update-rate gates to what the renderer actually drew.
+    // Without this the gates fail open and every tweq ticks every frame.
+    {
+        std::unordered_set<int32_t> renderable;
+        renderable.reserve(mission.objData.objects.size());
+        for (const auto &o : mission.objData.objects)
+            if (o.objID > 0) renderable.insert(o.objID);
+        objectVisibility.setRenderable(std::move(renderable));
+
+        state.objectVisibility = &objectVisibility;
+        tweqSystem.setVisibilityGating(cfg.tweqVisibilityGating);
+        tweqSystem.setVisibilityQuery([&objectVisibility](int32_t objID) {
+            return objectVisibility.wasVisible(objID);
+        });
+        std::fprintf(stderr, "Tweq update-rate gates: %s (%zu renderable objects)\n",
+                     cfg.tweqVisibilityGating ? "on" : "off (relaxed)",
+                     objectVisibility.renderableCount());
+    }
+
     tweqSystem.setEmitCallback([&spawnSystem](const Darkness::EmitRequest &req) {
         spawnSystem.spawn(req);
     });
@@ -7117,11 +7148,14 @@ int main(int argc, char *argv[]) {
     // keeps its collision body, its spatial-index entry and a truthy exists(),
     // so a slain object still blocks the player and answers AI and audio
     // queries while invisible.
-    tweqSystem.setDestroyCallback([&state, &spawnSystem,
+    tweqSystem.setDestroyCallback([&state, &spawnSystem, &objectVisibility,
                                    wq = worldQuery.get()](int32_t objID) {
         if (wq) wq->notifyDestroyed(objID);
         // Hand back the renderer slot if this was a spawned effect object.
         spawnSystem.recycle(objID);
+        // Drop its visibility stamp too, so a later object reusing the ID
+        // cannot inherit it.
+        objectVisibility.forget(objID);
         Darkness::ObjectCollisionWorld *ocw =
             state.physics ? state.physics->getObjectCollisionWorld() : nullptr;
         if (ocw) ocw->removeObject(objID);

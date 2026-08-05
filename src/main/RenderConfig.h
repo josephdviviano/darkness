@@ -112,6 +112,15 @@ struct RenderConfig {
     // Internally still stored as small ints to keep the runtime hot path branchless.
     int  filterMode        = 0;     // texture filter: 0=point, 1=bilinear, 2=trilinear, 3=anisotropic
     int  lightmapFiltering = 0;     // lightmap filter: 0=bilinear (default), 1=bicubic
+    // Honour the tweq update-rate gates: 184 of the 456 shipped tweq configs
+    // run only while their object is on screen, and 9 run only while it is
+    // off. Faithful when on. Turn it OFF if the gating ever reads worse than
+    // it simulates — a part caught mid-motion as it comes into view. This is a
+    // look-versus-fidelity dial, NOT a performance one: the entire tweq step
+    // measures 0.054 ms/frame on the heaviest shipped level, so there is
+    // nothing here to win back.
+    bool tweqVisibilityGating = true;
+
     bool linearMips        = false; // gamma-correct mipmap generation
     bool sharpMips         = false; // unsharp mask on mip levels
     // Multisample anti-aliasing: 0 (off), 2, 4, 8 or 16 samples.
@@ -710,6 +719,8 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 if      (val == "bicubic")  cfg.lightmapFiltering = 1;
                 else                        cfg.lightmapFiltering = 0; // "bilinear" or unknown → default
             }
+            if (gfx["tweq_visibility_gating"])
+                cfg.tweqVisibilityGating = gfx["tweq_visibility_gating"].as<bool>();
             if (gfx["linear_mips"])  cfg.linearMips = gfx["linear_mips"].as<bool>();
             if (gfx["sharp_mips"])   cfg.sharpMips  = gfx["sharp_mips"].as<bool>();
 

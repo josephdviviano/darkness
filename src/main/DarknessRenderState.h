@@ -49,6 +49,7 @@
 #include "LightingSystem.h"
 #include "ObjectPropParser.h"
 #include "BinMeshParser.h"
+#include "ObjectVisibility.h"
 #include "SpawnFinder.h"
 #include "TXListParser.h"
 #include "PCXDecoder.h"
@@ -403,6 +404,10 @@ struct RuntimeState {
     // thrown, a clock running); everything else reads the model's shared
     // rest matrices. `mutable` for the same reason as gpuLightScratch.
     mutable std::vector<Matrix4> subObjMatrixScratch;
+
+    // What the renderer drew last frame, consumed by the tweq update-rate
+    // gates. Owned by main(); null when the gates are not wired.
+    ObjectVisibility *objectVisibility = nullptr;
 
     // Per-frame uniform-buffer budget accounting (see the
     // kFrameUniformBudgetBytes block above for why this exists). Reset
