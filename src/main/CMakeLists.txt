@@ -207,10 +207,47 @@ bgfx_compile_shaders(
     AS_HEADERS
 )
 
+# Light corona shader — camera-facing additive billboard. Needs its own set
+# rather than reusing `textured`, for two reasons the corona cannot live
+# without: a float4 vertex colour (the per-corona tint exceeds 1.0 so the glow
+# reaches bloom) and no alpha-test discard (the sprite's shape is a continuous
+# alpha ramp, which a 0.5 cutoff would turn into a hard disc).
+bgfx_compile_shaders(
+    TYPE VERTEX
+    SHADERS ${SHADER_DIR}/vs_corona.sc
+    VARYING_DEF ${SHADER_DIR}/varying_corona.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR CORONA_VS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_corona.sc
+    VARYING_DEF ${SHADER_DIR}/varying_corona.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR CORONA_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+
 # bgfx_compile_shaders() doesn't track .h includes — when
 # object_lighting_constants.h changes (e.g. bumping OBJECT_LIGHT_CAP)
 # the per-vertex bytecode would otherwise stay stale. Mirror the .h
 # mtime onto the .sc files so the next build picks up the new value.
+# Same include-tracking gap as the per-vertex constants below: editing
+# corona_depth_fade.sh would otherwise leave both corona fragment shaders
+# stale. Mirror its mtime onto them.
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/.corona_shared_stamp
+    COMMAND ${CMAKE_COMMAND} -E touch_nocreate
+        ${SHADER_DIR}/fs_corona.sc
+    COMMAND ${CMAKE_COMMAND} -E touch
+        ${CMAKE_CURRENT_BINARY_DIR}/.corona_shared_stamp
+    DEPENDS ${SHADER_DIR}/corona_depth_fade.sh
+    COMMENT "Corona shared shader changed — re-touching corona sources"
+)
+
 set(PERVERTEX_CONSTANTS_H ${SHADER_DIR}/object_lighting_constants.h)
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/.pervertex_constants_stamp
@@ -235,7 +272,9 @@ add_custom_target(compile_shaders DEPENDS
     ${PERVERTEX_TEXTURED_FS_OUTPUTS} ${PERVERTEX_BASIC_FS_OUTPUTS}
     ${COMPOSITE_VS_OUTPUTS} ${COMPOSITE_FS_OUTPUTS}
     ${BLOOM_BLUR_FS_OUTPUTS} ${BLOOM_EXTRACT_FS_OUTPUTS}
+    ${CORONA_VS_OUTPUTS} ${CORONA_FS_OUTPUTS}
     ${CMAKE_CURRENT_BINARY_DIR}/.pervertex_constants_stamp
+    ${CMAKE_CURRENT_BINARY_DIR}/.corona_shared_stamp
 )
 
 add_executable(darknessRender DarknessRender.cpp)

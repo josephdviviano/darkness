@@ -321,6 +321,22 @@ inline ObjectPropData parseObjectProps(PropertyService *propSvc,
             continue;
         }
 
+        // RenderType=4 is NewDark's "Corona Only": the object's model is not
+        // drawn, only its light corona. Absent from Thief 2's own
+        // `objectrendertype` enum (which stops at EditorOnly=3), so no retail
+        // object can carry it and this is purely additive for fan missions.
+        // Without the case the model would render, since anything that is not
+        // 1 or 3 falls through to "draw it". CoronaSystem picks these objects
+        // up separately — being filtered here is exactly the point.
+        if (hasRenderType && rt.mode == 4) {
+            if (debugObjects) {
+                std::fprintf(stderr, "  [SKIP] obj %d: CoronaOnly (RenderType=4)\n", id);
+            }
+            ++filtered;
+            ++filteredNotRendered;
+            continue;
+        }
+
         // BRLIST membership is logged but NOT filtered — brush objects like doors
         // need their .bin models rendered even though their brush creates worldmesh
         // geometry. RenderType handles truly invisible brush objects.

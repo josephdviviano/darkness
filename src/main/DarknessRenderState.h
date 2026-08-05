@@ -56,6 +56,7 @@
 #include "RenderParamsParser.h"
 #include "ObjectIllumination.h"
 #include "DynamicLightList.h"
+#include "CoronaSystem.h"
 #include "PostProcess.h"
 #include "AutoFlyTour.h"
 #include "AutoRunTour.h"
@@ -175,9 +176,15 @@ struct GPUResources {
     // texturedProgram / flatProgram pair when per-vertex shading is on.
     bgfx::ProgramHandle texturedPerVertexProgram   = BGFX_INVALID_HANDLE;
     bgfx::ProgramHandle basicPerVertexProgram      = BGFX_INVALID_HANDLE;
+    // Light coronas — additive billboard with a float4 vertex colour, so the
+    // per-corona tint can exceed 1.0 and reach bloom.
+    bgfx::ProgramHandle coronaProgram              = BGFX_INVALID_HANDLE;
 
     // Uniforms
     bgfx::UniformHandle s_texColor     = BGFX_INVALID_HANDLE;
+    // Corona depth fade: scene depth sampler + (fadeRange, zNear, zFar, on).
+    bgfx::UniformHandle s_texDepth     = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_coronaDepth  = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle s_texLightmap  = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_waterParams  = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_waterFlow    = BGFX_INVALID_HANDLE;
@@ -228,6 +235,10 @@ struct GPUResources {
     bgfx::VertexBufferHandle  skyGlowVBH = BGFX_INVALID_HANDLE;
     bgfx::IndexBufferHandle   skyGlowIBH = BGFX_INVALID_HANDLE;
     uint32_t                  skyGlowIndexCount = 0;
+
+    // Corona sprites from bitmap.crf, keyed by the bare name a P$Corona
+    // record's `texture` field holds ("corona", "corblu", "cororn").
+    std::unordered_map<std::string, bgfx::TextureHandle>   coronaTexHandles;
 
     // Skybox
     bgfx::VertexBufferHandle  skyboxVBH = BGFX_INVALID_HANDLE;
@@ -373,6 +384,16 @@ struct RuntimeState {
     // which is painted into the skybox faces — past 1.0 in the HDR target
     // so bloom can pick them up. Proportional, so dark sky stays dark.
     float skyOverbright = 1.0f;
+
+    // Light coronas. Same mirror-the-config contract as the water and
+    // post-process blocks above: main() overwrites `coronaSettings` from the
+    // resolved config before the first frame. `coronas` is the resolved
+    // corona list, built once at load.
+    CoronaRuntime  coronas;
+    CoronaSettings coronaSettings;
+    // Scratch for the per-frame quad batches. Held as state so the vectors
+    // keep their capacity instead of reallocating every frame.
+    mutable std::vector<CoronaBatch> coronaBatches;
 
     // Per-object lighting (Dark Engine convention: ambient + cell-light-list
     // sum + sun + P$ExtraLight). When disabled, objects render at their
