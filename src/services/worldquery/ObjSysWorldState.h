@@ -408,13 +408,15 @@ public:
     // Environment queries (stubs until later phases)
     // ========================================================================
 
-    float getLightLevel(const Vector3 & /*pos*/) const override {
-        // Stub — will query lightmap/dynamic light in a later phase.
+    float getLightLevel(const Vector3 &pos) const override {
+        if (mLightLevelFn)
+            return mLightLevelFn(pos);
+
         WQ_FALLBACK_ONCE(
-            "[FALLBACK] IWorldQuery::getLightLevel: lighting system not wired "
+            "[FALLBACK] IWorldQuery::getLightLevel: no light probe injected "
             "— returning 1.0 (FULLY LIT) for EVERY position. Any AI vision "
-            "built on this sees the player in total darkness. (first call "
-            "only)\n");
+            "built on this sees the player as though standing in full light. "
+            "Wire setLightLevelProbe(). (first call only)\n");
         return 1.0f;
     }
 
@@ -447,6 +449,19 @@ public:
 
     /// Inject the raycaster implementation. Call once after WR data is parsed.
     void setRaycaster(RaycastFn fn) { mRaycaster = std::move(fn); }
+
+    /// Light-level probe, injected for the same reason as the raycaster:
+    /// the answer lives in renderer-owned data (the static light table and
+    /// the per-frame DynamicLightList), and the services layer must not
+    /// depend on src/main.
+    ///
+    /// Returns 0..1, where 1 is fully lit. Gameplay-critical — AI vision
+    /// and the light gem read this, so it must reflect what a player can
+    /// actually see, including runtime dynamic lights.
+    using LightLevelFn = std::function<float(const Vector3 &)>;
+
+    /// Inject the light-level probe. Call once after WR data is parsed.
+    void setLightLevelProbe(LightLevelFn fn) { mLightLevelFn = std::move(fn); }
 
 protected:
     const uint8_t *getRawPropertyData(EntityID id,
@@ -604,7 +619,8 @@ private:
     PortalOpenFractionFn mPortalOpenFractionFn;
 
     // Raycaster — injected by renderer, not set at construction time
-    RaycastFn mRaycaster;
+    RaycastFn    mRaycaster;
+    LightLevelFn mLightLevelFn;
 
     // Spatial index — mutable for lazy init from const query methods
     mutable SpatialIndex mSpatialIndex{32.0f};

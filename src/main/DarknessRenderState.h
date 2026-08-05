@@ -55,6 +55,7 @@
 #include "RenderParamsParser.h"
 #include "ObjectIllumination.h"
 #include "DynamicLightList.h"
+#include "PostProcess.h"
 #include "AutoFlyTour.h"
 #include "AutoRunTour.h"
 #include "AudioCaptureSpin.h"
@@ -93,6 +94,9 @@ struct MissionData {
     // Sky
     SkyParams                                         skyParams;
     SkyDome                                           skyDome;
+    // Sun/moon glow disc built from SKYOBJVAR's glow_* fields. Empty when
+    // the mission authored no glow (or supplied no SKYOBJVAR at all).
+    SkyDome                                           skyGlow;
     std::unordered_map<std::string, DecodedImage>     skyboxImages;
 
     // Fog
@@ -218,10 +222,21 @@ struct GPUResources {
     bgfx::IndexBufferHandle   skyIBH = BGFX_INVALID_HANDLE;
     uint32_t                  skyIndexCount = 0;
 
+    // Sun/moon glow disc from SKYOBJVAR's glow_* fields. Drawn additively
+    // over whichever sky is active, dome or skybox.
+    bgfx::VertexBufferHandle  skyGlowVBH = BGFX_INVALID_HANDLE;
+    bgfx::IndexBufferHandle   skyGlowIBH = BGFX_INVALID_HANDLE;
+    uint32_t                  skyGlowIndexCount = 0;
+
     // Skybox
     bgfx::VertexBufferHandle  skyboxVBH = BGFX_INVALID_HANDLE;
     bgfx::IndexBufferHandle   skyboxIBH = BGFX_INVALID_HANDLE;
     std::unordered_map<std::string, bgfx::TextureHandle>   skyboxTexHandles;
+
+    // Post-process: offscreen scene target + composite program/uniforms.
+    // Owns its own teardown via destroyPostProcess(), including the
+    // composite program, so it is not part of the program block above.
+    PostProcessResources postProcess;
 };
 
 // ── Per-frame uniform-buffer budget ──
@@ -337,6 +352,26 @@ struct RuntimeState {
     float uvDistortion = 0.015f;
     float waterRotation = 0.015f;
     float waterScrollSpeed = 0.05f;
+
+    // Post-process composite settings. Same mirror-the-config contract as the
+    // water block above: main() overwrites these from the resolved config
+    // before the first frame. Defaults are the identity transform with the
+    // pass disabled, so a directly-constructed RuntimeState renders exactly
+    // what the pre-post-process pipeline did.
+    PostProcessSettings postProcess;
+
+    // Sun/moon glow from SKYOBJVAR. Intensity multiplies the mission's own
+    // authored glow_scale; values above 1.0 push the glow past unity in the
+    // HDR target, which is what makes it bloom. Default 1.0 = mission
+    // intent, unmodified.
+    bool  skyGlowEnabled   = true;
+    float skyGlowIntensity = 1.0f;
+
+    // Sky overbright multiplier. 1.0 = untouched (original fidelity).
+    // Above 1.0 pushes the brightest sky texels — in practice the moon,
+    // which is painted into the skybox faces — past 1.0 in the HDR target
+    // so bloom can pick them up. Proportional, so dark sky stays dark.
+    float skyOverbright = 1.0f;
 
     // Per-object lighting (Dark Engine convention: ambient + cell-light-list
     // sum + sun + P$ExtraLight). When disabled, objects render at their
@@ -678,6 +713,27 @@ struct RuntimeState {
             || showVoiceArrows;
     }
 };
+
+// Wrap mode for every diffuse texture (world terrain, object meshes, flowing
+// water): plain REPEAT, which bgfx spells as "no wrap bits set". Named rather
+// than written inline so the four creation sites and the per-frame sampler in
+// prepareFrame() cannot drift apart again.
+//
+// This used to be BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR, which
+// reflects the image on every odd tile. The WR texture projection
+// (buildTexturedMesh / buildLightmappedMesh) emits unbounded, frequently
+// negative UVs — a wall's V typically runs downward from the origin vertex —
+// so which tile a polygon lands on is arbitrary. Under mirroring that decided
+// its orientation: measured over MISS1/MISS2/MISS12, 15–22% of textured solid
+// polygons sit wholly on an odd V tile and rendered upside-down, ~20–24% sit
+// on an odd U tile and rendered left-right reversed, and 58–70% straddle a
+// tile edge and showed a mirror seam partway across the face. Tiling
+// stonework hides all of that; anything with a distinct top and bottom
+// (windows, doors, signage) does not.
+//
+// Do not reintroduce mirroring to hide seams — authored level data assumes
+// repeat, and only repeat puts these textures the right way up.
+static constexpr uint32_t kDiffuseWrap = BGFX_SAMPLER_NONE;
 
 // ── FrameContext — Per-frame computed values ──
 // Returned by prepareFrame(), consumed by each render pass within

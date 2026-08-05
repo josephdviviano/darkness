@@ -162,6 +162,14 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
         registerRawProp("ModelName",   "ModelName", "always");
         registerRawProp("RenderType",  "RenderTyp", "always");
         registerRawProp("RenderAlpha", "RenderAlp", "always");
+        // Self-illumination scale, read per object by ObjectPropParser.
+        registerRawProp("SelfIllum",   "SelfIllum", "always");
+        // Runtime dynamic lights. SelfLitProducer walks P$SelfLit and folds
+        // in P$LightColor; without these registrations the walk finds
+        // nothing, which is precisely why it silently produced no lights
+        // before. LightColor is also read by the animated-light path.
+        registerRawProp("SelfLit",     "SelfLit",   "always");
+        registerRawProp("LightColor",  "LightColor", "always");
         // Scale uses "never" inheritor — kPropertyNoInherit in the original engine.
         // Archetype scales are physics bounding boxes, not visual model scales.
         registerRawProp("ModelScale",  "Scale",     "never");
@@ -349,6 +357,7 @@ static bool loadMissionData(const char *misPath,
     // Parse sky dome parameters from SKYOBJVAR chunk (if present)
     mission.skyParams = parseSkyObjVar(misPath);
     mission.skyDome = buildSkyDome(mission.skyParams);
+    mission.skyGlow = buildSkyGlow(mission.skyParams);
 
     // Parse global fog parameters from FOG chunk (if present)
     mission.fogParams = parseFogChunk(misPath);
@@ -767,6 +776,7 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
 // Sets up 3 views: sky (0), world+objects (1), debug overlay (2).
 // Returns the SDL window, or nullptr on failure.
 static SDL_Window *initWindow(const Darkness::FogParams &fogParams,
+                              int msaaSamples,
                                uint32_t &outSkyClearColor) {
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -801,7 +811,13 @@ static SDL_Window *initWindow(const Darkness::FogParams &fogParams,
     bInit.type = bgfx::RendererType::Count; // auto-detect: Metal/D3D11/OpenGL/Vulkan
     bInit.resolution.width  = WINDOW_WIDTH;
     bInit.resolution.height = WINDOW_HEIGHT;
-    bInit.resolution.reset  = BGFX_RESET_VSYNC;
+    // Backbuffer MSAA covers the direct path only — the one taken when
+    // post-processing is disabled, where the scene draws straight here.
+    // With post-processing on, the scene target carries its own MSAA (see
+    // createPostProcess) and this costs a little memory for nothing; that
+    // is the price of the toggle being live rather than a restart.
+    bInit.resolution.reset  = BGFX_RESET_VSYNC
+                            | Darkness::msaaResetFlag(msaaSamples);
 
 #if BX_PLATFORM_OSX
     bInit.platformData.nwh = wmi.info.cocoa.window;
@@ -1117,14 +1133,16 @@ static bool createGPUResources(const Darkness::MissionData &mission,
         );
         gpu.ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
 
-        // Create bgfx textures with full mip chains from loaded images
+        // Create bgfx textures with full mip chains from loaded images.
+        // Wrap mode: REPEAT (kDiffuseWrap) — see its definition; mirroring
+        // flips the texture on odd tiles.
         for (const auto &kv : mission.loadedTextures) {
             uint8_t idx = kv.first;
             const auto &img = kv.second;
             gpu.textureHandles[idx] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
-                | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
+                | kDiffuseWrap,
                 MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
         std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", gpu.textureHandles.size());
@@ -1137,7 +1155,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
             const auto &img = kv.second;
             gpu.flowTextureHandles[fg] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
-                BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
+                kDiffuseWrap,
                 MipAlphaMode::ALPHA_BLEND, linearMips, sharpMips);
         }
         if (!gpu.flowTextureHandles.empty()) {
@@ -1174,7 +1192,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
             gpu.textureHandles[idx] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
-                | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
+                | kDiffuseWrap,
                 MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
         std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", gpu.textureHandles.size());
@@ -1244,7 +1262,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
             gpu.objTextureHandles[kv.first] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
-                | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
+                | kDiffuseWrap,
                 MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
         if (!gpu.objTextureHandles.empty()) {
@@ -1423,6 +1441,20 @@ static bool createGPUResources(const Darkness::MissionData &mission,
         gpu.skyIndexCount = static_cast<uint32_t>(mission.skyDome.indices.size());
     }
 
+    // ── Create sun/moon glow GPU buffers ──
+    // Independent of which sky is active: the glow sits in sky space, so it
+    // applies to the textured skybox as readily as to the procedural dome.
+    if (!mission.skyGlow.vertices.empty()) {
+        gpu.skyGlowVBH = bgfx::createVertexBuffer(
+            bgfx::copy(mission.skyGlow.vertices.data(),
+                static_cast<uint32_t>(mission.skyGlow.vertices.size() * sizeof(PosColorVertex))),
+            PosColorVertex::layout);
+        gpu.skyGlowIBH = bgfx::createIndexBuffer(
+            bgfx::copy(mission.skyGlow.indices.data(),
+                static_cast<uint32_t>(mission.skyGlow.indices.size() * sizeof(uint16_t))));
+        gpu.skyGlowIndexCount = static_cast<uint32_t>(mission.skyGlow.indices.size());
+    }
+
     // ── Create textured skybox GPU buffers (old sky system) ──
 
     if (meshes.hasSkybox) {
@@ -1544,6 +1576,8 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
         bgfx::destroy(kv.second);
 
     // Sky dome buffers
+    if (bgfx::isValid(gpu.skyGlowVBH)) bgfx::destroy(gpu.skyGlowVBH);
+    if (bgfx::isValid(gpu.skyGlowIBH)) bgfx::destroy(gpu.skyGlowIBH);
     if (bgfx::isValid(gpu.skyVBH)) bgfx::destroy(gpu.skyVBH);
     if (bgfx::isValid(gpu.skyIBH)) bgfx::destroy(gpu.skyIBH);
 

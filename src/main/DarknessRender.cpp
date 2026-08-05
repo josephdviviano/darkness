@@ -52,6 +52,7 @@
 #include "CRFModelLoader.h"
 #include "LightmapAtlas.h"
 #include "SpawnFinder.h"
+#include "SelfLitProducer.h"
 #include "LightingSystem.h"
 #include "ObjectPropParser.h"
 #include "BinMeshParser.h"
@@ -645,15 +646,29 @@ static void renderSky(
 
     // Inline sky fog uniform helper
     float opaqueParams[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
-    // Sky and other non-object passes still feed shaders that read
-    // u_objectLight (fs_basic, fs_textured); pass white so the multiply is
-    // a no-op for those passes.
-    float whiteLight[4] = { 1.0f, 1.0f, 1.0f, 0.0f };
+    // Sky passes feed shaders that read u_objectLight (fs_basic,
+    // fs_textured). At 1.0 the multiply is a no-op, which is the default.
+    //
+    // Above 1.0 it becomes the sky overbright control. The skybox is where
+    // the moon actually lives — it is painted into the PCX faces, not
+    // authored as a SKYOBJVAR glow (only 1 of 15 retail missions supplies a
+    // glow at all, and that one is a 90-degree horizon wash). Texture
+    // samples cap at 1.0, so without this the moon can never reach the
+    // overbright range that bloom responds to.
+    //
+    // A plain multiply is the right tool here rather than a thresholded
+    // boost, because it is proportional: night sky at 0.05 goes to 0.075
+    // and stays visually dark, while a moon at 0.95 crosses to 1.4 and
+    // blooms. The bloom combine's quadratic luminance response then widens
+    // that gap further, so the sky effectively selects its own bright
+    // features without needing a cutoff.
+    const float ob = state.skyOverbright;
+    float skyLight[4] = { ob, ob, ob, 0.0f };
     auto setFogSky = [&]() {
         bgfx::setUniform(gpu.u_fogColor, fc.fogColorArr);
         bgfx::setUniform(gpu.u_fogParams, fc.skyFogArr);
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
-        bgfx::setUniform(gpu.u_objectLight, whiteLight);
+        bgfx::setUniform(gpu.u_objectLight, skyLight);
     };
 
     if (meshes.hasSkybox && bgfx::isValid(gpu.skyboxVBH)) {
@@ -677,6 +692,49 @@ static void renderSky(
         bgfx::setVertexBuffer(0, gpu.skyVBH);
         bgfx::setIndexBuffer(gpu.skyIBH);
         bgfx::setState(skyState);
+        bgfx::submit(0, gpu.flatProgram);
+    }
+
+    // ── Sun/moon glow (SKYOBJVAR glow_*) ──
+    //
+    // Drawn over whichever sky is active. The mesh carries a white-to-black
+    // radial falloff in its vertex colours and fs_basic multiplies that by
+    // u_objectLight, which is a float uniform — so the glow can exceed 1.0
+    // and therefore survives into the HDR target where bloom can find it.
+    // Vertex colours are packed 8-bit and could never express that alone.
+    //
+    // Skipped when the sky is fogged: the glow blends additively, and
+    // fs_basic's fog is a mix() toward fog colour, which for an additive
+    // draw would brighten the whole disc's bounding area instead of
+    // attenuating the glow. Physically the moon should not be visible
+    // through thick fog anyway, and the sky dome is far enough out that
+    // sky fog saturates.
+    if (state.skyGlowEnabled && bgfx::isValid(gpu.skyGlowVBH) && !fc.skyFogged) {
+        const Darkness::SkyParams &sky = mission.skyParams;
+
+        // Authored intensity times the user's tuning multiplier. Pushing
+        // this above 1.0 is the entire mechanism by which the glow blooms.
+        const float gain = sky.glowScale * state.skyGlowIntensity;
+        float glowLight[4] = {
+            sky.glowColor[0] * gain,
+            sky.glowColor[1] * gain,
+            sky.glowColor[2] * gain,
+            0.0f,
+        };
+        float noFog[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+        bgfx::setUniform(gpu.u_fogColor, fc.fogColorArr);
+        bgfx::setUniform(gpu.u_fogParams, noFog);
+        bgfx::setUniform(gpu.u_objectParams, opaqueParams);
+        bgfx::setUniform(gpu.u_objectLight, glowLight);
+
+        bgfx::setTransform(skyModel);
+        bgfx::setVertexBuffer(0, gpu.skyGlowVBH);
+        bgfx::setIndexBuffer(gpu.skyGlowIBH);
+        // Additive, no culling: the fan winding depends on where in the sky
+        // the glow sits, and a light source has no back face worth hiding.
+        bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                     | BGFX_STATE_BLEND_ADD);
         bgfx::submit(0, gpu.flatProgram);
     }
 }
@@ -2889,9 +2947,15 @@ static void renderObjects(
                 // outward-facing normals leave the interior light below
                 // Lambertian's half-space cutoff. The scalar shaders ignore
                 // this slot — they get the same effect via the load-time
-                // baked vertex tint. Future enhancement: multiply by
-                // P$SelfIllum per-object scale (default 1.0).
-                float objAlpha[4] = { finalAlpha, highlight, sm.matIllum, 0.0f };
+                // baked vertex tint.
+                //
+                // Scaled by the object's P$SelfIllum (default 1.0, so a
+                // mission that never sets it renders exactly as before).
+                // Deliberately not clamped at 1: content uses values above
+                // unity to mark a surface emissive, and that is what pushes
+                // it into the overbright range where bloom can see it.
+                const float illum = sm.matIllum * obj.selfIllum;
+                float objAlpha[4] = { finalAlpha, highlight, illum, 0.0f };
 
                 uint64_t drawState = opaquePass ? fc.renderState : translucentState;
 
@@ -3161,6 +3225,10 @@ static bool runBakeWithProgressBar(
 static void registerConsoleSettings(
     Darkness::DebugConsole &dbgConsole,
     Darkness::RuntimeState &state,
+    // Needed by the post_process toggle: enabling the pass is only
+    // meaningful if its GPU resources actually built, and a toggle that
+    // silently does nothing is worse than one that refuses out loud.
+    Darkness::GPUResources &gpu,
     SDL_Window *window,
     const std::string &misPath = "")
 {
@@ -3182,6 +3250,26 @@ static void registerConsoleSettings(
         {"bilinear", "bicubic"},
         [&state]() { return state.lightmapFiltering; },
         [&state, refreshTitle](int v) { state.lightmapFiltering = v; refreshTitle(); });
+
+    dbgConsole.addBool("sky_glow",
+        [&state]() { return state.skyGlowEnabled; },
+        [&state](bool v) { state.skyGlowEnabled = v; },
+        "Sun/moon glow disc from the mission's SKYOBJVAR glow_* fields");
+
+    dbgConsole.addFloat("sky_glow_intensity",
+        PostRange::kSkyGlowMin, PostRange::kSkyGlowMax,
+        [&state]() { return state.skyGlowIntensity; },
+        [&state](float v) { state.skyGlowIntensity = v; },
+        "Multiplies the mission's authored glow_scale. Above ~1 the glow "
+        "exceeds 1.0 in the HDR target and starts to bloom");
+
+    dbgConsole.addFloat("sky_overbright",
+        PostRange::kSkyOverbrightMin, PostRange::kSkyOverbrightMax,
+        [&state]() { return state.skyOverbright; },
+        [&state](float v) { state.skyOverbright = v; },
+        "Sky brightness multiplier (1 = untouched). This is what makes the "
+        "MOON bloom — it lives in the skybox texture, which caps at 1.0. "
+        "Proportional, so dark sky stays dark");
 
     dbgConsole.addBool("portal_culling",
         [&state]() { return state.portalCulling; },
@@ -3458,6 +3546,165 @@ static void registerConsoleSettings(
         [&state]() { return state.waterScrollSpeed; },
         [&state](float v) { state.waterScrollSpeed = v; },
         "Water UV scroll speed (world units/s)");
+
+    // ── Post-processing ──
+    //
+    // Bounds come from PostRange in RenderConfig.h, the same constants the
+    // YAML clamp uses, so the console cannot offer a value the config file
+    // could not persist. Naming mirrors graphics.post_process.* in YAML.
+
+    dbgConsole.setGroup("Post-processing");
+
+    dbgConsole.addBool("post_process",
+        [&state]() { return state.postProcess.enabled; },
+        [&state, &gpu](bool v) {
+            // Refuse to claim the pass is on when its resources failed to
+            // build — otherwise every knob below would silently do nothing.
+            if (v && !gpu.postProcess.valid()) {
+                std::fprintf(stderr,
+                    "[FALLBACK] postprocess: cannot enable — the scene target "
+                    "failed to build at startup. Staying on the direct path.\n");
+                return;
+            }
+            state.postProcess.enabled = v;
+        },
+        "Route the scene through the HDR target and composite pass "
+        "(tone mapping + colour correction)");
+
+    dbgConsole.addCategorical("tonemap",
+        {"none", "reinhard", "aces"},
+        [&state]() { return static_cast<int>(state.postProcess.tonemap); },
+        [&state](int v) {
+            state.postProcess.tonemap = static_cast<Darkness::ToneMapOperator>(v);
+        });
+
+    dbgConsole.addFloat("exposure",
+        PostRange::kExposureMin, PostRange::kExposureMax,
+        [&state]() { return state.postProcess.exposure; },
+        [&state](float v) { state.postProcess.exposure = v; },
+        "Linear multiplier applied before tone mapping");
+
+    dbgConsole.addFloat("cc_brightness",
+        PostRange::kBrightnessMin, PostRange::kBrightnessMax,
+        [&state]() { return state.postProcess.brightness; },
+        [&state](float v) { state.postProcess.brightness = v; },
+        "Additive brightness offset (0 = unchanged)");
+
+    dbgConsole.addFloat("cc_contrast",
+        PostRange::kContrastMin, PostRange::kContrastMax,
+        [&state]() { return state.postProcess.contrast; },
+        [&state](float v) { state.postProcess.contrast = v; },
+        "Contrast about the 0.5 pivot (1 = unchanged)");
+
+    dbgConsole.addFloat("cc_saturation",
+        PostRange::kSaturationMin, PostRange::kSaturationMax,
+        [&state]() { return state.postProcess.saturation; },
+        [&state](float v) { state.postProcess.saturation = v; },
+        "Colour saturation (0 = greyscale, 1 = unchanged)");
+
+    dbgConsole.addFloat("cc_gamma",
+        PostRange::kGammaMin, PostRange::kGammaMax,
+        [&state]() { return state.postProcess.gamma; },
+        [&state](float v) { state.postProcess.gamma = v; },
+        "Output gamma, applied last (1 = unchanged)");
+
+    dbgConsole.addFloat("cc_filter_r",
+        PostRange::kFilterMin, PostRange::kFilterMax,
+        [&state]() { return state.postProcess.filterR; },
+        [&state](float v) { state.postProcess.filterR = v; },
+        "RGB colour filter, red channel (1 = unchanged)");
+
+    dbgConsole.addFloat("cc_filter_g",
+        PostRange::kFilterMin, PostRange::kFilterMax,
+        [&state]() { return state.postProcess.filterG; },
+        [&state](float v) { state.postProcess.filterG = v; },
+        "RGB colour filter, green channel (1 = unchanged)");
+
+    dbgConsole.addFloat("cc_filter_b",
+        PostRange::kFilterMin, PostRange::kFilterMax,
+        [&state]() { return state.postProcess.filterB; },
+        [&state](float v) { state.postProcess.filterB = v; },
+        "RGB colour filter, blue channel (1 = unchanged)");
+
+    // crt = Rec.601-era weights (0.30, 0.58, 0.12) — the colour intent the
+    // 1999 art was authored against, and identical to HPL2's shipped bloom
+    // vector. lcd = Rec.709 (0.2126, 0.7152, 0.0722) — how a modern display
+    // actually behaves. Drives both the saturation pivot and bloom intensity.
+    dbgConsole.addCategorical("luma_mode",
+        {"crt", "lcd"},
+        [&state]() { return static_cast<int>(state.postProcess.lumaMode); },
+        [&state](int v) {
+            state.postProcess.lumaMode = static_cast<Darkness::LumaMode>(v);
+        });
+
+    dbgConsole.addBool("bloom",
+        [&state]() { return state.postProcess.bloomEnabled; },
+        [&state, &gpu](bool v) {
+            if (v && !gpu.postProcess.bloomValid()) {
+                std::fprintf(stderr,
+                    "[FALLBACK] postprocess: cannot enable bloom — its blur "
+                    "targets failed to build at startup.\n");
+                return;
+            }
+            state.postProcess.bloomEnabled = v;
+        },
+        "Quarter-res thresholdless bloom (HPL2/Amnesia construction)");
+
+    // The two styles have disjoint parameter sets — the knobs below are
+    // labelled with which style reads them, because a knob that silently
+    // does nothing is worse than one that is absent.
+    dbgConsole.addCategorical("bloom_style",
+        {"amnesia", "newdark"},
+        [&state]() { return static_cast<int>(state.postProcess.bloomStyle); },
+        [&state](int v) {
+            state.postProcess.bloomStyle = static_cast<Darkness::BloomStyle>(v);
+        });
+
+    dbgConsole.addFloat("bloom_intensity",
+        PostRange::kBloomIntenMin, PostRange::kBloomIntenMax,
+        [&state]() { return state.postProcess.bloomIntensity; },
+        [&state](float v) { state.postProcess.bloomIntensity = v; },
+        "[amnesia] Bloom strength — scales the luminance vector (1 = HPL2 default)");
+
+    dbgConsole.addFloat("bloom_blur_size",
+        PostRange::kBloomBlurMin, PostRange::kBloomBlurMax,
+        [&state]() { return state.postProcess.bloomBlurSize; },
+        [&state](float v) { state.postProcess.bloomBlurSize = v; },
+        "[both] Bloom blur radius multiplier (1 = HPL2 default, and the "
+        "kernel's designed tap spacing — above ~1.3 it aliases)");
+
+    dbgConsole.addFloat("bloom_threshold",
+        PostRange::kNdThresholdMin, PostRange::kNdThresholdMax,
+        [&state]() { return state.postProcess.ndThreshold; },
+        [&state](float v) { state.postProcess.ndThreshold = v; },
+        "[newdark] Bright-pass cutoff (0.6 = NewDark default). "
+        "The amnesia style has no threshold at all");
+
+    dbgConsole.addFloat("bloom_prescale",
+        PostRange::kNdPrescaleMin, PostRange::kNdPrescaleMax,
+        [&state]() { return state.postProcess.ndPrescale; },
+        [&state](float v) { state.postProcess.ndPrescale = v; },
+        "[newdark] Intensity multiplier applied before blurring (1 = NewDark default)");
+
+    dbgConsole.addFloat("bloom_scale",
+        PostRange::kNdScaleMin, PostRange::kNdScaleMax,
+        [&state]() { return state.postProcess.ndScale; },
+        [&state](float v) { state.postProcess.ndScale = v; },
+        "[newdark] Intensity multiplier applied after blurring (5 = NewDark default)");
+
+    dbgConsole.addFloat("bloom_saturation",
+        PostRange::kNdSaturationMin, PostRange::kNdSaturationMax,
+        [&state]() { return state.postProcess.ndSaturation; },
+        [&state](float v) { state.postProcess.ndSaturation = v; },
+        "[newdark] Saturation of the glow itself, 0 = greyscale (0.7 = NewDark default)");
+
+    dbgConsole.addFloat("bloom_iterations",
+        static_cast<float>(PostRange::kBloomIterMin),
+        static_cast<float>(PostRange::kBloomIterMax),
+        [&state]() { return static_cast<float>(state.postProcess.bloomIterations); },
+        [&state](float v) { state.postProcess.bloomIterations = static_cast<int>(v); },
+        "[both] Bloom blur iterations, each H+V (2 = HPL2 default). "
+        "Radius comes from here, not from a wider step");
 
     // ── Audio ──
 
@@ -4713,24 +4960,25 @@ static Darkness::FrameContext prepareFrame(
     // Texture sampler flags for the current filtering mode (shared by both views).
     // UINT32_MAX = use texture's baked POINT flags (default).
     // Other modes override with explicit sampler flags per draw call.
-    // Two variants: MIRROR wrap (world/object textures), CLAMP wrap (skybox).
+    // Two variants: REPEAT wrap (world/object textures, see kDiffuseWrap),
+    // CLAMP wrap (skybox — its faces must not bleed across the cube seams).
     switch (state.filterMode) {
     case 0: // Point: use texture's baked POINT flags
         fc.texSampler = UINT32_MAX;
         fc.skySampler = UINT32_MAX;
         break;
     case 1: // Bilinear: linear min/mag, point mip
-        fc.texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR
+        fc.texSampler = kDiffuseWrap
                       | BGFX_SAMPLER_MIP_POINT;
         fc.skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
                       | BGFX_SAMPLER_MIP_POINT;
         break;
     case 2: // Trilinear: linear min/mag/mip
-        fc.texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR;
+        fc.texSampler = kDiffuseWrap;
         fc.skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
         break;
     case 3: // Anisotropic: aniso min/mag, linear mip
-        fc.texSampler = BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR
+        fc.texSampler = kDiffuseWrap
                       | BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
         fc.skySampler = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
                       | BGFX_SAMPLER_MIN_ANISOTROPIC | BGFX_SAMPLER_MAG_ANISOTROPIC;
@@ -4973,6 +5221,32 @@ int main(int argc, char *argv[]) {
     state.uvDistortion     = cfg.uvDistortion;
     state.waterRotation    = cfg.waterRotation;
     state.waterScrollSpeed = cfg.waterScrollSpeed;
+    state.postProcess.enabled    = cfg.postProcess;
+    state.postProcess.exposure   = cfg.ppExposure;
+    state.postProcess.tonemap    =
+        static_cast<Darkness::ToneMapOperator>(cfg.ppToneMap);
+    state.postProcess.brightness = cfg.ppBrightness;
+    state.postProcess.contrast   = cfg.ppContrast;
+    state.postProcess.saturation = cfg.ppSaturation;
+    state.postProcess.filterR    = cfg.ppFilterR;
+    state.postProcess.filterG    = cfg.ppFilterG;
+    state.postProcess.filterB    = cfg.ppFilterB;
+    state.postProcess.gamma      = cfg.ppGamma;
+    state.postProcess.lumaMode   =
+        static_cast<Darkness::LumaMode>(cfg.ppLumaMode);
+    state.postProcess.bloomEnabled    = cfg.ppBloom;
+    state.postProcess.bloomStyle      =
+        static_cast<Darkness::BloomStyle>(cfg.ppBloomStyle);
+    state.postProcess.bloomIterations = cfg.ppBloomIterations;
+    state.postProcess.bloomBlurSize   = cfg.ppBloomBlurSize;
+    state.postProcess.bloomIntensity  = cfg.ppBloomIntensity;
+    state.postProcess.ndThreshold     = cfg.ppNdThreshold;
+    state.postProcess.ndPrescale      = cfg.ppNdPrescale;
+    state.postProcess.ndScale         = cfg.ppNdScale;
+    state.postProcess.ndSaturation    = cfg.ppNdSaturation;
+    state.skyGlowEnabled   = cfg.skyGlow;
+    state.skyGlowIntensity = cfg.skyGlowIntensity;
+    state.skyOverbright    = cfg.skyOverbright;
 
     // ── Mandatory game-resource paths ──
     // The renderer needs both snd.crf (sounds) and the schema directory
@@ -5686,6 +5960,35 @@ int main(int argc, char *argv[]) {
             return Darkness::raycastWorld(mission.wrData, from, to, hit);
         });
 
+    // Inject the light-level probe — the gameplay-facing answer to "how lit
+    // is this spot", read by AI vision and (eventually) the light gem.
+    //
+    // ObjectIlluminator::compute() is already exactly this query: it sums
+    // ambient, the cell's static light list with shadow-cache visibility,
+    // the sun, P$ExtraLight, and — the part that matters here — the
+    // per-frame DynamicLightList, each dynamic light gated by a fresh
+    // portal raycast and 1/r attenuated. Reusing it means AI and the
+    // renderer can never disagree about whether a spot is lit, which is
+    // the failure mode worth designing out.
+    worldQuery->setLightLevelProbe(
+        [&state](const Darkness::Vector3 &pos) -> float {
+            // Sentinel object id: compute() keys its shadow cache by id, and
+            // the probe follows the player around rather than belonging to
+            // any object. A dedicated id keeps it from evicting or
+            // corrupting a real object's cached visibility.
+            static constexpr int32_t kLightProbeId = -0x4C50;  // 'LP'
+            const Darkness::Vector3 rgb =
+                state.objectIlluminator.compute(kLightProbeId, pos, 0.0f);
+
+            // Scalar luminance. Deliberately FIXED weights rather than the
+            // luma_mode the composite pass uses: that setting is a display
+            // preference, and stealth visibility must not change because a
+            // player picked CRT over LCD. Rec.601 for consistency with the
+            // era the content was authored in.
+            return std::max(0.0f, std::min(1.0f,
+                rgb.x * 0.30f + rgb.y * 0.58f + rgb.z * 0.12f));
+        });
+
     // Diagnostic raycaster for the [PATH] periodic|spike block in AudioService.
     // Lets the diagnostic answer "is the voice's nearest-probe LOS actually
     // blocked by BSP geometry?" — distinguishes a wall-embedded source from
@@ -6371,7 +6674,8 @@ int main(int argc, char *argv[]) {
     Darkness::GPUResources gpu;
 
     // state.skyClearColor set by initWindow
-    SDL_Window *window = initWindow(mission.fogParams, state.skyClearColor);
+    SDL_Window *window = initWindow(mission.fogParams, cfg.msaa,
+                                    state.skyClearColor);
     if (!window) return 1;
 
     // ── Create all GPU resources: shaders, lightmap atlas, world/object/sky buffers ──
@@ -6380,6 +6684,50 @@ int main(int argc, char *argv[]) {
                             camX, camY, camZ)) {
         shutdownWindow(window);
         return 1;
+    }
+
+    // ── Post-process: HDR scene target + composite pass ──
+    //
+    // Built unconditionally, not only when the config enables it, so the
+    // debug console can toggle post-processing live without recreating GPU
+    // resources mid-frame. The cost of an idle target is memory, not
+    // bandwidth: when disabled, bindSceneTarget() points the scene views
+    // straight at the backbuffer and the composite is never submitted.
+    //
+    // A failure here is not fatal — the renderer falls back to the direct
+    // path it used before this pass existed, having already said so.
+    {
+        const bgfx::RendererType::Enum rendererType = bgfx::getRendererType();
+        bgfx::ProgramHandle compositeProgram = bgfx::createProgram(
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_composite"),
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_composite"),
+            true);
+        // Bloom blur reuses vs_composite — same fullscreen triangle, same
+        // varying def, so only the fragment stage differs.
+        bgfx::ProgramHandle blurProgram = bgfx::createProgram(
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_composite"),
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_bloom_blur"),
+            true);
+        bgfx::ProgramHandle extractProgram = bgfx::createProgram(
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_composite"),
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_bloom_extract"),
+            true);
+
+        if (!Darkness::createPostProcess(gpu.postProcess,
+                                         static_cast<uint16_t>(WINDOW_WIDTH),
+                                         static_cast<uint16_t>(WINDOW_HEIGHT),
+                                         compositeProgram, blurProgram,
+                                         extractProgram, cfg.msaa)) {
+            Darkness::destroyPostProcess(gpu.postProcess);
+            if (state.postProcess.enabled) {
+                std::fprintf(stderr,
+                    "[FALLBACK] postprocess: graphics.post_process.enabled was "
+                    "true in the config but the pass could not be created — "
+                    "continuing with the direct-to-backbuffer path. Tone "
+                    "mapping and colour correction will have no effect.\n");
+                state.postProcess.enabled = false;
+            }
+        }
     }
 
     // ── Create acoustic mesh debug wireframe buffer (after bgfx init) ──
@@ -6608,7 +6956,7 @@ int main(int argc, char *argv[]) {
     // ── Debug console for runtime settings management ──
     // Opened with backtick (`), provides tab-completion and value editing.
     Darkness::DebugConsole dbgConsole;
-    registerConsoleSettings(dbgConsole, state, window, misPath);
+    registerConsoleSettings(dbgConsole, state, gpu, window, misPath);
 
     updateTitleBar(window, state);
 
@@ -7029,6 +7377,14 @@ int main(int argc, char *argv[]) {
             auto fc = prepareFrame(state, mission);
             updateTitleBar(window, state);
 
+            // ── Post-process target binding ──
+            // Re-applied every frame (rather than latched at init) so the
+            // console toggle takes effect live. When inactive this binds the
+            // backbuffer, which is the pre-post-process path exactly.
+            const bool ppActive = state.postProcess.enabled &&
+                                  gpu.postProcess.valid();
+            Darkness::bindSceneTarget(gpu.postProcess, ppActive);
+
             // ── View 0: Sky pass ──
             renderSky(fc, meshes, gpu, mission, state);
 
@@ -7036,12 +7392,32 @@ int main(int argc, char *argv[]) {
             renderWorld(fc, meshes, gpu, mission, state);
 
             // ── Object meshes ──
-            // Reset the dynamic-light list once per frame before drawing
+            // Rebuild the dynamic-light list once per frame before drawing
             // objects. Gameplay systems (player flashlight / fire arrows /
-            // mage spells / creature glow) are responsible for re-adding
-            // their lights each frame; absent any caller, the list stays
-            // empty and only static-light + ambient illumination apply.
+            // mage spells / creature glow) re-add their lights each frame;
+            // the standing producer walks P$SelfLit objects, whose light is
+            // deliberately NOT baked into the lightmap and so must be
+            // contributed at runtime.
             state.dynamicLights.reset();
+            {
+                auto propSvc = GET_SERVICE(Darkness::PropertyService);
+                auto objSvc  = GET_SERVICE(Darkness::ObjectService);
+                Darkness::produceSelfLitLights(propSvc.get(), objSvc.get(),
+                                               state.objectStates,
+                                               state.dynamicLights);
+                // Report the count once. This producer existed for months
+                // while being entirely unreferenced, and the failure mode
+                // was silence — an empty light list looks identical to a
+                // mission that genuinely has no self-lit objects. Say which
+                // it is, once, so the distinction is never guesswork again.
+                static bool reported = false;
+                if (!reported) {
+                    reported = true;
+                    std::fprintf(stderr,
+                        "SelfLit: %d dynamic light(s) produced from P$SelfLit "
+                        "objects\n", state.dynamicLights.count());
+                }
+            }
             renderObjects(fc, gpu, mission, state);
 
             // ── Water surfaces ──
@@ -7049,6 +7425,20 @@ int main(int argc, char *argv[]) {
 
             // ── Debug raycast visualization (view 2) ──
             renderDebugOverlay(fc, gpu, mission, state);
+
+            // ── Bloom blur chain, then composite to the backbuffer ──
+            // Runs after every scene view has been submitted. bgfx orders
+            // views by id, so the blur passes and then the composite resolve
+            // last regardless of submit order.
+            // bgfx's debug-text overlay draws to the backbuffer on its own
+            // and is therefore never tone mapped — the console stays legible
+            // whatever the colour grade is doing.
+            if (ppActive) {
+                const bool bloomActive =
+                    Darkness::renderBloom(gpu.postProcess, state.postProcess);
+                Darkness::submitComposite(gpu.postProcess, state.postProcess,
+                                          bloomActive);
+            }
 
             // Frob target indicator + debug console overlay.
             // Both use bgfx debug text, which requires BGFX_DEBUG_TEXT.
@@ -7399,6 +7789,7 @@ int main(int argc, char *argv[]) {
     // Flush and close the head log before destroying physics / GPU resources.
     closeHeadLog(state);
 
+    Darkness::destroyPostProcess(gpu.postProcess);
     destroyGPUResources(gpu);
     shutdownWindow(window);
 

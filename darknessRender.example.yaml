@@ -33,6 +33,117 @@ graphics:
   # Sharpen mip levels to preserve detail at distance (default: false)
   sharp_mips: false
 
+  # Multisample anti-aliasing: 0 (off) | 2 | 4 | 8 | 16  (default: 4)
+  # Thief geometry is almost entirely hard edges — stair rails, window
+  # mullions, crate corners — so this is the single largest uniform image
+  # quality lift available. Mirrors NewDark's `multisampletype <2-16>`.
+  #
+  # Startup-only: changing it needs new render targets and a bgfx reset, so
+  # it is deliberately absent from the debug console. Drop to 0 or 2 if the
+  # GPU is struggling.
+  msaa: 4
+
+  # Sky glow / sky overbright
+  sky_glow:
+    # Sun/moon glow disc from the mission's SKYOBJVAR glow_* fields.
+    # Note: of the 15 retail T2 missions, only MISS1 authors a glow, and
+    # it is a wide dim horizon wash rather than a moon. (default: true)
+    enabled: true
+
+    # Multiplies the mission's authored glow_scale (default: 1.0)
+    intensity: 1.0
+
+    # Sky brightness multiplier (default: 1.0 = untouched).
+    # The knob that makes the MOON bloom: the moon is painted into the
+    # skybox texture and caps at 1.0, so it needs lifting past unity to
+    # register with bloom. Proportional, so dark sky stays dark.
+    # Try 1.3-1.8; beyond ~2 the sky looks lifted.
+    sky_overbright: 1.0
+
+  # ── Post-processing ──
+  # Routes the scene through a floating-point (RGBA16F) target before
+  # resolving to the display, then applies tone mapping and colour
+  # correction in one fullscreen pass.
+  #
+  # Why the HDR target matters: the lightmapped world shader computes
+  # diffuse * lightmap * 2.0 — the Dark Engine's overbright convention.
+  # Drawing straight to an 8-bit backbuffer clamps everything above 1.0
+  # flat. The float target keeps that headroom so tone mapping has real
+  # highlight range to roll off.
+  #
+  # Every default below is the identity transform: `enabled: true` with
+  # `tonemap: none` is bit-identical to `enabled: false`. All values are
+  # live-editable in the debug console (backtick), "Post-processing" group.
+  post_process:
+    # Master toggle (default: false — original-fidelity output)
+    enabled: false
+
+    # Tone-mapping operator: none | reinhard | aces (default: none)
+    #   none     = clamp only; identical to the pre-post-process image
+    #   reinhard = c / (1 + c); simple, desaturates highlights
+    #   aces     = filmic curve with a proper highlight shoulder
+    tonemap: none
+
+    # Linear multiplier applied before tone mapping (0.0-8.0, default: 1.0)
+    exposure: 1.0
+
+    # Colour correction, applied after tone mapping. Names, order and
+    # defaults follow NewDark's software colour-correction vars.
+    brightness: 0.0    # additive offset (-1.0-1.0, default: 0.0)
+    contrast:   1.0    # about the 0.5 pivot (0.0-4.0, default: 1.0)
+    saturation: 1.0    # 0 = greyscale (0.0-4.0, default: 1.0)
+    gamma:      1.0    # applied last (0.1-4.0, default: 1.0)
+
+    # RGB colour filter [r, g, b], each 0.0-1.0 (default: [1, 1, 1])
+    # Sepia, for example: saturation 0.25 with rgb_filter [1.0, 0.7, 0.3]
+    rgb_filter: [1.0, 1.0, 1.0]
+
+    # Luminance weighting - "what counts as bright". Drives both the
+    # saturation pivot and the bloom intensity term. (default: crt)
+    #   crt = (0.30, 0.58, 0.12), Rec.601-era. The colour intent Thief 2's
+    #         textures were authored against in 1999.
+    #   lcd = (0.2126, 0.7152, 0.0722), Rec.709 - how a modern display
+    #         actually behaves. Weights green harder.
+    luma_mode: crt
+
+    # Bloom. Construction follows HPL2 (Amnesia: The Dark Descent):
+    # quarter-res ping-pong blur buffers, N iterations of separable H+V
+    # Gaussian, and a combine with NO bright-pass threshold - the blur is
+    # weighted by its own luminance, so response is quadratic in brightness.
+    #
+    # Two deliberate divergences from HPL2: float buffers rather than 8-bit,
+    # and bloom added BEFORE tone mapping rather than last, so glows are
+    # exposed and rolled off with the rest of the image.
+    bloom:
+      enabled: false     # (default: false)
+
+      # Which engine's bloom construction: amnesia | newdark (default: amnesia)
+      #   amnesia = HPL2. No threshold; blur weighted by its own luminance,
+      #             so glow fades in continuously. Soft and diffuse.
+      #   newdark = NewDark 1.28. Hard threshold, then desaturate and scale
+      #             hard. Only the brightest surfaces glow, but strongly.
+      # iterations and blur_size are SHARED (the blur kernel); intensity is
+      # amnesia-only; threshold/prescale/scale/saturation are newdark-only.
+      style: amnesia
+
+      iterations: 2      # [both] H+V passes, 1-4 (HPL2 ships 2). Radius
+                         #        comes from here, not from a wider step.
+      blur_size: 1.0     # [both] blur radius multiplier (HPL2 ships 1.0 =
+                         #        the kernel's designed tap spacing; above
+                         #        ~1.3 it aliases and is converted into
+                         #        extra iterations instead)
+      intensity: 1.0     # [amnesia] scales the luminance vector (HPL2 ships 1.0)
+
+      # [newdark] NewDark 1.28's own documented defaults
+      threshold:  0.6    # min channel value to be included in bloom (0-1)
+      prescale:   1.0    # intensity multiplier applied BEFORE blurring
+      scale:      5.0    # intensity multiplier applied AFTER blurring
+      saturation: 0.7    # saturation of the glow itself (0 = greyscale)
+      # NewDark's bloom_range is deliberately not implemented - the radius
+      # it asks for exceeds what this kernel expresses cleanly, and chasing
+      # it caused visible grain. The newdark style is therefore tighter than
+      # nominal: same decision about WHAT glows, smaller spread.
+
 water:
   # Vertex wave displacement amplitude in world units (default: 0.3)
   # 0 = perfectly flat water, higher = more dramatic waves

@@ -985,6 +985,23 @@ struct SkyParams {
     float seventyColor[3];        // 70 degrees from pole
     float horizonColor[3];        // at the horizon (90 degrees)
     float dipColor[3];            // below horizon
+
+    // ── Remaining SKYOBJVAR fields ──
+    // Every one of these used to be read purely to advance the file cursor
+    // and then discarded. They are kept now so nothing in the chunk is
+    // thrown away, even where we do not yet act on it.
+    float atmosRadius;            // atmosphere shell radius (unused)
+    float earthRadius;            // planet radius (unused)
+    float clipLat;                // sky clip latitude, degrees (unused)
+
+    // Sun/moon glow. Drives the glow disc drawn into the sky pass.
+    bool  hasGlow;                // true when the chunk supplied glow data
+    float glowColor[3];           // glow tint, 0..1
+    float glowLat;                // latitude, degrees: 0 = zenith, 90 = horizon
+    float glowLon;                // longitude, degrees around the compass
+    float glowAng;                // angular RADIUS of the glow disc, degrees
+    float glowScale;              // authored intensity scale
+    uint32_t glowMethod;          // semantics undocumented — see buildSkyGlow
 };
 
 // Default sky colours — dark blue-grey for Thief 2's nighttime atmosphere
@@ -1002,6 +1019,18 @@ inline SkyParams defaultSkyParams() {
     p.seventyColor[0]    = 0.30f; p.seventyColor[1]    = 0.40f; p.seventyColor[2]    = 0.60f;
     p.horizonColor[0]    = 0.50f; p.horizonColor[1]    = 0.55f; p.horizonColor[2]    = 0.60f;
     p.dipColor[0]        = 0.25f; p.dipColor[1]        = 0.25f; p.dipColor[2]        = 0.30f;
+
+    // No glow unless a SKYOBJVAR chunk supplies one — the procedural dome is
+    // a bare gradient with no sun or moon in it, so inventing a glow here
+    // would put a light source in the sky that the mission never authored.
+    p.atmosRadius = 0.0f;
+    p.earthRadius = 0.0f;
+    p.clipLat     = 0.0f;
+    p.hasGlow     = false;
+    p.glowColor[0] = 1.0f; p.glowColor[1] = 1.0f; p.glowColor[2] = 1.0f;
+    p.glowLat = 0.0f; p.glowLon = 0.0f;
+    p.glowAng = 0.0f; p.glowScale = 0.0f;
+    p.glowMethod = 0;
 
     return p;
 }
@@ -1053,7 +1082,7 @@ inline SkyParams parseSkyObjVar(const char *misPath) {
             chunk->readElem(&colors[i][2], sizeof(float));
         }
 
-        // Read glow parameters (not used yet but consume for completeness)
+        // Read glow parameters — these drive the sky glow disc (buildSkyGlow)
         chunk->readElem(&glowColor[0], sizeof(float));
         chunk->readElem(&glowColor[1], sizeof(float));
         chunk->readElem(&glowColor[2], sizeof(float));
@@ -1078,8 +1107,41 @@ inline SkyParams parseSkyObjVar(const char *misPath) {
             std::memcpy(params.horizonColor, colors[3], sizeof(float) * 3);
             std::memcpy(params.dipColor, colors[4], sizeof(float) * 3);
 
+            // Carry the remaining fields rather than discarding them.
+            params.atmosRadius = atmosRadius;
+            params.earthRadius = earthRadius;
+            params.clipLat     = clipLat;
+
+            std::memcpy(params.glowColor, glowColor, sizeof(float) * 3);
+            params.glowLat    = glowLat;
+            params.glowLon    = glowLon;
+            params.glowAng    = glowAng;
+            params.glowScale  = glowScale;
+            params.glowMethod = glowMethod;
+
+            // A glow only exists if it has both a non-zero angular size and
+            // a non-zero intensity. Missions that authored no sun or moon
+            // leave these at 0, and drawing a zero-size disc would be a
+            // wasted draw call at best.
+            params.hasGlow = (glowAng > 0.0f) && (glowScale > 0.0f);
+
             std::fprintf(stderr, "SKYOBJVAR: lat=%d lon=%d dip=%.1f\n",
                          params.numLatPoints, params.numLonPoints, params.dipAngle);
+
+            // Log the raw glow values. Their units are not documented
+            // anywhere we can cite, so this is the evidence for whether the
+            // degrees assumption in buildSkyGlow holds against real
+            // missions — a glow_lat of 0.6 would mean radians, not degrees.
+            std::fprintf(stderr,
+                "SKYOBJVAR glow: color=(%.3f,%.3f,%.3f) lat=%.3f lon=%.3f "
+                "ang=%.3f scale=%.3f method=%u clip_lat=%.3f -> %s\n",
+                static_cast<double>(params.glowColor[0]),
+                static_cast<double>(params.glowColor[1]),
+                static_cast<double>(params.glowColor[2]),
+                static_cast<double>(glowLat), static_cast<double>(glowLon),
+                static_cast<double>(glowAng), static_cast<double>(glowScale),
+                glowMethod, static_cast<double>(clipLat),
+                params.hasGlow ? "ACTIVE" : "no glow authored");
         } else {
             std::fprintf(stderr, "SKYOBJVAR: new sky disabled, using defaults\n");
         }
@@ -1095,6 +1157,125 @@ struct SkyDome {
     std::vector<PosColorVertex> vertices;
     std::vector<uint16_t> indices;
 };
+
+/// Build the sun/moon glow disc from SKYOBJVAR's glow_* fields.
+///
+/// A triangle fan on the sky sphere, centred on (glow_lat, glow_lon) with an
+/// angular radius of glow_ang. Vertex colour carries the radial falloff —
+/// white at the centre fading to black at the rim — and the actual glow
+/// colour arrives at draw time through u_objectLight, which is a float
+/// uniform and can therefore exceed 1.0. That is the whole point: vertex
+/// colours are packed 8-bit and cannot represent overbright, but bloom only
+/// triggers on values above 1.0.
+///
+/// The falloff is squared to concentrate energy near the centre. A linear
+/// ramp reads as a flat disc with a hard-ish edge; squaring gives the soft
+/// core-and-halo shape a light source actually has.
+///
+/// UNITS ASSUMPTION: glow_lat / glow_lon / glow_ang are treated as DEGREES,
+/// consistent with dip_angle in the same chunk, which is unambiguously
+/// degrees (default 10.0). No citable documentation of these fields exists,
+/// so parseSkyObjVar logs the raw values — if a mission reports glow_lat
+/// around 0.6 rather than around 35, they are radians and this is wrong.
+///
+/// glow_method is carried through but not differentiated: its semantics are
+/// undocumented, and guessing at alternate falloff models would be inventing
+/// behaviour rather than reproducing it. Logged so a pattern across missions
+/// can be spotted later.
+inline SkyDome buildSkyGlow(const SkyParams &sky) {
+    SkyDome glow;
+    if (!sky.hasGlow)
+        return glow;
+
+    const float PI = 3.14159265f;
+    const float DEG2RAD = PI / 180.0f;
+
+    // Slightly inside the dome's radius so it cannot z-fight or poke through;
+    // neither pass writes depth, but draw order alone decides this and the
+    // glow is submitted after the dome.
+    const float radius = 990.0f;
+
+    const float latRad = sky.glowLat * DEG2RAD;
+    const float lonRad = sky.glowLon * DEG2RAD;
+    const float angRad = sky.glowAng * DEG2RAD;
+
+    // Sky basis matching buildSkyDome: lat 0 = +Z (zenith), lat 90 = horizon,
+    // lon sweeping around the XY plane. Dark Engine is Z-up.
+    const float sinLat = std::sin(latRad), cosLat = std::cos(latRad);
+    const Vector3 centre(sinLat * std::cos(lonRad),
+                         sinLat * std::sin(lonRad),
+                         cosLat);
+
+    // Any two vectors perpendicular to the centre direction span the disc.
+    // Pick the world axis least aligned with the centre so the cross product
+    // is well conditioned — using a fixed axis would degenerate when the glow
+    // sits at the zenith, which is exactly where a moon often is.
+    Vector3 helper(0.0f, 0.0f, 1.0f);
+    if (std::fabs(centre.z) > 0.9f)
+        helper = Vector3(1.0f, 0.0f, 0.0f);
+    const Vector3 tangent  = glm::normalize(glm::cross(helper, centre));
+    const Vector3 binormal = glm::normalize(glm::cross(centre, tangent));
+
+    const int kSegments = 32;
+    // Concentric rings, not a single fan: vertex colour interpolates
+    // linearly, so one fan can only ever produce a linear ramp. Rings let
+    // the falloff curve be sampled properly.
+    const int kRings = 6;
+
+    // Centre vertex: full brightness.
+    const Vector3 c = centre * radius;
+    glow.vertices.push_back({ c.x, c.y, c.z, packABGR(1.0f, 1.0f, 1.0f) });
+
+    for (int ring = 1; ring <= kRings; ++ring) {
+        const float rFrac = static_cast<float>(ring) / static_cast<float>(kRings);
+        const float ringAng = angRad * rFrac;
+        // Squared falloff — concentrates energy in the core. A linear ramp
+        // reads as a flat disc with a hard-ish edge; this gives the
+        // core-and-halo shape a real light source has.
+        const float bright = (1.0f - rFrac) * (1.0f - rFrac);
+        const uint32_t col = packABGR(bright, bright, bright);
+
+        for (int i = 0; i < kSegments; ++i) {
+            const float t = static_cast<float>(i) / static_cast<float>(kSegments)
+                          * 2.0f * PI;
+            // Spherical offset: rotate the centre direction toward the rim
+            // direction, rather than building a flat disc in the tangent
+            // plane. Keeps every vertex exactly on the sky sphere, which
+            // matters for wide glows where a flat disc would visibly bulge.
+            const Vector3 rimDir = tangent * std::cos(t) + binormal * std::sin(t);
+            const Vector3 dir = centre * std::cos(ringAng)
+                              + rimDir * std::sin(ringAng);
+            const Vector3 p = dir * radius;
+            glow.vertices.push_back({ p.x, p.y, p.z, col });
+        }
+    }
+
+    // Fan from the centre to the innermost ring.
+    for (int i = 0; i < kSegments; ++i) {
+        const int next = (i + 1) % kSegments;
+        glow.indices.push_back(0);
+        glow.indices.push_back(static_cast<uint16_t>(1 + i));
+        glow.indices.push_back(static_cast<uint16_t>(1 + next));
+    }
+
+    // Quad strips between consecutive rings.
+    for (int ring = 1; ring < kRings; ++ring) {
+        const int inner = 1 + (ring - 1) * kSegments;
+        const int outer = 1 + ring * kSegments;
+        for (int i = 0; i < kSegments; ++i) {
+            const int next = (i + 1) % kSegments;
+            glow.indices.push_back(static_cast<uint16_t>(inner + i));
+            glow.indices.push_back(static_cast<uint16_t>(outer + i));
+            glow.indices.push_back(static_cast<uint16_t>(outer + next));
+
+            glow.indices.push_back(static_cast<uint16_t>(inner + i));
+            glow.indices.push_back(static_cast<uint16_t>(outer + next));
+            glow.indices.push_back(static_cast<uint16_t>(inner + next));
+        }
+    }
+
+    return glow;
+}
 
 // Build a vertex-coloured hemisphere for sky rendering.
 // Latitude goes from 0 (pole/zenith) to 90+dipAngle degrees (below horizon).

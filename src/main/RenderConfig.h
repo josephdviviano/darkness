@@ -46,6 +46,45 @@ constexpr float kWaterRotationMin = 0.0f, kWaterRotationMax = 1.0f;  // console 
 constexpr float kWaterScrollMin   = 0.0f, kWaterScrollMax   = 1.0f;  // already agreed
 } // namespace WaterRange
 
+/// Post-process tunable bounds — SINGLE SOURCE OF TRUTH, same contract as
+/// WaterRange above: the YAML clamp is authoritative and the debug-console
+/// registration in DarknessRender.cpp reads these same constants, so the two
+/// cannot drift apart and the console cannot offer an unsaveable value.
+///
+/// Ranges are deliberately generous rather than tasteful — these are the
+/// limits of what the shader handles sanely, not a recommendation. The
+/// identity defaults (exposure 1, brightness 0, contrast 1, saturation 1,
+/// gamma 1) sit inside every range.
+namespace PostRange {
+constexpr float kExposureMin   =  0.0f, kExposureMax   = 8.0f;
+constexpr float kBrightnessMin = -1.0f, kBrightnessMax = 1.0f;
+constexpr float kContrastMin   =  0.0f, kContrastMax   = 4.0f;
+constexpr float kSaturationMin =  0.0f, kSaturationMax = 4.0f;
+constexpr float kFilterMin     =  0.0f, kFilterMax     = 1.0f;
+constexpr float kGammaMin      =  0.1f, kGammaMax      = 4.0f;
+// Bloom. Iteration ceiling must match kMaxBloomIterations in PostProcess.h,
+// which sizes the reserved bgfx view-id range.
+constexpr int   kBloomIterMin  = 1,     kBloomIterMax  = 4;
+constexpr float kBloomBlurMin  =  0.0f, kBloomBlurMax  = 8.0f;
+constexpr float kBloomIntenMin =  0.0f, kBloomIntenMax = 8.0f;
+// NewDark bloom style. Threshold, saturation and range use NewDark's own
+// documented ranges verbatim (new_config_vars.txt:375-384); prescale and
+// scale are documented as "0.0 - " (unbounded above), so the ceilings here
+// are ours.
+constexpr float kNdThresholdMin  = 0.0f, kNdThresholdMax  =   1.0f;
+constexpr float kNdPrescaleMin   = 0.0f, kNdPrescaleMax   =   8.0f;
+constexpr float kNdScaleMin      = 0.0f, kNdScaleMax      =  20.0f;
+constexpr float kNdSaturationMin = 0.0f, kNdSaturationMax =   1.0f;
+// Sky glow intensity multiplier. Ceiling is generous because the useful
+// range depends entirely on what glow_scale a given mission authored, and
+// that varies.
+constexpr float kSkyGlowMin      = 0.0f, kSkyGlowMax      = 32.0f;
+// Sky overbright. Ceiling is modest on purpose: this multiplies what the
+// player directly sees, not just the bloom source, so large values wash the
+// sky out rather than merely making the moon glow.
+constexpr float kSkyOverbrightMin = 1.0f, kSkyOverbrightMax = 4.0f;
+} // namespace PostRange
+
 /// Clamp a YAML-supplied value, announcing when the config file asked for
 /// something we would not honour. Silently rewriting a user's stated intent is
 /// the same class of bug as a silent fallback: the value in the file and the
@@ -75,6 +114,54 @@ struct RenderConfig {
     int  lightmapFiltering = 0;     // lightmap filter: 0=bilinear (default), 1=bicubic
     bool linearMips        = false; // gamma-correct mipmap generation
     bool sharpMips         = false; // unsharp mask on mip levels
+    // Multisample anti-aliasing: 0 (off), 2, 4, 8 or 16 samples.
+    // Startup-only — changing it needs new render targets and a bgfx reset,
+    // so it is not exposed in the debug console. Mirrors NewDark's
+    // `multisampletype <2-16>`.
+    int  msaa              = 4;
+
+    // -- graphics.post_process -- (ranges: see PostRange above)
+    //
+    // Off by default, and the defaults below are the identity transform, so
+    // both "disabled" and "enabled at defaults" reproduce the original image.
+    // Enabling this routes the scene through a floating-point target before
+    // resolving to the display, which is what preserves the >1.0 overbright
+    // the lightmap path already produces. Nothing here changes simulation.
+    //
+    // Names and defaults follow NewDark's software colour-correction vars
+    // (d3d_disp_sw_cc_bright 0, _contr 1, _sat 1, _rgbfilter 1 1 1) so the
+    // settings mean the same thing they do there.
+    bool  postProcess     = false;  // master toggle
+    float ppExposure      = 1.0f;   // linear multiplier applied pre-tonemap
+    int   ppToneMap       = 0;      // 0=none (clamp), 1=reinhard, 2=aces
+    float ppBrightness    = 0.0f;   // additive offset, post-tonemap
+    float ppContrast      = 1.0f;   // about the 0.5 pivot
+    float ppSaturation    = 1.0f;   // 0 = greyscale
+    float ppFilterR       = 1.0f;   // RGB colour filter (sepia etc.)
+    float ppFilterG       = 1.0f;
+    float ppFilterB       = 1.0f;
+    float ppGamma         = 1.0f;   // pow() applied last
+    // Luminance weighting for the saturation pivot and bloom intensity:
+    // 0 = crt (Rec.601-era, original colour intent), 1 = lcd (Rec.709).
+    int   ppLumaMode      = 0;
+
+    // -- graphics.post_process.bloom -- (defaults are HPL2's shipped values)
+    bool  ppBloom           = false;
+    int   ppBloomStyle      = 0;    // 0 = amnesia (HPL2), 1 = newdark
+    int   ppBloomIterations = 2;
+    float ppBloomBlurSize   = 1.0f;
+    float ppBloomIntensity  = 1.0f;
+    // NewDark-style-only knobs; defaults are NewDark 1.28's documented ones.
+    float ppNdThreshold     = 0.6f;
+    float ppNdPrescale      = 1.0f;
+    float ppNdScale         = 5.0f;
+    float ppNdSaturation    = 0.7f;
+
+    // -- graphics.sky_glow -- SKYOBJVAR sun/moon glow disc
+    bool  skyGlow          = true;
+    float skyGlowIntensity = 1.0f;  // multiplies the mission's glow_scale
+    float skyOverbright    = 1.0f;  // sky brightness multiplier; >1 lets the
+                                    // moon reach the overbright bloom range
 
     // -- paths -- (CLI flags --res / --schemas override these)
     std::string resPath;     // Thief 2 RES directory containing fam.crf / obj.crf / snd.crf
@@ -625,6 +712,186 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             }
             if (gfx["linear_mips"])  cfg.linearMips = gfx["linear_mips"].as<bool>();
             if (gfx["sharp_mips"])   cfg.sharpMips  = gfx["sharp_mips"].as<bool>();
+
+            if (gfx["msaa"]) {
+                const int v = gfx["msaa"].as<int>();
+                if (v == 0 || v == 2 || v == 4 || v == 8 || v == 16) {
+                    cfg.msaa = v;
+                } else {
+                    // Not a clamp: MSAA sample counts are a fixed set, so a
+                    // nearby value is not "close enough" — it is invalid.
+                    std::fprintf(stderr,
+                        "[FALLBACK] config: graphics.msaa = %d is not one of "
+                        "0|2|4|8|16 — disabling MSAA.\n", v);
+                    cfg.msaa = 0;
+                }
+            }
+
+            // sky_glow — SKYOBJVAR sun/moon glow disc
+            if (YAML::Node sg = gfx["sky_glow"]) {
+                if (sg["enabled"]) cfg.skyGlow = sg["enabled"].as<bool>();
+                if (sg["intensity"]) {
+                    cfg.skyGlowIntensity = clampConfigValue(
+                        sg["intensity"].as<float>(),
+                        PostRange::kSkyGlowMin, PostRange::kSkyGlowMax,
+                        "graphics.sky_glow.intensity");
+                }
+                if (sg["sky_overbright"]) {
+                    cfg.skyOverbright = clampConfigValue(
+                        sg["sky_overbright"].as<float>(),
+                        PostRange::kSkyOverbrightMin, PostRange::kSkyOverbrightMax,
+                        "graphics.sky_glow.sky_overbright");
+                }
+            }
+
+            // post_process subsection — HDR scene target + composite resolve.
+            if (YAML::Node pp = gfx["post_process"]) {
+                if (pp["enabled"]) cfg.postProcess = pp["enabled"].as<bool>();
+
+                if (pp["tonemap"]) {
+                    std::string val = pp["tonemap"].as<std::string>();
+                    if      (val == "none")     cfg.ppToneMap = 0;
+                    else if (val == "reinhard") cfg.ppToneMap = 1;
+                    else if (val == "aces")     cfg.ppToneMap = 2;
+                    else {
+                        // Unlike the older enum keys above, announce this
+                        // rather than defaulting in silence — a typo here
+                        // would otherwise look like "tone mapping does
+                        // nothing on my machine".
+                        std::fprintf(stderr,
+                            "[FALLBACK] config: graphics.post_process.tonemap = "
+                            "'%s' is not one of none|reinhard|aces — using "
+                            "'none'. Tone mapping will not be applied.\n",
+                            val.c_str());
+                        cfg.ppToneMap = 0;
+                    }
+                }
+
+                if (pp["exposure"]) {
+                    cfg.ppExposure = clampConfigValue(
+                        pp["exposure"].as<float>(),
+                        PostRange::kExposureMin, PostRange::kExposureMax,
+                        "graphics.post_process.exposure");
+                }
+                if (pp["brightness"]) {
+                    cfg.ppBrightness = clampConfigValue(
+                        pp["brightness"].as<float>(),
+                        PostRange::kBrightnessMin, PostRange::kBrightnessMax,
+                        "graphics.post_process.brightness");
+                }
+                if (pp["contrast"]) {
+                    cfg.ppContrast = clampConfigValue(
+                        pp["contrast"].as<float>(),
+                        PostRange::kContrastMin, PostRange::kContrastMax,
+                        "graphics.post_process.contrast");
+                }
+                if (pp["saturation"]) {
+                    cfg.ppSaturation = clampConfigValue(
+                        pp["saturation"].as<float>(),
+                        PostRange::kSaturationMin, PostRange::kSaturationMax,
+                        "graphics.post_process.saturation");
+                }
+                if (pp["gamma"]) {
+                    cfg.ppGamma = clampConfigValue(
+                        pp["gamma"].as<float>(),
+                        PostRange::kGammaMin, PostRange::kGammaMax,
+                        "graphics.post_process.gamma");
+                }
+                if (pp["luma_mode"]) {
+                    std::string val = pp["luma_mode"].as<std::string>();
+                    if      (val == "crt") cfg.ppLumaMode = 0;
+                    else if (val == "lcd") cfg.ppLumaMode = 1;
+                    else {
+                        std::fprintf(stderr,
+                            "[FALLBACK] config: graphics.post_process.luma_mode "
+                            "= '%s' is not one of crt|lcd — using 'crt'.\n",
+                            val.c_str());
+                        cfg.ppLumaMode = 0;
+                    }
+                }
+
+                // bloom subsection
+                if (YAML::Node bl = pp["bloom"]) {
+                    if (bl["enabled"]) cfg.ppBloom = bl["enabled"].as<bool>();
+                    if (bl["style"]) {
+                        std::string val = bl["style"].as<std::string>();
+                        if      (val == "amnesia") cfg.ppBloomStyle = 0;
+                        else if (val == "newdark") cfg.ppBloomStyle = 1;
+                        else {
+                            std::fprintf(stderr,
+                                "[FALLBACK] config: graphics.post_process."
+                                "bloom.style = '%s' is not one of "
+                                "amnesia|newdark — using 'amnesia'.\n",
+                                val.c_str());
+                            cfg.ppBloomStyle = 0;
+                        }
+                    }
+                    if (bl["threshold"]) {
+                        cfg.ppNdThreshold = clampConfigValue(
+                            bl["threshold"].as<float>(),
+                            PostRange::kNdThresholdMin, PostRange::kNdThresholdMax,
+                            "graphics.post_process.bloom.threshold");
+                    }
+                    if (bl["prescale"]) {
+                        cfg.ppNdPrescale = clampConfigValue(
+                            bl["prescale"].as<float>(),
+                            PostRange::kNdPrescaleMin, PostRange::kNdPrescaleMax,
+                            "graphics.post_process.bloom.prescale");
+                    }
+                    if (bl["scale"]) {
+                        cfg.ppNdScale = clampConfigValue(
+                            bl["scale"].as<float>(),
+                            PostRange::kNdScaleMin, PostRange::kNdScaleMax,
+                            "graphics.post_process.bloom.scale");
+                    }
+                    if (bl["saturation"]) {
+                        cfg.ppNdSaturation = clampConfigValue(
+                            bl["saturation"].as<float>(),
+                            PostRange::kNdSaturationMin, PostRange::kNdSaturationMax,
+                            "graphics.post_process.bloom.saturation");
+                    }
+                    if (bl["iterations"]) {
+                        cfg.ppBloomIterations = static_cast<int>(clampConfigValue(
+                            static_cast<float>(bl["iterations"].as<int>()),
+                            static_cast<float>(PostRange::kBloomIterMin),
+                            static_cast<float>(PostRange::kBloomIterMax),
+                            "graphics.post_process.bloom.iterations"));
+                    }
+                    if (bl["blur_size"]) {
+                        cfg.ppBloomBlurSize = clampConfigValue(
+                            bl["blur_size"].as<float>(),
+                            PostRange::kBloomBlurMin, PostRange::kBloomBlurMax,
+                            "graphics.post_process.bloom.blur_size");
+                    }
+                    if (bl["intensity"]) {
+                        cfg.ppBloomIntensity = clampConfigValue(
+                            bl["intensity"].as<float>(),
+                            PostRange::kBloomIntenMin, PostRange::kBloomIntenMax,
+                            "graphics.post_process.bloom.intensity");
+                    }
+                }
+
+                // rgb_filter: [r, g, b] — matches NewDark's
+                // d3d_disp_sw_cc_rgbfilter taking three values.
+                if (YAML::Node rgb = pp["rgb_filter"]) {
+                    if (rgb.IsSequence() && rgb.size() == 3) {
+                        cfg.ppFilterR = clampConfigValue(rgb[0].as<float>(),
+                            PostRange::kFilterMin, PostRange::kFilterMax,
+                            "graphics.post_process.rgb_filter[0]");
+                        cfg.ppFilterG = clampConfigValue(rgb[1].as<float>(),
+                            PostRange::kFilterMin, PostRange::kFilterMax,
+                            "graphics.post_process.rgb_filter[1]");
+                        cfg.ppFilterB = clampConfigValue(rgb[2].as<float>(),
+                            PostRange::kFilterMin, PostRange::kFilterMax,
+                            "graphics.post_process.rgb_filter[2]");
+                    } else {
+                        std::fprintf(stderr,
+                            "[FALLBACK] config: graphics.post_process.rgb_filter "
+                            "must be a 3-element sequence [r, g, b] — ignoring "
+                            "it and leaving the filter at white (1, 1, 1).\n");
+                    }
+                }
+            }
         }
 
         // water section
