@@ -92,6 +92,7 @@
 #include "motion/MotionService.h"
 #include "RawDataStorage.h"
 #include "PLDefParser.h"
+#include "SpawnSystem.h"
 #include "DTypeSizeParser.h"
 #include "SingleFieldDataStorage.h"
 #include "worldquery/ObjSysWorldState.h"
@@ -5825,6 +5826,7 @@ int main(int argc, char *argv[]) {
     state.doorSystem = &doorSystem;
 
     Darkness::TweqSystem tweqSystem;
+    Darkness::SpawnSystem spawnSystem;
     Darkness::MovingTerrainSystem movingTerrainSystem;
     state.movingTerrainSystem = &movingTerrainSystem;
 
@@ -6746,13 +6748,32 @@ int main(int argc, char *argv[]) {
         scriptManager.sendMessage(msg);
     });
 
+    // Hook emitter tweqs → spawn the object they name. Emitters spawn OBJECTS
+    // (an archetype by name), not GPU particles, and the spawned object runs
+    // its own tweqs — usually a Delete countdown that cleans it up.
+    {
+        Darkness::PropertyServicePtr propSvcForSpawn =
+            GET_SERVICE(Darkness::PropertyService);
+        Darkness::ObjectServicePtr objSvcForSpawn =
+            GET_SERVICE(Darkness::ObjectService);
+        spawnSystem.init(objSvcForSpawn.get(), propSvcForSpawn.get(),
+                         state.objectStates, &doorPlacements,
+                         &mission.objData, &mission.objCellIDs, &tweqSystem);
+    }
+    tweqSystem.setEmitCallback([&spawnSystem](const Darkness::EmitRequest &req) {
+        spawnSystem.spawn(req);
+    });
+
     // Hook tweq destruction → take the object out of the live world.
     // Setting kObjStateDestroyed only stops it being drawn; without this it
     // keeps its collision body, its spatial-index entry and a truthy exists(),
     // so a slain object still blocks the player and answers AI and audio
     // queries while invisible.
-    tweqSystem.setDestroyCallback([&state, wq = worldQuery.get()](int32_t objID) {
+    tweqSystem.setDestroyCallback([&state, &spawnSystem,
+                                   wq = worldQuery.get()](int32_t objID) {
         if (wq) wq->notifyDestroyed(objID);
+        // Hand back the renderer slot if this was a spawned effect object.
+        spawnSystem.recycle(objID);
         Darkness::ObjectCollisionWorld *ocw =
             state.physics ? state.physics->getObjectCollisionWorld() : nullptr;
         if (ocw) ocw->removeObject(objID);

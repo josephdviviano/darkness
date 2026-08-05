@@ -27,6 +27,7 @@
 #include "ai/AIHearingService.h"
 #include "sim/TweqSystem.h"
 #include "SubObjectPose.h"
+#include "SpawnSystem.h"
 
 // ── Initialize service stack and load mission database ──
 // Creates the ServiceManager with all 12 services, registers property/relation
@@ -627,6 +628,30 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
             if (added > 0) {
                 std::fprintf(stderr, "TweqSystem: added %d model variants for loading\n", added);
             }
+        }
+    }
+
+    // Same for every archetype an emitter tweq can spawn. Models must be in the
+    // load set up front: a spawn happens mid-frame and cannot stall on a GPU
+    // upload, so an un-preloaded emission would simply be invisible.
+    {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
+        auto emitModels = Darkness::SpawnSystem::collectEmitterModelNames(
+            propSvc.get(), objSvc.get());
+        if (!emitModels.empty()) {
+            int added = 0;
+            std::unordered_set<std::string> existing(
+                mission.objData.uniqueModels.begin(),
+                mission.objData.uniqueModels.end());
+            for (const auto &name : emitModels) {
+                if (!existing.count(name)) {
+                    mission.objData.uniqueModels.push_back(name);
+                    ++added;
+                }
+            }
+            std::fprintf(stderr, "SpawnSystem: %zu emitter target models, "
+                         "%d newly added for loading\n", emitModels.size(), added);
         }
     }
 

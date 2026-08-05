@@ -98,6 +98,13 @@ struct TweqInstance {
     // Lock tweq — the single model joint slot this lock drives
     int       lockJointSlot = 0;
 
+    // Emitter tweq. An object can carry five independent emitters, so the slot
+    // is part of this instance's identity (see tweqKey).
+    int       emitterSlot = 0;      // 0..4
+    char      emitWhat[17] = {};    // archetype symbolic name
+    Vector3   emitVelocity{0.0f};
+    Vector3   emitAngleRandom{0.0f};
+
     // Models tweq
     char      modelNames[6][16] = {};
     int       modelCount = 0;    // number of valid model names
@@ -123,6 +130,23 @@ struct TweqInstance {
 using TweqEventCallback = std::function<void(int32_t objID, eTweqType type,
                                               int haltAction)>;
 
+// ── One object emission requested by an emitter tweq ──
+//
+// The tweq decides WHAT to emit, WHERE and with what velocity; turning that
+// into a live object is the spawner's job, because it needs the object system,
+// the renderer's instance list and the asset set — none of which belong in a
+// sim subsystem.
+struct EmitRequest {
+    int32_t     emitterObjID = 0;   // who is emitting
+    int         emitterSlot = 0;    // which of the object's five emitters
+    std::string archetypeName;      // symbolic name of the archetype to spawn
+    Vector3     position{0.0f};     // world position to spawn at
+    Vector3     velocity{0.0f};     // initial velocity, flags already applied
+    uint16_t    miscFlags = 0;      // TweqMiscFlags — Gravity, NoPhysics, VHot…
+};
+
+using EmitCallback = std::function<void(const EmitRequest &)>;
+
 // ── Callback fired when a tweq destroys or slays its object ──
 // Wired to whatever has to take the object out of the live world: physics
 // bodies, the spatial index, world queries. Unlike TweqEventCallback this is
@@ -137,6 +161,12 @@ using ObjectDestroyCallback = std::function<void(int32_t objID)>;
 class TweqSystem : public SimListener {
 public:
     TweqSystem() : mRng(std::random_device{}()) {}
+
+    /// The five emitter slots' property names, in slot order.
+    static constexpr const char *kEmitterCfgProps[5] = {
+        "CfgTweqEm", "CfgTweq2E", "CfgTweq3E", "CfgTweq4E", "CfgTweq5E"};
+    static constexpr const char *kEmitterStateProps[5] = {
+        "StTweqEmi", "StTweq2Em", "StTweq3Em", "StTweq4Em", "StTweq5Em"};
 
     // ── Pre-init: collect model names for asset loading ──
 
@@ -195,6 +225,13 @@ public:
             propSvc, "CfgTweqDe", "StTweqDel", kTweqTypeDelete);
         initTweqsOfType<PropCfgTweqLock, PropStTweqLock>(
             propSvc, "CfgTweqLo", "StTweqLoc", kTweqTypeLock);
+
+        // Five independent emitter slots per object.
+        for (int slot = 0; slot < 5; ++slot) {
+            initTweqsOfType<PropCfgTweqEmitter, PropStTweqSimple>(
+                propSvc, kEmitterCfgProps[slot], kEmitterStateProps[slot],
+                kTweqTypeEmitter, slot);
+        }
 
         // Seed the joint pose of objects that carry a JointPos but no joints
         // tweq — a lever left thrown, a chest authored open. Without this they
@@ -279,6 +316,55 @@ public:
     /// Set callback for tweq completion events (for TweqComplete messages).
     void setEventCallback(TweqEventCallback cb) { mEventCallback = std::move(cb); }
 
+    /// Give an object created at runtime the tweqs its archetype defines.
+    ///
+    /// The object must already be in the placements map — the spawner puts it
+    /// there — because that is where every tweq type reads its base transform
+    /// from. Safe to call twice: instances are keyed, so a second call
+    /// overwrites rather than duplicating.
+    void registerObject(PropertyService *propSvc, int32_t objID) {
+        if (!propSvc || objID <= 0) return;
+        const size_t before = mTweqs.size();
+
+        initTweqsOfType<PropCfgTweqVector, PropStTweqVector>(
+            propSvc, "CfgTweqRo", "StTweqRot", kTweqTypeRotate, 0, objID);
+        initTweqsOfType<PropCfgTweqVector, PropStTweqVector>(
+            propSvc, "CfgTweqSc", "StTweqSca", kTweqTypeScale, 0, objID);
+        initTweqsOfType<PropCfgTweqSimple, PropStTweqSimple>(
+            propSvc, "CfgTweqBl", "StTweqBli", kTweqTypeFlicker, 0, objID);
+        initTweqsOfType<PropCfgTweqModels, PropStTweqSimple>(
+            propSvc, "CfgTweqMo", "StTweqMod", kTweqTypeModels, 0, objID);
+        initTweqsOfType<PropCfgTweqJoints, PropStTweqJoints>(
+            propSvc, "CfgTweqJo", "StTweqJoi", kTweqTypeJoints, 0, objID);
+        initTweqsOfType<PropCfgTweqSimple, PropStTweqSimple>(
+            propSvc, "CfgTweqDe", "StTweqDel", kTweqTypeDelete, 0, objID);
+        initTweqsOfType<PropCfgTweqLock, PropStTweqLock>(
+            propSvc, "CfgTweqLo", "StTweqLoc", kTweqTypeLock, 0, objID);
+        for (int slot = 0; slot < 5; ++slot) {
+            initTweqsOfType<PropCfgTweqEmitter, PropStTweqSimple>(
+                propSvc, kEmitterCfgProps[slot], kEmitterStateProps[slot],
+                kTweqTypeEmitter, slot, objID);
+        }
+
+        // A spawned object with no tweqs never expires, so it would sit in the
+        // world forever. Worth knowing about rather than discovering as a leak.
+        if (mTweqs.size() == before) {
+            static int warnCount = 0;
+            if (warnCount++ < 5)
+                std::fprintf(stderr, "[FALLBACK] TweqSystem: runtime object %d "
+                             "inherited no tweqs — nothing will ever expire it\n",
+                             objID);
+        }
+    }
+
+    /// Number of emissions requested so far (diagnostics).
+    uint32_t emissionCount() const { return mEmitFired; }
+
+    /// Set the callback that turns an emitter tweq's emission into a live
+    /// object. Without it, emissions are counted and reported but nothing
+    /// spawns.
+    void setEmitCallback(EmitCallback cb) { mEmitCallback = std::move(cb); }
+
     /// Set the callback that removes an object from the live world when a tweq
     /// destroys or slays it.
     void setDestroyCallback(ObjectDestroyCallback cb) {
@@ -339,6 +425,11 @@ public:
                 result = processDeleteTweq(tw, dt_ms);
                 break;
 
+            case kTweqTypeEmitter:
+                typeName = "Emitter";
+                result = processEmitterTweq(tw, dt_ms);
+                break;
+
             default:
                 break;
             }
@@ -393,9 +484,15 @@ public:
 
     // ── Accessors (for tests and diagnostics) ──
 
-    /// Pack objID + tweqType into a unique map key
-    static uint64_t tweqKey(int32_t objID, eTweqType type) {
+    /// Pack objID + tweqType (+ emitter slot) into a unique map key.
+    ///
+    /// Emitters are the one type an object can carry more than one of — five
+    /// slots — so the slot rides in the high nibble of the type byte. Types run
+    /// 0..9, so slot 0 gives exactly the old key and every other type is
+    /// unaffected.
+    static uint64_t tweqKey(int32_t objID, eTweqType type, int slot = 0) {
         return (static_cast<uint64_t>(static_cast<uint32_t>(objID)) << 8) |
+               (static_cast<uint64_t>(slot & 0xF) << 4) |
                static_cast<uint64_t>(type);
     }
 
@@ -421,7 +518,7 @@ public:
 
     /// Inject a tweq instance and set the object state map (for unit tests).
     void injectForTest(const TweqInstance &tw, ObjectStateMap *states) {
-        mTweqs[tweqKey(tw.objID, tw.type)] = tw;
+        mTweqs[tweqKey(tw.objID, tw.type, tw.emitterSlot)] = tw;
         mObjectStates = states;
     }
 
@@ -437,11 +534,16 @@ private:
     template <typename CfgT, typename StT>
     void initTweqsOfType(PropertyService *propSvc,
                           const char *cfgPropName, const char *stPropName,
-                          eTweqType tweqType) {
+                          eTweqType tweqType, int slot = 0,
+                          int32_t onlyObjID = 0) {
         if (!propSvc || !mPlacements) return;
 
         for (const auto &[objID, placement] : *mPlacements) {
             if (objID <= 0) continue;  // skip archetypes
+            // Runtime registration re-runs the same scan for a single object,
+            // so a spawned object gets its tweqs on exactly the path a placed
+            // one does — no second, drifting copy of this logic.
+            if (onlyObjID != 0 && objID != onlyObjID) continue;
 
             // Check if this object has the config property (with inheritance)
             CfgT cfg;
@@ -462,6 +564,7 @@ private:
             TweqInstance tw;
             tw.objID = objID;
             tw.type = tweqType;
+            tw.emitterSlot = slot;
             initFromConfig(tw, cfg, tweqType);
 
             // Read state property if present
@@ -594,7 +697,7 @@ private:
                 std::fprintf(stderr, "\n");
             }
 
-            mTweqs[tweqKey(objID, tweqType)] = std::move(tw);
+            mTweqs[tweqKey(objID, tweqType, slot)] = std::move(tw);
         }
     }
 
@@ -661,6 +764,30 @@ private:
         if (st.anim & kTweqStateOn) tw.active = true;
         tw.axisState[0] = st.axisState;
         tw.values[0] = st.value;
+    }
+
+    /// Extract config fields (emitter config)
+    void initFromConfig(TweqInstance &tw, const PropCfgTweqEmitter &cfg,
+                        eTweqType) {
+        tw.cfgCurve = cfg.curve;
+        tw.cfgAnim  = cfg.anim;
+        tw.cfgHalt  = cfg.halt;
+        tw.cfgMisc  = cfg.misc;
+        tw.cfgRate  = cfg.rate;
+        std::memcpy(tw.emitWhat, cfg.emitWhat, 16);
+        tw.emitWhat[16] = '\0';
+        tw.emitVelocity = Vector3(cfg.velocity[0], cfg.velocity[1],
+                                  cfg.velocity[2]);
+        tw.emitAngleRandom = Vector3(cfg.angleRandom[0], cfg.angleRandom[1],
+                                     cfg.angleRandom[2]);
+        // curFrame counts emissions down to zero, the way the flicker tweq
+        // counts its toggles.
+        tw.curFrame = static_cast<int16_t>(
+            std::clamp<int32_t>(cfg.maxFrames, 0, 32767));
+        if (cfg.rate == 0 && (cfg.anim & kTweqAnimSim)) {
+            std::fprintf(stderr, "[DEFAULT] TweqSystem: obj %d Emitter cfgRate=0 "
+                         "with Sim flag — would emit every tick\n", tw.objID);
+        }
     }
 
     /// Extract config fields (simple config: Flicker)
@@ -954,6 +1081,81 @@ private:
         if (seeded > 0)
             std::fprintf(stderr, "TweqSystem: %d objects seeded from JointPos "
                          "(no joints tweq)\n", seeded);
+    }
+
+    /// An emitter spawns one object every `cfgRate` milliseconds until its
+    /// frame budget runs out, then takes its halt action — usually deleting
+    /// itself, since most emitters are one-shot effect spawners.
+    int processEmitterTweq(TweqInstance &tw, float dt_ms) {
+        if (tw.cfgRate == 0 && !(tw.cfgAnim & kTweqAnimNoLimit)) {
+            // Guard the degenerate config the [DEFAULT] warning at init flags:
+            // a zero rate with a frame budget would drain it in one tick.
+            tw.active = false;
+            return tw.cfgHalt;
+        }
+
+        tw.elapsedMs += dt_ms;
+        if (tw.elapsedMs < static_cast<float>(tw.cfgRate))
+            return kTweqStatusQuo;
+        tw.elapsedMs -= static_cast<float>(tw.cfgRate);
+
+        emitOne(tw);
+
+        if (!(tw.cfgAnim & kTweqAnimNoLimit)) {
+            --tw.curFrame;
+            if (tw.curFrame <= 0) {
+                tw.active = false;
+                return tw.cfgHalt;
+            }
+        }
+        return kTweqFrameEvent;
+    }
+
+    /// Build one emission and hand it to the spawner.
+    void emitOne(TweqInstance &tw) {
+        if (tw.emitWhat[0] == '\0') {
+            static int warnCount = 0;
+            if (warnCount++ < 5)
+                std::fprintf(stderr, "[FALLBACK] TweqSystem: obj %d emitter %d has "
+                             "no archetype name — emitting nothing\n",
+                             tw.objID, tw.emitterSlot);
+            return;
+        }
+
+        EmitRequest req;
+        req.emitterObjID = tw.objID;
+        req.emitterSlot = tw.emitterSlot;
+        req.archetypeName.assign(tw.emitWhat, strnlen(tw.emitWhat, 16));
+        req.miscFlags = tw.cfgMisc;
+        req.position = tw.base.position;
+        if (mObjectStates) {
+            if (const ObjectState *os = mObjectStates->tryGet(tw.objID))
+                req.position = os->position;
+        }
+
+        // ZeroVel wins outright; otherwise the authored velocity, rotated into
+        // the emitter's frame when RelVel is set, then spread by AngleRandom.
+        if (!(tw.cfgMisc & kTweqMiscZeroVel)) {
+            Vector3 v = tw.emitVelocity;
+            if (tw.cfgMisc & kTweqMiscRelVel)
+                v = Vector3(tw.base.rotation * glm::vec4(v, 0.0f));
+            v.x += tw.emitAngleRandom.x * randFloat();
+            v.y += tw.emitAngleRandom.y * randFloat();
+            v.z += tw.emitAngleRandom.z * randFloat();
+            req.velocity = v;
+        }
+
+        ++mEmitFired;
+        if (mEmitCallback) {
+            mEmitCallback(req);
+        } else {
+            static int warnCount = 0;
+            if (warnCount++ < 3)
+                std::fprintf(stderr, "[FALLBACK] TweqSystem: obj %d emitting '%s' "
+                             "with no emit callback wired — the tweq runs but "
+                             "nothing spawns\n",
+                             tw.objID, req.archetypeName.c_str());
+        }
     }
 
     int processJointsTweq(TweqInstance &tw, float dt_ms) {
@@ -1296,6 +1498,8 @@ private:
     const std::unordered_map<int32_t, ObjPlacementInfo> *mPlacements = nullptr;
     TweqEventCallback mEventCallback;
     ObjectDestroyCallback mDestroyCallback;
+    EmitCallback mEmitCallback;
+    uint32_t mEmitFired = 0;
     std::mt19937 mRng;
     uint32_t mFrameCount = 0;
     const std::unordered_map<std::string, ParsedBinMesh> *mParsedModels = nullptr;

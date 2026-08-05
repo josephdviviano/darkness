@@ -687,6 +687,37 @@ struct PropCfgTweqJoints {
 };
 static_assert(sizeof(PropCfgTweqJoints) == 132);
 
+// ── CfgTweqEm / CfgTweq2E..CfgTweq5E — emitter tweq config ──
+// p_ver 2.52 → 52 bytes. An object can carry five independent emitters.
+//
+// The emitter spawns OBJECTS, not GPU particles: `emitWhat` is an archetype's
+// symbolic name ("H2OSplash", "MossSpore", "RippleRing", "fnordkaboom"), which
+// is why this needed an object-spawn path rather than a particle system.
+//
+// Field names, types, sizes and offsets are the engine's own descriptors, so
+// this layout is read off the binary rather than inferred:
+//   CurveC +1 (1) | AnimC +2 (1) | Halt +3 (1) | MiscC +4 (2) | Rate +6 (2)
+//   Max frames +8 (4) | Emit what +12 (16, string) | Velocity +28 (12, vec3)
+//   Angle Random +40 (12, vec3)
+// [BIN: sTweqEmitterConfig field table @0x7F2F18..0x7F3178, Thief2.exe NewDark 1.28]
+
+struct PropCfgTweqEmitter {
+    uint8_t  unknown;
+    uint8_t  curve;         // TweqCurveFlags
+    uint8_t  anim;          // TweqAnimFlags
+    uint8_t  halt;          // TweqHaltAction
+    uint16_t misc;          // TweqMiscFlags — Gravity/ZeroVel/RelVel/VHot/…
+    uint16_t rate;          // milliseconds between emissions
+    int32_t  maxFrames;     // how many objects to emit before halting
+    char     emitWhat[16];  // archetype symbolic name
+    float    velocity[3];   // emission velocity
+    float    angleRandom[3];// per-axis random spread applied to the velocity
+};
+static_assert(sizeof(PropCfgTweqEmitter) == 52);
+
+// StTweqEmi / StTweq2Em..StTweq5Em are p_ver 2.8 — the same 8-byte state block
+// the Flicker and Models tweqs use (PropStTweqSimple).
+
 // ── CfgTweqLo — lock tweq config ──
 // p_ver 2.32 → 32 bytes = the vector header + ONE joint block + the selector
 //

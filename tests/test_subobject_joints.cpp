@@ -485,6 +485,106 @@ TEST_CASE("TweqSystem: a halted delete tweq leaves the object alone", "[Tweq]") 
     REQUIRE((states.get(921).flags & Darkness::kObjStateDestroyed) == 0);
 }
 
+// ── Emitter tweq ──
+
+namespace {
+
+Darkness::TweqInstance makeEmitterTweq(int32_t objID, uint16_t rateMs,
+                                       int frames, const char *what,
+                                       uint16_t misc = 0) {
+    Darkness::TweqInstance tw;
+    tw.objID = objID;
+    tw.type = Darkness::kTweqTypeEmitter;
+    tw.cfgHalt = Darkness::kTweqHaltStop;
+    tw.cfgRate = rateMs;
+    tw.cfgMisc = misc;
+    tw.curFrame = static_cast<int16_t>(frames);
+    tw.emitVelocity = Vector3(0.0f, 0.0f, 4.0f);
+    std::strncpy(tw.emitWhat, what, sizeof(tw.emitWhat) - 1);
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.base.position = Vector3(1.0f, 2.0f, 3.0f);
+    tw.hasObjectState = true;
+    return tw;
+}
+
+} // namespace
+
+TEST_CASE("TweqSystem: an emitter emits its archetype on the configured beat",
+          "[Tweq][Emitter]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    std::vector<Darkness::EmitRequest> emitted;
+    sys.setEmitCallback([&emitted](const Darkness::EmitRequest &r) {
+        emitted.push_back(r);
+    });
+    sys.injectForTest(makeEmitterTweq(930, 100, 3, "MossSpore"), &states);
+
+    sys.simStep(0.0f, 0.05f);            // 50 ms — not yet
+    REQUIRE(emitted.empty());
+
+    sys.simStep(0.05f, 0.06f);           // 110 ms total — one emission
+    REQUIRE(emitted.size() == 1);
+    REQUIRE(emitted[0].archetypeName == "MossSpore");
+    REQUIRE(emitted[0].emitterObjID == 930);
+    REQUIRE(emitted[0].position.x == Approx(1.0f));
+    REQUIRE(emitted[0].velocity.z == Approx(4.0f));
+}
+
+TEST_CASE("TweqSystem: an emitter halts once its frame budget runs out",
+          "[Tweq][Emitter]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    int count = 0;
+    sys.setEmitCallback([&count](const Darkness::EmitRequest &) { ++count; });
+    sys.injectForTest(makeEmitterTweq(931, 100, 2, "H2OSplash"), &states);
+
+    for (int i = 0; i < 6; ++i) sys.simStep(0.0f, 0.1f);
+
+    REQUIRE(count == 2);   // budget of 2, not one per tick
+    REQUIRE_FALSE(sys.getInstanceForTest(931, Darkness::kTweqTypeEmitter)->active);
+}
+
+TEST_CASE("TweqSystem: ZeroVel emits with no velocity", "[Tweq][Emitter]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    std::vector<Darkness::EmitRequest> emitted;
+    sys.setEmitCallback([&emitted](const Darkness::EmitRequest &r) {
+        emitted.push_back(r);
+    });
+    sys.injectForTest(makeEmitterTweq(932, 10, 1, "RippleRing",
+                                      Darkness::kTweqMiscZeroVel), &states);
+
+    sys.simStep(0.0f, 0.05f);
+
+    REQUIRE(emitted.size() == 1);
+    REQUIRE(emitted[0].velocity.z == Approx(0.0f));
+}
+
+TEST_CASE("TweqSystem: the five emitter slots are independent instances",
+          "[Tweq][Emitter]") {
+    // Emitters are the one tweq type an object can carry several of, so the
+    // slot has to be part of the instance key or slot 2 would evict slot 1.
+    REQUIRE(Darkness::TweqSystem::tweqKey(7, Darkness::kTweqTypeEmitter, 0) !=
+            Darkness::TweqSystem::tweqKey(7, Darkness::kTweqTypeEmitter, 1));
+    // Slot 0 must still hash exactly like every other single-slot type.
+    REQUIRE(Darkness::TweqSystem::tweqKey(7, Darkness::kTweqTypeEmitter, 0) ==
+            Darkness::TweqSystem::tweqKey(7, Darkness::kTweqTypeEmitter));
+
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    int count = 0;
+    sys.setEmitCallback([&count](const Darkness::EmitRequest &) { ++count; });
+    auto a = makeEmitterTweq(933, 100, 1, "MossSpore");
+    auto b = makeEmitterTweq(933, 100, 1, "H2OSplash");
+    b.emitterSlot = 1;
+    sys.injectForTest(a, &states);
+    sys.injectForTest(b, &states);
+
+    sys.simStep(0.0f, 0.15f);
+    REQUIRE(count == 2);   // both slots fired, neither evicted the other
+}
+
 TEST_CASE("TweqSystem: animStateBits reports the live instance state",
           "[Tweq][SubObject]") {
     // Scripts read this instead of the StTweq* property, whose field accessor
