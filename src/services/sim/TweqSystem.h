@@ -89,6 +89,14 @@ struct TweqInstance {
     // all 6 (one per model joint slot) — the per-slot algorithm is identical.
     static constexpr int kMaxAxes = 6;
     PropTweqAxisConfig axes[kMaxAxes] = {};
+    // Joints carry a FULL config per joint, not just rate/low/high, and the
+    // driver runs each joint against its own curve/anim/halt. Vector tweqs
+    // (rotate, scale) genuinely share one config across their three axes, so
+    // these are only populated — and only consulted — for Joints.
+    uint8_t   axisCurve[kMaxAxes] = {};
+    uint8_t   axisAnim[kMaxAxes]  = {};
+    uint8_t   axisHalt[kMaxAxes]  = {};
+    bool      perAxisFlags = false;
     int       axisCount = 3;
     int32_t   primaryAxis = 0;   // 0=all, else 1-indexed axis/joint
 
@@ -853,20 +861,27 @@ private:
 
     /// Extract config fields (joints config)
     ///
-    /// Each joint carries its own flag block on top of rate/low/high. The
-    /// per-joint blocks in shipped data repeat the header's curve/anim, so the
-    /// shared per-axis algorithm reads the header flags exactly as the vector
-    /// tweqs do; only rate/low/high are genuinely per-joint.
+    /// Each joint carries its own FULL config — curve, anim and halt as well as
+    /// rate/low/high — and each is run against its own.
+    ///
+    /// An earlier version of this claimed the per-joint blocks merely repeat
+    /// the header's flags and read the header for every joint. That was false:
+    /// 41 of the 158 shipped joints configs have a live joint whose curve, anim
+    /// or halt differs from its header.
     void initFromConfig(TweqInstance &tw, const PropCfgTweqJoints &cfg, eTweqType) {
         tw.cfgCurve = cfg.curve;
         tw.cfgAnim  = cfg.anim;
         tw.cfgHalt  = cfg.halt;
         tw.cfgMisc  = cfg.misc;
         tw.axisCount = kJointSlotCount;
+        tw.perAxisFlags = true;
         for (int i = 0; i < kJointSlotCount; ++i) {
             tw.axes[i].rate = cfg.joint[i].rate;
             tw.axes[i].low  = cfg.joint[i].low;
             tw.axes[i].high = cfg.joint[i].high;
+            tw.axisCurve[i] = cfg.joint[i].curve;
+            tw.axisAnim[i]  = cfg.joint[i].anim;
+            tw.axisHalt[i]  = cfg.joint[i].halt;
         }
         tw.primaryAxis = cfg.primary;
     }
@@ -1084,6 +1099,12 @@ private:
         // Skip axes with zero rate (inactive)
         if (std::abs(cfg.rate) < 1e-6f) return kTweqStatusQuo;
 
+        // Joints run against their own flags; everything else shares the
+        // header's.
+        const uint8_t cfgCurve = tw.perAxisFlags ? tw.axisCurve[axisIdx] : tw.cfgCurve;
+        const uint8_t cfgAnim  = tw.perAxisFlags ? tw.axisAnim[axisIdx]  : tw.cfgAnim;
+        const uint8_t cfgHalt  = tw.perAxisFlags ? tw.axisHalt[axisIdx]  : tw.cfgHalt;
+
         float eff_rate = cfg.rate;
         bool isReverse = (tw.axisState[axisIdx] & kTweqStateReverse) != 0;
         if (isReverse) eff_rate *= -1.0f;
@@ -1093,11 +1114,11 @@ private:
 
         float new_val = tw.values[axisIdx];
 
-        if (tw.cfgCurve & kTweqCurveMul) {
+        if (cfgCurve & kTweqCurveMul) {
             // Multiplicative mode
-            if (tw.cfgCurve & kTweqCurveJitterMask) {
+            if (cfgCurve & kTweqCurveJitterMask) {
                 float delta = 0.05f + std::abs(1.0f - eff_rate);
-                float fac = static_cast<float>(tw.cfgCurve & kTweqCurveJitterMask);
+                float fac = static_cast<float>(cfgCurve & kTweqCurveJitterMask);
                 float r = randFloat();
                 delta = 1.0f + (delta * fac * r / 2.0f);
                 eff_rate *= delta;
@@ -1106,14 +1127,14 @@ private:
         } else {
             // Additive mode (most common)
             new_val += eff_rate * step;
-            if (tw.cfgCurve & kTweqCurveJitterMask) {
-                float fac = static_cast<float>(tw.cfgCurve & kTweqCurveJitterMask);
+            if (cfgCurve & kTweqCurveJitterMask) {
+                float fac = static_cast<float>(cfgCurve & kTweqCurveJitterMask);
                 new_val += eff_rate * randFloat() * fac * step / 2.0f;
             }
         }
 
         // Check bounds (unless NoLimit flag is set)
-        if (!(tw.cfgAnim & kTweqAnimNoLimit)) {
+        if (!(cfgAnim & kTweqAnimNoLimit)) {
             float lo = std::min(cfg.low, cfg.high);
             float hi = std::max(cfg.low, cfg.high);
 
@@ -1125,14 +1146,17 @@ private:
                 // Check end condition: OneBounce completes only when returning
                 // to the starting edge (reverse flag will be set on first hit)
                 bool isEnd = true;
-                if (tw.cfgAnim & kTweqAnimOneBounce) {
+                if (cfgAnim & kTweqAnimOneBounce) {
                     if (!isReverse) isEnd = false;  // first half, continue
                 }
 
-                if (tw.cfgAnim & kTweqAnimWrap) {
-                    // Wrap to opposite edge
+                if (cfgAnim & kTweqAnimWrap) {
+                    // Wrap to the opposite edge. This does NOT suppress the
+                    // halt action — a wrapping tweq whose end condition holds
+                    // still completes, exactly as a bouncing one does. The
+                    // comment here used to claim otherwise while the code did
+                    // the right thing.
                     new_val = (clip == 1) ? hi : lo;
-                    // Wrapping never triggers completion on its own
                 } else {
                     // Bounce: clamp to limit and reverse direction
                     new_val = (clip == 1) ? lo : hi;
@@ -1140,7 +1164,7 @@ private:
                 }
 
                 tw.values[axisIdx] = new_val;
-                if (isEnd) return tw.cfgHalt;
+                if (isEnd) return cfgHalt;
             }
         }
 
@@ -1650,8 +1674,19 @@ private:
         }
 
         switch (haltAction) {
+        case kTweqHaltSlay: {
+            // Slay is a damage-kill in the original — death reaction, AI
+            // notification — not a bare removal. With no damage system yet it
+            // is treated as Destroy, which is right about the object leaving
+            // and silent about everything else that should have happened.
+            static int warnCount = 0;
+            if (warnCount++ < 3)
+                std::fprintf(stderr, "[FALLBACK] TweqSystem: obj %d slain by a "
+                             "tweq — treated as a plain destroy; no death "
+                             "reaction or AI notification\n", tw.objID);
+            [[fallthrough]];
+        }
         case kTweqHaltDestroy:
-        case kTweqHaltSlay:
             // Mark object as destroyed — the renderer skips it from here on.
             if (mObjectStates) {
                 mObjectStates->get(tw.objID).flags |= kObjStateDestroyed;
@@ -1678,9 +1713,18 @@ private:
             tw.active = false;
             break;
 
-        case kTweqHaltRemoveProp:
+        case kTweqHaltRemoveProp: {
+            // The original removes the tweq property outright, leaving the
+            // object. We only stop the instance, so the tweq can be restarted
+            // by a message where the original would have needed it re-added.
+            static int warnCount = 0;
+            if (warnCount++ < 3)
+                std::fprintf(stderr, "[FALLBACK] TweqSystem: obj %d halt action "
+                             "RemoveProp — the tweq is stopped but its property "
+                             "is not removed\n", tw.objID);
             tw.active = false;
             break;
+        }
 
         case kTweqHaltStop:
             tw.active = false;

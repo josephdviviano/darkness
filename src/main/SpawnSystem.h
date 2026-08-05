@@ -225,6 +225,22 @@ public:
             reportOnce(req.archetypeName,
                        "the archetype has no ModelName, so it spawns invisible");
 
+        // The emission flags that change WHERE or HOW an object spawns are
+        // carried on the request and not acted on. Named individually rather
+        // than dropped in silence, because each one moves the object.
+        if (req.miscFlags & (kTweqMiscVHot | kTweqMiscPushOut |
+                             kTweqMiscGravity | kTweqMiscNoPhysics)) {
+            static int warnCount = 0;
+            if (warnCount++ < 3)
+                std::fprintf(stderr, "[FALLBACK] SpawnSystem: obj %d ignores "
+                             "emission flags 0x%03x%s%s%s%s\n", objID,
+                             req.miscFlags,
+                             (req.miscFlags & kTweqMiscVHot) ? " VHot(anchor at vhot)" : "",
+                             (req.miscFlags & kTweqMiscPushOut) ? " PushOut(clear the emitter)" : "",
+                             (req.miscFlags & kTweqMiscGravity) ? " Gravity" : "",
+                             (req.miscFlags & kTweqMiscNoPhysics) ? " NoPhysics" : "");
+        }
+
         // Velocity is carried on the request but nothing integrates it yet:
         // emitted objects need a dynamic physics body, which object physics
         // does not create at runtime. Announced rather than silently dropped.
