@@ -538,6 +538,80 @@ TEST_CASE("TweqSystem: a joints tweq does not trample a lock's joint slot",
     REQUIRE(states.tryGet(940)->joints[0] == Approx(90.0f));
 }
 
+// ── Update-rate gates ──
+
+namespace {
+
+/// A rotate tweq that runs forever, so any missed tick shows up as a value.
+Darkness::TweqInstance makeGatedTweq(int32_t objID, uint8_t animFlags) {
+    Darkness::TweqInstance tw;
+    tw.objID = objID;
+    tw.type = Darkness::kTweqTypeRotate;
+    tw.cfgAnim = animFlags | Darkness::kTweqAnimNoLimit;
+    tw.cfgHalt = Darkness::kTweqHaltContinue;
+    tw.axes[0] = {90.0f, 0.0f, 360.0f};
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.hasObjectState = true;
+    return tw;
+}
+
+float runGated(uint8_t animFlags, bool onScreen, bool gatingOn = true) {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    sys.setVisibilityGating(gatingOn);
+    sys.setVisibilityQuery([onScreen](int32_t) { return onScreen; });
+    sys.injectForTest(makeGatedTweq(950, animFlags), &states);
+    sys.simStep(0.0f, 0.1f);
+    return sys.getInstanceForTest(950, Darkness::kTweqTypeRotate)->values[0];
+}
+
+} // namespace
+
+TEST_CASE("TweqSystem: an ungated tweq ticks only while on screen", "[Tweq][Gate]") {
+    // 184 of 456 shipped configs carry neither SIM nor OFFSCRN.
+    REQUIRE(runGated(0, /*onScreen=*/true)  == Approx(90.0f));
+    REQUIRE(runGated(0, /*onScreen=*/false) == Approx(0.0f));
+}
+
+TEST_CASE("TweqSystem: a SIM tweq ticks regardless of visibility", "[Tweq][Gate]") {
+    REQUIRE(runGated(Darkness::kTweqAnimSim, true)  == Approx(90.0f));
+    REQUIRE(runGated(Darkness::kTweqAnimSim, false) == Approx(90.0f));
+}
+
+TEST_CASE("TweqSystem: an OFFSCRN tweq runs only when NOT on screen",
+          "[Tweq][Gate]") {
+    // The inverse of the default, not a relaxation of it — getting this
+    // backwards is what made these count down in view.
+    REQUIRE(runGated(Darkness::kTweqAnimOffscreen, false) == Approx(90.0f));
+    REQUIRE(runGated(Darkness::kTweqAnimOffscreen, true)  == Approx(0.0f));
+}
+
+TEST_CASE("TweqSystem: OFFSCRN beats SIM when both are set", "[Tweq][Gate]") {
+    const uint8_t both = Darkness::kTweqAnimOffscreen | Darkness::kTweqAnimSim;
+    REQUIRE(runGated(both, false) == Approx(90.0f));
+    REQUIRE(runGated(both, true)  == Approx(0.0f));
+}
+
+TEST_CASE("TweqSystem: gating off ticks everything, whatever the flags",
+          "[Tweq][Gate]") {
+    // The relaxation dial: fidelity gives way to look, not to speed.
+    REQUIRE(runGated(0, false, /*gatingOn=*/false) == Approx(90.0f));
+    REQUIRE(runGated(Darkness::kTweqAnimOffscreen, true, false) == Approx(90.0f));
+}
+
+TEST_CASE("TweqSystem: with no visibility query wired, nothing is gated",
+          "[Tweq][Gate]") {
+    // Fail open. A gate that cannot answer must not silently freeze the world.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    sys.setVisibilityGating(true);            // on, but no query wired
+    sys.injectForTest(makeGatedTweq(951, 0), &states);
+    sys.simStep(0.0f, 0.1f);
+    REQUIRE(sys.getInstanceForTest(951, Darkness::kTweqTypeRotate)->values[0]
+            == Approx(90.0f));
+}
+
 // ── Emitter tweq ──
 
 namespace {

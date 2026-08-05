@@ -147,6 +147,15 @@ struct EmitRequest {
 
 using EmitCallback = std::function<void(const EmitRequest &)>;
 
+// ── Query: is this object currently on screen? ──
+//
+// CONTRACT: returns true when the object is visible OR when it is not
+// renderable at all. The second half matters — an invisible marker with a
+// delete countdown (waypoints, particle anchors) must not be frozen forever
+// by a gate whose whole premise is "the player can see it". The renderer owns
+// that distinction, so it answers rather than the sim guessing.
+using VisibilityQuery = std::function<bool(int32_t objID)>;
+
 // ── Callback fired when a tweq destroys or slays its object ──
 // Wired to whatever has to take the object out of the live world: physics
 // bodies, the spatial index, world queries. Unlike TweqEventCallback this is
@@ -357,6 +366,28 @@ public:
         }
     }
 
+    /// Does this tweq get a tick this frame?
+    ///
+    /// The config word's anim bits are update-RATE gates, not activation:
+    ///   OFFSCRN  run ONLY while off screen (9 shipped configs) — the inverse
+    ///            of the default, not merely a relaxation of it
+    ///   SIM      run always (272 shipped configs)
+    ///   neither  run only while on screen (184 shipped configs)
+    ///
+    /// The two radius gates are deliberately NOT applied: their distances
+    /// (nominally 20 and 80 units) have no derivation, and this file already
+    /// shipped one inherited guess about these flags that turned out wrong.
+    /// SIMRADSM appears on zero shipped configs and SIMRADLG on 11, so leaving
+    /// them ungated costs 11 objects a slightly-too-eager tick.
+    bool shouldTickThisFrame(const TweqInstance &tw) const {
+        if (!mVisibilityGating || !mVisibilityQuery) return true;  // fail open
+
+        const bool onScreen = mVisibilityQuery(tw.objID);
+        if (tw.cfgAnim & kTweqAnimOffscreen) return !onScreen;
+        if (tw.cfgAnim & kTweqAnimSim) return true;
+        return onScreen;
+    }
+
     /// Drop every tweq instance belonging to an object that has left the
     /// world. Without this a destroyed object's OTHER tweqs keep running —
     /// a Models tweq goes on rewriting modelNameOverride forever — and the
@@ -379,6 +410,23 @@ public:
 
     /// Number of emissions requested so far (diagnostics).
     uint32_t emissionCount() const { return mEmitFired; }
+
+    /// Wire the on-screen test used by the update-rate gates. Until this is
+    /// set the gates cannot be applied and every tweq ticks every frame.
+    void setVisibilityQuery(VisibilityQuery q) { mVisibilityQuery = std::move(q); }
+
+    /// Turn the update-rate gates on or off.
+    ///
+    /// ON is faithful: the config word's flags say when a tweq should tick, and
+    /// 184 of the 456 shipped configs are gated to "only while on screen".
+    /// OFF ticks everything every frame, which costs almost nothing (measured
+    /// 0.054 ms/frame for all 539 tweq instances of the heaviest shipped level,
+    /// ~0.3% of a 60 Hz budget) and is the escape hatch if faithful gating ever
+    /// reads worse than it simulates — a part caught mid-motion as it comes on
+    /// screen, say. This is a look-versus-fidelity dial, NOT a performance one.
+    void setVisibilityGating(bool on) { mVisibilityGating = on; }
+
+    bool visibilityGating() const { return mVisibilityGating; }
 
     /// Set the callback that turns an emitter tweq's emission into a live
     /// object. Without it, emissions are counted and reported but nothing
@@ -404,6 +452,7 @@ public:
 
         for (auto &[key, tw] : mTweqs) {
             if (!tw.active) continue;
+            if (!shouldTickThisFrame(tw)) continue;
 
             int result = kTweqStatusQuo;
             const char *typeName = "?";
@@ -632,17 +681,13 @@ private:
             // and MISS13's 80 emitter states are stored off yet every one of
             // them began emitting at load.
 
-            // The update-rate gates are parsed but not yet honoured: every
-            // tweq ticks every frame regardless. That is more work than the
-            // original did, not less, so nothing stops animating — but an
-            // OFFSCRN tweq counts down in view when it should not.
-            if (tw.cfgAnim & (kTweqAnimSimSmallRadius | kTweqAnimSimLargeRadius |
-                              kTweqAnimOffscreen)) {
+            // The two radius gates stay unapplied — see shouldTickThisFrame.
+            if (tw.cfgAnim & (kTweqAnimSimSmallRadius | kTweqAnimSimLargeRadius)) {
                 static int warnCount = 0;
                 if (warnCount++ < 3)
-                    std::fprintf(stderr, "[FALLBACK] TweqSystem: obj %d has an "
-                                 "update-rate gate (anim=0x%02x: radius/offscreen) "
-                                 "that is not honoured — it ticks every frame\n",
+                    std::fprintf(stderr, "[FALLBACK] TweqSystem: obj %d has a "
+                                 "radius update gate (anim=0x%02x) that is not "
+                                 "applied — it ticks whenever it is on screen\n",
                                  objID, tw.cfgAnim);
             }
 
@@ -1635,6 +1680,8 @@ private:
     TweqEventCallback mEventCallback;
     ObjectDestroyCallback mDestroyCallback;
     EmitCallback mEmitCallback;
+    VisibilityQuery mVisibilityQuery;
+    bool mVisibilityGating = true;
     uint32_t mEmitFired = 0;
     // Objects destroyed during a step, torn down after it. See handleCompletion().
     std::vector<int32_t> mPendingDestroys;
