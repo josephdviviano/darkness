@@ -262,14 +262,15 @@ public:
         return std::clamp((door.currentValue - signedClosed) / range, 0.0f, 1.0f);
     }
 
-    /// Get the open fraction for a portal between two rooms.
-    /// Returns 1.0 (fully open) if no door exists between those rooms.
-    float getOpenFractionForRooms(int32_t room1, int32_t room2) const {
-        uint64_t key = roomPairKey(room1, room2);
-        auto it = mRoomPairToDoor.find(key);
-        if (it == mRoomPairToDoor.end()) return 1.0f;
-        return getOpenFraction(it->second);
-    }
+    // There is deliberately no getOpenFractionForRooms(). Renderer visibility
+    // must not be keyed on the room pair: mRoomPairToDoor holds one door per
+    // pair (so a double door's second leaf can never unblock anything), and a
+    // Thief doorway carries its own thin threshold room brush, so blocking the
+    // pair drops the doorway's own cells and stops the jamb / head / threshold
+    // reveal from being drawn. Bind to the opening instead — see
+    // DoorPortalBinding.h. The sound path below is a different question: it
+    // wants "how much does the door between these two rooms muffle", which
+    // genuinely is a room-pair property.
 
     /// Get the sound blocking factor (0.0-1.0) for a portal between two rooms.
     /// Returns 0.0 if no door or door is fully open.
@@ -350,6 +351,17 @@ public:
             out.push_back(std::move(geom));
         }
         return out;
+    }
+
+    /// The door's world transform at its CLOSED pose — rigid (rotation +
+    /// translation, no scale), matching the convention of the audio OBB mesh
+    /// whose vertices already carry world dimensions. This is the pose at
+    /// which the leaf fills its opening, so it is what the renderer's
+    /// door→WR-portal binding measures against. Identity if unknown.
+    Matrix4 getClosedWorldMatrix(int32_t objID) const {
+        auto it = mDoors.find(objID);
+        if (it == mDoors.end()) return Matrix4(1.0f);
+        return computeAudioWorldMatrixAt(it->second, it->second.closedValue);
     }
 
     /// Get all door IDs (for debug enumeration).
@@ -965,8 +977,11 @@ private:
     void applyDoorTransform(DoorState &door) {
         if (!mObjectStates) return;
 
-        ObjectState &os = mObjectStates->get(door.objID);
         Matrix4 fullGlm(1.0f);
+        // Where the door reports itself for queries. Rotating doors keep the
+        // hinge-anchored base position (the centre traces an arc, so neither
+        // end of it is a better answer); translating doors add their offset.
+        Vector3 queryPos = door.basePosition;
         // Audio mesh uses the unscaled transform — its vertices already encode
         // world dimensions (see DoorAudioGeometry / buildBoxMesh).
         Matrix4 audioGlm = computeAudioWorldMatrix(door);
@@ -1001,17 +1016,6 @@ private:
                 fullGlm = worldTranslate * baseMat * fromPivot * offsetRot * toPivot * scaleMat;
             }
 
-            // Copy GLM column-major matrix directly to the model matrix.
-            // bgfx passes the float[16] to the GPU without transposing, and
-            // the GPU reads it as column-major — which is GLM's native format.
-            // No 3x3 transpose needed (and doing one breaks pivot transforms
-            // by inverting the rotation while leaving translation unchanged).
-            std::memcpy(os.modelMatrix, glm::value_ptr(fullGlm), 16 * sizeof(float));
-
-            os.hasMatrix = true;
-            os.position = door.basePosition;  // approximate for queries
-            os.scale = door.baseScale;
-
         } else {
             // Translating door: offset position along axis in object-local frame
             float offset = door.currentValue;
@@ -1035,18 +1039,26 @@ private:
             Matrix4 scaleMat = glm::scale(Matrix4(1.0f), door.baseScale);
             fullGlm = worldTranslate * transMat * door.baseRotation * scaleMat;
 
-            float *m = os.modelMatrix;
-            for (int col = 0; col < 3; ++col)
-                for (int row = 0; row < 3; ++row)
-                    m[row * 4 + col] = fullGlm[col][row];
-            m[ 3] = 0.0f; m[ 7] = 0.0f; m[11] = 0.0f;
-            m[12] = fullGlm[3][0]; m[13] = fullGlm[3][1];
-            m[14] = fullGlm[3][2]; m[15] = 1.0f;
-
-            os.hasMatrix = true;
-            os.position = door.basePosition + worldOffset;
-            os.scale = door.baseScale;
+            queryPos = door.basePosition + worldOffset;
         }
+
+        // One copy-out for both door types, shared with every other sim
+        // system (TweqSystem, MovingTerrainSystem, PressurePlateSystem,
+        // DarkPhysics). DoorSystem used to hand-roll this twice, and the two
+        // copies drifted: the translating branch transposed the 3x3 on its
+        // way out. GLM's column-major storage and bgfx's row-major/row-vector
+        // storage are the same 16 floats for a given transform, so that
+        // transpose stored the INVERSE rotation while leaving the translation
+        // alone — mis-orienting every sliding door whose base facing was not
+        // axis-aligned, the moment it started moving, and desyncing the drawn
+        // pose from the collision OBB (mCollisionUpdateCb) and the acoustic
+        // mesh (mAudioMeshUpdateCb), both of which take fullGlm untransposed.
+        // Going through the shared helper also keeps os.orientation in step,
+        // which the hand-rolled copies never did — so IWorldQuery::
+        // getOrientation reported a door's pre-animation facing to AI, audio
+        // and anything else that asked.
+        applyModelMatrix(*mObjectStates, door.objID, fullGlm,
+                         queryPos, door.baseScale);
 
         // Update collision body to match the new visual transform.
         // fullGlm includes position, rotation, pivot, and scale — everything
