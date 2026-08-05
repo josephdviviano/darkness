@@ -1266,3 +1266,116 @@ TEST_CASE("ScriptRegistry: all registered scripts accessible", "[ScriptManager]"
     REQUIRE(all.count("TimerTestScript") > 0);
 }
 
+
+// ============================================================================
+// applyModelMatrix — the GLM → ObjectState copy-out convention
+// ============================================================================
+//
+// Every sim system that animates an object composes a GLM matrix and hands
+// the same 16 floats to three consumers: the renderer (bgfx), the collision
+// OBB, and the acoustic mesh. GLM stores column-major with column vectors;
+// bgfx stores row-major with row vectors. For one transform those are the
+// SAME 16 floats — so the copy is a straight memcpy, and transposing the 3x3
+// on the way out silently stores the inverse rotation while leaving the
+// translation alone.
+//
+// DoorSystem used to hand-roll this copy in each of its two branches and the
+// translating one did exactly that transpose, mis-orienting sliding doors
+// whose base facing was not axis-aligned. Both branches now go through
+// applyModelMatrix, so this is the one place the convention can break.
+
+namespace {
+
+// A translating door's product: T(base) * T(offset) * R_base * S.
+Darkness::Matrix4 slidingDoorTransform() {
+    const float heading = 0.7853981634f;   // 45° — transpose != original
+    Darkness::Matrix4 rot(glm::mat3(glm::eulerAngleZYX(heading, 0.0f, 0.0f)));
+    return glm::translate(Darkness::Matrix4(1.0f), Darkness::Vector3(10, -4, 3))
+         * glm::translate(Darkness::Matrix4(1.0f), Darkness::Vector3(0, 2, 0))
+         * rot
+         * glm::scale(Darkness::Matrix4(1.0f), Darkness::Vector3(1.0f, 0.25f, 2.0f));
+}
+
+// Apply a float[16] the way bgfx does: row-major storage, row vectors.
+Darkness::Vector3 bgfxTransform(const float *m, const Darkness::Vector3 &v) {
+    return Darkness::Vector3(
+        v.x * m[0] + v.y * m[4] + v.z * m[8]  + m[12],
+        v.x * m[1] + v.y * m[5] + v.z * m[9]  + m[13],
+        v.x * m[2] + v.y * m[6] + v.z * m[10] + m[14]);
+}
+
+} // namespace
+
+TEST_CASE("applyModelMatrix: stored floats mean the same transform to bgfx",
+          "[SimCommon]") {
+    Darkness::ObjectStateMap states;
+    const Darkness::Matrix4 full = slidingDoorTransform();
+
+    Darkness::applyModelMatrix(states, 100, full,
+                               Darkness::Vector3(10, -2, 3),
+                               Darkness::Vector3(1.0f, 0.25f, 2.0f));
+
+    const Darkness::ObjectState *os = states.tryGet(100);
+    REQUIRE(os != nullptr);
+    REQUIRE(os->hasMatrix);
+
+    // A corner of the door leaf must land in the same place for the renderer
+    // as it does for the collision OBB and the acoustic mesh, which consume
+    // the GLM matrix directly.
+    const Darkness::Vector3 local(2.0f, 0.5f, -4.0f);
+    const Darkness::Vector3 viaGlm(full * glm::vec4(local, 1.0f));
+    const Darkness::Vector3 viaBgfx = bgfxTransform(os->modelMatrix, local);
+
+    CHECK(viaBgfx.x == Catch::Approx(viaGlm.x).margin(1e-4));
+    CHECK(viaBgfx.y == Catch::Approx(viaGlm.y).margin(1e-4));
+    CHECK(viaBgfx.z == Catch::Approx(viaGlm.z).margin(1e-4));
+}
+
+TEST_CASE("applyModelMatrix: transposing the 3x3 would break it",
+          "[SimCommon]") {
+    // Guards the test above against becoming vacuous: with a 45° base facing
+    // the transposed copy-out really does land the corner somewhere else, so
+    // reintroducing DoorSystem's old hand-rolled loop fails the check.
+    const Darkness::Matrix4 full = slidingDoorTransform();
+
+    float transposed[16] = {};
+    for (int col = 0; col < 3; ++col)
+        for (int row = 0; row < 3; ++row)
+            transposed[row * 4 + col] = full[col][row];
+    transposed[12] = full[3][0]; transposed[13] = full[3][1];
+    transposed[14] = full[3][2]; transposed[15] = 1.0f;
+
+    const Darkness::Vector3 local(2.0f, 0.5f, -4.0f);
+    const Darkness::Vector3 viaGlm(full * glm::vec4(local, 1.0f));
+    const Darkness::Vector3 viaOldCopy = bgfxTransform(transposed, local);
+
+    CHECK(glm::length(viaOldCopy - viaGlm) > 1.0f);
+}
+
+TEST_CASE("applyModelMatrix: orientation is kept in step with the matrix",
+          "[SimCommon]") {
+    // The hand-rolled copies never updated os.orientation, so a door reported
+    // its pre-animation facing to IWorldQuery::getOrientation — and through it
+    // to AI and audio — for as long as it was moving.
+    Darkness::ObjectStateMap states;
+    const float heading = 0.7853981634f;
+    Darkness::Matrix4 rot(glm::mat3(glm::eulerAngleZYX(heading, 0.0f, 0.0f)));
+    // Non-uniform scale must not leak into the quaternion.
+    const Darkness::Matrix4 full =
+        glm::translate(Darkness::Matrix4(1.0f), Darkness::Vector3(1, 2, 3)) * rot
+        * glm::scale(Darkness::Matrix4(1.0f), Darkness::Vector3(1.0f, 0.25f, 2.0f));
+
+    Darkness::applyModelMatrix(states, 101, full, Darkness::Vector3(1, 2, 3),
+                               Darkness::Vector3(1.0f, 0.25f, 2.0f));
+
+    const Darkness::ObjectState *os = states.tryGet(101);
+    REQUIRE(os != nullptr);
+
+    // Rotating the leaf's local +X by the reported orientation must match
+    // rotating it by the matrix's own (scale-stripped) basis.
+    const Darkness::Vector3 fwd = os->orientation * Darkness::Vector3(1, 0, 0);
+    const Darkness::Vector3 expect = glm::normalize(Darkness::Vector3(rot[0]));
+    CHECK(fwd.x == Catch::Approx(expect.x).margin(1e-4));
+    CHECK(fwd.y == Catch::Approx(expect.y).margin(1e-4));
+    CHECK(fwd.z == Catch::Approx(expect.z).margin(1e-4));
+}
