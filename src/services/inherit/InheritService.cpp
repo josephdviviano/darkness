@@ -307,9 +307,11 @@ int InheritService::getArchetype(int objID) const {
 
     if (it != mInheritSources.end()) {
         // The 'it' is a pointer to a map (dstID, LinkDataPtr)
-        InheritLinkMap::const_iterator it2 = it->second.begin();
-
-        while (it2 != it->second.end()) {
+        // Priority 0 is the archetype link; anything else is a metaproperty.
+        // This loop used to never advance its iterator, so an object whose
+        // first entry was a metaproperty hung the process outright.
+        for (InheritLinkMap::const_iterator it2 = it->second.begin();
+             it2 != it->second.end(); ++it2) {
             if (it2->second.priority == 0) {
                 return it2->second.srcID;
             }
@@ -433,38 +435,49 @@ void InheritService::_addLink(const Link &link, unsigned int priority) {
 
 //------------------------------------------------------
 void InheritService::_changeLink(const Link &link, unsigned int priority) {
-    // Modify priority of the link
-    InheritMap::iterator it = mInheritSources.find(link.dst());
+    // Keyed exactly as _addLink stored it: mInheritSources is keyed by the
+    // inheriting object, which is link.src(). This used to look up
+    // mInheritSources[link.dst()][link.src()] — both halves swapped — and then
+    // dereference the inner iterator without checking it, so it either did
+    // nothing or read off the end.
+    InheritMap::iterator it = mInheritSources.find(link.src());
 
     if (it != mInheritSources.end()) {
-        // now insert for the link.src, with the InheritLink struct
-        InheritLinkMap::iterator it2 = it->second.find(link.src());
+        InheritLinkMap::iterator it2 = it->second.find(link.dst());
 
-        it2->second.priority = priority;
-    } else
-        DARKNESS_EXCEPT("Could not find the link to change the priority for");
+        if (it2 != it->second.end()) {
+            it2->second.priority = priority;
+            return;
+        }
+    }
+    DARKNESS_EXCEPT("Could not find the link to change the priority for");
 }
 
 //------------------------------------------------------
 void InheritService::_removeLink(const Link &link) {
-    InheritMap::iterator it = mInheritSources.find(link.dst());
+    // Mirror of _addLink, which stores mInheritSources[link.src()][link.dst()]
+    // and mInheritTargets[link.dst()][link.src()]. This had BOTH lookups
+    // swapped, so it never found the link it was asked to remove and threw
+    // instead — which made destroying any runtime-created object abort, since
+    // tearing it down removes its archetype link. getArchetype settles which
+    // way round the maps go: it reads mInheritSources keyed by the inheriting
+    // object and returns the archetype it finds there.
+    InheritMap::iterator it = mInheritSources.find(link.src());
 
     if (it != mInheritSources.end()) {
-        // now insert for the link.src, with the InheritLink struct
-        InheritLinkMap::iterator it2 = it->second.find(link.src());
+        InheritLinkMap::iterator it2 = it->second.find(link.dst());
 
         if (it2 != it->second.end())
             it->second.erase(it2);
         else
-            DARKNESS_EXCEPT("Could not find the link to change the priority for");
+            DARKNESS_EXCEPT("Could not find the inherit link to remove");
     } else
-        DARKNESS_EXCEPT("Could not find the link to change the priority for");
+        DARKNESS_EXCEPT("Could not find the inherit link to remove");
 
     // Same again, for the targets
-    it = mInheritTargets.find(link.src());
+    it = mInheritTargets.find(link.dst());
     if (it != mInheritTargets.end()) {
-        // now insert for the link.src, with the InheritLink struct
-        InheritLinkMap::iterator it2 = it->second.find(link.dst());
+        InheritLinkMap::iterator it2 = it->second.find(link.src());
 
         if (it2 != it->second.end())
             it->second.erase(it2);
