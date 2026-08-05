@@ -102,8 +102,30 @@ void WorkerThreadPool::shutdown() {
 
     POOL_LOG_INFO("WorkerThreadPool: shutting down...");
 
-    // Signal all workers to exit and wake them
-    mShutdown.store(true, std::memory_order_release);
+    // Signal all workers to exit and wake them.
+    //
+    // The store MUST happen under mQueueMutex even though mShutdown is atomic.
+    // Workers wait on mQueueCV with a predicate that reads mShutdown, and
+    // wait(lock, pred) evaluates that predicate while holding the mutex before
+    // atomically releasing it and registering as a waiter. Storing and
+    // notifying without the mutex can land entirely inside that window: the
+    // worker has already seen mShutdown false, is not yet a registered waiter,
+    // the notification reaches nobody, and the worker then blocks forever
+    // while shutdown() blocks forever in join().
+    //
+    // This deadlocked the test suite intermittently — roughly one run in
+    // three — with the main thread in thread::join() and a worker parked in
+    // condition_variable::wait(). Taking the mutex closes the window: the
+    // worker is then either already registered (so notify_all reaches it) or
+    // has not yet evaluated the predicate (so it observes the flag).
+    //
+    // The task-submission paths were already correct — they mutate the queue
+    // inside a locked scope and notify after it — and the completion CV below
+    // uses an empty lock_guard for exactly this reason.
+    {
+        std::lock_guard<std::mutex> lock(mQueueMutex);
+        mShutdown.store(true, std::memory_order_release);
+    }
     mQueueCV.notify_all();
 
     // Join all worker threads — ensures in-flight tasks complete before cleanup

@@ -39,6 +39,7 @@ Property::Property(PropertyService *owner, const std::string &name,
 
     // Find the inheritor by the name, and assign too
     mInheritService = GET_SERVICE(InheritService);
+    mInheritorName = inheritorName;
     mInheritor = mInheritService->createInheritor(inheritorName);
 
     // And as a final step, register as inheritor listener
@@ -60,6 +61,7 @@ Property::Property(PropertyService *owner, const std::string &name,
 
     // Find the inheritor by the name, and assign too
     mInheritService = GET_SERVICE(InheritService);
+    mInheritorName = inheritorName;
     mInheritor = mInheritService->createInheritor(inheritorName);
 
     // And as a final step, register as inheritor listener

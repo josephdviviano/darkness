@@ -49,12 +49,15 @@
 #include "LightingSystem.h"
 #include "ObjectPropParser.h"
 #include "BinMeshParser.h"
+#include "ObjectVisibility.h"
 #include "SpawnFinder.h"
 #include "TXListParser.h"
 #include "PCXDecoder.h"
 #include "RenderParamsParser.h"
 #include "ObjectIllumination.h"
 #include "DynamicLightList.h"
+#include "CoronaSystem.h"
+#include "PostProcess.h"
 #include "AutoFlyTour.h"
 #include "AutoRunTour.h"
 #include "AudioCaptureSpin.h"
@@ -93,6 +96,9 @@ struct MissionData {
     // Sky
     SkyParams                                         skyParams;
     SkyDome                                           skyDome;
+    // Sun/moon glow disc built from SKYOBJVAR's glow_* fields. Empty when
+    // the mission authored no glow (or supplied no SKYOBJVAR at all).
+    SkyDome                                           skyGlow;
     std::unordered_map<std::string, DecodedImage>     skyboxImages;
 
     // Fog
@@ -170,9 +176,15 @@ struct GPUResources {
     // texturedProgram / flatProgram pair when per-vertex shading is on.
     bgfx::ProgramHandle texturedPerVertexProgram   = BGFX_INVALID_HANDLE;
     bgfx::ProgramHandle basicPerVertexProgram      = BGFX_INVALID_HANDLE;
+    // Light coronas — additive billboard with a float4 vertex colour, so the
+    // per-corona tint can exceed 1.0 and reach bloom.
+    bgfx::ProgramHandle coronaProgram              = BGFX_INVALID_HANDLE;
 
     // Uniforms
     bgfx::UniformHandle s_texColor     = BGFX_INVALID_HANDLE;
+    // Corona depth fade: scene depth sampler + (fadeRange, zNear, zFar, on).
+    bgfx::UniformHandle s_texDepth     = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_coronaDepth  = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle s_texLightmap  = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_waterParams  = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_waterFlow    = BGFX_INVALID_HANDLE;
@@ -218,10 +230,25 @@ struct GPUResources {
     bgfx::IndexBufferHandle   skyIBH = BGFX_INVALID_HANDLE;
     uint32_t                  skyIndexCount = 0;
 
+    // Sun/moon glow disc from SKYOBJVAR's glow_* fields. Drawn additively
+    // over whichever sky is active, dome or skybox.
+    bgfx::VertexBufferHandle  skyGlowVBH = BGFX_INVALID_HANDLE;
+    bgfx::IndexBufferHandle   skyGlowIBH = BGFX_INVALID_HANDLE;
+    uint32_t                  skyGlowIndexCount = 0;
+
+    // Corona sprites from bitmap.crf, keyed by the bare name a P$Corona
+    // record's `texture` field holds ("corona", "corblu", "cororn").
+    std::unordered_map<std::string, bgfx::TextureHandle>   coronaTexHandles;
+
     // Skybox
     bgfx::VertexBufferHandle  skyboxVBH = BGFX_INVALID_HANDLE;
     bgfx::IndexBufferHandle   skyboxIBH = BGFX_INVALID_HANDLE;
     std::unordered_map<std::string, bgfx::TextureHandle>   skyboxTexHandles;
+
+    // Post-process: offscreen scene target + composite program/uniforms.
+    // Owns its own teardown via destroyPostProcess(), including the
+    // composite program, so it is not part of the program block above.
+    PostProcessResources postProcess;
 };
 
 // ── Per-frame uniform-buffer budget ──
@@ -338,6 +365,36 @@ struct RuntimeState {
     float waterRotation = 0.015f;
     float waterScrollSpeed = 0.05f;
 
+    // Post-process composite settings. Same mirror-the-config contract as the
+    // water block above: main() overwrites these from the resolved config
+    // before the first frame. Defaults are the identity transform with the
+    // pass disabled, so a directly-constructed RuntimeState renders exactly
+    // what the pre-post-process pipeline did.
+    PostProcessSettings postProcess;
+
+    // Sun/moon glow from SKYOBJVAR. Intensity multiplies the mission's own
+    // authored glow_scale; values above 1.0 push the glow past unity in the
+    // HDR target, which is what makes it bloom. Default 1.0 = mission
+    // intent, unmodified.
+    bool  skyGlowEnabled   = true;
+    float skyGlowIntensity = 1.0f;
+
+    // Sky overbright multiplier. 1.0 = untouched (original fidelity).
+    // Above 1.0 pushes the brightest sky texels — in practice the moon,
+    // which is painted into the skybox faces — past 1.0 in the HDR target
+    // so bloom can pick them up. Proportional, so dark sky stays dark.
+    float skyOverbright = 1.0f;
+
+    // Light coronas. Same mirror-the-config contract as the water and
+    // post-process blocks above: main() overwrites `coronaSettings` from the
+    // resolved config before the first frame. `coronas` is the resolved
+    // corona list, built once at load.
+    CoronaRuntime  coronas;
+    CoronaSettings coronaSettings;
+    // Scratch for the per-frame quad batches. Held as state so the vectors
+    // keep their capacity instead of reallocating every frame.
+    mutable std::vector<CoronaBatch> coronaBatches;
+
     // Per-object lighting (Dark Engine convention: ambient + cell-light-list
     // sum + sun + P$ExtraLight). When disabled, objects render at their
     // material color (the historical behavior). Toggle via debug console.
@@ -368,6 +425,10 @@ struct RuntimeState {
     // thrown, a clock running); everything else reads the model's shared
     // rest matrices. `mutable` for the same reason as gpuLightScratch.
     mutable std::vector<Matrix4> subObjMatrixScratch;
+
+    // What the renderer drew last frame, consumed by the tweq update-rate
+    // gates. Owned by main(); null when the gates are not wired.
+    ObjectVisibility *objectVisibility = nullptr;
 
     // Per-frame uniform-buffer budget accounting (see the
     // kFrameUniformBudgetBytes block above for why this exists). Reset
@@ -678,6 +739,27 @@ struct RuntimeState {
             || showVoiceArrows;
     }
 };
+
+// Wrap mode for every diffuse texture (world terrain, object meshes, flowing
+// water): plain REPEAT, which bgfx spells as "no wrap bits set". Named rather
+// than written inline so the four creation sites and the per-frame sampler in
+// prepareFrame() cannot drift apart again.
+//
+// This used to be BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR, which
+// reflects the image on every odd tile. The WR texture projection
+// (buildTexturedMesh / buildLightmappedMesh) emits unbounded, frequently
+// negative UVs — a wall's V typically runs downward from the origin vertex —
+// so which tile a polygon lands on is arbitrary. Under mirroring that decided
+// its orientation: measured over MISS1/MISS2/MISS12, 15–22% of textured solid
+// polygons sit wholly on an odd V tile and rendered upside-down, ~20–24% sit
+// on an odd U tile and rendered left-right reversed, and 58–70% straddle a
+// tile edge and showed a mirror seam partway across the face. Tiling
+// stonework hides all of that; anything with a distinct top and bottom
+// (windows, doors, signage) does not.
+//
+// Do not reintroduce mirroring to hide seams — authored level data assumes
+// repeat, and only repeat puts these textures the right way up.
+static constexpr uint32_t kDiffuseWrap = BGFX_SAMPLER_NONE;
 
 // ── FrameContext — Per-frame computed values ──
 // Returned by prepareFrame(), consumed by each render pass within

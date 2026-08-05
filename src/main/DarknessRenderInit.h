@@ -27,6 +27,7 @@
 #include "ai/AIHearingService.h"
 #include "sim/TweqSystem.h"
 #include "SubObjectPose.h"
+#include "SpawnSystem.h"
 
 // ── Initialize service stack and load mission database ──
 // Creates the ServiceManager with all 12 services, registers property/relation
@@ -161,6 +162,14 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
         registerRawProp("ModelName",   "ModelName", "always");
         registerRawProp("RenderType",  "RenderTyp", "always");
         registerRawProp("RenderAlpha", "RenderAlp", "always");
+        // Self-illumination scale, read per object by ObjectPropParser.
+        registerRawProp("SelfIllum",   "SelfIllum", "always");
+        // Runtime dynamic lights. SelfLitProducer walks P$SelfLit and folds
+        // in P$LightColor; without these registrations the walk finds
+        // nothing, which is precisely why it silently produced no lights
+        // before. LightColor is also read by the animated-light path.
+        registerRawProp("SelfLit",     "SelfLit",   "always");
+        registerRawProp("LightColor",  "LightColor", "always");
         // Scale uses "never" inheritor — kPropertyNoInherit in the original engine.
         // Archetype scales are physics bounding boxes, not visual model scales.
         registerRawProp("ModelScale",  "Scale",     "never");
@@ -348,6 +357,7 @@ static bool loadMissionData(const char *misPath,
     // Parse sky dome parameters from SKYOBJVAR chunk (if present)
     mission.skyParams = parseSkyObjVar(misPath);
     mission.skyDome = buildSkyDome(mission.skyParams);
+    mission.skyGlow = buildSkyGlow(mission.skyParams);
 
     // Parse global fog parameters from FOG chunk (if present)
     mission.fogParams = parseFogChunk(misPath);
@@ -630,6 +640,30 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
         }
     }
 
+    // Same for every archetype an emitter tweq can spawn. Models must be in the
+    // load set up front: a spawn happens mid-frame and cannot stall on a GPU
+    // upload, so an un-preloaded emission would simply be invisible.
+    {
+        Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+        Darkness::ObjectServicePtr objSvc = GET_SERVICE(Darkness::ObjectService);
+        auto emitModels = Darkness::SpawnSystem::collectEmitterModelNames(
+            propSvc.get(), objSvc.get());
+        if (!emitModels.empty()) {
+            int added = 0;
+            std::unordered_set<std::string> existing(
+                mission.objData.uniqueModels.begin(),
+                mission.objData.uniqueModels.end());
+            for (const auto &name : emitModels) {
+                if (!existing.count(name)) {
+                    mission.objData.uniqueModels.push_back(name);
+                    ++added;
+                }
+            }
+            std::fprintf(stderr, "SpawnSystem: %zu emitter target models, "
+                         "%d newly added for loading\n", emitModels.size(), added);
+        }
+    }
+
     // Load .bin models from obj.crf (if --res provided and objects enabled)
     if (state.showObjects && !resPath.empty()) {
         Darkness::CRFModelLoader modelLoader(resPath);
@@ -741,7 +775,11 @@ static void loadObjectAssets(const char *misPath, const std::string &resPath,
 // Initialize SDL2 window and bgfx rendering context.
 // Sets up 3 views: sky (0), world+objects (1), debug overlay (2).
 // Returns the SDL window, or nullptr on failure.
+/// `sceneW`/`sceneH` are the INTERNAL render resolution — equal to the window
+/// unless graphics.render_scale asks for less. Every scene view's rect is set
+/// from them; only the composite (set in createPostProcess) uses the window.
 static SDL_Window *initWindow(const Darkness::FogParams &fogParams,
+                              uint16_t sceneW, uint16_t sceneH,
                                uint32_t &outSkyClearColor) {
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -805,22 +843,30 @@ static SDL_Window *initWindow(const Darkness::FogParams &fogParams,
     }
     bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
                         outSkyClearColor, 1.0f, 0);
-    bgfx::setViewRect(0, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+    bgfx::setViewRect(0, 0, 0, sceneW, sceneH);
 
     // View 1: World + objects pass — clears depth only, preserves sky colour
-    bgfx::setViewClear(1, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
-    bgfx::setViewRect(1, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+    bgfx::setViewClear(Darkness::kViewWorld, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+    bgfx::setViewRect(Darkness::kViewWorld, 0, 0, sceneW, sceneH);
 
     // View 2: Debug overlay — no clear, renders on top of view 1.
     // Separate view ensures debug lines are drawn AFTER all world geometry,
     // regardless of bgfx's internal draw call sorting within a view.
-    bgfx::setViewClear(2, BGFX_CLEAR_NONE, 0, 1.0f, 0);
-    bgfx::setViewRect(2, 0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+    bgfx::setViewClear(Darkness::kViewDebug, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+    bgfx::setViewRect(Darkness::kViewDebug, 0, 0, sceneW, sceneH);
+
+    // View kViewCorona: light coronas, between world and debug. No clear —
+    // it draws additively over the world that view 1 just rendered, and on
+    // the depth-fade path it targets a framebuffer that has no depth
+    // attachment at all (see PostProcess.h).
+    bgfx::setViewClear(Darkness::kViewCorona, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+    bgfx::setViewRect(Darkness::kViewCorona, 0, 0, sceneW, sceneH);
 
     Darkness::PosColorVertex::init();
     Darkness::PosColorUVVertex::init();
     Darkness::PosUV2Vertex::init();
     Darkness::PosColorUVNormalVertex::init();
+    Darkness::CoronaVertex::init();
 
     return window;
 }
@@ -973,7 +1019,15 @@ static bool createGPUResources(const Darkness::MissionData &mission,
         bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_basic_pervertex"),
         true);
 
+    // Light coronas — additive billboard, float4 vertex colour.
+    gpu.coronaProgram = bgfx::createProgram(
+        bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_corona"),
+        bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_corona"),
+        true);
+
     gpu.s_texColor = bgfx::createUniform("s_texColor", bgfx::UniformType::Sampler);
+    gpu.s_texDepth = bgfx::createUniform("s_texDepth", bgfx::UniformType::Sampler);
+    gpu.u_coronaDepth = bgfx::createUniform("u_coronaDepth", bgfx::UniformType::Vec4);
     gpu.s_texLightmap = bgfx::createUniform("s_texLightmap", bgfx::UniformType::Sampler);
     gpu.u_waterParams = bgfx::createUniform("u_waterParams", bgfx::UniformType::Vec4);
     gpu.u_waterFlow = bgfx::createUniform("u_waterFlow", bgfx::UniformType::Vec4);
@@ -1092,14 +1146,16 @@ static bool createGPUResources(const Darkness::MissionData &mission,
         );
         gpu.ibh = bgfx::createIndexBuffer(ibMem, BGFX_BUFFER_INDEX32);
 
-        // Create bgfx textures with full mip chains from loaded images
+        // Create bgfx textures with full mip chains from loaded images.
+        // Wrap mode: REPEAT (kDiffuseWrap) — see its definition; mirroring
+        // flips the texture on odd tiles.
         for (const auto &kv : mission.loadedTextures) {
             uint8_t idx = kv.first;
             const auto &img = kv.second;
             gpu.textureHandles[idx] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
-                | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
+                | kDiffuseWrap,
                 MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
         std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", gpu.textureHandles.size());
@@ -1112,7 +1168,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
             const auto &img = kv.second;
             gpu.flowTextureHandles[fg] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
-                BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
+                kDiffuseWrap,
                 MipAlphaMode::ALPHA_BLEND, linearMips, sharpMips);
         }
         if (!gpu.flowTextureHandles.empty()) {
@@ -1149,7 +1205,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
             gpu.textureHandles[idx] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
-                | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
+                | kDiffuseWrap,
                 MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
         std::fprintf(stderr, "Created %zu GPU textures (mipmapped)\n", gpu.textureHandles.size());
@@ -1219,7 +1275,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
             gpu.objTextureHandles[kv.first] = createMipmappedTexture(
                 img.rgba.data(), img.width, img.height,
                 BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
-                | BGFX_SAMPLER_U_MIRROR | BGFX_SAMPLER_V_MIRROR,
+                | kDiffuseWrap,
                 MipAlphaMode::ALPHA_TEST, linearMips, sharpMips);
         }
         if (!gpu.objTextureHandles.empty()) {
@@ -1398,6 +1454,20 @@ static bool createGPUResources(const Darkness::MissionData &mission,
         gpu.skyIndexCount = static_cast<uint32_t>(mission.skyDome.indices.size());
     }
 
+    // ── Create sun/moon glow GPU buffers ──
+    // Independent of which sky is active: the glow sits in sky space, so it
+    // applies to the textured skybox as readily as to the procedural dome.
+    if (!mission.skyGlow.vertices.empty()) {
+        gpu.skyGlowVBH = bgfx::createVertexBuffer(
+            bgfx::copy(mission.skyGlow.vertices.data(),
+                static_cast<uint32_t>(mission.skyGlow.vertices.size() * sizeof(PosColorVertex))),
+            PosColorVertex::layout);
+        gpu.skyGlowIBH = bgfx::createIndexBuffer(
+            bgfx::copy(mission.skyGlow.indices.data(),
+                static_cast<uint32_t>(mission.skyGlow.indices.size() * sizeof(uint16_t))));
+        gpu.skyGlowIndexCount = static_cast<uint32_t>(mission.skyGlow.indices.size());
+    }
+
     // ── Create textured skybox GPU buffers (old sky system) ──
 
     if (meshes.hasSkybox) {
@@ -1425,6 +1495,91 @@ static bool createGPUResources(const Darkness::MissionData &mission,
     }
 
     return true;
+}
+
+// ── Build the corona list and upload its sprites ──
+//
+// Runs after createGPUResources: the synthesizer needs mission.objData (which
+// resolves ModelName through archetype inheritance) to know which lights are
+// attached to something the player can actually see.
+//
+// Counts are reported unconditionally, including zero. An empty corona list
+// is indistinguishable from a corona system that never ran, and this project
+// has already lost months to exactly that failure mode with SelfLitProducer —
+// a fully-implemented producer with no call sites, which docs described as
+// live for the entire time it was dead.
+static void initCoronas(const Darkness::MissionData &mission,
+                        const std::string &resPath,
+                        bool synthesized,
+                        Darkness::RuntimeState &state,
+                        Darkness::GPUResources &gpu)
+{
+    Darkness::PropertyServicePtr propSvc = GET_SERVICE(Darkness::PropertyService);
+    Darkness::ObjectServicePtr   objSvc  = GET_SERVICE(Darkness::ObjectService);
+    if (!propSvc || !objSvc) {
+        std::fprintf(stderr,
+            "[FALLBACK] coronas: property or object service unavailable — no "
+            "coronas will be drawn this session.\n");
+        return;
+    }
+
+    Darkness::parseAuthoredCoronas(propSvc.get(), objSvc.get(),
+                                   state.objectStates, state.coronas);
+    if (synthesized) {
+        Darkness::synthesizeCoronas(propSvc.get(), objSvc.get(),
+                                    state.objectStates, mission.objData,
+                                    mission.lightSources, state.coronas);
+    }
+    Darkness::finalizeCoronas(state.coronas);
+
+    std::fprintf(stderr,
+        "Coronas: %d authored (P$Corona) + %d synthesized = %zu total%s\n",
+        state.coronas.authoredCount, state.coronas.synthCount,
+        state.coronas.defs.size(),
+        synthesized ? "" : " (synthesis disabled)");
+
+    if (state.coronas.defs.empty()) return;
+
+    // Distinct sprite names across the whole list — typically one.
+    std::unordered_map<std::string, int> wanted;
+    for (const auto &def : state.coronas.defs)
+        ++wanted[def.texture];
+
+    if (resPath.empty()) {
+        std::fprintf(stderr,
+            "[FALLBACK] coronas: no --res path, so bitmap.crf cannot be "
+            "opened — %zu corona(s) resolved but none can be drawn.\n",
+            state.coronas.defs.size());
+        return;
+    }
+
+    Darkness::CRFTextureLoader bitmapLoader(resPath, "bitmap.crf");
+    for (const auto &kv : wanted) {
+        Darkness::CRFTextureLoader::BitmapResult res =
+            bitmapLoader.loadBitmap(kv.first);
+        if (!res.found) {
+            // Same diagnostic the editor emits for this exact case. Loud
+            // because the alternative — silently skipping the batch — looks
+            // identical to "coronas are switched off".
+            std::fprintf(stderr,
+                "[FALLBACK] coronas: can't find corona texture \"%s\" in "
+                "bitmap.crf — %d corona(s) using it will not draw.\n",
+                kv.first.c_str(), kv.second);
+            state.coronas.missingTexture += kv.second;
+            continue;
+        }
+        // CLAMP on both axes: the sprite's rim is transparent and wrapping
+        // would tile a second faint ring in from the opposite edge.
+        // ALPHA_BLEND mips because the shape lives entirely in the alpha
+        // ramp — coverage-preserving alpha-test mips would harden it.
+        gpu.coronaTexHandles[kv.first] = createMipmappedTexture(
+            res.image.rgba.data(), res.image.width, res.image.height,
+            BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+            MipAlphaMode::ALPHA_BLEND, false, false);
+        std::fprintf(stderr, "Coronas: sprite '%s' from %s (%ux%u)\n",
+                     kv.first.c_str(), res.path.c_str(),
+                     res.image.width, res.image.height);
+    }
 }
 
 // ── Initialize runtime state ──
@@ -1518,7 +1673,13 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
     for (auto &kv : gpu.skyboxTexHandles)
         bgfx::destroy(kv.second);
 
+    // Corona sprites
+    for (auto &kv : gpu.coronaTexHandles)
+        bgfx::destroy(kv.second);
+
     // Sky dome buffers
+    if (bgfx::isValid(gpu.skyGlowVBH)) bgfx::destroy(gpu.skyGlowVBH);
+    if (bgfx::isValid(gpu.skyGlowIBH)) bgfx::destroy(gpu.skyGlowIBH);
     if (bgfx::isValid(gpu.skyVBH)) bgfx::destroy(gpu.skyVBH);
     if (bgfx::isValid(gpu.skyIBH)) bgfx::destroy(gpu.skyIBH);
 
@@ -1540,6 +1701,8 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
         bgfx::destroy(kv.second);
     bgfx::destroy(gpu.s_texLightmap);
     bgfx::destroy(gpu.s_texColor);
+    if (bgfx::isValid(gpu.s_texDepth))    bgfx::destroy(gpu.s_texDepth);
+    if (bgfx::isValid(gpu.u_coronaDepth)) bgfx::destroy(gpu.u_coronaDepth);
     bgfx::destroy(gpu.u_waterParams);
     bgfx::destroy(gpu.u_waterFlow);
     bgfx::destroy(gpu.u_fogColor);
@@ -1563,6 +1726,8 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
     bgfx::destroy(gpu.waterProgram);
     bgfx::destroy(gpu.texturedPerVertexProgram);
     bgfx::destroy(gpu.basicPerVertexProgram);
+    if (bgfx::isValid(gpu.coronaProgram))
+        bgfx::destroy(gpu.coronaProgram);
 }
 
 // Shut down bgfx and SDL2 window.

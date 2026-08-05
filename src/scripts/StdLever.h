@@ -60,6 +60,29 @@ public:
         : ScriptBase(objID, className, services, manager) {}
 
 protected:
+    /// An interactive device is animated by its Joints or Rotate tweq, and by
+    /// nothing else.
+    ///
+    /// Asking for ALL types made a lever read whatever else the object
+    /// happened to carry: 171 shipped objects pair a joints tweq with a lock
+    /// tweq, so a lever reported its LOCK's run state as its own. Activating
+    /// untyped was worse — frobbing the lever toggled the lock animation along
+    /// with it.
+    uint32_t ownTweqStateBits(int32_t objID) const {
+        if (!svc || !svc->tweqSystem) return 0;
+        return svc->tweqSystem->animStateBits(objID, kTweqTypeJoints) |
+               svc->tweqSystem->animStateBits(objID, kTweqTypeRotate);
+    }
+
+    /// Drive only this device's own animation tweqs. Returns true if either
+    /// type was present.
+    bool activateOwnTweqs(TweqAction action) {
+        if (!svc || !svc->tweqSystem) return false;
+        const bool joints = svc->tweqSystem->activate(self, action, kTweqTypeJoints);
+        const bool rotate = svc->tweqSystem->activate(self, action, kTweqTypeRotate);
+        return joints || rotate;
+    }
+
     /// Broadcast TurnOn or TurnOff on ControlDevice links, respecting TrapFlags.
     void broadcast(bool on) {
         uint32_t trapFlags = 0;
@@ -100,6 +123,7 @@ public:
         : StdController(objID, className, services, manager) {}
 
 protected:
+
     /// Override in derived classes for pre/post tweq activation hooks.
     virtual void preTweqActivate(int dir) {}
     virtual void postTweqActivate(int dir) {}
@@ -127,7 +151,7 @@ protected:
 
         // Activate the tweq (toggle direction)
         if (svc && svc->tweqSystem) {
-            svc->tweqSystem->activate(self, kTweqDoDefault);
+            activateOwnTweqs(kTweqDoDefault);
         }
     }
 
@@ -183,8 +207,9 @@ private:
     /// lever reported the same target state regardless of its real position.
     bool tweqAnimStateHasVal(int32_t objID, int mask) const {
         if (!svc || !svc->tweqSystem) return false;
-        return (svc->tweqSystem->animStateBits(objID) & static_cast<uint32_t>(mask)) != 0;
+        return (ownTweqStateBits(objID) & static_cast<uint32_t>(mask)) != 0;
     }
+
 
     int targetStateOf(int32_t objID) const {
         bool active = tweqAnimStateHasVal(objID, 0x01);
@@ -294,7 +319,7 @@ private:
 
         // Bounce the button tweq
         if (svc && svc->tweqSystem)
-            svc->tweqSystem->activate(self, kTweqDoActivate);
+            activateOwnTweqs(kTweqDoActivate);
 
         // Credit discovery
         if (svc && svc->darkGame)

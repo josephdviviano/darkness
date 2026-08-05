@@ -91,6 +91,21 @@ public:
     /// was created)
     void endCreate(int objID);
 
+    /** Destroy an object created at runtime, releasing its ID for reuse.
+     *
+     * Removes its properties and links, returns the ID to the free stack and
+     * broadcasts OBJ_DESTROYED. Without this an ID is never reclaimed and each
+     * create extends the allocation range by 257 (one ID plus a 256 grow), so
+     * a level that spawns effects steadily walks the object range into the
+     * hundreds of thousands and re-grows every property bitmap with it.
+     *
+     * ONLY for objects the caller created and owns every reference to.
+     * Reusing an ID is safe exactly when nothing still holds the old one —
+     * doors, the renderer's static instance array and audio voices all cache
+     * raw object IDs, so this must never be called on placed world objects.
+     * @param objID the object to destroy */
+    void destroySpawned(int objID);
+
     /// Returns true if the object exists, false otherwise
     bool exists(int objID);
 

@@ -271,6 +271,37 @@ PropertyService::getFieldDesc(const std::string &propName) {
 }
 
 // --------------------------------------------------------------------------
+int PropertyService::copyNonInheritedState(int dstID, int srcID) {
+    static const char *kIdentityOrPlacement[] = {"SymbolicName", "SymName",
+                                                 "Position", "DonorType"};
+
+    int copied = 0;
+    for (auto &entry : mPropertyMap) {
+        Property *prop = entry.second;
+        if (!prop || prop->getInheritorName() != "never")
+            continue;
+
+        bool excluded = false;
+        for (const char *name : kIdentityOrPlacement)
+            if (entry.first == name) excluded = true;
+        if (excluded)
+            continue;
+
+        // Only what the archetype actually authored.
+        if (!prop->owns(srcID))
+            continue;
+
+        if (prop->cloneProperty(dstID, srcID))
+            ++copied;
+        else
+            LOG_ERROR("PropertyService: could not copy non-inherited property "
+                      "%s from archetype %d to new object %d",
+                      entry.first.c_str(), srcID, dstID);
+    }
+    return copied;
+}
+
+// --------------------------------------------------------------------------
 void PropertyService::objectDestroyed(int id) {
     PropertyMap::iterator it = mPropertyMap.begin();
 

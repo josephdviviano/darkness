@@ -184,6 +184,12 @@ public:
      */
     virtual bool get(int id, const std::string &field, Variant &target);
 
+    /** @return the name of the inheritor this property was registered with
+     * ("always", "archetype", "never", ...). "never" means the property does
+     * NOT flow from an archetype to its concrete objects, so a newly created
+     * object starts without it unless something copies it explicitly. */
+    const std::string &getInheritorName() const { return mInheritorName; }
+
     /** Notification that an object was destroyed. @see
      * PropertyService::objectDestroyed */
     void objectDestroyed(int id);
@@ -245,6 +251,7 @@ protected:
 
     /// Inheritor used to determine property inheritance
     Inheritor *mInheritor;
+    std::string mInheritorName;
     InheritServicePtr mInheritService;
 
     /// Inheritor value changes listener

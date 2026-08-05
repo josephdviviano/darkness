@@ -60,6 +60,8 @@ struct ObjectPlacement {
     int16_t bank;
     float scaleX, scaleY, scaleZ;  // from P$Scale (default 1,1,1)
     float renderAlpha;   // from P$RenderAlp (0.0=invisible, 1.0=opaque, default 1.0)
+    float selfIllum;     // from P$SelfIllum (per-object self-illumination
+                         // scale, default 1.0 = use the material's own value)
     bool hasPosition;    // false if object had model name but no position
 };
 
@@ -239,6 +241,7 @@ inline ObjectPropData parseObjectProps(PropertyService *propSvc,
                 p.bank = bank;
                 p.scaleX = 1.0f; p.scaleY = 1.0f; p.scaleZ = 1.0f;  // default scale
                 p.renderAlpha = 1.0f;  // default opaque, resolved later
+            p.selfIllum   = 1.0f;  // neutral scale, resolved later
                 p.hasPosition = true;
                 posMap[signedID] = p;
             } else {
@@ -318,6 +321,22 @@ inline ObjectPropData parseObjectProps(PropertyService *propSvc,
             continue;
         }
 
+        // RenderType=4 is NewDark's "Corona Only": the object's model is not
+        // drawn, only its light corona. Absent from Thief 2's own
+        // `objectrendertype` enum (which stops at EditorOnly=3), so no retail
+        // object can carry it and this is purely additive for fan missions.
+        // Without the case the model would render, since anything that is not
+        // 1 or 3 falls through to "draw it". CoronaSystem picks these objects
+        // up separately — being filtered here is exactly the point.
+        if (hasRenderType && rt.mode == 4) {
+            if (debugObjects) {
+                std::fprintf(stderr, "  [SKIP] obj %d: CoronaOnly (RenderType=4)\n", id);
+            }
+            ++filtered;
+            ++filteredNotRendered;
+            continue;
+        }
+
         // BRLIST membership is logged but NOT filtered — brush objects like doors
         // need their .bin models rendered even though their brush creates worldmesh
         // geometry. RenderType handles truly invisible brush objects.
@@ -361,6 +380,18 @@ inline ObjectPropData parseObjectProps(PropertyService *propSvc,
         if (getTypedProperty<PropRenderAlpha>(propSvc, "RenderAlpha", id, alpha)) {
             // Clamp to valid range
             placement.renderAlpha = std::max(0.0f, std::min(1.0f, alpha.alpha));
+        }
+
+        // Resolve self-illumination the same way. Also an "always"-inheriting
+        // property, so archetype values reach their concretes.
+        //
+        // Not clamped to 1.0 at the top: this scales the material's own
+        // illumination, and a value above 1 is how content says "this
+        // surface is emissive", which is exactly what needs to cross into
+        // the overbright range for bloom to see it.
+        PropSelfIllum illum;
+        if (getTypedProperty<PropSelfIllum>(propSvc, "SelfIllum", id, illum)) {
+            placement.selfIllum = std::max(0.0f, illum.brightness);
         }
 
         result.objects.push_back(placement);

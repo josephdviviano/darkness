@@ -485,6 +485,433 @@ TEST_CASE("TweqSystem: a halted delete tweq leaves the object alone", "[Tweq]") 
     REQUIRE((states.get(921).flags & Darkness::kObjStateDestroyed) == 0);
 }
 
+TEST_CASE("TweqSystem: a joints tweq does not trample a lock's joint slot",
+          "[Tweq][SubObject]") {
+    // 171 shipped objects carry BOTH a joints tweq and a lock tweq. On
+    // chestloc the joints config drives j1 alone, so a joints tweq that wrote
+    // all six slots rewrote joints[0] = 0 every tick and pinned the very lock
+    // plate the lock tweq was driving. Whichever ran last won — and that is
+    // unordered_map order, i.e. not stable across builds.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+
+    // Joints tweq driving slot 1 only (slot 0 has no rate).
+    Darkness::TweqInstance joints;
+    joints.objID = 940;
+    joints.type = Darkness::kTweqTypeJoints;
+    joints.cfgHalt = Darkness::kTweqHaltContinue;
+    joints.axisCount = Darkness::kJointSlotCount;
+    joints.axes[1] = {90.0f, 0.0f, 90.0f};
+    joints.active = true;
+    joints.base.rotation = Darkness::Matrix4(1.0f);
+    joints.hasObjectState = true;
+
+    // Lock tweq owning slot 0, parked at its unlocked position.
+    Darkness::TweqInstance lock;
+    lock.objID = 940;
+    lock.type = Darkness::kTweqTypeLock;
+    lock.cfgHalt = Darkness::kTweqHaltContinue;
+    lock.axisCount = 1;
+    lock.axes[0] = {0.0f, 0.0f, 90.0f};   // no rate: parked, not animating
+    lock.lockJointSlot = 0;
+    lock.values[0] = 90.0f;
+    lock.active = true;
+    lock.base.rotation = Darkness::Matrix4(1.0f);
+    lock.hasObjectState = true;
+
+    sys.injectForTest(joints, &states);
+    sys.injectForTest(lock, &states);
+
+    // One step: 50 ms at 90 deg/s is +45 on the joints tweq's own slot. Do NOT
+    // free-run this — the joints tweq bounces at its limit and comes back
+    // through 0, which would make the assertion below pass or fail on step
+    // count rather than on who wrote what.
+    sys.simStep(0.0f, 0.05f);
+
+    const Darkness::ObjectState *os = states.tryGet(940);
+    REQUIRE(os != nullptr);
+    REQUIRE(os->joints[0] == Approx(90.0f));   // the lock still owns slot 0
+    REQUIRE(os->joints[1] == Approx(45.0f));   // the joints tweq drove its own
+
+    // And the lock keeps its slot for as long as both run.
+    for (int i = 0; i < 4; ++i) sys.simStep(0.0f, 0.05f);
+    REQUIRE(states.tryGet(940)->joints[0] == Approx(90.0f));
+}
+
+TEST_CASE("TweqSystem: a halted rotate tweq keeps its final pose",
+          "[Tweq][Rotate]") {
+    // The frame a tweq halts, simStep marks the object dirty, handleCompletion
+    // clears active, and applyComposedTransform then runs. If it required
+    // active, it found nothing to contribute and wrote the placement
+    // orientation — so a mechanism driven to its end position snapped back to
+    // its start and stayed there, since nothing marks it dirty again.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+
+    Darkness::TweqInstance tw;
+    tw.objID = 960;
+    tw.type = Darkness::kTweqTypeRotate;
+    tw.cfgHalt = Darkness::kTweqHaltStop;     // halts at the limit
+    tw.axes[2] = {90.0f, 0.0f, 90.0f};        // heading 0 -> 90 degrees
+    tw.primaryAxis = 0;
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.base.scale = {1.0f, 1.0f, 1.0f};
+    tw.hasObjectState = true;
+    sys.injectForTest(tw, &states);
+
+    // Drive it to the limit; halt lands on one of these ticks.
+    for (int i = 0; i < 4; ++i) sys.simStep(0.0f, 0.1f);
+
+    const Darkness::TweqInstance *inst =
+        sys.getInstanceForTest(960, Darkness::kTweqTypeRotate);
+    REQUIRE_FALSE(inst->active);                     // it did halt
+    REQUIRE(inst->values[2] == Approx(90.0f));       // at its end position
+
+    // And the matrix handed to the renderer says so. A 90 degree heading puts
+    // column 0 at (cos 90, sin 90, 0) = (0, 1, 0); identity would be (1, 0, 0),
+    // which is exactly what the snap-back produced.
+    const Darkness::ObjectState *os = states.tryGet(960);
+    REQUIRE(os != nullptr);
+    REQUIRE(os->hasMatrix);
+    REQUIRE(os->modelMatrix[0] == Approx(0.0f).margin(1e-4));
+    REQUIRE(os->modelMatrix[1] == Approx(1.0f).margin(1e-4));
+}
+
+// ── Models tweq ──
+//
+// This type had no test coverage at all despite a 104-byte config, six name
+// slots, a documented gap rule, and a while-loop with two edge behaviours.
+
+namespace {
+
+Darkness::TweqInstance makeModelsTweq(int32_t objID, uint16_t rateMs,
+                                      std::initializer_list<const char *> names,
+                                      uint8_t animFlags = 0,
+                                      uint8_t halt = Darkness::kTweqHaltContinue) {
+    Darkness::TweqInstance tw;
+    tw.objID = objID;
+    tw.type = Darkness::kTweqTypeModels;
+    tw.cfgRate = rateMs;
+    tw.cfgAnim = animFlags;
+    tw.cfgHalt = halt;
+    int i = 0;
+    for (const char *n : names) {
+        std::strncpy(tw.modelNames[i], n, 15);
+        ++i;
+    }
+    tw.modelCount = static_cast<int>(names.size());
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.hasObjectState = true;
+    return tw;
+}
+
+} // namespace
+
+TEST_CASE("TweqSystem: a models tweq cycles forward through its names",
+          "[Tweq][Models]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    sys.injectForTest(makeModelsTweq(980, 99, {"flame1", "flame2", "flame3"}),
+                      &states);
+
+    REQUIRE(states.tryGet(980) == nullptr);   // nothing applied yet
+
+    sys.simStep(0.0f, 0.1f);                  // one frame duration (rate + 1)
+    REQUIRE(states.get(980).modelNameOverride == "flame2");
+
+    sys.simStep(0.0f, 0.1f);
+    REQUIRE(states.get(980).modelNameOverride == "flame3");
+}
+
+TEST_CASE("TweqSystem: a models tweq wraps to the first name", "[Tweq][Models]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    sys.injectForTest(makeModelsTweq(981, 99, {"a", "b"},
+                                     Darkness::kTweqAnimWrap), &states);
+
+    sys.simStep(0.0f, 0.1f);                  // a -> b
+    REQUIRE(states.get(981).modelNameOverride == "b");
+    sys.simStep(0.0f, 0.1f);                  // b -> wrap -> a
+    REQUIRE(states.get(981).modelNameOverride == "a");
+}
+
+TEST_CASE("TweqSystem: a models tweq bounces back off the last name",
+          "[Tweq][Models]") {
+    // Without Wrap the cycle reverses at the edge rather than jumping.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    sys.injectForTest(makeModelsTweq(982, 99, {"a", "b", "c"}), &states);
+
+    sys.simStep(0.0f, 0.1f);   // b
+    sys.simStep(0.0f, 0.1f);   // c  (at the top)
+    REQUIRE(states.get(982).modelNameOverride == "c");
+    sys.simStep(0.0f, 0.1f);   // reverses at the edge
+    sys.simStep(0.0f, 0.1f);
+    REQUIRE(states.get(982).modelNameOverride == "b");
+}
+
+TEST_CASE("TweqSystem: modelCount stops at the first empty slot",
+          "[Tweq][Models]") {
+    // The documented rule: names after a gap are script-accessible variants,
+    // not part of the animation cycle. initFromConfig implements it; this
+    // pins it, since a cycle that ran past the gap would show the wrong model.
+    Darkness::PropCfgTweqModels cfg{};
+    cfg.rate = 50;
+    std::strncpy(cfg.modelName[0], "one", 15);
+    std::strncpy(cfg.modelName[1], "two", 15);
+    // slot 2 deliberately empty
+    std::strncpy(cfg.modelName[3], "afterGap", 15);
+
+    Darkness::TweqSystem sys;
+    Darkness::TweqInstance tw;
+    sys.initFromConfigForTest(tw, cfg);
+
+    REQUIRE(tw.modelCount == 2);
+}
+
+// ── Update-rate gates ──
+
+namespace {
+
+/// A rotate tweq that runs forever, so any missed tick shows up as a value.
+Darkness::TweqInstance makeGatedTweq(int32_t objID, uint8_t animFlags) {
+    Darkness::TweqInstance tw;
+    tw.objID = objID;
+    tw.type = Darkness::kTweqTypeRotate;
+    tw.cfgAnim = animFlags | Darkness::kTweqAnimNoLimit;
+    tw.cfgHalt = Darkness::kTweqHaltContinue;
+    tw.axes[0] = {90.0f, 0.0f, 360.0f};
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.hasObjectState = true;
+    return tw;
+}
+
+float runGated(uint8_t animFlags, bool onScreen, bool gatingOn = true) {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    sys.setVisibilityGating(gatingOn);
+    sys.setVisibilityQuery([onScreen](int32_t) { return onScreen; });
+    sys.injectForTest(makeGatedTweq(950, animFlags), &states);
+    sys.simStep(0.0f, 0.1f);
+    return sys.getInstanceForTest(950, Darkness::kTweqTypeRotate)->values[0];
+}
+
+} // namespace
+
+TEST_CASE("TweqSystem: an ungated tweq ticks only while on screen", "[Tweq][Gate]") {
+    // 184 of 456 shipped configs carry neither SIM nor OFFSCRN.
+    REQUIRE(runGated(0, /*onScreen=*/true)  == Approx(90.0f));
+    REQUIRE(runGated(0, /*onScreen=*/false) == Approx(0.0f));
+}
+
+TEST_CASE("TweqSystem: a SIM tweq ticks regardless of visibility", "[Tweq][Gate]") {
+    REQUIRE(runGated(Darkness::kTweqAnimSim, true)  == Approx(90.0f));
+    REQUIRE(runGated(Darkness::kTweqAnimSim, false) == Approx(90.0f));
+}
+
+TEST_CASE("TweqSystem: an OFFSCRN tweq runs only when NOT on screen",
+          "[Tweq][Gate]") {
+    // The inverse of the default, not a relaxation of it — getting this
+    // backwards is what made these count down in view.
+    REQUIRE(runGated(Darkness::kTweqAnimOffscreen, false) == Approx(90.0f));
+    REQUIRE(runGated(Darkness::kTweqAnimOffscreen, true)  == Approx(0.0f));
+}
+
+TEST_CASE("TweqSystem: OFFSCRN beats SIM when both are set", "[Tweq][Gate]") {
+    const uint8_t both = Darkness::kTweqAnimOffscreen | Darkness::kTweqAnimSim;
+    REQUIRE(runGated(both, false) == Approx(90.0f));
+    REQUIRE(runGated(both, true)  == Approx(0.0f));
+}
+
+TEST_CASE("TweqSystem: gating off ticks everything, whatever the flags",
+          "[Tweq][Gate]") {
+    // The relaxation dial: fidelity gives way to look, not to speed.
+    REQUIRE(runGated(0, false, /*gatingOn=*/false) == Approx(90.0f));
+    REQUIRE(runGated(Darkness::kTweqAnimOffscreen, true, false) == Approx(90.0f));
+}
+
+TEST_CASE("TweqSystem: with no visibility query wired, nothing is gated",
+          "[Tweq][Gate]") {
+    // Fail open. A gate that cannot answer must not silently freeze the world.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    sys.setVisibilityGating(true);            // on, but no query wired
+    sys.injectForTest(makeGatedTweq(951, 0), &states);
+    sys.simStep(0.0f, 0.1f);
+    REQUIRE(sys.getInstanceForTest(951, Darkness::kTweqTypeRotate)->values[0]
+            == Approx(90.0f));
+}
+
+// ── Emitter tweq ──
+
+namespace {
+
+Darkness::TweqInstance makeEmitterTweq(int32_t objID, uint16_t rateMs,
+                                       int frames, const char *what,
+                                       uint16_t misc = 0) {
+    Darkness::TweqInstance tw;
+    tw.objID = objID;
+    tw.type = Darkness::kTweqTypeEmitter;
+    tw.cfgHalt = Darkness::kTweqHaltStop;
+    tw.cfgRate = rateMs;
+    tw.cfgMisc = misc;
+    tw.maxFrames = frames;
+    tw.curFrame = 0;
+    tw.emitVelocity = Vector3(0.0f, 0.0f, 4.0f);
+    std::strncpy(tw.emitWhat, what, sizeof(tw.emitWhat) - 1);
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.base.position = Vector3(1.0f, 2.0f, 3.0f);
+    tw.hasObjectState = true;
+    return tw;
+}
+
+} // namespace
+
+TEST_CASE("TweqSystem: an emitter emits its archetype on the configured beat",
+          "[Tweq][Emitter]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    std::vector<Darkness::EmitRequest> emitted;
+    sys.setEmitCallback([&emitted](const Darkness::EmitRequest &r) {
+        emitted.push_back(r);
+    });
+    sys.injectForTest(makeEmitterTweq(930, 100, 3, "MossSpore"), &states);
+
+    sys.simStep(0.0f, 0.05f);            // 50 ms — not yet
+    REQUIRE(emitted.empty());
+
+    sys.simStep(0.05f, 0.06f);           // 110 ms total — one emission
+    REQUIRE(emitted.size() == 1);
+    REQUIRE(emitted[0].archetypeName == "MossSpore");
+    REQUIRE(emitted[0].emitterObjID == 930);
+    REQUIRE(emitted[0].position.x == Approx(1.0f));
+    REQUIRE(emitted[0].velocity.z == Approx(4.0f));
+}
+
+TEST_CASE("TweqSystem: an emitter emits exactly its configured budget",
+          "[Tweq][Emitter]") {
+    // The budget lives in the CONFIG and the running count in the STATE.
+    // Conflating them let the state's frame index (0 in 225 of 226 shipped
+    // records) overwrite the budget, so every limited emitter fired once.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    int count = 0;
+    sys.setEmitCallback([&count](const Darkness::EmitRequest &) { ++count; });
+    sys.injectForTest(makeEmitterTweq(931, 100, 3, "H2OSplash"), &states);
+
+    for (int i = 0; i < 8; ++i) sys.simStep(0.0f, 0.1f);
+
+    REQUIRE(count == 3);   // exactly the budget — not 1, not one per tick
+    REQUIRE_FALSE(sys.getInstanceForTest(931, Darkness::kTweqTypeEmitter)->active);
+}
+
+TEST_CASE("TweqSystem: a flicker with a stored count of 0 runs indefinitely",
+          "[Tweq][Flicker]") {
+    // 108 of 190 shipped flicker states store 0. Halting on <= 0 stopped every
+    // one of them on its first toggle, and two carry a Slay halt action that
+    // killed their object. 0 means unlimited: the counter decrements to -1 and
+    // the halt test only fires on exactly zero.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+
+    Darkness::TweqInstance tw;
+    tw.objID = 970;
+    tw.type = Darkness::kTweqTypeFlicker;
+    tw.cfgRate = 50;
+    tw.cfgHalt = Darkness::kTweqHaltSlay;   // the dangerous shipped case
+    tw.curFrame = 0;                        // as shipped
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.hasObjectState = true;
+    sys.injectForTest(tw, &states);
+
+    for (int i = 0; i < 10; ++i) sys.simStep(0.0f, 0.06f);
+
+    REQUIRE(sys.getInstanceForTest(970, Darkness::kTweqTypeFlicker)->active);
+    REQUIRE((states.get(970).flags & Darkness::kObjStateDestroyed) == 0);
+}
+
+TEST_CASE("TweqSystem: a flicker with a real frame count still halts",
+          "[Tweq][Flicker]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+
+    Darkness::TweqInstance tw;
+    tw.objID = 971;
+    tw.type = Darkness::kTweqTypeFlicker;
+    tw.cfgRate = 50;
+    tw.cfgHalt = Darkness::kTweqHaltStop;
+    tw.curFrame = 2;
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.hasObjectState = true;
+    sys.injectForTest(tw, &states);
+
+    for (int i = 0; i < 6; ++i) sys.simStep(0.0f, 0.06f);
+
+    REQUIRE_FALSE(sys.getInstanceForTest(971, Darkness::kTweqTypeFlicker)->active);
+}
+
+TEST_CASE("TweqSystem: ZeroVel emits with no velocity", "[Tweq][Emitter]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    std::vector<Darkness::EmitRequest> emitted;
+    sys.setEmitCallback([&emitted](const Darkness::EmitRequest &r) {
+        emitted.push_back(r);
+    });
+    sys.injectForTest(makeEmitterTweq(932, 10, 1, "RippleRing",
+                                      Darkness::kTweqMiscZeroVel), &states);
+    // Same helper WITHOUT the flag, so the contrast proves the field is
+    // populated at all. Checking only "z == 0" was satisfied by an
+    // EmitRequest that default-constructs its velocity to zero — it could not
+    // distinguish ZeroVel working from the velocity never being set.
+    sys.injectForTest(makeEmitterTweq(934, 10, 1, "RippleRing"), &states);
+
+    sys.simStep(0.0f, 0.05f);
+
+    REQUIRE(emitted.size() == 2);
+    const Darkness::EmitRequest *zeroed = nullptr;
+    const Darkness::EmitRequest *normal = nullptr;
+    for (const auto &e : emitted) {
+        if (e.emitterObjID == 932) zeroed = &e;
+        if (e.emitterObjID == 934) normal = &e;
+    }
+    REQUIRE(zeroed != nullptr);
+    REQUIRE(normal != nullptr);
+    REQUIRE(normal->velocity.z == Approx(4.0f));    // the helper's velocity
+    REQUIRE(zeroed->velocity.x == Approx(0.0f));
+    REQUIRE(zeroed->velocity.y == Approx(0.0f));
+    REQUIRE(zeroed->velocity.z == Approx(0.0f));
+}
+
+TEST_CASE("TweqSystem: the five emitter slots are independent instances",
+          "[Tweq][Emitter]") {
+    // Emitters are the one tweq type an object can carry several of, so the
+    // slot has to be part of the instance key or slot 2 would evict slot 1.
+    REQUIRE(Darkness::TweqSystem::tweqKey(7, Darkness::kTweqTypeEmitter, 0) !=
+            Darkness::TweqSystem::tweqKey(7, Darkness::kTweqTypeEmitter, 1));
+    // Slot 0 must still hash exactly like every other single-slot type.
+    REQUIRE(Darkness::TweqSystem::tweqKey(7, Darkness::kTweqTypeEmitter, 0) ==
+            Darkness::TweqSystem::tweqKey(7, Darkness::kTweqTypeEmitter));
+
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    int count = 0;
+    sys.setEmitCallback([&count](const Darkness::EmitRequest &) { ++count; });
+    auto a = makeEmitterTweq(933, 100, 1, "MossSpore");
+    auto b = makeEmitterTweq(933, 100, 1, "H2OSplash");
+    b.emitterSlot = 1;
+    sys.injectForTest(a, &states);
+    sys.injectForTest(b, &states);
+
+    sys.simStep(0.0f, 0.15f);
+    REQUIRE(count == 2);   // both slots fired, neither evicted the other
+}
+
 TEST_CASE("TweqSystem: animStateBits reports the live instance state",
           "[Tweq][SubObject]") {
     // Scripts read this instead of the StTweq* property, whose field accessor

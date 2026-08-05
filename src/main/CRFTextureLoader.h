@@ -19,14 +19,16 @@
  *
  *****************************************************************************/
 
-// CRF texture loader — loads PCX/GIF textures from CRF (ZIP) archives via zziplib
+// CRF texture loader — loads PCX/GIF/TGA textures from CRF (ZIP) archives via zziplib
 
 #pragma once
 
 #include "PCXDecoder.h"
 #include "GIFDecoder.h"
+#include "TGADecoder.h"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <zzip/zzip.h>
@@ -176,10 +178,92 @@ public:
         return makeFallback();
     }
 
+    // Load an effect sprite by bare name from `bitmap.crf` — coronas, rain,
+    // snow, leaves. Unlike object materials, the names that reach here come
+    // from a property field (P$Corona's 16-byte `texture`) and carry NO
+    // extension, so we append candidates rather than joining the name
+    // directly.
+    //
+    // Search order mirrors the archive's own shape: the root holds the
+    // single-frame sprite (`CORONA.TGA`) and `txt/` holds the animated-family
+    // variants (`txt/CORONA00.TGA`). Root wins, because a corona that is not
+    // animated should not pick up frame 0 of something that is.
+    //
+    // Returns `found == false` rather than the magenta checkerboard when the
+    // name resolves to nothing: a checkerboard billboard drawn additively over
+    // the scene would be a far louder failure than the missing glow, and the
+    // caller needs to be able to say which happened. Mirrors the editor's own
+    // "can't find corona texture" diagnostic.
+    struct BitmapResult {
+        DecodedImage image;
+        bool found = false;
+        std::string path; // archive path that resolved, for logging
+    };
+
+    BitmapResult loadBitmap(const std::string &name) {
+        BitmapResult result;
+        if (!mDir || name.empty()) return result;
+
+        static const char *kExts[] = { ".tga", ".pcx", ".gif" };
+        std::vector<std::string> paths;
+        paths.reserve(12);
+        for (const char *ext : kExts) paths.push_back(name + ext);
+        for (const char *ext : kExts) paths.push_back("txt/" + name + ext);
+        // Animated families store frame 0 with a "00" suffix; a name that
+        // refers to the family as a whole resolves to its first frame.
+        for (const char *ext : kExts) paths.push_back("txt/" + name + "00" + ext);
+
+        for (const auto &path : paths) {
+            std::vector<uint8_t> buf;
+            if (!readArchiveFile(path, buf)) continue;
+            try {
+                result.image = decodeByContent(buf, path);
+            } catch (const std::exception &e) {
+                std::fprintf(stderr, "CRF: Failed to decode %s: %s\n",
+                             path.c_str(), e.what());
+                continue;
+            }
+            if (result.image.width == 0 || result.image.height == 0) continue;
+            result.found = true;
+            result.path  = path;
+            return result;
+        }
+        return result;
+    }
+
     bool isOpen() const { return mDir != nullptr; }
 
 private:
     ZZIP_DIR *mDir;
+
+    // Read a whole archive member into `buf`. Returns false if absent.
+    bool readArchiveFile(const std::string &path, std::vector<uint8_t> &buf) {
+        ZZIP_FILE *fp = zzip_file_open(mDir, path.c_str(), ZZIP_CASELESS);
+        if (!fp) return false;
+        buf.clear();
+        buf.reserve(65536);
+        uint8_t tmp[4096];
+        zzip_ssize_t n;
+        while ((n = zzip_file_read(fp, tmp, sizeof(tmp))) > 0) {
+            buf.insert(buf.end(), tmp, tmp + n);
+        }
+        zzip_file_close(fp);
+        return !buf.empty();
+    }
+
+    // Pick a decoder from the bytes, not the file name. The archive mixes
+    // extensions freely (`convey00.GIF` sits among the .tga sprites), and a
+    // wrong guess here decodes garbage rather than failing.
+    static DecodedImage decodeByContent(const std::vector<uint8_t> &buf,
+                                        const std::string &path) {
+        if (buf.size() >= 6 && std::memcmp(buf.data(), "GIF", 3) == 0)
+            return decodeGIF(buf.data(), buf.size());
+        if (buf.size() >= 128 + 769 && buf[0] == 0x0A)
+            return decodePCX(buf.data(), buf.size());
+        if (looksLikeTGA(buf.data(), buf.size()))
+            return decodeTGA(buf.data(), buf.size());
+        throw std::runtime_error("unrecognised image format in " + path);
+    }
 
     static DecodedImage makeFallback() {
         // 8x8 magenta/black checkerboard

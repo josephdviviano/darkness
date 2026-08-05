@@ -73,6 +73,20 @@ inline void applyModelMatrix(ObjectStateMap &states, int32_t objID,
     os.hasMatrix = true;
     os.position = pos;
     os.scale = scale;
+
+    // Keep the quaternion in step with the matrix. The renderer reads
+    // modelMatrix, but IWorldQuery::getOrientation reads this — so leaving it
+    // behind meant every rotating object reported its PRE-tweq orientation to
+    // AI, audio and anything else asking which way it faces.
+    //
+    // Scale has to come out of the basis first or quat_cast reads the
+    // stretch as rotation.
+    Matrix3 basis(fullGlm);
+    for (int i = 0; i < 3; ++i) {
+        const float len = glm::length(basis[i]);
+        if (len > 1e-6f) basis[i] /= len;
+    }
+    os.orientation = glm::quat_cast(basis);
 }
 
 // ============================================================================

@@ -114,6 +114,47 @@ struct PropLightColor {
     float saturation;
 };
 
+// P$Corona — dtype: Corona, inheritor: always, 52 bytes.
+//
+// The engine's own light-corona (lens-glare) record. Field NAMES and ORDER
+// come from the editor's property-field label table:
+//   [BIN: field label table @0x50c6a8-0x50c8e8 ("Corona", "flags",
+//    "radius up close", "radius at max dist", "max. dist. visible", "alpha",
+//    "texture", "color", "spot angle scale", "sCoronaLight"),
+//    DromEd.exe NewDark 1.28]
+//
+// Two fields in that table have no slot in the 52-byte retail record —
+// "color" and "spot angle scale" are the parameters NewDark 1.28's release
+// notes describe adding ("Added color param, additive blending and spotlight
+// cone falloff support to coronas"), so they postdate this layout. The 12
+// bytes after `flags` are instead a world POSITION, which is why the label
+// table has no entry for them: the engine caches the resolved anchor there
+// rather than the designer authoring it.
+//
+// Position is engine-derived, not authored. Retail MISS5's one authored
+// corona caches (-74.980, 189.106, 11.091) against its object's P$Position
+// of (-75.0, 189.35, 11.0) — a ~0.26-unit offset, i.e. a model vhot, which
+// matches NewDark's note about "vhot evaluation that could ... affect
+// show_vhots, coronas". Treat it as the anchor offset, never as the live
+// position: an object that moves must take its corona with it.
+//
+// `radiusFar` being LARGER than `radiusNear` is not a typo. The radii are
+// world units, and a billboard must grow with distance to hold its apparent
+// size; MISS5 authors 2.0 up close against 65.0 at its 300-unit limit.
+struct PropCorona {
+    uint32_t flags;          // semantics unobserved; retail authors 0x81 once
+    float posX, posY, posZ;  // engine-cached world anchor (see above)
+    float radiusNear;        // world radius when the viewer is at the light
+    float radiusFar;         // world radius at maxDist
+    float maxDist;           // beyond this the corona is not drawn
+    float alpha;             // blend strength
+    char  texture[16];       // bitmap.crf sprite name, no extension
+    uint32_t trailing;       // 0 in every retail record; purpose unobserved
+};
+static_assert(sizeof(PropCorona) == 52,
+    "PropCorona must match the 52-byte on-disk layout exactly — the property "
+    "version's low word IS the record size (PROPVERSION_CORONA 0x00010034)");
+
 // P$AnimLight — dtype: AnimLight, inheritor: archetype, 76 bytes
 // Sole on-disk representation used by all consumers (LightingSystem,
 // DarknessHeadless prop-dump). Read via getTypedProperty<PropAnimLight>(...)
@@ -521,9 +562,18 @@ static_assert(sizeof(PropTPath) == 16, "PropTPath must match TPath dtype (16 byt
 // ── Tweq flag types ──
 
 // Animation config flags (uint8 bitfield — CfgTweq*.anim)
+// Bit order is the order NewDark's public scripting API lists these constants
+// in: NOLIMIT, SIM, WRAP, 1BOUNCE, SIMRADSM, SIMRADLG, OFFSCRN for the config
+// word, and ONOFF, REVERSE, RESYNCH, GOEDGE, LAPONE for the state word.
+// (new_dark/doc/squirrel_script/API-reference.txt — public distribution.)
+//
+// NOTE the split that matters: activation lives in the STATE word (ONOFF), not
+// the config word. SIM/SIMRADSM/SIMRADLG/OFFSCRN are a family of update-rate
+// gates — how often to tick a tweq, not whether it is running.
 enum TweqAnimFlags : uint8_t {
     kTweqAnimNoLimit        = 0x01,  // Ignore axis bounds
-    kTweqAnimSim            = 0x02,  // Auto-start with simulation
+    kTweqAnimSim            = 0x02,  // Update continually, rather than only
+                                     //   while the object is on screen
     kTweqAnimWrap           = 0x04,  // Wrap at bounds (vs bounce)
     kTweqAnimOneBounce      = 0x08,  // Stop after one forward+reverse cycle
     kTweqAnimSimSmallRadius = 0x10,  // Only update within 20 units of camera
@@ -686,6 +736,37 @@ struct PropCfgTweqJoints {
     int32_t  primary;   // 0 = all joints gate completion, else 1-indexed joint
 };
 static_assert(sizeof(PropCfgTweqJoints) == 132);
+
+// ── CfgTweqEm / CfgTweq2E..CfgTweq5E — emitter tweq config ──
+// p_ver 2.52 → 52 bytes. An object can carry five independent emitters.
+//
+// The emitter spawns OBJECTS, not GPU particles: `emitWhat` is an archetype's
+// symbolic name ("H2OSplash", "MossSpore", "RippleRing", "fnordkaboom"), which
+// is why this needed an object-spawn path rather than a particle system.
+//
+// Field names, types, sizes and offsets are the engine's own descriptors, so
+// this layout is read off the binary rather than inferred:
+//   CurveC +1 (1) | AnimC +2 (1) | Halt +3 (1) | MiscC +4 (2) | Rate +6 (2)
+//   Max frames +8 (4) | Emit what +12 (16, string) | Velocity +28 (12, vec3)
+//   Angle Random +40 (12, vec3)
+// [BIN: sTweqEmitterConfig field table @0x7F2F18..0x7F3178, Thief2.exe NewDark 1.28]
+
+struct PropCfgTweqEmitter {
+    uint8_t  unknown;
+    uint8_t  curve;         // TweqCurveFlags
+    uint8_t  anim;          // TweqAnimFlags
+    uint8_t  halt;          // TweqHaltAction
+    uint16_t misc;          // TweqMiscFlags — Gravity/ZeroVel/RelVel/VHot/…
+    uint16_t rate;          // milliseconds between emissions
+    int32_t  maxFrames;     // how many objects to emit before halting
+    char     emitWhat[16];  // archetype symbolic name
+    float    velocity[3];   // emission velocity
+    float    angleRandom[3];// per-axis random spread applied to the velocity
+};
+static_assert(sizeof(PropCfgTweqEmitter) == 52);
+
+// StTweqEmi / StTweq2Em..StTweq5Em are p_ver 2.8 — the same 8-byte state block
+// the Flicker and Models tweqs use (PropStTweqSimple).
 
 // ── CfgTweqLo — lock tweq config ──
 // p_ver 2.32 → 32 bytes = the vector header + ONE joint block + the selector

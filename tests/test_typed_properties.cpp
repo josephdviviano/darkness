@@ -270,6 +270,18 @@ static void ensureMissionLoaded() {
                      propCount, relCount);
 
         // Load the mission database (.gam + .mis)
+        //
+        // RoomService must EXIST before the load, not merely be registered: it
+        // parses ROOM_DB off the onDBLoad broadcast, and a service that has not
+        // been instantiated is not a listener yet. This file and
+        // test_world_query.cpp share one process-global service stack and gate
+        // their load on the same sentinel, so whichever runs first performs it
+        // and the other piggybacks. Without this line, a seed that ran this
+        // fixture first left the room database unparsed and made ~28 cases in
+        // test_world_query.cpp skip — a coverage lottery decided by Catch2's
+        // shuffle.
+        (void)GET_SERVICE(Darkness::RoomService);
+
         Darkness::GameServicePtr gameSvc = GET_SERVICE(Darkness::GameService);
         gameSvc->load(s_misPath);
     }

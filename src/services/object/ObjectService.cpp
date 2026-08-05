@@ -78,6 +78,14 @@ int ObjectService::beginCreate(int archetype) {
 void ObjectService::endCreate(int objID) { _endCreateObject(objID); }
 
 //------------------------------------------------------
+void ObjectService::destroySpawned(int objID) {
+    if (objID <= 0 || !mAllocatedObjects[objID])
+        return;
+
+    _destroyObject(objID);
+}
+
+//------------------------------------------------------
 bool ObjectService::exists(int objID) { return mAllocatedObjects[objID]; }
 
 //------------------------------------------------------
@@ -557,8 +565,12 @@ void ObjectService::_beginCreateObject(int objID, int archetypeID) {
     // Use inherit service to set archetype for the new object
     mInheritService->setArchetype(objID, archetypeID);
 
-    // TODO: Copy the uninheritable properties (i.e. ask each special property
-    // to do it's work)
+    // Copy the archetype's non-inherited properties. Tweq STATE lives in these
+    // (StTweqDel, StTweqLoc are registered "never"), so without this a runtime
+    // created object has no state record, is never marked active, and its
+    // delete countdown never starts — spawned effects accumulated forever.
+    // Identity and placement are excluded; see copyNonInheritedState.
+    mPropertyService->copyNonInheritedState(objID, archetypeID);
 }
 
 //------------------------------------------------------
