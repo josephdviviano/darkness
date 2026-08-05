@@ -49,10 +49,12 @@
 #include <unordered_set>
 #include <vector>
 
+#include "DarknessException.h"
 #include "DarknessMath.h"
 #include "ObjectPropParser.h"
 #include "object/ObjectService.h"
 #include "property/DarkPropertyDefs.h"
+#include "property/Property.h"
 #include "property/PropertyService.h"
 #include "property/TypedProperty.h"
 #include "sim/SimCommon.h"
@@ -130,13 +132,25 @@ public:
         }
 
         // Give it a transform. P$Position is what every placement-scanning
-        // system reads, so write the property as well as the runtime state.
-        PropPosition pos{};
-        pos.x = req.position.x;
-        pos.y = req.position.y;
-        pos.z = req.position.z;
-        pos.cell = -1;
-        mPropSvc->set(objID, "Position", "position", Variant(req.position));
+        // system reads, so the property has to be written, not just the runtime
+        // state.
+        //
+        // The record must be CREATED first. A freshly created object has no
+        // Position record — the archetype cannot supply one either, since
+        // Position is registered with the "never" inheritor — and the storage's
+        // setField begins with a find() that returns false when the record is
+        // absent. `set` discards that, and only logs when the property NAME is
+        // unknown, so this failed completely silently: every spawned object
+        // reported position (0,0,0), which also kept it out of the spatial
+        // index and therefore out of every AI and audio query.
+        if (Property *posProp = mPropSvc->getProperty("Position")) {
+            if (!posProp->has(objID)) posProp->createProperty(objID);
+        }
+        if (!mPropSvc->set(objID, "Position", "position", Variant(req.position))) {
+            reportOnce(req.archetypeName,
+                       "could not write P$Position, so it spawns at the origin "
+                       "and stays invisible to AI and audio queries");
+        }
 
         char model[16] = {};
         getTypedProperty<char[16]>(mPropSvc, "ModelName", objID, model);
@@ -229,11 +243,47 @@ public:
     /// queries; a no-op for objects this system did not spawn.
     void recycle(int32_t objID) {
         auto it = mInstanceOfSpawn.find(objID);
-        if (it == mInstanceOfSpawn.end()) return;
+        if (it == mInstanceOfSpawn.end()) return;   // not ours
 
         const size_t idx = it->second;
         mInstanceOfSpawn.erase(it);
-        if (!mObjData || idx >= mObjData->objects.size()) return;
+
+        // Shed every other trace of it. Handing back the renderer slot alone
+        // still leaked into the placement map, the tweq map, the object-state
+        // map and the object system — measured at 500 spawns / 478 still live
+        // after 3 minutes of MISS13, with object IDs climbing past 143,000.
+        // Those maps are scanned linearly on hot paths, so the leak was also a
+        // steady slowdown.
+        if (mPlacements) mPlacements->erase(objID);
+        if (mTweqSystem) mTweqSystem->forgetObject(objID);
+        if (mObjectStates) mObjectStates->remove(objID);
+        // Only objects this system created may have their ID released: we own
+        // every reference to them. Placed objects keep their IDs forever
+        // because doors, the renderer's static instance array and audio voices
+        // all cache raw IDs, and recycling one would repoint those at a
+        // different object.
+        if (mObjSvc) {
+            // Teardown walks every registered property and relation for this
+            // object. A malformed one must not take the process down — report
+            // it and leave the ID allocated rather than abort mid-frame.
+            try {
+                mObjSvc->destroySpawned(objID);
+            } catch (const BasicException &e) {
+                static int warnCount = 0;
+                if (warnCount++ < 5)
+                    std::fprintf(stderr, "[FALLBACK] SpawnSystem: destroying "
+                                 "spawned obj %d threw (%s) — its ID stays "
+                                 "allocated\n", objID, e.getDetails().c_str());
+            }
+        }
+        ++mRecycled;
+
+        if (!mObjData || idx >= mObjData->objects.size()) {
+            std::fprintf(stderr, "[FALLBACK] SpawnSystem: obj %d had renderer "
+                         "slot %zu, which is out of range — the slot is lost "
+                         "rather than reused\n", objID, idx);
+            return;
+        }
 
         // Blank the slot so it draws nothing until something reuses it. The
         // destroyed flag on ObjectState already suppresses the draw; this makes
@@ -242,7 +292,6 @@ public:
         mObjData->objects[idx].objID = 0;
         mObjData->objects[idx].hasPosition = false;
         mFreeInstanceSlots.push_back(idx);
-        ++mRecycled;
     }
 
     uint32_t spawnCount() const { return mSpawned; }

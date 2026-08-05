@@ -485,6 +485,59 @@ TEST_CASE("TweqSystem: a halted delete tweq leaves the object alone", "[Tweq]") 
     REQUIRE((states.get(921).flags & Darkness::kObjStateDestroyed) == 0);
 }
 
+TEST_CASE("TweqSystem: a joints tweq does not trample a lock's joint slot",
+          "[Tweq][SubObject]") {
+    // 171 shipped objects carry BOTH a joints tweq and a lock tweq. On
+    // chestloc the joints config drives j1 alone, so a joints tweq that wrote
+    // all six slots rewrote joints[0] = 0 every tick and pinned the very lock
+    // plate the lock tweq was driving. Whichever ran last won — and that is
+    // unordered_map order, i.e. not stable across builds.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+
+    // Joints tweq driving slot 1 only (slot 0 has no rate).
+    Darkness::TweqInstance joints;
+    joints.objID = 940;
+    joints.type = Darkness::kTweqTypeJoints;
+    joints.cfgHalt = Darkness::kTweqHaltContinue;
+    joints.axisCount = Darkness::kJointSlotCount;
+    joints.axes[1] = {90.0f, 0.0f, 90.0f};
+    joints.active = true;
+    joints.base.rotation = Darkness::Matrix4(1.0f);
+    joints.hasObjectState = true;
+
+    // Lock tweq owning slot 0, parked at its unlocked position.
+    Darkness::TweqInstance lock;
+    lock.objID = 940;
+    lock.type = Darkness::kTweqTypeLock;
+    lock.cfgHalt = Darkness::kTweqHaltContinue;
+    lock.axisCount = 1;
+    lock.axes[0] = {0.0f, 0.0f, 90.0f};   // no rate: parked, not animating
+    lock.lockJointSlot = 0;
+    lock.values[0] = 90.0f;
+    lock.active = true;
+    lock.base.rotation = Darkness::Matrix4(1.0f);
+    lock.hasObjectState = true;
+
+    sys.injectForTest(joints, &states);
+    sys.injectForTest(lock, &states);
+
+    // One step: 50 ms at 90 deg/s is +45 on the joints tweq's own slot. Do NOT
+    // free-run this — the joints tweq bounces at its limit and comes back
+    // through 0, which would make the assertion below pass or fail on step
+    // count rather than on who wrote what.
+    sys.simStep(0.0f, 0.05f);
+
+    const Darkness::ObjectState *os = states.tryGet(940);
+    REQUIRE(os != nullptr);
+    REQUIRE(os->joints[0] == Approx(90.0f));   // the lock still owns slot 0
+    REQUIRE(os->joints[1] == Approx(45.0f));   // the joints tweq drove its own
+
+    // And the lock keeps its slot for as long as both run.
+    for (int i = 0; i < 4; ++i) sys.simStep(0.0f, 0.05f);
+    REQUIRE(states.tryGet(940)->joints[0] == Approx(90.0f));
+}
+
 // ── Emitter tweq ──
 
 namespace {

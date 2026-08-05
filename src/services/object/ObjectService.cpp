@@ -78,6 +78,14 @@ int ObjectService::beginCreate(int archetype) {
 void ObjectService::endCreate(int objID) { _endCreateObject(objID); }
 
 //------------------------------------------------------
+void ObjectService::destroySpawned(int objID) {
+    if (objID <= 0 || !mAllocatedObjects[objID])
+        return;
+
+    _destroyObject(objID);
+}
+
+//------------------------------------------------------
 bool ObjectService::exists(int objID) { return mAllocatedObjects[objID]; }
 
 //------------------------------------------------------

@@ -357,6 +357,26 @@ public:
         }
     }
 
+    /// Drop every tweq instance belonging to an object that has left the
+    /// world. Without this a destroyed object's OTHER tweqs keep running —
+    /// a Models tweq goes on rewriting modelNameOverride forever — and the
+    /// map grows without bound, which matters because activate(), hasTweqs(),
+    /// animStateBits() and applyComposedTransform() all scan it linearly.
+    ///
+    /// Returns how many instances were dropped.
+    size_t forgetObject(int32_t objID) {
+        size_t dropped = 0;
+        for (auto it = mTweqs.begin(); it != mTweqs.end(); ) {
+            if (it->second.objID == objID) {
+                it = mTweqs.erase(it);
+                ++dropped;
+            } else {
+                ++it;
+            }
+        }
+        return dropped;
+    }
+
     /// Number of emissions requested so far (diagnostics).
     uint32_t emissionCount() const { return mEmitFired; }
 
@@ -479,6 +499,29 @@ public:
         // Apply composed transforms for all dirty objects
         for (int32_t objID : mDirtyObjects) {
             applyComposedTransform(objID);
+        }
+
+        // Nothing is iterating mTweqs from here on, so the deferred work that
+        // mutates it can run.
+        //
+        // Teardown first, then spawning: a destroyed object returns its ID to
+        // the free stack, so this frame's spawns can reuse it instead of
+        // extending the object range.
+        if (!mPendingDestroys.empty()) {
+            mDestroyBatch.clear();
+            mDestroyBatch.swap(mPendingDestroys);
+            for (int32_t objID : mDestroyBatch)
+                mDestroyCallback(objID);
+        }
+
+        // Swap before dispatching: a spawned object can itself carry an
+        // emitter, and its emissions must land in the NEXT frame's batch
+        // rather than extending this loop indefinitely.
+        if (!mPendingEmissions.empty()) {
+            mEmissionBatch.clear();
+            mEmissionBatch.swap(mPendingEmissions);
+            for (const EmitRequest &req : mEmissionBatch)
+                mEmitCallback(req);
         }
     }
 
@@ -618,7 +661,7 @@ private:
                         locked.isLocked != 0;
                     tw.values[0] = isLocked ? tw.axes[0].low : tw.axes[0].high;
                 }
-                writeJointPose(tw);
+                writeJointPose(tw, /*seedAll=*/true);
             }
 
             // Joints start wherever JointPos left them (a lever authored
@@ -629,7 +672,7 @@ private:
                     for (int i = 0; i < kJointSlotCount; ++i)
                         tw.values[i] = jp.joint[i];
                 }
-                writeJointPose(tw);
+                writeJointPose(tw, /*seedAll=*/true);
             }
 
             // Initialize current values for Rotate tweqs from base angles
@@ -1017,7 +1060,19 @@ private:
     /// Joints move parts INSIDE the model, never the object itself, so this
     /// deliberately does not touch the object transform and does not mark the
     /// object dirty for applyComposedTransform.
-    void writeJointPose(TweqInstance &tw) {
+    /// Publish a tweq's joint values to the object's render pose.
+    ///
+    /// Every tweq writes ONLY the slots it drives. A Joints tweq used to write
+    /// all six, which put it in a fight with the Lock tweq on the same object:
+    /// 171 shipped objects carry both, and on `chestloc` the joints config
+    /// defines j1 alone, so it rewrote joints[0] = 0 every tick and pinned the
+    /// very lock plate the Lock tweq was driving. Whichever ran last won, and
+    /// that is unordered_map iteration order — hash-dependent, and not stable
+    /// across builds or platforms.
+    ///
+    /// `seedAll` is for the one-time init pose, where the values come from
+    /// JointPos and every slot is legitimately this tweq's to place.
+    void writeJointPose(TweqInstance &tw, bool seedAll = false) {
         if (!mObjectStates) return;
         static_assert(ObjectState::kJointSlots == kJointSlotCount,
                       "ObjectState joint array must match P$JointPos slot count");
@@ -1025,12 +1080,18 @@ private:
         ensureObjectState(tw);
         ObjectState &os = mObjectStates->get(tw.objID);
         if (tw.type == kTweqTypeLock) {
-            // A lock owns exactly one slot; the rest of the pose belongs to
-            // whatever else drives this object.
             os.joints[tw.lockJointSlot] = tw.values[0];
-        } else {
+        } else if (seedAll) {
             for (int i = 0; i < kJointSlotCount; ++i)
                 os.joints[i] = tw.values[i];
+        } else {
+            // Only the slots this tweq actually drives. Read from the live
+            // rate rather than a cached mask so the two cannot desync —
+            // processAxis skips a zero-rate slot outright, so such a slot is
+            // not this tweq's to write either.
+            for (int i = 0; i < kJointSlotCount && i < tw.axisCount; ++i)
+                if (std::fabs(tw.axes[i].rate) > 1e-6f)
+                    os.joints[i] = tw.values[i];
         }
         os.hasJoints = true;
     }
@@ -1139,15 +1200,44 @@ private:
             Vector3 v = tw.emitVelocity;
             if (tw.cfgMisc & kTweqMiscRelVel)
                 v = Vector3(tw.base.rotation * glm::vec4(v, 0.0f));
-            v.x += tw.emitAngleRandom.x * randFloat();
-            v.y += tw.emitAngleRandom.y * randFloat();
-            v.z += tw.emitAngleRandom.z * randFloat();
+
+            // Angle Random is an ANGLE, per the engine's own field label, and
+            // it is authored in degrees like every other rotational tweq
+            // value: `sword_hilt`, `doorknob` and `junklever` all ship
+            // (359, 359, 359) — the same "almost a full turn" idiom JointPos
+            // uses — against a velocity of (0, 0, -0.1). Adding those as
+            // linear velocity, which this used to do, launches the emitted
+            // object out of the level at 359 units/s.
+            //
+            // Applied here as a random per-axis rotation of the emission
+            // direction. That the field is an angle is established; that this
+            // is the engine's exact construction is NOT — a cone about the
+            // velocity is equally plausible. Revisit if emitted objects ever
+            // get integrated velocity to compare against.
+            const Vector3 spreadDeg(tw.emitAngleRandom.x * randFloat(),
+                                    tw.emitAngleRandom.y * randFloat(),
+                                    tw.emitAngleRandom.z * randFloat());
+            if (glm::length(tw.emitAngleRandom) > 1e-6f &&
+                glm::length(v) > 1e-6f) {
+                const float kDegToRad = 3.14159265358979f / 180.0f;
+                const Matrix4 spread =
+                    glm::eulerAngleZYX(spreadDeg.z * kDegToRad,
+                                       spreadDeg.y * kDegToRad,
+                                       spreadDeg.x * kDegToRad);
+                v = Vector3(spread * glm::vec4(v, 0.0f));
+            }
             req.velocity = v;
         }
 
         ++mEmitFired;
         if (mEmitCallback) {
-            mEmitCallback(req);
+            // Deferred, NOT dispatched here. The spawner registers the new
+            // object's tweqs, which inserts into mTweqs — and this runs from
+            // inside simStep's range-for over that same map. Mutating it mid
+            // iteration is undefined behaviour, and in practice rehashing
+            // silently skipped live tweqs (measured: 9-16 of 16 emitters
+            // serviced per frame instead of 16).
+            mPendingEmissions.push_back(std::move(req));
         } else {
             static int warnCount = 0;
             if (warnCount++ < 3)
@@ -1433,8 +1523,14 @@ private:
             // ... and take it out of the rest of the simulation. The flag alone
             // used to be the whole of it, so a slain object went on colliding,
             // being heard and answering area queries while invisible.
+            //
+            // Deferred for the same reason emissions are: the callback tears
+            // down a spawned object, which drops its tweq instances — and this
+            // runs from inside simStep's range-for over that very map. Calling
+            // it inline aborted the process the first time a spawned effect
+            // expired.
             if (mDestroyCallback) {
-                mDestroyCallback(tw.objID);
+                mPendingDestroys.push_back(tw.objID);
             } else {
                 static int warnCount = 0;
                 if (warnCount++ < 3)
@@ -1500,6 +1596,12 @@ private:
     ObjectDestroyCallback mDestroyCallback;
     EmitCallback mEmitCallback;
     uint32_t mEmitFired = 0;
+    // Objects destroyed during a step, torn down after it. See handleCompletion().
+    std::vector<int32_t> mPendingDestroys;
+    std::vector<int32_t> mDestroyBatch;
+    // Emissions raised during a step, dispatched after it. See emitOne().
+    std::vector<EmitRequest> mPendingEmissions;
+    std::vector<EmitRequest> mEmissionBatch;
     std::mt19937 mRng;
     uint32_t mFrameCount = 0;
     const std::unordered_map<std::string, ParsedBinMesh> *mParsedModels = nullptr;
