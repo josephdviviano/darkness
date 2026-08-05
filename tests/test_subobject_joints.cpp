@@ -578,6 +578,99 @@ TEST_CASE("TweqSystem: a halted rotate tweq keeps its final pose",
     REQUIRE(os->modelMatrix[1] == Approx(1.0f).margin(1e-4));
 }
 
+// ── Models tweq ──
+//
+// This type had no test coverage at all despite a 104-byte config, six name
+// slots, a documented gap rule, and a while-loop with two edge behaviours.
+
+namespace {
+
+Darkness::TweqInstance makeModelsTweq(int32_t objID, uint16_t rateMs,
+                                      std::initializer_list<const char *> names,
+                                      uint8_t animFlags = 0,
+                                      uint8_t halt = Darkness::kTweqHaltContinue) {
+    Darkness::TweqInstance tw;
+    tw.objID = objID;
+    tw.type = Darkness::kTweqTypeModels;
+    tw.cfgRate = rateMs;
+    tw.cfgAnim = animFlags;
+    tw.cfgHalt = halt;
+    int i = 0;
+    for (const char *n : names) {
+        std::strncpy(tw.modelNames[i], n, 15);
+        ++i;
+    }
+    tw.modelCount = static_cast<int>(names.size());
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.hasObjectState = true;
+    return tw;
+}
+
+} // namespace
+
+TEST_CASE("TweqSystem: a models tweq cycles forward through its names",
+          "[Tweq][Models]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    sys.injectForTest(makeModelsTweq(980, 99, {"flame1", "flame2", "flame3"}),
+                      &states);
+
+    REQUIRE(states.tryGet(980) == nullptr);   // nothing applied yet
+
+    sys.simStep(0.0f, 0.1f);                  // one frame duration (rate + 1)
+    REQUIRE(states.get(980).modelNameOverride == "flame2");
+
+    sys.simStep(0.0f, 0.1f);
+    REQUIRE(states.get(980).modelNameOverride == "flame3");
+}
+
+TEST_CASE("TweqSystem: a models tweq wraps to the first name", "[Tweq][Models]") {
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    sys.injectForTest(makeModelsTweq(981, 99, {"a", "b"},
+                                     Darkness::kTweqAnimWrap), &states);
+
+    sys.simStep(0.0f, 0.1f);                  // a -> b
+    REQUIRE(states.get(981).modelNameOverride == "b");
+    sys.simStep(0.0f, 0.1f);                  // b -> wrap -> a
+    REQUIRE(states.get(981).modelNameOverride == "a");
+}
+
+TEST_CASE("TweqSystem: a models tweq bounces back off the last name",
+          "[Tweq][Models]") {
+    // Without Wrap the cycle reverses at the edge rather than jumping.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+    sys.injectForTest(makeModelsTweq(982, 99, {"a", "b", "c"}), &states);
+
+    sys.simStep(0.0f, 0.1f);   // b
+    sys.simStep(0.0f, 0.1f);   // c  (at the top)
+    REQUIRE(states.get(982).modelNameOverride == "c");
+    sys.simStep(0.0f, 0.1f);   // reverses at the edge
+    sys.simStep(0.0f, 0.1f);
+    REQUIRE(states.get(982).modelNameOverride == "b");
+}
+
+TEST_CASE("TweqSystem: modelCount stops at the first empty slot",
+          "[Tweq][Models]") {
+    // The documented rule: names after a gap are script-accessible variants,
+    // not part of the animation cycle. initFromConfig implements it; this
+    // pins it, since a cycle that ran past the gap would show the wrong model.
+    Darkness::PropCfgTweqModels cfg{};
+    cfg.rate = 50;
+    std::strncpy(cfg.modelName[0], "one", 15);
+    std::strncpy(cfg.modelName[1], "two", 15);
+    // slot 2 deliberately empty
+    std::strncpy(cfg.modelName[3], "afterGap", 15);
+
+    Darkness::TweqSystem sys;
+    Darkness::TweqInstance tw;
+    sys.initFromConfigForTest(tw, cfg);
+
+    REQUIRE(tw.modelCount == 2);
+}
+
 // ── Update-rate gates ──
 
 namespace {

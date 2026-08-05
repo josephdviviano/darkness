@@ -630,6 +630,13 @@ public:
         return names;
     }
 
+    /// Parse a config into an instance (for unit tests). Exercises the real
+    /// initFromConfig overload rather than a copy of its rules.
+    template <typename CfgT>
+    void initFromConfigForTest(TweqInstance &tw, const CfgT &cfg) {
+        initFromConfig(tw, cfg, tw.type);
+    }
+
     /// Inject a tweq instance and set the object state map (for unit tests).
     void injectForTest(const TweqInstance &tw, ObjectStateMap *states) {
         mTweqs[tweqKey(tw.objID, tw.type, tw.emitterSlot)] = tw;
