@@ -76,11 +76,18 @@ namespace Darkness {
 // vertical) per iteration.
 static constexpr bgfx::ViewId kViewSky          = 0;
 static constexpr bgfx::ViewId kViewWorld        = 1;
-static constexpr bgfx::ViewId kViewDebug        = 2;
+// Light coronas. Their own view, not the tail of kViewWorld, because the
+// corona shader SAMPLES the scene depth buffer — and a texture cannot be
+// bound as a framebuffer attachment and as a sampler in the same draw. This
+// view therefore targets `colorOnlyFrameBuffer`: the same colour texture,
+// no depth attachment, so depth is free to be read. Coronas neither test nor
+// write depth (see renderCoronas), so they lose nothing by its absence.
+static constexpr bgfx::ViewId kViewCorona       = 2;
+static constexpr bgfx::ViewId kViewDebug        = 3;
 // Bright-pass extraction. Only the NewDark style submits it; the Amnesia
 // style blurs the scene directly and leaves this view unused.
-static constexpr bgfx::ViewId kViewBloomExtract = 3;
-static constexpr bgfx::ViewId kViewBloomBase    = 4;
+static constexpr bgfx::ViewId kViewBloomExtract = 4;
+static constexpr bgfx::ViewId kViewBloomBase    = 5;
 
 // HPL2 ships 2 iterations (cPostEffectParams_Bloom::mlBlurIterations).
 // Reserve headroom for 4 so the setting is explorable without renumbering
@@ -129,32 +136,6 @@ enum class LumaMode : int {
     // the point — this enum is the one place that disagreement is decided.
     LCD = 1,
 };
-
-/// Translate a sample count into bgfx's render-target MSAA bits.
-///
-/// bgfx packs the sample count into the texture flags rather than taking it
-/// as a number, and the same value is needed in two places: the offscreen
-/// scene target, and (for the direct path when post-processing is off) the
-/// backbuffer reset flags. Keeping the mapping here stops the two drifting.
-inline uint64_t msaaTextureFlag(int samples) {
-    switch (samples) {
-        case 2:  return BGFX_TEXTURE_RT_MSAA_X2;
-        case 4:  return BGFX_TEXTURE_RT_MSAA_X4;
-        case 8:  return BGFX_TEXTURE_RT_MSAA_X8;
-        case 16: return BGFX_TEXTURE_RT_MSAA_X16;
-        default: return BGFX_TEXTURE_RT;
-    }
-}
-
-inline uint32_t msaaResetFlag(int samples) {
-    switch (samples) {
-        case 2:  return BGFX_RESET_MSAA_X2;
-        case 4:  return BGFX_RESET_MSAA_X4;
-        case 8:  return BGFX_RESET_MSAA_X8;
-        case 16: return BGFX_RESET_MSAA_X16;
-        default: return 0;
-    }
-}
 
 inline void lumaWeightsFor(LumaMode mode, float outRGB[3]) {
     if (mode == LumaMode::LCD) {
@@ -279,11 +260,25 @@ struct PostProcessResources {
     bgfx::UniformHandle     u_extractParams = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle     u_bloomStyle    = BGFX_INVALID_HANDLE;
 
-    uint16_t width       = 0;
+    // Scene depth, and a framebuffer over the same colour texture WITHOUT it.
+    // Both exist only when the backend gave us a sampleable depth format —
+    // see createPostProcess. The corona depth fade is the only consumer.
+    bgfx::TextureHandle     sceneDepth = BGFX_INVALID_HANDLE;
+    bgfx::FrameBufferHandle colorOnlyFrameBuffer = BGFX_INVALID_HANDLE;
+    bool                    depthSampleable = false;
+
+    uint16_t width       = 0;   // scene target size (may be below the window)
     uint16_t height      = 0;
+    /// Point-sample the scene texture in the composite. This is the whole of
+    /// the "vintage" look: a low-resolution scene upscaled with POINT keeps
+    /// hard pixel edges, where LINEAR would just look like a blurry frame.
+    bool     pointUpscale = false;
+    /// Window size — where the composite lands. Differs from width/height
+    /// when render_scale asks for a lower internal resolution.
+    uint16_t outWidth    = 0;
+    uint16_t outHeight   = 0;
     uint16_t bloomWidth  = 0;
     uint16_t bloomHeight = 0;
-    int      msaaSamples = 0;   // 0 = off; what was actually achieved
 
     // False when the driver refused a float render target and we fell back to
     // RGBA8. Overbright above 1.0 clips at the target in that case, so tone
@@ -305,6 +300,54 @@ struct PostProcessResources {
     }
 };
 
+/// Internal render resolution, resolved from the config against the window.
+///
+/// `requestedHeight` 0 (or >= the window) means native. Otherwise the scene
+/// renders smaller and the composite scales it back up — the vintage look.
+///
+/// `integerScale` divides BOTH axes by the same whole number, which is what
+/// makes the pixel grid uniform. Without it a 1280-wide window showing a
+/// 380-wide image gives some pixels 3 screen-pixels across and some 4, and
+/// the grid visibly breaks up. With it, 1280x720 / 4 = 320x180 — every
+/// source pixel is exactly a 4x4 block.
+struct RenderResolution {
+    uint16_t width  = 0;
+    uint16_t height = 0;
+    int      divisor = 1;   // 1 = native
+    bool     isNative() const { return divisor == 1; }
+};
+
+inline RenderResolution resolveRenderResolution(uint16_t windowW,
+                                                uint16_t windowH,
+                                                int requestedHeight,
+                                                bool integerScale) {
+    RenderResolution r;
+    r.width = windowW; r.height = windowH; r.divisor = 1;
+    if (requestedHeight <= 0 || requestedHeight >= int(windowH))
+        return r;
+
+    if (integerScale) {
+        // Round to the nearest whole divisor rather than truncating, so
+        // asking for 240 out of 720 gives exactly 3x and not 2x.
+        int div = (int(windowH) + requestedHeight / 2) / requestedHeight;
+        if (div < 1) div = 1;
+        r.divisor = div;
+        r.width  = static_cast<uint16_t>(windowW / div);
+        r.height = static_cast<uint16_t>(windowH / div);
+    } else {
+        // Preserve the window's aspect so the composite's stretch does not
+        // distort. The projection uses the WINDOW aspect regardless, so a
+        // non-square internal pixel resolves correctly.
+        r.height = static_cast<uint16_t>(requestedHeight);
+        r.width  = static_cast<uint16_t>(
+            (int(windowW) * requestedHeight + int(windowH) / 2) / int(windowH));
+        r.divisor = 0; // non-integer
+    }
+    if (r.width  == 0) r.width  = 1;
+    if (r.height == 0) r.height = 1;
+    return r;
+}
+
 /// Pick the scene colour format, announcing a downgrade rather than taking it
 /// silently — an RGBA8 scene target defeats the entire point of the pass.
 inline bgfx::TextureFormat::Enum pickSceneColorFormat(bool &outHdrCapable) {
@@ -324,17 +367,37 @@ inline bgfx::TextureFormat::Enum pickSceneColorFormat(bool &outHdrCapable) {
 
 /// Pick a supported depth format. Formats differ in availability across
 /// Metal/D3D/GL/Vulkan, so probe rather than assume.
-inline bool pickDepthFormat(bgfx::TextureFormat::Enum &outFormat,
+///
+/// `sampleFlags` is what the depth attachment will actually be created with.
+/// A write-only depth buffer is cheaper and universally supported; a
+/// *sampleable* one is what the corona depth fade needs, and not every
+/// backend offers every format for reading. Probing with the real flags is
+/// the only honest test — `isTextureValid` with different flags answers a
+/// different question.
+inline bool pickDepthFormat(uint64_t sampleFlags,
+                            bgfx::TextureFormat::Enum &outFormat,
                             const char *&outName) {
     struct Candidate { bgfx::TextureFormat::Enum fmt; const char *name; };
-    const Candidate candidates[] = {
+    // D32F first when sampling: a plain 32-bit float depth is the most widely
+    // readable. D24S8 leads for the write-only case because it is the
+    // cheapest universally-supported render-target depth.
+    const Candidate sampled[] = {
+        { bgfx::TextureFormat::D32F,  "D32F"  },
+        { bgfx::TextureFormat::D24S8, "D24S8" },
+        { bgfx::TextureFormat::D24,   "D24"   },
+        { bgfx::TextureFormat::D16,   "D16"   },
+    };
+    const Candidate writeOnly[] = {
         { bgfx::TextureFormat::D24S8, "D24S8" },
         { bgfx::TextureFormat::D32F,  "D32F"  },
         { bgfx::TextureFormat::D24,   "D24"   },
         { bgfx::TextureFormat::D16,   "D16"   },
     };
-    for (const Candidate &c : candidates) {
-        if (bgfx::isTextureValid(0, false, 1, c.fmt, BGFX_TEXTURE_RT_WRITE_ONLY)) {
+    const bool wantSampling = (sampleFlags & BGFX_TEXTURE_RT_WRITE_ONLY) == 0;
+    const Candidate *list = wantSampling ? sampled : writeOnly;
+    for (int i = 0; i < 4; ++i) {
+        const Candidate &c = list[i];
+        if (bgfx::isTextureValid(0, false, 1, c.fmt, sampleFlags)) {
             outFormat = c.fmt;
             outName   = c.name;
             return true;
@@ -373,14 +436,22 @@ inline bgfx::VertexBufferHandle buildFullscreenTriangle() {
 /// Create the offscreen target, composite program and fullscreen triangle.
 /// Returns false (leaving `out` invalid) if the target could not be built;
 /// callers should fall back to the direct path and say so.
+/// `width`/`height` size the SCENE target; `outWidth`/`outHeight` size the
+/// composite's viewport, i.e. the window. They differ when
+/// graphics.render_scale asks for a lower internal resolution — the composite
+/// is where the upscale happens.
 inline bool createPostProcess(PostProcessResources &out,
                               uint16_t width, uint16_t height,
+                              uint16_t outWidth, uint16_t outHeight,
+                              bool pointUpscale,
                               bgfx::ProgramHandle compositeProgram,
                               bgfx::ProgramHandle blurProgram,
-                              bgfx::ProgramHandle extractProgram,
-                              int msaaSamples) {
+                              bgfx::ProgramHandle extractProgram) {
     out.width  = width;
     out.height = height;
+    out.outWidth  = outWidth;
+    out.outHeight = outHeight;
+    out.pointUpscale = pointUpscale;
     out.compositeProgram = compositeProgram;
     out.blurProgram      = blurProgram;
     out.extractProgram   = extractProgram;
@@ -393,15 +464,6 @@ inline bool createPostProcess(PostProcessResources &out,
     }
 
     const bgfx::TextureFormat::Enum colorFmt = pickSceneColorFormat(out.hdrCapable);
-
-    bgfx::TextureFormat::Enum depthFmt = bgfx::TextureFormat::D24S8;
-    const char *depthName = "unknown";
-    if (!pickDepthFormat(depthFmt, depthName)) {
-        std::fprintf(stderr,
-            "[FALLBACK] postprocess: no supported depth render-target format — "
-            "post-processing disabled, rendering direct to backbuffer.\n");
-        return false;
-    }
 
     // LINEAR filtering, not point.
     //
@@ -416,31 +478,62 @@ inline bool createPostProcess(PostProcessResources &out,
     // Clamp so the oversized triangle's out-of-range UVs (which land
     // outside the visible region) cannot wrap.
     //
-    // MSAA lives on this target, not the backbuffer: once the scene renders
-    // offscreen, backbuffer multisampling would only ever anti-alias the
-    // composite triangle's own screen-edge, which has no visible geometry
-    // on it. Both attachments must carry the same sample count or the
-    // framebuffer is invalid. bgfx resolves automatically when the colour
-    // texture is later sampled by the composite.
-    uint64_t rtFlag = msaaTextureFlag(msaaSamples);
-    if (msaaSamples > 0 &&
-        !bgfx::isTextureValid(0, false, 1, colorFmt, rtFlag)) {
-        std::fprintf(stderr,
-            "[FALLBACK] postprocess: %dx MSAA is unsupported for the scene "
-            "target on this backend — continuing without it. Geometry edges "
-            "will alias.\n", msaaSamples);
-        rtFlag = BGFX_TEXTURE_RT;
-        msaaSamples = 0;
-    }
-    out.msaaSamples = msaaSamples;
+    const uint64_t rtFlag = BGFX_TEXTURE_RT;
 
     const uint64_t colorFlags = rtFlag
                               | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
 
+    // ── Depth: sampleable if the backend allows it ──
+    //
+    // The corona pass reads this to fade its billboards behind geometry, so a
+    // readable depth buffer is worth asking for. It is not worth *insisting*
+    // on: a write-only depth buffer is cheaper and universally supported, and
+    // everything except the corona depth fade works fine with one. So probe
+    // for sampleable first and fall back rather than failing the whole pass.
+    //
+    // Depth is created SAMPLEABLE, because the corona depth fade reads it and
+    // SSAO / volumetric scattering on the roadmap will too. That is only
+    // possible because this engine has no MSAA: bgfx refuses to resolve a
+    // multisampled depth attachment on any backend —
+    //
+    //   "Frame buffer depth MSAA texture cannot be resolved. It must be
+    //    created with `BGFX_TEXTURE_RT_WRITE_ONLY` flag."   (bgfx.cpp:4561)
+    //
+    // — and that incompatibility is one of the two reasons MSAA was removed
+    // (the other being the deferred G-buffer in PLAN.DYNAMIC_LIGHTS.md). See
+    // PLAN.VISUALS.md "Anti-aliasing"; SMAA/TAA replace it.
+    //
+    // Still probe rather than assume: a write-only depth buffer is cheaper and
+    // universally supported, and everything except the depth-reading effects
+    // works fine with one, so degrade instead of failing the whole pass.
+    bgfx::TextureFormat::Enum depthFmt = bgfx::TextureFormat::D24S8;
+    const char *depthName = "unknown";
+    const uint64_t sampleableDepthFlags =
+        rtFlag | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
+    uint64_t depthFlags = sampleableDepthFlags;
+
+    if (pickDepthFormat(sampleableDepthFlags, depthFmt, depthName)) {
+        out.depthSampleable = true;
+    } else if (pickDepthFormat(rtFlag | BGFX_TEXTURE_RT_WRITE_ONLY,
+                               depthFmt, depthName)) {
+        out.depthSampleable = false;
+        depthFlags = rtFlag | BGFX_TEXTURE_RT_WRITE_ONLY;
+        std::fprintf(stderr,
+            "[FALLBACK] postprocess: no sampleable depth format on this "
+            "backend — using a write-only depth buffer. The corona depth fade "
+            "has nothing to read, so it is off and coronas fall back to "
+            "ray-traced occlusion alone.\n");
+    } else {
+        std::fprintf(stderr,
+            "[FALLBACK] postprocess: no supported depth render-target format — "
+            "post-processing disabled, rendering direct to backbuffer.\n");
+        return false;
+    }
+
     bgfx::TextureHandle attachments[2];
     attachments[0] = bgfx::createTexture2D(width, height, false, 1, colorFmt, colorFlags);
     attachments[1] = bgfx::createTexture2D(width, height, false, 1, depthFmt,
-                                           rtFlag | BGFX_TEXTURE_RT_WRITE_ONLY);
+                                           depthFlags);
 
     if (!bgfx::isValid(attachments[0]) || !bgfx::isValid(attachments[1])) {
         std::fprintf(stderr,
@@ -464,6 +557,32 @@ inline bool createPostProcess(PostProcessResources &out,
         return false;
     }
     out.sceneColor = bgfx::getTexture(out.frameBuffer, 0);
+    if (out.depthSampleable)
+        out.sceneDepth = bgfx::getTexture(out.frameBuffer, 1);
+
+    // ── Colour-only view of the same scene target ──
+    //
+    // Shares attachment 0 with the main framebuffer and deliberately has NO
+    // depth attachment. The corona pass renders through this so it can sample
+    // the depth texture: binding a texture as an attachment and as a sampler
+    // in the same draw is a read/write hazard, and undefined behaviour on
+    // every backend that bothers to say. `destroyTextures=false` — the main
+    // framebuffer owns that colour texture.
+    if (out.depthSampleable) {
+        bgfx::Attachment colorOnly[1];
+        colorOnly[0].init(out.sceneColor);
+        out.colorOnlyFrameBuffer = bgfx::createFrameBuffer(1, colorOnly, false);
+        if (!bgfx::isValid(out.colorOnlyFrameBuffer)) {
+            // Not fatal: coronas fall back to ray-traced occlusion, which is
+            // what they used before the depth fade existed.
+            std::fprintf(stderr,
+                "[FALLBACK] postprocess: colour-only framebuffer creation "
+                "failed — the corona depth fade cannot run and coronas will "
+                "fall back to ray-traced occlusion alone.\n");
+            out.depthSampleable = false;
+            out.sceneDepth = BGFX_INVALID_HANDLE;
+        }
+    }
 
     PostProcessVertex::init();
     out.triangleVBH = buildFullscreenTriangle();
@@ -535,16 +654,18 @@ inline bool createPostProcess(PostProcessResources &out,
     // pixel it covers, and the triangle covers all of them.
     bgfx::setViewName(kViewComposite, "composite");
     bgfx::setViewClear(kViewComposite, BGFX_CLEAR_NONE, 0, 1.0f, 0);
-    bgfx::setViewRect(kViewComposite, 0, 0, width, height);
+    bgfx::setViewRect(kViewComposite, 0, 0, outWidth, outHeight);
     bgfx::setViewFrameBuffer(kViewComposite, BGFX_INVALID_HANDLE);
 
     std::fprintf(stderr,
-        "Post-process: %ux%u scene target, colour=%s depth=%s msaa=%dx, "
+        "Post-process: %ux%u scene target%s, colour=%s depth=%s, "
         "backend=%s\n",
         width, height,
+        (width == outWidth && height == outHeight)
+            ? "" : (pointUpscale ? " -> point upscale (vintage)"
+                                 : " -> linear upscale"),
         out.hdrCapable ? "RGBA16F" : "RGBA8 (no HDR)",
         depthName,
-        out.msaaSamples > 0 ? out.msaaSamples : 1,
         bgfx::getRendererName(bgfx::getRendererType()));
 
     return true;
@@ -553,6 +674,11 @@ inline bool createPostProcess(PostProcessResources &out,
 inline void destroyPostProcess(PostProcessResources &pp) {
     // sceneColor / bloomTex are owned by their framebuffers (created with
     // destroyTextures=true), so they must not be destroyed separately.
+    // Destroyed BEFORE frameBuffer: it borrows that framebuffer's colour
+    // texture (created with destroyTextures=false), so it must go while the
+    // owner is still alive.
+    if (bgfx::isValid(pp.colorOnlyFrameBuffer))
+        bgfx::destroy(pp.colorOnlyFrameBuffer);
     if (bgfx::isValid(pp.frameBuffer))      bgfx::destroy(pp.frameBuffer);
     if (bgfx::isValid(pp.bloomFB[0]))       bgfx::destroy(pp.bloomFB[0]);
     if (bgfx::isValid(pp.bloomFB[1]))       bgfx::destroy(pp.bloomFB[1]);
@@ -585,6 +711,29 @@ inline void bindSceneTarget(const PostProcessResources &pp, bool active) {
     bgfx::setViewFrameBuffer(kViewSky,   target);
     bgfx::setViewFrameBuffer(kViewWorld, target);
     bgfx::setViewFrameBuffer(kViewDebug, target);
+
+    // Scene view rects follow the target, every frame. Under render_scale the
+    // offscreen target is smaller than the window, so the two cases need
+    // different viewports — and post-processing is toggleable live from the
+    // console, so latching this at init would leave the scene drawn into a
+    // small corner of the backbuffer the moment it was switched off.
+    if (pp.outWidth > 0 && pp.outHeight > 0 && pp.width != pp.outWidth) {
+        const uint16_t vw = active ? pp.width  : pp.outWidth;
+        const uint16_t vh = active ? pp.height : pp.outHeight;
+        bgfx::setViewRect(kViewSky,    0, 0, vw, vh);
+        bgfx::setViewRect(kViewWorld,  0, 0, vw, vh);
+        bgfx::setViewRect(kViewCorona, 0, 0, vw, vh);
+        bgfx::setViewRect(kViewDebug,  0, 0, vw, vh);
+    }
+
+    // Coronas go to the depth-free view of the same colour texture when one
+    // exists, so the pass can sample depth. Without it they share the normal
+    // target and simply do not read depth — the fade turns itself off, and
+    // the ray trace stays their only occluder.
+    bgfx::FrameBufferHandle coronaTarget = target;
+    if (active && bgfx::isValid(pp.colorOnlyFrameBuffer))
+        coronaTarget = pp.colorOnlyFrameBuffer;
+    bgfx::setViewFrameBuffer(kViewCorona, coronaTarget);
 }
 
 /// One separable blur pass: `src` → `dstFB`, stepping along `dirX/dirY`.
@@ -772,7 +921,13 @@ inline void submitComposite(const PostProcessResources &pp,
     bgfx::setUniform(pp.u_lumaWeights, lumaWeights);
     bgfx::setUniform(pp.u_bloomParams, bloomParams);
     bgfx::setUniform(pp.u_bloomStyle,  bloomStyle);
-    bgfx::setTexture(0, pp.s_texScene, pp.sceneColor);
+    // Explicit sampler flags rather than the texture's baked ones: bloom's
+    // first blur reads this SAME texture and needs LINEAR for its 2x2
+    // downsample, so the point filter has to be chosen here, per-draw, not
+    // baked at creation.
+    bgfx::setTexture(0, pp.s_texScene, pp.sceneColor,
+                     (pp.pointUpscale ? BGFX_SAMPLER_POINT : 0)
+                     | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
 
     // The bloom sampler must always have a valid texture bound even when
     // bloom is off, or backends that validate bindings will complain; the

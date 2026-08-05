@@ -40,6 +40,8 @@
 #include "glsl/fs_composite.sc.bin.h"
 #include "glsl/fs_bloom_blur.sc.bin.h"
 #include "glsl/fs_bloom_extract.sc.bin.h"
+#include "glsl/vs_corona.sc.bin.h"
+#include "glsl/fs_corona.sc.bin.h"
 
 // ESSL (OpenGL ES) — all platforms
 #include "essl/vs_basic.sc.bin.h"
@@ -59,6 +61,8 @@
 #include "essl/fs_composite.sc.bin.h"
 #include "essl/fs_bloom_blur.sc.bin.h"
 #include "essl/fs_bloom_extract.sc.bin.h"
+#include "essl/vs_corona.sc.bin.h"
+#include "essl/fs_corona.sc.bin.h"
 
 // SPIR-V (Vulkan) — all platforms
 #include "spirv/vs_basic.sc.bin.h"
@@ -78,6 +82,8 @@
 #include "spirv/fs_composite.sc.bin.h"
 #include "spirv/fs_bloom_blur.sc.bin.h"
 #include "spirv/fs_bloom_extract.sc.bin.h"
+#include "spirv/vs_corona.sc.bin.h"
+#include "spirv/fs_corona.sc.bin.h"
 
 // Metal — macOS / iOS only
 #if BGFX_PLATFORM_SUPPORTS_METAL
@@ -98,6 +104,8 @@
 #include "metal/fs_composite.sc.bin.h"
 #include "metal/fs_bloom_blur.sc.bin.h"
 #include "metal/fs_bloom_extract.sc.bin.h"
+#include "metal/vs_corona.sc.bin.h"
+#include "metal/fs_corona.sc.bin.h"
 #endif
 
 // DXBC (Direct3D 11/12) — Windows only
@@ -119,6 +127,8 @@
 #include "dx11/fs_composite.sc.bin.h"
 #include "dx11/fs_bloom_blur.sc.bin.h"
 #include "dx11/fs_bloom_extract.sc.bin.h"
+#include "dx11/vs_corona.sc.bin.h"
+#include "dx11/fs_corona.sc.bin.h"
 #endif
 
 // ── Embedded shader lookup table ──
@@ -142,5 +152,7 @@ static const bgfx::EmbeddedShader s_embeddedShaders[] = {
     BGFX_EMBEDDED_SHADER(fs_composite),
     BGFX_EMBEDDED_SHADER(fs_bloom_blur),
     BGFX_EMBEDDED_SHADER(fs_bloom_extract),
+    BGFX_EMBEDDED_SHADER(vs_corona),
+    BGFX_EMBEDDED_SHADER(fs_corona),
     BGFX_EMBEDDED_SHADER_END()
 };

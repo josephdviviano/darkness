@@ -411,6 +411,35 @@ struct RayOBBResult {
     Vector3 point;      // world-space hit point on the OBB surface
 };
 
+/// Segment-vs-AABB overlap, slab method. Broad-phase only: it answers
+/// "could this segment touch this box", exactly enough to nominate a body
+/// for the exact test that follows.
+///
+/// A segment's own bounding box is a poor filter for a long diagonal ray —
+/// it nominates most of a level — so this tests the segment itself rather
+/// than its extent.
+inline bool segmentVsAABB(const Vector3 &from, const Vector3 &dir,
+                          const Vector3 &boxMin, const Vector3 &boxMax) {
+    float tMin = 0.0f, tMax = 1.0f;
+    for (int axis = 0; axis < 3; ++axis) {
+        const float d = dir[axis];
+        const float o = from[axis];
+        if (std::fabs(d) < 1e-8f) {
+            // Parallel to this slab: no intersection unless already inside.
+            if (o < boxMin[axis] || o > boxMax[axis]) return false;
+            continue;
+        }
+        const float inv = 1.0f / d;
+        float t1 = (boxMin[axis] - o) * inv;
+        float t2 = (boxMax[axis] - o) * inv;
+        if (t1 > t2) std::swap(t1, t2);
+        if (t1 > tMin) tMin = t1;
+        if (t2 < tMax) tMax = t2;
+        if (tMin > tMax) return false;
+    }
+    return true;
+}
+
 /// Slab-based ray-vs-OBB intersection test.
 ///
 /// Tests a ray segment (start → end) against the 6 face planes of an OBB.
@@ -1057,6 +1086,71 @@ public:
     const ObjectCollisionBody *findBodyByObjID(int32_t objID) const {
         auto it = mObjIDToBody.find(objID);
         return (it != mObjIDToBody.end()) ? &mBodies[it->second] : nullptr;
+    }
+
+    // ── Line-of-sight against objects ────────────────────────────────────
+    //
+    // The WR raycaster answers "is this segment blocked by terrain". These
+    // two answer "is it blocked by an OBJECT" — a closed door, a crate, a
+    // bookcase. Doors matter most, and they work because DoorSystem,
+    // MovingTerrainSystem and PressurePlateSystem all push their animated
+    // transforms through updateBodyTransform(): a closed door's OBB is in
+    // the doorway, an open one's has swung out of it.
+    //
+    // Split into gather + test on purpose. A caller with several nearly
+    // parallel rays down the same corridor (a corona sampling a disc around
+    // its light) walks every body ONCE to collect candidates, then tests only
+    // those few against each ray. Walking all bodies per ray instead is what
+    // makes this kind of query expensive.
+
+    /// Collect indices of bodies whose AABB the segment could touch.
+    /// `pad` expands the test so one gather serves a bundle of rays spread up
+    /// to `pad` around the segment. `ignoreObjID` is dropped — a light must
+    /// not be occluded by the very fixture it hangs on.
+    void gatherSegmentOccluders(const Vector3 &from, const Vector3 &to,
+                                float pad, int32_t ignoreObjID,
+                                std::vector<uint32_t> &out) const {
+        out.clear();
+        const Vector3 dir = to - from;
+
+        for (size_t i = 0; i < mBodies.size(); ++i) {
+            const ObjectCollisionBody &b = mBodies[i];
+            if (b.removed) continue;
+            if (b.objID == ignoreObjID) continue;
+            // Volume triggers (pressure plates, trip wires) have collision
+            // bodies but nothing to see — they must not cast a shadow.
+            if (b.isEdgeTrigger) continue;
+
+            if (segmentVsAABB(from, dir, b.aabbMin - Vector3(pad),
+                              b.aabbMax + Vector3(pad)))
+                out.push_back(static_cast<uint32_t>(i));
+        }
+    }
+
+    /// Exact test of one segment against one body from `gatherSegmentOccluders`.
+    bool segmentHitsBody(const Vector3 &from, const Vector3 &to,
+                         uint32_t bodyIdx) const {
+        if (bodyIdx >= mBodies.size()) return false;
+        const ObjectCollisionBody &b = mBodies[bodyIdx];
+
+        if (b.shapeType == CollisionShapeType::Sphere) {
+            // Ray vs sphere, restricted to the segment.
+            const Vector3 d = to - from;
+            const Vector3 m = from - b.worldPos;
+            const float a = glm::dot(d, d);
+            if (a < 1e-12f) return false;
+            const float bq = glm::dot(m, d);
+            const float c = glm::dot(m, m) - b.sphereRadius * b.sphereRadius;
+            // Segment starts inside the sphere.
+            if (c <= 0.0f) return true;
+            if (bq > 0.0f) return false; // pointing away
+            const float disc = bq * bq - a * c;
+            if (disc < 0.0f) return false;
+            const float t = (-bq - std::sqrt(disc)) / a;
+            return (t >= 0.0f && t <= 1.0f);
+        }
+
+        return rayVsOBB(from, to, b).hit;
     }
 
     /// Set the skipPlayerCollision flag on a body. Used by GrabSystem (via

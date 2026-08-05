@@ -85,6 +85,31 @@ constexpr float kSkyGlowMin      = 0.0f, kSkyGlowMax      = 32.0f;
 constexpr float kSkyOverbrightMin = 1.0f, kSkyOverbrightMax = 4.0f;
 } // namespace PostRange
 
+/// Light-corona tunable bounds — same single-source-of-truth contract as
+/// PostRange and WaterRange: YAML clamps against these and the debug console
+/// registers against these, so the two cannot drift.
+namespace CoronaRange {
+// Intensity multiplies the corona's authored alpha. Above ~1 it pushes the
+// glow past unity in the HDR target, which is what makes it bloom — so the
+// ceiling is generous, the same reasoning as kSkyGlowMax.
+constexpr float kIntensityMin  = 0.0f, kIntensityMax  = 8.0f;
+constexpr float kSizeMin       = 0.0f, kSizeMax       = 4.0f;
+constexpr float kMaxDistMin    = 0.1f, kMaxDistMax    = 4.0f;
+// Occlusion crossfade. 0 means "snap", which is the original engine's own
+// behaviour and worth being able to reproduce; the ceiling is well past
+// anything that reads as responsive.
+constexpr float kFadeMin       = 0.0f, kFadeMax       = 2.0f;
+// Rays per visibility test. 1 = centre only (binary, pops on edges); the
+// ceiling matches the clamp in updateCoronas().
+constexpr int   kSamplesMin    = 1,    kSamplesMax    = 9;
+// Coronas re-traced per frame. 0 = no budget, trace every one every frame.
+constexpr int   kBudgetMin     = 0,    kBudgetMax     = 512;
+// Depth-fade distance, world units. 0 would be a hard silhouette edge; the
+// ceiling is well past where the glow stops reading as attached to its lamp.
+constexpr float kDepthFadeMin  = 0.0f, kDepthFadeMax  = 32.0f;
+constexpr float kDepthOffsetMin = 0.0f, kDepthOffsetMax = 8.0f;
+} // namespace CoronaRange
+
 /// Clamp a YAML-supplied value, announcing when the config file asked for
 /// something we would not honour. Silently rewriting a user's stated intent is
 /// the same class of bug as a silent fallback: the value in the file and the
@@ -123,11 +148,23 @@ struct RenderConfig {
 
     bool linearMips        = false; // gamma-correct mipmap generation
     bool sharpMips         = false; // unsharp mask on mip levels
-    // Multisample anti-aliasing: 0 (off), 2, 4, 8 or 16 samples.
-    // Startup-only — changing it needs new render targets and a bgfx reset,
-    // so it is not exposed in the debug console. Mirrors NewDark's
-    // `multisampletype <2-16>`.
-    int  msaa              = 4;
+
+    // -- graphics.render_scale -- internal render resolution
+    //
+    // The scene renders at `renderHeight` and the composite resolves it to the
+    // window. Below native this is the low-resolution "vintage" look (Return
+    // of the Obra Dinn, No One Lives Under the Lighthouse); the point filter
+    // is what makes it read as chunky pixels rather than a blurry upscale.
+    //
+    // Deliberately NOT offered as a supersampling knob above native. It
+    // multiplies every per-pixel cost, and PLAN.DYNAMIC_LIGHTS.md's deferred
+    // G-buffer plus PLAN.VISUALS.md's SSAO and volumetrics are all
+    // resolution-proportional — see PLAN.VISUALS.md "Anti-aliasing".
+    //
+    // Startup-only: the scene target and every view rect size off it.
+    int  renderHeight      = 0;      // 0 = native (match the window)
+    bool renderPointFilter = true;   // point upscale — the vintage look
+    bool renderIntegerScale = true;  // snap to a whole-number upscale ratio
 
     // -- graphics.post_process -- (ranges: see PostRange above)
     //
@@ -171,6 +208,30 @@ struct RenderConfig {
     float skyGlowIntensity = 1.0f;  // multiplies the mission's glow_scale
     float skyOverbright    = 1.0f;  // sky brightness multiplier; >1 lets the
                                     // moon reach the overbright bloom range
+
+    // -- graphics.coronas -- light-corona billboards (ranges: CoronaRange)
+    //
+    // `enabled` covers BOTH sources; `synthesized` covers only the
+    // enhancement. That split matters: P$Corona is an original Thief 2
+    // property and drawing it is replication, whereas putting a glow on every
+    // visible lamp is something the original engine never did. Turning
+    // `synthesized` off leaves exactly the coronas the mission authored —
+    // which across retail Thief 2 is one, in MISS5.
+    //
+    // `synthesized` is read once at load (the corona list is built there), so
+    // unlike the rest of this block it is not live-editable.
+    bool  coronas             = true;
+    bool  coronasSynthesized  = true;
+    float coronaIntensity     = 1.0f;
+    float coronaSizeScale     = 1.0f;
+    float coronaMaxDistScale  = 1.0f;
+    float coronaFadeSeconds   = 0.15f;
+    int   coronaTraceSamples  = 5;
+    int   coronaTraceBudget   = 32;
+    bool  coronaTraceObjects  = true;
+    bool  coronaDepthFade     = true;
+    float coronaDepthFadeRange = 1.5f;
+    float coronaDepthFadeOffset = 0.5f;
 
     // -- paths -- (CLI flags --res / --schemas override these)
     std::string resPath;     // Thief 2 RES directory containing fam.crf / obj.crf / snd.crf
@@ -724,18 +785,21 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             if (gfx["linear_mips"])  cfg.linearMips = gfx["linear_mips"].as<bool>();
             if (gfx["sharp_mips"])   cfg.sharpMips  = gfx["sharp_mips"].as<bool>();
 
+            // graphics.msaa was removed 2026-08-05, not deprecated: it is
+            // incompatible with the deferred G-buffer in
+            // PLAN.DYNAMIC_LIGHTS.md and it costs the readable depth buffer
+            // that the corona fade, SSAO and volumetrics all need (bgfx will
+            // not resolve a multisampled depth attachment on any backend).
+            // Announce a stale key rather than ignoring it, so a config that
+            // still sets it does not look like it is being honoured.
             if (gfx["msaa"]) {
-                const int v = gfx["msaa"].as<int>();
-                if (v == 0 || v == 2 || v == 4 || v == 8 || v == 16) {
-                    cfg.msaa = v;
-                } else {
-                    // Not a clamp: MSAA sample counts are a fixed set, so a
-                    // nearby value is not "close enough" — it is invalid.
-                    std::fprintf(stderr,
-                        "[FALLBACK] config: graphics.msaa = %d is not one of "
-                        "0|2|4|8|16 — disabling MSAA.\n", v);
-                    cfg.msaa = 0;
-                }
+                std::fprintf(stderr,
+                    "[FALLBACK] config: graphics.msaa is no longer supported "
+                    "and is being ignored — MSAA was removed because it "
+                    "cannot coexist with a readable depth buffer or a "
+                    "deferred G-buffer. Use graphics.render_scale for the "
+                    "vintage look; SMAA/TAA are the planned antialiasing "
+                    "(see PLAN.VISUALS.md). Delete the key to silence this.\n");
             }
 
             // sky_glow — SKYOBJVAR sun/moon glow disc
@@ -752,6 +816,98 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                         sg["sky_overbright"].as<float>(),
                         PostRange::kSkyOverbrightMin, PostRange::kSkyOverbrightMax,
                         "graphics.sky_glow.sky_overbright");
+                }
+            }
+
+            // render_scale — internal resolution + how it reaches the window
+            if (YAML::Node rs = gfx["render_scale"]) {
+                if (rs["height"]) {
+                    const int v = rs["height"].as<int>();
+                    if (v == 0 || (v >= 60 && v <= 4320)) {
+                        cfg.renderHeight = v;
+                    } else {
+                        std::fprintf(stderr,
+                            "[FALLBACK] config: graphics.render_scale.height = "
+                            "%d is not 0 (native) or within 60-4320 — using "
+                            "native resolution.\n", v);
+                        cfg.renderHeight = 0;
+                    }
+                }
+                if (rs["filter"]) {
+                    const std::string v = rs["filter"].as<std::string>();
+                    if      (v == "point")  cfg.renderPointFilter = true;
+                    else if (v == "linear") cfg.renderPointFilter = false;
+                    else {
+                        std::fprintf(stderr,
+                            "[FALLBACK] config: graphics.render_scale.filter = "
+                            "'%s' is not point|linear — using point.\n",
+                            v.c_str());
+                        cfg.renderPointFilter = true;
+                    }
+                }
+                if (rs["integer"])
+                    cfg.renderIntegerScale = rs["integer"].as<bool>();
+            }
+
+            // coronas — light-corona billboards (authored P$Corona +
+            // synthesized glows on visible light-emitting objects)
+            if (YAML::Node co = gfx["coronas"]) {
+                if (co["enabled"]) cfg.coronas = co["enabled"].as<bool>();
+                if (co["synthesized"])
+                    cfg.coronasSynthesized = co["synthesized"].as<bool>();
+                if (co["intensity"]) {
+                    cfg.coronaIntensity = clampConfigValue(
+                        co["intensity"].as<float>(),
+                        CoronaRange::kIntensityMin, CoronaRange::kIntensityMax,
+                        "graphics.coronas.intensity");
+                }
+                if (co["size_scale"]) {
+                    cfg.coronaSizeScale = clampConfigValue(
+                        co["size_scale"].as<float>(),
+                        CoronaRange::kSizeMin, CoronaRange::kSizeMax,
+                        "graphics.coronas.size_scale");
+                }
+                if (co["max_distance_scale"]) {
+                    cfg.coronaMaxDistScale = clampConfigValue(
+                        co["max_distance_scale"].as<float>(),
+                        CoronaRange::kMaxDistMin, CoronaRange::kMaxDistMax,
+                        "graphics.coronas.max_distance_scale");
+                }
+                if (co["fade_seconds"]) {
+                    cfg.coronaFadeSeconds = clampConfigValue(
+                        co["fade_seconds"].as<float>(),
+                        CoronaRange::kFadeMin, CoronaRange::kFadeMax,
+                        "graphics.coronas.fade_seconds");
+                }
+                if (co["trace_samples"]) {
+                    cfg.coronaTraceSamples = static_cast<int>(clampConfigValue(
+                        static_cast<float>(co["trace_samples"].as<int>()),
+                        static_cast<float>(CoronaRange::kSamplesMin),
+                        static_cast<float>(CoronaRange::kSamplesMax),
+                        "graphics.coronas.trace_samples"));
+                }
+                if (co["depth_fade"])
+                    cfg.coronaDepthFade = co["depth_fade"].as<bool>();
+                if (co["depth_fade_range"]) {
+                    cfg.coronaDepthFadeRange = clampConfigValue(
+                        co["depth_fade_range"].as<float>(),
+                        CoronaRange::kDepthFadeMin, CoronaRange::kDepthFadeMax,
+                        "graphics.coronas.depth_fade_range");
+                }
+                if (co["depth_fade_offset"]) {
+                    cfg.coronaDepthFadeOffset = clampConfigValue(
+                        co["depth_fade_offset"].as<float>(),
+                        CoronaRange::kDepthOffsetMin, CoronaRange::kDepthOffsetMax,
+                        "graphics.coronas.depth_fade_offset");
+                }
+                if (co["trace_objects"])
+                    cfg.coronaTraceObjects = co["trace_objects"].as<bool>();
+                if (co["trace_budget"]) {
+                    cfg.coronaTraceBudget = static_cast<int>(clampConfigValue(
+                        static_cast<float>(co["trace_budget"].as<int>()),
+                        static_cast<float>(CoronaRange::kBudgetMin),
+                        static_cast<float>(CoronaRange::kBudgetMax),
+                        "graphics.coronas.trace_budget"));
                 }
             }
 

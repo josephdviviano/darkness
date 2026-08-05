@@ -635,7 +635,7 @@ static void renderSky(
 {
     float skyView[16];
     state.cam.getSkyViewMatrix(skyView);
-    bgfx::setViewTransform(0, skyView, fc.proj);
+    bgfx::setViewTransform(Darkness::kViewSky, skyView, fc.proj);
 
     float skyModel[16];
     bx::mtxIdentity(skyModel);
@@ -684,7 +684,7 @@ static void renderSky(
             bgfx::setIndexBuffer(gpu.skyboxIBH, face.firstIndex, face.indexCount);
             bgfx::setState(skyState);
             bgfx::setTexture(0, gpu.s_texColor, texIt->second, fc.skySampler);
-            bgfx::submit(0, gpu.texturedProgram);
+            bgfx::submit(Darkness::kViewSky, gpu.texturedProgram);
         }
     } else if (bgfx::isValid(gpu.skyVBH)) {
         // Procedural dome (new sky system) — vertex-coloured hemisphere
@@ -693,7 +693,7 @@ static void renderSky(
         bgfx::setVertexBuffer(0, gpu.skyVBH);
         bgfx::setIndexBuffer(gpu.skyIBH);
         bgfx::setState(skyState);
-        bgfx::submit(0, gpu.flatProgram);
+        bgfx::submit(Darkness::kViewSky, gpu.flatProgram);
     }
 
     // ── Sun/moon glow (SKYOBJVAR glow_*) ──
@@ -736,7 +736,7 @@ static void renderSky(
         // the glow sits, and a light source has no back face worth hiding.
         bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                      | BGFX_STATE_BLEND_ADD);
-        bgfx::submit(0, gpu.flatProgram);
+        bgfx::submit(Darkness::kViewSky, gpu.flatProgram);
     }
 }
 
@@ -778,7 +778,7 @@ static void renderWorld(
             bgfx::setState(fc.renderState);
 
             if (grp.txtIndex == 0) {
-                bgfx::submit(1, gpu.flatProgram);
+                bgfx::submit(Darkness::kViewWorld, gpu.flatProgram);
             } else {
                 auto it = gpu.textureHandles.find(grp.txtIndex);
                 if (it != gpu.textureHandles.end()) {
@@ -795,9 +795,9 @@ static void renderWorld(
                                         float(gpu.lmAtlasSet.atlases[0].size), 0, 0 };
                         bgfx::setUniform(gpu.u_lmAtlasSize, sz);
                     }
-                    bgfx::submit(1, lmProg);
+                    bgfx::submit(Darkness::kViewWorld, lmProg);
                 } else {
-                    bgfx::submit(1, gpu.flatProgram);
+                    bgfx::submit(Darkness::kViewWorld, gpu.flatProgram);
                 }
             }
         }
@@ -813,14 +813,14 @@ static void renderWorld(
             bgfx::setState(fc.renderState);
 
             if (grp.txtIndex == 0) {
-                bgfx::submit(1, gpu.flatProgram);
+                bgfx::submit(Darkness::kViewWorld, gpu.flatProgram);
             } else {
                 auto it = gpu.textureHandles.find(grp.txtIndex);
                 if (it != gpu.textureHandles.end()) {
                     bgfx::setTexture(0, gpu.s_texColor, it->second, fc.texSampler);
-                    bgfx::submit(1, gpu.texturedProgram);
+                    bgfx::submit(Darkness::kViewWorld, gpu.texturedProgram);
                 } else {
-                    bgfx::submit(1, gpu.flatProgram);
+                    bgfx::submit(Darkness::kViewWorld, gpu.flatProgram);
                 }
             }
         }
@@ -834,7 +834,7 @@ static void renderWorld(
             bgfx::setVertexBuffer(0, gpu.vbh);
             bgfx::setIndexBuffer(gpu.ibh, grp.firstIndex, grp.numIndices);
             bgfx::setState(fc.renderState);
-            bgfx::submit(1, gpu.flatProgram);
+            bgfx::submit(Darkness::kViewWorld, gpu.flatProgram);
         }
     }
 }
@@ -907,14 +907,171 @@ static void renderWater(
 
             if (bgfx::isValid(tex)) {
                 bgfx::setTexture(0, gpu.s_texColor, tex, fc.texSampler);
-                bgfx::submit(1, gpu.waterProgram);
+                bgfx::submit(Darkness::kViewWorld, gpu.waterProgram);
             } else {
-                bgfx::submit(1, gpu.flatProgram);
+                bgfx::submit(Darkness::kViewWorld, gpu.flatProgram);
             }
         } else {
             // Non-textured water: flat blue-green from vertex color
-            bgfx::submit(1, gpu.flatProgram);
+            bgfx::submit(Darkness::kViewWorld, gpu.flatProgram);
         }
+    }
+}
+
+// Render light coronas into View 1, after world/objects/water.
+//
+// Additive, depth test OFF. That combination is deliberate and load-bearing:
+//   - Additive because a corona is glare added to the image, not a surface.
+//     It also makes draw order irrelevant, since addition commutes.
+//   - Depth test OFF because the billboard straddles whatever surface its
+//     lamp is mounted on, so a depth test would slice the disc along the wall
+//     plane rather than hiding it. Occlusion is decided by the ray trace in
+//     updateCoronas() instead — the same model the engine used, and the same
+//     one NewDark kept when it fixed corona occlusion by improving the trace
+//     rather than by depth-testing.
+//   - No depth WRITE either, so a corona never occludes anything itself.
+//
+// Uses transient buffers: the quads change every frame with the camera, so
+// there is nothing to keep between frames.
+static void renderCoronas(
+    const Darkness::FrameContext &fc,
+    const Darkness::GPUResources &gpu,
+    const Darkness::RuntimeState &state)
+{
+    if (!state.coronaSettings.enabled) return;
+    if (!bgfx::isValid(gpu.coronaProgram)) return;
+
+    // Reachability report. "Resolved 102 coronas" says nothing about whether
+    // any of them ever reach a draw call — dead code resolves data perfectly
+    // well, which is exactly how SelfLitProducer stayed unreferenced for
+    // months while the docs called it live. So announce the first frame that
+    // actually submits, and note the standing-still-and-seeing-nothing case
+    // too, since silence looks the same either way.
+    //
+    // Deliberately NOT tagged [FALLBACK]: standing where no light is in line
+    // of sight is a normal thing to do in a Thief level — measured on retail
+    // MISS5, whose start position sees none of its 155 coronas — and the
+    // engine has not deviated from anything by drawing nothing there. The tag
+    // is for "we did not do what was asked", and crying wolf with it is how a
+    // fallback log stops being read.
+    static bool everDrew = false;
+    static int  framesWithoutDraw = 0;
+
+    if (state.coronaBatches.empty()) {
+        if (!everDrew && !state.coronas.defs.empty()) {
+            if (++framesWithoutDraw == 600) {
+                std::fprintf(stderr,
+                    "Coronas: %zu resolved, none drawn yet after 600 frames — "
+                    "all culled, occluded or faded out from here. Expected if "
+                    "no light is in view; if it persists as you move, check "
+                    "corona_trace_objects and corona_max_distance.\n",
+                    state.coronas.defs.size());
+            }
+        }
+        return;
+    }
+
+    float identity[16];
+    bx::mtxIdentity(identity);
+
+    const uint64_t coronaState = BGFX_STATE_WRITE_RGB | BGFX_STATE_BLEND_ADD;
+    int submitted = 0;
+
+    // ── Depth fade ──
+    //
+    // Needs three things at once: the setting on, post-processing routing the
+    // scene through the offscreen target, and a backend that gave us a
+    // sampleable depth format. Any of them missing and the shader's `enabled`
+    // term goes to 0, leaving the ray trace as the only occluder — which is
+    // what coronas had before this existed, not a broken state.
+    const bool depthFadeActive =
+        state.coronaSettings.depthFade &&
+        state.postProcess.enabled &&
+        gpu.postProcess.valid() &&
+        gpu.postProcess.depthSampleable &&
+        bgfx::isValid(gpu.postProcess.sceneDepth);
+
+    // Near/far must match the projection prepareFrame() builds, or the
+    // linearization in the shader reconstructs the wrong distances.
+    const float depthParams[4] = {
+        state.coronaSettings.depthFadeRange,
+        Darkness::kCameraNearPlane,
+        Darkness::kCameraFarPlane,
+        depthFadeActive ? 1.0f : 0.0f,
+    };
+
+    // Say once which occluder is actually running. "Coronas bleed through
+    // walls" and "the depth fade silently never turned on" look identical
+    // from outside.
+    static bool reportedFade = false;
+    if (!reportedFade) {
+        reportedFade = true;
+        std::fprintf(stderr,
+            "Coronas: depth fade %s (setting=%s, post-process=%s, "
+            "sampleable depth=%s)\n",
+            depthFadeActive ? "ACTIVE" : "off",
+            state.coronaSettings.depthFade ? "on" : "off",
+            state.postProcess.enabled ? "on" : "off",
+            gpu.postProcess.depthSampleable ? "yes" : "no");
+    }
+
+    for (const auto &batch : state.coronaBatches) {
+        if (batch.indices.empty()) continue;
+
+        auto texIt = gpu.coronaTexHandles.find(batch.texture);
+        if (texIt == gpu.coronaTexHandles.end()) continue; // reported at load
+
+        const uint32_t numVerts = static_cast<uint32_t>(batch.vertices.size());
+        const uint32_t numIdx   = static_cast<uint32_t>(batch.indices.size());
+        if (bgfx::getAvailTransientVertexBuffer(
+                numVerts, Darkness::CoronaVertex::layout) < numVerts ||
+            bgfx::getAvailTransientIndexBuffer(numIdx) < numIdx) {
+            // The transient pool is a per-frame budget shared with every
+            // other pass. Say so rather than dropping the glow in silence.
+            std::fprintf(stderr,
+                "[FALLBACK] coronas: transient buffer exhausted (%u verts, "
+                "%u indices) — %zu corona(s) dropped this frame.\n",
+                numVerts, numIdx, batch.indices.size() / 6);
+            continue;
+        }
+
+        bgfx::TransientVertexBuffer tvb;
+        bgfx::TransientIndexBuffer  tib;
+        bgfx::allocTransientVertexBuffer(&tvb, numVerts,
+                                         Darkness::CoronaVertex::layout);
+        bgfx::allocTransientIndexBuffer(&tib, numIdx);
+        std::memcpy(tvb.data, batch.vertices.data(),
+                    numVerts * sizeof(Darkness::CoronaBatch::Vertex));
+        std::memcpy(tib.data, batch.indices.data(),
+                    numIdx * sizeof(uint16_t));
+
+        // Fog is applied inside fs_corona as an attenuation rather than the
+        // mix() the opaque passes use — see the shader for why an additive
+        // draw cannot use mix().
+        bgfx::setUniform(gpu.u_fogColor, fc.fogColorArr);
+        bgfx::setUniform(gpu.u_fogParams, fc.fogOnArr);
+        bgfx::setUniform(gpu.u_coronaDepth, depthParams);
+        if (depthFadeActive)
+            bgfx::setTexture(1, gpu.s_texDepth, gpu.postProcess.sceneDepth);
+
+        bgfx::setTransform(identity);
+        bgfx::setVertexBuffer(0, &tvb);
+        bgfx::setIndexBuffer(&tib);
+        bgfx::setState(coronaState);
+        // Bilinear regardless of the world texture filter: a corona is a
+        // smooth radial ramp magnified across many pixels, and point
+        // sampling would show its 64x64 grid as visible blocks.
+        bgfx::setTexture(0, gpu.s_texColor, texIt->second,
+                         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+        bgfx::submit(Darkness::kViewCorona, gpu.coronaProgram);
+        submitted += static_cast<int>(numIdx / 6);
+    }
+
+    if (submitted > 0 && !everDrew) {
+        everDrew = true;
+        std::fprintf(stderr,
+            "Coronas: first draw — %d corona(s) in %zu batch(es)\n",
+            submitted, state.coronaBatches.size());
     }
 }
 
@@ -1304,7 +1461,7 @@ static void renderDebugOverlay(
     }
 
     // Set up view 2 with same transform as view 1
-    bgfx::setViewTransform(2, fc.view, fc.proj);
+    bgfx::setViewTransform(Darkness::kViewDebug, fc.view, fc.proj);
 
     // Enable bgfx debug-text mode once for the whole function, so any
     // sub-overlay (raycast HUD, room ID labels, future debug text) can
@@ -1407,7 +1564,7 @@ static void renderDebugOverlay(
         bgfx::setUniform(gpu.u_fogParams, fc.fogOnArr);
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
         bgfx::setUniform(gpu.u_objectLight, whiteLight);
-        bgfx::submit(2, gpu.flatProgram);
+        bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
     }
     // (Debug-text mode and dbgTextClear were already set up at the top
     // of renderDebugOverlay so every show_* overlay can dbgTextPrintf,
@@ -1471,7 +1628,7 @@ static void renderDebugOverlay(
         float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
         bgfx::setUniform(gpu.u_objectLight, whiteLight);
-        bgfx::submit(2, gpu.flatProgram);
+        bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
     }
 
     // ── Acoustic-material solid overlay ──
@@ -1496,7 +1653,7 @@ static void renderDebugOverlay(
         float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
         bgfx::setUniform(gpu.u_objectLight, whiteLight);
-        bgfx::submit(2, gpu.flatProgram);
+        bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
     }
 
     // ── Acoustic-material on-screen legend + crosshair readout ──
@@ -1634,7 +1791,7 @@ static void renderDebugOverlay(
                     float doorTint[4] = {1.0f, 0.55f, 0.0f, 0.0f};
                     bgfx::setUniform(gpu.u_objectParams, opaqueParams);
                     bgfx::setUniform(gpu.u_objectLight, doorTint);
-                    bgfx::submit(2, gpu.flatProgram);
+                    bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
                 }
             }
         }
@@ -1795,7 +1952,7 @@ static void renderDebugOverlay(
                 float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
                 bgfx::setUniform(gpu.u_objectParams, opaqueParams);
                 bgfx::setUniform(gpu.u_objectLight, whiteLight);
-                bgfx::submit(2, gpu.flatProgram);
+                bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
             }
         }
     }
@@ -1839,7 +1996,7 @@ static void renderDebugOverlay(
         float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
         bgfx::setUniform(gpu.u_objectParams, opaqueParams);
         bgfx::setUniform(gpu.u_objectLight, whiteLight);
-        bgfx::submit(2, gpu.flatProgram);
+        bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
     };
 
     if ((state.showRooms || state.showPortals) && !state.roomDebug.empty()) {
@@ -2049,7 +2206,7 @@ static void renderDebugOverlay(
                     float whiteLight[4]   = {1.0f, 1.0f, 1.0f, 0.0f};
                     bgfx::setUniform(gpu.u_objectParams, opaqueParams);
                     bgfx::setUniform(gpu.u_objectLight, whiteLight);
-                    bgfx::submit(2, gpu.flatProgram);
+                    bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
                 }
             }
         }
@@ -2219,7 +2376,7 @@ static void renderDebugOverlay(
                     }
                 }
                 bgfx::setUniform(gpu.u_objectLight, tint);
-                bgfx::submit(2, gpu.flatProgram);
+                bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
             }
 
             // Pathing-batch probe overlay. Uses the same layer-2
@@ -2263,7 +2420,7 @@ static void renderDebugOverlay(
                     bgfx::setUniform(gpu.u_fogParams, noFog);
                     bgfx::setUniform(gpu.u_objectParams, opaque);
                     bgfx::setUniform(gpu.u_objectLight, pathTint);
-                    bgfx::submit(2, gpu.flatProgram);
+                    bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
                 }
             }
         }
@@ -2293,7 +2450,7 @@ static void renderDebugOverlay(
             bgfx::setUniform(gpu.u_fogParams, noFog);
             bgfx::setUniform(gpu.u_objectParams, opaque);
             bgfx::setUniform(gpu.u_objectLight,  yellow);
-            bgfx::submit(2, gpu.flatProgram);
+            bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
             markerVisibleThisFrame = true;
         }
 
@@ -2507,7 +2664,7 @@ static void renderDebugOverlay(
                     bgfx::setUniform(gpu.u_fogParams,   noFog);
                     bgfx::setUniform(gpu.u_objectParams, opaque);
                     bgfx::setUniform(gpu.u_objectLight,  whiteLight);
-                    bgfx::submit(2, gpu.flatProgram);
+                    bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
                 }
 
                 // HUD lines: probe counts + layer-2 occlusion
@@ -2673,7 +2830,7 @@ static void renderDebugOverlay(
                     bgfx::setUniform(gpu.u_fogParams,   noFog);
                     bgfx::setUniform(gpu.u_objectParams, opaqueParams);
                     bgfx::setUniform(gpu.u_objectLight,  whiteLight);
-                    bgfx::submit(2, gpu.flatProgram);
+                    bgfx::submit(Darkness::kViewDebug, gpu.flatProgram);
                 }
             }
 
@@ -3028,12 +3185,12 @@ static void renderObjects(
                     auto texIt = gpu.objTextureHandles.find(sm.matName);
                     if (texIt != gpu.objTextureHandles.end()) {
                         bgfx::setTexture(0, gpu.s_texColor, texIt->second, fc.texSampler);
-                        bgfx::submit(1, texturedProg);
+                        bgfx::submit(Darkness::kViewWorld, texturedProg);
                     } else {
-                        bgfx::submit(1, flatProg);
+                        bgfx::submit(Darkness::kViewWorld, flatProg);
                     }
                 } else {
-                    bgfx::submit(1, flatProg);
+                    bgfx::submit(Darkness::kViewWorld, flatProg);
                 }
             }
         } else if (state.showFallbackCubes && opaquePass) {
@@ -3051,7 +3208,7 @@ static void renderObjects(
             bgfx::setVertexBuffer(0, gpu.fallbackCubeVBH);
             bgfx::setIndexBuffer(gpu.fallbackCubeIBH);
             bgfx::setState(fc.renderState);
-            bgfx::submit(1, gpu.flatProgram);
+            bgfx::submit(Darkness::kViewWorld, gpu.flatProgram);
         }
     };
 
@@ -3711,6 +3868,96 @@ static void registerConsoleSettings(
         [&state](float v) { state.postProcess.bloomIterations = static_cast<int>(v); },
         "[both] Bloom blur iterations, each H+V (2 = HPL2 default). "
         "Radius comes from here, not from a wider step");
+
+    // ── Light coronas ──
+    //
+    // Bounds come from CoronaRange in RenderConfig.h — the same constants the
+    // YAML clamp uses, so the console cannot offer a value the config file
+    // could not persist. Naming mirrors graphics.coronas.* in YAML.
+    //
+    // `synthesized` is deliberately absent: the corona list is built once at
+    // load, so a live toggle would claim to do something it cannot.
+
+    dbgConsole.setGroup("Coronas");
+
+    dbgConsole.addBool("coronas",
+        [&state]() { return state.coronaSettings.enabled; },
+        [&state](bool v) { state.coronaSettings.enabled = v; },
+        "Light-corona billboards — the mission's own P$Corona records plus, "
+        "unless graphics.coronas.synthesized is off, a glow on every visible "
+        "light-emitting object");
+
+    dbgConsole.addFloat("corona_intensity",
+        CoronaRange::kIntensityMin, CoronaRange::kIntensityMax,
+        [&state]() { return state.coronaSettings.intensity; },
+        [&state](float v) { state.coronaSettings.intensity = v; },
+        "Multiplies each corona's authored alpha. Past ~1 the glow exceeds "
+        "1.0 in the HDR target and starts to bloom");
+
+    dbgConsole.addFloat("corona_size",
+        CoronaRange::kSizeMin, CoronaRange::kSizeMax,
+        [&state]() { return state.coronaSettings.sizeScale; },
+        [&state](float v) { state.coronaSettings.sizeScale = v; },
+        "Multiplies both corona radii (near and far)");
+
+    dbgConsole.addFloat("corona_max_distance",
+        CoronaRange::kMaxDistMin, CoronaRange::kMaxDistMax,
+        [&state]() { return state.coronaSettings.maxDistScale; },
+        [&state](float v) { state.coronaSettings.maxDistScale = v; },
+        "Multiplies each corona's own max visible distance");
+
+    dbgConsole.addFloat("corona_fade",
+        CoronaRange::kFadeMin, CoronaRange::kFadeMax,
+        [&state]() { return state.coronaSettings.fadeSeconds; },
+        [&state](float v) { state.coronaSettings.fadeSeconds = v; },
+        "Occlusion crossfade, seconds. 0 snaps, which is what the original "
+        "engine did");
+
+    dbgConsole.addBool("corona_depth_fade",
+        [&state]() { return state.coronaSettings.depthFade; },
+        [&state](bool v) { state.coronaSettings.depthFade = v; },
+        "Per-pixel fade where scene geometry stands in FRONT of a corona — "
+        "what stops the glow painting over a wall nearer than its lamp. "
+        "Needs post-processing on and a sampleable depth buffer");
+
+    dbgConsole.addFloat("corona_depth_fade_range",
+        CoronaRange::kDepthFadeMin, CoronaRange::kDepthFadeMax,
+        [&state]() { return state.coronaSettings.depthFadeRange; },
+        [&state](float v) { state.coronaSettings.depthFadeRange = v; },
+        "How far in front of a corona an occluder must be to hide it fully, "
+        "in world units. Small = crisp silhouette, large = glow bleeds softly "
+        "around the edge");
+
+    dbgConsole.addFloat("corona_depth_fade_offset",
+        CoronaRange::kDepthOffsetMin, CoronaRange::kDepthOffsetMax,
+        [&state]() { return state.coronaSettings.depthFadeOffset; },
+        [&state](float v) { state.coronaSettings.depthFadeOffset = v; },
+        "Pull the billboard this far toward the viewer before drawing, so it "
+        "clears its own lamp's geometry instead of fading against it");
+
+    dbgConsole.addBool("corona_trace_objects",
+        [&state]() { return state.coronaSettings.traceObjects; },
+        [&state](bool v) { state.coronaSettings.traceObjects = v; },
+        "Occlude coronas by objects (doors, crates, characters) as well as "
+        "terrain. Off reproduces the original engine, whose terrain-only "
+        "trace let coronas shine through closed doors — the artifact "
+        "NewDark's enhanced_corona_trace was added to fix");
+
+    dbgConsole.addFloat("corona_trace_samples",
+        static_cast<float>(CoronaRange::kSamplesMin),
+        static_cast<float>(CoronaRange::kSamplesMax),
+        [&state]() { return static_cast<float>(state.coronaSettings.traceSamples); },
+        [&state](float v) { state.coronaSettings.traceSamples = static_cast<int>(v); },
+        "Rays per visibility test. 1 = centre only, so a corona clipping a "
+        "doorframe pops; more spread over the disc so it fades");
+
+    dbgConsole.addFloat("corona_trace_budget",
+        static_cast<float>(CoronaRange::kBudgetMin),
+        static_cast<float>(CoronaRange::kBudgetMax),
+        [&state]() { return static_cast<float>(state.coronaSettings.traceBudget); },
+        [&state](float v) { state.coronaSettings.traceBudget = static_cast<int>(v); },
+        "Coronas re-traced per frame; the rest hold their previous answer. "
+        "0 = trace every corona every frame");
 
     // ── Audio ──
 
@@ -4963,7 +5210,7 @@ static Darkness::FrameContext prepareFrame(
     // Projection matrix (shared by sky and world views)
     bx::mtxProj(fc.proj, 60.0f,
                  float(WINDOW_WIDTH) / float(WINDOW_HEIGHT),
-                 0.1f, 5000.0f,
+                 Darkness::kCameraNearPlane, Darkness::kCameraFarPlane,
                  bgfx::getCaps()->homogeneousDepth,
                  bx::Handedness::Right);
 
@@ -5047,7 +5294,10 @@ static Darkness::FrameContext prepareFrame(
 
     // View 1 transform (world + objects)
     state.cam.getViewMatrix(fc.view);
-    bgfx::setViewTransform(1, fc.view, fc.proj);
+    bgfx::setViewTransform(Darkness::kViewWorld, fc.view, fc.proj);
+    // Coronas share the world's camera exactly — they are world-space
+    // billboards that happen to live in their own view so they can read depth.
+    bgfx::setViewTransform(Darkness::kViewCorona, fc.view, fc.proj);
 
     // Ensure view 1's depth clear always executes, even if portal culling
     // produces zero visible cells (e.g., camera between cells). Without this,
@@ -5257,6 +5507,18 @@ int main(int argc, char *argv[]) {
     state.skyGlowEnabled   = cfg.skyGlow;
     state.skyGlowIntensity = cfg.skyGlowIntensity;
     state.skyOverbright    = cfg.skyOverbright;
+    state.coronaSettings.enabled      = cfg.coronas;
+    state.coronaSettings.synthesized  = cfg.coronasSynthesized;
+    state.coronaSettings.intensity    = cfg.coronaIntensity;
+    state.coronaSettings.sizeScale    = cfg.coronaSizeScale;
+    state.coronaSettings.maxDistScale = cfg.coronaMaxDistScale;
+    state.coronaSettings.fadeSeconds  = cfg.coronaFadeSeconds;
+    state.coronaSettings.traceSamples = cfg.coronaTraceSamples;
+    state.coronaSettings.traceBudget  = cfg.coronaTraceBudget;
+    state.coronaSettings.traceObjects = cfg.coronaTraceObjects;
+    state.coronaSettings.depthFade      = cfg.coronaDepthFade;
+    state.coronaSettings.depthFadeRange = cfg.coronaDepthFadeRange;
+    state.coronaSettings.depthFadeOffset = cfg.coronaDepthFadeOffset;
 
     // ── Mandatory game-resource paths ──
     // The renderer needs both snd.crf (sounds) and the schema directory
@@ -6686,7 +6948,33 @@ int main(int argc, char *argv[]) {
     Darkness::GPUResources gpu;
 
     // state.skyClearColor set by initWindow
-    SDL_Window *window = initWindow(mission.fogParams, cfg.msaa,
+    // ── Internal render resolution ──
+    // Below the window this is the vintage look; the composite upscales.
+    const Darkness::RenderResolution renderRes =
+        Darkness::resolveRenderResolution(
+            WINDOW_WIDTH, WINDOW_HEIGHT, cfg.renderHeight,
+            cfg.renderIntegerScale);
+    if (!renderRes.isNative()) {
+        std::fprintf(stderr,
+            "Render scale: %ux%u internal -> %dx%d window (%s upscale%s)\n",
+            renderRes.width, renderRes.height, WINDOW_WIDTH, WINDOW_HEIGHT,
+            cfg.renderPointFilter ? "point" : "linear",
+            renderRes.divisor > 1 ? ", integer" : "");
+        if (!cfg.postProcess) {
+            // The offscreen target is what the scene renders small INTO, so
+            // with the post chain off there is nothing to scale and the views
+            // fall back to the window's own size (bindSceneTarget re-applies
+            // the rects every frame, so this also tracks the console toggle).
+            std::fprintf(stderr,
+                "[FALLBACK] render_scale needs graphics.post_process.enabled "
+                "— there is no offscreen scene target otherwise. Rendering at "
+                "native %dx%d until post-processing is switched on.\n",
+                WINDOW_WIDTH, WINDOW_HEIGHT);
+        }
+    }
+
+    SDL_Window *window = initWindow(mission.fogParams,
+                                    renderRes.width, renderRes.height,
                                     state.skyClearColor);
     if (!window) return 1;
 
@@ -6697,6 +6985,13 @@ int main(int argc, char *argv[]) {
         shutdownWindow(window);
         return 1;
     }
+
+    // ── Light coronas ──
+    // After createGPUResources because the synthesizer reads
+    // mission.objData.objects — the model-resolved, RenderType-filtered set
+    // that says which lights the player can actually see hanging on
+    // something. Uses the same resPath the object textures came from.
+    initCoronas(mission, resPath, cfg.coronasSynthesized, state, gpu);
 
     // ── Post-process: HDR scene target + composite pass ──
     //
@@ -6726,10 +7021,13 @@ int main(int argc, char *argv[]) {
             true);
 
         if (!Darkness::createPostProcess(gpu.postProcess,
+                                         renderRes.width, renderRes.height,
                                          static_cast<uint16_t>(WINDOW_WIDTH),
                                          static_cast<uint16_t>(WINDOW_HEIGHT),
+                                         cfg.renderPointFilter
+                                             && !renderRes.isNative(),
                                          compositeProgram, blurProgram,
-                                         extractProgram, cfg.msaa)) {
+                                         extractProgram)) {
             Darkness::destroyPostProcess(gpu.postProcess);
             if (state.postProcess.enabled) {
                 std::fprintf(stderr,
@@ -7456,6 +7754,36 @@ int main(int argc, char *argv[]) {
 
             // ── Water surfaces ──
             renderWater(fc, meshes, gpu, state);
+
+            // ── Light coronas ──
+            // Built here rather than in prepareFrame() because the quads are
+            // camera-facing and the trace runs against the camera position,
+            // so this wants the final camera for the frame. Drawn last in
+            // view 1 so the additive glare sits over everything opaque.
+            {
+                auto coronaObjSvc = GET_SERVICE(Darkness::ObjectService);
+                Darkness::Vector3 camRight, camUp, camForward;
+                state.cam.getBasis(camRight, camUp, camForward);
+                Darkness::updateCoronas(
+                    state.coronas, state.coronaSettings, mission.wrData,
+                    coronaObjSvc.get(), state.objectStates,
+                    mission.lightSources,
+                    // Object occlusion. Doors, moving platforms and pressure
+                    // plates all push their animated transforms into this
+                    // world, so a closed door's OBB really is in the doorway.
+                    state.physics ? state.physics->getObjectCollisionWorld()
+                                  : nullptr,
+                    Darkness::Vector3(state.cam.pos[0], state.cam.pos[1],
+                                      state.cam.pos[2]),
+                    camRight, camUp, camForward,
+                    // Same traversal acceleration ObjectIlluminator's shadow
+                    // rays use: every corona ray starts at the eye, so they
+                    // all share one start cell. prepareFrame() has already
+                    // resolved it this frame.
+                    state.lastValidCameraCell, dt,
+                    state.coronaBatches);
+            }
+            renderCoronas(fc, gpu, state);
 
             // ── Debug raycast visualization (view 2) ──
             renderDebugOverlay(fc, gpu, mission, state);

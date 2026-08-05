@@ -33,15 +33,41 @@ graphics:
   # Sharpen mip levels to preserve detail at distance (default: false)
   sharp_mips: false
 
-  # Multisample anti-aliasing: 0 (off) | 2 | 4 | 8 | 16  (default: 4)
-  # Thief geometry is almost entirely hard edges — stair rails, window
-  # mullions, crate corners — so this is the single largest uniform image
-  # quality lift available. Mirrors NewDark's `multisampletype <2-16>`.
+
+  # ── Internal render resolution / vintage mode ──
+  # The scene renders at this size and the composite scales it to the window.
   #
-  # Startup-only: changing it needs new render targets and a bgfx reset, so
-  # it is deliberately absent from the debug console. Drop to 0 or 2 if the
-  # GPU is struggling.
-  msaa: 4
+  # Below native with a point filter this is the low-resolution pixelated
+  # look — Return of the Obra Dinn, No One Lives Under the Lighthouse. The
+  # point filter is the whole effect: the same low resolution upscaled with
+  # `linear` just looks like a blurry frame.
+  #
+  # Deliberately NOT a supersampling knob above native. Supersampling
+  # multiplies every per-pixel cost, and the deferred G-buffer lighting, SSAO
+  # and volumetric scattering on the roadmap are all resolution-proportional
+  # — see .claude/PLAN.VISUALS.md "Anti-aliasing" for the measurements. Use
+  # SMAA/TAA for antialiasing instead.
+  #
+  # Needs post_process.enabled — the offscreen target is what the scene
+  # renders small into. With post-processing off it falls back to native, and
+  # tracks the console toggle live.
+  #
+  # Startup-only: the scene target and every scene view rect size off it.
+  render_scale:
+    # Internal render HEIGHT in pixels; width follows the window's aspect.
+    # 0 = native. Classic vintage values: 240 (PS1 era), 360, 480 (early PC).
+    height: 0
+
+    # point  — chunky uniform pixels; what makes the vintage look read
+    # linear — smooth
+    filter: point
+
+    # Snap the internal size so the upscale is a whole-number ratio. Without
+    # it, point upscaling makes some pixels wider than others and the grid
+    # visibly breaks up. At 1280x720 asking for 240 gives an exact 3x
+    # (426x240); the 2px horizontal remainder is stretched, which is 0.16%
+    # and invisible.
+    integer: true
 
   # Sky glow / sky overbright
   sky_glow:
@@ -59,6 +85,92 @@ graphics:
     # register with bloom. Proportional, so dark sky stays dark.
     # Try 1.3-1.8; beyond ~2 the sky looks lifted.
     sky_overbright: 1.0
+
+  # ── Light coronas ──
+  # The glare billboard drawn at a light source. Two sources feed one
+  # renderer:
+  #
+  #   AUTHORED   — the mission's own P$Corona records. An original Thief 2
+  #                property. Retail authors exactly ONE functional corona in
+  #                the whole campaign (MISS5), though NewDark-era fan
+  #                missions use them far more.
+  #   SYNTHESIZED — a corona on every visible light-emitting object, built
+  #                from that one retail record's shape and scaled by each
+  #                light's own brightness. The original engine drew no such
+  #                glow; this is an enhancement.
+  #
+  # Coronas are drawn additively with depth testing OFF and occlusion decided
+  # by a ray to the light — the engine's construction, and the only one that
+  # looks right, since a depth-tested billboard would be sliced by the wall
+  # its lamp is mounted on.
+  coronas:
+    # Master switch, both sources. (default: true)
+    enabled: true
+
+    # The enhancement, on its own switch. Set false for strictly the coronas
+    # the mission authored. Read once at load — not live-editable. (default: true)
+    synthesized: true
+
+    # Multiplies each corona's authored alpha. Past ~1 the glow crosses into
+    # the overbright range, which is what makes it bloom. (default: 1.0)
+    intensity: 1.0
+
+    # Multiplies both corona radii. (default: 1.0)
+    size_scale: 1.0
+
+    # Multiplies each corona's own max visible distance. (default: 1.0)
+    max_distance_scale: 1.0
+
+    # Occlusion crossfade time constant, seconds. 0 snaps, which is what the
+    # original engine did; the default softens the pop. (default: 0.15)
+    fade_seconds: 0.15
+
+    # Per-pixel depth fade: attenuate a corona where scene geometry stands
+    # in FRONT of it, so the glow stops painting over a wall nearer than its
+    # lamp. This is the "proximity fade" / soft-particle construction —
+    # Godot exposes the same thing as StandardMaterial3D.proximity_fade.
+    #
+    # It answers a different question from the ray trace below: the trace
+    # asks "is the light source visible", the fade asks "is THIS PIXEL of the
+    # disc covered". Both are wanted, and they compose.
+    #
+    # REQUIRES post_process.enabled — it reads the scene depth buffer. That
+    # buffer is readable because this engine has no MSAA: bgfx refuses to
+    # resolve a multisampled depth attachment on any backend, which is one of
+    # the two reasons MSAA was removed (see .claude/PLAN.VISUALS.md).
+    # The renderer says which occluder is actually running at startup
+    # ("Coronas: depth fade ACTIVE / off").
+    # (default: true)
+    depth_fade: true
+
+    # How far in front of a corona an occluder must be to hide it completely,
+    # in world units. Small = crisp silhouette; larger lets the glow bleed
+    # softly around an edge, which is what real glare does. (default: 1.5)
+    depth_fade_range: 1.5
+
+    # Pull the billboard this far toward the viewer before drawing, so it
+    # clears its own lamp's geometry instead of fading against it — the
+    # emitter's model writes depth at almost exactly the corona's distance.
+    # HPL2's cBillboard carries the same knob as mfForwardOffset.
+    # (default: 0.5)
+    depth_fade_offset: 0.5
+
+    # Occlude coronas by objects — doors, crates, characters — as well as
+    # terrain. The original engine traced terrain ONLY, which is why its
+    # coronas shine through closed doors and paint over characters; NewDark
+    # added the same switch as `enhanced_corona_trace`. Set false to
+    # reproduce the original behaviour. (default: true)
+    trace_objects: true
+
+    # Rays per visibility test. 1 = centre only, so a corona clipping a
+    # doorframe pops; more samples spread over the disc so it fades.
+    # (default: 5)
+    trace_samples: 5
+
+    # Coronas re-traced per frame; the rest hold their previous answer. Bounds
+    # raycast cost on light-heavy levels without freezing the fade.
+    # 0 = no budget, trace everything every frame. (default: 32)
+    trace_budget: 32
 
   # ── Post-processing ──
   # Routes the scene through a floating-point (RGBA16F) target before

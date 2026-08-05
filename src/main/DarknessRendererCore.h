@@ -82,6 +82,33 @@ struct PosColorUVVertex {
     }
 };
 
+// Camera clip planes. Shared rather than repeated at the mtxProj call,
+// because the corona depth fade reconstructs view-space distance from the
+// depth buffer using exactly these two numbers — if they drift apart from the
+// projection, the fade compares against distances that were never rendered.
+inline constexpr float kCameraNearPlane = 0.1f;
+inline constexpr float kCameraFarPlane  = 5000.0f;
+
+// Light-corona billboard vertex. The colour is a FLOAT4, not the usual
+// normalized uint8: a corona's tint routinely exceeds 1.0, and that is the
+// entire mechanism by which the glow reaches the overbright range bloom
+// responds to. Packed 8-bit colour caps at 1.0 and would silently flatten it.
+struct CoronaVertex {
+    float x, y, z;
+    float u, v;
+    float r, g, b, a;
+
+    inline static bgfx::VertexLayout layout;
+
+    static void init() {
+        layout.begin()
+            .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
+            .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
+            .add(bgfx::Attrib::Color0, 4, bgfx::AttribType::Float)
+            .end();
+    }
+};
+
 struct PosUV2Vertex {
     float x, y, z;
     float u0, v0; // diffuse texture UV
@@ -1096,6 +1123,39 @@ struct Camera {
         }
 
         bx::mtxLookAt(mtx, eye, target, upV, bx::Handedness::Right);
+    }
+
+    // Screen-aligned basis: the same forward and up-hint getViewMatrix()
+    // builds, orthonormalized into right/up/forward. Callers that construct
+    // camera-facing geometry in world space (corona billboards) need exactly
+    // this, and deriving it here rather than in each caller keeps it from
+    // drifting away from the view matrix it has to agree with.
+    void getBasis(Vector3 &right, Vector3 &up, Vector3 &forward) const {
+        const float cosPitch = std::cos(pitch);
+        forward = Vector3(std::cos(yaw) * cosPitch,
+                          std::sin(yaw) * cosPitch,
+                          std::sin(pitch));
+
+        Vector3 upHint(0.0f, 0.0f, 1.0f);
+        if (std::fabs(roll) > 0.001f) {
+            const float cosR = std::cos(roll);
+            const float sinR = std::sin(roll);
+            upHint = Vector3( sinR * std::sin(yaw),
+                             -sinR * std::cos(yaw),
+                              cosR);
+        }
+
+        Vector3 r = glm::cross(forward, upHint);
+        const float rlen = glm::length(r);
+        if (rlen > 1e-5f) {
+            right = r / rlen;
+        } else {
+            // Looking straight up or down: the up-hint is parallel to
+            // forward and the cross product degenerates. Any perpendicular
+            // will do — the corona sprite is radially symmetric.
+            right = Vector3(std::sin(yaw), -std::cos(yaw), 0.0f);
+        }
+        up = glm::cross(right, forward);
     }
 
     // Sky view matrix: rotation only, no translation.

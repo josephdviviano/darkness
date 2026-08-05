@@ -25,6 +25,7 @@ add_executable(darkness_tests
     test_steam_audio_pathing.cpp
     test_hybrid_route_graph.cpp
     test_subobject_joints.cpp
+    test_coronas.cpp
 )
 
 target_link_libraries(darkness_tests PRIVATE
