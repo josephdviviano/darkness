@@ -59,7 +59,9 @@
 
 namespace Darkness {
 
-// ── Tweq activation actions (matches Dark Engine eTweqDo) ──
+// ── Tweq activation actions ──
+// Names and order are NewDark's public scripting API (eTweqDo in
+// new_dark/doc/squirrel_script/API-reference.txt).
 enum TweqAction : int32_t {
     kTweqDoDefault   = 0,  // Toggle: if on→halt, if off→activate
     kTweqDoActivate  = 1,  // Start (if not already running)
@@ -747,8 +749,11 @@ private:
             // A lock's joint follows the object's lock state: locked sits at
             // `low`, unlocked at `high`. Confirmed both ways — the engine's
             // "set all my lock joint positions appropriately" command writes
-            // exactly that, and in shipped data every object carrying P$Locked
-            // has its stored value equal to `low` (10/10 in MISS6).
+            // exactly that, and shipped data agrees across all 16 databases:
+            // every object stored as LOCKED holds `low` (301 of 301) and every
+            // unlocked one holds `high` (62). An earlier note here generalised
+            // "equal to low" from a single mission, which reads as though the
+            // unlocked case holds low too — it does not.
             // [BIN: FUN_00595C40, Thief2.exe NewDark 1.28]
             //
             // The stored state wins when present: it is the authored pose, and
@@ -1089,7 +1094,7 @@ private:
         }
     }
 
-    // ── Core axis processing (Dark Engine processTweqAxis algorithm) ──
+    // ── Core axis processing: advance one axis and clip it to its limits ──
 
     /// Process a single axis. Returns kTweqStatusQuo if still running,
     /// or a TweqHaltAction value if the axis reached its bounds and completed.
@@ -1542,7 +1547,6 @@ private:
                 // object's Z position to keep the bottom of the bounding box
                 // fixed. Different flame model variants have different bbox
                 // heights, so without this the flame bobs up and down.
-                // Matches Dark Engine get_anchor/finalize_anchor logic.
                 // Anchor compensation: adjust Z so the bbox bottom stays at a
                 // fixed height. Uses baseAnchorZ (first model's bbox bottom)
                 // as a constant reference to avoid per-swap Z bobbing.
@@ -1763,7 +1767,7 @@ private:
     /// mystery.
     uint32_t mDeleteFired = 0;
 
-    /// Random float in [-1, 1] (matches Dark Engine frand_hack)
+    /// Random float in [-1, 1], the jitter source for curve flags.
     float randFloat() {
         return std::uniform_real_distribution<float>(-1.0f, 1.0f)(mRng);
     }
