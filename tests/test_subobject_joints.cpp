@@ -538,6 +538,46 @@ TEST_CASE("TweqSystem: a joints tweq does not trample a lock's joint slot",
     REQUIRE(states.tryGet(940)->joints[0] == Approx(90.0f));
 }
 
+TEST_CASE("TweqSystem: a halted rotate tweq keeps its final pose",
+          "[Tweq][Rotate]") {
+    // The frame a tweq halts, simStep marks the object dirty, handleCompletion
+    // clears active, and applyComposedTransform then runs. If it required
+    // active, it found nothing to contribute and wrote the placement
+    // orientation — so a mechanism driven to its end position snapped back to
+    // its start and stayed there, since nothing marks it dirty again.
+    Darkness::TweqSystem sys;
+    Darkness::ObjectStateMap states;
+
+    Darkness::TweqInstance tw;
+    tw.objID = 960;
+    tw.type = Darkness::kTweqTypeRotate;
+    tw.cfgHalt = Darkness::kTweqHaltStop;     // halts at the limit
+    tw.axes[2] = {90.0f, 0.0f, 90.0f};        // heading 0 -> 90 degrees
+    tw.primaryAxis = 0;
+    tw.active = true;
+    tw.base.rotation = Darkness::Matrix4(1.0f);
+    tw.base.scale = {1.0f, 1.0f, 1.0f};
+    tw.hasObjectState = true;
+    sys.injectForTest(tw, &states);
+
+    // Drive it to the limit; halt lands on one of these ticks.
+    for (int i = 0; i < 4; ++i) sys.simStep(0.0f, 0.1f);
+
+    const Darkness::TweqInstance *inst =
+        sys.getInstanceForTest(960, Darkness::kTweqTypeRotate);
+    REQUIRE_FALSE(inst->active);                     // it did halt
+    REQUIRE(inst->values[2] == Approx(90.0f));       // at its end position
+
+    // And the matrix handed to the renderer says so. A 90 degree heading puts
+    // column 0 at (cos 90, sin 90, 0) = (0, 1, 0); identity would be (1, 0, 0),
+    // which is exactly what the snap-back produced.
+    const Darkness::ObjectState *os = states.tryGet(960);
+    REQUIRE(os != nullptr);
+    REQUIRE(os->hasMatrix);
+    REQUIRE(os->modelMatrix[0] == Approx(0.0f).margin(1e-4));
+    REQUIRE(os->modelMatrix[1] == Approx(1.0f).margin(1e-4));
+}
+
 // ── Update-rate gates ──
 
 namespace {

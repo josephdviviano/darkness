@@ -1572,10 +1572,22 @@ private:
             if (tw.objID != objID) continue;
             if (!base) base = &tw.base;
 
-            if (tw.type == kTweqTypeRotate && tw.active) {
+            // NOT gated on tw.active. `active` says whether the tweq still
+            // ADVANCES, not whether its accumulated pose applies. Requiring it
+            // here made an object snap back to its placement orientation on the
+            // very frame its tweq halted — simStep marks the object dirty, then
+            // handleCompletion clears active, then this runs and finds nothing
+            // to contribute — and stay there, since nothing marks it dirty
+            // again. A mechanism driven to its end position visibly jumped back
+            // to its start.
+            //
+            // An inactive tweq that never ran contributes its seeded value,
+            // which is the placement transform, so the untouched case is
+            // unchanged.
+            if (tw.type == kTweqTypeRotate) {
                 tweqRotDeg = Vector3(tw.values[0], tw.values[1], tw.values[2]);
                 hasRotate = true;
-            } else if (tw.type == kTweqTypeScale && tw.active) {
+            } else if (tw.type == kTweqTypeScale) {
                 tweqScale = Vector3(tw.values[0], tw.values[1], tw.values[2]);
                 hasScale = true;
             }
@@ -1604,7 +1616,9 @@ private:
             Matrix4 worldTrans = glm::translate(Matrix4(1.0f), base->position);
             fullGlm = worldTrans * base->rotation * scaleMat;
         } else {
-            // No active vector tweqs — shouldn't reach here, but handle gracefully
+            // Reached when the object's only tweqs are non-vector types
+            // (joints, lock, models...) that were marked dirty by something
+            // else — the base transform is the right answer for those.
             Matrix4 scaleMat = glm::scale(Matrix4(1.0f), base->scale);
             Matrix4 worldTrans = glm::translate(Matrix4(1.0f), base->position);
             fullGlm = worldTrans * base->rotation * scaleMat;
