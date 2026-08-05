@@ -336,23 +336,31 @@ public:
         const size_t before = mTweqs.size();
 
         initTweqsOfType<PropCfgTweqVector, PropStTweqVector>(
-            propSvc, "CfgTweqRo", "StTweqRot", kTweqTypeRotate, 0, objID);
+            propSvc, "CfgTweqRo", "StTweqRot", kTweqTypeRotate, 0, objID,
+            /*activateWhenStateless=*/true);
         initTweqsOfType<PropCfgTweqVector, PropStTweqVector>(
-            propSvc, "CfgTweqSc", "StTweqSca", kTweqTypeScale, 0, objID);
+            propSvc, "CfgTweqSc", "StTweqSca", kTweqTypeScale, 0, objID,
+            /*activateWhenStateless=*/true);
         initTweqsOfType<PropCfgTweqSimple, PropStTweqSimple>(
-            propSvc, "CfgTweqBl", "StTweqBli", kTweqTypeFlicker, 0, objID);
+            propSvc, "CfgTweqBl", "StTweqBli", kTweqTypeFlicker, 0, objID,
+            /*activateWhenStateless=*/true);
         initTweqsOfType<PropCfgTweqModels, PropStTweqSimple>(
-            propSvc, "CfgTweqMo", "StTweqMod", kTweqTypeModels, 0, objID);
+            propSvc, "CfgTweqMo", "StTweqMod", kTweqTypeModels, 0, objID,
+            /*activateWhenStateless=*/true);
         initTweqsOfType<PropCfgTweqJoints, PropStTweqJoints>(
-            propSvc, "CfgTweqJo", "StTweqJoi", kTweqTypeJoints, 0, objID);
+            propSvc, "CfgTweqJo", "StTweqJoi", kTweqTypeJoints, 0, objID,
+            /*activateWhenStateless=*/true);
         initTweqsOfType<PropCfgTweqSimple, PropStTweqSimple>(
-            propSvc, "CfgTweqDe", "StTweqDel", kTweqTypeDelete, 0, objID);
+            propSvc, "CfgTweqDe", "StTweqDel", kTweqTypeDelete, 0, objID,
+            /*activateWhenStateless=*/true);
         initTweqsOfType<PropCfgTweqLock, PropStTweqLock>(
-            propSvc, "CfgTweqLo", "StTweqLoc", kTweqTypeLock, 0, objID);
+            propSvc, "CfgTweqLo", "StTweqLoc", kTweqTypeLock, 0, objID,
+            /*activateWhenStateless=*/true);
         for (int slot = 0; slot < 5; ++slot) {
             initTweqsOfType<PropCfgTweqEmitter, PropStTweqSimple>(
                 propSvc, kEmitterCfgProps[slot], kEmitterStateProps[slot],
-                kTweqTypeEmitter, slot, objID);
+                kTweqTypeEmitter, slot, objID,
+                /*activateWhenStateless=*/true);
         }
 
         // A spawned object with no tweqs never expires, so it would sit in the
@@ -627,7 +635,8 @@ private:
     void initTweqsOfType(PropertyService *propSvc,
                           const char *cfgPropName, const char *stPropName,
                           eTweqType tweqType, int slot = 0,
-                          int32_t onlyObjID = 0) {
+                          int32_t onlyObjID = 0,
+                          bool activateWhenStateless = false) {
         if (!propSvc || !mPlacements) return;
 
         for (const auto &[objID, placement] : *mPlacements) {
@@ -663,6 +672,21 @@ private:
             StT st;
             if (getTypedProperty<StT>(propSvc, stPropName, objID, st)) {
                 initFromState(tw, st, tweqType);
+            } else if (activateWhenStateless) {
+                // A runtime-created object has no authored state BY
+                // CONSTRUCTION: tweq state properties are registered "never",
+                // so they do not inherit, and nothing in the archetype chain
+                // supplies one. "No stored state" therefore means defaults
+                // here, not "stored as off" — and a spawned effect whose whole
+                // config is a self-destruct countdown has to run it or it never
+                // leaves the world.
+                //
+                // INFERRED, not established: the original's projectile launcher
+                // is not in any material available to us, so what it does to a
+                // freshly created object's tweqs is unverified. Scoped to the
+                // runtime path so placed objects keep their authored,
+                // state-driven behaviour either way.
+                tw.active = true;
             }
 
             // Capture base transform from placement data

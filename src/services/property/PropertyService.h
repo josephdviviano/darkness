@@ -124,6 +124,33 @@ public:
      * @param id The object id that was removed
      * @note Do NOT call this directly unless you know what it does
      */
+    /** Copy an archetype's non-inherited properties onto a freshly created
+     * concrete object.
+     *
+     * Properties registered with the "never" inheritor do NOT flow from an
+     * archetype to its concrete objects, so a runtime-created object starts
+     * without them entirely. That silently broke every spawned effect: tweq
+     * STATE lives in such properties (StTweqDel, StTweqLoc), so a spawned
+     * object had no state record, was never marked active, and its delete
+     * countdown never started — the objects accumulated forever.
+     *
+     * Three non-inherited properties are deliberately NOT copied:
+     *   SymName   identity. Copying it would give every spawn its archetype's
+     *             name, and named() would then resolve to a concrete object
+     *             instead of the archetype — breaking the very lookup that
+     *             spawning uses to find what to create.
+     *   Position  placement. The spawner sets this; the archetype's (if any)
+     *             is not where the new object belongs.
+     *   DonorType metaproperty donor bookkeeping, about the archetype being a
+     *             donor rather than about its instances. Excluded because the
+     *             semantics are not established, not because copying is known
+     *             to be wrong.
+     *
+     * @param dstID the newly created concrete object
+     * @param srcID the archetype it was created from
+     * @return how many properties were copied */
+    int copyNonInheritedState(int dstID, int srcID);
+
     void objectDestroyed(int id);
 
     /** Load the properties from the database
