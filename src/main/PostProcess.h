@@ -193,6 +193,18 @@ static constexpr bgfx::ViewId kViewSmaaEdges   = kViewComposite + 1;
 static constexpr bgfx::ViewId kViewSmaaWeights = kViewComposite + 2;
 static constexpr bgfx::ViewId kViewSmaaBlend   = kViewComposite + 3;
 
+// Film grain, LAST — after antialiasing, immediately before UI.
+//
+// Report §9.1 (NOTES.FILM_GRAIN.md): grain must follow AA and any temporal
+// upscale, because AA smooths it away and temporal upscalers reject it as
+// invalid history. It previously lived inside the composite, i.e. BEFORE
+// SMAA, which meant SMAA antialiased the grain and grain strength depended
+// on whether antialiasing happened to be on.
+//
+// When grain is off this view is never submitted and the chain ends exactly
+// where it did before — composite or SMAA blend straight to the backbuffer.
+static constexpr bgfx::ViewId kViewGrain = kViewComposite + 4;
+
 /// Which engine's bloom construction to run.
 ///
 /// Not two tunings of one effect — two different places to decide what
@@ -445,15 +457,30 @@ struct PostProcessSettings {
     float halationStrength = 0.0f;
     float halationTint[3]  = { 1.0f, 0.32f, 0.12f };   // red-orange
 
-    /// Scene value a pixel must exceed to halate at all.
+    /// Value a pixel must exceed, AFTER EXPOSURE, to halate at all.
     ///
-    /// Defaults to 1.0, which is a meaningful number in this engine rather
-    /// than a taste call: lit world geometry reaches 2.0 because of the
-    /// lightmap overbright convention, so 1.0 is exactly "brighter than
-    /// display white". Flames, lamps and the moon clear it; lit stone does
-    /// not. That is the film behaviour and it falls out of the convention
-    /// for free.
-    float halationThreshold = 1.0f;
+    /// **Measured, and the first value shipped here was wrong.** VIS-13 set
+    /// this to 1.0 reasoning that lit geometry "reaches 2.0" under the
+    /// lightmap overbright convention. That is the CEILING, not the
+    /// distribution: `fs_lightmapped.sc` computes `albedo * light * 2.0`, the
+    /// atlas clamps light to 1.0, and the actual static lightmaps across five
+    /// retail missions have a MEDIAN of 0.03-0.09 and a p99 of 0.47-0.85.
+    /// Only 0.9-3.8% of texels even exceed 0.50 — which is what a pure WHITE
+    /// texture would need to reach 1.0 at all. A threshold of 1.0 therefore
+    /// sat above essentially the whole frame and the effect did nothing.
+    /// `reportLightmapRange()` prints this per mission at load.
+    ///
+    /// 0.6 catches roughly the brightest one percent: surfaces at the top of
+    /// the lighting range, plus coronas and anything emissive. Lower and
+    /// ordinary lit stone starts to bleed, which is the wash this effect was
+    /// rebuilt to stop being.
+    ///
+    /// Compared against the EXPOSED value, not the raw scene, so the number
+    /// keeps meaning the same thing when exposure moves — exposure is part of
+    /// how brightly the negative was exposed, and halation happens at the
+    /// negative. Implemented by dividing the threshold through by exposure
+    /// before it reaches the extract pass.
+    float halationThreshold = 0.6f;
 
     /// Halo radius in OUTPUT PIXELS. Converted to blur iterations at quarter
     /// resolution, where one pass of the 5-tap kernel is about 6.5 px of
@@ -466,10 +493,38 @@ struct PostProcessSettings {
     float halationRadius = 10.0f;
 
     // ── Grain ──
-    // Additive, shadow-weighted. Size is in output pixels per noise cell;
-    // above 1 the grain clumps, which is closer to a pushed film stock.
+    // Additive, with a negative-film response: pronounced in the shadows,
+    // fading through the midtones, gone in the whites.
     float grainStrength = 0.0f;
-    float grainSize     = 1.5f;
+
+    /// Output pixels per noise cell — the grain's physical size. The noise
+    /// is value noise, so this is a real correlation length rather than a
+    /// sampling stride: below ~1 it approaches per-pixel speckle, above ~2
+    /// it clumps like a fast stock.
+    float grainSize = 1.5f;
+
+    /// Exponent on the process-emphasis factor `pow(1 - u, push)`, applied
+    /// PER CHANNEL on top of the physical `sqrt(V(u))` curve.
+    ///
+    /// **0 is a normally-processed stock** — the physical curve alone,
+    /// peaking at u = 0.436. Higher pushes grain toward the shadows, which is
+    /// what pushed film does. 1.0 peaks at u = 0.234.
+    ///
+    /// Defaulted to 1.0 to match PLAN.FILM_GRAIN.md; it shipped at 2.0 once
+    /// by accident, which peaks at 0.16 and fails the report's §11.2
+    /// signature test (peak should be near 0.44 with the physical factor
+    /// alone).
+    float grainShadowBias = 1.0f;
+
+    /// Non-physical multiplier, kept OUTSIDE the physical amplitude.
+    ///
+    /// Report §4.4 caps the physical model at sigma_n <= 0.076 and says a
+    /// stronger look "should be a separate non-physical gain" rather than
+    /// pushing the physical parameters out of validity. `grainStrength` is
+    /// dimensionally mu_r/sigma, so the model's `sigma >= 3 mu_r` condition
+    /// reads `strength <= 1/3` — that is where its range now stops, and
+    /// anything beyond it lives here instead.
+    float grainGain = 1.0f;
 };
 
 /// Derive the shader's curve constants for whichever operator is selected.
@@ -705,6 +760,15 @@ struct PostProcessResources {
     bgfx::TextureHandle     haloTex[2] = { BGFX_INVALID_HANDLE, BGFX_INVALID_HANDLE };
     bgfx::UniformHandle     s_texHalation = BGFX_INVALID_HANDLE;
 
+    // ── Film grain (final pass) ──
+    // grainFB is what the composite (or SMAA) writes into when grain is on,
+    // so the grain pass has something to read while it resolves to the
+    // backbuffer. The noise field itself is procedural — see fs_grain.sc.
+    bgfx::FrameBufferHandle grainFB     = BGFX_INVALID_HANDLE;
+    bgfx::TextureHandle     grainTex    = BGFX_INVALID_HANDLE;  // owned by grainFB
+    bgfx::ProgramHandle     grainProgram = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle     u_grainRes  = BGFX_INVALID_HANDLE;
+
     // SMAA's targets, LUTs and programs. Built only when the config asks for
     // it — three full-resolution targets is real memory to spend on a pass
     // that may never be switched on.
@@ -898,7 +962,8 @@ inline bool createPostProcess(PostProcessResources &out,
                               bgfx::ProgramHandle blurProgram,
                               bgfx::ProgramHandle extractProgram,
                               bgfx::ProgramHandle downsampleProgram,
-                              bgfx::ProgramHandle upsampleProgram) {
+                              bgfx::ProgramHandle upsampleProgram,
+                              bgfx::ProgramHandle grainProgram) {
     out.width  = width;
     out.height = height;
     out.outWidth  = outWidth;
@@ -1061,6 +1126,7 @@ inline bool createPostProcess(PostProcessResources &out,
     out.u_grain       = bgfx::createUniform("u_grain",       bgfx::UniformType::Vec4);
     out.s_texHalation =
         bgfx::createUniform("s_texHalation", bgfx::UniformType::Sampler);
+    out.u_grainRes  = bgfx::createUniform("u_grainRes",  bgfx::UniformType::Vec4);
 
     // ── Bloom targets ──
     // Quarter resolution, matching HPL2's `GetTempFrameBuffer(vSize/4, ...)`.
@@ -1171,6 +1237,36 @@ inline bool createPostProcess(PostProcessResources &out,
             }
         }
 
+        // ── Grain: final-pass target ──
+        // No noise texture: the field is generated per pixel (see
+        // fs_grain.sc). A stored template is periodic, and at any tile size
+        // smaller than the screen that period is visible — measured
+        // autocorrelation 1.0000 at one tile period.
+        if (bgfx::isValid(grainProgram)) {
+            out.grainProgram = grainProgram;
+            const uint64_t grainFlags = BGFX_TEXTURE_RT
+                                      | BGFX_SAMPLER_U_CLAMP
+                                      | BGFX_SAMPLER_V_CLAMP;
+            out.grainFB = bgfx::createFrameBuffer(outWidth, outHeight,
+                                                  bgfx::TextureFormat::RGBA8,
+                                                  grainFlags);
+            if (bgfx::isValid(out.grainFB)) {
+                out.grainTex = bgfx::getTexture(out.grainFB, 0);
+                std::fprintf(stderr,
+                    "Grain: procedural correlated field, 3 independent "
+                    "channels, final pass after antialiasing\n");
+            } else {
+                std::fprintf(stderr,
+                    "[FALLBACK] postprocess: grain target creation failed — "
+                    "film grain unavailable; the rest of the chain still "
+                    "runs.\n");
+            }
+        } else {
+            std::fprintf(stderr,
+                "[FALLBACK] postprocess: grain program failed to build — "
+                "film grain unavailable.\n");
+        }
+
         // Say what actually got built, once. "The pyramid is not widening my
         // bloom" and "the pyramid was never created" look identical from
         // outside, which is the §4 lesson applied ahead of time.
@@ -1205,6 +1301,7 @@ inline bool createPostProcess(PostProcessResources &out,
     }
 
     bgfx::setViewName(kViewComposite, "composite");
+    bgfx::setViewName(kViewGrain, "film-grain");
     bgfx::setViewClear(kViewComposite, BGFX_CLEAR_NONE, 0, 1.0f, 0);
     bgfx::setViewRect(kViewComposite, 0, 0, outWidth, outHeight);
     bgfx::setViewFrameBuffer(kViewComposite, BGFX_INVALID_HANDLE);
@@ -1424,8 +1521,114 @@ inline void destroyPostProcess(PostProcessResources &pp) {
     if (bgfx::isValid(pp.haloFB[0]))        bgfx::destroy(pp.haloFB[0]);
     if (bgfx::isValid(pp.haloFB[1]))        bgfx::destroy(pp.haloFB[1]);
     if (bgfx::isValid(pp.s_texHalation))    bgfx::destroy(pp.s_texHalation);
+    if (bgfx::isValid(pp.grainFB))          bgfx::destroy(pp.grainFB);
+    if (bgfx::isValid(pp.grainProgram))     bgfx::destroy(pp.grainProgram);
+    if (bgfx::isValid(pp.u_grainRes))       bgfx::destroy(pp.u_grainRes);
     destroySmaa(pp.smaa);
     pp = PostProcessResources{};
+}
+
+/// Whether the final grain pass runs this frame.
+///
+/// Grain needs its own target to resolve from, so unlike the other post
+/// stages it cannot simply no-op inside an existing pass — the chain has to
+/// be routed differently. Callers use this to decide where the composite and
+/// SMAA write.
+inline bool grainShouldRun(const PostProcessResources &pp,
+                           const PostProcessSettings &settings, bool ppActive) {
+    if (settings.grainStrength <= 0.0f)
+        return false;
+
+    // Say why, once. Asking for grain with post-processing off otherwise
+    // produces nothing and no explanation — the same silent refusal
+    // smaaShouldRun already warns about.
+    if (!ppActive) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr,
+                "[FALLBACK] postprocess: film grain needs "
+                "graphics.post_process.enabled — grain runs as the final "
+                "resolve of the post chain, and with no post chain there is "
+                "nothing for it to resolve. Grain is off.\n");
+        }
+        return false;
+    }
+
+    return bgfx::isValid(pp.grainProgram) && bgfx::isValid(pp.grainFB);
+}
+
+/// Resolve `src` to the backbuffer, adding film grain.
+///
+/// Always the last pass before UI — see kViewGrain.
+inline void submitGrain(const PostProcessResources &pp,
+                        const PostProcessSettings &settings,
+                        bgfx::TextureHandle src, uint32_t frameIndex) {
+    bgfx::setViewFrameBuffer(kViewGrain, BGFX_INVALID_HANDLE);
+    bgfx::setViewRect(kViewGrain, 0, 0, pp.outWidth, pp.outHeight);
+    bgfx::setViewClear(kViewGrain, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+
+    // Resolution scale. Grain has a fixed physical size on the negative, so
+    // it should occupy a fixed FRACTION of the frame however finely that
+    // frame is drawn (report §9.4); `size` is quoted against 1080p and the
+    // shader multiplies by this.
+    const float resScale = static_cast<float>(pp.outHeight) / 1080.0f;
+
+    // Per-frame seed. It goes into the HASH, never into a coordinate — a
+    // seed added to coordinates translates the field instead of replacing
+    // it, which is what made two earlier attempts read as a pattern sliding
+    // across the screen.
+    //
+    // THE WRAP IS NOT OPTIONAL. frameIndex grows without bound and
+    // `float(frameIndex) * phi` loses mantissa as it does, so fract() starts
+    // quantising: measured, 2000 consecutive frames yielded 2000 distinct
+    // seeds after a minute of play, 64 after an hour and 16 after four —
+    // i.e. the grain decays into a static pattern over a session. An earlier
+    // version wrapped for exactly this reason and the wrap was dropped in a
+    // rewrite. 8191 frames is ~2.3 minutes at 60 Hz, longer than anyone can
+    // hold a noise pattern in mind, and the golden-ratio low-discrepancy
+    // property survives any window.
+    const float wrapped = static_cast<float>(frameIndex & 8191u);
+    const float goldenSeq = wrapped * 0.6180339887f;
+
+    // Scaled to the hash's alias period so distinct frames can never collide.
+    // The seed enters grainHash as p3.z, which is multiplied by **0.0973** —
+    // NOT the 0.1031 of the x lane. The real period is 1/0.0973 = 10.2775;
+    // measured, a seed delta of 10.2775 reproduces the field at |r| = 0.983
+    // while 9.6993 gives 0.017. Spanning exactly one period means two seeds
+    // in [0, P) can never differ by P, so the alias is unreachable rather
+    // than merely avoided. Do NOT "correct" this to 1/0.1031 — that lands
+    // 5.6% short and is safe only by luck.
+    const float seed = (goldenSeq - std::floor(goldenSeq)) * 10.2775f;
+
+    // Prove the index advances PER FRAME, once, for the first three frames.
+    // An earlier wiring passed wall-clock seconds into this parameter and it
+    // converted silently to an integer, so the seed changed once a SECOND.
+    {
+        static int reports = 0;
+        if (reports < 3) {
+            ++reports;
+            std::fprintf(stderr, "Grain frame %u -> seed %.4f\n",
+                         frameIndex, static_cast<double>(seed));
+        }
+    }
+
+    const float res[4] = { resScale, settings.grainGain, 0.0f, 0.0f };
+
+    const float grain[4] = {
+        settings.grainStrength,
+        settings.grainSize,
+        settings.grainShadowBias,
+        seed,
+    };
+
+    bgfx::setUniform(pp.u_grain, grain);
+    bgfx::setUniform(pp.u_grainRes, res);
+    bgfx::setTexture(0, pp.s_texScene, src,
+                     BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+    bgfx::setVertexBuffer(0, pp.triangleVBH);
+    bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
+    bgfx::submit(kViewGrain, pp.grainProgram);
 }
 
 /// Whether SMAA can run this frame, saying once why not when it cannot.
@@ -1481,7 +1684,7 @@ inline bool smaaShouldRun(const PostProcessResources &pp,
 /// Call only when smaaShouldRun() returned true, and only after
 /// submitComposite() has been told to render into the SMAA colour target.
 inline void submitSmaa(const PostProcessResources &pp,
-                       const AntiAliasSettings &aa) {
+                       const AntiAliasSettings &aa, bool toGrain) {
     const SmaaResources &smaa = pp.smaa;
 
     const float metrics[4] = {
@@ -1526,8 +1729,14 @@ inline void submitSmaa(const PostProcessResources &pp,
     bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A);
     bgfx::submit(kViewSmaaWeights, smaa.weightProgram);
 
-    // ── Pass 3: neighborhood blending, straight to the backbuffer ──
-    bgfx::setViewFrameBuffer(kViewSmaaBlend, BGFX_INVALID_HANDLE);
+    // ── Pass 3: neighborhood blending — to the grain target if grain still
+    // has to run, otherwise straight to the backbuffer ──
+    // Assign-then-overwrite, NOT a ternary: BGFX_INVALID_HANDLE is a braced
+    // initialiser and cannot be a ternary operand (HANDOFF.VISUAL_PIPELINE.md
+    // §7 says so, and this walked into it anyway).
+    bgfx::FrameBufferHandle blendTarget = BGFX_INVALID_HANDLE;
+    if (toGrain) blendTarget = pp.grainFB;
+    bgfx::setViewFrameBuffer(kViewSmaaBlend, blendTarget);
     bgfx::setViewRect(kViewSmaaBlend, 0, 0, smaa.width, smaa.height);
     bgfx::setViewClear(kViewSmaaBlend, BGFX_CLEAR_NONE, 0, 1.0f, 0);
     bgfx::setUniform(smaa.u_smaaMetrics, metrics);
@@ -1824,8 +2033,13 @@ inline bool renderHalation(const PostProcessResources &pp,
     bgfx::setViewRect(kViewHalationExtract, 0, 0, pp.bloomWidth, pp.bloomHeight);
     bgfx::setViewClear(kViewHalationExtract, BGFX_CLEAR_NONE, 0, 1.0f, 0);
 
+    // Threshold the EXPOSED value: sceneColor*exposure > threshold is the
+    // same test as sceneColor > threshold/exposure, and the extract pass
+    // reads the scene target before the composite applies exposure. Doing it
+    // here costs nothing and keeps the knob meaning one thing.
+    const float exposure = settings.exposure > 1e-3f ? settings.exposure : 1e-3f;
     const float extract[4] = {
-        settings.halationThreshold,
+        settings.halationThreshold / exposure,
         1.0f,
         1.0f / static_cast<float>(pp.width),
         1.0f / static_cast<float>(pp.height),
@@ -1841,7 +2055,13 @@ inline bool renderHalation(const PostProcessResources &pp,
     // is (radius / sigma_per_pass)². Step stays at 1.0 throughout — widening
     // it would turn the 5-tap kernel into a sparse comb (see fs_bloom_blur.sc
     // and VIS-2f), which is the one thing this must not do.
-    const float wanted = settings.halationRadius / kBlurSigmaPixels;
+    // Scale with output height against a 1080p reference, exactly as grain
+    // does. Report §9.4 says halation radius and grain size should share a
+    // "film format" scaling; once grain scaled and halation did not, the two
+    // were scaled DIFFERENTLY, which is worse than neither scaling.
+    const float haloResScale = static_cast<float>(pp.outHeight) / 1080.0f;
+    const float wanted =
+        (settings.halationRadius * haloResScale) / kBlurSigmaPixels;
     int iterations = static_cast<int>(std::ceil(wanted * wanted));
     if (iterations < 1)
         iterations = 1;
@@ -1875,9 +2095,11 @@ inline bool renderHalation(const PostProcessResources &pp,
             reportedIters = iterations;
             reportedThresh = settings.halationThreshold;
             std::fprintf(stderr,
-                "Halation: threshold %.2f, %d blur iteration(s) -> ~%.1f px "
-                "halo (asked %.1f)\n",
-                static_cast<double>(settings.halationThreshold), iterations,
+                "Halation: threshold %.2f post-exposure (scene %.2f), %d blur "
+                "iteration(s) -> ~%.1f px halo (asked %.1f)\n",
+                static_cast<double>(settings.halationThreshold),
+                static_cast<double>(settings.halationThreshold / exposure),
+                iterations,
                 static_cast<double>(kBlurSigmaPixels
                     * std::sqrt(static_cast<float>(iterations))),
                 static_cast<double>(settings.halationRadius));
@@ -2011,7 +2233,7 @@ inline bool renderBloom(const PostProcessResources &pp,
 inline void submitComposite(const PostProcessResources &pp,
                             const PostProcessSettings &settings,
                             bool bloomActive, bool halationActive, bool toSmaa,
-                            float timeSeconds) {
+                            bool toGrain) {
     if (!pp.valid())
         return;
 
@@ -2019,9 +2241,12 @@ inline void submitComposite(const PostProcessResources &pp,
     // the scene views are: antialiasing is toggleable live from the console,
     // and a composite still pointing at last frame's target would either show
     // a stale image or drop the frame entirely.
+    // Where the composite lands depends on what still has to run after it.
+    // SMAA takes priority (it resolves into the grain target itself); with
+    // neither, straight to the backbuffer as before.
     bgfx::FrameBufferHandle compositeTarget = BGFX_INVALID_HANDLE;
-    if (toSmaa)
-        compositeTarget = pp.smaa.colorFB;
+    if (toSmaa)        compositeTarget = pp.smaa.colorFB;
+    else if (toGrain)  compositeTarget = pp.grainFB;
     bgfx::setViewFrameBuffer(kViewComposite, compositeTarget);
     bgfx::setViewRect(kViewComposite, 0, 0, pp.outWidth, pp.outHeight);
 
@@ -2134,13 +2359,6 @@ inline void submitComposite(const PostProcessResources &pp,
     // machine. Wrapped to keep float precision usable in a long session:
     // past a few thousand seconds the fractional part of a raw timer starts
     // quantising and the noise visibly stops moving.
-    const float grain[4] = {
-        settings.grainStrength,
-        settings.grainSize,
-        std::fmod(timeSeconds, 1024.0f),
-        0.0f,
-    };
-
     bgfx::setUniform(pp.u_ccParams0,   params0);
     bgfx::setUniform(pp.u_ccParams1,   params1);
     bgfx::setUniform(pp.u_ccFilter,    filter);
@@ -2152,7 +2370,6 @@ inline void submitComposite(const PostProcessResources &pp,
     bgfx::setUniform(pp.u_filmTintLo,  tintLo);
     bgfx::setUniform(pp.u_filmTintHi,  tintHi);
     bgfx::setUniform(pp.u_halation,    halation);
-    bgfx::setUniform(pp.u_grain,       grain);
     // Explicit sampler flags rather than the texture's baked ones: bloom's
     // first blur reads this SAME texture and needs LINEAR for its 2x2
     // downsample, so the point filter has to be chosen here, per-draw, not

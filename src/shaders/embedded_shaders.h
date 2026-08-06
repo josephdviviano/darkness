@@ -42,6 +42,7 @@
 #include "glsl/fs_bloom_extract.sc.bin.h"
 #include "glsl/fs_bloom_downsample.sc.bin.h"
 #include "glsl/fs_bloom_upsample.sc.bin.h"
+#include "glsl/fs_grain.sc.bin.h"
 #include "glsl/vs_corona.sc.bin.h"
 #include "glsl/fs_corona.sc.bin.h"
 #include "glsl/vs_smaa_edges.sc.bin.h"
@@ -71,6 +72,7 @@
 #include "essl/fs_bloom_extract.sc.bin.h"
 #include "essl/fs_bloom_downsample.sc.bin.h"
 #include "essl/fs_bloom_upsample.sc.bin.h"
+#include "essl/fs_grain.sc.bin.h"
 #include "essl/vs_corona.sc.bin.h"
 #include "essl/fs_corona.sc.bin.h"
 #include "essl/vs_smaa_edges.sc.bin.h"
@@ -100,6 +102,7 @@
 #include "spirv/fs_bloom_extract.sc.bin.h"
 #include "spirv/fs_bloom_downsample.sc.bin.h"
 #include "spirv/fs_bloom_upsample.sc.bin.h"
+#include "spirv/fs_grain.sc.bin.h"
 #include "spirv/vs_corona.sc.bin.h"
 #include "spirv/fs_corona.sc.bin.h"
 #include "spirv/vs_smaa_edges.sc.bin.h"
@@ -130,6 +133,7 @@
 #include "metal/fs_bloom_extract.sc.bin.h"
 #include "metal/fs_bloom_downsample.sc.bin.h"
 #include "metal/fs_bloom_upsample.sc.bin.h"
+#include "metal/fs_grain.sc.bin.h"
 #include "metal/vs_corona.sc.bin.h"
 #include "metal/fs_corona.sc.bin.h"
 #include "metal/vs_smaa_edges.sc.bin.h"
@@ -161,6 +165,7 @@
 #include "dx11/fs_bloom_extract.sc.bin.h"
 #include "dx11/fs_bloom_downsample.sc.bin.h"
 #include "dx11/fs_bloom_upsample.sc.bin.h"
+#include "dx11/fs_grain.sc.bin.h"
 #include "dx11/vs_corona.sc.bin.h"
 #include "dx11/fs_corona.sc.bin.h"
 #include "dx11/vs_smaa_edges.sc.bin.h"
@@ -194,6 +199,7 @@ static const bgfx::EmbeddedShader s_embeddedShaders[] = {
     BGFX_EMBEDDED_SHADER(fs_bloom_extract),
     BGFX_EMBEDDED_SHADER(fs_bloom_downsample),
     BGFX_EMBEDDED_SHADER(fs_bloom_upsample),
+    BGFX_EMBEDDED_SHADER(fs_grain),
     BGFX_EMBEDDED_SHADER(vs_corona),
     BGFX_EMBEDDED_SHADER(fs_corona),
     BGFX_EMBEDDED_SHADER(vs_smaa_edges),

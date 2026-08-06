@@ -18,3 +18,4 @@ type                  # reflections.type — HYBRID is the only algorithm now
 runtime_ir_clamp_ms   # superseded by reflections.hybrid_transition_time
 distance_model        # always INVERSEDISTANCE, per-voice from the schema's P$SchAttFac
 falloff_curve         # Dark Engine centibel curve; Steam Audio owns attenuation now
+shadow_bias

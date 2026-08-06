@@ -181,6 +181,36 @@ inline void composeSubObjectMatrices(const ParsedBinMesh &mesh,
     }
 }
 
+/// Model-space position of the attachment point carrying the given engine
+/// index, if this mesh has one. Matches on BinVHot::index, never on array
+/// position — see the note on BinVHot for why those differ.
+///
+/// `joints` poses the owning part; pass nullptr for the rest pose. The point is
+/// pushed through the owning sub-object's full ancestor chain, so a vhot on a
+/// moving part lands where that part currently is rather than where its local
+/// space would put it at the model origin.
+inline bool findVHotModelSpace(const ParsedBinMesh &mesh, uint32_t index,
+                               const float *joints, int jointCount,
+                               Vector3 &out) {
+    for (const auto &v : mesh.vhots) {
+        if (v.index != index) continue;
+
+        const Vector3 local(v.point[0], v.point[1], v.point[2]);
+        if (v.subObj <= 0 || v.subObj >= static_cast<int>(mesh.subObjects.size())) {
+            // Root-owned (or a model with no sub-object table): the part's
+            // frame IS the model frame, so the stored point needs no transform.
+            out = local;
+            return true;
+        }
+
+        std::vector<Matrix4> mats;
+        composeSubObjectMatrices(mesh, joints, jointCount, mats);
+        out = Vector3(mats[static_cast<size_t>(v.subObj)] * glm::vec4(local, 1.0f));
+        return true;
+    }
+    return false;
+}
+
 /// True when a mesh has parts that need a per-submesh transform at all. Single
 /// part models — 1541 of the 1782 stock models — skip the whole path.
 inline bool meshHasSubObjectTransforms(const ParsedBinMesh &mesh) {

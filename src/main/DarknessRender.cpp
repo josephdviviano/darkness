@@ -763,6 +763,13 @@ static void renderWorld(
                     if (!gpu.lightmapAtlasHandles.empty())
                         bgfx::setTexture(1, gpu.s_texLightmap, gpu.lightmapAtlasHandles[0]);
 
+                    // Set unconditionally, for both lightmap programs: a
+                    // path that left this unbound would render the world
+                    // black rather than merely mis-scaled.
+                    const float lmScale[4] = {
+                        state.lightmapScale, 0.0f, 0.0f, 0.0f };
+                    bgfx::setUniform(gpu.u_lightmapScale, lmScale);
+
                     // Select lightmap program: bilinear (hardware) or bicubic (shader)
                     bgfx::ProgramHandle lmProg = gpu.lightmappedProgram;
                     if (state.lightmapFiltering == 1 && bgfx::isValid(gpu.lightmappedBicubicProgram)) {
@@ -3841,6 +3848,14 @@ static void registerConsoleSettings(
         "[newdark] Saturation of the glow itself, 0 = greyscale (0.7 = NewDark default)");
 
     // ── Tone-curve shaping. Each is read only by its own operator. ──
+    dbgConsole.addFloat("lightmap_scale",
+        PostRange::kLightmapScaleMin, PostRange::kLightmapScaleMax,
+        [&state]() { return state.lightmapScale; },
+        [&state](float v) { state.lightmapScale = v; },
+        "Lightmap 2X-modulate multiplier. 1.0 puts world geometry on the "
+        "same fullbright reference as objects and sky; 2.0 is for 32-bit 2X "
+        "lightmaps. Put brightness in exposure, not here");
+
     dbgConsole.addFloat("agx_contrast",
         PostRange::kAgxContrastMin, PostRange::kAgxContrastMax,
         [&state]() { return state.postProcess.agxContrast; },
@@ -3922,14 +3937,29 @@ static void registerConsoleSettings(
         PostRange::kGrainMin, PostRange::kGrainMax,
         [&state]() { return state.postProcess.grainStrength; },
         [&state](float v) { state.postProcess.grainStrength = v; },
-        "Additive grain, weighted into the shadows where pushed film puts it");
+        "Additive film grain with a negative-film response: pronounced in "
+        "shadow, fading through midtones, gone in the whites");
+
+    dbgConsole.addFloat("grain_shadow_bias",
+        PostRange::kGrainBiasMin, PostRange::kGrainBiasMax,
+        [&state]() { return state.postProcess.grainShadowBias; },
+        [&state](float v) { state.postProcess.grainShadowBias = v; },
+        "Process emphasis, pow(1-u, push), per channel on top of the "
+        "physical curve. 0 = normally-processed stock (peak at u=0.44); 1 = peak at 0.23; higher = deeper into the shadows");
+
+    dbgConsole.addFloat("grain_gain",
+        PostRange::kGrainGainMin, PostRange::kGrainGainMax,
+        [&state]() { return state.postProcess.grainGain; },
+        [&state](float v) { state.postProcess.grainGain = v; },
+        "Non-physical grain multiplier, applied OUTSIDE the physical "
+        "amplitude. Use this for a stronger look, not grain strength");
 
     dbgConsole.addFloat("grain_size",
         PostRange::kGrainSizeMin, PostRange::kGrainSizeMax,
         [&state]() { return state.postProcess.grainSize; },
         [&state](float v) { state.postProcess.grainSize = v; },
-        "Output pixels per noise cell. Above 1 the grain clumps, closer to a "
-        "pushed stock");
+        "Grain size in output pixels — a real correlation length, not a "
+        "sampling stride. Below ~1 speckles, above ~2 clumps like a fast stock");
 
     dbgConsole.addFloat("bloom_range",
         PostRange::kBloomRangeMin, PostRange::kBloomRangeMax,
@@ -4022,6 +4052,31 @@ static void registerConsoleSettings(
         [&state]() { return state.coronaSettings.maxDistScale; },
         [&state](float v) { state.coronaSettings.maxDistScale = v; },
         "Multiplies each corona's own max visible distance");
+
+    // Live A/B on the biggest lever there is: the two models differ by 4x at
+    // 30 units and 32x at 300, so this is worth flipping in place rather than
+    // across two launches.
+    dbgConsole.addBool("corona_physical_size",
+        [&state]() {
+            return state.coronaSettings.distanceModel ==
+                   Darkness::CoronaDistanceModel::Physical;
+        },
+        [&state](bool v) {
+            state.coronaSettings.distanceModel =
+                v ? Darkness::CoronaDistanceModel::Physical
+                  : Darkness::CoronaDistanceModel::Engine;
+        },
+        "on = constant world radius, so a corona shrinks like its lamp does "
+        "(veiling-glare physics). off = the original Thief 2 growth to a "
+        "constant apparent size");
+
+    dbgConsole.addFloat("corona_reference_distance",
+        CoronaRange::kRefDistMin, CoronaRange::kRefDistMax,
+        [&state]() { return state.coronaSettings.physicalRefDistance; },
+        [&state](float v) { state.coronaSettings.physicalRefDistance = v; },
+        "Physical model only: the viewing distance whose size is frozen and "
+        "held at every range. This is the knob to reach for if coronas read "
+        "too small or too large overall");
 
     dbgConsole.addFloat("corona_fade",
         CoronaRange::kFadeMin, CoronaRange::kFadeMax,
@@ -5630,6 +5685,22 @@ int main(int argc, char *argv[]) {
     state.postProcess.ndPrescale      = cfg.ppNdPrescale;
     state.postProcess.ndScale         = cfg.ppNdScale;
     state.postProcess.ndSaturation    = cfg.ppNdSaturation;
+    state.lightmapScale               = cfg.lightmapScale;
+    // Announce it: this multiplier decides whether anything in world
+    // geometry can exceed 1.0 at all, so every bloom/halation threshold and
+    // the tone curve's working range sit downstream of it. It spent a week
+    // as an undocumented literal and cost two wrong defaults; it does not go
+    // back to being invisible.
+    std::fprintf(stderr,
+        "Lightmap scale: %.2f (world max = albedo * light * %.2f)%s\n",
+        static_cast<double>(cfg.lightmapScale),
+        static_cast<double>(cfg.lightmapScale),
+        cfg.lightmapScale > 1.001f
+            ? " — ABOVE 1.0, so world geometry is brighter than the object "
+              "and sky passes, which both cap at fullbright. Correct only "
+              "for 32-bit 2X lightmaps (WREXT; see WR-1)."
+            : " — matches the object and sky passes, which also cap at "
+              "fullbright.");
     state.postProcess.bloomRange      = cfg.ppBloomRange;
     state.postProcess.agxContrast     = cfg.ppAgxContrast;
     state.postProcess.lottesContrast  = cfg.ppLottesContrast;
@@ -5649,6 +5720,8 @@ int main(int argc, char *argv[]) {
     state.postProcess.halationRadius    = cfg.ppHalationRadius;
     state.postProcess.grainStrength    = cfg.ppGrainStrength;
     state.postProcess.grainSize        = cfg.ppGrainSize;
+    state.postProcess.grainShadowBias  = cfg.ppGrainShadowBias;
+    state.postProcess.grainGain        = cfg.ppGrainGain;
     state.antiAlias.mode          =
         static_cast<Darkness::AntiAliasMode>(cfg.antiAliasMode);
     state.antiAlias.smaaThreshold = cfg.smaaThreshold;
@@ -5660,6 +5733,9 @@ int main(int argc, char *argv[]) {
     state.coronaSettings.intensity    = cfg.coronaIntensity;
     state.coronaSettings.sizeScale    = cfg.coronaSizeScale;
     state.coronaSettings.maxDistScale = cfg.coronaMaxDistScale;
+    state.coronaSettings.distanceModel =
+        static_cast<Darkness::CoronaDistanceModel>(cfg.coronaDistanceModel);
+    state.coronaSettings.physicalRefDistance = cfg.coronaRefDistance;
     state.coronaSettings.fadeSeconds  = cfg.coronaFadeSeconds;
     state.coronaSettings.traceSamples = cfg.coronaTraceSamples;
     state.coronaSettings.traceBudget  = cfg.coronaTraceBudget;
@@ -7229,6 +7305,11 @@ int main(int argc, char *argv[]) {
             bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_composite"),
             bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_bloom_upsample"),
             true);
+        // Film grain — its own final pass, after antialiasing.
+        bgfx::ProgramHandle grainProgram = bgfx::createProgram(
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_composite"),
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_grain"),
+            true);
 
         if (!Darkness::createPostProcess(gpu.postProcess,
                                          renderRes.width, renderRes.height,
@@ -7238,7 +7319,7 @@ int main(int argc, char *argv[]) {
                                              && !renderRes.isNative(),
                                          compositeProgram, blurProgram,
                                          extractProgram, downsampleProgram,
-                                         upsampleProgram)) {
+                                         upsampleProgram, grainProgram)) {
             Darkness::destroyPostProcess(gpu.postProcess);
             if (state.postProcess.enabled) {
                 std::fprintf(stderr,
@@ -8048,20 +8129,34 @@ int main(int argc, char *argv[]) {
                 // resolve from.
                 const bool smaaActive = Darkness::smaaShouldRun(
                     gpu.postProcess, state.antiAlias, ppActive);
-                // Wall time, for grain. Taken here rather than accumulated
-                // from dt so the noise keeps moving at a constant rate
-                // regardless of frame rate — and so a paused or hitching
-                // frame does not freeze it into a fixed pattern, which reads
-                // as dirt on the lens rather than as grain.
-                const float nowSeconds =
-                    static_cast<float>(SDL_GetTicks64()) * 0.001f;
+                // Advance once per DRAWN FRAME. Not wall time: the grain
+                // offset is a low-discrepancy sequence over frames, and an
+                // earlier version passed seconds here, which converted
+                // silently to an integer and left the grain frozen for a
+                // second at a time.
+                ++state.frameIndex;
                 const bool halationActive =
                     Darkness::renderHalation(gpu.postProcess, state.postProcess);
+
+                // ── Chain routing ──
+                // Grain is the LAST pass and needs something to read, so
+                // whichever stage would otherwise have written to the
+                // backbuffer writes to the grain target instead:
+                //   composite -> [SMAA] -> [grain] -> backbuffer
+                // Each optional stage simply drops out when it is off.
+                const bool grainActive = Darkness::grainShouldRun(
+                    gpu.postProcess, state.postProcess, ppActive);
+
                 Darkness::submitComposite(gpu.postProcess, state.postProcess,
                                           bloomActive, halationActive,
-                                          smaaActive, nowSeconds);
+                                          smaaActive, grainActive);
                 if (smaaActive)
-                    Darkness::submitSmaa(gpu.postProcess, state.antiAlias);
+                    Darkness::submitSmaa(gpu.postProcess, state.antiAlias,
+                                         grainActive);
+                if (grainActive)
+                    Darkness::submitGrain(gpu.postProcess, state.postProcess,
+                                          gpu.postProcess.grainTex,
+                                          state.frameIndex);
             }
 
             // Frob target indicator + debug console overlay.
@@ -8121,6 +8216,7 @@ int main(int argc, char *argv[]) {
             dbgConsole.render();
 
             bgfx::frame();
+
         });
 
     loopSvc->addLoopClient(&inputClient);

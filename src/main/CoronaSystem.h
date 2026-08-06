@@ -69,6 +69,7 @@
 #include "ObjectPropParser.h"   // ObjectPropData — the visible-model set
 #include "RayCaster.h"
 #include "RenderParamsParser.h" // hsbToRgb
+#include "SubObjectPose.h"      // findVHotModelSpace — the light attachment point
 #include "physics/ObjectCollisionGeometry.h"
 #include "WRChunkParser.h"
 
@@ -101,6 +102,36 @@ struct CoronaTemplate {
 };
 inline constexpr CoronaTemplate kRetailTemplate{};
 
+/// The SIZE CURVE synthesized coronas use, taken from what people who actually
+/// author coronas choose rather than from retail's single record.
+///
+/// Retail MISS5 is an outlier in the one field that matters at range. Census of
+/// every P$Corona in the fan missions on hand (42 records, 13 distinct settings,
+/// Ominous Bequest Gold + Equilibrium) against it:
+///
+///                      radiusNear   radiusFar   maxDist    growth half-angle
+///   fan missions        1.0-2.5      4-18       8-64        3.6-17.9 deg
+///     median            2.0          6.0        48          6.4 deg
+///   retail MISS5        2.0          65.0       300         12.0 deg
+///
+/// The GROWTH RATE is not the problem — retail's 12 degrees sits inside normal
+/// practice. `maxDist` is: 300 is six times the largest value any of those
+/// authors picked. A 12-degree disc is unobjectionable while you only ever see
+/// it inside 48 units, and absurd when it is still 12 degrees at 300 while the
+/// lamp itself has shrunk to four pixels.
+///
+/// So the size curve tops out at the fan-mission median (radiusFar 6.0 reached
+/// at 48 units) and stays there. `maxDist` — how far the corona is DRAWN at all
+/// — keeps retail's 300, because a distant lamp glow is worth having in a dark
+/// level; it just should not be a dinner plate.
+inline constexpr CoronaTemplate kSynthTemplate{
+    /*radiusNear*/ 2.0f,
+    /*radiusFar */ 6.0f,
+    /*maxDist   */ 48.0f,   // where radiusFar is reached — NOT the draw range
+    /*alpha     */ 0.15f,   // retail's; fan missions run 0.20-0.75
+    /*texture   */ "corona",
+};
+
 /// Brightness that maps to template scale 1.0. The median concrete P$Light
 /// brightness across retail missions is ~120-125 (MISS6 125, MISS1 125,
 /// MISS12 120), so a typical lamp gets the shipped corona and only genuinely
@@ -113,11 +144,124 @@ inline constexpr float kReferenceBrightness = 125.0f;
 inline constexpr float kMinBrightScale = 0.5f;
 inline constexpr float kMaxBrightScale = 1.75f;
 
+/// The attachment point a corona hangs off: the model's vhot with engine index
+/// 1, transformed by the object's own rotation.
+///
+/// MEASURED, not assumed. Retail caches the anchor it resolved into the
+/// P$Corona record's position field, so the engine's own answer is readable
+/// off disk. Subtracting each object's P$Position leaves the offset the engine
+/// applied, and every one of them is a vhot at index 1:
+///
+///   MISS6  obj 95/160/167/180/193 → delta z +3.980, |xy| < 0.08
+///                                   = STRLANT.BIN  vhot 1 (-0.046, 0.020, 3.986)
+///   MISS12 obj 1354/1356/1360/1362 → delta z +0.297, |xy| ~ 0.40
+///                                   = GASLITE*.BIN vhot 1 ( 0.393, 0.073, 0.297)
+///   MISS12 obj 1388/1432/1433/1628/1823/2020 → delta z +0.091, |xy| ~ 0.22
+///                                   = ELECLGH.BIN  vhot 1 (-0.244,-0.020, 0.091)
+///
+/// Each of those three points is unique across all 1783 stock models at the
+/// measured tolerance, so the match is not a coincidence of similar numbers.
+/// (The residual few thousandths are the object positions being printed to one
+/// decimal, not a real disagreement.)
+///
+/// Three details fall out of the same data and each of them is a way to get
+/// this wrong:
+///
+///   INDEX, NOT SLOT. STRLANT.BIN stores index 3 at array slot 0 and index 1 at
+///   slot 1; GASLITE2.BIN stores the same pair in the opposite order. The
+///   anchors match index 1 in both, so "the first vhot" is the wrong rule and
+///   would put the streetlamp's glow 2.5 units too high.
+///
+///   ROTATED BY THE OBJECT. Retail's one authored corona (MISS5 obj 35) caches
+///   a delta of (0.020, -0.244, 0.091) against an object whose facing is the
+///   quaternion (w 0.7071, z 0.7071) — 90 degrees about Z. ELECLGH's vhot 1 is
+///   (-0.244, -0.020, 0.091), and rotating it by that facing gives the cached
+///   delta exactly. An unrotated offset would be visibly wrong on any lamp
+///   mounted at an angle.
+///
+///   NOT THE LIGHT OFFSET. P$Light carries its own offset field, and it is a
+///   different thing: MISS6's streetlamps have offset (0,0,0) yet anchor their
+///   coronas 3.98 units up. Across the whole campaign only 25 of 3325 P$Light
+///   records have a non-zero offset at all, which is why anchoring on it left
+///   99.2% of coronas sitting exactly on the object origin.
+inline constexpr uint32_t kVHotLight = 1;
+
 /// P$RenderType value NewDark adds for "draw the corona but not the model".
 /// Absent from Thief 2's own `objectrendertype` enum (Normal 0, Not Rendered
 /// 1, No Lightmap 2, Editor Only 3), so no retail object can carry it; it is
 /// handled purely so fan missions that do behave correctly.
 inline constexpr uint32_t kRenderTypeCoronaOnly = 4;
+
+/// How a corona's drawn radius responds to viewer distance. The two models
+/// disagree by up to 32x, so this is the single biggest lever on how coronas
+/// read in a scene.
+enum class CoronaDistanceModel : uint8_t {
+    /// The ORIGINAL Thief 2 rule: interpolate radiusNear → radiusFar across
+    /// the light's visible range. Retail's own numbers (2.0 at 0, 65.0 at 300)
+    /// work out to a constant apparent angular size — a ~24 degree disc, 40%
+    /// of screen height, at every distance.
+    ///
+    /// This is original, not a NewDark extension. Retail THIEF2.EXE v1.07
+    /// carries the field labels itself:
+    ///   [BIN: property-field label table @0x22e418-0x22e548, 0x40 stride
+    ///    ("Corona", "radius up close", "radius at max dist",
+    ///     "max. dist. visible", "alpha", "texture"), THIEF2.EXE v1.07
+    ///    2000-08-24]
+    /// NewDark 1.28's DromEd carries the identical strings and only appends
+    /// "color" and "spot angle scale" — the two its release notes describe
+    /// adding. So the growth belongs to the original engine and turning it off
+    /// is a deliberate divergence.
+    Engine,
+
+    /// Constant world radius: the corona shrinks on screen exactly as the lamp
+    /// does. This is what a veiling-glare disc actually does.
+    ///
+    /// Stiles-Holladay: the glare an eye or lens spreads around a source is
+    /// L(theta) = k*E/theta^2, with E = I/d^2 the irradiance the source
+    /// delivers. The visible edge of the glow is where L crosses the eye's
+    /// threshold T:
+    ///
+    ///     k*(I/d^2) / theta_v^2 = T   =>   theta_v = sqrt(k*I/T) / d
+    ///     world radius r = theta_v * d = sqrt(k*I/T)      <- no d
+    ///
+    /// So the world radius is INDEPENDENT of distance and proportional to
+    /// sqrt(source intensity) — which is exactly the reasoning already in
+    /// coronaBrightScale, applied to the other variable. The CIE 1999 glare
+    /// equation's theta^-3 term would add a d^(1/3) growth, far weaker than
+    /// the engine's linear one.
+    ///
+    /// NO SEPARATE DISTANCE DIMMING GOES WITH THIS, and adding one would be a
+    /// bug. A fixed-world-size disc drawn at constant radiance already loses
+    /// total flux as 1/d^2, because its solid angle does; multiplying by
+    /// another 1/d^2 would give 1/d^4.
+    ///
+    /// Both reference implementations size billboards this way. HPL2's
+    /// cBillboard holds a fixed world `mvSize` and varies only halo alpha
+    /// (BillBoard.cpp); Godot's billboards are world-sized by default, with
+    /// `FLAG_FIXED_SIZE` — hold screen size — an explicit opt-in meant for
+    /// editor gizmos rather than light glows.
+    Physical,
+};
+
+/// Where a corona's `offset` lives, which decides what has to happen to it
+/// before it can be added to a world position.
+enum class CoronaAnchor : uint8_t {
+    /// The object's own origin. What you get when the model has no vhot 1 —
+    /// the engine's fallback too, and wrong-looking on exactly the models that
+    /// deserve a glow, so the load-time report counts these.
+    Origin,
+    /// Model space: rotated (and scaled) by the object's live transform every
+    /// frame. The engine's construction — see kVHotLight.
+    VHot,
+    /// P$Light / P$AnimLight offset. Applied in world space, unrotated,
+    /// matching how LightingSystem places the light itself. Only reached when
+    /// the model has no vhot 1, and only 25 records campaign-wide are non-zero.
+    LightOffset,
+    /// An authored P$Corona's engine-cached world delta, used when we cannot
+    /// re-derive the anchor from a vhot. Correct where the object stands, but
+    /// frozen at the rotation it was cached with.
+    CachedAnchor,
+};
 
 /// One corona, resolved at load. `objID` is the object it hangs off; the
 /// world position is recomputed every frame from that object plus `offset`,
@@ -125,9 +269,28 @@ inline constexpr uint32_t kRenderTypeCoronaOnly = 4;
 struct CoronaDef {
     int32_t  objID       = 0;
     Vector3  offset{0.0f, 0.0f, 0.0f};
+    CoronaAnchor anchor  = CoronaAnchor::Origin;
+    /// Load-time P$Scale, applied to a model-space anchor before rotating it.
+    /// A scaled lamp's vhot scales with its geometry — NewDark 1.28 lists
+    /// "buggy transform for vhot ... when parent object is scaled" among its
+    /// fixes, so the original got this wrong and the fixed behaviour is ours.
+    Vector3  scale{1.0f, 1.0f, 1.0f};
     float    radiusNear  = 0.0f;
     float    radiusFar   = 0.0f;
+    /// How far the corona is DRAWN. Culling only.
     float    maxDist     = 0.0f;
+    /// Distance at which `radiusFar` is reached — the SIZE curve, which is a
+    /// different thing from the draw range and must not be conflated with it.
+    ///
+    /// Splitting them fixes a real bug as well as letting the two be tuned
+    /// apart. The synthesizer scales its radii by brightness, and when the
+    /// interpolation ran against a brightness-scaled maxDist the scale
+    /// cancelled outright:
+    ///     radius(d) = 2s + (65s - 2s) * d/(300s) = 2s + 0.21*d
+    /// A 12x brightness range then produced at most a 1.1x size difference
+    /// past 100 units — every light in the level drew the same disc. With the
+    /// size curve on its own un-scaled reference the s survives.
+    float    sizeMaxDist = 0.0f;
     float    alpha       = 0.0f;
     Vector3  color{1.0f, 1.0f, 1.0f};
     uint32_t flags       = 0;
@@ -153,6 +316,12 @@ struct CoronaRuntime {
     int authoredCount  = 0;
     int synthCount     = 0;
     int missingTexture = 0;
+    /// Anchor census, reported at load. A corona sitting on the object origin
+    /// is the failure the vhot lookup exists to fix, so "how many still do"
+    /// must be visible without a debugger.
+    int anchorVHot     = 0;
+    int anchorOrigin   = 0;
+    int anchorOther    = 0;
 
     /// Round-robin cursor into `defs` for the trace budget.
     size_t traceCursor = 0;
@@ -212,6 +381,62 @@ inline float coronaBrightScale(float brightness) {
     return std::clamp(s, kMinBrightScale, kMaxBrightScale);
 }
 
+/// Resolve an object's live orientation, in the same order coronaObjectPos
+/// resolves its position: runtime state first, static P$Position otherwise.
+/// A lamp that swings has to take its glow with it.
+inline Quaternion coronaObjectRot(ObjectService *objSvc,
+                                  const ObjectStateMap *objectStates,
+                                  int32_t objID) {
+    if (objectStates) {
+        if (const ObjectState *st = objectStates->tryGet(objID))
+            return st->orientation;
+    }
+    return objSvc->orientation(objID);
+}
+
+/// objectID -> the model the renderer draws for it.
+///
+/// Built from ObjectPropData::objects, which is the ONLY place a resolved
+/// ModelName lands. allPlacements looks like the more convenient source and is
+/// not: it is snapshotted before the inheritance walk that resolves ModelName,
+/// so its `modelName` field is empty for every entry, and a lookup through it
+/// silently answers "this object has no model" for the whole level.
+inline std::unordered_map<int32_t, const ObjectPlacement *>
+buildCoronaModelIndex(const ObjectPropData &objData) {
+    std::unordered_map<int32_t, const ObjectPlacement *> idx;
+    idx.reserve(objData.objects.size() * 2);
+    for (const auto &o : objData.objects)
+        idx[o.objID] = &o;
+    return idx;
+}
+
+/// The model-space light attachment point of whatever model an object draws,
+/// if it has one.
+///
+/// The rest pose is deliberate. A vhot on a moving part would strictly need
+/// the object's live joint values, but no stock light model puts vhot 1 on a
+/// moving part, and threading per-frame joints through the corona list to
+/// serve zero objects would cost every corona a sub-object composition.
+inline bool coronaModelVHot(const std::unordered_map<int32_t, const ObjectPlacement *> &modelIndex,
+                            const std::unordered_map<std::string, ParsedBinMesh> &models,
+                            int32_t objID, Vector3 &out) {
+    auto pit = modelIndex.find(objID);
+    if (pit == modelIndex.end() || pit->second->modelName[0] == '\0')
+        return false;
+
+    auto mit = models.find(pit->second->modelName);
+    if (mit == models.end() || !mit->second.valid) return false;
+
+    return findVHotModelSpace(mit->second, kVHotLight, nullptr, 0, out);
+}
+
+/// Load-time P$Scale, or (1,1,1) for an object we have no placement for.
+inline Vector3 coronaObjectScale(const ObjectPropData &objData, int32_t objID) {
+    auto pit = objData.allPlacements.find(objID);
+    if (pit == objData.allPlacements.end()) return Vector3(1.0f, 1.0f, 1.0f);
+    return Vector3(pit->second.scaleX, pit->second.scaleY, pit->second.scaleZ);
+}
+
 } // namespace detail
 
 /// Read every authored P$Corona record.
@@ -224,8 +449,12 @@ inline float coronaBrightScale(float brightness) {
 inline void parseAuthoredCoronas(PropertyService *propSvc,
                                  ObjectService *objSvc,
                                  const ObjectStateMap *objectStates,
+                                 const ObjectPropData &objData,
+                                 const std::unordered_map<std::string, ParsedBinMesh> &models,
                                  CoronaRuntime &out) {
     if (!propSvc || !objSvc) return;
+
+    const auto modelIndex = detail::buildCoronaModelIndex(objData);
 
     for (int objID : getAllObjectsWithProperty(propSvc, "Corona")) {
         if (objID <= 0) continue; // archetypes have no world position
@@ -248,6 +477,11 @@ inline void parseAuthoredCoronas(PropertyService *propSvc,
         def.radiusFar  = pc.radiusFar;
         def.maxDist    = (pc.maxDist > 0.0f) ? pc.maxDist
                                              : kRetailTemplate.maxDist;
+        // An authored record's size curve IS its draw range — the designer
+        // picked both radii against that one distance, and fan-mission authors
+        // demonstrably tune it (8 to 64 units across the missions surveyed).
+        // Only the synthesizer separates them.
+        def.sizeMaxDist = def.maxDist;
         def.alpha      = pc.alpha;
         def.flags      = pc.flags;
         def.color      = detail::coronaLightColor(propSvc, objID);
@@ -256,20 +490,33 @@ inline void parseAuthoredCoronas(PropertyService *propSvc,
         std::memcpy(tex, pc.texture, 16);
         def.texture = tex;
 
-        // The cached anchor minus the object's origin is the vhot offset the
-        // engine resolved. Storing the difference rather than the absolute
-        // position is what lets the corona follow a moving object while still
-        // landing exactly where the original engine put it on a static one.
-        const Vector3 objPos =
-            detail::coronaObjectPos(objSvc, objectStates, objID);
-        const Vector3 cached(pc.posX, pc.posY, pc.posZ);
-        Vector3 delta = cached - objPos;
-        // Guard against a stale cache from a since-moved object: a huge delta
-        // is not a vhot, and honouring it would strand the glow across the
-        // level. Vhots live inside the model's bounding box.
-        if (glm::length(delta) > 16.0f)
-            delta = Vector3(0.0f, 0.0f, 0.0f);
-        def.offset = delta;
+        // Prefer re-deriving the anchor from the model's light vhot over the
+        // engine's cached one. They agree where both exist — retail's one
+        // authored corona reproduces its cached delta exactly this way — but
+        // the cache is a world position frozen at bake time, so only the vhot
+        // survives the object being rotated or moved.
+        def.scale = detail::coronaObjectScale(objData, objID);
+        Vector3 vhot;
+        if (detail::coronaModelVHot(modelIndex, models, objID, vhot)) {
+            def.offset = vhot;
+            def.anchor = CoronaAnchor::VHot;
+        } else {
+            // No vhot to re-derive from: fall back to the cached anchor,
+            // stored as a difference from the object's origin so the glow at
+            // least follows the object rather than staying behind.
+            const Vector3 objPos =
+                detail::coronaObjectPos(objSvc, objectStates, objID);
+            const Vector3 cached(pc.posX, pc.posY, pc.posZ);
+            Vector3 delta = cached - objPos;
+            // Guard against a stale cache from a since-moved object: a huge
+            // delta is not a vhot, and honouring it would strand the glow
+            // across the level. Vhots live inside the model's bounding box.
+            if (glm::length(delta) > 16.0f)
+                delta = Vector3(0.0f, 0.0f, 0.0f);
+            def.offset = delta;
+            def.anchor = (glm::length(delta) > 1e-4f) ? CoronaAnchor::CachedAnchor
+                                                      : CoronaAnchor::Origin;
+        }
 
         out.defs.push_back(std::move(def));
         ++out.authoredCount;
@@ -290,11 +537,14 @@ inline void synthesizeCoronas(PropertyService *propSvc,
                               ObjectService *objSvc,
                               const ObjectStateMap *objectStates,
                               const ObjectPropData &objData,
+                              const std::unordered_map<std::string, ParsedBinMesh> &models,
                               const std::unordered_map<int16_t, LightSource> &lightSources,
                               CoronaRuntime &out) {
     if (!propSvc || !objSvc) return;
 
-    // Objects the renderer draws.
+    // Objects the renderer draws, and the model each one draws — the same set,
+    // read two ways.
+    const auto modelIndex = detail::buildCoronaModelIndex(objData);
     std::unordered_set<int32_t> visible;
     visible.reserve(objData.objects.size() * 2);
     for (const auto &o : objData.objects)
@@ -323,20 +573,42 @@ inline void synthesizeCoronas(PropertyService *propSvc,
                && rt.mode == kRenderTypeCoronaOnly;
     };
 
-    auto emit = [&](int32_t objID, float brightness, const Vector3 &offset,
+    auto emit = [&](int32_t objID, float brightness, const Vector3 &lightOffset,
                     int16_t animLightNum, float animMaxBright) {
         const float scale = detail::coronaBrightScale(brightness);
         if (scale <= 0.0f) return; // brightness 0 = the light is off
 
         CoronaDef def;
         def.objID        = objID;
-        def.offset       = offset;
-        def.radiusNear   = kRetailTemplate.radiusNear * scale;
-        def.radiusFar    = kRetailTemplate.radiusFar  * scale;
-        def.maxDist      = kRetailTemplate.maxDist    * scale;
-        def.alpha        = kRetailTemplate.alpha;
+
+        // The model's light vhot is the engine's own answer to "where does
+        // this lamp glow from", and it is usually nowhere near the origin: a
+        // street lantern's is 3.99 units up its post, a wall torch's about 1.4.
+        // Fall back to the light's authored offset — which 3300 of 3325 retail
+        // records leave at zero — only when the model names no such point.
+        def.scale = detail::coronaObjectScale(objData, objID);
+        Vector3 vhot;
+        if (detail::coronaModelVHot(modelIndex, models, objID, vhot)) {
+            def.offset = vhot;
+            def.anchor = CoronaAnchor::VHot;
+        } else {
+            def.offset = lightOffset;
+            def.anchor = (glm::length(lightOffset) > 1e-4f)
+                             ? CoronaAnchor::LightOffset
+                             : CoronaAnchor::Origin;
+        }
+
+        // Radii scale with brightness; the size curve's reference distance
+        // does NOT, or the scale cancels straight back out — see
+        // CoronaDef::sizeMaxDist. The draw range keeps scaling, because a
+        // brighter lamp genuinely should be visible from further away.
+        def.radiusNear   = kSynthTemplate.radiusNear * scale;
+        def.radiusFar    = kSynthTemplate.radiusFar  * scale;
+        def.sizeMaxDist  = kSynthTemplate.maxDist;
+        def.maxDist      = kRetailTemplate.maxDist   * scale;
+        def.alpha        = kSynthTemplate.alpha;
         def.color        = detail::coronaLightColor(propSvc, objID);
-        def.texture      = kRetailTemplate.texture;
+        def.texture      = kSynthTemplate.texture;
         def.synthesized  = true;
         def.animLightNum = animLightNum;
         def.animMaxBright = animMaxBright;
@@ -379,6 +651,13 @@ inline void synthesizeCoronas(PropertyService *propSvc,
 inline void finalizeCoronas(CoronaRuntime &rt) {
     rt.visibility.assign(rt.defs.size(), 0.0f);
     rt.traced.assign(rt.defs.size(), 0.0f);
+
+    rt.anchorVHot = rt.anchorOrigin = rt.anchorOther = 0;
+    for (const auto &d : rt.defs) {
+        if (d.anchor == CoronaAnchor::VHot)        ++rt.anchorVHot;
+        else if (d.anchor == CoronaAnchor::Origin) ++rt.anchorOrigin;
+        else                                       ++rt.anchorOther;
+    }
 }
 
 // ── Per-frame update ────────────────────────────────────────────────────────
@@ -392,6 +671,15 @@ struct CoronaSettings {
     float intensity    = 1.0f;   // multiplies alpha; >1 pushes into bloom
     float sizeScale    = 1.0f;   // multiplies both radii
     float maxDistScale = 1.0f;   // multiplies the per-corona distance limit
+    /// Engine rule or veiling-glare physics — see CoronaDistanceModel. Note
+    /// this changes only the drawn RADIUS; `maxDist` still bounds visibility
+    /// either way, so a light stops being drawn at the same range.
+    CoronaDistanceModel distanceModel = CoronaDistanceModel::Physical;
+    /// Physical model only: the viewing distance whose size is frozen and held
+    /// at every range. Bigger = bigger coronas everywhere, in proportion.
+    /// 20 units is a room's width in this game's scale, so the default reads
+    /// as "the size it looked from across the room".
+    float physicalRefDistance = 20.0f;
     float fadeSeconds  = 0.15f;  // occlusion crossfade time constant
     /// Rays per corona per visibility test. 1 = centre only (binary, pops).
     /// Higher samples the disc so a corona clipping an edge partially fades.
@@ -472,8 +760,16 @@ inline void updateCoronas(CoronaRuntime &rt,
     for (size_t i = 0; i < n; ++i) {
         const CoronaDef &def = rt.defs[i];
 
-        const Vector3 pos =
-            detail::coronaObjectPos(objSvc, objectStates, def.objID) + def.offset;
+        // A vhot anchor is model-space, so it has to ride the object's live
+        // transform; every other anchor is already a world-space delta.
+        Vector3 pos = detail::coronaObjectPos(objSvc, objectStates, def.objID);
+        if (def.anchor == CoronaAnchor::VHot) {
+            const Quaternion rot =
+                detail::coronaObjectRot(objSvc, objectStates, def.objID);
+            pos += rot * (def.offset * def.scale);
+        } else {
+            pos += def.offset;
+        }
 
         const Vector3 toCam = camPos - pos;
         const float dist = glm::length(toCam);
@@ -559,11 +855,32 @@ inline void updateCoronas(CoronaRuntime &rt,
         const float vis = rt.visibility[i];
         if (vis <= 0.002f) continue; // below this it contributes nothing
 
-        // Interpolate the world radius across the light's visible range, so
-        // the billboard holds roughly constant apparent size. Both endpoints
-        // come from the record; `radiusFar > radiusNear` is expected.
-        const float t = (maxDist > 1e-4f) ? std::clamp(dist / maxDist, 0.0f, 1.0f)
-                                          : 0.0f;
+        // World radius. Both models walk the SAME size curve; they differ only
+        // in where on it they stand.
+        //
+        //   engine    evaluate at the viewer's actual distance, so the radius
+        //             grows and the billboard holds a constant apparent size.
+        //   physical  evaluate once at a fixed reference distance and hold
+        //             that world radius forever, so the corona shrinks on
+        //             screen exactly as its lamp does.
+        //
+        // The reference distance is not a fudge — it is the free parameter the
+        // physics leaves open. The veiling-glare derivation fixes the SHAPE of
+        // the law (r independent of d, proportional to sqrt(I)) but its
+        // constant is sqrt(k*I/T), and T is the eye's adaptation threshold.
+        // Something has to set it, and "the size this corona had at a normal
+        // viewing distance" is the honest way to.
+        //
+        // Anchoring on `radiusNear` instead — the first thing tried — was
+        // wrong: that is the curve's value at d = 0, the smallest it ever
+        // takes, so every corona shrank including the one at arm's length.
+        const float sizeAt =
+            (cfg.distanceModel == CoronaDistanceModel::Physical)
+                ? cfg.physicalRefDistance
+                : dist;
+        const float t = (def.sizeMaxDist > 1e-4f)
+                            ? std::clamp(sizeAt / def.sizeMaxDist, 0.0f, 1.0f)
+                            : 0.0f;
         const float radius =
             (def.radiusNear + (def.radiusFar - def.radiusNear) * t) *
             cfg.sizeScale;

@@ -13,6 +13,7 @@ keys behind the example. Each was invisible until someone went looking.
         │  B: every documented key is really parsed   (dead documentation)
         │  C: same key set as the live config          (or it is never tested)
         │  D: the generated help is current
+        │  E: the struct default is what the example says it is
         ├──────────────► darknessRender.yaml
         └──────────────► src/main/ConfigHelpText.h ──► darknessRender --help
 
@@ -20,6 +21,7 @@ Usage:
     python3 tools/config_audit.py              # check the working tree
     python3 tools/config_audit.py --fix        # regenerate the help, then check
     python3 tools/config_audit.py --report     # option-surface census
+    python3 tools/config_audit.py --trace KEY  # where does this value come from?
     python3 tools/config_audit.py --staged     # check the git index (pre-commit)
     python3 tools/config_audit.py --precommit  # --staged, but skip when no
                                                #   config file is being committed
@@ -118,6 +120,26 @@ def key_names(node):
     return out
 
 
+def key_paths(node, prefix=""):
+    """Every key as a DOTTED PATH.
+
+    Check C compares two yaml files, and both carry full path information —
+    unlike the parser comparisons, which are limited to bare names because the
+    parser is read by text scan. Using names there too was a real blind spot:
+    a nested key could go missing from the live config and stay invisible so
+    long as its leaf name appeared anywhere else in the tree. That is exactly
+    how `graphics.post_process.halation.threshold` was dropped while the audit
+    reported OK — `threshold` also exists under `bloom`.
+    """
+    out = set()
+    if isinstance(node, dict):
+        for k, v in node.items():
+            path = f"{prefix}.{k}" if prefix else str(k)
+            out.add(path)
+            out |= key_paths(v, path)
+    return out
+
+
 def parser_keys(src):
     keys = set()
     for pattern in KEY_READ_PATTERNS:
@@ -174,13 +196,15 @@ def check_no_dead_docs(parsed, documented):
     return out
 
 
-def check_live_parity(documented, live_text):
+def check_live_parity(example_text, live_text):
     """C: the live config carries exactly the example's key set."""
     if live_text is None:
         print(f"  - {LIVE} absent (gitignored, not on this machine) — "
               f"parity check skipped")
         return []
-    live = key_names(yaml.safe_load(live_text))
+    # Paths, not bare names — see key_paths().
+    live = key_paths(yaml.safe_load(live_text))
+    documented = key_paths(yaml.safe_load(example_text))
     missing = sorted(documented - live)
     extra = sorted(live - documented)
     if not missing and not extra:
@@ -215,6 +239,145 @@ def check_help_current(example_text, help_text):
 
 
 # ── census ────────────────────────────────────────────────────────────────
+
+# `YAML::Node child = parent["key"]` — the parser's block structure, which is
+# what makes a key's FULL path recoverable rather than just its name.
+BIND_RE = re.compile(r'YAML::Node\s+(\w+)\s*=\s*(\w+)\s*\[\s*"([a-z0-9_]+)"\s*\]')
+LOOKUP_RE = re.compile(r'\b(\w+)\s*\[\s*"([a-z0-9_]+)"\s*\]')
+TINT_RE = re.compile(r'readTint\(\s*(\w+)\s*,\s*"([a-z0-9_]+)"')
+FIELD_RE = re.compile(r"cfg\.([A-Za-z_]\w*)")
+
+# A struct field with an initialiser: `float ppExposure = 1.0f;`
+DECL_RE = re.compile(
+    r"^\s{4}(?:bool|int|float|double|std::string|uint\d+_t)\s+([A-Za-z_]\w*)"
+    r"\s*=\s*([^;{]+);", re.M)
+
+# `# [default: 1024]` in the example yaml — states the C++ fallback where the
+# shipped value deliberately differs from it.
+DEFAULT_MARKER_RE = re.compile(r"\[default:\s*([^\]]+)\]")
+
+
+def path_to_field(src_text):
+    """Map each key's FULL dotted path to the `cfg.<field>` it assigns.
+
+    Paths, not bare names, because names collide badly: `enabled` appears in
+    a dozen blocks, `rays` in both realtime and bake, `height` in both
+    render_scale and probes. A name-keyed map reported 14 false mismatches
+    before this existed — every one a collision, not a real divergence.
+    """
+    src = src_text.split("\n")
+    varpath = {"root": ""}     # the parser's own root node
+    out = {}
+    for i, line in enumerate(src):
+        for m in BIND_RE.finditer(line):
+            child, parent, key = m.groups()
+            base = varpath.get(parent)
+            if base is not None:
+                varpath[child] = f"{base}.{key}" if base else key
+        for m in list(LOOKUP_RE.finditer(line)) + list(TINT_RE.finditer(line)):
+            var, key = m.group(1), m.group(2)
+            if var not in varpath or BIND_RE.search(line):
+                continue
+            base = varpath[var]
+            full = f"{base}.{key}" if base else key
+            if full in out:
+                continue
+            for j in range(i, min(i + 5, len(src))):
+                f = FIELD_RE.search(src[j])
+                if f:
+                    out[full] = f.group(1)
+                    break
+    return out
+
+
+def struct_defaults(src_text):
+    return {m.group(1): m.group(2).strip() for m in DECL_RE.finditer(src_text)}
+
+
+def documented_defaults(example_text):
+    """Per-key `[default: X]` markers, read from the example yaml's comments."""
+    out = {}
+    stack = []
+    for raw in example_text.split("\n"):
+        line = raw.rstrip()
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        m = re.match(r"^(\s*)([A-Za-z_][\w]*):(.*)$", line)
+        if not m:
+            continue
+        indent, key, rest = len(m.group(1)), m.group(2), m.group(3)
+        stack[:] = [(i, k) for i, k in stack if i < indent]
+        stack.append((indent, key))
+        marker = DEFAULT_MARKER_RE.search(rest)
+        if marker:
+            out[".".join(k for _, k in stack)] = marker.group(1).strip()
+    return out
+
+
+def _as_value(text):
+    """Normalise a C++ initialiser or a marker into a comparable value."""
+    t = text.strip().rstrip("f").strip('"').strip()
+    if t in ("true", "false"):
+        return t == "true"
+    try:
+        return float(t)
+    except ValueError:
+        return t
+
+
+def check_defaults(src_text, example_text):
+    """E: the struct default is what the example yaml says it is.
+
+    The subtlety this exists for: the example's VALUE is the shipped setting,
+    which is not always the same as the C++ fallback you get by deleting the
+    key. Where they differ deliberately, the comment carries `[default: X]`
+    and that is what gets compared. Where there is no marker, the value is
+    taken as the claim.
+    """
+    fields = struct_defaults(src_text)
+    pathfield = path_to_field(src_text)
+    markers = documented_defaults(example_text)
+    leaves = leaf_paths(yaml.safe_load(example_text))
+
+    problems, checked, unverifiable = [], 0, []
+    for path, value in leaves.items():
+        field = pathfield.get(path)
+        if not field or field not in fields:
+            unverifiable.append((path, "no struct field found"))
+            continue
+        cpp = _as_value(fields[field])
+        claim = _as_value(markers[path]) if path in markers else value
+        if isinstance(claim, (list, dict)) or claim is None:
+            unverifiable.append((path, "sequence — needs a [default: …] marker"))
+            continue
+        if isinstance(claim, str) or isinstance(cpp, str):
+            unverifiable.append((path, f"enum/string vs cfg.{field} = {fields[field]}"))
+            continue
+        checked += 1
+        if isinstance(claim, bool) or isinstance(cpp, bool):
+            if bool(claim) == bool(cpp):
+                continue
+        elif abs(float(claim) - float(cpp)) < 1e-9:
+            continue
+        problems.append((path, field, claim, fields[field],
+                         "marker" if path in markers else "value"))
+
+    print(f"  - defaults: {checked} compared, {len(unverifiable)} not comparable "
+          f"(enums, sequences, unmapped)")
+
+    if not problems:
+        return []
+    out = [f"{len(problems)} key(s) whose documented default is not the "
+           f"struct default:"]
+    for path, field, claim, cpp, src in problems:
+        out.append(f"    {path}")
+        out.append(f"      example {src} says {claim!r}, cfg.{field} = {cpp}")
+    out.append("  Fix: whichever is wrong. If the example's VALUE is a")
+    out.append("  deliberate recommendation that differs from the C++ fallback,")
+    out.append("  state the fallback in the comment as `[default: X]` — then a")
+    out.append("  reader can see both what ships and what deleting the key gives.")
+    return out
+
 
 def field_for_key(src):
     """Map each parsed key to the cfg.<field> its parse site assigns.
@@ -318,8 +481,68 @@ def report(example_text, live_text, deprecated, src):
 
 # ── driver ────────────────────────────────────────────────────────────────
 
+def trace(query, src_text, example_text, live_text):
+    """Answer "where does this value come from?" for one key.
+
+    The question that motivated check E: with four places a value can live,
+    reading any one of them tells you less than you think.
+    """
+    fields = struct_defaults(src_text)
+    pathfield = path_to_field(src_text)
+    markers = documented_defaults(example_text)
+    ex_leaves = leaf_paths(yaml.safe_load(example_text))
+    live_leaves = leaf_paths(yaml.safe_load(live_text)) if live_text else {}
+
+    hits = [p for p in ex_leaves if query in p]
+    if not hits:
+        hits = [p for p in pathfield if query in p]
+    if not hits:
+        print(f"  no config key matching '{query}'")
+        return 1
+
+    src_lines = src_text.split("\n")
+    for path in sorted(hits):
+        field = pathfield.get(path)
+        print(f"\n══ {path}")
+        print(f"  parsed into      cfg.{field}" if field else
+              "  parsed into      (no cfg field found — check the parse site)")
+        if field and field in fields:
+            print(f"  C++ default      {fields[field]}"
+                  f"   <- what you get if the key is ABSENT")
+        if path in markers:
+            print(f"  documented       [default: {markers[path]}] in the example comment")
+        print(f"  example ships    {ex_leaves.get(path, '(absent)')!r}")
+        if live_text is not None:
+            lv = live_leaves.get(path)
+            same = " (same as example)" if lv == ex_leaves.get(path) else " <- TUNED"
+            print(f"  live config      {lv!r}{same if lv is not None else ' (absent)'}")
+        # Clamp range, read from the parse site's clampConfigValue call.
+        if field:
+            for i, line in enumerate(src_lines):
+                if f"cfg.{field}" in line and "clampConfigValue" in "".join(
+                        src_lines[i:i + 3]):
+                    rng = re.search(r"(\w+::k\w+),\s*(\w+::k\w+)",
+                                    "".join(src_lines[i:i + 4]))
+                    if rng:
+                        print(f"  clamped to       {rng.group(1)} .. {rng.group(2)}")
+                    break
+            # Consumers, excluding the parser itself.
+            hits_out = []
+            for root, _, files in os.walk(os.path.join(REPO, "src")):
+                for f in files:
+                    if not f.endswith((".h", ".cpp", ".inl")) or f == "RenderConfig.h":
+                        continue
+                    p = os.path.join(root, f)
+                    with open(p, encoding="utf-8", errors="replace") as fh:
+                        if field in fh.read():
+                            hits_out.append(os.path.relpath(p, REPO))
+            print(f"  read by          {', '.join(hits_out) if hits_out else 'NOTHING OUTSIDE THE PARSER'}")
+    return 0
+
+
 def main():
     args = set(sys.argv[1:])
+    positional = [a for a in sys.argv[1:] if not a.startswith("-")]
     staged = bool(args & {"--staged", "--precommit"})
 
     if "--precommit" in args:
@@ -355,6 +578,11 @@ def main():
             f"every check below would pass without checking anything.\n\n")
         return 1
 
+    if "--trace" in args:
+        if not positional:
+            raise SystemExit("usage: config_audit.py --trace <key-or-substring>")
+        return trace(positional[0], src, example_text, live_text)
+
     if "--report" in args:
         report(example_text, live_text, deprecated, src)
         return 0
@@ -373,8 +601,9 @@ def main():
     problems = []
     problems += check_parser_documented(parsed, documented, deprecated)
     problems += check_no_dead_docs(parsed, documented)
-    problems += check_live_parity(documented, live_text)
+    problems += check_live_parity(example_text, live_text)
     problems += check_help_current(example_text, help_text)
+    problems += check_defaults(src, example_text)
 
     if problems:
         sys.stderr.write("\nCONFIG AUDIT FAILED\n\n")

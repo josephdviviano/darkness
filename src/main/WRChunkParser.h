@@ -205,6 +205,97 @@ inline int countBits(uint32_t src) {
 
 // ── Parser ──
 
+/// Report the static lightmap value distribution, once, at load.
+///
+/// This exists because a wrong assumption shipped without it. VIS-13 set the
+/// halation threshold to 1.0 on the reasoning that "lit world geometry
+/// reaches 2.0 because of the lightmap overbright convention" — true as a
+/// CEILING and misleading as a description, because `fs_lightmapped.sc`
+/// computes `albedo * light * 2.0` and that only exceeds 1.0 where
+/// `albedo * light > 0.5`. The lightmaps are clamped to 1.0 by the atlas, so
+/// even a pure white texture needs light above 0.5 to go overbright at all,
+/// and most of the world is nowhere near it. The effect silently did nothing.
+///
+/// Printing the actual distribution makes "nothing is overbright" a fact you
+/// can read rather than one you have to deduce from an effect not appearing.
+inline void reportLightmapRange(const WRParsedData &wr) {
+    // Histogram of the per-texel MAX channel, which is what decides whether a
+    // texel can push albedo*light*2 over 1.0.
+    size_t hist[16] = {};
+    size_t total = 0;
+    uint8_t peak = 0;
+    size_t atOrAbove248 = 0, atOrAbove128 = 0;
+    for (const auto &cell : wr.cells) {
+        for (const auto &lm : cell.staticLightmaps) {
+            const size_t texels = wr.lightSize == 1
+                ? lm.size() : lm.size() / 2;
+            for (size_t i = 0; i < texels; ++i) {
+                // Decode inline rather than pulling in LightmapAtlas.h: same
+                // two cases as convertLmPixel, and this header is included by
+                // the headless tool too.
+                uint8_t m;
+                if (wr.lightSize == 1) {
+                    m = lm[i];
+                } else {
+                    const uint16_t val =
+                        static_cast<uint16_t>(lm[i * 2] | (lm[i * 2 + 1] << 8));
+                    const uint8_t r = static_cast<uint8_t>((val & 0x1F) << 3);
+                    const uint8_t g = static_cast<uint8_t>(((val >> 5) & 0x1F) << 3);
+                    const uint8_t b = static_cast<uint8_t>(((val >> 10) & 0x1F) << 3);
+                    m = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                }
+                ++hist[m >> 4];
+                if (m > peak) peak = m;
+                if (m >= 248) ++atOrAbove248;
+                if (m >= 128) ++atOrAbove128;
+                ++total;
+            }
+        }
+    }
+    if (total == 0)
+        return;
+
+    auto pct = [&](double frac) {
+        size_t want = static_cast<size_t>(frac * static_cast<double>(total));
+        size_t run = 0;
+        for (int i = 0; i < 16; ++i) {
+            run += hist[i];
+            if (run >= want)
+                return (i * 16 + 8) / 255.0;
+        }
+        return 1.0;
+    };
+
+    // Overbright needs albedo*light > 0.5. Even at albedo 1.0 that means
+    // light > 0.5; at a more typical albedo of 0.6 it means light > 0.83.
+    size_t over50 = 0, over83 = 0;
+    for (int i = 0; i < 16; ++i) {
+        const double v = (i * 16 + 8) / 255.0;
+        if (v > 0.5)  over50 += hist[i];
+        if (v > 0.83) over83 += hist[i];
+    }
+
+    std::fprintf(stderr,
+        "Lightmaps: %zu texels, %s; median %.2f, p95 %.2f, p99 %.2f\n"
+        "  overbright reach: %.2f%% of texels exceed 0.50 (the most a pure "
+        "white texture needs), %.2f%% exceed 0.83 (what a 0.6-albedo surface "
+        "needs). Scene values above 1.0 are therefore RARE — thresholds that "
+        "assume otherwise will silently do nothing.\n",
+        total, wr.lightSize == 1 ? "8-bit grey" : "5:5:5 RGB",
+        pct(0.50), pct(0.95), pct(0.99),
+        100.0 * static_cast<double>(over50) / static_cast<double>(total),
+        100.0 * static_cast<double>(over83) / static_cast<double>(total));
+
+    // The peak decides whether the stored range is used in full, which is
+    // what says whether a x2 multiplier is a normalisation or an
+    // overbrightening. 248 is the ceiling for 5:5:5 data (0x1F << 3).
+    std::fprintf(stderr,
+        "  peak texel %u/255 (%.3f); %.3f%% at the 248 ceiling, %.2f%% >= 128\n",
+        static_cast<unsigned>(peak), peak / 255.0,
+        100.0 * static_cast<double>(atOrAbove248) / static_cast<double>(total),
+        100.0 * static_cast<double>(atOrAbove128) / static_cast<double>(total));
+}
+
 inline WRParsedData parseWRChunk(const std::string &misPath) {
     FilePtr fp(new StdFile(misPath, File::FILE_R));
     FileGroupPtr db(new DarkFileGroup(fp));

@@ -1279,6 +1279,27 @@ static void formatPropRecord(const std::string &propName, int objID,
         std::memcpy(&dampen, bytes + 4, 4);
         std::memcpy(&height, bytes + 8, 4);
         p("eax=%u dampening=%d height=%d", eax, dampen, height);
+    } else if (propName == "Corona" && sz >= sizeof(PropCorona)) {
+        // Canonical 52-byte layout — same struct CoronaSystem reads. The raw
+        // hex fallback truncates at 20 bytes, which cuts off maxDist and
+        // alpha, and those two are what decide whether a record draws at all
+        // and how fast its billboard grows.
+        PropCorona pc; std::memcpy(&pc, bytes, sizeof(pc));
+        char tex[17] = {0};
+        std::memcpy(tex, pc.texture, 16);
+        const bool draws = (pc.alpha > 0.0f) &&
+                           (pc.radiusNear > 0.0f || pc.radiusFar > 0.0f) &&
+                           tex[0] != '\0';
+        // (radiusFar - radiusNear) / maxDist IS the asymptotic apparent
+        // half-angle in radians — how big the glow stays on screen however far
+        // away it is. That single number is what makes two records comparable.
+        const float rate = (pc.maxDist > 1e-4f)
+                               ? (pc.radiusFar - pc.radiusNear) / pc.maxDist
+                               : 0.0f;
+        p("near=%.2f far=%.2f maxDist=%.1f alpha=%.3f tex='%s' flags=%#x "
+          "growth=%.4f rad (%.1f deg half-angle)%s",
+          pc.radiusNear, pc.radiusFar, pc.maxDist, pc.alpha, tex, pc.flags,
+          rate, rate * 57.29578f, draws ? "" : "  [inert]");
     } else if (propName == "AnimLight" && sz >= sizeof(PropAnimLight)) {
         // Canonical 76-byte layout — same struct LightingSystem reads.
         PropAnimLight al; std::memcpy(&al, bytes, sizeof(al));

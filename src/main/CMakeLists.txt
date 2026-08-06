@@ -220,6 +220,18 @@ bgfx_compile_shaders(
     AS_HEADERS
 )
 
+# Film grain — its own final pass after antialiasing (NOTES.FILM_GRAIN.md
+# §9.1). Reuses vs_composite / varying_composite.def.sc.
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_grain.sc
+    VARYING_DEF ${SHADER_DIR}/varying_composite.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR GRAIN_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+
 bgfx_compile_shaders(
     TYPE FRAGMENT
     SHADERS ${SHADER_DIR}/fs_bloom_upsample.sc
@@ -370,6 +382,7 @@ add_custom_target(compile_shaders DEPENDS
     ${COMPOSITE_VS_OUTPUTS} ${COMPOSITE_FS_OUTPUTS}
     ${BLOOM_BLUR_FS_OUTPUTS} ${BLOOM_EXTRACT_FS_OUTPUTS}
     ${BLOOM_DOWNSAMPLE_FS_OUTPUTS} ${BLOOM_UPSAMPLE_FS_OUTPUTS}
+    ${GRAIN_FS_OUTPUTS}
     ${CORONA_VS_OUTPUTS} ${CORONA_FS_OUTPUTS}
     ${SMAA_EDGES_VS_OUTPUTS}   ${SMAA_EDGES_FS_OUTPUTS}
     ${SMAA_WEIGHTS_VS_OUTPUTS} ${SMAA_WEIGHTS_FS_OUTPUTS}

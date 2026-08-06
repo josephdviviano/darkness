@@ -99,14 +99,33 @@ constexpr float kFilmTintMin     = 0.0f, kFilmTintMax     =   1.0f;
 // Halation strength is generous above 1 because it multiplies the bloom
 // texture, whose own level depends on bloom_intensity / bloomscale.
 constexpr float kHalationMin     = 0.0f, kHalationMax     =   4.0f;
-// Halation threshold is in SCENE units, where lit geometry reaches 2.0 — so
-// 1.0 means "brighter than display white". Radius is in output pixels and the
+// Halation threshold is compared against the EXPOSED value. Measured basis:
+// the static lightmaps of five retail missions have a median of 0.03-0.09 and
+// only 0.9-3.8% of texels exceed 0.50, so useful values sit around 0.4-0.9 and
+// 1.0 thresholds out the entire frame. Radius is in output pixels and the
 // ceiling is deliberately tight: halation is the LOCAL glow, and the blur
 // chain tops out near 13 px anyway (see renderHalation).
 constexpr float kHaloThreshMin   = 0.0f, kHaloThreshMax   =   4.0f;
 constexpr float kHaloRadiusMin   = 1.0f, kHaloRadiusMax   =  16.0f;
-constexpr float kGrainMin        = 0.0f, kGrainMax        =   0.5f;
+// Physical amplitude. `strength` is dimensionally mu_r/sigma, so the model's
+// validity condition sigma >= 3*mu_r reads strength <= 1/3 — and report §4.4's
+// sigma_n <= 0.076 ceiling lands in the same place. Stylisation beyond this
+// belongs in grain.gain, which is deliberately outside the physical model.
+constexpr float kGrainMin        = 0.0f, kGrainMax        = 0.3333f;
+constexpr float kGrainGainMin    = 0.0f, kGrainGainMax    =   4.0f;
 constexpr float kGrainSizeMin    = 0.25f, kGrainSizeMax   =   8.0f;
+// Negative-film shadow weighting, pow(1 - luma, bias). 1 is a straight ramp;
+// higher confines the grain to the shadows. Always zero at white.
+// 0 IS reachable and means a normally-processed stock (the physical curve
+// alone). It was clamped to 0.25 while the shader documented 0 as valid,
+// which made the physical baseline impossible to A/B.
+constexpr float kGrainBiasMin    = 0.0f, kGrainBiasMax    =   6.0f;
+// Lightmap "2X modulate" multiplier. 1.0 is correct for everything we can
+// currently load (WR and WRRGB) and is the only value that agrees with the
+// object and sky passes. 2.0 is what 32-bit 2X lightmaps want, and becomes a
+// per-mission value once WREXT lands (WR-1). Above 2 is beyond anything the
+// format describes and is purely a look choice.
+constexpr float kLightmapScaleMin = 0.25f, kLightmapScaleMax = 4.0f;
 // Sky glow intensity multiplier. Ceiling is generous because the useful
 // range depends entirely on what glow_scale a given mission authored, and
 // that varies.
@@ -132,6 +151,12 @@ namespace CoronaRange {
 constexpr float kIntensityMin  = 0.0f, kIntensityMax  = 8.0f;
 constexpr float kSizeMin       = 0.0f, kSizeMax       = 4.0f;
 constexpr float kMaxDistMin    = 0.1f, kMaxDistMax    = 4.0f;
+// Physical model's reference distance, WORLD UNITS (not a multiplier). The
+// floor is deliberately above zero: at 0 the curve returns radiusNear, which
+// is its smallest value, and every corona would collapse. The ceiling is the
+// synthesized size curve's own 48-unit reference, past which the curve clamps
+// and the knob stops doing anything.
+constexpr float kRefDistMin    = 1.0f, kRefDistMax    = 48.0f;
 // Occlusion crossfade. 0 means "snap", which is the original engine's own
 // behaviour and worth being able to reproduce; the ceiling is well past
 // anything that reads as responsive.
@@ -276,6 +301,12 @@ struct RenderConfig {
     // 0 = crt (Rec.601-era, original colour intent), 1 = lcd (Rec.709).
     int   ppLumaMode      = 0;
 
+    // Lightmap multiplier — see RuntimeState::lightmapScale. 1.0 is correct:
+    // it is what retail 16-bit lightmaps are authored for AND the only value
+    // that puts world geometry on the same fullbright reference as objects
+    // and sky. Put brightness in `exposure`, which lifts all three together.
+    float lightmapScale = 1.0f;
+
     // -- graphics.post_process.bloom -- (defaults are HPL2's shipped values)
     bool  ppBloom           = false;
     int   ppBloomStyle      = 0;    // 0 = amnesia (HPL2), 1 = newdark
@@ -308,10 +339,12 @@ struct RenderConfig {
     // -- graphics.post_process.halation / .grain --
     float ppHalationStrength = 0.0f;
     float ppHalationTint[3]  = { 1.0f, 0.32f, 0.12f };
-    float ppHalationThreshold = 1.0f;
+    float ppHalationThreshold = 0.6f;
     float ppHalationRadius    = 10.0f;
     float ppGrainStrength    = 0.0f;
     float ppGrainSize        = 1.5f;
+    float ppGrainShadowBias  = 1.0f;
+    float ppGrainGain        = 1.0f;
 
     // -- graphics.sky_glow -- SKYOBJVAR sun/moon glow disc
     bool  skyGlow          = true;
@@ -335,6 +368,11 @@ struct RenderConfig {
     float coronaIntensity     = 1.0f;
     float coronaSizeScale     = 1.0f;
     float coronaMaxDistScale  = 1.0f;
+    // Mirrors Darkness::CoronaDistanceModel — keep the two in step.
+    // 0 = engine (original growth to constant apparent size), 1 = physical
+    // (constant world radius; the glare shrinks like the lamp does).
+    int   coronaDistanceModel = 1;
+    float coronaRefDistance   = 20.0f;  // physical model only, world units
     float coronaFadeSeconds   = 0.15f;
     int   coronaTraceSamples  = 5;
     int   coronaTraceBudget   = 32;
@@ -890,6 +928,12 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                 if      (val == "bicubic")  cfg.lightmapFiltering = 1;
                 else                        cfg.lightmapFiltering = 0; // "bilinear" or unknown → default
             }
+            if (gfx["lightmap_scale"]) {
+                cfg.lightmapScale = clampConfigValue(
+                    gfx["lightmap_scale"].as<float>(),
+                    PostRange::kLightmapScaleMin, PostRange::kLightmapScaleMax,
+                    "graphics.lightmap_scale");
+            }
             if (gfx["tweq_visibility_gating"])
                 cfg.tweqVisibilityGating = gfx["tweq_visibility_gating"].as<bool>();
             if (gfx["linear_mips"])  cfg.linearMips = gfx["linear_mips"].as<bool>();
@@ -1005,6 +1049,26 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                         co["max_distance_scale"].as<float>(),
                         CoronaRange::kMaxDistMin, CoronaRange::kMaxDistMax,
                         "graphics.coronas.max_distance_scale");
+                }
+                if (co["distance_model"]) {
+                    std::string val = co["distance_model"].as<std::string>();
+                    if      (val == "engine")   cfg.coronaDistanceModel = 0;
+                    else if (val == "physical") cfg.coronaDistanceModel = 1;
+                    else {
+                        std::fprintf(stderr,
+                            "[FALLBACK] config: graphics.coronas.distance_model "
+                            "= '%s' is not one of engine|physical — using "
+                            "'physical'. Coronas will hold a constant world "
+                            "size rather than the engine's growth.\n",
+                            val.c_str());
+                        cfg.coronaDistanceModel = 1;
+                    }
+                }
+                if (co["physical_reference_distance"]) {
+                    cfg.coronaRefDistance = clampConfigValue(
+                        co["physical_reference_distance"].as<float>(),
+                        CoronaRange::kRefDistMin, CoronaRange::kRefDistMax,
+                        "graphics.coronas.physical_reference_distance");
                 }
                 if (co["fade_seconds"]) {
                     cfg.coronaFadeSeconds = clampConfigValue(
@@ -1276,6 +1340,31 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                             gr["strength"].as<float>(),
                             PostRange::kGrainMin, PostRange::kGrainMax,
                             "graphics.post_process.grain.strength");
+                    }
+                    // Renamed from `shadow_bias`: it is one factor of the
+                    // amplitude now, not the whole weighting, and 0 is a
+                    // meaningful value (normally-processed stock) where the
+                    // old key's floor was 0.25.
+                    if (gr["shadow_bias"]) {
+                        std::fprintf(stderr,
+                            "[FALLBACK] config: graphics.post_process.grain."
+                            "shadow_bias was renamed to `push` — it is now one "
+                            "factor of the amplitude rather than the whole "
+                            "weighting, and 0 is valid (a normally-processed "
+                            "stock). The value here is IGNORED; move it to "
+                            "`push`.\n");
+                    }
+                    if (gr["push"]) {
+                        cfg.ppGrainShadowBias = clampConfigValue(
+                            gr["push"].as<float>(),
+                            PostRange::kGrainBiasMin, PostRange::kGrainBiasMax,
+                            "graphics.post_process.grain.push");
+                    }
+                    if (gr["gain"]) {
+                        cfg.ppGrainGain = clampConfigValue(
+                            gr["gain"].as<float>(),
+                            PostRange::kGrainGainMin, PostRange::kGrainGainMax,
+                            "graphics.post_process.grain.gain");
                     }
                     if (gr["size"]) {
                         cfg.ppGrainSize = clampConfigValue(

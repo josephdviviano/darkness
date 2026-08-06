@@ -63,7 +63,6 @@ SAMPLER2D(s_texHalation, 2);
 // u_filmTintHi:  rgb = highlight tint (multiplicative), a = unused
 // u_halation:    rgb = halation tint, a = strength (0 = off, and also 0
 //                when the halation pass did not run this frame)
-// u_grain:       x = strength (0 = off), y = size in pixels, z = time seconds
 uniform vec4 u_ccParams0;
 uniform vec4 u_ccParams1;
 uniform vec4 u_ccFilter;
@@ -75,7 +74,6 @@ uniform vec4 u_filmParams;
 uniform vec4 u_filmTintLo;
 uniform vec4 u_filmTintHi;
 uniform vec4 u_halation;
-uniform vec4 u_grain;
 
 vec3 tonemapReinhard(vec3 c)
 {
@@ -333,15 +331,6 @@ vec3 filmResponse(vec3 color)
 	return color;
 }
 
-// Cheap hash for grain. Not a good general-purpose RNG — good enough for
-// per-pixel noise, which only needs to be uncorrelated to the eye.
-float hash21(vec2 p)
-{
-	p = fract(p * vec2(123.34, 456.21));
-	p += dot(p, p + 45.32);
-	return fract(p.x * p.y);
-}
-
 void main()
 {
 	vec3 color = texture2D(s_texScene, v_texcoord0).rgb;
@@ -473,23 +462,10 @@ void main()
 	//    cc.fx: saturate((vColor.xyz - 0.5) * g_fContrast + 0.5 + g_fBrightness)
 	color = clamp((color - 0.5) * u_ccParams1.y + 0.5 + u_ccParams1.x, 0.0, 1.0);
 
-	// ── Grain ──
-	// Last, in display space. Physically grain belongs to the negative and so
-	// ought to precede the curve, but put there the contrast stage reshapes
-	// it and the strength knob stops meaning anything; every practical
-	// implementation puts it here, and so does this one.
-	//
-	// ADDITIVE and weighted toward the shadows. Multiplicative grain vanishes
-	// in the blacks — it has nothing to multiply — which is the opposite of
-	// pushed film, where the shadows are exactly where grain lives.
-	if (u_grain.x > 0.0)
-	{
-		float g = hash21(gl_FragCoord.xy / max(u_grain.y, 0.25)
-		                 + vec2(u_grain.z, u_grain.z * 1.7));
-		float Lg = dot(color, u_lumaWeights.rgb);
-		float w = pow(1.0 - clamp(Lg, 0.0, 1.0), 1.5);
-		color = clamp(color + (g - 0.5) * u_grain.x * w, 0.0, 1.0);
-	}
+	// Grain used to be here. It now runs as its OWN pass AFTER antialiasing
+	// (kViewGrain, fs_grain.sc) — applied here it sat before SMAA, so SMAA
+	// antialiased it and its strength depended on whether AA was enabled.
+	// See NOTES.FILM_GRAIN.md §9.1.
 
 	gl_FragColor = vec4(color, 1.0);
 }
