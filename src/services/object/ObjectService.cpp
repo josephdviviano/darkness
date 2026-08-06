@@ -36,6 +36,7 @@
 
 #include "logger.h"
 
+#include <cstdio>
 #include <vector>
 
 namespace Darkness {
@@ -102,10 +103,19 @@ Vector3 ObjectService::position(int objID) {
 Quaternion ObjectService::orientation(int objID) {
     Variant res;
 
-    if (mPropPosition->get(objID, "orientation", res)) {
+    // "facing", not "orientation" — that is the name PositionPropertyStorage
+    // registers for the field, and asking for the other one always missed, so
+    // this returned the identity quaternion for every object in the level.
+    // Silent, because an identity rotation is a perfectly plausible answer.
+    if (mPropPosition->get(objID, "facing", res)) {
         return res.toQuaternion();
-    } else
+    } else {
+        std::fprintf(stderr,
+            "[FALLBACK] ObjectService::orientation(%d): no P$Position facing — "
+            "returning identity, so anything oriented by it draws unrotated\n",
+            objID);
         return Quaternion(1.0f, 0.0f, 0.0f, 0.0f);
+    }
 }
 
 //------------------------------------------------------

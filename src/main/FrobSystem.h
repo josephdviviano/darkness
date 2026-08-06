@@ -25,9 +25,18 @@
 // object. When the player right-clicks, dispatches the appropriate action
 // (door toggle, script message, pickup, etc.).
 //
-// The frob ray tests both world geometry (via RayCaster portal BFS) and
-// object OBBs (via ObjectCollisionGeometry ray-vs-OBB). The nearest hit
-// that has a FrobInfo property or is a door becomes the frob target.
+// The frob ray tests object OBBs (via ObjectCollisionGeometry ray-vs-OBB).
+// The nearest hit that has a FrobInfo property or is a door becomes the frob
+// target. World geometry is NOT tested — nothing here consults RayCaster — so
+// there is no line-of-sight check and a frobbable close behind a thin wall is
+// still reachable. Flagged as a placeholder in DESIGN_DOC.md.
+//
+// Doors get their own exact ray-vs-leaf test (rayVsDoorLeaf) rather than the
+// proximity cone the other cached frobbables use. A door is the one frobbable
+// that TRAVELS: a swung leaf ends up a door's width away from where it was
+// placed, and its ObjectState position stays at the hinge-anchored base by
+// design (DoorSystem::applyDoorTransform), so neither the placement cache nor
+// the live query position points at what the player is looking at.
 //
 // Visual feedback: the frob target's object name is shown as debug text.
 // Full HUD integration (crosshair highlight, use prompt) deferred to later.
@@ -142,6 +151,7 @@ public:
                 entry.objID = objID;
                 entry.worldAction = kFrobScript;
                 entry.position = Vector3(placement.x, placement.y, placement.z);
+                entry.isDoor = true;
                 mFrobCache.push_back(entry);
                 doorCount++;
             }
@@ -208,32 +218,40 @@ public:
 
             // This is the new best frob target
             bestT = result.t;
-            mTarget.objID = body.objID;
-            mTarget.distance = result.t * mFrobDistance;
-            mTarget.hitPoint = result.point;
-            mTarget.isDoor = isDoor;
-            mTarget.frobActions = frobActions;
-
-            // Get display name
-            if (mObjSvc) {
-                mTarget.name = mObjSvc->getName(body.objID);
-                if (mTarget.name.empty()) {
-                    mTarget.name = "obj " + std::to_string(body.objID);
-                    static int w = 0; if (w++ < 10)
-                        std::fprintf(stderr, "[DEFAULT] FrobSystem: obj %d has no name, using fallback '%s'\n",
-                                     body.objID, mTarget.name.c_str());
-                }
-            }
+            setTarget(body.objID, result.t * mFrobDistance, result.point,
+                      isDoor, frobActions);
         }
         } // end mCollisionWorld
 
-        // ── Proximity-based frob for all frobbable objects ──
-        // Most frobbable objects (levers, switches, books, doors) are small and
-        // may lack collision bodies. Use the pre-built frob cache with a cone
-        // test from the crosshair direction. This also covers doors (which are
-        // brush geometry without OBB collision bodies).
+        // ── Cached frobbables: doors exactly, everything else by cone ──
+        // Most frobbable objects (levers, switches, books) are small and may
+        // lack collision bodies, so they fall back to a cone test from the
+        // crosshair direction. Doors take the exact leaf test instead — they
+        // move too far from their placement point for a cone around it to
+        // mean anything (see rayVsDoorLeaf).
         if (!mFrobCache.empty()) {
             for (const auto &entry : mFrobCache) {
+                if (entry.isDoor) {
+                    RayOBBResult leafHit;
+                    if (rayVsDoorLeaf(entry.objID, rayStart, rayEnd, leafHit)) {
+                        if (leafHit.hit && leafHit.t < bestT) {
+                            bestT = leafHit.t;
+                            setTarget(entry.objID, leafHit.t * mFrobDistance,
+                                      leafHit.point, true, entry.worldAction);
+                        }
+                        continue;  // exact test done — no cone for this door
+                    }
+                    // No usable leaf bounds. The cone below is all this door
+                    // has, and it aims at the placement point — which is the
+                    // very bug the exact test exists to fix, so say so.
+                    static int boundsWarn = 0;
+                    if (boundsWarn++ < 10)
+                        std::fprintf(stderr,
+                            "[FALLBACK] FrobSystem: door %d has no usable leaf bounds "
+                            "(zero edgeLengths) — frob targeting falls back to a cone "
+                            "around its CLOSED placement point\n", entry.objID);
+                }
+
                 // Prefer the live runtime position if the StateMap has one;
                 // fall back to the load-time placement for objects that
                 // have never been touched. Without this, dropped or thrown
@@ -241,7 +259,16 @@ public:
                 Vector3 objPos = entry.position;
                 if (mStates) {
                     if (const ObjectState *s = mStates->tryGet(entry.objID)) {
-                        objPos = s->position;
+                        // The composed matrix's origin, not the query
+                        // position: a sim system may deliberately answer
+                        // position queries with something other than where
+                        // the visual sits (a rotating door reports its
+                        // hinge-anchored base). What the player aims at is
+                        // the visual.
+                        objPos = s->hasMatrix
+                            ? Vector3(s->modelMatrix[12], s->modelMatrix[13],
+                                      s->modelMatrix[14])
+                            : s->position;
                     }
                 }
                 Vector3 toObj = objPos - rayStart;
@@ -262,16 +289,9 @@ public:
                     continue;
 
                 bestT = t;
-                mTarget.objID = entry.objID;
-                mTarget.distance = dist;
-                mTarget.hitPoint = objPos;
-                mTarget.isDoor = (mDoorSys && mDoorSys->isDoor(entry.objID));
-                mTarget.frobActions = entry.worldAction;
-                if (mObjSvc) {
-                    mTarget.name = mObjSvc->getName(entry.objID);
-                    if (mTarget.name.empty())
-                        mTarget.name = "obj " + std::to_string(entry.objID);
-                }
+                setTarget(entry.objID, dist, objPos,
+                          mDoorSys && mDoorSys->isDoor(entry.objID),
+                          entry.worldAction);
             }
         }
     }
@@ -339,6 +359,51 @@ public:
     void setScriptManager(ScriptManager *sm) { mScriptManager = sm; }
 
 private:
+    /// Ray-vs-door-leaf at the door's CURRENT pose.
+    ///
+    /// DoorSystem already publishes the leaf box its audio occluder uses —
+    /// edgeLengths in final world size, paired with a rigid (unscaled)
+    /// transform. Testing frob against that same box means the slab that
+    /// blocks sound and the slab the player can reach are one object in one
+    /// place, at every point in the swing.
+    ///
+    /// Returns false when the door has no usable bounds, leaving the caller
+    /// to fall back to the proximity cone.
+    bool rayVsDoorLeaf(int32_t objID, const Vector3 &rayStart,
+                       const Vector3 &rayEnd, RayOBBResult &out) const {
+        if (!mDoorSys) return false;
+        const DoorState *door = mDoorSys->getDoor(objID);
+        if (!door || glm::length(door->edgeLengths) < 0.01f)
+            return false;
+
+        // The leaf box is centred on the model origin — the same assumption
+        // DoorSystem's audio occluder makes (buildBoxMesh centres on the
+        // origin), and what a pivotOffset of -width/2 encodes.
+        out = rayVsBoxPose(mDoorSys->getCurrentWorldMatrix(objID),
+                           door->edgeLengths,  // already post-scale world size
+                           rayStart, rayEnd);
+        return true;
+    }
+
+    /// Record the frob target, resolving its display name.
+    void setTarget(int32_t objID, float distance, const Vector3 &hitPoint,
+                   bool isDoor, uint32_t frobActions) {
+        mTarget.objID = objID;
+        mTarget.distance = distance;
+        mTarget.hitPoint = hitPoint;
+        mTarget.isDoor = isDoor;
+        mTarget.frobActions = frobActions;
+
+        if (!mObjSvc) return;
+        mTarget.name = mObjSvc->getName(objID);
+        if (mTarget.name.empty()) {
+            mTarget.name = "obj " + std::to_string(objID);
+            static int w = 0; if (w++ < 10)
+                std::fprintf(stderr, "[DEFAULT] FrobSystem: obj %d has no name, using fallback '%s'\n",
+                             objID, mTarget.name.c_str());
+        }
+    }
+
     PropertyService *mPropSvc = nullptr;
     ObjectService *mObjSvc = nullptr;
     DoorSystem *mDoorSys = nullptr;
@@ -354,7 +419,8 @@ private:
     struct FrobCacheEntry {
         int32_t objID;
         uint32_t worldAction;
-        Vector3 position;  // from allPlacements at load time
+        Vector3 position;   // from allPlacements at load time
+        bool isDoor = false;  // doors take the exact leaf test, not the cone
     };
     std::vector<FrobCacheEntry> mFrobCache;
 };

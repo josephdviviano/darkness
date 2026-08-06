@@ -280,6 +280,7 @@ static bool loadMissionData(const char *misPath,
     std::fprintf(stderr, "Loading WR geometry from %s...\n", misPath);
     try {
         mission.wrData = Darkness::parseWRChunk(misPath);
+        Darkness::reportLightmapRange(mission.wrData);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "Failed to parse WR chunk: %s\n", e.what());
         return false;
@@ -1039,6 +1040,8 @@ static bool createGPUResources(const Darkness::MissionData &mission,
     gpu.u_objectLight  = bgfx::createUniform("u_objectLight",  bgfx::UniformType::Vec4);
     // Atlas dimensions for bicubic shader texel-space calculations
     gpu.u_lmAtlasSize = bgfx::createUniform("u_lmAtlasSize", bgfx::UniformType::Vec4);
+    gpu.u_lightmapScale =
+        bgfx::createUniform("u_lightmapScale", bgfx::UniformType::Vec4);
 
     // Per-object light array uniforms feeding the per-vertex shaders.
     // Array sizes come from the shared OBJECT_LIGHT_CAP constant
@@ -1524,10 +1527,12 @@ static void initCoronas(const Darkness::MissionData &mission,
     }
 
     Darkness::parseAuthoredCoronas(propSvc.get(), objSvc.get(),
-                                   state.objectStates, state.coronas);
+                                   state.objectStates, mission.objData,
+                                   mission.parsedModels, state.coronas);
     if (synthesized) {
         Darkness::synthesizeCoronas(propSvc.get(), objSvc.get(),
                                     state.objectStates, mission.objData,
+                                    mission.parsedModels,
                                     mission.lightSources, state.coronas);
     }
     Darkness::finalizeCoronas(state.coronas);
@@ -1537,6 +1542,31 @@ static void initCoronas(const Darkness::MissionData &mission,
         state.coronas.authoredCount, state.coronas.synthCount,
         state.coronas.defs.size(),
         synthesized ? "" : " (synthesis disabled)");
+
+    // Where each glow hangs. An origin-anchored corona is drawn at the object's
+    // pivot rather than at the light — on a streetlamp that is 4 units down at
+    // the foot of the post — so this line is how "my coronas are in the wrong
+    // place" gets diagnosed without a debugger.
+    if (!state.coronas.defs.empty()) {
+        std::fprintf(stderr,
+            "  anchors: %d at the model's light vhot, %d at the object origin "
+            "(model names no vhot %u), %d from an authored offset\n",
+            state.coronas.anchorVHot, state.coronas.anchorOrigin,
+            Darkness::kVHotLight, state.coronas.anchorOther);
+
+        // And how big each one draws. The two models differ by 32x at 300
+        // units, so "coronas look wrong" is nearly always answered by this
+        // line before anything else.
+        const bool physical = state.coronaSettings.distanceModel ==
+                              Darkness::CoronaDistanceModel::Physical;
+        std::fprintf(stderr,
+            "  size: %s\n",
+            physical
+                ? "PHYSICAL — constant world radius, shrinks like the lamp "
+                  "(veiling-glare model; diverges from the original engine)"
+                : "ENGINE — grows radiusNear->radiusFar over maxDist, holding "
+                  "a constant apparent size (original Thief 2 behaviour)");
+    }
 
     if (state.coronas.defs.empty()) return;
 
@@ -1710,6 +1740,7 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
     bgfx::destroy(gpu.u_objectParams);
     bgfx::destroy(gpu.u_objectLight);
     bgfx::destroy(gpu.u_lmAtlasSize);
+    bgfx::destroy(gpu.u_lightmapScale);
     bgfx::destroy(gpu.u_objectLightCount);
     bgfx::destroy(gpu.u_objectAmbient);
     bgfx::destroy(gpu.u_objectLightLoc);

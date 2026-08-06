@@ -364,6 +364,18 @@ public:
         return computeAudioWorldMatrixAt(it->second, it->second.closedValue);
     }
 
+    /// The door's world transform at its CURRENT pose — same rigid (no
+    /// scale) convention as getClosedWorldMatrix, so it pairs directly with
+    /// DoorState::edgeLengths, which are already post-scale world dimensions.
+    /// This is the leaf box the audio occluder uses; frob targeting tests
+    /// against the same one, so what blocks sound and what the player can
+    /// reach are the same slab in the same place. Identity if unknown.
+    Matrix4 getCurrentWorldMatrix(int32_t objID) const {
+        auto it = mDoors.find(objID);
+        if (it == mDoors.end()) return Matrix4(1.0f);
+        return computeAudioWorldMatrix(it->second);
+    }
+
     /// Get all door IDs (for debug enumeration).
     std::vector<int32_t> getAllDoorIDs() const {
         std::vector<int32_t> ids;

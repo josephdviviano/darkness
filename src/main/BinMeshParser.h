@@ -94,6 +94,29 @@ struct BinSubObject {
     int16_t  next;        // next sibling sub-object, or -1
 };
 
+// One LGMD attachment point — a "vhot" in the engine's vocabulary. Artists
+// place these to mark a spot on the model that gameplay needs to name: where a
+// torch's flame sits, where an AI holds a sword, where a lamp emits light.
+//
+// `index` is the engine's SLOT NUMBER, not the position in the array. The two
+// disagree in practice and the distinction is load-bearing: STRLANT.BIN stores
+// index 3 at slot 0 and index 1 at slot 1, while GASLITE2.BIN stores the same
+// two indices in the opposite order. A consumer that took "the first vhot"
+// would read the wrong point on one of them. Always match on `index`.
+//
+// Slot 1 is the light position — see kVHotLight in CoronaSystem.h for the
+// measurement that established it.
+struct BinVHot {
+    uint32_t index;
+    // Owning sub-object. `point` is in THAT part's local space, so a vhot on a
+    // moving part must be pushed through the part's frame to reach model space;
+    // findVHotModelSpace() in SubObjectPose.h does that. LITEBEAK.BIN is the
+    // case that makes it matter — both its vhots hang off a rotating part whose
+    // axle sits 4.27 units off the model origin.
+    int      subObj;
+    float    point[3];
+};
+
 // Result of parsing a single .bin model file
 struct ParsedBinMesh {
     std::vector<BinVert> vertices;
@@ -110,6 +133,9 @@ struct ParsedBinMesh {
     // The sub-object table, in file order. Entry 0 is the model root. Empty
     // only when the model has no geometry at all.
     std::vector<BinSubObject> subObjects;
+    // Attachment points, in file order. Empty for the 1531 of 1783 stock
+    // models that carry none.
+    std::vector<BinVHot> vhots;
     bool valid; // false if parsing failed
 };
 
@@ -232,6 +258,11 @@ private:
         readSubObjects();
 
         exportSubObjects(result);
+
+        // Attachment points. After readSubObjects, because each vhot's local
+        // space is its owning sub-object's and only the sub-object table says
+        // which one that is.
+        readVHots(result);
 
         // Walk BSP tree for each sub-object, collecting polygons per
         // (sub-object, material) pair.
@@ -378,6 +409,53 @@ private:
             bs.child = s.child_sub_obj;
             bs.next = s.next_sub_obj;
             result.subObjects.push_back(bs);
+        }
+    }
+
+    // Read the vhot table and attribute each entry to the sub-object that owns
+    // it, via that sub-object's [vhot_start, vhot_start + sub_num_vhots) range.
+    //
+    // Ranges are applied in table order and later writes win. That is not
+    // arbitrary: a parent whose own count is zero still stores a start index
+    // (LITEBEAK.BIN's root says start=0 count=0 while its child says start=0
+    // count=2), so "last non-empty range covering this slot" is the reading
+    // that lands both vhots on the child, where the geometry actually is.
+    void readVHots(ParsedBinMesh &result) {
+        if (mHdr.num_vhots == 0) return;
+
+        const size_t start = static_cast<size_t>(mHdr.offset_vhots);
+        const size_t bytes = static_cast<size_t>(mHdr.num_vhots) * 16;
+        if (start >= mFileSize || bytes > mFileSize - start) {
+            std::fprintf(stderr,
+                "[FALLBACK] BinMeshParser: vhot table (%u entries at %zu) runs "
+                "past the end of a %zu-byte model — no attachment points read, "
+                "so anything anchored to one falls back to the model origin\n",
+                mHdr.num_vhots, start, mFileSize);
+            return;
+        }
+
+        result.vhots.resize(mHdr.num_vhots);
+        mFile->seek(mHdr.offset_vhots);
+        for (auto &v : result.vhots) {
+            VHotObj raw;
+            *mFile >> raw;
+            v.index    = raw.index;
+            v.subObj   = 0;
+            v.point[0] = raw.point.x;
+            v.point[1] = raw.point.y;
+            v.point[2] = raw.point.z;
+        }
+
+        for (size_t s = 0; s < mSubObjects.size(); ++s) {
+            const int first = mSubObjects[s].vhot_start;
+            const int count = mSubObjects[s].sub_num_vhots;
+            if (first < 0 || count <= 0) continue;
+            for (int j = first;
+                 j < first + count && j < static_cast<int>(result.vhots.size());
+                 ++j) {
+                result.vhots[static_cast<size_t>(j)].subObj =
+                    static_cast<int>(s);
+            }
         }
     }
 

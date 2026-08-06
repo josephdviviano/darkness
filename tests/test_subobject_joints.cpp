@@ -281,6 +281,72 @@ TEST_CASE("SubObjectPose: meshJointsAtRest tracks only the joints the mesh uses"
     REQUIRE_FALSE(Darkness::meshJointsAtRest(mesh, mine, 6));
 }
 
+// ── Attachment points (vhots) ──
+
+namespace {
+
+Darkness::BinVHot makeVHot(uint32_t index, int subObj, Vector3 pt) {
+    Darkness::BinVHot v = {};
+    v.index = index;
+    v.subObj = subObj;
+    v.point[0] = pt.x; v.point[1] = pt.y; v.point[2] = pt.z;
+    return v;
+}
+
+} // namespace
+
+TEST_CASE("VHot lookup matches the engine index, not the array position",
+          "[SubObject][VHot]") {
+    // STRLANT.BIN stores index 3 first and index 1 second; GASLITE2.BIN stores
+    // the same pair the other way round. Reading "the first vhot" would put a
+    // streetlamp's corona 2.5 units above its lamp head on one of them.
+    ParsedBinMesh mesh = {};
+    mesh.subObjects.push_back(makeRoot());
+    mesh.vhots.push_back(makeVHot(3, 0, Vector3(-0.046f, -0.007f, 6.491f)));
+    mesh.vhots.push_back(makeVHot(1, 0, Vector3(-0.046f,  0.020f, 3.986f)));
+
+    Vector3 out(0.0f);
+    REQUIRE(Darkness::findVHotModelSpace(mesh, 1, nullptr, 0, out));
+    REQUIRE(out.z == Approx(3.986f));
+
+    REQUIRE(Darkness::findVHotModelSpace(mesh, 3, nullptr, 0, out));
+    REQUIRE(out.z == Approx(6.491f));
+}
+
+TEST_CASE("VHot lookup reports absence rather than inventing a point",
+          "[SubObject][VHot]") {
+    // 1531 of the 1783 stock models carry no vhot at all, and a caller must be
+    // able to tell "no light attachment" from "one at the origin".
+    ParsedBinMesh mesh = {};
+    mesh.subObjects.push_back(makeRoot());
+    mesh.vhots.push_back(makeVHot(3, 0, Vector3(0.0f, 0.0f, 1.6f)));
+
+    Vector3 out(9.0f);
+    REQUIRE_FALSE(Darkness::findVHotModelSpace(mesh, 1, nullptr, 0, out));
+
+    ParsedBinMesh empty = {};
+    empty.subObjects.push_back(makeRoot());
+    REQUIRE_FALSE(Darkness::findVHotModelSpace(empty, 1, nullptr, 0, out));
+}
+
+TEST_CASE("A vhot on a moving part rides that part's frame",
+          "[SubObject][VHot]") {
+    // LITEBEAK.BIN hangs both its vhots off a rotating part whose axle sits
+    // 4.27 units off the model origin. Reading the stored point as model space
+    // would drop the attachment back at the pivot.
+    ParsedBinMesh mesh = singleJointMesh(Darkness::kSubObjRotate, 0);
+    mesh.vhots.push_back(makeVHot(1, 1, Vector3(2.0f, 0.0f, 0.0f)));
+
+    Vector3 out(0.0f);
+    REQUIRE(Darkness::findVHotModelSpace(mesh, 1, nullptr, 0, out));
+
+    // The part's local X maps to world +Z and its axle is at (5,0,0), so a
+    // point 2 along local X lands 2 above the axle.
+    REQUIRE(out.x == Approx(5.0f));
+    REQUIRE(out.y == Approx(0.0f));
+    REQUIRE(out.z == Approx(2.0f));
+}
+
 // ── Joints tweq ──
 
 namespace {

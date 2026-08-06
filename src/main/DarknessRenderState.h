@@ -199,6 +199,7 @@ struct GPUResources {
     bgfx::UniformHandle u_objectParams = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_objectLight  = BGFX_INVALID_HANDLE;  // .rgb = per-object lighting tint (scalar path)
     bgfx::UniformHandle u_lmAtlasSize  = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_lightmapScale = BGFX_INVALID_HANDLE;
 
     // Per-object light array uniforms (per-vertex path). Sized at
     // creation by kObjectLightCap (single source of truth in
@@ -323,9 +324,10 @@ constexpr uint32_t kUniformCostObjectScalarDraw =
     uniformAlignUp(128u) + uniformAlignUp(64u);
 
 // World draw (lightmapped / textured / flat): vs = u_modelView +
-// u_modelViewProj (128); fs ≤ u_fogColor + u_fogParams + u_lmAtlasSize (48).
+// u_modelViewProj (128); fs ≤ u_fogColor + u_fogParams + u_lmAtlasSize
+// + u_lightmapScale (64).
 constexpr uint32_t kUniformCostWorldDraw =
-    uniformAlignUp(128u) + uniformAlignUp(48u);
+    uniformAlignUp(128u) + uniformAlignUp(64u);
 
 // Water draw: vs = u_modelView + u_modelViewProj + u_waterParams +
 // u_waterFlow (160); fs = u_waterParams + u_fogColor + u_fogParams (48).
@@ -357,7 +359,40 @@ struct RuntimeState {
     bool  portalCulling = true;
     bool  cameraCollision = false;
     int   filterMode = 0;
+    /// Frames drawn since startup. Currently only the grain seed uses it,
+    /// but it is the right shape for anything needing a per-frame sequence
+    /// (temporal AA jitter, alternating-frame work), so it lives here rather
+    /// than as a static hidden inside one pass.
+    uint32_t frameIndex = 0;
+
     int   lightmapFiltering = 0;  // 0=bilinear (default), 1=bicubic
+
+    /// Multiplier on the lightmap in the world shaders — the "2X modulate"
+    /// factor. See graphics.lightmap_scale and NOTES.PROJECT.md "Lightmap
+    /// scale".
+    ///
+    /// **1.0 is correct, and the decisive argument is internal, not
+    /// historical.** Three passes render into the same target and only one
+    /// of them disagreed about what "fully lit" means:
+    ///
+    ///   world geometry   albedo * light * scale      -> 2.0 at scale 2
+    ///   objects          albedo * min(light, 1.0)    -> 1.0   (clamped in
+    ///                    ObjectIlluminator and again in the vertex shader)
+    ///   sky             texture * sky_overbright     -> 1.0   (default 1)
+    ///
+    /// At scale 2 a wall reached twice the brightness of a crate leaning
+    /// against it under the same torch, and the sky sat a full stop below
+    /// both. NewDark's docs and OPDE independently say x1 for 16-bit
+    /// lightmaps, but even without them this is the only value that makes
+    /// the frame self-consistent.
+    ///
+    /// Brightness belongs to `exposure`, which multiplies the whole
+    /// composite and therefore lifts all three passes together. Raising
+    /// exposure to 2.0 reproduces the old world brightness EXACTLY —
+    /// exposure is applied before the tone curve, so scale 1 + exposure 2
+    /// and scale 2 + exposure 1 deliver an identical signal — while
+    /// bringing objects and sky up with it instead of leaving them behind.
+    float lightmapScale = 1.0f;
     bool  debugAnimLightmaps = false; // tint animated lightmap polys magenta
     bool  forceFlicker = false;       // override all animated lights to flicker mode
     // Mirror RenderConfig's defaults. main() overwrites all four from the
@@ -377,6 +412,12 @@ struct RuntimeState {
     // pass disabled, so a directly-constructed RuntimeState renders exactly
     // what the pre-post-process pipeline did.
     PostProcessSettings postProcess;
+
+    // Antialiasing. Same mirror-the-config contract; default is none, which
+    // is the image the renderer produced before SMAA existed. The mode is
+    // live-toggleable from the console, but only within a session that
+    // started with SMAA's resources built — see the creation site.
+    AntiAliasSettings antiAlias;
 
     // Sun/moon glow from SKYOBJVAR. Intensity multiplies the mission's own
     // authored glow_scale; values above 1.0 push the glow past unity in the
