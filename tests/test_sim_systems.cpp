@@ -31,6 +31,11 @@
 #include "property/PropertyService.h"
 #include "room/RoomService.h"
 #include "physics/PhysicsService.h"
+// ObjectCollisionGeometry.h forward-declares these two for build(); its own
+// header comment names them as the caller's job to supply.
+#include "property/TypedProperty.h"
+#include "ObjectPropParser.h"
+#include "physics/ObjectCollisionGeometry.h"
 #include "logger.h"
 #include "stdlog.h"
 #include "ConsoleBackend.h"
@@ -1378,4 +1383,85 @@ TEST_CASE("applyModelMatrix: orientation is kept in step with the matrix",
     CHECK(fwd.x == Catch::Approx(expect.x).margin(1e-4));
     CHECK(fwd.y == Catch::Approx(expect.y).margin(1e-4));
     CHECK(fwd.z == Catch::Approx(expect.z).margin(1e-4));
+}
+
+
+// ============================================================================
+// Door interaction volume — the leaf where it swings, not where it was placed
+// ============================================================================
+//
+// A rotating door's ObjectState position stays at its hinge-anchored base by
+// design (the centre traces an arc, so neither end of it is a better answer
+// to "where is this door"), and the frob cache remembers the load-time
+// placement. Aim a door by either and you aim at its CLOSED pose forever: the
+// player had to look back at the empty doorway to shut a door they had just
+// opened. FrobSystem instead tests the leaf box DoorSystem publishes —
+// getCurrentWorldMatrix + DoorState::edgeLengths, the same box the audio
+// occluder uses — through rayVsBoxPose. These pin that geometry.
+
+namespace {
+
+// A 4 x 0.4 x 10 leaf hinged on its -X edge, the measurements DoorSystem
+// reports for a MISS1 double-door leaf. Reproduces applyDoorTransform's
+// rotating branch with the base at the origin and no base rotation:
+//   M = T(base) * R_base * T(+pivot) * R_offset * T(-pivot)
+constexpr float kLeafWidth = 4.0f;
+const Darkness::Vector3 kLeafEdges(kLeafWidth, 0.4f, 10.0f);
+
+Darkness::Matrix4 leafPose(float angle) {
+    // pivotOffset: centre → hinge edge, half the width along -X.
+    const Darkness::Vector3 pivot(-kLeafWidth * 0.5f, 0.0f, 0.0f);
+    return glm::translate(Darkness::Matrix4(1.0f), pivot)
+         * glm::rotate(Darkness::Matrix4(1.0f), angle, Darkness::Vector3(0, 0, 1))
+         * glm::translate(Darkness::Matrix4(1.0f), -pivot);
+}
+
+} // namespace
+
+TEST_CASE("Frob volume: a shut leaf fills its doorway", "[FrobTargeting]") {
+    // Down the corridor, through the doorway, at the leaf's own height.
+    const Darkness::Vector3 from(0.0f, -6.0f, 0.0f);
+    const Darkness::Vector3 to(0.0f, 2.0f, 0.0f);
+
+    const Darkness::RayOBBResult hit =
+        Darkness::rayVsBoxPose(leafPose(0.0f), kLeafEdges, from, to);
+
+    REQUIRE(hit.hit);
+    // Front face of a 0.4-thick leaf standing at y = 0.
+    CHECK(hit.point.y == Approx(-0.2f).margin(1e-3));
+}
+
+TEST_CASE("Frob volume: a swung leaf leaves its doorway behind",
+          "[FrobTargeting]") {
+    const Darkness::Matrix4 open = leafPose(1.5707963f);   // 90°
+
+    // Same corridor ray as above. The doorway is now empty, so aiming through
+    // it must NOT find the door — this is the half of the bug that let the
+    // player frob a door by looking at the hole it used to fill.
+    CHECK_FALSE(Darkness::rayVsBoxPose(open, kLeafEdges,
+                                       Darkness::Vector3(0.0f, -6.0f, 0.0f),
+                                       Darkness::Vector3(0.0f,  2.0f, 0.0f)).hit);
+
+    // The leaf swung about its hinge at x = -2 and now lies along the wall:
+    // centre (-2, 2, 0), 4 units of width running out along +Y. Looking at it
+    // finds it — the half of the bug that stopped the player closing a door
+    // they were staring at.
+    const Darkness::RayOBBResult hit =
+        Darkness::rayVsBoxPose(open, kLeafEdges,
+                               Darkness::Vector3(2.0f, 2.0f, 0.0f),
+                               Darkness::Vector3(-6.0f, 2.0f, 0.0f));
+    REQUIRE(hit.hit);
+    CHECK(hit.point.x == Approx(-1.8f).margin(1e-3));   // near face of the leaf
+}
+
+TEST_CASE("Frob volume: the swung leaf is nowhere near the placement point",
+          "[FrobTargeting]") {
+    // What the placement cache and ObjectState both report for this door is
+    // the origin, at every angle. A proximity cone around that point is aiming
+    // half a door-width away from the leaf once it is open, which is why doors
+    // do not use it.
+    const Darkness::Matrix4 open = leafPose(1.5707963f);
+    const Darkness::Vector3 leafCentre(open[3]);
+
+    CHECK(glm::length(leafCentre) == Approx(kLeafWidth * 0.7071f).margin(0.01));
 }

@@ -27,6 +27,7 @@ add_executable(darkness_tests
     test_subobject_joints.cpp
     test_coronas.cpp
     test_door_portal_binding.cpp
+    test_config_help.cpp
 )
 
 target_link_libraries(darkness_tests PRIVATE
@@ -51,6 +52,10 @@ target_include_directories(darkness_tests PRIVATE
 target_compile_definitions(darkness_tests PRIVATE
     FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures"
     SCRIPTS_DIR="${CMAKE_SOURCE_DIR}/scripts/thief2"
+    # test_config_help.cpp reads darknessRender.example.yaml and
+    # src/main/RenderConfig.h as data — they are the documentation sources it
+    # checks against each other.
+    REPO_ROOT="${CMAKE_SOURCE_DIR}"
 )
 
 # Auto-discover Catch2 test cases for CTest

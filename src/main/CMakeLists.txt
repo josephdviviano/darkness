@@ -207,6 +207,29 @@ bgfx_compile_shaders(
     AS_HEADERS
 )
 
+# Bloom pyramid down/up legs (VIS-3b) — the progressive-downsample chain that
+# gives bloom_range a real radius. Both reuse vs_composite /
+# varying_composite.def.sc, like every other post fragment shader.
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_bloom_downsample.sc
+    VARYING_DEF ${SHADER_DIR}/varying_composite.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR BLOOM_DOWNSAMPLE_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_bloom_upsample.sc
+    VARYING_DEF ${SHADER_DIR}/varying_composite.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR BLOOM_UPSAMPLE_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+
 # Light corona shader — camera-facing additive billboard. Needs its own set
 # rather than reusing `textured`, for two reasons the corona cannot live
 # without: a float4 vertex colour (the per-corona tint exceeds 1.0 so the glow
@@ -231,6 +254,65 @@ bgfx_compile_shaders(
     AS_HEADERS
 )
 
+# SMAA — three fullscreen passes (edge detection, blending weights,
+# neighborhood blending) sharing varying_smaa.def.sc. Each pass needs its own
+# vertex shader: the offsets they precompute are what makes the fragment
+# stages cheap, and no two passes want the same ones.
+bgfx_compile_shaders(
+    TYPE VERTEX
+    SHADERS ${SHADER_DIR}/vs_smaa_edges.sc
+    VARYING_DEF ${SHADER_DIR}/varying_smaa.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR SMAA_EDGES_VS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_smaa_edges.sc
+    VARYING_DEF ${SHADER_DIR}/varying_smaa.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR SMAA_EDGES_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE VERTEX
+    SHADERS ${SHADER_DIR}/vs_smaa_weights.sc
+    VARYING_DEF ${SHADER_DIR}/varying_smaa.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR SMAA_WEIGHTS_VS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_smaa_weights.sc
+    VARYING_DEF ${SHADER_DIR}/varying_smaa.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR SMAA_WEIGHTS_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE VERTEX
+    SHADERS ${SHADER_DIR}/vs_smaa_blend.sc
+    VARYING_DEF ${SHADER_DIR}/varying_smaa.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR SMAA_BLEND_VS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_smaa_blend.sc
+    VARYING_DEF ${SHADER_DIR}/varying_smaa.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR SMAA_BLEND_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+
 # bgfx_compile_shaders() doesn't track .h includes — when
 # object_lighting_constants.h changes (e.g. bumping OBJECT_LIGHT_CAP)
 # the per-vertex bytecode would otherwise stay stale. Mirror the .h
@@ -246,6 +328,21 @@ add_custom_command(
         ${CMAKE_CURRENT_BINARY_DIR}/.corona_shared_stamp
     DEPENDS ${SHADER_DIR}/corona_depth_fade.sh
     COMMENT "Corona shared shader changed — re-touching corona sources"
+)
+
+# Same include-tracking gap again: smaa_common.sh carries the quality preset
+# and the portability helpers for all six SMAA shaders, and editing it would
+# otherwise leave every one of them stale.
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/.smaa_shared_stamp
+    COMMAND ${CMAKE_COMMAND} -E touch_nocreate
+        ${SHADER_DIR}/vs_smaa_edges.sc   ${SHADER_DIR}/fs_smaa_edges.sc
+        ${SHADER_DIR}/vs_smaa_weights.sc ${SHADER_DIR}/fs_smaa_weights.sc
+        ${SHADER_DIR}/vs_smaa_blend.sc   ${SHADER_DIR}/fs_smaa_blend.sc
+    COMMAND ${CMAKE_COMMAND} -E touch
+        ${CMAKE_CURRENT_BINARY_DIR}/.smaa_shared_stamp
+    DEPENDS ${SHADER_DIR}/smaa_common.sh
+    COMMENT "SMAA shared shader changed — re-touching SMAA sources"
 )
 
 set(PERVERTEX_CONSTANTS_H ${SHADER_DIR}/object_lighting_constants.h)
@@ -272,9 +369,14 @@ add_custom_target(compile_shaders DEPENDS
     ${PERVERTEX_TEXTURED_FS_OUTPUTS} ${PERVERTEX_BASIC_FS_OUTPUTS}
     ${COMPOSITE_VS_OUTPUTS} ${COMPOSITE_FS_OUTPUTS}
     ${BLOOM_BLUR_FS_OUTPUTS} ${BLOOM_EXTRACT_FS_OUTPUTS}
+    ${BLOOM_DOWNSAMPLE_FS_OUTPUTS} ${BLOOM_UPSAMPLE_FS_OUTPUTS}
     ${CORONA_VS_OUTPUTS} ${CORONA_FS_OUTPUTS}
+    ${SMAA_EDGES_VS_OUTPUTS}   ${SMAA_EDGES_FS_OUTPUTS}
+    ${SMAA_WEIGHTS_VS_OUTPUTS} ${SMAA_WEIGHTS_FS_OUTPUTS}
+    ${SMAA_BLEND_VS_OUTPUTS}   ${SMAA_BLEND_FS_OUTPUTS}
     ${CMAKE_CURRENT_BINARY_DIR}/.pervertex_constants_stamp
     ${CMAKE_CURRENT_BINARY_DIR}/.corona_shared_stamp
+    ${CMAKE_CURRENT_BINARY_DIR}/.smaa_shared_stamp
 )
 
 add_executable(darknessRender DarknessRender.cpp)

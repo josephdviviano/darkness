@@ -378,6 +378,12 @@ struct RuntimeState {
     // what the pre-post-process pipeline did.
     PostProcessSettings postProcess;
 
+    // Antialiasing. Same mirror-the-config contract; default is none, which
+    // is the image the renderer produced before SMAA existed. The mode is
+    // live-toggleable from the console, but only within a session that
+    // started with SMAA's resources built — see the creation site.
+    AntiAliasSettings antiAlias;
+
     // Sun/moon glow from SKYOBJVAR. Intensity multiplies the mission's own
     // authored glow_scale; values above 1.0 push the glow past unity in the
     // HDR target, which is what makes it bloom. Default 1.0 = mission

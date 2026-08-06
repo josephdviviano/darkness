@@ -18,6 +18,7 @@
 | Mission / resource loading (`.mis`, `.gam`, `.crf`) | **Working** |
 | World rendering — geometry, textures, lightmaps, water, sky, fog, portal culling | **Working** |
 | Object rendering (static models) | **Working** |
+| Post-processing — HDR target, tone mapping, colour correction, bloom, sky glow, light coronas, SMAA, low-res "vintage" mode | **Working** |
 | Player physics — walk, crouch, jump, mantle, lean, stairs, slopes | **Working** |
 | Object interaction — doors, elevators, levers, tweqs, pressure plates, triggers, pushable objects | **Working** |
 | Frob / grab / throw | **Working** — see caveat below |
@@ -125,9 +126,9 @@ Settings come from three places. Precedence is **YAML < CLI flags < runtime debu
 
 Copy `darknessRender.example.yaml` to `darknessRender.yaml` in your working directory, or pass `--config <path>`. The default path is relative to the current directory. A missing config is fine — defaults apply silently. A config that exists but fails to parse is fatal.
 
-The file has six sections: `paths`, `graphics`, `water`, `physics`, `developer`, and `audio`. `audio` dominates — roughly 95 of the ~116 keys.
+The file has six sections: `paths`, `graphics`, `water`, `physics`, `developer`, and `audio`. `audio` dominates — roughly 130 of the ~190 keys.
 
-**`darknessRender --help` is the canonical config reference.** It lists every YAML key with its default, whether or not your local config mentions it, and is kept authoritative by convention. Prefer it over the example file if the two ever disagree. Note it prints to stderr, so redirect accordingly:
+**`darknessRender.example.yaml` is the reference** — every key, with its default and the reasoning behind it. `darknessRender --help` prints the same key set one line each, which is faster to scan; it is *generated* from the example file, so the two cannot disagree, and a test fails if the generated copy goes stale. Note it prints to stderr, so redirect accordingly:
 
 ```bash
 darknessRender --help 2>&1 | less

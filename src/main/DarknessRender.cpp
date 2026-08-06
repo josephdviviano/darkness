@@ -57,6 +57,8 @@
 #include "ObjectPropParser.h"
 #include "BinMeshParser.h"
 #include "RenderConfig.h"
+// Generated from darknessRender.example.yaml — see tools/gen_config_help.py.
+#include "ConfigHelpText.h"
 #include "RayCaster.h"
 #include "WRAcousticTopology.h"
 #include "DebugConsole.h"
@@ -399,9 +401,15 @@ static std::string deriveMissionName(const char* misPath) {
 }
 
 static void printHelp() {
-    // Help text is the canonical reference for every YAML key — it lists every
-    // field whether or not the user's local config mentions it. When you add
-    // a new YAML knob, also add it here so `--help` stays authoritative.
+    // The YAML reference below is GENERATED from darknessRender.example.yaml
+    // (tools/gen_config_help.py → ConfigHelpText.h), so it lists every key
+    // whether or not the user's local config mentions it, and cannot drift
+    // from the example the way a hand-written copy did. Adding a knob means
+    // documenting it in the example yaml and regenerating; forgetting the
+    // second step fails tests/test_config_help.cpp by name.
+    //
+    // Everything else here — CLI flags, controls, examples — is hand-written,
+    // because none of it is derivable from the config.
     std::fprintf(stderr,
         "darknessRender — Dark Engine world geometry + audio viewer\n"
         "\n"
@@ -535,48 +543,17 @@ static void printHelp() {
         "                    (= developer.capture_wav in YAML).\n"
         "  -h, --help        Show this message and exit.\n"
         "\n"
-        "YAML CONFIG REFERENCE (defaults shown; see darknessRender.example.yaml)\n"
+        "YAML CONFIG REFERENCE (every key, with its default)\n"
         "\n"
-        "  paths:\n"
-        "    res: <path>                     Thief 2 RES directory (CLI --res overrides)\n"
-        "    schemas: <path>                 Schema dir (CLI --schemas overrides)\n"
-        "\n"
-        "  graphics:\n"
-        "    texture_filter: point           point | bilinear | trilinear | anisotropic\n"
-        "    lightmap_filter: bilinear       bilinear | bicubic\n"
-        "    linear_mips: false              gamma-correct mipmap generation\n"
-        "    sharp_mips:  false              unsharp mask on mip levels\n"
-        "\n"
-        "  water:\n"
-        "    wave_amplitude: 0.3             vertex Z displacement, 0.0–10.0\n"
-        "    uv_distortion:  0.015           UV wobble strength, 0.0–0.1\n"
-        "    rotation_speed: 0.015           UV rotation rad/s, 0.0–1.0\n"
-        "    scroll_speed:   0.05            UV scroll units/s, 0.0–1.0\n"
-        "\n"
-        "  physics:\n"
-        "    rate: 60                        12=vintage (12.5Hz) | 60=modern | 120=ultra\n"
-        "\n"
-        "  developer:\n"
-        "    show_objects: true              render object meshes\n"
-        "    show_fallback_cubes: false      colored cubes for missing models\n"
-        "    portal_culling: true            portal/frustum culling\n"
-        "    camera_collision: false         clip to world (fly mode only)\n"
-        "    step_log: false                 stair-step CSV to stderr\n"
-        "    debug_objects: false            per-object filtering diagnostics\n"
-        "    toggle_platforms: false         auto-activate moving terrain at startup\n"
-        "    no_probes: false                skip Steam Audio probe baking\n"
-        "    audio_log: false                audio/sound/schema log output\n"
-        "    capture_wav: false              record final output to per-run output.wav\n"
-        "\n"
-        "  audio: (eight subsections — see darknessRender.example.yaml for the full set)\n"
-        "    audio.performance.*    sample rate, frame size, voice/thread caps, scene type\n"
-        "    audio.reflections.*    enabled, rays, bounces, duration, ambisonics_order\n"
-        "    audio.occlusion.*      radius, samples, transmission/absorption_scale, diffuse\n"
-        "    audio.propagation.*    portal_routing, probe_pathing, max_distance, door LPF\n"
-        "    audio.spatialization.* hrtf_volume, hrtf_interpolation, spatial_blend\n"
-        "    audio.ambient.*        hysteresis, default_priority, global_volume_scale\n"
-        "    audio.mixer.*          master_gain, reflection_gain, reflection_ramp_ms\n"
-        "    audio.dsp.*            limiter, compressor, EQ, ducking (per-stage)\n"
+        "  Generated from darknessRender.example.yaml, which carries the full\n"
+        "  reasoning behind each key — read that file when a one-liner here is\n"
+        "  not enough. Descriptions are truncated to keep this scannable.\n"
+        "\n");
+
+    for (int i = 0; i < Darkness::kConfigHelpLineCount; ++i)
+        std::fprintf(stderr, "%s\n", Darkness::kConfigHelpLines[i]);
+
+    std::fprintf(stderr,
         "\n"
         "RUNTIME CONTROLS (in window)\n"
         "  WASD              Move forward/left/back/right\n"
@@ -3734,8 +3711,10 @@ static void registerConsoleSettings(
         "Route the scene through the HDR target and composite pass "
         "(tone mapping + colour correction)");
 
+    // Order must match Darkness::ToneMapOperator — the console stores the
+    // index directly as the enum value.
     dbgConsole.addCategorical("tonemap",
-        {"none", "reinhard", "aces"},
+        {"none", "reinhard", "aces", "agx", "pbrneutral", "lottes"},
         [&state]() { return static_cast<int>(state.postProcess.tonemap); },
         [&state](int v) {
             state.postProcess.tonemap = static_cast<Darkness::ToneMapOperator>(v);
@@ -3861,6 +3840,104 @@ static void registerConsoleSettings(
         [&state](float v) { state.postProcess.ndSaturation = v; },
         "[newdark] Saturation of the glow itself, 0 = greyscale (0.7 = NewDark default)");
 
+    // ── Tone-curve shaping. Each is read only by its own operator. ──
+    dbgConsole.addFloat("agx_contrast",
+        PostRange::kAgxContrastMin, PostRange::kAgxContrastMax,
+        [&state]() { return state.postProcess.agxContrast; },
+        [&state](float v) { state.postProcess.agxContrast = v; },
+        "[agx] Curve contrast (1.25 = Godot default). Lower LIFTS shadows "
+        "and shortens the shoulder; higher deepens and lengthens both");
+
+    dbgConsole.addFloat("lottes_contrast",
+        PostRange::kLottesConMin, PostRange::kLottesConMax,
+        [&state]() { return state.postProcess.lottesContrast; },
+        [&state](float v) { state.postProcess.lottesContrast = v; },
+        "[lottes] Curve contrast (1.30 default). Middle grey stays pinned at "
+        "0.18 whatever this is");
+
+    dbgConsole.addFloat("lottes_shoulder",
+        PostRange::kLottesShoulderMin, PostRange::kLottesShoulderMax,
+        [&state]() { return state.postProcess.lottesShoulder; },
+        [&state](float v) { state.postProcess.lottesShoulder = v; },
+        "[lottes] Highlight rolloff length — the knob no other operator has. "
+        "Lower = longer, softer shoulder (0.977 default)");
+
+    dbgConsole.addFloat("lottes_white",
+        PostRange::kLottesWhiteMin, PostRange::kLottesWhiteMax,
+        [&state]() { return state.postProcess.lottesWhite; },
+        [&state](float v) { state.postProcess.lottesWhite = v; },
+        "[lottes] Scene value that maps to display white; everything above "
+        "clips. 3.0 leaves our 2.0 ceiling at 0.915 (default)");
+
+    // ── Film response. strength is the master; 0 is an exact no-op. ──
+    dbgConsole.addFloat("film_strength",
+        PostRange::kFilmStrengthMin, PostRange::kFilmStrengthMax,
+        [&state]() { return state.postProcess.filmStrength; },
+        [&state](float v) { state.postProcess.filmStrength = v; },
+        "Master dial for the whole film-response stage. 0 = off entirely");
+
+    dbgConsole.addFloat("film_shadow_sat",
+        PostRange::kFilmSatMin, PostRange::kFilmSatMax,
+        [&state]() { return state.postProcess.filmShadowSat; },
+        [&state](float v) { state.postProcess.filmShadowSat = v; },
+        "Saturation kept in the dark. The knob that greys the gloom without "
+        "touching the torches (0.55 default)");
+
+    dbgConsole.addFloat("film_highlight_sat",
+        PostRange::kFilmSatMin, PostRange::kFilmSatMax,
+        [&state]() { return state.postProcess.filmHighlightSat; },
+        [&state](float v) { state.postProcess.filmHighlightSat = v; },
+        "Saturation kept in the bright. 1.0 leaves fire exactly as the curve "
+        "delivered it");
+
+    dbgConsole.addFloat("film_falloff",
+        PostRange::kFilmFalloffMin, PostRange::kFilmFalloffMax,
+        [&state]() { return state.postProcess.filmToneFalloff; },
+        [&state](float v) { state.postProcess.filmToneFalloff = v; },
+        "How tightly each split tone is confined to its own end. Higher "
+        "leaves more of the midtones untouched");
+
+    dbgConsole.addFloat("halation",
+        PostRange::kHalationMin, PostRange::kHalationMax,
+        [&state]() { return state.postProcess.halationStrength; },
+        [&state](float v) { state.postProcess.halationStrength = v; },
+        "CineStill halation: a tight warm halo on genuinely overbright "
+        "sources. Independent of bloom");
+
+    dbgConsole.addFloat("halation_threshold",
+        PostRange::kHaloThreshMin, PostRange::kHaloThreshMax,
+        [&state]() { return state.postProcess.halationThreshold; },
+        [&state](float v) { state.postProcess.halationThreshold = v; },
+        "Scene value a pixel must exceed to halate. 1.0 = brighter than "
+        "display white, so only flames and lamps qualify");
+
+    dbgConsole.addFloat("halation_radius",
+        PostRange::kHaloRadiusMin, PostRange::kHaloRadiusMax,
+        [&state]() { return state.postProcess.halationRadius; },
+        [&state](float v) { state.postProcess.halationRadius = v; },
+        "Halo radius in output pixels. Reachable span is ~6.5-13; wider "
+        "belongs to bloom, not here");
+
+    dbgConsole.addFloat("grain",
+        PostRange::kGrainMin, PostRange::kGrainMax,
+        [&state]() { return state.postProcess.grainStrength; },
+        [&state](float v) { state.postProcess.grainStrength = v; },
+        "Additive grain, weighted into the shadows where pushed film puts it");
+
+    dbgConsole.addFloat("grain_size",
+        PostRange::kGrainSizeMin, PostRange::kGrainSizeMax,
+        [&state]() { return state.postProcess.grainSize; },
+        [&state](float v) { state.postProcess.grainSize = v; },
+        "Output pixels per noise cell. Above 1 the grain clumps, closer to a "
+        "pushed stock");
+
+    dbgConsole.addFloat("bloom_range",
+        PostRange::kBloomRangeMin, PostRange::kBloomRangeMax,
+        [&state]() { return state.postProcess.bloomRange; },
+        [&state](float v) { state.postProcess.bloomRange = v; },
+        "[both] Glow radius as a % of screen diagonal, via the downsample "
+        "pyramid (2 = NewDark default, 0 = pyramid off)");
+
     dbgConsole.addFloat("bloom_iterations",
         static_cast<float>(PostRange::kBloomIterMin),
         static_cast<float>(PostRange::kBloomIterMax),
@@ -3868,6 +3945,46 @@ static void registerConsoleSettings(
         [&state](float v) { state.postProcess.bloomIterations = static_cast<int>(v); },
         "[both] Bloom blur iterations, each H+V (2 = HPL2 default). "
         "Radius comes from here, not from a wider step");
+
+    // ── Antialiasing ──
+    //
+    // The mode toggles live so SMAA can be A/B'd against its own absence on
+    // the same frame, but only within a session that built its resources: they
+    // are allocated at startup only when the config asks for antialiasing, so
+    // turning the mode on here cannot conjure them. Say so rather than
+    // flipping a flag that quietly does nothing.
+
+    dbgConsole.setGroup("Antialiasing");
+
+    dbgConsole.addCategorical("aa_mode",
+        {"none", "smaa"},
+        [&state]() { return static_cast<int>(state.antiAlias.mode); },
+        [&state, &gpu](int v) {
+            const auto mode = static_cast<Darkness::AntiAliasMode>(v);
+            if (mode == Darkness::AntiAliasMode::SMAA
+                    && !gpu.postProcess.smaa.valid()) {
+                std::fprintf(stderr,
+                    "[FALLBACK] smaa: cannot enable — SMAA's targets are only "
+                    "built when graphics.antialiasing.mode is smaa at startup. "
+                    "Set it in the config and restart.\n");
+                return;
+            }
+            state.antiAlias.mode = mode;
+        });
+
+    dbgConsole.addFloat("smaa_threshold",
+        PostRange::kSmaaThresholdMin, PostRange::kSmaaThresholdMax,
+        [&state]() { return state.antiAlias.smaaThreshold; },
+        [&state](float v) { state.antiAlias.smaaThreshold = v; },
+        "SMAA edge-detection threshold — lower finds more edges (0.05 = the "
+        "reference's Ultra preset, 0.1 its default, 0.15 its Low)");
+
+    dbgConsole.addCategorical("aa_debug",
+        {"off", "edges", "weights"},
+        [&state]() { return static_cast<int>(state.antiAlias.debug); },
+        [&state](int v) {
+            state.antiAlias.debug = static_cast<Darkness::SmaaDebugView>(v);
+        });
 
     // ── Light coronas ──
     //
@@ -5513,6 +5630,28 @@ int main(int argc, char *argv[]) {
     state.postProcess.ndPrescale      = cfg.ppNdPrescale;
     state.postProcess.ndScale         = cfg.ppNdScale;
     state.postProcess.ndSaturation    = cfg.ppNdSaturation;
+    state.postProcess.bloomRange      = cfg.ppBloomRange;
+    state.postProcess.agxContrast     = cfg.ppAgxContrast;
+    state.postProcess.lottesContrast  = cfg.ppLottesContrast;
+    state.postProcess.lottesShoulder  = cfg.ppLottesShoulder;
+    state.postProcess.lottesWhite     = cfg.ppLottesWhite;
+    state.postProcess.filmStrength     = cfg.ppFilmStrength;
+    state.postProcess.filmShadowSat    = cfg.ppFilmShadowSat;
+    state.postProcess.filmHighlightSat = cfg.ppFilmHighSat;
+    state.postProcess.filmToneFalloff  = cfg.ppFilmFalloff;
+    for (int i = 0; i < 3; ++i) {
+        state.postProcess.filmShadowTint[i]    = cfg.ppFilmShadowTint[i];
+        state.postProcess.filmHighlightTint[i] = cfg.ppFilmHighTint[i];
+        state.postProcess.halationTint[i]      = cfg.ppHalationTint[i];
+    }
+    state.postProcess.halationStrength  = cfg.ppHalationStrength;
+    state.postProcess.halationThreshold = cfg.ppHalationThreshold;
+    state.postProcess.halationRadius    = cfg.ppHalationRadius;
+    state.postProcess.grainStrength    = cfg.ppGrainStrength;
+    state.postProcess.grainSize        = cfg.ppGrainSize;
+    state.antiAlias.mode          =
+        static_cast<Darkness::AntiAliasMode>(cfg.antiAliasMode);
+    state.antiAlias.smaaThreshold = cfg.smaaThreshold;
     state.skyGlowEnabled   = cfg.skyGlow;
     state.skyGlowIntensity = cfg.skyGlowIntensity;
     state.skyOverbright    = cfg.skyOverbright;
@@ -7080,6 +7219,16 @@ int main(int argc, char *argv[]) {
             bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_composite"),
             bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_bloom_extract"),
             true);
+        // Bloom pyramid legs (VIS-3b) — the down/up chain that gives
+        // bloom_range a real radius. Same vs_composite fullscreen triangle.
+        bgfx::ProgramHandle downsampleProgram = bgfx::createProgram(
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_composite"),
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_bloom_downsample"),
+            true);
+        bgfx::ProgramHandle upsampleProgram = bgfx::createProgram(
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_composite"),
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_bloom_upsample"),
+            true);
 
         if (!Darkness::createPostProcess(gpu.postProcess,
                                          renderRes.width, renderRes.height,
@@ -7088,7 +7237,8 @@ int main(int argc, char *argv[]) {
                                          cfg.renderPointFilter
                                              && !renderRes.isNative(),
                                          compositeProgram, blurProgram,
-                                         extractProgram)) {
+                                         extractProgram, downsampleProgram,
+                                         upsampleProgram)) {
             Darkness::destroyPostProcess(gpu.postProcess);
             if (state.postProcess.enabled) {
                 std::fprintf(stderr,
@@ -7097,6 +7247,39 @@ int main(int argc, char *argv[]) {
                     "continuing with the direct-to-backbuffer path. Tone "
                     "mapping and colour correction will have no effect.\n");
                 state.postProcess.enabled = false;
+            }
+        }
+
+        // ── SMAA ──
+        //
+        // Built only when the config asks for it, unlike the post-process
+        // target above: SMAA needs three more full-resolution targets plus a
+        // 180 KB lookup table, which is not memory to spend on a pass that
+        // may never be switched on. The console can therefore turn SMAA off
+        // and back on live, but cannot conjure it into a session that started
+        // with antialiasing set to none.
+        if (state.antiAlias.mode == Darkness::AntiAliasMode::SMAA
+                && gpu.postProcess.valid()) {
+            bgfx::ProgramHandle edgeProgram = bgfx::createProgram(
+                bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_smaa_edges"),
+                bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_smaa_edges"),
+                true);
+            bgfx::ProgramHandle weightProgram = bgfx::createProgram(
+                bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_smaa_weights"),
+                bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_smaa_weights"),
+                true);
+            bgfx::ProgramHandle blendProgram = bgfx::createProgram(
+                bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "vs_smaa_blend"),
+                bgfx::createEmbeddedShader(s_embeddedShaders, rendererType, "fs_smaa_blend"),
+                true);
+
+            if (!Darkness::createSmaa(gpu.postProcess.smaa,
+                                      static_cast<uint16_t>(WINDOW_WIDTH),
+                                      static_cast<uint16_t>(WINDOW_HEIGHT),
+                                      edgeProgram, weightProgram,
+                                      blendProgram)) {
+                Darkness::destroySmaa(gpu.postProcess.smaa);
+                state.antiAlias.mode = Darkness::AntiAliasMode::None;
             }
         }
     }
@@ -7859,8 +8042,26 @@ int main(int argc, char *argv[]) {
             if (ppActive) {
                 const bool bloomActive =
                     Darkness::renderBloom(gpu.postProcess, state.postProcess);
+                // SMAA runs on the composite's OUTPUT, so the composite is
+                // told up front where to put it: the backbuffer as before, or
+                // the SMAA colour target for the three antialiasing passes to
+                // resolve from.
+                const bool smaaActive = Darkness::smaaShouldRun(
+                    gpu.postProcess, state.antiAlias, ppActive);
+                // Wall time, for grain. Taken here rather than accumulated
+                // from dt so the noise keeps moving at a constant rate
+                // regardless of frame rate — and so a paused or hitching
+                // frame does not freeze it into a fixed pattern, which reads
+                // as dirt on the lens rather than as grain.
+                const float nowSeconds =
+                    static_cast<float>(SDL_GetTicks64()) * 0.001f;
+                const bool halationActive =
+                    Darkness::renderHalation(gpu.postProcess, state.postProcess);
                 Darkness::submitComposite(gpu.postProcess, state.postProcess,
-                                          bloomActive);
+                                          bloomActive, halationActive,
+                                          smaaActive, nowSeconds);
+                if (smaaActive)
+                    Darkness::submitSmaa(gpu.postProcess, state.antiAlias);
             }
 
             // Frob target indicator + debug console overlay.

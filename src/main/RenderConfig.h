@@ -75,6 +75,38 @@ constexpr float kNdThresholdMin  = 0.0f, kNdThresholdMax  =   1.0f;
 constexpr float kNdPrescaleMin   = 0.0f, kNdPrescaleMax   =   8.0f;
 constexpr float kNdScaleMin      = 0.0f, kNdScaleMax      =  20.0f;
 constexpr float kNdSaturationMin = 0.0f, kNdSaturationMax =   1.0f;
+// Bloom radius as a percentage of the screen diagonal — NewDark's
+// bloom_range, whose documented range is 0.0-10.0 and whose default is 2.
+// 0 means "no pyramid", which is our default rather than NewDark's; see
+// PostProcessSettings::bloomRange. Applies to both styles.
+constexpr float kBloomRangeMin   = 0.0f, kBloomRangeMax   =  10.0f;
+// Tone-curve shaping. AgX contrast is Godot's parameter (default 1.25);
+// Lottes' contrast/shoulder/white are his (shoulder is conventionally just
+// under 1 — at exactly 1 the curve loses most of its shoulder character).
+// The white floor is above middle grey because the curve solve divides by
+// (white^ad - mid^ad) and collapses if they meet.
+constexpr float kAgxContrastMin  = 0.60f, kAgxContrastMax  =   2.0f;
+constexpr float kLottesConMin    = 0.60f, kLottesConMax    =   3.0f;
+constexpr float kLottesShoulderMin = 0.70f, kLottesShoulderMax = 1.0f;
+constexpr float kLottesWhiteMin  = 1.00f, kLottesWhiteMax  =   8.0f;
+// Film response. Strength is the master; 0 is an exact no-op.
+constexpr float kFilmStrengthMin = 0.0f, kFilmStrengthMax =   1.0f;
+constexpr float kFilmSatMin      = 0.0f, kFilmSatMax      =   2.0f;
+constexpr float kFilmFalloffMin  = 0.25f, kFilmFalloffMax =   6.0f;
+// Tints are multiplicative and must not exceed 1 — a tint that brightens
+// would undo the gloom the stage exists to create.
+constexpr float kFilmTintMin     = 0.0f, kFilmTintMax     =   1.0f;
+// Halation strength is generous above 1 because it multiplies the bloom
+// texture, whose own level depends on bloom_intensity / bloomscale.
+constexpr float kHalationMin     = 0.0f, kHalationMax     =   4.0f;
+// Halation threshold is in SCENE units, where lit geometry reaches 2.0 — so
+// 1.0 means "brighter than display white". Radius is in output pixels and the
+// ceiling is deliberately tight: halation is the LOCAL glow, and the blur
+// chain tops out near 13 px anyway (see renderHalation).
+constexpr float kHaloThreshMin   = 0.0f, kHaloThreshMax   =   4.0f;
+constexpr float kHaloRadiusMin   = 1.0f, kHaloRadiusMax   =  16.0f;
+constexpr float kGrainMin        = 0.0f, kGrainMax        =   0.5f;
+constexpr float kGrainSizeMin    = 0.25f, kGrainSizeMax   =   8.0f;
 // Sky glow intensity multiplier. Ceiling is generous because the useful
 // range depends entirely on what glow_scale a given mission authored, and
 // that varies.
@@ -83,6 +115,11 @@ constexpr float kSkyGlowMin      = 0.0f, kSkyGlowMax      = 32.0f;
 // player directly sees, not just the bloom source, so large values wash the
 // sky out rather than merely making the moon glow.
 constexpr float kSkyOverbrightMin = 1.0f, kSkyOverbrightMax = 4.0f;
+// SMAA edge-detection threshold. The floor is not 0: at zero every pixel is
+// an edge, the weight pass runs its full search everywhere, and the result is
+// both slower and worse. The reference's own presets span 0.05 to 0.15 and it
+// documents 0.05 as the useful lower limit.
+constexpr float kSmaaThresholdMin = 0.01f, kSmaaThresholdMax = 0.5f;
 } // namespace PostRange
 
 /// Light-corona tunable bounds — same single-source-of-truth contract as
@@ -127,6 +164,38 @@ inline float clampConfigValue(float v, float lo, float hi, const char *key) {
     return v;
 }
 
+/// Read an `[r, g, b]` multiplicative tint into `out`, clamped to [0, 1].
+///
+/// Shared by every tint the grading stages take. The 1.0 ceiling is the point
+/// rather than an arbitrary bound: these tints multiply, so a value above 1
+/// would BRIGHTEN the region it applies to, and each of them exists to darken
+/// or shift one — a "shadow tint" that lifts the shadows is not a shadow
+/// tint. Clamping is announced by clampConfigValue, so an out-of-range value
+/// is not silently reinterpreted.
+///
+/// A malformed sequence leaves `out` at its default and says so, rather than
+/// half-applying a partial triple.
+inline void readTint(const YAML::Node &parent, const char *key, float out[3],
+                     const char *fullKeyForMessages) {
+    YAML::Node n = parent[key];
+    if (!n)
+        return;
+    if (!n.IsSequence() || n.size() != 3) {
+        std::fprintf(stderr,
+            "[FALLBACK] config: %s must be a 3-element sequence [r, g, b] — "
+            "ignoring it and leaving the tint at its default.\n",
+            fullKeyForMessages);
+        return;
+    }
+    char buf[192];
+    for (int i = 0; i < 3; ++i) {
+        std::snprintf(buf, sizeof(buf), "%s[%d]", fullKeyForMessages, i);
+        out[i] = clampConfigValue(n[i].as<float>(),
+                                  PostRange::kFilmTintMin,
+                                  PostRange::kFilmTintMax, buf);
+    }
+}
+
 // All configurable settings for the renderer.
 // Defaults match the original hardcoded values.
 struct RenderConfig {
@@ -166,6 +235,20 @@ struct RenderConfig {
     bool renderPointFilter = true;   // point upscale — the vintage look
     bool renderIntegerScale = true;  // snap to a whole-number upscale ratio
 
+    // -- graphics.antialiasing --
+    //
+    // 0 = none, 1 = SMAA. Matches AntiAliasMode in PostProcess.h; stored as an
+    // int here so RenderConfig stays free of render-module types.
+    //
+    // Off by default. SMAA is a fixed-cost screen-space pass (~0.2-0.4 ms at
+    // 1080p, three fullscreen passes) rather than a multiplier on every
+    // per-pixel cost, which is why it is the antialiasing this engine can
+    // afford once deferred lighting, SSAO and volumetrics land — see
+    // PLAN.VISUALS.md "Anti-aliasing". It needs post_process.enabled, and it
+    // is mutually exclusive with a below-native render_scale.
+    int   antiAliasMode  = 0;
+    float smaaThreshold  = 0.1f;
+
     // -- graphics.post_process -- (ranges: see PostRange above)
     //
     // Off by default, and the defaults below are the identity transform, so
@@ -179,7 +262,9 @@ struct RenderConfig {
     // settings mean the same thing they do there.
     bool  postProcess     = false;  // master toggle
     float ppExposure      = 1.0f;   // linear multiplier applied pre-tonemap
-    int   ppToneMap       = 0;      // 0=none (clamp), 1=reinhard, 2=aces
+    // 0=none (clamp), 1=reinhard, 2=aces, 3=agx, 4=pbrneutral.
+    // Mirrors Darkness::ToneMapOperator — keep the two in step.
+    int   ppToneMap       = 0;
     float ppBrightness    = 0.0f;   // additive offset, post-tonemap
     float ppContrast      = 1.0f;   // about the 0.5 pivot
     float ppSaturation    = 1.0f;   // 0 = greyscale
@@ -202,6 +287,31 @@ struct RenderConfig {
     float ppNdPrescale      = 1.0f;
     float ppNdScale         = 5.0f;
     float ppNdSaturation    = 0.7f;
+    // Glow radius, % of screen diagonal (NewDark's bloom_range). Applies to
+    // both styles. 0 = no pyramid, i.e. the pre-VIS-3b chain exactly.
+    float ppBloomRange      = 0.0f;
+
+    // -- tone-curve shaping (operator-scoped) --
+    float ppAgxContrast     = 1.25f;
+    float ppLottesContrast  = 1.30f;
+    float ppLottesShoulder  = 0.977f;
+    float ppLottesWhite     = 3.0f;
+
+    // -- graphics.post_process.film -- all default to an exact no-op
+    float ppFilmStrength    = 0.0f;
+    float ppFilmShadowSat   = 0.55f;
+    float ppFilmHighSat     = 1.0f;
+    float ppFilmShadowTint[3] = { 1.0f, 1.0f, 1.0f };
+    float ppFilmHighTint[3]   = { 1.0f, 0.98f, 0.94f };
+    float ppFilmFalloff     = 1.5f;
+
+    // -- graphics.post_process.halation / .grain --
+    float ppHalationStrength = 0.0f;
+    float ppHalationTint[3]  = { 1.0f, 0.32f, 0.12f };
+    float ppHalationThreshold = 1.0f;
+    float ppHalationRadius    = 10.0f;
+    float ppGrainStrength    = 0.0f;
+    float ppGrainSize        = 1.5f;
 
     // -- graphics.sky_glow -- SKYOBJVAR sun/moon glow disc
     bool  skyGlow          = true;
@@ -849,6 +959,29 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                     cfg.renderIntegerScale = rs["integer"].as<bool>();
             }
 
+            // antialiasing — the resolve that runs after the composite
+            if (YAML::Node aa = gfx["antialiasing"]) {
+                if (aa["mode"]) {
+                    const std::string v = aa["mode"].as<std::string>();
+                    if      (v == "none") cfg.antiAliasMode = 0;
+                    else if (v == "smaa") cfg.antiAliasMode = 1;
+                    else {
+                        std::fprintf(stderr,
+                            "[FALLBACK] config: graphics.antialiasing.mode = "
+                            "'%s' is not none|smaa — using none. (TAA is on "
+                            "the roadmap, not in this build.)\n", v.c_str());
+                        cfg.antiAliasMode = 0;
+                    }
+                }
+                if (aa["smaa_threshold"]) {
+                    cfg.smaaThreshold = clampConfigValue(
+                        aa["smaa_threshold"].as<float>(),
+                        PostRange::kSmaaThresholdMin,
+                        PostRange::kSmaaThresholdMax,
+                        "graphics.antialiasing.smaa_threshold");
+                }
+            }
+
             // coronas — light-corona billboards (authored P$Corona +
             // synthesized glows on visible light-emitting objects)
             if (YAML::Node co = gfx["coronas"]) {
@@ -917,9 +1050,12 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
 
                 if (pp["tonemap"]) {
                     std::string val = pp["tonemap"].as<std::string>();
-                    if      (val == "none")     cfg.ppToneMap = 0;
-                    else if (val == "reinhard") cfg.ppToneMap = 1;
-                    else if (val == "aces")     cfg.ppToneMap = 2;
+                    if      (val == "none")       cfg.ppToneMap = 0;
+                    else if (val == "reinhard")   cfg.ppToneMap = 1;
+                    else if (val == "aces")       cfg.ppToneMap = 2;
+                    else if (val == "agx")        cfg.ppToneMap = 3;
+                    else if (val == "pbrneutral") cfg.ppToneMap = 4;
+                    else if (val == "lottes")     cfg.ppToneMap = 5;
                     else {
                         // Unlike the older enum keys above, announce this
                         // rather than defaulting in silence — a typo here
@@ -927,8 +1063,9 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                         // nothing on my machine".
                         std::fprintf(stderr,
                             "[FALLBACK] config: graphics.post_process.tonemap = "
-                            "'%s' is not one of none|reinhard|aces — using "
-                            "'none'. Tone mapping will not be applied.\n",
+                            "'%s' is not one of none|reinhard|aces|agx|"
+                            "pbrneutral|lottes — using 'none'. Tone mapping "
+                            "will not be applied.\n",
                             val.c_str());
                         cfg.ppToneMap = 0;
                     }
@@ -1035,6 +1172,116 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
                             bl["intensity"].as<float>(),
                             PostRange::kBloomIntenMin, PostRange::kBloomIntenMax,
                             "graphics.post_process.bloom.intensity");
+                    }
+                    if (bl["range"]) {
+                        cfg.ppBloomRange = clampConfigValue(
+                            bl["range"].as<float>(),
+                            PostRange::kBloomRangeMin, PostRange::kBloomRangeMax,
+                            "graphics.post_process.bloom.range");
+                    }
+                }
+
+                // Tone-curve shaping. Each is read only by its own operator;
+                // they sit at the post_process level rather than under a
+                // per-operator map because the console has to expose them
+                // flat anyway.
+                if (pp["agx_contrast"]) {
+                    cfg.ppAgxContrast = clampConfigValue(
+                        pp["agx_contrast"].as<float>(),
+                        PostRange::kAgxContrastMin, PostRange::kAgxContrastMax,
+                        "graphics.post_process.agx_contrast");
+                }
+                if (pp["lottes_contrast"]) {
+                    cfg.ppLottesContrast = clampConfigValue(
+                        pp["lottes_contrast"].as<float>(),
+                        PostRange::kLottesConMin, PostRange::kLottesConMax,
+                        "graphics.post_process.lottes_contrast");
+                }
+                if (pp["lottes_shoulder"]) {
+                    cfg.ppLottesShoulder = clampConfigValue(
+                        pp["lottes_shoulder"].as<float>(),
+                        PostRange::kLottesShoulderMin,
+                        PostRange::kLottesShoulderMax,
+                        "graphics.post_process.lottes_shoulder");
+                }
+                if (pp["lottes_white"]) {
+                    cfg.ppLottesWhite = clampConfigValue(
+                        pp["lottes_white"].as<float>(),
+                        PostRange::kLottesWhiteMin, PostRange::kLottesWhiteMax,
+                        "graphics.post_process.lottes_white");
+                }
+
+                // film subsection — the response stage after the curve.
+                if (YAML::Node fl = pp["film"]) {
+                    if (fl["strength"]) {
+                        cfg.ppFilmStrength = clampConfigValue(
+                            fl["strength"].as<float>(),
+                            PostRange::kFilmStrengthMin,
+                            PostRange::kFilmStrengthMax,
+                            "graphics.post_process.film.strength");
+                    }
+                    if (fl["shadow_saturation"]) {
+                        cfg.ppFilmShadowSat = clampConfigValue(
+                            fl["shadow_saturation"].as<float>(),
+                            PostRange::kFilmSatMin, PostRange::kFilmSatMax,
+                            "graphics.post_process.film.shadow_saturation");
+                    }
+                    if (fl["highlight_saturation"]) {
+                        cfg.ppFilmHighSat = clampConfigValue(
+                            fl["highlight_saturation"].as<float>(),
+                            PostRange::kFilmSatMin, PostRange::kFilmSatMax,
+                            "graphics.post_process.film.highlight_saturation");
+                    }
+                    if (fl["tone_falloff"]) {
+                        cfg.ppFilmFalloff = clampConfigValue(
+                            fl["tone_falloff"].as<float>(),
+                            PostRange::kFilmFalloffMin,
+                            PostRange::kFilmFalloffMax,
+                            "graphics.post_process.film.tone_falloff");
+                    }
+                    readTint(fl, "shadow_tint", cfg.ppFilmShadowTint,
+                             "graphics.post_process.film.shadow_tint");
+                    readTint(fl, "highlight_tint", cfg.ppFilmHighTint,
+                             "graphics.post_process.film.highlight_tint");
+                }
+
+                // halation — warm bleed borrowed from the bloom pyramid.
+                if (YAML::Node ha = pp["halation"]) {
+                    if (ha["strength"]) {
+                        cfg.ppHalationStrength = clampConfigValue(
+                            ha["strength"].as<float>(),
+                            PostRange::kHalationMin, PostRange::kHalationMax,
+                            "graphics.post_process.halation.strength");
+                    }
+                    if (ha["threshold"]) {
+                        cfg.ppHalationThreshold = clampConfigValue(
+                            ha["threshold"].as<float>(),
+                            PostRange::kHaloThreshMin, PostRange::kHaloThreshMax,
+                            "graphics.post_process.halation.threshold");
+                    }
+                    if (ha["radius"]) {
+                        cfg.ppHalationRadius = clampConfigValue(
+                            ha["radius"].as<float>(),
+                            PostRange::kHaloRadiusMin, PostRange::kHaloRadiusMax,
+                            "graphics.post_process.halation.radius");
+                    }
+                    readTint(ha, "tint", cfg.ppHalationTint,
+                             "graphics.post_process.halation.tint");
+                }
+
+                // grain
+                if (YAML::Node gr = pp["grain"]) {
+                    if (gr["strength"]) {
+                        cfg.ppGrainStrength = clampConfigValue(
+                            gr["strength"].as<float>(),
+                            PostRange::kGrainMin, PostRange::kGrainMax,
+                            "graphics.post_process.grain.strength");
+                    }
+                    if (gr["size"]) {
+                        cfg.ppGrainSize = clampConfigValue(
+                            gr["size"].as<float>(),
+                            PostRange::kGrainSizeMin, PostRange::kGrainSizeMax,
+                            "graphics.post_process.grain.size");
                     }
                 }
 

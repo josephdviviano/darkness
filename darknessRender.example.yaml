@@ -33,6 +33,15 @@ graphics:
   # Sharpen mip levels to preserve detail at distance (default: false)
   sharp_mips: false
 
+  # Honour the tweq update-rate visibility gates (default: true).
+  # 184 of the 456 tweq configs shipped with the game run only while their
+  # object is on screen, and 9 only while it is off. True reproduces that.
+  # Turn it off if the gating ever reads worse than it simulates — a part
+  # caught mid-motion as it comes into view.
+  # This is a look-versus-fidelity dial, NOT a performance one: the whole
+  # tweq step measures 0.054 ms/frame on the heaviest shipped level.
+  tweq_visibility_gating: true
+
 
   # ── Internal render resolution / vintage mode ──
   # The scene renders at this size and the composite scales it to the window.
@@ -68,6 +77,36 @@ graphics:
     # (426x240); the 2px horizontal remainder is stretched, which is 0.16%
     # and invisible.
     integer: true
+
+  # ── Antialiasing ──
+  # Runs on the composite's output — the final image, after tone mapping and
+  # colour correction — because that is the image whose edges you see.
+  antialiasing:
+    # none | smaa
+    #
+    # smaa = SMAA 1x, the reference implementation at its Ultra quality
+    # preset. Three fullscreen passes: detect edges, look each edge's shape up
+    # in a precomputed coverage table, blend. Roughly 0.2-0.4 ms at 1080p, and
+    # FIXED — it does not scale with the lighting budget, which is why it is
+    # the antialiasing this engine can afford. MSAA was removed and
+    # supersampling deliberately not offered; see .claude/PLAN.VISUALS.md.
+    #
+    # Two requirements, both of which announce themselves if unmet:
+    #   * needs post_process.enabled — SMAA resolves the composite's output
+    #   * mutually exclusive with a below-native render_scale, which it would
+    #     smooth away
+    #
+    # Startup-only in one direction: the targets and the 180 KB lookup table
+    # are allocated only when this is `smaa` at launch. It can then be toggled
+    # live from the console (aa_mode), but a session that started with `none`
+    # cannot turn it on.
+    mode: none
+
+    # Edge-detection threshold. Lower finds more edges: more antialiasing,
+    # more work in the weight pass. The reference's presets are 0.05 (Ultra),
+    # 0.1 (Medium/High, and its documented default) and 0.15 (Low).
+    # Live-editable as smaa_threshold; `aa_debug edges` shows what it finds.
+    smaa_threshold: 0.1
 
   # Sky glow / sky overbright
   sky_glow:
@@ -190,11 +229,43 @@ graphics:
     # Master toggle (default: false — original-fidelity output)
     enabled: false
 
-    # Tone-mapping operator: none | reinhard | aces (default: none)
-    #   none     = clamp only; identical to the pre-post-process image
-    #   reinhard = c / (1 + c); simple, desaturates highlights
-    #   aces     = filmic curve with a proper highlight shoulder
+    # Tone-mapping operator (default: none)
+    #   none       = clamp only; identical to the pre-post-process image
+    #   reinhard   = c / (1 + c); simple, desaturates highlights
+    #   aces       = filmic curve with a proper highlight shoulder. A 2015
+    #                curve fit: it lifts middle grey (0.18 -> 0.267) and
+    #                pushes warm highlights toward yellow-white.
+    #   agx        = Blender/Godot's AgX. The best structural fit here: its
+    #                white point is 2.0 and so is our signal ceiling (the
+    #                lightmap 2x overbright convention), so 0.18 maps to
+    #                0.18 exactly and 2.0 to 1.0 exactly. Gentler, more
+    #                saturated highlight rolloff — a torch stays orange
+    #                instead of going white.
+    #   pbrneutral = Khronos PBR Neutral (2024). Preserves hue and albedo
+    #                rather than being filmic. Its black-point offset is
+    #                unconditional, so mid greys come out 0.04 darker; on
+    #                already-dark Thief content that reads as deeper blacks.
+    #   lottes     = Timothy Lottes (GDC 2016), midIn/midOut pinned to 0.18.
+    #                AgX's midtone behaviour with a much softer rolloff at
+    #                BOTH ends, which is the thing AgX does not give. Measured
+    #                against agx: shoulder 1.36 vs 0.76 of scene range (1.8x
+    #                longer), toe gradient 0.986 vs 1.013 (compressing rather
+    #                than linear), and 2.0 lands at 0.915 instead of clipping
+    #                to white — the reserve is what keeps a flame coloured.
     tonemap: none
+
+    # [agx] Curve contrast (0.6-2.0, default 1.25 = Godot's).
+    # Lower LIFTS the shadows and SHORTENS the shoulder; higher deepens and
+    # lengthens both. Middle grey stays at 0.18 either way.
+    agx_contrast: 1.25
+
+    # [lottes] Curve shape. Middle grey is pinned at 0.18 regardless of these.
+    lottes_contrast: 1.30    # 0.6-3.0
+    lottes_shoulder: 0.977   # 0.7-1.0; LOWER = longer, softer highlight rolloff
+    # Scene value that maps to display white; everything above it clips. Not a
+    # free knob — the curve constants are solved so f(white) == 1.0 exactly.
+    # 3.0 leaves the engine's own 2.0 ceiling at 0.915.
+    lottes_white: 3.0
 
     # Linear multiplier applied before tone mapping (0.0-8.0, default: 1.0)
     exposure: 1.0
@@ -251,10 +322,117 @@ graphics:
       prescale:   1.0    # intensity multiplier applied BEFORE blurring
       scale:      5.0    # intensity multiplier applied AFTER blurring
       saturation: 0.7    # saturation of the glow itself (0 = greyscale)
-      # NewDark's bloom_range is deliberately not implemented - the radius
-      # it asks for exceeds what this kernel expresses cleanly, and chasing
-      # it caused visible grain. The newdark style is therefore tighter than
-      # nominal: same decision about WHAT glows, smaller spread.
+
+      # [both] Glow radius as a percentage of the screen DIAGONAL - this is
+      # NewDark's bloom_range, and NewDark's own default is 2 (~29px at
+      # 1280x720). Live-editable as `bloom_range`.
+      #
+      # 0 DISABLES THE PYRAMID and is the default here. The chain then runs
+      # on iterations/blur_size alone, which is HPL2's actual construction.
+      #
+      # Above 0 the glow is widened by a progressive-downsample pyramid:
+      # each level halves resolution, so the radius comes from pyramid DEPTH
+      # rather than from a wider blur step. That distinction is the whole
+      # point - the 5-tap kernel is only a Gaussian at its designed tap
+      # spacing, so a bigger step does not widen the blur, it turns it into
+      # a sparse comb that aliases and reads as grain. Halving resolution
+      # doubles the reach while every filter stays at ~1 texel.
+      #
+      # Radius changes WIDTH only; the per-level contributions are scaled so
+      # that adding levels does not also brighten the glow.
+      range: 0.0
+
+    # ── Film response ──
+    # Runs between the tone curve and the colour-correction chain above.
+    # Two things a single global `saturation` cannot express:
+    #
+    #   1. desaturate the GLOOM while leaving bright warm sources alone
+    #   2. split tone — tint the two ends of the range differently
+    #
+    # Why it exists: measured over all 1,700 Thief 2 world textures, the art
+    # is 66.8% warm by pixel at 0.412 mean saturation. Global desaturation
+    # dulls the torches along with everything else; none at all leaves the
+    # world reading brown. The distinction is the whole effect.
+    #
+    # `strength` is the master dial and 0 is an EXACT no-op, so the whole
+    # stage ships off. Everything under it describes the look that strength
+    # scales toward — set the look once, then ride strength.
+    film:
+      # 0.0-1.0. Start low; 0.3-0.5 is a shroud, 1.0 is a statement.
+      strength: 0.0
+
+      # Saturation kept at each end (0.0-2.0). The shadow figure does the
+      # work: it greys the gloom without touching fire.
+      shadow_saturation: 0.55
+      highlight_saturation: 1.0
+
+      # Multiplicative split tone, [r, g, b], each 0.0-1.0. Multiplicative so
+      # neither end can ADD light — a tint that brightens would undo the
+      # gloom the stage exists to create.
+      #
+      # SHADOW TINT IS NEUTRAL BY DEFAULT AND SHOULD MOSTLY STAY THERE.
+      # Cool shadows are the obvious move and are wrong past a very small
+      # amount: visibly blue shadows read as a filter over the world rather
+      # than as darkness in it. Real gloom is inky and achromatic, and the
+      # original engine agrees — across all 32 retail missions of Thief 1 and
+      # 2 the authored ambient is never tinted, and Thief 1 has no field with
+      # which to. Shadows here get DESATURATED, not coloured.
+      # If you want a whisper of it, [0.97, 0.98, 1.00] is about the limit.
+      shadow_tint: [1.0, 1.0, 1.0]
+
+      # Highlights warm, because the light sources in this game are fire.
+      # Restrained on purpose — the target is a warm SOURCE in a neutral
+      # world, not a sepia frame.
+      highlight_tint: [1.0, 0.98, 0.94]
+
+      # How tightly each tint is confined to its own end of the range
+      # (0.25-6.0). Higher leaves more of the midtones untouched.
+      tone_falloff: 1.5
+
+    # ── Halation (the CineStill effect) ──
+    # CineStill 800T is Kodak Vision3 with the remjet anti-halation backing
+    # stripped off: light bright enough to punch through the emulsion
+    # reflects off the film base and re-exposes it from behind. Because long
+    # wavelengths penetrate deepest, the halo is red-orange.
+    #
+    # Two properties define it, and both are why this has its OWN chain
+    # rather than borrowing the bloom texture:
+    #
+    #   THRESHOLDED HARD — only genuinely intense sources halate. A dim lamp
+    #     does not. (Borrowing bloom inherited the amnesia style's lack of a
+    #     bright pass, so everything glowed slightly red.)
+    #   LOCAL — a halo hugging the source, not a screen-scale wash.
+    #     (Borrowing bloom inherited bloom.range, which at 2% is a ~27px
+    #     spread — about twice what this wants.)
+    #
+    # Same recipe as the digital-photography version: isolate the
+    # highlights, tint them, blur SMALL, add back. Independent of bloom.
+    halation:
+      strength: 0.0            # 0.0-4.0
+      tint: [1.0, 0.32, 0.12]  # red-orange, each 0.0-1.0
+
+      # Scene value a pixel must exceed to halate at all. 1.0 is a real
+      # number here rather than a taste call: lit world geometry reaches 2.0
+      # because of the lightmap overbright convention, so 1.0 is exactly
+      # "brighter than display white". Flames, lamps and the moon clear it;
+      # lit stone does not. Lower it and ordinary surfaces start to bleed.
+      threshold: 1.0           # 0.0-4.0
+
+      # Halo radius in OUTPUT PIXELS. Converted to blur iterations at quarter
+      # resolution, where one pass is ~6.5 px of sigma, so the reachable span
+      # is about 6.5-13 px and anything beyond says so rather than silently
+      # under-delivering. Deliberately tight — for a wide warm spread use
+      # bloom's own range with a warm tint; that is a different effect.
+      radius: 10.0             # 1.0-16.0
+
+    # ── Grain ──
+    # Additive and weighted into the SHADOWS, which is where a pushed stock
+    # puts it. Multiplicative grain vanishes in the blacks — nothing to
+    # multiply — which is the opposite of what pushed film looks like.
+    # Applied last, in display space.
+    grain:
+      strength: 0.0   # 0.0-0.5; 0.02-0.06 is a light dusting
+      size: 1.5       # 0.25-8.0 output pixels per noise cell; >1 clumps
 
 water:
   # Vertex wave displacement amplitude in world units (default: 0.3)
@@ -538,7 +716,8 @@ audio:
     #   - the bake's single-edge visRange cap (derived per mission from
     #     ROOM_DB room/portal spans — see [PATHING_BAKE_RANGE] in the
     #     bake log; runtime per-voice visRange is clamped to it with a
-    #     loud [FALLBACK]).
+    #     loud [FALLBACK]). `vis_range_override_ft` below is the one
+    #     escape hatch, and it is experimental rather than a tuning knob.
     #
     # Set to false to skip baking the pathing batch entirely. The
     # .probes file then contains only the reflection batch and Steam
@@ -555,6 +734,18 @@ audio:
     # global_dedup_radius_ft above. 0 disables the pass. Re-bake
     # required.
     dedup_radius_ft: 10.0  # (0.0–30.0)
+    # EXPERIMENTAL A/B lever, not a tuning knob. 0 (default) uses the
+    # coverage-derived visRange described in the CODE-OWNED note above;
+    # any other value FORCES the bake's single-edge visRange to exactly
+    # that, bypassing the derivation and its clamps. It announces itself
+    # (`[PATHING_BAKE_RANGE] EXPERIMENTAL OVERRIDE`, printing the derived
+    # value alongside for comparison) and is written into the .probes
+    # header like the derived value, so runtime clamping follows it
+    # automatically rather than disagreeing with the cache.
+    # Offline analysis suggests ~80 ft keeps the aperture graph healthy
+    # at a fraction of the edges — that sweep is what this exists for.
+    # Re-bake required.
+    vis_range_override_ft: 0.0  # (0.0–400.0; 0 = coverage-derived)
     # Probe layout density tier. The layout is the original Dark
     # Engine room/portal graph's nodes; density dials realism UP from
     # that baseline at stated cost (bake pairs AND the runtime path
@@ -652,6 +843,14 @@ audio:
     # lower visibility threshold / denser probes) is too expensive. Does
     # NOT affect the LPF blocking factor — only amplitude.
     pathing_gain_scale: 1.0      # multiplier on pathing gain (0.1–10.0)
+    # Multiplier on the pathing-derived LPF blocking factor — the companion
+    # to pathing_gain_scale, for the filter rather than the amplitude.
+    # Steam Audio returns very low eqHigh for cross-room voices (~0.02
+    # typical), so the plain mapping `blocking = 1 - eqHigh` pegs the door
+    # LPF at its floor and makes distant ambients unrecognisably muffled.
+    # Lower this to keep the filter more open. Range 0.0-1.0; 1.0 = the
+    # unscaled mapping.
+    pathing_blocking_scale: 1.0
     # Steam Audio pathing-simulation throttle. The sim runs on the
     # PathingSimulator worker thread; this interval sets how often the
     # worker is signalled. 0.1 s (10 Hz) matches the Unity/Unreal Steam

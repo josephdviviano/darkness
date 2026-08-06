@@ -535,6 +535,28 @@ inline RayOBBResult rayVsOBB(
     return result;
 }
 
+/// Ray-vs-box for a box that has no persistent collision body of its own:
+/// a rigid pose (rotation + translation, NO scale) plus final world-space edge
+/// lengths, with the box centred on the pose's origin. That is the convention
+/// DoorSystem publishes its door leaves in (getCurrentWorldMatrix +
+/// DoorState::edgeLengths), so a caller can test the leaf where it currently
+/// swings without the door needing an entry in the collision world.
+///
+/// @param pose         Rigid world transform; its translation is the box centre
+/// @param edgeLengths  Full edge lengths (X, Y, Z) — NOT half-extents
+inline RayOBBResult rayVsBoxPose(const Matrix4 &pose, const Vector3 &edgeLengths,
+                                 const Vector3 &rayStart, const Vector3 &rayEnd) {
+    ObjectCollisionBody box;
+    box.objID = 0;
+    box.shapeType = CollisionShapeType::OBB;
+    box.worldPos = Vector3(pose[3]);
+    box.edgeLengths = edgeLengths;
+    // Rigid by contract, so the columns are already the box's unit axes —
+    // nothing to normalize out.
+    box.rotation = Matrix3(pose);
+    return rayVsOBB(rayStart, rayEnd, box);
+}
+
 /// Compute the world-space outward normal for a given OBB face index (0-5).
 ///
 /// Face index mapping matches the Dark Engine convention:

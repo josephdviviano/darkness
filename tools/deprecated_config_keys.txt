@@ -1,0 +1,20 @@
+# Config keys the parser reads ONLY to report that they are gone.
+#
+# They are deliberately absent from darknessRender.example.yaml — documenting a
+# removed key invites its use — but they must stay parsed, per the CFG-1 rule
+# that a key is deleted or made real, never left silently inert. A config that
+# still sets one gets a [FALLBACK] / [CONFIG_DEPRECATED] line naming the
+# replacement.
+#
+# Read by BOTH tools/config_audit.py and tests/test_config_help.cpp, so the
+# list exists once. Adding a name here is a claim that the parse site emits a
+# deprecation message and stores nothing — verify that before adding one.
+#
+# One key per line. Blank lines and # comments ignored.
+
+msaa                  # removed 2026-08-05 with MSAA itself; use graphics.antialiasing
+bake_skip             # reflection-bake skip, removed with the Valve-pattern migration
+type                  # reflections.type — HYBRID is the only algorithm now
+runtime_ir_clamp_ms   # superseded by reflections.hybrid_transition_time
+distance_model        # always INVERSEDISTANCE, per-voice from the schema's P$SchAttFac
+falloff_curve         # Dark Engine centibel curve; Steam Audio owns attenuation now
