@@ -1,9 +1,11 @@
-$input v_texcoord0, v_texcoord1, v_fogDist
+$input v_texcoord0, v_texcoord1, v_worldPos, v_fogDist
 
 #include <bgfx_shader.sh>
+#include "lm_specular.sh"
 
 SAMPLER2D(s_texColor, 0);
 SAMPLER2D(s_texLightmap, 1);
+SAMPLER2D(s_texLmDir, 2);
 
 uniform vec4 u_fogColor;
 uniform vec4 u_fogParams;
@@ -16,6 +18,9 @@ uniform vec4 u_fogParams;
 // "Lightmap scale" has the evidence.
 uniform vec4 u_lightmapScale;
 uniform vec4 u_lmAtlasSize;  // x = width, y = height
+// Dominant-direction specular (see lm_specular.sh for the layout).
+uniform vec4 u_specParams;
+uniform vec4 u_camPosWorld;
 
 // Cubic B-spline basis functions for bicubic filtering.
 // Uses Godot's 4-tap approach: combine pairs of cubic weights and use
@@ -57,12 +62,22 @@ void main()
 {
     vec4 diffuse = texture2D(s_texColor, v_texcoord0);
     if (diffuse.a < 0.5) discard;
+    // u_lightmapScale.y = lighting-only debug view. Must stay in step with
+    // fs_lightmapped.sc — the console toggle drives both programs.
+    diffuse.rgb = mix(diffuse.rgb, vec3(1.0, 1.0, 1.0), u_lightmapScale.y);
 
     // Bicubic-filtered lightmap sample
     vec4 light = sampleBicubicLm(s_texLightmap, v_texcoord1, u_lmAtlasSize.xy);
 
     // Modulate diffuse by lightmap (2x intensity to match Dark Engine convention)
     vec4 finalColor = vec4(diffuse.rgb * light.rgb * u_lightmapScale.x, diffuse.a);
+
+    // Rough Fresnel specular from the baked dominant direction — must stay
+    // in step with fs_lightmapped.sc. Direction is low-frequency; plain
+    // bilinear is fine even in the bicubic program.
+    vec4 dirTex = texture2D(s_texLmDir, v_texcoord1);
+    finalColor.rgb += lmSpecular(dirTex, v_worldPos, u_camPosWorld.xyz,
+                                 light.rgb, diffuse.rgb, u_specParams);
 
     // Linear distance fog
     float fogFactor = clamp(v_fogDist / u_fogParams.y, 0.0, 1.0) * u_fogParams.x;

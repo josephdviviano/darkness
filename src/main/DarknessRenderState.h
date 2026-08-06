@@ -46,7 +46,9 @@
 #include "DarknessRendererCore.h"
 #include "DarknessRendererExtended.h"
 #include "LightmapAtlas.h"
+#include "LightmapBake.h"
 #include "LightingSystem.h"
+#include "SpecularMaterials.h"
 #include "ObjectPropParser.h"
 #include "BinMeshParser.h"
 #include "ObjectVisibility.h"
@@ -79,6 +81,10 @@ class ScriptManager;
 // any GPU resources are created.
 
 struct MissionData {
+    // Where this mission was loaded from. The re-bake cache lives beside it
+    // (`<mission>.lmbake`), following the audio probe-bake precedent.
+    std::string                                       sourceMisPath;
+
     // World geometry + portal graph
     WRParsedData                                      wrData;
     std::vector<std::vector<CellPortalInfo>>          cellPortals;
@@ -200,6 +206,10 @@ struct GPUResources {
     bgfx::UniformHandle u_objectLight  = BGFX_INVALID_HANDLE;  // .rgb = per-object lighting tint (scalar path)
     bgfx::UniformHandle u_lmAtlasSize  = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_lightmapScale = BGFX_INVALID_HANDLE;
+    // Dominant-direction specular (lm_specular.sh).
+    bgfx::UniformHandle s_texLmDir     = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_specParams   = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_camPosWorld  = BGFX_INVALID_HANDLE;
 
     // Per-object light array uniforms (per-vertex path). Sized at
     // creation by kObjectLightCap (single source of truth in
@@ -220,6 +230,29 @@ struct GPUResources {
     // Lightmap atlas
     LightmapAtlasSet                                       lmAtlasSet;
     std::vector<bgfx::TextureHandle>                       lightmapAtlasHandles;
+    // Parallel atlas holding OUR recomputed lumels (PLAN.HIGH_RES_SHADOWS S0).
+    // Same LmapEntry placements as the shipped atlas, so the world mesh UVs
+    // address either one and the A/B is a texture swap with nothing else
+    // changing. Empty unless --rebake-lightmaps was passed.
+    std::vector<bgfx::TextureHandle>                       rebakedAtlasHandles;
+    // The re-bake's CPU-side state: the density-scaled placement + atlas
+    // buffer (atlases[0] holds the CURRENT blended frame; the pristine base
+    // lives in rebakedAnimPolys' baseCrops), the per-polygon overlay records,
+    // and an index for the per-frame animated blend. rebakedDensity is the
+    // bake density the placement was scaled by.
+    LightmapAtlasSet                                       rebakedAtlasSet;
+    std::vector<RebakedAnimPoly>                           rebakedAnimPolys;
+    std::unordered_map<uint64_t, size_t>                   rebakedAnimIndex;
+    int                                                    rebakedDensity = 1;
+    // Dominant-direction atlas (octa dir + ratio + openness) — the compact
+    // directional lightmap behind the specular term. Invalid when the bake
+    // ran without it; the draw path then zeroes u_specParams.z.
+    bgfx::TextureHandle                                    rebakedDirHandle =
+        BGFX_INVALID_HANDLE;
+    // Per-texture-index specular presets (SpecularMaterials.h), resolved
+    // from TXLIST names through the acoustic keyword pipeline. World draws
+    // batch per texture, so the material arrives as per-draw uniforms.
+    std::array<SpecularPreset, 256>                        texSpecular{};
 
     // Water
     bgfx::VertexBufferHandle  waterVBH = BGFX_INVALID_HANDLE;
@@ -366,6 +399,45 @@ struct RuntimeState {
     uint32_t frameIndex = 0;
 
     int   lightmapFiltering = 0;  // 0=bilinear (default), 1=bicubic
+    // Bind our OWN recomputed lightmap atlas instead of the shipped one.
+    // Only meaningful when --rebake-lightmaps built it at load; the toggle
+    // refuses rather than silently showing the shipped atlas (see the
+    // [FALLBACK] in the console setter).
+    bool  useRebakedLightmaps = false;
+    // Force a full animated re-blend of the re-baked atlas on the next
+    // update. Set at load and whenever the atlas toggle flips: while the
+    // OTHER atlas was displayed this one's blended state went stale, and a
+    // stale blend looks exactly like "the toggle did nothing".
+    bool  rebakedBlendForceAll = true;
+    // Physically-typed lamp flicker (PLAN.FLICKER_PHYSICS.md). Modulates the
+    // RE-BAKED path only — the shipped atlas IS the vintage look and its
+    // blend gate keeps reading the vintage envelope, so vintage stays exact
+    // and cheap. flickerScale scales the DEVIATION (0 = exactly vintage).
+    // Defaults ON because it can only ACTIVATE under --rebake-lightmaps
+    // (itself opt-in) — the flag pair is "modernized lighting"; the console
+    // toggle opts back out.
+    bool  flickerPhysical = true;
+    float flickerScale    = 1.0f;
+    // Dominant-direction specular ("reflections", PLAN.HIGH_RES_SHADOWS §S6):
+    // per-material Fresnel sheen (SpecularMaterials.h carries the physics).
+    // These are MASTER scales over the material presets: strength multiplies
+    // F0/F90 (0 = identity/off), power multiplies each material's exponent.
+    // Physical values = 1.0/1.0.
+    float specStrength = 1.0f;
+    float specPower    = 1.0f;
+    // Last frame's portal-culling result, kept so the flicker blend can skip
+    // polygons nobody can see. Empty = no filtering (culling disabled), the
+    // same convention the render passes use.
+    std::unordered_set<uint32_t> lastVisibleCells;
+    // Lighting-only debug view: replace world albedo with white so the raw
+    // light field is visible. Against a real 64x64 stone texture the ~1
+    // world-unit lumel grid is masked by albedo detail — this is what makes
+    // the resolution problem visible rather than merely measurable.
+    bool  lightmapViewOnly  = false;
+    // Point-sample the lightmap atlas. Bilinear filtering smooths the lumel
+    // grid into exactly the soft blobs that hide it; POINT shows the texels
+    // as they are actually stored.
+    bool  lightmapPointFilter = false;
 
     /// Multiplier on the lightmap in the world shaders — the "2X modulate"
     /// factor. See graphics.lightmap_scale and NOTES.PROJECT.md "Lightmap

@@ -79,6 +79,10 @@
 // findCameraCell — the WR cell lookup raycastWorld does before tracing.
 // bgfx-free (see RayCaster.h), so it is safe in the headless binary.
 #include "CellGeometry.h"
+// lightmap_rebake verb — S0 of PLAN.HIGH_RES_SHADOWS.md. Also bgfx-free.
+#include "LightmapBake.h"
+#include "FlickerSynthesis.h"
+#include "RenderParamsParser.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -887,6 +891,589 @@ static void printWRCells(const std::string &misPath) {
                 "bad_plane=%d bad_idx=%d\n",
                 wr.numCells, polyCount, portalCount, solidCount,
                 badPlane, badIdx);
+}
+
+// ---------- lightmap_rebake ----------
+//
+// S0 of PLAN.HIGH_RES_SHADOWS.md: recompute the shipped lumels from the
+// mission's own light table and report how far off we are. Service-less —
+// parseWRChunk and parseRenderParamsChunk both read the .mis directly.
+//
+// The comparison target is the shipped static layer PLUS every animated
+// overlay at full intensity, because that is the state a bake over all of the
+// cell's lights reproduces, and it needs no AnimLight property mapping.
+//
+// Residuals are broken out by category, because a formula error hides in a
+// category rather than in the mean: sun-lit polygons, spot-lit polygons and
+// animated polygons each exercise a different branch.
+
+struct RebakeResidual {
+    std::vector<float> absErr;   // |ours - shipped|, 0..1 per channel
+    // Pairs are kept (capped) so the residual can be re-measured AFTER
+    // dividing out each variant's own brightness error. Without that, any
+    // comparison between two formula variants is really a comparison of which
+    // one happens to be dimmer — which is exactly how the half-Lambert vs
+    // plain-cosine question got the wrong answer the first time.
+    std::vector<std::pair<float, float>> pairs;
+    static constexpr size_t kMaxPairs = 4000000;
+    double sumOurs = 0.0, sumShipped = 0.0, sumOurShip = 0.0, sumOurOur = 0.0;
+    uint64_t samples = 0;
+
+    void add(float ours, float shipped) {
+        absErr.push_back(std::fabs(ours - shipped));
+        if (pairs.size() < kMaxPairs) pairs.emplace_back(ours, shipped);
+        sumOurs += ours;
+        sumShipped += shipped;
+        sumOurShip += static_cast<double>(ours) * shipped;
+        sumOurOur += static_cast<double>(ours) * ours;
+        ++samples;
+    }
+
+    // |k*ours - shipped| percentiles at the least-squares k. This is the number
+    // to compare formula variants on: it asks "is the SHAPE right", with the
+    // overall brightness error factored out.
+    void scaledPercentiles(float &p50, float &p95) {
+        p50 = p95 = 0.0f;
+        if (pairs.empty()) return;
+        const float k = static_cast<float>(fitScale());
+        std::vector<float> e;
+        e.reserve(pairs.size());
+        for (const auto &pr : pairs) e.push_back(std::fabs(k * pr.first - pr.second));
+        std::sort(e.begin(), e.end());
+        p50 = e[e.size() / 2];
+        p95 = e[static_cast<size_t>(0.95 * (e.size() - 1))];
+    }
+    float pct(double q) {
+        if (absErr.empty()) return 0.0f;
+        std::sort(absErr.begin(), absErr.end());
+        size_t i = static_cast<size_t>(q * (absErr.size() - 1));
+        return absErr[i];
+    }
+    // Least-squares k minimising |k*ours - shipped|. A k far from 1 is a
+    // brightness-scale error, which is the single most likely formula defect
+    // and the one an error histogram alone would not name.
+    double fitScale() const {
+        return sumOurOur > 1e-12 ? sumOurShip / sumOurOur : 0.0;
+    }
+    void report(const char *label) {
+        if (samples == 0) {
+            std::printf("REBAKE %-10s (no samples)\n", label);
+            return;
+        }
+        float sp50 = 0.0f, sp95 = 0.0f;
+        scaledPercentiles(sp50, sp95);
+        std::printf("REBAKE %-10s n=%-9llu  |err| p50=%5.1f p95=%5.1f "
+                    "max=%5.1f /255   scale=%.3f -> SHAPE p50=%5.1f p95=%5.1f\n",
+                    label, static_cast<unsigned long long>(samples),
+                    pct(0.50) * 255.0f, pct(0.95) * 255.0f, pct(1.0) * 255.0f,
+                    fitScale(), sp50 * 255.0f, sp95 * 255.0f);
+    }
+};
+
+static int runLightmapRebakeVerb(const std::string &misPath,
+                                 int stride,
+                                 const Darkness::BakeFormula &f,
+                                 bool staticOnly) {
+    Darkness::WRParsedData wr;
+    try {
+        wr = Darkness::parseWRChunk(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "lightmap_rebake: failed to parse WR chunk in "
+                     "'%s': %s\n", misPath.c_str(), e.what());
+        return 1;
+    }
+    if (wr.numCells == 0) {
+        std::fprintf(stderr, "lightmap_rebake: '%s' has 0 WR cells\n",
+                     misPath.c_str());
+        return 1;
+    }
+    const Darkness::RenderParams rp =
+        Darkness::parseRenderParamsChunk(misPath);
+
+    const char *fivebitName =
+        f.fivebit == Darkness::BakeFormula::FiveBit::Exact ? "exact"
+        : f.fivebit == Darkness::BakeFormula::FiveBit::Continuous ? "continuous"
+        : "off";
+
+    std::printf("lightmap_rebake: %s\n", misPath.c_str());
+    std::printf("  cells=%u  static lights=%d  sun=%s (scaled rgb %.1f %.1f %.1f)\n",
+                wr.numCells, wr.numStaticLights, rp.useSun ? "on" : "off",
+                rp.sunScaledRgb.x, rp.sunScaledRgb.y, rp.sunScaledRgb.z);
+    std::printf("  formula: half-Lambert=%d spot-as-cone=%d bright-scale=%.3f "
+                "surface-offset=%.3f  polygon stride=%d\n",
+                f.halfLambert ? 1 : 0, f.spotAsCone ? 1 : 0, f.brightScale,
+                f.surfaceOffset, stride);
+    std::printf("  visibility: %s%s  storage: 5-bit %s\n",
+                f.traceFromLight ? "light->surface (original direction)"
+                                 : "surface->light",
+                f.clampToWorld ? ", clamp-to-world pre-ray" : ", no clamp",
+                fivebitName);
+
+    // The light->surface trace starts in each light's own cell, resolved once
+    // — the same registration step the original performs. A light outside
+    // every cell casts nothing; that is a divergence from authored intent, so
+    // it is reported here rather than silently absorbed.
+    Darkness::BakeStats preStats;
+    const std::vector<int32_t> lightCells =
+        Darkness::resolveLightCells(wr, &preStats.lightsNoCell);
+    if (preStats.lightsNoCell)
+        std::printf("  WARNING: %llu static lights resolve to NO cell and "
+                    "will cast nothing under light->surface tracing\n",
+                    static_cast<unsigned long long>(preStats.lightsNoCell));
+
+    // --static-only: bake with the animated lights masked out and compare
+    // against the shipped STATIC layer alone. This sidesteps the animated-
+    // brightness ambiguity (the table's `bright` for an animated light is its
+    // save-time state, not what the overlay encodes — see lightmap_overlays),
+    // so it is the honest parity for the non-animated construction.
+    std::vector<uint8_t> lightMask;
+    if (staticOnly) {
+        const std::vector<uint8_t> animated = Darkness::animatedLightSet(wr);
+        lightMask.assign(wr.staticLights.size(), 1);
+        int animCount = 0;
+        for (size_t i = 0; i < animated.size(); ++i)
+            if (animated[i]) { lightMask[i] = 0; ++animCount; }
+        std::printf("  static-only: %d animated lights masked out; reference "
+                    "is the shipped static layer alone\n", animCount);
+    }
+
+    RebakeResidual all, sunLit, spotLit, animated, plain, offPoly;
+    // Per-channel and saturation accounting. A residual that merges the three
+    // channels cannot see a HUE error at all — it reports the same number for
+    // "too bright" and "grey where it should be warm".
+    double chOurs[3] = {0,0,0}, chShip[3] = {0,0,0};
+    double satOurs = 0.0, satShip = 0.0;
+    uint64_t satN = 0;
+    Darkness::BakeStats stats;
+    std::vector<Darkness::Vector3> ours, shipped;
+    std::vector<uint8_t> insidePoly;
+    uint64_t polysDone = 0, gridFail = 0;
+
+    int seen = 0;
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        const auto &cell = wr.cells[ci];
+
+        // Category flags are per cell for the light-set ones: which branches
+        // this cell's polygons will exercise.
+        bool hasSun = false, hasSpot = false;
+        const auto &lt = cell.lightIndices;
+        const int n = lt.empty() ? 0 : static_cast<int>(lt[0]);
+        for (int k = 0; k < n && k + 1 < static_cast<int>(lt.size()); ++k) {
+            const int32_t li = lt[k + 1];
+            if (li == 0) { hasSun = true; continue; }
+            if (li < static_cast<int32_t>(wr.staticLights.size()) &&
+                wr.staticLights[li].inner != -1.0f)
+                hasSpot = true;
+        }
+
+        for (int pi = 0; pi < cell.numTextured; ++pi) {
+            if (pi >= static_cast<int>(cell.lightInfos.size())) break;
+            const auto &li = cell.lightInfos[pi];
+            if (li.lx <= 0 || li.ly <= 0) continue;
+            if ((seen++ % stride) != 0) continue;
+
+            if (!Darkness::bakePolygon(wr, rp, ci, pi, f, lightCells, ours,
+                                       stats, &insidePoly,
+                                       lightMask.empty() ? nullptr
+                                                         : lightMask.data())) {
+                ++gridFail;
+                continue;
+            }
+            if (f.density != 1) { ++polysDone; continue; }  // no shipped reference at other densities
+            if (!Darkness::shippedLumelsAllOn(wr, ci, pi, shipped,
+                                              /*withOverlays=*/!staticOnly))
+                continue;
+            if (ours.size() != shipped.size()) continue;
+
+            for (size_t p = 0; p < ours.size(); ++p) {
+                const float o[3] = {std::min(1.0f, ours[p].x),
+                                    std::min(1.0f, ours[p].y),
+                                    std::min(1.0f, ours[p].z)};
+                const float s[3] = {shipped[p].x, shipped[p].y, shipped[p].z};
+                // Texels with no surface under them are held out of every
+                // other bucket: the shipped baker had to invent them too, so
+                // scoring them measures two guesses against each other.
+                const bool off = p < insidePoly.size() && !insidePoly[p];
+                if (!off) {
+                    for (int c = 0; c < 3; ++c) { chOurs[c] += o[c]; chShip[c] += s[c]; }
+                    const float mxO = std::max({o[0],o[1],o[2]});
+                    const float mnO = std::min({o[0],o[1],o[2]});
+                    const float mxS = std::max({s[0],s[1],s[2]});
+                    const float mnS = std::min({s[0],s[1],s[2]});
+                    // Saturation as (max-min)/max: 0 = grey, 1 = fully saturated.
+                    if (mxO > 0.004f) satOurs += (mxO - mnO) / mxO;
+                    if (mxS > 0.004f) satShip += (mxS - mnS) / mxS;
+                    ++satN;
+                }
+                for (int c = 0; c < 3; ++c) {
+                    if (off) { offPoly.add(o[c], s[c]); continue; }
+                    all.add(o[c], s[c]);
+                    if (li.animflags)   animated.add(o[c], s[c]);
+                    else if (hasSpot)   spotLit.add(o[c], s[c]);
+                    else if (hasSun)    sunLit.add(o[c], s[c]);
+                    else                plain.add(o[c], s[c]);
+                }
+            }
+            ++polysDone;
+        }
+    }
+
+    std::printf("  polygons baked=%llu (grid build failed on %llu), "
+                "lumels=%llu, rays=%llu (blocked %.1f%%, needed retry %.2f%%, "
+                "UNRESOLVED after retries %.3f%%)\n",
+                static_cast<unsigned long long>(polysDone),
+                static_cast<unsigned long long>(gridFail),
+                static_cast<unsigned long long>(stats.lumels),
+                static_cast<unsigned long long>(stats.rays),
+                stats.rays ? 100.0 * stats.rayBlocked / stats.rays : 0.0,
+                stats.rays ? 100.0 * stats.rayRetried / stats.rays : 0.0,
+                stats.rays ? 100.0 * stats.rayUnevaluable / stats.rays : 0.0);
+    {
+        // Which non-clean status, not just how many. "Outside every cell" is a
+        // bug in where we put the sample; "ran out of cell budget" is a real
+        // limit of long rays. They need different fixes. Under light->surface
+        // tracing this also splits crack-blocked (DiscardNoPolygon — blocked
+        // by the original's semantics) from budget-exhausted (ours alone).
+        uint64_t any = 0;
+        for (int s = 0; s < 16; ++s) any += stats.byStatus[s];
+        if (any) {
+            std::printf("  non-clean ray outcomes by status:");
+            for (int s = 0; s < 16; ++s) {
+                if (!stats.byStatus[s]) continue;
+                std::printf(" %s=%llu (%.2f%%)",
+                            Darkness::rayStatusName(static_cast<Darkness::RayStatus>(s)),
+                            static_cast<unsigned long long>(stats.byStatus[s]),
+                            stats.rays ? 100.0 * stats.byStatus[s] / stats.rays : 0.0);
+            }
+            std::printf("\n");
+        }
+    }
+    if (stats.clampRays)
+        std::printf("  clamp pre-rays=%llu: moved %llu lumel targets (%.2f%%), "
+                    "%llu unproven (kept as-is)\n",
+                    static_cast<unsigned long long>(stats.clampRays),
+                    static_cast<unsigned long long>(stats.clampMoved),
+                    100.0 * stats.clampMoved / stats.clampRays,
+                    static_cast<unsigned long long>(stats.clampUnproven));
+    if (stats.emitterRecell)
+        std::printf("  penumbra origins outside the light's cell: %llu "
+                    "(re-searched)\n",
+                    static_cast<unsigned long long>(stats.emitterRecell));
+    std::printf("  lumels on-polygon=%llu off-polygon=%llu (%.1f%%); "
+                "unresolved rays: on-poly %.3f%% of %llu, off-poly %.3f%% of %llu\n",
+                static_cast<unsigned long long>(stats.lumelsInside),
+                static_cast<unsigned long long>(stats.lumelsOutside),
+                (stats.lumelsInside + stats.lumelsOutside)
+                    ? 100.0 * stats.lumelsOutside
+                        / (stats.lumelsInside + stats.lumelsOutside) : 0.0,
+                stats.raysInside ? 100.0 * stats.unresolvedInside / stats.raysInside : 0.0,
+                static_cast<unsigned long long>(stats.raysInside),
+                stats.raysOutside ? 100.0 * stats.unresolvedOutside / stats.raysOutside : 0.0,
+                static_cast<unsigned long long>(stats.raysOutside));
+    if (stats.sunTests)
+        std::printf("  sky-access traces=%llu, reached sky=%llu (%.1f%%)\n",
+                    static_cast<unsigned long long>(stats.sunTests),
+                    static_cast<unsigned long long>(stats.sunLit),
+                    100.0 * stats.sunLit / stats.sunTests);
+    if (stats.penumbraTrivial + stats.penumbraRefined)
+        std::printf("  penumbra: %llu lumel-lights trivial, %llu refined (%.1f%% on an edge)\n",
+                    (unsigned long long)stats.penumbraTrivial,
+                    (unsigned long long)stats.penumbraRefined,
+                    100.0 * stats.penumbraRefined /
+                        (stats.penumbraTrivial + stats.penumbraRefined));
+    if (satN) {
+        std::printf("  per-channel mean  ours R%.4f G%.4f B%.4f | shipped R%.4f G%.4f B%.4f\n",
+                    chOurs[0]/satN, chOurs[1]/satN, chOurs[2]/satN,
+                    chShip[0]/satN, chShip[1]/satN, chShip[2]/satN);
+        std::printf("  mean saturation   ours %.4f | shipped %.4f  %s\n",
+                    satOurs/satN, satShip/satN,
+                    satOurs/satN < 0.5 * satShip/satN
+                        ? "<-- OURS IS WASHED OUT: colour is being lost" : "");
+    }
+    // Are the lights themselves coloured on disk? If not, no bake can be.
+    {
+        int coloured = 0, considered = 0;
+        for (size_t i = 1; i < wr.staticLights.size(); ++i) {
+            const auto &b = wr.staticLights[i].bright;
+            const float mx = std::max({b.x, b.y, b.z});
+            const float mn = std::min({b.x, b.y, b.z});
+            if (mx <= 0.0f) continue;
+            ++considered;
+            if ((mx - mn) / mx > 0.02f) ++coloured;
+        }
+        std::printf("  static light table: %d/%d lights carry a colour "
+                    "(>2%% channel spread)\n", coloured, considered);
+    }
+    all.report("ALL");
+    plain.report("plain");
+    sunLit.report("sun");
+    spotLit.report("spot");
+    animated.report("animated");
+    offPoly.report("off-poly");
+    return 0;
+}
+
+// ---------- lightmap_overlays ----------
+//
+// Per-overlay parity: identify, for each shipped animated-light overlay, WHICH
+// static-table light produced it and at WHAT brightness — by baking every
+// candidate light in the cell's list at UNIT WHITE brightness and fitting the
+// per-channel scale that best explains the shipped bytes. Exists to answer two
+// questions the all-on residual cannot:
+//
+//  1. What does an animated light's table `bright` mean? The renderer already
+//     synthesizes anim_max×colour and OVERWRITES it at load because some
+//     animated lights are baked at min-brightness (disk bright ~0) — so the
+//     overlay's encoded brightness and the disk field are known to disagree.
+//     The fitted scale IS the encoded brightness; the ratio against the disk
+//     field is the answer.
+//  2. Is `animMap[bit]` a static-table index? If the best-fit light's index
+//     equals it, the renderer's position-match heuristic is redundant.
+//
+// Unit-bright shape probing works because a point light's lumel pattern
+// (falloff × visibility) identifies it nearly uniquely within a cell; the
+// scale then falls out linearly. The candidate bake runs Continuous 5-bit
+// (linear in brightness, carries the storage scale) with no cutoff.
+static int runLightmapOverlaysVerb(const std::string &misPath, int stride) {
+    Darkness::WRParsedData wr;
+    try {
+        wr = Darkness::parseWRChunk(misPath);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "lightmap_overlays: failed to parse WR chunk in "
+                     "'%s': %s\n", misPath.c_str(), e.what());
+        return 1;
+    }
+    if (wr.numCells == 0) {
+        std::fprintf(stderr, "lightmap_overlays: '%s' has 0 WR cells\n",
+                     misPath.c_str());
+        return 1;
+    }
+    const Darkness::RenderParams rp =
+        Darkness::parseRenderParamsChunk(misPath);
+
+    Darkness::BakeFormula f;   // defaults = the parity-validated construction
+    f.penumbraSamples = 1;
+    f.supersample     = 1;
+    f.fivebit         = Darkness::BakeFormula::FiveBit::Continuous;
+    f.includeAmbient  = false;   // overlays carry ONE light, nothing else
+    f.includeSun      = false;
+    f.illumCutoff     = 0.0f;    // unit-bright probe: cutoff would clip wrong
+
+    Darkness::BakeStats stats;
+    const std::vector<int32_t> lightCells =
+        Darkness::resolveLightCells(wr, &stats.lightsNoCell);
+
+    std::printf("lightmap_overlays: %s  (stride %d)\n", misPath.c_str(), stride);
+
+    std::vector<Darkness::Vector3> ours, shipped;
+    std::vector<uint8_t> insidePoly;
+    std::vector<uint8_t> mask(wr.staticLights.size(), 0);
+
+    uint64_t overlaysSeen = 0, overlaysFit = 0, overlaysDark = 0;
+    uint64_t mapMatches = 0, mapValid = 0;
+    // ratio = fitted peak / disk-bright peak, the "what does bright mean"
+    // number. Collected only where the disk peak is nonzero.
+    std::vector<float> ratios, fitScales;
+    uint64_t zeroDiskBright = 0;
+    int examples = 0;
+
+    int seen = 0;
+    for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        Darkness::WRParsedCell &cell = wr.cells[ci];
+        const auto &lt = cell.lightIndices;
+        const int nLights = lt.empty() ? 0 : static_cast<int>(lt[0]);
+        for (int pi = 0; pi < cell.numTextured; ++pi) {
+            if (pi >= static_cast<int>(cell.lightInfos.size())) break;
+            const auto &li = cell.lightInfos[pi];
+            if (li.animflags == 0 || li.lx <= 0 || li.ly <= 0) continue;
+            if ((seen++ % stride) != 0) continue;
+
+            int overlayIdx = 0;
+            uint32_t flags = li.animflags;
+            while (flags) {
+                const int bit = __builtin_ctz(flags);
+                flags &= flags - 1;
+                const int thisOverlay = overlayIdx++;
+                if (!Darkness::shippedOverlayLumels(wr, ci, pi, thisOverlay,
+                                                    shipped))
+                    continue;
+                ++overlaysSeen;
+
+                // A fully dark overlay identifies nothing.
+                float shippedPeak = 0.0f;
+                for (const auto &v : shipped)
+                    shippedPeak = std::max({shippedPeak, v.x, v.y, v.z});
+                if (shippedPeak <= 0.0f) { ++overlaysDark; continue; }
+
+                const int16_t mapVal =
+                    (bit < static_cast<int>(cell.animMap.size()))
+                        ? cell.animMap[bit] : -1;
+
+                // Fit every candidate light in this cell's list.
+                int   bestIdx = -1;
+                float bestResid = 1e30f;
+                Darkness::Vector3 bestScale(0.0f);
+                for (int k = 0; k < nLights &&
+                                k + 1 < static_cast<int>(lt.size()); ++k) {
+                    const int32_t lightIdx = lt[k + 1];
+                    if (lightIdx <= 0 ||
+                        lightIdx >= static_cast<int32_t>(wr.staticLights.size()))
+                        continue;
+
+                    // Unit-white probe: overwrite bright, bake, restore.
+                    Darkness::WRStaticLight &L = wr.staticLights[lightIdx];
+                    const Darkness::Vector3 savedBright = L.bright;
+                    L.bright = Darkness::Vector3(1.0f);
+                    std::fill(mask.begin(), mask.end(), 0);
+                    mask[lightIdx] = 1;
+                    const bool ok = Darkness::bakePolygon(
+                        wr, rp, ci, pi, f, lightCells, ours, stats,
+                        &insidePoly, mask.data());
+                    L.bright = savedBright;
+                    if (!ok || ours.size() != shipped.size()) continue;
+
+                    // Per-channel least-squares scale on on-polygon texels,
+                    // then the residual at that scale decides the winner.
+                    double so[3] = {0, 0, 0}, ss[3] = {0, 0, 0};
+                    for (size_t p = 0; p < ours.size(); ++p) {
+                        if (p < insidePoly.size() && !insidePoly[p]) continue;
+                        for (int c = 0; c < 3; ++c) {
+                            const float o = ours[p][c], s = shipped[p][c];
+                            so[c] += static_cast<double>(o) * s;
+                            ss[c] += static_cast<double>(o) * o;
+                        }
+                    }
+                    Darkness::Vector3 scale(0.0f);
+                    for (int c = 0; c < 3; ++c)
+                        scale[c] = ss[c] > 1e-12
+                                 ? static_cast<float>(so[c] / ss[c]) : 0.0f;
+                    double resid = 0.0;
+                    uint64_t n = 0;
+                    for (size_t p = 0; p < ours.size(); ++p) {
+                        if (p < insidePoly.size() && !insidePoly[p]) continue;
+                        for (int c = 0; c < 3; ++c) {
+                            const double d = static_cast<double>(scale[c])
+                                           * ours[p][c] - shipped[p][c];
+                            resid += d * d;
+                            ++n;
+                        }
+                    }
+                    if (n == 0) continue;
+                    resid = std::sqrt(resid / n);
+                    if (resid < bestResid) {
+                        bestResid = static_cast<float>(resid);
+                        bestIdx = lightIdx;
+                        bestScale = scale;
+                    }
+                }
+                if (bestIdx < 0) continue;
+                ++overlaysFit;
+
+                if (mapVal >= 0) {
+                    ++mapValid;
+                    if (mapVal == bestIdx) ++mapMatches;
+                }
+
+                const Darkness::Vector3 &db = wr.staticLights[bestIdx].bright;
+                const float diskPeak = std::max({db.x, db.y, db.z});
+                const float fitPeak =
+                    std::max({bestScale.x, bestScale.y, bestScale.z});
+                fitScales.push_back(fitPeak);
+                if (diskPeak > 1e-6f) ratios.push_back(fitPeak / diskPeak);
+                else ++zeroDiskBright;
+
+                if (examples < 12) {
+                    ++examples;
+                    std::printf("  cell %u poly %d bit %d: animMap=%d "
+                                "bestLight=%d resid=%.4f fitPeak=%.3f "
+                                "diskPeak=%.3f%s\n",
+                                ci, pi, bit, mapVal, bestIdx, bestResid,
+                                fitPeak, diskPeak,
+                                diskPeak > 1e-6f ? "" : "  <-- ZERO disk bright");
+                }
+            }
+        }
+    }
+
+    auto pct = [](std::vector<float> &v, double q) -> float {
+        if (v.empty()) return 0.0f;
+        std::sort(v.begin(), v.end());
+        return v[static_cast<size_t>(q * (v.size() - 1))];
+    };
+    std::printf("  overlays: %llu seen, %llu identified, %llu all-dark, "
+                "%llu with ZERO disk bright\n",
+                (unsigned long long)overlaysSeen,
+                (unsigned long long)overlaysFit,
+                (unsigned long long)overlaysDark,
+                (unsigned long long)zeroDiskBright);
+    if (mapValid)
+        std::printf("  animMap[bit] == best-fit static index: %llu/%llu "
+                    "(%.1f%%)\n",
+                    (unsigned long long)mapMatches,
+                    (unsigned long long)mapValid,
+                    100.0 * mapMatches / mapValid);
+    if (!fitScales.empty())
+        std::printf("  fitted overlay brightness (peak): p5=%.3f p50=%.3f "
+                    "p95=%.3f\n",
+                    pct(fitScales, 0.05), pct(fitScales, 0.50),
+                    pct(fitScales, 0.95));
+    if (!ratios.empty())
+        std::printf("  fitted/disk bright ratio: p5=%.3f p50=%.3f p95=%.3f "
+                    "(1.0 = table holds the overlay's brightness)\n",
+                    pct(ratios, 0.05), pct(ratios, 0.50), pct(ratios, 0.95));
+    return 0;
+}
+
+// ---------- flicker_sim ----------
+//
+// Dump the flicker synthesizer's raw samples for one lamp type as CSV
+// (t,intensity,r,g,b) at the exact synthesis rate — no interpolation, no
+// mission, no services. analysis/flicker_spectrum.py consumes this to verify
+// the signal against the measured references (PLAN.FLICKER_PHYSICS.md §8):
+// the C++ synthesizer is the ONLY implementation, so the test exercises the
+// real thing instead of a Python re-derivation that would drift.
+static int runFlickerSimVerb(const std::string &typeName, float seconds,
+                             uint32_t seed) {
+    Darkness::LampType type = Darkness::LampType::Unclassified;
+    for (int i = 0; i < static_cast<int>(Darkness::LampType::kCount); ++i) {
+        if (typeName == Darkness::lampTypeName(
+                static_cast<Darkness::LampType>(i))) {
+            type = static_cast<Darkness::LampType>(i);
+            break;
+        }
+    }
+    // Convenience aliases matching how people actually name them.
+    if (type == Darkness::LampType::Unclassified) {
+        if (typeName == "torch")   type = Darkness::LampType::FireTorch;
+        else if (typeName == "candle") type = Darkness::LampType::FireCandle;
+        else if (typeName == "gas")    type = Darkness::LampType::GasOpen;
+    }
+    if (type == Darkness::LampType::Unclassified) {
+        std::fprintf(stderr, "flicker_sim: unknown lamp type '%s'. Types:",
+                     typeName.c_str());
+        for (int i = 1; i < static_cast<int>(Darkness::LampType::kCount); ++i)
+            std::fprintf(stderr, " %s",
+                         Darkness::lampTypeName(
+                             static_cast<Darkness::LampType>(i)));
+        std::fprintf(stderr, "\n");
+        return 1;
+    }
+
+    const Darkness::FlickerPreset &p = Darkness::flickerPreset(type);
+    Darkness::FlickerState s;
+    Darkness::seedFlicker(s, seed);
+    const int n = static_cast<int>(seconds * Darkness::kFlickerRate);
+    std::printf("# flicker_sim type=%s rate=%.1fHz seconds=%.1f seed=%u\n",
+                Darkness::lampTypeName(type), Darkness::kFlickerRate, seconds,
+                seed);
+    std::printf("t,intensity,r,g,b\n");
+    for (int i = 0; i < n; ++i) {
+        Darkness::Vector3 tint(1.0f);
+        const float m = Darkness::flickerdetail::synthTick(s, p, tint);
+        std::printf("%.4f,%.5f,%.4f,%.4f,%.4f\n",
+                    i * Darkness::kFlickerDt, m, tint.x, tint.y, tint.z);
+    }
+    return 0;
 }
 
 // ---------- Ambient sound dump ----------
@@ -3128,6 +3715,31 @@ static void printUsage(const char *prog) {
     std::cerr << "                    ROOM_DB portals — designer box boundaries — these are" << std::endl;
     std::cerr << "                    compiled from the real geometry, so an aperture's size" << std::endl;
     std::cerr << "                    is the opening's true size. Needs no services." << std::endl;
+    std::cerr << "  lightmap_rebake [--stride N] [--offset F] [--bright-scale F]" << std::endl;
+    std::cerr << "                  [--plain-cosine] [--spot-as-distance] [--no-ambient] [--no-sun]" << std::endl;
+    std::cerr << "                  [--density N] [--samples M] [--supersample S] [--emitter R]" << std::endl;
+    std::cerr << "                  [--trace-from-surface] [--no-clamp] [--no-5bit] [--5bit-continuous]" << std::endl;
+    std::cerr << "                    Recompute the shipped lumels from the mission's own static" << std::endl;
+    std::cerr << "                    light table and report the residual against the bytes on" << std::endl;
+    std::cerr << "                    disk. The correctness gate for runtime shadows: the same" << std::endl;
+    std::cerr << "                    formula later goes into both a bake shader and a world" << std::endl;
+    std::cerr << "                    shader, where an error would be identical in both and so" << std::endl;
+    std::cerr << "                    invisible in an A/B. Residuals are split by category (sun /" << std::endl;
+    std::cerr << "                    spot / animated / plain) because a formula error hides in a" << std::endl;
+    std::cerr << "                    branch, not in the mean. --stride samples every Nth" << std::endl;
+    std::cerr << "                    lightmapped polygon (default 64; 1 is the full mission and" << std::endl;
+    std::cerr << "                    takes minutes). Needs no services." << std::endl;
+    std::cerr << "  flicker_sim <type> [seconds] [seed]" << std::endl;
+    std::cerr << "                    Dump the physical lamp-flicker synthesizer's samples as" << std::endl;
+    std::cerr << "                    CSV (t,intensity,r,g,b) at the synthesis rate. Text-only:" << std::endl;
+    std::cerr << "                    no mission needed. analysis/flicker_spectrum.py verifies" << std::endl;
+    std::cerr << "                    the output against the measured flame references." << std::endl;
+    std::cerr << "  lightmap_overlays [--stride N]" << std::endl;
+    std::cerr << "                    Identify which static-table light produced each shipped" << std::endl;
+    std::cerr << "                    animated overlay (unit-bright shape fit) and what" << std::endl;
+    std::cerr << "                    brightness it encodes vs the table's field. Answers the" << std::endl;
+    std::cerr << "                    animated-bucket residual and whether animMap is a table" << std::endl;
+    std::cerr << "                    index. Needs no services." << std::endl;
     std::cerr << "  wr_cells          Dump raw WR cell geometry as machine-readable WRCELL /" << std::endl;
     std::cerr << "                    WRVERT / WRPOLY lines (vertices, and EVERY polygon —" << std::endl;
     std::cerr << "                    solid and portal — with its exact plane). For prototyping" << std::endl;
@@ -3232,7 +3844,7 @@ int main(int argc, char *argv[]) {
     //   darknessHeadless <mission|gam> sound_db [outpath]     → with overlays
     std::string dbFile;
     std::string command;
-    if (positionalArgs[0] == "sound_db") {
+    if (positionalArgs[0] == "sound_db" || positionalArgs[0] == "flicker_sim") {
         command = positionalArgs[0];
         // dbFile stays empty — text-only dump.
     } else {
@@ -3366,6 +3978,73 @@ int main(int argc, char *argv[]) {
             // Service-less for the same reason as wr_portals: raw cell
             // geometry comes straight out of the WR chunk.
             printWRCells(dbFile);
+        } else if (command == "lightmap_rebake") {
+            // Service-less: WR chunk + RENDPARAMS, both read from the .mis.
+            // Flags override a default-constructed BakeFormula, so the
+            // defaults live in ONE place (LightmapBake.h) — a hand-copied
+            // default here is how the corrected surface offset kept running
+            // at its stale value for a session.
+            Darkness::BakeFormula f;
+            // Parity defaults differ from the struct's in-game defaults:
+            // the shipped data has hard shadows and point-probed lumels, so
+            // penumbra and supersampling are off unless asked for.
+            f.penumbraSamples = 1;
+            f.supersample     = 1;
+            int stride = 64;
+            bool staticOnly = false;
+            for (size_t a = 2; a < positionalArgs.size(); ++a) {
+                const std::string &s = positionalArgs[a];
+                auto next = [&](float def) -> float {
+                    return (a + 1 < positionalArgs.size())
+                         ? std::strtof(positionalArgs[++a].c_str(), nullptr)
+                         : def;
+                };
+                if      (s == "--stride")           stride = std::max(1, (int)next(64));
+                else if (s == "--offset")           f.surfaceOffset = next(f.surfaceOffset);
+                else if (s == "--bright-scale")     f.brightScale = next(1.0f);
+                else if (s == "--illum-cutoff")     f.illumCutoff = next(0.0f);
+                else if (s == "--no-quantise")      f.quantiseLux = false;
+                else if (s == "--density")          f.density = (int)next(1.0f);
+                else if (s == "--samples")          f.penumbraSamples = (int)next(16.0f);
+                else if (s == "--emitter")          f.emitterRadius = next(f.emitterRadius);
+                else if (s == "--supersample")      f.supersample = (int)next(2.0f);
+                else if (s == "--plain-cosine")     f.halfLambert = false;
+                else if (s == "--spot-as-distance") f.spotAsCone = false;
+                else if (s == "--no-ambient")       f.includeAmbient = false;
+                else if (s == "--no-sun")           f.includeSun = false;
+                // The 2026-08-06 construction recoveries, each independently
+                // revertible for A/B measurement:
+                else if (s == "--trace-from-surface") f.traceFromLight = false;
+                else if (s == "--no-clamp")           f.clampToWorld = false;
+                else if (s == "--no-5bit")
+                    f.fivebit = Darkness::BakeFormula::FiveBit::Off;
+                else if (s == "--5bit-continuous")
+                    f.fivebit = Darkness::BakeFormula::FiveBit::Continuous;
+                else if (s == "--static-only")     staticOnly = true;
+            }
+            return runLightmapRebakeVerb(dbFile, stride, f, staticOnly);
+        } else if (command == "lightmap_overlays") {
+            // Per-overlay identification + brightness fit. Service-less.
+            int stride = 16;
+            for (size_t a = 2; a < positionalArgs.size(); ++a) {
+                if (positionalArgs[a] == "--stride" &&
+                    a + 1 < positionalArgs.size())
+                    stride = std::max(1, std::atoi(
+                        positionalArgs[++a].c_str()));
+            }
+            return runLightmapOverlaysVerb(dbFile, stride);
+        } else if (command == "flicker_sim") {
+            // Text-only synthesizer dump: flicker_sim <type> [seconds] [seed]
+            std::string typeName =
+                positionalArgs.size() >= 2 ? positionalArgs[1] : "fire-torch";
+            float seconds = positionalArgs.size() >= 3
+                ? std::strtof(positionalArgs[2].c_str(), nullptr) : 120.0f;
+            uint32_t seed = positionalArgs.size() >= 4
+                ? static_cast<uint32_t>(
+                      std::strtoul(positionalArgs[3].c_str(), nullptr, 10))
+                : 1234u;
+            if (seconds <= 0.0f) seconds = 120.0f;
+            return runFlickerSimVerb(typeName, seconds, seed);
         } else if (command == "sound_db") {
             // sound_db: walks the schema directory; optionally applies
             // P$SchAttFac/SchPlayPa overrides from dbFile when present.

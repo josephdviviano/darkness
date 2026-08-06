@@ -37,6 +37,7 @@
 #pragma once
 
 #include "WRChunkParser.h"
+#include "FlickerSynthesis.h"
 #include "property/PropertyService.h"
 #include "property/DarkPropertyDefs.h"
 #include "property/TypedProperty.h"
@@ -100,6 +101,16 @@ struct LightSource {
     // FLICKER, SMOOTH, RANDOM authoring survives a turn-on round-trip.
     uint16_t onLiteMode;
     uint16_t offLiteMode;
+
+    // Physically-typed flicker (PLAN.FLICKER_PHYSICS.md). Classified at load
+    // from the object's archetype ancestry; the synthesizer multiplies the
+    // vintage envelope above, never replaces it. Unclassified = vintage.
+    LampType lampType = LampType::Unclassified;
+    FlickerState flicker;
+    // The flicker intensity last blended into the RE-BAKED atlas — the
+    // continuous signal needs its own coarser gate (kFlickerBlendThreshold)
+    // or every fire light would re-blend its polygons every frame.
+    float lastRebakedIntensity = -1.0f;
 };
 
 // Compute per-light on/off modes from the authored mode. Direct port of

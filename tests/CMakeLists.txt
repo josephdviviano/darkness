@@ -26,6 +26,7 @@ add_executable(darkness_tests
     test_hybrid_route_graph.cpp
     test_subobject_joints.cpp
     test_coronas.cpp
+    test_flicker_synthesis.cpp
     test_door_portal_binding.cpp
     test_config_help.cpp
 )

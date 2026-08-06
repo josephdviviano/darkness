@@ -773,6 +773,34 @@ struct RenderConfig {
     bool portalCulling    = true;   // portal/frustum culling
     bool cameraCollision  = false;  // sphere collision against world geometry
     bool debugObjects     = false;  // dump per-object filtering diagnostics to stderr
+    // --rebake-lightmaps: recompute the whole lightmap atlas from the mission's
+    // own light table at load (PLAN.HIGH_RES_SHADOWS S0) so it can be compared
+    // against the shipped one in game via the `rebaked_lightmaps` console
+    // toggle. CLI-only and deliberately not a YAML key: it is a debug
+    // instrument with a multi-second load cost, not a setting.
+    bool rebakeLightmaps  = false;
+    int  rebakeDensity    = 2;      // lumels per shipped lumel, per axis
+    int  rebakeSamples    = 16;     // emitter samples; 1 = original hard shadows
+    float rebakeEmitter   = 0.75f;  // emitter radius, world units
+    int  rebakeSupersample = 2;     // receiver-side box supersampling factor
+    // S6: hemisphere gather over the direct bake — one pass computes both.
+    // Bounce = cosine-weighted single-bounce gather (albedo × direct at the
+    // hit); AO scales the AMBIENT term by hemisphere openness (occlusion
+    // within a short physical range). 0 disables either.
+    int   rebakeBounce    = 32;     // gather rays per lumel; 0 = direct-only
+    float rebakeAO        = 0.6f;   // ambient occlusion strength, 0..1
+    // Falloff naturalisation: widen each cell's light list by N portal hops
+    // (the baked lists otherwise CUT lights at cell seams), and fade
+    // radius-limited lights over the last fraction instead of a hard ring.
+    int   rebakeReach     = 1;      // portal hops; 0 = original lists exactly
+    float rebakeSoftRadius = 0.15f; // fade fraction; 0 = original hard edge
+    // Physical falloff: finite-emitter inverse-square 1/(r²+a²) anchored to
+    // the original's illuminance at rebakeFalloffAnchor, with light reach
+    // determined by GEOMETRY (sub-quantisation spheres + occlusion probes)
+    // instead of the authored cell lists. The physically-rooted answer to
+    // hard light borders — the falloff terminates on its own.
+    bool  rebakeFalloffPhysical = true;
+    float rebakeFalloffAnchor   = 8.0f;
     bool stepLog          = false;  // stair step diagnostics to stderr ([STEP] prefix)
     bool togglePlatforms  = false;  // auto-activate all moving terrain at startup
     bool noProbes         = false;  // skip probe baking (no spatial audio)
@@ -2576,6 +2604,32 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cli.schemasPath = argv[++i];
         } else if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             cli.configPath = argv[++i];
+        } else if (std::strcmp(argv[i], "--rebake-lightmaps") == 0) {
+            cfg.rebakeLightmaps = true;
+            // Optional density argument: --rebake-lightmaps 4
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                cfg.rebakeDensity = std::max(1, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--rebake-samples") == 0 && i + 1 < argc) {
+            cfg.rebakeSamples = std::max(1, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--rebake-emitter") == 0 && i + 1 < argc) {
+            cfg.rebakeEmitter = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(argv[i], "--rebake-supersample") == 0 && i + 1 < argc) {
+            cfg.rebakeSupersample = std::max(1, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--rebake-bounce") == 0 && i + 1 < argc) {
+            cfg.rebakeBounce = std::max(0, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--rebake-ao") == 0 && i + 1 < argc) {
+            cfg.rebakeAO = std::min(1.0f, std::max(0.0f,
+                static_cast<float>(std::atof(argv[++i]))));
+        } else if (std::strcmp(argv[i], "--rebake-reach") == 0 && i + 1 < argc) {
+            cfg.rebakeReach = std::max(0, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--rebake-soft-radius") == 0 && i + 1 < argc) {
+            cfg.rebakeSoftRadius = std::min(0.9f, std::max(0.0f,
+                static_cast<float>(std::atof(argv[++i]))));
+        } else if (std::strcmp(argv[i], "--rebake-falloff-original") == 0) {
+            cfg.rebakeFalloffPhysical = false;
+        } else if (std::strcmp(argv[i], "--rebake-falloff-anchor") == 0 && i + 1 < argc) {
+            cfg.rebakeFalloffAnchor = std::min(32.0f, std::max(1.0f,
+                static_cast<float>(std::atof(argv[++i]))));
         } else if (std::strcmp(argv[i], "--skip-reflection-bake") == 0) {
             // Deprecated CLI flag — reflection bake is no longer
             // skippable; every probe-bake-needed path runs the full bake

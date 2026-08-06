@@ -760,23 +760,72 @@ static void renderWorld(
                 auto it = gpu.textureHandles.find(grp.txtIndex);
                 if (it != gpu.textureHandles.end()) {
                     bgfx::setTexture(0, gpu.s_texColor, it->second, fc.texSampler);
-                    if (!gpu.lightmapAtlasHandles.empty())
-                        bgfx::setTexture(1, gpu.s_texLightmap, gpu.lightmapAtlasHandles[0]);
+                    const bool rebakedActive =
+                        state.useRebakedLightmaps &&
+                        !gpu.rebakedAtlasHandles.empty();
+                    if (!gpu.lightmapAtlasHandles.empty()) {
+                        // UINT32_MAX = use the texture's own baked flags
+                        // (bilinear). Point sampling is an explicit override so
+                        // the lumel grid is visible as stored.
+                        const uint32_t lmSampler = state.lightmapPointFilter
+                            ? (BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT |
+                               BGFX_SAMPLER_MIP_POINT)
+                            : UINT32_MAX;
+                        const bgfx::TextureHandle lmTex = rebakedActive
+                                ? gpu.rebakedAtlasHandles[0]
+                                : gpu.lightmapAtlasHandles[0];
+                        bgfx::setTexture(1, gpu.s_texLightmap, lmTex, lmSampler);
+
+                        // Dominant-direction specular: only meaningful with
+                        // the re-baked atlas's direction layer. Something
+                        // must always be bound to the sampler slot; when
+                        // inactive, rebind the lightmap and zero F0/F90 —
+                        // the identity path. Material presets are per
+                        // TEXTURE (this loop batches by texture), Fresnel
+                        // F0/F90 scaled by the master strength, exponent by
+                        // the master power scale.
+                        const bool specActive = rebakedActive &&
+                            bgfx::isValid(gpu.rebakedDirHandle);
+                        bgfx::setTexture(2, gpu.s_texLmDir,
+                            specActive ? gpu.rebakedDirHandle : lmTex);
+                        const Darkness::SpecularPreset &sp =
+                            gpu.texSpecular[grp.txtIndex];
+                        const float on = specActive ? 1.0f : 0.0f;
+                        const float specParams[4] = {
+                            std::max(1.0f, sp.exponent * state.specPower),
+                            sp.f0  * state.specStrength * on,
+                            sp.f90 * state.specStrength * on,
+                            sp.metalness };
+                        bgfx::setUniform(gpu.u_specParams, specParams);
+                        const float camPos[4] = {
+                            state.cam.pos[0], state.cam.pos[1],
+                            state.cam.pos[2], 0.0f };
+                        bgfx::setUniform(gpu.u_camPosWorld, camPos);
+                    }
 
                     // Set unconditionally, for both lightmap programs: a
                     // path that left this unbound would render the world
                     // black rather than merely mis-scaled.
                     const float lmScale[4] = {
-                        state.lightmapScale, 0.0f, 0.0f, 0.0f };
+                        state.lightmapScale,
+                        state.lightmapViewOnly ? 1.0f : 0.0f, 0.0f, 0.0f };
                     bgfx::setUniform(gpu.u_lightmapScale, lmScale);
 
                     // Select lightmap program: bilinear (hardware) or bicubic (shader)
                     bgfx::ProgramHandle lmProg = gpu.lightmappedProgram;
                     if (state.lightmapFiltering == 1 && bgfx::isValid(gpu.lightmappedBicubicProgram)) {
                         lmProg = gpu.lightmappedBicubicProgram;
-                        // Pass atlas dimensions for texel-space calculations in bicubic shader
-                        float sz[4] = { float(gpu.lmAtlasSet.atlases[0].size),
-                                        float(gpu.lmAtlasSet.atlases[0].size), 0, 0 };
+                        // Texel-space dimensions of the atlas actually BOUND —
+                        // the re-baked atlas is density-scaled, so using the
+                        // shipped size here made bicubic taps land between
+                        // texels under `rebaked_lightmaps on`.
+                        const int boundSize =
+                            (rebakedActive &&
+                             !gpu.rebakedAtlasSet.atlases.empty())
+                                ? gpu.rebakedAtlasSet.atlases[0].size
+                                : gpu.lmAtlasSet.atlases[0].size;
+                        float sz[4] = { float(boundSize), float(boundSize),
+                                        0, 0 };
                         bgfx::setUniform(gpu.u_lmAtlasSize, sz);
                     }
                     bgfx::submit(Darkness::kViewWorld, lmProg);
@@ -3418,6 +3467,83 @@ static void registerConsoleSettings(
         "MOON bloom — it lives in the skybox texture, which caps at 1.0. "
         "Proportional, so dark sky stays dark");
 
+    dbgConsole.addBool("rebaked_lightmaps",
+        [&state]() { return state.useRebakedLightmaps; },
+        [&state, &gpu](bool v) {
+            if (v && gpu.rebakedAtlasHandles.empty()) {
+                // Refuse loudly rather than setting a flag that shows the
+                // shipped atlas — "the toggle did nothing" and "our bake looks
+                // identical" are indistinguishable from the outside.
+                std::fprintf(stderr,
+                    "[FALLBACK] rebaked_lightmaps: no re-baked atlas exists — "
+                    "relaunch with --rebake-lightmaps (costs a few seconds at "
+                    "load). Staying on the shipped atlas.\n");
+                return;
+            }
+            state.useRebakedLightmaps = v;
+            // While the OTHER atlas was displayed this one's animated blend
+            // went stale; force a full re-blend on the next update so the
+            // A/B never compares a fresh atlas against a frozen one.
+            if (v) state.rebakedBlendForceAll = true;
+        },
+        "Bind OUR recomputed lightmap atlas instead of the shipped one. "
+        "Needs --rebake-lightmaps at launch. This is the A/B for whether our "
+        "bake matches the original");
+
+    dbgConsole.addBool("flicker_physical",
+        [&state]() { return state.flickerPhysical; },
+        [&state, &gpu](bool v) {
+            if (v && gpu.rebakedAnimPolys.empty()) {
+                std::fprintf(stderr,
+                    "[FALLBACK] flicker_physical: needs the re-baked atlas "
+                    "(--rebake-lightmaps at launch) — the shipped atlas stays "
+                    "pure vintage by design. Staying off.\n");
+                return;
+            }
+            state.flickerPhysical = v;
+            // Leaving physical mode strands the last flicker frame in the
+            // atlas; re-blend everything back to the vintage envelope.
+            if (!v) state.rebakedBlendForceAll = true;
+        },
+        "Physically-typed lamp flicker (PLAN.FLICKER_PHYSICS.md): fire "
+        "puffs+wanders+gusts with Planckian colour, gas barely moves, "
+        "electric holds steady. Modulates the re-baked atlas + object "
+        "lighting; vintage stays exact. Needs rebaked_lightmaps on");
+
+    dbgConsole.addFloat("flicker_scale", 0.0f, 2.0f,
+        [&state]() { return state.flickerScale; },
+        [&state](float v) { state.flickerScale = v; },
+        "Scales the physical flicker DEVIATION (0 = exactly vintage, "
+        "1 = measured-physics defaults, >1 exaggerated)");
+
+    dbgConsole.addFloat("spec_strength", 0.0f, 3.0f,
+        [&state]() { return state.specStrength; },
+        [&state](float v) { state.specStrength = v; },
+        "MASTER scale on the per-material Fresnel specular (F0/F90 from "
+        "SpecularMaterials.h). 1 = physical values, 0 = off. Needs "
+        "rebaked_lightmaps on");
+
+    dbgConsole.addFloat("spec_power", 0.25f, 4.0f,
+        [&state]() { return state.specPower; },
+        [&state](float v) { state.specPower = v; },
+        "MASTER scale on each material's shininess exponent: <1 broadens "
+        "every sheen, >1 tightens every glint. 1 = per-material values");
+
+    dbgConsole.addBool("lightmap_view",
+        [&state]() { return state.lightmapViewOnly; },
+        [&state](bool v) { state.lightmapViewOnly = v; },
+        "Lighting-only view: world albedo forced to white so the raw baked "
+        "light field is visible. Albedo detail otherwise masks the lumel grid "
+        "completely. Lightmapped world geometry only — objects and sky are "
+        "unaffected, which is itself informative");
+
+    dbgConsole.addBool("lightmap_point",
+        [&state]() { return state.lightmapPointFilter; },
+        [&state](bool v) { state.lightmapPointFilter = v; },
+        "Point-sample the lightmap atlas instead of bilinear. Shows lumels as "
+        "stored — one lumel is about one world unit, so this is the ~30cm "
+        "shadow quantisation made visible. Pair with lightmap_view");
+
     dbgConsole.addBool("portal_culling",
         [&state]() { return state.portalCulling; },
         [&state, refreshTitle](bool v) { state.portalCulling = v; refreshTitle(); },
@@ -5074,12 +5200,24 @@ static void updateMovement(
 // the atlas CPU buffer, then upload the updated atlas to the GPU.
 // debugTint: tint animated lightmap polygons magenta for visibility.
 // forceFlicker: override all lights to flicker mode (saved/restored on toggle).
+// rebakedActive: the re-baked atlas is the one being displayed — blend OUR
+//   base+overlay records into it instead of touching only the shipped atlas.
+// rebakedForceAll: in/out — full re-blend of the re-baked atlas requested
+//   (set at load and by the atlas toggle); cleared here once honoured.
+// flickerPhysical/flickerScale: the physically-typed lamp flicker
+//   (PLAN.FLICKER_PHYSICS.md). Modulates the RE-BAKED path only — the
+//   shipped atlas IS the vintage look. Scale scales the deviation.
+// visibleCells: LAST frame's portal-culling result; the continuous flicker
+//   blend skips polygons nobody can see (empty/null = no filtering).
 static void updateLightmaps(
     float dt, const Darkness::BuiltMeshes &meshes,
     Darkness::MissionData &mission, Darkness::GPUResources &gpu,
     Darkness::ObjectIlluminator &objectIlluminator,
     bool debugTint = false, bool forceFlicker = false,
-    bool scriptLightDirty = false)
+    bool scriptLightDirty = false,
+    bool rebakedActive = false, bool *rebakedForceAll = nullptr,
+    bool flickerPhysical = false, float flickerScale = 1.0f,
+    const std::unordered_set<uint32_t> *visibleCells = nullptr)
 {
     // Track debug mode transitions so we can force a full re-blend
     static bool prevDebugTint = false;
@@ -5122,7 +5260,15 @@ static void updateLightmaps(
     prevForceFlicker = forceFlicker;
 
     bool anyLightChanged = false;
-    std::unordered_map<int16_t, float> currentIntensities;
+    std::unordered_map<int16_t, float> currentIntensities;   // vintage envelope
+
+    // Physical flicker rides ON TOP of the vintage envelope, and only for
+    // the re-baked atlas + object lighting; currentIntensities stays the
+    // vintage signal so the shipped atlas remains exactly the original look.
+    const bool flickerActive = flickerPhysical && rebakedActive &&
+                               !gpu.rebakedAnimPolys.empty();
+    std::unordered_map<int16_t, float> flickerIntensities;
+    std::unordered_map<int16_t, Darkness::Vector3> flickerTints;
 
     for (auto &[lightNum, light] : mission.lightSources) {
         bool changed = Darkness::updateLightAnimation(light, dt);
@@ -5130,7 +5276,30 @@ static void updateLightmaps(
             ? light.brightness / light.maxBright : 0.0f;
         currentIntensities[lightNum] = intensity;
         if (changed) anyLightChanged = true;
+
+        if (flickerActive) {
+            float out = intensity;
+            if (Darkness::lampTypeFlickers(light.lampType)) {
+                const Darkness::FlickerPreset &fp =
+                    Darkness::flickerPreset(light.lampType);
+                const Darkness::FlickerOutput fo =
+                    Darkness::updateFlicker(light.flicker, fp, dt);
+                float m = 1.0f + flickerScale * (fo.intensity - 1.0f);
+                if (m < 0.0f) m = 0.0f;
+                out = intensity * m;
+                flickerTints[lightNum] = Darkness::Vector3(
+                    1.0f + flickerScale * (fo.tint.x - 1.0f),
+                    1.0f + flickerScale * (fo.tint.y - 1.0f),
+                    1.0f + flickerScale * (fo.tint.z - 1.0f));
+            }
+            flickerIntensities[lightNum] = out;
+        }
     }
+
+    // The signal everything downstream of the DISPLAYED atlas consumes:
+    // objects must flicker with the walls behind them or the seam shows.
+    const std::unordered_map<int16_t, float> &effIntensities =
+        flickerActive ? flickerIntensities : currentIntensities;
 
     // Check if LightScriptService changed any lights (script-driven on/off)
     if (scriptLightDirty) {
@@ -5145,8 +5314,8 @@ static void updateLightmaps(
     // the last reset (in setMissionData / objectIlluminator.clear()).
     objectIlluminator.resetLightMultipliers();
     for (const auto &[lightNum, idx] : mission.animLightToStaticIdx) {
-        auto it = currentIntensities.find(lightNum);
-        if (it == currentIntensities.end()) continue;
+        auto it = effIntensities.find(lightNum);
+        if (it == effIntensities.end()) continue;
         objectIlluminator.setLightMultiplier(idx, it->second);
     }
 
@@ -5280,6 +5449,12 @@ static void updateLightmaps(
     // Force full re-blend when debug mode toggles
     bool forceAll = debugChanged;
 
+    // Lights whose intensity moved past the threshold this frame — recorded
+    // by the shipped-atlas loop below (the single place that decides), and
+    // consumed again by the re-baked path, which cannot re-derive it after
+    // prevIntensity has been updated.
+    std::vector<int16_t> changedLights;
+
     // Re-blend changed lightmaps into atlas CPU buffer, tracking dirty region
     if (anyLightChanged || forceAll) {
         const auto &atlas = gpu.lmAtlasSet.atlases[0];
@@ -5318,6 +5493,7 @@ static void updateLightmaps(
                 float intensity = currentIntensities[lightNum];
                 if (std::abs(intensity - light.prevIntensity) < 0.002f) continue;
                 light.prevIntensity = intensity;
+                changedLights.push_back(lightNum);
 
                 auto it = mission.animLightIndex.find(lightNum);
                 if (it == mission.animLightIndex.end()) continue;
@@ -5354,6 +5530,156 @@ static void updateLightmaps(
             bgfx::updateTexture2D(gpu.lightmapAtlasHandles[0], 0, 0,
                 static_cast<uint16_t>(dirtyX0), static_cast<uint16_t>(dirtyY0),
                 static_cast<uint16_t>(dw), static_cast<uint16_t>(dh), mem);
+        }
+    }
+
+    // ── Re-baked atlas: the same blend against OUR base + overlays ──
+    // Runs only while the re-baked atlas is the displayed one; the shipped
+    // path above keeps running regardless so a toggle back is instant.
+    // The pad margin is density-scaled, like everything about this atlas.
+    //
+    // This is the CPU blend PLAN.HIGH_RES_SHADOWS.md §"the trap" warns is
+    // density² of the shipped one; the timing print below is the measurement
+    // that decides whether it must become a GPU pass.
+    if (rebakedActive && !gpu.rebakedAnimPolys.empty() &&
+        !gpu.rebakedAtlasSet.atlases.empty() &&
+        !gpu.rebakedAtlasHandles.empty()) {
+        const bool forceReb = rebakedForceAll && *rebakedForceAll;
+        if (anyLightChanged || forceAll || forceReb || flickerActive) {
+            const auto t0 = std::chrono::steady_clock::now();
+            auto &atlas = gpu.rebakedAtlasSet.atlases[0];
+            const int pad = 2 * gpu.rebakedDensity;
+            size_t blends = 0;
+
+            // The continuous flicker signal needs a coarser blend gate than
+            // the vintage 0.002 — it moves every frame by construction, and
+            // ~0.03 (≈3/255 on a bright overlay) is where a step becomes
+            // visible. Larger scripted changes clear it instantly.
+            constexpr float kFlickerBlendThreshold = 0.03f;
+
+            // Upload strategy: flickering polys are SCATTERED, so a single
+            // bounding dirty rect degenerates to nearly the whole atlas —
+            // measured 3856x4048 (~60 MB) for 38 polys. Incremental events
+            // therefore upload per poly (tiny rects); only the full re-blend
+            // uploads the whole atlas in one call.
+            const bool fullBlend = forceReb || forceAll;
+
+            auto uploadRect = [&](int x0, int y0, int w, int h) {
+                if (w <= 0 || h <= 0) return;
+                std::vector<uint8_t> sub(static_cast<size_t>(w) * h * 4);
+                for (int y = 0; y < h; ++y)
+                    std::memcpy(&sub[static_cast<size_t>(y) * w * 4],
+                                &atlas.rgba[((static_cast<size_t>(y0) + y)
+                                             * atlas.size + x0) * 4],
+                                static_cast<size_t>(w) * 4);
+                const bgfx::Memory *mem = bgfx::copy(
+                    sub.data(), static_cast<uint32_t>(sub.size()));
+                bgfx::updateTexture2D(gpu.rebakedAtlasHandles[0], 0, 0,
+                    static_cast<uint16_t>(x0), static_cast<uint16_t>(y0),
+                    static_cast<uint16_t>(w), static_cast<uint16_t>(h), mem);
+            };
+
+            auto blendOne = [&](size_t idx) {
+                const auto &rec = gpu.rebakedAnimPolys[idx];
+                if (rec.ci >= gpu.rebakedAtlasSet.entries.size()) return;
+                // Continuous flicker skips polygons nobody can see; they
+                // refresh within a tick or two of becoming visible because
+                // the signal never stops crossing the threshold. Full blends
+                // never filter (they exist to erase staleness).
+                if (!fullBlend && flickerActive && visibleCells &&
+                    !visibleCells->empty() &&
+                    visibleCells->count(rec.ci) == 0)
+                    return;
+                const auto &cellEntries = gpu.rebakedAtlasSet.entries[rec.ci];
+                if (rec.pi < 0 ||
+                    rec.pi >= static_cast<int32_t>(cellEntries.size())) return;
+                const auto &entry = cellEntries[rec.pi];
+                Darkness::blendRebakedLightmap(
+                    rec, entry, effIntensities, atlas, gpu.rebakedDensity,
+                    flickerActive ? &flickerTints : nullptr);
+                ++blends;
+                if (!fullBlend) {
+                    const int x0 = std::max(0, entry.pixelX - pad);
+                    const int y0 = std::max(0, entry.pixelY - pad);
+                    const int x1 = std::min(atlas.size,
+                                            entry.pixelX + rec.w + pad);
+                    const int y1 = std::min(atlas.size,
+                                            entry.pixelY + rec.h + pad);
+                    uploadRect(x0, y0, x1 - x0, y1 - y0);
+                }
+            };
+
+            if (fullBlend) {
+                for (size_t i = 0; i < gpu.rebakedAnimPolys.size(); ++i)
+                    blendOne(i);
+                if (rebakedForceAll) *rebakedForceAll = false;
+                uploadRect(0, 0, atlas.size, atlas.size);
+                for (auto &[lightNum, light] : mission.lightSources) {
+                    auto it = effIntensities.find(lightNum);
+                    light.lastRebakedIntensity =
+                        (it != effIntensities.end()) ? it->second : -1.0f;
+                }
+            } else {
+                // Which lights re-blend: with flicker active, gate each
+                // light on ITS OWN last-blended value (coarser threshold for
+                // the continuous signal); otherwise reuse the vintage
+                // changed-set the shipped loop recorded.
+                std::unordered_set<uint64_t> visited;
+                auto blendLight = [&](int16_t lightNum) {
+                    auto it = mission.animLightIndex.find(lightNum);
+                    if (it == mission.animLightIndex.end()) return;
+                    for (auto &[ci, pi] : it->second) {
+                        const uint64_t key =
+                            (static_cast<uint64_t>(ci) << 32)
+                            | static_cast<uint32_t>(pi);
+                        if (!visited.insert(key).second) continue;
+                        auto recIt = gpu.rebakedAnimIndex.find(key);
+                        if (recIt != gpu.rebakedAnimIndex.end())
+                            blendOne(recIt->second);
+                    }
+                };
+                if (flickerActive) {
+                    for (auto &[lightNum, light] : mission.lightSources) {
+                        auto it = effIntensities.find(lightNum);
+                        if (it == effIntensities.end()) continue;
+                        const float thr =
+                            Darkness::lampTypeFlickers(light.lampType)
+                                ? kFlickerBlendThreshold : 0.002f;
+                        if (std::abs(it->second - light.lastRebakedIntensity)
+                                < thr)
+                            continue;
+                        light.lastRebakedIntensity = it->second;
+                        blendLight(lightNum);
+                    }
+                } else {
+                    for (int16_t lightNum : changedLights)
+                        blendLight(lightNum);
+                }
+            }
+
+            // The density² cost measurement. First event prints immediately
+            // (a path that never logs and a path that never runs look the
+            // same); afterwards at most one line per second, wall-clock.
+            if (blends) {
+                const auto now = std::chrono::steady_clock::now();
+                const double ms = std::chrono::duration<double, std::milli>(
+                    now - t0).count();
+                static std::chrono::steady_clock::time_point lastLog{};
+                static double worstMs = 0.0;
+                static uint64_t events = 0;
+                worstMs = std::max(worstMs, ms);
+                ++events;
+                if (events == 1 ||
+                    std::chrono::duration<double>(now - lastLog).count() >= 1.0) {
+                    std::fprintf(stderr,
+                        "[REBAKE_BLEND] %zu polys blended+uploaded in %.2f ms "
+                        "this event (worst %.2f ms over %llu events)%s\n",
+                        blends, ms, worstMs,
+                        static_cast<unsigned long long>(events),
+                        fullBlend ? " [full atlas]" : "");
+                    lastLog = now;
+                }
+            }
         }
     }
 }
@@ -5482,6 +5808,11 @@ static Darkness::FrameContext prepareFrame(
     // When culling is disabled, visibleCells remains empty (skip filtering).
     // Guard band (world units) expands the frustum slightly to prevent large
     // objects from popping at screen edges due to cell-based culling.
+    if (!state.portalCulling) {
+        // Everything renders, so the flicker blend must filter nothing —
+        // a stale visibility set here would freeze visible torches.
+        state.lastVisibleCells.clear();
+    }
     if (state.portalCulling) {
         // Build a wider projection for culling than for rendering.
         // 120-degree vertical FOV (~160° horizontal at 16:9) gives generous
@@ -5557,6 +5888,9 @@ static Darkness::FrameContext prepareFrame(
                                      state.cam.pos[0], state.cam.pos[1], state.cam.pos[2],
                                      doorBlocking);
         state.cullVisibleCells = static_cast<uint32_t>(fc.visibleCells.size());
+        // Kept for NEXT frame's flicker blend (updateLightmaps runs before
+        // culling): one frame of lag, refreshed within a synthesis tick.
+        state.lastVisibleCells = fc.visibleCells;
 
         // Build a tighter frustum from the actual rendering projection for
         // per-object AABB tests. Objects whose cells are culled by the wide
@@ -5658,6 +5992,12 @@ int main(int argc, char *argv[]) {
     state.cameraCollision   = cfg.cameraCollision;
     state.filterMode        = cfg.filterMode;
     state.lightmapFiltering = cfg.lightmapFiltering;
+    // --rebake-lightmaps binds OUR atlas straight away. Asking for the re-bake
+    // and then still being shown the shipped atlas until a console toggle is
+    // found is a trap — the console's refusal only reaches stderr, which is
+    // invisible while the game is running. `rebaked_lightmaps off` switches
+    // back to the shipped atlas, which is the direction the A/B wants anyway.
+    state.useRebakedLightmaps = cfg.rebakeLightmaps;
     state.waveAmplitude    = cfg.waveAmplitude;
     state.uvDistortion     = cfg.uvDistortion;
     state.waterRotation    = cfg.waterRotation;
@@ -8028,7 +8368,11 @@ int main(int argc, char *argv[]) {
             updateLightmaps(dt, meshes, mission, gpu,
                             state.objectIlluminator,
                             state.debugAnimLightmaps, state.forceFlicker,
-                            scriptDirty);
+                            scriptDirty,
+                            state.useRebakedLightmaps,
+                            &state.rebakedBlendForceAll,
+                            state.flickerPhysical, state.flickerScale,
+                            &state.lastVisibleCells);
 
             // ── Prepare frame: matrices, fog, samplers, culling ──
             auto fc = prepareFrame(state, mission);

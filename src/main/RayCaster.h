@@ -54,12 +54,17 @@ static constexpr double EXTENDED_RAYCAST_EPSILON   = RAYCAST_EPSILON / 3.0;
 /// occurred, or the last cell traversed if no hit. Enables cell hint
 /// propagation between chained raycasts (e.g. the 3-phase stair step check).
 /// Pass outTerminalCell = nullptr to ignore.
+///
+/// `zeroEpsilon` runs the traversal with exact tolerances (no spatial slack,
+/// end time exactly 1.0). The Dark Engine's lightmap baker casts its
+/// clamp-to-world pre-ray this way; everything else wants the default.
 inline bool raycastWorld(const WRParsedData &wr,
                           const Vector3 &from,
                           const Vector3 &to,
                           RayHit &hit,
                           int32_t *outTerminalCell,
-                          int32_t startCellHint = -1);
+                          int32_t startCellHint = -1,
+                          bool zeroEpsilon = false);
 
 /// Standard overload — no cell output, no cell hint.
 inline bool raycastWorld(const WRParsedData &wr,
@@ -74,7 +79,8 @@ inline bool raycastWorld(const WRParsedData &wr,
                           const Vector3 &to,
                           RayHit &hit,
                           int32_t *outTerminalCell,
-                          int32_t startCellHint) {
+                          int32_t startCellHint,
+                          bool zeroEpsilon) {
     // ── Ray setup ──
     Vector3 delta = to - from;
     float rayLength = glm::length(delta);
@@ -140,8 +146,11 @@ inline bool raycastWorld(const WRParsedData &wr,
     // Space epsilon is a fixed spatial tolerance. Time epsilon scales
     // inversely with ray length so short rays get proportionally more
     // tolerance (critical for thin riser cells in stair geometry).
-    double spaceEpsilon = EXTENDED_RAYCAST_EPSILON;
-    double timeEpsilon  = spaceEpsilon / static_cast<double>(rayLength);
+    // Zero-epsilon mode matches the original engine's exact-tolerance cast
+    // (used by its lightmap clamp ray): no backface slack, end time 1.0.
+    double spaceEpsilon = zeroEpsilon ? 0.0 : EXTENDED_RAYCAST_EPSILON;
+    double timeEpsilon  = zeroEpsilon
+                        ? 0.0 : spaceEpsilon / static_cast<double>(rayLength);
     double endTime      = 1.0 - timeEpsilon;
 
     // ── Extended ray for backface culling ──
@@ -278,7 +287,17 @@ inline bool raycastWorld(const WRParsedData &wr,
             // that is geometrically between polygons (e.g., 0.02 above a riser
             // polygon due to STEP_CLEARANCE). Without this check, phantom cascade
             // steps are triggered by false-positive solid hits.
+            //
+            // hit.point/normal/distance/cellIdx ARE filled: the crossing point
+            // on the exit plane is known even when no polygon claims it, and
+            // the lightmap bake's clamp ray needs it (the original engine
+            // treats this crossing as a plain collision). Consumers keying off
+            // the bool are unaffected.
             if (hitPolyIdx < 0) {
+                hit.point    = hitPoint;
+                hit.normal   = cell.planes[bestPlaneIdx].normal;
+                hit.distance = glm::length(hitPoint - from);
+                hit.cellIdx  = curCell;
                 if (outTerminalCell) *outTerminalCell = curCell;
                 hit.status = RayStatus::DiscardNoPolygon;
                 return false;  // no valid polygon hit — discard like original
@@ -361,8 +380,13 @@ inline bool raycastWorld(const WRParsedData &wr,
             }
         }
 
-        // Same hitPolyIdx == -1 check as the no-portal path above.
+        // Same hitPolyIdx == -1 check as the no-portal path above, with the
+        // same hit-field fill for the same reason.
         if (hitPolyIdx < 0) {
+            hit.point    = hitPoint;
+            hit.normal   = cell.planes[bestPlaneIdx].normal;
+            hit.distance = glm::length(hitPoint - from);
+            hit.cellIdx  = curCell;
             if (outTerminalCell) *outTerminalCell = curCell;
             hit.status = RayStatus::DiscardNoPolygon;
             return false;

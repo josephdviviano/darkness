@@ -120,22 +120,22 @@ struct LightmapAtlasSet {
 // dataX/dataY = top-left of the actual data; lx/ly = data dimensions.
 // The padding area is dataX-2..dataX+lx+1, dataY-2..dataY+ly+1.
 inline void fillEdgePadding(std::vector<uint8_t> &rgba, int atlasSize,
-                            int dataX, int dataY, int lx, int ly) {
+                            int dataX, int dataY, int lx, int ly, int pad = 2) {
     // Helper: get a pointer to the RGBA pixel at (px, py) in the atlas
     auto pixel = [&](int px, int py) -> uint8_t * {
         return &rgba[(py * atlasSize + px) * 4];
     };
 
     // Fill left/right padding columns (including corners)
-    for (int dy = -2; dy < ly + 2; ++dy) {
+    for (int dy = -pad; dy < ly + pad; ++dy) {
         int srcRow = std::max(0, std::min(ly - 1, dy));
         // Left 2 columns: repeat leftmost data pixel in this row
         const uint8_t *srcLeft = pixel(dataX, dataY + srcRow);
-        for (int dx = -2; dx < 0; ++dx)
+        for (int dx = -pad; dx < 0; ++dx)
             std::memcpy(pixel(dataX + dx, dataY + dy), srcLeft, 4);
         // Right 2 columns: repeat rightmost data pixel in this row
         const uint8_t *srcRight = pixel(dataX + lx - 1, dataY + srcRow);
-        for (int dx = lx; dx < lx + 2; ++dx)
+        for (int dx = lx; dx < lx + pad; ++dx)
             std::memcpy(pixel(dataX + dx, dataY + dy), srcRight, 4);
     }
 
@@ -143,11 +143,11 @@ inline void fillEdgePadding(std::vector<uint8_t> &rgba, int atlasSize,
     for (int dx = 0; dx < lx; ++dx) {
         // Top 2 rows: repeat topmost data pixel in this column
         const uint8_t *srcTop = pixel(dataX + dx, dataY);
-        for (int dy = -2; dy < 0; ++dy)
+        for (int dy = -pad; dy < 0; ++dy)
             std::memcpy(pixel(dataX + dx, dataY + dy), srcTop, 4);
         // Bottom 2 rows: repeat bottommost data pixel in this column
         const uint8_t *srcBot = pixel(dataX + dx, dataY + ly - 1);
-        for (int dy = ly; dy < ly + 2; ++dy)
+        for (int dy = ly; dy < ly + pad; ++dy)
             std::memcpy(pixel(dataX + dx, dataY + dy), srcBot, 4);
     }
 }
@@ -319,6 +319,47 @@ inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr) {
     }
 
     return result;
+}
+
+// ── Density scaling ────────────────────────────────────────────────────────
+//
+// Returns the same packing at `density` times the linear resolution: every
+// pixel position, every size, the atlas edge and the padding all multiply by d.
+//
+// The point of scaling EVERYTHING uniformly — padding included — is that the
+// normalised UVs come out bit-identical:
+//
+//     atlasU  = (x*d) / (size*d) = x / size
+//     atlasSU = (w*d) / (size*d) = w / size
+//
+// so a mesh built against the 1:1 atlas addresses a denser one correctly with
+// no rebuild. That is what lets a higher-resolution re-bake be an in-place
+// texture swap against the shipped atlas instead of a parallel vertex buffer.
+//
+// Packing validity is preserved because a uniform scale cannot make two
+// non-overlapping rectangles overlap.
+inline LightmapAtlasSet scaleAtlasPlacement(const LightmapAtlasSet &src,
+                                            int density) {
+    LightmapAtlasSet out;
+    if (density < 1) density = 1;
+    out.entries = src.entries;
+    for (auto &cellEntries : out.entries) {
+        for (auto &e : cellEntries) {
+            e.pixelX *= density;
+            e.pixelY *= density;
+            e.pixelW *= density;
+            e.pixelH *= density;
+            // atlasU/atlasSU deliberately untouched — they are already correct
+            // for any density, which is the whole point.
+        }
+    }
+    for (const auto &a : src.atlases) {
+        AtlasTexture t;
+        t.size = a.size * density;
+        t.rgba.assign(static_cast<size_t>(t.size) * t.size * 4, 0);
+        out.atlases.push_back(std::move(t));
+    }
+    return out;
 }
 
 // ── Animated lightmap blending ──

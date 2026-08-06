@@ -27,6 +27,9 @@
 #include "ai/AIHearingService.h"
 #include "sim/TweqSystem.h"
 #include "SubObjectPose.h"
+// S0 parity bake, used only by --rebake-lightmaps (PLAN.HIGH_RES_SHADOWS).
+#include "LightmapBake.h"
+#include "LightmapBakeCache.h"
 #include "SpawnSystem.h"
 
 // ── Initialize service stack and load mission database ──
@@ -262,6 +265,8 @@ static std::unique_ptr<Darkness::ObjSysWorldState> initServiceStack(
 static bool loadMissionData(const char *misPath,
                             Darkness::MissionData &mission)
 {
+    mission.sourceMisPath = misPath;
+
     // Extract mission base name (e.g. "miss6" from "path/to/miss6.mis")
     // for constructing skybox texture filenames like "skyhw/miss6n.PCX"
     {
@@ -353,6 +358,76 @@ static bool loadMissionData(const char *misPath,
         }
         if (inactiveCount > 0)
             std::fprintf(stderr, "  inactive: %d lights\n", inactiveCount);
+    }
+
+    // ── Lamp-type classification (PLAN.FLICKER_PHYSICS.md) ──
+    // Concrete lights are unnamed; their TYPE lives in the archetype
+    // ancestry. Walk it nearest-ancestor-first (BFS over inheritance
+    // sources), matching name keywords — a specific ancestor ("GasFlame")
+    // is consulted before a generic one ("Lights", deliberately unmatched).
+    // Unclassified lights stay pure vintage and are COUNTED, never silent.
+    {
+        Darkness::ObjectServicePtr objSvc =
+            GET_SERVICE(Darkness::ObjectService);
+        Darkness::InheritServicePtr inheritSvc =
+            GET_SERVICE(Darkness::InheritService);
+        int typeCounts[static_cast<int>(Darkness::LampType::kCount)] = {};
+        // The names an unclassified light's ancestry actually carried — the
+        // audit that decides whether classifyLampName() needs a keyword.
+        std::unordered_set<std::string> unclassifiedNames;
+        for (auto &[num, ls] : mission.lightSources) {
+            Darkness::seedFlicker(ls.flicker,
+                                  static_cast<uint32_t>(num) + 0x51CBu);
+            Darkness::LampType t = Darkness::LampType::Unclassified;
+            std::string firstNamed;
+            if (ls.objectId != 0) {
+                std::vector<int> queue{ls.objectId};
+                std::unordered_set<int> visited;
+                for (size_t qi = 0; qi < queue.size() && qi < 64; ++qi) {
+                    const int id = queue[qi];
+                    if (!visited.insert(id).second) continue;
+                    std::string name = objSvc->getName(id);
+                    std::transform(name.begin(), name.end(), name.begin(),
+                                   [](unsigned char c) {
+                                       return std::tolower(c);
+                                   });
+                    if (firstNamed.empty() && !name.empty())
+                        firstNamed = name;
+                    t = Darkness::classifyLampName(name);
+                    if (t != Darkness::LampType::Unclassified) break;
+                    Darkness::InheritQueryResultPtr q =
+                        inheritSvc->getSources(id);
+                    while (q && !q->end()) {
+                        const Darkness::InheritLink &l = q->next();
+                        queue.push_back(l.srcID);
+                    }
+                }
+            }
+            ls.lampType = t;
+            ++typeCounts[static_cast<int>(t)];
+            if (t == Darkness::LampType::Unclassified)
+                unclassifiedNames.insert(firstNamed.empty() ? "(unnamed)"
+                                                            : firstNamed);
+        }
+        std::fprintf(stderr, "Lamp types:");
+        for (int i = 0; i < static_cast<int>(Darkness::LampType::kCount); ++i)
+            if (typeCounts[i])
+                std::fprintf(stderr, " %s=%d",
+                             Darkness::lampTypeName(
+                                 static_cast<Darkness::LampType>(i)),
+                             typeCounts[i]);
+        std::fprintf(stderr, "\n");
+        if (typeCounts[0]) {
+            std::fprintf(stderr,
+                "  %d light(s) UNCLASSIFIED (pure-vintage). Nearest named "
+                "ancestors:", typeCounts[0]);
+            int shown = 0;
+            for (const auto &n : unclassifiedNames) {
+                if (++shown > 16) { std::fprintf(stderr, " ..."); break; }
+                std::fprintf(stderr, " %s", n.c_str());
+            }
+            std::fprintf(stderr, "\n");
+        }
     }
 
     // Parse sky dome parameters from SKYOBJVAR chunk (if present)
@@ -1042,6 +1117,13 @@ static bool createGPUResources(const Darkness::MissionData &mission,
     gpu.u_lmAtlasSize = bgfx::createUniform("u_lmAtlasSize", bgfx::UniformType::Vec4);
     gpu.u_lightmapScale =
         bgfx::createUniform("u_lightmapScale", bgfx::UniformType::Vec4);
+    // Dominant-direction specular (lm_specular.sh).
+    gpu.s_texLmDir =
+        bgfx::createUniform("s_texLmDir", bgfx::UniformType::Sampler);
+    gpu.u_specParams =
+        bgfx::createUniform("u_specParams", bgfx::UniformType::Vec4);
+    gpu.u_camPosWorld =
+        bgfx::createUniform("u_camPosWorld", bgfx::UniformType::Vec4);
 
     // Per-object light array uniforms feeding the per-vertex shaders.
     // Array sizes come from the shared OBJECT_LIGHT_CAP constant
@@ -1119,6 +1201,300 @@ static bool createGPUResources(const Darkness::MissionData &mission,
             }
             std::fprintf(stderr, "Created %zu lightmap atlas GPU texture(s)\n",
                          gpu.lightmapAtlasHandles.size());
+
+            // ── Optional: recompute the atlas ourselves (S0 parity bake) ──
+            // Reuses the shipped atlas's LmapEntry placements, so the world
+            // mesh built below addresses either atlas and the in-game A/B is a
+            // texture swap with nothing else changing. Exists so our own output
+            // can be LOOKED at, not only measured offline.
+            if (cfg.rebakeLightmaps && !gpu.lmAtlasSet.atlases.empty()) {
+                Darkness::BakeFormula bf;
+                bf.density         = cfg.rebakeDensity;
+                bf.penumbraSamples = cfg.rebakeSamples;
+                bf.emitterRadius   = cfg.rebakeEmitter;
+                bf.supersample     = cfg.rebakeSupersample;
+                // The in-game bake wants the CONTINUOUS analogue of the
+                // original's 5-bit per-light storage: the same brightness
+                // (including the ~half-step truncation loss per light the
+                // shipped data carries) with none of its quantisation. Exact
+                // mode is for the offline parity harness; using it here would
+                // re-impose the very banding this bake exists to remove.
+                bf.fivebit = Darkness::BakeFormula::FiveBit::Continuous;
+                // Falloff naturalisation (in-game only; parity keeps the
+                // original construction exactly).
+                bf.reachExpand      = cfg.rebakeReach;
+                bf.softRadiusFrac   = cfg.rebakeSoftRadius;
+                bf.falloffPhysical  = cfg.rebakeFalloffPhysical;
+                bf.falloffAnchor    = cfg.rebakeFalloffAnchor;
+                Darkness::BakeStats bs;
+                // Scale the packing by the density. Normalised UVs are
+                // invariant under that scale, so the world mesh built for the
+                // shipped atlas addresses this one unchanged and the A/B stays
+                // a texture swap.
+                const Darkness::LightmapAtlasSet placement =
+                    Darkness::scaleAtlasPlacement(gpu.lmAtlasSet, bf.density);
+                Darkness::AtlasTexture ours = placement.atlases[0];
+
+                // Disk cache: keyed on mission CONTENT + every bake parameter
+                // + the formula version. A hit skips the bake entirely; a
+                // miss states its reason — both outcomes are printed because
+                // "loaded stale lighting" and "re-baked for no reason" are
+                // failures that look like success from the outside.
+                const std::string cachePath =
+                    Darkness::getLightmapBakeCachePath(mission.sourceMisPath);
+                Darkness::LmBakeCacheKey ckey;
+                ckey.missionHash =
+                    Darkness::hashFileContents(mission.sourceMisPath);
+                ckey.density     = bf.density;
+                ckey.samples     = bf.penumbraSamples;
+                ckey.supersample = bf.supersample;
+                ckey.emitter     = bf.emitterRadius;
+                ckey.fivebit     = static_cast<uint32_t>(bf.fivebit);
+                ckey.bounceSamples = cfg.rebakeBounce;
+                ckey.aoStrength    = cfg.rebakeAO;
+                ckey.reachExpand   = cfg.rebakeReach;
+                ckey.softRadius    = cfg.rebakeSoftRadius;
+                ckey.falloffPhysical = cfg.rebakeFalloffPhysical ? 1 : 0;
+                ckey.falloffAnchor   = cfg.rebakeFalloffAnchor;
+
+                std::vector<Darkness::RebakedAnimPoly> animPolys;
+                Darkness::AtlasTexture dirAtlas;
+                std::string whyMiss;
+                bool fromCache = Darkness::readLightmapBakeCache(
+                    cachePath, ckey, ours, animPolys, whyMiss, &dirAtlas);
+                if (fromCache &&
+                    ours.size != placement.atlases[0].size) {
+                    // A cache written for a different shipped-atlas packing —
+                    // possible only if the resource set changed under the
+                    // same mission hash key parameters. Treat as a miss.
+                    fromCache = false;
+                    whyMiss = "atlas size mismatch";
+                    ours = placement.atlases[0];
+                    animPolys.clear();
+                }
+                if (fromCache) {
+                    std::fprintf(stderr,
+                        "Re-baked lightmaps: CACHE HIT %s (%dx%d atlas, "
+                        "%zu animated polygons)\n",
+                        cachePath.c_str(), ours.size, ours.size,
+                        animPolys.size());
+                } else {
+                    std::fprintf(stderr,
+                        "Re-baking lightmaps (cache miss: %s): density %dx "
+                        "(%dx%d atlas, %.0f MB), %d emitter samples, radius "
+                        "%.2f, %dx%d receiver supersampling, %d bounce rays, "
+                        "AO %.2f...\n",
+                        whyMiss.c_str(), bf.density, ours.size, ours.size,
+                        ours.rgba.size() / 1048576.0, bf.penumbraSamples,
+                        bf.emitterRadius, bf.supersample, bf.supersample,
+                        cfg.rebakeBounce, cfg.rebakeAO);
+                    // Mean texture colour per WR texture index — the albedo
+                    // the bounce gather reflects off surfaces. Missing
+                    // textures keep the mid-grey default.
+                    Darkness::AlbedoTable albedo;
+                    for (const auto &[texIdx, img] : mission.loadedTextures) {
+                        if (img.rgba.empty()) continue;
+                        double r = 0, g = 0, b = 0;
+                        const size_t px = img.rgba.size() / 4;
+                        for (size_t k = 0; k + 3 < img.rgba.size(); k += 4) {
+                            r += img.rgba[k];
+                            g += img.rgba[k + 1];
+                            b += img.rgba[k + 2];
+                        }
+                        if (px)
+                            albedo.albedo[texIdx] = Darkness::Vector3(
+                                static_cast<float>(r / px / 255.0),
+                                static_cast<float>(g / px / 255.0),
+                                static_cast<float>(b / px / 255.0));
+                    }
+                    // Base + overlays, matching the shipped decomposition, so
+                    // animated lights keep animating under the re-bake. Runs
+                    // AFTER the animated-light bright synthesis above — the
+                    // overlay bake needs the table to hold each animated
+                    // light's MAXIMUM, and on disk it holds the save-time
+                    // state instead.
+                    // The dominant-direction layer bakes alongside for the
+                    // specular term; it rides the same passes at ~zero cost.
+                    dirAtlas.size = ours.size;
+                    dirAtlas.rgba.assign(ours.rgba.size(), 0);
+                    Darkness::bakeAtlasWithOverlays(
+                        mission.wrData, mission.renderParams, bf, placement,
+                        ours, animPolys, bs, 0,
+                        cfg.rebakeBounce, cfg.rebakeAO, &albedo, &dirAtlas);
+                    if (bs.dirTexels)
+                        std::fprintf(stderr,
+                            "Re-baked lightmaps: direction layer %llu texels, "
+                            "mean directionality %.2f\n",
+                            (unsigned long long)bs.dirTexels,
+                            static_cast<double>(bs.dirRatioSumMil)
+                                / bs.dirTexels / 1e6);
+                    if (bs.geomCandidates)
+                        std::fprintf(stderr,
+                            "Re-baked lightmaps: physical reach — %llu "
+                            "(polygon,light) candidates by geometry, %.1f%% "
+                            "culled by occlusion probes (%llu probe rays)\n",
+                            (unsigned long long)bs.geomCandidates,
+                            100.0 * bs.geomProbeCulled / bs.geomCandidates,
+                            (unsigned long long)bs.geomProbeRays);
+                    if (bs.roundtripFail)
+                        std::fprintf(stderr,
+                            "Re-baked lightmaps: WARNING — %llu polygons "
+                            "FAILED the gather round-trip self-check; their "
+                            "bounce samples were misdirected. This is a bug "
+                            "in atlasTexelForPoint, not a data problem.\n",
+                            (unsigned long long)bs.roundtripFail);
+                    if (bs.lumelsGathered)
+                        std::fprintf(stderr,
+                            "Re-baked lightmaps: gather %llu rays over %llu "
+                            "lumels — mean bounce +%.1f/255, mean hemisphere "
+                            "openness %.2f, sky %.1f%%, unproven %.2f%%\n",
+                            (unsigned long long)bs.gatherRays,
+                            (unsigned long long)bs.lumelsGathered,
+                            static_cast<double>(bs.bounceSum255)
+                                / bs.lumelsGathered,
+                            static_cast<double>(bs.aoSumMil)
+                                / bs.lumelsGathered / 1e6,
+                            100.0 * bs.gatherSky / bs.gatherRays,
+                            100.0 * bs.gatherUnproven / bs.gatherRays);
+                    if (Darkness::writeLightmapBakeCache(cachePath, ckey, ours,
+                                                         animPolys, &dirAtlas))
+                        std::fprintf(stderr,
+                            "Re-baked lightmaps: cache written to %s\n",
+                            cachePath.c_str());
+                    else
+                        std::fprintf(stderr,
+                            "Re-baked lightmaps: FAILED to write cache %s "
+                            "(read-only location?) — every load will re-bake\n",
+                            cachePath.c_str());
+                }
+
+                bgfx::TextureHandle rh = bgfx::createTexture2D(
+                    static_cast<uint16_t>(ours.size),
+                    static_cast<uint16_t>(ours.size),
+                    false, 1, bgfx::TextureFormat::RGBA8,
+                    BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+                const bgfx::Memory *rmem = bgfx::copy(ours.rgba.data(),
+                    static_cast<uint32_t>(ours.rgba.size()));
+                bgfx::updateTexture2D(rh, 0, 0, 0, 0,
+                    static_cast<uint16_t>(ours.size),
+                    static_cast<uint16_t>(ours.size), rmem);
+                // Prove the two atlases actually DIFFER before anyone goes
+                // looking for a visual difference. "Our bake looks the same" and
+                // "the swap never happened" are the same picture; only a number
+                // separates them.
+                if (bf.density == 1) {
+                    const auto &shipped = gpu.lmAtlasSet.atlases[0].rgba;
+                    uint64_t differing = 0, counted = 0;
+                    double sumOurs = 0.0, sumShipped = 0.0;
+                    for (size_t k = 0; k + 3 < shipped.size() &&
+                                       k + 3 < ours.rgba.size(); k += 4) {
+                        // Alpha is 255 everywhere; compare colour only.
+                        const int d = std::abs(int(ours.rgba[k]) - int(shipped[k]))
+                                    + std::abs(int(ours.rgba[k+1]) - int(shipped[k+1]))
+                                    + std::abs(int(ours.rgba[k+2]) - int(shipped[k+2]));
+                        if (d > 0) ++differing;
+                        sumOurs    += (ours.rgba[k] + ours.rgba[k+1] + ours.rgba[k+2]) / 3.0;
+                        sumShipped += (shipped[k] + shipped[k+1] + shipped[k+2]) / 3.0;
+                        ++counted;
+                    }
+                    std::fprintf(stderr,
+                        "Re-baked vs shipped atlas: %.1f%% of texels differ; "
+                        "mean level ours %.1f vs shipped %.1f (/255). "
+                        "%s\n",
+                        counted ? 100.0 * differing / counted : 0.0,
+                        counted ? sumOurs / counted : 0.0,
+                        counted ? sumShipped / counted : 0.0,
+                        differing == 0
+                            ? "IDENTICAL — the bake wrote nothing, do not look "
+                              "for a visual difference"
+                            : "so a visible difference is expected when the "
+                              "`rebaked_lightmaps` toggle takes effect");
+                }
+                gpu.rebakedAtlasHandles.push_back(rh);
+
+                // Direction layer texture (specular). A cache from a pre-v3
+                // bake or a bake without the layer leaves this invalid, and
+                // the draw path then zeroes the specular term.
+                if (dirAtlas.size == ours.size && !dirAtlas.rgba.empty()) {
+                    gpu.rebakedDirHandle = bgfx::createTexture2D(
+                        static_cast<uint16_t>(dirAtlas.size),
+                        static_cast<uint16_t>(dirAtlas.size),
+                        false, 1, bgfx::TextureFormat::RGBA8,
+                        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+                    const bgfx::Memory *dmem = bgfx::copy(
+                        dirAtlas.rgba.data(),
+                        static_cast<uint32_t>(dirAtlas.rgba.size()));
+                    bgfx::updateTexture2D(gpu.rebakedDirHandle, 0, 0, 0, 0,
+                        static_cast<uint16_t>(dirAtlas.size),
+                        static_cast<uint16_t>(dirAtlas.size), dmem);
+                    std::fprintf(stderr,
+                        "Re-baked lightmaps: direction layer bound — "
+                        "`spec_strength` in the console tunes the sheen\n");
+
+                    // Per-texture specular presets through the acoustic
+                    // keyword pipeline. Audited the same way txlist_audit
+                    // audits the acoustic side: generic fallbacks are named.
+                    int generic = 0;
+                    std::string genericNames;
+                    for (size_t ti = 0;
+                         ti < mission.txList.textures.size() && ti < 256;
+                         ++ti) {
+                        bool wasGeneric = false;
+                        gpu.texSpecular[ti] =
+                            Darkness::specularPresetForTexture(
+                                mission.txList.textures[ti].fullPath,
+                                &wasGeneric);
+                        if (wasGeneric) {
+                            ++generic;
+                            if (genericNames.size() < 200) {
+                                genericNames += " ";
+                                genericNames +=
+                                    mission.txList.textures[ti].fullPath;
+                            }
+                        }
+                    }
+                    if (generic)
+                        std::fprintf(stderr,
+                            "Specular materials: %d texture(s) fell back to "
+                            "generic:%s\n", generic, genericNames.c_str());
+                }
+
+                // Persist the CPU side: the scaled placement + current atlas
+                // buffer, the overlay records, and a (cell,poly) index so the
+                // per-frame animated blend can find its record. The blend
+                // needs a full pass before the first frame trusts the atlas
+                // (the bake stores overlays unblended) — rebakedBlendForceAll
+                // defaults true for exactly that.
+                gpu.rebakedAtlasSet = placement;
+                gpu.rebakedAtlasSet.atlases[0] = std::move(ours);
+                gpu.rebakedAnimPolys = std::move(animPolys);
+                gpu.rebakedAnimIndex.clear();
+                for (size_t i = 0; i < gpu.rebakedAnimPolys.size(); ++i) {
+                    const auto &rec = gpu.rebakedAnimPolys[i];
+                    gpu.rebakedAnimIndex[(static_cast<uint64_t>(rec.ci) << 32)
+                                         | static_cast<uint32_t>(rec.pi)] = i;
+                }
+                gpu.rebakedDensity = bf.density;
+
+                if (!fromCache)
+                    std::fprintf(stderr,
+                        "Re-baked lightmaps: %llu lumels, %llu rays "
+                        "(%.1f%% blocked, %.2f%% unresolved), %.1f%% of "
+                        "lumel-lights on a penumbra edge; %zu polygons carry "
+                        "animated overlays.\n",
+                        (unsigned long long)bs.lumels,
+                        (unsigned long long)bs.rays,
+                        bs.rays ? 100.0 * bs.rayBlocked / bs.rays : 0.0,
+                        bs.rays ? 100.0 * bs.rayUnevaluable / bs.rays : 0.0,
+                        (bs.penumbraTrivial + bs.penumbraRefined)
+                            ? 100.0 * bs.penumbraRefined
+                                / (bs.penumbraTrivial + bs.penumbraRefined) : 0.0,
+                        gpu.rebakedAnimPolys.size());
+                std::fprintf(stderr,
+                    "Re-baked lightmaps: OUR atlas is bound now; "
+                    "`rebaked_lightmaps off` switches back to the shipped "
+                    "one.\n");
+            }
         }
     }
 

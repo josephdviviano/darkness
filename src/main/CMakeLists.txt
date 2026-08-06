@@ -342,6 +342,19 @@ add_custom_command(
     COMMENT "Corona shared shader changed — re-touching corona sources"
 )
 
+# Same include-tracking gap: lm_specular.sh carries the dominant-direction
+# specular shared by both lightmapped fragment shaders.
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/.lm_specular_stamp
+    COMMAND ${CMAKE_COMMAND} -E touch_nocreate
+        ${SHADER_DIR}/fs_lightmapped.sc
+        ${SHADER_DIR}/fs_lightmapped_bicubic.sc
+    COMMAND ${CMAKE_COMMAND} -E touch
+        ${CMAKE_CURRENT_BINARY_DIR}/.lm_specular_stamp
+    DEPENDS ${SHADER_DIR}/lm_specular.sh
+    COMMENT "Lightmapped shared specular changed — re-touching consumers"
+)
+
 # Same include-tracking gap again: smaa_common.sh carries the quality preset
 # and the portability helpers for all six SMAA shaders, and editing it would
 # otherwise leave every one of them stale.
@@ -390,6 +403,7 @@ add_custom_target(compile_shaders DEPENDS
     ${CMAKE_CURRENT_BINARY_DIR}/.pervertex_constants_stamp
     ${CMAKE_CURRENT_BINARY_DIR}/.corona_shared_stamp
     ${CMAKE_CURRENT_BINARY_DIR}/.smaa_shared_stamp
+    ${CMAKE_CURRENT_BINARY_DIR}/.lm_specular_stamp
 )
 
 add_executable(darknessRender DarknessRender.cpp)
