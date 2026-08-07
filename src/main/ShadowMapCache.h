@@ -78,6 +78,16 @@ struct ShadowCasterVertex {
     }
 };
 
+// NEGATIVE-ID REGISTRY for pool slots. Static lights use their table
+// index (> 0); every transient user owns a disjoint negative range so
+// slots can never collide across subsystems:
+//   -1001            flashlight test vehicle (frame loop)
+//   -2000 - lightIdx S4c promoted light, CURRENT-pose faces
+//   -3000 - lightIdx S4c promoted light, FROZEN baked-pose faces (pinned)
+//   -9001            S1 cross-check dynamic leg
+//   -9100 and down   --door-diff-diag harness (released after each run)
+// Add new users here BEFORE picking an id.
+//
 // One pool slot: which light's six faces its tiles hold, and the state
 // those faces were rendered from (the HPL2 validity fields).
 struct ShadowSlot {

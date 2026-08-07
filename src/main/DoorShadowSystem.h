@@ -455,9 +455,15 @@ public:
             const bool flip = bgfx::getCaps()->originBottomLeft;
             const int S = LumelBakeGPU::kScratchSize;
             for (const auto &it : gpu->batch.items) {
-                if (it.recIdx >= mAnimPolys->size()) continue;
+                if (it.recIdx >= mAnimPolys->size() ||
+                    it.ovK >= (*mAnimPolys)[it.recIdx].overlays.size()) {
+                    std::fprintf(stderr,
+                        "[FALLBACK] door event (GPU): collected rect "
+                        "no longer maps to rec %zu ovK %zu — dropped\n",
+                        it.recIdx, it.ovK);
+                    continue;
+                }
                 RebakedAnimPoly &rec = (*mAnimPolys)[it.recIdx];
-                if (it.ovK >= rec.overlays.size()) continue;
                 std::vector<uint8_t> &buf = rec.overlays[it.ovK];
                 if (static_cast<int>(buf.size()) < it.w * it.h * 3)
                     buf.assign(static_cast<size_t>(it.w) * it.h * 3, 0);
@@ -657,7 +663,15 @@ public:
                     if (shelfY + grid.ly > S) break;   // batch full
                     const int slot = ensureShadowLight(
                         *sc, *mWr, lightIdx, bgfxFrame);
-                    if (slot < 0) { ++mWorkCursor; continue; }
+                    if (slot < 0) {
+                        std::fprintf(stderr,
+                            "[FALLBACK] door event (GPU): no S1 slot "
+                            "for light %d — its overlay stays at the "
+                            "previous pose\n",
+                            static_cast<int>(lightIdx));
+                        ++mWorkCursor;
+                        continue;
+                    }
                     const float anchor = mFormula.anchorFor(lightIdx);
                     const float a2 = mFormula.emitterRadius *
                                      mFormula.emitterRadius;
@@ -742,10 +756,24 @@ public:
             // Atomic handoff: every rec of the event becomes visible in
             // THIS update(), the same one that demotes the event's
             // promotions — new lightmaps and differential swap in one
-            // frame, no double-count window.
+            // frame, no double-count window. Dedupe: a preempted event
+            // leaves its recs pending and the successor re-bakes the
+            // same pairs. Direction rects release here too, so specular
+            // and energy land together.
+            std::sort(mPendingReady.begin(), mPendingReady.end());
+            mPendingReady.erase(
+                std::unique(mPendingReady.begin(), mPendingReady.end()),
+                mPendingReady.end());
             mReadyRecs.insert(mReadyRecs.end(), mPendingReady.begin(),
                               mPendingReady.end());
             mPendingReady.clear();
+            std::sort(mDirPending.begin(), mDirPending.end());
+            mDirPending.erase(
+                std::unique(mDirPending.begin(), mDirPending.end()),
+                mDirPending.end());
+            mDirDirty.insert(mDirDirty.end(), mDirPending.begin(),
+                             mDirPending.end());
+            mDirPending.clear();
             // S4c: the settle event landed — its doors' overlays now
             // hold the settled pose. Refresh those doors' baked-pose
             // snapshots and let their promotions extinguish (or
@@ -1425,6 +1453,16 @@ private:
             static_cast<int>(lumels.size()) == rec.w * rec.h) {
             packLumelsRGB8(lumels, rec.overlays[k]);
             mPendingReady.push_back(recIdx);   // atomic settle handoff
+            ++mEventCpuRects;
+        } else {
+            // A failed re-bake leaves the overlay at its previous door
+            // pose FOREVER (nothing retries) — never silent.
+            std::fprintf(stderr,
+                "[FALLBACK] door event: re-bake failed for cell %u poly "
+                "%d light %d (%zu lumels vs %dx%d) — overlay stays at "
+                "its previous pose\n",
+                rec.ci, rec.pi, static_cast<int>(lightIdx),
+                lumels.size(), rec.w, rec.h);
         }
         mEventRays += stats.rays;
     }
@@ -1499,7 +1537,7 @@ private:
         }
         writeDirTexelsToAtlas(polyDir, entry, *mDirAtlas, mDensity,
                               /*preserveAlpha=*/true);
-        mDirDirty.push_back(recIdx);
+        mDirPending.push_back(recIdx);   // released at event drain
     }
 
     // ── S4c promotion machinery ─────────────────────────────────────────
@@ -1721,6 +1759,7 @@ private:
     int mDensity = 1;
     std::vector<float> mReach;
     std::vector<size_t> mDirDirty;
+    std::vector<size_t> mDirPending;   // held until event drain
     std::vector<size_t> mDirQueue;
     bool mDirInitPainted = false;
 public:
