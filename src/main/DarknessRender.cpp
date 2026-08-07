@@ -3025,20 +3025,25 @@ static void renderObjects(
         const auto &obj = mission.objData.objects[oi];
         if (!obj.hasPosition) return;
 
-        // PORTAL culling, view-complete: an object draws iff its bound
-        // touches a visible cell. The old fallback tested the FRUSTUM
-        // when the object's cell was invisible — which meant everything
-        // behind a wall in front of the camera still drew (and paid its
-        // per-object lighting): objects were frustum-culled, not portal
-        // culled. Conservative in the safe direction throughout: cell
-        // bounding SPHERES and the model's bounding sphere, so we can
-        // over-draw but never vanish something visible.
+        // Object culling = FRUSTUM ∧ PORTAL. The frustum rejects
+        // behind/beside-camera objects (roughly half the mission); the
+        // portal term rejects in-frustum objects hidden behind walls —
+        // the class the old code drew every frame, per-object lighting
+        // included, because its only test on an invisible cell was the
+        // frustum. Both terms are conservative in the safe direction
+        // (model bounding sphere, cell bounding spheres): over-draw is
+        // possible, vanishing is not.
         //
         // objCellIDs holds the LOAD-time cell; a moved object (AI, a
         // carried crate) skips the cell fast-path and takes the sweep,
         // which answers from its CURRENT position — a stale cell can
         // therefore only cause an extra draw, never a wrong cull.
+        //
+        // DARKNESS_OLD_OBJ_CULL=1 resurrects the pre-portal behaviour
+        // (frustum-only) for A/B measurement.
         if (state.portalCulling && oi < mission.objCellIDs.size()) {
+            static const bool sOldCull =
+                std::getenv("DARKNESS_OLD_OBJ_CULL") != nullptr;
             float cx = obj.x, cy = obj.y, cz = obj.z;
             float csx = obj.scaleX, csy = obj.scaleY, csz = obj.scaleZ;
             const Darkness::ObjectState *cullState = state.objectStates
@@ -3052,22 +3057,30 @@ static void renderObjects(
                 moved = std::abs(cx - obj.x) + std::abs(cy - obj.y) +
                         std::abs(cz - obj.z) > 0.5f;
             }
+            std::string mname(obj.modelName);
+            auto mit = mission.parsedModels.find(mname);
+            if (mit == mission.parsedModels.end()) return;
+            const auto &mesh = mit->second;
+            const float hx =
+                (mesh.bboxMax[0] - mesh.bboxMin[0]) * 0.5f * csx;
+            const float hy =
+                (mesh.bboxMax[1] - mesh.bboxMin[1]) * 0.5f * csy;
+            const float hz =
+                (mesh.bboxMax[2] - mesh.bboxMin[2]) * 0.5f * csz;
+            const float objR = std::sqrt(hx * hx + hy * hy + hz * hz);
+            // Frustum first: the cheapest reject, and it now applies to
+            // ALL objects (the old code skipped it for visible-cell
+            // objects and let the GPU clip them).
+            if (!fc.objFrustum.testAABB(cx - objR, cy - objR, cz - objR,
+                                        cx + objR, cy + objR, cz + objR)) {
+                ++sObjPortalCulled;
+                return;
+            }
             const int32_t objCell = mission.objCellIDs[oi];
             const bool cellVisible =
                 !moved && objCell >= 0 &&
                 fc.visibleCells.count(static_cast<uint32_t>(objCell)) != 0;
-            if (!cellVisible) {
-                std::string mname(obj.modelName);
-                auto mit = mission.parsedModels.find(mname);
-                if (mit == mission.parsedModels.end()) return;
-                const auto &mesh = mit->second;
-                const float hx =
-                    (mesh.bboxMax[0] - mesh.bboxMin[0]) * 0.5f * csx;
-                const float hy =
-                    (mesh.bboxMax[1] - mesh.bboxMin[1]) * 0.5f * csy;
-                const float hz =
-                    (mesh.bboxMax[2] - mesh.bboxMin[2]) * 0.5f * csz;
-                const float objR = std::sqrt(hx * hx + hy * hy + hz * hz);
+            if (!cellVisible && !sOldCull) {
                 const Darkness::Vector3 oc(cx, cy, cz);
                 bool touches = false;
                 for (uint32_t ci : fc.visibleCells) {
@@ -9006,7 +9019,28 @@ int main(int argc, char *argv[]) {
                         "objects\n", state.dynamicLights.count());
                 }
             }
-            renderObjects(fc, gpu, mission, state);
+            {
+                // [VIS_CULL] A/B timing: CPU cost of the whole object
+                // pass (cull tests + light math + submits).
+                const auto ot0 = std::chrono::steady_clock::now();
+                renderObjects(fc, gpu, mission, state);
+                static double sObjMs = 0.0;
+                static uint32_t sObjFrames = 0;
+                sObjMs += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - ot0).count();
+                if (++sObjFrames == 300) {
+                    if (Darkness::logTagEnabled("VIS_CULL")) {
+                        const bgfx::Stats *bs = bgfx::getStats();
+                        std::fprintf(stderr,
+                            "[VIS_CULL] object pass %.2f ms/frame avg; "
+                            "frame draws %d\n",
+                            sObjMs / 300.0,
+                            static_cast<int>(bs->numDraw));
+                    }
+                    sObjMs = 0.0;
+                    sObjFrames = 0;
+                }
+            }
 
             // ── Water surfaces ──
             renderWater(fc, meshes, gpu, state);
