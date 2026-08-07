@@ -417,7 +417,8 @@ public:
                 mReadyRecs.push_back(it.recIdx);
                 // Direction stays a (gated) CPU pass until the second
                 // render target lands — run it as results arrive.
-                if (dirSignificant(it.recIdx, it.lightIdx) &&
+                if (kEventDirRebake &&
+                    dirSignificant(it.recIdx, it.lightIdx) &&
                     mEventDirDone.insert(it.recIdx).second)
                     rebakeDirection(it.recIdx);
             }
@@ -520,7 +521,8 @@ public:
                         // CPU fallback for this item.
                         ++mWorkCursor;
                         rebakeOverlay(recIdx, lightIdx);
-                        if (dirSignificant(recIdx, lightIdx) &&
+                        if (kEventDirRebake &&
+                            dirSignificant(recIdx, lightIdx) &&
                             mEventDirDone.insert(recIdx).second)
                             rebakeDirection(recIdx);
                         ++mEventCpuRects;
@@ -576,7 +578,8 @@ public:
             while (budget-- > 0 && mWorkCursor < mWork.size()) {
                 const auto &[recIdx, lightIdx] = mWork[mWorkCursor++];
                 rebakeOverlay(recIdx, lightIdx);
-                if (dirSignificant(recIdx, lightIdx) &&
+                if (kEventDirRebake &&
+                    dirSignificant(recIdx, lightIdx) &&
                     mEventDirDone.insert(recIdx).second)
                     rebakeDirection(recIdx);
                 if (std::chrono::duration<double, std::milli>(
@@ -717,6 +720,16 @@ private:
         mEventRays += stats.rays;
     }
 
+    // The CPU direction re-encode is PARKED (2026-08-07): on GPU-batch
+    // collect frames it burst up to 256 all-candidate ray passes into one
+    // frame (the "door opening is incredibly slow" hitch), and its
+    // dominance gate cuts exactly the dim-but-directional polys where
+    // specular-through-doors lives — so it cost frames without delivering
+    // the feature. Direction tracking door state ships as the S2 slice-3
+    // GPU render target instead; until then the KNOWN GAP is that
+    // specular does not follow door state. rebakeDirection stays as the
+    // slice-3 CPU reference.
+    static constexpr bool kEventDirRebake = false;
     static constexpr float kRebuildSec = 0.15f;
     static constexpr int kPolysPerFrame = 48;
     static constexpr double kFrameMsBudget = 4.0;
