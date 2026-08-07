@@ -131,11 +131,25 @@ struct ShadowMapCache {
     std::vector<ShadowSlot> slots;
 
     // ── S4b dynamic casters (door leaves) ──
-    // Bodies whose OBBs join every face render as transient boxes, and
-    // whose poses feed the validity hash — a light re-renders its faces
-    // when a door inside its reach moves. Set once after the door census.
+    // Bodies whose OBBs join every face render as boxes, and whose
+    // poses feed the validity hash — a light re-renders its faces when
+    // a door inside its reach moves. Set once after the door census.
     const ObjectCollisionWorld *dynCasterWorld = nullptr;
     std::vector<uint32_t>       dynCasterBodies;
+
+    // Retained dynamic VBs for the caster boxes. These were transient
+    // buffers, and the per-frame transient pool DROPPED them under
+    // pressure (silently, until 2026-08-08): a face rendered without
+    // its doors bakes door-transparent overlays and feeds the S4c
+    // differential a phantom across the light's whole reach — the
+    // "artifacts where the door isn't" bug. Shadow correctness must not
+    // share a budget with cosmetic transient users. Ring, one entry per
+    // face-render CALL (all 6 faces of a call share one buffer): bgfx
+    // dynamic-VB updates are last-writer-wins within a frame, so
+    // concurrent renders need distinct buffers. Entries created lazily.
+    static constexpr uint32_t kDynBoxRing = 32;
+    std::vector<bgfx::DynamicVertexBufferHandle> dynBoxVbh;
+    uint32_t dynBoxCursor = 0;
 
     // ── Stats (cumulative; the startup line and the HUD read these) ──
     uint32_t facesRendered = 0;
@@ -303,6 +317,9 @@ inline void initShadowMapCache(ShadowMapCache &c, const WRParsedData &wr,
 }
 
 inline void destroyShadowMapCache(ShadowMapCache &c) {
+    for (auto &h : c.dynBoxVbh)
+        if (bgfx::isValid(h)) { bgfx::destroy(h); h = BGFX_INVALID_HANDLE; }
+    c.dynBoxVbh.clear();
     auto kill = [](auto &h) {
         if (bgfx::isValid(h)) { bgfx::destroy(h); h.idx = bgfx::kInvalidHandle; }
     };
@@ -406,8 +423,13 @@ inline void renderShadowFacesAt(ShadowMapCache &c, const WRParsedData &wr,
                     return;
                 }
     };
-    std::vector<uint32_t> dynInReach;
+    // Box soup for the in-reach doors, built ONCE per call (identical
+    // for all six faces) and uploaded to a retained ring buffer — never
+    // the per-frame transient pool (see dynBoxVbh).
+    uint32_t dynBoxCount = 0;
+    bgfx::DynamicVertexBufferHandle dynVbh = BGFX_INVALID_HANDLE;
     if (c.dynCasterWorld) {
+        std::vector<ShadowCasterVertex> soup;
         const auto &bodies = c.dynCasterWorld->getBodies();
         for (uint32_t bi : c.dynCasterBodies) {
             if (bi >= bodies.size() || bodies[bi].removed) continue;
@@ -416,8 +438,54 @@ inline void renderShadowFacesAt(ShadowMapCache &c, const WRParsedData &wr,
             casterPose(bi, b, bp, br);
             const float maxEdge = std::max(
                 {b.edgeLengths.x, b.edgeLengths.y, b.edgeLengths.z});
-            if (glm::length(bp - lightPos) - maxEdge <= reach)
-                dynInReach.push_back(bi);
+            if (glm::length(bp - lightPos) - maxEdge > reach) continue;
+            const Vector3 he = b.edgeLengths * 0.5f;
+            const Vector3 ax = Vector3(br[0]) * he.x;
+            const Vector3 ay = Vector3(br[1]) * he.y;
+            const Vector3 az = Vector3(br[2]) * he.z;
+            Vector3 corner[8];
+            for (int k = 0; k < 8; ++k)
+                corner[k] = bp +
+                    ax * ((k & 1) ? 1.0f : -1.0f) +
+                    ay * ((k & 2) ? 1.0f : -1.0f) +
+                    az * ((k & 4) ? 1.0f : -1.0f);
+            // 12 triangles over the 6 box faces (winding irrelevant —
+            // the pass renders two-sided).
+            static const int tri[36] = {
+                0,1,3, 0,3,2,  4,6,7, 4,7,5,
+                0,4,5, 0,5,1,  2,3,7, 2,7,6,
+                0,2,6, 0,6,4,  1,5,7, 1,7,3};
+            for (int k = 0; k < 36; ++k) {
+                const Vector3 &pq = corner[tri[k]];
+                soup.push_back({pq.x, pq.y, pq.z});
+            }
+        }
+        if (!soup.empty()) {
+            if (c.dynBoxVbh.empty())
+                c.dynBoxVbh.assign(ShadowMapCache::kDynBoxRing,
+                                   BGFX_INVALID_HANDLE);
+            auto &slot2 = c.dynBoxVbh[c.dynBoxCursor];
+            c.dynBoxCursor =
+                (c.dynBoxCursor + 1) % ShadowMapCache::kDynBoxRing;
+            if (!bgfx::isValid(slot2))
+                slot2 = bgfx::createDynamicVertexBuffer(
+                    static_cast<uint32_t>(soup.size()),
+                    ShadowCasterVertex::layout,
+                    BGFX_BUFFER_ALLOW_RESIZE);
+            if (bgfx::isValid(slot2)) {
+                bgfx::update(slot2, 0,
+                             bgfx::copy(soup.data(),
+                                        static_cast<uint32_t>(
+                                            soup.size() *
+                                            sizeof(ShadowCasterVertex))));
+                dynVbh = slot2;
+                dynBoxCount = static_cast<uint32_t>(soup.size());
+            } else {
+                std::fprintf(stderr,
+                    "[FALLBACK] shadow face render: dynamic caster VB "
+                    "unavailable — %zu box vert(s) MISSING from slot "
+                    "%d\n", soup.size(), slot);
+            }
         }
     }
 
@@ -473,50 +541,14 @@ inline void renderShadowFacesAt(ShadowMapCache &c, const WRParsedData &wr,
                        BGFX_STATE_DEPTH_TEST_LESS);
         bgfx::submit(vid, c.depthProgram);
 
-        // Dynamic casters: one transient non-indexed triangle soup of the
-        // in-reach door boxes (12 tris each), same program and state.
-        if (!dynInReach.empty()) {
-            const uint32_t vcount =
-                static_cast<uint32_t>(dynInReach.size()) * 36u;
-            if (bgfx::getAvailTransientVertexBuffer(
-                    vcount, ShadowCasterVertex::layout) >= vcount) {
-                bgfx::TransientVertexBuffer tvb;
-                bgfx::allocTransientVertexBuffer(
-                    &tvb, vcount, ShadowCasterVertex::layout);
-                auto *v = reinterpret_cast<ShadowCasterVertex *>(tvb.data);
-                const auto &bodies = c.dynCasterWorld->getBodies();
-                size_t w = 0;
-                for (uint32_t bi : dynInReach) {
-                    const ObjectCollisionBody &b = bodies[bi];
-                    Vector3 bp; glm::mat3 br;
-                    casterPose(bi, b, bp, br);
-                    const Vector3 he = b.edgeLengths * 0.5f;
-                    const Vector3 ax = Vector3(br[0]) * he.x;
-                    const Vector3 ay = Vector3(br[1]) * he.y;
-                    const Vector3 az = Vector3(br[2]) * he.z;
-                    Vector3 corner[8];
-                    for (int k = 0; k < 8; ++k)
-                        corner[k] = bp +
-                            ax * ((k & 1) ? 1.0f : -1.0f) +
-                            ay * ((k & 2) ? 1.0f : -1.0f) +
-                            az * ((k & 4) ? 1.0f : -1.0f);
-                    // 12 triangles over the 6 faces (winding irrelevant —
-                    // the pass renders two-sided).
-                    static const int tri[36] = {
-                        0,1,3, 0,3,2,  4,6,7, 4,7,5,
-                        0,4,5, 0,5,1,  2,3,7, 2,7,6,
-                        0,2,6, 0,6,4,  1,5,7, 1,7,3};
-                    for (int k = 0; k < 36; ++k) {
-                        const Vector3 &p = corner[tri[k]];
-                        v[w++] = {p.x, p.y, p.z};
-                    }
-                }
-                bgfx::setUniform(c.u_shadowLightPos, lp);
-                bgfx::setVertexBuffer(0, &tvb);
-                bgfx::setState(BGFX_STATE_WRITE_R | BGFX_STATE_WRITE_Z |
-                               BGFX_STATE_DEPTH_TEST_LESS);
-                bgfx::submit(vid, c.depthProgram);
-            }
+        // Dynamic casters: the ring-buffered box soup built above, same
+        // program and state.
+        if (dynBoxCount > 0 && bgfx::isValid(dynVbh)) {
+            bgfx::setUniform(c.u_shadowLightPos, lp);
+            bgfx::setVertexBuffer(0, dynVbh, 0, dynBoxCount);
+            bgfx::setState(BGFX_STATE_WRITE_R | BGFX_STATE_WRITE_Z |
+                           BGFX_STATE_DEPTH_TEST_LESS);
+            bgfx::submit(vid, c.depthProgram);
         }
         ++c.facesRendered;
     }

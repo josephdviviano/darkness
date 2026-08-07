@@ -7982,7 +7982,8 @@ int main(int argc, char *argv[]) {
         // for one door and writes panel images (see DoorShadowSystem).
         if (cfg.doorDiffDiag != 0)
             doorShadow.runDiffDiagnostic(gpu.shadowCache,
-                                         cfg.doorDiffDiag);
+                                         cfg.doorDiffDiag,
+                                         &gpu.lumelBake);
     }
 
     // ── S1 acceptance: shadow-map vs raycastWorld cross-check ──

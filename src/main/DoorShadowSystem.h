@@ -196,14 +196,15 @@ public:
         // driver's overlayF construction.
         mFormula.includeAmbient = false;
         mFormula.includeSun = false;
-        // Runtime re-bakes trade emitter samples for latency. At load
-        // quality (16-sample penumbra x 2x2 receiver supersampling) ONE
-        // door's event measured 8.5M rays / 4.3 s of work — an ~18 s
-        // trickle at the frame budget, which reads as "the framerate
-        // never recovered". The fast profile (4 x 1x1) cuts ~16x; door
-        // shadows during/after a swing are slightly harder-edged than
-        // load-baked ones. A quality re-pass once the door RESTS is the
-        // recorded follow-up if the seam shows.
+        // Runtime re-bakes trade emitter samples for CPU cost. The
+        // original justification (an 18 s VISIBLE trickle at load
+        // quality) died with S4c: events fire once at settle and the
+        // differential carries the door shadow until they drain, so
+        // the trickle is invisible — the fast profile is now purely a
+        // CPU-budget choice. 4 x 1x1 quantises the door penumbra to 5
+        // levels vs the load bake's 16 x 2x2 (the [DOOR_DIAG] pose-A
+        // self-check measures the gap, max ~182/255 at penumbra
+        // texels); raise it here if edge banding shows at rest.
         mFormula.penumbraSamples = std::min(mFormula.penumbraSamples, 4);
         mFormula.supersample = 1;
 
@@ -782,7 +783,8 @@ public:
     // penumbra attribution and per-poly PPM panels
     // [truthA | midswing | truthB | err×8] under doorshadow_diag/.
     // Self-check: its own pose-A bake must equal the stored overlay.
-    void runDiffDiagnostic(ShadowMapCache &sc, int32_t doorID) {
+    void runDiffDiagnostic(ShadowMapCache &sc, int32_t doorID,
+                           LumelBakeGPU *gpu = nullptr) {
         if (!active() || !sc.valid() || !mOcclusion.world) {
             std::fprintf(stderr, "[DOOR_DIAG] inactive or no cache\n");
             return;
@@ -1058,12 +1060,13 @@ public:
         std::fprintf(stderr,
             "[DOOR_DIAG] door %d: %zu lights, %zu texels; midswing-vs-"
             "settled |err|: mean %.2f/255 p95 %.1f max %.1f; >8/255: "
-            "%.1f%% (penumbra-zone share %.1f%%); pose-A self-check max "
-            "%.1f/255 %s\n",
+            "%.1f%% (penumbra-zone share %.1f%%); event-vs-load penumbra "
+            "profile gap max %.1f/255 (4x1 vs load sampling — edge "
+            "SOFTNESS levels, not position; raise the event profile if "
+            "banding shows)\n",
             doorID, lds.size(), nTex, 255.0 * sumErr / nTex, 255.0f * p95,
             255.0f * errs.back(), 100.0 * nBad / nTex,
-            nBad ? 100.0 * nBadPen / nBad : 0.0, 255.0 * selfCheckMax,
-            selfCheckMax < 2.5 / 255.0 ? "PASS" : "FAIL");
+            nBad ? 100.0 * nBadPen / nBad : 0.0, 255.0 * selfCheckMax);
         std::sort(worst.begin(), worst.end(),
                   [](const PolyErr &a, const PolyErr &b) {
                       return a.maxErr > b.maxErr;
@@ -1129,6 +1132,268 @@ public:
                 std::fwrite(img.data(), 1, img.size(), f);
                 std::fclose(f);
                 std::fprintf(stderr, "[DOOR_DIAG]   wrote %s\n", path);
+            }
+        }
+
+        // ── GPU-event leg ──
+        // Re-bake every cone poly of the door's lights at the UNCHANGED
+        // pose through the real event path (ensureShadowLight + PCSS +
+        // storage transform) and diff against the stored load overlays.
+        // The truth is "nothing moved, so nothing may change": any
+        // nonzero here is pure event-path error on polys the door does
+        // not even shadow — the class the mid-swing sweep above cannot
+        // see. Worst polys imaged as [stored | gpuEvent | err x8].
+        if (gpu && gpu->valid())
+        for (int diagMode = 0; diagMode < 2; ++diagMode) {
+            // Mode 0: exact hard 1-tap (pcssEmitter 0) — errors here are
+            // shadow-map geometry/bias, independent of filtering.
+            // Mode 1: the real event path (PCSS on). The DIFFERENCE
+            // between the two attributes the error to the kernel.
+            const float diagPcss = diagMode == 0 ? 0.0f : -1.0f;
+            const char *diagLabel = diagMode == 0 ? "hard" : "pcss";
+            struct GpuItem { size_t recIdx; size_t ovK; int16_t li;
+                             int x, y, w, h; };
+            double gSum = 0.0; size_t gTex = 0, gBad = 0;
+            float gMax = 0.0f;
+            std::vector<float> gErrs;
+            struct GPanel { std::vector<uint8_t> stored, gpuB; int w, h;
+                            float maxErr; size_t recIdx; int16_t li; };
+            std::vector<GPanel> gPanels;
+            size_t clsStaleDark = 0, clsStaleBright = 0;
+            size_t clsGpuPhantom = 0, clsGpuMiss = 0, clsGpuMissWorld = 0;
+            size_t cursor = 0;
+            std::vector<std::pair<size_t, int16_t>> items(lw->second);
+            while (cursor < items.size()) {
+                beginLumelBatchView(*gpu);
+                std::vector<GpuItem> batch;
+                int shelfX = 0, shelfY = 0, shelfH = 0;
+                const int S = LumelBakeGPU::kScratchSize;
+                while (cursor < items.size()) {
+                    const auto &[recIdx, li] = items[cursor];
+                    const RebakedAnimPoly &rec = (*mAnimPolys)[recIdx];
+                    size_t k = 0;
+                    for (; k < rec.overlayLightIdx.size(); ++k)
+                        if (rec.overlayLightIdx[k] == li) break;
+                    const WRStaticLight &L =
+                        mWr->staticLights[static_cast<size_t>(li)];
+                    const LumelGrid grid =
+                        buildLumelGrid(*mWr, rec.ci, rec.pi, mDensity);
+                    if (L.inner != -1.0f || !grid.valid ||
+                        grid.lx != rec.w || grid.ly != rec.h ||
+                        k >= rec.overlays.size()) {
+                        ++cursor;
+                        continue;
+                    }
+                    if (shelfX + grid.lx > S) {
+                        shelfY += shelfH; shelfX = 0; shelfH = 0;
+                    }
+                    if (shelfY + grid.ly > S) break;
+                    const int slot =
+                        ensureShadowLight(sc, *mWr, li, 2);
+                    const float reach =
+                        static_cast<size_t>(li) < mReach.size()
+                            ? mReach[static_cast<size_t>(li)] : 0.0f;
+                    if (slot < 0 || reach <= 0.0f) { ++cursor; continue; }
+                    const Vector3 cK =
+                        L.bright * (mFormula.brightScale * promoteK(li));
+                    if (!submitLumelRect(*gpu, sc, grid,
+                                         mFormula.surfaceOffset, L.loc,
+                                         reach, cK, slot,
+                                         mFormula.emitterRadius, shelfX,
+                                         shelfY, diagPcss))
+                        break;
+                    batch.push_back({recIdx, k, li, shelfX, shelfY,
+                                     grid.lx, grid.ly});
+                    shelfX += grid.lx;
+                    shelfH = std::max(shelfH, grid.ly);
+                    ++cursor;
+                }
+                if (batch.empty()) { if (cursor < items.size()) ++cursor; continue; }
+                const uint32_t ready = kickLumelBatchReadback(*gpu);
+                uint32_t cur = bgfx::frame();
+                while (cur < ready) cur = bgfx::frame();
+                const bool flip = bgfx::getCaps()->originBottomLeft;
+                for (const GpuItem &it : batch) {
+                    const RebakedAnimPoly &rec = (*mAnimPolys)[it.recIdx];
+                    const std::vector<uint8_t> &stored =
+                        rec.overlays[it.ovK];
+                    const LumelGrid cgrid = buildLumelGrid(
+                        *mWr, rec.ci, rec.pi, mDensity);
+                    const WRStaticLight &cL = mWr->staticLights[
+                        static_cast<size_t>(it.li)];
+                    GPanel gp;
+                    gp.w = it.w; gp.h = it.h;
+                    gp.recIdx = it.recIdx; gp.li = it.li;
+                    gp.maxErr = 0.0f;
+                    gp.stored = stored;
+                    gp.gpuB.resize(static_cast<size_t>(it.w) * it.h * 3);
+                    for (int y = 0; y < it.h; ++y) {
+                        const int sy = it.y + y;
+                        const int row = flip ? (S - 1 - sy) : sy;
+                        const uint8_t *src = &gpu->batch.pixels[
+                            (static_cast<size_t>(row) * S + it.x) * 4];
+                        for (int x = 0; x < it.w; ++x) {
+                            float texErr = 0.0f;
+                            for (int ch = 0; ch < 3; ++ch) {
+                                const uint8_t g8 = src[x * 4 + ch];
+                                const uint8_t s8 =
+                                    stored[(static_cast<size_t>(y) *
+                                            it.w + x) * 3 + ch];
+                                gp.gpuB[(static_cast<size_t>(y) * it.w +
+                                         x) * 3 + ch] = g8;
+                                texErr = std::max(texErr,
+                                    std::abs(int(g8) - int(s8)) / 255.0f);
+                            }
+                            gSum += texErr;
+                            gErrs.push_back(texErr);
+                            ++gTex;
+                            if (texErr > 8.0f / 255.0f) ++gBad;
+                            gp.maxErr = std::max(gp.maxErr, texErr);
+                            gMax = std::max(gMax, texErr);
+                            // Classify gross errors with the CPU door
+                            // test at CURRENT poses: whichever of
+                            // GPU/stored agrees with it is telling the
+                            // truth. Separates "stored overlay is
+                            // STALE w.r.t. door poses" from "the GPU
+                            // scene has a phantom / missing occluder".
+                            if (texErr > 32.0f / 255.0f && cgrid.valid) {
+                                const Vector3 P2 =
+                                    cgrid.at(x, y) +
+                                    cgrid.normal *
+                                        mFormula.surfaceOffset;
+                                const bool doorBlk =
+                                    DoorSegmentOcclusion::blocked(
+                                        &mOcclusion, cL.loc, P2);
+                                RayHit wrHit;
+                                raycastWorld(*mWr, cL.loc, P2, wrHit);
+                                const bool wrBlk =
+                                    wrHit.status == RayStatus::Hit;
+                                const bool blk = doorBlk || wrBlk;
+                                int gSumB = 0, sSumB = 0;
+                                for (int ch2 = 0; ch2 < 3; ++ch2) {
+                                    gSumB += gp.gpuB[
+                                        (static_cast<size_t>(y) * it.w +
+                                         x) * 3 + ch2];
+                                    sSumB += stored[
+                                        (static_cast<size_t>(y) * it.w +
+                                         x) * 3 + ch2];
+                                }
+                                const bool gpuDark = gSumB < sSumB;
+                                // The ray is the arbiter: whoever
+                                // disagrees with it is the defect.
+                                if (gpuDark == blk) {
+                                    if (gpuDark) ++clsStaleDark;
+                                    else ++clsStaleBright;
+                                } else if (gpuDark) {
+                                    ++clsGpuPhantom;
+                                    if (wrBlk) {}  // unreachable: blk
+                                } else {
+                                    ++clsGpuMiss;
+                                    if (wrBlk) ++clsGpuMissWorld;
+                                }
+                            }
+                        }
+                    }
+                    gPanels.push_back(std::move(gp));
+                }
+                gpu->batch.items.clear();
+                gpu->batch.inFlight = false;
+            }
+            if (gTex) {
+                std::sort(gErrs.begin(), gErrs.end());
+                std::fprintf(stderr,
+                    "[DOOR_DIAG] GPU-event leg [%s] (pose unchanged, %zu "
+                    "texels): |gpu - storedLoad| mean %.2f/255 p95 %.1f "
+                    "max %.1f; >8/255: %.2f%% — nothing moved, so "
+                    "nonzero = event-path error\n",
+                    diagLabel, gTex, 255.0 * gSum / gTex,
+                    255.0f * gErrs[static_cast<size_t>(
+                        gErrs.size() * 0.95)],
+                    255.0f * gMax, 100.0 * gBad / gTex);
+                std::fprintf(stderr,
+                    "[DOOR_DIAG]   gross-error classes [%s] (CPU "
+                    "ray+door @ current poses is the arbiter): "
+                    "staleStored dark=%zu bright=%zu | "
+                    "gpuPhantomShadow=%zu gpuMissedOccluder=%zu "
+                    "(world=%zu)\n",
+                    diagLabel, clsStaleDark, clsStaleBright,
+                    clsGpuPhantom, clsGpuMiss, clsGpuMissWorld);
+                std::sort(gPanels.begin(), gPanels.end(),
+                          [](const GPanel &a, const GPanel &b) {
+                              return a.maxErr > b.maxErr;
+                          });
+                for (size_t w2 = 0; w2 < gPanels.size() && w2 < 4; ++w2) {
+                    const GPanel &gp = gPanels[w2];
+                    const RebakedAnimPoly &rec =
+                        (*mAnimPolys)[gp.recIdx];
+                    std::fprintf(stderr,
+                        "[DOOR_DIAG]   gpu-worst[%s] %zu: cell %u poly "
+                        "%d light %d (%dx%d) maxErr %.1f/255\n",
+                        diagLabel, w2, rec.ci, rec.pi,
+                        static_cast<int>(gp.li),
+                        gp.w, gp.h, 255.0f * gp.maxErr);
+                    const int up2 = 8, sep2 = 2;
+                    const int W2 = gp.w * up2 * 3 + sep2 * 2;
+                    const int H2 = gp.h * up2;
+                    std::vector<uint8_t> img2(
+                        static_cast<size_t>(W2) * H2 * 3, 32);
+                    auto put2 = [&](int panel,
+                                    const std::function<void(
+                                        int, int, uint8_t *)> &pix) {
+                        const int x0 = panel * (gp.w * up2 + sep2);
+                        for (int y = 0; y < H2; ++y)
+                            for (int x = 0; x < gp.w * up2; ++x) {
+                                uint8_t rgb[3];
+                                pix(x / up2, y / up2, rgb);
+                                uint8_t *o = &img2[
+                                    (static_cast<size_t>(y) * W2 + x0 +
+                                     x) * 3];
+                                o[0] = rgb[0]; o[1] = rgb[1];
+                                o[2] = rgb[2];
+                            }
+                    };
+                    put2(0, [&](int x, int y, uint8_t *rgb) {
+                        const size_t t =
+                            (static_cast<size_t>(y) * gp.w + x) * 3;
+                        rgb[0] = gp.stored[t]; rgb[1] = gp.stored[t + 1];
+                        rgb[2] = gp.stored[t + 2];
+                    });
+                    put2(1, [&](int x, int y, uint8_t *rgb) {
+                        const size_t t =
+                            (static_cast<size_t>(y) * gp.w + x) * 3;
+                        rgb[0] = gp.gpuB[t]; rgb[1] = gp.gpuB[t + 1];
+                        rgb[2] = gp.gpuB[t + 2];
+                    });
+                    put2(2, [&](int x, int y, uint8_t *rgb) {
+                        const size_t t =
+                            (static_cast<size_t>(y) * gp.w + x) * 3;
+                        int dpos = 0, dneg = 0;
+                        for (int ch = 0; ch < 3; ++ch) {
+                            const int dd = int(gp.gpuB[t + ch]) -
+                                           int(gp.stored[t + ch]);
+                            dpos = std::max(dpos, dd);
+                            dneg = std::max(dneg, -dd);
+                        }
+                        rgb[0] = static_cast<uint8_t>(
+                            std::min(255, dpos * 8));
+                        rgb[1] = 0;
+                        rgb[2] = static_cast<uint8_t>(
+                            std::min(255, dneg * 8));
+                    });
+                    char path2[128];
+                    std::snprintf(path2, sizeof(path2),
+                                  "doorshadow_diag/gpuevent_%s_d%d_c%u"
+                                  "_p%d_l%d.ppm",
+                                  diagLabel, doorID, rec.ci, rec.pi,
+                                  static_cast<int>(gp.li));
+                    if (FILE *f2 = std::fopen(path2, "wb")) {
+                        std::fprintf(f2, "P6\n%d %d\n255\n", W2, H2);
+                        std::fwrite(img2.data(), 1, img2.size(), f2);
+                        std::fclose(f2);
+                        std::fprintf(stderr, "[DOOR_DIAG]   wrote %s\n",
+                                     path2);
+                    }
+                }
             }
         }
     }

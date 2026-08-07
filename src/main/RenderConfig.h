@@ -832,9 +832,16 @@ struct RenderConfig {
     // --lumel-bake-test: the S2 GPU engine's acceptance — GPU-bake one
     // door overlay and diff it against the CPU bake of the same rect.
     bool lumelBakeTest        = false;
-    // --rebake-cpu-events: force door events onto the CPU ray path (the
-    // verification oracle) instead of the GPU lumel-bake engine.
-    bool rebakeCpuEvents      = false;
+    // Door-event re-bake path. CPU (the default) runs the exact load
+    // formula's ray path — measured drift-free against the stored load
+    // overlays, where the GPU path missed thin/grazing WORLD occluders
+    // (sub-texel silhouettes in the 256^2 faces; --door-diff-diag
+    // classes gpuMissedOccluder=148/gpuPhantomShadow=171 on door 403).
+    // Event latency is hidden: the S4c differential carries the door
+    // shadow until the event drains, so the CPU trickle is invisible.
+    // --rebake-gpu-events re-enables the GPU engine (kept for the
+    // --lumel-bake-test acceptance and the diagnostic harness).
+    bool rebakeCpuEvents      = true;
     // DEV-ONLY --stress-frob-obj "a,b": send FrobWorldEnd to exactly these
     // object IDs every ~3 s (5 s warmup) through ScriptManager — the same
     // message FrobSystem::executeFrob sends, so lever→ControlDevice→script
@@ -2695,6 +2702,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cfg.lumelBakeTest = true;
         } else if (std::strcmp(argv[i], "--rebake-cpu-events") == 0) {
             cfg.rebakeCpuEvents = true;
+        } else if (std::strcmp(argv[i], "--rebake-gpu-events") == 0) {
+            cfg.rebakeCpuEvents = false;
         } else if (std::strcmp(argv[i], "--shadow-crosscheck") == 0) {
             // Optional pair-count argument: --shadow-crosscheck 50000
             cfg.shadowCrossCheckPairs = 20000;

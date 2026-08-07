@@ -891,6 +891,12 @@ static SDL_Window *initWindow(const Darkness::FogParams &fogParams,
     bInit.resolution.width  = WINDOW_WIDTH;
     bInit.resolution.height = WINDOW_HEIGHT;
     bInit.resolution.reset  = BGFX_RESET_VSYNC;
+    // The 6 MB default transient-VB pool measurably runs dry in busy
+    // frames (corona quads log exhaustion; shadow caster boxes used to
+    // be dropped SILENTLY from S1 faces before moving to retained
+    // buffers on 2026-08-08). Cosmetic users stay on the pool — give
+    // them headroom; every exhaustion still screams.
+    bInit.limits.transientVbSize = 16u << 20;
 
 #if BX_PLATFORM_OSX
     bInit.platformData.nwh = wmi.info.cocoa.window;
