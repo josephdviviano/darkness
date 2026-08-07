@@ -47,6 +47,23 @@
 
 namespace Darkness {
 
+// One in-flight GPU bake batch: packed rects submitted to the scratch RT,
+// blitted to staging, read back ~2 frames later. Single slot (v1): a new
+// batch starts only after the previous collected — an event of ~700 rects
+// still lands in ~150 ms end-to-end vs 3 s of CPU rays.
+struct LumelBakeBatch {
+    struct Item {
+        size_t recIdx = 0;
+        size_t ovK = 0;
+        int16_t lightIdx = 0;
+        int x = 0, y = 0, w = 0, h = 0;
+    };
+    std::vector<Item> items;
+    std::vector<uint8_t> pixels;   // staging readback, scratch W*H*4
+    uint32_t readyFrame = 0;
+    bool inFlight = false;
+};
+
 struct LumelBakeGPU {
     bgfx::ProgramHandle program = BGFX_INVALID_HANDLE;   // owned
     bgfx::UniformHandle u_bakeOrigin = BGFX_INVALID_HANDLE;
@@ -60,7 +77,16 @@ struct LumelBakeGPU {
     bgfx::UniformHandle u_liveShadowInfo = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle s_liveShadowAtlas = BGFX_INVALID_HANDLE;
 
-    bool valid() const { return bgfx::isValid(program); }
+    // Scratch RT + staging for the batched event path.
+    static constexpr int kScratchSize = 1024;
+    bgfx::TextureHandle scratchTex = BGFX_INVALID_HANDLE;
+    bgfx::FrameBufferHandle scratchFb = BGFX_INVALID_HANDLE;
+    bgfx::TextureHandle stagingTex = BGFX_INVALID_HANDLE;
+    LumelBakeBatch batch;
+
+    bool valid() const {
+        return bgfx::isValid(program) && bgfx::isValid(scratchFb);
+    }
 };
 
 inline void initLumelBakeGPU(LumelBakeGPU &g, bgfx::ProgramHandle program) {
@@ -83,6 +109,42 @@ inline void initLumelBakeGPU(LumelBakeGPU &g, bgfx::ProgramHandle program) {
                                              bgfx::UniformType::Vec4);
     g.s_liveShadowAtlas = bgfx::createUniform("s_liveShadowAtlas",
                                               bgfx::UniformType::Sampler);
+    g.scratchTex = bgfx::createTexture2D(
+        LumelBakeGPU::kScratchSize, LumelBakeGPU::kScratchSize, false, 1,
+        bgfx::TextureFormat::RGBA8,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT);
+    g.scratchFb = bgfx::createFrameBuffer(1, &g.scratchTex, false);
+    g.stagingTex = bgfx::createTexture2D(
+        LumelBakeGPU::kScratchSize, LumelBakeGPU::kScratchSize, false, 1,
+        bgfx::TextureFormat::RGBA8,
+        BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK);
+}
+
+// Configure the bake view over the persistent scratch for this frame's
+// submits. Call once per frame BEFORE any submitLumelRect.
+inline void beginLumelBatchView(const LumelBakeGPU &g) {
+    bgfx::setViewFrameBuffer(kViewLumelBake, g.scratchFb);
+    bgfx::setViewRect(kViewLumelBake, 0, 0, LumelBakeGPU::kScratchSize,
+                      LumelBakeGPU::kScratchSize);
+    bgfx::setViewClear(kViewLumelBake, BGFX_CLEAR_COLOR, 0x000000ff);
+    const Matrix4 ident(1.0f);
+    const float sz = static_cast<float>(LumelBakeGPU::kScratchSize);
+    const Matrix4 proj = bgfx::getCaps()->homogeneousDepth
+        ? glm::orthoRH_NO(0.0f, sz, sz, 0.0f, -1.0f, 1.0f)
+        : glm::orthoRH_ZO(0.0f, sz, sz, 0.0f, -1.0f, 1.0f);
+    bgfx::setViewTransform(kViewLumelBake, glm::value_ptr(ident),
+                           glm::value_ptr(proj));
+}
+
+// Blit + readback kick for this frame's batch (call after the submits).
+// Returns the bgfx frame at which `batch.pixels` is valid.
+inline uint32_t kickLumelBatchReadback(LumelBakeGPU &g) {
+    bgfx::blit(kViewLumelRead, g.stagingTex, 0, 0, g.scratchTex, 0, 0,
+               LumelBakeGPU::kScratchSize, LumelBakeGPU::kScratchSize);
+    g.batch.pixels.assign(static_cast<size_t>(LumelBakeGPU::kScratchSize) *
+                              LumelBakeGPU::kScratchSize * 4,
+                          0);
+    return bgfx::readTexture(g.stagingTex, g.batch.pixels.data());
 }
 
 inline void destroyLumelBakeGPU(LumelBakeGPU &g) {
@@ -99,6 +161,9 @@ inline void destroyLumelBakeGPU(LumelBakeGPU &g) {
     kill(g.u_liveFalloff);
     kill(g.u_liveShadowInfo);
     kill(g.s_liveShadowAtlas);
+    kill(g.scratchFb);
+    kill(g.scratchTex);
+    kill(g.stagingTex);
 }
 
 // Submit one poly rect: a quad at [x0,y0]..[x0+w,y0+h] of the target (the

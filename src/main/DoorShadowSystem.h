@@ -40,6 +40,7 @@
 #pragma once
 
 #include "LightmapBake.h"
+#include "LumelBakeGPU.h"
 #include "../services/physics/ObjectCollisionGeometry.h"
 
 #include <algorithm>
@@ -376,10 +377,54 @@ public:
     // doors — radius spans the door's swept sphere plus the largest
     // affected light's reach, so every object whose sight-line to an
     // affected light could cross the door re-runs its visibility rays.
-    std::vector<std::pair<Vector3, float>> update() {
+    // gpu/sc may be null (headless / --rebake-cpu-events): the CPU ray
+    // path then burns the budget exactly as before.
+    std::vector<std::pair<Vector3, float>> update(
+        LumelBakeGPU *gpu = nullptr, ShadowMapCache *sc = nullptr,
+        uint32_t bgfxFrame = 0, bool cpuEvents = false) {
         std::vector<std::pair<Vector3, float>> rebuiltFor;
         if (!active()) return rebuiltFor;
         const auto now = std::chrono::steady_clock::now();
+        const bool gpuMode = !cpuEvents && gpu && gpu->valid() && sc &&
+                             sc->valid();
+
+        // ── Collect a landed GPU batch ──
+        if (gpuMode && gpu->batch.inFlight &&
+            bgfxFrame >= gpu->batch.readyFrame) {
+            const bool flip = bgfx::getCaps()->originBottomLeft;
+            const int S = LumelBakeGPU::kScratchSize;
+            for (const auto &it : gpu->batch.items) {
+                if (it.recIdx >= mAnimPolys->size()) continue;
+                RebakedAnimPoly &rec = (*mAnimPolys)[it.recIdx];
+                if (it.ovK >= rec.overlays.size()) continue;
+                std::vector<uint8_t> &buf = rec.overlays[it.ovK];
+                if (static_cast<int>(buf.size()) < it.w * it.h * 3)
+                    buf.assign(static_cast<size_t>(it.w) * it.h * 3, 0);
+                for (int y = 0; y < it.h; ++y) {
+                    const int sy = it.y + y;
+                    const int row = flip ? (S - 1 - sy) : sy;
+                    const uint8_t *src =
+                        &gpu->batch.pixels[(static_cast<size_t>(row) * S +
+                                            it.x) * 4];
+                    uint8_t *dst =
+                        &buf[static_cast<size_t>(y) * it.w * 3];
+                    for (int x = 0; x < it.w; ++x) {
+                        dst[x * 3 + 0] = src[x * 4 + 0];
+                        dst[x * 3 + 1] = src[x * 4 + 1];
+                        dst[x * 3 + 2] = src[x * 4 + 2];
+                    }
+                }
+                mReadyRecs.push_back(it.recIdx);
+                // Direction stays a (gated) CPU pass until the second
+                // render target lands — run it as results arrive.
+                if (dirSignificant(it.recIdx, it.lightIdx) &&
+                    mEventDirDone.insert(it.recIdx).second)
+                    rebakeDirection(it.recIdx);
+            }
+            mEventGpuRects += gpu->batch.items.size();
+            gpu->batch.items.clear();
+            gpu->batch.inFlight = false;
+        }
 
         // Immediate rebuild when idle (kills the first-frame lag the user
         // reported); rate-limited only while an event is in flight.
@@ -434,6 +479,8 @@ public:
             mEventRays = 0;
             mEventMs = 0.0;
             mEventDirDone.clear();
+            mEventGpuRects = 0;
+            mEventCpuRects = 0;
             // Rebuild census — the line that distinguishes "no events
             // arrive" from "events arrive but select no work" (both look
             // like a dead feature without it). Cadence-limited by the
@@ -444,22 +491,104 @@ public:
                 mWork.size(), rebuiltFor.size());
         }
 
-        // Burn the budget — bounded in BOTH polys and milliseconds (the
-        // per-poly cost varies with lumel count and penumbra edges).
-        int budget = kPolysPerFrame;
         const auto t0 = std::chrono::steady_clock::now();
-        while (budget-- > 0 && mWorkCursor < mWork.size()) {
-            const auto &[recIdx, lightIdx] = mWork[mWorkCursor++];
-            rebakeOverlay(recIdx, lightIdx);
-            if (dirSignificant(recIdx, lightIdx) &&
-                mEventDirDone.insert(recIdx).second)
-                rebakeDirection(recIdx);
-            if (std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count() >
-                kFrameMsBudget)
-                break;
+        if (gpuMode) {
+            // ── Submit phase: pack rects into the scratch, one batch in
+            // flight. Spot lights fall back to the CPU path per item (the
+            // GPU shader is omni-only — recorded TODO).
+            if (!gpu->batch.inFlight && mWorkCursor < mWork.size()) {
+                beginLumelBatchView(*gpu);
+                int shelfX = 0, shelfY = 0, shelfH = 0;
+                const int S = LumelBakeGPU::kScratchSize;
+                while (mWorkCursor < mWork.size() &&
+                       gpu->batch.items.size() < kGpuRectsPerBatch) {
+                    const auto &[recIdx, lightIdx] = mWork[mWorkCursor];
+                    const RebakedAnimPoly &rec = (*mAnimPolys)[recIdx];
+                    size_t k = 0;
+                    for (; k < rec.overlayLightIdx.size(); ++k)
+                        if (rec.overlayLightIdx[k] == lightIdx) break;
+                    const WRStaticLight &L =
+                        mWr->staticLights[static_cast<size_t>(lightIdx)];
+                    const bool spot = (L.inner != -1.0f);
+                    const LumelGrid grid =
+                        buildLumelGrid(*mWr, rec.ci, rec.pi, mDensity);
+                    const bool gridOk = grid.valid &&
+                                        grid.lx == rec.w &&
+                                        grid.ly == rec.h &&
+                                        k < rec.overlays.size();
+                    if (spot || !gridOk) {
+                        // CPU fallback for this item.
+                        ++mWorkCursor;
+                        rebakeOverlay(recIdx, lightIdx);
+                        if (dirSignificant(recIdx, lightIdx) &&
+                            mEventDirDone.insert(recIdx).second)
+                            rebakeDirection(recIdx);
+                        ++mEventCpuRects;
+                        continue;
+                    }
+                    // Shelf-pack.
+                    if (shelfX + grid.lx > S) {
+                        shelfY += shelfH;
+                        shelfX = 0;
+                        shelfH = 0;
+                    }
+                    if (shelfY + grid.ly > S) break;   // batch full
+                    const int slot = ensureShadowLight(
+                        *sc, *mWr, lightIdx, bgfxFrame);
+                    if (slot < 0) { ++mWorkCursor; continue; }
+                    const float anchor = mFormula.anchorFor(lightIdx);
+                    const float a2 = mFormula.emitterRadius *
+                                     mFormula.emitterRadius;
+                    const float K = (anchor * anchor + a2) / anchor;
+                    const Vector3 colorK =
+                        L.bright * (mFormula.brightScale * K);
+                    const float reach =
+                        static_cast<size_t>(lightIdx) < mReach.size()
+                            ? mReach[static_cast<size_t>(lightIdx)] : 0.0f;
+                    if (reach <= 0.0f) { ++mWorkCursor; continue; }
+                    if (!submitLumelRect(*gpu, *sc, grid,
+                                         mFormula.surfaceOffset, L.loc,
+                                         reach, colorK, slot,
+                                         mFormula.emitterRadius, shelfX,
+                                         shelfY))
+                        break;   // transient pool exhausted this frame
+                    LumelBakeBatch::Item item;
+                    item.recIdx = recIdx;
+                    item.ovK = k;
+                    item.lightIdx = lightIdx;
+                    item.x = shelfX;
+                    item.y = shelfY;
+                    item.w = grid.lx;
+                    item.h = grid.ly;
+                    gpu->batch.items.push_back(item);
+                    shelfX += grid.lx;
+                    shelfH = std::max(shelfH, grid.ly);
+                    ++mWorkCursor;
+                }
+                if (!gpu->batch.items.empty()) {
+                    gpu->batch.readyFrame = kickLumelBatchReadback(*gpu);
+                    gpu->batch.inFlight = true;
+                }
+            }
+        } else {
+            // ── CPU ray path (--rebake-cpu-events / no GPU engine) ──
+            int budget = kPolysPerFrame;
+            while (budget-- > 0 && mWorkCursor < mWork.size()) {
+                const auto &[recIdx, lightIdx] = mWork[mWorkCursor++];
+                rebakeOverlay(recIdx, lightIdx);
+                if (dirSignificant(recIdx, lightIdx) &&
+                    mEventDirDone.insert(recIdx).second)
+                    rebakeDirection(recIdx);
+                if (std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count() >
+                    kFrameMsBudget)
+                    break;
+            }
         }
-        if (mWork.size() && mWorkCursor >= mWork.size()) {
+        const bool drained =
+            mWorkCursor >= mWork.size() &&
+            !(gpuMode && gpu->batch.inFlight);
+        if (mWork.size() && drained) {
             mEventMs += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0).count();
             // Event complete — report once, rate-limited.
@@ -469,8 +598,9 @@ public:
                 mLastLog = nowLog;
                 std::fprintf(stderr,
                     "[DOOR_SHADOW] event: %zu overlay polys re-baked "
-                    "(%llu rays, %.1f ms total across frames)\n",
-                    mEventPolysTotal,
+                    "(%zu GPU rects, %zu CPU, %llu CPU rays, %.1f ms CPU "
+                    "across frames)\n",
+                    mEventPolysTotal, mEventGpuRects, mEventCpuRects,
                     static_cast<unsigned long long>(mEventRays), mEventMs);
             }
             mWork.clear();
@@ -595,6 +725,7 @@ private:
     // stale cache until it moves — accepted cut, recorded in the plan.
     static constexpr float kInvalidateMargin = 24.0f;
     static constexpr float kInvalidateSec = 0.75f;
+    static constexpr size_t kGpuRectsPerBatch = 256;
 
     const WRParsedData *mWr = nullptr;
     const RenderParams *mRp = nullptr;
@@ -615,6 +746,8 @@ private:
     std::unordered_set<size_t> mEventDirDone;
     std::vector<uint8_t> mRecBasePeak;
     std::vector<std::vector<uint8_t>> mRecOverlayPeak;
+    size_t mEventGpuRects = 0;
+    size_t mEventCpuRects = 0;
 
     std::unordered_set<int32_t> mDirtyDoors;
     std::unordered_set<int32_t> mProcessingDoors;

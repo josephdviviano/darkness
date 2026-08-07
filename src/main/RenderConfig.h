@@ -827,6 +827,9 @@ struct RenderConfig {
     // --lumel-bake-test: the S2 GPU engine's acceptance — GPU-bake one
     // door overlay and diff it against the CPU bake of the same rect.
     bool lumelBakeTest        = false;
+    // --rebake-cpu-events: force door events onto the CPU ray path (the
+    // verification oracle) instead of the GPU lumel-bake engine.
+    bool rebakeCpuEvents      = false;
     // DEV-ONLY --stress-frob-obj "a,b": send FrobWorldEnd to exactly these
     // object IDs every ~3 s (5 s warmup) through ScriptManager — the same
     // message FrobSystem::executeFrob sends, so lever→ControlDevice→script
@@ -2674,6 +2677,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
                 std::atoi(argv[++i])));
         } else if (std::strcmp(argv[i], "--lumel-bake-test") == 0) {
             cfg.lumelBakeTest = true;
+        } else if (std::strcmp(argv[i], "--rebake-cpu-events") == 0) {
+            cfg.rebakeCpuEvents = true;
         } else if (std::strcmp(argv[i], "--shadow-crosscheck") == 0) {
             // Optional pair-count argument: --shadow-crosscheck 50000
             cfg.shadowCrossCheckPairs = 20000;

@@ -8716,7 +8716,9 @@ int main(int argc, char *argv[]) {
             // invalidation spheres so nearby objects re-run their
             // visibility rays against the new door pose.
             {
-                const auto doorInvalidations = doorShadow.update();
+                const auto doorInvalidations = doorShadow.update(
+                    &gpu.lumelBake, &gpu.shadowCache, state.bgfxFrame,
+                    cfg.rebakeCpuEvents);
                 for (const auto &inv : doorInvalidations)
                     state.objectIlluminator.invalidateNear(inv.first,
                                                            inv.second);
@@ -9001,7 +9003,7 @@ int main(int argc, char *argv[]) {
             // Debug console overlay (draws on top of frob hint when open)
             dbgConsole.render();
 
-            bgfx::frame();
+            state.bgfxFrame = bgfx::frame();
 
         });
 

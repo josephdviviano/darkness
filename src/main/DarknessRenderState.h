@@ -486,6 +486,9 @@ struct RuntimeState {
     // draw as tiles on the right of the screen. -1 = off. Set via the
     // `shadow_debug` console setting.
     int shadowDebugLight = -1;
+    // Current bgfx frame number (bgfx::frame()'s return) — async GPU
+    // readbacks compare their ready-frame against this.
+    uint32_t bgfxFrame = 0;
     // S4 live lights, rebuilt each frame (promotions + test vehicles).
     std::vector<LiveLight> liveLights;
     // Console test vehicle: a warm live light carried at the camera.
