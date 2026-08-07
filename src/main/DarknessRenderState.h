@@ -49,6 +49,7 @@
 #include "LightmapBake.h"
 #include "LightingSystem.h"
 #include "ShadowMapCache.h"
+#include "DoorShadowSystem.h"
 #include "SpecularMaterials.h"
 #include "ObjectPropParser.h"
 #include "BinMeshParser.h"
@@ -297,6 +298,36 @@ struct GPUResources {
     // teardown via destroyShadowMapCache(), including its two programs,
     // mirroring the postProcess pattern.
     ShadowMapCache shadowCache;
+
+    // ── S3 door-shadow re-bake context (DoorShadowSystem.h) ──
+    // Captured at load-bake time so runtime door-event re-bakes run the
+    // IDENTICAL formula (anchors, penumbra, hook). rebakedFormula's
+    // non-owning pointers are re-bound by DoorShadowSystem::init to the
+    // vectors stored here / in the system.
+    BakeFormula                 rebakedFormula{};
+    std::vector<float>          rebakedAnchors;
+    std::vector<int32_t>        rebakedLightCells;
+    std::vector<DoorShadowDoor> doorShadowDoors;
+    std::vector<uint8_t>        doorShadowLights;   // per static light
+    std::vector<glm::vec4>      doorShadowSpheres;  // xyz center, w radius
+
+    // ── S4 live lights (live_lights.sh — edit the cap together) ──
+    bgfx::UniformHandle u_liveLightCount = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_liveFalloff    = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_liveLightPos   = BGFX_INVALID_HANDLE; // vec4 x cap
+    bgfx::UniformHandle u_liveLightColor = BGFX_INVALID_HANDLE; // vec4 x cap
+};
+
+// Mirrors LIVE_LIGHT_CAP in shaders/live_lights.sh.
+constexpr int kLiveLightCap = 4;
+
+// One light promoted out of the baked atlas (or transient, e.g. the
+// flashlight test vehicle). colorK carries bright x brightScale x K_i —
+// the per-light throw intensity folded, mirroring the object path.
+struct LiveLight {
+    Vector3 pos{0.0f};
+    float   reach2 = 0.0f;   // cutoff; sub-quantisation at the edge
+    Vector3 colorK{0.0f};
 };
 
 // ── Per-frame uniform-buffer budget ──
@@ -365,10 +396,13 @@ constexpr uint32_t kUniformCostObjectScalarDraw =
     uniformAlignUp(128u) + uniformAlignUp(64u);
 
 // World draw (lightmapped / textured / flat): vs = u_modelView +
-// u_modelViewProj (128); fs ≤ u_fogColor + u_fogParams + u_lmAtlasSize
-// + u_lightmapScale (64).
+// u_modelViewProj (128); fs ≤ u_fogColor + u_fogParams + u_lmAtlasSize +
+// u_lightmapScale + u_specParams + u_camPosWorld (96) + S4 live lights
+// (u_liveLightCount + u_liveFalloff + 2 arrays × kLiveLightCap = 160).
 constexpr uint32_t kUniformCostWorldDraw =
-    uniformAlignUp(128u) + uniformAlignUp(64u);
+    uniformAlignUp(128u) +
+    uniformAlignUp(96u + 32u +
+                   2u * static_cast<uint32_t>(kLiveLightCap) * 16u);
 
 // Water draw: vs = u_modelView + u_modelViewProj + u_waterParams +
 // u_waterFlow (160); fs = u_waterParams + u_fogColor + u_fogParams (48).
@@ -441,6 +475,10 @@ struct RuntimeState {
     // draw as tiles on the right of the screen. -1 = off. Set via the
     // `shadow_debug` console setting.
     int shadowDebugLight = -1;
+    // S4 live lights, rebuilt each frame (promotions + test vehicles).
+    std::vector<LiveLight> liveLights;
+    // Console test vehicle: a warm live light carried at the camera.
+    bool liveFlashlight = false;
     // Lighting-only debug view: replace world albedo with white so the raw
     // light field is visible. Against a real 64x64 stone texture the ~1
     // world-unit lumel grid is masked by albedo detail — this is what makes

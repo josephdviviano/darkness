@@ -187,6 +187,36 @@ public:
     float physicalFalloffK() const { return mPhysK; }
     float physicalFalloffA2() const { return mPhysA2; }
 
+    // ── S3 dynamic occluders (door leaves) ──
+    // Same fn+ctx shape the bake hook uses (DoorShadowSystem cannot be
+    // included here — the include chain runs the other way). Applied in
+    // locationSeesLight AFTER the WR ray, and only while the physical
+    // mirror is active: vintage object lighting never considered doors
+    // and must stay exact.
+    void setDynamicOcclusion(bool (*fn)(const void *, const Vector3 &,
+                                        const Vector3 &),
+                             const void *ctx) {
+        mDynOccFn = fn;
+        mDynOccCtx = ctx;
+    }
+
+    // Drop cached visibility for objects near a moved door — the
+    // invalidate API the ShadowCache invariant comment demands. Cheap:
+    // affected objects re-run their 96 rays on next evaluation.
+    void invalidateNear(const Vector3 &center, float radius) {
+        int dropped = 0;
+        for (auto it = mCache.begin(); it != mCache.end();) {
+            if (it->second.valid &&
+                glm::length(it->second.pos - center) <= radius) {
+                it = mCache.erase(it);
+                ++dropped;
+            } else {
+                ++it;
+            }
+        }
+        (void)dropped;
+    }
+
     // Set the brightness multiplier for one static-light slot. Used by the
     // animated lighting system to propagate AnimLight intensity changes
     // (FLICKER mode, brighten/dim transitions, on/off via tweqs) to the
@@ -282,6 +312,9 @@ private:
     // frame: vintage mode must stay exactly vintage.
     const std::vector<float> *mPhysReach = nullptr;
     const std::vector<float> *mPhysAnchors = nullptr;  // per-light (throw)
+    bool (*mDynOccFn)(const void *, const Vector3 &, const Vector3 &) =
+        nullptr;
+    const void *mDynOccCtx = nullptr;
     float mPhysK      = 0.0f;
     float mPhysA2     = 0.0f;
     bool  mPhysActive = false;
@@ -653,7 +686,16 @@ inline bool ObjectIlluminator::locationSeesLight(const Vector3 &from,
     RayHit hit;
     int32_t terminalCell = -1;
     bool hitWorld = raycastWorld(*mWr, from, lightLoc, hit, &terminalCell, cellHint);
-    return !hitWorld;
+    if (hitWorld) return false;
+    // S3: door leaves occlude object lighting while the physical mirror
+    // is displayed (walls already darken behind a closed door there; an
+    // object that stayed lit would be the wall/object mismatch class
+    // again). Vintage path: never — the original had no dynamic
+    // occluders here.
+    if (mPhysActive && mDynOccFn &&
+        mDynOccFn(mDynOccCtx, from, lightLoc))
+        return false;
+    return true;
 }
 
 inline void ObjectIlluminator::applyOneLight(int32_t lightIdx,

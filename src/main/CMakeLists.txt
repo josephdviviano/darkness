@@ -385,6 +385,19 @@ add_custom_command(
     COMMENT "Lightmapped shared specular changed — re-touching consumers"
 )
 
+# Same include-tracking gap: live_lights.sh carries the S4 per-fragment
+# live-light term shared by both lightmapped fragment shaders.
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/.live_lights_stamp
+    COMMAND ${CMAKE_COMMAND} -E touch_nocreate
+        ${SHADER_DIR}/fs_lightmapped.sc
+        ${SHADER_DIR}/fs_lightmapped_bicubic.sc
+    COMMAND ${CMAKE_COMMAND} -E touch
+        ${CMAKE_CURRENT_BINARY_DIR}/.live_lights_stamp
+    DEPENDS ${SHADER_DIR}/live_lights.sh
+    COMMENT "Live-light shared shader changed — re-touching consumers"
+)
+
 # Same include-tracking gap again: smaa_common.sh carries the quality preset
 # and the portability helpers for all six SMAA shaders, and editing it would
 # otherwise leave every one of them stale.

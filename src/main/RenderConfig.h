@@ -808,6 +808,15 @@ struct RenderConfig {
     // physical look). Default set from the shipped-atlas luminance-ratio
     // sweep (PLAN.HIGH_RES_SHADOWS falloff section).
     float rebakeThrowAlpha      = 0.5f;
+    // S3 door shadows: door-adjacent lights become overlays and door
+    // leaves occlude their bake rays; door events re-bake those overlays
+    // live. Physical-falloff mode only. Kill switch for A/B and for
+    // isolating bake-cost regressions.
+    bool  rebakeDoorShadows     = true;
+    // DEV-ONLY --stress-doors-cycles N: stop the door-stress harness after
+    // N toggle cycles (0 = forever). Exists so "system at rest afterwards"
+    // is a reproducible measurement window.
+    int   stressDoorsCycles     = 0;
     // S1 shadow-map oracle (PLAN.HIGH_RES_SHADOWS §S1). CLI-only like the
     // rebake family — promotion to YAML waits for the knobs to stabilise
     // (handoff §4.7). Face size is the per-face edge in texels; the
@@ -2653,6 +2662,10 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
         } else if (std::strcmp(argv[i], "--rebake-throw-alpha") == 0 && i + 1 < argc) {
             cfg.rebakeThrowAlpha = std::min(1.0f, std::max(0.0f,
                 static_cast<float>(std::atof(argv[++i]))));
+        } else if (std::strcmp(argv[i], "--rebake-no-door-shadows") == 0) {
+            cfg.rebakeDoorShadows = false;
+        } else if (std::strcmp(argv[i], "--stress-doors-cycles") == 0 && i + 1 < argc) {
+            cfg.stressDoorsCycles = std::max(0, std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--shadow-face-size") == 0 && i + 1 < argc) {
             cfg.shadowFaceSize = std::min(2048, std::max(64,
                 std::atoi(argv[++i])));

@@ -329,6 +329,29 @@ struct BakeFormula {
     // anchor everywhere. Never hashed into the cache key — throwAlpha is
     // the generative parameter.
     const std::vector<float> *perLightAnchor = nullptr;
+    // ── S3 door shadows (DoorShadowSystem.h) ──
+    // Optional dynamic-occluder test for visibility rays: called only
+    // after a ray proves WR-clear, and only for lights flagged in
+    // extraOverlayLights (by construction no other light's rays can cross
+    // a door inside its reach). Plain fn+ctx so BakeFormula stays
+    // trivially copyable; must be thread-safe across bake workers.
+    bool (*segmentBlockedFn)(const void *ctx, const Vector3 &a,
+                             const Vector3 &b) = nullptr;
+    const void *segmentBlockedCtx = nullptr;
+    // Static-light indices forced into the overlay set (door-adjacent):
+    // excluded from the base, each gets its own overlay — but ONLY on
+    // polygons inside a door's shadow cone (segment poly->light crosses a
+    // door swept sphere; see doorSpheres). That per-poly gate is what
+    // keeps both the bake cost and a door event's re-bake bounded: the
+    // first cut gated on candidacy alone and MISS6 baked 18,935 buffers
+    // for 121 'adjacent' lights (throw-boosted reach spheres touch some
+    // door almost everywhere). NON-OWNING; keyed in the cache via the
+    // doorShadows flag, not by content (deterministic from mission +
+    // reach).
+    const std::vector<uint8_t> *extraOverlayLights = nullptr;
+    // Door swept spheres (xyz = center, w = radius) for the shadow-cone
+    // gate above. NON-OWNING.
+    const std::vector<glm::vec4> *doorSpheres = nullptr;
 
     bool throwMode() const {
         return falloffPhysical && throwAlpha > 0.0f && perLightAnchor;
@@ -521,6 +544,9 @@ struct BakeStats {
     // pairs considered by reach-sphere test, culled by the occlusion probes,
     // and the probe rays themselves.
     uint64_t geomCandidates = 0;
+    // S3: door-adjacent overlay buffers baked (extras appended past the
+    // animflags bits).
+    uint64_t doorOverlays = 0;
     uint64_t geomProbeCulled = 0;
     uint64_t geomProbeRays = 0;
     // atlasTexelForPoint failing to round-trip a lumel's own centre — a
@@ -702,6 +728,21 @@ constexpr float kPhysicalReachCap = 200.0f;
 inline float physicalDistFactor(float len, float anchor, float emitterA) {
     const float a2 = emitterA * emitterA;
     return (anchor * anchor + a2) / (anchor * (len * len + a2));
+}
+
+// Does segment a->b pass within `radius` of `center`? The S3 door
+// shadow-cone gate: a polygon needs a door-light overlay only if its
+// light ray can cross the door's swept sphere.
+inline bool segmentNearSphere(const Vector3 &a, const Vector3 &b,
+                              const Vector3 &center, float radius) {
+    const Vector3 d = b - a;
+    const float len2 = glm::dot(d, d);
+    float t = 0.0f;
+    if (len2 > 1e-12f)
+        t = std::min(1.0f, std::max(0.0f,
+                glm::dot(center - a, d) / len2));
+    const Vector3 closest = a + d * t;
+    return glm::dot(center - closest, center - closest) <= radius * radius;
 }
 
 // ── Throw-derived intensity (per-light anchors) ────────────────────────────
@@ -929,11 +970,26 @@ inline float visibilityFraction(const WRParsedData &wr,
                                 int32_t surfaceCellHint,
                                 int32_t lightCellHint,
                                 const BakeFormula &f,
-                                BakeStats &stats) {
+                                BakeStats &stats,
+                                bool testDynamicOccluders = false) {
     // One emitter point, either direction. Also owns the stats bookkeeping:
     // rayRetried/byStatus count first-attempt-unproven in surface→light mode,
     // and every non-Hit/non-Clear outcome in light→surface mode (there the
     // interesting split is crack-blocked vs budget-exhausted).
+    //
+    // Dynamic occluders (S3 door leaves): tested only after a WR-clear
+    // ray, and only when the caller flagged this light as door-adjacent —
+    // every other light's rays cannot cross a door within reach, so the
+    // whole base bake pays nothing for the hook.
+    auto doorGate = [&](const Vector3 &emitterPos,
+                        VisibilityResult v) -> VisibilityResult {
+        if (v == VisibilityResult::Clear && testDynamicOccluders &&
+            f.segmentBlockedFn &&
+            f.segmentBlockedFn(f.segmentBlockedCtx, emitterPos,
+                               surfacePoint))
+            return VisibilityResult::Blocked;
+        return v;
+    };
     auto castOne = [&](const Vector3 &emitterPos,
                        int32_t emitterCell) -> VisibilityResult {
         ++stats.rays;
@@ -943,7 +999,7 @@ inline float visibilityFraction(const WRParsedData &wr,
                 wr, emitterPos, surfacePoint, emitterCell, &st);
             if (st != RayStatus::Hit && st != RayStatus::Clear)
                 ++stats.byStatus[static_cast<int>(st)];
-            return v;
+            return doorGate(emitterPos, v);
         }
         int retries = 0;
         RayStatus first = RayStatus::Unset;
@@ -953,7 +1009,7 @@ inline float visibilityFraction(const WRParsedData &wr,
             ++stats.rayRetried;
             ++stats.byStatus[static_cast<int>(first)];
         }
-        return v;
+        return doorGate(emitterPos, v);
     };
 
     const int samples = std::max(1, f.penumbraSamples);
@@ -1407,8 +1463,14 @@ inline bool bakePolygon(const WRParsedData &wr,
                 // shadowed, 1 = fully lit, anything between is penumbra — the
                 // term that makes the result smooth rather than stepped.
                 if (inside) ++stats.raysInside; else ++stats.raysOutside;
+                const bool dynOcc =
+                    f.segmentBlockedFn && f.extraOverlayLights &&
+                    static_cast<size_t>(lightIdx) <
+                        f.extraOverlayLights->size() &&
+                    (*f.extraOverlayLights)[lightIdx];
                 const float visFrac = visibilityFraction(
-                    wr, p, L.loc, pCell, lightCells[lightIdx], f, stats);
+                    wr, p, L.loc, pCell, lightCells[lightIdx], f, stats,
+                    dynOcc);
                 if (visFrac <= 0.0f) continue;
 
                 acc.add(sample, visFrac, f);
@@ -1527,6 +1589,7 @@ inline void mergeBakeStats(BakeStats &dst, const BakeStats &src) {
     dst.dirRatioSumMil += src.dirRatioSumMil;
     dst.dirTexels += src.dirTexels;
     dst.geomCandidates += src.geomCandidates;
+    dst.doorOverlays += src.doorOverlays;
     dst.geomProbeCulled += src.geomProbeCulled;
     dst.geomProbeRays += src.geomProbeRays;
     dst.roundtripFail += src.roundtripFail;
@@ -1850,17 +1913,25 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
     const std::vector<int32_t> lightCells =
         resolveLightCells(wr, &stats.lightsNoCell);
     const std::vector<uint8_t> animated = animatedLightSet(wr);
-    // Base mask: everything except the animated set.
+    // Base mask: everything except the animated set. S3 door-adjacent
+    // extras are excluded PER POLY instead (only where the poly actually
+    // gets a door overlay — the shadow-cone gate): a global exclusion
+    // paired with cone-gated overlays LOSES the light everywhere outside
+    // the cones (measured: [LUM_RATIO] p5 collapsed 0.47 -> 0.18).
+    // Conservation rule: a poly's base excludes exactly the lights it
+    // carries overlays for.
     std::vector<uint8_t> baseMask(wr.staticLights.size(), 1);
     for (size_t i = 0; i < animated.size(); ++i)
         if (animated[i]) baseMask[i] = 0;
 
-    // Throw-derived per-light anchors (intensity recovery). Owned here —
-    // baseF/overlayF below carry non-owning pointers into it, and the
-    // vector outlives every worker thread this function spawns.
+    // Throw-derived per-light anchors (intensity recovery). Owned here
+    // unless the caller supplied its own table (the renderer does, so the
+    // runtime door re-bake can reuse the identical anchors) —
+    // baseF/overlayF below carry non-owning pointers, and the vector
+    // outlives every worker thread this function spawns.
     std::vector<float> throwAnchors;
     const bool throwMode = f.falloffPhysical && f.throwAlpha > 0.0f;
-    if (throwMode)
+    if (throwMode && !f.perLightAnchor)
         throwAnchors = physicalAnchors(wr, f.throwAlpha, f.falloffAnchor);
 
     // Overlay bakes carry exactly one light: no ambient, no sun, hard
@@ -1876,9 +1947,12 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
     BakeFormula baseF = f;
     if (gather) baseF.includeAmbient = false;
 
+    const std::vector<float> *anchorTable =
+        throwMode ? (f.perLightAnchor ? f.perLightAnchor : &throwAnchors)
+                  : nullptr;
     if (throwMode) {
-        overlayF.perLightAnchor = &throwAnchors;
-        baseF.perLightAnchor    = &throwAnchors;
+        overlayF.perLightAnchor = anchorTable;
+        baseF.perLightAnchor    = anchorTable;
     }
 
     static const AlbedoTable kGreyAlbedo;
@@ -1896,7 +1970,7 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
             if (lightCells[li] >= 0)   // outside the world: casts nothing
                 reachRadii[li] = physicalReachRadius(
                     wr.staticLights[li],
-                    throwMode ? throwAnchors[li] : f.falloffAnchor,
+                    anchorTable ? (*anchorTable)[li] : f.falloffAnchor,
                     f.emitterRadius, f.brightScale,
                     /*clampToAuthored=*/!throwMode);
     } else if (f.reachExpand > 0) {
@@ -2041,8 +2115,56 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                     lightList = &expandedLists[ci];
                 }
 
+                // S3: compute this poly's door-overlay lights BEFORE the
+                // base bake — the per-poly base mask excludes exactly them.
+                std::vector<int16_t> extraForPoly;
+                if (f.extraOverlayLights && f.falloffPhysical && lightList &&
+                    f.doorSpheres && !f.doorSpheres->empty()) {
+                    const auto &pidx2 = cell.polyIndices[pi];
+                    Vector3 pc2(0.0f);
+                    for (uint8_t vi : pidx2) pc2 += cell.vertices[vi];
+                    pc2 /= static_cast<float>(pidx2.size());
+                    float pr2 = 0.0f;
+                    for (uint8_t vi : pidx2)
+                        pr2 = std::max(pr2,
+                                       glm::length(cell.vertices[vi] - pc2));
+                    const auto &ll = *lightList;
+                    const int cnt =
+                        ll.empty() ? 0 : static_cast<int>(ll[0]);
+                    for (int k = 1;
+                         k <= cnt && k < static_cast<int>(ll.size()); ++k) {
+                        const uint16_t li = ll[k];
+                        if (!(li > 0 &&
+                              li < f.extraOverlayLights->size() &&
+                              (*f.extraOverlayLights)[li]))
+                            continue;
+                        if (baseMask[li] == 0) continue;  // already animated
+                        bool coneHit = false;
+                        for (const auto &ds : *f.doorSpheres) {
+                            if (segmentNearSphere(
+                                    pc2, wr.staticLights[li].loc,
+                                    Vector3(ds.x, ds.y, ds.z),
+                                    ds.w + pr2)) {
+                                coneHit = true;
+                                break;
+                            }
+                        }
+                        if (coneHit)
+                            extraForPoly.push_back(
+                                static_cast<int16_t>(li));
+                    }
+                }
+                const uint8_t *polyBaseMask = baseMask.data();
+                std::vector<uint8_t> maskedBase;
+                if (!extraForPoly.empty()) {
+                    maskedBase = baseMask;
+                    for (int16_t xli : extraForPoly)
+                        maskedBase[static_cast<size_t>(xli)] = 0;
+                    polyBaseMask = maskedBase.data();
+                }
+
                 if (!bakePolygon(wr, rp, ci, pi, baseF, lightCells, lumels,
-                                 partial[t], nullptr, baseMask.data(), dirPtr,
+                                 partial[t], nullptr, polyBaseMask, dirPtr,
                                  lightList))
                     continue;
                 if (static_cast<int>(lumels.size()) != e.pixelW * e.pixelH)
@@ -2052,7 +2174,7 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                 const uint32_t animflags =
                     (pi < static_cast<int>(cell.lightInfos.size()))
                         ? cell.lightInfos[pi].animflags : 0;
-                if (animflags) {
+                if (animflags || !extraForPoly.empty()) {
                     RebakedAnimPoly rec;
                     rec.ci = ci;
                     rec.pi = pi;
@@ -2094,6 +2216,35 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                                 0);
                         rec.overlays.push_back(std::move(buf));
                         rec.overlayLightIdx.push_back(lightIdx);
+                    }
+                    // S3 extras: appended AFTER the animflags bits (whose
+                    // order the blend and the shipped format both fix), one
+                    // overlay per door-adjacent candidate not already
+                    // recorded via animMap. The blend scales unmapped
+                    // lights at intensity 1.0 — geometry-only overlays.
+                    for (int16_t xli : extraForPoly) {
+                        bool already = false;
+                        for (int16_t seen : rec.overlayLightIdx)
+                            if (seen == xli) { already = true; break; }
+                        if (already) continue;
+                        std::fill(overlayMask.begin(), overlayMask.end(), 0);
+                        overlayMask[static_cast<size_t>(xli)] = 1;
+                        std::vector<uint8_t> buf;
+                        if (bakePolygon(wr, rp, ci, pi, overlayF,
+                                        lightCells, lumels, partial[t],
+                                        nullptr, overlayMask.data(),
+                                        dirPtr, lightList) &&
+                            static_cast<int>(lumels.size()) ==
+                                e.pixelW * e.pixelH) {
+                            packLumelsRGB8(lumels, buf);
+                        }
+                        if (buf.empty())
+                            buf.assign(
+                                static_cast<size_t>(e.pixelW) * e.pixelH * 3,
+                                0);
+                        rec.overlays.push_back(std::move(buf));
+                        rec.overlayLightIdx.push_back(xli);
+                        ++partial[t].doorOverlays;
                     }
                     partialAnim[t].push_back(std::move(rec));
                 }

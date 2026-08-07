@@ -817,6 +817,33 @@ static void renderWorld(
                         state.lightmapViewOnly ? 1.0f : 0.0f, 0.0f, 0.0f };
                     bgfx::setUniform(gpu.u_lightmapScale, lmScale);
 
+                    // S4 live lights (live_lights.sh). Count 0 turns the
+                    // term off; the arrays only upload when active.
+                    const int liveN = std::min<int>(
+                        static_cast<int>(state.liveLights.size()),
+                        Darkness::kLiveLightCap);
+                    const float liveCount[4] = {
+                        static_cast<float>(liveN), 0.0f, 0.0f, 0.0f };
+                    bgfx::setUniform(gpu.u_liveLightCount, liveCount);
+                    if (liveN > 0) {
+                        const float a = 0.75f;   // bake emitter radius
+                        const float liveFall[4] = { a * a, 0, 0, 0 };
+                        bgfx::setUniform(gpu.u_liveFalloff, liveFall);
+                        float lp[Darkness::kLiveLightCap][4];
+                        float lc[Darkness::kLiveLightCap][4];
+                        for (int i = 0; i < liveN; ++i) {
+                            const auto &L = state.liveLights[i];
+                            lp[i][0] = L.pos.x; lp[i][1] = L.pos.y;
+                            lp[i][2] = L.pos.z; lp[i][3] = L.reach2;
+                            lc[i][0] = L.colorK.x; lc[i][1] = L.colorK.y;
+                            lc[i][2] = L.colorK.z; lc[i][3] = 0.0f;
+                        }
+                        bgfx::setUniform(gpu.u_liveLightPos, lp,
+                                         static_cast<uint16_t>(liveN));
+                        bgfx::setUniform(gpu.u_liveLightColor, lc,
+                                         static_cast<uint16_t>(liveN));
+                    }
+
                     // Select lightmap program: bilinear (hardware) or bicubic (shader)
                     bgfx::ProgramHandle lmProg = gpu.lightmappedProgram;
                     if (state.lightmapFiltering == 1 && bgfx::isValid(gpu.lightmappedBicubicProgram)) {
@@ -3553,6 +3580,14 @@ static void registerConsoleSettings(
         "completely. Lightmapped world geometry only — objects and sky are "
         "unaffected, which is itself informative");
 
+    dbgConsole.addBool("live_flashlight",
+        [&state]() { return state.liveFlashlight; },
+        [&state](bool v) { state.liveFlashlight = v; },
+        "S4 test vehicle: carry a warm live light at the camera, lighting "
+        "WORLD geometry per-fragment (physical falloff + half-Lambert via "
+        "derivative normals). Unshadowed until S4b. Lightmapped world "
+        "only");
+
     dbgConsole.addFloat("shadow_debug", -1.0f, 4095.0f,
         [&state]() { return static_cast<float>(state.shadowDebugLight); },
         [&state, &gpu](float v) {
@@ -5265,7 +5300,8 @@ static void updateLightmaps(
     bool scriptLightDirty = false,
     bool rebakedActive = false, bool *rebakedForceAll = nullptr,
     bool flickerPhysical = false, float flickerScale = 1.0f,
-    const std::unordered_set<uint32_t> *visibleCells = nullptr)
+    const std::unordered_set<uint32_t> *visibleCells = nullptr,
+    Darkness::DoorShadowSystem *doorShadow = nullptr)
 {
     // Track debug mode transitions so we can force a full re-blend
     static bool prevDebugTint = false;
@@ -5605,11 +5641,19 @@ static void updateLightmaps(
     // This is the CPU blend PLAN.HIGH_RES_SHADOWS.md §"the trap" warns is
     // density² of the shipped one; the timing print below is the measurement
     // that decides whether it must become a GPU pass.
+    // S3: overlay recs whose buffers a door event re-baked this frame.
+    // Swapped out unconditionally (they must not accumulate while the
+    // vintage atlas is displayed — the toggle-back force-all re-blends
+    // everything anyway).
+    std::vector<size_t> doorRecs;
+    if (doorShadow) doorRecs.swap(doorShadow->readyRecs());
+
     if (rebakedActive && !gpu.rebakedAnimPolys.empty() &&
         !gpu.rebakedAtlasSet.atlases.empty() &&
         !gpu.rebakedAtlasHandles.empty()) {
         const bool forceReb = rebakedForceAll && *rebakedForceAll;
-        if (anyLightChanged || forceAll || forceReb || flickerActive) {
+        if (anyLightChanged || forceAll || forceReb || flickerActive ||
+            !doorRecs.empty()) {
             const auto t0 = std::chrono::steady_clock::now();
             auto &atlas = gpu.rebakedAtlasSet.atlases[0];
             const int pad = 2 * gpu.rebakedDensity;
@@ -5768,6 +5812,13 @@ static void updateLightmaps(
                         blendLight(lightNum, /*bypassVis=*/false);
                 }
             }
+
+            // S3: door-event re-baked overlays re-blend NOW, visibility
+            // filter bypassed (a door event is an envelope event — the
+            // whole room must update, on-screen or not).
+            if (!fullBlend)
+                for (size_t recIdx : doorRecs)
+                    blendOne(recIdx, /*bypassVisibility=*/true);
 
             // The density² cost measurement. First event prints immediately
             // (a path that never logs and a path that never runs look the
@@ -7096,6 +7147,9 @@ int main(int argc, char *argv[]) {
     // allPlacements with position/angle data for ALL concrete objects).
     Darkness::DoorSystem doorSystem;
     state.doorSystem = &doorSystem;
+    // S3 door shadows — inert until init() after the re-bake; declared
+    // here so the collision callback below can capture it.
+    Darkness::DoorShadowSystem doorShadow;
 
     Darkness::TweqSystem tweqSystem;
     Darkness::SpawnSystem spawnSystem;
@@ -7649,8 +7703,12 @@ int main(int argc, char *argv[]) {
             state.physics ? state.physics->getObjectCollisionWorld() : nullptr;
         if (ocw) {
             doorSystem.setCollisionUpdateCallback(
-                [ocw](int32_t objID, const Darkness::Matrix4 &worldMatrix) {
+                [ocw, &doorShadow](int32_t objID,
+                                   const Darkness::Matrix4 &worldMatrix) {
                     ocw->updateBodyTransform(objID, worldMatrix);
+                    // S3: a moved leaf dirties its door's shadow overlays
+                    // (matrix-gated: an unchanged pose never dirties).
+                    doorShadow.markDirty(objID, worldMatrix);
                 });
             // Moving terrain also needs collision body updates
             movingTerrainSystem.setCollisionUpdateCallback(
@@ -7729,8 +7787,23 @@ int main(int argc, char *argv[]) {
 
     // ── Create all GPU resources: shaders, lightmap atlas, world/object/sky buffers ──
     float camX, camY, camZ;
+    // S3: door census for the shadow bake — needs collision bodies (built
+    // above) and DoorSystem's door registry.
+    std::vector<Darkness::DoorShadowDoor> doorCensus;
+    if (cfg.rebakeLightmaps && cfg.rebakeDoorShadows && state.physics) {
+        Darkness::ObjectCollisionWorld *ocwDoors =
+            state.physics->getObjectCollisionWorld();
+        if (ocwDoors)
+            doorCensus = Darkness::buildDoorShadowCensus(
+                *ocwDoors,
+                [&doorSystem](int32_t id) { return doorSystem.isDoor(id); });
+    }
+
     if (!createGPUResources(mission, cfg, state.showObjects, meshes, gpu,
-                            camX, camY, camZ)) {
+                            camX, camY, camZ, &doorCensus,
+                            state.physics
+                                ? state.physics->getObjectCollisionWorld()
+                                : nullptr)) {
         shutdownWindow(window);
         return 1;
     }
@@ -7750,6 +7823,25 @@ int main(int argc, char *argv[]) {
     state.objectIlluminator.setPhysicalFalloff(
         &gpu.shadowCache.lightReach, &gpu.shadowCache.lightAnchor,
         cfg.rebakeFalloffAnchor, cfg.rebakeEmitter);
+
+    // ── S3 door shadows: runtime system + object-lighting coupling ──
+    // Only meaningful when the re-bake produced door overlays; init copies
+    // the load formula and re-binds its non-owning pointers.
+    if (!gpu.rebakedAnimPolys.empty() && !gpu.doorShadowDoors.empty()) {
+        doorShadow.init(&mission.wrData, &mission.renderParams,
+                        gpu.rebakedFormula, gpu.rebakedAnchors,
+                        gpu.rebakedLightCells, gpu.doorShadowDoors,
+                        gpu.doorShadowLights,
+                        state.physics
+                            ? state.physics->getObjectCollisionWorld()
+                            : nullptr,
+                        &gpu.rebakedAnimPolys);
+        // Objects share the same door-occlusion test (physical mode only;
+        // the illuminator gates on its own active flag).
+        state.objectIlluminator.setDynamicOcclusion(
+            &Darkness::DoorSegmentOcclusion::blocked,
+            doorShadow.occlusion());
+    }
 
     // ── S1 acceptance: shadow-map vs raycastWorld cross-check ──
     // Startup diagnostic (--shadow-crosscheck): renders a pool of lights'
@@ -8526,6 +8618,15 @@ int main(int argc, char *argv[]) {
                 state.useRebakedLightmaps &&
                 !gpu.rebakedAtlasHandles.empty() &&
                 cfg.rebakeFalloffPhysical);
+            // S3: budgeted door-shadow overlay re-bakes. Rebuilds return
+            // invalidation spheres so nearby objects re-run their
+            // visibility rays against the new door pose.
+            {
+                const auto doorInvalidations = doorShadow.update();
+                for (const auto &inv : doorInvalidations)
+                    state.objectIlluminator.invalidateNear(inv.first,
+                                                           inv.second);
+            }
             updateLightmaps(dt, meshes, mission, gpu,
                             state.objectIlluminator,
                             state.debugAnimLightmaps, state.forceFlicker,
@@ -8533,7 +8634,7 @@ int main(int argc, char *argv[]) {
                             state.useRebakedLightmaps,
                             &state.rebakedBlendForceAll,
                             state.flickerPhysical, state.flickerScale,
-                            &state.lastVisibleCells);
+                            &state.lastVisibleCells, &doorShadow);
 
             // ── Prepare frame: matrices, fog, samplers, culling ──
             auto fc = prepareFrame(state, mission);
@@ -8549,6 +8650,26 @@ int main(int argc, char *argv[]) {
 
             // ── View 0: Sky pass ──
             renderSky(fc, meshes, gpu, mission, state);
+
+            // S4: rebuild the live-light list for this frame. Door
+            // promotions join here in S4c; today the flashlight test
+            // vehicle proves the shader term.
+            state.liveLights.clear();
+            if (state.liveFlashlight) {
+                Darkness::LiveLight fl;
+                fl.pos = Darkness::Vector3(state.cam.pos[0],
+                                           state.cam.pos[1],
+                                           state.cam.pos[2]);
+                // Warm torch-class light: bright ~2 in table units, K at
+                // the global 8u anchor (matches the bake's brightness
+                // math), reach = its sub-quantisation radius.
+                const float kG = (8.0f * 8.0f + 0.5625f) / 8.0f;
+                fl.colorK = Darkness::Vector3(2.0f, 1.9f, 1.7f) * kG;
+                const float reach = std::sqrt(
+                    2.0f * kG / Darkness::kSubQuantThreshold);
+                fl.reach2 = reach * reach;
+                state.liveLights.push_back(fl);
+            }
 
             // ── View 1: World geometry ──
             renderWorld(fc, meshes, gpu, mission, state);
@@ -8974,7 +9095,9 @@ int main(int argc, char *argv[]) {
         // (nonzero edgeLengths — the same filter registerDoorGeometry
         // applies), ranked by distance to the current camera each cycle
         // so a touring player keeps stressing NEARBY doors.
-        if (cfg.stressDoors > 0) {
+        if (cfg.stressDoors > 0 &&
+            (cfg.stressDoorsCycles <= 0 ||
+             stressDoorsCycle < cfg.stressDoorsCycles)) {
             float elapsed = std::chrono::duration<float>(
                 std::chrono::steady_clock::now() - mainLoopStart).count();
             if (elapsed >= stressDoorsNextToggleSec) {

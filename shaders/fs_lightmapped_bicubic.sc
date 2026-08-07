@@ -2,6 +2,7 @@ $input v_texcoord0, v_texcoord1, v_worldPos, v_fogDist
 
 #include <bgfx_shader.sh>
 #include "lm_specular.sh"
+#include "live_lights.sh"
 
 SAMPLER2D(s_texColor, 0);
 SAMPLER2D(s_texLightmap, 1);
@@ -70,6 +71,10 @@ void main()
     vec4 light = sampleBicubicLm(s_texLightmap, v_texcoord1, u_lmAtlasSize.xy);
 
     // Modulate diffuse by lightmap (2x intensity to match Dark Engine convention)
+    // S4: promoted/live lights add to the sampled lightmap BEFORE
+    // the scale, so their brightness path matches the overlays they
+    // replace (see live_lights.sh).
+    light.rgb += liveLightSum(v_worldPos, u_camPosWorld.xyz);
     vec4 finalColor = vec4(diffuse.rgb * light.rgb * u_lightmapScale.x, diffuse.a);
 
     // Rough Fresnel specular from the baked dominant direction — must stay

@@ -1041,7 +1041,13 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                                bool showObjects,
                                Darkness::BuiltMeshes &meshes,
                                Darkness::GPUResources &gpu,
-                               float &centroidX, float &centroidY, float &centroidZ)
+                               float &centroidX, float &centroidY, float &centroidZ,
+                               // S3: door census + collision world for the
+                               // door-shadow bake (nullptr = no doors).
+                               const std::vector<Darkness::DoorShadowDoor>
+                                   *doorCensus = nullptr,
+                               const Darkness::ObjectCollisionWorld
+                                   *doorOcw = nullptr)
 {
     bool linearMips = cfg.linearMips;
     bool sharpMips = cfg.sharpMips;
@@ -1132,6 +1138,16 @@ static bool createGPUResources(const Darkness::MissionData &mission,
         "u_objectLightCount",  bgfx::UniformType::Vec4);
     gpu.u_objectFalloff     = bgfx::createUniform(
         "u_objectFalloff",     bgfx::UniformType::Vec4);
+    gpu.u_liveLightCount    = bgfx::createUniform(
+        "u_liveLightCount",    bgfx::UniformType::Vec4);
+    gpu.u_liveFalloff       = bgfx::createUniform(
+        "u_liveFalloff",       bgfx::UniformType::Vec4);
+    gpu.u_liveLightPos      = bgfx::createUniform(
+        "u_liveLightPos",      bgfx::UniformType::Vec4,
+        Darkness::kLiveLightCap);
+    gpu.u_liveLightColor    = bgfx::createUniform(
+        "u_liveLightColor",    bgfx::UniformType::Vec4,
+        Darkness::kLiveLightCap);
     gpu.u_objectAmbient     = bgfx::createUniform(
         "u_objectAmbient",     bgfx::UniformType::Vec4);
     gpu.u_objectLightLoc    = bgfx::createUniform(
@@ -1229,6 +1245,59 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 bf.falloffPhysical  = cfg.rebakeFalloffPhysical;
                 bf.falloffAnchor    = cfg.rebakeFalloffAnchor;
                 bf.throwAlpha       = cfg.rebakeThrowAlpha;
+
+                // Throw anchors computed HERE (not inside the bake driver)
+                // so the runtime door re-bake reuses the identical table.
+                if (bf.falloffPhysical && bf.throwAlpha > 0.0f) {
+                    gpu.rebakedAnchors = Darkness::physicalAnchors(
+                        mission.wrData, bf.throwAlpha, bf.falloffAnchor);
+                    bf.perLightAnchor = &gpu.rebakedAnchors;
+                }
+                gpu.rebakedLightCells =
+                    Darkness::resolveLightCells(mission.wrData, nullptr);
+
+                // ── S3 door shadows: adjacency + bake-ray hook ──
+                // Physical mode only (candidates are the overlay gate).
+                Darkness::DoorSegmentOcclusion doorOcc;   // outlives the bake
+                if (cfg.rebakeDoorShadows && bf.falloffPhysical &&
+                    doorCensus && !doorCensus->empty() && doorOcw) {
+                    std::vector<float> selReach(
+                        mission.wrData.staticLights.size(), 0.0f);
+                    for (size_t li = 1; li < selReach.size(); ++li)
+                        if (gpu.rebakedLightCells[li] >= 0)
+                            selReach[li] = Darkness::physicalReachRadius(
+                                mission.wrData.staticLights[li],
+                                bf.perLightAnchor
+                                    ? (*bf.perLightAnchor)[li]
+                                    : bf.falloffAnchor,
+                                bf.emitterRadius, bf.brightScale,
+                                /*clampToAuthored=*/bf.throwAlpha <= 0.0f);
+                    gpu.doorShadowDoors  = *doorCensus;
+                    gpu.doorShadowLights = Darkness::doorAdjacentLights(
+                        mission.wrData, selReach, gpu.doorShadowDoors);
+                    doorOcc.world = doorOcw;
+                    gpu.doorShadowSpheres.clear();
+                    for (const auto &d : gpu.doorShadowDoors) {
+                        doorOcc.bodies.push_back(d.bodyIdx);
+                        gpu.doorShadowSpheres.push_back(glm::vec4(
+                            d.pos.x, d.pos.y, d.pos.z, d.sweptRadius));
+                    }
+                    bf.extraOverlayLights = &gpu.doorShadowLights;
+                    bf.doorSpheres = &gpu.doorShadowSpheres;
+                    bf.segmentBlockedFn =
+                        &Darkness::DoorSegmentOcclusion::blocked;
+                    bf.segmentBlockedCtx = &doorOcc;
+                    std::fprintf(stderr,
+                        "Door shadows: %zu door(s), %d door-adjacent "
+                        "light(s) moved to overlays\n",
+                        gpu.doorShadowDoors.size(),
+                        static_cast<int>(std::count(
+                            gpu.doorShadowLights.begin(),
+                            gpu.doorShadowLights.end(), 1)));
+                }
+                // Runtime re-bake context: the formula EXACTLY as baked
+                // (DoorShadowSystem re-binds the non-owning pointers).
+                gpu.rebakedFormula = bf;
                 Darkness::BakeStats bs;
                 // Scale the packing by the density. Normalised UVs are
                 // invariant under that scale, so the world mesh built for the
@@ -1261,6 +1330,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 ckey.falloffAnchor   = cfg.rebakeFalloffAnchor;
                 ckey.throwAlpha      = cfg.rebakeFalloffPhysical
                                            ? cfg.rebakeThrowAlpha : 0.0f;
+                ckey.doorShadows     = bf.extraOverlayLights ? 1 : 0;
 
                 std::vector<Darkness::RebakedAnimPoly> animPolys;
                 Darkness::AtlasTexture dirAtlas;
@@ -1333,6 +1403,11 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                             (unsigned long long)bs.dirTexels,
                             static_cast<double>(bs.dirRatioSumMil)
                                 / bs.dirTexels / 1e6);
+                    if (bs.doorOverlays)
+                        std::fprintf(stderr,
+                            "Re-baked lightmaps: %llu door-shadow overlay "
+                            "buffer(s) baked (door-occluded rays)\n",
+                            (unsigned long long)bs.doorOverlays);
                     if (bs.geomCandidates)
                         std::fprintf(stderr,
                             "Re-baked lightmaps: physical reach — %llu "
@@ -2273,6 +2348,10 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
     bgfx::destroy(gpu.u_lightmapScale);
     bgfx::destroy(gpu.u_objectLightCount);
     bgfx::destroy(gpu.u_objectFalloff);
+    bgfx::destroy(gpu.u_liveLightCount);
+    bgfx::destroy(gpu.u_liveFalloff);
+    bgfx::destroy(gpu.u_liveLightPos);
+    bgfx::destroy(gpu.u_liveLightColor);
     bgfx::destroy(gpu.u_objectAmbient);
     bgfx::destroy(gpu.u_objectLightLoc);
     bgfx::destroy(gpu.u_objectLightDir);
