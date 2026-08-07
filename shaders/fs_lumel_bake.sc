@@ -38,9 +38,15 @@ void main()
     float fall = 1.0 / (d2 + u_liveFalloff.x);
     // Visibility from the offset probe point, like the bake's rays.
     vec3 probe = worldPos + u_bakeNormal.xyz * u_bakeOrigin.w;
-    float shadow = liveShadowFactor(
+    // PCSS: event re-bakes keep the load bake's SOFT penumbra (a 1-tap
+    // bake permanently hardened every shadow edge a door swing touched
+    // — the rest-state artifact class the --door-diff-diag harness
+    // exposed). PCSS emitter size rides u_liveFalloff.y; 0 = exact
+    // hard tap (the self-test path).
+    float shadow = liveShadowFactorPCSS(
         probe, u_bakeLight.xyz, u_bakeColor.w,
-        inversesqrt(max(u_bakeLight.w, 1e-6)));
+        inversesqrt(max(u_bakeLight.w, 1e-6)),
+        u_liveFalloff.y);
 
     // The Continuous 5-bit storage transform — the CPU accumulator's
     // exact math (LumelAccumulator::add, Continuous case, incl. the C1

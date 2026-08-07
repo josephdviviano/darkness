@@ -44,6 +44,8 @@
 #include "../services/physics/ObjectCollisionGeometry.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <map>
 #include <chrono>
 #include <functional>
 #include <cstdio>
@@ -472,7 +474,15 @@ public:
                         dst[x * 3 + 2] = src[x * 4 + 2];
                     }
                 }
-                mReadyRecs.push_back(it.recIdx);
+                // ATOMIC SETTLE HANDOFF: recs hold in mPendingReady
+                // until the whole event drains, then upload in the same
+                // update() that drops the differential. Progressive
+                // uploads double-counted the swing delta for the whole
+                // batch window (~0.3 s of double-bright over the newly
+                // lit region — the user-visible "weird artifacts on
+                // open"; measured by the --door-diff-diag harness's
+                // process of elimination).
+                mPendingReady.push_back(it.recIdx);
                 // Direction: queue the ray-free RECOMBINE (slice 3) —
                 // budgeted per frame below, ungated (every door poly's
                 // direction tracks door state; the dim-but-directional
@@ -728,6 +738,13 @@ public:
             }
             mWork.clear();
             mWorkCursor = 0;
+            // Atomic handoff: every rec of the event becomes visible in
+            // THIS update(), the same one that demotes the event's
+            // promotions — new lightmaps and differential swap in one
+            // frame, no double-count window.
+            mReadyRecs.insert(mReadyRecs.end(), mPendingReady.begin(),
+                              mPendingReady.end());
+            mPendingReady.clear();
             // S4c: the settle event landed — its doors' overlays now
             // hold the settled pose. Refresh those doors' baked-pose
             // snapshots and let their promotions extinguish (or
@@ -752,6 +769,368 @@ public:
                 std::chrono::steady_clock::now() - t0).count();
         }
         return rebuiltFor;
+    }
+
+    // ── S4c diagnostic harness (--door-diff-diag <doorID>) ──────────────
+    // The screen cannot be captured in this environment, so this renders
+    // what the screen WOULD show mid-swing as data: for one door, pose A
+    // = as loaded, pose B = synthetic 90° hinge swing. Per cone lumel it
+    // computes the baked overlay at A, the mid-swing screen value
+    // (overlay A + the differential term exactly as live_lights.sh
+    // computes it, from real S1 face renders at both poses), and the
+    // settled truth (CPU soft bake at B). Emits error histograms with
+    // penumbra attribution and per-poly PPM panels
+    // [truthA | midswing | truthB | err×8] under doorshadow_diag/.
+    // Self-check: its own pose-A bake must equal the stored overlay.
+    void runDiffDiagnostic(ShadowMapCache &sc, int32_t doorID) {
+        if (!active() || !sc.valid() || !mOcclusion.world) {
+            std::fprintf(stderr, "[DOOR_DIAG] inactive or no cache\n");
+            return;
+        }
+        const DoorShadowDoor *d = nullptr;
+        for (const auto &dd : mDoors)
+            if (dd.objID == doorID) { d = &dd; break; }
+        auto lw = mDoorWork.find(doorID);
+        if (!d || lw == mDoorWork.end() || lw->second.empty()) {
+            std::fprintf(stderr,
+                "[DOOR_DIAG] door %d unknown or has no cone work\n",
+                doorID);
+            return;
+        }
+        const auto &bodies = mOcclusion.world->getBodies();
+        if (d->bodyIdx >= bodies.size()) return;
+        const ObjectCollisionBody &db = bodies[d->bodyIdx];
+
+        // Synthetic pose B: swing 90° about the vertical axis through
+        // the hinge edge (the wider horizontal local axis is the leaf
+        // width; the hinge is its negative-side edge).
+        int vAx = 0; float vBest = -1.0f;
+        for (int i = 0; i < 3; ++i) {
+            const float az = std::abs(db.rotation[i].z);
+            if (az > vBest) { vBest = az; vAx = i; }
+        }
+        int wAx = -1;
+        for (int i = 0; i < 3; ++i) {
+            if (i == vAx) continue;
+            if (wAx < 0 || db.edgeLengths[i] > db.edgeLengths[wAx]) wAx = i;
+        }
+        const Vector3 hinge =
+            db.worldPos - Vector3(db.rotation[wAx]) *
+                              (db.edgeLengths[wAx] * 0.5f);
+        const glm::mat3 rz90(0, 1, 0, -1, 0, 0, 0, 0, 1);  // +90° about Z
+        const Vector3 posB = hinge + rz90 * (db.worldPos - hinge);
+        const glm::mat3 rotB = rz90 * db.rotation;
+
+        // Truth-bake occlusion at pose B: the moved leaf as an explicit
+        // OBB, every other door at its live pose.
+        struct DiagOcc {
+            const DoorSegmentOcclusion *base;
+            uint32_t skipBody;
+            Vector3 pos, he;
+            glm::mat3 rot;
+            static bool blocked(const void *ctxRaw, const Vector3 &a,
+                                const Vector3 &b) {
+                const auto *c = static_cast<const DiagOcc *>(ctxRaw);
+                // Slab test in the box frame.
+                const Vector3 ro = glm::transpose(c->rot) * (a - c->pos);
+                const Vector3 rd = glm::transpose(c->rot) * (b - a);
+                float t0 = 0.0f, t1 = 1.0f;
+                bool hit = true;
+                for (int i = 0; i < 3 && hit; ++i) {
+                    if (std::abs(rd[i]) < 1e-9f) {
+                        if (std::abs(ro[i]) > c->he[i]) hit = false;
+                    } else {
+                        float ta = (-c->he[i] - ro[i]) / rd[i];
+                        float tb = (c->he[i] - ro[i]) / rd[i];
+                        if (ta > tb) std::swap(ta, tb);
+                        t0 = std::max(t0, ta);
+                        t1 = std::min(t1, tb);
+                        if (t0 > t1) hit = false;
+                    }
+                }
+                if (hit) return true;
+                if (c->base && c->base->world)
+                    for (uint32_t bi : c->base->bodies)
+                        if (bi != c->skipBody &&
+                            c->base->world->segmentHitsBody(a, b, bi))
+                            return true;
+                return false;
+            }
+        };
+        DiagOcc occB;
+        occB.base = &mOcclusion;
+        occB.skipBody = d->bodyIdx;
+        occB.pos = posB;
+        occB.he = db.edgeLengths * 0.5f;
+        occB.rot = rotB;
+        BakeFormula fB = mFormula;
+        fB.segmentBlockedFn = &DiagOcc::blocked;
+        fB.segmentBlockedCtx = &occB;
+
+        // S1 faces at both poses (real renders — the same pixels the
+        // shader samples), then one blocking readback.
+        std::vector<ShadowCasterPoseOverride> ovB = {
+            {d->bodyIdx, posB, rotB}};
+        const std::vector<ShadowCasterPoseOverride> ovA;  // live = pose A
+        std::vector<float> atlas;
+        struct LightDiag {
+            int16_t li;
+            int slotA, slotB;
+            Vector3 colorK;
+            float reach;
+        };
+        std::vector<LightDiag> lds;
+        {
+            std::vector<int16_t> lights;
+            for (const auto &pr : lw->second)
+                if (std::find(lights.begin(), lights.end(), pr.second) ==
+                    lights.end())
+                    lights.push_back(pr.second);
+            int nextId = -9100;
+            for (int16_t li : lights) {
+                const WRStaticLight &L =
+                    mWr->staticLights[static_cast<size_t>(li)];
+                if (L.inner != -1.0f) continue;   // spots never promote
+                const float reach =
+                    static_cast<size_t>(li) < mReach.size()
+                        ? mReach[static_cast<size_t>(li)] : 0.0f;
+                if (reach <= 0.0f) continue;
+                LightDiag ld;
+                ld.li = li;
+                ld.reach = reach;
+                ld.colorK =
+                    L.bright * (mFormula.brightScale * promoteK(li));
+                ld.slotA = acquireFrozenShadowSlot(sc, *mWr, nextId--,
+                                                   L.loc, reach, ovA, 1);
+                ld.slotB = acquireFrozenShadowSlot(sc, *mWr, nextId--,
+                                                   L.loc, reach, ovB, 1);
+                if (ld.slotA >= 0 && ld.slotB >= 0) lds.push_back(ld);
+                if (lds.size() * 2 + 2 >=
+                    static_cast<size_t>(sc.slotCount))
+                    break;   // pool budget: leave room for others
+            }
+            if (!readShadowAtlasBlocking(sc, atlas)) return;
+        }
+
+        // Hard 1-tap visibility with the SHADER's bias.
+        auto hardVis = [&](int slot, const Vector3 &lp, float reach,
+                           const Vector3 &P) -> float {
+            const float stored =
+                shadowAtlasSampleCPU(sc, atlas, slot, lp, P);
+            if (stored < 0.0f) return 1.0f;
+            const float dn = glm::length(P - lp) / reach;
+            return dn <= stored + 0.5f / reach ? 1.0f : 0.0f;
+        };
+
+        // Per-lumel sweep over the door's cone polys. Panel buffers are
+        // retained (stored-space bytes) so the worst polys can be
+        // written as images after ranking.
+        struct PanelData {
+            int w = 0, h = 0;
+            std::vector<uint8_t> a, sMid, b;   // RGB8 each
+        };
+        struct PolyErr { size_t recIdx; int16_t li; float maxErr; };
+        std::map<std::pair<size_t, int16_t>, PanelData> panels;
+        std::vector<PolyErr> worst;
+        double sumErr = 0.0;
+        size_t nTex = 0, nBad = 0, nBadPen = 0;
+        std::vector<float> errs;
+        double selfCheckMax = 0.0;
+        for (const LightDiag &ld : lds) {
+            const WRStaticLight &L =
+                mWr->staticLights[static_cast<size_t>(ld.li)];
+            std::vector<uint8_t> mask(mWr->staticLights.size(), 0);
+            mask[static_cast<size_t>(ld.li)] = 1;
+            const std::vector<uint16_t> lightList = {
+                1, static_cast<uint16_t>(ld.li)};
+            for (const auto &pr : lw->second) {
+                if (pr.second != ld.li) continue;
+                const size_t recIdx = pr.first;
+                if (recIdx >= mAnimPolys->size()) continue;
+                const RebakedAnimPoly &rec = (*mAnimPolys)[recIdx];
+                size_t k = 0;
+                for (; k < rec.overlayLightIdx.size(); ++k)
+                    if (rec.overlayLightIdx[k] == ld.li) break;
+                if (k >= rec.overlays.size()) continue;
+                const LumelGrid grid =
+                    buildLumelGrid(*mWr, rec.ci, rec.pi, mDensity);
+                if (!grid.valid || grid.lx != rec.w || grid.ly != rec.h)
+                    continue;
+                // Truth bakes at both poses (A doubles as self-check).
+                BakeStats st;
+                std::vector<Vector3> truthA, truthB;
+                if (!bakePolygon(*mWr, *mRp, rec.ci, rec.pi, mFormula,
+                                 mLightCells, truthA, st, nullptr,
+                                 mask.data(), nullptr, &lightList) ||
+                    !bakePolygon(*mWr, *mRp, rec.ci, rec.pi, fB,
+                                 mLightCells, truthB, st, nullptr,
+                                 mask.data(), nullptr, &lightList))
+                    continue;
+                if (static_cast<int>(truthA.size()) != rec.w * rec.h ||
+                    static_cast<int>(truthB.size()) != rec.w * rec.h)
+                    continue;
+                PanelData pd;
+                pd.w = rec.w;
+                pd.h = rec.h;
+                const size_t np = static_cast<size_t>(rec.w) * rec.h * 3;
+                pd.a.resize(np);
+                pd.sMid.resize(np);
+                pd.b.resize(np);
+                float polyMax = 0.0f;
+                for (int j = 0; j < rec.h; ++j)
+                    for (int i = 0; i < rec.w; ++i) {
+                        const size_t t =
+                            static_cast<size_t>(j) * rec.w + i;
+                        const Vector3 P = grid.at(i, j);
+                        const Vector3 toL = L.loc - P;
+                        const float dist2 = glm::dot(toL, toL);
+                        const float dist =
+                            std::sqrt(std::max(dist2, 1e-6f));
+                        const float cosT =
+                            glm::dot(grid.normal, toL) / dist;
+                        const float a2 = mFormula.emitterRadius *
+                                         mFormula.emitterRadius;
+                        float live = 0.0f, hlFall = 0.0f;
+                        if (cosT > 0.0f) {
+                            const float hl = cosT * 0.5f + 0.5f;
+                            hlFall = hl / (dist2 + a2);
+                            const float dv =
+                                hardVis(ld.slotB, L.loc, ld.reach, P) -
+                                hardVis(ld.slotA, L.loc, ld.reach, P);
+                            live = hlFall * dv;
+                        }
+                        const uint8_t *ovA8 = &rec.overlays[k][t * 3];
+                        float texErr = 0.0f, selfErr = 0.0f;
+                        float visA = 0.0f, visB = 0.0f;
+                        for (int ch = 0; ch < 3; ++ch) {
+                            const float baked = ovA8[ch] / 255.0f;
+                            const float screen = std::max(
+                                0.0f, baked + ld.colorK[ch] * live);
+                            const float truth = std::min(
+                                1.0f, std::max(0.0f, truthB[t][ch]));
+                            pd.a[t * 3 + ch] = ovA8[ch];
+                            pd.sMid[t * 3 + ch] = static_cast<uint8_t>(
+                                std::min(1.0f, screen) * 255.0f);
+                            pd.b[t * 3 + ch] = static_cast<uint8_t>(
+                                truth * 255.0f);
+                            texErr = std::max(texErr,
+                                              std::abs(screen - truth));
+                            selfErr = std::max(
+                                selfErr,
+                                std::abs(baked - std::min(1.0f,
+                                    std::max(0.0f, truthA[t][ch]))));
+                            const float un = ld.colorK[ch] * hlFall;
+                            if (un > 1e-4f) {
+                                visA = std::max(visA,
+                                    std::min(1.0f, baked / un));
+                                visB = std::max(visB,
+                                    std::min(1.0f, truth / un));
+                            }
+                        }
+                        selfCheckMax = std::max(selfCheckMax,
+                                                (double)selfErr);
+                        sumErr += texErr;
+                        errs.push_back(texErr);
+                        ++nTex;
+                        if (texErr > 8.0f / 255.0f) {
+                            ++nBad;
+                            const bool pen =
+                                (visA > 0.05f && visA < 0.95f) ||
+                                (visB > 0.05f && visB < 0.95f);
+                            if (pen) ++nBadPen;
+                        }
+                        polyMax = std::max(polyMax, texErr);
+                    }
+                worst.push_back({recIdx, ld.li, polyMax});
+                panels[{recIdx, ld.li}] = std::move(pd);
+            }
+        }
+        for (const LightDiag &ld : lds) {
+            if (ld.slotA >= 0) sc.slots[ld.slotA] = ShadowSlot{};
+            if (ld.slotB >= 0) sc.slots[ld.slotB] = ShadowSlot{};
+        }
+        if (nTex == 0) {
+            std::fprintf(stderr, "[DOOR_DIAG] no texels swept\n");
+            return;
+        }
+        std::sort(errs.begin(), errs.end());
+        const float p95 = errs[static_cast<size_t>(errs.size() * 0.95)];
+        std::fprintf(stderr,
+            "[DOOR_DIAG] door %d: %zu lights, %zu texels; midswing-vs-"
+            "settled |err|: mean %.2f/255 p95 %.1f max %.1f; >8/255: "
+            "%.1f%% (penumbra-zone share %.1f%%); pose-A self-check max "
+            "%.1f/255 %s\n",
+            doorID, lds.size(), nTex, 255.0 * sumErr / nTex, 255.0f * p95,
+            255.0f * errs.back(), 100.0 * nBad / nTex,
+            nBad ? 100.0 * nBadPen / nBad : 0.0, 255.0 * selfCheckMax,
+            selfCheckMax < 2.5 / 255.0 ? "PASS" : "FAIL");
+        std::sort(worst.begin(), worst.end(),
+                  [](const PolyErr &a, const PolyErr &b) {
+                      return a.maxErr > b.maxErr;
+                  });
+        std::error_code ec;
+        std::filesystem::create_directories("doorshadow_diag", ec);
+        for (size_t w = 0; w < worst.size() && w < 6; ++w) {
+            const RebakedAnimPoly &rec = (*mAnimPolys)[worst[w].recIdx];
+            const PanelData &pd = panels[{worst[w].recIdx, worst[w].li}];
+            std::fprintf(stderr,
+                "[DOOR_DIAG]   worst %zu: cell %u poly %d light %d "
+                "(%dx%d) maxErr %.1f/255\n",
+                w, rec.ci, rec.pi, static_cast<int>(worst[w].li), rec.w,
+                rec.h, 255.0f * worst[w].maxErr);
+            // Panel image: [truthA | midswing | truthB | err x8],
+            // nearest-upscaled x8. err panel: red = midswing too
+            // bright, blue = too dark.
+            const int up = 8, sep = 2;
+            const int W = pd.w * up * 4 + sep * 3, H = pd.h * up;
+            std::vector<uint8_t> img(static_cast<size_t>(W) * H * 3, 32);
+            auto putPanel = [&](int panel, auto pix) {
+                const int x0 = panel * (pd.w * up + sep);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < pd.w * up; ++x) {
+                        uint8_t rgb[3];
+                        pix(x / up, y / up, rgb);
+                        uint8_t *o =
+                            &img[(static_cast<size_t>(y) * W + x0 + x) *
+                                 3];
+                        o[0] = rgb[0]; o[1] = rgb[1]; o[2] = rgb[2];
+                    }
+            };
+            auto plain = [&](const std::vector<uint8_t> &buf) {
+                return [&buf, &pd](int x, int y, uint8_t *rgb) {
+                    const size_t t =
+                        (static_cast<size_t>(y) * pd.w + x) * 3;
+                    rgb[0] = buf[t]; rgb[1] = buf[t + 1];
+                    rgb[2] = buf[t + 2];
+                };
+            };
+            putPanel(0, plain(pd.a));
+            putPanel(1, plain(pd.sMid));
+            putPanel(2, plain(pd.b));
+            putPanel(3, [&](int x, int y, uint8_t *rgb) {
+                const size_t t = (static_cast<size_t>(y) * pd.w + x) * 3;
+                int dpos = 0, dneg = 0;
+                for (int ch = 0; ch < 3; ++ch) {
+                    const int dd = int(pd.sMid[t + ch]) - int(pd.b[t + ch]);
+                    dpos = std::max(dpos, dd);
+                    dneg = std::max(dneg, -dd);
+                }
+                rgb[0] = static_cast<uint8_t>(std::min(255, dpos * 8));
+                rgb[1] = 0;
+                rgb[2] = static_cast<uint8_t>(std::min(255, dneg * 8));
+            });
+            char path[128];
+            std::snprintf(path, sizeof(path),
+                          "doorshadow_diag/door%d_c%u_p%d_l%d.ppm",
+                          doorID, rec.ci, rec.pi,
+                          static_cast<int>(worst[w].li));
+            if (FILE *f = std::fopen(path, "wb")) {
+                std::fprintf(f, "P6\n%d %d\n255\n", W, H);
+                std::fwrite(img.data(), 1, img.size(), f);
+                std::fclose(f);
+                std::fprintf(stderr, "[DOOR_DIAG]   wrote %s\n", path);
+            }
+        }
     }
 
 private:
@@ -780,7 +1159,7 @@ private:
                         &lightList) &&
             static_cast<int>(lumels.size()) == rec.w * rec.h) {
             packLumelsRGB8(lumels, rec.overlays[k]);
-            mReadyRecs.push_back(recIdx);
+            mPendingReady.push_back(recIdx);   // atomic settle handoff
         }
         mEventRays += stats.rays;
     }
@@ -1106,6 +1485,7 @@ private:
     std::vector<std::pair<size_t, int16_t>> mWork;
     size_t mWorkCursor = 0;
     std::vector<size_t> mReadyRecs;
+    std::vector<size_t> mPendingReady;   // held until event drain
     std::chrono::steady_clock::time_point mLastRebuild{};
     std::chrono::steady_clock::time_point mLastLog{};
     size_t mEventPolysTotal = 0;

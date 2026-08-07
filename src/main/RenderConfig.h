@@ -824,6 +824,11 @@ struct RenderConfig {
     // (point, light) face lookups against raycastWorld (0 = don't run).
     int shadowFaceSize        = 256;
     int shadowCrossCheckPairs = 0;
+    // --door-diff-diag <objID>: S4c artifact harness — for one door,
+    // compare the mid-swing differential result against the settled CPU
+    // truth over its cone polys; histograms + panel images under
+    // doorshadow_diag/. 0 = off.
+    int  doorDiffDiag         = 0;
     // --lumel-bake-test: the S2 GPU engine's acceptance — GPU-bake one
     // door overlay and diff it against the CPU bake of the same rect.
     bool lumelBakeTest        = false;
@@ -2675,6 +2680,9 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
         } else if (std::strcmp(argv[i], "--shadow-face-size") == 0 && i + 1 < argc) {
             cfg.shadowFaceSize = std::min(2048, std::max(64,
                 std::atoi(argv[++i])));
+        } else if (std::strcmp(argv[i], "--door-diff-diag") == 0 &&
+                   i + 1 < argc) {
+            cfg.doorDiffDiag = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--lumel-bake-test") == 0) {
             cfg.lumelBakeTest = true;
         } else if (std::strcmp(argv[i], "--rebake-cpu-events") == 0) {

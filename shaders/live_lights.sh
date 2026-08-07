@@ -90,6 +90,100 @@ float liveShadowFactor(vec3 worldPos, vec3 lightPos, float slot,
     return (distNorm <= stored + biasNorm) ? 1.0 : 0.0;
 }
 
+// Tile sampler shared by the PCSS path: clamps into the tile so
+// filtering can never read a neighbouring light's face.
+float liveTileStored(float tx, float ty, float u, float v)
+{
+    float cu = clamp(u, 0.002, 0.998);
+    float cv = clamp(v, 0.002, 0.998);
+    vec2 uv = vec2((tx + cu) * u_liveShadowInfo.y,
+                   (ty + (1.0 - cv)) * u_liveShadowInfo.z);
+    if (u_liveShadowInfo.w > 0.5) uv.y = 1.0 - uv.y;
+    return texture2D(s_liveShadowAtlas, uv).r;
+}
+
+// PCSS visibility — soft penumbra from the stored LINEAR occluder
+// distance: width = emitterA * (dRecv - dOcc) / dOcc, projected to face
+// UV (a world offset s at the receiver subtends s/dRecv; u spans the
+// 90-degree frustum so uvR = 0.5 * s / dRecv). The faces store linear
+// distance precisely so this is computable from one map. Degenerates to
+// the 1-tap hard test when emitterA = 0 (the [LUMEL_BAKE] self-test
+// path stays bit-exact). ~14 taps: used by the OFFSCREEN lumel bake so
+// event re-bakes keep the load bake's soft edges — not by the per-frame
+// lightmapped shaders.
+float liveShadowFactorPCSS(vec3 worldPos, vec3 lightPos, float slot,
+                           float invReach, float emitterA)
+{
+    if (slot < 0.0) return 1.0;
+    vec3 d = worldPos - lightPos;
+    vec3 ad = abs(d);
+    float face; vec3 fwd; vec3 rgt; vec3 up;
+    if (ad.x >= ad.y && ad.x >= ad.z) {
+        if (d.x >= 0.0) { face = 0.0; fwd = vec3( 1, 0, 0); rgt = vec3( 0,-1, 0); up = vec3(0, 0, 1); }
+        else            { face = 1.0; fwd = vec3(-1, 0, 0); rgt = vec3( 0, 1, 0); up = vec3(0, 0, 1); }
+    } else if (ad.y >= ad.z) {
+        if (d.y >= 0.0) { face = 2.0; fwd = vec3( 0, 1, 0); rgt = vec3( 1, 0, 0); up = vec3(0, 0, 1); }
+        else            { face = 3.0; fwd = vec3( 0,-1, 0); rgt = vec3(-1, 0, 0); up = vec3(0, 0, 1); }
+    } else {
+        if (d.z >= 0.0) { face = 4.0; fwd = vec3( 0, 0, 1); rgt = vec3(-1, 0, 0); up = vec3(0, 1, 0); }
+        else            { face = 5.0; fwd = vec3( 0, 0,-1); rgt = vec3( 1, 0, 0); up = vec3(0, 1, 0); }
+    }
+    float z = dot(d, fwd);
+    if (z <= 1e-4) return 1.0;
+    float u = dot(d, rgt) / z * 0.5 + 0.5;
+    float v = dot(d, up)  / z * 0.5 + 0.5;
+    float tile = slot * 6.0 + face;
+    float tpr = u_liveShadowInfo.x;
+    float tx = tile - tpr * floor(tile / tpr);
+    float ty = floor(tile / tpr);
+    float distNorm = length(d) * invReach;
+    float biasNorm = 0.5 * invReach;
+
+    // Blocker search: centre + 4 diagonals over the emitter's projected
+    // extent at this depth.
+    float searchR = clamp(0.5 * emitterA / max(z, 0.5), 0.004, 0.04);
+    float occSum = 0.0;
+    float occN = 0.0;
+    float s0 = liveTileStored(tx, ty, u, v);
+    if (s0 + biasNorm < distNorm) { occSum += s0; occN += 1.0; }
+    float s1 = liveTileStored(tx, ty, u - searchR, v - searchR);
+    if (s1 + biasNorm < distNorm) { occSum += s1; occN += 1.0; }
+    float s2 = liveTileStored(tx, ty, u + searchR, v - searchR);
+    if (s2 + biasNorm < distNorm) { occSum += s2; occN += 1.0; }
+    float s3 = liveTileStored(tx, ty, u - searchR, v + searchR);
+    if (s3 + biasNorm < distNorm) { occSum += s3; occN += 1.0; }
+    float s4 = liveTileStored(tx, ty, u + searchR, v + searchR);
+    if (s4 + biasNorm < distNorm) { occSum += s4; occN += 1.0; }
+    if (occN < 0.5) return 1.0;                       // fully lit
+    float dOccN = occSum / occN;                      // reach-normalised
+    float ratio = max(distNorm - dOccN, 0.0) / max(dOccN, 1e-4);
+    float uvR = clamp(0.5 * emitterA * ratio * invReach / distNorm,
+                      0.0, 0.05);
+    if (uvR < 0.002)   // sub-texel penumbra: the hard test IS the answer
+        return (distNorm <= s0 + biasNorm) ? 1.0 : 0.0;
+
+    // PCF: centre + 8-tap disc at the penumbra radius.
+    float lit = (distNorm <= s0 + biasNorm) ? 1.0 : 0.0;
+    float t;
+    t = liveTileStored(tx, ty, u - 0.7071 * uvR, v);
+    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
+    t = liveTileStored(tx, ty, u + 0.7071 * uvR, v);
+    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
+    t = liveTileStored(tx, ty, u, v - 0.7071 * uvR);
+    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
+    t = liveTileStored(tx, ty, u, v + 0.7071 * uvR);
+    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
+    t = liveTileStored(tx, ty, u - 0.35 * uvR, v - 0.35 * uvR);
+    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
+    t = liveTileStored(tx, ty, u + 0.35 * uvR, v - 0.35 * uvR);
+    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
+    t = liveTileStored(tx, ty, u - 0.35 * uvR, v + 0.35 * uvR);
+    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
+    t = liveTileStored(tx, ty, u + 0.35 * uvR, v + 0.35 * uvR);
+    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
+    return lit / 9.0;
+}
+
 vec3 liveLightSum(vec3 worldPos, vec3 camPos)
 {
     vec3 sum = vec3(0.0, 0.0, 0.0);

@@ -186,7 +186,8 @@ inline bool submitLumelRect(const LumelBakeGPU &g, const ShadowMapCache &sc,
                             const LumelGrid &grid, float surfaceOffset,
                             const Vector3 &lightPos, float reach,
                             const Vector3 &colorK, int slot,
-                            float emitterA, int x0, int y0) {
+                            float emitterA, int x0, int y0,
+                            float pcssEmitter = -1.0f) {
     using QuadVertex = LumelQuadVertex;
     static bool layoutInit = false;
     if (!layoutInit) { QuadVertex::init(); layoutInit = true; }
@@ -223,7 +224,12 @@ inline bool submitLumelRect(const LumelBakeGPU &g, const ShadowMapCache &sc,
     const float li[4] = {lightPos.x, lightPos.y, lightPos.z, reach * reach};
     const float co[4] = {colorK.x, colorK.y, colorK.z,
                          static_cast<float>(slot)};
-    const float fall[4] = {emitterA * emitterA, 0, 0, 0};
+    // .x = falloff a^2; .y = the PCSS emitter size (the penumbra the
+    // shadow tap synthesises). Decoupled so the self-test can run the
+    // falloff physically while pinning the shadow to the exact 1-tap.
+    const float fall[4] = {emitterA * emitterA,
+                           pcssEmitter < 0.0f ? emitterA : pcssEmitter,
+                           0, 0};
     const float info[4] = {
         static_cast<float>(sc.tilesPerRow),
         sc.atlasW > 0 ? float(sc.faceSize) / float(sc.atlasW) : 0.0f,
@@ -356,8 +362,12 @@ inline void runLumelBakeSelfTest(LumelBakeGPU &g, ShadowMapCache &sc,
     const Vector3 colorK = L.bright * (formula.brightScale * K);
     const float reach = sc.lightReach[lightIdx];
 
+    // pcssEmitter = 0: the self-test pins the GPU to the exact hard tap
+    // (the CPU reference bakes penumbra-free); penumbra parity is the
+    // --door-diff-diag harness's metric, not this one's.
     if (!submitLumelRect(g, sc, grid, formula.surfaceOffset, L.loc, reach,
-                         colorK, slot, formula.emitterRadius, 0, 0)) {
+                         colorK, slot, formula.emitterRadius, 0, 0,
+                         /*pcssEmitter=*/0.0f)) {
         std::fprintf(stderr, "[LUMEL_BAKE] submit failed\n");
         bgfx::destroy(fb); bgfx::destroy(rt); bgfx::destroy(staging);
         return;

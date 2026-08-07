@@ -36,3 +36,4 @@ darknessRender.yaml
 # audio profiling artifacts (see tools/perf_README.md)
 /perf/
 __pycache__/
+doorshadow_diag/

@@ -7956,6 +7956,13 @@ int main(int argc, char *argv[]) {
                 gpu.rebakedAnimPolys, gpu.doorShadowLights,
                 gpu.rebakedDensity);
         }
+
+        // S4c artifact harness: --door-diff-diag <objID> compares the
+        // mid-swing differential result against the settled CPU truth
+        // for one door and writes panel images (see DoorShadowSystem).
+        if (cfg.doorDiffDiag != 0)
+            doorShadow.runDiffDiagnostic(gpu.shadowCache,
+                                         cfg.doorDiffDiag);
     }
 
     // ── S1 acceptance: shadow-map vs raycastWorld cross-check ──
