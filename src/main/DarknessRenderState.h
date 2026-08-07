@@ -331,12 +331,12 @@ struct GPUResources {
 // Mirrors LIVE_LIGHT_CAP in shaders/live_lights.sh.
 // 32 = the upper industry-standard shadowed-light budget (rationale at
 // PostProcess.h kShadowMaxPoolSlots, which is sized to match: 2 slots
-// per differential + flashlight). The shader loop is count-gated, so
+// per differential + live emitters). The shader loop is count-gated, so
 // inactive entries cost one compare each.
 constexpr int kLiveLightCap = 32;
 
 // One light promoted out of the baked atlas (or transient, e.g. the
-// flashlight test vehicle). colorK carries bright x brightScale x K_i —
+// player lantern / live emitters). colorK carries bright x brightScale x K_i —
 // the per-light throw intensity folded, mirroring the object path.
 struct LiveLight {
     Vector3 pos{0.0f};
@@ -502,7 +502,26 @@ struct RuntimeState {
     // S4 live lights, rebuilt each frame (promotions + test vehicles).
     std::vector<LiveLight> liveLights;
     // Console test vehicle: a warm live light carried at the camera.
-    bool liveFlashlight = false;
+    // ── Live emitters ──
+    // Moving light-emitting objects that want the LIVE per-pixel path
+    // (world lighting + S1 shadow faces that re-render as they move):
+    // the player lantern some fan missions carry, and future producers
+    // — fire arrows in flight, AI-carried torches. Rebuilt every frame
+    // by producers, like dynamicLights; the frame loop turns each into
+    // a live light. `id` must be unique and come from the dynamic-
+    // emitter range of ShadowMapCache's negative-id registry
+    // (-1000..-1999).
+    struct LiveEmitter {
+        int     id = -1001;
+        Vector3 pos{0.0f};
+        Vector3 colorK{0.0f};   // bright x brightScale x K (bake units)
+        float   reach = 0.0f;
+    };
+    std::vector<LiveEmitter> liveEmitters;
+    // Console test vehicle AND the fan-mission player-lantern preview:
+    // carries a warm lantern low-right of the camera (Thief has no
+    // player flashlight — the lantern is the real feature this models).
+    bool liveLantern = false;
     // Lighting-only debug view: replace world albedo with white so the raw
     // light field is visible. Against a real 64x64 stone texture the ~1
     // world-unit lumel grid is masked by albedo detail — this is what makes

@@ -1,6 +1,7 @@
 // S4a (PLAN.HIGH_RES_SHADOWS §S4): per-fragment term for LIVE lights —
 // lights promoted out of the baked atlas (a door is swinging through
-// their cone) plus transient sources like the flashlight test vehicle.
+// their cone) plus LIVE EMITTERS — moving light-emitting objects (the
+// fan-mission player lantern, fire arrows, carried torches).
 //
 // The term must be BRIGHTNESS-CONTINUOUS with the overlay it replaces:
 // same half-Lambert response the bake uses (backface culled first, like

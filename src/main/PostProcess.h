@@ -217,7 +217,8 @@ static constexpr bgfx::ViewId kViewGrain = kViewComposite + 4;
 // kShadowMaxPoolSlots bounds the VIEW ID RESERVATION (and the runtime
 // pool); 6 is kShadowFaceCount (static_asserted in ShadowMapCache.h).
 // 66 slots = 32 concurrent S4c differentials (2 slots each: frozen +
-// current) + the flashlight + spare. 32 shadowed live lights is the
+// current) + live emitters (player lantern etc.) + spare. 32 shadowed
+// live lights is the
 // upper industry-standard tier (Unity HDRP defaults 24 shadowed
 // punctuals; Godot's whole default atlas is 88 low-res tiles; HPL2
 // ships 11 maps). The old per-slot view scheme capped the pool at ~38

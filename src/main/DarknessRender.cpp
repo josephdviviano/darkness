@@ -3682,13 +3682,13 @@ static void registerConsoleSettings(
             "Startup set comes from dev: log_mute");
     }
 
-    dbgConsole.addBool("live_flashlight",
-        [&state]() { return state.liveFlashlight; },
-        [&state](bool v) { state.liveFlashlight = v; },
-        "S4 test vehicle: carry a warm live light at the camera, lighting "
-        "WORLD geometry per-fragment (physical falloff + half-Lambert via "
-        "derivative normals). Unshadowed until S4b. Lightmapped world "
-        "only");
+    dbgConsole.addBool("live_lantern",
+        [&state]() { return state.liveLantern; },
+        [&state](bool v) { state.liveLantern = v; },
+        "Carried lantern (the fan-mission player-lantern preview, and "
+        "the live-emitter test vehicle): a warm live light held low-"
+        "right of the camera, lighting world geometry per-fragment with "
+        "S1 shadows that track its motion");
 
     dbgConsole.addFloat("shadow_debug", -1.0f, 4095.0f,
         [&state]() { return static_cast<float>(state.shadowDebugLight); },
@@ -8848,53 +8848,67 @@ int main(int argc, char *argv[]) {
             // ── View 0: Sky pass ──
             renderSky(fc, meshes, gpu, mission, state);
 
-            // S4: rebuild the live-light list for this frame. Door
-            // promotions join here in S4c; today the flashlight test
-            // vehicle proves the shader term.
+            // S4: rebuild the live-light list for this frame — door
+            // promotions plus the LIVE EMITTERS (moving light-emitting
+            // objects: the fan-mission player lantern, and future
+            // producers like fire arrows or AI-carried torches; Thief
+            // has no player flashlight — the lantern is the feature
+            // this models).
             state.liveLights.clear();
-            if (state.liveFlashlight) {
-                Darkness::LiveLight fl;
-                // OFFSET from the eye — a light coaxial with the camera
-                // casts almost no VISIBLE shadow (every visible fragment
-                // is visible from the light; the shadowed set is exactly
-                // the hidden set). Held low-right like a carried lantern
-                // so parallax exposes shadow edges.
+            state.liveEmitters.clear();
+            // Producer: the carried lantern (console `live_lantern` —
+            // the FM-lantern preview and the shader term's test
+            // vehicle). OFFSET from the eye: a light coaxial with the
+            // camera casts almost no VISIBLE shadow (every visible
+            // fragment is visible from the light; the shadowed set is
+            // exactly the hidden set). Held low-right like a carried
+            // lantern so parallax exposes shadow edges.
+            if (state.liveLantern) {
                 Darkness::Vector3 camR, camU, camF;
                 state.cam.getBasis(camR, camU, camF);
-                fl.pos = Darkness::Vector3(state.cam.pos[0],
-                                           state.cam.pos[1],
-                                           state.cam.pos[2])
-                       + camR * 2.0f - camU * 1.5f;
-                // Warm torch-class light: bright ~2 in table units, K at
-                // the global 8u anchor (matches the bake's brightness
+                Darkness::RuntimeState::LiveEmitter lantern;
+                lantern.id = -1001;
+                lantern.pos = Darkness::Vector3(state.cam.pos[0],
+                                                state.cam.pos[1],
+                                                state.cam.pos[2])
+                            + camR * 2.0f - camU * 1.5f;
+                // Warm lantern-class light: bright ~2 in table units, K
+                // at the global 8u anchor (matches the bake's brightness
                 // math), reach = its sub-quantisation radius.
                 const float kG = (8.0f * 8.0f + 0.5625f) / 8.0f;
-                fl.colorK = Darkness::Vector3(2.0f, 1.9f, 1.7f) * kG;
-                const float reach = std::sqrt(
+                lantern.colorK = Darkness::Vector3(2.0f, 1.9f, 1.7f) * kG;
+                lantern.reach = std::sqrt(
                     2.0f * kG / Darkness::kSubQuantThreshold);
-                fl.reach2 = reach * reach;
-                // S4b: real shadows from the S1 faces. The flashlight
-                // moves every frame, so its six faces re-render every
-                // frame — the live-shadow worst case, and the measurement
-                // of it.
-                fl.shadowSlot = Darkness::ensureDynamicShadowLight(
-                    gpu.shadowCache, mission.wrData, -1001, fl.pos, reach,
-                    state.bgfxFrame);
-                // One-time state print — "no shadows" must be attributable
-                // to a stage, not a shrug.
+                state.liveEmitters.push_back(lantern);
+            }
+            // Every emitter becomes a live light with S1 faces that
+            // re-render whenever it moves (position feeds the slot
+            // validity hash) — the moving-emitter worst case, and the
+            // measurement of it.
+            for (const auto &em : state.liveEmitters) {
+                Darkness::LiveLight ll;
+                ll.pos = em.pos;
+                ll.colorK = em.colorK;
+                ll.reach2 = em.reach * em.reach;
+                ll.shadowSlot = Darkness::ensureDynamicShadowLight(
+                    gpu.shadowCache, mission.wrData, em.id, em.pos,
+                    em.reach, state.bgfxFrame);
+                // One-time state print — "no shadows" must be
+                // attributable to a stage, not a shrug.
                 static bool sLiveShadowLogged = false;
                 if (!sLiveShadowLogged) {
                     sLiveShadowLogged = true;
                     std::fprintf(stderr,
-                        "[LIVE_SHADOW] flashlight: slot=%d reach=%.1f "
+                        "[LIVE_SHADOW] emitter %d: slot=%d reach=%.1f "
                         "atlas=%dx%d tilesPerRow=%d faceSize=%d "
                         "originBottomLeft=%d\n",
-                        fl.shadowSlot, reach, gpu.shadowCache.atlasW,
+                        em.id, ll.shadowSlot, em.reach,
+                        gpu.shadowCache.atlasW,
                         gpu.shadowCache.atlasH, gpu.shadowCache.tilesPerRow,
                         gpu.shadowCache.faceSize,
                         bgfx::getCaps()->originBottomLeft ? 1 : 0);
                 }
-                state.liveLights.push_back(fl);
+                state.liveLights.push_back(ll);
             }
             // Light-vs-visible-set test, shared by every runtime light
             // path this frame. A light is culled by whether its REACH
@@ -8942,7 +8956,7 @@ int main(int argc, char *argv[]) {
                                 Darkness::kLiveLightCap,
                                 doorShadow.promotedLive().size() -
                                     (Darkness::kLiveLightCap -
-                                     (state.liveFlashlight ? 1 : 0)));
+                                     state.liveEmitters.size()));
                         }
                         break;
                     }

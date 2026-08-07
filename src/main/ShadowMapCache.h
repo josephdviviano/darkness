@@ -81,7 +81,9 @@ struct ShadowCasterVertex {
 // NEGATIVE-ID REGISTRY for pool slots. Static lights use their table
 // index (> 0); every transient user owns a disjoint negative range so
 // slots can never collide across subsystems:
-//   -1001            flashlight test vehicle (frame loop)
+//   -1000..-1999     LIVE EMITTERS (RuntimeState::liveEmitters —
+//                    moving light-emitting objects; -1001 = the player
+//                    lantern / console test vehicle)
 //   -2000 - lightIdx S4c promoted light, CURRENT-pose faces
 //   -3000 - lightIdx S4c promoted light, FROZEN baked-pose faces (pinned)
 //   -9001            S1 cross-check dynamic leg
@@ -435,7 +437,7 @@ struct ShadowCasterPoseOverride {
 // because a culled face's tile would otherwise keep a previous occupant's
 // distances and lookups into it would read another light's scene.
 // Core face render for a light at an arbitrary position — static lights
-// and transients (flashlight, S4c door promotions) share it.
+// and transients (live emitters, S4c door promotions) share it.
 inline void renderShadowFacesAt(ShadowMapCache &c, const WRParsedData &wr,
                                 const Vector3 &lightPos, float reach,
                                 int slot,
@@ -711,7 +713,7 @@ inline int ensureShadowLight(ShadowMapCache &c, const WRParsedData &wr,
     return slot;
 }
 
-// Transient lights (the flashlight, S4c door promotions when a light
+// Transient lights (live emitters, S4c door promotions when a light
 // must track a moving emitter) — identified by caller-chosen NEGATIVE
 // ids so they can never collide with static-table indices. A moving
 // light re-renders every frame (pos changes); a parked one goes valid

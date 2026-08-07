@@ -1889,7 +1889,8 @@ private:
     // physics ticks at 12.5 Hz (80 ms gaps between markDirty calls
     // mid-swing) — 0.3 s cannot false-settle a moving leaf.
     static constexpr float kSettleSec = 0.30f;
-    // kLiveLightCap minus the flashlight's slot; the frame loop merges
+    // kLiveLightCap minus the live emitters' slots (player lantern
+    // etc.); the frame loop merges
     // and enforces the real cap, logging any truncation. Each promotion
     // holds TWO S1 slots (frozen + current) — kShadowMaxPoolSlots is
     // sized to match. When more lights want the realtime path than fit,
