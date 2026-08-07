@@ -837,7 +837,14 @@ static void renderWorld(
                             lp[i][2] = L.pos.z; lp[i][3] = L.reach2;
                             lc[i][0] = L.colorK.x; lc[i][1] = L.colorK.y;
                             lc[i][2] = L.colorK.z;
-                            lc[i][3] = static_cast<float>(L.shadowSlot);
+                            // S4c differential lights pack BOTH slots:
+                            // 100 + frozen·16 + current (slots < 16 by
+                            // pool construction) — decoded in
+                            // live_lights.sh.
+                            lc[i][3] = L.shadowSlotFrozen >= 0
+                                ? 100.0f + 16.0f * L.shadowSlotFrozen +
+                                      static_cast<float>(L.shadowSlot)
+                                : static_cast<float>(L.shadowSlot);
                         }
                         bgfx::setUniform(gpu.u_liveLightPos, lp,
                                          static_cast<uint16_t>(liveN));
@@ -8792,7 +8799,7 @@ int main(int argc, char *argv[]) {
                 // of it.
                 fl.shadowSlot = Darkness::ensureDynamicShadowLight(
                     gpu.shadowCache, mission.wrData, -1001, fl.pos, reach,
-                    state.frameIndex);
+                    state.bgfxFrame);
                 // One-time state print — "no shadows" must be attributable
                 // to a stage, not a shrug.
                 static bool sLiveShadowLogged = false;
@@ -8808,6 +8815,40 @@ int main(int argc, char *argv[]) {
                         bgfx::getCaps()->originBottomLeft ? 1 : 0);
                 }
                 state.liveLights.push_back(fl);
+            }
+            // S4c: differential door promotions — only while the rebaked
+            // atlas is DISPLAYED (the differential corrects rebaked
+            // overlays; adding it over the vintage atlas would brighten
+            // lights that atlas never dimmed).
+            if (state.useRebakedLightmaps &&
+                !gpu.rebakedAtlasHandles.empty()) {
+                for (const auto &pl : doorShadow.promotedLive()) {
+                    if (static_cast<int>(state.liveLights.size()) >=
+                        Darkness::kLiveLightCap) {
+                        // No silent caps: a truncated promotion means a
+                        // visibly lagged shadow — say so.
+                        static uint32_t sLastCapLog = 0;
+                        if (state.bgfxFrame - sLastCapLog > 120) {
+                            sLastCapLog = state.bgfxFrame;
+                            std::fprintf(stderr,
+                                "[LIVE_SHADOW] live-light cap %d full — "
+                                "%zu promoted light(s) dropped this "
+                                "frame\n",
+                                Darkness::kLiveLightCap,
+                                doorShadow.promotedLive().size() -
+                                    (Darkness::kLiveLightCap -
+                                     (state.liveFlashlight ? 1 : 0)));
+                        }
+                        break;
+                    }
+                    Darkness::LiveLight ll;
+                    ll.pos = pl.pos;
+                    ll.reach2 = pl.reach2;
+                    ll.colorK = pl.colorK;
+                    ll.shadowSlot = pl.slotCurrent;
+                    ll.shadowSlotFrozen = pl.slotFrozen;
+                    state.liveLights.push_back(ll);
+                }
             }
 
             // ── View 1: World geometry ──
@@ -8831,10 +8872,15 @@ int main(int argc, char *argv[]) {
                 // objects — a flashlight that lit walls but not the door
                 // leaf in front of them read as broken). The object path
                 // is vintage 1/r, so hand it plain bright, not colorK.
-                for (const auto &ll : state.liveLights)
+                // S4c differential lights are EXCLUDED: they are
+                // static-table lights already in the object path;
+                // re-adding them would double their object contribution.
+                for (const auto &ll : state.liveLights) {
+                    if (ll.shadowSlotFrozen >= 0) continue;
                     state.dynamicLights.add(
                         ll.pos, ll.colorK / 8.07f,
                         std::sqrt(std::max(ll.reach2, 0.0f)));
+                }
                 // Report the count once. This producer existed for months
                 // while being entirely unreferenced, and the failure mode
                 // was silence — an empty light list looks identical to a

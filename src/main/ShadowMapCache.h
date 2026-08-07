@@ -82,6 +82,11 @@ struct ShadowCasterVertex {
 // those faces were rendered from (the HPL2 validity fields).
 struct ShadowSlot {
     int      lightIdx  = -1;          // -1 = never used
+    // S4c: a pinned slot holds a FROZEN reference (door casters at the
+    // last-baked pose) for a differential live light. Ensure/LRU must
+    // never steal or re-render it — its whole value is that it does NOT
+    // track the moving door.
+    bool     pinned    = false;
     Vector3  pos{0.0f};               // light position at render time
     Vector3  bright{0.0f};            // brightness at render time (reach input)
     float    reach     = 0.0f;        // reach the faces were normalised by
@@ -353,6 +358,15 @@ inline bool shadowDynamicSegmentBlocked(const ShadowMapCache &c,
 
 // ── Face rendering ──────────────────────────────────────────────────────────
 
+// S4c: a dynamic caster drawn at a pose OTHER than its body's current one
+// — the frozen-reference faces render the promoted door at the pose the
+// baked overlay was last baked at, not where the leaf is now.
+struct ShadowCasterPoseOverride {
+    uint32_t  bodyIdx;
+    Vector3   worldPos;
+    glm::mat3 rotation;
+};
+
 // Render the six faces of `lightIdx` into `slot`'s tiles. Faces whose 90°
 // frustum misses every cell bounding sphere within the light's reach are
 // not drawn — their tiles are still CLEARED (to 1.0 = "no occluder"),
@@ -362,7 +376,9 @@ inline bool shadowDynamicSegmentBlocked(const ShadowMapCache &c,
 // and transients (flashlight, S4c door promotions) share it.
 inline void renderShadowFacesAt(ShadowMapCache &c, const WRParsedData &wr,
                                 const Vector3 &lightPos, float reach,
-                                int slot) {
+                                int slot,
+                                const std::vector<ShadowCasterPoseOverride>
+                                    *poseOv = nullptr) {
     const float farZ = std::max(reach, c.nearZ * 2.0f);
     const bool homoDepth = bgfx::getCaps()->homogeneousDepth;
 
@@ -375,16 +391,32 @@ inline void renderShadowFacesAt(ShadowMapCache &c, const WRParsedData &wr,
     }
 
     // S4b: dynamic casters (door leaves) within reach, drawn as transient
-    // boxes into every face after the static mesh.
+    // boxes into every face after the static mesh. Overridden bodies
+    // (S4c frozen references) take their pose from the override, not the
+    // live body.
+    auto casterPose = [&](uint32_t bi, const ObjectCollisionBody &b,
+                          Vector3 &pos, glm::mat3 &rot) {
+        pos = b.worldPos;
+        rot = b.rotation;
+        if (poseOv)
+            for (const ShadowCasterPoseOverride &ov : *poseOv)
+                if (ov.bodyIdx == bi) {
+                    pos = ov.worldPos;
+                    rot = ov.rotation;
+                    return;
+                }
+    };
     std::vector<uint32_t> dynInReach;
     if (c.dynCasterWorld) {
         const auto &bodies = c.dynCasterWorld->getBodies();
         for (uint32_t bi : c.dynCasterBodies) {
             if (bi >= bodies.size() || bodies[bi].removed) continue;
             const ObjectCollisionBody &b = bodies[bi];
+            Vector3 bp; glm::mat3 br;
+            casterPose(bi, b, bp, br);
             const float maxEdge = std::max(
                 {b.edgeLengths.x, b.edgeLengths.y, b.edgeLengths.z});
-            if (glm::length(b.worldPos - lightPos) - maxEdge <= reach)
+            if (glm::length(bp - lightPos) - maxEdge <= reach)
                 dynInReach.push_back(bi);
         }
     }
@@ -456,13 +488,15 @@ inline void renderShadowFacesAt(ShadowMapCache &c, const WRParsedData &wr,
                 size_t w = 0;
                 for (uint32_t bi : dynInReach) {
                     const ObjectCollisionBody &b = bodies[bi];
+                    Vector3 bp; glm::mat3 br;
+                    casterPose(bi, b, bp, br);
                     const Vector3 he = b.edgeLengths * 0.5f;
-                    const Vector3 ax = Vector3(b.rotation[0]) * he.x;
-                    const Vector3 ay = Vector3(b.rotation[1]) * he.y;
-                    const Vector3 az = Vector3(b.rotation[2]) * he.z;
+                    const Vector3 ax = Vector3(br[0]) * he.x;
+                    const Vector3 ay = Vector3(br[1]) * he.y;
+                    const Vector3 az = Vector3(br[2]) * he.z;
                     Vector3 corner[8];
                     for (int k = 0; k < 8; ++k)
-                        corner[k] = b.worldPos +
+                        corner[k] = bp +
                             ax * ((k & 1) ? 1.0f : -1.0f) +
                             ay * ((k & 2) ? 1.0f : -1.0f) +
                             az * ((k & 4) ? 1.0f : -1.0f);
@@ -538,9 +572,11 @@ inline int ensureShadowLight(ShadowMapCache &c, const WRParsedData &wr,
             renderShadowFaces(c, wr, lightIdx, i, frameIndex);
             return i;
         }
+        if (s.pinned) continue;   // frozen reference — never steal
         if (s.lightIdx < 0 && freeSlot < 0) freeSlot = i;
         if (s.lastUsed < lruAge) { lruAge = s.lastUsed; lruSlot = i; }
     }
+    if (freeSlot < 0 && lruAge == 0xffffffffu) return -1;  // all pinned
 
     const int slot = freeSlot >= 0 ? freeSlot : lruSlot;
     renderShadowFaces(c, wr, lightIdx, slot, frameIndex);
@@ -581,11 +617,13 @@ inline int ensureDynamicShadowLight(ShadowMapCache &c,
             ++c.lightRenders;
             return i;
         }
+        if (s.pinned) continue;   // frozen reference — never steal
         if (s.lightIdx < 0 && s.lightIdx != id && freeSlot < 0 &&
             !s.rendered)
             freeSlot = i;
         if (s.lastUsed < lruAge) { lruAge = s.lastUsed; lruSlot = i; }
     }
+    if (freeSlot < 0 && lruAge == 0xffffffffu) return -1;  // all pinned
     const int slot = freeSlot >= 0 ? freeSlot : lruSlot;
     renderShadowFacesAt(c, wr, pos, reach, slot);
     ShadowSlot &s = c.slots[slot];
@@ -598,6 +636,60 @@ inline int ensureDynamicShadowLight(ShadowMapCache &c,
     s.rendered = true;
     ++c.lightRenders;
     return slot;
+}
+
+// ── S4c frozen references ───────────────────────────────────────────────────
+// A frozen slot holds a promoted light's faces with the door casters at
+// the LAST-BAKED pose (poseOv) — the reference the differential live term
+// subtracts. It renders ONCE per acquire and is pinned: the ensure
+// functions must neither steal nor refresh it (its hash is deliberately
+// left at 0 — no validity machinery applies; the owner re-acquires when
+// the baked pose changes and releases when the promotion ends).
+inline int acquireFrozenShadowSlot(ShadowMapCache &c, const WRParsedData &wr,
+                                   int id, const Vector3 &pos, float reach,
+                                   const std::vector<ShadowCasterPoseOverride>
+                                       &poseOv,
+                                   uint32_t frameIndex) {
+    if (!c.valid() || id >= 0 || reach <= 0.0f) return -1;
+    int freeSlot = -1, lruSlot = -1, existing = -1;
+    uint32_t lruAge = 0xffffffffu;
+    for (int i = 0; i < c.slotCount; ++i) {
+        ShadowSlot &s = c.slots[i];
+        if (s.lightIdx == id) { existing = i; break; }
+        if (s.pinned) continue;
+        if (s.lightIdx < 0 && freeSlot < 0) freeSlot = i;
+        if (s.lastUsed < lruAge) { lruAge = s.lastUsed; lruSlot = i; }
+    }
+    const int slot = existing >= 0 ? existing
+                   : freeSlot >= 0 ? freeSlot : lruSlot;
+    if (slot < 0) return -1;   // pool entirely pinned
+    renderShadowFacesAt(c, wr, pos, reach, slot, &poseOv);
+    ShadowSlot &s = c.slots[slot];
+    s.lightIdx = id;
+    s.pinned = true;
+    s.pos = pos;
+    s.bright = Vector3(0.0f);
+    s.reach = reach;
+    s.casterHash = 0;
+    s.lastUsed = frameIndex;
+    s.rendered = true;
+    ++c.lightRenders;
+    return slot;
+}
+
+inline void releaseShadowSlot(ShadowMapCache &c, int id) {
+    for (ShadowSlot &s : c.slots)
+        if (s.lightIdx == id) {
+            s = ShadowSlot{};
+            return;
+        }
+}
+
+// Keep a pinned/held slot warm in the LRU without touching its faces.
+inline void touchShadowSlot(ShadowMapCache &c, int slot,
+                            uint32_t frameIndex) {
+    if (slot >= 0 && slot < c.slotCount)
+        c.slots[slot].lastUsed = frameIndex;
 }
 
 // ── CPU-side atlas lookup (readback consumers: the cross-check) ────────────

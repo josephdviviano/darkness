@@ -293,6 +293,29 @@ public:
             "Door shadows: %zu door-adjacent overlay buffer(s), %.1f MB "
             "(the base a K-pose pre-bake multiplies)\n",
             doorOverlayCount, doorOverlayBytes / 1048576.0);
+        // Name the most light-coupled doors — the doors whose swings
+        // actually exercise this system. `--stress-doors` picks by
+        // camera distance, and a spawn-area door with no lights near it
+        // stress-tests NOTHING; pin one of these with
+        // `--stress-door-ids <id>` instead.
+        {
+            std::vector<std::pair<size_t, int32_t>> rank;
+            for (const auto &dw : mDoorWork)
+                if (!dw.second.empty())
+                    rank.push_back({dw.second.size(), dw.first});
+            std::sort(rank.rbegin(), rank.rend());
+            std::string line;
+            char buf[64];
+            for (size_t i = 0; i < rank.size() && i < 5; ++i) {
+                std::snprintf(buf, sizeof(buf), "%s%d (%zu items)",
+                              i ? ", " : "", rank[i].second,
+                              rank[i].first);
+                line += buf;
+            }
+            std::fprintf(stderr,
+                "[DOOR_SHADOW] most light-coupled doors: %s\n",
+                line.empty() ? "none" : line.c_str());
+        }
         // ── Init-time direction recombine ──
         // Door-adjacent lights contribute no direction at LOAD (or the
         // runtime recombine would double-count them) — paint their term
@@ -360,6 +383,10 @@ public:
                 }
                 mLastPose[objID] = worldMatrix;
                 mDirtyDoors.insert(objID);
+                // S4c: a real pose change marks the door IN MOTION —
+                // update() promotes its lights to differential live and
+                // defers the re-bake event until the door settles.
+                mLastMotion[objID] = std::chrono::steady_clock::now();
                 return;
             }
     }
@@ -372,6 +399,23 @@ public:
     // Recs whose DIRECTION texels were re-encoded this frame — the
     // renderer uploads their rects from the CPU dir atlas.
     std::vector<size_t> &dirDirtyRecs() { return mDirDirty; }
+
+    // S4c: lights currently promoted to DIFFERENTIAL live rendering
+    // because a door is swinging through their cone. The frame loop
+    // appends these to the live-light list; the shader adds
+    // K·falloff·cos·(shadow(slotCurrent) − shadow(slotFrozen)) — the
+    // signed correction over the still-untouched baked overlay. Rebuilt
+    // every update().
+    struct PromotedLive {
+        Vector3 pos{0.0f};
+        Vector3 colorK{0.0f};
+        float   reach2 = 0.0f;
+        int     slotFrozen = -1;
+        int     slotCurrent = -1;
+    };
+    const std::vector<PromotedLive> &promotedLive() const {
+        return mPromotedLive;
+    }
 
     // The doors currently dirty or being processed — the object-lighting
     // invalidation radius comes from here (DarknessRender.cpp couples it
@@ -441,10 +485,59 @@ public:
             gpu->batch.inFlight = false;
         }
 
+        // ── S4c: differential live promotion while doors move ──
+        // The re-bake event is DEFERRED until every dirty door has
+        // settled (no pose change for kSettleSec): while a leaf is
+        // moving, the promoted lights' differential term carries the
+        // shadow per-pixel with zero lag, so mid-swing re-bakes are
+        // pure waste — they were also the cost that made door opening
+        // slow. One event fires at the final pose.
+        const bool liveOk = sc && sc->valid() && mWr;
+        if (liveOk) {
+            if (!mPoseSnapInit) {
+                mPoseSnapInit = true;
+                snapshotBakedPoses(nullptr);
+            }
+            for (const auto &lm : mLastMotion)
+                if (std::chrono::duration<float>(now - lm.second).count() <
+                    kSettleSec)
+                    promoteDoorLights(*sc, lm.first, bgfxFrame, now,
+                                      rebuiltFor);
+            // Per-frame upkeep: the current-pose transient re-renders
+            // exactly when the door pose changed (caster hash); the
+            // frozen slot only gets its LRU stamp.
+            mPromotedLive.clear();
+            for (PromotedLight &p : mPromoted) {
+                const size_t li = static_cast<size_t>(p.lightIdx);
+                if (li >= mWr->staticLights.size() ||
+                    li >= mReach.size()) continue;
+                const WRStaticLight &L = mWr->staticLights[li];
+                const float reach = mReach[li];
+                if (reach <= 0.0f) continue;
+                p.slotCurrent = ensureDynamicShadowLight(
+                    *sc, *mWr, p.dynId, L.loc, reach, bgfxFrame);
+                touchShadowSlot(*sc, p.slotFrozen, bgfxFrame);
+                if (p.slotFrozen < 0 || p.slotCurrent < 0) continue;
+                PromotedLive pl;
+                pl.pos = L.loc;
+                pl.colorK = L.bright *
+                            (mFormula.brightScale * promoteK(p.lightIdx));
+                pl.reach2 = reach * reach;
+                pl.slotFrozen = p.slotFrozen;
+                pl.slotCurrent = p.slotCurrent;
+                mPromotedLive.push_back(pl);
+            }
+        }
+
         // Immediate rebuild when idle (kills the first-frame lag the user
-        // reported); rate-limited only while an event is in flight.
+        // reported); rate-limited only while an event is in flight —
+        // and settle-gated: no event starts while one of its doors is
+        // still moving (see the S4c block above).
         const bool idle = mWork.empty();
-        if (!mDirtyDoors.empty() &&
+        bool allSettled = true;
+        for (int32_t objID : mDirtyDoors)
+            if (doorMoving(objID, now)) { allSettled = false; break; }
+        if (!mDirtyDoors.empty() && allSettled &&
             (idle ||
              std::chrono::duration<float>(now - mLastRebuild).count() >=
                  kRebuildSec)) {
@@ -464,6 +557,10 @@ public:
             std::unordered_set<uint64_t> seenPair;
             mDirtyDoors.swap(mProcessingDoors);
             mDirtyDoors.clear();
+            // S4c: remember which doors this event bakes — the drain
+            // refreshes their baked-pose snapshots and demotes their
+            // promoted lights.
+            mEventDoors = mProcessingDoors;
             mWork.clear();
             mWorkCursor = 0;
             for (int32_t objID : mProcessingDoors) {
@@ -631,6 +728,25 @@ public:
             }
             mWork.clear();
             mWorkCursor = 0;
+            // S4c: the settle event landed — its doors' overlays now
+            // hold the settled pose. Refresh those doors' baked-pose
+            // snapshots and let their promotions extinguish (or
+            // refreeze, if a door is already moving again). Also fire
+            // an UNCONDITIONAL invalidation sphere per event door:
+            // motion-time invalidation ran on a cadence, so the
+            // settled pose may never have been sampled — and settled
+            // is the state objects keep.
+            for (int32_t objID : mEventDoors)
+                for (const auto &dd : mDoors)
+                    if (dd.objID == objID) {
+                        mLastInvalidate[objID] = now;
+                        rebuiltFor.push_back(
+                            {dd.pos,
+                             dd.sweptRadius + kInvalidateMargin});
+                        break;
+                    }
+            if (liveOk) settleDrained(*sc, bgfxFrame, now);
+            else mEventDoors.clear();
         } else if (mWorkCursor < mWork.size()) {
             mEventMs += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -742,7 +858,199 @@ private:
         mDirDirty.push_back(recIdx);
     }
 
+    // ── S4c promotion machinery ─────────────────────────────────────────
+    // One baked light rendered differentially while a door swings
+    // through its cone. frozenId's faces hold the door at the
+    // LAST-BAKED pose (pinned, rendered once per acquire); dynId's
+    // faces track the current pose via the caster hash.
+    struct PromotedLight {
+        int16_t lightIdx = -1;
+        int     frozenId = -1;
+        int     dynId = -1;
+        int     slotFrozen = -1;
+        int     slotCurrent = -1;
+        std::unordered_set<int32_t> doors;
+    };
+
+    bool doorMoving(int32_t objID,
+                    std::chrono::steady_clock::time_point now) const {
+        auto it = mLastMotion.find(objID);
+        return it != mLastMotion.end() &&
+               std::chrono::duration<float>(now - it->second).count() <
+                   kSettleSec;
+    }
+
+    // The bake's per-light intensity factor — same math as the event
+    // submit path (K folded into the colour, shader stays formula-free).
+    float promoteK(int16_t lightIdx) const {
+        const float anchor = mFormula.anchorFor(lightIdx);
+        const float a2 = mFormula.emitterRadius * mFormula.emitterRadius;
+        return anchor > 0.0f ? (anchor * anchor + a2) / anchor : 0.0f;
+    }
+
+    // Snapshot door body poses as the "baked pose" reference — all doors
+    // at first sight (load pose == bake pose), the drained event's doors
+    // after each settle re-bake. If a door re-moved mid-event the
+    // snapshot reads the already-moving pose and the frozen reference is
+    // briefly wrong; the next settle event corrects it (double-swing,
+    // rare, transient).
+    void snapshotBakedPoses(const std::unordered_set<int32_t> *only) {
+        if (!mOcclusion.world) return;
+        const auto &bodies = mOcclusion.world->getBodies();
+        for (const DoorShadowDoor &d : mDoors) {
+            if (only && !only->count(d.objID)) continue;
+            if (d.bodyIdx >= bodies.size()) continue;
+            const ObjectCollisionBody &b = bodies[d.bodyIdx];
+            mBakedPoseSnap[d.objID] =
+                ShadowCasterPoseOverride{d.bodyIdx, b.worldPos, b.rotation};
+        }
+    }
+
+    std::vector<ShadowCasterPoseOverride> bakedPoseOverrides() const {
+        std::vector<ShadowCasterPoseOverride> ov;
+        ov.reserve(mBakedPoseSnap.size());
+        for (const auto &kv : mBakedPoseSnap) ov.push_back(kv.second);
+        return ov;
+    }
+
+    // Door began (or continues) moving: promote its cone lights. Also
+    // fires the object-cache invalidation spheres during motion — with
+    // events deferred to settle, motion-time invalidation no longer
+    // rides the rebuild.
+    void promoteDoorLights(ShadowMapCache &sc, int32_t objID,
+                           uint32_t bgfxFrame,
+                           std::chrono::steady_clock::time_point now,
+                           std::vector<std::pair<Vector3, float>> &inval) {
+        const DoorShadowDoor *d = nullptr;
+        for (const auto &dd : mDoors)
+            if (dd.objID == objID) { d = &dd; break; }
+        if (!d) return;
+        auto &lastInv = mLastInvalidate[objID];
+        if (std::chrono::duration<float>(now - lastInv).count() >=
+            kInvalidateSec) {
+            lastInv = now;
+            inval.push_back({d->pos, d->sweptRadius + kInvalidateMargin});
+        }
+        auto lw = mDoorWork.find(objID);
+        if (lw == mDoorWork.end()) return;
+        // Unique cone lights of this door, nearest to the leaf first —
+        // when the cap truncates, the lights whose shadows the swing
+        // changes most keep their slots.
+        std::vector<int16_t> lights;
+        for (const auto &pr : lw->second) {
+            if (std::find(lights.begin(), lights.end(), pr.second) ==
+                lights.end())
+                lights.push_back(pr.second);
+        }
+        std::sort(lights.begin(), lights.end(),
+                  [&](int16_t a, int16_t b) {
+                      return glm::length(mWr->staticLights[a].loc - d->pos) <
+                             glm::length(mWr->staticLights[b].loc - d->pos);
+                  });
+        for (int16_t li : lights) {
+            PromotedLight *p = nullptr;
+            for (auto &pp : mPromoted)
+                if (pp.lightIdx == li) { p = &pp; break; }
+            if (p) { p->doors.insert(objID); continue; }
+            const WRStaticLight &L =
+                mWr->staticLights[static_cast<size_t>(li)];
+            // Spot lights: the live term is omni-only (same TODO as the
+            // GPU bake shader) — they keep the settle-event path.
+            if (L.inner != -1.0f) continue;
+            const float reach =
+                static_cast<size_t>(li) < mReach.size()
+                    ? mReach[static_cast<size_t>(li)] : 0.0f;
+            if (reach <= 0.0f) continue;
+            if (mPromoted.size() >= kPromoteCap) {
+                const auto nowLog = std::chrono::steady_clock::now();
+                if (std::chrono::duration<float>(nowLog - mLastPromoteLog)
+                        .count() >= 1.0f) {
+                    mLastPromoteLog = nowLog;
+                    std::fprintf(stderr,
+                        "[DOOR_SHADOW] promotion cap %d full — light %d "
+                        "(door %d) stays baked (lagged) this swing\n",
+                        static_cast<int>(kPromoteCap),
+                        static_cast<int>(li), objID);
+                }
+                continue;
+            }
+            PromotedLight np;
+            np.lightIdx = li;
+            np.frozenId = -3000 - static_cast<int>(li);
+            np.dynId = -2000 - static_cast<int>(li);
+            const auto ov = bakedPoseOverrides();
+            np.slotFrozen = acquireFrozenShadowSlot(
+                sc, *mWr, np.frozenId, L.loc, reach, ov, bgfxFrame);
+            if (np.slotFrozen < 0) {
+                std::fprintf(stderr,
+                    "[DOOR_SHADOW] no S1 slot for frozen reference of "
+                    "light %d — promotion skipped (pool exhausted?)\n",
+                    static_cast<int>(li));
+                continue;
+            }
+            np.doors.insert(objID);
+            std::fprintf(stderr,
+                "[DOOR_SHADOW] promote light %d for door %d "
+                "(frozen slot %d)\n",
+                static_cast<int>(li), objID, np.slotFrozen);
+            mPromoted.push_back(std::move(np));
+        }
+    }
+
+    // Settle event drained: refresh its doors' baked poses; drop those
+    // doors from promotions (they are baked and still); refreeze lights
+    // whose OTHER doors are still moving/pending against the new poses.
+    void settleDrained(ShadowMapCache &sc, uint32_t bgfxFrame,
+                       std::chrono::steady_clock::time_point now) {
+        snapshotBakedPoses(&mEventDoors);
+        for (auto it = mPromoted.begin(); it != mPromoted.end();) {
+            PromotedLight &p = *it;
+            bool refreeze = false;
+            for (auto dit = p.doors.begin(); dit != p.doors.end();) {
+                const int32_t dID = *dit;
+                const bool baked = mEventDoors.count(dID) != 0;
+                const bool pending = mDirtyDoors.count(dID) != 0 ||
+                                     doorMoving(dID, now);
+                if (baked && !pending) {
+                    dit = p.doors.erase(dit);
+                } else {
+                    if (baked) refreeze = true;
+                    ++dit;
+                }
+            }
+            if (p.doors.empty()) {
+                releaseShadowSlot(sc, p.frozenId);
+                releaseShadowSlot(sc, p.dynId);
+                std::fprintf(stderr, "[DOOR_SHADOW] demote light %d\n",
+                             static_cast<int>(p.lightIdx));
+                it = mPromoted.erase(it);
+                continue;
+            }
+            if (refreeze) {
+                const size_t li = static_cast<size_t>(p.lightIdx);
+                const float reach =
+                    li < mReach.size() ? mReach[li] : 0.0f;
+                if (reach > 0.0f) {
+                    const auto ov = bakedPoseOverrides();
+                    p.slotFrozen = acquireFrozenShadowSlot(
+                        sc, *mWr, p.frozenId,
+                        mWr->staticLights[li].loc, reach, ov, bgfxFrame);
+                }
+            }
+            ++it;
+        }
+        mEventDoors.clear();
+    }
+
     static constexpr float kRebuildSec = 0.15f;
+    // Motion is over when no pose change arrives for this long. Door
+    // physics ticks at 12.5 Hz (80 ms gaps between markDirty calls
+    // mid-swing) — 0.3 s cannot false-settle a moving leaf.
+    static constexpr float kSettleSec = 0.30f;
+    // Mirrors the shader's LIVE_LIGHT_CAP minus nothing — the frame
+    // loop merges these with the flashlight and enforces the real cap,
+    // logging any truncation.
+    static constexpr size_t kPromoteCap = 4;
     static constexpr int kPolysPerFrame = 48;
     static constexpr double kFrameMsBudget = 4.0;
     // Object-cache invalidation: door-scale radius, at most once per
@@ -781,6 +1089,15 @@ private:
     std::unordered_set<int32_t> mDirtyDoors;
     std::unordered_set<int32_t> mProcessingDoors;
     std::unordered_map<int32_t, Matrix4> mLastPose;
+    // S4c promotion state.
+    std::vector<PromotedLight> mPromoted;
+    std::vector<PromotedLive> mPromotedLive;
+    std::unordered_map<int32_t,
+                       std::chrono::steady_clock::time_point> mLastMotion;
+    std::unordered_map<int32_t, ShadowCasterPoseOverride> mBakedPoseSnap;
+    std::unordered_set<int32_t> mEventDoors;
+    std::chrono::steady_clock::time_point mLastPromoteLog{};
+    bool mPoseSnapInit = false;
     std::unordered_map<int32_t, std::vector<std::pair<size_t, int16_t>>>
         mDoorWork;
     std::unordered_map<int32_t,

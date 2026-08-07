@@ -31,7 +31,13 @@ uniform vec4 u_liveFalloff;
 // sub-quantisation by construction, so the edge cannot pop)
 uniform vec4 u_liveLightPos[LIVE_LIGHT_CAP];
 // rgb = bright × brightScale × K_i (throw intensity folded),
-// .w = S1 shadow-pool slot (< 0 = unshadowed)
+// .w = S1 shadow-pool slot (< 0 = unshadowed). S4c DIFFERENTIAL lights
+// (a baked light whose door is mid-swing) pack TWO slots:
+// .w = 100 + frozenSlot·16 + currentSlot; the term becomes
+// shadow(current) − shadow(frozen) — negative where the moving leaf now
+// blocks the light, positive where it has swung away, ZERO everywhere
+// the two poses agree. The baked overlay stays untouched during the
+// swing; this term is the (signed) correction on top of it.
 uniform vec4 u_liveLightColor[LIVE_LIGHT_CAP];
 // S1 face atlas geometry: .x = tilesPerRow, .y = faceSize/atlasW,
 // .z = faceSize/atlasH, .w = 1 when the backend's render-target memory is
@@ -105,9 +111,22 @@ vec3 liveLightSum(vec3 worldPos, vec3 camPos)
         if (cosT <= 0.0) continue;
         float halfLam = cosT * 0.5 + 0.5;
         float fall = 1.0 / (d2 + u_liveFalloff.x);
-        float shadow = liveShadowFactor(
-            worldPos, u_liveLightPos[i].xyz, u_liveLightColor[i].w,
-            inversesqrt(max(u_liveLightPos[i].w, 1e-6)));
+        float sw = u_liveLightColor[i].w;
+        float invReach = inversesqrt(max(u_liveLightPos[i].w, 1e-6));
+        float shadow;
+        if (sw >= 99.5) {
+            // Differential (S4c): current-pose minus frozen-pose.
+            float t = sw - 100.0;
+            float sFrozen = floor(t / 16.0);
+            float sCur = t - sFrozen * 16.0;
+            shadow = liveShadowFactor(worldPos, u_liveLightPos[i].xyz,
+                                      sCur, invReach)
+                   - liveShadowFactor(worldPos, u_liveLightPos[i].xyz,
+                                      sFrozen, invReach);
+        } else {
+            shadow = liveShadowFactor(worldPos, u_liveLightPos[i].xyz,
+                                      sw, invReach);
+        }
         sum += u_liveLightColor[i].rgb * (halfLam * fall * shadow);
     }
     return sum;

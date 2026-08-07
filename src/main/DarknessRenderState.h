@@ -339,6 +339,12 @@ struct LiveLight {
     float   reach2 = 0.0f;   // cutoff; sub-quantisation at the edge
     Vector3 colorK{0.0f};
     int     shadowSlot = -1; // S1 pool slot (-1 = unshadowed)
+    // S4c: >= 0 makes this a DIFFERENTIAL light — the shader term is
+    // shadow(shadowSlot) − shadow(shadowSlotFrozen), the signed
+    // correction for a baked light whose door is mid-swing. Differential
+    // lights are already in the object path as static-table lights and
+    // must NOT be re-added to dynamicLights.
+    int     shadowSlotFrozen = -1;
 };
 
 // ── Per-frame uniform-buffer budget ──

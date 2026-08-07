@@ -75,6 +75,10 @@ void main()
     // the scale, so their brightness path matches the overlays they
     // replace (see live_lights.sh).
     light.rgb += liveLightSum(v_worldPos, u_camPosWorld.xyz);
+    // S4c differential lights are SIGNED (a swinging leaf newly
+    // blocking a baked light subtracts) — never let the sum go
+    // below dark.
+    light.rgb = max(light.rgb, vec3_splat(0.0));
     vec4 finalColor = vec4(diffuse.rgb * light.rgb * u_lightmapScale.x, diffuse.a);
 
     // Rough Fresnel specular from the baked dominant direction — must stay
