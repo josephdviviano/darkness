@@ -114,6 +114,7 @@ inline const char *const kConfigHelpLines[] = {
     "    portal_culling: true                  Portal/frustum culling (default: true)",
     "    camera_collision: false               Camera collision with world geometry (default: false)",
     "    step_log: false                       Log stair step diagnostics to stderr (default: false)",
+    "    log_mute: \"ODE\"                       Muted stderr log channels — comma-separated tags. Gated…",
     "    debug_objects: false                  Dump per-object filtering diagnostics to stderr…",
     "    toggle_platforms: false               Auto-activate all moving terrain at startup (default:…",
     "    no_probes: false                      Skip Steam Audio probe baking (default: false)",

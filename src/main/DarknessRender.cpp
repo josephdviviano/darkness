@@ -56,6 +56,7 @@
 #include "LightingSystem.h"
 #include "ObjectPropParser.h"
 #include "BinMeshParser.h"
+#include "../base/logger/LogChannels.h"
 #include "RenderConfig.h"
 // Generated from darknessRender.example.yaml — see tools/gen_config_help.py.
 #include "ConfigHelpText.h"
@@ -3611,6 +3612,24 @@ static void registerConsoleSettings(
         "completely. Lightmapped world geometry only — objects and sky are "
         "unaffected, which is itself informative");
 
+    // Per-subsystem log channels (LogChannels.h): each gated tag gets a
+    // live toggle. true = printing, false = muted.
+    for (const auto &tag : {"ODE", "TWEQ", "TWEQ_MODEL", "PATH_RAW"}) {
+        std::string cmd = "log_";
+        for (const char *c = tag; *c; ++c)
+            cmd.push_back(static_cast<char>(std::tolower(*c)));
+        const std::string tagS = tag;
+        dbgConsole.addBool(cmd,
+            [tagS]() { return Darkness::logTagEnabled(tagS.c_str()); },
+            [tagS](bool v) {
+                Darkness::setLogTagEnabled(tagS.c_str(), v);
+                std::fprintf(stderr, "log channel [%s]: %s\n",
+                             tagS.c_str(), v ? "printing" : "muted");
+            },
+            "Log channel [" + tagS + "]: on = printing, off = muted. "
+            "Startup set comes from dev: log_mute");
+    }
+
     dbgConsole.addBool("live_flashlight",
         [&state]() { return state.liveFlashlight; },
         [&state](bool v) { state.liveFlashlight = v; },
@@ -6464,6 +6483,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Enable stair step diagnostics if developer.step_log is true
+    Darkness::applyLogMuteList(cfg.logMute);
     if (cfg.stepLog && state.physics) {
         state.physics->getPlayerPhysics().setStepLog(true);
         std::fprintf(stderr, "Stair step logging enabled (developer.step_log)\n");

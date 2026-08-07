@@ -842,6 +842,13 @@ struct RenderConfig {
     // the cathedral lights" without a mouse.
     std::string stressFrobObjs;
     bool stepLog          = false;  // stair step diagnostics to stderr ([STEP] prefix)
+    // Muted stderr log channels (comma-separated tag list, e.g.
+    // "ODE,TWEQ"). Gated tags: ODE (awake-body physics dump), TWEQ /
+    // TWEQ_MODEL (tweq activation + model-swap traces), PATH_RAW (audio
+    // pathing solver raw output). Console: log_ode / log_tweq /
+    // log_tweq_model / log_path_raw toggle them live. [FALLBACK] lines
+    // are never muteable.
+    std::string logMute   = "ODE";
     bool togglePlatforms  = false;  // auto-activate all moving terrain at startup
     bool noProbes         = false;  // skip probe baking (no spatial audio)
     bool audioLog         = false;  // enable audio/sound/schema log output
@@ -2144,6 +2151,7 @@ inline bool loadConfigFromYAML(const std::string& path, RenderConfig& cfg) {
             if (dev["portal_culling"])      cfg.portalCulling     = dev["portal_culling"].as<bool>();
             if (dev["camera_collision"])    cfg.cameraCollision   = dev["camera_collision"].as<bool>();
             if (dev["step_log"])            cfg.stepLog           = dev["step_log"].as<bool>();
+            if (dev["log_mute"])            cfg.logMute           = dev["log_mute"].as<std::string>();
             if (dev["debug_objects"])       cfg.debugObjects      = dev["debug_objects"].as<bool>();
             if (dev["toggle_platforms"])    cfg.togglePlatforms   = dev["toggle_platforms"].as<bool>();
             if (dev["no_probes"])           cfg.noProbes          = dev["no_probes"].as<bool>();

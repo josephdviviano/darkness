@@ -59,6 +59,7 @@
 #include "sim/SimCommon.h"
 #include "sim/ObjectPushSystem.h"
 #include "property/TypedProperty.h"
+#include "../../base/logger/LogChannels.h"
 
 namespace Darkness {
 
@@ -902,7 +903,7 @@ private:
 
             // Log awake bodies every 30 frames (~0.5s at 60Hz)
             // Include orientation: local Z axis in world space shows tilt
-            if (mODEFrameCount % 30 == 0) {
+            if (mODEFrameCount % 30 == 0 && logTagEnabled("ODE")) {
                 dMass mass;
                 dBodyGetMass(body, &mass);
                 const dReal *angVel = dBodyGetAngularVel(body);
@@ -952,7 +953,8 @@ private:
             // Sync renderer (ObjectState)
             applyModelMatrix(*mObjectStates, objID, modelMatrix, position, scale);
         }
-        if (awakeCount > 0 && mODEFrameCount % 30 == 0) {
+        if (awakeCount > 0 && mODEFrameCount % 30 == 0 &&
+            logTagEnabled("ODE")) {
             std::fprintf(stderr, "  [ODE] %d bodies awake\n", awakeCount);
         }
     }

@@ -36,6 +36,7 @@
 
 // Steam Audio C API (for iplSimulatorRunPathing, iplSourceAdd, etc.)
 #include <phonon.h>
+#include "../../base/logger/LogChannels.h"
 
 namespace Darkness {
 
@@ -304,7 +305,8 @@ void PathingSimulator::workerMain()
             // main thread cannot mutate during this read). If the list
             // is empty (e.g. AudioService hasn't notified us yet via
             // trackSourceAdded), the log is silently skipped this iter.
-            if (!mTrackedSources.empty()) {
+            if (!mTrackedSources.empty() &&
+                Darkness::logTagEnabled("PATH_RAW")) {
                 const auto now = t1;
                 const auto sinceLast =
                     std::chrono::duration_cast<std::chrono::milliseconds>(

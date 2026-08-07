@@ -613,6 +613,11 @@ developer:
   # Log stair step diagnostics to stderr (default: false)
   # Prints [STEP] messages for debugging stair-step logic
   step_log: false
+  # Muted stderr log channels — comma-separated tags. Gated (runtime-
+  # recurring) tags: ODE, TWEQ, TWEQ_MODEL, PATH_RAW. Toggle live via
+  # console log_ode / log_tweq / log_tweq_model / log_path_raw.
+  # [FALLBACK] lines are never muteable.
+  log_mute: "ODE"
 
   # Dump per-object filtering diagnostics to stderr (default: false)
   debug_objects: false
