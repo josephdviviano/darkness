@@ -101,6 +101,26 @@ bgfx_compile_shaders(
     AS_HEADERS
 )
 
+# S2 lumel-bake pass — GPU twin of the CPU overlay bake
+bgfx_compile_shaders(
+    TYPE VERTEX
+    SHADERS ${SHADER_DIR}/vs_lumel_bake.sc
+    VARYING_DEF ${SHADER_DIR}/varying_lumel.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR LUMEL_BAKE_VS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_lumel_bake.sc
+    VARYING_DEF ${SHADER_DIR}/varying_lumel.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR LUMEL_BAKE_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+
 # Lightmapped shader — uses varying_lightmapped.def.sc
 bgfx_compile_shaders(
     TYPE VERTEX
@@ -392,6 +412,7 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E touch_nocreate
         ${SHADER_DIR}/fs_lightmapped.sc
         ${SHADER_DIR}/fs_lightmapped_bicubic.sc
+        ${SHADER_DIR}/fs_lumel_bake.sc
     COMMAND ${CMAKE_COMMAND} -E touch
         ${CMAKE_CURRENT_BINARY_DIR}/.live_lights_stamp
     DEPENDS ${SHADER_DIR}/live_lights.sh
@@ -445,6 +466,7 @@ add_custom_target(compile_shaders DEPENDS
     ${SMAA_BLEND_VS_OUTPUTS}   ${SMAA_BLEND_FS_OUTPUTS}
     ${SHADOW_DEPTH_VS_OUTPUTS} ${SHADOW_DEPTH_FS_OUTPUTS}
     ${SHADOW_DEBUG_FS_OUTPUTS}
+    ${LUMEL_BAKE_VS_OUTPUTS}   ${LUMEL_BAKE_FS_OUTPUTS}
     ${CMAKE_CURRENT_BINARY_DIR}/.pervertex_constants_stamp
     ${CMAKE_CURRENT_BINARY_DIR}/.corona_shared_stamp
     ${CMAKE_CURRENT_BINARY_DIR}/.smaa_shared_stamp

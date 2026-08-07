@@ -824,6 +824,9 @@ struct RenderConfig {
     // (point, light) face lookups against raycastWorld (0 = don't run).
     int shadowFaceSize        = 256;
     int shadowCrossCheckPairs = 0;
+    // --lumel-bake-test: the S2 GPU engine's acceptance — GPU-bake one
+    // door overlay and diff it against the CPU bake of the same rect.
+    bool lumelBakeTest        = false;
     // DEV-ONLY --stress-frob-obj "a,b": send FrobWorldEnd to exactly these
     // object IDs every ~3 s (5 s warmup) through ScriptManager — the same
     // message FrobSystem::executeFrob sends, so lever→ControlDevice→script
@@ -2669,6 +2672,8 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
         } else if (std::strcmp(argv[i], "--shadow-face-size") == 0 && i + 1 < argc) {
             cfg.shadowFaceSize = std::min(2048, std::max(64,
                 std::atoi(argv[++i])));
+        } else if (std::strcmp(argv[i], "--lumel-bake-test") == 0) {
+            cfg.lumelBakeTest = true;
         } else if (std::strcmp(argv[i], "--shadow-crosscheck") == 0) {
             // Optional pair-count argument: --shadow-crosscheck 50000
             cfg.shadowCrossCheckPairs = 20000;

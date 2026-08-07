@@ -50,6 +50,7 @@
 #include "LightingSystem.h"
 #include "ShadowMapCache.h"
 #include "DoorShadowSystem.h"
+#include "LumelBakeGPU.h"
 #include "SpecularMaterials.h"
 #include "ObjectPropParser.h"
 #include "BinMeshParser.h"
@@ -315,6 +316,8 @@ struct GPUResources {
     // field must track door state; a door-transparent field leaked lobes
     // through closed doors).
     AtlasTexture                rebakedDirAtlas;
+    // S2 GPU lumel-bake engine (LumelBakeGPU.h). Owns its program.
+    LumelBakeGPU                lumelBake;
 
     // ── S4 live lights (live_lights.sh — edit the cap together) ──
     bgfx::UniformHandle u_liveLightCount = BGFX_INVALID_HANDLE;

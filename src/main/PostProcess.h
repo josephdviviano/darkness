@@ -223,6 +223,13 @@ static constexpr bgfx::ViewId kViewShadowFaceFirst = kViewGrain + 1;
 // AFTER every face render, and neither targets the atlas.
 static constexpr bgfx::ViewId kViewShadowDebug =
     kViewShadowFaceFirst + kShadowMaxPoolSlots * 6;
+// S2 lumel-bake pass: GPU overlay re-bakes draw packed rects into a
+// scratch RT here — after the face views (it samples the atlas they
+// write) and before nothing (readback consumes it).
+static constexpr bgfx::ViewId kViewLumelBake = kViewShadowDebug + 1;
+// Blit/readback companion: bgfx executes a view's blits BEFORE its draw
+// items, so copying a lumel-bake result must happen on a LATER view.
+static constexpr bgfx::ViewId kViewLumelRead = kViewLumelBake + 1;
 
 /// Which engine's bloom construction to run.
 ///

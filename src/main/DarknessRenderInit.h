@@ -1723,6 +1723,13 @@ static bool createGPUResources(const Darkness::MissionData &mission,
             bgfx::createEmbeddedShader(s_embeddedShaders, rendererType,
                                        "fs_shadow_debug"),
             true);
+        bgfx::ProgramHandle lumelBakeProg = bgfx::createProgram(
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType,
+                                       "vs_lumel_bake"),
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType,
+                                       "fs_lumel_bake"),
+            true);
+        Darkness::initLumelBakeGPU(gpu.lumelBake, lumelBakeProg);
         const Darkness::BakeFormula reachDefaults; // brightScale = bake default
         Darkness::initShadowMapCache(
             gpu.shadowCache, mission.wrData, cfg.rebakeFalloffAnchor,
@@ -2302,6 +2309,7 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
 {
     // Shadow-map face pool (owns its atlas, caster mesh and programs)
     Darkness::destroyShadowMapCache(gpu.shadowCache);
+    Darkness::destroyLumelBakeGPU(gpu.lumelBake);
 
     // Water surface buffers and flow textures
     if (bgfx::isValid(gpu.waterVBH)) bgfx::destroy(gpu.waterVBH);

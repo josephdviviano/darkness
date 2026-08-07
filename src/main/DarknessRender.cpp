@@ -7916,6 +7916,25 @@ int main(int argc, char *argv[]) {
         gpu.shadowCache.dynCasterBodies.clear();
         for (const auto &d : gpu.doorShadowDoors)
             gpu.shadowCache.dynCasterBodies.push_back(d.bodyIdx);
+
+        // S2 acceptance: GPU lumel bake vs the CPU bake, same rect.
+        if (cfg.lumelBakeTest) {
+            Darkness::BakeFormula testF = gpu.rebakedFormula;
+            // Re-bind the non-owning pointers to the stored tables (the
+            // bake-time vectors died with the load bake).
+            testF.perLightAnchor =
+                gpu.rebakedAnchors.empty() ? nullptr : &gpu.rebakedAnchors;
+            testF.extraOverlayLights =
+                gpu.doorShadowLights.empty() ? nullptr
+                                             : &gpu.doorShadowLights;
+            testF.segmentBlockedFn = &Darkness::DoorSegmentOcclusion::blocked;
+            testF.segmentBlockedCtx = doorShadow.occlusion();
+            Darkness::runLumelBakeSelfTest(
+                gpu.lumelBake, gpu.shadowCache, mission.wrData,
+                mission.renderParams, testF, gpu.rebakedLightCells,
+                gpu.rebakedAnimPolys, gpu.doorShadowLights,
+                gpu.rebakedDensity);
+        }
     }
 
     // ── S1 acceptance: shadow-map vs raycastWorld cross-check ──
