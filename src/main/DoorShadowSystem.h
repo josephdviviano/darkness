@@ -287,7 +287,8 @@ public:
                         static_cast<size_t>(li) < mExtraLights.size() &&
                         mExtraLights[li] &&
                         k < rec.overlays.size()) {
-                        doorOverlayBytes += rec.overlays[k].size();
+                        doorOverlayBytes +=
+                            rec.overlays[k].size() * sizeof(uint16_t);
                         ++doorOverlayCount;
                     }
                 }
@@ -517,7 +518,8 @@ public:
     // path then burns the budget exactly as before.
     std::vector<std::pair<Vector3, float>> update(
         LumelBakeGPU *gpu = nullptr, ShadowMapCache *sc = nullptr,
-        uint32_t bgfxFrame = 0, bool cpuEvents = false) {
+        uint32_t bgfxFrame = 0, bool cpuEvents = false,
+        const std::unordered_set<uint32_t> *visCells = nullptr) {
         std::vector<std::pair<Vector3, float>> rebuiltFor;
         if (!active()) return rebuiltFor;
         const auto now = std::chrono::steady_clock::now();
@@ -590,11 +592,127 @@ public:
                 mPoseSnapInit = true;
                 snapshotBakedPoses(nullptr);
             }
-            for (const auto &lm : mLastMotion)
-                if (std::chrono::duration<float>(now - lm.second).count() <
-                    kSettleSec)
-                    promoteDoorLights(*sc, lm.first, bgfxFrame, now,
-                                      rebuiltFor);
+            // Global promotion budget. Candidates come from every
+            // moving door (intensity-gated); the ranking implements the
+            // demotion rule: when more lights want the realtime path
+            // than kPromoteCap holds, keep those nearest the player's
+            // VISIBLE REGION (min distance from the light to a visible
+            // cell), ties broken by intensity at their door. Incumbents
+            // get a distance bonus so slot churn needs a decisive
+            // winner, not a tie flip.
+            {
+                std::vector<int32_t> movingDoors;
+                for (const auto &lm : mLastMotion)
+                    if (std::chrono::duration<float>(
+                            now - lm.second).count() < kSettleSec)
+                        movingDoors.push_back(lm.first);
+                struct Cand {
+                    int32_t door; int16_t li; float inten; float score;
+                };
+                std::vector<Cand> cands;
+                for (int32_t objID : movingDoors) {
+                    const DoorShadowDoor *d = nullptr;
+                    for (const auto &dd : mDoors)
+                        if (dd.objID == objID) { d = &dd; break; }
+                    if (!d) continue;
+                    auto &lastInv = mLastInvalidate[objID];
+                    if (std::chrono::duration<float>(
+                            now - lastInv).count() >= kInvalidateSec) {
+                        lastInv = now;
+                        rebuiltFor.push_back(
+                            {d->pos, d->sweptRadius + kInvalidateMargin});
+                    }
+                    auto lw = mDoorWork.find(objID);
+                    if (lw == mDoorWork.end()) continue;
+                    for (const auto &pr : lw->second) {
+                        const WRStaticLight &L = mWr->staticLights[
+                            static_cast<size_t>(pr.second)];
+                        if (L.inner != -1.0f) continue;   // spot
+                        const float inten = doorIntensity(pr.second, *d);
+                        if (inten < kPromoteMinIntensity) continue;
+                        Cand *ex = nullptr;
+                        for (auto &cc : cands)
+                            if (cc.li == pr.second) { ex = &cc; break; }
+                        if (ex) {
+                            if (inten > ex->inten) {
+                                ex->inten = inten;
+                                ex->door = objID;
+                            }
+                            continue;
+                        }
+                        float dist = 0.0f;
+                        if (visCells && !visCells->empty()) {
+                            dist = 1e9f;
+                            for (uint32_t ci : *visCells) {
+                                if (ci >= mWr->numCells) continue;
+                                const auto &cell = mWr->cells[ci];
+                                dist = std::min(
+                                    dist,
+                                    glm::length(cell.center - L.loc) -
+                                        cell.radius);
+                            }
+                            dist = std::max(0.0f, dist);
+                        }
+                        bool incumbent = false;
+                        for (const auto &pp : mPromoted)
+                            if (pp.lightIdx == pr.second) {
+                                incumbent = true;
+                                break;
+                            }
+                        cands.push_back({objID, pr.second, inten,
+                                         dist - (incumbent
+                                                     ? kPromoteHysteresis
+                                                     : 0.0f)});
+                    }
+                }
+                std::sort(cands.begin(), cands.end(),
+                          [](const Cand &a, const Cand &b) {
+                              if (a.score != b.score)
+                                  return a.score < b.score;
+                              return a.inten > b.inten;
+                          });
+                if (cands.size() > kPromoteCap) {
+                    const auto nowLog = std::chrono::steady_clock::now();
+                    if (std::chrono::duration<float>(
+                            nowLog - mLastPromoteLog).count() >= 1.0f) {
+                        mLastPromoteLog = nowLog;
+                        std::fprintf(stderr,
+                            "[DOOR_SHADOW] promotion cap %d full — %zu "
+                            "light(s) demoted to the settle path by "
+                            "visible-region distance\n",
+                            static_cast<int>(kPromoteCap),
+                            cands.size() - kPromoteCap);
+                    }
+                    cands.resize(kPromoteCap);
+                }
+                // Demote live-swing promotions that lost their ranking
+                // (settled-door promotions extinguish at drain instead).
+                for (auto it2 = mPromoted.begin();
+                     it2 != mPromoted.end();) {
+                    PromotedLight &p = *it2;
+                    bool moving = false;
+                    for (int32_t dID : p.doors)
+                        if (doorMoving(dID, now)) { moving = true; break; }
+                    bool wanted = false;
+                    for (const auto &cc : cands)
+                        if (cc.li == p.lightIdx) { wanted = true; break; }
+                    if (moving && !wanted &&
+                        cands.size() >= kPromoteCap) {
+                        releaseShadowSlot(*sc, p.frozenId);
+                        releaseShadowSlot(*sc, p.dynId);
+                        std::fprintf(stderr,
+                            "[DOOR_SHADOW] demote light %d (outranked "
+                            "by visible-region distance)\n",
+                            static_cast<int>(p.lightIdx));
+                        it2 = mPromoted.erase(it2);
+                        continue;
+                    }
+                    ++it2;
+                }
+                // Promote the ranked set.
+                for (const auto &cc : cands)
+                    promoteOne(*sc, cc.door, cc.li, bgfxFrame);
+            }
             // Per-frame upkeep: the current-pose transient re-renders
             // exactly when the door pose changed (caster hash); the
             // frozen slot only gets its LRU stamp.
@@ -1328,7 +1446,7 @@ public:
                     gp.w = it.w; gp.h = it.h;
                     gp.recIdx = it.recIdx; gp.li = it.li;
                     gp.maxErr = 0.0f;
-                    gp.stored = stored;
+                    gp.stored = stored8;
                     gp.gpuB.resize(static_cast<size_t>(it.w) * it.h * 3);
                     for (int y = 0; y < it.h; ++y) {
                         const int sy = it.y + y;
@@ -1340,8 +1458,8 @@ public:
                             for (int ch = 0; ch < 3; ++ch) {
                                 const uint8_t g8 = src[x * 4 + ch];
                                 const uint8_t s8 =
-                                    stored[(static_cast<size_t>(y) *
-                                            it.w + x) * 3 + ch];
+                                    stored8[(static_cast<size_t>(y) *
+                                             it.w + x) * 3 + ch];
                                 gp.gpuB[(static_cast<size_t>(y) * it.w +
                                          x) * 3 + ch] = g8;
                                 texErr = std::max(texErr,
@@ -1377,7 +1495,7 @@ public:
                                     gSumB += gp.gpuB[
                                         (static_cast<size_t>(y) * it.w +
                                          x) * 3 + ch2];
-                                    sSumB += stored[
+                                    sSumB += stored8[
                                         (static_cast<size_t>(y) * it.w +
                                          x) * 3 + ch2];
                                 }
@@ -1526,7 +1644,7 @@ private:
                         lumels, stats, nullptr, mask.data(), nullptr,
                         &lightList) &&
             static_cast<int>(lumels.size()) == rec.w * rec.h) {
-            packLumelsRGB8(lumels, rec.overlays[k]);
+            packLumelsHalf3(lumels, rec.overlays[k]);
             mPendingReady.push_back(recIdx);   // atomic settle handoff
             ++mEventCpuRects;
         } else {
@@ -1571,7 +1689,7 @@ private:
         if (!grid.valid || grid.lx != rec.w || grid.ly != rec.h) return;
 
         // Door overlays on this rec (light index + buffer).
-        struct DoorOv { const std::vector<uint8_t> *buf; Vector3 loc; };
+        struct DoorOv { const std::vector<uint16_t> *buf; Vector3 loc; };
         std::vector<DoorOv> doorOvs;
         for (size_t k = 0; k < rec.overlayLightIdx.size(); ++k) {
             const int16_t li = rec.overlayLightIdx[k];
@@ -1686,92 +1804,39 @@ private:
         return ov;
     }
 
-    // Door began (or continues) moving: promote its cone lights. Also
-    // fires the object-cache invalidation spheres during motion — with
-    // events deferred to settle, motion-time invalidation no longer
-    // rides the rebuild.
-    void promoteDoorLights(ShadowMapCache &sc, int32_t objID,
-                           uint32_t bgfxFrame,
-                           std::chrono::steady_clock::time_point now,
-                           std::vector<std::pair<Vector3, float>> &inval) {
-        const DoorShadowDoor *d = nullptr;
-        for (const auto &dd : mDoors)
-            if (dd.objID == objID) { d = &dd; break; }
-        if (!d) return;
-        auto &lastInv = mLastInvalidate[objID];
-        if (std::chrono::duration<float>(now - lastInv).count() >=
-            kInvalidateSec) {
-            lastInv = now;
-            inval.push_back({d->pos, d->sweptRadius + kInvalidateMargin});
-        }
-        auto lw = mDoorWork.find(objID);
-        if (lw == mDoorWork.end()) return;
-        // Unique cone lights of this door, strongest-at-the-door first
-        // (intensity, not distance: a bright lamp two steps away beats
-        // a candle at the hinge) — when the cap truncates, the lights
-        // whose shadows the swing changes most keep their slots. The
-        // intensity gate drops lights whose delta cannot be seen.
-        std::vector<int16_t> lights;
-        for (const auto &pr : lw->second) {
-            if (std::find(lights.begin(), lights.end(), pr.second) !=
-                lights.end())
-                continue;
-            if (doorIntensity(pr.second, *d) < kPromoteMinIntensity)
-                continue;
-            lights.push_back(pr.second);
-        }
-        std::sort(lights.begin(), lights.end(),
-                  [&](int16_t a, int16_t b) {
-                      return doorIntensity(a, *d) > doorIntensity(b, *d);
-                  });
-        for (int16_t li : lights) {
-            PromotedLight *p = nullptr;
-            for (auto &pp : mPromoted)
-                if (pp.lightIdx == li) { p = &pp; break; }
-            if (p) { p->doors.insert(objID); continue; }
-            const WRStaticLight &L =
-                mWr->staticLights[static_cast<size_t>(li)];
-            // Spot lights: the live term is omni-only (same TODO as the
-            // GPU bake shader) — they keep the settle-event path.
-            if (L.inner != -1.0f) continue;
-            const float reach =
-                static_cast<size_t>(li) < mReach.size()
-                    ? mReach[static_cast<size_t>(li)] : 0.0f;
-            if (reach <= 0.0f) continue;
-            if (mPromoted.size() >= kPromoteCap) {
-                const auto nowLog = std::chrono::steady_clock::now();
-                if (std::chrono::duration<float>(nowLog - mLastPromoteLog)
-                        .count() >= 1.0f) {
-                    mLastPromoteLog = nowLog;
-                    std::fprintf(stderr,
-                        "[DOOR_SHADOW] promotion cap %d full — light %d "
-                        "(door %d) stays baked (lagged) this swing\n",
-                        static_cast<int>(kPromoteCap),
-                        static_cast<int>(li), objID);
-                }
-                continue;
-            }
-            PromotedLight np;
-            np.lightIdx = li;
-            np.frozenId = -3000 - static_cast<int>(li);
-            np.dynId = -2000 - static_cast<int>(li);
-            const auto ov = bakedPoseOverrides();
-            np.slotFrozen = acquireFrozenShadowSlot(
-                sc, *mWr, np.frozenId, L.loc, reach, ov, bgfxFrame);
-            if (np.slotFrozen < 0) {
-                std::fprintf(stderr,
-                    "[DOOR_SHADOW] no S1 slot for frozen reference of "
-                    "light %d — promotion skipped (pool exhausted?)\n",
-                    static_cast<int>(li));
-                continue;
-            }
-            np.doors.insert(objID);
+    // Execute one promotion decided by the ranking in update():
+    // acquire the frozen reference, register the light. Idempotent for
+    // already-promoted lights (adds the door to their holder set).
+    void promoteOne(ShadowMapCache &sc, int32_t objID, int16_t li,
+                    uint32_t bgfxFrame) {
+        for (auto &pp : mPromoted)
+            if (pp.lightIdx == li) { pp.doors.insert(objID); return; }
+        const WRStaticLight &L =
+            mWr->staticLights[static_cast<size_t>(li)];
+        const float reach =
+            static_cast<size_t>(li) < mReach.size()
+                ? mReach[static_cast<size_t>(li)] : 0.0f;
+        if (reach <= 0.0f) return;
+        PromotedLight np;
+        np.lightIdx = li;
+        np.frozenId = -3000 - static_cast<int>(li);
+        np.dynId = -2000 - static_cast<int>(li);
+        const auto ov = bakedPoseOverrides();
+        np.slotFrozen = acquireFrozenShadowSlot(
+            sc, *mWr, np.frozenId, L.loc, reach, ov, bgfxFrame);
+        if (np.slotFrozen < 0) {
             std::fprintf(stderr,
-                "[DOOR_SHADOW] promote light %d for door %d "
-                "(frozen slot %d)\n",
-                static_cast<int>(li), objID, np.slotFrozen);
-            mPromoted.push_back(std::move(np));
+                "[DOOR_SHADOW] no S1 slot for frozen reference of "
+                "light %d — promotion skipped (pool exhausted?)\n",
+                static_cast<int>(li));
+            return;
         }
+        np.doors.insert(objID);
+        std::fprintf(stderr,
+            "[DOOR_SHADOW] promote light %d for door %d "
+            "(frozen slot %d)\n",
+            static_cast<int>(li), objID, np.slotFrozen);
+        mPromoted.push_back(std::move(np));
     }
 
     // Settle event drained: refresh its doors' baked poses; drop those
@@ -1827,13 +1892,20 @@ private:
     // kLiveLightCap minus the flashlight's slot; the frame loop merges
     // and enforces the real cap, logging any truncation. Each promotion
     // holds TWO S1 slots (frozen + current) — kShadowMaxPoolSlots is
-    // sized to match.
-    static constexpr size_t kPromoteCap = 15;
+    // sized to match. When more lights want the realtime path than fit,
+    // the ranking in update() demotes by DISTANCE TO THE VISIBLE REGION
+    // (user rule, 2026-08-08).
+    static constexpr size_t kPromoteCap = 31;
     // A light below this stored-space contribution AT THE DOOR cannot
     // produce a visible shadow delta (the delta is bounded by the
     // contribution) — it never earns a slot. Same gate the
     // [DOOR_CENSUS] uses.
     static constexpr float kPromoteMinIntensity = 8.0f / 255.0f;
+    // Incumbent bonus in the visible-region-distance ranking (world
+    // units): a challenger must be this much closer to the visible
+    // region to steal a promoted light's slots — frozen references cost
+    // a render, so ties must not flip.
+    static constexpr float kPromoteHysteresis = 16.0f;
     static constexpr int kPolysPerFrame = 48;
     static constexpr double kFrameMsBudget = 4.0;
     // Object-cache invalidation: door-scale radius, at most once per

@@ -1729,6 +1729,12 @@ static bool createGPUResources(const Darkness::MissionData &mission,
             bgfx::createEmbeddedShader(s_embeddedShaders, rendererType,
                                        "fs_shadow_debug"),
             true);
+        bgfx::ProgramHandle shadowClearProg = bgfx::createProgram(
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType,
+                                       "vs_shadow_clear"),
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType,
+                                       "fs_shadow_clear"),
+            true);
         bgfx::ProgramHandle lumelBakeProg = bgfx::createProgram(
             bgfx::createEmbeddedShader(s_embeddedShaders, rendererType,
                                        "vs_lumel_bake"),
@@ -1741,7 +1747,8 @@ static bool createGPUResources(const Darkness::MissionData &mission,
             gpu.shadowCache, mission.wrData, cfg.rebakeFalloffAnchor,
             cfg.rebakeEmitter, reachDefaults.brightScale,
             cfg.rebakeFalloffPhysical ? cfg.rebakeThrowAlpha : 0.0f,
-            cfg.shadowFaceSize, shadowDepthProg, shadowDebugProg);
+            cfg.shadowFaceSize, shadowDepthProg, shadowDebugProg,
+            shadowClearProg);
     }
 
     // ── Build geometry and create GPU buffers ──

@@ -90,6 +90,26 @@ bgfx_compile_shaders(
     INCLUDE_DIRS ${SHADER_DIR}
     AS_HEADERS
 )
+# Shadow tile clear — quad through the tile remap, far depth (single-view
+# atlas has no per-view clears)
+bgfx_compile_shaders(
+    TYPE VERTEX
+    SHADERS ${SHADER_DIR}/vs_shadow_clear.sc
+    VARYING_DEF ${SHADER_DIR}/varying_shadow.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR SHADOW_CLEAR_VS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_shadow_clear.sc
+    VARYING_DEF ${SHADER_DIR}/varying_shadow.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR SHADOW_CLEAR_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
 # Shadow-face debug HUD (S1) — fragment-only, reuses vs_textured
 bgfx_compile_shaders(
     TYPE FRAGMENT
@@ -465,6 +485,7 @@ add_custom_target(compile_shaders DEPENDS
     ${SMAA_WEIGHTS_VS_OUTPUTS} ${SMAA_WEIGHTS_FS_OUTPUTS}
     ${SMAA_BLEND_VS_OUTPUTS}   ${SMAA_BLEND_FS_OUTPUTS}
     ${SHADOW_DEPTH_VS_OUTPUTS} ${SHADOW_DEPTH_FS_OUTPUTS}
+    ${SHADOW_CLEAR_VS_OUTPUTS} ${SHADOW_CLEAR_FS_OUTPUTS}
     ${SHADOW_DEBUG_FS_OUTPUTS}
     ${LUMEL_BAKE_VS_OUTPUTS}   ${LUMEL_BAKE_FS_OUTPUTS}
     ${CMAKE_CURRENT_BINARY_DIR}/.pervertex_constants_stamp

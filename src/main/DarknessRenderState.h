@@ -329,10 +329,11 @@ struct GPUResources {
 };
 
 // Mirrors LIVE_LIGHT_CAP in shaders/live_lights.sh.
-// Sized with the door-density census (see PostProcess.h at
-// kShadowMaxPoolSlots): 15 door promotions + the flashlight. The shader
-// loop is count-gated, so inactive entries cost one compare each.
-constexpr int kLiveLightCap = 16;
+// 32 = the upper industry-standard shadowed-light budget (rationale at
+// PostProcess.h kShadowMaxPoolSlots, which is sized to match: 2 slots
+// per differential + flashlight). The shader loop is count-gated, so
+// inactive entries cost one compare each.
+constexpr int kLiveLightCap = 32;
 
 // One light promoted out of the baked atlas (or transient, e.g. the
 // flashlight test vehicle). colorK carries bright x brightScale x K_i —

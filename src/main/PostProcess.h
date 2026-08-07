@@ -216,17 +216,21 @@ static constexpr bgfx::ViewId kViewGrain = kViewComposite + 4;
 //
 // kShadowMaxPoolSlots bounds the VIEW ID RESERVATION (and the runtime
 // pool); 6 is kShadowFaceCount (static_asserted in ShadowMapCache.h).
-// 32 slots = 15 concurrent S4c differentials (2 slots each: frozen +
-// current) + the flashlight + margin — sized by the 2026-08-08 density
-// census (visible-delta lights per door: p95 11-26 across all missions)
-// against the bgfx 256-view budget (192 face views land ~241).
-static constexpr int kShadowMaxPoolSlots = 32;
-static constexpr bgfx::ViewId kViewShadowFaceFirst = kViewGrain + 1;
-// One id past the face range: the shadow debug HUD (draws the atlas tiles
+// 66 slots = 32 concurrent S4c differentials (2 slots each: frozen +
+// current) + the flashlight + spare. 32 shadowed live lights is the
+// upper industry-standard tier (Unity HDRP defaults 24 shadowed
+// punctuals; Godot's whole default atlas is 88 low-res tiles; HPL2
+// ships 11 maps). The old per-slot view scheme capped the pool at ~38
+// slots (bgfx 256-view budget); every face now renders into the ONE
+// kViewShadowFaces via per-draw tile remap + scissor, so the pool is
+// bounded by atlas MEMORY alone (66 slots @256² ≈ 100 MB R32F + the
+// same again for depth — shadow_face_size scales it down).
+static constexpr int kShadowMaxPoolSlots = 66;
+static constexpr bgfx::ViewId kViewShadowFaces = kViewGrain + 1;
+// One id past the face view: the shadow debug HUD (draws the atlas tiles
 // to the backbuffer) and the readback blit both live here — both must run
 // AFTER every face render, and neither targets the atlas.
-static constexpr bgfx::ViewId kViewShadowDebug =
-    kViewShadowFaceFirst + kShadowMaxPoolSlots * 6;
+static constexpr bgfx::ViewId kViewShadowDebug = kViewShadowFaces + 1;
 // S2 lumel-bake pass: GPU overlay re-bakes draw packed rects into a
 // scratch RT here — after the face views (it samples the atlas they
 // write) and before nothing (readback consumes it).

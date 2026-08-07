@@ -50,7 +50,7 @@
 #include "LightmapBake.h"   // physicalReachRadius, bakeRand01, kSubQuantThreshold
 #include "RayCaster.h"      // the CPU oracle for the acceptance cross-check
 #include "CellGeometry.h"   // findCameraCell — "is this light inside the world"
-#include "PostProcess.h"    // kViewShadowFaceFirst / kViewShadowDebug ownership
+#include "PostProcess.h"    // kViewShadowFaces / kViewShadowDebug ownership
 #include "../services/physics/ObjectCollisionGeometry.h"  // S4b dynamic casters
 
 #include <bgfx/bgfx.h>
@@ -119,11 +119,19 @@ struct ShadowMapCache {
     bgfx::FrameBufferHandle fb           = BGFX_INVALID_HANDLE;
     bgfx::ProgramHandle     depthProgram = BGFX_INVALID_HANDLE; // owned
     bgfx::ProgramHandle     debugProgram = BGFX_INVALID_HANDLE; // owned (HUD)
+    bgfx::ProgramHandle     clearProgram = BGFX_INVALID_HANDLE; // owned (tile clear)
     bgfx::UniformHandle     u_shadowLightPos = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle     u_shadowFaceMtx  = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle     s_shadowAtlas    = BGFX_INVALID_HANDLE;
     bgfx::VertexBufferHandle casterVbh  = BGFX_INVALID_HANDLE;
     bgfx::IndexBufferHandle  casterIbh  = BGFX_INVALID_HANDLE;
     uint32_t                 casterIndexCount = 0;
+    bgfx::VertexBufferHandle clearQuadVbh = BGFX_INVALID_HANDLE;
+    // Per-cell index ranges into casterIbh (first index, count) — the
+    // mesh is built cell-contiguous precisely so face renders can draw
+    // only the cells a face can see instead of the whole mission (at 32
+    // moving lights the full-mesh draw was ~6M tris/frame).
+    std::vector<std::pair<uint32_t, uint32_t>> cellIndexRange;
 
     // ── Per-light derived state (index-parallel with wr.staticLights) ──
     // Reach via physicalReachRadius with the SAME anchor/emitter parameters
@@ -169,20 +177,17 @@ struct ShadowMapCache {
     bool valid() const { return bgfx::isValid(fb); }
 };
 
-// Palette index for the face clear colour. Cleared tiles read 1.0 =
-// "no occluder within reach" — which is also the correct stored value for
-// a face whose whole frustum was culled. bgfx's default integer view clear
-// cannot express 1.0f in R32F, hence the palette.
-constexpr uint8_t kShadowClearPalette = 15;
-
 // ── Caster mesh ─────────────────────────────────────────────────────────────
 // Every solid polygon of every cell, fan-triangulated, positions only.
 // Includes sky (249) and flat/null-textured polygons — see the header
 // comment for why this must NOT reuse the render mesh.
-inline void buildShadowCasterMesh(const WRParsedData &wr,
-                                  std::vector<ShadowCasterVertex> &verts,
-                                  std::vector<uint32_t> &indices) {
+inline void buildShadowCasterMesh(
+    const WRParsedData &wr, std::vector<ShadowCasterVertex> &verts,
+    std::vector<uint32_t> &indices,
+    std::vector<std::pair<uint32_t, uint32_t>> *cellRanges = nullptr) {
+    if (cellRanges) cellRanges->assign(wr.numCells, {0u, 0u});
     for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+        const uint32_t cellFirst = static_cast<uint32_t>(indices.size());
         const auto &cell = wr.cells[ci];
         const int numSolid = cell.numPolygons - cell.numPortals;
         for (int pi = 0; pi < numSolid; ++pi) {
@@ -204,6 +209,10 @@ inline void buildShadowCasterMesh(const WRParsedData &wr,
                 indices.push_back(base + k + 1);
             }
         }
+        if (cellRanges)
+            (*cellRanges)[ci] = {
+                cellFirst,
+                static_cast<uint32_t>(indices.size()) - cellFirst};
     }
 }
 
@@ -218,7 +227,9 @@ inline void initShadowMapCache(ShadowMapCache &c, const WRParsedData &wr,
                                float anchor, float emitterA, float brightScale,
                                float throwAlpha, int faceSize,
                                bgfx::ProgramHandle depthProgram,
-                               bgfx::ProgramHandle debugProgram) {
+                               bgfx::ProgramHandle debugProgram,
+                               bgfx::ProgramHandle clearProgram =
+                                   BGFX_INVALID_HANDLE) {
     c.faceSize  = std::max(64, faceSize);
     c.slotCount = kShadowMaxPoolSlots;
 
@@ -267,6 +278,7 @@ inline void initShadowMapCache(ShadowMapCache &c, const WRParsedData &wr,
         // uniform even on the disabled path.
         c.depthProgram = depthProgram;
         c.debugProgram = debugProgram;
+        c.clearProgram = clearProgram;
         return;
     }
 
@@ -286,12 +298,13 @@ inline void initShadowMapCache(ShadowMapCache &c, const WRParsedData &wr,
     const bgfx::TextureHandle att[2] = {c.atlasTex, c.depthTex};
     c.fb = bgfx::createFrameBuffer(2, att, false);
 
-    bgfx::setPaletteColor(kShadowClearPalette, 1.0f, 1.0f, 1.0f, 1.0f);
-
     c.depthProgram = depthProgram;
     c.debugProgram = debugProgram;
+    c.clearProgram = clearProgram;
     c.u_shadowLightPos = bgfx::createUniform("u_shadowLightPos",
                                              bgfx::UniformType::Vec4);
+    c.u_shadowFaceMtx = bgfx::createUniform("u_shadowFaceMtx",
+                                            bgfx::UniformType::Mat4);
     c.s_shadowAtlas = bgfx::createUniform("s_texColor",
                                           bgfx::UniformType::Sampler);
 
@@ -299,7 +312,7 @@ inline void initShadowMapCache(ShadowMapCache &c, const WRParsedData &wr,
     ShadowCasterVertex::init();
     std::vector<ShadowCasterVertex> verts;
     std::vector<uint32_t> indices;
-    buildShadowCasterMesh(wr, verts, indices);
+    buildShadowCasterMesh(wr, verts, indices, &c.cellIndexRange);
     if (!indices.empty()) {
         c.casterVbh = bgfx::createVertexBuffer(
             bgfx::copy(verts.data(),
@@ -311,6 +324,16 @@ inline void initShadowMapCache(ShadowMapCache &c, const WRParsedData &wr,
                        static_cast<uint32_t>(indices.size() * sizeof(uint32_t))),
             BGFX_BUFFER_INDEX32);
         c.casterIndexCount = static_cast<uint32_t>(indices.size());
+    }
+
+    // Tile-clear quad: unit NDC quad, placed per draw by the remap in
+    // u_shadowFaceMtx (see vs_shadow_clear).
+    {
+        const ShadowCasterVertex q[6] = {
+            {-1.0f, -1.0f, 0.0f}, {1.0f, -1.0f, 0.0f}, {1.0f, 1.0f, 0.0f},
+            {-1.0f, -1.0f, 0.0f}, {1.0f, 1.0f, 0.0f}, {-1.0f, 1.0f, 0.0f}};
+        c.clearQuadVbh = bgfx::createVertexBuffer(
+            bgfx::copy(q, sizeof(q)), ShadowCasterVertex::layout);
     }
 
     c.slots.assign(c.slotCount, ShadowSlot{});
@@ -330,6 +353,18 @@ inline void destroyShadowMapCache(ShadowMapCache &c) {
     for (auto &h : c.dynBoxVbh)
         if (bgfx::isValid(h)) { bgfx::destroy(h); h = BGFX_INVALID_HANDLE; }
     c.dynBoxVbh.clear();
+    if (bgfx::isValid(c.clearProgram)) {
+        bgfx::destroy(c.clearProgram);
+        c.clearProgram = BGFX_INVALID_HANDLE;
+    }
+    if (bgfx::isValid(c.clearQuadVbh)) {
+        bgfx::destroy(c.clearQuadVbh);
+        c.clearQuadVbh = BGFX_INVALID_HANDLE;
+    }
+    if (bgfx::isValid(c.u_shadowFaceMtx)) {
+        bgfx::destroy(c.u_shadowFaceMtx);
+        c.u_shadowFaceMtx = BGFX_INVALID_HANDLE;
+    }
     auto kill = [](auto &h) {
         if (bgfx::isValid(h)) { bgfx::destroy(h); h.idx = bgfx::kInvalidHandle; }
     };
@@ -409,12 +444,13 @@ inline void renderShadowFacesAt(ShadowMapCache &c, const WRParsedData &wr,
     const float farZ = std::max(reach, c.nearZ * 2.0f);
     const bool homoDepth = bgfx::getCaps()->homogeneousDepth;
 
-    // Candidate cells once per light; per-face frustum test below.
-    std::vector<const WRParsedCell *> nearCells;
+    // Candidate cells once per light (ascending index — the range merge
+    // below depends on it); per-face frustum test at draw time.
+    std::vector<uint32_t> nearCells;
     for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
         const WRParsedCell &cell = wr.cells[ci];
         if (glm::length(cell.center - lightPos) - cell.radius <= reach)
-            nearCells.push_back(&cell);
+            nearCells.push_back(ci);
     }
 
     // S4b: dynamic casters (door leaves) within reach, drawn as transient
@@ -499,22 +535,77 @@ inline void renderShadowFacesAt(ShadowMapCache &c, const WRParsedData &wr,
         }
     }
 
+    // ── The single shadow view ──
+    // Every face of every slot renders here (the per-slot view scheme hit
+    // bgfx's 256-view budget at 15 differentials). Viewport = the whole
+    // atlas; each draw places its tile via a clip-space remap composed
+    // into u_shadowFaceMtx plus a matching scissor. Sequential mode:
+    // the clear quad MUST precede its tile's geometry.
+    const bgfx::ViewId vid = kViewShadowFaces;
+    bgfx::setViewFrameBuffer(vid, c.fb);
+    bgfx::setViewRect(vid, 0, 0, static_cast<uint16_t>(c.atlasW),
+                      static_cast<uint16_t>(c.atlasH));
+    bgfx::setViewClear(vid, BGFX_CLEAR_NONE);
+    bgfx::setViewMode(vid, bgfx::ViewMode::Sequential);
+
+    const float lp[4] = {lightPos.x, lightPos.y, lightPos.z,
+                         reach > 0.0f ? 1.0f / reach : 0.0f};
+
     for (int face = 0; face < kShadowFaceCount; ++face) {
-        const bgfx::ViewId vid = static_cast<bgfx::ViewId>(
-            kViewShadowFaceFirst + slot * kShadowFaceCount + face);
         int ox = 0, oy = 0;
         shadowAtlasTileOrigin(slot, face, c.tilesPerRow, c.faceSize, ox, oy);
 
-        bgfx::setViewFrameBuffer(vid, c.fb);
-        bgfx::setViewRect(vid, static_cast<uint16_t>(ox),
-                          static_cast<uint16_t>(oy),
-                          static_cast<uint16_t>(c.faceSize),
-                          static_cast<uint16_t>(c.faceSize));
-        bgfx::setViewClear(vid, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 1.0f, 0,
-                           kShadowClearPalette, kShadowClearPalette,
-                           kShadowClearPalette, kShadowClearPalette,
-                           kShadowClearPalette, kShadowClearPalette,
-                           kShadowClearPalette, kShadowClearPalette);
+        // Clip-space tile placement: tile-local NDC → this tile's patch
+        // of the full-atlas viewport (top-left origin, +y up in NDC —
+        // the same mapping setViewRect used to provide).
+        Matrix4 remap(1.0f);
+        remap[0][0] = static_cast<float>(c.faceSize) / c.atlasW;
+        remap[1][1] = static_cast<float>(c.faceSize) / c.atlasH;
+        remap[3][0] =
+            (2.0f * ox + c.faceSize) / static_cast<float>(c.atlasW) - 1.0f;
+        remap[3][1] =
+            1.0f - (2.0f * oy + c.faceSize) / static_cast<float>(c.atlasH);
+
+        // Tile clear: quad through the remap alone at far depth
+        // (per-view clears cannot scope to a tile). Runs for CULLED
+        // faces too — their tiles must read 1.0, not a previous
+        // occupant's distances.
+        bgfx::setScissor(static_cast<uint16_t>(ox),
+                         static_cast<uint16_t>(oy),
+                         static_cast<uint16_t>(c.faceSize),
+                         static_cast<uint16_t>(c.faceSize));
+        bgfx::setUniform(c.u_shadowFaceMtx, glm::value_ptr(remap));
+        bgfx::setVertexBuffer(0, c.clearQuadVbh);
+        bgfx::setState(BGFX_STATE_WRITE_R | BGFX_STATE_WRITE_Z |
+                       BGFX_STATE_DEPTH_TEST_ALWAYS);
+        bgfx::submit(vid, c.clearProgram);
+
+        // Per-face visible cells → merged index ranges. Gap-tolerant
+        // merge bounds the draw count; if the face still needs too many
+        // ranges, one full-mesh draw is never WORSE than the old path.
+        std::vector<std::pair<uint32_t, uint32_t>> ranges;
+        for (uint32_t ci : nearCells) {
+            const WRParsedCell &cell = wr.cells[ci];
+            if (!shadowFaceSeesSphere(lightPos, face, cell.center,
+                                      cell.radius, reach))
+                continue;
+            if (ci >= c.cellIndexRange.size()) continue;
+            const auto &r = c.cellIndexRange[ci];
+            if (r.second == 0) continue;
+            if (!ranges.empty() &&
+                r.first - (ranges.back().first + ranges.back().second) <=
+                    4096)
+                ranges.back().second =
+                    r.first + r.second - ranges.back().first;
+            else
+                ranges.push_back(r);
+        }
+        if (ranges.empty() || c.casterIndexCount == 0) {
+            ++c.facesCulled;
+            continue;   // tile stays cleared = 1.0
+        }
+        if (ranges.size() > 24)
+            ranges.assign(1, {0u, c.casterIndexCount});
 
         const Matrix4 view = shadowFaceView(lightPos, face);
         // The backend's clip convention decides the projection variant —
@@ -523,37 +614,32 @@ inline void renderShadowFacesAt(ShadowMapCache &c, const WRParsedData &wr,
         // both; only clip/ordering z differs.
         const Matrix4 proj = homoDepth ? shadowFaceProj(c.nearZ, farZ)
                                        : shadowFaceProjZO(c.nearZ, farZ);
-        bgfx::setViewTransform(vid, glm::value_ptr(view), glm::value_ptr(proj));
+        const Matrix4 faceMtx = remap * proj * view;
 
-        bool anyGeometry = false;
-        for (const WRParsedCell *cell : nearCells) {
-            if (shadowFaceSeesSphere(lightPos, face, cell->center,
-                                     cell->radius, reach)) {
-                anyGeometry = true;
-                break;
-            }
+        for (const auto &r : ranges) {
+            bgfx::setScissor(static_cast<uint16_t>(ox),
+                             static_cast<uint16_t>(oy),
+                             static_cast<uint16_t>(c.faceSize),
+                             static_cast<uint16_t>(c.faceSize));
+            bgfx::setUniform(c.u_shadowFaceMtx, glm::value_ptr(faceMtx));
+            bgfx::setUniform(c.u_shadowLightPos, lp);
+            bgfx::setVertexBuffer(0, c.casterVbh);
+            bgfx::setIndexBuffer(c.casterIbh, r.first, r.second);
+            // Two-sided: the raycaster stops at solid polygons regardless
+            // of approach side, so the caster mesh must too. Depth test
+            // resolves the closest surface; R carries linear distance.
+            bgfx::setState(BGFX_STATE_WRITE_R | BGFX_STATE_WRITE_Z |
+                           BGFX_STATE_DEPTH_TEST_LESS);
+            bgfx::submit(vid, c.depthProgram);
         }
-        if (!anyGeometry || c.casterIndexCount == 0) {
-            ++c.facesCulled;
-            bgfx::touch(vid);   // clear still runs — tile reads 1.0
-            continue;
-        }
 
-        const float lp[4] = {lightPos.x, lightPos.y, lightPos.z,
-                             reach > 0.0f ? 1.0f / reach : 0.0f};
-        bgfx::setUniform(c.u_shadowLightPos, lp);
-        bgfx::setVertexBuffer(0, c.casterVbh);
-        bgfx::setIndexBuffer(c.casterIbh, 0, c.casterIndexCount);
-        // Two-sided: the raycaster stops at solid polygons regardless of
-        // approach side, so the caster mesh must too. Depth test resolves
-        // the closest surface; the R channel carries the linear distance.
-        bgfx::setState(BGFX_STATE_WRITE_R | BGFX_STATE_WRITE_Z |
-                       BGFX_STATE_DEPTH_TEST_LESS);
-        bgfx::submit(vid, c.depthProgram);
-
-        // Dynamic casters: the ring-buffered box soup built above, same
-        // program and state.
+        // Dynamic casters: the ring-buffered box soup built above.
         if (dynBoxCount > 0 && bgfx::isValid(dynVbh)) {
+            bgfx::setScissor(static_cast<uint16_t>(ox),
+                             static_cast<uint16_t>(oy),
+                             static_cast<uint16_t>(c.faceSize),
+                             static_cast<uint16_t>(c.faceSize));
+            bgfx::setUniform(c.u_shadowFaceMtx, glm::value_ptr(faceMtx));
             bgfx::setUniform(c.u_shadowLightPos, lp);
             bgfx::setVertexBuffer(0, dynVbh, 0, dynBoxCount);
             bgfx::setState(BGFX_STATE_WRITE_R | BGFX_STATE_WRITE_Z |

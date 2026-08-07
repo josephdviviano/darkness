@@ -8819,7 +8819,7 @@ int main(int argc, char *argv[]) {
             {
                 const auto doorInvalidations = doorShadow.update(
                     &gpu.lumelBake, &gpu.shadowCache, state.bgfxFrame,
-                    cfg.rebakeCpuEvents);
+                    cfg.rebakeCpuEvents, &state.lastVisibleCells);
                 for (const auto &inv : doorInvalidations)
                     state.objectIlluminator.invalidateNear(inv.first,
                                                            inv.second);
