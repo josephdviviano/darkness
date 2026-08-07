@@ -2978,6 +2978,10 @@ static void renderDebugOverlay(
 // Final alpha = (1.0 - material.trans) * object.renderAlpha
 // where material.trans is from .bin mat_extra (0=opaque, 0.3=glass)
 // and object.renderAlpha is from P$RenderAlp property (1.0=opaque)
+// [VIS_CULL] counters for the object pass (drawn vs portal-culled per
+// census window; both passes count, so numbers are ~2x object count).
+static uint64_t sObjDrawn = 0, sObjPortalCulled = 0;
+
 static void renderObjects(
     const Darkness::FrameContext &fc,
     const Darkness::GPUResources &gpu,
@@ -2985,6 +2989,18 @@ static void renderObjects(
     const Darkness::RuntimeState &state)
 {
     if (!state.showObjects) return;
+    if (Darkness::logTagEnabled("VIS_CULL")) {
+        static uint32_t sCalls = 0;
+        if (++sCalls % 300 == 0 && (sObjDrawn + sObjPortalCulled)) {
+            std::fprintf(stderr,
+                "[VIS_CULL] objects: %.0f drawn vs %.0f portal-culled "
+                "per frame (%.0f%% culled)\n",
+                sObjDrawn / 300.0, sObjPortalCulled / 300.0,
+                100.0 * sObjPortalCulled /
+                    double(sObjDrawn + sObjPortalCulled));
+            sObjDrawn = sObjPortalCulled = 0;
+        }
+    }
 
     // Alpha-blend state for translucent submeshes
     uint64_t translucentState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
@@ -3009,41 +3025,64 @@ static void renderObjects(
         const auto &obj = mission.objData.objects[oi];
         if (!obj.hasPosition) return;
 
-        // Portal culling: skip objects in non-visible cells, unless the
-        // object's world-space AABB still intersects the rendering frustum.
-        // This prevents large objects from popping when their center-of-mass
-        // cell passes behind the camera but part of the mesh is still visible.
+        // PORTAL culling, view-complete: an object draws iff its bound
+        // touches a visible cell. The old fallback tested the FRUSTUM
+        // when the object's cell was invisible — which meant everything
+        // behind a wall in front of the camera still drew (and paid its
+        // per-object lighting): objects were frustum-culled, not portal
+        // culled. Conservative in the safe direction throughout: cell
+        // bounding SPHERES and the model's bounding sphere, so we can
+        // over-draw but never vanish something visible.
+        //
+        // objCellIDs holds the LOAD-time cell; a moved object (AI, a
+        // carried crate) skips the cell fast-path and takes the sweep,
+        // which answers from its CURRENT position — a stale cell can
+        // therefore only cause an extra draw, never a wrong cull.
         if (state.portalCulling && oi < mission.objCellIDs.size()) {
-            int32_t objCell = mission.objCellIDs[oi];
-            if (objCell >= 0 && fc.visibleCells.count(static_cast<uint32_t>(objCell)) == 0) {
-                // Cell not visible — check if model AABB intersects frustum
+            float cx = obj.x, cy = obj.y, cz = obj.z;
+            float csx = obj.scaleX, csy = obj.scaleY, csz = obj.scaleZ;
+            const Darkness::ObjectState *cullState = state.objectStates
+                ? state.objectStates->tryGet(obj.objID) : nullptr;
+            bool moved = false;
+            if (cullState) {
+                cx = cullState->position.x; cy = cullState->position.y;
+                cz = cullState->position.z;
+                csx = cullState->scale.x; csy = cullState->scale.y;
+                csz = cullState->scale.z;
+                moved = std::abs(cx - obj.x) + std::abs(cy - obj.y) +
+                        std::abs(cz - obj.z) > 0.5f;
+            }
+            const int32_t objCell = mission.objCellIDs[oi];
+            const bool cellVisible =
+                !moved && objCell >= 0 &&
+                fc.visibleCells.count(static_cast<uint32_t>(objCell)) != 0;
+            if (!cellVisible) {
                 std::string mname(obj.modelName);
                 auto mit = mission.parsedModels.find(mname);
                 if (mit == mission.parsedModels.end()) return;
                 const auto &mesh = mit->second;
-
-                // Compute conservative world-space AABB from model bbox + position.
-                // Ignores rotation for speed — the resulting box is larger than
-                // the true oriented bbox, so we never cull something visible.
-                // Use runtime position if available (moving doors/platforms).
-                float cx = obj.x, cy = obj.y, cz = obj.z;
-                float csx = obj.scaleX, csy = obj.scaleY, csz = obj.scaleZ;
-                const Darkness::ObjectState *cullState = state.objectStates
-                    ? state.objectStates->tryGet(obj.objID) : nullptr;
-                if (cullState) {
-                    cx = cullState->position.x; cy = cullState->position.y; cz = cullState->position.z;
-                    csx = cullState->scale.x; csy = cullState->scale.y; csz = cullState->scale.z;
+                const float hx =
+                    (mesh.bboxMax[0] - mesh.bboxMin[0]) * 0.5f * csx;
+                const float hy =
+                    (mesh.bboxMax[1] - mesh.bboxMin[1]) * 0.5f * csy;
+                const float hz =
+                    (mesh.bboxMax[2] - mesh.bboxMin[2]) * 0.5f * csz;
+                const float objR = std::sqrt(hx * hx + hy * hy + hz * hz);
+                const Darkness::Vector3 oc(cx, cy, cz);
+                bool touches = false;
+                for (uint32_t ci : fc.visibleCells) {
+                    if (ci >= mission.wrData.numCells) continue;
+                    const auto &cell = mission.wrData.cells[ci];
+                    if (glm::length(cell.center - oc) <=
+                        cell.radius + objR) {
+                        touches = true;
+                        break;
+                    }
                 }
-                float halfX = (mesh.bboxMax[0] - mesh.bboxMin[0]) * 0.5f * csx;
-                float halfY = (mesh.bboxMax[1] - mesh.bboxMin[1]) * 0.5f * csy;
-                float halfZ = (mesh.bboxMax[2] - mesh.bboxMin[2]) * 0.5f * csz;
-                float extent = std::max({halfX, halfY, halfZ});  // sphere-ish bound
-                if (!fc.objFrustum.testAABB(
-                        cx - extent, cy - extent, cz - extent,
-                        cx + extent, cy + extent, cz + extent))
-                    return;
+                if (!touches) { ++sObjPortalCulled; return; }
             }
         }
+        ++sObjDrawn;
 
         // Compute per-object model matrix. If the object has a runtime state
         // override (door opening, platform moving, tweq animating), use that
@@ -8844,13 +8883,38 @@ int main(int argc, char *argv[]) {
                 }
                 state.liveLights.push_back(fl);
             }
+            // Light-vs-visible-set test, shared by every runtime light
+            // path this frame. A light is culled by whether its REACH
+            // touches visible space — never by emitter visibility: the
+            // player sees spill and shadows without seeing the source.
+            // Conservative (cell bounding spheres): over-keeps, never
+            // over-culls.
+            auto lightTouchesVisible = [&](const Darkness::Vector3 &p,
+                                           float r) {
+                for (uint32_t ci : fc.visibleCells) {
+                    if (ci >= mission.wrData.numCells) continue;
+                    const auto &cell = mission.wrData.cells[ci];
+                    if (glm::length(cell.center - p) <= cell.radius + r)
+                        return true;
+                }
+                return false;
+            };
             // S4c: differential door promotions — only while the rebaked
             // atlas is DISPLAYED (the differential corrects rebaked
             // overlays; adding it over the vintage atlas would brighten
-            // lights that atlas never dimmed).
+            // lights that atlas never dimmed). Promotions whose reach
+            // touches no visible cell are skipped: their differential
+            // could only shade pixels nobody can see, and the slots go
+            // to lights that matter (the visible-first priority).
+            size_t liveCulled = 0;
             if (state.useRebakedLightmaps &&
                 !gpu.rebakedAtlasHandles.empty()) {
                 for (const auto &pl : doorShadow.promotedLive()) {
+                    if (!lightTouchesVisible(
+                            pl.pos, std::sqrt(std::max(pl.reach2, 0.0f)))) {
+                        ++liveCulled;
+                        continue;
+                    }
                     if (static_cast<int>(state.liveLights.size()) >=
                         Darkness::kLiveLightCap) {
                         // No silent caps: a truncated promotion means a
@@ -8908,6 +8972,26 @@ int main(int argc, char *argv[]) {
                     state.dynamicLights.add(
                         ll.pos, ll.colorK / 8.07f,
                         std::sqrt(std::max(ll.reach2, 0.0f)));
+                }
+                // Visibility-cull + nearest-first (see prioritize) —
+                // radius-0 lights are unbounded and never culled.
+                const int dynBefore = state.dynamicLights.count();
+                state.dynamicLights.prioritize(
+                    Darkness::Vector3(state.cam.pos[0], state.cam.pos[1],
+                                      state.cam.pos[2]),
+                    lightTouchesVisible);
+                // Periodic culling census ([VIS_CULL] log channel).
+                if (Darkness::logTagEnabled("VIS_CULL")) {
+                    static uint32_t sLastVisLog = 0;
+                    if (state.bgfxFrame - sLastVisLog > 300) {
+                        sLastVisLog = state.bgfxFrame;
+                        std::fprintf(stderr,
+                            "[VIS_CULL] dyn lights %d -> %d "
+                            "(reach-vs-visible), promoted live culled "
+                            "%zu, visible cells %zu\n",
+                            dynBefore, state.dynamicLights.count(),
+                            liveCulled, fc.visibleCells.size());
+                    }
                 }
                 // Report the count once. This producer existed for months
                 // while being entirely unreferenced, and the failure mode

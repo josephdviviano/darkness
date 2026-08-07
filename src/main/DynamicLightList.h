@@ -37,6 +37,8 @@
 #include "DarknessMath.h"
 
 #include <cstdint>
+#include <algorithm>
+#include <cstdio>
 #include <vector>
 
 namespace Darkness {
@@ -63,8 +65,44 @@ public:
     // 1/r distance attenuation applied during the per-object compute.
     // Calls beyond kMaxDynamicLights are silently dropped (avoiding spam).
     void add(const Vector3 &pos, const Vector3 &bright, float radius = 0.0f) {
-        if (static_cast<int>(mLights.size()) >= kMaxDynamicLights) return;
+        if (static_cast<int>(mLights.size()) >= kMaxDynamicLights) {
+            // The comment above always promised a warning; deliver it.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr,
+                    "[FALLBACK] DynamicLightList: cap %d hit — further "
+                    "dynamic lights this frame are DROPPED (prioritize() "
+                    "keeps the nearest if the frame loop runs it)\n",
+                    kMaxDynamicLights);
+            }
+            return;
+        }
         mLights.push_back({ pos, bright, radius });
+    }
+
+    // Visibility-cull + prioritize, run by the frame loop after all
+    // adds and before any consumer: drop lights whose reach sphere
+    // cannot touch VISIBLE space (a light is culled by where its LIGHT
+    // can be seen, never by whether its emitter is on screen — spill
+    // and shadows are visible without the source), then order
+    // nearest-camera-first so caps keep the lights that matter.
+    // radius <= 0 means unbounded (vintage 1/r): never culled.
+    template <typename TouchesVisible>
+    void prioritize(const Vector3 &camPos, TouchesVisible &&touches) {
+        mLights.erase(
+            std::remove_if(mLights.begin(), mLights.end(),
+                           [&](const DynamicLight &l) {
+                               return l.radius > 0.0f &&
+                                      !touches(l.loc, l.radius);
+                           }),
+            mLights.end());
+        std::sort(mLights.begin(), mLights.end(),
+                  [&](const DynamicLight &a, const DynamicLight &b) {
+                      const Vector3 da = a.loc - camPos;
+                      const Vector3 db = b.loc - camPos;
+                      return glm::dot(da, da) < glm::dot(db, db);
+                  });
     }
 
     int  count() const                     { return static_cast<int>(mLights.size()); }
