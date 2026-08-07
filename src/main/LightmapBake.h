@@ -1803,6 +1803,43 @@ struct RebakedAnimPoly {
 // `tints` (optional) carries per-light RGB multipliers — the Planckian
 // colour ramp of the physical flicker (PLAN.FLICKER_PHYSICS.md): a dimming
 // torch REDDENS, not just darkens. The vintage path never passes it.
+// Encode a polygon's accumulated dominant-direction texels into the dir
+// atlas (octa dir + directionality ratio; alpha untouched here — the
+// load-time gather refines openness and runtime re-encodes must not
+// clobber it). Shared by the load bake and the S4 door-event direction
+// re-bake.
+inline void writeDirTexelsToAtlas(const std::vector<DirAccum> &polyDir,
+                                  const LmapEntry &e, AtlasTexture &dirAtlas,
+                                  int density, bool preserveAlpha,
+                                  uint64_t *ratioSumMil = nullptr,
+                                  uint64_t *texels = nullptr) {
+    for (int y = 0; y < e.pixelH; ++y) {
+        for (int x = 0; x < e.pixelW; ++x) {
+            const DirAccum &da =
+                polyDir[static_cast<size_t>(y) * e.pixelW + x];
+            float u = 0.5f, v = 0.5f, ratio = 0.0f;
+            if (da.weight > 1e-6f) {
+                const float mag = glm::length(da.sum);
+                ratio = std::min(1.0f, mag / da.weight);
+                octahedralEncode(
+                    mag > 1e-6f ? da.sum / mag : Vector3(0.0f), u, v);
+            }
+            const size_t px = (static_cast<size_t>(e.pixelY + y)
+                                   * dirAtlas.size + (e.pixelX + x)) * 4;
+            if (px + 3 >= dirAtlas.rgba.size()) continue;
+            dirAtlas.rgba[px + 0] = static_cast<uint8_t>(u * 255.0f);
+            dirAtlas.rgba[px + 1] = static_cast<uint8_t>(v * 255.0f);
+            dirAtlas.rgba[px + 2] = static_cast<uint8_t>(ratio * 255.0f);
+            if (!preserveAlpha) dirAtlas.rgba[px + 3] = 255;
+            if (ratioSumMil)
+                *ratioSumMil += static_cast<uint64_t>(ratio * 1e6f);
+            if (texels) ++(*texels);
+        }
+    }
+    fillEdgePadding(dirAtlas.rgba, dirAtlas.size, e.pixelX, e.pixelY,
+                    e.pixelW, e.pixelH, 2 * density);
+}
+
 inline void blendRebakedLightmap(const RebakedAnimPoly &rec,
                                  const LmapEntry &entry,
                                  const std::unordered_map<int16_t, float> &intensities,
@@ -2222,6 +2259,13 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                     // overlay per door-adjacent candidate not already
                     // recorded via animMap. The blend scales unmapped
                     // lights at intensity 1.0 — geometry-only overlays.
+                    // Door overlays: energy AND direction bake with the
+                    // door occlusion hook — the direction field reflects
+                    // the CURRENT door state, and door events re-bake it
+                    // alongside the energy (a door-transparent direction
+                    // was tried and leaked specular through closed doors:
+                    // light.rgb is TOTAL energy, so ambient fed a lobe
+                    // pointing at the hidden light).
                     for (int16_t xli : extraForPoly) {
                         bool already = false;
                         for (int16_t seen : rec.overlayLightIdx)
@@ -2252,39 +2296,11 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                 // Encode the dominant-direction texels now that base AND
                 // overlays have accumulated. Alpha starts at 255 (fully
                 // open); the gather phase refines it with real openness.
-                if (dirAtlas) {
-                    for (int y = 0; y < e.pixelH; ++y) {
-                        for (int x = 0; x < e.pixelW; ++x) {
-                            const DirAccum &da =
-                                polyDir[static_cast<size_t>(y) * e.pixelW + x];
-                            float u = 0.5f, v = 0.5f, ratio = 0.0f;
-                            if (da.weight > 1e-6f) {
-                                const float mag = glm::length(da.sum);
-                                ratio = std::min(1.0f, mag / da.weight);
-                                octahedralEncode(
-                                    mag > 1e-6f ? da.sum / mag : Vector3(0.0f),
-                                    u, v);
-                            }
-                            const size_t px =
-                                (static_cast<size_t>(e.pixelY + y)
-                                     * dirAtlas->size + (e.pixelX + x)) * 4;
-                            if (px + 3 >= dirAtlas->rgba.size()) continue;
-                            dirAtlas->rgba[px + 0] =
-                                static_cast<uint8_t>(u * 255.0f);
-                            dirAtlas->rgba[px + 1] =
-                                static_cast<uint8_t>(v * 255.0f);
-                            dirAtlas->rgba[px + 2] =
-                                static_cast<uint8_t>(ratio * 255.0f);
-                            dirAtlas->rgba[px + 3] = 255;
-                            partial[t].dirRatioSumMil +=
-                                static_cast<uint64_t>(ratio * 1e6f);
-                            ++partial[t].dirTexels;
-                        }
-                    }
-                    fillEdgePadding(dirAtlas->rgba, dirAtlas->size, e.pixelX,
-                                    e.pixelY, e.pixelW, e.pixelH,
-                                    2 * f.density);
-                }
+                if (dirAtlas)
+                    writeDirTexelsToAtlas(polyDir, e, *dirAtlas, f.density,
+                                          /*preserveAlpha=*/false,
+                                          &partial[t].dirRatioSumMil,
+                                          &partial[t].dirTexels);
             }
         }
     };

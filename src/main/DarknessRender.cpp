@@ -836,12 +836,36 @@ static void renderWorld(
                             lp[i][0] = L.pos.x; lp[i][1] = L.pos.y;
                             lp[i][2] = L.pos.z; lp[i][3] = L.reach2;
                             lc[i][0] = L.colorK.x; lc[i][1] = L.colorK.y;
-                            lc[i][2] = L.colorK.z; lc[i][3] = 0.0f;
+                            lc[i][2] = L.colorK.z;
+                            lc[i][3] = static_cast<float>(L.shadowSlot);
                         }
                         bgfx::setUniform(gpu.u_liveLightPos, lp,
                                          static_cast<uint16_t>(liveN));
                         bgfx::setUniform(gpu.u_liveLightColor, lc,
                                          static_cast<uint16_t>(liveN));
+                        // S1 face atlas geometry for the shadow lookup
+                        // (live_lights.sh liveShadowFactor).
+                        const auto &sc = gpu.shadowCache;
+                        const float info[4] = {
+                            static_cast<float>(sc.tilesPerRow),
+                            sc.atlasW > 0
+                                ? float(sc.faceSize) / float(sc.atlasW)
+                                : 0.0f,
+                            sc.atlasH > 0
+                                ? float(sc.faceSize) / float(sc.atlasH)
+                                : 0.0f,
+                            bgfx::getCaps()->originBottomLeft ? 1.0f
+                                                              : 0.0f };
+                        bgfx::setUniform(gpu.u_liveShadowInfo, info);
+                    }
+                    // Something must always sit on sampler 3; the shader
+                    // only reads it for lights with a slot >= 0.
+                    if (gpu.shadowCache.valid()) {
+                        bgfx::setTexture(3, gpu.s_liveShadowAtlas,
+                                         gpu.shadowCache.atlasTex);
+                    } else if (!gpu.lightmapAtlasHandles.empty()) {
+                        bgfx::setTexture(3, gpu.s_liveShadowAtlas,
+                                         gpu.lightmapAtlasHandles[0]);
                     }
 
                     // Select lightmap program: bilinear (hardware) or bicubic (shader)
@@ -5820,6 +5844,47 @@ static void updateLightmaps(
                 for (size_t recIdx : doorRecs)
                     blendOne(recIdx, /*bypassVisibility=*/true);
 
+            // S4: door-event DIRECTION re-encodes — upload their rects
+            // from the CPU dir atlas so specular tracks door state.
+            if (doorShadow && bgfx::isValid(gpu.rebakedDirHandle) &&
+                !gpu.rebakedDirAtlas.rgba.empty()) {
+                auto &dirDirty = doorShadow->dirDirtyRecs();
+                const int pad = 2 * gpu.rebakedDensity;
+                for (size_t recIdx : dirDirty) {
+                    if (recIdx >= gpu.rebakedAnimPolys.size()) continue;
+                    const auto &rec = gpu.rebakedAnimPolys[recIdx];
+                    if (rec.ci >= gpu.rebakedAtlasSet.entries.size())
+                        continue;
+                    const auto &ce = gpu.rebakedAtlasSet.entries[rec.ci];
+                    if (rec.pi < 0 ||
+                        rec.pi >= static_cast<int32_t>(ce.size()))
+                        continue;
+                    const auto &e = ce[rec.pi];
+                    const auto &da = gpu.rebakedDirAtlas;
+                    const int x0 = std::max(0, e.pixelX - pad);
+                    const int y0 = std::max(0, e.pixelY - pad);
+                    const int x1 = std::min(da.size, e.pixelX + rec.w + pad);
+                    const int y1 = std::min(da.size, e.pixelY + rec.h + pad);
+                    const int w = x1 - x0, h = y1 - y0;
+                    if (w <= 0 || h <= 0) continue;
+                    std::vector<uint8_t> sub(
+                        static_cast<size_t>(w) * h * 4);
+                    for (int y = 0; y < h; ++y)
+                        std::memcpy(&sub[static_cast<size_t>(y) * w * 4],
+                                    &da.rgba[((static_cast<size_t>(y0) + y)
+                                              * da.size + x0) * 4],
+                                    static_cast<size_t>(w) * 4);
+                    const bgfx::Memory *mem = bgfx::copy(
+                        sub.data(), static_cast<uint32_t>(sub.size()));
+                    bgfx::updateTexture2D(gpu.rebakedDirHandle, 0, 0,
+                        static_cast<uint16_t>(x0),
+                        static_cast<uint16_t>(y0),
+                        static_cast<uint16_t>(w),
+                        static_cast<uint16_t>(h), mem);
+                }
+                dirDirty.clear();
+            }
+
             // The density² cost measurement. First event prints immediately
             // (a path that never logs and a path that never runs look the
             // same); afterwards at most one line per second, wall-clock.
@@ -7835,12 +7900,22 @@ int main(int argc, char *argv[]) {
                         state.physics
                             ? state.physics->getObjectCollisionWorld()
                             : nullptr,
-                        &gpu.rebakedAnimPolys);
+                        &gpu.rebakedAnimPolys,
+                        &gpu.rebakedDirAtlas, &gpu.rebakedAtlasSet,
+                        gpu.rebakedDensity);
         // Objects share the same door-occlusion test (physical mode only;
         // the illuminator gates on its own active flag).
         state.objectIlluminator.setDynamicOcclusion(
             &Darkness::DoorSegmentOcclusion::blocked,
             doorShadow.occlusion());
+        // S4b: the same door bodies join the S1 shadow faces as dynamic
+        // casters (and the readback cross-check's CPU term).
+        gpu.shadowCache.dynCasterWorld =
+            state.physics ? state.physics->getObjectCollisionWorld()
+                          : nullptr;
+        gpu.shadowCache.dynCasterBodies.clear();
+        for (const auto &d : gpu.doorShadowDoors)
+            gpu.shadowCache.dynCasterBodies.push_back(d.bodyIdx);
     }
 
     // ── S1 acceptance: shadow-map vs raycastWorld cross-check ──
@@ -8657,9 +8732,17 @@ int main(int argc, char *argv[]) {
             state.liveLights.clear();
             if (state.liveFlashlight) {
                 Darkness::LiveLight fl;
+                // OFFSET from the eye — a light coaxial with the camera
+                // casts almost no VISIBLE shadow (every visible fragment
+                // is visible from the light; the shadowed set is exactly
+                // the hidden set). Held low-right like a carried lantern
+                // so parallax exposes shadow edges.
+                Darkness::Vector3 camR, camU, camF;
+                state.cam.getBasis(camR, camU, camF);
                 fl.pos = Darkness::Vector3(state.cam.pos[0],
                                            state.cam.pos[1],
-                                           state.cam.pos[2]);
+                                           state.cam.pos[2])
+                       + camR * 2.0f - camU * 1.5f;
                 // Warm torch-class light: bright ~2 in table units, K at
                 // the global 8u anchor (matches the bake's brightness
                 // math), reach = its sub-quantisation radius.
@@ -8668,6 +8751,27 @@ int main(int argc, char *argv[]) {
                 const float reach = std::sqrt(
                     2.0f * kG / Darkness::kSubQuantThreshold);
                 fl.reach2 = reach * reach;
+                // S4b: real shadows from the S1 faces. The flashlight
+                // moves every frame, so its six faces re-render every
+                // frame — the live-shadow worst case, and the measurement
+                // of it.
+                fl.shadowSlot = Darkness::ensureDynamicShadowLight(
+                    gpu.shadowCache, mission.wrData, -1001, fl.pos, reach,
+                    state.frameIndex);
+                // One-time state print — "no shadows" must be attributable
+                // to a stage, not a shrug.
+                static bool sLiveShadowLogged = false;
+                if (!sLiveShadowLogged) {
+                    sLiveShadowLogged = true;
+                    std::fprintf(stderr,
+                        "[LIVE_SHADOW] flashlight: slot=%d reach=%.1f "
+                        "atlas=%dx%d tilesPerRow=%d faceSize=%d "
+                        "originBottomLeft=%d\n",
+                        fl.shadowSlot, reach, gpu.shadowCache.atlasW,
+                        gpu.shadowCache.atlasH, gpu.shadowCache.tilesPerRow,
+                        gpu.shadowCache.faceSize,
+                        bgfx::getCaps()->originBottomLeft ? 1 : 0);
+                }
                 state.liveLights.push_back(fl);
             }
 
@@ -8688,6 +8792,14 @@ int main(int argc, char *argv[]) {
                 Darkness::produceSelfLitLights(propSvc.get(), objSvc.get(),
                                                state.objectStates,
                                                state.dynamicLights);
+                // S4: live lights also feed the OBJECT path (doors are
+                // objects — a flashlight that lit walls but not the door
+                // leaf in front of them read as broken). The object path
+                // is vintage 1/r, so hand it plain bright, not colorK.
+                for (const auto &ll : state.liveLights)
+                    state.dynamicLights.add(
+                        ll.pos, ll.colorK / 8.07f,
+                        std::sqrt(std::max(ll.reach2, 0.0f)));
                 // Report the count once. This producer existed for months
                 // while being entirely unreferenced, and the failure mode
                 // was silence — an empty light list looks identical to a

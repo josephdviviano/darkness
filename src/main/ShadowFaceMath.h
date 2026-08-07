@@ -130,18 +130,27 @@ inline bool shadowFaceSeesSphere(const Vector3 &lightPos, int face,
     return true;
 }
 
+// The face's full orthonormal basis — THE reference the S4 GLSL mirror
+// hardcodes as six literal triples (live_lights.sh); the "basis literals"
+// test pins each one so shader and C++ cannot drift silently.
+inline void shadowFaceBasis(int face, Vector3 &fwd, Vector3 &right,
+                            Vector3 &realUp) {
+    fwd = shadowFaceDir(face);
+    const Vector3 up = shadowFaceUp(face);
+    right = glm::normalize(glm::cross(fwd, up));
+    realUp = glm::cross(right, fwd);
+}
+
 // Where `point` lands on `face`, in [0,1]² — the lookup the S4 shader
 // mirrors. Returns false when the point projects outside the face (caller
 // picked the wrong face, or the point sits behind the light plane).
 inline bool shadowFaceUV(const Vector3 &lightPos, int face,
                          const Vector3 &point, float &u, float &v) {
     const Vector3 d = point - lightPos;
-    const Vector3 fwd = shadowFaceDir(face);
+    Vector3 fwd, right, realUp;
+    shadowFaceBasis(face, fwd, right, realUp);
     const float z = glm::dot(d, fwd);
     if (z <= 1e-6f) return false;
-    const Vector3 up = shadowFaceUp(face);
-    const Vector3 right = glm::normalize(glm::cross(fwd, up));
-    const Vector3 realUp = glm::cross(right, fwd);
     // 90° FOV: half-extent at depth z is exactly z.
     const float x = glm::dot(d, right) / z;
     const float y = glm::dot(d, realUp) / z;

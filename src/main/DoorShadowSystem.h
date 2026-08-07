@@ -150,7 +150,10 @@ public:
               std::vector<DoorShadowDoor> doors,
               std::vector<uint8_t> extraLights,
               const ObjectCollisionWorld *ocw,
-              std::vector<RebakedAnimPoly> *animPolys) {
+              std::vector<RebakedAnimPoly> *animPolys,
+              AtlasTexture *dirAtlas = nullptr,
+              const LightmapAtlasSet *atlasSet = nullptr,
+              int density = 1) {
         mWr = wr;
         mRp = rp;
         mFormula = overlayFormula;
@@ -159,6 +162,20 @@ public:
         mDoors = std::move(doors);
         mExtraLights = std::move(extraLights);
         mAnimPolys = animPolys;
+        mDirAtlas = dirAtlas;
+        mAtlasSet = atlasSet;
+        mDensity = density;
+        // Per-light reach cache for the direction pass's candidate
+        // gathering (all lights, not just the event's).
+        mReach.assign(mWr ? mWr->staticLights.size() : 0, 0.0f);
+        if (mWr)
+            for (size_t li = 1; li < mWr->staticLights.size(); ++li)
+                mReach[li] = physicalReachRadius(
+                    mWr->staticLights[li],
+                    li < mAnchors.size() ? mAnchors[li]
+                                         : mFormula.falloffAnchor,
+                    mFormula.emitterRadius, mFormula.brightScale,
+                    /*clampToAuthored=*/mFormula.throwAlpha <= 0.0f);
         // Re-bind the formula's non-owning pointers to OUR storage — the
         // bake-time vectors died with the bake. EVERY pointer field must
         // be re-bound here or the runtime re-bake reads freed memory.
@@ -194,6 +211,29 @@ public:
                 for (int16_t li : (*mAnimPolys)[r].overlayLightIdx)
                     if (li > 0) mLightRecs[li].push_back(r);
         }
+        // Per-rec peaks (max byte of base / each overlay) — the DIRECTION
+        // re-bake gate: re-encoding a poly's direction costs an
+        // all-candidates pass (measured 12x the energy pass: 17.4M rays /
+        // 9.1 s per one-door event ungated), and it only MATTERS where
+        // this light meaningfully shapes the field.
+        mRecBasePeak.clear();
+        mRecOverlayPeak.clear();
+        if (mAnimPolys) {
+            mRecBasePeak.resize(mAnimPolys->size(), 0);
+            mRecOverlayPeak.resize(mAnimPolys->size());
+            for (size_t r = 0; r < mAnimPolys->size(); ++r) {
+                const RebakedAnimPoly &rec = (*mAnimPolys)[r];
+                uint8_t bp = 0;
+                for (uint8_t b : rec.baseCrop) bp = std::max(bp, b);
+                mRecBasePeak[r] = bp;
+                auto &ops = mRecOverlayPeak[r];
+                ops.resize(rec.overlays.size(), 0);
+                for (size_t k = 0; k < rec.overlays.size(); ++k)
+                    for (uint8_t b : rec.overlays[k])
+                        ops[k] = std::max(ops[k], b);
+            }
+        }
+
         // Per-rec poly bounding spheres for the shadow-cone work-list
         // filter: an event re-bakes a (rec, light) pair only if the
         // segment poly->light crosses THE dirty door's swept sphere.
@@ -314,6 +354,10 @@ public:
     // visibility filter bypassed.
     std::vector<size_t> &readyRecs() { return mReadyRecs; }
 
+    // Recs whose DIRECTION texels were re-encoded this frame — the
+    // renderer uploads their rects from the CPU dir atlas.
+    std::vector<size_t> &dirDirtyRecs() { return mDirDirty; }
+
     // The doors currently dirty or being processed — the object-lighting
     // invalidation radius comes from here (DarknessRender.cpp couples it
     // to ObjectIlluminator::invalidateNear).
@@ -389,6 +433,7 @@ public:
             mEventPolysTotal = mWork.size();
             mEventRays = 0;
             mEventMs = 0.0;
+            mEventDirDone.clear();
             // Rebuild census — the line that distinguishes "no events
             // arrive" from "events arrive but select no work" (both look
             // like a dead feature without it). Cadence-limited by the
@@ -406,6 +451,9 @@ public:
         while (budget-- > 0 && mWorkCursor < mWork.size()) {
             const auto &[recIdx, lightIdx] = mWork[mWorkCursor++];
             rebakeOverlay(recIdx, lightIdx);
+            if (dirSignificant(recIdx, lightIdx) &&
+                mEventDirDone.insert(recIdx).second)
+                rebakeDirection(recIdx);
             if (std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count() >
                 kFrameMsBudget)
@@ -465,6 +513,80 @@ private:
         mEventRays += stats.rays;
     }
 
+    // Does this light shape the poly's field enough for its door state to
+    // matter to the DIRECTION texels? Peaks precomputed at init.
+    bool dirSignificant(size_t recIdx, int16_t lightIdx) const {
+        if (recIdx >= mRecOverlayPeak.size() || !mAnimPolys) return false;
+        const RebakedAnimPoly &rec = (*mAnimPolys)[recIdx];
+        for (size_t k = 0; k < rec.overlayLightIdx.size(); ++k) {
+            if (rec.overlayLightIdx[k] != lightIdx) continue;
+            const uint8_t op = k < mRecOverlayPeak[recIdx].size()
+                                   ? mRecOverlayPeak[recIdx][k] : 0;
+            // Visible (>= ~6% full) AND at least half the base's peak.
+            return op >= 16 && op * 2 >= mRecBasePeak[recIdx];
+        }
+        return false;
+    }
+
+    // Re-encode one poly's DIRECTION texels at current door poses: a
+    // dir-only bake over ALL of the poly's candidate lights (the dir
+    // texel is a weighted average across every contributor, so a
+    // single-light pass cannot update it). Mirrors the load composition:
+    // sun included, ambient excluded (directionless), door hook applies
+    // to door-adjacent lights via the formula's extraOverlayLights gate.
+    // Openness alpha is PRESERVED (the gather's, not re-derivable here).
+    void rebakeDirection(size_t recIdx) {
+        if (!mDirAtlas || !mAtlasSet || !mAnimPolys ||
+            recIdx >= mAnimPolys->size())
+            return;
+        const RebakedAnimPoly &rec = (*mAnimPolys)[recIdx];
+        if (rec.ci >= mAtlasSet->entries.size()) return;
+        const auto &cellEntries = mAtlasSet->entries[rec.ci];
+        if (rec.pi < 0 ||
+            rec.pi >= static_cast<int>(cellEntries.size()))
+            return;
+        const LmapEntry &entry = cellEntries[rec.pi];
+
+        // Candidate lights by reach vs the poly's bounding sphere; sun
+        // joins if the cell's own authored list carries slot 0 (the same
+        // rule the load bake applies).
+        std::vector<uint16_t> cand;
+        cand.push_back(0);
+        const glm::vec4 &ps =
+            recIdx < mRecSphere.size() ? mRecSphere[recIdx]
+                                       : glm::vec4(0.0f);
+        const Vector3 pc(ps.x, ps.y, ps.z);
+        {
+            const auto &own = mWr->cells[rec.ci].lightIndices;
+            const int cnt = own.empty() ? 0 : static_cast<int>(own[0]);
+            for (int k = 1; k <= cnt && k < static_cast<int>(own.size());
+                 ++k)
+                if (own[k] == 0) { cand.push_back(0); break; }
+        }
+        for (size_t li = 1; li < mReach.size(); ++li)
+            if (mReach[li] > 0.0f &&
+                glm::length(mWr->staticLights[li].loc - pc) <=
+                    mReach[li] + ps.w)
+                cand.push_back(static_cast<uint16_t>(li));
+        cand[0] = static_cast<uint16_t>(cand.size() - 1);
+
+        BakeFormula dirF = mFormula;
+        dirF.includeSun = true;     // the load dir field includes it
+        BakeStats stats;
+        std::vector<Vector3> lumels;
+        std::vector<DirAccum> polyDir(
+            static_cast<size_t>(rec.w) * rec.h, DirAccum{});
+        if (bakePolygon(*mWr, *mRp, rec.ci, rec.pi, dirF, mLightCells,
+                        lumels, stats, nullptr, nullptr, &polyDir,
+                        &cand) &&
+            static_cast<int>(lumels.size()) == rec.w * rec.h) {
+            writeDirTexelsToAtlas(polyDir, entry, *mDirAtlas, mDensity,
+                                  /*preserveAlpha=*/true);
+            mDirDirty.push_back(recIdx);
+        }
+        mEventRays += stats.rays;
+    }
+
     static constexpr float kRebuildSec = 0.15f;
     static constexpr int kPolysPerFrame = 48;
     static constexpr double kFrameMsBudget = 4.0;
@@ -485,6 +607,14 @@ private:
     std::vector<RebakedAnimPoly> *mAnimPolys = nullptr;
     std::unordered_map<int16_t, std::vector<size_t>> mLightRecs;
     std::vector<glm::vec4> mRecSphere;   // xyz poly center, w radius
+    AtlasTexture *mDirAtlas = nullptr;
+    const LightmapAtlasSet *mAtlasSet = nullptr;
+    int mDensity = 1;
+    std::vector<float> mReach;
+    std::vector<size_t> mDirDirty;
+    std::unordered_set<size_t> mEventDirDone;
+    std::vector<uint8_t> mRecBasePeak;
+    std::vector<std::vector<uint8_t>> mRecOverlayPeak;
 
     std::unordered_set<int32_t> mDirtyDoors;
     std::unordered_set<int32_t> mProcessingDoors;

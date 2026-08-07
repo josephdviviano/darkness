@@ -310,12 +310,19 @@ struct GPUResources {
     std::vector<DoorShadowDoor> doorShadowDoors;
     std::vector<uint8_t>        doorShadowLights;   // per static light
     std::vector<glm::vec4>      doorShadowSpheres;  // xyz center, w radius
+    // CPU copy of the direction atlas — door events re-encode affected
+    // polys' texels here and upload the rects (the specular direction
+    // field must track door state; a door-transparent field leaked lobes
+    // through closed doors).
+    AtlasTexture                rebakedDirAtlas;
 
     // ── S4 live lights (live_lights.sh — edit the cap together) ──
     bgfx::UniformHandle u_liveLightCount = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_liveFalloff    = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_liveLightPos   = BGFX_INVALID_HANDLE; // vec4 x cap
     bgfx::UniformHandle u_liveLightColor = BGFX_INVALID_HANDLE; // vec4 x cap
+    bgfx::UniformHandle u_liveShadowInfo = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle s_liveShadowAtlas = BGFX_INVALID_HANDLE;
 };
 
 // Mirrors LIVE_LIGHT_CAP in shaders/live_lights.sh.
@@ -328,6 +335,7 @@ struct LiveLight {
     Vector3 pos{0.0f};
     float   reach2 = 0.0f;   // cutoff; sub-quantisation at the edge
     Vector3 colorK{0.0f};
+    int     shadowSlot = -1; // S1 pool slot (-1 = unshadowed)
 };
 
 // ── Per-frame uniform-buffer budget ──

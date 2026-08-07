@@ -210,6 +210,26 @@ TEST_CASE("face culling rejects what it can prove away", "[shadow]") {
     }
 }
 
+TEST_CASE("face basis literals match the GLSL mirror", "[shadow]") {
+    // live_lights.sh hardcodes these six triples; if this test moves, the
+    // shader literals must move with it (and vice versa).
+    const Vector3 want[6][3] = {
+        {{ 1, 0, 0}, { 0,-1, 0}, { 0, 0, 1}},   // +X
+        {{-1, 0, 0}, { 0, 1, 0}, { 0, 0, 1}},   // -X
+        {{ 0, 1, 0}, { 1, 0, 0}, { 0, 0, 1}},   // +Y
+        {{ 0,-1, 0}, {-1, 0, 0}, { 0, 0, 1}},   // -Y
+        {{ 0, 0, 1}, {-1, 0, 0}, { 0, 1, 0}},   // +Z
+        {{ 0, 0,-1}, { 1, 0, 0}, { 0, 1, 0}},   // -Z
+    };
+    for (int f = 0; f < kShadowFaceCount; ++f) {
+        Vector3 fwd, right, up;
+        shadowFaceBasis(f, fwd, right, up);
+        REQUIRE(glm::length(fwd - want[f][0]) < 1e-6f);
+        REQUIRE(glm::length(right - want[f][1]) < 1e-6f);
+        REQUIRE(glm::length(up - want[f][2]) < 1e-6f);
+    }
+}
+
 TEST_CASE("atlas tiles are disjoint and inside the atlas", "[shadow]") {
     const int tileSize = 512;
     const int tilesPerRow = 8;                   // 4096 atlas

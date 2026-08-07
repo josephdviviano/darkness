@@ -51,6 +51,7 @@
 #include "RayCaster.h"      // the CPU oracle for the acceptance cross-check
 #include "CellGeometry.h"   // findCameraCell — "is this light inside the world"
 #include "PostProcess.h"    // kViewShadowFaceFirst / kViewShadowDebug ownership
+#include "../services/physics/ObjectCollisionGeometry.h"  // S4b dynamic casters
 
 #include <bgfx/bgfx.h>
 #include <glm/gtc/type_ptr.hpp>
@@ -123,6 +124,13 @@ struct ShadowMapCache {
 
     // ── Pool ──
     std::vector<ShadowSlot> slots;
+
+    // ── S4b dynamic casters (door leaves) ──
+    // Bodies whose OBBs join every face render as transient boxes, and
+    // whose poses feed the validity hash — a light re-renders its faces
+    // when a door inside its reach moves. Set once after the door census.
+    const ObjectCollisionWorld *dynCasterWorld = nullptr;
+    std::vector<uint32_t>       dynCasterBodies;
 
     // ── Stats (cumulative; the startup line and the HUD read these) ──
     uint32_t facesRendered = 0;
@@ -305,6 +313,44 @@ inline void destroyShadowMapCache(ShadowMapCache &c) {
     c.slots.clear();
 }
 
+// Pose hash of the dynamic casters within a light's reach — the
+// `ShadowCastersAreUnchanged` term of the HPL2 validity pattern, finally
+// fed. FNV over body index + world transform floats.
+inline uint64_t shadowDynamicCasterHash(const ShadowMapCache &c,
+                                        const Vector3 &pos, float reach) {
+    if (!c.dynCasterWorld) return 0;
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void *p, size_t n) {
+        const uint8_t *b = static_cast<const uint8_t *>(p);
+        for (size_t i = 0; i < n; ++i)
+            h = (h ^ b[i]) * 1099511628211ull;
+    };
+    const auto &bodies = c.dynCasterWorld->getBodies();
+    for (uint32_t bi : c.dynCasterBodies) {
+        if (bi >= bodies.size()) continue;
+        const ObjectCollisionBody &b = bodies[bi];
+        if (b.removed) continue;
+        const float maxEdge = std::max(
+            {b.edgeLengths.x, b.edgeLengths.y, b.edgeLengths.z});
+        if (glm::length(b.worldPos - pos) - maxEdge > reach) continue;
+        mix(&bi, sizeof(bi));
+        mix(&b.worldPos, sizeof(b.worldPos));
+        mix(&b.rotation, sizeof(b.rotation));
+    }
+    return h;
+}
+
+// Is the segment blocked by a dynamic caster? The CPU cross-check's door
+// term — the same bodies the GPU faces draw, so the two oracles keep
+// answering the same question.
+inline bool shadowDynamicSegmentBlocked(const ShadowMapCache &c,
+                                        const Vector3 &a, const Vector3 &b) {
+    if (!c.dynCasterWorld) return false;
+    for (uint32_t bi : c.dynCasterBodies)
+        if (c.dynCasterWorld->segmentHitsBody(a, b, bi)) return true;
+    return false;
+}
+
 // ── Face rendering ──────────────────────────────────────────────────────────
 
 // Render the six faces of `lightIdx` into `slot`'s tiles. Faces whose 90°
@@ -312,10 +358,11 @@ inline void destroyShadowMapCache(ShadowMapCache &c) {
 // not drawn — their tiles are still CLEARED (to 1.0 = "no occluder"),
 // because a culled face's tile would otherwise keep a previous occupant's
 // distances and lookups into it would read another light's scene.
-inline void renderShadowFaces(ShadowMapCache &c, const WRParsedData &wr,
-                              int lightIdx, int slot, uint32_t frameIndex) {
-    const WRStaticLight &L = wr.staticLights[lightIdx];
-    const float reach = c.lightReach[lightIdx];
+// Core face render for a light at an arbitrary position — static lights
+// and transients (flashlight, S4c door promotions) share it.
+inline void renderShadowFacesAt(ShadowMapCache &c, const WRParsedData &wr,
+                                const Vector3 &lightPos, float reach,
+                                int slot) {
     const float farZ = std::max(reach, c.nearZ * 2.0f);
     const bool homoDepth = bgfx::getCaps()->homogeneousDepth;
 
@@ -323,8 +370,23 @@ inline void renderShadowFaces(ShadowMapCache &c, const WRParsedData &wr,
     std::vector<const WRParsedCell *> nearCells;
     for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
         const WRParsedCell &cell = wr.cells[ci];
-        if (glm::length(cell.center - L.loc) - cell.radius <= reach)
+        if (glm::length(cell.center - lightPos) - cell.radius <= reach)
             nearCells.push_back(&cell);
+    }
+
+    // S4b: dynamic casters (door leaves) within reach, drawn as transient
+    // boxes into every face after the static mesh.
+    std::vector<uint32_t> dynInReach;
+    if (c.dynCasterWorld) {
+        const auto &bodies = c.dynCasterWorld->getBodies();
+        for (uint32_t bi : c.dynCasterBodies) {
+            if (bi >= bodies.size() || bodies[bi].removed) continue;
+            const ObjectCollisionBody &b = bodies[bi];
+            const float maxEdge = std::max(
+                {b.edgeLengths.x, b.edgeLengths.y, b.edgeLengths.z});
+            if (glm::length(b.worldPos - lightPos) - maxEdge <= reach)
+                dynInReach.push_back(bi);
+        }
     }
 
     for (int face = 0; face < kShadowFaceCount; ++face) {
@@ -344,7 +406,7 @@ inline void renderShadowFaces(ShadowMapCache &c, const WRParsedData &wr,
                            kShadowClearPalette, kShadowClearPalette,
                            kShadowClearPalette, kShadowClearPalette);
 
-        const Matrix4 view = shadowFaceView(L.loc, face);
+        const Matrix4 view = shadowFaceView(lightPos, face);
         // The backend's clip convention decides the projection variant —
         // render with the wrong one and the backend clips half the depth
         // range away (see shadowFaceProjZO). The UV math is identical in
@@ -355,8 +417,8 @@ inline void renderShadowFaces(ShadowMapCache &c, const WRParsedData &wr,
 
         bool anyGeometry = false;
         for (const WRParsedCell *cell : nearCells) {
-            if (shadowFaceSeesSphere(L.loc, face, cell->center, cell->radius,
-                                     reach)) {
+            if (shadowFaceSeesSphere(lightPos, face, cell->center,
+                                     cell->radius, reach)) {
                 anyGeometry = true;
                 break;
             }
@@ -367,7 +429,7 @@ inline void renderShadowFaces(ShadowMapCache &c, const WRParsedData &wr,
             continue;
         }
 
-        const float lp[4] = {L.loc.x, L.loc.y, L.loc.z,
+        const float lp[4] = {lightPos.x, lightPos.y, lightPos.z,
                              reach > 0.0f ? 1.0f / reach : 0.0f};
         bgfx::setUniform(c.u_shadowLightPos, lp);
         bgfx::setVertexBuffer(0, c.casterVbh);
@@ -378,15 +440,66 @@ inline void renderShadowFaces(ShadowMapCache &c, const WRParsedData &wr,
         bgfx::setState(BGFX_STATE_WRITE_R | BGFX_STATE_WRITE_Z |
                        BGFX_STATE_DEPTH_TEST_LESS);
         bgfx::submit(vid, c.depthProgram);
+
+        // Dynamic casters: one transient non-indexed triangle soup of the
+        // in-reach door boxes (12 tris each), same program and state.
+        if (!dynInReach.empty()) {
+            const uint32_t vcount =
+                static_cast<uint32_t>(dynInReach.size()) * 36u;
+            if (bgfx::getAvailTransientVertexBuffer(
+                    vcount, ShadowCasterVertex::layout) >= vcount) {
+                bgfx::TransientVertexBuffer tvb;
+                bgfx::allocTransientVertexBuffer(
+                    &tvb, vcount, ShadowCasterVertex::layout);
+                auto *v = reinterpret_cast<ShadowCasterVertex *>(tvb.data);
+                const auto &bodies = c.dynCasterWorld->getBodies();
+                size_t w = 0;
+                for (uint32_t bi : dynInReach) {
+                    const ObjectCollisionBody &b = bodies[bi];
+                    const Vector3 he = b.edgeLengths * 0.5f;
+                    const Vector3 ax = Vector3(b.rotation[0]) * he.x;
+                    const Vector3 ay = Vector3(b.rotation[1]) * he.y;
+                    const Vector3 az = Vector3(b.rotation[2]) * he.z;
+                    Vector3 corner[8];
+                    for (int k = 0; k < 8; ++k)
+                        corner[k] = b.worldPos +
+                            ax * ((k & 1) ? 1.0f : -1.0f) +
+                            ay * ((k & 2) ? 1.0f : -1.0f) +
+                            az * ((k & 4) ? 1.0f : -1.0f);
+                    // 12 triangles over the 6 faces (winding irrelevant —
+                    // the pass renders two-sided).
+                    static const int tri[36] = {
+                        0,1,3, 0,3,2,  4,6,7, 4,7,5,
+                        0,4,5, 0,5,1,  2,3,7, 2,7,6,
+                        0,2,6, 0,6,4,  1,5,7, 1,7,3};
+                    for (int k = 0; k < 36; ++k) {
+                        const Vector3 &p = corner[tri[k]];
+                        v[w++] = {p.x, p.y, p.z};
+                    }
+                }
+                bgfx::setUniform(c.u_shadowLightPos, lp);
+                bgfx::setVertexBuffer(0, &tvb);
+                bgfx::setState(BGFX_STATE_WRITE_R | BGFX_STATE_WRITE_Z |
+                               BGFX_STATE_DEPTH_TEST_LESS);
+                bgfx::submit(vid, c.depthProgram);
+            }
+        }
         ++c.facesRendered;
     }
+}
 
+// Static-light wrapper: bookkeeping + the caster-pose validity hash.
+inline void renderShadowFaces(ShadowMapCache &c, const WRParsedData &wr,
+                              int lightIdx, int slot, uint32_t frameIndex) {
+    const WRStaticLight &L = wr.staticLights[lightIdx];
+    const float reach = c.lightReach[lightIdx];
+    renderShadowFacesAt(c, wr, L.loc, reach, slot);
     ShadowSlot &s = c.slots[slot];
     s.lightIdx = lightIdx;
     s.pos = L.loc;
     s.bright = L.bright;
     s.reach = reach;
-    s.casterHash = 0;      // world-only until S3 feeds moving casters
+    s.casterHash = shadowDynamicCasterHash(c, L.loc, reach);
     s.lastUsed = frameIndex;
     s.rendered = true;
     ++c.lightRenders;
@@ -416,7 +529,8 @@ inline int ensureShadowLight(ShadowMapCache &c, const WRParsedData &wr,
             const bool valid = s.rendered && s.pos == L.loc &&
                                s.bright == L.bright &&
                                s.reach == c.lightReach[lightIdx] &&
-                               s.casterHash == 0;
+                               s.casterHash == shadowDynamicCasterHash(
+                                   c, L.loc, c.lightReach[lightIdx]);
             if (valid) {
                 s.lastUsed = frameIndex;
                 return i;
@@ -430,6 +544,59 @@ inline int ensureShadowLight(ShadowMapCache &c, const WRParsedData &wr,
 
     const int slot = freeSlot >= 0 ? freeSlot : lruSlot;
     renderShadowFaces(c, wr, lightIdx, slot, frameIndex);
+    return slot;
+}
+
+// Transient lights (the flashlight, S4c door promotions when a light
+// must track a moving emitter) — identified by caller-chosen NEGATIVE
+// ids so they can never collide with static-table indices. A moving
+// light re-renders every frame (pos changes); a parked one goes valid
+// like any other slot.
+inline int ensureDynamicShadowLight(ShadowMapCache &c,
+                                    const WRParsedData &wr, int id,
+                                    const Vector3 &pos, float reach,
+                                    uint32_t frameIndex) {
+    if (!c.valid() || id >= 0 || reach <= 0.0f) return -1;
+    int freeSlot = -1, lruSlot = 0;
+    uint32_t lruAge = 0xffffffffu;
+    for (int i = 0; i < c.slotCount; ++i) {
+        ShadowSlot &s = c.slots[i];
+        if (s.lightIdx == id) {
+            const bool valid = s.rendered && s.pos == pos &&
+                               s.reach == reach &&
+                               s.casterHash ==
+                                   shadowDynamicCasterHash(c, pos, reach);
+            if (valid) {
+                s.lastUsed = frameIndex;
+                return i;
+            }
+            renderShadowFacesAt(c, wr, pos, reach, i);
+            s.lightIdx = id;
+            s.pos = pos;
+            s.bright = Vector3(0.0f);
+            s.reach = reach;
+            s.casterHash = shadowDynamicCasterHash(c, pos, reach);
+            s.lastUsed = frameIndex;
+            s.rendered = true;
+            ++c.lightRenders;
+            return i;
+        }
+        if (s.lightIdx < 0 && s.lightIdx != id && freeSlot < 0 &&
+            !s.rendered)
+            freeSlot = i;
+        if (s.lastUsed < lruAge) { lruAge = s.lastUsed; lruSlot = i; }
+    }
+    const int slot = freeSlot >= 0 ? freeSlot : lruSlot;
+    renderShadowFacesAt(c, wr, pos, reach, slot);
+    ShadowSlot &s = c.slots[slot];
+    s.lightIdx = id;
+    s.pos = pos;
+    s.bright = Vector3(0.0f);
+    s.reach = reach;
+    s.casterHash = shadowDynamicCasterHash(c, pos, reach);
+    s.lastUsed = frameIndex;
+    s.rendered = true;
+    ++c.lightRenders;
     return slot;
 }
 
@@ -577,7 +744,11 @@ inline void runShadowCrossCheck(ShadowMapCache &c, const WRParsedData &wr,
             RayHit hit;
             raycastWorld(wr, L.loc, P, hit, nullptr, c.lightCell[li]);
             if (!rayStatusProven(hit.status)) { ++unproven; continue; }
-            const bool occCPU = (hit.status == RayStatus::Hit);
+            // Dynamic casters (door leaves) block the CPU oracle exactly
+            // as they block the GPU faces — the S4b requirement that the
+            // cross-check keep both sides answering the same question.
+            const bool occCPU = (hit.status == RayStatus::Hit) ||
+                                shadowDynamicSegmentBlocked(c, L.loc, P);
 
             const float stored = shadowAtlasSampleCPU(c, atlas, slot, L.loc, P);
             if (stored < 0.0f) { ++outsideFace; continue; }
@@ -648,6 +819,58 @@ inline void runShadowCrossCheck(ShadowMapCache &c, const WRParsedData &wr,
             "pairs): p50 %.3fu  p95 %.3fu  max %.3fu\n",
             occErr.size(), occErr[occErr.size() / 2],
             occErr[occErr.size() * 95 / 100], occErr.back());
+    }
+
+    // ── Dynamic-light leg (S4b) ──
+    // ensureDynamicShadowLight + the atlas content + the CPU lookup that
+    // MIRRORS the shader path, validated the same way: park a transient
+    // light at the first sampled light's position (with the same reach)
+    // and compare. A failure here indicts the dynamic ensure path or the
+    // slot addressing; a pass here with no shadows ON SCREEN indicts the
+    // shader mirror or its uniforms.
+    if (!sample.empty()) {
+        const int li = sample[0];
+        const Vector3 dpos = wr.staticLights[li].loc;
+        const float dreach = c.lightReach[li];
+        const int dslot = ensureDynamicShadowLight(c, wr, -9001, dpos,
+                                                   dreach, 999999u);
+        if (dslot < 0) {
+            std::fprintf(stderr,
+                "[SHADOW_XCHECK] dynamic leg: ensureDynamicShadowLight "
+                "FAILED (slot -1)\n");
+        } else if (readShadowAtlasBlocking(c, atlas)) {
+            long dagree = 0, dtotal = 0;
+            uint32_t drng = 0xBEEF01u;
+            for (int m = 0; m < 2000; ++m) {
+                Vector3 dir;
+                float len2;
+                do {
+                    dir = Vector3(bakeRand01(drng) * 2.0f - 1.0f,
+                                  bakeRand01(drng) * 2.0f - 1.0f,
+                                  bakeRand01(drng) * 2.0f - 1.0f);
+                    len2 = glm::dot(dir, dir);
+                } while (len2 < 1e-4f || len2 > 1.0f);
+                dir *= 1.0f / std::sqrt(len2);
+                const float dist = c.nearZ * 4.0f +
+                    bakeRand01(drng) * (dreach * 0.98f - c.nearZ * 4.0f);
+                const Vector3 P = dpos + dir * dist;
+                RayHit hit;
+                raycastWorld(wr, dpos, P, hit, nullptr, c.lightCell[li]);
+                if (!rayStatusProven(hit.status)) continue;
+                const bool occCPU = (hit.status == RayStatus::Hit) ||
+                                    shadowDynamicSegmentBlocked(c, dpos, P);
+                const float stored =
+                    shadowAtlasSampleCPU(c, atlas, dslot, dpos, P);
+                if (stored < 0.0f) continue;
+                ++dtotal;
+                if ((stored * dreach < dist) == occCPU) ++dagree;
+            }
+            std::fprintf(stderr,
+                "[SHADOW_XCHECK] dynamic leg: slot %d, %ld pairs, "
+                "%.2f%% agreement\n",
+                dslot, dtotal,
+                dtotal ? 100.0 * dagree / dtotal : 0.0);
+        }
     }
 }
 

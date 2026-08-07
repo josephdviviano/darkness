@@ -1148,6 +1148,10 @@ static bool createGPUResources(const Darkness::MissionData &mission,
     gpu.u_liveLightColor    = bgfx::createUniform(
         "u_liveLightColor",    bgfx::UniformType::Vec4,
         Darkness::kLiveLightCap);
+    gpu.u_liveShadowInfo    = bgfx::createUniform(
+        "u_liveShadowInfo",    bgfx::UniformType::Vec4);
+    gpu.s_liveShadowAtlas   = bgfx::createUniform(
+        "s_liveShadowAtlas",   bgfx::UniformType::Sampler);
     gpu.u_objectAmbient     = bgfx::createUniform(
         "u_objectAmbient",     bgfx::UniformType::Vec4);
     gpu.u_objectLightLoc    = bgfx::createUniform(
@@ -1555,6 +1559,9 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                                          | static_cast<uint32_t>(rec.pi)] = i;
                 }
                 gpu.rebakedDensity = bf.density;
+                // Keep the CPU direction atlas for door-event partial
+                // re-encodes + rect uploads.
+                gpu.rebakedDirAtlas = dirAtlas;
 
                 // ── [LUM_RATIO] — the gameplay-relevant acceptance number ──
                 // Per-polygon mean luminance of OUR bake against the SHIPPED
@@ -2352,6 +2359,8 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
     bgfx::destroy(gpu.u_liveFalloff);
     bgfx::destroy(gpu.u_liveLightPos);
     bgfx::destroy(gpu.u_liveLightColor);
+    bgfx::destroy(gpu.u_liveShadowInfo);
+    bgfx::destroy(gpu.s_liveShadowAtlas);
     bgfx::destroy(gpu.u_objectAmbient);
     bgfx::destroy(gpu.u_objectLightLoc);
     bgfx::destroy(gpu.u_objectLightDir);

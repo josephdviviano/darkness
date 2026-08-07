@@ -72,7 +72,12 @@ constexpr uint32_t kLmBakeCacheVersion  = 7;
 //       overlays (static-baked lights keep disk bright in the base — the
 //       MISS6 cathedral-lamp overbright fix). The synthesis feeds the bake
 //       input, so identical parameters now produce a different base.
-constexpr uint32_t kLmBakeFormulaVersion = 3;
+//   v4: door-overlay DIRECTION bake went door-transparent — REVERTED
+//       (leaked specular through closed doors: light.rgb is total energy,
+//       ambient fed the lobe).
+//   v5: direction is door-occluded at load and re-encoded at runtime by
+//       door events; v4 caches carry the leaky field and must die.
+constexpr uint32_t kLmBakeFormulaVersion = 5;
 
 struct LmBakeCacheKey {
     uint64_t missionHash = 0;
